@@ -101,7 +101,7 @@ function parseEnv(raw: string): { env: Record<string, string>; ignored: number }
  *  badge everywhere a harness/template kind is shown. Extend this list (not
  *  the individual call sites) as a kind graduates out of experimental. */
 function isExperimentalKind(kind: AgentKind): boolean {
-  return kind === "codex" || kind === "cursor" || kind === "gemini";
+  return kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "fx";
 }
 
 function stringifyEnv(env: Record<string, string>): string {
@@ -158,6 +158,11 @@ const HARNESS_HOME_COPY: Record<AgentKind, { label: string; slug: string; help: 
     label: "GEMINI_CLI_HOME override (absolute path; optional)",
     slug: "gemini-2",
     help: "Sets GEMINI_CLI_HOME on spawn — gemini stores its login, sessions, and settings under this path (a dedicated override, not the real HOME), so a separate path gives this harness its own account.",
+  },
+  fx: {
+    label: "HOME override (absolute path; optional)",
+    slug: "fx-2",
+    help: "HOME override — fx has no dedicated config-dir env var; the harness home becomes $HOME for the spawned agent, so fx's state (~/.fx) lands under this path, giving this harness its own account.",
   },
 };
 
@@ -836,6 +841,14 @@ function HarnessesSection({
                         experimental
                       </span>
                     )}
+                    {status?.loggedIn === false && (
+                      <span
+                        className="rounded bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-warning"
+                        title={status.authHelp ?? "Not logged in"}
+                      >
+                        not logged in
+                      </span>
+                    )}
                     <span
                       className={cn(
                         "inline-block size-1.5 rounded-full",
@@ -849,6 +862,11 @@ function HarnessesSection({
                     {h.home && <> · HOME={abbreviateHome(h.home, homeDir)}</>}
                     {status?.version && <> · {status.version}</>}
                   </div>
+                  {status?.loggedIn === false && status.authHelp && (
+                    <div className="truncate text-[11px] text-warning" title={status.authHelp}>
+                      {status.authHelp}
+                    </div>
+                  )}
                 </div>
                 <Switch
                   checked={pendingToggle[h.id] ?? h.enabled}
@@ -1039,8 +1057,8 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Harness type</label>
-        <div className="grid grid-cols-4 gap-1">
-          {(["claude-code", "codex", "cursor", "gemini"] as AgentKind[]).map((k) => {
+        <div className="grid grid-cols-5 gap-1">
+          {(["claude-code", "codex", "cursor", "gemini", "fx"] as AgentKind[]).map((k) => {
             const experimental = isExperimentalKind(k);
             return (
               <Button

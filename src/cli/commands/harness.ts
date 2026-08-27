@@ -27,6 +27,16 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
         ];
       });
       out(table(["", "id", "kind", "label", "status", "version", ""], rows));
+      // Logged-out state rides alongside availability rather than inside the
+      // table cell (a login probe result, not an install/PATH problem) — one
+      // extra line per affected harness, same red-text treatment as the
+      // table's own unavailable/reason cell above.
+      for (const h of harnesses) {
+        const st = byId.get(h.id);
+        if (st?.loggedIn === false) {
+          out(`  ${c.red("!")} ${c.bold(h.id)} not logged in — ${st.authHelp ?? "run its login command"}`);
+        }
+      }
       return;
     }
     case "add": {

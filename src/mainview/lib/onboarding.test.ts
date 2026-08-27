@@ -17,6 +17,8 @@ function status(overrides: Partial<HarnessStatus> = {}): HarnessStatus {
     version: null,
     reason: null,
     installHint: null,
+    loggedIn: null,
+    authHelp: null,
     ...overrides,
   } as HarnessStatus;
 }
@@ -109,6 +111,49 @@ test("harness step is done if ANY status among several satisfies available+enabl
       status({ harnessId: "codex", available: true }),
     ],
     enabledHarnessIds: new Set(["codex"]),
+    projectCount: 0,
+    tasks: [],
+  });
+  expect(steps.find((s) => s.id === "harness")!.done).toBe(true);
+});
+
+test("harness step is NOT done when the only available status is logged out (loggedIn === false)", () => {
+  const steps = deriveOnboardingSteps({
+    statuses: [status({ harnessId: "fx", kind: "fx", available: true, loggedIn: false, authHelp: "Run fx login…" })],
+    enabledHarnessIds: null,
+    projectCount: 0,
+    tasks: [],
+  });
+  expect(steps.find((s) => s.id === "harness")!.done).toBe(false);
+});
+
+test("harness step IS done when an available status has loggedIn === true", () => {
+  const steps = deriveOnboardingSteps({
+    statuses: [status({ harnessId: "fx", kind: "fx", available: true, loggedIn: true })],
+    enabledHarnessIds: null,
+    projectCount: 0,
+    tasks: [],
+  });
+  expect(steps.find((s) => s.id === "harness")!.done).toBe(true);
+});
+
+test("harness step IS done when an available status has loggedIn === null (unknown, fail-open)", () => {
+  const steps = deriveOnboardingSteps({
+    statuses: [status({ harnessId: "claude-code", available: true, loggedIn: null })],
+    enabledHarnessIds: null,
+    projectCount: 0,
+    tasks: [],
+  });
+  expect(steps.find((s) => s.id === "harness")!.done).toBe(true);
+});
+
+test("harness step is done if ANY status among several satisfies available+not-logged-out, even if another is logged out", () => {
+  const steps = deriveOnboardingSteps({
+    statuses: [
+      status({ harnessId: "fx", kind: "fx", available: true, loggedIn: false }),
+      status({ harnessId: "codex", available: true, loggedIn: true }),
+    ],
+    enabledHarnessIds: null,
     projectCount: 0,
     tasks: [],
   });

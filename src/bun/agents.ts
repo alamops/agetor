@@ -1,5 +1,4 @@
-import path from "node:path";
-import { cursorModelArg, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
+import path from "node:path";import { cursorModelArg, FX_PROVIDER_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
 import { settleSubagentById } from "./claude-subagents.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
@@ -10,9 +9,10 @@ import {
   type SpawnedAgent,
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
-import { spawnCursorViaTmux } from "./cursor-tmux.ts";
-import { subagents as subagentsDb } from "./db.ts";
+import { spawnCursorViaTmux } from "./cursor-tmux.ts";import { dataDir, subagents as subagentsDb } from "./db.ts";
+import { spawnFxViaAcp, type FxMode } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
+import { answerFxPermission, registerFxPermission } from "./interactions.ts";
 import { gitWritableRootsSync } from "./worktree.ts";
 
 export type { SpawnedAgent };
@@ -84,8 +84,12 @@ export interface AgentRunOptions {
    * Existing session id to resume a prior conversation on a follow-up turn.
    * For claude-code: the JSONL session uuid, resumed via `claude --resume
    * <id>`. For codex: the `thread_id`, resumed via `codex exec resume <id>`.
-   * Either way the new prompt attaches to the full prior conversation instead
-   * of starting fresh.
+   * For fx: fx's own ACP session id (DISCOVERED from `session/new`'s
+   * response on the first turn, not pre-generated — see `onSessionId` on
+   * `SpawnAgentArgs`), resumed via the ACP `session/resume` request (falling
+   * back to `session/load` on a resume error — see fx-acp.ts). Either way
+   * the new prompt attaches to the full prior conversation instead of
+   * starting fresh.
    */
   resumeSessionId?: string | null;
   /**
@@ -109,6 +113,19 @@ export interface AgentRunOptions {
    * sandbox (which can't write anything regardless).
    */
   codexExternalGitDirs?: string[];
+  /**
+   * The run row id, threaded into `buildCommand` ONLY for fx: fx's argv
+   * embeds a deterministic `--log-file <dataDir>/fx-logs/<runId>.log` path
+   * (fx owns and writes that log itself — see fx-acp.ts's header — this just
+   * gives it somewhere to open). Every other kind ignores this field; codex
+   * and cursor instead take a `runId` directly as a `spawnAgent`/tmux-driver
+   * argument for the same per-turn log/prompt-file purpose, since their
+   * per-kind command-building functions (`buildCodexCommand`) already have a
+   * dedicated seam for cwd/run-scoped values. fx's is simpler (no fs calls
+   * needed to resolve it) so it rides directly in `AgentRunOptions` instead
+   * of getting its own `buildFxCommand` wrapper.
+   */
+  runId?: string | null;
 }
 
 // Map friendly model ids to the exact strings the claude-code CLI expects.
@@ -250,6 +267,10 @@ export function resolveBin(harness: Harness): string {
       fallback = "gemini";
       override = process.env.AGETOR_GEMINI_BIN;
       break;
+    case "fx":
+      fallback = "fx";
+      override = process.env.AGETOR_FX_BIN;
+      break;
   }
   if (override) return override;
   return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
@@ -287,6 +308,13 @@ export function harnessEnv(harness: Harness): Record<string, string> {
       env.HOME = harness.home;
       env.CODEX_HOME = path.join(harness.home, ".codex");
     } else if (harness.kind === "cursor") {
+      env.HOME = harness.home;
+    } else if (harness.kind === "fx") {
+      // fx has no dedicated config-dir env var (verified against binary
+      // v0.0.4 — no FX_HOME or FX_CONFIG_DIR in its strings); its state
+      // lives hardcoded at `~/.fx/*`, so isolating an additional account's
+      // login/config means a true HOME override, same approach as cursor's
+      // branch above.
       env.HOME = harness.home;
     } else {
       // gemini: GEMINI_CLI_HOME is a dedicated home-override env var (verified
@@ -612,6 +640,47 @@ export function buildCommand(
     return { cmd: args, env: Object.keys(env).length ? env : undefined };
   }
 
+  if (harness.kind === "fx") {
+    // fx — driven over ACP/stdio via fx-acp.ts, no tmux involved at all (see
+    // that file's header). The prompt is NOT an argv element: it rides over
+    // the `session/prompt` JSON-RPC call the driver issues after the
+    // handshake, so unlike claude/gemini there's no tmux-imsg-cap-style
+    // argv-size budget to enforce here.
+    const extra = (process.env.AGETOR_FX_ARGS ?? "").split(/\s+/).filter(Boolean);
+
+    if (!opts.model) {
+      throw new Error("model is required for fx");
+    }
+    if (!opts.runId) {
+      throw new Error("runId is required for fx (used to build the --log-file path)");
+    }
+
+    // fx owns and writes its own `--log-file` for its own troubleshooting —
+    // agetor never reads it (fx-acp.ts's `ensureLogDirForArgv` only makes
+    // sure the parent dir exists so `fx acp` doesn't fail to open it). This
+    // is the seam `FxLaunchOptions.argv` documents: buildCommand emits the
+    // full argv, `--log-file` already filled in; the driver appends nothing.
+    const logFile = path.join(dataDir, "fx-logs", `${opts.runId}.log`);
+
+    const args: string[] = [bin, "acp", "--model", opts.model, "--log-file", logFile, ...extra];
+
+    // Permission posture rides as an env var, not an argv flag — mirrors the
+    // FX_PERMISSION_MODE contract FxLaunchOptions.env documents. `auto`
+    // (also the null default, per house convention) and `ask` map straight
+    // through since fx's own mode ids already match agetor's; any other
+    // (future/unknown) mode id passes through verbatim, same convention as
+    // every other kind's unknown-model/mode passthrough in this file.
+    const mode = opts.mode ?? "auto";
+    env.FX_PERMISSION_MODE = mode;
+
+    // fx has no per-invocation effort/reasoning flag — its models route
+    // through the Vercel AI Gateway verbatim, with no CLI-level effort knob
+    // (mirrors gemini's silent-ignore of opts.effort above, not codex's
+    // required-effort throw).
+
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  }
+
   // codex — hosted in tmux via codex-tmux.ts. The prompt is NOT an argv
   // element: it's delivered on stdin (the trailing `-`), so the driver can
   // pipe a prompt file in and no user text touches the shell wrapper.
@@ -728,6 +797,16 @@ export function __getFakeDriver(taskId: string): FakeDriverInstance | undefined 
  */
 export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
 
+/** * Prompt-marker trigger for the `fx_permission` card scenario (see
+ * `makeFakeAgent` below), same rationale as `FAKE_CLAUDE_TODOS_PROMPT_MARKER`
+ * above: the e2e suite's worker-scoped backend fixture spawns one
+ * `headless.ts` per worker with a single fixed env block shared by every
+ * test/task in that worker, so a spec can't get its own env var into that
+ * already-running process — but it CAN put anything it wants in
+ * `task.prompt` at task-create time. Exported so an fx-permission e2e spec
+ * can reference the exact string instead of duplicating it.
+ */
+export const FAKE_FX_PERMISSION_PROMPT_MARKER = "__agetor_fake_fx_permission__";
 /**
  * Same prompt-marker trick as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER}, for the
  * "Claude Code Monitor" scenario (see
@@ -762,9 +841,12 @@ export const FAKE_CLAUDE_MONITOR_PROMPT_MARKER = "__agetor_fake_claude_monitor__
 const FAKE_CLAUDE_MONITOR_SETTLE_MS_RE = new RegExp(`${FAKE_CLAUDE_MONITOR_PROMPT_MARKER}:(\\d+)`);
 const FAKE_CLAUDE_MONITOR_DEFAULT_SETTLE_MS = 4000;
 const FAKE_CLAUDE_MONITOR_MIN_SETTLE_MS = 50;
-
-function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler, runId?: string): SpawnedAgent {
-  const record: string[] = [`spawn:${prompt}`];
+function makeFakeAgent(
+  taskId: string,
+  prompt: string,
+  onChunk: ChunkHandler,
+  fakeOpts: { runId?: string; mode?: string; kind?: AgentKind } = {},
+): SpawnedAgent {  const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
   const done = new Promise<number>((res) => { resolveDone = res; });
   // Every setTimeout this fake schedules is tracked here so `kill()` can
@@ -774,6 +856,19 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler, ru
   // `SQLITE_CONSTRAINT_FOREIGNKEY` against the cascade-deleted row.
   const timers: ReturnType<typeof setTimeout>[] = [];
   const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
+  // Set only by the AGETOR_FAKE_FX_PERMISSION scenario below — `kill()`
+  // needs it to settle a still-open card the same way `dropFxSession` →
+  // `settleFx` does in the real driver (see interactions.ts's "Settlement
+  // single-source-of-truth"), so Stop/delete during the fake card doesn't
+  // leave a phantom registry entry.
+  let fxPermissionCardId: string | undefined;
+  // Set by `kill()` before it settles `done` itself. The fx-permission
+  // scenario's `answer.then` callback below checks this so it never emits
+  // chunks or re-resolves `done` after `kill()` has already torn everything
+  // down (a still-pending `answer` promise can resolve asynchronously after
+  // `kill()` returns, since `answerFxPermission` there just settles the
+  // registry entry — it doesn't synchronously flush this driver's `.then`).
+  let killed = false;
   // Test hook: simulate a claude code API error mid-turn so orchestrator
   // tests can exercise the api-error → `blocked` column flip without having
   // to plumb a real synthetic-message JSONL through the driver. Mirrors what
@@ -914,8 +1009,7 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler, ru
       );
     });
     after(23, () => onChunk("assistant", "Starting Phase 1 — Investigate now."));
-    after(26, () => { onChunk("status", "turn complete"); resolveDone(0); });
-  } else if (prompt.includes(FAKE_CLAUDE_MONITOR_PROMPT_MARKER)) {
+    after(26, () => { onChunk("status", "turn complete"); resolveDone(0); });  } else if (prompt.includes(FAKE_CLAUDE_MONITOR_PROMPT_MARKER)) {
     // Test hook: simulate arming a Claude Code `Monitor` and later ending it
     // — see FAKE_CLAUDE_MONITOR_PROMPT_MARKER's doc comment above for why
     // this scenario inserts/settles the `subagents` row itself instead of
@@ -939,7 +1033,7 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler, ru
     // `completed` row from a previous run (an e2e retry, Stop→Start, a re-run
     // of the marker prompt) and silently degrade to a plain fake turn with no
     // hold. Same reasoning as `fakePlanCallCounter` in the cursor fake.
-    const monitorId = `fake-monitor-${runId ?? taskId}`;
+    const monitorId = `fake-monitor-${fakeOpts.runId ?? taskId}`;
     after(5, () => {
       onChunk(
         "tool_use",
@@ -968,7 +1062,7 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler, ru
       subagentsDb.insertIfAbsent({
         id: monitorId,
         taskId,
-        runId: runId ?? null,
+        runId: fakeOpts.runId ?? null,
         parentKind: "monitor",
         agentType: "monitor",
         description: "Fake monitor",
@@ -996,7 +1090,79 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler, ru
       settleSubagentById(monitorId, "completed", "receipt");
       record.push(`monitor:settled:${monitorId}`);
     });
-  } else {
+  } else if (
+    process.env.AGETOR_FAKE_FX_PERMISSION === "1"
+    || prompt.includes(FAKE_FX_PERMISSION_PROMPT_MARKER)
+  ) {
+    // Test hook: simulate fx's ACP `session/request_permission` round-trip
+    // so Playwright/e2e specs can drive the `fx_permission` card
+    // (RunPanel's FxPermissionCard) end to end without the real ACP driver.
+    // Mirrors fx-acp.ts's real handler almost exactly: register the card via
+    // `registerFxPermission` and await its `answer` promise instead of
+    // scheduling a fixed-delay end-of-turn timer — this scenario's turn only
+    // resolves once the card is answered (by the user via the HTTP route, or
+    // by `kill()` below on Stop/delete), same registry-awaiter discipline as
+    // the real driver.
+    //
+    // Mirrors the real driver's `maybeEmitProvider` (fx-acp.ts): the
+    // `configOptions` provider id rides a `FX_PROVIDER_STATUS_PREFIX` status
+    // chunk once per turn, emitted before any turn content, so the run-row
+    // provider chip is e2e-visible under this fake too.
+    if (fakeOpts.kind === "fx") onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+    after(5, () => onChunk("assistant", "requesting permission…"));
+    if (fakeOpts.mode === "yolo") {
+      // Mirror the real driver: `yolo` auto-allows client-side and answers
+      // synchronously without ever reaching `session/request_permission`'s
+      // registry round-trip, so this fake must not register a card for it
+      // either — a yolo task should never surface an `fx_permission` card.
+      after(8, () => {
+        onChunk("status", "fake fx permission auto-allowed (yolo)");
+        onChunk("status", "turn complete");
+        resolveDone(0);
+      });
+    } else {
+      try {
+        const { id, answer } = registerFxPermission({
+          taskId,
+          runId: fakeOpts.runId ?? "fake-run",
+          toolCall: {
+            toolCallId: "fake-fx-permission-1",
+            title: "Write file",
+            kind: "edit",
+            rawInput: { path: "/tmp/example.txt" },
+          },
+          options: [
+            { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+            { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+          ],
+          mode: fakeOpts.mode === "ask" ? "ask" : "auto",
+        });
+        fxPermissionCardId = id;
+        answer
+          .then((a) => {
+            // `kill()` may have already cleared the timers and settled
+            // `done` (and answered this same card `cancelled` itself)
+            // before this promise resolves — skip emitting/resolving a
+            // second time so we never double-resolve `resolveDone` or emit
+            // chunks against a run `kill()` already tore down.
+            if (killed) return;
+            onChunk("status", `fake fx permission resolved: ${"optionId" in a ? a.optionId : "cancelled"}`);
+            onChunk("status", "turn complete");
+            resolveDone(0);
+          })
+          .catch(() => {});
+      } catch (err) {
+        onChunk(
+          "status",
+          `fake fx permission registration failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        resolveDone(1);
+      }
+    }  } else {
+    // Generic fallback, shared with claude's fake driver — only fx turns get
+    // the provider sentinel (mirrors `maybeEmitProvider` in fx-acp.ts; see
+    // the fx-permission scenario above for the same comment in full).
+    if (fakeOpts.kind === "fx") onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
     after(5, () => onChunk("stdout", `fake response to: ${prompt}`));
     after(20, () => { onChunk("status", "turn complete"); resolveDone(0); });
   }
@@ -1004,6 +1170,10 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler, ru
     _record: record,
     kill: () => {
       record.push("kill");
+      // Set before anything else so the fx-permission scenario's still-
+      // pending `answer.then` callback (if any) sees it and skips emitting
+      // chunks / re-resolving `done` once that promise settles.
+      killed = true;
       // Clear every pending timer so no further chunks/resolutions fire from
       // them, but still settle `done` immediately (with the same code the
       // timer chain would have used) so a kill never leaves a caller awaiting
@@ -1011,6 +1181,14 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler, ru
       // (clearTimeout on an elapsed timer, resolveDone on an already-settled
       // promise).
       for (const t of timers) clearTimeout(t);
+      // Mirror the real fx driver's settlement discipline: a still-open
+      // fx_permission card must be resolved on teardown, not left dangling
+      // in the registry. `answerFxPermission` is idempotent (returns false
+      // if the card was already answered/cancelled), so this is safe to call
+      // unconditionally whenever this fake spawned one.
+      if (fxPermissionCardId !== undefined) {
+        answerFxPermission(fxPermissionCardId, { cancelled: true });
+      }
       resolveDone(0);
     },
     writeInput: (line) => { record.push(`write:${line}`); return true; },
@@ -1116,10 +1294,12 @@ export interface SpawnAgentArgs {
    * Fires with the agent's session uuid. For claude-code and gemini, both of
    * which take a self-issued `--session-id`, this fires synchronously before
    * the CLI has even written its first event — useful for persisting the id
-   * on the run row immediately. For codex it fires later, once the driver
-   * discovers the `thread_id` from the `thread.started` event (codex has no
-   * pre-generation flag). Not invoked at all pre-gemini for codex-shaped
-   * "no comparable session id" cases — every kind now has one.
+   * on the run row immediately. For codex and fx it fires later, once the
+   * driver DISCOVERS the id from the process itself — codex from the
+   * `thread.started` event, fx from the ACP `session/new` response's
+   * `sessionId` (both have no pre-generation flag/mechanism). Not invoked at
+   * all pre-gemini for codex-shaped "no comparable session id" cases — every
+   * kind now has one.
    */
   onSessionId?: (sessionId: string) => void;
   opts?: AgentRunOptions;
@@ -1140,9 +1320,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
     if (process.env.AGETOR_CLAUDE_DRIVER === "fake") {
       // Build the command anyway so the fake records the prompt going by;
       // the fake's behaviour doesn't depend on the argv shape.
-      buildCommand(harness, prompt, opts);
-      return makeFakeAgent(taskId, prompt, onChunk, runId);
-    }
+      buildCommand(harness, prompt, opts);      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });    }
     // Pre-generate a session uuid when we're not resuming. The driver will
     // expect claude to write its JSONL at the deterministic path derived
     // from cwd + this uuid, replacing the previous mtime-poll race.
@@ -1180,9 +1358,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       // behavior is unchanged (see `makeFakeCursorPlanAgent`'s header).
       if (process.env.AGETOR_FAKE_CURSOR_PLAN === "1") {
         return makeFakeCursorPlanAgent(taskId, prompt, onChunk);
-      }
-      return makeFakeAgent(taskId, prompt, onChunk, runId);
-    }
+      }      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });    }
     const built = buildCommand(harness, prompt, opts);
     return spawnCursorViaTmux({
       taskId,
@@ -1205,9 +1381,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       // value tests can assert on (mirrors codex's fake `thread.started`
       // stand-in, `fake-codex-thread-${taskId}`).
       const sessionId = opts.resumeSessionId ?? `fake-gemini-session-${taskId}`;
-      onSessionId?.(sessionId);
-      return makeFakeAgent(taskId, prompt, onChunk, runId);
-    }
+      onSessionId?.(sessionId);      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });    }
     // Pre-generate a session uuid when we're not resuming — mirrors claude's
     // pattern (`--session-id` up front) rather than codex's discover-later
     // pattern, even though the tmux HOSTING strategy below (one-shot per
@@ -1228,6 +1402,38 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
     });
   }
 
+  if (harness.kind === "fx") {
+    // fx — driven over ACP/stdio via fx-acp.ts, a plain `Bun.spawn` child
+    // process with no tmux involved (see that file's header for why: an ACP
+    // stdio server has nothing to reattach to across an agetor restart, so a
+    // mid-turn death orphans the run by design).
+    if (process.env.AGETOR_FX_DRIVER === "fake") {
+      // Build the command anyway so the fake records the prompt going by and
+      // exercises the same validation (missing model/runId) the real path
+      // does; the fake's behaviour doesn't depend on the argv shape.
+      buildCommand(harness, prompt, { ...opts, runId });
+      // fx's ACP session id is DISCOVERED from `session/new`'s response, not
+      // pre-generated — mirrors codex's `thread.started`-discovery timing
+      // (see the `onSessionId` doc on `SpawnAgentArgs`), not claude/gemini's
+      // pre-generated-uuid pattern.
+      onSessionId?.(`fake-fx-session-${taskId}`);
+      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto", kind: "fx" });
+    }
+    const built = buildCommand(harness, prompt, { ...opts, runId });
+    return spawnFxViaAcp({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      mode: (opts.mode ?? "auto") as FxMode,
+      resumeSessionId: opts.resumeSessionId ?? undefined,
+      onChunk,
+      onSessionId,
+    });
+  }
+
   // codex — hosted in a per-task tmux session via codex-tmux.ts (so a mid-turn
   // run survives an agetor restart and is reattachable), streaming structured
   // events by tailing codex's `--json` log.
@@ -1236,9 +1442,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
     // Hand the orchestrator a thread id so it persists `codex_session_id` and
     // can route follow-ups through `codex exec resume` — mirrors what a real
     // `thread.started` event would deliver.
-    onSessionId?.(`fake-codex-thread-${taskId}`);
-    return makeFakeAgent(taskId, prompt, onChunk, runId);
-  }
+    onSessionId?.(`fake-codex-thread-${taskId}`);    return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });  }
   // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
   // worktree) so a codex `auto` run that has to write there escalates its
   // sandbox to full access. Computed here — the single choke point every codex

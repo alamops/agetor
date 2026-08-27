@@ -4,7 +4,11 @@ import { usageError } from "../usage.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, isTTY } from "../output.ts";
 import type { AgetorClient } from "../api-client.ts";
-import type { AskQuestionsRequest, TmuxPromptRequest } from "../../bun/interactions.ts";
+import type {
+  AskQuestionsRequest,
+  TmuxPromptRequest,
+  FxPermissionRequest,
+} from "../../bun/interactions.ts";
 import { buildAskAnswer, CUSTOM_OPTION } from "../answer-logic.ts";
 
 export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
@@ -25,8 +29,11 @@ export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
     if (req.kind === "ask_questions") {
       const ok = await answerAsk(client, req);
       if (!ok) return; // cancelled
-    } else {
+    } else if (req.kind === "tmux_prompt") {
       const ok = await answerTmux(client, req);
+      if (!ok) return;
+    } else {
+      const ok = await answerFx(client, req);
       if (!ok) return;
     }
   }
@@ -93,6 +100,34 @@ async function answerTmux(client: AgetorClient, req: TmuxPromptRequest): Promise
       ? await client.answerTmuxPrompt(req.id, { reject: true })
       : await client.answerTmuxPrompt(req.id, { key: choice });
   out(res.ok ? c.green("✓ answered") : c.red(res.error ?? "failed to answer"));
+  return true;
+}
+
+async function answerFx(client: AgetorClient, req: FxPermissionRequest): Promise<boolean> {
+  const title = req.toolCall.title ?? req.toolCall.kind ?? "tool call";
+  const kindBadge = req.toolCall.kind ? c.dim(` [${req.toolCall.kind}]`) : "";
+  out(`${title}${kindBadge} ${c.dim(`(${req.mode})`)}`);
+  // Values are indexes into req.options, not fx's wire-provided optionIds —
+  // an fx option literally named "__dismiss__" would otherwise collide with
+  // the sentinel and get misread as a rejection. -1 marks the dismiss row.
+  const DISMISS = -1;
+  const choice = await p.select({
+    message: "Choose",
+    options: [
+      ...req.options.map((o, i) => ({ value: i, label: o.name })),
+      { value: DISMISS, label: "Dismiss (reject)" },
+    ],
+  });
+  // Esc mirrors every sibling (answerAsk/answerTmux): it aborts the whole
+  // `agetor answer` loop via cancel(), leaving the interaction pending —
+  // only the explicit "Dismiss (reject)" row posts `{ cancel: true }`.
+  if (p.isCancel(choice)) return cancel();
+  const selected = choice === DISMISS ? null : req.options[choice as number];
+  const body: { optionId: string } | { cancel: true } = selected
+    ? { optionId: selected.optionId }
+    : { cancel: true };
+  const res = await client.answerFxPermission(req.id, body);
+  out(res.ok ? c.green("✓ answered") : c.dim("already resolved (answered elsewhere or cancelled)"));
   return true;
 }
 

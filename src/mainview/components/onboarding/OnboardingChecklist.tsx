@@ -41,7 +41,22 @@ const LOGIN_COMMAND: Partial<Record<AgentKind, string>> = {
   "claude-code": "claude /login",
   codex: "codex login",
   cursor: "cursor-agent login",
+  fx: "fx login",
 };
+
+/** fx ≥0.0.5 supports logging into a subscription provider (Codex/Grok
+ *  accounts) in addition to the default Vercel AI Gateway login — shown
+ *  wherever `LOGIN_COMMAND.fx` itself is shown, so the user isn't left
+ *  thinking `fx login` is the only option. */
+function FxLoginHint({ className }: { className?: string }) {
+  return (
+    <p className={cn("text-[11px] text-muted-foreground", className)}>
+      or <code className="rounded bg-muted px-1 py-0.5 font-mono">fx login codex</code> /{" "}
+      <code className="rounded bg-muted px-1 py-0.5 font-mono">fx login grok</code> for a
+      subscription provider
+    </p>
+  );
+}
 
 function StepIcon({ done, index }: { done: boolean; index: number }) {
   if (done) {
@@ -96,6 +111,28 @@ function HarnessStepDetail({
               </div>
             );
           }
+          if (s.available && s.loggedIn === false) {
+            return (
+              <div key={s.harnessId} className="space-y-1 text-xs">
+                <div className="flex items-center gap-2">
+                  <span className="inline-block size-1.5 shrink-0 rounded-full bg-warning" />
+                  <AgentIcon kind={s.kind} className="size-3.5 shrink-0" />
+                  <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                    {label} — installed but not logged in
+                  </span>
+                </div>
+                {LOGIN_COMMAND[s.kind] && (
+                  <code className="ml-5 block truncate rounded bg-muted px-2 py-1 font-mono text-[11px]">
+                    {LOGIN_COMMAND[s.kind]}
+                  </code>
+                )}
+                {s.kind === "fx" && <FxLoginHint className="ml-5" />}
+                {s.authHelp && (
+                  <p className="ml-5 text-[11px] text-muted-foreground">{s.authHelp}</p>
+                )}
+              </div>
+            );
+          }
           if (s.available) {
             return (
               <div key={s.harnessId} className="flex items-center gap-2 text-xs">
@@ -137,6 +174,13 @@ function HarnessStepDetail({
                 <code className="rounded bg-muted px-1 py-0.5 font-mono">gemini</code> once and
                 follow the browser sign-in.
               </p>
+            ) : kind === "fx" ? (
+              <div key={kind} className="space-y-1">
+                <code className="block rounded bg-muted px-2 py-1 font-mono text-[11px]">
+                  {LOGIN_COMMAND[kind]}
+                </code>
+                <FxLoginHint />
+              </div>
             ) : LOGIN_COMMAND[kind] ? (
               <code key={kind} className="block rounded bg-muted px-2 py-1 font-mono text-[11px]">
                 {LOGIN_COMMAND[kind]}

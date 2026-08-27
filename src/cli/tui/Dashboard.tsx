@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task, RunEvent } from "../../shared/types.ts";
-import { commitPushPrompt } from "../../shared/types.ts";
+import { commitPushPrompt, isInternalStatusSentinel } from "../../shared/types.ts";
 import { useTasks } from "./useTasks.ts";
 import { useCoalescedStream, eventKey } from "./useCoalescedStream.ts";
 import { useSpinner } from "./useSpinner.ts";
@@ -300,6 +300,11 @@ const EventLine = memo(function EventLine({ e }: { e: RunEvent }) {
         </Text>
       );
     case "status":
+      // Internal-only sentinel status chunks (permission-mode chip, fx usage
+      // chip, …) are UI-plumbing, not transcript content — see
+      // `isInternalStatusSentinel` in shared/types.ts, the one predicate every
+      // raw-status renderer must consult. Skip rendering them.
+      if (isInternalStatusSentinel(e.data)) return null;
       return (
         <Text dimColor wrap="truncate-end">
           • {e.data}

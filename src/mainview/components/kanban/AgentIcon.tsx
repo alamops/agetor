@@ -1,4 +1,4 @@
-import { ClaudeCode, Codex, Cursor, GeminiCLI } from "@lobehub/icons";
+import { ClaudeCode, Codex, Cursor, GeminiCLI, Vercel } from "@lobehub/icons";
 import type { ComponentType } from "react";
 import { cn } from "@/lib/utils";
 import type { AgentKind } from "../../../shared/types.ts";
@@ -13,6 +13,10 @@ const ICONS: Record<AgentKind, ComponentType<IconProps>> = {
   // equivalent to Claude/Codex's colored glyphs here.
   "cursor": Cursor,
   "gemini": GeminiCLI.Color,
+  // Same story as Cursor above — @lobehub/icons ships no `.Color` variant
+  // for Vercel (fx's maker), so the plain (Mono) triangle glyph is the
+  // closest equivalent.
+  "fx": Vercel,
 };
 
 /**

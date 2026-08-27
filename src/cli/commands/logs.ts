@@ -5,6 +5,7 @@ import { c, out, errln } from "../output.ts";
 import { usageError } from "../usage.ts";
 import { notifyFor, osNotify } from "../notify.ts";
 import type { RunEvent, GlobalEvent } from "../../shared/types.ts";
+import { isInternalStatusSentinel } from "../../shared/types.ts";
 
 export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   const ref = args.find((a) => !a.startsWith("-"));
@@ -25,7 +26,10 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
     }
     const { events, reason } = await client.rebuildEvents(run.id);
     if (reason) errln(c.dim(reason));
-    for (const e of events) out(flags.json ? JSON.stringify(e) : formatEvent(e));
+    for (const e of events) {
+      if (!flags.json && shouldSkipEvent(e)) continue;
+      out(flags.json ? JSON.stringify(e) : formatEvent(e));
+    }
     return;
   }
 
@@ -40,7 +44,9 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
       resolve();
     };
     const onEvent = (e: RunEvent) => {
-      out(flags.json ? JSON.stringify(e) : formatEvent(e));
+      if (flags.json || !shouldSkipEvent(e)) {
+        out(flags.json ? JSON.stringify(e) : formatEvent(e));
+      }
       if (noFollow) {
         // Close once the replay burst goes quiet for a beat.
         if (quiet) clearTimeout(quiet);
@@ -74,6 +80,16 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   });
 }
 
+// Internal-only sentinel status chunks (permission-mode chip, fx usage chip,
+// …) are UI-plumbing, not transcript content — see `isInternalStatusSentinel`
+// in shared/types.ts, the one predicate every raw-status renderer must
+// consult so a new sentinel can't leak verbatim into one surface while
+// another suppresses it. `--json` still emits the raw event for programmatic
+// consumers; only the human-readable render skips it.
+function shouldSkipEvent(e: RunEvent): boolean {
+  return e.stream === "status" && isInternalStatusSentinel(e.data);
+}
+
 function formatEvent(e: RunEvent): string {
   switch (e.stream) {
     case "user":
@@ -98,6 +114,9 @@ function formatEvent(e: RunEvent): string {
     }
     case "interaction": {
       const r = tryJson(e.data) as { kind?: string } | null;
+      if (r?.kind === "fx_permission") {
+        return c.yellow(`! fx is requesting permission — agetor answer ${e.taskId.slice(0, 8)}`);
+      }
       return c.yellow(
         `! needs answer (${r?.kind ?? "?"}) — agetor answer ${e.taskId.slice(0, 8)}`,
       );

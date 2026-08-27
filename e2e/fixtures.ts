@@ -1,6 +1,13 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { type WriteStream, createWriteStream, existsSync } from "node:fs";
+import {
+  type WriteStream,
+  chmodSync,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -48,6 +55,53 @@ const HEALTH_POLL_INTERVAL_MS = 200;
 const TEARDOWN_GRACE_MS = 4_000;
 const FINAL_KILL_WAIT_MS = 2_000;
 const PREFLIGHT_TIMEOUT_MS = 2_000;
+
+/**
+ * fx's availability probe (`checkHarness` in src/bun/agent-status.ts) is a
+ * DUAL probe — `--version` (generic, same as every other harness) AND
+ * `--help`, whose output must contain "coding agent" — because the bare
+ * name `fx` collides with an unrelated npm JSON-viewer CLI, and `--version`
+ * alone can't tell them apart. That probe runs regardless of
+ * `AGETOR_FX_DRIVER=fake` (the driver override only replaces `spawnAgent`'s
+ * fx branch, not the separate start-task pre-flight), so a bare `/bin/echo`
+ * — good enough for claude's probe below — would fail fx's `--help` check
+ * and `startTask` would reject every fx run before the fake driver ever ran.
+ * This stub script mirrors the one `src/bun/orchestrator-fx.test.ts` writes
+ * for the identical reason.
+ *
+ * Written inside the given `dataDir` (a subdirectory, so it can't collide
+ * with anything `headless.ts` itself creates there) rather than at its own
+ * module-scope temp dir — `dataDir` is already `rm -rf`'d by
+ * `provisionBackend`'s teardown (both the success and pre-health-check
+ * failure paths), so the stub is cleaned up for free instead of leaking a
+ * bare `mkdtempSync` directory per importing process for the lifetime of the
+ * machine. Callers must invoke this after `dataDir` exists but before
+ * spawning the backend, since `AGETOR_FX_BIN` must already point at an
+ * executable file by the time `headless.ts` starts probing it.
+ */
+function writeFxStubBin(dataDir: string): string {
+  const binDir = path.join(dataDir, "fx-stub-bin");
+  mkdirSync(binDir, { recursive: true });
+  const binPath = path.join(binDir, "fx");
+  writeFileSync(
+    binPath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--help" ]; then',
+      '  echo "Fast, native coding agent for the terminal"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "--version" ]; then',
+      '  echo "0.0.4-fake"',
+      "  exit 0",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(binPath, 0o755);
+  return binPath;
+}
 
 async function tailFile(filePath: string, maxBytes = 4_000): Promise<string> {
   if (!existsSync(filePath)) return `<${filePath} not found>`;
@@ -173,6 +227,8 @@ async function provisionBackend(
   const dataDir = await mkdtemp(path.join(tmpdir(), "agetor-e2e-"));
   const logFile = path.join(dataDir, "backend.log");
   const daemonLogFile = path.join(dataDir, "daemon.log");
+  // Must happen before the spawn below — see writeFxStubBin's doc comment.
+  const fxStubBinPath = writeFxStubBin(dataDir);
 
   const logStream: WriteStream = createWriteStream(logFile);
   await new Promise<void>((resolve, reject) => {
@@ -210,6 +266,21 @@ async function provisionBackend(
       AGETOR_CLAUDE_BIN: "/bin/echo",
       AGETOR_TMUX_BIN: "/bin/echo",
       AGETOR_CLAUDE_ARGS: "",
+      // fx routes through the in-process fake driver (spawnAgent's fx
+      // branch) exactly like claude-code above, and e2e/fx-interactions
+      // .spec.ts exercises it — this is not inert. Unlike claude, whose
+      // start-task pre-flight is satisfied by a binary-shaped `/bin/echo`,
+      // fx's `checkHarness` (agent-status.ts) dual-probes `--version` AND
+      // `--help`, requiring "coding agent" in the `--help` output to
+      // disambiguate Vercel's fx from an unrelated npm JSON-viewer CLI of
+      // the same name — that probe runs regardless of the driver override,
+      // so `AGETOR_FX_BIN` points at the stub script written into this
+      // backend's own `dataDir` above (mirrors
+      // `src/bun/orchestrator-fx.test.ts`'s) instead of `/bin/echo`. Note:
+      // codex/cursor/gemini have no equivalent fake-driver wiring in this
+      // fixture — no spec here starts a run on any of them.
+      AGETOR_FX_DRIVER: "fake",
+      AGETOR_FX_BIN: fxStubBinPath,
       // Points every GitHub REST/GraphQL call this backend makes at a local
       // stub server instead of the real api.github.com (see
       // src/bun/github.ts's `GITHUB_API_BASE` seam and e2e/github-stub.ts).

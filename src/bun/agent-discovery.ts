@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import type { AgentKind } from "../shared/types.ts";
 
 /**
@@ -14,6 +16,15 @@ export interface DiscoveredModel {
  * Run an external command with a 3-second timeout. Designed for cheap CLI
  * probes where blocking the API boot is unacceptable — if the CLI hangs (e.g.
  * waiting for an auth flow) we give up rather than freezing app startup.
+ *
+ * No `env` override parameter: every discoverer here probes a built-in CLI's
+ * model-listing subcommand, none of which need a harness alias's HOME/config-
+ * dir override to answer (see discoverFx's comment for why that's true of fx
+ * specifically). Keeping this module free of per-harness env plumbing is what
+ * lets it stay free of the database and process-spawning helper modules too
+ * (which would otherwise drag DB-open and process-signal-handler side effects
+ * into a plain best-effort prober) — see the module-level note below on
+ * `discoverFx`.
  */
 async function runProbe(cmd: string[]): Promise<{ ok: boolean; stdout: string }> {
   try {
@@ -134,6 +145,90 @@ async function discoverGemini(): Promise<DiscoveredModel[]> {
   return [];
 }
 
+/**
+ * Parse `fx models --json` output. Unlike codex/cursor (whose CLI output
+ * format isn't formally specified, hence the loose line-heuristic parsers
+ * above), fx's shape here IS known precisely — spike-verified against the
+ * real 0.0.6 binary: exactly one JSON object on stdout,
+ * `{kind:"models", count, shown_count, more_count, private_models_hidden,
+ * ids: string[]}`. `ids` is the complete Gateway catalog (`shown_count ===
+ * count`; no pagination flag exists, `--all` is rejected) — 228 ids at spike
+ * time. We only trust `ids`; any other shape (non-JSON, missing/malformed
+ * `ids`, non-string entries) yields an empty list rather than throwing —
+ * discovery is best-effort, never a hard dependency for the picker. Ids are
+ * deduped (same `seen`-Set convention as `parseCodexModels`/
+ * `parseCursorModels` above) — a repeated id in the Gateway catalog would
+ * otherwise surface as a duplicate React key in the model picker.
+ */
+function parseFxModels(stdout: string): DiscoveredModel[] {
+  try {
+    const parsed: unknown = JSON.parse(stdout.trim());
+    if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { ids?: unknown }).ids)) {
+      return [];
+    }
+    const out: DiscoveredModel[] = [];
+    const seen = new Set<string>();
+    for (const id of (parsed as { ids: unknown[] }).ids) {
+      if (typeof id !== "string" || id.length === 0) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push({ id });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * `fx models --json` is spike-verified (against binary v0.0.6) to run
+ * unauthenticated with zero filesystem writes — no `fx login` needed for
+ * discovery to work, unlike the pre-flight auth check gating task starts.
+ * The catalog is Gateway-wide (228 ids at spike time) and deliberately not
+ * curated: the hardcoded `AGENT_OPTIONS.fx.models` stays the labeled/hinted
+ * subset shown first in the picker, and merges with this list the same way
+ * the codex/cursor discovered lists merge with their own curated arrays
+ * (nothing fx-specific to change on the UI side).
+ *
+ * No labels come back from fx's CLI, so every discovered entry is `{id}`
+ * only — the picker falls back to rendering the bare id, same as codex.
+ */
+async function discoverFx(): Promise<DiscoveredModel[]> {
+  // Resolve exactly the way discoverCodex/discoverCursor do above:
+  // rehydrated-PATH lookup only — no import of the sqlite-backed database
+  // module (which opens+migrates the DB as an import-time side effect) and
+  // no import of the process-spawning agents/harness-env module (whose
+  // module chain registers fx's process signal handlers) — neither belongs
+  // in a module whose whole contract is "best-effort, never a hard
+  // dependency, never throws". `fx models --json` is unauthenticated and
+  // doesn't read/write HOME or a config dir, so the per-harness HOME
+  // override that gates a spawned fx *run* (multi-account isolation) has
+  // nothing to do here — plain PATH resolution against AGETOR_FX_BIN is
+  // enough.
+  //
+  // The whole body is wrapped below (try/catch → []) as a backstop: even a
+  // future change here that starts throwing synchronously must still
+  // degrade to an empty list, since `refreshDiscoveredModels` fans this out
+  // alongside the other four discoverers and one throw must never strand
+  // them all.
+  try {
+    const fallback = process.env.AGETOR_FX_BIN ?? "fx";
+    const bin = Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+    // Confirm the binary actually resolves before spending a probe on it —
+    // an unresolvable name (fx not installed) would otherwise just make
+    // Bun.spawn throw inside runProbe, which is caught there too, but
+    // bailing here skips the spawn attempt entirely and reads clearer as
+    // "skipped".
+    const resolvable = isAbsolute(bin) ? existsSync(bin) : Bun.which(bin, { PATH: process.env.PATH }) !== null;
+    if (!resolvable) return [];
+    const probe = await runProbe([bin, "models", "--json"]);
+    if (!probe.ok || !probe.stdout) return [];
+    return parseFxModels(probe.stdout);
+  } catch {
+    return [];
+  }
+}
+
 const cache = new Map<AgentKind, DiscoveredModel[]>();
 let inflight: Promise<void> | null = null;
 
@@ -150,19 +245,29 @@ export function getDiscoveredModels(agent: AgentKind): DiscoveredModel[] {
 export async function refreshDiscoveredModels(): Promise<void> {
   if (inflight) return inflight;
   inflight = (async () => {
-    const [codex, claude, cursor, gemini] = await Promise.all([
+    // Promise.allSettled, not Promise.all: every discoverer above is already
+    // internally best-effort (probe failures resolve to []), but this is the
+    // backstop against one of them throwing anyway (a stray import-time or
+    // synchronous bug) — index.ts/headless.ts call this as a bare
+    // `void refreshDiscoveredModels()` at boot, so an unhandled rejection
+    // here surfaces as an unhandled-rejection crash risk, and with
+    // Promise.all a single rejection would strand every OTHER kind's cache
+    // (they'd never get set, staying whatever they were before — empty on
+    // first boot) even though only one kind actually failed.
+    const results = await Promise.allSettled([
       discoverCodex(),
       discoverClaude(),
       discoverCursor(),
       discoverGemini(),
+      discoverFx(),
     ]);
-    cache.set("codex", codex);
-    cache.set("claude-code", claude);
-    cache.set("cursor", cursor);
-    cache.set("gemini", gemini);
+    const kinds: AgentKind[] = ["codex", "claude-code", "cursor", "gemini", "fx"];
+    results.forEach((result, i) => {
+      cache.set(kinds[i]!, result.status === "fulfilled" ? result.value : []);
+    });
   })().finally(() => { inflight = null; });
   return inflight;
 }
 
 // Exposed for tests that want to feed in synthetic CLI output.
-export const __testing = { parseCodexModels, parseCursorModels };
+export const __testing = { parseCodexModels, parseCursorModels, parseFxModels };

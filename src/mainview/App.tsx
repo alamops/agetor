@@ -213,7 +213,7 @@ function AppInner() {
   // harness step tell "not loaded yet" (skip the disabled/enabled
   // distinction) apart from "loaded, and it happens to be empty".
   const [harnessesLoaded, setHarnessesLoaded] = useState(false);
-  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [] });
+  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
   // Per-harness quota/usage snapshots for the topbar chip mini-bar + popover
   // (D2). Seeded once on boot via `getAllUsage`, kept current afterwards by
   // the `harness_usage` AppEvent (see the `subscribeAppEvents` handler
@@ -1252,11 +1252,12 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               const harness = harnesses.find((h) => h.id === a.harnessId);
               const displayName = harness?.label ?? a.harnessId;
               const q = usage[a.harnessId];
+              const loggedOut = a.available && a.loggedIn === false;
               const dot = (
                 <span
                   className={
                     "inline-block size-1.5 rounded-full " +
-                    (a.available ? "bg-success-solid" : "bg-danger-solid")
+                    (!a.available ? "bg-danger-solid" : loggedOut ? "bg-warning-solid" : "bg-success-solid")
                   }
                 />
               );
@@ -1278,7 +1279,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               const chip = (
                 <span
                   className="flex items-center gap-1"
-                  title={a.reason ?? a.path ?? ""}
+                  title={loggedOut ? (a.authHelp ?? "Not logged in") : (a.reason ?? a.path ?? "")}
                 >
                   <AgentIcon kind={a.kind} className="size-3" />
                   {displayName}

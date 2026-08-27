@@ -37,6 +37,7 @@ import {
 } from "../../../shared/types.ts";
 import { BranchNamingDialog } from "@/components/settings/BranchNamingDialog";
 import { AgentIcon } from "./AgentIcon";
+import { HarnessAuthHint } from "./HarnessAuthHint";
 import { BranchPicker } from "./BranchPicker";
 import { ProjectPicker } from "./ProjectPicker";
 import {
@@ -323,6 +324,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
     "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"], fast: false, maxMode: false },
     "cursor": { mode: initialMode("cursor"), model: DEFAULT_MODEL["cursor"], effort: DEFAULT_EFFORT["cursor"], fast: false, maxMode: false },
     "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"], fast: false, maxMode: false },
+    "fx": { mode: initialMode("fx"), model: DEFAULT_MODEL["fx"], effort: DEFAULT_EFFORT["fx"], fast: false, maxMode: false },
   });
 
   // Seed mode + model + effort defaults from the last submitted picks,
@@ -372,6 +374,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
       seed("codex");
       seed("cursor");
       seed("gemini");
+      seed("fx");
       const active = agentCache.current[kind];
       setMode(active.mode);
       setModel(active.model);
@@ -860,7 +863,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
                         variant={agent === h.id ? "default" : "outline"}
                         onClick={() => switchAgent(h.id)}
                         title={
-                          [status?.reason, status?.path, status?.version]
+                          [
+                            status?.reason,
+                            status?.loggedIn === false ? (status.authHelp ?? "Not logged in") : null,
+                            status?.path,
+                            status?.version,
+                          ]
                             .filter(Boolean)
                             .join(" — ") || h.id
                         }
@@ -903,6 +911,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
                         ? "Cursor has no native plan mode — routed to propose-only 'ask' so nothing auto-executes."
                         : kind === "gemini"
                         ? "Routed to gemini's --approval-mode plan — a real read-only mode, no changes made."
+                        : kind === "fx"
+                        ? "fx has no native plan mode — routed to 'ask': only pre-approved rules run; anything else surfaces as an approval card in the run panel."
                         : "Plan only — agent describes what it would do without making changes."
                     }
                   >
@@ -1019,6 +1029,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
                   )}
                 </div>
               )}
+
+              {/* Not blocking — Create/Run still work and the run pre-flight
+                  reports the actionable error if the turn actually needs
+                  credentials. This is a heads-up, not a disable. */}
+              <HarnessAuthHint status={selectedStatus} />
             </div>
 
             <div className="flex shrink-0 gap-2 border-t border-border/60 px-4 py-3">

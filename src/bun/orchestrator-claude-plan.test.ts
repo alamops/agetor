@@ -375,7 +375,7 @@ test("a second run whose TaskCreate numbering restarts at 1 resets the board sum
     claudeSessionId: null,
     codexSessionId: null,
     cursorSessionId: null,
-    geminiSessionId: null,
+    geminiSessionId: null, fxSessionId: null,
   });
   __dispatchChunkForTest(runId2, id, "claude-code", "tool_use", toolUse("toolu_c3", "TaskCreate", { subject: "Run2 A", activeForm: "A" }));
   __dispatchChunkForTest(runId2, id, "claude-code", "tool_result", toolResult("toolu_c3", "Task #1 created successfully: Run2 A"));
@@ -417,7 +417,7 @@ test("a follow-up run that ADDS a task continues the session's numbering — boa
     claudeSessionId: null,
     codexSessionId: null,
     cursorSessionId: null,
-    geminiSessionId: null,
+    geminiSessionId: null, fxSessionId: null,
   });
   __dispatchChunkForTest(runId2, id, "claude-code", "tool_use", toolUse("toolu_c3", "TaskCreate", { subject: "Turn2 C", activeForm: "C" }));
   __dispatchChunkForTest(runId2, id, "claude-code", "tool_result", toolResult("toolu_c3", "Task #3 created successfully: Turn2 C"));

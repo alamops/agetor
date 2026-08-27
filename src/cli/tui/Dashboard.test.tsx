@@ -1,9 +1,37 @@
-import { test, expect } from "bun:test";
+import { test, expect, mock, afterAll } from "bun:test";
 import { render } from "ink-testing-library";
 import { Dashboard } from "./Dashboard.tsx";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
-import type { Task } from "../../shared/types.ts";
-import { commitPushPrompt } from "../../shared/types.ts";
+import type { Task, RunEvent } from "../../shared/types.ts";
+import { commitPushPrompt, FX_USAGE_STATUS_PREFIX, PERMISSION_MODE_STATUS_PREFIX } from "../../shared/types.ts";
+
+// Snapshot the real `sse.ts` exports before mocking so the mock can be
+// reverted after this file's tests finish — `mock.module` overwrites the
+// module record in place, and other test files in the same `bun test`
+// process (anything importing "../sse.ts" transitively) must see the real
+// implementation again once we're done here.
+import * as realSse from "../sse.ts";
+const realSseSnapshot = { ...realSse };
+
+// Captures the most recently opened `/tasks/:id/events` subscription so a
+// test can push synthetic RunEvents straight into useCoalescedStream without
+// a live daemon. The `/events` global-toast subscription (useGlobalEvents) is
+// acknowledged with a no-op handle and never driven — no test here needs it.
+let onTaskEvents: ((e: RunEvent) => void) | null = null;
+
+mock.module("../sse.ts", () => ({
+  ...realSseSnapshot,
+  streamSse: (pathname: string, onEvent: (e: unknown) => void) => {
+    if (pathname.startsWith("/tasks/") && pathname.includes("/events")) {
+      onTaskEvents = onEvent as (e: RunEvent) => void;
+    }
+    return { close: () => {} };
+  },
+}));
+
+afterAll(() => {
+  mock.module("../sse.ts", () => realSseSnapshot);
+});
 
 const ENTER = "\r";
 const wait = (ms = 60) => new Promise((r) => setTimeout(r, ms));
@@ -118,5 +146,37 @@ test("the 'c' key commits even while the task is running (mid-turn commit folds 
   stdin.write("c");
   await wait(80);
   expect(sends).toEqual([{ runId: "runR", line: commitPushPrompt(taskR) }]);
+  unmount();
+});
+
+test("event stream: an fx_permission interaction renders generically, sentinel status chunks are suppressed, a plain status renders", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90); // first poll selects taskA and opens the /tasks/taskA/events subscription
+  expect(onTaskEvents).not.toBeNull();
+
+  const base = { runId: "runA", taskId: "taskA" };
+  const push = onTaskEvents!;
+  push({ ...base, stream: "interaction", data: JSON.stringify({ kind: "fx_permission" }), ts: 1 });
+  push({ ...base, stream: "status", data: `${FX_USAGE_STATUS_PREFIX}{"used":1,"size":2}`, ts: 2 });
+  push({ ...base, stream: "status", data: `${PERMISSION_MODE_STATUS_PREFIX}auto`, ts: 3 });
+  push({ ...base, stream: "status", data: "plain status text", ts: 4 });
+  await wait(80); // let useCoalescedStream's 33ms flush interval commit the batch
+
+  const frame = lastFrame() ?? "";
+  // The interaction row is the same generic "press g" line regardless of
+  // interaction kind — unlike logs.ts, the dashboard doesn't special-case fx.
+  expect(frame).toContain("needs answer — press g");
+  expect(frame).not.toContain("answer in the app");
+  // Internal-only sentinel status chunks never reach the transcript.
+  expect(frame).not.toContain(FX_USAGE_STATUS_PREFIX);
+  expect(frame).not.toContain(PERMISSION_MODE_STATUS_PREFIX);
+  // A plain status line still renders.
+  expect(frame).toContain("plain status text");
   unmount();
 });

@@ -147,7 +147,9 @@ import * as gitHost from "./git-host.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
 import {
+  answerFxPermission,
   answerTmuxPrompt,
+  findFxPermissionById,
   findTmuxPromptById,
   getAskQuestionsById,
   listPendingForTask,
@@ -2900,10 +2902,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           if (
             body.kind !== "claude-code" && body.kind !== "codex" &&
-            body.kind !== "cursor" && body.kind !== "gemini"
+            body.kind !== "cursor" && body.kind !== "gemini" && body.kind !== "fx"
           ) {
             return json(
-              { error: "kind must be 'claude-code', 'codex', 'cursor', or 'gemini'" },
+              { error: "kind must be 'claude-code', 'codex', 'cursor', 'gemini', or 'fx'" },
               { status: 400, headers: corsHeaders(req) },
             );
           }
@@ -3231,6 +3233,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               "codex": getDiscoveredModels("codex"),
               "cursor": getDiscoveredModels("cursor"),
               "gemini": getDiscoveredModels("gemini"),
+              "fx": getDiscoveredModels("fx"),
             },
             { headers: corsHeaders(req) },
           )),
@@ -3242,6 +3245,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               "codex": getDiscoveredModels("codex"),
               "cursor": getDiscoveredModels("cursor"),
               "gemini": getDiscoveredModels("gemini"),
+              "fx": getDiscoveredModels("fx"),
             },
             { headers: corsHeaders(req) },
           );
@@ -4252,6 +4256,48 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // `markTmuxPromptAnswered` for why this is two-step.
           markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
           const ok = answerTmuxPrompt(req.params.id, { key });
+          return json({ ok }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // ─── Interactions: fx ACP permission requests ────────────────────
+      // fx's `session/request_permission` blocks the driver's in-process
+      // awaiter (`fx-acp.ts`) until we resolve it here — unlike the tmux
+      // kinds above there is no pane and no keystroke leg; resolving the
+      // interaction directly unblocks the awaiter, which sends the ACP
+      // JSON-RPC response back to the fx child.
+      //
+      // Not-found and lost-race outcomes return `{ ok: false }` at HTTP 200,
+      // mirroring the tmux-prompt sibling above: either the request was
+      // already resolved by someone else (a concurrent answer, or fx
+      // auto-cancelling) or the id is unknown, and in both cases the UI
+      // should just drop the card on its next poll rather than treat it as
+      // an error — a 404 here would also make health-gated fetch replays
+      // invisible. Genuine validation failures (missing/unknown optionId)
+      // stay 400.
+      "/fx-permissions/:id/answer": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { optionId?: unknown; cancel?: unknown };
+          const pending = findFxPermissionById(req.params.id);
+          if (!pending) {
+            return json({ ok: false }, { headers: corsHeaders(req) });
+          }
+          if (body.cancel === true) {
+            const ok = answerFxPermission(req.params.id, { cancelled: true });
+            return json({ ok }, { headers: corsHeaders(req) });
+          }
+          const optionId = typeof body.optionId === "string" ? body.optionId : "";
+          if (!optionId) {
+            return json({ error: "optionId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Reject anything not in the recorded option set — mirrors the
+          // tmux route's key validation: the request ships the exact
+          // option ids fx offered, and an unknown id here is an attempt
+          // to inject an arbitrary outcome into the ACP reply.
+          if (!pending.options.some((o) => o.optionId === optionId)) {
+            return json({ error: "unknown option" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const ok = answerFxPermission(req.params.id, { optionId });
           return json({ ok }, { headers: corsHeaders(req) });
         }),
       },

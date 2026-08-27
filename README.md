@@ -14,7 +14,7 @@ It runs entirely on your machine. No cloud relay, no remote sandbox — agents e
 
 ## Highlights
 
-- **Multi-agent, multi-account.** Built-in support for `claude-code` and `codex`. Define additional *harnesses* to run a second Claude or Codex account in parallel — each one gets a dedicated `$HOME` so logins, history, and config never collide.
+- **Multi-agent, multi-account.** Built-in support for five agent kinds: `claude-code`, `codex`, `cursor`, `gemini`, and `fx` (Vercel Labs' `fx.sh`, driven over the Agent Client Protocol rather than a tmux-hosted CLI — ships experimental and disabled by default until you enable it in Settings). Define additional *harnesses* to run a second account of any of them in parallel — each one gets a dedicated `$HOME` so logins, history, and config never collide.
 - **Per-task git worktrees.** Every task runs on its own branch (`agetor/<short-id>-<slug>`) in a dedicated worktree under `~/.agetor/worktrees/`. Two agents can hammer the same repo simultaneously without stepping on each other. Base ref is pinned at create time, so re-runs always start from the same commit.
 - **Interactive Claude sessions.** Claude Code is hosted in a per-task `tmux` session that stays alive across multiple turns. Follow up on a task without losing the conversation. Output is streamed by tailing Claude's own JSONL transcript, so assistant text, thinking blocks, tool calls, and tool results all render with their own UI components.
 - **Approvals and questions, lifted out of the TUI.** Agetor watches Claude's tmux pane and JSONL transcript to detect `AskUserQuestion` / `ExitPlanMode` modals and tool-permission prompts, and surfaces them in the run panel as structured cards — radios, checkboxes, free-text. It's fully non-invasive: it registers no MCP server and installs no hook (it only strips stale entries left by older builds). Codex prompts are detected heuristically from stdout and surfaced the same way.
@@ -199,8 +199,18 @@ All persistent state lives in `~/.agetor/` (override with `AGETOR_DATA_DIR`):
 | `AGETOR_CLAUDE_ARGS` | Extra args appended to every Claude spawn. | *(none)* |
 | `AGETOR_CODEX_BIN` | Override the `codex` binary path. | `codex` on `PATH` |
 | `AGETOR_CODEX_ARGS` | Extra args appended to every Codex spawn. | *(none)* |
+| `AGETOR_CURSOR_BIN` | Override the `cursor-agent` binary path. | `cursor-agent` on `PATH` |
+| `AGETOR_CURSOR_ARGS` | Extra args appended to every Cursor spawn. | *(none)* |
+| `AGETOR_GEMINI_BIN` | Override the `gemini` binary path. | `gemini` on `PATH` |
+| `AGETOR_GEMINI_ARGS` | Extra args appended to every Gemini spawn. | *(none)* |
+| `AGETOR_FX_BIN` | Override the `fx` binary path. | `fx` on `PATH` |
+| `AGETOR_FX_ARGS` | Extra args appended to every fx spawn. | *(none)* |
 | `AGETOR_TMUX_BIN` | Override the `tmux` binary path. | `tmux` on `PATH` |
 | `AGETOR_CLAUDE_DRIVER` | Set to `fake` to skip tmux + the real CLI (test-only). | unset |
+| `AGETOR_CODEX_DRIVER` | Same, for Codex (test-only). | unset |
+| `AGETOR_CURSOR_DRIVER` | Same, for Cursor (test-only). | unset |
+| `AGETOR_GEMINI_DRIVER` | Same, for Gemini (test-only). | unset |
+| `AGETOR_FX_DRIVER` | Same, for fx — skips spawning the ACP child entirely (test-only). | unset |
 | `AGETOR_GITHUB_API_BASE` | GitHub REST/GraphQL API origin. Dev/e2e only — see `e2e/github-stub.ts`; never point it at a non-loopback host (the GitHub token is sent there). | `https://api.github.com` |
 | `AGETOR_DAEMON_IDLE_MS` | CLI daemon: idle-shutdown after this long with no run and no attached client. `0` disables. | `300000` (5 min) |
 

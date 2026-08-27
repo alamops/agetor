@@ -79,7 +79,7 @@ test("a running run row makes hasRunningWork true", async () => {
     claudeSessionId: null,
     codexSessionId: null,
     cursorSessionId: null,
-    geminiSessionId: null,
+    geminiSessionId: null, fxSessionId: null,
   });
 
   try {

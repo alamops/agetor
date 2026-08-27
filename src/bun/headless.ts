@@ -5,6 +5,7 @@ import { reconcileOrphans, reapIdleSessions } from "./orchestrator.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
+import { reapLiveFxProcs } from "./fx-acp.ts";
 import {
   writeCoreCreds,
   removeCoreCreds,
@@ -91,6 +92,15 @@ function shutdown(reason: string, code = 0): void {
   if (shuttingDown) return;
   shuttingDown = true;
   daemonLog(`shutting down (${reason})`);
+  // fx-acp.ts's own SIGINT/SIGTERM/SIGHUP handlers always reap `fx acp`
+  // children but only call `process.exit` themselves when they're the sole
+  // listener for that signal — since this module registers its own
+  // SIGINT/SIGTERM handlers below (making fx-acp's handler NOT the sole
+  // listener), fx-acp steps back and this shutdown path is what actually
+  // owns the exit sequence. That means this is also the path responsible for
+  // reaping any live fx children — do it explicitly, before the rest of
+  // teardown, rather than relying on fx-acp's handler to have done it.
+  reapLiveFxProcs();
   try {
     removeCoreCreds(dataDir);
   } catch {

@@ -28,6 +28,47 @@ export const SESSION_DIED_STATUS_PREFIX = "session ended: ";
 export const PERMISSION_MODE_STATUS_PREFIX = "permission-mode: ";
 
 /**
+ * Sentinel prefix for the `status` chunk fx-acp.ts emits per ACP
+ * `usage_update` notification. Payload is JSON: `{used, size, cost?:
+ * {amount, currency}}` (verbatim ACP shape — `used`/`size` are token counts,
+ * `cost` is present only when fx reports one). RunPanel suppresses this
+ * prefix from the transcript's status dividers (same as
+ * `PERMISSION_MODE_STATUS_PREFIX` — that suppression is load-bearing, not
+ * dead code) and instead derives the latest value into a small usage chip on
+ * the run's summary row.
+ */
+export const FX_USAGE_STATUS_PREFIX = "fx-usage: ";
+
+/**
+ * Sentinel prefix for the `status` chunk fx-acp.ts emits once per turn with
+ * the provider fx reports in its `session/new` / resume `configOptions`
+ * (`{id:"provider", currentValue:"gateway"|"codex"|"grok"}` — fx ≥0.0.5
+ * multi-provider auth). Payload is the bare provider value. Suppressed from
+ * transcripts via `isInternalStatusSentinel`; RunPanel derives a small
+ * run-row chip from the latest one.
+ */
+export const FX_PROVIDER_STATUS_PREFIX = "fx-provider: ";
+
+/**
+ * True for `status`-stream chunks that are UI-internal sentinel channels, not
+ * transcript content: currently `PERMISSION_MODE_STATUS_PREFIX` (fed a chip,
+ * now suppressed-only), `FX_USAGE_STATUS_PREFIX` (feeds the run-row usage
+ * chip), and `FX_PROVIDER_STATUS_PREFIX` (feeds the run-row provider chip).
+ * Every renderer of raw status events — RunPanel's status dividers,
+ * the CLI's `agetor logs` formatter, and the TUI dashboard — must consult
+ * this ONE predicate instead of maintaining its own prefix list, so a new
+ * sentinel can't silently leak verbatim into one surface while another
+ * suppresses it.
+ */
+export function isInternalStatusSentinel(data: string): boolean {
+  return (
+    data.startsWith(PERMISSION_MODE_STATUS_PREFIX) ||
+    data.startsWith(FX_USAGE_STATUS_PREFIX) ||
+    data.startsWith(FX_PROVIDER_STATUS_PREFIX)
+  );
+}
+
+/**
  * The Settings section name where per-host git credentials live, interpolated
  * into the server-side credential-error hints (github.ts `privateRepoHint`,
  * gitlab.ts `authHint`, bitbucket.ts `bitbucketAccessHint` and friends) as
@@ -76,7 +117,7 @@ export function isApprovalPrompt(text: string): boolean {
   return APPROVAL_PROMPT_PATTERNS.some((re) => re.test(text));
 }
 
-export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini";
+export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini" | "fx";
 
 /**
  * A "harness" is the user-facing name for an agent configuration. Built-in
@@ -112,6 +153,11 @@ export interface Harness {
    *    and every gemini state dir — `.gemini/`, session chats, OAuth creds —
    *    is joined onto that), so unlike codex there's no need to touch the
    *    real `HOME` at all.
+   *  - fx: emitted as a plain HOME=<home> override — fx has no dedicated
+   *    config-dir env var (verified against fx v0.0.4 and v0.0.6 — no FX_HOME
+   *    or FX_CONFIG_DIR in its strings), and its state lives hardcoded at
+   *    `~/.fx/*`, so isolating an additional account's login/config means
+   *    re-homing the whole process, same approach as cursor.
    *  NULL means "inherit the agetor process env". */
   home: string | null;
   /** Optional binary path override. NULL falls back to the AGETOR_*_BIN
@@ -164,6 +210,18 @@ export interface HarnessStatus {
   reason: string | null;
   /** Suggested install command when missing. */
   installHint: string | null;
+  /**
+   * Login state, when the kind's probe can determine it cheaply and without
+   * side effects — today only fx (`fx status --json` reports `auth`). Strictly
+   * fail-open: `false` ONLY when the probe positively reported "missing";
+   * `true` for any other reported value; `null` when the kind has no login
+   * probe, the probe failed, or its output wasn't parseable — `null` must
+   * never block a run.
+   */
+  loggedIn: boolean | null;
+  /** The CLI's own login guidance (verbatim, e.g. fx's `auth_help`) when
+   *  `loggedIn === false`; otherwise null. */
+  authHelp: string | null;
 }
 
 /**
@@ -301,6 +359,17 @@ export const HARNESS_TEMPLATES: HarnessTemplate[] = [
     kind: "gemini",
     suggestedHarnessId: "gemini-2",
     home: "{dataDir}/harnesses/gemini-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "fx-additional",
+    label: "Additional fx",
+    description:
+      "Another fx harness with its own HOME override so login and config are isolated from the built-in — fx has no dedicated config-dir env var, so a full HOME override is how accounts are separated.",
+    kind: "fx",
+    suggestedHarnessId: "fx-2",
+    home: "{dataDir}/harnesses/fx-2",
     bin: null,
     env: {},
   },
@@ -1215,6 +1284,15 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // for simple prompts, which fails "always default to the best available
   // model" (root CLAUDE.md). Pin an explicit flagship instead.
   "gemini": "gemini-3-pro-preview",
+  // fx's own compiled default since 0.0.6 — Kimi K3 (Fast mode on),
+  // following fx's own default rather than picking one ourselves. Ids are
+  // Vercel AI Gateway ids, passed verbatim. fx is exempt from the "always
+  // default to the best available model" rule above: the Gateway bills per
+  // token to the user's own account, and this tier is the tuned sweet spot
+  // for fx's agentic loop rather than a cost compromise — flagship tiers
+  // (gpt-5.5, claude-sonnet-5/opus-5, gemini-3.1-pro-preview) remain one
+  // click away in the picker.
+  "fx": "moonshotai/kimi-k3",
 };
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
@@ -1230,6 +1308,11 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   // concurrent tasks). MODEL_EFFORT_SUPPORT.gemini is empty for every model
   // so the picker collapses; this default is unused but kept for symmetry.
   "gemini": "high",
+  // fx has no per-invocation effort/reasoning flag (its models are routed
+  // through the Vercel AI Gateway verbatim, with no CLI-level effort knob).
+  // MODEL_EFFORT_SUPPORT.fx is empty for every model so the picker collapses;
+  // this default is unused but kept for symmetry.
+  "fx": "high",
 };
 
 export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
@@ -1571,6 +1654,16 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
   // codex's read-only-sandbox stand-in — but reuse codex's "ask" id since
   // AGENT_OPTIONS.gemini.modes below labels it the same "Read-only" way.
   "gemini": { code: "auto", plan: "ask" },
+  // fx has three of its own permission modes (yolo/auto/ask — see
+  // AGENT_OPTIONS.fx.modes below). Like every other kind, Code resolves to
+  // modes[0] — "auto" (fx's LLM auto-review resolves most tool calls;
+  // anything unresolved surfaces as an approval card) — the
+  // hands-off-but-reviewed default, not "yolo" (permission checks disabled
+  // entirely): a Plan→Code pill round-trip must not escalate a task past
+  // what it started at. "yolo" stays reachable only as an explicit picker
+  // choice. Plan resolves to "ask" (only pre-approved rules run; everything
+  // else surfaces as an approval card).
+  "fx": { code: "auto", plan: "ask" },
 };
 
 /**
@@ -1667,6 +1760,18 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gemini-3.5-flash": [],
     "gemini-2.5-flash": [],
   },
+  // Empty for every model: fx has no per-invocation effort/reasoning flag —
+  // its models route through the Vercel AI Gateway verbatim with no CLI-level
+  // knob to tune. Same treatment as gemini above.
+  fx: {
+    "moonshotai/kimi-k3": [],
+    "moonshotai/kimi-k3-fast": [],
+    "zai/glm-5.2-fast": [],
+    "anthropic/claude-opus-5": [],
+    "anthropic/claude-sonnet-5": [],
+    "openai/gpt-5.5": [],
+    "google/gemini-3.1-pro-preview": [],
+  },
 };
 
 /**
@@ -1717,6 +1822,7 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   // (auto/ask) are universally available across its model list.
   cursor: {},
   gemini: {},
+  fx: {},
 };
 
 export function supportedModes(agent: AgentKind, model: string | null): AgentOption[] {
@@ -1801,6 +1907,26 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // picker collapses for every model — see EFFORT_OPTIONS list comment.
     efforts: EFFORT_OPTIONS,
   },
+  fx: {
+    // Vercel AI Gateway ids, passed verbatim.
+    models: [
+      { id: "moonshotai/kimi-k3", label: "Kimi K3", hint: "fx's compiled default since 0.0.6 — Fast mode." },
+      { id: "moonshotai/kimi-k3-fast", label: "Kimi K3 Fast", hint: "Fast variant of fx's default." },
+      { id: "zai/glm-5.2-fast", label: "GLM 5.2 Fast", hint: "Cheap, fast tier via the Gateway." },
+      { id: "anthropic/claude-opus-5", label: "Claude Opus 5", hint: "Anthropic's top tier via the Gateway." },
+      { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5", hint: "Anthropic's fast flagship via the Gateway." },
+      { id: "openai/gpt-5.5", label: "GPT-5.5", hint: "OpenAI flagship via the Gateway." },
+      { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", hint: "Google flagship via the Gateway." },
+    ],
+    modes: [
+      { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; anything unresolved surfaces as an approval card." },
+      { id: "yolo", label: "Yolo", hint: "Disables fx permission checks — full access." },
+      { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
+    ],
+    // No model in MODEL_EFFORT_SUPPORT.fx accepts the effort flag, so the
+    // picker collapses for every model — see EFFORT_OPTIONS list comment.
+    efforts: EFFORT_OPTIONS,
+  },
 };
 
 export type RunStatus =
@@ -1862,6 +1988,14 @@ export interface Run {
    * and legacy rows.
    */
   geminiSessionId: string | null;
+  /**
+   * fx's own conversation/session id — DISCOVERED (not pre-generated), the
+   * ACP `session/new` result's `sessionId`. Captured by the fx-acp driver and
+   * persisted for `session/resume` on follow-up turns, mirroring codex's
+   * discovered-from-an-event `codexSessionId` rather than gemini's
+   * self-issued-uuid pattern. NULL for every other agent kind and legacy rows.
+   */
+  fxSessionId: string | null;
   /**
    * How this run came to exist. `null`/undefined = user-initiated (Run
    * button, a follow-up message typed into the panel — every run before

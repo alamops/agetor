@@ -3,8 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, Radar, RefreshCw, Search, Send, Slash, SquareSlash,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
@@ -32,7 +31,9 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   EVENTS_WINDOW_MAX,
-  PERMISSION_MODE_STATUS_PREFIX,
+  FX_PROVIDER_STATUS_PREFIX,
+  FX_USAGE_STATUS_PREFIX,
+  isInternalStatusSentinel,
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
@@ -199,6 +200,29 @@ function formatTime(ts: number): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+/** fx's `usage_update` payload, decoded from the `FX_USAGE_STATUS_PREFIX`
+ *  sentinel — mirrors the ACP shape `{used, size, cost?: {amount, currency}}`
+ *  (`src/bun/fx-acp.ts`). */
+interface FxUsageData {
+  used: number;
+  size: number;
+  cost?: { amount: number; currency: string };
+}
+
+/** Compact token-count formatting for the usage chip: 45_000 → "45k",
+ *  1_200_000 → "1.2M". Whole thousands/millions drop the decimal. */
+function formatUsageCount(n: number): string {
+  if (n >= 1_000_000) {
+    const v = n / 1_000_000;
+    return `${Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)}M`;
+  }
+  if (n >= 1_000) {
+    const v = n / 1_000;
+    return `${Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)}k`;
+  }
+  return String(n);
 }
 
 /**
@@ -1222,6 +1246,48 @@ function RunPanelBody({
    *  so it splices against these. */
   const mainEvents = useMemo(() => events.filter((e) => !e.subagentId), [events]);
 
+  /** Latest fx `usage_update` per run, keyed by `runId` — feeds the run-row
+   *  chip in `RunsList`. Sourced from the raw (unfiltered) `events` state
+   *  rather than `displayedEvents` so the chip stays correct regardless of
+   *  which subagent tab is active or whether a JSONL rebuild snapshot has
+   *  spliced the main stream. `events` arrives in arrival order, so a plain
+   *  overwrite-on-iterate naturally keeps the latest per run (fx's own
+   *  `usage_update` cadence is "MAY", snapshot semantics — most-recent wins).
+   *  Gated on `kind === "fx"` — every other agent kind never emits this
+   *  sentinel, so scanning the full (possibly windowed) event list on every
+   *  render for them is pure waste. Note the same windowing applies here as
+   *  everywhere else `events` is read: once an older run's events slide out
+   *  of the kept window (`eventWindowKeepCount`/`EVENTS_WINDOW_MAX`), its
+   *  usage chip disappears too — intended, not a bug to chase. */
+  const usageByRunId = useMemo(() => {
+    const m = new Map<string, FxUsageData>();
+    if (kind !== "fx") return m;
+    for (const e of events) {
+      if (e.stream !== "status" || !e.data.startsWith(FX_USAGE_STATUS_PREFIX)) continue;
+      const parsed = safeParse<FxUsageData>(e.data.slice(FX_USAGE_STATUS_PREFIX.length));
+      if (!parsed || typeof parsed.used !== "number" || typeof parsed.size !== "number") continue;
+      m.set(e.runId, parsed);
+    }
+    return m;
+  }, [events, kind]);
+
+  /** Latest fx `fx-provider: <value>` per run, keyed by `runId` — sibling
+   *  derivation to {@link usageByRunId} above, same fx gating and the same
+   *  windowed-events caveat (an older run's chip disappears once its events
+   *  slide out of the kept window). Feeds the small provider chip in
+   *  `RunsList`, rendered beside the usage chip. */
+  const providerByRunId = useMemo(() => {
+    const m = new Map<string, string>();
+    if (kind !== "fx") return m;
+    for (const e of events) {
+      if (e.stream !== "status" || !e.data.startsWith(FX_PROVIDER_STATUS_PREFIX)) continue;
+      const value = e.data.slice(FX_PROVIDER_STATUS_PREFIX.length).trim();
+      if (!value) continue;
+      m.set(e.runId, value);
+    }
+    return m;
+  }, [events, kind]);
+
   /** Background/sub-agent events bucketed by subagent id, in arrival order. */
   const subagentEventsById = useMemo(() => {
     const m = new Map<string, RunEvent[]>();
@@ -1573,11 +1639,15 @@ function RunPanelBody({
   // run rather than stacking queued rows that could strand "running".
   const canSend = !!resumableRunId;
   // While a native modal (question / plan / permission prompt) is pending,
-  // claude is blocked on it in the tmux REPL — a typed message would paste
-  // into the modal instead of reaching claude (and the run would hang
-  // "working"). So gate the send box: answer via the card above, or press Stop
-  // to cancel cleanly first. AskUserQuestion's own card carries a per-question
-  // "Custom answer" field, so custom input isn't lost.
+  // the agent is blocked on it — a typed message would go astray instead of
+  // reaching the agent (and the run would hang "working"). This gate is
+  // kind-agnostic over the `interactions` array: for claude, a typed message
+  // would paste into the live tmux modal instead of reaching claude; for fx,
+  // the turn is parked awaiting the ACP permission reply, so a follow-up
+  // would only sit in `fxTurnQueue` behind an unanswered card. Either way the
+  // gate keeps the UX consistent across kinds: answer via the card above, or
+  // press Stop to cancel cleanly first. AskUserQuestion's own card carries a
+  // per-question "Custom answer" field, so custom input isn't lost.
   const modalPending = interactions.length > 0;
 
   const [input, setInput] = useState("");
@@ -2650,7 +2720,7 @@ function RunPanelBody({
         tmuxSession={latestRun?.tmuxSession ?? null}
       />
 
-      <RunsList runs={runs} />
+      <RunsList runs={runs} usageByRun={usageByRunId} providerByRun={providerByRunId} />
 
       <TerminalsSection task={task} />
 
@@ -3536,7 +3606,55 @@ function SubagentTabs({
  * for the latest run (status, ordinal, time, duration). Expanded: every
  * prior run in reverse-chronological order.
  */
-function RunsList({ runs }: { runs: Run[] }) {
+/** Compact `used/size` (+ `· $cost`/`· cost CUR`) chip for an fx run's
+ *  latest `usage_update`, rendered beside the duration/exit chips on a
+ *  run-summary row. `title` carries the exact numbers on hover; the visible
+ *  text is the abbreviated form. */
+function UsageChip({ usage }: { usage: FxUsageData }) {
+  // Sub-cent amounts round to "$0.00" under toFixed(2) — nearly every fx
+  // call at these token volumes costs a fraction of a cent, so that's the
+  // common case, not an edge case. Widen to 4 decimals below that threshold;
+  // the title tooltip below always carries the exact, unrounded amount.
+  const displayAmount = (amount: number) => amount < 0.01 ? amount.toFixed(4) : amount.toFixed(2);
+  const costText = usage.cost
+    ? usage.cost.currency === "USD"
+      ? ` · $${displayAmount(usage.cost.amount)}`
+      : ` · ${displayAmount(usage.cost.amount)} ${usage.cost.currency}`
+    : "";
+  const title = `fx usage: ${usage.used.toLocaleString()}/${usage.size.toLocaleString()} tokens`
+    + (usage.cost ? ` · ${usage.cost.amount} ${usage.cost.currency}` : "");
+  return (
+    <span className="text-muted-foreground" title={title}>
+      {formatUsageCount(usage.used)}/{formatUsageCount(usage.size)}
+      {costText}
+    </span>
+  );
+}
+
+/** Small muted chip naming the provider fx routed a turn through
+ *  (`gateway`/`codex`/`grok`), rendered beside {@link UsageChip} on a run's
+ *  summary row. Text is the bare value fx reported — no relabeling, so an
+ *  unreleased provider id still renders sensibly. */
+function ProviderChip({ provider }: { provider: string }) {
+  return (
+    <span
+      className="inline-block max-w-[10rem] truncate align-bottom text-muted-foreground"
+      title="fx provider"
+    >
+      {provider}
+    </span>
+  );
+}
+
+function RunsList({
+  runs,
+  usageByRun,
+  providerByRun,
+}: {
+  runs: Run[];
+  usageByRun?: Map<string, FxUsageData>;
+  providerByRun?: Map<string, string>;
+}) {
   const [open, setOpen] = useState(false);
 
   if (runs.length === 0) {
@@ -3592,6 +3710,8 @@ function RunsList({ runs }: { runs: Run[] }) {
           {latest.exitCode !== null && latest.exitCode !== 0 && (
             <span className="text-destructive">exit {latest.exitCode}</span>
           )}
+          {usageByRun?.get(latest.id) && <UsageChip usage={usageByRun.get(latest.id)!} />}
+          {providerByRun?.get(latest.id) && <ProviderChip provider={providerByRun.get(latest.id)!} />}
           {canExpand && (
             <span className="text-muted-foreground">{open ? "▲" : "▼"}</span>
           )}
@@ -3621,11 +3741,15 @@ function RunsList({ runs }: { runs: Run[] }) {
                   #{ordinalFor(r.id)} · {formatTime(r.startedAt)}
                 </span>
               </span>
-              <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
-                {formatDuration(r)}
-                {r.exitCode !== null && r.exitCode !== 0 && (
-                  <span className="ml-1 text-destructive">exit {r.exitCode}</span>
-                )}
+              <span className="flex shrink-0 items-center gap-1.5 font-mono text-[10px] text-muted-foreground">
+                <span>
+                  {formatDuration(r)}
+                  {r.exitCode !== null && r.exitCode !== 0 && (
+                    <span className="ml-1 text-destructive">exit {r.exitCode}</span>
+                  )}
+                </span>
+                {usageByRun?.get(r.id) && <UsageChip usage={usageByRun.get(r.id)!} />}
+                {providerByRun?.get(r.id) && <ProviderChip provider={providerByRun.get(r.id)!} />}
               </span>
             </li>
           ))}
@@ -3950,13 +4074,21 @@ function RunEventList({
           // trailing `]` or ending in an ellipsis — are filtered too, on
           // replay as well as live.
           if (isImageSourceMetaBreadcrumb(e.data)) return [];
-          // Suppress the raw "permission-mode: <mode>" status chunk too. It
-          // used to feed a chip pinned below the transcript; that chip is
-          // gone, but the suppression is NOT dead code — claude emits one of
-          // these at every turn start and every mid-turn Shift+Tab, so
-          // dropping this guard would spam a divider into the scrollback for
-          // each one (and historical rows already carry them).
-          if (e.data.startsWith(PERMISSION_MODE_STATUS_PREFIX)) return [];
+          // Suppress UI-internal status sentinels — `PERMISSION_MODE_STATUS_
+          // PREFIX` (used to feed a chip pinned below the transcript; that
+          // chip is gone, but the suppression is NOT dead code — claude
+          // emits one of these at every turn start and every mid-turn
+          // Shift+Tab, so dropping this guard would spam a divider into the
+          // scrollback for each one), `FX_USAGE_STATUS_PREFIX` (feeds the
+          // run-row usage chip — `RunsList`'s `UsageChip`, derived in the
+          // parent from the raw `events` state — not the transcript; fx's
+          // `usage_update` cadence is unspecified ("MAY"), so leaving this
+          // unsuppressed would spam a divider into the scrollback on every
+          // update), and `FX_PROVIDER_STATUS_PREFIX` (same story, one per
+          // turn — feeds `RunsList`'s `ProviderChip` via `providerByRunId`).
+          // Single shared predicate so a new sentinel can't leak
+          // into one surface while another suppresses it.
+          if (isInternalStatusSentinel(e.data)) return [];
           return [wrap(key, evid, <StatusDivider text={e.data} />)];
         case "stderr":
           return [wrap(key, evid, <ErrorBlock text={e.data} />)];
@@ -3988,6 +4120,8 @@ function RunEventList({
               planMarkdown={it.id === latestPlanPromptId ? latestPlanMarkdown : null}
             />
           );
+        case "fx_permission":
+          return <FxPermissionCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
       }
     };
 
@@ -5352,10 +5486,13 @@ function AgentSelect({
       className="h-6 text-[11px]"
     >
       {harnesses.map((h) => {
-        const available = agents.find((a) => a.harnessId === h.id)?.available ?? true;
+        const status = agents.find((a) => a.harnessId === h.id);
+        const available = status?.available ?? true;
+        const loggedOut = available && status?.loggedIn === false;
+        const suffix = !available ? " (unavailable)" : loggedOut ? " (not logged in)" : "";
         return (
           <option key={h.id} value={h.id}>
-            {h.label}{available ? "" : " (unavailable)"}
+            {h.label}{suffix}
           </option>
         );
       })}
@@ -5775,6 +5912,144 @@ function TmuxPromptCard({
             </Button>
           );
         })}
+      </div>
+      {error && (
+        <p className="mt-2 text-right text-[11px] text-destructive">{error}</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Card for fx's ACP `session/request_permission` — the ACP-native analog
+ * of `TmuxPromptCard` above, but a real in-process RPC awaiter rather than
+ * a scraped tmux pane: resolving the interaction (via `answerFxPermission`)
+ * directly unblocks fx's turn, so there's no keystroke leg and no
+ * "already resolved" scraper race to guard against beyond the ordinary
+ * network-failure retry.
+ *
+ * Shares `AskQuestionsCard`'s card shell (border-primary/ring-primary — a
+ * permission gate is closer in weight to a question than a paused-pane
+ * warning). Option buttons render fx's own `name`s verbatim: fx documents
+ * session-scoped approvals ("Allow for this session") beyond ACP's four
+ * canonical `PermissionOptionKind`s, so hardcoding a fixed label set would
+ * misrender those.
+ */
+// Sentinel `submitting` key for the unconditional Dismiss button — distinct
+// from any real `optionId` fx could offer, so the two paths' "Sending…"/
+// "Dismissing…" labels stay independently addressable.
+const FX_DISMISS_SUBMIT_KEY = "__fx_dismiss__";
+
+function FxPermissionCard({
+  req,
+  onResolved,
+}: {
+  req: Extract<PendingInteraction, { kind: "fx_permission" }>;
+  onResolved: (id: string) => void;
+}) {
+  const [submitting, setSubmitting] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // `{ ok: false }` (HTTP 200) means the request was already resolved
+  // server-side — a sibling `answer`/`cancel` call won the race — so the
+  // card should just go away, not show an error. Mirrors `TmuxPromptCard.
+  // send`'s rationale exactly: neither handler branches on the response
+  // body's `ok` value, since a non-throwing call means the server has
+  // already settled this interaction one way or another; only a genuine
+  // delivery failure (410/500, thrown by `api.*`) falls into the catch
+  // below and surfaces an error.
+  const choose = async (optionId: string) => {
+    if (submitting) return;
+    setSubmitting(optionId);
+    setError(null);
+    try {
+      await api.answerFxPermission(req.id, { optionId });
+      onResolved(req.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to send the answer.");
+    } finally {
+      setSubmitting(null);
+    }
+  };
+
+  // Unconditional deny path, independent of whatever options fx offered —
+  // answers the request `cancelled`.
+  const dismiss = async () => {
+    if (submitting) return;
+    setSubmitting(FX_DISMISS_SUBMIT_KEY);
+    setError(null);
+    try {
+      await api.answerFxPermission(req.id, { cancel: true });
+      onResolved(req.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to dismiss.");
+    } finally {
+      setSubmitting(null);
+    }
+  };
+
+  const title = req.toolCall.title || req.toolCall.kind || "tool call";
+
+  return (
+    <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary">
+          <ShieldAlert className="size-3.5" aria-hidden /> Fx is requesting permission
+        </span>
+        {/* The agetor mode (`auto`/`ask`) that caused this to surface as a
+         *  card — `yolo` auto-allows and never reaches here, so an auto-mode
+         *  user seeing this badge knows fx's own LLM review escalated the
+         *  call rather than agetor's mode gating it. */}
+        <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground">
+          {req.mode}
+        </Badge>
+      </div>
+      <div className="rounded-md border border-border/40 bg-muted/20 p-2">
+        <div className="flex items-center gap-1.5 text-[12px] font-medium">
+          <span className="truncate">{title}</span>
+          {req.toolCall.kind && (
+            <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground">
+              {req.toolCall.kind}
+            </Badge>
+          )}
+        </div>
+        {req.toolCall.rawInput !== undefined && (
+          <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-1.5 font-mono text-[10px] leading-snug text-muted-foreground">
+            {typeof req.toolCall.rawInput === "string"
+              ? req.toolCall.rawInput
+              : JSON.stringify(req.toolCall.rawInput, null, 2)}
+          </pre>
+        )}
+      </div>
+      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        {/* Defensive only — the driver guards against fx sending a request
+         *  with zero options — but if it ever happens, Dismiss is the only
+         *  affordance the card offers. */}
+        {req.options.length === 0 && (
+          <p className="mr-auto text-[11px] text-muted-foreground">fx offered no options</p>
+        )}
+        {req.options.map((opt) => {
+          const isReject = opt.kind?.startsWith("reject") ?? false;
+          return (
+            <Button
+              key={opt.optionId}
+              onClick={() => void choose(opt.optionId)}
+              size="sm"
+              variant={isReject ? "outline" : "default"}
+              disabled={submitting !== null}
+            >
+              {submitting === opt.optionId ? "Sending…" : opt.name}
+            </Button>
+          );
+        })}
+        <Button
+          onClick={() => void dismiss()}
+          size="sm"
+          variant="outline"
+          disabled={submitting !== null}
+        >
+          {submitting === FX_DISMISS_SUBMIT_KEY ? "Dismissing…" : "Dismiss (reject)"}
+        </Button>
       </div>
       {error && (
         <p className="mt-2 text-right text-[11px] text-destructive">{error}</p>

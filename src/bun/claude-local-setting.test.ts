@@ -416,6 +416,7 @@ async function makeClaudeTaskWithRun(model: string, effort: string | null) {
     codexSessionId: null,
     cursorSessionId: null,
     geminiSessionId: null,
+    fxSessionId: null,
   });
   return task;
 }
@@ -795,6 +796,7 @@ test("applyClaudeLocalSetting appends a 'synced from claude' status breadcrumb t
     codexSessionId: null,
     cursorSessionId: null,
     geminiSessionId: null,
+    fxSessionId: null,
   });
 
   const changed = applyClaudeLocalSetting(task.id, {

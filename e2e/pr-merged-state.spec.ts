@@ -196,7 +196,7 @@ function auxiliaryRoutes(): StubRoute[] {
 /** Opens the Git dialog (board toolbar button, aria-label "Git") and returns
  *  its `role="dialog"` locator once rendered. */
 async function openGitDialog(page: Page) {
-  await page.getByRole("button", { name: "Git" }).click();
+  await page.getByRole("button", { name: "Git", exact: true }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
   return dialog;

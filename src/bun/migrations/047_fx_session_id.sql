@@ -1,0 +1,11 @@
+-- fx session parity: persist fx.sh's own conversation/session id so a
+-- follow-up turn can resume it via ACP `session/resume` (falling back to
+-- `session/load`). Unlike the tmux-hosted kinds there is NO mid-turn
+-- reattach after an agetor restart — fx is driven over ACP/stdio and its
+-- pipes die with the process, so a mid-turn restart orphans the run by
+-- design (see fx-acp.ts). Mirrors `cursor_session_id` (migration 033) /
+-- `gemini_session_id` (migration 036) / `codex_session_id` (migration 021) /
+-- `claude_session_id` (migration 009) but is a distinct namespace — none of
+-- the session id columns are interchangeable. NULL for every other agent's
+-- runs and pre-migration rows.
+ALTER TABLE runs ADD COLUMN fx_session_id TEXT;

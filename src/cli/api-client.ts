@@ -176,6 +176,12 @@ export class AgetorClient {
   ): Promise<{ ok: boolean; error?: string }> {
     return this.req("POST", `/tmux-prompts/${id}/answer`, body);
   }
+  answerFxPermission(
+    id: string,
+    body: { optionId: string } | { cancel: true },
+  ): Promise<{ ok: boolean }> {
+    return this.req("POST", `/fx-permissions/${id}/answer`, body);
+  }
 
   // ── projects ───────────────────────────────────────────────────────────────
   listProjects(): Promise<Project[]> {

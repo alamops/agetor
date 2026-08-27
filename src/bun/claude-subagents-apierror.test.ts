@@ -92,7 +92,7 @@ async function seed() {
   });
   runs.insert({
     id: runId, taskId, agent: "claude-code", status: "succeeded", startedAt: now,
-    endedAt: now, exitCode: 0, tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null,
+    endedAt: now, exitCode: 0, tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
   });
 
   const sessionId = randomUUID();

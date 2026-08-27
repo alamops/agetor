@@ -258,6 +258,7 @@ test("reconcileTaskSession: a withheld /model mirror leaves a '\u26a0\ufe0f mode
     codexSessionId: null,
     cursorSessionId: null,
     geminiSessionId: null,
+    fxSessionId: null,
   });
 
   const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
@@ -327,6 +328,7 @@ test("reconcileTaskSession: a withheld /plan mirror leaves a '\u26a0\ufe0f plan 
     codexSessionId: null,
     cursorSessionId: null,
     geminiSessionId: null,
+    fxSessionId: null,
   });
 
   const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
@@ -774,6 +776,7 @@ test("reconcileTaskSession: a model id the picker can't select exactly (opus-4.8
     codexSessionId: null,
     cursorSessionId: null,
     geminiSessionId: null,
+    fxSessionId: null,
   });
 
   try {
@@ -837,6 +840,7 @@ test("reconcileTaskSession: model mirror poll timeout when the picker never rend
     codexSessionId: null,
     cursorSessionId: null,
     geminiSessionId: null,
+    fxSessionId: null,
   });
 
   const prevSettle = claudeTmux.__forTest.setSlashCommandSettleMs(0);
@@ -911,6 +915,7 @@ test("reconcileTaskSession: model mirror closes the picker with Escape when the 
     codexSessionId: null,
     cursorSessionId: null,
     geminiSessionId: null,
+    fxSessionId: null,
   });
 
   const prevSettle = claudeTmux.__forTest.setSlashCommandSettleMs(0);
@@ -986,6 +991,7 @@ test("reconcileTaskSession: an effort change is never mirrored into the live ses
     codexSessionId: null,
     cursorSessionId: null,
     geminiSessionId: null,
+    fxSessionId: null,
   });
 
   try {
@@ -1051,6 +1057,7 @@ test("reconcileTaskSession: effort breadcrumb falls back to before.effort when t
     codexSessionId: null,
     cursorSessionId: null,
     geminiSessionId: null,
+    fxSessionId: null,
   });
 
   try {
@@ -1116,6 +1123,7 @@ test("reconcileTaskSession: a model change with NO in-memory session state (even
     codexSessionId: null,
     cursorSessionId: null,
     geminiSessionId: null,
+    fxSessionId: null,
   });
 
   try {

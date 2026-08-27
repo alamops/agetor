@@ -341,7 +341,7 @@ test("runs.lastEventData returns the most recently appended MAIN-stream event's 
     tmuxSession: null,
     claudeSessionId: null,
     codexSessionId: null,
-    cursorSessionId: null, geminiSessionId: null,
+    cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
   });
 
   try {

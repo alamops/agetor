@@ -116,7 +116,7 @@ function makeRun(taskId: string): string {
     claudeSessionId: null,
     codexSessionId: null,
     cursorSessionId: null,
-    geminiSessionId: null,
+    geminiSessionId: null, fxSessionId: null,
   });
   return runId;
 }

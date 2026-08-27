@@ -18,9 +18,10 @@ const {
   CLAUDE_PROMPT_ARGV_MAX_BYTES,
   GEMINI_PROMPT_ARGV_MAX_BYTES,
   isValidEnvKey,
-  toTerminalAppleScript,
-  claudeModelPickerFamily,
+  toTerminalAppleScript,  claudeModelPickerFamily,
+  spawnAgent,
 } = await import("./agents.ts");
+const { dataDir } = await import("./db.ts");
 
 beforeEach(() => {
   // Force the literal "claude" / "codex" names in argv. Production
@@ -32,10 +33,13 @@ beforeEach(() => {
   process.env.AGETOR_CODEX_BIN = "codex";
   process.env.AGETOR_CURSOR_BIN = "cursor-agent";
   process.env.AGETOR_GEMINI_BIN = "gemini";
+  process.env.AGETOR_FX_BIN = "fx";
   delete process.env.AGETOR_CLAUDE_ARGS;
   delete process.env.AGETOR_CODEX_ARGS;
   delete process.env.AGETOR_CURSOR_ARGS;
   delete process.env.AGETOR_GEMINI_ARGS;
+  delete process.env.AGETOR_FX_ARGS;
+  delete process.env.AGETOR_FX_DRIVER;
 });
 
 /** Build a built-in harness for tests — kind doubles as id, no overrides. */
@@ -77,6 +81,10 @@ const cursorDefaults = { mode: "auto", model: "cursor-grok-4.6", effort: "high" 
 // Gemini has no effort flag at all (see MODEL_EFFORT_SUPPORT.gemini in
 // shared/types.ts) — buildCommand's gemini branch never reads opts.effort.
 const geminiDefaults = { mode: "auto", model: "gemini-3-pro-preview" } as const;
+// fx has no effort flag either (silently ignored, mirrors gemini) but,
+// unlike every other kind, buildCommand also requires `runId` (used to build
+// the deterministic --log-file path) — see the throw tests below.
+const fxDefaults = { mode: "auto", model: "fx-default", runId: "run-fx-1" } as const;
 
 test("aliased claude-code with a config-dir override emits CLAUDE_CONFIG_DIR (not HOME)", () => {
   // HOME is deliberately not overridden — see harnessEnv: re-homing breaks
@@ -878,6 +886,128 @@ test("aliased gemini with a home override emits GEMINI_CLI_HOME (not HOME)", () 
   );
   expect(result.env?.GEMINI_CLI_HOME).toBe("/tmp/agetor-test/gemini-2");
   expect(result.env?.HOME).toBeUndefined();
+});
+
+// --- fx -----------------------------------------------------------------
+// fx — driven over ACP/stdio (fx-acp.ts), never tmux. The prompt rides over
+// the ACP session/prompt call, not argv, so there's no argv-size budget to
+// enforce here (unlike claude/gemini). Mode rides as an env var
+// (FX_PERMISSION_MODE), not an argv flag; effort is silently ignored (no
+// per-invocation effort knob, mirrors gemini's silent-ignore); model has no
+// translation table (unlike claude) — every id, known or not, rides verbatim.
+
+test("fx with defaults emits acp --model <id> --log-file <dataDir>/fx-logs/<runId>.log", () => {
+  const { cmd } = buildCommand(builtin("fx"), "hi", { ...fxDefaults });
+  expect(cmd).toEqual([
+    "fx",
+    "acp",
+    "--model", "fx-default",
+    "--log-file", path.join(dataDir, "fx-logs", "run-fx-1.log"),
+  ]);
+});
+
+test("fx model id passes through verbatim — no translation table, unlike claude", () => {
+  const { cmd } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, model: "anthropic/claude-opus-5" });
+  const i = cmd.indexOf("--model");
+  expect(i).toBeGreaterThan(-1);
+  expect(cmd[i + 1]).toBe("anthropic/claude-opus-5");
+});
+
+test.each(["auto", "ask", "yolo"])(
+  "fx mode '%s' maps straight through to FX_PERMISSION_MODE env (no translation table)",
+  (mode) => {
+    const { env } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, mode });
+    expect(env?.FX_PERMISSION_MODE).toBe(mode);
+  },
+);
+
+test("fx null mode defaults to FX_PERMISSION_MODE=auto, house convention", () => {
+  const { env } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, mode: null });
+  expect(env?.FX_PERMISSION_MODE).toBe("auto");
+});
+
+test("fx unknown mode id passes through verbatim to FX_PERMISSION_MODE", () => {
+  const { env } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, mode: "some-future-mode" });
+  expect(env?.FX_PERMISSION_MODE).toBe("some-future-mode");
+});
+
+test("fx ignores effort — no effort-shaped flag in argv, no effort env var, regardless of value", () => {
+  const { cmd, env } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, effort: "max" });
+  expect(cmd.join(" ")).not.toMatch(/effort/i);
+  expect(env?.CLAUDE_CODE_EFFORT_LEVEL).toBeUndefined();
+});
+
+test("fx throws when model is missing", () => {
+  expect(() =>
+    buildCommand(builtin("fx"), "hi", { mode: "auto", runId: "run-fx-1" }),
+  ).toThrow(/model is required for fx/);
+});
+
+test("fx throws when runId is missing", () => {
+  expect(() =>
+    buildCommand(builtin("fx"), "hi", { mode: "auto", model: "fx-default" }),
+  ).toThrow(/runId is required for fx/);
+});
+
+test("AGETOR_FX_BIN override is respected for the built-in fx harness", () => {
+  process.env.AGETOR_FX_BIN = "/env-fallback/fx";
+  expect(buildCommand(builtin("fx"), "hi", { ...fxDefaults }).cmd[0]).toBe("/env-fallback/fx");
+});
+
+test("AGETOR_FX_ARGS extra args land at the end of argv, after --log-file", () => {
+  process.env.AGETOR_FX_ARGS = "--verbose --foo";
+  const { cmd } = buildCommand(builtin("fx"), "hi", { ...fxDefaults });
+  expect(cmd.slice(-2)).toEqual(["--verbose", "--foo"]);
+});
+
+test("aliased fx with a home override emits HOME (no dedicated fx config-dir env var, mirrors cursor)", () => {
+  const result = buildCommand(
+    alias("fx", { home: "/tmp/agetor-test/fx-2" }),
+    "hi",
+    { ...fxDefaults },
+  );
+  expect(result.env?.HOME).toBe("/tmp/agetor-test/fx-2");
+});
+
+test("fx harness without a home override sets no HOME (env carries only FX_PERMISSION_MODE)", () => {
+  const result = buildCommand(builtin("fx"), "hi", { ...fxDefaults });
+  expect(result.env?.HOME).toBeUndefined();
+  expect(result.env?.FX_PERMISSION_MODE).toBe("auto");
+});
+
+test("fx AGETOR_FX_DRIVER=fake yields a fake handle and fires onSessionId with fake-fx-session-<taskId>", () => {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  let sessionId: string | undefined;
+  const handle = spawnAgent({
+    taskId: "task-fx-1",
+    runId: "run-fx-1",
+    harness: builtin("fx"),
+    prompt: "hi",
+    cwd: "/tmp",
+    onChunk: () => {},
+    onSessionId: (id) => { sessionId = id; },
+    opts: { ...fxDefaults },
+  });
+  expect(sessionId).toBe("fake-fx-session-task-fx-1");
+  expect(handle).toBeDefined();
+  expect(typeof handle.kill).toBe("function");
+  expect(typeof handle.writeInput).toBe("function");
+  handle.kill();
+});
+
+test("fx AGETOR_FX_DRIVER=fake still exercises buildCommand's validation (throws on missing model)", () => {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  expect(() =>
+    spawnAgent({
+      taskId: "task-fx-2",
+      runId: "run-fx-2",
+      harness: builtin("fx"),
+      prompt: "hi",
+      cwd: "/tmp",
+      onChunk: () => {},
+      opts: { mode: "auto" },
+    }),
+  ).toThrow(/model is required for fx/);
 });
 
 test("claude-code 'max' effort sets CLAUDE_CODE_EFFORT_LEVEL=max env", () => {
