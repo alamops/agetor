@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, ClipboardList, Code2, GitBranch, SlidersHorizontal } from "lucide-react";
+import { ChevronLeft, ChevronRight, ClipboardList, Code2, GitBranch, RefreshCw, SlidersHorizontal } from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension, type BranchNamingConfig } from "@/lib/api";
+import { mergeModelOptions } from "../../../shared/model-options.ts";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -13,6 +14,7 @@ import { taskTypeIcon } from "@/lib/task-type-icon";
 import { branchFieldState } from "@/lib/branch-field";
 import {
   AGENT_OPTIONS,
+  CATALOG_SCOPED_KINDS,
   CODE_PLAN_MODE,
   DEFAULT_BRANCH_CONFIG,
   DEFAULT_EFFORT,
@@ -90,9 +92,25 @@ interface Props {
   /** Registered harnesses — built-ins plus user aliases. The agent picker
    *  renders one button per harness. */
   harnesses: Harness[];
-  /** Models discovered from each agent's CLI at boot. Merged with the static
-   *  AGENT_OPTIONS list. */
+  /** Kind-level models discovered from each agent's CLI, refreshed by the
+   *  triggers documented on `onRefreshModels` below. Merged with the static
+   *  AGENT_OPTIONS list — used as the fallback when `harnessModels` has
+   *  nothing for the selected harness (e.g. an older daemon predating the
+   *  per-harness route). */
   agentModels: AgentModelMap;
+  /** Per-harness model catalog (keyed by harness id, not kind) — the
+   *  account-scoped fx picker needs this distinction, since a second `fx-2`
+   *  harness sees its own account's catalog rather than the built-in fx
+   *  harness's. Preferred over `agentModels` when it has an entry for the
+   *  selected harness. */
+  harnessModels: Record<string, { id: string; label?: string }[]>;
+  /** Force a fresh discovery probe — one harness (pass its id) or every
+   *  enabled harness (omit it) — then refetch both `agentModels` and
+   *  `harnessModels`. Also fires automatically on the `agent_models_changed`
+   *  SSE event, on window focus/visibility, and on a bounded 2s ready-retry
+   *  at boot; this prop backs the picker's manual ↻ button for "I just ran
+   *  fx login, check now". */
+  onRefreshModels: (harnessId?: string) => Promise<void>;
   /** Bumped by the onboarding checklist when it wants to draw attention to
    *  this panel (e.g. the "create your first task" step). On increment
    *  (never on mount, never while `undefined`) the panel expands if
@@ -101,7 +119,7 @@ interface Props {
   focusNonce?: number;
 }
 
-export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNonce }: Props) {
+export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
   // Collapsed = thin icon rail; the board's `flex-1` <main> takes the freed
   // width on its own. Seeded synchronously from localStorage (lazy initial
   // state) so a restart repaints in the state the user left it in — an async
@@ -248,6 +266,9 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
   const [effort, setEffort] = useState<string | null>(DEFAULT_EFFORT["claude-code"]);
   const [fast, setFast] = useState(false);
   const [maxMode, setMaxMode] = useState(false);
+  // Spins the Model label's ↻ button while a manual `onRefreshModels` probe
+  // is in flight for the currently-selected harness.
+  const [refreshingModels, setRefreshingModels] = useState(false);
   // Auto-select the default harness once it (and the harness list) loads.
   // We only force-switch when the *current* selection isn't valid for the
   // loaded list — so a user mid-edit doesn't get their pick stolen. The
@@ -409,18 +430,20 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
   // (all current claude models); other models would error at spawn. supportedModes
   // filters the dropdown so the user can't pick an incompatible combo.
   const modes = supportedModes(kind, model);
-  // Merge in any models the agent's CLI surfaced at boot. We dedup by id and
-  // append discovered-only entries after the curated list so the familiar
-  // labels stay on top. Discovered ids without a curated label fall through
-  // to their raw id as the visible label — better than hiding them.
-  const models = (() => {
-    const known = new Set(staticModels.map((m) => m.id));
-    const extras = (agentModels[kind] ?? [])
-      .filter((m) => !known.has(m.id))
-      .filter((m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id))
-      .map((m): typeof staticModels[number] => ({ id: m.id, label: m.label ?? m.id }));
-    return [...staticModels, ...extras];
-  })();
+  // Merge the curated list with whatever this harness's CLI catalog
+  // discovery surfaced, per the shared rules in `mergeModelOptions` (plan
+  // `fx-model-catalog-refresh.md` §3 D3). Prefer the per-harness catalog
+  // (keyed by harness id — distinguishes a second `fx-2` account from the
+  // built-in fx harness) over the kind-level map, which only exists as a
+  // fallback for an older daemon predating `GET /agent-models/harnesses`.
+  const discoveredForAgent = (harnessModels[agent] ?? agentModels[kind] ?? [])
+    .filter((m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id));
+  const models = mergeModelOptions({
+    curated: staticModels,
+    discovered: discoveredForAgent,
+    selected: model,
+    scoped: CATALOG_SCOPED_KINDS.has(kind),
+  });
   // Effort options depend on both kind and model — re-derived each render
   // so a model switch immediately narrows the dropdown. When the new model
   // doesn't accept any effort (Haiku 4.5), effort drops to `null` and the
@@ -937,14 +960,40 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
 
               <div className="grid grid-cols-2 gap-2">
                 <div className="min-w-0 space-y-1">
-                  <label className="text-muted-foreground">Model</label>
+                  <div className="flex items-center gap-1">
+                    <label className="text-muted-foreground">Model</label>
+                    <button
+                      type="button"
+                      title="Refresh model list"
+                      aria-label="Refresh model list"
+                      data-testid="refresh-models"
+                      disabled={refreshingModels}
+                      className={cn(
+                        "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
+                        refreshingModels && "animate-spin",
+                      )}
+                      onClick={async () => {
+                        setRefreshingModels(true);
+                        try {
+                          await onRefreshModels(agent);
+                        } catch {
+                          // The SSE / ready-retry paths also refetch — a
+                          // failed manual probe just leaves the list as-is.
+                        } finally {
+                          setRefreshingModels(false);
+                        }
+                      }}
+                    >
+                      <RefreshCw className="size-3" />
+                    </button>
+                  </div>
                   <Select
                     value={model}
                     onChange={(e) => setModel(e.target.value)}
                     className="h-8"
                   >
                     {models.map((m) => (
-                      <option key={m.id} value={m.id}>{m.label}</option>
+                      <option key={m.id} value={m.id} title={m.unlisted ? m.hint : undefined}>{m.label}</option>
                     ))}
                   </Select>
                 </div>

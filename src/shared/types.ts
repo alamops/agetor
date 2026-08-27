@@ -1236,6 +1236,16 @@ export interface AgentOption {
   label: string;
   /** One-line hint under the option in the picker. */
   hint?: string;
+  /**
+   * Offered only when the harness's CLI-discovered catalog positively
+   * contains this id — never on the discovery-empty fallback (unlike an
+   * ordinary curated row, which still shows when discovery has nothing).
+   * Used for fx's premium Gateway tiers, which a standard `fx login` team
+   * account can't run: the Gateway catalog is account-scoped — 230 ids
+   * unauthenticated vs 158 on a standard plan, measured 2026-08-27 on fx
+   * 0.0.6.
+   */
+  catalogOnly?: boolean;
 }
 
 export interface AgentOptions {
@@ -1284,16 +1294,33 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // for simple prompts, which fails "always default to the best available
   // model" (root CLAUDE.md). Pin an explicit flagship instead.
   "gemini": "gemini-3-pro-preview",
-  // fx's own compiled default since 0.0.6 — Kimi K3 (Fast mode on),
-  // following fx's own default rather than picking one ourselves. Ids are
-  // Vercel AI Gateway ids, passed verbatim. fx is exempt from the "always
-  // default to the best available model" rule above: the Gateway bills per
-  // token to the user's own account, and this tier is the tuned sweet spot
-  // for fx's agentic loop rather than a cost compromise — flagship tiers
-  // (gpt-5.5, claude-sonnet-5/opus-5, gemini-3.1-pro-preview) remain one
-  // click away in the picker.
-  "fx": "moonshotai/kimi-k3",
+  // Owner-chosen default (2026-08-27). fx's own compiled default is still
+  // moonshotai/kimi-k3 (verified via empty-HOME `fx status --json` on
+  // 0.0.6), but the Vercel AI Gateway catalog is account-scoped — K3 is
+  // absent from a standard `fx login` team account's 158-id catalog — so
+  // agetor pins the model fx actually runs on that account instead
+  // (`~/.fx/settings.json` on the reference account). Ids are Vercel AI
+  // Gateway ids, passed verbatim. fx is exempt from the "always default to
+  // the best available model" rule above: the Gateway bills per token to the
+  // user's own account, and flagship tiers (opus-5, sonnet-5, gpt-5.5,
+  // gemini-3.1-pro-preview, kimi-k3) stay one click away in the picker as
+  // catalog-gated rows — offered only when the signed-in account's catalog
+  // actually contains them (see `AgentOption.catalogOnly`).
+  "fx": "zai/glm-5.3-flash",
 };
+
+/**
+ * Kinds whose CLI-discovered model catalog depends on the signed-in account
+ * rather than being a fixed, harness-wide list. For these kinds the picker
+ * renders curated ∩ discovered (plus discovered-only extras) instead of the
+ * usual curated + discovered — see `mergeModelOptions` in
+ * `src/shared/model-options.ts` (added by a sibling task). fx is the only
+ * member today: the Vercel AI Gateway catalog `fx models --json` returns is
+ * scoped to whatever account `fx login` (or `AI_GATEWAY_API_KEY`) is signed
+ * into, so a curated row unconditionally offered here could be a model the
+ * signed-in account can't actually run.
+ */
+export const CATALOG_SCOPED_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["fx"]);
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
   "codex": "high",
@@ -1764,13 +1791,27 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // its models route through the Vercel AI Gateway verbatim with no CLI-level
   // knob to tune. Same treatment as gemini above.
   fx: {
-    "moonshotai/kimi-k3": [],
-    "moonshotai/kimi-k3-fast": [],
-    "zai/glm-5.2-fast": [],
+    "zai/glm-5.3-flash": [],
+    "zai/glm-5v-turbo": [],
+    "zai/glm-4.7": [],
+    "openai/gpt-5.2": [],
+    "openai/gpt-5.1-codex-max": [],
+    "openai/gpt-5.4-mini": [],
+    "spacexai/grok-4.6": [],
+    "spacexai/grok-build-0.1": [],
+    "moonshotai/kimi-k2.7-code": [],
+    "deepseek/deepseek-v4-flash": [],
+    "minimax/minimax-m3": [],
+    "alibaba/qwen3.8-flash": [],
+    "alibaba/qwen3-coder-plus": [],
+    "mistral/devstral-2": [],
+    "google/gemini-2.5-flash": [],
+    "anthropic/claude-3-haiku": [],
     "anthropic/claude-opus-5": [],
     "anthropic/claude-sonnet-5": [],
     "openai/gpt-5.5": [],
     "google/gemini-3.1-pro-preview": [],
+    "moonshotai/kimi-k3": [],
   },
 };
 
@@ -1908,15 +1949,37 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     efforts: EFFORT_OPTIONS,
   },
   fx: {
-    // Vercel AI Gateway ids, passed verbatim.
+    // Vercel AI Gateway ids, passed verbatim. The standard (non-catalogOnly)
+    // rows are drawn from a standard-plan 158-id catalog (measured
+    // 2026-08-27 on fx 0.0.6); the catalogOnly rows below are drawn from the
+    // 230-id unauthenticated catalog and are absent from that 158-id
+    // account, so they're offered only when the signed-in account's own
+    // discovered catalog actually contains them (see
+    // `AgentOption.catalogOnly`, `CATALOG_SCOPED_KINDS`). Discovered-only ids
+    // (neither list) append via `mergeModelOptions`
+    // (`src/shared/model-options.ts`).
     models: [
-      { id: "moonshotai/kimi-k3", label: "Kimi K3", hint: "fx's compiled default since 0.0.6 — Fast mode." },
-      { id: "moonshotai/kimi-k3-fast", label: "Kimi K3 Fast", hint: "Fast variant of fx's default." },
-      { id: "zai/glm-5.2-fast", label: "GLM 5.2 Fast", hint: "Cheap, fast tier via the Gateway." },
-      { id: "anthropic/claude-opus-5", label: "Claude Opus 5", hint: "Anthropic's top tier via the Gateway." },
-      { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5", hint: "Anthropic's fast flagship via the Gateway." },
-      { id: "openai/gpt-5.5", label: "GPT-5.5", hint: "OpenAI flagship via the Gateway." },
-      { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", hint: "Google flagship via the Gateway." },
+      { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
+      { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
+      { id: "zai/glm-4.7", label: "GLM 4.7", hint: "200K context · 120K output, prior Z.AI flagship." },
+      { id: "openai/gpt-5.2", label: "GPT-5.2", hint: "400K context · 128K output — top OpenAI tier on a standard Gateway plan; openai/gpt-5.2-fast via discovery." },
+      { id: "openai/gpt-5.1-codex-max", label: "GPT-5.1 Codex Max", hint: "400K context · 128K output, codex-tuned." },
+      { id: "openai/gpt-5.4-mini", label: "GPT-5.4 Mini", hint: "400K context · 128K output, newest-gen small model." },
+      { id: "spacexai/grok-4.6", label: "Grok 4.6", hint: "500K context · 500K output." },
+      { id: "spacexai/grok-build-0.1", label: "Grok Build 0.1", hint: "256K context · 256K output, xAI's coding-agent model." },
+      { id: "moonshotai/kimi-k2.7-code", label: "Kimi K2.7 Code", hint: "256K context · 32K output — nearest available successor to fx's compiled default (K3)." },
+      { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash", hint: "1M context · 384K output." },
+      { id: "minimax/minimax-m3", label: "MiniMax M3", hint: "1M context · 1M output." },
+      { id: "alibaba/qwen3.8-flash", label: "Qwen 3.8 Flash", hint: "991K context · 128K output." },
+      { id: "alibaba/qwen3-coder-plus", label: "Qwen3 Coder Plus", hint: "1M context · 65K output, coding-tuned." },
+      { id: "mistral/devstral-2", label: "Devstral 2", hint: "256K context · 256K output, coding-tuned." },
+      { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "1M context · 65K output." },
+      { id: "anthropic/claude-3-haiku", label: "Claude 3 Haiku", hint: "200K context · 4K output — the only Anthropic id a standard Gateway plan exposes." },
+      { id: "anthropic/claude-opus-5", label: "Claude Opus 5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-5.5", label: "GPT-5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "moonshotai/kimi-k3", label: "Kimi K3", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [
       { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; anything unresolved surfaces as an approval card." },
@@ -2819,6 +2882,9 @@ export type GlobalEvent =
  *   harness_usage — the background usage poller (or a force-refresh) produced
  *                  a fresh `HarnessQuota` snapshot for one harness. Webview
  *                  updates that harness's topbar chip in place.
+ *   agent_models_changed — the model-discovery scheduler re-probed one or
+ *                  more harnesses' CLI model catalogs and at least one list
+ *                  changed. Webview refetches `GET /agent-models/harnesses`.
  */
 export type AppEvent =
   | {
@@ -2835,6 +2901,11 @@ export type AppEvent =
   | {
       type: "harness_usage";
       quota: HarnessQuota;
+      ts: number;
+    }
+  | {
+      type: "agent_models_changed";
+      harnessIds: string[];
       ts: number;
     };
 

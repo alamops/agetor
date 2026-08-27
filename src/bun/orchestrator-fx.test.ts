@@ -82,7 +82,7 @@ async function settle(ms = 80) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
-test("createTask (fx) defaults model to moonshotai/kimi-k3, no effort, and lands in backlog", async () => {
+test("createTask (fx) defaults model to zai/glm-5.3-flash, no effort, and lands in backlog", async () => {
   const { createTask } = await import("./orchestrator.ts");
 
   const created = await createTask({
@@ -96,7 +96,7 @@ test("createTask (fx) defaults model to moonshotai/kimi-k3, no effort, and lands
   if ("error" in created) throw new Error(created.error);
 
   expect(created.task.agent).toBe("fx");
-  expect(created.task.model).toBe("moonshotai/kimi-k3");
+  expect(created.task.model).toBe("zai/glm-5.3-flash");
   // fx has no per-invocation effort flag — every model in MODEL_EFFORT_SUPPORT.fx
   // reports an empty supported-effort list, so createTask leaves effort null
   // rather than defaulting it (see orchestrator.ts's createTask default logic).
@@ -463,7 +463,7 @@ test("reconcileTaskSession drops the fx session and resets mode to the new kind'
     id: "fx-switch-away",
     agent: "fx",
     mode: "yolo", // valid for fx, invalid for gemini
-    model: "zai/glm-5.2-fast",
+    model: "zai/glm-4.7",
     effort: null,
   });
   tasks.insert(before);
@@ -516,7 +516,7 @@ test("reconcileTaskSession preserves mode/model/effort on a same-kind fx alias s
     id: "fx-same-kind",
     agent: "fx",
     mode: "yolo",
-    model: "openai/gpt-5.5",
+    model: "openai/gpt-5.2",
     effort: null,
   });
   tasks.insert(before);
@@ -527,7 +527,7 @@ test("reconcileTaskSession preserves mode/model/effort on a same-kind fx alias s
   const updated = tasks.get(before.id)!;
   // Same kind -> ids stay valid -> keep the picks.
   expect(updated.mode).toBe("yolo");
-  expect(updated.model).toBe("openai/gpt-5.5");
+  expect(updated.model).toBe("openai/gpt-5.2");
 });
 
 test("reconcileOrphans has no reattach path for fx: a mid-boot running fx run always flips to orphaned, task back to ready", async () => {

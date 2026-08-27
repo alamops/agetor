@@ -21,7 +21,7 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { api, type AgentModelMap } from "@/lib/api";
+import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
@@ -214,6 +214,13 @@ function AppInner() {
   // distinction) apart from "loaded, and it happens to be empty".
   const [harnessesLoaded, setHarnessesLoaded] = useState(false);
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
+  // Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`.
+  // `discoveryReady` mirrors the daemon's boot discovery sweep: false until
+  // the first `GET /agent-models/harnesses` reports `ready: true`, which is
+  // what the ready-retry effect below polls for (closes the boot race where
+  // the webview's first fetch can race the sweep's own first probe).
+  const [harnessModels, setHarnessModels] = useState<HarnessModelMap["byHarness"]>({});
+  const [discoveryReady, setDiscoveryReady] = useState(false);
   // Per-harness quota/usage snapshots for the topbar chip mini-bar + popover
   // (D2). Seeded once on boot via `getAllUsage`, kept current afterwards by
   // the `harness_usage` AppEvent (see the `subscribeAppEvents` handler
@@ -379,9 +386,53 @@ function AppInner() {
       setHarnessesLoaded(true);
     } catch { /* leave previous state */ }
   }, []);
+  // Last-serialized-form cache for `agentModels`/`harnessModels`, mirroring
+  // `taskReconcileCacheRef`'s rationale above: the ready-retry (every 2s
+  // until ready), the twice-per-refocus `onVisible`, and every SSE-triggered
+  // refetch would otherwise call `setAgentModels`/`setHarnessModels` with a
+  // brand-new object graph even when the fetched catalog is byte-identical
+  // to what's already rendered — re-rendering `NewTaskForm` and the whole
+  // `RunPanel` for nothing. A plain `JSON.stringify` compare is cheap at
+  // this scale (a handful of harnesses/kinds, once per poll).
+  const agentModelsJsonRef = useRef<string>(JSON.stringify({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] }));
+  const harnessModelsJsonRef = useRef<string>(JSON.stringify({}));
   const refreshAgentModels = useCallback(async () => {
-    try { setAgentModels(await api.listAgentModels()); } catch { /* leave previous state */ }
+    try {
+      const map = await api.listAgentModels();
+      const json = JSON.stringify(map);
+      if (json !== agentModelsJsonRef.current) {
+        agentModelsJsonRef.current = json;
+        setAgentModels(map);
+      }
+    } catch { /* leave previous state */ }
   }, []);
+  /** Refetch the per-harness catalog. Errors (including a 404 from an old
+   *  daemon that predates this route) are swallowed and leave state as-is —
+   *  `discoveryReady` simply never flips true, and the bounded ready-retry
+   *  effect below gives up after 30 attempts, at which point every picker
+   *  just falls back to `agentModels`' kind-level list (today's behavior).
+   *  Returns the fetched `ready` boolean (or `false` on failure) so the
+   *  ready-retry effect can read the *fresh* value instead of a stale
+   *  closure over `discoveryReady` state — see that effect's comment. */
+  const refreshHarnessModels = useCallback(async (): Promise<boolean> => {
+    try {
+      const map = await api.listHarnessModels();
+      const json = JSON.stringify(map.byHarness);
+      if (json !== harnessModelsJsonRef.current) {
+        harnessModelsJsonRef.current = json;
+        setHarnessModels(map.byHarness);
+      }
+      setDiscoveryReady(map.ready);
+      return map.ready;
+    } catch { /* leave previous state */ return false; }
+  }, []);
+  /** Manual ↻ in a model picker: force a fresh discovery probe (one harness,
+   *  or every enabled harness when omitted), then refetch both maps so the
+   *  picker reflects it immediately rather than waiting on SSE. */
+  const onRefreshModels = useCallback(async (harnessId?: string) => {
+    await api.refreshAgentModels(harnessId);
+    await Promise.all([refreshAgentModels(), refreshHarnessModels()]);
+  }, [refreshAgentModels, refreshHarnessModels]);
   // Per-project serialized-form cache for `reconcileById` below, mirroring
   // `taskReconcileCacheRef` — keeps `projects` referentially stable across
   // polls where nothing actually changed.
@@ -405,6 +456,7 @@ function AppInner() {
     void refresh();
     void refreshAgents();
     void refreshAgentModels();
+    void refreshHarnessModels();
     void refreshProjects();
     // Seed the topbar usage tracker with whatever the Bun side last
     // persisted, so chips show a meter immediately on boot rather than
@@ -458,6 +510,12 @@ function AppInner() {
       void refresh();
       void refreshProjects();
       void refreshAgents();
+      // fx login (and any other harness auth flow) often happens in a
+      // separate window/terminal — returning focus to agetor should reflect
+      // whatever the account's catalog looks like now, not whatever it was
+      // when the window last had focus.
+      void refreshAgentModels();
+      void refreshHarnessModels();
     };
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onVisible);
@@ -468,7 +526,47 @@ function AppInner() {
       window.removeEventListener("focus", onVisible);
       if (defaultsTimer) clearTimeout(defaultsTimer);
     };
-  }, [refresh, refreshAgents, refreshAgentModels, refreshProjects]);
+  }, [refresh, refreshAgents, refreshAgentModels, refreshHarnessModels, refreshProjects]);
+
+  // Ready-retry for the per-harness discovery sweep: while the daemon's
+  // boot sweep hasn't resolved yet (`discoveryReady === false`), re-poll
+  // `GET /agent-models/harnesses` every 2s so the picker picks up the
+  // catalog the moment the sweep finishes, without waiting on the SSE
+  // connection or a poll tick. Capped at 30 attempts (60s) so an old daemon
+  // that predates the `/agent-models/harnesses` route (which never reports
+  // `ready: true`) can't spin the retry forever — every picker just falls
+  // back to `agentModels`' kind-level list once the cap is hit, matching
+  // pre-discovery behavior.
+  //
+  // The stop condition reads the value `refreshHarnessModels` just fetched
+  // (its resolved `ready`), not `discoveryReady` state read from this
+  // closure — that state was always `false` at the moment this effect ran
+  // (a `true` value makes the effect return above before ever scheduling a
+  // tick), so a stale in-closure read could never observe the flip to
+  // `true`. What actually stops the loop when the sweep finishes is React
+  // re-running this effect (since `discoveryReady` is a dep) and its
+  // cleanup clearing the pending timer; checking the fresh return value
+  // here is a same-tick belt-and-suspenders stop, not the primary
+  // mechanism.
+  useEffect(() => {
+    if (discoveryReady) return;
+    let cancelled = false;
+    let attempts = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tick = () => {
+      if (cancelled) return;
+      attempts += 1;
+      void refreshHarnessModels().then((ready) => {
+        if (cancelled || ready || attempts >= 30) return;
+        timer = setTimeout(tick, 2_000);
+      });
+    };
+    timer = setTimeout(tick, 2_000);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [discoveryReady, refreshHarnessModels]);
 
   // Suppress WebKit's native right-click menu everywhere except editable
   // text, the xterm terminal, and while read-only text is selected (owner
@@ -593,6 +691,14 @@ function AppInner() {
         setUsage((prev) => ({ ...prev, [ev.quota.harnessId]: ev.quota }));
         return;
       }
+      if (ev.type === "agent_models_changed") {
+        // The model-discovery scheduler re-probed one or more harnesses and
+        // at least one catalog changed — refetch both the kind-level and
+        // per-harness maps so every open picker reflects it live.
+        void refreshAgentModels();
+        void refreshHarnessModels();
+        return;
+      }
       if (ev.type === "open_task") {
         // A native notification deep-link (`agetor://task/<id>`) was
         // clicked. Open that task's RunPanel, fetching a fresh task list
@@ -651,7 +757,7 @@ function AppInner() {
       });
     });
     return cancel;
-  }, [confirm]);
+  }, [confirm, refreshAgentModels, refreshHarnessModels]);
 
   // App-wide lifecycle subscription. Drives toasts + native notifications.
   useEffect(() => {
@@ -1344,6 +1450,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           agents={agents}
           harnesses={harnesses}
           agentModels={agentModels}
+          harnessModels={harnessModels}
+          onRefreshModels={onRefreshModels}
           focusNonce={newTaskFocusNonce}
           onSubmit={async (input, { start }) => {
             try {
@@ -1482,6 +1590,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         agents={agents}
         harnesses={harnesses}
         agentModels={agentModels}
+        harnessModels={harnessModels}
+        onRefreshModels={onRefreshModels}
         homeDir={homeDir}
         onClose={() => setSelected(null)}
         onShowDiff={setDiffTask}

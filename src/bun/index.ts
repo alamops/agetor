@@ -8,7 +8,7 @@ import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZ
 import { pollAllUsage } from "./usage/poller.ts";
 import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
-import { refreshDiscoveredModels } from "./agent-discovery.ts";
+import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
 import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
@@ -167,10 +167,19 @@ setInterval(() => {
 
 installNativeMenu();
 
-// Best-effort: probe the agent CLIs for their model lists so the form can
-// surface anything new the user installed without an app update. Runs in the
-// background — we don't await it so a slow CLI never delays the API/window.
-void refreshDiscoveredModels();
+// Best-effort: probe the agent CLIs (and every enabled fx harness's own
+// account-scoped catalog) for their model lists so the form can surface
+// anything new the user installed — or logged into — without an app update.
+// Runs in the background — we don't await it so a slow CLI never delays the
+// API/window; the webview polls GET /agent-models/harnesses' `ready` flag
+// until this sweep lands, which is what closes the boot race
+// docs/plans/fx-model-catalog-refresh.md §2 reproduced (fx=0 for the first
+// ~1s after boot). `startPeriodicDiscovery` re-runs the sweep every 15
+// minutes (`.unref()`'d — never itself keeps the app alive) so catalog
+// drift (new models, revoked account access) is eventually noticed even
+// with no triggering event.
+void refreshAllModels();
+startPeriodicDiscovery();
 
 /**
  * Posts a task notification, deep-linking it to the task when possible.

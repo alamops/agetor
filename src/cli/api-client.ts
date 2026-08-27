@@ -242,8 +242,35 @@ export class AgetorClient {
     if (branch) params.set("branch", branch);
     return this.req("GET", `/agent-discovery?${params.toString()}`);
   }
-  agentModels(): Promise<Record<string, string[]>> {
+  /** Kind-level discovered model catalog (fx's row is the built-in fx
+   *  harness's list). The server's actual shape has always been
+   *  `{id, label?}[]` per kind — the prior `string[]` annotation here was
+   *  wrong, just never exercised since callers only ever read `.id`. */
+  agentModels(): Promise<Record<string, { id: string; label?: string }[]>> {
     return this.req("GET", "/agent-models");
+  }
+  /** Per-harness discovered model catalog — a key per *enabled* harness
+   *  (not just per kind), so a second fx harness with its own account sees
+   *  its own list. `ready` is false until the first full discovery sweep
+   *  has resolved at least once since boot. Falls back to the kind map
+   *  (via `.catch` at the call site) against an older daemon that hasn't
+   *  landed this route yet. */
+  harnessModels(): Promise<{
+    ready: boolean;
+    byHarness: Record<string, { id: string; label?: string }[]>;
+  }> {
+    return this.req("GET", "/agent-models/harnesses");
+  }
+  /** Force a fresh discovery sweep. Omit `harnessId` to refresh every
+   *  enabled harness; pass one to refresh just that harness (e.g. right
+   *  after `fx login`). Returns the same kind-keyed map as `agentModels()`
+   *  — byte-compatible with that route, so a refresh of a non-built-in fx
+   *  harness (e.g. `fx-2`) is NOT reflected in this response (the kind map
+   *  only ever carries the built-in fx harness's list). Callers that need
+   *  the per-harness view must call `harnessModels()` afterwards. */
+  refreshAgentModels(harnessId?: string): Promise<Record<string, { id: string; label?: string }[]>> {
+    const qs = harnessId ? `?harness=${encodeURIComponent(harnessId)}` : "";
+    return this.req("POST", `/agent-models${qs}`);
   }
 }
 

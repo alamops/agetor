@@ -144,7 +144,14 @@ import {
 } from "./github.ts";
 import { remoteHostsForDirs } from "./git-provider.ts";
 import * as gitHost from "./git-host.ts";
-import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
+import { getDiscoveredModels } from "./agent-discovery.ts";
+import {
+  refreshAllModels,
+  refreshHarnessModels,
+  noteHarnessRemoved,
+  getHarnessModelMap,
+  noteHarnessStatuses,
+} from "./model-discovery.ts";
 import { getMainWindow } from "./window.ts";
 import {
   answerFxPermission,
@@ -2883,11 +2890,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // with its own binary path + env so multi-account aliases report
       // their own status independently.
       "/harnesses": {
-        GET: authed(async (req) =>
-          json(
-            { harnesses: harnesses.list(), statuses: await checkAllHarnesses() },
+        GET: authed(async (req) => {
+          const statuses = await checkAllHarnesses();
+          // Fire-and-forget: feeds the transition detector (docs/plans/
+          // fx-model-catalog-refresh.md §3 D4) so an availability/login
+          // flip noticed by this poll (fx login, an install, a version
+          // bump) schedules a debounced model-catalog refresh without this
+          // request waiting on it — never throws, so it can't affect the
+          // response below either way.
+          noteHarnessStatuses(statuses);
+          return json(
+            { harnesses: harnesses.list(), statuses },
             { headers: corsHeaders(req) },
-          )),
+          );
+        }),
         POST: authed(async (req) => {
           const body = (await req.json().catch(() => ({}))) as {
             id?: unknown;
@@ -2958,6 +2974,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               bin,
               env,
             });
+            // A brand-new harness (fx or otherwise) has no discovered
+            // catalog yet — probe it now instead of waiting for the next
+            // periodic sweep. Fire-and-forget: never blocks the response,
+            // never throws (see model-discovery.ts's contract).
+            void refreshHarnessModels(created.id);
             return json(created, { headers: corsHeaders(req) });
           } catch (e) {
             return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
@@ -2996,6 +3017,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           if (typeof body.enabled === "boolean") {
             harnesses.setEnabled(req.params.id, body.enabled);
+            // Re-enabling a harness that was previously excluded from every
+            // discovery sweep (disabled harnesses are skipped — see
+            // model-discovery.ts's discoveryTargets) needs its own probe now
+            // rather than waiting up to 15 minutes for the periodic sweep.
+            // Disabling needs no such trigger: getHarnessModelMap already
+            // skips disabled harnesses, so it drops out of the picker
+            // immediately with no probe required.
+            if (body.enabled) void refreshHarnessModels(req.params.id);
           }
           if (!hasConfigPatch) {
             return json(harnesses.get(req.params.id), { headers: corsHeaders(req) });
@@ -3028,6 +3057,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           try {
             const updated = harnesses.update(req.params.id, patch);
+            // home/bin/env can each change which account's (or which
+            // binary's) catalog this harness resolves to — re-probe rather
+            // than let the picker show a stale list until the next periodic
+            // sweep. `refreshHarnessModels` → `resolveBin(harness)` (the
+            // same resolver every real fx spawn uses) is what makes a `bin`
+            // edit actually change what gets probed, not just what gets
+            // spawned.
+            void refreshHarnessModels(updated.id);
             return json(updated, { headers: corsHeaders(req) });
           } catch (e) {
             if (e instanceof HarnessBuiltinError) {
@@ -3039,6 +3076,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         DELETE: authed((req) => {
           try {
             harnesses.delete(req.params.id);
+            // Prunes the deleted harness out of the per-harness discovery
+            // cache and its transition-detector bookkeeping, then publishes
+            // once — cheaper than a full `refreshAllModels()` sweep (which
+            // used to be called here just to exercise its own
+            // pruning-by-absence logic in agent-discovery.ts's runRefresh;
+            // that path still exists as a backstop for any harness removal
+            // that doesn't route through this DELETE handler).
+            noteHarnessRemoved(req.params.id);
             return new Response(null, { status: 204, headers: corsHeaders(req) });
           } catch (e) {
             if (e instanceof HarnessInUseError) {
@@ -3238,7 +3283,29 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             { headers: corsHeaders(req) },
           )),
         POST: authed(async (req) => {
-          await refreshDiscoveredModels();
+          // Optional `?harness=<id>` refreshes just that one harness via the
+          // scheduler (cheaper than a full sweep for the common "I just
+          // fixed this one harness" case — fx login, a binary swap, …);
+          // omitted, it re-probes everything. Both branches await the
+          // refresh before responding, same as the unqualified form always
+          // has, so a caller reading this response sees the fresh list.
+          //
+          // The response body is ALWAYS the kind-keyed map below, byte-
+          // compatible with the unqualified POST/GET — including when
+          // `?harness=` names a non-built-in alias (e.g. a second fx
+          // account), whose per-harness catalog has no slot in this
+          // kind-keyed shape at all. To read that harness's own list after
+          // the refresh resolves, follow up with `GET /agent-models/harnesses`
+          // (keyed by harness id, not kind).
+          const harnessId = new URL(req.url).searchParams.get("harness");
+          if (harnessId) {
+            if (!harnesses.get(harnessId)) {
+              return json({ error: "unknown harness" }, { status: 404, headers: corsHeaders(req) });
+            }
+            await refreshHarnessModels(harnessId);
+          } else {
+            await refreshAllModels();
+          }
           return json(
             {
               "claude-code": getDiscoveredModels("claude-code"),
@@ -3250,6 +3317,22 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             { headers: corsHeaders(req) },
           );
         }),
+      },
+
+      // Harness-keyed sibling of GET /agent-models above: one key per
+      // *enabled* harness (all kinds), not per kind — an additional-account
+      // fx harness (its own `HOME` override) gets its own catalog here
+      // instead of being filtered against the built-in fx harness's list,
+      // which is what makes D3's account-scoped picker filtering (see
+      // docs/plans/fx-model-catalog-refresh.md) correct for multi-account
+      // setups. `ready` mirrors `isDiscoveryReady()` — false until the first
+      // boot sweep has fully settled, which is what lets the webview tell
+      // "discovery hasn't run yet" apart from "ran and found nothing" and
+      // closes the boot race the plan's §2 reproduced. GET /agent-models
+      // itself stays byte-compatible (kind-keyed) for the CLI and existing
+      // tests — this is strictly additive.
+      "/agent-models/harnesses": {
+        GET: authed((req) => json(getHarnessModelMap(), { headers: corsHeaders(req) })),
       },
 
       // Slash commands/skills (for the `/…` autocomplete) and MCP/skill/plugin

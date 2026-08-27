@@ -30,9 +30,22 @@ import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub"
  * project through the real `POST /projects` API. Shared across all three
  * tests below (`beforeAll`/`afterAll`, serial mode) rather than one repo per
  * test: the three scenarios are really three views of the *same* PR #42
- * over time (open -> merged), so a single registered project avoids the
- * "multiple projects registered, which one does the dialog auto-select"
- * question entirely — there is always exactly one.
+ * over time (open -> merged).
+ *
+ * `openGitDialog` explicitly selects this project in the dialog's Project
+ * combobox rather than relying on whatever the dialog defaults to: the
+ * worker-scoped `backend` fixture (e2e/fixtures.ts) is shared with every
+ * other spec file that lands in the same Playwright worker, and the
+ * dialog's no-prefill default (`App.tsx`'s `initialProjectPath` for the
+ * plain toolbar "Git" button) falls all the way through to `tasks[0]
+ * ?.workdir` — the most recently *created* task's workdir, irrespective of
+ * the `projects` table. `e2e/fx-interactions.spec.ts` creates and starts
+ * tasks with `workdir: tmpdir()`; when it runs in the same worker before
+ * this file, its last task becomes `tasks[0]` and the dialog opens on a
+ * synthetic, unregistered "T" project (`path.basename(tmpdir())` on macOS)
+ * instead of this repo. Pinning the project explicitly makes these tests
+ * pass regardless of what other specs sharing the worker have registered or
+ * created.
  *
  * The stub GitHub API (`e2e/github-stub.ts`) is started once on
  * `backend.githubStubPort` (the backend was launched with
@@ -193,12 +206,23 @@ function auxiliaryRoutes(): StubRoute[] {
   ];
 }
 
-/** Opens the Git dialog (board toolbar button, aria-label "Git") and returns
- *  its `role="dialog"` locator once rendered. */
+/** Opens the Git dialog (board toolbar button, aria-label "Git"), pins its
+ *  Project combobox to this spec's own repo (see the file header for why —
+ *  the dialog's default project isn't reliable when other specs share this
+ *  worker's backend), and returns the `role="dialog"` locator once rendered.
+ *  Selecting is skipped when `projectDir` is already the selected value, so
+ *  this is a no-op on a dialog that already defaulted correctly. */
 async function openGitDialog(page: Page) {
   await page.getByRole("button", { name: "Git", exact: true }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
+
+  const projectSelect = dialog.getByRole("combobox", { name: "Project" });
+  await expect(projectSelect).toBeVisible();
+  if ((await projectSelect.inputValue()) !== projectDir) {
+    await projectSelect.selectOption({ value: projectDir });
+  }
+
   return dialog;
 }
 

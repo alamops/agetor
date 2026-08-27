@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import {
   AGENT_OPTIONS,
+  CATALOG_SCOPED_KINDS,
   CODE_PLAN_MODE,
   DEFAULT_MODEL,
   FX_PROVIDER_STATUS_PREFIX,
@@ -30,7 +31,7 @@ test("isInternalStatusSentinel: false for a plain status line that merely mentio
 });
 
 test("isInternalStatusSentinel: false for plain transcript text", () => {
-  expect(isInternalStatusSentinel("started — worktree — agent=fx, model=zai/glm-5.2-fast, mode=auto")).toBe(false);
+  expect(isInternalStatusSentinel("started — worktree — agent=fx, model=zai/glm-5.3-flash, mode=auto")).toBe(false);
 });
 
 test("isInternalStatusSentinel: false for an empty string", () => {
@@ -94,12 +95,14 @@ test("every AGENT_OPTIONS model entry (all kinds) carries a non-empty hint", () 
   }
 });
 
-/* ── fx 0.0.6 model catalog invariants (docs/plans/fx-0.0.6-compat.md §3.1) ─ */
+/* ── fx model catalog invariants (docs/plans/fx-model-catalog-refresh.md §3) ─ */
 
-test("DEFAULT_MODEL.fx is moonshotai/kimi-k3 (fx's own compiled default since 0.0.6) and is present in AGENT_OPTIONS.fx.models", () => {
-  expect(DEFAULT_MODEL.fx).toBe("moonshotai/kimi-k3");
+test("DEFAULT_MODEL.fx is zai/glm-5.3-flash (owner-chosen, 2026-08-27) and is present in AGENT_OPTIONS.fx.models as a non-catalogOnly row", () => {
+  expect(DEFAULT_MODEL.fx).toBe("zai/glm-5.3-flash");
   const ids = AGENT_OPTIONS.fx.models.map((m) => m.id);
   expect(ids).toContain(DEFAULT_MODEL.fx);
+  const defaultRow = AGENT_OPTIONS.fx.models.find((m) => m.id === DEFAULT_MODEL.fx);
+  expect(defaultRow?.catalogOnly).toBeFalsy();
 });
 
 test("for every AgentKind, DEFAULT_MODEL[kind] is present in AGENT_OPTIONS[kind].models", () => {
@@ -126,10 +129,60 @@ test("MODEL_EFFORT_SUPPORT.fx reports no supported efforts for any model — fx 
   }
 });
 
-test("the stale, nonexistent fx model id google/gemini-3-pro is gone from both the catalog and the effort-support map", () => {
-  const catalogIds = AGENT_OPTIONS.fx.models.map((m) => m.id);
+test("none of the seven previously-curated fx ids survives as an unconditional row — each is either absent or catalogOnly — and the nonexistent google/gemini-3-pro id is gone entirely", () => {
+  const models = AGENT_OPTIONS.fx.models;
+  const byId = new Map(models.map((m) => [m.id, m]));
+  const previouslyCurated = [
+    "moonshotai/kimi-k3",
+    "moonshotai/kimi-k3-fast",
+    "zai/glm-5.2-fast",
+    "anthropic/claude-opus-5",
+    "anthropic/claude-sonnet-5",
+    "openai/gpt-5.5",
+    "google/gemini-3.1-pro-preview",
+  ];
+  for (const id of previouslyCurated) {
+    const row = byId.get(id);
+    if (row) expect(row.catalogOnly).toBe(true);
+    // else: absent from the catalog entirely — also acceptable.
+  }
+  const catalogIds = models.map((m) => m.id);
   expect(catalogIds).not.toContain("google/gemini-3-pro");
   expect(Object.keys(MODEL_EFFORT_SUPPORT.fx)).not.toContain("google/gemini-3-pro");
-  // The real replacement id is present instead.
-  expect(catalogIds).toContain("google/gemini-3.1-pro-preview");
+});
+
+test("exactly the five premium Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
+  const expectedCatalogOnly = new Set([
+    "anthropic/claude-opus-5",
+    "anthropic/claude-sonnet-5",
+    "openai/gpt-5.5",
+    "google/gemini-3.1-pro-preview",
+    "moonshotai/kimi-k3",
+  ]);
+  const actualCatalogOnly = new Set(
+    AGENT_OPTIONS.fx.models.filter((m) => m.catalogOnly).map((m) => m.id),
+  );
+  expect(actualCatalogOnly).toEqual(expectedCatalogOnly);
+
+  for (const kind of KINDS) {
+    if (kind === "fx") continue;
+    for (const model of AGENT_OPTIONS[kind].models) {
+      expect(model.catalogOnly).toBeFalsy();
+    }
+  }
+});
+
+test("AGENT_OPTIONS.fx.models has unique ids, unique labels, and every id matches provider/model shape", () => {
+  const ids = AGENT_OPTIONS.fx.models.map((m) => m.id);
+  const labels = AGENT_OPTIONS.fx.models.map((m) => m.label);
+  expect(new Set(ids).size).toBe(ids.length);
+  expect(new Set(labels).size).toBe(labels.length);
+  for (const id of ids) {
+    expect(id).toMatch(/^[a-z0-9.-]+\/[a-z0-9.-]+$/);
+  }
+});
+
+test("CATALOG_SCOPED_KINDS contains exactly fx", () => {
+  expect(CATALOG_SCOPED_KINDS.size).toBe(1);
+  expect(CATALOG_SCOPED_KINDS.has("fx")).toBe(true);
 });
