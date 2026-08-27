@@ -2054,9 +2054,7 @@ function RunPanelBody({
     const body = appendReferences(line, sendRefs);
     try {
       const res = await api.sendRunInput(resumableRunId, body);
-      if (!res.delivered) {
-        setSendHint(res.reason);
-      } else {
+      if (res.delivered) {
         setInput("");
         setSendRefs([]);
         // The composer is now empty — clear the persisted draft so it can't
@@ -2092,6 +2090,27 @@ function RunPanelBody({
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
         });
+      } else if (res.withheld && res.savedToBacklog) {
+        // Claude is showing a modal — the paste was withheld and the server
+        // already re-stashed this exact message into the task's backlog tray
+        // rather than lose it (orchestrator's `sendInput` / `handlePasteWithheld`).
+        // Clear the composer + persisted draft exactly like the delivered
+        // branch above: the text now lives in the tray, so leaving it here
+        // too would duplicate it on next send. Refresh the tray right away
+        // instead of waiting for the next 2s task poll, and toast the
+        // outcome — there's no run/turn here to carry a status line the way
+        // a mid-turn withhold would.
+        setInput("");
+        setSendRefs([]);
+        cancelDraftSaveTimer();
+        draftGenRef.current++;
+        lastSavedDraftRef.current = null;
+        draftPristineRef.current = false;
+        void api.clearTaskDraft(task.id).catch(() => {});
+        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        toast(res.reason);
+      } else {
+        setSendHint(res.reason);
       }
     } catch (e) {
       setSendHint(e instanceof Error ? e.message : String(e));
@@ -2153,9 +2172,7 @@ function RunPanelBody({
     const body = appendReferences(item.text, item.references);
     try {
       const res = await api.sendRunInput(resumableRunId, body);
-      if (!res.delivered) {
-        setSendHint(res.reason);
-      } else {
+      if (res.delivered) {
         try {
           const updated = await api.deleteBacklogItem(task.id, item.id);
           setBacklogItems(updated.backlog);
@@ -2173,6 +2190,19 @@ function RunPanelBody({
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
         });
+      } else if (res.withheld && res.savedToBacklog) {
+        // `item` was never deleted above (delivery failed), so it's still
+        // sitting in `backlogItems` — do NOT delete it here. The server's
+        // re-stash (`restashPasteWithheldText`, orchestrator.ts) now dedupes
+        // against the WHOLE backlog rather than just its most-recent item
+        // (finding #3, §10 re-review), so it recognizes `item`'s own text is
+        // already present and does NOT write a duplicate entry — no local
+        // filtering needed here any more. Just refetch and adopt whatever the
+        // server has.
+        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        toast(res.reason);
+      } else {
+        setSendHint(res.reason);
       }
     } catch (e) {
       setSendHint(e instanceof Error ? e.message : String(e));
@@ -2253,9 +2283,7 @@ function RunPanelBody({
     setSendHint(null);
     try {
       const res = await api.sendRunInput(resumableRunId, message);
-      if (!res.delivered) {
-        setSendHint(res.reason);
-      } else {
+      if (res.delivered) {
         setRebuilt(null);
         setRebuildNote(null);
         void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
@@ -2263,6 +2291,16 @@ function RunPanelBody({
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
         });
+      } else if (res.withheld && res.savedToBacklog) {
+        // Claude is showing a modal — the canned commit/push message was
+        // withheld and stashed into the backlog tray instead of being lost.
+        // Refresh the tray right away and toast the outcome; there's no
+        // run/turn here to carry a status line the way a mid-turn withhold
+        // would.
+        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        toast(res.reason);
+      } else {
+        setSendHint(res.reason);
       }
     } catch (e) {
       setSendHint(e instanceof Error ? e.message : String(e));
@@ -2313,14 +2351,7 @@ function RunPanelBody({
     setSendHint(null);
     try {
       const res = await api.sendRunInput(resumableRunId, prompt);
-      if (!res.delivered) {
-        setSendHint(res.reason);
-        // The button can be hidden by the time this resolves — archived,
-        // a subagent tab (dock-level), or the mergeability re-fetch clearing
-        // `prStatus` — any of which would make `sendHint` invisible, so
-        // toast to surface the failure regardless.
-        toast.error(res.reason);
-      } else {
+      if (res.delivered) {
         setRebuilt(null);
         setRebuildNote(null);
         void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
@@ -2331,6 +2362,21 @@ function RunPanelBody({
         if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
         setResolveConflictsSent(true);
         resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
+      } else if (res.withheld && res.savedToBacklog) {
+        // Claude is showing a modal — the merge/resolve-conflicts prompt was
+        // withheld and stashed into the backlog tray instead of being lost.
+        // Refresh the tray right away; toast (not toast.error — nothing
+        // failed, the message just landed somewhere other than the agent)
+        // since the button can be hidden by the time this resolves.
+        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        toast(res.reason);
+      } else {
+        setSendHint(res.reason);
+        // The button can be hidden by the time this resolves — archived,
+        // a subagent tab (dock-level), or the mergeability re-fetch clearing
+        // `prStatus` — any of which would make `sendHint` invisible, so
+        // toast to surface the failure regardless.
+        toast.error(res.reason);
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -2724,6 +2770,16 @@ function RunPanelBody({
                 plans={kind === "cursor" || kind === "claude-code" ? plans : NO_PLANS}
                 onOpenPlan={onOpenPlan}
                 agentKind={kind}
+                onAskAnswerWithheld={(reason) => {
+                  // Same informational framing as `send()`'s withheld branch
+                  // above: claude was showing some OTHER blocking modal when
+                  // the free-text ask-card answer tried to land as a
+                  // follow-up turn, so the server re-stashed it into the
+                  // backlog tray instead of losing it. Refresh the tray right
+                  // away and toast (not toast.error — nothing failed).
+                  toast(reason);
+                  void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+                }}
               />
             </>
           )}
@@ -3641,6 +3697,7 @@ function RunEventList({
   plans = [],
   onOpenPlan,
   agentKind,
+  onAskAnswerWithheld,
 }: {
   events: RunEvent[];
   interactions?: PendingInteraction[];
@@ -3675,6 +3732,12 @@ function RunEventList({
    *  needs it; cursor/codex/gemini tasks would otherwise pay the same
    *  per-tool_use JSON-parse cost for a value nothing consumes). */
   agentKind?: AgentKind;
+  /** Forwarded to `AskQuestionsCard` — fires when a free-text ask-card answer
+   *  came back `{ ok: false, withheld: true, savedToBacklog: true, reason }`
+   *  (some OTHER blocking modal was up when the answer tried to land as a
+   *  follow-up turn), so the caller can toast the outcome and refresh the
+   *  backlog tray exactly like the composer's own withheld branch. */
+  onAskAnswerWithheld?: (reason: string) => void;
 }) {
   // Index tool_results by their tool_use_id so the tool-use card can show
   // Normalise legacy `[tool: Name] {...}` / `[thinking] ...` / `[result] ...`
@@ -3908,7 +3971,14 @@ function RunEventList({
       const onResolved = onInteractionResolved ?? (() => {});
       switch (it.kind) {
         case "ask_questions":
-          return <AskQuestionsCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
+          return (
+            <AskQuestionsCard
+              key={`int-${it.id}`}
+              req={it}
+              onResolved={onResolved}
+              onWithheld={onAskAnswerWithheld}
+            />
+          );
         case "tmux_prompt":
           return (
             <TmuxPromptCard
@@ -5323,9 +5393,14 @@ function summarizeToolInput(toolName: string, input: unknown): string {
 function AskQuestionsCard({
   req,
   onResolved,
+  onWithheld,
 }: {
   req: Extract<PendingInteraction, { kind: "ask_questions" }>;
   onResolved: (id: string) => void;
+  /** Fires when the free-text answer path came back withheld-and-saved (see
+   *  `RunEventList`'s `onAskAnswerWithheld` doc). Undefined for the
+   *  drive-a-numbered-modal path, which can't withhold. */
+  onWithheld?: (reason: string) => void;
 }) {
   // One entry per question. selected = picked option labels; custom = optional free-text.
   const [answers, setAnswers] = useState<Array<{ selected: string[]; custom: string }>>(
@@ -5364,12 +5439,22 @@ function AskQuestionsCard({
     if (!canSubmit || submitting) return;
     setSubmitting(true);
     try {
-      await api.answerAskQuestions(req.id, {
+      const res = await api.answerAskQuestions(req.id, {
         answers: answers.map((a) => ({
           selected: a.selected,
           custom: a.custom.trim() || undefined,
         })),
       });
+      // The server drops the card regardless of outcome (see its own doc):
+      // the Escape it sent before attempting delivery already dismissed
+      // THIS modal, so keeping the card up wouldn't let the user retry
+      // answering it. A withheld-and-saved outcome (some OTHER blocking
+      // modal came up while delivering the follow-up turn) is purely
+      // informational — surface it exactly like the composer's own withheld
+      // branch (toast + backlog refresh) before dropping the card.
+      if (res.withheld && res.savedToBacklog) {
+        onWithheld?.(res.reason ?? "claude is waiting on a prompt — your answer was saved to the backlog tray");
+      }
       onResolved(req.id);
     } finally {
       setSubmitting(false);

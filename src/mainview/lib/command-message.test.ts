@@ -209,6 +209,15 @@ describe("parseUserMessage — local-command-stdout shape", () => {
       output: "",
     });
   });
+
+  test("ANSI SGR escapes around a bolded model name are stripped", () => {
+    const text =
+      "<local-command-stdout>Set model to \x1b[1mOpus 5 (1M context)\x1b[22m for this session only</local-command-stdout>";
+    expect(parseUserMessage(text)).toEqual({
+      kind: "command-output",
+      output: "Set model to Opus 5 (1M context) for this session only",
+    });
+  });
 });
 
 describe("parseUserMessage — ordinary text stays null", () => {

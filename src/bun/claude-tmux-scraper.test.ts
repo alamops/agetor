@@ -26,6 +26,24 @@ const {
   UNPARSABLE_STABILITY_TICKS,
   nextUnparsableStreak,
   unparsableStreakCleared,
+  matchSliderModal,
+  SLIDER_TRACK_RE,
+  SLIDER_TRACK_MIN_CHARS,
+  SLIDER_FOOTER_RE,
+  matchSlashConfirmModal,
+  paneShowsIdleInputBox,
+  STATUS_BAR_RE,
+  IDLE_PROMPT_SEARCH_LINES,
+  pickScrapeMatch,
+  paneShowsBlockingPrompt,
+  idleSettleTick,
+  paneShowsComposerText,
+  SESSION_ONLY_CONFIRM_RE,
+  pickerRowFamily,
+  pickerChoiceIndexForFamily,
+  stripVolatileStatusBarHint,
+  EFFORT_HINT_SUFFIX_RE,
+  TURN_DONE_SUMMARY_RE,
 } = __forTest;
 
 /** Real tmux pane captures of claude-code 2.1.161's AskUserQuestion modal —
@@ -150,6 +168,10 @@ test("matchNumberedModal — tool-use permission prompt: wrapped description's '
     "Yes, and don't ask again for example MCP server – Fetch Records commands in /Users/me/.agetor/worktrees/demo",
   );
   expect(m!.choices[2]!.label).toBe("No");
+  // A permission prompt's footer (`Esc to cancel · Tab to amend`) never
+  // mentions a session-only confirm — `confirmKey` must stay undefined so
+  // this modal is still dismissed with a plain Enter.
+  expect(m!.confirmKey).toBeUndefined();
 });
 
 test("matchNumberedModal — a same-indent line under the last option is not folded into its label", () => {
@@ -579,6 +601,18 @@ test("MODAL_FOOTER_RE — matches the three evidence-backed footer phrasings, ca
   expect(MODAL_FOOTER_RE.test("? for shortcuts")).toBe(false);
 });
 
+test("SESSION_ONLY_CONFIRM_RE — matches the bare /model picker's session-only confirm phrasing", () => {
+  expect(SESSION_ONLY_CONFIRM_RE.test("Enter to set as default · s to use this session only · Esc to cancel")).toBe(
+    true,
+  );
+});
+
+test("SESSION_ONLY_CONFIRM_RE — does not match ordinary modal footers (permission prompts, the effort slider, plain Esc-to-cancel)", () => {
+  expect(SESSION_ONLY_CONFIRM_RE.test("Esc to cancel · Tab to amend")).toBe(false);
+  expect(SESSION_ONLY_CONFIRM_RE.test("←/→ to adjust · Enter to confirm · Esc to cancel")).toBe(false);
+  expect(SESSION_ONLY_CONFIRM_RE.test("Enter to continue · Esc to cancel")).toBe(false);
+});
+
 // ── Fingerprint stability ────────────────────────────────────────────────
 //
 // `matchUnparsableModal`'s fingerprint is sha1 of the same last-12-raw-line
@@ -625,6 +659,65 @@ test("matchUnparsableModal — fingerprint is stable across an inserted volatile
     false,
   )!;
   expect(withTip.fingerprint).toBe(clean.fingerprint);
+});
+
+test("matchUnparsableModal — fingerprint is stable across an inserted completed-turn 'done' summary line (still volatile, per VOLATILE_PANE_LINE_RE's un-negated SPINNER_ELAPSED_LINE)", () => {
+  // TURN_DONE_SUMMARY_RE's own doc: the elapsed-summary row keeps carrying
+  // its `· done <time>` suffix on an idle pane forever after a turn
+  // completes. It's no longer "working" (WORKING_LINE_RE negates this form),
+  // but it must stay VOLATILE — a card's fingerprint or the reaper's
+  // activity diff must not jitter on the tick where this suffix appears.
+  const clean = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const withDoneRow = matchUnparsableModal(
+    SHORT_UNPARSABLE_PANE.replace("Do a thing?", "Do a thing?\n✻ Churned for 1s · done 5:35 PM"),
+    false,
+  )!;
+  expect(withDoneRow.fingerprint).toBe(clean.fingerprint);
+});
+
+// ── stripVolatileStatusBarHint / EFFORT_HINT_SUFFIX_RE (wave-5 finding #8) ──
+//
+// Smoke evidence, claude 2.1.246: on a genuinely idle session the status
+// bar's right-hand hint FLICKERS on its own — one capture read
+//   ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent            ● high · /effort
+// and the identical row WITHOUT the trailing `● high · /effort` segment a
+// second later. An EARLIER fix stripped the WHOLE status-bar row via
+// VOLATILE_PANE_LINE_RE whenever it carried this hint — but that also erased
+// the mode name itself from the activity diff and the unparsable card's
+// paneText, hiding a genuine terminal-side mode flip. The current fix is
+// narrower: `stripVolatileStatusBarHint` strips ONLY the self-flickering
+// suffix off a matched `STATUS_BAR_RE` row (via `EFFORT_HINT_SUFFIX_RE`),
+// leaving the mode glyph / name / cycle hint / agent count intact — this is
+// what `normalizePaneForActivity` (not itself exposed via __forTest, since
+// its only call site is the private `scrapeOnce`) applies to every line
+// before its own VOLATILE_PANE_LINE_RE filter, so the activity-diff yields
+// the SAME normalized value for the idle pane with and without the suffix.
+
+test("stripVolatileStatusBarHint — strips the self-flickering '● <effort> · /effort' suffix off a status-bar row, yielding the SAME value as the row without it", () => {
+  const withSuffix = "⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent            ● high · /effort";
+  const withoutSuffix = "⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent";
+  expect(stripVolatileStatusBarHint(withSuffix)).toBe(withoutSuffix);
+  // The already-bare row (no suffix to strip) round-trips unchanged — proof
+  // this is the SAME normalized value on both sides of the flicker, not just
+  // "produces something".
+  expect(stripVolatileStatusBarHint(withoutSuffix)).toBe(withoutSuffix);
+  expect(stripVolatileStatusBarHint(withSuffix)).toBe(stripVolatileStatusBarHint(withoutSuffix));
+});
+
+test("stripVolatileStatusBarHint — a no-op on any line that ISN'T a recognized status bar, even one shaped exactly like the hint suffix", () => {
+  // The gate is `STATUS_BAR_RE.test(line)` first — narrower than the whole
+  // row being blindly regex-replaced regardless of context (finding #8).
+  const notAStatusBar = "some transcript line · ← 1 agent            ● high · /effort";
+  expect(stripVolatileStatusBarHint(notAStatusBar)).toBe(notAStatusBar);
+});
+
+test("EFFORT_HINT_SUFFIX_RE — matches only the trailing '● <word> · /effort' segment, anchored to end of line", () => {
+  expect(EFFORT_HINT_SUFFIX_RE.test("· ← 1 agent            ● high · /effort")).toBe(true);
+  expect(EFFORT_HINT_SUFFIX_RE.test(" ● high · /effort")).toBe(true);
+  // Not anchored at end-of-line — must not match trailing prose past it.
+  expect(EFFORT_HINT_SUFFIX_RE.test(" ● high · /effort trailing text")).toBe(false);
+  // No leading whitespace before the glyph — the regex requires `\s+` first.
+  expect(EFFORT_HINT_SUFFIX_RE.test("● high · /effort")).toBe(false);
 });
 
 test("matchUnparsableModal — a genuinely different modal gets a different fingerprint", () => {
@@ -729,6 +822,7 @@ const ALL_ARMED = {
   now: WATCHDOG_NOW,
   paneWorking: false,
   askCardLive: false,
+  paneIdle: false,
 };
 
 test("stuckTurnFallbackArmed — all conditions true → armed", () => {
@@ -1120,4 +1214,842 @@ test("unparsable streak — a 1–2 tick blip (the old flicker) never registers"
   // or two ticks before the pane moves on must never become a card.
   expect(driveStreak(["A", null, "A", null, "A", null])).toBeNull();
   expect(driveStreak(["A", "A", null, "A", "A", null])).toBeNull();
+});
+
+// ── idleSettleTick — pure per-tick streak step for scrapeOnce's idle-settle
+// net, the settle-side mirror of nextUnparsableStreak/unparsableStreakCleared
+// above: `eligible` is the caller's own idleSettleEligible decision for THIS
+// tick (already folded in the `lastActivityAt` recency requirement — see the
+// function's own doc); `streak` is the running count going in. Not eligible
+// ⇒ reset to 0, never fire. Eligible ⇒ increment, firing (and resetting back
+// to 0) once the streak reaches UNPARSABLE_STABILITY_TICKS — the SAME
+// stability bar the unparsable fallback itself uses. ─────────────────────────
+
+test("idleSettleTick — not eligible resets the streak to 0 and never fires, regardless of the incoming streak", () => {
+  expect(idleSettleTick({ eligible: false, streak: 0 })).toEqual({ streak: 0, fire: false });
+  expect(idleSettleTick({ eligible: false, streak: 2 })).toEqual({ streak: 0, fire: false });
+  expect(idleSettleTick({ eligible: false, streak: 5 })).toEqual({ streak: 0, fire: false });
+});
+
+test("idleSettleTick — eligible ticks increment the streak without firing until it reaches UNPARSABLE_STABILITY_TICKS", () => {
+  expect(UNPARSABLE_STABILITY_TICKS).toBe(3);
+  expect(idleSettleTick({ eligible: true, streak: 0 })).toEqual({ streak: 1, fire: false });
+  expect(idleSettleTick({ eligible: true, streak: 1 })).toEqual({ streak: 2, fire: false });
+});
+
+test("idleSettleTick — the 3rd consecutive eligible tick fires and resets the streak back to 0", () => {
+  expect(idleSettleTick({ eligible: true, streak: 2 })).toEqual({ streak: 0, fire: true });
+});
+
+test("idleSettleTick — fires (and resets) from a streak already at or past the threshold too, not just exactly one below it", () => {
+  expect(idleSettleTick({ eligible: true, streak: 3 })).toEqual({ streak: 0, fire: true });
+  expect(idleSettleTick({ eligible: true, streak: 5 })).toEqual({ streak: 0, fire: true });
+});
+
+// Drive it the way scrapeOnce does: `streak = idleSettleTick({eligible, streak}).streak`
+// on every tick; settles on the first tick where `.fire` is true.
+function driveIdleSettle(eligibleTicks: boolean[]): number | null {
+  let streak = 0;
+  for (const [i, eligible] of eligibleTicks.entries()) {
+    const step = idleSettleTick({ eligible, streak });
+    streak = step.streak;
+    if (step.fire) return i;
+  }
+  return null;
+}
+
+test("idleSettleTick driven over a sequence — fires on the 3rd consecutive eligible tick, never earlier", () => {
+  expect(driveIdleSettle([true, true])).toBeNull();
+  expect(driveIdleSettle([true, true, true])).toBe(2);
+});
+
+test("idleSettleTick driven over a sequence — an ineligible tick in between restarts the count", () => {
+  expect(driveIdleSettle([true, true, false, true, true])).toBeNull();
+  expect(driveIdleSettle([true, true, false, true, true, true])).toBe(5);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Claude Code 2.1.245 — `/model` and `/effort` in-TUI widgets
+// (docs/plans/model-effort-local-command-turns.md §2, §5 T4). Real pane
+// captures from the spike: the bare `/model` numbered picker, the bare
+// `/effort` slider (two cursor positions), the mid-conversation "Switch
+// model?" / "Change effort level?" confirms, and the idle input box across
+// every observed status-bar variant.
+
+/** 120 × U+2500 — the exact border width the 2.1.245 idle input box draws
+ *  (plan §2). Shared by every idle-pane fixture below. */
+const IDLE_BORDER = "─".repeat(120);
+
+/** Idle input box immediately after an inline local command (`/model sonnet`)
+ *  resolved with no assistant turn — verbatim shape from the spike, only the
+ *  status-bar line varies across the five observed mode variants. */
+function idlePane(statusBar: string): string {
+  return `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+${IDLE_BORDER}
+❯ 
+${IDLE_BORDER}
+  ${statusBar}`;
+}
+
+/**
+ * Same idle pane as `idlePane`, but with claude's completed-turn elapsed
+ * summary (`✻ Churned for 1s · done 5:35 PM`, `TURN_DONE_SUMMARY_RE`'s own
+ * doc) inserted where the smoke evidence found it — sitting exactly 5
+ * non-blank rows from the bottom of the pane (counting up: status bar,
+ * border, bare `❯ ` prompt, border, this line), i.e. still comfortably inside
+ * `WORKING_CHROME_WINDOW_LINES`.
+ */
+function idlePaneWithDoneRow(statusBar: string): string {
+  return `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+✻ Churned for 1s · done 5:35 PM
+
+${IDLE_BORDER}
+❯
+${IDLE_BORDER}
+  ${statusBar}`;
+}
+
+// ── TURN_DONE_SUMMARY_RE / the completed-turn 'done' marker ─────────────────
+// (docs/plans/model-effort-local-command-turns.md §10) — the one token that
+// tells a FINISHED elapsed-summary row (`✻ Churned for 1s · done 5:35 PM`)
+// apart from a still-RUNNING one (`✻ Cooked for 2m 18s`). See
+// SPINNER_ELAPSED_WORKING_LINE / SPINNER_ELAPSED_LINE's doc comments for the
+// two different questions ("is it working?" vs "is it volatile?") that ride
+// on this split.
+
+test("TURN_DONE_SUMMARY_RE — matches the completed-turn marker, not a still-running elapsed summary", () => {
+  expect(TURN_DONE_SUMMARY_RE.test("✻ Churned for 1s · done 5:35 PM")).toBe(true);
+  expect(TURN_DONE_SUMMARY_RE.test("✻ Cooked for 2m 18s")).toBe(false);
+});
+
+test("paneShowsClaudeWorking — false on an idle tail carrying a completed turn's 'done' summary 5 rows above the input box, even though the live ticking forms of the SAME elapsed shape still read as working", () => {
+  // The negation in SPINNER_ELAPSED_WORKING_LINE is what makes this false —
+  // without it, ANY session that ever finished a turn would read as
+  // permanently working (see that constant's own doc for the four real
+  // consumers that broke: mirrorModelViaPicker's busy bail, the idle-settle
+  // net, the unparsable footer arm, and paneShowsComposerText).
+  const idleWithDoneRow = idlePaneWithDoneRow("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
+  expect(paneShowsClaudeWorking(idleWithDoneRow)).toBe(false);
+
+  // The same elapsed-summary SHAPE, minus the "· done" suffix, is still
+  // genuinely working — a long non-shell tool call whose only pane signal is
+  // the ticking elapsed timer.
+  expect(paneShowsClaudeWorking("✻ Cooked for 2m 18s")).toBe(true);
+  expect(paneShowsClaudeWorking("✽ Frosting… (2m 52s · ↓ 12.1k tokens)")).toBe(true);
+});
+
+test("idle+done tail (a completed turn's summary row still on screen 3 minutes later) reads as idle across the whole chain: paneShowsIdleInputBox true, pickScrapeMatch null, paneShowsBlockingPrompt false", () => {
+  const pane = idlePaneWithDoneRow("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
+  expect(paneShowsClaudeWorking(pane)).toBe(false);
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+  expect(pickScrapeMatch(pane, { paneWorking: paneShowsClaudeWorking(pane), watchdogArmed: false })).toBeNull();
+  expect(paneShowsBlockingPrompt(pane)).toBe(false);
+});
+
+// ── Model picker (bare `/model`) ─────────────────────────────────────────────
+
+const MODEL_PICKER_PANE = `   Select model
+   Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names,
+   specify with --model.
+
+     1. Default (recommended)  Opus 5 with 1M context · Best for everyday, complex tasks
+     2. Opus (1M context)      Opus 5 with 1M context · Best for everyday, complex tasks
+     3. Fable                  Fable 5 · Most capable for your hardest and longest-running tasks
+     4. Sonnet                 Sonnet 5 · Efficient for routine tasks
+     5. Haiku                  Haiku 4.5 · Fastest for quick answers
+   ❯ 6. Opus 4.8 ✔             Newer version available · select Opus for Opus 5
+
+   ◉ xHigh effort ←/→ to adjust
+
+   Enter to set as default · s to use this session only · Esc to cancel`;
+
+test("matchNumberedModal — 2.1.245 bare /model picker: 6 choices, cursor on the current model (Opus 4.8), high-confidence", () => {
+  const m = matchNumberedModal(MODEL_PICKER_PANE);
+  expect(m).not.toBeNull();
+  expect(m!.choices.length).toBe(6);
+  expect(m!.cursorIndex).toBe(5);
+  expect(m!.highConfidence).toBe(true);
+  expect(m!.nav).toBeUndefined();
+});
+
+test("matchSliderModal — the /model picker has no ▲ track line, so it never looks like the effort slider", () => {
+  expect(matchSliderModal(MODEL_PICKER_PANE)).toBeNull();
+});
+
+test("matchSlashConfirmModal — the /model picker is not a Switch model?/Change effort level? confirm, for either kind", () => {
+  expect(matchSlashConfirmModal(MODEL_PICKER_PANE, "model")).toBeNull();
+  expect(matchSlashConfirmModal(MODEL_PICKER_PANE, "effort")).toBeNull();
+});
+
+test("matchNumberedModal — 2.1.245 bare /model picker: confirmKey is 's' (footer offers 's to use this session only')", () => {
+  // Owner decision (plan §8 Q6, 2026-08-26): a card click through agetor
+  // must confirm with 's' (session-only), never plain Enter (which would
+  // rewrite the user's global claude default model).
+  const m = matchNumberedModal(MODEL_PICKER_PANE);
+  expect(m).not.toBeNull();
+  expect(m!.confirmKey).toBe("s");
+});
+
+test("pickScrapeMatch — the /model picker's confirmKey rides along through the shared chain", () => {
+  const direct = matchNumberedModal(MODEL_PICKER_PANE)!;
+  expect(direct.confirmKey).toBe("s");
+  const dispatched = pickScrapeMatch(MODEL_PICKER_PANE, { paneWorking: false, watchdogArmed: false });
+  expect(dispatched!.confirmKey).toBe("s");
+});
+
+// ── pickerRowFamily / pickerChoiceIndexForFamily — the 2.1.246 bare /model
+// picker's row-name parse (mirrorModelViaPicker's pure half). Verbatim rows
+// from that function's own doc comment in claude-tmux.ts:
+//   1. Default (recommended)  Opus 5 with 1M context, best for complex work
+//   2. Opus (1M context)      Opus 5 with 1M context …
+//   3. Fable                  Fable 5 …
+//   4. Sonnet ✔               Sonnet 5 …
+//   5. Haiku                  Haiku 4.5 …
+// (labels below omit the leading "N. " — matchNumberedModal already strips
+// that before a row reaches `choices[].label`.)
+
+test("pickerRowFamily — 2.1.246 bare /model picker row labels", () => {
+  expect(pickerRowFamily("Default (recommended)  Opus 5 with 1M context, best for complex work")).toBe("Default");
+  expect(pickerRowFamily("Opus (1M context)      Opus 5 with 1M context, best for complex work")).toBe("Opus");
+  expect(pickerRowFamily("Fable                  Fable 5, most capable for your hardest and longest-running tasks"))
+    .toBe("Fable");
+  expect(pickerRowFamily("Sonnet ✔               Sonnet 5, efficient for routine tasks")).toBe("Sonnet");
+  expect(pickerRowFamily("Haiku                  Haiku 4.5, fastest for quick answers")).toBe("Haiku");
+});
+
+test("pickerRowFamily — no leading word at all yields null", () => {
+  expect(pickerRowFamily("")).toBeNull();
+  expect(pickerRowFamily("   ")).toBeNull();
+});
+
+test("pickerChoiceIndexForFamily — 2.1.246 bare /model picker: Default is never selectable (from either direction), known families resolve by index, unknown family is -1", () => {
+  const choices = [
+    { key: "1", label: "Default (recommended)  Opus 5 with 1M context, best for complex work" },
+    { key: "2", label: "Opus (1M context)      Opus 5 with 1M context, best for complex work" },
+    { key: "3", label: "Fable                  Fable 5, most capable for your hardest and longest-running tasks" },
+    { key: "4", label: "Sonnet ✔               Sonnet 5, efficient for routine tasks" },
+    { key: "5", label: "Haiku                  Haiku 4.5, fastest for quick answers" },
+  ];
+  expect(pickerChoiceIndexForFamily(choices, "Opus")).toBe(1);
+  expect(pickerChoiceIndexForFamily(choices, "Sonnet")).toBe(3);
+  expect(pickerChoiceIndexForFamily(choices, "Fable")).toBe(2);
+  expect(pickerChoiceIndexForFamily(choices, "Haiku")).toBe(4);
+  expect(pickerChoiceIndexForFamily(choices, "Mythos")).toBe(-1);
+  // Never-pick-Default, from both directions.
+  expect(pickerChoiceIndexForFamily(choices, "Default")).toBe(-1);
+  expect(pickerChoiceIndexForFamily(choices, "default")).toBe(-1);
+  // Case-insensitive match on a real family.
+  expect(pickerChoiceIndexForFamily(choices, "opus")).toBe(1);
+});
+
+// ── Effort slider (bare `/effort`) ───────────────────────────────────────────
+
+const EFFORT_SLIDER_XHIGH_PANE = `   Effort
+
+                             Faster                                                 Smarter
+                             ──────────────────────────────▲────────────┆──────────────────
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+
+const EFFORT_SLIDER_HIGH_PANE = `   Effort
+
+                             Faster                                                 Smarter
+                             ────────────────────▲──────────────────────┆──────────────────
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+
+test("matchSliderModal — ▲ at column 59 is nearest-centre to xhigh (cursorIndex 3), nav horizontal, high-confidence", () => {
+  const m = matchSliderModal(EFFORT_SLIDER_XHIGH_PANE);
+  expect(m).not.toBeNull();
+  expect(m!.choices.map((c) => c.key)).toEqual(["1", "2", "3", "4", "5", "6"]);
+  expect(m!.choices.map((c) => c.label)).toEqual(["low", "medium", "high", "xhigh", "max", "ultracode"]);
+  expect(m!.cursorIndex).toBe(3);
+  expect(m!.nav).toBe("horizontal");
+  expect(m!.highConfidence).toBe(true);
+});
+
+test("matchSliderModal — ▲ at column 49 is nearest-centre to high (cursorIndex 2)", () => {
+  const m = matchSliderModal(EFFORT_SLIDER_HIGH_PANE);
+  expect(m).not.toBeNull();
+  expect(m!.cursorIndex).toBe(2);
+});
+
+test("matchSliderModal — fingerprints differ between the two cursor captures and are stable across repeated calls on the same pane", () => {
+  const a1 = matchSliderModal(EFFORT_SLIDER_XHIGH_PANE)!;
+  const a2 = matchSliderModal(EFFORT_SLIDER_XHIGH_PANE)!;
+  const b = matchSliderModal(EFFORT_SLIDER_HIGH_PANE)!;
+  expect(a1.fingerprint).toBe(a2.fingerprint);
+  expect(a1.fingerprint).not.toBe(b.fingerprint);
+});
+
+test("matchNumberedModal / matchYesNoModal — the effort slider has no digits or (y/N) shape, so neither generic matcher fires", () => {
+  expect(matchNumberedModal(EFFORT_SLIDER_XHIGH_PANE)).toBeNull();
+  expect(matchYesNoModal(EFFORT_SLIDER_XHIGH_PANE)).toBeNull();
+  expect(matchNumberedModal(EFFORT_SLIDER_HIGH_PANE)).toBeNull();
+  expect(matchYesNoModal(EFFORT_SLIDER_HIGH_PANE)).toBeNull();
+});
+
+// ── pickScrapeMatch — the shared numbered > yes-no > slider > unparsable
+// chain used by BOTH scrapeOnce and the boot poller (docs/plans/model-
+// effort-local-command-turns.md §10 review finding #9) — tests exercise the
+// production function directly rather than re-implementing the `??` chain
+// in the test body, so a future reorder of the real chain would fail here
+// too.
+
+test("pickScrapeMatch — a slider pane resolves to the slider match, never unparsable, even with the watchdog armed", () => {
+  const direct = matchSliderModal(EFFORT_SLIDER_XHIGH_PANE)!;
+  const dispatched = pickScrapeMatch(EFFORT_SLIDER_XHIGH_PANE, { paneWorking: false, watchdogArmed: true });
+  expect(dispatched).not.toBeNull();
+  expect(dispatched).toEqual(direct);
+  expect((dispatched as any).unparsable).toBeUndefined();
+});
+
+test("pickScrapeMatch — the /model picker resolves to the numbered match", () => {
+  const direct = matchNumberedModal(MODEL_PICKER_PANE)!;
+  expect(pickScrapeMatch(MODEL_PICKER_PANE, { paneWorking: false, watchdogArmed: false })).toEqual(direct);
+});
+
+test("pickScrapeMatch — a (y/N) pane resolves to the yes-no match", () => {
+  const pane = `Continue with the operation? (y/N)`;
+  const direct = matchYesNoModal(pane)!;
+  expect(pickScrapeMatch(pane, { paneWorking: false, watchdogArmed: false })).toEqual(direct);
+});
+
+test("pickScrapeMatch — an idle input box with watchdogArmed:true (paneWorking:false) resolves to the unparsable watchdog match", () => {
+  // pickScrapeMatch itself has no independent notion of "idle" — it trusts
+  // whatever paneWorking/watchdogArmed the caller computed. Production never
+  // actually calls it this way for a real idle pane (stuckTurnFallbackArmed's
+  // own paneIdle term keeps watchdogArmed false there — see the paired
+  // assertion further below), but this pins the shared chain's own dispatch
+  // logic in isolation from that caller-side guard.
+  const pane = idlePane("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
+  const dispatched = pickScrapeMatch(pane, { paneWorking: false, watchdogArmed: true });
+  expect(dispatched).not.toBeNull();
+  expect(dispatched!.unparsable).toBe(true);
+});
+
+test("pickScrapeMatch — the same idle pane with paneWorking:true resolves to null (the paneWorking gate skips the unparsable arm outright)", () => {
+  const pane = idlePane("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
+  expect(pickScrapeMatch(pane, { paneWorking: true, watchdogArmed: true })).toBeNull();
+});
+
+test("pickScrapeMatch — a footer-bearing unknown modal resolves to the unparsable footer match even with the watchdog NOT armed", () => {
+  const direct = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const dispatched = pickScrapeMatch(SHORT_UNPARSABLE_PANE, { paneWorking: false, watchdogArmed: false });
+  expect(dispatched).toEqual(direct);
+  expect(dispatched!.unparsable).toBe(true);
+});
+
+test("pickScrapeMatch — boot semantics: the boot poller always passes watchdogArmed:false, so a footerless stuck pane never cards there (only the footer arm can ever fire at boot)", () => {
+  const stuckPane = `● Running Bash(a very long build)…
+
+Still going, no visible progress, nothing that looks like a modal or a
+footer — just a wedged TUI.`;
+  expect(pickScrapeMatch(stuckPane, { paneWorking: false, watchdogArmed: false })).toBeNull();
+});
+
+// ── Effort slider negatives (one of the three required signals missing) ────
+
+test("matchSliderModal — label row missing (track line directly followed by the footer) → null", () => {
+  const pane = `   Effort
+
+                             Faster                                                 Smarter
+                             ──────────────────────────────▲────────────┆──────────────────
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+  expect(matchSliderModal(pane)).toBeNull();
+});
+
+test("matchSliderModal — track + label present but no ←/→ to adjust footer within the last 3 non-blank lines → null", () => {
+  const pane = `   Effort
+
+                             Faster                                                 Smarter
+                             ──────────────────────────────▲────────────┆──────────────────
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows`;
+  expect(matchSliderModal(pane)).toBeNull();
+});
+
+// ── Signal (b)/(c) distance boundaries ──────────────────────────────────────
+
+test("matchSliderModal — signal (b) boundary: a label-shaped row 3+ non-blank lines below the track (past LABEL_ROW_SEARCH_NONBLANK=2) → null", () => {
+  // Two non-label filler lines separate the track from the label row, so the
+  // label search (bounded to 2 non-blank lines below the track) runs out
+  // before ever reaching it — labelIdx stays unset regardless of what a
+  // footer further down might say.
+  const pane = `   Effort
+
+                             Faster                                                 Smarter
+                             ──────────────────────────────▲────────────┆──────────────────
+filler one
+filler two
+                             low     medium     high     xhigh      max       ultracode
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+  expect(matchSliderModal(pane)).toBeNull();
+});
+
+test("matchSliderModal — signal (c) boundary: the footer 4+ non-blank lines below the label row (past FOOTER_SEARCH_NONBLANK=3) → null even though the footer text exists in the pane", () => {
+  const pane = `   Effort
+
+                             Faster                                                 Smarter
+                             ──────────────────────────────▲────────────┆──────────────────
+                             low     medium     high     xhigh      max       ultracode
+filler one
+filler two
+filler three
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+  expect(matchSliderModal(pane)).toBeNull();
+});
+
+test("matchSliderModal — signal (c): an old echo's stale track/label ABOVE a live slider whose own track has scrolled off the top of the tail → null, and the fallback still cards via matchUnparsableModal's footer arm", () => {
+  // The bottom-up track search in (a) has only ONE track line to find in the
+  // whole tail — the OLD echo's — so it wins by default (the live slider's
+  // track is gone, off-screen). Signal (b) then finds the label row
+  // immediately below THAT stale track (the echo's own label row, adjacent
+  // as always). Signal (c) is what rejects the pane: searching from the
+  // ECHO's label row, the real (live) footer down at the true bottom sits
+  // far more than FOOTER_SEARCH_NONBLANK (3) non-blank lines away — buried
+  // behind the echo's own sub-row plus several lines of intervening
+  // transcript — so footerIdx is never found and matchSliderModal returns
+  // null before signal (d) (which the live footer legitimately WOULD pass,
+  // being among the tail's last 3 non-blank lines) is ever reached. That's
+  // the asymmetric partner to the "OLD echo above an idle box" case below,
+  // where (d) is what rejects instead of (c).
+  const pane = `❯ /effort
+   Effort
+
+                             Faster                                                 Smarter
+                             ────────────────────▲──────────────────────┆──────────────────
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+❯ /effort xhigh
+
+some later transcript line one
+some later transcript line two
+some later transcript line three
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+  expect(matchSliderModal(pane)).toBeNull();
+  // The real footer at the true bottom is exactly what drives the fallback
+  // card instead — confirming "falls through to matchUnparsableModal" isn't
+  // just a doc claim but the actual outcome for this pane.
+  const fallback = matchUnparsableModal(pane, false);
+  expect(fallback).not.toBeNull();
+  expect(fallback!.unparsable).toBe(true);
+});
+
+/** Same slider shape as `EFFORT_SLIDER_XHIGH_PANE` (real label row + real
+ *  footer), but with a caller-supplied track line — lets the
+ *  SLIDER_TRACK_MIN_CHARS tests isolate signal (a) without also having to
+ *  reconstruct the label/footer rows. */
+function sliderPaneWithTrack(track: string): string {
+  return `   Effort
+
+                             Faster                                                 Smarter
+                             ${track}
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+}
+
+test("matchSliderModal — a lone ▲ (no real track) never looks like the slider, even with a real label row and footer", () => {
+  expect(matchSliderModal(sliderPaneWithTrack("▲"))).toBeNull();
+});
+
+test("SLIDER_TRACK_MIN_CHARS — a 9-char track (one short of the minimum) still fails to parse", () => {
+  const track = "─".repeat(SLIDER_TRACK_MIN_CHARS - 1) + "▲";
+  expect(track.length).toBe(SLIDER_TRACK_MIN_CHARS); // sanity: 9 dashes + the ▲ itself
+  expect(matchSliderModal(sliderPaneWithTrack(track))).toBeNull();
+});
+
+test("SLIDER_TRACK_MIN_CHARS — a 10-char track (meets the minimum) parses normally", () => {
+  const track = "─".repeat(SLIDER_TRACK_MIN_CHARS) + "▲";
+  expect(matchSliderModal(sliderPaneWithTrack(track))).not.toBeNull();
+});
+
+test("matchSliderModal / pickScrapeMatch / paneShowsBlockingPrompt — a real slider at the bottom is still recognised with genuine working chrome (a spinner line) above it", () => {
+  // matchSliderModal is a pure pane-SHAPE matcher — it never consults
+  // paneShowsClaudeWorking at all, unlike the unparsable fallback's gate —
+  // so a real slider track/labels/footer at the bottom parses regardless of
+  // what's rendered above it. (The vacuous predecessor of this test merely
+  // fed a bare spinner line with no slider shape in it at all, which
+  // trivially returns null without exercising anything about "working".)
+  const pane = `✳ Working… (esc to interrupt · 12s · 1.2k tokens)
+${EFFORT_SLIDER_XHIGH_PANE}`;
+  const direct = matchSliderModal(pane);
+  expect(direct).not.toBeNull();
+  expect(direct!.nav).toBe("horizontal");
+
+  // pickScrapeMatch's own paneWorking gate (see its doc) only ever wraps the
+  // TRAILING unparsable arm — a real slider match still wins outright, even
+  // with paneWorking AND the watchdog both true.
+  const dispatched = pickScrapeMatch(pane, { paneWorking: true, watchdogArmed: true });
+  expect(dispatched).toEqual(direct);
+  expect((dispatched as any).unparsable).toBeUndefined();
+
+  // And the paste-guard predicate agrees for the same reason: a live slider
+  // blocks a pending paste regardless of the spinner text also on the pane.
+  expect(paneShowsBlockingPrompt(pane)).toBe(true);
+});
+
+test("matchSliderModal — a transcript that merely contains an OLD slider echo, followed by the idle input box, does not re-fire", () => {
+  // Signal (d): the footer requirement is checked against the CURRENT bottom
+  // of the pane, not near the stale track line. Signals (a)-(c) all pass for
+  // the echo in isolation — it's a complete, self-contained slider capture
+  // (its own track, its own adjacent label row, its own footer right below
+  // that) — so (c) alone would still match. (d) is what rejects it: that
+  // footer is buried under the idle box that now follows, so it is NOT among
+  // the tail's last 3 non-blank lines. See the (c)-fails case (an old echo
+  // above a LIVE slider whose track has scrolled off) in the boundary tests
+  // above for the asymmetric partner this signal split exists to cover.
+  const pane = `❯ /effort
+${EFFORT_SLIDER_HIGH_PANE}
+❯ /effort high
+
+${idlePane("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent")}`;
+  expect(matchSliderModal(pane)).toBeNull();
+});
+
+test("SLIDER_TRACK_MIN_CHARS is 10", () => {
+  expect(SLIDER_TRACK_MIN_CHARS).toBe(10);
+});
+
+test("SLIDER_TRACK_RE — matches a track line with exactly one ▲, not a bare border or a two-marker line", () => {
+  expect(SLIDER_TRACK_RE.test(
+    "                             ──────────────────────────────▲────────────┆──────────────────",
+  )).toBe(true);
+  expect(SLIDER_TRACK_RE.test("─".repeat(30))).toBe(false); // no ▲ at all
+  expect(SLIDER_TRACK_RE.test("▲──▲")).toBe(false); // two markers — not "exactly one"
+});
+
+test("SLIDER_FOOTER_RE — matches the captured slider footer phrase specifically", () => {
+  expect(SLIDER_FOOTER_RE.test("←/→ to adjust · Enter to confirm · Esc to cancel")).toBe(true);
+  expect(SLIDER_FOOTER_RE.test("Enter to confirm · Esc to cancel")).toBe(false);
+});
+
+// ── Signal (d) boundary: rows drawn AFTER the (otherwise correctly-anchored)
+// footer, between it and the pane's true bottom ─────────────────────────────
+
+/** A real, correctly-anchored slider (signals a/b/c all satisfied) with N
+ *  extra rows appended after the footer — e.g. the "Tip: …" hint banner
+ *  claude sometimes draws below its own footer. Isolates signal (d) — "the
+ *  footer must ALSO be among the tail's last 3 non-blank lines" — from (a)/
+ *  (b)/(c), which this shape always satisfies regardless of `trailingRows`. */
+function sliderPaneWithTrailingRows(trailingRows: string[]): string {
+  const trailer = trailingRows.map((r) => `\n${r}`).join("");
+  return `   Effort
+
+                             Faster                                                 Smarter
+                             ──────────────────────────────▲────────────┆──────────────────
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel${trailer}`;
+}
+
+test("matchSliderModal — signal (d): a single Tip: hint row between the footer and the pane bottom still parses (footer remains within the last 3 non-blank lines)", () => {
+  const pane = sliderPaneWithTrailingRows(["Tip: Ask Claude to make a plan before coding"]);
+  expect(matchSliderModal(pane)).not.toBeNull();
+});
+
+test("matchSliderModal — signal (d) boundary: footer exactly 3rd-from-bottom (two trailing rows) still parses", () => {
+  const pane = sliderPaneWithTrailingRows(["Tip: row one", "Tip: row two"]);
+  expect(matchSliderModal(pane)).not.toBeNull();
+});
+
+test("matchSliderModal — signal (d) boundary: footer pushed to 4th-from-bottom (three trailing rows) → null", () => {
+  // Documents the exact boundary: 3 non-blank lines drawn after the footer
+  // is the point signal (d) stops treating the widget as still live at the
+  // bottom of the pane.
+  const pane = sliderPaneWithTrailingRows(["Tip: row one", "Tip: row two", "Tip: row three"]);
+  expect(matchSliderModal(pane)).toBeNull();
+});
+
+// ── Slash confirms (2.1.245 "Switch model?" / "Change effort level?") ──────
+
+const EFFORT_CONFIRM_PANE = `   Change effort level?
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current effort level. Switching to low means the full history gets re-read on
+   your next message.
+
+   ❯ 1. Yes, switch to low
+     2. No, go back`;
+
+const MODEL_CONFIRM_PANE = `   Switch model?
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current model. Switching to Opus 5 means the full history gets re-read on your
+   next message.
+
+   ❯ 1. Yes, switch to Opus 5
+     2. No, go back`;
+
+test("matchSlashConfirmModal — effort confirm matches kind 'effort', cursor on 'Yes, switch to low'", () => {
+  const m = matchSlashConfirmModal(EFFORT_CONFIRM_PANE, "effort");
+  expect(m).not.toBeNull();
+  expect(m!.cursorIndex).toBe(0);
+});
+
+test("matchSlashConfirmModal — effort confirm does NOT match kind 'model'", () => {
+  expect(matchSlashConfirmModal(EFFORT_CONFIRM_PANE, "model")).toBeNull();
+});
+
+test("matchSlashConfirmModal — model confirm matches kind 'model', cursor on 'Yes, switch to Opus 5'", () => {
+  const m = matchSlashConfirmModal(MODEL_CONFIRM_PANE, "model");
+  expect(m).not.toBeNull();
+  expect(m!.cursorIndex).toBe(0);
+});
+
+test("matchSlashConfirmModal — model confirm does NOT match kind 'effort'", () => {
+  expect(matchSlashConfirmModal(MODEL_CONFIRM_PANE, "effort")).toBeNull();
+});
+
+test("matchSlashConfirmModal — cursor moved to 'No, go back' never matches, for either kind", () => {
+  const noSelected = EFFORT_CONFIRM_PANE
+    .replace("   ❯ 1. Yes, switch to low", "     1. Yes, switch to low")
+    .replace("     2. No, go back", "   ❯ 2. No, go back");
+  expect(matchNumberedModal(noSelected)!.cursorIndex).toBe(1); // sanity: cursor really moved
+  expect(matchSlashConfirmModal(noSelected, "effort")).toBeNull();
+  expect(matchSlashConfirmModal(noSelected, "model")).toBeNull();
+});
+
+test("matchNumberedModal — both confirms parse as a plain 2-choice modal, not high-confidence (no Esc-to-cancel footer)", () => {
+  const effort = matchNumberedModal(EFFORT_CONFIRM_PANE);
+  const model = matchNumberedModal(MODEL_CONFIRM_PANE);
+  expect(effort!.choices.length).toBe(2);
+  expect(effort!.highConfidence).toBeFalsy();
+  expect(model!.choices.length).toBe(2);
+  expect(model!.highConfidence).toBeFalsy();
+});
+
+test("matchNumberedModal — neither 'Switch model?' nor 'Change effort level?' confirm carries a session-only confirmKey", () => {
+  // These confirms have no footer at all (see the test above), let alone the
+  // /model picker's session-only phrasing — they must always dismiss with
+  // the default Enter.
+  expect(matchNumberedModal(EFFORT_CONFIRM_PANE)!.confirmKey).toBeUndefined();
+  expect(matchNumberedModal(MODEL_CONFIRM_PANE)!.confirmKey).toBeUndefined();
+});
+
+// ── Idle input box (`paneShowsIdleInputBox`) ────────────────────────────────
+
+const IDLE_STATUS_BAR_VARIANTS: Array<[string, string]> = [
+  ["bypass permissions", "⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent"],
+  ["auto mode", "⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent"],
+  ["manual mode (no shift+tab hint, uses '? for shortcuts' instead)", "⏸ manual mode on · ? for shortcuts · ← 1 agent"],
+  ["accept edits", "⏵⏵ accept edits on (shift+tab to cycle) · ← 1 agent"],
+  ["plan mode", "⏸ plan mode on (shift+tab to cycle) · ← 1 agent"],
+  ["bypass permissions, no '· ← N agent' suffix", "⏵⏵ bypass permissions on (shift+tab to cycle)"],
+];
+
+for (const [label, bar] of IDLE_STATUS_BAR_VARIANTS) {
+  test(`paneShowsIdleInputBox — true for the idle pane with the "${label}" status bar`, () => {
+    expect(STATUS_BAR_RE.test(bar)).toBe(true);
+    expect(paneShowsIdleInputBox(idlePane(bar))).toBe(true);
+  });
+}
+
+test("STATUS_BAR_RE — does not match '⏵⏵ auto mode on' without either cycle hint (status-bar-shaped but incomplete)", () => {
+  expect(STATUS_BAR_RE.test("⏵⏵ auto mode on · ← 1 agent")).toBe(false);
+});
+
+test("paneShowsIdleInputBox — false for the /model picker (a modal replaces the input box, not a status bar)", () => {
+  expect(paneShowsIdleInputBox(MODEL_PICKER_PANE)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — false for both effort slider captures", () => {
+  expect(paneShowsIdleInputBox(EFFORT_SLIDER_XHIGH_PANE)).toBe(false);
+  expect(paneShowsIdleInputBox(EFFORT_SLIDER_HIGH_PANE)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — false for both slash confirms", () => {
+  expect(paneShowsIdleInputBox(EFFORT_CONFIRM_PANE)).toBe(false);
+  expect(paneShowsIdleInputBox(MODEL_CONFIRM_PANE)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — false for a working pane (spinner above the status bar, whose bar carries 'esc to interrupt')", () => {
+  // A working pane's OWN status bar carries the same "(shift+tab to cycle)"
+  // hint STATUS_BAR_RE matches, with "esc to interrupt" spliced in (see
+  // STATUS_BAR_RE's doc comment) — that's rejected directly (check b), so
+  // this reads false regardless of whether a bare "❯" happens to sit above it.
+  const pane = `✽ Frosting… (2m 52s · ↓ 12.1k tokens)
+
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — false when idle-box rows sit in scrollback ABOVE a modal (idle rows, a ▔ divider, then the confirm as the last lines)", () => {
+  const pane = `${idlePane("⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent")}
+${"▔".repeat(120)}
+${EFFORT_CONFIRM_PANE}`;
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — false when the status bar is NOT in the last two non-blank lines (two ordinary transcript rows follow it)", () => {
+  const pane = `${idlePane("⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent")}
+some later transcript line one
+some later transcript line two`;
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — true with a 'Tip: …' row and an '✔ Update installed' row sitting between the input box and the status bar", () => {
+  const pane = `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+${IDLE_BORDER}
+❯
+${IDLE_BORDER}
+  Tip: Ask Claude to make a plan before coding
+  ✔ Update installed · restart to apply
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+});
+
+test("paneShowsIdleInputBox — true with a 2-row background-agent roster (⏺ main / ◯ explorer) sitting between the input box and the status bar", () => {
+  const pane = `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+${IDLE_BORDER}
+❯
+${IDLE_BORDER}
+⏺ main
+◯ explorer
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+});
+
+test("paneShowsIdleInputBox — false when the bare ❯ prompt sits 9+ non-blank rows above the bar (outside IDLE_PROMPT_SEARCH_LINES)", () => {
+  const filler = Array.from({ length: IDLE_PROMPT_SEARCH_LINES + 1 }, (_, i) => `filler line ${i}`).join("\n");
+  const pane = `❯ \n${filler}\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — true when the bare ❯ prompt sits exactly IDLE_PROMPT_SEARCH_LINES non-blank rows above the bar (boundary)", () => {
+  const filler = Array.from({ length: IDLE_PROMPT_SEARCH_LINES - 1 }, (_, i) => `filler line ${i}`).join("\n");
+  const pane = `❯ \n${filler}\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+});
+
+test("IDLE_PROMPT_SEARCH_LINES is 8", () => {
+  expect(IDLE_PROMPT_SEARCH_LINES).toBe(8);
+});
+
+// ── stuckTurnFallbackArmed / matchUnparsableModal — idle interplay ──────────
+
+test("stuckTurnFallbackArmed — idle at the input box disarms the watchdog even when everything else is armed", () => {
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, paneIdle: true })).toBe(false);
+});
+
+test("stuckTurnFallbackArmed — a working pane on the esc-to-interrupt blink-OFF tick (paneIdle reads true) still never arms", () => {
+  // paneShowsIdleInputBox's "esc to interrupt" text blinks at ~1 Hz in
+  // claude's real TUI, so paneIdle can legitimately read true on the
+  // blink-off tick of an otherwise-busy pane (see that function's doc).
+  // paneShowsClaudeWorking (the spinner line) is what actually protects the
+  // settle path — stuckTurnFallbackArmed's own `!paneWorking` term holds
+  // regardless of what paneIdle says.
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking: true, paneIdle: true })).toBe(false);
+});
+
+test("matchUnparsableModal — the idle input box never trips the footer arm (idle is proof the turn ended, not an unparsable modal); the actual protection against the WATCHDOG arm lives one level up, in stuckTurnFallbackArmed's paneIdle term", () => {
+  const pane = idlePane("⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent");
+  expect(matchUnparsableModal(pane, false)).toBeNull();
+  // matchUnparsableModal itself has no notion of "idle" at all — passed
+  // watchdogArmed directly (as if some caller had already decided to arm
+  // it), it fires on this same idle pane same as any other footerless,
+  // notice-free pane. The reason a real idle pane never actually reaches
+  // here with watchdogArmed:true in production is stuckTurnFallbackArmed's
+  // own `!p.paneIdle` term below — that's where the real protection lives.
+  expect(matchUnparsableModal(pane, true)).not.toBeNull();
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, paneIdle: true })).toBe(false);
+});
+
+// ── Composer text (`paneShowsComposerText`) ─────────────────────────────────
+// (docs/plans/model-effort-local-command-turns.md §10 review finding #2) —
+// this predicate is `paneShowsIdleInputBox`'s complement on the SAME
+// `livePromptRow`: bare vs. non-bare live row. Used by `queuePaste`'s
+// composer-dirty check before pasting a new message over a stranded one.
+
+test("paneShowsComposerText — false on the verbatim idlePane() fixture (bare live row), even with a '❯ /model sonnet' transcript ECHO above it; paneShowsIdleInputBox is true for the same pane", () => {
+  const pane = idlePane("⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent");
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+  expect(paneShowsComposerText(pane)).toBe(false);
+});
+
+/** Same shape as `idlePane`, but with arbitrary text sitting in the LIVE
+ *  (bottom) composer row instead of the bare `❯ ` prompt — lets a test drive
+ *  `paneShowsComposerText`'s non-bare branch without reconstructing the
+ *  echo/border chrome by hand each time. */
+function idlePaneWithComposerText(statusBar: string, composerText: string): string {
+  return `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+${IDLE_BORDER}
+❯ ${composerText}
+${IDLE_BORDER}
+  ${statusBar}`;
+}
+
+test("paneShowsComposerText — true when the live row holds unsent text ('hello from agetor'); paneShowsIdleInputBox is false for the same pane", () => {
+  const pane = idlePaneWithComposerText(
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent",
+    "hello from agetor",
+  );
+  expect(paneShowsComposerText(pane)).toBe(true);
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+test("paneShowsComposerText — true for the multi-line paste placeholder ('[Pasted text #1 +12 lines]')", () => {
+  const pane = idlePaneWithComposerText(
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent",
+    "[Pasted text #1 +12 lines]",
+  );
+  expect(paneShowsComposerText(pane)).toBe(true);
+});
+
+test("paneShowsComposerText — false for the /model picker, both effort slider captures, and both slash confirms (no anchored status bar, so livePromptRow finds nothing)", () => {
+  expect(paneShowsComposerText(MODEL_PICKER_PANE)).toBe(false);
+  expect(paneShowsComposerText(EFFORT_SLIDER_XHIGH_PANE)).toBe(false);
+  expect(paneShowsComposerText(EFFORT_SLIDER_HIGH_PANE)).toBe(false);
+  expect(paneShowsComposerText(EFFORT_CONFIRM_PANE)).toBe(false);
+  expect(paneShowsComposerText(MODEL_CONFIRM_PANE)).toBe(false);
+});
+
+test("paneShowsComposerText / paneShowsIdleInputBox — both false on a working pane (spinner + 'esc to interrupt' bar), even with a non-bare live row", () => {
+  const pane = `✽ Frosting… (2m 52s · ↓ 12.1k tokens)
+
+❯ still typing
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent`;
+  expect(paneShowsComposerText(pane)).toBe(false);
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+// ── paneShowsBlockingPrompt spot-checks — picker / idle / working (the
+// slider case is already pinned above, alongside pickScrapeMatch) ──────────
+
+test("paneShowsBlockingPrompt — true for the /model picker (a numbered modal)", () => {
+  expect(paneShowsBlockingPrompt(MODEL_PICKER_PANE)).toBe(true);
+});
+
+test("paneShowsBlockingPrompt — false for the idle input box", () => {
+  const pane = idlePane("⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent");
+  expect(paneShowsBlockingPrompt(pane)).toBe(false);
+});
+
+test("paneShowsBlockingPrompt — false for a working pane with no modal on screen (spinner chrome alone never blocks a pending paste)", () => {
+  const pane = `✽ Frosting… (2m 52s · ↓ 12.1k tokens)
+
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent`;
+  expect(paneShowsBlockingPrompt(pane)).toBe(false);
 });

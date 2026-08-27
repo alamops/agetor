@@ -139,6 +139,60 @@ export function toClaudeModelArg(id: string): string {
 }
 
 /**
+ * Inverse of `toClaudeModelArg`/`CLAUDE_MODEL_FLAG`: given a `/model <arg>`
+ * argument as claude itself would echo it back (or as agetor's own dropdown
+ * mirror sent it — see `reconcileTaskSession`), resolve it to the agetor
+ * model id whose flag matches exactly. Falls back to the arg itself when it
+ * already looks like a raw claude model id (`claude-…`), so a future
+ * curated id "just works" before `CLAUDE_MODEL_FLAG` catches up.
+ *
+ * Deliberately does NOT resolve claude's own aliases (`sonnet`, `opus`,
+ * `default`, …) — those map many-to-one onto a model family and can't be
+ * inverted losslessly from the arg alone. Callers that need to resolve an
+ * alias must fall back to the `<local-command-stdout>` display name instead
+ * (see `claudeModelIdFromDisplayName` in `claude-local-setting.ts`).
+ */
+export function claudeModelIdFromArg(arg: string): string | null {
+  for (const [id, flag] of Object.entries(CLAUDE_MODEL_FLAG)) {
+    if (flag === arg) return id;
+  }
+  return /^claude-/.test(arg) ? arg : null;
+}
+
+/**
+ * Map an agetor claude-code model id to the model-FAMILY label the 2.1.246
+ * `/model` picker's UI actually offers as a selectable row (`Opus`, `Sonnet`,
+ * `Fable`, `Haiku`) — smoke-tested on claude 2.1.246
+ * (docs/plans/model-effort-local-command-turns.md §10, owner decision 2).
+ * The picker is coarser than `CLAUDE_MODEL_FLAG`: it offers one row per
+ * family, always resolving to that family's CURRENT release, not every
+ * versioned id agetor tracks. An id whose family row would therefore land on
+ * a DIFFERENT specific version than the one just requested — `opus-4.8`,
+ * `opus-4.7`, `opus-4.6`, `sonnet-4.6` (all superseded within their family by
+ * a newer pinned id) — is deliberately mapped to `null` rather than the
+ * nearest family, so the live-session mirror is skipped instead of silently
+ * switching the session to a different version than the task row now holds.
+ * `mythos-5` has no picker row at all. An unknown/future raw id also returns
+ * `null` rather than guess. Sole caller: `reconcileTaskSession`'s model
+ * mirror (`orchestrator.ts`), which feeds the result to `mirrorModelViaPicker`
+ * (`claude-tmux.ts`).
+ */
+export function claudeModelPickerFamily(id: string): "Opus" | "Sonnet" | "Fable" | "Haiku" | null {
+  switch (id) {
+    case "opus-5":
+      return "Opus";
+    case "sonnet-5":
+      return "Sonnet";
+    case "fable-5":
+      return "Fable";
+    case "haiku-4.5":
+      return "Haiku";
+    default:
+      return null;
+  }
+}
+
+/**
  * Effort → `CLAUDE_CODE_EFFORT_LEVEL` env var on the spawned process. Same
  * lever the `/effort` slash command uses internally, so it works on every
  * claude model rather than relying on per-model API support. Unknown ids are

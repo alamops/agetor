@@ -16,7 +16,27 @@ import { randomUUID } from "node:crypto";
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-tmux-queue-"));
 
-const { __forTest, dismissTmuxPrompt, pasteFollowUp } = await import("./claude-tmux.ts");
+const { __forTest, dismissTmuxPrompt, pasteFollowUp, cycleToMode, sendTurn, sendModalKeys } =
+  await import("./claude-tmux.ts");
+
+// Real type for a withheld-paste outcome, derived from `pasteFollowUp`'s own
+// `onPasteFailure` parameter — `PasteOutcome` itself isn't exported, so this
+// is the only way to get the literal `phase` union (and the rest of the
+// shape) without an `as any` cast at every push site.
+type PasteFailureOutcome = Parameters<
+  NonNullable<NonNullable<Parameters<typeof pasteFollowUp>[2]>["onPasteFailure"]>
+>[0];
+type ModalGuardFailure = Extract<PasteFailureOutcome, { op: "modal-guard" }>;
+
+/** Narrow a captured `onPasteFailure` outcome to the `modal-guard` member so
+ *  `.phase` is accessible without a cast — every guard test here expects
+ *  exactly this member; a mismatch is a real assertion failure, not a type
+ *  hole to paper over. */
+function assertModalGuard(outcome: PasteFailureOutcome): asserts outcome is ModalGuardFailure {
+  if (outcome.op !== "modal-guard") {
+    throw new Error(`expected a modal-guard failure, got op=${outcome.op}`);
+  }
+}
 
 // Each test gets its own taskId + JSONL file so they can't trample each
 // other. The dispatch logic is purely synchronous on flushSync (we don't
@@ -38,6 +58,17 @@ function freshSession(): { taskId: string; jsonlPath: string } {
   writeFileSync(jsonlPath, "");
   return { taskId: randomUUID(), jsonlPath };
 }
+
+// A pane fixture showing a live claude modal — same numbered-picker shape as
+// claude-tmux-local-command.test.ts's PICKER_PANE (duplicated here, not
+// cross-imported, per this task's file-ownership boundary). Used by the
+// `queuePaste` modal-guard tests below (`pasteFollowUp`, `cycleToMode`).
+const BLOCKING_MODAL_PANE = [
+  "Do you want to make this edit to foo.ts?",
+  "❯ 1. Yes",
+  "  2. Yes, allow all",
+  "  3. No",
+].join("\n");
 
 function endTurnLine(text: string): string {
   return JSON.stringify({
@@ -152,7 +183,7 @@ test("pasteFollowUp: folds into the active turn without pushing a new slot", asy
       const doneA = __forTest.pushTurnSlot(state, a.onChunk);
 
       // Fold a message in while the turn is live.
-      expect(pasteFollowUp(taskId, "second message while busy")).toBe(true);
+      expect(pasteFollowUp(taskId, "second message while busy")).toMatchObject({ delivered: true });
       // No second slot — the queue stays at one in-flight turn (synchronous;
       // pasteFollowUp never touches turnQueue).
       expect(state.turnQueue.length).toBe(1);
@@ -191,6 +222,85 @@ test("pasteFollowUp: returns false when no live session exists", () => {
   expect(pasteFollowUp(randomUUID(), "msg")).toBe(false);
 });
 
+// ─── pasteFollowUp({ onPasteFailure }) honors queuePaste's modal guard
+// (docs/plans/model-effort-local-command-turns.md §10, finding #4): a
+// follow-up folded in while a live claude modal is up must not silently
+// vanish — it's withheld, and the caller (the orchestrator, in production)
+// finds out via `onPasteFailure` so it can re-stash the message instead of
+// losing it. ───
+
+test("pasteFollowUp({onPasteFailure}): a blocked pane fires the callback once (phase 'pre-paste') and pastes nothing", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    // Shrink the modal guard's grace/poll so a persistently-blocked pane
+    // withholds in milliseconds instead of paying the real
+    // PASTE_MODAL_GRACE_MS (1.5s) + PASTE_MODAL_POLL_MS (250ms) window.
+    const prevGrace = __forTest.setPasteModalGraceMs(20);
+    const prevPoll = __forTest.setPasteModalPollMs(5);
+    const { taskId, jsonlPath } = freshSession();
+    __forTest.installSession(taskId, jsonlPath);
+    const prevCapture = __forTest.setCapturePastePane(() => BLOCKING_MODAL_PANE);
+    const failures: PasteFailureOutcome[] = [];
+    try {
+      const result = pasteFollowUp(taskId, "a follow-up message", {
+        onPasteFailure: (outcome) => failures.push(outcome),
+      });
+      expect(result).toMatchObject({ delivered: true });
+      if (result === false) throw new Error("expected delivered");
+
+      await __forTest.pasteChains.get(taskId);
+
+      expect(failures.length).toBe(1);
+      const failure = failures[0]!;
+      assertModalGuard(failure);
+      // This is the pre-any-tmux-call guard site — never the TOCTOU re-check
+      // (there's no bracketed Enter gap to race here) or the composer-dirty
+      // branch (composerHoldsText starts false on a fresh session).
+      expect(failure.phase).toBe("pre-paste");
+      expect(readTmuxLog(logPath)).toEqual([]);
+
+      // `pasteOutcome` is the awaitable twin of `onPasteFailure` — same
+      // outcome object, never hangs, never rejects.
+      const outcome = await result.pasteOutcome;
+      expect(outcome).toBe(failure);
+    } finally {
+      __forTest.setCapturePastePane(prevCapture);
+      __forTest.setPasteModalPollMs(prevPoll);
+      __forTest.setPasteModalGraceMs(prevGrace);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("pasteFollowUp without {onPasteFailure}: a blocked pane withholds silently — nothing throws", async () => {
+  await withFakeTmuxBin(async () => {
+    const prevGrace = __forTest.setPasteModalGraceMs(20);
+    const prevPoll = __forTest.setPasteModalPollMs(5);
+    const { taskId, jsonlPath } = freshSession();
+    __forTest.installSession(taskId, jsonlPath);
+    const prevCapture = __forTest.setCapturePastePane(() => BLOCKING_MODAL_PANE);
+    try {
+      const result = pasteFollowUp(taskId, "a follow-up message");
+      expect(result).toMatchObject({ delivered: true });
+      if (result === false) throw new Error("expected delivered");
+      await expect(__forTest.pasteChains.get(taskId)).resolves.toBeUndefined();
+      // Silent withhold still settles pasteOutcome — never hangs, and the
+      // caller can inspect it even without passing onPasteFailure.
+      const outcome = await result.pasteOutcome;
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) {
+        expect(outcome.op).toBe("modal-guard");
+        assertModalGuard(outcome);
+        expect(outcome.phase).toBe("pre-paste");
+      }
+    } finally {
+      __forTest.setCapturePastePane(prevCapture);
+      __forTest.setPasteModalPollMs(prevPoll);
+      __forTest.setPasteModalGraceMs(prevGrace);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
 test("pasteFollowUp: holds the run open across folded turns until the session goes idle", async () => {
   // The fix for the review's medium finding: a single mid-turn follow-up must
   // NOT bounce the run to "succeeded" (task → review) on the intermediate
@@ -205,9 +315,15 @@ test("pasteFollowUp: holds the run open across folded turns until the session go
       const a = recorder();
       const doneA = __forTest.pushTurnSlot(state, a.onChunk);
 
-      expect(pasteFollowUp(taskId, "do another thing")).toBe(true);
+      const foldResult = pasteFollowUp(taskId, "do another thing");
+      expect(foldResult).toMatchObject({ delivered: true });
       expect(state.holdUntilIdle).toBe(true);
       await new Promise((r) => setTimeout(r, 20)); // drain the paste chain
+
+      // The fold's paste actually landed — pasteOutcome resolves { ok: true }
+      // for a successful bracketed paste, same contract as sendTurn's.
+      if (foldResult === false) throw new Error("expected delivered");
+      await expect(foldResult.pasteOutcome).resolves.toEqual({ ok: true });
 
       // R1's response ends, then claude immediately starts answering the
       // folded message (a NEW assistant message id). Driven through the async
@@ -735,6 +851,56 @@ test("queueTmuxOp: skips its body if the session was disposed between scheduling
   });
 });
 
+// ─── cycleToMode's `/plan` branch honors queuePaste's modal guard
+// (docs/plans/model-effort-local-command-turns.md §10, finding #3): a
+// withheld `/plan` paste must be visible to the caller as
+// `{ ok: false, reason: "paste withheld" }` rather than silently reporting
+// `{ ok: true, via: "slash-plan" }` as though it landed — the exact deadlock
+// `reconcileTaskSession`'s post-cycle `ensureInstalledForCwd(cwd, "plan")`
+// call would otherwise walk into. ───
+
+test("cycleToMode('plan'): a blocked pane withholds the /plan paste — result is { ok: false, reason: 'paste withheld' }", async () => {
+  await withFakeTmuxBin(async () => {
+    const prevGrace = __forTest.setPasteModalGraceMs(20);
+    const prevPoll = __forTest.setPasteModalPollMs(5);
+    const { taskId, jsonlPath } = freshSession();
+    __forTest.installSession(taskId, jsonlPath);
+    const prevCapture = __forTest.setCapturePastePane(() => BLOCKING_MODAL_PANE);
+    try {
+      const result = await cycleToMode(taskId, "plan");
+      expect(result).toEqual({ ok: false, reason: "paste withheld" });
+    } finally {
+      __forTest.setCapturePastePane(prevCapture);
+      __forTest.setPasteModalPollMs(prevPoll);
+      __forTest.setPasteModalGraceMs(prevGrace);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("cycleToMode('plan'): a clear pane still returns { ok: true, via: 'slash-plan' } (modal guard is a no-op when nothing is blocking)", async () => {
+  await withFakeTmuxBin(async () => {
+    const { taskId, jsonlPath } = freshSession();
+    __forTest.installSession(taskId, jsonlPath);
+    const idlePane = [
+      "─".repeat(80),
+      "❯ ",
+      "─".repeat(80),
+      "⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent",
+    ].join("\n");
+    const prevCapture = __forTest.setCapturePastePane(() => idlePane);
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    try {
+      const result = await cycleToMode(taskId, "plan");
+      expect(result).toEqual({ ok: true, presses: 0, via: "slash-plan" });
+    } finally {
+      __forTest.setCapturePastePane(prevCapture);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
 // ─── pasteContainsImagePath / countImagePaths detection rules ──────────
 // The image-aware long gap inside `queuePaste` only fires when these
 // helpers signal an image path in the paste. Get the rule wrong in
@@ -878,8 +1044,24 @@ test("queuePaste(bracketed): trailing Enter is skipped when the session is dispo
       __forTest.installSession(taskId, jsonlPath);
       await paste;
       const cmds = readTmuxLog(logPath).map((e) => e.argv[0]);
-      // Paste body landed; Enter was dropped by the re-gate.
-      expect(cmds).toEqual(["load-buffer", "paste-buffer", "delete-buffer"]);
+      // Paste body landed; Enter was dropped by the re-gate. One or more
+      // leading "capture-pane" calls are expected: `queuePaste`'s modal guard
+      // (docs/plans/model-effort-local-command-turns.md §10) reads the pane
+      // via `capturePastePane` (default `captureTail`, which shells out to
+      // this same recording tmux stub) before every guarded paste — AND
+      // again via its own unconditional pre-paste re-check right before
+      // dispatch (§10 re-review finding #2). The stub prints nothing, so
+      // every captured tail is `""` — `paneShowsBlockingPrompt("")` is false,
+      // each guard stage falls through immediately, and the paste proceeds
+      // exactly as before. The exact capture-pane COUNT is a race between
+      // real subprocess spawn timing and this test's own mid-gap teardown
+      // (each stillBlocking-style check is itself a real, variable-latency
+      // tmux spawn) — not a stable invariant — so this asserts the shape
+      // (all-captures-then-the-paste-body) rather than a fixed length.
+      const firstNonCapture = cmds.findIndex((c) => c !== "capture-pane");
+      expect(firstNonCapture).toBeGreaterThan(0);
+      expect(cmds.slice(0, firstNonCapture).every((c) => c === "capture-pane")).toBe(true);
+      expect(cmds.slice(firstNonCapture)).toEqual(["load-buffer", "paste-buffer", "delete-buffer"]);
       expect(cmds).not.toContain("send-keys");
     } finally {
       __forTest.uninstallSession(taskId);
@@ -1077,4 +1259,191 @@ test("queuePaste(image): sends exactly ONE Enter (no stray empty submit / pane i
       __forTest.setSlashCommandSettleMs(prevSettle);
     }
   });
+});
+
+// ─── lastKeystrokeAt: the "agetor last touched this pane" clock (wave 5) ───
+//
+// `bumpKeystroke` is the single write site (see its doc comment in
+// claude-tmux.ts) — every path that delivers keystrokes or a paste to the
+// pane calls it, immediately before the tmux dispatch. `bumpActivity` is a
+// SEPARATE clock (`lastActivityAt`) bumped by claude's own JSONL activity
+// (a turn resolving, a fresh line arriving) — it must never be conflated
+// with `lastKeystrokeAt`, since the whole point of splitting them was that
+// a status-bar hint flickering inside claude's own output kept
+// `lastActivityAt` pinned "now" forever (see `VOLATILE_PANE_LINE_RE`'s doc)
+// while agetor genuinely hadn't touched the pane in a while.
+
+/** Stamp `state.lastKeystrokeAt` far in the past so a bump is unambiguous
+ *  (never a same-millisecond false negative under a fast test run). */
+function staleKeystrokeAt(): number {
+  return Date.now() - 100_000;
+}
+
+test("sendTurn bumps state.lastKeystrokeAt via queuePaste's pre-dispatch write site", async () => {
+  await withFakeTmuxBin(async () => {
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    const stale = staleKeystrokeAt();
+    state.lastKeystrokeAt = stale;
+    try {
+      const agent = sendTurn(taskId, "hello agent", () => {});
+      await agent.pasteOutcome;
+      expect(state.lastKeystrokeAt).toBeGreaterThan(stale);
+    } finally {
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("pasteFollowUp bumps state.lastKeystrokeAt via queuePaste's pre-dispatch write site", async () => {
+  await withFakeTmuxBin(async () => {
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    const stale = staleKeystrokeAt();
+    state.lastKeystrokeAt = stale;
+    try {
+      const result = pasteFollowUp(taskId, "a follow-up");
+      expect(result).toMatchObject({ delivered: true });
+      if (result === false) throw new Error("expected delivered");
+      await result.pasteOutcome;
+      expect(state.lastKeystrokeAt).toBeGreaterThan(stale);
+    } finally {
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("dismissTmuxPrompt bumps state.lastKeystrokeAt (walkCursor / literal-key / confirm keystrokes)", async () => {
+  await withFakeTmuxBin(async () => {
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    const stale = staleKeystrokeAt();
+    state.lastKeystrokeAt = stale;
+    try {
+      const ok = await dismissTmuxPrompt(taskId, "1", {
+        choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+        cursorIndex: 0,
+      });
+      expect(ok).toBe(true);
+      expect(state.lastKeystrokeAt).toBeGreaterThan(stale);
+    } finally {
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("sendModalKeys bumps state.lastKeystrokeAt", async () => {
+  await withFakeTmuxBin(async () => {
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    const stale = staleKeystrokeAt();
+    state.lastKeystrokeAt = stale;
+    try {
+      const ok = await sendModalKeys(taskId, ["Down", "Enter"]);
+      expect(ok).toBe(true);
+      expect(state.lastKeystrokeAt).toBeGreaterThan(stale);
+    } finally {
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("bumpActivity alone (a turn resolving purely from claude's own JSONL content, no agetor keystroke) does NOT touch lastKeystrokeAt", () => {
+  // Drives popEndOfTurn -> bumpActivity with no tmux call anywhere in the
+  // path (flushSync's end_turn staging + force-fire is pure JSONL/queue
+  // bookkeeping) — isolates bumpActivity's write site from bumpKeystroke's.
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  const staleKeystroke = staleKeystrokeAt();
+  state.lastKeystrokeAt = staleKeystroke;
+  state.lastActivityAt = 0;
+  try {
+    __forTest.pushTurnSlot(state, () => {});
+    appendFileSync(jsonlPath, endTurnLine("done"));
+    __forTest.flushSync(state);
+
+    // bumpActivity DID fire (popEndOfTurn's own life-signal bump)...
+    expect(state.lastActivityAt).toBeGreaterThan(0);
+    // ...but lastKeystrokeAt is untouched — no keystroke went out.
+    expect(state.lastKeystrokeAt).toBe(staleKeystroke);
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+// ─── pasteOutcome (wave 5): sendTurn / pasteFollowUp's awaitable paste-landed
+// signal, and the PASTE_DROPPED_OUTCOME backstop for a session torn down
+// before the queued paste ever runs. The pasteFollowUp success/failure cases
+// are also pinned inline above (the "holds the run open" and
+// "{onPasteFailure}"/"without {onPasteFailure}" tests) since those already
+// set up the exact landed/withheld scenarios this contract cares about. ───
+
+test("sendTurn(...).pasteOutcome resolves { ok: true } once the bracketed paste (paste-buffer + Enter) actually lands", async () => {
+  await withFakeTmuxBin(async () => {
+    const { taskId, jsonlPath } = freshSession();
+    __forTest.installSession(taskId, jsonlPath);
+    try {
+      const agent = sendTurn(taskId, "hello agent", () => {});
+      await expect(agent.pasteOutcome).resolves.toEqual({ ok: true });
+    } finally {
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("sendTurn(...).pasteOutcome resolves the modal-guard failure (with phase) when a live modal withholds the opening paste, and the turn's done() rejects", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevGrace = __forTest.setPasteModalGraceMs(20);
+    const prevPoll = __forTest.setPasteModalPollMs(5);
+    const { taskId, jsonlPath } = freshSession();
+    __forTest.installSession(taskId, jsonlPath);
+    const prevCapture = __forTest.setCapturePastePane(() => BLOCKING_MODAL_PANE);
+    try {
+      const agent = sendTurn(taskId, "hello agent", () => {});
+      const outcome = await agent.pasteOutcome!;
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) {
+        assertModalGuard(outcome);
+        expect(outcome.phase).toBe("pre-paste");
+      }
+      // The withheld paste never reached paste-buffer at all.
+      expect(readTmuxLog(logPath).some((e) => e.argv[0] === "paste-buffer")).toBe(false);
+      // sendTurn's own onPasteFailure wiring settles the turn slot too —
+      // the run must not hang "running" forever on a withheld paste.
+      await expect(agent.done).rejects.toThrow();
+    } finally {
+      __forTest.setCapturePastePane(prevCapture);
+      __forTest.setPasteModalPollMs(prevPoll);
+      __forTest.setPasteModalGraceMs(prevGrace);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("sendTurn(...).pasteOutcome resolves a PASTE_DROPPED_OUTCOME-shaped failure (never hangs) when the session is torn down before the queued paste runs", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  __forTest.installSession(taskId, jsonlPath);
+  const agent = sendTurn(taskId, "hello agent", () => {});
+  // The dropped paste also rejects the turn slot's `done` — expected (the
+  // run must settle failed, not hang), but left unhandled here it would
+  // otherwise surface as an unhandled-rejection failure unrelated to this
+  // test's actual assertion (pasteOutcome, below).
+  agent.done.catch(() => {});
+  // Tear down the session SYNCHRONOUSLY, before the queued tmux op's
+  // microtask gets a chance to run — queueTmuxOp's identity gate
+  // (`sessions.get(taskId) === expectedState`) then drops the op body
+  // entirely, so no tmux call (and no fake tmux bin) is needed here.
+  __forTest.uninstallSession(taskId);
+
+  const outcome = await Promise.race([
+    agent.pasteOutcome!,
+    new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("pasteOutcome never settled")), 2000);
+    }),
+  ]);
+  expect(outcome.ok).toBe(false);
+  if (!outcome.ok) {
+    expect(outcome.op).toBe("send-keys");
+    expect(outcome.stderr).toContain("paste dropped");
+  }
 });
