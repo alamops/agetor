@@ -4347,13 +4347,21 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
-      // Unread-messages indicator: mark a task's watermark caught up.
-      // Intentionally NOT gated by `backlogGuard`/an archived check — marking
-      // seen is user-side read state, not a task mutation, and the archived
-      // board view still needs to be able to clear a dot (plan §3/§4).
+      // Unread-messages indicator: mark a task's watermark caught up (POST)
+      // or re-flag it as unread (DELETE — "Mark as unread" in the board's
+      // task context menu). Intentionally NOT gated by `backlogGuard`/an
+      // archived check for either verb — both are user-side read state, not
+      // a task mutation, and the archived board view still needs to be able
+      // to set/clear a dot (plan §3/§4).
       "/tasks/:id/seen": {
         POST: authed((req) => {
           const updated = tasks.markSeen(req.params.id);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        DELETE: authed((req) => {
+          const updated = tasks.markUnread(req.params.id);
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });

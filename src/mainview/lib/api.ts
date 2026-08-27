@@ -1249,6 +1249,15 @@ export const api = {
    *  don't wait for the next poll). Idempotent; safe to fire-and-forget. */
   markTaskSeen: (taskId: string) =>
     j<Task>(`/tasks/${taskId}/seen`, { method: "POST" }),
+  /** Re-flags a task's read watermark as unread — the board's task context
+   *  menu's "Mark as unread" entry, restoring `task.unread`'s "New messages"
+   *  dot. No-op (server-side) when the task has no assistant messages yet
+   *  (`task.hasAssistantMessages` is the client-side gate for showing the
+   *  menu entry at all). Returns the full updated Task so the caller can
+   *  merge only the `unread` field back into board state, same as
+   *  `markTaskSeen`. */
+  markTaskUnread: (taskId: string) =>
+    j<Task>(`/tasks/${taskId}/seen`, { method: "DELETE" }),
 
   // Messages backlog — saved, not-yet-sent draft messages parked on a task.
   // Every mutation returns the full updated Task so the caller can re-sync.

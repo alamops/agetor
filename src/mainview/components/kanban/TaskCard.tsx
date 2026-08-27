@@ -26,9 +26,13 @@ interface Props {
    *  user is actively watching the task (messages streamed while open are
    *  marked seen on close, not shown as unread in the meantime). */
   isOpen?: boolean;
+  /** Right-click (or keyboard menu-key) on the card. `pos` is where App.tsx's
+   *  task context menu should anchor — omitted entirely when the caller
+   *  doesn't wire it up (no menu to open). */
+  onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
 }
 
-function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, isOpen }: Props) {
+function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu }: Props) {
   const archived = task.archivedAt != null;
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
@@ -81,7 +85,35 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         awaiting && "ring-2 ring-warning/60 ring-offset-2 ring-offset-background animate-awaiting-pulse motion-reduce:animate-none",
         archived && "cursor-default opacity-60",
       )}
+      // `onClick` (open) stays untouched by the addition below — a
+      // right-click never opens the panel, only `onContextMenu` fires for it.
       onClick={() => onOpen(task)}
+      // dnd-kit's `useDraggable` above is unaffected by right-click: its
+      // `PointerSensor` bails on `event.button !== 0`, so a right-click can
+      // never arm a drag — `{...listeners}` and this handler don't fight.
+      onContextMenu={(e) => {
+        e.preventDefault();
+        if (!onContextMenu) return;
+        // Keyboard-invoked context menus (Shift+F10 / the menu key) report
+        // clientX/Y = 0,0 — anchor those to the card instead of the
+        // viewport corner.
+        const fromKeyboard = e.clientX === 0 && e.clientY === 0;
+        const r = e.currentTarget.getBoundingClientRect();
+        onContextMenu(task, fromKeyboard ? { x: r.left, y: r.top } : { x: e.clientX, y: e.clientY });
+      }}
+      // The card is focusable (dnd-kit's `attributes` below add
+      // `tabIndex=0`), so a right-click would otherwise focus it and WebKit
+      // scrolls a partially-visible card into view inside `.kanban-scroll`;
+      // the board would visibly jump (and focus would land on the card)
+      // under the freshly-opened menu. Only suppress the default for the
+      // right button — left-click focus/drag
+      // behavior (dnd-kit's `PointerSensor`, wired via `{...listeners}`
+      // below as `onPointerDown`, so there's no prop collision here) is
+      // untouched, and `contextmenu` still fires after a default-prevented
+      // `mousedown`.
+      onMouseDown={(e) => {
+        if (e.button === 2) e.preventDefault();
+      }}
       {...listeners}
       {...attributes}
     >

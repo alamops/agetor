@@ -29,6 +29,9 @@ interface Props {
    *  `TaskCard` as `isOpen` so the unread dot is suppressed for the task
    *  being actively watched. */
   selectedTaskId?: string | null;
+  /** Right-click on a card within this column — forwarded verbatim to every
+   *  `TaskCard`. See `TaskCard`'s doc comment for the payload shape. */
+  onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
 }
 
 /** Array is considered unchanged when same length and every element is the
@@ -43,7 +46,7 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
-function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId }: Props) {
+function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   return (
     <div
@@ -77,6 +80,7 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
             onArchive={onArchive}
             onUnarchive={onUnarchive}
             isOpen={t.id === selectedTaskId}
+            onContextMenu={onContextMenu}
           />
         ))}
       </div>
@@ -112,5 +116,6 @@ export const Column = memo(ColumnImpl, (prev, next) => (
   prev.onUnarchive === next.onUnarchive &&
   prev.emptyHint === next.emptyHint &&
   prev.selectedTaskId === next.selectedTaskId &&
+  prev.onContextMenu === next.onContextMenu &&
   sameTasks(prev.tasks, next.tasks)
 ));
