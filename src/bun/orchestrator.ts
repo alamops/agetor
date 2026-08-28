@@ -954,19 +954,27 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   // keeps the `@tokens` and re-resolves them against whatever cwd that next
   // run gets (a fresh worktree, a moved workdir, etc).
   const expandedPrompt = expandAtReferences(task.prompt, prepared.cwd);
-  // Budget-check the fully expanded + reffed prompt — not the raw one —
-  // before touching the DB at all. Expansion can turn a handful of short
-  // `@tokens` into long absolute paths and push a prompt over an agent's
-  // argv-launch cap (gemini today, see prompt-limits.ts) even though the
-  // raw text the user typed comfortably fit under it. Catching that here
-  // means a rejected start never inserts a run row or flips the task to
-  // `running` in the first place.
-  const overage = promptByteOverage(harness.kind, appendReferences(expandedPrompt, task.references));
-  if (overage) {
+  // Budget-check the fully expanded + reffed prompt against what the RAW
+  // (pre-expansion) prompt would already have needed. Expansion can turn a
+  // handful of short `@tokens` into long absolute paths and push a prompt
+  // over an agent's argv-launch cap (gemini today, see prompt-limits.ts)
+  // even though the raw text the user typed comfortably fit under it —
+  // that's the ONLY case this pre-check exists to catch early, before any
+  // run row is inserted or the task flips to `running`. A prompt that was
+  // ALREADY over budget with no `@` tokens involved (`rawOverage` truthy
+  // too) is deliberately left alone here and falls through to the
+  // pre-existing hardening below — `buildCommand`'s own throw inside
+  // `spawnAgentOrFail`'s catch, exercised (with a run row landing `failed`)
+  // by orchestrator-fx.test.ts's "spawn-throw hardening (gemini)" test —
+  // so that pre-existing behavior/error text is unchanged by this feature.
+  const expandedOverage = promptByteOverage(harness.kind, appendReferences(expandedPrompt, task.references));
+  const rawOverage = promptByteOverage(harness.kind, appendReferences(task.prompt, task.references));
+  if (expandedOverage && !rawOverage) {
     return {
       error:
-        `prompt is ${overage.bytes - overage.limit} bytes over ${harness.label}'s ${overage.limit}-byte `
-        + `launch limit after expanding @ file references — shorten it or reference fewer files`,
+        `prompt is ${expandedOverage.bytes - expandedOverage.limit} bytes over ${harness.label}'s `
+        + `${expandedOverage.limit}-byte launch limit after expanding @ file references — shorten it or `
+        + `reference fewer files`,
     };
   }
 
