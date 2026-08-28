@@ -142,3 +142,11 @@ Assumptions logged (routine, reversible):
 5. Backlog inline editor and the DiffDialog composer get server-side expansion but no popover/highlight (no composer machinery there today).
 6. The CLI needs no change; `agetor send "@src/x.ts"` expands server-side. `--ref` semantics unchanged.
 7. The sibling branch is merged with `--no-ff` (its commits ride along until its own PR lands; PR diff shrinks afterwards).
+
+## 10. Outcome (2026-08-28)
+
+- **Commits** (branch `feature/reference-files-in-the-from-the-selected`, base `795a5ef` = merge of `fix/remove-from-issue-field-of-new-task`): `44ab83e` plan · `4b74b89` wave 1 · `db5c326` wave 2 · `d505dfd` wave 3 · `e4faa41` budget pre-check carve-out · `c3f9b4c` e2e spec · `a6980ca` review fixes. Not pushed.
+- **Deviation from §4:** the sibling branch's own follow-up (merged in wave 0) had already moved RunPanel's send box onto `PromptComposer`, so T7 shrank to "pass a `fileScope`" — the `@` layer is wired once, in `PromptComposer`.
+- **Review** (opus, `code-review` skill): 3 major / 11 minor / 7 nit — all 21 applied in `a6980ca` (+ the wave-2 regression T4 caught in the full suite: the budget pre-check must not intercept prompts already over the cap, `e4faa41`).
+- **Verification:** `bun run typecheck` clean; `bun test` 4059 pass / 3 skip / 0 fail (205 files; baseline on the merged tree was 3934); Playwright `at-file-autocomplete` 9/9, `issue-task` 6/6, `resolve-conflicts` 1/1, `quote` 1/1 (17/17).
+- **Open:** owner smoke test of the highlight backdrop in the dev build (`bun run dev:hmr`, `~/.agetor-dev`) — Chromium-verified, WKWebView metrics not machine-verified. Two documented validity divergences (gitignored paths and paths past the 20k cap are expanded on send but not highlighted).
