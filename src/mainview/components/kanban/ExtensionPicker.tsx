@@ -80,7 +80,16 @@ export function ExtensionPicker({
     const onDocClick = (e: MouseEvent) => {
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // Consume Escape (while the popover is open — this effect only runs
+      // then) before it reaches Dialog's document listener, which registered
+      // earlier and would otherwise run first and close the whole dialog
+      // instead of just this popover. See the data-popover-open convention
+      // in dialog.tsx.
+      e.preventDefault();
+      setOpen(false);
+    };
     document.addEventListener("mousedown", onDocClick);
     document.addEventListener("keydown", onKey);
     return () => {
@@ -166,6 +175,7 @@ export function ExtensionPicker({
     <div ref={rootRef} className="relative">
       <button
         type="button"
+        data-testid="extension-picker-trigger"
         disabled={disabled}
         onClick={() => setOpen((o) => !o)}
         title="Insert an MCP server, skill, plugin reference, or saved prompt"
@@ -182,6 +192,8 @@ export function ExtensionPicker({
 
       {open && (
         <div
+          data-popover-open=""
+          data-testid="extension-picker-popover"
           className={cn(
             "absolute z-30 w-72 max-w-[90vw] overflow-hidden rounded-md border border-border/60 bg-card text-card-foreground shadow-lg",
             placement === "above" ? "bottom-full mb-1" : "top-full mt-1",
@@ -191,6 +203,7 @@ export function ExtensionPicker({
           <div className="border-b border-border/60 p-1.5">
             <input
               ref={searchRef}
+              data-testid="extension-picker-search"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={(e) => {
@@ -237,6 +250,7 @@ export function ExtensionPicker({
                         <button
                           type="button"
                           data-idx={idx}
+                          data-testid="extension-picker-row"
                           // mousedown so the textarea doesn't blur before insert.
                           onMouseDown={(ev) => { ev.preventDefault(); insert(row); }}
                           onMouseEnter={() => setActive(idx)}

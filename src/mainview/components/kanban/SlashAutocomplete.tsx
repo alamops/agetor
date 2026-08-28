@@ -178,6 +178,8 @@ export function SlashAutocomplete({ commands, savedPrompts, value, onChange, tex
 
   return (
     <div
+      data-popover-open=""
+      data-testid="slash-autocomplete"
       className={cn(
         "absolute left-0 right-0 z-20 max-h-56 overflow-y-auto rounded-md border border-border/60 bg-card text-card-foreground shadow-lg",
         // The textarea sits inside a `relative` wrapper provided by the
@@ -193,7 +195,10 @@ export function SlashAutocomplete({ commands, savedPrompts, value, onChange, tex
           // always come first, so this fires at most once.
           const showPromptLabel = row.tag === "prompt" && filtered[i - 1]?.tag !== "prompt";
           return (
-          <li key={row.tag === "cmd" ? `${row.cmd.kind}:${row.cmd.name}` : `prompt:${row.prompt.id}`}>
+          <li
+            data-testid="slash-autocomplete-row"
+            key={row.tag === "cmd" ? `${row.cmd.kind}:${row.cmd.name}` : `prompt:${row.prompt.id}`}
+          >
             {showPromptLabel && (
               <div className="flex items-center gap-1.5 px-3 pb-0.5 pt-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                 <BookText className="size-3 opacity-70" />

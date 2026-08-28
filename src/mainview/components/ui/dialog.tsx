@@ -89,7 +89,22 @@ export function Dialog({
       // run first and close the wrong layer.
       if (panelRef.current !== openDialogStack[openDialogStack.length - 1]) return;
 
+      // A nested popover (SlashAutocomplete's Escape/Tab/Enter handling) may
+      // have already consumed this key for its own purposes — don't also
+      // drive the dialog's Escape-close or Tab-trap on top of that.
+      if (e.defaultPrevented) return;
+
       if (e.key === "Escape") {
+        // Yield to an open popover so Escape closes IT first, not the whole
+        // dialog. `defaultPrevented` above can't catch this case: ExtensionPicker
+        // and SearchSelect register their own document-level keydown listeners,
+        // but Dialog's listener is registered earlier (it mounted first) and so
+        // runs first on the same keydown — by the time theirs would call
+        // preventDefault(), Dialog has already acted. The DOM marker is the
+        // only thing observable at this point. Carriers of `data-popover-open`:
+        // SearchSelect, the task context menu, and (after this change)
+        // SlashAutocomplete / ExtensionPicker.
+        if (document.querySelector("[data-popover-open]")) return;
         e.preventDefault();
         onCloseRef.current();
         return;
