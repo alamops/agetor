@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
@@ -8,27 +8,52 @@ import { gotoApp } from "./helpers";
 import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub";
 
 /**
- * E2E coverage for "New task from a Git issue + its comment thread"
- * (docs/plans/new-task-from-git-issue.md §5 T4 — covers Tasks B, C, D, E):
+ * E2E coverage for "task from a Git issue + its comment thread" via the
+ * issue detail page's "Work on this with Agetor" dialog
+ * (`CreateTaskFromIssueDialog.tsx`), which — per
+ * docs/plans/issue-pr-modal-worktree-composer-parity.md — now carries the
+ * New Task left panel's worktree row (`WorktreeOptions`) and prompt composer
+ * (`PromptComposer`) via shared modules, so the two can't drift. The panel's
+ * own "From issue" paste-URL row was removed on this branch (issue tasks are
+ * still created from this dialog and from `agetor add --issue`), so the
+ * form-path tests that used to live here are gone too.
  *
- *  1. Issue detail page -> "Work on this with Agetor" (`IssueActions` in
- *     `GitHubDialog.tsx`) -> the stacked `CreateTaskFromIssueDialog` ->
- *     create & start -> board card + durable `issueUrl`/snapshot reference
- *     -> run panel "View issue" -> task card context menu "View issue".
- *  2. New Task sidebar -> paste an issue URL -> seeded title/prompt/chip ->
- *     "To backlog" -> a linked backlog task.
- *  3. Pasting an issue URL for a *different* repository than the selected
- *     project is rejected with no chip.
+ * Four scenarios, all against the same fixture issue #7:
+ *
+ *  1. Dialog path (baseline): issue detail -> "Work on this with Agetor" ->
+ *     the stacked `CreateTaskFromIssueDialog` -> create & start (default
+ *     Isolate ON) -> board card + durable `issueUrl`/snapshot reference ->
+ *     run panel "View issue" -> task card context menu "View issue".
+ *  2. Isolate off: unchecking `isolate-toggle` swaps the info-box copy, hides
+ *     the branch-name field, and creates a task with `isolation: "none"` and
+ *     no branch/worktree.
+ *  3. Branch-from + custom name: picking a non-default branch in the
+ *     `WorktreeOptions` Branch picker and typing a custom branch name sends
+ *     both through — `baseRef` resolves server-side to that branch's sha.
+ *  4. Composer: the `/` slash autocomplete and the "MCP · Skills · Plugins ·
+ *     Prompts" extension picker both insert into the prompt textarea, Escape
+ *     closes an open popover without closing the dialog underneath it (the
+ *     `dialog.tsx` / `data-popover-open` fix), and the Files/Folders
+ *     references picker renders (its native file panel isn't e2e-drivable).
  *
  * Arrange: one throwaway git repo with `origin` -> `https://github.com/
  * e2e-org/e2e-repo.git` (same recipe as `e2e/pr-merged-state.spec.ts`'s
  * `initRepo`), registered as a project through the real `POST /projects`.
- * Shared across all three tests (`beforeAll`/`afterAll`, serial mode) — the
- * three scenarios are really three views of the same issue #7. The stub
- * GitHub API (`e2e/github-stub.ts`) is started once on
+ * Shared across all four tests (`beforeAll`/`afterAll`, serial mode) — the
+ * four scenarios are really four views of the same issue #7 and the same
+ * fixture repo. The stub GitHub API (`e2e/github-stub.ts`) is started once on
  * `backend.githubStubPort` and its route table is installed once in
  * `beforeAll` (issue #7's data never changes across these tests, unlike
  * pr-merged-state's mid-test PR-state flips).
+ *
+ * The fixture repo also carries a `.claude/skills/e2e-skill/SKILL.md` and a
+ * root `.mcp.json` (committed on `main`, present on `develop` too) so
+ * `listAgentCapabilities`'s claude-code discovery (src/bun/commands.ts) has
+ * something project-scoped to surface in the composer test's extension
+ * picker, plus a `develop` branch (one commit ahead of `main`) for the
+ * branch-from test's Branch picker. Discovery reads the *source* repo on
+ * disk (the dialog's `workdir`), not a worktree, and needs no claude binary
+ * — `CLAUDE_BUILTINS` (e.g. `/code-review`) are always listed regardless.
  *
  * `openGitDialog` explicitly selects this spec's project in the dialog's
  * Project combobox — see `pr-merged-state.spec.ts`'s file header for why
@@ -44,6 +69,13 @@ const ISSUE_TITLE = "reconcileById loses task identity on rapid polls";
 const ISSUE_HTML_URL = `https://github.com/e2e-org/e2e-repo/issues/${ISSUE_NUMBER}`;
 const COMMENT_1_BODY = "Repro on 0.9.3 — reconcileById loses identity";
 const COMMENT_2_BODY = "Confirmed on main";
+const CARD_TITLE = `Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}`;
+
+// Tooltip WorktreeOptions puts on the Branch picker trigger while isolated —
+// see WorktreeOptions.tsx. Used to find the trigger without depending on
+// BranchPicker's internal DOM structure (label and picker aren't siblings).
+const BRANCH_PICKER_TITLE =
+  "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start.";
 
 // Generous but bounded convergence timeout — the create+start round trip
 // involves a real worktree/branch creation against a real temp git repo, on
@@ -67,8 +99,40 @@ async function initRepo(): Promise<string> {
   git(dir, ["config", "commit.gpgsign", "false"]);
   git(dir, ["remote", "add", "origin", "https://github.com/e2e-org/e2e-repo.git"]);
   await writeFile(path.join(dir, "README.md"), "e2e fixture repo\n");
+
+  // Discovery fixtures for the composer test — listAvailableCommands /
+  // discoverMcpAndPluginExtensions (src/bun/commands.ts) read these straight
+  // off this SOURCE repo on disk, not a worktree. A project skill's
+  // slash-invokable name is its folder name (discoverSkills) — the SKILL.md
+  // frontmatter only needs `description:` — and a project .mcp.json's
+  // `mcpServers` keys surface as `@name` mention extensions
+  // (mcpServersToExtensions). Planted and committed on `main` (before the
+  // `develop` branch below forks off it, so it inherits them too) so `git
+  // status` stays clean for the worktree machinery.
+  await mkdir(path.join(dir, ".claude", "skills", "e2e-skill"), { recursive: true });
+  await writeFile(
+    path.join(dir, ".claude", "skills", "e2e-skill", "SKILL.md"),
+    "---\ndescription: An e2e fixture skill.\n---\nDo the e2e thing.\n",
+  );
+  await writeFile(
+    path.join(dir, ".mcp.json"),
+    JSON.stringify({ mcpServers: { "e2e-mcp": { command: "true" } } }),
+  );
+
   git(dir, ["add", "-A"]);
   git(dir, ["commit", "-q", "-m", "initial commit"]);
+
+  // A second branch, one commit ahead of `main`, purely for the branch-from
+  // test's Branch picker (BranchPicker lists local branches of the project).
+  // Switch back to `main` afterward so the fixture's checked-out branch (and
+  // hence claude-code's discovery read of this same `dir`) is unaffected by
+  // whichever base ref a test later *picks* in the dialog.
+  git(dir, ["checkout", "-q", "-b", "develop"]);
+  await writeFile(path.join(dir, "DEVELOP.md"), "develop marker\n");
+  git(dir, ["add", "-A"]);
+  git(dir, ["commit", "-q", "-m", "develop commit"]);
+  git(dir, ["checkout", "-q", "main"]);
+
   return dir;
 }
 
@@ -177,12 +241,6 @@ function issueRoutes(): StubRoute[] {
   ];
 }
 
-/** The New Task sidebar's `<aside>` — mounted first in App.tsx's JSX (see
- *  e2e/quote.spec.ts / e2e/task-context-menu.spec.ts's identical helpers). */
-function newTaskAside(page: Page): Locator {
-  return page.locator("aside").first();
-}
-
 /** The run panel's slide-over `<aside>` — mounted after NewTaskForm, so
  *  `.last()` resolves it once a task is open. */
 function runPanel(page: Page): Locator {
@@ -234,21 +292,40 @@ async function openGitDialog(page: Page): Promise<Locator> {
   return dialog;
 }
 
-/** Selects `projectDir` in the New Task sidebar's Project field
- *  (`ProjectPicker` -> `SearchSelect`, a hand-rolled combobox — not a native
- *  `<select>`, so this drives its popover directly): opens the popover via
- *  the trigger button immediately following the plain-text "Project" label,
- *  types the directory's basename into the search box to filter down to
- *  exactly this project, then clicks the one matching row. */
-async function selectProjectInForm(page: Page, dir: string): Promise<void> {
-  const form = newTaskAside(page);
-  const trigger = form.locator('label:text-is("Project") + div button').first();
-  await trigger.click();
-  const search = form.locator('input[placeholder="Search projects…"]');
-  const base = path.basename(dir);
-  await expect(search).toBeVisible();
-  await search.fill(base);
-  await form.getByRole("button", { name: base }).first().click();
+/** Drives the issue detail page's "Work on this with Agetor" button and
+ *  waits for `CreateTaskFromIssueDialog` (`issue-task-dialog`) to be up with
+ *  its prompt seeded from the fetched thread — the common setup every test
+ *  below needs before it starts poking at the worktree row or the composer.
+ *  Scoped locators throughout: once this dialog is open, two `role=dialog`s
+ *  are stacked (`GitHubDialog` underneath), so every subsequent locator in a
+ *  test should be rooted at the returned `issueTaskDialog`, not `page`. */
+async function openIssueTaskDialog(page: Page): Promise<Locator> {
+  const dialog = await openGitDialog(page);
+
+  const row = dialog.getByRole("button", { name: `#${ISSUE_NUMBER} ${ISSUE_TITLE}` });
+  await expect(row).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  await row.click();
+
+  // Detail subpage loaded — its header renders the issue's plain-text title
+  // (GitHubDialog.tsx's `expandedItem.title` line).
+  await expect(dialog.getByText(ISSUE_TITLE, { exact: true })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+  const workButton = dialog.getByTestId("issue-work-with-agetor");
+  await expect(workButton).toBeVisible();
+  await workButton.click();
+
+  const issueTaskDialog = page.getByTestId("issue-task-dialog");
+  await expect(issueTaskDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+  const promptTextarea = issueTaskDialog.getByTestId("prompt-textarea");
+  await expect(promptTextarea).toBeVisible();
+  await expect(async () => {
+    const value = await promptTextarea.inputValue();
+    expect(value).toContain(`Issue #${ISSUE_NUMBER}`);
+    expect(value).toContain(COMMENT_1_BODY);
+  }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+  return issueTaskDialog;
 }
 
 test.beforeAll(async ({ backend }) => {
@@ -286,7 +363,17 @@ async function findTaskByTitle(
   request: APIRequestContext,
   backend: E2EBackend,
   title: string,
-): Promise<{ id: string; issueUrl: string | null; references: { path: string; isDirectory: boolean }[]; column: string } | null> {
+): Promise<{
+  id: string;
+  issueUrl: string | null;
+  references: { path: string; isDirectory: boolean }[];
+  column: string;
+  isolation: "worktree" | "none";
+  branch: string | null;
+  baseRef: string | null;
+  worktreePath: string | null;
+  branchSource: "created" | "existing";
+} | null> {
   const res = await request.get(`${backend.apiBase}/tasks`, {
     headers: { authorization: `Bearer ${backend.apiToken}` },
   });
@@ -297,8 +384,29 @@ async function findTaskByTitle(
     issueUrl: string | null;
     references: { path: string; isDirectory: boolean }[];
     column: string;
+    isolation: "worktree" | "none";
+    branch: string | null;
+    baseRef: string | null;
+    worktreePath: string | null;
+    branchSource: "created" | "existing";
   }>;
   return rows.find((r) => r.title === title) ?? null;
+}
+
+/** Polls `GET /tasks` until a task with `title` shows up, registers it for
+ *  cleanup, and returns it. Shared by every test below that creates a task. */
+async function awaitCreatedTask(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  title: string,
+): Promise<NonNullable<Awaited<ReturnType<typeof findTaskByTitle>>>> {
+  let task: Awaited<ReturnType<typeof findTaskByTitle>> = null;
+  await expect(async () => {
+    task = await findTaskByTitle(request, backend, title);
+    expect(task).not.toBeNull();
+  }).toPass({ timeout: CONVERGE_TIMEOUT });
+  createdTaskIds.push(task!.id);
+  return task!;
 }
 
 test.describe("task from a Git issue", () => {
@@ -396,66 +504,187 @@ test.describe("task from a Git issue", () => {
     createdTaskIds.splice(createdTaskIds.indexOf(taskId), 1);
   });
 
-  test("form path: New Task sidebar paste-URL seeds title/prompt/chip and links the created task", async ({
+  test("isolate off: unchecking Isolate creates a task with no worktree", async ({ page, request, backend }) => {
+    test.setTimeout(60_000);
+    await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
+
+    const worktreeOptions = issueTaskDialog.getByTestId("worktree-options");
+    const isolateToggle = worktreeOptions.getByTestId("isolate-toggle");
+    await expect(isolateToggle).toBeChecked();
+    await isolateToggle.uncheck();
+
+    await expect(
+      issueTaskDialog.getByText(/Runs the agent directly in the project checkout/),
+    ).toBeVisible();
+    await expect(worktreeOptions.getByTestId("branch-name-input")).toHaveCount(0);
+
+    const submit = issueTaskDialog.getByTestId("issue-task-submit");
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await submit.click();
+    await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+
+    const task = await awaitCreatedTask(request, backend, CARD_TITLE);
+
+    expect(task.isolation).toBe("none");
+    expect(task.branch).toBeNull();
+    expect(task.worktreePath).toBeNull();
+
+    await deleteTask(request, backend, task.id);
+    createdTaskIds.splice(createdTaskIds.indexOf(task.id), 1);
+  });
+
+  test("branch-from + custom name: picking develop as the base ref and a custom branch name sends both", async ({
     page,
     request,
     backend,
   }) => {
     test.setTimeout(60_000);
     await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
 
-    await selectProjectInForm(page, projectDir);
+    const worktreeOptions = issueTaskDialog.getByTestId("worktree-options");
 
-    const urlInput = page.getByTestId("issue-url-input");
-    await expect(urlInput).toBeEnabled();
-    await urlInput.fill(ISSUE_HTML_URL);
-    await page.getByTestId("issue-url-load").click();
+    // BranchPicker's label and its SearchSelect trigger aren't DOM siblings
+    // (the label shares a flex row with the Git Pull/Fetch buttons), so find
+    // the trigger by its tooltip instead — WorktreeOptions.tsx sets this
+    // exact title while isolated.
+    const branchTrigger = worktreeOptions.getByTitle(BRANCH_PICKER_TITLE);
+    await branchTrigger.scrollIntoViewIfNeeded();
+    await branchTrigger.click();
 
-    const titleInput = page.getByPlaceholder("Short description");
-    await expect(async () => {
-      expect(await titleInput.inputValue()).toBe(`Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}`);
-    }).toPass({ timeout: CONVERGE_TIMEOUT });
+    const search = worktreeOptions.getByPlaceholder("Search branches…");
+    await expect(search).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await search.fill("develop");
 
-    const promptTextarea = page.getByPlaceholder("What should the agent do? Type / for commands.");
-    await expect(async () => {
-      expect(await promptTextarea.inputValue()).toContain(COMMENT_1_BODY);
-    }).toPass({ timeout: CONVERGE_TIMEOUT });
+    const popover = worktreeOptions.locator("[data-popover-open]");
+    const developRow = popover.locator("button").filter({ hasText: "develop" }).first();
+    await expect(developRow).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await developRow.scrollIntoViewIfNeeded();
+    await developRow.click();
 
-    const chip = page.getByTestId("issue-link-chip");
-    await expect(chip).toBeVisible();
-    await expect(chip).toContainText(`Issue #${ISSUE_NUMBER}`);
+    const branchNameInput = worktreeOptions.getByTestId("branch-name-input");
+    await expect(branchNameInput).toBeVisible();
+    await branchNameInput.fill("feature/e2e-custom");
 
-    await page.getByRole("button", { name: "To backlog", exact: true }).click();
+    const submit = issueTaskDialog.getByTestId("issue-task-submit");
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await submit.click();
+    await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
 
-    const formCardTitle = `Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}`;
-    let task: Awaited<ReturnType<typeof findTaskByTitle>> = null;
-    await expect(async () => {
-      task = await findTaskByTitle(request, backend, formCardTitle);
-      expect(task).not.toBeNull();
-    }).toPass({ timeout: CONVERGE_TIMEOUT });
-    const taskId = task!.id;
-    createdTaskIds.push(taskId);
+    const task = await awaitCreatedTask(request, backend, CARD_TITLE);
 
-    expect(task!.column).toBe("backlog");
-    expect(task!.issueUrl).toBe(ISSUE_HTML_URL);
+    const expectedBaseRef = execFileSync("git", ["rev-parse", "develop"], { cwd: projectDir })
+      .toString()
+      .trim();
 
-    await deleteTask(request, backend, taskId);
-    createdTaskIds.splice(createdTaskIds.indexOf(taskId), 1);
+    expect(task.isolation).toBe("worktree");
+    expect(task.branch).toBe("feature/e2e-custom");
+    expect(task.baseRef).toBe(expectedBaseRef);
+
+    await deleteTask(request, backend, task.id);
+    createdTaskIds.splice(createdTaskIds.indexOf(task.id), 1);
   });
 
-  test("wrong repo: pasting an issue URL for a different repository is rejected with no chip", async ({
+  test("composer: slash autocomplete, extension picker, Escape yields to the popover, references picker renders", async ({
     page,
     backend,
   }) => {
+    test.setTimeout(60_000);
     await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
 
-    await selectProjectInForm(page, projectDir);
+    const promptTextarea = issueTaskDialog.getByTestId("prompt-textarea");
 
-    const urlInput = page.getByTestId("issue-url-input");
-    await urlInput.fill(`https://github.com/other-org/other-repo/issues/${ISSUE_NUMBER}`);
-    await page.getByTestId("issue-url-load").click();
+    // Place the caret at the end of the seeded prompt, then type a `/`
+    // trigger — SlashAutocomplete only opens for a `/` at line-start or
+    // after whitespace, hence the leading `\n`.
+    await promptTextarea.click();
+    await promptTextarea.evaluate((el: HTMLTextAreaElement) => {
+      el.setSelectionRange(el.value.length, el.value.length);
+    });
+    await page.keyboard.type("\n/code-");
 
-    await expect(page.getByText(/different repository/i)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-    await expect(page.getByTestId("issue-link-chip")).toHaveCount(0);
+    const slashMenu = issueTaskDialog.getByTestId("slash-autocomplete");
+    await expect(slashMenu).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    const codeReviewRow = slashMenu.getByTestId("slash-autocomplete-row").filter({ hasText: "/code-review" });
+    await expect(codeReviewRow).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    // Click the row directly rather than pressing Enter (which inserts
+    // whichever row is "active" — index 0 by default): claude-code's user-
+    // level discovery reads the REAL machine's `~/.claude/skills`
+    // (commands.ts has no way to fake `os.homedir()`, same limitation
+    // commands.test.ts documents), and a real installed skill can
+    // legitimately mention "code-review" in its own description (e.g. a
+    // parenthetical "(code-review)") and so also match the `code-` query —
+    // sorting ahead of `/code-review` alphabetically would make Enter
+    // non-deterministic across machines. Clicking the exact row keeps this
+    // assertion about the autocomplete's matching/inserting behavior
+    // regardless of what else is installed locally.
+    await codeReviewRow.click();
+    await expect(async () => {
+      expect(await promptTextarea.inputValue()).toContain("/code-review ");
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+    // Reopen the menu, then Escape it — regression guard for the
+    // dialog.tsx `data-popover-open` fix: Escape must close the popover,
+    // not the dialog underneath it. Trailing filler text (typed first, then
+    // the caret is moved back before it) is deliberate: SlashAutocomplete's
+    // own Escape handler exits the query slice by moving the caret to
+    // `el.value.length` (the document's absolute end) — a no-op when the
+    // `/query` is already sitting at that exact position, which it would be
+    // if we typed it with nothing after it. With real trailing content, the
+    // same handler genuinely exits the slice, so this exercises the popover
+    // actually closing (not just the dialog surviving the keypress).
+    await page.keyboard.type(" x");
+    await page.keyboard.press("ArrowLeft");
+    await page.keyboard.press("ArrowLeft");
+    await page.keyboard.type("/co");
+    await expect(slashMenu).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await page.keyboard.press("Escape");
+    await expect(slashMenu).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await expect(issueTaskDialog).toBeVisible();
+
+    // Extension picker: a project skill inserts as `/name`.
+    const extTrigger = issueTaskDialog.getByTestId("extension-picker-trigger");
+    const extPopover = issueTaskDialog.getByTestId("extension-picker-popover");
+    const extSearch = issueTaskDialog.getByTestId("extension-picker-search");
+
+    await extTrigger.click();
+    await expect(extPopover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await extSearch.fill("e2e-skill");
+    const skillRow = extPopover.getByTestId("extension-picker-row").filter({ hasText: "e2e-skill" });
+    await expect(skillRow).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await skillRow.click();
+    await expect(async () => {
+      expect(await promptTextarea.inputValue()).toContain("/e2e-skill ");
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+    // A project MCP server inserts as `@name`.
+    await extTrigger.click();
+    await expect(extPopover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await extSearch.fill("e2e-mcp");
+    const mcpRow = extPopover.getByTestId("extension-picker-row").filter({ hasText: "e2e-mcp" });
+    await expect(mcpRow).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await mcpRow.click();
+    await expect(async () => {
+      expect(await promptTextarea.inputValue()).toContain("@e2e-mcp ");
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+    // Reopen once more with nothing selected, then Escape it — same
+    // regression guard as the slash menu above, for the second popover kind.
+    await extTrigger.click();
+    await expect(extPopover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await page.keyboard.press("Escape");
+    await expect(extPopover).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await expect(issueTaskDialog).toBeVisible();
+
+    // Files/Folders references picker renders (its native open-panel isn't
+    // e2e-drivable — only presence is asserted).
+    await expect(issueTaskDialog.getByText("Files / Folders")).toBeVisible();
+
+    // No task should be created by this test — just close the dialog.
+    await issueTaskDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
   });
 });
