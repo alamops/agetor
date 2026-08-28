@@ -133,6 +133,8 @@ import type {
 } from "../shared/types.ts";
 import { WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
 import { appendReferences } from "../shared/refs.ts";
+import { promptByteOverage } from "../shared/prompt-limits.ts";
+import { expandAtReferences } from "./project-files.ts";
 
 type Listener = (e: RunEvent) => void;
 const listeners = new Set<Listener>();
@@ -942,6 +944,32 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   });
   if ("error" in prepared) return { error: prepared.error };
 
+  // Expand `@`-tokens into absolute paths now, right after `prepareWorkdir`
+  // returns — this is the EARLIEST point in the whole flow that knows the
+  // agent's real cwd: `prepared.cwd` is the worktree root once it has just
+  // been materialized (isolation "worktree"), or the raw workdir otherwise.
+  // No code before this line could have resolved a token correctly. Only
+  // `expandedPrompt` (a local) carries the expansion — `task.prompt` itself
+  // is left untouched in the DB, so editing the task or re-running it later
+  // keeps the `@tokens` and re-resolves them against whatever cwd that next
+  // run gets (a fresh worktree, a moved workdir, etc).
+  const expandedPrompt = expandAtReferences(task.prompt, prepared.cwd);
+  // Budget-check the fully expanded + reffed prompt — not the raw one —
+  // before touching the DB at all. Expansion can turn a handful of short
+  // `@tokens` into long absolute paths and push a prompt over an agent's
+  // argv-launch cap (gemini today, see prompt-limits.ts) even though the
+  // raw text the user typed comfortably fit under it. Catching that here
+  // means a rejected start never inserts a run row or flips the task to
+  // `running` in the first place.
+  const overage = promptByteOverage(harness.kind, appendReferences(expandedPrompt, task.references));
+  if (overage) {
+    return {
+      error:
+        `prompt is ${overage.bytes - overage.limit} bytes over ${harness.label}'s ${overage.limit}-byte `
+        + `launch limit after expanding @ file references — shorten it or reference fewer files`,
+    };
+  }
+
   // Lazy-pin baseRef: workdir wasn't a git repo when the task was created but
   // is one now. Pin the sha actually used so re-runs stay reproducible.
   if (!task.baseRef && prepared.worktreePath) {
@@ -992,7 +1020,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
     emitGlobal({ kind: "column", taskId, runId, column: "running", prev: prevColumn, ts: now });
   }
 
-  const promptWithRefs = appendReferences(task.prompt, task.references);
+  const promptWithRefs = appendReferences(expandedPrompt, task.references);
 
   const onChunk = makeChunkHandler(runId, taskId, harness.kind, task.mode);
   // Echo the initial prompt as a "user" event so the panel renders a
@@ -2202,6 +2230,17 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
       return { delivered: false, reason: `worktree restore failed: ${msg}` };
     }
   }
+
+  // Single choke point for `@`-token expansion on every follow-up path:
+  // webview sends, the backlog tray, the diff composer, ask-card free-text
+  // answers, and the CLI all funnel through `sendInput`, so expanding here
+  // once — rather than in each per-kind `send*Turn` below — covers all of
+  // them with no per-caller change. Re-read the task (rather than reuse the
+  // `task` fetched above) because the worktree-restore branch just above may
+  // have materialized `worktreePath` for the first time; a stale read would
+  // expand against a cwd that didn't exist yet.
+  const cwdTask = tasks.get(row.task_id) ?? task;
+  line = expandAtReferences(line, cwdTask.worktreePath ?? cwdTask.workdir);
 
   const kind = resolveHarness(row.agent)?.kind;
   if (kind === "claude-code") {

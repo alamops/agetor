@@ -1167,6 +1167,20 @@ export const api = {
       `/agent-discovery?${q.toString()}`,
     );
   },
+  /** File/directory listing for the `@` file-reference popover and
+   *  highlighter — `GET /files/index`. Two modes, chosen by whether `ref` is
+   *  given: with a `ref`, the server resolves tracked files at that ref via
+   *  `git ls-tree` (the shape a not-yet-created worktree will have once it's
+   *  materialized); without one, it resolves the live working tree via
+   *  `git ls-files` (tracked + untracked, minus ignored/deleted). `ref` is
+   *  omitted from the request entirely when blank/null so the server always
+   *  sees "no ref" rather than an empty-string one. `truncated` is true when
+   *  the listing hit the server's file-count cap. */
+  listProjectFiles: (scope: { dir: string; ref?: string | null }) => {
+    const q = new URLSearchParams({ dir: scope.dir });
+    if (scope.ref) q.set("ref", scope.ref);
+    return j<{ files: string[]; truncated: boolean }>(`/files/index?${q.toString()}`);
+  },
   listTasks: () => j<Task[]>("/tasks"),
   /** Single task by id, fresh from the server (bypasses the 2s board poll's
    *  staleness). Used to re-check a task's persisted draft right after the

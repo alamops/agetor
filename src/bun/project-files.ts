@@ -5,6 +5,7 @@
 import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { isSafeRelPath } from "./worktree.ts";
+import { expandAtTokens } from "../shared/at-refs.ts";
 
 export const MAX_PROJECT_FILES = 20_000;
 
@@ -170,4 +171,22 @@ export function resolveAtPath(cwd: string, relPath: string, isDirectory: boolean
   }
 
   return isDirectory ? `${abs}/` : abs;
+}
+
+/**
+ * The single send-time `@`-token expansion point: `startTask` and
+ * `sendInput` (orchestrator.ts) both call this, exactly once, right after
+ * they learn the agent's real cwd (a worktree root once `prepareWorkdir` has
+ * materialized it, or the raw workdir on isolation "none"/fallback) — no
+ * earlier point in either path knows that cwd. Every resolvable token
+ * (`@src/x.ts`, `@src/`) is replaced in place with the absolute path
+ * `resolveAtPath` resolves against `cwd`; everything unresolvable — a typo,
+ * a file that doesn't exist in this cwd, or an `@name` extension mention
+ * like `@github` — is left verbatim, exactly as the user typed it. `text`
+ * itself (typically `task.prompt`) is never mutated by the caller: only the
+ * returned string carries the expansion, so a stored prompt keeps its
+ * `@tokens` and re-resolves them against whatever cwd a later run/edit gets.
+ */
+export function expandAtReferences(text: string, cwd: string): string {
+  return expandAtTokens(text, (p, isDir) => resolveAtPath(cwd, p, isDir));
 }
