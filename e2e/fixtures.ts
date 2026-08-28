@@ -8,7 +8,7 @@ import {
   mkdirSync,
   writeFileSync,
 } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,10 +38,18 @@ export interface E2EBackend {
    *  `startGitHubStub(backend.githubStubPort, routes)` transparently becomes
    *  the app's GitHub API for the lifetime of that backend. */
   githubStubPort: number;
-  /** Directory `POST /refs/pick` returns from in this headless backend —
-   *  write the files a spec wants "picked" here, then click the picker's
-   *  Files/Folder button; see the seam in server.ts. */
+  /** Directory `POST /refs/pick` returns from in this headless backend.
+   *  Use `plantPicks` — it clears first; the dir is worker-shared, so a
+   *  spec that writes into it directly can leak stale files into a later
+   *  spec's "files" pick. See the seam in server.ts. */
   fakePickDir: string;
+  /** Clears `fakePickDir` (it's worker-shared, so a spec's leftover files
+   *  would otherwise leak into the next spec's "files"-mode pick) and
+   *  replants it with the given `{ name: content }` entries, returning
+   *  their absolute paths in the same key order. Call this instead of
+   *  writing into `fakePickDir` by hand before exercising the
+   *  Files/Folder picker buttons. */
+  plantPicks: (files: Record<string, string>) => Promise<string[]>;
 }
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
@@ -390,6 +398,20 @@ async function provisionBackend(
     throw new Error(`${(err as Error).message}\n${tails}`);
   }
 
+  // Backs `E2EBackend.plantPicks` — see its JSDoc on the interface above.
+  // Closes over `fakePickDir` so callers never have to pass it themselves.
+  async function plantPicks(files: Record<string, string>): Promise<string[]> {
+    await rm(fakePickDir, { recursive: true, force: true });
+    await mkdir(fakePickDir, { recursive: true });
+    const paths: string[] = [];
+    for (const [name, content] of Object.entries(files)) {
+      const filePath = path.join(fakePickDir, name);
+      await writeFile(filePath, content);
+      paths.push(filePath);
+    }
+    return paths;
+  }
+
   const backend: E2EBackend = {
     apiPort,
     apiToken,
@@ -398,6 +420,7 @@ async function provisionBackend(
     dataDir,
     githubStubPort,
     fakePickDir,
+    plantPicks,
   };
 
   await use(backend);

@@ -796,6 +796,10 @@ describe("inferTaskTypeFromLabels", () => {
   test("a run-together word like 'bugfix' (no delimiter) does not match the bug family", () => {
     expect(inferTaskTypeFromLabels([{ name: "bugfix" }])).toBe("task");
   });
+
+  test("has no negation awareness: 'not-a-bug' still seeds bug, by design", () => {
+    expect(inferTaskTypeFromLabels([{ name: "not-a-bug" }])).toBe("bug");
+  });
 });
 
 describe("agentFacingCommentsError", () => {

@@ -23,12 +23,11 @@ import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-inser
  * Lifted **verbatim** out of `NewTaskForm.tsx` (its capabilities effect,
  * saved-prompts loader, `applyCaptured`/`reportCapture`/`onPromptPaste`
  * capture handlers, and the prompt-block JSX) — this module is the single
- * source of truth for that behavior now, consumed by three call sites
- * (`NewTaskForm`, `CreateTaskFromIssueDialog`, `ResolveConflictsDialog`).
- * `NewTaskForm` itself is migrated onto this module in a later change; until
- * then, keep this file and `NewTaskForm`'s copy in lockstep rather than
- * letting them drift — the same discipline `TaskLaunchPickers.tsx` documents
- * for the harness/mode/model/effort picker it was lifted from.
+ * source of truth for that behavior now, consumed by four call sites:
+ * `NewTaskForm`, `CreateTaskFromIssueDialog`, `ResolveConflictsDialog`, and
+ * `RunPanel`'s send dock (via the layout slots below — `toolbar`/`actions`/
+ * `notice`/`inputAdornment`/`trailing`/`hint`/`hintClassName`). There is no
+ * separate copy left to keep in lockstep — this file is it.
  *
  * **The `capture` seam**: `usePromptCapture` needs a real, dispatch-shaped
  * (`Dispatch<SetStateAction<...>>`) prompt/references setter to safely
@@ -66,17 +65,26 @@ import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-inser
  * `NewTaskForm`'s identical effect verbatim. Empty/whitespace `workdir`
  * short-circuits to empty lists without a fetch; a failed fetch also
  * resolves to empty lists (no autocomplete is no worse than none).
+ *
+ * `opts.enabled` (default `true`) lets a caller that hoists this hook above
+ * a conditionally-mounted `PromptComposer` skip the disk walk entirely when
+ * the composer's own internal call would otherwise be idle — see
+ * `PromptComposerProps.capabilities`'s doc for why that hoisting exists.
+ * `enabled: false` never fetches and reports back `{ commands: [],
+ * extensions: [] }`.
  */
 export function useAgentCapabilities(
   agent: string,
   workdir: string,
   branch?: string,
+  opts?: { enabled?: boolean },
 ): { commands: AvailableCommand[]; extensions: AvailableExtension[] } {
+  const enabled = opts?.enabled ?? true;
   const [commands, setCommands] = useState<AvailableCommand[]>([]);
   const [extensions, setExtensions] = useState<AvailableExtension[]>([]);
 
   useEffect(() => {
-    if (!workdir.trim()) { setCommands([]); setExtensions([]); return; }
+    if (!enabled || !workdir.trim()) { setCommands([]); setExtensions([]); return; }
     let cancelled = false;
     // Pass the harness id (not just the kind) so aliased multi-account
     // harnesses read their own per-harness commands/skills — the server
@@ -91,7 +99,7 @@ export function useAgentCapabilities(
       })
       .catch(() => { if (!cancelled) { setCommands([]); setExtensions([]); } });
     return () => { cancelled = true; };
-  }, [agent, workdir, branch]);
+  }, [agent, workdir, branch, enabled]);
 
   return { commands, extensions };
 }
@@ -102,13 +110,24 @@ export function useAgentCapabilities(
  * Extensions picker's `onPromptsOpen` and the textarea's `onFocus` call, so
  * an edit made in Settings mid-session shows up without a remount. Lifted
  * from `NewTaskForm`'s `savedPrompts`/`loadSavedPrompts` verbatim.
+ *
+ * `opts.enabled` (default `true`) mirrors `useAgentCapabilities`'s flag, for
+ * the same hoisting reason — see `PromptComposerProps.savedPrompts`'s doc.
+ * `enabled: false` skips the mount-time fetch, `reload` becomes a no-op, and
+ * `savedPrompts` state settles to `[]`.
  */
-export function useSavedPrompts(): { savedPrompts: SavedPrompt[]; reload: () => void } {
+export function useSavedPrompts(opts?: { enabled?: boolean }): { savedPrompts: SavedPrompt[]; reload: () => void } {
+  const enabled = opts?.enabled ?? true;
   const [savedPrompts, setSavedPrompts] = useState<SavedPrompt[]>([]);
   const reload = () => {
+    if (!enabled) return;
     void api.listSavedPrompts().then(setSavedPrompts).catch(() => setSavedPrompts([]));
   };
-  useEffect(() => { reload(); }, []);
+  useEffect(() => {
+    if (!enabled) { setSavedPrompts([]); return; }
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled]);
   return { savedPrompts, reload };
 }
 
@@ -244,6 +263,26 @@ export interface PromptComposerProps {
    * hooks can't be conditional — and is used only when this prop is absent.
    */
   capture?: ReturnType<typeof usePromptCapture>;
+  /**
+   * A pre-fetched `useAgentCapabilities` result, for a caller whose own
+   * `<PromptComposer>` instance is conditionally mounted/unmounted (e.g.
+   * RunPanel's send dock, which swaps out for a read-only footer on every
+   * Main ↔ subagent tab switch and on the archived-without-canSend state).
+   * `useAgentCapabilities` is always called internally too — hooks can't be
+   * conditional — but with `enabled: !capabilities`, so it never fetches
+   * while this prop is supplied. Hoisting the hook to the consumer's stable
+   * parent component is what keeps its disk walk (MCP/skills/plugins
+   * discovery) from refiring on every remount; the other three consumers
+   * mount this component once and never supply it.
+   */
+  capabilities?: { commands: AvailableCommand[]; extensions: AvailableExtension[] };
+  /**
+   * A pre-fetched `useSavedPrompts` result, for the same remount-survival
+   * reason as `capabilities` above. `useSavedPrompts` is still always
+   * called internally (with `enabled: !savedPrompts`) so it never
+   * mount-fetches while this prop is supplied.
+   */
+  savedPrompts?: { savedPrompts: SavedPrompt[]; reload: () => void };
   rows?: number;
   placeholder?: string;
   /** `null` renders no `<label>` at all (RunPanel's send dock has none —
@@ -324,6 +363,12 @@ export interface PromptComposerProps {
    * `capture.dropHint` never leaves `null` once `onReport` is wired up.
    */
   hint?: string | null;
+  /** Extra className merged (via `cn`) onto the hint paragraph's default
+   *  `"text-[10px] text-muted-foreground"` — applies whether the rendered
+   *  text comes from `hint` or from `activeCapture.dropHint`. RunPanel
+   *  passes `"mt-1"` so its dock's hint line keeps the same rendered class
+   *  list it had before this prop existed. */
+  hintClassName?: string;
 }
 
 /**
@@ -343,6 +388,8 @@ export function PromptComposer({
   setReferences,
   textareaRef,
   capture,
+  capabilities,
+  savedPrompts: savedPromptsProp,
   rows = 6,
   placeholder = "What should the agent do? Type / for commands.",
   label = "Prompt",
@@ -365,12 +412,20 @@ export function PromptComposer({
   textareaClassName,
   textareaTestId = "prompt-textarea",
   hint,
+  hintClassName,
 }: PromptComposerProps) {
   const internalTextareaRef = useRef<HTMLTextAreaElement>(null);
   const ref = textareaRef ?? internalTextareaRef;
 
-  const { commands, extensions } = useAgentCapabilities(agent, workdir, branch);
-  const { savedPrompts, reload } = useSavedPrompts();
+  // Always call both hooks — hooks can't be conditional — but disable their
+  // fetches whenever the caller supplied a pre-fetched result via
+  // `capabilities`/`savedPrompts` (see those props' docs for why a caller
+  // would hoist them). `?? internal` below picks whichever the caller
+  // actually wants driving this render.
+  const internalCapabilities = useAgentCapabilities(agent, workdir, branch, { enabled: !capabilities });
+  const { commands, extensions } = capabilities ?? internalCapabilities;
+  const internalSavedPrompts = useSavedPrompts({ enabled: !savedPromptsProp });
+  const { savedPrompts, reload } = savedPromptsProp ?? internalSavedPrompts;
 
   // Bridges for `usePromptCapture`'s internal instance below — it needs
   // `Dispatch`-shaped setters, but this component's public props are plain
@@ -407,14 +462,11 @@ export function PromptComposer({
   // `hint` overrides the internal drop-hint rendering when a caller routes
   // capture reports elsewhere (see the prop doc) — `undefined` (the default)
   // means "not overridden", so every existing consumer falls back to
-  // `activeCapture.dropHint` unchanged. RunPanel's own hint paragraph
-  // historically carried an extra `mt-1` — a no-op today, `space-y-1.5` on
-  // its ancestor wins that specificity fight — kept here anyway so the
-  // rendered class list matches its old DOM byte-for-byte.
+  // `activeCapture.dropHint` unchanged. `hintClassName` merges onto the
+  // default classes the same way regardless of which source the text came
+  // from — see that prop's doc.
   const hintText = hint !== undefined ? hint : activeCapture.dropHint;
-  const hintClassName = hint !== undefined
-    ? "mt-1 text-[10px] text-muted-foreground"
-    : "text-[10px] text-muted-foreground";
+  const hintClass = cn("text-[10px] text-muted-foreground", hintClassName);
 
   const referencesPicker = (
     <ReferencesPicker
@@ -491,7 +543,7 @@ export function PromptComposer({
           </div>
         )}
         {textareaRow}
-        {hintText && <p className={hintClassName}>{hintText}</p>}
+        {hintText && <p className={hintClass}>{hintText}</p>}
         {footer}
       </div>
 

@@ -119,8 +119,11 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     // An explicit `--type` stays authoritative; only fill it from the
     // issue's own labels (e.g. `bug`, `kind/defect`, `spike`) when the user
     // didn't pass one — mirrors the "Work on this with Agetor" dialog's
-    // Type-picker seeding (`CreateTaskFromIssueDialog`).
-    o.type ??= inferTaskTypeFromLabels(thread.item.labels);
+    // Type-picker seeding (`CreateTaskFromIssueDialog`). Checked with
+    // `?.trim()` rather than `??=`: `flagValue` returns `""` for a bare
+    // `--type ""`, which `??=` would leave alone, silently falling through
+    // to the server's default type instead of the issue's labels.
+    if (!o.type?.trim()) o.type = inferTaskTypeFromLabels(thread.item.labels);
     issueUrl = thread.item.htmlUrl;
     issueSnapshot = renderIssueThreadMarkdown(thread);
     if (thread.commentsError) {

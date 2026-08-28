@@ -72,7 +72,7 @@ import {
   ReferencesPicker,
   captureDroppedOrPastedItems,
 } from "./ReferencesPicker";
-import { PromptComposer, usePromptCapture } from "./PromptComposer";
+import { PromptComposer, usePromptCapture, useAgentCapabilities, useSavedPrompts } from "./PromptComposer";
 import { MessageHistoryPicker } from "./MessageHistoryPicker";
 import { TerminalView } from "./TerminalView";
 import { deriveTodoProgress } from "@/lib/todo-progress";
@@ -1939,11 +1939,17 @@ function RunPanelBody({
   const [gitStatus, setGitStatus] = useState<TaskGitStatus | null>(null);
   const [sendDragging, setSendDragging] = useState(false);
   // `/`-command, skill autocomplete, and saved-prompts loading for the send
-  // field are owned by `PromptComposer` itself now (via its `agent`/
-  // `workdir`/`branch` props below) — the same `useAgentCapabilities`/
-  // `useSavedPrompts` hooks NewTaskForm/CreateTaskFromIssueDialog/
-  // ResolveConflictsDialog already go through, so this dock can't drift
-  // from those. RunPanel no longer needs its own copies.
+  // field render through `PromptComposer`'s own `useAgentCapabilities`/
+  // `useSavedPrompts` hooks — the same ones NewTaskForm/
+  // CreateTaskFromIssueDialog/ResolveConflictsDialog go through, so this
+  // dock can't drift from those. RunPanel calls both hooks itself (near
+  // where `capture` is built below) and passes the results down via the
+  // composer's `capabilities`/`savedPrompts` props, rather than letting the
+  // composer's internal calls own them — the dock unmounts on every Main ↔
+  // subagent tab switch and the archived-without-canSend swap, and hoisting
+  // the hooks to this stable parent keeps their fetches (a disk walk of
+  // MCP/skills/plugins) alive across those remounts instead of refiring
+  // them every time.
   const sendRef = useRef<HTMLTextAreaElement>(null);
   // "Chat about it" affordance for a plan modal — same `requestAnimationFrame`
   // + focus idiom as `MessageHistoryPicker`'s insert-and-focus above. No
@@ -2495,6 +2501,14 @@ function RunPanelBody({
     setReferences: setSendRefs,
     onReport: setSendHint,
   });
+  // Hoisted above the composer's own internal calls (passed down via
+  // `capabilities`/`savedPrompts` below) so the dock's Main ↔ subagent tab
+  // switches and the archived-without-canSend swap — which unmount and
+  // remount `<PromptComposer>` — don't refire the capabilities disk walk or
+  // the saved-prompts fetch on every round trip. See the comment above
+  // `sendRef`.
+  const capabilities = useAgentCapabilities(task.agent, task.workdir, task.branch ?? undefined);
+  const savedPromptsState = useSavedPrompts();
   const onSendDragOver = (e: React.DragEvent) => {
     if (!e.dataTransfer.types.includes("Files")) return;
     // Always preventDefault on a file dragover so WKWebView doesn't fall back
@@ -2958,6 +2972,11 @@ function RunPanelBody({
             setReferences={setSendRefs}
             textareaRef={sendRef}
             capture={capture}
+            // Pass the hoisted results down (see the comment above
+            // `capabilities`'s declaration) so this dock's remounts don't
+            // refire the composer's own internal fetches.
+            capabilities={capabilities}
+            savedPrompts={savedPromptsState}
             // The dock's own wrapper above already gives every child
             // `space-y-1.5` (it used to be one flat list of siblings); both
             // spacing props here flatten the composer's default two-tier
@@ -3155,7 +3174,12 @@ function RunPanelBody({
             // when we can't send: that's the point of "Save for later".
             // Sending is gated separately — the Send button below plus the
             // `canSend` / `modalPending` guards inside `send()` — so a
-            // keystroke can never leak into a live tmux modal.
+            // keystroke can never leak into a live tmux modal. Note: the
+            // composer internally also disables its Extensions picker on
+            // `!workdir.trim()`, a condition this dock's old inline JSX
+            // never checked (`task.workdir` is required at task-create
+            // time, so it's always non-empty here) — a known, deliberate
+            // no-op delta from the migration, not a behavior change.
             disabled={sending || backlogBusy}
             onKeyDown={(e) => {
               // Enter to send; Shift+Enter for a newline. SlashAutocomplete
@@ -3182,6 +3206,10 @@ function RunPanelBody({
               }
             }}
             hint={sendHint}
+            // Keeps this dock's hint paragraph's rendered class list
+            // byte-identical to before `hintClassName` existed on
+            // `PromptComposer` (see that prop's doc).
+            hintClassName="mt-1"
           />
         </div>
       )}

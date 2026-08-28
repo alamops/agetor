@@ -384,6 +384,21 @@ test("cmdAdd: --issue with an explicit --type keeps it, ignoring the thread's la
   expect(createTaskCalls[0]!.taskType).toBe("spike");
 });
 
+test("cmdAdd: --issue with an explicit --type \"\" still infers taskType from the thread's labels", async () => {
+  reset();
+  const thread = makeThread({
+    item: makeItem({ labels: [{ name: "bug", color: null }] }),
+  });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir, "--type", ""], flags({ json: true }));
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.taskType).toBe("bug");
+});
+
 test("cmdAdd: --issue whose thread has unrelated (or no) labels falls back to the default task type", async () => {
   reset();
   const thread = makeThread({

@@ -208,7 +208,7 @@ export function ReferencesPicker({
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
         onDrop={onDrop}
-        data-testid="refs-dropzone"
+        data-testid="refs-dropzone-inline"
         className={cn(
           "relative rounded-md border border-dashed border-border/60 bg-card/40 px-1.5 py-1",
           dragging && "border-primary/60 bg-primary/5",
@@ -235,7 +235,7 @@ export function ReferencesPicker({
     <details
       open={open}
       onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
-      data-testid="refs-dropzone"
+      data-testid="refs-dropzone-expandable"
       className={cn(
         "relative rounded-md border border-border/60 bg-card/40 px-2 py-1.5",
         dragging && "border-primary/60 bg-primary/5",

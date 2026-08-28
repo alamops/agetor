@@ -783,8 +783,10 @@ test.describe("task from a Git issue", () => {
 
     // Plant two regular files for the fake-picker seam
     // (AGETOR_FAKE_PICK_REFS_DIR, see server.ts's POST /refs/pick) to return.
-    await writeFile(path.join(backend.fakePickDir, "notes.md"), "notes\n");
-    await writeFile(path.join(backend.fakePickDir, "spec.txt"), "spec\n");
+    // `plantPicks` clears the (worker-shared) dir first, so an earlier
+    // spec's leftover files can't leak into this test's chip-count
+    // assertions.
+    await backend.plantPicks({ "notes.md": "notes\n", "spec.txt": "spec\n" });
 
     await gotoApp(page, backend.bootBase);
     const issueTaskDialog = await openIssueTaskDialog(page);
@@ -794,7 +796,7 @@ test.describe("task from a Git issue", () => {
     const summary = issueTaskDialog.getByTestId("refs-summary");
     await summary.click();
 
-    const dropzone = issueTaskDialog.getByTestId("refs-dropzone");
+    const dropzone = issueTaskDialog.getByTestId("refs-dropzone-expandable");
     const chips = issueTaskDialog.getByTestId("refs-chip");
 
     // "files" mode lists fakePickDir's regular files — notes.md + spec.txt.

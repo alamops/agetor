@@ -196,10 +196,10 @@ export function issueTaskTitle(item: Pick<GitHubListItem, "number" | "title">): 
 }
 
 /** Keyword families {@link inferTaskTypeFromLabels} matches against, each
- *  compared case-insensitively to a label's full name and to every token
- *  obtained by splitting the name on non-alphanumeric characters — so
- *  `type: bug`, `kind/defect`, and `bug-report` all count as "bug" even
- *  though none of them equal the literal string "bug". */
+ *  compared against any token obtained by splitting the lowercased label
+ *  name on non-alphanumeric characters — so `type: bug`, `kind/defect`, and
+ *  `bug-report` all count as "bug" even though none of them equal the
+ *  literal string "bug". */
 const BUG_LABEL_KEYWORDS = new Set(["bug", "defect", "regression", "crash"]);
 const SPIKE_LABEL_KEYWORDS = new Set([
   "spike",
@@ -217,11 +217,17 @@ const SPIKE_LABEL_KEYWORDS = new Set([
  * default) from the issue tracker's own labels, so a `bug`-labelled issue
  * lands on a `fix/…` branch instead of the blanket `feature/…` every issue
  * task used to get regardless of label. Case-insensitive: a label matches a
- * family when its full lowercased name, OR any token from splitting that
- * name on non-alphanumeric characters, is one of the family's keywords (see
+ * family when any token obtained by splitting the lowercased name on
+ * non-alphanumeric characters is one of the family's keywords (see
  * {@link BUG_LABEL_KEYWORDS} / {@link SPIKE_LABEL_KEYWORDS}) — so
  * `Type: Bug`, `kind/defect`, and `bug-report` all match "bug", while
  * `bugfix` (no separator between the two words) does not.
+ *
+ * This is a plain keyword match with no negation awareness: a label like
+ * `not-a-bug` or `wontfix-bug-report` still seeds `"bug"`, since the
+ * tokenizer has no concept of `not`/`wontfix` negating the `bug` token that
+ * follows it. That's by design — this is a fast default, and the Type picker
+ * (or `--type`) is always available to override a bad guess.
  *
  * When labels match both families (e.g. a "bug investigation" issue tagged
  * both `bug` and `research`), `"bug"` wins — it's still a bug fix at heart.
@@ -231,11 +237,9 @@ const SPIKE_LABEL_KEYWORDS = new Set([
 export function inferTaskTypeFromLabels(labels: ReadonlyArray<{ name: string }>): TaskType {
   let sawSpike = false;
   for (const label of labels) {
-    const lower = label.name.toLowerCase();
-    const tokens = lower.split(/[^a-z0-9]+/).filter(Boolean);
-    const candidates = [lower, ...tokens];
-    if (candidates.some((c) => BUG_LABEL_KEYWORDS.has(c))) return "bug";
-    if (candidates.some((c) => SPIKE_LABEL_KEYWORDS.has(c))) sawSpike = true;
+    const tokens = label.name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    if (tokens.some((c) => BUG_LABEL_KEYWORDS.has(c))) return "bug";
+    if (tokens.some((c) => SPIKE_LABEL_KEYWORDS.has(c))) sawSpike = true;
   }
   return sawSpike ? "spike" : DEFAULT_TASK_TYPE;
 }

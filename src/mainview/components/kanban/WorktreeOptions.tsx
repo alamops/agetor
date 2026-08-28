@@ -22,9 +22,10 @@ import { BranchPicker } from "./BranchPicker";
  * of `NewTaskForm.tsx` (its original home) so it can be reused by
  * `CreateTaskFromIssueDialog` (same live behavior) and by
  * `ResolveConflictsDialog` (a read-only `locked` variant — a PR's head
- * branch is always checked out as-is, in its own worktree). `NewTaskForm`
- * itself migrates onto this module in a later change; until then this file
- * must not drift from its behavior.
+ * branch is always checked out as-is, in its own worktree). All three
+ * consumers — `NewTaskForm`, `CreateTaskFromIssueDialog`, and
+ * `ResolveConflictsDialog` — are on this module now; there is no separate
+ * copy left to keep in lockstep.
  *
  * The branch-name field follows the clean/dirty model documented in
  * `src/mainview/lib/branch-field.ts`: while clean, it live-renders this
