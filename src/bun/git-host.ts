@@ -2,6 +2,7 @@ import type {
   GitHubChecksResult,
   GitHubComment,
   GitHubCommentsResult,
+  GitHubIssueThreadResult,
   GitHubItemKind,
   GitHubItemState,
   GitHubLabelsResult,
@@ -27,6 +28,7 @@ import {
   getGitHubPullBlob,
   getGitHubPullChecks,
   getGitHubPullDefaults,
+  getGitHubIssueThread,
   getGitHubPullDetail,
   getGitHubPullDiff,
   getGitHubPullMergeability,
@@ -53,6 +55,7 @@ import {
   createGitLabPullLineComment,
   getGitLabPullBlob,
   getGitLabPullChecks,
+  getGitLabIssueThread,
   getGitLabPullDefaults,
   getGitLabPullDetail,
   getGitLabPullDiff,
@@ -76,6 +79,7 @@ import {
   createBitbucketPullLineComment,
   getBitbucketPullBlob,
   getBitbucketPullChecks,
+  getBitbucketIssueThread,
   getBitbucketPullDefaults,
   getBitbucketPullDetail,
   getBitbucketPullDiff,
@@ -131,6 +135,7 @@ export interface FacadeError {
 type ListResponse = ({ ok: true } & GitHubListResult) | FacadeError;
 type PullDefaultsResponse = ({ ok: true } & GitHubPullDefaultsResult) | FacadeError;
 type IssueResponse = ({ ok: true; item: GitHubListItem; message?: string }) | FacadeError;
+type IssueThreadResponse = ({ ok: true } & GitHubIssueThreadResult) | FacadeError;
 type DiffResponse = ({ ok: true } & TaskDiff) | FacadeError;
 type CommentsResponse = ({ ok: true } & GitHubCommentsResult) | FacadeError;
 type CommentResponse = ({ ok: true; comment: GitHubComment }) | FacadeError;
@@ -466,6 +471,86 @@ export async function pullDetail(input: { dir: string; number: number }): Promis
     : await getBitbucketPullDetail(repoInfo, input.number);
   if (!res.ok) return res;
   return { ...res, item: withSourcePath(res.item, input.dir) };
+}
+
+/** Single-quotes a shell argument for interpolation into the commands
+ *  `refetchCommandFor` builds, escaping any embedded single quote as the
+ *  standard POSIX `'\''` (close quote, escaped literal quote, reopen quote).
+ *  Pure — unit-tested directly and via `refetchCommandFor`. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Pure — no I/O — so it's unit-testable without a fake `gh`/`glab` on PATH.
+ * Only GitHub and GitLab have a re-fetch CLI: `gh issue view <htmlUrl>
+ * --comments` works against GHES hosts too (the URL form, not `--repo`),
+ * and `glab issue view <number> --comments --repo <owner/name>` mirrors it
+ * for GitLab. Bitbucket has no equivalent CLI, so it's always null; either
+ * provider is also null when its CLI isn't on PATH. `htmlUrl` and `repo`
+ * are single-quoted (`shellQuote`) before interpolation — both come from the
+ * API response, not a fixed shape, so an unescaped embedded `'` (or shell
+ * metacharacter) could otherwise break the command a user copy-pastes.
+ */
+export function refetchCommandFor(args: {
+  provider: GitProvider;
+  htmlUrl: string;
+  repo: string;
+  number: number;
+  ghAvailable: boolean;
+  glabAvailable: boolean;
+}): string | null {
+  if (args.provider === "github") {
+    return args.ghAvailable ? `gh issue view ${shellQuote(args.htmlUrl)} --comments` : null;
+  }
+  if (args.provider === "gitlab") {
+    return args.glabAvailable ? `glab issue view ${args.number} --comments --repo ${shellQuote(args.repo)}` : null;
+  }
+  return null;
+}
+
+/**
+ * Fetches a single issue plus its full comment thread — the payload behind
+ * "create a task from this issue" (dialog, New Task form paste-URL, CLI
+ * `agetor add --issue`). Dispatches like `pullDetail`: GitHub's own
+ * `getGitHubIssueThread` already stitches `sourcePath` on via its own
+ * `normalizeItem(kind, raw, dir)` call, GitLab/Bitbucket get `withSourcePath`
+ * applied here (same asymmetry every other facade function in this module
+ * has). `refetchCommand` is filled in here, not by the adapters — it depends
+ * on whether `gh`/`glab` are on PATH, which is this facade's concern, not
+ * theirs. `Bun.which` is called with the `PATH` option (see `agent-status.ts`)
+ * — omitting it can silently return null in some environments. `includeComments`
+ * (default `true`) passes straight through to whichever adapter serves the
+ * request — `false` is what "View issue" uses to fetch just the item.
+ */
+export async function issueThread(
+  input: { dir: string; number: number; includeComments?: boolean },
+): Promise<IssueThreadResponse> {
+  const repoInfo = await providerRepoForDir(input.dir);
+  if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
+  const includeComments = input.includeComments ?? true;
+
+  let res: IssueThreadResponse;
+  if (repoInfo.provider === "github") {
+    res = await getGitHubIssueThread({ ...input, includeComments });
+  } else if (repoInfo.provider === "gitlab") {
+    const r = await getGitLabIssueThread(repoInfo, input.number, includeComments);
+    res = r.ok ? { ...r, item: withSourcePath(r.item, input.dir) } : r;
+  } else {
+    const r = await getBitbucketIssueThread(repoInfo, input.number, includeComments);
+    res = r.ok ? { ...r, item: withSourcePath(r.item, input.dir) } : r;
+  }
+  if (!res.ok) return res;
+
+  const refetchCommand = refetchCommandFor({
+    provider: repoInfo.provider,
+    htmlUrl: res.item.htmlUrl,
+    repo: res.repo,
+    number: input.number,
+    ghAvailable: !!Bun.which("gh", { PATH: process.env.PATH }),
+    glabAvailable: !!Bun.which("glab", { PATH: process.env.PATH }),
+  });
+  return { ...res, refetchCommand };
 }
 
 export interface ListCommentsInput {

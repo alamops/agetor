@@ -1,5 +1,6 @@
-import { expect, test } from "bun:test";
-import { __githubInternals, githubRepoFromRemoteForTest } from "./github.ts";
+import { expect, test, beforeAll } from "bun:test";
+import { __githubInternals, getGitHubIssueThread, getGitHubPullDetail, githubRepoFromRemoteForTest } from "./github.ts";
+import { makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
 import type { GitHubListItem } from "../shared/types.ts";
 
 const {
@@ -134,6 +135,41 @@ test("parseGitRemote extracts host/owner/name across url syntaxes", () => {
   });
   expect(parseGitRemote("../relative/path")).toBeNull();
   expect(parseGitRemote("/absolute/path/repo.git")).toBeNull();
+});
+
+// A nested GitLab group ("group/sub/project") has more than one path segment
+// after the owner — all three syntaxes must keep every one of them as `name`
+// (not just the last), matching each other exactly. https used to truncate
+// this to just "sub" (see docs/plans/new-task-from-git-issue.md code review).
+test("parseGitRemote keeps every path segment after the owner as name for a nested GitLab group — https, ssh://, and scp-like all agree", () => {
+  const { parseGitRemote } = __githubInternals;
+  const expected = { host: "gitlab.com", rawHost: "gitlab.com", owner: "group", name: "sub/project" };
+  expect(parseGitRemote("https://gitlab.com/group/sub/project.git")).toEqual(expected);
+  expect(parseGitRemote("https://gitlab.com/group/sub/project")).toEqual(expected);
+  expect(parseGitRemote("ssh://git@gitlab.com/group/sub/project.git")).toEqual(expected);
+  expect(parseGitRemote("git@gitlab.com:group/sub/project.git")).toEqual(expected);
+});
+
+test("parseGitRemote strips a trailing slash (with or without .git) from a nested https/ssh remote", () => {
+  const { parseGitRemote } = __githubInternals;
+  expect(parseGitRemote("https://gitlab.com/group/sub/project.git/")).toEqual({
+    host: "gitlab.com",
+    rawHost: "gitlab.com",
+    owner: "group",
+    name: "sub/project",
+  });
+  expect(parseGitRemote("https://github.com/o/r/")).toEqual({
+    host: "github.com",
+    rawHost: "github.com",
+    owner: "o",
+    name: "r",
+  });
+  expect(parseGitRemote("ssh://git@gitlab.com/group/sub/project.git/")).toEqual({
+    host: "gitlab.com",
+    rawHost: "gitlab.com",
+    owner: "group",
+    name: "sub/project",
+  });
 });
 
 test("matchesFilters matches on assignee login (case-insensitive), rejects non-assignees", () => {
@@ -1310,3 +1346,242 @@ test("parseGitRemote preserves rawHost for a github ssh host alias while canonic
 // remoteHostsForDirs moved to git-provider.ts, reimplemented over
 // providerRepoForDir (docs/plans/consolidate-git-host-discovery.md) — its
 // test moved with it, to git-provider.test.ts.
+
+// ---------------------------------------------------------------------------
+// getGitHubIssueThread (docs/plans/new-task-from-git-issue.md, Task A) —
+// network-level tests against a mocked fetch, mirroring the fetcher-level
+// section of pull-detail.test.ts. Complements github-network.test.ts's own
+// convention of forcing a deterministic GITHUB_TOKEN so githubToken() never
+// shells out to `gh`.
+// ---------------------------------------------------------------------------
+
+beforeAll(() => {
+  process.env.GITHUB_TOKEN = "test-token";
+});
+
+function githubIssue(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    number: 7,
+    title: "Something is broken",
+    state: "open",
+    html_url: "https://github.com/acme/widgets/issues/7",
+    draft: false,
+    user: { login: "octocat" },
+    assignees: [],
+    milestone: null,
+    body: "steps to reproduce",
+    labels: [],
+    comments: 2,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-02T00:00:00Z",
+    closed_at: null,
+    merged_at: null,
+    locked: false,
+    ...overrides,
+  };
+}
+
+function githubComment(id: number): Record<string, unknown> {
+  return {
+    id,
+    html_url: `https://github.com/acme/widgets/issues/7#issuecomment-${id}`,
+    body: `comment ${id}`,
+    user: { login: "octocat" },
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  };
+}
+
+test("getGitHubIssueThread happy path normalizes the issue, follows Link pagination across two pages, and reports truncated:false", async () => {
+  const dir = await makeGitHubRepo("acme", "widgets");
+  const page1 = Array.from({ length: 100 }, (_, i) => githubComment(i + 1));
+  const page2 = Array.from({ length: 50 }, (_, i) => githubComment(i + 101));
+  const mock = mockGitHubFetch([
+    // End-anchored so this never swallows the /comments sub-path requests
+    // below (a plain substring match would, since it's their URL prefix).
+    { match: /\/repos\/acme\/widgets\/issues\/7$/, json: githubIssue() },
+    {
+      match: "/repos/acme/widgets/issues/7/comments?per_page=100",
+      json: page1,
+      // Deliberately omits `per_page=100` from the next-page URL (mirroring
+      // github-network.test.ts's listGitHubLabels pagination fixture) so this
+      // route's own match string can't accidentally swallow the page-2 request.
+      headers: { link: '<https://api.github.com/repos/acme/widgets/issues/7/comments?page=2>; rel="next"' },
+    },
+    { match: "comments?page=2", json: page2 },
+  ]);
+  try {
+    const res = await getGitHubIssueThread({ dir, number: 7 });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.repo).toBe("acme/widgets");
+    expect(res.item.kind).toBe("issues");
+    expect(res.item.number).toBe(7);
+    expect(res.item.sourcePath).toBe(dir);
+    expect(res.comments).toHaveLength(150);
+    expect(res.comments.map((c) => c.id)).toEqual(Array.from({ length: 150 }, (_, i) => i + 1));
+    expect(res.truncated).toBe(false);
+    // The adapter never resolves gh/glab availability itself — the facade
+    // (git-host.ts's issueThread) fills refetchCommand in.
+    expect(res.refetchCommand).toBeNull();
+    expect(mock.calls).toHaveLength(3); // 1 issue fetch + 2 comment pages
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubIssueThread with includeComments:false skips the comments fetch entirely", async () => {
+  const dir = await makeGitHubRepo("acme", "widgets1b");
+  const mock = mockGitHubFetch([
+    { match: /\/repos\/acme\/widgets1b\/issues\/7$/, json: githubIssue({ html_url: "https://github.com/acme/widgets1b/issues/7" }) },
+    // Deliberately no route for the /comments endpoint — if the adapter
+    // fetched it anyway, mockGitHubFetch would throw "no route for ..." and
+    // fail this test loudly.
+  ]);
+  try {
+    const res = await getGitHubIssueThread({ dir, number: 7, includeComments: false });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.comments).toEqual([]);
+    expect(res.truncated).toBe(false);
+    expect(mock.calls).toHaveLength(1); // issue fetch only
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubIssueThread stops at the 5-page cap, fetching exactly 500 comments and reporting truncated:true", async () => {
+  const dir = await makeGitHubRepo("acme", "bigthread");
+  const routes: Parameters<typeof mockGitHubFetch>[0] = [
+    { match: /\/repos\/acme\/bigthread\/issues\/9$/, json: githubIssue({ number: 9, html_url: "https://github.com/acme/bigthread/issues/9" }) },
+    {
+      match: "/repos/acme/bigthread/issues/9/comments?per_page=100",
+      json: Array.from({ length: 100 }, (_, i) => githubComment(i + 1)),
+      headers: { link: '<https://api.github.com/repos/acme/bigthread/issues/9/comments?page=2>; rel="next"' },
+    },
+    ...[2, 3, 4].map((page) => ({
+      match: `comments?page=${page}`,
+      json: Array.from({ length: 100 }, (_, i) => githubComment((page - 1) * 100 + i + 1)),
+      headers: { link: `<https://api.github.com/repos/acme/bigthread/issues/9/comments?page=${page + 1}>; rel="next"` },
+    })),
+    // Page 5 is the LAST page the fetch is allowed to make
+    // (ISSUE_THREAD_MAX_PAGES=5) — its own response still advertises a page 6
+    // via rel="next" (a real 501+ comment thread would), which is what proves
+    // truncated:true even though a 6th page is never actually requested.
+    // Deliberately no route for page 6 — if the loop fetched it anyway,
+    // mockGitHubFetch would throw "no route for ..." and fail this test loudly.
+    {
+      match: "comments?page=5",
+      json: Array.from({ length: 100 }, (_, i) => githubComment(400 + i + 1)),
+      headers: { link: "<https://api.github.com/repos/acme/bigthread/issues/9/comments?page=6>; rel=\"next\"" },
+    },
+  ];
+  const mock = mockGitHubFetch(routes);
+  try {
+    const res = await getGitHubIssueThread({ dir, number: 9 });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.comments).toHaveLength(500);
+    expect(res.comments.map((c) => c.id)).toEqual(Array.from({ length: 500 }, (_, i) => i + 1));
+    expect(res.truncated).toBe(true);
+    expect(mock.calls).toHaveLength(6); // 1 issue fetch + 5 comment pages, capped
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubIssueThread rejects a payload that carries a pull_request key, mentioning it's a pull request", async () => {
+  const dir = await makeGitHubRepo("acme", "widgets2");
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets2/issues/12",
+      json: githubIssue({ number: 12, html_url: "https://github.com/acme/widgets2/pull/12", pull_request: { url: "x" } }),
+    },
+  ]);
+  try {
+    const res = await getGitHubIssueThread({ dir, number: 12 });
+    expect(res).toEqual({ ok: false, error: "#12 is a pull request, not an issue" });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain("pull request");
+    // Never got to the comments fetch.
+    expect(mock.calls).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubIssueThread maps a non-2xx GitHub response through privateRepoHint", async () => {
+  const dir = await makeGitHubRepo("acme", "widgets3");
+  const mock = mockGitHubFetch([
+    { match: "/repos/acme/widgets3/issues/404", status: 404, json: { message: "Not Found" } },
+  ]);
+  try {
+    const res = await getGitHubIssueThread({ dir, number: 404 });
+    // GITHUB_TOKEN is set for this whole file (see beforeAll above), so the
+    // hadToken branch of privateRepoHint's message is the one that fires.
+    expect(res).toEqual({
+      ok: false,
+      error: "acme/widgets3 was not found on GitHub — if the repo is private, add a token for github.com in "
+        + "Settings → Git host tokens (the configured token cannot access it — check it belongs to the right account)",
+    });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubIssueThread leaves a non-404 non-2xx response's message unchanged", async () => {
+  const dir = await makeGitHubRepo("acme", "widgets3b");
+  const mock = mockGitHubFetch([
+    { match: "/repos/acme/widgets3b/issues/500", status: 500, json: { message: "Internal Server Error" } },
+  ]);
+  try {
+    const res = await getGitHubIssueThread({ dir, number: 500 });
+    expect(res).toEqual({ ok: false, error: "Internal Server Error" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubPullDetail maps a non-2xx GitHub response through privateRepoHint, mirroring getGitHubIssueThread", async () => {
+  const dir = await makeGitHubRepo("acme", "widgets3c");
+  const mock = mockGitHubFetch([
+    { match: "/repos/acme/widgets3c/pulls/404", status: 404, json: { message: "Not Found" } },
+  ]);
+  try {
+    const res = await getGitHubPullDetail({ dir, number: 404 });
+    // GITHUB_TOKEN is set for this whole file (see beforeAll above), so the
+    // hadToken branch of privateRepoHint's message is the one that fires.
+    expect(res).toEqual({
+      ok: false,
+      error: "acme/widgets3c was not found on GitHub — if the repo is private, add a token for github.com in "
+        + "Settings → Git host tokens (the configured token cannot access it — check it belongs to the right account)",
+    });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubPullDetail leaves a non-404 non-2xx response's message unchanged", async () => {
+  const dir = await makeGitHubRepo("acme", "widgets3d");
+  const mock = mockGitHubFetch([
+    { match: "/repos/acme/widgets3d/pulls/500", status: 500, json: { message: "Internal Server Error" } },
+  ]);
+  try {
+    const res = await getGitHubPullDetail({ dir, number: 500 });
+    expect(res).toEqual({ ok: false, error: "Internal Server Error" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubIssueThread rejects a non-positive/non-integer number before any fetch", async () => {
+  const dir = await makeGitHubRepo("acme", "widgets4");
+  const mock = mockGitHubFetch([]); // any fetch call would throw — proves none happens
+
+  for (const bad of [0, -1, 1.5]) {
+    const res = await getGitHubIssueThread({ dir, number: bad });
+    expect(res).toEqual({ ok: false, error: "issue number must be positive" });
+  }
+  expect(mock.calls).toHaveLength(0);
+  mock.restore();
+});

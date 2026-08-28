@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
@@ -58,6 +58,7 @@ import {
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
 import { mergeModelOptions } from "../../../shared/model-options.ts";
+import { parseIssueUrl } from "../../../shared/issue-task.ts";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
 import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
@@ -169,6 +170,10 @@ interface Props {
    *  `prUrl` — see the header "View PR" affordance below. Same App-level-
    *  singleton ownership rationale as `onOpenPullRequest`. */
   onViewPullRequest: (input: { projectPath: string; prUrl: string }) => void;
+  /** Open GitHubDialog directly on the issue detail subpage for this task's
+   *  `issueUrl` — see the header "View issue" affordance below. Same
+   *  App-level-singleton ownership rationale as `onOpenPullRequest`. */
+  onViewIssue: (input: { projectPath: string; issueUrl: string }) => void;
 }
 
 const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" | "destructive"> = {
@@ -195,6 +200,27 @@ const NEAR_BOTTOM_PX = 80;
 // development, so this still branches rather than assuming Mac.
 const IS_MAC_PLATFORM =
   typeof navigator !== "undefined" && /mac/i.test(navigator.platform || navigator.userAgent || "");
+
+/**
+ * Prefills the "Closes #N" (GitHub/GitLab) / "Issue #N" (Bitbucket) line
+ * into a Create-PR body when the task was created from an issue — the
+ * counterpart to `buildIssueTaskPrompt`'s in-prompt directive, but applied
+ * at PR-open time since the body itself is only assembled here (the "Create
+ * PR" click handler below, which builds the `GitHubPullPrefill` passed to
+ * `onOpenPullRequest`). No-op when `issueUrl` doesn't parse (not an
+ * issue-sourced task) or the body already references the issue number, so a
+ * user-edited body already mentioning the issue is never double-appended.
+ * The re-check is a word-boundary regex (`#7` must not match `#71`) rather
+ * than a plain substring test.
+ */
+function appendIssueCloseDirective(body: string, issueUrl: string | null | undefined): string {
+  const parsed = parseIssueUrl(issueUrl);
+  if (!parsed) return body;
+  const marker = `#${parsed.number}`;
+  if (new RegExp(`#${parsed.number}(?!\\d)`).test(body)) return body;
+  const directive = parsed.provider === "bitbucket" ? `Issue ${marker}` : `Closes ${marker}`;
+  return body ? `${body}\n\n${directive}` : directive;
+}
 
 function formatDuration(r: Run): string {
   const end = r.endedAt ?? Date.now();
@@ -244,7 +270,7 @@ function formatUsageCount(n: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest }: Props) {
+export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -339,6 +365,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, 
           onUnarchive={onUnarchive}
           onOpenPullRequest={onOpenPullRequest}
           onViewPullRequest={onViewPullRequest}
+          onViewIssue={onViewIssue}
         />
       </aside>
     </>
@@ -364,6 +391,7 @@ function RunPanelBody({
   onUnarchive,
   onOpenPullRequest,
   onViewPullRequest,
+  onViewIssue,
 }: {
   task: Task;
   agents: AgentStatus[];
@@ -383,6 +411,7 @@ function RunPanelBody({
   onUnarchive: (t: Task) => void;
   onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
   onViewPullRequest: (input: { projectPath: string; prUrl: string }) => void;
+  onViewIssue: (input: { projectPath: string; issueUrl: string }) => void;
 }) {
   const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
@@ -2548,6 +2577,9 @@ function RunPanelBody({
   // drops narrowing on a mutable property access once it's referenced
   // inside a nested function expression.
   const prUrl = task.prUrl;
+  // Same capture rationale as `prUrl` above, for the "View issue" header
+  // affordance.
+  const issueUrl = task.issueUrl;
 
   return (
     <>
@@ -2586,6 +2618,32 @@ function RunPanelBody({
                 title="Open the pull request created for this task"
               >
                 <GitPullRequest className="mr-1 size-3" /> View PR
+              </ExternalLink>
+            )
+          )}
+          {/* Durable "View issue" sibling of "View PR" above — same
+              rationale (header, not the composer chip row) and the same
+              in-app-detail-vs-external-link branch, keyed on whether
+              `issueUrl` parses to a recognized provider issue URL. */}
+          {issueUrl && (
+            parseIssueUrl(issueUrl) != null ? (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => onViewIssue({ projectPath: task.workdir, issueUrl })}
+                title="Open the issue this task was created from"
+                data-testid="view-issue"
+              >
+                <CircleDot className="mr-1 size-3" /> View issue
+              </Button>
+            ) : (
+              <ExternalLink
+                href={issueUrl}
+                className={cn(buttonVariants({ variant: "outline", size: "sm" }), "no-underline hover:no-underline")}
+                title="Open the issue this task was created from"
+                data-testid="view-issue"
+              >
+                <CircleDot className="mr-1 size-3" /> View issue
               </ExternalLink>
             )
           )}
@@ -3032,7 +3090,7 @@ function RunPanelBody({
                         projectPath: task.workdir,
                         head: prHead,
                         title: proposal?.title ?? "",
-                        body: proposal?.description ?? "",
+                        body: appendIssueCloseDirective(proposal?.description ?? "", task.issueUrl),
                         taskId: task.id,
                       });
                     }}

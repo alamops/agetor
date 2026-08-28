@@ -2,9 +2,13 @@
 // exercised entirely through `__gitlabInternals` — no network, no fetch mock.
 // Complements gitlab-network.test.ts, which exercises the exported async
 // functions end-to-end (URL/header/pagination shapes) via a mocked fetch.
-import { expect, test } from "bun:test";
-import { __gitlabInternals } from "./gitlab.ts";
-import { sampleRepo } from "./gitlab-test-util.ts";
+import { expect, test, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { __clearApiHostCacheForTest } from "./git-provider.ts";
+import { __gitlabInternals, getGitLabIssueThread, listGitLabComments } from "./gitlab.ts";
+import { cleanupSshStubs, gitlabIssue, gitlabNote, mockGitLabFetch, sampleRepo, writeSshStub } from "./gitlab-test-util.ts";
 
 const {
   encodeProjectId,
@@ -399,9 +403,34 @@ test("authHint mentions the configured token can't access it when hadToken is tr
   expect(msg).toContain("cannot access it");
 });
 
-test("authHint passes non-401/404 statuses through unchanged", () => {
+test("authHint passes non-401/403/404 statuses through unchanged", () => {
   expect(authHint(500, "boom", REPO, false)).toBe("boom");
-  expect(authHint(403, "forbidden", REPO, true)).toBe("forbidden");
+  expect(authHint(502, "boom", REPO, true)).toBe("boom");
+});
+
+test("authHint enriches 401 with 'requires authentication' wording, distinct from 404's 'not found' wording", () => {
+  const msg = authHint(401, "Unauthorized", REPO, false);
+  expect(msg).toContain("acme/app");
+  expect(msg).toContain("requires authentication (401)");
+  expect(msg).toContain("Settings → Git host tokens");
+  expect(msg).not.toContain("was not found on GitLab");
+});
+
+test("authHint's 401 wording says the configured token was rejected when hadToken is true", () => {
+  const msg = authHint(401, "Unauthorized", REPO, true);
+  expect(msg).toContain("the configured token was rejected");
+});
+
+test("authHint enriches 403 with 'denied access' wording", () => {
+  const msg = authHint(403, "forbidden", REPO, false);
+  expect(msg).toContain("acme/app");
+  expect(msg).toContain("denied access (403)");
+  expect(msg).toContain("Settings → Git host tokens");
+});
+
+test("authHint's 403 wording also says the configured token was rejected when hadToken is true", () => {
+  const msg = authHint(403, "forbidden", REPO, true);
+  expect(msg).toContain("the configured token was rejected");
 });
 
 test("authHint falls back to gitlab.com when remoteHost is empty", () => {
@@ -507,4 +536,177 @@ test("gitlabStateParams maps all→[\"all\"] regardless of kind", () => {
 test("gitlabStateParams fans closed pulls out to [closed, merged], but issues stay [closed]", () => {
   expect(gitlabStateParams("pulls", "closed")).toEqual(["closed", "merged"]);
   expect(gitlabStateParams("issues", "closed")).toEqual(["closed"]);
+});
+
+// ---------------------------------------------------------------------------
+// getGitLabIssueThread / listGitLabComments (docs/plans/new-task-from-git-issue.md,
+// Task A) — network-level tests against a mocked fetch, mirroring
+// gitlab-network.test.ts's own setup (hermetic AGETOR_DATA_DIR + GITLAB_TOKEN,
+// an identity ssh stub so gitlabApiBase's host resolution never depends on the
+// real ~/.ssh/config, and per-test cache resets).
+// ---------------------------------------------------------------------------
+
+const ORIGINAL_DATA_DIR = process.env.AGETOR_DATA_DIR;
+const ORIGINAL_GITLAB_TOKEN = process.env.GITLAB_TOKEN;
+const ORIGINAL_SSH_BIN = process.env.AGETOR_SSH_BIN;
+let issueThreadDataDir: string;
+
+beforeAll(() => {
+  issueThreadDataDir = mkdtempSync(path.join(tmpdir(), "agetor-gitlab-issue-thread-"));
+  process.env.AGETOR_DATA_DIR = issueThreadDataDir;
+  process.env.GITLAB_TOKEN = "test-token";
+});
+
+afterAll(() => {
+  rmSync(issueThreadDataDir, { recursive: true, force: true });
+  if (ORIGINAL_DATA_DIR === undefined) delete process.env.AGETOR_DATA_DIR;
+  else process.env.AGETOR_DATA_DIR = ORIGINAL_DATA_DIR;
+  if (ORIGINAL_GITLAB_TOKEN === undefined) delete process.env.GITLAB_TOKEN;
+  else process.env.GITLAB_TOKEN = ORIGINAL_GITLAB_TOKEN;
+});
+
+beforeEach(() => {
+  __clearApiHostCacheForTest();
+  process.env.AGETOR_SSH_BIN = writeSshStub('#!/bin/sh\necho "hostname $3"\n');
+});
+
+afterEach(() => {
+  __clearApiHostCacheForTest();
+  cleanupSshStubs();
+  if (ORIGINAL_SSH_BIN === undefined) delete process.env.AGETOR_SSH_BIN;
+  else process.env.AGETOR_SSH_BIN = ORIGINAL_SSH_BIN;
+});
+
+test("getGitLabIssueThread happy path normalizes the issue, drops a system note, and follows x-next-page pagination", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([
+    // End-anchored so this never swallows the /notes sub-path request below
+    // (a plain substring match would, since it's that request's URL prefix).
+    { match: /\/projects\/acme%2Fapp\/issues\/5$/, json: gitlabIssue() },
+    {
+      match: /\/issues\/5\/notes\?sort=asc&order_by=created_at&per_page=100$/,
+      json: [
+        gitlabNote({ id: 1, body: "added label ~bug", system: true, author: { username: "bot" } }),
+        gitlabNote({ id: 2, body: "a real comment", system: false, author: { username: "alice" } }),
+      ],
+      headers: { "x-next-page": "2" },
+    },
+    {
+      match: "page=2",
+      json: [gitlabNote({ id: 3, body: "a later comment", system: false, author: { username: "bob" } })],
+      // No x-next-page on the last page — resolveNextPage treats that as the end.
+    },
+  ]);
+  try {
+    const res = await getGitLabIssueThread(repo, 5);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.repo).toBe("acme/app");
+    expect(res.item.kind).toBe("issues");
+    expect(res.item.number).toBe(5);
+    // The adapter never resolves a working directory (see gitlab.ts's module
+    // doc comment) — sourcePath is always null here; the facade stitches it on.
+    expect(res.item.sourcePath).toBeNull();
+    expect(res.comments.map((c) => c.id)).toEqual([2, 3]); // system note (id:1) dropped
+    expect(res.truncated).toBe(false);
+    // The adapter never resolves gh/glab availability itself — the facade
+    // (git-host.ts's issueThread) fills refetchCommand in.
+    expect(res.refetchCommand).toBeNull();
+    expect(mock.calls).toHaveLength(3); // 1 issue fetch + 2 note pages
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabIssueThread with includeComments:false skips collectGitLabNotes entirely", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([
+    { match: /\/projects\/acme%2Fapp\/issues\/5$/, json: gitlabIssue() },
+    // Deliberately no route for the /notes endpoint — if the adapter fetched
+    // it anyway, mockGitLabFetch would throw "no route for ..." and fail
+    // this test loudly.
+  ]);
+  try {
+    const res = await getGitLabIssueThread(repo, 5, false);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.comments).toEqual([]);
+    expect(res.truncated).toBe(false);
+    expect(mock.calls).toHaveLength(1); // issue fetch only
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabIssueThread rejects a non-positive/non-integer iid before any fetch", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([]); // any fetch call would throw — proves none happens
+
+  for (const bad of [0, -1, 2.5]) {
+    const res = await getGitLabIssueThread(repo, bad);
+    expect(res).toEqual({ ok: false, error: "issue number must be positive" });
+  }
+  expect(mock.calls).toHaveLength(0);
+  mock.restore();
+});
+
+test("getGitLabIssueThread surfaces the notes fetch's error after a successful issue fetch", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([
+    { match: /\/projects\/acme%2Fapp\/issues\/6$/, json: gitlabIssue({ iid: 6 }) },
+    { match: "/issues/6/notes", status: 404, json: { message: "404 Project Not Found" } },
+  ]);
+  try {
+    const res = await getGitLabIssueThread(repo, 6);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    // A 404 is enriched by authHint (Settings pointer) rather than surfacing
+    // the raw API message verbatim — same wording apiError/authHint tests
+    // above already pin for the pure helper.
+    expect(res.error).toContain("acme/app");
+    expect(res.error).toContain("Settings");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitLabComments (shared by getGitLabIssueThread) excludes system notes and follows x-next-page pagination — pinning the existing behavior", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([
+    {
+      match: /\/issues\/8\/notes\?sort=asc&order_by=created_at&per_page=100$/,
+      json: [
+        gitlabNote({ id: 10, body: "changed milestone", system: true }),
+        gitlabNote({ id: 11, body: "first real comment", system: false }),
+      ],
+      headers: { "x-next-page": "2" },
+    },
+    {
+      match: "page=2",
+      json: [gitlabNote({ id: 12, body: "second real comment", system: false })],
+    },
+  ]);
+  try {
+    const res = await listGitLabComments(repo, 8, "issues");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.repo).toBe("acme/app");
+    expect(res.itemNumber).toBe(8);
+    expect(res.comments.map((c) => c.id)).toEqual([11, 12]);
+    expect(mock.calls).toHaveLength(2);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("authHint keeps GitLab's own 401/403 body message (it often names the real fix) but drops the generic 'NNN Status' fallback", () => {
+  const { authHint } = __gitlabInternals;
+  const REPO = { provider: "gitlab", host: "gitlab.com", remoteHost: "gitlab.com", owner: "acme", name: "widgets" } as const;
+  const scoped = authHint(403, "insufficient_scope", REPO as any, true);
+  expect(scoped).toContain("denied access (403)");
+  expect(scoped).toContain("insufficient_scope");
+  expect(scoped).toContain("Settings → Git host tokens");
+  const generic = authHint(401, "401 Unauthorized", REPO as any, false);
+  expect(generic).toContain("requires authentication (401)");
+  expect(generic).not.toContain("401 Unauthorized");
 });

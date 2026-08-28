@@ -69,6 +69,7 @@ type TaskRow = {
   branch: string | null; worktree_path: string | null; base_ref: string | null;
   branch_source: string;
   pr_url: string | null;
+  issue_url: string | null;
   mode: string | null; model: string | null; effort: string | null;
   fast: number;
   max_mode: number;
@@ -269,6 +270,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   worktreePath: r.worktree_path,
   baseRef: r.base_ref,
   prUrl: r.pr_url,
+  issueUrl: r.issue_url,
   mode: r.mode,
   model: r.model,
   effort: r.effort,
@@ -336,14 +338,14 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans, todo_progress,
+          branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans, todo_progress,
           last_assistant_event_id, last_seen_event_id,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
-        t.branch, t.branchSource, t.worktreePath, t.baseRef, t.prUrl ?? null, t.mode, t.model, t.effort, t.fast ? 1 : 0, t.maxMode ? 1 : 0,
+        t.branch, t.branchSource, t.worktreePath, t.baseRef, t.prUrl ?? null, t.issueUrl ?? null, t.mode, t.model, t.effort, t.fast ? 1 : 0, t.maxMode ? 1 : 0,
         JSON.stringify(t.references ?? []),
         JSON.stringify(t.backlog ?? []),
         t.draft ? JSON.stringify(t.draft) : null,
@@ -374,13 +376,13 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
+         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, issue_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
         next.taskType,
-        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.prUrl ?? null, next.mode, next.model, next.effort, next.fast ? 1 : 0, next.maxMode ? 1 : 0,
+        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.prUrl ?? null, next.issueUrl ?? null, next.mode, next.model, next.effort, next.fast ? 1 : 0, next.maxMode ? 1 : 0,
         JSON.stringify(next.references ?? []),
         JSON.stringify(next.backlog ?? []),
         next.draft ? JSON.stringify(next.draft) : null,

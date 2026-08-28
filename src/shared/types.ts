@@ -784,6 +784,15 @@ export interface Task {
    */
   prUrl: string | null;
   /**
+   * URL of the issue this task was created from, or null. Set only at create
+   * time by `createTask` (validated with `parseIssueUrl` and same-repo-
+   * checked against the workdir's remote); never patchable (kept out of the
+   * PATCH allow-list). Optional at the type level only for fixture
+   * compatibility (same reason as `unread`/`hasAssistantMessages`) —
+   * `toTask` always sets it.
+   */
+  issueUrl?: string | null;
+  /**
    * Friendly mode id ("auto", "ask", "acceptEdits", "plan", …). Maps to
    * agent-specific CLI flags in `src/bun/agents.ts`. NULL means "use the
    * agent's hands-off default" (back-compat: --dangerously-skip-permissions
@@ -2272,6 +2281,35 @@ export interface GitHubCommentsResult {
   itemNumber: number;
   comments: GitHubComment[];
 }
+
+/**
+ * A single issue plus its full comment thread — the payload behind
+ * `GET /github/issue-thread` (`gitHost.issueThread`), consumed by every "new
+ * task from an issue" entry point (dialog, New Task form paste-URL, CLI
+ * `agetor add --issue`) to build both the launch prompt
+ * (`buildIssueTaskPrompt`, `src/shared/issue-task.ts`) and the durable
+ * snapshot file (`renderIssueThreadMarkdown`). `truncated` is set once the
+ * fetch hit its page cap (5×100 comments) — the prompt and snapshot both
+ * surface that instead of silently under-representing the thread.
+ * `refetchCommand` is a one-line `gh`/`glab` invocation the agent can run to
+ * pull the live thread later (null when neither CLI is on PATH, or on
+ * Bitbucket, which has no such CLI).
+ */
+export interface GitHubIssueThreadResult {
+  repo: string;
+  item: GitHubListItem;
+  comments: GitHubComment[];
+  truncated: boolean;
+  refetchCommand: string | null;
+  /** Set when the item itself loaded but its comment thread couldn't be
+   *  fetched (e.g. GitLab answers 401 to anonymous `/notes` even on public
+   *  projects); `comments` is `[]` and `truncated` is `false` in that case.
+   *  Absent/null when comments were fetched (or skipped via
+   *  `includeComments: false`). */
+  commentsError?: string | null;
+}
+
+export type GitHubIssueThreadResponse = ({ ok: true } & GitHubIssueThreadResult) | { ok: false; error: string };
 
 export interface GitHubPullReviewCommentsResult {
   repo: string;

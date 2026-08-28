@@ -1,26 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertCircle, GitMerge, Loader2, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { cn } from "@/lib/utils";
-import { api, type AgentModelMap } from "@/lib/api";
-import {
-  AGENT_OPTIONS,
-  DEFAULT_EFFORT,
-  DEFAULT_MODEL,
-  supportedEfforts,
-  supportedModes,
-  type AgentKind,
-  type AgentStatus,
-  type Harness,
-} from "../../../shared/types.ts";
-import { AgentIcon } from "./AgentIcon";
-import { HarnessAuthHint } from "./HarnessAuthHint";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
-
-const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
+import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
 
 export interface ResolveConflictsContext {
   path: string;
@@ -39,25 +23,7 @@ interface Props {
 }
 
 export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Props) {
-  const [harnesses, setHarnesses] = useState<Harness[]>([]);
-  const [agents, setAgents] = useState<AgentStatus[]>([]);
-  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
-  const [loadingHarnesses, setLoadingHarnesses] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
-
-  const availableHarnesses = useMemo(() => harnesses.filter((h) => h.enabled), [harnesses]);
-
-  const [agent, setAgent] = useState<string>("claude-code");
-  const selectedHarness = useMemo(
-    () => harnesses.find((h) => h.id === agent) ?? null,
-    [harnesses, agent],
-  );
-  const kind: AgentKind = selectedHarness?.kind ?? "claude-code";
-  const selectedStatus = agents.find((a) => a.harnessId === agent);
-
-  const [mode, setMode] = useState<string>(initialMode("claude-code"));
-  const [model, setModel] = useState<string>(DEFAULT_MODEL["claude-code"]);
-  const [effort, setEffort] = useState<string | null>(DEFAULT_EFFORT["claude-code"]);
+  const launch = useTaskLaunch(open);
 
   const [prompt, setPrompt] = useState("");
   const [promptDirty, setPromptDirty] = useState(false);
@@ -67,59 +33,12 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   // Reset per-open transient state (prompt dirtiness, errors) so a previous
-  // PR's edits don't leak into the next one, then self-fetch harness data —
-  // mirrors NewTaskForm/App.tsx's own fetch, but scoped to this dialog since
-  // it's mounted lazily from GitHubDialog rather than always-on like the
-  // sidebar form.
+  // PR's edits don't leak into the next one. Harness/model/prefs fetching is
+  // owned by useTaskLaunch.
   useEffect(() => {
     if (!open) return;
     setPromptDirty(false);
     setSubmitError(null);
-    setLoadError(null);
-    setLoadingHarnesses(true);
-    let cancelled = false;
-    Promise.all([api.listHarnesses(), api.listAgentModels(), api.listPreferences()])
-      .then(([payload, models, prefs]) => {
-        if (cancelled) return;
-        setHarnesses(payload.harnesses);
-        setAgents(payload.statuses);
-        setAgentModels(models);
-        const enabled = payload.harnesses.filter((h) => h.enabled);
-        const want = prefs.defaultHarness;
-        const nextAgent =
-          want && enabled.some((h) => h.id === want)
-            ? want
-            : (enabled.some((h) => h.id === agent) ? agent : enabled[0]?.id ?? "claude-code");
-        const nextHarness = enabled.find((h) => h.id === nextAgent);
-        const nextKind: AgentKind = nextHarness?.kind ?? "claude-code";
-        setAgent(nextAgent);
-
-        const seedMode = prefs[`lastMode:${nextKind}`];
-        const seedModel = prefs[`lastModel:${nextKind}`];
-        const seedEffort = prefs[`lastEffort:${nextKind}`];
-        const resolvedModel =
-          seedModel && AGENT_OPTIONS[nextKind].models.some((m) => m.id === seedModel)
-            ? seedModel
-            : DEFAULT_MODEL[nextKind];
-        const resolvedMode =
-          seedMode && supportedModes(nextKind, resolvedModel).some((m) => m.id === seedMode)
-            ? seedMode
-            : initialMode(nextKind);
-        const supportedEff = supportedEfforts(nextKind, resolvedModel);
-        const resolvedEffort =
-          seedEffort && supportedEff.some((e) => e.id === seedEffort)
-            ? seedEffort
-            : supportedEff.some((e) => e.id === DEFAULT_EFFORT[nextKind])
-              ? DEFAULT_EFFORT[nextKind]
-              : (supportedEff[0]?.id ?? null);
-        setMode(resolvedMode);
-        setModel(resolvedModel);
-        setEffort(resolvedEffort);
-      })
-      .catch((e) => { if (!cancelled) setLoadError(e instanceof Error ? e.message : String(e)); })
-      .finally(() => { if (!cancelled) setLoadingHarnesses(false); });
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   // Seed (and re-seed) the prompt from the context, but only while the user
@@ -131,84 +50,27 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, context, promptDirty]);
 
-  const { models: staticModels } = AGENT_OPTIONS[kind];
-  const modes = supportedModes(kind, model);
-  const models = useMemo(() => {
-    const known = new Set(staticModels.map((m) => m.id));
-    const extras = (agentModels[kind] ?? [])
-      .filter((m) => !known.has(m.id))
-      .map((m): typeof staticModels[number] => ({ id: m.id, label: m.label ?? m.id }));
-    return [...staticModels, ...extras];
-  }, [staticModels, agentModels, kind]);
-  const efforts = supportedEfforts(kind, model);
-
-  useEffect(() => {
-    if (efforts.length === 0) {
-      if (effort !== null) setEffort(null);
-      return;
-    }
-    if (effort !== null && efforts.some((e) => e.id === effort)) return;
-    const fallback = efforts.some((e) => e.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : efforts[0]!.id;
-    setEffort(fallback);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, model]);
-  useEffect(() => {
-    if (!modes.some((m) => m.id === mode)) {
-      const fallback = modes[0]?.id;
-      if (fallback) setMode(fallback);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, model]);
-
-  const switchAgent = (nextId: string) => {
-    if (nextId === agent) return;
-    const next = harnesses.find((h) => h.id === nextId);
-    const nextKind = next?.kind ?? "claude-code";
-    setAgent(nextId);
-    if (nextKind !== kind) {
-      setMode(initialMode(nextKind));
-      setModel(DEFAULT_MODEL[nextKind]);
-      setEffort(DEFAULT_EFFORT[nextKind]);
-    }
-  };
-
-  const canSubmit = !!context && prompt.trim().length > 0 && !!selectedStatus?.available && !submitting;
+  const canSubmit = !!context && prompt.trim().length > 0 && !!launch.selectedStatus?.available && !submitting;
 
   const submit = async () => {
     if (!context || !canSubmit) return;
     setSubmitting(true);
     setSubmitError(null);
     try {
-      const input = {
+      const created = await createAndStartTask({
         title: `Resolve conflicts: PR #${context.number} — ${context.title}`,
         prompt: prompt.trim(),
-        agent,
+        agent: launch.agent,
         workdir: context.path,
         isolation: "worktree" as const,
         existingBranch: context.headRef,
-        mode,
-        model,
-        effort,
+        mode: launch.mode,
+        model: launch.model,
+        effort: launch.effort,
         column: "ready" as const,
-      };
-      const created = await api.createTask(input);
-      try {
-        await api.startTask(created.id);
-      } catch (startErr) {
-        const detail = startErr instanceof Error ? startErr.message : String(startErr);
-        // Roll the task back so a retry doesn't trip the taken-branch guard on
-        // the row this dialog just created.
-        const rolledBack = await api.deleteTask(created.id).then(() => true, () => false);
-        throw new Error(
-          rolledBack
-            ? `couldn't start the task: ${detail}`
-            : `task was created but couldn't start (${detail}) — find it on the board and start it manually`,
-        );
-      }
-      void api.setPreference(`lastMode:${kind}`, mode).catch(() => {});
-      void api.setPreference(`lastModel:${kind}`, model).catch(() => {});
-      if (effort !== null) void api.setPreference(`lastEffort:${kind}`, effort).catch(() => {});
-      onCreated?.(created.id);
+      });
+      launch.rememberPicks();
+      onCreated?.(created);
       onClose();
     } catch (e) {
       setSubmitError(e instanceof Error ? e.message : String(e));
@@ -250,26 +112,26 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3 text-xs">
-        {loadingHarnesses && (
+        {launch.loading && (
           <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" /> Loading harnesses…
           </div>
         )}
 
-        {!loadingHarnesses && loadError && (
+        {!launch.loading && launch.loadError && (
           <div className="flex items-center justify-center gap-2 py-8 text-sm text-danger">
-            <AlertCircle className="size-4" /> {loadError}
+            <AlertCircle className="size-4" /> {launch.loadError}
           </div>
         )}
 
-        {!loadingHarnesses && !loadError && !context && (
+        {!launch.loading && !launch.loadError && !context && (
           <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
             <AlertCircle className="size-4" /> The PR's state changed — close and reopen this dialog if
             you still want to resolve conflicts.
           </div>
         )}
 
-        {!loadingHarnesses && !loadError && !!context && (
+        {!launch.loading && !launch.loadError && !!context && (
           <div className="space-y-3">
             {context && (
               <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground">
@@ -290,90 +152,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
               />
             </div>
 
-            <div className="space-y-1">
-              <label className="text-muted-foreground">Harness</label>
-              <div className="grid grid-cols-2 gap-1">
-                {availableHarnesses.map((h) => {
-                  const status = agents.find((s) => s.harnessId === h.id);
-                  const available = status?.available ?? false;
-                  const loggedOut = available && status?.loggedIn === false;
-                  return (
-                    <Button
-                      key={h.id}
-                      size="sm"
-                      variant={agent === h.id ? "default" : "outline"}
-                      onClick={() => switchAgent(h.id)}
-                      title={
-                        [
-                          status?.reason,
-                          status?.loggedIn === false ? (status.authHelp ?? "Not logged in") : null,
-                          status?.path,
-                          status?.version,
-                        ]
-                          .filter(Boolean)
-                          .join(" — ") || h.id
-                      }
-                      className="justify-start"
-                    >
-                      <AgentIcon kind={h.kind} className="mr-1" />
-                      <span className="truncate">{h.label}</span>
-                      <span
-                        className={cn(
-                          "ml-auto inline-block size-1.5 rounded-full",
-                          !available ? "bg-danger-solid" : loggedOut ? "bg-warning-solid" : "bg-success-solid",
-                        )}
-                      />
-                    </Button>
-                  );
-                })}
-              </div>
-              {selectedStatus && !selectedStatus.available && (
-                <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
-                  <div className="font-medium">{selectedStatus.reason}</div>
-                  {selectedStatus.installHint && (
-                    <div className="mt-1 font-mono opacity-80">{selectedStatus.installHint}</div>
-                  )}
-                </div>
-              )}
-              <HarnessAuthHint status={selectedStatus} />
-            </div>
-
-            <div className="space-y-1">
-              <label className="text-muted-foreground">Mode</label>
-              <Select value={mode} onChange={(e) => setMode(e.target.value)} className="h-8">
-                {modes.map((m) => (
-                  <option key={m.id} value={m.id}>{m.label}</option>
-                ))}
-              </Select>
-            </div>
-
-            <div className="grid grid-cols-2 gap-2">
-              <div className="min-w-0 space-y-1">
-                <label className="text-muted-foreground">Model</label>
-                <Select value={model} onChange={(e) => setModel(e.target.value)} className="h-8">
-                  {models.map((m) => (
-                    <option key={m.id} value={m.id}>{m.label}</option>
-                  ))}
-                </Select>
-              </div>
-              <div className="min-w-0 space-y-1">
-                <label className="text-muted-foreground">Effort</label>
-                <Select
-                  value={effort ?? ""}
-                  onChange={(e) => setEffort(e.target.value)}
-                  disabled={efforts.length === 0}
-                  className="h-8"
-                >
-                  {efforts.length === 0 ? (
-                    <option value="">n/a</option>
-                  ) : (
-                    efforts.map((m) => (
-                      <option key={m.id} value={m.id}>{m.label}</option>
-                    ))
-                  )}
-                </Select>
-              </div>
-            </div>
+            <TaskLaunchPickers launch={launch} />
 
             {submitError && (
               <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">

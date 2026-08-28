@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach, afterAll } from "bun:test";
-import { mkdtempSync, existsSync, writeFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, existsSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -9,6 +9,7 @@ import {
   tokenForHost,
   githubTokensPath,
 } from "./github-tokens.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 // github-tokens.ts resolves AGETOR_DATA_DIR lazily at call time (not at module
 // load), so — unlike db.ts/orchestrator.ts tests — it's safe to swap the env
@@ -24,7 +25,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(dataDir, { recursive: true, force: true });
+  rmTestDataDir(dataDir);
 });
 
 afterAll(() => {

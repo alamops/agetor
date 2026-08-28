@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { basename, join } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog } from "./db.ts";
+import { basename, join } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir } from "./db.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
 import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progress.ts";
+import { ISSUE_SNAPSHOT_FILENAME, normalizeIssueUrl, parseIssueUrl } from "../shared/issue-task.ts";
+import { providerRepoForDir } from "./git-provider.ts";
 import {
   AGENT_OPTIONS,
   DEFAULT_BRANCH_CONFIG,
@@ -3427,6 +3429,23 @@ export interface CreateTaskInput extends Partial<Task> {
    * from a template.
    */
   existingBranch?: string;
+  /**
+   * Issue URL this task is created from — validated with `parseIssueUrl` and
+   * same-repo-checked against `workdir`'s remote (see `createTask`'s body).
+   * Also settable via the inherited `Partial<Task>` field; listed here too
+   * so its doc comment lives next to `issueSnapshot`, which only makes sense
+   * alongside it.
+   */
+  issueUrl?: string | null;
+  /**
+   * Full markdown snapshot of the issue + its comment thread
+   * (`renderIssueThreadMarkdown`). When present (and `issueUrl` validates),
+   * written to `dataDir/issue-threads/<taskId>/<ISSUE_SNAPSHOT_FILENAME>`
+   * and appended to the task's references so the agent can read the full
+   * thread regardless of the prompt's inline cap. Ignored (no-op, not an
+   * error) when `issueUrl` is absent or fails validation.
+   */
+  issueSnapshot?: string;
 }
 
 /**
@@ -3567,6 +3586,33 @@ export async function createTask(
     plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);
   }
 
+  // Issue provenance (docs/plans/new-task-from-git-issue.md): validated once,
+  // at create time only — `issueUrl` is never patchable afterward (kept out
+  // of the PATCH allow-list in server.ts). A bad or wrong-repo URL rejects
+  // the whole create, since "View issue" and the PR-body "Closes #N" prefill
+  // both trust this field being correct. The stored value is the
+  // `normalizeIssueUrl` form (lowercased host, no query/hash/slug tail), not
+  // the raw string the caller sent — so the durable field is always
+  // canonical and directly comparable via `normalizeIssueUrl`/`sameIssueUrl`
+  // elsewhere, regardless of which slug/query the user happened to paste.
+  let validatedIssueUrl: string | null = null;
+  let parsedIssue: ReturnType<typeof parseIssueUrl> = null;
+  const rawIssueUrl = input.issueUrl?.trim() || "";
+  if (rawIssueUrl) {
+    parsedIssue = parseIssueUrl(rawIssueUrl);
+    if (!parsedIssue) return { error: "issueUrl is not a recognized issue URL" };
+    const repoInfo = await providerRepoForDir(workdir);
+    if (!repoInfo) return { error: `${workdir} has no ${parsedIssue.provider} remote for that issue` };
+    const sameRepo = repoInfo.provider === parsedIssue.provider
+      && `${repoInfo.owner}/${repoInfo.name}`.toLowerCase() === `${parsedIssue.owner}/${parsedIssue.repo}`.toLowerCase();
+    if (!sameRepo) {
+      return {
+        error: `issue URL points at ${parsedIssue.owner}/${parsedIssue.repo}, but the project's remote is ${repoInfo.owner}/${repoInfo.name}`,
+      };
+    }
+    validatedIssueUrl = normalizeIssueUrl(rawIssueUrl);
+  }
+
   const task = tasks.insert({
     id,
     title: input.title,
@@ -3582,6 +3628,7 @@ export async function createTask(
     baseRef,
     // No PR exists for a brand-new task; set server-side by pull-create.
     prUrl: null,
+    issueUrl: validatedIssueUrl,
     mode: input.mode ?? null,
     model,
     effort,
@@ -3614,6 +3661,29 @@ export async function createTask(
     updatedAt: now,
     archivedAt: null,
   });
+
+  // Write the full thread snapshot (issue body + every fetched comment) to
+  // its own per-task directory and reference it, so the agent can read the
+  // complete thread regardless of the prompt's inline cap. Best-effort: the
+  // prompt already carries an inline excerpt, so a write failure shouldn't
+  // fail task creation — just log and hand back the task as-is.
+  if (validatedIssueUrl && parsedIssue && input.issueSnapshot) {
+    try {
+      const snapshotDir = join(dataDir, "issue-threads", task.id);
+      mkdirSync(snapshotDir, { recursive: true });
+      const snapshotPath = join(snapshotDir, ISSUE_SNAPSHOT_FILENAME(parsedIssue.number));
+      writeFileSync(snapshotPath, input.issueSnapshot);
+      if (!task.references.some((r) => r.path === snapshotPath)) {
+        const updated = tasks.update(task.id, {
+          references: [...task.references, { path: snapshotPath, isDirectory: false }],
+        });
+        if (updated) return { task: updated };
+      }
+    } catch (e) {
+      console.warn(`[agetor] failed to write issue thread snapshot for task ${task.id}:`, e);
+    }
+  }
+
   return { task };
 }
 
@@ -3895,8 +3965,17 @@ export async function deleteTask(taskId: string): Promise<void> {
     await killTerminalsForTask(taskId);
     await removeWorktree(task);
   });
-  // No per-task attachments directory to clean up — refs are path-only,
-  // agetor never copied anything to disk.
+  // Refs are otherwise path-only — agetor never copies anything to disk for
+  // them — except the per-task issue-thread snapshot directory (written by
+  // `createTask` when `issueSnapshot` is provided), which is the one thing
+  // under `dataDir` this task might own. Best-effort: a task without one
+  // (the common case) makes this a no-op, and a failure here shouldn't block
+  // the delete itself.
+  try {
+    rmSync(join(dataDir, "issue-threads", taskId), { recursive: true, force: true });
+  } catch (e) {
+    console.warn(`[agetor] failed to remove issue thread snapshot dir for task ${taskId}:`, e);
+  }
   tasks.delete(taskId);
 }
 

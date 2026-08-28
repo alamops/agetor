@@ -1,7 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, ClipboardList, Code2, GitBranch, RefreshCw, SlidersHorizontal } from "lucide-react";
+import {
+  AlertCircle,
+  ChevronLeft,
+  ChevronRight,
+  CircleDot,
+  ClipboardList,
+  Code2,
+  GitBranch,
+  Loader2,
+  RefreshCw,
+  SlidersHorizontal,
+  X,
+} from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension, type BranchNamingConfig } from "@/lib/api";
 import { mergeModelOptions } from "../../../shared/model-options.ts";
+import {
+  buildIssueTaskPrompt,
+  issueTaskTitle,
+  parseIssueUrl,
+  renderIssueThreadMarkdown,
+  sameIssueUrl,
+  withoutSnapshotParagraph,
+} from "../../../shared/issue-task.ts";
+import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -85,6 +106,12 @@ interface Props {
       maxMode: boolean;
       references: TaskReference[];
       taskType: TaskType;
+      /** URL of the issue this task was seeded from, when the user loaded
+       *  one via the "From issue" row. Validated + same-repo checked server-side. */
+      issueUrl?: string;
+      /** Full markdown snapshot of the issue + its comment thread — only
+       *  meaningful alongside `issueUrl`. */
+      issueSnapshot?: string;
     },
     options: { start: boolean },
   ) => void;
@@ -164,6 +191,20 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [taskType, setTaskType] = useState<TaskType>(DEFAULT_TASK_TYPE);
+  // "From issue" row — paste a GitHub/GitLab/Bitbucket issue URL, fetch its
+  // thread for the *selected project*, and seed title/prompt from it. See
+  // `CreateTaskFromIssueDialog` for the sibling flow off the issue detail
+  // page; this is the lighter paste-URL entry point from the sidebar.
+  const [issueUrlDraft, setIssueUrlDraft] = useState("");
+  const [issueBusy, setIssueBusy] = useState(false);
+  const [issueError, setIssueError] = useState<string | null>(null);
+  const [issueLink, setIssueLink] = useState<{ url: string; number: number; snapshot: string } | null>(null);
+  // Non-blocking sibling of `issueError`: set when the issue itself loaded
+  // fine but its comment thread couldn't be fetched (`thread.commentsError`,
+  // e.g. GitLab's 401-to-anonymous `/notes`). Kept distinct from `issueError`
+  // (the load-failure path, which blocks the link) so a successfully-linked
+  // issue can still surface a heads-up without reading as a failure.
+  const [issueWarning, setIssueWarning] = useState<string | null>(null);
   // Soft-deleted harnesses are excluded from the picker and the default-
   // fallback logic. The full `harnesses` list is still used for
   // `selectedHarness` lookup so the resolved kind stays correct even for a
@@ -190,6 +231,25 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   // ProjectPicker will auto-select the most-recently-used project from the
   // persisted list.
   const [workdir, setWorkdir] = useState("");
+  // Staleness guard for `loadIssueFromUrl`'s fetch, mirroring the
+  // `cancelled`-flag pattern `CreateTaskFromIssueDialog` uses for its own
+  // on-open fetch: `workdirRef` mirrors the latest `workdir` (a plain closure
+  // over `workdir` would only see the value from the render that started the
+  // fetch, so a project switch mid-fetch wouldn't be detected), the sequence
+  // ref detects a newer load superseding this one, and the mounted ref
+  // catches an unmount mid-fetch.
+  const workdirRef = useRef(workdir);
+  useEffect(() => { workdirRef.current = workdir; }, [workdir]);
+  const issueLoadSeqRef = useRef(0);
+  const issueFormMountedRef = useRef(true);
+  // Set on mount AND reset in cleanup: React StrictMode runs mount → unmount →
+  // mount on the first render, so a cleanup-only effect would leave the ref
+  // stuck at `false` and every load would read as stale (the form-path e2e
+  // caught exactly that — the title never seeded).
+  useEffect(() => {
+    issueFormMountedRef.current = true;
+    return () => { issueFormMountedRef.current = false; };
+  }, []);
   const [isolate, setIsolate] = useState(true);
   const [baseRef, setBaseRef] = useState("");
   // Branch nomenclature for the selected project (loaded from the server;
@@ -216,6 +276,22 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
       .then((c) => { if (!cancelled) setBranchConfig(c); })
       .catch(() => { if (!cancelled) setBranchConfig(DEFAULT_BRANCH_CONFIG); });
     return () => { cancelled = true; };
+  }, [workdir]);
+
+  // The issue-thread same-repo guarantee is per project — a linked issue (or
+  // a stale error) from a previously-selected project must not survive a
+  // project switch. When a link is actually cleared, also strip the snapshot
+  // paragraph it added to the prompt — otherwise switching projects leaves a
+  // dangling "read the snapshot file" pointer to a file that was never
+  // attached to the new project's task.
+  useEffect(() => {
+    if (issueLink) {
+      setIssueLink(null);
+      setPrompt((p) => withoutSnapshotParagraph(p));
+    }
+    setIssueError(null);
+    setIssueWarning(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workdir]);
 
   // The tag-visible pattern for the current config + type, e.g. `feature/<slug>`.
@@ -492,8 +568,68 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
     setMode(codePlan.plan);
   };
 
+  // Gemini's one-shot tmux launch has no deferred-paste fallback for an
+  // oversized prompt — surfaced here (and blocking submit) rather than
+  // letting it fail at spawn time. Mirrors CreateTaskFromIssueDialog's guard.
+  const promptOverage = promptByteOverage(kind, prompt);
+  const selectedHarnessLabel = selectedHarness?.label ?? agent;
+
   const canSubmit =
-    title.trim() && prompt.trim() && workdir.trim() && (!isolate || branchValidation.ok);
+    title.trim() && prompt.trim() && workdir.trim() && (!isolate || branchValidation.ok)
+    && promptOverage == null;
+
+  // Parses + fetches the pasted issue URL against the *selected project*,
+  // then seeds title (only if empty) and prompt (appended if non-empty) from
+  // the thread — mirrors CreateTaskFromIssueDialog's seeding rules, minus
+  // the dialog's own editable-launch-pickers UI (this form already has one).
+  const loadIssueFromUrl = async () => {
+    const raw = issueUrlDraft.trim();
+    const dir = workdir.trim();
+    if (!raw || issueBusy || !dir) return;
+    const parsed = parseIssueUrl(raw);
+    if (!parsed) {
+      setIssueError("Not a recognized GitHub/GitLab/Bitbucket issue URL");
+      return;
+    }
+    const seq = ++issueLoadSeqRef.current;
+    // True once this fetch's result is no longer relevant: the component
+    // unmounted, a newer load superseded this one, or the user switched
+    // projects while this one was in flight.
+    const stale = () =>
+      !issueFormMountedRef.current
+      || issueLoadSeqRef.current !== seq
+      || workdirRef.current.trim() !== dir;
+    setIssueBusy(true);
+    setIssueError(null);
+    setIssueWarning(null);
+    try {
+      const thread = await api.getGitHubIssueThread(dir, parsed.number);
+      if (stale()) return;
+      if (!sameIssueUrl(thread.item.htmlUrl, raw)) {
+        setIssueError("That issue belongs to a different repository than the selected project");
+        return;
+      }
+      if (!title.trim()) setTitle(issueTaskTitle(thread.item));
+      const built = buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt;
+      setPrompt((cur) => (cur.trim() ? `${cur}\n\n${built}` : built));
+      setIssueLink({
+        url: thread.item.htmlUrl,
+        number: parsed.number,
+        snapshot: renderIssueThreadMarkdown(thread),
+      });
+      setIssueUrlDraft("");
+      if (thread.commentsError) setIssueWarning(thread.commentsError);
+    } catch (e) {
+      if (stale()) return;
+      setIssueError(e instanceof Error ? e.message : String(e));
+    } finally {
+      // Gated on the sequence only (not the full `stale()`, which also trips
+      // on a plain project switch) — a project switch with no new load in
+      // flight must still clear busy, or the Load button on the new project
+      // stays disabled forever.
+      if (issueLoadSeqRef.current === seq) setIssueBusy(false);
+    }
+  };
 
   const submit = ({ start }: { start: boolean }) => {
     if (!canSubmit) return;
@@ -519,6 +655,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
         maxMode: kind === "cursor" ? maxMode : false,
         references,
         taskType,
+        issueUrl: issueLink?.url,
+        issueSnapshot: issueLink?.snapshot,
       },
       { start },
     );
@@ -537,6 +675,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
     setBaseRef("");
     setReferences([]);
     setDropHint(null);
+    setIssueLink(null);
+    setIssueUrlDraft("");
+    setIssueError(null);
+    setIssueWarning(null);
     // Reset the branch field so the next task re-derives from its (now empty)
     // title and gets a fresh unique token; drop any manual override.
     setBranchDirty(false);
@@ -721,6 +863,71 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
               </div>
 
               <div className="space-y-1">
+                <label className="text-muted-foreground">From issue</label>
+                <div className="flex items-center gap-1.5">
+                  <Input
+                    data-testid="issue-url-input"
+                    placeholder="Paste a GitHub/GitLab issue URL"
+                    value={issueUrlDraft}
+                    onChange={(e) => setIssueUrlDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key !== "Enter") return;
+                      e.preventDefault();
+                      void loadIssueFromUrl();
+                    }}
+                    disabled={!workdir.trim()}
+                    title={!workdir.trim() ? "Pick a project first" : undefined}
+                    className="min-w-0 flex-1"
+                  />
+                  <Button
+                    data-testid="issue-url-load"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void loadIssueFromUrl()}
+                    disabled={!workdir.trim() || issueBusy}
+                    title={!workdir.trim() ? "Pick a project first" : undefined}
+                  >
+                    {issueBusy ? <Loader2 className="size-3.5 animate-spin" /> : "Load"}
+                  </Button>
+                </div>
+                {issueError && (
+                  <p className="flex items-center gap-1 text-[10px] text-danger">
+                    <AlertCircle className="size-3 shrink-0" /> {issueError}
+                  </p>
+                )}
+                {issueLink && (
+                  <div
+                    data-testid="issue-link-chip"
+                    className="inline-flex items-center gap-1 rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                  >
+                    <CircleDot className="size-3 shrink-0" />
+                    Issue #{issueLink.number}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIssueLink(null);
+                        setPrompt((p) => withoutSnapshotParagraph(p));
+                        setIssueWarning(null);
+                      }}
+                      title="Unlink issue"
+                      aria-label="Unlink issue"
+                      className="ml-0.5 text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </div>
+                )}
+                {issueLink && issueWarning && (
+                  <p
+                    data-testid="issue-comments-warning"
+                    className="flex items-center gap-1 text-[10px] text-warning"
+                  >
+                    <AlertCircle className="size-3 shrink-0" /> Comments weren't fetched — {issueWarning}
+                  </p>
+                )}
+              </div>
+
+              <div className="space-y-1">
                 <label className="text-muted-foreground">Title</label>
                 <Input
                   ref={titleRef}
@@ -770,6 +977,13 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                 </div>
                 {dropHint && (
                   <p className="text-[10px] text-muted-foreground">{dropHint}</p>
+                )}
+                {promptOverage && (
+                  <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
+                    This prompt is {Math.ceil(promptOverage.bytes / 1024)} KB — {selectedHarnessLabel}'s
+                    one-shot launch caps prompts at {Math.floor(promptOverage.limit / 1024)} KB. Pick
+                    another harness or trim the prompt.
+                  </div>
                 )}
               </div>
 

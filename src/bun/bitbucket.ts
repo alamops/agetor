@@ -3,6 +3,7 @@ import type {
   GitHubChecksResult,
   GitHubComment,
   GitHubCommentsResult,
+  GitHubIssueThreadResult,
   GitHubItemKind,
   GitHubItemState,
   GitHubListItem,
@@ -150,6 +151,7 @@ type BitbucketChecksResponse = ({ ok: true } & GitHubChecksResult) | BitbucketEr
 type BitbucketPullMergeResponse = GitHubPullMergeResult | BitbucketError;
 type BitbucketPullDefaultsResponse = ({ ok: true } & GitHubPullDefaultsResult) | BitbucketError;
 type BitbucketIssueResponse = ({ ok: true; item: GitHubListItem; message?: string }) | BitbucketError;
+type BitbucketIssueThreadResponse = ({ ok: true } & GitHubIssueThreadResult) | BitbucketError;
 type BitbucketActionResponse =
   | ({ ok: true; message?: string; item?: GitHubListItem; commentPosted?: boolean })
   | BitbucketError;
@@ -1550,6 +1552,57 @@ export async function getBitbucketPullDetail(repo: ProviderRepoInfo, number: num
   const item = normalizeBitbucketPull(json, null);
   if (!item) return { ok: false, error: "Bitbucket returned an unexpected pull request response" };
   return { ok: true, item };
+}
+
+/** Matches `getGitHubIssueThread`'s shape — a single issue by id, normalized
+ *  through `normalizeBitbucketIssue` (the same mapper `createBitbucketIssue`
+ *  uses), plus its comments via `listBitbucketComments`. Bitbucket's comments
+ *  adapter already drains every page itself (`collectRemainingValues`), so
+ *  `truncated` is always false here — unlike GitHub/GitLab there's no
+ *  page-count cap to hit. Bitbucket Cloud retired its issue tracker on
+ *  2026-08-20; a 404 with credentials sent still maps to the same friendly
+ *  "issue tracker is not enabled" hint `createBitbucketIssue` uses, since an
+ *  authenticated 404 on this endpoint means the tracker itself is gone, not
+ *  that the issue doesn't exist. `includeComments` (default `true`) mirrors
+ *  `getGitHubIssueThread`'s flag — `false` skips `listBitbucketComments`
+ *  entirely and returns `comments: [], truncated: false`, for a caller
+ *  ("View issue") that only needs the item. */
+export async function getBitbucketIssueThread(
+  repo: ProviderRepoInfo,
+  id: number,
+  includeComments = true,
+): Promise<BitbucketIssueThreadResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
+  if (!Number.isInteger(id) || id <= 0) return { ok: false, error: "issue number must be positive" };
+  const creds = await bitbucketCreds(repo.remoteHost);
+  const res = await fetchBitbucket(`${repoBasePath(repo)}/issues/${id}`, creds, "application/json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    if (res.status === 404 && creds) {
+      return { ok: false, error: "issue tracker is not enabled for this repository" };
+    }
+    return { ok: false, error: errorFrom(res, json, repo, !!creds) };
+  }
+  const item = normalizeBitbucketIssue(json, null);
+  if (!item) return { ok: false, error: "Bitbucket returned an unexpected issue response" };
+
+  if (!includeComments) {
+    return { ok: true, repo: `${repo.owner}/${repo.name}`, item, comments: [], truncated: false, refetchCommand: null };
+  }
+
+  const commentsRes = await listBitbucketComments(repo, id, "issues");
+  if (!commentsRes.ok) return commentsRes;
+
+  return {
+    ok: true,
+    repo: `${repo.owner}/${repo.name}`,
+    item,
+    comments: commentsRes.comments,
+    truncated: false,
+    refetchCommand: null,
+  };
 }
 
 /** The shared `GitHubPullMergeMethod` enum ("merge"|"squash"|"rebase") maps to

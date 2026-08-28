@@ -5,6 +5,7 @@ import {
   Archive,
   ArchiveRestore,
   CheckCircle2,
+  CircleDot,
   Copy,
   FolderGit2,
   FolderOpen,
@@ -24,11 +25,12 @@ import {
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { parseIssueUrl } from "../shared/issue-task.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
-import { GitHubDialog, type GitHubPullDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
+import { GitHubDialog, type GitHubItemDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
 import { UsageMeter } from "@/components/usage/UsageMeter";
 import { UsagePopover } from "@/components/usage/UsagePopover";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
@@ -191,6 +193,7 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
   diff: GitCompare,
   "open-in-finder": Folder,
   "view-pr": GitPullRequest,
+  "view-issue": CircleDot,
   "mark-read": MailOpen,
   "mark-unread": Mail,
   "copy-branch": GitBranch,
@@ -271,11 +274,14 @@ function AppInner() {
   // specific task; cleared when the dialog closes so a later plain "GitHub"
   // open (no prefill) doesn't inherit a stale project/task.
   const [githubPullPrefill, setGithubPullPrefill] = useState<GitHubPullPrefill | null>(null);
-  // Set by RunPanel's "View PR" header affordance to open GitHubDialog
-  // straight on that PR's detail subpage; cleared alongside `githubPullPrefill`
-  // above (dialog close, or the other prefill kind winning a race) so only
-  // one prefill kind is ever live at a time.
-  const [githubPullDetailPrefill, setGithubPullDetailPrefill] = useState<GitHubPullDetailPrefill | null>(null);
+  // Set by RunPanel's "View PR" / "View issue" header affordances to open
+  // GitHubDialog straight on that item's detail subpage; cleared alongside
+  // `githubPullPrefill` above (dialog close, or the other prefill kind
+  // winning a race) so only one prefill kind is ever live at a time.
+  // Generalized from the PR-only `GitHubPullDetailPrefill` (was
+  // `githubPullDetailPrefill`) so pulls and issues share one mechanism —
+  // see `GitHubItemDetailPrefill`'s doc comment in GitHubDialog.tsx.
+  const [githubItemDetailPrefill, setGithubItemDetailPrefill] = useState<GitHubItemDetailPrefill | null>(null);
   const [worktreesOpen, setWorktreesOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
@@ -1146,7 +1152,24 @@ function AppInner() {
       });
       return;
     }
-    setGithubPullDetailPrefill({ projectPath, number, prUrl });
+    setGithubItemDetailPrefill({ projectPath, kind: "pulls", number, url: prUrl });
+    setGithubPullPrefill(null);
+    setGithubOpen(true);
+  }, []);
+
+  // Issue-flavored sibling of `viewPullRequest` above — same fallback
+  // rationale (an unparseable URL can't drive the in-app detail subpage) and
+  // the same generalized `GitHubItemDetailPrefill` mechanism, just with
+  // `kind: "issues"`.
+  const viewIssue = useCallback(({ projectPath, issueUrl }: { projectPath: string; issueUrl: string }) => {
+    const number = parseIssueUrl(issueUrl)?.number;
+    if (number == null) {
+      void api.openExternal(issueUrl).catch((err: unknown) => {
+        toast.error(err instanceof Error ? err.message : "Could not open link");
+      });
+      return;
+    }
+    setGithubItemDetailPrefill({ projectPath, kind: "issues", number, url: issueUrl });
     setGithubPullPrefill(null);
     setGithubOpen(true);
   }, []);
@@ -1261,6 +1284,12 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         if (prUrl) viewPullRequest({ projectPath: t.workdir, prUrl });
         break;
       }
+      case "view-issue": {
+        // Same snapshot-first rationale as "view-pr" above.
+        const issueUrl = snapshot.issueUrl ?? t.issueUrl;
+        if (issueUrl) viewIssue({ projectPath: t.workdir, issueUrl });
+        break;
+      }
       case "mark-read":
         void markRead(t);
         break;
@@ -1285,7 +1314,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         return exhaustive;
       }
     }
-  }, [start, cancel, markDone, archive, unarchive, openInFinder, viewPullRequest, markRead, markUnread, copyToClipboard, del]);
+  }, [start, cancel, markDone, archive, unarchive, openInFinder, viewPullRequest, viewIssue, markRead, markUnread, copyToClipboard, del]);
 
   // Maps `buildTaskContextMenu`'s pure entries onto the primitive's
   // `ContextMenuItem[]`, inserting a separator whenever the group changes
@@ -1323,7 +1352,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
   const closeGithubDialog = useCallback(() => {
     setGithubOpen(false);
     setGithubPullPrefill(null);
-    setGithubPullDetailPrefill(null);
+    setGithubItemDetailPrefill(null);
   }, []);
 
   return (
@@ -1599,10 +1628,11 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         onUnarchive={unarchive}
         onOpenPullRequest={(prefill) => {
           setGithubPullPrefill(prefill);
-          setGithubPullDetailPrefill(null);
+          setGithubItemDetailPrefill(null);
           setGithubOpen(true);
         }}
         onViewPullRequest={viewPullRequest}
+        onViewIssue={viewIssue}
       />
       <DiffDialog
         open={!!diffTask}
@@ -1621,9 +1651,9 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       <GitHubDialog
         open={githubOpen}
         projects={projects}
-        initialProjectPath={githubPullDetailPrefill?.projectPath ?? githubPullPrefill?.projectPath ?? repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
+        initialProjectPath={githubItemDetailPrefill?.projectPath ?? githubPullPrefill?.projectPath ?? repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
         pullPrefill={githubPullPrefill}
-        pullDetailPrefill={githubPullDetailPrefill}
+        itemDetailPrefill={githubItemDetailPrefill}
         onClose={closeGithubDialog}
         onOpenSettings={() => {
           closeGithubDialog();

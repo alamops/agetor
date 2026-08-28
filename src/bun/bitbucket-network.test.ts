@@ -33,6 +33,7 @@ import {
   reviewBitbucketPull,
   updateBitbucketIssue,
 } from "./bitbucket.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 const ORIGINAL_DATA_DIR = process.env.AGETOR_DATA_DIR;
 const ORIGINAL_TOKEN = process.env.BITBUCKET_TOKEN;
@@ -53,7 +54,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  rmSync(dataDir, { recursive: true, force: true });
+  rmTestDataDir(dataDir);
   if (ORIGINAL_DATA_DIR === undefined) delete process.env.AGETOR_DATA_DIR;
   else process.env.AGETOR_DATA_DIR = ORIGINAL_DATA_DIR;
   if (ORIGINAL_TOKEN === undefined) delete process.env.BITBUCKET_TOKEN;

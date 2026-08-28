@@ -1005,6 +1005,27 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      "/github/issue-thread": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof number !== "number" || !Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // "false"/"0" → skip the comments fetch (the "View issue" prefill only
+          // needs the item); anything else (including absent) → the default true.
+          const includeCommentsParam = url.searchParams.get("includeComments");
+          const includeComments = includeCommentsParam !== "false" && includeCommentsParam !== "0";
+          const result = await gitHost.issueThread({ dir, number, includeComments });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
       "/github/viewer": {
         GET: authed(async (req) => {
           const url = new URL(req.url);
@@ -3386,12 +3407,30 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             baseRef?: string;
             existingBranch?: string;
             references?: TaskReference[];
+            /** Full markdown snapshot of the issue thread — written to
+             *  `dataDir/issue-threads/<taskId>/` and attached as a task
+             *  reference. Only meaningful alongside `issueUrl`. */
+            issueSnapshot?: string;
           };
           if (!body.title || !body.prompt) {
             return json(
               { error: "title and prompt required" },
               { status: 400, headers: corsHeaders(req) },
             );
+          }
+          if (body.issueUrl !== undefined && typeof body.issueUrl !== "string") {
+            return json({ error: "issueUrl must be a string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.issueSnapshot !== undefined) {
+            if (typeof body.issueSnapshot !== "string") {
+              return json({ error: "issueSnapshot must be a string" }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (body.issueSnapshot.length > 2_000_000) {
+              return json({ error: "issueSnapshot is too large" }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (!body.issueUrl) {
+              return json({ error: "issueSnapshot requires issueUrl" }, { status: 400, headers: corsHeaders(req) });
+            }
           }
           // Sanitize references: keep only entries with a non-empty string
           // `path` of reasonable length; coerce `isDirectory` to boolean.

@@ -7,6 +7,13 @@ import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import { flagValue } from "../args.ts";
 import { resolveRefs, warnMissingRefs } from "../refs.ts";
 import {
+  parseIssueUrl,
+  sameIssueUrl,
+  issueTaskTitle,
+  renderIssueThreadMarkdown,
+  buildIssueTaskPrompt,
+} from "../../shared/issue-task.ts";
+import {
   AGENT_OPTIONS,
   DEFAULT_MODEL,
   DEFAULT_EFFORT,
@@ -32,9 +39,12 @@ interface AddOpts {
   type?: string;
   start?: boolean;
   refs: string[];
+  /** Seed title/prompt from a GitHub/GitLab/Bitbucket issue + its comment
+   *  thread — resolved against `--workdir` (or cwd) in `cmdAdd`. */
+  issue?: string;
 }
 
-function parseAdd(args: string[]): AddOpts {
+export function parseAdd(args: string[]): AddOpts {
   const o: AddOpts = { refs: [] };
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -57,6 +67,7 @@ function parseAdd(args: string[]): AddOpts {
       case "--type": o.type = val(); break;
       case "--ref": o.refs.push(val()); break;
       case "--start": o.start = true; break;
+      case "--issue": o.issue = val(); break;
       default: break;
     }
   }
@@ -70,21 +81,66 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     prompt = o.promptFile === "-" ? (await Bun.stdin.text()).trim() : readFileSync(o.promptFile, "utf8");
   }
 
+  // Captured BEFORE the `--issue` block below fills in title/prompt
+  // fallbacks — otherwise every `--issue` invocation would look "explicit"
+  // and `chooseAddPath` would always skip the wizard (see fix #3).
+  const explicit = Boolean(o.title) && Boolean(prompt);
+
   const client = await getClient(flags);
 
+  // `--issue <url>` seeds title/prompt from the issue + its comment thread
+  // (same route the app's issue dialogs and New Task form use) and stamps
+  // `issueUrl`/`issueSnapshot` onto the created task. Resolved against
+  // `--workdir` (or cwd) since the thread fetch needs a repo to match against.
+  let issueUrl: string | undefined;
+  let issueSnapshot: string | undefined;
+  // Set from `thread.commentsError` when the issue loaded but its comment
+  // thread couldn't be fetched (e.g. GitLab's 401-to-anonymous `/notes` even
+  // on a public project) — surfaced as a terminal warning below, and folded
+  // into the `--json` result's `warnings` array instead of the plain-text
+  // print, matching the dialog/form's non-blocking treatment of the same
+  // signal.
+  let issueWarning: string | undefined;
+  if (o.issue) {
+    const parsed = parseIssueUrl(o.issue);
+    if (!parsed) throw new Error("--issue: not a recognized GitHub/GitLab/Bitbucket issue URL");
+    // Resolve relative to the CLI's cwd (not the daemon's — see `baseInput`'s
+    // comment) so the thread fetch and the eventual task both land on the
+    // same absolute path the user meant.
+    const workdir = path.resolve(o.workdir ?? process.cwd());
+    o.workdir = workdir;
+    const thread = await client.getIssueThread(workdir, parsed.number);
+    if (!sameIssueUrl(thread.item.htmlUrl, o.issue)) {
+      throw new Error("--issue: that issue belongs to a different repository than --workdir");
+    }
+    o.title ??= issueTaskTitle(thread.item);
+    prompt ??= buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt;
+    issueUrl = thread.item.htmlUrl;
+    issueSnapshot = renderIssueThreadMarkdown(thread);
+    if (thread.commentsError) {
+      issueWarning = thread.commentsError;
+      if (!flags.json) out(c.yellow("⚠ comments not fetched — " + thread.commentsError));
+    }
+  }
+
   let input: CreateTaskInput | null;
-  if (o.title && prompt) {
+  if (chooseAddPath({ explicit, isTTY, json: flags.json }) === "non-interactive") {
+    if (!(o.title && prompt)) {
+      throw new Error(
+        "agetor add needs --title and --prompt (or --prompt-file), or --issue <url>, when not run interactively",
+      );
+    }
     input = baseInput(o, o.title, prompt);
-  } else if (isTTY && !flags.json) {
-    input = await wizard(client, o, prompt);
   } else {
-    throw new Error(
-      "agetor add needs --title and --prompt (or --prompt-file) when not run interactively",
-    );
+    input = await wizard(client, o, prompt);
   }
   if (!input) {
     out("cancelled");
     return;
+  }
+  if (issueUrl) {
+    input.issueUrl = issueUrl;
+    input.issueSnapshot = issueSnapshot;
   }
   if (input.references?.length) warnMissingRefs(input.references);
 
@@ -102,12 +158,35 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
       started = false;
     }
   }
-  if (flags.json) return printJson({ task, started });
+  if (flags.json) {
+    return printJson(issueWarning ? { task, started, warnings: [issueWarning] } : { task, started });
+  }
   out(
     `${c.green("✓")} created ${c.dim(task.id.slice(0, 8))} — ${task.title}` +
       (started ? c.cyan("  ▸ started") : ""),
   );
   if (!started) out(c.dim(`  start it: agetor start ${task.id.slice(0, 8)}`));
+}
+
+/** Pure decision of whether `agetor add` should run non-interactively (a
+ *  ready-made title+prompt already in hand) or launch the interactive
+ *  wizard — factored out of `cmdAdd` so the branching (fix for `--issue`
+ *  wrongly bypassing the wizard) is testable without driving `@clack/prompts`.
+ *
+ *  Non-interactive whenever: the user explicitly supplied both `--title` and
+ *  a prompt (`--prompt`/`--prompt-file`) themselves — `explicit` must be
+ *  computed BEFORE any `--issue`-derived fallback fills those in, otherwise
+ *  every `--issue` invocation would look "explicit" — or this isn't a real
+ *  terminal (`!isTTY`), or `--json` output was requested (the wizard has no
+ *  JSON rendering). Otherwise (a TTY, no `--json`, and the user didn't fully
+ *  spell it out — e.g. `--issue` alone) the wizard runs, prefilled with
+ *  whatever the caller already resolved (issue-derived title/prompt, etc). */
+export function chooseAddPath(input: {
+  explicit: boolean;
+  isTTY: boolean;
+  json: boolean;
+}): "non-interactive" | "wizard" {
+  return input.explicit || !input.isTTY || input.json ? "non-interactive" : "wizard";
 }
 
 function baseInput(o: AddOpts, title: string, prompt: string): CreateTaskInput {
