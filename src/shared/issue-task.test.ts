@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildIssueTaskPrompt,
+  inferTaskTypeFromLabels,
   issueTaskTitle,
   normalizeIssueUrl,
   parseIssueUrl,
@@ -730,6 +731,70 @@ describe("snapshotParagraph", () => {
   test("snapshotParagraph is unaffected when commentsError is omitted or null", () => {
     expect(snapshotParagraph(7, 3, false)).toBe(snapshotParagraph(7, 3, false, null));
     expect(snapshotParagraph(7, 3, false, undefined)).toBe(snapshotParagraph(7, 3, false));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// inferTaskTypeFromLabels
+// ---------------------------------------------------------------------------
+
+describe("inferTaskTypeFromLabels", () => {
+  test("empty labels falls back to task", () => {
+    expect(inferTaskTypeFromLabels([])).toBe("task");
+  });
+
+  test("plain 'bug' label", () => {
+    expect(inferTaskTypeFromLabels([{ name: "bug" }])).toBe("bug");
+  });
+
+  test("'Type: Bug' matches case-insensitively as a token", () => {
+    expect(inferTaskTypeFromLabels([{ name: "Type: Bug" }])).toBe("bug");
+  });
+
+  test("'kind/defect' matches the bug family via the slash-delimited token", () => {
+    expect(inferTaskTypeFromLabels([{ name: "kind/defect" }])).toBe("bug");
+  });
+
+  test("'bug-report' matches via the hyphen-delimited token", () => {
+    expect(inferTaskTypeFromLabels([{ name: "bug-report" }])).toBe("bug");
+  });
+
+  test("'regression' and 'crash' also match the bug family", () => {
+    expect(inferTaskTypeFromLabels([{ name: "regression" }])).toBe("bug");
+    expect(inferTaskTypeFromLabels([{ name: "CRASH" }])).toBe("bug");
+  });
+
+  test("plain 'spike' label", () => {
+    expect(inferTaskTypeFromLabels([{ name: "spike" }])).toBe("spike");
+  });
+
+  test("'research' matches the spike family", () => {
+    expect(inferTaskTypeFromLabels([{ name: "research" }])).toBe("spike");
+  });
+
+  test("other spike-family keywords: investigation, investigate, exploration, poc, prototype", () => {
+    expect(inferTaskTypeFromLabels([{ name: "investigation" }])).toBe("spike");
+    expect(inferTaskTypeFromLabels([{ name: "investigate" }])).toBe("spike");
+    expect(inferTaskTypeFromLabels([{ name: "exploration" }])).toBe("spike");
+    expect(inferTaskTypeFromLabels([{ name: "poc" }])).toBe("spike");
+    expect(inferTaskTypeFromLabels([{ name: "prototype" }])).toBe("spike");
+  });
+
+  test("both families present ('bug' + 'research') — bug wins", () => {
+    expect(inferTaskTypeFromLabels([{ name: "research" }, { name: "bug" }])).toBe("bug");
+    expect(inferTaskTypeFromLabels([{ name: "bug" }, { name: "research" }])).toBe("bug");
+  });
+
+  test("a single label matching both families at once still resolves to bug", () => {
+    expect(inferTaskTypeFromLabels([{ name: "bug-investigation" }])).toBe("bug");
+  });
+
+  test("unrelated labels fall back to task", () => {
+    expect(inferTaskTypeFromLabels([{ name: "good first issue" }, { name: "priority: high" }])).toBe("task");
+  });
+
+  test("a run-together word like 'bugfix' (no delimiter) does not match the bug family", () => {
+    expect(inferTaskTypeFromLabels([{ name: "bugfix" }])).toBe("task");
   });
 });
 

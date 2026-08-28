@@ -38,6 +38,10 @@ export interface E2EBackend {
    *  `startGitHubStub(backend.githubStubPort, routes)` transparently becomes
    *  the app's GitHub API for the lifetime of that backend. */
   githubStubPort: number;
+  /** Directory `POST /refs/pick` returns from in this headless backend —
+   *  write the files a spec wants "picked" here, then click the picker's
+   *  Files/Folder button; see the seam in server.ts. */
+  fakePickDir: string;
 }
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
@@ -253,6 +257,13 @@ async function provisionBackend(
   const daemonLogFile = path.join(dataDir, "daemon.log");
   // Must happen before the spawn below — see writeFxStubBin's doc comment.
   const fxStubBinPath = writeFxStubBin(dataDir);
+  // Backs the `/refs/pick` test seam (src/bun/server.ts) — a spec plants
+  // files here, then clicks the picker's Files/Folder button, and the
+  // headless backend returns them instead of opening a native panel that
+  // doesn't exist in this environment. Created up front (like the fx stub
+  // bin above) so a spec can write into it before the backend even boots.
+  const fakePickDir = path.join(dataDir, "fake-picks");
+  mkdirSync(fakePickDir, { recursive: true });
 
   const logStream: WriteStream = createWriteStream(logFile);
   await new Promise<void>((resolve, reject) => {
@@ -311,6 +322,9 @@ async function provisionBackend(
       // Specs that never open the Git dialog never hit this — it's inert
       // until something calls startGitHubStub(backend.githubStubPort, ...).
       AGETOR_GITHUB_API_BASE: `http://127.0.0.1:${githubStubPort}`,
+      // Test seam for `/refs/pick` (src/bun/server.ts) — see fakePickDir
+      // above. Never set in production launches.
+      AGETOR_FAKE_PICK_REFS_DIR: fakePickDir,
       // So `githubToken()` resolves this literal token from env and never
       // shells out to `gh auth token` on the dev machine (which could hang,
       // fail, or leak a real token into a test run).
@@ -383,6 +397,7 @@ async function provisionBackend(
     bootBase: `${E2E_BASE_URL}/#api=${apiPort}&token=${apiToken}`,
     dataDir,
     githubStubPort,
+    fakePickDir,
   };
 
   await use(backend);

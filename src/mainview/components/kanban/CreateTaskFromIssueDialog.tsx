@@ -3,9 +3,10 @@ import { AlertCircle, AlertTriangle, Bot, Loader2, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
-import type { GitHubIssueThreadResult, TaskReference } from "../../../shared/types.ts";
+import { DEFAULT_TASK_TYPE, type GitHubIssueThreadResult, type TaskReference, type TaskType } from "../../../shared/types.ts";
 import {
   buildIssueTaskPrompt,
+  inferTaskTypeFromLabels,
   issueTaskTitle,
   renderIssueThreadMarkdown,
   sameIssueUrl,
@@ -14,6 +15,7 @@ import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
 import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
 import { PromptComposer } from "./PromptComposer";
+import { TaskTypePicker } from "./TaskTypePicker";
 
 /** The exact sibling of `ResolveConflictsContext` for issues: enough to
  *  refetch the thread and know where to put the resulting task. */
@@ -39,8 +41,11 @@ interface Props {
  * as the New Task left panel via `useWorktreeOptions`/`WorktreeOptions`
  * (`./WorktreeOptions`) and `PromptComposer` (`./PromptComposer`) — so the
  * panel and the two modals can't drift. Fetches the full issue thread on
- * open, seeds an editable prompt from it, and creates + starts a task (on a
- * fresh worktree branch by default, same as the panel) with the thread
+ * open, seeds an editable prompt from it, seeds the Type picker
+ * (`TaskTypePicker`) from the issue's own labels via `inferTaskTypeFromLabels`
+ * (so e.g. a `bug`-labelled issue defaults to `"bug"` instead of every issue
+ * task landing on the blanket `"task"` default), and creates + starts a task
+ * (on a fresh worktree branch by default, same as the panel) with the thread
  * embedded (inline in the prompt, and in full as a referenced snapshot
  * file).
  */
@@ -55,15 +60,22 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
   const [promptDirty, setPromptDirty] = useState(false);
   const [references, setReferences] = useState<TaskReference[]>([]);
 
-  // This modal has no Type picker (unlike the New Task form), so `taskType`
-  // is always "task" — the server's own default. The branch-name field
-  // derives live from the fixed task title (same `issueTaskTitle` the
-  // submit path uses), so it shows e.g. `feature/issue-7-…` once the thread
-  // loads.
+  // This modal now has a Type picker (`TaskTypePicker`, mirroring the New
+  // Task form), seeded from the issue's own labels via
+  // `inferTaskTypeFromLabels` once the thread loads — see the seeding effect
+  // below. `typeDirty` mirrors `promptDirty`'s "don't clobber what the user
+  // picked" rule: once the user touches the picker themselves, label-driven
+  // re-seeding stops.
+  const [taskType, setTaskType] = useState<TaskType>(DEFAULT_TASK_TYPE);
+  const [typeDirty, setTypeDirty] = useState(false);
+
+  // The branch-name field derives live from the current title + taskType
+  // (same `issueTaskTitle` the submit path uses), so it shows e.g.
+  // `fix/issue-7-…` for a bug-labelled issue once the thread loads.
   const wt = useWorktreeOptions({
     workdir: context?.path ?? "",
     title: thread ? issueTaskTitle(thread.item) : "",
-    taskType: "task",
+    taskType,
     // `IssueActions` (GitHubDialog.tsx) mounts this dialog unconditionally,
     // so the branch-config fetch must stay off until it's actually open.
     enabled: open,
@@ -79,10 +91,10 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
   // (GitHubDialog's `IssueActions`) re-renders on every board poll, and an
   // equal-valued-but-new-identity `context` object must NOT re-trigger this
   // (it would refetch the thread and reset `promptDirty`, wiping edits).
-  // `wt.resetForOpen()` and `setReferences([])` are here for the same
-  // reason as `setPromptDirty(false)`: a previous issue's branch-name edits,
-  // isolate-toggle choice, or attached references must not leak into the
-  // next open.
+  // `wt.resetForOpen()`, `setReferences([])`, and the `taskType`/`typeDirty`
+  // reset are here for the same reason as `setPromptDirty(false)`: a
+  // previous issue's branch-name edits, isolate-toggle choice, attached
+  // references, or manually-picked Type must not leak into the next open.
   useEffect(() => {
     setPromptDirty(false);
     setSubmitError(null);
@@ -90,6 +102,8 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
     setThreadError(null);
     wt.resetForOpen();
     setReferences([]);
+    setTaskType(DEFAULT_TASK_TYPE);
+    setTypeDirty(false);
     if (!open || !context) return;
     setThreadLoading(true);
     let cancelled = false;
@@ -116,6 +130,15 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
     setPrompt(buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [thread, promptDirty]);
+
+  // Seed (and re-seed) the Type picker from the fetched thread's labels, but
+  // only while the user hasn't picked one themselves — same "don't clobber
+  // what the user picked" rule as the prompt-seeding effect above.
+  useEffect(() => {
+    if (!thread || typeDirty) return;
+    setTaskType(inferTaskTypeFromLabels(thread.item.labels));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [thread, typeDirty]);
 
   const loading = launch.loading || threadLoading;
   const error = launch.loadError ?? threadError;
@@ -148,6 +171,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
         effort: launch.effort,
         column: "ready",
         references,
+        taskType,
         issueUrl: thread.item.htmlUrl,
         issueSnapshot: renderIssueThreadMarkdown(thread),
       });
@@ -257,6 +281,11 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
                   </div>
                 </div>
               )}
+
+              <TaskTypePicker
+                value={taskType}
+                onChange={(t) => { setTaskType(t); setTypeDirty(true); }}
+              />
 
               <PromptComposer
                 value={prompt}

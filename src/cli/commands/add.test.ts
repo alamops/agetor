@@ -354,6 +354,51 @@ test("cmdAdd: --issue whose thread has commentsError folds it into --json's warn
   expect(outputs).toEqual([]);
 });
 
+test("cmdAdd: --issue infers taskType from the thread's labels when --type is omitted", async () => {
+  reset();
+  const thread = makeThread({
+    item: makeItem({ labels: [{ name: "kind/defect", color: null }] }),
+  });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir], flags({ json: true }));
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.taskType).toBe("bug");
+});
+
+test("cmdAdd: --issue with an explicit --type keeps it, ignoring the thread's labels", async () => {
+  reset();
+  const thread = makeThread({
+    item: makeItem({ labels: [{ name: "bug", color: null }] }),
+  });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir, "--type", "spike"], flags({ json: true }));
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.taskType).toBe("spike");
+});
+
+test("cmdAdd: --issue whose thread has unrelated (or no) labels falls back to the default task type", async () => {
+  reset();
+  const thread = makeThread({
+    item: makeItem({ labels: [{ name: "good first issue", color: null }] }),
+  });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir], flags({ json: true }));
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.taskType).toBe("task");
+});
+
 test("cmdAdd: --issue whose thread has no commentsError omits `warnings` from the --json result entirely", async () => {
   reset();
   const thread = makeThread();

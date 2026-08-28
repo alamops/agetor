@@ -10,6 +10,7 @@
 // --issue`) both build on these so the prompt/snapshot shape can never drift
 // between entry points.
 import type { GitHubComment, GitHubIssueThreadResult, GitHubListItem, GitProvider } from "./types.ts";
+import { DEFAULT_TASK_TYPE, type TaskType } from "./types.ts";
 
 /** Prepended before the quoted issue content in both the launch prompt (as
  *  its own paragraph, immediately above the `---` separator) and the
@@ -192,6 +193,51 @@ export function sameIssueUrl(a: string | null | undefined, b: string | null | un
 /** `Issue #<n>: <title>` — neutral title template (not every issue is a bug). */
 export function issueTaskTitle(item: Pick<GitHubListItem, "number" | "title">): string {
   return `Issue #${item.number}: ${item.title}`;
+}
+
+/** Keyword families {@link inferTaskTypeFromLabels} matches against, each
+ *  compared case-insensitively to a label's full name and to every token
+ *  obtained by splitting the name on non-alphanumeric characters — so
+ *  `type: bug`, `kind/defect`, and `bug-report` all count as "bug" even
+ *  though none of them equal the literal string "bug". */
+const BUG_LABEL_KEYWORDS = new Set(["bug", "defect", "regression", "crash"]);
+const SPIKE_LABEL_KEYWORDS = new Set([
+  "spike",
+  "research",
+  "investigation",
+  "investigate",
+  "exploration",
+  "poc",
+  "prototype",
+]);
+
+/**
+ * Infers a {@link TaskType} from an issue's labels — seeds the "Work on this
+ * with Agetor" dialog's Type picker (and `agetor add --issue`'s `--type`
+ * default) from the issue tracker's own labels, so a `bug`-labelled issue
+ * lands on a `fix/…` branch instead of the blanket `feature/…` every issue
+ * task used to get regardless of label. Case-insensitive: a label matches a
+ * family when its full lowercased name, OR any token from splitting that
+ * name on non-alphanumeric characters, is one of the family's keywords (see
+ * {@link BUG_LABEL_KEYWORDS} / {@link SPIKE_LABEL_KEYWORDS}) — so
+ * `Type: Bug`, `kind/defect`, and `bug-report` all match "bug", while
+ * `bugfix` (no separator between the two words) does not.
+ *
+ * When labels match both families (e.g. a "bug investigation" issue tagged
+ * both `bug` and `research`), `"bug"` wins — it's still a bug fix at heart.
+ * No match (including no labels at all) falls back to
+ * {@link DEFAULT_TASK_TYPE}.
+ */
+export function inferTaskTypeFromLabels(labels: ReadonlyArray<{ name: string }>): TaskType {
+  let sawSpike = false;
+  for (const label of labels) {
+    const lower = label.name.toLowerCase();
+    const tokens = lower.split(/[^a-z0-9]+/).filter(Boolean);
+    const candidates = [lower, ...tokens];
+    if (candidates.some((c) => BUG_LABEL_KEYWORDS.has(c))) return "bug";
+    if (candidates.some((c) => SPIKE_LABEL_KEYWORDS.has(c))) sawSpike = true;
+  }
+  return sawSpike ? "spike" : DEFAULT_TASK_TYPE;
 }
 
 /** Filename the full thread snapshot is written under, per task

@@ -16,7 +16,6 @@ import { SearchSelect } from "@/components/ui/search-select";
 import { InfoTip } from "@/components/ui/info-tip";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
-import { taskTypeIcon } from "@/lib/task-type-icon";
 import {
   AGENT_OPTIONS,
   CATALOG_SCOPED_KINDS,
@@ -24,7 +23,6 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
-  TASK_TYPES,
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
@@ -40,6 +38,7 @@ import {
 import { AgentIcon } from "./AgentIcon";
 import { HarnessAuthHint } from "./HarnessAuthHint";
 import { ProjectPicker } from "./ProjectPicker";
+import { TaskTypePicker } from "./TaskTypePicker";
 import { captureDroppedOrPastedItems } from "./ReferencesPicker";
 import { PromptComposer, usePromptCapture } from "./PromptComposer";
 import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
@@ -543,28 +542,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
             </div>
 
             <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3 text-xs">
-              <div className="space-y-1">
-                <label className="text-muted-foreground">Type</label>
-                <div className="grid grid-cols-3 gap-1">
-                  {TASK_TYPES.map((t) => {
-                    const Icon = taskTypeIcon(t.icon);
-                    const selected = taskType === t.id;
-                    return (
-                      <Button
-                        key={t.id}
-                        size="sm"
-                        variant={selected ? "default" : "outline"}
-                        onClick={() => setTaskType(t.id)}
-                        title={t.hint}
-                        className="justify-start"
-                      >
-                        <Icon className={cn("mr-1 size-3.5", !selected && t.iconClass)} />
-                        <span className="truncate">{t.label}</span>
-                      </Button>
-                    );
-                  })}
-                </div>
-              </div>
+              <TaskTypePicker value={taskType} onChange={setTaskType} />
 
               <div className="space-y-1">
                 <label className="text-muted-foreground">Title</label>
