@@ -131,14 +131,32 @@ export function usePromptCapture(opts: {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   setPrompt: Dispatch<SetStateAction<string>>;
   setReferences: Dispatch<SetStateAction<TaskReference[]>>;
+  /**
+   * When supplied, capture status messages (attached/skipped/error hints)
+   * are routed here INSTEAD of the hook's own `dropHint` state, which then
+   * never leaves `null` (its setter is simply never called in that branch).
+   * `clearDropHint()` calls `onReport(null)` the same way.
+   *
+   * RunPanel needs this: its `sendHint` is one shared status line written by
+   * nine call sites (send, backlog CRUD, commit & push, resolve conflicts).
+   * A separate drop-only hint here would let a stale send error and a fresh
+   * drop hint render on screen at the same time — routing both through the
+   * same setter keeps exactly one hint visible, matching RunPanel's existing
+   * `reportSendCapture` → `setSendHint` behavior byte-for-byte.
+   */
+  onReport?: (message: string | null) => void;
 }): {
   dropHint: string | null;
   clearDropHint: () => void;
   onPaste: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void | Promise<void>;
   handleResult: (result: CaptureResult) => void;
 } {
-  const { textareaRef, setPrompt, setReferences } = opts;
-  const [dropHint, setDropHint] = useState<string | null>(null);
+  const { textareaRef, setPrompt, setReferences, onReport } = opts;
+  const [dropHint, setDropHintState] = useState<string | null>(null);
+  const setDropHint = (message: string | null) => {
+    if (onReport) onReport(message);
+    else setDropHintState(message);
+  };
 
   const applyCaptured = (items: CapturedItem[]) => {
     if (!items.length) return;
@@ -228,15 +246,84 @@ export interface PromptComposerProps {
   capture?: ReturnType<typeof usePromptCapture>;
   rows?: number;
   placeholder?: string;
-  label?: string;
+  /** `null` renders no `<label>` at all (RunPanel's send dock has none —
+   *  its toolbar row is picker + actions only). Defaults to `"Prompt"`,
+   *  matching every existing consumer. */
+  label?: string | null;
   referencesLabel?: string;
   startingFolder?: string;
   disabled?: boolean;
   /** Rendered right after the drop-hint line, inside the prompt block —
    *  e.g. a Gemini prompt-overage warning box. */
   footer?: ReactNode;
-  /** Extra className on the outer wrapper. */
+  /** Extra className on the outer wrapper (merged via `cn`/`tailwind-merge`,
+   *  so passing e.g. `"space-y-1.5"` cleanly overrides the default
+   *  `"space-y-3"` instead of producing two conflicting classes). */
   className?: string;
+  /** Extra className on the inner group wrapping the toolbar row, the
+   *  textarea row, and the hint/footer line (defaults to `"space-y-1"`,
+   *  matching every existing consumer). RunPanel overrides this alongside
+   *  `className` so its whole dock — References picker included — reads as
+   *  one uniformly-spaced `space-y-1.5` stack, exactly as it does today
+   *  (where all of this is one flat list of siblings, no inner grouping). */
+  innerClassName?: string;
+
+  /** Popover placement for BOTH the Extensions picker and the `/`
+   *  autocomplete. "below" (default) suits a form with room beneath the
+   *  field; pass "above" for a chat-style send box pinned to a panel's
+   *  bottom edge, or the popover renders off-screen. */
+  placement?: "above" | "below";
+  /** Whether to render the label/picker row at all. `false` fully skips it
+   *  — RunPanel renders its row only in certain send-states, so it passes
+   *  the same boolean condition it used to gate the row directly. */
+  toolbar?: boolean;
+  /** Right-hand cluster rendered in the toolbar row, after the Extensions
+   *  picker, inside its own `flex items-center gap-2` wrapper. Supplying
+   *  this also flips the picker's popover to `align="left"` — it's no
+   *  longer the rightmost element in the row (the default, label-only row
+   *  keeps `align="right"`, matching every existing consumer). */
+  actions?: ReactNode;
+  /** Rendered between the references picker (when `referencesPosition` is
+   *  `"before"`) and the toolbar row — e.g. RunPanel's archived-task
+   *  "Sending will unarchive…" notice. Renders regardless of `toolbar`,
+   *  same as that notice does today. */
+  notice?: ReactNode;
+  /** `ReferencesPicker`'s own `variant` — `"expandable"` (default, a
+   *  collapsible `<details>`) or `"inline"` (RunPanel's always-open strip). */
+  referencesVariant?: "expandable" | "inline";
+  /** Whether the references picker renders before or after the rest of the
+   *  composer. Defaults to `"after"`, matching every existing consumer;
+   *  RunPanel's dock puts it first. */
+  referencesPosition?: "before" | "after";
+  /** Extra element rendered inside the `relative` textarea wrapper, after
+   *  `SlashAutocomplete` — e.g. RunPanel's `MessageHistoryPicker` trigger,
+   *  absolutely positioned over the textarea's corner. */
+  inputAdornment?: ReactNode;
+  /** Extra element rendered alongside the textarea — e.g. RunPanel's Send
+   *  button. When supplied, the textarea's `relative` wrapper gains
+   *  `flex-1` and both are wrapped together in a `flex items-stretch
+   *  gap-2` row; when absent, the wrapper renders exactly as today
+   *  (`<div className="relative">`, no extra row). */
+  trailing?: ReactNode;
+  onKeyDown?: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  /** Called after the composer's own on-focus `reload()` (saved prompts
+   *  refetch) — never instead of it. */
+  onFocus?: () => void;
+  /** Merged (via `cn`) with the textarea's default `"resize-none"`. */
+  textareaClassName?: string;
+  /** `data-testid` on the prompt `<textarea>`. Defaults to
+   *  `"prompt-textarea"`, matching every existing consumer/e2e locator;
+   *  RunPanel uses `"send-textarea"` to stay distinguishable. */
+  textareaTestId?: string;
+  /**
+   * External override for the hint line normally driven by
+   * `activeCapture.dropHint`. `undefined` (the default) leaves that
+   * internal behavior untouched. Pass a value (including `null`) when the
+   * caller routes capture reports elsewhere via `usePromptCapture`'s
+   * `onReport` — e.g. RunPanel passes its own `sendHint` state, since its
+   * `capture.dropHint` never leaves `null` once `onReport` is wired up.
+   */
+  hint?: string | null;
 }
 
 /**
@@ -264,6 +351,20 @@ export function PromptComposer({
   disabled,
   footer,
   className,
+  innerClassName = "space-y-1",
+  placement = "below",
+  toolbar = true,
+  actions,
+  notice,
+  referencesVariant = "expandable",
+  referencesPosition = "after",
+  inputAdornment,
+  trailing,
+  onKeyDown,
+  onFocus,
+  textareaClassName,
+  textareaTestId = "prompt-textarea",
+  hint,
 }: PromptComposerProps) {
   const internalTextareaRef = useRef<HTMLTextAreaElement>(null);
   const ref = textareaRef ?? internalTextareaRef;
@@ -303,63 +404,98 @@ export function PromptComposer({
   });
   const activeCapture = capture ?? internalCapture;
 
+  // `hint` overrides the internal drop-hint rendering when a caller routes
+  // capture reports elsewhere (see the prop doc) — `undefined` (the default)
+  // means "not overridden", so every existing consumer falls back to
+  // `activeCapture.dropHint` unchanged. RunPanel's own hint paragraph
+  // historically carried an extra `mt-1` — a no-op today, `space-y-1.5` on
+  // its ancestor wins that specificity fight — kept here anyway so the
+  // rendered class list matches its old DOM byte-for-byte.
+  const hintText = hint !== undefined ? hint : activeCapture.dropHint;
+  const hintClassName = hint !== undefined
+    ? "mt-1 text-[10px] text-muted-foreground"
+    : "text-[10px] text-muted-foreground";
+
+  const referencesPicker = (
+    <ReferencesPicker
+      variant={referencesVariant}
+      label={referencesLabel}
+      refs={references}
+      onChange={onReferencesChange}
+      startingFolder={startingFolder}
+    />
+  );
+
+  // `relative` anchors SlashAutocomplete's popover to the textarea it
+  // decorates — keep the two together if this block ever moves.
+  const textareaBlock = (
+    <div className={cn("relative", trailing && "flex-1")}>
+      <Textarea
+        ref={ref}
+        data-testid={textareaTestId}
+        placeholder={placeholder}
+        value={value}
+        onChange={(e) => { onChange(e.target.value); if (activeCapture.dropHint) activeCapture.clearDropHint(); }}
+        onPaste={activeCapture.onPaste}
+        // Refetch saved prompts on focus (in addition to the popover-open
+        // refetch) so a deleted/edited prompt made in Settings mid-session
+        // doesn't linger in the `/` autocomplete indefinitely. The caller's
+        // own `onFocus` (if any) fires after.
+        onFocus={() => { reload(); onFocus?.(); }}
+        onKeyDown={onKeyDown}
+        rows={rows}
+        className={cn("resize-none", textareaClassName)}
+        disabled={disabled}
+      />
+      <SlashAutocomplete
+        commands={commands}
+        savedPrompts={savedPrompts}
+        value={value}
+        onChange={onChange}
+        textareaRef={ref}
+        placement={placement}
+      />
+      {inputAdornment}
+    </div>
+  );
+  // When `trailing` is supplied (e.g. RunPanel's Send button), the textarea
+  // wrapper gains `flex-1` (above) and both are wrapped in a `flex
+  // items-stretch gap-2` row instead of `textareaBlock` rendering standalone.
+  const textareaRow = trailing ? (
+    <div className="flex items-stretch gap-2">
+      {textareaBlock}
+      {trailing}
+    </div>
+  ) : textareaBlock;
+
   return (
     <div className={cn("space-y-3", className)}>
-      <div className="space-y-1">
-        <div className="flex items-center justify-between gap-2">
-          <label className="text-muted-foreground">{label}</label>
-          <ExtensionPicker
-            extensions={extensions}
-            savedPrompts={savedPrompts}
-            onPromptsOpen={reload}
-            value={value}
-            onChange={onChange}
-            textareaRef={ref}
-            placement="below"
-            align="right"
-            disabled={disabled || !workdir.trim()}
-          />
-        </div>
-        {/* `relative` anchors SlashAutocomplete's popover to the textarea it
-            decorates — keep the two together if this block ever moves. */}
-        <div className="relative">
-          <Textarea
-            ref={ref}
-            data-testid="prompt-textarea"
-            placeholder={placeholder}
-            value={value}
-            onChange={(e) => { onChange(e.target.value); if (activeCapture.dropHint) activeCapture.clearDropHint(); }}
-            onPaste={activeCapture.onPaste}
-            // Refetch saved prompts on focus (in addition to the
-            // popover-open refetch) so a deleted/edited prompt made in
-            // Settings mid-session doesn't linger in the `/` autocomplete
-            // indefinitely.
-            onFocus={reload}
-            rows={rows}
-            className="resize-none"
-            disabled={disabled}
-          />
-          <SlashAutocomplete
-            commands={commands}
-            savedPrompts={savedPrompts}
-            value={value}
-            onChange={onChange}
-            textareaRef={ref}
-          />
-        </div>
-        {activeCapture.dropHint && (
-          <p className="text-[10px] text-muted-foreground">{activeCapture.dropHint}</p>
+      {referencesPosition === "before" && referencesPicker}
+      <div className={innerClassName}>
+        {notice}
+        {toolbar && (
+          <div className="flex items-center justify-between gap-2">
+            {label !== null && <label className="text-muted-foreground">{label}</label>}
+            <ExtensionPicker
+              extensions={extensions}
+              savedPrompts={savedPrompts}
+              onPromptsOpen={reload}
+              value={value}
+              onChange={onChange}
+              textareaRef={ref}
+              placement={placement}
+              align={actions ? "left" : "right"}
+              disabled={disabled || !workdir.trim()}
+            />
+            {actions && <div className="flex items-center gap-2">{actions}</div>}
+          </div>
         )}
+        {textareaRow}
+        {hintText && <p className={hintClassName}>{hintText}</p>}
         {footer}
       </div>
 
-      <ReferencesPicker
-        variant="expandable"
-        label={referencesLabel}
-        refs={references}
-        onChange={onReferencesChange}
-        startingFolder={startingFolder}
-      />
+      {referencesPosition === "after" && referencesPicker}
     </div>
   );
 }
