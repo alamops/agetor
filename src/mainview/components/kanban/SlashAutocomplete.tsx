@@ -94,7 +94,27 @@ export function SlashAutocomplete({ commands, savedPrompts, value, onChange, tex
   }, [textareaRef]);
 
   const slice = useMemo(() => findActiveQuery(value, caret), [value, caret]);
-  const open = slice !== null && (commands.length > 0 || (savedPrompts?.length ?? 0) > 0);
+
+  // Escape dismisses the popover WITHOUT moving the caret — see the Escape
+  // branch below for why forcing the caret to the end of the textarea was
+  // buggy. Instead we record the query slice that was active when Escape
+  // fired; `open`'s derivation treats an unchanged, identical slice as
+  // dismissed. Any edit that produces a different slice (more typing, an
+  // arrow-key or click caret move) naturally stops matching, which is what
+  // lets the popover reopen — the effect below then clears the stale
+  // dismissal so it can't reappear if the caret/text round-trips back to the
+  // same slice later.
+  const [dismissedSlice, setDismissedSlice] = useState<{ start: number; end: number; query: string } | null>(null);
+  useEffect(() => {
+    if (!dismissedSlice) return;
+    if (!slice || slice.start !== dismissedSlice.start || slice.end !== dismissedSlice.end || slice.query !== dismissedSlice.query) {
+      setDismissedSlice(null);
+    }
+  }, [slice, dismissedSlice]);
+
+  const isDismissed = !!(dismissedSlice && slice
+    && slice.start === dismissedSlice.start && slice.end === dismissedSlice.end && slice.query === dismissedSlice.query);
+  const open = slice !== null && !isDismissed && (commands.length > 0 || (savedPrompts?.length ?? 0) > 0);
 
   // Commands first, saved prompts second — the render groups them under a
   // "Saved Prompts" label so the combined list stays visually distinct while
@@ -160,11 +180,14 @@ export function SlashAutocomplete({ commands, savedPrompts, value, onChange, tex
         if (choice) insert(choice);
       } else if (e.key === "Escape") {
         e.preventDefault();
-        // Closing the popover means moving the caret out of the slice; the
-        // simplest way is to clear the slice tracking by faking caret = end.
-        const end = el.value.length;
-        el.setSelectionRange(end, end);
-        setCaret(end);
+        // Dismiss unconditionally. We used to move the caret to the very end
+        // of the textarea's value to fall out of the active slice — a no-op
+        // (and therefore a popover stuck open) whenever the slice already
+        // sat at the end, e.g. right after inserting one command and typing
+        // another with nothing after it. Recording the slice here and
+        // consulting it in `open`'s derivation above closes the popover
+        // regardless of caret position.
+        if (slice) setDismissedSlice(slice);
       }
     };
     el.addEventListener("keydown", onKey);
@@ -179,6 +202,11 @@ export function SlashAutocomplete({ commands, savedPrompts, value, onChange, tex
   return (
     <div
       data-popover-open=""
+      // This popover only cares about Escape (to dismiss itself first, ahead
+      // of an enclosing Dialog) — it doesn't want to swallow other
+      // document-level shortcuts like RunPanel's Cmd/Ctrl+F. See the
+      // `:not([data-popover-keys="escape-only"])` clause on that handler.
+      data-popover-keys="escape-only"
       data-testid="slash-autocomplete"
       className={cn(
         "absolute left-0 right-0 z-20 max-h-56 overflow-y-auto rounded-md border border-border/60 bg-card text-card-foreground shadow-lg",

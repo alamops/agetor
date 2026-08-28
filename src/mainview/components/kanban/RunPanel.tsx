@@ -1524,7 +1524,11 @@ function RunPanelBody({
       if (e.key.toLowerCase() !== "f" || e.altKey) return;
       const wantsFind = IS_MAC_PLATFORM ? (e.metaKey && !e.ctrlKey) : e.ctrlKey;
       if (!wantsFind) return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      // Cmd/Ctrl+F isn't Escape, so a popover that only wants Escape yielded
+      // to it (marked `data-popover-keys="escape-only"` — SlashAutocomplete,
+      // ExtensionPicker) shouldn't block this shortcut too; excluding those
+      // keeps Cmd+F live while the `/` menu or Extensions popover is open.
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]:not([data-popover-keys="escape-only"])')) return;
       if ((e.target as Element | null)?.closest?.(".xterm")) return;
       e.preventDefault();
       if (searchOpen) {

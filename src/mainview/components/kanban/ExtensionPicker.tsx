@@ -193,6 +193,11 @@ export function ExtensionPicker({
       {open && (
         <div
           data-popover-open=""
+          // This popover only cares about Escape (to dismiss itself first,
+          // ahead of an enclosing Dialog) — it doesn't want to swallow other
+          // document-level shortcuts like RunPanel's Cmd/Ctrl+F. See the
+          // `:not([data-popover-keys="escape-only"])` clause on that handler.
+          data-popover-keys="escape-only"
           data-testid="extension-picker-popover"
           className={cn(
             "absolute z-30 w-72 max-w-[90vw] overflow-hidden rounded-md border border-border/60 bg-card text-card-foreground shadow-lg",

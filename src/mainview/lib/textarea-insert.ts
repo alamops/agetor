@@ -41,11 +41,19 @@ export function readCaret(el: HTMLTextAreaElement | null): { start: number; end:
 /** Restore the caret on the next frame, after React has flushed the new
  *  `value` into the DOM. WKWebView occasionally throws if `value` hasn't
  *  propagated yet — the try/catch keeps the marker visible even when the
- *  caret restore fails. */
+ *  caret restore fails.
+ *
+ *  Caret-before-focus is mandatory here, not stylistic: `SlashAutocomplete`
+ *  syncs its tracked caret off the native `focus` event, so calling
+ *  `.focus()` before `setSelectionRange` makes it read the stale pre-insert
+ *  offset — which can land inside a `/token`, pop the slash menu, and
+ *  swallow the next Enter via `preventDefault`. Position the caret first,
+ *  *then* focus. See `ExtensionPicker.tsx`'s `insertText` for the canonical
+ *  example of getting this right. */
 export function restoreCaret(el: HTMLTextAreaElement | null, caret: number): void {
   if (!el) return;
   requestAnimationFrame(() => {
-    el.focus();
     try { el.setSelectionRange(caret, caret); } catch { /* see above */ }
+    el.focus();
   });
 }

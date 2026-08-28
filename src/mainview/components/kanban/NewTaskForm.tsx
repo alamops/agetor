@@ -584,7 +584,6 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                 branch={wt.baseRef}
                 references={references}
                 onReferencesChange={setReferences}
-                setReferences={setReferences}
                 textareaRef={promptRef}
                 capture={capture}
                 startingFolder={workdir || undefined}

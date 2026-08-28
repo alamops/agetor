@@ -69,6 +69,14 @@ export interface WorktreeOptionsState {
   /** Post-submit reset: re-derive the branch field from the (now empty)
    *  title and get a fresh unique token; drop any manual override. */
   resetAfterSubmit: () => void;
+  /** Fresh-open reset: `resetAfterSubmit()` plus re-arming `isolate` to its
+   *  default (`true`). Dialogs (`CreateTaskFromIssueDialog`,
+   *  `ResolveConflictsDialog`) call this on open so an isolate toggle a user
+   *  unchecked and then cancelled out of doesn't silently carry into the
+   *  next issue/PR. `NewTaskForm` deliberately keeps `isolate` sticky across
+   *  submits (a rapid-fire multi-task workflow) and uses `resetAfterSubmit`
+   *  instead. */
+  resetForOpen: () => void;
   onBranchConfigSaved: Dispatch<SetStateAction<BranchNamingConfig>>;
   /** Echoed back from the hook's own inputs — the component needs both for
    *  the branch-name field's settings gear and its `BranchNamingDialog`. */
@@ -82,7 +90,7 @@ export interface WorktreeOptionsState {
  * fetch, and the clean/dirty branch-name field. Mirrors `TaskLaunchPickers`'s
  * `useTaskLaunch` house style — state hook + component + helper in one file.
  */
-export function useWorktreeOptions({ workdir, title, taskType }: { workdir: string; title: string; taskType: TaskType }): WorktreeOptionsState {
+export function useWorktreeOptions({ workdir, title, taskType, enabled = true }: { workdir: string; title: string; taskType: TaskType; enabled?: boolean }): WorktreeOptionsState {
   const [isolate, setIsolate] = useState(true);
   const [baseRef, setBaseRef] = useState("");
   // Branch nomenclature for the selected project (loaded from the server;
@@ -101,15 +109,18 @@ export function useWorktreeOptions({ workdir, title, taskType }: { workdir: stri
   const [branchSettingsOpen, setBranchSettingsOpen] = useState(false);
 
   // Load the selected project's branch nomenclature. Empty workdir → defaults.
+  // `enabled` (default true) lets a caller mounted unconditionally but not
+  // yet open — e.g. `CreateTaskFromIssueDialog`, which `IssueActions` renders
+  // regardless of dialog visibility — skip the fetch entirely until it does.
   useEffect(() => {
     const dir = workdir.trim();
-    if (!dir) { setBranchConfig(DEFAULT_BRANCH_CONFIG); return; }
+    if (!enabled || !dir) { setBranchConfig(DEFAULT_BRANCH_CONFIG); return; }
     let cancelled = false;
     api.getProjectBranchConfig(dir)
       .then((c) => { if (!cancelled) setBranchConfig(c); })
       .catch(() => { if (!cancelled) setBranchConfig(DEFAULT_BRANCH_CONFIG); });
     return () => { cancelled = true; };
-  }, [workdir]);
+  }, [workdir, enabled]);
 
   // The tag-visible pattern for the current config + type, e.g. `feature/<slug>`.
   // Deliberately stable while the title is typed — only config/taskType move
@@ -167,6 +178,11 @@ export function useWorktreeOptions({ workdir, title, taskType }: { workdir: stri
     setBranchToken(newBranchToken());
   };
 
+  const resetForOpen = () => {
+    resetAfterSubmit();
+    setIsolate(true);
+  };
+
   return {
     isolate,
     setIsolate,
@@ -186,6 +202,7 @@ export function useWorktreeOptions({ workdir, title, taskType }: { workdir: stri
     payload,
     resetBaseRef,
     resetAfterSubmit,
+    resetForOpen,
     onBranchConfigSaved: setBranchConfig,
     workdir,
     taskType,
@@ -217,10 +234,8 @@ export function WorktreeOptions(props: Props) {
           <Input
             data-testid="locked-branch"
             readOnly
-            disabled
             value={branch}
             className="font-mono text-[11px]"
-            title="PR head branch — checked out as-is"
           />
           <p className="text-[10px] text-muted-foreground">PR head branch — checked out as-is.</p>
         </div>

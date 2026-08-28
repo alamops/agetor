@@ -101,10 +101,37 @@ export function Dialog({
         // but Dialog's listener is registered earlier (it mounted first) and so
         // runs first on the same keydown — by the time theirs would call
         // preventDefault(), Dialog has already acted. The DOM marker is the
-        // only thing observable at this point. Carriers of `data-popover-open`:
-        // SearchSelect, the task context menu, and (after this change)
-        // SlashAutocomplete / ExtensionPicker.
-        if (document.querySelector("[data-popover-open]")) return;
+        // only thing observable at this point.
+        //
+        // The query is scoped to THIS panel (`panelRef.current`), not
+        // document-wide: a `[data-popover-open]` marker carried by a popover
+        // that lives outside the topmost dialog (e.g. an `InfoTip` left open
+        // elsewhere on the page while a dialog opens programmatically) must
+        // not suppress this dialog's Escape.
+        //
+        // Full carrier list (verify with `grep -rn "data-popover-open"
+        // src/mainview`): `SearchSelect` (ui/search-select.tsx),
+        // `MultiSearchSelect` (ui/multi-search-select.tsx), `InfoTip`
+        // (ui/info-tip.tsx), `MessageHistoryPicker`, the task context menu
+        // (ui/context-menu.tsx — portals to `document.body`, but it's never
+        // opened from inside a dialog and owns its own Escape listener),
+        // `SlashAutocomplete`, and `ExtensionPicker`. None of these carriers
+        // portal out of their parent (the context menu is the one exception,
+        // and it doesn't apply here for the reason above), which is what
+        // makes panel-scoping safe.
+        //
+        // Invariant every carrier must uphold: render the marker ONLY while
+        // open, and close itself on Escape — otherwise this dialog becomes
+        // un-closable by keyboard while that popover happens to be open
+        // somewhere on the page.
+        //
+        // A carrier that wants Escape yielded to it but does NOT want to
+        // swallow other document-level shortcuts pairs the marker with
+        // `data-popover-keys="escape-only"` — e.g. RunPanel's Cmd/Ctrl+F
+        // handler additionally requires
+        // `:not([data-popover-keys="escape-only"])` so an open `/`
+        // autocomplete or Extensions popover doesn't also block Cmd+F.
+        if (panelRef.current?.querySelector("[data-popover-open]")) return;
         e.preventDefault();
         onCloseRef.current();
         return;

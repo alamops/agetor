@@ -33,14 +33,22 @@ import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-inser
  * **The `capture` seam**: `usePromptCapture` needs a real, dispatch-shaped
  * (`Dispatch<SetStateAction<...>>`) prompt/references setter to safely
  * serialize two captures that land back-to-back across an async boundary
- * (see `applyCaptured` below) — a plain `value`/`onChange` prop pair can only
- * approximate that from the latest render's props. `NewTaskForm` owns a
- * full aside-wide drop zone (`onAsideDrop`) where concurrent drops are a real
- * scenario, so it builds its own `usePromptCapture` from its actual
- * `useState` dispatchers and passes the result in via the `capture` prop,
- * sharing the exact same drop-hint/caret path the textarea's own paste
- * handler uses. A dialog with no outer drop zone has no such race in
- * practice and can just let the composer own its own internal instance.
+ * (see `applyCaptured` below). When the caller doesn't supply one, this
+ * component derives a bridge from its `value`/`onChange` props, backed by a
+ * ref that's refreshed on every render (see `valueRef`/`referencesRef`
+ * below) — that keeps each individual functional-update call closure-safe
+ * across an async boundary (e.g. one capture's `setPrompt((cur) => …)`
+ * firing after a keystroke or a SlashAutocomplete/ExtensionPicker insertion
+ * lands in between). What the bridge can't do is serialize *two* functional
+ * updates dispatched in the same tick, before the parent has re-rendered and
+ * refreshed the ref — only a real `useState` dispatcher does that. `NewTaskForm`
+ * owns a full aside-wide drop zone (`onAsideDrop`) where two such
+ * same-tick captures are a real scenario, so it builds its own
+ * `usePromptCapture` from its actual `useState` dispatchers and passes the
+ * result in via the `capture` prop, sharing the exact same drop-hint/caret
+ * path the textarea's own paste handler uses. A dialog with no outer drop
+ * zone has no such race in practice and can just let the composer own its
+ * own internal instance.
  *
  * **The caret-before-focus rule**: any future code that inserts text into
  * the prompt textarea programmatically must call `setSelectionRange` (or
@@ -229,7 +237,6 @@ export interface PromptComposerProps {
   footer?: ReactNode;
   /** Extra className on the outer wrapper. */
   className?: string;
-  autoFocus?: boolean;
 }
 
 /**
@@ -257,7 +264,6 @@ export function PromptComposer({
   disabled,
   footer,
   className,
-  autoFocus,
 }: PromptComposerProps) {
   const internalTextareaRef = useRef<HTMLTextAreaElement>(null);
   const ref = textareaRef ?? internalTextareaRef;
@@ -270,10 +276,23 @@ export function PromptComposer({
   // `value`/`onChange` pairs. When the caller supplies `setReferences`
   // directly (or its own `capture`, built off real `useState` dispatchers),
   // these bridges are unused.
+  //
+  // A functional updater must read the *latest* prop, not the value closed
+  // over at render time: `usePromptCapture.onPaste` awaits
+  // `captureDroppedOrPastedItems` before calling `setPrompt((cur) => …)`, so
+  // anything typed (or inserted by SlashAutocomplete/ExtensionPicker) during
+  // that async window would otherwise be silently reverted by a stale `value`
+  // closure. Mirroring the props into refs and reading `.current` inside the
+  // bridge keeps each individual functional-update call closure-safe across
+  // that boundary, because the ref is updated on every render in between.
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const referencesRef = useRef(references);
+  referencesRef.current = references;
   const bridgeSetPrompt: Dispatch<SetStateAction<string>> = (update) =>
-    onChange(typeof update === "function" ? (update as (prev: string) => string)(value) : update);
+    onChange(typeof update === "function" ? (update as (prev: string) => string)(valueRef.current) : update);
   const bridgeSetReferences: Dispatch<SetStateAction<TaskReference[]>> = (update) =>
-    onReferencesChange(typeof update === "function" ? (update as (prev: TaskReference[]) => TaskReference[])(references) : update);
+    onReferencesChange(typeof update === "function" ? (update as (prev: TaskReference[]) => TaskReference[])(referencesRef.current) : update);
 
   // Hooks can't be conditional, so this always runs; `capture ?? internal`
   // below picks whichever the caller actually wants driving the textarea.
@@ -319,7 +338,6 @@ export function PromptComposer({
             rows={rows}
             className="resize-none"
             disabled={disabled}
-            autoFocus={autoFocus}
           />
           <SlashAutocomplete
             commands={commands}

@@ -4,6 +4,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import type { TaskReference } from "../../../shared/types.ts";
+import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
 import { WorktreeOptions } from "./WorktreeOptions";
 import { PromptComposer } from "./PromptComposer";
@@ -63,7 +64,11 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, context, promptDirty]);
 
-  const canSubmit = !!context && prompt.trim().length > 0 && !!launch.selectedStatus?.available && !submitting;
+  const overage = promptByteOverage(launch.kind, prompt);
+  const selectedHarnessLabel = launch.harnesses.find((h) => h.id === launch.agent)?.label ?? launch.agent;
+
+  const canSubmit =
+    !!context && prompt.trim().length > 0 && !!launch.selectedStatus?.available && !submitting && overage == null;
 
   const submit = async () => {
     if (!context || !canSubmit) return;
@@ -173,6 +178,13 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
                 setReferences={setReferences}
                 startingFolder={context.path}
                 rows={8}
+                footer={overage && (
+                  <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
+                    This prompt is {Math.ceil(overage.bytes / 1024)} KB — {selectedHarnessLabel}'s one-shot
+                    launch caps prompts at {Math.floor(overage.limit / 1024)} KB. Pick another harness or
+                    trim the prompt.
+                  </div>
+                )}
               />
 
               <WorktreeOptions locked={{ branch: context.headRef }} />

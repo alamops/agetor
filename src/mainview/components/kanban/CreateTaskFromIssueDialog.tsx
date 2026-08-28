@@ -64,6 +64,9 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
     workdir: context?.path ?? "",
     title: thread ? issueTaskTitle(thread.item) : "",
     taskType: "task",
+    // `IssueActions` (GitHubDialog.tsx) mounts this dialog unconditionally,
+    // so the branch-config fetch must stay off until it's actually open.
+    enabled: open,
   });
 
   const [submitting, setSubmitting] = useState(false);
@@ -76,15 +79,16 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
   // (GitHubDialog's `IssueActions`) re-renders on every board poll, and an
   // equal-valued-but-new-identity `context` object must NOT re-trigger this
   // (it would refetch the thread and reset `promptDirty`, wiping edits).
-  // `wt.resetAfterSubmit()` and `setReferences([])` are here for the same
-  // reason as `setPromptDirty(false)`: a previous issue's branch-name edits
-  // or attached references must not leak into the next open.
+  // `wt.resetForOpen()` and `setReferences([])` are here for the same
+  // reason as `setPromptDirty(false)`: a previous issue's branch-name edits,
+  // isolate-toggle choice, or attached references must not leak into the
+  // next open.
   useEffect(() => {
     setPromptDirty(false);
     setSubmitError(null);
     setThread(null);
     setThreadError(null);
-    wt.resetAfterSubmit();
+    wt.resetForOpen();
     setReferences([]);
     if (!open || !context) return;
     setThreadLoading(true);
@@ -220,7 +224,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
               <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground">
                 {wt.isolate
                   ? "Creates a task on a fresh branch in its own worktree."
-                  : "Runs the agent directly in the project checkout (no worktree)."}{" "}
+                  : "Runs the agent directly in the project checkout — it commits onto your current branch, in your working tree."}{" "}
                 {thread.commentsError ? (
                   "The issue is embedded in the prompt (comments couldn't be fetched) and saved as a referenced snapshot file."
                 ) : (
@@ -230,8 +234,8 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
                     {thread.comments.length === 1 ? "is" : "are"} embedded in the prompt and saved as a
                     referenced snapshot file.
                   </>
-                )}{" "}
-                The agent commits locally; it never pushes.
+                )}
+                {wt.isolate && " The agent commits locally; it never pushes."}
                 {thread.truncated && " Thread truncated at the fetch cap."}
                 {thread.refetchCommand && (
                   <div className="mt-1">
