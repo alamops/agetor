@@ -91,6 +91,20 @@ test("fuzzyPathMatch: indices are positions in the original (not lowercased) pat
   expect(match!.indices).toEqual([0, 1]);
 });
 
+test("fuzzyPathMatch: indices are dropped (not misaligned) when toLowerCase() changes the string's length", () => {
+  // U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE) lowercases to two UTF-16
+  // code units ("i" + a combining dot above), so `path.toLowerCase()` is one
+  // char longer than `path` itself. Mapping a lowerPath-relative index back
+  // onto `path` in that case would point at the wrong character (or past
+  // the end) — the match must still succeed, but with empty `indices`.
+  const path = "İstanbul.md";
+  expect(path.toLowerCase().length).not.toBe(path.length);
+  const match = fuzzyPathMatch("ist", path);
+  expect(match).not.toBeNull();
+  expect(match!.score).toBeGreaterThan(0);
+  expect(match!.indices).toEqual([]);
+});
+
 test("fuzzyPathMatch: a fully consecutive match scores higher than one with gaps", () => {
   const consecutive = fuzzyPathMatch("db", "db.ts")!;
   const gappy = fuzzyPathMatch("dt", "db.ts")!; // d...t, skips "b."
@@ -213,21 +227,61 @@ test("descendInto: collapses existing trailing slashes to exactly one", () => {
 });
 
 // ── performance ──────────────────────────────────────────────────────────────
-
-test("filters a 20k-entry listing well under 100ms", () => {
+//
+// Exercises the two-stage ranking design documented at the top of
+// at-file-filter.ts (cheap subsequence reject → cheap greedy score → cap to
+// the top 300 → exact DP only on those). The fixture is built to give each
+// query a large, realistic survivor set — not just a handful of entries that
+// isSubsequence rejects outright — so the DP-on-300-finalists stage is
+// actually exercised, not skipped:
+//   - every path contains "database", so both "d" and "db" (a genuine
+//     substring of "database", not just a scattered subsequence) match
+//     essentially every one of the 20k+ entries;
+//   - a fifth of paths sit under "src/bun/", so "src/bun/d" gets a large
+//     (but not universal) survivor set anchored on a real directory prefix,
+//     the same shape as the ranking tests above ("src/bun/db.ts").
+function buildPerfFixture(): FileEntry[] {
+  const dirs = ["src/bun", "src/mainview", "src/shared", "docs", "scripts"];
   const files: string[] = [];
   for (let i = 0; i < 20_000; i++) {
-    files.push(`src/module${i % 50}/component${i}/file${i}.ts`);
+    const dir = dirs[i % dirs.length];
+    files.push(`${dir}/module${i % 250}/database${i}.ts`);
   }
-  const entries: FileEntry[] = buildFileEntries(files);
+  return buildFileEntries(files);
+}
+
+function medianMs(fn: () => void, runs = 5): number {
+  const samples: number[] = [];
+  for (let i = 0; i < runs; i++) {
+    const start = performance.now();
+    fn();
+    samples.push(performance.now() - start);
+  }
+  samples.sort((a, b) => a - b);
+  return samples[Math.floor(samples.length / 2)]!;
+}
+
+test("filters a 20k-entry listing within a tight per-keystroke budget", () => {
+  const entries = buildPerfFixture();
   expect(entries.length).toBeGreaterThan(20_000);
 
-  const start = performance.now();
-  const result = filterFileEntries(entries, "comp1file", 50);
-  const elapsed = performance.now() - start;
+  // Soft target from the design: median ≤ 15ms on a healthy machine. Not
+  // asserted directly (CI/dev-machine load makes single-digit-ms timing
+  // flaky) — only logged so a real regression is visible without failing
+  // the suite on noise. The assertion below is the hard, skip-safe ceiling.
+  const softTargetMs = 15;
+  const hardCeilingMs = 60;
 
-  // Generous bound — this is meant to catch an accidental O(n^2)-over-the-
-  // whole-listing regression, not to pin down exact timing.
-  expect(elapsed).toBeLessThan(1000);
-  expect(result.length).toBeLessThanOrEqual(50);
+  for (const query of ["d", "db", "src/bun/d"]) {
+    const elapsed = medianMs(() => {
+      const result = filterFileEntries(entries, query, 50);
+      expect(result.length).toBeLessThanOrEqual(50);
+    });
+    if (elapsed > softTargetMs) {
+      console.warn(
+        `filterFileEntries("${query}") median ${elapsed.toFixed(2)}ms exceeds the ${softTargetMs}ms soft target (still under the ${hardCeilingMs}ms hard ceiling)`,
+      );
+    }
+    expect(elapsed).toBeLessThan(hardCeilingMs);
+  }
 });

@@ -66,6 +66,21 @@ test("listProjectFiles (live mode) lists tracked + untracked, excludes ignored +
   expect(res.files).toEqual([...res.files].sort((a, b) => (a < b ? -1 : 1)));
 });
 
+test("listProjectFiles (live mode) round-trips a filename with a LEADING space intact (R15)", async () => {
+  // Regression for R15: the local `git()` helper used to `.trim()` the whole
+  // `-z`-separated stdout blob, which silently ate a leading space off the
+  // FIRST NUL-terminated entry. A filename starting with a space is exactly
+  // the case that would have corrupted — " leading-space.txt" would have
+  // come back as "leading-space.txt", no longer matching anything on disk.
+  const { listProjectFiles } = await import("./project-files.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, " leading-space.txt"), "hi\n");
+
+  const res = await listProjectFiles({ dir: repo });
+  if ("error" in res) throw new Error(res.error);
+  expect(res.files).toContain(" leading-space.txt");
+});
+
 // ---------------------------------------------------------------------------
 // listProjectFiles — ref mode
 // ---------------------------------------------------------------------------
@@ -190,6 +205,11 @@ describe("resolveAtPath", () => {
     const expected = `${path.join(repo, "sub")}/`;
     expect(resolveAtPath(repo, "sub", true)).toBe(expected);
     expect(resolveAtPath(repo, "sub/", true)).toBe(expected);
+    // R10: a bare mention with NO trailing slash on the typed token arrives
+    // here as `isDirectory: false` (that's how `expandAtTokens` derives the
+    // flag) — the trailing slash must still be appended because `sub`
+    // actually IS a directory on disk, regardless of what the caller asked.
+    expect(resolveAtPath(repo, "sub", false)).toBe(expected);
   });
 
   test("rejects a '..'-escaping path", async () => {
@@ -230,5 +250,38 @@ describe("resolveAtPath", () => {
     const repo = await makeRepo();
     writeFileSync(path.join(repo, "space file.txt"), "hi\n");
     expect(resolveAtPath(repo, "space file.txt", false)).toBe(path.join(repo, "space file.txt"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// expandAtReferences
+// ---------------------------------------------------------------------------
+
+describe("expandAtReferences", () => {
+  test("a bare directory mention with no trailing slash expands WITH the trailing slash (R10)", async () => {
+    const { expandAtReferences } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "src"));
+    expect(expandAtReferences("look at @src for the code", repo)).toBe(
+      `look at ${path.join(repo, "src")}/ for the code`,
+    );
+  });
+
+  test("a resolved path containing whitespace is wrapped in double quotes (R9)", async () => {
+    const { expandAtReferences } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    writeFileSync(path.join(repo, "my notes.md"), "hi\n");
+    // The user had to quote the token in the first place BECAUSE the path has
+    // a space (`@"my notes.md"` — the bare-token grammar can't span a space).
+    // Expansion must not silently drop that delimiting once it swaps in the
+    // absolute path.
+    expect(expandAtReferences('see @"my notes.md"', repo)).toBe(`see "${path.join(repo, "my notes.md")}"`);
+  });
+
+  test("a resolved directory path containing whitespace is quoted with its trailing slash inside the quotes (R9 + R10)", async () => {
+    const { expandAtReferences } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "my notes"));
+    expect(expandAtReferences('see @"my notes/"', repo)).toBe(`see "${path.join(repo, "my notes")}/"`);
   });
 });

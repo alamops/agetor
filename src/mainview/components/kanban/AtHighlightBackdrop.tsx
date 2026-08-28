@@ -69,6 +69,22 @@ function readTextareaMetrics(el: HTMLTextAreaElement): React.CSSProperties {
   return style as React.CSSProperties;
 }
 
+/** Shallow key/value equality over the plain string-valued objects
+ *  `readTextareaMetrics` produces — used to keep the previous `style` object
+ *  identity across a re-read that turned up no actual change, so a
+ *  no-op metrics refresh doesn't force a re-render of every highlight
+ *  `<mark>` downstream. */
+function stylesEqual(a: React.CSSProperties, b: React.CSSProperties): boolean {
+  const aRec = a as Record<string, unknown>;
+  const bRec = b as Record<string, unknown>;
+  const aKeys = Object.keys(aRec);
+  if (aKeys.length !== Object.keys(bRec).length) return false;
+  for (const key of aKeys) {
+    if (aRec[key] !== bRec[key]) return false;
+  }
+  return true;
+}
+
 /**
  * Paints `<mark>` highlight boxes *behind* a textarea's native text. Must be
  * mounted BEFORE the `<textarea>` in DOM source order (not via z-index) so
@@ -85,24 +101,32 @@ export function AtHighlightBackdrop({ textareaRef, value, validPaths, className 
   const [style, setStyle] = useState<React.CSSProperties>({});
 
   // Mirror metrics on mount and on every resize of the textarea (font load,
-  // container resize, manual textarea resize handle, etc.).
+  // container resize, manual textarea resize handle, etc.) — `ResizeObserver`
+  // defaults to observing the *content* box, so a scrollbar appearing/
+  // disappearing (which shrinks/grows the content box with no border-box
+  // change) already fires this without needing a separate value-keyed
+  // effect. Deliberately NOT re-read on every `value` change: none of the
+  // `MIRRORED_PROPERTIES` (font, padding, border width, …) depend on the
+  // textarea's *text* — only on its box/typography, which only mount and a
+  // real resize can change — so keying this off `value` was forcing a
+  // synchronous `getComputedStyle` + a new style object on every keystroke
+  // for no payoff. `setStyle`'s functional form keeps the previous object
+  // identity when the freshly-read metrics are unchanged (`stylesEqual`),
+  // which is what actually matters here: `ResizeObserver`'s callback still
+  // fires on layout thrash even when nothing visibly moved, so the identity
+  // check is what stops that from cascading into a re-render.
   useLayoutEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
-    setStyle(readTextareaMetrics(el));
-    const ro = new ResizeObserver(() => setStyle(readTextareaMetrics(el)));
+    const applyMetrics = () => {
+      const next = readTextareaMetrics(el);
+      setStyle((prev) => (stylesEqual(prev, next) ? prev : next));
+    };
+    applyMetrics();
+    const ro = new ResizeObserver(applyMetrics);
     ro.observe(el);
     return () => ro.disconnect();
   }, [textareaRef]);
-
-  // Re-read on every value change too — a computed metric can shift with no
-  // ResizeObserver-visible size change (e.g. a scrollbar appearing changes
-  // the content box without changing the border box `ResizeObserver` sees).
-  useLayoutEffect(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    setStyle(readTextareaMetrics(el));
-  }, [value, textareaRef]);
 
   // Keep the backdrop's scroll position glued to the textarea's — the
   // backdrop itself is `overflow-hidden` (never scrollable on its own), so

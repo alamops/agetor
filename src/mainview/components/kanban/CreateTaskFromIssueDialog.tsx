@@ -90,7 +90,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
   // Memoized so `useProjectFiles`'s effect doesn't refire on every
   // unrelated re-render.
   const fileScope = useMemo(
-    () => (open ? { dir: context?.path ?? "", ref: wt.isolate ? (wt.baseRef || "HEAD") : null } : null),
+    () => (open ? { dir: context?.path ?? "", ref: wt.isolate ? (wt.baseRef.trim() || "HEAD") : null } : null),
     [open, context?.path, wt.isolate, wt.baseRef],
   );
 

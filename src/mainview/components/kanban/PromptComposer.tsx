@@ -459,6 +459,9 @@ export function PromptComposer({
 
   // `null`/undefined `fileScope` (no project/scope resolved yet) short-
   // circuits to no fetch and empty results — see `useProjectFiles`.
+  // `projectFiles.error` (a failed listing's message) is intentionally
+  // unused here — no error UI in this pass; it's available for a future
+  // inline hint if that's ever wanted.
   const projectFiles = useProjectFiles(fileScope ?? null);
 
   // Bridges for `usePromptCapture`'s internal instance below — it needs
@@ -519,9 +522,23 @@ export function PromptComposer({
   // see the file header) and the `Textarea` itself needs `relative` too, so
   // it — a later, *positioned* sibling — wins the paint order over the
   // earlier, absolutely-positioned backdrop.
+  // Both the backdrop and the popover are gated on `fileScope` being
+  // non-null — a composer with no scope (no `@` project tree resolved yet)
+  // must cost nothing per keystroke: no `getComputedStyle` reads, no
+  // highlight re-segmenting, no popover-query recompute. `useProjectFiles`
+  // itself stays an unconditional hook call above (hooks can't be
+  // conditional) but already short-circuits to empty results with no fetch
+  // when `fileScope` is nullish, so gating only the JSX here is sufficient —
+  // `projectFiles.entries`/`.validPaths` are just `[]`/`new Set()` in that
+  // case and these two components would render as no-ops anyway, but never
+  // mounting them at all is what actually removes their per-keystroke work
+  // (see AtHighlightBackdrop's/AtFileAutocomplete's own layout-effect and
+  // memo costs).
+  const hasFileScope = !!(fileScope && fileScope.dir);
+
   const textareaBlock = (
     <div className={cn("relative", trailing && "flex-1")}>
-      <AtHighlightBackdrop textareaRef={ref} value={value} validPaths={projectFiles.validPaths} />
+      {hasFileScope && <AtHighlightBackdrop textareaRef={ref} value={value} validPaths={projectFiles.validPaths} />}
       <Textarea
         ref={ref}
         data-testid={textareaTestId}
@@ -550,14 +567,16 @@ export function PromptComposer({
         textareaRef={ref}
         placement={placement}
       />
-      <AtFileAutocomplete
-        entries={projectFiles.entries}
-        truncated={projectFiles.truncated}
-        value={value}
-        onChange={onChange}
-        textareaRef={ref}
-        placement={placement}
-      />
+      {hasFileScope && (
+        <AtFileAutocomplete
+          entries={projectFiles.entries}
+          truncated={projectFiles.truncated}
+          value={value}
+          onChange={onChange}
+          textareaRef={ref}
+          placement={placement}
+        />
+      )}
       {inputAdornment}
     </div>
   );

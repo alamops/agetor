@@ -36,6 +36,15 @@ export interface AtToken {
  *  a defensive cap against a pathological line of non-whitespace text. */
 export const AT_TOKEN_MAX_LEN = 4096;
 
+/** Hard cap on how many paths the server's `listProjectFiles` (`GET
+ *  /files/index`) will return for a single scope, and the number the
+ *  client-side `@` popover footer reports when a listing was truncated at
+ *  it. Defined here (rather than in `src/bun/project-files.ts` or a
+ *  mainview-only module) so both processes — and `at-file-filter.ts`'s
+ *  perf test, which sizes its synthetic fixture off it — read the same
+ *  constant instead of two numbers that could drift apart. */
+export const MAX_PROJECT_FILES = 20_000;
+
 const WHITESPACE_RE = /\s/;
 
 /** Trailing chars stripped off the end of a *bare* token's raw run, one at a
@@ -137,10 +146,26 @@ export function findAtTokens(text: string): AtToken[] {
   return tokens;
 }
 
-/** Render a path back into `@`-token text — quoted when the path contains
- *  whitespace (which a bare token could never round-trip), bare otherwise. */
+/** Render a path back into `@`-token text so that, for any path not
+ *  containing a `"`, `findAtTokens(formatAtToken(p))[0]?.path === p` — i.e.
+ *  it round-trips through the grammar above. Quoting is required whenever a
+ *  *bare* token would parse back to something other than `path`:
+ *    - `path` contains whitespace — a bare token's run stops at the first
+ *      whitespace char, so anything after it would be lost.
+ *    - `path` ends in one of `TRAILING_STRIP_CHARS` (`. , ; : ! ? ) ] } > '`)
+ *      — a bare token strips those off the end, so e.g. `README.md.` would
+ *      come back as `README.md`.
+ *  A path containing a `"` is the one case this function cannot represent
+ *  faithfully either way: quoting it would just relocate the problem, since
+ *  the quoted form's own scanner stops at the first unescaped `"` (there is
+ *  no escape syntax), splitting the path early on re-parse. Bare form is
+ *  emitted instead — still lossy, but at least doesn't silently misparse a
+ *  `"` as the token's closing quote. */
 export function formatAtToken(path: string): string {
-  return WHITESPACE_RE.test(path) ? `@"${path}"` : `@${path}`;
+  if (path.includes('"')) return `@${path}`;
+  const lastChar = path.charAt(path.length - 1);
+  const needsQuoting = WHITESPACE_RE.test(path) || TRAILING_STRIP_CHARS.has(lastChar);
+  return needsQuoting ? `@"${path}"` : `@${path}`;
 }
 
 /**

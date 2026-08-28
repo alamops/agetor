@@ -3,6 +3,35 @@
 // React here) so the matching/ranking logic can be unit-tested in isolation
 // from the popover component that renders it — mirrors prompt-picker.ts and
 // diff-selection.ts in spirit.
+//
+// ── Two-stage ranking (why `filterFileEntries` isn't just "score everything
+// with the exact matcher") ──────────────────────────────────────────────────
+// `fuzzyPathMatch`'s dynamic program is O(query.length × path.length) and
+// allocates two typed arrays per call. Run over every entry in a large repo
+// (`MAX_PROJECT_FILES` = 20,000, see at-refs.ts) on every keystroke, that
+// scorer alone cost 20–43ms — most of it spent exact-ranking thousands of
+// entries the user will never scroll to. `rankByFuzzy` instead runs three
+// passes, each an order of magnitude cheaper than the last:
+//   1. `isSubsequence` — cheap O(path.length) reject, no allocation. Throws
+//      out entries that couldn't possibly match at all (the overwhelming
+//      majority once a query has a couple of characters).
+//   2. `greedyPathScore` — the same start/boundary/consecutive/gap bonus
+//      scheme as `fuzzyPathMatch`, but a single greedy left-to-right pass
+//      (no allocation, no backtracking) instead of the full DP. Not
+//      optimal — it can't trade off a later boundary bonus against an
+//      earlier gap the way the DP can — but it's a good-enough proxy for
+//      "is this entry in the ballpark", which is all a pre-filter needs.
+//      `TopCandidates` keeps only the top `TOP_N_FOR_EXACT_RANKING` (300) by
+//      this score — a partial selection, not a full sort of the listing.
+//   3. `fuzzyPathMatch` — the exact DP, run only on those ≤300 finalists,
+//      producing the real score and `indices` used for final ordering and
+//      for bolding matched characters in the popover row.
+// Below the 300-candidate threshold (true for every fixture in this file's
+// non-performance tests) stage 2 keeps every survivor, so the exact DP still
+// ranks the whole candidate set and the output is identical to a naive
+// single-stage implementation — the approximation only kicks in at the
+// scale where per-keystroke exactness across the whole listing was already
+// too slow to matter.
 
 /** One row the `@` popover can render. Directories carry a trailing "/" on
  *  `path` (e.g. "src/", "src/bun/") so callers can distinguish "src/" (the
@@ -88,6 +117,33 @@ const CONSECUTIVE_BONUS = 15;
 const GAP_PENALTY = 3;
 const BASE_CHAR_SCORE = 1;
 
+// Module-level scratch buffers for `fuzzyPathMatch`'s DP, grown on demand
+// and reused across calls instead of allocating two typed arrays (a
+// Float64Array + an Int32Array per query-length row) every time. Safe under
+// JS's single-threaded, non-reentrant execution model — nothing here awaits
+// or otherwise yields mid-computation, so no two calls ever interleave their
+// use of these buffers. Rows only ever grow, never shrink, so a later call
+// with a shorter query/path than a previous one just uses a prefix of an
+// already-sized buffer.
+let dpScratchRows: Float64Array[] = [];
+let parentScratchRows: Int32Array[] = [];
+
+/** Ensure the scratch pool has at least `rows` rows, each at least `cols`
+ *  wide, reallocating only the rows that are missing or too small. */
+function ensureScratchCapacity(rows: number, cols: number): void {
+  for (let i = 0; i < rows; i++) {
+    if (i >= dpScratchRows.length) {
+      dpScratchRows.push(new Float64Array(cols));
+      parentScratchRows.push(new Int32Array(cols));
+      continue;
+    }
+    if (dpScratchRows[i]!.length < cols) {
+      dpScratchRows[i] = new Float64Array(cols);
+      parentScratchRows[i] = new Int32Array(cols);
+    }
+  }
+}
+
 /** Case-insensitive fuzzy subsequence match of `query` against `path`, in
  *  the spirit of the scoring `command-score` (vendored by cmdk) uses —
  *  hand-rolled here since the repo has no fuzzy-match dependency. Returns
@@ -114,12 +170,13 @@ export function fuzzyPathMatch(query: string, path: string): FuzzyMatch | null {
   const m = lowerPath.length;
   const NEG = Number.NEGATIVE_INFINITY;
 
-  const dp: Float64Array[] = [];
-  const parent: Int32Array[] = [];
-  for (let i = 0; i < n; i++) {
-    dp.push(new Float64Array(m).fill(NEG));
-    parent.push(new Int32Array(m).fill(-2)); // -2 = unreachable, -1 = virtual root (row 0's predecessor)
-  }
+  // -2 = unreachable, -1 = virtual root (row 0's predecessor). Scratch rows
+  // may be wider than `m` (left over from a larger previous call) — every
+  // fill/read below is explicitly bounded to `[0, m)`, so leftover data past
+  // `m` in a reused row is never touched.
+  ensureScratchCapacity(n, m);
+  const dp = dpScratchRows;
+  const parent = parentScratchRows;
 
   function charBonus(j: number): number {
     if (j === 0) return BASE_CHAR_SCORE + START_BONUS;
@@ -130,7 +187,9 @@ export function fuzzyPathMatch(query: string, path: string): FuzzyMatch | null {
   // Row 0: only predecessor is the virtual root at index -1, so every
   // unmatched leading char is a "gap" of size j.
   const dpRow0 = dp[0]!;
+  dpRow0.fill(NEG, 0, m);
   const parentRow0 = parent[0]!;
+  parentRow0.fill(-2, 0, m);
   for (let j = 0; j < m; j++) {
     if (lowerPath.charAt(j) !== lowerQuery.charAt(0)) continue;
     dpRow0[j] = charBonus(j) - GAP_PENALTY * j;
@@ -140,7 +199,9 @@ export function fuzzyPathMatch(query: string, path: string): FuzzyMatch | null {
   for (let i = 1; i < n; i++) {
     const prevDp = dp[i - 1]!;
     const curDp = dp[i]!;
+    curDp.fill(NEG, 0, m);
     const curParent = parent[i]!;
+    curParent.fill(-2, 0, m);
     const qc = lowerQuery.charAt(i);
 
     // Running max of (prevDp[j'] + GAP_PENALTY * j') over j' <= j - 2 — the
@@ -213,6 +274,21 @@ export function fuzzyPathMatch(query: string, path: string): FuzzyMatch | null {
   }
   indices.reverse();
 
+  // `indices` are positions computed against `lowerPath` but are meant to be
+  // read as positions in `path` (the original, real-case string a caller
+  // bolds characters in). That's safe as long as the two strings are the
+  // same length — true for virtually all input — but `toLowerCase()` can
+  // change a string's length for a handful of Unicode code points (e.g.
+  // U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE lowercases to two UTF-16
+  // code units). When lengths differ, indices computed on `lowerPath` no
+  // longer line up with `path` and would highlight the wrong character (or
+  // one past the end). Rather than attempt a codepoint-aware realignment for
+  // this rare case, drop the indices — the match itself (and its score) is
+  // still correct and returned.
+  if (lowerPath.length !== path.length) {
+    return { score: bestScore, indices: [] };
+  }
+
   return { score: bestScore, indices };
 }
 
@@ -254,9 +330,104 @@ function isDirectChild(dirQuery: string, path: string): boolean {
   return stripped.length > 0 && !stripped.includes("/");
 }
 
+/** How many greedy-scored survivors get promoted to the exact DP stage — see
+ *  the "Two-stage ranking" note at the top of this file. */
+const TOP_N_FOR_EXACT_RANKING = 300;
+
+/** A cheap, non-optimal proxy for `fuzzyPathMatch`'s score: one greedy,
+ *  leftmost left-to-right pass (no backtracking, no allocation) using the
+ *  same start/boundary/consecutive/gap bonus scheme (see `fuzzyPathMatch`'s
+ *  doc comment) — `gap` there is generalized to "chars since the previous
+ *  match (or since the start)", which collapses to the same formula whether
+ *  or not there's been a previous match yet. Assumes `lowerQuery` is already
+ *  known to be a subsequence of `lowerPath` (callers check `isSubsequence`
+ *  first), so every query char is guaranteed to find a match and the loop
+ *  never has to signal "no match".
+ *
+ *  This is deliberately *not* the exact score: by always taking the first
+ *  available occurrence of each query char, it can undervalue a path where
+ *  waiting for a later occurrence would score higher (e.g. trading a small
+ *  gap now for a boundary bonus a few characters on) — precisely the
+ *  tradeoff `fuzzyPathMatch`'s DP searches for. It only needs to be a
+ *  reasonable proxy for "is this entry in the ballpark", since it's used
+ *  solely to pick which survivors get promoted to the exact stage. */
+function greedyPathScore(lowerQuery: string, lowerPath: string, path: string): number {
+  const n = lowerQuery.length;
+  const m = lowerPath.length;
+  let score = 0;
+  let qi = 0;
+  let lastMatchIndex = -1; // -1 = no match yet (the DP's "virtual root")
+  for (let pi = 0; pi < m && qi < n; pi++) {
+    if (lowerPath.charCodeAt(pi) !== lowerQuery.charCodeAt(qi)) continue;
+    const gap = pi - lastMatchIndex - 1;
+    let bonus = BASE_CHAR_SCORE;
+    if (pi === 0) bonus += START_BONUS;
+    else if (isBoundary(path, pi)) bonus += BOUNDARY_BONUS;
+    if (gap === 0 && lastMatchIndex !== -1) bonus += CONSECUTIVE_BONUS;
+    score += bonus - GAP_PENALTY * gap;
+    lastMatchIndex = pi;
+    qi++;
+  }
+  return score;
+}
+
+/** Keeps the top `cap` `consider()`-ed items ranked by score, without ever
+ *  holding more than `cap` at once — a partial selection, not a full sort of
+ *  everything that's been considered. Internally ascending (index 0 is the
+ *  weakest kept item), so admitting a new candidate once full is a single
+ *  comparison against the current floor, and evicting it is an O(cap)
+ *  bubble-into-place. That's the right tradeoff at `cap =
+ *  TOP_N_FOR_EXACT_RANKING`: O(entries × cap) total instead of O(entries log
+ *  entries) to fully sort a listing whose vast majority will be discarded
+ *  anyway. */
+class TopCandidates<T> {
+  private readonly items: { value: T; score: number }[] = [];
+  constructor(private readonly cap: number) {}
+
+  consider(value: T, score: number): void {
+    if (this.items.length < this.cap) {
+      let i = this.items.length;
+      this.items.push({ value, score });
+      while (i > 0 && this.items[i - 1]!.score > score) {
+        this.items[i] = this.items[i - 1]!;
+        i--;
+      }
+      this.items[i] = { value, score };
+      return;
+    }
+    if (score <= this.items[0]!.score) return; // wouldn't displace the weakest kept item
+    let i = 0;
+    while (i + 1 < this.items.length && this.items[i + 1]!.score < score) {
+      this.items[i] = this.items[i + 1]!;
+      i++;
+    }
+    this.items[i] = { value, score };
+  }
+
+  values(): T[] {
+    return this.items.map((x) => x.value);
+  }
+}
+
 function rankByFuzzy(entries: FileEntry[], query: string): FileEntry[] {
-  const scored: { entry: FileEntry; match: FuzzyMatch }[] = [];
+  const lowerQuery = query.toLowerCase();
+
+  // Stage 1 + 2: cheap reject, then cheap greedy score, keeping only the top
+  // TOP_N_FOR_EXACT_RANKING survivors. Below that cap this is a no-op filter
+  // — every survivor is kept — so the exact stage below still ranks the
+  // whole candidate set and output matches a naive single-stage
+  // implementation exactly.
+  const finalists = new TopCandidates<FileEntry>(TOP_N_FOR_EXACT_RANKING);
   for (const entry of entries) {
+    if (lowerQuery.length > entry.path.length) continue;
+    const lowerPath = entry.path.toLowerCase();
+    if (!isSubsequence(lowerQuery, lowerPath)) continue;
+    finalists.consider(entry, greedyPathScore(lowerQuery, lowerPath, entry.path));
+  }
+
+  // Stage 3: exact DP, only over the ≤300 finalists.
+  const scored: { entry: FileEntry; match: FuzzyMatch }[] = [];
+  for (const entry of finalists.values()) {
     const match = fuzzyPathMatch(query, entry.path);
     if (match) scored.push({ entry, match });
   }

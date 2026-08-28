@@ -968,7 +968,13 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   // by orchestrator-fx.test.ts's "spawn-throw hardening (gemini)" test —
   // so that pre-existing behavior/error text is unchanged by this feature.
   const expandedOverage = promptByteOverage(harness.kind, appendReferences(expandedPrompt, task.references));
-  const rawOverage = promptByteOverage(harness.kind, appendReferences(task.prompt, task.references));
+  // Skip re-encoding the same text twice (R19, code review) when expansion
+  // was a no-op — a prompt with no `@` tokens at all (or none that resolved)
+  // has `expandedPrompt === task.prompt`, so `expandedOverage` already IS
+  // what re-running `promptByteOverage` on the raw prompt would compute.
+  const rawOverage = expandedPrompt === task.prompt
+    ? expandedOverage
+    : promptByteOverage(harness.kind, appendReferences(task.prompt, task.references));
   if (expandedOverage && !rawOverage) {
     return {
       error:
@@ -2248,11 +2254,44 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   // have materialized `worktreePath` for the first time; a stale read would
   // expand against a cwd that didn't exist yet.
   const cwdTask = tasks.get(row.task_id) ?? task;
+  // Keep the pre-expansion text around: a claude paste that gets withheld by
+  // the modal guard re-stashes into the task's backlog tray (see
+  // `handlePasteWithheld`/`restashPasteWithheldText`), and that re-stash must
+  // dedupe against the RAW `@token` text a draft/tray item was saved with
+  // (plan §3.2) — re-stashing the EXPANDED absolute-path text would never
+  // match, producing a duplicate backlog entry every time the same message is
+  // retried (R2, code review).
+  const rawLine = line;
   line = expandAtReferences(line, cwdTask.worktreePath ?? cwdTask.workdir);
 
-  const kind = resolveHarness(row.agent)?.kind;
+  const harness = resolveHarness(row.agent);
+  const kind = harness?.kind;
+
+  // Re-check the argv-launch budget AFTER expansion, mirroring `startTask`'s
+  // pre-check (R5, code review): expanding a handful of short `@tokens` into
+  // long absolute paths can push a follow-up over gemini's one-shot argv cap
+  // even though the raw text the user typed comfortably fit under it. Must
+  // run before the per-kind dispatch below — once a kind's `send*Turn` is
+  // called it may already queue behind (or fold into) a live session with no
+  // way to un-send. A prompt that was ALREADY over budget with no `@` tokens
+  // involved (`rawOverage` truthy too) is left alone here, same as
+  // `startTask`'s identical carve-out.
+  if (kind) {
+    const expandedOverage = promptByteOverage(kind, line);
+    const rawOverage = line === rawLine ? expandedOverage : promptByteOverage(kind, rawLine);
+    if (expandedOverage && !rawOverage) {
+      return {
+        delivered: false,
+        reason:
+          `message is ${expandedOverage.bytes - expandedOverage.limit} bytes over `
+          + `${harness?.label ?? row.agent}'s ${expandedOverage.limit}-byte launch limit after expanding `
+          + `@ file references — shorten it or reference fewer files`,
+      };
+    }
+  }
+
   if (kind === "claude-code") {
-    const result = await sendClaudeTurn(row.task_id, line);
+    const result = await sendClaudeTurn(row.task_id, line, rawLine);
     if (!result) return { delivered: false, reason: "internal: task lookup failed" };
     if (!result.delivered) {
       if (result.withheld) {
@@ -3034,8 +3073,17 @@ async function resolveClaudeTurnOutcome(
  *
  * Returns null only on internal lookup failure (missing task row). Sessions
  * are always recoverable as long as the task itself still exists.
+ *
+ * `rawLine` is `line` BEFORE `sendInput` expanded its `@tokens` into absolute
+ * paths — threaded through so a withheld paste (see `sendTurnInExistingSession`
+ * → `handlePasteWithheld`) re-stashes the RAW text into the task's backlog,
+ * matching the `@token` form a draft/tray item was saved with (plan §3.2).
+ * Optional and defaults to `line` for callers with nothing to distinguish
+ * (there are none in production — `sendInput` always passes it — but keeping
+ * it optional avoids forcing every test/helper caller to thread a value that
+ * happens to equal `line` anyway).
  */
-async function sendClaudeTurn(taskId: string, line: string): Promise<ClaudeTurnResult | null> {
+async function sendClaudeTurn(taskId: string, line: string, rawLine?: string): Promise<ClaudeTurnResult | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
 
@@ -3055,14 +3103,23 @@ async function sendClaudeTurn(taskId: string, line: string): Promise<ClaudeTurnR
   // session over a transient probe failure. Only an unambiguous `gone` (or no
   // in-memory state at all) reaches the destructive respawn path.
   if (hasSessionState(taskId) && sessionLiveness(sessionNameFor(taskId)) !== "gone") {
-    return sendTurnInExistingSession(task, taskId, line);
+    return sendTurnInExistingSession(task, taskId, line, rawLine);
   }
   // A fresh spawn has no live modal to withhold a keystroke against, so
   // there's no `pasteOutcome` to await here — always delivered.
   return { runId: spawnResumedSession(task, taskId, line), delivered: true };
 }
 
-async function sendTurnInExistingSession(task: Task, taskId: string, line: string): Promise<ClaudeTurnResult> {
+/**
+ * `rawLine` is `line` before `@token` expansion — see `sendClaudeTurn`'s doc
+ * for why a withheld paste must re-stash that raw form, not the expanded one.
+ */
+async function sendTurnInExistingSession(
+  task: Task,
+  taskId: string,
+  line: string,
+  rawLine?: string,
+): Promise<ClaudeTurnResult> {
   // Fold-while-busy: if a turn is already in flight, paste the message into
   // the live session and record it on the ACTIVE run — no new run row, no new
   // turn slot. Claude's TUI queues the keystrokes and replays them as part of
@@ -3083,7 +3140,7 @@ async function sendTurnInExistingSession(task: Task, taskId: string, line: strin
     // the run, since the "user" bubble below is appended optimistically
     // before the paste's real outcome is known.
     const pasted = pasteFollowUp(taskId, line, {
-      onPasteFailure: (outcome) => handlePasteWithheld(taskId, activeRunId, line, outcome),
+      onPasteFailure: (outcome) => handlePasteWithheld(taskId, activeRunId, rawLine ?? line, outcome),
     });
     // `pasteFollowUp` returns `false` only when no live session exists (falls
     // through to the idle/respawn path below); otherwise `{ delivered: true;
@@ -3140,7 +3197,7 @@ async function sendTurnInExistingSession(task: Task, taskId: string, line: strin
   onChunk("user", normalizeUserText(line));
 
   const agent = sendTurn(taskId, line, onChunk, {
-    onPasteFailure: (outcome) => handlePasteWithheld(taskId, newRunId, line, outcome),
+    onPasteFailure: (outcome) => handlePasteWithheld(taskId, newRunId, rawLine ?? line, outcome),
   });
   registerActiveRun(newRunId, taskId, task, agent);
   attachDoneHandler(newRunId, taskId, agent);
@@ -3213,7 +3270,14 @@ async function sendTurnInExistingSession(task: Task, taskId: string, line: strin
  *
  * `text` is already the fully-composed message (references, if any, are
  * flattened into it client-side before it ever reaches `sendInput` — see
- * the `/runs/:id/input` route), so there's nothing further to pass through.
+ * the `/runs/:id/input` route), so there's nothing further to pass through —
+ * except that both call sites in `sendTurnInExistingSession` deliberately
+ * pass the PRE-expansion (`rawLine ?? line`) text, not the `@token`-expanded
+ * one `sendInput` actually hands to claude (R2, code review): a draft/tray
+ * backlog item is saved with the raw `@token` form, and this function's own
+ * dedupe (`restashPasteWithheldText`'s `item.text === text` scan) would never
+ * match an expanded absolute-path re-stash against it, producing a duplicate
+ * entry every time the same withheld message is retried.
  */
 function handlePasteWithheld(
   taskId: string,

@@ -2513,15 +2513,22 @@ function RunPanelBody({
   // Which tree the `@` file popover lists/validates against — must match what
   // the server will expand against at send time (`task.worktreePath ?? task.workdir`,
   // see orchestrator `sendInput`): the live worktree once it exists; before the
-  // first run of an isolated task, the source repo at its pinned base ref (the
-  // worktree will be created from exactly that commit); a plain workdir otherwise.
+  // first run of an isolated task, the source repo at whatever ref
+  // `prepareWorkdir` (worktree.ts) will actually check the worktree out on —
+  // `task.branch` when this task is pinned to a pre-existing branch
+  // (`branchSource === "existing"`, e.g. a PR's head branch), else the
+  // pinned `baseRef` a freshly-created branch will be cut from; a plain
+  // workdir otherwise.
   const fileScope = useMemo<FileScope>(() => (
     task.worktreePath
       ? { dir: task.worktreePath }
       : task.isolation === "worktree"
-        ? { dir: task.workdir, ref: task.baseRef ?? "HEAD" }
+        ? {
+            dir: task.workdir,
+            ref: task.branchSource === "existing" && task.branch ? task.branch : (task.baseRef ?? "HEAD"),
+          }
         : { dir: task.workdir }
-  ), [task.worktreePath, task.isolation, task.workdir, task.baseRef]);
+  ), [task.worktreePath, task.isolation, task.workdir, task.baseRef, task.branchSource, task.branch]);
   const onSendDragOver = (e: React.DragEvent) => {
     if (!e.dataTransfer.types.includes("Files")) return;
     // Always preventDefault on a file dragover so WKWebView doesn't fall back

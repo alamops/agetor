@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { descendInto, filterFileEntries, fuzzyPathMatch, type FileEntry } from "@/lib/at-file-filter";
 import { iconForRef } from "@/lib/file-icons";
 import { cn } from "@/lib/utils";
-import { findActiveAtQuery, formatAtToken } from "../../../shared/at-refs.ts";
+import { findActiveAtQuery, formatAtToken, MAX_PROJECT_FILES } from "../../../shared/at-refs.ts";
 
 interface Props {
   /** File/directory entries to suggest, scoped to the surface's project +
@@ -136,7 +136,21 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
     if (!slice) return;
     const before = value.slice(0, slice.start);
     const after = value.slice(slice.end);
-    const token = `@${descendInto(entry.path)}`;
+    const descended = descendInto(entry.path);
+    // Invariant: a bare `@`-slice can never contain whitespace —
+    // `findActiveAtQuery`'s bare branch rejects any query matching
+    // `WHITESPACE_RE`, and `findAtTokens`' bare form stops at the first
+    // whitespace char. So when the descended path itself has a space (or the
+    // slice we're rewriting was already quoted), we must emit the QUOTED
+    // in-progress form — an opening quote with NO closing quote — so the
+    // rewritten text still round-trips through `findActiveAtQuery`'s quoted
+    // branch (which tolerates any char but `"`/newline) and the popover
+    // keeps narrowing into the directory instead of the slice going dead
+    // mid-path. The commit path (Enter/click) is unaffected: `commit` calls
+    // `formatAtToken(entry.path) + " "`, which replaces this whole slice —
+    // including any opening quote left dangling here — with a freshly built,
+    // properly closed token.
+    const token = (slice.quoted || /\s/.test(descended)) ? `@"${descended}` : `@${descended}`;
     const next = before + token + after;
     onChange(next);
     const newCaret = before.length + token.length;
@@ -225,7 +239,7 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
         })}
         {truncated && (
           <li className="px-3 py-1.5 text-[10px] text-muted-foreground">
-            Showing the first 20,000 files — keep typing to narrow
+            Showing the first {MAX_PROJECT_FILES.toLocaleString()} files — keep typing to narrow
           </li>
         )}
       </ul>

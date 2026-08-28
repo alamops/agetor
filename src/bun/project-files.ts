@@ -5,9 +5,12 @@
 import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { isSafeRelPath } from "./worktree.ts";
-import { expandAtTokens } from "../shared/at-refs.ts";
+import { expandAtTokens, MAX_PROJECT_FILES } from "../shared/at-refs.ts";
 
-export const MAX_PROJECT_FILES = 20_000;
+// The cap lives in the shared module so the webview's truncation footer and
+// this listing can never disagree about the number; re-exported here for the
+// existing server-side importers/tests.
+export { MAX_PROJECT_FILES };
 
 export interface FileScope {
   /** Absolute path to an existing directory — either a task's live cwd (a
@@ -52,7 +55,15 @@ async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Pro
       new Response(proc.stderr).text(),
       proc.exited,
     ]);
-    return { ok: exitCode === 0, stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
+    // `stdout` is returned RAW — deliberately not `.trim()`ed. Every `-z`
+    // caller below (`ls-tree -z`, `ls-files -z`) NUL-terminates every entry,
+    // and a filename can legitimately start (or end) with a space (e.g.
+    // " leading-space.txt"); a whole-string `.trim()` would silently eat
+    // that leading space off the FIRST entry, corrupting the round-tripped
+    // name (R15, code review). The one caller that needs a trimmed scalar
+    // (the `rev-parse --is-inside-work-tree` probe, to strip its trailing
+    // newline) trims at the call site instead.
+    return { ok: exitCode === 0, stdout, stderr: stderr.trim(), exitCode };
   } finally {
     clearTimeout(timer);
   }
@@ -97,7 +108,7 @@ export async function listProjectFiles(scope: FileScope): Promise<ProjectFilesRe
   if (!st.isDirectory()) return { error: "directory does not exist" };
 
   const inside = await git(["rev-parse", "--is-inside-work-tree"], dir);
-  if (!inside.ok || inside.stdout !== "true") return { error: "not a git repository" };
+  if (!inside.ok || inside.stdout.trim() !== "true") return { error: "not a git repository" };
 
   if (ref) {
     // Defense-in-depth: a "-"-leading ref would otherwise be read as a git
@@ -143,8 +154,13 @@ export async function listProjectFiles(scope: FileScope): Promise<ProjectFilesRe
  *    symlink-escape guard, since this app has no sandbox and a mention must
  *    not be a way to read arbitrary files elsewhere on disk
  *
- * A trailing slash is re-appended on a directory result, matching
- * `formatReferences`' directory convention (src/shared/refs.ts).
+ * A trailing slash is re-appended on a directory result — driven by what the
+ * resolved path ACTUALLY is on disk (`st.isDirectory()`), not by whether the
+ * caller's `isDirectory` flag was set: a bare, no-trailing-slash mention like
+ * `@src` (`isDirectory: false`, since `expandAtTokens` derives the flag from
+ * whether the TYPED token ended in `/`) that resolves to a directory still
+ * gets the trailing slash (R10, code review) — matching `formatReferences`'
+ * directory convention (src/shared/refs.ts) regardless of how it was typed.
  */
 export function resolveAtPath(cwd: string, relPath: string, isDirectory: boolean): string | null {
   let rel = relPath;
@@ -170,7 +186,7 @@ export function resolveAtPath(cwd: string, relPath: string, isDirectory: boolean
     return null;
   }
 
-  return isDirectory ? `${abs}/` : abs;
+  return st.isDirectory() ? `${abs}/` : abs;
 }
 
 /**
@@ -186,7 +202,21 @@ export function resolveAtPath(cwd: string, relPath: string, isDirectory: boolean
  * itself (typically `task.prompt`) is never mutated by the caller: only the
  * returned string carries the expansion, so a stored prompt keeps its
  * `@tokens` and re-resolves them against whatever cwd a later run/edit gets.
+ *
+ * A resolved path containing whitespace is wrapped in double quotes before
+ * being spliced back in (R9, code review): the `@`-token grammar only forces
+ * the user to quote a TYPED token that itself has a space (`@"my notes/a.md"`),
+ * but the EXPANDED absolute path can carry whitespace the typed token never
+ * did — a short unquoted bare mention like `@notes` can resolve to an
+ * absolute path with a space in it once joined with `cwd`. Without a
+ * delimiter, that expansion would read to the agent as two separate words
+ * instead of one path — exactly the ambiguity the user's own `@"..."`
+ * quoting (when present) was there to prevent.
  */
 export function expandAtReferences(text: string, cwd: string): string {
-  return expandAtTokens(text, (p, isDir) => resolveAtPath(cwd, p, isDir));
+  return expandAtTokens(text, (p, isDir) => {
+    const resolved = resolveAtPath(cwd, p, isDir);
+    if (resolved === null) return null;
+    return /\s/.test(resolved) ? `"${resolved}"` : resolved;
+  });
 }

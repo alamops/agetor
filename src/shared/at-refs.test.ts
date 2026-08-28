@@ -170,6 +170,54 @@ describe("formatAtToken", () => {
   test("quoted form for a path containing whitespace", () => {
     expect(formatAtToken("docs/my file.md")).toBe('@"docs/my file.md"');
   });
+
+  test("quotes a path ending in a trailing-strip char so it round-trips", () => {
+    expect(formatAtToken("README.md.")).toBe('@"README.md."');
+    expect(formatAtToken("notes,")).toBe('@"notes,"');
+    expect(formatAtToken("weird!")).toBe('@"weird!"');
+    expect(formatAtToken("a(b)")).toBe('@"a(b)"');
+  });
+
+  test("does not quote a path ending in a trailing slash (directory marker survives bare)", () => {
+    expect(formatAtToken("src/bun/")).toBe("@src/bun/");
+  });
+
+  test("a path containing a double quote is emitted bare (unrepresentable — documented lossy case)", () => {
+    expect(formatAtToken('a b".md')).toBe('@a b".md');
+    // Confirms the round-trip really does NOT hold for this one shape, per
+    // the doc comment on formatAtToken.
+    expect(findAtTokens(formatAtToken('a b".md'))[0]?.path).not.toBe('a b".md');
+  });
+
+  test("round-trip invariant: every path without a `\"` survives findAtTokens(formatAtToken(p))", () => {
+    const paths = [
+      "src/bun/db.ts",
+      "docs/my file.md",
+      "README.md.",
+      "notes,",
+      "weird!",
+      "a(b)",
+      "a[b]",
+      "a{b}",
+      "trailing'",
+      "closing>",
+      "src/bun/",
+      "docs/my folder/",
+      "unicode/日本語.md",
+      "café/naïve.txt",
+      "emoji/😀.md",
+      "İstanbul.md",
+      "multi.dots...",
+      "  leading-and-trailing-space  ",
+      "a b c.d,e;f:g!h?i)j]k}l>m'n",
+    ];
+    for (const path of paths) {
+      const formatted = formatAtToken(path);
+      const tokens = findAtTokens(formatted);
+      expect(tokens).toHaveLength(1);
+      expect(tokens[0]!.path).toBe(path);
+    }
+  });
 });
 
 describe("findActiveAtQuery — bare", () => {

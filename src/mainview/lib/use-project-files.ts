@@ -23,6 +23,17 @@ interface CacheEntry {
   truncated: boolean;
 }
 
+/** A resolved fetch attempt: `error` is null on success, or the failure
+ *  message on failure (from the `{ error }` 400 body via `ApiError.message`,
+ *  or the thrown error's own message). Deliberately NOT the same shape as
+ *  `CacheEntry` — a failed attempt must never be written to `cache` (see
+ *  `fetchEntry`'s doc), so keeping the two types distinct is what stops a
+ *  future edit from accidentally `cache.set`-ing a failure result. */
+interface FetchResult {
+  entry: CacheEntry;
+  error: string | null;
+}
+
 function cacheKey(scope: { dir: string; ref?: string | null }): string {
   return `${scope.dir} ${scope.ref ?? ""}`;
 }
@@ -32,18 +43,25 @@ function cacheKey(scope: { dir: string; ref?: string | null }): string {
 // — renders its file list instantly from cache instead of refetching, and so
 // a scope change is deduped across every mounted consumer sharing that key.
 const cache = new Map<string, CacheEntry>();
-const inflight = new Map<string, Promise<CacheEntry>>();
+const inflight = new Map<string, Promise<FetchResult>>();
 
-function fetchEntry(scope: { dir: string; ref?: string | null }): Promise<CacheEntry> {
+/** Never throws into a render and never populates `cache` on failure — a
+ *  down server or a bad `ref` must not coerce into a cached `{files: [],
+ *  truncated: false}` entry, or every other composer sharing this scope
+ *  would render an empty listing (no error, no retry) until something else
+ *  happens to trigger a refetch. Failures are surfaced via `FetchResult
+ *  .error` instead and left for the caller to decide what (if anything) to
+ *  cache. */
+function fetchEntry(scope: { dir: string; ref?: string | null }): Promise<FetchResult> {
   const key = cacheKey(scope);
   const existing = inflight.get(key);
   if (existing) return existing;
   const promise = api.listProjectFiles(scope)
-    .catch((e: unknown) => {
-      // Never throw into a render — an unreachable server or a bad `ref`
-      // just means "no suggestions yet", not a crash.
+    .then((entry): FetchResult => ({ entry, error: null }))
+    .catch((e: unknown): FetchResult => {
       console.warn("[agetor] listProjectFiles failed", e);
-      return { files: [], truncated: false } as CacheEntry;
+      const message = e instanceof Error ? e.message : String(e);
+      return { entry: { files: [], truncated: false }, error: message };
     })
     .finally(() => {
       inflight.delete(key);
@@ -64,6 +82,14 @@ export function useProjectFiles(scope: FileScope | null | undefined): {
   validPaths: Set<string>;
   truncated: boolean;
   loading: boolean;
+  /** Non-null when the most recent fetch attempt for the current scope
+   *  failed (server unreachable, bad `ref`, …) — the `{ error }` 400 body's
+   *  message, or the thrown error's own message. Cleared on the next
+   *  successful fetch for this scope. A failure never touches `entries`/
+   *  `validPaths`/`truncated` (they keep whatever was last known-good for
+   *  this scope, empty if nothing ever succeeded) and never poisons the
+   *  shared module-level cache — see `fetchEntry`. */
+  error: string | null;
   refresh: () => void;
 } {
   const hasScope = !!(scope && scope.dir);
@@ -73,6 +99,7 @@ export function useProjectFiles(scope: FileScope | null | undefined): {
     () => (initialKey ? cache.get(initialKey)?.truncated ?? false : false),
   );
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   // Bumped by `refresh()` to force a refetch even when the scope itself
   // hasn't changed.
   const [gen, setGen] = useState(0);
@@ -86,6 +113,7 @@ export function useProjectFiles(scope: FileScope | null | undefined): {
       setFiles([]);
       setTruncated(false);
       setLoading(false);
+      setError(null);
       return;
     }
 
@@ -97,11 +125,22 @@ export function useProjectFiles(scope: FileScope | null | undefined): {
 
     const requestId = ++requestIdRef.current;
     setLoading(true);
-    fetchEntry(thisScope).then((entry) => {
-      cache.set(key, entry);
+    fetchEntry(thisScope).then(({ entry, error }) => {
       if (requestIdRef.current !== requestId) return; // superseded — drop it
+      if (error) {
+        // Do NOT cache.set here — a failed listing must not overwrite (or
+        // manufacture) a cache entry for this scope; every other composer
+        // sharing it keeps whatever it already had. `files`/`truncated`
+        // likewise stay at whatever was set above (the cached entry, or
+        // empty if this scope never succeeded).
+        setError(error);
+        setLoading(false);
+        return;
+      }
+      cache.set(key, entry);
       setFiles(entry.files);
       setTruncated(entry.truncated);
+      setError(null);
       setLoading(false);
     });
     // `insert`-style closures aside, the only inputs that should trigger a
@@ -115,5 +154,5 @@ export function useProjectFiles(scope: FileScope | null | undefined): {
   const entries = useMemo(() => buildFileEntries(files), [files]);
   const validPaths = useMemo(() => new Set(entries.map((e) => e.path)), [entries]);
 
-  return { entries, validPaths, truncated, loading, refresh };
+  return { entries, validPaths, truncated, loading, error, refresh };
 }

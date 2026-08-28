@@ -229,7 +229,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   // effect (keyed on `scope.dir`/`scope.ref`) doesn't see a new object
   // identity — and therefore doesn't refire — on every unrelated re-render.
   const fileScope = useMemo(
-    () => (workdir.trim() ? { dir: workdir, ref: wt.isolate ? (wt.baseRef.trim() || "HEAD") : null } : null),
+    () => (workdir.trim() ? { dir: workdir.trim(), ref: wt.isolate ? (wt.baseRef.trim() || "HEAD") : null } : null),
     [workdir, wt.isolate, wt.baseRef],
   );
   // Drag/paste-to-attach wiring for the prompt textarea, shared with the

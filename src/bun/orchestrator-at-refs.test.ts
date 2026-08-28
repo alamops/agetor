@@ -2,6 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 // Top-level: db.ts captures AGETOR_DATA_DIR at first import — mirrors
 // orchestrator.test.ts's own top-of-file setup.
@@ -41,6 +42,40 @@ async function makeRepo(): Promise<string> {
 async function settle(ms = 400) {
   await new Promise((r) => setTimeout(r, ms));
 }
+
+/** Poll `check` until it returns true or `timeoutMs` elapses — used by the
+ *  withheld-paste test below instead of a fixed `settle` so it doesn't flake
+ *  under load (mirrors orchestrator-paste-withheld.test.ts's own helper). */
+async function waitFor(check: () => boolean, timeoutMs = 5000, stepMs = 20): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (check()) return;
+    if (Date.now() > deadline) throw new Error("waitFor: timed out waiting for condition");
+    await new Promise((r) => setTimeout(r, stepMs));
+  }
+}
+
+/** A fresh, empty JSONL file to back a `claude-tmux.__forTest.installSession`
+ *  call — mirrors orchestrator-paste-withheld.test.ts's own helper (this
+ *  repo's "no cross-test-file imports" convention means each test file
+ *  duplicates small fixtures like this rather than sharing them). */
+function freshJsonl(): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-at-refs-session-"));
+  const jsonlPath = path.join(dir, `${randomUUID()}.jsonl`);
+  writeFileSync(jsonlPath, "");
+  return jsonlPath;
+}
+
+/** A numbered permission-style modal — recognised by `matchNumberedModal` and
+ *  therefore `paneShowsBlockingPrompt`. Used to force `queuePaste`'s modal
+ *  guard to withhold a follow-up send (mirrors orchestrator-paste-withheld
+ *  .test.ts's own `BLOCKING_PANE`). */
+const BLOCKING_PANE = [
+  "Do you want to make this edit to foo.ts?",
+  "❯ 1. Yes",
+  "  2. Yes, allow all",
+  "  3. No",
+].join("\n");
 
 // Concatenate every "user"/"stdout" event persisted for a task — both the
 // echoed launch/follow-up "user" bubble (which carries whatever
@@ -206,3 +241,116 @@ test("startTask (gemini) rejects before any run row exists when @ expansion push
 
   tasks.delete(taskId);
 });
+
+test("sendInput (gemini follow-up) rejects a message that only exceeds the argv budget after @ expansion, even though the raw follow-up fits (R5)", async () => {
+  const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
+  const { tasks, runs, harnesses } = await import("./db.ts");
+  const { expandAtReferences } = await import("./project-files.ts");
+  const { GEMINI_PROMPT_ARGV_MAX_BYTES } = await import("../shared/prompt-limits.ts");
+  harnesses.setEnabled("gemini", true);
+
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-at-refs-gemini-followup-"));
+  writeFileSync(path.join(dir, "README.md"), "hi\n");
+
+  const created = await createTask({
+    title: "at refs gemini followup overage",
+    prompt: "hello",
+    agent: "gemini",
+    workdir: dir,
+    isolation: "none",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  await settle(500); // let the fake gemini driver's first turn resolve
+
+  // Same shape as the startTask overage test above: the raw follow-up fits
+  // gemini's argv budget, but each `@README.md` token expands to an absolute
+  // path, and enough of them together blow past it.
+  const count = 350;
+  const rawLine = Array(count).fill("@README.md").join(" ");
+  const rawBytes = new TextEncoder().encode(rawLine).length;
+  expect(rawBytes).toBeLessThan(GEMINI_PROMPT_ARGV_MAX_BYTES);
+  const expandedBytes = new TextEncoder().encode(expandAtReferences(rawLine, dir)).length;
+  expect(expandedBytes).toBeGreaterThan(GEMINI_PROMPT_ARGV_MAX_BYTES);
+
+  const sent = await sendInput(started.runId, rawLine);
+  expect(sent.delivered).toBe(false);
+  if (!sent.delivered) {
+    expect(sent.reason).toMatch(/byte/);
+    expect(sent.reason).toMatch(/limit/);
+  }
+
+  // The guard fires before `sendGeminiTurn` is ever called — no follow-up run
+  // was spawned or queued for the rejected message.
+  expect(runs.listForTask(taskId).length).toBe(1);
+
+  tasks.delete(taskId);
+});
+
+test("sendInput (claude, withheld paste): re-stash keeps the RAW @token text, not the expanded absolute path, so it dedupes against a pre-existing raw tray item (R2)", async () => {
+  const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
+  const { tasks, backlog } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const repo = await makeRepo();
+  const created = await createTask({
+    title: "at refs withheld paste",
+    prompt: "first message",
+    agent: "claude-code",
+    workdir: repo,
+    isolation: "none",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  // Let the fake driver's initial turn resolve fully — the fake driver never
+  // registers real claude-tmux session state (see the follow-up test above),
+  // so this exercises the idle-send path once a real session is installed
+  // below, mirroring orchestrator-paste-withheld.test.ts's "withheld idle
+  // send" test.
+  await waitFor(() => tasks.get(taskId)?.column !== "running");
+
+  const rawLine = "look at @README.md";
+  // A tray item already saved with the RAW @token text — the dedupe this
+  // test exercises must recognize a re-stash of the SAME raw text and not
+  // add a second (previously: expanded-path) duplicate entry.
+  backlog.add(taskId, { text: rawLine });
+  expect(tasks.get(taskId)?.backlog.length).toBe(1);
+
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+  const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
+  const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(10);
+  const prevCapture = claudeTmux.__forTest.setCapturePastePane(() => BLOCKING_PANE);
+
+  try {
+    const sent = await sendInput(started.runId, rawLine);
+    if (sent.delivered) throw new Error(`expected the withheld send to report delivered:false, got ${JSON.stringify(sent)}`);
+    expect(sent.withheld).toBe(true);
+    expect(sent.savedToBacklog).toBe(true);
+
+    await claudeTmux.__forTest.pasteChains.get(taskId);
+    await waitFor(() => (tasks.get(taskId)?.backlog.length ?? 0) >= 1);
+
+    const after = tasks.get(taskId);
+    // Still exactly 1 item — the re-stash matched the pre-existing RAW-text
+    // item instead of adding a second, expanded-path duplicate (the R2 bug:
+    // `restashPasteWithheldText`'s `item.text === text` dedupe scan never
+    // matches a stored raw `@token` draft against a re-stash of the EXPANDED
+    // absolute-path text).
+    expect(after?.backlog.length).toBe(1);
+    expect(after?.backlog[0]?.text).toBe(rawLine);
+    // The stashed text is the raw @token, never the expanded absolute path.
+    expect(after?.backlog[0]?.text).not.toContain(repo);
+  } finally {
+    claudeTmux.__forTest.setCapturePastePane(prevCapture);
+    claudeTmux.__forTest.setPasteModalGraceMs(prevGrace);
+    claudeTmux.__forTest.setPasteModalPollMs(prevPoll);
+    claudeTmux.__forTest.uninstallSession(taskId);
+    tasks.delete(taskId);
+  }
+}, 10_000);
