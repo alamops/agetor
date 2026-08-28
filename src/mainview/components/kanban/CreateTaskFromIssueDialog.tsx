@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, AlertTriangle, Bot, Loader2, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -83,6 +83,16 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
 
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+
+  // `@` file-reference scope — gated on `open` since `IssueActions` mounts
+  // this dialog unconditionally (same reason `useWorktreeOptions` above
+  // takes `enabled: open`): a closed dialog must never fetch a listing.
+  // Memoized so `useProjectFiles`'s effect doesn't refire on every
+  // unrelated re-render.
+  const fileScope = useMemo(
+    () => (open ? { dir: context?.path ?? "", ref: wt.isolate ? (wt.baseRef || "HEAD") : null } : null),
+    [open, context?.path, wt.isolate, wt.baseRef],
+  );
 
   // Reset per-open transient state, then fetch the thread this dialog was
   // opened for. Mirrors useTaskLaunch's own on-open fetch, but this one is
@@ -296,6 +306,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
                 references={references}
                 onReferencesChange={setReferences}
                 setReferences={setReferences}
+                fileScope={fileScope}
                 startingFolder={context.path}
                 rows={12}
                 footer={overage && (

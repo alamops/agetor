@@ -16,6 +16,7 @@ import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
+import type { FileScope } from "@/lib/use-project-files";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -2509,6 +2510,18 @@ function RunPanelBody({
   // `sendRef`.
   const capabilities = useAgentCapabilities(task.agent, task.workdir, task.branch ?? undefined);
   const savedPromptsState = useSavedPrompts();
+  // Which tree the `@` file popover lists/validates against — must match what
+  // the server will expand against at send time (`task.worktreePath ?? task.workdir`,
+  // see orchestrator `sendInput`): the live worktree once it exists; before the
+  // first run of an isolated task, the source repo at its pinned base ref (the
+  // worktree will be created from exactly that commit); a plain workdir otherwise.
+  const fileScope = useMemo<FileScope>(() => (
+    task.worktreePath
+      ? { dir: task.worktreePath }
+      : task.isolation === "worktree"
+        ? { dir: task.workdir, ref: task.baseRef ?? "HEAD" }
+        : { dir: task.workdir }
+  ), [task.worktreePath, task.isolation, task.workdir, task.baseRef]);
   const onSendDragOver = (e: React.DragEvent) => {
     if (!e.dataTransfer.types.includes("Files")) return;
     // Always preventDefault on a file dragover so WKWebView doesn't fall back
@@ -2972,6 +2985,7 @@ function RunPanelBody({
             setReferences={setSendRefs}
             textareaRef={sendRef}
             capture={capture}
+            fileScope={fileScope}
             // Pass the hoisted results down (see the comment above
             // `capabilities`'s declaration) so this dock's remounts don't
             // refire the composer's own internal fetches.
@@ -3158,10 +3172,10 @@ function RunPanelBody({
                 ? "Answer the prompt above — or type a message and Save it for later."
                 : canSend
                 ? task.column === "running"
-                  ? "Agent is working — your message will be added to the current turn. Type / for commands."
+                  ? "Agent is working — your message will be added to the current turn. Type / for commands, @ for files."
                   : task.column === "blocked"
-                    ? "Answer the question, or send any follow-up. Type / for commands."
-                    : "Send a message — resumes the conversation in a fresh session. Type / for commands."
+                    ? "Answer the question, or send any follow-up. Type / for commands, @ for files."
+                    : "Send a message — resumes the conversation in a fresh session. Type / for commands, @ for files."
                 // `!canSend` covers two states: never run, and "ran but has
                 // no resumable session" (a codex task whose run_id was
                 // cleared — claude falls back to its newest run). Don't

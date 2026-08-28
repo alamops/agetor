@@ -13,6 +13,9 @@ import {
 } from "./ReferencesPicker";
 import { SlashAutocomplete } from "./SlashAutocomplete";
 import { ExtensionPicker } from "./ExtensionPicker";
+import { AtFileAutocomplete } from "./AtFileAutocomplete";
+import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
+import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 
 /**
@@ -57,6 +60,22 @@ import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-inser
  * land inside a `/token`, pop the slash menu, and swallow the next Enter via
  * `preventDefault`. See `ExtensionPicker.tsx`'s `insertText` for the
  * canonical example of getting this right.
+ *
+ * **The `@` file-reference layer**: `fileScope` (a `{ dir, ref? }` pair — see
+ * `useProjectFiles`/`FileScope`) tells this composer which project tree the
+ * `@` popover (`AtFileAutocomplete`) lists and the in-field highlight
+ * (`AtHighlightBackdrop`) validates against; `null`/omitted disables both
+ * with no fetch. `AtHighlightBackdrop` must render as the FIRST child of the
+ * textarea's `relative` wrapper — it paints highlight marks *behind* the
+ * textarea's own text via DOM order, not z-index, so the textarea itself
+ * needs `relative` (not just its wrapper) for that stacking to hold; a
+ * static (non-positioned) textarea would let the absolutely-positioned
+ * backdrop painted-later win instead. `AtFileAutocomplete` sits after
+ * `SlashAutocomplete` in the same wrapper and shares its `placement`. The two
+ * popovers coexist without fighting over the same keystroke because `/` only
+ * triggers at BOF or after whitespace/a `@`-token boundary the same way `@`
+ * does — `findActiveAtQuery`'s grammar excludes `/` from ever appearing
+ * inside an open `@` slice, so an `@src/` query never pops the slash menu.
  */
 
 /**
@@ -243,6 +262,16 @@ export interface PromptComposerProps {
   references: TaskReference[];
   onReferencesChange: (refs: TaskReference[]) => void;
   /**
+   * Which project tree the `@` popover (`AtFileAutocomplete`) lists and the
+   * in-field highlight (`AtHighlightBackdrop`) validates against. `{ dir }`
+   * for a live tree — an existing worktree, or an isolation=none task's
+   * workdir. `{ dir, ref }` for a not-yet-created worktree, listing tracked
+   * files at the pinned base ref (the shape the worktree will actually have
+   * once `startTask` materializes it). `null`/omitted disables the `@`
+   * popover and highlighting entirely — no fetch is made.
+   */
+  fileScope?: FileScope | null;
+  /**
    * Functional-updater-capable references setter for `usePromptCapture`'s
    * internal instance (see the `capture` prop doc). When the caller already
    * tracks `references` via `useState` it can pass that setter directly and
@@ -386,12 +415,13 @@ export function PromptComposer({
   references,
   onReferencesChange,
   setReferences,
+  fileScope,
   textareaRef,
   capture,
   capabilities,
   savedPrompts: savedPromptsProp,
   rows = 6,
-  placeholder = "What should the agent do? Type / for commands.",
+  placeholder = "What should the agent do? Type / for commands, @ for files.",
   label = "Prompt",
   referencesLabel = "Files / Folders",
   startingFolder,
@@ -426,6 +456,10 @@ export function PromptComposer({
   const { commands, extensions } = capabilities ?? internalCapabilities;
   const internalSavedPrompts = useSavedPrompts({ enabled: !savedPromptsProp });
   const { savedPrompts, reload } = savedPromptsProp ?? internalSavedPrompts;
+
+  // `null`/undefined `fileScope` (no project/scope resolved yet) short-
+  // circuits to no fetch and empty results — see `useProjectFiles`.
+  const projectFiles = useProjectFiles(fileScope ?? null);
 
   // Bridges for `usePromptCapture`'s internal instance below — it needs
   // `Dispatch`-shaped setters, but this component's public props are plain
@@ -478,10 +512,16 @@ export function PromptComposer({
     />
   );
 
-  // `relative` anchors SlashAutocomplete's popover to the textarea it
-  // decorates — keep the two together if this block ever moves.
+  // `relative` anchors SlashAutocomplete's/AtFileAutocomplete's popovers to
+  // the textarea they decorate — keep the two together if this block ever
+  // moves. `AtHighlightBackdrop` must be the FIRST child here (DOM order,
+  // not z-index, is what puts its marks behind the textarea's real text —
+  // see the file header) and the `Textarea` itself needs `relative` too, so
+  // it — a later, *positioned* sibling — wins the paint order over the
+  // earlier, absolutely-positioned backdrop.
   const textareaBlock = (
     <div className={cn("relative", trailing && "flex-1")}>
+      <AtHighlightBackdrop textareaRef={ref} value={value} validPaths={projectFiles.validPaths} />
       <Textarea
         ref={ref}
         data-testid={textareaTestId}
@@ -489,19 +529,30 @@ export function PromptComposer({
         value={value}
         onChange={(e) => { onChange(e.target.value); if (activeCapture.dropHint) activeCapture.clearDropHint(); }}
         onPaste={activeCapture.onPaste}
-        // Refetch saved prompts on focus (in addition to the popover-open
-        // refetch) so a deleted/edited prompt made in Settings mid-session
-        // doesn't linger in the `/` autocomplete indefinitely. The caller's
-        // own `onFocus` (if any) fires after.
-        onFocus={() => { reload(); onFocus?.(); }}
+        // Refetch saved prompts (in addition to the popover-open refetch) and
+        // the project file listing on focus — a deleted/edited prompt made in
+        // Settings, or a file created by the agent/user since the last open,
+        // shouldn't linger stale in the `/`/`@` autocompletes indefinitely.
+        // `useProjectFiles.refresh()` dedupes in-flight requests, so this is
+        // cheap even when nothing changed. The caller's own `onFocus` (if
+        // any) fires after both.
+        onFocus={() => { reload(); projectFiles.refresh(); onFocus?.(); }}
         onKeyDown={onKeyDown}
         rows={rows}
-        className={cn("resize-none", textareaClassName)}
+        className={cn("relative resize-none", textareaClassName)}
         disabled={disabled}
       />
       <SlashAutocomplete
         commands={commands}
         savedPrompts={savedPrompts}
+        value={value}
+        onChange={onChange}
+        textareaRef={ref}
+        placement={placement}
+      />
+      <AtFileAutocomplete
+        entries={projectFiles.entries}
+        truncated={projectFiles.truncated}
         value={value}
         onChange={onChange}
         textareaRef={ref}

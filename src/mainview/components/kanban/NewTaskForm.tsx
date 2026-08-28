@@ -222,6 +222,16 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   const [references, setReferences] = useState<TaskReference[]>([]);
   const [dragging, setDragging] = useState(false);
   const promptRef = useRef<HTMLTextAreaElement>(null);
+  // `@` file-reference scope: a live tree when isolation is off (the agent
+  // will run directly in `workdir`), or the pinned base ref's tracked files
+  // when isolation is on (the worktree doesn't exist yet — see
+  // `docs/plans/at-file-references.md` §3.3). Memoized so `useProjectFiles`'s
+  // effect (keyed on `scope.dir`/`scope.ref`) doesn't see a new object
+  // identity — and therefore doesn't refire — on every unrelated re-render.
+  const fileScope = useMemo(
+    () => (workdir.trim() ? { dir: workdir, ref: wt.isolate ? (wt.baseRef.trim() || "HEAD") : null } : null),
+    [workdir, wt.isolate, wt.baseRef],
+  );
   // Drag/paste-to-attach wiring for the prompt textarea, shared with the
   // aside-wide drop zone below (`onAsideDrop`) — see `PromptComposer.tsx`'s
   // `capture` seam doc for why this needs real `useState` dispatchers.
@@ -562,6 +572,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                 branch={wt.baseRef}
                 references={references}
                 onReferencesChange={setReferences}
+                fileScope={fileScope}
                 textareaRef={promptRef}
                 capture={capture}
                 startingFolder={workdir || undefined}
