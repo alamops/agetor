@@ -1,27 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertCircle,
   ChevronLeft,
   ChevronRight,
-  CircleDot,
   ClipboardList,
   Code2,
-  GitBranch,
-  Loader2,
   RefreshCw,
-  SlidersHorizontal,
-  X,
 } from "lucide-react";
-import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension, type BranchNamingConfig } from "@/lib/api";
+import { api, type AgentModelMap } from "@/lib/api";
 import { mergeModelOptions } from "../../../shared/model-options.ts";
-import {
-  buildIssueTaskPrompt,
-  issueTaskTitle,
-  parseIssueUrl,
-  renderIssueThreadMarkdown,
-  sameIssueUrl,
-  withoutSnapshotParagraph,
-} from "../../../shared/issue-task.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,50 +15,34 @@ import { Select } from "@/components/ui/select";
 import { SearchSelect } from "@/components/ui/search-select";
 import { InfoTip } from "@/components/ui/info-tip";
 import { Switch } from "@/components/ui/switch";
-import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
-import { branchFieldState } from "@/lib/branch-field";
 import {
   AGENT_OPTIONS,
   CATALOG_SCOPED_KINDS,
   CODE_PLAN_MODE,
-  DEFAULT_BRANCH_CONFIG,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
   TASK_TYPES,
-  branchPattern,
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
-  hasBranchTemplateTags,
   supportedEfforts,
   supportedModes,
-  validateBranchName,
   type AgentKind,
   type AgentStatus,
   type Harness,
   type Isolation,
-  type SavedPrompt,
   type TaskReference,
   type TaskType,
 } from "../../../shared/types.ts";
-import { BranchNamingDialog } from "@/components/settings/BranchNamingDialog";
 import { AgentIcon } from "./AgentIcon";
 import { HarnessAuthHint } from "./HarnessAuthHint";
-import { BranchPicker } from "./BranchPicker";
 import { ProjectPicker } from "./ProjectPicker";
-import {
-  ReferencesPicker,
-  captureDroppedOrPastedItems,
-  dropHintMessage,
-  mergeRefs,
-  type CapturedItem,
-} from "./ReferencesPicker";
-import { SlashAutocomplete } from "./SlashAutocomplete";
-import { ExtensionPicker } from "./ExtensionPicker";
-import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
+import { captureDroppedOrPastedItems } from "./ReferencesPicker";
+import { PromptComposer, usePromptCapture } from "./PromptComposer";
+import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
 import {
   NEW_TASK_PANEL_COLLAPSED_KEY,
   readCollapsed,
@@ -80,11 +50,6 @@ import {
 } from "@/lib/panel-collapse";
 
 const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
-
-/** Short unique token seeding the `<slug>`/`<token>` fallback in the preview.
- *  Always exactly 6 hex chars, mirroring the server's task-id-derived token,
- *  so the client-side validation can't reject a name the server would accept. */
-const newBranchToken = () => crypto.randomUUID().replace(/-/g, "").slice(0, 6);
 
 interface Props {
   onSubmit: (
@@ -106,12 +71,6 @@ interface Props {
       maxMode: boolean;
       references: TaskReference[];
       taskType: TaskType;
-      /** URL of the issue this task was seeded from, when the user loaded
-       *  one via the "From issue" row. Validated + same-repo checked server-side. */
-      issueUrl?: string;
-      /** Full markdown snapshot of the issue + its comment thread — only
-       *  meaningful alongside `issueUrl`. */
-      issueSnapshot?: string;
     },
     options: { start: boolean },
   ) => void;
@@ -191,20 +150,6 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [taskType, setTaskType] = useState<TaskType>(DEFAULT_TASK_TYPE);
-  // "From issue" row — paste a GitHub/GitLab/Bitbucket issue URL, fetch its
-  // thread for the *selected project*, and seed title/prompt from it. See
-  // `CreateTaskFromIssueDialog` for the sibling flow off the issue detail
-  // page; this is the lighter paste-URL entry point from the sidebar.
-  const [issueUrlDraft, setIssueUrlDraft] = useState("");
-  const [issueBusy, setIssueBusy] = useState(false);
-  const [issueError, setIssueError] = useState<string | null>(null);
-  const [issueLink, setIssueLink] = useState<{ url: string; number: number; snapshot: string } | null>(null);
-  // Non-blocking sibling of `issueError`: set when the issue itself loaded
-  // fine but its comment thread couldn't be fetched (`thread.commentsError`,
-  // e.g. GitLab's 401-to-anonymous `/notes`). Kept distinct from `issueError`
-  // (the load-failure path, which blocks the link) so a successfully-linked
-  // issue can still surface a heads-up without reading as a failure.
-  const [issueWarning, setIssueWarning] = useState<string | null>(null);
   // Soft-deleted harnesses are excluded from the picker and the default-
   // fallback logic. The full `harnesses` list is still used for
   // `selectedHarness` lookup so the resolved kind stays correct even for a
@@ -231,110 +176,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   // ProjectPicker will auto-select the most-recently-used project from the
   // persisted list.
   const [workdir, setWorkdir] = useState("");
-  // Staleness guard for `loadIssueFromUrl`'s fetch, mirroring the
-  // `cancelled`-flag pattern `CreateTaskFromIssueDialog` uses for its own
-  // on-open fetch: `workdirRef` mirrors the latest `workdir` (a plain closure
-  // over `workdir` would only see the value from the render that started the
-  // fetch, so a project switch mid-fetch wouldn't be detected), the sequence
-  // ref detects a newer load superseding this one, and the mounted ref
-  // catches an unmount mid-fetch.
-  const workdirRef = useRef(workdir);
-  useEffect(() => { workdirRef.current = workdir; }, [workdir]);
-  const issueLoadSeqRef = useRef(0);
-  const issueFormMountedRef = useRef(true);
-  // Set on mount AND reset in cleanup: React StrictMode runs mount → unmount →
-  // mount on the first render, so a cleanup-only effect would leave the ref
-  // stuck at `false` and every load would read as stale (the form-path e2e
-  // caught exactly that — the title never seeded).
-  useEffect(() => {
-    issueFormMountedRef.current = true;
-    return () => { issueFormMountedRef.current = false; };
-  }, []);
-  const [isolate, setIsolate] = useState(true);
-  const [baseRef, setBaseRef] = useState("");
-  // Branch nomenclature for the selected project (loaded from the server;
-  // falls back to the built-in defaults). While clean (`!branchDirty`), the
-  // field DERIVES its display from the tag-visible PATTERN (e.g.
-  // `feature/<slug>`) rendered live against the current title/type/config —
-  // realtime by construction, no seeding effect required. Once the user edits
-  // it (`branchDirty`), `branchOverride` holds their literal text, sent to the
-  // server verbatim — tags and all, the server resolves them authoritatively
-  // at create time. `branchToken` seeds the client-side preview/validation
-  // fallback (used when `<slug>` would otherwise render empty).
-  const [branchConfig, setBranchConfig] = useState<BranchNamingConfig>(DEFAULT_BRANCH_CONFIG);
-  const [branchOverride, setBranchOverride] = useState("");
-  const [branchDirty, setBranchDirty] = useState(false);
-  const [branchToken, setBranchToken] = useState(newBranchToken);
-  const [branchSettingsOpen, setBranchSettingsOpen] = useState(false);
-
-  // Load the selected project's branch nomenclature. Empty workdir → defaults.
-  useEffect(() => {
-    const dir = workdir.trim();
-    if (!dir) { setBranchConfig(DEFAULT_BRANCH_CONFIG); return; }
-    let cancelled = false;
-    api.getProjectBranchConfig(dir)
-      .then((c) => { if (!cancelled) setBranchConfig(c); })
-      .catch(() => { if (!cancelled) setBranchConfig(DEFAULT_BRANCH_CONFIG); });
-    return () => { cancelled = true; };
-  }, [workdir]);
-
-  // The issue-thread same-repo guarantee is per project — a linked issue (or
-  // a stale error) from a previously-selected project must not survive a
-  // project switch. When a link is actually cleared, also strip the snapshot
-  // paragraph it added to the prompt — otherwise switching projects leaves a
-  // dangling "read the snapshot file" pointer to a file that was never
-  // attached to the new project's task.
-  useEffect(() => {
-    if (issueLink) {
-      setIssueLink(null);
-      setPrompt((p) => withoutSnapshotParagraph(p));
-    }
-    setIssueError(null);
-    setIssueWarning(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workdir]);
-
-  // The tag-visible pattern for the current config + type, e.g. `feature/<slug>`.
-  // Deliberately stable while the title is typed — only config/taskType move
-  // it — so the field never rewrites itself into a jarring live value.
-  const computedPattern = useMemo(
-    () => branchPattern(branchConfig, taskType),
-    [branchConfig, taskType],
-  );
-
-  // Last path segment of the workdir, used as `<project_name>` in the live
-  // preview — mirrors the server's own resolution so the preview matches what
-  // will actually be created.
-  const projectName = useMemo(() => {
-    const parts = workdir.trim().split("/").filter(Boolean);
-    return parts[parts.length - 1] ?? "";
-  }, [workdir]);
-
-  // Derived clean/dirty projection of the branch field — see
-  // `src/mainview/lib/branch-field.ts`. Clean: `displayValue`/`resolved`
-  // live-render the pattern each render (realtime as title/type/config
-  // change), and `submitValue` is the raw un-rendered pattern so the server
-  // stays the authoritative resolver. Dirty: the user's literal text wins.
-  const branchField = useMemo(
-    () => branchFieldState({
-      dirty: branchDirty,
-      override: branchOverride,
-      pattern: computedPattern,
-      title,
-      projectName,
-      taskType,
-      token: branchToken,
-    }),
-    [branchDirty, branchOverride, computedPattern, title, projectName, taskType, branchToken],
-  );
-
-  // Validation gates on the RESOLVED name (a template like `feature/<slug>` is
-  // always git-legal since `<`/`>` are allowed in ref names, but we want the
-  // error — and canSubmit — to reflect what will actually be created).
-  const branchValidation = useMemo(
-    () => validateBranchName(branchField.resolved.trim()),
-    [branchField.resolved],
-  );
+  // Owns the isolate toggle, base-ref, and branch-name field state/derivations
+  // — see `WorktreeOptions.tsx`. Declared here (before the mode/model state)
+  // since `wt.baseRef` is read further down by `<PromptComposer branch={…}>`.
+  const wt = useWorktreeOptions({ workdir, title, taskType });
   const [mode, setMode] = useState<string>(initialMode("claude-code"));
   const [model, setModel] = useState<string>(DEFAULT_MODEL["claude-code"]);
   // `null` is reserved for the Haiku-style "model doesn't accept effort" case.
@@ -377,40 +222,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   }, [availableHarnesses, agent]);
   const [references, setReferences] = useState<TaskReference[]>([]);
   const [dragging, setDragging] = useState(false);
-  const [dropHint, setDropHint] = useState<string | null>(null);
-  const [agentCommands, setAgentCommands] = useState<AvailableCommand[]>([]);
-  const [agentExtensions, setAgentExtensions] = useState<AvailableExtension[]>([]);
-  // User-global saved prompts — not keyed on agent/workdir, unlike the two
-  // lists above. Loaded once on mount; refetched when the Extensions popover
-  // opens so an edit made in Settings mid-session shows up.
-  const [savedPrompts, setSavedPrompts] = useState<SavedPrompt[]>([]);
-  const loadSavedPrompts = () => {
-    void api.listSavedPrompts().then(setSavedPrompts).catch(() => setSavedPrompts([]));
-  };
-  useEffect(() => { loadSavedPrompts(); }, []);
   const promptRef = useRef<HTMLTextAreaElement>(null);
-
-  // Refresh both the `/…` autocomplete (commands/skills) and the Extensions
-  // picker (MCP/skills/plugins) whenever the agent / project / branch changes —
-  // those three together determine what's reachable. One fetch covers both.
-  // Failures are swallowed: empty lists are no worse than no autocomplete.
-  useEffect(() => {
-    if (!workdir.trim()) { setAgentCommands([]); setAgentExtensions([]); return; }
-    let cancelled = false;
-    // Pass the harness id (not just the kind) so aliased multi-account
-    // harnesses read their own per-harness commands/skills — the server
-    // resolves it via getByIdOrKind, so a built-in's id-equals-kind is still
-    // honored unchanged.
-    api
-      .listAgentCapabilities({ agent, workdir: workdir.trim(), branch: baseRef.trim() || undefined })
-      .then(({ commands, extensions }) => {
-        if (cancelled) return;
-        setAgentCommands(commands);
-        setAgentExtensions(extensions);
-      })
-      .catch(() => { if (!cancelled) { setAgentCommands([]); setAgentExtensions([]); } });
-    return () => { cancelled = true; };
-  }, [agent, workdir, baseRef]);
+  // Drag/paste-to-attach wiring for the prompt textarea, shared with the
+  // aside-wide drop zone below (`onAsideDrop`) — see `PromptComposer.tsx`'s
+  // `capture` seam doc for why this needs real `useState` dispatchers.
+  const capture = usePromptCapture({ textareaRef: promptRef, setPrompt, setReferences });
 
   // Per-kind cache so switching aliases-of-the-same-kind preserves the prior
   // picks (mode/model/effort are kind-specific, not alias-specific).
@@ -575,61 +391,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   const selectedHarnessLabel = selectedHarness?.label ?? agent;
 
   const canSubmit =
-    title.trim() && prompt.trim() && workdir.trim() && (!isolate || branchValidation.ok)
+    title.trim() && prompt.trim() && workdir.trim() && wt.valid
     && promptOverage == null;
-
-  // Parses + fetches the pasted issue URL against the *selected project*,
-  // then seeds title (only if empty) and prompt (appended if non-empty) from
-  // the thread — mirrors CreateTaskFromIssueDialog's seeding rules, minus
-  // the dialog's own editable-launch-pickers UI (this form already has one).
-  const loadIssueFromUrl = async () => {
-    const raw = issueUrlDraft.trim();
-    const dir = workdir.trim();
-    if (!raw || issueBusy || !dir) return;
-    const parsed = parseIssueUrl(raw);
-    if (!parsed) {
-      setIssueError("Not a recognized GitHub/GitLab/Bitbucket issue URL");
-      return;
-    }
-    const seq = ++issueLoadSeqRef.current;
-    // True once this fetch's result is no longer relevant: the component
-    // unmounted, a newer load superseded this one, or the user switched
-    // projects while this one was in flight.
-    const stale = () =>
-      !issueFormMountedRef.current
-      || issueLoadSeqRef.current !== seq
-      || workdirRef.current.trim() !== dir;
-    setIssueBusy(true);
-    setIssueError(null);
-    setIssueWarning(null);
-    try {
-      const thread = await api.getGitHubIssueThread(dir, parsed.number);
-      if (stale()) return;
-      if (!sameIssueUrl(thread.item.htmlUrl, raw)) {
-        setIssueError("That issue belongs to a different repository than the selected project");
-        return;
-      }
-      if (!title.trim()) setTitle(issueTaskTitle(thread.item));
-      const built = buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt;
-      setPrompt((cur) => (cur.trim() ? `${cur}\n\n${built}` : built));
-      setIssueLink({
-        url: thread.item.htmlUrl,
-        number: parsed.number,
-        snapshot: renderIssueThreadMarkdown(thread),
-      });
-      setIssueUrlDraft("");
-      if (thread.commentsError) setIssueWarning(thread.commentsError);
-    } catch (e) {
-      if (stale()) return;
-      setIssueError(e instanceof Error ? e.message : String(e));
-    } finally {
-      // Gated on the sequence only (not the full `stale()`, which also trips
-      // on a plain project switch) — a project switch with no new load in
-      // flight must still clear busy, or the Load button on the new project
-      // stays disabled forever.
-      if (issueLoadSeqRef.current === seq) setIssueBusy(false);
-    }
-  };
 
   const submit = ({ start }: { start: boolean }) => {
     if (!canSubmit) return;
@@ -639,13 +402,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
         prompt: prompt.trim(),
         agent,
         workdir: workdir.trim(),
-        isolation: isolate ? "worktree" : "none",
-        baseRef: isolate && baseRef.trim() ? baseRef.trim() : undefined,
-        // The branch is only meaningful under worktree isolation. Clean →
-        // the raw pattern (server resolves authoritatively at create time);
-        // dirty → the user's literal text, trimmed. The server validates it
-        // and guarantees uniqueness either way.
-        branch: isolate && branchField.submitValue ? branchField.submitValue : undefined,
+        // The branch is only meaningful under worktree isolation — see
+        // `worktreePayload` for the isolation/baseRef/branch mapping this
+        // spreads in.
+        ...wt.payload(),
         // model is always an explicit option id. effort is too, except for
         // the Haiku-style "model doesn't accept effort" case which sends null.
         mode,
@@ -655,8 +415,6 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
         maxMode: kind === "cursor" ? maxMode : false,
         references,
         taskType,
-        issueUrl: issueLink?.url,
-        issueSnapshot: issueLink?.snapshot,
       },
       { start },
     );
@@ -672,24 +430,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
     void api.setPreference(`lastMaxMode:${kind}`, String(kind === "cursor" && maxMode)).catch(() => {});
     setTitle("");
     setPrompt("");
-    setBaseRef("");
     setReferences([]);
-    setDropHint(null);
-    setIssueLink(null);
-    setIssueUrlDraft("");
-    setIssueError(null);
-    setIssueWarning(null);
-    // Reset the branch field so the next task re-derives from its (now empty)
-    // title and gets a fresh unique token; drop any manual override.
-    setBranchDirty(false);
-    setBranchToken(newBranchToken());
+    capture.clearDropHint();
+    wt.resetAfterSubmit();
     // Keep `workdir`, `model`, `effort`, `mode` set on purpose — the next
     // task should default to the same project + picks the user just used.
   };
-
-  const isolateTitle =
-    "Runs the agent on a dedicated branch off the chosen base, so parallel tasks "
-    + "on the same repo don't collide. No-op when the workdir isn't a git repo.";
 
   // Sidebar-wide drag/drop — anything dropped on the form (not just the
   // ReferencesPicker) gets added to the references list. The inner picker
@@ -707,56 +453,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   const onAsideDragLeave = (e: React.DragEvent) => {
     if (e.currentTarget === e.target) setDragging(false);
   };
-  const applyCaptured = (items: CapturedItem[]) => {
-    if (!items.length) return;
-    setReferences((cur) => mergeRefs(cur, items.map((i) => i.ref)));
-    const marker = items.map((i) => `[${i.basename}]`).join(" ");
-    // Read the caret synchronously (DOM state, not React state) then drive
-    // setPrompt with a functional updater so two captures landing back-to-
-    // back across an async boundary don't see stale `prompt` closures.
-    const selection = readCaret(promptRef.current);
-    let caret = 0;
-    setPrompt((cur) => {
-      const r = spliceAtSelection(cur, selection, marker);
-      caret = r.caret;
-      return r.next;
-    });
-    restoreCaret(promptRef.current, caret);
-  };
-  const reportCapture = (result: {
-    items: CapturedItem[];
-    skipped: number;
-    skippedFolders: number;
-    error?: string;
-  }) => {
-    setDropHint(dropHintMessage(result, {
-      partialFolder: "Attached the files — one folder couldn't be attached; use the folder picker.",
-      allFolder: "Couldn't attach the folder — use the folder picker instead.",
-      nothingToAttach: "Nothing to attach — drag a file from Finder, or paste a screenshot.",
-    }));
-  };
   const onAsideDrop = async (e: React.DragEvent) => {
     if (collapsed) return;
     e.preventDefault();
     setDragging(false);
-    setDropHint(null);
+    capture.clearDropHint();
     const dt = e.dataTransfer;
     const result = await captureDroppedOrPastedItems(dt, { kind: "drop" });
-    reportCapture(result);
-    applyCaptured(result.items);
-  };
-  const onPromptPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const cd = e.clipboardData;
-    if (!cd) return;
-    // Only intercept when the clipboard actually carries a file — otherwise
-    // let the default text paste run.
-    const hasFile = Array.from(cd.items ?? []).some((it) => it.kind === "file");
-    if (!hasFile) return;
-    e.preventDefault();
-    setDropHint(null);
-    const result = await captureDroppedOrPastedItems(cd, { kind: "paste" });
-    reportCapture(result);
-    applyCaptured(result.items);
+    capture.handleResult(result);
   };
 
   return (
@@ -863,71 +567,6 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
               </div>
 
               <div className="space-y-1">
-                <label className="text-muted-foreground">From issue</label>
-                <div className="flex items-center gap-1.5">
-                  <Input
-                    data-testid="issue-url-input"
-                    placeholder="Paste a GitHub/GitLab issue URL"
-                    value={issueUrlDraft}
-                    onChange={(e) => setIssueUrlDraft(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key !== "Enter") return;
-                      e.preventDefault();
-                      void loadIssueFromUrl();
-                    }}
-                    disabled={!workdir.trim()}
-                    title={!workdir.trim() ? "Pick a project first" : undefined}
-                    className="min-w-0 flex-1"
-                  />
-                  <Button
-                    data-testid="issue-url-load"
-                    size="sm"
-                    variant="outline"
-                    onClick={() => void loadIssueFromUrl()}
-                    disabled={!workdir.trim() || issueBusy}
-                    title={!workdir.trim() ? "Pick a project first" : undefined}
-                  >
-                    {issueBusy ? <Loader2 className="size-3.5 animate-spin" /> : "Load"}
-                  </Button>
-                </div>
-                {issueError && (
-                  <p className="flex items-center gap-1 text-[10px] text-danger">
-                    <AlertCircle className="size-3 shrink-0" /> {issueError}
-                  </p>
-                )}
-                {issueLink && (
-                  <div
-                    data-testid="issue-link-chip"
-                    className="inline-flex items-center gap-1 rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[11px] text-muted-foreground"
-                  >
-                    <CircleDot className="size-3 shrink-0" />
-                    Issue #{issueLink.number}
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setIssueLink(null);
-                        setPrompt((p) => withoutSnapshotParagraph(p));
-                        setIssueWarning(null);
-                      }}
-                      title="Unlink issue"
-                      aria-label="Unlink issue"
-                      className="ml-0.5 text-muted-foreground transition-colors hover:text-foreground"
-                    >
-                      <X className="size-3" />
-                    </button>
-                  </div>
-                )}
-                {issueLink && issueWarning && (
-                  <p
-                    data-testid="issue-comments-warning"
-                    className="flex items-center gap-1 text-[10px] text-warning"
-                  >
-                    <AlertCircle className="size-3 shrink-0" /> Comments weren't fetched — {issueWarning}
-                  </p>
-                )}
-              </div>
-
-              <div className="space-y-1">
                 <label className="text-muted-foreground">Title</label>
                 <Input
                   ref={titleRef}
@@ -937,62 +576,25 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                 />
               </div>
 
-              <div className="space-y-1">
-                <div className="flex items-center justify-between gap-2">
-                  <label className="text-muted-foreground">Prompt</label>
-                  <ExtensionPicker
-                    extensions={agentExtensions}
-                    savedPrompts={savedPrompts}
-                    onPromptsOpen={loadSavedPrompts}
-                    value={prompt}
-                    onChange={setPrompt}
-                    textareaRef={promptRef}
-                    placement="below"
-                    align="right"
-                    disabled={!workdir.trim()}
-                  />
-                </div>
-                <div className="relative">
-                  <Textarea
-                    ref={promptRef}
-                    placeholder="What should the agent do? Type / for commands."
-                    value={prompt}
-                    onChange={(e) => { setPrompt(e.target.value); if (dropHint) setDropHint(null); }}
-                    onPaste={onPromptPaste}
-                    // Refetch saved prompts on focus (in addition to the
-                    // popover-open refetch) so a deleted/edited prompt made in
-                    // Settings mid-session doesn't linger in the `/`
-                    // autocomplete indefinitely.
-                    onFocus={loadSavedPrompts}
-                    rows={6}
-                    className="resize-none"
-                  />
-                  <SlashAutocomplete
-                    commands={agentCommands}
-                    savedPrompts={savedPrompts}
-                    value={prompt}
-                    onChange={setPrompt}
-                    textareaRef={promptRef}
-                  />
-                </div>
-                {dropHint && (
-                  <p className="text-[10px] text-muted-foreground">{dropHint}</p>
-                )}
-                {promptOverage && (
+              <PromptComposer
+                value={prompt}
+                onChange={setPrompt}
+                agent={agent}
+                workdir={workdir}
+                branch={wt.baseRef}
+                references={references}
+                onReferencesChange={setReferences}
+                setReferences={setReferences}
+                textareaRef={promptRef}
+                capture={capture}
+                startingFolder={workdir || undefined}
+                footer={promptOverage && (
                   <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
                     This prompt is {Math.ceil(promptOverage.bytes / 1024)} KB — {selectedHarnessLabel}'s
                     one-shot launch caps prompts at {Math.floor(promptOverage.limit / 1024)} KB. Pick
                     another harness or trim the prompt.
                   </div>
                 )}
-              </div>
-
-              <ReferencesPicker
-                variant="expandable"
-                label="Files / Folders"
-                refs={references}
-                onChange={setReferences}
-                startingFolder={workdir || undefined}
               />
 
               {/* Project + Branch each get their own full-width row. Side-by-side in
@@ -1006,86 +608,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                     setWorkdir(p);
                     // The previously-picked branch likely doesn't exist on the new
                     // project — drop back to HEAD so the picker shows a valid default.
-                    setBaseRef("");
+                    wt.resetBaseRef();
                   }}
                   autoSelectFirst
                   placement="bottom"
                   title="Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list."
                 />
               </div>
-              <BranchPicker
-                label="Branch"
-                workdir={workdir}
-                value={baseRef}
-                onChange={setBaseRef}
-                placement="bottom"
-                title={
-                  isolate
-                    ? "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start."
-                    : "Isolation is off — the value is recorded but the agent will run directly in the project workdir."
-                }
-              />
-
-              <label
-                className="flex cursor-pointer items-center gap-1.5"
-                title={isolateTitle}
-              >
-                <input
-                  type="checkbox"
-                  checked={isolate}
-                  onChange={(e) => setIsolate(e.target.checked)}
-                />
-                <GitBranch className="size-3" />
-                <span>Isolate (worktree)</span>
-              </label>
-
-              {isolate && (
-                <div className="space-y-1">
-                  <label className="text-muted-foreground">Branch name</label>
-                  <div className="relative">
-                    <Input
-                      value={branchField.displayValue}
-                      onChange={(e) => { setBranchOverride(e.target.value); setBranchDirty(true); }}
-                      spellCheck={false}
-                      placeholder="feature/my-task"
-                      className={cn(
-                        "pr-9 font-mono text-[11px]",
-                        !branchValidation.ok && "border-destructive focus-visible:ring-destructive",
-                      )}
-                      title="Git branch the worktree will use. Live-resolved from this project's nomenclature (title, type, project name); edit to override, or use the settings button to change the pattern."
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setBranchSettingsOpen(true)}
-                      disabled={!workdir.trim()}
-                      title="Branch naming settings for this project"
-                      aria-label="Configure branch naming"
-                      className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
-                    >
-                      <SlidersHorizontal className="size-3.5" />
-                    </button>
-                  </div>
-                  {!branchValidation.ok ? (
-                    <p className="text-[10px] text-destructive">{branchValidation.reason}</p>
-                  ) : branchDirty && hasBranchTemplateTags(branchOverride) ? (
-                    <p
-                      className="text-[10px] font-mono text-muted-foreground truncate"
-                      title={branchField.resolved}
-                    >
-                      → {branchField.resolved}
-                    </p>
-                  ) : null}
-                  {branchDirty && (
-                    <button
-                      type="button"
-                      onClick={() => setBranchDirty(false)}
-                      className="text-[10px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
-                    >
-                      Reset to pattern
-                    </button>
-                  )}
-                </div>
-              )}
+              <WorktreeOptions state={wt} />
 
               <div className="space-y-1">
                 <label className="text-muted-foreground">Harness</label>
@@ -1329,14 +859,6 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
           </div>
         )}
       </div>
-
-      <BranchNamingDialog
-        open={branchSettingsOpen}
-        projectPath={workdir.trim()}
-        activeTaskType={taskType}
-        onClose={() => setBranchSettingsOpen(false)}
-        onSaved={(c) => setBranchConfig(c)}
-      />
     </aside>
   );
 }

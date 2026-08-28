@@ -2,9 +2,8 @@ import { useEffect, useState } from "react";
 import { AlertCircle, AlertTriangle, Bot, Loader2, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { GitHubIssueThreadResult } from "../../../shared/types.ts";
+import type { GitHubIssueThreadResult, TaskReference } from "../../../shared/types.ts";
 import {
   buildIssueTaskPrompt,
   issueTaskTitle,
@@ -13,6 +12,8 @@ import {
 } from "../../../shared/issue-task.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
+import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
+import { PromptComposer } from "./PromptComposer";
 
 /** The exact sibling of `ResolveConflictsContext` for issues: enough to
  *  refetch the thread and know where to put the resulting task. */
@@ -34,10 +35,14 @@ interface Props {
  * "Work on this with Agetor" dialog for a Git issue — the issue-tracker
  * sibling of `ResolveConflictsDialog`, built on the same generic launch
  * machinery (`useTaskLaunch`/`TaskLaunchPickers`/`createAndStartTask` from
- * `./TaskLaunchPickers`). Fetches the full issue thread on open, seeds an
- * editable prompt from it, and creates + starts a task on a fresh worktree
- * branch with the thread embedded (inline in the prompt, and in full as a
- * referenced snapshot file).
+ * `./TaskLaunchPickers`), and now on the same worktree row + prompt composer
+ * as the New Task left panel via `useWorktreeOptions`/`WorktreeOptions`
+ * (`./WorktreeOptions`) and `PromptComposer` (`./PromptComposer`) — so the
+ * panel and the two modals can't drift. Fetches the full issue thread on
+ * open, seeds an editable prompt from it, and creates + starts a task (on a
+ * fresh worktree branch by default, same as the panel) with the thread
+ * embedded (inline in the prompt, and in full as a referenced snapshot
+ * file).
  */
 export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }: Props) {
   const launch = useTaskLaunch(open);
@@ -48,6 +53,18 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
 
   const [prompt, setPrompt] = useState("");
   const [promptDirty, setPromptDirty] = useState(false);
+  const [references, setReferences] = useState<TaskReference[]>([]);
+
+  // This modal has no Type picker (unlike the New Task form), so `taskType`
+  // is always "task" — the server's own default. The branch-name field
+  // derives live from the fixed task title (same `issueTaskTitle` the
+  // submit path uses), so it shows e.g. `feature/issue-7-…` once the thread
+  // loads.
+  const wt = useWorktreeOptions({
+    workdir: context?.path ?? "",
+    title: thread ? issueTaskTitle(thread.item) : "",
+    taskType: "task",
+  });
 
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -59,11 +76,16 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
   // (GitHubDialog's `IssueActions`) re-renders on every board poll, and an
   // equal-valued-but-new-identity `context` object must NOT re-trigger this
   // (it would refetch the thread and reset `promptDirty`, wiping edits).
+  // `wt.resetAfterSubmit()` and `setReferences([])` are here for the same
+  // reason as `setPromptDirty(false)`: a previous issue's branch-name edits
+  // or attached references must not leak into the next open.
   useEffect(() => {
     setPromptDirty(false);
     setSubmitError(null);
     setThread(null);
     setThreadError(null);
+    wt.resetAfterSubmit();
+    setReferences([]);
     if (!open || !context) return;
     setThreadLoading(true);
     let cancelled = false;
@@ -103,7 +125,8 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
     prompt.trim().length > 0 &&
     !!launch.selectedStatus?.available &&
     !submitting &&
-    promptByteOverage(launch.kind, prompt) == null;
+    promptByteOverage(launch.kind, prompt) == null &&
+    wt.valid;
 
   const submit = async () => {
     if (!context || !thread || !canSubmit) return;
@@ -115,11 +138,12 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
         prompt: prompt.trim(),
         agent: launch.agent,
         workdir: context.path,
-        isolation: "worktree",
+        ...wt.payload(),
         mode: launch.mode,
         model: launch.model,
         effort: launch.effort,
         column: "ready",
+        references,
         issueUrl: thread.item.htmlUrl,
         issueSnapshot: renderIssueThreadMarkdown(thread),
       });
@@ -194,7 +218,9 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
           {!loading && !error && !!context && !!thread && (
             <div className="space-y-3">
               <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground">
-                Creates a task on a fresh branch in its own worktree.{" "}
+                {wt.isolate
+                  ? "Creates a task on a fresh branch in its own worktree."
+                  : "Runs the agent directly in the project checkout (no worktree)."}{" "}
                 {thread.commentsError ? (
                   "The issue is embedded in the prompt (comments couldn't be fetched) and saved as a referenced snapshot file."
                 ) : (
@@ -228,25 +254,29 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
                 </div>
               )}
 
-              <div className="space-y-1">
-                <label className="text-muted-foreground">Prompt</label>
-                <Textarea
-                  value={prompt}
-                  onChange={(e) => { setPrompt(e.target.value); setPromptDirty(true); }}
-                  rows={12}
-                  className="resize-none"
-                />
-              </div>
+              <PromptComposer
+                value={prompt}
+                onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
+                agent={launch.agent}
+                workdir={context.path}
+                branch={wt.baseRef || undefined}
+                references={references}
+                onReferencesChange={setReferences}
+                setReferences={setReferences}
+                startingFolder={context.path}
+                rows={12}
+                footer={overage && (
+                  <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
+                    This prompt is {Math.ceil(overage.bytes / 1024)} KB — {selectedHarnessLabel}'s one-shot
+                    launch caps prompts at {Math.floor(overage.limit / 1024)} KB. Pick another harness or
+                    trim the prompt.
+                  </div>
+                )}
+              />
+
+              <WorktreeOptions state={wt} />
 
               <TaskLaunchPickers launch={launch} />
-
-              {overage && (
-                <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
-                  This prompt is {Math.ceil(overage.bytes / 1024)} KB — {selectedHarnessLabel}'s one-shot
-                  launch caps prompts at {Math.floor(overage.limit / 1024)} KB. Pick another harness or
-                  trim the prompt.
-                </div>
-              )}
 
               {submitError && (
                 <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">

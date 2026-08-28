@@ -269,16 +269,16 @@ function commitReferencePhrase(provider: GitProvider, number: number): string {
   return `issue #${number}`;
 }
 
-/** Stable prefix `withoutSnapshotParagraph` matches on — kept as a constant
- *  so the builder and the stripper can never drift out of sync. */
+/** Stable prefix of the "the complete thread snapshot is saved as …"
+ *  paragraph — kept as a constant so `snapshotParagraph` has one exact
+ *  string shape to build from. */
 const SNAPSHOT_PARAGRAPH_PREFIX = "The complete thread snapshot";
 
 /**
  * Builds the "the complete thread snapshot is saved as …" paragraph
  * (`buildIssueTaskPrompt` includes it only when the caller says the snapshot
  * file was actually written). Factored out as a stable, independently
- * testable unit — and so `withoutSnapshotParagraph` has one exact string
- * shape to strip back out.
+ * testable unit.
  *
  * `commentsError` (additive 4th param, mirrors `GitHubIssueThreadResult`) —
  * when set, the comments phrase becomes "(comments were not fetched)" instead
@@ -308,29 +308,6 @@ export function snapshotParagraph(
   return `${SNAPSHOT_PARAGRAPH_PREFIX} (${commentsPhrase}) is saved as `
     + `\`${ISSUE_SNAPSHOT_FILENAME(n)}\`, listed under "Referenced files/folders" below — `
     + "read it if the inline excerpt is cut short.";
-}
-
-/**
- * Removes the `snapshotParagraph` block from a previously-built prompt,
- * wherever it appears, along with the one surrounding blank line so no
- * double blank line is left behind. Matches on the stable
- * `SNAPSHOT_PARAGRAPH_PREFIX` through the end of that paragraph (the
- * paragraph itself is always a single line — no embedded newlines — so "end
- * of paragraph" is just "end of line"). A no-op (returns the input
- * unchanged) when the paragraph isn't present, so it's safe to call
- * unconditionally and idempotently.
- */
-export function withoutSnapshotParagraph(prompt: string): string {
-  const withLeadingBlank = new RegExp(`\\n\\n${SNAPSHOT_PARAGRAPH_PREFIX}[^\\n]*`);
-  if (withLeadingBlank.test(prompt)) {
-    return prompt.replace(withLeadingBlank, "");
-  }
-  const withTrailingBlank = new RegExp(`^${SNAPSHOT_PARAGRAPH_PREFIX}[^\\n]*\\n\\n`);
-  if (withTrailingBlank.test(prompt)) {
-    return prompt.replace(withTrailingBlank, "");
-  }
-  const wholePrompt = new RegExp(`^${SNAPSHOT_PARAGRAPH_PREFIX}[^\\n]*$`);
-  return wholePrompt.test(prompt) ? "" : prompt;
 }
 
 /**

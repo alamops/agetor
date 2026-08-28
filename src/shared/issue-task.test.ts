@@ -7,7 +7,6 @@ import {
   renderIssueThreadMarkdown,
   sameIssueUrl,
   snapshotParagraph,
-  withoutSnapshotParagraph,
   agentFacingCommentsError,
 } from "./issue-task.ts";
 import type { GitHubComment, GitHubIssueThreadResult, GitHubListItem } from "./types.ts";
@@ -707,45 +706,10 @@ describe("buildIssueTaskPrompt", () => {
 });
 
 // ---------------------------------------------------------------------------
-// snapshotParagraph / withoutSnapshotParagraph
+// snapshotParagraph
 // ---------------------------------------------------------------------------
 
-describe("snapshotParagraph / withoutSnapshotParagraph", () => {
-  test("round-trip: stripping the snapshot paragraph from a snapshot-attached prompt matches the "
-    + "snapshot-omitted prompt exactly", () => {
-    const comments = [makeComment({ id: 1, body: "A reply." })];
-    const t = makeThread({ comments, refetchCommand: "gh issue view 7 --repo acme/widgets --comments" });
-
-    const attached = buildIssueTaskPrompt({ ...t, snapshotAttached: true }).prompt;
-    const omitted = buildIssueTaskPrompt({ ...t, snapshotAttached: false }).prompt;
-
-    expect(withoutSnapshotParagraph(attached)).toBe(omitted);
-  });
-
-  test("round-trip holds with no refetchCommand too (snapshot paragraph followed directly by the warning)", () => {
-    const t = makeThread({ refetchCommand: null });
-    const attached = buildIssueTaskPrompt({ ...t, snapshotAttached: true }).prompt;
-    const omitted = buildIssueTaskPrompt({ ...t, snapshotAttached: false }).prompt;
-
-    expect(withoutSnapshotParagraph(attached)).toBe(omitted);
-  });
-
-  test("is idempotent, and a no-op, on a prompt that never had the paragraph", () => {
-    const t = makeThread();
-    const omitted = buildIssueTaskPrompt({ ...t, snapshotAttached: false }).prompt;
-
-    expect(withoutSnapshotParagraph(omitted)).toBe(omitted);
-    expect(withoutSnapshotParagraph(withoutSnapshotParagraph(omitted))).toBe(omitted);
-  });
-
-  test("is idempotent when applied twice to a prompt that did have the paragraph", () => {
-    const t = makeThread();
-    const attached = buildIssueTaskPrompt({ ...t, snapshotAttached: true }).prompt;
-
-    const once = withoutSnapshotParagraph(attached);
-    expect(withoutSnapshotParagraph(once)).toBe(once);
-  });
-
+describe("snapshotParagraph", () => {
   test("snapshotParagraph reflects the comment count and the truncated flag", () => {
     expect(snapshotParagraph(7, 3, false)).toBe(
       "The complete thread snapshot (issue body + all 3 comments) is saved as `issue-7-thread.md`, "
@@ -766,13 +730,6 @@ describe("snapshotParagraph / withoutSnapshotParagraph", () => {
   test("snapshotParagraph is unaffected when commentsError is omitted or null", () => {
     expect(snapshotParagraph(7, 3, false)).toBe(snapshotParagraph(7, 3, false, null));
     expect(snapshotParagraph(7, 3, false, undefined)).toBe(snapshotParagraph(7, 3, false));
-  });
-
-  test("withoutSnapshotParagraph round-trip still holds when commentsError is set", () => {
-    const t = makeThread({ commentsError: "acme/widgets: GitLab requires a token to read this (401)" });
-    const attached = buildIssueTaskPrompt({ ...t, snapshotAttached: true }).prompt;
-    const omitted = buildIssueTaskPrompt({ ...t, snapshotAttached: false }).prompt;
-    expect(withoutSnapshotParagraph(attached)).toBe(omitted);
   });
 });
 
