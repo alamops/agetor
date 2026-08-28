@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp } from "./helpers";
 import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub";
@@ -18,7 +19,8 @@ import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub"
  * still created from this dialog and from `agetor add --issue`), so the
  * form-path tests that used to live here are gone too.
  *
- * Four scenarios, all against the same fixture issue #7:
+ * Six scenarios, all against the same fixture issue #7 (which now carries a
+ * "bug" label — see `issuePayload()` — for scenario 5 below):
  *
  *  1. Dialog path (baseline): issue detail -> "Work on this with Agetor" ->
  *     the stacked `CreateTaskFromIssueDialog` -> create & start (default
@@ -35,6 +37,16 @@ import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub"
  *     closes an open popover without closing the dialog underneath it (the
  *     `dialog.tsx` / `data-popover-open` fix), and the Files/Folders
  *     references picker renders (its native file panel isn't e2e-drivable).
+ *  5. Label-inferred type: the issue's "bug" label seeds `TaskTypePicker` on
+ *     "Bug" (`inferTaskTypeFromLabels`), which drives the branch-name field's
+ *     `fix/…` prefix; clicking Spike/Bug swaps both the picker selection and
+ *     the derived prefix, and the created task carries `taskType: "bug"`.
+ *  6. References picker: `refs-pick-files`/`refs-pick-folder` (via the
+ *     `AGETOR_FAKE_PICK_REFS_DIR` test seam) and a real drag-drop (a
+ *     non-transient file from this repo checkout, resolved through
+ *     `POST /refs/resolve`) all attach chips; removing one leaves the rest,
+ *     and the created task's `references` carries exactly those paths plus
+ *     the issue-snapshot reference.
  *
  * Arrange: one throwaway git repo with `origin` -> `https://github.com/
  * e2e-org/e2e-repo.git` (same recipe as `e2e/pr-merged-state.spec.ts`'s
@@ -62,6 +74,12 @@ import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub"
  */
 
 test.describe.configure({ mode: "serial" });
+
+// Same recipe as `e2e/fixtures.ts`'s own `REPO_ROOT` — resolves to this repo
+// checkout's root, used by the references-picker test below to drop a
+// non-transient real file (`README.md`) that survives `isTransientPath`'s
+// `/tmp`/`/var/folders` filter (see `src/mainview/lib/capture-refs.ts`).
+const REPO_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
 
 const REPO_PATH = "/repos/e2e-org/e2e-repo";
 const ISSUE_NUMBER = 7;
@@ -171,7 +189,11 @@ function issuePayload() {
     assignees: [] as unknown[],
     milestone: null,
     body: "Steps to reproduce:\n1. Open two tabs\n2. Poll rapidly\n\nExpected: identity preserved.",
-    labels: [] as unknown[],
+    // A "bug" label — read by `inferTaskTypeFromLabels` (src/shared/issue-
+    // task.ts) to seed the dialog's Type picker. No existing test in this
+    // file string-matches the prompt's "Labels: (none)" line, so this is
+    // safe to add without touching any other assertion.
+    labels: [{ name: "bug", color: "d73a4a" }] as unknown[],
     comments: 2,
     created_at: "2026-08-10T09:00:00Z",
     updated_at: "2026-08-20T09:00:00Z",
@@ -373,6 +395,7 @@ async function findTaskByTitle(
   baseRef: string | null;
   worktreePath: string | null;
   branchSource: "created" | "existing";
+  taskType: "task" | "bug" | "spike";
 } | null> {
   const res = await request.get(`${backend.apiBase}/tasks`, {
     headers: { authorization: `Bearer ${backend.apiToken}` },
@@ -387,6 +410,7 @@ async function findTaskByTitle(
     isolation: "worktree" | "none";
     branch: string | null;
     baseRef: string | null;
+    taskType: "task" | "bug" | "spike";
     worktreePath: string | null;
     branchSource: "created" | "existing";
   }>;
@@ -686,5 +710,149 @@ test.describe("task from a Git issue", () => {
     // No task should be created by this test — just close the dialog.
     await issueTaskDialog.getByRole("button", { name: "Cancel", exact: true }).click();
     await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+  });
+
+  test("label-inferred type: the issue's bug label seeds Bug + fix/ branch prefix", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(60_000);
+    await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
+
+    const typePicker = issueTaskDialog.getByTestId("task-type-picker");
+    const taskButton = typePicker.getByRole("button", { name: "Task", exact: true });
+    const bugButton = typePicker.getByRole("button", { name: "Bug", exact: true });
+    const spikeButton = typePicker.getByRole("button", { name: "Spike", exact: true });
+
+    // Seeded from the fixture issue's "bug" label (inferTaskTypeFromLabels,
+    // src/shared/issue-task.ts) once the thread loads — Bug renders with the
+    // `default` Button variant (`bg-primary` in its class list, per
+    // TaskTypePicker.tsx), Task/Spike stay on the `outline` variant, which
+    // never emits `bg-primary`.
+    await expect(bugButton).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
+    await expect(taskButton).not.toHaveClass(/bg-primary/);
+    await expect(spikeButton).not.toHaveClass(/bg-primary/);
+
+    const worktreeOptions = issueTaskDialog.getByTestId("worktree-options");
+    const branchNameInput = worktreeOptions.getByTestId("branch-name-input");
+    await expect(branchNameInput).toBeVisible();
+    await expect(async () => {
+      expect(await branchNameInput.inputValue()).toMatch(/^fix\//);
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+    // Picking Spike swaps both the selected button and the derived prefix
+    // (DEFAULT_BRANCH_CONFIG.rules.spike.prefix === "spike/").
+    await spikeButton.click();
+    await expect(spikeButton).toHaveClass(/bg-primary/);
+    await expect(bugButton).not.toHaveClass(/bg-primary/);
+    await expect(async () => {
+      expect(await branchNameInput.inputValue()).toMatch(/^spike\//);
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+    // Picking Bug back swaps them again (fix/ per DEFAULT_BRANCH_CONFIG).
+    await bugButton.click();
+    await expect(bugButton).toHaveClass(/bg-primary/);
+    await expect(spikeButton).not.toHaveClass(/bg-primary/);
+    await expect(async () => {
+      expect(await branchNameInput.inputValue()).toMatch(/^fix\//);
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+    const submit = issueTaskDialog.getByTestId("issue-task-submit");
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await submit.click();
+    await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+
+    const task = await awaitCreatedTask(request, backend, CARD_TITLE);
+
+    expect(task.taskType).toBe("bug");
+    expect(task.isolation).toBe("worktree");
+    expect(task.branch).toMatch(/^fix\//);
+
+    await deleteTask(request, backend, task.id);
+    createdTaskIds.splice(createdTaskIds.indexOf(task.id), 1);
+  });
+
+  test("references picker: Files/Folder picks + drag-drop attach, remove leaves the rest", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(60_000);
+
+    // Plant two regular files for the fake-picker seam
+    // (AGETOR_FAKE_PICK_REFS_DIR, see server.ts's POST /refs/pick) to return.
+    await writeFile(path.join(backend.fakePickDir, "notes.md"), "notes\n");
+    await writeFile(path.join(backend.fakePickDir, "spec.txt"), "spec\n");
+
+    await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
+
+    // Expand the (initially collapsed, since references start empty) refs
+    // section before poking at its buttons/dropzone.
+    const summary = issueTaskDialog.getByTestId("refs-summary");
+    await summary.click();
+
+    const dropzone = issueTaskDialog.getByTestId("refs-dropzone");
+    const chips = issueTaskDialog.getByTestId("refs-chip");
+
+    // "files" mode lists fakePickDir's regular files — notes.md + spec.txt.
+    await issueTaskDialog.getByTestId("refs-pick-files").click();
+    await expect(chips).toHaveCount(2, { timeout: CONVERGE_TIMEOUT });
+    await expect(dropzone.getByText("notes.md", { exact: true })).toBeVisible();
+    await expect(dropzone.getByText("spec.txt", { exact: true })).toBeVisible();
+
+    // "folder" mode returns fakePickDir itself (isDirectory: true, rendered
+    // with a trailing "/").
+    await issueTaskDialog.getByTestId("refs-pick-folder").click();
+    await expect(chips).toHaveCount(3, { timeout: CONVERGE_TIMEOUT });
+    const fakeDirBasename = path.basename(backend.fakePickDir);
+    await expect(dropzone.getByText(`${fakeDirBasename}/`, { exact: true })).toBeVisible();
+
+    // Drag-drop a real, non-transient file (README.md from this repo
+    // checkout — isTransientPath would reject anything under /tmp or
+    // /var/folders) as a text/uri-list `file://` line, exactly what WebKit
+    // puts on a Finder drag. Built in page context since a DataTransfer
+    // can't cross the Node/browser boundary any other way.
+    const readmePath = path.join(REPO_ROOT, "README.md");
+    const dt = await page.evaluateHandle((fileUrl) => {
+      const d = new DataTransfer();
+      d.setData("text/uri-list", fileUrl);
+      return d;
+    }, "file://" + encodeURI(readmePath));
+    await dropzone.dispatchEvent("dragover", { dataTransfer: dt });
+    await dropzone.dispatchEvent("drop", { dataTransfer: dt });
+
+    await expect(chips).toHaveCount(4, { timeout: CONVERGE_TIMEOUT });
+    await expect(dropzone.getByText("README.md", { exact: true })).toBeVisible();
+
+    // Remove spec.txt's chip — three remain: notes.md, the folder, README.md.
+    const specChip = chips.filter({ hasText: "spec.txt" });
+    await specChip.getByTestId("refs-remove").click();
+    await expect(chips).toHaveCount(3, { timeout: CONVERGE_TIMEOUT });
+    await expect(dropzone.getByText("spec.txt", { exact: true })).toBeHidden();
+
+    const submit = issueTaskDialog.getByTestId("issue-task-submit");
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await submit.click();
+    await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+
+    const task = await awaitCreatedTask(request, backend, CARD_TITLE);
+
+    const paths = task.references.map((r) => r.path);
+    expect(paths).toContain(path.join(backend.fakePickDir, "notes.md"));
+    expect(paths).toContain(backend.fakePickDir);
+    expect(paths).toContain(readmePath);
+    expect(paths).not.toContain(path.join(backend.fakePickDir, "spec.txt"));
+
+    // Plus the issue-snapshot reference every created issue task carries —
+    // exactly four references total, nothing extra.
+    const snapshotRef = task.references.find((r) => r.path.endsWith(`issue-${ISSUE_NUMBER}-thread.md`));
+    expect(snapshotRef, `references: ${JSON.stringify(task.references)}`).toBeTruthy();
+    expect(task.references.length).toBe(4);
+
+    await deleteTask(request, backend, task.id);
+    createdTaskIds.splice(createdTaskIds.indexOf(task.id), 1);
   });
 });
