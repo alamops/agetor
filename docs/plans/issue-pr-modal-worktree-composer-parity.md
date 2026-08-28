@@ -146,3 +146,9 @@ Assumptions logged:
 ## 9. Completeness ledger
 
 Not run under `--no-follow-ups`. Candidate follow-ups surfaced: Type picker in the issue modal; migrating RunPanel onto `PromptComposer`; `updatedAt` display for saved prompts (pre-existing).
+
+## 10. Outcome (2026-08-27)
+
+Commits on `fix/remove-from-issue-field-of-new-task` (base `7c85f87`): `0c52b1b` plan · `6d98ecc` wave 1 (shared `PromptComposer` + `WorktreeOptions` + `worktree-payload`, `dialog.tsx` yields to popovers) · `f1472e3` wave 2 (NewTaskForm 1342→865 lines, issue modal full parity, PR modal locked row + composer, dead `withoutSnapshotParagraph` removed, CLAUDE.md 10/11) · `e13b420` e2e/issue-task rewrite · `4b676f0` review fixes (opus, `code-review` skill: 0 critical/major, 7 minor, 4 nit — all applied: closure-safe composer bridges, `restoreCaret` caret-before-focus, panel-scoped marker + `data-popover-keys="escape-only"` for RunPanel's Cmd+F, slash-menu Escape always dismisses, `resetForOpen()`/`enabled` on the worktree hook, PR-modal prompt-size guard, copy/a11y nits) · `6e11edc` e2e/resolve-conflicts + worktreePayload unit tests.
+
+Verification: `bun run typecheck` clean; `bun test` 3910 pass / 3 skip / 0 fail; full Playwright suite 55/55 (incl. the rewritten `issue-task.spec.ts` — 4 tests — and the new `resolve-conflicts.spec.ts`). Assumptions from §8 stand; follow-up candidates: Type picker in the issue modal, migrating RunPanel onto `PromptComposer`.
