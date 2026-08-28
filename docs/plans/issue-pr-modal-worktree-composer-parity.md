@@ -163,3 +163,9 @@ Verification: `bun run typecheck` clean; `bun test` 3910 pass / 3 skip / 0 fail;
 | A3b e2e | `e2e/issue-task.spec.ts` | Drive Files/Folder picks via the seam, a `text/uri-list` drop of a non-temp file (`isTransientPath` filters `/tmp` and `/var/folders`), assert chips + `task.references`; assert the label-inferred Type (`bug` → `fix/` branch) and `taskType` on the created task. |
 
 Sequence: A1 ∥ A3a → A2 (after recon) → A3b (Playwright only after product edits stop) → opus review → full run. `CLAUDE.md` updates are made by the orchestrator at the end (single writer).
+
+### Follow-up outcome (2026-08-28)
+
+Commits: `7f77409` §11 scope · `2d2ce22` A1 (shared `TaskTypePicker`, `inferTaskTypeFromLabels`, label-seeded Type in the issue modal, CLI `--issue` default) + A3a (`AGETOR_FAKE_PICK_REFS_DIR` seam, `backend.fakePickDir`, picker test ids) · `3648fa6` A2 (RunPanel send box on `PromptComposer` via additive layout slots, `usePromptCapture.onReport`) · `733f7cf` e2e (label-inferred type → `fix/` branch + `taskType`; Files/Folder picks + `text/uri-list` drop + remove → `task.references`) · `e456e0e` review fixes (opus, `code-review` skill: 0 critical/major, 4 minor, 5 nit — all applied: hoisted composer hooks with `enabled` + `capabilities`/`savedPrompts` pass-through so tab switches don't refetch, `plantPicks` clears the worker-shared pick dir, variant-specific `refs-dropzone-*` roots, `--type ""` still infers, inference doc/negation test, `hintClassName`, stale headers, docs).
+
+Verification: typecheck clean; `bun test` 3931 pass / 3 skip / 0 fail; full Playwright suite 57/57 (issue-task 6, resolve-conflicts 1; one earlier `unread-indicator` failure was the pre-existing close-animation timing race — passed on re-run and on the final run). All three §10 open items are closed; no remainder.
