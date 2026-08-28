@@ -111,3 +111,24 @@ Owner decisions (asked as one pass):
 - **Commit 2:** full lockfile regeneration (every resolution → latest inside its existing range; `package.json` ranges untouched; e.g. `@lobehub/icons` 5.8→5.16, `lucide-react` 1.14→1.34, `ink` 7.0.5→7.1.1, `react` 19.2.6→19.2.8, `vite` 8.0.12→8.2.2) — chosen over "skip commit 2" and "six overrides". Still gated on typecheck + `bun test` + `vite build` + Playwright e2e; owner to eyeball icons/TUI before pushing.
 
 Fleet knowledge captured: "bun 1.3.10: `bun update` never re-resolves a transitive edge whose dependent version didn't change".
+
+## 10. Results
+
+### Commit 1 — `7919041` `fix: floor shell-quote at >=1.9.0 (CVE-2026-13311, CVE-2026-9277) via overrides + concurrently 9.2.4`
+- Files: `package.json` (+`overrides.shell-quote ^1.9.0`, `concurrently ^9.2.4`), `bun.lock` (4 package lines: workspace range, overrides block, `concurrently@9.2.4`, single `shell-quote@1.10.0`), `src/bun/lockfile-advisories.test.ts`, this plan.
+- Guard test: **1 fail on the old lockfile** (`shell-quote@1.8.3 (floor is >=1.9.0)`), 3/3 pass after; removing the override from a scratch `package.json` makes the new package.json check fail (negative proof).
+- Gate: typecheck clean; `bun test` **3905 pass / 1 skip / 0 fail**, 198 files, 269 s.
+- Review (opus, `code-review` skill): 0 must-fix, 3 should-fix, 4 nits — all folded in before the commit (plan contradictions corrected; package.json override check + `lastVulnerable`; unverifiable-resolution partition; lazy lockfile read; ceiling/removal note; red-on-removal note; scope-less `fix:` subject).
+- `bun audit` after commit 1: shell-quote gone; 24 findings remain (5 high, 14 moderate, 5 low) → commit 2.
+- `concurrently` 9.2.4 smoke (`-n a,b "echo a" "echo b"`): OK.
+- `quote()` newline reproduction (#196, scratchpad): on 1.8.3 `quote(["echo","hi",{op:"\n"},"id"])` → `"echo hi \n id"` — the raw `\n` (also `\r`, U+2028) passes through as a shell command separator; on 1.10.0 the same call throws `TypeError: invalid op value` (the fix whitelists `op`).
+
+### Commit 2 — full `bun.lock` regeneration (`rm bun.lock && bun install`)
+- `package.json` untouched; `overrides` block preserved; `--frozen-lockfile` consistent; guard test 3/3.
+- `bun audit`: **No vulnerabilities found** (26 → 0).
+- Resolutions: 205 moved, 16 added, 137 removed (844 → 723 entries). `mermaid`/`dompurify` left the tree entirely (newer `@lobehub/ui` no longer depends on them).
+- Direct deps moved (15, all patch/minor inside their ranges): @clack/prompts 1.5.1→1.7.0, @fontsource-variable/geist 5.2.8→5.3.0, @lobehub/icons 5.8.0→5.16.0, @types/bun 1.3.13→1.4.0, @types/react 19.2.14→19.2.18, @types/react-dom 19.2.3→19.2.5, @vitejs/plugin-react 6.0.1→6.1.0, autoprefixer 10.5.0→10.5.4, ink 7.0.5→7.1.1, lucide-react 1.14.0→1.34.0, postcss 8.5.14→8.5.26, react/react-dom 19.2.6→19.2.8, sonner 2.0.7→2.0.8, vite 8.0.12→8.2.2.
+- Transitive major bumps (12) — upstream-declared, not range drift: the dependents that moved now pin them (`marked ^18.0.6`, `uuid ^14.0.1`, `diff 9.0.0`, `@pierre/theme 1.1.0`, `@splinetool/runtime 1.12.98`, `react-zoom-pan-pinch ^4.0.3`, `entities ^7.0.1`, `@rc-component/*`); only `@types/node` (`*` → 26.4.0, with `undici-types`) and `react-is` (`^19.2.7` → 19.2.8) came through loose ranges.
+- Gate: `bun test` **3906 pass / 1 skip / 0 fail** (198 files, 281 s); `vite build` OK (2.2 s; pre-existing >500 kB chunk warning for the pdf/index chunks); Playwright e2e **53 passed / 0 failed** (66 s; port 5173 free before and after; Chromium cached).
+- **Typecheck initially FAILED** — 6 errors in `node_modules/electrobun/dist/api/bun/proc/native.ts` (`Type 'bigint | Pointer' is not assignable to type 'FFIType.ptr'`, `'filePath' is possibly 'null'`). Cause: `/bun` is declared `"latest"` in `package.json`, so the regeneration moved it and `bun-types` 1.3.13 → 1.4.0 while `electrobun` (1.18.1) and `typescript` (5.9.3) stayed put, and tsc compiles electrobun's shipped `.ts` sources against the new bun types. A fresh clone without the lockfile would hit the same thing.
+- **Fix — the one `package.json` range change in commit 2:** `/bun` pinned to `~1.3.13` (the 1.3 line matches the bun 1.3.x runtime in use and is the version the lockfile already carried). `bun-types` is `.d.ts`-only, so the unit/e2e results above (run before the pin) are unaffected; typecheck re-run after the pin: **clean**; `bun audit` still 0; guard test 3/3; `--frozen-lockfile` consistent. Revisit the pin when electrobun is upgraded (2.x may be typed against newer bun-types).
