@@ -7,8 +7,8 @@ import type { HarnessQuota } from "../../../shared/types.ts";
 
 interface Props {
   /** The harness's latest usage snapshot, or `null` when none exists yet
-   *  (disabled harness, unsupported kind, or first poll still pending) —
-   *  the popover then renders `placeholder` guidance instead of meters. */
+   *  (unsupported kind, or first poll still pending) — the popover then
+   *  renders `placeholder` guidance instead of meters. */
   quota: HarnessQuota | null;
   harnessLabel: string;
   children: ReactNode;

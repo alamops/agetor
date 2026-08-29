@@ -33,6 +33,7 @@ import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { GitHubDialog, type GitHubItemDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
 import { UsageMeter } from "@/components/usage/UsageMeter";
 import { UsagePopover } from "@/components/usage/UsagePopover";
+import { visibleTopbarAgents } from "@/lib/usage";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -1383,7 +1384,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             <h1 className="font-geist text-base font-semibold leading-none tracking-tight">Agetor</h1>
           </div>
           <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2 text-xs text-muted-foreground">
-            {agents.map((a) => {
+            {visibleTopbarAgents(agents, harnesses).map((a) => {
               const harness = harnesses.find((h) => h.id === a.harnessId);
               const displayName = harness?.label ?? a.harnessId;
               const q = usage[a.harnessId];
@@ -1397,20 +1398,14 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 />
               );
               // Every chip is clickable: with a snapshot the popover shows
-              // meters; without one it explains WHY there's no data (harness
-              // disabled / kind unsupported / first poll pending) instead of
-              // silently rendering a bare chip — "no bar and no explanation"
-              // reads as broken.
+              // meters; without one it explains WHY there's no data (kind
+              // unsupported / first poll pending) instead of silently
+              // rendering a bare chip — "no bar and no explanation" reads as
+              // broken.
               const kindSupported = (USAGE_SUPPORTED_KINDS as readonly string[]).includes(a.kind);
-              const enabled = harness?.enabled ?? false;
               const placeholder = !kindSupported
                 ? { message: "Usage tracking isn't supported for this harness yet.", canRefresh: false }
-                : !enabled
-                  ? {
-                      message: "Usage tracking is off because this harness is disabled — enable it in Settings → Harnesses to see its meters.",
-                      canRefresh: false,
-                    }
-                  : { message: "No usage data yet — the first poll runs shortly, or refresh now.", canRefresh: true };
+                : { message: "No usage data yet — the first poll runs shortly, or refresh now.", canRefresh: true };
               const chip = (
                 <span
                   className="flex items-center gap-1"

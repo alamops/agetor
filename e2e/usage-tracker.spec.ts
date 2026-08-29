@@ -21,11 +21,12 @@ import type { HarnessQuota } from "../src/shared/types.ts";
  * migration 038's seed data), and `AGETOR_CLAUDE_BIN`/`AGETOR_TMUX_BIN`
  * point at `/bin/echo` in every worker's backend (e2e/fixtures.ts), so its
  * chip is deterministically available and rendered — no dependency on a real
- * `claude`/`tmux` install on the machine running these tests. `codex`/
- * `cursor`/`gemini` still render their own (usage-less) chips alongside it,
- * but with no seeded snapshot they stay plain spans rather than
- * `UsagePopover`-wrapped buttons, so they can't be confused with the
- * claude-code chip under test.
+ * `claude`/`tmux` install on the machine running these tests. The other
+ * built-ins seeded by migration 046 (`codex`, `cursor`, `gemini`, `fx`) ship
+ * `enabled=0` and `visibleTopbarAgents` (src/mainview/lib/usage.ts) filters
+ * the topbar to enabled harnesses only, so none of them render a chip at
+ * all — not even a plain, usage-less span (docs/plans
+ * /hide-disabled-harnesses-topbar.md).
  *
  * Assert DOM structure/classes/text — same convention as theme.spec.ts and
  * font-size.spec.ts (real Chromium against the real webview + a real Bun
@@ -71,8 +72,19 @@ test("renders the claude-code chip's worst-meter mini-bar and its popover's mete
   // Scoped to the app-bar (`<header>`, implicit role "banner") — the New
   // Task form's agent picker also has a button named "Claude Code", and an
   // unscoped role query would hit both (strict-mode violation).
-  const chip = page.getByRole("banner").getByRole("button", { name: "Claude Code", exact: true });
+  const banner = page.getByRole("banner");
+  const chip = banner.getByRole("button", { name: "Claude Code", exact: true });
   await expect(chip).toBeVisible();
+
+  // The other built-in harnesses (Codex, Cursor, Gemini CLI, fx.sh) are
+  // disabled by default and must not render a chip — not a button, not any
+  // other element — in the topbar (docs/plans
+  // /hide-disabled-harnesses-topbar.md). Labels per src/bun/migrations
+  // /046_fx_harness.sql; `exact: true` so "Gemini CLI" doesn't collide with
+  // a future "Gemini" label elsewhere.
+  for (const label of ["Codex", "Cursor", "Gemini CLI", "fx.sh"]) {
+    await expect(banner.getByRole("button", { name: label, exact: true })).toHaveCount(0);
+  }
 
   // Mini-bar: a fixed-size track (`bg-muted`) with a fill span colored by
   // the worst meter's tier. aria-hidden on both spans (decorative), so they

@@ -167,11 +167,12 @@ export interface Harness {
    *  the home-derived block. Power-user surface. */
   env: Record<string, string>;
   /** Soft-delete flag. Disabled harnesses are hidden from the New Task
-   *  picker and the default-harness selector, but the row stays in the DB
-   *  so historical `tasks.agent = <id>` references keep resolving. The
-   *  orchestrator refuses to start new runs on a disabled harness;
-   *  in-flight runs are unaffected. Built-ins are toggleable too — this
-   *  is the one carve-out from the built-in immutability rule. */
+   *  picker, the default-harness selector, and the window topbar, but the
+   *  row stays in the DB so historical `tasks.agent = <id>` references
+   *  keep resolving. The orchestrator refuses to start new runs on a
+   *  disabled harness; in-flight runs are unaffected. Built-ins are
+   *  toggleable too — this is the one carve-out from the built-in
+   *  immutability rule. */
   enabled: boolean;
 }
 
