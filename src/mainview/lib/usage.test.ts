@@ -4,6 +4,7 @@ import {
   formatResetsIn,
   formatUpdatedAgo,
   tierColorVar,
+  visibleTopbarAgents,
   warnTier,
   worstMeter,
   worstTier,
@@ -161,5 +162,81 @@ describe("formatUpdatedAgo", () => {
 
   test("a fetchedAtMs in the future (clock skew) still renders 'updated just now'", () => {
     expect(formatUpdatedAgo(now + 60_000, now)).toBe("updated just now");
+  });
+});
+
+describe("visibleTopbarAgents", () => {
+  function harness(id: string, enabled: boolean): { id: string; enabled: boolean } {
+    return { id, enabled };
+  }
+
+  test("enabled harnesses pass through, order preserved", () => {
+    const agents = [{ harnessId: "claude-code" }, { harnessId: "codex" }];
+    const harnesses = [harness("claude-code", true), harness("codex", true)];
+    expect(visibleTopbarAgents(agents, harnesses)).toEqual(agents);
+  });
+
+  test("disabled harnesses are dropped", () => {
+    const agents = [{ harnessId: "claude-code" }, { harnessId: "codex" }];
+    const harnesses = [harness("claude-code", true), harness("codex", false)];
+    expect(visibleTopbarAgents(agents, harnesses)).toEqual([{ harnessId: "claude-code" }]);
+  });
+
+  test("an agent whose harnessId has no matching harness row is dropped", () => {
+    const agents = [{ harnessId: "claude-code" }, { harnessId: "ghost" }];
+    const harnesses = [harness("claude-code", true)];
+    expect(visibleTopbarAgents(agents, harnesses)).toEqual([{ harnessId: "claude-code" }]);
+  });
+
+  test("empty agents returns an empty list", () => {
+    const harnesses = [harness("claude-code", true)];
+    expect(visibleTopbarAgents([], harnesses)).toEqual([]);
+  });
+
+  test("empty harnesses returns an empty list even if agents is non-empty", () => {
+    const agents = [{ harnessId: "claude-code" }, { harnessId: "codex" }];
+    expect(visibleTopbarAgents(agents, [])).toEqual([]);
+  });
+
+  test("mixed list: enabled kept, disabled and unknown dropped, order preserved among keepers", () => {
+    const agents = [
+      { harnessId: "claude-code" },
+      { harnessId: "codex" },
+      { harnessId: "cursor" },
+      { harnessId: "ghost" },
+      { harnessId: "gemini" },
+    ];
+    const harnesses = [
+      harness("claude-code", true),
+      harness("codex", false),
+      harness("cursor", true),
+      harness("gemini", false),
+    ];
+    expect(visibleTopbarAgents(agents, harnesses)).toEqual([
+      { harnessId: "claude-code" },
+      { harnessId: "cursor" },
+    ]);
+  });
+
+  test("extra fields on the agent objects are preserved", () => {
+    const agents = [
+      { harnessId: "claude-code", kind: "claude-code" as const },
+      { harnessId: "codex", kind: "codex" as const },
+    ];
+    const harnesses = [harness("claude-code", true), harness("codex", false)];
+    expect(visibleTopbarAgents(agents, harnesses)).toEqual([
+      { harnessId: "claude-code", kind: "claude-code" },
+    ]);
+  });
+
+  test("availability/loggedIn fields on an agent do not affect inclusion", () => {
+    const agents = [
+      { harnessId: "claude-code", available: false, loggedIn: false },
+      { harnessId: "codex", available: true, loggedIn: true },
+    ];
+    const harnesses = [harness("claude-code", true), harness("codex", false)];
+    expect(visibleTopbarAgents(agents, harnesses)).toEqual([
+      { harnessId: "claude-code", available: false, loggedIn: false },
+    ]);
   });
 });

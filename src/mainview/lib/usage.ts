@@ -70,6 +70,22 @@ export function clampPercent(p: number): number {
   return p;
 }
 
+/**
+ * Filter a list of agent statuses down to the ones whose harness is
+ * `enabled` — this is what drives the window topbar's chip list. An agent
+ * whose harness id has no matching row (or whose row is disabled) is
+ * dropped, same as today's `harness?.enabled ?? false` inline check.
+ * Enabled-but-unavailable/logged-out harnesses still pass through; this
+ * only looks at the Settings toggle, not live probe state. Input order is
+ * preserved.
+ */
+export function visibleTopbarAgents<A extends { harnessId: string }>(
+  agents: readonly A[],
+  harnesses: readonly { id: string; enabled: boolean }[],
+): A[] {
+  return agents.filter((a) => harnesses.find((h) => h.id === a.harnessId)?.enabled ?? false);
+}
+
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
