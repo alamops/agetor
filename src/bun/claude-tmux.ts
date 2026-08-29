@@ -25,6 +25,7 @@ import {
   type TmuxPromptChoice,
 } from "./interactions.ts";
 import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
+import { createDeathProbe } from "./session-liveness.ts";
 import { detectAskModal, parseModalPane, type AskModalKind, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
 /**
@@ -1656,6 +1657,42 @@ export function sessionLiveness(name: string): SessionLiveness {
   // string we can't assume. A genuinely-dead session/server that only ever
   // emits an unrecognized error degrades to boot `reconcileOrphans`.
   return "unreachable";
+}
+
+/**
+ * The pid of the process running in `name`'s (first) pane — for a claude
+ * session that is the `claude` REPL itself (tmux execs the launch argv
+ * directly, no shell in between); for the one-shot codex/cursor/gemini
+ * sessions it's the `sh -c 'exec …'` pane whose `exec` replaced it with the
+ * agent binary (same pid). `null` when the session has no pane, the server
+ * is unreachable, or the answer doesn't parse as a pid.
+ *
+ * Read via `list-panes -a` + an exact `session_name` match in JS rather than
+ * `display-message -p -t =<name>`: tmux 3.6a silently expands every format
+ * variable to EMPTY (exit 0) for `=`-prefixed targets on that command, so a
+ * target-addressed read can't be trusted, whereas a listing filtered
+ * client-side can. Only the first pane of the session is considered — agetor
+ * creates exactly one, and a user who splits the window from a manual
+ * `tmux attach` leaves the original agent pane at index 0, listed first.
+ *
+ * This is the one-off cost that lets the death watch check liveness with a
+ * `kill(pid, 0)` syscall per tick instead of forking a tmux client — see
+ * `createDeathProbe` in session-liveness.ts.
+ */
+export function panePidFor(name: string): number | null {
+  const r = tmux(["list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}"]);
+  if (!r.ok) return null;
+  for (const line of r.stdout.split("\n")) {
+    const tab = line.indexOf("\t");
+    if (tab < 0 || line.slice(0, tab) !== name) continue;
+    const pid = line.slice(tab + 1).trim();
+    // Strict all-digit check BEFORE Number(): `Number("")` is 0, which
+    // `Number.isFinite` happily accepts (the tmux 3.6a empty-format trap).
+    if (!/^[0-9]+$/.test(pid)) return null;
+    const n = Number(pid);
+    return n > 0 ? n : null;
+  }
+  return null;
 }
 
 /** True when `path` was written within `windowMs` — used as a death-watch veto:
@@ -5958,7 +5995,9 @@ function startScraper(state: SessionState): void {
   }, SCRAPE_INTERVAL_MS);
 }
 
-/** How often the death watch polls `tmux has-session`. */
+/** How often the death watch ticks. A tick is a `kill(pid, 0)` syscall on the
+ *  pane's process — the `tmux has-session` fork only runs to confirm a dead
+ *  pid or on the periodic re-validation (`createDeathProbe`). */
 const DEATH_POLL_MS = 400;
 /** Grace after the session disappears before we settle, so any final JSONL
  *  bytes (a real end_turn that landed just before the session died) are
@@ -6301,12 +6340,21 @@ function startDeathWatch(state: SessionState): void {
   // is never wrongly blocked. Reset on any tick where the session is alive/
   // unreachable, the JSONL was just written, or no turn is running (and the
   // task isn't held open for background agents).
+  // Fork-free liveness: a `kill(pid, 0)` on the pane's process per tick, with
+  // the `has-session` fork reserved for confirming a dead pid and for the
+  // periodic re-validation that bounds pid reuse (see `createDeathProbe`).
+  // One probe per watch — it lives exactly as long as this interval does.
+  const probe = createDeathProbe({
+    sessionName: state.sessionName,
+    authoritative: sessionLiveness,
+    resolvePid: panePidFor,
+  });
   let misses = 0;
   state.deathTimer = setInterval(() => {
-    if (!turnInFlight(state) && !heldProbeSafe(state.taskId)) { misses = 0; return; } // idle & not held — skip the tmux poll
+    if (!turnInFlight(state) && !heldProbeSafe(state.taskId)) { misses = 0; return; } // idle & not held — skip the poll
     // Compute the log-recency veto lazily — it only matters for a `gone` probe,
     // and `gone` is the rare tick, so we skip a statSync on every `alive` poll.
-    const liveness = sessionLiveness(state.sessionName);
+    const liveness = probe.probe();
     const outcome = deathTickOutcome({
       liveness,
       logFresh: liveness === "gone" && fileWrittenWithin(state.jsonlPath, DEATH_JSONL_QUIET_MS),

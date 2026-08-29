@@ -95,3 +95,34 @@ Alternatives considered: replacing 2s polling with pure SSE push (bigger blast r
 - Assumed 800 as the replay window and 3000 as the live cap (owner approved "cap + load earlier" without exact numbers; constants centralized in T0, trivial to tune).
 - Assumed reap sweep every 5min is fine (not asked; bounded staleness 30–35min).
 - Assumed emitting a status event on reap is desirable visibility (investigation recommendation; harmless).
+
+## 9. Round 2 — battery (2026-08-28): fork-free death watch, no per-commit fsync, compositor-only chrome
+
+Triggered by "one running task drains a MacBook in under an hour". Profiling the
+live release build (`sample`, `top -pid`, `pmset`) with one claude task in
+flight showed the app's own footprint at ≈7% of one core (bun main ≈3–4.6%,
+WebContent ≈2.7%, tmux server 0.3%) — real, but **not** the drain: that was
+eight orphaned `zsh` busy-loops (`for i in $(seq 1 8); do (while :; do :; done) &
+done`, a "saturate the cores" load generator from a Claude Code session in an
+unrelated project whose `kill $LOAD` never fired) at ~90–100% CPU *each*, alive
+for 11 days. Agetor was the visible process, not the culprit. The Agetor-side
+work below is what "master-class on battery" looks like for the parts we own:
+
+| Hot spot (measured) | Before | After |
+|---|---|---|
+| Death watch, per in-flight run (`claude`, `codex`, `cursor`, `gemini`) | `Bun.spawnSync tmux has-session` every 400 ms — 2.5 forks/s, event loop blocked each time; `__posix_spawn` was the top non-idle leaf in a 5 s `sample` of the main process | `createDeathProbe` (`src/bun/session-liveness.ts`): `kill(pid, 0)` on the pane pid per tick; the tmux fork only confirms a vanished pid or re-validates every 10 s (pid-reuse bound). ≈0.1 forks/s. Verdict contract (`alive`/`gone`/`unreachable` → `deathTickOutcome`) unchanged — a `gone` is always tmux's own. |
+| SQLite commits | WAL with default `synchronous=FULL` → fsync on every `run_events` INSERT and every unread-watermark UPDATE while streaming | `PRAGMA synchronous = NORMAL` — WAL stays crash-consistent; only the last commit(s) before a *kernel* panic can roll back |
+| RunPanel 2 s backstop polls (`/runs`, `/subagents`) | `setRuns(list)` / rebuilt subagent array every tick → whole open panel re-rendered every 2 s while a run streams | `reconcileById` (moved to `src/mainview/lib/reconcile.ts`, shared with the board) returns the previous array when nothing changed → React bails out |
+| RunPanel scrim | `backdrop-blur-sm` over the full window: WebKit re-blurs the entire board every frame anything beneath repaints/animates, for as long as the panel is open | plain `bg-background/50` scrim, zero per-frame cost |
+| Awaiting-card glow | `animate-awaiting-pulse` animated `filter: drop-shadow` on the card → CPU re-rasterization every frame (60–120 Hz) while any card awaits | static `box-shadow` on a `pointer-events-none` overlay whose **opacity** pulses (compositor-only) |
+
+Verified: `bun run typecheck`, `bunx vite build`, `bun test` on the new units
+(`session-liveness`, `pane-pid`, `reconcile`) and the four drivers' existing
+death-watch suites (all fake-tmux — never the shared socket).
+
+Left alone on purpose (measured cheap, or latency-bearing): the 1 s pane
+scraper while a turn is in flight (modal detection latency), the 400 ms JSONL
+stat backstop (one `stat`; fs.watch drops appends on macOS), the 2 s board
+poll (sub-millisecond, identity-preserving), the 15 s `/harnesses` poll
+(`claude --version` is a 10 ms fast path), and the `animate-ping` heartbeat
+dot (composited; equal cost to any replacement that still animates).

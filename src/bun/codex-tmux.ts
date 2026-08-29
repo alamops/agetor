@@ -15,6 +15,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
+import { createDeathProbe } from "./session-liveness.ts";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import {
   DEATH_JSONL_QUIET_MS,
@@ -22,6 +23,7 @@ import {
   deathTickOutcome,
   fileWrittenWithin,
   killSessionByName,
+  panePidFor,
   sessionExistsByName,
   sessionLiveness,
   sessionNameFor,
@@ -369,11 +371,19 @@ function startCodexTailer(state: CodexSessionState): Promise<number> {
   // the shared socket resets the counter, and a codex log written a beat ago
   // vetoes it — so a live one-shot run is never wrongly torn down (mirrors
   // claude-tmux's death watch; see `sessionLiveness`).
+  // Fork-free liveness — see `createDeathProbe`: a `kill(pid, 0)` on the
+  // pane's process per tick; the `has-session` fork only confirms a dead pid
+  // or re-validates periodically.
+  const probe = createDeathProbe({
+    sessionName: state.sessionName,
+    authoritative: sessionLiveness,
+    resolvePid: panePidFor,
+  });
   let misses = 0;
   state.deathTimer = setInterval(() => {
     tryWatch();
     // Compute the log-recency veto lazily — only a `gone` probe uses it.
-    const liveness = sessionLiveness(state.sessionName);
+    const liveness = probe.probe();
     const outcome = deathTickOutcome({
       liveness,
       logFresh: liveness === "gone" && fileWrittenWithin(state.logPath, DEATH_JSONL_QUIET_MS),

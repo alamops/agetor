@@ -16,6 +16,7 @@ import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
+import { reconcileById } from "@/lib/reconcile";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -340,7 +341,13 @@ export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, 
         aria-label="Close task panel"
         onClick={onClose}
         className={cn(
-          "fixed inset-0 z-30 bg-background/40 backdrop-blur-sm transition-opacity duration-200",
+          // Deliberately NO backdrop blur utility: a full-window backdrop filter makes
+          // WebKit re-blur the entire board every frame anything beneath it
+          // repaints or animates (an awaiting card's glow, a poll-driven
+          // re-render) for as long as the panel is open — i.e. exactly while
+          // the user sits watching a run. A slightly denser plain scrim gives
+          // the same "focus on the panel" read for zero per-frame cost.
+          "fixed inset-0 z-30 bg-background/50 transition-opacity duration-200",
           open ? "opacity-100" : "pointer-events-none opacity-0",
         )}
       />
@@ -669,7 +676,7 @@ function RunPanelBody({
       try {
         const list = await api.listRuns(task.id);
         if (cancelled) return;
-        setRuns(list);
+        setRuns((prev) => reconcileById(prev, list, (r) => r.id));
       } catch { /* task may have been deleted */ }
     };
     const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
@@ -734,7 +741,14 @@ function RunPanelBody({
           const byId = new Map<string, Subagent>();
           for (const s of cur) byId.set(s.id, s);
           for (const s of list) byId.set(s.id, s);
-          return [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1));
+          // Identity-preserving: hand back `cur` itself when nothing changed,
+          // so this backstop poll can't re-render the whole open panel every
+          // 2s while a run merely streams (see `reconcileById`).
+          return reconcileById(
+            cur,
+            [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1)),
+            (s) => s.id,
+          );
         });
       } catch { /* task may have been deleted */ }
     };
@@ -2197,7 +2211,7 @@ function RunPanelBody({
         setRebuildNote(null);
         // Refresh the runs list right away so the new run row appears
         // immediately, rather than waiting up to 2s for the next poll.
-        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
         // Pin the view to the newest content the moment the message is
         // accepted — the user's own message lands first, followed by
         // streamed assistant chunks. The unified task-level stream picks
@@ -2303,7 +2317,7 @@ function RunPanelBody({
         setRebuildNote(null);
         // No optimistic git-status touch here (main's #94 dropped that): the
         // git-status polling effect keeps `gitStatus` current on its own.
-        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
         nearBottomRef.current = true;
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -2404,7 +2418,7 @@ function RunPanelBody({
       if (res.delivered) {
         setRebuilt(null);
         setRebuildNote(null);
-        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
         nearBottomRef.current = true;
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -2472,7 +2486,7 @@ function RunPanelBody({
       if (res.delivered) {
         setRebuilt(null);
         setRebuildNote(null);
-        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
         nearBottomRef.current = true;
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -4489,7 +4503,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
 
   return (
     <div className="flex justify-end">
-      <div ref={bubbleRef} className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/30 bg-card/50 px-3 py-1.5 text-foreground shadow-sm backdrop-blur-md">
+      <div ref={bubbleRef} className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/30 bg-card px-3 py-1.5 text-foreground shadow-sm">
         {parsed?.kind === "command-output" ? (
           <>
             <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
