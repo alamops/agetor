@@ -8,7 +8,7 @@ import {
   mkdirSync,
   writeFileSync,
 } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,6 +38,18 @@ export interface E2EBackend {
    *  `startGitHubStub(backend.githubStubPort, routes)` transparently becomes
    *  the app's GitHub API for the lifetime of that backend. */
   githubStubPort: number;
+  /** Directory `POST /refs/pick` returns from in this headless backend.
+   *  Use `plantPicks` — it clears first; the dir is worker-shared, so a
+   *  spec that writes into it directly can leak stale files into a later
+   *  spec's "files" pick. See the seam in server.ts. */
+  fakePickDir: string;
+  /** Clears `fakePickDir` (it's worker-shared, so a spec's leftover files
+   *  would otherwise leak into the next spec's "files"-mode pick) and
+   *  replants it with the given `{ name: content }` entries, returning
+   *  their absolute paths in the same key order. Call this instead of
+   *  writing into `fakePickDir` by hand before exercising the
+   *  Files/Folder picker buttons. */
+  plantPicks: (files: Record<string, string>) => Promise<string[]>;
 }
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
@@ -253,6 +265,13 @@ async function provisionBackend(
   const daemonLogFile = path.join(dataDir, "daemon.log");
   // Must happen before the spawn below — see writeFxStubBin's doc comment.
   const fxStubBinPath = writeFxStubBin(dataDir);
+  // Backs the `/refs/pick` test seam (src/bun/server.ts) — a spec plants
+  // files here, then clicks the picker's Files/Folder button, and the
+  // headless backend returns them instead of opening a native panel that
+  // doesn't exist in this environment. Created up front (like the fx stub
+  // bin above) so a spec can write into it before the backend even boots.
+  const fakePickDir = path.join(dataDir, "fake-picks");
+  mkdirSync(fakePickDir, { recursive: true });
 
   const logStream: WriteStream = createWriteStream(logFile);
   await new Promise<void>((resolve, reject) => {
@@ -311,6 +330,9 @@ async function provisionBackend(
       // Specs that never open the Git dialog never hit this — it's inert
       // until something calls startGitHubStub(backend.githubStubPort, ...).
       AGETOR_GITHUB_API_BASE: `http://127.0.0.1:${githubStubPort}`,
+      // Test seam for `/refs/pick` (src/bun/server.ts) — see fakePickDir
+      // above. Never set in production launches.
+      AGETOR_FAKE_PICK_REFS_DIR: fakePickDir,
       // So `githubToken()` resolves this literal token from env and never
       // shells out to `gh auth token` on the dev machine (which could hang,
       // fail, or leak a real token into a test run).
@@ -376,6 +398,20 @@ async function provisionBackend(
     throw new Error(`${(err as Error).message}\n${tails}`);
   }
 
+  // Backs `E2EBackend.plantPicks` — see its JSDoc on the interface above.
+  // Closes over `fakePickDir` so callers never have to pass it themselves.
+  async function plantPicks(files: Record<string, string>): Promise<string[]> {
+    await rm(fakePickDir, { recursive: true, force: true });
+    await mkdir(fakePickDir, { recursive: true });
+    const paths: string[] = [];
+    for (const [name, content] of Object.entries(files)) {
+      const filePath = path.join(fakePickDir, name);
+      await writeFile(filePath, content);
+      paths.push(filePath);
+    }
+    return paths;
+  }
+
   const backend: E2EBackend = {
     apiPort,
     apiToken,
@@ -383,6 +419,8 @@ async function provisionBackend(
     bootBase: `${E2E_BASE_URL}/#api=${apiPort}&token=${apiToken}`,
     dataDir,
     githubStubPort,
+    fakePickDir,
+    plantPicks,
   };
 
   await use(backend);

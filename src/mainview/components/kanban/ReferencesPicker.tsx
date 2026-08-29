@@ -141,6 +141,7 @@ export function ReferencesPicker({
           <li
             key={r.path}
             title={r.path}
+            data-testid="refs-chip"
             className="inline-flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-card px-1.5 py-0.5 text-[11px]"
           >
             <Icon className="size-3 shrink-0 opacity-70" />
@@ -150,6 +151,7 @@ export function ReferencesPicker({
             <button
               type="button"
               onClick={() => remove(r.path)}
+              data-testid="refs-remove"
               className="-mr-0.5 ml-0.5 rounded-sm p-0.5 text-muted-foreground hover:text-foreground hover:bg-accent/40"
               title="Remove"
             >
@@ -172,6 +174,7 @@ export function ReferencesPicker({
         variant="ghost"
         size="sm"
         disabled={picking}
+        data-testid="refs-pick-files"
         className="h-6 gap-1 px-2 text-[11px]"
         onClick={(e) => { e.stopPropagation(); void pick("files"); }}
       >
@@ -182,6 +185,7 @@ export function ReferencesPicker({
         variant="ghost"
         size="sm"
         disabled={picking}
+        data-testid="refs-pick-folder"
         className="h-6 gap-1 px-2 text-[11px]"
         onClick={(e) => { e.stopPropagation(); void pick("folder"); }}
       >
@@ -204,6 +208,7 @@ export function ReferencesPicker({
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
         onDrop={onDrop}
+        data-testid="refs-dropzone-inline"
         className={cn(
           "relative rounded-md border border-dashed border-border/60 bg-card/40 px-1.5 py-1",
           dragging && "border-primary/60 bg-primary/5",
@@ -230,6 +235,7 @@ export function ReferencesPicker({
     <details
       open={open}
       onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
+      data-testid="refs-dropzone-expandable"
       className={cn(
         "relative rounded-md border border-border/60 bg-card/40 px-2 py-1.5",
         dragging && "border-primary/60 bg-primary/5",
@@ -239,7 +245,10 @@ export function ReferencesPicker({
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      <summary className="flex cursor-pointer items-center justify-between gap-2 text-[11px] text-muted-foreground">
+      <summary
+        data-testid="refs-summary"
+        className="flex cursor-pointer items-center justify-between gap-2 text-[11px] text-muted-foreground"
+      >
         <span className="inline-flex items-center gap-1">
           {label}{" "}
           {refs.length > 0 && <span className="font-mono">({refs.length})</span>}

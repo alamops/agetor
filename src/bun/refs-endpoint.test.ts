@@ -81,3 +81,56 @@ test("/refs/resolve requires a token", async () => {
   });
   expect(res.status).toBe(401);
 });
+
+const pick = (mode: "files" | "folder") =>
+  fetch("http://127.0.0.1:4421/refs/pick", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+
+test("/refs/pick is unavailable in headless mode when the fake-pick seam is unset", async () => {
+  // Guards against the seam changing behavior when AGETOR_FAKE_PICK_REFS_DIR
+  // is absent — no `native` bridge exists in this test process, so the
+  // request must still fall through to the same 501 the real headless
+  // backend returns.
+  delete process.env.AGETOR_FAKE_PICK_REFS_DIR;
+  const res = await pick("files");
+  expect(res.status).toBe(501);
+});
+
+test("/refs/pick honors AGETOR_FAKE_PICK_REFS_DIR", async () => {
+  const pickDir = mkdtempSync(path.join(tmpdir(), "agetor-refs-pick-"));
+  writeFileSync(path.join(pickDir, "b.txt"), "b");
+  writeFileSync(path.join(pickDir, "a.txt"), "a");
+  mkdirSync(path.join(pickDir, "subdir")); // not a regular file — must be excluded from "files" mode
+  process.env.AGETOR_FAKE_PICK_REFS_DIR = pickDir;
+  try {
+    const filesRes = await pick("files");
+    expect(filesRes.status).toBe(200);
+    const { refs: fileRefs } = (await filesRes.json()) as { refs: { path: string; isDirectory: boolean }[] };
+    expect(fileRefs).toEqual([
+      { path: path.join(pickDir, "a.txt"), isDirectory: false },
+      { path: path.join(pickDir, "b.txt"), isDirectory: false },
+    ]);
+
+    const folderRes = await pick("folder");
+    expect(folderRes.status).toBe(200);
+    const { refs: folderRefs } = (await folderRes.json()) as { refs: { path: string; isDirectory: boolean }[] };
+    expect(folderRefs).toEqual([{ path: pickDir, isDirectory: true }]);
+  } finally {
+    delete process.env.AGETOR_FAKE_PICK_REFS_DIR;
+  }
+});
+
+test("/refs/pick returns a cancelled pick when AGETOR_FAKE_PICK_REFS_DIR doesn't exist", async () => {
+  process.env.AGETOR_FAKE_PICK_REFS_DIR = path.join(SCRATCH, "does-not-exist");
+  try {
+    const res = await pick("files");
+    expect(res.status).toBe(200);
+    const { refs } = (await res.json()) as { refs: unknown[] };
+    expect(refs).toEqual([]);
+  } finally {
+    delete process.env.AGETOR_FAKE_PICK_REFS_DIR;
+  }
+});

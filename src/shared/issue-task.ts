@@ -10,6 +10,7 @@
 // --issue`) both build on these so the prompt/snapshot shape can never drift
 // between entry points.
 import type { GitHubComment, GitHubIssueThreadResult, GitHubListItem, GitProvider } from "./types.ts";
+import { DEFAULT_TASK_TYPE, type TaskType } from "./types.ts";
 
 /** Prepended before the quoted issue content in both the launch prompt (as
  *  its own paragraph, immediately above the `---` separator) and the
@@ -194,6 +195,55 @@ export function issueTaskTitle(item: Pick<GitHubListItem, "number" | "title">): 
   return `Issue #${item.number}: ${item.title}`;
 }
 
+/** Keyword families {@link inferTaskTypeFromLabels} matches against, each
+ *  compared against any token obtained by splitting the lowercased label
+ *  name on non-alphanumeric characters — so `type: bug`, `kind/defect`, and
+ *  `bug-report` all count as "bug" even though none of them equal the
+ *  literal string "bug". */
+const BUG_LABEL_KEYWORDS = new Set(["bug", "defect", "regression", "crash"]);
+const SPIKE_LABEL_KEYWORDS = new Set([
+  "spike",
+  "research",
+  "investigation",
+  "investigate",
+  "exploration",
+  "poc",
+  "prototype",
+]);
+
+/**
+ * Infers a {@link TaskType} from an issue's labels — seeds the "Work on this
+ * with Agetor" dialog's Type picker (and `agetor add --issue`'s `--type`
+ * default) from the issue tracker's own labels, so a `bug`-labelled issue
+ * lands on a `fix/…` branch instead of the blanket `feature/…` every issue
+ * task used to get regardless of label. Case-insensitive: a label matches a
+ * family when any token obtained by splitting the lowercased name on
+ * non-alphanumeric characters is one of the family's keywords (see
+ * {@link BUG_LABEL_KEYWORDS} / {@link SPIKE_LABEL_KEYWORDS}) — so
+ * `Type: Bug`, `kind/defect`, and `bug-report` all match "bug", while
+ * `bugfix` (no separator between the two words) does not.
+ *
+ * This is a plain keyword match with no negation awareness: a label like
+ * `not-a-bug` or `wontfix-bug-report` still seeds `"bug"`, since the
+ * tokenizer has no concept of `not`/`wontfix` negating the `bug` token that
+ * follows it. That's by design — this is a fast default, and the Type picker
+ * (or `--type`) is always available to override a bad guess.
+ *
+ * When labels match both families (e.g. a "bug investigation" issue tagged
+ * both `bug` and `research`), `"bug"` wins — it's still a bug fix at heart.
+ * No match (including no labels at all) falls back to
+ * {@link DEFAULT_TASK_TYPE}.
+ */
+export function inferTaskTypeFromLabels(labels: ReadonlyArray<{ name: string }>): TaskType {
+  let sawSpike = false;
+  for (const label of labels) {
+    const tokens = label.name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    if (tokens.some((c) => BUG_LABEL_KEYWORDS.has(c))) return "bug";
+    if (tokens.some((c) => SPIKE_LABEL_KEYWORDS.has(c))) sawSpike = true;
+  }
+  return sawSpike ? "spike" : DEFAULT_TASK_TYPE;
+}
+
 /** Filename the full thread snapshot is written under, per task
  *  (`dataDir/issue-threads/<taskId>/<this>`). */
 export const ISSUE_SNAPSHOT_FILENAME = (n: number): string => `issue-${n}-thread.md`;
@@ -269,16 +319,16 @@ function commitReferencePhrase(provider: GitProvider, number: number): string {
   return `issue #${number}`;
 }
 
-/** Stable prefix `withoutSnapshotParagraph` matches on — kept as a constant
- *  so the builder and the stripper can never drift out of sync. */
+/** Stable prefix of the "the complete thread snapshot is saved as …"
+ *  paragraph — kept as a constant so `snapshotParagraph` has one exact
+ *  string shape to build from. */
 const SNAPSHOT_PARAGRAPH_PREFIX = "The complete thread snapshot";
 
 /**
  * Builds the "the complete thread snapshot is saved as …" paragraph
  * (`buildIssueTaskPrompt` includes it only when the caller says the snapshot
  * file was actually written). Factored out as a stable, independently
- * testable unit — and so `withoutSnapshotParagraph` has one exact string
- * shape to strip back out.
+ * testable unit.
  *
  * `commentsError` (additive 4th param, mirrors `GitHubIssueThreadResult`) —
  * when set, the comments phrase becomes "(comments were not fetched)" instead
@@ -308,29 +358,6 @@ export function snapshotParagraph(
   return `${SNAPSHOT_PARAGRAPH_PREFIX} (${commentsPhrase}) is saved as `
     + `\`${ISSUE_SNAPSHOT_FILENAME(n)}\`, listed under "Referenced files/folders" below — `
     + "read it if the inline excerpt is cut short.";
-}
-
-/**
- * Removes the `snapshotParagraph` block from a previously-built prompt,
- * wherever it appears, along with the one surrounding blank line so no
- * double blank line is left behind. Matches on the stable
- * `SNAPSHOT_PARAGRAPH_PREFIX` through the end of that paragraph (the
- * paragraph itself is always a single line — no embedded newlines — so "end
- * of paragraph" is just "end of line"). A no-op (returns the input
- * unchanged) when the paragraph isn't present, so it's safe to call
- * unconditionally and idempotently.
- */
-export function withoutSnapshotParagraph(prompt: string): string {
-  const withLeadingBlank = new RegExp(`\\n\\n${SNAPSHOT_PARAGRAPH_PREFIX}[^\\n]*`);
-  if (withLeadingBlank.test(prompt)) {
-    return prompt.replace(withLeadingBlank, "");
-  }
-  const withTrailingBlank = new RegExp(`^${SNAPSHOT_PARAGRAPH_PREFIX}[^\\n]*\\n\\n`);
-  if (withTrailingBlank.test(prompt)) {
-    return prompt.replace(withTrailingBlank, "");
-  }
-  const wholePrompt = new RegExp(`^${SNAPSHOT_PARAGRAPH_PREFIX}[^\\n]*$`);
-  return wholePrompt.test(prompt) ? "" : prompt;
 }
 
 /**

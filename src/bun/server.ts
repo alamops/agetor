@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -4001,6 +4001,32 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             typeof body.startingFolder === "string" && body.startingFolder.trim()
               ? body.startingFolder
               : homedir();
+          // Test seam for the Playwright harness (`e2e/fixtures.ts`), which
+          // has no native open-panel to drive: when set, this env var wins
+          // over the real dialog, mirroring the `AGETOR_*_DRIVER=fake`
+          // convention used for agent drivers. Never set in production
+          // launches — the fixture is the only writer. "folder" mode returns
+          // the directory itself; "files" mode lists its immediate regular
+          // files (no recursion, no dotfiles filtering — the fixture owns
+          // what it plants there). A missing/unreadable directory reads as a
+          // cancelled pick (`refs: []`) rather than a 500.
+          const fakeDir = process.env.AGETOR_FAKE_PICK_REFS_DIR?.trim();
+          if (fakeDir) {
+            if (mode === "folder") {
+              return json({ refs: refsFromPaths([fakeDir]) }, { headers: corsHeaders(req) });
+            }
+            try {
+              const entries = readdirSync(fakeDir, { withFileTypes: true })
+                .filter((e) => e.isFile())
+                .sort((a, b) => a.name.localeCompare(b.name));
+              return json(
+                { refs: refsFromPaths(entries.map((e) => path.join(fakeDir, e.name))) },
+                { headers: corsHeaders(req) },
+              );
+            } catch {
+              return json({ refs: [] }, { headers: corsHeaders(req) }); // gone / unreadable — cancelled pick
+            }
+          }
           if (!native) return notAvailableHeadless(req);
           const paths = await native.openFileDialog({
             startingFolder,

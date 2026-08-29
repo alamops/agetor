@@ -6,7 +6,7 @@ import {
   Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
-import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
+import { api, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
@@ -47,7 +47,6 @@ import {
   type GitHubPullMergeability,
   type Run,
   type RunEvent,
-  type SavedPrompt,
   type Subagent,
   type SubagentEvent,
   type Task,
@@ -72,14 +71,9 @@ import { AttachmentChips } from "./AttachmentChips";
 import {
   ReferencesPicker,
   captureDroppedOrPastedItems,
-  dropHintMessage,
-  mergeRefs,
-  type CapturedItem,
 } from "./ReferencesPicker";
-import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
-import { SlashAutocomplete } from "./SlashAutocomplete";
+import { PromptComposer, usePromptCapture, useAgentCapabilities, useSavedPrompts } from "./PromptComposer";
 import { MessageHistoryPicker } from "./MessageHistoryPicker";
-import { ExtensionPicker } from "./ExtensionPicker";
 import { TerminalView } from "./TerminalView";
 import { deriveTodoProgress } from "@/lib/todo-progress";
 import { TodoProgressCard } from "./TodoProgressCard";
@@ -1524,7 +1518,11 @@ function RunPanelBody({
       if (e.key.toLowerCase() !== "f" || e.altKey) return;
       const wantsFind = IS_MAC_PLATFORM ? (e.metaKey && !e.ctrlKey) : e.ctrlKey;
       if (!wantsFind) return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      // Cmd/Ctrl+F isn't Escape, so a popover that only wants Escape yielded
+      // to it (marked `data-popover-keys="escape-only"` — SlashAutocomplete,
+      // ExtensionPicker) shouldn't block this shortcut too; excluding those
+      // keeps Cmd+F live while the `/` menu or Extensions popover is open.
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]:not([data-popover-keys="escape-only"])')) return;
       if ((e.target as Element | null)?.closest?.(".xterm")) return;
       e.preventDefault();
       if (searchOpen) {
@@ -1940,20 +1938,18 @@ function RunPanelBody({
   // long as the panel is mounted.
   const [gitStatus, setGitStatus] = useState<TaskGitStatus | null>(null);
   const [sendDragging, setSendDragging] = useState(false);
-  // `/`-command and skill autocomplete for the send field. Same list the
-  // New Task form uses — depends on (agent, workdir, branch) so a slash
-  // command available in this project shows up here too.
-  const [sendCommands, setSendCommands] = useState<AvailableCommand[]>([]);
-  // MCP / skill / plugin entries for the Extensions picker above the send box.
-  const [sendExtensions, setSendExtensions] = useState<AvailableExtension[]>([]);
-  // User-global saved prompts — not keyed on agent/workdir like the two lists
-  // above. Loaded once on mount; refetched when the Extensions popover opens
-  // so an edit made in Settings mid-session shows up.
-  const [savedPrompts, setSavedPrompts] = useState<SavedPrompt[]>([]);
-  const loadSavedPrompts = () => {
-    void api.listSavedPrompts().then(setSavedPrompts).catch(() => setSavedPrompts([]));
-  };
-  useEffect(() => { loadSavedPrompts(); }, []);
+  // `/`-command, skill autocomplete, and saved-prompts loading for the send
+  // field render through `PromptComposer`'s own `useAgentCapabilities`/
+  // `useSavedPrompts` hooks — the same ones NewTaskForm/
+  // CreateTaskFromIssueDialog/ResolveConflictsDialog go through, so this
+  // dock can't drift from those. RunPanel calls both hooks itself (near
+  // where `capture` is built below) and passes the results down via the
+  // composer's `capabilities`/`savedPrompts` props, rather than letting the
+  // composer's internal calls own them — the dock unmounts on every Main ↔
+  // subagent tab switch and the archived-without-canSend swap, and hoisting
+  // the hooks to this stable parent keeps their fetches (a disk walk of
+  // MCP/skills/plugins) alive across those remounts instead of refiring
+  // them every time.
   const sendRef = useRef<HTMLTextAreaElement>(null);
   // "Chat about it" affordance for a plan modal — same `requestAnimationFrame`
   // + focus idiom as `MessageHistoryPicker`'s insert-and-focus above. No
@@ -1986,27 +1982,6 @@ function RunPanelBody({
     },
     [input],
   );
-  useEffect(() => {
-    if (!task.workdir.trim()) { setSendCommands([]); setSendExtensions([]); return; }
-    let cancelled = false;
-    // Use the same (agent, workdir, branch) shape NewTaskForm uses so the
-    // discovery sources never disagree. We pick `task.branch` (the worktree's
-    // working branch, or null for isolation=none → falls back to repo HEAD on
-    // the backend) rather than `task.baseRef` (a pinned SHA used only for
-    // reproducibility) — discovery runs against the live branch context, not
-    // the historical base. Pass the harness id (task.agent) so aliased
-    // multi-account harnesses read their own per-harness config.
-    const branch = task.branch?.trim() || undefined;
-    api
-      .listAgentCapabilities({ agent: task.agent, workdir: task.workdir.trim(), branch })
-      .then(({ commands, extensions }) => {
-        if (cancelled) return;
-        setSendCommands(commands);
-        setSendExtensions(extensions);
-      })
-      .catch(() => { if (!cancelled) { setSendCommands([]); setSendExtensions([]); } });
-    return () => { cancelled = true; };
-  }, [task.agent, task.workdir, task.branch]);
 
   // Poll the task's git status every 5s for as long as the panel is
   // mounted, regardless of run status — with background agents, most of a
@@ -2505,24 +2480,35 @@ function RunPanelBody({
     }
   };
 
-  // Drag/drop + paste capture for the message textarea. Mirrors the
-  // NewTaskForm sidebar flow: pathful files come straight through, blob
-  // screenshots (macOS floating thumbnail, clipboard paste) get uploaded
-  // to `~/.agetor/screenshots/` first. Captured items land both as chips
-  // in `sendRefs` *and* as `[basename]` markers at the cursor.
-  const applySendCaptured = (items: CapturedItem[]) => {
-    if (!items.length) return;
-    setSendRefs((cur) => mergeRefs(cur, items.map((i) => i.ref)));
-    const marker = items.map((i) => `[${i.basename}]`).join(" ");
-    const selection = readCaret(sendRef.current);
-    let caret = 0;
-    setInput((cur) => {
-      const r = spliceAtSelection(cur, selection, marker);
-      caret = r.caret;
-      return r.next;
-    });
-    restoreCaret(sendRef.current, caret);
-  };
+  // Drag/drop + paste capture for the message textarea, via the module
+  // `NewTaskForm`/`CreateTaskFromIssueDialog`/`ResolveConflictsDialog` share
+  // through `PromptComposer` — pathful files come straight through, blob
+  // screenshots (macOS floating thumbnail, clipboard paste) get uploaded to
+  // `~/.agetor/screenshots/` first. Captured items land both as chips in
+  // `sendRefs` *and* as `[basename]` markers at the cursor. Built here
+  // (rather than left to `PromptComposer`'s own internal instance) because
+  // RunPanel owns an outer drop zone (the dock's `onDrop` below) that needs
+  // to share this exact drop-hint/caret path — same reason `NewTaskForm`
+  // builds its own instance for its aside-wide drop zone. `onReport` routes
+  // capture status messages into `sendHint` instead of the hook's own
+  // (otherwise-unused) internal `dropHint` state: `sendHint` is one shared
+  // status line written by nine call sites (send, backlog CRUD, commit &
+  // push, resolve conflicts) — a separate drop-only hint would let a stale
+  // send error and a fresh drop hint show on screen at once.
+  const capture = usePromptCapture({
+    textareaRef: sendRef,
+    setPrompt: setInput,
+    setReferences: setSendRefs,
+    onReport: setSendHint,
+  });
+  // Hoisted above the composer's own internal calls (passed down via
+  // `capabilities`/`savedPrompts` below) so the dock's Main ↔ subagent tab
+  // switches and the archived-without-canSend swap — which unmount and
+  // remount `<PromptComposer>` — don't refire the capabilities disk walk or
+  // the saved-prompts fetch on every round trip. See the comment above
+  // `sendRef`.
+  const capabilities = useAgentCapabilities(task.agent, task.workdir, task.branch ?? undefined);
+  const savedPromptsState = useSavedPrompts();
   const onSendDragOver = (e: React.DragEvent) => {
     if (!e.dataTransfer.types.includes("Files")) return;
     // Always preventDefault on a file dragover so WKWebView doesn't fall back
@@ -2537,18 +2523,6 @@ function RunPanelBody({
     if (!canSend) { setSendDragging(false); return; }
     if (e.currentTarget === e.target) setSendDragging(false);
   };
-  const reportSendCapture = (result: {
-    items: CapturedItem[];
-    skipped: number;
-    skippedFolders: number;
-    error?: string;
-  }) => {
-    setSendHint(dropHintMessage(result, {
-      partialFolder: "Attached the files — one folder couldn't be attached; use the folder picker.",
-      allFolder: "Couldn't attach the folder — use the folder picker instead.",
-      nothingToAttach: "Nothing to attach — drag a file from Finder, or paste a screenshot.",
-    }));
-  };
   const onSendDrop = async (e: React.DragEvent) => {
     // preventDefault unconditionally so a stray drop while !canSend doesn't
     // hand the file to WKWebView's native handler.
@@ -2557,19 +2531,7 @@ function RunPanelBody({
     if (!canSend) return;
     setSendHint(null);
     const result = await captureDroppedOrPastedItems(e.dataTransfer, { kind: "drop" });
-    reportSendCapture(result);
-    applySendCaptured(result.items);
-  };
-  const onSendPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const cd = e.clipboardData;
-    if (!cd) return;
-    const hasFile = Array.from(cd.items ?? []).some((it) => it.kind === "file");
-    if (!hasFile) return;
-    e.preventDefault();
-    setSendHint(null);
-    const result = await captureDroppedOrPastedItems(cd, { kind: "paste" });
-    reportSendCapture(result);
-    applySendCaptured(result.items);
+    capture.handleResult(result);
   };
 
   // Captured as a local const (not read via `task.prUrl` inline) so its
@@ -2999,49 +2961,40 @@ function RunPanelBody({
           onDragLeave={onSendDragLeave}
           onDrop={onSendDrop}
         >
-          {/* Always available: refs can be attached to a draft you're only
-              stashing, before the task has ever run. */}
-          <ReferencesPicker
-            variant="inline"
-            refs={sendRefs}
-            onChange={setSendRefs}
-            startingFolder={task.worktreePath ?? task.workdir}
-          />
-          {/* Archived-but-sendable: the task has a resumable run, so the
-              composer above is fully live — but sending here has a side
-              effect (auto-unarchive + worktree restore) that a non-archived
-              idle task doesn't have, so call it out inline rather than
-              silently. */}
-          {archived && (
-            <p className="text-[10px] text-muted-foreground">
-              Sending will unarchive this task and restore its worktree.
-            </p>
-          )}
-          {/* Shown once the task is sendable, OR as soon as there's something to
-              stash — that's what lets "Save for later" work pre-run. Also
-              shown whenever Resolve Conflicts is offerable (even disabled),
-              so an offerable-but-not-yet-sendable task doesn't have the
-              button pop in and out as the draft is typed. */}
-          {(canSend || input.trim() || sendRefs.length > 0 || showResolveConflicts) && (
-            // Picker on the left; "Save for later" / "Commit & push" pushed to
-            // the right so they aren't stacked directly on top of the picker.
-            <div className="flex items-center justify-between gap-2">
-              <ExtensionPicker
-                extensions={sendExtensions}
-                savedPrompts={savedPrompts}
-                onPromptsOpen={loadSavedPrompts}
-                value={input}
-                onChange={setInput}
-                textareaRef={sendRef}
-                placement="above"
-                // Deliberately mirrors MessageHistoryPicker's disabled
-                // condition below (not `!canSend`/`modalPending`) — composing
-                // is decoupled from sending, so the picker stays usable
-                // before the task's first run and while a native prompt is
-                // pending.
-                disabled={sending || backlogBusy}
-              />
-              <div className="flex items-center gap-2">
+          <PromptComposer
+            value={input}
+            onChange={setInput}
+            agent={task.agent}
+            workdir={task.workdir}
+            branch={task.branch ?? undefined}
+            references={sendRefs}
+            onReferencesChange={setSendRefs}
+            setReferences={setSendRefs}
+            textareaRef={sendRef}
+            capture={capture}
+            // Pass the hoisted results down (see the comment above
+            // `capabilities`'s declaration) so this dock's remounts don't
+            // refire the composer's own internal fetches.
+            capabilities={capabilities}
+            savedPrompts={savedPromptsState}
+            // The dock's own wrapper above already gives every child
+            // `space-y-1.5` (it used to be one flat list of siblings); both
+            // spacing props here flatten the composer's default two-tier
+            // (space-y-3 outer / space-y-1 inner) spacing back down to that
+            // same single value so nesting the composer doesn't change any
+            // gap.
+            className="space-y-1.5"
+            innerClassName="space-y-1.5"
+            placement="above"
+            label={null}
+            // Shown once the task is sendable, OR as soon as there's
+            // something to stash — that's what lets "Save for later" work
+            // pre-run. Also shown whenever Resolve Conflicts is offerable
+            // (even disabled), so an offerable-but-not-yet-sendable task
+            // doesn't have the button pop in and out as the draft is typed.
+            toolbar={Boolean(canSend || input.trim() || sendRefs.length > 0 || showResolveConflicts)}
+            actions={
+              <>
                 {/* Backlog mutations are frozen server-side while archived
                     (`backlogGuard`) — only Send (which auto-unarchives) is
                     offered on an archived task. */}
@@ -3131,82 +3084,25 @@ function RunPanelBody({
                     <GitMerge className="mr-1 size-3" /> {resolveConflictsSent ? "Sent to agent" : "Resolve Conflicts"}
                   </Button>
                 )}
-              </div>
-            </div>
-          )}
-          <div className="flex items-stretch gap-2">
-            <div className="relative flex-1">
-              <Textarea
-                ref={sendRef}
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onPaste={onSendPaste}
-                // Refetch saved prompts on focus (in addition to the
-                // popover-open refetch) so a deleted/edited prompt made in
-                // Settings mid-session doesn't linger in the `/` autocomplete
-                // indefinitely.
-                onFocus={loadSavedPrompts}
-                onKeyDown={(e) => {
-                  // Enter to send; Shift+Enter for a newline. SlashAutocomplete
-                  // attaches a native keydown listener that calls preventDefault
-                  // when it picks a suggestion — bail here so we don't *also*
-                  // send the message in the same keystroke. React fires the
-                  // synthetic handler even when the native default was
-                  // prevented; `defaultPrevented` is the discriminator.
-                  if (e.defaultPrevented) return;
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    // The field is typable in states we can't send from (before
-                    // the first run, or while a prompt is pending). Swallowing
-                    // Enter there would be a dead key, so it does the thing the
-                    // user means: stash the draft. `send()` guards both states
-                    // too, so this is the only place that decides.
-                    if (!canSend || modalPending) {
-                      // Archived tasks can't stash drafts (server freezes the
-                      // backlog) — swallow Enter instead of surfacing a 400.
-                      if (!archived) void saveForLater();
-                      return;
-                    }
-                    void send();
-                  }
-                }}
-                placeholder={
-                  modalPending
-                    ? "Answer the prompt above — or type a message and Save it for later."
-                    : canSend
-                    ? task.column === "running"
-                      ? "Agent is working — your message will be added to the current turn. Type / for commands."
-                      : task.column === "blocked"
-                        ? "Answer the question, or send any follow-up. Type / for commands."
-                        : "Send a message — resumes the conversation in a fresh session. Type / for commands."
-                    // `!canSend` covers two states: never run, and "ran but has
-                    // no resumable session" (a codex task whose run_id was
-                    // cleared — claude falls back to its newest run). Don't
-                    // claim "not running yet" in the latter.
-                    : runs.length > 0
-                      ? "No live session to send to — save this message for later, or re-run the task."
-                      : "Not running yet — type a message and Save it for later, ready to send once the task runs."
-                }
-                rows={2}
-                // Typing is allowed in every state the composer renders, even
-                // when we can't send: that's the point of "Save for later".
-                // Sending is gated separately — the Send button below plus the
-                // `canSend` / `modalPending` guards inside `send()` — so a
-                // keystroke can never leak into a live tmux modal.
-                disabled={sending || backlogBusy}
-                className="h-16 min-h-0 w-full resize-none text-xs pr-8"
-              />
-              <SlashAutocomplete
-                commands={sendCommands}
-                savedPrompts={savedPrompts}
-                value={input}
-                onChange={setInput}
-                textareaRef={sendRef}
-                // Send field is pinned to the bottom of the panel — anchor
-                // the popover above the textarea so it doesn't render below
-                // the visible window.
-                placement="above"
-              />
+              </>
+            }
+            // Archived-but-sendable: the task has a resumable run, so the
+            // composer is fully live — but sending here has a side effect
+            // (auto-unarchive + worktree restore) that a non-archived idle
+            // task doesn't have, so call it out inline rather than silently.
+            notice={
+              archived && (
+                <p className="text-[10px] text-muted-foreground">
+                  Sending will unarchive this task and restore its worktree.
+                </p>
+              )
+            }
+            // Always available: refs can be attached to a draft you're only
+            // stashing, before the task has ever run.
+            referencesVariant="inline"
+            referencesPosition="before"
+            startingFolder={task.worktreePath ?? task.workdir}
+            inputAdornment={
               <MessageHistoryPicker
                 taskId={task.id}
                 // Deliberately mirrors the textarea's own disabled condition
@@ -3232,30 +3128,89 @@ function RunPanelBody({
                 }}
                 className="absolute right-1.5 top-1.5 z-10"
               />
-            </div>
-            <Button
-              size="icon"
-              onClick={() => void send()}
-              disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
-              title={
-                // Distinguish "live session exists" from "needs resume" — not
-                // "turn in flight". `liveRunId` (task.runId) stays set while the
-                // tmux session is alive (including between turns) and is only
-                // null once the session is gone (orphan-reconciled), which is the
-                // resume path. Keying off `canControl` here would mislabel the
-                // common "session alive, no turn in flight" state as a resume.
-                liveRunId
-                  ? "Send to the live agent"
-                  : "Resume the conversation with this message"
+            }
+            trailing={
+              <Button
+                size="icon"
+                onClick={() => void send()}
+                disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
+                title={
+                  // Distinguish "live session exists" from "needs resume" — not
+                  // "turn in flight". `liveRunId` (task.runId) stays set while the
+                  // tmux session is alive (including between turns) and is only
+                  // null once the session is gone (orphan-reconciled), which is the
+                  // resume path. Keying off `canControl` here would mislabel the
+                  // common "session alive, no turn in flight" state as a resume.
+                  liveRunId
+                    ? "Send to the live agent"
+                    : "Resume the conversation with this message"
+                }
+                className="h-16 w-12 shrink-0"
+              >
+                <Send className="size-4" />
+              </Button>
+            }
+            rows={2}
+            textareaClassName="h-16 min-h-0 w-full resize-none text-xs pr-8"
+            textareaTestId="send-textarea"
+            placeholder={
+              modalPending
+                ? "Answer the prompt above — or type a message and Save it for later."
+                : canSend
+                ? task.column === "running"
+                  ? "Agent is working — your message will be added to the current turn. Type / for commands."
+                  : task.column === "blocked"
+                    ? "Answer the question, or send any follow-up. Type / for commands."
+                    : "Send a message — resumes the conversation in a fresh session. Type / for commands."
+                // `!canSend` covers two states: never run, and "ran but has
+                // no resumable session" (a codex task whose run_id was
+                // cleared — claude falls back to its newest run). Don't
+                // claim "not running yet" in the latter.
+                : runs.length > 0
+                  ? "No live session to send to — save this message for later, or re-run the task."
+                  : "Not running yet — type a message and Save it for later, ready to send once the task runs."
+            }
+            // Typing is allowed in every state the composer renders, even
+            // when we can't send: that's the point of "Save for later".
+            // Sending is gated separately — the Send button below plus the
+            // `canSend` / `modalPending` guards inside `send()` — so a
+            // keystroke can never leak into a live tmux modal. Note: the
+            // composer internally also disables its Extensions picker on
+            // `!workdir.trim()`, a condition this dock's old inline JSX
+            // never checked (`task.workdir` is required at task-create
+            // time, so it's always non-empty here) — a known, deliberate
+            // no-op delta from the migration, not a behavior change.
+            disabled={sending || backlogBusy}
+            onKeyDown={(e) => {
+              // Enter to send; Shift+Enter for a newline. SlashAutocomplete
+              // attaches a native keydown listener that calls preventDefault
+              // when it picks a suggestion — bail here so we don't *also*
+              // send the message in the same keystroke. React fires the
+              // synthetic handler even when the native default was
+              // prevented; `defaultPrevented` is the discriminator.
+              if (e.defaultPrevented) return;
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                // The field is typable in states we can't send from (before
+                // the first run, or while a prompt is pending). Swallowing
+                // Enter there would be a dead key, so it does the thing the
+                // user means: stash the draft. `send()` guards both states
+                // too, so this is the only place that decides.
+                if (!canSend || modalPending) {
+                  // Archived tasks can't stash drafts (server freezes the
+                  // backlog) — swallow Enter instead of surfacing a 400.
+                  if (!archived) void saveForLater();
+                  return;
+                }
+                void send();
               }
-              className="h-16 w-12 shrink-0"
-            >
-              <Send className="size-4" />
-            </Button>
-          </div>
-          {sendHint && (
-            <p className="mt-1 text-[10px] text-muted-foreground">{sendHint}</p>
-          )}
+            }}
+            hint={sendHint}
+            // Keeps this dock's hint paragraph's rendered class list
+            // byte-identical to before `hintClassName` existed on
+            // `PromptComposer` (see that prop's doc).
+            hintClassName="mt-1"
+          />
         </div>
       )}
       {/* Same gate as the composer dock above (`archived && !canSend` ? static
