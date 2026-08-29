@@ -57,6 +57,16 @@ export const credsFilePath = coreCredsPath(DATA_DIR);
 
 export const db = new Database(path.join(DATA_DIR, "agetor.sqlite"));
 db.exec("PRAGMA journal_mode = WAL;");
+// WAL + NORMAL is SQLite's documented sweet spot for a local single-writer
+// app. WAL already makes every transaction atomic and the database consistent
+// across an app crash AND a power loss; NORMAL merely stops forcing an fsync
+// at every commit (FULL — the default — does). That fsync was being paid on
+// every streamed `run_events` row and every unread-watermark bump: dozens of
+// disk flushes a minute while an agent works, buying durability for the last
+// few milliseconds of a log that is re-derivable from the agent's own JSONL.
+// A battery/CPU win with no correctness cost — the only thing NORMAL gives
+// up is that a kernel panic mid-stream may roll back the final commit(s).
+db.exec("PRAGMA synchronous = NORMAL;");
 db.exec("PRAGMA foreign_keys = ON;");
 
 const applied = migrate(db, migrations);

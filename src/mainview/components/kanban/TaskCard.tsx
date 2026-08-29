@@ -82,7 +82,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         "relative cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
         type.borderClass,
         isDragging && "opacity-50",
-        awaiting && "ring-2 ring-warning/60 ring-offset-2 ring-offset-background animate-awaiting-pulse motion-reduce:animate-none",
+        awaiting && "ring-2 ring-warning/60 ring-offset-2 ring-offset-background",
         archived && "cursor-default opacity-60",
       )}
       // `onClick` (open) stays untouched by the addition below — a
@@ -270,6 +270,21 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
           </Button>
         </div>
       </CardContent>
+      {/* The "waiting on you" glow. A separate overlay whose OPACITY pulses,
+          rather than animating `filter: drop-shadow` on the card itself:
+          filter animations re-rasterize the whole card on the CPU every
+          frame (60–120 Hz, for as long as the card is awaiting), whereas an
+          opacity animation is compositor-only. The shadow is static and
+          paints outside the overlay's box, so the overlay is invisible over
+          the card's own content and `pointer-events-none` keeps clicks and
+          drags untouched. */}
+      {awaiting && (
+        <span
+          aria-hidden
+          className="pointer-events-none absolute inset-0 rounded-[inherit] animate-awaiting-pulse motion-reduce:animate-none"
+          style={{ boxShadow: "0 0 14px hsl(var(--warning) / 0.85)" }}
+        />
+      )}
     </Card>
   );
 }

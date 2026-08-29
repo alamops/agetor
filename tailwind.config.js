@@ -78,16 +78,15 @@ export default {
         geist: ['"Geist Variable"', "ui-sans-serif", "system-ui", "sans-serif"],
       },
       keyframes: {
-        // Slower, calmer than tailwind's default `pulse` — used by TaskCard
-        // to indicate "this card is waiting on you" without feeling anxious.
-        // Pulses `filter: drop-shadow` rather than `box-shadow` so it stacks
-        // cleanly on top of Tailwind's `ring-*` utilities (which themselves
-        // compile to box-shadow and would otherwise be clobbered).
+        // Slower, calmer than tailwind's default `pulse` — used by TaskCard's
+        // awaiting-glow overlay to indicate "this card is waiting on you"
+        // without feeling anxious. Animates OPACITY only (compositor-friendly:
+        // no per-frame repaint) — the glow itself is a static box-shadow on a
+        // dedicated overlay element (see TaskCard), which is also what keeps
+        // it from clobbering Tailwind's `ring-*` box-shadow on the card.
         "awaiting-pulse": {
-          // Driven by --warning so the glow tracks the theme alongside the
-          // ring-warning it sits behind (amber-400 dark / amber-800 light).
-          "0%, 100%": { filter: "drop-shadow(0 0 6px hsl(var(--warning) / 0.55))" },
-          "50%":      { filter: "drop-shadow(0 0 14px hsl(var(--warning) / 0.85))" },
+          "0%, 100%": { opacity: "0.45" },
+          "50%":      { opacity: "1" },
         },
       },
       animation: {
