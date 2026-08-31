@@ -274,10 +274,22 @@ test.describe("@ file references", () => {
     const row = atRow(form, "README.md");
     await expect(row).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 
+    // ARIA combobox wiring: the textarea announces the open listbox and its
+    // active option; rows are real options.
+    await expect(textarea).toHaveAttribute("aria-expanded", "true");
+    const listbox = atPopover(form).getByRole("listbox");
+    await expect(listbox).toBeVisible();
+    const activeOption = atPopover(form).getByRole("option", { selected: true });
+    await expect(activeOption).toHaveCount(1);
+    const controls = await textarea.getAttribute("aria-controls");
+    expect(controls).toBe(await listbox.getAttribute("id"));
+    expect(await textarea.getAttribute("aria-activedescendant")).toBe(await activeOption.getAttribute("id"));
+
     await page.keyboard.press("Enter");
 
     await expect(textarea).toHaveValue("see @README.md ");
     await expect(atPopover(form)).toBeHidden();
+    await expect(textarea).toHaveAttribute("aria-expanded", "false");
     await expect(highlightMarks(form)).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
   });
 
