@@ -150,3 +150,7 @@ Assumptions logged (routine, reversible):
 - **Review** (opus, `code-review` skill): 3 major / 11 minor / 7 nit — all 21 applied in `a6980ca` (+ the wave-2 regression T4 caught in the full suite: the budget pre-check must not intercept prompts already over the cap, `e4faa41`).
 - **Verification:** `bun run typecheck` clean; `bun test` 4059 pass / 3 skip / 0 fail (205 files; baseline on the merged tree was 3934); Playwright `at-file-autocomplete` 9/9, `issue-task` 6/6, `resolve-conflicts` 1/1, `quote` 1/1 (17/17).
 - **Open:** owner smoke test of the highlight backdrop in the dev build (`bun run dev:hmr`, `~/.agetor-dev`) — Chromium-verified, WKWebView metrics not machine-verified. Two documented validity divergences (gitignored paths and paths past the 20k cap are expanded on send but not highlighted).
+
+## 11. Follow-up (2026-08-31)
+
+- Closed the "unresolved tokens fail silently" gap: `PromptComposer` now shows an inline `text-warning` line (`at-unresolved-warning`) while the draft holds `@` tokens that match no project file — listing verdict first, known `@name` extension mentions exempt, and for live scopes a 300 ms-debounced `POST /refs/resolve` stat rescues gitignored-but-present paths (which send-time expansion WILL resolve); suppressed while the listing is loading/failed/empty/truncated; advisory only, send behavior unchanged. Helpers `unresolvedAtTokens`/`isSafeClientRelPath` in `lib/at-highlight.ts` (+7 unit tests), e2e scenario 7 (spec now 10/10). Typecheck clean; `bun test src/mainview` 930/0.
