@@ -2559,18 +2559,8 @@ function RunPanelBody({
 
   return (
     <>
-      <header className="flex items-start justify-between gap-2 border-b border-border/60 p-3">
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-semibold">{task.title}</div>
-          <div className="truncate text-xs text-muted-foreground">
-            {task.agent} · {task.column}
-            {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
-            {task.baseRef && (
-              <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
-            )}
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
+      <header className="border-b border-border/60 p-3">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           {/* Lives in the header (not the composer chip row) so the link stays
               reachable on archived tasks and after orphan reconciliation
               clears the resumable run — pr_url is durable, the link must be
@@ -2580,20 +2570,22 @@ function RunPanelBody({
           {prUrl && (
             parsePullNumber(prUrl) != null ? (
               <Button
-                size="sm"
+                size="icon"
                 variant="outline"
                 onClick={() => onViewPullRequest({ projectPath: task.workdir, prUrl })}
                 title="Open the pull request created for this task"
+                aria-label="View PR"
               >
-                <GitPullRequest className="mr-1 size-3" /> View PR
+                <GitPullRequest className="size-4" />
               </Button>
             ) : (
               <ExternalLink
                 href={prUrl}
-                className={cn(buttonVariants({ variant: "outline", size: "sm" }), "no-underline hover:no-underline")}
+                className={cn(buttonVariants({ variant: "outline", size: "icon" }), "no-underline hover:no-underline")}
                 title="Open the pull request created for this task"
+                aria-label="View PR"
               >
-                <GitPullRequest className="mr-1 size-3" /> View PR
+                <GitPullRequest className="size-4" />
               </ExternalLink>
             )
           )}
@@ -2604,22 +2596,24 @@ function RunPanelBody({
           {issueUrl && (
             parseIssueUrl(issueUrl) != null ? (
               <Button
-                size="sm"
+                size="icon"
                 variant="outline"
                 onClick={() => onViewIssue({ projectPath: task.workdir, issueUrl })}
                 title="Open the issue this task was created from"
+                aria-label="View issue"
                 data-testid="view-issue"
               >
-                <CircleDot className="mr-1 size-3" /> View issue
+                <CircleDot className="size-4" />
               </Button>
             ) : (
               <ExternalLink
                 href={issueUrl}
-                className={cn(buttonVariants({ variant: "outline", size: "sm" }), "no-underline hover:no-underline")}
+                className={cn(buttonVariants({ variant: "outline", size: "icon" }), "no-underline hover:no-underline")}
                 title="Open the issue this task was created from"
+                aria-label="View issue"
                 data-testid="view-issue"
               >
-                <CircleDot className="mr-1 size-3" /> View issue
+                <CircleDot className="size-4" />
               </ExternalLink>
             )
           )}
@@ -2632,20 +2626,22 @@ function RunPanelBody({
               onClick={refreshPrStatus}
               disabled={prStatusLoading}
               title={prStatusError ?? "Re-check PR mergeability"}
+              aria-label="Re-check PR status"
             >
-              <RefreshCw className="size-3.5" />
+              <RefreshCw className="size-4" />
             </Button>
           )}
           <Button
-            size="sm"
+            size="icon"
             variant="outline"
             onClick={() => onShowDiff(task)}
             title="View this task's changes (git diff)"
+            aria-label="View diff"
           >
-            <GitCompare className="mr-1 size-3" /> Diff
+            <GitCompare className="size-4" />
           </Button>
           <Button
-            size="sm"
+            size="icon"
             variant="outline"
             onClick={() =>
               void api.openPath({
@@ -2658,36 +2654,39 @@ function RunPanelBody({
                 ? `Open the worktree in your file manager: ${task.worktreePath}`
                 : `Open the project workdir in your file manager: ${task.workdir}`
             }
+            aria-label="Open working folder"
           >
-            <FolderOpen className="mr-1 size-3" /> Open
+            <FolderOpen className="size-4" />
           </Button>
           {/* Stop targets the main run. Hide it while viewing a read-only
               background-agent tab so the control doesn't read as "stop this
               agent" — switch back to Main to stop the task. */}
           {!archived && canControl && activeStream === "main" && (
-            <Button size="sm" variant="destructive" onClick={stop}>
-              <Square className="mr-1 size-3" /> Stop
+            <Button size="icon" variant="destructive" onClick={stop} title="Stop" aria-label="Stop">
+              <Square className="size-4" />
             </Button>
           )}
           {!archived && (task.column === "done" || active) && (
             <Button
-              size="sm"
+              size="icon"
               variant="outline"
               onClick={() => onArchive(task)}
               title={active ? "Stop the running agent and archive task" : "Archive task"}
+              aria-label="Archive"
             >
-              <Archive className="mr-1 size-3" /> Archive
+              <Archive className="size-4" />
             </Button>
           )}
           {archived && (
-            <Button size="sm" variant="outline" onClick={() => onUnarchive(task)} title="Unarchive task">
-              <ArchiveRestore className="mr-1 size-3" /> Unarchive
+            <Button size="icon" variant="outline" onClick={() => onUnarchive(task)} title="Unarchive task" aria-label="Unarchive">
+              <ArchiveRestore className="size-4" />
             </Button>
           )}
           <Button
             size="icon"
             variant="ghost"
             title="Search messages"
+            aria-label="Search messages"
             onClick={() => {
               if (searchOpen) {
                 closeSearch();
@@ -2702,9 +2701,17 @@ function RunPanelBody({
           >
             <Search className="size-4" />
           </Button>
-          <Button size="icon" variant="ghost" onClick={onClose}>
+          <Button size="icon" variant="ghost" onClick={onClose} title="Close task details" aria-label="Close task details">
             <X className="size-4" />
           </Button>
+        </div>
+        <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
+        <div className="mt-0.5 truncate text-xs text-muted-foreground">
+          {task.agent} · {task.column}
+          {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
+          {task.baseRef && (
+            <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
+          )}
         </div>
       </header>
 
