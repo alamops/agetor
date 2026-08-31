@@ -11,6 +11,7 @@ import {
   existsInLiveScope,
   filterUnresolvedRefs,
   unresolvedWarningLine,
+  verifyTokensViaSearch,
   warnUnresolvedRefs,
 } from "../at-warn.ts";
 import { fileScopeForTask } from "../tui/at-complete.ts";
@@ -214,8 +215,8 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     // will actually run in (the same `fileScopeForTask` table `RunPanel` /
     // the TUI composer use, CLAUDE.md §12) and flag any `@`-token the user
     // typed that won't resolve there. Never blocks or fails the add; a
-    // listing that errored, came back empty, or got truncated can't prove a
-    // token unresolved, so it's skipped silently rather than false-warning.
+    // listing that errored or came back empty can't prove a token
+    // unresolved, so it's skipped silently rather than false-warning.
     // `restrictTo === ""` (an `--issue` add with no user-typed prompt) is
     // checked above before this branch even runs: every candidate token
     // would be filtered out anyway, so there's no reason to pay for the
@@ -223,7 +224,7 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     try {
       const scope = fileScopeForTask(task);
       const listing = await client.listProjectFiles(scope);
-      if (!listing.truncated && listing.files.length > 0) {
+      if (listing.files.length > 0) {
         const validPaths = new Set(buildFileEntries(listing.files).map((e) => e.path));
         let unresolvedTokens = unresolvedAtTokens(input.prompt, validPaths);
         if (scope.ref == null) {
@@ -233,10 +234,36 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
           // on disk, and send-time expansion will resolve it — must not warn.
           unresolvedTokens = unresolvedTokens.filter((t) => !existsInLiveScope(scope.dir, t.path));
         }
-        const rawUnresolved = unresolvedTokens.map((t) => t.raw);
-        if (rawUnresolved.length) {
+        if (listing.truncated) {
+          // A TRUNCATED listing (the 20k `MAX_PROJECT_FILES` cap — a
+          // monorepo) can't tell "not present" from "present but past the
+          // cap" apart, so a token missing from it isn't provably
+          // unresolved — unlike the untruncated branch below, which can
+          // warn on `unresolvedTokens` directly. Shrink to the candidates
+          // that would otherwise warn (extension mentions and non-user-typed
+          // tokens are exempt regardless of what a search would find, so
+          // there's no reason to spend a round-trip on them) and verify each
+          // one via the server's full-depth search before trusting it as
+          // missing (`verifyTokensViaSearch`, CLAUDE.md §12's webview
+          // parity). Only PROVEN-missing tokens warn.
           const extensionNames = await discoveredExtensionNames(client, task);
-          unresolvedRefsWarning = filterUnresolvedRefs(rawUnresolved, { extensionNames, restrictTo });
+          const candidateRaws = new Set(
+            filterUnresolvedRefs(
+              unresolvedTokens.map((t) => t.raw),
+              { extensionNames, restrictTo },
+            ),
+          );
+          const candidates = unresolvedTokens.filter((t) => candidateRaws.has(t.raw));
+          if (candidates.length) {
+            const missing = await verifyTokensViaSearch(client, scope, candidates);
+            unresolvedRefsWarning = missing.map((t) => t.raw);
+          }
+        } else {
+          const rawUnresolved = unresolvedTokens.map((t) => t.raw);
+          if (rawUnresolved.length) {
+            const extensionNames = await discoveredExtensionNames(client, task);
+            unresolvedRefsWarning = filterUnresolvedRefs(rawUnresolved, { extensionNames, restrictTo });
+          }
         }
       }
     } catch {

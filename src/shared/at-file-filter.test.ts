@@ -285,3 +285,25 @@ test("filters a 20k-entry listing within a tight per-keystroke budget", () => {
     expect(elapsed).toBeLessThan(hardCeilingMs);
   }
 });
+
+test("blank query over a 20k-entry listing stays O(n)-ish — no full sort of the whole listing", () => {
+  // Regression for the review finding that `sortListingOrder` used to
+  // `Array#sort` every entry (with `{entry, index}` wrapper allocation) just
+  // to keep the top `limit` (default 50) — measured ~2.5s at 315k real
+  // entries. A tight ceiling here catches a regression back to that
+  // O(n log n) shape without needing the full 315k fixture in the unit
+  // suite (see the standalone `bun -e` benchmark in the review response for
+  // the 315k-scale before/after numbers).
+  const entries = buildPerfFixture();
+  expect(entries.length).toBeGreaterThan(20_000);
+
+  const hardCeilingMs = 15;
+  const elapsed = medianMs(() => {
+    const result = filterFileEntries(entries, "", 50);
+    expect(result.length).toBe(50);
+  });
+  if (elapsed > 3) {
+    console.warn(`filterFileEntries(entries, "", 50) median ${elapsed.toFixed(2)}ms over the 20k fixture`);
+  }
+  expect(elapsed).toBeLessThan(hardCeilingMs);
+});

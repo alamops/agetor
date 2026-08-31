@@ -282,6 +282,42 @@ test("a stale remoteSearch answer for an old query is discarded once a newer que
   expect(after).toContain("newer-query-result.ts");
 });
 
+test("a null (errored) remoteSearch answer keeps the local rows instead of blanking the popover", async () => {
+  const remoteSearch = async (_q: string): Promise<{ path: string; isDirectory: boolean }[] | null> => null;
+  const { stdin, lastFrame } = render(
+    <Composer active label="→" fileEntries={fileEntries} remoteSearch={remoteSearch} onSubmit={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write("@RE");
+  await wait(300); // let the debounce fire and resolve to null
+  const frame = lastFrame() ?? "";
+  // The local `suggestAtEntries` rows (README.md matches "RE") are still
+  // shown — a `null` answer must never be treated as an authoritative
+  // "zero matches" that blanks the popover.
+  expect(frame).toContain("README.md");
+});
+
+test("remoteSearch is never invoked for a sub-2-char query (bare @ or a single char)", async () => {
+  let calls = 0;
+  const remoteSearch = async (_q: string) => {
+    calls++;
+    return [];
+  };
+  const { stdin } = render(
+    <Composer active label="→" fileEntries={fileEntries} remoteSearch={remoteSearch} onSubmit={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write("@"); // bare @, query length 0
+  await wait(300); // well past the debounce window
+  expect(calls).toBe(0);
+  stdin.write("R"); // query length 1
+  await wait(300);
+  expect(calls).toBe(0);
+  stdin.write("E"); // query length 2 — now it should fire
+  await wait(300);
+  expect(calls).toBe(1);
+});
+
 test("without remoteSearch, behavior is unchanged — only the local rows ever render", async () => {
   const { stdin, lastFrame } = render(
     <Composer active label="→" fileEntries={fileEntries} onSubmit={() => {}} onCancel={() => {}} />,

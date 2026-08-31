@@ -14,17 +14,28 @@ import { buildFileEntries, filterFileEntries, type FileEntry } from "../shared/a
 export { MAX_PROJECT_FILES };
 
 /**
- * Absolute bound on how many listing entries either mode of
- * `listProjectFiles` will scan out of a single `git` invocation's output.
- * Entries beyond this are dropped before any further processing.
+ * Absolute bound on how many listing entries q-mode will scan out of a
+ * single `git` invocation's output before building `FileEntry`s and ranking
+ * them. Entries beyond this are dropped before any further processing.
  *
- * No-q mode never surfaces this as `truncated` — it keeps its own,
- * pre-existing `MAX_PROJECT_FILES` display cap and semantics unchanged (this
- * bound is 12.5x larger, so it's a backstop against a pathological repo, not
- * something the existing 20k-cap flow is expected to hit). q-mode DOES
- * report this as `truncated`, since q-mode ranks over the *full* listing
- * (files + every derived directory prefix) rather than a capped slice of it,
- * and needs some bound on how much a single search can scan.
+ * This bound is q-mode-only: no-q mode feeds `rawListing`'s FULL (uncapped)
+ * output straight to `finalize`, which sorts the whole thing and THEN caps
+ * at the much smaller `MAX_PROJECT_FILES` (20k) display cap — exactly the
+ * behavior this app had before q-mode existed. Capping the raw, still
+ * git-emission-ordered listing at this (much larger) bound first — as an
+ * earlier version of this file did, applying it to both modes via a shared
+ * `rawListing` — was a latent ordering bug for no-q mode specifically: live
+ * mode's `ls-files --cached --others` emits untracked-then-tracked (each
+ * internally sorted, but not merged with each other), so a slice taken in
+ * that raw order, past ~230k untracked files, could silently drop tracked
+ * files the unmerged `finalize` sort would otherwise have surfaced in the
+ * 20k-file display window. q-mode has no such ordering hazard — it ranks
+ * the resulting `FileEntry`s by fuzzy score, not by scan position — so this
+ * bound stays load-bearing there: q-mode ranks over the *full* listing
+ * (files + every derived directory prefix) rather than a capped display
+ * slice, and needs some bound on how much a single search can scan. q-mode
+ * reports hitting this bound as `truncated`; no-q mode's `truncated` still
+ * means only "more than `MAX_PROJECT_FILES` files exist," as before.
  */
 export const MAX_SCANNED_FILES = 250_000;
 
@@ -107,7 +118,9 @@ function splitNulTerminated(out: string): string[] {
 /** Dedupe, sort with a plain code-unit comparison (locale-independent, so
  *  results are stable across machines/locales), and cap at
  *  `MAX_PROJECT_FILES`. Unchanged from before q-mode existed — no-q callers
- *  must see byte-for-byte identical behavior. */
+ *  must see byte-for-byte identical behavior: this always runs over the
+ *  FULL (uncapped) listing `rawListing` returns — `MAX_SCANNED_FILES` never
+ *  applies to the no-q path (see the comment on that constant). */
 function finalize(files: Iterable<string>): ProjectFilesResult {
   const sorted = Array.from(new Set(files)).sort((a, b) => (a < b ? -1 : 1));
   const truncated = sorted.length > MAX_PROJECT_FILES;
@@ -115,30 +128,31 @@ function finalize(files: Iterable<string>): ProjectFilesResult {
 }
 
 interface RawListing {
-  /** Deduped, unsorted paths straight off `git`'s output, capped at
-   *  `MAX_SCANNED_FILES`. */
+  /** Deduped, unsorted paths straight off `git`'s output — NOT capped at
+   *  `MAX_SCANNED_FILES`. That cap is applied separately (via `capScan`)
+   *  only on the q-mode path; see the comment on `MAX_SCANNED_FILES`. */
   files: string[];
-  /** Whether dedupe produced more than `MAX_SCANNED_FILES` entries (i.e. the
-   *  cap above actually dropped something). */
-  scanCapped: boolean;
 }
 
-/** Dedupe and cap at `MAX_SCANNED_FILES` — the shared first stage both
- *  `finalize` (no-q) and q-mode's ranking build on. */
-function capScan(files: Iterable<string>): RawListing {
-  const deduped = Array.from(new Set(files));
-  if (deduped.length > MAX_SCANNED_FILES) {
-    return { files: deduped.slice(0, MAX_SCANNED_FILES), scanCapped: true };
+/** Cap (already-deduped) `files` at `MAX_SCANNED_FILES` — q-mode's own
+ *  bound, applied on top of `rawListing`'s full output right before
+ *  `buildFileEntries`. Order doesn't matter for q-mode's own cap the way it
+ *  does for the no-q display cap (`finalize` sorts before slicing) — q-mode
+ *  ranks the resulting entries by score, not by scan order, so a slice in
+ *  git-emission order is fine here. */
+function capScan(files: string[]): { files: string[]; scanCapped: boolean } {
+  if (files.length > MAX_SCANNED_FILES) {
+    return { files: files.slice(0, MAX_SCANNED_FILES), scanCapped: true };
   }
-  return { files: deduped, scanCapped: false };
+  return { files, scanCapped: false };
 }
 
 /**
  * The shared git-listing core for both ref mode and live mode — factored out
  * of `listProjectFiles` so q-mode and no-q mode read the exact same tree
  * instead of two implementations that could drift. Returns the raw
- * (deduped, `MAX_SCANNED_FILES`-capped, NOT yet `MAX_PROJECT_FILES`-capped or
- * sorted) file list, or `{ error }`.
+ * (deduped, NOT capped or sorted) file list, or `{ error }`. Callers apply
+ * whatever cap/sort fits their mode (see `finalize` and `capScan`).
  */
 async function rawListing(dir: string, ref: string | null | undefined): Promise<RawListing | { error: string }> {
   if (ref) {
@@ -156,7 +170,7 @@ async function rawListing(dir: string, ref: string | null | undefined): Promise<
       res = await lsTree(`refs/remotes/origin/${ref}`);
     }
     if (!res.ok) return { error: `unknown ref: ${ref}` };
-    return capScan(splitNulTerminated(res.stdout));
+    return { files: Array.from(new Set(splitNulTerminated(res.stdout))) };
   }
 
   const [listed, deleted] = await Promise.all([
@@ -169,7 +183,40 @@ async function rawListing(dir: string, ref: string | null | undefined): Promise<
   // the agent can reference.
   const deletedSet = new Set(deleted.ok ? splitNulTerminated(deleted.stdout) : []);
   const files = splitNulTerminated(listed.stdout).filter((f) => !deletedSet.has(f));
-  return capScan(files);
+  return { files: Array.from(new Set(files)) };
+}
+
+/** Shared precondition checks for both q-mode and no-q mode: `dir` must be
+ *  an absolute path to an existing directory inside a git repo. Returns
+ *  `{ error }` on any failure, `null` when everything checks out. Never
+ *  throws. */
+async function validateScope(dir: string): Promise<{ error: string } | null> {
+  if (!path.isAbsolute(dir)) return { error: "dir must be an absolute path" };
+  let st;
+  try {
+    st = statSync(dir);
+  } catch {
+    return { error: "directory does not exist" };
+  }
+  if (!st.isDirectory()) return { error: "directory does not exist" };
+
+  const inside = await git(["rev-parse", "--is-inside-work-tree"], dir);
+  if (!inside.ok || inside.stdout.trim() !== "true") return { error: "not a git repository" };
+  return null;
+}
+
+/** Cheap existence check — used on a q-mode cache hit (see the TTL-cache hit
+ *  in `listProjectFiles`) so a warm cache can't paper over a `dir` that
+ *  vanished (e.g. a worktree deleted) while it was still within the TTL
+ *  window. Deliberately just an existence/directory check, not the full
+ *  `validateScope` (which also shells out to `git rev-parse`) — the whole
+ *  point of the cache hit path is to avoid that cost. */
+function dirStillExists(dir: string): boolean {
+  try {
+    return statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -183,12 +230,58 @@ interface QModeCacheEntry {
   scanCapped: boolean;
 }
 
-const Q_MODE_CACHE_TTL_MS = 3000;
+/** Default q-mode cache TTL. Overridable only via
+ *  `__setQModeCacheTtlForTest` (finding 6 — makes the TTL-cache test assert
+ *  cache *behavior* instead of racing wall-clock git speed against a fixed
+ *  window). */
+export const DEFAULT_Q_MODE_CACHE_TTL_MS = 3000;
+let qModeCacheTtlMs = DEFAULT_Q_MODE_CACHE_TTL_MS;
+
+/** Test-only: override the q-mode cache TTL (ms). There is no automatic
+ *  reset between tests — a caller that changes this must restore it (e.g. to
+ *  `DEFAULT_Q_MODE_CACHE_TTL_MS`) itself, typically in a `try/finally` or
+ *  `afterEach`. */
+export function __setQModeCacheTtlForTest(ms: number): void {
+  qModeCacheTtlMs = ms;
+}
+
+/** Upper bound on how many distinct `dir`+`ref` scopes `qModeCache` holds at
+ *  once. Each cached entry is a full `FileEntry[]` for the scope's listing —
+ *  unbounded in a large monorepo (tens of MB at 300k+ entries) — and absent
+ *  a cap would accumulate forever as a long-running session's composers
+ *  point at more scopes (different worktrees, different base-ref previews)
+ *  over time. Evicted FIFO (oldest inserted first) rather than true LRU:
+ *  the simplest thing that keeps memory bounded, which is enough since a
+ *  realistic session touches at most a handful of scopes at once anyway. */
+const MAX_CACHED_SCOPES = 4;
 
 /** Keyed on `dir` + `ref` (never on `q`/`limit` — those are re-ranked fresh
  *  every call against the cached listing). No-q mode never reads or writes
  *  this cache, so its behavior (and the tests pinning it) is untouched. */
 const qModeCache = new Map<string, QModeCacheEntry>();
+
+/**
+ * In-flight q-mode loads, keyed identically to `qModeCache` (finding 2). A
+ * cache miss registers its load promise here BEFORE awaiting anything, so N
+ * concurrent callers against the same (uncached) scope — e.g. several
+ * `PromptComposer` verification requests landing at once — share one
+ * `loadQModeEntry` run (one `git` spawn + one `buildFileEntries` pass)
+ * instead of each kicking off its own. Removed on settle (success or
+ * failure, via `finally`) so the next call after the load completes goes
+ * through the normal cache-check path rather than replaying a stale
+ * promise.
+ */
+const qModeInflight = new Map<string, Promise<QModeCacheEntry | { error: string }>>();
+
+/** Test-only: count of actual q-mode listing loads (`loadQModeEntry` calls —
+ *  cache misses that ran `git`, deduplicated by `qModeInflight`), regardless
+ *  of how many callers ended up sharing one load's result. Lets a test prove
+ *  single-flight behavior deterministically instead of racing a filesystem
+ *  write against the cache's TTL window. */
+let qModeListingRuns = 0;
+export function __getQModeListingRunsForTest(): number {
+  return qModeListingRuns;
+}
 
 function qModeCacheKey(dir: string, ref: string | null | undefined): string {
   return `${dir}\0${ref ?? ""}`;
@@ -196,9 +289,54 @@ function qModeCacheKey(dir: string, ref: string | null | undefined): string {
 
 /** Test-only: drop every cached q-mode listing so a test can force the next
  *  call to re-run `git` (or, conversely, prove a listing change is invisible
- *  until this is called and the TTL window is gone). */
+ *  until this is called and the TTL window is gone). Does not touch
+ *  in-flight loads or the run counter — a test resetting the cache mid-flight
+ *  isn't a scenario this app hits (loads are always awaited before the next
+ *  call starts). */
 export function __clearProjectFilesCacheForTest(): void {
   qModeCache.clear();
+}
+
+/** Drops expired entries, then evicts the oldest remaining ones (Map
+ *  iteration order = insertion order, so this is a plain FIFO) until at most
+ *  `MAX_CACHED_SCOPES - 1` remain. Called right before every insert so the
+ *  cache never holds more than `MAX_CACHED_SCOPES` scopes at once (finding
+ *  3), regardless of how many distinct dirs/refs a long-running session
+ *  ends up querying. */
+function pruneQModeCache(): void {
+  const now = Date.now();
+  for (const [key, entry] of qModeCache) {
+    if (now - entry.at >= qModeCacheTtlMs) qModeCache.delete(key);
+  }
+  while (qModeCache.size >= MAX_CACHED_SCOPES) {
+    const oldestKey: string | undefined = qModeCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    qModeCache.delete(oldestKey);
+  }
+}
+
+/** Validates `dir`, lists it (dedup, no display cap), caps at
+ *  `MAX_SCANNED_FILES`, and builds the `FileEntry[]` a q-mode call ranks
+ *  against. The single "did an actual git listing" unit both the
+ *  in-flight de-dup (finding 2) and the `__getQModeListingRunsForTest`
+ *  counter key off — every call increments the counter exactly once, no
+ *  matter how many concurrent `listProjectFiles` callers end up sharing its
+ *  result via `qModeInflight`. Never throws. */
+async function loadQModeEntry(
+  dir: string,
+  ref: string | null | undefined,
+): Promise<QModeCacheEntry | { error: string }> {
+  qModeListingRuns++;
+
+  const validationError = await validateScope(dir);
+  if (validationError) return validationError;
+
+  const raw = await rawListing(dir, ref);
+  if ("error" in raw) return raw;
+
+  const capped = capScan(raw.files);
+  const entries = buildFileEntries(capped.files);
+  return { entries, at: Date.now(), scanCapped: capped.scanCapped };
 }
 
 function clampLimit(limit: number | undefined): number {
@@ -220,45 +358,51 @@ function clampLimit(limit: number | undefined): number {
  * the full listing — files plus every derived directory prefix — via the
  * shared `filterFileEntries` scorer and returns up to `scope.limit` matches;
  * `truncated` then reports whether the internal `MAX_SCANNED_FILES` scan cap
- * was hit, not the `MAX_PROJECT_FILES` display cap. A fresh (<3s old)
- * q-mode listing for the same `dir`+`ref` is served from an in-memory cache
- * without spawning `git` again — see `qModeCache` above.
+ * was hit, not the `MAX_PROJECT_FILES` display cap. A fresh q-mode listing
+ * for the same `dir`+`ref` (within `qModeCacheTtlMs`, honest-checked against
+ * `dir` still existing) is served from an in-memory cache without spawning
+ * `git` again; concurrent misses against the same scope share one load
+ * instead of each spawning `git` — see `qModeCache`/`qModeInflight` above.
  */
 export async function listProjectFiles(scope: FileScope): Promise<ProjectFilesResult> {
   const { dir, ref } = scope;
   const qPresent = typeof scope.q === "string";
 
   if (qPresent) {
-    const cached = qModeCache.get(qModeCacheKey(dir, ref));
-    if (cached && Date.now() - cached.at < Q_MODE_CACHE_TTL_MS) {
-      const ranked = filterFileEntries(cached.entries, scope.q as string, clampLimit(scope.limit));
-      return { files: ranked.map((e) => e.path), truncated: cached.scanCapped };
+    const key = qModeCacheKey(dir, ref);
+    const cached = qModeCache.get(key);
+    if (cached && Date.now() - cached.at < qModeCacheTtlMs) {
+      // Finding 5: a cache hit must not paper over a `dir` that vanished
+      // (e.g. a worktree torn down) while the cache was still warm — that's
+      // cheap enough (one `statSync`) to check on every hit, unlike the full
+      // `validateScope` this path exists to avoid.
+      if (dirStillExists(dir)) {
+        const ranked = filterFileEntries(cached.entries, scope.q as string, clampLimit(scope.limit));
+        return { files: ranked.map((e) => e.path), truncated: cached.scanCapped };
+      }
+      qModeCache.delete(key);
     }
+
+    let pending = qModeInflight.get(key);
+    if (!pending) {
+      pending = loadQModeEntry(dir, ref).finally(() => qModeInflight.delete(key));
+      qModeInflight.set(key, pending);
+    }
+    const loaded = await pending;
+    if ("error" in loaded) return loaded;
+
+    pruneQModeCache();
+    qModeCache.set(key, loaded);
+    const ranked = filterFileEntries(loaded.entries, scope.q as string, clampLimit(scope.limit));
+    return { files: ranked.map((e) => e.path), truncated: loaded.scanCapped };
   }
 
-  if (!path.isAbsolute(dir)) return { error: "dir must be an absolute path" };
-  let st;
-  try {
-    st = statSync(dir);
-  } catch {
-    return { error: "directory does not exist" };
-  }
-  if (!st.isDirectory()) return { error: "directory does not exist" };
-
-  const inside = await git(["rev-parse", "--is-inside-work-tree"], dir);
-  if (!inside.ok || inside.stdout.trim() !== "true") return { error: "not a git repository" };
+  const validationError = await validateScope(dir);
+  if (validationError) return validationError;
 
   const raw = await rawListing(dir, ref);
   if ("error" in raw) return raw;
-
-  if (!qPresent) {
-    return finalize(raw.files);
-  }
-
-  const entries = buildFileEntries(raw.files);
-  qModeCache.set(qModeCacheKey(dir, ref), { entries, at: Date.now(), scanCapped: raw.scanCapped });
-  const ranked = filterFileEntries(entries, scope.q as string, clampLimit(scope.limit));
-  return { files: ranked.map((e) => e.path), truncated: raw.scanCapped };
+  return finalize(raw.files);
 }
 
 /**

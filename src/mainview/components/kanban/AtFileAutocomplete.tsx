@@ -72,17 +72,22 @@ function landCaret(el: HTMLTextAreaElement, caret: number, next: string) {
  * `AtHighlightBackdrop`).
  *
  * **Truncated-scope fallback**: when `truncated` and `fileScope` are both
- * given, an active slice also fires a debounced (150ms) server-side search
- * (`searchProjectFiles`) over the FULL listing, not just the capped `entries`
- * this component otherwise filters client-side. The remote result is tagged
- * with the exact `(scope, query)` it answers (`remoteResult`) so a response
- * that arrives after the user has moved on to a different query or scope is
- * never shown — `remoteRowsForCurrentQuery` re-validates the tag on every
- * render before trusting it. While a matching remote result exists it
+ * given and the active query is at least 2 chars (below that, the capped
+ * local `entries` already serve it fine and a full-listing server rank isn't
+ * worth the cost), an active slice also fires a debounced (150ms) server-side
+ * search (`searchProjectFiles`) over the FULL listing, not just the capped
+ * `entries` this component otherwise filters client-side. The remote result
+ * is tagged with the exact `(scope, query)` it answers (`remoteResult`) so a
+ * response that arrives after the user has moved on to a different query or
+ * scope is never shown — `remoteRowsForCurrentQuery` re-validates the tag on
+ * every render before trusting it. While a matching remote result exists it
  * REPLACES the displayed rows outright (`rows`); otherwise (no `fileScope`,
- * or the search hasn't resolved yet for the current query) the existing
- * instant client-filtered subset is shown, so the popover never goes blank
- * while a request is in flight.
+ * the query is too short, the search hasn't resolved yet for the current
+ * query, or the request FAILED — `searchProjectFiles` resolves `null` for a
+ * failure, which is never treated as an answer) the existing instant
+ * client-filtered subset is shown, so the popover never goes blank — or
+ * misreports a real search as "nothing found" — while a request is in flight
+ * or unavailable.
  */
 export function AtFileAutocomplete({ entries, truncated, value, onChange, textareaRef, placement = "below", fileScope }: Props) {
   const [caret, setCaret] = useState<number>(0);
@@ -134,7 +139,13 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
   const scopeKey = fileScope ? `${fileScope.dir}\0${fileScope.ref ?? ""}` : null;
   const [remoteResult, setRemoteResult] = useState<{ scopeKey: string; query: string; rows: FileEntry[] } | null>(null);
   useEffect(() => {
-    if (!truncated || !fileScope || !slice || !scopeKey) {
+    // A query under 2 chars (a bare `@`, or one typed char) isn't worth a
+    // full-listing server rank — it costs the same as any other q-mode
+    // request but the capped local `entries` already serve a 0-1 char query
+    // just fine (there's rarely a meaningful narrowing at that length
+    // anyway). The verification effect in `PromptComposer` is unaffected: its
+    // queries are always full token paths, never this short.
+    if (!truncated || !fileScope || !slice || !scopeKey || slice.query.length < 2) {
       setRemoteResult(null);
       return;
     }
@@ -149,6 +160,17 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
     const timer = setTimeout(() => {
       searchProjectFiles(scope, query, 50).then((rows) => {
         if (cancelled) return; // superseded by a newer slice/scope — drop it
+        // `null` means the REQUEST failed (see searchProjectFiles's doc), not
+        // that the server found nothing — never treat it as an answer. Leave
+        // `remoteResult` as whatever it already was so the existing
+        // client-filtered `filtered` rows keep showing instead of the
+        // popover going blank or (worse) looking confidently empty.
+        if (rows === null) return;
+        // A genuinely empty (but non-null) answer legitimately REPLACES the
+        // client-filtered rows: `filtered` is itself a subset of the same
+        // full listing the server just ranked, so an empty full-listing
+        // answer implies `filtered` would also be empty — trusting `[]` here
+        // can't hide a match the client-side filter already had.
         setRemoteResult({ scopeKey: answeredScopeKey, query, rows });
       });
     }, 150);
@@ -174,9 +196,16 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
 
   const open = slice !== null && !isDismissed && rows.length > 0;
 
-  // Reset highlight when the displayed list changes (avoid a stale index
-  // that points past the new list's length).
-  useEffect(() => { setActive(0); }, [slice?.query, rows.length]);
+  // Reset highlight when the displayed list changes. Keyed on the `rows`
+  // ARRAY ITSELF, not `rows.length` — remote rows replacing client-filtered
+  // rows of the same length (a common case: both are capped at 50) would
+  // otherwise leave a stale `active` index pointing at a different file than
+  // the one under the highlight, and Enter would commit the wrong row. Both
+  // candidate arrays (`filtered`, `remoteResult.rows`) are identity-stable
+  // between renders — they only change identity when their own inputs
+  // actually change — so this doesn't reset on every render, only on a real
+  // swap.
+  useEffect(() => { setActive(0); }, [slice?.query, rows]);
 
   // Keep the highlighted row scrolled into view.
   useEffect(() => {
@@ -309,7 +338,14 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
         {truncated && (
           remoteRowsForCurrentQuery !== null ? (
             <li className="px-3 py-1.5 text-[10px] text-muted-foreground/70">
-              Large repo — matches searched server-side over the full listing
+              {/* Deliberately not "over the full listing" — q-mode's own
+                  250k-file scan cap (`MAX_SCANNED_FILES` in
+                  project-files.ts) means an even-larger repo's search may
+                  itself be partial. That `truncated` flag on the q-mode
+                  response isn't plumbed up here; this copy is worded to stay
+                  true whether or not it was hit, rather than overclaiming
+                  coverage. */}
+              Large repo — matches searched server-side
             </li>
           ) : (
             <li className="px-3 py-1.5 text-[10px] text-muted-foreground">

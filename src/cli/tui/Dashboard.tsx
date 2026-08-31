@@ -167,12 +167,16 @@ export function Dashboard({
   const composeRemoteSearch = useMemo(() => {
     if (!composeTruncated || !composeScope) return undefined;
     const scope = composeScope;
-    return async (q: string): Promise<FileEntry[]> => {
+    return async (q: string): Promise<FileEntry[] | null> => {
       try {
         const { files } = await client.listProjectFiles({ ...scope, q, limit: 5 });
         return files.map((path) => ({ path, isDirectory: path.endsWith("/") }));
       } catch {
-        return [];
+        // `null`, not `[]` — a request failure must not be indistinguishable
+        // from a genuine "zero matches" answer, or Composer.tsx would treat
+        // it as authoritative and blank the popover's local rows on a
+        // transient network hiccup (review finding, commit 720dffd).
+        return null;
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

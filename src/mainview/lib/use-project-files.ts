@@ -75,7 +75,11 @@ function fetchEntry(scope: { dir: string; ref?: string | null }): Promise<FetchR
  * (no project/scope resolved yet) or a blank `dir` skips fetching entirely
  * and yields empty results. Refetches whenever `scope.dir`/`scope.ref`
  * changes; `refresh()` forces another fetch for the current scope (e.g. on
- * textarea focus, to pick up files the agent just created).
+ * textarea focus, to pick up files the agent just created) and also drops
+ * any cached `searchProjectFiles` answers for that scope (see
+ * `clearSearchCacheForScope`) — otherwise a truncated scope's remote search
+ * results could keep serving a stale answer for up to `SEARCH_CACHE_TTL_MS`
+ * after a run-settle refresh, defeating the point of forcing one.
  */
 export function useProjectFiles(scope: FileScope | null | undefined): {
   entries: FileEntry[];
@@ -149,7 +153,13 @@ export function useProjectFiles(scope: FileScope | null | undefined): {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope?.dir, scope?.ref, gen]);
 
-  const refresh = useCallback(() => setGen((g) => g + 1), []);
+  const refresh = useCallback(() => {
+    // Clear remote-search results for this scope FIRST, so a caller that
+    // awaits nothing (the common case — `refresh()` is fire-and-forget) can't
+    // observe a stale cached `searchProjectFiles` answer served in between.
+    if (scope?.dir) clearSearchCacheForScope({ dir: scope.dir, ref: scope.ref });
+    setGen((g) => g + 1);
+  }, [scope?.dir, scope?.ref]);
 
   const entries = useMemo(() => buildFileEntries(files), [files]);
   const validPaths = useMemo(() => new Set(entries.map((e) => e.path)), [entries]);
@@ -167,28 +177,64 @@ export function useProjectFiles(scope: FileScope | null | undefined): {
 // `PromptComposer` (highlight/warning verification of individual tokens).
 // ---------------------------------------------------------------------------
 
-/** Result cache for `searchProjectFiles`, keyed on scope + exact query text
- *  (unlike `cache` above, which is keyed on scope alone) — so backspacing
- *  through a query re-renders instantly from cache instead of re-fetching on
- *  every keystroke. Best-effort only: the server has its own 3s TTL on the
- *  underlying listing a query is ranked against, so a stale cache entry here
- *  is bounded by that, not indefinite. Capped at `SEARCH_CACHE_MAX` entries,
- *  evicting the oldest (first-inserted) key once full — a plain `Map`'s
- *  insertion-order iteration makes that a one-line `delete`, no LRU
- *  bookkeeping needed for what's just a keystroke-smoothing cache. */
+/** Result cache for `searchProjectFiles`, keyed on scope + `limit` + exact
+ *  query text (unlike `cache` above, which is keyed on scope alone) — so
+ *  backspacing through a query re-renders instantly from cache instead of
+ *  re-fetching on every keystroke. `limit` is part of the key because a
+ *  `limit: 20` verification answer (`PromptComposer`'s truncated-scope
+ *  per-token check) must never silently serve a `limit: 50` popover request
+ *  (`AtFileAutocomplete`) for the same query — the popover would render
+ *  fewer rows than it asked for. Each entry is stamped with `at: Date.now()`
+ *  and treated as a miss once older than `SEARCH_CACHE_TTL_MS`: this enforces
+ *  the same 3s TTL the server places on the underlying listing a query is
+ *  ranked against (`Q_MODE_CACHE_TTL_MS` in `project-files.ts`) — a prior
+ *  version of this comment claimed the server's own TTL alone bounded
+ *  staleness here, but an *unstamped* client cache entry never expires on
+ *  its own, so it would happily keep serving a 10-minute-old answer forever.
+ *  Also cleared per-scope by `clearSearchCacheForScope` (called from
+ *  `useProjectFiles`'s `refresh()`) so a forced refresh — e.g. the run-settle
+ *  `fileScopeRefreshToken` — doesn't have to wait out the TTL either. Capped
+ *  at `SEARCH_CACHE_MAX` entries, evicting the oldest (first-inserted) key
+ *  once full — a plain `Map`'s insertion-order iteration makes that a
+ *  one-line `delete`, no LRU bookkeeping needed for what's just a
+ *  keystroke-smoothing cache. */
 const SEARCH_CACHE_MAX = 200;
-const searchCache = new Map<string, FileEntry[]>();
+const SEARCH_CACHE_TTL_MS = 3000;
+const searchCache = new Map<string, { rows: FileEntry[]; at: number }>();
 
-function searchCacheKey(scope: FileScope, q: string): string {
-  return `${scope.dir}\0${scope.ref ?? ""}\0${q}`;
+function searchCacheKey(scope: FileScope, q: string, limit: number): string {
+  return `${scope.dir}\0${scope.ref ?? ""}\0${limit}\0${q}`;
 }
 
-function setSearchCacheEntry(key: string, value: FileEntry[]): void {
+/** Prefix shared by every `searchCacheKey` for `scope`, regardless of query
+ *  or limit — `dir`/`ref` come first in the key precisely so this prefix
+ *  match works. */
+function searchScopePrefix(scope: FileScope): string {
+  return `${scope.dir}\0${scope.ref ?? ""}\0`;
+}
+
+function setSearchCacheEntry(key: string, rows: FileEntry[]): void {
   if (searchCache.size >= SEARCH_CACHE_MAX && !searchCache.has(key)) {
     const oldestKey = searchCache.keys().next().value;
     if (oldestKey !== undefined) searchCache.delete(oldestKey);
   }
-  searchCache.set(key, value);
+  searchCache.set(key, { rows, at: Date.now() });
+}
+
+/**
+ * Drops every cached `searchProjectFiles` answer for `scope` — any query,
+ * any `limit`. Called from `useProjectFiles`'s `refresh()` so a forced
+ * refresh (textarea focus, the run-settle `fileScopeRefreshToken`) actually
+ * invalidates a truncated scope's remote search results too, not just the
+ * base listing `useProjectFiles` itself caches — restoring the mid-run
+ * freshness guarantee `fileScopeRefreshToken` provides for scopes under the
+ * cap to scopes past it as well.
+ */
+export function clearSearchCacheForScope(scope: FileScope): void {
+  const prefix = searchScopePrefix(scope);
+  for (const key of [...searchCache.keys()]) {
+    if (key.startsWith(prefix)) searchCache.delete(key);
+  }
 }
 
 // Scopes (dir+ref, via the existing `cacheKey`) already warned about after a
@@ -201,19 +247,34 @@ const searchWarnedScopes = new Set<string>();
  * Server-side ranked search over a scope's FULL file listing (`GET
  * /files/index?q=`), for use once `useProjectFiles` reports `truncated` —
  * the client-cached listing is capped at `MAX_PROJECT_FILES` and can't find
- * anything past it. Returns up to `limit` `FileEntry` rows (files plus
+ * anything past it. Resolves to up to `limit` `FileEntry` rows (files plus
  * derived directories, matching `buildFileEntries`'s shape — a directory
- * path ends with "/"). `null`/blank `scope.dir` and a failed request both
- * resolve to `[]`; a failure additionally `console.warn`s, at most once per
- * scope (see `searchWarnedScopes`) until a later call against that same
- * scope succeeds.
+ * path ends with "/") — including a genuinely empty `[]` when the server
+ * ranked the query and found nothing.
+ *
+ * Resolves to `null` — deliberately NOT `[]` — when the REQUEST itself
+ * failed (network error, non-2xx, a bad `ref`, …): `null` means "unknown,"
+ * `[]` means "the server looked and there's nothing." A caller that
+ * conflated the two would read a transient outage as proof a file doesn't
+ * exist — e.g. warning on an `@`-token that's actually fine, or silently
+ * dropping rows a popover already had. See the two call sites
+ * (`AtFileAutocomplete`'s remote-search effect, `PromptComposer`'s
+ * truncated-scope verification effect) for how each keeps the "unproven"
+ * state distinct from "confirmed missing."
+ *
+ * `null`/blank `scope.dir` resolves to `[]`, not `null` — there is no
+ * request in flight to have failed. A failure additionally `console.warn`s,
+ * at most once per scope (see `searchWarnedScopes`) until a later call
+ * against that same scope succeeds, and — unlike a success — is never
+ * written to `searchCache`: caching a transient failure would make it
+ * durably "not found" for up to `SEARCH_CACHE_TTL_MS`.
  */
-export async function searchProjectFiles(scope: FileScope, q: string, limit = 50): Promise<FileEntry[]> {
+export async function searchProjectFiles(scope: FileScope, q: string, limit = 50): Promise<FileEntry[] | null> {
   if (!scope || !scope.dir) return [];
   const scopeWarnKey = cacheKey(scope);
-  const resultKey = searchCacheKey(scope, q);
+  const resultKey = searchCacheKey(scope, q, limit);
   const cached = searchCache.get(resultKey);
-  if (cached) return cached;
+  if (cached && Date.now() - cached.at < SEARCH_CACHE_TTL_MS) return cached.rows;
   try {
     const { files } = await api.listProjectFiles({ dir: scope.dir, ref: scope.ref, q, limit });
     const entries: FileEntry[] = files.map((path) => ({ path, isDirectory: path.endsWith("/") }));
@@ -225,6 +286,6 @@ export async function searchProjectFiles(scope: FileScope, q: string, limit = 50
       searchWarnedScopes.add(scopeWarnKey);
       console.warn("[agetor] searchProjectFiles failed", e);
     }
-    return [];
+    return null;
   }
 }

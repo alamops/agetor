@@ -303,33 +303,118 @@ describe("listProjectFiles (q-mode)", () => {
   });
 
   test("the TTL cache serves a second q call without re-running git", async () => {
-    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    // Finding 6: TTL pinned artificially high so this test asserts CACHE
+    // BEHAVIOR (a fresh call within the window is served from the cache),
+    // not wall-clock git speed racing a fixed 3s window — the git add+commit
+    // below must finish inside whatever TTL is in effect, and a slow CI/dev
+    // machine shouldn't be able to flake this.
+    const { listProjectFiles, __clearProjectFilesCacheForTest, __setQModeCacheTtlForTest, DEFAULT_Q_MODE_CACHE_TTL_MS } =
+      await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    __setQModeCacheTtlForTest(60_000);
+    try {
+      const repo = await makeRepo();
+      writeFileSync(path.join(repo, "cached-file.txt"), "x\n");
+      await git(["add", "."], repo);
+      await git(["commit", "-m", "seed"], repo);
+
+      const first = await listProjectFiles({ dir: repo, q: "new-file" });
+      if ("error" in first) throw new Error(first.error);
+      expect(first.files).not.toContain("new-file.txt");
+
+      // A file added AFTER the first call, queried again within the TTL
+      // window, must not appear — the cached listing (not fresh git output)
+      // is what gets re-ranked.
+      writeFileSync(path.join(repo, "new-file.txt"), "x\n");
+      await git(["add", "."], repo);
+      await git(["commit", "-m", "add new file"], repo);
+
+      const stillCached = await listProjectFiles({ dir: repo, q: "new-file" });
+      if ("error" in stillCached) throw new Error(stillCached.error);
+      expect(stillCached.files).not.toContain("new-file.txt");
+
+      // Clearing the cache forces a fresh git listing on the next call.
+      __clearProjectFilesCacheForTest();
+      const fresh = await listProjectFiles({ dir: repo, q: "new-file" });
+      if ("error" in fresh) throw new Error(fresh.error);
+      expect(fresh.files).toContain("new-file.txt");
+    } finally {
+      __setQModeCacheTtlForTest(DEFAULT_Q_MODE_CACHE_TTL_MS);
+    }
+  });
+
+  test("concurrent q-mode misses against the same scope share one git listing (finding 2, single-flight)", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest, __getQModeListingRunsForTest } =
+      await import("./project-files.ts");
     __clearProjectFilesCacheForTest();
     const repo = await makeRepo();
-    writeFileSync(path.join(repo, "cached-file.txt"), "x\n");
+    writeFileSync(path.join(repo, "alpha.txt"), "x\n");
+    writeFileSync(path.join(repo, "beta.txt"), "x\n");
     await git(["add", "."], repo);
     await git(["commit", "-m", "seed"], repo);
 
-    const first = await listProjectFiles({ dir: repo, q: "new-file" });
-    if ("error" in first) throw new Error(first.error);
-    expect(first.files).not.toContain("new-file.txt");
+    const runsBefore = __getQModeListingRunsForTest();
+    const [a, b] = await Promise.all([
+      listProjectFiles({ dir: repo, q: "alpha" }),
+      listProjectFiles({ dir: repo, q: "beta" }),
+    ]);
+    const runsAfter = __getQModeListingRunsForTest();
 
-    // A file added AFTER the first call, queried again within the TTL
-    // window, must not appear — the cached listing (not fresh git output) is
-    // what gets re-ranked.
-    writeFileSync(path.join(repo, "new-file.txt"), "x\n");
-    await git(["add", "."], repo);
-    await git(["commit", "-m", "add new file"], repo);
+    if ("error" in a) throw new Error(a.error);
+    if ("error" in b) throw new Error(b.error);
+    expect(a.files).toContain("alpha.txt");
+    expect(b.files).toContain("beta.txt");
+    // Two concurrent misses against the identical (dir, ref) scope must have
+    // triggered exactly one actual git-backed listing load, not two.
+    expect(runsAfter - runsBefore).toBe(1);
+  });
 
-    const stillCached = await listProjectFiles({ dir: repo, q: "new-file" });
-    if ("error" in stillCached) throw new Error(stillCached.error);
-    expect(stillCached.files).not.toContain("new-file.txt");
-
-    // Clearing the cache forces a fresh git listing on the next call.
+  test("a q-mode cache hit for a scope whose dir has since vanished falls through to a failing validation, not a stale success (finding 5)", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
     __clearProjectFilesCacheForTest();
-    const fresh = await listProjectFiles({ dir: repo, q: "new-file" });
-    if ("error" in fresh) throw new Error(fresh.error);
-    expect(fresh.files).toContain("new-file.txt");
+    const repo = await makeRepo();
+    writeFileSync(path.join(repo, "alpha.txt"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "seed"], repo);
+
+    const warm = await listProjectFiles({ dir: repo, q: "alpha" });
+    if ("error" in warm) throw new Error(warm.error);
+    expect(warm.files).toContain("alpha.txt");
+
+    // Delete the repo entirely — well within the TTL window, this cache
+    // entry is still "fresh" by age alone, but the directory it names no
+    // longer exists.
+    rmSync(repo, { recursive: true, force: true });
+
+    const afterDelete = await listProjectFiles({ dir: repo, q: "alpha" });
+    expect("error" in afterDelete).toBe(true);
+  });
+
+  test("the cache never holds more than MAX_CACHED_SCOPES distinct scopes (finding 3, FIFO eviction)", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest, __getQModeListingRunsForTest } =
+      await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+
+    const repos: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const repo = await makeRepo();
+      writeFileSync(path.join(repo, `only-${i}.txt`), "x\n");
+      await git(["add", "."], repo);
+      await git(["commit", "-m", `seed ${i}`], repo);
+      repos.push(repo);
+      const res = await listProjectFiles({ dir: repo, q: `only-${i}` });
+      if ("error" in res) throw new Error(res.error);
+    }
+
+    // The cache caps at MAX_CACHED_SCOPES (4) scopes; with 5 distinct
+    // dirs queried in order, the first (oldest) must have been evicted —
+    // querying it again must trigger a fresh git-backed load rather than a
+    // cache hit.
+    const runsBefore = __getQModeListingRunsForTest();
+    const res = await listProjectFiles({ dir: repos[0]!, q: "only-0" });
+    if ("error" in res) throw new Error(res.error);
+    expect(res.files).toContain("only-0.txt");
+    expect(__getQModeListingRunsForTest()).toBe(runsBefore + 1);
   });
 });
 

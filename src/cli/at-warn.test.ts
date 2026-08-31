@@ -33,6 +33,7 @@ const {
   isSafeClientRelPath,
   existsInLiveScope,
   discoveredExtensionNames,
+  verifyTokensViaSearch,
 } = await import("./at-warn.ts");
 
 // ── filterUnresolvedRefs ─────────────────────────────────────────────────
@@ -266,4 +267,63 @@ test("discoveredExtensionNames: passes agent/workdir/branch through to agentDisc
 
   await discoveredExtensionNames(client, { agent: "codex", workdir: "/x", branch: "feature/y" });
   expect(calls).toEqual([["codex", "/x", "feature/y"]]);
+});
+
+// ── verifyTokensViaSearch ─────────────────────────────────────────────────
+
+test("verifyTokensViaSearch: a token the search finds is proven listed — not returned as missing", async () => {
+  const calls: Array<{ q?: string | null; limit?: number }> = [];
+  const client = {
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null; limit?: number }) => {
+      calls.push({ q: scope.q, limit: scope.limit });
+      return { files: ["src/bun/db.ts"], truncated: true };
+    },
+  } as unknown as AgetorClient;
+
+  const tokens = [{ raw: "@src/bun/db.ts", path: "src/bun/db.ts", isDirectory: false }];
+  const missing = await verifyTokensViaSearch(client, { dir: "/repo" }, tokens);
+  expect(missing).toEqual([]);
+  expect(calls).toEqual([{ q: "src/bun/db.ts", limit: 20 }]);
+});
+
+test("verifyTokensViaSearch: a token absent from the search result is returned as missing", async () => {
+  const client = {
+    listProjectFiles: async () => ({ files: [], truncated: true }),
+  } as unknown as AgetorClient;
+
+  const tokens = [{ raw: "@nope.md", path: "nope.md", isDirectory: false }];
+  const missing = await verifyTokensViaSearch(client, { dir: "/repo" }, tokens);
+  expect(missing).toEqual(tokens);
+});
+
+test("verifyTokensViaSearch: a throwing search request leaves that token unproven — never reported missing", async () => {
+  const client = {
+    listProjectFiles: async () => {
+      throw new Error("network down");
+    },
+  } as unknown as AgetorClient;
+
+  const tokens = [{ raw: "@nope.md", path: "nope.md", isDirectory: false }];
+  const missing = await verifyTokensViaSearch(client, { dir: "/repo" }, tokens);
+  expect(missing).toEqual([]);
+});
+
+test("verifyTokensViaSearch: caps at 8 candidates — a 9th token is never searched", async () => {
+  const queried: string[] = [];
+  const client = {
+    listProjectFiles: async (scope: { q?: string | null }) => {
+      queried.push(scope.q ?? "");
+      return { files: [], truncated: true };
+    },
+  } as unknown as AgetorClient;
+
+  const tokens = Array.from({ length: 9 }, (_, i) => ({
+    raw: `@f${i}.md`,
+    path: `f${i}.md`,
+    isDirectory: false,
+  }));
+  const missing = await verifyTokensViaSearch(client, { dir: "/repo" }, tokens);
+  expect(queried.length).toBe(8);
+  expect(missing.length).toBe(8);
+  expect(missing.some((t) => t.path === "f8.md")).toBe(false);
 });

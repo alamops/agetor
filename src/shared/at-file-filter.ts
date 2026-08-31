@@ -306,17 +306,40 @@ function depthOf(entry: FileEntry): number {
  *  first, directories before files at the same depth, otherwise stable
  *  (preserves the input's relative order — which for a buildFileEntries
  *  output is already alphabetical with directories immediately preceding
- *  their contents). */
+ *  their contents).
+ *
+ *  Bucketed by depth in one O(n) pass instead of a full `Array#sort` over
+ *  `{entry, index}` wrapper objects — at 315k entries (a real monorepo's
+ *  full listing, files + every derived directory prefix) the previous
+ *  O(n log n) comparator-based sort measured ~2.5s, all of it spent
+ *  re-ordering entries the blank-query caller keeps only the top `limit`
+ *  (default 50) of anyway. Two arrays per depth (directories, files) hold
+ *  entries in the order they were bucketed — since that's the input's own
+ *  relative order, concatenating dirs-then-files at each depth in ascending
+ *  depth order reproduces the exact same ordering the old sort produced,
+ *  without ever comparing two entries against each other. */
 function sortListingOrder(entries: FileEntry[]): FileEntry[] {
-  return entries
-    .map((entry, index) => ({ entry, index }))
-    .sort((a, b) => {
-      const depthDiff = depthOf(a.entry) - depthOf(b.entry);
-      if (depthDiff !== 0) return depthDiff;
-      if (a.entry.isDirectory !== b.entry.isDirectory) return a.entry.isDirectory ? -1 : 1;
-      return a.index - b.index;
-    })
-    .map((x) => x.entry);
+  const dirsByDepth: FileEntry[][] = [];
+  const filesByDepth: FileEntry[][] = [];
+  let maxDepth = -1;
+
+  for (const entry of entries) {
+    const depth = depthOf(entry);
+    if (depth > maxDepth) maxDepth = depth;
+    const buckets = entry.isDirectory ? dirsByDepth : filesByDepth;
+    const bucket = buckets[depth];
+    if (bucket) bucket.push(entry);
+    else buckets[depth] = [entry];
+  }
+
+  const result: FileEntry[] = [];
+  for (let depth = 0; depth <= maxDepth; depth++) {
+    const dirs = dirsByDepth[depth];
+    if (dirs) for (const entry of dirs) result.push(entry);
+    const files = filesByDepth[depth];
+    if (files) for (const entry of files) result.push(entry);
+  }
+  return result;
 }
 
 /** Whether `path` is a direct child of the directory `dirQuery` names

@@ -18,7 +18,7 @@ import { gotoApp } from "./helpers";
  *   - `AtFileAutocomplete`'s popover (see its "Truncated-scope fallback" doc
  *     comment) debounces a `searchProjectFiles` call so a past-the-cap file
  *     still autocompletes, with a "Large repo — matches searched server-side
- *     over the full listing" footer replacing the generic truncation notice.
+ *     footer replacing the generic truncation notice.
  *   - `PromptComposer`'s unresolved-`@`-reference warning (see its "Truncated-
  *     scope verification" block) individually verifies each unlisted token
  *     via the same search before ever warning on it — an unproven token never
@@ -163,7 +163,7 @@ test.describe("@ file references past the truncation cap", () => {
     const row = atRow(form, "src/zzz-target.ts");
     await expect(row).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await expect(
-      atPopover(form).getByText("Large repo — matches searched server-side over the full listing"),
+      atPopover(form).getByText("Large repo — matches searched server-side"),
     ).toBeVisible();
 
     await page.keyboard.press("Enter");

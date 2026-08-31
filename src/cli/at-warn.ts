@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { c, errln } from "./output.ts";
-import { findAtTokens } from "../shared/at-refs.ts";
+import { findAtTokens, isListedPath } from "../shared/at-refs.ts";
 import type { AgetorClient } from "./api-client.ts";
 import type { Task } from "../shared/types.ts";
 
@@ -115,6 +115,63 @@ export function existsInLiveScope(dir: string, tokenPath: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Cap on candidate tokens verified per `verifyTokensViaSearch` call —
+ *  mirrors the webview's `PromptComposer.tsx` truncated-scope verification
+ *  (same cap, same reasoning): a prompt with a pile of unresolved tokens
+ *  can't fan out into an unbounded number of round-trips. */
+const MAX_VERIFY_CANDIDATES = 8;
+
+/**
+ * For a TRUNCATED listing (the base `/files/index` fetch hit the 20k
+ * `MAX_PROJECT_FILES` cap — a monorepo), the capped listing can't tell "not
+ * present" from "present but past the cap" apart, so a token missing from it
+ * isn't provably unresolved. This verifies each candidate token individually
+ * against the server's full-depth search (`GET /files/index?q=`, the same
+ * route+params `PromptComposer.tsx`'s truncated-mode verification uses) and
+ * returns only the tokens PROVEN missing from the FULL listing.
+ *
+ * De-dupes candidates by their trailing-slash-stripped path, drops any that
+ * fail {@link isSafeClientRelPath} (mirrors the webview's `byKey` guard —
+ * there's nothing to usefully search for a `..`-escaping or absolute
+ * candidate), and caps at {@link MAX_VERIFY_CANDIDATES}. A search request
+ * that throws for a given token leaves that token UNPROVEN — it is never
+ * added to the returned "missing" list, since an over-cautious skip beats a
+ * false "won't resolve" warning caused by a transient network hiccup.
+ *
+ * Generic over `T` (rather than a fixed `{path, isDirectory}` shape) so a
+ * caller can pass its own token type (e.g. `AtToken`, which also carries
+ * `raw`) and get back the exact same objects for the ones proven missing —
+ * no need to re-correlate by path afterward.
+ */
+export async function verifyTokensViaSearch<T extends { path: string; isDirectory: boolean }>(
+  client: AgetorClient,
+  scope: { dir: string; ref?: string | null },
+  tokens: T[],
+): Promise<T[]> {
+  const byKey = new Map<string, T>();
+  for (const t of tokens) {
+    const key = t.path.replace(/\/+$/, "");
+    if (!isSafeClientRelPath(key) || byKey.has(key)) continue;
+    byKey.set(key, t);
+    if (byKey.size >= MAX_VERIFY_CANDIDATES) break;
+  }
+
+  const missing: T[] = [];
+  await Promise.all(
+    [...byKey.entries()].map(async ([key, token]) => {
+      let results: { files: string[] };
+      try {
+        results = await client.listProjectFiles({ ...scope, q: key, limit: 20 });
+      } catch {
+        return; // request failed — leave this token unproven, never warn.
+      }
+      const rowPaths = new Set(results.files);
+      if (!isListedPath(rowPaths, token.path, token.isDirectory)) missing.push(token);
+    }),
+  );
+  return missing;
 }
 
 /** `agentDiscovery`'s extension names, as the set `filterUnresolvedRefs`

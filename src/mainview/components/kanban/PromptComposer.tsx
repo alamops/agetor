@@ -648,6 +648,16 @@ export function PromptComposer({
   // stripped); `verifiedEntryPaths` separately keeps the exact matched
   // listing entry (slash intact for a directory) for the highlight
   // backdrop's `validPaths` union below.
+  //
+  // Deliberately runs on a LIVE truncated scope even for a token
+  // `existsOnDisk` (the `/refs/resolve` stat above) already cleared: that
+  // stat only feeds the WARNING oracle — it has no `validPaths`-shaped output
+  // and never touches `verifiedEntryPaths`/`highlightValidPaths` below. So a
+  // gitignored-but-present, past-the-cap file would stop being warned on
+  // (thanks to `existsOnDisk`) yet still render unhighlighted forever if this
+  // q-mode check were skipped whenever the on-disk stat already resolved it.
+  // Both oracles are independently load-bearing on a live truncated scope —
+  // this is not redundant double-checking.
   const [verifiedListed, setVerifiedListed] = useState<ReadonlySet<string>>(EMPTY_PATH_SET);
   const [verifiedEntryPaths, setVerifiedEntryPaths] = useState<ReadonlySet<string>>(EMPTY_PATH_SET);
   const [checkedMissing, setCheckedMissing] = useState<ReadonlySet<string>>(EMPTY_PATH_SET);
@@ -668,7 +678,15 @@ export function PromptComposer({
     const scope = fileScope!;
     // De-dupe by stripped path (a bare-typed and a slash-typed token for the
     // same path shouldn't cost two round-trips) and cap at 8 so a draft with
-    // a pile of unresolved tokens can't fan out unboundedly.
+    // a pile of unresolved tokens can't fan out unboundedly. Deliberate
+    // consequence: the 9th-and-later distinct unlisted token in a draft is
+    // never added to `byKey`, so it never gets a `searchProjectFiles` call at
+    // all — it stays permanently UNPROVEN for this render, exactly like a
+    // token whose lookup came back `null` (see below). It's never added to
+    // `checkedMissing` (never warned) and never to `verifiedEntryPaths`
+    // (never highlighted past the cap). A draft with more than 8 broken `@`
+    // refs is out of scope for this feature; the tokens within the cap still
+    // behave correctly.
     const byKey = new Map<string, { path: string; isDirectory: boolean }>();
     for (const t of unlistedTokens) {
       const key = t.path.replace(/\/+$/, "");
@@ -690,6 +708,13 @@ export function PromptComposer({
       await Promise.all([...byKey.entries()].map(async ([key, token]) => {
         const results = await searchProjectFiles(scope, key, 20);
         if (cancelled) return;
+        // `null` means the REQUEST failed (network/server error) — NOT that
+        // the server looked and found nothing (see `searchProjectFiles`'s
+        // doc). Skip this candidate entirely: it lands in neither `listed`
+        // nor `missing`, so it stays UNPROVEN — same fate as a token past the
+        // cap-8 cutoff above — rather than being misread as "confirmed
+        // missing" and warned on.
+        if (results === null) return;
         const rowPaths = new Set(results.map((r) => r.path));
         if (isListedPath(rowPaths, token.path, token.isDirectory)) {
           listed.add(key);

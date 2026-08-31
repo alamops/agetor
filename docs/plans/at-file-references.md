@@ -166,3 +166,10 @@ Assumptions logged (routine, reversible):
 ## 13. Follow-up (2026-08-31): run-settle listing refresh
 
 - `PromptComposer` gains `fileScopeRefreshToken?: unknown` — a change fires `projectFiles.refresh()` (ref-compared, never on mount). RunPanel passes `task.column`, so any run-settle/start transition re-lists the tree without blur/refocus; the TUI Dashboard's per-scope cache stores the column it was fetched under and refetches on mismatch (stale entries stay visible during the refetch). e2e: new RunPanel scenario proves a file written into the worktree after the focus-refetch appears in the open popover after a column change, with no focus events in between.
+
+## 14. Follow-up (2026-08-31): monorepo fallback past the 20k cap
+
+- `GET /files/index?q&limit`: full-listing ranked search (shared scorer, 250k q-mode scan cap, 3 s-TTL single-flight cache pruned+capped at 4 scopes, dir stat on hit); no-q mode sorts the full list before the 20k cap (fixes an untracked-then-tracked ordering hazard).
+- Truncated composers: popover falls back to server search (≥2-char queries, 150 ms debounce, request-failure = keep local rows); PromptComposer verifies ≤8 unlisted tokens via q-mode → highlight union + proven-missing-only warnings (unproven never warns); TUI `remoteSearch` and `agetor add`'s pre-check mirror the contract.
+- Review (opus, code-review skill): 4 high / 3 medium / 7 low — all applied (blank-query O(n) path + client gate, server single-flight, null-failure semantics, cache prune/cap, client search-cache TTL+limit key+refresh clear, active-row reset on row identity, footer reword, no-q sort-before-cap, TTL test seam, add.ts past-cap parity).
+- e2e: `at-file-truncated.spec.ts` — 20,050-file fixture (~2 s build), target past the cap: fallback popover + footer, past-cap highlight, proven-missing warning, below-cap regression; 15/15 with the main spec.

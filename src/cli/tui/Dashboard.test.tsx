@@ -386,13 +386,45 @@ test("a truncated listing wires the composer's remoteSearch, which is invoked wi
   await wait(90);
   stdin.write("m"); // enter compose — fires the truncated listProjectFiles fetch
   await wait(80);
-  stdin.write("@x");
+  // Two chars — `remoteSearch` never fires below `MIN_REMOTE_QUERY_LEN`
+  // (Composer.tsx), so this must clear that floor to exercise the wiring.
+  stdin.write("@xy");
   await wait(300); // let the composer's 200ms remoteSearch debounce fire
   const frame = lastFrame() ?? "";
   expect(seenQueries.length).toBeGreaterThan(0);
-  expect(seenQueries[0]!.q).toBe("x");
+  expect(seenQueries[0]!.q).toBe("xy");
   expect(seenQueries[0]!.limit).toBe(5);
   expect(frame).toContain("deep/remote-match.ts");
+  unmount();
+});
+
+test("a remote search failure keeps the local rows instead of blanking the popover", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null }) => {
+      if (scope.q !== undefined) throw new Error("network down");
+      // Initial (untruncated-signature) fetch on compose-open: report the
+      // listing itself as truncated so the composer switches to remote
+      // search, with a local match for "xy" so we can tell it survived.
+      return { files: ["deep/xylophone.ts"], truncated: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the truncated listProjectFiles fetch
+  await wait(80);
+  stdin.write("@xy");
+  await wait(300); // let the composer's 200ms remoteSearch debounce fire and reject
+  const frame = lastFrame() ?? "";
+  // A `null` answer (composeRemoteSearch's catch) must not blank the
+  // popover — the local suggestAtEntries row still renders.
+  expect(frame).toContain("deep/xylophone.ts");
   unmount();
 });
 

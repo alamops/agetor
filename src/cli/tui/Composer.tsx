@@ -21,6 +21,13 @@ const REMOTE_SEARCH_DEBOUNCE_MS = 200;
  *  caller's remoteSearch resolves with (mirrors at-complete.ts's own cap). */
 const MAX_REMOTE_SUGGESTIONS = 5;
 
+/** Shortest query `remoteSearch` is ever fired for — a bare `@` (empty
+ *  query) or a single character would force the server to rank the ENTIRE
+ *  listing to serve at most a handful of very loose matches, and the local
+ *  capped `suggestAtEntries` rows already serve a query this short just
+ *  fine. */
+const MIN_REMOTE_QUERY_LEN = 2;
+
 /**
  * A minimal single-line text input, hand-rolled on `useInput` (no extra dep).
  * Stays mounted across sends so you can fire several messages in a row; clears
@@ -50,10 +57,15 @@ export function Composer({
    *  truncated at the 20k cap (CLAUDE.md §12) — when given, an active `@`
    *  query is debounced and handed to this instead of relying solely on the
    *  capped `fileEntries` passed in above. Resolves with rows already
-   *  ranked/filtered for `q`; this component only caps the display count and
-   *  discards a stale (superseded-by-a-newer-query) answer. Omitting this
-   *  prop is a no-op — identical to before it existed. */
-  remoteSearch?: (q: string) => Promise<FileEntry[]>;
+   *  ranked/filtered for `q`, or `null` on a failed search — a `null`
+   *  leaves whatever's already showing untouched (the local
+   *  `suggestAtEntries` rows), so a transient failure can't blank the
+   *  popover; a genuine `[]` DOES replace them (every local match is
+   *  contained in the full listing, so an empty full-search answer means
+   *  there's truly nothing there). This component only caps the display
+   *  count and discards a stale (superseded-by-a-newer-query) answer.
+   *  Omitting this prop is a no-op — identical to before it existed. */
+  remoteSearch?: (q: string) => Promise<FileEntry[] | null>;
   onSubmit: (text: string) => void;
   onCancel: () => void;
 }) {
@@ -97,6 +109,9 @@ export function Composer({
     if (!remoteSearch || !suggestions || currentKey === null) return;
     const key = currentKey;
     const query = suggestions.slice.query;
+    // Don't fire a full-listing rank for a query this short — see
+    // `MIN_REMOTE_QUERY_LEN`'s doc.
+    if (query.length < MIN_REMOTE_QUERY_LEN) return;
     let alive = true;
     const timer = setTimeout(() => {
       void remoteSearch(query)
@@ -105,11 +120,18 @@ export function Composer({
           // query has since taken over (the ref is the live truth; `key` is
           // just what this particular request was asked to resolve).
           if (!alive || currentKeyRef.current !== key) return;
+          // `null` means the search errored — leave `remoteEntries` alone so
+          // the fallback below keeps showing the local `suggestAtEntries`
+          // rows instead of being blanked by a failure masquerading as
+          // "zero matches". A genuine `[]` DOES replace them (see the prop
+          // doc above).
+          if (entries === null) return;
           setRemoteEntries({ key, entries: entries.slice(0, MAX_REMOTE_SUGGESTIONS) });
         })
         .catch(() => {
-          // Best-effort: keep showing whatever's already on screen (the
-          // local `suggestAtEntries` rows via the fallback below).
+          // Defensive backstop only — the contract is that `remoteSearch`
+          // never rejects (a failure resolves to `null` instead). Keep
+          // showing whatever's already on screen if it does anyway.
         });
     }, REMOTE_SEARCH_DEBOUNCE_MS);
     return () => {
