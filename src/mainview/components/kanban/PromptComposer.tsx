@@ -803,6 +803,7 @@ export function PromptComposer({
         <AtFileAutocomplete
           entries={projectFiles.entries}
           truncated={projectFiles.truncated}
+          error={projectFiles.error}
           value={value}
           onChange={onChange}
           textareaRef={ref}

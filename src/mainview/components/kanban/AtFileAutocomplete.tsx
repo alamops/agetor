@@ -32,6 +32,14 @@ interface Props {
    *  rows over the capped `entries` only, with the "keep typing to narrow"
    *  footer. */
   fileScope?: FileScope | null;
+  /** The base listing's failure message (`useProjectFiles().error`). When an
+   *  `@` query is active and there are no entries to suggest, the popover
+   *  renders this as a non-interactive notice instead of silently never
+   *  opening — a failed listing (bad ref, server hiccup, non-git workdir)
+   *  must be distinguishable from "no matches" / an empty repo. Only Escape
+   *  is handled in that mode (dismiss); every other key — Enter included —
+   *  passes through untouched so typing/sending never changes behavior. */
+  error?: string | null;
 }
 
 type Slice = { start: number; end: number; query: string; quoted: boolean };
@@ -89,7 +97,7 @@ function landCaret(el: HTMLTextAreaElement, caret: number, next: string) {
  * misreports a real search as "nothing found" — while a request is in flight
  * or unavailable.
  */
-export function AtFileAutocomplete({ entries, truncated, value, onChange, textareaRef, placement = "below", fileScope }: Props) {
+export function AtFileAutocomplete({ entries, truncated, value, onChange, textareaRef, placement = "below", fileScope, error }: Props) {
   const [caret, setCaret] = useState<number>(0);
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLUListElement>(null);
@@ -195,6 +203,11 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
   const rows = remoteRowsForCurrentQuery ?? filtered;
 
   const open = slice !== null && !isDismissed && rows.length > 0;
+  // Error-notice mode: an active query, nothing to suggest, and the base
+  // listing failed — see the `error` prop's doc. `entries.length === 0`
+  // (not `rows`) is the load-bearing half: a stale error string next to a
+  // later-successful listing must never override real suggestions.
+  const errorOpen = slice !== null && !isDismissed && !open && entries.length === 0 && !!error;
 
   // Reset highlight when the displayed list changes. Keyed on the `rows`
   // ARRAY ITSELF, not `rows.length` — remote rows replacing client-filtered
@@ -266,6 +279,15 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
     const el = textareaRef.current;
     if (!el) return;
     const onKey = (e: KeyboardEvent) => {
+      // Error-notice mode handles ONLY Escape (dismiss) — everything else,
+      // Enter-to-send included, must behave as if no popover were up.
+      if (errorOpen) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          if (slice) setDismissedSlice(slice);
+        }
+        return;
+      }
       if (!open || rows.length === 0) return;
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -293,9 +315,9 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
     // `commit`/`descend` close over the current value/slice; rebinding on
     // those changes keeps the closure fresh without holding a stale snapshot.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, rows, active, value, slice?.start, slice?.end]);
+  }, [open, errorOpen, rows, active, value, slice?.start, slice?.end]);
 
-  if (!open) return null;
+  if (!open && !errorOpen) return null;
 
   return (
     <div
@@ -310,6 +332,13 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
         placement === "above" ? "bottom-full mb-1" : "top-full mt-1",
       )}
     >
+      {errorOpen && (
+        <p data-testid="at-file-error" className="px-3 py-2 text-[11px] text-warning">
+          Couldn't list this project's files — @ suggestions unavailable
+          {error ? <span className="block truncate text-[10px] text-muted-foreground">{error}</span> : null}
+        </p>
+      )}
+      {open && (
       <ul ref={listRef} className="py-1">
         {rows.map((entry, i) => {
           const Icon = iconForRef(entry);
@@ -354,6 +383,7 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
           )
         )}
       </ul>
+      )}
     </div>
   );
 }

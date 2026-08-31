@@ -781,6 +781,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
                 <AtFileAutocomplete
                   entries={projectFiles.entries}
                   truncated={projectFiles.truncated}
+                  error={projectFiles.error}
                   value={draft}
                   onChange={setDraft}
                   textareaRef={composerRef}

@@ -70,6 +70,7 @@ export function Dashboard({
   // `use-project-files.ts`. A fetch failure degrades to no suggestions rather
   // than blocking the composer.
   const [composeFileEntries, setComposeFileEntries] = useState<FileEntry[]>([]);
+  const [composeListingError, setComposeListingError] = useState<string | null>(null);
   // Whether the last fetch for the CURRENT scope hit the server's
   // `MAX_PROJECT_FILES` cap (CLAUDE.md §12's monorepo fallback) — when true,
   // the local `composeFileEntries` listing is known-incomplete, so the
@@ -113,6 +114,7 @@ export function Dashboard({
     // post-send/post-start "won't resolve" warning (see `getExtensionNames`
     // below) — independent of, and no slower than, the file listing fetch.
     void getExtensionNames(target);
+    setComposeListingError(null);
     const cached = fileEntriesCache.current.get(composeScopeKey);
     if (cached && cached.column === composeColumn) {
       setComposeFileEntries(cached.entries);
@@ -139,8 +141,11 @@ export function Dashboard({
         fileEntriesCache.current.set(composeScopeKey, { entries, column: columnAtFetch, truncated });
         setComposeFileEntries(entries);
         setComposeTruncated(truncated);
-      } catch {
-        // Best-effort: no suggestions this time, composer still usable.
+      } catch (e) {
+        // Best-effort: no suggestions this time, composer still usable — but
+        // tell it WHY, so an @ query renders a notice instead of silently
+        // never suggesting (a failed listing must not read as an empty repo).
+        if (alive) setComposeListingError((e as Error).message || "file listing unavailable");
       }
     })();
     return () => {
@@ -350,6 +355,7 @@ export function Dashboard({
           width={cols}
           label={`→ ${target.id.slice(0, 8)}`}
           fileEntries={composeFileEntries}
+          listingError={composeListingError}
           remoteSearch={composeRemoteSearch}
           onSubmit={(t) => sendMessage(target, t)}
           onCancel={() => setMode("nav")}

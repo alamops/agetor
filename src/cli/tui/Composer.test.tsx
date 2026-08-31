@@ -346,3 +346,32 @@ test("Esc dismisses, then typing past it and backspacing back to the same query 
   await wait();
   expect(lastFrame() ?? "").toContain("tab/enter accept"); // reopens, not stuck closed
 });
+
+test("listingError: an @ query with no entries shows the notice; Esc dismisses it, second Esc cancels", async () => {
+  let cancelled = false;
+  const { stdin, lastFrame, unmount } = render(
+    <Composer
+      active
+      label="→"
+      fileEntries={[]}
+      listingError="not a git repository"
+      onSubmit={() => {}}
+      onCancel={() => { cancelled = true; }}
+    />,
+  );
+  await wait();
+  stdin.write("@x");
+  await wait();
+  expect(lastFrame()).toContain("file listing unavailable");
+  expect(lastFrame()).toContain("not a git repository");
+
+  stdin.write(ESC); // dismisses the notice only
+  await wait();
+  expect(lastFrame()).not.toContain("file listing unavailable");
+  expect(cancelled).toBe(false);
+
+  stdin.write(ESC); // nothing shown → cancels compose
+  await wait();
+  expect(cancelled).toBe(true);
+  unmount();
+});

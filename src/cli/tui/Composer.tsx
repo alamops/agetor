@@ -46,6 +46,7 @@ export function Composer({
   width,
   fileEntries,
   remoteSearch,
+  listingError,
   onSubmit,
   onCancel,
 }: {
@@ -66,6 +67,12 @@ export function Composer({
    *  count and discards a stale (superseded-by-a-newer-query) answer.
    *  Omitting this prop is a no-op — identical to before it existed. */
   remoteSearch?: (q: string) => Promise<FileEntry[] | null>;
+  /** Why the file listing couldn't be fetched (Dashboard's compose-open
+   *  fetch failed). With an active `@` query and zero entries, the popover
+   *  area renders this as a dim notice instead of staying silent — a failed
+   *  listing must not read as "no matches". Escape dismisses it; every
+   *  other key behaves as if nothing were shown. */
+  listingError?: string | null;
   onSubmit: (text: string) => void;
   onCancel: () => void;
 }) {
@@ -152,6 +159,8 @@ export function Composer({
   const displayEntries = remoteEntriesForCurrentKey ?? (suggestions ? suggestions.entries : []);
 
   const open = suggestions !== null && displayEntries.length > 0 && currentKey !== dismissedKey;
+  const errorOpen = suggestions !== null && displayEntries.length === 0
+    && (fileEntries?.length ?? 0) === 0 && !!listingError && currentKey !== dismissedKey;
   const clampedSel = displayEntries.length > 0 ? Math.min(sel, displayEntries.length - 1) : 0;
 
   // Reset the highlighted row whenever the active query changes (new slice
@@ -176,6 +185,14 @@ export function Composer({
 
   useInput(
     (input, key) => {
+      if (errorOpen && suggestions) {
+        // Notice mode: only Escape (dismiss) is handled — typing/Enter must
+        // behave as if nothing were shown.
+        if (key.escape) {
+          setDismissedKey(currentKey);
+          return;
+        }
+      }
       if (open && suggestions) {
         if (key.tab || key.return) {
           const entry = displayEntries[clampedSel];
@@ -236,6 +253,13 @@ export function Composer({
           <Text color="cyan">▏</Text>
         </Text>
       </Box>
+      {errorOpen ? (
+        <Box paddingX={1} width={width}>
+          <Text color="yellow" dimColor wrap="truncate">
+            ⚠ file listing unavailable — @ suggestions off ({listingError})
+          </Text>
+        </Box>
+      ) : null}
       {open && suggestions ? (
         <Box flexDirection="column" paddingX={1} width={width}>
           {displayEntries.map((entry, i) => (

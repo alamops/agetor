@@ -3467,6 +3467,7 @@ function BacklogItemRow({
             <AtFileAutocomplete
               entries={projectFiles.entries}
               truncated={projectFiles.truncated}
+              error={projectFiles.error}
               value={draft}
               onChange={setDraft}
               textareaRef={editorRef}

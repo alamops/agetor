@@ -618,6 +618,45 @@ test.describe("@ file references", () => {
     await expect(dialog).toBeVisible();
   });
 
+  test("Failed listing surfaces in the popover: a non-git workdir shows the error notice, not silence", async ({ page, backend }) => {
+    test.setTimeout(60_000);
+    // A task whose isolated scope can never list: the workdir isn't a git
+    // repo, so GET /files/index 400s ("not a git repository") — previously
+    // indistinguishable in the UI from an empty repo.
+    const nonGit = await mkdtemp(path.join(tmpdir(), "agetor-nongit-"));
+    const title = `at-error ${Date.now()}`;
+    const created = await fetch(`${backend.apiBase}/tasks`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ title, prompt: "x", agent: "claude-code", workdir: nonGit, isolation: "worktree", column: "ready" }),
+    });
+    expect(created.ok).toBe(true);
+    const task = (await created.json()) as TaskRow;
+    createdTaskIds.push(task.id);
+
+    await gotoApp(page, backend.bootBase);
+    await taskCard(page, title).click();
+    const panel = runPanel(page);
+    const textarea = panel.getByTestId("send-textarea");
+    await expect(textarea).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    await textarea.click();
+    await page.keyboard.type("@x");
+    const notice = panel.getByTestId("at-file-error");
+    await expect(notice).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(notice).toContainText("Couldn't list this project's files");
+    // The unresolved warning stays suppressed on a failed listing — the
+    // notice is the one signal, never a bogus "won't resolve".
+    await expect(panel.getByTestId("at-unresolved-warning")).toBeHidden();
+
+    // Escape dismisses only the notice; the panel survives.
+    await page.keyboard.press("Escape");
+    await expect(notice).toBeHidden();
+    await expect(textarea).toBeVisible();
+
+    await rm(nonGit, { recursive: true, force: true });
+  });
+
   test("Issue dialog: @REA popover works inside it; Escape leaves the dialog open", async ({ page, backend }) => {
     test.setTimeout(60_000);
     await gotoApp(page, backend.bootBase);
