@@ -134,7 +134,7 @@ import type {
 import { WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
 import { appendReferences } from "../shared/refs.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
-import { expandAtReferences } from "./project-files.ts";
+import { expandAtReferencesDetailed } from "./project-files.ts";
 
 type Listener = (e: RunEvent) => void;
 const listeners = new Set<Listener>();
@@ -883,7 +883,9 @@ function spawnAgentOrFail(
   }
 }
 
-export async function startTask(taskId: string): Promise<{ runId: string } | { error: string }> {
+export async function startTask(
+  taskId: string,
+): Promise<{ runId: string; unresolvedRefs?: string[] } | { error: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
@@ -953,7 +955,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   // is left untouched in the DB, so editing the task or re-running it later
   // keeps the `@tokens` and re-resolves them against whatever cwd that next
   // run gets (a fresh worktree, a moved workdir, etc).
-  const expandedPrompt = expandAtReferences(task.prompt, prepared.cwd);
+  const { text: expandedPrompt, unresolved: unresolvedRefs } = expandAtReferencesDetailed(task.prompt, prepared.cwd);
   // Budget-check the fully expanded + reffed prompt against what the RAW
   // (pre-expansion) prompt would already have needed. Expansion can turn a
   // handful of short `@tokens` into long absolute paths and push a prompt
@@ -1077,7 +1079,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
 
   attachDoneHandler(runId, taskId, agent);
 
-  return { runId };
+  return { runId, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
 }
 
 /** Cheap pre-filter before doing the more expensive JSON-parse + DB query a
@@ -2165,9 +2167,16 @@ export function cancelRun(runId: string): boolean {
  * didn't reach the agent. A genuine tmux subprocess failure (not a modal
  * withhold) keeps this plain `{ delivered: false, reason }` shape with no
  * `withheld`/`savedToBacklog` flags.
+ *
+ * `unresolvedRefs` (delivered variant only, omitted when empty): the raw
+ * `@`-tokens (`token.raw` — e.g. `@nope.md`, `@"my file.md"`) the send-time
+ * expansion left verbatim because they didn't resolve against this task's
+ * cwd — a typo, a file not present in this cwd's tree, or an `@name`
+ * extension mention (`@github`) are all indistinguishable here; the server
+ * reports the fact, callers decide what's noise.
  */
 export type SendInputResult =
-  | { delivered: true; runId: string }
+  | { delivered: true; runId: string; unresolvedRefs?: string[] }
   | { delivered: false; reason: string; withheld?: true; savedToBacklog?: true };
 
 /**
@@ -2262,7 +2271,9 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   // match, producing a duplicate backlog entry every time the same message is
   // retried (R2, code review).
   const rawLine = line;
-  line = expandAtReferences(line, cwdTask.worktreePath ?? cwdTask.workdir);
+  const expanded = expandAtReferencesDetailed(line, cwdTask.worktreePath ?? cwdTask.workdir);
+  line = expanded.text;
+  const unresolvedRefs = expanded.unresolved;
 
   const harness = resolveHarness(row.agent);
   const kind = harness?.kind;
@@ -2304,30 +2315,30 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
       }
       return { delivered: false, reason: result.reason };
     }
-    return { delivered: true, runId: result.runId };
+    return { delivered: true, runId: result.runId, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
   }
   if (kind === "codex") {
     const result = sendCodexTurn(row.task_id, line);
     return result
-      ? { delivered: true, runId: result }
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : { delivered: false, reason: "internal: task lookup failed" };
   }
   if (kind === "cursor") {
     const result = sendCursorTurn(row.task_id, line);
     return result
-      ? { delivered: true, runId: result }
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : { delivered: false, reason: "internal: task lookup failed" };
   }
   if (kind === "gemini") {
     const result = sendGeminiTurn(row.task_id, line);
     return result
-      ? { delivered: true, runId: result }
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : { delivered: false, reason: "internal: task lookup failed" };
   }
   if (kind === "fx") {
     const result = sendFxTurn(row.task_id, line);
     return result
-      ? { delivered: true, runId: result }
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : { delivered: false, reason: "internal: task lookup failed" };
   }
   return { delivered: false, reason: `unknown agent kind for "${row.agent}"` };

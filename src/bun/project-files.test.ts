@@ -285,3 +285,41 @@ describe("expandAtReferences", () => {
     expect(expandAtReferences('see @"my notes/"', repo)).toBe(`see "${path.join(repo, "my notes")}/"`);
   });
 });
+
+// ---------------------------------------------------------------------------
+// expandAtReferencesDetailed
+// ---------------------------------------------------------------------------
+
+describe("expandAtReferencesDetailed", () => {
+  test("mixed resolve/miss: `text` matches expandAtReferences, `unresolved` lists only the misses, in document order", async () => {
+    const { expandAtReferencesDetailed, expandAtReferences } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    const prompt = "see @README and @nope.txt and @also-nope";
+    const result = expandAtReferencesDetailed(prompt, repo);
+    expect(result.text).toBe(expandAtReferences(prompt, repo));
+    expect(result.text).toBe(`see ${path.join(repo, "README")} and @nope.txt and @also-nope`);
+    expect(result.unresolved).toEqual(["@nope.txt", "@also-nope"]);
+  });
+
+  test("an unresolved quoted token is reported with its raw quoted form intact", async () => {
+    const { expandAtReferencesDetailed } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    const result = expandAtReferencesDetailed('see @"my missing file.md" now', repo);
+    expect(result.text).toBe('see @"my missing file.md" now');
+    expect(result.unresolved).toEqual(['@"my missing file.md"']);
+  });
+
+  test("a repeated unresolved token is deduped to a single entry", async () => {
+    const { expandAtReferencesDetailed } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    const result = expandAtReferencesDetailed("@nope.txt and again @nope.txt", repo);
+    expect(result.unresolved).toEqual(["@nope.txt"]);
+  });
+
+  test("a fully-resolving prompt reports an empty (not omitted) unresolved array", async () => {
+    const { expandAtReferencesDetailed } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    const result = expandAtReferencesDetailed("see @README", repo);
+    expect(result.unresolved).toEqual([]);
+  });
+});

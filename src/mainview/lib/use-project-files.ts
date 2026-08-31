@@ -7,7 +7,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
-import { buildFileEntries, type FileEntry } from "./at-file-filter";
+import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
 
 /** The project scope a listing is fetched against — mirrors `GET
  *  /files/index`'s two query params. `ref` given selects the `git ls-tree`

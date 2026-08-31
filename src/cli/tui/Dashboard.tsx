@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task, RunEvent } from "../../shared/types.ts";
@@ -11,6 +11,8 @@ import { Composer } from "./Composer.tsx";
 import { AnswerOverlay } from "./AnswerOverlay.tsx";
 import { runControl, resumableRunId } from "../run-logic.ts";
 import { Logo } from "./logo.tsx";
+import { fileScopeForTask } from "./at-complete.ts";
+import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
 
 type Mode = "nav" | "compose" | "answer";
 
@@ -58,6 +60,43 @@ export function Dashboard({
   const anyRunning = useMemo(() => sorted.some((t) => t.column === "running"), [sorted]);
   const frame = useSpinner(anyRunning);
 
+  // `@` file-reference listing for the composer's popover — see at-complete.ts
+  // and CLAUDE.md §12. Fetched once per task id (not on every 1.5s board
+  // poll) and cached in a ref so reopening the composer for the same task is
+  // instant; a fetch failure degrades to no suggestions rather than blocking
+  // the composer.
+  const [composeFileEntries, setComposeFileEntries] = useState<FileEntry[]>([]);
+  const fileEntriesCache = useRef<Map<string, FileEntry[]>>(new Map());
+  useEffect(() => {
+    if (mode !== "compose" || !targetId) return;
+    const cached = fileEntriesCache.current.get(targetId);
+    if (cached) {
+      setComposeFileEntries(cached);
+      return;
+    }
+    const composeTask = sorted.find((t) => t.id === targetId);
+    if (!composeTask) return;
+    let alive = true;
+    setComposeFileEntries([]); // no stale suggestions from a previous task while this loads
+    void (async () => {
+      try {
+        const { files } = await client.listProjectFiles(fileScopeForTask(composeTask));
+        if (!alive) return;
+        const entries = buildFileEntries(files);
+        fileEntriesCache.current.set(targetId, entries);
+        setComposeFileEntries(entries);
+      } catch {
+        // Best-effort: no suggestions this time, composer still usable.
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+    // `sorted` changes every 1.5s poll and must NOT retrigger this fetch —
+    // only a compose-mode open for a (possibly different) task should.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, targetId, client]);
+
   const sendMessage = (task: Task, text: string, okLabel = "→ sent") => {
     if (task.pendingInteractionCount > 0) {
       setStatus("answer the pending question first (g)");
@@ -74,7 +113,25 @@ export function Dashboard({
           return;
         }
         const res = await client.sendInput(runId, text);
-        setStatus(res.delivered === false ? `! ${res.reason ?? "not delivered"}` : okLabel);
+        if (res.delivered === false) {
+          setStatus(`! ${res.reason ?? "not delivered"}`);
+        } else if (res.unresolvedRefs?.length) {
+          // Surface the send-time expansion's leftovers inline — no
+          // discovery/filtering here (that's the popover's job while
+          // composing); this is just a transient one-line heads-up after
+          // the message is already gone, mirroring the webview's
+          // "won't resolve" warning at send time.
+          const n = res.unresolvedRefs.length;
+          const preview = res.unresolvedRefs.slice(0, 2).join(", ");
+          setStatus(
+            truncate(
+              `${okLabel} · ⚠ ${n} @ ref${n === 1 ? "" : "s"} won't resolve: ${preview}`,
+              120,
+            ),
+          );
+        } else {
+          setStatus(okLabel);
+        }
       } catch (e) {
         setStatus(`! ${(e as Error).message}`);
       }
@@ -192,6 +249,7 @@ export function Dashboard({
           active
           width={cols}
           label={`→ ${target.id.slice(0, 8)}`}
+          fileEntries={composeFileEntries}
           onSubmit={(t) => sendMessage(target, t)}
           onCancel={() => setMode("nav")}
         />

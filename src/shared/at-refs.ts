@@ -208,23 +208,60 @@ export function findActiveAtQuery(
  * Expand every `@`-token in `text` via `resolve(path, isDirectory)`. A
  * non-null return replaces the token's `raw` text in place; a null return
  * leaves that token untouched (e.g. an unresolvable path — the user still
- * sees what they typed). Processes right to left so earlier tokens' indices
- * stay valid as later replacements change the string's length. Text with no
- * `@` at all is returned as the same string instance (fast path).
+ * sees what they typed) and, when `onUnresolved` is given, invokes it with
+ * that token (in document order — `resolve` itself is also called in
+ * document order; only the actual string splicing happens right-to-left so
+ * earlier tokens' indices stay valid as later replacements change the
+ * string's length). Text with no `@` at all is returned as the same string
+ * instance (fast path).
  */
 export function expandAtTokens(
   text: string,
   resolve: (path: string, isDirectory: boolean) => string | null,
+  onUnresolved?: (token: AtToken) => void,
 ): string {
   if (!text.includes("@")) return text;
 
   const tokens = findAtTokens(text);
-  let result = text;
-  for (let k = tokens.length - 1; k >= 0; k--) {
+  const replacements: (string | null)[] = new Array(tokens.length);
+  for (let k = 0; k < tokens.length; k++) {
     const token = tokens[k]!;
     const replacement = resolve(token.path, token.isDirectory);
+    replacements[k] = replacement;
+    if (replacement === null) onUnresolved?.(token);
+  }
+
+  let result = text;
+  for (let k = tokens.length - 1; k >= 0; k--) {
+    const replacement = replacements[k]!;
     if (replacement === null) continue;
+    const token = tokens[k]!;
     result = result.slice(0, token.start) + replacement + result.slice(token.end);
   }
   return result;
+}
+
+/**
+ * Whether `path` counts as "listed" for highlight purposes: an exact hit in
+ * `validPaths`, or — when the token itself wasn't typed as a directory (no
+ * trailing "/") — the same path with a trailing "/" appended. This is what
+ * lets a hand-typed `@src/bun` highlight when `src/bun/` is a listed
+ * directory (every directory entry `buildFileEntries` produces carries the
+ * trailing slash, but a user typing a token by hand has no reason to know
+ * that). A token already typed *with* a trailing slash (`isDirectory:
+ * true`) must match `validPaths` on its own — appending a second slash would
+ * never hit.
+ */
+export function isListedPath(validPaths: Set<string>, path: string, isDirectory: boolean): boolean {
+  return validPaths.has(path) || (!isDirectory && validPaths.has(`${path}/`));
+}
+
+/** Tokens in `text` that do NOT pass {@link isListedPath} against
+ *  `validPaths` — the candidate set for the composer's "won't resolve"
+ *  warning. This helper only knows the listing oracle; the caller layers its
+ *  own exemptions on top (known `@name` extension mentions, the live-scope
+ *  on-disk stat check for gitignored-but-present files). */
+export function unresolvedAtTokens(text: string, validPaths: Set<string>): AtToken[] {
+  if (!text.includes("@")) return [];
+  return findAtTokens(text).filter((t) => !isListedPath(validPaths, t.path, t.isDirectory));
 }

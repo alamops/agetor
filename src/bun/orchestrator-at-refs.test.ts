@@ -107,6 +107,10 @@ test("startTask (claude, worktree isolation) expands @tokens to the worktree's a
   if ("error" in started) throw new Error(started.error);
   await settle(600); // worktree materialization (`git worktree add`) + the fake driver's ~20ms resolve
 
+  // Unresolvable tokens are also reported back structurally, in document
+  // order, deduped — not just left verbatim in the transcript text below.
+  expect(started.unresolvedRefs).toEqual(["@nope.txt", "@github"]);
+
   const updated = tasks.get(taskId);
   expect(updated?.worktreePath).toBeTruthy();
   const wt = updated!.worktreePath!;
@@ -145,6 +149,10 @@ test("startTask (claude, isolation none) expands @tokens to <workdir>-rooted abs
   const started = await startTask(taskId);
   if ("error" in started) throw new Error(started.error);
   await settle();
+
+  // A fully-resolving prompt gets no `unresolvedRefs` key at all — omitted,
+  // not an empty array, when there's nothing to report.
+  expect("unresolvedRefs" in started).toBe(false);
 
   const updated = tasks.get(taskId);
   expect(updated?.worktreePath ?? null).toBeNull();
@@ -185,10 +193,18 @@ test("sendInput (claude follow-up) expands @tokens against the task's live cwd (
 
   const sent = await sendInput(started.runId, "now @src/app.ts");
   expect(sent.delivered).toBe(true);
+  // Fully-resolving follow-up: no `unresolvedRefs` key.
+  if (sent.delivered) expect(sent.unresolvedRefs).toBeUndefined();
   await settle(300);
 
   const text = transcriptText(runs.eventsForTask(taskId));
   expect(text).toContain(`${wt}/src/app.ts`);
+
+  // A follow-up with a typo reports it back, deduped, in document order.
+  const sentTypo = await sendInput(started.runId, "also see @nope.md and @nope.md again");
+  if (!sentTypo.delivered) throw new Error(`expected delivered:true, got ${JSON.stringify(sentTypo)}`);
+  expect(sentTypo.unresolvedRefs).toEqual(["@nope.md"]);
+  await settle(300);
 
   tasks.delete(taskId);
 });

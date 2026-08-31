@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { descendInto, filterFileEntries, fuzzyPathMatch, type FileEntry } from "@/lib/at-file-filter";
 import { iconForRef } from "@/lib/file-icons";
 import { cn } from "@/lib/utils";
 import { findActiveAtQuery, formatAtToken, MAX_PROJECT_FILES } from "../../../shared/at-refs.ts";
+import { descendInto, filterFileEntries, fuzzyPathMatch, type FileEntry } from "../../../shared/at-file-filter.ts";
 
 interface Props {
   /** File/directory entries to suggest, scoped to the surface's project +

@@ -6,6 +6,7 @@ import { c, out, printJson, isTTY } from "../output.ts";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import { flagValue } from "../args.ts";
 import { resolveRefs, warnMissingRefs } from "../refs.ts";
+import { filterUnresolvedRefs, unresolvedWarningLine, warnUnresolvedRefs } from "../at-warn.ts";
 import {
   parseIssueUrl,
   sameIssueUrl,
@@ -21,8 +22,11 @@ import {
   CATALOG_SCOPED_KINDS,
   supportedEfforts,
   type AgentKind,
+  type Task,
 } from "../../shared/types.ts";
 import { mergeModelOptions, type DiscoveredModel } from "../../shared/model-options.ts";
+import { buildFileEntries } from "../../shared/at-file-filter.ts";
+import { unresolvedAtTokens } from "../../shared/at-refs.ts";
 
 interface AddOpts {
   title?: string;
@@ -158,23 +162,86 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
 
   const task = await client.createTask(input);
 
+  // `restrictTo` matches the `--start`/pre-check paths below: an `--issue`
+  // task's composed prompt quotes issue text full of `@octocat`-style
+  // mentions that must not trigger the warning — only tokens the user
+  // themselves typed into `--prompt`/`--prompt-file` count. A plain add's
+  // whole prompt is user-typed, so no restriction is needed.
+  // An `--issue` add with no user-typed `--prompt` has NO user-typed tokens
+  // at all — restrict to the empty string (warn on nothing) rather than null
+  // (warn on everything), or the composed thread body's quoted third-party
+  // `@mentions` would all read as "won't resolve".
+  const restrictTo = o.issue ? (o.prompt ?? "") : null;
+  let unresolvedRefsWarning: string[] = [];
+
   let started = false;
   if (o.start) {
     try {
-      await client.startTask(task.id);
+      const startRes = await client.startTask(task.id);
       started = true;
+      if (startRes.unresolvedRefs?.length) {
+        const extensionNames = await discoveredExtensionNames(client, task);
+        unresolvedRefsWarning = filterUnresolvedRefs(startRes.unresolvedRefs, { extensionNames, restrictTo });
+      }
     } catch {
       started = false;
     }
+  } else if (input.prompt.includes("@")) {
+    // Task wasn't started, so there's no server-side send-time expansion to
+    // ask — advisory client-side pre-check instead: list the scope the task
+    // will actually run in (mirrors the webview's `fileScope` derivation,
+    // CLAUDE.md §12) and flag any `@`-token the user typed that won't
+    // resolve there. Never blocks or fails the add; a listing that errored
+    // or got truncated can't prove a token unresolved, so it's skipped
+    // silently rather than false-warning.
+    try {
+      const scope = {
+        dir: task.workdir,
+        ref: (o.isolation ?? "worktree") !== "none" ? o.baseRef?.trim() || "HEAD" : null,
+      };
+      const listing = await client.listProjectFiles(scope);
+      if (!listing.truncated) {
+        const validPaths = new Set(buildFileEntries(listing.files).map((e) => e.path));
+        const rawUnresolved = unresolvedAtTokens(input.prompt, validPaths).map((t) => t.raw);
+        if (rawUnresolved.length) {
+          const extensionNames = await discoveredExtensionNames(client, task);
+          unresolvedRefsWarning = filterUnresolvedRefs(rawUnresolved, { extensionNames, restrictTo });
+        }
+      }
+    } catch {
+      // listing failed — skip silently, see comment above.
+    }
   }
+
   if (flags.json) {
-    return printJson(issueWarning ? { task, started, warnings: [issueWarning] } : { task, started });
+    const warnings = [issueWarning, unresolvedWarningLine(unresolvedRefsWarning)].filter(
+      (w): w is string => Boolean(w),
+    );
+    return printJson(warnings.length ? { task, started, warnings } : { task, started });
   }
   out(
     `${c.green("✓")} created ${c.dim(task.id.slice(0, 8))} — ${task.title}` +
       (started ? c.cyan("  ▸ started") : ""),
   );
+  warnUnresolvedRefs(unresolvedRefsWarning);
   if (!started) out(c.dim(`  start it: agetor start ${task.id.slice(0, 8)}`));
+}
+
+/** `agentDiscovery`'s extension names, as the set `filterUnresolvedRefs`
+ *  exempts from the "won't resolve" warning (the ExtensionPicker's own
+ *  `@name` mention syntax — e.g. `@github` — is never a file reference). A
+ *  discovery failure must not block or fail the add: falls back to an empty
+ *  set (over-warn rather than crash). */
+async function discoveredExtensionNames(
+  client: AgetorClient,
+  task: Pick<Task, "agent" | "workdir" | "branch">,
+): Promise<Set<string>> {
+  try {
+    const { extensions } = await client.agentDiscovery(task.agent, task.workdir, task.branch ?? null);
+    return new Set(extensions.map((e) => (e.insert.startsWith("@") ? e.insert.slice(1) : e.name)));
+  } catch {
+    return new Set();
+  }
 }
 
 /** Pure decision of whether `agetor add` should run non-interactively (a

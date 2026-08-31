@@ -5,6 +5,7 @@ import { runControl, resumableRunId } from "../run-logic.ts";
 import { c, out, printJson } from "../output.ts";
 import { resolveRefs, warnMissingRefs } from "../refs.ts";
 import { appendReferences } from "../../shared/refs.ts";
+import { filterUnresolvedRefs, warnUnresolvedRefs } from "../at-warn.ts";
 
 export async function cmdStart(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -77,7 +78,22 @@ export async function cmdSend(args: string[], flags: Flags): Promise<void> {
   const body = refs.length ? appendReferences(message, refs) : message;
   const res = await client.sendInput(runId, body);
   if (!res.delivered) throw new Error(res.reason ?? "message was not delivered");
+  // `--json` mode carries the server's raw `unresolvedRefs` in `res` as-is —
+  // this discovery-filtered, human-phrased warning is a plain-mode nicety.
   if (flags.json) return printJson(res);
+  if (res.unresolvedRefs?.length) {
+    let extensionNames = new Set<string>();
+    try {
+      const { extensions } = await client.agentDiscovery(task.agent, task.workdir, task.branch ?? null);
+      extensionNames = new Set(
+        extensions.map((e) => (e.insert.startsWith("@") ? e.insert.slice(1) : e.name)),
+      );
+    } catch {
+      // A discovery failure must not fail an already-delivered send — fall
+      // back to no exemptions (over-warn rather than crash).
+    }
+    warnUnresolvedRefs(filterUnresolvedRefs(res.unresolvedRefs, { extensionNames }));
+  }
   const refNote = refPaths.length ? c.dim(` (+${refPaths.length} ref${refPaths.length > 1 ? "s" : ""})`) : "";
   out(`${c.green("→")} sent to ${c.dim(short)}${refNote}`);
 }

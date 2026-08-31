@@ -4,7 +4,12 @@
 // grammar or validity-decision work itself. Kept DOM-free (no React here) so
 // it's unit-testable in isolation, mirroring at-file-filter.ts in spirit.
 
-import { findAtTokens, type AtToken } from "../../shared/at-refs.ts";
+import { findAtTokens } from "../../shared/at-refs.ts";
+
+// `isListedPath` and `unresolvedAtTokens` live in the shared module now (the
+// CLI needs them too) — re-exported here so this module's existing consumers
+// (PromptComposer.tsx, at-highlight.test.ts) keep working unchanged.
+export { isListedPath, unresolvedAtTokens } from "../../shared/at-refs.ts";
 
 /** One run of `text`, in order — concatenating every segment's `text`
  *  reconstructs the original string exactly (no segment trims, transforms,
@@ -58,31 +63,6 @@ export function computeAtHighlights(
   if (cursor < text.length) pushPlain(text.slice(cursor));
 
   return segments;
-}
-
-/**
- * Whether `path` counts as "listed" for highlight purposes: an exact hit in
- * `validPaths`, or — when the token itself wasn't typed as a directory (no
- * trailing "/") — the same path with a trailing "/" appended. This is what
- * lets a hand-typed `@src/bun` highlight when `src/bun/` is a listed
- * directory (every directory entry `buildFileEntries` produces carries the
- * trailing slash, but a user typing a token by hand has no reason to know
- * that). A token already typed *with* a trailing slash (`isDirectory:
- * true`) must match `validPaths` on its own — appending a second slash would
- * never hit.
- */
-export function isListedPath(validPaths: Set<string>, path: string, isDirectory: boolean): boolean {
-  return validPaths.has(path) || (!isDirectory && validPaths.has(`${path}/`));
-}
-
-/** Tokens in `text` that do NOT pass {@link isListedPath} against
- *  `validPaths` — the candidate set for the composer's "won't resolve"
- *  warning. This helper only knows the listing oracle; the caller layers its
- *  own exemptions on top (known `@name` extension mentions, the live-scope
- *  on-disk stat check for gitignored-but-present files). */
-export function unresolvedAtTokens(text: string, validPaths: Set<string>): AtToken[] {
-  if (!text.includes("@")) return [];
-  return findAtTokens(text).filter((t) => !isListedPath(validPaths, t.path, t.isDirectory));
 }
 
 /** Client-side mirror of the server's `isSafeRelPath` (worktree.ts): a

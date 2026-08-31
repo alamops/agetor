@@ -82,6 +82,7 @@ test("compose pins the target task even when the board re-sorts under the cursor
       sends.push({ runId, line });
       return { delivered: true };
     },
+    listProjectFiles: async () => ({ files: [], truncated: false }),
   } as unknown as AgetorClient;
 
   const { stdin, unmount } = render(
@@ -178,5 +179,56 @@ test("event stream: an fx_permission interaction renders generically, sentinel s
   expect(frame).not.toContain(PERMISSION_MODE_STATUS_PREFIX);
   // A plain status line still renders.
   expect(frame).toContain("plain status text");
+  unmount();
+});
+
+// ── @ file autocomplete wiring (compose mode → Composer's fileEntries) ──────
+
+test("opening the composer fetches the task's project-file listing and feeds the @ popover", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    listProjectFiles: async () => ({ files: ["README.md", "src/bun/db.ts"], truncated: false }),
+    sendInput: async () => ({ delivered: true }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the listProjectFiles fetch
+  await wait(80);
+  stdin.write("@RE");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("README.md");
+  expect(frame).toContain("tab/enter accept");
+  unmount();
+});
+
+test("a send whose reply carries unresolvedRefs surfaces a one-line warning after the ok status", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    listProjectFiles: async () => ({ files: [], truncated: false }),
+    sendInput: async () => ({ delivered: true, unresolvedRefs: ["@nope.txt", "@also-missing"] }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("hello");
+  await wait(40);
+  stdin.write(ENTER);
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("→ sent");
+  expect(frame).toContain("2 @ refs won't resolve");
+  expect(frame).toContain("@nope.txt");
   unmount();
 });

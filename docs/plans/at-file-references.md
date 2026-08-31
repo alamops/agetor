@@ -154,3 +154,10 @@ Assumptions logged (routine, reversible):
 ## 11. Follow-up (2026-08-31)
 
 - Closed the "unresolved tokens fail silently" gap: `PromptComposer` now shows an inline `text-warning` line (`at-unresolved-warning`) while the draft holds `@` tokens that match no project file — listing verdict first, known `@name` extension mentions exempt, and for live scopes a 300 ms-debounced `POST /refs/resolve` stat rescues gitignored-but-present paths (which send-time expansion WILL resolve); suppressed while the listing is loading/failed/empty/truncated; advisory only, send behavior unchanged. Helpers `unresolvedAtTokens`/`isSafeClientRelPath` in `lib/at-highlight.ts` (+7 unit tests), e2e scenario 7 (spec now 10/10). Typecheck clean; `bun test src/mainview` 930/0.
+
+## 12. Follow-up (2026-08-31): CLI parity
+
+- Server truth source: `expandAtReferencesDetailed` (project-files.ts); `startTask` + `sendInput` results carry additive `unresolvedRefs?: string[]` (raw tokens left verbatim).
+- `agetor send` / `agetor add --start`: yellow stderr warning filtered against `@name` extension mentions (agent-discovery, fail-open); `add` pre-validates a non-start prompt via `GET /files/index`; `--issue` restricts warnings to user-typed `--prompt` tokens (empty restriction when none — the composed thread quotes third-party @mentions). `--json`: raw `unresolvedRefs` on send; filtered line in `add`'s `warnings`.
+- TUI Dashboard composer: `@` autocomplete (`tui/at-complete.ts`: RunPanel-parity `fileScopeForTask`, top-5 suggestions, Tab/Enter accept, dir descend incl. spaced-dir quoted form, ↑/↓, Esc dismiss-then-cancel), listing cached per pinned task; post-send `⚠ N @ refs won't resolve` status.
+- Shared moves: `at-file-filter.ts` → `src/shared/`; `isListedPath`/`unresolvedAtTokens` → `src/shared/at-refs.ts` (re-exported from `lib/at-highlight.ts`).

@@ -214,9 +214,35 @@ export function resolveAtPath(cwd: string, relPath: string, isDirectory: boolean
  * quoting (when present) was there to prevent.
  */
 export function expandAtReferences(text: string, cwd: string): string {
-  return expandAtTokens(text, (p, isDir) => {
-    const resolved = resolveAtPath(cwd, p, isDir);
-    if (resolved === null) return null;
-    return /\s/.test(resolved) ? `"${resolved}"` : resolved;
-  });
+  return expandAtReferencesDetailed(text, cwd).text;
+}
+
+/**
+ * Same expansion as {@link expandAtReferences}, plus the RAW form (`token.raw`
+ * — e.g. `@nope.md`, `@"my file.md"`) of every token that didn't resolve,
+ * deduped, in document order. This is what lets a caller (orchestrator's
+ * `startTask`/`sendInput`) report facts about the send back to the UI/CLI
+ * ("these tokens were left verbatim") instead of the server silently
+ * swallowing the distinction between "no @ tokens" and "some didn't
+ * resolve" — a typo, a file not in this cwd's tree, or a `@name` extension
+ * mention (`@github`) are all indistinguishable to this function; it's the
+ * caller's job to decide what's noise.
+ */
+export function expandAtReferencesDetailed(text: string, cwd: string): { text: string; unresolved: string[] } {
+  const unresolved: string[] = [];
+  const seen = new Set<string>();
+  const expanded = expandAtTokens(
+    text,
+    (p, isDir) => {
+      const resolved = resolveAtPath(cwd, p, isDir);
+      if (resolved === null) return null;
+      return /\s/.test(resolved) ? `"${resolved}"` : resolved;
+    },
+    (token) => {
+      if (seen.has(token.raw)) return;
+      seen.add(token.raw);
+      unresolved.push(token.raw);
+    },
+  );
+  return { text: expanded, unresolved };
 }
