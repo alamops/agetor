@@ -71,7 +71,7 @@ import {
  * in-branch reply never fires and `handleServerRequest`'s catch-all fallback
  * writes the sole reply instead.
  *
- * ── Protocol index (verified against fx v0.0.4 and v0.0.6 + ACP's canonical schema.json) ──
+ * ── Protocol index (verified against fx v0.0.4, v0.0.6 and v0.0.7 + ACP's canonical schema.json) ──
  *
  *   - `initialize`                  SPIKE-VERIFIED             handshake; unauth fails here (see describeHandshakeFailure)
  *   - `session/new`                 SPIKE-VERIFIED             → {sessionId, modes?, configOptions?}; mode nudge is best-effort (see runFxTurn)
@@ -82,21 +82,28 @@ import {
  *   - `session/cancel`              SCHEMA-DERIVED             notification, no reply expected (see cancelFxTurn)
  *   - death                         —                          unexpected exit before settlement (see the `exited` watcher)
  *
- * ── Facts verified against fx 0.0.5/0.0.6 (spike + release notes + Zig source diff) ──
+ * ── Facts verified against fx 0.0.5/0.0.6/0.0.7 (spike + release notes + Zig source diff, 2026-08-31) ──
  *
  *   - **No sandbox since 0.0.5** — fx retired its command sandbox; approved
  *     tool calls run as ordinary host subprocesses. Agetor's permission mode
  *     (`session/set_mode` + this driver's `session/request_permission`
  *     policy, see `respondPermissionRequest`) is the ONLY gate fx has left —
  *     there is no `sandbox_denied` outcome to parse and never was one here.
+ *     Still true at 0.0.7 — 0.0.7 even adds an fx-side test asserting legacy
+ *     `sandbox` settings keys stay inert (spike + Zig source diff,
+ *     2026-08-31).
  *   - **Credential re-checks on `session/prompt` AND `session/resume`
- *     (0.0.5+)** — an unauthenticated/deauthorized binary no longer fails
- *     only at `initialize`; either call can return `-32600` mid-session with
- *     the same "Fx needs access to Vercel AI Gateway…" text or a
- *     provider-specific variant (e.g. "Fx needs a Codex subscription login
- *     for this model. Run fx login codex."). `-32600` is JSON-RPC's generic
- *     "Invalid Request" code, not an auth-specific one — fx merely reuses it
- *     for credential failures — so `session/resume`'s `-32600` is treated
+ *     (0.0.5+; re-check paths unchanged through 0.0.7 — `server.zig`/
+ *     `jsonrpc.zig` are byte-identical 0.0.6→0.0.7)** — an unauthenticated/
+ *     deauthorized binary no longer fails only at `initialize`; either call
+ *     can return `-32600` mid-session with the same "fx needs access to
+ *     Vercel AI Gateway…" text or a provider-specific variant (e.g. "fx
+ *     needs a Codex subscription login for this model. Run fx login
+ *     codex."). 0.0.7 recased these (and other) user-facing strings from
+ *     "Fx" to lowercase "fx" — cosmetic only, no behavior change (spike +
+ *     Zig source diff, 2026-08-31). `-32600` is JSON-RPC's generic "Invalid
+ *     Request" code, not an auth-specific one — fx merely reuses it for
+ *     credential failures — so `session/resume`'s `-32600` is treated
  *     exactly like its `-32601`/`-32602` siblings in `runFxTurn`: it falls
  *     through to the `session/load` fallback rather than failing the turn
  *     immediately. If `session/load` in turn also answers `-32600`, that's
@@ -117,14 +124,44 @@ import {
  *     `FX_PROVIDER_STATUS_PREFIX` status chunk (see `maybeEmitProvider` in
  *     `runFxTurn`) — RunPanel renders it as a small provider chip. Absence
  *     (0.0.4 binaries, or a response that omits the array) is tolerated
- *     silently; no chip that turn.
- *   - **Exactly six `session/update` kinds are emitted, in both 0.0.4 and
- *     0.0.6**: `agent_message_chunk`, `user_message_chunk`, `tool_call`,
+ *     silently; no chip that turn. `src/acp/server.zig` is byte-identical
+ *     0.0.6→0.0.7 — the provider values are still exactly `"gateway"` |
+ *     `"codex"` | `"grok"` (spike + Zig source diff, 2026-08-31). Trap:
+ *     0.0.7's binary also compiles inline-menu TUI strings that look like
+ *     mode/model configOptions entries — those are TUI-only, never on the
+ *     wire; don't infer a protocol change from a `strings` scan alone.
+ *   - **Exactly six `session/update` kinds are emitted, in 0.0.4, 0.0.6 and
+ *     0.0.7**: `agent_message_chunk`, `user_message_chunk`, `tool_call`,
  *     `tool_call_update`, `available_commands_update`, `session_info_update`.
- *     `mapFxUpdate`'s `agent_thought_chunk`/`plan`/`usage_update` branches
- *     are ACP-spec-correct and stay (forward-compatible, unit-tested), but
- *     are DORMANT — fx has never been observed to send any of the three, so
- *     those three chunk kinds never reach a real run today.
+ *     Re-verified at 0.0.7 two ways — `src/acp/types.zig`'s writers have a
+ *     0-line functional diff vs 0.0.6, and a binary `strings` scan still
+ *     shows the same six with no `agent_thought_chunk`/`plan`/
+ *     `usage_update` (spike + Zig source diff, 2026-08-31). `mapFxUpdate`'s
+ *     `agent_thought_chunk`/`plan`/`usage_update` branches are ACP-spec-correct
+ *     and stay (forward-compatible, unit-tested), but are DORMANT — fx has
+ *     never been observed to send any of the three, so those three chunk
+ *     kinds never reach a real run today.
+ *   - **`agent_message_chunk` carries raw Markdown, not rendered text
+ *     (0.0.7)** — 0.0.6 streamed ANSI-stripped, already-rendered text and
+ *     discarded the markdown source; 0.0.7 flips that (`src/acp/prompt.zig`):
+ *     the chunk now carries the raw Markdown source instead. fx's changelog
+ *     also notes a resumed response no longer repeats text already
+ *     delivered. Neither needs a driver change here — chunks were already
+ *     forwarded verbatim and rendered as markdown downstream by the webview
+ *     — but a transcript captured against 0.0.7 carries markdown source
+ *     where an 0.0.6 transcript carried pre-rendered text (spike + Zig
+ *     source diff, 2026-08-31).
+ *   - **Project `.mcp.json` merges into ACP sessions (0.0.7)** —
+ *     `session/new` AND `session/resume` now merge the workspace's
+ *     project-level `.mcp.json` MCP servers into the session (trust-gated by
+ *     fx's own approval flow / `allow_acp_mcp`; `sessions.zig` gained a new
+ *     `invalid_params` error path, "MCP servers are unavailable in this
+ *     runtime"). This driver still passes `mcpServers: []` on every
+ *     `session/new`/`session/load` call below, but a task `workdir` that
+ *     itself carries a `.mcp.json` can still introduce MCP tools into the
+ *     session via that merge — their `tool_call`s render generically like
+ *     any other tool call; no driver change needed (spike + Zig source diff,
+ *     2026-08-31).
  */
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -372,8 +409,8 @@ class RpcTimeoutError extends Error {}
 /** Rejection shape for a real JSON-RPC error reply from fx (as opposed to
  *  `RpcTimeoutError`, which is ours). `code` is the JSON-RPC error code —
  *  callers use it to distinguish a credential re-check failure (`-32600`,
- *  see the header's "Facts verified against fx 0.0.5/0.0.6" section) from
- *  every other protocol error, without re-parsing `message`. The message
+ *  see the header's "Facts verified against fx 0.0.5/0.0.6/0.0.7" section)
+ *  from every other protocol error, without re-parsing `message`. The message
  *  text itself is UNCHANGED from before this class existed
  *  (`"<fx message> (code <n>)"`) so every existing message-based assertion
  *  still holds — `code` is purely additive. `rawMessage` is fx's error
@@ -1007,7 +1044,7 @@ function acpModeIdFor(mode: FxMode): string | null {
 
 /** Pull the active provider id out of a `session/new`/`session/resume`/
  *  `session/load` result's `configOptions` array (0.0.5+, additive — see
- *  the file header's "Facts verified against fx 0.0.5/0.0.6" section).
+ *  the file header's "Facts verified against fx 0.0.5/0.0.6/0.0.7" section).
  *  Pure and exported for the same reason `mapFxUpdate` is: unit-testable
  *  against a raw result object without spawning a child. Tolerates a
  *  missing/non-array `configOptions` (0.0.4 binaries, or a response that
@@ -1044,7 +1081,7 @@ async function runFxTurn(
   // Emits the `FX_PROVIDER_STATUS_PREFIX` status chunk at most once per
   // turn, from whichever of session/new|resume|load's results carries a
   // `configOptions` provider entry first — see the file header's "Facts
-  // verified against fx 0.0.5/0.0.6" section.
+  // verified against fx 0.0.5/0.0.6/0.0.7" section.
   let providerEmitted = false;
   function maybeEmitProvider(result: unknown): void {
     if (providerEmitted) return;

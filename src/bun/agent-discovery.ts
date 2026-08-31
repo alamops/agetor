@@ -173,6 +173,13 @@ async function discoverGemini(): Promise<DiscoveredModel[]> {
  * `parseCodexModels`/`parseCursorModels` above) — a repeated id in the
  * catalog would otherwise surface as a duplicate React key in the model
  * picker.
+ *
+ * Re-measured against fx 0.0.7 (build cef08aa0f178, full 0.0.6→0.0.7 source
+ * diff, 2026-08-31): the `models --json` shape is unchanged. The
+ * unauthenticated (empty-`HOME`) catalog grew from 230 to 234 ids, still
+ * `private_models_hidden: true`; the reference signed-in (158-id) account's
+ * view could not be re-measured this pass — the local `fx login` token had
+ * expired, so there was no live authenticated account to probe.
  */
 function parseFxModels(stdout: string): DiscoveredModel[] {
   try {
@@ -204,6 +211,18 @@ function parseFxModels(stdout: string): DiscoveredModel[] {
  * the premium tiers); a reference logged-in account sees 158 — a strict
  * subset missing exactly the premium tiers. Latency is 0.3–0.9 s either way,
  * well inside `runProbe`'s 3 s timeout.
+ *
+ * Re-measured against fx 0.0.7 (build cef08aa0f178, 2026-08-31): still zero
+ * filesystem writes either way, and the unauth catalog grew to 234 ids
+ * (still every flagship present); the 158-id signed-in reference could not
+ * be re-checked this pass (expired local login token). New in 0.0.7 and
+ * load-bearing for this account-scoping story: on an account whose login has
+ * expired (`auth_expired: true`), a passive probe like this one does NOT
+ * refresh the token — it silently falls back to the UNAUTHENTICATED catalog
+ * rather than erroring or blocking, so a discovered list can quietly
+ * over-show premium `catalogOnly` ids for a user whose session lapsed, until
+ * they re-run `fx login`. There is no probe-side way to distinguish that
+ * from a genuinely unauthenticated account; both read identically.
  *
  * That account-scoping is exactly why `env` exists as a parameter here (and
  * threads through to `runProbe`): a harness with its own `HOME` override —
