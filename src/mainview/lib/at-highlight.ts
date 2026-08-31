@@ -4,7 +4,7 @@
 // grammar or validity-decision work itself. Kept DOM-free (no React here) so
 // it's unit-testable in isolation, mirroring at-file-filter.ts in spirit.
 
-import { findAtTokens } from "../../shared/at-refs.ts";
+import { findAtTokens, type AtToken } from "../../shared/at-refs.ts";
 
 /** One run of `text`, in order — concatenating every segment's `text`
  *  reconstructs the original string exactly (no segment trims, transforms,
@@ -73,4 +73,26 @@ export function computeAtHighlights(
  */
 export function isListedPath(validPaths: Set<string>, path: string, isDirectory: boolean): boolean {
   return validPaths.has(path) || (!isDirectory && validPaths.has(`${path}/`));
+}
+
+/** Tokens in `text` that do NOT pass {@link isListedPath} against
+ *  `validPaths` — the candidate set for the composer's "won't resolve"
+ *  warning. This helper only knows the listing oracle; the caller layers its
+ *  own exemptions on top (known `@name` extension mentions, the live-scope
+ *  on-disk stat check for gitignored-but-present files). */
+export function unresolvedAtTokens(text: string, validPaths: Set<string>): AtToken[] {
+  if (!text.includes("@")) return [];
+  return findAtTokens(text).filter((t) => !isListedPath(validPaths, t.path, t.isDirectory));
+}
+
+/** Client-side mirror of the server's `isSafeRelPath` (worktree.ts): a
+ *  repo-relative path that is non-empty, not absolute, NUL-free, and never
+ *  escapes upward. Used to decide which unlisted tokens are even worth the
+ *  live-scope `/refs/resolve` stat check — a token the server-side
+ *  `resolveAtPath` would reject anyway (`@../x`, `@/abs`) must keep its
+ *  warning rather than being "rescued" by a stat of a file outside the
+ *  project. */
+export function isSafeClientRelPath(path: string): boolean {
+  if (!path || path.startsWith("/") || path.includes("\0")) return false;
+  return !path.split("/").some((seg) => seg === "..");
 }

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { Dispatch, ReactNode, RefObject, SetStateAction } from "react";
 import { api, type AvailableCommand, type AvailableExtension } from "@/lib/api";
 import { Textarea } from "@/components/ui/textarea";
@@ -17,6 +17,11 @@ import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
+import { unresolvedAtTokens, isSafeClientRelPath } from "@/lib/at-highlight";
+
+/** Stable empty set so clearing the on-disk override doesn't churn state
+ *  identity (and thus the warning memo) on every effect pass. */
+const EMPTY_PATH_SET: ReadonlySet<string> = new Set();
 
 /**
  * Shared prompt-composer block: the label row + Extensions picker, the
@@ -536,6 +541,85 @@ export function PromptComposer({
   // memo costs).
   const hasFileScope = !!(fileScope && fileScope.dir);
 
+  // --- Unresolved `@` reference warning -----------------------------------
+  // Send-time expansion (orchestrator `startTask`/`sendInput`) silently
+  // leaves unresolvable tokens verbatim — the agent just receives literal
+  // `@`-text. The unhighlighted state is the only passive signal, so this
+  // warns actively while the draft holds a token that won't become a path.
+  // Verdict layering, cheapest first:
+  //   1. listing membership — same oracle as the highlight backdrop;
+  //   2. known `@name` extension mentions (the ExtensionPicker's own insert
+  //      syntax, e.g. `@github`) are never file references → never warned;
+  //   3. LIVE scopes only (no `ref`): a debounced `/refs/resolve` stat
+  //      rescues paths that exist on disk but aren't listed (gitignored
+  //      `@.env`) — send-time expansion WILL resolve those, so warning
+  //      would lie. Ref scopes skip the stat: a fresh worktree at the
+  //      pinned ref contains exactly the listing, so listing = truth.
+  // Suppressed while the listing is loading/failed/empty or truncated — a
+  // partial or absent set can't prove a token unresolved.
+  const extensionNames = useMemo(
+    () => new Set(extensions.map((e) => (e.insert.startsWith("@") ? e.insert.slice(1) : e.name))),
+    [extensions],
+  );
+  const unlistedTokens = useMemo(() => {
+    if (!hasFileScope || projectFiles.loading || projectFiles.error || projectFiles.truncated) return [];
+    if (projectFiles.entries.length === 0) return [];
+    return unresolvedAtTokens(value, projectFiles.validPaths).filter((t) => !extensionNames.has(t.path));
+  }, [hasFileScope, projectFiles.loading, projectFiles.error, projectFiles.truncated, projectFiles.entries.length, projectFiles.validPaths, value, extensionNames]);
+  // Paths the live-scope stat check confirmed on disk, keyed by token path
+  // with any trailing "/" stripped.
+  const [existsOnDisk, setExistsOnDisk] = useState<ReadonlySet<string>>(EMPTY_PATH_SET);
+  // Stands in for `unlistedTokens` in the effect deps: the memo re-derives a
+  // fresh array per keystroke, but an unchanged token set must not re-arm
+  // the debounce timer.
+  const unlistedKey = unlistedTokens.map((t) => t.path).join("\u0000");
+  useEffect(() => {
+    const dir = fileScope?.dir?.trim();
+    const live = !!dir && !(fileScope?.ref ?? "").trim();
+    const candidates = live
+      ? [...new Set(unlistedTokens.map((t) => t.path.replace(/\/+$/, "")).filter(isSafeClientRelPath))]
+      : [];
+    if (candidates.length === 0) {
+      setExistsOnDisk((prev) => (prev.size ? EMPTY_PATH_SET : prev));
+      return;
+    }
+    let cancelled = false;
+    // Debounced, and only ever in flight while the draft actually holds
+    // unlisted tokens (rare) — this is not a per-keystroke request.
+    const timer = setTimeout(async () => {
+      try {
+        const refs = await api.resolveRefs(candidates.map((p) => `${dir}/${p}`));
+        if (cancelled) return;
+        const found = new Set<string>();
+        for (const r of refs) {
+          if (r.path.startsWith(`${dir}/`)) found.add(r.path.slice(dir!.length + 1).replace(/\/+$/, ""));
+        }
+        setExistsOnDisk(found);
+      } catch {
+        // Stat unavailable — keep the listing verdict. Worst case is an
+        // over-warn on a gitignored path until the next successful check;
+        // it never under-warns.
+      }
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKey stands in for unlistedTokens (see above)
+  }, [unlistedKey, fileScope?.dir, fileScope?.ref]);
+  const unresolvedWarning = useMemo(() => {
+    const seen = new Set<string>();
+    const unresolved = unlistedTokens.filter((t) => {
+      const key = t.path.replace(/\/+$/, "");
+      if (existsOnDisk.has(key) || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    if (unresolved.length === 0) return null;
+    const shown = unresolved.slice(0, 3).map((t) => t.raw).join(", ");
+    const extra = unresolved.length > 3 ? ` and ${unresolved.length - 3} more` : "";
+    return unresolved.length === 1
+      ? `${shown} doesn't match a project file — it will be sent as plain text, not expanded to a path`
+      : `${unresolved.length} @ references don't match a project file (${shown}${extra}) — they'll be sent as plain text, not expanded to paths`;
+  }, [unlistedTokens, existsOnDisk]);
+
   const textareaBlock = (
     <div className={cn("relative", trailing && "flex-1")}>
       {hasFileScope && <AtHighlightBackdrop textareaRef={ref} value={value} validPaths={projectFiles.validPaths} />}
@@ -614,6 +698,11 @@ export function PromptComposer({
         )}
         {textareaRow}
         {hintText && <p className={hintClass}>{hintText}</p>}
+        {unresolvedWarning && (
+          <p data-testid="at-unresolved-warning" className={cn("text-[10px] text-warning", hintClassName)}>
+            {unresolvedWarning}
+          </p>
+        )}
         {footer}
       </div>
 

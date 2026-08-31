@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { computeAtHighlights, isListedPath, type HighlightSegment } from "./at-highlight.ts";
+import { computeAtHighlights, isListedPath, type HighlightSegment, unresolvedAtTokens, isSafeClientRelPath } from "./at-highlight.ts";
 
 /** Every test's segments must reconstruct the original text exactly — this
  *  invariant is checked alongside the segment shape in most cases below. */
@@ -138,4 +138,31 @@ describe("isListedPath", () => {
     // must match validPaths on its own.
     expect(isListedPath(new Set(["src/bun"]), "src/bun/", true)).toBe(false);
   });
+});
+
+test("unresolvedAtTokens: unlisted tokens returned; listed and bare-dir-listed excluded", () => {
+  const valid = new Set(["src/", "src/app.ts", "README.md"]);
+  const tokens = unresolvedAtTokens("see @README.md @src @src/app.ts @nope.md @github", valid);
+  expect(tokens.map((t) => t.path)).toEqual(["nope.md", "github"]);
+  // Raw text and offsets survive so the caller can render the exact token.
+  expect(tokens[0]!.raw).toBe("@nope.md");
+});
+
+test("unresolvedAtTokens: fast path with no @ returns []", () => {
+  expect(unresolvedAtTokens("plain text, no tokens", new Set(["a"]))).toEqual([]);
+});
+
+test("unresolvedAtTokens: directory token with trailing slash checks the listing verbatim", () => {
+  const valid = new Set(["src/"]);
+  expect(unresolvedAtTokens("look at @src/ and @docs/", valid).map((t) => t.path)).toEqual(["docs/"]);
+});
+
+test("isSafeClientRelPath mirrors the server-side guard", () => {
+  expect(isSafeClientRelPath("src/app.ts")).toBe(true);
+  expect(isSafeClientRelPath("docs/my notes.md")).toBe(true);
+  expect(isSafeClientRelPath("a/..b/x")).toBe(true);
+  expect(isSafeClientRelPath("")).toBe(false);
+  expect(isSafeClientRelPath("/abs/x")).toBe(false);
+  expect(isSafeClientRelPath("../x")).toBe(false);
+  expect(isSafeClientRelPath("a/../x")).toBe(false);
 });

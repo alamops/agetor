@@ -51,7 +51,8 @@ function git(cwd: string, args: string[]): void {
 
 /** Temp git repo with committed README.md/src/app.ts/"docs/my notes.md" (the
  *  file with a space in its name exercises the quoted-token form) plus an
- *  untracked scratch.txt (exercises the live-vs-ref listing-scope split —
+ *  untracked scratch.txt and a gitignored-but-present ignored.log
+ *  (exercises the live-vs-ref listing-scope split and the unresolved-warning stat rescue —
  *  see §3.3: isolated tasks list tracked files at the pinned base ref via
  *  `git ls-tree`, live/uniisolated tasks list `git ls-files` including
  *  untracked-not-ignored files). A GitHub `origin` remote is wired so the
@@ -70,6 +71,9 @@ async function initRepo(): Promise<string> {
   await writeFile(path.join(dir, "src", "app.ts"), "export {};\n");
   await mkdir(path.join(dir, "docs"), { recursive: true });
   await writeFile(path.join(dir, "docs", "my notes.md"), "notes with a space in the filename\n");
+  // Committed ignore rule for the unresolved-warning test: `ignored.log`
+  // exists on disk but is absent from every listing mode.
+  await writeFile(path.join(dir, ".gitignore"), "ignored.log\n");
 
   git(dir, ["add", "-A"]);
   git(dir, ["commit", "-q", "-m", "initial commit"]);
@@ -77,6 +81,7 @@ async function initRepo(): Promise<string> {
   // Deliberately never `git add`-ed — only the live (non-ref) listing mode
   // should ever surface this.
   await writeFile(path.join(dir, "scratch.txt"), "untracked scratch file\n");
+  await writeFile(path.join(dir, "ignored.log"), "gitignored but present on disk\n");
 
   return dir;
 }
@@ -386,6 +391,43 @@ test.describe("@ file references", () => {
     // Scope flips to the live tree (`git ls-files`, untracked-not-ignored
     // included) — same typed query, no need to retype it.
     await expect(atRow(form, "scratch.txt")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  });
+
+  test("Unresolved @ references warn under the composer; gitignored-but-present files don't (live scope)", async ({ page, backend }) => {
+    await gotoApp(page, backend.bootBase);
+    const form = newTaskForm(page);
+    const textarea = promptTextarea(form);
+    const warning = form.getByTestId("at-unresolved-warning");
+    await textarea.click();
+
+    // Warm-up: the warning is suppressed until the listing has loaded, so
+    // first prove it's live (same trick as the isolate-scope test).
+    await page.keyboard.type("@REA");
+    await expect(atRow(form, "README.md")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    // Ref scope (Isolate ON default): a typo'd token warns straight off the
+    // listing verdict; the resolvable token isn't named in the warning.
+    await textarea.fill("see @nope.md and @README.md");
+    await expect(warning).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(warning).toContainText("@nope.md");
+    await expect(warning).not.toContainText("@README.md");
+
+    // Fixing the token clears the warning.
+    await textarea.fill("see @README.md");
+    await expect(warning).toBeHidden();
+
+    // Live scope (Isolate OFF): a gitignored file is absent from the listing
+    // but exists on disk — the debounced /refs/resolve stat check rescues it
+    // (send-time expansion WILL resolve it). The warning may flash while the
+    // stat is in flight; toBeHidden polls until it settles.
+    const worktreeOptions = form.getByTestId("worktree-options");
+    await worktreeOptions.getByTestId("isolate-toggle").uncheck();
+    await textarea.fill("read @ignored.log");
+    await expect(warning).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+
+    // A live-scope typo still warns — the stat check finds nothing to rescue.
+    await textarea.fill("read @nope.md");
+    await expect(warning).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   });
 
   test("Start: @README.md expands to the worktree's absolute path; task.prompt keeps the token", async ({
