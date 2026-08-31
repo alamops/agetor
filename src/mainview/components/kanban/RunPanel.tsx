@@ -3182,13 +3182,14 @@ function RunPanelBody({
               <Tooltip
                 align="end"
                 side="top"
+                className="shrink-0"
                 label={liveRunId ? "Send to the live agent" : "Resume the conversation with this message"}
               >
                 <Button
                   size="icon"
                   onClick={() => void send()}
                   disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
-                  aria-label={liveRunId ? "Send to the live agent" : "Resume the conversation with this message"}
+                  aria-label="Send"
                   className="h-16 w-12 shrink-0"
                 >
                   <Send className="size-4" />
@@ -3547,11 +3548,7 @@ function BacklogItemRow({
               className={BACKLOG_ICON_BTN}
               disabled={!canSend || busy}
               onClick={onSend}
-              aria-label={
-                canSend
-                  ? "Send now"
-                  : "Can't send right now — run the task, or answer the pending prompt first"
-              }
+              aria-label="Send now"
             >
               <Send className="size-3.5" />
             </button>

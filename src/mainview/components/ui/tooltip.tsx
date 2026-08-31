@@ -23,7 +23,7 @@ interface Props {
    *  visually-hidden twin of the label, so the descriptive text stays
    *  reachable by assistive tech (the trigger's own `aria-label` remains the
    *  accessible name). */
-  children: ReactElement<{ "aria-describedby"?: string }>;
+  children: ReactElement<{ "aria-describedby"?: string; "aria-label"?: string }>;
 }
 
 /** Hover delay before the bubble appears — long enough that a cursor passing
@@ -55,7 +55,11 @@ let closeActive: (() => void) | null = null;
  * transform — but `document.body` is untransformed, so `fixed` is safe there
  * (same reasoning as ui/context-menu.tsx). Position is measured from the
  * trigger on open, clamped to the viewport horizontally, and the bubble hides
- * on any scroll/resize rather than tracking (it re-shows on the next hover).
+ * rather than tracking — on scroll of any container enclosing the trigger
+ * (NOT unrelated scrolls: the transcript's per-chunk auto-pin must not kill
+ * header tooltips), on window resize, and on Enter/Space/Escape keydown
+ * (activation can move the trigger; Escape slides the panel out from under a
+ * fixed bubble). It re-shows on the next hover/focus.
  *
  * The visible bubble is `aria-hidden`: the trigger keeps its `aria-label` as
  * the accessible name, and a permanent `sr-only` twin of the label (inside
@@ -132,6 +136,10 @@ export function Tooltip({ label, align = "center", side = "bottom", className, c
       style.left = rect.left + rect.width / 2;
     }
     setPos(style);
+    // Every re-anchor starts the clamp from a clean baseline — a shift that
+    // corrected a previous (e.g. longer) label must not linger once the
+    // overflow it fixed is gone.
+    setShiftX(0);
   }, [open, align, side, label]);
 
   // Clamp horizontally once the bubble has a size: keep both edges inside the
@@ -149,17 +157,25 @@ export function Tooltip({ label, align = "center", side = "bottom", className, c
   }, [pos]);
 
   // A stale fixed-position bubble after a scroll or resize would float over
-  // the wrong content — hide instead of tracking.
+  // the wrong content — hide instead of tracking. The scroll hide is scoped
+  // to containers that actually enclose the trigger: RunPanel's transcript
+  // auto-pin fires a scroll on its log container for every streamed chunk,
+  // and an unscoped capture-phase listener would kill every tooltip in the
+  // panel for the whole duration of a run.
   useEffect(() => {
     if (!open) return;
     const hide = () => {
       setHovered(false);
       setFocused(false);
     };
-    window.addEventListener("scroll", hide, { capture: true, passive: true });
+    const onScroll = (e: Event) => {
+      const wrapper = wrapperRef.current;
+      if (wrapper != null && e.target instanceof Node && e.target.contains(wrapper)) hide();
+    };
+    window.addEventListener("scroll", onScroll, { capture: true, passive: true });
     window.addEventListener("resize", hide);
     return () => {
-      window.removeEventListener("scroll", hide, { capture: true });
+      window.removeEventListener("scroll", onScroll, { capture: true });
       window.removeEventListener("resize", hide);
     };
   }, [open]);
@@ -170,6 +186,12 @@ export function Tooltip({ label, align = "center", side = "bottom", className, c
       : shiftX !== 0
         ? `translateX(${shiftX}px)`
         : undefined;
+
+  // When the trigger's own aria-label is the same string as the tooltip,
+  // wiring it again as the accessible description would make AT announce it
+  // twice ("Move up, Move up") — only wire the description when it adds
+  // information beyond the name.
+  const describe = children.props["aria-label"] !== label;
 
   return (
     <span
@@ -201,18 +223,32 @@ export function Tooltip({ label, align = "center", side = "bottom", className, c
         setHovered(false);
         setFocused(false);
       }}
+      onKeyDownCapture={(e) => {
+        // Keyboard mirror of the mousedown hide: Enter/Space activation can
+        // move the trigger (a tray row reorder, a sent draft) and would leave
+        // the fixed bubble parked at the old coordinates; Escape closes the
+        // enclosing panel, whose slide-out the portaled bubble no longer
+        // travels with. Never preventDefault — the key still does its job.
+        if (e.key === "Enter" || e.key === " " || e.key === "Escape") {
+          clearTimer();
+          setHovered(false);
+          setFocused(false);
+        }
+      }}
     >
-      {cloneElement(children, { "aria-describedby": descId })}
-      <span id={descId} className="sr-only">
-        {label}
-      </span>
+      {describe ? cloneElement(children, { "aria-describedby": descId }) : children}
+      {describe && (
+        <span id={descId} className="sr-only">
+          {label}
+        </span>
+      )}
       {open && pos != null &&
         createPortal(
           <span
             ref={bubbleRef}
             aria-hidden="true"
             data-testid="tooltip"
-            className="pointer-events-none fixed z-50 max-w-64 break-words rounded border border-border bg-card px-2 py-1 text-xs text-card-foreground shadow-md"
+            className="pointer-events-none fixed z-[60] max-w-64 break-words rounded border border-border bg-card px-2 py-1 text-xs text-card-foreground shadow-md"
             style={{ ...pos, transform: translate }}
           >
             {label}
