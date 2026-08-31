@@ -16,7 +16,9 @@ import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
-import type { FileScope } from "@/lib/use-project-files";
+import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { AtFileAutocomplete } from "./AtFileAutocomplete";
+import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { shortenTaskPaths } from "@/lib/shorten-task-paths";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
 import type { GitHubPullPrefill } from "./GitHubDialog";
@@ -2935,6 +2937,7 @@ function RunPanelBody({
           view-only (`readOnly`), so saved drafts aren't silently invisible. */}
       {activeStream === "main" && backlogItems.length > 0 && (
         <BacklogTray
+          fileScope={fileScope}
           items={backlogItems}
           canSend={canSend && !modalPending}
           busy={sending || backlogBusy}
@@ -3290,6 +3293,7 @@ const BACKLOG_ICON_BTN =
  * which item is currently in inline-edit mode.
  */
 function BacklogTray({
+  fileScope,
   items,
   canSend,
   busy,
@@ -3300,6 +3304,10 @@ function BacklogTray({
   onDelete,
   onMove,
 }: {
+  /** The task's `@`-listing scope (same object the send composer uses) —
+   *  threaded into each row's inline editor for popover + highlight parity.
+   *  Display/suggestion layer only; expansion stays server-side. */
+  fileScope?: FileScope | null;
   items: BacklogMessage[];
   /** Whether "Send now" is available (task has a resumable run and no pending prompt). */
   canSend: boolean;
@@ -3351,6 +3359,7 @@ function BacklogTray({
             busy={busy}
             readOnly={readOnly}
             editing={editingId === item.id}
+            fileScope={fileScope}
             startingFolder={startingFolder}
             onStartEdit={() => setEditingId(item.id)}
             onCancelEdit={() => setEditingId(null)}
@@ -3371,6 +3380,7 @@ function BacklogTray({
 /** One saved draft: a read-only row with hover actions, or an inline editor
  *  (textarea + references picker) when `editing` is true. */
 function BacklogItemRow({
+  fileScope,
   item,
   index,
   total,
@@ -3386,6 +3396,7 @@ function BacklogItemRow({
   onDelete,
   onMove,
 }: {
+  fileScope?: FileScope | null;
   item: BacklogMessage;
   index: number;
   total: number;
@@ -3404,6 +3415,13 @@ function BacklogItemRow({
   const [draft, setDraft] = useState(item.text);
   const [draftRefs, setDraftRefs] = useState<TaskReference[]>(item.references);
   const actionsRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<HTMLTextAreaElement>(null);
+  // `@` popover + highlight for the inline editor — scope gated on `editing`
+  // so a tray full of closed rows fetches nothing (the module-level cache is
+  // shared with the send composer anyway, so entering edit mode is a cache
+  // hit in practice). Expansion still happens server-side on send; this is
+  // the suggestion/validation layer only, same as every other composer.
+  const projectFiles = useProjectFiles(editing && !readOnly ? (fileScope ?? null) : null);
   // Re-seed the edit form only when we *enter* edit mode. We deliberately do
   // NOT depend on `item.text` / `item.references`: the 2s task poll rebuilds
   // `task.backlog` into fresh objects (new array references) on every tick, so
@@ -3430,13 +3448,33 @@ function BacklogItemRow({
     const canSave = draft.trim().length > 0 || draftRefs.length > 0;
     return (
       <div className="space-y-1.5 rounded-md border border-border/60 bg-background/50 p-2">
-        <Textarea
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          rows={2}
-          autoFocus
-          className="min-h-0 w-full resize-none text-xs"
-        />
+        {/* Backdrop first, `relative` on the textarea — DOM order decides the
+            paint, see AtHighlightBackdrop's doc. Popover anchors above (the
+            tray sits at the panel's bottom edge). */}
+        <div className="relative">
+          {fileScope && (
+            <AtHighlightBackdrop textareaRef={editorRef} value={draft} validPaths={projectFiles.validPaths} />
+          )}
+          <Textarea
+            ref={editorRef}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            rows={2}
+            autoFocus
+            className="relative min-h-0 w-full resize-none text-xs"
+          />
+          {fileScope && (
+            <AtFileAutocomplete
+              entries={projectFiles.entries}
+              truncated={projectFiles.truncated}
+              value={draft}
+              onChange={setDraft}
+              textareaRef={editorRef}
+              placement="above"
+              fileScope={fileScope}
+            />
+          )}
+        </div>
         <ReferencesPicker
           variant="inline"
           refs={draftRefs}

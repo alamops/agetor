@@ -8,6 +8,9 @@ import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { AtFileAutocomplete } from "./AtFileAutocomplete";
+import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { api, type PendingInteraction } from "@/lib/api";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
 import {
@@ -499,6 +502,26 @@ export function DiffDialog({ open, task, onClose }: Props) {
   }, [selected]);
   const composerVisible = totalSelected > 0;
 
+  // `@` popover + highlight for the compose-from-diff box — the same scope
+  // table as RunPanel's composer (CLAUDE.md §12): the live worktree once it
+  // exists; a not-yet-started isolated task previews its pinned base ref
+  // (existing-branch tasks their branch); else the plain workdir. Gated on
+  // the composer actually showing so an open dialog with no selection
+  // fetches nothing. Expansion stays server-side in sendInput.
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const fileScope = useMemo<FileScope | null>(() => {
+    if (!task) return null;
+    if (task.worktreePath) return { dir: task.worktreePath };
+    if (task.isolation === "worktree") {
+      return {
+        dir: task.workdir,
+        ref: task.branchSource === "existing" && task.branch ? task.branch : task.baseRef ?? "HEAD",
+      };
+    }
+    return { dir: task.workdir };
+  }, [task?.worktreePath, task?.isolation, task?.workdir, task?.baseRef, task?.branchSource, task?.branch]);
+  const projectFiles = useProjectFiles(open && composerVisible ? fileScope : null);
+
   // A new selection starting (composer reappearing) supersedes whatever hint
   // was left over from the last send/save — e.g. the "Sent to agent." success
   // hint from a moment ago shouldn't linger once the user starts picking new
@@ -726,10 +749,20 @@ export function DiffDialog({ open, task, onClose }: Props) {
                   <X className="mr-1 size-3" /> Clear
                 </Button>
               </div>
+              <div className="relative">
+              {fileScope && (
+                <AtHighlightBackdrop textareaRef={composerRef} value={draft} validPaths={projectFiles.validPaths} />
+              )}
               <Textarea
+                ref={composerRef}
                 value={draft}
                 onChange={(e) => setDraft(e.target.value)}
                 onKeyDown={(e) => {
+                  // AtFileAutocomplete preventDefault()s the Enter that
+                  // commits a suggestion — without this bail the same
+                  // keystroke would ALSO send/save (RunPanel's composer has
+                  // the identical guard).
+                  if (e.defaultPrevented) return;
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
                     if (canSend) {
@@ -742,8 +775,20 @@ export function DiffDialog({ open, task, onClose }: Props) {
                 placeholder="Add a message about the selected lines… (optional)"
                 rows={2}
                 disabled={busy}
-                className="h-16 min-h-0 w-full resize-none text-xs"
+                className="relative h-16 min-h-0 w-full resize-none text-xs"
               />
+              {fileScope && (
+                <AtFileAutocomplete
+                  entries={projectFiles.entries}
+                  truncated={projectFiles.truncated}
+                  value={draft}
+                  onChange={setDraft}
+                  textareaRef={composerRef}
+                  placement="above"
+                  fileScope={fileScope}
+                />
+              )}
+              </div>
               {archived && (
                 <p className="mt-1 text-[10px] text-muted-foreground">
                   Sending will unarchive this task and restore its worktree.

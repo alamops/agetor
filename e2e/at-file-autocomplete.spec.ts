@@ -550,6 +550,74 @@ test.describe("@ file references", () => {
     await expect(atRow(panel, "fresh-file.ts")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   });
 
+  test("Backlog tray inline editor: @ popover + highlight parity", async ({ page, backend }) => {
+    test.setTimeout(60_000);
+    expect(startedTaskId, "the prior 'Start' scenario must have run first").toBeTruthy();
+
+    // Seed a draft via the API, then edit it in the tray.
+    const seeded = await fetch(`${backend.apiBase}/tasks/${startedTaskId}/backlog`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ text: "note to self" }),
+    });
+    expect(seeded.ok).toBe(true);
+
+    await gotoApp(page, backend.bootBase);
+    await taskCard(page, startedTaskTitle).click();
+    const panel = runPanel(page);
+    await panel.getByTitle("Edit").first().click();
+
+    // Put the caret at the end of the seeded text deterministically (autoFocus
+    // caret position is engine-dependent), then type an @ query.
+    const editor = panel.locator('textarea:not([data-testid="send-textarea"])');
+    await expect(editor).toBeVisible();
+    await editor.evaluate((el) => {
+      const t = el as HTMLTextAreaElement;
+      t.focus();
+      t.setSelectionRange(t.value.length, t.value.length);
+    });
+    await page.keyboard.type(" @REA");
+    await expect(atRow(panel, "README.md")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await page.keyboard.press("Enter");
+
+    // Committed into the editor draft (not saved, not sent) and highlighted —
+    // the send box is empty, so the panel's one mark belongs to the editor.
+    await expect(editor).toHaveValue("note to self @README.md ");
+    await expect(highlightMarks(panel)).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+    await panel.getByRole("button", { name: "Cancel" }).click();
+  });
+
+  test("DiffDialog composer: @ popover + highlight parity; a popover Enter never sends", async ({ page, backend }) => {
+    test.setTimeout(60_000);
+    expect(startedTaskId, "the prior 'Start' scenario must have run first").toBeTruthy();
+
+    await gotoApp(page, backend.bootBase);
+    const card = taskCard(page, startedTaskTitle);
+    await expect(card).toBeVisible();
+    await card.getByTitle("View changes (git diff)").click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    // `fresh-file.ts` was written into the worktree by the run-settle
+    // scenario — it shows as an added (untracked) line; selecting it reveals
+    // the compose-from-diff box.
+    await dialog.getByText("export const fresh = true;").first().click();
+    const composer = dialog.getByPlaceholder("Add a message about the selected lines… (optional)");
+    await expect(composer).toBeVisible();
+
+    await composer.click();
+    await page.keyboard.type("@REA");
+    await expect(atRow(dialog, "README.md")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await page.keyboard.press("Enter");
+
+    // The popover's Enter commits the suggestion; the composer's own
+    // Enter-to-send must NOT also fire (`e.defaultPrevented` guard) — the
+    // draft is intact, highlighted, and the dialog is still open.
+    await expect(composer).toHaveValue("@README.md ");
+    await expect(dialog.getByTestId("at-highlight-mark")).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+    await expect(dialog).toBeVisible();
+  });
+
   test("Issue dialog: @REA popover works inside it; Escape leaves the dialog open", async ({ page, backend }) => {
     test.setTimeout(60_000);
     await gotoApp(page, backend.bootBase);

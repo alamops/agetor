@@ -177,3 +177,7 @@ Assumptions logged (routine, reversible):
 ## 15. Follow-up (2026-08-31): transcript path shortening
 
 - `shortenTaskPaths` (mainview/lib, 10 unit tests) folds expanded absolute paths under `worktreePath`/`workdir` back to `@rel` / `@\"rel with spaces\"` in the USER bubble's rendered markdown only — refs arrays/chips/previews and the raw event keep absolute paths. Threaded as `RunEventList.pathRoots` (memoized in RunPanelBody). e2e: the RunPanel follow-up scenario now asserts the bubble shows `and @src/app.ts` while the stdout echo keeps the absolute path.
+
+## 16. Follow-up (2026-08-31): parity for the tray editor + DiffDialog composer
+
+- Backlog tray inline editor and the DiffDialog composer now mount `AtHighlightBackdrop` + `AtFileAutocomplete` (popover above, listing fetched only while the surface is active; module cache shared with the send composer). DiffDialog's Enter-to-send gained the `e.defaultPrevented` bail so a popover commit never doubles as a send. The unresolved-token warning stays PromptComposer-only by design (closes plan §8 assumption 5). e2e: two new scenarios (tray edit commit + highlight; diff composer commit + highlight + no-send-on-popover-Enter).
