@@ -198,8 +198,8 @@ export function useProjectFiles(scope: FileScope | null | undefined): {
  *  once full — a plain `Map`'s insertion-order iteration makes that a
  *  one-line `delete`, no LRU bookkeeping needed for what's just a
  *  keystroke-smoothing cache. */
-const SEARCH_CACHE_MAX = 200;
-const SEARCH_CACHE_TTL_MS = 3000;
+export const SEARCH_CACHE_MAX = 200;
+export const SEARCH_CACHE_TTL_MS = 3000;
 const searchCache = new Map<string, { rows: FileEntry[]; at: number }>();
 
 function searchCacheKey(scope: FileScope, q: string, limit: number): string {
