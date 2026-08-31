@@ -2513,6 +2513,13 @@ function RunPanelBody({
   // `sendRef`.
   const capabilities = useAgentCapabilities(task.agent, task.workdir, task.branch ?? undefined);
   const savedPromptsState = useSavedPrompts();
+  // Stable identity for RunEventList/UserMessageBlock's display-only path
+  // shortening (see the `pathRoots` prop doc) — both are memoized, so a
+  // fresh array each render would defeat them.
+  const pathRoots = useMemo(
+    () => [task.worktreePath, task.workdir],
+    [task.worktreePath, task.workdir],
+  );
   // Which tree the `@` file popover lists/validates against — must match what
   // the server will expand against at send time (`task.worktreePath ?? task.workdir`,
   // see orchestrator `sendInput`): the live worktree once it exists; before the
@@ -2522,13 +2529,6 @@ function RunPanelBody({
   // (`branchSource === "existing"`, e.g. a PR's head branch), else the
   // pinned `baseRef` a freshly-created branch will be cut from; a plain
   // workdir otherwise.
-  // Stable identity for RunEventList/UserMessageBlock's display-only path
-  // shortening (see the `pathRoots` prop doc) — both are memoized, so a
-  // fresh array each render would defeat them.
-  const pathRoots = useMemo(
-    () => [task.worktreePath, task.workdir],
-    [task.worktreePath, task.workdir],
-  );
   const fileScope = useMemo<FileScope>(() => (
     task.worktreePath
       ? { dir: task.worktreePath }
@@ -4501,7 +4501,11 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
       return;
     }
     setNeedsToggle(el.scrollHeight > el.clientHeight + 2);
-  }, [text]);
+    // Keyed on the RENDERED strings, not `text`: the display-only path
+    // shortening derives from `pathRoots` too, which changes when a task's
+    // worktree materializes — measuring `text` alone left a stale
+    // "Show more" on bubbles whose folded content no longer overflows.
+  }, [displayCommandArgs, displayOrdinaryArgs]);
 
   // After expand/collapse commits, apply the saved scroll-top compensation.
   useLayoutEffect(() => {

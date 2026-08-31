@@ -144,8 +144,12 @@ export function SlashAutocomplete({ commands, savedPrompts, value, onChange, tex
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
-    el.setAttribute("aria-autocomplete", "list");
-    el.setAttribute("aria-haspopup", "listbox");
+    // Claim the popup only once one is actually possible — see the same
+    // guard in AtFileAutocomplete (set-once, never removed).
+    if (commands.length > 0 || (savedPrompts?.length ?? 0) > 0) {
+      el.setAttribute("aria-autocomplete", "list");
+      el.setAttribute("aria-haspopup", "listbox");
+    }
     const owns = () => el.getAttribute("aria-controls") === listboxId;
     if (open && filtered.length > 0) {
       el.setAttribute("aria-expanded", "true");
@@ -164,11 +168,14 @@ export function SlashAutocomplete({ commands, savedPrompts, value, onChange, tex
     // `aria-expanded="true"` if this popover unmounts while open (a scope
     // flipping to null mid-query — rare, and the textarea usually unmounts
     // with it).
-  }, [open, filtered.length, active, listboxId, textareaRef]);
+  }, [open, filtered.length, active, listboxId, textareaRef, commands.length, savedPrompts?.length]);
 
-  // Reset highlight when the filtered list changes (avoid a stale index that
-  // points past the new list's length).
-  useEffect(() => { setActive(0); }, [slice?.query, filtered.length]);
+  // Reset highlight when the filtered list changes — keyed on the ARRAY
+  // ITSELF, not its length, so a same-length content swap (a focus-refetch
+  // reordering commands under an unchanged query) can't leave `active`
+  // pointing at a different row than the highlighted one. Mirrors
+  // AtFileAutocomplete's reset.
+  useEffect(() => { setActive(0); }, [slice?.query, filtered]);
 
   // Keep the highlighted row scrolled into view. `data-idx` (not positional
   // children) since the "Saved Prompts" group label is itself a list child.

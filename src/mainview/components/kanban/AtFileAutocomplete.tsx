@@ -222,14 +222,23 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
-    el.setAttribute("aria-autocomplete", "list");
-    el.setAttribute("aria-haspopup", "listbox");
+    // Claim the popup only once one is actually possible (entries to
+    // suggest, or a failure notice to show). Set-once, never removed — a
+    // removal here would re-create the shared-textarea ordering hazard the
+    // no-cleanup note below describes, and "had data once" is close enough.
+    if (entries.length > 0 || error) {
+      el.setAttribute("aria-autocomplete", "list");
+      el.setAttribute("aria-haspopup", "listbox");
+    }
     const owns = () => el.getAttribute("aria-controls") === listboxId;
-    if (open || errorOpen) {
+    // Error-notice mode is deliberately COLLAPSED for combobox purposes:
+    // it renders a `role="status"` paragraph, not the listbox, so claiming
+    // aria-expanded/aria-controls there would point at an id that doesn't
+    // exist. The status role announces the notice on its own.
+    if (open) {
       el.setAttribute("aria-expanded", "true");
       el.setAttribute("aria-controls", listboxId);
-      if (open) el.setAttribute("aria-activedescendant", `${listboxId}-opt-${active}`);
-      else el.removeAttribute("aria-activedescendant");
+      el.setAttribute("aria-activedescendant", `${listboxId}-opt-${active}`);
     } else if (owns()) {
       el.setAttribute("aria-expanded", "false");
       el.removeAttribute("aria-controls");
@@ -243,8 +252,7 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
     // `aria-expanded="true"` if this popover unmounts while open (a scope
     // flipping to null mid-query — rare, and the textarea usually unmounts
     // with it).
-  }, [open, errorOpen, active, listboxId, textareaRef]);
-
+  }, [open, active, listboxId, textareaRef, entries.length, error]);
 
   // Reset highlight when the displayed list changes. Keyed on the `rows`
   // ARRAY ITSELF, not `rows.length` — remote rows replacing client-filtered

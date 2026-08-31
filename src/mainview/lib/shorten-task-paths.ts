@@ -24,6 +24,12 @@ const REGEX_ESC = /[.*+?^${}()|[\]\\]/g;
  * picker attached from elsewhere on disk, paths the agent itself printed —
  * are left untouched.
  */
+/** Fenced code blocks (``` … ``` — an unterminated fence swallows the rest)
+ *  and single-line inline code spans. Content inside these is NOT folded:
+ *  code context implies literal output (a pasted error log, a command), and
+ *  rewriting paths there would misrepresent what the text actually said. */
+const CODE_SPANS = /(```[\s\S]*?(?:```|$)|`[^`\n]*`)/g;
+
 export function shortenTaskPaths(
   text: string,
   roots: ReadonlyArray<string | null | undefined>,
@@ -34,6 +40,16 @@ export function shortenTaskPaths(
       .filter((r): r is string => typeof r === "string" && r.trim().length > 0)
       .map((r) => r.replace(/\/+$/, "")),
   )].sort((a, b) => b.length - a.length);
+  if (cleaned.length === 0) return text;
+  // Split-with-capture yields [plain, code, plain, code, …] — odd indices
+  // are the captured code spans, passed through verbatim.
+  return text
+    .split(CODE_SPANS)
+    .map((seg, i) => (i % 2 === 1 ? seg : foldSegment(seg, cleaned)))
+    .join("");
+}
+
+function foldSegment(text: string, cleaned: readonly string[]): string {
   let out = text;
   for (const root of cleaned) {
     if (!out.includes(`${root}/`)) continue;

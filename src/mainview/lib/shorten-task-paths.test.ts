@@ -52,3 +52,13 @@ test("no slash fast path returns the same string", () => {
   const s = "plain text";
   expect(shortenTaskPaths(s, [WT])).toBe(s);
 });
+
+test("code spans are never folded: fenced blocks, inline code, unterminated fences", () => {
+  const fenced = "look:\n```\nError at " + WT + "/src/db.ts:3\n```\nand " + WT + "/src/db.ts";
+  expect(shortenTaskPaths(fenced, [WT]))
+    .toBe("look:\n```\nError at " + WT + "/src/db.ts:3\n```\nand @src/db.ts");
+  expect(shortenTaskPaths("see `" + WT + "/a.ts` and " + WT + "/a.ts", [WT]))
+    .toBe("see `" + WT + "/a.ts` and @a.ts");
+  const unterminated = "log:\n```\ntrace " + WT + "/x.ts";
+  expect(shortenTaskPaths(unterminated, [WT])).toBe(unterminated);
+});
