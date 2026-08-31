@@ -143,4 +143,36 @@ test.describe("task details header", () => {
     await closeButton.click();
     await expect(panel).toHaveClass(/translate-x-full/);
   });
+
+  test("header icon buttons show a hover tooltip and carry no native title", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const prompt = `header-tooltip-e2e ${randomUUID()}`;
+    await createAndStartFakeClaudeTask(request, backend, prompt);
+
+    await gotoApp(page, backend.bootBase);
+    await openTask(page, prompt);
+    const header = panelHeader(page);
+    const viewDiffButton = header.getByRole("button", { name: "View diff" });
+    const tooltip = header.getByTestId("tooltip");
+
+    // --- (1) hovering the button shows the `Tooltip` bubble (auto-waiting
+    // covers the 300ms `TOOLTIP_SHOW_DELAY_MS` from tooltip.tsx) with the
+    // expected label text. -------------------------------------------------
+    await expect(tooltip).not.toBeVisible();
+    await viewDiffButton.hover();
+    await expect(tooltip).toBeVisible();
+    await expect(tooltip).toHaveText("View this task's changes (git diff)");
+
+    // --- (2) moving the mouse away hides the bubble (mouseleave) -----------
+    await page.mouse.move(0, 0);
+    await expect(tooltip).not.toBeVisible();
+
+    // --- (3) the wrapped button no longer carries a native `title` attribute
+    // — guards against the double-tooltip regression (native title tooltip
+    // stacking on top of the new hover bubble). -----------------------------
+    await expect(viewDiffButton).not.toHaveAttribute("title");
+  });
 });
