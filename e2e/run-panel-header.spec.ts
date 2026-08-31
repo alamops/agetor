@@ -156,7 +156,10 @@ test.describe("task details header", () => {
     await openTask(page, prompt);
     const header = panelHeader(page);
     const viewDiffButton = header.getByRole("button", { name: "View diff" });
-    const tooltip = header.getByTestId("tooltip");
+    // The bubble portals to document.body (scroll-container clipping + the
+    // aside's transform), so it is looked up page-wide — safe from strict-mode
+    // ambiguity because the Tooltip primitive only ever paints one bubble.
+    const tooltip = page.getByTestId("tooltip");
 
     // --- (1) hovering the button shows the `Tooltip` bubble (auto-waiting
     // covers the 300ms `TOOLTIP_SHOW_DELAY_MS` from tooltip.tsx) with the

@@ -3173,25 +3173,27 @@ function RunPanelBody({
               />
             }
             trailing={
-              <Button
-                size="icon"
-                onClick={() => void send()}
-                disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
-                title={
-                  // Distinguish "live session exists" from "needs resume" — not
-                  // "turn in flight". `liveRunId` (task.runId) stays set while the
-                  // tmux session is alive (including between turns) and is only
-                  // null once the session is gone (orphan-reconciled), which is the
-                  // resume path. Keying off `canControl` here would mislabel the
-                  // common "session alive, no turn in flight" state as a resume.
-                  liveRunId
-                    ? "Send to the live agent"
-                    : "Resume the conversation with this message"
-                }
-                className="h-16 w-12 shrink-0"
+              // Distinguish "live session exists" from "needs resume" — not
+              // "turn in flight". `liveRunId` (task.runId) stays set while the
+              // tmux session is alive (including between turns) and is only
+              // null once the session is gone (orphan-reconciled), which is the
+              // resume path. Keying off `canControl` here would mislabel the
+              // common "session alive, no turn in flight" state as a resume.
+              <Tooltip
+                align="end"
+                side="top"
+                label={liveRunId ? "Send to the live agent" : "Resume the conversation with this message"}
               >
-                <Send className="size-4" />
-              </Button>
+                <Button
+                  size="icon"
+                  onClick={() => void send()}
+                  disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
+                  aria-label={liveRunId ? "Send to the live agent" : "Resume the conversation with this message"}
+                  className="h-16 w-12 shrink-0"
+                >
+                  <Send className="size-4" />
+                </Button>
+              </Tooltip>
             }
             rows={2}
             textareaClassName="h-16 min-h-0 w-full resize-none text-xs pr-8"
@@ -3496,57 +3498,75 @@ function BacklogItemRow({
       </div>
       {!readOnly && (
         <div className="flex shrink-0 items-center gap-0.5 opacity-60 transition-opacity group-hover:opacity-100">
-          <button
-            type="button"
-            className={BACKLOG_ICON_BTN}
-            disabled={index === 0 || busy}
-            onClick={() => onMove(-1)}
-            title="Move up"
-          >
-            <ArrowUp className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={BACKLOG_ICON_BTN}
-            disabled={index === total - 1 || busy}
-            onClick={() => onMove(1)}
-            title="Move down"
-          >
-            <ArrowDown className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={BACKLOG_ICON_BTN}
-            onClick={onStartEdit}
-            title="Edit"
-          >
-            <FilePenLine className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={BACKLOG_ICON_BTN}
-            disabled={!canSend || busy}
-            onClick={onSend}
-            // `canSend` here is the parent's `canSend && !modalPending`, so it
-            // goes false for two different reasons — no live/resumable session,
-            // or a prompt is waiting. Keep the copy true for both.
-            title={
+          <Tooltip align="end" side="top" label="Move up">
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              disabled={index === 0 || busy}
+              onClick={() => onMove(-1)}
+              aria-label="Move up"
+            >
+              <ArrowUp className="size-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip align="end" side="top" label="Move down">
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              disabled={index === total - 1 || busy}
+              onClick={() => onMove(1)}
+              aria-label="Move down"
+            >
+              <ArrowDown className="size-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip align="end" side="top" label="Edit">
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              onClick={onStartEdit}
+              aria-label="Edit"
+            >
+              <FilePenLine className="size-3.5" />
+            </button>
+          </Tooltip>
+          {/* `canSend` here is the parent's `canSend && !modalPending`, so it
+              goes false for two different reasons — no live/resumable session,
+              or a prompt is waiting. Keep the copy true for both. */}
+          <Tooltip
+            align="end"
+            side="top"
+            label={
               canSend
                 ? "Send now"
                 : "Can't send right now — run the task, or answer the pending prompt first"
             }
           >
-            <Send className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={cn(BACKLOG_ICON_BTN, "hover:bg-destructive/10 hover:text-destructive")}
-            disabled={busy}
-            onClick={onDelete}
-            title="Delete"
-          >
-            <Trash2 className="size-3.5" />
-          </button>
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              disabled={!canSend || busy}
+              onClick={onSend}
+              aria-label={
+                canSend
+                  ? "Send now"
+                  : "Can't send right now — run the task, or answer the pending prompt first"
+              }
+            >
+              <Send className="size-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip align="end" side="top" label="Delete">
+            <button
+              type="button"
+              className={cn(BACKLOG_ICON_BTN, "hover:bg-destructive/10 hover:text-destructive")}
+              disabled={busy}
+              onClick={onDelete}
+              aria-label="Delete"
+            >
+              <Trash2 className="size-3.5" />
+            </button>
+          </Tooltip>
         </div>
       )}
     </div>
@@ -5359,29 +5379,30 @@ function TaskDetails({
           <dt className="flex items-center gap-1 text-muted-foreground">
             Model
             {editable && (
-              <button
-                type="button"
-                title="Refresh model list"
-                aria-label="Refresh model list"
-                data-testid="refresh-models-details"
-                disabled={refreshingModels}
-                className={cn(
-                  "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
-                  refreshingModels && "animate-spin",
-                )}
-                onClick={async () => {
-                  setRefreshingModels(true);
-                  try {
-                    await onRefreshModels(task.agent);
-                  } catch {
-                    // The SSE / ready-retry paths also refetch.
-                  } finally {
-                    setRefreshingModels(false);
-                  }
-                }}
-              >
-                <RefreshCw className="size-3" />
-              </button>
+              <Tooltip label="Refresh model list">
+                <button
+                  type="button"
+                  aria-label="Refresh model list"
+                  data-testid="refresh-models-details"
+                  disabled={refreshingModels}
+                  className={cn(
+                    "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
+                    refreshingModels && "animate-spin",
+                  )}
+                  onClick={async () => {
+                    setRefreshingModels(true);
+                    try {
+                      await onRefreshModels(task.agent);
+                    } catch {
+                      // The SSE / ready-retry paths also refetch.
+                    } finally {
+                      setRefreshingModels(false);
+                    }
+                  }}
+                >
+                  <RefreshCw className="size-3" />
+                </button>
+              </Tooltip>
             )}
           </dt>
           <dd className="min-w-0">
