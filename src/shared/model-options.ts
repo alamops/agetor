@@ -53,6 +53,17 @@
  *    actually run. Rule 6's selected-unlisted append still applies on top
  *    of this fallback, same as any other discovery-empty case.
  *
+ *    Every new `mergeModelOptions` caller must thread `HarnessStatus.loggedIn`
+ *    through — the field is optional only for back-compat ("omitted ⇒
+ *    unchanged behavior", same as `true`/`null`); omitting it at a real
+ *    picker site silently reproduces the over-show bug this rule exists to
+ *    prevent. Note also that rule 7 itself is kind-agnostic — it applies to
+ *    any caller that passes `loggedIn`, `scoped` or not — while its
+ *    rationale above is fx-specific: a future kind whose logged-out
+ *    discovery happened to return a correct catalog would have it discarded
+ *    too. That's acceptable: this rule intentionally fails closed on trust
+ *    rather than carving out per-kind exceptions.
+ *
  * Inputs are never mutated; a new array is always returned.
  */
 
@@ -183,10 +194,16 @@ export function mergeModelOptions(input: MergeModelOptionsInput): ModelOption[] 
   // both lists.
   if (selected) {
     if (!seen.has(selected)) {
+      // On the rule-7 distrust path the catalog was discarded, not
+      // consulted, so "not in this account's catalog" would be a claim we
+      // never actually checked — use the honest logged-out hint instead.
+      const hint = input.loggedIn === false
+        ? "Not logged in — this account's catalog is unavailable"
+        : "Not in this account's model catalog";
       result.push({
         id: selected,
         label: selected,
-        hint: "Not in this account's model catalog",
+        hint,
         unlisted: true,
       });
     }

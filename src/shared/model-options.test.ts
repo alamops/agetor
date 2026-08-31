@@ -291,13 +291,15 @@ test("rule 7: loggedIn:false still appends a selected discovered-only id as unli
     {
       id: "e2e/discovered-only",
       label: "e2e/discovered-only",
-      hint: "Not in this account's model catalog",
+      hint: "Not logged in — this account's catalog is unavailable",
       unlisted: true,
     },
   ]);
 });
 
-test("rule 7: loggedIn true/null/omitted are all identical to today's (unchanged) behavior", () => {
+test("rule 7: loggedIn true/null/omitted are all identical to today's (unchanged) behavior — unscoped", () => {
+  // Explicit-literal pin for the unscoped case, kept alongside the looped
+  // assertion below so the scoped/unscoped pair can't both silently drift.
   const curated = curatedFixture();
   const discovered: DiscoveredModel[] = [
     { id: "openai/gpt-5.2" },
@@ -316,6 +318,24 @@ test("rule 7: loggedIn true/null/omitted are all identical to today's (unchanged
   expect(withTrue).toEqual(expected);
   expect(withNull).toEqual(expected);
   expect(omitted).toEqual(expected);
+});
+
+test("rule 7: loggedIn true/null/omitted are all identical to today's (unchanged) behavior — scoped and unscoped", () => {
+  const curated = curatedFixture();
+  const discovered: DiscoveredModel[] = [
+    { id: "openai/gpt-5.2" },
+    { id: "anthropic/claude-opus-5" },
+    { id: "e2e/discovered-only" },
+  ];
+  for (const scoped of [true, false]) {
+    const expected = mergeModelOptions({ curated, discovered, scoped, selected: null });
+    const withTrue = mergeModelOptions({ curated, discovered, scoped, selected: null, loggedIn: true });
+    const withNull = mergeModelOptions({ curated, discovered, scoped, selected: null, loggedIn: null });
+    const omitted = mergeModelOptions({ curated, discovered, scoped, selected: null });
+    expect(withTrue).toEqual(expected);
+    expect(withNull).toEqual(expected);
+    expect(omitted).toEqual(expected);
+  }
 });
 
 // --- hasDiscoveredCatalog -------------------------------------------------

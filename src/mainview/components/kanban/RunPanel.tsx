@@ -5213,6 +5213,7 @@ function TaskDetails({
   const [refreshingModels, setRefreshingModels] = useState(false);
   const editable = task.column !== "running" && task.column !== "blocked";
   const kind = harnessKindOf(task.agent, harnesses);
+  const selectedStatus = agents.find((a) => a.harnessId === task.agent);
 
   const save = async (patch: Partial<Task>) => {
     try {
@@ -5279,6 +5280,20 @@ function TaskDetails({
         : nextEfforts[0]!.id;
     void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, fast: false, maxMode: false });
   };
+
+  // Memoized so the merge (curated ∪ discovered, rule 1–7) only re-runs when
+  // one of its actual inputs changes, not on every streamed-event render.
+  const modelOptions = useMemo(
+    () => mergedModels(
+      kind,
+      task.agent,
+      agentModels,
+      harnessModels,
+      task.model ?? DEFAULT_MODEL[kind],
+      selectedStatus?.loggedIn ?? null,
+    ),
+    [kind, task.agent, agentModels, harnessModels, task.model, selectedStatus?.loggedIn],
+  );
 
   return (
     <details className="border-b border-border/60 px-3 py-2 text-xs">
@@ -5359,7 +5374,7 @@ function TaskDetails({
             {editable ? (
               <CompactSelect
                 value={task.model ?? DEFAULT_MODEL[kind]}
-                options={mergedModels(kind, task.agent, agentModels, harnessModels, task.model ?? DEFAULT_MODEL[kind], agents.find((a) => a.harnessId === task.agent)?.loggedIn ?? null)}
+                options={modelOptions}
                 onChange={(model) => void save({ model })}
               />
             ) : (

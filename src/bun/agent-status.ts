@@ -291,8 +291,15 @@ const TMUX_INSTALL_HINT = "brew install tmux (macOS) or apt install tmux (Debian
  * above) for this one call. Start (`orchestrator.ts`'s `startTask`) passes
  * `{ freshAuth: true }` — a user who just ran `fx login` must not be refused
  * for up to `STATUS_CACHE_TTL_MS` by a stale cached `false`. The 15s
- * `/harnesses` poll can tolerate that staleness (it's just painting a status
- * dot), so it omits the option and reads from cache.
+ * `/harnesses` poll can tolerate that staleness for its own purpose (it's
+ * just painting a status dot), so it omits the option and reads from cache
+ * — but `loggedIn` now has a second consumer: `mergeModelOptions`'s rule 7
+ * (`src/shared/model-options.ts`) uses it to decide whether a picker trusts
+ * the harness's discovered catalog. A stale cached `false` therefore also
+ * transiently collapses the model list to the non-gated curated rows for up
+ * to `STATUS_CACHE_TTL_MS` — self-healing on the next post-expiry poll, and
+ * never hit by `startTask` itself since that call always passes
+ * `freshAuth: true`.
  */
 export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolean }): Promise<HarnessStatus> {
   const bin = resolveBin(harness);
