@@ -1,13 +1,37 @@
-import { test, expect } from "bun:test";
+import { test, expect, mock, afterAll } from "bun:test";
 import { render } from "ink-testing-library";
 import { Composer } from "./Composer.tsx";
 import { buildFileEntries } from "../../shared/at-file-filter.ts";
+
+// Snapshot the real `at-complete.ts` exports into a plain object BEFORE
+// mocking (same pattern as `Dashboard.test.tsx`'s `../sse.ts` mock) so a spy
+// on `suggestAtEntries` (memoization regression test below) can be reverted
+// after this file's tests finish. This snapshot copy is load-bearing, not
+// cosmetic: `mock.module` replaces the live module record in place, so if
+// the wrapped `suggestAtEntries` below called back through the live
+// `realAtComplete` namespace instead of this frozen copy, it would end up
+// calling ITSELF (infinite recursion) once the mock is installed.
+import * as realAtComplete from "./at-complete.ts";
+const realAtCompleteSnapshot = { ...realAtComplete };
+let suggestCalls = 0;
+mock.module("./at-complete.ts", () => ({
+  ...realAtCompleteSnapshot,
+  suggestAtEntries: (...args: Parameters<typeof realAtComplete.suggestAtEntries>) => {
+    suggestCalls++;
+    return realAtCompleteSnapshot.suggestAtEntries(...args);
+  },
+}));
+afterAll(() => {
+  mock.module("./at-complete.ts", () => realAtCompleteSnapshot);
+});
 
 const wait = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 const ENTER = "\r";
 const TAB = "\t";
 const BACKSPACE = String.fromCharCode(127); // DEL
 const ESC = String.fromCharCode(27);
+const UP = ESC + "[A"; // xterm up-arrow sequence
+const DOWN = ESC + "[B"; // xterm down-arrow sequence
 
 const fileEntries = buildFileEntries(["README.md", "docs/my notes.md", "src/bun/db.ts"]);
 
@@ -187,4 +211,42 @@ test("Esc dismisses the popover without cancelling the composer; a second Esc ca
   stdin.write(ESC);
   await wait();
   expect(cancelled).toBe(true); // second Esc, nothing open, falls through to cancel
+});
+
+test("suggestions are memoized: an unrelated re-render (arrow-key nav) doesn't recompute them", async () => {
+  suggestCalls = 0;
+  const { stdin } = render(
+    <Composer active label="→" fileEntries={fileEntries} onSubmit={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write("@RE");
+  await wait();
+  const afterTyping = suggestCalls;
+  expect(afterTyping).toBeGreaterThan(0);
+  // Up/down arrow only moves the highlighted row (`sel` state) — `text` and
+  // `fileEntries` are unchanged, so the memoized suggestions must not be
+  // recomputed even though the component re-renders.
+  stdin.write(DOWN);
+  await wait();
+  stdin.write(UP);
+  await wait();
+  expect(suggestCalls).toBe(afterTyping);
+});
+
+test("Esc dismisses, then typing past it and backspacing back to the same query reopens the popover", async () => {
+  const { stdin, lastFrame } = render(
+    <Composer active label="→" fileEntries={fileEntries} onSubmit={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write("@src");
+  await wait();
+  expect(lastFrame() ?? "").toContain("tab/enter accept"); // open on "src"
+  stdin.write(ESC);
+  await wait();
+  expect(lastFrame() ?? "").not.toContain("tab/enter accept"); // dismissed for "src"
+  stdin.write("x");
+  await wait();
+  stdin.write(BACKSPACE); // back to "src" — the exact key that was dismissed
+  await wait();
+  expect(lastFrame() ?? "").toContain("tab/enter accept"); // reopens, not stuck closed
 });

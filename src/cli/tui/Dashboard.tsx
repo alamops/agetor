@@ -13,6 +13,8 @@ import { runControl, resumableRunId } from "../run-logic.ts";
 import { Logo } from "./logo.tsx";
 import { fileScopeForTask } from "./at-complete.ts";
 import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
+// `../at-warn.ts` is owned by a sibling — import its pure exports only, never edit the file.
+import { discoveredExtensionNames, filterUnresolvedRefs } from "../at-warn.ts";
 
 type Mode = "nav" | "compose" | "answer";
 
@@ -61,29 +63,55 @@ export function Dashboard({
   const frame = useSpinner(anyRunning);
 
   // `@` file-reference listing for the composer's popover — see at-complete.ts
-  // and CLAUDE.md §12. Fetched once per task id (not on every 1.5s board
-  // poll) and cached in a ref so reopening the composer for the same task is
-  // instant; a fetch failure degrades to no suggestions rather than blocking
-  // the composer.
+  // and CLAUDE.md §12. Cached by SCOPE (dir+ref), not by task id: a task
+  // cached pre-run under `{dir: workdir, ref: baseRef}` must NOT keep serving
+  // that listing once its worktree materializes and `fileScopeForTask` starts
+  // returning `{dir: worktreePath}` — same `cacheKey` shape as the webview's
+  // `use-project-files.ts`. A fetch failure degrades to no suggestions rather
+  // than blocking the composer.
   const [composeFileEntries, setComposeFileEntries] = useState<FileEntry[]>([]);
   const fileEntriesCache = useRef<Map<string, FileEntry[]>>(new Map());
+  // `target` is resolved by id (see above) so this stays valid even though
+  // `sorted` reshuffles every 1.5s poll.
+  const composeScope = target ? fileScopeForTask(target) : null;
+  const composeScopeKey = composeScope ? `${composeScope.dir} ${composeScope.ref ?? ""}` : null;
+
+  // `agentDiscovery`'s `@name` extension names for a task (the ExtensionPicker's
+  // own mention syntax, e.g. `@github` — never a file reference). Delegates
+  // the actual fetch/mapping to `discoveredExtensionNames` (`../at-warn.ts`,
+  // owned by a sibling — shared with `commands/add.ts`/`commands/lifecycle.ts`
+  // so all three surfaces agree on what's exempt and on fail-open-to-empty
+  // behavior), adding only a per-task-id cache on top: unlike the file-listing
+  // scope, agent/workdir/branch don't change mid-task the way a worktree
+  // materializing does, so there's no need to key this on scope.
+  const extensionNamesCache = useRef<Map<string, Set<string>>>(new Map());
+  const getExtensionNames = async (task: Task): Promise<Set<string>> => {
+    const cached = extensionNamesCache.current.get(task.id);
+    if (cached) return cached;
+    const names = await discoveredExtensionNames(client, task);
+    extensionNamesCache.current.set(task.id, names);
+    return names;
+  };
+
   useEffect(() => {
-    if (mode !== "compose" || !targetId) return;
-    const cached = fileEntriesCache.current.get(targetId);
+    if (mode !== "compose" || !targetId || !target || !composeScope || !composeScopeKey) return;
+    // Fire-and-forget: warm the `@name` extension-exemption set used by the
+    // post-send/post-start "won't resolve" warning (see `getExtensionNames`
+    // below) — independent of, and no slower than, the file listing fetch.
+    void getExtensionNames(target);
+    const cached = fileEntriesCache.current.get(composeScopeKey);
     if (cached) {
       setComposeFileEntries(cached);
       return;
     }
-    const composeTask = sorted.find((t) => t.id === targetId);
-    if (!composeTask) return;
     let alive = true;
-    setComposeFileEntries([]); // no stale suggestions from a previous task while this loads
+    setComposeFileEntries([]); // no stale suggestions from a previous scope while this loads
     void (async () => {
       try {
-        const { files } = await client.listProjectFiles(fileScopeForTask(composeTask));
+        const { files } = await client.listProjectFiles(composeScope);
         if (!alive) return;
         const entries = buildFileEntries(files);
-        fileEntriesCache.current.set(targetId, entries);
+        fileEntriesCache.current.set(composeScopeKey, entries);
         setComposeFileEntries(entries);
       } catch {
         // Best-effort: no suggestions this time, composer still usable.
@@ -92,10 +120,13 @@ export function Dashboard({
     return () => {
       alive = false;
     };
-    // `sorted` changes every 1.5s poll and must NOT retrigger this fetch —
-    // only a compose-mode open for a (possibly different) task should.
+    // `sorted`/`target`/`composeScope` change every 1.5s poll (new object
+    // identity even when the scope is unchanged) and must NOT retrigger this
+    // fetch on their own — only a compose-mode open for a different task OR
+    // an actual scope change (tracked via the stable `composeScopeKey`
+    // string) should.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, targetId, client]);
+  }, [mode, targetId, composeScopeKey, client]);
 
   const sendMessage = (task: Task, text: string, okLabel = "→ sent") => {
     if (task.pendingInteractionCount > 0) {
@@ -116,19 +147,16 @@ export function Dashboard({
         if (res.delivered === false) {
           setStatus(`! ${res.reason ?? "not delivered"}`);
         } else if (res.unresolvedRefs?.length) {
-          // Surface the send-time expansion's leftovers inline — no
-          // discovery/filtering here (that's the popover's job while
-          // composing); this is just a transient one-line heads-up after
-          // the message is already gone, mirroring the webview's
-          // "won't resolve" warning at send time.
-          const n = res.unresolvedRefs.length;
-          const preview = res.unresolvedRefs.slice(0, 2).join(", ");
-          setStatus(
-            truncate(
-              `${okLabel} · ⚠ ${n} @ ref${n === 1 ? "" : "s"} won't resolve: ${preview}`,
-              120,
-            ),
-          );
+          // Surface the send-time expansion's leftovers inline — a transient
+          // one-line heads-up after the message is already gone, mirroring
+          // the webview's "won't resolve" warning at send time. Filtered
+          // through the same discovery-based exemption `agetor send`/`agetor
+          // add --issue` use (`filterUnresolvedRefs` in `../at-warn.ts`) so an
+          // `@name` extension mention (e.g. `@github`) doesn't false-warn.
+          const extensionNames = await getExtensionNames(task);
+          const filtered = filterUnresolvedRefs(res.unresolvedRefs, { extensionNames });
+          const fragment = unresolvedWarningFragment(filtered);
+          setStatus(fragment ? truncate(`${okLabel}${fragment}`, 120) : okLabel);
         } else {
           setStatus(okLabel);
         }
@@ -165,10 +193,28 @@ export function Dashboard({
       const sid = selected.id.slice(0, 8);
       const ctrl = runControl(selected);
       if (ctrl === "run") {
-        void client
-          .startTask(selected.id)
-          .then(() => setStatus(`▸ started ${sid}`))
-          .catch((e) => setStatus(`! ${e.message}`));
+        const task = selected;
+        void (async () => {
+          try {
+            const res = await client.startTask(task.id);
+            if (res.unresolvedRefs?.length) {
+              // The discovery set may not be warmed yet — this task may never
+              // have been composed to (`getExtensionNames` fails open to an
+              // empty set on a discovery error, so a missing/erroring
+              // `agentDiscovery` never blocks the "started" status).
+              const extensionNames = await getExtensionNames(task);
+              const filtered = filterUnresolvedRefs(res.unresolvedRefs, { extensionNames });
+              const fragment = unresolvedWarningFragment(filtered);
+              if (fragment) {
+                setStatus(truncate(`▸ started ${sid}${fragment}`, 120));
+                return;
+              }
+            }
+            setStatus(`▸ started ${sid}`);
+          } catch (e) {
+            setStatus(`! ${(e as Error).message}`);
+          }
+        })();
       } else if (ctrl === "stop") {
         setStatus("already running — press x to stop");
       } else {
@@ -441,6 +487,17 @@ function columnColor(col: string): string {
 
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+/** `" · ⚠ N @ ref(s) won't resolve: ..."` fragment for a non-empty, already
+ *  discovery-filtered list of raw unresolved `@`-tokens; `""` (nothing to
+ *  append) for an empty list. Shared by the post-send and post-start status
+ *  lines so the two surfaces can't drift in wording. */
+function unresolvedWarningFragment(tokens: string[]): string {
+  if (tokens.length === 0) return "";
+  const n = tokens.length;
+  const preview = tokens.slice(0, 2).join(", ");
+  return ` · ⚠ ${n} @ ref${n === 1 ? "" : "s"} won't resolve: ${preview}`;
 }
 
 function jsonField(s: string, field: string): string | undefined {

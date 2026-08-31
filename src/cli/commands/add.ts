@@ -6,7 +6,14 @@ import { c, out, printJson, isTTY } from "../output.ts";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import { flagValue } from "../args.ts";
 import { resolveRefs, warnMissingRefs } from "../refs.ts";
-import { filterUnresolvedRefs, unresolvedWarningLine, warnUnresolvedRefs } from "../at-warn.ts";
+import {
+  discoveredExtensionNames,
+  existsInLiveScope,
+  filterUnresolvedRefs,
+  unresolvedWarningLine,
+  warnUnresolvedRefs,
+} from "../at-warn.ts";
+import { fileScopeForTask } from "../tui/at-complete.ts";
 import {
   parseIssueUrl,
   sameIssueUrl,
@@ -22,7 +29,6 @@ import {
   CATALOG_SCOPED_KINDS,
   supportedEfforts,
   type AgentKind,
-  type Task,
 } from "../../shared/types.ts";
 import { mergeModelOptions, type DiscoveredModel } from "../../shared/model-options.ts";
 import { buildFileEntries } from "../../shared/at-file-filter.ts";
@@ -85,6 +91,20 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   if (o.promptFile) {
     prompt = o.promptFile === "-" ? (await Bun.stdin.text()).trim() : readFileSync(o.promptFile, "utf8");
   }
+
+  // The user-typed prompt, if any, exactly as supplied via `--prompt` or
+  // `--prompt-file` — snapshotted here, BEFORE the `--issue` block below may
+  // compose the thread body into `prompt` via `??=`, so it's provably
+  // pre-composition regardless of which path runs next. This is what
+  // `restrictTo` filters against for an `--issue` add (below): the wizard
+  // never independently solicits additional prompt text for an issue task —
+  // `wizard()`'s `prefilledPrompt` param is always already non-null by the
+  // time it's called (either this snapshot, when the user passed
+  // `--prompt`/`--prompt-file`, or the composed thread body otherwise), so
+  // its own `p.text` prompt question never fires — meaning nothing after
+  // this point can add more genuinely user-typed content for an issue task,
+  // in either the TTY (wizard) or non-interactive (flag) path.
+  const userTypedPrompt = prompt ?? null;
 
   // Captured BEFORE the `--issue` block below fills in title/prompt
   // fallbacks — otherwise every `--issue` invocation would look "explicit"
@@ -165,13 +185,15 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   // `restrictTo` matches the `--start`/pre-check paths below: an `--issue`
   // task's composed prompt quotes issue text full of `@octocat`-style
   // mentions that must not trigger the warning — only tokens the user
-  // themselves typed into `--prompt`/`--prompt-file` count. A plain add's
-  // whole prompt is user-typed, so no restriction is needed.
-  // An `--issue` add with no user-typed `--prompt` has NO user-typed tokens
-  // at all — restrict to the empty string (warn on nothing) rather than null
+  // themselves typed (into `--prompt`, `--prompt-file`, or the wizard's
+  // interactive prompt — captured above as `userTypedPrompt`, never
+  // `--title`) count. A plain add's whole prompt is user-typed, so no
+  // restriction is needed.
+  // An `--issue` add with no user-typed prompt has NO user-typed tokens at
+  // all — restrict to the empty string (warn on nothing) rather than null
   // (warn on everything), or the composed thread body's quoted third-party
   // `@mentions` would all read as "won't resolve".
-  const restrictTo = o.issue ? (o.prompt ?? "") : null;
+  const restrictTo = o.issue ? (userTypedPrompt ?? "") : null;
   let unresolvedRefsWarning: string[] = [];
 
   let started = false;
@@ -186,23 +208,32 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     } catch {
       started = false;
     }
-  } else if (input.prompt.includes("@")) {
+  } else if (restrictTo !== "" && input.prompt.includes("@")) {
     // Task wasn't started, so there's no server-side send-time expansion to
     // ask — advisory client-side pre-check instead: list the scope the task
-    // will actually run in (mirrors the webview's `fileScope` derivation,
-    // CLAUDE.md §12) and flag any `@`-token the user typed that won't
-    // resolve there. Never blocks or fails the add; a listing that errored
-    // or got truncated can't prove a token unresolved, so it's skipped
-    // silently rather than false-warning.
+    // will actually run in (the same `fileScopeForTask` table `RunPanel` /
+    // the TUI composer use, CLAUDE.md §12) and flag any `@`-token the user
+    // typed that won't resolve there. Never blocks or fails the add; a
+    // listing that errored, came back empty, or got truncated can't prove a
+    // token unresolved, so it's skipped silently rather than false-warning.
+    // `restrictTo === ""` (an `--issue` add with no user-typed prompt) is
+    // checked above before this branch even runs: every candidate token
+    // would be filtered out anyway, so there's no reason to pay for the
+    // listing fetch.
     try {
-      const scope = {
-        dir: task.workdir,
-        ref: (o.isolation ?? "worktree") !== "none" ? o.baseRef?.trim() || "HEAD" : null,
-      };
+      const scope = fileScopeForTask(task);
       const listing = await client.listProjectFiles(scope);
-      if (!listing.truncated) {
+      if (!listing.truncated && listing.files.length > 0) {
         const validPaths = new Set(buildFileEntries(listing.files).map((e) => e.path));
-        const rawUnresolved = unresolvedAtTokens(input.prompt, validPaths).map((t) => t.raw);
+        let unresolvedTokens = unresolvedAtTokens(input.prompt, validPaths);
+        if (scope.ref == null) {
+          // A LIVE scope (`--isolation none`) runs on this same machine, so
+          // mirror the server's real oracle directly: a gitignored-but-
+          // present path (e.g. `@.env`) isn't in the listing but DOES exist
+          // on disk, and send-time expansion will resolve it — must not warn.
+          unresolvedTokens = unresolvedTokens.filter((t) => !existsInLiveScope(scope.dir, t.path));
+        }
+        const rawUnresolved = unresolvedTokens.map((t) => t.raw);
         if (rawUnresolved.length) {
           const extensionNames = await discoveredExtensionNames(client, task);
           unresolvedRefsWarning = filterUnresolvedRefs(rawUnresolved, { extensionNames, restrictTo });
@@ -225,23 +256,6 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   );
   warnUnresolvedRefs(unresolvedRefsWarning);
   if (!started) out(c.dim(`  start it: agetor start ${task.id.slice(0, 8)}`));
-}
-
-/** `agentDiscovery`'s extension names, as the set `filterUnresolvedRefs`
- *  exempts from the "won't resolve" warning (the ExtensionPicker's own
- *  `@name` mention syntax — e.g. `@github` — is never a file reference). A
- *  discovery failure must not block or fail the add: falls back to an empty
- *  set (over-warn rather than crash). */
-async function discoveredExtensionNames(
-  client: AgetorClient,
-  task: Pick<Task, "agent" | "workdir" | "branch">,
-): Promise<Set<string>> {
-  try {
-    const { extensions } = await client.agentDiscovery(task.agent, task.workdir, task.branch ?? null);
-    return new Set(extensions.map((e) => (e.insert.startsWith("@") ? e.insert.slice(1) : e.name)));
-  } catch {
-    return new Set();
-  }
 }
 
 /** Pure decision of whether `agetor add` should run non-interactively (a

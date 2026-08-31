@@ -1338,7 +1338,10 @@ export const api = {
     // retry: false — a replay would paste a duplicate message into a live
     // agent tmux session.
     j<
-      | { delivered: true; runId: string }
+      // `unresolvedRefs` = raw `@` tokens the server-side expansion left
+      // verbatim. The webview deliberately doesn't render it post-send —
+      // PromptComposer's inline warning covers it pre-send.
+      | { delivered: true; runId: string; unresolvedRefs?: string[] }
       | { delivered: false; reason: string; withheld?: boolean; savedToBacklog?: boolean }
     >(
       `/runs/${runId}/input`,

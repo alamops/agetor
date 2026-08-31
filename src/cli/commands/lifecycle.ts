@@ -5,7 +5,8 @@ import { runControl, resumableRunId } from "../run-logic.ts";
 import { c, out, printJson } from "../output.ts";
 import { resolveRefs, warnMissingRefs } from "../refs.ts";
 import { appendReferences } from "../../shared/refs.ts";
-import { filterUnresolvedRefs, warnUnresolvedRefs } from "../at-warn.ts";
+import { discoveredExtensionNames, filterUnresolvedRefs, warnUnresolvedRefs } from "../at-warn.ts";
+import { findAtTokens } from "../../shared/at-refs.ts";
 
 export async function cmdStart(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -34,6 +35,29 @@ export async function cmdStart(args: string[], flags: Flags): Promise<void> {
   }
   const res = await client.startTask(task.id);
   if (flags.json) return printJson(res);
+  if (res.unresolvedRefs?.length) {
+    const extensionNames = await discoveredExtensionNames(client, task);
+    let tokens = res.unresolvedRefs;
+    if (task.issueUrl) {
+      // A started task's prompt is whatever `task.prompt` already holds — for
+      // an issue-seeded task that's the composed thread body, and the CLI has
+      // no record here of any user-typed portion to `restrictTo` against the
+      // way `agetor add --issue` does (it captures `userTypedPrompt` before
+      // composition, at create time; by `start` time that distinction is
+      // gone). Heuristic instead of a `restrictTo` restriction: a real
+      // file/dir path virtually always carries a `/` or a `.` (extension)
+      // somewhere in it, while an issue-thread `@mention` (`@octocat`,
+      // `@some-org`) is a bare word with neither — drop those, on top of the
+      // extension-name exemption every path shares below. Plain (non-issue)
+      // tasks get no such heuristic: nothing composes third-party mentions
+      // into their prompt.
+      tokens = tokens.filter((raw) => {
+        const token = findAtTokens(raw)[0];
+        return !token || token.path.includes("/") || token.path.includes(".");
+      });
+    }
+    warnUnresolvedRefs(filterUnresolvedRefs(tokens, { extensionNames, restrictTo: null }));
+  }
   out(`${c.cyan("▸")} started ${c.dim(short)} — run ${res.runId.slice(0, 8)}`);
 }
 
@@ -82,16 +106,10 @@ export async function cmdSend(args: string[], flags: Flags): Promise<void> {
   // this discovery-filtered, human-phrased warning is a plain-mode nicety.
   if (flags.json) return printJson(res);
   if (res.unresolvedRefs?.length) {
-    let extensionNames = new Set<string>();
-    try {
-      const { extensions } = await client.agentDiscovery(task.agent, task.workdir, task.branch ?? null);
-      extensionNames = new Set(
-        extensions.map((e) => (e.insert.startsWith("@") ? e.insert.slice(1) : e.name)),
-      );
-    } catch {
-      // A discovery failure must not fail an already-delivered send — fall
-      // back to no exemptions (over-warn rather than crash).
-    }
+    // `discoveredExtensionNames` is already fail-open (a discovery failure
+    // must not fail an already-delivered send — falls back to no exemptions,
+    // over-warn rather than crash).
+    const extensionNames = await discoveredExtensionNames(client, task);
     warnUnresolvedRefs(filterUnresolvedRefs(res.unresolvedRefs, { extensionNames }));
   }
   const refNote = refPaths.length ? c.dim(` (+${refPaths.length} ref${refPaths.length > 1 ? "s" : ""})`) : "";

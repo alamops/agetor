@@ -1,4 +1,8 @@
 import { test, expect, mock, afterAll } from "bun:test";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import type { AgetorClient } from "./api-client.ts";
 
 /**
  * `warnUnresolvedRefs` writes through `./output.ts`'s `errln` — mocked here
@@ -22,7 +26,14 @@ afterAll(() => {
   mock.module("./output.ts", () => realOutputSnapshot);
 });
 
-const { filterUnresolvedRefs, unresolvedWarningLine, warnUnresolvedRefs } = await import("./at-warn.ts");
+const {
+  filterUnresolvedRefs,
+  unresolvedWarningLine,
+  warnUnresolvedRefs,
+  isSafeClientRelPath,
+  existsInLiveScope,
+  discoveredExtensionNames,
+} = await import("./at-warn.ts");
 
 // ── filterUnresolvedRefs ─────────────────────────────────────────────────
 
@@ -139,4 +150,120 @@ test("warnUnresolvedRefs: prints one yellow-prefixed line for a non-empty list",
   warnUnresolvedRefs(["@nope.md"]);
   expect(errLines.length).toBe(1);
   expect(errLines[0]).toBe("! @nope.md won't resolve to a project file — sent as plain text");
+});
+
+// ── isSafeClientRelPath ──────────────────────────────────────────────────
+
+test("isSafeClientRelPath: rejects empty string", () => {
+  expect(isSafeClientRelPath("")).toBe(false);
+});
+
+test("isSafeClientRelPath: rejects a leading slash (absolute path)", () => {
+  expect(isSafeClientRelPath("/etc/passwd")).toBe(false);
+});
+
+test("isSafeClientRelPath: rejects a NUL byte", () => {
+  expect(isSafeClientRelPath("foo\0bar")).toBe(false);
+});
+
+test("isSafeClientRelPath: rejects a bare '..' segment", () => {
+  expect(isSafeClientRelPath("..")).toBe(false);
+  expect(isSafeClientRelPath("../secrets.env")).toBe(false);
+  expect(isSafeClientRelPath("a/../../b")).toBe(false);
+});
+
+test("isSafeClientRelPath: accepts an ordinary repo-relative path", () => {
+  expect(isSafeClientRelPath("src/bun/db.ts")).toBe(true);
+  expect(isSafeClientRelPath(".env")).toBe(true);
+});
+
+// ── existsInLiveScope ─────────────────────────────────────────────────────
+
+function withTempDir<T>(fn: (dir: string) => T): T {
+  const dir = mkdtempSync(path.join(tmpdir(), "at-warn-test-"));
+  try {
+    return fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("existsInLiveScope: true for a gitignored-but-present file on disk", () => {
+  withTempDir((dir) => {
+    writeFileSync(path.join(dir, ".env"), "SECRET=1");
+    expect(existsInLiveScope(dir, ".env")).toBe(true);
+  });
+});
+
+test("existsInLiveScope: false for a path that doesn't exist", () => {
+  withTempDir((dir) => {
+    expect(existsInLiveScope(dir, "nope.txt")).toBe(false);
+  });
+});
+
+test("existsInLiveScope: strips a trailing slash before checking a directory", () => {
+  withTempDir((dir) => {
+    mkdirSync(path.join(dir, "sub"));
+    expect(existsInLiveScope(dir, "sub/")).toBe(true);
+  });
+});
+
+test("existsInLiveScope: false for an unsafe path even if something exists there", () => {
+  withTempDir((dir) => {
+    // The parent of `dir` definitely exists, but `../` must never be
+    // "rescued" by a stat outside the project.
+    expect(existsInLiveScope(dir, "../")).toBe(false);
+    expect(existsInLiveScope(dir, "../etc/passwd")).toBe(false);
+  });
+});
+
+test("existsInLiveScope: false for an empty path", () => {
+  withTempDir((dir) => {
+    expect(existsInLiveScope(dir, "")).toBe(false);
+  });
+});
+
+// ── discoveredExtensionNames ──────────────────────────────────────────────
+
+function fakeTask(): { agent: string; workdir: string; branch: string | null } {
+  return { agent: "claude-code", workdir: "/tmp/whatever", branch: null };
+}
+
+test("discoveredExtensionNames: maps `@`-prefixed inserts by stripping the leading `@`, others by name", async () => {
+  const client = {
+    agentDiscovery: async () => ({
+      commands: [],
+      extensions: [
+        { name: "github-ext", insert: "@github" },
+        { name: "plain-name", insert: "plain-name" },
+      ],
+    }),
+  } as unknown as AgetorClient;
+
+  const names = await discoveredExtensionNames(client, fakeTask());
+  expect(names).toEqual(new Set(["github", "plain-name"]));
+});
+
+test("discoveredExtensionNames: a discovery failure fails open to an empty set", async () => {
+  const client = {
+    agentDiscovery: async () => {
+      throw new Error("network down");
+    },
+  } as unknown as AgetorClient;
+
+  const names = await discoveredExtensionNames(client, fakeTask());
+  expect(names).toEqual(new Set());
+});
+
+test("discoveredExtensionNames: passes agent/workdir/branch through to agentDiscovery verbatim", async () => {
+  const calls: Array<[string, string, string | null]> = [];
+  const client = {
+    agentDiscovery: async (agent: string, workdir: string, branch: string | null) => {
+      calls.push([agent, workdir, branch]);
+      return { commands: [], extensions: [] };
+    },
+  } as unknown as AgetorClient;
+
+  await discoveredExtensionNames(client, { agent: "codex", workdir: "/x", branch: "feature/y" });
+  expect(calls).toEqual([["codex", "/x", "feature/y"]]);
 });
