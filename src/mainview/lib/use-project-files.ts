@@ -156,3 +156,75 @@ export function useProjectFiles(scope: FileScope | null | undefined): {
 
   return { entries, validPaths, truncated, loading, error, refresh };
 }
+
+// ---------------------------------------------------------------------------
+// searchProjectFiles — server-side full-depth search, for when a scope's base
+// listing (above) came back `truncated` (a monorepo past `MAX_PROJECT_FILES`,
+// see at-refs.ts). `GET /files/index?q=` ranks the FULL listing — not just
+// the capped set `useProjectFiles` caches — via the same `filterFileEntries`
+// scorer the client uses locally, so a past-the-cap file can still be found
+// by name. Consumed by `AtFileAutocomplete` (popover fallback) and
+// `PromptComposer` (highlight/warning verification of individual tokens).
+// ---------------------------------------------------------------------------
+
+/** Result cache for `searchProjectFiles`, keyed on scope + exact query text
+ *  (unlike `cache` above, which is keyed on scope alone) — so backspacing
+ *  through a query re-renders instantly from cache instead of re-fetching on
+ *  every keystroke. Best-effort only: the server has its own 3s TTL on the
+ *  underlying listing a query is ranked against, so a stale cache entry here
+ *  is bounded by that, not indefinite. Capped at `SEARCH_CACHE_MAX` entries,
+ *  evicting the oldest (first-inserted) key once full — a plain `Map`'s
+ *  insertion-order iteration makes that a one-line `delete`, no LRU
+ *  bookkeeping needed for what's just a keystroke-smoothing cache. */
+const SEARCH_CACHE_MAX = 200;
+const searchCache = new Map<string, FileEntry[]>();
+
+function searchCacheKey(scope: FileScope, q: string): string {
+  return `${scope.dir}\0${scope.ref ?? ""}\0${q}`;
+}
+
+function setSearchCacheEntry(key: string, value: FileEntry[]): void {
+  if (searchCache.size >= SEARCH_CACHE_MAX && !searchCache.has(key)) {
+    const oldestKey = searchCache.keys().next().value;
+    if (oldestKey !== undefined) searchCache.delete(oldestKey);
+  }
+  searchCache.set(key, value);
+}
+
+// Scopes (dir+ref, via the existing `cacheKey`) already warned about after a
+// failed search — at most one `console.warn` per scope until a subsequent
+// successful search re-arms it, so a flaky server (or a scope with no
+// network path) doesn't spam the console on every keystroke of a fast typer.
+const searchWarnedScopes = new Set<string>();
+
+/**
+ * Server-side ranked search over a scope's FULL file listing (`GET
+ * /files/index?q=`), for use once `useProjectFiles` reports `truncated` —
+ * the client-cached listing is capped at `MAX_PROJECT_FILES` and can't find
+ * anything past it. Returns up to `limit` `FileEntry` rows (files plus
+ * derived directories, matching `buildFileEntries`'s shape — a directory
+ * path ends with "/"). `null`/blank `scope.dir` and a failed request both
+ * resolve to `[]`; a failure additionally `console.warn`s, at most once per
+ * scope (see `searchWarnedScopes`) until a later call against that same
+ * scope succeeds.
+ */
+export async function searchProjectFiles(scope: FileScope, q: string, limit = 50): Promise<FileEntry[]> {
+  if (!scope || !scope.dir) return [];
+  const scopeWarnKey = cacheKey(scope);
+  const resultKey = searchCacheKey(scope, q);
+  const cached = searchCache.get(resultKey);
+  if (cached) return cached;
+  try {
+    const { files } = await api.listProjectFiles({ dir: scope.dir, ref: scope.ref, q, limit });
+    const entries: FileEntry[] = files.map((path) => ({ path, isDirectory: path.endsWith("/") }));
+    setSearchCacheEntry(resultKey, entries);
+    searchWarnedScopes.delete(scopeWarnKey);
+    return entries;
+  } catch (e) {
+    if (!searchWarnedScopes.has(scopeWarnKey)) {
+      searchWarnedScopes.add(scopeWarnKey);
+      console.warn("[agetor] searchProjectFiles failed", e);
+    }
+    return [];
+  }
+}

@@ -6,11 +6,27 @@ import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { isSafeRelPath } from "./worktree.ts";
 import { expandAtTokens, MAX_PROJECT_FILES } from "../shared/at-refs.ts";
+import { buildFileEntries, filterFileEntries, type FileEntry } from "../shared/at-file-filter.ts";
 
 // The cap lives in the shared module so the webview's truncation footer and
 // this listing can never disagree about the number; re-exported here for the
 // existing server-side importers/tests.
 export { MAX_PROJECT_FILES };
+
+/**
+ * Absolute bound on how many listing entries either mode of
+ * `listProjectFiles` will scan out of a single `git` invocation's output.
+ * Entries beyond this are dropped before any further processing.
+ *
+ * No-q mode never surfaces this as `truncated` — it keeps its own,
+ * pre-existing `MAX_PROJECT_FILES` display cap and semantics unchanged (this
+ * bound is 12.5x larger, so it's a backstop against a pathological repo, not
+ * something the existing 20k-cap flow is expected to hit). q-mode DOES
+ * report this as `truncated`, since q-mode ranks over the *full* listing
+ * (files + every derived directory prefix) rather than a capped slice of it,
+ * and needs some bound on how much a single search can scan.
+ */
+export const MAX_SCANNED_FILES = 250_000;
 
 export interface FileScope {
   /** Absolute path to an existing directory — either a task's live cwd (a
@@ -21,6 +37,18 @@ export interface FileScope {
   /** When set (non-empty), list the tracked files at this ref instead of the
    *  live working tree — used to preview a not-yet-created worktree. */
   ref?: string | null;
+  /**
+   * Presence (not truthiness) switches to server-side search mode: rank the
+   * FULL listing — every file plus every derived directory prefix — via the
+   * shared `filterFileEntries` scorer and return up to `limit` matches. An
+   * empty string counts as present (the scorer's own "blank query" ordering
+   * — shallowest-first). `undefined`/omitted preserves exactly today's
+   * behavior (top-`MAX_PROJECT_FILES` sorted listing), byte-for-byte.
+   */
+  q?: string | null;
+  /** q-mode only: max ranked entries to return. Clamped to 1..200; defaults
+   *  to 50 when omitted or not a finite number. Ignored when `q` is absent. */
+  limit?: number;
 }
 
 export type ProjectFilesResult = { files: string[]; truncated: boolean } | { error: string };
@@ -78,38 +106,41 @@ function splitNulTerminated(out: string): string[] {
 
 /** Dedupe, sort with a plain code-unit comparison (locale-independent, so
  *  results are stable across machines/locales), and cap at
- *  `MAX_PROJECT_FILES`. */
+ *  `MAX_PROJECT_FILES`. Unchanged from before q-mode existed — no-q callers
+ *  must see byte-for-byte identical behavior. */
 function finalize(files: Iterable<string>): ProjectFilesResult {
   const sorted = Array.from(new Set(files)).sort((a, b) => (a < b ? -1 : 1));
   const truncated = sorted.length > MAX_PROJECT_FILES;
   return { files: sorted.slice(0, MAX_PROJECT_FILES), truncated };
 }
 
-/**
- * List a project's files the way an agent will see them: either the live
- * working tree (tracked + untracked-not-ignored, minus tracked-but-deleted),
- * or the tracked files at a specific ref (for previewing a worktree that
- * hasn't been materialized yet — agetor worktrees are always rooted at the
- * repo root, so a ref listing is repo-root-relative, matching that shape).
- *
- * `dir` must be an absolute path to an existing directory inside a git repo,
- * else `{ error }`. Never throws.
- */
-export async function listProjectFiles(scope: FileScope): Promise<ProjectFilesResult> {
-  const { dir, ref } = scope;
+interface RawListing {
+  /** Deduped, unsorted paths straight off `git`'s output, capped at
+   *  `MAX_SCANNED_FILES`. */
+  files: string[];
+  /** Whether dedupe produced more than `MAX_SCANNED_FILES` entries (i.e. the
+   *  cap above actually dropped something). */
+  scanCapped: boolean;
+}
 
-  if (!path.isAbsolute(dir)) return { error: "dir must be an absolute path" };
-  let st;
-  try {
-    st = statSync(dir);
-  } catch {
-    return { error: "directory does not exist" };
+/** Dedupe and cap at `MAX_SCANNED_FILES` — the shared first stage both
+ *  `finalize` (no-q) and q-mode's ranking build on. */
+function capScan(files: Iterable<string>): RawListing {
+  const deduped = Array.from(new Set(files));
+  if (deduped.length > MAX_SCANNED_FILES) {
+    return { files: deduped.slice(0, MAX_SCANNED_FILES), scanCapped: true };
   }
-  if (!st.isDirectory()) return { error: "directory does not exist" };
+  return { files: deduped, scanCapped: false };
+}
 
-  const inside = await git(["rev-parse", "--is-inside-work-tree"], dir);
-  if (!inside.ok || inside.stdout.trim() !== "true") return { error: "not a git repository" };
-
+/**
+ * The shared git-listing core for both ref mode and live mode — factored out
+ * of `listProjectFiles` so q-mode and no-q mode read the exact same tree
+ * instead of two implementations that could drift. Returns the raw
+ * (deduped, `MAX_SCANNED_FILES`-capped, NOT yet `MAX_PROJECT_FILES`-capped or
+ * sorted) file list, or `{ error }`.
+ */
+async function rawListing(dir: string, ref: string | null | undefined): Promise<RawListing | { error: string }> {
   if (ref) {
     // Defense-in-depth: a "-"-leading ref would otherwise be read as a git
     // flag rather than a revision — mirrors the leading-dash guards
@@ -125,7 +156,7 @@ export async function listProjectFiles(scope: FileScope): Promise<ProjectFilesRe
       res = await lsTree(`refs/remotes/origin/${ref}`);
     }
     if (!res.ok) return { error: `unknown ref: ${ref}` };
-    return finalize(splitNulTerminated(res.stdout));
+    return capScan(splitNulTerminated(res.stdout));
   }
 
   const [listed, deleted] = await Promise.all([
@@ -138,7 +169,96 @@ export async function listProjectFiles(scope: FileScope): Promise<ProjectFilesRe
   // the agent can reference.
   const deletedSet = new Set(deleted.ok ? splitNulTerminated(deleted.stdout) : []);
   const files = splitNulTerminated(listed.stdout).filter((f) => !deletedSet.has(f));
-  return finalize(files);
+  return capScan(files);
+}
+
+// ---------------------------------------------------------------------------
+// q-mode: server-side search over the full listing, TTL-cached so a typing
+// burst doesn't spawn `git` on every keystroke.
+// ---------------------------------------------------------------------------
+
+interface QModeCacheEntry {
+  entries: FileEntry[];
+  at: number;
+  scanCapped: boolean;
+}
+
+const Q_MODE_CACHE_TTL_MS = 3000;
+
+/** Keyed on `dir` + `ref` (never on `q`/`limit` — those are re-ranked fresh
+ *  every call against the cached listing). No-q mode never reads or writes
+ *  this cache, so its behavior (and the tests pinning it) is untouched. */
+const qModeCache = new Map<string, QModeCacheEntry>();
+
+function qModeCacheKey(dir: string, ref: string | null | undefined): string {
+  return `${dir}\0${ref ?? ""}`;
+}
+
+/** Test-only: drop every cached q-mode listing so a test can force the next
+ *  call to re-run `git` (or, conversely, prove a listing change is invisible
+ *  until this is called and the TTL window is gone). */
+export function __clearProjectFilesCacheForTest(): void {
+  qModeCache.clear();
+}
+
+function clampLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) return 50;
+  return Math.max(1, Math.min(200, Math.trunc(limit)));
+}
+
+/**
+ * List a project's files the way an agent will see them: either the live
+ * working tree (tracked + untracked-not-ignored, minus tracked-but-deleted),
+ * or the tracked files at a specific ref (for previewing a worktree that
+ * hasn't been materialized yet — agetor worktrees are always rooted at the
+ * repo root, so a ref listing is repo-root-relative, matching that shape).
+ *
+ * `dir` must be an absolute path to an existing directory inside a git repo,
+ * else `{ error }`. Never throws.
+ *
+ * When `scope.q` is present (including `""`), switches to search mode: ranks
+ * the full listing — files plus every derived directory prefix — via the
+ * shared `filterFileEntries` scorer and returns up to `scope.limit` matches;
+ * `truncated` then reports whether the internal `MAX_SCANNED_FILES` scan cap
+ * was hit, not the `MAX_PROJECT_FILES` display cap. A fresh (<3s old)
+ * q-mode listing for the same `dir`+`ref` is served from an in-memory cache
+ * without spawning `git` again — see `qModeCache` above.
+ */
+export async function listProjectFiles(scope: FileScope): Promise<ProjectFilesResult> {
+  const { dir, ref } = scope;
+  const qPresent = typeof scope.q === "string";
+
+  if (qPresent) {
+    const cached = qModeCache.get(qModeCacheKey(dir, ref));
+    if (cached && Date.now() - cached.at < Q_MODE_CACHE_TTL_MS) {
+      const ranked = filterFileEntries(cached.entries, scope.q as string, clampLimit(scope.limit));
+      return { files: ranked.map((e) => e.path), truncated: cached.scanCapped };
+    }
+  }
+
+  if (!path.isAbsolute(dir)) return { error: "dir must be an absolute path" };
+  let st;
+  try {
+    st = statSync(dir);
+  } catch {
+    return { error: "directory does not exist" };
+  }
+  if (!st.isDirectory()) return { error: "directory does not exist" };
+
+  const inside = await git(["rev-parse", "--is-inside-work-tree"], dir);
+  if (!inside.ok || inside.stdout.trim() !== "true") return { error: "not a git repository" };
+
+  const raw = await rawListing(dir, ref);
+  if ("error" in raw) return raw;
+
+  if (!qPresent) {
+    return finalize(raw.files);
+  }
+
+  const entries = buildFileEntries(raw.files);
+  qModeCache.set(qModeCacheKey(dir, ref), { entries, at: Date.now(), scanCapped: raw.scanCapped });
+  const ranked = filterFileEntries(entries, scope.q as string, clampLimit(scope.limit));
+  return { files: ranked.map((e) => e.path), truncated: raw.scanCapped };
 }
 
 /**

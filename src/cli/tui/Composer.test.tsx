@@ -233,6 +233,66 @@ test("suggestions are memoized: an unrelated re-render (arrow-key nav) doesn't r
   expect(suggestCalls).toBe(afterTyping);
 });
 
+// ── remoteSearch (monorepo fallback, CLAUDE.md §12) ─────────────────────────
+
+test("remoteSearch replaces the local rows once its debounced answer matches the current query", async () => {
+  const remoteSearch = async (_q: string) => [{ path: "deep/dir/zzz-target.ts", isDirectory: false }];
+  const { stdin, lastFrame } = render(
+    <Composer active label="→" fileEntries={fileEntries} remoteSearch={remoteSearch} onSubmit={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write("@RE");
+  await wait();
+  // Before the debounce fires, the local rows (README.md matches "RE") are
+  // still what's shown — remoteSearch hasn't answered yet.
+  expect(lastFrame() ?? "").toContain("README.md");
+  // Let the 200ms debounce fire and the fake remoteSearch resolve.
+  await wait(300);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("deep/dir/zzz-target.ts");
+  expect(frame).not.toContain("README.md");
+});
+
+test("a stale remoteSearch answer for an old query is discarded once a newer query has taken over", async () => {
+  let resolveFirst: ((entries: { path: string; isDirectory: boolean }[]) => void) | null = null;
+  let calls = 0;
+  const remoteSearch = (_q: string) =>
+    new Promise<{ path: string; isDirectory: boolean }[]>((resolve) => {
+      calls++;
+      if (calls === 1) resolveFirst = resolve;
+      else resolve([{ path: "src/bun/newer-query-result.ts", isDirectory: false }]);
+    });
+  const { stdin, lastFrame } = render(
+    <Composer active label="→" fileEntries={fileEntries} remoteSearch={remoteSearch} onSubmit={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write("@RE");
+  await wait(300); // let the first debounce fire (its promise stays pending — resolveFirst captured)
+  expect(calls).toBe(1);
+  stdin.write("A"); // narrows the query to "REA" — a newer, distinct query key
+  await wait(300); // let the second debounce fire and its (different) promise resolve
+  expect(calls).toBe(2);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("newer-query-result.ts");
+  // Now let the FIRST (stale) request resolve late.
+  resolveFirst!([{ path: "should-never-render.ts", isDirectory: false }]);
+  await wait();
+  const after = lastFrame() ?? "";
+  expect(after).not.toContain("should-never-render.ts");
+  expect(after).toContain("newer-query-result.ts");
+});
+
+test("without remoteSearch, behavior is unchanged — only the local rows ever render", async () => {
+  const { stdin, lastFrame } = render(
+    <Composer active label="→" fileEntries={fileEntries} onSubmit={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write("@RE");
+  await wait(300);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("README.md");
+});
+
 test("Esc dismisses, then typing past it and backspacing back to the same query reopens the popover", async () => {
   const { stdin, lastFrame } = render(
     <Composer active label="→" fileEntries={fileEntries} onSubmit={() => {}} onCancel={() => {}} />,

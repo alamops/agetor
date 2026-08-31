@@ -360,6 +360,69 @@ test("a cached listing is invalidated when the task's column changes (run settle
   unmount();
 });
 
+// ── @ remote search fallback (truncated listing → server-side search, CLAUDE.md §12) ──
+
+test("a truncated listing wires the composer's remoteSearch, which is invoked with a q param after typing", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const seenQueries: Array<{ dir: string; q?: string | null; limit?: number }> = [];
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null; limit?: number }) => {
+      if (scope.q !== undefined) {
+        seenQueries.push(scope);
+        return { files: ["deep/remote-match.ts"], truncated: true };
+      }
+      // Initial (untruncated-signature) fetch on compose-open: report the
+      // listing itself as truncated so the composer switches to remote search.
+      return { files: ["README.md"], truncated: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the truncated listProjectFiles fetch
+  await wait(80);
+  stdin.write("@x");
+  await wait(300); // let the composer's 200ms remoteSearch debounce fire
+  const frame = lastFrame() ?? "";
+  expect(seenQueries.length).toBeGreaterThan(0);
+  expect(seenQueries[0]!.q).toBe("x");
+  expect(seenQueries[0]!.limit).toBe(5);
+  expect(frame).toContain("deep/remote-match.ts");
+  unmount();
+});
+
+test("an untruncated listing never wires remoteSearch — no q-carrying call is ever made", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const seenQueries: Array<{ q?: string | null }> = [];
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null }) => {
+      if (scope.q !== undefined) seenQueries.push(scope);
+      return { files: ["README.md"], truncated: false };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("@RE");
+  await wait(300);
+  const frame = lastFrame() ?? "";
+  expect(seenQueries.length).toBe(0);
+  expect(frame).toContain("README.md");
+  unmount();
+});
+
 // ── 's' start path: unresolvedRefs surfaces a ⚠ in the started status ───────
 
 test("the 's' start path surfaces ⚠ in the started status when startTask returns unresolvedRefs", async () => {

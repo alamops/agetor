@@ -15,9 +15,9 @@ import { SlashAutocomplete } from "./SlashAutocomplete";
 import { ExtensionPicker } from "./ExtensionPicker";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
-import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { useProjectFiles, searchProjectFiles, type FileScope } from "@/lib/use-project-files";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
-import { unresolvedAtTokens, isSafeClientRelPath } from "@/lib/at-highlight";
+import { unresolvedAtTokens, isSafeClientRelPath, isListedPath } from "@/lib/at-highlight";
 
 /** Stable empty set so clearing the on-disk override doesn't churn state
  *  identity (and thus the warning memo) on every effect pass. */
@@ -574,17 +574,32 @@ export function PromptComposer({
   //      `@.env`) — send-time expansion WILL resolve those, so warning
   //      would lie. Ref scopes skip the stat: a fresh worktree at the
   //      pinned ref contains exactly the listing, so listing = truth.
-  // Suppressed while the listing is loading/failed/empty or truncated — a
-  // partial or absent set can't prove a token unresolved.
+  //   4. TRUNCATED scopes (the base listing hit the 20k `MAX_PROJECT_FILES`
+  //      cap, e.g. a monorepo): the capped listing can't prove a token
+  //      unresolved on its own, so a token missing from it is neither warned
+  //      NOR cleared until a debounced server-side full-depth search
+  //      (`searchProjectFiles`, `GET /files/index?q=`) checks that ONE token
+  //      by name — found → treated as listed (folded into `verifiedListed`,
+  //      and the exact matched entry path is unioned into the highlight
+  //      backdrop's `validPaths` via `verifiedEntryPaths` so it highlights
+  //      too, same as step 1); confirmed absent from the full listing →
+  //      recorded in `checkedMissing`, the only tokens allowed to warn while
+  //      truncated. An unproven token (not checked yet, or the check is
+  //      still in flight) never warns — that per-token guarantee is what
+  //      replaces the old blanket "suppress the whole warning while
+  //      truncated" behavior; non-truncated scopes never populate
+  //      `checkedMissing`, so this step is a no-op for them.
+  // Suppressed while the listing is loading/failed/empty — a partial or
+  // absent set can't prove any token unresolved.
   const extensionNames = useMemo(
     () => new Set(extensions.map((e) => (e.insert.startsWith("@") ? e.insert.slice(1) : e.name))),
     [extensions],
   );
   const unlistedTokens = useMemo(() => {
-    if (!hasFileScope || projectFiles.loading || projectFiles.error || projectFiles.truncated) return [];
+    if (!hasFileScope || projectFiles.loading || projectFiles.error) return [];
     if (projectFiles.entries.length === 0) return [];
     return unresolvedAtTokens(value, projectFiles.validPaths).filter((t) => !extensionNames.has(t.path));
-  }, [hasFileScope, projectFiles.loading, projectFiles.error, projectFiles.truncated, projectFiles.entries.length, projectFiles.validPaths, value, extensionNames]);
+  }, [hasFileScope, projectFiles.loading, projectFiles.error, projectFiles.entries.length, projectFiles.validPaths, value, extensionNames]);
   // Paths the live-scope stat check confirmed on disk, keyed by token path
   // with any trailing "/" stripped.
   const [existsOnDisk, setExistsOnDisk] = useState<ReadonlySet<string>>(EMPTY_PATH_SET);
@@ -623,11 +638,90 @@ export function PromptComposer({
     return () => { cancelled = true; clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKey stands in for unlistedTokens (see above)
   }, [unlistedKey, fileScope?.dir, fileScope?.ref]);
+
+  // --- Truncated-scope verification: per-token server-side search ---------
+  // Only relevant once `projectFiles.truncated` is true — a capped listing
+  // can't tell "not present" from "present but past the cap" apart, so
+  // every unlisted token gets an individual server-side lookup before it's
+  // allowed to either warn or stay unhighlighted. `verifiedListed`/
+  // `checkedMissing` are keyed like `existsOnDisk` (token path, trailing "/"
+  // stripped); `verifiedEntryPaths` separately keeps the exact matched
+  // listing entry (slash intact for a directory) for the highlight
+  // backdrop's `validPaths` union below.
+  const [verifiedListed, setVerifiedListed] = useState<ReadonlySet<string>>(EMPTY_PATH_SET);
+  const [verifiedEntryPaths, setVerifiedEntryPaths] = useState<ReadonlySet<string>>(EMPTY_PATH_SET);
+  const [checkedMissing, setCheckedMissing] = useState<ReadonlySet<string>>(EMPTY_PATH_SET);
+  // Stands in for `unlistedTokens` in the effect deps below, same reasoning
+  // as `unlistedKey` above — includes each token's `isDirectory` flag since
+  // that affects the `isListedPath` verdict for an otherwise-identical path.
+  const unlistedKeyForVerify = unlistedTokens.map((t) => `${t.path} ${t.isDirectory ? "1" : "0"}`).join("  ");
+  useEffect(() => {
+    const clear = () => {
+      setVerifiedListed((prev) => (prev.size ? EMPTY_PATH_SET : prev));
+      setVerifiedEntryPaths((prev) => (prev.size ? EMPTY_PATH_SET : prev));
+      setCheckedMissing((prev) => (prev.size ? EMPTY_PATH_SET : prev));
+    };
+    if (!projectFiles.truncated || !hasFileScope || unlistedTokens.length === 0) {
+      clear();
+      return;
+    }
+    const scope = fileScope!;
+    // De-dupe by stripped path (a bare-typed and a slash-typed token for the
+    // same path shouldn't cost two round-trips) and cap at 8 so a draft with
+    // a pile of unresolved tokens can't fan out unboundedly.
+    const byKey = new Map<string, { path: string; isDirectory: boolean }>();
+    for (const t of unlistedTokens) {
+      const key = t.path.replace(/\/+$/, "");
+      if (!isSafeClientRelPath(key) || byKey.has(key)) continue;
+      byKey.set(key, { path: t.path, isDirectory: t.isDirectory });
+      if (byKey.size >= 8) break;
+    }
+    if (byKey.size === 0) {
+      clear();
+      return;
+    }
+    let cancelled = false;
+    // Debounced, and only ever in flight while the draft holds truncated-mode
+    // unlisted tokens — not a per-keystroke request.
+    const timer = setTimeout(async () => {
+      const listed = new Set<string>();
+      const entryPaths = new Set<string>();
+      const missing = new Set<string>();
+      await Promise.all([...byKey.entries()].map(async ([key, token]) => {
+        const results = await searchProjectFiles(scope, key, 20);
+        if (cancelled) return;
+        const rowPaths = new Set(results.map((r) => r.path));
+        if (isListedPath(rowPaths, token.path, token.isDirectory)) {
+          listed.add(key);
+          // The exact entry that matched: the token's own path when it hit
+          // directly, else (only possible when the token wasn't typed as a
+          // directory) the listing's slash-suffixed form of it.
+          entryPaths.add(rowPaths.has(token.path) ? token.path : `${key}/`);
+        } else {
+          missing.add(key);
+        }
+      }));
+      if (cancelled) return;
+      setVerifiedListed(listed);
+      setVerifiedEntryPaths(entryPaths);
+      setCheckedMissing(missing);
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKeyForVerify stands in for unlistedTokens; fileScope read via closure, keyed by dir/ref below
+  }, [projectFiles.truncated, hasFileScope, unlistedKeyForVerify, fileScope?.dir, fileScope?.ref]);
+
   const unresolvedWarning = useMemo(() => {
     const seen = new Set<string>();
     const unresolved = unlistedTokens.filter((t) => {
       const key = t.path.replace(/\/+$/, "");
-      if (existsOnDisk.has(key) || seen.has(key)) return false;
+      if (existsOnDisk.has(key) || verifiedListed.has(key)) return false;
+      // Truncated mode: an unproven token (not yet checked, or still in
+      // flight) must never warn — only one the remote search confirmed
+      // absent from the full listing may. Non-truncated mode leaves
+      // `checkedMissing` empty, so this condition is a no-op there and
+      // behavior stays byte-identical to before this feature.
+      if (projectFiles.truncated && !checkedMissing.has(key)) return false;
+      if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
@@ -637,11 +731,21 @@ export function PromptComposer({
     return unresolved.length === 1
       ? `${shown} doesn't match a project file — it will be sent as plain text, not expanded to a path`
       : `${unresolved.length} @ references don't match a project file (${shown}${extra}) — they'll be sent as plain text, not expanded to paths`;
-  }, [unlistedTokens, existsOnDisk]);
+  }, [unlistedTokens, existsOnDisk, verifiedListed, checkedMissing, projectFiles.truncated]);
+
+  // Union in server-verified past-the-cap entries so a truncated scope's
+  // highlight backdrop isn't limited to the (possibly incomplete) base
+  // listing — see the truncated-scope verification block above.
+  const highlightValidPaths = useMemo(
+    () => (verifiedEntryPaths.size
+      ? new Set([...projectFiles.validPaths, ...verifiedEntryPaths])
+      : projectFiles.validPaths),
+    [projectFiles.validPaths, verifiedEntryPaths],
+  );
 
   const textareaBlock = (
     <div className={cn("relative", trailing && "flex-1")}>
-      {hasFileScope && <AtHighlightBackdrop textareaRef={ref} value={value} validPaths={projectFiles.validPaths} />}
+      {hasFileScope && <AtHighlightBackdrop textareaRef={ref} value={value} validPaths={highlightValidPaths} />}
       <Textarea
         ref={ref}
         data-testid={textareaTestId}
@@ -678,6 +782,7 @@ export function PromptComposer({
           onChange={onChange}
           textareaRef={ref}
           placement={placement}
+          fileScope={fileScope}
         />
       )}
       {inputAdornment}

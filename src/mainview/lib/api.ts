@@ -1175,11 +1175,22 @@ export const api = {
    *  `git ls-files` (tracked + untracked, minus ignored/deleted). `ref` is
    *  omitted from the request entirely when blank/null so the server always
    *  sees "no ref" rather than an empty-string one. `truncated` is true when
-   *  the listing hit the server's file-count cap. */
-  listProjectFiles: (scope: { dir: string; ref?: string | null }) => {
-    const q = new URLSearchParams({ dir: scope.dir });
-    if (scope.ref) q.set("ref", scope.ref);
-    return j<{ files: string[]; truncated: boolean }>(`/files/index?${q.toString()}`);
+   *  the listing hit the server's file-count cap.
+   *
+   *  `q` switches to server-side search mode (monorepo fallback past the 20k
+   *  display cap): when set — the empty string counts, `null`/`undefined`
+   *  omit the param entirely — the server ranks files + derived directories
+   *  over the ENTIRE listing with the shared `filterFileEntries` scorer and
+   *  returns up to `limit` (server default 50) matches; `truncated` then
+   *  reports the internal 250k scan cap instead of the 20k display cap. See
+   *  `searchProjectFiles` (`use-project-files.ts`), the `@` popover's
+   *  consumer of this mode. */
+  listProjectFiles: (scope: { dir: string; ref?: string | null; q?: string | null; limit?: number }) => {
+    const params = new URLSearchParams({ dir: scope.dir });
+    if (scope.ref) params.set("ref", scope.ref);
+    if (scope.q != null) params.set("q", scope.q);
+    if (scope.limit != null) params.set("limit", String(scope.limit));
+    return j<{ files: string[]; truncated: boolean }>(`/files/index?${params.toString()}`);
   },
   listTasks: () => j<Task[]>("/tasks"),
   /** Single task by id, fresh from the server (bypasses the 2s board poll's

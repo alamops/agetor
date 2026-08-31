@@ -217,9 +217,21 @@ export class AgetorClient {
    *  to list the live working tree at `dir` (tracked + untracked-not-
    *  ignored). Capped at `MAX_PROJECT_FILES` server-side; `truncated` reports
    *  when that cap was hit. */
-  listProjectFiles(scope: { dir: string; ref?: string | null }): Promise<{ files: string[]; truncated: boolean }> {
+  listProjectFiles(scope: {
+    dir: string;
+    ref?: string | null;
+    /** Full-depth server-side search (monorepo fallback past the 20k cap):
+     *  when set — the empty string counts — the server ranks files + derived
+     *  directories over the ENTIRE listing with the shared scorer and returns
+     *  up to `limit` (default 50) matches; `truncated` then reports the
+     *  internal scan cap, not the display cap. */
+    q?: string | null;
+    limit?: number;
+  }): Promise<{ files: string[]; truncated: boolean }> {
     const params = new URLSearchParams({ dir: scope.dir });
     if (scope.ref) params.set("ref", scope.ref);
+    if (scope.q != null) params.set("q", scope.q);
+    if (scope.limit != null) params.set("limit", String(scope.limit));
     return this.req("GET", `/files/index?${params.toString()}`);
   }
 

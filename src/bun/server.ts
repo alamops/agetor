@@ -4074,6 +4074,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // allow-list, so any absolute directory the caller names is listable.
       // Deliberately has NO `native` dependency (unlike `/refs/pick` above)
       // so it works under `headless.ts` (CLI/e2e), not just the packaged app.
+      // `q` (present, even as `q=`) switches to server-side search mode for
+      // monorepos past the client's `MAX_PROJECT_FILES` cap — see
+      // `listProjectFiles`'s header. `q` is read as-is (no trim — it's user
+      // text the scorer treats verbatim, matching `filterFileEntries`'s own
+      // trim-only-for-blank-check behavior); `limit` is parsed as an int and
+      // passed through un-clamped — `listProjectFiles`/`clampLimit` own the
+      // 1..200 clamp and the default-50 fallback for anything not a finite
+      // number, so this route doesn't duplicate that policy.
       "/files/index": {
         GET: authed(async (req) => {
           const url = new URL(req.url);
@@ -4085,7 +4093,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             );
           }
           const refParam = url.searchParams.get("ref")?.trim();
-          const result = await listProjectFiles({ dir, ref: refParam ? refParam : undefined });
+          const q = url.searchParams.has("q") ? (url.searchParams.get("q") ?? "") : undefined;
+          const limitParam = url.searchParams.get("limit");
+          const limit = limitParam === null ? undefined : Number.parseInt(limitParam, 10);
+          const result = await listProjectFiles({ dir, ref: refParam ? refParam : undefined, q, limit });
           if ("error" in result) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

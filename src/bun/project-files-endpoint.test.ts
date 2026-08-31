@@ -125,3 +125,47 @@ test("GET /files/index without a bearer token → 401", async () => {
   const res = await callNoAuth(`/files/index?dir=${encodeURIComponent(repo)}`);
   expect(res.status).toBe(401);
 });
+
+// ---------------------------------------------------------------------------
+// GET /files/index — q-mode (server-side search)
+// ---------------------------------------------------------------------------
+
+test("GET /files/index?q= returns ranked matches over the full listing", async () => {
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "untracked.txt"), "new\n");
+
+  const res = await call(`/files/index?dir=${encodeURIComponent(repo)}&q=untracked`);
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { files: string[]; truncated: boolean };
+  expect(body.files).toContain("untracked.txt");
+  expect(body.files).not.toContain("README.md");
+  expect(typeof body.truncated).toBe("boolean");
+});
+
+test("GET /files/index?q=&limit= clamps limit and caps the result count", async () => {
+  const repo = await makeRepo();
+  for (let i = 0; i < 5; i++) {
+    writeFileSync(path.join(repo, `match-${i}.txt`), `${i}\n`);
+  }
+
+  const res = await call(`/files/index?dir=${encodeURIComponent(repo)}&q=match&limit=2`);
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { files: string[]; truncated: boolean };
+  expect(body.files.length).toBe(2);
+
+  // limit clamps up to a minimum of 1 rather than returning zero results.
+  const clampedLow = await call(`/files/index?dir=${encodeURIComponent(repo)}&q=match&limit=0`);
+  expect(clampedLow.status).toBe(200);
+  const clampedLowBody = (await clampedLow.json()) as { files: string[]; truncated: boolean };
+  expect(clampedLowBody.files.length).toBe(1);
+});
+
+test("GET /files/index — an empty q= still counts as search mode (present, not omitted)", async () => {
+  const repo = await makeRepo();
+  const res = await call(`/files/index?dir=${encodeURIComponent(repo)}&q=`);
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { files: string[]; truncated: boolean };
+  // README.md is a depth-0 file — with no query, `sortListingOrder`'s
+  // blank-query ordering surfaces it in the default-50 window.
+  expect(body.files).toContain("README.md");
+});

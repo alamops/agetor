@@ -70,11 +70,18 @@ export function Dashboard({
   // `use-project-files.ts`. A fetch failure degrades to no suggestions rather
   // than blocking the composer.
   const [composeFileEntries, setComposeFileEntries] = useState<FileEntry[]>([]);
+  // Whether the last fetch for the CURRENT scope hit the server's
+  // `MAX_PROJECT_FILES` cap (CLAUDE.md §12's monorepo fallback) — when true,
+  // the local `composeFileEntries` listing is known-incomplete, so the
+  // composer's `@` popover falls back to a per-keystroke server-side search
+  // instead of ranking only the capped local set (see `composeRemoteSearch`
+  // below).
+  const [composeTruncated, setComposeTruncated] = useState(false);
   // Entries are cached per SCOPE but only trusted while the task's column is
   // unchanged: a column transition means a run settled (or started) and the
   // agent may have written files since the fetch — the TUI mirror of the
   // webview composer's `fileScopeRefreshToken={task.column}`.
-  const fileEntriesCache = useRef<Map<string, { entries: FileEntry[]; column: string }>>(new Map());
+  const fileEntriesCache = useRef<Map<string, { entries: FileEntry[]; column: string; truncated: boolean }>>(new Map());
   // `target` is resolved by id (see above) so this stays valid even though
   // `sorted` reshuffles every 1.5s poll.
   const composeScope = target ? fileScopeForTask(target) : null;
@@ -109,22 +116,29 @@ export function Dashboard({
     const cached = fileEntriesCache.current.get(composeScopeKey);
     if (cached && cached.column === composeColumn) {
       setComposeFileEntries(cached.entries);
+      setComposeTruncated(cached.truncated);
       return;
     }
     let alive = true;
     // No cache at all → clear so a previous scope's suggestions can't leak.
     // A stale-COLUMN hit keeps showing while the refetch runs (better than
     // flashing the popover empty mid-compose).
-    if (!cached) setComposeFileEntries([]);
-    else setComposeFileEntries(cached.entries);
+    if (!cached) {
+      setComposeFileEntries([]);
+      setComposeTruncated(false);
+    } else {
+      setComposeFileEntries(cached.entries);
+      setComposeTruncated(cached.truncated);
+    }
     const columnAtFetch = composeColumn ?? "";
     void (async () => {
       try {
-        const { files } = await client.listProjectFiles(composeScope);
+        const { files, truncated } = await client.listProjectFiles(composeScope);
         if (!alive) return;
         const entries = buildFileEntries(files);
-        fileEntriesCache.current.set(composeScopeKey, { entries, column: columnAtFetch });
+        fileEntriesCache.current.set(composeScopeKey, { entries, column: columnAtFetch, truncated });
         setComposeFileEntries(entries);
+        setComposeTruncated(truncated);
       } catch {
         // Best-effort: no suggestions this time, composer still usable.
       }
@@ -139,6 +153,30 @@ export function Dashboard({
     // string) should.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, targetId, composeScopeKey, composeColumn, client]);
+
+  // Monorepo fallback (CLAUDE.md §12): once the local listing for the
+  // current scope came back `truncated` (the 20k `MAX_PROJECT_FILES` cap),
+  // per-keystroke ranking over only that capped set would miss real matches
+  // further down the tree — so hand the composer a server-side search
+  // instead, via `GET /files/index`'s additive `q`/`limit` params. `scope`
+  // is captured from whichever render created this memo; its `dir`/`ref`
+  // content is guaranteed identical across every render for which
+  // `composeScopeKey` (the actual dep below) is unchanged, so a stale
+  // object reference here is never a stale VALUE — same trick the file-
+  // listing effect above already relies on to stay poll-stable.
+  const composeRemoteSearch = useMemo(() => {
+    if (!composeTruncated || !composeScope) return undefined;
+    const scope = composeScope;
+    return async (q: string): Promise<FileEntry[]> => {
+      try {
+        const { files } = await client.listProjectFiles({ ...scope, q, limit: 5 });
+        return files.map((path) => ({ path, isDirectory: path.endsWith("/") }));
+      } catch {
+        return [];
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [composeTruncated, composeScopeKey, client]);
 
   const sendMessage = (task: Task, text: string, okLabel = "→ sent") => {
     if (task.pendingInteractionCount > 0) {
@@ -308,6 +346,7 @@ export function Dashboard({
           width={cols}
           label={`→ ${target.id.slice(0, 8)}`}
           fileEntries={composeFileEntries}
+          remoteSearch={composeRemoteSearch}
           onSubmit={(t) => sendMessage(target, t)}
           onCancel={() => setMode("nav")}
         />

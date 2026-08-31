@@ -187,6 +187,152 @@ test("MAX_PROJECT_FILES is 20000 and a small repo is not reported truncated", as
   expect(res.files.length).toBeGreaterThanOrEqual(13); // README + 12 new files
 });
 
+test("MAX_SCANNED_FILES is 250000 (structural)", async () => {
+  const { MAX_SCANNED_FILES } = await import("./project-files.ts");
+  expect(MAX_SCANNED_FILES).toBe(250_000);
+});
+
+// ---------------------------------------------------------------------------
+// listProjectFiles — q-mode (server-side search)
+// ---------------------------------------------------------------------------
+
+describe("listProjectFiles (q-mode)", () => {
+  test("ranks matches over the full listing and returns them by path", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "src", "bun"), { recursive: true });
+    writeFileSync(path.join(repo, "src", "bun", "db.ts"), "x\n");
+    writeFileSync(path.join(repo, "src", "bun", "agents.ts"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "add src"], repo);
+
+    const res = await listProjectFiles({ dir: repo, q: "db" });
+    if ("error" in res) throw new Error(res.error);
+    expect(res.files).toContain("src/bun/db.ts");
+    expect(res.files).not.toContain("src/bun/agents.ts");
+  });
+
+  test("a derived directory prefix is returned WITH its trailing slash for a matching query", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "src", "bun"), { recursive: true });
+    writeFileSync(path.join(repo, "src", "bun", "db.ts"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "add src"], repo);
+
+    const res = await listProjectFiles({ dir: repo, q: "src" });
+    if ("error" in res) throw new Error(res.error);
+    expect(res.files).toContain("src/");
+  });
+
+  test("an exact-filename query ranks that file first, ahead of a nested same-named file", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "src"));
+    writeFileSync(path.join(repo, "app.tsx"), "x\n");
+    writeFileSync(path.join(repo, "src", "app.tsx"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "add app.tsx"], repo);
+
+    const res = await listProjectFiles({ dir: repo, q: "app.tsx" });
+    if ("error" in res) throw new Error(res.error);
+    expect(res.files[0]).toBe("app.tsx");
+  });
+
+  test("limit is respected and clamped (min 1, max 200)", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(repo, `match-${i}.txt`), `${i}\n`);
+    }
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "add matches"], repo);
+
+    const capped = await listProjectFiles({ dir: repo, q: "match", limit: 2 });
+    if ("error" in capped) throw new Error(capped.error);
+    expect(capped.files.length).toBe(2);
+
+    // limit: 0 clamps up to the minimum of 1.
+    const clampedLow = await listProjectFiles({ dir: repo, q: "match", limit: 0 });
+    if ("error" in clampedLow) throw new Error(clampedLow.error);
+    expect(clampedLow.files.length).toBe(1);
+
+    // limit: 1000 clamps down to 200, but only 5 entries match anyway.
+    const clampedHigh = await listProjectFiles({ dir: repo, q: "match", limit: 1000 });
+    if ("error" in clampedHigh) throw new Error(clampedHigh.error);
+    expect(clampedHigh.files.length).toBe(5);
+  });
+
+  test("q-mode at a ref sees only that ref's tree", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    writeFileSync(path.join(repo, "second.txt"), "second\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "second commit"], repo);
+
+    const atFirst = await listProjectFiles({ dir: repo, ref: "HEAD~1", q: "second" });
+    if ("error" in atFirst) throw new Error(atFirst.error);
+    expect(atFirst.files).not.toContain("second.txt");
+
+    const atMain = await listProjectFiles({ dir: repo, ref: "main", q: "second" });
+    if ("error" in atMain) throw new Error(atMain.error);
+    expect(atMain.files).toContain("second.txt");
+  });
+
+  test("an empty q string returns shallowest-first entries (dirs before files), capped at limit", async () => {
+    // repo already has "README" at the root (from makeRepo) — depth 0, a
+    // file, so it's a fine stand-in for a root-level entry alongside the
+    // derived "src/" directory (also depth 0).
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "src", "bun"), { recursive: true });
+    writeFileSync(path.join(repo, "src", "app.tsx"), "x\n");
+    writeFileSync(path.join(repo, "src", "bun", "db.ts"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "add tree"], repo);
+
+    const res = await listProjectFiles({ dir: repo, q: "", limit: 3 });
+    if ("error" in res) throw new Error(res.error);
+    expect(res.files).toEqual(["src/", "README", "src/bun/"]);
+  });
+
+  test("the TTL cache serves a second q call without re-running git", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    writeFileSync(path.join(repo, "cached-file.txt"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "seed"], repo);
+
+    const first = await listProjectFiles({ dir: repo, q: "new-file" });
+    if ("error" in first) throw new Error(first.error);
+    expect(first.files).not.toContain("new-file.txt");
+
+    // A file added AFTER the first call, queried again within the TTL
+    // window, must not appear — the cached listing (not fresh git output) is
+    // what gets re-ranked.
+    writeFileSync(path.join(repo, "new-file.txt"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "add new file"], repo);
+
+    const stillCached = await listProjectFiles({ dir: repo, q: "new-file" });
+    if ("error" in stillCached) throw new Error(stillCached.error);
+    expect(stillCached.files).not.toContain("new-file.txt");
+
+    // Clearing the cache forces a fresh git listing on the next call.
+    __clearProjectFilesCacheForTest();
+    const fresh = await listProjectFiles({ dir: repo, q: "new-file" });
+    if ("error" in fresh) throw new Error(fresh.error);
+    expect(fresh.files).toContain("new-file.txt");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // resolveAtPath
 // ---------------------------------------------------------------------------
