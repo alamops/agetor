@@ -502,6 +502,11 @@ test.describe("@ file references", () => {
 
     const expectedPath = `${backend.dataDir}/worktrees/${startedTaskId}/src/app.ts`;
     await expect(page.getByText(expectedPath).first()).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    // Display-only shortening: the user bubble folds the expanded absolute
+    // path back to the typed mention, while the stdout echo above keeps the
+    // absolute path (what the agent actually received).
+    await expect(panel.getByText("and @src/app.ts").first()).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   });
 
   test("Run-settle refresh: a file created after the listing loaded appears without blur/refocus", async ({ page, backend }) => {

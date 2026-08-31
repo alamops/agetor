@@ -17,6 +17,7 @@ import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
 import type { FileScope } from "@/lib/use-project-files";
+import { shortenTaskPaths } from "@/lib/shorten-task-paths";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -2519,6 +2520,13 @@ function RunPanelBody({
   // (`branchSource === "existing"`, e.g. a PR's head branch), else the
   // pinned `baseRef` a freshly-created branch will be cut from; a plain
   // workdir otherwise.
+  // Stable identity for RunEventList/UserMessageBlock's display-only path
+  // shortening (see the `pathRoots` prop doc) — both are memoized, so a
+  // fresh array each render would defeat them.
+  const pathRoots = useMemo(
+    () => [task.worktreePath, task.workdir],
+    [task.worktreePath, task.workdir],
+  );
   const fileScope = useMemo<FileScope>(() => (
     task.worktreePath
       ? { dir: task.worktreePath }
@@ -2898,6 +2906,7 @@ function RunPanelBody({
                 indicatorMode={indicatorMode}
                 holdSummary={holdSummary}
                 taskId={task.id}
+                pathRoots={pathRoots}
                 plans={kind === "cursor" || kind === "claude-code" ? plans : NO_PLANS}
                 onOpenPlan={onOpenPlan}
                 agentKind={kind}
@@ -3881,6 +3890,7 @@ function RunEventList({
   onOpenPlan,
   agentKind,
   onAskAnswerWithheld,
+  pathRoots,
 }: {
   events: RunEvent[];
   interactions?: PendingInteraction[];
@@ -3898,6 +3908,11 @@ function RunEventList({
    *  relative attachment ref can resolve against the task's worktree/workdir
    *  when the user clicks it. */
   taskId?: string;
+  /** The task's own filesystem roots (`worktreePath`, `workdir`) — used by
+   *  `UserMessageBlock` for DISPLAY-ONLY folding of expanded absolute `@`
+   *  paths back to the mention form the user typed. Never consulted for
+   *  chips/previews, which need the real absolute paths. */
+  pathRoots?: readonly (string | null | undefined)[];
   /** Plans detected on this task (`task.plans`) — Cursor's
    *  `createPlanToolCall` or claude-code's `ExitPlanMode`. Empty (`NO_PLANS`)
    *  for every other agent. Matched against each `tool_use` event's parsed id
@@ -4093,7 +4108,7 @@ function RunEventList({
           // child of the scroll container (`sections.map` below renders one
           // `<section>` per user-message group), so THIS is the element that
           // has to pin to `top-0` for the sticky header to work at all.
-          return [wrap(key, evid, <UserMessageBlock text={e.data} taskId={taskId} />, "sticky top-0 z-10")];
+          return [wrap(key, evid, <UserMessageBlock text={e.data} taskId={taskId} pathRoots={pathRoots} />, "sticky top-0 z-10")];
         case "assistant":
           return [wrap(key, evid, <AssistantBlock text={e.data} />)];
         case "thinking":
@@ -4205,7 +4220,7 @@ function RunEventList({
     current.body.push(...tail);
     if (current.header !== null || current.body.length > 0) out.push(current);
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, pathRoots, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -4380,7 +4395,7 @@ function findScrollParent(el: HTMLElement | null): HTMLElement | null {
 // importing back from this file (that used to be a circular import: PlanDialog
 // -> RunPanel -> PlanDialog). See md-components.tsx's doc comment.
 
-const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text: string; taskId?: string }) {
+const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoots }: { text: string; taskId?: string; pathRoots?: readonly (string | null | undefined)[] }) {
   const [expanded, setExpanded] = useState(false);
   const [needsToggle, setNeedsToggle] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -4426,6 +4441,13 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
     ordinary.references.length > 0
       ? stripImagePlaceholders(ordinary.args)
       : ordinary.args;
+
+  // Display-only: fold expanded absolute paths under the task's own roots
+  // back to the `@rel` mention the user typed (send-time expansion produced
+  // them — see CLAUDE.md §12). Applied to the rendered markdown body ONLY;
+  // the references arrays keep absolute paths for chips/previews.
+  const displayCommandArgs = pathRoots?.length ? shortenTaskPaths(commandArgsText, pathRoots) : commandArgsText;
+  const displayOrdinaryArgs = pathRoots?.length ? shortenTaskPaths(ordinaryArgsText, pathRoots) : ordinaryArgsText;
 
   // Default to the collapsed ~3-line cap and measure once mounted. The cap
   // is always rendered so short messages don't flash full-height first;
@@ -4495,7 +4517,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
             {commandArgsText && (
               <div ref={contentRef} className={collapseClassName}>
                 <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
-                  {commandArgsText}
+                  {displayCommandArgs}
                 </ReactMarkdown>
               </div>
             )}
@@ -4508,7 +4530,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
             </div>
             <div ref={contentRef} className={collapseClassName}>
               <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
-                {ordinaryArgsText}
+                {displayOrdinaryArgs}
               </ReactMarkdown>
             </div>
             <AttachmentChips references={ordinary.references} taskId={taskId} />

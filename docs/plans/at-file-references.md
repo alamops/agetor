@@ -173,3 +173,7 @@ Assumptions logged (routine, reversible):
 - Truncated composers: popover falls back to server search (≥2-char queries, 150 ms debounce, request-failure = keep local rows); PromptComposer verifies ≤8 unlisted tokens via q-mode → highlight union + proven-missing-only warnings (unproven never warns); TUI `remoteSearch` and `agetor add`'s pre-check mirror the contract.
 - Review (opus, code-review skill): 4 high / 3 medium / 7 low — all applied (blank-query O(n) path + client gate, server single-flight, null-failure semantics, cache prune/cap, client search-cache TTL+limit key+refresh clear, active-row reset on row identity, footer reword, no-q sort-before-cap, TTL test seam, add.ts past-cap parity).
 - e2e: `at-file-truncated.spec.ts` — 20,050-file fixture (~2 s build), target past the cap: fallback popover + footer, past-cap highlight, proven-missing warning, below-cap regression; 15/15 with the main spec.
+
+## 15. Follow-up (2026-08-31): transcript path shortening
+
+- `shortenTaskPaths` (mainview/lib, 10 unit tests) folds expanded absolute paths under `worktreePath`/`workdir` back to `@rel` / `@\"rel with spaces\"` in the USER bubble's rendered markdown only — refs arrays/chips/previews and the raw event keep absolute paths. Threaded as `RunEventList.pathRoots` (memoized in RunPanelBody). e2e: the RunPanel follow-up scenario now asserts the bubble shows `and @src/app.ts` while the stdout echo keeps the absolute path.
