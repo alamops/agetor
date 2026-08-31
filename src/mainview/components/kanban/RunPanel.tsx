@@ -2569,8 +2569,8 @@ function RunPanelBody({
               subpage directly; otherwise (an unrecognized provider URL
               shape) fall back to the plain external link, as before. */}
           {prUrl && (
-            parsePullNumber(prUrl) != null ? (
-              <Tooltip align="end" label="Open the pull request created for this task">
+            <Tooltip align="end" label="Open the pull request created for this task">
+              {parsePullNumber(prUrl) != null ? (
                 <Button
                   size="icon"
                   variant="outline"
@@ -2579,9 +2579,7 @@ function RunPanelBody({
                 >
                   <GitPullRequest className="size-4" />
                 </Button>
-              </Tooltip>
-            ) : (
-              <Tooltip align="end" label="Open the pull request created for this task">
+              ) : (
                 <ExternalLink
                   href={prUrl}
                   className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
@@ -2589,16 +2587,16 @@ function RunPanelBody({
                 >
                   <GitPullRequest className="size-4" />
                 </ExternalLink>
-              </Tooltip>
-            )
+              )}
+            </Tooltip>
           )}
           {/* Durable "View issue" sibling of "View PR" above — same
               rationale (header, not the composer chip row) and the same
               in-app-detail-vs-external-link branch, keyed on whether
               `issueUrl` parses to a recognized provider issue URL. */}
           {issueUrl && (
-            parseIssueUrl(issueUrl) != null ? (
-              <Tooltip align="end" label="Open the issue this task was created from">
+            <Tooltip align="end" label="Open the issue this task was created from">
+              {parseIssueUrl(issueUrl) != null ? (
                 <Button
                   size="icon"
                   variant="outline"
@@ -2608,9 +2606,7 @@ function RunPanelBody({
                 >
                   <CircleDot className="size-4" />
                 </Button>
-              </Tooltip>
-            ) : (
-              <Tooltip align="end" label="Open the issue this task was created from">
+              ) : (
                 <ExternalLink
                   href={issueUrl}
                   className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
@@ -2619,8 +2615,8 @@ function RunPanelBody({
                 >
                   <CircleDot className="size-4" />
                 </ExternalLink>
-              </Tooltip>
-            )
+              )}
+            </Tooltip>
           )}
           {/* Manual re-check — only once a first fetch has settled, so it
               doesn't appear (and immediately duplicate) the initial load. */}

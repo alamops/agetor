@@ -58,3 +58,7 @@ Restructure the RunPanel ("Task details") header so that:
 
 - Owner answered: all buttons icon-only (incl. Stop); row right-aligned in current order.
 - Assumption (low risk): keeping per-button variants (outline/ghost/destructive) rather than flattening to all-ghost; matches the "least surprise" reading of the screenshot. Reversible in one line per button.
+
+## 10. Addendum — hover tooltips (owner follow-up, 2026-08-31)
+
+Owner asked for real tooltips after the icon-only conversion (native `title` shows only on ~1s mouse hover, never on keyboard focus/touch). Delivered as `src/mainview/components/ui/tooltip.tsx` wrapped around all 13 icon buttons (10 header + search-bar prev/next/close), replacing their `title` attrs; the search-bar trio gained the `aria-label`s they never had (their `title` had been their only accessible name). Contract decisions: absolute-positioned bubble (never fixed — aside transform), `bg-card` styling, `aria-hidden` bubble + permanent `sr-only` twin wired via `aria-describedby` (keeps the descriptive channel `title` used to provide), no `data-popover-open` (transient bubbles must not block Escape layering), 300ms hover delay, `:focus-visible`-gated keyboard show, split hover/focus state, module-level single-open token, viewport-left clamp. Opus-reviewed (2 medium + 4 low, all addressed or consciously declined); e2e extended for hover show/hide + no-native-title. Out of scope (different ticket): sweeping RunPanel's remaining ~12 native-`title` icon buttons (backlog tray etc.) onto the new primitive.
