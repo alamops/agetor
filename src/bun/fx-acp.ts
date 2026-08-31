@@ -1261,7 +1261,7 @@ function describeHandshakeFailure(err: unknown, step: string, timeoutMs: number)
   }
   // A real ACP error response (e.g. the unauthenticated-binary case) is
   // user-actionable on its own — surface its message verbatim rather than
-  // wrapping it, so e.g. "Fx needs access to Vercel AI Gateway…" reads
+  // wrapping it, so e.g. "fx needs access to Vercel AI Gateway…" reads
   // cleanly in the run panel.
   return errMessage(err);
 }

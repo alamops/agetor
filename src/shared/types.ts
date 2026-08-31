@@ -221,8 +221,9 @@ export interface HarnessStatus {
    * failed, or its output wasn't parseable — `null` must never block a run.
    */
   loggedIn: boolean | null;
-  /** The CLI's own login guidance (verbatim, e.g. fx's `auth_help`) when
-   *  `loggedIn === false`; otherwise null. */
+  /** Login guidance when `loggedIn === false`: fx's own `auth_help` when the
+   *  probe supplies one, else one of agetor's two synthesized fallback hints
+   *  (missing credentials vs. an expired login); otherwise null. */
   authHelp: string | null;
 }
 

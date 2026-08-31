@@ -924,10 +924,12 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   // env-var auth IS reflected by the probe (AI_GATEWAY_API_KEY /
   // VERCEL_OIDC_TOKEN both report a non-"missing" `auth` value) — since the
   // probe runs with the same harnessEnv(harness) a real spawn uses, a
-  // key-authenticated user is never gated out here (see agent-status.ts's
-  // probeStatus doc comment). As of 0.0.7, that same explicit `false` also
-  // covers an expired login that can't self-refresh (`auth_expired === true
-  // && auth_refreshable === false`) — see agent-status.ts's probeStatus doc.
+  // key-authenticated user is never gated out here. As of 0.0.7, that same
+  // explicit `false` can also come from an expired login that can't
+  // self-refresh (`auth_expired === true && auth_refreshable === false`) —
+  // but that gate explicitly exempts the env-key `auth` values above (see
+  // agent-status.ts's probeStatus doc comment for the full rationale), so
+  // the "never gated out" guarantee holds with no exception.
   if (status.loggedIn === false) {
     return { error: `${harness.label} isn't logged in — ${status.authHelp ?? "run its login command"}` };
   }

@@ -136,6 +136,18 @@ async function probeJson(bin: string, args: string[], env: Record<string, string
  *     login is actually dead — blocking here would be a false "logged out"
  *     for a session fx would happily revive.
  *
+ * This expired-login gate is exempt entirely when `auth` is one of the
+ * env-key values (`"AI_GATEWAY_API_KEY"` / `"VERCEL_OIDC_TOKEN"`) — those
+ * `auth` values mean the ACTIVE auth mechanism is the env key, not a stored
+ * login, so a stale *stored* login must never refuse a run that would
+ * authenticate via the key. Whether fx even emits `auth_expired` alongside
+ * env-key auth is unobserved (these fields were only ever seen on real `fx
+ * login` accounts, never on an env-key-authenticated probe), and the gate
+ * deliberately exempts them anyway so the long-standing guarantee "a
+ * key-authenticated user is never gated out here" stays literally true. The
+ * expired-login gate thus applies only to login-style `auth` values (e.g.
+ * `"fx login"`, provider subscription logins like `"fx login codex"`).
+ *
  * Empirically verified auth values (real fx binary, v0.0.6 and v0.0.7 —
  * `HOME` pointed at an empty dir so no ambient credentials leak in): no
  * credentials at all → `auth:"missing"` + `auth_help`; `AI_GATEWAY_API_KEY`
@@ -186,8 +198,16 @@ async function probeStatus(bin: string, env: Record<string, string>): Promise<{ 
   // 0.0.7+: an authenticated-but-expired, non-refreshable login. Strict on
   // both booleans by design — see the doc comment above for why every other
   // combination (absent/non-boolean/`auth_refreshable !== false`) must stay
-  // fail-open instead of joining this branch.
-  if (record.auth_expired === true && record.auth_refreshable === false) {
+  // fail-open instead of joining this branch. Env-key auth is exempt from
+  // this gate entirely (see the doc comment above) — the active auth
+  // mechanism there is the key, not a stored login, so a stale stored login
+  // must never refuse a run that would authenticate via the key.
+  if (
+    auth !== "AI_GATEWAY_API_KEY" &&
+    auth !== "VERCEL_OIDC_TOKEN" &&
+    record.auth_expired === true &&
+    record.auth_refreshable === false
+  ) {
     const authHelp = record.auth_help;
     return {
       loggedIn: false,
