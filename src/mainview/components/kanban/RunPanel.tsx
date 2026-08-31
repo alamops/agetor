@@ -2581,7 +2581,7 @@ function RunPanelBody({
             ) : (
               <ExternalLink
                 href={prUrl}
-                className={cn(buttonVariants({ variant: "outline", size: "icon" }), "no-underline hover:no-underline")}
+                className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
                 title="Open the pull request created for this task"
                 aria-label="View PR"
               >
@@ -2608,7 +2608,7 @@ function RunPanelBody({
             ) : (
               <ExternalLink
                 href={issueUrl}
-                className={cn(buttonVariants({ variant: "outline", size: "icon" }), "no-underline hover:no-underline")}
+                className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
                 title="Open the issue this task was created from"
                 aria-label="View issue"
                 data-testid="view-issue"
@@ -2626,7 +2626,7 @@ function RunPanelBody({
               onClick={refreshPrStatus}
               disabled={prStatusLoading}
               title={prStatusError ?? "Re-check PR mergeability"}
-              aria-label="Re-check PR status"
+              aria-label={prStatusError ? `Re-check PR status — ${prStatusError}` : "Re-check PR status"}
             >
               <RefreshCw className="size-4" />
             </Button>
@@ -2672,7 +2672,7 @@ function RunPanelBody({
               variant="outline"
               onClick={() => onArchive(task)}
               title={active ? "Stop the running agent and archive task" : "Archive task"}
-              aria-label="Archive"
+              aria-label={active ? "Stop the running agent and archive task" : "Archive task"}
             >
               <Archive className="size-4" />
             </Button>
@@ -2687,6 +2687,7 @@ function RunPanelBody({
             variant="ghost"
             title="Search messages"
             aria-label="Search messages"
+            aria-expanded={searchOpen}
             onClick={() => {
               if (searchOpen) {
                 closeSearch();
