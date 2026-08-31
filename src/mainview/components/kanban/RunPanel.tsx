@@ -20,6 +20,7 @@ import { reconcileById } from "@/lib/reconcile";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Badge, badgeVariants } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -2569,24 +2570,26 @@ function RunPanelBody({
               shape) fall back to the plain external link, as before. */}
           {prUrl && (
             parsePullNumber(prUrl) != null ? (
-              <Button
-                size="icon"
-                variant="outline"
-                onClick={() => onViewPullRequest({ projectPath: task.workdir, prUrl })}
-                title="Open the pull request created for this task"
-                aria-label="View PR"
-              >
-                <GitPullRequest className="size-4" />
-              </Button>
+              <Tooltip align="end" label="Open the pull request created for this task">
+                <Button
+                  size="icon"
+                  variant="outline"
+                  onClick={() => onViewPullRequest({ projectPath: task.workdir, prUrl })}
+                  aria-label="View PR"
+                >
+                  <GitPullRequest className="size-4" />
+                </Button>
+              </Tooltip>
             ) : (
-              <ExternalLink
-                href={prUrl}
-                className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
-                title="Open the pull request created for this task"
-                aria-label="View PR"
-              >
-                <GitPullRequest className="size-4" />
-              </ExternalLink>
+              <Tooltip align="end" label="Open the pull request created for this task">
+                <ExternalLink
+                  href={prUrl}
+                  className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
+                  aria-label="View PR"
+                >
+                  <GitPullRequest className="size-4" />
+                </ExternalLink>
+              </Tooltip>
             )
           )}
           {/* Durable "View issue" sibling of "View PR" above — same
@@ -2595,116 +2598,132 @@ function RunPanelBody({
               `issueUrl` parses to a recognized provider issue URL. */}
           {issueUrl && (
             parseIssueUrl(issueUrl) != null ? (
-              <Button
-                size="icon"
-                variant="outline"
-                onClick={() => onViewIssue({ projectPath: task.workdir, issueUrl })}
-                title="Open the issue this task was created from"
-                aria-label="View issue"
-                data-testid="view-issue"
-              >
-                <CircleDot className="size-4" />
-              </Button>
+              <Tooltip align="end" label="Open the issue this task was created from">
+                <Button
+                  size="icon"
+                  variant="outline"
+                  onClick={() => onViewIssue({ projectPath: task.workdir, issueUrl })}
+                  aria-label="View issue"
+                  data-testid="view-issue"
+                >
+                  <CircleDot className="size-4" />
+                </Button>
+              </Tooltip>
             ) : (
-              <ExternalLink
-                href={issueUrl}
-                className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
-                title="Open the issue this task was created from"
-                aria-label="View issue"
-                data-testid="view-issue"
-              >
-                <CircleDot className="size-4" />
-              </ExternalLink>
+              <Tooltip align="end" label="Open the issue this task was created from">
+                <ExternalLink
+                  href={issueUrl}
+                  className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
+                  aria-label="View issue"
+                  data-testid="view-issue"
+                >
+                  <CircleDot className="size-4" />
+                </ExternalLink>
+              </Tooltip>
             )
           )}
           {/* Manual re-check — only once a first fetch has settled, so it
               doesn't appear (and immediately duplicate) the initial load. */}
           {parsedPrUrl && (prStatus != null || prStatusError != null) && (
+            <Tooltip align="end" label={prStatusError ?? "Re-check PR mergeability"}>
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={refreshPrStatus}
+                disabled={prStatusLoading}
+                aria-label={prStatusError ? `Re-check PR status — ${prStatusError}` : "Re-check PR status"}
+              >
+                <RefreshCw className="size-4" />
+              </Button>
+            </Tooltip>
+          )}
+          <Tooltip align="end" label="View this task's changes (git diff)">
             <Button
               size="icon"
-              variant="ghost"
-              onClick={refreshPrStatus}
-              disabled={prStatusLoading}
-              title={prStatusError ?? "Re-check PR mergeability"}
-              aria-label={prStatusError ? `Re-check PR status — ${prStatusError}` : "Re-check PR status"}
+              variant="outline"
+              onClick={() => onShowDiff(task)}
+              aria-label="View diff"
             >
-              <RefreshCw className="size-4" />
+              <GitCompare className="size-4" />
             </Button>
-          )}
-          <Button
-            size="icon"
-            variant="outline"
-            onClick={() => onShowDiff(task)}
-            title="View this task's changes (git diff)"
-            aria-label="View diff"
-          >
-            <GitCompare className="size-4" />
-          </Button>
-          <Button
-            size="icon"
-            variant="outline"
-            onClick={() =>
-              void api.openPath({
-                path: task.worktreePath ?? task.workdir,
-                taskId: task.id,
-              }).catch(() => { /* swallowed — openPath failures are best-effort */ })
-            }
-            title={
+          </Tooltip>
+          <Tooltip
+            align="end"
+            label={
               task.worktreePath
                 ? `Open the worktree in your file manager: ${task.worktreePath}`
                 : `Open the project workdir in your file manager: ${task.workdir}`
             }
-            aria-label="Open working folder"
           >
-            <FolderOpen className="size-4" />
-          </Button>
+            <Button
+              size="icon"
+              variant="outline"
+              onClick={() =>
+                void api.openPath({
+                  path: task.worktreePath ?? task.workdir,
+                  taskId: task.id,
+                }).catch(() => { /* swallowed — openPath failures are best-effort */ })
+              }
+              aria-label="Open working folder"
+            >
+              <FolderOpen className="size-4" />
+            </Button>
+          </Tooltip>
           {/* Stop targets the main run. Hide it while viewing a read-only
               background-agent tab so the control doesn't read as "stop this
               agent" — switch back to Main to stop the task. */}
           {!archived && canControl && activeStream === "main" && (
-            <Button size="icon" variant="destructive" onClick={stop} title="Stop" aria-label="Stop">
-              <Square className="size-4" />
-            </Button>
+            <Tooltip align="end" label="Stop">
+              <Button size="icon" variant="destructive" onClick={stop} aria-label="Stop">
+                <Square className="size-4" />
+              </Button>
+            </Tooltip>
           )}
           {!archived && (task.column === "done" || active) && (
-            <Button
-              size="icon"
-              variant="outline"
-              onClick={() => onArchive(task)}
-              title={active ? "Stop the running agent and archive task" : "Archive task"}
-              aria-label={active ? "Stop the running agent and archive task" : "Archive task"}
-            >
-              <Archive className="size-4" />
-            </Button>
+            <Tooltip align="end" label={active ? "Stop the running agent and archive task" : "Archive task"}>
+              <Button
+                size="icon"
+                variant="outline"
+                onClick={() => onArchive(task)}
+                aria-label={active ? "Stop the running agent and archive task" : "Archive task"}
+              >
+                <Archive className="size-4" />
+              </Button>
+            </Tooltip>
           )}
           {archived && (
-            <Button size="icon" variant="outline" onClick={() => onUnarchive(task)} title="Unarchive task" aria-label="Unarchive">
-              <ArchiveRestore className="size-4" />
-            </Button>
+            <Tooltip align="end" label="Unarchive task">
+              <Button size="icon" variant="outline" onClick={() => onUnarchive(task)} aria-label="Unarchive">
+                <ArchiveRestore className="size-4" />
+              </Button>
+            </Tooltip>
           )}
-          <Button
-            size="icon"
-            variant="ghost"
-            title="Search messages"
-            aria-label="Search messages"
-            aria-expanded={searchOpen}
-            onClick={() => {
-              if (searchOpen) {
-                closeSearch();
-                return;
-              }
-              setSearchOpen(true);
-              // The input isn't mounted yet on the render this triggers (the
-              // bar renders conditionally on `searchOpen`) — focus after the
-              // next paint.
-              requestAnimationFrame(() => searchInputRef.current?.focus());
-            }}
-          >
-            <Search className="size-4" />
-          </Button>
-          <Button size="icon" variant="ghost" onClick={onClose} title="Close task details" aria-label="Close task details">
-            <X className="size-4" />
-          </Button>
+          <Tooltip align="end" label="Search messages">
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="Search messages"
+              aria-expanded={searchOpen}
+              onClick={() => {
+                if (searchOpen) {
+                  closeSearch();
+                  return;
+                }
+                setSearchOpen(true);
+                // The input isn't mounted yet on the render this triggers (the
+                // bar renders conditionally on `searchOpen`) — focus after the
+                // next paint.
+                requestAnimationFrame(() => searchInputRef.current?.focus());
+              }}
+            >
+              <Search className="size-4" />
+            </Button>
+          </Tooltip>
+          <Tooltip align="end" label="Close task details">
+            <Button size="icon" variant="ghost" onClick={onClose} aria-label="Close task details">
+              <X className="size-4" />
+            </Button>
+          </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
         <div className="mt-0.5 truncate text-xs text-muted-foreground">
@@ -2742,29 +2761,35 @@ function RunPanelBody({
           <span aria-live="polite" className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
             {matches.length === 0 ? "0/0" : `${activeMatchPosition + 1}/${matches.length}`}
           </span>
-          <Button
-            size="icon"
-            variant="ghost"
-            className="size-7"
-            disabled={matches.length === 0}
-            title="Previous match"
-            onClick={() => stepSearch(-1)}
-          >
-            <ChevronUp className="size-3.5" />
-          </Button>
-          <Button
-            size="icon"
-            variant="ghost"
-            className="size-7"
-            disabled={matches.length === 0}
-            title="Next match"
-            onClick={() => stepSearch(1)}
-          >
-            <ChevronDown className="size-3.5" />
-          </Button>
-          <Button size="icon" variant="ghost" className="size-7" title="Close search" onClick={closeSearch}>
-            <X className="size-3.5" />
-          </Button>
+          <Tooltip align="end" label="Previous match">
+            <Button
+              size="icon"
+              variant="ghost"
+              className="size-7"
+              disabled={matches.length === 0}
+              onClick={() => stepSearch(-1)}
+              aria-label="Previous match"
+            >
+              <ChevronUp className="size-3.5" />
+            </Button>
+          </Tooltip>
+          <Tooltip align="end" label="Next match">
+            <Button
+              size="icon"
+              variant="ghost"
+              className="size-7"
+              disabled={matches.length === 0}
+              onClick={() => stepSearch(1)}
+              aria-label="Next match"
+            >
+              <ChevronDown className="size-3.5" />
+            </Button>
+          </Tooltip>
+          <Tooltip align="end" label="Close search">
+            <Button size="icon" variant="ghost" className="size-7" onClick={closeSearch} aria-label="Close search">
+              <X className="size-3.5" />
+            </Button>
+          </Tooltip>
         </div>
       )}
 
