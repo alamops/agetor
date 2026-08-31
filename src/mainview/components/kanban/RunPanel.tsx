@@ -2993,6 +2993,10 @@ function RunPanelBody({
             textareaRef={sendRef}
             capture={capture}
             fileScope={fileScope}
+            // A column transition = a run settled (or started): the agent may
+            // have just written files while focus never left the composer —
+            // retrigger the listing fetch (see the prop's doc).
+            fileScopeRefreshToken={task.column}
             // Pass the hoisted results down (see the comment above
             // `capabilities`'s declaration) so this dock's remounts don't
             // refire the composer's own internal fetches.

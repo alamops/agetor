@@ -504,6 +504,47 @@ test.describe("@ file references", () => {
     await expect(page.getByText(expectedPath).first()).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   });
 
+  test("Run-settle refresh: a file created after the listing loaded appears without blur/refocus", async ({ page, backend }) => {
+    test.setTimeout(60_000);
+    expect(startedTaskId, "the prior 'Start' scenario must have run first").toBeTruthy();
+
+    await gotoApp(page, backend.bootBase);
+    await taskCard(page, startedTaskTitle).click();
+    const panel = runPanel(page);
+    const textarea = panel.getByTestId("send-textarea");
+    await expect(textarea).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    // Load the listing (focus-refetch) and prove it's live BEFORE the new
+    // file exists.
+    await textarea.click();
+    await page.keyboard.type("@REA");
+    await expect(atRow(panel, "README.md")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await textarea.fill("");
+
+    // "The agent creates a file mid-session" — the fake driver writes no
+    // files, so the test does: on disk, but absent from the listing above.
+    await writeFile(
+      path.join(backend.dataDir, "worktrees", startedTaskId!, "fresh-file.ts"),
+      "export const fresh = true;\n",
+    );
+
+    // Focus never left the textarea → no focus-refetch → the popover must
+    // not know the file yet.
+    await page.keyboard.type("@fres");
+    await expect(atPopover(panel)).toBeHidden();
+
+    // A column transition (here via the API; in real life the run settling)
+    // is the refresh trigger: the still-open query re-ranks against the
+    // fresh listing with no blur/refocus anywhere.
+    const patch = await fetch(`${backend.apiBase}/tasks/${startedTaskId}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ column: "ready" }),
+    });
+    expect(patch.ok).toBe(true);
+    await expect(atRow(panel, "fresh-file.ts")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  });
+
   test("Issue dialog: @REA popover works inside it; Escape leaves the dialog open", async ({ page, backend }) => {
     test.setTimeout(60_000);
     await gotoApp(page, backend.bootBase);

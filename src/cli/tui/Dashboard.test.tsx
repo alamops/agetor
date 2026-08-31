@@ -327,6 +327,39 @@ test("the file-listing cache is keyed by scope, not task id — a scope change m
   unmount();
 });
 
+test("a cached listing is invalidated when the task's column changes (run settles) — same scope refetches", async () => {
+  let calls = 0;
+  // Scope stays constant (worktree already materialized); only the column
+  // flips, mimicking the agent's run settling while the composer stays open.
+  let column: "running" | "review" = "running";
+  const taskA = () =>
+    task({
+      id: "taskA", column: column, runId: column === "running" ? "runA" : null, title: "A",
+      workdir: "/repo", isolation: "worktree", baseRef: "main", branchSource: "created", branch: null,
+      worktreePath: "/repo-worktree",
+    });
+  const client = {
+    listTasks: async () => [taskA()],
+    listProjectFiles: async () => {
+      calls++;
+      return { files: [], truncated: false };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // compose opens — fetches under column "running"
+  await wait(80);
+  expect(calls).toBe(1);
+
+  column = "review"; // the run settles; the agent may have written files
+  await wait(1700); // let the 1.5s poll deliver the column transition
+  expect(calls).toBe(2); // same scope key, stale column → refetched
+  unmount();
+});
+
 // ── 's' start path: unresolvedRefs surfaces a ⚠ in the started status ───────
 
 test("the 's' start path surfaces ⚠ in the started status when startTask returns unresolvedRefs", async () => {

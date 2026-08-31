@@ -70,11 +70,18 @@ export function Dashboard({
   // `use-project-files.ts`. A fetch failure degrades to no suggestions rather
   // than blocking the composer.
   const [composeFileEntries, setComposeFileEntries] = useState<FileEntry[]>([]);
-  const fileEntriesCache = useRef<Map<string, FileEntry[]>>(new Map());
+  // Entries are cached per SCOPE but only trusted while the task's column is
+  // unchanged: a column transition means a run settled (or started) and the
+  // agent may have written files since the fetch — the TUI mirror of the
+  // webview composer's `fileScopeRefreshToken={task.column}`.
+  const fileEntriesCache = useRef<Map<string, { entries: FileEntry[]; column: string }>>(new Map());
   // `target` is resolved by id (see above) so this stays valid even though
   // `sorted` reshuffles every 1.5s poll.
   const composeScope = target ? fileScopeForTask(target) : null;
   const composeScopeKey = composeScope ? `${composeScope.dir} ${composeScope.ref ?? ""}` : null;
+  // Stable string (unlike `target`'s per-poll identity) — its CHANGE is the
+  // run-settle signal that invalidates the listing cache below.
+  const composeColumn = target ? target.column : null;
 
   // `agentDiscovery`'s `@name` extension names for a task (the ExtensionPicker's
   // own mention syntax, e.g. `@github` — never a file reference). Delegates
@@ -100,18 +107,23 @@ export function Dashboard({
     // below) — independent of, and no slower than, the file listing fetch.
     void getExtensionNames(target);
     const cached = fileEntriesCache.current.get(composeScopeKey);
-    if (cached) {
-      setComposeFileEntries(cached);
+    if (cached && cached.column === composeColumn) {
+      setComposeFileEntries(cached.entries);
       return;
     }
     let alive = true;
-    setComposeFileEntries([]); // no stale suggestions from a previous scope while this loads
+    // No cache at all → clear so a previous scope's suggestions can't leak.
+    // A stale-COLUMN hit keeps showing while the refetch runs (better than
+    // flashing the popover empty mid-compose).
+    if (!cached) setComposeFileEntries([]);
+    else setComposeFileEntries(cached.entries);
+    const columnAtFetch = composeColumn ?? "";
     void (async () => {
       try {
         const { files } = await client.listProjectFiles(composeScope);
         if (!alive) return;
         const entries = buildFileEntries(files);
-        fileEntriesCache.current.set(composeScopeKey, entries);
+        fileEntriesCache.current.set(composeScopeKey, { entries, column: columnAtFetch });
         setComposeFileEntries(entries);
       } catch {
         // Best-effort: no suggestions this time, composer still usable.
@@ -126,7 +138,7 @@ export function Dashboard({
     // an actual scope change (tracked via the stable `composeScopeKey`
     // string) should.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, targetId, composeScopeKey, client]);
+  }, [mode, targetId, composeScopeKey, composeColumn, client]);
 
   const sendMessage = (task: Task, text: string, okLabel = "→ sent") => {
     if (task.pendingInteractionCount > 0) {

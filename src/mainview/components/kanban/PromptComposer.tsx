@@ -276,6 +276,13 @@ export interface PromptComposerProps {
    * popover and highlighting entirely — no fetch is made.
    */
   fileScope?: FileScope | null;
+  /** Opaque token whose CHANGE triggers a listing `refresh()` — RunPanel
+   *  passes `task.column`, so a run settling (running → review/ready/blocked)
+   *  re-lists the tree the agent may have just written files into. The
+   *  focus-refetch misses exactly that case: the cursor is often already in
+   *  the composer when the run ends, so no blur/focus ever fires. Consumers
+   *  without run state simply omit it (undefined never fires). */
+  fileScopeRefreshToken?: unknown;
   /**
    * Functional-updater-capable references setter for `usePromptCapture`'s
    * internal instance (see the `capture` prop doc). When the caller already
@@ -421,6 +428,7 @@ export function PromptComposer({
   onReferencesChange,
   setReferences,
   fileScope,
+  fileScopeRefreshToken,
   textareaRef,
   capture,
   capabilities,
@@ -468,6 +476,17 @@ export function PromptComposer({
   // unused here — no error UI in this pass; it's available for a future
   // inline hint if that's ever wanted.
   const projectFiles = useProjectFiles(fileScope ?? null);
+
+  // Fire `refresh()` when the caller's run-settle token changes — never on
+  // mount (the hook's own scope-change fetch covers that). Guarded by a ref
+  // compare, not the effect merely running: `projectFiles` is a fresh object
+  // every render, so the deps alone can't debounce this.
+  const prevRefreshTokenRef = useRef(fileScopeRefreshToken);
+  useEffect(() => {
+    if (Object.is(prevRefreshTokenRef.current, fileScopeRefreshToken)) return;
+    prevRefreshTokenRef.current = fileScopeRefreshToken;
+    projectFiles.refresh();
+  }, [fileScopeRefreshToken, projectFiles]);
 
   // Bridges for `usePromptCapture`'s internal instance below — it needs
   // `Dispatch`-shaped setters, but this component's public props are plain
