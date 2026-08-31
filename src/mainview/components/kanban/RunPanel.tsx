@@ -5359,7 +5359,7 @@ function TaskDetails({
             {editable ? (
               <CompactSelect
                 value={task.model ?? DEFAULT_MODEL[kind]}
-                options={mergedModels(kind, task.agent, agentModels, harnessModels, task.model ?? DEFAULT_MODEL[kind])}
+                options={mergedModels(kind, task.agent, agentModels, harnessModels, task.model ?? DEFAULT_MODEL[kind], agents.find((a) => a.harnessId === task.agent)?.loggedIn ?? null)}
                 onChange={(model) => void save({ model })}
               />
             ) : (
@@ -5519,6 +5519,7 @@ function mergedModels(
   agentModels: AgentModelMap,
   harnessModels: Record<string, { id: string; label?: string }[]>,
   selected: string | null,
+  loggedIn: boolean | null,
 ) {
   const discovered = (harnessModels[harnessId] ?? agentModels[kind] ?? [])
     .filter((m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id));
@@ -5527,6 +5528,7 @@ function mergedModels(
     discovered,
     selected,
     scoped: CATALOG_SCOPED_KINDS.has(kind),
+    loggedIn,
   });
 }
 

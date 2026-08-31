@@ -43,6 +43,15 @@
  *    has no matching `<option>` renders blank, so the selected id must
  *    always be representable even when it fell out of both lists (a stale
  *    task.model no longer in this account's catalog, for instance).
+ * 7. `loggedIn === false` distrusts `discovered` entirely — it is treated as
+ *    empty (rule 2's fallback) regardless of how many ids it actually
+ *    carries. This exists because a harness's catalog discovery can be
+ *    *passive* (no fresh auth round-trip): an expired fx login's discovery
+ *    still reads back the last-known catalog, which for fx specifically is
+ *    the unauthenticated one (premium ids included, see `HarnessStatus`) —
+ *    a logged-out account has no business being offered rows it can't
+ *    actually run. Rule 6's selected-unlisted append still applies on top
+ *    of this fallback, same as any other discovery-empty case.
  *
  * Inputs are never mutated; a new array is always returned.
  */
@@ -86,6 +95,15 @@ export interface MergeModelOptionsInput {
    *  down to the discovered set (rule 3) instead of being shown wholesale
    *  (rule 4). */
   scoped: boolean;
+  /** Login state of the harness whose account produced `discovered`
+   *  (`HarnessStatus.loggedIn`). `false` ⇒ the discovered catalog is
+   *  untrustworthy — e.g. an expired fx login's passive discovery reads
+   *  back the UNAUTHENTICATED catalog (premium ids included) — so it is
+   *  treated exactly as discovery-empty: non-`catalogOnly` curated rows
+   *  only, discovered-only rows dropped, the selected-unlisted rule still
+   *  applies (rule 7). `true`/`null`/`undefined` ⇒ behavior unchanged
+   *  (`null` = no login probe for this kind — stubs, non-fx kinds). */
+  loggedIn?: boolean | null;
 }
 
 /** True when the harness's CLI surfaced a non-empty discovered catalog —
@@ -109,7 +127,11 @@ function toDiscoveredOnlyOption(m: DiscoveredModel): ModelOption {
  *  the rules documented above. See `docs/plans/fx-model-catalog-refresh.md`
  *  §3 D3 for the design rationale. */
 export function mergeModelOptions(input: MergeModelOptionsInput): ModelOption[] {
-  const { curated, discovered, selected, scoped } = input;
+  const { curated, selected, scoped } = input;
+  // Rule 7: a logged-out harness's discovered catalog is untrustworthy —
+  // distrust it wholesale by falling through to the discovery-empty path,
+  // same as if the CLI had surfaced nothing at all.
+  const discovered = input.loggedIn === false ? [] : input.discovered;
 
   const result: ModelOption[] = [];
   const seen = new Set<string>();

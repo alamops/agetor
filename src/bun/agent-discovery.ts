@@ -222,7 +222,11 @@ function parseFxModels(stdout: string): DiscoveredModel[] {
  * rather than erroring or blocking, so a discovered list can quietly
  * over-show premium `catalogOnly` ids for a user whose session lapsed, until
  * they re-run `fx login`. There is no probe-side way to distinguish that
- * from a genuinely unauthenticated account; both read identically.
+ * from a genuinely unauthenticated account; both read identically. The
+ * pickers compensate for this at the merge layer: `mergeModelOptions`
+ * (src/shared/model-options.ts) treats a harness whose `HarnessStatus.loggedIn
+ * === false` as having no trustworthy discovered catalog, so `catalogOnly`
+ * rows can't over-show from that degraded view.
  *
  * That account-scoping is exactly why `env` exists as a parameter here (and
  * threads through to `runProbe`): a harness with its own `HOME` override —
