@@ -77,7 +77,7 @@ Add Claude **Fable 5.1** and **Mythos 5.1** as selectable claude-code models, an
 
 - `task.model` is a free string column — no migration; existing tasks unaffected. PATCH validation reads the maps dynamically.
 - Demoting `fable-5` from the mirror family: a mid-session dropdown change to Fable 5 now posts a next-run breadcrumb instead of driving the picker — intended (Opus precedent), and the launch argv path is unchanged.
-- If claude 2.1.257's Fable picker row actually still resolves to Fable 5, a `fable-5.1` mid-session mirror lands on Fable 5 and the stdout sync drift-corrects the row + breadcrumbs — degraded UX, no corruption. Next `--model claude-fable-5-1` launch is always correct.
+- If claude 2.1.257's Fable picker row actually still resolves to Fable 5, a `fable-5.1` mid-session mirror lands on Fable 5 and the stdout sync drift-corrects the task row to `fable-5` with a breadcrumb (the `Set model to` sync is unconditional — not gated on `viaMirror` mismatch), so the next run launches `claude-fable-5` too until the user re-picks Fable 5.1. Degraded UX, no corruption; self-heals once the CLI's Fable row advances and the user re-selects.
 - Cursor: ids measured against the live catalog today; `(NO ZDR)` display suffix is stripped by the generic qualifier logic and irrelevant to id composition.
 - Rollback: single revert; no data shape changes.
 

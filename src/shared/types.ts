@@ -1292,7 +1292,7 @@ export interface CursorModelSpec {
  */
 export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // Default to Opus 5 — the most-capable Opus, priced identically to Opus 4.8
-  // ($5/$25 per MTok). Mythos 5 and Fable 5 sit above it in the picker but
+  // ($5/$25 per MTok). Mythos 5.1 / 5 and Fable 5.1 / 5 sit above it in the picker but
   // cost 2x the usage, so the default stays on the most-capable non-premium
   // tier.
   "claude-code": "opus-5",
