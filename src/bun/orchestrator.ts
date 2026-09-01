@@ -185,8 +185,10 @@ let reapInFlight = false;
 // Archive/delete teardown (tmux session kill, terminal teardown, worktree
 // detach/remove) is deferred onto a per-source-workdir FIFO queue so
 // `archiveTask` can flip the DB column and respond in milliseconds instead of
-// blocking on `spawnSync` tmux kills and `git worktree remove --force`/
-// `prune`. The serialization is deliberate, not incidental: concurrent `git
+// blocking on tmux kills (async `Bun.spawn` since the fix-task-details-load-
+// delay conversion, but still real wall-clock latency, not free) and `git
+// worktree remove --force`/`prune`. The serialization is deliberate, not
+// incidental: concurrent `git
 // worktree remove`/`prune` invocations against the SAME source repo contend
 // on git's internal locks (`.git/worktrees/.lock` etc.), so archiving several
 // tasks that share a workdir must still tear them down one at a time — just
@@ -586,7 +588,7 @@ setResolvedBroadcaster((res: InteractionResolved) => {
  *
  * Called once at boot from `src/bun/index.ts`.
  */
-export function reconcileOrphans(): number {
+export async function reconcileOrphans(): Promise<number> {
   // Sort newest-first so the at-most-one-reattach-per-task rule below keeps
   // the latest run row. If agetor crashed in the narrow window between
   // `sendTurnInExistingSession` inserting Run2 and `attachDoneHandler`
@@ -625,20 +627,31 @@ export function reconcileOrphans(): number {
       : null;
     // fx is driven over ACP/stdio, not tmux — nothing to reattach to, so a
     // `running` fx row at boot always takes the orphaned→ready path.
-    const canTryReattach =
+    // Split into a cheap sync pre-check and a separate async liveness probe
+    // (rather than one `&&` chain) — `sessionExistsByName` is genuinely async
+    // now (wave 1), and a boolean-context `&&` with an un-awaited Promise
+    // operand would evaluate to always-truthy (the Promise object itself),
+    // silently skipping the actual liveness check. The `if` guard preserves
+    // the original short-circuit (never probes tmux for a row that can't
+    // possibly reattach) and keeps TS's narrowing of `row.tmux_session` to
+    // `string` for everything below.
+    let canTryReattach = false;
+    if (
       (kind === "claude-code" || kind === "codex" || kind === "cursor" || kind === "gemini")
       && task !== null
       && row.tmux_session !== null
       && reattachKey !== null
       && !reattachedTaskIds.has(row.task_id)
-      && sessionExistsByName(row.tmux_session);
+    ) {
+      canTryReattach = await sessionExistsByName(row.tmux_session);
+    }
 
     if (canTryReattach && task) {
       const cwd = task.worktreePath ?? task.workdir;
       const harness = resolveHarness(task.agent);
       const onChunk = makeChunkHandler(row.id, row.task_id, kind as AgentKind, task.mode);
       const spawned = kind === "claude-code"
-        ? reattachSession({
+        ? await reattachSession({
             taskId: row.task_id,
             cwd,
             sessionId: row.claude_session_id as string,
@@ -648,7 +661,7 @@ export function reconcileOrphans(): number {
             mode: task.mode,
           })
         : kind === "codex"
-        ? reattachCodexSession({
+        ? await reattachCodexSession({
             taskId: row.task_id,
             runId: row.id,
             sessionName: row.tmux_session as string,
@@ -656,14 +669,14 @@ export function reconcileOrphans(): number {
             seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
           })
         : kind === "cursor"
-        ? reattachCursorSession({
+        ? await reattachCursorSession({
             taskId: row.task_id,
             runId: row.id,
             sessionName: row.tmux_session as string,
             onChunk,
             seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
           })
-        : reattachGeminiSession({
+        : await reattachGeminiSession({
             taskId: row.task_id,
             runId: row.id,
             sessionName: row.tmux_session as string,
@@ -702,7 +715,7 @@ export function reconcileOrphans(): number {
       }
       // JSONL missing despite live tmux — can't safely resume; kill the
       // session and fall through to orphan marking.
-      killSessionByName(row.tmux_session as string);
+      await killSessionByName(row.tmux_session as string);
     }
     orphaned.push({ id: row.id, task_id: row.task_id, prevColumn });
   }
@@ -782,7 +795,7 @@ export function reconcileOrphans(): number {
       // background agents" task, not an ordinary run still legitimately in
       // progress that just happens to also have live subagent rows).
       if (!isHeldByBackgroundAgents(heldId)) continue;
-      if (sessionExistsByName(sessionNameFor(heldId))) {
+      if (await sessionExistsByName(sessionNameFor(heldId))) {
         const run = task.runId ? runs.get(task.runId) : null;
         // No JSONL session id means no watch directory to derive, so nothing will
         // ever observe these agents finishing. Treat it exactly like a dead
@@ -818,7 +831,7 @@ export function reconcileOrphans(): number {
     // session-alive / session-id-recoverable branch structure as above.
     // HARD INVARIANT: never kill or create tmux sessions here — only re-arm
     // watchers and flip DB rows.
-    if (sessionExistsByName(sessionNameFor(heldId))) {
+    if (await sessionExistsByName(sessionNameFor(heldId))) {
       const run = task.runId ? runs.get(task.runId) : null;
       if (!run?.claudeSessionId) {
         orphanRunningSubagents(heldId);
@@ -866,11 +879,11 @@ export function reconcileOrphans(): number {
  * `onChunk` itself (see `SpawnAgentArgs`), so there's no separate parameter
  * for them.
  */
-function spawnAgentOrFail(
+async function spawnAgentOrFail(
   args: SpawnAgentArgs,
-): { agent: SpawnedAgent; message?: undefined } | { agent: null; message: string } {
+): Promise<{ agent: SpawnedAgent; message?: undefined } | { agent: null; message: string }> {
   try {
-    return { agent: spawnAgent(args) };
+    return { agent: await spawnAgent(args) };
   } catch (err) {
     const { runId, taskId, onChunk } = args;
     const message = err instanceof Error ? err.message : String(err);
@@ -881,11 +894,40 @@ function spawnAgentOrFail(
   }
 }
 
+/**
+ * Guards against two overlapping `startTask` calls for the SAME task both
+ * reaching `spawnAgentOrFail`. The `task.runId && active.has(task.runId)`
+ * check at the top only rules out a task that's ALREADY running — it does
+ * nothing about two concurrent calls that both read that check as false and
+ * then both walk the chain of awaits below (`pendingTeardown`, `checkHarness`,
+ * `prepareWorkdir`, `resolveRef`, and now the async `spawnAgentOrFail`
+ * itself) before either has registered an active run. This window predates
+ * wave 1 (the first three awaits already existed), but the async spawn adds
+ * one more await after the DB transaction has already stamped `task.runId` —
+ * so a second overlapping call could, in principle, race in behind the first
+ * and reach `spawnAgentOrFail` too, minting two run rows and two spawned
+ * agents for one task. `startingTaskIds` closes the window for real double
+ * clicks / rapid re-POSTs to `/tasks/:id/start`: whichever call claims the
+ * taskId first proceeds through the whole function; a second overlapping
+ * call is rejected immediately instead of racing through every await behind
+ * it.
+ */
+const startingTaskIds = new Set<string>();
+
 export async function startTask(taskId: string): Promise<{ runId: string } | { error: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
+  if (startingTaskIds.has(taskId)) return { error: "task is already starting" };
+  startingTaskIds.add(taskId);
+  try {
+    return await startTaskInner(taskId, task);
+  } finally {
+    startingTaskIds.delete(taskId);
+  }
+}
 
+async function startTaskInner(taskId: string, task: Task): Promise<{ runId: string } | { error: string }> {
   // startTask auto-unarchives and materializes the worktree below — it must
   // not race a teardown archiveTask (or deleteTask) deferred for this task,
   // or a `detachWorktree`/`removeWorktree` still in flight could yank the
@@ -1008,7 +1050,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   // up.
   onChunk("user", normalizeUserText(promptWithRefs));
 
-  const { agent, message } = spawnAgentOrFail({
+  const { agent, message } = await spawnAgentOrFail({
     taskId,
     runId,
     harness,
@@ -1329,7 +1371,15 @@ function registerActiveRun(
   runId: string,
   taskId: string,
   task: Task,
-  agent: ReturnType<typeof spawnAgent>,
+  // NOT `ReturnType<typeof spawnAgent>` — `spawnAgent` itself resolves to
+  // `Promise<SpawnedAgent>` (wave 1 async contract); every caller here
+  // already passes the awaited value. Using the raw ReturnType would
+  // silently retype this as `Promise<SpawnedAgent>` the moment agents.ts
+  // lands its own async conversion, breaking every call site with no
+  // typecheck signal in THIS file (the mismatch would only surface as a
+  // runtime `.kill is not a function` once a Promise is stored and later
+  // used as if it were the resolved agent).
+  agent: SpawnedAgent,
 ): void {
   active.set(runId, {
     taskId,
@@ -1412,10 +1462,22 @@ function detectCursorPlan(task: Task, runId: string): void {
 function attachDoneHandler(
   runId: string,
   taskId: string,
-  agent: ReturnType<typeof spawnAgent>,
+  // See `registerActiveRun`'s doc: `SpawnedAgent`, not
+  // `ReturnType<typeof spawnAgent>` — every caller passes the already-awaited
+  // agent handle, never the promise `spawnAgent` itself returns.
+  agent: SpawnedAgent,
 ): void {
   agent.done
-    .then((code) => {
+    // Async: `drainCodexQueue`/`drainCursorQueue`/`drainGeminiQueue`/
+    // `drainFxQueue` below now await their own spawn (wave 1's async
+    // `spawnAgentOrFail`). This callback is never itself awaited by anything
+    // (attachDoneHandler returns void; the `.then()`/`.catch()` chain is
+    // fire-and-forget from every caller's perspective, same as before), so
+    // making it `async` only changes how ITS OWN internal steps are
+    // sequenced — still strictly sequential, matching the pre-wave-1
+    // back-to-back synchronous calls exactly. A throw here still flows into
+    // the `.catch()` below exactly as a synchronous throw always did.
+    .then(async (code) => {
       const handle = active.get(runId);
       const wasCancelled = handle?.cancelled ?? false;
       const wasApiError = handle?.apiError ?? false;
@@ -1518,12 +1580,12 @@ function attachDoneHandler(
       }
       // Spawn the next queued codex/cursor/gemini/fx follow-up, if any (no-op
       // for a task of a different kind).
-      drainCodexQueue(taskId);
-      drainCursorQueue(taskId);
-      drainGeminiQueue(taskId);
-      drainFxQueue(taskId);
+      await drainCodexQueue(taskId);
+      await drainCursorQueue(taskId);
+      await drainGeminiQueue(taskId);
+      await drainFxQueue(taskId);
     })
-    .catch((err) => {
+    .catch(async (err) => {
       const handle = active.get(runId);
       const wasCancelled = handle?.cancelled ?? false;
       const wasSessionDied = handle?.sessionDied ?? false;
@@ -1552,10 +1614,10 @@ function attachDoneHandler(
       }
       // Spawn the next queued codex/cursor/gemini/fx follow-up, if any (no-op
       // for a task of a different kind).
-      drainCodexQueue(taskId);
-      drainCursorQueue(taskId);
-      drainGeminiQueue(taskId);
-      drainFxQueue(taskId);
+      await drainCodexQueue(taskId);
+      await drainCursorQueue(taskId);
+      await drainGeminiQueue(taskId);
+      await drainFxQueue(taskId);
     });
 }
 
@@ -1591,11 +1653,11 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
   // alias's HOME/env block changes, so the on-disk JSONL & login differ. Even
   // same-kind alias swaps (claude-work → claude-personal) need a fresh tmux.
   if (before.agent !== after.agent) {
-    if (beforeKind === "claude-code") dropSession(taskId);
-    else if (beforeKind === "codex") dropCodexSession(taskId);
-    else if (beforeKind === "cursor") dropCursorSession(taskId);
-    else if (beforeKind === "gemini") dropGeminiSession(taskId);
-    else if (beforeKind === "fx") dropFxSession(taskId);
+    if (beforeKind === "claude-code") await dropSession(taskId);
+    else if (beforeKind === "codex") await dropCodexSession(taskId);
+    else if (beforeKind === "cursor") await dropCursorSession(taskId);
+    else if (beforeKind === "gemini") await dropGeminiSession(taskId);
+    else if (beforeKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
     // Any queued codex/cursor/gemini/fx follow-ups belong to the old agent —
     // drop them so a later drain doesn't spawn them against the new harness.
     codexTurnQueue.delete(taskId);
@@ -1615,7 +1677,7 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     return;
   }
   if (afterKind !== "claude-code") return;
-  if (!sessionExists(taskId)) return;
+  if (!(await sessionExists(taskId))) return;
 
   // `after.mode` guard: a PATCH that clears the mode (mode → null) leaves
   // the live session alone — the UI doesn't expose a "clear mode" control
@@ -1635,7 +1697,7 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     // which is the right fallback for "we couldn't switch modes."
     if (result.ok) {
       const cwd = after.worktreePath ?? after.workdir;
-      const refreshed = ensureInstalledForCwd(cwd, after.mode);
+      const refreshed = await ensureInstalledForCwd(cwd, after.mode);
       if (!refreshed) emitMatcherRefreshFailure(taskId, cwd);
     }
   }
@@ -2086,13 +2148,17 @@ function stopActiveHandle(h: ActiveRun, reason: string): void {
  * no `active` handle to kill. Interrupt the live session and release the
  * hold. Shared by `cancelRun` (Stop button) and `archiveTask` (`stopRun`).
  */
-function stopHeldTask(taskId: string, reason: string): void {
+async function stopHeldTask(taskId: string, reason: string): Promise<void> {
   cancelPendingForTask(taskId, reason);
-  interruptTaskSession(taskId);
+  // Ordering rule (§7 of the async-warmup plan): the interrupt must complete
+  // — not fire-and-forget — before this returns, matching `deleteTask`'s and
+  // `enqueueArchiveTeardown`'s kill-before-teardown discipline. Awaited here
+  // rather than left as a bare call now that `interruptTaskSession` is async.
+  await interruptTaskSession(taskId);
   orphanRunningSubagents(taskId);
 }
 
-export function cancelRun(runId: string): boolean {
+export async function cancelRun(runId: string): Promise<boolean> {
   const h = active.get(runId);
   if (!h) {
     // A held task (turn succeeded, background agents still running) has no
@@ -2103,7 +2169,7 @@ export function cancelRun(runId: string): boolean {
     // already succeeded, so the card advances to `review`.
     const taskId = runs.get(runId)?.taskId;
     if (!taskId || !isHeldByBackgroundAgents(taskId)) return false;
-    stopHeldTask(taskId, "cancelled by user");
+    await stopHeldTask(taskId, "cancelled by user");
     return true;
   }
   // Stop targets the whole task, not just one run.
@@ -2226,25 +2292,25 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
     return { delivered: true, runId: result.runId };
   }
   if (kind === "codex") {
-    const result = sendCodexTurn(row.task_id, line);
+    const result = await sendCodexTurn(row.task_id, line);
     return result
       ? { delivered: true, runId: result }
       : { delivered: false, reason: "internal: task lookup failed" };
   }
   if (kind === "cursor") {
-    const result = sendCursorTurn(row.task_id, line);
+    const result = await sendCursorTurn(row.task_id, line);
     return result
       ? { delivered: true, runId: result }
       : { delivered: false, reason: "internal: task lookup failed" };
   }
   if (kind === "gemini") {
-    const result = sendGeminiTurn(row.task_id, line);
+    const result = await sendGeminiTurn(row.task_id, line);
     return result
       ? { delivered: true, runId: result }
       : { delivered: false, reason: "internal: task lookup failed" };
   }
   if (kind === "fx") {
-    const result = sendFxTurn(row.task_id, line);
+    const result = await sendFxTurn(row.task_id, line);
     return result
       ? { delivered: true, runId: result }
       : { delivered: false, reason: "internal: task lookup failed" };
@@ -2269,7 +2335,7 @@ const codexTurnQueue = new Map<string, string[]>();
  * already running, the message is queued; otherwise it spawns immediately.
  * Returns the run id the message was attached to, or null on lookup failure.
  */
-function sendCodexTurn(taskId: string, line: string): string | null {
+async function sendCodexTurn(taskId: string, line: string): Promise<string | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
   if (task.runId && active.has(task.runId)) {
@@ -2292,7 +2358,7 @@ function sendCodexTurn(taskId: string, line: string): string | null {
  * `codex exec resume <thread_id>`. New run row, new tmux session (the previous
  * turn's exited), same `thread_id` carried forward.
  */
-function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
+async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Promise<string> {
   const priorThreadId = findLastCodexSessionId(taskId);
   const cwd = task.worktreePath ?? task.workdir;
   const harness = resolveHarness(task.agent);
@@ -2340,7 +2406,7 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
     return newRunId;
   }
 
-  const { agent } = spawnAgentOrFail({
+  const { agent } = await spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -2380,7 +2446,7 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
  * fresh resume turn. No-op for claude tasks (their queue is always empty) and
  * while a run is still active for the task.
  */
-function drainCodexQueue(taskId: string): void {
+async function drainCodexQueue(taskId: string): Promise<void> {
   const q = codexTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
   const task = tasks.get(taskId);
@@ -2396,7 +2462,7 @@ function drainCodexQueue(taskId: string): void {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) codexTurnQueue.delete(taskId);
-  if (next !== undefined) spawnCodexTurnNow(task, taskId, next);
+  if (next !== undefined) await spawnCodexTurnNow(task, taskId, next);
 }
 
 /** Most-recent codex thread id across the task's runs (for `resume`). */
@@ -2427,7 +2493,7 @@ const cursorTurnQueue = new Map<string, string[]>();
  * immediately. Returns the run id the message was attached to, or null on
  * lookup failure.
  */
-function sendCursorTurn(taskId: string, line: string): string | null {
+async function sendCursorTurn(taskId: string, line: string): Promise<string | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
   if (task.runId && active.has(task.runId)) {
@@ -2450,7 +2516,7 @@ function sendCursorTurn(taskId: string, line: string): string | null {
  * `cursor-agent --resume <session_id>`. New run row, new tmux session (the
  * previous turn's exited), same `session_id` carried forward.
  */
-function spawnCursorTurnNow(task: Task, taskId: string, line: string): string {
+async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Promise<string> {
   const priorSessionId = findLastCursorSessionId(taskId);
   const cwd = task.worktreePath ?? task.workdir;
   const harness = resolveHarness(task.agent);
@@ -2498,7 +2564,7 @@ function spawnCursorTurnNow(task: Task, taskId: string, line: string): string {
     return newRunId;
   }
 
-  const { agent } = spawnAgentOrFail({
+  const { agent } = await spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -2540,7 +2606,7 @@ function spawnCursorTurnNow(task: Task, taskId: string, line: string): string {
  * fresh resume turn. No-op for claude/codex/gemini tasks (their queue is
  * always empty) and while a run is still active for the task.
  */
-function drainCursorQueue(taskId: string): void {
+async function drainCursorQueue(taskId: string): Promise<void> {
   const q = cursorTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
   const task = tasks.get(taskId);
@@ -2556,7 +2622,7 @@ function drainCursorQueue(taskId: string): void {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) cursorTurnQueue.delete(taskId);
-  if (next !== undefined) spawnCursorTurnNow(task, taskId, next);
+  if (next !== undefined) await spawnCursorTurnNow(task, taskId, next);
 }
 
 /** Most-recent cursor session id across the task's runs (for `--resume`). */
@@ -2586,7 +2652,7 @@ const geminiTurnQueue = new Map<string, string[]>();
  * immediately. Returns the run id the message was attached to, or null on
  * lookup failure.
  */
-function sendGeminiTurn(taskId: string, line: string): string | null {
+async function sendGeminiTurn(taskId: string, line: string): Promise<string | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
   if (task.runId && active.has(task.runId)) {
@@ -2612,7 +2678,7 @@ function sendGeminiTurn(taskId: string, line: string): string | null {
  * session id is already known synchronously, so it's stamped on the new run
  * row directly rather than via an `onSessionId` re-stamp.
  */
-function spawnGeminiTurnNow(task: Task, taskId: string, line: string): string {
+async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Promise<string> {
   const priorSessionId = findLastGeminiSessionId(taskId);
   const cwd = task.worktreePath ?? task.workdir;
   const harness = resolveHarness(task.agent);
@@ -2657,7 +2723,7 @@ function spawnGeminiTurnNow(task: Task, taskId: string, line: string): string {
     return newRunId;
   }
 
-  const { agent } = spawnAgentOrFail({
+  const { agent } = await spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -2700,7 +2766,7 @@ function spawnGeminiTurnNow(task: Task, taskId: string, line: string): string {
  * fresh resume turn. No-op while a run is still active for the task, or if
  * the task's agent was switched away from gemini mid-flight.
  */
-function drainGeminiQueue(taskId: string): void {
+async function drainGeminiQueue(taskId: string): Promise<void> {
   const q = geminiTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
   const task = tasks.get(taskId);
@@ -2715,7 +2781,7 @@ function drainGeminiQueue(taskId: string): void {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) geminiTurnQueue.delete(taskId);
-  if (next !== undefined) spawnGeminiTurnNow(task, taskId, next);
+  if (next !== undefined) await spawnGeminiTurnNow(task, taskId, next);
 }
 
 /** Most-recent gemini session id across the task's runs (for `--resume`). */
@@ -2744,7 +2810,7 @@ const fxTurnQueue = new Map<string, string[]>();
  * immediately. Returns the run id the message was attached to, or null on
  * lookup failure.
  */
-function sendFxTurn(taskId: string, line: string): string | null {
+async function sendFxTurn(taskId: string, line: string): Promise<string | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
   if (task.runId && active.has(task.runId)) {
@@ -2770,7 +2836,7 @@ function sendFxTurn(taskId: string, line: string): string | null {
  * response), so it's carried forward on the insert below and re-stamped
  * (idempotently) once `onSessionId` fires again for this turn.
  */
-function spawnFxTurnNow(task: Task, taskId: string, line: string): string {
+async function spawnFxTurnNow(task: Task, taskId: string, line: string): Promise<string> {
   const priorSessionId = findLastFxSessionId(taskId);
   const cwd = task.worktreePath ?? task.workdir;
   const harness = resolveHarness(task.agent);
@@ -2815,7 +2881,7 @@ function spawnFxTurnNow(task: Task, taskId: string, line: string): string {
     return newRunId;
   }
 
-  const { agent } = spawnAgentOrFail({
+  const { agent } = await spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -2852,7 +2918,7 @@ function spawnFxTurnNow(task: Task, taskId: string, line: string): string {
  * fresh resume turn. No-op while a run is still active for the task, or if
  * the task's agent was switched away from fx mid-flight.
  */
-function drainFxQueue(taskId: string): void {
+async function drainFxQueue(taskId: string): Promise<void> {
   const q = fxTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
   const task = tasks.get(taskId);
@@ -2867,7 +2933,7 @@ function drainFxQueue(taskId: string): void {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) fxTurnQueue.delete(taskId);
-  if (next !== undefined) spawnFxTurnNow(task, taskId, next);
+  if (next !== undefined) await spawnFxTurnNow(task, taskId, next);
 }
 
 /** Most-recent fx session id across the task's runs (for resume). */
@@ -2937,6 +3003,33 @@ type ClaudeTurnResult =
  * `{ ok: true }`.
  */
 const PASTE_OUTCOME_TIMEOUT_MS = 15_000;
+
+/**
+ * Guards the claude "this task is idle (or its session is dead) → mint a
+ * brand-new run" critical section, shared by `sendClaudeTurn`'s fresh-spawn
+ * branch (`spawnResumedSession`) and `sendTurnInExistingSession`'s idle
+ * branch. Before wave 1, `sendClaudeTurn` read `sessionLiveness` (and
+ * `sessionExists`) SYNCHRONOUSLY, so the whole stretch from that read through
+ * the new run row's `tasks.update` executed as one uninterrupted tick of JS —
+ * two overlapping `sendInput` calls for the same task could never both
+ * observe "idle": whichever one's continuation resumed first ran that entire
+ * stretch to completion (including stamping `task.runId`) before the other's
+ * continuation got a turn. `sessionLiveness` becoming genuinely async (a real
+ * tmux probe) opened a real event-loop gap between that read and everything
+ * after it. Two sends arriving close together can now both read "idle" (or
+ * "session dead") from their own independently-fetched `task` snapshot and
+ * both try to mint a run: the second `tasks.update` clobbers the first's
+ * `runId` stamp while BOTH runs still end up registered in `active`,
+ * violating the "at most one in-flight run per task" invariant the rest of
+ * this file depends on. This closes that window the same way `startingTaskIds`
+ * protects `startTask` below: whichever call claims the taskId first
+ * proceeds; a second overlapping call is told to retry rather than silently
+ * mint a sibling run. Scoped to ONLY the idle/dead-session paths — the
+ * fold-while-busy path (`pasteFollowUp`, above the idle branch in
+ * `sendTurnInExistingSession`) is unaffected and still allows any number of
+ * concurrent follow-ups to fold onto the one active run.
+ */
+const startingClaudeIdleTurns = new Set<string>();
 
 /**
  * Await a paste's `pasteOutcome` (from `sendTurn`/`pasteFollowUp`, §10
@@ -3012,12 +3105,28 @@ async function sendClaudeTurn(taskId: string, line: string): Promise<ClaudeTurnR
   // pre-kill (`spawnClaudeViaTmux`) tearing down a live, possibly mid-turn
   // session over a transient probe failure. Only an unambiguous `gone` (or no
   // in-memory state at all) reaches the destructive respawn path.
-  if (hasSessionState(taskId) && sessionLiveness(sessionNameFor(taskId)) !== "gone") {
+  if (hasSessionState(taskId) && (await sessionLiveness(sessionNameFor(taskId))) !== "gone") {
     return sendTurnInExistingSession(task, taskId, line);
   }
-  // A fresh spawn has no live modal to withhold a keystroke against, so
-  // there's no `pasteOutcome` to await here — always delivered.
-  return { runId: spawnResumedSession(task, taskId, line), delivered: true };
+  // Dead/no session: about to mint a brand-new run. Claim the per-task
+  // "starting" slot first — see `startingClaudeIdleTurns`'s doc for why this
+  // is needed now that `sessionLiveness` above is a genuine await.
+  if (startingClaudeIdleTurns.has(taskId)) {
+    return {
+      runId: task.runId ?? "",
+      delivered: false,
+      withheld: false,
+      reason: "another message is already starting a new turn for this task — try again in a moment",
+    };
+  }
+  startingClaudeIdleTurns.add(taskId);
+  try {
+    // A fresh spawn has no live modal to withhold a keystroke against, so
+    // there's no `pasteOutcome` to await here — always delivered.
+    return { runId: await spawnResumedSession(task, taskId, line), delivered: true };
+  } finally {
+    startingClaudeIdleTurns.delete(taskId);
+  }
 }
 
 async function sendTurnInExistingSession(task: Task, taskId: string, line: string): Promise<ClaudeTurnResult> {
@@ -3040,7 +3149,7 @@ async function sendTurnInExistingSession(task: Task, taskId: string, line: strin
     // the task's backlog tray (rather than lose it outright) and say so on
     // the run, since the "user" bubble below is appended optimistically
     // before the paste's real outcome is known.
-    const pasted = pasteFollowUp(taskId, line, {
+    const pasted = await pasteFollowUp(taskId, line, {
       onPasteFailure: (outcome) => handlePasteWithheld(taskId, activeRunId, line, outcome),
     });
     // `pasteFollowUp` returns `false` only when no live session exists (falls
@@ -3062,47 +3171,66 @@ async function sendTurnInExistingSession(task: Task, taskId: string, line: strin
     }
   }
 
-  // Idle (or the paste raced a vanishing session): one run row per user turn —
-  // the runs list mirrors the conversation history at turn granularity. The
-  // race that used to make a fast claude reply land the new row as "succeeded"
-  // before the UI ever observed the "running" transition no longer matters:
-  // the unified task-level event stream surfaces the new user/assistant
-  // messages live regardless of which run row they belong to.
-  const newRunId = randomUUID();
-  const now = Date.now();
-  const inheritedSessionId = findLastClaudeSessionId(taskId);
-  runs.insert({
-    id: newRunId,
-    taskId,
-    agent: task.agent,
-    status: "running",
-    startedAt: now,
-    endedAt: null,
-    exitCode: null,
-    tmuxSession: sessionNameFor(taskId),
-    claudeSessionId: inheritedSessionId,
-    codexSessionId: null,
-    cursorSessionId: null,
-    geminiSessionId: null,
-    fxSessionId: null,
-  });
-  const prevColumn: ColumnId = task.column;
-  tasks.update(taskId, { column: "running", runId: newRunId });
-  if (prevColumn !== "running") {
-    emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+  // Idle (or the paste raced a vanishing session): about to mint a brand-new
+  // run row. Claim the per-task "starting" slot first — see
+  // `startingClaudeIdleTurns`'s doc for why this is needed now that
+  // `sendClaudeTurn`'s `sessionLiveness` read is a genuine await: two
+  // overlapping sends can both arrive here having each independently
+  // observed "idle" from their own stale snapshot.
+  if (startingClaudeIdleTurns.has(taskId)) {
+    return {
+      runId: task.runId ?? "",
+      delivered: false,
+      withheld: false,
+      reason: "another message is already starting a new turn for this task — try again in a moment",
+    };
   }
+  startingClaudeIdleTurns.add(taskId);
+  try {
+    // One run row per user turn — the runs list mirrors the conversation
+    // history at turn granularity. The race that used to make a fast claude
+    // reply land the new row as "succeeded" before the UI ever observed the
+    // "running" transition no longer matters: the unified task-level event
+    // stream surfaces the new user/assistant messages live regardless of
+    // which run row they belong to.
+    const newRunId = randomUUID();
+    const now = Date.now();
+    const inheritedSessionId = findLastClaudeSessionId(taskId);
+    runs.insert({
+      id: newRunId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      tmuxSession: sessionNameFor(taskId),
+      claudeSessionId: inheritedSessionId,
+      codexSessionId: null,
+      cursorSessionId: null,
+      geminiSessionId: null,
+      fxSessionId: null,
+    });
+    const prevColumn: ColumnId = task.column;
+    tasks.update(taskId, { column: "running", runId: newRunId });
+    if (prevColumn !== "running") {
+      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    }
 
-  const harness = resolveHarness(task.agent);
-  const kind: AgentKind = harness?.kind ?? "claude-code";
-  const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
-  onChunk("user", normalizeUserText(line));
+    const harness = resolveHarness(task.agent);
+    const kind: AgentKind = harness?.kind ?? "claude-code";
+    const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+    onChunk("user", normalizeUserText(line));
 
-  const agent = sendTurn(taskId, line, onChunk, {
-    onPasteFailure: (outcome) => handlePasteWithheld(taskId, newRunId, line, outcome),
-  });
-  registerActiveRun(newRunId, taskId, task, agent);
-  attachDoneHandler(newRunId, taskId, agent);
-  return resolveClaudeTurnOutcome(newRunId, agent.pasteOutcome);
+    const agent = await sendTurn(taskId, line, onChunk, {
+      onPasteFailure: (outcome) => handlePasteWithheld(taskId, newRunId, line, outcome),
+    });
+    registerActiveRun(newRunId, taskId, task, agent);
+    attachDoneHandler(newRunId, taskId, agent);
+    return resolveClaudeTurnOutcome(newRunId, agent.pasteOutcome);
+  } finally {
+    startingClaudeIdleTurns.delete(taskId);
+  }
 }
 
 /**
@@ -3333,7 +3461,7 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
  * Reuses the existing worktree (`task.worktreePath`) so the agent operates
  * on the same checkout as before.
  */
-function spawnResumedSession(task: Task, taskId: string, line: string): string {
+async function spawnResumedSession(task: Task, taskId: string, line: string): Promise<string> {
   const priorSessionId = findLastClaudeSessionId(taskId);
   const cwd = task.worktreePath ?? task.workdir;
 
@@ -3377,7 +3505,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
     tasks.update(taskId, { column: "ready", runId: null });
     return newRunId;
   }
-  const { agent } = spawnAgentOrFail({
+  const { agent } = await spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -3757,12 +3885,17 @@ function enqueueArchiveTeardown(
     }
     // Same contract as deleteTask: dropSession is non-throwing (it
     // best-efforts tmux teardown internally). Don't wrap — a silent catch
-    // would hide a regression in claude-tmux from the next reviewer.
-    if (kind === "claude-code") dropSession(cur.id);
-    else if (kind === "codex") dropCodexSession(cur.id);
-    else if (kind === "cursor") dropCursorSession(cur.id);
-    else if (kind === "gemini") dropGeminiSession(cur.id);
-    else if (kind === "fx") dropFxSession(cur.id);
+    // would hide a regression in claude-tmux from the next reviewer. Awaited
+    // (wave 1 made every drop* async) so the session kill genuinely completes
+    // BEFORE killTerminalsForTask/detachWorktree below — ordering rule from
+    // docs/plans/fix-archive-teardown-queue.md, still load-bearing now that
+    // "complete" means "the awaited promise settled" rather than "the
+    // synchronous call returned".
+    if (kind === "claude-code") await dropSession(cur.id);
+    else if (kind === "codex") await dropCodexSession(cur.id);
+    else if (kind === "cursor") await dropCursorSession(cur.id);
+    else if (kind === "gemini") await dropGeminiSession(cur.id);
+    else if (kind === "fx") dropFxSession(cur.id); // fx has no tmux session — stays sync
     await killTerminalsForTask(cur.id);
     result = await detachWorktree(cur, { force: opts?.force });
   });
@@ -3828,7 +3961,7 @@ export async function archiveTask(
     }
     stopActiveHandle(active.get(task.runId)!, "task archived");
   } else if (opts?.stopRun && isHeldByBackgroundAgents(taskId)) {
-    stopHeldTask(taskId, "task archived");
+    await stopHeldTask(taskId, "task archived");
   }
   if (task.archivedAt != null) {
     // Already archived is normally a cheap no-op — repeat-archives (e.g. a
@@ -3880,8 +4013,9 @@ export async function archiveTask(
   // detach) is pushed onto this task's source-workdir teardown queue rather
   // than awaited here, so `archiveTask` can flip the DB column and return in
   // milliseconds. Archiving several tasks against the same workdir back-to-
-  // back no longer blocks each POST on `spawnSync` tmux kills or `git
-  // worktree remove --force`/`prune` — those still run (serialized per
+  // back no longer blocks each POST on tmux kills (async `Bun.spawn` now,
+  // but still real wall-clock latency) or `git worktree remove --force`/
+  // `prune` — those still run (serialized per
   // workdir, see `enqueueTeardown`), just off the request's critical path;
   // tasks in a different workdir proceed independently. Callers that must
   // not race a deferred teardown (unarchive, start, delete, the boot sweep)
@@ -3959,11 +4093,15 @@ export async function deleteTask(taskId: string): Promise<void> {
   // remove`/`prune` calls against the same repo never contend on git's locks
   // at the same time. A delete against an unrelated workdir is unaffected.
   await enqueueTeardown(taskId, task.workdir, async () => {
-    if (deleteKind === "claude-code") dropSession(taskId);
-    else if (deleteKind === "codex") dropCodexSession(taskId);
-    else if (deleteKind === "cursor") dropCursorSession(taskId);
-    else if (deleteKind === "gemini") dropGeminiSession(taskId);
-    else if (deleteKind === "fx") dropFxSession(taskId);
+    // Awaited (wave 1 made every drop* async) — the session kill must
+    // genuinely complete before killTerminalsForTask/removeWorktree below,
+    // not just be kicked off. Same ordering discipline as
+    // enqueueArchiveTeardown above.
+    if (deleteKind === "claude-code") await dropSession(taskId);
+    else if (deleteKind === "codex") await dropCodexSession(taskId);
+    else if (deleteKind === "cursor") await dropCursorSession(taskId);
+    else if (deleteKind === "gemini") await dropGeminiSession(taskId);
+    else if (deleteKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
     // Kill any open terminal tabs before removing the worktree — a live shell
     // sitting in the worktree dir would block `git worktree remove`. Awaited
     // so the shells are actually gone before we tear the directory down.
@@ -4141,7 +4279,7 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
         // called out in the review: a session could be driven by something
         // other than agetor (a human at the tmux client) bumping tmux's
         // activity clock without ever updating our DB row, or vice versa.
-        const activity = probeSessionActivity(taskId);
+        const activity = await probeSessionActivity(taskId);
         if (!activity) continue;
         if (activity.attached) continue;
         idleLongEnough =
@@ -4156,7 +4294,7 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
       const fresh = tasks.get(taskId);
       if (!fresh || !isReapable(fresh)) continue;
 
-      dropSession(taskId);
+      await dropSession(taskId);
       reaped.push(taskId);
 
       const recent = runs.listForTask(taskId)[0];
