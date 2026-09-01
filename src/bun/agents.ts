@@ -138,6 +138,8 @@ export interface AgentRunOptions {
 // curated list doesn't know about yet). Codex accepts the friendly ids as-is
 // so it doesn't need a translation table.
 const CLAUDE_MODEL_FLAG: Record<string, string> = {
+  "mythos-5.1": "claude-mythos-5-1",
+  "fable-5.1": "claude-fable-5-1",
   "mythos-5": "claude-mythos-5",
   "fable-5": "claude-fable-5",
   "opus-5": "claude-opus-5",
@@ -194,9 +196,14 @@ export function claudeModelIdFromArg(arg: string): string | null {
  * a newer pinned id) — is deliberately mapped to `null` rather than the
  * nearest family, so the live-session mirror is skipped instead of silently
  * switching the session to a different version than the task row now holds.
- * `mythos-5` has no picker row at all. An unknown/future raw id also returns
- * `null` rather than guess. Sole caller: `reconcileTaskSession`'s model
- * mirror (`orchestrator.ts`), which feeds the result to `mirrorModelViaPicker`
+ * Fable follows the same current-release convention as Opus: `fable-5.1`
+ * owns the "Fable" row since the installed claude CLI (2.1.257) ships the
+ * `claude-fable-5-1` model id, so the now-superseded `fable-5` maps to `null`
+ * (next-run-only, same as any other superseded pinned id). `mythos-5` and
+ * `mythos-5.1` both have no picker row at all — claude's picker has no
+ * Mythos row of any kind. An unknown/future raw id also returns `null`
+ * rather than guess. Sole caller: `reconcileTaskSession`'s model mirror
+ * (`orchestrator.ts`), which feeds the result to `mirrorModelViaPicker`
  * (`claude-tmux.ts`).
  */
 export function claudeModelPickerFamily(id: string): "Opus" | "Sonnet" | "Fable" | "Haiku" | null {
@@ -205,7 +212,7 @@ export function claudeModelPickerFamily(id: string): "Opus" | "Sonnet" | "Fable"
       return "Opus";
     case "sonnet-5":
       return "Sonnet";
-    case "fable-5":
+    case "fable-5.1":
       return "Fable";
     case "haiku-4.5":
       return "Haiku";

@@ -1456,6 +1456,21 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
     },
     fastEfforts: ["xhigh", "high", "medium", "low", "none"],
   },
+  // Ids verified against `cursor-agent models` (2026-09-01); the catalog
+  // exposes no -fast Fable variants (hence no fastEfforts), same shape as
+  // claude-fable-5 below.
+  "claude-fable-5-1": {
+    label: "Fable 5.1",
+    hint: "Anthropic Fable 5.1 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-fable-5-1-max",
+      xhigh: "claude-fable-5-1-xhigh",
+      high: "claude-fable-5-1-high",
+      medium: "claude-fable-5-1-medium",
+      low: "claude-fable-5-1-low",
+    },
+  },
   "claude-fable-5": {
     label: "Fable 5",
     hint: "Anthropic Fable 5 via Cursor.",
@@ -1726,7 +1741,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "max", label: "Max thinking", hint: "Absolute maximum reasoning effort. Separate from Cursor Max Mode context." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Mythos 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5.1 / 5 / Mythos 5.1 / 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
@@ -1752,15 +1767,21 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  */
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
-  // effort parameter is API-supported on Fable 5 / Mythos 5 / Opus 5 / 4.8 /
-  // 4.7 / 4.6 / Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is Fable-5-, Mythos-5-,
-  // Opus-, and Sonnet-5-only; Sonnet 4.6 has no xhigh; Haiku 4.5 doesn't
-  // support effort at all). The `/effort` CLI command accepts more
-  // levels but the underlying API request would fail for unsupported pairs,
-  // so we filter at the picker rather than letting the user fire bad runs.
+  // effort parameter is API-supported on Fable 5.1 / 5 / Mythos 5.1 / 5 /
+  // Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is
+  // Fable-, Mythos-, Opus-, and Sonnet-5-only; Sonnet 4.6 has no xhigh;
+  // Haiku 4.5 doesn't support effort at all). The `/effort` CLI command
+  // accepts more levels but the underlying API request would fail for
+  // unsupported pairs, so we filter at the picker rather than letting the
+  // user fire bad runs.
   "claude-code": {
+    // Mythos 5.1 shares Fable 5.1's request surface (same underlying model).
+    "mythos-5.1": ["max", "xhigh", "high", "medium", "low"],
     // Mythos 5 shares Fable 5's request surface (same underlying model).
     "mythos-5": ["max", "xhigh", "high", "medium", "low"],
+    // Fable 5.1 is the Fable 5 successor with the same effort ladder (per
+    // Anthropic's effort docs).
+    "fable-5.1": ["max", "xhigh", "high", "medium", "low"],
     // Fable 5 shares Opus 4.7/4.8's request surface (effort low→max, xhigh).
     "fable-5": ["max", "xhigh", "high", "medium", "low"],
     // Opus 5 supports the full effort ladder incl. xhigh (per claude-api skill).
@@ -1865,7 +1886,9 @@ export function supportedEfforts(agent: AgentKind, model: string | null): AgentO
  */
 const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   "claude-code": {
+    "mythos-5.1": [],
     "mythos-5": [],
+    "fable-5.1": [],
     "fable-5": [],
     "opus-5": [],
     "opus-4.8": [],
@@ -1896,8 +1919,10 @@ export function supportedModes(agent: AgentKind, model: string | null): AgentOpt
 export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   "claude-code": {
     models: [
-      { id: "mythos-5", label: "Mythos 5", hint: "Fable 5's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
-      { id: "fable-5", label: "Fable 5", hint: "Most powerful tier — above Opus. Uses 2x the usage of Opus." },
+      { id: "mythos-5.1", label: "Mythos 5.1", hint: "Fable 5.1's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
+      { id: "mythos-5", label: "Mythos 5", hint: "Prior Mythos release — Fable 5's twin; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
+      { id: "fable-5.1", label: "Fable 5.1", hint: "Most capable widely released model — above Opus. Uses 2x the usage of Opus." },
+      { id: "fable-5", label: "Fable 5", hint: "Prior Fable release — above Opus. Uses 2x the usage of Opus." },
       { id: "opus-5", label: "Opus 5", hint: "Most capable Opus; same usage cost as 4.8." },
       { id: "opus-4.8", label: "Opus 4.8", hint: "Prior Opus flagship." },
       { id: "opus-4.7", label: "Opus 4.7", hint: "Prior flagship; same effort range as 4.8." },
