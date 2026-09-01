@@ -122,7 +122,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         // deliberately unanimated (the amber awaiting-pulse ring is the only
         // animated attention state). Pinned to the corner so it coexists
         // with that ring (an outline) without visual conflict, and sits
-        // above the header badge stack in the DOM/paint order.
+        // above the header's row-1 harness badge in the DOM/paint order.
         <span
           // -1.5 offsets keep the dot's background halo clear of the
           // awaiting state's ring-offset outline instead of notching it.
@@ -134,7 +134,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
       )}
       <CardHeader className="pb-2 space-y-1">
         <div className="flex items-center justify-between gap-2">
-          <div className="flex min-w-0 items-center gap-1.5">
+          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
             <TypeIcon
               className={cn("size-3.5 shrink-0", type.iconClass)}
               aria-label={type.label}
@@ -142,7 +142,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
             {runningSubagents > 0 && (
               <Badge
                 variant="outline"
-                className="gap-1 text-[10px]"
+                className="gap-1 text-[10px] shrink-0"
                 title={`${runningSubagents} background task${runningSubagents > 1 ? "s" : ""} running`}
               >
                 <Bot className="size-3" />
@@ -152,7 +152,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
             {task.openTerminalCount > 0 && (
               <Badge
                 variant="outline"
-                className="gap-1 text-[10px]"
+                className="gap-1 text-[10px] shrink-0"
                 title={`${task.openTerminalCount} open terminal${task.openTerminalCount > 1 ? "s" : ""}`}
               >
                 <Terminal className="size-3" />
@@ -163,7 +163,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               <Badge
                 variant="outline"
                 className={cn(
-                  "gap-1 text-[10px]",
+                  "gap-1 text-[10px] shrink-0",
                   task.todoProgress.completed === task.todoProgress.total
                     ? "text-success"
                     : "text-muted-foreground",
@@ -181,11 +181,9 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
           </Badge>
         </div>
         {(task.model || task.mode) && (
-          <div className="flex justify-end">
-            <span className="text-[10px] font-mono text-muted-foreground">
-              {[task.model, task.mode].filter(Boolean).join(" · ")}
-            </span>
-          </div>
+          <span className="self-end text-[10px] font-mono text-muted-foreground">
+            {[task.model, task.mode].filter(Boolean).join(" · ")}
+          </span>
         )}
         <CardTitle className="text-sm break-words">{task.title}</CardTitle>
       </CardHeader>
