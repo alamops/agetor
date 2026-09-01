@@ -20,6 +20,7 @@ import { reconcileById } from "@/lib/reconcile";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Badge, badgeVariants } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -2559,18 +2560,8 @@ function RunPanelBody({
 
   return (
     <>
-      <header className="flex items-start justify-between gap-2 border-b border-border/60 p-3">
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-semibold">{task.title}</div>
-          <div className="truncate text-xs text-muted-foreground">
-            {task.agent} · {task.column}
-            {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
-            {task.baseRef && (
-              <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
-            )}
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
+      <header className="border-b border-border/60 p-3">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           {/* Lives in the header (not the composer chip row) so the link stays
               reachable on archived tasks and after orphan reconciliation
               clears the resumable run — pr_url is durable, the link must be
@@ -2578,133 +2569,165 @@ function RunPanelBody({
               subpage directly; otherwise (an unrecognized provider URL
               shape) fall back to the plain external link, as before. */}
           {prUrl && (
-            parsePullNumber(prUrl) != null ? (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => onViewPullRequest({ projectPath: task.workdir, prUrl })}
-                title="Open the pull request created for this task"
-              >
-                <GitPullRequest className="mr-1 size-3" /> View PR
-              </Button>
-            ) : (
-              <ExternalLink
-                href={prUrl}
-                className={cn(buttonVariants({ variant: "outline", size: "sm" }), "no-underline hover:no-underline")}
-                title="Open the pull request created for this task"
-              >
-                <GitPullRequest className="mr-1 size-3" /> View PR
-              </ExternalLink>
-            )
+            <Tooltip align="end" label="Open the pull request created for this task">
+              {parsePullNumber(prUrl) != null ? (
+                <Button
+                  size="icon"
+                  variant="outline"
+                  onClick={() => onViewPullRequest({ projectPath: task.workdir, prUrl })}
+                  aria-label="View PR"
+                >
+                  <GitPullRequest className="size-4" />
+                </Button>
+              ) : (
+                <ExternalLink
+                  href={prUrl}
+                  className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
+                  aria-label="View PR"
+                >
+                  <GitPullRequest className="size-4" />
+                </ExternalLink>
+              )}
+            </Tooltip>
           )}
           {/* Durable "View issue" sibling of "View PR" above — same
               rationale (header, not the composer chip row) and the same
               in-app-detail-vs-external-link branch, keyed on whether
               `issueUrl` parses to a recognized provider issue URL. */}
           {issueUrl && (
-            parseIssueUrl(issueUrl) != null ? (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => onViewIssue({ projectPath: task.workdir, issueUrl })}
-                title="Open the issue this task was created from"
-                data-testid="view-issue"
-              >
-                <CircleDot className="mr-1 size-3" /> View issue
-              </Button>
-            ) : (
-              <ExternalLink
-                href={issueUrl}
-                className={cn(buttonVariants({ variant: "outline", size: "sm" }), "no-underline hover:no-underline")}
-                title="Open the issue this task was created from"
-                data-testid="view-issue"
-              >
-                <CircleDot className="mr-1 size-3" /> View issue
-              </ExternalLink>
-            )
+            <Tooltip align="end" label="Open the issue this task was created from">
+              {parseIssueUrl(issueUrl) != null ? (
+                <Button
+                  size="icon"
+                  variant="outline"
+                  onClick={() => onViewIssue({ projectPath: task.workdir, issueUrl })}
+                  aria-label="View issue"
+                  data-testid="view-issue"
+                >
+                  <CircleDot className="size-4" />
+                </Button>
+              ) : (
+                <ExternalLink
+                  href={issueUrl}
+                  className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
+                  aria-label="View issue"
+                  data-testid="view-issue"
+                >
+                  <CircleDot className="size-4" />
+                </ExternalLink>
+              )}
+            </Tooltip>
           )}
           {/* Manual re-check — only once a first fetch has settled, so it
               doesn't appear (and immediately duplicate) the initial load. */}
           {parsedPrUrl && (prStatus != null || prStatusError != null) && (
+            <Tooltip align="end" label={prStatusError ?? "Re-check PR mergeability"}>
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={refreshPrStatus}
+                disabled={prStatusLoading}
+                aria-label={prStatusError ? `Re-check PR status — ${prStatusError}` : "Re-check PR status"}
+              >
+                <RefreshCw className="size-4" />
+              </Button>
+            </Tooltip>
+          )}
+          <Tooltip align="end" label="View this task's changes (git diff)">
             <Button
               size="icon"
-              variant="ghost"
-              onClick={refreshPrStatus}
-              disabled={prStatusLoading}
-              title={prStatusError ?? "Re-check PR mergeability"}
+              variant="outline"
+              onClick={() => onShowDiff(task)}
+              aria-label="View diff"
             >
-              <RefreshCw className="size-3.5" />
+              <GitCompare className="size-4" />
             </Button>
-          )}
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => onShowDiff(task)}
-            title="View this task's changes (git diff)"
-          >
-            <GitCompare className="mr-1 size-3" /> Diff
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() =>
-              void api.openPath({
-                path: task.worktreePath ?? task.workdir,
-                taskId: task.id,
-              }).catch(() => { /* swallowed — openPath failures are best-effort */ })
-            }
-            title={
+          </Tooltip>
+          <Tooltip
+            align="end"
+            label={
               task.worktreePath
                 ? `Open the worktree in your file manager: ${task.worktreePath}`
                 : `Open the project workdir in your file manager: ${task.workdir}`
             }
           >
-            <FolderOpen className="mr-1 size-3" /> Open
-          </Button>
+            <Button
+              size="icon"
+              variant="outline"
+              onClick={() =>
+                void api.openPath({
+                  path: task.worktreePath ?? task.workdir,
+                  taskId: task.id,
+                }).catch(() => { /* swallowed — openPath failures are best-effort */ })
+              }
+              aria-label="Open working folder"
+            >
+              <FolderOpen className="size-4" />
+            </Button>
+          </Tooltip>
           {/* Stop targets the main run. Hide it while viewing a read-only
               background-agent tab so the control doesn't read as "stop this
               agent" — switch back to Main to stop the task. */}
           {!archived && canControl && activeStream === "main" && (
-            <Button size="sm" variant="destructive" onClick={stop}>
-              <Square className="mr-1 size-3" /> Stop
-            </Button>
+            <Tooltip align="end" label="Stop">
+              <Button size="icon" variant="destructive" onClick={stop} aria-label="Stop">
+                <Square className="size-4" />
+              </Button>
+            </Tooltip>
           )}
           {!archived && (task.column === "done" || active) && (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => onArchive(task)}
-              title={active ? "Stop the running agent and archive task" : "Archive task"}
-            >
-              <Archive className="mr-1 size-3" /> Archive
-            </Button>
+            <Tooltip align="end" label={active ? "Stop the running agent and archive task" : "Archive task"}>
+              <Button
+                size="icon"
+                variant="outline"
+                onClick={() => onArchive(task)}
+                aria-label={active ? "Stop the running agent and archive task" : "Archive task"}
+              >
+                <Archive className="size-4" />
+              </Button>
+            </Tooltip>
           )}
           {archived && (
-            <Button size="sm" variant="outline" onClick={() => onUnarchive(task)} title="Unarchive task">
-              <ArchiveRestore className="mr-1 size-3" /> Unarchive
-            </Button>
+            <Tooltip align="end" label="Unarchive task">
+              <Button size="icon" variant="outline" onClick={() => onUnarchive(task)} aria-label="Unarchive">
+                <ArchiveRestore className="size-4" />
+              </Button>
+            </Tooltip>
           )}
-          <Button
-            size="icon"
-            variant="ghost"
-            title="Search messages"
-            onClick={() => {
-              if (searchOpen) {
-                closeSearch();
-                return;
-              }
-              setSearchOpen(true);
-              // The input isn't mounted yet on the render this triggers (the
-              // bar renders conditionally on `searchOpen`) — focus after the
-              // next paint.
-              requestAnimationFrame(() => searchInputRef.current?.focus());
-            }}
-          >
-            <Search className="size-4" />
-          </Button>
-          <Button size="icon" variant="ghost" onClick={onClose}>
-            <X className="size-4" />
-          </Button>
+          <Tooltip align="end" label="Search messages">
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="Search messages"
+              aria-expanded={searchOpen}
+              onClick={() => {
+                if (searchOpen) {
+                  closeSearch();
+                  return;
+                }
+                setSearchOpen(true);
+                // The input isn't mounted yet on the render this triggers (the
+                // bar renders conditionally on `searchOpen`) — focus after the
+                // next paint.
+                requestAnimationFrame(() => searchInputRef.current?.focus());
+              }}
+            >
+              <Search className="size-4" />
+            </Button>
+          </Tooltip>
+          <Tooltip align="end" label="Close task details">
+            <Button size="icon" variant="ghost" onClick={onClose} aria-label="Close task details">
+              <X className="size-4" />
+            </Button>
+          </Tooltip>
+        </div>
+        <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
+        <div className="mt-0.5 truncate text-xs text-muted-foreground">
+          {task.agent} · {task.column}
+          {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
+          {task.baseRef && (
+            <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
+          )}
         </div>
       </header>
 
@@ -2734,29 +2757,35 @@ function RunPanelBody({
           <span aria-live="polite" className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
             {matches.length === 0 ? "0/0" : `${activeMatchPosition + 1}/${matches.length}`}
           </span>
-          <Button
-            size="icon"
-            variant="ghost"
-            className="size-7"
-            disabled={matches.length === 0}
-            title="Previous match"
-            onClick={() => stepSearch(-1)}
-          >
-            <ChevronUp className="size-3.5" />
-          </Button>
-          <Button
-            size="icon"
-            variant="ghost"
-            className="size-7"
-            disabled={matches.length === 0}
-            title="Next match"
-            onClick={() => stepSearch(1)}
-          >
-            <ChevronDown className="size-3.5" />
-          </Button>
-          <Button size="icon" variant="ghost" className="size-7" title="Close search" onClick={closeSearch}>
-            <X className="size-3.5" />
-          </Button>
+          <Tooltip align="end" label="Previous match">
+            <Button
+              size="icon"
+              variant="ghost"
+              className="size-7"
+              disabled={matches.length === 0}
+              onClick={() => stepSearch(-1)}
+              aria-label="Previous match"
+            >
+              <ChevronUp className="size-3.5" />
+            </Button>
+          </Tooltip>
+          <Tooltip align="end" label="Next match">
+            <Button
+              size="icon"
+              variant="ghost"
+              className="size-7"
+              disabled={matches.length === 0}
+              onClick={() => stepSearch(1)}
+              aria-label="Next match"
+            >
+              <ChevronDown className="size-3.5" />
+            </Button>
+          </Tooltip>
+          <Tooltip align="end" label="Close search">
+            <Button size="icon" variant="ghost" className="size-7" onClick={closeSearch} aria-label="Close search">
+              <X className="size-3.5" />
+            </Button>
+          </Tooltip>
         </div>
       )}
 
@@ -3144,25 +3173,28 @@ function RunPanelBody({
               />
             }
             trailing={
-              <Button
-                size="icon"
-                onClick={() => void send()}
-                disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
-                title={
-                  // Distinguish "live session exists" from "needs resume" — not
-                  // "turn in flight". `liveRunId` (task.runId) stays set while the
-                  // tmux session is alive (including between turns) and is only
-                  // null once the session is gone (orphan-reconciled), which is the
-                  // resume path. Keying off `canControl` here would mislabel the
-                  // common "session alive, no turn in flight" state as a resume.
-                  liveRunId
-                    ? "Send to the live agent"
-                    : "Resume the conversation with this message"
-                }
-                className="h-16 w-12 shrink-0"
+              // Distinguish "live session exists" from "needs resume" — not
+              // "turn in flight". `liveRunId` (task.runId) stays set while the
+              // tmux session is alive (including between turns) and is only
+              // null once the session is gone (orphan-reconciled), which is the
+              // resume path. Keying off `canControl` here would mislabel the
+              // common "session alive, no turn in flight" state as a resume.
+              <Tooltip
+                align="end"
+                side="top"
+                className="shrink-0"
+                label={liveRunId ? "Send to the live agent" : "Resume the conversation with this message"}
               >
-                <Send className="size-4" />
-              </Button>
+                <Button
+                  size="icon"
+                  onClick={() => void send()}
+                  disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
+                  aria-label="Send"
+                  className="h-16 w-12 shrink-0"
+                >
+                  <Send className="size-4" />
+                </Button>
+              </Tooltip>
             }
             rows={2}
             textareaClassName="h-16 min-h-0 w-full resize-none text-xs pr-8"
@@ -3467,57 +3499,71 @@ function BacklogItemRow({
       </div>
       {!readOnly && (
         <div className="flex shrink-0 items-center gap-0.5 opacity-60 transition-opacity group-hover:opacity-100">
-          <button
-            type="button"
-            className={BACKLOG_ICON_BTN}
-            disabled={index === 0 || busy}
-            onClick={() => onMove(-1)}
-            title="Move up"
-          >
-            <ArrowUp className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={BACKLOG_ICON_BTN}
-            disabled={index === total - 1 || busy}
-            onClick={() => onMove(1)}
-            title="Move down"
-          >
-            <ArrowDown className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={BACKLOG_ICON_BTN}
-            onClick={onStartEdit}
-            title="Edit"
-          >
-            <FilePenLine className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={BACKLOG_ICON_BTN}
-            disabled={!canSend || busy}
-            onClick={onSend}
-            // `canSend` here is the parent's `canSend && !modalPending`, so it
-            // goes false for two different reasons — no live/resumable session,
-            // or a prompt is waiting. Keep the copy true for both.
-            title={
+          <Tooltip align="end" side="top" label="Move up">
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              disabled={index === 0 || busy}
+              onClick={() => onMove(-1)}
+              aria-label="Move up"
+            >
+              <ArrowUp className="size-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip align="end" side="top" label="Move down">
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              disabled={index === total - 1 || busy}
+              onClick={() => onMove(1)}
+              aria-label="Move down"
+            >
+              <ArrowDown className="size-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip align="end" side="top" label="Edit">
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              onClick={onStartEdit}
+              aria-label="Edit"
+            >
+              <FilePenLine className="size-3.5" />
+            </button>
+          </Tooltip>
+          {/* `canSend` here is the parent's `canSend && !modalPending`, so it
+              goes false for two different reasons — no live/resumable session,
+              or a prompt is waiting. Keep the copy true for both. */}
+          <Tooltip
+            align="end"
+            side="top"
+            label={
               canSend
                 ? "Send now"
                 : "Can't send right now — run the task, or answer the pending prompt first"
             }
           >
-            <Send className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={cn(BACKLOG_ICON_BTN, "hover:bg-destructive/10 hover:text-destructive")}
-            disabled={busy}
-            onClick={onDelete}
-            title="Delete"
-          >
-            <Trash2 className="size-3.5" />
-          </button>
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              disabled={!canSend || busy}
+              onClick={onSend}
+              aria-label="Send now"
+            >
+              <Send className="size-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip align="end" side="top" label="Delete">
+            <button
+              type="button"
+              className={cn(BACKLOG_ICON_BTN, "hover:bg-destructive/10 hover:text-destructive")}
+              disabled={busy}
+              onClick={onDelete}
+              aria-label="Delete"
+            >
+              <Trash2 className="size-3.5" />
+            </button>
+          </Tooltip>
         </div>
       )}
     </div>
@@ -5330,29 +5376,30 @@ function TaskDetails({
           <dt className="flex items-center gap-1 text-muted-foreground">
             Model
             {editable && (
-              <button
-                type="button"
-                title="Refresh model list"
-                aria-label="Refresh model list"
-                data-testid="refresh-models-details"
-                disabled={refreshingModels}
-                className={cn(
-                  "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
-                  refreshingModels && "animate-spin",
-                )}
-                onClick={async () => {
-                  setRefreshingModels(true);
-                  try {
-                    await onRefreshModels(task.agent);
-                  } catch {
-                    // The SSE / ready-retry paths also refetch.
-                  } finally {
-                    setRefreshingModels(false);
-                  }
-                }}
-              >
-                <RefreshCw className="size-3" />
-              </button>
+              <Tooltip label="Refresh model list">
+                <button
+                  type="button"
+                  aria-label="Refresh model list"
+                  data-testid="refresh-models-details"
+                  disabled={refreshingModels}
+                  className={cn(
+                    "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
+                    refreshingModels && "animate-spin",
+                  )}
+                  onClick={async () => {
+                    setRefreshingModels(true);
+                    try {
+                      await onRefreshModels(task.agent);
+                    } catch {
+                      // The SSE / ready-retry paths also refetch.
+                    } finally {
+                      setRefreshingModels(false);
+                    }
+                  }}
+                >
+                  <RefreshCw className="size-3" />
+                </button>
+              </Tooltip>
             )}
           </dt>
           <dd className="min-w-0">
