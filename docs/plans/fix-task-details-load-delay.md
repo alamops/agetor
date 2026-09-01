@@ -8,7 +8,7 @@
 | Flags | none |
 | Gates | grilled + scope confirmed by owner (4-question pass); plan approval pending |
 | Branch | fix/fix-task-details-load-delay |
-| Base SHA | TBD — set in Phase 4 |
+| Base SHA | bceeb1880abd8ef946364137e84f763a9ad5415a |
 
 ## 1. Objective & success criteria
 

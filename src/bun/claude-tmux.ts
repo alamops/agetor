@@ -1416,20 +1416,32 @@ interface RunResult {
 /** Run a one-shot tmux command. Never throws — callers check `ok`. Always
  *  threads `tmuxSocketArgs()` in right after the binary — see
  *  `tmuxSocketName()` in tmux-resolution.ts for why every invocation (this is
- *  the single choke point all of them share) must carry the socket args. */
-function tmux(args: string[], opts: { stdinText?: string } = {}): RunResult {
+ *  the single choke point all of them share) must carry the socket args.
+ *
+ *  Async (`Bun.spawn` + `await proc.exited`) so a tmux round-trip never
+ *  blocks the event loop that also serves the HTTP API — this used to be
+ *  `Bun.spawnSync`, which stalled every concurrent request for the duration
+ *  of the fork+exec (see docs/plans/fix-task-details-load-delay.md). No
+ *  timeout: a wedged tmux client now hangs only the awaiting op, not the
+ *  whole process, and adding one was explicitly declined for this change. */
+async function tmux(args: string[], opts: { stdinText?: string } = {}): Promise<RunResult> {
   try {
-    const proc = Bun.spawnSync([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
+    const proc = Bun.spawn([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
       stdin: opts.stdinText !== undefined
         ? new TextEncoder().encode(opts.stdinText)
         : "ignore",
       stdout: "pipe",
       stderr: "pipe",
     });
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const exitCode = await proc.exited;
     return {
-      ok: proc.exitCode === 0,
-      stdout: new TextDecoder().decode(proc.stdout).trim(),
-      stderr: new TextDecoder().decode(proc.stderr).trim(),
+      ok: exitCode === 0,
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
     };
   } catch (e) {
     return { ok: false, stdout: "", stderr: (e as Error).message };
@@ -1440,8 +1452,8 @@ function tmux(args: string[], opts: { stdinText?: string } = {}): RunResult {
  *  an exact match — without it, a probe for an absent name PREFIX-MATCHES
  *  and can report a live, unrelated session as "exists" (empirically proven
  *  on this task's sibling `agetor-<id>` names). */
-export function sessionExists(taskId: string): boolean {
-  return tmux(["has-session", "-t", "=" + sessionNameFor(taskId)]).ok;
+export async function sessionExists(taskId: string): Promise<boolean> {
+  return (await tmux(["has-session", "-t", "=" + sessionNameFor(taskId)])).ok;
 }
 
 /**
@@ -1495,8 +1507,8 @@ export function getSessionLaunchEffort(taskId: string): string | null {
 /** Name-keyed variant for callers that hold a persisted session name (e.g.
  *  `runs.tmux_session`) and don't want to recompute it from a task id.
  *  Exact-match `=` prefix — see `sessionExists`. */
-export function sessionExistsByName(name: string): boolean {
-  return tmux(["has-session", "-t", "=" + name]).ok;
+export async function sessionExistsByName(name: string): Promise<boolean> {
+  return (await tmux(["has-session", "-t", "=" + name])).ok;
 }
 
 /**
@@ -1568,8 +1580,8 @@ export function parseSessionActivityLine(line: string): { attached: boolean; act
  * the caller treats that as "can't tell," not "definitely dead."
  */
 let probeFailureWarned = false;
-export function probeSessionActivity(taskId: string): { attached: boolean; activityAt: number } | null {
-  const r = tmux([
+export async function probeSessionActivity(taskId: string): Promise<{ attached: boolean; activityAt: number } | null> {
+  const r = await tmux([
     "list-sessions", "-F", "#{session_attached}:#{session_activity}",
     "-f", "#{==:#{session_name}," + sessionNameFor(taskId) + "}",
   ]);
@@ -1624,11 +1636,11 @@ export type SessionLiveness = "alive" | "gone" | "unreachable";
  * detecting a genuinely-dead session or server the moment tmux says so (instead
  * of waiting for boot `reconcileOrphans`).
  */
-export function sessionLiveness(name: string): SessionLiveness {
+export async function sessionLiveness(name: string): Promise<SessionLiveness> {
   // Exact-match `=` prefix — see `sessionExists`. tmux's error string becomes
   // e.g. "can't find session: =x", which still contains "find session" below,
   // so the classification is unaffected by the prefix.
-  const r = tmux(["has-session", "-t", "=" + name]);
+  const r = await tmux(["has-session", "-t", "=" + name]);
   if (r.ok) return "alive";
   const err = `${r.stderr} ${r.stdout}`.toLowerCase();
   // Only UNAMBIGUOUS death strings count as `gone`:
@@ -1679,8 +1691,8 @@ export function sessionLiveness(name: string): SessionLiveness {
  * `kill(pid, 0)` syscall per tick instead of forking a tmux client — see
  * `createDeathProbe` in session-liveness.ts.
  */
-export function panePidFor(name: string): number | null {
-  const r = tmux(["list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}"]);
+export async function panePidFor(name: string): Promise<number | null> {
+  const r = await tmux(["list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}"]);
   if (!r.ok) return null;
   for (const line of r.stdout.split("\n")) {
     const tab = line.indexOf("\t");
@@ -1735,14 +1747,14 @@ export function deathTickOutcome(
 /** Kill any tmux session for the given task. Idempotent / silent on miss.
  *  Exact-match `=` prefix — see `sessionExists`; without it a kill for an
  *  absent exact name can prefix-match and kill an unrelated live session. */
-export function killTaskSession(taskId: string): void {
-  tmux(["kill-session", "-t", "=" + sessionNameFor(taskId)]);
+export async function killTaskSession(taskId: string): Promise<void> {
+  await tmux(["kill-session", "-t", "=" + sessionNameFor(taskId)]);
 }
 
 /** Kill an arbitrary session name. Used by reconcileOrphans. Exact-match `=`
  *  prefix — see `sessionExists`. */
-export function killSessionByName(name: string): void {
-  tmux(["kill-session", "-t", "=" + name]);
+export async function killSessionByName(name: string): Promise<void> {
+  await tmux(["kill-session", "-t", "=" + name]);
 }
 
 /**
@@ -1876,7 +1888,7 @@ export async function dismissTmuxPrompt(
     } else {
       // y/n style: send the literal keystroke.
       bumpKeystroke(state);
-      if (!tmux(["send-keys", "-t", state.sessionName, key]).ok) return;
+      if (!(await tmux(["send-keys", "-t", state.sessionName, key])).ok) return;
       await Bun.sleep(50);
       if (!stillCurrent()) return;
     }
@@ -1892,7 +1904,7 @@ export async function dismissTmuxPrompt(
     // keystroke and always confirms with a plain Enter here.
     const finalKey = useArrowNav ? (ctx.confirmKey ?? "Enter") : "Enter";
     bumpKeystroke(state);
-    ok = tmux(["send-keys", "-t", state.sessionName, finalKey]).ok;
+    ok = (await tmux(["send-keys", "-t", state.sessionName, finalKey])).ok;
   }, state);
   return ok;
 }
@@ -1927,7 +1939,7 @@ async function walkCursor(
 ): Promise<boolean> {
   for (let i = 0; i < steps; i++) {
     bumpKeystroke(state);
-    if (!tmux(["send-keys", "-t", state.sessionName, arrow]).ok) return false;
+    if (!(await tmux(["send-keys", "-t", state.sessionName, arrow])).ok) return false;
     await Bun.sleep(30);
     if (!stillCurrent()) return false;
   }
@@ -1961,7 +1973,7 @@ export async function sendModalKeys(taskId: string, keys: NavKey[]): Promise<boo
   await queueTmuxOp(taskId, async (stillCurrent) => {
     for (const key of keys) {
       bumpKeystroke(state);
-      if (!tmux(["send-keys", "-t", state.sessionName, key]).ok) return;
+      if (!(await tmux(["send-keys", "-t", state.sessionName, key])).ok) return;
       // Inter-key gap mirrors dismissTmuxPrompt: a bursted pair can read as a
       // single Ink event, and the gap lets the dispose re-gate fire.
       await Bun.sleep(35);
@@ -2103,7 +2115,7 @@ export async function driveAskAnswers(
   await queueTmuxOp(taskId, async (stillCurrent) => {
     for (const key of body) {
       bumpKeystroke(state);
-      if (!tmux(["send-keys", "-t", state.sessionName, key]).ok) return;
+      if (!(await tmux(["send-keys", "-t", state.sessionName, key])).ok) return;
       // Inter-key gap mirrors sendModalKeys: a bursted pair can read as a
       // single Ink event, and the gap lets the dispose re-gate fire.
       await Bun.sleep(35);
@@ -2115,11 +2127,11 @@ export async function driveAskAnswers(
       for (let attempt = 0; attempt < ASK_REVIEW_POLL_ATTEMPTS && !confirmSent; attempt++) {
         await Bun.sleep(ASK_REVIEW_POLL_MS);
         if (!stillCurrent()) return;
-        const step = decideAskDriveStep(detectAskModal(captureTail(state)), confirmSent, 0);
+        const step = decideAskDriveStep(detectAskModal(await captureTail(state)), confirmSent, 0);
         if (step === "done") { ok = true; return; }
         if (step === "send-enter") {
           bumpKeystroke(state);
-          if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return;
+          if (!(await tmux(["send-keys", "-t", state.sessionName, "Enter"])).ok) return;
           confirmSent = true;
         }
         // "wait" — review screen not up yet; keep polling. ("fail" cannot
@@ -2134,12 +2146,12 @@ export async function driveAskAnswers(
     for (let attempt = 0; attempt < ASK_VERIFY_POLL_ATTEMPTS; attempt++) {
       await Bun.sleep(ASK_VERIFY_POLL_MS);
       if (!stillCurrent()) return;
-      const step = decideAskDriveStep(detectAskModal(captureTail(state)), confirmSent, resends);
+      const step = decideAskDriveStep(detectAskModal(await captureTail(state)), confirmSent, resends);
       if (step === "done") { ok = true; return; }
       if (step === "fail") return;
       if (step === "send-enter") {
         bumpKeystroke(state);
-        if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return;
+        if (!(await tmux(["send-keys", "-t", state.sessionName, "Enter"])).ok) return;
         confirmSent = true;
         resends++;
       }
@@ -2628,9 +2640,10 @@ const sessions = new Map<string, SessionState>(); // taskId → state
  * choice can't interleave its `"1"` + Enter keystrokes with an in-flight
  * paste from `queuePaste`. (The exact tmux payload is mode-dependent —
  * non-bracketed slash commands send `load-buffer + paste-buffer +
- * delete-buffer + send-keys Enter` synchronously, while bracketed user
- * pastes split the trailing Enter out with a small `bracketedEnterGapMs`
- * sleep in between. See `queuePaste`.)
+ * delete-buffer + send-keys Enter` back-to-back with no deliberate gap
+ * (each still its own awaited `tmux()` round-trip — see `pastePrompt`),
+ * while bracketed user pastes split the trailing Enter out with a small
+ * `bracketedEnterGapMs` sleep in between. See `queuePaste`.)
  *
  * The map's value is the tail promise of the in-flight chain; new ops
  * append via `queueTmuxOp`. Entries self-evict on completion when no
@@ -2754,7 +2767,7 @@ function bumpActivity(state: SessionState): void {
  *     calls `queueTmuxOp`, since queuing a paste on a long-idle session is
  *     already the intent to type, and the queued op can sit behind other work
  *     on the per-task chain for multiple scrape ticks before it actually
- *     runs), and again right before each `pastePromptSync` dispatch, before
+ *     runs), and again right before each `pastePrompt` dispatch, before
  *     the deferred bracketed Enter, and before the composer-clear keystrokes;
  *   - `walkCursor` (the shared arrow-nav loop behind `dismissTmuxPrompt` and
  *     `mirrorModelViaPicker`) and `dismissTmuxPrompt`'s own literal-key and
@@ -2954,8 +2967,8 @@ function firePendingEndTurn(state: SessionState): void {
  * tool_result. This prevents both the "run flips to succeeded mid-turn" bug
  * and the spurious "TURN COMPLETE" divider spam it caused. */
 /** Capture the trailing pane lines for this session (best-effort; "" on miss). */
-function captureTail(state: SessionState): string {
-  const cap = tmux(["capture-pane", "-p", "-t", state.sessionName]);
+async function captureTail(state: SessionState): Promise<string> {
+  const cap = await tmux(["capture-pane", "-p", "-t", state.sessionName]);
   if (!cap.ok) return "";
   const cl = cap.stdout.split("\n");
   return cl.slice(Math.max(0, cl.length - SCRAPE_TAIL_LINES)).join("\n");
@@ -3083,24 +3096,24 @@ const OPTION_NAV_MS = 160;         // settle after each Up/Down before capturing
  *  with a fake pane (the real one shells out to tmux). */
 interface PaneIo {
   /** Full pane capture (NOT the scrape tail). */
-  capture(): string;
+  capture(): Promise<string>;
   /** Send one nav key; false when tmux errored (session gone). */
-  send(key: NavKey): boolean;
+  send(key: NavKey): Promise<boolean>;
   /** Current `<w>x<h>`, or null. */
-  size(): { w: number; h: number } | null;
-  resize(w: number, h: number): void;
-  restore(w: number, h: number): void;
+  size(): Promise<{ w: number; h: number } | null>;
+  resize(w: number, h: number): Promise<void>;
+  restore(w: number, h: number): Promise<void>;
   sleep(ms: number): Promise<void>;
 }
 
 function tmuxPaneIo(state: SessionState): PaneIo {
   return {
     capture: () => captureFullPane(state),
-    send: (key) => {
+    send: async (key) => {
       // Ask-collector cursor navigation is still agetor typing into the live
       // pane — same idle-settle clock as every other keystroke path.
       bumpKeystroke(state);
-      return tmux(["send-keys", "-t", state.sessionName, key]).ok;
+      return (await tmux(["send-keys", "-t", state.sessionName, key])).ok;
     },
     size: () => paneSize(state),
     resize: (w, h) => resizePane(state, w, h),
@@ -3121,8 +3134,8 @@ function paneHasPreviewPanel(text: string): boolean {
 }
 
 /** Current `<w>x<h>` of the session's window, or null. */
-function paneSize(state: SessionState): { w: number; h: number } | null {
-  const r = tmux(["display-message", "-p", "-t", state.sessionName, "#{window_width}x#{window_height}"]);
+async function paneSize(state: SessionState): Promise<{ w: number; h: number } | null> {
+  const r = await tmux(["display-message", "-p", "-t", state.sessionName, "#{window_width}x#{window_height}"]);
   if (!r.ok) return null;
   const m = r.stdout.trim().match(/^(\d+)x(\d+)$/);
   return m ? { w: Number(m[1]), h: Number(m[2]) } : null;
@@ -3134,8 +3147,8 @@ function paneSize(state: SessionState): { w: number; h: number } | null {
  *  it's a literal semicolon, not a shell-escaped `\;`) so the two commands reach
  *  the tmux server atomically: if agetor dies mid-call there's no window where
  *  `window-size` is `manual` but the resize hasn't landed yet. */
-function resizePane(state: SessionState, w: number, h: number): void {
-  tmux([
+async function resizePane(state: SessionState, w: number, h: number): Promise<void> {
+  await tmux([
     "set-window-option", "-t", "=" + state.sessionName, "window-size", "manual", ";",
     "resize-window", "-t", "=" + state.sessionName, "-x", String(w), "-y", String(h),
   ]);
@@ -3160,8 +3173,8 @@ function resizePane(state: SessionState, w: number, h: number): void {
  *  inherited value rather than forcing `latest` — see the comment on
  *  `healWindowSize` for why that heal path, unlike this one, deliberately
  *  forces `latest` instead. */
-function restorePaneSize(state: SessionState, w: number, h: number): void {
-  const r = tmux([
+async function restorePaneSize(state: SessionState, w: number, h: number): Promise<void> {
+  const r = await tmux([
     "resize-window", "-t", "=" + state.sessionName, "-x", String(w), "-y", String(h), ";",
     "set-window-option", "-u", "-t", "=" + state.sessionName, "window-size",
   ]);
@@ -3170,7 +3183,7 @@ function restorePaneSize(state: SessionState, w: number, h: number): void {
       `[claude-tmux] restorePaneSize chain failed for session ${state.sessionName} — ` +
         `falling back to a standalone unpin: ${r.stderr}`,
     );
-    tmux(["set-window-option", "-u", "-t", "=" + state.sessionName, "window-size"]);
+    await tmux(["set-window-option", "-u", "-t", "=" + state.sessionName, "window-size"]);
   }
 }
 
@@ -3205,17 +3218,17 @@ function restorePaneSize(state: SessionState, w: number, h: number): void {
  * `reattachSession` only runs for sessions `reconcileOrphans` already
  * verified alive.
  */
-export function healWindowSize(taskId: string, opts: { assumeAlive?: boolean } = {}): void {
+export async function healWindowSize(taskId: string, opts: { assumeAlive?: boolean } = {}): Promise<void> {
   const state = sessions.get(taskId);
   if (state?.paneGrowInFlight) return;
-  if (!opts.assumeAlive && !sessionExists(taskId)) return;
-  tmux(["set-window-option", "-t", "=" + sessionNameFor(taskId), "window-size", "latest"]);
+  if (!opts.assumeAlive && !(await sessionExists(taskId))) return;
+  await tmux(["set-window-option", "-t", "=" + sessionNameFor(taskId), "window-size", "latest"]);
 }
 
 /** Full pane capture (NOT the 40-line tail) — a grown preview panel can be much
  *  taller than the scrape tail. Sliced to the modal region by the caller. */
-function captureFullPane(state: SessionState): string {
-  const cap = tmux(["capture-pane", "-p", "-t", state.sessionName]);
+async function captureFullPane(state: SessionState): Promise<string> {
+  const cap = await tmux(["capture-pane", "-p", "-t", state.sessionName]);
   return cap.ok ? cap.stdout : "";
 }
 
@@ -3251,11 +3264,11 @@ async function captureTabWithPreviews(
   const previews: Array<string | undefined> = base.options.map((o) => o.preview);
   let downs = 0;
   for (let j = 1; j < base.options.length; j++) {
-    if (!io.send("Down")) break;
+    if (!(await io.send("Down"))) break;
     downs++;
     await io.sleep(OPTION_NAV_MS);
     if (!stillCurrent()) break;
-    const p = parseModalPane(sliceModalRegion(io.capture()));
+    const p = parseModalPane(sliceModalRegion(await io.capture()));
     // Only trust a capture whose cursor AND option count match — a mid-repaint
     // frame can't then misassign a preview to the wrong option.
     if (p && p.cursorIndex === j && p.options.length === base.options.length) {
@@ -3265,7 +3278,7 @@ async function captureTabWithPreviews(
   // Restore the cursor to option 0 (exact Up count — no over-pressing, which
   // could wrap) so the later answer-drive starts where planAskAnswers expects.
   for (let k = 0; k < downs; k++) {
-    if (!io.send("Up")) break;
+    if (!(await io.send("Up"))) break;
     await io.sleep(OPTION_NAV_MS);
     if (!stillCurrent()) break;
   }
@@ -3331,7 +3344,7 @@ async function collectAskQuestionsFromPane(
   let sizeUnavailable = false;
   const collected: Array<ParsedQuestionPane | null> = [];
   await queueTmuxOp(state.taskId, async (stillCurrent) => {
-    const orig = io.size();
+    const orig = await io.size();
     if (orig) grew = true;
     else sizeUnavailable = true;
     // Brackets the ONLY window where `window-size manual` is expected on this
@@ -3343,24 +3356,24 @@ async function collectAskQuestionsFromPane(
     if (orig) state.paneGrowInFlight = true;
     try {
       if (orig) {
-        io.resize(Math.max(orig.w, PREVIEW_PANE_MIN_COLS), PREVIEW_PANE_ROWS);
+        await io.resize(Math.max(orig.w, PREVIEW_PANE_MIN_COLS), PREVIEW_PANE_ROWS);
         await io.sleep(PREVIEW_REFLOW_MS);
         if (!stillCurrent()) return; // finally below restores + clears
       }
       for (let t = 0; t < n; t++) {
         if (t > 0) {
-          if (!io.send("Right")) return; // entering a tab resets the cursor to option 0
+          if (!(await io.send("Right"))) return; // entering a tab resets the cursor to option 0
           await io.sleep(180);
           if (!stillCurrent()) return;
         }
-        const base = parseModalPane(sliceModalRegion(io.capture()));
+        const base = parseModalPane(sliceModalRegion(await io.capture()));
         if (!base) { collected.push(null); return; }
         if (t === 0 && orig) {
           // Guard the post-resize transient: a mid-reflow capture can drop an
           // option and mis-drive the answer. Require two consecutive captures to
           // agree on the option count before trusting this tab.
           await io.sleep(OPTION_NAV_MS);
-          const recheck = parseModalPane(sliceModalRegion(io.capture()));
+          const recheck = parseModalPane(sliceModalRegion(await io.capture()));
           if (!recheck || recheck.options.length !== base.options.length) { collected.push(null); return; }
         }
         // Walk options only when THIS tab's focused option actually has a panel
@@ -3373,14 +3386,14 @@ async function collectAskQuestionsFromPane(
       }
       // Back to the first tab so the answer-driving sequence starts known.
       for (let t = 1; t < n; t++) {
-        if (!io.send("Left")) break;
+        if (!(await io.send("Left"))) break;
         await io.sleep(90);
         if (!stillCurrent()) break;
       }
     } finally {
       if (orig) {
         try {
-          io.restore(orig.w, orig.h);
+          await io.restore(orig.w, orig.h);
         } finally {
           state.paneGrowInFlight = false;
         }
@@ -3470,7 +3483,7 @@ async function collectAndRegisterAskCard(state: SessionState, firstTail: string)
     const questions = fromJsonl ?? await collectAskQuestionsFromPane(state, firstTail);
     if (!questions) return;
     // The modal may have been answered out from under us mid-collect.
-    if (state.askCardId || detectAskModal(captureTail(state)) === null) return;
+    if (state.askCardId || detectAskModal(await captureTail(state)) === null) return;
     const card = registerScrapedAskQuestions({
       taskId: state.taskId,
       runId,
@@ -4020,6 +4033,31 @@ export function rebuildEventsFromJsonl(text: string, onChunk: ChunkHandler): voi
  * without yielding to the event loop. Used by `sendTurn` before pushing a
  * new turn slot — guarantees that any trailing end_turn from the current
  * turn lands on the *current* slot, not on the one we're about to queue.
+ *
+ * DELIBERATELY KEPT SYNC (docs/plans/fix-task-details-load-delay.md T1) — this
+ * is the one sync fs read this file's async conversion left in place, and it's
+ * a correctness requirement, not an oversight. `flush()`'s own race guard
+ * (`if (state.offset !== startOffset) return;`, see its comment) only works
+ * because a call to THIS function is atomic with respect to the event loop:
+ * it runs `fsStatSync`/`fsOpenSync`/`fsReadSync`/`fsCloseSync` back-to-back
+ * with no `await` in between, so no other flush of the same `state.offset`
+ * can interleave mid-read. Rewriting it on top of `fs/promises` (mirroring
+ * `readAppended`) would reopen exactly the double-dispatch race `flush`'s
+ * guard exists to close — two overlapping reads of the same byte range, each
+ * independently advancing `state.offset` and re-dispatching lines, with a
+ * trailing `end_turn` capable of popping the wrong turn slot. Closing that
+ * race for real needs a shared in-flight guard both `flush` and this function
+ * check *before* their first read (not just after, the way `flush` does now)
+ * — restructuring beyond a same-file, same-task conversion, so it's left for
+ * a follow-up rather than risked here.
+ *
+ * The blocking cost this leaves behind is bounded, not unbounded: unlike the
+ * tmux spawns this task converts (one full process fork+exec per call) or the
+ * SSE replay query (sorts a task's ENTIRE event history), `flushSync` only
+ * reads the bytes appended to the JSONL since `state.offset` — normally a
+ * single turn's worth of new lines, a few KB at most — via a plain sync
+ * stat+read, not a subprocess. That's exactly the class of "µs-scale syscall"
+ * the file's own `fileWrittenWithin` comment calls out as fine to leave sync.
  */
 function flushSync(state: SessionState): void {
   let st;
@@ -5063,11 +5101,11 @@ async function confirmStartupDialog(taskId: string, sessionName: string, m: Star
   const arrow = delta >= 0 ? "Down" : "Up";
   for (let i = 0; i < Math.abs(delta); i++) {
     bumpIfLive();
-    if (!tmux(["send-keys", "-t", sessionName, arrow]).ok) return false;
+    if (!(await tmux(["send-keys", "-t", sessionName, arrow])).ok) return false;
     await Bun.sleep(30);
   }
   bumpIfLive();
-  return tmux(["send-keys", "-t", sessionName, "Enter"]).ok;
+  return (await tmux(["send-keys", "-t", sessionName, "Enter"])).ok;
 }
 
 /** How often the boot-time consent poller re-checks the pane. Fast enough
@@ -5675,7 +5713,7 @@ function normalizePaneForActivity(tail: string): string {
 /** Run a single scrape tick. Idempotent: registers at most one new
  *  TmuxPromptRequest per call, auto-cancels any pending one whose
  *  fingerprint no longer matches the pane. */
-function scrapeOnce(state: SessionState): void {
+async function scrapeOnce(state: SessionState): Promise<void> {
   const now = Date.now();
   // Computed once and reused for every read below (`decideScrapeTick`'s
   // `activePromptCount`, the idle-settle gate, and the `__external__` sweep)
@@ -5700,7 +5738,7 @@ function scrapeOnce(state: SessionState): void {
   if (tick.stampIdle) state.lastIdleScrapeAt = now;
   if (!tick.run) return;
 
-  const cap = tmux(["capture-pane", "-p", "-t", state.sessionName]);
+  const cap = await tmux(["capture-pane", "-p", "-t", state.sessionName]);
   if (!cap.ok) {
     // Session vanished — let `disposeSessionState` clean us up the next
     // time the orchestrator notices. Don't churn here.
@@ -5991,7 +6029,7 @@ export function markTmuxPromptAnswered(taskId: string, fingerprint: string): voi
 function startScraper(state: SessionState): void {
   if (state.scrapeTimer) return;
   state.scrapeTimer = setInterval(() => {
-    try { scrapeOnce(state); } catch { /* swallow — never crash the timer */ }
+    void scrapeOnce(state).catch(() => { /* swallow — never crash the timer */ });
   }, SCRAPE_INTERVAL_MS);
 }
 
@@ -6350,24 +6388,41 @@ function startDeathWatch(state: SessionState): void {
     resolvePid: panePidFor,
   });
   let misses = 0;
+  // Guards a tick against overlapping the previous one now that the
+  // authoritative probe is awaited (no timeout — an owner decision, see
+  // docs/plans/fix-task-details-load-delay.md §8): without it, a stalled
+  // tmux round-trip could let a second 400ms tick start concurrently and
+  // double-count a `wait` outcome. Mirrors codex/cursor/gemini-tmux's own
+  // death watch, which converted to this same shape for the same reason.
+  // The decision logic itself is unchanged.
+  let tickInFlight = false;
   state.deathTimer = setInterval(() => {
+    if (tickInFlight) return;
     if (!turnInFlight(state) && !heldProbeSafe(state.taskId)) { misses = 0; return; } // idle & not held — skip the poll
-    // Compute the log-recency veto lazily — it only matters for a `gone` probe,
-    // and `gone` is the rare tick, so we skip a statSync on every `alive` poll.
-    const liveness = probe.probe();
-    const outcome = deathTickOutcome({
-      liveness,
-      logFresh: liveness === "gone" && fileWrittenWithin(state.jsonlPath, DEATH_JSONL_QUIET_MS),
-      misses,
-      threshold: DEATH_MISS_THRESHOLD,
-    });
-    if (outcome === "reset") { misses = 0; return; }
-    if (outcome === "wait") { misses++; return; }
-    if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
-    setTimeout(() => {
-      flushSync(state);
-      signalSessionDeath(state);
-    }, DEATH_GRACE_MS);
+    tickInFlight = true;
+    void (async () => {
+      try {
+        // Compute the log-recency veto lazily — it only matters for a `gone`
+        // probe, and `gone` is the rare tick, so we skip a statSync on every
+        // `alive` poll.
+        const liveness = await probe.probe();
+        const outcome = deathTickOutcome({
+          liveness,
+          logFresh: liveness === "gone" && fileWrittenWithin(state.jsonlPath, DEATH_JSONL_QUIET_MS),
+          misses,
+          threshold: DEATH_MISS_THRESHOLD,
+        });
+        if (outcome === "reset") { misses = 0; return; }
+        if (outcome === "wait") { misses++; return; }
+        if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
+        setTimeout(() => {
+          flushSync(state);
+          signalSessionDeath(state);
+        }, DEATH_GRACE_MS);
+      } finally {
+        tickInFlight = false;
+      }
+    })();
   }, DEATH_POLL_MS);
 }
 
@@ -6499,7 +6554,7 @@ const DEFERRED_PROMPT_TIMEOUT_MS = 30_000;
  * Assumes `sessionExists(taskId)` is false; the caller (orchestrator) is
  * responsible for routing follow-up turns through `sendTurn`.
  */
-export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
+export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<SpawnedAgent> {
   const sessionName = sessionNameFor(opts.taskId);
 
   // Defensively clear any stale same-named session before (re)creating it, so
@@ -6508,7 +6563,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // `reconcileOrphans`): an idle claude session survives a restart, so a fresh
   // run of the same task must reset it. Own-scoped (only this task's name) and
   // idempotent/silent on miss — mirrors codex's spawn pre-kill.
-  killTaskSession(opts.taskId);
+  await killTaskSession(opts.taskId);
 
   // Clean up any stale agetor settings before tmux starts so claude reads a
   // tidy `.claude/settings.local.json` on launch. agetor is non-invasive: it
@@ -6518,7 +6573,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // self-heals permission rules in owned worktrees. Owned worktrees get a
   // self-heal-safe pass; user-repo cwds (isolation=none) get a merge pass
   // that preserves all existing user config.
-  ensureInstalledForCwd(opts.cwd, opts.mode);
+  await ensureInstalledForCwd(opts.cwd, opts.mode);
 
   // Build the tmux command. `-e KEY=VAL` injects env vars into the new
   // session (so the spawned claude inherits them); `--` separates the tmux
@@ -6535,7 +6590,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   for (const [k, v] of Object.entries(fullEnv)) tmuxArgs.push("-e", `${k}=${v}`);
   tmuxArgs.push("--", ...opts.argv);
 
-  const launch = tmux(tmuxArgs);
+  const launch = await tmux(tmuxArgs);
   if (!launch.ok) {
     const err = new Error(`tmux new-session failed: ${launch.stderr || launch.stdout}`);
     opts.onChunk("stderr", err.message);
@@ -6679,24 +6734,24 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
         windows: for (;;) {
           const deadline = Date.now() + DEFERRED_PROMPT_TIMEOUT_MS;
           while (Date.now() < deadline) {
-            if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return; // session died — nothing to paste into
+            if (!(await tmux(["has-session", "-t", "=" + sessionName])).ok) return; // session died — nothing to paste into
             if (sessions.get(opts.taskId) !== state) return; // superseded by a newer spawn/reattach
             if (!slotLive()) return; // cancelled (or otherwise settled) — never paste over it
-            if (readPaneMode(state) !== null) { ready = true; break windows; }
+            if ((await readPaneMode(state)) !== null) { ready = true; break windows; }
             await Bun.sleep(DEFERRED_PROMPT_POLL_MS);
           }
           // Window timed out. Don't paste over an unanswered startup
           // question — re-arm a fresh window instead, as long as there's
           // still something to wait for.
           if (activeTmuxPromptsForTask(opts.taskId).length === 0) break;
-          if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return;
+          if (!(await tmux(["has-session", "-t", "=" + sessionName])).ok) return;
           if (sessions.get(opts.taskId) !== state) return;
           if (!slotLive()) return;
         }
         // Re-check liveness/identity before the final attempt — the loop can
         // exit via the timeout with the session still alive, and a dropped
         // prompt is worse than a best-effort paste into whatever's on screen.
-        if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return;
+        if (!(await tmux(["has-session", "-t", "=" + sessionName])).ok) return;
         if (sessions.get(opts.taskId) !== state) return;
         if (!slotLive()) return; // cancelled during the final liveness check
         if (!ready) {
@@ -6803,8 +6858,8 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
           // a re-shown consent dialog on resume is out of scope (bypass
           // acceptance is global + persistent once accepted).
           if (bootSettled || existsSync(jsonlPath)) return;
-          if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return;
-          const pane = tmux(["capture-pane", "-p", "-t", sessionName]).stdout;
+          if (!(await tmux(["has-session", "-t", "=" + sessionName])).ok) return;
+          const pane = (await tmux(["capture-pane", "-p", "-t", sessionName])).stdout;
           // A startup prompt we already surfaced and is still awaiting the
           // user keeps the boot window from expiring under them.
           if (activeTmuxPromptsForTask(opts.taskId).length > 0) {
@@ -6913,17 +6968,17 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
       if (found) break;
       const blockedOnUser =
         sawStartupPromptThisWindow || activeTmuxPromptsForTask(opts.taskId).length > 0;
-      if (blockedOnUser && tmux(["has-session", "-t", "=" + sessionName]).ok) continue;
+      if (blockedOnUser && (await tmux(["has-session", "-t", "=" + sessionName])).ok) continue;
       break;
     }
     bootSettled = true;
     if (!found) {
-      const stillAlive = tmux(["has-session", "-t", "=" + sessionName]).ok;
+      const stillAlive = (await tmux(["has-session", "-t", "=" + sessionName])).ok;
       // Capture whatever claude actually printed inside the pane so the user
       // sees the real cause (unknown flag, MCP initialize hung, auth prompt
       // waiting, …) rather than just "no JSONL".
       const paneRaw = stillAlive
-        ? tmux(["capture-pane", "-p", "-t", sessionName, "-S", "-200"]).stdout
+        ? (await tmux(["capture-pane", "-p", "-t", sessionName, "-S", "-200"])).stdout
         : "";
       const pane = paneRaw.trim() || "(empty — claude has not drawn any TUI output yet)";
       const detail = stillAlive
@@ -6932,7 +6987,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
       opts.onChunk("stderr", `claude session JSONL never appeared: ${detail}`);
       opts.onChunk("stderr", `expected at: ${jsonlPath}`);
       opts.onChunk("stderr", `--- tmux pane ---\n${pane}\n--- end pane ---`);
-      killTaskSession(opts.taskId);
+      await killTaskSession(opts.taskId);
       sessions.delete(opts.taskId);
       // Reject every queued turn so all dependent promises settle. Drop any
       // staged end_turn — without claude's JSONL we can't confirm it, and
@@ -6989,7 +7044,7 @@ export interface ReattachOptions {
  * as orphaned and kill the tmux session — without the JSONL we'd have no
  * structured visibility into the session anyway).
  */
-export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
+export async function reattachSession(opts: ReattachOptions): Promise<SpawnedAgent | null> {
   const sessionName = sessionNameFor(opts.taskId);
   const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.configDir);
   if (!existsSync(jsonlPath)) return null;
@@ -7050,7 +7105,7 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
   // `assumeAlive`: `reattachSession` only runs for sessions `reconcileOrphans`
   // already verified alive, so the internal `sessionExists` probe would be a
   // duplicate round-trip.
-  healWindowSize(opts.taskId, { assumeAlive: true });
+  await healWindowSize(opts.taskId, { assumeAlive: true });
 
   return {
     kill: () => {
@@ -7062,7 +7117,10 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
       // Drop any staged end_turn so a late-arriving JSONL line can't fire it
       // post-cancel and emit a spurious "turn complete" banner.
       bumpKeystroke(s);
-      tmux(["send-keys", "-t", s.sessionName, "C-c"]);
+      // Fire-and-forget: `kill` is a sync SpawnedAgent method (shared contract
+      // across every driver) and tmux() never throws, so there's nothing to
+      // await here — mirrors `makeAgent`'s kill below.
+      void tmux(["send-keys", "-t", s.sessionName, "C-c"]);
       const err = new Error("cancelled");
       s.pendingEndTurn = null;
       for (const slot of s.turnQueue.splice(0)) slot.reject?.(err);
@@ -7101,12 +7159,12 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
  * `onPasteFailure` callback: same outcomes, plus the success case, and it
  * always settles even when the queued tmux op is dropped without running.
  */
-export function sendTurn(
+export async function sendTurn(
   taskId: string,
   prompt: string,
   onChunk: ChunkHandler,
   opts?: { onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void },
-): SpawnedAgent {
+): Promise<SpawnedAgent> {
   const state = sessions.get(taskId);
   if (!state) {
     const err = new Error(`no live session for task ${taskId}`);
@@ -7241,11 +7299,11 @@ export function sendTurn(
  * The callback and `pasteOutcome` describe the same event — use whichever
  * shape fits the call site; both fire for every failure.
  */
-export function pasteFollowUp(
+export async function pasteFollowUp(
   taskId: string,
   prompt: string,
   opts?: { onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void },
-): { delivered: true; pasteOutcome: Promise<PasteOutcome> } | false {
+): Promise<{ delivered: true; pasteOutcome: Promise<PasteOutcome> } | false> {
   const state = sessions.get(taskId);
   if (!state) return false;
   // A folded-in follow-up paste is a life signal — reset the idle clock and
@@ -7300,7 +7358,7 @@ const SLASH_CONFIRM_IDLE_BREAK_TICKS = 2;
  * for `cycleToMode`); the unit suite swaps in a synthetic pane so it can
  * drive the confirm-detection step without a real claude session.
  */
-let captureConfirmPane: (state: SessionState) => string = captureTail;
+let captureConfirmPane: (state: SessionState) => Promise<string> = captureTail;
 
 /**
  * Test seam: how `queuePaste`'s modal guard reads the live pane before
@@ -7309,7 +7367,7 @@ let captureConfirmPane: (state: SessionState) => string = captureTail;
  * Mirrors `captureConfirmPane` immediately above exactly — a SEPARATE seam,
  * deliberately: overriding one must never silently redirect the other.
  */
-let capturePastePane: (state: SessionState) => string = captureTail;
+let capturePastePane: (state: SessionState) => Promise<string> = captureTail;
 
 /**
  * How often `queuePaste`'s modal guard re-captures the pane while a
@@ -7358,9 +7416,9 @@ let PASTE_MODAL_GRACE_MS = 1_500;
  * the "am I about to act on this" moment.
  */
 async function stillBlocking(state: SessionState): Promise<boolean> {
-  if (!paneShowsBlockingPrompt(capturePastePane(state))) return false;
+  if (!paneShowsBlockingPrompt(await capturePastePane(state))) return false;
   await Bun.sleep(PASTE_MODAL_POLL_MS);
-  return paneShowsBlockingPrompt(capturePastePane(state));
+  return paneShowsBlockingPrompt(await capturePastePane(state));
 }
 
 /**
@@ -7438,14 +7496,14 @@ async function stillBlocking(state: SessionState): Promise<boolean> {
  * ticks (not one) guards against a single transient idle-looking frame
  * mid-repaint; Enter is still never sent on this path.
  */
-export function sendSlashCommand(
+export async function sendSlashCommand(
   taskId: string,
   line: string,
   opts?: {
     autoConfirm?: "model" | "effort";
     onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void;
   },
-): boolean {
+): Promise<boolean> {
   const state = sessions.get(taskId);
   if (!state) return false;
   // Settle delay after slash commands: claude's TUI takes ~hundreds of ms
@@ -7499,12 +7557,12 @@ async function autoConfirmSlashModal(
   let idleStreak = 0;
   for (let i = 0; i < attempts; i++) {
     if (!stillCurrent()) return false;
-    const tail = captureConfirmPane(state);
+    const tail = await captureConfirmPane(state);
     const match = matchSlashConfirmModal(tail, kind);
     if (match) {
       if (!stillCurrent()) return false;
       bumpKeystroke(state);
-      if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return false;
+      if (!(await tmux(["send-keys", "-t", state.sessionName, "Enter"])).ok) return false;
       // Stamp answered only AFTER the Enter actually landed (finding #6):
       // a failed send-keys means the confirm is still genuinely on the
       // pane, so it must stay eligible for the scraper's own matcher
@@ -7726,7 +7784,7 @@ export async function mirrorModelViaPicker(
   // Never open the picker on a busy session (finding #2, wave-5 re-review) —
   // see this function's doc. Checked again as the first thing the driving op
   // does below.
-  if (turnInFlight(state) || paneShowsClaudeWorking(capturePastePane(state))) {
+  if (turnInFlight(state) || paneShowsClaudeWorking(await capturePastePane(state))) {
     return { ok: false, reason: "turn in flight" };
   }
 
@@ -7764,7 +7822,7 @@ export async function mirrorModelViaPicker(
     // busy — including one where the bare `/model` we just pasted got
     // swallowed into claude's queued-input buffer instead of opening the
     // picker immediately.
-    if (turnInFlight(state) || paneShowsClaudeWorking(capturePastePane(state))) {
+    if (turnInFlight(state) || paneShowsClaudeWorking(await capturePastePane(state))) {
       result = { ok: false, reason: "turn in flight" };
       return;
     }
@@ -7784,7 +7842,7 @@ export async function mirrorModelViaPicker(
       let picker: ScrapeMatch | null = null;
       for (let i = 0; i < attempts; i++) {
         if (!stillCurrent()) return;
-        const m = matchNumberedModal(captureConfirmPane(state));
+        const m = matchNumberedModal(await captureConfirmPane(state));
         if (m && m.confirmKey === "s" && typeof m.cursorIndex === "number") {
           picker = m;
           break;
@@ -7807,7 +7865,7 @@ export async function mirrorModelViaPicker(
           return;
         }
         bumpKeystroke(state);
-        const escape = tmux(["send-keys", "-t", state.sessionName, "Escape"]);
+        const escape = await tmux(["send-keys", "-t", state.sessionName, "Escape"]);
         // Stamp the fingerprint answered ONLY when the Escape actually
         // landed (finding #4, wave-5 re-review) — mirrors the symmetry
         // `autoConfirmSlashModal` already applies to its own Enter: a failed
@@ -7834,7 +7892,7 @@ export async function mirrorModelViaPicker(
       // the match rather than hardcoding, so a future footer wording change
       // flows through `SESSION_ONLY_CONFIRM_RE` in one place.
       bumpKeystroke(state);
-      if (!tmux(["send-keys", "-t", state.sessionName, picker.confirmKey!]).ok) {
+      if (!(await tmux(["send-keys", "-t", state.sessionName, picker.confirmKey!])).ok) {
         result = { ok: false, reason: "keystroke failed" };
         return;
       }
@@ -7939,7 +7997,7 @@ let modePollIntervalMs = 100;
  * drive the verifier without a real claude session (the `/bin/echo` tmux stub
  * the tests use can't paint a status bar).
  */
-let captureModePane: (state: SessionState) => string = captureTail;
+let captureModePane: (state: SessionState) => Promise<string> = captureTail;
 
 /**
  * Parse claude's current permission mode out of the tmux status bar. The bar
@@ -7964,8 +8022,8 @@ let captureModePane: (state: SessionState) => string = captureTail;
  * "auto mode on" sitting in assistant/user output above the bar would
  * otherwise be mis-read as the live mode.
  */
-function readPaneMode(state: SessionState): string | null {
-  const lines = captureModePane(state).split("\n");
+async function readPaneMode(state: SessionState): Promise<string | null> {
+  const lines = (await captureModePane(state)).split("\n");
   let bar = "";
   for (let i = lines.length - 1; i >= 0; i--) {
     if (lines[i]!.trim() !== "") { bar = lines[i]!; break; }
@@ -8003,7 +8061,7 @@ async function waitForPaneMode(state: SessionState, from: string, target: string
   const deadline = Date.now() + modeVerifyTimeoutMs;
   let prev: string | null = null;
   for (;;) {
-    const mode = readPaneMode(state);
+    const mode = await readPaneMode(state);
     if (mode === target) return mode;
     // Settled on a moved, non-target mode → that's the landing.
     if (mode !== null && mode !== from && mode === prev) return mode;
@@ -8136,7 +8194,7 @@ async function cycleToModeInner(taskId: string, targetAgetorMode: string): Promi
     // every "mode change" silently no-op'd).
     const keys = Array<string>(presses).fill("BTab");
     bumpKeystroke(state);
-    tmux(["send-keys", "-t", state.sessionName, ...keys]);
+    await tmux(["send-keys", "-t", state.sessionName, ...keys]);
 
     // Verify by scraping the status bar, NOT the JSONL: claude only journals
     // `permission-mode` at the next turn start, so an idle Shift+Tab emits no
@@ -8199,7 +8257,7 @@ export function cycleToMode(taskId: string, targetAgetorMode: string): Promise<C
  * Tear down per-task state for `taskId` and kill the tmux session. Used by
  * deleteTask and reconcileOrphans.
  */
-export function dropSession(taskId: string): void {
+export async function dropSession(taskId: string): Promise<void> {
   const state = sessions.get(taskId);
   if (state) {
     // `orphanSubagents: true` — this task's session is being torn down for
@@ -8215,7 +8273,7 @@ export function dropSession(taskId: string): void {
     detachWatcherFor(taskId);
     orphanRunningSubagents(taskId);
   }
-  killTaskSession(taskId);
+  await killTaskSession(taskId);
 }
 
 /**
@@ -8225,15 +8283,15 @@ export function dropSession(taskId: string): void {
  * no `active` run handle to route the interrupt through, and after a restart it
  * has no `SessionState` either. Returns false when the session is already gone.
  */
-export function interruptTaskSession(taskId: string): boolean {
+export async function interruptTaskSession(taskId: string): Promise<boolean> {
   const name = sessionNameFor(taskId);
-  if (!sessionExistsByName(name)) return false;
+  if (!(await sessionExistsByName(name))) return false;
   // Best-effort: this path deliberately works from the session NAME alone
   // (there may be no in-memory state after a restart), but when there IS a
   // live state, stamp the keystroke clock like every other send-keys site.
   const state = sessions.get(taskId);
   if (state) bumpKeystroke(state);
-  tmux(["send-keys", "-t", name, "C-c"]);
+  await tmux(["send-keys", "-t", name, "C-c"]);
   return true;
 }
 
@@ -8333,7 +8391,8 @@ function makeAgent(
       const state = sessions.get(taskId);
       if (!state) return;
       bumpKeystroke(state);
-      tmux(["send-keys", "-t", state.sessionName, "C-c"]);
+      // Fire-and-forget — see reattachSession's kill closure for why.
+      void tmux(["send-keys", "-t", state.sessionName, "C-c"]);
       const err = new Error("cancelled");
       state.pendingEndTurn = null;
       for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
@@ -8497,7 +8556,9 @@ export const __forTest = {
    *  tmux pane). Tests inject a synthetic status bar — pass a function that
    *  returns the pane text claude would show. Returns the previous reader so
    *  the test can restore it. */
-  setCaptureModePane(fn: (state: SessionState) => string): (state: SessionState) => string {
+  setCaptureModePane(
+    fn: (state: SessionState) => Promise<string>,
+  ): (state: SessionState) => Promise<string> {
     const prev = captureModePane;
     captureModePane = fn;
     return prev;
@@ -8508,7 +8569,9 @@ export const __forTest = {
    *  confirm-modal pane so the confirm-poll step can be driven without a
    *  real tmux session. Returns the previous reader so the test can restore
    *  it in `afterEach` (mirrors `setCaptureModePane`). */
-  setCaptureConfirmPane(fn: (state: SessionState) => string): (state: SessionState) => string {
+  setCaptureConfirmPane(
+    fn: (state: SessionState) => Promise<string>,
+  ): (state: SessionState) => Promise<string> {
     const prev = captureConfirmPane;
     captureConfirmPane = fn;
     return prev;
@@ -8662,7 +8725,9 @@ export const __forTest = {
    *  synthetic modal (or idle) pane so the guard can be driven without a
    *  real tmux session. Returns the previous reader so the test can restore
    *  it in `afterEach` (mirrors `setCaptureConfirmPane`). */
-  setCapturePastePane(fn: (state: SessionState) => string): (state: SessionState) => string {
+  setCapturePastePane(
+    fn: (state: SessionState) => Promise<string>,
+  ): (state: SessionState) => Promise<string> {
     const prev = capturePastePane;
     capturePastePane = fn;
     return prev;
@@ -8779,12 +8844,28 @@ const IMAGE_ATTACH_SETTLE_MAX_MS = 3_000;
  * newlines, dollar signs, quotes, …), paste it into the active window, then
  * press Enter to submit.
  *
- * Stays synchronous — the caller (`queuePaste`) is responsible for any
- * post-paste delays (the base bracketed gap or the longer image-attach
- * gap) and for re-gating the trailing Enter on session identity. Keeping
- * this function sync preserves the "no awaits between tmux calls"
- * invariant the `queueTmuxOp` chain depends on; the gap + Enter split for
- * the bracketed case happens in `queuePaste`.
+ * Async (renamed from `pastePromptSync` — docs/plans/fix-task-details-load-
+ * delay.md T1: `tmux()` itself moved off `Bun.spawnSync`, so nothing in this
+ * file is truly "Sync" anymore). Its four tmux calls (load-buffer,
+ * paste-buffer, delete-buffer, send-keys Enter) each now yield to the event
+ * loop across the `await`.
+ *
+ * The load-bearing invariant is no longer "no awaits between tmux calls"
+ * (that guarantee is gone by construction) — it's that this whole
+ * micro-sequence is only ever invoked from inside a `queueTmuxOp`/`queuePaste`
+ * body on the PER-TASK chain (`pasteChains`), so two calls for the *same*
+ * task can never interleave their four steps with each other. Cross-task
+ * interleaving is safe by construction too: each call targets a distinct
+ * tmux session (`-t sessionName`) and a distinct, session-scoped buffer name
+ * (`agetor-${sessionName}`), so even fully-concurrent awaits for different
+ * tasks can never step on each other's buffer or pane. A session dying
+ * mid-sequence (between, say, load-buffer and paste-buffer) is no longer
+ * structurally impossible the way a single synchronous call made it — but it
+ * doesn't need to be: the next tmux call in the sequence just comes back
+ * `ok: false` (session gone), which this function already turns into a
+ * `TmuxPasteFailure` the caller (`queuePaste`) already knows how to handle
+ * (re-stash to the backlog, surface a status line) exactly as it does for
+ * any other tmux failure.
  *
  * `skipEnter` defers the trailing Enter to the caller so it can insert a
  * gap before the `send-keys Enter`. See `queuePaste`'s bracketed branch
@@ -8799,14 +8880,14 @@ const IMAGE_ATTACH_SETTLE_MAX_MS = 3_000;
  * caller instead of silently swallowed — see `queuePaste`'s handling of a
  * non-`ok` result.
  */
-function pastePromptSync(
+async function pastePrompt(
   sessionName: string,
   text: string,
   opts: { bracketed?: boolean; skipEnter?: boolean } = {},
-): { ok: true } | TmuxPasteFailure {
+): Promise<{ ok: true } | TmuxPasteFailure> {
   // load-buffer reads from stdin; -b names a tmux buffer we can target.
   const buf = `agetor-${sessionName}`;
-  const load = tmux(["load-buffer", "-b", buf, "-"], { stdinText: text });
+  const load = await tmux(["load-buffer", "-b", buf, "-"], { stdinText: text });
   if (!load.ok) return { ok: false, op: "load-buffer", stderr: load.stderr };
   // `-p` wraps the paste in bracketed-paste codes (ESC[200~ … ESC[201~) when
   // the app has requested bracketed-paste mode (claude's Ink TUI does). Long
@@ -8818,8 +8899,8 @@ function pastePromptSync(
   // typically insert pasted text verbatim instead of dispatching it as a
   // command, which would silently break the mode/model switchers.
   const pasteFlags = opts.bracketed ? ["-p"] : [];
-  const paste = tmux(["paste-buffer", ...pasteFlags, "-b", buf, "-t", sessionName]);
-  tmux(["delete-buffer", "-b", buf]);
+  const paste = await tmux(["paste-buffer", ...pasteFlags, "-b", buf, "-t", sessionName]);
+  await tmux(["delete-buffer", "-b", buf]);
   if (!paste.ok) return { ok: false, op: "paste-buffer", stderr: paste.stderr };
   // `skipEnter` defers the trailing Enter to the caller so it can sleep
   // between the bracketed paste and the Enter — see `queuePaste`. Without
@@ -8828,19 +8909,19 @@ function pastePromptSync(
   // absorbed as part of the same paste event, so the queued bubble sits
   // unsubmitted until the user (or a later Enter) commits it.
   if (!opts.skipEnter) {
-    const enter = tmux(["send-keys", "-t", sessionName, "Enter"]);
+    const enter = await tmux(["send-keys", "-t", sessionName, "Enter"]);
     if (!enter.ok) return { ok: false, op: "send-keys", stderr: enter.stderr };
   }
   return { ok: true };
 }
 
-/** Result of `pastePromptSync` / the deferred bracketed-paste Enter in
+/** Result of `pastePrompt` / the deferred bracketed-paste Enter in
  *  `queuePaste`, PLUS the guard's own synthesized withhold. `ok: false` for
  *  `op: "load-buffer" | "paste-buffer" | "send-keys"` means the tmux
  *  subprocess for `op` exited non-zero — a real signal that the paste didn't
  *  land (dead server, socket gone, session vanished mid-op), not just
  *  "nothing happened yet". `op: "modal-guard"` is different in kind: it's
- *  synthesized by `queuePaste` itself (never by `pastePromptSync`, and never
+ *  synthesized by `queuePaste` itself (never by `pastePrompt`, and never
  *  the result of an actual tmux call) when the paste — or its deferred
  *  bracketed Enter — is withheld because a live claude modal is still on the
  *  pane after the guard's grace window; see the guard blocks in `queuePaste`.
@@ -8866,10 +8947,10 @@ export type PasteOutcome =
 
 /**
  * The subset of `PasteOutcome` failures that actually came from a tmux
- * subprocess call (`pastePromptSync`'s three failure ops, or the manually
+ * subprocess call (`pastePrompt`'s three failure ops, or the manually
  * constructed `"send-keys"` outcome for the deferred bracketed Enter) — i.e.
  * every `PasteOutcome` failure except the guard's own synthesized
- * `"modal-guard"`. Used as `pastePromptSync`'s return type, so its declared
+ * `"modal-guard"`. Used as `pastePrompt`'s return type, so its declared
  * type itself proves (no cast needed) that it can never produce
  * `modal-guard`, and to narrow `reportPasteFailure`'s parameter (finding
  * #11, docs/plans/model-effort-local-command-turns.md §10) so its
@@ -8892,7 +8973,7 @@ type TmuxPasteFailure = Exclude<Extract<PasteOutcome, { ok: false }>, { op: "mod
  * applied before the *next* operation — never before the slash itself.
  *
  * Important caveat about what this delay actually buys: the timer starts
- * when `pastePromptSync` returns (i.e. when tmux's `send-keys Enter`
+ * when `pastePrompt` returns (i.e. when tmux's `send-keys Enter`
  * exits), NOT when claude has finished processing the slash command. On
  * an idle REPL these are close enough that 700ms covers consumption +
  * repaint. When claude is mid-turn, the slash command queues inside
@@ -9045,7 +9126,7 @@ function queueTmuxOp(
  * of which is "deliver this as the next chat message." If the modal is
  * STILL there once the grace window elapses, `stillBlocking` (a double
  * sample — finding #3, §10 review) confirms it isn't just a mid-repaint
- * transient before the paste is WITHHELD (no `pastePromptSync` call at
+ * transient before the paste is WITHHELD (no `pastePrompt` call at
  * all): a `status` chunk + console log surface it, and `opts.onPasteFailure`
  * fires with `{ ok: false, op: "modal-guard", phase: "pre-paste" }` exactly
  * like any other paste failure, so a caller with a turn slot (`sendTurn`)
@@ -9195,9 +9276,12 @@ function queuePaste(
   // delayed well past this enqueue-time stamp.
   if (expectedState) bumpKeystroke(expectedState);
   // Non-bracketed path: load-buffer + paste-buffer + delete-buffer +
-  // send-keys Enter all happen synchronously inside pastePromptSync, so
-  // the only await is the optional settle — no tmux calls land after the
-  // sleep, and a dispose during the sleep can't leak keystrokes.
+  // send-keys Enter each now await their own tmux() round-trip inside
+  // `pastePrompt` (it stopped being truly "synchronous" the moment `tmux()`
+  // itself moved off `Bun.spawnSync` — see `pastePrompt`'s doc for how
+  // atomicity survives that: the per-task chain plus per-session buffer
+  // names, not an uninterruptible call). The settle sleep after it returns is
+  // just one more await in the same already-async op body.
   //
   // Bracketed path: we split the trailing Enter out and insert a gap so
   // claude's Ink TUI has time to consume `ESC[201~` and commit the paste
@@ -9254,7 +9338,8 @@ function queuePaste(
     if (expectedState && !opts.skipModalGuard) {
       const graceMs = opts.modalGuardGraceMs ?? PASTE_MODAL_GRACE_MS;
       const guardDeadline = Date.now() + graceMs;
-      while (paneShowsBlockingPrompt(capturePastePane(expectedState))) {
+      while (paneShowsBlockingPrompt(await capturePastePane(expectedState))) {
+        if (!stillCurrent()) return;
         if (Date.now() >= guardDeadline) {
           // Double-sample before withholding (finding #3, docs/plans/model-
           // effort-local-command-turns.md §10 review) — also what turns the
@@ -9295,7 +9380,8 @@ function queuePaste(
     // nothing to catch.
     let insertedComposerClearDelay = false;
     if (expectedState && !opts.skipModalGuard && expectedState.composerHoldsText) {
-      const tail = capturePastePane(expectedState);
+      const tail = await capturePastePane(expectedState);
+      if (!stillCurrent()) return;
       if (paneShowsClaudeWorking(tail)) {
         // No safe mid-turn clear — Escape/Ctrl-C would interrupt the live
         // turn (see COMPOSER_CLEAR_KEYS's doc) — so withhold until idle.
@@ -9315,7 +9401,12 @@ function queuePaste(
         // other tmux call — check `.ok` rather than assuming the clear
         // keystrokes landed just because a pane re-capture follows.
         bumpKeystroke(expectedState);
-        const clearResult = tmux(["send-keys", "-t", sessionName, ...COMPOSER_CLEAR_KEYS]);
+        // No `stillCurrent()` gate immediately after this await, for the same
+        // reason as the `pastePrompt` call below: a real send-keys failure
+        // here must still be reported (invariant #3), not swallowed behind a
+        // stale-session check. `stillCurrent()` gates the settle sleep right
+        // after instead, before any further action is taken on success.
+        const clearResult = await tmux(["send-keys", "-t", sessionName, ...COMPOSER_CLEAR_KEYS]);
         if (!clearResult.ok) {
           const outcome: Extract<PasteOutcome, { ok: false }> =
             { ok: false, op: "modal-guard", phase: "composer-dirty", stderr: clearResult.stderr || "composer-clear send-keys failed" };
@@ -9337,7 +9428,8 @@ function queuePaste(
         // since that predicate requires `!paneShowsClaudeWorking` and a
         // genuine `❯`-row, neither of which a modal provides). Require both
         // "no blocking prompt" AND a confirmed bare row before trusting it.
-        const after = capturePastePane(expectedState);
+        const after = await capturePastePane(expectedState);
+        if (!stillCurrent()) return;
         if (paneShowsBlockingPrompt(after) || !paneShowsIdleInputBox(after)) {
           const outcome: Extract<PasteOutcome, { ok: false }> =
             { ok: false, op: "modal-guard", phase: "composer-dirty", stderr: "composer clear did not take" };
@@ -9401,7 +9493,14 @@ function queuePaste(
     }
     if (opts.bracketed) {
       if (expectedState) bumpKeystroke(expectedState);
-      const result = pastePromptSync(sessionName, text, { bracketed: true, skipEnter: true });
+      // No `stillCurrent()` gate right after this await (unlike the pane-read
+      // awaits above): `pastePrompt` already ran its tmux calls against
+      // whatever session was live when they fired, and that outcome — success
+      // or a real tmux failure — is the truth to report either way (invariant
+      // #3: mid-sequence session death surfaces as a non-ok result, not a
+      // suppressed one). `stillCurrent()` still gates every action taken
+      // AFTER this point, below.
+      const result = await pastePrompt(sessionName, text, { bracketed: true, skipEnter: true });
       if (!result.ok) {
         reportPasteFailure(taskId, expectedState, result);
         report(result);
@@ -9447,7 +9546,7 @@ function queuePaste(
         }
       }
       if (expectedState) bumpKeystroke(expectedState);
-      const enter = tmux(["send-keys", "-t", sessionName, "Enter"]);
+      const enter = await tmux(["send-keys", "-t", sessionName, "Enter"]);
       if (!enter.ok) {
         const outcome: TmuxPasteFailure =
           { ok: false, op: "send-keys", stderr: enter.stderr };
@@ -9470,23 +9569,22 @@ function queuePaste(
       report({ ok: true });
     } else {
       if (expectedState) bumpKeystroke(expectedState);
-      const result = pastePromptSync(sessionName, text, { bracketed: opts.bracketed });
+      const result = await pastePrompt(sessionName, text, { bracketed: opts.bracketed });
       if (!result.ok) {
         reportPasteFailure(taskId, expectedState, result);
-        // (finding #7, §10 re-review) `pastePromptSync` without `skipEnter`
-        // runs load-buffer + paste-buffer + send-keys Enter all
-        // synchronously — an `op: "send-keys"` failure here means the paste
-        // itself already landed and only the Enter didn't, so the composer
-        // holds this text exactly like the bracketed path's Enter-failure
-        // branch above.
+        // (finding #7, §10 re-review) `pastePrompt` without `skipEnter`
+        // runs load-buffer + paste-buffer + send-keys Enter in sequence —
+        // an `op: "send-keys"` failure here means the paste itself already
+        // landed and only the Enter didn't, so the composer holds this text
+        // exactly like the bracketed path's Enter-failure branch above.
         if (expectedState && result.op === "send-keys") expectedState.composerHoldsText = true;
         report(result);
         return;
       }
       if (expectedState) expectedState.composerHoldsText = false;
-      // Terminal success for the non-bracketed path: `pastePromptSync`
-      // without `skipEnter` runs load-buffer + paste-buffer + Enter all
-      // synchronously, so an `ok` result means all three landed.
+      // Terminal success for the non-bracketed path: `pastePrompt`
+      // without `skipEnter` runs load-buffer + paste-buffer + Enter in
+      // sequence, so an `ok` result means all three landed.
       report({ ok: true });
     }
     if (settleMs > 0) await Bun.sleep(settleMs);

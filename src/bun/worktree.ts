@@ -1,6 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { dataDir } from "./db.ts";
@@ -341,29 +340,24 @@ export async function repoRoot(dir: string): Promise<string | null> {
  * writable cwd, or when `cwd` isn't a git repo / git is unavailable
  * (non-throwing — callers just get no extra roots).
  *
- * Synchronous on purpose: the codex spawn paths (`spawnCodexTurnNow`,
- * `spawnAgent`) are synchronous, and a local `git rev-parse` is sub-20ms.
- * `--path-format=absolute` (git ≥ 2.31) yields an absolute path directly; the
- * `path.resolve` is belt-and-suspenders for any git that ignores the flag.
+ * Async, via the file's shared `git()` helper (`Bun.spawn` + its own 5s
+ * timeout here) rather than a sync `child_process.spawnSync` — the codex
+ * spawn paths this feeds (`buildCodexCommand` → `spawnAgent`) run on the same
+ * thread that serves `Bun.serve` + the whole orchestrator, so a sync fork
+ * would stall every concurrent HTTP/SSE connection for the life of the git
+ * call. `--path-format=absolute` (git ≥ 2.31) yields an absolute path
+ * directly; the `path.resolve` is belt-and-suspenders for any git that
+ * ignores the flag.
  *
  * Containment is checked against the realpath'd cwd: git canonicalizes symlinks
  * in the path it reports (e.g. `/tmp` → `/private/tmp` on macOS), so comparing
  * the reported common dir against a non-canonical `cwd` would otherwise flag an
  * ordinary `.git`-inside-cwd checkout as "outside" and add a redundant root.
  */
-export function gitWritableRootsSync(cwd: string): string[] {
-  let out: string;
-  try {
-    const res = spawnSync(
-      "git",
-      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-      { cwd, encoding: "utf8", timeout: 5_000 },
-    );
-    if (res.status !== 0 || typeof res.stdout !== "string") return [];
-    out = res.stdout.trim();
-  } catch {
-    return [];
-  }
+export async function gitWritableRoots(cwd: string): Promise<string[]> {
+  const res = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd, 5_000);
+  if (!res.ok) return [];
+  const out = res.stdout;
   if (!out) return [];
   const commonDir = path.resolve(cwd, out);
   let realCwd = cwd;
@@ -984,7 +978,7 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
     // filename char, so it must never be rewritten).
     //
     // `repoRoot` reports git's canonicalized path (symlinks resolved, e.g.
-    // `/tmp` → `/private/tmp` on macOS — see `gitWritableRootsSync`'s doc
+    // `/tmp` → `/private/tmp` on macOS — see `gitWritableRoots`'s doc
     // comment for the same gotcha), so diffing it against a non-canonical
     // `cwd` would spuriously produce a non-empty prefix even when cwd IS the
     // root. Realpath `cwd` first to compare like-for-like. Skipped entirely

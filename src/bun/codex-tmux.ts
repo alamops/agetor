@@ -12,7 +12,6 @@ import {
 } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
@@ -380,38 +379,52 @@ function startCodexTailer(state: CodexSessionState): Promise<number> {
     resolvePid: panePidFor,
   });
   let misses = 0;
+  // Guards a tick against overlapping the previous one now that the
+  // authoritative probe is awaited (no timeout — an owner decision, see
+  // docs/plans/fix-task-details-load-delay.md §8): without it, a stalled
+  // tmux round-trip could let a second 400ms tick start concurrently and
+  // double-count a `wait` outcome. The decision logic itself is unchanged.
+  let tickInFlight = false;
   state.deathTimer = setInterval(() => {
-    tryWatch();
-    // Compute the log-recency veto lazily — only a `gone` probe uses it.
-    const liveness = probe.probe();
-    const outcome = deathTickOutcome({
-      liveness,
-      logFresh: liveness === "gone" && fileWrittenWithin(state.logPath, DEATH_JSONL_QUIET_MS),
-      misses,
-      threshold: DEATH_MISS_THRESHOLD,
-    });
-    if (outcome === "reset") { misses = 0; return; }
-    if (outcome === "wait") { misses++; return; }
-    // Session gone. Give the FS a beat to surface the final bytes, flush, then
-    // resolve with whatever terminal code we saw (default: failed — a codex
-    // exec that vanished without `turn.completed` did not succeed).
-    setTimeout(() => {
-      flushCodexLog(state);
-      // If the final flush surfaced a terminal event (turn.completed/failed),
-      // resolveCodexDone already fired — this was an orderly finish, not a
-      // death, so don't emit the "session ended" sentinel.
-      if (!state.resolved) {
-        // Emit the shared sentinel so the orchestrator flips the card to
-        // `blocked` (via makeChunkHandler) and the user sees WHY the run
-        // stopped in the stream, instead of a silent drop to `ready`.
-        state.onChunk(
-          "status",
-          `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`,
-        );
+    if (tickInFlight) return;
+    tickInFlight = true;
+    void (async () => {
+      try {
+        tryWatch();
+        // Compute the log-recency veto lazily — only a `gone` probe uses it.
+        const liveness = await probe.probe();
+        const outcome = deathTickOutcome({
+          liveness,
+          logFresh: liveness === "gone" && fileWrittenWithin(state.logPath, DEATH_JSONL_QUIET_MS),
+          misses,
+          threshold: DEATH_MISS_THRESHOLD,
+        });
+        if (outcome === "reset") { misses = 0; return; }
+        if (outcome === "wait") { misses++; return; }
+        // Session gone. Give the FS a beat to surface the final bytes, flush, then
+        // resolve with whatever terminal code we saw (default: failed — a codex
+        // exec that vanished without `turn.completed` did not succeed).
+        setTimeout(() => {
+          flushCodexLog(state);
+          // If the final flush surfaced a terminal event (turn.completed/failed),
+          // resolveCodexDone already fired — this was an orderly finish, not a
+          // death, so don't emit the "session ended" sentinel.
+          if (!state.resolved) {
+            // Emit the shared sentinel so the orchestrator flips the card to
+            // `blocked` (via makeChunkHandler) and the user sees WHY the run
+            // stopped in the stream, instead of a silent drop to `ready`.
+            state.onChunk(
+              "status",
+              `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`,
+            );
+          }
+          resolveCodexDone(state, state.lastCode ?? 1);
+        }, DEATH_GRACE_MS);
+        if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
+      } finally {
+        tickInFlight = false;
       }
-      resolveCodexDone(state, state.lastCode ?? 1);
-    }, DEATH_GRACE_MS);
-    if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
+    })();
   }, DEATH_POLL_MS);
 
   return done;
@@ -422,6 +435,39 @@ function startCodexTailer(state: CodexSessionState): Promise<number> {
  * ────────────────────────────────────────────────────────────────────────── */
 
 const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+
+/**
+ * Launch `tmux new-session` for codex's detached hosting session. Async
+ * (`Bun.spawn` + `await proc.exited`) so this fork+exec never blocks the
+ * event loop that also serves the HTTP API — this used to be
+ * `node:child_process`'s `spawnSync`, which stalled every concurrent request
+ * for the duration of tmux's fork+exec (see
+ * docs/plans/fix-task-details-load-delay.md). No timeout, mirroring
+ * claude-tmux.ts's `tmux()` helper — an owner decision to keep behavior
+ * unchanged beyond removing the block. Never throws; a spawn failure (e.g.
+ * tmux not on PATH) folds into `stderr` the same way a non-zero exit does,
+ * so callers only need one failure branch.
+ */
+async function spawnTmuxNewSession(
+  tmux: string,
+  args: string[],
+): Promise<{ status: number | null; stderr: string }> {
+  try {
+    const proc = Bun.spawn([tmux, ...args], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const status = await proc.exited;
+    return { status, stderr: stderr.trim() };
+  } catch (e) {
+    return { status: null, stderr: (e as Error).message };
+  }
+}
 
 export interface CodexLaunchOptions {
   taskId: string;
@@ -444,7 +490,7 @@ export interface CodexLaunchOptions {
  * `--json` log. Returns a `SpawnedAgent` whose `done` resolves when the turn
  * ends (0 on `turn.completed`, 1 on failure/crash).
  */
-export function spawnCodexViaTmux(opts: CodexLaunchOptions): SpawnedAgent {
+export async function spawnCodexViaTmux(opts: CodexLaunchOptions): Promise<SpawnedAgent> {
   ensureLogDir();
   const logPath = codexLogPath(opts.runId);
   const promptPath = codexPromptPath(opts.runId);
@@ -455,7 +501,7 @@ export function spawnCodexViaTmux(opts: CodexLaunchOptions): SpawnedAgent {
 
   const sessionName = sessionNameFor(opts.taskId);
   // Defensive: a zombie session under this name would make new-session fail.
-  killSessionByName(sessionName);
+  await killSessionByName(sessionName);
 
   const tmux = resolveTmuxBin();
   const inner = `exec ${opts.argv.map(sq).join(" ")} < ${sq(promptPath)} > ${sq(logPath)} 2>&1`;
@@ -473,7 +519,7 @@ export function spawnCodexViaTmux(opts: CodexLaunchOptions): SpawnedAgent {
     ...envArgs,
     "--", "sh", "-c", inner,
   ];
-  const res = spawnSync(tmux, args, { encoding: "utf8" });
+  const res = await spawnTmuxNewSession(tmux, args);
 
   const state: CodexSessionState = {
     taskId: opts.taskId,
@@ -499,7 +545,7 @@ export function spawnCodexViaTmux(opts: CodexLaunchOptions): SpawnedAgent {
   if (res.status !== 0) {
     // tmux failed to launch the session — surface stderr and resolve failed
     // synchronously so the run doesn't hang in `running`.
-    const detail = (res.stderr || res.error?.message || "tmux new-session failed").trim();
+    const detail = (res.stderr || "tmux new-session failed").trim();
     opts.onChunk("stderr", `failed to start codex session: ${detail}`, undefined);
     const done = Promise.resolve(1);
     return { kill: () => { /* nothing to kill */ }, writeInput: () => false, done };
@@ -523,11 +569,24 @@ export function spawnCodexViaTmux(opts: CodexLaunchOptions): SpawnedAgent {
  * resolution code here is immaterial to the recorded status.
  */
 function killCodexState(state: CodexSessionState): void {
-  killSessionByName(state.sessionName);
-  setTimeout(() => {
-    flushCodexLog(state);
-    resolveCodexDone(state, state.lastCode ?? 1);
-  }, DEATH_GRACE_MS);
+  // `kill` is a synchronous `SpawnedAgent` field (shared contract in
+  // claude-tmux.ts), so the now-async tmux kill is fired-and-forgotten here
+  // rather than awaited — never left unhandled: a rejection still falls
+  // through to schedule the flush + resolve so the run can't hang.
+  void (async () => {
+    try {
+      await killSessionByName(state.sessionName);
+    } catch {
+      // best-effort — killSessionByName is expected to never throw (its
+      // underlying tmux() swallows spawn errors into an ok:false result),
+      // but this path must never leave the run stuck in `running` even if
+      // that changes.
+    }
+    setTimeout(() => {
+      flushCodexLog(state);
+      resolveCodexDone(state, state.lastCode ?? 1);
+    }, DEATH_GRACE_MS);
+  })();
 }
 
 export interface CodexReattachOptions {
@@ -546,8 +605,8 @@ export interface CodexReattachOptions {
  * resolves `done` when the turn finishes. Returns null when the session is no
  * longer alive (caller should orphan the run).
  */
-export function reattachCodexSession(opts: CodexReattachOptions): SpawnedAgent | null {
-  if (!sessionExistsByName(opts.sessionName)) return null;
+export async function reattachCodexSession(opts: CodexReattachOptions): Promise<SpawnedAgent | null> {
+  if (!(await sessionExistsByName(opts.sessionName))) return null;
   const state: CodexSessionState = {
     taskId: opts.taskId,
     runId: opts.runId,
@@ -587,11 +646,11 @@ export function codexSessionActive(taskId: string): boolean {
  * archiveTask and on a cross-kind agent switch. Safe to call when no codex
  * session exists (kills any stray session under the task's name too).
  */
-export function dropCodexSession(taskId: string): void {
+export async function dropCodexSession(taskId: string): Promise<void> {
   const state = codexSessions.get(taskId);
   if (state) {
     disposeCodexState(state);
     codexSessions.delete(taskId);
   }
-  killSessionByName(sessionNameFor(taskId));
+  await killSessionByName(sessionNameFor(taskId));
 }

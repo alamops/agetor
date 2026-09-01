@@ -13,7 +13,6 @@ import {
 } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
@@ -448,55 +447,69 @@ function startCursorTailer(state: CursorSessionState): Promise<number> {
     resolvePid: panePidFor,
   });
   let misses = 0;
+  // Guards a tick against overlapping the previous one now that the
+  // authoritative probe is awaited (no timeout — an owner decision, see
+  // docs/plans/fix-task-details-load-delay.md §8): without it, a stalled
+  // tmux round-trip could let a second 400ms tick start concurrently and
+  // double-count a `wait` outcome. The decision logic itself is unchanged.
+  let tickInFlight = false;
   state.deathTimer = setInterval(() => {
-    tryWatch();
-    // Compute the log-recency veto lazily — only a `gone` probe uses it.
-    const liveness = probe.probe();
-    const outcome = deathTickOutcome({
-      liveness,
-      logFresh: liveness === "gone" && fileWrittenWithin(state.logPath, DEATH_JSONL_QUIET_MS),
-      misses,
-      threshold: DEATH_MISS_THRESHOLD,
-    });
-    if (outcome === "reset") { misses = 0; return; }
-    if (outcome === "wait") { misses++; return; }
-    // Session gone. Give the FS a beat to surface the final bytes, flush, then
-    // decide clean-exit vs death before resolving.
-    setTimeout(() => {
-      flushCursorLog(state);
-      // If the final flush surfaced a terminal event (`result`),
-      // resolveCursorDone already fired — this was an orderly finish, not a
-      // death, so don't emit the "session ended" sentinel.
-      if (!state.resolved) {
-        // Check the exit-code sidecar FIRST: its presence means the hosting
-        // shell ran to completion and wrote `echo $?` before the tmux
-        // session went away — a clean process exit, just one that happened
-        // not to end in a `result` event (e.g. cursor-agent errored out
-        // before printing one). That's an ordinary failed/succeeded run,
-        // not a death, so it must NOT get the session-died sentinel (which
-        // the orchestrator maps to `blocked`, not the normal
-        // running->ready/review flow).
-        const exitCode = readCursorExitCode(state.runId);
-        if (exitCode !== null) {
-          if (exitCode !== 0) {
-            state.onChunk("stderr", `cursor-agent exited with code ${exitCode}`);
+    if (tickInFlight) return;
+    tickInFlight = true;
+    void (async () => {
+      try {
+        tryWatch();
+        // Compute the log-recency veto lazily — only a `gone` probe uses it.
+        const liveness = await probe.probe();
+        const outcome = deathTickOutcome({
+          liveness,
+          logFresh: liveness === "gone" && fileWrittenWithin(state.logPath, DEATH_JSONL_QUIET_MS),
+          misses,
+          threshold: DEATH_MISS_THRESHOLD,
+        });
+        if (outcome === "reset") { misses = 0; return; }
+        if (outcome === "wait") { misses++; return; }
+        // Session gone. Give the FS a beat to surface the final bytes, flush, then
+        // decide clean-exit vs death before resolving.
+        setTimeout(() => {
+          flushCursorLog(state);
+          // If the final flush surfaced a terminal event (`result`),
+          // resolveCursorDone already fired — this was an orderly finish, not a
+          // death, so don't emit the "session ended" sentinel.
+          if (!state.resolved) {
+            // Check the exit-code sidecar FIRST: its presence means the hosting
+            // shell ran to completion and wrote `echo $?` before the tmux
+            // session went away — a clean process exit, just one that happened
+            // not to end in a `result` event (e.g. cursor-agent errored out
+            // before printing one). That's an ordinary failed/succeeded run,
+            // not a death, so it must NOT get the session-died sentinel (which
+            // the orchestrator maps to `blocked`, not the normal
+            // running->ready/review flow).
+            const exitCode = readCursorExitCode(state.runId);
+            if (exitCode !== null) {
+              if (exitCode !== 0) {
+                state.onChunk("stderr", `cursor-agent exited with code ${exitCode}`);
+              }
+              resolveCursorDone(state, exitCode);
+              return;
+            }
+            // No exitfile: the session vanished before the shell could write
+            // one — a genuine crash / external kill / tmux server death. Emit
+            // the shared sentinel so the orchestrator flips the card to
+            // `blocked` (via makeChunkHandler) and the user sees WHY the run
+            // stopped in the stream, instead of a silent drop to `ready`.
+            state.onChunk(
+              "status",
+              `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`,
+            );
           }
-          resolveCursorDone(state, exitCode);
-          return;
-        }
-        // No exitfile: the session vanished before the shell could write
-        // one — a genuine crash / external kill / tmux server death. Emit
-        // the shared sentinel so the orchestrator flips the card to
-        // `blocked` (via makeChunkHandler) and the user sees WHY the run
-        // stopped in the stream, instead of a silent drop to `ready`.
-        state.onChunk(
-          "status",
-          `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`,
-        );
+          resolveCursorDone(state, state.lastCode ?? 1);
+        }, DEATH_GRACE_MS);
+        if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
+      } finally {
+        tickInFlight = false;
       }
-      resolveCursorDone(state, state.lastCode ?? 1);
-    }, DEATH_GRACE_MS);
-    if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
+    })();
   }, DEATH_POLL_MS);
 
   return done;
@@ -511,6 +524,39 @@ function startCursorTailer(state: CursorSessionState): Promise<number> {
  *  than reimplemented) from codex-tmux's convention so both drivers quote
  *  identically. */
 const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+
+/**
+ * Launch `tmux new-session` for cursor's detached hosting session. Async
+ * (`Bun.spawn` + `await proc.exited`) so this fork+exec never blocks the
+ * event loop that also serves the HTTP API — this used to be
+ * `node:child_process`'s `spawnSync`, which stalled every concurrent request
+ * for the duration of tmux's fork+exec (see
+ * docs/plans/fix-task-details-load-delay.md). No timeout, mirroring
+ * claude-tmux.ts's `tmux()` helper — an owner decision to keep behavior
+ * unchanged beyond removing the block. Never throws; a spawn failure (e.g.
+ * tmux not on PATH) folds into `stderr` the same way a non-zero exit does,
+ * so callers only need one failure branch.
+ */
+async function spawnTmuxNewSession(
+  tmux: string,
+  args: string[],
+): Promise<{ status: number | null; stderr: string }> {
+  try {
+    const proc = Bun.spawn([tmux, ...args], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const status = await proc.exited;
+    return { status, stderr: stderr.trim() };
+  } catch (e) {
+    return { status: null, stderr: (e as Error).message };
+  }
+}
 
 export interface CursorLaunchOptions {
   taskId: string;
@@ -565,7 +611,7 @@ export interface CursorLaunchOptions {
  * `sq` the same way codex-tmux escapes its paths; those paths are
  * agetor-generated (derived from `runId`), never user text.
  */
-export function spawnCursorViaTmux(opts: CursorLaunchOptions): SpawnedAgent {
+export async function spawnCursorViaTmux(opts: CursorLaunchOptions): Promise<SpawnedAgent> {
   ensureLogDir();
   const logPath = cursorLogPath(opts.runId);
   const promptPath = cursorPromptPath(opts.runId);
@@ -580,7 +626,7 @@ export function spawnCursorViaTmux(opts: CursorLaunchOptions): SpawnedAgent {
 
   const sessionName = sessionNameFor(opts.taskId);
   // Defensive: a zombie session under this name would make new-session fail.
-  killSessionByName(sessionName);
+  await killSessionByName(sessionName);
 
   const tmux = resolveTmuxBin();
   // The prompt never enters shell text: `"$(cat <promptfile>)"` is expanded
@@ -607,7 +653,7 @@ export function spawnCursorViaTmux(opts: CursorLaunchOptions): SpawnedAgent {
     ...envArgs,
     "--", "sh", "-c", inner, "sh", ...opts.argv,
   ];
-  const res = spawnSync(tmux, args, { encoding: "utf8" });
+  const res = await spawnTmuxNewSession(tmux, args);
 
   const state: CursorSessionState = {
     taskId: opts.taskId,
@@ -634,7 +680,7 @@ export function spawnCursorViaTmux(opts: CursorLaunchOptions): SpawnedAgent {
   if (res.status !== 0) {
     // tmux failed to launch the session — surface stderr and resolve failed
     // synchronously so the run doesn't hang in `running`.
-    const detail = (res.stderr || res.error?.message || "tmux new-session failed").trim();
+    const detail = (res.stderr || "tmux new-session failed").trim();
     opts.onChunk("stderr", `failed to start cursor session: ${detail}`, undefined);
     const done = Promise.resolve(1);
     return { kill: () => { /* nothing to kill */ }, writeInput: () => false, done };
@@ -659,11 +705,24 @@ export function spawnCursorViaTmux(opts: CursorLaunchOptions): SpawnedAgent {
  * resolution code here is immaterial to the recorded status.
  */
 function killCursorState(state: CursorSessionState): void {
-  killSessionByName(state.sessionName);
-  setTimeout(() => {
-    flushCursorLog(state);
-    resolveCursorDone(state, state.lastCode ?? 1);
-  }, DEATH_GRACE_MS);
+  // `kill` is a synchronous `SpawnedAgent` field (shared contract in
+  // claude-tmux.ts), so the now-async tmux kill is fired-and-forgotten here
+  // rather than awaited — never left unhandled: a rejection still falls
+  // through to schedule the flush + resolve so the run can't hang.
+  void (async () => {
+    try {
+      await killSessionByName(state.sessionName);
+    } catch {
+      // best-effort — killSessionByName is expected to never throw (its
+      // underlying tmux() swallows spawn errors into an ok:false result),
+      // but this path must never leave the run stuck in `running` even if
+      // that changes.
+    }
+    setTimeout(() => {
+      flushCursorLog(state);
+      resolveCursorDone(state, state.lastCode ?? 1);
+    }, DEATH_GRACE_MS);
+  })();
 }
 
 export interface CursorReattachOptions {
@@ -682,8 +741,8 @@ export interface CursorReattachOptions {
  * resolves `done` when the turn finishes. Returns null when the session is
  * no longer alive (caller should orphan the run).
  */
-export function reattachCursorSession(opts: CursorReattachOptions): SpawnedAgent | null {
-  if (!sessionExistsByName(opts.sessionName)) return null;
+export async function reattachCursorSession(opts: CursorReattachOptions): Promise<SpawnedAgent | null> {
+  if (!(await sessionExistsByName(opts.sessionName))) return null;
   const state: CursorSessionState = {
     taskId: opts.taskId,
     runId: opts.runId,
@@ -724,11 +783,11 @@ export function cursorSessionActive(taskId: string): boolean {
  * archiveTask and on a cross-kind agent switch. Safe to call when no cursor
  * session exists (kills any stray session under the task's name too).
  */
-export function dropCursorSession(taskId: string): void {
+export async function dropCursorSession(taskId: string): Promise<void> {
   const state = cursorSessions.get(taskId);
   if (state) {
     disposeCursorState(state);
     cursorSessions.delete(taskId);
   }
-  killSessionByName(sessionNameFor(taskId));
+  await killSessionByName(sessionNameFor(taskId));
 }
