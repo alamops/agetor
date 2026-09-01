@@ -925,7 +925,11 @@ test("reconcileTaskSession: model mirror closes the picker with Escape when the 
   try {
     await withRecordingTmuxBin(async (logPath) => {
       const before = tasks.get(taskId)!;
-      const after = { ...before, model: "fable-5" };
+      // fable-5.1, not fable-5: claudeModelPickerFamily("fable-5") is now
+      // null (superseded — the mirror never even starts for it), so only
+      // fable-5.1 still owns the "Fable" row and exercises this "picker is
+      // up but doesn't offer the target family" path at all.
+      const after = { ...before, model: "fable-5.1" };
       await reconcileTaskSession(taskId, before, after);
       await claudeTmux.__forTest.pasteChains.get(taskId);
 
@@ -939,7 +943,7 @@ test("reconcileTaskSession: model mirror closes the picker with Escape when the 
 
     const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
     expect(statusTexts.some((t) => t.startsWith("⚠️ model change not applied — target not offered"))).toBe(true);
-    expect(statusTexts.some((t) => t.includes("fable-5"))).toBe(true);
+    expect(statusTexts.some((t) => t.includes("fable-5.1"))).toBe(true);
   } finally {
     claudeTmux.__forTest.setCaptureConfirmPane(prevConfirmPane);
     claudeTmux.__forTest.setCapturePastePane(prevPastePane);

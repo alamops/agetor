@@ -231,6 +231,26 @@ test("claude-code 'mythos-5' maps to --model claude-mythos-5", () => {
   ]);
 });
 
+test("claude-code 'fable-5.1' maps to --model claude-fable-5-1", () => {
+  const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "fable-5.1", mode: "auto" });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-fable-5-1",
+    "--permission-mode", "auto",
+    "--", "do thing",
+  ]);
+});
+
+test("claude-code 'mythos-5.1' maps to --model claude-mythos-5-1", () => {
+  const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "mythos-5.1", mode: "auto" });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-mythos-5-1",
+    "--permission-mode", "auto",
+    "--", "do thing",
+  ]);
+});
+
 test("claude-code 'sonnet-5' maps to --model claude-sonnet-5", () => {
   const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "sonnet-5", mode: "auto" });
   expect(cmd).toEqual([
@@ -252,7 +272,7 @@ test("claude-code 'sonnet-5' maps to --model claude-sonnet-5", () => {
 test("claudeModelPickerFamily maps each current-release id to its picker row family", () => {
   expect(claudeModelPickerFamily("opus-5")).toBe("Opus");
   expect(claudeModelPickerFamily("sonnet-5")).toBe("Sonnet");
-  expect(claudeModelPickerFamily("fable-5")).toBe("Fable");
+  expect(claudeModelPickerFamily("fable-5.1")).toBe("Fable");
   expect(claudeModelPickerFamily("haiku-4.5")).toBe("Haiku");
 });
 
@@ -264,8 +284,11 @@ test("claudeModelPickerFamily returns null for ids the picker's single per-famil
   expect(claudeModelPickerFamily("opus-4.7")).toBeNull();
   expect(claudeModelPickerFamily("opus-4.6")).toBeNull();
   expect(claudeModelPickerFamily("sonnet-4.6")).toBeNull();
-  // No picker row at all for this one.
+  // fable-5 is now superseded by fable-5.1 — same "wrong version" hazard.
+  expect(claudeModelPickerFamily("fable-5")).toBeNull();
+  // No picker row at all for either Mythos id.
   expect(claudeModelPickerFamily("mythos-5")).toBeNull();
+  expect(claudeModelPickerFamily("mythos-5.1")).toBeNull();
   // Unknown/future raw id — never guess.
   expect(claudeModelPickerFamily("claude-opus-6")).toBeNull();
   // Empty string.

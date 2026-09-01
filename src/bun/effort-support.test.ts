@@ -4,6 +4,7 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   cursorModelArg,
+  cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
   supportedEfforts,
@@ -78,6 +79,18 @@ test("claude fable-5 supports xhigh + max", () => {
 
 test("claude mythos-5 supports xhigh + max", () => {
   const ids = supportedEfforts("claude-code", "mythos-5").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("max");
+});
+
+test("claude fable-5.1 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "fable-5.1").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("max");
+});
+
+test("claude mythos-5.1 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "mythos-5.1").map((o) => o.id);
   expect(ids).toContain("xhigh");
   expect(ids).toContain("max");
 });
@@ -220,6 +233,24 @@ test("cursorModelArg composes known model, effort, and fast variants", () => {
   expect(cursorModelArg("cursor-grok-4.6", null, false)).toBe("cursor-grok-4.6-high");
   expect(cursorModelArg("cursor-grok-4.6", "xhigh", true)).toBe("cursor-grok-4.6-xhigh-fast");
   expect(cursorModelArg("cursor-grok-4.6", "low", false)).toBe("cursor-grok-4.6-low");
+});
+
+test("cursor Fable 5.1 exposes the full max/xhigh/high/medium/low ladder", () => {
+  const ids = supportedEfforts("cursor", "claude-fable-5-1").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+});
+
+test("cursorModelArg composes Fable 5.1 efforts with no -fast variant (catalog has none)", () => {
+  expect(cursorModelArg("claude-fable-5-1", "xhigh", false)).toBe("claude-fable-5-1-xhigh");
+  // fast never composes for this model — no fastEfforts entry in the catalog.
+  expect(cursorModelArg("claude-fable-5-1", "high", true)).toBe("claude-fable-5-1-high");
+  expect(cursorModelSupportsFast("claude-fable-5-1", "high")).toBe(false);
+  // Max-Mode bracket syntax omits `fast=` since fastEfforts is absent.
+  expect(cursorModelArg("claude-fable-5-1", "xhigh", false, true)).toBe("claude-fable-5-1[context=1m,effort=xhigh]");
+});
+
+test("cursorModelIdCoveredByCatalog recognizes a Fable 5.1 effort variant", () => {
+  expect(cursorModelIdCoveredByCatalog("claude-fable-5-1-high")).toBe(true);
 });
 
 test("cursor supportedModes returns the auto/ask pair (no per-model mode carve-outs)", () => {
