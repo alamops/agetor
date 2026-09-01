@@ -155,8 +155,9 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
       discovered: discoveredForAgent,
       selected: model,
       scoped: CATALOG_SCOPED_KINDS.has(kind),
+      loggedIn: selectedStatus?.loggedIn ?? null,
     });
-  }, [staticModels, harnessModels, agentModels, agent, kind, model]);
+  }, [staticModels, harnessModels, agentModels, agent, kind, model, selectedStatus?.loggedIn]);
   const efforts = supportedEfforts(kind, model);
 
   useEffect(() => {

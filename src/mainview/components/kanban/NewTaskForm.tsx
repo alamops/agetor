@@ -334,6 +334,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
     discovered: discoveredForAgent,
     selected: model,
     scoped: CATALOG_SCOPED_KINDS.has(kind),
+    loggedIn: selectedStatus?.loggedIn ?? null,
   });
   // Effort options depend on both kind and model — re-derived each render
   // so a model switch immediately narrows the dropdown. When the new model

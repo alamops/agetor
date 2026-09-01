@@ -245,7 +245,7 @@ async function wizard(
 
   // Load harnesses + saved preferences once, for the agent / model / mode /
   // effort defaults — so the common picks are a single Enter.
-  const { harnesses } = await client
+  const { harnesses, statuses } = await client
     .listHarnesses()
     .catch(() => ({ harnesses: [], statuses: [] }));
   const prefs = await client.getPreferences().catch(() => ({}) as Record<string, string>);
@@ -291,6 +291,7 @@ async function wizard(
       discovered: catalog,
       selected: initial,
       scoped: CATALOG_SCOPED_KINDS.has(kind),
+      loggedIn: statuses.find((s) => s.harnessId === agent)?.loggedIn ?? null,
     });
     const picked = await pickOption("Model", options, initial);
     if (picked === null) return cancelled();

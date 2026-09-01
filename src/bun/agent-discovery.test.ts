@@ -123,6 +123,27 @@ test("parseFxModels: empty string / non-JSON input -> [] without throwing", () =
   expect(__testing.parseFxModels("{not even valid json")).toEqual([]);
 });
 
+test("parseFxModels: full 0.0.7-shaped `models --json` payload (kind/count/shown_count/more_count/private_models_hidden) -> ids parsed, extra fields ignored", () => {
+  // Real fx 0.0.7 wraps `ids` in envelope metadata parseFxModels never reads
+  // (only `ids` is read, matching every JSON-parsing probe's
+  // unknown-fields-are-fine contract) — this is an explicit tolerance
+  // assertion, not just a shape check.
+  const payload = {
+    kind: "models",
+    count: 234,
+    shown_count: 234,
+    more_count: 0,
+    private_models_hidden: true,
+    ids: ["zai/glm-5.3-flash", "openai/gpt-5.2", "anthropic/claude-sonnet-5"],
+  };
+  const parsed = __testing.parseFxModels(JSON.stringify(payload));
+  expect(parsed.map((m) => m.id)).toEqual([
+    "zai/glm-5.3-flash",
+    "openai/gpt-5.2",
+    "anthropic/claude-sonnet-5",
+  ]);
+});
+
 /* ── fx: discoverFx (exercised indirectly via refreshDiscoveredModels +
  * getDiscoveredModels, since discoverFx itself isn't exported — same
  * pattern the codex CLI-missing test above uses) ───────────────────────── */

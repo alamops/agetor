@@ -509,7 +509,20 @@ test.describe("task from a Git issue", () => {
     // a `translate-x-full` CSS transform), so `toBeHidden()` never fires —
     // wait for that class instead, which is what actually clears it from the
     // click's hit-test.
-    await page.keyboard.press("Escape");
+    //
+    // Close via the header button, NOT `keyboard.press("Escape")`: the
+    // panel's document-level Escape listener is gated on RunPanel's `open`
+    // state, which flips true only in a requestAnimationFrame scheduled a
+    // render after `mountedTask` commits (mount at translate-x-full, then
+    // animate in). The textarea/view-issue visibility waits above resolve
+    // before that rAF fires — `toBeVisible()` ignores transforms — so under
+    // full-suite CPU load a single Escape can land in the window where no
+    // listener is attached yet and the panel never closes (observed as a
+    // 20s timeout load-flake). The button's `onClick={onClose}` is wired
+    // unconditionally on an always-rendered element, so the click is
+    // race-free regardless of rAF timing (same pattern as
+    // unread-indicator.spec.ts).
+    await page.getByRole("button", { name: "Close task panel" }).click();
     await expect(panel).toHaveClass(/translate-x-full/, { timeout: CONVERGE_TIMEOUT });
 
     // Context menu also offers "View issue", and it reopens the Git dialog

@@ -285,6 +285,156 @@ test("a non-fx kind never populates loggedIn/authHelp (stays null even when avai
   expect(status.authHelp).toBeNull();
 });
 
+// --- fx status --json expired-login gate (0.0.7+) ---------------------------
+// New in 0.0.7: a login-style `auth` value (not "missing", not an env-key
+// value) can also read as logged-out when `auth_expired === true` AND
+// `auth_refreshable === false` — both strict booleans. Every other shape
+// (absent fields, a refreshable expiry, or a non-boolean value on either
+// field) stays fail-open (loggedIn:true), exactly as pre-0.0.7. Env-key auth
+// (`AI_GATEWAY_API_KEY`/`VERCEL_OIDC_TOKEN`) is exempt from this gate
+// entirely — see agent-status.ts's probeStatus doc comment.
+
+test("fx status --json expired + non-refreshable login, no auth_help -> loggedIn:false, fallback expired-login text", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":true,"auth_refreshable":false}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(false);
+  // Exact fallback string from probeStatus (agent-status.ts) — asserted
+  // verbatim so a future copy edit there is caught here too.
+  expect(status.authHelp).toBe("fx login has expired — run fx login to sign in again.");
+});
+
+test("fx status --json expired + non-refreshable login, with auth_help -> authHelp verbatim from fx", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":true,"auth_refreshable":false,"auth_help":"custom fx text"}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(false);
+  expect(status.authHelp).toBe("custom fx text");
+});
+
+test("fx status --json expired but still refreshable -> stays fail-open, loggedIn:true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":true,"auth_refreshable":true}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json 0.0.6-shaped payload (auth_expired/auth_refreshable absent entirely) -> loggedIn:true (pre-0.0.7 regression)", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(`echo '{"auth":"fx login"}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test('fx status --json auth_expired is a non-boolean string ("yes") -> fails open, loggedIn:true', async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":"yes","auth_refreshable":false}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json auth_expired is a non-boolean number (1) -> fails open, loggedIn:true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":1,"auth_refreshable":false}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test('fx status --json auth_refreshable is a non-boolean string ("false") -> fails open, loggedIn:true', async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":true,"auth_refreshable":"false"}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json auth_refreshable is a non-boolean number (0) -> fails open, loggedIn:true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":true,"auth_refreshable":0}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json auth:AI_GATEWAY_API_KEY is exempt from the expired-login gate -> always loggedIn:true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"AI_GATEWAY_API_KEY","auth_expired":true,"auth_refreshable":false}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json auth:VERCEL_OIDC_TOKEN is exempt from the expired-login gate -> always loggedIn:true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"VERCEL_OIDC_TOKEN","auth_expired":true,"auth_refreshable":false}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+/**
+ * A realistic full 0.0.7 `status --json` payload — the additive fields real
+ * fx 0.0.7 emits (`mcp`, `mcp_config_warning`, `team`, plus ordinary account/
+ * config metadata) alongside the fields probeStatus actually reads (`auth`,
+ * `auth_help`, `auth_expired`, `auth_refreshable`). Every unread field must be
+ * silently ignored (probeStatus's unknown-fields-are-fine contract) rather
+ * than causing a parse failure or a fail-open result.
+ */
+function fullFxStatusPayload(authRefreshable: boolean): string {
+  return JSON.stringify({
+    version: "0.0.7",
+    auth: "fx login",
+    auth_help: null,
+    auth_expired: true,
+    auth_refreshable: authRefreshable,
+    team: "acme",
+    account: "user@example.com",
+    default_model: "zai/glm-5.3-flash",
+    config_path: "/home/user/.fx/config.json",
+    log_file: "/home/user/.fx/logs/fx.log",
+    sandbox: "none",
+    updated_at: "2026-08-31T00:00:00Z",
+    mcp: {
+      connection_check: "not_checked",
+      servers: [],
+      configuration_issues: [],
+      inspection_error: null,
+    },
+    mcp_config_warning: null,
+  });
+}
+
+test("fx status --json full realistic 0.0.7 payload (mcp/team/etc additive fields) with auth_refreshable:true -> parses fine, loggedIn:true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(`echo '${fullFxStatusPayload(true)}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json full realistic 0.0.7 payload with auth_refreshable:false -> parses fine, loggedIn:false", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(`echo '${fullFxStatusPayload(false)}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(false);
+  // auth_help is explicitly `null` in this payload (a real fx omitting a
+  // string there), so probeStatus's fallback text kicks in.
+  expect(status.authHelp).toBe("fx login has expired — run fx login to sign in again.");
+});
+
 // --- fx status cache (getCachedStatus / statusCache in agent-status.ts) ----
 // `checkHarness`'s fx-only auth pre-flight spawns `fx status --json`. Without
 // memoization the 15s `/harnesses` poll (App.tsx's checkAllHarnesses) would

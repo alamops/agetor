@@ -214,14 +214,16 @@ export interface HarnessStatus {
   /**
    * Login state, when the kind's probe can determine it cheaply and without
    * side effects — today only fx (`fx status --json` reports `auth`). Strictly
-   * fail-open: `false` ONLY when the probe positively reported "missing";
-   * `true` for any other reported value; `null` when the kind has no login
-   * probe, the probe failed, or its output wasn't parseable — `null` must
-   * never block a run.
+   * fail-open: `false` ONLY when the probe positively reported `auth:
+   * "missing"`, or (fx 0.0.7+) an expired non-refreshable login
+   * (`auth_expired === true && auth_refreshable === false`); `true` for any
+   * other reported value; `null` when the kind has no login probe, the probe
+   * failed, or its output wasn't parseable — `null` must never block a run.
    */
   loggedIn: boolean | null;
-  /** The CLI's own login guidance (verbatim, e.g. fx's `auth_help`) when
-   *  `loggedIn === false`; otherwise null. */
+  /** Login guidance when `loggedIn === false`: fx's own `auth_help` when the
+   *  probe supplies one, else one of agetor's two synthesized fallback hints
+   *  (missing credentials vs. an expired login); otherwise null. */
   authHelp: string | null;
 }
 
@@ -1316,6 +1318,11 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // gemini-3.1-pro-preview, kimi-k3) stay one click away in the picker as
   // catalog-gated rows — offered only when the signed-in account's catalog
   // actually contains them (see `AgentOption.catalogOnly`).
+  // Re-verified 2026-08-31 on fx 0.0.7: compiled default unchanged
+  // (moonshotai/kimi-k3 via empty-HOME `fx status --json`), zai/glm-5.3-flash
+  // still present in the (grown to 234-id) unauth catalog — the reference
+  // signed-in 158-id account could not be re-checked this pass (expired
+  // login token).
   "fx": "zai/glm-5.3-flash",
 };
 
@@ -1968,6 +1975,9 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // `AgentOption.catalogOnly`, `CATALOG_SCOPED_KINDS`). Discovered-only ids
     // (neither list) append via `mergeModelOptions`
     // (`src/shared/model-options.ts`).
+    // Re-verified 2026-08-31 on fx 0.0.7 (unauth view: all 16 standard + 5
+    // catalogOnly ids present, catalog grown to 234; signed-in view
+    // unverifiable this pass — token expired).
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },

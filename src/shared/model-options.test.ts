@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   type CuratedModel,
   type DiscoveredModel,
+  type ModelOption,
   hasDiscoveredCatalog,
   mergeModelOptions,
 } from "./model-options.ts";
@@ -234,6 +235,107 @@ test("mergeModelOptions returns a fresh array each call, not a shared reference"
   const b = mergeModelOptions({ curated, discovered, scoped: false, selected: null });
   expect(a).not.toBe(b);
   expect(a).toEqual(b);
+});
+
+// --- rule 7: loggedIn:false distrusts the discovered catalog ------------
+
+test("rule 7: loggedIn:false with a catalogOnly-containing discovered catalog (scoped) matches the discovery-empty fallback", () => {
+  const curated = curatedFixture();
+  const discovered: DiscoveredModel[] = [
+    { id: "zai/glm-5.3-flash" },
+    { id: "anthropic/claude-opus-5" },
+    { id: "e2e/discovered-only" },
+  ];
+  const loggedOut = mergeModelOptions({ curated, discovered, scoped: true, selected: null, loggedIn: false });
+  const fallback = mergeModelOptions({ curated, discovered: [], scoped: true, selected: null });
+  expect(loggedOut).toEqual(fallback);
+  expect(loggedOut).toEqual([
+    { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default" },
+    { id: "openai/gpt-5.2", label: "GPT-5.2" },
+  ]);
+});
+
+test("rule 7: loggedIn:false with a catalogOnly-containing discovered catalog (unscoped) matches the discovery-empty fallback", () => {
+  const curated = curatedFixture();
+  const discovered: DiscoveredModel[] = [
+    { id: "openai/gpt-5.2" },
+    { id: "anthropic/claude-opus-5" },
+    { id: "google/gemini-3.1-pro-preview" },
+    { id: "e2e/discovered-only" },
+  ];
+  const loggedOut = mergeModelOptions({ curated, discovered, scoped: false, selected: null, loggedIn: false });
+  const fallback = mergeModelOptions({ curated, discovered: [], scoped: false, selected: null });
+  expect(loggedOut).toEqual(fallback);
+  expect(loggedOut).toEqual([
+    { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default" },
+    { id: "openai/gpt-5.2", label: "GPT-5.2" },
+  ]);
+});
+
+test("rule 7: loggedIn:false still appends a selected discovered-only id as unlisted (rule 6 survives the distrust)", () => {
+  const curated = curatedFixture();
+  const discovered: DiscoveredModel[] = [
+    { id: "zai/glm-5.3-flash" },
+    { id: "e2e/discovered-only" },
+  ];
+  const result = mergeModelOptions({
+    curated,
+    discovered,
+    scoped: true,
+    selected: "e2e/discovered-only",
+    loggedIn: false,
+  });
+  expect(result).toEqual([
+    { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default" },
+    { id: "openai/gpt-5.2", label: "GPT-5.2" },
+    {
+      id: "e2e/discovered-only",
+      label: "e2e/discovered-only",
+      hint: "Not logged in — this account's catalog is unavailable",
+      unlisted: true,
+    },
+  ]);
+});
+
+test("rule 7: loggedIn true/null/omitted are all identical to today's (unchanged) behavior — unscoped", () => {
+  // Explicit-literal pin for the unscoped case, kept alongside the looped
+  // assertion below so the scoped/unscoped pair can't both silently drift.
+  const curated = curatedFixture();
+  const discovered: DiscoveredModel[] = [
+    { id: "openai/gpt-5.2" },
+    { id: "anthropic/claude-opus-5" },
+    { id: "e2e/discovered-only" },
+  ];
+  const withTrue = mergeModelOptions({ curated, discovered, scoped: false, selected: null, loggedIn: true });
+  const withNull = mergeModelOptions({ curated, discovered, scoped: false, selected: null, loggedIn: null });
+  const omitted = mergeModelOptions({ curated, discovered, scoped: false, selected: null });
+  const expected: ModelOption[] = [
+    { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default" },
+    { id: "openai/gpt-5.2", label: "GPT-5.2" },
+    { id: "anthropic/claude-opus-5", label: "Claude Opus 5", hint: "Premium" },
+    { id: "e2e/discovered-only", label: "e2e/discovered-only" },
+  ];
+  expect(withTrue).toEqual(expected);
+  expect(withNull).toEqual(expected);
+  expect(omitted).toEqual(expected);
+});
+
+test("rule 7: loggedIn true/null/omitted are all identical to today's (unchanged) behavior — scoped and unscoped", () => {
+  const curated = curatedFixture();
+  const discovered: DiscoveredModel[] = [
+    { id: "openai/gpt-5.2" },
+    { id: "anthropic/claude-opus-5" },
+    { id: "e2e/discovered-only" },
+  ];
+  for (const scoped of [true, false]) {
+    const expected = mergeModelOptions({ curated, discovered, scoped, selected: null });
+    const withTrue = mergeModelOptions({ curated, discovered, scoped, selected: null, loggedIn: true });
+    const withNull = mergeModelOptions({ curated, discovered, scoped, selected: null, loggedIn: null });
+    const omitted = mergeModelOptions({ curated, discovered, scoped, selected: null });
+    expect(withTrue).toEqual(expected);
+    expect(withNull).toEqual(expected);
+    expect(omitted).toEqual(expected);
+  }
 });
 
 // --- hasDiscoveredCatalog -------------------------------------------------
