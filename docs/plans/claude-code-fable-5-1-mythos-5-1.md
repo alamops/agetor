@@ -83,6 +83,6 @@ Add Claude **Fable 5.1** and **Mythos 5.1** as selectable claude-code models, an
 
 ## 8. Open questions / assumptions
 
-- Assumption: claude's `/model` picker Fable family row on ≥2.1.257 selects Fable 5.1 (evidence: binary bundles `claude-fable-5-1`; not smoke-driven live). Mitigated by stdout drift-correction; worth a one-line release-notes check on the next dogfood run.
+- ~~Assumption~~ **Confirmed (2026-09-01)**: claude's `/model` picker Fable family row on ≥2.1.257 selects Fable 5.1 — the Claude Code CHANGELOG for 2.1.257 reads "Added Claude Fable 5.1 (`claude-fable-5-1`), now the default Fable model — 1M context", and the model-config docs state the `fable` alias "resolves to the recommended Fable version for your provider and updates over time". Carve-out that doesn't affect agetor: Claude apps *gateway* sessions keep `fable`/`best` resolving to Fable 5 for now (unconfigured gateways reject 5.1); agetor spawns the local CLI, not gateway sessions.
 - Assumption: Mythos 5.1 effort surface = Fable 5.1 (claude-api skill states same API surface).
 - Cursor Mythos excluded — not in the measured catalog (evidence-based, not deferred work).
