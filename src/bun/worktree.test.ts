@@ -311,6 +311,31 @@ test("gitWritableRoots returns [] for a non-git directory", async () => {
   expect(await gitWritableRoots(dir)).toEqual([]);
 });
 
+// Async-conversion regression guard (gitWritableRootsSync -> gitWritableRoots):
+// prove several calls can genuinely be in flight together and each still
+// resolves with its own correct, independent result — rather than requiring
+// a caller to serialize them one at a time the way a sync spawn effectively
+// would. Deliberately no wall-clock assertion (documented flake class for
+// fake-tmux/subprocess timing in this repo) — Promise.all + result equality
+// is the whole check.
+test("gitWritableRoots resolves correctly when several calls are in flight concurrently (no serialization required)", async () => {
+  const { prepareWorkdir, gitWritableRoots } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const wt = await prepareWorkdir(fakeTask({ workdir: repo }));
+  if ("error" in wt) throw new Error(wt.error);
+  const nonGit = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit3-"));
+
+  const [linkedRoots, plainRoots, nonGitRoots] = await Promise.all([
+    gitWritableRoots(wt.cwd),
+    gitWritableRoots(repo),
+    gitWritableRoots(nonGit),
+  ]);
+  expect(linkedRoots).toHaveLength(1);
+  expect(path.basename(linkedRoots[0]!)).toBe(".git");
+  expect(plainRoots).toEqual([]);
+  expect(nonGitRoots).toEqual([]);
+});
+
 // End-to-end wiring of the codex spawn path: buildCodexCommand resolves the
 // cwd's external git dirs and feeds them to buildCommand's sandbox decision.
 // This is the seam spawnAgent uses; covering it here (where real worktrees

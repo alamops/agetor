@@ -284,6 +284,94 @@ test("ensureInstalled: strips permission entries claude's parser would reject (o
   expect(settings.permissions.allow).toEqual(["Bash(git status)", "Edit(/repo/src/**)"]);
 });
 
+test("ensureInstalledMerged / ensureInstalled / ensureInstalledForCwd all resolve { settingsFile } pointing at the exact settings.local.json path", async () => {
+  const { ensureInstalledMerged, ensureInstalled, ensureInstalledForCwd } = await import("./hook-installer.ts");
+
+  const cwd1 = makeCwd();
+  const r1 = await ensureInstalledMerged(cwd1);
+  expect(r1).toEqual({ settingsFile: path.join(cwd1, ".claude", "settings.local.json") });
+
+  const cwd2 = makeCwd();
+  const r2 = await ensureInstalled(cwd2);
+  expect(r2).toEqual({ settingsFile: path.join(cwd2, ".claude", "settings.local.json") });
+
+  const owned = path.join(process.env.AGETOR_DATA_DIR!, "worktrees", "shape-task");
+  require("node:fs").mkdirSync(owned, { recursive: true });
+  const r3 = await ensureInstalledForCwd(owned, "ask");
+  expect(r3).toEqual({ settingsFile: path.join(owned, ".claude", "settings.local.json") });
+});
+
+test("ensureInstalled (owned worktree): overwrites malformed JSON instead of refusing — the self-heal branch ensureInstalledMerged's refuse path deliberately does NOT take", async () => {
+  const { ensureInstalled } = await import("./hook-installer.ts");
+  const owned = path.join(process.env.AGETOR_DATA_DIR!, "worktrees", "malformed-task");
+  const dir = path.join(owned, ".claude");
+  require("node:fs").mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "settings.local.json");
+  writeFileSync(file, "{ this is not json");
+
+  const result = await ensureInstalled(owned);
+  expect(result).not.toBeNull();
+  const settings = JSON.parse(readFileSync(file, "utf8")) as {
+    hooks?: { PreToolUse?: unknown[] };
+    mcpServers?: Record<string, unknown>;
+  };
+  expect(settings.hooks?.PreToolUse).toBeUndefined();
+  expect(settings.mcpServers).toBeUndefined();
+});
+
+test("ensureInstalled (owned worktree): overwrites a malformed JSON array too (the non-object shape ensureInstalledMerged refuses on)", async () => {
+  const { ensureInstalled } = await import("./hook-installer.ts");
+  const owned = path.join(process.env.AGETOR_DATA_DIR!, "worktrees", "malformed-array-task");
+  const dir = path.join(owned, ".claude");
+  require("node:fs").mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "settings.local.json");
+  writeFileSync(file, JSON.stringify([1, 2, 3]));
+
+  const result = await ensureInstalled(owned);
+  expect(result).not.toBeNull();
+  const settings = JSON.parse(readFileSync(file, "utf8"));
+  expect(Array.isArray(settings)).toBe(false);
+});
+
+test("writeJsonAtomic leaves exactly one file behind — no leftover *.tmp.<pid>.<random> artifact after a successful install", async () => {
+  const { ensureInstalled } = await import("./hook-installer.ts");
+  const cwd = makeCwd();
+  await ensureInstalled(cwd);
+  const dir = path.join(cwd, ".claude");
+  const entries: string[] = require("node:fs").readdirSync(dir);
+  expect(entries).toEqual(["settings.local.json"]);
+});
+
+test("writeJsonAtomic: concurrent installs against the same file never leave it partially written, and no racer's temp file survives", async () => {
+  // Each concurrent ensureInstalledMerged call reads the file, computes its
+  // own merge, writes to its OWN uniquely-named temp file (pid + random
+  // suffix — see writeJsonAtomic), then renames onto the shared target.
+  // POSIX rename is atomic, so however the five calls interleave, the final
+  // file must always be exactly one complete writer's output — never a torn
+  // read of two writes at once, and never left as a stray tempfile.
+  const { ensureInstalledMerged } = await import("./hook-installer.ts");
+  const cwd = makeCwd();
+  const dir = path.join(cwd, ".claude");
+  require("node:fs").mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "settings.local.json");
+  // Give every racer something non-trivial to preserve, so a torn write
+  // would be obviously wrong rather than accidentally matching `{}`.
+  writeFileSync(file, JSON.stringify({ permissions: { allow: ["Bash(git status)"] } }));
+
+  const results = await Promise.all(
+    Array.from({ length: 5 }, () => ensureInstalledMerged(cwd)),
+  );
+  expect(results.every((r) => r !== null)).toBe(true);
+
+  const raw = readFileSync(file, "utf8");
+  expect(() => JSON.parse(raw)).not.toThrow(); // never truncated/interleaved
+  const final = JSON.parse(raw) as { permissions: { allow: string[] } };
+  expect(final.permissions.allow).toEqual(["Bash(git status)"]);
+
+  const entries: string[] = require("node:fs").readdirSync(dir);
+  expect(entries).toEqual(["settings.local.json"]); // every racer's tempfile was renamed away, none abandoned
+});
+
 test("ensureInstalledMerged: does NOT strip a user repo's own permission entries", async () => {
   // The user's source repo (isolation=none) — we strip our stale entries but
   // must never silently delete the user's version-controlled rules, even ones
