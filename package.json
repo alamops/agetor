@@ -1,6 +1,6 @@
 {
   "name": "agetor",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Local agent orchestrator with a kanban view — runs Claude Code, Codex and other CLI agents on tasks you create.",
   "type": "module",
   "private": true,
