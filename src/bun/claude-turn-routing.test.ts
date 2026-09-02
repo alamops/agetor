@@ -80,6 +80,40 @@ function readLog(logPath: string): Array<{ argv: string[]; stdin?: string }> {
 }
 
 /**
+ * Poll `readLog(logPath)` until some entry's argv contains `token`, or
+ * `maxMs` elapses. Every tmux op in these fixtures now costs a real
+ * fork+exec (`tmux()` moved off `Bun.spawnSync` — see
+ * docs/plans/fix-task-details-load-delay.md), and with several independent
+ * pollers (death-watch, boot-wait, the deferred-paste chain itself) now
+ * running concurrently instead of serialized on one blocking thread, the
+ * wall-clock cost of a given chain reaching this fixture's process is both
+ * higher and noisier than the old fully-synchronous world. Polling for the
+ * actual recorded op (rather than sleeping a fixed guess) avoids asserting a
+ * tight wall-clock bound — see the flake class this repo already documents:
+ * never assert a fixed sleep is enough for a fake-tmux spawn chain to
+ * settle; either poll for the recorded outcome or use a >=5x margin.
+ */
+async function waitForLog(logPath: string, token: string, maxMs = 4000): Promise<Array<{ argv: string[]; stdin?: string }>> {
+  const deadline = Date.now() + maxMs;
+  for (;;) {
+    const entries = readLog(logPath);
+    if (entries.some((e) => e.argv.includes(token)) || Date.now() >= deadline) return entries;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+/** General-purpose poll: same rationale as `waitForLog`, for conditions that
+ *  aren't a logged tmux invocation (e.g. a run row's status settling). */
+async function waitUntil(check: () => boolean, maxMs = 4000): Promise<boolean> {
+  const deadline = Date.now() + maxMs;
+  for (;;) {
+    if (check()) return true;
+    if (Date.now() >= deadline) return check();
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+/**
  * Write an executable fake tmux for the deferred-large-prompt regression
  * tests below. Unlike `fakeRoutingTmuxBin` (a single fixed `has-session`
  * verdict for the whole test), this stub needs to answer `has-session`
@@ -386,7 +420,7 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
   // Make claude's composer look immediately idle so the deferred-paste
   // readiness gate (`readPaneMode`, which reads via this seam) fires on its
   // first poll instead of spinning toward DEFERRED_PROMPT_TIMEOUT_MS (30s).
-  const prevCapture = __forTest.setCaptureModePane(() => "? for shortcuts");
+  const prevCapture = __forTest.setCaptureModePane(async () => "? for shortcuts");
   const prevGap = __forTest.setBracketedEnterGapMs(0);
   const prevSettle = __forTest.setSlashCommandSettleMs(0);
 
@@ -443,10 +477,11 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
     const newRunId = result.runId;
 
     // Let the spawn + the fire-and-forget deferred-paste chain run their
-    // course (readiness is immediate given the captureModePane stub above,
-    // so this only needs to cover a handful of synchronous tmux round-trips,
-    // not the real 30s timeout).
-    await new Promise((r) => setTimeout(r, 800));
+    // course. Poll for the final `send-keys Enter` rather than sleeping a
+    // fixed guess — see `waitForLog`'s doc for why a flat sleep here is the
+    // documented flake class now that every tmux op is a real fork+exec
+    // running alongside other concurrent pollers (death-watch, boot-wait).
+    await waitForLog(logPath, "send-keys");
 
     const entries = readLog(logPath);
 
@@ -522,7 +557,7 @@ test("cancelling a run while its large prompt is deferred (composer never confir
   // loop's readiness gate (`readPaneMode`) never fires, so it sits in its
   // poll loop exactly like a launch whose claude session is slow to boot.
   // This is the window a Stop click needs to land in for the bug to repro.
-  const prevCapture = __forTest.setCaptureModePane(() => "");
+  const prevCapture = __forTest.setCaptureModePane(async () => "");
   const prevGap = __forTest.setBracketedEnterGapMs(0);
   const prevSettle = __forTest.setSlashCommandSettleMs(0);
 
@@ -580,7 +615,7 @@ test("cancelling a run while its large prompt is deferred (composer never confir
     // IIFE reach its poll loop (composer stays "" so it never breaks out).
     await new Promise((r) => setTimeout(r, 150));
 
-    expect(cancelRun(newRunId)).toBe(true);
+    expect(await cancelRun(newRunId)).toBe(true);
 
     // Let the poll loop wake at least once (DEFERRED_PROMPT_POLL_MS = 400ms)
     // after the cancel and observe the slot is gone.
@@ -589,7 +624,7 @@ test("cancelling a run while its large prompt is deferred (composer never confir
     // Now flip the composer to "ready" — if the abort check were missing,
     // the very next poll tick would go ahead and paste. Give it another
     // full poll interval to prove it doesn't.
-    __forTest.setCaptureModePane(() => "? for shortcuts");
+    __forTest.setCaptureModePane(async () => "? for shortcuts");
     await new Promise((r) => setTimeout(r, 700));
 
     const entries = readLog(logPath);
@@ -684,7 +719,7 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
   // Make the composer look immediately idle so the deferred-paste loop fires
   // its (doomed) paste attempt right away instead of spinning toward the
   // 30s timeout.
-  const prevCapture = __forTest.setCaptureModePane(() => "? for shortcuts");
+  const prevCapture = __forTest.setCaptureModePane(async () => "? for shortcuts");
   const prevGap = __forTest.setBracketedEnterGapMs(0);
   const prevSettle = __forTest.setSlashCommandSettleMs(0);
 
@@ -740,8 +775,10 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
 
     // Let the spawn + the fire-and-forget deferred-paste chain run their
     // course, including the doomed load-buffer call and its failure
-    // handling.
-    await new Promise((r) => setTimeout(r, 800));
+    // handling. Poll for the run settling rather than a fixed sleep — see
+    // `waitForLog`'s doc for why a flat wait over a fake-tmux spawn chain is
+    // the documented flake class now that `tmux()` is a real fork+exec.
+    await waitUntil(() => runs.listForTask(taskId).find((r) => r.id === newRunId)?.status !== "running");
 
     const entries = readLog(logPath);
     expect(entries.some((e) => e.argv.includes("load-buffer"))).toBe(true);
@@ -880,7 +917,13 @@ test("spawnClaudeViaTmux pins state.launchEffort from CLAUDE_CODE_EFFORT_LEVEL i
   writeFileSync(jsonlPath, "");
 
   try {
-    const agent = spawnClaudeViaTmux({
+    // spawnClaudeViaTmux is itself async now (killTaskSession/
+    // ensureInstalledForCwd/`tmux new-session` are all awaited internally),
+    // but launchEffort is still pinned before it kicks off the fire-and-
+    // forget boot-wait IIFE (BOOT_TIMEOUT_MS poller) and returns — awaiting
+    // the call resolves well ahead of that background poller, which is what
+    // still lets this assert the pin without waiting out any boot timeout.
+    const agent = await spawnClaudeViaTmux({
       taskId,
       argv: ["claude", "--session-id", sessionId, "hello"],
       env: { CLAUDE_CODE_EFFORT_LEVEL: "high" },
@@ -892,8 +935,6 @@ test("spawnClaudeViaTmux pins state.launchEffort from CLAUDE_CODE_EFFORT_LEVEL i
     });
     agent.done.catch(() => {}); // never resolves in this fake-tmux harness — not under test here
 
-    // Pinned synchronously inside spawnClaudeViaTmux, before its async
-    // boot-wait IIFE even starts.
     expect(__forTest.getSessionLaunchEffort(taskId)).toBe("high");
 
     // Let the boot-wait poller notice the pre-created JSONL and settle
@@ -924,7 +965,9 @@ test("spawnClaudeViaTmux with no CLAUDE_CODE_EFFORT_LEVEL in the launch env leav
   writeFileSync(jsonlPath, "");
 
   try {
-    const agent = spawnClaudeViaTmux({
+    // See the sibling test above for why `await` here still checks the pin
+    // ahead of the fire-and-forget boot-wait poller.
+    const agent = await spawnClaudeViaTmux({
       taskId,
       argv: ["claude", "--session-id", sessionId, "hello"],
       env: {},

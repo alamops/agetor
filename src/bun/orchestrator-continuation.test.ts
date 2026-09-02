@@ -252,7 +252,7 @@ test("onAdopted registers the continuation run as active (cancelRun succeeds aga
   // documented way to observe registration (same technique
   // subagent-hold.test.ts uses for the settle-hook side of #92).
   const { cancelRun } = await import("./orchestrator.ts");
-  const result = cancelRun(newRunId);
+  const result = await cancelRun(newRunId);
   expect(result).toBe(true);
   expect(killed).toBe(true);
 });

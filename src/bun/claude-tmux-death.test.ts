@@ -125,17 +125,17 @@ test("F5: a throwing heldSessionProbe is treated as not-held (no crash, no emiss
   }
 });
 
-test("sessionLiveness: exit 0 is alive", () => {
+test("sessionLiveness: exit 0 is alive", async () => {
   const restore = fakeTmux(0, "");
-  try { expect(sessionLiveness("agetor-x")).toBe("alive"); } finally { restore(); }
+  try { expect(await sessionLiveness("agetor-x")).toBe("alive"); } finally { restore(); }
 });
 
-test("sessionLiveness: 'can't find session' with a responsive server is gone", () => {
+test("sessionLiveness: 'can't find session' with a responsive server is gone", async () => {
   const restore = fakeTmux(1, "can't find session: agetor-x");
-  try { expect(sessionLiveness("agetor-x")).toBe("gone"); } finally { restore(); }
+  try { expect(await sessionLiveness("agetor-x")).toBe("gone"); } finally { restore(); }
 });
 
-test("sessionLiveness: any ambiguous / unknown failure is unreachable, never a death", () => {
+test("sessionLiveness: any ambiguous / unknown failure is unreachable, never a death", async () => {
   // The regression: a busy shared tmux server too swamped to answer, an ambiguous
   // connect error, or ANY string we don't recognize must never be read as a dead
   // session — that's what abandoned live, working sessions. We don't know the
@@ -148,11 +148,11 @@ test("sessionLiveness: any ambiguous / unknown failure is unreachable, never a d
     "", // a torn-down client can exit non-zero with no diagnostics
   ]) {
     const restore = fakeTmux(1, stderr);
-    try { expect(sessionLiveness("agetor-x")).toBe("unreachable"); } finally { restore(); }
+    try { expect(await sessionLiveness("agetor-x")).toBe("unreachable"); } finally { restore(); }
   }
 });
 
-test("sessionLiveness: only an UNAMBIGUOUS dead session or dead server is gone", () => {
+test("sessionLiveness: only an UNAMBIGUOUS dead session or dead server is gone", async () => {
   // During an in-flight turn our own session keeps the shared server alive, so
   // "no server running"/"lost server" means the server died WITH our session — a
   // real death. "session not found" is the server saying our session is absent.
@@ -165,7 +165,7 @@ test("sessionLiveness: only an UNAMBIGUOUS dead session or dead server is gone",
     "lost server",
   ]) {
     const restore = fakeTmux(1, stderr);
-    try { expect(sessionLiveness("agetor-x")).toBe("gone"); } finally { restore(); }
+    try { expect(await sessionLiveness("agetor-x")).toBe("gone"); } finally { restore(); }
   }
 });
 
@@ -351,7 +351,7 @@ async function setupHeldReattach() {
   tasks.insert(baseTask(taskId));
 
   const rec = recorder();
-  const agent = reattachSession({
+  const agent = await reattachSession({
     taskId,
     cwd,
     sessionId,
@@ -365,8 +365,8 @@ async function setupHeldReattach() {
   return { taskId, rec };
 }
 
-function cleanupHeldReattach(taskId: string) {
-  dropSession(taskId); // clears any still-armed timers, kills the (fake) tmux session
+async function cleanupHeldReattach(taskId: string) {
+  await dropSession(taskId); // clears any still-armed timers, kills the (fake) tmux session
   db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]); // cascades subagents/runs/run_events
 }
 
@@ -427,7 +427,7 @@ test(
     } finally {
       setHeldSessionProbe(prevProbe);
       ctrlTmux.restore();
-      if (taskId) cleanupHeldReattach(taskId);
+      if (taskId) await cleanupHeldReattach(taskId);
     }
   },
 );
@@ -459,7 +459,7 @@ test(
     } finally {
       setHeldSessionProbe(prevProbe);
       ctrlTmux.restore();
-      if (taskId) cleanupHeldReattach(taskId);
+      if (taskId) await cleanupHeldReattach(taskId);
     }
   },
 );
@@ -503,7 +503,7 @@ test(
     } finally {
       setHeldSessionProbe(prevProbe);
       ctrlTmux.restore();
-      if (taskId) cleanupHeldReattach(taskId);
+      if (taskId) await cleanupHeldReattach(taskId);
     }
   },
 );
@@ -539,7 +539,7 @@ test(
     } finally {
       setHeldSessionProbe(prevProbe);
       ctrlTmux.restore();
-      if (taskId) cleanupHeldReattach(taskId);
+      if (taskId) await cleanupHeldReattach(taskId);
     }
   },
 );
@@ -579,7 +579,7 @@ test(
     } finally {
       setHeldSessionProbe(prevProbe);
       ctrlTmux.restore();
-      if (taskId) cleanupHeldReattach(taskId);
+      if (taskId) await cleanupHeldReattach(taskId);
     }
   },
 );
