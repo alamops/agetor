@@ -4,7 +4,7 @@ export default {
   app: {
     name: "Agetor",
     identifier: "sh.alamops.agetor",
-    version: "0.1.4",
+    version: "0.1.5",
     // Registers agetor:// so a clicked terminal-notifier notification's
     // `-open agetor://task/<id>` (see src/bun/notifier.ts) routes back into
     // this app as an "open-url" event, which src/bun/deep-link.ts parses
