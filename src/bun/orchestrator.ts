@@ -1647,9 +1647,11 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
   // agetor id to the coarse family the picker actually offers as a row
   // (`Opus`/`Sonnet`/`Fable`/`Haiku`); an id the 2.1.246 picker can't select
   // exactly (an older pinned version within a family the picker only offers
-  // the CURRENT release of, `mythos-5`, or an unknown id) is a live-session
-  // no-op — the row already has the new id, only the mirror into the running
-  // session is skipped. `mirrorModelViaPicker`'s own resolved result already
+  // the CURRENT release of — including the now-superseded `fable-5`, demoted
+  // once `fable-5.1` took over the "Fable" row — `mythos-5`, `mythos-5.1`, or
+  // an unknown id) is a live-session no-op — the row already has the new id,
+  // only the mirror into the running session is skipped.
+  // `mirrorModelViaPicker`'s own resolved result already
   // carries a `reason` for every `ok:false` outcome (no live session, a turn
   // already in flight, a withheld keystroke, the picker never rendering, the
   // target not being offered, or a keystroke itself failing), so

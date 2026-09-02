@@ -772,19 +772,21 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                 </div>
               )}
 
-              {/* Fable 5 sits above Opus in the picker but bills at 2x the usage —
-                  surface that under the model row so the cost is obvious before Create. */}
-              {kind === "claude-code" && model === "fable-5" && (
+              {/* Fable models (5, 5.1, …) sit above Opus in the picker but bill at
+                  2x the usage — surface that under the model row so the cost is
+                  obvious before Create. Family check (not an exact id) so every
+                  point release picks this up with no code change. */}
+              {kind === "claude-code" && model?.startsWith("fable-") && (
                 <div className="text-[11px] text-muted-foreground">
-                  Fable 5 uses 2x the usage of Opus.
+                  {models.find((m) => m.id === model)?.label ?? model} uses 2x the usage of Opus.
                 </div>
               )}
 
-              {/* Mythos 5 is Fable 5's access-gated twin — same 2x usage, plus the
-                  Project Glasswing requirement, so both need calling out here. */}
-              {kind === "claude-code" && model === "mythos-5" && (
+              {/* Mythos models are Fable's access-gated twin — same 2x usage, plus
+                  the Project Glasswing requirement, so both need calling out here. */}
+              {kind === "claude-code" && model?.startsWith("mythos-") && (
                 <div className="text-[11px] text-muted-foreground">
-                  Mythos 5 uses 2x the usage of Opus and requires approved-org (Project Glasswing) access.
+                  {models.find((m) => m.id === model)?.label ?? model} uses 2x the usage of Opus and requires approved-org (Project Glasswing) access.
                 </div>
               )}
 

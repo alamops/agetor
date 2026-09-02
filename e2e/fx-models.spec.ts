@@ -157,11 +157,20 @@ function newTaskModelSelect(page: Page): Locator {
  * inside the very next `<dd>` sibling. `panel` should already be scrolled to
  * / have its "Task details" `<details>` expanded before this resolves
  * anything.
+ *
+ * Walks up via `ancestor::dt[1]` rather than a single `..` hop: since #204
+ * (task-details header — icon-only button row with hover tooltips) the
+ * button is wrapped in `<Tooltip>`, which renders its own `<span>` around
+ * the trigger — so the button's immediate parent is that span, not the
+ * `<dt>` itself, and a bare `..` landed on the span (with no `dd`
+ * following-sibling) instead of the `dt`. `ancestor::dt[1]` finds the
+ * nearest enclosing `<dt>` regardless of how many wrapper elements (Tooltip
+ * or otherwise) sit between it and the button.
  */
 function detailsModelSelect(panel: Locator): Locator {
   return panel
     .getByTestId("refresh-models-details")
-    .locator("xpath=../following-sibling::dd[1]")
+    .locator("xpath=ancestor::dt[1]/following-sibling::dd[1]")
     .locator("select");
 }
 
