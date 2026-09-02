@@ -77,7 +77,7 @@ import {
  *   - `session/new`                 SPIKE-VERIFIED             → {sessionId, modes?, configOptions?}; mode nudge is best-effort (see runFxTurn)
  *   - `session/resume`/`load`       SCHEMA-DERIVED             resume falls back to load on -32601/-32602/-32600 alike (see runFxTurn)
  *   - `session/prompt`              SPIKE-VERIFIED shape       sole completion signal, no timeout (see runFxTurn)
- *   - `session/update`              SPIKE-VERIFIED envelope    variant → chunk mapping (see mapFxUpdate)
+ *   - `session/update`              SPIKE-VERIFIED envelope    variant → chunk mapping (see mapFxUpdate); text deltas folded per message (see FxTextCoalescer)
  *   - `session/request_permission`  SCHEMA-DERIVED, UNVERIFIED-LIVE card flow  (see respondPermissionRequest)
  *   - `session/cancel`              SCHEMA-DERIVED             notification, no reply expected (see cancelFxTurn)
  *   - death                         —                          unexpected exit before settlement (see the `exited` watcher)
@@ -162,6 +162,31 @@ import {
  *     session via that merge — their `tool_call`s render generically like
  *     any other tool call; no driver change needed (spike + Zig source diff,
  *     2026-08-31).
+ *   - **`agent_message_chunk` is a token-level delta stream** — fx is the
+ *     only agetor driver that streams sub-message deltas (claude's JSONL,
+ *     codex's `item.completed`, gemini's `message` and cursor's `assistant`
+ *     are all message-level). A live run against 0.0.7 (2026-09-01)
+ *     delivered a ~400-char answer as 102 chunks ("This project", " is
+ *     **Aget", "or** — a", …), and forwarding each as its own `assistant`
+ *     event rendered one bubble per delta. `FxTextCoalescer` (which every
+ *     `emit` routes through) buffers consecutive `assistant`/`thinking`
+ *     deltas and delivers them as ONE event carrying the first delta's
+ *     line_uuid, flushed by the next non-text chunk (a tool call, a status
+ *     line), by an inbound `session/request_permission`
+ *     (`respondPermissionRequest`), and at settlement (`settleFx`).
+ *   - **fx's `[context] …` diagnostics ride `agent_message_chunk`** — ACP
+ *     has no diagnostic channel, so 0.0.7's context-budget warnings
+ *     (`[context] skill description "x" truncated: observed=… effective=1024
+ *     bytes …; override with --context-limit skill_description_bytes=
+ *     BYTES|off`, plus the project-instructions / skill-catalog / MCP
+ *     siblings a binary `strings` scan shows) arrive as the turn's first
+ *     "message" chunk: one chunk, one `[context] ` line per warning.
+ *     `mapFxUpdate` demotes a chunk made only of such lines to one `status`
+ *     line each (`isFxContextDiagnostic`) instead of assistant prose. The
+ *     override is a *global* `fx [--context-limit …] <command>` flag —
+ *     `fx acp --context-limit …` is rejected by the subcommand's own usage
+ *     check (probed 2026-09-01) — so `AGETOR_FX_ARGS`, which lands after
+ *     `acp`, cannot carry it today.
  */
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -257,6 +282,10 @@ interface FxSessionState {
   cardIdByRequestId: Map<number | string, string>;
   seq: number;
   seenLineUuids: Set<string>;
+  /** Folds `agent_message_chunk`/`agent_thought_chunk` deltas into whole
+   *  messages — every chunk passes through it via `emit`; see the class
+   *  doc for the flush boundaries. */
+  coalescer: FxTextCoalescer;
 
   resolved: boolean;
   killRequested: boolean;
@@ -441,7 +470,15 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 }
 
 /** Emit a chunk through the run's `line_uuid` dedup gate, mirroring the other
- *  drivers' `seenLineUuids` pattern (see cursor-tmux.ts / gemini-tmux.ts). */
+ *  drivers' `seenLineUuids` pattern (see cursor-tmux.ts / gemini-tmux.ts),
+ *  then through the session's `FxTextCoalescer`: an `assistant`/`thinking`
+ *  delta is buffered rather than delivered, and any other chunk first
+ *  flushes whatever text is buffered ahead of itself — so every non-text
+ *  event (a status line, a tool call, fx's own diagnostics) lands *after*
+ *  the prose that preceded it, exactly as the wire ordered them, and that
+ *  prose lands as ONE event. `flushText` is the explicit counterpart for
+ *  the message boundaries that aren't chunks: an inbound permission
+ *  request and settlement. */
 function emit(state: FxSessionState, stream: RunEventStream, data: string, lineUuid?: string): void {
   // A settled turn emits nothing: pumpStdout keeps dispatching whatever
   // lines remain in the pipe until SIGTERM actually closes the stream, and
@@ -452,7 +489,18 @@ function emit(state: FxSessionState, stream: RunEventStream, data: string, lineU
     if (state.seenLineUuids.has(lineUuid)) return;
     state.seenLineUuids.add(lineUuid);
   }
-  state.onChunk(stream, data, lineUuid);
+  deliver(state, state.coalescer.push({ stream, data, lineUuid }));
+}
+
+/** Deliver whatever text the coalescer is holding — a no-op when it holds
+ *  nothing. Same settled-turn gate as `emit`. */
+function flushText(state: FxSessionState): void {
+  if (state.resolved) return;
+  deliver(state, state.coalescer.flush());
+}
+
+function deliver(state: FxSessionState, chunks: FxChunk[]): void {
+  for (const c of chunks) state.onChunk(c.stream, c.data, c.lineUuid);
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -564,6 +612,12 @@ async function respondPermissionRequest(
     respondCancelled(state, id);
     return;
   }
+
+  // A permission request is a message boundary: the prose fx streamed
+  // before asking ("I'll run X…") must be on the transcript before the
+  // card (or an auto-answer's consequences) shows up, not only once the
+  // whole turn ends. Whichever mode answers below, this ordering holds.
+  flushText(state);
 
   const options = Array.isArray(params?.options) ? params!.options! : [];
 
@@ -726,10 +780,89 @@ function toolResultContent(update: Record<string, unknown>): unknown {
 
 /** A chunk `mapFxUpdate` wants emitted — the pure equivalent of an `emit()`
  *  call, minus the dedup/settled-turn gating `emit` itself applies. */
-interface FxChunk {
+export interface FxChunk {
   stream: RunEventStream;
   data: string;
   lineUuid?: string;
+}
+
+/** fx tags its human-facing context-budget diagnostics with this prefix
+ *  (`[context] skill description "x" truncated: observed=… effective=1024
+ *  bytes …; override with --context-limit skill_description_bytes=BYTES|off`,
+ *  plus the project-instructions / skill-catalog / MCP siblings a binary
+ *  `strings` scan shows) and — ACP having no diagnostic channel — ships them
+ *  as the turn's first `agent_message_chunk`, one chunk with one line per
+ *  warning. Observed live against 0.0.7 (2026-09-01). */
+export const FX_CONTEXT_DIAGNOSTIC_PREFIX = "[context] ";
+
+/** True when every non-blank line of `text` is one of fx's `[context] …`
+ *  diagnostics — i.e. the whole chunk is a diagnostics block, not prose.
+ *  Deliberately all-or-nothing: a model answer that merely *mentions* a
+ *  `[context]` line, or a chunk that mixes prose with one, stays prose. */
+export function isFxContextDiagnostic(text: string): boolean {
+  const lines = text.split("\n").filter((line) => line.trim() !== "");
+  return lines.length > 0 && lines.every((line) => line.trimStart().startsWith(FX_CONTEXT_DIAGNOSTIC_PREFIX));
+}
+
+/** The two streams whose chunks are token-level *deltas* of one logical
+ *  message rather than whole events. */
+type FxTextStream = "assistant" | "thinking";
+
+/**
+ * Folds fx's sub-message deltas back into whole messages. fx is the only
+ * agetor driver that streams token-level deltas — claude's JSONL, codex's
+ * `item.completed`, gemini's `message` and cursor's `assistant` events are
+ * all message-level — and forwarding each delta as its own `assistant`
+ * event persisted a ~400-char answer as 102 `run_events` rows that RunPanel
+ * rendered as one bubble per delta ("This project", " is **Aget", "or** —
+ * a", …). This buffers consecutive same-stream deltas and hands them back
+ * as ONE chunk carrying the *first* delta's line uuid (unique per run, so
+ * the `(run_id, line_uuid)` dedup index still holds).
+ *
+ * Message boundaries — where `push` flushes on its own: a delta on the
+ * *other* text stream (assistant → thinking or back), and any non-text
+ * chunk (tool_use/tool_result/status/…), which is delivered *after* the
+ * flushed text so wire order is preserved. Boundaries that aren't chunks
+ * (an inbound `session/request_permission`, settlement) call `flush`
+ * explicitly via `flushText`.
+ *
+ * Pure and exported for the same reason `mapFxUpdate` is: unit-testable
+ * without a child process (see fx-acp-mapper.test.ts).
+ */
+export class FxTextCoalescer {
+  private stream: FxTextStream | null = null;
+  private text = "";
+  private lineUuid: string | undefined;
+
+  /** Feed one mapped chunk; returns the chunks now ready to deliver, in
+   *  order (possibly none — a buffered delta returns `[]`). */
+  push(chunk: FxChunk): FxChunk[] {
+    if (chunk.stream === "assistant" || chunk.stream === "thinking") {
+      const out = this.stream !== null && this.stream !== chunk.stream ? this.flush() : [];
+      if (this.stream === null) {
+        this.stream = chunk.stream;
+        this.lineUuid = chunk.lineUuid;
+      }
+      this.text += chunk.data;
+      return out;
+    }
+    return [...this.flush(), chunk];
+  }
+
+  /** Hand back the buffered message (if any) and reset. */
+  flush(): FxChunk[] {
+    if (this.stream === null) return [];
+    const out: FxChunk = { stream: this.stream, data: this.text, lineUuid: this.lineUuid };
+    this.stream = null;
+    this.text = "";
+    this.lineUuid = undefined;
+    return [out];
+  }
+
+  /** True while a message is buffered and not yet flushed. */
+  get pending(): boolean {
+    return this.stream !== null;
+  }
 }
 
 /**
@@ -745,7 +878,20 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: { runId: strin
   switch (kind) {
     case "agent_message_chunk": {
       const text = extractText(update.content);
-      return text ? [{ stream: "assistant", data: text, lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}` }] : [];
+      if (!text) return [];
+      // fx's context-budget diagnostics ride this same stream (see
+      // FX_CONTEXT_DIAGNOSTIC_PREFIX) and would otherwise render as the
+      // model's opening paragraph. Demote a diagnostics-only chunk to one
+      // `status` line per warning; the seq counter still advances per line
+      // so every line_uuid stays unique within the run.
+      if (isFxContextDiagnostic(text)) {
+        return text
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line !== "")
+          .map((line) => ({ stream: "status" as const, data: line, lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}` }));
+      }
+      return [{ stream: "assistant", data: text, lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}` }];
     }
 
     case "agent_thought_chunk": {
@@ -944,6 +1090,16 @@ async function pumpStderr(state: FxSessionState): Promise<void> {
  */
 function settleFx(state: FxSessionState, code: number): void {
   if (state.resolved) return;
+  // Last chance for buffered prose: an `end_turn` (or a cancel, or a death)
+  // arrives with the message's trailing deltas still in the coalescer,
+  // since nothing after them ever forced a flush. Wrapped because a
+  // throwing `onChunk` (e.g. `appendEvent` against a since-deleted run)
+  // must never keep the process alive or the session registered.
+  try {
+    flushText(state);
+  } catch {
+    /* settlement proceeds regardless */
+  }
   state.resolved = true;
   // Identity-checked: a cross-kind agent switch or a fresh turn on the same
   // task can already have replaced this taskId's map entry with a newer
@@ -1349,6 +1505,7 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
     cardIdByRequestId: new Map(),
     seq: 0,
     seenLineUuids: new Set(),
+    coalescer: new FxTextCoalescer(),
     resolved: false,
     killRequested: false,
     cancelRequested: false,

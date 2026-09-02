@@ -292,6 +292,20 @@ const FAKE_ACP_SERVER_SRC = [
   '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "working..." } } });',
   "    return;",
   "  }",
+  '  if (scenario === "context-diagnostic") {',
+  "    // fx 0.0.7 ships its context-budget warnings as the turn's first",
+  "    // agent_message_chunk — one chunk, one [context] line per warning.",
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "[context] skill description \\"appstore-review\\" truncated: observed=1040 bytes effective=1024 bytes\\n[context] skill catalog omitted 2 entries\\n" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hi " } } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "there" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "die-mid-turn-text") {',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial answer" } } });',
+  "    setTimeout(function () { process.exit(1); }, 20);",
+  "    return;",
+  "  }",
   '  if (scenario === "die-mid-turn") {',
   "    setTimeout(function () { process.exit(1); }, 20);",
   "    return;",
@@ -499,8 +513,11 @@ describe("happy path (first turn)", () => {
       const toolUseChunks = chunks.filter((c) => c.stream === "tool_use");
       const toolResultChunks = chunks.filter((c) => c.stream === "tool_result");
 
-      expect(assistantChunks.map((c) => c.data)).toEqual(["Hello ", "world"]);
-      expect(assistantChunks.map((c) => c.lineUuid)).toEqual([`fx:${runId}:0`, `fx:${runId}:1`]);
+      // The two "Hello " / "world" deltas arrive as ONE assistant event
+      // (closed by the thought chunk that follows them), carrying the first
+      // delta's uuid — the second delta's seq (1) is consumed but unused.
+      expect(assistantChunks.map((c) => c.data)).toEqual(["Hello world"]);
+      expect(assistantChunks.map((c) => c.lineUuid)).toEqual([`fx:${runId}:0`]);
 
       expect(thinkingChunks).toHaveLength(1);
       expect(thinkingChunks[0]?.data).toBe("thinking...");
@@ -583,7 +600,7 @@ describe("resume fallback (session/load)", () => {
       expect(chunks.some((c) => c.data.includes("REPLAYED"))).toBe(false);
 
       // The turn still proceeds normally after the fallback completes.
-      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello ")).toBe(true);
+      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello world")).toBe(true);
     },
     10_000,
   );
@@ -603,7 +620,7 @@ describe("resume fallback (session/load)", () => {
       expect(loadReq).toBeDefined();
       expect((loadReq!.msg as { sessionId?: string }).sessionId).toBe(resumeId);
 
-      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello ")).toBe(true);
+      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello world")).toBe(true);
     },
     10_000,
   );
@@ -669,7 +686,7 @@ describe("resume credential re-check failure (-32600)", () => {
       expect(entries.some((e) => e.label === "session/load")).toBe(true);
       expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
 
-      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello ")).toBe(true);
+      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello world")).toBe(true);
       // No spurious credential-failure status chunk leaked through.
       expect(chunks.some((c) => c.stream === "status" && c.data.includes("Codex subscription"))).toBe(false);
     },
@@ -960,10 +977,15 @@ describe("session/request_permission auto-answer policy", () => {
     // "cancelled": an allow here would authorize fx to START a new tool
     // action in the middle of a user-initiated Stop.
     const { agent, chunks, captureFile } = spawnFake("cancel-permission-race", { mode: "auto" });
-    await waitFor(() => chunks.some((c) => c.stream === "assistant" && c.data.includes("working")));
+    // The fake's streamed "working..." delta stays buffered in the
+    // coalescer until settlement, so wait for the prompt to have reached
+    // the fake instead — that's the "turn in flight" signal.
+    await waitFor(() => readCaptured(captureFile).some((e) => e.label === "session/prompt"));
     agent.kill();
     const code = await agent.done;
     expect(code).toBe(1);
+    // The partial prose was flushed at settlement, not lost to the cancel.
+    expect(chunks.some((c) => c.stream === "assistant" && c.data === "working...")).toBe(true);
 
     const entries = readCaptured(captureFile);
     const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-race");
@@ -1151,10 +1173,11 @@ describe("kill() during an in-flight turn", () => {
     async () => {
       const { agent, chunks, captureFile } = spawnFake("kill-cancel");
 
-      // Wait until the turn is actually in flight (the fake has started
-      // streaming) before cancelling, so session/cancel has a live prompt to
-      // interrupt.
-      await waitFor(() => chunks.some((c) => c.stream === "assistant" && c.data === "working..."));
+      // Wait until the turn is actually in flight (the fake has received
+      // the prompt) before cancelling, so session/cancel has a live prompt
+      // to interrupt. The fake's streamed "working..." delta can't be that
+      // signal any more — the coalescer holds it until settlement.
+      await waitFor(() => readCaptured(captureFile).some((e) => e.label === "session/prompt"));
 
       const killedAt = Date.now();
       agent.kill();
@@ -1162,6 +1185,8 @@ describe("kill() during an in-flight turn", () => {
       const elapsedMs = Date.now() - killedAt;
 
       expect(code).toBe(1);
+      // The partial prose was flushed at settlement, not lost to the cancel.
+      expect(chunks.some((c) => c.stream === "assistant" && c.data === "working...")).toBe(true);
       // Well under CANCEL_WAIT_MS (3000ms) plus KILL_GRACE_MS (2000ms) — the
       // fake answers session/cancel almost immediately, so this proves the
       // driver didn't fall through to the force-kill timeout.
@@ -1187,6 +1212,20 @@ describe("process death", () => {
       expect(code).toBe(1);
       const statusChunks = chunks.filter((c) => c.stream === "status");
       expect(statusChunks.some((c) => c.data.startsWith(SESSION_DIED_STATUS_PREFIX))).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "prose streamed before a mid-turn death is flushed AHEAD of the session-died status, not lost",
+    async () => {
+      const { agent, chunks } = spawnFake("die-mid-turn-text");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      const textAt = chunks.findIndex((c) => c.stream === "assistant" && c.data === "partial answer");
+      const diedAt = chunks.findIndex((c) => c.stream === "status" && c.data.startsWith(SESSION_DIED_STATUS_PREFIX));
+      expect(textAt).toBeGreaterThanOrEqual(0);
+      expect(diedAt).toBeGreaterThan(textAt);
     },
     10_000,
   );
@@ -1221,7 +1260,44 @@ describe("malformed stdout line", () => {
       const code = await agent.done;
       expect(code).toBe(0);
       const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+      // Two events, not one: the malformed-line status emitted between them
+      // is a non-text chunk, so it closes "before" ahead of itself and
+      // "after" opens a fresh message that settlement flushes.
       expect(assistantChunks.map((c) => c.data)).toEqual(["before", "after"]);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 9b. fx `[context]` diagnostics + delta coalescing, end-to-end through emit.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("[context] diagnostics and delta coalescing", () => {
+  test(
+    "a [context]-only chunk lands as one status line per warning, and the deltas after it land as ONE assistant event",
+    async () => {
+      const { agent, chunks, runId } = spawnFake("context-diagnostic");
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const statusLines = chunks.filter((c) => c.stream === "status" && c.data.startsWith("[context] "));
+      expect(statusLines.map((c) => c.data)).toEqual([
+        '[context] skill description "appstore-review" truncated: observed=1040 bytes effective=1024 bytes',
+        "[context] skill catalog omitted 2 entries",
+      ]);
+
+      const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+      expect(assistantChunks.map((c) => c.data)).toEqual(["Hi there"]);
+
+      // Every line_uuid is run-scoped and distinct — the seq counter
+      // advanced once per status line and once per delta.
+      const uuids = [...statusLines, ...assistantChunks].map((c) => c.lineUuid);
+      for (const u of uuids) expect(u).toStartWith(`fx:${runId}:`);
+      expect(new Set(uuids).size).toBe(uuids.length);
+
+      // Wire order preserved: the diagnostics precede the prose.
+      expect(chunks.indexOf(statusLines[1]!)).toBeLessThan(chunks.indexOf(assistantChunks[0]!));
     },
     10_000,
   );
