@@ -6,7 +6,7 @@
 | Source | /implement — "fix the lag on loading task details when agetor is warming up another task the user just sent a message" |
 | Config | AGENTS_CONFIG.yml (balanced) |
 | Flags | none |
-| Gates | grilled + scope confirmed by owner (4-question pass); plan approval pending |
+| Gates | grilled + scope confirmed by owner (4-question pass); plan approved by owner |
 | Branch | fix/fix-task-details-load-delay |
 | Base SHA | bceeb1880abd8ef946364137e84f763a9ad5415a |
 
@@ -109,6 +109,7 @@ Run recipe: `bun test` (whole suite), `bun run typecheck`. Dev smoke (optional, 
 - `login-path.ts` (boot-only) and `git-provider.ts` ssh probe (git-host dialog path) keep their `spawnSync` — off the warm-up path; different ticket if ever.
 - `getCurrentPermissionMode` assumed memory-only (stays sync); T1 verifies and may move it into the async set if it actually reads the pane.
 - The e2e "Task details editor" convergence flake (`e2e/fx-models.spec.ts`) is a known env-dependent failure on main — not a signal for this branch.
+- Phase-8 code review fix: `startTask`, claude's idle-mint paths, and the four one-shot `spawn{Codex,Cursor,Gemini,Fx}TurnNow` functions now share ONE module-level `startingTaskIds` claim (orchestrator.ts) to close the multi-fork double-mint window the async spawn conversion opened between minting a run row and registering it active. Direct consequence of the owner-declined tmux-op timeout noted above: a permanently wedged tmux op (its claim never released) leaves that task un-startable / un-sendable for the remaining lifetime of the process. Accepted, same trade-off as the declined timeout — strictly better than the old app-wide synchronous hang, and scoped to one task rather than the whole app. Revisit together with the tmux op timeout follow-up.
 
 ## 9. Completeness ledger
 

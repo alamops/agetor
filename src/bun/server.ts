@@ -3914,8 +3914,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       },
 
       "/runs/:id/cancel": {
-        POST: authed((req) =>
-          json({ cancelled: cancelRun(req.params.id) }, { headers: corsHeaders(req) })),
+        POST: authed(async (req) =>
+          json({ cancelled: await cancelRun(req.params.id) }, { headers: corsHeaders(req) })),
       },
 
       // Forward a line of user input to the running agent's stdin. Returns

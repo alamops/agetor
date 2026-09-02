@@ -267,7 +267,14 @@ test("reconcileTaskSession does NOT refresh the matcher when cycleToMode fails (
   state.permissionMode = "default";
 
   const after: Task = { ...before, mode: "bypass" };
-  reconcileTaskSession("task-matcher-skip", before, after);
+  // Await the reconcile (mirrors the two sibling tests above) so its
+  // internal async work — `sessionExists`'s real tmux probe plus whatever
+  // `cycleToMode` does before bailing on the unreachable target — can't
+  // keep running as an unawaited background chain past this test's own
+  // teardown and leak stray `tmux` calls into a later test file's fake-tmux
+  // recording log (see the identical comment on the narrow/full tests
+  // above).
+  await reconcileTaskSession("task-matcher-skip", before, after);
 
   // No agetor entry was written, so readMatcher returns undefined.
   expect(readMatcher(cwd)).toBeUndefined();

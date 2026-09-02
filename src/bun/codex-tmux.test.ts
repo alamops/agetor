@@ -193,7 +193,7 @@ function readArgvLog(logPath: string): Array<{ argv: string[] }> {
   return readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
 }
 
-test("spawnCodexViaTmux's new-session argv pins -x 200 -y 50 (fixed size, never window-size manual)", () => {
+test("spawnCodexViaTmux's new-session argv pins -x 200 -y 50 (fixed size, never window-size manual)", async () => {
   const { bin, logPath } = fakeFailingTmuxBin();
   const prevBin = process.env.AGETOR_TMUX_BIN;
   process.env.AGETOR_TMUX_BIN = bin;
@@ -201,7 +201,7 @@ test("spawnCodexViaTmux's new-session argv pins -x 200 -y 50 (fixed size, never 
     const { chunks, onChunk } = collect();
     const taskId = `task-codexsize-${randomUUID()}`;
     const runId = `run-codexsize-${randomUUID()}`;
-    spawnCodexViaTmux({
+    await spawnCodexViaTmux({
       taskId,
       runId,
       argv: ["codex", "exec", "-"],

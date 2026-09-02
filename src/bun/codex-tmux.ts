@@ -13,7 +13,7 @@ import {
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
 import { dataDir } from "./db.ts";
-import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import {
@@ -421,6 +421,8 @@ function startCodexTailer(state: CodexSessionState): Promise<number> {
           resolveCodexDone(state, state.lastCode ?? 1);
         }, DEATH_GRACE_MS);
         if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
+      } catch {
+        /* never crash the watch */
       } finally {
         tickInFlight = false;
       }
@@ -436,38 +438,8 @@ function startCodexTailer(state: CodexSessionState): Promise<number> {
 
 const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
 
-/**
- * Launch `tmux new-session` for codex's detached hosting session. Async
- * (`Bun.spawn` + `await proc.exited`) so this fork+exec never blocks the
- * event loop that also serves the HTTP API — this used to be
- * `node:child_process`'s `spawnSync`, which stalled every concurrent request
- * for the duration of tmux's fork+exec (see
- * docs/plans/fix-task-details-load-delay.md). No timeout, mirroring
- * claude-tmux.ts's `tmux()` helper — an owner decision to keep behavior
- * unchanged beyond removing the block. Never throws; a spawn failure (e.g.
- * tmux not on PATH) folds into `stderr` the same way a non-zero exit does,
- * so callers only need one failure branch.
- */
-async function spawnTmuxNewSession(
-  tmux: string,
-  args: string[],
-): Promise<{ status: number | null; stderr: string }> {
-  try {
-    const proc = Bun.spawn([tmux, ...args], {
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ]);
-    const status = await proc.exited;
-    return { status, stderr: stderr.trim() };
-  } catch (e) {
-    return { status: null, stderr: (e as Error).message };
-  }
-}
+// `spawnTmuxNewSession` (launches codex's detached hosting session) lives in
+// tmux-resolution.ts — shared verbatim with cursor-tmux.ts/gemini-tmux.ts.
 
 export interface CodexLaunchOptions {
   taskId: string;

@@ -22,7 +22,11 @@ interface GitResult {
 const GIT_TIMEOUT_MS = 30_000;
 
 /**
- * Run `git` against a working directory. Never throws — callers inspect `ok`.
+ * Run `git` against a working directory. Resolves with `ok` reflecting exit
+ * status for a normal invocation — but CAN throw synchronously, since it's a
+ * thin wrapper over `Bun.spawn`, which throws when the `git` binary isn't on
+ * `PATH` or `cwd` doesn't exist. Callers that need a true non-throwing
+ * contract (e.g. `gitWritableRoots`) must wrap their own call in try/catch.
  * Using Bun.spawn directly (not Bun.$) so we don't pay shell-parsing cost or
  * worry about argument quoting on user-supplied paths/branch names.
  *
@@ -355,7 +359,17 @@ export async function repoRoot(dir: string): Promise<string | null> {
  * ordinary `.git`-inside-cwd checkout as "outside" and add a redundant root.
  */
 export async function gitWritableRoots(cwd: string): Promise<string[]> {
-  const res = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd, 5_000);
+  let res: GitResult;
+  try {
+    res = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd, 5_000);
+  } catch {
+    // `git()` itself can throw synchronously (`Bun.spawn` throws on a
+    // missing `git` binary or a `cwd` that no longer exists) even though
+    // THIS function's own contract, documented above, is non-throwing — a
+    // codex spawn on a host without git must proceed unescalated, not
+    // hard-fail. Same outcome as every other "can't tell" branch below.
+    return [];
+  }
   if (!res.ok) return [];
   const out = res.stdout;
   if (!out) return [];

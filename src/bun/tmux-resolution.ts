@@ -109,3 +109,42 @@ export function tmuxSocketArgs(): string[] {
   const name = tmuxSocketName();
   return name ? ["-L", name] : [];
 }
+
+/**
+ * Launch `tmux new-session` for a driver's detached hosting session. Async
+ * (`Bun.spawn` + `await proc.exited`) so this fork+exec never blocks the
+ * event loop that also serves the HTTP API — this used to be
+ * `node:child_process`'s `spawnSync`, which stalled every concurrent request
+ * for the duration of tmux's fork+exec (see
+ * docs/plans/fix-task-details-load-delay.md). No timeout, mirroring
+ * claude-tmux.ts's `tmux()` helper — an owner decision to keep behavior
+ * unchanged beyond removing the block. Never throws; a spawn failure (e.g.
+ * tmux not on PATH) folds into `stderr` the same way a non-zero exit does,
+ * so callers only need one failure branch.
+ *
+ * Shared by codex-tmux.ts, cursor-tmux.ts, and gemini-tmux.ts — the
+ * one-shot-per-turn drivers that each host a turn in a detached tmux
+ * session. Hoisted here per docs/plans/tmux-sessions-killed-unexpectedly.md
+ * ("every tmux invocation flows through the single choke point... no
+ * parallel spawn logic") so the three drivers can't drift.
+ */
+export async function spawnTmuxNewSession(
+  tmux: string,
+  args: string[],
+): Promise<{ status: number | null; stderr: string }> {
+  try {
+    const proc = Bun.spawn([tmux, ...args], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const status = await proc.exited;
+    return { status, stderr: stderr.trim() };
+  } catch (e) {
+    return { status: null, stderr: (e as Error).message };
+  }
+}

@@ -6028,8 +6028,22 @@ export function markTmuxPromptAnswered(taskId: string, fingerprint: string): voi
  *  `attachTailer`; torn down by `disposeSessionState`. */
 function startScraper(state: SessionState): void {
   if (state.scrapeTimer) return;
+  // Guards a tick against overlapping the previous one now that `scrapeOnce`
+  // does a real awaited capture-pane: without it, a stalled tmux round-trip
+  // could let a second SCRAPE_INTERVAL_MS tick start concurrently and act on
+  // the same pane frame, defeating the two-tick stability gates
+  // (`scrapeLastFingerprint`, `scrapeUnparsableStreak`, `scrapeIdleSettleStreak`)
+  // that exist precisely to require a modal to persist across ticks before a
+  // card is registered off it — a card registered from a single sighting can
+  // drive wrong-option keystrokes. Mirrors the death watch's own
+  // `tickInFlight` guard (see `startDeathWatch`).
+  let tickInFlight = false;
   state.scrapeTimer = setInterval(() => {
-    void scrapeOnce(state).catch(() => { /* swallow — never crash the timer */ });
+    if (tickInFlight) return;
+    tickInFlight = true;
+    void scrapeOnce(state)
+      .catch(() => { /* swallow — never crash the timer */ })
+      .finally(() => { tickInFlight = false; });
   }, SCRAPE_INTERVAL_MS);
 }
 
@@ -6419,6 +6433,8 @@ function startDeathWatch(state: SessionState): void {
           flushSync(state);
           signalSessionDeath(state);
         }, DEATH_GRACE_MS);
+      } catch {
+        /* never crash the watch */
       } finally {
         tickInFlight = false;
       }
@@ -9106,8 +9122,10 @@ function queueTmuxOp(
  * the one this paste was scheduled against — see `queueTmuxOp` for the
  * race this closes.
  *
- * When `opts.bracketed` is true, the trailing `Enter` is split out of
- * the synchronous paste body and sent after a small internal gap
+ * When `opts.bracketed` is true, the trailing `Enter` is split out of the
+ * paste body — load-buffer + paste-buffer land back-to-back, each its own
+ * awaited `tmux()` round-trip, with no deliberate gap between them — and
+ * sent after a small internal gap
  * (`bracketedEnterGapMs`) so claude's Ink TUI commits the `ESC[200~ …
  * ESC[201~` paste event before the `\r` arrives — without that gap the
  * Enter is absorbed as part of the paste event and the queued bubble
@@ -9158,8 +9176,9 @@ function queueTmuxOp(
  * already-bare branch, which inserts no delay) — a further one-shot,
  * double-sampled (`stillBlocking`) re-check of `paneShowsBlockingPrompt` runs
  * right before dispatch, covering BOTH paste paths, since the non-bracketed
- * one sends paste+Enter synchronously with no pre-Enter net of its own
- * (unlike the bracketed path's own re-check below).
+ * one sends paste+Enter back-to-back — each its own awaited `tmux()`
+ * round-trip, with no deliberate gap — and so has no pre-Enter net of its
+ * own (unlike the bracketed path's own re-check below).
  *
  * The modal guard re-runs a THIRD time — one-shot, double-sampled via
  * `stillBlocking`, no polling loop — right before the deferred bracketed
@@ -9474,7 +9493,8 @@ function queuePaste(
     // ever saw (e.g. a permission prompt that appeared during that sleep).
     // Re-run the same double-sampled check right before dispatch so BOTH
     // paste paths get this net — the non-bracketed path sends paste+Enter
-    // synchronously with no separate pre-Enter check of its own, unlike the
+    // back-to-back, each its own awaited tmux() round-trip, with no
+    // deliberate gap and no separate pre-Enter check of its own, unlike the
     // bracketed path below.
     if (insertedComposerClearDelay && expectedState && !opts.skipModalGuard) {
       const blocked = await stillBlocking(expectedState);

@@ -114,6 +114,48 @@ async function waitUntil(check: () => boolean, maxMs = 4000): Promise<boolean> {
 }
 
 /**
+ * Poll a run's persisted events until a `status` chunk containing `substr`
+ * appears, or `maxMs` elapses. Used to deterministically wait for
+ * `spawnClaudeViaTmux`'s fire-and-forget boot-wait IIFE to reach
+ * `attachTailer` — signaled by the "claude session … ready (jsonl: …)"
+ * status line it emits right after (see claude-tmux.ts's boot-wait, just
+ * after `attachTailer(state)`) — before a test's `finally` calls
+ * `dropSession`.
+ *
+ * Without this, `dropSession` can race that still-in-flight IIFE: several
+ * tests below only wait for the DEFERRED-PASTE chain (a separate
+ * fire-and-forget IIFE — see claude-tmux.ts's `deferredPrompt` branch) to
+ * finish, or for the run to settle, neither of which implies the boot-wait
+ * IIFE has reached `attachTailer` yet — the two IIFEs race independently off
+ * the same `spawnClaudeViaTmux` call. If `dropSession` disposes + removes
+ * the in-memory `SessionState` first, the still-in-flight boot-wait IIFE
+ * then calls `attachTailer` on the now-orphaned state object, arming a
+ * deathTimer/pollTimer/scraper/fs.watch that nothing will ever clear again —
+ * a zombie poller that keeps firing real tmux invocations (has-session,
+ * capture-pane, …) into whatever `AGETOR_TMUX_BIN` (process-global) happens
+ * to point at once a LATER test file reassigns that env var, contaminating
+ * that file's own fake-tmux recording log mid-test (see
+ * claude-tmux-local-command.test.ts's `[load-buffer, paste-buffer,
+ * delete-buffer]`-shaped assertions, which is exactly the shape a stray
+ * interleaved `has-session` call corrupts).
+ */
+async function waitForRunStatus(
+  runsModule: { events(runId: string): Array<{ stream: string; data: string }> },
+  runId: string,
+  substr: string,
+  maxMs = 4000,
+): Promise<boolean> {
+  const deadline = Date.now() + maxMs;
+  for (;;) {
+    const found = runsModule.events(runId).some(
+      (e) => e.stream === "status" && e.data.includes(substr),
+    );
+    if (found || Date.now() >= deadline) return found;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+/**
  * Write an executable fake tmux for the deferred-large-prompt regression
  * tests below. Unlike `fakeRoutingTmuxBin` (a single fixed `has-session`
  * verdict for the whole test), this stub needs to answer `has-session`
@@ -361,6 +403,7 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
 
     const result = await sendInput(priorRunId, "please continue");
     expect(result.delivered).toBe(true);
+    const newRunId = result.delivered ? result.runId : undefined;
 
     const entries = readLog(logPath);
     const killIdx = entries.findIndex((e) => e.argv.includes("kill-session"));
@@ -370,9 +413,12 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
     expect(killIdx).toBeLessThan(newIdx);
 
     // Give the background boot-wait a beat to observe the pre-created JSONL
-    // and settle (bootSettled=true) before this test — and the dangling
-    // AGETOR_TMUX_BIN it keeps re-resolving — hands off to the next test.
-    await new Promise((r) => setTimeout(r, 500));
+    // and settle (bootSettled=true, `attachTailer` called) before this test —
+    // and the dangling AGETOR_TMUX_BIN it keeps re-resolving — hands off to
+    // the next test. Deterministic (poll for the "ready" status the boot-wait
+    // IIFE emits right after `attachTailer`) rather than a fixed sleep — see
+    // `waitForRunStatus`'s doc for why a race here leaks a zombie poller.
+    if (newRunId) await waitForRunStatus(runs, newRunId, "ready (jsonl:");
   } finally {
     // Dispose in-memory state + kill whatever (fake) session is now named
     // for this task, mirroring claude-followup-restart.test.ts's cleanup.
@@ -428,6 +474,11 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
   const largePrompt = "x".repeat(CLAUDE_PROMPT_ARGV_MAX_BYTES + 500);
   expect(Buffer.byteLength(largePrompt, "utf8")).toBeGreaterThan(CLAUDE_PROMPT_ARGV_MAX_BYTES);
 
+  // Declared outside `try` (not `const` inside it) so `finally` can see it —
+  // needed to wait for the boot-wait IIFE's "ready" status before disposing
+  // the session (see `waitForRunStatus`'s doc).
+  let newRunId: string | undefined;
+
   try {
     tasks.insert({
       id: taskId,
@@ -474,7 +525,7 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
     const result = await sendInput(priorRunId, largePrompt);
     expect(result.delivered).toBe(true);
     if (!result.delivered) throw new Error(result.reason);
-    const newRunId = result.runId;
+    newRunId = result.runId;
 
     // Let the spawn + the fire-and-forget deferred-paste chain run their
     // course. Poll for the final `send-keys Enter` rather than sleeping a
@@ -522,6 +573,9 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
     __forTest.setCaptureModePane(prevCapture);
     __forTest.setBracketedEnterGapMs(prevGap);
     __forTest.setSlashCommandSettleMs(prevSettle);
+    // Let the (independent, fire-and-forget) boot-wait IIFE reach
+    // `attachTailer` before disposing the session — see `waitForRunStatus`.
+    if (newRunId) await waitForRunStatus(runs, newRunId, "ready (jsonl:");
     dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
@@ -562,6 +616,11 @@ test("cancelling a run while its large prompt is deferred (composer never confir
   const prevSettle = __forTest.setSlashCommandSettleMs(0);
 
   const largePrompt = "y".repeat(CLAUDE_PROMPT_ARGV_MAX_BYTES + 500);
+
+  // Declared outside `try` (not `const` inside it) so `finally` can see it —
+  // needed to wait for the boot-wait IIFE's "ready" status before disposing
+  // the session (see `waitForRunStatus`'s doc).
+  let newRunId: string | undefined;
 
   try {
     tasks.insert({
@@ -609,7 +668,7 @@ test("cancelling a run while its large prompt is deferred (composer never confir
     const result = await sendInput(priorRunId, largePrompt);
     expect(result.delivered).toBe(true);
     if (!result.delivered) throw new Error(result.reason);
-    const newRunId = result.runId;
+    newRunId = result.runId;
 
     // Give the spawn a moment to run `new-session` and let the deferred-paste
     // IIFE reach its poll loop (composer stays "" so it never breaks out).
@@ -641,6 +700,9 @@ test("cancelling a run while its large prompt is deferred (composer never confir
     __forTest.setCaptureModePane(prevCapture);
     __forTest.setBracketedEnterGapMs(prevGap);
     __forTest.setSlashCommandSettleMs(prevSettle);
+    // Let the (independent, fire-and-forget) boot-wait IIFE reach
+    // `attachTailer` before disposing the session — see `waitForRunStatus`.
+    if (newRunId) await waitForRunStatus(runs, newRunId, "ready (jsonl:");
     dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
@@ -725,6 +787,11 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
 
   const largePrompt = "z".repeat(CLAUDE_PROMPT_ARGV_MAX_BYTES + 500);
 
+  // Declared outside `try` (not `const` inside it) so `finally` can see it —
+  // needed to wait for the boot-wait IIFE's "ready" status before disposing
+  // the session (see `waitForRunStatus`'s doc).
+  let newRunId: string | undefined;
+
   try {
     tasks.insert({
       id: taskId,
@@ -771,7 +838,7 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
     const result = await sendInput(priorRunId, largePrompt);
     expect(result.delivered).toBe(true);
     if (!result.delivered) throw new Error(result.reason);
-    const newRunId = result.runId;
+    newRunId = result.runId;
 
     // Let the spawn + the fire-and-forget deferred-paste chain run their
     // course, including the doomed load-buffer call and its failure
@@ -796,6 +863,9 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
     __forTest.setCaptureModePane(prevCapture);
     __forTest.setBracketedEnterGapMs(prevGap);
     __forTest.setSlashCommandSettleMs(prevSettle);
+    // Let the (independent, fire-and-forget) boot-wait IIFE reach
+    // `attachTailer` before disposing the session — see `waitForRunStatus`.
+    if (newRunId) await waitForRunStatus(runs, newRunId, "ready (jsonl:");
     dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
@@ -826,6 +896,11 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
   writeFileSync(expectedJsonlPath, "");
 
   const smallPrompt = "please continue with the small change";
+
+  // Declared outside `try` (not `const` inside it) so `finally` can see it —
+  // needed to wait for the boot-wait IIFE's "ready" status before disposing
+  // the session (see `waitForRunStatus`'s doc).
+  let newRunId: string | undefined;
 
   try {
     tasks.insert({
@@ -872,6 +947,7 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
 
     const result = await sendInput(priorRunId, smallPrompt);
     expect(result.delivered).toBe(true);
+    if (result.delivered) newRunId = result.runId;
 
     await new Promise((r) => setTimeout(r, 300));
 
@@ -886,6 +962,9 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
     // have fired for it at all.
     expect(entries.some((e) => e.argv.includes("load-buffer"))).toBe(false);
   } finally {
+    // Let the (independent, fire-and-forget) boot-wait IIFE reach
+    // `attachTailer` before disposing the session — see `waitForRunStatus`.
+    if (newRunId) await waitForRunStatus(runs, newRunId, "ready (jsonl:");
     dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
