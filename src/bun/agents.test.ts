@@ -863,6 +863,18 @@ test("gemini-3.8-flash model id is emitted verbatim via -m", () => {
   ]);
 });
 
+test("gemini-3.8-flash-cyber (Fairwind-gated) model id is emitted verbatim via -m", () => {
+  const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, model: "gemini-3.8-flash-cyber" });
+  expect(cmd).toEqual([
+    "gemini",
+    "-m", "gemini-3.8-flash-cyber",
+    "--output-format", "stream-json",
+    "--yolo",
+    "--skip-trust",
+    "-p", "hi",
+  ]);
+});
+
 test("gemini 'ask' mode uses --approval-mode plan instead of --yolo", () => {
   const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, mode: "ask" });
   expect(cmd).not.toContain("--yolo");

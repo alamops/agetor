@@ -152,6 +152,10 @@ test("gemini gemini-3.8-flash exposes no effort options (no effort flag on the C
   expect(ids).toEqual([]);
 });
 
+test("gemini gemini-3.8-flash-cyber exposes no effort options (same CLI, no effort flag)", () => {
+  expect(supportedEfforts("gemini", "gemini-3.8-flash-cyber").map((o) => o.id)).toEqual([]);
+});
+
 test("gemini default model gemini-3.1-pro-preview exposes no effort options", () => {
   expect(supportedEfforts("gemini", "gemini-3.1-pro-preview").map((o) => o.id)).toEqual([]);
   expect(supportedEfforts("gemini", null).map((o) => o.id)).toEqual([]);

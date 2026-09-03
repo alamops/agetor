@@ -221,10 +221,20 @@ test("gemini picker is tier-ordered: Pro rows first, then Flash rows newest-firs
     "gemini-3.1-pro-preview",
     "gemini-2.5-pro",
     "gemini-3.8-flash",
+    "gemini-3.8-flash-cyber",
     "gemini-3.7-flash",
     "gemini-3.5-flash",
     "gemini-2.5-flash",
   ]);
+});
+
+test("gemini-3.8-flash-cyber sits directly under 3.8 Flash and its hint names the Fairwind gate (no public model code — id is convention-based)", () => {
+  const models = AGENT_OPTIONS.gemini.models;
+  const i = models.findIndex((m) => m.id === "gemini-3.8-flash-cyber");
+  expect(i).toBeGreaterThan(0);
+  expect(models[i - 1]?.id).toBe("gemini-3.8-flash");
+  expect(models[i]?.hint).toContain("Fairwind");
+  expect(DEFAULT_MODEL.gemini).not.toBe("gemini-3.8-flash-cyber");
 });
 
 test("cursor picker lists Gemini Flash newest-first: 3.8 before 3.7 before 3.6", () => {

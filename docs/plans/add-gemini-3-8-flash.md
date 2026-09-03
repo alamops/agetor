@@ -180,9 +180,33 @@ no new user flow, route, or UI surface. The existing `e2e/fx-models.spec.ts` is 
 | `createTask` storing `effort: "high"` for an unlisted gemini/fx id where a listed one stores `null` (review low) | **out of scope** — pre-existing for every unlisted gemini/fx id, not introduced here (the retired id is unreachable from any picker after 049 and `buildCommand` ignores effort for both kinds); the durable fix is a kind-level rule in `createTask` + the PATCH guard, an orchestrator-wide semantic change that deserves its own review |
 | fx rows for `google/gemini-3.7-flash` / 3.6 / 3.5 Flash | **out of scope** — fx curated list is deliberately short; discovered-only ids already append via `mergeModelOptions`; owner asked for 3.8 only |
 | gemini picker rows for `gemini-3.1-flash-lite`, `gemini-3.6-flash`, `gemini-3-flash` | **out of scope** — curated list is newest-per-tier; typed ids pass through; nobody asked |
-| Gemini 3.8 Flash Cyber | **out of scope** — Fairwind-gated, no public id |
+| Gemini 3.8 Flash Cyber | **in this run** — owner widened scope 2026-09-03 (see §10); row `gemini-3.8-flash-cyber` under 3.8 Flash with a Fairwind-gate hint |
 | Gemini thinking-level knob for the gemini harness | **out of scope** — CLI 0.58.0 exposes no flag; nothing to wire |
 | README roadmap line still listing "Gemini CLI" as future | **out of scope** — pre-existing stale line unrelated to this change (different ticket) |
 | `docs/plans/add-gemini-3-7-flash.md` says the default stays 3-pro-preview | **out of scope** — dated historical artifact, superseded by this plan |
 
 No owner-deferred rows.
+
+## 10. Addendum (2026-09-03) — Gemini 3.8 Flash Cyber
+
+Owner asked, after the 3.8 Flash delivery landed, to also offer the Fairwind-Program-gated Cyber variant.
+
+- **Evidence gathered:** Google's Cyber page, the Fairwind Program page, the launch post, the Gemini API models
+  docs (no page — 404), the DeepMind model-card index (no Cyber card), the Enterprise Agent Platform model list
+  (21 ids, none Cyber), the CodeMender docs (newest model listed is 3.7 Flash) and the launch-day Hacker News
+  thread all refer to the model only by name. Access is delivered as a managed model on the Enterprise Agent
+  Platform to vetted defenders (governments, critical-infrastructure operators, core platforms). Cursor
+  (`cursor-agent models`) and fx (`fx models --json`) expose no Cyber id → gemini harness only.
+- **Owner decision (grill, one question):** use `gemini-3.8-flash-cyber`, following Google's own suffix
+  convention (`gemini-3.1-flash-lite`, `gemini-3-pro-image`) and OpenAI's `gpt-5.6-cyber` precedent; the
+  owner asked for a web confirmation pass, which found no published code either way. The row's hint and a
+  code comment state that the id is convention-based pending a published code; agetor passes it through
+  verbatim, so a grant that names it differently needs only the literal changed.
+- **Change:** `AGENT_OPTIONS.gemini.models` gains the row directly under `gemini-3.8-flash` (a variant of the
+  newest Flash, not a new tier — unlike GPT-5.6 Cyber, which the owner asked to put on top of Sol);
+  `MODEL_EFFORT_SUPPORT.gemini["gemini-3.8-flash-cyber"] = []`; default unchanged; no migration, no CLI, no
+  README/CLAUDE.md enumeration to update. Tests: verbatim `-m` argv, empty effort surface, exact tier order,
+  and a placement + Fairwind-hint assertion.
+- **Process note:** applied inline by the orchestrator (a four-line mirror of the reviewed 3.8 row) rather
+  than through the sonnet implementation runner; no separate opus review pass was run for this addendum.
+- **Open:** A4 — the model code is unconfirmed; first Fairwind-approved run will confirm or correct it.

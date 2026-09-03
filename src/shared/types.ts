@@ -1849,6 +1849,7 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gemini-3.1-pro-preview": [],
     "gemini-2.5-pro": [],
     "gemini-3.8-flash": [],
+    "gemini-3.8-flash-cyber": [],
     "gemini-3.7-flash": [],
     "gemini-3.5-flash": [],
     "gemini-2.5-flash": [],
@@ -2010,6 +2011,15 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", hint: "Recommended default — current flagship; Google's successor to the retired 3 Pro preview." },
       { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", hint: "Prior stable flagship." },
       { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Latest and most capable Flash — built for long-horizon coding and agentic work at Flash cost." },
+      // Fairwind-Program-gated cybersecurity twin of 3.8 Flash (launched 2026-09-02).
+      // Google has published no model code for it — not on the Cyber page, the
+      // Fairwind page, the API models table, the model-card index, or the
+      // Enterprise Agent Platform model list (all checked 2026-09-03) — so this
+      // id follows Google's own suffix convention (gemini-3.1-flash-lite,
+      // gemini-3-pro-image) and OpenAI's gpt-5.6-cyber precedent. Owner-approved
+      // pending a published code; agetor passes it through verbatim, so a
+      // grant that names it differently needs only this literal changed.
+      { id: "gemini-3.8-flash-cyber", label: "Gemini 3.8 Flash Cyber", hint: "Cybersecurity-tuned 3.8 Flash for vulnerability discovery and patching. Requires Fairwind Program access (invite-only); no public model code yet — id follows Google's naming convention." },
       { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", hint: "Prior Flash generation — strong on coding and agentic work." },
       { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost — earlier Flash generation." },
       { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, earliest Flash generation offered." },
