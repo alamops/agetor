@@ -186,3 +186,85 @@ at a time.
 | Free-text filter boxes (`Search title, prompt, workdir, branch…`) in KanbanFilters / WorktreesDialog | **out of scope** | they search prose (titles, prompts) as well as identifiers; not asked for, and not a "remainder" of this change |
 | Docs / CLAUDE.md | **out of scope** — nothing describes the old behaviour | — |
 | Owner-deferred | none | — |
+
+## 10. Wave 3 addendum — post-review sweep (2026-09-03)
+
+The wave-1 review (opus, `code-review` skill; 0 must-fix, 4 should-fix, 2 nits)
+found identifier inputs the §2 survey missed because they are raw `<input>`s
+or live in surfaces outside the New Task flow. The owner was asked once more
+and chose the **full identifier sweep**. Commit `63a8889`.
+
+**Review fixes applied**
+
+- Spread-first convention: `{...IDENTIFIER_INPUT_PROPS}` is the first prop at
+  every site (after `ref` / `data-testid` / `id` when present) so an explicit
+  local prop always wins; the duplicated inline comments in the two `ui/*-select`
+  primitives were removed (the constant's doc comment carries the rationale).
+- Datalist rule (documented in `identifier-input.ts`): an input with `list="…"`
+  spreads the constant then sets `autoComplete={undefined}` — `autocomplete="off"`
+  can suppress `<datalist>` suggestions in some engines, and React omits
+  undefined props. Applied to the Settings host input and the GitHub dialog's
+  Labels and Tag-name inputs.
+- Doc-comment site count removed (it was already wrong and would rot).
+
+**Ledger additions (all *in this run*, owner-approved at the review gate)**
+
+| Surface | Sites |
+| --- | --- |
+| `kanban/ExtensionPicker.tsx` search box (MCP / skills / plugins / prompts names) | 1 |
+| `settings/SettingsDialog.tsx` additional-harness editor: Id/slug, HOME path, Bin override (not the display Label) | 3 |
+| `kanban/GitHubDialog.tsx` — every input that must match a remote identifier exactly: labels, assignees, milestone number (×2 composers), item search query, assignee, head/base branch, reviewers (×2), teams, label name + hex (create + edit), tag name, ref, workflow-dispatch input name, `#number` (×2), transfer owner/repo | 24 |
+
+Still **out of scope** (prose): every Title / Description / Release-title
+input, the workflow-dispatch "Value" input, date inputs, textareas, prompt
+names, and the free-text "Search title, prompt, …" filter boxes. Password
+inputs never autocorrect.
+
+**Tests (wave 4)**: `e2e/identifier-inputs.spec.ts` extended to the Extensions
+search box and the Settings host input (asserting autocorrect/autocapitalize/
+spellcheck present and `autocomplete` absent — the datalist rule), plus the
+harness editor and GitHub-dialog inputs where reachable with existing fixtures.
+
+**Phase 7 first pass** (before wave 3): typecheck 0, bun suite all green,
+Playwright 48 passed / 3 failed / 12 skipped. `font-size.spec.ts` failed at the
+worker fixture's port pre-flight (a leaked worker backend on :4600 from an
+earlier single-spec run; the 12 skips are that worker's remaining tests) —
+environmental. `fx-interactions.spec.ts` and `resolve-conflicts.spec.ts` each
+had one failure whose artifacts were lost to a retry; both are re-triaged in
+the Phase 8 re-run.
+
+## 11. Wave 4 addendum — search/filter rule + wave-3 review (2026-09-03)
+
+The wave-3 review (opus, `code-review` skill; 0 must-fix, 2 should-fix, 1 nit)
+pointed out that the GitHub item-search box had opted out while its two
+structurally identical siblings (the Kanban and Worktrees free-text filter
+boxes) had not, with no recorded rule separating them. Resolution — the rule
+is now written into `identifier-input.ts`: **identifier inputs AND
+search/filter boxes opt out** (a box whose text is matched against existing
+content never wants correction; a corrected query just finds nothing);
+**composition fields keep autocorrect** (titles, descriptions, notes, prompts,
+prompt names). Consequently three more sites were swept in:
+
+| Surface | Sites |
+| --- | --- |
+| `kanban/KanbanFilters.tsx` free-text filter ("Search title, prompt, workdir, branch…") | 1 |
+| `worktrees/WorktreesDialog.tsx` free-text filter ("Search title, branch, project, path…") | 1 |
+| `kanban/RunPanel.tsx` transcript search ("Search messages") | 1 |
+
+This flips the §9 row "Free-text filter boxes — out of scope" to *in this
+run*, by the orchestrator under the completeness contract (the owner chose the
+widest scope at all three gates); it's a one-line revert per site if unwanted.
+
+**Datalist carve-out kept, honestly labelled.** The review noted the HTML
+spec says `autocomplete` shouldn't gate `<datalist>` suggestions and asked for
+an empirical check in the packaged app. That check can't be automated here,
+so the three `autoComplete={undefined}` overrides stay as the conservative
+choice (the datalist behaves exactly as it did before this change) and the
+doc comment now says so and names the removal condition. **Manual check for
+the owner:** in the packaged app, Settings → Git host tokens → does the
+detected-hosts dropdown still appear? If yes, the overrides can go.
+
+The three inline datalist comments were unified to the one-line
+cross-reference. Tests: the unit-test docstring lists the search/filter boxes;
+`e2e/identifier-inputs.spec.ts` gains an assertion on the Kanban free-text
+box (six e2e tests in the file now). Total spread sites: 36.

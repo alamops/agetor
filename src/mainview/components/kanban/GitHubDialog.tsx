@@ -3686,7 +3686,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         {caps.labels && (
           <Input
             {...IDENTIFIER_INPUT_PROPS}
-            // datalist suggestions can be suppressed by autocomplete="off" in some engines; the correction attributes still apply.
+            // Keeps the <datalist> working — see identifier-input.ts.
             autoComplete={undefined}
             value={labels}
             onChange={(e) => setLabels(e.target.value)}
@@ -5101,7 +5101,7 @@ function ReleasesManager({
       <div className="mb-2 grid gap-2 md:grid-cols-[minmax(0,0.8fr)_minmax(0,1fr)]">
         <Input
           {...IDENTIFIER_INPUT_PROPS}
-          // datalist suggestions can be suppressed by autocomplete="off" in some engines; the correction attributes still apply.
+          // Keeps the <datalist> working — see identifier-input.ts.
           autoComplete={undefined}
           value={tagName}
           onChange={(e) => setTagName(e.target.value)}
