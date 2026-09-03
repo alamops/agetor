@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
   canonicalizeUserText,
+  isMachineEmittedMessage,
+  parseForkedSkillLaunch,
+  parseMessageSegments,
   parseUserMessage,
   splitReferences,
-} from "./command-message.ts";
-import { appendReferences } from "../../shared/refs.ts";
-import type { TaskReference } from "../../shared/types.ts";
+  userMessageLines,
+} from "./user-message.ts";
+import { appendReferences } from "./refs.ts";
+import type { TaskReference } from "./types.ts";
 
 const REFS: TaskReference[] = [
   { path: "/a/b.png", isDirectory: false },
@@ -321,5 +325,76 @@ describe("canonicalizeUserText", () => {
   test("near-miss XML (leftover content) is returned identically", () => {
     const text = "hello <command-name>/implement</command-name> world";
     expect(canonicalizeUserText(text)).toBe(text);
+  });
+});
+
+describe("parseMessageSegments — smoke", () => {
+  test("real fixture: forked-skill-launch line, newline-separated (prod transcript shape)", () => {
+    const text =
+      "<local-command-stdout>Running in the background as @code-review</local-command-stdout>\n" +
+      '<forked-skill-launch>{"agentId":"a7db6829e09d1ba9b","skillName":"code-review","description":"/code-review"}</forked-skill-launch>';
+
+    const segments = parseMessageSegments(text);
+    expect(segments).toEqual([
+      { kind: "tag", name: "local-command-stdout", attrs: "", body: "Running in the background as @code-review", raw: "<local-command-stdout>Running in the background as @code-review</local-command-stdout>" },
+      { kind: "tag", name: "forked-skill-launch", attrs: "", body: '{"agentId":"a7db6829e09d1ba9b","skillName":"code-review","description":"/code-review"}', raw: '<forked-skill-launch>{"agentId":"a7db6829e09d1ba9b","skillName":"code-review","description":"/code-review"}</forked-skill-launch>' },
+    ]);
+    expect(isMachineEmittedMessage(segments)).toBe(true);
+
+    const launchSeg = segments[1];
+    if (launchSeg?.kind !== "tag") throw new Error("expected tag segment");
+    expect(parseForkedSkillLaunch(launchSeg.body)).toEqual({
+      agentId: "a7db6829e09d1ba9b",
+      skillName: "code-review",
+      description: "/code-review",
+    });
+
+    expect(parseUserMessage(text)).toEqual({
+      kind: "tagged",
+      text,
+      segments,
+      references: [],
+    });
+    expect(userMessageLines(text)).toEqual([
+      { label: "cmd›", text: "Running in the background as @code-review", tone: "machine" },
+      { label: "skill›", text: "/code-review launched in background (agent a7db6829)", tone: "machine" },
+    ]);
+  });
+
+  test("real fixture: same forked-skill-launch line, space-separated (copy-paste artifact)", () => {
+    const text =
+      "<local-command-stdout>Running in the background as @code-review</local-command-stdout> " +
+      '<forked-skill-launch>{"agentId":"a7db6829e09d1ba9b","skillName":"code-review","description":"/code-review"}</forked-skill-launch>';
+
+    const segments = parseMessageSegments(text);
+    expect(segments.filter((s) => s.kind === "tag")).toHaveLength(2);
+    expect(isMachineEmittedMessage(segments)).toBe(true);
+    expect(userMessageLines(text)).toEqual([
+      { label: "cmd›", text: "Running in the background as @code-review", tone: "machine" },
+      { label: "skill›", text: "/code-review launched in background (agent a7db6829)", tone: "machine" },
+    ]);
+  });
+
+  test("real fixture: shell escape (bash-input / empty bash-stdout / bash-stderr)", () => {
+    const text =
+      "<bash-input>supabase db push --linked</bash-input>\n" +
+      "<bash-stdout></bash-stdout><bash-stderr>(eval):1: command not found: supabase\n</bash-stderr>";
+
+    const segments = parseMessageSegments(text);
+    const tagNames = segments.filter((s) => s.kind === "tag").map((s) => (s.kind === "tag" ? s.name : ""));
+    expect(tagNames).toEqual(["bash-input", "bash-stdout", "bash-stderr"]);
+    expect(isMachineEmittedMessage(segments)).toBe(true);
+
+    const lines = userMessageLines(text);
+    expect(lines).toEqual([
+      { label: "sh›", text: "$ supabase db push --linked", tone: "machine" },
+      { label: "err›", text: "(eval):1: command not found: supabase", tone: "error" },
+    ]);
+  });
+
+  test("guard: type-parameter-like/URL-like/inline-code angle brackets never become tags", () => {
+    const text = "Use `Array<string>` and see <https://example.com> — `<not-a-tag>` in code";
+    expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
+    expect(parseUserMessage(text)).toBeNull();
   });
 });
