@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AppEvent, HarnessStatus } from "../shared/types.ts";
+import { plantFakeCodexAppServer } from "./test-codex-app-server.ts";
 
 // Top-level, before any db.ts-touching import: model-discovery.ts imports
 // db.ts (unlike agent-discovery.ts, which is a deliberate leaf) so this file
@@ -312,7 +313,7 @@ test("refreshHarnessModels: an unknown harness id is a true no-op — never thro
   const events: AppEvent[] = [];
   const unsubscribe = subscribeAppEvents((e) => events.push(e));
   try {
-    const codexBin = plantFakeFxModelsBin(`echo 'unused-model-x'; exit 0`);
+    const codexBin = plantFakeCodexAppServer({ pages: [[{ id: "unused-model-x" }]] });
     await withCodexBin(codexBin, async () => {
       await expect(scheduler.refreshHarnessModels("does-not-exist")).resolves.toBeUndefined();
       // A true no-op never probes anything, so codex's kind-level cache
@@ -328,11 +329,58 @@ test("refreshHarnessModels: an unknown harness id is a true no-op — never thro
 
 test("refreshHarnessModels: a known non-fx harness id (e.g. codex, a real built-in row) does a kind-targeted refresh — not a full sweep, not a no-op", async () => {
   resetAll();
-  const codexBin = plantFakeFxModelsBin(`echo 'gpt-9-test'; exit 0`);
+  const codexBin = plantFakeCodexAppServer({ pages: [[{ id: "gpt-9-test" }]] });
   await withCodexBin(codexBin, async () => {
     await expect(scheduler.refreshHarnessModels("codex")).resolves.toBeUndefined();
-    expect(discovery.getDiscoveredModels("codex")).toEqual([{ id: "gpt-9-test" }]);
+    expect(discovery.getDiscoveredModels("codex")).toEqual([{ id: "gpt-9-test", label: "gpt-9-test" }]);
   });
+});
+
+/* ── snapshot key hashes efforts too (not just ids) ──────────────────────── */
+
+test("refreshHarnessModels: an efforts-only catalog change (same ids, different discovered efforts) still publishes agent_models_changed — the snapshot key hashes efforts, not just ids", async () => {
+  resetAll();
+  const events: AppEvent[] = [];
+  const unsubscribe = subscribeAppEvents((e) => events.push(e));
+  // The built-in "codex" harness row ships disabled by default (migration
+  // 016) — publishIfChanged() skips disabled harnesses entirely, so a
+  // publish keyed on the "codex" harness id needs it enabled for the
+  // duration of this test. Restored afterward so sibling tests in this file
+  // (which assume today's default-disabled state) aren't affected.
+  const wasEnabled = harnesses.get("codex")?.enabled !== false;
+  harnesses.setEnabled("codex", true);
+  try {
+    // First refresh (resetAll() cleared previousSnapshot, so this is the
+    // "first publish" — any non-empty harness catalog counts as changed).
+    await withCodexBin(plantFakeCodexAppServer({ pages: [[{ id: "m", efforts: ["low", "high"] }]] }), async () => {
+      await scheduler.refreshHarnessModels("codex");
+    });
+    expect(discovery.getDiscoveredModels("codex")).toEqual([{ id: "m", label: "m", efforts: ["low", "high"] }]);
+    let changeEvents = events.filter((e): e is Extract<AppEvent, { type: "agent_models_changed" }> => e.type === "agent_models_changed");
+    expect(changeEvents.some((e) => e.harnessIds.includes("codex"))).toBe(true);
+    events.length = 0;
+
+    // Same id ("m"), but the reported effort list grew -> snapshot key
+    // changed even though the id set didn't -> publishes again.
+    await withCodexBin(plantFakeCodexAppServer({ pages: [[{ id: "m", efforts: ["low", "high", "ultra"] }]] }), async () => {
+      await scheduler.refreshHarnessModels("codex");
+    });
+    expect(discovery.getDiscoveredModels("codex")).toEqual([{ id: "m", label: "m", efforts: ["low", "high", "ultra"] }]);
+    changeEvents = events.filter((e): e is Extract<AppEvent, { type: "agent_models_changed" }> => e.type === "agent_models_changed");
+    expect(changeEvents.some((e) => e.harnessIds.includes("codex"))).toBe(true);
+    events.length = 0;
+
+    // Identical output as the previous refresh -> snapshot key unchanged ->
+    // not published again.
+    await withCodexBin(plantFakeCodexAppServer({ pages: [[{ id: "m", efforts: ["low", "high", "ultra"] }]] }), async () => {
+      await scheduler.refreshHarnessModels("codex");
+    });
+    changeEvents = events.filter((e): e is Extract<AppEvent, { type: "agent_models_changed" }> => e.type === "agent_models_changed");
+    expect(changeEvents.some((e) => e.harnessIds.includes("codex"))).toBe(false);
+  } finally {
+    harnesses.setEnabled("codex", wasEnabled);
+    unsubscribe();
+  }
 });
 
 /* ── getHarnessModelMap ───────────────────────────────────────────────────── */

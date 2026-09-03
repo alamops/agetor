@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   __testing,
   getAllHarnessDiscoveredModels,
+  getDiscoveredEfforts,
   getDiscoveredModels,
   getHarnessDiscoveredModels,
   isDiscoveryReady,
@@ -14,40 +15,96 @@ import {
   refreshKindModels,
   type FxHarnessTarget,
 } from "./agent-discovery.ts";
+import { plantFakeCodexAppServer } from "./test-codex-app-server.ts";
 
-test("codex parser picks model ids out of a verbose listing", () => {
-  const stdout = [
-    "Available models:",
-    "  ID                NAME            TYPE",
-    "  ----------------  --------------  ---------",
-    "  gpt-5             GPT-5           reasoning",
-    "  gpt-5-codex       GPT-5 Codex     reasoning",
-    "  o4-mini           o4 mini         reasoning",
-    "",
-    "Use `codex exec --model <id>` to start a run.",
-  ].join("\n");
+/* ── codex: parseCodexModelList (pure) ───────────────────────────────────
+ * `discoverCodex` speaks `codex app-server`'s JSON-RPC `model/list` and hands
+ * the concatenated-across-pages `{ data: [...] }` result straight to this
+ * parser — see agent-discovery.ts's doc comment. Replaces the old
+ * line-heuristic `parseCodexModels` parser, which never actually ran against
+ * anything real (`codex prompt --models` never existed). */
 
-  const parsed = __testing.parseCodexModels(stdout);
-  const ids = parsed.map((m) => m.id);
-  expect(ids).toContain("gpt-5");
-  expect(ids).toContain("gpt-5-codex");
-  expect(ids).toContain("o4-mini");
-  // Banner/prose lines must not bleed in.
-  expect(ids).not.toContain("Available");
-  expect(ids).not.toContain("Use");
+test("parseCodexModelList: picks ids and labels out of a model/list result", () => {
+  const result = {
+    data: [
+      { id: "gpt-6-astra", displayName: "GPT-6 Astra" },
+      { id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol" },
+    ],
+  };
+  const parsed = __testing.parseCodexModelList(result);
+  expect(parsed).toEqual([
+    { id: "gpt-6-astra", label: "GPT-6 Astra" },
+    { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
+  ]);
 });
 
-test("codex parser dedupes repeated ids", () => {
-  const parsed = __testing.parseCodexModels("gpt-5\ngpt-5\ngpt-5-codex");
-  expect(parsed.map((m) => m.id)).toEqual(["gpt-5", "gpt-5-codex"]);
+test("parseCodexModelList: carries efforts in reported order and dedupes them", () => {
+  const result = {
+    data: [
+      {
+        id: "gpt-6-astra",
+        displayName: "GPT-6 Astra",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "ultra" },
+          { reasoningEffort: "high" },
+          { reasoningEffort: "high" },
+          { reasoningEffort: "low" },
+        ],
+      },
+    ],
+  };
+  const parsed = __testing.parseCodexModelList(result);
+  expect(parsed).toEqual([
+    { id: "gpt-6-astra", label: "GPT-6 Astra", efforts: ["ultra", "high", "low"] },
+  ]);
 });
 
-test("codex parser drops single-token words without dashes", () => {
-  // Real model ids in our universe always contain a dash (gpt-5, gpt-5-codex,
-  // o4-mini, opus-4-7). A bare prose word like "Available" wouldn't match
-  // even if the header guard missed it.
-  const parsed = __testing.parseCodexModels("hello\nworld\ngpt-5");
-  expect(parsed.map((m) => m.id)).toEqual(["gpt-5"]);
+test("parseCodexModelList: omits the efforts key when the list is empty or missing", () => {
+  const result = {
+    data: [
+      { id: "x", displayName: "X", supportedReasoningEfforts: [] },
+      { id: "y", displayName: "Y" },
+    ],
+  };
+  const parsed = __testing.parseCodexModelList(result);
+  // toEqual is exact-shape here — this fails if an `efforts` key sneaks in.
+  expect(parsed[0]).toEqual({ id: "x", label: "X" });
+  expect(parsed[1]).toEqual({ id: "y", label: "Y" });
+});
+
+test("parseCodexModelList: skips hidden:true entries", () => {
+  const result = {
+    data: [
+      { id: "visible", displayName: "Visible" },
+      { id: "secret", displayName: "Secret", hidden: true },
+    ],
+  };
+  const parsed = __testing.parseCodexModelList(result);
+  expect(parsed).toEqual([{ id: "visible", label: "Visible" }]);
+});
+
+test("parseCodexModelList: dedupes repeated ids, first occurrence wins", () => {
+  const result = {
+    data: [
+      { id: "dup", displayName: "First" },
+      { id: "dup", displayName: "Second" },
+    ],
+  };
+  const parsed = __testing.parseCodexModelList(result);
+  expect(parsed).toEqual([{ id: "dup", label: "First" }]);
+});
+
+test("parseCodexModelList: malformed inputs degrade to [] without throwing", () => {
+  expect(__testing.parseCodexModelList(null)).toEqual([]);
+  expect(__testing.parseCodexModelList({})).toEqual([]);
+  expect(__testing.parseCodexModelList({ data: "nope" })).toEqual([]);
+  expect(__testing.parseCodexModelList({ data: [null, 42, { id: "" }] })).toEqual([]);
+});
+
+test("parseCodexModelList: ignores a non-string displayName", () => {
+  const result = { data: [{ id: "x", displayName: 42 }] };
+  const parsed = __testing.parseCodexModelList(result);
+  expect(parsed).toEqual([{ id: "x" }]);
 });
 
 test("cache returns an empty list before refresh is called", () => {
@@ -57,17 +114,69 @@ test("cache returns an empty list before refresh is called", () => {
   expect(Array.isArray(getDiscoveredModels("codex"))).toBe(true);
 });
 
-test("refreshDiscoveredModels resolves without throwing when the CLI is missing", async () => {
-  // Point to a binary that definitely doesn't exist so the spawn fails fast.
-  const prev = process.env.AGETOR_CODEX_BIN;
-  process.env.AGETOR_CODEX_BIN = "/tmp/agetor-nonexistent-codex-bin-xxxxx";
-  try {
-    await refreshDiscoveredModels();
-    expect(getDiscoveredModels("codex")).toEqual([]);
-  } finally {
-    if (prev === undefined) delete process.env.AGETOR_CODEX_BIN;
-    else process.env.AGETOR_CODEX_BIN = prev;
-  }
+/* ── codex: discoverCodex end-to-end (via refreshKindModels + a planted
+ * `codex app-server` JSON-RPC stub) ─────────────────────────────────────── */
+
+test("discoverCodex (via refreshKindModels): one page with a hidden row surfaces only the visible rows, with label + efforts", async () => {
+  __testing.resetForTests();
+  const bin = plantFakeCodexAppServer({
+    pages: [
+      [
+        { id: "m1", displayName: "M One", efforts: ["low", "high", "ultra"] },
+        { id: "m2", displayName: "M Two", hidden: true },
+      ],
+    ],
+  });
+  await withEnvOverride("AGETOR_CODEX_BIN", bin, async () => {
+    await refreshKindModels("codex");
+  });
+  expect(getDiscoveredModels("codex")).toEqual([
+    { id: "m1", label: "M One", efforts: ["low", "high", "ultra"] },
+  ]);
+});
+
+test("discoverCodex (via refreshKindModels): two pages via nextCursor are merged in order", async () => {
+  __testing.resetForTests();
+  const bin = plantFakeCodexAppServer({
+    pages: [
+      [{ id: "page1-model", displayName: "Page 1 Model" }],
+      [{ id: "page2-model", displayName: "Page 2 Model" }],
+    ],
+  });
+  await withEnvOverride("AGETOR_CODEX_BIN", bin, async () => {
+    await refreshKindModels("codex");
+  });
+  expect(getDiscoveredModels("codex")).toEqual([
+    { id: "page1-model", label: "Page 1 Model" },
+    { id: "page2-model", label: "Page 2 Model" },
+  ]);
+});
+
+test("discoverCodex (via refreshKindModels): a JSON-RPC error on model/list resolves to []", async () => {
+  __testing.resetForTests();
+  const bin = plantFakeCodexAppServer({ pages: [[{ id: "unreachable" }]], error: true });
+  await withEnvOverride("AGETOR_CODEX_BIN", bin, async () => {
+    await refreshKindModels("codex");
+  });
+  expect(getDiscoveredModels("codex")).toEqual([]);
+});
+
+test("discoverCodex (via refreshKindModels): /bin/echo as the bin resolves to [] promptly — on child exit, not the 5s timer", async () => {
+  __testing.resetForTests();
+  const start = Date.now();
+  await withEnvOverride("AGETOR_CODEX_BIN", "/bin/echo", async () => {
+    await refreshKindModels("codex");
+  });
+  expect(getDiscoveredModels("codex")).toEqual([]);
+  expect(Date.now() - start).toBeLessThan(2_000);
+});
+
+test("discoverCodex (via refreshKindModels): a non-existent bin path resolves to [] without throwing", async () => {
+  __testing.resetForTests();
+  await withEnvOverride("AGETOR_CODEX_BIN", "/tmp/agetor-nonexistent-codex-bin-xxxxx", async () => {
+    await refreshKindModels("codex");
+  });
+  expect(getDiscoveredModels("codex")).toEqual([]);
 });
 
 /* ── fx: parseFxModels (pure) ────────────────────────────────────────────
@@ -421,13 +530,13 @@ function plantBin(name: string, script: string): string {
 
 test("refreshKindModels: refreshes only the targeted kind's cache, leaving a sibling kind untouched", async () => {
   __testing.resetForTests();
-  const codexBin = plantBin("codex", `echo 'model-one-x'; exit 0`);
+  const codexBin = plantFakeCodexAppServer({ pages: [[{ id: "model-one-x" }]] });
   const cursorBin = plantBin("cursor-agent", `echo 'model-two-y'; exit 0`);
 
   await withEnvOverride("AGETOR_CODEX_BIN", codexBin, () =>
     withEnvOverride("AGETOR_CURSOR_BIN", cursorBin, async () => {
       await refreshKindModels("codex");
-      expect(getDiscoveredModels("codex")).toEqual([{ id: "model-one-x" }]);
+      expect(getDiscoveredModels("codex")).toEqual([{ id: "model-one-x", label: "model-one-x" }]);
       // refreshKindModels("codex") must never have probed cursor.
       expect(getDiscoveredModels("cursor")).toEqual([]);
     }));
@@ -484,4 +593,58 @@ test("refreshDiscoveredModels: a thunk `fxHarnesses` is resolved inside the enqu
     await promise;
   });
   expect(getAllHarnessDiscoveredModels()).toEqual({ "after-run": [{ id: "x" }] });
+});
+
+/* ── getDiscoveredEfforts (the bun-side twin of `discoveredEffortsFor` in
+ * src/shared/model-options.ts): harness cache first, then kind cache, `null`
+ * when nothing matches or the matching entry has no efforts ────────────── */
+
+test("getDiscoveredEfforts: returns the discovered efforts for a codex model after refresh", async () => {
+  __testing.resetForTests();
+  const bin = plantFakeCodexAppServer({
+    pages: [[{ id: "gpt-6-astra", displayName: "GPT-6 Astra", efforts: ["ultra", "max", "high"] }]],
+  });
+  await withEnvOverride("AGETOR_CODEX_BIN", bin, async () => {
+    await refreshKindModels("codex");
+  });
+  expect(getDiscoveredEfforts("codex", "gpt-6-astra")).toEqual(["ultra", "max", "high"]);
+});
+
+test("getDiscoveredEfforts: null for an unknown model id", async () => {
+  __testing.resetForTests();
+  const bin = plantFakeCodexAppServer({ pages: [[{ id: "gpt-6-astra", efforts: ["high"] }]] });
+  await withEnvOverride("AGETOR_CODEX_BIN", bin, async () => {
+    await refreshKindModels("codex");
+  });
+  expect(getDiscoveredEfforts("codex", "does-not-exist")).toBeNull();
+});
+
+test("getDiscoveredEfforts: null for a model whose discovered entry has no efforts", async () => {
+  __testing.resetForTests();
+  const bin = plantFakeCodexAppServer({ pages: [[{ id: "no-efforts-model" }]] });
+  await withEnvOverride("AGETOR_CODEX_BIN", bin, async () => {
+    await refreshKindModels("codex");
+  });
+  expect(getDiscoveredEfforts("codex", "no-efforts-model")).toBeNull();
+});
+
+test("getDiscoveredEfforts: null when nothing is cached for the kind", () => {
+  __testing.resetForTests();
+  expect(getDiscoveredEfforts("codex", "anything")).toBeNull();
+});
+
+// codex has no per-harness discovery seam today — only fx populates
+// `harnessCache` (via `refreshFxHarnessModels`/the `fxHarnesses` sweep
+// option), so harness-first precedence for codex can't be exercised here.
+// This pins the fallback half of that precedence instead: a `harnessId`
+// with no entry in `harnessCache` (true for every codex harness id, since
+// nothing ever writes one) falls through to the kind-level cache rather than
+// returning `null` outright.
+test("getDiscoveredEfforts: a harnessId with no harness-cache entry falls back to the kind cache", async () => {
+  __testing.resetForTests();
+  const bin = plantFakeCodexAppServer({ pages: [[{ id: "gpt-6-astra", efforts: ["ultra"] }]] });
+  await withEnvOverride("AGETOR_CODEX_BIN", bin, async () => {
+    await refreshKindModels("codex");
+  });
+  expect(getDiscoveredEfforts("codex", "gpt-6-astra", "some-codex-harness-id")).toEqual(["ultra"]);
 });
