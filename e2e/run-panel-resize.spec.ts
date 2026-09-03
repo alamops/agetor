@@ -1,14 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { test, expect, type APIRequestContext, type E2EBackend, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import { getPreferences, gotoApp, openSettingsGeneral } from "./helpers";
 
 /**
  * E2E coverage for the RunPanel's user-resizable width (drag handle on the
  * panel's left edge, persisted in localStorage — `src/mainview/lib/
- * panel-width.ts`) and for the removal of the sticky user-message pinning
- * (user bubbles used to carry `sticky top-0` and overlay the transcript
- * while scrolling).
+ * panel-width.ts`) and for the configurable user-message pinning.
  *
  * Mirrors the boot/task-creation/panel-opening idiom from
  * `e2e/run-panel-header.spec.ts`: per-worker headless backend with
@@ -118,21 +116,35 @@ test.describe("run panel resize", () => {
     await expect.poll(() => panelWidth(page)).toBe(DEFAULT_WIDTH);
   });
 
-  test("user-message bubbles scroll with the transcript (no sticky overlay)", async ({
+  test("user messages are sticky by default and can switch to a standard chat list", async ({
     page,
     request,
     backend,
   }) => {
-    const prompt = `no-sticky-e2e ${randomUUID()}`;
+    const prompt = `sticky-toggle-e2e ${randomUUID()}`;
     await createAndStartFakeClaudeTask(request, backend, prompt);
 
     await gotoApp(page, backend.bootBase);
     const panel = await openTask(page, prompt);
 
-    // The prompt renders as a user bubble in the transcript…
+    // The prompt renders as a sticky user bubble by default.
     await expect(panel.getByText(prompt, { exact: true }).last()).toBeVisible();
-    // …and no event wrapper in the panel carries the old sticky pinning that
-    // made user messages overlay the assistant text while scrolling.
-    await expect(panel.locator("[data-evid].sticky")).toHaveCount(0);
+    await expect(panel.locator("[data-evid].sticky")).toHaveCount(1);
+
+    await panel.getByRole("button", { name: "Close" }).click();
+    const settings = await openSettingsGeneral(page);
+    const stickySwitch = settings.getByRole("switch", { name: "Sticky user messages" });
+    await expect(stickySwitch).toBeChecked();
+    await stickySwitch.click();
+    await expect(stickySwitch).not.toBeChecked();
+    await expect.poll(async () => (await getPreferences(request, backend)).stickyUserMessages).toBe("false");
+    await settings.getByRole("button", { name: "Close" }).click();
+
+    // Reload to prove the standard-list selection comes back from the
+    // persisted preference, rather than only living in App state.
+    await page.reload();
+    await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+    const standardPanel = await openTask(page, prompt);
+    await expect(standardPanel.locator("[data-evid].sticky")).toHaveCount(0);
   });
 });

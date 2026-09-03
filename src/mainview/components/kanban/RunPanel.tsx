@@ -137,6 +137,8 @@ type StreamEvent = RunEvent & { id: number; dbId?: number };
 interface Props {
   /** When null, the panel slides off-screen and unmounts after the exit animation. */
   task: Task | null;
+  /** Pin the current user message while its response scrolls (default mode). */
+  stickyUserMessages: boolean;
   agents: AgentStatus[];
   /** Registered harnesses — needed so the panel's agent dropdown can list
    *  every known harness (built-ins + aliases). */
@@ -267,7 +269,7 @@ function formatUsageCount(n: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -451,6 +453,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, 
         />
         <RunPanelBody
           task={mountedTask}
+          stickyUserMessages={stickyUserMessages}
           agents={agents}
           harnesses={harnesses}
           agentModels={agentModels}
@@ -477,6 +480,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, 
  */
 function RunPanelBody({
   task,
+  stickyUserMessages,
   agents,
   harnesses,
   agentModels,
@@ -493,6 +497,7 @@ function RunPanelBody({
   onViewIssue,
 }: {
   task: Task;
+  stickyUserMessages: boolean;
   agents: AgentStatus[];
   harnesses: Harness[];
   agentModels: AgentModelMap;
@@ -3012,6 +3017,7 @@ function RunPanelBody({
               </div>
               <RunEventList
                 events={displayedEvents}
+                stickyUserMessages={stickyUserMessages}
                 interactions={interactions}
                 onInteractionResolved={dismissInteraction}
                 runStatus={activeRunStatus}
@@ -4003,6 +4009,7 @@ type RunIndicatorMode = "off" | "active";
 
 function RunEventList({
   events,
+  stickyUserMessages,
   interactions = [],
   onInteractionResolved,
   runStatus,
@@ -4015,6 +4022,8 @@ function RunEventList({
   onAskAnswerWithheld,
 }: {
   events: RunEvent[];
+  /** True groups turns and pins each user message for its own response. */
+  stickyUserMessages: boolean;
   interactions?: PendingInteraction[];
   onInteractionResolved?: (id: string) => void;
   runStatus?: Run["status"] | null;
@@ -4169,12 +4178,10 @@ function RunEventList({
     return slots;
   }, [normalised, sortedInteractions]);
 
-  // Render every event and interaction card as one flat block list. (User
-  // messages used to open a `<section>` and pin `sticky top-0` for the
-  // section's duration; the pinning overlaid the transcript with a
-  // transparent wrapper and was removed — user messages now scroll normally
-  // with the conversation, and with it gone the grouping had no observable
-  // output left, so it went too.)
+  // Render either turn-grouped sections with a sticky user-message header or
+  // one flat, normally scrolling block list. Settings defaults to the former
+  // because keeping the last sent message visible is useful while
+  // multitasking; users who prefer a standard chat list select the latter.
   //
   // Memoized over the parsed inputs: this rebuilds the rendered element tree
   // only when the events / interactions / tool-result map actually change.
@@ -4196,7 +4203,8 @@ function RunEventList({
     // highlight ring itself is toggled by the DOM effect in RunPanelBody, not
     // by a render-time class, so this memo doesn't need `activeMatchId` as a
     // dep (re-deriving the whole block tree on every match navigation was
-    // the point being fixed).
+    // the point being fixed). `extraClassName` is used only by sticky mode:
+    // the wrapper, as the direct flex child, is the element that must pin.
     // Returns `null` (no wrapper at all) when `node` is nullish, so an event
     // with nothing to render (e.g. an unparseable orphan tool_result — see
     // the `tool_result` case below) doesn't still leave a phantom empty div
@@ -4205,10 +4213,11 @@ function RunEventList({
       key: string,
       evid: number,
       node: React.ReactNode,
+      extraClassName?: string,
     ): React.ReactNode => {
       if (node === null || node === undefined) return null;
       return (
-        <div key={key} data-evid={evid}>
+        <div key={key} data-evid={evid} className={extraClassName}>
           {node}
         </div>
       );
@@ -4216,7 +4225,14 @@ function RunEventList({
     const renderEvent = (e: RunEvent, key: string, evid: number): React.ReactNode[] => {
       switch (e.stream) {
         case "user":
-          return [wrap(key, evid, <UserMessageBlock text={e.data} taskId={taskId} />)];
+          return [
+            wrap(
+              key,
+              evid,
+              <UserMessageBlock text={e.data} taskId={taskId} />,
+              stickyUserMessages ? "sticky top-0 z-10" : undefined,
+            ),
+          ];
         case "assistant":
           return [wrap(key, evid, <AssistantBlock text={e.data} />)];
         case "thinking":
@@ -4307,6 +4323,38 @@ function RunEventList({
       }
     };
 
+    if (stickyUserMessages) {
+      const sections: { key: string; header: React.ReactNode; body: React.ReactNode[] }[] = [];
+      // Preamble events before the first user message share an initial
+      // headerless section. Each subsequent user message starts a new turn;
+      // its sticky lifetime naturally ends at that section's boundary.
+      let current: { key: string; header: React.ReactNode; body: React.ReactNode[] } = {
+        key: "",
+        header: null,
+        body: [],
+      };
+      for (let i = 0; i < normalised.length; i++) {
+        const e = normalised[i]!;
+        const key = `${e.ts}-${i}`;
+        const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
+        if (e.stream === "user") {
+          if (current.header !== null || current.body.length > 0) sections.push(current);
+          current = { key, header: renderEvent(e, key, i)[0] ?? null, body: [...before] };
+        } else {
+          if (current.key === "") current.key = key;
+          current.body.push(...before, ...renderEvent(e, key, i));
+        }
+      }
+      current.body.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
+      if (current.header !== null || current.body.length > 0) sections.push(current);
+      return sections.map((section, index) => (
+        <section key={section.key || `section-${index}`} className="flex flex-col gap-4">
+          {section.header}
+          {section.body}
+        </section>
+      ));
+    }
+
     const out: React.ReactNode[] = [];
     for (let i = 0; i < normalised.length; i++) {
       const e = normalised[i]!;
@@ -4326,7 +4374,7 @@ function RunEventList({
     // finished") spill out at the bottom.
     out.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId, stickyUserMessages]);
 
   return (
     <div className="flex flex-col gap-4">
