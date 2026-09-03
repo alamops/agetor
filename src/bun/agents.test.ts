@@ -80,7 +80,7 @@ const codexDefaults = { mode: "auto", model: "gpt-5.6-sol", effort: "high" } as 
 const cursorDefaults = { mode: "auto", model: "cursor-grok-4.6", effort: "high" } as const;
 // Gemini has no effort flag at all (see MODEL_EFFORT_SUPPORT.gemini in
 // shared/types.ts) — buildCommand's gemini branch never reads opts.effort.
-const geminiDefaults = { mode: "auto", model: "gemini-3-pro-preview" } as const;
+const geminiDefaults = { mode: "auto", model: "gemini-3.1-pro-preview" } as const;
 // fx has no effort flag either (silently ignored, mirrors gemini) but,
 // unlike every other kind, buildCommand also requires `runId` (used to build
 // the deterministic --log-file path) — see the throw tests below.
@@ -788,7 +788,7 @@ test("gemini with defaults emits -m + stream-json + --yolo + --skip-trust, promp
   const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults });
   expect(cmd).toEqual([
     "gemini",
-    "-m", "gemini-3-pro-preview",
+    "-m", "gemini-3.1-pro-preview",
     "--output-format", "stream-json",
     "--yolo",
     "--skip-trust",
@@ -813,7 +813,7 @@ test("gemini 'ask' mode uses --approval-mode plan instead of --yolo", () => {
   expect(cmd).not.toContain("--yolo");
   expect(cmd).toEqual([
     "gemini",
-    "-m", "gemini-3-pro-preview",
+    "-m", "gemini-3.1-pro-preview",
     "--output-format", "stream-json",
     "--approval-mode", "plan",
     "--skip-trust",
@@ -865,7 +865,7 @@ test("gemini throws when model is missing", () => {
 });
 
 test("gemini never requires effort — no flag emitted, no throw, even when omitted", () => {
-  const { cmd, env } = buildCommand(builtin("gemini"), "hi", { mode: "auto", model: "gemini-3-pro-preview" });
+  const { cmd, env } = buildCommand(builtin("gemini"), "hi", { mode: "auto", model: "gemini-3.1-pro-preview" });
   expect(cmd).toContain("-p");
   // No effort-shaped flag anywhere in argv, and no env var either.
   expect(cmd.join(" ")).not.toMatch(/effort/i);

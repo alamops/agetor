@@ -492,7 +492,7 @@ test("reconcileTaskSession resets mode to fx's own modes[0] when switching INTO 
     mode: "ask", // valid for gemini, and happens to also be a valid fx id —
     // still must be reset since the KIND changed, not preserved because the
     // literal id happens to overlap.
-    model: "gemini-3-pro-preview",
+    model: "gemini-3.1-pro-preview",
     effort: null,
   });
   tasks.insert(before);

@@ -151,12 +151,13 @@ test("none of the seven previously-curated fx ids survives as an unconditional r
   expect(Object.keys(MODEL_EFFORT_SUPPORT.fx)).not.toContain("google/gemini-3-pro");
 });
 
-test("exactly the five premium Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
+test("exactly the six premium Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
   const expectedCatalogOnly = new Set([
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-5",
     "openai/gpt-5.5",
     "google/gemini-3.1-pro-preview",
+    "google/gemini-3.8-flash",
     "moonshotai/kimi-k3",
   ]);
   const actualCatalogOnly = new Set(
