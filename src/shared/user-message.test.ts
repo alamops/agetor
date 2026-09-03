@@ -1,11 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import {
   canonicalizeUserText,
+  forkedSkillLabel,
+  hasTagSegments,
+  humanizeTagName,
   isMachineEmittedMessage,
   parseForkedSkillLaunch,
   parseMessageSegments,
   parseUserMessage,
   splitReferences,
+  stripAnsiSgr,
+  tryParseJsonBody,
   userMessageLines,
 } from "./user-message.ts";
 import { appendReferences } from "./refs.ts";
@@ -396,5 +401,525 @@ describe("parseMessageSegments — smoke", () => {
     const text = "Use `Array<string>` and see <https://example.com> — `<not-a-tag>` in code";
     expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
     expect(parseUserMessage(text)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Area 1 — parseMessageSegments matrix
+
+describe("parseMessageSegments — segment matrix", () => {
+  test("balanced tag with prose before and after: 3 segments, text verbatim/untrimmed", () => {
+    const text = "before text <note>body here</note> after text";
+    expect(parseMessageSegments(text)).toEqual([
+      { kind: "text", text: "before text " },
+      { kind: "tag", name: "note", attrs: "", body: "body here", raw: "<note>body here</note>" },
+      { kind: "text", text: " after text" },
+    ]);
+  });
+
+  test("self-closing <note/> and <note kind=\"x\" /> — attrs captured, body empty", () => {
+    expect(parseMessageSegments("<note/>")).toEqual([
+      { kind: "tag", name: "note", attrs: "", body: "", raw: "<note/>" },
+    ]);
+    expect(parseMessageSegments('<note kind="x" />')).toEqual([
+      { kind: "tag", name: "note", attrs: 'kind="x"', body: "", raw: '<note kind="x" />' },
+    ]);
+  });
+
+  test("attrs on a normal (non-self-closing) tag are captured trimmed, body untouched", () => {
+    expect(parseMessageSegments('<box kind="x">hello</box>')).toEqual([
+      { kind: "tag", name: "box", attrs: 'kind="x"', body: "hello", raw: '<box kind="x">hello</box>' },
+    ]);
+  });
+
+  test("nested tags of a DIFFERENT name: outer segment's body contains the inner tag's raw text", () => {
+    const text = "<outer>text <inner>y</inner> more</outer>";
+    expect(parseMessageSegments(text)).toEqual([
+      { kind: "tag", name: "outer", attrs: "", body: "text <inner>y</inner> more", raw: text },
+    ]);
+  });
+
+  test("same-name nesting closes at the OUTER close, not the inner one", () => {
+    const text = "<a-tag>outer <a-tag>inner</a-tag> more</a-tag>";
+    expect(parseMessageSegments(text)).toEqual([
+      { kind: "tag", name: "a-tag", attrs: "", body: "outer <a-tag>inner</a-tag> more", raw: text },
+    ]);
+  });
+
+  test("unbalanced <foo> (no closing tag) yields a single untouched text segment", () => {
+    const text = "<foo>abc";
+    expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
+  });
+
+  test("uppercase tag names (<T>, <Foo>) are never recognized as tags", () => {
+    expect(parseMessageSegments("<T>abc</T>")).toEqual([{ kind: "text", text: "<T>abc</T>" }]);
+    expect(parseMessageSegments("<Foo>abc</Foo>")).toEqual([{ kind: "text", text: "<Foo>abc</Foo>" }]);
+  });
+
+  test("Array<string> (a TS generic, no matching close) stays plain text", () => {
+    const text = "a value of type Array<string> in TS";
+    expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
+  });
+
+  test("an autolink <https://example.com> is never a tag", () => {
+    const text = "see <https://example.com> for more";
+    expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
+  });
+
+  test("an email autolink <foo@bar.com> is never a tag", () => {
+    const text = "contact <foo@bar.com> please";
+    expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
+  });
+
+  test("HTML element names (<b>, <div>) stay literal text", () => {
+    expect(parseMessageSegments("<b>x</b>")).toEqual([{ kind: "text", text: "<b>x</b>" }]);
+    expect(parseMessageSegments("<div>..</div>")).toEqual([{ kind: "text", text: "<div>..</div>" }]);
+  });
+
+  test("the three reserved command-XML tag names are never recognized as generic tags", () => {
+    expect(parseMessageSegments("<command-message>hi</command-message>")).toEqual([
+      { kind: "text", text: "<command-message>hi</command-message>" },
+    ]);
+    expect(parseMessageSegments("<command-name>/foo</command-name>")).toEqual([
+      { kind: "text", text: "<command-name>/foo</command-name>" },
+    ]);
+    expect(parseMessageSegments("<command-args>x</command-args>")).toEqual([
+      { kind: "text", text: "<command-args>x</command-args>" },
+    ]);
+  });
+
+  test("a tag inside a fenced ``` block is protected as text; a tag AFTER the fence still parses", () => {
+    const text = ["```", "<inside>fenced</inside>", "```", "<after>parsed</after>"].join("\n");
+    expect(parseMessageSegments(text)).toEqual([
+      { kind: "text", text: "```\n<inside>fenced</inside>\n```\n" },
+      { kind: "tag", name: "after", attrs: "", body: "parsed", raw: "<after>parsed</after>" },
+    ]);
+  });
+
+  test("a tag inside a fenced ~~~ block is protected as text; a tag AFTER the fence still parses", () => {
+    const text = ["~~~", "<inside>fenced</inside>", "~~~", "<after>parsed</after>"].join("\n");
+    expect(parseMessageSegments(text)).toEqual([
+      { kind: "text", text: "~~~\n<inside>fenced</inside>\n~~~\n" },
+      { kind: "tag", name: "after", attrs: "", body: "parsed", raw: "<after>parsed</after>" },
+    ]);
+  });
+
+  test("a tag inside an inline code span (backticks) stays literal text", () => {
+    const text = "see `<flag>on</flag>` here";
+    expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
+  });
+
+  test("an unterminated fence protects everything to the end of the text", () => {
+    const text = ["```", "<tag>never closes</tag>", "more text with <another>tag</another>"].join("\n");
+    expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
+  });
+
+  test("CRLF newlines inside a tag body are normalized to \\n", () => {
+    expect(parseMessageSegments("<box>line one\r\nline two</box>")).toEqual([
+      { kind: "tag", name: "box", attrs: "", body: "line one\nline two", raw: "<box>line one\nline two</box>" },
+    ]);
+  });
+
+  test("bare \\r newlines inside a tag body are normalized to \\n", () => {
+    expect(parseMessageSegments("<box>line one\rline two</box>")).toEqual([
+      { kind: "tag", name: "box", attrs: "", body: "line one\nline two", raw: "<box>line one\nline two</box>" },
+    ]);
+  });
+
+  test("whitespace-only text between two adjacent tags produces no text segment", () => {
+    expect(parseMessageSegments("<one>1</one>   \n  <two>2</two>")).toEqual([
+      { kind: "tag", name: "one", attrs: "", body: "1", raw: "<one>1</one>" },
+      { kind: "tag", name: "two", attrs: "", body: "2", raw: "<two>2</two>" },
+    ]);
+  });
+
+  test("a tag at the very start of the text, with trailing prose", () => {
+    expect(parseMessageSegments("<start>tag</start> trailing text")).toEqual([
+      { kind: "tag", name: "start", attrs: "", body: "tag", raw: "<start>tag</start>" },
+      { kind: "text", text: " trailing text" },
+    ]);
+  });
+
+  test("a tag at the very end of the text, with leading prose", () => {
+    expect(parseMessageSegments("leading text <end>tag</end>")).toEqual([
+      { kind: "text", text: "leading text " },
+      { kind: "tag", name: "end", attrs: "", body: "tag", raw: "<end>tag</end>" },
+    ]);
+  });
+
+  test("a tag that is the entire text (no surrounding prose at all)", () => {
+    expect(parseMessageSegments("<whole>tag</whole>")).toEqual([
+      { kind: "tag", name: "whole", attrs: "", body: "tag", raw: "<whole>tag</whole>" },
+    ]);
+  });
+
+  test("a lone trailing '<' as the last character is never a tag", () => {
+    const text = "hello <";
+    expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
+  });
+
+  test("a closing tag with no matching open (</name> before any open) is text", () => {
+    const text = "</foo> some text";
+    expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
+  });
+
+  test("no tags at all: exactly one text segment covering the whole input", () => {
+    const text = "just prose text";
+    expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
+  });
+
+  test("hasTagSegments is true when at least one tag segment is present", () => {
+    expect(hasTagSegments(parseMessageSegments("<one>1</one>"))).toBe(true);
+  });
+
+  test("hasTagSegments is false for pure prose (no tags recognized)", () => {
+    expect(hasTagSegments(parseMessageSegments("just prose text"))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Area 2 — real fixtures (prod transcript shapes from the plan)
+
+describe("parseMessageSegments / userMessageLines — real fixtures", () => {
+  const forkedNewline =
+    "<local-command-stdout>Running in the background as @code-review</local-command-stdout>\n" +
+    '<forked-skill-launch>{"agentId":"a7db6829e09d1ba9b","skillName":"code-review","description":"/code-review"}</forked-skill-launch>';
+  const forkedSpace =
+    "<local-command-stdout>Running in the background as @code-review</local-command-stdout> " +
+    '<forked-skill-launch>{"agentId":"a7db6829e09d1ba9b","skillName":"code-review","description":"/code-review"}</forked-skill-launch>';
+
+  test("newline-separated forked-skill-launch line: 2 tag segments, isMachineEmittedMessage true", () => {
+    const segments = parseMessageSegments(forkedNewline);
+    expect(segments.filter((s) => s.kind === "tag")).toHaveLength(2);
+    expect(segments).toHaveLength(2);
+    expect(isMachineEmittedMessage(segments)).toBe(true);
+  });
+
+  test("space-separated forked-skill-launch line (copy-paste artifact): same result as newline-separated", () => {
+    const segments = parseMessageSegments(forkedSpace);
+    expect(segments.filter((s) => s.kind === "tag")).toHaveLength(2);
+    expect(segments).toHaveLength(2);
+    expect(isMachineEmittedMessage(segments)).toBe(true);
+  });
+
+  test("<bash-input>supabase db push --linked</bash-input> alone parses to a single machine-emitted tag", () => {
+    const text = "<bash-input>supabase db push --linked</bash-input>";
+    const segments = parseMessageSegments(text);
+    expect(segments).toEqual([
+      { kind: "tag", name: "bash-input", attrs: "", body: "supabase db push --linked", raw: text },
+    ]);
+    expect(isMachineEmittedMessage(segments)).toBe(true);
+    expect(userMessageLines(text)).toEqual([{ label: "sh›", text: "$ supabase db push --linked", tone: "machine" }]);
+  });
+
+  test("<bash-stdout></bash-stdout><bash-stderr>...</bash-stderr> pair with empty stdout", () => {
+    const text = "<bash-stdout></bash-stdout><bash-stderr>(eval):1: command not found: supabase\n</bash-stderr>";
+    const segments = parseMessageSegments(text);
+    expect(segments).toEqual([
+      { kind: "tag", name: "bash-stdout", attrs: "", body: "", raw: "<bash-stdout></bash-stdout>" },
+      {
+        kind: "tag",
+        name: "bash-stderr",
+        attrs: "",
+        body: "(eval):1: command not found: supabase\n",
+        raw: "<bash-stderr>(eval):1: command not found: supabase\n</bash-stderr>",
+      },
+    ]);
+    expect(isMachineEmittedMessage(segments)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Area 3 — parseForkedSkillLaunch / forkedSkillLabel / humanizeTagName /
+// tryParseJsonBody / stripAnsiSgr
+
+describe("parseForkedSkillLaunch", () => {
+  test("valid body with all three fields", () => {
+    expect(
+      parseForkedSkillLaunch('{"agentId":"abc123","skillName":"code-review","description":"/code-review"}'),
+    ).toEqual({ agentId: "abc123", skillName: "code-review", description: "/code-review" });
+  });
+
+  test("missing agentId and description default to empty strings", () => {
+    expect(parseForkedSkillLaunch('{"skillName":"code-review"}')).toEqual({
+      agentId: "",
+      skillName: "code-review",
+      description: "",
+    });
+  });
+
+  test("a JSON array body is not an object → null", () => {
+    expect(parseForkedSkillLaunch("[1,2,3]")).toBeNull();
+  });
+
+  test("a JSON scalar body (string) is not an object → null", () => {
+    expect(parseForkedSkillLaunch('"just a string"')).toBeNull();
+  });
+
+  test("invalid JSON → null", () => {
+    expect(parseForkedSkillLaunch("{not json")).toBeNull();
+  });
+
+  test("missing skillName → null", () => {
+    expect(parseForkedSkillLaunch('{"agentId":"abc"}')).toBeNull();
+  });
+
+  test("non-string skillName → null", () => {
+    expect(parseForkedSkillLaunch('{"skillName":123}')).toBeNull();
+  });
+
+  test("empty or whitespace-only body → null", () => {
+    expect(parseForkedSkillLaunch("")).toBeNull();
+    expect(parseForkedSkillLaunch("   ")).toBeNull();
+  });
+});
+
+describe("forkedSkillLabel", () => {
+  test("description starting with '/' wins over skillName", () => {
+    expect(forkedSkillLabel({ agentId: "a", skillName: "code-review", description: "/code-review" })).toBe(
+      "/code-review",
+    );
+  });
+
+  test("description not starting with '/' falls back to /<skillName>", () => {
+    expect(forkedSkillLabel({ agentId: "a", skillName: "code-review", description: "runs code review" })).toBe(
+      "/code-review",
+    );
+  });
+
+  test("empty description falls back to /<skillName>", () => {
+    expect(forkedSkillLabel({ agentId: "a", skillName: "code-review", description: "" })).toBe("/code-review");
+  });
+});
+
+describe("humanizeTagName", () => {
+  test("hyphens become spaces", () => {
+    expect(humanizeTagName("forked-skill-launch")).toBe("forked skill launch");
+  });
+
+  test("underscores become spaces", () => {
+    expect(humanizeTagName("some_tag_name")).toBe("some tag name");
+  });
+
+  test("runs of mixed hyphens/underscores collapse to a single space", () => {
+    expect(humanizeTagName("a--b__c")).toBe("a b c");
+  });
+
+  test("a name with no separators is returned unchanged", () => {
+    expect(humanizeTagName("note")).toBe("note");
+  });
+});
+
+describe("tryParseJsonBody", () => {
+  test("a JSON object body returns the parsed value", () => {
+    expect(tryParseJsonBody('{"a":1}')).toEqual({ a: 1 });
+  });
+
+  test("a JSON array body returns the parsed value", () => {
+    expect(tryParseJsonBody("[1,2,3]")).toEqual([1, 2, 3]);
+  });
+
+  test("a scalar JSON body (string/number/boolean/null) returns undefined", () => {
+    expect(tryParseJsonBody('"hello"')).toBeUndefined();
+    expect(tryParseJsonBody("42")).toBeUndefined();
+    expect(tryParseJsonBody("true")).toBeUndefined();
+    expect(tryParseJsonBody("null")).toBeUndefined();
+  });
+
+  test("invalid JSON returns undefined", () => {
+    expect(tryParseJsonBody("{not json")).toBeUndefined();
+  });
+
+  test("empty/whitespace-only body returns undefined", () => {
+    expect(tryParseJsonBody("")).toBeUndefined();
+    expect(tryParseJsonBody("   ")).toBeUndefined();
+  });
+});
+
+describe("stripAnsiSgr", () => {
+  test("strips SGR escape codes around bolded text", () => {
+    expect(stripAnsiSgr("Set model to \x1b[1mOpus 5\x1b[22m done")).toBe("Set model to Opus 5 done");
+  });
+
+  test("text with no ANSI codes is returned unchanged", () => {
+    expect(stripAnsiSgr("no ansi here")).toBe("no ansi here");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Area 4 — isMachineEmittedMessage
+
+describe("isMachineEmittedMessage", () => {
+  test("true when every segment is a machine tag", () => {
+    expect(isMachineEmittedMessage(parseMessageSegments("<bash-input>ls</bash-input>"))).toBe(true);
+  });
+
+  test("false when a machine tag is mixed with authored text", () => {
+    expect(isMachineEmittedMessage(parseMessageSegments("hi <bash-input>ls</bash-input>"))).toBe(false);
+  });
+
+  test("false for a user-authored tag not in MACHINE_TAGS (e.g. <context>)", () => {
+    expect(isMachineEmittedMessage(parseMessageSegments("<context>hello</context>"))).toBe(false);
+  });
+
+  test("false for an empty segment array", () => {
+    expect(isMachineEmittedMessage([])).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Area 5 — parseUserMessage → tagged kind, precedence, and null guards
+
+describe("parseUserMessage — tagged kind", () => {
+  test("a user-authored tag plus prose parses to kind 'tagged' with segments and empty references", () => {
+    const text = "<context>some info</context>\n\nPlease do the thing";
+    const segments = parseMessageSegments(text);
+    expect(parseUserMessage(text)).toEqual({ kind: "tagged", text, segments, references: [] });
+  });
+
+  test("a trailing Referenced files/folders block is split off: text excludes it, references populated", () => {
+    const base = "<context>info</context>\n\nDo it";
+    const text = appendReferences(base, REFS);
+    const expectedSegments = parseMessageSegments(base);
+    expect(parseUserMessage(text)).toEqual({
+      kind: "tagged",
+      text: base,
+      segments: expectedSegments,
+      references: ["/a/b.png", "/c/d/"],
+    });
+  });
+
+  test("a message with only HTML-named or unbalanced tags is ordinary text → null", () => {
+    expect(parseUserMessage("<b>x</b>")).toBeNull();
+    expect(parseUserMessage("<foo>abc")).toBeNull();
+  });
+});
+
+describe("parseUserMessage — precedence order", () => {
+  test("the slash-command XML twin wins even when its args contain a user-authored tag (kind stays 'command', tag left inside args)", () => {
+    const xml = [
+      "<command-message>run</command-message>",
+      "<command-name>/run</command-name>",
+      "<command-args>please handle <note>this thing</note> carefully</command-args>",
+    ].join("\n");
+    expect(parseUserMessage(xml)).toEqual({
+      kind: "command",
+      command: { name: "/run", args: "please handle <note>this thing</note> carefully", references: [] },
+    });
+  });
+
+  test("a lone <local-command-stdout> (full match) stays kind 'command-output', not 'tagged'", () => {
+    expect(parseUserMessage("<local-command-stdout>only</local-command-stdout>")).toEqual({
+      kind: "command-output",
+      output: "only",
+    });
+  });
+
+  test("local-command-stdout combined with extra prose fails the strict full-match and falls through to 'tagged'", () => {
+    const text = "<local-command-stdout>foo</local-command-stdout> and more text";
+    expect(parseUserMessage(text)).toEqual({
+      kind: "tagged",
+      text,
+      segments: parseMessageSegments(text),
+      references: [],
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Area 6 — userMessageLines plain-text rendering
+
+describe("userMessageLines", () => {
+  test("ordinary text yields exactly one you› line, untouched (including a bare-CR input)", () => {
+    expect(userMessageLines("just a normal reply about the bug")).toEqual([
+      { label: "you›", text: "just a normal reply about the bug", tone: "user" },
+    ]);
+    const crText = "line one\rline two";
+    expect(userMessageLines(crText)).toEqual([{ label: "you›", text: crText, tone: "user" }]);
+  });
+
+  test("the XML command expansion renders as you› /name args", () => {
+    const xml = [
+      "<command-message>implement</command-message>",
+      "<command-name>/implement</command-name>",
+      "<command-args>do the thing</command-args>",
+    ].join("\n");
+    expect(userMessageLines(xml)).toEqual([{ label: "you›", text: "/implement do the thing", tone: "user" }]);
+  });
+
+  test("command-output renders as a single cmd› line", () => {
+    expect(userMessageLines("<local-command-stdout>some output</local-command-stdout>")).toEqual([
+      { label: "cmd›", text: "some output", tone: "machine" },
+    ]);
+  });
+
+  test("the forked-skill-launch fixture renders cmd› then skill› with a shortened agent id", () => {
+    const text =
+      "<local-command-stdout>Running in the background as @code-review</local-command-stdout>\n" +
+      '<forked-skill-launch>{"agentId":"a7db6829e09d1ba9b","skillName":"code-review","description":"/code-review"}</forked-skill-launch>';
+    expect(userMessageLines(text)).toEqual([
+      { label: "cmd›", text: "Running in the background as @code-review", tone: "machine" },
+      { label: "skill›", text: "/code-review launched in background (agent a7db6829)", tone: "machine" },
+    ]);
+  });
+
+  test("bash trio: empty stdout produces no line, stderr is err›/error, input is sh›/$ cmd", () => {
+    const text =
+      "<bash-input>ls -la</bash-input>\n<bash-stdout></bash-stdout><bash-stderr>boom\n</bash-stderr>";
+    expect(userMessageLines(text)).toEqual([
+      { label: "sh›", text: "$ ls -la", tone: "machine" },
+      { label: "err›", text: "boom", tone: "error" },
+    ]);
+  });
+
+  test("a generic (unrecognized) tag renders as <name>› with tone 'tag'; nested tags stay raw in its body", () => {
+    expect(userMessageLines("<context>hello there</context>")).toEqual([
+      { label: "context›", text: "hello there", tone: "tag" },
+    ]);
+    expect(userMessageLines("<outer>a <inner>b</inner> c</outer>")).toEqual([
+      { label: "outer›", text: "a <inner>b</inner> c", tone: "tag" },
+    ]);
+  });
+
+  test("a tagged message with a trailing refs block appends a final refs› line", () => {
+    const text = appendReferences("<context>info</context>\n\nDo it", REFS);
+    expect(userMessageLines(text)).toEqual([
+      { label: "context›", text: "info", tone: "tag" },
+      { label: "you›", text: "Do it", tone: "user" },
+      { label: "refs›", text: "/a/b.png, /c/d/", tone: "user" },
+    ]);
+  });
+
+  test("ANSI SGR codes are stripped from a local-command-stdout line inside a tagged (multi-tag) message", () => {
+    const text =
+      "<local-command-stdout>Set model to \x1b[1mOpus 5\x1b[22m done</local-command-stdout>\n" +
+      '<forked-skill-launch>{"skillName":"code-review"}</forked-skill-launch>';
+    expect(userMessageLines(text)).toEqual([
+      { label: "cmd›", text: "Set model to Opus 5 done", tone: "machine" },
+      { label: "skill›", text: "/code-review launched in background", tone: "machine" },
+    ]);
+  });
+
+  test("result is never empty: an all-empty bash pair falls back to a single cmd› — line", () => {
+    expect(userMessageLines("<bash-stdout></bash-stdout><bash-stderr></bash-stderr>")).toEqual([
+      { label: "cmd›", text: "—", tone: "machine" },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Area 7 — canonicalizeUserText identity on tagged text
+
+describe("canonicalizeUserText — tagged messages stay byte-identical", () => {
+  test("a user-authored tagged message is returned identically", () => {
+    const text = "<context>some info</context>\n\nPlease do the thing";
+    expect(canonicalizeUserText(text)).toBe(text);
+  });
+
+  test("the forked-skill-launch fixture is returned identically (byte-for-byte, no CR normalization)", () => {
+    const text =
+      "<local-command-stdout>Running in the background as @code-review</local-command-stdout>\r" +
+      '<forked-skill-launch>{"agentId":"a7db6829e09d1ba9b","skillName":"code-review","description":"/code-review"}</forked-skill-launch>';
+    expect(canonicalizeUserText(text)).toBe(text);
   });
 });
