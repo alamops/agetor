@@ -2,6 +2,8 @@ import { test, expect } from "bun:test";
 import { Database } from "bun:sqlite";
 import { migrate, splitSqlStatements, type Migration } from "./migrate.ts";
 import reseedBuiltins from "./migrations/024_reseed_harness_builtins.sql" with { type: "text" };
+import retireGemini3ProPreview from "./migrations/049_retire_gemini_3_pro_preview.sql" with { type: "text" };
+import { migrations } from "./migrations/index.ts";
 
 // Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
 const HARNESSES_DDL = `
@@ -153,4 +155,56 @@ test("024_reseed_harness_builtins restores wiped builtins, is idempotent, and pr
     { id: "claude-code", enabled: 0 }, // preserved, not reset to 1
     { id: "codex", enabled: 0 },
   ]);
+});
+
+test("049_retire_gemini_3_pro_preview rewrites only tasks pinned to the shut-down id, on any harness, and is idempotent", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT
+    );
+  `);
+
+  db.exec(`
+    INSERT INTO tasks (id, agent, model) VALUES
+      ('t1', 'gemini', 'gemini-3-pro-preview'),
+      ('t2', 'gemini-2', 'gemini-3-pro-preview'),
+      ('t3', 'gemini', 'gemini-3.7-flash'),
+      ('t4', 'cursor', 'gemini-3.1-pro'),
+      ('t5', 'fx', 'google/gemini-3.1-pro-preview'),
+      ('t6', 'codex', 'gpt-5.6-sol'),
+      ('t7', 'gemini', NULL);
+  `);
+
+  const readAll = () =>
+    db
+      .query<{ id: string; agent: string; model: string | null }, []>(
+        `SELECT id, agent, model FROM tasks ORDER BY id`,
+      )
+      .all();
+
+  db.exec(retireGemini3ProPreview);
+  expect(readAll()).toEqual([
+    { id: "t1", agent: "gemini", model: "gemini-3.1-pro-preview" }, // rewritten
+    { id: "t2", agent: "gemini-2", model: "gemini-3.1-pro-preview" }, // rewritten — additional-account harness, no join needed
+    { id: "t3", agent: "gemini", model: "gemini-3.7-flash" }, // untouched
+    { id: "t4", agent: "cursor", model: "gemini-3.1-pro" }, // untouched — different literal
+    { id: "t5", agent: "fx", model: "google/gemini-3.1-pro-preview" }, // untouched — different literal
+    { id: "t6", agent: "codex", model: "gpt-5.6-sol" }, // untouched — unrelated kind
+    { id: "t7", agent: "gemini", model: null }, // untouched — still NULL
+  ]);
+
+  // Idempotent: re-applying the same UPDATE against the already-rewritten
+  // rows is a no-op.
+  const beforeSecond = readAll();
+  db.exec(retireGemini3ProPreview);
+  expect(readAll()).toEqual(beforeSecond);
+});
+
+test("049 is registered last in the migrations index", () => {
+  const last = migrations[migrations.length - 1];
+  expect(last?.id).toBe("049_retire_gemini_3_pro_preview");
+  expect(last?.sql).toContain("gemini-3.1-pro-preview");
 });

@@ -686,6 +686,49 @@ test("cursor composes a curated model plus effort into Cursor's concrete model i
   ]);
 });
 
+test("cursor Gemini 3.8 Flash + medium effort composes gemini-3.8-flash-medium", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gemini-3.8-flash",
+    effort: "medium",
+  });
+  expect(cmd).toEqual([
+    "cursor-agent",
+    "-p", "--output-format", "stream-json",
+    "--model", "gemini-3.8-flash-medium",
+    "--force", "--sandbox", "disabled",
+  ]);
+});
+
+test("cursor Gemini 3.8 Flash with null effort falls back to the high variant", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gemini-3.8-flash",
+    effort: null,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.8-flash-high");
+});
+
+test("cursor Gemini 3.7 Flash + low effort composes gemini-3.7-flash-low", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gemini-3.7-flash",
+    effort: "low",
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.7-flash-low");
+});
+
+test("cursor Gemini 3.8 Flash ignores fast and maxMode (no fast variant, no Max Mode)", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gemini-3.8-flash",
+    effort: "high",
+    fast: true,
+    maxMode: true,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.8-flash-high");
+});
+
 test("cursor fast toggle selects the Fast model variant when that effort supports it", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
@@ -801,6 +844,18 @@ test("gemini-3.7-flash model id is emitted verbatim via -m", () => {
   expect(cmd).toEqual([
     "gemini",
     "-m", "gemini-3.7-flash",
+    "--output-format", "stream-json",
+    "--yolo",
+    "--skip-trust",
+    "-p", "hi",
+  ]);
+});
+
+test("gemini-3.8-flash model id is emitted verbatim via -m", () => {
+  const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, model: "gemini-3.8-flash" });
+  expect(cmd).toEqual([
+    "gemini",
+    "-m", "gemini-3.8-flash",
     "--output-format", "stream-json",
     "--yolo",
     "--skip-trust",

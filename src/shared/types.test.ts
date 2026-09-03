@@ -3,6 +3,7 @@ import {
   AGENT_OPTIONS,
   CATALOG_SCOPED_KINDS,
   CODE_PLAN_MODE,
+  CURSOR_MODEL_SPECS,
   DEFAULT_MODEL,
   FX_PROVIDER_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
@@ -186,4 +187,63 @@ test("AGENT_OPTIONS.fx.models has unique ids, unique labels, and every id matche
 test("CATALOG_SCOPED_KINDS contains exactly fx", () => {
   expect(CATALOG_SCOPED_KINDS.size).toBe(1);
   expect(CATALOG_SCOPED_KINDS.has("fx")).toBe(true);
+});
+
+/* ── gemini 3.8 Flash + retired gemini-3-pro-preview default (docs/plans/add-gemini-3-8-flash.md §5 TEST-2) ── */
+
+test("DEFAULT_MODEL.gemini is gemini-3.1-pro-preview (Google's successor to the shut-down 3 Pro preview) and heads the gemini picker", () => {
+  expect(DEFAULT_MODEL.gemini).toBe("gemini-3.1-pro-preview");
+  expect(AGENT_OPTIONS.gemini.models[0]?.id).toBe("gemini-3.1-pro-preview");
+});
+
+test("the gemini picker offers gemini-3.8-flash and no longer offers the shut-down gemini-3-pro-preview", () => {
+  const ids = AGENT_OPTIONS.gemini.models.map((m) => m.id);
+  expect(ids).toContain("gemini-3.8-flash");
+  expect(ids).not.toContain("gemini-3-pro-preview");
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.gemini)).not.toContain("gemini-3-pro-preview");
+});
+
+test("MODEL_EFFORT_SUPPORT.gemini's keys exactly match AGENT_OPTIONS.gemini.models' ids (both directions) and every value is empty", () => {
+  const catalogIds = new Set(AGENT_OPTIONS.gemini.models.map((m) => m.id));
+  const effortKeys = new Set(Object.keys(MODEL_EFFORT_SUPPORT.gemini));
+  for (const id of catalogIds) expect(effortKeys.has(id)).toBe(true);
+  for (const key of effortKeys) expect(catalogIds.has(key)).toBe(true);
+  expect(effortKeys.size).toBe(catalogIds.size);
+
+  for (const supported of Object.values(MODEL_EFFORT_SUPPORT.gemini)) {
+    expect(supported).toEqual([]);
+  }
+});
+
+test("gemini picker is tier-ordered: Pro rows first, then Flash rows newest-first", () => {
+  const ids = AGENT_OPTIONS.gemini.models.map((m) => m.id);
+  expect(ids).toEqual([
+    "gemini-3.1-pro-preview",
+    "gemini-2.5-pro",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+  ]);
+});
+
+test("cursor picker lists Gemini Flash newest-first: 3.8 before 3.7 before 3.6", () => {
+  const ids = AGENT_OPTIONS.cursor.models.map((m) => m.id);
+  const i38 = ids.indexOf("gemini-3.8-flash");
+  const i37 = ids.indexOf("gemini-3.7-flash");
+  const i36 = ids.indexOf("gemini-3.6-flash");
+  expect(i38).toBeGreaterThanOrEqual(0);
+  expect(i37).toBeGreaterThanOrEqual(0);
+  expect(i36).toBeGreaterThanOrEqual(0);
+  expect(i38).toBeLessThan(i37);
+  expect(i37).toBeLessThan(i36);
+
+  for (const id of ["gemini-3.8-flash", "gemini-3.7-flash"]) {
+    const spec = CURSOR_MODEL_SPECS[id];
+    expect(spec).toBeDefined();
+    expect(Object.keys(spec?.effortIds ?? {}).sort()).toEqual(["high", "low", "medium"]);
+    expect(spec?.fastEfforts).toBeUndefined();
+    expect(spec?.fastId).toBeUndefined();
+    expect(spec?.supportsMaxMode).toBeUndefined();
+  }
 });

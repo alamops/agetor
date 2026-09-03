@@ -115,10 +115,12 @@ no new user flow, route, or UI surface. The existing `e2e/fx-models.spec.ts` is 
 
 ## 6. Execution waves
 
-1. Phase 4 wave 1: IMPL-1 ∥ IMPL-2 ∥ IMPL-3 (sonnet, `general-purpose`) → typecheck + test → commit.
-2. Phase 5: review (opus) of `git diff 3a771b3...HEAD` with the built-in rubric (no `code-review` skill
-   handoff needed — but it is available; see Phase 5 note) → triage.
-3. Phase 6 wave 2: TEST-1 ∥ TEST-2 (sonnet) → commit.
+1. Phase 4 wave 1: IMPL-1 ∥ IMPL-2 ∥ IMPL-3 (sonnet, `general-purpose`) → typecheck + test → commit
+   (landed as c73798a; checkpoint: typecheck clean, 4001 pass / 3 skip / 0 fail).
+2. Phase 5: review (opus) of `git diff 3a771b3...HEAD`, briefed to load the `code-review` skill and fall
+   back to the built-in rubric if unavailable, reporting which it used → triage.
+3. Phase 6 wave 2: TEST-1 ∥ TEST-2 (sonnet) → commit. Run **concurrently with Phase 5** — the review is
+   read-only and scoped to the committed diff, the test agents write only test files, so no collision.
 4. Phase 7: haiku runs `bun run typecheck && bun test` → report.
 5. Phase 8: fix agents only if review must-fixes or failures exist → re-run.
 
