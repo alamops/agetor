@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Check, ChevronDown, Search } from "lucide-react";
 import { Input } from "./input";
 import { cn } from "@/lib/utils";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 
 export interface MultiSearchSelectItem<T extends string = string> {
   value: T;
@@ -148,6 +149,9 @@ export function MultiSearchSelect<T extends string>({
               onChange={(e) => setQuery(e.target.value)}
               placeholder={placeholder}
               className="h-7 border-0 px-0 shadow-none focus-visible:ring-0"
+              // This box filters identifiers (paths, branch names, harness
+              // ids) — never let the OS autocorrect them.
+              {...IDENTIFIER_INPUT_PROPS}
             />
           </div>
           <div className="max-h-64 overflow-y-auto py-1">

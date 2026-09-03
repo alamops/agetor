@@ -3,6 +3,7 @@ import { BookOpen, Trash2 } from "lucide-react";
 import { api, type GitHubTokensResult } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { GitHubSetupDialog } from "@/components/settings/GitHubSetupDialog";
 import { GIT_HOST_TOKENS_SECTION } from "../../../shared/types.ts";
 
@@ -197,7 +198,7 @@ export function GitHubTokensSection() {
             onChange={(e) => setHost(e.target.value)}
             placeholder="github.com / gitlab.com / bitbucket.org"
             list={DATALIST_ID}
-            spellCheck={false}
+            {...IDENTIFIER_INPUT_PROPS}
           />
           <datalist id={DATALIST_ID}>
             {data.detectedHosts.map((h) => (

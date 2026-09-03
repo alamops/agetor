@@ -3,6 +3,7 @@ import { GitBranch, SlidersHorizontal } from "lucide-react";
 import { api, type BranchNamingConfig } from "@/lib/api";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { branchFieldState, type BranchFieldState } from "@/lib/branch-field";
 import { worktreePayload, type WorktreePayload } from "@/lib/worktree-payload";
 import {
@@ -309,7 +310,7 @@ export function WorktreeOptions(props: Props) {
               data-testid="branch-name-input"
               value={branchField.displayValue}
               onChange={(e) => { setBranchOverride(e.target.value); setBranchDirty(true); }}
-              spellCheck={false}
+              {...IDENTIFIER_INPUT_PROPS}
               placeholder="feature/my-task"
               className={cn(
                 "pr-9 font-mono text-[11px]",

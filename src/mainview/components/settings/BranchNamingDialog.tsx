@@ -7,6 +7,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import {
   BRANCH_TEMPLATE_TAGS,
   DEFAULT_BRANCH_CONFIG,
@@ -148,7 +149,7 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
                     value={prefix}
                     onChange={(e) => setPrefix(t.id, e.target.value)}
                     placeholder="feature/"
-                    spellCheck={false}
+                    {...IDENTIFIER_INPUT_PROPS}
                     className="h-8 font-mono text-xs"
                   />
                   <p className="text-[10px] text-muted-foreground">
