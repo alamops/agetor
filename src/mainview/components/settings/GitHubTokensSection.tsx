@@ -194,11 +194,13 @@ export function GitHubTokensSection() {
         <div className="space-y-1">
           <label className="text-xs text-muted-foreground">Host</label>
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
+            // Keeps the detected-hosts <datalist> working — see identifier-input.ts.
+            autoComplete={undefined}
             value={host}
             onChange={(e) => setHost(e.target.value)}
             placeholder="github.com / gitlab.com / bitbucket.org"
             list={DATALIST_ID}
-            {...IDENTIFIER_INPUT_PROPS}
           />
           <datalist id={DATALIST_ID}>
             {data.detectedHosts.map((h) => (

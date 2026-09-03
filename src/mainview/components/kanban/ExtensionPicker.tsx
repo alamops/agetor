@@ -3,6 +3,7 @@ import { Blocks, BookText, ChevronDown, Plug, Puzzle, Sparkles } from "lucide-re
 import type { AvailableExtension } from "@/lib/api";
 import type { SavedPrompt } from "../../../shared/types.ts";
 import { filterPromptsForPicker } from "@/lib/prompt-picker";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -209,6 +210,7 @@ export function ExtensionPicker({
             <input
               ref={searchRef}
               data-testid="extension-picker-search"
+              {...IDENTIFIER_INPUT_PROPS}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={(e) => {

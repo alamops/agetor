@@ -22,9 +22,15 @@ import type { InputHTMLAttributes } from "react";
  *
  * One shared constant, spread (`{...IDENTIFIER_INPUT_PROPS}`) at each site,
  * exists so a future identifier input adopts the full set in one line
- * instead of re-deriving it — three of today's four call sites had already
- * drifted to a partial (`spellCheck`-only, or `spellCheck` + `autoComplete`)
- * opt-out before this constant existed.
+ * instead of re-deriving it — several call sites had already drifted to a
+ * partial (`spellCheck`-only) opt-out before this constant existed.
+ *
+ * One exception to the "just spread it" pattern: an input that also carries
+ * `list="…"` (backed by a `<datalist>`) spreads this constant and then sets
+ * `autoComplete={undefined}` right after it, because `autocomplete="off"`
+ * can suppress datalist suggestions in some engines — React omits
+ * `undefined` props entirely, so the datalist keeps working while the other
+ * three correction attributes still apply.
  */
 export const IDENTIFIER_INPUT_PROPS = {
   autoCorrect: "off",

@@ -152,13 +152,11 @@ export function SearchSelect({
               <Search className="size-3.5 shrink-0 opacity-60" aria-hidden />
               <Input
                 ref={searchRef}
+                {...IDENTIFIER_INPUT_PROPS}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder={placeholder}
                 className="h-7 border-0 px-0 shadow-none focus-visible:ring-0"
-                // This box filters identifiers (paths, branch names, harness
-                // ids) — never let the OS autocorrect them.
-                {...IDENTIFIER_INPUT_PROPS}
               />
             </div>
           )}

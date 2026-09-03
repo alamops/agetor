@@ -146,10 +146,10 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
                   <Input
                     id={`prefix-${t.id}`}
                     ref={i === 0 ? firstFieldRef : undefined}
+                    {...IDENTIFIER_INPUT_PROPS}
                     value={prefix}
                     onChange={(e) => setPrefix(t.id, e.target.value)}
                     placeholder="feature/"
-                    {...IDENTIFIER_INPUT_PROPS}
                     className="h-8 font-mono text-xs"
                   />
                   <p className="text-[10px] text-muted-foreground">

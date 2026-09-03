@@ -308,9 +308,9 @@ export function WorktreeOptions(props: Props) {
           <div className="relative">
             <Input
               data-testid="branch-name-input"
+              {...IDENTIFIER_INPUT_PROPS}
               value={branchField.displayValue}
               onChange={(e) => { setBranchOverride(e.target.value); setBranchDirty(true); }}
-              {...IDENTIFIER_INPUT_PROPS}
               placeholder="feature/my-task"
               className={cn(
                 "pr-9 font-mono text-[11px]",

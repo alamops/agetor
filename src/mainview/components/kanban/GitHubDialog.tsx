@@ -71,6 +71,7 @@ import { toRows, type DiffRow } from "@/lib/diff-rows";
 import { mergeabilityView, type MergeTone } from "@/lib/mergeability";
 import { isMergedPull, mergedPullReplacement } from "@/lib/pull-merged";
 import { isCredentialError } from "@/lib/credential-error";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
 import { sameIssueUrl } from "../../../shared/issue-task.ts";
@@ -403,6 +404,7 @@ function LabelAssigneeMilestoneFields({
         </div>
       ) : (
         <Input
+          {...IDENTIFIER_INPUT_PROPS}
           value={labelDraft}
           onChange={(e) => onLabelDraftChange(e.target.value)}
           placeholder="Labels, comma separated"
@@ -429,6 +431,7 @@ function LabelAssigneeMilestoneFields({
         </div>
       ) : (
         <Input
+          {...IDENTIFIER_INPUT_PROPS}
           value={assigneeDraft}
           onChange={(e) => onAssigneeDraftChange(e.target.value)}
           placeholder="Assignees, comma separated"
@@ -453,6 +456,7 @@ function LabelAssigneeMilestoneFields({
         </Select>
       ) : (
         <Input
+          {...IDENTIFIER_INPUT_PROPS}
           value={milestoneDraft}
           onChange={(e) => onMilestoneDraftChange(e.target.value)}
           placeholder="Milestone number"
@@ -3646,6 +3650,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         <div className="relative md:col-span-2">
           <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
@@ -3680,6 +3685,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         </div>
         {caps.labels && (
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
+            // datalist suggestions can be suppressed by autocomplete="off" in some engines; the correction attributes still apply.
+            autoComplete={undefined}
             value={labels}
             onChange={(e) => setLabels(e.target.value)}
             placeholder="Labels, comma separated"
@@ -3688,6 +3696,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
           />
         )}
         <Input
+          {...IDENTIFIER_INPUT_PROPS}
           value={assignee}
           onChange={(e) => setAssignee(e.target.value)}
           placeholder="Assignee"
@@ -4345,6 +4354,7 @@ function PullComposer({
         />
         <div className="grid gap-2 md:grid-cols-2">
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
             value={head}
             onChange={(e) => onHeadChange(e.target.value)}
             placeholder="Head branch"
@@ -4352,6 +4362,7 @@ function PullComposer({
             disabled={submitting}
           />
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
             value={base}
             onChange={(e) => onBaseChange(e.target.value)}
             placeholder="Base branch"
@@ -4367,6 +4378,7 @@ function PullComposer({
           disabled={submitting}
         />
         <Input
+          {...IDENTIFIER_INPUT_PROPS}
           value={reviewers}
           onChange={(e) => onReviewersChange(e.target.value)}
           placeholder="Reviewers, comma separated"
@@ -4493,6 +4505,7 @@ function IssueComposer({
         />
         {caps.labels && (
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
             value={labels}
             onChange={(e) => onLabelsChange(e.target.value)}
             placeholder="Labels, comma separated"
@@ -4502,6 +4515,7 @@ function IssueComposer({
         )}
         <div className="grid gap-2 md:grid-cols-2">
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
             value={assignees}
             onChange={(e) => onAssigneesChange(e.target.value)}
             placeholder="Assignees, comma separated"
@@ -4510,6 +4524,7 @@ function IssueComposer({
           />
           {caps.milestones && (
             <Input
+              {...IDENTIFIER_INPUT_PROPS}
               value={milestone}
               onChange={(e) => onMilestoneChange(e.target.value)}
               placeholder="Milestone number"
@@ -4596,10 +4611,10 @@ function LabelManager({
         </div>
       </div>
       <div className="mb-2 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.4fr)_auto]">
-        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" className="h-8 text-xs" disabled={creating || !authenticated} />
+        <Input {...IDENTIFIER_INPUT_PROPS} value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" className="h-8 text-xs" disabled={creating || !authenticated} />
         <div className="flex items-center gap-1">
           <span className="size-4 shrink-0 rounded-full border border-border/60" style={{ backgroundColor: labelSwatch(color) }} />
-          <Input value={color} onChange={(e) => setColor(e.target.value)} placeholder="hex" className="h-8 w-20 text-xs" disabled={creating || !authenticated} />
+          <Input {...IDENTIFIER_INPUT_PROPS} value={color} onChange={(e) => setColor(e.target.value)} placeholder="hex" className="h-8 w-20 text-xs" disabled={creating || !authenticated} />
         </div>
         <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description (optional)" className="h-8 text-xs" disabled={creating || !authenticated} />
         <Button
@@ -4681,10 +4696,10 @@ function LabelRow({
     return (
       <div className="rounded border border-border/60 p-2">
         <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.4fr)]">
-          <Input value={name} onChange={(e) => setName(e.target.value)} className="h-7 text-xs" disabled={busy === "save"} />
+          <Input {...IDENTIFIER_INPUT_PROPS} value={name} onChange={(e) => setName(e.target.value)} className="h-7 text-xs" disabled={busy === "save"} />
           <div className="flex items-center gap-1">
             <span className="size-4 shrink-0 rounded-full border border-border/60" style={{ backgroundColor: labelSwatch(color) }} />
-            <Input value={color} onChange={(e) => setColor(e.target.value)} placeholder="hex" className="h-7 w-20 text-xs" disabled={busy === "save"} />
+            <Input {...IDENTIFIER_INPUT_PROPS} value={color} onChange={(e) => setColor(e.target.value)} placeholder="hex" className="h-7 w-20 text-xs" disabled={busy === "save"} />
           </div>
           <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description" className="h-7 text-xs" disabled={busy === "save"} />
         </div>
@@ -5085,6 +5100,9 @@ function ReleasesManager({
       </div>
       <div className="mb-2 grid gap-2 md:grid-cols-[minmax(0,0.8fr)_minmax(0,1fr)]">
         <Input
+          {...IDENTIFIER_INPUT_PROPS}
+          // datalist suggestions can be suppressed by autocomplete="off" in some engines; the correction attributes still apply.
+          autoComplete={undefined}
           value={tagName}
           onChange={(e) => setTagName(e.target.value)}
           placeholder="Tag name"
@@ -5630,6 +5648,7 @@ function ActionsPanel({
             ))}
           </Select>
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
             value={dispatchRef}
             onChange={(e) => onDispatchRefChange(e.target.value)}
             placeholder="Ref (branch, tag, or sha) — e.g. main"
@@ -5641,6 +5660,7 @@ function ActionsPanel({
           {dispatchInputs.map((row, i) => (
             <div key={i} className="flex items-center gap-1.5">
               <Input
+                {...IDENTIFIER_INPUT_PROPS}
                 value={row.key}
                 onChange={(e) => onUpdateDispatchInputRow(i, { key: e.target.value })}
                 placeholder="Input name"
@@ -5966,6 +5986,7 @@ function ProjectsPanel({
                 <option value="pr">PR</option>
               </Select>
               <Input
+                {...IDENTIFIER_INPUT_PROPS}
                 value={addNumber}
                 onChange={(e) => onAddNumberChange(e.target.value.replace(/[^0-9]/g, ""))}
                 placeholder="#number"
@@ -7327,6 +7348,7 @@ function IssueActions({
       {caps.issueTransfer && (
         <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/40 pt-3">
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
             value={transferDraft}
             onChange={(e) => onTransferDraftChange(e.target.value)}
             placeholder="Transfer to owner/repo"
@@ -7551,6 +7573,7 @@ function SubIssues({ path, issueNumber, canPush }: { path: string; issueNumber: 
           )}
           <div className="mt-2 flex items-center gap-2">
             <Input
+              {...IDENTIFIER_INPUT_PROPS}
               value={addDraft}
               onChange={(e) => setAddDraft(e.target.value)}
               placeholder="Add by #number"
@@ -7733,6 +7756,7 @@ function PullTriage({
       {provider === "github" && (
         <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
             value={reviewerDraft}
             onChange={(e) => onReviewerDraftChange(e.target.value)}
             placeholder={prOpen ? "Reviewers, comma separated" : "Reviewers can only be requested on open PRs"}
@@ -7740,6 +7764,7 @@ function PullTriage({
             disabled={isBusy || !prOpen || !canPush}
           />
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
             value={teamReviewerDraft}
             onChange={(e) => onTeamReviewerDraftChange(e.target.value)}
             placeholder={prOpen ? "Teams, comma separated (org slugs)" : "Teams can only be requested on open PRs"}
