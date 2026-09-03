@@ -40,6 +40,8 @@ import {
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
+  EFFORT_OPTIONS,
+  retainableEfforts,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -58,7 +60,7 @@ import {
   type TaskReference,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
-import { mergeModelOptions } from "../../../shared/model-options.ts";
+import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
 import { parseIssueUrl } from "../../../shared/issue-task.ts";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
@@ -5277,18 +5279,58 @@ function TaskDetails({
   // a model that no longer supports the saved effort, drop it back to the
   // kind's default effort (if supported) or null when the model is the
   // Haiku-style "no effort" case. Same pattern as the new-task form.
+  //
+  // The CLI's own discovered per-model efforts (when reported) win over the
+  // curated table for what the picker OFFERS — see `supportedEfforts`'s
+  // third argument. But the cascade below deliberately checks the wider
+  // `retainableEfforts` union (discovered ∪ curated), not just what's
+  // offered right now: a discovery refresh that happens to omit an id (e.g.
+  // `none`, which Codex's own `model/list` never lists even though the API
+  // accepts it) must not silently PATCH away an effort the user already
+  // chose. Only an effort neither source supports triggers the fallback.
+  const discoveredEffortsForTask = useMemo(
+    () => discoveredEffortsFor(harnessModels[task.agent] ?? agentModels[kind], task.model),
+    [harnessModels, agentModels, task.agent, kind, task.model],
+  );
   const supportedEffortsForModel = useMemo(
-    () => supportedEfforts(kind, task.model),
-    [kind, task.model],
+    () => supportedEfforts(kind, task.model, discoveredEffortsForTask),
+    [kind, task.model, discoveredEffortsForTask],
   );
   const allowedEfforts = useMemo(
     () => new Set(supportedEffortsForModel.map((o) => o.id)),
     [supportedEffortsForModel],
   );
+  const retainable = useMemo(
+    () => retainableEfforts(kind, task.model, discoveredEffortsForTask),
+    [kind, task.model, discoveredEffortsForTask],
+  );
+  // Mirrors `mergeModelOptions` rule 6: a task's current effort can be
+  // retained (kept valid by the cascade above) without being one the picker
+  // would otherwise offer — e.g. a discovery refresh that omits `none`. Add
+  // it back as an explicit unlisted row so the select never renders blank.
+  const effortSelectOptions = useMemo(() => {
+    if (
+      task.effort
+      && !allowedEfforts.has(task.effort)
+      && retainable.has(task.effort)
+    ) {
+      const label = EFFORT_OPTIONS.find((o) => o.id === task.effort)?.label ?? task.effort;
+      return [
+        ...supportedEffortsForModel,
+        {
+          id: task.effort,
+          label,
+          hint: "Not in this account's Codex menu — kept as you chose it.",
+          unlisted: true,
+        },
+      ];
+    }
+    return supportedEffortsForModel;
+  }, [supportedEffortsForModel, allowedEfforts, retainable, task.effort]);
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
   const fastAvailable = kind === "cursor" && cursorModelSupportsFast(task.model, task.effort);
   useEffect(() => {
-    if (task.effort && allowedEfforts.has(task.effort)) return;
+    if (task.effort && retainable.has(task.effort)) return;
     if (supportedEffortsForModel.length === 0) {
       if (task.effort !== null) void save({ effort: null });
       return;
@@ -5298,7 +5340,7 @@ function TaskDetails({
       : supportedEffortsForModel[0]!.id;
     if (task.effort !== fallback) void save({ effort: fallback });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allowedEfforts, task.effort, supportedEffortsForModel]);
+  }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel]);
   useEffect(() => {
     if (task.fast && !fastAvailable) void save({ fast: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -5318,7 +5360,11 @@ function TaskDetails({
     const nextKind = harnessKindOf(nextId, harnesses);
     const nextMode = AGENT_OPTIONS[nextKind].modes[0]?.id ?? "auto";
     const nextModel = DEFAULT_MODEL[nextKind];
-    const nextEfforts = supportedEfforts(nextKind, nextModel);
+    const nextEfforts = supportedEfforts(
+      nextKind,
+      nextModel,
+      discoveredEffortsFor(harnessModels[nextId] ?? agentModels[nextKind], nextModel),
+    );
     const nextEffort = nextEfforts.length === 0
       ? null
       : nextEfforts.some((e) => e.id === DEFAULT_EFFORT[nextKind])
@@ -5434,7 +5480,7 @@ function TaskDetails({
             {editable ? (
               <CompactSelect
                 value={task.effort ?? ""}
-                options={supportedEffortsForModel}
+                options={effortSelectOptions}
                 onChange={(effort) => void save({ effort })}
                 disabled={supportedEffortsForModel.length === 0}
                 placeholder="n/a"

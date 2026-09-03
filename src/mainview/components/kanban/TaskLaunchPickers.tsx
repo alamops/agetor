@@ -3,7 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { api, type AgentModelMap } from "@/lib/api";
-import { mergeModelOptions } from "../../../shared/model-options.ts";
+import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
 import {
   AGENT_OPTIONS,
   CATALOG_SCOPED_KINDS,
@@ -122,7 +122,11 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
           seedMode && supportedModes(nextKind, resolvedModel).some((m) => m.id === seedMode)
             ? seedMode
             : initialMode(nextKind);
-        const supportedEff = supportedEfforts(nextKind, resolvedModel);
+        const supportedEff = supportedEfforts(
+          nextKind,
+          resolvedModel,
+          discoveredEffortsFor(harnessModelPayload.byHarness[nextAgent] ?? models[nextKind], resolvedModel),
+        );
         const resolvedEffort =
           seedEffort && supportedEff.some((e) => e.id === seedEffort)
             ? seedEffort
@@ -158,7 +162,10 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
       loggedIn: selectedStatus?.loggedIn ?? null,
     });
   }, [staticModels, harnessModels, agentModels, agent, kind, model, selectedStatus?.loggedIn]);
-  const efforts = supportedEfforts(kind, model);
+  // Discovered-wins, no retain logic — mirrors NewTaskForm: there's no prior
+  // intent to preserve for a task that doesn't exist yet.
+  const efforts = supportedEfforts(kind, model, discoveredEffortsFor(harnessModels[agent] ?? agentModels[kind], model));
+  const effortsKey = efforts.map((o) => o.id).join(",");
 
   useEffect(() => {
     if (efforts.length === 0) {
@@ -169,7 +176,7 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
     const fallback = efforts.some((e) => e.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : efforts[0]!.id;
     setEffort(fallback);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, model]);
+  }, [kind, model, effortsKey]);
   useEffect(() => {
     if (!modes.some((m) => m.id === mode)) {
       const fallback = modes[0]?.id;

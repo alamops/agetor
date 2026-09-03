@@ -22,7 +22,7 @@ import {
   supportedEfforts,
   type AgentKind,
 } from "../../shared/types.ts";
-import { mergeModelOptions, type DiscoveredModel } from "../../shared/model-options.ts";
+import { mergeModelOptions, discoveredEffortsFor, type DiscoveredModel } from "../../shared/model-options.ts";
 
 interface AddOpts {
   title?: string;
@@ -279,13 +279,16 @@ async function wizard(
 
   const kind: AgentKind = harnesses.find((h) => h.id === agent)?.kind ?? "claude-code";
 
+  // Prefer the per-harness catalog (keyed by harness id, e.g. distinguishes
+  // an additional `fx-2` account from the built-in `fx`); fall back to the
+  // kind-level map for an older daemon without `/agent-models/harnesses`.
+  // Computed once agent/kind are known so the model picker and the effort
+  // prompt below read the same discovered list.
+  const catalog: DiscoveredModel[] = (agent && harnessModels.byHarness[agent]) || discovered[kind] || [];
+
   let model = o.model;
   if (!model) {
     const initial = prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind];
-    // Prefer the per-harness catalog (keyed by harness id, e.g. distinguishes
-    // an additional `fx-2` account from the built-in `fx`); fall back to the
-    // kind-level map for an older daemon without `/agent-models/harnesses`.
-    const catalog: DiscoveredModel[] = (agent && harnessModels.byHarness[agent]) || discovered[kind] || [];
     const options = mergeModelOptions({
       curated: AGENT_OPTIONS[kind].models,
       discovered: catalog,
@@ -305,7 +308,7 @@ async function wizard(
   }
   let effort = o.effort;
   if (!effort) {
-    const efforts = supportedEfforts(kind, model ?? null);
+    const efforts = supportedEfforts(kind, model ?? null, discoveredEffortsFor(catalog, model));
     if (efforts.length > 0) {
       const picked = await pickOption("Effort", efforts, prefs[`lastEffort:${kind}`] ?? DEFAULT_EFFORT[kind]);
       if (picked === null) return cancelled();

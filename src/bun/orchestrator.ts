@@ -4,6 +4,7 @@ import { rm } from "node:fs/promises";
 import { basename, join } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir } from "./db.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
+import { getDiscoveredEfforts } from "./agent-discovery.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
 import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progress.ts";
 import { ISSUE_SNAPSHOT_FILENAME, normalizeIssueUrl, parseIssueUrl } from "../shared/issue-task.ts";
@@ -15,11 +16,11 @@ import {
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
   IDLE_SESSION_REAP_MS,
-  MODEL_EFFORT_SUPPORT,
   SESSION_DIED_STATUS_PREFIX,
   TASK_TYPES,
   branchPattern,
   renderBranchTemplate,
+  retainableEfforts,
   supportedEfforts,
   validateBranchName,
   type AgentKind,
@@ -1796,25 +1797,36 @@ function emitEffortPinnedStatus(taskId: string, effortId: string, beforeEffort: 
 
 /**
  * Mirrors kanban/RunPanel.tsx's own effort-fallback effect (~4917-4928)
- * EXACTLY: when a task's model changes, the previously-saved effort may no
- * longer be valid for the new model (Haiku 4.5 takes no effort param at all;
- * Sonnet 4.6 has no `xhigh`). `undefined` means "no change needed" — the
- * current effort (even `null`) is already valid for `model`. Otherwise this
- * is the value the effort column should be patched to alongside the model
- * (including `null`, for the "model accepts no effort at all" case).
+ * EXACTLY, INCLUDING the retain rule (see plan §3 "Cascade rule" in
+ * docs/plans/add-gpt-6-astra.md): when a task's model changes, the
+ * previously-saved effort may no longer be valid for the new model (Haiku
+ * 4.5 takes no effort param at all; Sonnet 4.6 has no `xhigh`) — but an
+ * effort either the discovered or the curated set still supports
+ * (`retainableEfforts`, the union of both) is kept as-is; only an effort
+ * neither source supports triggers a fallback. This is deliberate: a
+ * discovery refresh that happens to omit an id the curated table still
+ * lists (e.g. `none` on GPT-5.6 Sol, which Codex's own catalog never lists
+ * but the API accepts) must not silently PATCH away an effort the user
+ * already chose. `undefined` means "no change needed" — the current effort
+ * (even `null`) is already retainable for `model`. Otherwise this is the
+ * value the effort column should be patched to alongside the model
+ * (including `null`, for the "model accepts no effort at all" case); the
+ * fallback itself narrows to the discovered-wins set (`supportedEfforts`),
+ * not the wider retainable union — new intent should reflect what's
+ * actually offered.
  */
 function effortFallbackForModelChange(
   kind: AgentKind,
   model: string,
   currentEffort: string | null,
+  discoveredEfforts?: readonly string[] | null,
 ): string | null | undefined {
-  const supportedEffortsForModel = supportedEfforts(kind, model);
-  const allowed = new Set(supportedEffortsForModel.map((o) => o.id));
-  if (currentEffort && allowed.has(currentEffort)) return undefined;
-  if (supportedEffortsForModel.length === 0) {
+  const offered = supportedEfforts(kind, model, discoveredEfforts);
+  if (currentEffort && retainableEfforts(kind, model, discoveredEfforts).has(currentEffort)) return undefined;
+  if (offered.length === 0) {
     return currentEffort !== null ? null : undefined;
   }
-  const fallback = allowed.has(DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : supportedEffortsForModel[0]!.id;
+  const fallback = offered.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : offered[0]!.id;
   return currentEffort !== fallback ? fallback : undefined;
 }
 
@@ -1835,8 +1847,8 @@ function effortFallbackForModelChange(
  * value is unchanged, claude landed on a value agetor can't represent
  * (`kind: "unrepresentable"` — a breadcrumb is still emitted so the drift
  * isn't silent), or — for an effort outcome — the parsed id isn't supported
- * by the task's current model (`MODEL_EFFORT_SUPPORT`/`supportedEfforts`,
- * the same table the RunPanel picker filters against). Model equality is
+ * by the task's current model (`supportedEfforts`, discovered-then-curated,
+ * the same contract the RunPanel picker filters against). Model equality is
  * checked both by raw id AND via `toClaudeModelArg` so an alias (e.g. claude
  * reporting "sonnet" resolved to agetor id `sonnet-5`) can never flip the
  * stored id against an already-equivalent one. A `null` `task.model` (the
@@ -1938,7 +1950,12 @@ export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo):
     patch = { model: outcome.id };
     breadcrumb = describeLocalSettingSync(outcome);
 
-    const effortFallback = effortFallbackForModelChange("claude-code", outcome.id, task.effort);
+    const effortFallback = effortFallbackForModelChange(
+      "claude-code",
+      outcome.id,
+      task.effort,
+      getDiscoveredEfforts("claude-code", outcome.id, task.agent),
+    );
     if (effortFallback !== undefined) {
       patch.effort = effortFallback;
       // "for the next run" — this cascaded adjustment is NEVER mirrored into
@@ -1950,11 +1967,20 @@ export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo):
     }
   } else {
     // outcome.kind === "effort" — validate against the (agent, model) pair
-    // before writing, same table the RunPanel picker filters against. A
+    // before writing, same discovered-wins-then-curated contract the
+    // RunPanel picker filters against (claude-code reports no discovered
+    // efforts today, so this is curated-only in practice — but it keeps one
+    // contract with every other `supportedEfforts` call site). A
     // representable-but-unsupported id (claude accepted `/effort xhigh` on
     // a model whose agetor entry doesn't list it) must not silently widen
     // the task row past what the picker would ever allow.
-    const allowed = new Set(supportedEfforts("claude-code", task.model).map((o) => o.id));
+    const allowed = new Set(
+      supportedEfforts(
+        "claude-code",
+        task.model,
+        getDiscoveredEfforts("claude-code", task.model, task.agent),
+      ).map((o) => o.id),
+    );
     if (!allowed.has(outcome.id)) {
       const modelLabel = task.model ?? DEFAULT_MODEL["claude-code"];
       announce(
@@ -3539,11 +3565,28 @@ export async function createTask(
   }
   const kind = harness.kind;
   const model = input.model ?? DEFAULT_MODEL[kind];
-  // Haiku 4.5 (and any future model whose effort support list is empty) sends
-  // null effort; every other model carries a real id.
-  const effortSupport = MODEL_EFFORT_SUPPORT[kind][model];
+  // Discovered efforts (e.g. Codex's own app-server catalog) win when the
+  // harness reported a non-empty list for this model; the curated
+  // MODEL_EFFORT_SUPPORT table is only the fallback (see
+  // `supportedEfforts`/`getDiscoveredEfforts`). The default effort is the
+  // kind default (`DEFAULT_EFFORT[kind]`) when it's among the offered ids,
+  // else the strongest offered id — mirroring the picker's own "kind default
+  // if offered, else first row" rule. Haiku 4.5 (and any future model whose
+  // effort support list is empty either way) sends null effort.
+  //
+  // Deliberate side effect versus the old direct-table read: an *unlisted*
+  // gemini/fx model id used to store `high` here (`MODEL_EFFORT_SUPPORT[kind][model]`
+  // read `undefined` for an unknown key, which failed the `Array.isArray`
+  // check and fell through to `DEFAULT_EFFORT[kind]`), while a *listed*
+  // gemini/fx model (whose curated set is `[]`) stored `null`. Routing
+  // through `supportedEfforts` makes both cases resolve to `null` — that's
+  // what the PATCH null-clear guard and every picker already compute for an
+  // unknown id, so this closes a known inconsistency, on purpose.
+  const support = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, harness.id));
   const effort = input.effort
-    ?? (Array.isArray(effortSupport) && effortSupport.length === 0 ? null : DEFAULT_EFFORT[kind]);
+    ?? (support.length === 0
+      ? null
+      : support.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : support[0]!.id);
 
   // Validate taskType against the known set so a bogus value can't poison
   // the row (the picker only ever sends one of the canonical ids, but

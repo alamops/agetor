@@ -7,7 +7,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
-import { mergeModelOptions } from "../../../shared/model-options.ts";
+import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -268,7 +268,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
           agentCache.current[a].model = m;
         }
         if (e) {
-          const supported = supportedEfforts(a, agentCache.current[a].model);
+          const supported = supportedEfforts(
+            a,
+            agentCache.current[a].model,
+            discoveredEffortsFor(agentModels[a], agentCache.current[a].model),
+          );
           if (supported.some((x) => x.id === e)) {
             agentCache.current[a].effort = e;
           } else if (supported.length === 0) {
@@ -341,7 +345,13 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   // doesn't accept any effort (Haiku 4.5), effort drops to `null` and the
   // dropdown disables itself. Otherwise we re-pin to the kind's default
   // effort when supported, falling back to the highest available option.
-  const efforts = supportedEfforts(kind, model);
+  // The CLI's own discovered per-model efforts (when reported) win over the
+  // curated table — see `supportedEfforts`'s third argument. Unlike
+  // RunPanel's task-details cascade, there's no prior intent to retain here
+  // (a new task doesn't exist yet), so this uses the discovered-wins set
+  // strictly.
+  const efforts = supportedEfforts(kind, model, discoveredEffortsFor(harnessModels[agent] ?? agentModels[kind], model));
+  const effortsKey = efforts.map((o) => o.id).join(",");
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(model);
   const fastAvailable = kind === "cursor" && cursorModelSupportsFast(model, effort);
   useEffect(() => {
@@ -355,7 +365,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
       : efforts[0]!.id;
     setEffort(fallback);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, model]);
+  }, [kind, model, effortsKey]);
   useEffect(() => {
     if (!fastAvailable && fast) setFast(false);
   }, [fastAvailable, fast]);
