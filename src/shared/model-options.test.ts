@@ -508,3 +508,48 @@ test("hasDiscoveredCatalog: false for an empty catalog", () => {
 test("hasDiscoveredCatalog: true for a non-empty catalog", () => {
   expect(hasDiscoveredCatalog([{ id: "openai/gpt-5.2" }])).toBe(true);
 });
+
+// --- discoveredEffortsFor over mergeModelOptions' MERGED rows applies rule 7 ---
+
+test("discoveredEffortsFor over merged rows: loggedIn:false distrusts discovered efforts (rule 7 applied)", () => {
+  const merged = mergeModelOptions({
+    curated: [{ id: "a", label: "A" }],
+    discovered: [{ id: "a", efforts: ["low", "high"] }],
+    selected: "a",
+    scoped: false,
+    loggedIn: false,
+  });
+  // Rule 7 discarded `discovered` wholesale before rule 8 ever ran, so the
+  // merged row for "a" carries no `efforts` key at all.
+  expect(discoveredEffortsFor(merged, "a")).toBeNull();
+});
+
+test("discoveredEffortsFor over merged rows: loggedIn:true (or omitted) trusts discovered efforts", () => {
+  const mergedLoggedIn = mergeModelOptions({
+    curated: [{ id: "a", label: "A" }],
+    discovered: [{ id: "a", efforts: ["low", "high"] }],
+    selected: "a",
+    scoped: false,
+    loggedIn: true,
+  });
+  expect(discoveredEffortsFor(mergedLoggedIn, "a")).toEqual(["low", "high"]);
+
+  const mergedOmitted = mergeModelOptions({
+    curated: [{ id: "a", label: "A" }],
+    discovered: [{ id: "a", efforts: ["low", "high"] }],
+    selected: "a",
+    scoped: false,
+  });
+  expect(discoveredEffortsFor(mergedOmitted, "a")).toEqual(["low", "high"]);
+});
+
+test("discoveredEffortsFor over the RAW discovered list would wrongly return efforts regardless of loggedIn — documenting why callers must pass merged rows", () => {
+  const rawDiscovered: DiscoveredModel[] = [{ id: "a", efforts: ["low", "high"] }];
+  // discoveredEffortsFor has no `loggedIn` of its own to consult — fed the
+  // raw pre-merge list, it can't tell a distrusted (logged-out) catalog from
+  // a trusted one, so it returns the efforts unconditionally. This is
+  // exactly the bug rule 8's merged-rows contract exists to prevent; real
+  // callers must pass `mergeModelOptions`'s own output instead (see the two
+  // tests above).
+  expect(discoveredEffortsFor(rawDiscovered, "a")).toEqual(["low", "high"]);
+});

@@ -50,6 +50,28 @@ function insertFxHarness(overrides: { id: string; home?: string | null }): Retur
   return created;
 }
 
+/** Same idea as `insertFxHarness`, for an *additional* codex harness row —
+ *  codex joined the fx per-harness discovery path (see `HarnessTarget` /
+ *  `refreshHarnessTarget` in agent-discovery.ts), so a second codex harness
+ *  with its own `home` (-> `HOME`+`CODEX_HOME` via `harnessEnv`) and/or its
+ *  own `bin` gets its own account-scoped catalog exactly like an
+ *  additional-account fx harness does. Unlike `insertFxHarness`, `bin` is
+ *  accepted here — codex tests distinguish harnesses by pointing each at a
+ *  different fake `codex app-server` stub binary (`plantFakeCodexAppServer`),
+ *  not by a HOME-branching script the way the fx helpers above do. */
+function insertCodexHarness(overrides: { id: string; home?: string | null; bin?: string | null }): ReturnType<typeof import("./db.ts").harnesses.insert> {
+  const created = harnesses.insert({
+    id: overrides.id,
+    kind: "codex",
+    label: overrides.id,
+    home: overrides.home ?? null,
+    bin: overrides.bin ?? null,
+    env: {},
+  });
+  createdHarnessIds.push(created.id);
+  return created;
+}
+
 afterEach(() => {
   for (const id of createdHarnessIds.splice(0)) {
     try {
@@ -421,6 +443,118 @@ test("getHarnessModelMap: an enabled fx harness is keyed by its own per-harness 
   });
 });
 
+/* ── codex per-harness discovery (codex joined the fx-only per-harness
+ * discovery path — see `HarnessTarget`/`refreshHarnessTarget` in
+ * agent-discovery.ts; the built-in "codex" harness row ships disabled by
+ * default (migration 016), so every test below that needs it enabled
+ * flips it for the duration of the test and restores it in `finally`,
+ * matching the "efforts-only catalog change" test above) ─────────────────── */
+
+test("refreshAllModels: a full sweep probes each enabled codex harness under its own bin — the built-in row via AGETOR_CODEX_BIN, an additional codex harness via its own configured bin", async () => {
+  resetAll();
+  const events: AppEvent[] = [];
+  const unsubscribe = subscribeAppEvents((e) => events.push(e));
+  const wasEnabled = harnesses.get("codex")?.enabled !== false;
+  harnesses.setEnabled("codex", true);
+  try {
+    const binA = plantFakeCodexAppServer({ pages: [[{ id: "codex-sweep-a" }]] });
+    const homeB = mkdtempSync(path.join(tmpdir(), "agetor-model-discovery-codex-home-b-"));
+    const binB = plantFakeCodexAppServer({ pages: [[{ id: "codex-sweep-b" }]] });
+
+    await withCodexBin(binA, async () => {
+      const created = insertCodexHarness({ id: "codex-2", home: homeB, bin: binB });
+
+      await scheduler.refreshAllModels();
+
+      const map = scheduler.getHarnessModelMap();
+      expect(map.byHarness["codex"]).toEqual([{ id: "codex-sweep-a", label: "codex-sweep-a" }]);
+      expect(map.byHarness[created.id]).toEqual([{ id: "codex-sweep-b", label: "codex-sweep-b" }]);
+
+      const changeEvents = events.filter(
+        (e): e is Extract<AppEvent, { type: "agent_models_changed" }> => e.type === "agent_models_changed",
+      );
+      expect(changeEvents.length).toBeGreaterThanOrEqual(1);
+      const publishedIds = changeEvents.flatMap((e) => e.harnessIds);
+      expect(publishedIds).toContain("codex");
+      expect(publishedIds).toContain(created.id);
+    });
+  } finally {
+    harnesses.setEnabled("codex", wasEnabled);
+    unsubscribe();
+  }
+});
+
+test("refreshHarnessModels: refreshing an additional codex harness re-probes only that harness's own bin — the built-in codex kind-level entry is left untouched", async () => {
+  resetAll();
+  const events: AppEvent[] = [];
+  const unsubscribe = subscribeAppEvents((e) => events.push(e));
+  const wasEnabled = harnesses.get("codex")?.enabled !== false;
+  harnesses.setEnabled("codex", true);
+  try {
+    const binA = plantFakeCodexAppServer({ pages: [[{ id: "codex-refresh-a" }]] });
+    const homeB = mkdtempSync(path.join(tmpdir(), "agetor-model-discovery-codex-home-refresh-"));
+    const dirB = mkdtempSync(path.join(tmpdir(), "agetor-model-discovery-codex-binb-refresh-"));
+    const binB = plantFakeCodexAppServer({ dir: dirB, pages: [[{ id: "codex-refresh-b1" }]] });
+
+    await withCodexBin(binA, async () => {
+      const created = insertCodexHarness({ id: "codex-2-refresh", home: homeB, bin: binB });
+
+      await scheduler.refreshAllModels();
+      expect(discovery.getDiscoveredModels("codex")).toEqual([{ id: "codex-refresh-a", label: "codex-refresh-a" }]);
+      expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([{ id: "codex-refresh-b1", label: "codex-refresh-b1" }]);
+      events.length = 0;
+
+      // Overwrite the stub *at the same bin path* with a different catalog —
+      // `created.id`'s harness row still points at `binB`, so a refresh of
+      // just that harness must see the new models.
+      plantFakeCodexAppServer({ dir: dirB, pages: [[{ id: "codex-refresh-b2" }]] });
+
+      await scheduler.refreshHarnessModels(created.id);
+
+      expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([{ id: "codex-refresh-b2", label: "codex-refresh-b2" }]);
+      // The built-in "codex" kind-level cache must be untouched by a
+      // per-harness refresh of a *different* harness.
+      expect(discovery.getDiscoveredModels("codex")).toEqual([{ id: "codex-refresh-a", label: "codex-refresh-a" }]);
+
+      const changeEvents = events.filter(
+        (e): e is Extract<AppEvent, { type: "agent_models_changed" }> => e.type === "agent_models_changed",
+      );
+      expect(changeEvents.some((e) => e.harnessIds.includes(created.id))).toBe(true);
+      for (const e of changeEvents) {
+        expect(e.harnessIds).not.toContain("codex");
+      }
+    });
+  } finally {
+    harnesses.setEnabled("codex", wasEnabled);
+    unsubscribe();
+  }
+});
+
+test("getHarnessModelMap: an additional codex harness is keyed by its own per-harness catalog, not the shared kind-level codex list — modelsForHarness reads harnessCache for codex, mirroring fx", async () => {
+  resetAll();
+  const wasEnabled = harnesses.get("codex")?.enabled !== false;
+  harnesses.setEnabled("codex", true);
+  try {
+    const binA = plantFakeCodexAppServer({ pages: [[{ id: "codex-map-a" }]] });
+    const homeB = mkdtempSync(path.join(tmpdir(), "agetor-model-discovery-codex-home-map-"));
+    const binB = plantFakeCodexAppServer({ pages: [[{ id: "codex-map-b" }]] });
+
+    await withCodexBin(binA, async () => {
+      const created = insertCodexHarness({ id: "codex-2-map", home: homeB, bin: binB });
+      await scheduler.refreshAllModels();
+
+      const map = scheduler.getHarnessModelMap();
+      expect(map.byHarness[created.id]).toEqual([{ id: "codex-map-b", label: "codex-map-b" }]);
+      // Must come from the per-harness cache, not the shared kind-level
+      // "codex" list (which — probed under agetor's own process env/bin,
+      // i.e. stub A, not stub B — would read the "codex-map-a" entry instead).
+      expect(map.byHarness[created.id]).not.toEqual(discovery.getDiscoveredModels("codex"));
+    });
+  } finally {
+    harnesses.setEnabled("codex", wasEnabled);
+  }
+});
+
 /* ── noteHarnessRemoved (code-review finding #2: the DELETE route used to
  * call a full refreshAllModels() sweep just to exercise its own
  * pruning-by-absence logic — noteHarnessRemoved prunes directly instead) ── */
@@ -436,6 +570,24 @@ test("noteHarnessRemoved: prunes the harness's discovered-models cache entry (mi
     scheduler.noteHarnessRemoved(created.id);
   });
   expect(discovery.getHarnessDiscoveredModels("fx-remove-cache-test")).toEqual([]);
+});
+
+test("noteHarnessRemoved: prunes an additional codex harness's per-harness discovered-models cache entry, mirroring the fx case above — codex joined the per-harness discovery path", async () => {
+  resetAll();
+  const home = mkdtempSync(path.join(tmpdir(), "agetor-model-discovery-codex-home-prune-"));
+  const bin = plantFakeCodexAppServer({ pages: [[{ id: "codex-prune-model" }]] });
+  const created = insertCodexHarness({ id: "codex-2-prune", home, bin });
+
+  await scheduler.refreshHarnessModels(created.id);
+  expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([{ id: "codex-prune-model", label: "codex-prune-model" }]);
+
+  harnesses.delete(created.id);
+  scheduler.noteHarnessRemoved(created.id);
+
+  expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([]);
+  // The harness is gone from the DB and pruned from the cache, so a fresh
+  // map built after the prune + publish must not carry its id either.
+  expect(scheduler.getHarnessModelMap().byHarness[created.id]).toBeUndefined();
 });
 
 test("noteHarnessRemoved: clears the harness's transition-detector bookkeeping — lastStatusKey and any pending debounce timer", () => {

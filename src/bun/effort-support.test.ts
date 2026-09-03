@@ -11,7 +11,9 @@ import {
   retainableEfforts,
   supportedEfforts,
   supportedModes,
+  type AgentOption,
 } from "../shared/types.ts";
+import type { ModelOption } from "../shared/model-options.ts";
 
 test("claude opus-5 supports xhigh + max", () => {
   const ids = supportedEfforts("claude-code", "opus-5").map((o) => o.id);
@@ -225,6 +227,31 @@ describe("supportedEfforts with discovered efforts", () => {
   test("a non-codex kind with a discovered list also honours it (the function is kind-agnostic)", () => {
     const ids = supportedEfforts("claude-code", "opus-5", ["low", "medium"]).map((o) => o.id);
     expect(ids).toEqual(["medium", "low"]);
+  });
+
+  test("cursor unknown-id guard runs before the discovered branch — a discovered list can't re-open efforts for an unknown cursor id", () => {
+    // cursor encodes effort in the model id itself (cursorModelArg); an
+    // unknown id has no way to receive an effort no matter what a harness
+    // "discovered" for it. If the discovered short-circuit ran first, this
+    // would incorrectly return ["high", "low"].
+    expect(supportedEfforts("cursor", "cursor-unknown-9", ["low", "high"])).toEqual([]);
+  });
+
+  test("cursor unknown-id guard only affects unknown ids — a known cursor id still honours a discovered list", () => {
+    const ids = supportedEfforts("cursor", "cursor-grok-4.6", ["low"]).map((o) => o.id);
+    expect(ids).toEqual(["low"]);
+  });
+});
+
+describe("AgentOption / ModelOption efforts field placement", () => {
+  test("AgentOption has no efforts field (moved to ModelOption, see mergeModelOptions rule 8)", () => {
+    const opt: AgentOption = { id: "x", label: "X" };
+    expect("efforts" in opt).toBe(false);
+  });
+
+  test("ModelOption (mergeModelOptions' output shape) is where efforts lives", () => {
+    const opt: ModelOption = { id: "x", label: "X", efforts: ["low", "high"] };
+    expect(opt.efforts).toEqual(["low", "high"]);
   });
 });
 

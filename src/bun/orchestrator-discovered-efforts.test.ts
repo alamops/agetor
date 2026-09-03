@@ -42,18 +42,27 @@ process.env.AGETOR_API_PORT = "4597";
 const BASE = "http://127.0.0.1:4597";
 
 let tasks: typeof import("./db.ts").tasks;
+let harnesses: typeof import("./db.ts").harnesses;
 let createTask: typeof import("./orchestrator.ts").createTask;
 let refreshKindModels: typeof import("./agent-discovery.ts").refreshKindModels;
+let refreshHarnessTarget: typeof import("./agent-discovery.ts").refreshHarnessTarget;
 let discoveryTesting: typeof import("./agent-discovery.ts").__testing;
 let server: { stop: () => void } | null = null;
 let token: string;
 let prevCodexBinEnv: string | undefined;
 
+/** Harness id created by the "second codex harness" section below, torn
+ *  down in `afterAll` — mirrors model-discovery.test.ts's
+ *  `createdHarnessIds` convention, just scoped to the one row this file
+ *  needs rather than a full afterEach sweep. */
+const CODEX_2_HARNESS_ID = "codex-2";
+
 beforeAll(async () => {
-  ({ tasks } = await import("./db.ts"));
+  ({ tasks, harnesses } = await import("./db.ts"));
   ({ createTask } = await import("./orchestrator.ts"));
   const discovery = await import("./agent-discovery.ts");
   refreshKindModels = discovery.refreshKindModels;
+  refreshHarnessTarget = discovery.refreshHarnessTarget;
   discoveryTesting = discovery.__testing;
   const { startApiServer, API_TOKEN } = await import("./server.ts");
   server = startApiServer() as unknown as { stop: () => void };
@@ -73,6 +82,11 @@ beforeAll(async () => {
 
 afterAll(() => {
   discoveryTesting.resetForTests();
+  try {
+    harnesses.delete(CODEX_2_HARNESS_ID);
+  } catch {
+    /* best effort — may not exist if the section below never ran */
+  }
   if (prevCodexBinEnv === undefined) delete process.env.AGETOR_CODEX_BIN;
   else process.env.AGETOR_CODEX_BIN = prevCodexBinEnv;
   server?.stop?.();
@@ -338,4 +352,95 @@ test("createTask (gemini, unlisted model id, no discovery): stores effort null �
   // and fell all the way through to DEFAULT_EFFORT.gemini ("high") instead —
   // see orchestrator.ts's "Deliberate side effect" comment on createTask.
   expect(created.task.effort).toBeNull();
+});
+
+/* ── Case 5: a second, non-built-in codex harness has its own catalog —
+      `createTask`/the PATCH guard must key discovered efforts off
+      `harness.id`, not just `kind`, so a custom harness alias doesn't blend
+      into (or get blended into by) the built-in "codex" harness's own
+      discovered set. ── */
+
+test("createTask + PATCH guard: a second codex harness's own discovered catalog wins over the built-in harness's catalog for the same model id", async () => {
+  discoveryTesting.resetForTests();
+
+  // Plant the second harness's own account (its own HOME/CODEX_HOME) and
+  // stub app-server, reporting a *different* effort set than the built-in
+  // harness will report for the exact same model id ("m1") below — this is
+  // what proves the lookup is harness-scoped, not kind-scoped. Inserted once
+  // in this file (see CODEX_2_HARNESS_ID / afterAll teardown above) — a
+  // duplicate `harnesses.insert` for the same id would violate the table's
+  // `id TEXT PRIMARY KEY` constraint, so every assertion about codex-2 lives
+  // in this single test.
+  const codex2Home = mkdtempSync(path.join(tmpdir(), "agetor-codex2-home-"));
+  const codex2Bin = plantFakeCodexAppServer({ pages: [[{ id: "m1", efforts: ["low", "medium"] }]] });
+  harnesses.insert({
+    id: CODEX_2_HARNESS_ID,
+    kind: "codex",
+    label: "Codex 2",
+    home: codex2Home,
+    bin: codex2Bin,
+    env: { HOME: codex2Home, CODEX_HOME: path.join(codex2Home, ".codex") },
+  });
+  await refreshHarnessTarget({
+    harnessId: CODEX_2_HARNESS_ID,
+    kind: "codex",
+    env: { HOME: codex2Home, CODEX_HOME: path.join(codex2Home, ".codex") },
+    bin: codex2Bin,
+  });
+
+  // Populate the *built-in* "codex" harness's kind-level cache under a
+  // separate stub reporting a different effort set for the same "m1" id.
+  const codex1Bin = plantFakeCodexAppServer({ pages: [[{ id: "m1", efforts: ["low", "high"] }]] });
+  await withEnvOverride("AGETOR_CODEX_BIN", codex1Bin, async () => {
+    await refreshKindModels("codex");
+  });
+
+  // Second harness: discovered {low, medium} — "high" isn't offered, so the
+  // strongest offered id (canonical EFFORT_OPTIONS order) wins: "medium".
+  const created2 = await createTask({
+    title: "case5-codex-2",
+    prompt: "p",
+    agent: CODEX_2_HARNESS_ID,
+    model: "m1",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created2) throw new Error(created2.error);
+  expect(created2.task.agent).toBe(CODEX_2_HARNESS_ID);
+  expect(created2.task.effort).toBe("medium");
+
+  // Built-in harness: discovered {low, high} — "high" == DEFAULT_EFFORT.codex
+  // and is offered, so the kind default wins outright, exactly as case 2
+  // above already pins for the kind-level cache alone. This is the same
+  // model id ("m1") as the codex-2 task, proving the two harnesses' catalogs
+  // don't bleed into each other.
+  const created1 = await createTask({
+    title: "case5-codex-builtin",
+    prompt: "p",
+    agent: "codex",
+    model: "m1",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created1) throw new Error(created1.error);
+  expect(created1.task.agent).toBe("codex");
+  expect(created1.task.effort).toBe("high");
+
+  // PATCH null-clear guard, over real HTTP, for the codex-2 task: its
+  // harness-scoped discovered set ({low, medium}) is non-empty, so clearing
+  // effort must be rejected — mirroring Case 3 above, but proving the guard
+  // reads `resolvedHarness?.id` (server.ts), not just `resolvedKind`.
+  const res = await authedFetch(`/tasks/${created2.task.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ effort: null }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toBe(`effort cannot be cleared for model "m1"`);
+
+  // The row itself must be untouched by the rejected patch.
+  const stillHas = tasks.get(created2.task.id);
+  expect(stillHas?.effort).toBe("medium");
 });
