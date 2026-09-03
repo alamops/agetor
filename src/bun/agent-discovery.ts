@@ -1,15 +1,28 @@
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
+import type { Subprocess } from "bun";
+import pkg from "../../package.json" with { type: "json" };
 import type { AgentKind } from "../shared/types.ts";
 
 /**
  * A model id (and optional human label) surfaced by the agent CLI itself.
  * Discovery is best-effort — a missing or unparseable CLI just returns an
  * empty list and the UI falls back to the hardcoded AGENT_OPTIONS.
+ *
+ * `efforts`, when present, is the deduped list of bare reasoning-effort ids
+ * (e.g. `"high"`, `"ultra"`) the CLI itself reported as supported for this
+ * model — codex only today, sourced from `codex app-server`'s `model/list`
+ * response (`supportedReasoningEfforts[].reasoningEffort`; see
+ * `parseCodexModelList`). Omitted entirely when the CLI reported no efforts
+ * (never an empty array), so a model with no discovered effort data is
+ * byte-identical to the pre-`efforts` shape. Consumed via `supportedEfforts`'
+ * third argument (`src/shared/types.ts`), where a non-empty discovered set
+ * wins over the curated `MODEL_EFFORT_SUPPORT` table.
  */
 export interface DiscoveredModel {
   id: string;
   label?: string;
+  efforts?: string[];
 }
 
 /**
@@ -21,14 +34,19 @@ export interface DiscoveredModel {
  * exists solely so `discoverFx` can probe an additional-account fx harness
  * (one with a `HOME` override) under *that* harness's own env instead of
  * agetor's process env, since fx's catalog is account-scoped (see
- * `discoverFx`'s comment below). Every other discoverer in this module
- * probes a built-in CLI's model-listing subcommand and never passes `env` —
- * none of those catalogs vary by account. Keeping the override optional and
- * purely additive is what lets this module stay free of the database and
- * process-spawning helper modules (which would otherwise drag DB-open and
- * process-signal-handler side effects into a plain best-effort prober) — see
- * the module-level note on `discoverFx` below for the full "stay a leaf"
- * constraint.
+ * `discoverFx`'s comment below). Cursor is the only other user of this
+ * helper today — it probes a built-in CLI's model-listing subcommand and
+ * never passes `env`, since its catalog doesn't vary by account. Codex used
+ * to as well (`codex prompt --models`), but that flag never actually existed
+ * (binary-verified 0.147.0/0.153.0, 2026-09-03 — `error: unexpected
+ * argument '--models'`; `discoverCodex` had always returned `[]`), so it's
+ * moved off this helper entirely onto `codex app-server`'s own JSON-RPC
+ * protocol (see `discoverCodex` below) rather than a `runProbe` call.
+ * Keeping the override optional and purely additive is what lets this
+ * module stay free of the database and process-spawning helper modules
+ * (which would otherwise drag DB-open and process-signal-handler side
+ * effects into a plain best-effort prober) — see the module-level note on
+ * `discoverFx` below for the full "stay a leaf" constraint.
  */
 async function runProbe(
   cmd: string[],
@@ -52,29 +70,57 @@ async function runProbe(
 }
 
 /**
- * Parse `codex prompt --models` output. We don't know the exact format codex
- * uses (it has changed across releases and isn't formally specified), so we
- * lean on a loose heuristic: any line whose first whitespace-separated token
- * looks like a model id (`<word>-<word>...` with at least one dash) is taken
- * as a model. Header rows and `Available models:` chatter are dropped.
+ * Parse a `codex app-server` `model/list` JSON-RPC result (the `result`
+ * object shape, i.e. `{ data: [...], nextCursor }` — see `discoverCodex`
+ * below for how the pages are collected and concatenated before this is
+ * called). Pure, never throws: any malformed input (non-object, a missing or
+ * non-array `data`, a non-object entry) degrades to `[]` rather than
+ * throwing — discovery is best-effort, never a hard dependency.
+ *
+ * Per entry: `id` must be a non-empty string (else skipped); `hidden ===
+ * true` entries are skipped defensively (the server already filters these,
+ * per the spike, but a future account/build regression shouldn't leak a
+ * hidden row into the picker); ids are deduped (same `seen`-Set convention
+ * as `parseCursorModels`/`parseFxModels` below — first occurrence wins).
+ * `label` is `displayName` when it's a non-empty string, else omitted.
+ * `efforts` is the deduped list of `supportedReasoningEfforts[].reasoningEffort`
+ * strings, in the order the CLI reported them, with the key omitted entirely
+ * when that list is empty — so an entry with no reported efforts stays
+ * `{ id }`-only, byte-identical to the pre-`efforts` shape.
  */
-function parseCodexModels(stdout: string): DiscoveredModel[] {
+function parseCodexModelList(result: unknown): DiscoveredModel[] {
+  if (!result || typeof result !== "object") return [];
+  const data = (result as { data?: unknown }).data;
+  if (!Array.isArray(data)) return [];
   const out: DiscoveredModel[] = [];
   const seen = new Set<string>();
-  for (const raw of stdout.split("\n")) {
-    const line = raw.trim();
-    if (!line) continue;
-    // Skip obvious banner / header lines.
-    if (/^(available|models|model\s+id|---|=+)/i.test(line)) continue;
-    const first = line.split(/\s+/)[0]!;
-    // A loose "looks like a model id" check: lowercase, alphanumeric + dashes,
-    // contains at least one dash. Tight enough to skip prose but lenient
-    // enough to keep "gpt-5", "gpt-5-codex", "o4-mini" etc.
-    if (!/^[a-z0-9][a-z0-9.\-_]*[a-z0-9]$/i.test(first)) continue;
-    if (!first.includes("-")) continue;
-    if (seen.has(first)) continue;
-    seen.add(first);
-    out.push({ id: first });
+  for (const entry of data) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const id = e.id;
+    if (typeof id !== "string" || id.length === 0) continue;
+    if (e.hidden === true) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
+
+    const model: DiscoveredModel = { id };
+    if (typeof e.displayName === "string" && e.displayName.length > 0) {
+      model.label = e.displayName;
+    }
+    if (Array.isArray(e.supportedReasoningEfforts)) {
+      const efforts: string[] = [];
+      const effortsSeen = new Set<string>();
+      for (const s of e.supportedReasoningEfforts) {
+        if (!s || typeof s !== "object") continue;
+        const reasoningEffort = (s as Record<string, unknown>).reasoningEffort;
+        if (typeof reasoningEffort !== "string" || reasoningEffort.length === 0) continue;
+        if (effortsSeen.has(reasoningEffort)) continue;
+        effortsSeen.add(reasoningEffort);
+        efforts.push(reasoningEffort);
+      }
+      if (efforts.length > 0) model.efforts = efforts;
+    }
+    out.push(model);
   }
   return out;
 }
@@ -118,6 +164,48 @@ async function discoverCursor(): Promise<DiscoveredModel[]> {
   return parseCursorModels(probe.stdout);
 }
 
+/**
+ * Discover codex's model catalog by speaking to `codex app-server` directly
+ * over JSON-RPC 2.0 (newline-delimited, one object per line each direction)
+ * on its stdio pipes — NOT via a model-listing subcommand like
+ * `parseCursorModels`/`parseFxModels`'s CLIs offer. `codex prompt --models`
+ * was assumed to exist by a previous version of this function but never
+ * did: binary-verified against codex-cli 0.147.0 and 0.153.0 (2026-09-03),
+ * it fails with `error: unexpected argument '--models'` on both, so
+ * `discoverCodex` had always silently returned `[]`.
+ *
+ * Protocol (spike-verified, both versions, 2026-09-03):
+ *   1. `{jsonrpc:"2.0", id, method:"initialize", params:{clientInfo}}` →
+ *      response in ~160ms. Unsolicited notifications with no `id` (e.g.
+ *      `remoteControl/status/changed`) may arrive interleaved — ignored.
+ *   2. `{jsonrpc:"2.0", method:"initialized", params:{}}` — a notification,
+ *      no `id`, no response expected.
+ *   3. `{jsonrpc:"2.0", id, method:"model/list", params:{}}` → response in
+ *      0.8–1.8s: `{id, result:{data:[...], nextCursor}}`. An unknown method
+ *      would answer `{id, error:{code:-32600, message}}`.
+ *
+ * The catalog is account-scoped and server-fetched (codex caches it at
+ * `~/.codex/models_cache.json`), which is exactly why this can't be a
+ * one-shot `runProbe` subcommand call the way cursor/fx's discoverers are —
+ * it's a stateful handshake over a long-lived pipe, not a single argv probe.
+ *
+ * Contract, matching every other discoverer in this module: never throws,
+ * never hangs. Resolves `[]` when: the child exits before the `model/list`
+ * result arrives (the `/bin/echo app-server` unit-test stub case — this
+ * resolves promptly on exit, it does not wait out the 5s budget below); a
+ * response carries a JSON-RPC `error`; the 5s overall budget elapses; or
+ * anything throws (including a `stdin.write`/`flush` against an
+ * already-closed pipe, guarded individually since that stub case closes its
+ * pipe immediately). The child is always killed and the timer always
+ * cleared in a `finally`. Pagination follows a non-empty string
+ * `nextCursor` with a fresh `model/list` call (`{cursor}`), bounded to 5
+ * pages total, concatenating each page's `data` before handing the whole
+ * batch to `parseCodexModelList`.
+ *
+ * Stays a leaf like every other discoverer here: no import of db.ts,
+ * agents.ts, or any other process-spawning helper module — see the
+ * module-level "stay a leaf" note on `discoverFx` below.
+ */
 async function discoverCodex(): Promise<DiscoveredModel[]> {
   // Resolve against the rehydrated PATH explicitly — Bun.spawn (and the
   // implicit lookup inside it) uses Bun's startup PATH cache, which on a
@@ -125,12 +213,144 @@ async function discoverCodex(): Promise<DiscoveredModel[]> {
   // full story.
   const fallback = process.env.AGETOR_CODEX_BIN ?? "codex";
   const bin = Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
-  // Newer codex builds expose `codex prompt --models`; older builds may not.
-  // We try the documented form first; if it fails we return empty rather than
-  // probing harder — the hardcoded list is the fallback.
-  const probe = await runProbe([bin, "prompt", "--models"]);
-  if (!probe.ok || !probe.stdout) return [];
-  return parseCodexModels(probe.stdout);
+
+  let proc: Subprocess<"pipe", "pipe", "ignore">;
+  try {
+    proc = Bun.spawn([bin, "app-server"], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+  } catch {
+    return [];
+  }
+
+  // `settled` flips true the moment we know no further response is coming
+  // (child exited, or our own timeout fired) — every pending/future `call()`
+  // resolves to `undefined` from that point on instead of hanging.
+  let settled = false;
+  let killed = false;
+  const kill = (): void => {
+    if (killed) return;
+    killed = true;
+    try { proc.kill(); } catch { /* already exited */ }
+  };
+
+  let nextId = 1;
+  const pending = new Map<number, (msg: unknown) => void>();
+  const settleAllPending = (): void => {
+    settled = true;
+    for (const resolve of pending.values()) resolve(undefined);
+    pending.clear();
+  };
+
+  // The child dying before it answered a pending request must unblock that
+  // request's promise rather than hang until the 5s timer — this is what
+  // makes a stub like `/bin/echo app-server` (which prints "app-server" and
+  // exits at once) resolve `[]` promptly.
+  proc.exited.then(settleAllPending).catch(settleAllPending);
+
+  const timer = setTimeout(() => {
+    settleAllPending();
+    kill();
+  }, 5_000);
+
+  // Background read loop: buffer stdout, split on newlines, `JSON.parse`
+  // each non-empty line as one JSON-RPC message (an unparsable line is
+  // skipped, not fatal), and resolve whichever pending call's numeric `id`
+  // it matches. A message with no numeric `id` — an unsolicited notification
+  // — or one whose `id` doesn't match any pending call is silently ignored.
+  void (async () => {
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          let msg: unknown;
+          try {
+            msg = JSON.parse(trimmed);
+          } catch {
+            continue;
+          }
+          if (!msg || typeof msg !== "object") continue;
+          const id = (msg as { id?: unknown }).id;
+          if (typeof id !== "number") continue;
+          const resolve = pending.get(id);
+          if (resolve) {
+            pending.delete(id);
+            resolve(msg);
+          }
+        }
+      }
+    } catch {
+      /* stream error — the `exited` handler above still settles any pending calls */
+    }
+  })();
+
+  const send = (obj: unknown): void => {
+    try {
+      proc.stdin.write(`${JSON.stringify(obj)}\n`);
+      proc.stdin.flush();
+    } catch {
+      // Child's stdin already closed (e.g. the `/bin/echo app-server` stub,
+      // which exits immediately) — the caller learns "no response coming"
+      // via the `exited`/timeout settlement above, not via this throwing.
+    }
+  };
+
+  const call = (method: string, params: unknown): Promise<unknown> => {
+    const id = nextId++;
+    return new Promise((resolve) => {
+      if (settled) {
+        resolve(undefined);
+        return;
+      }
+      pending.set(id, resolve);
+      send({ jsonrpc: "2.0", id, method, params });
+    });
+  };
+
+  const notify = (method: string, params: unknown): void => {
+    send({ jsonrpc: "2.0", method, params });
+  };
+
+  try {
+    const initMsg = (await call("initialize", {
+      clientInfo: { name: "agetor", title: "Agetor", version: pkg.version },
+    })) as { result?: unknown; error?: unknown } | undefined;
+    if (!initMsg || initMsg.error) return [];
+
+    notify("initialized", {});
+
+    let allData: unknown[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 5; page++) {
+      const params: Record<string, unknown> = cursor !== undefined ? { cursor } : {};
+      const listMsg = (await call("model/list", params)) as { result?: unknown; error?: unknown } | undefined;
+      if (!listMsg || listMsg.error) break;
+      const result = listMsg.result;
+      if (!result || typeof result !== "object") break;
+      const data = (result as { data?: unknown }).data;
+      if (Array.isArray(data)) allData = allData.concat(data);
+      const nextCursor = (result as { nextCursor?: unknown }).nextCursor;
+      if (typeof nextCursor === "string" && nextCursor.length > 0) {
+        cursor = nextCursor;
+      } else {
+        break;
+      }
+    }
+    return parseCodexModelList({ data: allData });
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+    kill();
+  }
 }
 
 /**
@@ -170,7 +390,7 @@ async function discoverGemini(): Promise<DiscoveredModel[]> {
  * missing/malformed `ids`, non-string entries) yields an empty list rather
  * than throwing — discovery is best-effort, never a hard dependency for the
  * picker. Ids are deduped (same `seen`-Set convention as
- * `parseCodexModels`/`parseCursorModels` above) — a repeated id in the
+ * `parseCodexModelList`/`parseCursorModels` above) — a repeated id in the
  * catalog would otherwise surface as a duplicate React key in the model
  * picker.
  *
@@ -404,6 +624,32 @@ export function getAllHarnessDiscoveredModels(): Record<string, DiscoveredModel[
 }
 
 /**
+ * The bun-side twin of `discoveredEffortsFor` in `src/shared/model-options.ts`
+ * (which serves the webview/CLI from the model lists those callers already
+ * fetched over the API) — this one reads straight from this module's own
+ * in-memory caches instead, for callers that live on this side of the
+ * process (the orchestrator, `server.ts`'s PATCH guard). Looks in
+ * `harnessCache.get(harnessId)` first when `harnessId` is given (fx is the
+ * only kind whose catalog varies per harness — a `harnessId` for any other
+ * kind simply won't have an entry there, so this is a harmless miss), then
+ * falls back to `cache.get(kind)`. Returns the matching model's `efforts`
+ * when that list is non-empty, else `null` (no model arg, no matching
+ * entry, or an entry with no discovered efforts all read the same way).
+ * Callers pass this straight through as `supportedEfforts`'s third argument.
+ */
+export function getDiscoveredEfforts(
+  kind: AgentKind,
+  model: string | null,
+  harnessId?: string | null,
+): string[] | null {
+  if (!model) return null;
+  const fromHarness = harnessId ? harnessCache.get(harnessId)?.find((m) => m.id === model) : undefined;
+  const entry = fromHarness ?? cache.get(kind)?.find((m) => m.id === model);
+  if (entry?.efforts && entry.efforts.length > 0) return entry.efforts;
+  return null;
+}
+
+/**
  * False until the first `refreshDiscoveredModels` call has fully settled
  * (success or failure), true forever after. Callers — e.g. a webview
  * boot-race retry — use this to tell "discovery hasn't run yet" apart from
@@ -610,4 +856,4 @@ function resetForTests(): void {
 
 // Exposed for tests that want to feed in synthetic CLI output, and to reset
 // module-level state between tests.
-export const __testing = { parseCodexModels, parseCursorModels, parseFxModels, resetForTests };
+export const __testing = { parseCodexModelList, parseCursorModels, parseFxModels, resetForTests };

@@ -69,8 +69,14 @@ function discoveryTargets(): FxHarnessTarget[] {
  */
 let previousSnapshot: Map<string, string> | null = null;
 
+// Hashes `id` *and* `efforts` (joined, in reported order) per model, not
+// just `id` — a catalog whose ids are unchanged but whose per-model
+// discovered effort sets changed (e.g. codex's `model/list` starts/stops
+// reporting `ultra` for an id already in the cache) must still be treated
+// as a change and publish `agent_models_changed`, since that's the only
+// signal that drives a picker refetch.
 function snapshotKey(models: DiscoveredModel[]): string {
-  return JSON.stringify(models.map((m) => m.id));
+  return JSON.stringify(models.map((m) => `${m.id}:${(m.efforts ?? []).join(",")}`));
 }
 
 function modelsForHarness(harnessId: string, kind: AgentKind): DiscoveredModel[] {

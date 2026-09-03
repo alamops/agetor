@@ -64,6 +64,22 @@
  *    too. That's acceptable: this rule intentionally fails closed on trust
  *    rather than carving out per-kind exceptions.
  *
+ * 8. When a row's id has a matching entry in the (rule-7-trusted) `discovered`
+ *    list and that entry's `efforts` is a non-empty array, the merged row
+ *    carries a fresh copy of it as `ModelOption.efforts`. This applies to
+ *    both curated∩discovered rows and discovered-only rows — it is the one
+ *    field discovery contributes to an otherwise-curated row; rule 5's
+ *    label/hint precedence (curated wins on a shared id) is unchanged. No
+ *    row carries `efforts` when rule 7 distrusts `discovered`
+ *    (`loggedIn === false`) or `discovered` is empty. The `unlisted` row
+ *    appended by rule 6 carries `efforts` too, under the same lookup, when
+ *    the trusted `discovered` list has a matching entry. Pickers read a
+ *    row's `efforts` via the `discoveredEffortsFor` helper below (fed the
+ *    same `discovered` list passed in here) and hand the result to
+ *    `supportedEfforts` (`./types.ts`) as its third argument, so a
+ *    CLI-discovered per-model effort set wins over the curated
+ *    `MODEL_EFFORT_SUPPORT` table.
+ *
  * Inputs are never mutated; a new array is always returned.
  */
 
@@ -83,6 +99,10 @@ export interface CuratedModel {
 export interface DiscoveredModel {
   id: string;
   label?: string;
+  /** Bare reasoning-effort ids the harness's CLI reported for this model
+   *  (codex only today, via `codex app-server model/list`). Absent when the
+   *  CLI reported none. See rule 8. */
+  efforts?: readonly string[];
 }
 
 /** One row in the merged, render-ready model list. */
@@ -93,6 +113,10 @@ export interface ModelOption {
   /** True when `selected` wasn't in curated ∪ discovered and was appended
    *  so the `<select>` keeps a valid value (rule 6). */
   unlisted?: boolean;
+  /** Copied from the discovered entry by rule 8, when present. Pickers pass
+   *  this as the third argument of `supportedEfforts` (`./types.ts`) so the
+   *  discovered set wins over the curated `MODEL_EFFORT_SUPPORT` table. */
+  efforts?: readonly string[];
 }
 
 export interface MergeModelOptionsInput {
@@ -124,14 +148,27 @@ export function hasDiscoveredCatalog(discovered: readonly DiscoveredModel[]): bo
   return discovered.length > 0;
 }
 
-function toCuratedOption(m: CuratedModel): ModelOption {
+/** Rule 8: a fresh copy of `entry.efforts` when it's a non-empty array,
+ *  else `undefined` (so callers can spread it in without ever attaching an
+ *  empty/undefined `efforts` key). */
+function effortsFor(entry: DiscoveredModel | undefined): readonly string[] | undefined {
+  if (entry?.efforts && entry.efforts.length > 0) return [...entry.efforts];
+  return undefined;
+}
+
+function toCuratedOption(m: CuratedModel, discoveredById: Map<string, DiscoveredModel>): ModelOption {
   const opt: ModelOption = { id: m.id, label: m.label };
   if (m.hint !== undefined) opt.hint = m.hint;
+  const efforts = effortsFor(discoveredById.get(m.id));
+  if (efforts !== undefined) opt.efforts = efforts;
   return opt;
 }
 
 function toDiscoveredOnlyOption(m: DiscoveredModel): ModelOption {
-  return { id: m.id, label: m.label ?? m.id };
+  const opt: ModelOption = { id: m.id, label: m.label ?? m.id };
+  const efforts = effortsFor(m);
+  if (efforts !== undefined) opt.efforts = efforts;
+  return opt;
 }
 
 /** Merges a kind's curated model list with its CLI-discovered catalog per
@@ -143,6 +180,13 @@ export function mergeModelOptions(input: MergeModelOptionsInput): ModelOption[] 
   // distrust it wholesale by falling through to the discovery-empty path,
   // same as if the CLI had surfaced nothing at all.
   const discovered = input.loggedIn === false ? [] : input.discovered;
+  // Rule 8: id -> discovered entry, for attaching `efforts` to curated rows
+  // (first occurrence wins, matching the merge's own de-dupe policy — not
+  // that a well-formed discovered list would carry duplicate ids anyway).
+  const discoveredById = new Map<string, DiscoveredModel>();
+  for (const m of discovered) {
+    if (!discoveredById.has(m.id)) discoveredById.set(m.id, m);
+  }
 
   const result: ModelOption[] = [];
   const seen = new Set<string>();
@@ -150,7 +194,7 @@ export function mergeModelOptions(input: MergeModelOptionsInput): ModelOption[] 
   const pushCurated = (m: CuratedModel) => {
     if (seen.has(m.id)) return;
     seen.add(m.id);
-    result.push(toCuratedOption(m));
+    result.push(toCuratedOption(m, discoveredById));
   };
 
   const pushDiscoveredOnly = (m: DiscoveredModel) => {
@@ -200,14 +244,36 @@ export function mergeModelOptions(input: MergeModelOptionsInput): ModelOption[] 
       const hint = input.loggedIn === false
         ? "Not logged in — this account's catalog is unavailable"
         : "Not in this account's model catalog";
-      result.push({
+      const unlistedOpt: ModelOption = {
         id: selected,
         label: selected,
         hint,
         unlisted: true,
-      });
+      };
+      const efforts = effortsFor(discoveredById.get(selected));
+      if (efforts !== undefined) unlistedOpt.efforts = efforts;
+      result.push(unlistedOpt);
     }
   }
 
   return result;
+}
+
+/** The webview/CLI twin of the bun-side `getDiscoveredEfforts`
+ *  (`src/bun/agent-discovery.ts`, which reads the in-process discovery
+ *  caches): given the same discovered-model list a caller hands to
+ *  `mergeModelOptions` (`harnessModels[harnessId] ?? agentModels[kind]` in
+ *  the webview, the fetched `discovered` list in `agetor add`), returns the
+ *  matching entry's `efforts` when it's a non-empty array, else `null`.
+ *  Pass the result straight through as `supportedEfforts`'s third argument
+ *  (`./types.ts`). Structural over `models`/`id` for the same reason the
+ *  rest of this module is structural — see the module doc comment. */
+export function discoveredEffortsFor(
+  models: readonly { id: string; efforts?: readonly string[] }[] | null | undefined,
+  id: string | null | undefined,
+): readonly string[] | null {
+  if (!models || !id) return null;
+  const entry = models.find((m) => m.id === id);
+  if (entry?.efforts && entry.efforts.length > 0) return entry.efforts;
+  return null;
 }

@@ -66,6 +66,10 @@
 - **Aeon row** with an "unverified id" hint; effort set = Astra's (assumption).
 - No migration, no `MODEL_MODE_DENY` entry, no `agents.ts` change (verbatim passthrough is the tested contract).
 
+
+- **Cascade rule (orchestrator decision, wave-1 checkpoint):** "discovered wins" narrows what the pickers *offer*, but an *existing* task effort stays valid when either the discovered or the curated set supports it — `retainableEfforts(kind, model, discoveredEfforts)` in `src/shared/types.ts`, the union of both — and only an effort neither source supports triggers RunPanel's cascade or the orchestrator's `effortFallbackForModelChange`. A retained-but-unoffered effort renders as an unlisted row in the effort select (rule-6 analogue). Rationale: a discovery refresh that omits `none` (Codex's catalog never lists it; the API accepts it) must not silently PATCH away an effort the user chose. New-task forms and `createTask` have no prior intent for the task, so they use the discovered-wins set strictly.
+
+
 ## 4. Work breakdown — implementation tasks
 
 **Wave 1 (foundations; disjoint files)**

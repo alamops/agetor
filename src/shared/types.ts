@@ -1258,6 +1258,16 @@ export interface AgentOption {
    * 0.0.6.
    */
   catalogOnly?: boolean;
+  /**
+   * Per-model reasoning-effort ids the harness's CLI itself reported for
+   * this model (bare `EFFORT_OPTIONS` ids). Set only by `mergeModelOptions`
+   * (`src/shared/model-options.ts`) from a CLI-discovered catalog entry —
+   * never present on a purely curated row. Pickers pass this as
+   * `supportedEfforts`'s third argument (`discoveredEfforts`) so the
+   * discovered set wins over the static `MODEL_EFFORT_SUPPORT` table. Codex
+   * is the only kind reporting it today, via `codex app-server model/list`.
+   */
+  efforts?: readonly string[];
 }
 
 export interface AgentOptions {
@@ -1296,7 +1306,14 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // cost 2x the usage, so the default stays on the most-capable non-premium
   // tier.
   "claude-code": "opus-5",
-  "codex": "gpt-5.6-sol",
+  // Owner decision 2026-09-03: default to GPT-6 Astra, OpenAI's most capable
+  // model (released 2026-09-03). Live spike the same day on a ChatGPT-plan
+  // account: codex 0.147.0 and 0.153.0 both get HTTP 400 "The 'gpt-6-astra'
+  // model is not supported when using Codex with a ChatGPT account." during
+  // OpenAI's phased rollout (Trusted Access Program first, ChatGPT plans +
+  // API "in the coming days"). The picker hint carries the gate, and
+  // GPT-5.6 Sol (the previous default) stays one click away.
+  "codex": "gpt-6-astra",
   // Grok 4.6 (high effort via DEFAULT_EFFORT) — replaces cursor-agent's own
   // "auto" as agetor's default so new tasks pin an explicit flagship model.
   "cursor": "cursor-grok-4.6",
@@ -1340,6 +1357,8 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
 export const CATALOG_SCOPED_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["fx"]);
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
+  // `ultra` (Codex's automatic-sub-agent-delegation tier) is deliberately
+  // not the default — it burns several times Max's usage per turn.
   "codex": "high",
   // Models with `effortIds` default to High where they expose it (else their
   // first available level — e.g. claude-4.6-sonnet only exposes medium).
@@ -1740,6 +1759,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  * `none` is currently used only by GPT-5.6-family Codex models.
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
+  { id: "ultra", label: "Ultra", hint: "Codex's top tier — maximum reasoning plus automatic delegation to internal sub-agents. Several times Max's usage; Codex-only today." },
   { id: "max", label: "Max thinking", hint: "Absolute maximum reasoning effort. Separate from Cursor Max Mode context." },
   { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5.1 / 5 / Mythos 5.1 / 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
@@ -1797,13 +1817,29 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "haiku-4.5": [],
   },
   codex: {
-    // Cyber's own model page doesn't enumerate efforts; assume the GPT-5.6
-    // family surface (the set Sol documents). Revisit if codex rejects none/max.
-    "gpt-5.6-cyber": ["max", "xhigh", "high", "medium", "low", "none"],
-    "gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none"],
-    "gpt-5.6-terra": ["max", "xhigh", "high", "medium", "low", "none"],
+    // Evidence (2026-09-03): the OpenAI model page documents Astra as
+    // low/medium/high/xhigh/max with `none` explicitly unsupported, and the
+    // Codex models page adds an Ultra tier (automatic sub-agent delegation)
+    // on top of that. Aeon (the long-horizon Astra variant) is assumed to
+    // share Astra's set. `codex app-server model/list` on 0.147.0 and
+    // 0.153.0 lists `ultra` for Sol and Terra but not for Luna, and lists
+    // `none` for nobody in this account's catalog — yet a live `codex exec`
+    // accepted `none` on both Sol and Luna, and accepted `ultra` even on
+    // Luna despite Codex's own catalog not offering it there; `max` on
+    // gpt-5.5 was rejected with "Supported values are: 'none', 'low',
+    // 'medium', 'high', and 'xhigh'." So the curated `ultra` rows follow
+    // Codex's offering (not the live-acceptance superset), `none` follows
+    // live acceptance, and Cyber mirrors Sol (assumption — Cyber isn't in
+    // this account's catalog at all). Note: discovered efforts (see
+    // `supportedEfforts`'s third argument) override this table whenever the
+    // CLI itself reports a set for the model.
+    "gpt-6-astra": ["ultra", "max", "xhigh", "high", "medium", "low"],
+    "gpt-6-astra-aeon": ["ultra", "max", "xhigh", "high", "medium", "low"],
+    "gpt-5.6-cyber": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-sol": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-terra": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
-    "gpt-5.5": ["xhigh", "high", "medium", "low"],
+    "gpt-5.5": ["xhigh", "high", "medium", "low", "none"],
     "gpt-5": ["xhigh", "high", "medium", "low"],
     "gpt-5-codex": ["xhigh", "high", "medium", "low"],
   },
@@ -1862,8 +1898,32 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
  * unknown cursor id passes through verbatim, so any effort picked for it
  * would silently never reach the CLI. Those report no efforts instead.
  * Returned in the EFFORT_OPTIONS order (highest → lowest).
+ *
+ * `discoveredEfforts` (optional third arg) is the CLI's own reported effort
+ * set for this exact model, when a caller has one (see `AgentOption.efforts`
+ * and `discoveredEffortsFor` in `src/shared/model-options.ts`). Precedence:
+ * a non-empty `discoveredEfforts` wins outright — the result is
+ * `EFFORT_OPTIONS` filtered to it (canonical highest→lowest order) — unless
+ * none of its ids are known to agetor, in which case we fall through to the
+ * curated table below. `undefined`, `null`, or an empty array behave exactly
+ * like the two-argument call (today's curated-table-only behaviour). The
+ * curated table stays the fallback rather than the source of truth because
+ * discovery is best-effort and account-scoped (a harness may be absent,
+ * unauthenticated, or on an older CLI that can't discover at all): the
+ * curated catalog is what the harness's own UI *offers*, while its API often
+ * *accepts* a superset, so this function only ever narrows what the picker
+ * shows — it never invents an option the harness didn't report.
  */
-export function supportedEfforts(agent: AgentKind, model: string | null): AgentOption[] {
+export function supportedEfforts(
+  agent: AgentKind,
+  model: string | null,
+  discoveredEfforts?: readonly string[] | null,
+): AgentOption[] {
+  if (discoveredEfforts && discoveredEfforts.length > 0) {
+    const discoveredAllowed = new Set(discoveredEfforts);
+    const fromDiscovery = EFFORT_OPTIONS.filter((o) => discoveredAllowed.has(o.id));
+    if (fromDiscovery.length > 0) return fromDiscovery;
+  }
   if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor)) return [];
   const key = model ?? DEFAULT_MODEL[agent];
   const ids =
@@ -1872,6 +1932,34 @@ export function supportedEfforts(agent: AgentKind, model: string | null): AgentO
     ?? [];
   const allowed = new Set(ids);
   return EFFORT_OPTIONS.filter((o) => allowed.has(o.id));
+}
+
+/**
+ * Effort ids a task's CURRENT effort may keep on `model`: the union of the
+ * discovered-wins set (`supportedEfforts` with `discoveredEfforts`) and the
+ * curated set (`supportedEfforts` without it). Consumed only by the
+ * model-change cascades — RunPanel's effort effect and the orchestrator's
+ * `effortFallbackForModelChange` — never by the pickers, which narrow their
+ * rows to the discovered-wins set.
+ *
+ * Why a union: the pickers mirror what the CLI's own menu offers, but a
+ * discovery refresh that omits an id — `none` on GPT-5.6 Sol, which the API
+ * accepts although Codex's `model/list` doesn't list it (live-verified
+ * 2026-09-03) — must not silently PATCH away an effort the user already chose
+ * from the curated table. Only an effort neither source supports cascades to
+ * a fallback. A retained-but-unoffered effort is rendered as an unlisted row
+ * in the effort select (same idea as `mergeModelOptions`' rule 6 for models)
+ * so the control never renders blank.
+ */
+export function retainableEfforts(
+  agent: AgentKind,
+  model: string | null,
+  discoveredEfforts?: readonly string[] | null,
+): ReadonlySet<string> {
+  const ids = new Set<string>();
+  for (const o of supportedEfforts(agent, model, discoveredEfforts)) ids.add(o.id);
+  for (const o of supportedEfforts(agent, model)) ids.add(o.id);
+  return ids;
 }
 
 /**
@@ -1946,11 +2034,13 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
+      { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "Recommended default — OpenAI's most capable model. Rolling out in phases; rejected on ChatGPT plans until OpenAI enables it for your account." },
+      { id: "gpt-6-astra-aeon", label: "GPT-6 Astra Aeon", hint: "Long-horizon Astra variant for multi-day tasks. Unverified id — not on OpenAI's model page yet; same rollout gate as Astra." },
       { id: "gpt-5.6-cyber", label: "GPT-5.6 Cyber", hint: "Cybersecurity-tuned GPT-5.6. Requires OpenAI Daybreak approval on an API-key account; rejected on ChatGPT plans." },
-      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Recommended default — flagship GPT-5.6 capability." },
+      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Previous recommended default — flagship GPT-5.6; works on ChatGPT plans." },
       { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model for strong performance at lower cost." },
       { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model for high-volume workloads." },
-      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous recommended default — works on ChatGPT plans." },
+      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous-generation model — works on ChatGPT plans." },
       { id: "gpt-5-codex", label: "GPT-5 Codex", hint: "Requires an API-key account; rejected on ChatGPT plans." },
       { id: "gpt-5", label: "GPT-5", hint: "Requires an API-key account; rejected on ChatGPT plans." },
     ],
