@@ -206,3 +206,25 @@ test("logs --rebuild: the slash-command XML twin renders you› /name args", asy
   expect(outputs).toHaveLength(1);
   expect(outputs[0]).toBe("you› /x do it");
 });
+
+// --- Phase 8 review fix: command args containing tags (src/shared/user-message.ts Fix 5a) ---
+
+test("logs --rebuild: a slash-command whose args contain a tag renders you›/name then per-segment lines, no raw <context>", async () => {
+  outputs.length = 0;
+  const e: RunEvent = {
+    runId: "run1", taskId: "t1", stream: "user",
+    data:
+      "<command-message>x</command-message>\n<command-name>/x</command-name>\n<command-args>see <context>ctx</context> now</command-args>",
+    ts: 1,
+  };
+  currentClient = makeClient([e]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]!.split("\n")).toEqual([
+    "you› /x",
+    "you› see",
+    "context› ctx",
+    "you› now",
+  ]);
+  expect(outputs[0]).not.toContain("<context>");
+});

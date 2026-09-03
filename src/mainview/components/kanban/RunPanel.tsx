@@ -4550,7 +4550,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
             </div>
             {commandArgsText && (
               <div ref={contentRef} className={collapseClassName}>
-                <MessageSegments segments={commandSegments} taskId={taskId} />
+                <MessageSegments segments={commandSegments} />
               </div>
             )}
             <AttachmentChips references={parsed.command.references} taskId={taskId} />
@@ -4559,7 +4559,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
           <>
             {hasAuthoredContent(taggedSegments) && <MachineLabel>you</MachineLabel>}
             <div ref={contentRef} className={collapseClassName}>
-              <MessageSegments segments={taggedSegments} taskId={taskId} />
+              <MessageSegments segments={taggedSegments} />
             </div>
             <AttachmentChips references={parsed.references} taskId={taskId} />
           </>

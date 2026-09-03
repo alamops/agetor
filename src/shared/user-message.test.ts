@@ -923,3 +923,177 @@ describe("canonicalizeUserText — tagged messages stay byte-identical", () => {
     expect(canonicalizeUserText(text)).toBe(text);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 8 review fixes (docs/plans/tagged-user-messages.md, task FIX-A)
+
+describe("findBalancedClose — same-name self-closing tag inside a body (Fix 1)", () => {
+  test("<note><note/></note> is ONE balanced tag whose body is the self-closing child, not unbalanced", () => {
+    const text = "<note><note/></note>";
+    expect(parseMessageSegments(text)).toEqual([
+      { kind: "tag", name: "note", attrs: "", body: "<note/>", raw: text },
+    ]);
+  });
+
+  test("a self-closing same-name tag mixed with a real nested same-name tag still closes at the outer close", () => {
+    const text = "<a-tag>x <a-tag/> y <a-tag>z</a-tag></a-tag>";
+    expect(parseMessageSegments(text)).toEqual([
+      { kind: "tag", name: "a-tag", attrs: "", body: "x <a-tag/> y <a-tag>z</a-tag>", raw: text },
+    ]);
+  });
+});
+
+describe("TAG_OPEN_RE — quote-aware attrs allow a literal '>' inside a quoted value (Fix 2)", () => {
+  test("a double-quoted attribute value containing '>' does not split the tag early", () => {
+    const text = '<note title="x > y">foo</note>';
+    expect(parseMessageSegments(text)).toEqual([
+      { kind: "tag", name: "note", attrs: 'title="x > y"', body: "foo", raw: text },
+    ]);
+  });
+
+  test("a single-quoted attribute value containing '>' does not split the tag early", () => {
+    const text = "<note title='x > y'>foo</note>";
+    expect(parseMessageSegments(text)).toEqual([
+      { kind: "tag", name: "note", attrs: "title='x > y'", body: "foo", raw: text },
+    ]);
+  });
+
+  test("an unbalanced quote in an attribute value fails the open match entirely — stays literal text", () => {
+    const text = '<note title="x>foo</note>';
+    expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
+  });
+
+  test("a plain unquoted attribute (no quotes involved) still parses", () => {
+    expect(parseMessageSegments("<step n=1>go</step>")).toEqual([
+      { kind: "tag", name: "step", attrs: "n=1", body: "go", raw: "<step n=1>go</step>" },
+    ]);
+  });
+});
+
+describe("computeProtectedRanges — indented code blocks (Fix 3)", () => {
+  test("a 4-space-indented tag preceded by a blank line is protected: whole message stays a single text segment", () => {
+    const text = "text\n\n    <config>value</config>\n";
+    expect(parseMessageSegments(text)).toEqual([{ kind: "text", text }]);
+  });
+
+  test("an indented block between two real tags protects only the middle one", () => {
+    // "a"/"b" are avoided here — they're HTML_ELEMENT_NAMES (anchor/bold) and
+    // never recognized as tags regardless of indentation; this test is about
+    // the indented-code carve-out specifically.
+    const text = "<one>1</one>\n\n    <note>2</note>\n\nafter <three>3</three>";
+    expect(parseMessageSegments(text)).toEqual([
+      { kind: "tag", name: "one", attrs: "", body: "1", raw: "<one>1</one>" },
+      { kind: "text", text: "\n\n    <note>2</note>\n\nafter " },
+      { kind: "tag", name: "three", attrs: "", body: "3", raw: "<three>3</three>" },
+    ]);
+  });
+});
+
+describe("protectedRangeAt — binary search correctness and non-quadratic performance (Fix 4)", () => {
+  test("several inline-code spans plus a fence still combine correctly (no cross-contamination between ranges)", () => {
+    const lines = [
+      "prefix `<a>x</a>` and `<b>y</b>` middle",
+      "```",
+      "<inside>fenced</inside>",
+      "```",
+      "tail <c>z</c> and `<d>w</d>` end",
+    ];
+    const text = lines.join("\n");
+    expect(parseMessageSegments(text)).toEqual([
+      {
+        kind: "text",
+        text: "prefix `<a>x</a>` and `<b>y</b>` middle\n```\n<inside>fenced</inside>\n```\ntail ",
+      },
+      { kind: "tag", name: "c", attrs: "", body: "z", raw: "<c>z</c>" },
+      { kind: "text", text: " and `<d>w</d>` end" },
+    ]);
+  });
+
+  test("a ~200KB message with 2000 inline-code spans and 2000 generic-looking angle brackets parses in well under 200ms", () => {
+    const rows: string[] = [];
+    for (let i = 0; i < 2000; i++) {
+      rows.push(
+        `Line ${i}: some prose padding to bulk up the line \`<code-${i}>\` inline, plus a Map<string, number> generic here.`,
+      );
+    }
+    const text = rows.join("\n");
+    expect(text.length).toBeGreaterThan(150_000);
+
+    const started = performance.now();
+    const segments = parseMessageSegments(text);
+    const elapsed = performance.now() - started;
+
+    // None of the angle brackets here form a recognized tag (the code spans
+    // are backtick-protected; the generics are broken by their comma) — the
+    // whole thing collapses to one text segment either way. The real
+    // assertion is the timing bound below: this is not a correctness probe.
+    expect(segments).toEqual([{ kind: "text", text }]);
+    expect(elapsed).toBeLessThan(500);
+  });
+});
+
+describe("userMessageLines — command args containing tags render per-segment, not as raw XML (Fix 5a)", () => {
+  test("a slash-command XML twin whose args contain a tag renders you› <name> then per-segment lines", () => {
+    const xml = [
+      "<command-message>run</command-message>",
+      "<command-name>/run</command-name>",
+      "<command-args>see <context>ctx</context> now</command-args>",
+    ].join("\n");
+    expect(userMessageLines(xml)).toEqual([
+      { label: "you›", text: "/run", tone: "user" },
+      { label: "you›", text: "see", tone: "user" },
+      { label: "context›", text: "ctx", tone: "tag" },
+      { label: "you›", text: "now", tone: "user" },
+    ]);
+  });
+
+  test("the same shape via a plain echo (no XML) renders identically", () => {
+    const text = "/run see <context>ctx</context> now";
+    expect(userMessageLines(text)).toEqual([
+      { label: "you›", text: "/run", tone: "user" },
+      { label: "you›", text: "see", tone: "user" },
+      { label: "context›", text: "ctx", tone: "tag" },
+      { label: "you›", text: "now", tone: "user" },
+    ]);
+  });
+
+  test("a trailing refs block on a tagged command's args appends a final refs› line", () => {
+    const baseArgs = "see <context>ctx</context> now";
+    const argsRaw = appendReferences(baseArgs, REFS);
+    const xml = [
+      "<command-message>run</command-message>",
+      "<command-name>/run</command-name>",
+      `<command-args>${argsRaw}</command-args>`,
+    ].join("\n");
+    expect(userMessageLines(xml)).toEqual([
+      { label: "you›", text: "/run", tone: "user" },
+      { label: "you›", text: "see", tone: "user" },
+      { label: "context›", text: "ctx", tone: "tag" },
+      { label: "you›", text: "now", tone: "user" },
+      { label: "refs›", text: "/a/b.png, /c/d/", tone: "user" },
+    ]);
+  });
+
+  test("a command with no tags in its args keeps today's single-line rendering byte-for-byte", () => {
+    const xml = [
+      "<command-message>implement</command-message>",
+      "<command-name>/implement</command-name>",
+      "<command-args>do the thing</command-args>",
+    ].join("\n");
+    expect(userMessageLines(xml)).toEqual([{ label: "you›", text: "/implement do the thing", tone: "user" }]);
+  });
+});
+
+describe("userMessageLines — generic tag label includes attrs when present (Fix 5b)", () => {
+  test("a generic tag with attributes renders '<name> <attrs>›' as the label", () => {
+    expect(userMessageLines('<note kind="x">hello</note>')).toEqual([
+      { label: 'note kind="x"›', text: "hello", tone: "tag" },
+    ]);
+  });
+
+  test("a generic tag with no attributes keeps the plain '<name>›' label (no regression)", () => {
+    expect(userMessageLines("<context>hello</context>")).toEqual([
+      { label: "context›", text: "hello", tone: "tag" },
+    ]);
+  });
+});

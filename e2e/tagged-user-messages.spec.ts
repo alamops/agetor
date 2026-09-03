@@ -134,6 +134,13 @@ test.describe("tagged user messages", () => {
     const bubble = tagBlock.locator("xpath=ancestor::div[contains(@class,'rounded-2xl')][1]");
     await expect(bubble.locator(".agetor-md p", { hasText: "Please summarize the risks." })).toBeVisible();
 
+    // Pin the fix for the `.agetor-md` direct-child spacing rules
+    // (index.css:146/:160): the trailing prose's `<p>` must be a *direct*
+    // child of an `.agetor-md` element (MessageSegments' own container),
+    // not merely a descendant, or the `> * + *` / `> :first-child` rules
+    // never apply to it.
+    await expect(bubble.locator(".agetor-md > p", { hasText: "Please summarize the risks." })).toBeVisible();
+
     // Authored content (the trailing prose) is present, so the "you" header
     // shows, unlike the purely-machine-emitted case above.
     await expect(bubble.getByText("you", { exact: true }).first()).toBeVisible();
@@ -156,5 +163,36 @@ test.describe("tagged user messages", () => {
     await expect(shellBlock).toBeVisible();
     await expect(shellBlock).toContainText("$ supabase db push --linked");
     await expect(shellBlock).toContainText("shell");
+  });
+
+  test("silent shell escape (empty stdout + stderr) renders a labeled '—' block, not a blank bubble", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const marker = randomUUID();
+    const title = `tagged-silent-shell-escape ${marker}`;
+    // What any successful silent `!` command produces: both machine tags
+    // present but empty. `ShellOutputBlock` returns `null` for both, so
+    // without the fix the "you" bubble would render bordered and blank —
+    // MessageSegments must fall back to a labeled "—" block instead.
+    const prompt = "<bash-stdout></bash-stdout><bash-stderr></bash-stderr>";
+
+    await createAndStartTask(request, backend, title, prompt);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+
+    const outputBlock = panel.locator('[data-testid="command-output-block"]');
+    await expect(outputBlock).toBeVisible();
+    await expect(outputBlock).toHaveText("—");
+
+    const bubble = outputBlock.locator("xpath=ancestor::div[contains(@class,'rounded-2xl')][1]");
+    await expect(bubble.getByText("shell output", { exact: true })).toBeVisible();
+
+    const bubbleText = await bubble.innerText();
+    expect(bubbleText.trim().length).toBeGreaterThan(0);
+    expect(bubbleText).not.toContain("<bash-stdout");
+    expect(bubbleText).not.toContain("<bash-stderr");
   });
 });

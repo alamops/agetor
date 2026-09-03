@@ -276,7 +276,18 @@ const RESERVED_COMMAND_XML_TAG_NAMES: ReadonlySet<string> = new Set([
 // what lets a trailing `/` right before `>` register as self-closing instead
 // of being swallowed into attrs (it only extends past "attrs" once the
 // shorter match fails to reach `/>` or `>`).
-const TAG_OPEN_RE = /<([a-z][a-z0-9_-]*)(?:\s+([^<>]*?))?\s*(\/)?>/y;
+//
+// The attrs group is quote-aware: at any position it's either a whole
+// double-quoted span, a whole single-quoted span, or a single character
+// that's none of `<`, `>`, `"`, `'` — never ambiguous, since a quote
+// character can only ever be consumed by its own quoted alternative. This
+// lets a quoted attribute value contain a literal `>` (`<note title="x >
+// y">`) without ending the tag early. It also means an attribute value with
+// an opening quote but no matching close (an author typo, `<note
+// title="x>foo</note>`) can never be bridged: nothing in the group can
+// consume that lone quote, so the whole open-tag match fails and the text
+// renders literally instead of guessing where the tag "should" have ended.
+const TAG_OPEN_RE = /<([a-z][a-z0-9_-]*)(?:\s+((?:"[^"]*"|'[^']*'|[^<>"'])*?))?\s*(\/)?>/y;
 
 interface TagOpenMatch {
   name: string;
@@ -297,8 +308,32 @@ function matchTagOpen(text: string, at: number): TagOpenMatch | null {
 
 type ProtectedRange = readonly [start: number, end: number];
 
-function inProtectedRange(ranges: readonly ProtectedRange[], idx: number): boolean {
-  return ranges.some(([start, end]) => idx >= start && idx < end);
+/**
+ * Binary search for the protected range (if any) containing `idx`. Requires
+ * `ranges` sorted ascending by start and non-overlapping — the contract
+ * `computeProtectedRanges` upholds via its own trailing sort — so this never
+ * needs to fall back to a linear scan. Replaces an earlier `.some()` linear
+ * scan that made a message with many `<`-adjacent protected spans (thousands
+ * of inline-code spans, or `Map<K, V>`-style generics) effectively
+ * quadratic: every `<` re-scanned every range from scratch. Both callers
+ * (`parseMessageSegments`, `findBalancedClose`) additionally jump straight to
+ * a hit range's `end` rather than stepping through it one character at a
+ * time, so a protected range is entered at most once regardless of how many
+ * `<` characters it contains.
+ */
+function protectedRangeAt(ranges: readonly ProtectedRange[], idx: number): ProtectedRange | null {
+  let lo = 0;
+  let hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const range = ranges[mid];
+    if (!range) break; // unreachable — mid is always within [lo, hi]
+    const [start, end] = range;
+    if (idx < start) hi = mid - 1;
+    else if (idx >= end) lo = mid + 1;
+    else return range;
+  }
+  return null;
 }
 
 const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})/;
@@ -333,14 +368,44 @@ function inlineCodeRanges(line: string, lineStart: number): ProtectedRange[] {
   return ranges;
 }
 
+// A run of lines each starting with 4+ spaces or a tab — markdown's third
+// code form, alongside the two fence styles above.
+const INDENTED_LINE_RE = /^(?: {4,}|\t)/;
+
 /**
  * Ranges of `text` where a `<` must never be read as a tag boundary and a
- * would-be closing tag must never be treated as a real close: fenced code
- * blocks (``` or ~~~, ≤3-space indent, closed by a same-or-longer matching
- * fence — an unterminated fence protects to the end of the text) and inline
- * code spans (a backtick run paired with a same-length run later on the same
- * line). These are the only two "this isn't really markup" carve-outs —
- * everything else on the top-level scan is fair game.
+ * would-be closing tag must never be treated as a real close:
+ *
+ *  1. Fenced code blocks (``` or ~~~, ≤3-space indent, closed by a
+ *     same-or-longer matching fence — an unterminated fence protects to the
+ *     end of the text).
+ *  2. Indented code blocks: a run of lines each matching `INDENTED_LINE_RE`
+ *     (blank lines allowed inside the run — they don't end it, but a
+ *     trailing one is never absorbed into the range either) that is preceded
+ *     by a blank line, or sits at the very start of the text. Lines already
+ *     claimed by a fence are skipped.
+ *  3. Inline code spans: a backtick run paired with a same-length run later
+ *     on the same line, skipped on any line already claimed by (1) or (2).
+ *
+ * These are the only "this isn't really markup" carve-outs — everything else
+ * on the top-level scan is fair game.
+ *
+ * Known limitation of the indented-code heuristic: a `- ` list item's
+ * continuation line is *also* 4-space indented and isn't distinguished from
+ * a genuine code block by anything other than the "preceded by a blank line"
+ * precondition — which covers the common case (a continuation directly below
+ * its list item's own text is never preceded by a blank line, so it's never
+ * misclassified) but not every case, e.g. a continuation separated from its
+ * item by a blank line.
+ *
+ * The three passes below populate `ranges` in an order that does NOT match
+ * ascending text position (all of pass 1's ranges land in the array before
+ * any of pass 2's, regardless of where in the text each actually falls), so
+ * the trailing sort is load-bearing, not defensive — it's what gives
+ * `protectedRangeAt`'s binary search the ascending, non-overlapping array it
+ * requires. The three passes never produce overlapping ranges (each later
+ * pass skips every line an earlier one already claimed), so no merge step is
+ * needed, only the sort.
  */
 function computeProtectedRanges(text: string): ProtectedRange[] {
   const ranges: ProtectedRange[] = [];
@@ -351,41 +416,105 @@ function computeProtectedRanges(text: string): ProtectedRange[] {
     lineStarts.push(offset);
     offset += line.length + 1;
   }
+  const claimed: boolean[] = new Array(lines.length).fill(false);
 
-  let fenceOpen = false;
-  let fenceChar = "";
-  let fenceLen = 0;
-  let fenceStart = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i] ?? "";
-    const start = lineStarts[i] ?? 0;
-    const m = FENCE_LINE_RE.exec(line);
-    if (!fenceOpen) {
-      if (m?.[1]) {
-        fenceOpen = true;
-        fenceChar = m[1][0] ?? "";
-        fenceLen = m[1].length;
-        fenceStart = start;
-      } else {
-        ranges.push(...inlineCodeRanges(line, start));
+  // Pass 1 — fenced code blocks.
+  {
+    let fenceOpen = false;
+    let fenceChar = "";
+    let fenceLen = 0;
+    let fenceStart = 0;
+    let fenceStartLine = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i] ?? "";
+      const start = lineStarts[i] ?? 0;
+      const m = FENCE_LINE_RE.exec(line);
+      if (!fenceOpen) {
+        if (m?.[1]) {
+          fenceOpen = true;
+          fenceChar = m[1][0] ?? "";
+          fenceLen = m[1].length;
+          fenceStart = start;
+          fenceStartLine = i;
+        }
+      } else if (m?.[1] && m[1][0] === fenceChar && m[1].length >= fenceLen) {
+        ranges.push([fenceStart, start + line.length]);
+        for (let k = fenceStartLine; k <= i; k++) claimed[k] = true;
+        fenceOpen = false;
+        fenceChar = "";
       }
-    } else if (m?.[1] && m[1][0] === fenceChar && m[1].length >= fenceLen) {
-      ranges.push([fenceStart, start + line.length]);
-      fenceOpen = false;
-      fenceChar = "";
+    }
+    if (fenceOpen) {
+      ranges.push([fenceStart, text.length]);
+      for (let k = fenceStartLine; k < lines.length; k++) claimed[k] = true;
     }
   }
-  if (fenceOpen) ranges.push([fenceStart, text.length]);
+
+  // Pass 2 — indented code blocks, skipping lines a fence already claimed.
+  {
+    let runStartLine = -1;
+    let runEndLine = -1; // last line actually matching INDENTED_LINE_RE in the run
+    let precededByBlank = true; // start of text counts as "preceded by blank"
+    const closeRun = () => {
+      if (runStartLine === -1) return;
+      const rangeStart = lineStarts[runStartLine] ?? 0;
+      const rangeEnd = (lineStarts[runEndLine] ?? 0) + (lines[runEndLine] ?? "").length;
+      ranges.push([rangeStart, rangeEnd]);
+      for (let k = runStartLine; k <= runEndLine; k++) claimed[k] = true;
+      runStartLine = -1;
+    };
+    for (let i = 0; i < lines.length; i++) {
+      if (claimed[i]) {
+        closeRun();
+        precededByBlank = false; // fenced content is not a blank line
+        continue;
+      }
+      const line = lines[i] ?? "";
+      const isBlank = line.trim() === "";
+      const isIndented = INDENTED_LINE_RE.test(line);
+      if (runStartLine === -1) {
+        if (isIndented && precededByBlank) {
+          runStartLine = i;
+          runEndLine = i;
+        }
+      } else if (isIndented) {
+        runEndLine = i;
+      } else if (!isBlank) {
+        closeRun(); // a non-indented, non-blank line ends the run
+      }
+      // A blank line mid-run just waits — runEndLine stays pinned to the
+      // last actually-indented line, so trailing blanks are never absorbed.
+      precededByBlank = isBlank;
+    }
+    closeRun();
+  }
+
+  // Pass 3 — inline code spans, skipping lines pass 1 or 2 already claimed.
+  for (let i = 0; i < lines.length; i++) {
+    if (claimed[i]) continue;
+    ranges.push(...inlineCodeRanges(lines[i] ?? "", lineStarts[i] ?? 0));
+  }
+
+  ranges.sort((a, b) => a[0] - b[0]);
   return ranges;
 }
 
 /**
  * Scan forward from `start` (just past the open tag's `>`) for the balancing
- * `</name>` (optionally `</name  >`), counting nested same-name opens
- * (`<name` followed by whitespace, `/`, or `>`) so a tag containing a nested
- * tag of the same name closes at the outer close, not the inner one. `<` and
- * would-be closes inside a protected range are skipped entirely. Returns
- * `null` (unbalanced) when no close is found before the end of `text`.
+ * `</name>` (optionally `</name  >`), counting nested same-name opens so a
+ * tag containing a nested tag of the same name closes at the outer close,
+ * not the inner one. A nested open only counts when `matchTagOpen` confirms
+ * it really is one — same name, real tag boundary, not a same-prefixed
+ * different name like `<notes>` while scanning for `note` (which falls
+ * through and is skipped one character at a time as plain text, same as any
+ * other non-match) — AND it isn't self-closing: `<name/>` is a complete,
+ * already-closed unit and must never increase the depth the outer `</name>`
+ * has to unwind (otherwise `<note><note/></note>` reads as unbalanced, since
+ * the real closing tag would be consumed unwinding a depth that was never
+ * really nested). `<` and would-be closes inside a protected range are
+ * skipped in one jump straight to the range's end, not character by
+ * character — see `protectedRangeAt`. Returns `null` (unbalanced) when no
+ * close is found before the end of `text`.
  */
 function findBalancedClose(
   text: string,
@@ -398,8 +527,13 @@ function findBalancedClose(
   let depth = 0;
   let j = start;
   while (j < text.length) {
-    if (text[j] !== "<" || inProtectedRange(protectedRanges, j)) {
+    if (text[j] !== "<") {
       j++;
+      continue;
+    }
+    const protectedRange = protectedRangeAt(protectedRanges, j);
+    if (protectedRange) {
+      j = protectedRange[1];
       continue;
     }
     if (text.startsWith(closePrefix, j)) {
@@ -416,10 +550,10 @@ function findBalancedClose(
       continue;
     }
     if (text.startsWith(openPrefix, j)) {
-      const nextCh = text[j + openPrefix.length];
-      if (nextCh !== undefined && /[\s>/]/.test(nextCh)) {
-        depth++;
-        j += openPrefix.length;
+      const open = matchTagOpen(text, j);
+      if (open && open.name === name) {
+        if (!open.selfClosing) depth++;
+        j = open.end;
         continue;
       }
     }
@@ -437,6 +571,17 @@ function findBalancedClose(
  * dropped once at least one tag is found (so the newline or space separating
  * two adjacent tags produces no segment); non-whitespace text is kept
  * verbatim, untrimmed.
+ *
+ * Limitation (deliberate trade-off, not a bug): each text segment is later
+ * rendered as its own independent markdown document (the webview) or printed
+ * as its own line (the CLI/TUI). A tag landing in the middle of a markdown
+ * block-level construct — a list, a table, a blockquote — cuts that
+ * construct across two segments, and each half renders as if it were the
+ * whole thing. Fenced and indented code blocks are protected from this (see
+ * `computeProtectedRanges`) specifically because splitting THOSE would
+ * corrupt code rather than just look visually odd; no such protection exists
+ * for lists/tables/blockquotes — top-level segmentation is a
+ * document-splitting operation, and this is the accepted cost of it.
  */
 export function parseMessageSegments(text: string): MessageSegment[] {
   const normalized = text.replace(/\r\n?/g, "\n");
@@ -453,8 +598,15 @@ export function parseMessageSegments(text: string): MessageSegment[] {
   };
 
   while (i < normalized.length) {
-    if (normalized[i] !== "<" || inProtectedRange(protectedRanges, i)) {
+    if (normalized[i] !== "<") {
       i++;
+      continue;
+    }
+    // Jump straight past a protected span instead of stepping through it one
+    // `<` at a time — see `protectedRangeAt`.
+    const protectedRange = protectedRangeAt(protectedRanges, i);
+    if (protectedRange) {
+      i = protectedRange[1];
       continue;
     }
     const open = matchTagOpen(normalized, i);
@@ -654,29 +806,20 @@ export interface PlainLine {
 }
 
 /**
- * Render a raw user-turn string as one or more labeled plain-text lines.
- * Ordinary prose (parseUserMessage → null) yields exactly one `you›` line
- * with `text` untouched — byte-identical to today's CLI/TUI output. A
- * `tagged` message yields one line per segment (text runs become `you›`
- * lines; known machine tags get a dedicated label; any other tag gets a
- * generic `<name>›` label with its body, nested tags left raw); a non-empty
- * `references` list appends a trailing `refs›` line. If every segment
- * produces no visible line (e.g. a message that's only an empty
- * `<bash-stdout>`), falls back to a single `cmd› —` line so callers never
- * have to handle an empty result.
+ * Map tag/text segments to their `PlainLine` rendering — the per-segment
+ * logic shared by the `tagged` branch of `userMessageLines` and by a
+ * `command` whose own args contain tags (see below): a text run becomes a
+ * `you›` line (trimmed); known machine tags (`local-command-stdout`,
+ * `forked-skill-launch`, `bash-input`, `bash-stdout`, `bash-stderr`) get
+ * their dedicated label and body handling; any other tag gets a generic
+ * `<name>[ attrs]›` label (attrs appended verbatim when the tag has any) with
+ * its body trimmed, nested tags left raw. A segment can legitimately produce
+ * no line at all (e.g. an empty `<bash-stdout>`) — callers that need a
+ * non-empty result apply their own fallback.
  */
-export function userMessageLines(text: string): PlainLine[] {
-  const parsed = parseUserMessage(text);
-  if (parsed === null) return [{ label: "you›", text, tone: "user" }];
-  if (parsed.kind === "command") {
-    return [{ label: "you›", text: canonicalizeUserText(text), tone: "user" }];
-  }
-  if (parsed.kind === "command-output") {
-    return [{ label: "cmd›", text: parsed.output || "—", tone: "machine" }];
-  }
-
+function segmentPlainLines(segments: readonly MessageSegment[]): PlainLine[] {
   const lines: PlainLine[] = [];
-  for (const seg of parsed.segments) {
+  for (const seg of segments) {
     if (seg.kind === "text") {
       lines.push({ label: "you›", text: seg.text.trim(), tone: "user" });
       continue;
@@ -714,8 +857,52 @@ export function userMessageLines(text: string): PlainLine[] {
       if (t) lines.push({ label: "err›", text: t, tone: "error" });
       continue;
     }
-    lines.push({ label: `${seg.name}›`, text: seg.body.trim(), tone: "tag" });
+    lines.push({ label: `${seg.name}${seg.attrs ? ` ${seg.attrs}` : ""}›`, text: seg.body.trim(), tone: "tag" });
   }
+  return lines;
+}
+
+/**
+ * Render a raw user-turn string as one or more labeled plain-text lines.
+ * Ordinary prose (parseUserMessage → null) yields exactly one `you›` line
+ * with `text` untouched — byte-identical to today's CLI/TUI output. A
+ * `command` whose args contain no tags keeps that same single `you› /name
+ * args` line (byte-identical to today's output); a command whose args DO
+ * contain tags instead renders a `you› /name` line followed by the same
+ * per-segment lines a `tagged` message would produce for those args (see
+ * `segmentPlainLines`), then a trailing `refs›` line when the command
+ * carries references — this is what keeps a slash-command invocation whose
+ * argument text itself quotes a tag (e.g. `/run see <context>ctx</context>
+ * now`) from rendering that tag as raw `<context>` text instead of a labeled
+ * line. A `tagged` message yields one line per segment the same way; a
+ * non-empty `references` list appends a trailing `refs›` line. If every
+ * segment produces no visible line (e.g. a message that's only an empty
+ * `<bash-stdout>`), falls back to a single `cmd› —` line so callers never
+ * have to handle an empty result.
+ */
+export function userMessageLines(text: string): PlainLine[] {
+  const parsed = parseUserMessage(text);
+  if (parsed === null) return [{ label: "you›", text, tone: "user" }];
+  if (parsed.kind === "command") {
+    const { command } = parsed;
+    const argSegments = parseMessageSegments(command.args);
+    if (hasTagSegments(argSegments)) {
+      const lines: PlainLine[] = [
+        { label: "you›", text: command.name, tone: "user" },
+        ...segmentPlainLines(argSegments),
+      ];
+      if (command.references.length > 0) {
+        lines.push({ label: "refs›", text: command.references.join(", "), tone: "user" });
+      }
+      return lines;
+    }
+    return [{ label: "you›", text: canonicalizeUserText(text), tone: "user" }];
+  }
+  if (parsed.kind === "command-output") {
+    return [{ label: "cmd›", text: parsed.output || "—", tone: "machine" }];
+  }
+
+  const lines: PlainLine[] = segmentPlainLines(parsed.segments);
   if (parsed.references.length > 0) {
     lines.push({ label: "refs›", text: parsed.references.join(", "), tone: "user" });
   }

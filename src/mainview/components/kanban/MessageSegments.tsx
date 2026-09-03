@@ -20,6 +20,7 @@
 // classes — per the repo's dark/light theming convention (CLAUDE.md "UI
 // conventions").
 import type React from "react";
+import { useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { GitFork, Terminal } from "lucide-react";
@@ -145,15 +146,25 @@ export function ShellOutputBlock({
  *  the header. */
 export function GenericTagBlock({
   segment,
-  taskId,
   depth,
 }: {
   segment: TagSegment;
-  taskId?: string;
   depth: number;
 }) {
   const isEmpty = segment.body.trim() === "";
-  const jsonValue = isEmpty ? undefined : tryParseJsonBody(segment.body);
+  // Both parses run in the render body, but only ever need to redo the work
+  // when the underlying tag body changes — not on every re-render (e.g. a
+  // sibling's Show more/less toggle). Hooks are called unconditionally
+  // (both memos compute regardless of `isEmpty`/`jsonValue`) and only the
+  // JSX below branches on their results.
+  const jsonValue = useMemo(
+    () => (isEmpty ? undefined : tryParseJsonBody(segment.body)),
+    [isEmpty, segment.body],
+  );
+  const nestedSegments = useMemo(
+    () => parseMessageSegments(segment.body),
+    [segment.body],
+  );
 
   return (
     <div
@@ -178,11 +189,7 @@ export function GenericTagBlock({
               {JSON.stringify(jsonValue, null, 2)}
             </pre>
           ) : depth < 3 ? (
-            <MessageSegments
-              segments={parseMessageSegments(segment.body)}
-              taskId={taskId}
-              depth={depth + 1}
-            />
+            <MessageSegments segments={nestedSegments} depth={depth + 1} />
           ) : (
             <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
               {segment.body.trim()}
@@ -191,6 +198,19 @@ export function GenericTagBlock({
         </div>
       )}
     </div>
+  );
+}
+
+/** True for a `bash-stdout`/`bash-stderr` segment whose body is empty or
+ *  whitespace-only — the two cases `ShellOutputBlock` itself renders as
+ *  `null`. Every other segment kind always renders something (a text
+ *  segment is never blank per `parseMessageSegments`; every other tag
+ *  renders at least its name pill via `GenericTagBlock`, or a card). */
+function rendersNothing(seg: MessageSegment): boolean {
+  return (
+    seg.kind === "tag" &&
+    (seg.name === "bash-stdout" || seg.name === "bash-stderr") &&
+    seg.body.trim() === ""
   );
 }
 
@@ -204,19 +224,41 @@ export function GenericTagBlock({
  * top-level message omit it (defaults to 0). Keys are index-based — segments
  * are derived fresh from one immutable string on every parse, so there's no
  * stable identity to key on and no reordering to worry about.
+ *
+ * A silent `!`-shell-escape parses to `<bash-stdout></bash-stdout><bash-stderr>
+ * </bash-stderr>` — two segments that each render as `null` (see
+ * `ShellOutputBlock`) — which would otherwise leave a bordered, blank "you"
+ * bubble with no label at all. `visibleSegments` drops those dead segments
+ * up front so that case can be detected: when the input carried at least one
+ * segment but nothing is left to render, fall back to a labeled "—" block,
+ * mirroring `userMessageLines`'s `cmd› —` guard (shared/user-message.ts).
+ *
+ * The container itself is `.agetor-md` (see index.css) so a text segment's
+ * markdown gets the same heading/paragraph rhythm as everywhere else the
+ * class is used — a plain `flex flex-col gap-1` here would collapse that
+ * spacing to a uniform 0.25rem gap and keep a leading heading's `margin-top`.
  */
 export function MessageSegments({
   segments,
-  taskId,
   depth = 0,
 }: {
   segments: MessageSegment[];
-  taskId?: string;
   depth?: number;
 }) {
+  const visibleSegments = segments.filter((seg) => !rendersNothing(seg));
+
+  if (segments.length > 0 && visibleSegments.length === 0) {
+    return (
+      <div data-testid="message-segments">
+        <MachineLabel>shell output</MachineLabel>
+        <CommandOutputBody output="" />
+      </div>
+    );
+  }
+
   return (
-    <div data-testid="message-segments" className="flex flex-col gap-1">
-      {segments.map((seg, i) => {
+    <div data-testid="message-segments" className="agetor-md">
+      {visibleSegments.map((seg, i) => {
         if (seg.kind === "text") {
           return (
             <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
@@ -239,7 +281,7 @@ export function MessageSegments({
           return launch ? (
             <ForkedSkillCard key={i} launch={launch} />
           ) : (
-            <GenericTagBlock key={i} segment={seg} taskId={taskId} depth={depth} />
+            <GenericTagBlock key={i} segment={seg} depth={depth} />
           );
         }
 
@@ -255,7 +297,7 @@ export function MessageSegments({
           return <ShellOutputBlock key={i} kind="stderr" body={seg.body} />;
         }
 
-        return <GenericTagBlock key={i} segment={seg} taskId={taskId} depth={depth} />;
+        return <GenericTagBlock key={i} segment={seg} depth={depth} />;
       })}
     </div>
   );
