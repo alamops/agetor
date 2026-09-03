@@ -157,13 +157,18 @@ test("024_reseed_harness_builtins restores wiped builtins, is idempotent, and pr
   ]);
 });
 
-test("049_retire_gemini_3_pro_preview rewrites only tasks pinned to the shut-down id, on any harness, and clears the stale lastModel:gemini preference, idempotently", () => {
+test("049_retire_gemini_3_pro_preview rewrites only tasks pinned to the shut-down id (any harness), clears the stale lastModel:gemini preference, normalizes suffixed Cursor Gemini Flash variants to base id + effort, idempotently", () => {
   const db = new Database(":memory:");
   db.exec(`
+    CREATE TABLE harnesses (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL
+    );
     CREATE TABLE tasks (
       id TEXT PRIMARY KEY,
       agent TEXT NOT NULL,
-      model TEXT
+      model TEXT,
+      effort TEXT
     );
     CREATE TABLE preferences (
       key TEXT PRIMARY KEY,
@@ -173,14 +178,26 @@ test("049_retire_gemini_3_pro_preview rewrites only tasks pinned to the shut-dow
   `);
 
   db.exec(`
-    INSERT INTO tasks (id, agent, model) VALUES
-      ('t1', 'gemini', 'gemini-3-pro-preview'),
-      ('t2', 'gemini-2', 'gemini-3-pro-preview'),
-      ('t3', 'gemini', 'gemini-3.7-flash'),
-      ('t4', 'cursor', 'gemini-3.1-pro'),
-      ('t5', 'fx', 'google/gemini-3.1-pro-preview'),
-      ('t6', 'codex', 'gpt-5.6-sol'),
-      ('t7', 'gemini', NULL);
+    INSERT INTO harnesses (id, kind) VALUES
+      ('gemini', 'gemini'), ('gemini-2', 'gemini'),
+      ('cursor', 'cursor'), ('cursor-2', 'cursor'),
+      ('fx', 'fx'), ('codex', 'codex');
+  `);
+
+  db.exec(`
+    INSERT INTO tasks (id, agent, model, effort) VALUES
+      ('t01', 'gemini', 'gemini-3-pro-preview', NULL),
+      ('t02', 'gemini-2', 'gemini-3-pro-preview', NULL),
+      ('t03', 'gemini', 'gemini-3.7-flash', NULL),
+      ('t04', 'cursor', 'gemini-3.1-pro', 'high'),
+      ('t05', 'fx', 'google/gemini-3.1-pro-preview', NULL),
+      ('t06', 'codex', 'gpt-5.6-sol', 'high'),
+      ('t07', 'gemini', NULL, NULL),
+      ('t08', 'cursor', 'gemini-3.8-flash-high', NULL),
+      ('t09', 'cursor-2', 'gemini-3.7-flash-low', 'high'),
+      ('t10', 'cursor', 'gemini-3.8-flash-medium', 'medium'),
+      ('t11', 'gemini', 'gemini-3.8-flash-medium', NULL),
+      ('t12', 'cursor', 'gemini-3.6-flash', 'minimal');
   `);
 
   db.exec(`
@@ -193,8 +210,8 @@ test("049_retire_gemini_3_pro_preview rewrites only tasks pinned to the shut-dow
 
   const readAll = () =>
     db
-      .query<{ id: string; agent: string; model: string | null }, []>(
-        `SELECT id, agent, model FROM tasks ORDER BY id`,
+      .query<{ id: string; agent: string; model: string | null; effort: string | null }, []>(
+        `SELECT id, agent, model, effort FROM tasks ORDER BY id`,
       )
       .all();
 
@@ -207,39 +224,47 @@ test("049_retire_gemini_3_pro_preview rewrites only tasks pinned to the shut-dow
 
   db.exec(retireGemini3ProPreview);
   expect(readAll()).toEqual([
-    { id: "t1", agent: "gemini", model: "gemini-3.1-pro-preview" }, // rewritten
-    { id: "t2", agent: "gemini-2", model: "gemini-3.1-pro-preview" }, // rewritten — additional-account harness, no join needed
-    { id: "t3", agent: "gemini", model: "gemini-3.7-flash" }, // untouched
-    { id: "t4", agent: "cursor", model: "gemini-3.1-pro" }, // untouched — different literal
-    { id: "t5", agent: "fx", model: "google/gemini-3.1-pro-preview" }, // untouched — different literal
-    { id: "t6", agent: "codex", model: "gpt-5.6-sol" }, // untouched — unrelated kind
-    { id: "t7", agent: "gemini", model: null }, // untouched — still NULL
+    { id: "t01", agent: "gemini", model: "gemini-3.1-pro-preview", effort: null }, // rewritten
+    { id: "t02", agent: "gemini-2", model: "gemini-3.1-pro-preview", effort: null }, // rewritten — additional-account harness, no join needed
+    { id: "t03", agent: "gemini", model: "gemini-3.7-flash", effort: null }, // untouched
+    { id: "t04", agent: "cursor", model: "gemini-3.1-pro", effort: "high" }, // untouched — different literal
+    { id: "t05", agent: "fx", model: "google/gemini-3.1-pro-preview", effort: null }, // untouched — different literal
+    { id: "t06", agent: "codex", model: "gpt-5.6-sol", effort: "high" }, // untouched — unrelated kind
+    { id: "t07", agent: "gemini", model: null, effort: null }, // untouched — still NULL
+    { id: "t08", agent: "cursor", model: "gemini-3.8-flash", effort: "high" }, // variant → base + effort
+    { id: "t09", agent: "cursor-2", model: "gemini-3.7-flash", effort: "low" }, // variant wins over a stale effort; additional cursor harness via the kind join
+    { id: "t10", agent: "cursor", model: "gemini-3.8-flash", effort: "medium" }, // variant → base, effort already matched
+    { id: "t11", agent: "gemini", model: "gemini-3.8-flash-medium", effort: null }, // untouched — not a cursor-kind harness
+    { id: "t12", agent: "cursor", model: "gemini-3.6-flash", effort: "minimal" }, // untouched — already base + effort
   ]);
   expect(readPrefs()).toEqual([
-    // lastModel:gemini deleted — the other three prefs (including a
-    // different key entirely, a different agent, and a similarly-named
-    // gemini model on a different agent's key) are untouched.
-    { key: "lastMode:gemini", value: "auto" },
-    { key: "lastModel:codex", value: "gpt-5.6-sol" },
-    { key: "lastModel:cursor", value: "gemini-3.1-pro" },
+    { key: "lastMode:gemini", value: "auto" }, // untouched — not a lastModel key
+    { key: "lastModel:codex", value: "gpt-5.6-sol" }, // untouched — other kind
+    { key: "lastModel:cursor", value: "gemini-3.1-pro" }, // untouched — other kind
+    // lastModel:gemini (the dead id) is gone
   ]);
 
-  // Idempotent: re-applying against the already-rewritten/already-deleted
-  // rows is a no-op on both tables.
-  const beforeSecond = readAll();
+  // Idempotent: re-applying against the already-rewritten rows is a no-op
+  // for both tables.
+  const tasksBeforeSecond = readAll();
   const prefsBeforeSecond = readPrefs();
   db.exec(retireGemini3ProPreview);
-  expect(readAll()).toEqual(beforeSecond);
+  expect(readAll()).toEqual(tasksBeforeSecond);
   expect(readPrefs()).toEqual(prefsBeforeSecond);
 });
 
 test("049 leaves a lastModel:gemini pref that already points at a live model alone", () => {
   const db = new Database(":memory:");
   db.exec(`
+    CREATE TABLE harnesses (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL
+    );
     CREATE TABLE tasks (
       id TEXT PRIMARY KEY,
       agent TEXT NOT NULL,
-      model TEXT
+      model TEXT,
+      effort TEXT
     );
     CREATE TABLE preferences (
       key TEXT PRIMARY KEY,

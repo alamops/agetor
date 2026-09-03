@@ -54,11 +54,11 @@ const FX_DEFAULT_MODEL_ID = "zai/glm-5.3-flash";
 
 /** Curated ids that must NOT survive the curated ∩ discovered filter against
  *  the 3-id stub catalog: two ordinary curated rows absent from the stub
- *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and three of the five
+ *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and four of the six
  *  `catalogOnly` premium rows (absent from the stub the same as any other
  *  id would be — catalogOnly gates them even harder, but plain absence
  *  already excludes them under the scoped merge). */
-const EXCLUDED_FX_OPTION_LABELS = ["Grok 4.6", "Kimi K2.7 Code", "Claude Opus 5", "GPT-5.5", "Kimi K3"];
+const EXCLUDED_FX_OPTION_LABELS = ["Grok 4.6", "Kimi K2.7 Code", "Claude Opus 5", "GPT-5.5", "Gemini 3.8 Flash", "Kimi K3"];
 
 /** Mirrors `e2e/fx-interactions.spec.ts`'s identical helper. Duplicated
  *  locally rather than imported — this task's brief scopes edits to this

@@ -210,3 +210,20 @@ Owner asked, after the 3.8 Flash delivery landed, to also offer the Fairwind-Pro
 - **Process note:** applied inline by the orchestrator (a four-line mirror of the reviewed 3.8 row) rather
   than through the sonnet implementation runner; no separate opus review pass was run for this addendum.
 - **Open:** A4 — the model code is unconfirmed; first Fairwind-approved run will confirm or correct it.
+
+## 11. Post-review fixes (2026-09-03, `/code-review` on the branch — 0 must-fix, 5 low, all applied)
+
+- **049 normalizes suffixed Cursor Gemini Flash variants** — six kind-joined `UPDATE`s map
+  `gemini-3.{8,7}-flash-{high,medium,low}` on cursor-kind tasks to base id + effort (the shape `cursorModelArg`
+  re-composes into the same argv), so a task that picked a variant as a discovered-only row before the specs
+  existed no longer renders as a "not in this account's catalog" unlisted row with a collapsed effort dropdown.
+  Mirrors 034's `claude-opus-4.8` normalization. 049 was still unreleased (prod DB at 048, dev at 045).
+- **`resolveInitialModel` mirrors rule 7** — takes `loggedIn` and ignores a logged-out harness's discovered
+  catalog, so a discovered-only pref can't be pre-selected as an unlisted row the merge just declared
+  unavailable. The webview pickers remain stricter (curated-only validation); the CLI keeps a valid
+  discovered-only fx pref on a logged-in harness, which is the more useful of the two for account-scoped
+  catalogs.
+- Comment accuracy: the gemini CLI `pro`-alias claim is now conditional on 3.1 preview access; the fx
+  `DEFAULT_MODEL` comment and the e2e spec comment count six catalog-gated rows; `EXCLUDED_FX_OPTION_LABELS`
+  gains "Gemini 3.8 Flash" so the e2e asserts the new gated row stays hidden under the stub catalog.
+- Cyber hint now names the recovery path for a differently-named grant (`agetor add --model <code>`).

@@ -26,3 +26,26 @@ WHERE model = 'gemini-3-pro-preview';
 -- needs no further data fix).
 DELETE FROM preferences
 WHERE key = 'lastModel:gemini' AND value = 'gemini-3-pro-preview';
+
+-- Cursor: this release adds CURSOR_MODEL_SPECS entries for Gemini 3.8 / 3.7
+-- Flash, so their suffixed variant ids (gemini-3.{8,7}-flash-{high,medium,low})
+-- are now "covered by the catalog" and every picker hides the discovered
+-- rows. A task that picked one of those variants as a discovered-only row
+-- before this release would otherwise render as an unlisted "not in this
+-- account's catalog" row with a collapsed effort dropdown (the run itself
+-- still works — cursorModelArg passes unknown ids through verbatim).
+-- Normalize to base id + effort, the shape cursorModelArg re-composes into
+-- the same --model argv — mirrors 034's claude-opus-4.8 normalization,
+-- kind-joined because effort is only meaningful on cursor rows.
+UPDATE tasks SET model = 'gemini-3.8-flash', effort = 'high'
+WHERE model = 'gemini-3.8-flash-high' AND agent IN (SELECT id FROM harnesses WHERE kind = 'cursor');
+UPDATE tasks SET model = 'gemini-3.8-flash', effort = 'medium'
+WHERE model = 'gemini-3.8-flash-medium' AND agent IN (SELECT id FROM harnesses WHERE kind = 'cursor');
+UPDATE tasks SET model = 'gemini-3.8-flash', effort = 'low'
+WHERE model = 'gemini-3.8-flash-low' AND agent IN (SELECT id FROM harnesses WHERE kind = 'cursor');
+UPDATE tasks SET model = 'gemini-3.7-flash', effort = 'high'
+WHERE model = 'gemini-3.7-flash-high' AND agent IN (SELECT id FROM harnesses WHERE kind = 'cursor');
+UPDATE tasks SET model = 'gemini-3.7-flash', effort = 'medium'
+WHERE model = 'gemini-3.7-flash-medium' AND agent IN (SELECT id FROM harnesses WHERE kind = 'cursor');
+UPDATE tasks SET model = 'gemini-3.7-flash', effort = 'low'
+WHERE model = 'gemini-3.7-flash-low' AND agent IN (SELECT id FROM harnesses WHERE kind = 'cursor');

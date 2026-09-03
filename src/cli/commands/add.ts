@@ -227,15 +227,20 @@ function baseInput(o: AddOpts, title: string, prompt: string): CreateTaskInput {
  *  discovered-only ids) — else the kind's default. Mirrors the two webview
  *  pickers' validation so a retired id (e.g. gemini-3-pro-preview, shut down
  *  2026-03-09 and cleared by migration 049) can't be re-offered as the
- *  pre-selected default via mergeModelOptions' unlisted-row rule. */
+ *  pre-selected default via mergeModelOptions' unlisted-row rule. `loggedIn`
+ *  mirrors mergeModelOptions rule 7: a logged-out harness's discovered
+ *  catalog is untrustworthy (an expired login reads back the unauthenticated
+ *  catalog), so it is not consulted — only curated rows can keep the pref. */
 export function resolveInitialModel(
   kind: AgentKind,
   stored: string | undefined | null,
   discovered: readonly DiscoveredModel[],
+  loggedIn: boolean | null = null,
 ): string {
+  const offerable = loggedIn === false ? [] : discovered;
   if (
     stored &&
-    (AGENT_OPTIONS[kind].models.some((m) => m.id === stored) || discovered.some((m) => m.id === stored))
+    (AGENT_OPTIONS[kind].models.some((m) => m.id === stored) || offerable.some((m) => m.id === stored))
   ) {
     return stored;
   }
@@ -311,13 +316,14 @@ async function wizard(
     const catalog: DiscoveredModel[] = ((agent && harnessModels.byHarness[agent]) || discovered[kind] || []).filter(
       (m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id),
     );
-    const initial = resolveInitialModel(kind, prefs[`lastModel:${kind}`], catalog);
+    const loggedIn = statuses.find((s) => s.harnessId === agent)?.loggedIn ?? null;
+    const initial = resolveInitialModel(kind, prefs[`lastModel:${kind}`], catalog, loggedIn);
     const options = mergeModelOptions({
       curated: AGENT_OPTIONS[kind].models,
       discovered: catalog,
       selected: initial,
       scoped: CATALOG_SCOPED_KINDS.has(kind),
-      loggedIn: statuses.find((s) => s.harnessId === agent)?.loggedIn ?? null,
+      loggedIn,
     });
     const picked = await pickOption("Model", options, initial);
     if (picked === null) return cancelled();

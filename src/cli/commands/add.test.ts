@@ -491,3 +491,11 @@ test("resolveInitialModel: a suffixed cursor variant id is not a curated row, so
 test("resolveInitialModel: but the base cursor id is kept", () => {
   expect(resolveInitialModel("cursor", "gemini-3.8-flash", [])).toBe("gemini-3.8-flash");
 });
+
+test("resolveInitialModel: a logged-out harness's discovered catalog is not consulted (mirrors mergeModelOptions rule 7) — discovered-only pref falls back, curated pref survives", () => {
+  const discovered: DiscoveredModel[] = [{ id: "google/gemini-3.7-flash", label: "Gemini 3.7 Flash" }];
+  expect(resolveInitialModel("fx", "google/gemini-3.7-flash", discovered, false)).toBe(DEFAULT_MODEL.fx);
+  expect(resolveInitialModel("fx", "google/gemini-3.7-flash", discovered, true)).toBe("google/gemini-3.7-flash");
+  expect(resolveInitialModel("fx", "google/gemini-3.7-flash", discovered, null)).toBe("google/gemini-3.7-flash");
+  expect(resolveInitialModel("fx", "zai/glm-5v-turbo", discovered, false)).toBe("zai/glm-5v-turbo"); // curated row — kept even when logged out
+});

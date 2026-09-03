@@ -1308,8 +1308,9 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // to the old id. Deliberately NOT the "auto" alias — a spike showed "auto"
   // internally routes across mixed pro/flash-lite models even for simple
   // prompts, which fails "always default to the best available model" (root
-  // CLAUDE.md). The CLI's own `pro` alias also resolves to 3.1 Pro preview
-  // (gemini-cli 0.58.0 resolveModel, checked 2026-09-02).
+  // CLAUDE.md). The CLI's own `pro` alias resolves to 3.1 Pro preview on
+  // accounts with 3.1 preview access (else to 3 Pro preview, or 2.5 Pro with
+  // no preview access at all — gemini-cli 0.58.0 resolveModel, 2026-09-02).
   "gemini": "gemini-3.1-pro-preview",
   // Owner-chosen default (2026-08-27). fx's own compiled default is still
   // moonshotai/kimi-k3 (verified via empty-HOME `fx status --json` on
@@ -1320,9 +1321,9 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // Gateway ids, passed verbatim. fx is exempt from the "always default to
   // the best available model" rule above: the Gateway bills per token to the
   // user's own account, and flagship tiers (opus-5, sonnet-5, gpt-5.5,
-  // gemini-3.1-pro-preview, kimi-k3) stay one click away in the picker as
-  // catalog-gated rows — offered only when the signed-in account's catalog
-  // actually contains them (see `AgentOption.catalogOnly`).
+  // gemini-3.1-pro-preview, gemini-3.8-flash, kimi-k3) stay one click away
+  // in the picker as catalog-gated rows — offered only when the signed-in
+  // account's catalog actually contains them (see `AgentOption.catalogOnly`).
   // Re-verified 2026-08-31 on fx 0.0.7: compiled default unchanged
   // (moonshotai/kimi-k3 via empty-HOME `fx status --json`), zai/glm-5.3-flash
   // still present in the (grown to 234-id) unauth catalog — the reference
@@ -2019,7 +2020,7 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       // gemini-3-pro-image) and OpenAI's gpt-5.6-cyber precedent. Owner-approved
       // pending a published code; agetor passes it through verbatim, so a
       // grant that names it differently needs only this literal changed.
-      { id: "gemini-3.8-flash-cyber", label: "Gemini 3.8 Flash Cyber", hint: "Cybersecurity-tuned 3.8 Flash for vulnerability discovery and patching. Requires Fairwind Program access (invite-only); no public model code yet — id follows Google's naming convention." },
+      { id: "gemini-3.8-flash-cyber", label: "Gemini 3.8 Flash Cyber", hint: "Cybersecurity-tuned 3.8 Flash for vulnerability discovery and patching. Requires Fairwind Program access (invite-only). No public model code yet — this id follows Google's naming convention; if your grant names it differently, create the task with `agetor add --model <code>`." },
       { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", hint: "Prior Flash generation — strong on coding and agentic work." },
       { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost — earlier Flash generation." },
       { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, earliest Flash generation offered." },
