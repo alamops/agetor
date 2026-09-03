@@ -187,4 +187,7 @@
 | Make codex a `CATALOG_SCOPED_KINDS` member | **out of scope** — would hide Astra on accounts the rollout hasn't reached, contradicting the default flip |
 | GPT-6 rows for Cursor / fx | **out of scope** — neither catalog carries a GPT-6 id yet (2026-09-03) |
 | Migration / backfill; "update your Codex CLI" hint | **out of scope** — nothing to backfill; both CLI versions forward the id |
+| Per-harness codex discovery (a second codex account must not inherit the built-in's catalog/efforts) — review finding | **in** — Phase 8 (`HarnessTarget{kind}`, `refreshHarnessTarget`, kind-aware targets/caches) |
+| `discoverCodex` reader cancel / timeout → `[]` / newline flush — review findings | **in** — Phase 8 |
+| Pickers/CLI read efforts from merged rows (rule 7 applies); `AgentOption.efforts` removed; cursor guard order; RunPanel unlisted row order + hint; NewTaskForm seed no-op — review findings | **in** — Phase 8 |
 | Owner-deferred | none |
