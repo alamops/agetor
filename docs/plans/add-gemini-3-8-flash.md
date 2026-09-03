@@ -123,6 +123,15 @@ no new user flow, route, or UI surface. The existing `e2e/fx-models.spec.ts` is 
    read-only and scoped to the committed diff, the test agents write only test files, so no collision.
 4. Phase 7: haiku runs `bun run typecheck && bun test` → report.
 5. Phase 8: fix agents only if review must-fixes or failures exist → re-run.
+   **Outcome:** wave 2 landed as 57bde99 (4016 pass / 3 skip / 0 fail). Opus review (via the `code-review`
+   skill): 0 must-fix, 1 should-fix, 4 low — "approve with should-fixes"; it also executed 049 through the real
+   runner and confirmed the no-join form (015's separate orphan catch-all is the precedent showing the join is
+   the weaker form). Wave 3 (fixes, file-disjoint): FIX-1 = 049 gains a `DELETE FROM preferences WHERE key =
+   'lastModel:gemini' AND value = 'gemini-3-pro-preview'` (049 is unreleased and applied to no durable DB —
+   prod at 048, dev at 045 — so an in-place edit is safe), migrate.test extended, two comment nits in
+   types.ts; FIX-2 = `agetor add` validates the stored pref against curated ∪ discovered via an exported
+   `resolveInitialModel` helper (mirrors the webview pickers) and applies the UI's cursor covered-id filter,
+   with unit tests. Then Phase 7 re-run.
 
 ## 7. Blast radius & risks
 
@@ -161,6 +170,11 @@ no new user flow, route, or UI surface. The existing `e2e/fx-models.spec.ts` is 
 | Cursor `gemini-3.8-flash` + `gemini-3.7-flash` (3.7 plan's A2 deferral, now shipped by Cursor) | **in this run** — IMPL-1 (owner swept in) |
 | fx `google/gemini-3.8-flash` catalogOnly row | **in this run** — IMPL-1 (owner swept in) |
 | New coverage for all of the above | **in this run** — TEST-1, TEST-2 |
+| Stale `preferences.lastModel:gemini` still holding the dead id after 049 (review should-fix) | **in this run** — FIX-1 (049 second statement) |
+| `agetor add` seeding its picker from an unvalidated pref, re-offering a retired id (review should-fix) | **in this run** — FIX-2 (`resolveInitialModel`, mirrors NewTaskForm/TaskLaunchPickers) |
+| CLI cursor picker listing the new specs' six `-low/-medium/-high` variants alongside the base rows (review low; created for these ids by this change) | **in this run** — FIX-2 (same covered-id filter the three UI pickers use) |
+| Comment accuracy: fx "5 catalogOnly" dated note, cursor "verified" block folding in the label convention (review low) | **in this run** — FIX-1 |
+| `createTask` storing `effort: "high"` for an unlisted gemini/fx id where a listed one stores `null` (review low) | **out of scope** — pre-existing for every unlisted gemini/fx id, not introduced here (the retired id is unreachable from any picker after 049 and `buildCommand` ignores effort for both kinds); the durable fix is a kind-level rule in `createTask` + the PATCH guard, an orchestrator-wide semantic change that deserves its own review |
 | fx rows for `google/gemini-3.7-flash` / 3.6 / 3.5 Flash | **out of scope** — fx curated list is deliberately short; discovered-only ids already append via `mergeModelOptions`; owner asked for 3.8 only |
 | gemini picker rows for `gemini-3.1-flash-lite`, `gemini-3.6-flash`, `gemini-3-flash` | **out of scope** — curated list is newest-per-tier; typed ids pass through; nobody asked |
 | Gemini 3.8 Flash Cyber | **out of scope** — Fairwind-gated, no public id |

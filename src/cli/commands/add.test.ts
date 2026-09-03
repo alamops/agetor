@@ -3,6 +3,8 @@ import path from "node:path";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import type { Flags } from "../context.ts";
 import type { GitHubComment, GitHubIssueThreadResult, GitHubListItem, Task } from "../../shared/types.ts";
+import { DEFAULT_MODEL } from "../../shared/types.ts";
+import type { DiscoveredModel } from "../../shared/model-options.ts";
 import { buildIssueTaskPrompt, issueTaskTitle, renderIssueThreadMarkdown } from "../../shared/issue-task.ts";
 
 /**
@@ -54,7 +56,7 @@ afterAll(() => {
   mock.module("../output.ts", () => realOutputSnapshot);
 });
 
-const { parseAdd, cmdAdd, chooseAddPath } = await import("./add.ts");
+const { parseAdd, cmdAdd, chooseAddPath, resolveInitialModel } = await import("./add.ts");
 
 // ── fixtures ─────────────────────────────────────────────────────────────
 
@@ -451,4 +453,41 @@ test("chooseAddPath: non-TTY always goes non-interactive, explicit or not", () =
 
 test("chooseAddPath: --json always goes non-interactive, even in a TTY", () => {
   expect(chooseAddPath({ explicit: false, isTTY: true, json: true })).toBe("non-interactive");
+});
+
+// ── resolveInitialModel (pure) ───────────────────────────────────────────
+//
+// Seeds the interactive model picker from `lastModel:<kind>` the same way
+// the webview's NewTaskForm / TaskLaunchPickers pickers validate their own
+// seed — a stored id that's no longer offerable (e.g. a retired model)
+// falls back to DEFAULT_MODEL instead of being re-offered as the
+// pre-selected default via mergeModelOptions' unlisted-row rule.
+
+test("resolveInitialModel: keeps a stored id that is still a curated row", () => {
+  expect(resolveInitialModel("gemini", "gemini-3.7-flash", [])).toBe("gemini-3.7-flash");
+});
+
+test("resolveInitialModel: falls back to DEFAULT_MODEL when the stored id was retired from the catalog", () => {
+  expect(resolveInitialModel("gemini", "gemini-3-pro-preview", [])).toBe(DEFAULT_MODEL.gemini);
+  expect(DEFAULT_MODEL.gemini).toBe("gemini-3.1-pro-preview");
+});
+
+test("resolveInitialModel: falls back to DEFAULT_MODEL when no pref is stored", () => {
+  expect(resolveInitialModel("gemini", undefined, [])).toBe(DEFAULT_MODEL.gemini);
+  expect(resolveInitialModel("gemini", "", [])).toBe(DEFAULT_MODEL.gemini);
+  expect(resolveInitialModel("codex", undefined, [])).toBe(DEFAULT_MODEL.codex);
+  expect(resolveInitialModel("codex", "", [])).toBe(DEFAULT_MODEL.codex);
+});
+
+test("resolveInitialModel: keeps a discovered-only id (fx account catalogs carry ids the curated list doesn't)", () => {
+  const discovered: DiscoveredModel[] = [{ id: "google/gemini-3.7-flash", label: "Gemini 3.7 Flash" }];
+  expect(resolveInitialModel("fx", "google/gemini-3.7-flash", discovered)).toBe("google/gemini-3.7-flash");
+});
+
+test("resolveInitialModel: a suffixed cursor variant id is not a curated row, so it falls back to the default like the webview pickers do", () => {
+  expect(resolveInitialModel("cursor", "gemini-3.8-flash-high", [])).toBe(DEFAULT_MODEL.cursor);
+});
+
+test("resolveInitialModel: but the base cursor id is kept", () => {
+  expect(resolveInitialModel("cursor", "gemini-3.8-flash", [])).toBe("gemini-3.8-flash");
 });

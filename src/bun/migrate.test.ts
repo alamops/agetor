@@ -157,13 +157,18 @@ test("024_reseed_harness_builtins restores wiped builtins, is idempotent, and pr
   ]);
 });
 
-test("049_retire_gemini_3_pro_preview rewrites only tasks pinned to the shut-down id, on any harness, and is idempotent", () => {
+test("049_retire_gemini_3_pro_preview rewrites only tasks pinned to the shut-down id, on any harness, and clears the stale lastModel:gemini preference, idempotently", () => {
   const db = new Database(":memory:");
   db.exec(`
     CREATE TABLE tasks (
       id TEXT PRIMARY KEY,
       agent TEXT NOT NULL,
       model TEXT
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
     );
   `);
 
@@ -178,10 +183,25 @@ test("049_retire_gemini_3_pro_preview rewrites only tasks pinned to the shut-dow
       ('t7', 'gemini', NULL);
   `);
 
+  db.exec(`
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:gemini', 'gemini-3-pro-preview', 1),
+      ('lastModel:codex', 'gpt-5.6-sol', 1),
+      ('lastMode:gemini', 'auto', 1),
+      ('lastModel:cursor', 'gemini-3.1-pro', 1);
+  `);
+
   const readAll = () =>
     db
       .query<{ id: string; agent: string; model: string | null }, []>(
         `SELECT id, agent, model FROM tasks ORDER BY id`,
+      )
+      .all();
+
+  const readPrefs = () =>
+    db
+      .query<{ key: string; value: string }, []>(
+        `SELECT key, value FROM preferences ORDER BY key`,
       )
       .all();
 
@@ -195,12 +215,52 @@ test("049_retire_gemini_3_pro_preview rewrites only tasks pinned to the shut-dow
     { id: "t6", agent: "codex", model: "gpt-5.6-sol" }, // untouched — unrelated kind
     { id: "t7", agent: "gemini", model: null }, // untouched — still NULL
   ]);
+  expect(readPrefs()).toEqual([
+    // lastModel:gemini deleted — the other three prefs (including a
+    // different key entirely, a different agent, and a similarly-named
+    // gemini model on a different agent's key) are untouched.
+    { key: "lastMode:gemini", value: "auto" },
+    { key: "lastModel:codex", value: "gpt-5.6-sol" },
+    { key: "lastModel:cursor", value: "gemini-3.1-pro" },
+  ]);
 
-  // Idempotent: re-applying the same UPDATE against the already-rewritten
-  // rows is a no-op.
+  // Idempotent: re-applying against the already-rewritten/already-deleted
+  // rows is a no-op on both tables.
   const beforeSecond = readAll();
+  const prefsBeforeSecond = readPrefs();
   db.exec(retireGemini3ProPreview);
   expect(readAll()).toEqual(beforeSecond);
+  expect(readPrefs()).toEqual(prefsBeforeSecond);
+});
+
+test("049 leaves a lastModel:gemini pref that already points at a live model alone", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
+  db.exec(`
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:gemini', 'gemini-3.7-flash', 1);
+  `);
+
+  db.exec(retireGemini3ProPreview);
+
+  const prefs = db
+    .query<{ key: string; value: string }, []>(
+      `SELECT key, value FROM preferences ORDER BY key`,
+    )
+    .all();
+  expect(prefs).toEqual([{ key: "lastModel:gemini", value: "gemini-3.7-flash" }]);
 });
 
 test("049 is registered last in the migrations index", () => {

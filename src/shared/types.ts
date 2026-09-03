@@ -1584,8 +1584,9 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   },
   // Ids verified against `cursor-agent models` (2026-09-02): Gemini 3.8 / 3.7
   // Flash ship as gemini-3.{8,7}-flash-{low,medium,high} — no minimal tier
-  // (unlike 3.6), no bare id, no -fast variants, no Max Mode. The high
-  // variant carries the unsuffixed label, same convention as 3.6.
+  // (unlike 3.6), no bare id, no -fast variants, no Max Mode. We map the
+  // unsuffixed label to the high tier — agetor's convention, mirroring 3.6;
+  // Cursor's own listing calls it "Gemini 3.8 Flash High" (cosmetic).
   "gemini-3.8-flash": {
     label: "Gemini 3.8 Flash",
     hint: "Google Gemini 3.8 Flash via Cursor.",
@@ -2031,8 +2032,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // `AgentOption.catalogOnly`, `CATALOG_SCOPED_KINDS`). Discovered-only ids
     // (neither list) append via `mergeModelOptions`
     // (`src/shared/model-options.ts`).
-    // Re-verified 2026-08-31 on fx 0.0.7 (unauth view: all 16 standard + 5
-    // catalogOnly ids present, catalog grown to 234; signed-in view
+    // Re-verified 2026-08-31 on fx 0.0.7 (unauth view: all 16 standard + the
+    // then-5 catalogOnly ids present, catalog grown to 234; signed-in view
     // unverifiable this pass — token expired).
     // 2026-09-02: google/gemini-3.8-flash added from fx 0.0.7's unauthenticated
     // catalog (`fx models --json` under an expired login); its presence in a

@@ -20,6 +20,7 @@ import {
   DEFAULT_EFFORT,
   CATALOG_SCOPED_KINDS,
   supportedEfforts,
+  cursorModelIdCoveredByCatalog,
   type AgentKind,
 } from "../../shared/types.ts";
 import { mergeModelOptions, type DiscoveredModel } from "../../shared/model-options.ts";
@@ -220,6 +221,27 @@ function baseInput(o: AddOpts, title: string, prompt: string): CreateTaskInput {
   };
 }
 
+/** Seed for the interactive model picker: the stored `lastModel:<kind>` pref
+ *  when it is still offerable — a curated row for the kind, or an id the
+ *  harness's discovered catalog actually lists (fx accounts can carry
+ *  discovered-only ids) — else the kind's default. Mirrors the two webview
+ *  pickers' validation so a retired id (e.g. gemini-3-pro-preview, shut down
+ *  2026-03-09 and cleared by migration 049) can't be re-offered as the
+ *  pre-selected default via mergeModelOptions' unlisted-row rule. */
+export function resolveInitialModel(
+  kind: AgentKind,
+  stored: string | undefined | null,
+  discovered: readonly DiscoveredModel[],
+): string {
+  if (
+    stored &&
+    (AGENT_OPTIONS[kind].models.some((m) => m.id === stored) || discovered.some((m) => m.id === stored))
+  ) {
+    return stored;
+  }
+  return DEFAULT_MODEL[kind];
+}
+
 async function wizard(
   client: AgetorClient,
   o: AddOpts,
@@ -281,11 +303,15 @@ async function wizard(
 
   let model = o.model;
   if (!model) {
-    const initial = prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind];
     // Prefer the per-harness catalog (keyed by harness id, e.g. distinguishes
     // an additional `fx-2` account from the built-in `fx`); fall back to the
     // kind-level map for an older daemon without `/agent-models/harnesses`.
-    const catalog: DiscoveredModel[] = (agent && harnessModels.byHarness[agent]) || discovered[kind] || [];
+    // Spec'd cursor models show as one base row + effort dropdown, not N
+    // suffixed rows — same filter as the webview pickers (NewTaskForm.tsx).
+    const catalog: DiscoveredModel[] = ((agent && harnessModels.byHarness[agent]) || discovered[kind] || []).filter(
+      (m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id),
+    );
+    const initial = resolveInitialModel(kind, prefs[`lastModel:${kind}`], catalog);
     const options = mergeModelOptions({
       curated: AGENT_OPTIONS[kind].models,
       discovered: catalog,
