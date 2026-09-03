@@ -33,7 +33,7 @@
 // of the same send to one identical string, so a dedup key computed from it
 // collapses the two into a single event. Callers are expected to have
 // already normalized `\r` / `\r\n` to `\n` (mirrors the CR-normalization
-// contract `command-message.ts`'s `parseUserMessage` documents) — this
+// contract `user-message.ts`'s `parseUserMessage` documents) — this
 // module does no newline normalization of its own.
 import { REFS_HEADING } from "./refs.ts";
 
@@ -176,7 +176,7 @@ type Bullet =
 
 /** Classify one line of a references-block bullet list. Tolerates both the
  *  well-formed `- <path>` shape (`splitReferences`' own rule, in
- *  `src/mainview/lib/command-message.ts`) and claude's rewritten bare `-`
+ *  `src/shared/user-message.ts`) and claude's rewritten bare `-`
  *  (or `- ` with trailing whitespace) left behind once an image bullet's
  *  path has been stripped. Anything else is `invalid` — a signal to the
  *  caller that this isn't a references block after all. */

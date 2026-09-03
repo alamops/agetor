@@ -953,8 +953,8 @@ function syntheticNotificationUuid(content: string): string {
  * A `/model`/`/effort` twin is claude ANSWERING a local command, not claude
  * continuing work — so both shapes are excluded here and route instead to
  * `state.lastChunk` (the previous run's handler), where they render as the
- * command / command-output bubbles `lib/command-message.ts` already knows how
- * to draw. The `isMeta` `<local-command-caveat>` breadcrumb is already
+ * command / command-output bubbles `src/shared/user-message.ts` already knows
+ * how to draw. The `isMeta` `<local-command-caveat>` breadcrumb is already
  * excluded by the `isMeta` check just above.
  */
 function isContinuationContentEvent(evt: ParsedJsonlEvent): boolean {
@@ -1333,10 +1333,10 @@ function mapParsedEventToChunks(
       // branch above already renders. Render this flat variant as a `user`
       // chunk too (CR-normalised like the human-turn path — tmux can leak
       // `\r`-only line endings into these lines the same way it does for
-      // real prompts) so the webview's command-message parser produces the
-      // identical command/command-output bubbles regardless of which shape
-      // claude happened to use. See `isLocalCommandStdoutEvent` for the
-      // matching settle-detection half of this.
+      // real prompts) so the shared `src/shared/user-message.ts` parser
+      // produces the identical command/command-output bubbles regardless of
+      // which shape claude happened to use. See `isLocalCommandStdoutEvent`
+      // for the matching settle-detection half of this.
       if (evt.type === "system" && evt.subtype === "local_command"
         && typeof evt.content === "string" && evt.content.length > 0) {
         onChunk("user", evt.content.replace(/\r\n?/g, "\n"), uuid);

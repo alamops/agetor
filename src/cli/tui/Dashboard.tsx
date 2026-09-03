@@ -3,6 +3,7 @@ import { Box, Text, useApp, useInput } from "ink";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task, RunEvent } from "../../shared/types.ts";
 import { commitPushPrompt, isInternalStatusSentinel } from "../../shared/types.ts";
+import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
 import { useTasks } from "./useTasks.ts";
 import { useCoalescedStream, eventKey } from "./useCoalescedStream.ts";
 import { useSpinner } from "./useSpinner.ts";
@@ -284,12 +285,20 @@ function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
 
 const EventLine = memo(function EventLine({ e }: { e: RunEvent }) {
   switch (e.stream) {
+    // `userMessageLines` (src/shared/user-message.ts) is the single source of
+    // truth for rendering a raw user-turn string across all three surfaces —
+    // the webview's transcript bubble, the CLI's `agetor logs`, and this
+    // dashboard — so a tagged message (slash-command XML, local-command
+    // output, a forked-skill launch, a shell escape, …) prints labeled lines
+    // instead of raw `<tag>` text. Ordinary messages render one `you› ` line,
+    // identical to today.
     case "user":
       return (
-        <Text wrap="truncate-end">
-          <Text color="cyan">you› </Text>
-          {e.data}
-        </Text>
+        <Box flexDirection="column">
+          {userMessageLines(e.data).map((line, i) => (
+            <UserPlainLine key={i} line={line} />
+          ))}
+        </Box>
       );
     case "assistant":
       return <Text wrap="truncate-end">{e.data}</Text>;
@@ -336,6 +345,30 @@ const EventLine = memo(function EventLine({ e }: { e: RunEvent }) {
       return <Text wrap="truncate-end">{e.data}</Text>;
   }
 });
+
+/** One `PlainLine` from `userMessageLines`, rendered to match today's
+ *  `<Text color="cyan">you› </Text>{data}` shape for the ordinary ("user")
+ *  case: label colored, a space, then the text. An `error` line (shell
+ *  stderr) colors the whole line red; `machine`/`tag` lines dim only the
+ *  label so the text itself (shell stdout, a skill launch line, …) stays
+ *  readable. */
+function UserPlainLine({ line }: { line: PlainLine }) {
+  if (line.tone === "error") {
+    return (
+      <Text color="red" wrap="truncate-end">
+        {line.label} {line.text}
+      </Text>
+    );
+  }
+  return (
+    <Text wrap="truncate-end">
+      <Text color={line.tone === "user" ? "cyan" : undefined} dimColor={line.tone !== "user"}>
+        {line.label}{" "}
+      </Text>
+      {line.text}
+    </Text>
+  );
+}
 
 function Footer({
   status,

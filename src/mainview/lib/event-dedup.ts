@@ -8,7 +8,7 @@
 // must collapse duplicates client-side — this is that collapse, extracted as a
 // pure helper so it can be unit-tested apart from the React effect.
 import type { RunEvent } from "../../shared/types.ts";
-import { canonicalizeUserText } from "./command-message.ts";
+import { canonicalizeUserText } from "../../shared/user-message.ts";
 import { canonicalizeAttachmentText } from "../../shared/attachments.ts";
 
 /** Normalize CR-only / CRLF newlines to `\n`. tmux's paste-buffer delivers our

@@ -1,5 +1,5 @@
 // Pure search-over-events logic for the task-details message stream
-// (RunPanel). Kept DOM-free (like subagent-tabs.ts / command-message.ts) so
+// (RunPanel). Kept DOM-free (like subagent-tabs.ts / shared/user-message.ts) so
 // the matching/navigation math can be unit-tested without a DOM harness —
 // this repo has no jsdom/testing-library, so anything that touches the log's
 // actual React tree has to be validated by testing the logic it's driven by

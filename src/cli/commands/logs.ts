@@ -6,6 +6,7 @@ import { usageError } from "../usage.ts";
 import { notifyFor, osNotify } from "../notify.ts";
 import type { RunEvent, GlobalEvent } from "../../shared/types.ts";
 import { isInternalStatusSentinel } from "../../shared/types.ts";
+import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
 
 export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   const ref = args.find((a) => !a.startsWith("-"));
@@ -92,8 +93,15 @@ function shouldSkipEvent(e: RunEvent): boolean {
 
 function formatEvent(e: RunEvent): string {
   switch (e.stream) {
+    // `userMessageLines` (src/shared/user-message.ts) is the single source of
+    // truth for rendering a raw user-turn string across all three surfaces —
+    // the webview's transcript bubble, this CLI render, and the TUI dashboard
+    // — so a tagged message (slash-command XML, local-command output, a
+    // forked-skill launch, a shell escape, …) prints labeled lines here
+    // instead of raw `<tag>` text. `--json` output is unaffected: it emits
+    // the raw event, never routing through this formatter.
     case "user":
-      return `${c.cyan("you›")} ${e.data}`;
+      return userMessageLines(e.data).map((line) => `${colorLabel(line)} ${line.text}`).join("\n");
     case "assistant":
       return e.data;
     case "thinking":
@@ -125,6 +133,20 @@ function formatEvent(e: RunEvent): string {
       return c.dim("✓ interaction answered");
     default:
       return e.data;
+  }
+}
+
+/** Color a `PlainLine`'s label by its tone — `user` cyan (matches today's
+ *  "you›"), `machine`/`tag` dim, `error` red. */
+function colorLabel(line: PlainLine): string {
+  switch (line.tone) {
+    case "user":
+      return c.cyan(line.label);
+    case "error":
+      return c.red(line.label);
+    case "machine":
+    case "tag":
+      return c.dim(line.label);
   }
 }
 

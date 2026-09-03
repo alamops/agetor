@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { History } from "lucide-react";
 import { api, type SentMessageItem } from "@/lib/api";
-import { parseUserMessage, splitReferences } from "@/lib/command-message";
+import { isMachineEmittedMessage, parseUserMessage, splitReferences } from "../../../shared/user-message.ts";
 import { canonicalizeAttachmentText } from "../../../shared/attachments.ts";
 import { cn } from "@/lib/utils";
 
@@ -36,9 +36,17 @@ interface CleanedItem {
  *  reduce to identical text and collapse under the caller's dedup-by-text
  *  loop, then unwrap a slash-command XML expansion back to its plain
  *  "/cmd args" echo (same shape `parseUserMessage`/`canonicalizeUserText`
- *  use elsewhere for the run stream), then strip a trailing "Referenced
- *  files" block via the shared splitter so its heading text never gets
- *  re-typed here. */
+ *  use elsewhere for the run stream, both from `src/shared/user-message.ts`),
+ *  then strip a trailing "Referenced files" block via the shared splitter so
+ *  its heading text never gets re-typed here. A `tagged` message whose
+ *  segments are ALL machine-emitted (a `<local-command-stdout>` +
+ *  `<forked-skill-launch>` pair after a background skill launch, a `!`
+ *  shell-escape's `<bash-*>` lines) is not user-authored either and is
+ *  dropped the same way; a message that mixes in (or is entirely)
+ *  user-authored prose or tags — e.g. `<context>…</context>` pasted ahead of
+ *  typed text — is kept VERBATIM, tags included, so re-inserting it from
+ *  history reproduces the original prompt byte-for-byte rather than losing
+ *  the tags the user relied on. */
 function cleanMessageText(raw: string): string {
   const text = canonicalizeAttachmentText(raw.replace(/\r\n?/g, "\n"));
   const parsed = parseUserMessage(text);
@@ -53,6 +61,9 @@ function cleanMessageText(raw: string): string {
     // Local-command stdout is not a user-authored message — drop it (the
     // caller's `if (!text) continue` filter relies on the empty string).
     return "";
+  }
+  if (parsed?.kind === "tagged") {
+    return isMachineEmittedMessage(parsed.segments) ? "" : parsed.text.trim();
   }
   const { args } = splitReferences(text);
   return args.trim();
@@ -76,8 +87,8 @@ function formatTime(ts: number): string {
  * Client-side cleaning collapses the remaining duplicate shapes the server
  * can't see cheaply: a slash-command send shows up twice in claude-code's
  * transcript — once as the live plain-text echo, once as claude's JSONL XML
- * expansion of the same send (see `command-message.ts`'s header comment) —
- * and either shape may carry a trailing "Referenced files" block that
+ * expansion of the same send (see `src/shared/user-message.ts`'s header
+ * comment) — and either shape may carry a trailing "Referenced files" block that
  * shouldn't be replayed verbatim. Both are normalized here, then deduped by
  * cleaned text (first occurrence wins — items arrive newest-first).
  */
