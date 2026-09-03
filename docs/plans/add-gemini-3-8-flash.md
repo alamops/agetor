@@ -132,6 +132,9 @@ no new user flow, route, or UI surface. The existing `e2e/fx-models.spec.ts` is 
    types.ts; FIX-2 = `agetor add` validates the stored pref against curated ∪ discovered via an exported
    `resolveInitialModel` helper (mirrors the webview pickers) and applies the UI's cursor covered-id filter,
    with unit tests. Then Phase 7 re-run.
+   **Final:** wave 3 landed as dae3b2f. Phase 7 (haiku) on dae3b2f: typecheck clean; `bun test` 4023 pass /
+   3 skip / 0 fail across 202 files (235 s); the five touched suites 223 pass / 0 fail. Phase 8 loop closed
+   in one round. Branch not pushed — owner's call.
 
 ## 7. Blast radius & risks
 
