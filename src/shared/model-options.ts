@@ -73,12 +73,15 @@
  *    row carries `efforts` when rule 7 distrusts `discovered`
  *    (`loggedIn === false`) or `discovered` is empty. The `unlisted` row
  *    appended by rule 6 carries `efforts` too, under the same lookup, when
- *    the trusted `discovered` list has a matching entry. Pickers read a
- *    row's `efforts` via the `discoveredEffortsFor` helper below (fed the
- *    same `discovered` list passed in here) and hand the result to
- *    `supportedEfforts` (`./types.ts`) as its third argument, so a
- *    CLI-discovered per-model effort set wins over the curated
- *    `MODEL_EFFORT_SUPPORT` table.
+ *    the trusted `discovered` list has a matching entry. Pickers/CLI read a
+ *    row's `efforts` via the `discoveredEffortsFor` helper below, fed this
+ *    function's own MERGED output (the `ModelOption[]` returned here) rather
+ *    than the raw `discovered` input — `discoveredEffortsFor` has no
+ *    visibility into `loggedIn`, so only the merged rows (which already
+ *    reflect rule 7's distrust) make rule 8 the single source of truth for
+ *    per-model efforts. The looked-up result is handed to `supportedEfforts`
+ *    (`./types.ts`) as its third argument, so a CLI-discovered per-model
+ *    effort set wins over the curated `MODEL_EFFORT_SUPPORT` table.
  *
  * Inputs are never mutated; a new array is always returned.
  */
@@ -261,13 +264,19 @@ export function mergeModelOptions(input: MergeModelOptionsInput): ModelOption[] 
 
 /** The webview/CLI twin of the bun-side `getDiscoveredEfforts`
  *  (`src/bun/agent-discovery.ts`, which reads the in-process discovery
- *  caches): given the same discovered-model list a caller hands to
- *  `mergeModelOptions` (`harnessModels[harnessId] ?? agentModels[kind]` in
- *  the webview, the fetched `discovered` list in `agetor add`), returns the
- *  matching entry's `efforts` when it's a non-empty array, else `null`.
- *  Pass the result straight through as `supportedEfforts`'s third argument
- *  (`./types.ts`). Structural over `models`/`id` for the same reason the
- *  rest of this module is structural — see the module doc comment. */
+ *  caches). Callers MUST pass the MERGED rows — `mergeModelOptions`'s own
+ *  `ModelOption[]` result — not the raw `discovered` list that was fed into
+ *  it: `mergeModelOptions` has already applied rule 7's `loggedIn` distrust
+ *  (and rule 6's unlisted-row handling) by the time a row reaches here, so
+ *  this lookup doesn't re-derive any of that — it's a plain id lookup over
+ *  rule 8's already-attached `efforts`, making rule 8 the single source of
+ *  the per-model effort set. Passing the raw discovered list instead would
+ *  silently bypass rule 7 (this function has no `loggedIn` of its own to
+ *  check). Given those merged rows and an id, returns the matching row's
+ *  `efforts` when it's a non-empty array, else `null`. Pass the result
+ *  straight through as `supportedEfforts`'s third argument (`./types.ts`).
+ *  Structural over `models`/`id` for the same reason the rest of this module
+ *  is structural — see the module doc comment. */
 export function discoveredEffortsFor(
   models: readonly { id: string; efforts?: readonly string[] }[] | null | undefined,
   id: string | null | undefined,

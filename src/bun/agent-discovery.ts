@@ -165,6 +165,17 @@ async function discoverCursor(): Promise<DiscoveredModel[]> {
 }
 
 /**
+ * Default `codex app-server` probe budget, in ms — overridable only via the
+ * test seam `__testing.setCodexProbeTimeoutMs` below (re-read at the start
+ * of every `discoverCodex` call, so a test can drive the timeout path in
+ * well under a second instead of eating the full 5s). Never exposed as a
+ * real env var — discovery timing isn't something a shipped user needs to
+ * tune.
+ */
+const DEFAULT_CODEX_PROBE_TIMEOUT_MS = 5_000;
+let codexProbeTimeoutMs = DEFAULT_CODEX_PROBE_TIMEOUT_MS;
+
+/**
  * Discover codex's model catalog by speaking to `codex app-server` directly
  * over JSON-RPC 2.0 (newline-delimited, one object per line each direction)
  * on its stdio pipes — NOT via a model-listing subcommand like
@@ -189,34 +200,91 @@ async function discoverCursor(): Promise<DiscoveredModel[]> {
  * one-shot `runProbe` subcommand call the way cursor/fx's discoverers are —
  * it's a stateful handshake over a long-lived pipe, not a single argv probe.
  *
+ * `env`, when given, is merged over `process.env` for this one spawn — same
+ * convention (and same reason) as `runProbe`/`discoverFx`'s `env` parameter:
+ * codex's catalog is account-scoped, so a second codex harness (its own
+ * `home` → `HOME`+`CODEX_HOME` override via `harnessEnv`, see
+ * `src/bun/agents.ts`) must be probed under *its own* env to see *its own*
+ * account's catalog rather than the built-in harness's. `bin`, when given,
+ * is used verbatim in place of the `AGETOR_CODEX_BIN ?? "codex"` /
+ * `Bun.which` resolution below — mirrors `discoverFx`'s `bin` parameter and
+ * `resolveBin`'s harness.bin-first resolution in `agents.ts`. Both are
+ * optional and additive: every pre-existing no-args caller keeps probing the
+ * built-in harness under agetor's own process env, exactly as before these
+ * parameters existed.
+ *
  * Contract, matching every other discoverer in this module: never throws,
  * never hangs. Resolves `[]` when: the child exits before the `model/list`
  * result arrives (the `/bin/echo app-server` unit-test stub case — this
- * resolves promptly on exit, it does not wait out the 5s budget below); a
- * response carries a JSON-RPC `error`; the 5s overall budget elapses; or
+ * resolves promptly on exit, it does not wait out the timeout budget below);
+ * a response carries a JSON-RPC `error`; the timeout budget elapses; or
  * anything throws (including a `stdin.write`/`flush` against an
  * already-closed pipe, guarded individually since that stub case closes its
  * pipe immediately). The child is always killed and the timer always
  * cleared in a `finally`. Pagination follows a non-empty string
  * `nextCursor` with a fresh `model/list` call (`{cursor}`), bounded to 5
  * pages total, concatenating each page's `data` before handing the whole
- * batch to `parseCodexModelList`.
+ * batch to `parseCodexModelList` — UNLESS the timeout fired at any point
+ * during that pagination (`timedOut`, set only by the timer callback): in
+ * that case this resolves `[]` outright, discarding whatever pages had
+ * already landed, rather than returning (and letting the caller cache +
+ * publish) a partial catalog that would just flip back to the full one on
+ * the next sweep. This is distinct from a genuine JSON-RPC `error` on
+ * `model/list`, which is unaffected by the timeout flag: an error on the
+ * FIRST page still resolves `[]` (nothing was collected yet to keep), but an
+ * error on a LATER page keeps whatever earlier pages already landed — both
+ * halves of that behavior are unchanged from before this fix, just spelled
+ * out precisely here.
+ *
+ * Leak-safety: the background stdout reader is hoisted to this function's
+ * scope (`reader`, assigned inside the read loop's own try) so the outer
+ * `finally` can `reader.cancel()` it after `kill()`ing the direct child —
+ * without this, a grandchild that inherited the same stdout pipe (a real
+ * `codex app-server` may spawn MCP/helper children) keeps that pipe's write
+ * end open from its side, the reader's `read()` never resolves `done`, and
+ * this process never releases its own reference to the pipe — which is
+ * exactly what keeps a `Bun.spawn`'d child's stdout stream, and therefore
+ * agetor's own event loop, from ever going idle. Cancelling the reader (not
+ * just killing the direct child) releases *this process's* end of the pipe
+ * regardless of what a grandchild still holds open on its side. The read
+ * loop's `getReader()` call itself is inside its own try (previously it sat
+ * outside — a throw there was an unhandled rejection); every `await` in that
+ * loop is covered by the same try/catch, which degrades to a silent no-op
+ * on any stream error rather than rejecting into the void (the `exited`
+ * handler already settles any pending calls independently). On a clean
+ * `done` (the child closed stdout normally), a non-empty residual `buf` —
+ * the tail of a reply that never got its own trailing newline — is run
+ * through the same dispatch path before the loop exits, instead of being
+ * silently discarded.
  *
  * Stays a leaf like every other discoverer here: no import of db.ts,
  * agents.ts, or any other process-spawning helper module — see the
  * module-level "stay a leaf" note on `discoverFx` below.
  */
-async function discoverCodex(): Promise<DiscoveredModel[]> {
+async function discoverCodex(env?: Record<string, string>, bin?: string): Promise<DiscoveredModel[]> {
+  const timeoutMs = codexProbeTimeoutMs;
+
   // Resolve against the rehydrated PATH explicitly — Bun.spawn (and the
   // implicit lookup inside it) uses Bun's startup PATH cache, which on a
   // packaged .app is launchd's minimal set. See agent-status.ts for the
-  // full story.
-  const fallback = process.env.AGETOR_CODEX_BIN ?? "codex";
-  const bin = Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+  // full story. An explicit `bin` (a harness's own resolved binary path)
+  // wins outright, same as `discoverFx`.
+  let resolvedBin: string;
+  if (bin !== undefined) {
+    resolvedBin = bin;
+  } else {
+    const fallback = process.env.AGETOR_CODEX_BIN ?? "codex";
+    resolvedBin = Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+  }
 
   let proc: Subprocess<"pipe", "pipe", "ignore">;
   try {
-    proc = Bun.spawn([bin, "app-server"], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+    proc = Bun.spawn([resolvedBin, "app-server"], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "ignore",
+      ...(env ? { env: { ...process.env, ...env } } : {}),
+    });
   } catch {
     return [];
   }
@@ -226,6 +294,8 @@ async function discoverCodex(): Promise<DiscoveredModel[]> {
   // resolves to `undefined` from that point on instead of hanging.
   let settled = false;
   let killed = false;
+  let timedOut = false;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   const kill = (): void => {
     if (killed) return;
     killed = true;
@@ -241,50 +311,63 @@ async function discoverCodex(): Promise<DiscoveredModel[]> {
   };
 
   // The child dying before it answered a pending request must unblock that
-  // request's promise rather than hang until the 5s timer — this is what
-  // makes a stub like `/bin/echo app-server` (which prints "app-server" and
-  // exits at once) resolve `[]` promptly.
+  // request's promise rather than hang until the timeout fires — this is
+  // what makes a stub like `/bin/echo app-server` (which prints "app-server"
+  // and exits at once) resolve `[]` promptly.
   proc.exited.then(settleAllPending).catch(settleAllPending);
 
   const timer = setTimeout(() => {
+    timedOut = true;
     settleAllPending();
     kill();
-  }, 5_000);
+  }, timeoutMs);
 
-  // Background read loop: buffer stdout, split on newlines, `JSON.parse`
-  // each non-empty line as one JSON-RPC message (an unparsable line is
-  // skipped, not fatal), and resolve whichever pending call's numeric `id`
-  // it matches. A message with no numeric `id` — an unsolicited notification
-  // — or one whose `id` doesn't match any pending call is silently ignored.
-  void (async () => {
-    const reader = proc.stdout.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
+  // Parse one already-newline-stripped line as a JSON-RPC message and
+  // resolve whichever pending call's numeric `id` it matches. A message with
+  // no numeric `id` — an unsolicited notification — or one whose `id`
+  // doesn't match any pending call is silently ignored. An unparsable line
+  // is skipped, not fatal. Shared by the read loop's newline-split path and
+  // its end-of-stream residual-buffer flush (finding: a reply lacking a
+  // trailing newline used to be discarded outright).
+  const dispatchLine = (line: string): void => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let msg: unknown;
     try {
+      msg = JSON.parse(trimmed);
+    } catch {
+      return;
+    }
+    if (!msg || typeof msg !== "object") return;
+    const id = (msg as { id?: unknown }).id;
+    if (typeof id !== "number") return;
+    const resolve = pending.get(id);
+    if (resolve) {
+      pending.delete(id);
+      resolve(msg);
+    }
+  };
+
+  // Background read loop: buffer stdout, split on newlines, dispatch each
+  // complete line via `dispatchLine`. `reader` is assigned here (not
+  // declared here) — see the enclosing function's leak-safety doc above for
+  // why it's hoisted to that outer scope.
+  void (async () => {
+    try {
+      reader = proc.stdout.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
       for (;;) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          if (buf.trim().length > 0) dispatchLine(buf);
+          break;
+        }
         buf += decoder.decode(value, { stream: true });
         let nl: number;
         while ((nl = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, nl);
+          dispatchLine(buf.slice(0, nl));
           buf = buf.slice(nl + 1);
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          let msg: unknown;
-          try {
-            msg = JSON.parse(trimmed);
-          } catch {
-            continue;
-          }
-          if (!msg || typeof msg !== "object") continue;
-          const id = (msg as { id?: unknown }).id;
-          if (typeof id !== "number") continue;
-          const resolve = pending.get(id);
-          if (resolve) {
-            pending.delete(id);
-            resolve(msg);
-          }
         }
       }
     } catch {
@@ -344,12 +427,15 @@ async function discoverCodex(): Promise<DiscoveredModel[]> {
         break;
       }
     }
+    // Timeout trumps partial data — see the doc comment above.
+    if (timedOut) return [];
     return parseCodexModelList({ data: allData });
   } catch {
     return [];
   } finally {
     clearTimeout(timer);
     kill();
+    try { void reader?.cancel(); } catch { /* already released/cancelled */ }
   }
 }
 
@@ -468,11 +554,23 @@ function parseFxModels(stdout: string): DiscoveredModel[] {
  * against `process.env.PATH` — used whenever a caller doesn't hand in an
  * explicit `bin` (see `discoverFx` below). Factored out so the "is this
  * target indistinguishable from the built-in/kind-level probe" checks in
- * `runRefresh`/`runRefreshFxHarnessModels` can compare a target's `bin`
+ * `runRefresh`/`runRefreshHarnessTarget` can compare a target's `bin`
  * against this same computation instead of re-deriving it inline.
  */
 function defaultFxBin(): string {
   const fallback = process.env.AGETOR_FX_BIN ?? "fx";
+  return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+}
+
+/**
+ * The default codex binary resolution — `AGETOR_CODEX_BIN ?? "codex"`,
+ * rehydrated against `process.env.PATH` — the codex sibling of `defaultFxBin`
+ * above, used by the same "is this target indistinguishable from the
+ * built-in/kind-level probe" checks now that codex has joined the
+ * per-harness discovery path (code-review finding #4).
+ */
+function defaultCodexBin(): string {
+  const fallback = process.env.AGETOR_CODEX_BIN ?? "codex";
   return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
 }
 
@@ -528,35 +626,60 @@ async function discoverFx(env?: Record<string, string>, bin?: string): Promise<D
 
 /**
  * True when `target` is indistinguishable from the kind-level built-in probe
- * (`discoverFx()` with no args) — no env override AND either no `bin` at all
- * or a `bin` that resolves to exactly the same binary the no-args call would
- * pick. Used to decide whether a per-harness fx probe can (a) reuse the
- * kind-level result instead of spawning fx a second time for an identical
- * probe, and (b) drift-correct the kind-level "fx" cache. A target with a
- * *different* `bin` — even with an empty `env` — is a different binary (and
- * possibly a different account), so it must never share either shortcut.
+ * (`discoverFx()`/`discoverCodex()` with no args, per `target.kind`) — no env
+ * override AND either no `bin` at all or a `bin` that resolves to exactly the
+ * same binary the no-args call for that kind would pick. Used to decide
+ * whether a per-harness probe can (a) reuse the kind-level result instead of
+ * spawning the CLI a second time for an identical probe, and (b)
+ * drift-correct the kind-level cache. A target with a *different* `bin` —
+ * even with an empty `env` — is a different binary (and possibly a different
+ * account), so it must never share either shortcut.
+ *
+ * Generalized from the fx-only `isBuiltinLikeFxTarget` when codex joined the
+ * per-harness discovery path (code-review finding #4 on the GPT-6 Astra /
+ * codex app-server discovery landing). It was never exported, so there's no
+ * external caller/test to keep an alias for (grep confirms nothing else in
+ * the repo references the old name) — renamed outright rather than aliased.
  */
-function isBuiltinLikeFxTarget(target: FxHarnessTarget): boolean {
+function isBuiltinLikeTarget(target: HarnessTarget): boolean {
   if (Object.keys(target.env).length !== 0) return false;
-  return target.bin === undefined || target.bin === defaultFxBin();
+  const kind = target.kind ?? "fx";
+  const defaultBin = kind === "codex" ? defaultCodexBin() : defaultFxBin();
+  return target.bin === undefined || target.bin === defaultBin;
 }
 
 /**
- * One fx harness to probe for its own account-scoped catalog. `env` is the
- * harness's spawn-env overrides (typically a `HOME` override for an
- * additional-account harness, mirroring `harnessEnv(harness)` one layer up
- * in `agents.ts`) — an empty object means "the built-in fx harness, probe
- * under agetor's own process env, same account as the kind-level cache".
- * `bin`, when given, is the harness's own resolved binary path (mirroring
- * `resolveBin(harness)` in `agents.ts` — the same resolver every real fx
- * spawn uses) — omitted, discovery falls back to `AGETOR_FX_BIN ?? "fx"`,
- * same as before this field existed.
+ * One harness to probe for its own account-scoped catalog — fx and codex are
+ * the two kinds whose catalog varies per harness (`kind` defaults to `"fx"`
+ * when omitted, so every caller/test written before codex joined this path —
+ * `{ harnessId, env, bin }` with no `kind` field — keeps compiling and
+ * behaving unchanged). `env` is the harness's spawn-env overrides (typically
+ * a `HOME` override for an additional-account fx/cursor-style harness, or
+ * `HOME`+`CODEX_HOME` for codex — mirroring `harnessEnv(harness)` one layer
+ * up in `agents.ts`) — an empty object means "the built-in harness of this
+ * kind, probe under agetor's own process env, same account as the kind-level
+ * cache". `bin`, when given, is the harness's own resolved binary path
+ * (mirroring `resolveBin(harness)` in `agents.ts` — the same resolver every
+ * real spawn of that kind uses) — omitted, discovery falls back to that
+ * kind's own `AGETOR_*_BIN ?? "<kind>"` default, same as before this field
+ * existed.
  */
-export interface FxHarnessTarget {
+export interface HarnessTarget {
   harnessId: string;
+  /** Defaults to `"fx"` when omitted — see the interface doc above. */
+  kind?: "fx" | "codex";
   env: Record<string, string>;
   bin?: string;
 }
+
+/**
+ * Pre-codex name for `HarnessTarget`, kept as a type alias (not renamed
+ * outright) because it IS exported and imported by name elsewhere — e.g.
+ * `agent-discovery.test.ts`'s `import { type FxHarnessTarget }` — so
+ * dropping it would be a breaking rename for no behavior gain. Prefer
+ * `HarnessTarget` in new code; both names describe the exact same shape.
+ */
+export type FxHarnessTarget = HarnessTarget;
 
 const cache = new Map<AgentKind, DiscoveredModel[]>();
 const harnessCache = new Map<string, DiscoveredModel[]>();
@@ -596,10 +719,11 @@ export function getDiscoveredModels(agent: AgentKind): DiscoveredModel[] {
 }
 
 /**
- * Discovered models for one fx harness, keyed by harness id rather than
- * kind. `[]` for a harness that hasn't been probed yet — this includes every
- * non-fx harness, since this cache is fx-only (the only kind whose catalog
- * varies per-harness).
+ * Discovered models for one harness, keyed by harness id rather than kind.
+ * `[]` for a harness that hasn't been probed yet — this includes every
+ * non-fx/non-codex harness, since this cache only ever gets entries for the
+ * two kinds whose catalog varies per-harness (fx always did; codex joined
+ * via code-review finding #4).
  */
 export function getHarnessDiscoveredModels(harnessId: string): DiscoveredModel[] {
   return harnessCache.get(harnessId) ?? [];
@@ -629,11 +753,12 @@ export function getAllHarnessDiscoveredModels(): Record<string, DiscoveredModel[
  * fetched over the API) — this one reads straight from this module's own
  * in-memory caches instead, for callers that live on this side of the
  * process (the orchestrator, `server.ts`'s PATCH guard). Looks in
- * `harnessCache.get(harnessId)` first when `harnessId` is given (fx is the
- * only kind whose catalog varies per harness — a `harnessId` for any other
- * kind simply won't have an entry there, so this is a harmless miss), then
- * falls back to `cache.get(kind)`. Returns the matching model's `efforts`
- * when that list is non-empty, else `null` (no model arg, no matching
+ * `harnessCache.get(harnessId)` first when `harnessId` is given (fx and
+ * codex are the only kinds whose catalog varies per harness — a `harnessId`
+ * for any other kind simply won't have an entry there, so this is a
+ * harmless miss), then falls back to `cache.get(kind)`. Returns the
+ * matching model's `efforts` when that list is non-empty, else `null` (no
+ * model arg, no matching
  * entry, or an entry with no discovered efforts all read the same way).
  * Callers pass this straight through as `supportedEfforts`'s third argument.
  */
@@ -662,9 +787,13 @@ export function isDiscoveryReady(): boolean {
 /**
  * `opts.fxHarnesses` may be given as a plain array, or as a thunk returning
  * one — see `refreshDiscoveredModels`'s doc comment for why the thunk form
- * exists.
+ * exists. The option key and type name both predate codex joining the
+ * per-harness discovery path (code-review finding #4) and are kept as-is —
+ * renaming them would churn every caller/test for no behavior gain — but the
+ * targets they carry are `HarnessTarget`s now, so a target list built from
+ * this option may include codex harnesses alongside fx ones.
  */
-export type FxHarnessTargetsOption = FxHarnessTarget[] | (() => FxHarnessTarget[]);
+export type FxHarnessTargetsOption = HarnessTarget[] | (() => HarnessTarget[]);
 
 async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Promise<void> {
   try {
@@ -701,15 +830,22 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Prom
     const targetsOpt = opts?.fxHarnesses;
     const targets = typeof targetsOpt === "function" ? targetsOpt() : targetsOpt;
     if (targets) {
-      // Reuse the kind-level fx result computed just above for any target
+      // Reuse the kind-level result computed just above for any target
       // that's indistinguishable from that probe (no env override, and
-      // either no `bin` or a `bin` matching the default resolution) instead
-      // of spawning fx a second time for what would be an identical probe.
-      const builtIn = cache.get("fx") ?? [];
+      // either no `bin` or a `bin` matching that kind's default resolution)
+      // instead of spawning the CLI a second time for what would be an
+      // identical probe. Both fx and codex apply now (code-review finding
+      // #4) — dispatched by `target.kind` (defaults to `"fx"`).
+      const builtInFx = cache.get("fx") ?? [];
+      const builtInCodex = cache.get("codex") ?? [];
       const targetResults = await Promise.allSettled(
-        targets.map((target) =>
-          isBuiltinLikeFxTarget(target) ? Promise.resolve(builtIn) : discoverFx(target.env, target.bin),
-        ),
+        targets.map((target) => {
+          const kind = target.kind ?? "fx";
+          if (isBuiltinLikeTarget(target)) {
+            return Promise.resolve(kind === "codex" ? builtInCodex : builtInFx);
+          }
+          return kind === "codex" ? discoverCodex(target.env, target.bin) : discoverFx(target.env, target.bin);
+        }),
       );
       const seen = new Set<string>();
       targets.forEach((target, i) => {
@@ -732,11 +868,12 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Prom
 
 /**
  * Refreshes the kind-level cache (all five agent kinds, as before) and, when
- * `opts.fxHarnesses` is given, the harness-level fx cache too. Calls are
- * serialized through `enqueue` (see its comment) so two overlapping calls
- * with different `fxHarnesses` target lists can't drop either one's targets.
+ * `opts.fxHarnesses` is given, the harness-level fx/codex cache too. Calls
+ * are serialized through `enqueue` (see its comment) so two overlapping
+ * calls with different `fxHarnesses` target lists can't drop either one's
+ * targets.
  *
- * `opts.fxHarnesses` accepts a thunk (`() => FxHarnessTarget[]`) as well as
+ * `opts.fxHarnesses` accepts a thunk (`() => HarnessTarget[]`) as well as
  * a plain array — `runRefresh` resolves it only once its turn in the queue
  * actually starts, so a target list built from a live DB read (as
  * `refreshAllModels`'s `discoveryTargets` is) reflects the harness set at
@@ -747,37 +884,65 @@ export function refreshDiscoveredModels(opts?: { fxHarnesses?: FxHarnessTargetsO
   return enqueue(() => runRefresh(opts));
 }
 
-async function runRefreshFxHarnessModels(target: FxHarnessTarget): Promise<DiscoveredModel[]> {
+/**
+ * Probes one harness target (fx or codex, per `target.kind`) and updates
+ * both the per-harness cache and — when the target is indistinguishable
+ * from the kind-level built-in probe — the kind-level cache too. Kind-neutral
+ * successor to the fx-only `runRefreshFxHarnessModels` (code-review finding
+ * #4); the fx-named `refreshFxHarnessModels` export below simply forwards to
+ * this.
+ */
+async function runRefreshHarnessTarget(target: HarnessTarget): Promise<DiscoveredModel[]> {
+  const kind = target.kind ?? "fx";
+  const builtinLike = isBuiltinLikeTarget(target);
   let models: DiscoveredModel[];
   try {
-    models = isBuiltinLikeFxTarget(target) ? await discoverFx() : await discoverFx(target.env, target.bin);
+    if (kind === "codex") {
+      models = builtinLike ? await discoverCodex() : await discoverCodex(target.env, target.bin);
+    } else {
+      models = builtinLike ? await discoverFx() : await discoverFx(target.env, target.bin);
+    }
   } catch {
     models = [];
   }
   harnessCache.set(target.harnessId, models);
   // A target indistinguishable from the built-in kind-level probe (empty
-  // env, no distinguishing bin — see `isBuiltinLikeFxTarget`) drift-corrects
+  // env, no distinguishing bin — see `isBuiltinLikeTarget`) drift-corrects
   // the kind-level cache too — otherwise a manual refresh of just the
   // built-in harness would update harnessCache but leave
-  // `getDiscoveredModels("fx")` (still read by every non-harness-aware
+  // `getDiscoveredModels(kind)` (still read by every non-harness-aware
   // caller) stale until the next full sweep. A target with its own `bin`
   // (a distinct binary/account even with an empty env) must NOT drift-
   // correct the shared kind-level cache — that would blend a harness
   // alias's catalog into the built-in's.
-  if (isBuiltinLikeFxTarget(target)) {
-    cache.set("fx", models);
+  if (builtinLike) {
+    cache.set(kind, models);
   }
   return models;
 }
 
 /**
- * Probes exactly one fx harness — through the same serialized queue as
- * `refreshDiscoveredModels` — and returns its discovered models. Never
- * throws: a probe failure resolves to `[]`, the same contract every other
- * discoverer in this module already follows.
+ * Probes exactly one harness (fx or codex, per `target.kind`) — through the
+ * same serialized queue as `refreshDiscoveredModels` — and returns its
+ * discovered models. Never throws: a probe failure resolves to `[]`, the
+ * same contract every other discoverer in this module already follows.
+ * Kind-neutral name introduced alongside `HarnessTarget` (code-review
+ * finding #4); `refreshFxHarnessModels` below is the pre-codex fx-only name,
+ * kept as a thin forwarding export.
+ */
+export function refreshHarnessTarget(target: HarnessTarget): Promise<DiscoveredModel[]> {
+  return enqueue(() => runRefreshHarnessTarget(target));
+}
+
+/**
+ * Pre-codex name for `refreshHarnessTarget`, kept exported (per code-review
+ * finding #4) because it's imported by name elsewhere — e.g.
+ * `agent-discovery.test.ts`. Forwards verbatim; `target.kind` still defaults
+ * to `"fx"` when omitted, so every existing call site behaves identically.
+ * Prefer `refreshHarnessTarget` in new code — it works for both kinds.
  */
 export function refreshFxHarnessModels(target: FxHarnessTarget): Promise<DiscoveredModel[]> {
-  return enqueue(() => runRefreshFxHarnessModels(target));
+  return refreshHarnessTarget(target);
 }
 
 async function runRefreshKind(kind: AgentKind): Promise<void> {
@@ -810,19 +975,20 @@ async function runRefreshKind(kind: AgentKind): Promise<void> {
  * Refreshes exactly one agent kind's kind-level cache — cheaper than the
  * five-kind `refreshDiscoveredModels` sweep when only one harness's
  * availability/config changed (see model-discovery.ts's
- * `refreshHarnessModels`, which routes every non-fx harness edit here
- * instead of a full sweep). Runs through the same serialized queue as
- * `refreshDiscoveredModels`/`refreshFxHarnessModels` so it can't race a
- * concurrent full sweep or per-harness fx probe.
+ * `refreshHarnessModels`, which routes every non-fx/non-codex harness edit
+ * here instead of a full sweep). Runs through the same serialized queue as
+ * `refreshDiscoveredModels`/`refreshHarnessTarget` so it can't race a
+ * concurrent full sweep or per-harness probe.
  *
- * `kind: "fx"` only refreshes the kind-level "fx" entry (the built-in
- * account's catalog, as exposed by `getDiscoveredModels("fx")` and the
- * byte-compatible `GET /agent-models` endpoint) — it never touches any
- * per-harness cache entry. fx's own harness-scoped catalogs are always
- * refreshed through `refreshFxHarnessModels` instead (model-discovery.ts's
- * `refreshHarnessModels` routes every fx harness, built-in or alias, there
- * rather than here), since fx's catalog varies per harness while every
- * other kind's is shared.
+ * `kind: "fx"` / `kind: "codex"` only refresh the kind-level entry for that
+ * kind (the built-in account's catalog, as exposed by
+ * `getDiscoveredModels(kind)` and the byte-compatible `GET /agent-models`
+ * endpoint) — neither ever touches a per-harness cache entry. fx's and
+ * codex's own harness-scoped catalogs are always refreshed through
+ * `refreshHarnessTarget` instead (model-discovery.ts's
+ * `refreshHarnessModels` routes every fx or codex harness, built-in or
+ * alias, there rather than here), since those two kinds' catalogs vary per
+ * harness while every other kind's is shared.
  */
 export function refreshKindModels(kind: AgentKind): Promise<void> {
   return enqueue(() => runRefreshKind(kind));
@@ -843,17 +1009,37 @@ export function pruneHarnessDiscovery(harnessId: string): void {
 }
 
 /**
- * Clears both caches, the serialization chain, and the `ready` flag. Tests
- * that assert on cache contents or `isDiscoveryReady()` call this first so
- * module-level state from an earlier test in the same file can't leak in.
+ * Test seam for `discoverCodex`'s probe budget — `null` restores the 5s
+ * default, any other value overrides it. Read fresh at the start of every
+ * `discoverCodex` call (`codexProbeTimeoutMs`), so a test can drive the
+ * timeout path (code-review finding #2) in well under a second instead of
+ * eating the real 5s budget.
+ */
+function setCodexProbeTimeoutMs(ms: number | null): void {
+  codexProbeTimeoutMs = ms ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS;
+}
+
+/**
+ * Clears both caches, the serialization chain, the `ready` flag, and the
+ * codex probe-timeout override. Tests that assert on cache contents or
+ * `isDiscoveryReady()` call this first so module-level state from an earlier
+ * test in the same file can't leak in — including a `setCodexProbeTimeoutMs`
+ * override a prior test forgot to restore.
  */
 function resetForTests(): void {
   cache.clear();
   harnessCache.clear();
   chain = Promise.resolve();
   ready = false;
+  codexProbeTimeoutMs = DEFAULT_CODEX_PROBE_TIMEOUT_MS;
 }
 
-// Exposed for tests that want to feed in synthetic CLI output, and to reset
-// module-level state between tests.
-export const __testing = { parseCodexModelList, parseCursorModels, parseFxModels, resetForTests };
+// Exposed for tests that want to feed in synthetic CLI output, drive the
+// codex probe-timeout path, and reset module-level state between tests.
+export const __testing = {
+  parseCodexModelList,
+  parseCursorModels,
+  parseFxModels,
+  resetForTests,
+  setCodexProbeTimeoutMs,
+};

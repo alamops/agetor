@@ -268,11 +268,15 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
           agentCache.current[a].model = m;
         }
         if (e) {
-          const supported = supportedEfforts(
-            a,
-            agentCache.current[a].model,
-            discoveredEffortsFor(agentModels[a], agentCache.current[a].model),
-          );
+          // No discovered-efforts argument here: this seed effect runs once
+          // on mount with `[]` deps, before harness discovery has resolved,
+          // so `agentModels`/`harnessModels` are still empty at this point
+          // and `discoveredEffortsFor` would always read back `null` —
+          // effectively dead. Validate against the curated table only; the
+          // render-path `efforts` below (keyed on `effortsKey`, which reacts
+          // to `agentModels`/`harnessModels` updates) is the authoritative
+          // check once discovery actually lands.
+          const supported = supportedEfforts(a, agentCache.current[a].model);
           if (supported.some((x) => x.id === e)) {
             agentCache.current[a].effort = e;
           } else if (supported.length === 0) {
@@ -349,8 +353,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   // curated table — see `supportedEfforts`'s third argument. Unlike
   // RunPanel's task-details cascade, there's no prior intent to retain here
   // (a new task doesn't exist yet), so this uses the discovered-wins set
-  // strictly.
-  const efforts = supportedEfforts(kind, model, discoveredEffortsFor(harnessModels[agent] ?? agentModels[kind], model));
+  // strictly. Reads from `models` (the merged rows just above), not the raw
+  // `harnessModels`/`agentModels` maps, so a logged-out harness's discovery
+  // is distrusted here the same way `mergeModelOptions` rule 7 distrusts it
+  // for the Model picker — rule 8 stays a single source.
+  const efforts = supportedEfforts(kind, model, discoveredEffortsFor(models, model));
   const effortsKey = efforts.map((o) => o.id).join(",");
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(model);
   const fastAvailable = kind === "cursor" && cursorModelSupportsFast(model, effort);

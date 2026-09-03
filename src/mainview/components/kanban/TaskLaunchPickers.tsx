@@ -122,10 +122,24 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
           seedMode && supportedModes(nextKind, resolvedModel).some((m) => m.id === seedMode)
             ? seedMode
             : initialMode(nextKind);
+        // Mirror the `models` memo below exactly (curated/discovered/scoped/
+        // loggedIn inputs) rather than reading the raw discovered list, so
+        // effort discovery goes through the same rule-7 logged-out distrust
+        // the Model picker gets — rule 8 stays a single source.
+        const nextLoggedIn = payload.statuses.find((a) => a.harnessId === nextAgent)?.loggedIn ?? null;
+        const nextDiscovered = (harnessModelPayload.byHarness[nextAgent] ?? models[nextKind] ?? [])
+          .filter((m) => nextKind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id));
+        const nextModelRows = mergeModelOptions({
+          curated: AGENT_OPTIONS[nextKind].models,
+          discovered: nextDiscovered,
+          selected: resolvedModel,
+          scoped: CATALOG_SCOPED_KINDS.has(nextKind),
+          loggedIn: nextLoggedIn,
+        });
         const supportedEff = supportedEfforts(
           nextKind,
           resolvedModel,
-          discoveredEffortsFor(harnessModelPayload.byHarness[nextAgent] ?? models[nextKind], resolvedModel),
+          discoveredEffortsFor(nextModelRows, resolvedModel),
         );
         const resolvedEffort =
           seedEffort && supportedEff.some((e) => e.id === seedEffort)
@@ -163,8 +177,10 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
     });
   }, [staticModels, harnessModels, agentModels, agent, kind, model, selectedStatus?.loggedIn]);
   // Discovered-wins, no retain logic — mirrors NewTaskForm: there's no prior
-  // intent to preserve for a task that doesn't exist yet.
-  const efforts = supportedEfforts(kind, model, discoveredEffortsFor(harnessModels[agent] ?? agentModels[kind], model));
+  // intent to preserve for a task that doesn't exist yet. Reads from `models`
+  // (the merged rows above), not the raw `harnessModels`/`agentModels` maps,
+  // so a logged-out harness's discovery is distrusted here too (rule 7).
+  const efforts = supportedEfforts(kind, model, discoveredEffortsFor(models, model));
   const effortsKey = efforts.map((o) => o.id).join(",");
 
   useEffect(() => {

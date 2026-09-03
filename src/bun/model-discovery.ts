@@ -2,14 +2,14 @@ import { harnesses } from "./db.ts";
 import { harnessEnv, resolveBin } from "./agents.ts";
 import {
   refreshDiscoveredModels,
-  refreshFxHarnessModels,
+  refreshHarnessTarget,
   refreshKindModels,
   pruneHarnessDiscovery,
   getDiscoveredModels,
   getHarnessDiscoveredModels,
   isDiscoveryReady,
   type DiscoveredModel,
-  type FxHarnessTarget,
+  type HarnessTarget,
 } from "./agent-discovery.ts";
 import { broadcastAppEvent } from "./quit-guard.ts";
 import type { AgentKind, HarnessStatus } from "../shared/types.ts";
@@ -40,22 +40,27 @@ const DEBOUNCE_MS = 500;
 const DEFAULT_PERIODIC_MS = 15 * 60_000;
 
 /**
- * Every *enabled* fx harness, as an `FxHarnessTarget` (its own `harnessEnv`
- * and `resolveBin` — so an additional-account `fx-2`-style harness is probed
- * under its own `HOME` override rather than agetor's process env, *and* a
- * harness with its own configured `bin` (a second fx install, say) is probed
- * against that binary rather than the process-wide `AGETOR_FX_BIN ?? "fx"`
- * default — `resolveBin` is the exact same resolver `agents.ts` uses for
- * every real fx spawn, so discovery can never target a different binary than
- * the one a run would actually launch). Disabled harnesses are skipped —
- * they're hidden from every picker, so probing them would just burn a
- * ~0.3-0.9s spawn for a catalog nothing renders.
+ * Every *enabled* fx or codex harness, as a `HarnessTarget` (its own
+ * `harnessEnv` and `resolveBin` — so an additional-account harness (fx's
+ * `fx-2`-style alias, or a second codex harness with its own `home`) is
+ * probed under its own env override rather than agetor's process env, *and*
+ * a harness with its own configured `bin` (a second install of that CLI) is
+ * probed against that binary rather than the process-wide
+ * `AGETOR_<KIND>_BIN ?? "<kind>"` default — `resolveBin` is the exact same
+ * resolver `agents.ts` uses for every real spawn of that kind, so discovery
+ * can never target a different binary than the one a run would actually
+ * launch). Disabled harnesses are skipped — they're hidden from every
+ * picker, so probing them would just burn a spawn for a catalog nothing
+ * renders. Both kinds joined this per-harness path together historically fx
+ * first, codex added by code-review finding #4 on the GPT-6 Astra / codex
+ * app-server discovery landing (codex's catalog is account-scoped exactly
+ * like fx's — see `discoverCodex`'s doc comment in agent-discovery.ts).
  */
-function discoveryTargets(): FxHarnessTarget[] {
+function discoveryTargets(): HarnessTarget[] {
   return harnesses
     .list()
-    .filter((h) => h.enabled !== false && h.kind === "fx")
-    .map((h) => ({ harnessId: h.id, env: harnessEnv(h), bin: resolveBin(h) }));
+    .filter((h) => h.enabled !== false && (h.kind === "fx" || h.kind === "codex"))
+    .map((h) => ({ harnessId: h.id, kind: h.kind as "fx" | "codex", env: harnessEnv(h), bin: resolveBin(h) }));
 }
 
 /**
@@ -80,7 +85,7 @@ function snapshotKey(models: DiscoveredModel[]): string {
 }
 
 function modelsForHarness(harnessId: string, kind: AgentKind): DiscoveredModel[] {
-  return kind === "fx" ? getHarnessDiscoveredModels(harnessId) : getDiscoveredModels(kind);
+  return kind === "fx" || kind === "codex" ? getHarnessDiscoveredModels(harnessId) : getDiscoveredModels(kind);
 }
 
 /**
@@ -114,8 +119,8 @@ function publishIfChanged(): void {
 }
 
 /**
- * Full sweep: every kind's built-in discoverer plus every enabled fx
- * harness's own account-scoped catalog. Broadcasts `agent_models_changed`
+ * Full sweep: every kind's built-in discoverer plus every enabled fx or
+ * codex harness's own account-scoped catalog. Broadcasts `agent_models_changed`
  * for whichever harnesses' lists changed. Never throws — this is called
  * fire-and-forget (`void refreshAllModels()`) from index.ts/headless.ts at
  * boot and from the periodic timer, with no caller left to observe a
@@ -141,9 +146,10 @@ export async function refreshAllModels(): Promise<void> {
 /**
  * Refreshes exactly one harness — kind-targeted, not a five-kind sweep:
  * an unknown/deleted harness id does nothing at all (there's nothing to
- * refresh and no kind to resolve it to); fx probes that harness's own
- * account-scoped catalog directly (`refreshFxHarnessModels`, keyed by
- * harness id, since fx's catalog varies per harness); every other kind
+ * refresh and no kind to resolve it to); fx and codex each probe that
+ * harness's own account-scoped catalog directly (`refreshHarnessTarget`,
+ * keyed by harness id, since both kinds' catalogs vary per harness — codex
+ * joined fx on this path via code-review finding #4); every other kind
  * refreshes just that kind's shared cache (`refreshKindModels` — kind-level
  * lists are shared across every harness of that kind, so there's nothing
  * harness-specific left to probe beyond the kind itself). Publishes at most
@@ -155,8 +161,13 @@ export async function refreshHarnessModels(harnessId: string): Promise<void> {
   const harness = harnesses.get(harnessId);
   if (!harness) return;
   try {
-    if (harness.kind === "fx") {
-      await refreshFxHarnessModels({ harnessId: harness.id, env: harnessEnv(harness), bin: resolveBin(harness) });
+    if (harness.kind === "fx" || harness.kind === "codex") {
+      await refreshHarnessTarget({
+        harnessId: harness.id,
+        kind: harness.kind,
+        env: harnessEnv(harness),
+        bin: resolveBin(harness),
+      });
     } else {
       await refreshKindModels(harness.kind);
     }
@@ -194,11 +205,11 @@ export function noteHarnessRemoved(harnessId: string): void {
 
 /**
  * `GET /agent-models/harnesses`'s payload: one key per *enabled* harness
- * (all kinds) — fx harnesses get their own per-harness catalog, every other
- * kind maps to its shared kind-level list, so callers have a single lookup
- * regardless of kind. `ready` mirrors `isDiscoveryReady()` — false until the
- * first full sweep has settled, so the webview's boot-race retry can tell
- * "hasn't run yet" apart from "ran and found nothing".
+ * (all kinds) — fx and codex harnesses get their own per-harness catalog,
+ * every other kind maps to its shared kind-level list, so callers have a
+ * single lookup regardless of kind. `ready` mirrors `isDiscoveryReady()` —
+ * false until the first full sweep has settled, so the webview's boot-race
+ * retry can tell "hasn't run yet" apart from "ran and found nothing".
  */
 export function getHarnessModelMap(): { ready: boolean; byHarness: Record<string, DiscoveredModel[]> } {
   const byHarness: Record<string, DiscoveredModel[]> = {};

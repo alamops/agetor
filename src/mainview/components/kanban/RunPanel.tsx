@@ -5274,6 +5274,24 @@ function TaskDetails({
     }
   };
 
+  // Memoized so the merge (curated ∪ discovered, rule 1–7) only re-runs when
+  // one of its actual inputs changes, not on every streamed-event render.
+  // Declared before the effort memos below because they read from it —
+  // per rule 8/rule 7, effort discovery must go through the same
+  // logged-out-distrusting merge the Model picker uses, not the raw
+  // discovered list.
+  const modelOptions = useMemo(
+    () => mergedModels(
+      kind,
+      task.agent,
+      agentModels,
+      harnessModels,
+      task.model ?? DEFAULT_MODEL[kind],
+      selectedStatus?.loggedIn ?? null,
+    ),
+    [kind, task.agent, agentModels, harnessModels, task.model, selectedStatus?.loggedIn],
+  );
+
   // Effort is per (agent, model) — e.g. xhigh isn't valid for Sonnet 4.6,
   // and Haiku 4.5 doesn't accept the effort param at all. When the user picks
   // a model that no longer supports the saved effort, drop it back to the
@@ -5288,9 +5306,14 @@ function TaskDetails({
   // `none`, which Codex's own `model/list` never lists even though the API
   // accepts it) must not silently PATCH away an effort the user already
   // chose. Only an effort neither source supports triggers the fallback.
+  //
+  // Reads from `modelOptions` (the merged rows), not the raw
+  // `harnessModels`/`agentModels` maps — `mergeModelOptions` already applies
+  // rule 7 (a logged-out harness's discovered catalog is untrustworthy), and
+  // this is the single source that distrust must flow through.
   const discoveredEffortsForTask = useMemo(
-    () => discoveredEffortsFor(harnessModels[task.agent] ?? agentModels[kind], task.model),
-    [harnessModels, agentModels, task.agent, kind, task.model],
+    () => discoveredEffortsFor(modelOptions, task.model),
+    [modelOptions, task.model],
   );
   const supportedEffortsForModel = useMemo(
     () => supportedEfforts(kind, task.model, discoveredEffortsForTask),
@@ -5306,27 +5329,41 @@ function TaskDetails({
   );
   // Mirrors `mergeModelOptions` rule 6: a task's current effort can be
   // retained (kept valid by the cascade above) without being one the picker
-  // would otherwise offer — e.g. a discovery refresh that omits `none`. Add
-  // it back as an explicit unlisted row so the select never renders blank.
+  // would otherwise offer — e.g. a discovery refresh that omits `none`.
+  // Built in `EFFORT_OPTIONS` order (highest→lowest) rather than appended
+  // last, so a retained `ultra` still sorts above `Low` instead of trailing
+  // the whole list; the "kept as you chose it" hint names the harness the
+  // task is actually running on instead of hardcoding "Codex".
   const effortSelectOptions = useMemo(() => {
-    if (
-      task.effort
-      && !allowedEfforts.has(task.effort)
-      && retainable.has(task.effort)
-    ) {
-      const label = EFFORT_OPTIONS.find((o) => o.id === task.effort)?.label ?? task.effort;
+    const harnessLabel = harnesses.find((h) => h.id === task.agent)?.label ?? kind;
+    const known = EFFORT_OPTIONS.some((o) => o.id === task.effort);
+    const options = EFFORT_OPTIONS
+      .filter((o) => allowedEfforts.has(o.id) || (o.id === task.effort && retainable.has(o.id)))
+      .map((o) => (
+        allowedEfforts.has(o.id)
+          ? o
+          : {
+              ...o,
+              unlisted: true,
+              hint: `Not in ${harnessLabel}'s discovered effort menu — kept as you chose it.`,
+            }
+      ));
+    // `task.effort` may be an id with no `EFFORT_OPTIONS` row at all (an
+    // unknown/future effort id) — the filter above can't represent it, so
+    // fall back to a raw row labelled by the id itself.
+    if (task.effort && !known && retainable.has(task.effort)) {
       return [
-        ...supportedEffortsForModel,
+        ...options,
         {
           id: task.effort,
-          label,
-          hint: "Not in this account's Codex menu — kept as you chose it.",
+          label: task.effort,
+          hint: `Not in ${harnessLabel}'s discovered effort menu — kept as you chose it.`,
           unlisted: true,
         },
       ];
     }
-    return supportedEffortsForModel;
-  }, [supportedEffortsForModel, allowedEfforts, retainable, task.effort]);
+    return options;
+  }, [allowedEfforts, retainable, task.effort, harnesses, task.agent, kind]);
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
   const fastAvailable = kind === "cursor" && cursorModelSupportsFast(task.model, task.effort);
   useEffect(() => {
@@ -5360,10 +5397,15 @@ function TaskDetails({
     const nextKind = harnessKindOf(nextId, harnesses);
     const nextMode = AGENT_OPTIONS[nextKind].modes[0]?.id ?? "auto";
     const nextModel = DEFAULT_MODEL[nextKind];
+    // Same merged-rows source `modelOptions` reads from (rule 7's
+    // logged-out distrust), but for the harness being switched TO rather
+    // than the task's current one.
+    const nextLoggedIn = agents.find((a) => a.harnessId === nextId)?.loggedIn ?? null;
+    const nextModelRows = mergedModels(nextKind, nextId, agentModels, harnessModels, nextModel, nextLoggedIn);
     const nextEfforts = supportedEfforts(
       nextKind,
       nextModel,
-      discoveredEffortsFor(harnessModels[nextId] ?? agentModels[nextKind], nextModel),
+      discoveredEffortsFor(nextModelRows, nextModel),
     );
     const nextEffort = nextEfforts.length === 0
       ? null
@@ -5372,20 +5414,6 @@ function TaskDetails({
         : nextEfforts[0]!.id;
     void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, fast: false, maxMode: false });
   };
-
-  // Memoized so the merge (curated ∪ discovered, rule 1–7) only re-runs when
-  // one of its actual inputs changes, not on every streamed-event render.
-  const modelOptions = useMemo(
-    () => mergedModels(
-      kind,
-      task.agent,
-      agentModels,
-      harnessModels,
-      task.model ?? DEFAULT_MODEL[kind],
-      selectedStatus?.loggedIn ?? null,
-    ),
-    [kind, task.agent, agentModels, harnessModels, task.model, selectedStatus?.loggedIn],
-  );
 
   return (
     <details className="border-b border-border/60 px-3 py-2 text-xs">

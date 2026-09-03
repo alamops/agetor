@@ -286,17 +286,22 @@ async function wizard(
   // prompt below read the same discovered list.
   const catalog: DiscoveredModel[] = (agent && harnessModels.byHarness[agent]) || discovered[kind] || [];
 
+  // Hoisted so both the model picker and the effort prompt below read the
+  // same merged rows — computed unconditionally (not just inside the
+  // `!model` branch) since `--model` can be passed without `--effort`, and
+  // the effort prompt still needs rule-7/8-honoring `efforts` per model.
+  const modelOptions = mergeModelOptions({
+    curated: AGENT_OPTIONS[kind].models,
+    discovered: catalog,
+    selected: o.model ?? prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind],
+    scoped: CATALOG_SCOPED_KINDS.has(kind),
+    loggedIn: statuses.find((s) => s.harnessId === agent)?.loggedIn ?? null,
+  });
+
   let model = o.model;
   if (!model) {
     const initial = prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind];
-    const options = mergeModelOptions({
-      curated: AGENT_OPTIONS[kind].models,
-      discovered: catalog,
-      selected: initial,
-      scoped: CATALOG_SCOPED_KINDS.has(kind),
-      loggedIn: statuses.find((s) => s.harnessId === agent)?.loggedIn ?? null,
-    });
-    const picked = await pickOption("Model", options, initial);
+    const picked = await pickOption("Model", modelOptions, initial);
     if (picked === null) return cancelled();
     model = picked;
   }
@@ -308,7 +313,12 @@ async function wizard(
   }
   let effort = o.effort;
   if (!effort) {
-    const efforts = supportedEfforts(kind, model ?? null, discoveredEffortsFor(catalog, model));
+    // Efforts must come from the merged rows, never the raw discovered
+    // catalog — `modelOptions` already honours rule 7 (a logged-out
+    // harness's discovered catalog is untrusted) and rule 8 (`efforts` is
+    // computed per merged row), so reading `catalog` directly here would
+    // bypass both.
+    const efforts = supportedEfforts(kind, model ?? null, discoveredEffortsFor(modelOptions, model));
     if (efforts.length > 0) {
       const picked = await pickOption("Effort", efforts, prefs[`lastEffort:${kind}`] ?? DEFAULT_EFFORT[kind]);
       if (picked === null) return cancelled();

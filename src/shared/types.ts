@@ -1258,16 +1258,6 @@ export interface AgentOption {
    * 0.0.6.
    */
   catalogOnly?: boolean;
-  /**
-   * Per-model reasoning-effort ids the harness's CLI itself reported for
-   * this model (bare `EFFORT_OPTIONS` ids). Set only by `mergeModelOptions`
-   * (`src/shared/model-options.ts`) from a CLI-discovered catalog entry —
-   * never present on a purely curated row. Pickers pass this as
-   * `supportedEfforts`'s third argument (`discoveredEfforts`) so the
-   * discovered set wins over the static `MODEL_EFFORT_SUPPORT` table. Codex
-   * is the only kind reporting it today, via `codex app-server model/list`.
-   */
-  efforts?: readonly string[];
 }
 
 export interface AgentOptions {
@@ -1900,7 +1890,7 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
  * Returned in the EFFORT_OPTIONS order (highest → lowest).
  *
  * `discoveredEfforts` (optional third arg) is the CLI's own reported effort
- * set for this exact model, when a caller has one (see `AgentOption.efforts`
+ * set for this exact model, when a caller has one (see `ModelOption.efforts`
  * and `discoveredEffortsFor` in `src/shared/model-options.ts`). Precedence:
  * a non-empty `discoveredEfforts` wins outright — the result is
  * `EFFORT_OPTIONS` filtered to it (canonical highest→lowest order) — unless
@@ -1919,12 +1909,17 @@ export function supportedEfforts(
   model: string | null,
   discoveredEfforts?: readonly string[] | null,
 ): AgentOption[] {
+  // Cursor encodes effort in the model id itself (`cursorModelArg`), so an
+  // unknown cursor id has no way to receive an effort at all — this guard
+  // must run BEFORE the discovered-effort short-circuit below, or a
+  // non-empty `discoveredEfforts` for an unknown cursor id would defeat it
+  // and offer effort choices that would silently never reach the CLI.
+  if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor)) return [];
   if (discoveredEfforts && discoveredEfforts.length > 0) {
     const discoveredAllowed = new Set(discoveredEfforts);
     const fromDiscovery = EFFORT_OPTIONS.filter((o) => discoveredAllowed.has(o.id));
     if (fromDiscovery.length > 0) return fromDiscovery;
   }
-  if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor)) return [];
   const key = model ?? DEFAULT_MODEL[agent];
   const ids =
     MODEL_EFFORT_SUPPORT[agent][key]
