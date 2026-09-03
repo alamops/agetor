@@ -268,3 +268,26 @@ The three inline datalist comments were unified to the one-line
 cross-reference. Tests: the unit-test docstring lists the search/filter boxes;
 `e2e/identifier-inputs.spec.ts` gains an assertion on the Kanban free-text
 box (six e2e tests in the file now). Total spread sites: 36.
+
+## 12. Final verification (Phase 8, after wave 4 — 2026-09-03)
+
+| Layer | Command | Result |
+| --- | --- | --- |
+| Typecheck | `bun run typecheck` | exit 0 |
+| Unit / integration | `bun test` | 4003 passed, 3 skipped, 0 failed (203 files) |
+| E2E | `bun node_modules/@playwright/test/cli.js test` | 66 passed, 1 failed, 0 skipped |
+| New spec | `… test e2e/identifier-inputs.spec.ts` | 6 / 6 passed |
+
+The single e2e failure — `unread-indicator.spec.ts` "board dot appears … stays
+clear on close" — passed on a same-file retry. Its assertion targets
+`locator("aside").last()` right after Close and expects `translate-x-full`;
+when the RunPanel unmounts before the assertion samples, `.last()` resolves to
+the New Task `<aside>` (`w-80` class string in the error). A close-animation
+race unrelated to input attributes. The three failures from the first pass
+(font-size port pre-flight, fx-interactions, resolve-conflicts) all passed in
+this run — environmental / flaky, not caused by the change.
+
+Residual manual checks (not automatable in Chromium): in the packaged app,
+type a project or branch name into the pickers and confirm no correction /
+capitalization; open Settings → Git host tokens and confirm the detected-hosts
+dropdown still appears (then the datalist carve-out can be removed).
