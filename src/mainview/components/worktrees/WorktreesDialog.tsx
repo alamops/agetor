@@ -10,6 +10,7 @@ import { MultiSearchSelect } from "@/components/ui/multi-search-select";
 import { Select } from "@/components/ui/select";
 import { useConfirm } from "@/components/ui/confirm";
 import { abbreviateHome } from "@/lib/utils";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import {
   COLUMNS,
   type ColumnId,
@@ -399,6 +400,7 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
         <div className="relative min-w-[200px] flex-1">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search title, branch, project, path…"

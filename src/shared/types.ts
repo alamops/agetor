@@ -167,11 +167,12 @@ export interface Harness {
    *  the home-derived block. Power-user surface. */
   env: Record<string, string>;
   /** Soft-delete flag. Disabled harnesses are hidden from the New Task
-   *  picker and the default-harness selector, but the row stays in the DB
-   *  so historical `tasks.agent = <id>` references keep resolving. The
-   *  orchestrator refuses to start new runs on a disabled harness;
-   *  in-flight runs are unaffected. Built-ins are toggleable too — this
-   *  is the one carve-out from the built-in immutability rule. */
+   *  picker, the default-harness selector, and the window topbar, but the
+   *  row stays in the DB so historical `tasks.agent = <id>` references
+   *  keep resolving. The orchestrator refuses to start new runs on a
+   *  disabled harness; in-flight runs are unaffected. Built-ins are
+   *  toggleable too — this is the one carve-out from the built-in
+   *  immutability rule. */
   enabled: boolean;
 }
 
@@ -213,14 +214,16 @@ export interface HarnessStatus {
   /**
    * Login state, when the kind's probe can determine it cheaply and without
    * side effects — today only fx (`fx status --json` reports `auth`). Strictly
-   * fail-open: `false` ONLY when the probe positively reported "missing";
-   * `true` for any other reported value; `null` when the kind has no login
-   * probe, the probe failed, or its output wasn't parseable — `null` must
-   * never block a run.
+   * fail-open: `false` ONLY when the probe positively reported `auth:
+   * "missing"`, or (fx 0.0.7+) an expired non-refreshable login
+   * (`auth_expired === true && auth_refreshable === false`); `true` for any
+   * other reported value; `null` when the kind has no login probe, the probe
+   * failed, or its output wasn't parseable — `null` must never block a run.
    */
   loggedIn: boolean | null;
-  /** The CLI's own login guidance (verbatim, e.g. fx's `auth_help`) when
-   *  `loggedIn === false`; otherwise null. */
+  /** Login guidance when `loggedIn === false`: fx's own `auth_help` when the
+   *  probe supplies one, else one of agetor's two synthesized fallback hints
+   *  (missing credentials vs. an expired login); otherwise null. */
   authHelp: string | null;
 }
 
@@ -1289,20 +1292,33 @@ export interface CursorModelSpec {
  */
 export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // Default to Opus 5 — the most-capable Opus, priced identically to Opus 4.8
-  // ($5/$25 per MTok). Mythos 5 and Fable 5 sit above it in the picker but
+  // ($5/$25 per MTok). Mythos 5.1 / 5 and Fable 5.1 / 5 sit above it in the picker but
   // cost 2x the usage, so the default stays on the most-capable non-premium
   // tier.
   "claude-code": "opus-5",
-  "codex": "gpt-5.6-sol",
+  // Owner decision 2026-09-03: default to GPT-6 Astra, OpenAI's most capable
+  // model (released 2026-09-03). Live spike the same day on a ChatGPT-plan
+  // account: codex 0.147.0 and 0.153.0 both get HTTP 400 "The 'gpt-6-astra'
+  // model is not supported when using Codex with a ChatGPT account." during
+  // OpenAI's phased rollout (Trusted Access Program first, ChatGPT plans +
+  // API "in the coming days"). The picker hint carries the gate, and
+  // GPT-5.6 Sol (the previous default) stays one click away.
+  "codex": "gpt-6-astra",
   // Grok 4.6 (high effort via DEFAULT_EFFORT) — replaces cursor-agent's own
   // "auto" as agetor's default so new tasks pin an explicit flagship model.
   "cursor": "cursor-grok-4.6",
-  // gemini-3-pro-preview is the current flagship per google-gemini/gemini-cli
-  // docs (verified 2026-08-06). Deliberately NOT the "auto" alias — a spike
-  // showed "auto" internally routes across mixed pro/flash-lite models even
-  // for simple prompts, which fails "always default to the best available
-  // model" (root CLAUDE.md). Pin an explicit flagship instead.
-  "gemini": "gemini-3-pro-preview",
+  // gemini-3.1-pro-preview is Google's current flagship Pro. It replaced
+  // gemini-3-pro-preview (agetor's default until 2026-09), which Google shut
+  // down on 2026-03-09 — ai.google.dev/gemini-api/docs/deprecations names
+  // 3.1 Pro preview as the replacement, and the old id is at best a
+  // server-side alias for it now; migration 049 rewrites tasks still pinned
+  // to the old id. Deliberately NOT the "auto" alias — a spike showed "auto"
+  // internally routes across mixed pro/flash-lite models even for simple
+  // prompts, which fails "always default to the best available model" (root
+  // CLAUDE.md). The CLI's own `pro` alias resolves to 3.1 Pro preview on
+  // accounts with 3.1 preview access (else to 3 Pro preview, or 2.5 Pro with
+  // no preview access at all — gemini-cli 0.58.0 resolveModel, 2026-09-02).
+  "gemini": "gemini-3.1-pro-preview",
   // Owner-chosen default (2026-08-27). fx's own compiled default is still
   // moonshotai/kimi-k3 (verified via empty-HOME `fx status --json` on
   // 0.0.6), but the Vercel AI Gateway catalog is account-scoped — K3 is
@@ -1312,9 +1328,14 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // Gateway ids, passed verbatim. fx is exempt from the "always default to
   // the best available model" rule above: the Gateway bills per token to the
   // user's own account, and flagship tiers (opus-5, sonnet-5, gpt-5.5,
-  // gemini-3.1-pro-preview, kimi-k3) stay one click away in the picker as
-  // catalog-gated rows — offered only when the signed-in account's catalog
-  // actually contains them (see `AgentOption.catalogOnly`).
+  // gemini-3.1-pro-preview, gemini-3.8-flash, kimi-k3) stay one click away
+  // in the picker as catalog-gated rows — offered only when the signed-in
+  // account's catalog actually contains them (see `AgentOption.catalogOnly`).
+  // Re-verified 2026-08-31 on fx 0.0.7: compiled default unchanged
+  // (moonshotai/kimi-k3 via empty-HOME `fx status --json`), zai/glm-5.3-flash
+  // still present in the (grown to 234-id) unauth catalog — the reference
+  // signed-in 158-id account could not be re-checked this pass (expired
+  // login token).
   "fx": "zai/glm-5.3-flash",
 };
 
@@ -1332,6 +1353,8 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
 export const CATALOG_SCOPED_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["fx"]);
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
+  // `ultra` (Codex's automatic-sub-agent-delegation tier) is deliberately
+  // not the default — it burns several times Max's usage per turn.
   "codex": "high",
   // Models with `effortIds` default to High where they expose it (else their
   // first available level — e.g. claude-4.6-sonnet only exposes medium).
@@ -1448,6 +1471,21 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
     },
     fastEfforts: ["xhigh", "high", "medium", "low", "none"],
   },
+  // Ids verified against `cursor-agent models` (2026-09-01); the catalog
+  // exposes no -fast Fable variants (hence no fastEfforts), same shape as
+  // claude-fable-5 below.
+  "claude-fable-5-1": {
+    label: "Fable 5.1",
+    hint: "Anthropic Fable 5.1 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-fable-5-1-max",
+      xhigh: "claude-fable-5-1-xhigh",
+      high: "claude-fable-5-1-high",
+      medium: "claude-fable-5-1-medium",
+      low: "claude-fable-5-1-low",
+    },
+  },
   "claude-fable-5": {
     label: "Fable 5",
     hint: "Anthropic Fable 5 via Cursor.",
@@ -1553,6 +1591,29 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
       none: "gpt-5.6-luna-none",
     },
     fastEfforts: ["max", "xhigh", "high", "medium", "low", "none"],
+  },
+  // Ids verified against `cursor-agent models` (2026-09-02): Gemini 3.8 / 3.7
+  // Flash ship as gemini-3.{8,7}-flash-{low,medium,high} — no minimal tier
+  // (unlike 3.6), no bare id, no -fast variants, no Max Mode. We map the
+  // unsuffixed label to the high tier — agetor's convention, mirroring 3.6;
+  // Cursor's own listing calls it "Gemini 3.8 Flash High" (cosmetic).
+  "gemini-3.8-flash": {
+    label: "Gemini 3.8 Flash",
+    hint: "Google Gemini 3.8 Flash via Cursor.",
+    effortIds: {
+      high: "gemini-3.8-flash-high",
+      medium: "gemini-3.8-flash-medium",
+      low: "gemini-3.8-flash-low",
+    },
+  },
+  "gemini-3.7-flash": {
+    label: "Gemini 3.7 Flash",
+    hint: "Google Gemini 3.7 Flash via Cursor.",
+    effortIds: {
+      high: "gemini-3.7-flash-high",
+      medium: "gemini-3.7-flash-medium",
+      low: "gemini-3.7-flash-low",
+    },
   },
   "gemini-3.6-flash": {
     label: "Gemini 3.6 Flash",
@@ -1717,8 +1778,9 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  * `none` is currently used only by GPT-5.6-family Codex models.
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
+  { id: "ultra", label: "Ultra", hint: "Codex's top tier — maximum reasoning plus automatic delegation to internal sub-agents. Several times Max's usage; Codex-only today." },
   { id: "max", label: "Max thinking", hint: "Absolute maximum reasoning effort. Separate from Cursor Max Mode context." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Mythos 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5.1 / 5 / Mythos 5.1 / 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
@@ -1744,15 +1806,21 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  */
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
-  // effort parameter is API-supported on Fable 5 / Mythos 5 / Opus 5 / 4.8 /
-  // 4.7 / 4.6 / Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is Fable-5-, Mythos-5-,
-  // Opus-, and Sonnet-5-only; Sonnet 4.6 has no xhigh; Haiku 4.5 doesn't
-  // support effort at all). The `/effort` CLI command accepts more
-  // levels but the underlying API request would fail for unsupported pairs,
-  // so we filter at the picker rather than letting the user fire bad runs.
+  // effort parameter is API-supported on Fable 5.1 / 5 / Mythos 5.1 / 5 /
+  // Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is
+  // Fable-, Mythos-, Opus-, and Sonnet-5-only; Sonnet 4.6 has no xhigh;
+  // Haiku 4.5 doesn't support effort at all). The `/effort` CLI command
+  // accepts more levels but the underlying API request would fail for
+  // unsupported pairs, so we filter at the picker rather than letting the
+  // user fire bad runs.
   "claude-code": {
+    // Mythos 5.1 shares Fable 5.1's request surface (same underlying model).
+    "mythos-5.1": ["max", "xhigh", "high", "medium", "low"],
     // Mythos 5 shares Fable 5's request surface (same underlying model).
     "mythos-5": ["max", "xhigh", "high", "medium", "low"],
+    // Fable 5.1 is the Fable 5 successor with the same effort ladder (per
+    // Anthropic's effort docs).
+    "fable-5.1": ["max", "xhigh", "high", "medium", "low"],
     // Fable 5 shares Opus 4.7/4.8's request surface (effort low→max, xhigh).
     "fable-5": ["max", "xhigh", "high", "medium", "low"],
     // Opus 5 supports the full effort ladder incl. xhigh (per claude-api skill).
@@ -1768,13 +1836,29 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "haiku-4.5": [],
   },
   codex: {
-    // Cyber's own model page doesn't enumerate efforts; assume the GPT-5.6
-    // family surface (the set Sol documents). Revisit if codex rejects none/max.
-    "gpt-5.6-cyber": ["max", "xhigh", "high", "medium", "low", "none"],
-    "gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none"],
-    "gpt-5.6-terra": ["max", "xhigh", "high", "medium", "low", "none"],
+    // Evidence (2026-09-03): the OpenAI model page documents Astra as
+    // low/medium/high/xhigh/max with `none` explicitly unsupported, and the
+    // Codex models page adds an Ultra tier (automatic sub-agent delegation)
+    // on top of that. Aeon (the long-horizon Astra variant) is assumed to
+    // share Astra's set. `codex app-server model/list` on 0.147.0 and
+    // 0.153.0 lists `ultra` for Sol and Terra but not for Luna, and lists
+    // `none` for nobody in this account's catalog — yet a live `codex exec`
+    // accepted `none` on both Sol and Luna, and accepted `ultra` even on
+    // Luna despite Codex's own catalog not offering it there; `max` on
+    // gpt-5.5 was rejected with "Supported values are: 'none', 'low',
+    // 'medium', 'high', and 'xhigh'." So the curated `ultra` rows follow
+    // Codex's offering (not the live-acceptance superset), `none` follows
+    // live acceptance, and Cyber mirrors Sol (assumption — Cyber isn't in
+    // this account's catalog at all). Note: discovered efforts (see
+    // `supportedEfforts`'s third argument) override this table whenever the
+    // CLI itself reports a set for the model.
+    "gpt-6-astra": ["ultra", "max", "xhigh", "high", "medium", "low"],
+    "gpt-6-astra-aeon": ["ultra", "max", "xhigh", "high", "medium", "low"],
+    "gpt-5.6-cyber": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-sol": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-terra": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
-    "gpt-5.5": ["xhigh", "high", "medium", "low"],
+    "gpt-5.5": ["xhigh", "high", "medium", "low", "none"],
     "gpt-5": ["xhigh", "high", "medium", "low"],
     "gpt-5-codex": ["xhigh", "high", "medium", "low"],
   },
@@ -1789,9 +1873,10 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // [] for any model key here, which collapses the effort picker in the UI —
   // the same treatment claude-code's haiku-4.5 gets.
   gemini: {
-    "gemini-3-pro-preview": [],
     "gemini-3.1-pro-preview": [],
     "gemini-2.5-pro": [],
+    "gemini-3.8-flash": [],
+    "gemini-3.8-flash-cyber": [],
     "gemini-3.7-flash": [],
     "gemini-3.5-flash": [],
     "gemini-2.5-flash": [],
@@ -1820,6 +1905,7 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "anthropic/claude-sonnet-5": [],
     "openai/gpt-5.5": [],
     "google/gemini-3.1-pro-preview": [],
+    "google/gemini-3.8-flash": [],
     "moonshotai/kimi-k3": [],
   },
 };
@@ -1833,9 +1919,38 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
  * unknown cursor id passes through verbatim, so any effort picked for it
  * would silently never reach the CLI. Those report no efforts instead.
  * Returned in the EFFORT_OPTIONS order (highest → lowest).
+ *
+ * `discoveredEfforts` (optional third arg) is the CLI's own reported effort
+ * set for this exact model, when a caller has one (see `ModelOption.efforts`
+ * and `discoveredEffortsFor` in `src/shared/model-options.ts`). Precedence:
+ * a non-empty `discoveredEfforts` wins outright — the result is
+ * `EFFORT_OPTIONS` filtered to it (canonical highest→lowest order) — unless
+ * none of its ids are known to agetor, in which case we fall through to the
+ * curated table below. `undefined`, `null`, or an empty array behave exactly
+ * like the two-argument call (today's curated-table-only behaviour). The
+ * curated table stays the fallback rather than the source of truth because
+ * discovery is best-effort and account-scoped (a harness may be absent,
+ * unauthenticated, or on an older CLI that can't discover at all): the
+ * curated catalog is what the harness's own UI *offers*, while its API often
+ * *accepts* a superset, so this function only ever narrows what the picker
+ * shows — it never invents an option the harness didn't report.
  */
-export function supportedEfforts(agent: AgentKind, model: string | null): AgentOption[] {
+export function supportedEfforts(
+  agent: AgentKind,
+  model: string | null,
+  discoveredEfforts?: readonly string[] | null,
+): AgentOption[] {
+  // Cursor encodes effort in the model id itself (`cursorModelArg`), so an
+  // unknown cursor id has no way to receive an effort at all — this guard
+  // must run BEFORE the discovered-effort short-circuit below, or a
+  // non-empty `discoveredEfforts` for an unknown cursor id would defeat it
+  // and offer effort choices that would silently never reach the CLI.
   if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor)) return [];
+  if (discoveredEfforts && discoveredEfforts.length > 0) {
+    const discoveredAllowed = new Set(discoveredEfforts);
+    const fromDiscovery = EFFORT_OPTIONS.filter((o) => discoveredAllowed.has(o.id));
+    if (fromDiscovery.length > 0) return fromDiscovery;
+  }
   const key = model ?? DEFAULT_MODEL[agent];
   const ids =
     MODEL_EFFORT_SUPPORT[agent][key]
@@ -1843,6 +1958,34 @@ export function supportedEfforts(agent: AgentKind, model: string | null): AgentO
     ?? [];
   const allowed = new Set(ids);
   return EFFORT_OPTIONS.filter((o) => allowed.has(o.id));
+}
+
+/**
+ * Effort ids a task's CURRENT effort may keep on `model`: the union of the
+ * discovered-wins set (`supportedEfforts` with `discoveredEfforts`) and the
+ * curated set (`supportedEfforts` without it). Consumed only by the
+ * model-change cascades — RunPanel's effort effect and the orchestrator's
+ * `effortFallbackForModelChange` — never by the pickers, which narrow their
+ * rows to the discovered-wins set.
+ *
+ * Why a union: the pickers mirror what the CLI's own menu offers, but a
+ * discovery refresh that omits an id — `none` on GPT-5.6 Sol, which the API
+ * accepts although Codex's `model/list` doesn't list it (live-verified
+ * 2026-09-03) — must not silently PATCH away an effort the user already chose
+ * from the curated table. Only an effort neither source supports cascades to
+ * a fallback. A retained-but-unoffered effort is rendered as an unlisted row
+ * in the effort select (same idea as `mergeModelOptions`' rule 6 for models)
+ * so the control never renders blank.
+ */
+export function retainableEfforts(
+  agent: AgentKind,
+  model: string | null,
+  discoveredEfforts?: readonly string[] | null,
+): ReadonlySet<string> {
+  const ids = new Set<string>();
+  for (const o of supportedEfforts(agent, model, discoveredEfforts)) ids.add(o.id);
+  for (const o of supportedEfforts(agent, model)) ids.add(o.id);
+  return ids;
 }
 
 /**
@@ -1857,7 +2000,9 @@ export function supportedEfforts(agent: AgentKind, model: string | null): AgentO
  */
 const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   "claude-code": {
+    "mythos-5.1": [],
     "mythos-5": [],
+    "fable-5.1": [],
     "fable-5": [],
     "opus-5": [],
     "opus-4.8": [],
@@ -1888,8 +2033,10 @@ export function supportedModes(agent: AgentKind, model: string | null): AgentOpt
 export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   "claude-code": {
     models: [
-      { id: "mythos-5", label: "Mythos 5", hint: "Fable 5's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
-      { id: "fable-5", label: "Fable 5", hint: "Most powerful tier — above Opus. Uses 2x the usage of Opus." },
+      { id: "mythos-5.1", label: "Mythos 5.1", hint: "Fable 5.1's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
+      { id: "mythos-5", label: "Mythos 5", hint: "Prior Mythos release — Fable 5's twin; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
+      { id: "fable-5.1", label: "Fable 5.1", hint: "Most capable widely released model — above Opus. Uses 2x the usage of Opus." },
+      { id: "fable-5", label: "Fable 5", hint: "Prior Fable release — above Opus. Uses 2x the usage of Opus." },
       { id: "opus-5", label: "Opus 5", hint: "Most capable Opus; same usage cost as 4.8." },
       { id: "opus-4.8", label: "Opus 4.8", hint: "Prior Opus flagship." },
       { id: "opus-4.7", label: "Opus 4.7", hint: "Prior flagship; same effort range as 4.8." },
@@ -1913,11 +2060,13 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
+      { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "Recommended default — OpenAI's most capable model. Rolling out in phases; rejected on ChatGPT plans until OpenAI enables it for your account." },
+      { id: "gpt-6-astra-aeon", label: "GPT-6 Astra Aeon", hint: "Long-horizon Astra variant for multi-day tasks. Unverified id — not on OpenAI's model page yet; same rollout gate as Astra." },
       { id: "gpt-5.6-cyber", label: "GPT-5.6 Cyber", hint: "Cybersecurity-tuned GPT-5.6. Requires OpenAI Daybreak approval on an API-key account; rejected on ChatGPT plans." },
-      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Recommended default — flagship GPT-5.6 capability." },
+      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Previous recommended default — flagship GPT-5.6; works on ChatGPT plans." },
       { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model for strong performance at lower cost." },
       { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model for high-volume workloads." },
-      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous recommended default — works on ChatGPT plans." },
+      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous-generation model — works on ChatGPT plans." },
       { id: "gpt-5-codex", label: "GPT-5 Codex", hint: "Requires an API-key account; rejected on ChatGPT plans." },
       { id: "gpt-5", label: "GPT-5", hint: "Requires an API-key account; rejected on ChatGPT plans." },
     ],
@@ -1941,13 +2090,25 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   gemini: {
     // Pro tier first, then Flash tier; newest first within each tier.
+    // gemini-3-pro-preview (the default until 2026-09) was shut down by
+    // Google on 2026-03-09 and is retired here; migration 049 rewrites
+    // tasks still pinned to it to its successor, 3.1 Pro preview.
     models: [
-      { id: "gemini-3-pro-preview", label: "Gemini 3 Pro (preview)", hint: "Recommended default — current flagship." },
-      { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", hint: "Newer preview tier." },
+      { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", hint: "Recommended default — current flagship; Google's successor to the retired 3 Pro preview." },
       { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", hint: "Prior stable flagship." },
-      { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", hint: "Latest and most capable Flash — strong on coding and agentic work at Flash cost." },
-      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost — prior Flash generation." },
-      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, earlier generation." },
+      { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Latest and most capable Flash — built for long-horizon coding and agentic work at Flash cost." },
+      // Fairwind-Program-gated cybersecurity twin of 3.8 Flash (launched 2026-09-02).
+      // Google has published no model code for it — not on the Cyber page, the
+      // Fairwind page, the API models table, the model-card index, or the
+      // Enterprise Agent Platform model list (all checked 2026-09-03) — so this
+      // id follows Google's own suffix convention (gemini-3.1-flash-lite,
+      // gemini-3-pro-image) and OpenAI's gpt-5.6-cyber precedent. Owner-approved
+      // pending a published code; agetor passes it through verbatim, so a
+      // grant that names it differently needs only this literal changed.
+      { id: "gemini-3.8-flash-cyber", label: "Gemini 3.8 Flash Cyber", hint: "Cybersecurity-tuned 3.8 Flash for vulnerability discovery and patching. Requires Fairwind Program access (invite-only). No public model code yet — this id follows Google's naming convention; if your grant names it differently, create the task with `agetor add --model <code>`." },
+      { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", hint: "Prior Flash generation — strong on coding and agentic work." },
+      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost — earlier Flash generation." },
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, earliest Flash generation offered." },
     ],
     modes: [
       { id: "auto", label: "Auto (yolo)", hint: "Edit files without approval prompts (--yolo)." },
@@ -1967,6 +2128,12 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // `AgentOption.catalogOnly`, `CATALOG_SCOPED_KINDS`). Discovered-only ids
     // (neither list) append via `mergeModelOptions`
     // (`src/shared/model-options.ts`).
+    // Re-verified 2026-08-31 on fx 0.0.7 (unauth view: all 16 standard + the
+    // then-5 catalogOnly ids present, catalog grown to 234; signed-in view
+    // unverifiable this pass — token expired).
+    // 2026-09-02: google/gemini-3.8-flash added from fx 0.0.7's unauthenticated
+    // catalog (`fx models --json` under an expired login); its presence in a
+    // standard signed-in account's catalog is unverified, hence catalogOnly.
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
@@ -1988,6 +2155,7 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "openai/gpt-5.5", label: "GPT-5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "google/gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "moonshotai/kimi-k3", label: "Kimi K3", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [

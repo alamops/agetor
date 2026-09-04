@@ -7,7 +7,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
-import { mergeModelOptions } from "../../../shared/model-options.ts";
+import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -278,6 +278,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
           agentCache.current[a].model = m;
         }
         if (e) {
+          // No discovered-efforts argument here: this seed effect runs once
+          // on mount with `[]` deps, before harness discovery has resolved,
+          // so `agentModels`/`harnessModels` are still empty at this point
+          // and `discoveredEffortsFor` would always read back `null` —
+          // effectively dead. Validate against the curated table only; the
+          // render-path `efforts` below (keyed on `effortsKey`, which reacts
+          // to `agentModels`/`harnessModels` updates) is the authoritative
+          // check once discovery actually lands.
           const supported = supportedEfforts(a, agentCache.current[a].model);
           if (supported.some((x) => x.id === e)) {
             agentCache.current[a].effort = e;
@@ -344,13 +352,23 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
     discovered: discoveredForAgent,
     selected: model,
     scoped: CATALOG_SCOPED_KINDS.has(kind),
+    loggedIn: selectedStatus?.loggedIn ?? null,
   });
   // Effort options depend on both kind and model — re-derived each render
   // so a model switch immediately narrows the dropdown. When the new model
   // doesn't accept any effort (Haiku 4.5), effort drops to `null` and the
   // dropdown disables itself. Otherwise we re-pin to the kind's default
   // effort when supported, falling back to the highest available option.
-  const efforts = supportedEfforts(kind, model);
+  // The CLI's own discovered per-model efforts (when reported) win over the
+  // curated table — see `supportedEfforts`'s third argument. Unlike
+  // RunPanel's task-details cascade, there's no prior intent to retain here
+  // (a new task doesn't exist yet), so this uses the discovered-wins set
+  // strictly. Reads from `models` (the merged rows just above), not the raw
+  // `harnessModels`/`agentModels` maps, so a logged-out harness's discovery
+  // is distrusted here the same way `mergeModelOptions` rule 7 distrusts it
+  // for the Model picker — rule 8 stays a single source.
+  const efforts = supportedEfforts(kind, model, discoveredEffortsFor(models, model));
+  const effortsKey = efforts.map((o) => o.id).join(",");
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(model);
   const fastAvailable = kind === "cursor" && cursorModelSupportsFast(model, effort);
   useEffect(() => {
@@ -364,7 +382,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
       : efforts[0]!.id;
     setEffort(fallback);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, model]);
+  }, [kind, model, effortsKey]);
   useEffect(() => {
     if (!fastAvailable && fast) setFast(false);
   }, [fastAvailable, fast]);
@@ -782,19 +800,21 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                 </div>
               )}
 
-              {/* Fable 5 sits above Opus in the picker but bills at 2x the usage —
-                  surface that under the model row so the cost is obvious before Create. */}
-              {kind === "claude-code" && model === "fable-5" && (
+              {/* Fable models (5, 5.1, …) sit above Opus in the picker but bill at
+                  2x the usage — surface that under the model row so the cost is
+                  obvious before Create. Family check (not an exact id) so every
+                  point release picks this up with no code change. */}
+              {kind === "claude-code" && model?.startsWith("fable-") && (
                 <div className="text-[11px] text-muted-foreground">
-                  Fable 5 uses 2x the usage of Opus.
+                  {models.find((m) => m.id === model)?.label ?? model} uses 2x the usage of Opus.
                 </div>
               )}
 
-              {/* Mythos 5 is Fable 5's access-gated twin — same 2x usage, plus the
-                  Project Glasswing requirement, so both need calling out here. */}
-              {kind === "claude-code" && model === "mythos-5" && (
+              {/* Mythos models are Fable's access-gated twin — same 2x usage, plus
+                  the Project Glasswing requirement, so both need calling out here. */}
+              {kind === "claude-code" && model?.startsWith("mythos-") && (
                 <div className="text-[11px] text-muted-foreground">
-                  Mythos 5 uses 2x the usage of Opus and requires approved-org (Project Glasswing) access.
+                  {models.find((m) => m.id === model)?.label ?? model} uses 2x the usage of Opus and requires approved-org (Project Glasswing) access.
                 </div>
               )}
 

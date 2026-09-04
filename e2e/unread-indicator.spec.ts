@@ -153,7 +153,15 @@ test.describe("unread messages indicator", () => {
     // close — assert on the closed-state class instead, which flips
     // synchronously with the click (App.tsx's `setSelected(null)`, the
     // same state change that flips `TaskCard`'s `isOpen` prop).
-    await page.getByRole("button", { name: "Close task panel" }).click();
+    //
+    // The header X ("Close task details"), NOT the backdrop scrim: the scrim
+    // spans the whole viewport but the resizable panel `<aside>` overlays an
+    // arbitrary share of it, so any scrim click coordinate is silently
+    // coupled to the panel width and the test viewport. The header X lives
+    // INSIDE the panel, so the panel can never occlude it, and its
+    // `onClick={onClose}` is wired unconditionally on an always-rendered
+    // element — the same race-free property the scrim click had.
+    await panel.getByRole("button", { name: "Close task details" }).click();
     await expect(runPanel(page)).toHaveClass(/translate-x-full/);
     await expect(dot).toBeHidden();
     // Re-marked seen on close (covers anything that streamed while open) —

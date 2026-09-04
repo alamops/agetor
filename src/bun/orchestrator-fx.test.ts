@@ -357,7 +357,7 @@ test("cancelRun (fx) mid-turn records the run cancelled and returns the task to 
   // makeFakeAgent's kill() clears the pending timers and resolves done(0)
   // immediately, with the `cancelled` flag on the active handle overriding
   // the exit-code mapping.
-  const result = cancelRun(runId);
+  const result = await cancelRun(runId);
   expect(result).toBe(true);
 
   await settle();
@@ -492,7 +492,7 @@ test("reconcileTaskSession resets mode to fx's own modes[0] when switching INTO 
     mode: "ask", // valid for gemini, and happens to also be a valid fx id —
     // still must be reset since the KIND changed, not preserved because the
     // literal id happens to overlap.
-    model: "gemini-3-pro-preview",
+    model: "gemini-3.1-pro-preview",
     effort: null,
   });
   tasks.insert(before);
@@ -587,7 +587,7 @@ test("reconcileOrphans has no reattach path for fx: a mid-boot running fx run al
     fxSessionId: `fake-fx-session-${taskId}`,
   });
 
-  const reconciled = reconcileOrphans();
+  const reconciled = await reconcileOrphans();
   expect(reconciled).toBe(1);
 
   const row = db.query<{ status: string }, [string]>(`SELECT status FROM runs WHERE id = ?`).get(runId);
@@ -598,7 +598,7 @@ test("reconcileOrphans has no reattach path for fx: a mid-boot running fx run al
   expect(task?.runId).toBeNull();
 
   // A second call is a no-op — nothing left to reconcile.
-  expect(reconcileOrphans()).toBe(0);
+  expect(await reconcileOrphans()).toBe(0);
 });
 
 /* ─── T11 additions: todo tracker, card × queue interplay, model-null

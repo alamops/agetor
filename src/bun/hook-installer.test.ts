@@ -23,7 +23,7 @@ beforeEach(() => {
 test("ensureInstalledMerged: writes a clean settings file into an empty repo (no hook, no MCP)", async () => {
   const { ensureInstalledMerged } = await import("./hook-installer.ts");
   const cwd = makeCwd();
-  const paths = ensureInstalledMerged(cwd);
+  const paths = await ensureInstalledMerged(cwd);
   expect(paths).not.toBeNull();
 
   const settings = readSettings(cwd) as { hooks?: { PreToolUse?: unknown[] }; mcpServers?: Record<string, unknown> };
@@ -50,7 +50,7 @@ test("ensureInstalledMerged: preserves a pre-existing user PreToolUse entry", as
   require("node:fs").mkdirSync(dir, { recursive: true });
   writeFileSync(path.join(dir, "settings.local.json"), JSON.stringify(existing));
 
-  ensureInstalledMerged(cwd);
+  await ensureInstalledMerged(cwd);
 
   const settings = readSettings(cwd) as {
     hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }> };
@@ -67,9 +67,9 @@ test("ensureInstalledMerged: preserves a pre-existing user PreToolUse entry", as
 test("ensureInstalledMerged: re-merge stays clean — never installs a PreToolUse hook or MCP", async () => {
   const { ensureInstalledMerged } = await import("./hook-installer.ts");
   const cwd = makeCwd();
-  ensureInstalledMerged(cwd);
-  ensureInstalledMerged(cwd);
-  ensureInstalledMerged(cwd);
+  await ensureInstalledMerged(cwd);
+  await ensureInstalledMerged(cwd);
+  await ensureInstalledMerged(cwd);
 
   const settings = readSettings(cwd) as { hooks?: { PreToolUse?: unknown[] }; mcpServers?: Record<string, unknown> };
   expect(settings.hooks?.PreToolUse).toBeUndefined();
@@ -93,7 +93,7 @@ test("ensureInstalledMerged: strips a stale agetor PreToolUse hook from a previo
     },
   }));
 
-  ensureInstalledMerged(cwd);
+  await ensureInstalledMerged(cwd);
 
   const settings = readSettings(cwd) as {
     hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }> };
@@ -120,7 +120,7 @@ test("ensureInstalledMerged: strips a stale `mcpServers.agetor` registration (no
     },
   }));
 
-  ensureInstalledMerged(cwd);
+  await ensureInstalledMerged(cwd);
 
   const settings = readSettings(cwd) as { mcpServers: Record<string, { command: string }> };
   // The stale agetor registration is gone, and none is re-added.
@@ -138,7 +138,7 @@ test("ensureInstalledMerged: drops the whole mcpServers object once the only key
     mcpServers: { agetor: { command: "/old/.agetor/bin/agetor-mcp.sh" } },
   }));
 
-  ensureInstalledMerged(cwd);
+  await ensureInstalledMerged(cwd);
 
   const settings = readSettings(cwd) as { mcpServers?: Record<string, unknown> };
   // Mirrors the empty-PreToolUse handling: drop the key, don't leave `{}`.
@@ -153,7 +153,7 @@ test("ensureInstalledMerged: refuses to overwrite malformed JSON and returns nul
   const file = path.join(dir, "settings.local.json");
   writeFileSync(file, "{ this is not json");
 
-  const result = ensureInstalledMerged(cwd);
+  const result = await ensureInstalledMerged(cwd);
   expect(result).toBeNull();
   // Original content untouched.
   expect(readFileSync(file, "utf8")).toBe("{ this is not json");
@@ -167,7 +167,7 @@ test("ensureInstalledMerged: refuses to overwrite a JSON array (must be an objec
   const file = path.join(dir, "settings.local.json");
   writeFileSync(file, JSON.stringify([1, 2, 3]));
 
-  const result = ensureInstalledMerged(cwd);
+  const result = await ensureInstalledMerged(cwd);
   expect(result).toBeNull();
   expect(JSON.parse(readFileSync(file, "utf8"))).toEqual([1, 2, 3]);
 });
@@ -179,7 +179,7 @@ test("ensureInstalledMerged: empty file content treated as fresh install", async
   require("node:fs").mkdirSync(dir, { recursive: true });
   writeFileSync(path.join(dir, "settings.local.json"), "   \n  ");
 
-  const result = ensureInstalledMerged(cwd);
+  const result = await ensureInstalledMerged(cwd);
   expect(result).not.toBeNull();
   const settings = readSettings(cwd) as { hooks?: { PreToolUse?: unknown[] }; mcpServers?: Record<string, unknown> };
   expect(settings.hooks?.PreToolUse).toBeUndefined();
@@ -190,13 +190,13 @@ test("ensureInstalledMerged: returns null when the cwd doesn't exist", async () 
   const { ensureInstalledMerged } = await import("./hook-installer.ts");
   const missing = path.join(tmpdir(), "definitely-not-a-real-dir-" + Date.now());
   expect(existsSync(missing)).toBe(false);
-  expect(ensureInstalledMerged(missing)).toBeNull();
+  expect(await ensureInstalledMerged(missing)).toBeNull();
 });
 
 test("ensureInstalled (owned worktree): writes a clean settings file — no hook, no MCP, no CLAUDE.md", async () => {
   const { ensureInstalled } = await import("./hook-installer.ts");
   const cwd = makeCwd();
-  ensureInstalled(cwd);
+  await ensureInstalled(cwd);
   const settings = readSettings(cwd) as {
     hooks?: { PreToolUse?: Array<{ matcher: string }> };
     mcpServers?: Record<string, unknown>;
@@ -213,7 +213,7 @@ test("ensureInstalledForCwd: cleans up inside an agetor-owned worktree", async (
   const owned = path.join(process.env.AGETOR_DATA_DIR!, "worktrees", "fake-task");
   require("node:fs").mkdirSync(owned, { recursive: true });
 
-  const paths = ensureInstalledForCwd(owned, "ask");
+  const paths = await ensureInstalledForCwd(owned, "ask");
   expect(paths).not.toBeNull();
   const settings = readSettings(owned) as {
     hooks?: { PreToolUse?: Array<{ matcher: string }> };
@@ -237,7 +237,7 @@ test("ensureInstalled preserves `permissions.allow` and other keys across re-spa
   require("node:fs").mkdirSync(owned, { recursive: true });
 
   // 1. First install (fresh worktree, no settings file).
-  ensureInstalled(owned);
+  await ensureInstalled(owned);
 
   // 2. Simulate a permissions.allow entry landing in the same settings
   //    file (from any of the sources noted above).
@@ -249,7 +249,7 @@ test("ensureInstalled preserves `permissions.allow` and other keys across re-spa
   require("node:fs").writeFileSync(settingsFile, JSON.stringify(after1, null, 2));
 
   // 3. Re-spawn: ensureInstalled runs again on the same cwd.
-  ensureInstalled(owned);
+  await ensureInstalled(owned);
 
   const final = JSON.parse(require("node:fs").readFileSync(settingsFile, "utf8"));
   expect(final.permissions?.allow).toEqual(["Bash(git status)"]);
@@ -278,10 +278,98 @@ test("ensureInstalled: strips permission entries claude's parser would reject (o
     },
   }));
 
-  ensureInstalled(owned);
+  await ensureInstalled(owned);
 
   const settings = readSettings(owned) as { permissions: { allow: string[] } };
   expect(settings.permissions.allow).toEqual(["Bash(git status)", "Edit(/repo/src/**)"]);
+});
+
+test("ensureInstalledMerged / ensureInstalled / ensureInstalledForCwd all resolve { settingsFile } pointing at the exact settings.local.json path", async () => {
+  const { ensureInstalledMerged, ensureInstalled, ensureInstalledForCwd } = await import("./hook-installer.ts");
+
+  const cwd1 = makeCwd();
+  const r1 = await ensureInstalledMerged(cwd1);
+  expect(r1).toEqual({ settingsFile: path.join(cwd1, ".claude", "settings.local.json") });
+
+  const cwd2 = makeCwd();
+  const r2 = await ensureInstalled(cwd2);
+  expect(r2).toEqual({ settingsFile: path.join(cwd2, ".claude", "settings.local.json") });
+
+  const owned = path.join(process.env.AGETOR_DATA_DIR!, "worktrees", "shape-task");
+  require("node:fs").mkdirSync(owned, { recursive: true });
+  const r3 = await ensureInstalledForCwd(owned, "ask");
+  expect(r3).toEqual({ settingsFile: path.join(owned, ".claude", "settings.local.json") });
+});
+
+test("ensureInstalled (owned worktree): overwrites malformed JSON instead of refusing — the self-heal branch ensureInstalledMerged's refuse path deliberately does NOT take", async () => {
+  const { ensureInstalled } = await import("./hook-installer.ts");
+  const owned = path.join(process.env.AGETOR_DATA_DIR!, "worktrees", "malformed-task");
+  const dir = path.join(owned, ".claude");
+  require("node:fs").mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "settings.local.json");
+  writeFileSync(file, "{ this is not json");
+
+  const result = await ensureInstalled(owned);
+  expect(result).not.toBeNull();
+  const settings = JSON.parse(readFileSync(file, "utf8")) as {
+    hooks?: { PreToolUse?: unknown[] };
+    mcpServers?: Record<string, unknown>;
+  };
+  expect(settings.hooks?.PreToolUse).toBeUndefined();
+  expect(settings.mcpServers).toBeUndefined();
+});
+
+test("ensureInstalled (owned worktree): overwrites a malformed JSON array too (the non-object shape ensureInstalledMerged refuses on)", async () => {
+  const { ensureInstalled } = await import("./hook-installer.ts");
+  const owned = path.join(process.env.AGETOR_DATA_DIR!, "worktrees", "malformed-array-task");
+  const dir = path.join(owned, ".claude");
+  require("node:fs").mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "settings.local.json");
+  writeFileSync(file, JSON.stringify([1, 2, 3]));
+
+  const result = await ensureInstalled(owned);
+  expect(result).not.toBeNull();
+  const settings = JSON.parse(readFileSync(file, "utf8"));
+  expect(Array.isArray(settings)).toBe(false);
+});
+
+test("writeJsonAtomic leaves exactly one file behind — no leftover *.tmp.<pid>.<random> artifact after a successful install", async () => {
+  const { ensureInstalled } = await import("./hook-installer.ts");
+  const cwd = makeCwd();
+  await ensureInstalled(cwd);
+  const dir = path.join(cwd, ".claude");
+  const entries: string[] = require("node:fs").readdirSync(dir);
+  expect(entries).toEqual(["settings.local.json"]);
+});
+
+test("writeJsonAtomic: concurrent installs against the same file never leave it partially written, and no racer's temp file survives", async () => {
+  // Each concurrent ensureInstalledMerged call reads the file, computes its
+  // own merge, writes to its OWN uniquely-named temp file (pid + random
+  // suffix — see writeJsonAtomic), then renames onto the shared target.
+  // POSIX rename is atomic, so however the five calls interleave, the final
+  // file must always be exactly one complete writer's output — never a torn
+  // read of two writes at once, and never left as a stray tempfile.
+  const { ensureInstalledMerged } = await import("./hook-installer.ts");
+  const cwd = makeCwd();
+  const dir = path.join(cwd, ".claude");
+  require("node:fs").mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "settings.local.json");
+  // Give every racer something non-trivial to preserve, so a torn write
+  // would be obviously wrong rather than accidentally matching `{}`.
+  writeFileSync(file, JSON.stringify({ permissions: { allow: ["Bash(git status)"] } }));
+
+  const results = await Promise.all(
+    Array.from({ length: 5 }, () => ensureInstalledMerged(cwd)),
+  );
+  expect(results.every((r) => r !== null)).toBe(true);
+
+  const raw = readFileSync(file, "utf8");
+  expect(() => JSON.parse(raw)).not.toThrow(); // never truncated/interleaved
+  const final = JSON.parse(raw) as { permissions: { allow: string[] } };
+  expect(final.permissions.allow).toEqual(["Bash(git status)"]);
+
+  const entries: string[] = require("node:fs").readdirSync(dir);
+  expect(entries).toEqual(["settings.local.json"]); // every racer's tempfile was renamed away, none abandoned
 });
 
 test("ensureInstalledMerged: does NOT strip a user repo's own permission entries", async () => {
@@ -296,7 +384,7 @@ test("ensureInstalledMerged: does NOT strip a user repo's own permission entries
     permissions: { allow: ["Bash(git status)", "Bash(echo $((1+1)))"] },
   }));
 
-  ensureInstalledMerged(cwd);
+  await ensureInstalledMerged(cwd);
 
   const settings = readSettings(cwd) as { permissions: { allow: string[] } };
   expect(settings.permissions.allow).toEqual(["Bash(git status)", "Bash(echo $((1+1)))"]);

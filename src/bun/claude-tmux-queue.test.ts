@@ -183,7 +183,7 @@ test("pasteFollowUp: folds into the active turn without pushing a new slot", asy
       const doneA = __forTest.pushTurnSlot(state, a.onChunk);
 
       // Fold a message in while the turn is live.
-      expect(pasteFollowUp(taskId, "second message while busy")).toMatchObject({ delivered: true });
+      expect(await pasteFollowUp(taskId, "second message while busy")).toMatchObject({ delivered: true });
       // No second slot — the queue stays at one in-flight turn (synchronous;
       // pasteFollowUp never touches turnQueue).
       expect(state.turnQueue.length).toBe(1);
@@ -218,8 +218,8 @@ test("pasteFollowUp: folds into the active turn without pushing a new slot", asy
   });
 });
 
-test("pasteFollowUp: returns false when no live session exists", () => {
-  expect(pasteFollowUp(randomUUID(), "msg")).toBe(false);
+test("pasteFollowUp: returns false when no live session exists", async () => {
+  expect(await pasteFollowUp(randomUUID(), "msg")).toBe(false);
 });
 
 // ─── pasteFollowUp({ onPasteFailure }) honors queuePaste's modal guard
@@ -238,10 +238,10 @@ test("pasteFollowUp({onPasteFailure}): a blocked pane fires the callback once (p
     const prevPoll = __forTest.setPasteModalPollMs(5);
     const { taskId, jsonlPath } = freshSession();
     __forTest.installSession(taskId, jsonlPath);
-    const prevCapture = __forTest.setCapturePastePane(() => BLOCKING_MODAL_PANE);
+    const prevCapture = __forTest.setCapturePastePane(async () => BLOCKING_MODAL_PANE);
     const failures: PasteFailureOutcome[] = [];
     try {
-      const result = pasteFollowUp(taskId, "a follow-up message", {
+      const result = await pasteFollowUp(taskId, "a follow-up message", {
         onPasteFailure: (outcome) => failures.push(outcome),
       });
       expect(result).toMatchObject({ delivered: true });
@@ -277,9 +277,9 @@ test("pasteFollowUp without {onPasteFailure}: a blocked pane withholds silently 
     const prevPoll = __forTest.setPasteModalPollMs(5);
     const { taskId, jsonlPath } = freshSession();
     __forTest.installSession(taskId, jsonlPath);
-    const prevCapture = __forTest.setCapturePastePane(() => BLOCKING_MODAL_PANE);
+    const prevCapture = __forTest.setCapturePastePane(async () => BLOCKING_MODAL_PANE);
     try {
-      const result = pasteFollowUp(taskId, "a follow-up message");
+      const result = await pasteFollowUp(taskId, "a follow-up message");
       expect(result).toMatchObject({ delivered: true });
       if (result === false) throw new Error("expected delivered");
       await expect(__forTest.pasteChains.get(taskId)).resolves.toBeUndefined();
@@ -315,7 +315,7 @@ test("pasteFollowUp: holds the run open across folded turns until the session go
       const a = recorder();
       const doneA = __forTest.pushTurnSlot(state, a.onChunk);
 
-      const foldResult = pasteFollowUp(taskId, "do another thing");
+      const foldResult = await pasteFollowUp(taskId, "do another thing");
       expect(foldResult).toMatchObject({ delivered: true });
       expect(state.holdUntilIdle).toBe(true);
       await new Promise((r) => setTimeout(r, 20)); // drain the paste chain
@@ -865,7 +865,7 @@ test("cycleToMode('plan'): a blocked pane withholds the /plan paste — result i
     const prevPoll = __forTest.setPasteModalPollMs(5);
     const { taskId, jsonlPath } = freshSession();
     __forTest.installSession(taskId, jsonlPath);
-    const prevCapture = __forTest.setCapturePastePane(() => BLOCKING_MODAL_PANE);
+    const prevCapture = __forTest.setCapturePastePane(async () => BLOCKING_MODAL_PANE);
     try {
       const result = await cycleToMode(taskId, "plan");
       expect(result).toEqual({ ok: false, reason: "paste withheld" });
@@ -888,7 +888,7 @@ test("cycleToMode('plan'): a clear pane still returns { ok: true, via: 'slash-pl
       "─".repeat(80),
       "⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent",
     ].join("\n");
-    const prevCapture = __forTest.setCapturePastePane(() => idlePane);
+    const prevCapture = __forTest.setCapturePastePane(async () => idlePane);
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     try {
       const result = await cycleToMode(taskId, "plan");
@@ -1292,7 +1292,7 @@ test("sendTurn bumps state.lastKeystrokeAt via queuePaste's pre-dispatch write s
     const stale = staleKeystrokeAt();
     state.lastKeystrokeAt = stale;
     try {
-      const agent = sendTurn(taskId, "hello agent", () => {});
+      const agent = await sendTurn(taskId, "hello agent", () => {});
       await agent.pasteOutcome;
       expect(state.lastKeystrokeAt).toBeGreaterThan(stale);
     } finally {
@@ -1308,7 +1308,7 @@ test("pasteFollowUp bumps state.lastKeystrokeAt via queuePaste's pre-dispatch wr
     const stale = staleKeystrokeAt();
     state.lastKeystrokeAt = stale;
     try {
-      const result = pasteFollowUp(taskId, "a follow-up");
+      const result = await pasteFollowUp(taskId, "a follow-up");
       expect(result).toMatchObject({ delivered: true });
       if (result === false) throw new Error("expected delivered");
       await result.pasteOutcome;
@@ -1389,7 +1389,7 @@ test("sendTurn(...).pasteOutcome resolves { ok: true } once the bracketed paste 
     const { taskId, jsonlPath } = freshSession();
     __forTest.installSession(taskId, jsonlPath);
     try {
-      const agent = sendTurn(taskId, "hello agent", () => {});
+      const agent = await sendTurn(taskId, "hello agent", () => {});
       await expect(agent.pasteOutcome).resolves.toEqual({ ok: true });
     } finally {
       __forTest.uninstallSession(taskId);
@@ -1403,9 +1403,9 @@ test("sendTurn(...).pasteOutcome resolves the modal-guard failure (with phase) w
     const prevPoll = __forTest.setPasteModalPollMs(5);
     const { taskId, jsonlPath } = freshSession();
     __forTest.installSession(taskId, jsonlPath);
-    const prevCapture = __forTest.setCapturePastePane(() => BLOCKING_MODAL_PANE);
+    const prevCapture = __forTest.setCapturePastePane(async () => BLOCKING_MODAL_PANE);
     try {
-      const agent = sendTurn(taskId, "hello agent", () => {});
+      const agent = await sendTurn(taskId, "hello agent", () => {});
       const outcome = await agent.pasteOutcome!;
       expect(outcome.ok).toBe(false);
       if (!outcome.ok) {
@@ -1429,18 +1429,33 @@ test("sendTurn(...).pasteOutcome resolves the modal-guard failure (with phase) w
 test("sendTurn(...).pasteOutcome resolves a PASTE_DROPPED_OUTCOME-shaped failure (never hangs) when the session is torn down before the queued paste runs", async () => {
   const { taskId, jsonlPath } = freshSession();
   __forTest.installSession(taskId, jsonlPath);
-  const agent = sendTurn(taskId, "hello agent", () => {});
+  // Deliberately NOT awaited here. `sendTurn` is `async` now (the tmux()
+  // choke point moved off Bun.spawnSync — see docs/plans/fix-task-details-
+  // load-delay.md), but its own body has no internal `await` before it
+  // registers the queued paste op (`void queuePaste(...)`) and returns — that
+  // registration is still fully synchronous. Awaiting the call here would
+  // itself cross a microtask boundary that lands AFTER queueTmuxOp's
+  // identity-check microtask already ran (verified empirically: the chain's
+  // `prev.then(...)` callback was scheduled, synchronously, before this
+  // function even returns its promise, so it's next in the microtask queue
+  // ahead of this `await`'s own continuation) — defeating the race this test
+  // exists to win. Calling `sendTurn` without awaiting and tearing the
+  // session down in the SAME synchronous tick is what still lands the
+  // teardown before that identity check.
+  const agentPromise = sendTurn(taskId, "hello agent", () => {});
   // The dropped paste also rejects the turn slot's `done` — expected (the
   // run must settle failed, not hang), but left unhandled here it would
   // otherwise surface as an unhandled-rejection failure unrelated to this
-  // test's actual assertion (pasteOutcome, below).
-  agent.done.catch(() => {});
+  // test's actual assertion (pasteOutcome, below). Chained via `.then`
+  // (not awaited) so it doesn't delay the synchronous teardown below.
+  agentPromise.then((agent) => agent.done.catch(() => {}));
   // Tear down the session SYNCHRONOUSLY, before the queued tmux op's
   // microtask gets a chance to run — queueTmuxOp's identity gate
   // (`sessions.get(taskId) === expectedState`) then drops the op body
   // entirely, so no tmux call (and no fake tmux bin) is needed here.
   __forTest.uninstallSession(taskId);
 
+  const agent = await agentPromise;
   const outcome = await Promise.race([
     agent.pasteOutcome!,
     new Promise<never>((_, reject) => {

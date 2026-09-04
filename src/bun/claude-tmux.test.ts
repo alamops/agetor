@@ -1593,7 +1593,7 @@ test("cycleToMode: success on first attempt when the status bar shows the target
   const { __forTest } = await import("./claude-tmux.ts");
   const prevPoll = __forTest.setModePollIntervalMs(1);
   // The status bar already reports auto once the presses land.
-  const prevPane = __forTest.setCaptureModePane(() => "⏵⏵ auto mode on (shift+tab to cycle)");
+  const prevPane = __forTest.setCaptureModePane(async () => "⏵⏵ auto mode on (shift+tab to cycle)");
   try {
     const taskId = "task-cycle-success";
     const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
@@ -1615,7 +1615,7 @@ test("cycleToMode: retries from the newly-observed mode when the first press lan
   const prevPoll = __forTest.setModePollIntervalMs(1);
   // Attempt 1 (from default) settles on acceptEdits; once cycleToMode records
   // that landing on the session, attempt 2's bar reports auto.
-  const prevPane = __forTest.setCaptureModePane((s) =>
+  const prevPane = __forTest.setCaptureModePane(async (s) =>
     s.permissionMode === CLAUDE_MODE_ACCEPT_EDITS
       ? "⏵⏵ auto mode on (shift+tab to cycle)"
       : "⏵⏵ accept edits on (shift+tab to cycle)",
@@ -1642,7 +1642,7 @@ test("cycleToMode: returns 'verification timed out' when the status bar never co
   const prevPoll = __forTest.setModePollIntervalMs(1);
   // Bar shows no recognisable mode banner (e.g. the auto opt-in modal is
   // painted over it) — readPaneMode returns null on every poll.
-  const prevPane = __forTest.setCaptureModePane(() => "Some unrelated output\n❯ ");
+  const prevPane = __forTest.setCaptureModePane(async () => "Some unrelated output\n❯ ");
   try {
     const taskId = "task-cycle-timeout";
     const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
@@ -1668,7 +1668,7 @@ test("cycleToMode: gives up with 'verification mismatch' after MAX_VERIFY_ATTEMP
   const prevPoll = __forTest.setModePollIntervalMs(1);
   // Each attempt lands on a wrong mode, keyed off where the previous attempt
   // left the session: default → acceptEdits → plan → default.
-  const prevPane = __forTest.setCaptureModePane((s) => {
+  const prevPane = __forTest.setCaptureModePane(async (s) => {
     if (s.permissionMode === CLAUDE_MODE_ACCEPT_EDITS) return "⏸ plan mode on (shift+tab to cycle)";
     if (s.permissionMode === CLAUDE_MODE_PLAN) return "? for shortcuts";
     return "⏵⏵ accept edits on (shift+tab to cycle)";
@@ -1708,7 +1708,7 @@ test("cycleToMode: overlapping calls on the same task both resolve", async () =>
   // concurrent cycleToMode calls (e.g. a user double-PATCH) each settle.
   const { __forTest } = await import("./claude-tmux.ts");
   const prevPoll = __forTest.setModePollIntervalMs(1);
-  const prevPane = __forTest.setCaptureModePane(() => "⏵⏵ auto mode on (shift+tab to cycle)");
+  const prevPane = __forTest.setCaptureModePane(async () => "⏵⏵ auto mode on (shift+tab to cycle)");
   try {
     const taskId = "task-cycle-race";
     const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
@@ -1733,7 +1733,7 @@ test("readPaneMode: reads the trailing status-bar banner, ignoring mode phrases 
   const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
   // A decoy "auto mode on" in assistant output must NOT win over the real
   // banner on the trailing line.
-  const prevPane = __forTest.setCaptureModePane(() =>
+  const prevPane = __forTest.setCaptureModePane(async () =>
     [
       "Assistant: I'll switch to auto mode on your behalf.",
       "❯ ",
@@ -1741,7 +1741,7 @@ test("readPaneMode: reads the trailing status-bar banner, ignoring mode phrases 
     ].join("\n"),
   );
   try {
-    expect(__forTest.readPaneMode(state)).toBe(CLAUDE_MODE_PLAN);
+    expect(await __forTest.readPaneMode(state)).toBe(CLAUDE_MODE_PLAN);
   } finally {
     __forTest.setCaptureModePane(prevPane);
     __forTest.uninstallSession(taskId);
@@ -1752,9 +1752,9 @@ test("readPaneMode: default mode recognised via the '? for shortcuts' trailing h
   const { __forTest } = await import("./claude-tmux.ts");
   const taskId = "task-readpane-default";
   const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
-  const prevPane = __forTest.setCaptureModePane(() => "❯ \n  ? for shortcuts · ← for agents");
+  const prevPane = __forTest.setCaptureModePane(async () => "❯ \n  ? for shortcuts · ← for agents");
   try {
-    expect(__forTest.readPaneMode(state)).toBe(CLAUDE_MODE_DEFAULT);
+    expect(await __forTest.readPaneMode(state)).toBe(CLAUDE_MODE_DEFAULT);
   } finally {
     __forTest.setCaptureModePane(prevPane);
     __forTest.uninstallSession(taskId);
@@ -1766,9 +1766,9 @@ test("readPaneMode: null when a mode phrase lacks the cycle-hint banner (e.g. mo
   const taskId = "task-readpane-null";
   const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
   // "auto mode on" appears, but not as the trailing `(shift+tab to cycle)` banner.
-  const prevPane = __forTest.setCaptureModePane(() => "talking about auto mode on\n❯ ");
+  const prevPane = __forTest.setCaptureModePane(async () => "talking about auto mode on\n❯ ");
   try {
-    expect(__forTest.readPaneMode(state)).toBeNull();
+    expect(await __forTest.readPaneMode(state)).toBeNull();
   } finally {
     __forTest.setCaptureModePane(prevPane);
     __forTest.uninstallSession(taskId);
@@ -1976,8 +1976,8 @@ function makeFakePane(tabs: FakeTab[]) {
   let tab = 0, cursor = 0, w = 120, h = 30;
   const log: string[] = [];
   const io = {
-    capture: () => renderFakeModal(tabs, tab, cursor),
-    send: (key: NavKey) => {
+    capture: async () => renderFakeModal(tabs, tab, cursor),
+    send: async (key: NavKey) => {
       log.push(key);
       if (key === "Down") cursor = Math.min(cursor + 1, tabs[tab]!.options.length - 1);
       else if (key === "Up") cursor = Math.max(cursor - 1, 0);
@@ -1985,9 +1985,9 @@ function makeFakePane(tabs: FakeTab[]) {
       else if (key === "Left") { tab = Math.max(tab - 1, 0); cursor = 0; }
       return true;
     },
-    size: () => ({ w, h }),
-    resize: (nw: number, nh: number) => { w = nw; h = nh; log.push(`resize:${nw}x${nh}`); },
-    restore: (nw: number, nh: number) => { w = nw; h = nh; log.push(`restore:${nw}x${nh}`); },
+    size: async () => ({ w, h }),
+    resize: async (nw: number, nh: number) => { w = nw; h = nh; log.push(`resize:${nw}x${nh}`); },
+    restore: async (nw: number, nh: number) => { w = nw; h = nh; log.push(`restore:${nw}x${nh}`); },
     sleep: async () => { /* no delay in tests */ },
   };
   return { io, log, at: () => ({ tab, cursor, w, h }) };
@@ -2133,11 +2133,11 @@ function makeGrowablePane(opts: { grownTail: string | null }) {
   let grown = false;
   const log: string[] = [];
   const io = {
-    capture: () => (grown && opts.grownTail !== null ? opts.grownTail : TRUNCATED_TOP_TAIL),
-    send: (key: NavKey) => { log.push(key); return true; },
-    size: () => ({ w: 80, h: 24 }),
-    resize: (w: number, h: number) => { grown = true; log.push(`resize:${w}x${h}`); },
-    restore: (w: number, h: number) => { log.push(`restore:${w}x${h}`); },
+    capture: async () => (grown && opts.grownTail !== null ? opts.grownTail : TRUNCATED_TOP_TAIL),
+    send: async (key: NavKey) => { log.push(key); return true; },
+    size: async () => ({ w: 80, h: 24 }),
+    resize: async (w: number, h: number) => { grown = true; log.push(`resize:${w}x${h}`); },
+    restore: async (w: number, h: number) => { log.push(`restore:${w}x${h}`); },
     sleep: async () => { /* no delay in tests */ },
   };
   return { io, log };
@@ -2187,11 +2187,11 @@ test("collectAskQuestionsFromPane: unavailable pane size (io.size() → null) st
   const { __forTest } = await import("./claude-tmux.ts");
   const log: string[] = [];
   const io = {
-    capture: () => TRUNCATED_TOP_TAIL,
-    send: () => true,
-    size: () => null,
-    resize: (w: number, h: number) => { log.push(`resize:${w}x${h}`); },
-    restore: (w: number, h: number) => { log.push(`restore:${w}x${h}`); },
+    capture: async () => TRUNCATED_TOP_TAIL,
+    send: async () => true,
+    size: async () => null,
+    resize: async (w: number, h: number) => { log.push(`resize:${w}x${h}`); },
+    restore: async (w: number, h: number) => { log.push(`restore:${w}x${h}`); },
     sleep: async () => { /* no delay in tests */ },
   };
   const state = __forTest.installSession("ask-size-unavailable", "/tmp/never-read.jsonl");
@@ -2396,8 +2396,8 @@ test("healWindowSize issues no tmux call at all when a pane-grow is in flight fo
   const state = __forTest.installSession("heal-inflight", "/tmp/never-read.jsonl");
   state.paneGrowInFlight = true;
   try {
-    await withFakeTmuxBin(bin, () => {
-      healWindowSize("heal-inflight");
+    await withFakeTmuxBin(bin, async () => {
+      await healWindowSize("heal-inflight");
     });
     const log = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
     expect(log).toBe("");
@@ -2410,10 +2410,10 @@ test("healWindowSize probes has-session but issues no set-window-option when the
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-heal-log-"));
   const logPath = path.join(dir, "log.txt");
   const bin = fakeHealTmuxBin(1, logPath); // has-session always "fails"
-  await withFakeTmuxBin(bin, () => {
+  await withFakeTmuxBin(bin, async () => {
     // No installed SessionState for this taskId at all — mirrors the boot
     // path where a session outlived the process with no state rebuilt yet.
-    healWindowSize("heal-missing-task-id");
+    await healWindowSize("heal-missing-task-id");
   });
   const log = readFileSync(logPath, "utf8");
   expect(log).toContain("has-session");
@@ -2424,8 +2424,8 @@ test("healWindowSize resets window-size to latest with a single call when the se
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-heal-log-"));
   const logPath = path.join(dir, "log.txt");
   const bin = fakeHealTmuxBin(0, logPath); // has-session always "succeeds"
-  await withFakeTmuxBin(bin, () => {
-    healWindowSize("heal-live-task-id");
+  await withFakeTmuxBin(bin, async () => {
+    await healWindowSize("heal-live-task-id");
   });
   const lines = readFileSync(logPath, "utf8").trim().split("\n");
   expect(lines.length).toBe(2);

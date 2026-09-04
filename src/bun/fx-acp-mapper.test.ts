@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { extractFxProviderValue, mapFxUpdate } from "./fx-acp.ts";
+import { FxTextCoalescer, extractFxProviderValue, isFxContextDiagnostic, mapFxUpdate } from "./fx-acp.ts";
 import { FX_USAGE_STATUS_PREFIX } from "../shared/types.ts";
 import { deriveTodoProgress } from "../shared/todo-progress.ts";
 
@@ -406,5 +406,76 @@ describe("unknown / forward-compat sessionUpdate variants", () => {
       expect(mapFxUpdate({ sessionUpdate: kind }, ctx)).toEqual([]);
     }
     expect(ctx.current).toBe(0);
+  });
+});
+
+describe("agent_message_chunk carrying fx [context] diagnostics", () => {
+  test("a chunk made only of [context] lines maps to one status line each (blank lines dropped), one seq per line", () => {
+    const ctx = makeCtx();
+    const text =
+      '[context] skill description "a" truncated: observed=1040 bytes effective=1024 bytes\n\n[context] skill catalog omitted 2 entries\n';
+    expect(mapFxUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } }, ctx)).toEqual([
+      {
+        stream: "status",
+        data: '[context] skill description "a" truncated: observed=1040 bytes effective=1024 bytes',
+        lineUuid: "fx:run-1:0",
+      },
+      { stream: "status", data: "[context] skill catalog omitted 2 entries", lineUuid: "fx:run-1:1" },
+    ]);
+    expect(ctx.current).toBe(2);
+  });
+
+  test("prose that contains, follows, or merely mentions a [context] line stays a single assistant chunk", () => {
+    for (const text of ["Note:\n[context] foo", "[context] foo\nbut then prose", "see the [context] docs", "[contextual] aside"]) {
+      const ctx = makeCtx();
+      expect(mapFxUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } }, ctx)).toEqual([
+        { stream: "assistant", data: text, lineUuid: "fx:run-1:0" },
+      ]);
+    }
+  });
+
+  test("isFxContextDiagnostic: all-or-nothing over non-blank lines; blank-only text is not a diagnostic", () => {
+    expect(isFxContextDiagnostic("[context] a")).toBe(true);
+    expect(isFxContextDiagnostic("  [context] a\n\n[context] b\n")).toBe(true);
+    expect(isFxContextDiagnostic("[context] a\nprose")).toBe(false);
+    expect(isFxContextDiagnostic("\n  \n")).toBe(false);
+    expect(isFxContextDiagnostic("")).toBe(false);
+  });
+});
+
+describe("FxTextCoalescer", () => {
+  test("consecutive same-stream deltas merge into one chunk carrying the FIRST delta's line uuid", () => {
+    const c = new FxTextCoalescer();
+    expect(c.push({ stream: "assistant", data: "Hello ", lineUuid: "fx:r:0" })).toEqual([]);
+    expect(c.push({ stream: "assistant", data: "world", lineUuid: "fx:r:1" })).toEqual([]);
+    expect(c.pending).toBe(true);
+    expect(c.flush()).toEqual([{ stream: "assistant", data: "Hello world", lineUuid: "fx:r:0" }]);
+    expect(c.pending).toBe(false);
+    // Flushing an empty coalescer yields nothing, and doesn't throw.
+    expect(c.flush()).toEqual([]);
+  });
+
+  test("a delta on the other text stream closes the open message first", () => {
+    const c = new FxTextCoalescer();
+    c.push({ stream: "assistant", data: "answer", lineUuid: "fx:r:0" });
+    expect(c.push({ stream: "thinking", data: "hmm", lineUuid: "fx:r:1" })).toEqual([
+      { stream: "assistant", data: "answer", lineUuid: "fx:r:0" },
+    ]);
+    expect(c.push({ stream: "thinking", data: "…", lineUuid: "fx:r:2" })).toEqual([]);
+    expect(c.flush()).toEqual([{ stream: "thinking", data: "hmm…", lineUuid: "fx:r:1" }]);
+  });
+
+  test("any non-text chunk flushes buffered text AHEAD of itself and passes through in wire order", () => {
+    const c = new FxTextCoalescer();
+    c.push({ stream: "assistant", data: "I'll run ls", lineUuid: "fx:r:0" });
+    const tool = { stream: "tool_use" as const, data: "{}", lineUuid: "fx:tool:1:use" };
+    expect(c.push(tool)).toEqual([{ stream: "assistant", data: "I'll run ls", lineUuid: "fx:r:0" }, tool]);
+    // Nothing buffered → a non-text chunk passes straight through alone,
+    // and a uuid-less status chunk is a boundary just the same.
+    expect(c.push(tool)).toEqual([tool]);
+    c.push({ stream: "assistant", data: "done", lineUuid: "fx:r:3" });
+    const status = { stream: "status" as const, data: "fx turn ended: max_tokens" };
+    expect(c.push(status)).toEqual([{ stream: "assistant", data: "done", lineUuid: "fx:r:3" }, status]);
+    expect(c.pending).toBe(false);
   });
 });

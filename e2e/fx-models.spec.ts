@@ -54,11 +54,11 @@ const FX_DEFAULT_MODEL_ID = "zai/glm-5.3-flash";
 
 /** Curated ids that must NOT survive the curated ∩ discovered filter against
  *  the 3-id stub catalog: two ordinary curated rows absent from the stub
- *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and three of the five
+ *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and four of the six
  *  `catalogOnly` premium rows (absent from the stub the same as any other
  *  id would be — catalogOnly gates them even harder, but plain absence
  *  already excludes them under the scoped merge). */
-const EXCLUDED_FX_OPTION_LABELS = ["Grok 4.6", "Kimi K2.7 Code", "Claude Opus 5", "GPT-5.5", "Kimi K3"];
+const EXCLUDED_FX_OPTION_LABELS = ["Grok 4.6", "Kimi K2.7 Code", "Claude Opus 5", "GPT-5.5", "Gemini 3.8 Flash", "Kimi K3"];
 
 /** Mirrors `e2e/fx-interactions.spec.ts`'s identical helper. Duplicated
  *  locally rather than imported — this task's brief scopes edits to this
@@ -157,11 +157,20 @@ function newTaskModelSelect(page: Page): Locator {
  * inside the very next `<dd>` sibling. `panel` should already be scrolled to
  * / have its "Task details" `<details>` expanded before this resolves
  * anything.
+ *
+ * Walks up via `ancestor::dt[1]` rather than a single `..` hop: since #204
+ * (task-details header — icon-only button row with hover tooltips) the
+ * button is wrapped in `<Tooltip>`, which renders its own `<span>` around
+ * the trigger — so the button's immediate parent is that span, not the
+ * `<dt>` itself, and a bare `..` landed on the span (with no `dd`
+ * following-sibling) instead of the `dt`. `ancestor::dt[1]` finds the
+ * nearest enclosing `<dt>` regardless of how many wrapper elements (Tooltip
+ * or otherwise) sit between it and the button.
  */
 function detailsModelSelect(panel: Locator): Locator {
   return panel
     .getByTestId("refresh-models-details")
-    .locator("xpath=../following-sibling::dd[1]")
+    .locator("xpath=ancestor::dt[1]/following-sibling::dd[1]")
     .locator("select");
 }
 

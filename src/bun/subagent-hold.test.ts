@@ -315,7 +315,7 @@ test("cancelled wins over a hold: task goes to ready, not running", async () => 
 
   // Cancel immediately — the fake driver's success path doesn't resolve
   // `done()` until ~20ms, so this races ahead of it deterministically.
-  const cancelled = cancelRun(runId);
+  const cancelled = await cancelRun(runId);
   expect(cancelled).toBe(true);
 
   await wait(250);
@@ -495,7 +495,7 @@ test("Stop on a held task releases it: cancelRun orphans subagents and moves the
   // side effect (best-effort Ctrl+C) — it never reads the return value, so
   // whatever `/bin/echo` makes the underlying tmux probe report doesn't
   // change the outcome here; the assertion is on cancelRun's own return.
-  const cancelled = cancelRun(runId);
+  const cancelled = await cancelRun(runId);
   expect(cancelled).toBe(true);
 
   const task = tasks.get(taskId);
@@ -619,7 +619,7 @@ test("cancelled wins over a monitor hold: task goes to ready, not running", asyn
 
   // Cancel immediately — the fake driver's success path doesn't resolve
   // `done()` until ~20ms, so this races ahead of it deterministically.
-  const cancelled = cancelRun(runId);
+  const cancelled = await cancelRun(runId);
   expect(cancelled).toBe(true);
 
   await wait(250);

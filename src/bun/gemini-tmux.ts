@@ -12,9 +12,9 @@ import {
 } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { dataDir } from "./db.ts";
-import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
+import { createDeathProbe } from "./session-liveness.ts";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import {
   DEATH_JSONL_QUIET_MS,
@@ -22,6 +22,7 @@ import {
   deathTickOutcome,
   fileWrittenWithin,
   killSessionByName,
+  panePidFor,
   sessionExistsByName,
   sessionLiveness,
   sessionNameFor,
@@ -350,38 +351,62 @@ function startGeminiTailer(state: GeminiSessionState): Promise<number> {
   // tmux hiccup on the shared socket resets the counter, and a gemini log
   // written a beat ago vetoes it — so a live one-shot run is never wrongly
   // torn down (mirrors codex-tmux's death watch; see `sessionLiveness`).
+  // Fork-free liveness — see `createDeathProbe`: a `kill(pid, 0)` on the
+  // pane's process per tick; the `has-session` fork only confirms a dead pid
+  // or re-validates periodically.
+  const probe = createDeathProbe({
+    sessionName: state.sessionName,
+    authoritative: sessionLiveness,
+    resolvePid: panePidFor,
+  });
   let misses = 0;
+  // Guards a tick against overlapping the previous one now that the
+  // authoritative probe is awaited (no timeout — an owner decision, see
+  // docs/plans/fix-task-details-load-delay.md §8): without it, a stalled
+  // tmux round-trip could let a second 400ms tick start concurrently and
+  // double-count a `wait` outcome. The decision logic itself is unchanged.
+  let tickInFlight = false;
   state.deathTimer = setInterval(() => {
-    tryWatch();
-    const liveness = sessionLiveness(state.sessionName);
-    const outcome = deathTickOutcome({
-      liveness,
-      logFresh: liveness === "gone" && fileWrittenWithin(state.logPath, DEATH_JSONL_QUIET_MS),
-      misses,
-      threshold: DEATH_MISS_THRESHOLD,
-    });
-    if (outcome === "reset") { misses = 0; return; }
-    if (outcome === "wait") { misses++; return; }
-    // Session gone. Give the FS a beat to surface the final bytes, flush, then
-    // resolve with whatever terminal code we saw (default: failed — a gemini
-    // process that vanished without a `result` event did not succeed).
-    setTimeout(() => {
-      flushGeminiLog(state);
-      // If the final flush surfaced a terminal `result` event,
-      // resolveGeminiDone already fired — this was an orderly finish, not a
-      // death, so don't emit the "session ended" sentinel.
-      if (!state.resolved) {
-        // Emit the shared sentinel so the orchestrator flips the card to
-        // `blocked` (via makeChunkHandler) and the user sees WHY the run
-        // stopped in the stream, instead of a silent drop to `ready`.
-        state.onChunk(
-          "status",
-          `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`,
-        );
+    if (tickInFlight) return;
+    tickInFlight = true;
+    void (async () => {
+      try {
+        tryWatch();
+        const liveness = await probe.probe();
+        const outcome = deathTickOutcome({
+          liveness,
+          logFresh: liveness === "gone" && fileWrittenWithin(state.logPath, DEATH_JSONL_QUIET_MS),
+          misses,
+          threshold: DEATH_MISS_THRESHOLD,
+        });
+        if (outcome === "reset") { misses = 0; return; }
+        if (outcome === "wait") { misses++; return; }
+        // Session gone. Give the FS a beat to surface the final bytes, flush, then
+        // resolve with whatever terminal code we saw (default: failed — a gemini
+        // process that vanished without a `result` event did not succeed).
+        setTimeout(() => {
+          flushGeminiLog(state);
+          // If the final flush surfaced a terminal `result` event,
+          // resolveGeminiDone already fired — this was an orderly finish, not a
+          // death, so don't emit the "session ended" sentinel.
+          if (!state.resolved) {
+            // Emit the shared sentinel so the orchestrator flips the card to
+            // `blocked` (via makeChunkHandler) and the user sees WHY the run
+            // stopped in the stream, instead of a silent drop to `ready`.
+            state.onChunk(
+              "status",
+              `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`,
+            );
+          }
+          resolveGeminiDone(state, state.lastCode ?? 1);
+        }, DEATH_GRACE_MS);
+        if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
+      } catch {
+        /* never crash the watch */
+      } finally {
+        tickInFlight = false;
       }
-      resolveGeminiDone(state, state.lastCode ?? 1);
-    }, DEATH_GRACE_MS);
-    if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
+    })();
   }, DEATH_POLL_MS);
 
   return done;
@@ -392,6 +417,9 @@ function startGeminiTailer(state: GeminiSessionState): Promise<number> {
  * ────────────────────────────────────────────────────────────────────────── */
 
 const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+
+// `spawnTmuxNewSession` (launches gemini's detached hosting session) lives in
+// tmux-resolution.ts — shared verbatim with codex-tmux.ts/cursor-tmux.ts.
 
 export interface GeminiLaunchOptions {
   taskId: string;
@@ -410,7 +438,7 @@ export interface GeminiLaunchOptions {
  * `stream-json` log. Returns a `SpawnedAgent` whose `done` resolves when the
  * turn ends (0 on a `result` event with `status: "success"`, 1 otherwise).
  */
-export function spawnGeminiViaTmux(opts: GeminiLaunchOptions): SpawnedAgent {
+export async function spawnGeminiViaTmux(opts: GeminiLaunchOptions): Promise<SpawnedAgent> {
   ensureLogDir();
   const logPath = geminiLogPath(opts.runId);
   // Truncate/create the log up front so the tailer's first stat succeeds and
@@ -419,7 +447,7 @@ export function spawnGeminiViaTmux(opts: GeminiLaunchOptions): SpawnedAgent {
 
   const sessionName = sessionNameFor(opts.taskId);
   // Defensive: a zombie session under this name would make new-session fail.
-  killSessionByName(sessionName);
+  await killSessionByName(sessionName);
 
   const tmux = resolveTmuxBin();
   // No stdin redirect — unlike codex, gemini's prompt is already an argv
@@ -439,7 +467,7 @@ export function spawnGeminiViaTmux(opts: GeminiLaunchOptions): SpawnedAgent {
     ...envArgs,
     "--", "sh", "-c", inner,
   ];
-  const res = spawnSync(tmux, args, { encoding: "utf8" });
+  const res = await spawnTmuxNewSession(tmux, args);
 
   const state: GeminiSessionState = {
     taskId: opts.taskId,
@@ -463,7 +491,7 @@ export function spawnGeminiViaTmux(opts: GeminiLaunchOptions): SpawnedAgent {
   if (res.status !== 0) {
     // tmux failed to launch the session — surface stderr and resolve failed
     // synchronously so the run doesn't hang in `running`.
-    const detail = (res.stderr || res.error?.message || "tmux new-session failed").trim();
+    const detail = (res.stderr || "tmux new-session failed").trim();
     opts.onChunk("stderr", `failed to start gemini session: ${detail}`, undefined);
     const done = Promise.resolve(1);
     return { kill: () => { /* nothing to kill */ }, writeInput: () => false, done };
@@ -487,11 +515,24 @@ export function spawnGeminiViaTmux(opts: GeminiLaunchOptions): SpawnedAgent {
  * resolution code here is immaterial to the recorded status.
  */
 function killGeminiState(state: GeminiSessionState): void {
-  killSessionByName(state.sessionName);
-  setTimeout(() => {
-    flushGeminiLog(state);
-    resolveGeminiDone(state, state.lastCode ?? 1);
-  }, DEATH_GRACE_MS);
+  // `kill` is a synchronous `SpawnedAgent` field (shared contract in
+  // claude-tmux.ts), so the now-async tmux kill is fired-and-forgotten here
+  // rather than awaited — never left unhandled: a rejection still falls
+  // through to schedule the flush + resolve so the run can't hang.
+  void (async () => {
+    try {
+      await killSessionByName(state.sessionName);
+    } catch {
+      // best-effort — killSessionByName is expected to never throw (its
+      // underlying tmux() swallows spawn errors into an ok:false result),
+      // but this path must never leave the run stuck in `running` even if
+      // that changes.
+    }
+    setTimeout(() => {
+      flushGeminiLog(state);
+      resolveGeminiDone(state, state.lastCode ?? 1);
+    }, DEATH_GRACE_MS);
+  })();
 }
 
 export interface GeminiReattachOptions {
@@ -510,8 +551,8 @@ export interface GeminiReattachOptions {
  * resolves `done` when the turn finishes. Returns null when the session is no
  * longer alive (caller should orphan the run).
  */
-export function reattachGeminiSession(opts: GeminiReattachOptions): SpawnedAgent | null {
-  if (!sessionExistsByName(opts.sessionName)) return null;
+export async function reattachGeminiSession(opts: GeminiReattachOptions): Promise<SpawnedAgent | null> {
+  if (!(await sessionExistsByName(opts.sessionName))) return null;
   const state: GeminiSessionState = {
     taskId: opts.taskId,
     runId: opts.runId,
@@ -549,11 +590,11 @@ export function geminiSessionActive(taskId: string): boolean {
  * archiveTask and on a cross-kind agent switch. Safe to call when no gemini
  * session exists (kills any stray session under the task's name too).
  */
-export function dropGeminiSession(taskId: string): void {
+export async function dropGeminiSession(taskId: string): Promise<void> {
   const state = geminiSessions.get(taskId);
   if (state) {
     disposeGeminiState(state);
     geminiSessions.delete(taskId);
   }
-  killSessionByName(sessionNameFor(taskId));
+  await killSessionByName(sessionNameFor(taskId));
 }

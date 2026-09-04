@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Check, ChevronDown, Search } from "lucide-react";
 import { Input } from "./input";
 import { cn } from "@/lib/utils";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 
 export interface MultiSearchSelectItem<T extends string = string> {
   value: T;
@@ -144,6 +145,7 @@ export function MultiSearchSelect<T extends string>({
             <Search className="size-3.5 shrink-0 opacity-60" aria-hidden />
             <Input
               ref={searchRef}
+              {...IDENTIFIER_INPUT_PROPS}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder={placeholder}

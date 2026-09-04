@@ -29,9 +29,10 @@ import {
   DEFAULT_EFFORT,
   CATALOG_SCOPED_KINDS,
   supportedEfforts,
+  cursorModelIdCoveredByCatalog,
   type AgentKind,
 } from "../../shared/types.ts";
-import { mergeModelOptions, type DiscoveredModel } from "../../shared/model-options.ts";
+import { mergeModelOptions, discoveredEffortsFor, type DiscoveredModel } from "../../shared/model-options.ts";
 import { buildFileEntries } from "../../shared/at-file-filter.ts";
 import { unresolvedAtTokens } from "../../shared/at-refs.ts";
 
@@ -328,6 +329,32 @@ function baseInput(o: AddOpts, title: string, prompt: string): CreateTaskInput {
   };
 }
 
+/** Seed for the interactive model picker: the stored `lastModel:<kind>` pref
+ *  when it is still offerable — a curated row for the kind, or an id the
+ *  harness's discovered catalog actually lists (fx accounts can carry
+ *  discovered-only ids) — else the kind's default. Mirrors the two webview
+ *  pickers' validation so a retired id (e.g. gemini-3-pro-preview, shut down
+ *  2026-03-09 and cleared by migration 049) can't be re-offered as the
+ *  pre-selected default via mergeModelOptions' unlisted-row rule. `loggedIn`
+ *  mirrors mergeModelOptions rule 7: a logged-out harness's discovered
+ *  catalog is untrustworthy (an expired login reads back the unauthenticated
+ *  catalog), so it is not consulted — only curated rows can keep the pref. */
+export function resolveInitialModel(
+  kind: AgentKind,
+  stored: string | undefined | null,
+  discovered: readonly DiscoveredModel[],
+  loggedIn: boolean | null = null,
+): string {
+  const offerable = loggedIn === false ? [] : discovered;
+  if (
+    stored &&
+    (AGENT_OPTIONS[kind].models.some((m) => m.id === stored) || offerable.some((m) => m.id === stored))
+  ) {
+    return stored;
+  }
+  return DEFAULT_MODEL[kind];
+}
+
 async function wizard(
   client: AgetorClient,
   o: AddOpts,
@@ -353,7 +380,7 @@ async function wizard(
 
   // Load harnesses + saved preferences once, for the agent / model / mode /
   // effort defaults — so the common picks are a single Enter.
-  const { harnesses } = await client
+  const { harnesses, statuses } = await client
     .listHarnesses()
     .catch(() => ({ harnesses: [], statuses: [] }));
   const prefs = await client.getPreferences().catch(() => ({}) as Record<string, string>);
@@ -387,20 +414,40 @@ async function wizard(
 
   const kind: AgentKind = harnesses.find((h) => h.id === agent)?.kind ?? "claude-code";
 
+  // Prefer the per-harness catalog (keyed by harness id, e.g. distinguishes
+  // an additional `fx-2` account from the built-in `fx`); fall back to the
+  // kind-level map for an older daemon without `/agent-models/harnesses`.
+  // Computed once agent/kind are known so the model picker and the effort
+  // prompt below read the same discovered list.
+  // Spec'd cursor models show as one base row + effort dropdown, not N
+  // suffixed rows — same filter as the webview pickers (NewTaskForm.tsx).
+  const catalog: DiscoveredModel[] = ((agent && harnessModels.byHarness[agent]) || discovered[kind] || []).filter(
+    (m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id),
+  );
+  const loggedIn = statuses.find((s) => s.harnessId === agent)?.loggedIn ?? null;
+
+  // Picker seed: an explicit `--model` wins verbatim (unknown ids pass
+  // through — house convention); otherwise the stored `lastModel:<kind>`
+  // pref only while it is still offerable (`resolveInitialModel`, which
+  // mirrors the webview pickers' validation and rule 7's logged-out
+  // distrust), else the kind's default.
+  const initial = o.model ?? resolveInitialModel(kind, prefs[`lastModel:${kind}`], catalog, loggedIn);
+
+  // Hoisted so both the model picker and the effort prompt below read the
+  // same merged rows — computed unconditionally (not just inside the
+  // `!model` branch) since `--model` can be passed without `--effort`, and
+  // the effort prompt still needs rule-7/8-honoring `efforts` per model.
+  const modelOptions = mergeModelOptions({
+    curated: AGENT_OPTIONS[kind].models,
+    discovered: catalog,
+    selected: initial,
+    scoped: CATALOG_SCOPED_KINDS.has(kind),
+    loggedIn,
+  });
+
   let model = o.model;
   if (!model) {
-    const initial = prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind];
-    // Prefer the per-harness catalog (keyed by harness id, e.g. distinguishes
-    // an additional `fx-2` account from the built-in `fx`); fall back to the
-    // kind-level map for an older daemon without `/agent-models/harnesses`.
-    const catalog: DiscoveredModel[] = (agent && harnessModels.byHarness[agent]) || discovered[kind] || [];
-    const options = mergeModelOptions({
-      curated: AGENT_OPTIONS[kind].models,
-      discovered: catalog,
-      selected: initial,
-      scoped: CATALOG_SCOPED_KINDS.has(kind),
-    });
-    const picked = await pickOption("Model", options, initial);
+    const picked = await pickOption("Model", modelOptions, initial);
     if (picked === null) return cancelled();
     model = picked;
   }
@@ -412,7 +459,12 @@ async function wizard(
   }
   let effort = o.effort;
   if (!effort) {
-    const efforts = supportedEfforts(kind, model ?? null);
+    // Efforts must come from the merged rows, never the raw discovered
+    // catalog — `modelOptions` already honours rule 7 (a logged-out
+    // harness's discovered catalog is untrusted) and rule 8 (`efforts` is
+    // computed per merged row), so reading `catalog` directly here would
+    // bypass both.
+    const efforts = supportedEfforts(kind, model ?? null, discoveredEffortsFor(modelOptions, model));
     if (efforts.length > 0) {
       const picked = await pickOption("Effort", efforts, prefs[`lastEffort:${kind}`] ?? DEFAULT_EFFORT[kind]);
       if (picked === null) return cancelled();

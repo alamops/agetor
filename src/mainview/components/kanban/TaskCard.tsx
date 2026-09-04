@@ -82,7 +82,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         "relative cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
         type.borderClass,
         isDragging && "opacity-50",
-        awaiting && "ring-2 ring-warning/60 ring-offset-2 ring-offset-background animate-awaiting-pulse motion-reduce:animate-none",
+        awaiting && "ring-2 ring-warning/60 ring-offset-2 ring-offset-background",
         archived && "cursor-default opacity-60",
       )}
       // `onClick` (open) stays untouched by the addition below — a
@@ -122,7 +122,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         // deliberately unanimated (the amber awaiting-pulse ring is the only
         // animated attention state). Pinned to the corner so it coexists
         // with that ring (an outline) without visual conflict, and sits
-        // above the header badge stack in the DOM/paint order.
+        // above the header's row-1 harness badge in the DOM/paint order.
         <span
           // -1.5 offsets keep the dot's background halo clear of the
           // awaiting state's ring-offset outline instead of notching it.
@@ -132,50 +132,38 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
           aria-label="New messages"
         />
       )}
-      <CardHeader className="pb-2">
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex min-w-0 flex-1 items-start gap-1.5">
+      <CardHeader className="pb-2 space-y-1">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
             <TypeIcon
-              className={cn("mt-0.5 size-3.5 shrink-0", type.iconClass)}
+              className={cn("size-3.5 shrink-0", type.iconClass)}
               aria-label={type.label}
             />
-            <CardTitle className="text-sm min-w-0 flex-1 break-words">{task.title}</CardTitle>
-          </div>
-          <div className="flex shrink-0 flex-col items-end gap-1">
-            <Badge variant="secondary" className="gap-1">
-              <AgentIcon kind={task.agent} className="size-3" />
-              {task.agent}
-            </Badge>
-            {(task.model || task.mode) && (
-              <span className="text-[10px] font-mono text-muted-foreground">
-                {[task.model, task.mode].filter(Boolean).join(" · ")}
-              </span>
-            )}
-            {task.openTerminalCount > 0 && (
-              <Badge
-                variant="outline"
-                className="gap-1 text-[10px]"
-                title={`${task.openTerminalCount} open terminal${task.openTerminalCount > 1 ? "s" : ""}`}
-              >
-                <Terminal className="size-3" />
-                {task.openTerminalCount}
-              </Badge>
-            )}
             {runningSubagents > 0 && (
               <Badge
                 variant="outline"
-                className="gap-1 text-[10px]"
+                className="gap-1 text-[10px] shrink-0"
                 title={`${runningSubagents} background task${runningSubagents > 1 ? "s" : ""} running`}
               >
                 <Bot className="size-3" />
                 {runningSubagents}
               </Badge>
             )}
+            {task.openTerminalCount > 0 && (
+              <Badge
+                variant="outline"
+                className="gap-1 text-[10px] shrink-0"
+                title={`${task.openTerminalCount} open terminal${task.openTerminalCount > 1 ? "s" : ""}`}
+              >
+                <Terminal className="size-3" />
+                {task.openTerminalCount}
+              </Badge>
+            )}
             {task.todoProgress && task.todoProgress.total > 0 && (
               <Badge
                 variant="outline"
                 className={cn(
-                  "gap-1 text-[10px]",
+                  "gap-1 text-[10px] shrink-0",
                   task.todoProgress.completed === task.todoProgress.total
                     ? "text-success"
                     : "text-muted-foreground",
@@ -187,7 +175,17 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               </Badge>
             )}
           </div>
+          <Badge variant="secondary" className="gap-1 shrink-0">
+            <AgentIcon kind={task.agent} className="size-3" />
+            {task.agent}
+          </Badge>
         </div>
+        {(task.model || task.mode) && (
+          <span className="self-end text-[10px] font-mono text-muted-foreground">
+            {[task.model, task.mode].filter(Boolean).join(" · ")}
+          </span>
+        )}
+        <CardTitle className="text-sm break-words">{task.title}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-2">
         <p className="text-xs text-muted-foreground line-clamp-2">{task.prompt}</p>
@@ -270,6 +268,21 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
           </Button>
         </div>
       </CardContent>
+      {/* The "waiting on you" glow. A separate overlay whose OPACITY pulses,
+          rather than animating `filter: drop-shadow` on the card itself:
+          filter animations re-rasterize the whole card on the CPU every
+          frame (60–120 Hz, for as long as the card is awaiting), whereas an
+          opacity animation is compositor-only. The shadow is static and
+          paints outside the overlay's box, so the overlay is invisible over
+          the card's own content and `pointer-events-none` keeps clicks and
+          drags untouched. */}
+      {awaiting && (
+        <span
+          aria-hidden
+          className="pointer-events-none absolute inset-0 rounded-[inherit] animate-awaiting-pulse motion-reduce:animate-none"
+          style={{ boxShadow: "0 0 14px hsl(var(--warning) / 0.85)" }}
+        />
+      )}
     </Card>
   );
 }

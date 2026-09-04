@@ -124,7 +124,7 @@ test.skipIf(!HAVE_TMUX)(
       // outlived the process, or a fresh boot before reattach rebuilds
       // state): `paneGrowInFlight` is only checked on a state that exists,
       // so healing must still proceed via the plain sessionExists() path.
-      healWindowSize(taskId);
+      await healWindowSize(taskId);
 
       const after = Bun.spawnSync([
         tmuxBin, ...sockArgs, "show-window-options", "-t", sessionName, "window-size",

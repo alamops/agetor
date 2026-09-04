@@ -188,11 +188,11 @@ export interface AvailableExtension {
  *  built-in harness only — see `HarnessModelMap` for the per-harness list a
  *  multi-account setup needs. */
 export interface AgentModelMap {
-  "claude-code": { id: string; label?: string }[];
-  "codex": { id: string; label?: string }[];
-  "cursor": { id: string; label?: string }[];
-  "gemini": { id: string; label?: string }[];
-  "fx": { id: string; label?: string }[];
+  "claude-code": { id: string; label?: string; efforts?: string[] }[];
+  "codex": { id: string; label?: string; efforts?: string[] }[];
+  "cursor": { id: string; label?: string; efforts?: string[] }[];
+  "gemini": { id: string; label?: string; efforts?: string[] }[];
+  "fx": { id: string; label?: string; efforts?: string[] }[];
 }
 
 /** Per-harness model id list from `GET /agent-models/harnesses` — one entry
@@ -200,10 +200,12 @@ export interface AgentModelMap {
  *  their kind's list so callers have a single lookup keyed by harness id,
  *  which is what `task.agent` / the New Task form's `agent` state hold).
  *  `ready` is false until the boot discovery sweep has resolved at least
- *  once — before that, `byHarness` may be incomplete or empty. */
+ *  once — before that, `byHarness` may be incomplete or empty. `efforts`
+ *  carries the CLI-discovered per-model reasoning-effort ids (codex only
+ *  today; see `discoveredEffortsFor` in `src/shared/model-options.ts`). */
 export interface HarnessModelMap {
   ready: boolean;
-  byHarness: Record<string, { id: string; label?: string }[]>;
+  byHarness: Record<string, { id: string; label?: string; efforts?: string[] }[]>;
 }
 
 /** Pending multi-question card from claude's built-in AskUserQuestion tool

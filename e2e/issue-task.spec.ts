@@ -503,13 +503,32 @@ test.describe("task from a Git issue", () => {
     await expect(panel.getByTestId("view-issue")).toBeVisible();
 
     // Close the run panel before right-clicking the card below — the panel
-    // is a fixed 520px-wide overlay that can sit on top of a board card in
+    // is a fixed-position overlay (default 720px wide) that can sit on top of a board card in
     // a narrow test viewport, which would otherwise intercept the click. The
     // panel never unmounts (App.tsx keeps it mounted and slides it off with
     // a `translate-x-full` CSS transform), so `toBeHidden()` never fires —
     // wait for that class instead, which is what actually clears it from the
     // click's hit-test.
-    await page.keyboard.press("Escape");
+    //
+    // Close via the header button, NOT `keyboard.press("Escape")`: the
+    // panel's document-level Escape listener is gated on RunPanel's `open`
+    // state, which flips true only in a requestAnimationFrame scheduled a
+    // render after `mountedTask` commits (mount at translate-x-full, then
+    // animate in). The textarea/view-issue visibility waits above resolve
+    // before that rAF fires — `toBeVisible()` ignores transforms — so under
+    // full-suite CPU load a single Escape can land in the window where no
+    // listener is attached yet and the panel never closes (observed as a
+    // 20s timeout load-flake). The button's `onClick={onClose}` is wired
+    // unconditionally on an always-rendered element, so the click is
+    // race-free regardless of rAF timing (same pattern as
+    // unread-indicator.spec.ts).
+    //
+    // The header X ("Close task details"), NOT the backdrop scrim: the scrim
+    // spans the whole viewport but the resizable panel `<aside>` overlays an
+    // arbitrary share of it, so any scrim click coordinate is silently
+    // coupled to the panel width and the test viewport. The header X lives
+    // INSIDE the panel, so the panel can never occlude it.
+    await panel.getByRole("button", { name: "Close task details" }).click();
     await expect(panel).toHaveClass(/translate-x-full/, { timeout: CONVERGE_TIMEOUT });
 
     // Context menu also offers "View issue", and it reopens the Git dialog

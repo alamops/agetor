@@ -48,7 +48,8 @@ async function probeVersion(bin: string, env: Record<string, string>): Promise<s
  * harnesses we additionally probe `--help` and look for a marker string
  * unique to Vercel's fx ("coding agent" — real fx v0.0.4 says "Fast, native
  * coding agent for the terminal"; the JSON viewer's says "Terminal JSON
- * viewer"). Doesn't gate on exit code — some CLIs exit non-zero for --help.
+ * viewer"; re-verified present on v0.0.6 and v0.0.7 — the marker probe is
+ * still safe). Doesn't gate on exit code — some CLIs exit non-zero for --help.
  */
 async function probeHelp(bin: string, env: Record<string, string>): Promise<string | null> {
   const proc = Bun.spawn([bin, "--help"], {
@@ -118,17 +119,57 @@ async function probeJson(bin: string, args: string[], env: Record<string, string
  *   - a future fx renaming or dropping the `auth` field must degrade to
  *     "unknown", not "logged out" — see A1 in the plan doc: the authenticated
  *     value of `auth` is unverified, only `"missing"` is confirmed.
- * Only `auth === "missing"` (from a real fx binary that answered the probe)
- * is treated as a positive "logged out" signal; every other parseable value
- * is treated as logged in.
+ * Two combinations are treated as a positive "logged out" signal; every other
+ * parseable value — including any absent or non-boolean field along the way —
+ * is treated as logged in, exactly as before:
+ *   - `auth === "missing"` (from a real fx binary that answered the probe);
+ *   - `auth !== "missing"` but `auth_expired === true` (strict boolean) AND
+ *     `auth_refreshable === false` (strict boolean) — a 0.0.7+ expired,
+ *     non-refreshable login. Real `fx acp` would fail this at `initialize`
+ *     with fx's own raw -32600 anyway (see fx-acp.ts's `RpcError.rawMessage`
+ *     passthrough for that same code), so a friendly pre-flight refusal here
+ *     is strictly better than letting the run fail unexplained later. An
+ *     expired login that's still refreshable (`auth_refreshable` anything but
+ *     strict `false` — absent, non-boolean, or `true`) stays fail-open on
+ *     purpose: fx may silently refresh the token on real use (`fx acp`), and
+ *     this passive probe never attempts a refresh, so it can't prove the
+ *     login is actually dead — blocking here would be a false "logged out"
+ *     for a session fx would happily revive.
  *
- * Empirically verified auth values (real fx v0.0.6 binary, `HOME` pointed at
- * an empty dir so no ambient credentials leak in): no credentials at all →
- * `auth:"missing"` + `auth_help`; `AI_GATEWAY_API_KEY` set → `auth:
- * "AI_GATEWAY_API_KEY"`; `VERCEL_OIDC_TOKEN` set → `auth:"VERCEL_OIDC_TOKEN"`
- * — i.e. env-var auth IS reflected in the probe's output, and since this
- * probe runs with the same `harnessEnv(harness)` a real spawn uses, a
- * key-authenticated user is never gated out here. The probe writes no files.
+ * This expired-login gate is exempt entirely when `auth` is one of the
+ * env-key values (`"AI_GATEWAY_API_KEY"` / `"VERCEL_OIDC_TOKEN"`) — those
+ * `auth` values mean the ACTIVE auth mechanism is the env key, not a stored
+ * login, so a stale *stored* login must never refuse a run that would
+ * authenticate via the key. Whether fx even emits `auth_expired` alongside
+ * env-key auth is unobserved (these fields were only ever seen on real `fx
+ * login` accounts, never on an env-key-authenticated probe), and the gate
+ * deliberately exempts them anyway so the long-standing guarantee "a
+ * key-authenticated user is never gated out here" stays literally true. The
+ * expired-login gate thus applies only to login-style `auth` values (e.g.
+ * `"fx login"`, provider subscription logins like `"fx login codex"`).
+ *
+ * Empirically verified auth values (real fx binary, v0.0.6 and v0.0.7 —
+ * `HOME` pointed at an empty dir so no ambient credentials leak in): no
+ * credentials at all → `auth:"missing"` + `auth_help`; `AI_GATEWAY_API_KEY`
+ * set → `auth:"AI_GATEWAY_API_KEY"`; `VERCEL_OIDC_TOKEN` set → `auth:
+ * "VERCEL_OIDC_TOKEN"` — i.e. env-var auth IS reflected in the probe's
+ * output, and since this probe runs with the same `harnessEnv(harness)` a
+ * real spawn uses, a key-authenticated user is never gated out here. The
+ * probe writes no files.
+ *
+ * 0.0.7 additions (verified 2026-08-31 against a live fx 0.0.7 binary, build
+ * cef08aa0f178, real logged-in account): `status --json` gained an
+ * always-present `mcp:{connection_check,servers,configuration_issues,
+ * inspection_error}` object and `mcp_config_warning` — both purely additive
+ * and ignored here by construction (only `auth`, `auth_help`, `auth_expired`,
+ * `auth_refreshable` are read, matching every JSON-parsing probe's
+ * unknown-fields-are-fine contract) — plus `auth_expired`, `auth_refreshable`,
+ * and `team` appearing on real login accounts. Observed live on one such
+ * account with an expired session: `auth:"fx login"`, `auth_expired:true`,
+ * `auth_refreshable:true`, `team` present — i.e. real accounts do exercise
+ * the refreshable branch above, and in that state passive probes (this one
+ * included) see the unauthenticated model catalog, which is a separate,
+ * already-fail-open concern (`discoverFx`), not this gate's job.
  */
 async function probeStatus(bin: string, env: Record<string, string>): Promise<{ loggedIn: boolean | null; authHelp: string | null }> {
   const out = await probeJson(bin, ["status", "--json"], env);
@@ -142,14 +183,36 @@ async function probeStatus(bin: string, env: Record<string, string>): Promise<{ 
   }
 
   if (typeof parsed !== "object" || parsed === null) return { loggedIn: null, authHelp: null };
-  const auth = (parsed as Record<string, unknown>).auth;
+  const record = parsed as Record<string, unknown>;
+  const auth = record.auth;
   if (typeof auth !== "string") return { loggedIn: null, authHelp: null };
 
   if (auth === "missing") {
-    const authHelp = (parsed as Record<string, unknown>).auth_help;
+    const authHelp = record.auth_help;
     return {
       loggedIn: false,
       authHelp: typeof authHelp === "string" ? authHelp : "Run fx login to sign in.",
+    };
+  }
+
+  // 0.0.7+: an authenticated-but-expired, non-refreshable login. Strict on
+  // both booleans by design — see the doc comment above for why every other
+  // combination (absent/non-boolean/`auth_refreshable !== false`) must stay
+  // fail-open instead of joining this branch. Env-key auth is exempt from
+  // this gate entirely (see the doc comment above) — the active auth
+  // mechanism there is the key, not a stored login, so a stale stored login
+  // must never refuse a run that would authenticate via the key.
+  if (
+    auth !== "AI_GATEWAY_API_KEY" &&
+    auth !== "VERCEL_OIDC_TOKEN" &&
+    record.auth_expired === true &&
+    record.auth_refreshable === false
+  ) {
+    const authHelp = record.auth_help;
+    return {
+      loggedIn: false,
+      authHelp:
+        typeof authHelp === "string" ? authHelp : "fx login has expired — run fx login to sign in again.",
     };
   }
 
@@ -228,8 +291,15 @@ const TMUX_INSTALL_HINT = "brew install tmux (macOS) or apt install tmux (Debian
  * above) for this one call. Start (`orchestrator.ts`'s `startTask`) passes
  * `{ freshAuth: true }` — a user who just ran `fx login` must not be refused
  * for up to `STATUS_CACHE_TTL_MS` by a stale cached `false`. The 15s
- * `/harnesses` poll can tolerate that staleness (it's just painting a status
- * dot), so it omits the option and reads from cache.
+ * `/harnesses` poll can tolerate that staleness for its own purpose (it's
+ * just painting a status dot), so it omits the option and reads from cache
+ * — but `loggedIn` now has a second consumer: `mergeModelOptions`'s rule 7
+ * (`src/shared/model-options.ts`) uses it to decide whether a picker trusts
+ * the harness's discovered catalog. A stale cached `false` therefore also
+ * transiently collapses the model list to the non-gated curated rows for up
+ * to `STATUS_CACHE_TTL_MS` — self-healing on the next post-expiry poll, and
+ * never hit by `startTask` itself since that call always passes
+ * `freshAuth: true`.
  */
 export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolean }): Promise<HarnessStatus> {
   const bin = resolveBin(harness);

@@ -9,6 +9,7 @@ import {
 import { api, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
 import { EXPAND_EVENT, isExpandTargetFor } from "@/lib/expand-on-jump";
 import { latestPrProposal } from "@/lib/pr-proposal";
@@ -20,9 +21,12 @@ import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { shortenTaskPaths } from "@/lib/shorten-task-paths";
+import { reconcileById } from "@/lib/reconcile";
+import { RUN_PANEL_DEFAULT_WIDTH, RUN_PANEL_MIN_WIDTH, clampPanelWidth, readPanelWidth, writePanelWidth } from "@/lib/panel-width";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Badge, badgeVariants } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -42,6 +46,8 @@ import {
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
+  EFFORT_OPTIONS,
+  retainableEfforts,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -60,7 +66,7 @@ import {
   type TaskReference,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
-import { mergeModelOptions } from "../../../shared/model-options.ts";
+import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
 import { parseIssueUrl } from "../../../shared/issue-task.ts";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
@@ -68,7 +74,7 @@ import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
-import { parseUserMessage, splitReferences } from "@/lib/command-message";
+import { parseUserMessage, splitReferences, parseMessageSegments, type MessageSegment } from "../../../shared/user-message.ts";
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
 import { AttachmentChips } from "./AttachmentChips";
@@ -83,6 +89,7 @@ import { deriveTodoProgress } from "@/lib/todo-progress";
 import { TodoProgressCard } from "./TodoProgressCard";
 import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
 import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink } from "./md-components";
+import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent } from "./MessageSegments";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -138,6 +145,8 @@ type StreamEvent = RunEvent & { id: number; dbId?: number };
 interface Props {
   /** When null, the panel slides off-screen and unmounts after the exit animation. */
   task: Task | null;
+  /** Pin the current user message while its response scrolls (default mode). */
+  stickyUserMessages: boolean;
   agents: AgentStatus[];
   /** Registered harnesses — needed so the panel's agent dropdown can list
    *  every known harness (built-ins + aliases). */
@@ -268,11 +277,81 @@ function formatUsageCount(n: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
   const [open, setOpen] = useState<boolean>(!!task);
+
+  // User-resizable width, persisted in localStorage (`panel-width.ts`).
+  // Resolved synchronously in the initializer — an effect-time read would
+  // paint the default width first and snap. Live drag frames update only
+  // this local state; the committed value (drag end / keyboard / reset) is
+  // also written to storage.
+  const [width, setWidth] = useState<number>(() => readPanelWidth(window.innerWidth));
+  const [resizing, setResizing] = useState(false);
+  const dragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
+  // The user's chosen width, independent of the current viewport clamp —
+  // shrinking the window squeezes `width` down (resize listener below) but
+  // re-growing it restores this preference rather than the squeezed value.
+  const preferredWidthRef = useRef(width);
+
+  const commitWidth = useCallback((w: number) => {
+    preferredWidthRef.current = w;
+    setWidth(w);
+    writePanelWidth(w);
+  }, []);
+
+  // Single owner for every non-React consumer of the width: publish it as a
+  // CSS custom property on the document root. The Toaster's offset reads
+  // `var(--run-panel-width)` instead of threading the value through App —
+  // no mirror state, and any future consumer is a zero-prop CSS read.
+  useEffect(() => {
+    document.documentElement.style.setProperty("--run-panel-width", `${width}px`);
+    return () => {
+      document.documentElement.style.removeProperty("--run-panel-width");
+    };
+  }, [width]);
+
+  // Re-clamp when the window resizes, so state can never disagree with the
+  // rendered width (the CSS `max-w-[90vw]` on the `<aside>` would otherwise
+  // win silently and leave stale numbers in the CSS variable above —
+  // off-screen toasts on a persisted-wide panel in a shrunken window).
+  useEffect(() => {
+    const onResize = () => setWidth(clampPanelWidth(preferredWidthRef.current, window.innerWidth));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const onResizePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    dragRef.current = { pointerId: e.pointerId, startX: e.clientX, startWidth: width };
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setResizing(true);
+  };
+  const onResizePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    // Panel is anchored to the right edge, so dragging LEFT grows it.
+    setWidth(clampPanelWidth(drag.startWidth + (drag.startX - e.clientX), window.innerWidth));
+  };
+  const onResizePointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    dragRef.current = null;
+    setResizing(false);
+    // Recompute from the event rather than reading `width` — the last
+    // pointermove's setState may not have flushed into this closure yet.
+    commitWidth(clampPanelWidth(drag.startWidth + (drag.startX - e.clientX), window.innerWidth));
+  };
+  const onResizeKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // Handle sits on the panel's LEFT edge: ArrowLeft moves it left = wider.
+    const delta = e.key === "ArrowLeft" ? 32 : e.key === "ArrowRight" ? -32 : 0;
+    if (delta === 0) return;
+    e.preventDefault();
+    commitWidth(clampPanelWidth(width + delta, window.innerWidth));
+  };
 
   useEffect(() => {
     if (task) {
@@ -338,18 +417,51 @@ export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, 
         aria-label="Close task panel"
         onClick={onClose}
         className={cn(
-          "fixed inset-0 z-30 bg-background/40 backdrop-blur-sm transition-opacity duration-200",
+          // Deliberately NO backdrop blur utility: a full-window backdrop filter makes
+          // WebKit re-blur the entire board every frame anything beneath it
+          // repaints or animates (an awaiting card's glow, a poll-driven
+          // re-render) for as long as the panel is open — i.e. exactly while
+          // the user sits watching a run. A slightly denser plain scrim gives
+          // the same "focus on the panel" read for zero per-frame cost.
+          "fixed inset-0 z-30 bg-background/50 transition-opacity duration-200",
           open ? "opacity-100" : "pointer-events-none opacity-0",
         )}
       />
       <aside
+        style={{ width }}
         className={cn(
-          "fixed right-0 top-0 z-40 flex h-full w-[520px] max-w-[90vw] flex-col border-l border-border/60 bg-card shadow-2xl transition-transform duration-300 ease-out",
+          "fixed right-0 top-0 z-40 flex h-full max-w-[90vw] flex-col border-l border-border/60 bg-card shadow-2xl transition-transform duration-300 ease-out",
           open ? "translate-x-0" : "translate-x-full",
         )}
       >
+        {/* Resize handle on the panel's left edge. `touch-none` so pointer
+            capture isn't hijacked by scroll gestures; `select-none` plus the
+            pointerdown preventDefault keep a drag from starting a text
+            selection in the transcript underneath. */}
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize task panel"
+          aria-valuenow={width}
+          aria-valuemin={RUN_PANEL_MIN_WIDTH}
+          tabIndex={0}
+          data-testid="run-panel-resize"
+          onPointerDown={onResizePointerDown}
+          onPointerMove={onResizePointerMove}
+          onPointerUp={onResizePointerEnd}
+          onPointerCancel={onResizePointerEnd}
+          onDoubleClick={() => commitWidth(clampPanelWidth(RUN_PANEL_DEFAULT_WIDTH, window.innerWidth))}
+          onKeyDown={onResizeKeyDown}
+          title="Drag to resize · double-click to reset"
+          className={cn(
+            "absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize touch-none select-none outline-none transition-colors",
+            "hover:bg-primary/40 focus-visible:bg-primary/40",
+            resizing && "bg-primary/50",
+          )}
+        />
         <RunPanelBody
           task={mountedTask}
+          stickyUserMessages={stickyUserMessages}
           agents={agents}
           harnesses={harnesses}
           agentModels={agentModels}
@@ -376,6 +488,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, 
  */
 function RunPanelBody({
   task,
+  stickyUserMessages,
   agents,
   harnesses,
   agentModels,
@@ -392,6 +505,7 @@ function RunPanelBody({
   onViewIssue,
 }: {
   task: Task;
+  stickyUserMessages: boolean;
   agents: AgentStatus[];
   harnesses: Harness[];
   agentModels: AgentModelMap;
@@ -619,7 +733,7 @@ function RunPanelBody({
     return () => { cancelled = true; };
   }, [task.id]);
 
-  // Stable identity so RunEventList's memoized section tree isn't invalidated
+  // Stable identity so RunEventList's memoized block tree isn't invalidated
   // on every parent re-render (e.g. the 2s runs poll). `setInteractions` is a
   // stable setter, so the empty dep list is correct.
   const dismissInteraction = useCallback(
@@ -667,7 +781,7 @@ function RunPanelBody({
       try {
         const list = await api.listRuns(task.id);
         if (cancelled) return;
-        setRuns(list);
+        setRuns((prev) => reconcileById(prev, list, (r) => r.id));
       } catch { /* task may have been deleted */ }
     };
     const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
@@ -732,7 +846,14 @@ function RunPanelBody({
           const byId = new Map<string, Subagent>();
           for (const s of cur) byId.set(s.id, s);
           for (const s of list) byId.set(s.id, s);
-          return [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1));
+          // Identity-preserving: hand back `cur` itself when nothing changed,
+          // so this backstop poll can't re-render the whole open panel every
+          // 2s while a run merely streams (see `reconcileById`).
+          return reconcileById(
+            cur,
+            [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1)),
+            (s) => s.id,
+          );
         });
       } catch { /* task may have been deleted */ }
     };
@@ -1440,10 +1561,10 @@ function RunPanelBody({
   }, [matches, task.id, activeStream, rebuilt, rebuiltScopeKey]);
 
   // Highlight + scroll the active match imperatively rather than through a
-  // React prop/memo dep: `RunEventList`'s `sections` memo used to take
+  // React prop/memo dep: `RunEventList`'s `blocks` memo used to take
   // `activeMatchId` as a dep purely so it could stamp a highlight class on
   // one wrapper div, which meant re-deriving (and re-diffing) the ENTIRE
-  // section tree on every match navigation. Toggling classList directly on
+  // block tree on every match navigation. Toggling classList directly on
   // the previous/next `[data-evid]` element is O(1) instead. Runs after the
   // resolve effect above (and after any tab/task/rebuild-scope switch), so by
   // the time this fires `activeMatchId` already points at an event rendered
@@ -2176,7 +2297,7 @@ function RunPanelBody({
         setRebuildNote(null);
         // Refresh the runs list right away so the new run row appears
         // immediately, rather than waiting up to 2s for the next poll.
-        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
         // Pin the view to the newest content the moment the message is
         // accepted — the user's own message lands first, followed by
         // streamed assistant chunks. The unified task-level stream picks
@@ -2282,7 +2403,7 @@ function RunPanelBody({
         setRebuildNote(null);
         // No optimistic git-status touch here (main's #94 dropped that): the
         // git-status polling effect keeps `gitStatus` current on its own.
-        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
         nearBottomRef.current = true;
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -2383,7 +2504,7 @@ function RunPanelBody({
       if (res.delivered) {
         setRebuilt(null);
         setRebuildNote(null);
-        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
         nearBottomRef.current = true;
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -2451,7 +2572,7 @@ function RunPanelBody({
       if (res.delivered) {
         setRebuilt(null);
         setRebuildNote(null);
-        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
         nearBottomRef.current = true;
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -2575,18 +2696,8 @@ function RunPanelBody({
 
   return (
     <>
-      <header className="flex items-start justify-between gap-2 border-b border-border/60 p-3">
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-semibold">{task.title}</div>
-          <div className="truncate text-xs text-muted-foreground">
-            {task.agent} · {task.column}
-            {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
-            {task.baseRef && (
-              <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
-            )}
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
+      <header className="border-b border-border/60 p-3">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           {/* Lives in the header (not the composer chip row) so the link stays
               reachable on archived tasks and after orphan reconciliation
               clears the resumable run — pr_url is durable, the link must be
@@ -2594,133 +2705,165 @@ function RunPanelBody({
               subpage directly; otherwise (an unrecognized provider URL
               shape) fall back to the plain external link, as before. */}
           {prUrl && (
-            parsePullNumber(prUrl) != null ? (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => onViewPullRequest({ projectPath: task.workdir, prUrl })}
-                title="Open the pull request created for this task"
-              >
-                <GitPullRequest className="mr-1 size-3" /> View PR
-              </Button>
-            ) : (
-              <ExternalLink
-                href={prUrl}
-                className={cn(buttonVariants({ variant: "outline", size: "sm" }), "no-underline hover:no-underline")}
-                title="Open the pull request created for this task"
-              >
-                <GitPullRequest className="mr-1 size-3" /> View PR
-              </ExternalLink>
-            )
+            <Tooltip align="end" label="Open the pull request created for this task">
+              {parsePullNumber(prUrl) != null ? (
+                <Button
+                  size="icon"
+                  variant="outline"
+                  onClick={() => onViewPullRequest({ projectPath: task.workdir, prUrl })}
+                  aria-label="View PR"
+                >
+                  <GitPullRequest className="size-4" />
+                </Button>
+              ) : (
+                <ExternalLink
+                  href={prUrl}
+                  className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
+                  aria-label="View PR"
+                >
+                  <GitPullRequest className="size-4" />
+                </ExternalLink>
+              )}
+            </Tooltip>
           )}
           {/* Durable "View issue" sibling of "View PR" above — same
               rationale (header, not the composer chip row) and the same
               in-app-detail-vs-external-link branch, keyed on whether
               `issueUrl` parses to a recognized provider issue URL. */}
           {issueUrl && (
-            parseIssueUrl(issueUrl) != null ? (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => onViewIssue({ projectPath: task.workdir, issueUrl })}
-                title="Open the issue this task was created from"
-                data-testid="view-issue"
-              >
-                <CircleDot className="mr-1 size-3" /> View issue
-              </Button>
-            ) : (
-              <ExternalLink
-                href={issueUrl}
-                className={cn(buttonVariants({ variant: "outline", size: "sm" }), "no-underline hover:no-underline")}
-                title="Open the issue this task was created from"
-                data-testid="view-issue"
-              >
-                <CircleDot className="mr-1 size-3" /> View issue
-              </ExternalLink>
-            )
+            <Tooltip align="end" label="Open the issue this task was created from">
+              {parseIssueUrl(issueUrl) != null ? (
+                <Button
+                  size="icon"
+                  variant="outline"
+                  onClick={() => onViewIssue({ projectPath: task.workdir, issueUrl })}
+                  aria-label="View issue"
+                  data-testid="view-issue"
+                >
+                  <CircleDot className="size-4" />
+                </Button>
+              ) : (
+                <ExternalLink
+                  href={issueUrl}
+                  className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
+                  aria-label="View issue"
+                  data-testid="view-issue"
+                >
+                  <CircleDot className="size-4" />
+                </ExternalLink>
+              )}
+            </Tooltip>
           )}
           {/* Manual re-check — only once a first fetch has settled, so it
               doesn't appear (and immediately duplicate) the initial load. */}
           {parsedPrUrl && (prStatus != null || prStatusError != null) && (
+            <Tooltip align="end" label={prStatusError ?? "Re-check PR mergeability"}>
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={refreshPrStatus}
+                disabled={prStatusLoading}
+                aria-label={prStatusError ? `Re-check PR status — ${prStatusError}` : "Re-check PR status"}
+              >
+                <RefreshCw className="size-4" />
+              </Button>
+            </Tooltip>
+          )}
+          <Tooltip align="end" label="View this task's changes (git diff)">
             <Button
               size="icon"
-              variant="ghost"
-              onClick={refreshPrStatus}
-              disabled={prStatusLoading}
-              title={prStatusError ?? "Re-check PR mergeability"}
+              variant="outline"
+              onClick={() => onShowDiff(task)}
+              aria-label="View diff"
             >
-              <RefreshCw className="size-3.5" />
+              <GitCompare className="size-4" />
             </Button>
-          )}
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => onShowDiff(task)}
-            title="View this task's changes (git diff)"
-          >
-            <GitCompare className="mr-1 size-3" /> Diff
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() =>
-              void api.openPath({
-                path: task.worktreePath ?? task.workdir,
-                taskId: task.id,
-              }).catch(() => { /* swallowed — openPath failures are best-effort */ })
-            }
-            title={
+          </Tooltip>
+          <Tooltip
+            align="end"
+            label={
               task.worktreePath
                 ? `Open the worktree in your file manager: ${task.worktreePath}`
                 : `Open the project workdir in your file manager: ${task.workdir}`
             }
           >
-            <FolderOpen className="mr-1 size-3" /> Open
-          </Button>
+            <Button
+              size="icon"
+              variant="outline"
+              onClick={() =>
+                void api.openPath({
+                  path: task.worktreePath ?? task.workdir,
+                  taskId: task.id,
+                }).catch(() => { /* swallowed — openPath failures are best-effort */ })
+              }
+              aria-label="Open working folder"
+            >
+              <FolderOpen className="size-4" />
+            </Button>
+          </Tooltip>
           {/* Stop targets the main run. Hide it while viewing a read-only
               background-agent tab so the control doesn't read as "stop this
               agent" — switch back to Main to stop the task. */}
           {!archived && canControl && activeStream === "main" && (
-            <Button size="sm" variant="destructive" onClick={stop}>
-              <Square className="mr-1 size-3" /> Stop
-            </Button>
+            <Tooltip align="end" label="Stop">
+              <Button size="icon" variant="destructive" onClick={stop} aria-label="Stop">
+                <Square className="size-4" />
+              </Button>
+            </Tooltip>
           )}
           {!archived && (task.column === "done" || active) && (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => onArchive(task)}
-              title={active ? "Stop the running agent and archive task" : "Archive task"}
-            >
-              <Archive className="mr-1 size-3" /> Archive
-            </Button>
+            <Tooltip align="end" label={active ? "Stop the running agent and archive task" : "Archive task"}>
+              <Button
+                size="icon"
+                variant="outline"
+                onClick={() => onArchive(task)}
+                aria-label={active ? "Stop the running agent and archive task" : "Archive task"}
+              >
+                <Archive className="size-4" />
+              </Button>
+            </Tooltip>
           )}
           {archived && (
-            <Button size="sm" variant="outline" onClick={() => onUnarchive(task)} title="Unarchive task">
-              <ArchiveRestore className="mr-1 size-3" /> Unarchive
-            </Button>
+            <Tooltip align="end" label="Unarchive task">
+              <Button size="icon" variant="outline" onClick={() => onUnarchive(task)} aria-label="Unarchive">
+                <ArchiveRestore className="size-4" />
+              </Button>
+            </Tooltip>
           )}
-          <Button
-            size="icon"
-            variant="ghost"
-            title="Search messages"
-            onClick={() => {
-              if (searchOpen) {
-                closeSearch();
-                return;
-              }
-              setSearchOpen(true);
-              // The input isn't mounted yet on the render this triggers (the
-              // bar renders conditionally on `searchOpen`) — focus after the
-              // next paint.
-              requestAnimationFrame(() => searchInputRef.current?.focus());
-            }}
-          >
-            <Search className="size-4" />
-          </Button>
-          <Button size="icon" variant="ghost" onClick={onClose}>
-            <X className="size-4" />
-          </Button>
+          <Tooltip align="end" label="Search messages">
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="Search messages"
+              aria-expanded={searchOpen}
+              onClick={() => {
+                if (searchOpen) {
+                  closeSearch();
+                  return;
+                }
+                setSearchOpen(true);
+                // The input isn't mounted yet on the render this triggers (the
+                // bar renders conditionally on `searchOpen`) — focus after the
+                // next paint.
+                requestAnimationFrame(() => searchInputRef.current?.focus());
+              }}
+            >
+              <Search className="size-4" />
+            </Button>
+          </Tooltip>
+          <Tooltip align="end" label="Close task details">
+            <Button size="icon" variant="ghost" onClick={onClose} aria-label="Close task details">
+              <X className="size-4" />
+            </Button>
+          </Tooltip>
+        </div>
+        <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
+        <div className="mt-0.5 truncate text-xs text-muted-foreground">
+          {task.agent} · {task.column}
+          {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
+          {task.baseRef && (
+            <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
+          )}
         </div>
       </header>
 
@@ -2730,6 +2873,7 @@ function RunPanelBody({
             <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
             <Input
               ref={searchInputRef}
+              {...IDENTIFIER_INPUT_PROPS}
               aria-label="Search messages"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
@@ -2750,29 +2894,35 @@ function RunPanelBody({
           <span aria-live="polite" className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
             {matches.length === 0 ? "0/0" : `${activeMatchPosition + 1}/${matches.length}`}
           </span>
-          <Button
-            size="icon"
-            variant="ghost"
-            className="size-7"
-            disabled={matches.length === 0}
-            title="Previous match"
-            onClick={() => stepSearch(-1)}
-          >
-            <ChevronUp className="size-3.5" />
-          </Button>
-          <Button
-            size="icon"
-            variant="ghost"
-            className="size-7"
-            disabled={matches.length === 0}
-            title="Next match"
-            onClick={() => stepSearch(1)}
-          >
-            <ChevronDown className="size-3.5" />
-          </Button>
-          <Button size="icon" variant="ghost" className="size-7" title="Close search" onClick={closeSearch}>
-            <X className="size-3.5" />
-          </Button>
+          <Tooltip align="end" label="Previous match">
+            <Button
+              size="icon"
+              variant="ghost"
+              className="size-7"
+              disabled={matches.length === 0}
+              onClick={() => stepSearch(-1)}
+              aria-label="Previous match"
+            >
+              <ChevronUp className="size-3.5" />
+            </Button>
+          </Tooltip>
+          <Tooltip align="end" label="Next match">
+            <Button
+              size="icon"
+              variant="ghost"
+              className="size-7"
+              disabled={matches.length === 0}
+              onClick={() => stepSearch(1)}
+              aria-label="Next match"
+            >
+              <ChevronDown className="size-3.5" />
+            </Button>
+          </Tooltip>
+          <Tooltip align="end" label="Close search">
+            <Button size="icon" variant="ghost" className="size-7" onClick={closeSearch} aria-label="Close search">
+              <X className="size-3.5" />
+            </Button>
+          </Tooltip>
         </div>
       )}
 
@@ -2902,6 +3052,7 @@ function RunPanelBody({
               </div>
               <RunEventList
                 events={displayedEvents}
+                stickyUserMessages={stickyUserMessages}
                 interactions={interactions}
                 onInteractionResolved={dismissInteraction}
                 runStatus={activeRunStatus}
@@ -3167,25 +3318,28 @@ function RunPanelBody({
               />
             }
             trailing={
-              <Button
-                size="icon"
-                onClick={() => void send()}
-                disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
-                title={
-                  // Distinguish "live session exists" from "needs resume" — not
-                  // "turn in flight". `liveRunId` (task.runId) stays set while the
-                  // tmux session is alive (including between turns) and is only
-                  // null once the session is gone (orphan-reconciled), which is the
-                  // resume path. Keying off `canControl` here would mislabel the
-                  // common "session alive, no turn in flight" state as a resume.
-                  liveRunId
-                    ? "Send to the live agent"
-                    : "Resume the conversation with this message"
-                }
-                className="h-16 w-12 shrink-0"
+              // Distinguish "live session exists" from "needs resume" — not
+              // "turn in flight". `liveRunId` (task.runId) stays set while the
+              // tmux session is alive (including between turns) and is only
+              // null once the session is gone (orphan-reconciled), which is the
+              // resume path. Keying off `canControl` here would mislabel the
+              // common "session alive, no turn in flight" state as a resume.
+              <Tooltip
+                align="end"
+                side="top"
+                className="shrink-0"
+                label={liveRunId ? "Send to the live agent" : "Resume the conversation with this message"}
               >
-                <Send className="size-4" />
-              </Button>
+                <Button
+                  size="icon"
+                  onClick={() => void send()}
+                  disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
+                  aria-label="Send"
+                  className="h-16 w-12 shrink-0"
+                >
+                  <Send className="size-4" />
+                </Button>
+              </Tooltip>
             }
             rows={2}
             textareaClassName="h-16 min-h-0 w-full resize-none text-xs pr-8"
@@ -3526,57 +3680,71 @@ function BacklogItemRow({
       </div>
       {!readOnly && (
         <div className="flex shrink-0 items-center gap-0.5 opacity-60 transition-opacity group-hover:opacity-100">
-          <button
-            type="button"
-            className={BACKLOG_ICON_BTN}
-            disabled={index === 0 || busy}
-            onClick={() => onMove(-1)}
-            title="Move up"
-          >
-            <ArrowUp className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={BACKLOG_ICON_BTN}
-            disabled={index === total - 1 || busy}
-            onClick={() => onMove(1)}
-            title="Move down"
-          >
-            <ArrowDown className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={BACKLOG_ICON_BTN}
-            onClick={onStartEdit}
-            title="Edit"
-          >
-            <FilePenLine className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={BACKLOG_ICON_BTN}
-            disabled={!canSend || busy}
-            onClick={onSend}
-            // `canSend` here is the parent's `canSend && !modalPending`, so it
-            // goes false for two different reasons — no live/resumable session,
-            // or a prompt is waiting. Keep the copy true for both.
-            title={
+          <Tooltip align="end" side="top" label="Move up">
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              disabled={index === 0 || busy}
+              onClick={() => onMove(-1)}
+              aria-label="Move up"
+            >
+              <ArrowUp className="size-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip align="end" side="top" label="Move down">
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              disabled={index === total - 1 || busy}
+              onClick={() => onMove(1)}
+              aria-label="Move down"
+            >
+              <ArrowDown className="size-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip align="end" side="top" label="Edit">
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              onClick={onStartEdit}
+              aria-label="Edit"
+            >
+              <FilePenLine className="size-3.5" />
+            </button>
+          </Tooltip>
+          {/* `canSend` here is the parent's `canSend && !modalPending`, so it
+              goes false for two different reasons — no live/resumable session,
+              or a prompt is waiting. Keep the copy true for both. */}
+          <Tooltip
+            align="end"
+            side="top"
+            label={
               canSend
                 ? "Send now"
                 : "Can't send right now — run the task, or answer the pending prompt first"
             }
           >
-            <Send className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={cn(BACKLOG_ICON_BTN, "hover:bg-destructive/10 hover:text-destructive")}
-            disabled={busy}
-            onClick={onDelete}
-            title="Delete"
-          >
-            <Trash2 className="size-3.5" />
-          </button>
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              disabled={!canSend || busy}
+              onClick={onSend}
+              aria-label="Send now"
+            >
+              <Send className="size-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip align="end" side="top" label="Delete">
+            <button
+              type="button"
+              className={cn(BACKLOG_ICON_BTN, "hover:bg-destructive/10 hover:text-destructive")}
+              disabled={busy}
+              onClick={onDelete}
+              aria-label="Delete"
+            >
+              <Trash2 className="size-3.5" />
+            </button>
+          </Tooltip>
         </div>
       )}
     </div>
@@ -3919,6 +4087,7 @@ type RunIndicatorMode = "off" | "active";
 
 function RunEventList({
   events,
+  stickyUserMessages,
   interactions = [],
   onInteractionResolved,
   runStatus,
@@ -3932,6 +4101,8 @@ function RunEventList({
   pathRoots,
 }: {
   events: RunEvent[];
+  /** True groups turns and pins each user message for its own response. */
+  stickyUserMessages: boolean;
   interactions?: PendingInteraction[];
   onInteractionResolved?: (id: string) => void;
   runStatus?: Run["status"] | null;
@@ -4049,7 +4220,7 @@ function RunEventList({
   // Index plans by their raw (possibly-`\n`-containing) toolCallId so the
   // `tool_use` case below can do an O(1) lookup instead of a per-render scan
   // over `plans` — same perf rationale as `resultByToolId` above; this map
-  // is one of the `sections` memo's deps, not recomputed inside its loop.
+  // is one of the `blocks` memo's deps, not recomputed inside its loop.
   //
   // Keyed on a content signature (`plansKey`), not `plans` itself: the
   // `plans` state mirror in `RunPanelBody` gets a fresh array identity on
@@ -4058,7 +4229,7 @@ function RunEventList({
   // only renders `id`/`name`/`toolCallId`/`status` — `toolCallId` never
   // changes for a given plan record and `name` is fixed at creation, so
   // `id:status` is the only content that can invalidate what gets rendered.
-  // Without this, `sections` (a dep-of-`planByToolCallId` memo) recomputed
+  // Without this, `blocks` (a dep-of-`planByToolCallId` memo) recomputed
   // — and re-parsed every markdown block in a long conversation — on every
   // poll tick regardless of whether a plan changed.
   const plansKey = plans.map((p) => `${p.id}:${p.status}`).join("|");
@@ -4091,12 +4262,10 @@ function RunEventList({
     return slots;
   }, [normalised, sortedInteractions]);
 
-  // Group events into sections delimited by user messages. Each section
-  // wraps its user message (sticky) and the events that followed it, so
-  // the user-message bubble pins to the top of the scroll viewport only
-  // for the duration of its own section — when the next user message
-  // appears in view, the previous one releases naturally rather than
-  // stacking on top of it.
+  // Render either turn-grouped sections with a sticky user-message header or
+  // one flat, normally scrolling block list. Settings defaults to the former
+  // because keeping the last sent message visible is useful while
+  // multitasking; users who prefer a standard chat list select the latter.
   //
   // Memoized over the parsed inputs: this rebuilds the rendered element tree
   // only when the events / interactions / tool-result map actually change.
@@ -4106,7 +4275,7 @@ function RunEventList({
   // poll is what made long conversations lag. `renderEvent`/`renderInteraction`
   // live inside so their captured deps (`resultByToolId`, `onInteractionResolved`,
   // `planByToolCallId`, `onOpenPlan`) are tracked explicitly.
-  const sections = useMemo(() => {
+  const blocks = useMemo(() => {
     // Wrap a rendered block in the `data-evid` carrier the search bar scrolls
     // to and imperatively highlights (`logRef.current?.querySelector('[data-
     // evid="…"]')` in RunPanelBody — see the highlight effect there). `evid`
@@ -4117,11 +4286,9 @@ function RunEventList({
     // identity/props untouched. Only STATIC classes belong here — the
     // highlight ring itself is toggled by the DOM effect in RunPanelBody, not
     // by a render-time class, so this memo doesn't need `activeMatchId` as a
-    // dep (re-deriving the whole section tree on every match navigation was
-    // the point being fixed). `extraClassName` lets a specific stream (only
-    // `user`, below) opt into a class that has to live on THIS wrapper rather
-    // than on the block's own root — sticky positioning needs to be applied
-    // to the element that's actually the flex child of the scroll container.
+    // dep (re-deriving the whole block tree on every match navigation was
+    // the point being fixed). `extraClassName` is used only by sticky mode:
+    // the wrapper, as the direct flex child, is the element that must pin.
     // Returns `null` (no wrapper at all) when `node` is nullish, so an event
     // with nothing to render (e.g. an unparseable orphan tool_result — see
     // the `tool_result` case below) doesn't still leave a phantom empty div
@@ -4142,12 +4309,14 @@ function RunEventList({
     const renderEvent = (e: RunEvent, key: string, evid: number): React.ReactNode[] => {
       switch (e.stream) {
         case "user":
-          // Sticky positioning lives on this wrapper, not on
-          // `UserMessageBlock`'s own root — the wrapper is the actual flex
-          // child of the scroll container (`sections.map` below renders one
-          // `<section>` per user-message group), so THIS is the element that
-          // has to pin to `top-0` for the sticky header to work at all.
-          return [wrap(key, evid, <UserMessageBlock text={e.data} taskId={taskId} pathRoots={pathRoots} />, "sticky top-0 z-10")];
+          return [
+            wrap(
+              key,
+              evid,
+              <UserMessageBlock text={e.data} taskId={taskId} pathRoots={pathRoots} />,
+              stickyUserMessages ? "sticky top-0 z-10" : undefined,
+            ),
+          ];
         case "assistant":
           return [wrap(key, evid, <AssistantBlock text={e.data} />)];
         case "thinking":
@@ -4238,37 +4407,62 @@ function RunEventList({
       }
     };
 
-    const out: { key: string; header: React.ReactNode; body: React.ReactNode[] }[] = [];
-    // Stable per-section key = the key of the section's first event (`ts-index`,
-    // unique and append-stable), so appending events keeps earlier sections'
-    // identity instead of reindexing them as the old `sec-${idx}` key did.
-    let current: { key: string; header: React.ReactNode; body: React.ReactNode[] } = { key: "", header: null, body: [] };
+    if (stickyUserMessages) {
+      const sections: { key: string; header: React.ReactNode; body: React.ReactNode[] }[] = [];
+      // Preamble events before the first user message share an initial
+      // headerless section. Each subsequent user message starts a new turn;
+      // its sticky lifetime naturally ends at that section's boundary.
+      let current: { key: string; header: React.ReactNode; body: React.ReactNode[] } = {
+        key: "",
+        header: null,
+        body: [],
+      };
+      for (let i = 0; i < normalised.length; i++) {
+        const e = normalised[i]!;
+        const key = `${e.ts}-${i}`;
+        const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
+        if (e.stream === "user") {
+          if (current.header !== null || current.body.length > 0) sections.push(current);
+          current = { key, header: renderEvent(e, key, i)[0] ?? null, body: [...before] };
+        } else {
+          if (current.key === "") current.key = key;
+          current.body.push(...before, ...renderEvent(e, key, i));
+        }
+      }
+      current.body.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
+      if (current.header !== null || current.body.length > 0) sections.push(current);
+      return sections.map((section, index) => (
+        <section key={section.key || `section-${index}`} className="flex flex-col gap-4">
+          {section.header}
+          {section.body}
+        </section>
+      ));
+    }
+
+    const out: React.ReactNode[] = [];
     for (let i = 0; i < normalised.length; i++) {
       const e = normalised[i]!;
       const key = `${e.ts}-${i}`;
       const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
       if (e.stream === "user") {
-        if (current.header !== null || current.body.length > 0) out.push(current);
-        current = { key, header: renderEvent(e, key, i)[0] ?? null, body: [...before] };
+        // Order quirk preserved from the old section grouping: an
+        // interaction slotted AT a user message's index renders after the
+        // message (it used to land in the new section's body, below the
+        // section's header).
+        out.push(...renderEvent(e, key, i), ...before);
       } else {
-        if (current.key === "") current.key = key;
-        current.body.push(...before, ...renderEvent(e, key, i));
+        out.push(...before, ...renderEvent(e, key, i));
       }
     }
-    const tail = (interactionByIndex.get(normalised.length) ?? []).map(renderInteraction);
-    current.body.push(...tail);
-    if (current.header !== null || current.body.length > 0) out.push(current);
+    // Interactions that fired after the last event ("since the run
+    // finished") spill out at the bottom.
+    out.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, pathRoots, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, pathRoots, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId, stickyUserMessages]);
 
   return (
     <div className="flex flex-col gap-4">
-      {sections.map((s, idx) => (
-        <section key={s.key || `sec-${idx}`} className="flex flex-col gap-4">
-          {s.header}
-          {s.body}
-        </section>
-      ))}
+      {blocks}
       {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
       {holdSummary && <HoldingIndicator text={holdSummary} />}
     </div>
@@ -4445,10 +4639,13 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   // visual position after expand/collapse.
   const pendingAdjustRef = useRef<{ scroller: HTMLElement; prevHeight: number } | null>(null);
 
-  // Recognize slash-command invocations (XML expansion or plain echo) and
-  // `<local-command-stdout>` blocks so they render as structured UI instead
-  // of literal `<command-*>` tags. `null` for an ordinary message — the
-  // fallback branch below renders exactly what this component always has.
+  // Recognize slash-command invocations (XML expansion or plain echo),
+  // `<local-command-stdout>` blocks, and (see `src/shared/user-message.ts`'s
+  // "tagged" kind) any other message carrying balanced top-level tags — a
+  // background skill launch, a shell escape, or a user's own prompt tags —
+  // so all of these render as structured UI instead of literal `<tag>` text.
+  // `null` for an ordinary message — the fallback branch below renders
+  // exactly what this component always has.
   const parsed = useMemo(() => parseUserMessage(text), [text]);
 
   // For an ordinary (non-command) message, split off a trailing "Referenced
@@ -4483,10 +4680,35 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
 
   // Display-only: fold expanded absolute paths under the task's own roots
   // back to the `@rel` mention the user typed (send-time expansion produced
-  // them — see CLAUDE.md §12). Applied to the rendered markdown body ONLY;
-  // the references arrays keep absolute paths for chips/previews.
+  // them — see CLAUDE.md §12). Applied to the rendered markdown/segment body
+  // ONLY; the references arrays keep absolute paths for chips/previews.
+  // Shortening runs BEFORE segmentation below: it never touches tag markup
+  // (tags aren't paths) and it already skips code spans itself, so the
+  // segment parser sees the folded text and both features compose.
   const displayCommandArgs = pathRoots?.length ? shortenTaskPaths(commandArgsText, pathRoots) : commandArgsText;
   const displayOrdinaryArgs = pathRoots?.length ? shortenTaskPaths(ordinaryArgsText, pathRoots) : ordinaryArgsText;
+
+  // A slash command's args are an intended user message too — segment them
+  // the same general way a `tagged` message's text is segmented below, so a
+  // command invoked with e.g. `<context>…</context>` in its args also gets
+  // structured rendering instead of literal tag text. Unused (and cheap:
+  // `commandArgsText` is `""`) when `parsed.kind !== "command"`.
+  const commandSegments = useMemo(
+    () => parseMessageSegments(displayCommandArgs),
+    [displayCommandArgs],
+  );
+
+  // For the `tagged` kind: strip `[Image #N]` placeholders when the message
+  // carries references (mirroring the command/ordinary branches above), fold
+  // paths, then segment. Always re-segments from the display text — the
+  // pre-parsed `parsed.segments` can't be reused once shortening may have
+  // rewritten path strings inside them. Unused (and cheap) when
+  // `parsed.kind !== "tagged"`.
+  const taggedSegments = useMemo((): MessageSegment[] => {
+    if (!parsed || parsed.kind !== "tagged") return [];
+    const text = parsed.references.length > 0 ? stripImagePlaceholders(parsed.text) : parsed.text;
+    return parseMessageSegments(pathRoots?.length ? shortenTaskPaths(text, pathRoots) : text);
+  }, [parsed, pathRoots]);
 
   // Default to the collapsed ~3-line cap and measure once mounted. The cap
   // is always rendered so short messages don't flash full-height first;
@@ -4505,7 +4727,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
     // shortening derives from `pathRoots` too, which changes when a task's
     // worktree materializes — measuring `text` alone left a stale
     // "Show more" on bubbles whose folded content no longer overflows.
-  }, [displayCommandArgs, displayOrdinaryArgs]);
+  }, [displayCommandArgs, displayOrdinaryArgs, taggedSegments]);
 
   // After expand/collapse commits, apply the saved scroll-top compensation.
   useLayoutEffect(() => {
@@ -4534,16 +4756,12 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
 
   return (
     <div className="flex justify-end">
-      <div ref={bubbleRef} className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/30 bg-card/50 px-3 py-1.5 text-foreground shadow-sm backdrop-blur-md">
+      <div ref={bubbleRef} className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/30 bg-card px-3 py-1.5 text-foreground shadow-sm">
         {parsed?.kind === "command-output" ? (
           <>
-            <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
-              command output
-            </div>
+            <MachineLabel>command output</MachineLabel>
             <div ref={contentRef} className={collapseClassName}>
-              <div className="whitespace-pre-wrap font-mono text-[11px] text-muted-foreground">
-                {parsed.output || "—"}
-              </div>
+              <CommandOutputBody output={parsed.output} />
             </div>
           </>
         ) : parsed?.kind === "command" ? (
@@ -4559,12 +4777,18 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
             </div>
             {commandArgsText && (
               <div ref={contentRef} className={collapseClassName}>
-                <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
-                  {displayCommandArgs}
-                </ReactMarkdown>
+                <MessageSegments segments={commandSegments} />
               </div>
             )}
             <AttachmentChips references={parsed.command.references} taskId={taskId} />
+          </>
+        ) : parsed?.kind === "tagged" ? (
+          <>
+            {hasAuthoredContent(taggedSegments) && <MachineLabel>you</MachineLabel>}
+            <div ref={contentRef} className={collapseClassName}>
+              <MessageSegments segments={taggedSegments} />
+            </div>
+            <AttachmentChips references={parsed.references} taskId={taskId} />
           </>
         ) : (
           <>
@@ -4639,7 +4863,7 @@ const StatusDivider = memo(function StatusDivider({ text }: { text: string }) {
  *  `onExpand` when `root` is (or contains) the element that dispatched it —
  *  the imperative counterpart to that effect, so a jump onto a match inside
  *  a collapsed tool-call card / result fold / thinking block reveals it
- *  without threading new props through the `sections` memo. */
+ *  without threading new props through the `blocks` memo. */
 function useExpandOnJump(rootRef: React.RefObject<HTMLDivElement | null>, onExpand: () => void) {
   useEffect(() => {
     const handler = (evt: Event) => {
@@ -5124,7 +5348,7 @@ function ToolResultBody({ result, openSignal = 0 }: { result: ParsedToolResult; 
   // doesn't exist yet to catch the bubbling `EXPAND_EVENT`, so `ToolUseBlock`
   // also bumps this counter (in its own jump-expand callback) and hands it
   // down as a prop — safe for the memo'd tree since it originates from
-  // `ToolUseBlock`'s own local state, not from the `sections` memo. A mount
+  // `ToolUseBlock`'s own local state, not from the `blocks` memo. A mount
   // with `openSignal > 0` opens the fold immediately; incrementing (rather
   // than a boolean) means a repeat jump to the same block re-opens it even
   // if the user had since collapsed it manually.
@@ -5289,6 +5513,7 @@ function TaskDetails({
   const [refreshingModels, setRefreshingModels] = useState(false);
   const editable = task.column !== "running" && task.column !== "blocked";
   const kind = harnessKindOf(task.agent, harnesses);
+  const selectedStatus = agents.find((a) => a.harnessId === task.agent);
 
   const save = async (patch: Partial<Task>) => {
     try {
@@ -5301,23 +5526,100 @@ function TaskDetails({
     }
   };
 
+  // Memoized so the merge (curated ∪ discovered, rule 1–7) only re-runs when
+  // one of its actual inputs changes, not on every streamed-event render.
+  // Declared before the effort memos below because they read from it —
+  // per rule 8/rule 7, effort discovery must go through the same
+  // logged-out-distrusting merge the Model picker uses, not the raw
+  // discovered list.
+  const modelOptions = useMemo(
+    () => mergedModels(
+      kind,
+      task.agent,
+      agentModels,
+      harnessModels,
+      task.model ?? DEFAULT_MODEL[kind],
+      selectedStatus?.loggedIn ?? null,
+    ),
+    [kind, task.agent, agentModels, harnessModels, task.model, selectedStatus?.loggedIn],
+  );
+
   // Effort is per (agent, model) — e.g. xhigh isn't valid for Sonnet 4.6,
   // and Haiku 4.5 doesn't accept the effort param at all. When the user picks
   // a model that no longer supports the saved effort, drop it back to the
   // kind's default effort (if supported) or null when the model is the
   // Haiku-style "no effort" case. Same pattern as the new-task form.
+  //
+  // The CLI's own discovered per-model efforts (when reported) win over the
+  // curated table for what the picker OFFERS — see `supportedEfforts`'s
+  // third argument. But the cascade below deliberately checks the wider
+  // `retainableEfforts` union (discovered ∪ curated), not just what's
+  // offered right now: a discovery refresh that happens to omit an id (e.g.
+  // `none`, which Codex's own `model/list` never lists even though the API
+  // accepts it) must not silently PATCH away an effort the user already
+  // chose. Only an effort neither source supports triggers the fallback.
+  //
+  // Reads from `modelOptions` (the merged rows), not the raw
+  // `harnessModels`/`agentModels` maps — `mergeModelOptions` already applies
+  // rule 7 (a logged-out harness's discovered catalog is untrustworthy), and
+  // this is the single source that distrust must flow through.
+  const discoveredEffortsForTask = useMemo(
+    () => discoveredEffortsFor(modelOptions, task.model),
+    [modelOptions, task.model],
+  );
   const supportedEffortsForModel = useMemo(
-    () => supportedEfforts(kind, task.model),
-    [kind, task.model],
+    () => supportedEfforts(kind, task.model, discoveredEffortsForTask),
+    [kind, task.model, discoveredEffortsForTask],
   );
   const allowedEfforts = useMemo(
     () => new Set(supportedEffortsForModel.map((o) => o.id)),
     [supportedEffortsForModel],
   );
+  const retainable = useMemo(
+    () => retainableEfforts(kind, task.model, discoveredEffortsForTask),
+    [kind, task.model, discoveredEffortsForTask],
+  );
+  // Mirrors `mergeModelOptions` rule 6: a task's current effort can be
+  // retained (kept valid by the cascade above) without being one the picker
+  // would otherwise offer — e.g. a discovery refresh that omits `none`.
+  // Built in `EFFORT_OPTIONS` order (highest→lowest) rather than appended
+  // last, so a retained `ultra` still sorts above `Low` instead of trailing
+  // the whole list; the "kept as you chose it" hint names the harness the
+  // task is actually running on instead of hardcoding "Codex".
+  const effortSelectOptions = useMemo(() => {
+    const harnessLabel = harnesses.find((h) => h.id === task.agent)?.label ?? kind;
+    const known = EFFORT_OPTIONS.some((o) => o.id === task.effort);
+    const options = EFFORT_OPTIONS
+      .filter((o) => allowedEfforts.has(o.id) || (o.id === task.effort && retainable.has(o.id)))
+      .map((o) => (
+        allowedEfforts.has(o.id)
+          ? o
+          : {
+              ...o,
+              unlisted: true,
+              hint: `Not in ${harnessLabel}'s discovered effort menu — kept as you chose it.`,
+            }
+      ));
+    // `task.effort` may be an id with no `EFFORT_OPTIONS` row at all (an
+    // unknown/future effort id) — the filter above can't represent it, so
+    // fall back to a raw row labelled by the id itself.
+    if (task.effort && !known && retainable.has(task.effort)) {
+      return [
+        ...options,
+        {
+          id: task.effort,
+          label: task.effort,
+          hint: `Not in ${harnessLabel}'s discovered effort menu — kept as you chose it.`,
+          unlisted: true,
+        },
+      ];
+    }
+    return options;
+  }, [allowedEfforts, retainable, task.effort, harnesses, task.agent, kind]);
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
   const fastAvailable = kind === "cursor" && cursorModelSupportsFast(task.model, task.effort);
   useEffect(() => {
-    if (task.effort && allowedEfforts.has(task.effort)) return;
+    if (task.effort && retainable.has(task.effort)) return;
     if (supportedEffortsForModel.length === 0) {
       if (task.effort !== null) void save({ effort: null });
       return;
@@ -5327,7 +5629,7 @@ function TaskDetails({
       : supportedEffortsForModel[0]!.id;
     if (task.effort !== fallback) void save({ effort: fallback });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allowedEfforts, task.effort, supportedEffortsForModel]);
+  }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel]);
   useEffect(() => {
     if (task.fast && !fastAvailable) void save({ fast: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -5347,7 +5649,16 @@ function TaskDetails({
     const nextKind = harnessKindOf(nextId, harnesses);
     const nextMode = AGENT_OPTIONS[nextKind].modes[0]?.id ?? "auto";
     const nextModel = DEFAULT_MODEL[nextKind];
-    const nextEfforts = supportedEfforts(nextKind, nextModel);
+    // Same merged-rows source `modelOptions` reads from (rule 7's
+    // logged-out distrust), but for the harness being switched TO rather
+    // than the task's current one.
+    const nextLoggedIn = agents.find((a) => a.harnessId === nextId)?.loggedIn ?? null;
+    const nextModelRows = mergedModels(nextKind, nextId, agentModels, harnessModels, nextModel, nextLoggedIn);
+    const nextEfforts = supportedEfforts(
+      nextKind,
+      nextModel,
+      discoveredEffortsFor(nextModelRows, nextModel),
+    );
     const nextEffort = nextEfforts.length === 0
       ? null
       : nextEfforts.some((e) => e.id === DEFAULT_EFFORT[nextKind])
@@ -5406,36 +5717,37 @@ function TaskDetails({
           <dt className="flex items-center gap-1 text-muted-foreground">
             Model
             {editable && (
-              <button
-                type="button"
-                title="Refresh model list"
-                aria-label="Refresh model list"
-                data-testid="refresh-models-details"
-                disabled={refreshingModels}
-                className={cn(
-                  "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
-                  refreshingModels && "animate-spin",
-                )}
-                onClick={async () => {
-                  setRefreshingModels(true);
-                  try {
-                    await onRefreshModels(task.agent);
-                  } catch {
-                    // The SSE / ready-retry paths also refetch.
-                  } finally {
-                    setRefreshingModels(false);
-                  }
-                }}
-              >
-                <RefreshCw className="size-3" />
-              </button>
+              <Tooltip label="Refresh model list">
+                <button
+                  type="button"
+                  aria-label="Refresh model list"
+                  data-testid="refresh-models-details"
+                  disabled={refreshingModels}
+                  className={cn(
+                    "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
+                    refreshingModels && "animate-spin",
+                  )}
+                  onClick={async () => {
+                    setRefreshingModels(true);
+                    try {
+                      await onRefreshModels(task.agent);
+                    } catch {
+                      // The SSE / ready-retry paths also refetch.
+                    } finally {
+                      setRefreshingModels(false);
+                    }
+                  }}
+                >
+                  <RefreshCw className="size-3" />
+                </button>
+              </Tooltip>
             )}
           </dt>
           <dd className="min-w-0">
             {editable ? (
               <CompactSelect
                 value={task.model ?? DEFAULT_MODEL[kind]}
-                options={mergedModels(kind, task.agent, agentModels, harnessModels, task.model ?? DEFAULT_MODEL[kind])}
+                options={modelOptions}
                 onChange={(model) => void save({ model })}
               />
             ) : (
@@ -5448,7 +5760,7 @@ function TaskDetails({
             {editable ? (
               <CompactSelect
                 value={task.effort ?? ""}
-                options={supportedEffortsForModel}
+                options={effortSelectOptions}
                 onChange={(effort) => void save({ effort })}
                 disabled={supportedEffortsForModel.length === 0}
                 placeholder="n/a"
@@ -5595,6 +5907,7 @@ function mergedModels(
   agentModels: AgentModelMap,
   harnessModels: Record<string, { id: string; label?: string }[]>,
   selected: string | null,
+  loggedIn: boolean | null,
 ) {
   const discovered = (harnessModels[harnessId] ?? agentModels[kind] ?? [])
     .filter((m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id));
@@ -5603,6 +5916,7 @@ function mergedModels(
     discovered,
     selected,
     scoped: CATALOG_SCOPED_KINDS.has(kind),
+    loggedIn,
   });
 }
 
@@ -5942,7 +6256,7 @@ function TmuxPromptCard({
   // pane dump) — same polish as the AskUserQuestion card. Detect it by its
   // signature and render labelled buttons plus the plan markdown itself
   // (`planMarkdown`, below) — the plan's `tool_use` event renders as a
-  // `PlanCard` summary button now (see `RunEventList`'s `sections` memo),
+  // `PlanCard` summary button now (see `RunEventList`'s `blocks` memo),
   // not an inline expanded body, so this card is the only place the full
   // text is shown at decision time.
   const isPlan = CLAUDE_PLAN_PROMPT_RE.test(req.paneText);

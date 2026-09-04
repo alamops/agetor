@@ -2,6 +2,8 @@ import { test, expect } from "bun:test";
 import { Database } from "bun:sqlite";
 import { migrate, splitSqlStatements, type Migration } from "./migrate.ts";
 import reseedBuiltins from "./migrations/024_reseed_harness_builtins.sql" with { type: "text" };
+import retireGemini3ProPreview from "./migrations/049_retire_gemini_3_pro_preview.sql" with { type: "text" };
+import { migrations } from "./migrations/index.ts";
 
 // Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
 const HARNESSES_DDL = `
@@ -153,4 +155,141 @@ test("024_reseed_harness_builtins restores wiped builtins, is idempotent, and pr
     { id: "claude-code", enabled: 0 }, // preserved, not reset to 1
     { id: "codex", enabled: 0 },
   ]);
+});
+
+test("049_retire_gemini_3_pro_preview rewrites only tasks pinned to the shut-down id (any harness), clears the stale lastModel:gemini preference, normalizes suffixed Cursor Gemini Flash variants to base id + effort, idempotently", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL
+    );
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
+  db.exec(`
+    INSERT INTO harnesses (id, kind) VALUES
+      ('gemini', 'gemini'), ('gemini-2', 'gemini'),
+      ('cursor', 'cursor'), ('cursor-2', 'cursor'),
+      ('fx', 'fx'), ('codex', 'codex');
+  `);
+
+  db.exec(`
+    INSERT INTO tasks (id, agent, model, effort) VALUES
+      ('t01', 'gemini', 'gemini-3-pro-preview', NULL),
+      ('t02', 'gemini-2', 'gemini-3-pro-preview', NULL),
+      ('t03', 'gemini', 'gemini-3.7-flash', NULL),
+      ('t04', 'cursor', 'gemini-3.1-pro', 'high'),
+      ('t05', 'fx', 'google/gemini-3.1-pro-preview', NULL),
+      ('t06', 'codex', 'gpt-5.6-sol', 'high'),
+      ('t07', 'gemini', NULL, NULL),
+      ('t08', 'cursor', 'gemini-3.8-flash-high', NULL),
+      ('t09', 'cursor-2', 'gemini-3.7-flash-low', 'high'),
+      ('t10', 'cursor', 'gemini-3.8-flash-medium', 'medium'),
+      ('t11', 'gemini', 'gemini-3.8-flash-medium', NULL),
+      ('t12', 'cursor', 'gemini-3.6-flash', 'minimal');
+  `);
+
+  db.exec(`
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:gemini', 'gemini-3-pro-preview', 1),
+      ('lastModel:codex', 'gpt-5.6-sol', 1),
+      ('lastMode:gemini', 'auto', 1),
+      ('lastModel:cursor', 'gemini-3.1-pro', 1);
+  `);
+
+  const readAll = () =>
+    db
+      .query<{ id: string; agent: string; model: string | null; effort: string | null }, []>(
+        `SELECT id, agent, model, effort FROM tasks ORDER BY id`,
+      )
+      .all();
+
+  const readPrefs = () =>
+    db
+      .query<{ key: string; value: string }, []>(
+        `SELECT key, value FROM preferences ORDER BY key`,
+      )
+      .all();
+
+  db.exec(retireGemini3ProPreview);
+  expect(readAll()).toEqual([
+    { id: "t01", agent: "gemini", model: "gemini-3.1-pro-preview", effort: null }, // rewritten
+    { id: "t02", agent: "gemini-2", model: "gemini-3.1-pro-preview", effort: null }, // rewritten — additional-account harness, no join needed
+    { id: "t03", agent: "gemini", model: "gemini-3.7-flash", effort: null }, // untouched
+    { id: "t04", agent: "cursor", model: "gemini-3.1-pro", effort: "high" }, // untouched — different literal
+    { id: "t05", agent: "fx", model: "google/gemini-3.1-pro-preview", effort: null }, // untouched — different literal
+    { id: "t06", agent: "codex", model: "gpt-5.6-sol", effort: "high" }, // untouched — unrelated kind
+    { id: "t07", agent: "gemini", model: null, effort: null }, // untouched — still NULL
+    { id: "t08", agent: "cursor", model: "gemini-3.8-flash", effort: "high" }, // variant → base + effort
+    { id: "t09", agent: "cursor-2", model: "gemini-3.7-flash", effort: "low" }, // variant wins over a stale effort; additional cursor harness via the kind join
+    { id: "t10", agent: "cursor", model: "gemini-3.8-flash", effort: "medium" }, // variant → base, effort already matched
+    { id: "t11", agent: "gemini", model: "gemini-3.8-flash-medium", effort: null }, // untouched — not a cursor-kind harness
+    { id: "t12", agent: "cursor", model: "gemini-3.6-flash", effort: "minimal" }, // untouched — already base + effort
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:gemini", value: "auto" }, // untouched — not a lastModel key
+    { key: "lastModel:codex", value: "gpt-5.6-sol" }, // untouched — other kind
+    { key: "lastModel:cursor", value: "gemini-3.1-pro" }, // untouched — other kind
+    // lastModel:gemini (the dead id) is gone
+  ]);
+
+  // Idempotent: re-applying against the already-rewritten rows is a no-op
+  // for both tables.
+  const tasksBeforeSecond = readAll();
+  const prefsBeforeSecond = readPrefs();
+  db.exec(retireGemini3ProPreview);
+  expect(readAll()).toEqual(tasksBeforeSecond);
+  expect(readPrefs()).toEqual(prefsBeforeSecond);
+});
+
+test("049 leaves a lastModel:gemini pref that already points at a live model alone", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL
+    );
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
+  db.exec(`
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:gemini', 'gemini-3.7-flash', 1);
+  `);
+
+  db.exec(retireGemini3ProPreview);
+
+  const prefs = db
+    .query<{ key: string; value: string }, []>(
+      `SELECT key, value FROM preferences ORDER BY key`,
+    )
+    .all();
+  expect(prefs).toEqual([{ key: "lastModel:gemini", value: "gemini-3.7-flash" }]);
+});
+
+test("049 is registered last in the migrations index", () => {
+  const last = migrations[migrations.length - 1];
+  expect(last?.id).toBe("049_retire_gemini_3_pro_preview");
+  expect(last?.sql).toContain("gemini-3.1-pro-preview");
 });

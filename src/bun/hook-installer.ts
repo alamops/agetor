@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { dataDir } from "./db.ts";
@@ -42,7 +43,7 @@ export interface InstalledPaths {
   settingsFile: string;
 }
 
-export function ensureInstalled(cwd: string): InstalledPaths | null {
+export async function ensureInstalled(cwd: string): Promise<InstalledPaths | null> {
   // We own the worktree dir, but the settings.local.json INSIDE it may still
   // hold `permissions.allow` entries we have to preserve across re-spawns:
   // legacy entries from older agetor builds, rules the user hand-added, and
@@ -62,7 +63,7 @@ export function ensureInstalled(cwd: string): InstalledPaths | null {
  * inside agetor's owned worktree namespace. Used by claude-tmux to avoid
  * accidentally touching a user's source repo when isolation is off.
  */
-export function ensureInstalledIfOwned(cwd: string): InstalledPaths | null {
+export async function ensureInstalledIfOwned(cwd: string): Promise<InstalledPaths | null> {
   const owned = path.resolve(dataDir, "worktrees") + path.sep;
   if (!path.resolve(cwd).startsWith(owned)) return null;
   // Guard against an exotic case where the dir was deleted between
@@ -113,7 +114,7 @@ function isAgetorHookEntry(e: unknown): boolean {
  * Returns null when the cwd doesn't exist OR the existing settings file
  * is malformed; otherwise the settings file path.
  */
-export function ensureInstalledMerged(cwd: string): InstalledPaths | null {
+export async function ensureInstalledMerged(cwd: string): Promise<InstalledPaths | null> {
   return applyAgetorSettings(cwd, {
     refuseOnMalformed: true,
     sanitizeAllow: false,
@@ -142,21 +143,21 @@ interface ApplyOpts {
  * `mcpServers.agetor`), optionally self-heals `permissions.allow`, and writes
  * back atomically. All other keys are preserved verbatim.
  */
-function applyAgetorSettings(
+async function applyAgetorSettings(
   cwd: string,
   opts: ApplyOpts,
-): InstalledPaths | null {
+): Promise<InstalledPaths | null> {
   if (!existsSync(cwd)) return null;
 
   const settingsDir = path.join(cwd, ".claude");
-  mkdirSync(settingsDir, { recursive: true });
+  await mkdir(settingsDir, { recursive: true });
   const settingsFile = path.join(settingsDir, "settings.local.json");
 
   // Read & parse existing settings.
   let settings: Record<string, unknown> = {};
   if (existsSync(settingsFile)) {
     let raw: string;
-    try { raw = readFileSync(settingsFile, "utf8"); } catch (e) {
+    try { raw = await readFile(settingsFile, "utf8"); } catch (e) {
       console.error(
         `[agetor:hook-installer] cannot read ${settingsFile}: ${(e as Error).message}. ` +
         `Skipping settings install.`,
@@ -250,7 +251,7 @@ function applyAgetorSettings(
     }
   }
 
-  writeJsonAtomic(settingsFile, settings);
+  await writeJsonAtomic(settingsFile, settings);
 
   return { settingsFile };
 }
@@ -260,10 +261,10 @@ function applyAgetorSettings(
  *  leave the destination corrupted. Crucial for settings.local.json which
  *  hook-installer merges into on every task spawn while preserving any
  *  pre-existing user / legacy entries underneath. */
-function writeJsonAtomic(file: string, value: unknown): void {
+async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
   const tmp = `${file}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
-  writeFileSync(tmp, JSON.stringify(value, null, 2));
-  renameSync(tmp, file);
+  await writeFile(tmp, JSON.stringify(value, null, 2));
+  await rename(tmp, file);
 }
 
 /**
@@ -274,10 +275,10 @@ function writeJsonAtomic(file: string, value: unknown): void {
  * The `mode` argument is accepted for call-site compatibility but no longer
  * influences behaviour — agetor installs nothing mode-specific any more.
  */
-export function ensureInstalledForCwd(
+export async function ensureInstalledForCwd(
   cwd: string,
   _mode?: string | null | undefined,
-): InstalledPaths | null {
+): Promise<InstalledPaths | null> {
   const owned = path.resolve(dataDir, "worktrees") + path.sep;
   if (path.resolve(cwd).startsWith(owned)) {
     if (!existsSync(cwd)) return null;

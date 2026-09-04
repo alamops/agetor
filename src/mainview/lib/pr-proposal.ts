@@ -10,7 +10,7 @@
 // best-effort and the whole thing degrades to `null` rather than throwing or
 // mis-rendering garbage.
 //
-// Pure, DOM-free, unit-testable — same convention as `command-message.ts`.
+// Pure, DOM-free, unit-testable — same convention as `shared/user-message.ts`.
 import type { RunEvent } from "../../shared/types.ts";
 
 export interface PrProposal {

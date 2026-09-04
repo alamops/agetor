@@ -15,6 +15,7 @@ import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
 import { useFontSize } from "@/components/font-size-provider";
 import { useTheme } from "@/components/theme-provider";
 import { isMacPlatform } from "@/lib/font-size";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
@@ -61,6 +62,9 @@ const THEME_PREFERENCE_ICON: Record<ThemePreference, typeof Monitor> = {
 interface Props {
   open: boolean;
   onClose: () => void;
+  /** Whether sent user messages pin to the top of the transcript. */
+  stickyUserMessages: boolean;
+  onStickyUserMessagesChange: (sticky: boolean) => void;
   /** Refresh agents/harnesses on the parent after CRUD operations. */
   onChange?: () => void;
   /** Resolved home dir from `GET /defaults` — used to expand `~` in templates. */
@@ -201,7 +205,7 @@ async function describeHarnessInUse(err: unknown): Promise<string | null> {
   return `In use by ${titles.length} ${noun}: ${titles.join(", ")}`;
 }
 
-export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir, initialSection }: Props) {
+export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, onChange, homeDir, dataDir, initialSection }: Props) {
   const [version, setVersion] = useState<string>("");
   const [payload, setPayload] = useState<HarnessesPayload>({ harnesses: [], statuses: [] });
   const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
@@ -461,6 +465,8 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir, init
                       defaultHarness={defaultHarness}
                       payload={payload}
                       onPickDefault={onPickDefault}
+                      stickyUserMessages={stickyUserMessages}
+                      onStickyUserMessagesChange={onStickyUserMessagesChange}
                       tmuxSource={tmuxSource}
                       bundledTmuxAvailable={bundledTmuxAvailable}
                       onPickTmuxSource={onPickTmuxSource}
@@ -599,6 +605,8 @@ function GeneralSection({
   payload,
   defaultHarness,
   onPickDefault,
+  stickyUserMessages,
+  onStickyUserMessagesChange,
   tmuxSource,
   bundledTmuxAvailable,
   onPickTmuxSource,
@@ -607,6 +615,8 @@ function GeneralSection({
   payload: HarnessesPayload;
   defaultHarness: string;
   onPickDefault: (id: string) => void;
+  stickyUserMessages: boolean;
+  onStickyUserMessagesChange: (sticky: boolean) => void;
   tmuxSource: "system" | "bundled";
   bundledTmuxAvailable: boolean;
   onPickTmuxSource: (source: "system" | "bundled") => void;
@@ -727,6 +737,23 @@ function GeneralSection({
           </Button>
         </div>
         <p className="text-[11px] text-muted-foreground">{FONT_SIZE_HINT}</p>
+      </section>
+
+      <section className="space-y-1">
+        <div className="flex items-center justify-between gap-4">
+          <label htmlFor="sticky-user-messages" className="text-xs text-muted-foreground">
+            Sticky user messages
+          </label>
+          <Switch
+            id="sticky-user-messages"
+            checked={stickyUserMessages}
+            onCheckedChange={onStickyUserMessagesChange}
+            aria-label="Sticky user messages"
+          />
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Keep your latest sent message visible while its response scrolls. Turn this off for a standard chat list.
+        </p>
       </section>
 
       <section className="space-y-1">
@@ -1040,6 +1067,7 @@ function Editor({
         <div className="space-y-1">
           <label className="text-xs text-muted-foreground">Id (slug)</label>
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
             value={id}
             onChange={(e) => setId(e.target.value)}
             disabled={isEdit}
@@ -1086,6 +1114,7 @@ function Editor({
           {HARNESS_HOME_COPY[kind].label}
         </label>
         <Input
+          {...IDENTIFIER_INPUT_PROPS}
           value={home}
           onChange={(e) => setHome(e.target.value)}
           placeholder={
@@ -1102,6 +1131,7 @@ function Editor({
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Bin override (absolute path; optional)</label>
         <Input
+          {...IDENTIFIER_INPUT_PROPS}
           value={bin}
           onChange={(e) => setBin(e.target.value)}
           placeholder="/opt/homebrew/bin/claude"

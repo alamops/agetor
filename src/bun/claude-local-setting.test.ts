@@ -38,6 +38,11 @@ test("claudeModelIdFromArg resolves CLAUDE_MODEL_FLAG values back to their ageto
   expect(claudeModelIdFromArg("claude-haiku-4-5")).toBe("haiku-4.5");
 });
 
+test("claudeModelIdFromArg resolves the Fable 5.1 / Mythos 5.1 CLAUDE_MODEL_FLAG values back to their agetor ids", () => {
+  expect(claudeModelIdFromArg("claude-fable-5-1")).toBe("fable-5.1");
+  expect(claudeModelIdFromArg("claude-mythos-5-1")).toBe("mythos-5.1");
+});
+
 test("claudeModelIdFromArg passes an unrecognized raw claude-* id through verbatim", () => {
   expect(claudeModelIdFromArg("claude-opus-6")).toBe("claude-opus-6");
 });
@@ -154,6 +159,51 @@ test("model: a raw claude-<id> stdout display name passes through verbatim", () 
 });
 
 // ---------------------------------------------------------------------------
+// parseClaudeLocalSetting — Fable 5.1 / Mythos 5.1 (commit 6429d9e). Mirrors
+// the opus-5/sonnet-5 "Set model to"/"Kept model as" cases above.
+// ---------------------------------------------------------------------------
+
+test("model: 'Set model to Fable 5.1' resolves to fable-5.1", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Fable 5.1 and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "fable-5.1" });
+});
+
+test("model: 'Set model to Fable 5.1' with appended qualifiers still resolves to fable-5.1", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Fable 5.1 (1M context) and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "fable-5.1" });
+});
+
+test("model: 'Set model to Mythos 5.1' resolves to mythos-5.1", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Mythos 5.1 and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "mythos-5.1" });
+});
+
+test("model: 'Kept model as Fable 5.1' parses as the kept/no-change outcome with id fable-5.1", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Kept model as Fable 5.1",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "fable-5.1", kept: true });
+});
+
+// ---------------------------------------------------------------------------
 // claudeModelIdFromDisplayName — word boundary after the label (finding #4,
 // docs/plans/model-effort-local-command-turns.md §10 re-review): a bare
 // `startsWith` would let a longer real model name that merely shares a
@@ -179,6 +229,44 @@ test("claudeModelIdFromDisplayName: 'Opus 5 and saved …' matches via the space
 
 test("claudeModelIdFromDisplayName: 'Sonnet 5 for this session only' matches via the space word boundary", () => {
   expect(claudeModelIdFromDisplayName("Sonnet 5 for this session only")).toBe("sonnet-5");
+});
+
+// ---------------------------------------------------------------------------
+// claudeModelIdFromDisplayName — Fable 5.1 / Mythos 5.1 (commit 6429d9e):
+// the same word-boundary guard now has to keep the NEW "Fable 5.1" label from
+// conflating with the EXISTING "Fable 5" label in both directions — a longer
+// real name must not fall back to the shorter superseded label, and the
+// shorter real name must not spuriously match the longer one either.
+// ---------------------------------------------------------------------------
+
+test("claudeModelIdFromDisplayName: 'Fable 5.1' resolves to fable-5.1", () => {
+  expect(claudeModelIdFromDisplayName("Fable 5.1")).toBe("fable-5.1");
+});
+
+test("claudeModelIdFromDisplayName: 'Mythos 5.1' resolves to mythos-5.1", () => {
+  expect(claudeModelIdFromDisplayName("Mythos 5.1")).toBe("mythos-5.1");
+});
+
+test("claudeModelIdFromDisplayName: 'Fable 5.1 (1M context)' strips the qualifier and resolves to fable-5.1", () => {
+  expect(claudeModelIdFromDisplayName("Fable 5.1 (1M context)")).toBe("fable-5.1");
+});
+
+test("claudeModelIdFromDisplayName: 'Fable 5' still resolves to fable-5, not fable-5.1", () => {
+  // Word-boundary guard, forward direction: "fable 5" must match the "Fable
+  // 5" label exactly, not get pulled onto the newer "Fable 5.1" label just
+  // because it shares a leading prefix.
+  expect(claudeModelIdFromDisplayName("Fable 5")).toBe("fable-5");
+  expect(claudeModelIdFromDisplayName("Fable 5 and saved as your default for new sessions")).toBe("fable-5");
+});
+
+test("claudeModelIdFromDisplayName: 'Fable 5.1' does not word-boundary-match the 'Fable 5' label", () => {
+  // Word-boundary guard, reverse direction (the actual regression this
+  // guard exists for): "fable 5.1" does not start with "fable 5 " (the
+  // character after the shared "fable 5" prefix is "." not " "), so it must
+  // fall through to the "Fable 5.1" label instead of mismatching onto the
+  // shorter, superseded "Fable 5" label.
+  expect(claudeModelIdFromDisplayName("Fable 5.1")).not.toBe("fable-5");
+  expect(claudeModelIdFromDisplayName("Fable 5.1 and saved as your default for new sessions")).toBe("fable-5.1");
 });
 
 test("model: 'Opus 5.1 (1M context) and saved …' resolves to 'unrepresentable' with a qualifier-stripped raw of 'Opus 5.1'", () => {

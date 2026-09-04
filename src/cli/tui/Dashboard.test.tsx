@@ -499,3 +499,108 @@ test("the 's' start path shows a plain started status when there are no unresolv
   expect(frame).not.toContain("⚠");
   unmount();
 });
+
+// --- userMessageLines rendering (src/shared/user-message.ts) --------------
+// `EventLine`'s "user" case renders one `UserPlainLine` per `userMessageLines`
+// entry; ink-testing-library's fake stdout reports 100 columns and isn't a
+// TTY (so chalk/ink emit no ANSI color codes into `lastFrame()`), which is
+// why these assert on plain substrings rather than stripping escape codes.
+
+test("event stream: an ordinary user event still renders you› <text>, unchanged", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  onTaskEvents!({ runId: "runA", taskId: "taskA", stream: "user", data: "hello there", ts: 1 });
+  await wait(80);
+
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("you› hello there");
+  unmount();
+});
+
+test("event stream: a forked-skill-launch user event renders cmd›/skill› lines with no raw tags", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const data =
+    "<local-command-stdout>Running in the background as @code-review</local-command-stdout>\n" +
+    '<forked-skill-launch>{"agentId":"a7db6829e09d1ba9b","skillName":"code-review","description":"/code-review"}</forked-skill-launch>';
+  onTaskEvents!({ runId: "runA", taskId: "taskA", stream: "user", data, ts: 1 });
+  await wait(80);
+
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("cmd› Running in the background as @code-review");
+  expect(frame).toContain("skill› /code-review launched in background (agent a7db6829)");
+  expect(frame).not.toContain("<forked-skill-launch");
+  expect(frame).not.toContain("<local-command-stdout");
+  unmount();
+});
+
+test("event stream: a bash-input/bash-stdout/bash-stderr pair renders sh›/err› with no out› line", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const base = { runId: "runA", taskId: "taskA" };
+  const push = onTaskEvents!;
+  push({ ...base, stream: "user", data: "<bash-input>supabase db push --linked</bash-input>", ts: 1 });
+  push({
+    ...base, stream: "user",
+    data: "<bash-stdout></bash-stdout><bash-stderr>(eval):1: command not found: supabase\n</bash-stderr>",
+    ts: 2,
+  });
+  await wait(80);
+
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("sh› $ supabase db push --linked");
+  expect(frame).toContain("err› (eval):1: command not found: supabase");
+  expect(frame).not.toContain("out›");
+  unmount();
+});
+
+test("event stream: a user-typed <context> tag renders context› followed by you› on the next line", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  onTaskEvents!({
+    runId: "runA", taskId: "taskA", stream: "user",
+    data: "<context>\nWe migrate X\n</context>\n\nPlease do Y", ts: 1,
+  });
+  await wait(80);
+
+  // Multi-line user events render as multiple frame lines — one per
+  // `userMessageLines` entry — so pin their relative order, not just presence.
+  const lines = (lastFrame() ?? "").split("\n");
+  const contextIdx = lines.findIndex((l) => l.includes("context› We migrate X"));
+  const youIdx = lines.findIndex((l) => l.includes("you› Please do Y"));
+  expect(contextIdx).toBeGreaterThanOrEqual(0);
+  expect(youIdx).toBe(contextIdx + 1);
+  unmount();
+});

@@ -33,6 +33,7 @@ import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { GitHubDialog, type GitHubItemDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
 import { UsageMeter } from "@/components/usage/UsageMeter";
 import { UsagePopover } from "@/components/usage/UsagePopover";
+import { visibleTopbarAgents } from "@/lib/usage";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -59,6 +60,8 @@ import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "@
 import { cn } from "@/lib/utils";
 import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
 import type { SettingsSectionId } from "@/lib/settings-dialog-view";
+import { reconcileById } from "@/lib/reconcile";
+import { parseStickyUserMessagesPreference, STICKY_USER_MESSAGES_PREF } from "@/lib/user-message-display";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
 /**
@@ -105,68 +108,6 @@ function ErrorToast({ error, onDismiss }: { error: string | null; onDismiss: () 
       </button>
     </div>
   );
-}
-
-/**
- * Reconcile a freshly-fetched list against the previously-rendered one,
- * preserving object identity for entries that haven't actually changed.
- * Poll-driven fetches (`/tasks` every 2s, `/harnesses` every 15s) otherwise
- * hand back brand-new object graphs every tick even when nothing changed
- * server-side — that defeats `React.memo` on every downstream card/column
- * and force-renders the selected-task sync effect. Deep-equality here is a
- * plain `JSON.stringify` compare: cheap at this scale (hundreds of small
- * objects, once per poll) and robust against any field changing without a
- * corresponding `updatedAt` bump (e.g. `pendingInteractionCount`,
- * `runningSubagents`, `openTerminalCount` are all computed server-side per
- * request and aren't reflected in `updatedAt`).
- *
- * `cache`, when passed, memoizes each entry's serialized form by id so a
- * poll where nothing changed only has to `JSON.stringify` the freshly
- * fetched (`next`) side — the `prev` side is a cache hit as long as the
- * cached entry's object reference still matches what's actually in `prev`
- * (it can legitimately not: several call sites patch `tasks` state directly
- * for optimistic updates, bypassing this function, so a stale/mismatched
- * cache entry falls back to recomputing rather than trusting a stringified
- * form for a different object). Entries whose id no longer appears in
- * `next` are evicted so the cache doesn't grow unboundedly across a
- * session's worth of deleted/archived tasks.
- *
- * Returns `prev` itself (same array reference) when every entry, in the
- * same order, is unchanged — letting the caller's `setState` bail out
- * entirely instead of triggering a render.
- */
-function reconcileById<T>(
-  prev: T[],
-  next: T[],
-  keyOf: (item: T) => string,
-  cache?: Map<string, { obj: T; json: string }>,
-): T[] {
-  const prevByKey = new Map(prev.map((item) => [keyOf(item), item] as const));
-  const seen = new Set<string>();
-  const merged = next.map((item) => {
-    const key = keyOf(item);
-    seen.add(key);
-    const old = prevByKey.get(key);
-    const nextJson = JSON.stringify(item);
-    let unchanged = false;
-    if (old !== undefined) {
-      const cached = cache?.get(key);
-      const oldJson = cached && cached.obj === old ? cached.json : JSON.stringify(old);
-      unchanged = oldJson === nextJson;
-    }
-    const finalItem = unchanged ? old! : item;
-    if (cache) cache.set(key, { obj: finalItem, json: nextJson });
-    return finalItem;
-  });
-  if (cache) {
-    for (const key of cache.keys()) {
-      if (!seen.has(key)) cache.delete(key);
-    }
-  }
-  if (merged.length === prev.length && merged.every((item, i) => item === prev[i])) {
-    return prev;
-  }
-  return merged;
 }
 
 /** Muted one-line hints shown in empty columns while onboarding's checklist
@@ -240,6 +181,10 @@ function AppInner() {
   const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Missing preference intentionally resolves to sticky so existing users
+  // retain the last-sent-message reminder until they opt into the standard
+  // scrolling chat list in Settings.
+  const [stickyUserMessages, setStickyUserMessages] = useState(true);
   // Section the Settings dialog should land on when it next opens — set by
   // onboarding's "Enable in Settings…" deep link, cleared on close so the
   // plain gear-icon open still lands on General.
@@ -339,6 +284,7 @@ function AppInner() {
       // read at boot is enough. `refetchOnboardingPref` (used after Settings
       // closes) re-reads just this key via the same route.
       setOnboardingDismissedPref(prefs[ONBOARDING_DISMISSED_PREF]);
+      setStickyUserMessages(parseStickyUserMessagesPreference(prefs[STICKY_USER_MESSAGES_PREF]));
       setPrefsLoaded(true);
     }).catch(() => { /* keep the boot-seeded preferences; onboarding stays hidden (prefsLoaded=false) rather than guess */ });
     // Run once at boot only — intentionally not re-run when either local
@@ -1383,7 +1329,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             <h1 className="font-geist text-base font-semibold leading-none tracking-tight">Agetor</h1>
           </div>
           <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2 text-xs text-muted-foreground">
-            {agents.map((a) => {
+            {visibleTopbarAgents(agents, harnesses).map((a) => {
               const harness = harnesses.find((h) => h.id === a.harnessId);
               const displayName = harness?.label ?? a.harnessId;
               const q = usage[a.harnessId];
@@ -1397,20 +1343,14 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 />
               );
               // Every chip is clickable: with a snapshot the popover shows
-              // meters; without one it explains WHY there's no data (harness
-              // disabled / kind unsupported / first poll pending) instead of
-              // silently rendering a bare chip — "no bar and no explanation"
-              // reads as broken.
+              // meters; without one it explains WHY there's no data (kind
+              // unsupported / first poll pending) instead of silently
+              // rendering a bare chip — "no bar and no explanation" reads as
+              // broken.
               const kindSupported = (USAGE_SUPPORTED_KINDS as readonly string[]).includes(a.kind);
-              const enabled = harness?.enabled ?? false;
               const placeholder = !kindSupported
                 ? { message: "Usage tracking isn't supported for this harness yet.", canRefresh: false }
-                : !enabled
-                  ? {
-                      message: "Usage tracking is off because this harness is disabled — enable it in Settings → Harnesses to see its meters.",
-                      canRefresh: false,
-                    }
-                  : { message: "No usage data yet — the first poll runs shortly, or refresh now.", canRefresh: true };
+                : { message: "No usage data yet — the first poll runs shortly, or refresh now.", canRefresh: true };
               const chip = (
                 <span
                   className="flex items-center gap-1"
@@ -1616,6 +1556,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       </div>
       <RunPanel
         task={selected}
+        stickyUserMessages={stickyUserMessages}
         agents={agents}
         harnesses={harnesses}
         agentModels={agentModels}
@@ -1673,6 +1614,15 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       />
       <SettingsDialog
         open={settingsOpen}
+        stickyUserMessages={stickyUserMessages}
+        onStickyUserMessagesChange={(sticky) => {
+          setStickyUserMessages(sticky);
+          void api.setPreference(STICKY_USER_MESSAGES_PREF, String(sticky)).catch(() => {
+            // Revert only if this failed write is still the latest selection;
+            // a subsequent click must not be overwritten by an older request.
+            setStickyUserMessages((current) => current === sticky ? !sticky : current);
+          });
+        }}
         onClose={() => {
           setSettingsOpen(false);
           // Clear the deep-link so a later plain gear-icon open lands back

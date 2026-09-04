@@ -577,7 +577,7 @@ test.describe("@ file references", () => {
     await gotoApp(page, backend.bootBase);
     await taskCard(page, startedTaskTitle).click();
     const panel = runPanel(page);
-    await panel.getByTitle("Edit").first().click();
+    await panel.getByRole("button", { name: "Edit", exact: true }).first().click();
 
     // Put the caret at the end of the seeded text deterministically (autoFocus
     // caret position is engine-dependent), then type an @ query.

@@ -3,6 +3,7 @@ import { BookOpen, Trash2 } from "lucide-react";
 import { api, type GitHubTokensResult } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { GitHubSetupDialog } from "@/components/settings/GitHubSetupDialog";
 import { GIT_HOST_TOKENS_SECTION } from "../../../shared/types.ts";
 
@@ -193,11 +194,13 @@ export function GitHubTokensSection() {
         <div className="space-y-1">
           <label className="text-xs text-muted-foreground">Host</label>
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
+            // Keeps the detected-hosts <datalist> working — see identifier-input.ts.
+            autoComplete={undefined}
             value={host}
             onChange={(e) => setHost(e.target.value)}
             placeholder="github.com / gitlab.com / bitbucket.org"
             list={DATALIST_ID}
-            spellCheck={false}
           />
           <datalist id={DATALIST_ID}>
             {data.detectedHosts.map((h) => (

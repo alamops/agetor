@@ -122,3 +122,109 @@ test("logs --rebuild --json: sentinel status events are still emitted raw for pr
   expect(outputs).toHaveLength(1);
   expect(JSON.parse(outputs[0]!)).toEqual(events[0]);
 });
+
+// --- userMessageLines rendering (src/shared/user-message.ts) --------------
+// `formatEvent`'s "user" case is a thin wrapper over `userMessageLines` +
+// `colorLabel`; with `output.ts`'s `c` helpers mocked to identity above, the
+// colored label is indistinguishable from the raw label text, so these
+// assert on the exact rendered strings.
+
+test("logs --rebuild: an ordinary user event still renders you› <text>, unchanged", async () => {
+  outputs.length = 0;
+  const e: RunEvent = {
+    runId: "run1", taskId: "t1", stream: "user",
+    data: "hello there", ts: 1,
+  };
+  currentClient = makeClient([e]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]).toBe("you› hello there");
+});
+
+test("logs --rebuild: a forked-skill-launch user event renders cmd›/skill› lines with no raw tags", async () => {
+  outputs.length = 0;
+  const data =
+    "<local-command-stdout>Running in the background as @code-review</local-command-stdout>\n" +
+    '<forked-skill-launch>{"agentId":"a7db6829e09d1ba9b","skillName":"code-review","description":"/code-review"}</forked-skill-launch>';
+  const e: RunEvent = { runId: "run1", taskId: "t1", stream: "user", data, ts: 1 };
+  currentClient = makeClient([e]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]!.split("\n")).toEqual([
+    "cmd› Running in the background as @code-review",
+    "skill› /code-review launched in background (agent a7db6829)",
+  ]);
+  expect(outputs[0]).not.toContain("<forked-skill-launch");
+  expect(outputs[0]).not.toContain("<local-command-stdout");
+});
+
+test("logs --rebuild: a bash-input/bash-stdout/bash-stderr pair renders sh›/err› with no out› line", async () => {
+  outputs.length = 0;
+  const events: RunEvent[] = [
+    {
+      runId: "run1", taskId: "t1", stream: "user",
+      data: "<bash-input>supabase db push --linked</bash-input>", ts: 1,
+    },
+    {
+      runId: "run1", taskId: "t1", stream: "user",
+      data: "<bash-stdout></bash-stdout><bash-stderr>(eval):1: command not found: supabase\n</bash-stderr>",
+      ts: 2,
+    },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(2);
+  expect(outputs[0]).toBe("sh› $ supabase db push --linked");
+  expect(outputs[1]).toBe("err› (eval):1: command not found: supabase");
+  expect(outputs.join("\n")).not.toContain("out›");
+});
+
+test("logs --rebuild: a user-typed <context> tag renders a context› line followed by you›", async () => {
+  outputs.length = 0;
+  const e: RunEvent = {
+    runId: "run1", taskId: "t1", stream: "user",
+    data: "<context>\nWe migrate X\n</context>\n\nPlease do Y", ts: 1,
+  };
+  currentClient = makeClient([e]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]!.split("\n")).toEqual([
+    "context› We migrate X",
+    "you› Please do Y",
+  ]);
+});
+
+test("logs --rebuild: the slash-command XML twin renders you› /name args", async () => {
+  outputs.length = 0;
+  const e: RunEvent = {
+    runId: "run1", taskId: "t1", stream: "user",
+    data: "<command-message>x</command-message>\n<command-name>/x</command-name>\n<command-args>do it</command-args>",
+    ts: 1,
+  };
+  currentClient = makeClient([e]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]).toBe("you› /x do it");
+});
+
+// --- Phase 8 review fix: command args containing tags (src/shared/user-message.ts Fix 5a) ---
+
+test("logs --rebuild: a slash-command whose args contain a tag renders you›/name then per-segment lines, no raw <context>", async () => {
+  outputs.length = 0;
+  const e: RunEvent = {
+    runId: "run1", taskId: "t1", stream: "user",
+    data:
+      "<command-message>x</command-message>\n<command-name>/x</command-name>\n<command-args>see <context>ctx</context> now</command-args>",
+    ts: 1,
+  };
+  currentClient = makeClient([e]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]!.split("\n")).toEqual([
+    "you› /x",
+    "you› see",
+    "context› ctx",
+    "you› now",
+  ]);
+  expect(outputs[0]).not.toContain("<context>");
+});

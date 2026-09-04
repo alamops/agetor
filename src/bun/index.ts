@@ -119,8 +119,17 @@ async function getMainViewUrl(): Promise<string> {
 rehydratePath();
 
 // Mark any runs that were "running" when we last shut down as orphaned, so the
-// kanban doesn't show stuck cards.
-reconcileOrphans();
+// kanban doesn't show stuck cards. Awaited (top-level await — this module is
+// ESM) so the rest of boot, in particular `startApiServer()` below, never
+// runs concurrently with reconciliation: the API must not start serving
+// `/tasks`/`/runs` while a `status='running'` row from a previous process is
+// still being reattached or flipped to `orphaned` underneath it — the same
+// "reconcile before the API starts" invariant CLAUDE.md §5 documents, and the
+// same ordering the old synchronous `reconcileOrphans` gave for free by
+// blocking this whole script until it returned. An unhandled rejection here
+// fails boot loudly, matching that old synchronous-throw behavior — no
+// swallow.
+await reconcileOrphans();
 
 // Heal any archive/delete teardown (tmux kill, terminal shells, worktree
 // detach) that was deferred to the in-memory teardown queue but never ran

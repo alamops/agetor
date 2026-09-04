@@ -341,7 +341,7 @@ test("sendInput (claude, withheld paste): re-stash keeps the RAW @token text, no
   claudeTmux.__forTest.installSession(taskId, freshJsonl());
   const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
   const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(10);
-  const prevCapture = claudeTmux.__forTest.setCapturePastePane(() => BLOCKING_PANE);
+  const prevCapture = claudeTmux.__forTest.setCapturePastePane(async () => BLOCKING_PANE);
 
   try {
     const sent = await sendInput(started.runId, rawLine);
