@@ -247,8 +247,8 @@ Add a harness from **Settings → Harnesses**. Templates pre-fill common pattern
 Each task picks:
 
 - a **mode** — how much permission the agent has (`auto`, `ask`, `acceptEdits`, `plan`, `bypass` — exposed per agent),
-- a **model** — Opus / Sonnet / Haiku for Claude, GPT-5.6 Sol / Terra / Luna (plus the access-gated GPT-5.6 Cyber) and earlier GPT-5 options for Codex,
-- an **effort** level — reasoning depth, where the model supports it.
+- a **model** — Opus / Sonnet / Haiku for Claude, GPT-6 Astra / Astra Aeon (rolling out in phases; rejected on ChatGPT plans until OpenAI enables them for your account), GPT-5.6 Sol / Terra / Luna (plus the access-gated GPT-5.6 Cyber), and earlier GPT-5 options for Codex,
+- an **effort** level — reasoning depth, where the model supports it, up to Codex's `Ultra` delegation tier where offered; Codex's effort menu follows what the signed-in account's Codex CLI actually reports.
 
 The picker filters incompatible combinations (e.g. effort is hidden on Haiku 4.5 because Anthropic's API doesn't accept it there).
 

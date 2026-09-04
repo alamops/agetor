@@ -144,7 +144,7 @@ import {
 } from "./github.ts";
 import { remoteHostsForDirs } from "./git-provider.ts";
 import * as gitHost from "./git-host.ts";
-import { getDiscoveredModels } from "./agent-discovery.ts";
+import { getDiscoveredEfforts, getDiscoveredModels } from "./agent-discovery.ts";
 import {
   refreshAllModels,
   refreshHarnessModels,
@@ -165,9 +165,9 @@ import {
 import {
   DEFAULT_BRANCH_CONFIG,
   EVENTS_REPLAY_LIMIT,
-  MODEL_EFFORT_SUPPORT,
   TASK_EVENTS_REPLAY_META_EVENT,
   TASK_TYPES,
+  supportedEfforts,
   validateBranchConfig,
 } from "../shared/types.ts";
 import type {
@@ -3531,12 +3531,30 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           if ("effort" in patch && patch.effort === null) {
             const resolvedAgent = typeof patch.agent === "string" ? patch.agent : before.agent;
-            const resolvedKind = harnesses.getByIdOrKind(resolvedAgent)?.kind ?? null;
+            const resolvedHarness = harnesses.getByIdOrKind(resolvedAgent);
+            const resolvedKind = resolvedHarness?.kind ?? null;
             const resolvedModel =
               typeof patch.model === "string" ? patch.model : before.model;
             if (resolvedKind && resolvedModel) {
-              const support = MODEL_EFFORT_SUPPORT[resolvedKind][resolvedModel];
-              const modelDeclinesEffort = Array.isArray(support) && support.length === 0;
+              // Discovered-then-curated, same contract as every other
+              // `supportedEfforts` call site (a harness-reported catalog wins
+              // when non-empty; the curated MODEL_EFFORT_SUPPORT table is the
+              // fallback). This stays NULL-CLEAR-ONLY, exactly as before: a
+              // model whose supported-effort set is empty (by either source)
+              // declines effort entirely, so clearing it is allowed. A
+              // non-null effort id is deliberately never validated here —
+              // the discovered/curated catalog can understate what the live
+              // CLI/API actually accepts (Codex's app-server `model/list`
+              // never lists `none`, and `ultra` runs on models the API
+              // accepts it on but the catalog doesn't offer it for), so
+              // rejecting a value here would block a choice that runs fine.
+              // See docs/plans/add-gpt-6-astra.md §3.
+              const support = supportedEfforts(
+                resolvedKind,
+                resolvedModel,
+                getDiscoveredEfforts(resolvedKind, resolvedModel, resolvedHarness?.id),
+              );
+              const modelDeclinesEffort = support.length === 0;
               if (!modelDeclinesEffort) {
                 return json(
                   { error: `effort cannot be cleared for model "${resolvedModel}"` },
