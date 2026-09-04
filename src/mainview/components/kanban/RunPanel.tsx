@@ -41,6 +41,8 @@ import {
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
+  EFFORT_OPTIONS,
+  retainableEfforts,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -59,7 +61,7 @@ import {
   type TaskReference,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
-import { mergeModelOptions } from "../../../shared/model-options.ts";
+import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
 import { parseIssueUrl } from "../../../shared/issue-task.ts";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
@@ -5401,23 +5403,100 @@ function TaskDetails({
     }
   };
 
+  // Memoized so the merge (curated ∪ discovered, rule 1–7) only re-runs when
+  // one of its actual inputs changes, not on every streamed-event render.
+  // Declared before the effort memos below because they read from it —
+  // per rule 8/rule 7, effort discovery must go through the same
+  // logged-out-distrusting merge the Model picker uses, not the raw
+  // discovered list.
+  const modelOptions = useMemo(
+    () => mergedModels(
+      kind,
+      task.agent,
+      agentModels,
+      harnessModels,
+      task.model ?? DEFAULT_MODEL[kind],
+      selectedStatus?.loggedIn ?? null,
+    ),
+    [kind, task.agent, agentModels, harnessModels, task.model, selectedStatus?.loggedIn],
+  );
+
   // Effort is per (agent, model) — e.g. xhigh isn't valid for Sonnet 4.6,
   // and Haiku 4.5 doesn't accept the effort param at all. When the user picks
   // a model that no longer supports the saved effort, drop it back to the
   // kind's default effort (if supported) or null when the model is the
   // Haiku-style "no effort" case. Same pattern as the new-task form.
+  //
+  // The CLI's own discovered per-model efforts (when reported) win over the
+  // curated table for what the picker OFFERS — see `supportedEfforts`'s
+  // third argument. But the cascade below deliberately checks the wider
+  // `retainableEfforts` union (discovered ∪ curated), not just what's
+  // offered right now: a discovery refresh that happens to omit an id (e.g.
+  // `none`, which Codex's own `model/list` never lists even though the API
+  // accepts it) must not silently PATCH away an effort the user already
+  // chose. Only an effort neither source supports triggers the fallback.
+  //
+  // Reads from `modelOptions` (the merged rows), not the raw
+  // `harnessModels`/`agentModels` maps — `mergeModelOptions` already applies
+  // rule 7 (a logged-out harness's discovered catalog is untrustworthy), and
+  // this is the single source that distrust must flow through.
+  const discoveredEffortsForTask = useMemo(
+    () => discoveredEffortsFor(modelOptions, task.model),
+    [modelOptions, task.model],
+  );
   const supportedEffortsForModel = useMemo(
-    () => supportedEfforts(kind, task.model),
-    [kind, task.model],
+    () => supportedEfforts(kind, task.model, discoveredEffortsForTask),
+    [kind, task.model, discoveredEffortsForTask],
   );
   const allowedEfforts = useMemo(
     () => new Set(supportedEffortsForModel.map((o) => o.id)),
     [supportedEffortsForModel],
   );
+  const retainable = useMemo(
+    () => retainableEfforts(kind, task.model, discoveredEffortsForTask),
+    [kind, task.model, discoveredEffortsForTask],
+  );
+  // Mirrors `mergeModelOptions` rule 6: a task's current effort can be
+  // retained (kept valid by the cascade above) without being one the picker
+  // would otherwise offer — e.g. a discovery refresh that omits `none`.
+  // Built in `EFFORT_OPTIONS` order (highest→lowest) rather than appended
+  // last, so a retained `ultra` still sorts above `Low` instead of trailing
+  // the whole list; the "kept as you chose it" hint names the harness the
+  // task is actually running on instead of hardcoding "Codex".
+  const effortSelectOptions = useMemo(() => {
+    const harnessLabel = harnesses.find((h) => h.id === task.agent)?.label ?? kind;
+    const known = EFFORT_OPTIONS.some((o) => o.id === task.effort);
+    const options = EFFORT_OPTIONS
+      .filter((o) => allowedEfforts.has(o.id) || (o.id === task.effort && retainable.has(o.id)))
+      .map((o) => (
+        allowedEfforts.has(o.id)
+          ? o
+          : {
+              ...o,
+              unlisted: true,
+              hint: `Not in ${harnessLabel}'s discovered effort menu — kept as you chose it.`,
+            }
+      ));
+    // `task.effort` may be an id with no `EFFORT_OPTIONS` row at all (an
+    // unknown/future effort id) — the filter above can't represent it, so
+    // fall back to a raw row labelled by the id itself.
+    if (task.effort && !known && retainable.has(task.effort)) {
+      return [
+        ...options,
+        {
+          id: task.effort,
+          label: task.effort,
+          hint: `Not in ${harnessLabel}'s discovered effort menu — kept as you chose it.`,
+          unlisted: true,
+        },
+      ];
+    }
+    return options;
+  }, [allowedEfforts, retainable, task.effort, harnesses, task.agent, kind]);
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
   const fastAvailable = kind === "cursor" && cursorModelSupportsFast(task.model, task.effort);
   useEffect(() => {
-    if (task.effort && allowedEfforts.has(task.effort)) return;
+    if (task.effort && retainable.has(task.effort)) return;
     if (supportedEffortsForModel.length === 0) {
       if (task.effort !== null) void save({ effort: null });
       return;
@@ -5427,7 +5506,7 @@ function TaskDetails({
       : supportedEffortsForModel[0]!.id;
     if (task.effort !== fallback) void save({ effort: fallback });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allowedEfforts, task.effort, supportedEffortsForModel]);
+  }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel]);
   useEffect(() => {
     if (task.fast && !fastAvailable) void save({ fast: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -5447,7 +5526,16 @@ function TaskDetails({
     const nextKind = harnessKindOf(nextId, harnesses);
     const nextMode = AGENT_OPTIONS[nextKind].modes[0]?.id ?? "auto";
     const nextModel = DEFAULT_MODEL[nextKind];
-    const nextEfforts = supportedEfforts(nextKind, nextModel);
+    // Same merged-rows source `modelOptions` reads from (rule 7's
+    // logged-out distrust), but for the harness being switched TO rather
+    // than the task's current one.
+    const nextLoggedIn = agents.find((a) => a.harnessId === nextId)?.loggedIn ?? null;
+    const nextModelRows = mergedModels(nextKind, nextId, agentModels, harnessModels, nextModel, nextLoggedIn);
+    const nextEfforts = supportedEfforts(
+      nextKind,
+      nextModel,
+      discoveredEffortsFor(nextModelRows, nextModel),
+    );
     const nextEffort = nextEfforts.length === 0
       ? null
       : nextEfforts.some((e) => e.id === DEFAULT_EFFORT[nextKind])
@@ -5455,20 +5543,6 @@ function TaskDetails({
         : nextEfforts[0]!.id;
     void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, fast: false, maxMode: false });
   };
-
-  // Memoized so the merge (curated ∪ discovered, rule 1–7) only re-runs when
-  // one of its actual inputs changes, not on every streamed-event render.
-  const modelOptions = useMemo(
-    () => mergedModels(
-      kind,
-      task.agent,
-      agentModels,
-      harnessModels,
-      task.model ?? DEFAULT_MODEL[kind],
-      selectedStatus?.loggedIn ?? null,
-    ),
-    [kind, task.agent, agentModels, harnessModels, task.model, selectedStatus?.loggedIn],
-  );
 
   return (
     <details className="border-b border-border/60 px-3 py-2 text-xs">
@@ -5563,7 +5637,7 @@ function TaskDetails({
             {editable ? (
               <CompactSelect
                 value={task.effort ?? ""}
-                options={supportedEffortsForModel}
+                options={effortSelectOptions}
                 onChange={(effort) => void save({ effort })}
                 disabled={supportedEffortsForModel.length === 0}
                 placeholder="n/a"
