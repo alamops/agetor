@@ -207,7 +207,7 @@ test("spawnGeminiViaTmux's new-session argv pins -x 200 -y 50 and forwards GEMIN
     spawnGeminiViaTmux({
       taskId,
       runId,
-      argv: ["gemini", "-m", "gemini-3-pro-preview", "--output-format", "stream-json", "--yolo", "--skip-trust", "-p", "hello"],
+      argv: ["gemini", "-m", "gemini-3.1-pro-preview", "--output-format", "stream-json", "--yolo", "--skip-trust", "-p", "hello"],
       env: { GEMINI_CLI_HOME: "/tmp/gemini-home" },
       cwd: "/tmp",
       onChunk,

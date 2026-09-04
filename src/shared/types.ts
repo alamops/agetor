@@ -1307,12 +1307,18 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // Grok 4.6 (high effort via DEFAULT_EFFORT) — replaces cursor-agent's own
   // "auto" as agetor's default so new tasks pin an explicit flagship model.
   "cursor": "cursor-grok-4.6",
-  // gemini-3-pro-preview is the current flagship per google-gemini/gemini-cli
-  // docs (verified 2026-08-06). Deliberately NOT the "auto" alias — a spike
-  // showed "auto" internally routes across mixed pro/flash-lite models even
-  // for simple prompts, which fails "always default to the best available
-  // model" (root CLAUDE.md). Pin an explicit flagship instead.
-  "gemini": "gemini-3-pro-preview",
+  // gemini-3.1-pro-preview is Google's current flagship Pro. It replaced
+  // gemini-3-pro-preview (agetor's default until 2026-09), which Google shut
+  // down on 2026-03-09 — ai.google.dev/gemini-api/docs/deprecations names
+  // 3.1 Pro preview as the replacement, and the old id is at best a
+  // server-side alias for it now; migration 049 rewrites tasks still pinned
+  // to the old id. Deliberately NOT the "auto" alias — a spike showed "auto"
+  // internally routes across mixed pro/flash-lite models even for simple
+  // prompts, which fails "always default to the best available model" (root
+  // CLAUDE.md). The CLI's own `pro` alias resolves to 3.1 Pro preview on
+  // accounts with 3.1 preview access (else to 3 Pro preview, or 2.5 Pro with
+  // no preview access at all — gemini-cli 0.58.0 resolveModel, 2026-09-02).
+  "gemini": "gemini-3.1-pro-preview",
   // Owner-chosen default (2026-08-27). fx's own compiled default is still
   // moonshotai/kimi-k3 (verified via empty-HOME `fx status --json` on
   // 0.0.6), but the Vercel AI Gateway catalog is account-scoped — K3 is
@@ -1322,9 +1328,9 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // Gateway ids, passed verbatim. fx is exempt from the "always default to
   // the best available model" rule above: the Gateway bills per token to the
   // user's own account, and flagship tiers (opus-5, sonnet-5, gpt-5.5,
-  // gemini-3.1-pro-preview, kimi-k3) stay one click away in the picker as
-  // catalog-gated rows — offered only when the signed-in account's catalog
-  // actually contains them (see `AgentOption.catalogOnly`).
+  // gemini-3.1-pro-preview, gemini-3.8-flash, kimi-k3) stay one click away
+  // in the picker as catalog-gated rows — offered only when the signed-in
+  // account's catalog actually contains them (see `AgentOption.catalogOnly`).
   // Re-verified 2026-08-31 on fx 0.0.7: compiled default unchanged
   // (moonshotai/kimi-k3 via empty-HOME `fx status --json`), zai/glm-5.3-flash
   // still present in the (grown to 234-id) unauth catalog — the reference
@@ -1586,6 +1592,29 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
     },
     fastEfforts: ["max", "xhigh", "high", "medium", "low", "none"],
   },
+  // Ids verified against `cursor-agent models` (2026-09-02): Gemini 3.8 / 3.7
+  // Flash ship as gemini-3.{8,7}-flash-{low,medium,high} — no minimal tier
+  // (unlike 3.6), no bare id, no -fast variants, no Max Mode. We map the
+  // unsuffixed label to the high tier — agetor's convention, mirroring 3.6;
+  // Cursor's own listing calls it "Gemini 3.8 Flash High" (cosmetic).
+  "gemini-3.8-flash": {
+    label: "Gemini 3.8 Flash",
+    hint: "Google Gemini 3.8 Flash via Cursor.",
+    effortIds: {
+      high: "gemini-3.8-flash-high",
+      medium: "gemini-3.8-flash-medium",
+      low: "gemini-3.8-flash-low",
+    },
+  },
+  "gemini-3.7-flash": {
+    label: "Gemini 3.7 Flash",
+    hint: "Google Gemini 3.7 Flash via Cursor.",
+    effortIds: {
+      high: "gemini-3.7-flash-high",
+      medium: "gemini-3.7-flash-medium",
+      low: "gemini-3.7-flash-low",
+    },
+  },
   "gemini-3.6-flash": {
     label: "Gemini 3.6 Flash",
     hint: "Google Gemini 3.6 Flash via Cursor.",
@@ -1844,9 +1873,10 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // [] for any model key here, which collapses the effort picker in the UI —
   // the same treatment claude-code's haiku-4.5 gets.
   gemini: {
-    "gemini-3-pro-preview": [],
     "gemini-3.1-pro-preview": [],
     "gemini-2.5-pro": [],
+    "gemini-3.8-flash": [],
+    "gemini-3.8-flash-cyber": [],
     "gemini-3.7-flash": [],
     "gemini-3.5-flash": [],
     "gemini-2.5-flash": [],
@@ -1875,6 +1905,7 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "anthropic/claude-sonnet-5": [],
     "openai/gpt-5.5": [],
     "google/gemini-3.1-pro-preview": [],
+    "google/gemini-3.8-flash": [],
     "moonshotai/kimi-k3": [],
   },
 };
@@ -2059,13 +2090,25 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   gemini: {
     // Pro tier first, then Flash tier; newest first within each tier.
+    // gemini-3-pro-preview (the default until 2026-09) was shut down by
+    // Google on 2026-03-09 and is retired here; migration 049 rewrites
+    // tasks still pinned to it to its successor, 3.1 Pro preview.
     models: [
-      { id: "gemini-3-pro-preview", label: "Gemini 3 Pro (preview)", hint: "Recommended default — current flagship." },
-      { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", hint: "Newer preview tier." },
+      { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", hint: "Recommended default — current flagship; Google's successor to the retired 3 Pro preview." },
       { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", hint: "Prior stable flagship." },
-      { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", hint: "Latest and most capable Flash — strong on coding and agentic work at Flash cost." },
-      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost — prior Flash generation." },
-      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, earlier generation." },
+      { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Latest and most capable Flash — built for long-horizon coding and agentic work at Flash cost." },
+      // Fairwind-Program-gated cybersecurity twin of 3.8 Flash (launched 2026-09-02).
+      // Google has published no model code for it — not on the Cyber page, the
+      // Fairwind page, the API models table, the model-card index, or the
+      // Enterprise Agent Platform model list (all checked 2026-09-03) — so this
+      // id follows Google's own suffix convention (gemini-3.1-flash-lite,
+      // gemini-3-pro-image) and OpenAI's gpt-5.6-cyber precedent. Owner-approved
+      // pending a published code; agetor passes it through verbatim, so a
+      // grant that names it differently needs only this literal changed.
+      { id: "gemini-3.8-flash-cyber", label: "Gemini 3.8 Flash Cyber", hint: "Cybersecurity-tuned 3.8 Flash for vulnerability discovery and patching. Requires Fairwind Program access (invite-only). No public model code yet — this id follows Google's naming convention; if your grant names it differently, create the task with `agetor add --model <code>`." },
+      { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", hint: "Prior Flash generation — strong on coding and agentic work." },
+      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost — earlier Flash generation." },
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, earliest Flash generation offered." },
     ],
     modes: [
       { id: "auto", label: "Auto (yolo)", hint: "Edit files without approval prompts (--yolo)." },
@@ -2085,9 +2128,12 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // `AgentOption.catalogOnly`, `CATALOG_SCOPED_KINDS`). Discovered-only ids
     // (neither list) append via `mergeModelOptions`
     // (`src/shared/model-options.ts`).
-    // Re-verified 2026-08-31 on fx 0.0.7 (unauth view: all 16 standard + 5
-    // catalogOnly ids present, catalog grown to 234; signed-in view
+    // Re-verified 2026-08-31 on fx 0.0.7 (unauth view: all 16 standard + the
+    // then-5 catalogOnly ids present, catalog grown to 234; signed-in view
     // unverifiable this pass — token expired).
+    // 2026-09-02: google/gemini-3.8-flash added from fx 0.0.7's unauthenticated
+    // catalog (`fx models --json` under an expired login); its presence in a
+    // standard signed-in account's catalog is unverified, hence catalogOnly.
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
@@ -2109,6 +2155,7 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "openai/gpt-5.5", label: "GPT-5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "google/gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "moonshotai/kimi-k3", label: "Kimi K3", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [

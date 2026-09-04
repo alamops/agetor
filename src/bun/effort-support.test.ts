@@ -300,6 +300,20 @@ test("gemini gemini-3.7-flash exposes no effort options (no effort flag on the C
   expect(ids).toEqual([]);
 });
 
+test("gemini gemini-3.8-flash exposes no effort options (no effort flag on the CLI)", () => {
+  const ids = supportedEfforts("gemini", "gemini-3.8-flash").map((o) => o.id);
+  expect(ids).toEqual([]);
+});
+
+test("gemini gemini-3.8-flash-cyber exposes no effort options (same CLI, no effort flag)", () => {
+  expect(supportedEfforts("gemini", "gemini-3.8-flash-cyber").map((o) => o.id)).toEqual([]);
+});
+
+test("gemini default model gemini-3.1-pro-preview exposes no effort options", () => {
+  expect(supportedEfforts("gemini", "gemini-3.1-pro-preview").map((o) => o.id)).toEqual([]);
+  expect(supportedEfforts("gemini", null).map((o) => o.id)).toEqual([]);
+});
+
 // --- cursor: model thinking modes + fast variants -----------------------------
 
 test("cursor DEFAULT_MODEL is Grok 4.6 (explicit flagship pin, not cursor-agent's 'auto')", () => {
@@ -353,6 +367,17 @@ test("cursor GPT-5.4 exposes Extra High but not Max", () => {
 
 test("cursor Gemini 3.6 Flash exposes Minimal", () => {
   expect(supportedEfforts("cursor", "gemini-3.6-flash").map((o) => o.id)).toContain("minimal");
+});
+
+test("cursor Gemini 3.8 Flash and 3.7 Flash expose exactly High/Medium/Low — no Minimal (unlike 3.6), verified via `cursor-agent models` 2026-09-02", () => {
+  for (const id of ["gemini-3.8-flash", "gemini-3.7-flash"]) {
+    expect(supportedEfforts("cursor", id).map((o) => o.id)).toEqual(["high", "medium", "low"]);
+    expect(cursorModelSupportsMaxMode(id)).toBe(false);
+    expect(cursorModelSupportsFast(id, "high")).toBe(false);
+  }
+  const ids = AGENT_OPTIONS.cursor.models.map((m) => m.id);
+  expect(ids.indexOf("gemini-3.8-flash")).toBeLessThan(ids.indexOf("gemini-3.7-flash"));
+  expect(ids.indexOf("gemini-3.7-flash")).toBeLessThan(ids.indexOf("gemini-3.6-flash"));
 });
 
 test("cursor unknown model id reports zero efforts (effort rides in the id, so a pick would be inert)", () => {

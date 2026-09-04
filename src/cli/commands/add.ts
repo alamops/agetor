@@ -20,6 +20,7 @@ import {
   DEFAULT_EFFORT,
   CATALOG_SCOPED_KINDS,
   supportedEfforts,
+  cursorModelIdCoveredByCatalog,
   type AgentKind,
 } from "../../shared/types.ts";
 import { mergeModelOptions, discoveredEffortsFor, type DiscoveredModel } from "../../shared/model-options.ts";
@@ -220,6 +221,32 @@ function baseInput(o: AddOpts, title: string, prompt: string): CreateTaskInput {
   };
 }
 
+/** Seed for the interactive model picker: the stored `lastModel:<kind>` pref
+ *  when it is still offerable — a curated row for the kind, or an id the
+ *  harness's discovered catalog actually lists (fx accounts can carry
+ *  discovered-only ids) — else the kind's default. Mirrors the two webview
+ *  pickers' validation so a retired id (e.g. gemini-3-pro-preview, shut down
+ *  2026-03-09 and cleared by migration 049) can't be re-offered as the
+ *  pre-selected default via mergeModelOptions' unlisted-row rule. `loggedIn`
+ *  mirrors mergeModelOptions rule 7: a logged-out harness's discovered
+ *  catalog is untrustworthy (an expired login reads back the unauthenticated
+ *  catalog), so it is not consulted — only curated rows can keep the pref. */
+export function resolveInitialModel(
+  kind: AgentKind,
+  stored: string | undefined | null,
+  discovered: readonly DiscoveredModel[],
+  loggedIn: boolean | null = null,
+): string {
+  const offerable = loggedIn === false ? [] : discovered;
+  if (
+    stored &&
+    (AGENT_OPTIONS[kind].models.some((m) => m.id === stored) || offerable.some((m) => m.id === stored))
+  ) {
+    return stored;
+  }
+  return DEFAULT_MODEL[kind];
+}
+
 async function wizard(
   client: AgetorClient,
   o: AddOpts,
@@ -284,7 +311,19 @@ async function wizard(
   // kind-level map for an older daemon without `/agent-models/harnesses`.
   // Computed once agent/kind are known so the model picker and the effort
   // prompt below read the same discovered list.
-  const catalog: DiscoveredModel[] = (agent && harnessModels.byHarness[agent]) || discovered[kind] || [];
+  // Spec'd cursor models show as one base row + effort dropdown, not N
+  // suffixed rows — same filter as the webview pickers (NewTaskForm.tsx).
+  const catalog: DiscoveredModel[] = ((agent && harnessModels.byHarness[agent]) || discovered[kind] || []).filter(
+    (m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id),
+  );
+  const loggedIn = statuses.find((s) => s.harnessId === agent)?.loggedIn ?? null;
+
+  // Picker seed: an explicit `--model` wins verbatim (unknown ids pass
+  // through — house convention); otherwise the stored `lastModel:<kind>`
+  // pref only while it is still offerable (`resolveInitialModel`, which
+  // mirrors the webview pickers' validation and rule 7's logged-out
+  // distrust), else the kind's default.
+  const initial = o.model ?? resolveInitialModel(kind, prefs[`lastModel:${kind}`], catalog, loggedIn);
 
   // Hoisted so both the model picker and the effort prompt below read the
   // same merged rows — computed unconditionally (not just inside the
@@ -293,14 +332,13 @@ async function wizard(
   const modelOptions = mergeModelOptions({
     curated: AGENT_OPTIONS[kind].models,
     discovered: catalog,
-    selected: o.model ?? prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind],
+    selected: initial,
     scoped: CATALOG_SCOPED_KINDS.has(kind),
-    loggedIn: statuses.find((s) => s.harnessId === agent)?.loggedIn ?? null,
+    loggedIn,
   });
 
   let model = o.model;
   if (!model) {
-    const initial = prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind];
     const picked = await pickOption("Model", modelOptions, initial);
     if (picked === null) return cancelled();
     model = picked;

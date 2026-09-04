@@ -80,7 +80,7 @@ const codexDefaults = { mode: "auto", model: "gpt-6-astra", effort: "high" } as 
 const cursorDefaults = { mode: "auto", model: "cursor-grok-4.6", effort: "high" } as const;
 // Gemini has no effort flag at all (see MODEL_EFFORT_SUPPORT.gemini in
 // shared/types.ts) — buildCommand's gemini branch never reads opts.effort.
-const geminiDefaults = { mode: "auto", model: "gemini-3-pro-preview" } as const;
+const geminiDefaults = { mode: "auto", model: "gemini-3.1-pro-preview" } as const;
 // fx has no effort flag either (silently ignored, mirrors gemini) but,
 // unlike every other kind, buildCommand also requires `runId` (used to build
 // the deterministic --log-file path) — see the throw tests below.
@@ -737,6 +737,49 @@ test("cursor composes a curated model plus effort into Cursor's concrete model i
   ]);
 });
 
+test("cursor Gemini 3.8 Flash + medium effort composes gemini-3.8-flash-medium", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gemini-3.8-flash",
+    effort: "medium",
+  });
+  expect(cmd).toEqual([
+    "cursor-agent",
+    "-p", "--output-format", "stream-json",
+    "--model", "gemini-3.8-flash-medium",
+    "--force", "--sandbox", "disabled",
+  ]);
+});
+
+test("cursor Gemini 3.8 Flash with null effort falls back to the high variant", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gemini-3.8-flash",
+    effort: null,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.8-flash-high");
+});
+
+test("cursor Gemini 3.7 Flash + low effort composes gemini-3.7-flash-low", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gemini-3.7-flash",
+    effort: "low",
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.7-flash-low");
+});
+
+test("cursor Gemini 3.8 Flash ignores fast and maxMode (no fast variant, no Max Mode)", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gemini-3.8-flash",
+    effort: "high",
+    fast: true,
+    maxMode: true,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.8-flash-high");
+});
+
 test("cursor fast toggle selects the Fast model variant when that effort supports it", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
@@ -839,7 +882,7 @@ test("gemini with defaults emits -m + stream-json + --yolo + --skip-trust, promp
   const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults });
   expect(cmd).toEqual([
     "gemini",
-    "-m", "gemini-3-pro-preview",
+    "-m", "gemini-3.1-pro-preview",
     "--output-format", "stream-json",
     "--yolo",
     "--skip-trust",
@@ -859,12 +902,36 @@ test("gemini-3.7-flash model id is emitted verbatim via -m", () => {
   ]);
 });
 
+test("gemini-3.8-flash model id is emitted verbatim via -m", () => {
+  const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, model: "gemini-3.8-flash" });
+  expect(cmd).toEqual([
+    "gemini",
+    "-m", "gemini-3.8-flash",
+    "--output-format", "stream-json",
+    "--yolo",
+    "--skip-trust",
+    "-p", "hi",
+  ]);
+});
+
+test("gemini-3.8-flash-cyber (Fairwind-gated) model id is emitted verbatim via -m", () => {
+  const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, model: "gemini-3.8-flash-cyber" });
+  expect(cmd).toEqual([
+    "gemini",
+    "-m", "gemini-3.8-flash-cyber",
+    "--output-format", "stream-json",
+    "--yolo",
+    "--skip-trust",
+    "-p", "hi",
+  ]);
+});
+
 test("gemini 'ask' mode uses --approval-mode plan instead of --yolo", () => {
   const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, mode: "ask" });
   expect(cmd).not.toContain("--yolo");
   expect(cmd).toEqual([
     "gemini",
-    "-m", "gemini-3-pro-preview",
+    "-m", "gemini-3.1-pro-preview",
     "--output-format", "stream-json",
     "--approval-mode", "plan",
     "--skip-trust",
@@ -916,7 +983,7 @@ test("gemini throws when model is missing", () => {
 });
 
 test("gemini never requires effort — no flag emitted, no throw, even when omitted", () => {
-  const { cmd, env } = buildCommand(builtin("gemini"), "hi", { mode: "auto", model: "gemini-3-pro-preview" });
+  const { cmd, env } = buildCommand(builtin("gemini"), "hi", { mode: "auto", model: "gemini-3.1-pro-preview" });
   expect(cmd).toContain("-p");
   // No effort-shaped flag anywhere in argv, and no env var either.
   expect(cmd.join(" ")).not.toMatch(/effort/i);
