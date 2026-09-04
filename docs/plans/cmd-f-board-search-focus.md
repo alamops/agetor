@@ -9,6 +9,7 @@
 | Gates | grilled + approved by owner |
 | Branch | feature/cmd-f-auto-focus-on-search-field |
 | Base SHA | a59ba44 |
+| Review | opus, `code-review` skill rubric — ship; 0 critical/high/medium, 2 low, 2 info (all but INFO-3 fixed in 4f402f5) |
 
 ## 1. Objective & success criteria
 
@@ -201,6 +202,10 @@ Assumptions proceeding on:
 | `.xterm` bail on the board handler | out of scope — unreachable: terminals mount only inside RunPanel (`RunPanel.tsx:4062`), where the board handler is off |
 | ⌘F inside WorktreesDialog / GitHubDialog search boxes | out of scope — modal dialogs; today the chord is inert there and stays so (different ticket) |
 | TUI / CLI analog | out of scope — no board search exists in those surfaces |
-| e2e + unit coverage for the above | in this run — TT1, TT2 |
+| e2e + unit coverage for the above | in this run — TT1, TT2 (+ a regression test for the Escape double-peel below) |
+| Close-edge race: RunPanel's Cmd+F listener outlives App's ref gate for ≥1 scheduler task (review LOW-1) | in this run — fix wave: synchronous `openRef` checked inside RunPanel's handler |
+| Escape in the board box also closed a marker-less popover (usage popover: `role="dialog"` without `aria-modal`; review LOW-2) | in this run — fix wave: the box yields to `[role="dialog"], [data-popover-open], [data-quote-open]` |
+| Comment cross-refs made stale by the `isMacPlatform` move (review INFO-4) | in this run — fix wave |
+| Chord moves focus out of the New Task composer while a `/` or `@` autocomplete is open, leaving it painted (review INFO-3) | out of scope — pre-existing click-away behavior of `SlashAutocomplete`/`AtFileAutocomplete` (no blur/outside-click dismissal); a `focusout` dismissal there is a different ticket |
 
 No owner-deferred rows.
