@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 import { MultiSearchSelect } from "@/components/ui/multi-search-select";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { COLUMNS, TASK_TYPES, type ColumnId, type Harness, type Project, type TaskType } from "../../../shared/types.ts";
 
@@ -110,6 +111,7 @@ export function KanbanFilters({
       <div className="relative flex-1 max-w-md">
         <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
         <Input
+          {...IDENTIFIER_INPUT_PROPS}
           value={textQuery}
           onChange={(e) => onTextQueryChange(e.target.value)}
           placeholder="Search title, prompt, workdir, branch…"

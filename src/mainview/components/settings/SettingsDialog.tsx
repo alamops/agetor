@@ -15,6 +15,7 @@ import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
 import { useFontSize } from "@/components/font-size-provider";
 import { useTheme } from "@/components/theme-provider";
 import { isMacPlatform } from "@/lib/font-size";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
@@ -1066,6 +1067,7 @@ function Editor({
         <div className="space-y-1">
           <label className="text-xs text-muted-foreground">Id (slug)</label>
           <Input
+            {...IDENTIFIER_INPUT_PROPS}
             value={id}
             onChange={(e) => setId(e.target.value)}
             disabled={isEdit}
@@ -1112,6 +1114,7 @@ function Editor({
           {HARNESS_HOME_COPY[kind].label}
         </label>
         <Input
+          {...IDENTIFIER_INPUT_PROPS}
           value={home}
           onChange={(e) => setHome(e.target.value)}
           placeholder={
@@ -1128,6 +1131,7 @@ function Editor({
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Bin override (absolute path; optional)</label>
         <Input
+          {...IDENTIFIER_INPUT_PROPS}
           value={bin}
           onChange={(e) => setBin(e.target.value)}
           placeholder="/opt/homebrew/bin/claude"

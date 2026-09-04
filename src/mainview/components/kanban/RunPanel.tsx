@@ -9,6 +9,7 @@ import {
 import { api, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
 import { EXPAND_EVENT, isExpandTargetFor } from "@/lib/expand-on-jump";
 import { latestPrProposal } from "@/lib/pr-proposal";
@@ -2842,6 +2843,7 @@ function RunPanelBody({
             <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
             <Input
               ref={searchInputRef}
+              {...IDENTIFIER_INPUT_PROPS}
               aria-label="Search messages"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
