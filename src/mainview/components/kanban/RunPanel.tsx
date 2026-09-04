@@ -69,7 +69,7 @@ import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
-import { parseUserMessage, splitReferences } from "@/lib/command-message";
+import { parseUserMessage, splitReferences, parseMessageSegments, type MessageSegment } from "../../../shared/user-message.ts";
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
 import { AttachmentChips } from "./AttachmentChips";
@@ -84,6 +84,7 @@ import { deriveTodoProgress } from "@/lib/todo-progress";
 import { TodoProgressCard } from "./TodoProgressCard";
 import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
 import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink } from "./md-components";
+import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent } from "./MessageSegments";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -4557,10 +4558,13 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
   // visual position after expand/collapse.
   const pendingAdjustRef = useRef<{ scroller: HTMLElement; prevHeight: number } | null>(null);
 
-  // Recognize slash-command invocations (XML expansion or plain echo) and
-  // `<local-command-stdout>` blocks so they render as structured UI instead
-  // of literal `<command-*>` tags. `null` for an ordinary message — the
-  // fallback branch below renders exactly what this component always has.
+  // Recognize slash-command invocations (XML expansion or plain echo),
+  // `<local-command-stdout>` blocks, and (see `src/shared/user-message.ts`'s
+  // "tagged" kind) any other message carrying balanced top-level tags — a
+  // background skill launch, a shell escape, or a user's own prompt tags —
+  // so all of these render as structured UI instead of literal `<tag>` text.
+  // `null` for an ordinary message — the fallback branch below renders
+  // exactly what this component always has.
   const parsed = useMemo(() => parseUserMessage(text), [text]);
 
   // For an ordinary (non-command) message, split off a trailing "Referenced
@@ -4592,6 +4596,27 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
     ordinary.references.length > 0
       ? stripImagePlaceholders(ordinary.args)
       : ordinary.args;
+
+  // A slash command's args are an intended user message too — segment them
+  // the same general way a `tagged` message's text is segmented below, so a
+  // command invoked with e.g. `<context>…</context>` in its args also gets
+  // structured rendering instead of literal tag text. Unused (and cheap:
+  // `commandArgsText` is `""`) when `parsed.kind !== "command"`.
+  const commandSegments = useMemo(
+    () => parseMessageSegments(commandArgsText),
+    [commandArgsText],
+  );
+
+  // For the `tagged` kind: re-segment with `[Image #N]` placeholders
+  // stripped when the message carries references (mirroring the command/
+  // ordinary branches above) — otherwise the already-parsed segments are
+  // reused as-is. Unused (and cheap) when `parsed.kind !== "tagged"`.
+  const taggedSegments = useMemo((): MessageSegment[] => {
+    if (!parsed || parsed.kind !== "tagged") return [];
+    return parsed.references.length > 0
+      ? parseMessageSegments(stripImagePlaceholders(parsed.text))
+      : parsed.segments;
+  }, [parsed]);
 
   // Default to the collapsed ~3-line cap and measure once mounted. The cap
   // is always rendered so short messages don't flash full-height first;
@@ -4638,13 +4663,9 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
       <div ref={bubbleRef} className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/30 bg-card px-3 py-1.5 text-foreground shadow-sm">
         {parsed?.kind === "command-output" ? (
           <>
-            <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
-              command output
-            </div>
+            <MachineLabel>command output</MachineLabel>
             <div ref={contentRef} className={collapseClassName}>
-              <div className="whitespace-pre-wrap font-mono text-[11px] text-muted-foreground">
-                {parsed.output || "—"}
-              </div>
+              <CommandOutputBody output={parsed.output} />
             </div>
           </>
         ) : parsed?.kind === "command" ? (
@@ -4660,12 +4681,18 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
             </div>
             {commandArgsText && (
               <div ref={contentRef} className={collapseClassName}>
-                <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
-                  {commandArgsText}
-                </ReactMarkdown>
+                <MessageSegments segments={commandSegments} />
               </div>
             )}
             <AttachmentChips references={parsed.command.references} taskId={taskId} />
+          </>
+        ) : parsed?.kind === "tagged" ? (
+          <>
+            {hasAuthoredContent(taggedSegments) && <MachineLabel>you</MachineLabel>}
+            <div ref={contentRef} className={collapseClassName}>
+              <MessageSegments segments={taggedSegments} />
+            </div>
+            <AttachmentChips references={parsed.references} taskId={taskId} />
           </>
         ) : (
           <>
