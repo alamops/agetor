@@ -134,6 +134,8 @@ import type {
 } from "../shared/types.ts";
 import { WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
 import { appendReferences } from "../shared/refs.ts";
+import { promptByteOverage } from "../shared/prompt-limits.ts";
+import { expandAtReferencesDetailed } from "./project-files.ts";
 
 type Listener = (e: RunEvent) => void;
 const listeners = new Set<Listener>();
@@ -944,7 +946,9 @@ async function spawnAgentOrFail(
  */
 const startingTaskIds = new Set<string>();
 
-export async function startTask(taskId: string): Promise<{ runId: string } | { error: string }> {
+export async function startTask(
+  taskId: string,
+): Promise<{ runId: string; unresolvedRefs?: string[] } | { error: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
@@ -957,7 +961,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   }
 }
 
-async function startTaskInner(taskId: string, task: Task): Promise<{ runId: string } | { error: string }> {
+async function startTaskInner(taskId: string, task: Task): Promise<{ runId: string; unresolvedRefs?: string[] } | { error: string }> {
   // startTask auto-unarchives and materializes the worktree below — it must
   // not race a teardown archiveTask (or deleteTask) deferred for this task,
   // or a `detachWorktree`/`removeWorktree` still in flight could yank the
@@ -1019,6 +1023,46 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
   });
   if ("error" in prepared) return { error: prepared.error };
 
+  // Expand `@`-tokens into absolute paths now, right after `prepareWorkdir`
+  // returns — this is the EARLIEST point in the whole flow that knows the
+  // agent's real cwd: `prepared.cwd` is the worktree root once it has just
+  // been materialized (isolation "worktree"), or the raw workdir otherwise.
+  // No code before this line could have resolved a token correctly. Only
+  // `expandedPrompt` (a local) carries the expansion — `task.prompt` itself
+  // is left untouched in the DB, so editing the task or re-running it later
+  // keeps the `@tokens` and re-resolves them against whatever cwd that next
+  // run gets (a fresh worktree, a moved workdir, etc).
+  const { text: expandedPrompt, unresolved: unresolvedRefs } = expandAtReferencesDetailed(task.prompt, prepared.cwd);
+  // Budget-check the fully expanded + reffed prompt against what the RAW
+  // (pre-expansion) prompt would already have needed. Expansion can turn a
+  // handful of short `@tokens` into long absolute paths and push a prompt
+  // over an agent's argv-launch cap (gemini today, see prompt-limits.ts)
+  // even though the raw text the user typed comfortably fit under it —
+  // that's the ONLY case this pre-check exists to catch early, before any
+  // run row is inserted or the task flips to `running`. A prompt that was
+  // ALREADY over budget with no `@` tokens involved (`rawOverage` truthy
+  // too) is deliberately left alone here and falls through to the
+  // pre-existing hardening below — `buildCommand`'s own throw inside
+  // `spawnAgentOrFail`'s catch, exercised (with a run row landing `failed`)
+  // by orchestrator-fx.test.ts's "spawn-throw hardening (gemini)" test —
+  // so that pre-existing behavior/error text is unchanged by this feature.
+  const expandedOverage = promptByteOverage(harness.kind, appendReferences(expandedPrompt, task.references));
+  // Skip re-encoding the same text twice (R19, code review) when expansion
+  // was a no-op — a prompt with no `@` tokens at all (or none that resolved)
+  // has `expandedPrompt === task.prompt`, so `expandedOverage` already IS
+  // what re-running `promptByteOverage` on the raw prompt would compute.
+  const rawOverage = expandedPrompt === task.prompt
+    ? expandedOverage
+    : promptByteOverage(harness.kind, appendReferences(task.prompt, task.references));
+  if (expandedOverage && !rawOverage) {
+    return {
+      error:
+        `prompt is ${expandedOverage.bytes - expandedOverage.limit} bytes over ${harness.label}'s `
+        + `${expandedOverage.limit}-byte launch limit after expanding @ file references — shorten it or `
+        + `reference fewer files`,
+    };
+  }
+
   // Lazy-pin baseRef: workdir wasn't a git repo when the task was created but
   // is one now. Pin the sha actually used so re-runs stay reproducible.
   if (!task.baseRef && prepared.worktreePath) {
@@ -1069,7 +1113,7 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
     emitGlobal({ kind: "column", taskId, runId, column: "running", prev: prevColumn, ts: now });
   }
 
-  const promptWithRefs = appendReferences(task.prompt, task.references);
+  const promptWithRefs = appendReferences(expandedPrompt, task.references);
 
   const onChunk = makeChunkHandler(runId, taskId, harness.kind, task.mode);
   // Echo the initial prompt as a "user" event so the panel renders a
@@ -1112,7 +1156,7 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
 
   attachDoneHandler(runId, taskId, agent);
 
-  return { runId };
+  return { runId, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
 }
 
 /** Cheap pre-filter before doing the more expensive JSON-parse + DB query a
@@ -2251,9 +2295,16 @@ export async function cancelRun(runId: string): Promise<boolean> {
  * didn't reach the agent. A genuine tmux subprocess failure (not a modal
  * withhold) keeps this plain `{ delivered: false, reason }` shape with no
  * `withheld`/`savedToBacklog` flags.
+ *
+ * `unresolvedRefs` (delivered variant only, omitted when empty): the raw
+ * `@`-tokens (`token.raw` — e.g. `@nope.md`, `@"my file.md"`) the send-time
+ * expansion left verbatim because they didn't resolve against this task's
+ * cwd — a typo, a file not present in this cwd's tree, or an `@name`
+ * extension mention (`@github`) are all indistinguishable here; the server
+ * reports the fact, callers decide what's noise.
  */
 export type SendInputResult =
-  | { delivered: true; runId: string }
+  | { delivered: true; runId: string; unresolvedRefs?: string[] }
   | { delivered: false; reason: string; withheld?: true; savedToBacklog?: true };
 
 /**
@@ -2331,9 +2382,55 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
     }
   }
 
-  const kind = resolveHarness(row.agent)?.kind;
+  // Single choke point for `@`-token expansion on every follow-up path:
+  // webview sends, the backlog tray, the diff composer, ask-card free-text
+  // answers, and the CLI all funnel through `sendInput`, so expanding here
+  // once — rather than in each per-kind `send*Turn` below — covers all of
+  // them with no per-caller change. Re-read the task (rather than reuse the
+  // `task` fetched above) because the worktree-restore branch just above may
+  // have materialized `worktreePath` for the first time; a stale read would
+  // expand against a cwd that didn't exist yet.
+  const cwdTask = tasks.get(row.task_id) ?? task;
+  // Keep the pre-expansion text around: a claude paste that gets withheld by
+  // the modal guard re-stashes into the task's backlog tray (see
+  // `handlePasteWithheld`/`restashPasteWithheldText`), and that re-stash must
+  // dedupe against the RAW `@token` text a draft/tray item was saved with
+  // (plan §3.2) — re-stashing the EXPANDED absolute-path text would never
+  // match, producing a duplicate backlog entry every time the same message is
+  // retried (R2, code review).
+  const rawLine = line;
+  const expanded = expandAtReferencesDetailed(line, cwdTask.worktreePath ?? cwdTask.workdir);
+  line = expanded.text;
+  const unresolvedRefs = expanded.unresolved;
+
+  const harness = resolveHarness(row.agent);
+  const kind = harness?.kind;
+
+  // Re-check the argv-launch budget AFTER expansion, mirroring `startTask`'s
+  // pre-check (R5, code review): expanding a handful of short `@tokens` into
+  // long absolute paths can push a follow-up over gemini's one-shot argv cap
+  // even though the raw text the user typed comfortably fit under it. Must
+  // run before the per-kind dispatch below — once a kind's `send*Turn` is
+  // called it may already queue behind (or fold into) a live session with no
+  // way to un-send. A prompt that was ALREADY over budget with no `@` tokens
+  // involved (`rawOverage` truthy too) is left alone here, same as
+  // `startTask`'s identical carve-out.
+  if (kind) {
+    const expandedOverage = promptByteOverage(kind, line);
+    const rawOverage = line === rawLine ? expandedOverage : promptByteOverage(kind, rawLine);
+    if (expandedOverage && !rawOverage) {
+      return {
+        delivered: false,
+        reason:
+          `message is ${expandedOverage.bytes - expandedOverage.limit} bytes over `
+          + `${harness?.label ?? row.agent}'s ${expandedOverage.limit}-byte launch limit after expanding `
+          + `@ file references — shorten it or reference fewer files`,
+      };
+    }
+  }
+
   if (kind === "claude-code") {
-    const result = await sendClaudeTurn(row.task_id, line);
+    const result = await sendClaudeTurn(row.task_id, line, rawLine);
     if (!result) return { delivered: false, reason: "internal: task lookup failed" };
     if (!result.delivered) {
       if (result.withheld) {
@@ -2346,7 +2443,7 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
       }
       return { delivered: false, reason: result.reason };
     }
-    return { delivered: true, runId: result.runId };
+    return { delivered: true, runId: result.runId, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
   }
   // The four `send*Turn` helpers below return `null` in two cases: the task
   // vanished between `sendInput`'s own lookup above and their internal
@@ -2360,7 +2457,7 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   if (kind === "codex") {
     const result = await sendCodexTurn(row.task_id, line);
     return result
-      ? { delivered: true, runId: result }
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
           delivered: false,
           reason: "another message is already starting a new turn for this task — try again in a moment",
@@ -2369,7 +2466,7 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   if (kind === "cursor") {
     const result = await sendCursorTurn(row.task_id, line);
     return result
-      ? { delivered: true, runId: result }
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
           delivered: false,
           reason: "another message is already starting a new turn for this task — try again in a moment",
@@ -2378,7 +2475,7 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   if (kind === "gemini") {
     const result = await sendGeminiTurn(row.task_id, line);
     return result
-      ? { delivered: true, runId: result }
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
           delivered: false,
           reason: "another message is already starting a new turn for this task — try again in a moment",
@@ -2387,7 +2484,7 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   if (kind === "fx") {
     const result = await sendFxTurn(row.task_id, line);
     return result
-      ? { delivered: true, runId: result }
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
           delivered: false,
           reason: "another message is already starting a new turn for this task — try again in a moment",
@@ -3206,8 +3303,17 @@ async function resolveClaudeTurnOutcome(
  *
  * Returns null only on internal lookup failure (missing task row). Sessions
  * are always recoverable as long as the task itself still exists.
+ *
+ * `rawLine` is `line` BEFORE `sendInput` expanded its `@tokens` into absolute
+ * paths — threaded through so a withheld paste (see `sendTurnInExistingSession`
+ * → `handlePasteWithheld`) re-stashes the RAW text into the task's backlog,
+ * matching the `@token` form a draft/tray item was saved with (plan §3.2).
+ * Optional and defaults to `line` for callers with nothing to distinguish
+ * (there are none in production — `sendInput` always passes it — but keeping
+ * it optional avoids forcing every test/helper caller to thread a value that
+ * happens to equal `line` anyway).
  */
-async function sendClaudeTurn(taskId: string, line: string): Promise<ClaudeTurnResult | null> {
+async function sendClaudeTurn(taskId: string, line: string, rawLine?: string): Promise<ClaudeTurnResult | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
 
@@ -3227,7 +3333,7 @@ async function sendClaudeTurn(taskId: string, line: string): Promise<ClaudeTurnR
   // session over a transient probe failure. Only an unambiguous `gone` (or no
   // in-memory state at all) reaches the destructive respawn path.
   if (hasSessionState(taskId) && (await sessionLiveness(sessionNameFor(taskId))) !== "gone") {
-    return sendTurnInExistingSession(task, taskId, line);
+    return sendTurnInExistingSession(task, taskId, line, rawLine);
   }
   // Dead/no session: about to mint a brand-new run. Claim the unified
   // per-task "starting" slot first — see `startingTaskIds`'s doc (near
@@ -3251,7 +3357,16 @@ async function sendClaudeTurn(taskId: string, line: string): Promise<ClaudeTurnR
   }
 }
 
-async function sendTurnInExistingSession(task: Task, taskId: string, line: string): Promise<ClaudeTurnResult> {
+/**
+ * `rawLine` is `line` before `@token` expansion — see `sendClaudeTurn`'s doc
+ * for why a withheld paste must re-stash that raw form, not the expanded one.
+ */
+async function sendTurnInExistingSession(
+  task: Task,
+  taskId: string,
+  line: string,
+  rawLine?: string,
+): Promise<ClaudeTurnResult> {
   // Fold-while-busy: if a turn is already in flight, paste the message into
   // the live session and record it on the ACTIVE run — no new run row, no new
   // turn slot. Claude's TUI queues the keystrokes and replays them as part of
@@ -3272,7 +3387,7 @@ async function sendTurnInExistingSession(task: Task, taskId: string, line: strin
     // the run, since the "user" bubble below is appended optimistically
     // before the paste's real outcome is known.
     const pasted = await pasteFollowUp(taskId, line, {
-      onPasteFailure: (outcome) => handlePasteWithheld(taskId, activeRunId, line, outcome),
+      onPasteFailure: (outcome) => handlePasteWithheld(taskId, activeRunId, rawLine ?? line, outcome),
     });
     // `pasteFollowUp` returns `false` only when no live session exists (falls
     // through to the idle/respawn path below); otherwise `{ delivered: true;
@@ -3345,7 +3460,7 @@ async function sendTurnInExistingSession(task: Task, taskId: string, line: strin
     onChunk("user", normalizeUserText(line));
 
     const agent = await sendTurn(taskId, line, onChunk, {
-      onPasteFailure: (outcome) => handlePasteWithheld(taskId, newRunId, line, outcome),
+      onPasteFailure: (outcome) => handlePasteWithheld(taskId, newRunId, rawLine ?? line, outcome),
     });
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
@@ -3421,7 +3536,14 @@ async function sendTurnInExistingSession(task: Task, taskId: string, line: strin
  *
  * `text` is already the fully-composed message (references, if any, are
  * flattened into it client-side before it ever reaches `sendInput` — see
- * the `/runs/:id/input` route), so there's nothing further to pass through.
+ * the `/runs/:id/input` route), so there's nothing further to pass through —
+ * except that both call sites in `sendTurnInExistingSession` deliberately
+ * pass the PRE-expansion (`rawLine ?? line`) text, not the `@token`-expanded
+ * one `sendInput` actually hands to claude (R2, code review): a draft/tray
+ * backlog item is saved with the raw `@token` form, and this function's own
+ * dedupe (`restashPasteWithheldText`'s `item.text === text` scan) would never
+ * match an expanded absolute-path re-stash against it, producing a duplicate
+ * entry every time the same withheld message is retried.
  */
 function handlePasteWithheld(
   taskId: string,

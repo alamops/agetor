@@ -82,6 +82,7 @@ test("compose pins the target task even when the board re-sorts under the cursor
       sends.push({ runId, line });
       return { delivered: true };
     },
+    listProjectFiles: async () => ({ files: [], truncated: false }),
   } as unknown as AgetorClient;
 
   const { stdin, unmount } = render(
@@ -178,6 +179,324 @@ test("event stream: an fx_permission interaction renders generically, sentinel s
   expect(frame).not.toContain(PERMISSION_MODE_STATUS_PREFIX);
   // A plain status line still renders.
   expect(frame).toContain("plain status text");
+  unmount();
+});
+
+// ── @ file autocomplete wiring (compose mode → Composer's fileEntries) ──────
+
+test("opening the composer fetches the task's project-file listing and feeds the @ popover", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    listProjectFiles: async () => ({ files: ["README.md", "src/bun/db.ts"], truncated: false }),
+    sendInput: async () => ({ delivered: true }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the listProjectFiles fetch
+  await wait(80);
+  stdin.write("@RE");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("README.md");
+  expect(frame).toContain("tab/enter accept");
+  unmount();
+});
+
+test("a send whose reply carries unresolvedRefs surfaces a one-line warning after the ok status", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    listProjectFiles: async () => ({ files: [], truncated: false }),
+    sendInput: async () => ({ delivered: true, unresolvedRefs: ["@nope.txt", "@also-missing"] }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("hello");
+  await wait(40);
+  stdin.write(ENTER);
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("→ sent");
+  expect(frame).toContain("2 @ refs won't resolve");
+  expect(frame).toContain("@nope.txt");
+  unmount();
+});
+
+test("an unresolved ref matching a discovered extension is exempted — no ⚠ at all", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A", agent: "claude-code", workdir: "/repo", branch: null });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    listProjectFiles: async () => ({ files: [], truncated: false }),
+    agentDiscovery: async () => ({ commands: [], extensions: [{ name: "github", insert: "@github" }] }),
+    sendInput: async () => ({ delivered: true, unresolvedRefs: ["@github"] }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("hello");
+  await wait(40);
+  stdin.write(ENTER);
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("→ sent");
+  expect(frame).not.toContain("⚠");
+  unmount();
+});
+
+test("a discovered-extension mention is filtered out but a real typo alongside it still warns", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A", agent: "claude-code", workdir: "/repo", branch: null });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    listProjectFiles: async () => ({ files: [], truncated: false }),
+    agentDiscovery: async () => ({ commands: [], extensions: [{ name: "github", insert: "@github" }] }),
+    sendInput: async () => ({ delivered: true, unresolvedRefs: ["@github", "@nope.txt"] }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("hello");
+  await wait(40);
+  stdin.write(ENTER);
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("→ sent");
+  expect(frame).toContain("1 @ ref won't resolve");
+  expect(frame).toContain("@nope.txt");
+  expect(frame).not.toContain("@github");
+  unmount();
+});
+
+// ── @ file autocomplete: scope-keyed listing cache (worktree materializing mid-compose) ──
+
+test("the file-listing cache is keyed by scope, not task id — a scope change mid-compose refetches", async () => {
+  let calls = 0;
+  const seenScopes: Array<{ dir: string; ref?: string | null }> = [];
+  // Same task id throughout; only its resolved scope changes (pre-run
+  // {workdir, baseRef} → post-worktree {worktreePath}), mimicking a worktree
+  // materializing while the composer stays open.
+  let materialized = false;
+  const taskA = () =>
+    task({
+      id: "taskA", column: "ready", runId: null, title: "A",
+      workdir: "/repo", isolation: "worktree", baseRef: "main", branchSource: "created", branch: null,
+      worktreePath: materialized ? "/repo-worktree" : null,
+    });
+  const client = {
+    listTasks: async () => [taskA()],
+    listProjectFiles: async (scope: { dir: string; ref?: string | null }) => {
+      calls++;
+      seenScopes.push(scope);
+      return { files: [], truncated: false };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // compose opens — fetches the pre-run scope {dir: workdir, ref: baseRef}
+  await wait(80);
+  expect(calls).toBe(1);
+  expect(seenScopes[0]).toEqual({ dir: "/repo", ref: "main" });
+
+  materialized = true; // next poll's listTasks() reports the worktree path
+  await wait(1700); // let the 1.5s poll pick up the new task snapshot
+  expect(calls).toBe(2); // scope changed → refetched, not served from the stale cache
+  expect(seenScopes[1]).toEqual({ dir: "/repo-worktree" });
+  unmount();
+});
+
+test("a cached listing is invalidated when the task's column changes (run settles) — same scope refetches", async () => {
+  let calls = 0;
+  // Scope stays constant (worktree already materialized); only the column
+  // flips, mimicking the agent's run settling while the composer stays open.
+  let column: "running" | "review" = "running";
+  const taskA = () =>
+    task({
+      id: "taskA", column: column, runId: column === "running" ? "runA" : null, title: "A",
+      workdir: "/repo", isolation: "worktree", baseRef: "main", branchSource: "created", branch: null,
+      worktreePath: "/repo-worktree",
+    });
+  const client = {
+    listTasks: async () => [taskA()],
+    listProjectFiles: async () => {
+      calls++;
+      return { files: [], truncated: false };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // compose opens — fetches under column "running"
+  await wait(80);
+  expect(calls).toBe(1);
+
+  column = "review"; // the run settles; the agent may have written files
+  await wait(1700); // let the 1.5s poll deliver the column transition
+  expect(calls).toBe(2); // same scope key, stale column → refetched
+  unmount();
+});
+
+// ── @ remote search fallback (truncated listing → server-side search, CLAUDE.md §12) ──
+
+test("a truncated listing wires the composer's remoteSearch, which is invoked with a q param after typing", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const seenQueries: Array<{ dir: string; q?: string | null; limit?: number }> = [];
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null; limit?: number }) => {
+      if (scope.q !== undefined) {
+        seenQueries.push(scope);
+        return { files: ["deep/remote-match.ts"], truncated: true };
+      }
+      // Initial (untruncated-signature) fetch on compose-open: report the
+      // listing itself as truncated so the composer switches to remote search.
+      return { files: ["README.md"], truncated: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the truncated listProjectFiles fetch
+  await wait(80);
+  // Two chars — `remoteSearch` never fires below `MIN_REMOTE_QUERY_LEN`
+  // (Composer.tsx), so this must clear that floor to exercise the wiring.
+  stdin.write("@xy");
+  await wait(300); // let the composer's 200ms remoteSearch debounce fire
+  const frame = lastFrame() ?? "";
+  expect(seenQueries.length).toBeGreaterThan(0);
+  expect(seenQueries[0]!.q).toBe("xy");
+  expect(seenQueries[0]!.limit).toBe(5);
+  expect(frame).toContain("deep/remote-match.ts");
+  unmount();
+});
+
+test("a remote search failure keeps the local rows instead of blanking the popover", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null }) => {
+      if (scope.q !== undefined) throw new Error("network down");
+      // Initial (untruncated-signature) fetch on compose-open: report the
+      // listing itself as truncated so the composer switches to remote
+      // search, with a local match for "xy" so we can tell it survived.
+      return { files: ["deep/xylophone.ts"], truncated: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the truncated listProjectFiles fetch
+  await wait(80);
+  stdin.write("@xy");
+  await wait(300); // let the composer's 200ms remoteSearch debounce fire and reject
+  const frame = lastFrame() ?? "";
+  // A `null` answer (composeRemoteSearch's catch) must not blank the
+  // popover — the local suggestAtEntries row still renders.
+  expect(frame).toContain("deep/xylophone.ts");
+  unmount();
+});
+
+test("an untruncated listing never wires remoteSearch — no q-carrying call is ever made", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const seenQueries: Array<{ q?: string | null }> = [];
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null }) => {
+      if (scope.q !== undefined) seenQueries.push(scope);
+      return { files: ["README.md"], truncated: false };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("@RE");
+  await wait(300);
+  const frame = lastFrame() ?? "";
+  expect(seenQueries.length).toBe(0);
+  expect(frame).toContain("README.md");
+  unmount();
+});
+
+// ── 's' start path: unresolvedRefs surfaces a ⚠ in the started status ───────
+
+test("the 's' start path surfaces ⚠ in the started status when startTask returns unresolvedRefs", async () => {
+  const taskA = task({ id: "taskA", column: "ready", runId: null, title: "A", hasOpenableRun: false });
+  const client = {
+    listTasks: async () => [taskA],
+    // No `agentDiscovery` stub here on purpose — this task was never composed
+    // to, so the discovery cache isn't warmed; `getExtensionNames` must fetch
+    // (and fail open, since the stub client has no such method) rather than
+    // block the "started" status.
+    startTask: async () => ({ runId: "runA", unresolvedRefs: ["@nope.txt"] }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("s");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("▸ started");
+  expect(frame).toContain("1 @ ref won't resolve");
+  expect(frame).toContain("@nope.txt");
+  unmount();
+});
+
+test("the 's' start path shows a plain started status when there are no unresolvedRefs", async () => {
+  const taskA = task({ id: "taskA", column: "ready", runId: null, title: "A", hasOpenableRun: false });
+  const client = {
+    listTasks: async () => [taskA],
+    startTask: async () => ({ runId: "runA" }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("s");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("▸ started");
+  expect(frame).not.toContain("⚠");
   unmount();
 });
 

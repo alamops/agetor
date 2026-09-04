@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { Dispatch, ReactNode, RefObject, SetStateAction } from "react";
 import { api, type AvailableCommand, type AvailableExtension } from "@/lib/api";
 import { Textarea } from "@/components/ui/textarea";
@@ -13,7 +13,15 @@ import {
 } from "./ReferencesPicker";
 import { SlashAutocomplete } from "./SlashAutocomplete";
 import { ExtensionPicker } from "./ExtensionPicker";
+import { AtFileAutocomplete } from "./AtFileAutocomplete";
+import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
+import { useProjectFiles, searchProjectFiles, type FileScope } from "@/lib/use-project-files";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
+import { unresolvedAtTokens, isSafeClientRelPath, isListedPath } from "@/lib/at-highlight";
+
+/** Stable empty set so clearing the on-disk override doesn't churn state
+ *  identity (and thus the warning memo) on every effect pass. */
+const EMPTY_PATH_SET: ReadonlySet<string> = new Set();
 
 /**
  * Shared prompt-composer block: the label row + Extensions picker, the
@@ -57,6 +65,22 @@ import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-inser
  * land inside a `/token`, pop the slash menu, and swallow the next Enter via
  * `preventDefault`. See `ExtensionPicker.tsx`'s `insertText` for the
  * canonical example of getting this right.
+ *
+ * **The `@` file-reference layer**: `fileScope` (a `{ dir, ref? }` pair — see
+ * `useProjectFiles`/`FileScope`) tells this composer which project tree the
+ * `@` popover (`AtFileAutocomplete`) lists and the in-field highlight
+ * (`AtHighlightBackdrop`) validates against; `null`/omitted disables both
+ * with no fetch. `AtHighlightBackdrop` must render as the FIRST child of the
+ * textarea's `relative` wrapper — it paints highlight marks *behind* the
+ * textarea's own text via DOM order, not z-index, so the textarea itself
+ * needs `relative` (not just its wrapper) for that stacking to hold; a
+ * static (non-positioned) textarea would let the absolutely-positioned
+ * backdrop painted-later win instead. `AtFileAutocomplete` sits after
+ * `SlashAutocomplete` in the same wrapper and shares its `placement`. The two
+ * popovers coexist without fighting over the same keystroke because `/` only
+ * triggers at BOF or after whitespace/a `@`-token boundary the same way `@`
+ * does — `findActiveAtQuery`'s grammar excludes `/` from ever appearing
+ * inside an open `@` slice, so an `@src/` query never pops the slash menu.
  */
 
 /**
@@ -243,6 +267,23 @@ export interface PromptComposerProps {
   references: TaskReference[];
   onReferencesChange: (refs: TaskReference[]) => void;
   /**
+   * Which project tree the `@` popover (`AtFileAutocomplete`) lists and the
+   * in-field highlight (`AtHighlightBackdrop`) validates against. `{ dir }`
+   * for a live tree — an existing worktree, or an isolation=none task's
+   * workdir. `{ dir, ref }` for a not-yet-created worktree, listing tracked
+   * files at the pinned base ref (the shape the worktree will actually have
+   * once `startTask` materializes it). `null`/omitted disables the `@`
+   * popover and highlighting entirely — no fetch is made.
+   */
+  fileScope?: FileScope | null;
+  /** Opaque token whose CHANGE triggers a listing `refresh()` — RunPanel
+   *  passes `task.column`, so a run settling (running → review/ready/blocked)
+   *  re-lists the tree the agent may have just written files into. The
+   *  focus-refetch misses exactly that case: the cursor is often already in
+   *  the composer when the run ends, so no blur/focus ever fires. Consumers
+   *  without run state simply omit it (undefined never fires). */
+  fileScopeRefreshToken?: unknown;
+  /**
    * Functional-updater-capable references setter for `usePromptCapture`'s
    * internal instance (see the `capture` prop doc). When the caller already
    * tracks `references` via `useState` it can pass that setter directly and
@@ -386,12 +427,14 @@ export function PromptComposer({
   references,
   onReferencesChange,
   setReferences,
+  fileScope,
+  fileScopeRefreshToken,
   textareaRef,
   capture,
   capabilities,
   savedPrompts: savedPromptsProp,
   rows = 6,
-  placeholder = "What should the agent do? Type / for commands.",
+  placeholder = "What should the agent do? Type / for commands, @ for files.",
   label = "Prompt",
   referencesLabel = "Files / Folders",
   startingFolder,
@@ -426,6 +469,24 @@ export function PromptComposer({
   const { commands, extensions } = capabilities ?? internalCapabilities;
   const internalSavedPrompts = useSavedPrompts({ enabled: !savedPromptsProp });
   const { savedPrompts, reload } = savedPromptsProp ?? internalSavedPrompts;
+
+  // `null`/undefined `fileScope` (no project/scope resolved yet) short-
+  // circuits to no fetch and empty results — see `useProjectFiles`.
+  // `projectFiles.error` (a failed listing's message) is intentionally
+  // unused here — no error UI in this pass; it's available for a future
+  // inline hint if that's ever wanted.
+  const projectFiles = useProjectFiles(fileScope ?? null);
+
+  // Fire `refresh()` when the caller's run-settle token changes — never on
+  // mount (the hook's own scope-change fetch covers that). Guarded by a ref
+  // compare, not the effect merely running: `projectFiles` is a fresh object
+  // every render, so the deps alone can't debounce this.
+  const prevRefreshTokenRef = useRef(fileScopeRefreshToken);
+  useEffect(() => {
+    if (Object.is(prevRefreshTokenRef.current, fileScopeRefreshToken)) return;
+    prevRefreshTokenRef.current = fileScopeRefreshToken;
+    projectFiles.refresh();
+  }, [fileScopeRefreshToken, projectFiles]);
 
   // Bridges for `usePromptCapture`'s internal instance below — it needs
   // `Dispatch`-shaped setters, but this component's public props are plain
@@ -478,10 +539,238 @@ export function PromptComposer({
     />
   );
 
-  // `relative` anchors SlashAutocomplete's popover to the textarea it
-  // decorates — keep the two together if this block ever moves.
+  // `relative` anchors SlashAutocomplete's/AtFileAutocomplete's popovers to
+  // the textarea they decorate — keep the two together if this block ever
+  // moves. `AtHighlightBackdrop` must be the FIRST child here (DOM order,
+  // not z-index, is what puts its marks behind the textarea's real text —
+  // see the file header) and the `Textarea` itself needs `relative` too, so
+  // it — a later, *positioned* sibling — wins the paint order over the
+  // earlier, absolutely-positioned backdrop.
+  // Both the backdrop and the popover are gated on `fileScope` being
+  // non-null — a composer with no scope (no `@` project tree resolved yet)
+  // must cost nothing per keystroke: no `getComputedStyle` reads, no
+  // highlight re-segmenting, no popover-query recompute. `useProjectFiles`
+  // itself stays an unconditional hook call above (hooks can't be
+  // conditional) but already short-circuits to empty results with no fetch
+  // when `fileScope` is nullish, so gating only the JSX here is sufficient —
+  // `projectFiles.entries`/`.validPaths` are just `[]`/`new Set()` in that
+  // case and these two components would render as no-ops anyway, but never
+  // mounting them at all is what actually removes their per-keystroke work
+  // (see AtHighlightBackdrop's/AtFileAutocomplete's own layout-effect and
+  // memo costs).
+  const hasFileScope = !!(fileScope && fileScope.dir);
+
+  // --- Unresolved `@` reference warning -----------------------------------
+  // Send-time expansion (orchestrator `startTask`/`sendInput`) silently
+  // leaves unresolvable tokens verbatim — the agent just receives literal
+  // `@`-text. The unhighlighted state is the only passive signal, so this
+  // warns actively while the draft holds a token that won't become a path.
+  // Verdict layering, cheapest first:
+  //   1. listing membership — same oracle as the highlight backdrop;
+  //   2. known `@name` extension mentions (the ExtensionPicker's own insert
+  //      syntax, e.g. `@github`) are never file references → never warned;
+  //   3. LIVE scopes only (no `ref`): a debounced `/refs/resolve` stat
+  //      rescues paths that exist on disk but aren't listed (gitignored
+  //      `@.env`) — send-time expansion WILL resolve those, so warning
+  //      would lie. Ref scopes skip the stat: a fresh worktree at the
+  //      pinned ref contains exactly the listing, so listing = truth.
+  //   4. TRUNCATED scopes (the base listing hit the 20k `MAX_PROJECT_FILES`
+  //      cap, e.g. a monorepo): the capped listing can't prove a token
+  //      unresolved on its own, so a token missing from it is neither warned
+  //      NOR cleared until a debounced server-side full-depth search
+  //      (`searchProjectFiles`, `GET /files/index?q=`) checks that ONE token
+  //      by name — found → treated as listed (folded into `verifiedListed`,
+  //      and the exact matched entry path is unioned into the highlight
+  //      backdrop's `validPaths` via `verifiedEntryPaths` so it highlights
+  //      too, same as step 1); confirmed absent from the full listing →
+  //      recorded in `checkedMissing`, the only tokens allowed to warn while
+  //      truncated. An unproven token (not checked yet, or the check is
+  //      still in flight) never warns — that per-token guarantee is what
+  //      replaces the old blanket "suppress the whole warning while
+  //      truncated" behavior; non-truncated scopes never populate
+  //      `checkedMissing`, so this step is a no-op for them.
+  // Suppressed while the listing is loading/failed/empty — a partial or
+  // absent set can't prove any token unresolved.
+  const extensionNames = useMemo(
+    () => new Set(extensions.map((e) => (e.insert.startsWith("@") ? e.insert.slice(1) : e.name))),
+    [extensions],
+  );
+  const unlistedTokens = useMemo(() => {
+    if (!hasFileScope || projectFiles.loading || projectFiles.error) return [];
+    if (projectFiles.entries.length === 0) return [];
+    return unresolvedAtTokens(value, projectFiles.validPaths).filter((t) => !extensionNames.has(t.path));
+  }, [hasFileScope, projectFiles.loading, projectFiles.error, projectFiles.entries.length, projectFiles.validPaths, value, extensionNames]);
+  // Paths the live-scope stat check confirmed on disk, keyed by token path
+  // with any trailing "/" stripped.
+  const [existsOnDisk, setExistsOnDisk] = useState<ReadonlySet<string>>(EMPTY_PATH_SET);
+  // Stands in for `unlistedTokens` in the effect deps: the memo re-derives a
+  // fresh array per keystroke, but an unchanged token set must not re-arm
+  // the debounce timer.
+  const unlistedKey = unlistedTokens.map((t) => t.path).join("\u0000");
+  useEffect(() => {
+    const dir = fileScope?.dir?.trim();
+    const live = !!dir && !(fileScope?.ref ?? "").trim();
+    const candidates = live
+      ? [...new Set(unlistedTokens.map((t) => t.path.replace(/\/+$/, "")).filter(isSafeClientRelPath))]
+      : [];
+    if (candidates.length === 0) {
+      setExistsOnDisk((prev) => (prev.size ? EMPTY_PATH_SET : prev));
+      return;
+    }
+    let cancelled = false;
+    // Debounced, and only ever in flight while the draft actually holds
+    // unlisted tokens (rare) — this is not a per-keystroke request.
+    const timer = setTimeout(async () => {
+      try {
+        const refs = await api.resolveRefs(candidates.map((p) => `${dir}/${p}`));
+        if (cancelled) return;
+        const found = new Set<string>();
+        for (const r of refs) {
+          if (r.path.startsWith(`${dir}/`)) found.add(r.path.slice(dir!.length + 1).replace(/\/+$/, ""));
+        }
+        setExistsOnDisk(found);
+      } catch {
+        // Stat unavailable — keep the listing verdict. Worst case is an
+        // over-warn on a gitignored path until the next successful check;
+        // it never under-warns.
+      }
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKey stands in for unlistedTokens (see above)
+  }, [unlistedKey, fileScope?.dir, fileScope?.ref]);
+
+  // --- Truncated-scope verification: per-token server-side search ---------
+  // Only relevant once `projectFiles.truncated` is true — a capped listing
+  // can't tell "not present" from "present but past the cap" apart, so
+  // every unlisted token gets an individual server-side lookup before it's
+  // allowed to either warn or stay unhighlighted. `verifiedListed`/
+  // `checkedMissing` are keyed like `existsOnDisk` (token path, trailing "/"
+  // stripped); `verifiedEntryPaths` separately keeps the exact matched
+  // listing entry (slash intact for a directory) for the highlight
+  // backdrop's `validPaths` union below.
+  //
+  // Deliberately runs on a LIVE truncated scope even for a token
+  // `existsOnDisk` (the `/refs/resolve` stat above) already cleared: that
+  // stat only feeds the WARNING oracle — it has no `validPaths`-shaped output
+  // and never touches `verifiedEntryPaths`/`highlightValidPaths` below. So a
+  // gitignored-but-present, past-the-cap file would stop being warned on
+  // (thanks to `existsOnDisk`) yet still render unhighlighted forever if this
+  // q-mode check were skipped whenever the on-disk stat already resolved it.
+  // Both oracles are independently load-bearing on a live truncated scope —
+  // this is not redundant double-checking.
+  const [verifiedListed, setVerifiedListed] = useState<ReadonlySet<string>>(EMPTY_PATH_SET);
+  const [verifiedEntryPaths, setVerifiedEntryPaths] = useState<ReadonlySet<string>>(EMPTY_PATH_SET);
+  const [checkedMissing, setCheckedMissing] = useState<ReadonlySet<string>>(EMPTY_PATH_SET);
+  // Stands in for `unlistedTokens` in the effect deps below, same reasoning
+  // as `unlistedKey` above — includes each token's `isDirectory` flag since
+  // that affects the `isListedPath` verdict for an otherwise-identical path.
+  const unlistedKeyForVerify = unlistedTokens.map((t) => `${t.path} ${t.isDirectory ? "1" : "0"}`).join("  ");
+  useEffect(() => {
+    const clear = () => {
+      setVerifiedListed((prev) => (prev.size ? EMPTY_PATH_SET : prev));
+      setVerifiedEntryPaths((prev) => (prev.size ? EMPTY_PATH_SET : prev));
+      setCheckedMissing((prev) => (prev.size ? EMPTY_PATH_SET : prev));
+    };
+    if (!projectFiles.truncated || !hasFileScope || unlistedTokens.length === 0) {
+      clear();
+      return;
+    }
+    const scope = fileScope!;
+    // De-dupe by stripped path (a bare-typed and a slash-typed token for the
+    // same path shouldn't cost two round-trips) and cap at 8 so a draft with
+    // a pile of unresolved tokens can't fan out unboundedly. Deliberate
+    // consequence: the 9th-and-later distinct unlisted token in a draft is
+    // never added to `byKey`, so it never gets a `searchProjectFiles` call at
+    // all — it stays permanently UNPROVEN for this render, exactly like a
+    // token whose lookup came back `null` (see below). It's never added to
+    // `checkedMissing` (never warned) and never to `verifiedEntryPaths`
+    // (never highlighted past the cap). A draft with more than 8 broken `@`
+    // refs is out of scope for this feature; the tokens within the cap still
+    // behave correctly.
+    const byKey = new Map<string, { path: string; isDirectory: boolean }>();
+    for (const t of unlistedTokens) {
+      const key = t.path.replace(/\/+$/, "");
+      if (!isSafeClientRelPath(key) || byKey.has(key)) continue;
+      byKey.set(key, { path: t.path, isDirectory: t.isDirectory });
+      if (byKey.size >= 8) break;
+    }
+    if (byKey.size === 0) {
+      clear();
+      return;
+    }
+    let cancelled = false;
+    // Debounced, and only ever in flight while the draft holds truncated-mode
+    // unlisted tokens — not a per-keystroke request.
+    const timer = setTimeout(async () => {
+      const listed = new Set<string>();
+      const entryPaths = new Set<string>();
+      const missing = new Set<string>();
+      await Promise.all([...byKey.entries()].map(async ([key, token]) => {
+        const results = await searchProjectFiles(scope, key, 20);
+        if (cancelled) return;
+        // `null` means the REQUEST failed (network/server error) — NOT that
+        // the server looked and found nothing (see `searchProjectFiles`'s
+        // doc). Skip this candidate entirely: it lands in neither `listed`
+        // nor `missing`, so it stays UNPROVEN — same fate as a token past the
+        // cap-8 cutoff above — rather than being misread as "confirmed
+        // missing" and warned on.
+        if (results === null) return;
+        const rowPaths = new Set(results.map((r) => r.path));
+        if (isListedPath(rowPaths, token.path, token.isDirectory)) {
+          listed.add(key);
+          // The exact entry that matched: the token's own path when it hit
+          // directly, else (only possible when the token wasn't typed as a
+          // directory) the listing's slash-suffixed form of it.
+          entryPaths.add(rowPaths.has(token.path) ? token.path : `${key}/`);
+        } else {
+          missing.add(key);
+        }
+      }));
+      if (cancelled) return;
+      setVerifiedListed(listed);
+      setVerifiedEntryPaths(entryPaths);
+      setCheckedMissing(missing);
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKeyForVerify stands in for unlistedTokens; fileScope read via closure, keyed by dir/ref below
+  }, [projectFiles.truncated, hasFileScope, unlistedKeyForVerify, fileScope?.dir, fileScope?.ref]);
+
+  const unresolvedWarning = useMemo(() => {
+    const seen = new Set<string>();
+    const unresolved = unlistedTokens.filter((t) => {
+      const key = t.path.replace(/\/+$/, "");
+      if (existsOnDisk.has(key) || verifiedListed.has(key)) return false;
+      // Truncated mode: an unproven token (not yet checked, or still in
+      // flight) must never warn — only one the remote search confirmed
+      // absent from the full listing may. Non-truncated mode leaves
+      // `checkedMissing` empty, so this condition is a no-op there and
+      // behavior stays byte-identical to before this feature.
+      if (projectFiles.truncated && !checkedMissing.has(key)) return false;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    if (unresolved.length === 0) return null;
+    const shown = unresolved.slice(0, 3).map((t) => t.raw).join(", ");
+    const extra = unresolved.length > 3 ? ` and ${unresolved.length - 3} more` : "";
+    return unresolved.length === 1
+      ? `${shown} doesn't match a project file — it will be sent as plain text, not expanded to a path`
+      : `${unresolved.length} @ references don't match a project file (${shown}${extra}) — they'll be sent as plain text, not expanded to paths`;
+  }, [unlistedTokens, existsOnDisk, verifiedListed, checkedMissing, projectFiles.truncated]);
+
+  // Union in server-verified past-the-cap entries so a truncated scope's
+  // highlight backdrop isn't limited to the (possibly incomplete) base
+  // listing — see the truncated-scope verification block above.
+  const highlightValidPaths = useMemo(
+    () => (verifiedEntryPaths.size
+      ? new Set([...projectFiles.validPaths, ...verifiedEntryPaths])
+      : projectFiles.validPaths),
+    [projectFiles.validPaths, verifiedEntryPaths],
+  );
+
   const textareaBlock = (
     <div className={cn("relative", trailing && "flex-1")}>
+      {hasFileScope && <AtHighlightBackdrop textareaRef={ref} value={value} validPaths={highlightValidPaths} />}
       <Textarea
         ref={ref}
         data-testid={textareaTestId}
@@ -489,14 +778,17 @@ export function PromptComposer({
         value={value}
         onChange={(e) => { onChange(e.target.value); if (activeCapture.dropHint) activeCapture.clearDropHint(); }}
         onPaste={activeCapture.onPaste}
-        // Refetch saved prompts on focus (in addition to the popover-open
-        // refetch) so a deleted/edited prompt made in Settings mid-session
-        // doesn't linger in the `/` autocomplete indefinitely. The caller's
-        // own `onFocus` (if any) fires after.
-        onFocus={() => { reload(); onFocus?.(); }}
+        // Refetch saved prompts (in addition to the popover-open refetch) and
+        // the project file listing on focus — a deleted/edited prompt made in
+        // Settings, or a file created by the agent/user since the last open,
+        // shouldn't linger stale in the `/`/`@` autocompletes indefinitely.
+        // `useProjectFiles.refresh()` dedupes in-flight requests, so this is
+        // cheap even when nothing changed. The caller's own `onFocus` (if
+        // any) fires after both.
+        onFocus={() => { reload(); projectFiles.refresh(); onFocus?.(); }}
         onKeyDown={onKeyDown}
         rows={rows}
-        className={cn("resize-none", textareaClassName)}
+        className={cn("relative resize-none", textareaClassName)}
         disabled={disabled}
       />
       <SlashAutocomplete
@@ -507,6 +799,18 @@ export function PromptComposer({
         textareaRef={ref}
         placement={placement}
       />
+      {hasFileScope && (
+        <AtFileAutocomplete
+          entries={projectFiles.entries}
+          truncated={projectFiles.truncated}
+          error={projectFiles.error}
+          value={value}
+          onChange={onChange}
+          textareaRef={ref}
+          placement={placement}
+          fileScope={fileScope}
+        />
+      )}
       {inputAdornment}
     </div>
   );
@@ -544,6 +848,11 @@ export function PromptComposer({
         )}
         {textareaRow}
         {hintText && <p className={hintClass}>{hintText}</p>}
+        {unresolvedWarning && (
+          <p data-testid="at-unresolved-warning" className={cn("text-[10px] text-warning", hintClassName)}>
+            {unresolvedWarning}
+          </p>
+        )}
         {footer}
       </div>
 

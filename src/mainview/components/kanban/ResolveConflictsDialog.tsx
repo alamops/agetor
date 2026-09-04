@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, GitMerge, Loader2, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -44,6 +44,16 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
 
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+
+  // `@` file-reference scope: the worktree is locked to the PR's head branch
+  // (`context.headRef`) — `listProjectFiles` falls back to
+  // `origin/<headRef>` when it only exists as a remote-tracking ref. Gated
+  // on `open` so a closed dialog never fetches; memoized so
+  // `useProjectFiles`'s effect doesn't refire on every unrelated re-render.
+  const fileScope = useMemo(
+    () => (open && context ? { dir: context.path, ref: context.headRef } : null),
+    [open, context?.path, context?.headRef],
+  );
 
   // Reset per-open transient state (prompt dirtiness, errors, references) so
   // a previous PR's edits don't leak into the next one. Harness/model/prefs
@@ -176,6 +186,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
                 references={references}
                 onReferencesChange={setReferences}
                 setReferences={setReferences}
+                fileScope={fileScope}
                 startingFolder={context.path}
                 rows={8}
                 footer={overage && (

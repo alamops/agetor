@@ -133,7 +133,11 @@ export class AgetorClient {
   deleteTask(id: string): Promise<void> {
     return this.req("DELETE", `/tasks/${id}`);
   }
-  startTask(id: string): Promise<{ runId: string }> {
+  /** `unresolvedRefs` (omitted when empty) lists the raw `@`-tokens (verbatim,
+   *  `@` included) in the task's prompt that didn't resolve to a real file
+   *  under the freshly-materialized worktree/workdir — CLAUDE.md §12's
+   *  send-time expansion contract. Advisory only; the run still starts. */
+  startTask(id: string): Promise<{ runId: string; unresolvedRefs?: string[] }> {
     return this.req("POST", `/tasks/${id}/start`, undefined, START_TIMEOUT_MS);
   }
   archiveTask(id: string): Promise<Task> {
@@ -153,10 +157,13 @@ export class AgetorClient {
   }
 
   // ── runs ─────────────────────────────────────────────────────────────────
+  /** `unresolvedRefs` (omitted when empty) mirrors `startTask`'s field — the
+   *  raw `@`-tokens in `line` that didn't resolve against the task's live
+   *  cwd. Advisory only; delivery isn't blocked on it. */
   sendInput(
     runId: string,
     line: string,
-  ): Promise<{ delivered: boolean; runId?: string; reason?: string }> {
+  ): Promise<{ delivered: boolean; runId?: string; reason?: string; unresolvedRefs?: string[] }> {
     return this.req("POST", `/runs/${runId}/input`, { line });
   }
   cancelRun(runId: string): Promise<{ ok?: boolean; cancelled?: boolean }> {
@@ -201,6 +208,31 @@ export class AgetorClient {
   }
   listBranches(path: string): Promise<BranchInfo[]> {
     return this.req("GET", `/projects/branches?path=${encodeURIComponent(path)}`);
+  }
+  /** List a scope's files for the `@`-mention picker (`GET /files/index`) —
+   *  the same route the webview's `useProjectFiles` calls. Two modes,
+   *  mirroring `src/bun/project-files.ts` / CLAUDE.md §12: pass `ref` to list
+   *  the tracked files at that ref (previewing a worktree that hasn't been
+   *  materialized yet — e.g. an isolated task before its first run); omit it
+   *  to list the live working tree at `dir` (tracked + untracked-not-
+   *  ignored). Capped at `MAX_PROJECT_FILES` server-side; `truncated` reports
+   *  when that cap was hit. */
+  listProjectFiles(scope: {
+    dir: string;
+    ref?: string | null;
+    /** Full-depth server-side search (monorepo fallback past the 20k cap):
+     *  when set — the empty string counts — the server ranks files + derived
+     *  directories over the ENTIRE listing with the shared scorer and returns
+     *  up to `limit` (default 50) matches; `truncated` then reports the
+     *  internal scan cap, not the display cap. */
+    q?: string | null;
+    limit?: number;
+  }): Promise<{ files: string[]; truncated: boolean }> {
+    const params = new URLSearchParams({ dir: scope.dir });
+    if (scope.ref) params.set("ref", scope.ref);
+    if (scope.q != null) params.set("q", scope.q);
+    if (scope.limit != null) params.set("limit", String(scope.limit));
+    return this.req("GET", `/files/index?${params.toString()}`);
   }
 
   // ── github issues ────────────────────────────────────────────────────────

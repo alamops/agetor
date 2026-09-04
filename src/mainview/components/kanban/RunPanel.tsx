@@ -17,6 +17,10 @@ import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
+import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { AtFileAutocomplete } from "./AtFileAutocomplete";
+import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
+import { shortenTaskPaths } from "@/lib/shorten-task-paths";
 import { reconcileById } from "@/lib/reconcile";
 import { RUN_PANEL_DEFAULT_WIDTH, RUN_PANEL_MIN_WIDTH, clampPanelWidth, readPanelWidth, writePanelWidth } from "@/lib/panel-width";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
@@ -2630,6 +2634,32 @@ function RunPanelBody({
   // `sendRef`.
   const capabilities = useAgentCapabilities(task.agent, task.workdir, task.branch ?? undefined);
   const savedPromptsState = useSavedPrompts();
+  // Stable identity for RunEventList/UserMessageBlock's display-only path
+  // shortening (see the `pathRoots` prop doc) — both are memoized, so a
+  // fresh array each render would defeat them.
+  const pathRoots = useMemo(
+    () => [task.worktreePath, task.workdir],
+    [task.worktreePath, task.workdir],
+  );
+  // Which tree the `@` file popover lists/validates against — must match what
+  // the server will expand against at send time (`task.worktreePath ?? task.workdir`,
+  // see orchestrator `sendInput`): the live worktree once it exists; before the
+  // first run of an isolated task, the source repo at whatever ref
+  // `prepareWorkdir` (worktree.ts) will actually check the worktree out on —
+  // `task.branch` when this task is pinned to a pre-existing branch
+  // (`branchSource === "existing"`, e.g. a PR's head branch), else the
+  // pinned `baseRef` a freshly-created branch will be cut from; a plain
+  // workdir otherwise.
+  const fileScope = useMemo<FileScope>(() => (
+    task.worktreePath
+      ? { dir: task.worktreePath }
+      : task.isolation === "worktree"
+        ? {
+            dir: task.workdir,
+            ref: task.branchSource === "existing" && task.branch ? task.branch : (task.baseRef ?? "HEAD"),
+          }
+        : { dir: task.workdir }
+  ), [task.worktreePath, task.isolation, task.workdir, task.baseRef, task.branchSource, task.branch]);
   const onSendDragOver = (e: React.DragEvent) => {
     if (!e.dataTransfer.types.includes("Files")) return;
     // Always preventDefault on a file dragover so WKWebView doesn't fall back
@@ -3029,6 +3059,7 @@ function RunPanelBody({
                 indicatorMode={indicatorMode}
                 holdSummary={holdSummary}
                 taskId={task.id}
+                pathRoots={pathRoots}
                 plans={kind === "cursor" || kind === "claude-code" ? plans : NO_PLANS}
                 onOpenPlan={onOpenPlan}
                 agentKind={kind}
@@ -3057,6 +3088,7 @@ function RunPanelBody({
           view-only (`readOnly`), so saved drafts aren't silently invisible. */}
       {activeStream === "main" && backlogItems.length > 0 && (
         <BacklogTray
+          fileScope={fileScope}
           items={backlogItems}
           canSend={canSend && !modalPending}
           busy={sending || backlogBusy}
@@ -3123,6 +3155,11 @@ function RunPanelBody({
             setReferences={setSendRefs}
             textareaRef={sendRef}
             capture={capture}
+            fileScope={fileScope}
+            // A column transition = a run settled (or started): the agent may
+            // have just written files while focus never left the composer —
+            // retrigger the listing fetch (see the prop's doc).
+            fileScopeRefreshToken={task.column}
             // Pass the hoisted results down (see the comment above
             // `capabilities`'s declaration) so this dock's remounts don't
             // refire the composer's own internal fetches.
@@ -3312,10 +3349,10 @@ function RunPanelBody({
                 ? "Answer the prompt above — or type a message and Save it for later."
                 : canSend
                 ? task.column === "running"
-                  ? "Agent is working — your message will be added to the current turn. Type / for commands."
+                  ? "Agent is working — your message will be added to the current turn. Type / for commands, @ for files."
                   : task.column === "blocked"
-                    ? "Answer the question, or send any follow-up. Type / for commands."
-                    : "Send a message — resumes the conversation in a fresh session. Type / for commands."
+                    ? "Answer the question, or send any follow-up. Type / for commands, @ for files."
+                    : "Send a message — resumes the conversation in a fresh session. Type / for commands, @ for files."
                 // `!canSend` covers two states: never run, and "ran but has
                 // no resumable session" (a codex task whose run_id was
                 // cleared — claude falls back to its newest run). Don't
@@ -3410,6 +3447,7 @@ const BACKLOG_ICON_BTN =
  * which item is currently in inline-edit mode.
  */
 function BacklogTray({
+  fileScope,
   items,
   canSend,
   busy,
@@ -3420,6 +3458,10 @@ function BacklogTray({
   onDelete,
   onMove,
 }: {
+  /** The task's `@`-listing scope (same object the send composer uses) —
+   *  threaded into each row's inline editor for popover + highlight parity.
+   *  Display/suggestion layer only; expansion stays server-side. */
+  fileScope?: FileScope | null;
   items: BacklogMessage[];
   /** Whether "Send now" is available (task has a resumable run and no pending prompt). */
   canSend: boolean;
@@ -3471,6 +3513,7 @@ function BacklogTray({
             busy={busy}
             readOnly={readOnly}
             editing={editingId === item.id}
+            fileScope={fileScope}
             startingFolder={startingFolder}
             onStartEdit={() => setEditingId(item.id)}
             onCancelEdit={() => setEditingId(null)}
@@ -3491,6 +3534,7 @@ function BacklogTray({
 /** One saved draft: a read-only row with hover actions, or an inline editor
  *  (textarea + references picker) when `editing` is true. */
 function BacklogItemRow({
+  fileScope,
   item,
   index,
   total,
@@ -3506,6 +3550,7 @@ function BacklogItemRow({
   onDelete,
   onMove,
 }: {
+  fileScope?: FileScope | null;
   item: BacklogMessage;
   index: number;
   total: number;
@@ -3524,6 +3569,13 @@ function BacklogItemRow({
   const [draft, setDraft] = useState(item.text);
   const [draftRefs, setDraftRefs] = useState<TaskReference[]>(item.references);
   const actionsRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<HTMLTextAreaElement>(null);
+  // `@` popover + highlight for the inline editor — scope gated on `editing`
+  // so a tray full of closed rows fetches nothing (the module-level cache is
+  // shared with the send composer anyway, so entering edit mode is a cache
+  // hit in practice). Expansion still happens server-side on send; this is
+  // the suggestion/validation layer only, same as every other composer.
+  const projectFiles = useProjectFiles(editing && !readOnly ? (fileScope ?? null) : null);
   // Re-seed the edit form only when we *enter* edit mode. We deliberately do
   // NOT depend on `item.text` / `item.references`: the 2s task poll rebuilds
   // `task.backlog` into fresh objects (new array references) on every tick, so
@@ -3550,13 +3602,34 @@ function BacklogItemRow({
     const canSave = draft.trim().length > 0 || draftRefs.length > 0;
     return (
       <div className="space-y-1.5 rounded-md border border-border/60 bg-background/50 p-2">
-        <Textarea
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          rows={2}
-          autoFocus
-          className="min-h-0 w-full resize-none text-xs"
-        />
+        {/* Backdrop first, `relative` on the textarea — DOM order decides the
+            paint, see AtHighlightBackdrop's doc. Popover anchors above (the
+            tray sits at the panel's bottom edge). */}
+        <div className="relative">
+          {fileScope && (
+            <AtHighlightBackdrop textareaRef={editorRef} value={draft} validPaths={projectFiles.validPaths} />
+          )}
+          <Textarea
+            ref={editorRef}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            rows={2}
+            autoFocus
+            className="relative min-h-0 w-full resize-none text-xs"
+          />
+          {fileScope && (
+            <AtFileAutocomplete
+              entries={projectFiles.entries}
+              truncated={projectFiles.truncated}
+              error={projectFiles.error}
+              value={draft}
+              onChange={setDraft}
+              textareaRef={editorRef}
+              placement="above"
+              fileScope={fileScope}
+            />
+          )}
+        </div>
         <ReferencesPicker
           variant="inline"
           refs={draftRefs}
@@ -4025,6 +4098,7 @@ function RunEventList({
   onOpenPlan,
   agentKind,
   onAskAnswerWithheld,
+  pathRoots,
 }: {
   events: RunEvent[];
   /** True groups turns and pins each user message for its own response. */
@@ -4044,6 +4118,11 @@ function RunEventList({
    *  relative attachment ref can resolve against the task's worktree/workdir
    *  when the user clicks it. */
   taskId?: string;
+  /** The task's own filesystem roots (`worktreePath`, `workdir`) — used by
+   *  `UserMessageBlock` for DISPLAY-ONLY folding of expanded absolute `@`
+   *  paths back to the mention form the user typed. Never consulted for
+   *  chips/previews, which need the real absolute paths. */
+  pathRoots?: readonly (string | null | undefined)[];
   /** Plans detected on this task (`task.plans`) — Cursor's
    *  `createPlanToolCall` or claude-code's `ExitPlanMode`. Empty (`NO_PLANS`)
    *  for every other agent. Matched against each `tool_use` event's parsed id
@@ -4234,7 +4313,7 @@ function RunEventList({
             wrap(
               key,
               evid,
-              <UserMessageBlock text={e.data} taskId={taskId} />,
+              <UserMessageBlock text={e.data} taskId={taskId} pathRoots={pathRoots} />,
               stickyUserMessages ? "sticky top-0 z-10" : undefined,
             ),
           ];
@@ -4379,7 +4458,7 @@ function RunEventList({
     // finished") spill out at the bottom.
     out.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId, stickyUserMessages]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, pathRoots, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId, stickyUserMessages]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -4549,7 +4628,7 @@ function findScrollParent(el: HTMLElement | null): HTMLElement | null {
 // importing back from this file (that used to be a circular import: PlanDialog
 // -> RunPanel -> PlanDialog). See md-components.tsx's doc comment.
 
-const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text: string; taskId?: string }) {
+const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoots }: { text: string; taskId?: string; pathRoots?: readonly (string | null | undefined)[] }) {
   const [expanded, setExpanded] = useState(false);
   const [needsToggle, setNeedsToggle] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -4599,26 +4678,37 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
       ? stripImagePlaceholders(ordinary.args)
       : ordinary.args;
 
+  // Display-only: fold expanded absolute paths under the task's own roots
+  // back to the `@rel` mention the user typed (send-time expansion produced
+  // them — see CLAUDE.md §12). Applied to the rendered markdown/segment body
+  // ONLY; the references arrays keep absolute paths for chips/previews.
+  // Shortening runs BEFORE segmentation below: it never touches tag markup
+  // (tags aren't paths) and it already skips code spans itself, so the
+  // segment parser sees the folded text and both features compose.
+  const displayCommandArgs = pathRoots?.length ? shortenTaskPaths(commandArgsText, pathRoots) : commandArgsText;
+  const displayOrdinaryArgs = pathRoots?.length ? shortenTaskPaths(ordinaryArgsText, pathRoots) : ordinaryArgsText;
+
   // A slash command's args are an intended user message too — segment them
   // the same general way a `tagged` message's text is segmented below, so a
   // command invoked with e.g. `<context>…</context>` in its args also gets
   // structured rendering instead of literal tag text. Unused (and cheap:
   // `commandArgsText` is `""`) when `parsed.kind !== "command"`.
   const commandSegments = useMemo(
-    () => parseMessageSegments(commandArgsText),
-    [commandArgsText],
+    () => parseMessageSegments(displayCommandArgs),
+    [displayCommandArgs],
   );
 
-  // For the `tagged` kind: re-segment with `[Image #N]` placeholders
-  // stripped when the message carries references (mirroring the command/
-  // ordinary branches above) — otherwise the already-parsed segments are
-  // reused as-is. Unused (and cheap) when `parsed.kind !== "tagged"`.
+  // For the `tagged` kind: strip `[Image #N]` placeholders when the message
+  // carries references (mirroring the command/ordinary branches above), fold
+  // paths, then segment. Always re-segments from the display text — the
+  // pre-parsed `parsed.segments` can't be reused once shortening may have
+  // rewritten path strings inside them. Unused (and cheap) when
+  // `parsed.kind !== "tagged"`.
   const taggedSegments = useMemo((): MessageSegment[] => {
     if (!parsed || parsed.kind !== "tagged") return [];
-    return parsed.references.length > 0
-      ? parseMessageSegments(stripImagePlaceholders(parsed.text))
-      : parsed.segments;
-  }, [parsed]);
+    const text = parsed.references.length > 0 ? stripImagePlaceholders(parsed.text) : parsed.text;
+    return parseMessageSegments(pathRoots?.length ? shortenTaskPaths(text, pathRoots) : text);
+  }, [parsed, pathRoots]);
 
   // Default to the collapsed ~3-line cap and measure once mounted. The cap
   // is always rendered so short messages don't flash full-height first;
@@ -4633,7 +4723,11 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
       return;
     }
     setNeedsToggle(el.scrollHeight > el.clientHeight + 2);
-  }, [text]);
+    // Keyed on the RENDERED strings, not `text`: the display-only path
+    // shortening derives from `pathRoots` too, which changes when a task's
+    // worktree materializes — measuring `text` alone left a stale
+    // "Show more" on bubbles whose folded content no longer overflows.
+  }, [displayCommandArgs, displayOrdinaryArgs, taggedSegments]);
 
   // After expand/collapse commits, apply the saved scroll-top compensation.
   useLayoutEffect(() => {
@@ -4703,7 +4797,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
             </div>
             <div ref={contentRef} className={collapseClassName}>
               <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
-                {ordinaryArgsText}
+                {displayOrdinaryArgs}
               </ReactMarkdown>
             </div>
             <AttachmentChips references={ordinary.references} taskId={taskId} />

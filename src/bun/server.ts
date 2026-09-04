@@ -81,6 +81,7 @@ import {
   type TerminalSocketData,
 } from "./terminals.ts";
 import { listAgentCapabilities } from "./commands.ts";
+import { listProjectFiles } from "./project-files.ts";
 import {
   addGitHubDiscussionComment,
   addGitHubProjectItem,
@@ -4081,6 +4082,46 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       "/refs/drag": {
         POST: authed((req) => {
           return json({ refs: refsFromPaths(readDragPasteboardPaths()) }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // List a project's files for the `@`-mention file picker: either the
+      // live working tree (tracked + untracked-not-ignored, `dir` mode) or
+      // the tracked files at a given ref (`ref` mode, for previewing a
+      // worktree that hasn't been materialized yet). Thin wrapper over
+      // `listProjectFiles` — see its header for the two listing shapes.
+      // Trust posture matches `/projects/branches?path=`: the bearer token +
+      // 127.0.0.1 bind is the only boundary, there's no additional path
+      // allow-list, so any absolute directory the caller names is listable.
+      // Deliberately has NO `native` dependency (unlike `/refs/pick` above)
+      // so it works under `headless.ts` (CLI/e2e), not just the packaged app.
+      // `q` (present, even as `q=`) switches to server-side search mode for
+      // monorepos past the client's `MAX_PROJECT_FILES` cap — see
+      // `listProjectFiles`'s header. `q` is read as-is (no trim — it's user
+      // text the scorer treats verbatim, matching `filterFileEntries`'s own
+      // trim-only-for-blank-check behavior); `limit` is parsed as an int and
+      // passed through un-clamped — `listProjectFiles`/`clampLimit` own the
+      // 1..200 clamp and the default-50 fallback for anything not a finite
+      // number, so this route doesn't duplicate that policy.
+      "/files/index": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("dir");
+          if (!dir || !path.isAbsolute(dir)) {
+            return json(
+              { error: "dir must be a non-empty absolute path" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const refParam = url.searchParams.get("ref")?.trim();
+          const q = url.searchParams.has("q") ? (url.searchParams.get("q") ?? "") : undefined;
+          const limitParam = url.searchParams.get("limit");
+          const limit = limitParam === null ? undefined : Number.parseInt(limitParam, 10);
+          const result = await listProjectFiles({ dir, ref: refParam ? refParam : undefined, q, limit });
+          if ("error" in result) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
         }),
       },
 

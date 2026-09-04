@@ -1,0 +1,556 @@
+import { test, expect, describe } from "bun:test";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+// Set AGETOR_DATA_DIR BEFORE importing project-files.ts, which imports
+// worktree.ts, which imports db.ts (opens the sqlite db at module load).
+const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-pf-data-"));
+process.env.AGETOR_DATA_DIR = DATA_DIR;
+
+// Standalone helper: run git in a directory, fire-and-forget.
+async function git(args: string[], cwd: string) {
+  const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  await proc.exited;
+}
+
+async function makeRepo(): Promise<string> {
+  const repo = mkdtempSync(path.join(tmpdir(), "agetor-pf-repo-"));
+  await git(["init", "-b", "main"], repo);
+  await git(["config", "user.email", "test@example.com"], repo);
+  await git(["config", "user.name", "test"], repo);
+  writeFileSync(path.join(repo, "README"), "hi\n");
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "init"], repo);
+  return repo;
+}
+
+// ---------------------------------------------------------------------------
+// listProjectFiles — live mode
+// ---------------------------------------------------------------------------
+
+test("listProjectFiles (live mode) lists tracked + untracked, excludes ignored + deleted, keeps spaced filenames intact", async () => {
+  const { listProjectFiles } = await import("./project-files.ts");
+  const repo = await makeRepo();
+
+  // Tracked file, then deleted from disk without committing the deletion —
+  // must not be offered.
+  writeFileSync(path.join(repo, "to-delete.txt"), "bye\n");
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "add to-delete"], repo);
+  rmSync(path.join(repo, "to-delete.txt"));
+
+  // Untracked file — must be included.
+  writeFileSync(path.join(repo, "untracked.txt"), "new\n");
+
+  // Ignored file — must be excluded.
+  writeFileSync(path.join(repo, ".gitignore"), "ignored.txt\n");
+  await git(["add", ".gitignore"], repo);
+  await git(["commit", "-m", "add gitignore"], repo);
+  writeFileSync(path.join(repo, "ignored.txt"), "skip me\n");
+
+  // Untracked filename with a space — must round-trip intact.
+  writeFileSync(path.join(repo, "space file.txt"), "spaces\n");
+
+  const res = await listProjectFiles({ dir: repo });
+  if ("error" in res) throw new Error(res.error);
+
+  expect(res.files).toContain("README");
+  expect(res.files).toContain(".gitignore");
+  expect(res.files).toContain("untracked.txt");
+  expect(res.files).toContain("space file.txt");
+  expect(res.files).not.toContain("to-delete.txt");
+  expect(res.files).not.toContain("ignored.txt");
+  expect(res.truncated).toBe(false);
+  // Sorted by plain code-unit comparison.
+  expect(res.files).toEqual([...res.files].sort((a, b) => (a < b ? -1 : 1)));
+});
+
+test("listProjectFiles (live mode) round-trips a filename with a LEADING space intact (R15)", async () => {
+  // Regression for R15: the local `git()` helper used to `.trim()` the whole
+  // `-z`-separated stdout blob, which silently ate a leading space off the
+  // FIRST NUL-terminated entry. A filename starting with a space is exactly
+  // the case that would have corrupted — " leading-space.txt" would have
+  // come back as "leading-space.txt", no longer matching anything on disk.
+  const { listProjectFiles } = await import("./project-files.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, " leading-space.txt"), "hi\n");
+
+  const res = await listProjectFiles({ dir: repo });
+  if ("error" in res) throw new Error(res.error);
+  expect(res.files).toContain(" leading-space.txt");
+});
+
+// ---------------------------------------------------------------------------
+// listProjectFiles — ref mode
+// ---------------------------------------------------------------------------
+
+test("listProjectFiles (ref mode) lists only the files present at HEAD~1 vs main", async () => {
+  const { listProjectFiles } = await import("./project-files.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "second.txt"), "second\n");
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "second commit"], repo);
+
+  const first = await listProjectFiles({ dir: repo, ref: "HEAD~1" });
+  if ("error" in first) throw new Error(first.error);
+  expect(first.files).toEqual(["README"]);
+
+  const second = await listProjectFiles({ dir: repo, ref: "main" });
+  if ("error" in second) throw new Error(second.error);
+  expect(second.files.sort()).toEqual(["README", "second.txt"]);
+});
+
+test("listProjectFiles (ref mode) resolves a local-only branch name", async () => {
+  const { listProjectFiles } = await import("./project-files.ts");
+  const repo = await makeRepo();
+  await git(["checkout", "-b", "feature"], repo);
+  writeFileSync(path.join(repo, "feature.txt"), "f\n");
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "feature commit"], repo);
+
+  const res = await listProjectFiles({ dir: repo, ref: "feature" });
+  if ("error" in res) throw new Error(res.error);
+  expect(res.files.sort()).toEqual(["README", "feature.txt"]);
+});
+
+test("listProjectFiles (ref mode) returns an error for an unknown ref", async () => {
+  const { listProjectFiles } = await import("./project-files.ts");
+  const repo = await makeRepo();
+  const res = await listProjectFiles({ dir: repo, ref: "definitely-not-a-real-ref" });
+  expect(res).toEqual({ error: "unknown ref: definitely-not-a-real-ref" });
+});
+
+test("listProjectFiles (ref mode) falls back to refs/remotes/origin/<ref> when the branch exists only on origin", async () => {
+  const { listProjectFiles } = await import("./project-files.ts");
+  const bare = mkdtempSync(path.join(tmpdir(), "agetor-pf-bare-"));
+  await git(["init", "--bare", "-b", "main"], bare);
+  const repo = await makeRepo();
+  await git(["remote", "add", "origin", bare], repo);
+  await git(["push", "-u", "origin", "main"], repo);
+
+  await git(["checkout", "-b", "pr-head"], repo);
+  writeFileSync(path.join(repo, "prhead.txt"), "pr work\n");
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "pr head commit"], repo);
+  await git(["push", "origin", "pr-head"], repo);
+  await git(["checkout", "main"], repo);
+  await git(["fetch", "origin"], repo);
+  // Local branch is gone; only refs/remotes/origin/pr-head remains.
+  await git(["branch", "-D", "pr-head"], repo);
+
+  const res = await listProjectFiles({ dir: repo, ref: "pr-head" });
+  if ("error" in res) throw new Error(res.error);
+  expect(res.files.sort()).toEqual(["README", "prhead.txt"]);
+});
+
+// ---------------------------------------------------------------------------
+// listProjectFiles — dir validation
+// ---------------------------------------------------------------------------
+
+test("listProjectFiles returns an error when dir is not a git repository", async () => {
+  const { listProjectFiles } = await import("./project-files.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pf-nongit-"));
+  const res = await listProjectFiles({ dir });
+  expect(res).toEqual({ error: "not a git repository" });
+});
+
+test("listProjectFiles returns an error for a relative dir path", async () => {
+  const { listProjectFiles } = await import("./project-files.ts");
+  const res = await listProjectFiles({ dir: "relative/path" });
+  expect("error" in res).toBe(true);
+});
+
+test("listProjectFiles returns an error for a missing directory", async () => {
+  const { listProjectFiles } = await import("./project-files.ts");
+  const missing = path.join(tmpdir(), `agetor-pf-missing-${Date.now()}`);
+  const res = await listProjectFiles({ dir: missing });
+  expect("error" in res).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// listProjectFiles — truncation (structural — MAX_PROJECT_FILES is 20000, too
+// large to exercise directly in a unit test)
+// ---------------------------------------------------------------------------
+
+test("MAX_PROJECT_FILES is 20000 and a small repo is not reported truncated", async () => {
+  const { listProjectFiles, MAX_PROJECT_FILES } = await import("./project-files.ts");
+  expect(MAX_PROJECT_FILES).toBe(20_000);
+
+  const repo = await makeRepo();
+  for (let i = 0; i < 12; i++) {
+    writeFileSync(path.join(repo, `file-${i}.txt`), `${i}\n`);
+  }
+  const res = await listProjectFiles({ dir: repo });
+  if ("error" in res) throw new Error(res.error);
+  expect(res.truncated).toBe(false);
+  expect(res.files.length).toBeGreaterThanOrEqual(13); // README + 12 new files
+});
+
+test("MAX_SCANNED_FILES is 250000 (structural)", async () => {
+  const { MAX_SCANNED_FILES } = await import("./project-files.ts");
+  expect(MAX_SCANNED_FILES).toBe(250_000);
+});
+
+// ---------------------------------------------------------------------------
+// listProjectFiles — q-mode (server-side search)
+// ---------------------------------------------------------------------------
+
+describe("listProjectFiles (q-mode)", () => {
+  test("ranks matches over the full listing and returns them by path", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "src", "bun"), { recursive: true });
+    writeFileSync(path.join(repo, "src", "bun", "db.ts"), "x\n");
+    writeFileSync(path.join(repo, "src", "bun", "agents.ts"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "add src"], repo);
+
+    const res = await listProjectFiles({ dir: repo, q: "db" });
+    if ("error" in res) throw new Error(res.error);
+    expect(res.files).toContain("src/bun/db.ts");
+    expect(res.files).not.toContain("src/bun/agents.ts");
+  });
+
+  test("a derived directory prefix is returned WITH its trailing slash for a matching query", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "src", "bun"), { recursive: true });
+    writeFileSync(path.join(repo, "src", "bun", "db.ts"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "add src"], repo);
+
+    const res = await listProjectFiles({ dir: repo, q: "src" });
+    if ("error" in res) throw new Error(res.error);
+    expect(res.files).toContain("src/");
+  });
+
+  test("an exact-filename query ranks that file first, ahead of a nested same-named file", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "src"));
+    writeFileSync(path.join(repo, "app.tsx"), "x\n");
+    writeFileSync(path.join(repo, "src", "app.tsx"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "add app.tsx"], repo);
+
+    const res = await listProjectFiles({ dir: repo, q: "app.tsx" });
+    if ("error" in res) throw new Error(res.error);
+    expect(res.files[0]).toBe("app.tsx");
+  });
+
+  test("limit is respected and clamped (min 1, max 200)", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(repo, `match-${i}.txt`), `${i}\n`);
+    }
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "add matches"], repo);
+
+    const capped = await listProjectFiles({ dir: repo, q: "match", limit: 2 });
+    if ("error" in capped) throw new Error(capped.error);
+    expect(capped.files.length).toBe(2);
+
+    // limit: 0 clamps up to the minimum of 1.
+    const clampedLow = await listProjectFiles({ dir: repo, q: "match", limit: 0 });
+    if ("error" in clampedLow) throw new Error(clampedLow.error);
+    expect(clampedLow.files.length).toBe(1);
+
+    // limit: 1000 clamps down to 200, but only 5 entries match anyway.
+    const clampedHigh = await listProjectFiles({ dir: repo, q: "match", limit: 1000 });
+    if ("error" in clampedHigh) throw new Error(clampedHigh.error);
+    expect(clampedHigh.files.length).toBe(5);
+  });
+
+  test("q-mode at a ref sees only that ref's tree", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    writeFileSync(path.join(repo, "second.txt"), "second\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "second commit"], repo);
+
+    const atFirst = await listProjectFiles({ dir: repo, ref: "HEAD~1", q: "second" });
+    if ("error" in atFirst) throw new Error(atFirst.error);
+    expect(atFirst.files).not.toContain("second.txt");
+
+    const atMain = await listProjectFiles({ dir: repo, ref: "main", q: "second" });
+    if ("error" in atMain) throw new Error(atMain.error);
+    expect(atMain.files).toContain("second.txt");
+  });
+
+  test("an empty q string returns shallowest-first entries (dirs before files), capped at limit", async () => {
+    // repo already has "README" at the root (from makeRepo) — depth 0, a
+    // file, so it's a fine stand-in for a root-level entry alongside the
+    // derived "src/" directory (also depth 0).
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "src", "bun"), { recursive: true });
+    writeFileSync(path.join(repo, "src", "app.tsx"), "x\n");
+    writeFileSync(path.join(repo, "src", "bun", "db.ts"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "add tree"], repo);
+
+    const res = await listProjectFiles({ dir: repo, q: "", limit: 3 });
+    if ("error" in res) throw new Error(res.error);
+    expect(res.files).toEqual(["src/", "README", "src/bun/"]);
+  });
+
+  test("the TTL cache serves a second q call without re-running git", async () => {
+    // Finding 6: TTL pinned artificially high so this test asserts CACHE
+    // BEHAVIOR (a fresh call within the window is served from the cache),
+    // not wall-clock git speed racing a fixed 3s window — the git add+commit
+    // below must finish inside whatever TTL is in effect, and a slow CI/dev
+    // machine shouldn't be able to flake this.
+    const { listProjectFiles, __clearProjectFilesCacheForTest, __setQModeCacheTtlForTest, DEFAULT_Q_MODE_CACHE_TTL_MS } =
+      await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    __setQModeCacheTtlForTest(60_000);
+    try {
+      const repo = await makeRepo();
+      writeFileSync(path.join(repo, "cached-file.txt"), "x\n");
+      await git(["add", "."], repo);
+      await git(["commit", "-m", "seed"], repo);
+
+      const first = await listProjectFiles({ dir: repo, q: "new-file" });
+      if ("error" in first) throw new Error(first.error);
+      expect(first.files).not.toContain("new-file.txt");
+
+      // A file added AFTER the first call, queried again within the TTL
+      // window, must not appear — the cached listing (not fresh git output)
+      // is what gets re-ranked.
+      writeFileSync(path.join(repo, "new-file.txt"), "x\n");
+      await git(["add", "."], repo);
+      await git(["commit", "-m", "add new file"], repo);
+
+      const stillCached = await listProjectFiles({ dir: repo, q: "new-file" });
+      if ("error" in stillCached) throw new Error(stillCached.error);
+      expect(stillCached.files).not.toContain("new-file.txt");
+
+      // Clearing the cache forces a fresh git listing on the next call.
+      __clearProjectFilesCacheForTest();
+      const fresh = await listProjectFiles({ dir: repo, q: "new-file" });
+      if ("error" in fresh) throw new Error(fresh.error);
+      expect(fresh.files).toContain("new-file.txt");
+    } finally {
+      __setQModeCacheTtlForTest(DEFAULT_Q_MODE_CACHE_TTL_MS);
+    }
+  });
+
+  test("concurrent q-mode misses against the same scope share one git listing (finding 2, single-flight)", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest, __getQModeListingRunsForTest } =
+      await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    writeFileSync(path.join(repo, "alpha.txt"), "x\n");
+    writeFileSync(path.join(repo, "beta.txt"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "seed"], repo);
+
+    const runsBefore = __getQModeListingRunsForTest();
+    const [a, b] = await Promise.all([
+      listProjectFiles({ dir: repo, q: "alpha" }),
+      listProjectFiles({ dir: repo, q: "beta" }),
+    ]);
+    const runsAfter = __getQModeListingRunsForTest();
+
+    if ("error" in a) throw new Error(a.error);
+    if ("error" in b) throw new Error(b.error);
+    expect(a.files).toContain("alpha.txt");
+    expect(b.files).toContain("beta.txt");
+    // Two concurrent misses against the identical (dir, ref) scope must have
+    // triggered exactly one actual git-backed listing load, not two.
+    expect(runsAfter - runsBefore).toBe(1);
+  });
+
+  test("a q-mode cache hit for a scope whose dir has since vanished falls through to a failing validation, not a stale success (finding 5)", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest } = await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+    const repo = await makeRepo();
+    writeFileSync(path.join(repo, "alpha.txt"), "x\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "seed"], repo);
+
+    const warm = await listProjectFiles({ dir: repo, q: "alpha" });
+    if ("error" in warm) throw new Error(warm.error);
+    expect(warm.files).toContain("alpha.txt");
+
+    // Delete the repo entirely — well within the TTL window, this cache
+    // entry is still "fresh" by age alone, but the directory it names no
+    // longer exists.
+    rmSync(repo, { recursive: true, force: true });
+
+    const afterDelete = await listProjectFiles({ dir: repo, q: "alpha" });
+    expect("error" in afterDelete).toBe(true);
+  });
+
+  test("the cache never holds more than MAX_CACHED_SCOPES distinct scopes (finding 3, FIFO eviction)", async () => {
+    const { listProjectFiles, __clearProjectFilesCacheForTest, __getQModeListingRunsForTest } =
+      await import("./project-files.ts");
+    __clearProjectFilesCacheForTest();
+
+    const repos: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const repo = await makeRepo();
+      writeFileSync(path.join(repo, `only-${i}.txt`), "x\n");
+      await git(["add", "."], repo);
+      await git(["commit", "-m", `seed ${i}`], repo);
+      repos.push(repo);
+      const res = await listProjectFiles({ dir: repo, q: `only-${i}` });
+      if ("error" in res) throw new Error(res.error);
+    }
+
+    // The cache caps at MAX_CACHED_SCOPES (4) scopes; with 5 distinct
+    // dirs queried in order, the first (oldest) must have been evicted —
+    // querying it again must trigger a fresh git-backed load rather than a
+    // cache hit.
+    const runsBefore = __getQModeListingRunsForTest();
+    const res = await listProjectFiles({ dir: repos[0]!, q: "only-0" });
+    if ("error" in res) throw new Error(res.error);
+    expect(res.files).toContain("only-0.txt");
+    expect(__getQModeListingRunsForTest()).toBe(runsBefore + 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveAtPath
+// ---------------------------------------------------------------------------
+
+describe("resolveAtPath", () => {
+  test("resolves a happy-path file", async () => {
+    const { resolveAtPath } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    expect(resolveAtPath(repo, "README", false)).toBe(path.join(repo, "README"));
+  });
+
+  test("resolves a happy-path directory, with and without a trailing slash on input", async () => {
+    const { resolveAtPath } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "sub"));
+    const expected = `${path.join(repo, "sub")}/`;
+    expect(resolveAtPath(repo, "sub", true)).toBe(expected);
+    expect(resolveAtPath(repo, "sub/", true)).toBe(expected);
+    // R10: a bare mention with NO trailing slash on the typed token arrives
+    // here as `isDirectory: false` (that's how `expandAtTokens` derives the
+    // flag) — the trailing slash must still be appended because `sub`
+    // actually IS a directory on disk, regardless of what the caller asked.
+    expect(resolveAtPath(repo, "sub", false)).toBe(expected);
+  });
+
+  test("rejects a '..'-escaping path", async () => {
+    const { resolveAtPath } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    expect(resolveAtPath(repo, "../etc/passwd", false)).toBeNull();
+  });
+
+  test("rejects an absolute path", async () => {
+    const { resolveAtPath } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    expect(resolveAtPath(repo, "/etc/passwd", false)).toBeNull();
+  });
+
+  test("returns null for a missing path", async () => {
+    const { resolveAtPath } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    expect(resolveAtPath(repo, "does-not-exist.txt", false)).toBeNull();
+  });
+
+  test("returns null when a file is requested as a directory", async () => {
+    const { resolveAtPath } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    expect(resolveAtPath(repo, "README", true)).toBeNull();
+  });
+
+  test("returns null for a symlink that resolves outside cwd", async () => {
+    const { resolveAtPath } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    const outside = mkdtempSync(path.join(tmpdir(), "agetor-pf-outside-"));
+    writeFileSync(path.join(outside, "secret.txt"), "shh\n");
+    symlinkSync(path.join(outside, "secret.txt"), path.join(repo, "escape-link.txt"));
+    expect(resolveAtPath(repo, "escape-link.txt", false)).toBeNull();
+  });
+
+  test("resolves a filename containing spaces", async () => {
+    const { resolveAtPath } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    writeFileSync(path.join(repo, "space file.txt"), "hi\n");
+    expect(resolveAtPath(repo, "space file.txt", false)).toBe(path.join(repo, "space file.txt"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// expandAtReferences
+// ---------------------------------------------------------------------------
+
+describe("expandAtReferences", () => {
+  test("a bare directory mention with no trailing slash expands WITH the trailing slash (R10)", async () => {
+    const { expandAtReferences } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "src"));
+    expect(expandAtReferences("look at @src for the code", repo)).toBe(
+      `look at ${path.join(repo, "src")}/ for the code`,
+    );
+  });
+
+  test("a resolved path containing whitespace is wrapped in double quotes (R9)", async () => {
+    const { expandAtReferences } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    writeFileSync(path.join(repo, "my notes.md"), "hi\n");
+    // The user had to quote the token in the first place BECAUSE the path has
+    // a space (`@"my notes.md"` — the bare-token grammar can't span a space).
+    // Expansion must not silently drop that delimiting once it swaps in the
+    // absolute path.
+    expect(expandAtReferences('see @"my notes.md"', repo)).toBe(`see "${path.join(repo, "my notes.md")}"`);
+  });
+
+  test("a resolved directory path containing whitespace is quoted with its trailing slash inside the quotes (R9 + R10)", async () => {
+    const { expandAtReferences } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    mkdirSync(path.join(repo, "my notes"));
+    expect(expandAtReferences('see @"my notes/"', repo)).toBe(`see "${path.join(repo, "my notes")}/"`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// expandAtReferencesDetailed
+// ---------------------------------------------------------------------------
+
+describe("expandAtReferencesDetailed", () => {
+  test("mixed resolve/miss: `text` matches expandAtReferences, `unresolved` lists only the misses, in document order", async () => {
+    const { expandAtReferencesDetailed, expandAtReferences } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    const prompt = "see @README and @nope.txt and @also-nope";
+    const result = expandAtReferencesDetailed(prompt, repo);
+    expect(result.text).toBe(expandAtReferences(prompt, repo));
+    expect(result.text).toBe(`see ${path.join(repo, "README")} and @nope.txt and @also-nope`);
+    expect(result.unresolved).toEqual(["@nope.txt", "@also-nope"]);
+  });
+
+  test("an unresolved quoted token is reported with its raw quoted form intact", async () => {
+    const { expandAtReferencesDetailed } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    const result = expandAtReferencesDetailed('see @"my missing file.md" now', repo);
+    expect(result.text).toBe('see @"my missing file.md" now');
+    expect(result.unresolved).toEqual(['@"my missing file.md"']);
+  });
+
+  test("a repeated unresolved token is deduped to a single entry", async () => {
+    const { expandAtReferencesDetailed } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    const result = expandAtReferencesDetailed("@nope.txt and again @nope.txt", repo);
+    expect(result.unresolved).toEqual(["@nope.txt"]);
+  });
+
+  test("a fully-resolving prompt reports an empty (not omitted) unresolved array", async () => {
+    const { expandAtReferencesDetailed } = await import("./project-files.ts");
+    const repo = await makeRepo();
+    const result = expandAtReferencesDetailed("see @README", repo);
+    expect(result.unresolved).toEqual([]);
+  });
+});

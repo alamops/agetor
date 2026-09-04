@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { BookText, Sparkles, Terminal } from "lucide-react";
 import type { AvailableCommand } from "@/lib/api";
 import type { SavedPrompt } from "../../../shared/types.ts";
@@ -130,9 +130,52 @@ export function SlashAutocomplete({ commands, savedPrompts, value, onChange, tex
     return [...cmdRows, ...promptRows];
   }, [commands, savedPrompts, slice]);
 
-  // Reset highlight when the filtered list changes (avoid a stale index that
-  // points past the new list's length).
-  useEffect(() => { setActive(0); }, [slice?.query, filtered.length]);
+  const listboxId = useId();
+
+  // ARIA combobox wiring (WAI-ARIA 1.2 pattern for an input with a popup
+  // listbox), applied imperatively through the ref because this component
+  // decorates a textarea it doesn't render. The `/` and `@` autocompletes
+  // share one textarea and are never open at once (different trigger
+  // guards), so each manages the dynamic trio (expanded/controls/
+  // activedescendant) only while it owns the popup — the `aria-controls`
+  // ownership check keeps a closing popover from clobbering the other's
+  // state. `aria-autocomplete`/`aria-haspopup` are static and identical
+  // from both, so setting them unconditionally is idempotent.
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    // Claim the popup only once one is actually possible — see the same
+    // guard in AtFileAutocomplete (set-once, never removed).
+    if (commands.length > 0 || (savedPrompts?.length ?? 0) > 0) {
+      el.setAttribute("aria-autocomplete", "list");
+      el.setAttribute("aria-haspopup", "listbox");
+    }
+    const owns = () => el.getAttribute("aria-controls") === listboxId;
+    if (open && filtered.length > 0) {
+      el.setAttribute("aria-expanded", "true");
+      el.setAttribute("aria-controls", listboxId);
+      el.setAttribute("aria-activedescendant", `${listboxId}-opt-${active}`);
+    } else if (owns()) {
+      el.setAttribute("aria-expanded", "false");
+      el.removeAttribute("aria-controls");
+      el.removeAttribute("aria-activedescendant");
+    }
+    // Deliberately NO cleanup removal: React runs cleanup before the next
+    // body, so removing here would strip the attributes right before the
+    // closed-state branch checks `owns()` — leaving `aria-expanded` absent
+    // instead of "false". The body's ownership gate is what prevents the two
+    // popovers from clobbering each other; the one cost is a dangling
+    // `aria-expanded="true"` if this popover unmounts while open (a scope
+    // flipping to null mid-query — rare, and the textarea usually unmounts
+    // with it).
+  }, [open, filtered.length, active, listboxId, textareaRef, commands.length, savedPrompts?.length]);
+
+  // Reset highlight when the filtered list changes — keyed on the ARRAY
+  // ITSELF, not its length, so a same-length content swap (a focus-refetch
+  // reordering commands under an unchanged query) can't leave `active`
+  // pointing at a different row than the highlighted one. Mirrors
+  // AtFileAutocomplete's reset.
+  useEffect(() => { setActive(0); }, [slice?.query, filtered]);
 
   // Keep the highlighted row scrolled into view. `data-idx` (not positional
   // children) since the "Saved Prompts" group label is itself a list child.
@@ -217,13 +260,14 @@ export function SlashAutocomplete({ commands, savedPrompts, value, onChange, tex
         placement === "above" ? "bottom-full mb-1" : "top-full mt-1",
       )}
     >
-      <ul ref={listRef} className="py-1">
+      <ul ref={listRef} role="listbox" id={listboxId} aria-label="Command and prompt suggestions" className="py-1">
         {filtered.map((row, i) => {
           // Group label right before the first prompt row — commands (if any)
           // always come first, so this fires at most once.
           const showPromptLabel = row.tag === "prompt" && filtered[i - 1]?.tag !== "prompt";
           return (
           <li
+            role="presentation"
             data-testid="slash-autocomplete-row"
             key={row.tag === "cmd" ? `${row.cmd.kind}:${row.cmd.name}` : `prompt:${row.prompt.id}`}
           >
@@ -235,6 +279,10 @@ export function SlashAutocomplete({ commands, savedPrompts, value, onChange, tex
             )}
             <button
               type="button"
+              role="option"
+              id={`${listboxId}-opt-${i}`}
+              aria-selected={i === active}
+              tabIndex={-1}
               data-idx={i}
               // `onMouseDown` instead of `onClick` so the textarea doesn't lose
               // focus before the insertion runs (the popover handles its own
