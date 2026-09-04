@@ -61,6 +61,7 @@ import { cn } from "@/lib/utils";
 import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
 import type { SettingsSectionId } from "@/lib/settings-dialog-view";
 import { reconcileById } from "@/lib/reconcile";
+import { parseStickyUserMessagesPreference, STICKY_USER_MESSAGES_PREF } from "@/lib/user-message-display";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
 /**
@@ -180,6 +181,10 @@ function AppInner() {
   const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Missing preference intentionally resolves to sticky so existing users
+  // retain the last-sent-message reminder until they opt into the standard
+  // scrolling chat list in Settings.
+  const [stickyUserMessages, setStickyUserMessages] = useState(true);
   // Section the Settings dialog should land on when it next opens — set by
   // onboarding's "Enable in Settings…" deep link, cleared on close so the
   // plain gear-icon open still lands on General.
@@ -279,6 +284,7 @@ function AppInner() {
       // read at boot is enough. `refetchOnboardingPref` (used after Settings
       // closes) re-reads just this key via the same route.
       setOnboardingDismissedPref(prefs[ONBOARDING_DISMISSED_PREF]);
+      setStickyUserMessages(parseStickyUserMessagesPreference(prefs[STICKY_USER_MESSAGES_PREF]));
       setPrefsLoaded(true);
     }).catch(() => { /* keep the boot-seeded preferences; onboarding stays hidden (prefsLoaded=false) rather than guess */ });
     // Run once at boot only — intentionally not re-run when either local
@@ -1550,6 +1556,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       </div>
       <RunPanel
         task={selected}
+        stickyUserMessages={stickyUserMessages}
         agents={agents}
         harnesses={harnesses}
         agentModels={agentModels}
@@ -1607,6 +1614,15 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       />
       <SettingsDialog
         open={settingsOpen}
+        stickyUserMessages={stickyUserMessages}
+        onStickyUserMessagesChange={(sticky) => {
+          setStickyUserMessages(sticky);
+          void api.setPreference(STICKY_USER_MESSAGES_PREF, String(sticky)).catch(() => {
+            // Revert only if this failed write is still the latest selection;
+            // a subsequent click must not be overwritten by an older request.
+            setStickyUserMessages((current) => current === sticky ? !sticky : current);
+          });
+        }}
         onClose={() => {
           setSettingsOpen(false);
           // Clear the deep-link so a later plain gear-icon open lands back

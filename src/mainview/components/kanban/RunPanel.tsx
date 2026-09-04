@@ -17,6 +17,7 @@ import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
 import { reconcileById } from "@/lib/reconcile";
+import { RUN_PANEL_DEFAULT_WIDTH, RUN_PANEL_MIN_WIDTH, clampPanelWidth, readPanelWidth, writePanelWidth } from "@/lib/panel-width";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -136,6 +137,8 @@ type StreamEvent = RunEvent & { id: number; dbId?: number };
 interface Props {
   /** When null, the panel slides off-screen and unmounts after the exit animation. */
   task: Task | null;
+  /** Pin the current user message while its response scrolls (default mode). */
+  stickyUserMessages: boolean;
   agents: AgentStatus[];
   /** Registered harnesses — needed so the panel's agent dropdown can list
    *  every known harness (built-ins + aliases). */
@@ -266,11 +269,81 @@ function formatUsageCount(n: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
   const [open, setOpen] = useState<boolean>(!!task);
+
+  // User-resizable width, persisted in localStorage (`panel-width.ts`).
+  // Resolved synchronously in the initializer — an effect-time read would
+  // paint the default width first and snap. Live drag frames update only
+  // this local state; the committed value (drag end / keyboard / reset) is
+  // also written to storage.
+  const [width, setWidth] = useState<number>(() => readPanelWidth(window.innerWidth));
+  const [resizing, setResizing] = useState(false);
+  const dragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
+  // The user's chosen width, independent of the current viewport clamp —
+  // shrinking the window squeezes `width` down (resize listener below) but
+  // re-growing it restores this preference rather than the squeezed value.
+  const preferredWidthRef = useRef(width);
+
+  const commitWidth = useCallback((w: number) => {
+    preferredWidthRef.current = w;
+    setWidth(w);
+    writePanelWidth(w);
+  }, []);
+
+  // Single owner for every non-React consumer of the width: publish it as a
+  // CSS custom property on the document root. The Toaster's offset reads
+  // `var(--run-panel-width)` instead of threading the value through App —
+  // no mirror state, and any future consumer is a zero-prop CSS read.
+  useEffect(() => {
+    document.documentElement.style.setProperty("--run-panel-width", `${width}px`);
+    return () => {
+      document.documentElement.style.removeProperty("--run-panel-width");
+    };
+  }, [width]);
+
+  // Re-clamp when the window resizes, so state can never disagree with the
+  // rendered width (the CSS `max-w-[90vw]` on the `<aside>` would otherwise
+  // win silently and leave stale numbers in the CSS variable above —
+  // off-screen toasts on a persisted-wide panel in a shrunken window).
+  useEffect(() => {
+    const onResize = () => setWidth(clampPanelWidth(preferredWidthRef.current, window.innerWidth));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const onResizePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    dragRef.current = { pointerId: e.pointerId, startX: e.clientX, startWidth: width };
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setResizing(true);
+  };
+  const onResizePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    // Panel is anchored to the right edge, so dragging LEFT grows it.
+    setWidth(clampPanelWidth(drag.startWidth + (drag.startX - e.clientX), window.innerWidth));
+  };
+  const onResizePointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    dragRef.current = null;
+    setResizing(false);
+    // Recompute from the event rather than reading `width` — the last
+    // pointermove's setState may not have flushed into this closure yet.
+    commitWidth(clampPanelWidth(drag.startWidth + (drag.startX - e.clientX), window.innerWidth));
+  };
+  const onResizeKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // Handle sits on the panel's LEFT edge: ArrowLeft moves it left = wider.
+    const delta = e.key === "ArrowLeft" ? 32 : e.key === "ArrowRight" ? -32 : 0;
+    if (delta === 0) return;
+    e.preventDefault();
+    commitWidth(clampPanelWidth(width + delta, window.innerWidth));
+  };
 
   useEffect(() => {
     if (task) {
@@ -347,13 +420,40 @@ export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, 
         )}
       />
       <aside
+        style={{ width }}
         className={cn(
-          "fixed right-0 top-0 z-40 flex h-full w-[520px] max-w-[90vw] flex-col border-l border-border/60 bg-card shadow-2xl transition-transform duration-300 ease-out",
+          "fixed right-0 top-0 z-40 flex h-full max-w-[90vw] flex-col border-l border-border/60 bg-card shadow-2xl transition-transform duration-300 ease-out",
           open ? "translate-x-0" : "translate-x-full",
         )}
       >
+        {/* Resize handle on the panel's left edge. `touch-none` so pointer
+            capture isn't hijacked by scroll gestures; `select-none` plus the
+            pointerdown preventDefault keep a drag from starting a text
+            selection in the transcript underneath. */}
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize task panel"
+          aria-valuenow={width}
+          aria-valuemin={RUN_PANEL_MIN_WIDTH}
+          tabIndex={0}
+          data-testid="run-panel-resize"
+          onPointerDown={onResizePointerDown}
+          onPointerMove={onResizePointerMove}
+          onPointerUp={onResizePointerEnd}
+          onPointerCancel={onResizePointerEnd}
+          onDoubleClick={() => commitWidth(clampPanelWidth(RUN_PANEL_DEFAULT_WIDTH, window.innerWidth))}
+          onKeyDown={onResizeKeyDown}
+          title="Drag to resize · double-click to reset"
+          className={cn(
+            "absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize touch-none select-none outline-none transition-colors",
+            "hover:bg-primary/40 focus-visible:bg-primary/40",
+            resizing && "bg-primary/50",
+          )}
+        />
         <RunPanelBody
           task={mountedTask}
+          stickyUserMessages={stickyUserMessages}
           agents={agents}
           harnesses={harnesses}
           agentModels={agentModels}
@@ -380,6 +480,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, 
  */
 function RunPanelBody({
   task,
+  stickyUserMessages,
   agents,
   harnesses,
   agentModels,
@@ -396,6 +497,7 @@ function RunPanelBody({
   onViewIssue,
 }: {
   task: Task;
+  stickyUserMessages: boolean;
   agents: AgentStatus[];
   harnesses: Harness[];
   agentModels: AgentModelMap;
@@ -623,7 +725,7 @@ function RunPanelBody({
     return () => { cancelled = true; };
   }, [task.id]);
 
-  // Stable identity so RunEventList's memoized section tree isn't invalidated
+  // Stable identity so RunEventList's memoized block tree isn't invalidated
   // on every parent re-render (e.g. the 2s runs poll). `setInteractions` is a
   // stable setter, so the empty dep list is correct.
   const dismissInteraction = useCallback(
@@ -1451,10 +1553,10 @@ function RunPanelBody({
   }, [matches, task.id, activeStream, rebuilt, rebuiltScopeKey]);
 
   // Highlight + scroll the active match imperatively rather than through a
-  // React prop/memo dep: `RunEventList`'s `sections` memo used to take
+  // React prop/memo dep: `RunEventList`'s `blocks` memo used to take
   // `activeMatchId` as a dep purely so it could stamp a highlight class on
   // one wrapper div, which meant re-deriving (and re-diffing) the ENTIRE
-  // section tree on every match navigation. Toggling classList directly on
+  // block tree on every match navigation. Toggling classList directly on
   // the previous/next `[data-evid]` element is O(1) instead. Runs after the
   // resolve effect above (and after any tab/task/rebuild-scope switch), so by
   // the time this fires `activeMatchId` already points at an event rendered
@@ -2915,6 +3017,7 @@ function RunPanelBody({
               </div>
               <RunEventList
                 events={displayedEvents}
+                stickyUserMessages={stickyUserMessages}
                 interactions={interactions}
                 onInteractionResolved={dismissInteraction}
                 runStatus={activeRunStatus}
@@ -3906,6 +4009,7 @@ type RunIndicatorMode = "off" | "active";
 
 function RunEventList({
   events,
+  stickyUserMessages,
   interactions = [],
   onInteractionResolved,
   runStatus,
@@ -3918,6 +4022,8 @@ function RunEventList({
   onAskAnswerWithheld,
 }: {
   events: RunEvent[];
+  /** True groups turns and pins each user message for its own response. */
+  stickyUserMessages: boolean;
   interactions?: PendingInteraction[];
   onInteractionResolved?: (id: string) => void;
   runStatus?: Run["status"] | null;
@@ -4030,7 +4136,7 @@ function RunEventList({
   // Index plans by their raw (possibly-`\n`-containing) toolCallId so the
   // `tool_use` case below can do an O(1) lookup instead of a per-render scan
   // over `plans` — same perf rationale as `resultByToolId` above; this map
-  // is one of the `sections` memo's deps, not recomputed inside its loop.
+  // is one of the `blocks` memo's deps, not recomputed inside its loop.
   //
   // Keyed on a content signature (`plansKey`), not `plans` itself: the
   // `plans` state mirror in `RunPanelBody` gets a fresh array identity on
@@ -4039,7 +4145,7 @@ function RunEventList({
   // only renders `id`/`name`/`toolCallId`/`status` — `toolCallId` never
   // changes for a given plan record and `name` is fixed at creation, so
   // `id:status` is the only content that can invalidate what gets rendered.
-  // Without this, `sections` (a dep-of-`planByToolCallId` memo) recomputed
+  // Without this, `blocks` (a dep-of-`planByToolCallId` memo) recomputed
   // — and re-parsed every markdown block in a long conversation — on every
   // poll tick regardless of whether a plan changed.
   const plansKey = plans.map((p) => `${p.id}:${p.status}`).join("|");
@@ -4072,12 +4178,10 @@ function RunEventList({
     return slots;
   }, [normalised, sortedInteractions]);
 
-  // Group events into sections delimited by user messages. Each section
-  // wraps its user message (sticky) and the events that followed it, so
-  // the user-message bubble pins to the top of the scroll viewport only
-  // for the duration of its own section — when the next user message
-  // appears in view, the previous one releases naturally rather than
-  // stacking on top of it.
+  // Render either turn-grouped sections with a sticky user-message header or
+  // one flat, normally scrolling block list. Settings defaults to the former
+  // because keeping the last sent message visible is useful while
+  // multitasking; users who prefer a standard chat list select the latter.
   //
   // Memoized over the parsed inputs: this rebuilds the rendered element tree
   // only when the events / interactions / tool-result map actually change.
@@ -4087,7 +4191,7 @@ function RunEventList({
   // poll is what made long conversations lag. `renderEvent`/`renderInteraction`
   // live inside so their captured deps (`resultByToolId`, `onInteractionResolved`,
   // `planByToolCallId`, `onOpenPlan`) are tracked explicitly.
-  const sections = useMemo(() => {
+  const blocks = useMemo(() => {
     // Wrap a rendered block in the `data-evid` carrier the search bar scrolls
     // to and imperatively highlights (`logRef.current?.querySelector('[data-
     // evid="…"]')` in RunPanelBody — see the highlight effect there). `evid`
@@ -4098,11 +4202,9 @@ function RunEventList({
     // identity/props untouched. Only STATIC classes belong here — the
     // highlight ring itself is toggled by the DOM effect in RunPanelBody, not
     // by a render-time class, so this memo doesn't need `activeMatchId` as a
-    // dep (re-deriving the whole section tree on every match navigation was
-    // the point being fixed). `extraClassName` lets a specific stream (only
-    // `user`, below) opt into a class that has to live on THIS wrapper rather
-    // than on the block's own root — sticky positioning needs to be applied
-    // to the element that's actually the flex child of the scroll container.
+    // dep (re-deriving the whole block tree on every match navigation was
+    // the point being fixed). `extraClassName` is used only by sticky mode:
+    // the wrapper, as the direct flex child, is the element that must pin.
     // Returns `null` (no wrapper at all) when `node` is nullish, so an event
     // with nothing to render (e.g. an unparseable orphan tool_result — see
     // the `tool_result` case below) doesn't still leave a phantom empty div
@@ -4123,12 +4225,14 @@ function RunEventList({
     const renderEvent = (e: RunEvent, key: string, evid: number): React.ReactNode[] => {
       switch (e.stream) {
         case "user":
-          // Sticky positioning lives on this wrapper, not on
-          // `UserMessageBlock`'s own root — the wrapper is the actual flex
-          // child of the scroll container (`sections.map` below renders one
-          // `<section>` per user-message group), so THIS is the element that
-          // has to pin to `top-0` for the sticky header to work at all.
-          return [wrap(key, evid, <UserMessageBlock text={e.data} taskId={taskId} />, "sticky top-0 z-10")];
+          return [
+            wrap(
+              key,
+              evid,
+              <UserMessageBlock text={e.data} taskId={taskId} />,
+              stickyUserMessages ? "sticky top-0 z-10" : undefined,
+            ),
+          ];
         case "assistant":
           return [wrap(key, evid, <AssistantBlock text={e.data} />)];
         case "thinking":
@@ -4219,37 +4323,62 @@ function RunEventList({
       }
     };
 
-    const out: { key: string; header: React.ReactNode; body: React.ReactNode[] }[] = [];
-    // Stable per-section key = the key of the section's first event (`ts-index`,
-    // unique and append-stable), so appending events keeps earlier sections'
-    // identity instead of reindexing them as the old `sec-${idx}` key did.
-    let current: { key: string; header: React.ReactNode; body: React.ReactNode[] } = { key: "", header: null, body: [] };
+    if (stickyUserMessages) {
+      const sections: { key: string; header: React.ReactNode; body: React.ReactNode[] }[] = [];
+      // Preamble events before the first user message share an initial
+      // headerless section. Each subsequent user message starts a new turn;
+      // its sticky lifetime naturally ends at that section's boundary.
+      let current: { key: string; header: React.ReactNode; body: React.ReactNode[] } = {
+        key: "",
+        header: null,
+        body: [],
+      };
+      for (let i = 0; i < normalised.length; i++) {
+        const e = normalised[i]!;
+        const key = `${e.ts}-${i}`;
+        const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
+        if (e.stream === "user") {
+          if (current.header !== null || current.body.length > 0) sections.push(current);
+          current = { key, header: renderEvent(e, key, i)[0] ?? null, body: [...before] };
+        } else {
+          if (current.key === "") current.key = key;
+          current.body.push(...before, ...renderEvent(e, key, i));
+        }
+      }
+      current.body.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
+      if (current.header !== null || current.body.length > 0) sections.push(current);
+      return sections.map((section, index) => (
+        <section key={section.key || `section-${index}`} className="flex flex-col gap-4">
+          {section.header}
+          {section.body}
+        </section>
+      ));
+    }
+
+    const out: React.ReactNode[] = [];
     for (let i = 0; i < normalised.length; i++) {
       const e = normalised[i]!;
       const key = `${e.ts}-${i}`;
       const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
       if (e.stream === "user") {
-        if (current.header !== null || current.body.length > 0) out.push(current);
-        current = { key, header: renderEvent(e, key, i)[0] ?? null, body: [...before] };
+        // Order quirk preserved from the old section grouping: an
+        // interaction slotted AT a user message's index renders after the
+        // message (it used to land in the new section's body, below the
+        // section's header).
+        out.push(...renderEvent(e, key, i), ...before);
       } else {
-        if (current.key === "") current.key = key;
-        current.body.push(...before, ...renderEvent(e, key, i));
+        out.push(...before, ...renderEvent(e, key, i));
       }
     }
-    const tail = (interactionByIndex.get(normalised.length) ?? []).map(renderInteraction);
-    current.body.push(...tail);
-    if (current.header !== null || current.body.length > 0) out.push(current);
+    // Interactions that fired after the last event ("since the run
+    // finished") spill out at the bottom.
+    out.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId, stickyUserMessages]);
 
   return (
     <div className="flex flex-col gap-4">
-      {sections.map((s, idx) => (
-        <section key={s.key || `sec-${idx}`} className="flex flex-col gap-4">
-          {s.header}
-          {s.body}
-        </section>
-      ))}
+      {blocks}
       {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
       {holdSummary && <HoldingIndicator text={holdSummary} />}
     </div>
@@ -4609,7 +4738,7 @@ const StatusDivider = memo(function StatusDivider({ text }: { text: string }) {
  *  `onExpand` when `root` is (or contains) the element that dispatched it —
  *  the imperative counterpart to that effect, so a jump onto a match inside
  *  a collapsed tool-call card / result fold / thinking block reveals it
- *  without threading new props through the `sections` memo. */
+ *  without threading new props through the `blocks` memo. */
 function useExpandOnJump(rootRef: React.RefObject<HTMLDivElement | null>, onExpand: () => void) {
   useEffect(() => {
     const handler = (evt: Event) => {
@@ -5094,7 +5223,7 @@ function ToolResultBody({ result, openSignal = 0 }: { result: ParsedToolResult; 
   // doesn't exist yet to catch the bubbling `EXPAND_EVENT`, so `ToolUseBlock`
   // also bumps this counter (in its own jump-expand callback) and hands it
   // down as a prop — safe for the memo'd tree since it originates from
-  // `ToolUseBlock`'s own local state, not from the `sections` memo. A mount
+  // `ToolUseBlock`'s own local state, not from the `blocks` memo. A mount
   // with `openSignal > 0` opens the fold immediately; incrementing (rather
   // than a boolean) means a repeat jump to the same block re-opens it even
   // if the user had since collapsed it manually.
@@ -5930,7 +6059,7 @@ function TmuxPromptCard({
   // pane dump) — same polish as the AskUserQuestion card. Detect it by its
   // signature and render labelled buttons plus the plan markdown itself
   // (`planMarkdown`, below) — the plan's `tool_use` event renders as a
-  // `PlanCard` summary button now (see `RunEventList`'s `sections` memo),
+  // `PlanCard` summary button now (see `RunEventList`'s `blocks` memo),
   // not an inline expanded body, so this card is the only place the full
   // text is shown at decision time.
   const isPlan = CLAUDE_PLAN_PROMPT_RE.test(req.paneText);
