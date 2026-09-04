@@ -18,6 +18,8 @@ import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
 import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { isMacPlatform } from "@/lib/platform";
+import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { shortenTaskPaths } from "@/lib/shorten-task-paths";
@@ -200,13 +202,8 @@ export const EXIT_DURATION_MS = 250;
 // fire inconsistently depending on which path last updated `nearBottomRef`.
 const NEAR_BOTTOM_PX = 80;
 
-// Computed once at module load rather than per keystroke — used by the
-// Cmd/Ctrl+F handler below to pick the platform-appropriate modifier
-// (`metaKey` on macOS, `ctrlKey` elsewhere). Agetor packages arm64-only for
-// macOS, but the dev webview (Vite) can run in any browser during
-// development, so this still branches rather than assuming Mac.
-const IS_MAC_PLATFORM =
-  typeof navigator !== "undefined" && /mac/i.test(navigator.platform || navigator.userAgent || "");
+// Computed once at module load — see `lib/platform.ts`; used by the Cmd/Ctrl+F handler below.
+const IS_MAC_PLATFORM = isMacPlatform();
 
 /**
  * Prefills the "Closes #N" (GitHub/GitLab) / "Issue #N" (Bitbucket) line
@@ -1640,14 +1637,9 @@ function RunPanelBody({
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key.toLowerCase() !== "f" || e.altKey) return;
-      const wantsFind = IS_MAC_PLATFORM ? (e.metaKey && !e.ctrlKey) : e.ctrlKey;
-      if (!wantsFind) return;
-      // Cmd/Ctrl+F isn't Escape, so a popover that only wants Escape yielded
-      // to it (marked `data-popover-keys="escape-only"` — SlashAutocomplete,
-      // ExtensionPicker) shouldn't block this shortcut too; excluding those
-      // keeps Cmd+F live while the `/` menu or Extensions popover is open.
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]:not([data-popover-keys="escape-only"])')) return;
+      if (!isFindShortcut(e, IS_MAC_PLATFORM)) return;
+      // See `FIND_SHORTCUT_BLOCKING_LAYERS`'s doc comment for the escape-only carve-out.
+      if (document.querySelector(FIND_SHORTCUT_BLOCKING_LAYERS)) return;
       if ((e.target as Element | null)?.closest?.(".xterm")) return;
       e.preventDefault();
       if (searchOpen) {
