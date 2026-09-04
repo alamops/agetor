@@ -74,7 +74,7 @@ function alias(kind: AgentKind, opts: { home?: string; bin?: string; env?: Recor
 // missing-model / missing-effort guards. Mirrors what the UI + orchestrator
 // will now always pass at runtime.
 const claudeDefaults = { mode: "auto", model: "opus-4.7", effort: "high" } as const;
-const codexDefaults = { mode: "auto", model: "gpt-5.6-sol", effort: "high" } as const;
+const codexDefaults = { mode: "auto", model: "gpt-6-astra", effort: "high" } as const;
 // Cursor's effort rides inside the --model id (`cursorModelArg` composes
 // model + effort + fast into one string), not a separate flag.
 const cursorDefaults = { mode: "auto", model: "cursor-grok-4.6", effort: "high" } as const;
@@ -504,7 +504,7 @@ test("codex with defaults emits --model + reasoning effort + structured-stream f
   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults });
   expect(cmd).toEqual([
     "codex", "exec",
-    "--model", "gpt-5.6-sol",
+    "--model", "gpt-6-astra",
     "-c", "model_reasoning_effort=high",
     "--json", "--color", "never", "--skip-git-repo-check",
     "--sandbox", "workspace-write",
@@ -517,10 +517,34 @@ test("codex 'ask' mode uses --sandbox read-only so codex can't change anything",
   expect(cmd).not.toContain("workspace-write");
   expect(cmd).toEqual([
     "codex", "exec",
-    "--model", "gpt-5.6-sol",
+    "--model", "gpt-6-astra",
     "-c", "model_reasoning_effort=high",
     "--json", "--color", "never", "--skip-git-repo-check",
     "--sandbox", "read-only",
+    "-",
+  ]);
+});
+
+test("codex model 'gpt-6-astra' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-6-astra", mode: "auto" });
+  expect(cmd).toEqual([
+    "codex", "exec",
+    "--model", "gpt-6-astra",
+    "-c", "model_reasoning_effort=high",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
+  ]);
+});
+
+test("codex model 'gpt-6-astra-aeon' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-6-astra-aeon", mode: "auto" });
+  expect(cmd).toEqual([
+    "codex", "exec",
+    "--model", "gpt-6-astra-aeon",
+    "-c", "model_reasoning_effort=high",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
     "-",
   ]);
 });
@@ -625,6 +649,33 @@ test("codex effort 'high' adds -c model_reasoning_effort=high", () => {
   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, effort: "high", mode: "auto" });
   expect(cmd).toContain("-c");
   expect(cmd[cmd.indexOf("-c") + 1]).toBe("model_reasoning_effort=high");
+});
+
+test("codex effort 'ultra' passes through verbatim on gpt-6-astra (-c model_reasoning_effort=ultra)", () => {
+  // buildCommand never filters efforts against MODEL_EFFORT_SUPPORT — that
+  // gate lives at the picker layer (supportedEfforts), not the CLI-argv
+  // layer, so any effort id the caller passes rides straight through.
+  const { cmd } = buildCommand(builtin("codex"), "hi", {
+    ...codexDefaults,
+    model: "gpt-6-astra",
+    effort: "ultra",
+    mode: "auto",
+  });
+  expect(cmd).toContain("-c");
+  expect(cmd[cmd.indexOf("-c") + 1]).toBe("model_reasoning_effort=ultra");
+});
+
+test("codex effort 'none' passes through verbatim on gpt-5.6-sol (-c model_reasoning_effort=none)", () => {
+  // Pins that the CLI path never filters efforts: "none" is curated for Sol
+  // today, but this contract holds regardless of the curated table's shape.
+  const { cmd } = buildCommand(builtin("codex"), "hi", {
+    ...codexDefaults,
+    model: "gpt-5.6-sol",
+    effort: "none",
+    mode: "auto",
+  });
+  expect(cmd).toContain("-c");
+  expect(cmd[cmd.indexOf("-c") + 1]).toBe("model_reasoning_effort=none");
 });
 
 test("codex throws when model is missing", () => {

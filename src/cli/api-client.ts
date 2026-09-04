@@ -261,8 +261,11 @@ export class AgetorClient {
   /** Kind-level discovered model catalog (fx's row is the built-in fx
    *  harness's list). The server's actual shape has always been
    *  `{id, label?}[]` per kind — the prior `string[]` annotation here was
-   *  wrong, just never exercised since callers only ever read `.id`. */
-  agentModels(): Promise<Record<string, { id: string; label?: string }[]>> {
+   *  wrong, just never exercised since callers only ever read `.id`.
+   *  `efforts` (bare effort ids the CLI reported; codex only today) is
+   *  present only when the daemon's discovery probe reported a non-empty
+   *  list for that model — feed it to `discoveredEffortsFor`. */
+  agentModels(): Promise<Record<string, { id: string; label?: string; efforts?: string[] }[]>> {
     return this.req("GET", "/agent-models");
   }
   /** Per-harness discovered model catalog — a key per *enabled* harness
@@ -273,7 +276,7 @@ export class AgetorClient {
    *  landed this route yet. */
   harnessModels(): Promise<{
     ready: boolean;
-    byHarness: Record<string, { id: string; label?: string }[]>;
+    byHarness: Record<string, { id: string; label?: string; efforts?: string[] }[]>;
   }> {
     return this.req("GET", "/agent-models/harnesses");
   }
@@ -284,7 +287,7 @@ export class AgetorClient {
    *  harness (e.g. `fx-2`) is NOT reflected in this response (the kind map
    *  only ever carries the built-in fx harness's list). Callers that need
    *  the per-harness view must call `harnessModels()` afterwards. */
-  refreshAgentModels(harnessId?: string): Promise<Record<string, { id: string; label?: string }[]>> {
+  refreshAgentModels(harnessId?: string): Promise<Record<string, { id: string; label?: string; efforts?: string[] }[]>> {
     const qs = harnessId ? `?harness=${encodeURIComponent(harnessId)}` : "";
     return this.req("POST", `/agent-models${qs}`);
   }
