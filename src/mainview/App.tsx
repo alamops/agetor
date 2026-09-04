@@ -640,12 +640,17 @@ function AppInner() {
   // Cmd/Ctrl+F while no task details panel is open focuses the board's
   // free-text search box and selects its contents so typing replaces the
   // query. Ownership of the chord is complementary with RunPanel's own
-  // Cmd/Ctrl+F handler (RunPanel.tsx, the message-search shortcut): that
-  // one is attached only while the panel's `open` state is true, and `open`
-  // flips false in the same commit that sets `selected` to null, so exactly
-  // one of the two listeners is live at any time (bar the one-frame rAF gap
-  // on panel open, which is pre-existing and harmless). The gate reads
-  // `selectedIdRef` — kept current by the effect above — rather than
+  // Cmd/Ctrl+F handler (RunPanel.tsx, the message-search shortcut), but not
+  // perfectly interlocked: on close, RunPanel's listener outlives this
+  // gate by at least one scheduler task, because its `setOpen(false)` is
+  // scheduled from a passive effect rather than applied synchronously —
+  // `selectedIdRef` below can already be null while that listener is still
+  // attached and its `open` state hasn't caught up. RunPanel additionally
+  // checks a synchronously-written `openRef` inside its handler and stays
+  // inert for that window, so this board listener is the only one that
+  // acts on a chord landing there. On open there's a one-frame rAF gap
+  // where neither fires, which is pre-existing and harmless. The gate
+  // reads `selectedIdRef` — kept current by the effect above — rather than
   // `selected`, so this listener is attached once instead of being torn
   // down and re-added on every kanban poll. Same higher-priority-layer
   // guard as RunPanel (modal dialog / non-escape-only popover), bailing

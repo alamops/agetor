@@ -131,6 +131,15 @@ export function KanbanFilters({
             // (see the comment block in RunPanel.tsx ~line 381-392), and
             // `ui/dialog.tsx` already honors `defaultPrevented`.
             if (e.key !== "Escape") return;
+            // A dismissable layer above the board — any dialog (modal or
+            // not, e.g. the usage popover, which carries no marker at all),
+            // an open popover, or the floating quote pill — owns this
+            // Escape first: the box yields WITHOUT `preventDefault` so that
+            // layer's own listener closes it, and the NEXT Escape blurs the
+            // box. Without this bail, a chord that focused the box while
+            // such a layer was open would blur the box AND close the layer
+            // on one keypress.
+            if (document.querySelector('[role="dialog"], [data-popover-open], [data-quote-open]')) return;
             e.preventDefault();
             e.currentTarget.blur();
           }}

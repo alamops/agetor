@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { gotoApp, openSettingsGeneral } from "./helpers";
+import { gotoApp, openSettingsGeneral, seedHarnessUsage } from "./helpers";
+import type { HarnessQuota } from "../src/shared/types.ts";
 
 /**
  * E2E coverage for the Cmd/Ctrl+F board-search-focus feature
@@ -46,6 +47,30 @@ import { gotoApp, openSettingsGeneral } from "./helpers";
  */
 
 test.describe.configure({ mode: "serial" });
+
+const NOW = Date.now();
+const HOUR_MS = 60 * 60_000;
+const DAY_MS = 24 * HOUR_MS;
+
+/** A seeded `claude-code` usage snapshot — copied from `claudeCodeQuota()`
+ *  in `e2e/usage-tracker.spec.ts` (~lines 40-60), which this test reuses
+ *  only to get a real `UsagePopover` on screen; the meter values themselves
+ *  are irrelevant here. */
+function claudeCodeQuota(): HarnessQuota {
+  return {
+    harnessId: "claude-code",
+    kind: "claude-code",
+    planType: "max",
+    status: "ok",
+    source: "cache",
+    fetchedAtMs: NOW,
+    meters: [
+      { id: "five_hour", label: "Session (5h)", usedPercent: 42, resetsAtMs: NOW + 3 * HOUR_MS },
+      { id: "seven_day", label: "Weekly", usedPercent: 95, resetsAtMs: NOW + 2 * DAY_MS },
+    ],
+    reason: null,
+  };
+}
 
 interface TaskRow {
   id: string;
@@ -243,5 +268,42 @@ test.describe("board search: Cmd/Ctrl+F focus", () => {
 
     await expect(box).not.toBeFocused();
     await expect(box).toHaveValue("keep me");
+  });
+
+  test("(f) Escape with the usage popover open closes only the popover; the next Escape blurs the box", async ({
+    page,
+    backend,
+  }) => {
+    // `UsagePopover` renders `role="dialog"` WITHOUT `aria-modal` and
+    // WITHOUT `data-popover-open`, so it isn't in
+    // `FIND_SHORTCUT_BLOCKING_LAYERS` — the chord still reaches the board
+    // box while it's open. It IS matched by `KanbanFilters`'s broader
+    // `[role="dialog"], [data-popover-open], [data-quote-open]` Escape
+    // guard, so the box must yield the first Escape to it and only blur on
+    // the second.
+    seedHarnessUsage(backend, claudeCodeQuota());
+    await gotoApp(page, backend.bootBase);
+
+    const chip = page.getByRole("banner").getByRole("button", { name: "Claude Code", exact: true });
+    await chip.click();
+    const popover = page.getByRole("dialog", { name: "Claude Code usage" });
+    await expect(popover).toBeVisible();
+
+    const box = boardSearchBox(page);
+    await box.fill("keep me too");
+
+    const mod = await shortcutModifier(page);
+    await pressFindChord(page, mod);
+
+    await expect(box).toBeFocused();
+    await expect(popover).toBeVisible();
+
+    await page.keyboard.press("Escape");
+    await expect(popover).toBeHidden();
+    await expect(box).toBeFocused();
+
+    await page.keyboard.press("Escape");
+    await expect(box).not.toBeFocused();
+    await expect(box).toHaveValue("keep me too");
   });
 });
