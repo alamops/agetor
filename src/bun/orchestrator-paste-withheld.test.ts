@@ -86,7 +86,7 @@ test("withheld folded follow-up: re-stashed to backlog with a status breadcrumb,
 
   const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
   const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(10);
-  const prevCapture = claudeTmux.__forTest.setCapturePastePane(() => BLOCKING_PANE);
+  const prevCapture = claudeTmux.__forTest.setCapturePastePane(async () => BLOCKING_PANE);
 
   try {
     // TIMING INVARIANT (mirrors orchestrator.test.ts): no await between
@@ -182,7 +182,7 @@ test("withheld idle send: the fresh run ends failed, the task returns to ready, 
   claudeTmux.__forTest.installSession(taskId, freshJsonl());
   const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
   const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(10);
-  const prevCapture = claudeTmux.__forTest.setCapturePastePane(() => BLOCKING_PANE);
+  const prevCapture = claudeTmux.__forTest.setCapturePastePane(async () => BLOCKING_PANE);
 
   try {
     const sent = await sendInput(r1, "are you there");
@@ -263,8 +263,8 @@ test("reconcileTaskSession: a withheld /model mirror leaves a '\u26a0\ufe0f mode
 
   const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
   const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(10);
-  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(() => BLOCKING_PANE);
-  const prevConfirmPane = claudeTmux.__forTest.setCaptureConfirmPane(() => BLOCKING_PANE);
+  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(async () => BLOCKING_PANE);
+  const prevConfirmPane = claudeTmux.__forTest.setCaptureConfirmPane(async () => BLOCKING_PANE);
 
   try {
     const before = tasks.get(taskId)!;
@@ -333,7 +333,7 @@ test("reconcileTaskSession: a withheld /plan mirror leaves a '\u26a0\ufe0f plan 
 
   const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
   const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(10);
-  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(() => BLOCKING_PANE);
+  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(async () => BLOCKING_PANE);
 
   try {
     const before = tasks.get(taskId)!;
@@ -530,13 +530,13 @@ test("sendSlashCommand({autoConfirm}): a confirm that only renders after two sti
   __forTest.installSession(taskId, freshJsonl());
 
   let confirmCalls = 0;
-  const prevConfirmPane = __forTest.setCaptureConfirmPane(() => {
+  const prevConfirmPane = __forTest.setCaptureConfirmPane(async () => {
     confirmCalls++;
     return confirmCalls <= 2 ? STILL_WORKING_PANE : EFFORT_CONFIRM_PANE;
   });
   // Keep the paste's OWN modal guard from ever seeing a blocking pane — this
   // test is about the auto-confirm poll, not the paste guard.
-  const prevPastePane = __forTest.setCapturePastePane(() => "");
+  const prevPastePane = __forTest.setCapturePastePane(async () => "");
 
   const match = __forTest.matchSlashConfirmModal(EFFORT_CONFIRM_PANE, "effort");
   expect(match).not.toBeNull();
@@ -552,7 +552,7 @@ test("sendSlashCommand({autoConfirm}): a confirm that only renders after two sti
   expect(listPendingForTask(taskId)).toHaveLength(1);
 
   try {
-    const ok = sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
+    const ok = await sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
     expect(ok).toBe(true);
 
     await __forTest.pasteChains.get(taskId);
@@ -578,70 +578,95 @@ test("sendSlashCommand({autoConfirm}): a confirm that only renders after two sti
  * enough headroom, per its own doc comment in orchestrator.ts) race must not
  * delay an ordinary (non-withheld) send — it should settle off the paste's
  * real, fast outcome.
+ *
+ * RESTRUCTURED for the async tmux conversion (docs/plans/
+ * fix-task-details-load-delay.md T1/T5): this test's "fold, not a fresh
+ * spawn" proof (`sent.runId === r1`) depends on R1 still being in the
+ * orchestrator's in-memory `active` set at the moment `sendInput` checks it —
+ * true only while R1's fake turn hasn't resolved yet. Under the OLD sync
+ * `tmux()`, `sessionLiveness`'s `has-session` probe blocked the event loop,
+ * so the fake driver's own 20ms completion `setTimeout` could never fire
+ * mid-probe; the "no await between startTask and sendInput" comment that used
+ * to live here was sufficient on that guarantee alone. `sessionLiveness` (called from
+ * `sendClaudeTurn` before the fold check) is now a genuine `await Bun.spawn`,
+ * which yields the event loop — so a slow `AGETOR_TMUX_BIN` stub can now lose
+ * the race against that 20ms timer where it never could before. This file's
+ * `withRecordingTmuxBin` helper writes a FRESH `#!bun` script per call, and a
+ * freshly-written executable pays a one-time macOS exec/Gatekeeper penalty on
+ * first spawn (measured 130–350ms here) — nowhere near production's
+ * already-cached real `tmux` binary, and enough alone to blow the fake's 20ms
+ * budget across the several sequential tmux calls a fold does (liveness probe
+ * + load-buffer/paste-buffer/send-keys). Using the file-scope `/bin/echo`
+ * (already resident, no cold-start tax — much closer to a real installed
+ * `tmux` binary's spawn cost) keeps the whole fold well under that budget, so
+ * this test no longer needs a recording stub to prove the same guarantee: a
+ * `delivered:true` + `runId === r1` result is only reachable through
+ * `sendTurnInExistingSession`'s `pasteFollowUp` → `resolveClaudeTurnOutcome`
+ * path, which itself only reports `delivered:true` once `pasteOutcome.ok` —
+ * i.e. the real tmux paste calls already succeeded — so that pairing already
+ * proves "a real tmux paste landed" without a separate call log. What's
+ * dropped is only the redundant cross-check against recorded call
+ * timestamps; the "not the 15s race" guarantee stays intact via `elapsed`.
  * ────────────────────────────────────────────────────────────────────────── */
 
 test("non-withheld send: delivered:true resolves promptly, driven by the paste's real outcome, not the 15s race timeout", async () => {
-  await withRecordingTmuxBin(async (logPath) => {
-    const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
-    const { db, tasks } = await import("./db.ts");
-    const claudeTmux = await import("./claude-tmux.ts");
+  const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
+  const { db, tasks } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
 
-    const created = await createTask({
-      title: "non-withheld-fold",
-      prompt: "first message",
-      agent: "claude-code",
-      workdir: process.cwd(),
-      isolation: "none",
-      model: "sonnet-5",
-      effort: "high",
-    });
-    if ("error" in created) throw new Error(created.error);
-    const taskId = created.task.id;
-
-    const res = await startTask(taskId);
-    expect("runId" in res).toBe(true);
-    if (!("runId" in res)) return;
-    const r1 = res.runId;
-
-    // Install a REAL session so this takes the fold-capable path, same as
-    // test 1 above — but the pane is a plain idle composer this time, so the
-    // modal guard never engages and the paste lands immediately.
-    claudeTmux.__forTest.installSession(taskId, freshJsonl());
-    const prevCapture = claudeTmux.__forTest.setCapturePastePane(() => "");
-
-    try {
-      // TIMING INVARIANT (mirrors test 1): no await between `startTask`
-      // above and this call — R1 must still be in `active` when `sendInput`
-      // reads it, so this folds instead of spawning a new turn.
-      const start = Date.now();
-      const sent = await sendInput(r1, "hello again");
-      const afterSend = Date.now();
-      const elapsed = afterSend - start;
-
-      if (!sent.delivered) throw new Error(`expected delivered:true, got ${JSON.stringify(sent)}`);
-      expect(sent.runId).toBe(r1);
-
-      // The 15s race (`PASTE_OUTCOME_TIMEOUT_MS`) must not be what resolved
-      // this — a real, non-withheld paste lands almost immediately. The
-      // fake tmux bin spawns a real subprocess per tmux call (load-buffer /
-      // paste-buffer / delete-buffer / send-keys), so the bound here is
-      // generous for a loaded machine while still catching a regression that
-      // waits out anywhere near the full 15s race.
-      expect(elapsed).toBeLessThan(3000);
-
-      // Cross-check against the recorded paste's own landing time: `sendInput`
-      // should have resolved shortly after the paste's last real tmux call,
-      // not after padding out most of a 15s wait.
-      const log = readTmuxLog(logPath);
-      expect(log.length).toBeGreaterThan(0);
-      const lastCallMs = Math.max(...log.map((e) => e.ms));
-      expect(afterSend - lastCallMs).toBeLessThan(2000);
-    } finally {
-      claudeTmux.__forTest.setCapturePastePane(prevCapture);
-      claudeTmux.__forTest.uninstallSession(taskId);
-      db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
-    }
+  const created = await createTask({
+    title: "non-withheld-fold",
+    prompt: "first message",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
   });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const res = await startTask(taskId);
+  expect("runId" in res).toBe(true);
+  if (!("runId" in res)) return;
+  const r1 = res.runId;
+
+  // Install a REAL session so this takes the fold-capable path, same as
+  // test 1 above — but the pane is a plain idle composer this time, so the
+  // modal guard never engages and the paste lands immediately. Deliberately
+  // NOT wrapped in `withRecordingTmuxBin` — see the restructuring note above.
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+  const prevCapture = claudeTmux.__forTest.setCapturePastePane(async () => "");
+
+  try {
+    // TIMING INVARIANT (mirrors test 1): no await between `startTask` above
+    // and this call — R1 must still be in `active` when `sendInput` reads
+    // it, so this folds instead of spawning a new turn. Holds here because
+    // every tmux call the fold makes (liveness probe + load-buffer/
+    // paste-buffer/send-keys) goes through the already-resident `/bin/echo`,
+    // comfortably faster than the fake driver's 20ms completion timer.
+    const start = Date.now();
+    const sent = await sendInput(r1, "hello again");
+    const elapsed = Date.now() - start;
+
+    if (!sent.delivered) throw new Error(`expected delivered:true, got ${JSON.stringify(sent)}`);
+    // Only reachable via the fold path (`sendTurnInExistingSession` →
+    // `pasteFollowUp` → `resolveClaudeTurnOutcome`) — which is itself proof
+    // the real tmux paste calls landed (see restructuring note above), so no
+    // separate recorded-call cross-check is needed.
+    expect(sent.runId).toBe(r1);
+
+    // The 15s race (`PASTE_OUTCOME_TIMEOUT_MS`) must not be what resolved
+    // this — a real, non-withheld paste lands almost immediately. The bound
+    // here is generous (~30x the typical ~90-100ms observed against
+    // `/bin/echo`) for a loaded machine while still catching a regression
+    // that waits out anywhere near the full 15s race.
+    expect(elapsed).toBeLessThan(3000);
+  } finally {
+    claudeTmux.__forTest.setCapturePastePane(prevCapture);
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
 }, 10_000);
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -694,9 +719,9 @@ test("reconcileTaskSession: a full /model picker mirror walks the cursor, confir
   claudeTmux.__forTest.installSession(taskId, freshJsonl());
 
   const prevSettle = claudeTmux.__forTest.setSlashCommandSettleMs(0);
-  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(() => ""); // idle — guard passes
+  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(async () => ""); // idle — guard passes
   let confirmPaneCalls = 0;
-  const prevConfirmPane = claudeTmux.__forTest.setCaptureConfirmPane(() => {
+  const prevConfirmPane = claudeTmux.__forTest.setCaptureConfirmPane(async () => {
     confirmPaneCalls++;
     // `mirrorModelViaPicker`'s picker-detection poll registers on its very
     // FIRST sighting (no stability-gate, unlike the scraper's own matcher
@@ -844,9 +869,9 @@ test("reconcileTaskSession: model mirror poll timeout when the picker never rend
   });
 
   const prevSettle = claudeTmux.__forTest.setSlashCommandSettleMs(0);
-  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(() => "");
+  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(async () => "");
   // Idle throughout — the picker never renders on the pane at all.
-  const prevConfirmPane = claudeTmux.__forTest.setCaptureConfirmPane(() => "");
+  const prevConfirmPane = claudeTmux.__forTest.setCaptureConfirmPane(async () => "");
 
   try {
     const before = tasks.get(taskId)!;
@@ -919,8 +944,8 @@ test("reconcileTaskSession: model mirror closes the picker with Escape when the 
   });
 
   const prevSettle = claudeTmux.__forTest.setSlashCommandSettleMs(0);
-  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(() => "");
-  const prevConfirmPane = claudeTmux.__forTest.setCaptureConfirmPane(() => MODEL_PICKER_PANE_NO_FABLE);
+  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(async () => "");
+  const prevConfirmPane = claudeTmux.__forTest.setCaptureConfirmPane(async () => MODEL_PICKER_PANE_NO_FABLE);
 
   try {
     await withRecordingTmuxBin(async (logPath) => {
@@ -1111,7 +1136,7 @@ test("reconcileTaskSession: a model change with NO in-memory session state (even
 
   // Deliberately NO claudeTmux.__forTest.installSession call.
   expect(claudeTmux.hasSessionState(taskId)).toBe(false);
-  expect(claudeTmux.sessionExists(taskId)).toBe(true);
+  expect(await claudeTmux.sessionExists(taskId)).toBe(true);
 
   const runId = randomUUID();
   runs.insert({
@@ -1183,7 +1208,7 @@ test("withheld send: whole-backlog dedupe — a withheld message whose matching 
   claudeTmux.__forTest.installSession(taskId, freshJsonl());
   const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
   const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(10);
-  const prevCapture = claudeTmux.__forTest.setCapturePastePane(() => BLOCKING_PANE);
+  const prevCapture = claudeTmux.__forTest.setCapturePastePane(async () => BLOCKING_PANE);
 
   try {
     const sent = await sendInput(r1, "are you there");
@@ -1250,7 +1275,7 @@ test("POST /ask-questions/:id/answer: a custom free-text answer while a blocking
   claudeTmux.__forTest.installSession(taskId, freshJsonl());
   const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
   const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(10);
-  const prevCapture = claudeTmux.__forTest.setCapturePastePane(() => BLOCKING_PANE);
+  const prevCapture = claudeTmux.__forTest.setCapturePastePane(async () => BLOCKING_PANE);
 
   const specs = [{ question: "Which approach?", multiSelect: false, options: ["A", "B"] }];
   const expectedText = formatAnswersMessage(specs, [{ selected: [], custom: "my own answer" }]);

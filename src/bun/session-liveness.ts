@@ -58,20 +58,30 @@ export function pidAlive(pid: number): boolean {
 export interface DeathProbeOptions {
   sessionName: string;
   /** The real tmux probe (`sessionLiveness`). Called only when the fast path
-   *  can't vouch for the session, or when re-validation is due. */
-  authoritative: (sessionName: string) => SessionLiveness;
+   *  can't vouch for the session, or when re-validation is due. Async since
+   *  docs/plans/fix-task-details-load-delay.md (claude-tmux.ts's `tmux()`
+   *  choke point moved off `Bun.spawnSync`) — a plain sync return still works
+   *  (every caller `await`s the result either way). */
+  authoritative: (sessionName: string) => SessionLiveness | Promise<SessionLiveness>;
   /** Maps a session name to its pane's pid (`panePidFor`); `null` when it
-   *  can't. Called at most once per `authoritativeEveryMs`. */
-  resolvePid: (sessionName: string) => number | null;
-  /** Injectable for tests; defaults to the real `kill(pid, 0)`. */
+   *  can't. Called at most once per `authoritativeEveryMs`. Async for the same
+   *  reason as `authoritative`. */
+  resolvePid: (sessionName: string) => number | null | Promise<number | null>;
+  /** Injectable for tests; defaults to the real `kill(pid, 0)`. Deliberately
+   *  stays synchronous — it's a bare `kill(pid, 0)` syscall, not a subprocess,
+   *  and is the whole point of the fast path this module exists to provide. */
   pidAlive?: (pid: number) => boolean;
   authoritativeEveryMs?: number;
   now?: () => number;
 }
 
 export interface DeathProbe {
-  /** One death-watch tick's liveness verdict — drop-in for `sessionLiveness`. */
-  probe(): SessionLiveness;
+  /** One death-watch tick's liveness verdict — drop-in for `sessionLiveness`.
+   *  Async because the slow path awaits `authoritative`/`resolvePid`, which
+   *  (as of the sync→async tmux conversion) fork a real `tmux` client; the
+   *  fast `kill(pid, 0)` path still returns effectively immediately, just
+   *  wrapped in the same Promise so callers don't need to branch. */
+  probe(): Promise<SessionLiveness>;
   /** The pane pid currently trusted for the fast path, or null. Diagnostic /
    *  test surface only. */
   pid(): number | null;
@@ -86,14 +96,14 @@ export function createDeathProbe(opts: DeathProbeOptions): DeathProbe {
   let lastResolveAt = -Infinity;
   return {
     pid: () => pid,
-    probe(): SessionLiveness {
+    async probe(): Promise<SessionLiveness> {
       const t = now();
       const due = t - lastAuthoritativeAt >= every;
       // Fast path: a known pid that still answers, inside the validation
       // window. No fork, no tmux round-trip.
       if (pid !== null && !due && isAlive(pid)) return "alive";
       // Slow path: the pid is unknown, has vanished, or re-validation is due.
-      const liveness = opts.authoritative(opts.sessionName);
+      const liveness = await opts.authoritative(opts.sessionName);
       lastAuthoritativeAt = t;
       if (liveness === "gone") {
         // Whatever pid we held is stale (dead, or recycled by an unrelated
@@ -106,7 +116,7 @@ export function createDeathProbe(opts: DeathProbeOptions): DeathProbe {
         // pane pid, throttled so an unparseable `list-panes` can't turn every
         // tick into two forks.
         lastResolveAt = t;
-        pid = opts.resolvePid(opts.sessionName);
+        pid = await opts.resolvePid(opts.sessionName);
       }
       // `unreachable` keeps whatever pid we had: a busy tmux server says
       // nothing about the pane process, and the next tick's `kill(pid, 0)`

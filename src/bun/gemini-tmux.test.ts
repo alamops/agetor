@@ -196,7 +196,7 @@ function readArgvLog(logPath: string): Array<{ argv: string[] }> {
   return readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
 }
 
-test("spawnGeminiViaTmux's new-session argv pins -x 200 -y 50 and forwards GEMINI_CLI_HOME via -e", () => {
+test("spawnGeminiViaTmux's new-session argv pins -x 200 -y 50 and forwards GEMINI_CLI_HOME via -e", async () => {
   const { bin, logPath } = fakeFailingTmuxBin();
   const prevBin = process.env.AGETOR_TMUX_BIN;
   process.env.AGETOR_TMUX_BIN = bin;
@@ -204,7 +204,7 @@ test("spawnGeminiViaTmux's new-session argv pins -x 200 -y 50 and forwards GEMIN
     const { chunks, onChunk } = collect();
     const taskId = `task-geminisize-${randomUUID()}`;
     const runId = `run-geminisize-${randomUUID()}`;
-    spawnGeminiViaTmux({
+    await spawnGeminiViaTmux({
       taskId,
       runId,
       argv: ["gemini", "-m", "gemini-3.1-pro-preview", "--output-format", "stream-json", "--yolo", "--skip-trust", "-p", "hello"],

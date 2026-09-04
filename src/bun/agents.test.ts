@@ -1116,10 +1116,10 @@ test("fx harness without a home override sets no HOME (env carries only FX_PERMI
   expect(result.env?.FX_PERMISSION_MODE).toBe("auto");
 });
 
-test("fx AGETOR_FX_DRIVER=fake yields a fake handle and fires onSessionId with fake-fx-session-<taskId>", () => {
+test("fx AGETOR_FX_DRIVER=fake yields a fake handle and fires onSessionId with fake-fx-session-<taskId>", async () => {
   process.env.AGETOR_FX_DRIVER = "fake";
   let sessionId: string | undefined;
-  const handle = spawnAgent({
+  const handle = await spawnAgent({
     taskId: "task-fx-1",
     runId: "run-fx-1",
     harness: builtin("fx"),
@@ -1136,9 +1136,9 @@ test("fx AGETOR_FX_DRIVER=fake yields a fake handle and fires onSessionId with f
   handle.kill();
 });
 
-test("fx AGETOR_FX_DRIVER=fake still exercises buildCommand's validation (throws on missing model)", () => {
+test("fx AGETOR_FX_DRIVER=fake still exercises buildCommand's validation (throws on missing model)", async () => {
   process.env.AGETOR_FX_DRIVER = "fake";
-  expect(() =>
+  await expect(
     spawnAgent({
       taskId: "task-fx-2",
       runId: "run-fx-2",
@@ -1148,7 +1148,7 @@ test("fx AGETOR_FX_DRIVER=fake still exercises buildCommand's validation (throws
       onChunk: () => {},
       opts: { mode: "auto" },
     }),
-  ).toThrow(/model is required for fx/);
+  ).rejects.toThrow(/model is required for fx/);
 });
 
 test("claude-code 'max' effort sets CLAUDE_CODE_EFFORT_LEVEL=max env", () => {

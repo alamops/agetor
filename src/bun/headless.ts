@@ -115,8 +115,15 @@ export async function runDaemon(): Promise<void> {
 
   // Same PATH hydration + orphan reconciliation the app does at boot, so the
   // daemon can find claude/codex/tmux and doesn't leave stale "running" cards.
+  // Awaited so `startApiServer()` below never starts serving `/tasks`/`/runs`
+  // while a `status='running'` row from a previous process is still being
+  // reattached or flipped to `orphaned` underneath it — the "reconcile
+  // before the API starts" invariant (CLAUDE.md §5), mirroring index.ts's
+  // desktop boot path. A reconcile throw propagates out of `runDaemon` and
+  // fails boot loudly, same as the old synchronous `reconcileOrphans` did —
+  // no swallow.
   rehydratePath();
-  reconcileOrphans();
+  await reconcileOrphans();
   // Same boot-sweep + periodic-refresh pair as index.ts's desktop boot path
   // (see its comment for the full rationale) — the daemon needs the same
   // model-discovery freshness the app gets, and `startPeriodicDiscovery`'s

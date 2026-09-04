@@ -1147,12 +1147,12 @@ test("sendSlashCommand({autoConfirm}): a matching confirm pane sends the auto-ac
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId } = freshSession();
     let captureCalls = 0;
-    const prevCapture = __forTest.setCaptureConfirmPane(() => {
+    const prevCapture = __forTest.setCaptureConfirmPane(async () => {
       captureCalls++;
       return effortConfirmPane;
     });
     try {
-      const ok = sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
+      const ok = await sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
       expect(ok).toBe(true);
 
       await __forTest.pasteChains.get(taskId);
@@ -1183,12 +1183,12 @@ test("sendSlashCommand({autoConfirm: 'effort'}): a 'Switch model?' confirm (wron
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId } = freshSession();
     let captureCalls = 0;
-    const prevCapture = __forTest.setCaptureConfirmPane(() => {
+    const prevCapture = __forTest.setCaptureConfirmPane(async () => {
       captureCalls++;
       return switchModelConfirmPane;
     });
     try {
-      const ok = sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
+      const ok = await sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
       expect(ok).toBe(true);
 
       await __forTest.pasteChains.get(taskId);
@@ -1214,7 +1214,7 @@ test("sendSlashCommand({autoConfirm}): two consecutive idle-input-box polls brea
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId } = freshSession();
     let captureCalls = 0;
-    const prevCapture = __forTest.setCaptureConfirmPane(() => {
+    const prevCapture = __forTest.setCaptureConfirmPane(async () => {
       captureCalls++;
       return idlePane;
     });
@@ -1227,10 +1227,10 @@ test("sendSlashCommand({autoConfirm}): two consecutive idle-input-box polls brea
     // guard's OWN seam removes that spawn entirely without touching what
     // this test actually exercises (the confirm-poll's early exit, driven
     // via the separate `captureConfirmPane` seam above).
-    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
+    const prevPastePane = __forTest.setCapturePastePane(async () => idlePane);
     try {
       const start = Date.now();
-      const ok = sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
+      const ok = await sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
       expect(ok).toBe(true);
 
       // Let the op run to completion on its own — no manual uninstall this
@@ -1280,17 +1280,17 @@ test("sendSlashCommand({autoConfirm}): a numbered PERMISSION prompt (not a confi
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId } = freshSession();
     let captureCalls = 0;
-    const prevCapture = __forTest.setCaptureConfirmPane(() => {
+    const prevCapture = __forTest.setCaptureConfirmPane(async () => {
       captureCalls++;
       return PERMISSION_PROMPT_PANE;
     });
     // Same rationale as the idle-break test above: keep the paste's OWN
     // modal guard from adding a real tmux subprocess spawn to this test's
     // timing budget.
-    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
+    const prevPastePane = __forTest.setCapturePastePane(async () => idlePane);
     try {
       const start = Date.now();
-      const ok = sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
+      const ok = await sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
       expect(ok).toBe(true);
 
       await __forTest.pasteChains.get(taskId);
@@ -1328,12 +1328,12 @@ test("sendSlashCommand without opts: no auto-confirm step runs at all (no Enter 
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId } = freshSession();
     let captureCalls = 0;
-    const prevCapture = __forTest.setCaptureConfirmPane(() => {
+    const prevCapture = __forTest.setCaptureConfirmPane(async () => {
       captureCalls++;
       return effortConfirmPane; // would match if the poll ever ran
     });
     try {
-      const ok = sendSlashCommand(taskId, "/effort low");
+      const ok = await sendSlashCommand(taskId, "/effort low");
       expect(ok).toBe(true);
 
       await __forTest.pasteChains.get(taskId);
@@ -1365,15 +1365,15 @@ test("sendSlashCommand({autoConfirm}): a blocked pane withholds the mirror paste
     const prevGrace = __forTest.setPasteModalGraceMs(20);
     const prevPoll = __forTest.setPasteModalPollMs(5);
     const { taskId } = freshSession();
-    const prevPastePane = __forTest.setCapturePastePane(() => PICKER_PANE);
+    const prevPastePane = __forTest.setCapturePastePane(async () => PICKER_PANE);
     let confirmCalls = 0;
-    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => {
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(async () => {
       confirmCalls++;
       return PICKER_PANE;
     });
     const failures: PasteFailureOutcome[] = [];
     try {
-      const ok = sendSlashCommand(taskId, "/model claude-opus-5", {
+      const ok = await sendSlashCommand(taskId, "/model claude-opus-5", {
         autoConfirm: "model",
         onPasteFailure: (outcome) => failures.push(outcome),
       });
@@ -1440,13 +1440,13 @@ test("mirrorModelViaPicker: cursor on Sonnet ✔ (index 3), target Opus — walk
   await withRecordingTmuxBin(async (logPath) => {
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId } = freshSession();
-    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
+    const prevPastePane = __forTest.setCapturePastePane(async () => idlePane);
     // Same seam drives both the picker-detection poll AND the subsequent
     // autoConfirmSlashModal poll (both read captureConfirmPane) — key off
     // whether the session-only confirm key ("s") has actually been sent yet,
     // rather than a manual call counter, so this reflects the real state
     // transition mirrorModelViaPicker drives.
-    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => {
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(async () => {
       const sSent = readTmuxLog(logPath).some(
         (e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "s",
       );
@@ -1500,8 +1500,8 @@ test("mirrorModelViaPicker: target family not offered by the picker — sends Es
   await withRecordingTmuxBin(async (logPath) => {
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId } = freshSession();
-    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
-    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => PICKER_246_NO_FABLE_PANE);
+    const prevPastePane = __forTest.setCapturePastePane(async () => idlePane);
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(async () => PICKER_246_NO_FABLE_PANE);
 
     const pickerMatch = matchNumberedModal(PICKER_246_NO_FABLE_PANE)!;
     const { answer } = registerTmuxPrompt({
@@ -1540,8 +1540,8 @@ test("mirrorModelViaPicker: idle pane throughout — the poll window elapses wit
   await withRecordingTmuxBin(async (logPath) => {
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId } = freshSession();
-    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
-    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => idlePane);
+    const prevPastePane = __forTest.setCapturePastePane(async () => idlePane);
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(async () => idlePane);
     try {
       const result = await mirrorModelViaPicker(taskId, "Opus");
       expect(result).toEqual({ ok: false, reason: "picker not shown" });
@@ -1568,7 +1568,7 @@ test("mirrorModelViaPicker: a live modal blocks the opening /model paste — ret
     const prevGrace = __forTest.setPasteModalGraceMs(20);
     const prevPoll = __forTest.setPasteModalPollMs(5);
     const { taskId } = freshSession();
-    const prevPastePane = __forTest.setCapturePastePane(() => PICKER_PANE);
+    const prevPastePane = __forTest.setCapturePastePane(async () => PICKER_PANE);
     const failures: PasteFailureOutcome[] = [];
     try {
       const result = await mirrorModelViaPicker(taskId, "Opus", {
@@ -1619,7 +1619,7 @@ test("mirrorModelViaPicker: idle turnQueue but the pane shows claude working (ba
   // catches working chrome even with no turn slot at all.
   await withRecordingTmuxBin(async (logPath) => {
     const { taskId } = freshSession();
-    const prevPastePane = __forTest.setCapturePastePane(() => COMPOSER_WORKING_NONBARE_PANE);
+    const prevPastePane = __forTest.setCapturePastePane(async () => COMPOSER_WORKING_NONBARE_PANE);
     try {
       const result = await mirrorModelViaPicker(taskId, "Opus");
       expect(result).toEqual({ ok: false, reason: "turn in flight" });
@@ -1643,9 +1643,9 @@ test("mirrorModelViaPicker: state.drivingPrompt is true for every confirm-pane p
   await withRecordingTmuxBin(async (logPath) => {
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId, state } = freshSession();
-    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
+    const prevPastePane = __forTest.setCapturePastePane(async () => idlePane);
     const drivingSightings: boolean[] = [];
-    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => {
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(async () => {
       drivingSightings.push(state.drivingPrompt);
       const sSent = readTmuxLog(logPath).some(
         (e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "s",
@@ -1719,8 +1719,8 @@ test("mirrorModelViaPicker: target not offered AND the closing Escape's send-key
   await withFailingSingleEscapeTmuxBin(async (logPath) => {
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId } = freshSession();
-    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
-    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => PICKER_246_NO_FABLE_PANE);
+    const prevPastePane = __forTest.setCapturePastePane(async () => idlePane);
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(async () => PICKER_246_NO_FABLE_PANE);
 
     const pickerMatch = matchNumberedModal(PICKER_246_NO_FABLE_PANE)!;
     registerTmuxPrompt({
@@ -1770,8 +1770,8 @@ test("mirrorModelViaPicker success stamps SessionState.lastModelMirrorAt, and a 
   await withRecordingTmuxBin(async (logPath) => {
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId, state } = freshSession();
-    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
-    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => {
+    const prevPastePane = __forTest.setCapturePastePane(async () => idlePane);
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(async () => {
       const sSent = readTmuxLog(logPath).some(
         (e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "s",
       );
@@ -1830,8 +1830,8 @@ test("mirrorModelViaPicker 'target not offered' (Escape) never stamps lastModelM
   await withRecordingTmuxBin(async (logPath) => {
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId, state } = freshSession();
-    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
-    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => PICKER_246_NO_FABLE_PANE);
+    const prevPastePane = __forTest.setCapturePastePane(async () => idlePane);
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(async () => PICKER_246_NO_FABLE_PANE);
 
     const pickerMatch = matchNumberedModal(PICKER_246_NO_FABLE_PANE)!;
     const { answer } = registerTmuxPrompt({
@@ -1901,11 +1901,15 @@ test("sendTurn: bumpKeystroke fires at ENQUEUE time — state.lastKeystrokeAt is
   // eventually runs — this test only cares about the ENQUEUE-time bump,
   // which (per queuePaste's doc) happens before the op ever reaches
   // queueTmuxOp, so what the op itself does afterward is irrelevant here.
-  const prevPastePane = __forTest.setCapturePastePane(() => PICKER_PANE);
+  const prevPastePane = __forTest.setCapturePastePane(async () => PICKER_PANE);
   try {
     const before = state.lastKeystrokeAt;
     await new Promise((r) => setTimeout(r, 5)); // let Date.now() tick forward
-    const agent = sendTurn(taskId, "hello", () => {});
+    // Deliberately NOT awaited here — `sendTurn` is `async` now (the tmux()
+    // choke point moved off Bun.spawnSync), but its own body has no internal
+    // `await` before it returns, so calling it without awaiting still runs
+    // it inline, synchronously, in this exact tick.
+    const agentPromise = sendTurn(taskId, "hello", () => {});
     // Read synchronously, before awaiting anything: sendTurn's own
     // `void queuePaste(...)` call runs queuePaste's body inline up to (and
     // past) its enqueue-time `bumpKeystroke` before sendTurn ever returns —
@@ -1915,7 +1919,7 @@ test("sendTurn: bumpKeystroke fires at ENQUEUE time — state.lastKeystrokeAt is
 
     // Swallow the expected rejection (withheld paste) and let the guard's
     // grace window elapse so nothing leaks into a later test.
-    agent.done.catch(() => {});
+    agentPromise.then((agent) => agent.done.catch(() => {}));
     await __forTest.pasteChains.get(taskId);
   } finally {
     __forTest.setCapturePastePane(prevPastePane);
@@ -1930,16 +1934,22 @@ test("PASTE_DROPPED_OUTCOME: a session torn down before the queued paste ever ru
   // file owns the broader queue/dropped-op contract) — pinned here too since
   // this task's boundary is this file specifically.
   const { taskId } = freshSession();
-  const agent = sendTurn(taskId, "hello", () => {});
+  // Deliberately NOT awaited — see the sibling `lastKeystrokeAt` test above
+  // for why calling `sendTurn` without awaiting still registers the queued
+  // op synchronously, in this same tick, ahead of queueTmuxOp's identity
+  // check — which is exactly the race this test needs to win so the
+  // teardown below lands first.
+  const agentPromise = sendTurn(taskId, "hello", () => {});
   // Irrelevant to this test's assertion (the dropped-op outcome's stderr
   // wording) — swallow it so it doesn't surface as an unhandled rejection.
-  agent.done.catch(() => {});
+  agentPromise.then((agent) => agent.done.catch(() => {}));
   // Tear down SYNCHRONOUSLY, before the queued tmux op's microtask runs —
   // queueTmuxOp's identity gate then drops the op body entirely, so the
   // chain settles via the unconditional PASTE_DROPPED_OUTCOME backstop with
   // no tmux call (and no fake tmux bin) needed at all.
   __forTest.uninstallSession(taskId);
 
+  const agent = await agentPromise;
   const outcome = await Promise.race([
     agent.pasteOutcome!,
     new Promise<never>((_, reject) => {
@@ -1966,7 +1976,7 @@ describe("queuePaste modal guard", () => {
       const prevGrace = __forTest.setPasteModalGraceMs(20);
       const prevPoll = __forTest.setPasteModalPollMs(5);
       const { taskId, state } = freshSession();
-      const prevCapture = __forTest.setCapturePastePane(() => PICKER_PANE);
+      const prevCapture = __forTest.setCapturePastePane(async () => PICKER_PANE);
       const rec = recorder();
       const failures: PasteFailureOutcome[] = [];
       try {
@@ -2009,7 +2019,7 @@ describe("queuePaste modal guard", () => {
       const prevPoll = __forTest.setPasteModalPollMs(5);
       const { taskId, state } = freshSession();
       let calls = 0;
-      const prevCapture = __forTest.setCapturePastePane(() => {
+      const prevCapture = __forTest.setCapturePastePane(async () => {
         calls++;
         return PICKER_PANE;
       });
@@ -2053,7 +2063,7 @@ describe("queuePaste modal guard", () => {
       const prevPoll = __forTest.setPasteModalPollMs(5);
       const { taskId, state } = freshSession();
       let calls = 0;
-      const prevCapture = __forTest.setCapturePastePane(() => {
+      const prevCapture = __forTest.setCapturePastePane(async () => {
         calls++;
         return PICKER_PANE;
       });
@@ -2084,11 +2094,11 @@ describe("queuePaste modal guard", () => {
       const prevGrace = __forTest.setPasteModalGraceMs(20);
       const prevPoll = __forTest.setPasteModalPollMs(5);
       const { taskId } = freshSession();
-      const prevCapture = __forTest.setCapturePastePane(() => PICKER_PANE);
+      const prevCapture = __forTest.setCapturePastePane(async () => PICKER_PANE);
       const failures: PasteFailureOutcome[] = [];
       try {
         const rec = recorder();
-        const agent = sendTurn(taskId, "hello", rec.onChunk, {
+        const agent = await sendTurn(taskId, "hello", rec.onChunk, {
           onPasteFailure: (outcome) => failures.push(outcome),
         });
         await expect(agent.done).rejects.toThrow("paste failed");
@@ -2126,7 +2136,7 @@ describe("queuePaste modal guard", () => {
       // ever appears in the log, however many such stages there are. Once
       // the paste has demonstrably landed (`load-buffer` recorded), a picker
       // modal appearing is exactly the TOCTOU scenario this test targets.
-      const prevCapture = __forTest.setCapturePastePane(() => {
+      const prevCapture = __forTest.setCapturePastePane(async () => {
         const landed = readTmuxLog(logPath).some((e) => e.argv[0] === "load-buffer");
         return landed ? PICKER_PANE : idlePane;
       });
@@ -2134,7 +2144,7 @@ describe("queuePaste modal guard", () => {
       try {
         const rec = recorder();
         expect(state.composerHoldsText).toBe(false);
-        const agent = sendTurn(taskId, "hello", rec.onChunk, {
+        const agent = await sendTurn(taskId, "hello", rec.onChunk, {
           onPasteFailure: (outcome) => failures.push(outcome),
         });
         await expect(agent.done).rejects.toThrow("paste failed");
@@ -2182,7 +2192,7 @@ describe("queuePaste modal guard", () => {
       // that is idle again, so stillBlocking's confirming second sample
       // resolves false (not blocked) and the Enter proceeds normally.
       let postLandingCalls = 0;
-      const prevCapture = __forTest.setCapturePastePane(() => {
+      const prevCapture = __forTest.setCapturePastePane(async () => {
         const landed = readTmuxLog(logPath).some((e) => e.argv[0] === "load-buffer");
         if (!landed) return idlePane;
         postLandingCalls++;
@@ -2219,7 +2229,7 @@ describe("queuePaste modal guard", () => {
       const prevPoll = __forTest.setPasteModalPollMs(5);
       const { taskId, state } = freshSession();
       let calls = 0;
-      const prevCapture = __forTest.setCapturePastePane(() => {
+      const prevCapture = __forTest.setCapturePastePane(async () => {
         calls++;
         return calls <= 2 ? PICKER_PANE : idlePane;
       });
@@ -2248,7 +2258,7 @@ describe("queuePaste modal guard", () => {
     await withRecordingTmuxBin(async (logPath) => {
       const { taskId, state } = freshSession();
       let calls = 0;
-      const prevCapture = __forTest.setCapturePastePane(() => {
+      const prevCapture = __forTest.setCapturePastePane(async () => {
         calls++;
         return PICKER_PANE;
       });
@@ -2270,7 +2280,7 @@ describe("queuePaste modal guard", () => {
   test("no expectedState → the guard is inert even with PICKER_PANE on the pane (matches the other queuePaste tests that omit state)", async () => {
     await withRecordingTmuxBin(async (logPath) => {
       let calls = 0;
-      const prevCapture = __forTest.setCapturePastePane(() => {
+      const prevCapture = __forTest.setCapturePastePane(async () => {
         calls++;
         return PICKER_PANE;
       });
@@ -2322,7 +2332,7 @@ describe("queuePaste composer-clear check", () => {
       const { taskId, state } = freshSession();
       state.composerHoldsText = true;
       let calls = 0;
-      const prevCapture = __forTest.setCapturePastePane(() => {
+      const prevCapture = __forTest.setCapturePastePane(async () => {
         calls++;
         if (calls === 1) return idlePane; // pre-paste guard: clear
         if (calls === 2) return COMPOSER_DIRTY_PANE; // composer check: dirty
@@ -2360,7 +2370,7 @@ describe("queuePaste composer-clear check", () => {
       const prevGap = __forTest.setBracketedEnterGapMs(0);
       const { taskId, state } = freshSession();
       state.composerHoldsText = true;
-      const prevCapture = __forTest.setCapturePastePane(() => idlePane); // bare throughout
+      const prevCapture = __forTest.setCapturePastePane(async () => idlePane); // bare throughout
       try {
         await __forTest.queuePaste(taskId, state.sessionName, "hello", 0, state, { bracketed: true });
 
@@ -2385,7 +2395,7 @@ describe("queuePaste composer-clear check", () => {
       state.composerHoldsText = true;
       const rec = recorder();
       state.turnQueue.push({ onChunk: rec.onChunk, resolve: () => {}, reject: () => {}, slashCommand: null });
-      const prevCapture = __forTest.setCapturePastePane(() => COMPOSER_WORKING_NONBARE_PANE);
+      const prevCapture = __forTest.setCapturePastePane(async () => COMPOSER_WORKING_NONBARE_PANE);
       const failures: PasteFailureOutcome[] = [];
       try {
         await __forTest.queuePaste(taskId, state.sessionName, "hello", 0, state, {
@@ -2418,7 +2428,7 @@ describe("queuePaste composer-clear check", () => {
       const rec = recorder();
       state.turnQueue.push({ onChunk: rec.onChunk, resolve: () => {}, reject: () => {}, slashCommand: null });
       let calls = 0;
-      const prevCapture = __forTest.setCapturePastePane(() => {
+      const prevCapture = __forTest.setCapturePastePane(async () => {
         calls++;
         if (calls === 1) return idlePane; // pre-paste guard: clear
         return COMPOSER_DIRTY_PANE; // composer check + post-clear re-check: still dirty
@@ -2467,7 +2477,7 @@ test("every modal-guard withhold phase emits a status chunk starting with 'paste
         const { taskId, state } = freshSession();
         const rec = recorder();
         state.turnQueue.push({ onChunk: rec.onChunk, resolve: () => {}, reject: () => {}, slashCommand: null });
-        const prevCapture = __forTest.setCapturePastePane(() => PICKER_PANE);
+        const prevCapture = __forTest.setCapturePastePane(async () => PICKER_PANE);
         try {
           await __forTest.queuePaste(taskId, state.sessionName, "hello", 0, state, { bracketed: true });
         } finally {
@@ -2485,7 +2495,7 @@ test("every modal-guard withhold phase emits a status chunk starting with 'paste
         // Anchored on the tmux log (mirrors the dedicated TOCTOU test):
         // clear until the paste demonstrably lands (`load-buffer` recorded),
         // then a picker modal shows up on the TOCTOU re-check.
-        const prevCapture = __forTest.setCapturePastePane(() => {
+        const prevCapture = __forTest.setCapturePastePane(async () => {
           const landed = readTmuxLog(logPath).some((e) => e.argv[0] === "load-buffer");
           return landed ? PICKER_PANE : idlePane;
         });
@@ -2504,7 +2514,7 @@ test("every modal-guard withhold phase emits a status chunk starting with 'paste
         state.composerHoldsText = true;
         const rec = recorder();
         state.turnQueue.push({ onChunk: rec.onChunk, resolve: () => {}, reject: () => {}, slashCommand: null });
-        const prevCapture = __forTest.setCapturePastePane(() => COMPOSER_WORKING_NONBARE_PANE);
+        const prevCapture = __forTest.setCapturePastePane(async () => COMPOSER_WORKING_NONBARE_PANE);
         try {
           await __forTest.queuePaste(taskId, state.sessionName, "hello", 0, state, { bracketed: true });
         } finally {
@@ -2714,10 +2724,10 @@ test("sendSlashCommand({autoConfirm}) confirm-Enter failure: a failed confirm se
   await withFailingNthEnterTmuxBin(2, async () => {
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     const { taskId, state } = freshSession();
-    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
-    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => effortConfirmPane);
+    const prevPastePane = __forTest.setCapturePastePane(async () => idlePane);
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(async () => effortConfirmPane);
     try {
-      const ok = sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
+      const ok = await sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
       expect(ok).toBe(true);
 
       await __forTest.pasteChains.get(taskId);
@@ -2751,11 +2761,16 @@ test("sendTurn: opts.onPasteFailure still fires with op 'modal-guard' even when 
     const prevGrace = __forTest.setPasteModalGraceMs(20);
     const prevPoll = __forTest.setPasteModalPollMs(5);
     const { taskId, state } = freshSession();
-    const prevCapture = __forTest.setCapturePastePane(() => PICKER_PANE); // persistently blocking
+    const prevCapture = __forTest.setCapturePastePane(async () => PICKER_PANE); // persistently blocking
     const failures: PasteFailureOutcome[] = [];
     try {
       const rec = recorder();
-      const agent = sendTurn(taskId, "hello", rec.onChunk, {
+      // Deliberately NOT awaited — sendTurn's own body has no internal
+      // `await` before it registers the queued paste op and returns, so
+      // calling it without awaiting still runs that registration inline, in
+      // this same tick (see the sibling lastKeystrokeAt/PASTE_DROPPED_OUTCOME
+      // tests above for the fuller rationale).
+      const agentPromise = sendTurn(taskId, "hello", rec.onChunk, {
         onPasteFailure: (outcome) => failures.push(outcome),
       });
 
@@ -2766,6 +2781,7 @@ test("sendTurn: opts.onPasteFailure still fires with op 'modal-guard' even when 
       expect(state.turnQueue.length).toBe(1);
       state.pendingEndTurn = { messageId: null, uuid: undefined, emitBanner: false, stagedAt: Date.now() };
       __forTest.firePendingEndTurn(state);
+      const agent = await agentPromise;
       await expect(agent.done).resolves.toBe(0);
       expect(state.turnQueue.length).toBe(0);
 
@@ -2826,7 +2842,7 @@ test("bracketed paste: a failed trailing send-keys Enter (after load-buffer/past
     // idle read so the ONLY tmux calls left in the log are the paste path's
     // own four ops, keeping the assertion below about exactly the trailing
     // Enter.
-    const prevCapture = __forTest.setCapturePastePane(() => "");
+    const prevCapture = __forTest.setCapturePastePane(async () => "");
     const failures: PasteFailureOutcome[] = [];
     try {
       expect(state.composerHoldsText).toBe(false);
@@ -2868,7 +2884,7 @@ test("composer-clear check: a failed Escape,Escape send-keys withholds with phas
     // false — so the composer-clear branch attempts the Escape,Escape clear
     // rather than withholding immediately (the "claude working" branch) or
     // treating the composer as already-bare.
-    const prevCapture = __forTest.setCapturePastePane(() => COMPOSER_DIRTY_PANE);
+    const prevCapture = __forTest.setCapturePastePane(async () => COMPOSER_DIRTY_PANE);
     const failures: PasteFailureOutcome[] = [];
     try {
       await __forTest.queuePaste(taskId, state.sessionName, "hello", 0, state, {

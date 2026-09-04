@@ -33,33 +33,33 @@ function fakeTmux(stdout: string, code = 0) {
   };
 }
 
-test("panePidFor: exact session-name match on the list-panes listing", () => {
+test("panePidFor: exact session-name match on the list-panes listing", async () => {
   const restore = fakeTmux("agetor-other\t111\nagetor-x\t4242\nagetor-x2\t9\n");
   try {
-    expect(panePidFor("agetor-x")).toBe(4242);
-    expect(panePidFor("agetor-x2")).toBe(9);
-    expect(panePidFor("agetor-other")).toBe(111);
+    expect(await panePidFor("agetor-x")).toBe(4242);
+    expect(await panePidFor("agetor-x2")).toBe(9);
+    expect(await panePidFor("agetor-other")).toBe(111);
   } finally { restore(); }
 });
 
-test("panePidFor: a name prefix never matches (agetor-x must not read agetor-x2's pid)", () => {
+test("panePidFor: a name prefix never matches (agetor-x must not read agetor-x2's pid)", async () => {
   const restore = fakeTmux("agetor-x2\t9\n");
-  try { expect(panePidFor("agetor-x")).toBeNull(); } finally { restore(); }
+  try { expect(await panePidFor("agetor-x")).toBeNull(); } finally { restore(); }
 });
 
-test("panePidFor: the first listed pane wins when the user split the window", () => {
+test("panePidFor: the first listed pane wins when the user split the window", async () => {
   const restore = fakeTmux("agetor-x\t4242\nagetor-x\t5151\n");
-  try { expect(panePidFor("agetor-x")).toBe(4242); } finally { restore(); }
+  try { expect(await panePidFor("agetor-x")).toBe(4242); } finally { restore(); }
 });
 
-test("panePidFor: an empty/unparseable pid field is null, never 0 (tmux 3.6a empty-format trap)", () => {
+test("panePidFor: an empty/unparseable pid field is null, never 0 (tmux 3.6a empty-format trap)", async () => {
   for (const out of ["agetor-x\t\n", "agetor-x\tabc\n", "agetor-x\t0\n", "agetor-x\n", ""]) {
     const restore = fakeTmux(out);
-    try { expect(panePidFor("agetor-x")).toBeNull(); } finally { restore(); }
+    try { expect(await panePidFor("agetor-x")).toBeNull(); } finally { restore(); }
   }
 });
 
-test("panePidFor: a failing tmux is null", () => {
+test("panePidFor: a failing tmux is null", async () => {
   const restore = fakeTmux("agetor-x\t4242\n", 1);
-  try { expect(panePidFor("agetor-x")).toBeNull(); } finally { restore(); }
+  try { expect(await panePidFor("agetor-x")).toBeNull(); } finally { restore(); }
 });

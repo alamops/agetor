@@ -3774,7 +3774,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // for each failure mode instead of an empty Terminal that immediately
       // errors with "can't find session".
       "/tasks/:id/open-tmux": {
-        POST: authed((req) => {
+        POST: authed(async (req) => {
           const task = tasks.get(req.params.id);
           if (!task) {
             return json({ error: "task not found" }, { status: 404, headers: corsHeaders(req) });
@@ -3806,7 +3806,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               { status: 503, headers: corsHeaders(req) },
             );
           }
-          if (!sessionExists(task.id)) {
+          if (!(await sessionExists(task.id))) {
             return json(
               {
                 error: `no live tmux session "${sessionName}" — start (or send a message to) the task first`,
@@ -3819,10 +3819,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // Heal a stuck `window-size manual` pin (a prior crash mid pane-grow)
           // before attaching, so the client's own size wins instead of being
           // confined to whatever the pin left behind — see `healWindowSize`.
-          // Best-effort: must not block or delay the attach below.
+          // Best-effort: intentionally not awaited — must not block or delay
+          // the attach below. `healWindowSize` never throws (it only awaits
+          // `tmux()`, which itself never throws — see its doc comment), so
+          // this fire-and-forget can't produce an unhandled rejection.
           // `assumeAlive`: `sessionExists(task.id)` was just checked above, so
           // skip the internal probe's duplicate round-trip.
-          healWindowSize(task.id, { assumeAlive: true });
+          void healWindowSize(task.id, { assumeAlive: true });
           // AppleScript `do script` runs the string through `/bin/bash`, so
           // we escape anything bash would interpret inside double-quotes:
           // backslash, dollar, backtick, and the double-quote itself. Without
@@ -3929,8 +3932,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       },
 
       "/runs/:id/cancel": {
-        POST: authed((req) =>
-          json({ cancelled: cancelRun(req.params.id) }, { headers: corsHeaders(req) })),
+        POST: authed(async (req) =>
+          json({ cancelled: await cancelRun(req.params.id) }, { headers: corsHeaders(req) })),
       },
 
       // Forward a line of user input to the running agent's stdin. Returns
@@ -4365,7 +4368,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // in-flight Esc-then-send interrupt (which is what corrupts the run
           // accounting). The modal having been Esc'd, the message reaches claude.
           if (body.reject === true) {
-            if (!sessionExists(pending.taskId)) {
+            if (!(await sessionExists(pending.taskId))) {
               return json(
                 { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
                 { status: 410, headers: corsHeaders(req) },
@@ -4398,7 +4401,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // the modal. The user clicks "Yes", the card vanishes, and
           // nothing actually happens. Surface the failure so the UI
           // can leave the card up for retry.
-          if (!sessionExists(pending.taskId)) {
+          if (!(await sessionExists(pending.taskId))) {
             return json(
               { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
               { status: 410, headers: corsHeaders(req) },

@@ -218,6 +218,117 @@ test("eventsForTask limit larger than available events returns all of them", () 
 });
 
 // ---------------------------------------------------------------------------
+// runs.eventsForTask — oracle-parity grid, events INTERLEAVED with a foreign
+// task in the global run_events id space.
+//
+// This is the regression trap for the two-step limit-path rewrite (db.ts
+// ~:1177): step 1 sorts ids-only over the covering index, step 2 fetches the
+// actual rows for `id >= minId` (re-filtered by `runs.task_id` AND, when
+// given, `beforeId`). A step-2 fetch that dropped the task filter — trusting
+// the `id >= minId` floor alone — or a step-1 id search missing it, would
+// leak a foreign task's rows into the page whenever they land inside
+// [minId, max] of this task's own ids. Plain sequential seeding (like
+// `seedTaskWithEvents` above, or two single-task seeds run back to back)
+// can't exercise that: a naive bug would go unnoticed because the id ranges
+// never actually overlap. The interleaving below guarantees they do.
+// ---------------------------------------------------------------------------
+
+/** Seeds `taskId` with `runCount` runs of `eventsPerRun` events each,
+ *  interleaving a second, unrelated task's events between every run so the
+ *  target task's own event ids form a "holey" (non-contiguous) subsequence
+ *  of the global id space — every id range this task's events span also
+ *  contains foreign rows. Returns the target task's id and its full
+ *  ascending list of persisted event ids: the ground truth (the oracle)
+ *  every case in the grid below is checked against. */
+function seedTaskInterleavedWithForeignEvents(
+  eventsPerRun: number,
+  runCount: number,
+): { taskId: string; ids: number[] } {
+  const taskId = randomUUID();
+  const foreignTaskId = randomUUID();
+  const foreignRunId = randomUUID();
+  const now = Date.now();
+  tasks.insert(makeTaskRow(taskId));
+  tasks.insert(makeTaskRow(foreignTaskId));
+  runs.insert({
+    id: foreignRunId, taskId: foreignTaskId, agent: "claude-code", status: "succeeded",
+    startedAt: now, endedAt: now + 1, exitCode: 0,
+    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+  });
+
+  const seedAll = db.transaction(() => {
+    for (let r = 0; r < runCount; r++) {
+      const runId = randomUUID();
+      runs.insert({
+        id: runId, taskId, agent: "claude-code", status: "succeeded",
+        startedAt: now, endedAt: now + 1, exitCode: 0,
+        tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+      });
+      for (let i = 0; i < eventsPerRun; i++) runs.appendEvent(runId, "assistant", `a-r${r}-e${i}`);
+      // The foreign task's events land in the id range right after this
+      // run's block and before the next — this is what guarantees foreign
+      // ids fall inside [minId, max] of any page built from this task's own
+      // events below.
+      for (let i = 0; i < eventsPerRun; i++) runs.appendEvent(foreignRunId, "assistant", `foreign-r${r}-e${i}`);
+    }
+  });
+  seedAll();
+
+  const ids = runs.eventsForTask(taskId).map((e) => e.id);
+  return { taskId, ids };
+}
+
+/** Ground truth for what the limit-path SHOULD return, computed purely from
+ *  the unlimited oracle list: filter to ids strictly before `beforeId` (when
+ *  given), then keep the newest `limit` of what remains, ascending — exactly
+ *  what the two-step query claims to compute. */
+function expectedPage(oracleIds: number[], opts: { beforeId?: number; limit: number }): number[] {
+  let eligible = oracleIds;
+  if (opts.beforeId != null) eligible = eligible.filter((id) => id < opts.beforeId!);
+  return eligible.slice(-opts.limit);
+}
+
+const GRID_EVENTS_PER_RUN = 5;
+const GRID_RUN_COUNT = 3; // 15 total target-task events, spread across 3 runs with a foreign block between each
+
+const gridCases: Array<{ name: string; opts: (ids: number[]) => { beforeId?: number; limit: number } }> = [
+  { name: "limit smaller than the eligible set (no beforeId)", opts: () => ({ limit: 5 }) },
+  { name: "limit equal to the eligible set (no beforeId)", opts: () => ({ limit: 15 }) },
+  { name: "limit larger than the eligible set (no beforeId)", opts: () => ({ limit: 1000 }) },
+  // ids[9] is the 10th target-task event (last event of the middle run) — a
+  // real id belonging to this task, well inside the seeded range.
+  { name: "beforeId at a mid id, limit smaller than what remains eligible", opts: (ids) => ({ beforeId: ids[9]!, limit: 4 }) },
+  { name: "beforeId at a mid id, eligible set (9) smaller than limit", opts: (ids) => ({ beforeId: ids[9]!, limit: 1000 }) },
+  { name: "beforeId at the smallest id — empty result", opts: (ids) => ({ beforeId: ids[0]!, limit: 1000 }) },
+];
+
+for (const { name, opts } of gridCases) {
+  test(`eventsForTask limit-path matches the unlimited oracle, foreign-task events interleaved in the id space: ${name}`, () => {
+    const { taskId, ids } = seedTaskInterleavedWithForeignEvents(GRID_EVENTS_PER_RUN, GRID_RUN_COUNT);
+    expect(ids.length).toBe(GRID_EVENTS_PER_RUN * GRID_RUN_COUNT);
+
+    const resolvedOpts = opts(ids);
+    const page = runs.eventsForTask(taskId, resolvedOpts);
+    expect(page.map((e) => e.id)).toEqual(expectedPage(ids, resolvedOpts));
+    // No foreign-task leakage: every returned row belongs to this task's own
+    // seeded prefix, never the interleaved foreign task's ("foreign-...").
+    expect(page.every((e) => e.data.startsWith("a-"))).toBe(true);
+    // Ascending order, not the DESC order step 1 sorts in internally.
+    for (let i = 1; i < page.length; i++) expect(page[i]!.id).toBeGreaterThan(page[i - 1]!.id);
+  });
+}
+
+test("eventsForTask limit-path returns empty for a task with zero events, even with foreign events elsewhere in the id space", () => {
+  // Seed unrelated interleaved data first so the global id space is
+  // non-trivial and spans well past this empty task's (nonexistent) events.
+  seedTaskInterleavedWithForeignEvents(GRID_EVENTS_PER_RUN, GRID_RUN_COUNT);
+  const emptyTaskId = randomUUID();
+  tasks.insert(makeTaskRow(emptyTaskId));
+  expect(runs.eventsForTask(emptyTaskId, { limit: 50 })).toEqual([]);
+  expect(runs.eventsForTask(emptyTaskId, { beforeId: 999999999, limit: 50 })).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
 // runs.hasEventsBefore
 // ---------------------------------------------------------------------------
 

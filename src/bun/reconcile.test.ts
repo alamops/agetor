@@ -206,7 +206,7 @@ test("reconcileOrphans marks running rows as orphaned and returns tasks to ready
     claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
   });
 
-  const reconciled = reconcileOrphans();
+  const reconciled = await reconcileOrphans();
   expect(reconciled).toBe(1);
 
   const row = db.query<{ status: string }, [string]>(`SELECT status FROM runs WHERE id = ?`).get(runId);
@@ -217,7 +217,7 @@ test("reconcileOrphans marks running rows as orphaned and returns tasks to ready
   expect(task?.runId).toBeNull();
 
   // A second call is a no-op.
-  expect(reconcileOrphans()).toBe(0);
+  expect(await reconcileOrphans()).toBe(0);
 });
 
 test("reattach pre-seed SQL: detects a prior api-error status row scoped to the run", async () => {
@@ -338,7 +338,7 @@ test("startTask honors cancel — exit handler records status 'cancelled'", asyn
 
   // Give the tmux session a moment to come up, then cancel.
   await new Promise((r) => setTimeout(r, 250));
-  expect(cancelRun(started.runId)).toBe(true);
+  expect(await cancelRun(started.runId)).toBe(true);
 
   // Wait past the driver's kill grace + the exit handler's status flip.
   await new Promise((r) => setTimeout(r, 700));
@@ -383,8 +383,7 @@ test("held-task boot pass: dead tmux session → subagent orphaned, task release
     runs.insert(succeededRun(runId, taskId));
     subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
 
-    reconcileOrphans();
-
+    await reconcileOrphans();
     const sub = subagents.get(subId);
     expect(sub?.status).toBe("orphaned");
     expect(sub?.endedAt).not.toBeNull();
@@ -436,8 +435,7 @@ test("held-task boot pass: a task whose terminal run is still 'running' has its 
     }));
     subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
 
-    reconcileOrphans();
-
+    await reconcileOrphans();
     // Unchanged: the first pass still owns the run and the column drop.
     const run = runs.get(runId);
     expect(run?.status).toBe("orphaned");
@@ -483,8 +481,7 @@ test("held-task boot pass: succeeded run with no running subagents is left untou
   runs.insert(succeededRun(runId, taskId));
   subagents.insertIfAbsent(subagentRow(subId, taskId, runId, { status: "completed", endedAt: Date.now() }));
 
-  reconcileOrphans();
-
+  await reconcileOrphans();
   const task = tasks.get(taskId);
   expect(task?.column).toBe("running");
 
@@ -515,8 +512,7 @@ test("held-task boot pass: a codex task can never be held — the kind !== 'clau
   }));
   subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
 
-  reconcileOrphans();
-
+  await reconcileOrphans();
   const task = tasks.get(taskId);
   expect(task?.column).toBe("running");
 
@@ -546,8 +542,7 @@ test("held-task boot pass: null claudeSessionId with a live tmux session is rele
     runs.insert(succeededRun(runId, taskId, { claudeSessionId: null }));
     subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
 
-    reconcileOrphans();
-
+    await reconcileOrphans();
     const task = tasks.get(taskId);
     expect(task?.column).toBe("review");
 
@@ -592,7 +587,7 @@ test("boot pass (blind spot): review-column task with a dead-session subagent ro
       if (e.kind === "column" && e.taskId === taskId) columnEvents.push(e);
     });
 
-    reconcileOrphans();
+    await reconcileOrphans();
     unsub();
 
     const sub = subagents.get(subId);
@@ -629,8 +624,7 @@ test("boot pass (blind spot): review-column task with a live session + recoverab
     runs.insert(succeededRun(runId, taskId)); // seeds a non-null claudeSessionId
     subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
 
-    reconcileOrphans();
-
+    await reconcileOrphans();
     const sub = subagents.get(subId);
     expect(sub?.status).toBe("running");
 
@@ -660,8 +654,7 @@ test("boot pass (blind spot): review-column task with a live session but no clau
     runs.insert(succeededRun(runId, taskId, { claudeSessionId: null }));
     subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
 
-    reconcileOrphans();
-
+    await reconcileOrphans();
     const sub = subagents.get(subId);
     expect(sub?.status).toBe("orphaned");
 
@@ -695,8 +688,7 @@ test("boot pass (blind spot): a codex task's stray running subagent row is skipp
     }));
     subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
 
-    reconcileOrphans();
-
+    await reconcileOrphans();
     const task = tasks.get(taskId);
     expect(task?.column).toBe("review");
 
@@ -731,7 +723,7 @@ test("boot pass: never issues a tmux kill — dead and live review-column cases 
 
   let restoreTmux = fakeTmux(1, "can't find session", logPath);
   try {
-    reconcileOrphans();
+    await reconcileOrphans();
   } finally {
     restoreTmux();
   }
@@ -747,7 +739,7 @@ test("boot pass: never issues a tmux kill — dead and live review-column cases 
 
   restoreTmux = fakeTmux(0, "", logPath);
   try {
-    reconcileOrphans();
+    await reconcileOrphans();
   } finally {
     detachWatcherFor(liveTaskId);
     restoreTmux();

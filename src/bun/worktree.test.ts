@@ -279,14 +279,14 @@ test("prepareWorkdir on branchSource=existing uses the local branch when it alre
   expect(headBranch).toBe("pr-head");
 });
 
-test("gitWritableRootsSync returns the source repo's .git for a linked worktree", async () => {
-  const { prepareWorkdir, gitWritableRootsSync } = await import("./worktree.ts");
+test("gitWritableRoots returns the source repo's .git for a linked worktree", async () => {
+  const { prepareWorkdir, gitWritableRoots } = await import("./worktree.ts");
   const repo = await makeRepo();
   const task = fakeTask({ workdir: repo });
   const r = await prepareWorkdir(task);
   if ("error" in r) throw new Error(r.error);
 
-  const roots = gitWritableRootsSync(r.cwd);
+  const roots = await gitWritableRoots(r.cwd);
   expect(roots).toHaveLength(1);
   const common = roots[0]!;
   // It's the shared common dir (objects/refs + worktree registrations live here)…
@@ -298,17 +298,42 @@ test("gitWritableRootsSync returns the source repo's .git for a linked worktree"
   expect(common.startsWith(r.cwd + path.sep)).toBe(false);
 });
 
-test("gitWritableRootsSync returns [] for an ordinary in-repo checkout", async () => {
-  const { gitWritableRootsSync } = await import("./worktree.ts");
+test("gitWritableRoots returns [] for an ordinary in-repo checkout", async () => {
+  const { gitWritableRoots } = await import("./worktree.ts");
   const repo = await makeRepo();
   // `.git` sits inside the cwd, already covered by codex's writable workspace.
-  expect(gitWritableRootsSync(repo)).toEqual([]);
+  expect(await gitWritableRoots(repo)).toEqual([]);
 });
 
-test("gitWritableRootsSync returns [] for a non-git directory", async () => {
-  const { gitWritableRootsSync } = await import("./worktree.ts");
+test("gitWritableRoots returns [] for a non-git directory", async () => {
+  const { gitWritableRoots } = await import("./worktree.ts");
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit2-"));
-  expect(gitWritableRootsSync(dir)).toEqual([]);
+  expect(await gitWritableRoots(dir)).toEqual([]);
+});
+
+// Async-conversion regression guard (gitWritableRootsSync -> gitWritableRoots):
+// prove several calls can genuinely be in flight together and each still
+// resolves with its own correct, independent result — rather than requiring
+// a caller to serialize them one at a time the way a sync spawn effectively
+// would. Deliberately no wall-clock assertion (documented flake class for
+// fake-tmux/subprocess timing in this repo) — Promise.all + result equality
+// is the whole check.
+test("gitWritableRoots resolves correctly when several calls are in flight concurrently (no serialization required)", async () => {
+  const { prepareWorkdir, gitWritableRoots } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const wt = await prepareWorkdir(fakeTask({ workdir: repo }));
+  if ("error" in wt) throw new Error(wt.error);
+  const nonGit = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit3-"));
+
+  const [linkedRoots, plainRoots, nonGitRoots] = await Promise.all([
+    gitWritableRoots(wt.cwd),
+    gitWritableRoots(repo),
+    gitWritableRoots(nonGit),
+  ]);
+  expect(linkedRoots).toHaveLength(1);
+  expect(path.basename(linkedRoots[0]!)).toBe(".git");
+  expect(plainRoots).toEqual([]);
+  expect(nonGitRoots).toEqual([]);
 });
 
 // End-to-end wiring of the codex spawn path: buildCodexCommand resolves the
@@ -328,7 +353,7 @@ test("buildCodexCommand escalates to danger-full-access in a linked worktree", a
   const r = await prepareWorkdir(fakeTask({ workdir: repo }));
   if ("error" in r) throw new Error(r.error);
 
-  const { cmd } = buildCodexCommand(codexHarness, "hi", { ...codexOpts }, r.cwd);
+  const { cmd } = await buildCodexCommand(codexHarness, "hi", { ...codexOpts }, r.cwd);
   expect(cmd).toContain("danger-full-access");
   expect(cmd).not.toContain("workspace-write");
   expect(cmd).toContain("approval_policy=never");
@@ -338,7 +363,7 @@ test("buildCodexCommand keeps workspace-write for an ordinary in-repo checkout",
   const { buildCodexCommand } = await import("./agents.ts");
   const repo = await makeRepo();
 
-  const { cmd } = buildCodexCommand(codexHarness, "hi", { ...codexOpts }, repo);
+  const { cmd } = await buildCodexCommand(codexHarness, "hi", { ...codexOpts }, repo);
   expect(cmd).toContain("workspace-write");
   expect(cmd).not.toContain("danger-full-access");
 });

@@ -1147,32 +1147,73 @@ export const runs = {
    *
    *  With `opts.limit` set, returns only the MOST RECENT `limit` events:
    *  filters `id < opts.beforeId` when given, orders by id DESC, takes
-   *  `limit`, then reverses so the caller still sees ascending order. This
-   *  is what powers the capped SSE replay window and the `/events/page`
-   *  paging route — both want "the newest N (before some cursor)", not
-   *  "the first N". */
+   *  `limit`, then re-sorts ascending. This is what powers the capped SSE
+   *  replay window and the `/events/page` paging route — both want "the
+   *  newest N (before some cursor)", not "the first N".
+   *
+   *  The limit path is a two-step query, not one. A single
+   *  `SELECT … ORDER BY run_events.id DESC LIMIT ?` still has to sort every
+   *  matching row before it can take the top N — `EXPLAIN QUERY PLAN` shows
+   *  SQLite picks the covering index for the join+filter but then falls back
+   *  to `USE TEMP B-TREE FOR ORDER BY`, and that b-tree materializes the full
+   *  `data` payload (often the largest column by far) for EVERY event the
+   *  task ever had, not just the `limit` returned. Measured 219.5ms on a
+   *  production task with 18.5k events. Splitting it in two fixes that:
+   *   1. Sort ids only (`SELECT run_events.id …`) — no `data` payload in the
+   *      row, so the temp b-tree rides the covering index
+   *      (`idx_run_events_run(run_id, id)`) instead of materializing text.
+   *   2. Fetch the actual rows for that exact id range, ascending (no
+   *      reverse needed) — a plain indexed range scan, not a sort.
+   *  Measured 14.8ms + 3.9ms ≈ 19ms for the identical 800-row result on the
+   *  same task — an ~11x improvement, no schema change.
+   *
+   *  Step 2 re-applies `beforeId` (not just the `id >= minId` floor coming
+   *  out of step 1): without it, events newer than the cursor — i.e. events
+   *  the caller has already seen, or that landed on a DIFFERENT run of the
+   *  same task with an id inside `[minId, taskMax]` but still `>= beforeId`
+   *  — would wrongly re-enter the page. `id >= minId` alone only bounds the
+   *  page from below; `beforeId` is what bounds it from above, exactly as it
+   *  did in the one-query version. */
   eventsForTask(
     taskId: string,
     opts?: { beforeId?: number; limit?: number },
   ): Array<{ id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null }> {
     type Row = { id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null };
     if (opts?.limit) {
-      const conditions = ["runs.task_id = ?"];
-      const params: Array<string | number> = [taskId];
+      const idConditions = ["runs.task_id = ?"];
+      const idParams: Array<string | number> = [taskId];
       if (opts.beforeId != null) {
-        conditions.push("run_events.id < ?");
-        params.push(opts.beforeId);
+        idConditions.push("run_events.id < ?");
+        idParams.push(opts.beforeId);
       }
-      params.push(opts.limit);
-      const rows = db.query<Row, Array<string | number>>(
+      idParams.push(opts.limit);
+      const idRows = db.query<{ id: number }, Array<string | number>>(
+        `SELECT run_events.id as id
+         FROM run_events
+         JOIN runs ON runs.id = run_events.run_id
+         WHERE ${idConditions.join(" AND ")}
+         ORDER BY run_events.id DESC
+         LIMIT ?`,
+      ).all(...idParams);
+      if (idRows.length === 0) return [];
+      // DESC order — the last row is the smallest id in the page.
+      const minId = idRows[idRows.length - 1]!.id;
+
+      const rowConditions = ["runs.task_id = ?", "run_events.id >= ?"];
+      const rowParams: Array<string | number> = [taskId, minId];
+      if (opts.beforeId != null) {
+        rowConditions.push("run_events.id < ?");
+        rowParams.push(opts.beforeId);
+      }
+      rowParams.push(opts.limit);
+      return db.query<Row, Array<string | number>>(
         `SELECT run_events.id as id, run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
          FROM run_events
          JOIN runs ON runs.id = run_events.run_id
-         WHERE ${conditions.join(" AND ")}
-         ORDER BY run_events.id DESC
+         WHERE ${rowConditions.join(" AND ")}
+         ORDER BY run_events.id ASC
          LIMIT ?`,
-      ).all(...params);
-      return rows.reverse();
+      ).all(...rowParams);
     }
     return db.query<Row, [string]>(
       `SELECT run_events.id as id, run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId

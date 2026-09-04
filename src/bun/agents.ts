@@ -14,7 +14,7 @@ import { spawnCursorViaTmux } from "./cursor-tmux.ts";import { dataDir, subagent
 import { spawnFxViaAcp, type FxMode } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
 import { answerFxPermission, registerFxPermission } from "./interactions.ts";
-import { gitWritableRootsSync } from "./worktree.ts";
+import { gitWritableRoots } from "./worktree.ts";
 
 export type { SpawnedAgent };
 
@@ -113,7 +113,7 @@ export interface AgentRunOptions {
    * workdir). When this is non-empty, a `git commit`'s objects/refs must reach
    * a dir the cwd-scoped `workspace-write` sandbox doesn't cover, so the codex
    * `auto` run is escalated to `--sandbox danger-full-access` (see
-   * `buildCommand`). Resolved by `gitWritableRootsSync(cwd)` and only set on the
+   * `buildCommand`). Resolved by `await gitWritableRoots(cwd)` and only set on the
    * codex spawn path; ignored by claude-code and by codex's read-only ("ask")
    * sandbox (which can't write anything regardless).
    */
@@ -562,7 +562,7 @@ export function buildCommand(
     // philosophy as claude's --dangerously-skip-permissions and codex's
     // danger-full-access escalation. `ask` emits neither flag: cursor-agent
     // -p cannot execute unapproved actions headlessly, so this is a
-    // propose-only run. No gitWritableRootsSync escalation is needed here
+    // propose-only run. No gitWritableRoots escalation is needed here
     // (plan §3.4) — auto never runs sandboxed for cursor in the first place.
     const mode = opts.mode ?? "auto";
     if (mode === "auto") {
@@ -768,16 +768,23 @@ export function buildCommand(
  * `buildCommand` can decide whether to escalate the sandbox to full access. This
  * is the seam `spawnAgent` uses — kept separate from the pure `buildCommand` so
  * the cwd→sandbox wiring is unit-testable without standing up tmux.
+ *
+ * Async because `gitWritableRoots` now spawns `git` via the async `git()`
+ * helper (see worktree.ts) instead of `child_process.spawnSync` — this is the
+ * only reason `buildCodexCommand` differs from the otherwise-synchronous
+ * `buildCommand`, whose exported signature stays sync on purpose (100+ sync
+ * call sites in agents.test.ts, and orchestrator-fx.test.ts's fake gemini
+ * driver relies on `buildCommand` staying synchronous).
  */
-export function buildCodexCommand(
+export async function buildCodexCommand(
   harness: Harness,
   prompt: string,
   opts: AgentRunOptions,
   cwd: string,
-): AgentCommand {
+): Promise<AgentCommand> {
   return buildCommand(harness, prompt, {
     ...opts,
-    codexExternalGitDirs: gitWritableRootsSync(cwd),
+    codexExternalGitDirs: await gitWritableRoots(cwd),
   });
 }
 
@@ -1324,8 +1331,17 @@ export interface SpawnAgentArgs {
  *
  * Returns a unified `SpawnedAgent` so the orchestrator's bookkeeping is the
  * same for both agents.
+ *
+ * Async: `spawnClaudeViaTmux`/`spawnCodexViaTmux`/`spawnCursorViaTmux`/
+ * `spawnGeminiViaTmux` are now `Bun.spawn`-backed tmux drivers (wave 1 of
+ * docs/plans/fix-task-details-load-delay.md — no more `Bun.spawnSync` on the
+ * warm-up path), so every dispatch branch below awaits its driver spawn.
+ * `spawnFxViaAcp` stays synchronous (fx never used tmux — see fx-acp.ts) and
+ * the fake-driver branches stay synchronous too (`makeFakeAgent` /
+ * `makeFakeCursorPlanAgent`); both are still valid returns from this `async`
+ * function, just resolved immediately.
  */
-export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
+export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
   const { taskId, runId, harness, prompt, cwd, onChunk, onSessionId, opts = {} } = args;
 
   if (harness.kind === "claude-code") {
@@ -1342,7 +1358,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       sessionId: opts.resumeSessionId ? null : sessionId,
     });
     onSessionId?.(sessionId);
-    return spawnClaudeViaTmux({
+    return await spawnClaudeViaTmux({
       taskId,
       argv: built.cmd,
       env: built.env ?? {},
@@ -1372,7 +1388,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
         return makeFakeCursorPlanAgent(taskId, prompt, onChunk);
       }      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });    }
     const built = buildCommand(harness, prompt, opts);
-    return spawnCursorViaTmux({
+    return await spawnCursorViaTmux({
       taskId,
       runId,
       argv: built.cmd,
@@ -1404,7 +1420,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       sessionId: opts.resumeSessionId ? null : sessionId,
     });
     onSessionId?.(sessionId);
-    return spawnGeminiViaTmux({
+    return await spawnGeminiViaTmux({
       taskId,
       runId,
       argv: built.cmd,
@@ -1460,9 +1476,10 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
   // sandbox to full access. Computed here — the single choke point every codex
   // spawn path funnels through — rather than at each orchestrator call site.
   // No-op for an ordinary checkout or a non-git cwd, so the argv is unchanged
-  // there. `buildCodexCommand` is the testable seam for this wiring.
-  const built = buildCodexCommand(harness, prompt, opts, cwd);
-  return spawnCodexViaTmux({
+  // there. `buildCodexCommand` is the testable seam for this wiring (async —
+  // it awaits `gitWritableRoots`, which now shells out via `Bun.spawn`).
+  const built = await buildCodexCommand(harness, prompt, opts, cwd);
+  return await spawnCodexViaTmux({
     taskId,
     runId,
     argv: built.cmd,

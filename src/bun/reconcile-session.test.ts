@@ -176,7 +176,7 @@ test("reconcileTaskSession refreshes the hook matcher to narrow on ask → auto"
   // polling a real pane for the full timeout. Await the reconcile so its
   // (otherwise fire-and-forget) background poll can't leak `tmux` calls into
   // a later test's recording bin.
-  const prevPane = __forTest.setCaptureModePane(() => "⏵⏵ auto mode on (shift+tab to cycle)");
+  const prevPane = __forTest.setCaptureModePane(async () => "⏵⏵ auto mode on (shift+tab to cycle)");
   const prevPoll = __forTest.setModePollIntervalMs(1);
   const after: Task = { ...before, mode: "auto" };
   await reconcileTaskSession("task-matcher-narrow", before, after);
@@ -220,7 +220,7 @@ test("reconcileTaskSession refreshes the hook matcher to full on auto → ask", 
   // Target `ask` → claude's `default` mode, whose status bar shows the
   // "? for shortcuts" hint (no mode banner). Feed that so the switch resolves
   // promptly, and await so the background poll can't leak `tmux` calls.
-  const prevPane = __forTest.setCaptureModePane(() => "? for shortcuts · ← for agents");
+  const prevPane = __forTest.setCaptureModePane(async () => "? for shortcuts · ← for agents");
   const prevPoll = __forTest.setModePollIntervalMs(1);
   const after: Task = { ...before, mode: "ask" };
   await reconcileTaskSession("task-matcher-full", before, after);
@@ -267,7 +267,14 @@ test("reconcileTaskSession does NOT refresh the matcher when cycleToMode fails (
   state.permissionMode = "default";
 
   const after: Task = { ...before, mode: "bypass" };
-  reconcileTaskSession("task-matcher-skip", before, after);
+  // Await the reconcile (mirrors the two sibling tests above) so its
+  // internal async work — `sessionExists`'s real tmux probe plus whatever
+  // `cycleToMode` does before bailing on the unreachable target — can't
+  // keep running as an unawaited background chain past this test's own
+  // teardown and leak stray `tmux` calls into a later test file's fake-tmux
+  // recording log (see the identical comment on the narrow/full tests
+  // above).
+  await reconcileTaskSession("task-matcher-skip", before, after);
 
   // No agetor entry was written, so readMatcher returns undefined.
   expect(readMatcher(cwd)).toBeUndefined();
