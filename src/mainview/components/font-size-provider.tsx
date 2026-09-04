@@ -4,12 +4,12 @@ import { FONT_SIZE_DEFAULT, FONT_SIZE_MAX, FONT_SIZE_MIN } from "../../shared/ty
 import { api } from "@/lib/api";
 import {
   fontSizeShortcutAction,
-  isMacPlatform,
   readFontSizeFromBoot,
   rootFontSizeStyle,
   stepFontSize,
   type FontSizeAction,
 } from "@/lib/font-size";
+import { isMacPlatform } from "@/lib/platform";
 
 // Trailing-edge debounce for the persisted write: a burst of Cmd+= presses
 // updates the optimistic UI state on every keystroke, but only writes once,

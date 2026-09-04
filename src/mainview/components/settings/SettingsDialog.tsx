@@ -14,7 +14,7 @@ import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
 import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
 import { useFontSize } from "@/components/font-size-provider";
 import { useTheme } from "@/components/theme-provider";
-import { isMacPlatform } from "@/lib/font-size";
+import { isMacPlatform } from "@/lib/platform";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
 import { abbreviateHome, cn } from "@/lib/utils";

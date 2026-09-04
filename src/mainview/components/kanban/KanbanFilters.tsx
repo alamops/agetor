@@ -31,6 +31,10 @@ interface Props {
    *  options, so users can still narrow to historical runs of a removed
    *  harness. */
   taskAgentIds: string[];
+  /** Attaches directly to the free-text search `<Input>` — App.tsx's
+   *  Cmd/Ctrl+F handler focuses (and selects) the box through it when no
+   *  task details panel is open. */
+  searchInputRef?: React.Ref<HTMLInputElement>;
 }
 
 const basename = (p: string) => {
@@ -55,6 +59,7 @@ export function KanbanFilters({
   projects,
   harnesses,
   taskAgentIds,
+  searchInputRef,
 }: Props) {
   const repoItems = projects.map((p) => ({
     value: p.path,
@@ -112,10 +117,23 @@ export function KanbanFilters({
         <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
         <Input
           {...IDENTIFIER_INPUT_PROPS}
+          ref={searchInputRef}
           value={textQuery}
           onChange={(e) => onTextQueryChange(e.target.value)}
           placeholder="Search title, prompt, workdir, branch…"
+          aria-label="Search tasks"
           className="pl-8"
+          onKeyDown={(e) => {
+            // Owner decision: Escape leaves the field but keeps the query
+            // (no clear) — just blur so focus returns to the board.
+            // `preventDefault` only, no `stopPropagation`: document-level
+            // Escape listeners in this app coordinate through DOM markers
+            // (see the comment block in RunPanel.tsx ~line 381-392), and
+            // `ui/dialog.tsx` already honors `defaultPrevented`.
+            if (e.key !== "Escape") return;
+            e.preventDefault();
+            e.currentTarget.blur();
+          }}
         />
       </div>
       <MultiSearchSelect

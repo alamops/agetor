@@ -103,10 +103,3 @@ export function fontSizeShortcutAction(
       return null;
   }
 }
-
-/** Same platform-sniff convention as `RunPanel.tsx`'s `IS_MAC_PLATFORM`,
- *  duplicated here rather than imported — that constant isn't exported, and
- *  this module intentionally stays DOM-adjacent-but-standalone like `theme.ts`. */
-export function isMacPlatform(): boolean {
-  return typeof navigator !== "undefined" && /mac/i.test(navigator.platform || navigator.userAgent || "");
-}
