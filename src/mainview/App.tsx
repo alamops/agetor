@@ -35,6 +35,8 @@ import { UsageMeter } from "@/components/usage/UsageMeter";
 import { UsagePopover } from "@/components/usage/UsagePopover";
 import { visibleTopbarAgents } from "@/lib/usage";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
+import { isMacPlatform } from "@/lib/platform";
+import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
@@ -630,8 +632,46 @@ function AppInner() {
   // notification hook alert only on the FIRST prompt for a task (not once per
   // stacked prompt) and clear the alert only when the LAST one resolves.
   const pendingInputRef = useRef<PendingInputTracker>(new PendingInputTracker());
+  // Focus target for the board's Cmd/Ctrl+F handler below.
+  const boardSearchRef = useRef<HTMLInputElement>(null);
   useEffect(() => { tasksRef.current = tasks; }, [tasks]);
   useEffect(() => { selectedIdRef.current = selected?.id ?? null; }, [selected]);
+
+  // Cmd/Ctrl+F while no task details panel is open focuses the board's
+  // free-text search box and selects its contents so typing replaces the
+  // query. Ownership of the chord is complementary with RunPanel's own
+  // Cmd/Ctrl+F handler (RunPanel.tsx, the message-search shortcut), but not
+  // perfectly interlocked: on close, RunPanel's listener outlives this
+  // gate by at least one scheduler task, because its `setOpen(false)` is
+  // scheduled from a passive effect rather than applied synchronously —
+  // `selectedIdRef` below can already be null while that listener is still
+  // attached and its `open` state hasn't caught up. RunPanel additionally
+  // checks a synchronously-written `openRef` inside its handler and stays
+  // inert for that window, so this board listener is the only one that
+  // acts on a chord landing there. On open there's a one-frame rAF gap
+  // where neither fires, which is pre-existing and harmless. The gate
+  // reads `selectedIdRef` — kept current by the effect above — rather than
+  // `selected`, so this listener is attached once instead of being torn
+  // down and re-added on every kanban poll. Same higher-priority-layer
+  // guard as RunPanel (modal dialog / non-escape-only popover), bailing
+  // WITHOUT preventDefault so those layers keep their own behavior. No
+  // `.xterm` bail is needed here: terminals only mount inside RunPanel,
+  // where this listener is off.
+  useEffect(() => {
+    const isMac = isMacPlatform();
+    const onKey = (e: KeyboardEvent) => {
+      if (!isFindShortcut(e, isMac)) return;
+      if (selectedIdRef.current !== null) return;
+      if (document.querySelector(FIND_SHORTCUT_BLOCKING_LAYERS)) return;
+      const input = boardSearchRef.current;
+      if (!input) return;
+      e.preventDefault();
+      input.focus();
+      input.select();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
 
   // Confirm-on-quit. The main process emits `quit_request` over the app
   // SSE channel when Cmd+Q / window close lands while runs are active. We
@@ -1474,6 +1514,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             </div>
           )}
           <KanbanFilters
+            searchInputRef={boardSearchRef}
             textQuery={textQuery}
             onTextQueryChange={setTextQuery}
             repoFilter={repoFilter}

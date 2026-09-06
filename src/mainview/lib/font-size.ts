@@ -75,7 +75,8 @@ export function readFontSizeFromBoot(agetorGlobal: unknown, hash: string): numbe
 /**
  * Map a keydown to a font-size action, or `null` if the combo isn't one we
  * handle. The primary modifier is `metaKey` on macOS, `ctrlKey` elsewhere,
- * matching `RunPanel.tsx`'s Cmd/Ctrl+F convention exactly: the *other*
+ * matching `isFindShortcut`'s (`find-shortcut.ts`) Cmd/Ctrl+F convention
+ * exactly — `RunPanel.tsx` merely calls that predicate: the *other*
  * modifier being also held disqualifies (Mac wants meta-without-ctrl, other
  * platforms want ctrl-without-meta) so a combo like Ctrl+Cmd+= — which some
  * window managers or IMEs can report — doesn't ambiguously fire both this
@@ -102,11 +103,4 @@ export function fontSizeShortcutAction(
     default:
       return null;
   }
-}
-
-/** Same platform-sniff convention as `RunPanel.tsx`'s `IS_MAC_PLATFORM`,
- *  duplicated here rather than imported — that constant isn't exported, and
- *  this module intentionally stays DOM-adjacent-but-standalone like `theme.ts`. */
-export function isMacPlatform(): boolean {
-  return typeof navigator !== "undefined" && /mac/i.test(navigator.platform || navigator.userAgent || "");
 }

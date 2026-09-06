@@ -76,7 +76,7 @@ function rootInlineFontSize(page: Page): Promise<string> {
 }
 
 /** Same `metaKey` (Mac) vs `ctrlKey` (elsewhere) sniff the app itself uses
- *  (`isMacPlatform` in src/mainview/lib/font-size.ts), evaluated in-page so
+ *  (`isMacPlatform` in src/mainview/lib/platform.ts), evaluated in-page so
  *  the correct modifier is pressed regardless of the host platform Chromium
  *  reports. */
 async function shortcutModifier(page: Page): Promise<"Meta" | "Control"> {

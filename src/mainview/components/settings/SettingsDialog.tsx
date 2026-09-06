@@ -14,7 +14,7 @@ import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
 import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
 import { useFontSize } from "@/components/font-size-provider";
 import { useTheme } from "@/components/theme-provider";
-import { isMacPlatform } from "@/lib/font-size";
+import { isMacPlatform } from "@/lib/platform";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
 import { abbreviateHome, cn } from "@/lib/utils";
@@ -42,12 +42,12 @@ import {
   type ThemePreference,
 } from "../../../shared/types.ts";
 
-// Computed once at module load, same convention as RunPanel's
-// `IS_MAC_PLATFORM` — the Settings → General font-size hint text names the
-// platform-appropriate shortcut. The non-Mac string calls out "outside a
-// terminal" because `font-size-provider.tsx`'s keydown handler lets a
-// focused `.xterm` pane keep Ctrl+-/Ctrl+_ for readline's undo/literal
-// bindings there.
+// Computed once at module load, same convention as `isMacPlatform()` in
+// `lib/platform.ts` (the single sniff) — the Settings → General font-size
+// hint text names the platform-appropriate shortcut. The non-Mac string
+// calls out "outside a terminal" because `font-size-provider.tsx`'s keydown
+// handler lets a focused `.xterm` pane keep Ctrl+-/Ctrl+_ for readline's
+// undo/literal bindings there.
 const FONT_SIZE_HINT = isMacPlatform()
   ? "⌘= and ⌘− also work anywhere; ⌘0 resets."
   : "Ctrl+= and Ctrl+− also work anywhere outside a terminal; Ctrl+0 resets.";

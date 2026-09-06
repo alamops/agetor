@@ -18,6 +18,8 @@ import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
 import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { isMacPlatform } from "@/lib/platform";
+import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { shortenTaskPaths } from "@/lib/shorten-task-paths";
@@ -200,13 +202,8 @@ export const EXIT_DURATION_MS = 250;
 // fire inconsistently depending on which path last updated `nearBottomRef`.
 const NEAR_BOTTOM_PX = 80;
 
-// Computed once at module load rather than per keystroke — used by the
-// Cmd/Ctrl+F handler below to pick the platform-appropriate modifier
-// (`metaKey` on macOS, `ctrlKey` elsewhere). Agetor packages arm64-only for
-// macOS, but the dev webview (Vite) can run in any browser during
-// development, so this still branches rather than assuming Mac.
-const IS_MAC_PLATFORM =
-  typeof navigator !== "undefined" && /mac/i.test(navigator.platform || navigator.userAgent || "");
+// Computed once at module load — see `lib/platform.ts`; used by the Cmd/Ctrl+F handler below.
+const IS_MAC_PLATFORM = isMacPlatform();
 
 /**
  * Prefills the "Closes #N" (GitHub/GitLab) / "Issue #N" (Bitbucket) line
@@ -282,6 +279,15 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, agentMod
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
   const [open, setOpen] = useState<boolean>(!!task);
+  // Synchronously-written mirror of `open` for listeners that must not
+  // outlive the close: `open` itself only flips on a re-render scheduled
+  // from a passive effect (the `[task]` effect below calls `setOpen(false)`
+  // from inside a passive effect, which is default-priority, not sync), so
+  // it can land at least one scheduler task after App's `selectedIdRef` has
+  // already gone null. `openRef` is written at the same moment as the
+  // `setOpen` call it mirrors, so a listener that reads it sees the close
+  // immediately instead of racing the deferred re-render.
+  const openRef = useRef(false);
 
   // User-resizable width, persisted in localStorage (`panel-width.ts`).
   // Resolved synchronously in the initializer — an effect-time read would
@@ -363,9 +369,13 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, agentMod
       // while task=null, so every close path's setSelected(null) is a no-op).
       // The 2s kanban poll re-creates `selected` — and so re-runs this effect —
       // every tick, which is what made the bug intermittent.
-      const raf = requestAnimationFrame(() => setOpen(true));
+      const raf = requestAnimationFrame(() => {
+        openRef.current = true;
+        setOpen(true);
+      });
       return () => cancelAnimationFrame(raf);
     }
+    openRef.current = false;
     setOpen(false);
   }, [task]);
 
@@ -469,6 +479,7 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, agentMod
           onRefreshModels={onRefreshModels}
           homeDir={homeDir}
           open={open}
+          openRef={openRef}
           onClose={onClose}
           onShowDiff={onShowDiff}
           onArchive={onArchive}
@@ -496,6 +507,7 @@ function RunPanelBody({
   onRefreshModels,
   homeDir,
   open,
+  openRef,
   onClose,
   onShowDiff,
   onArchive,
@@ -517,6 +529,12 @@ function RunPanelBody({
    *  Cmd/Ctrl+F listener below so it doesn't hijack the shortcut while the
    *  panel is animating out or not actually visible. */
   open: boolean;
+  /** Synchronously-written mirror of `open` — see its doc comment in
+   *  `RunPanel`. Checked inside the Cmd/Ctrl+F handler itself (not just the
+   *  attaching effect) so the listener stays inert through the close-edge
+   *  window where `open` hasn't re-rendered yet but the board's own
+   *  `selectedIdRef` is already null. */
+  openRef: React.RefObject<boolean>;
   onClose: () => void;
   onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
@@ -1640,14 +1658,16 @@ function RunPanelBody({
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key.toLowerCase() !== "f" || e.altKey) return;
-      const wantsFind = IS_MAC_PLATFORM ? (e.metaKey && !e.ctrlKey) : e.ctrlKey;
-      if (!wantsFind) return;
-      // Cmd/Ctrl+F isn't Escape, so a popover that only wants Escape yielded
-      // to it (marked `data-popover-keys="escape-only"` — SlashAutocomplete,
-      // ExtensionPicker) shouldn't block this shortcut too; excluding those
-      // keeps Cmd+F live while the `/` menu or Extensions popover is open.
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]:not([data-popover-keys="escape-only"])')) return;
+      // The effect's `if (!open) return;` gate above only controls
+      // attachment — it can't see a close that happened after this effect
+      // last ran but before the deferred re-render that would detach it.
+      // This ref check makes the handler itself inert during that window,
+      // so the board's own listener (App.tsx) is the only one that acts on
+      // a chord landing there.
+      if (!openRef.current) return;
+      if (!isFindShortcut(e, IS_MAC_PLATFORM)) return;
+      // See `FIND_SHORTCUT_BLOCKING_LAYERS`'s doc comment for the escape-only carve-out.
+      if (document.querySelector(FIND_SHORTCUT_BLOCKING_LAYERS)) return;
       if ((e.target as Element | null)?.closest?.(".xterm")) return;
       e.preventDefault();
       if (searchOpen) {
