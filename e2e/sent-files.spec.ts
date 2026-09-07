@@ -188,7 +188,11 @@ test.describe("sent files to user", () => {
     // Evidence hook (opt-in): `AGETOR_E2E_SHOT_DIR=<dir>` saves a PNG of the
     // run panel with both cards rendered, for reports/PR descriptions.
     if (process.env.AGETOR_E2E_SHOT_DIR) {
-      await panel.screenshot({ path: `${process.env.AGETOR_E2E_SHOT_DIR}/sent-files-cards.png` });
+      const dir = process.env.AGETOR_E2E_SHOT_DIR;
+      await cards.first().scrollIntoViewIfNeeded();
+      await panel.screenshot({ path: `${dir}/sent-files-cards.png` });
+      await cards.first().screenshot({ path: `${dir}/sent-files-card-delivered.png` });
+      await cards.nth(1).screenshot({ path: `${dir}/sent-files-card-error.png` });
     }
 
     // --- (7) historical render: reload and re-open from persisted events --
