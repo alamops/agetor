@@ -300,6 +300,19 @@ registerNotifierBundle();
 const native: ApiNative = {
   openFileDialog: (opts) => Utils.openFileDialog(opts),
   openPath: (p) => Utils.openPath(p),
+  // No Electrobun `Utils.revealPath` equivalent — spawn macOS's own
+  // Finder-reveal command directly (agetor ships arm64 macOS only, so no
+  // cross-platform branch is needed). `open -R <path>` reveals AND selects
+  // the item in Finder, unlike a bare `open <path>` (which would launch it).
+  // Fire-and-forget, same "best-effort boolean" contract as `openPath`.
+  revealPath: (p) => {
+    try {
+      Bun.spawn(["open", "-R", p], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  },
   openExternal: (url) => Utils.openExternal(url),
   showNotification: (n) => showTaskNotification(n),
   focusWindow: () => focusMainWindow(),

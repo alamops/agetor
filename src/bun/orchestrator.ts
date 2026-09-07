@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { basename, join } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir } from "./db.ts";
+import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir } from "./db.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
 import { getDiscoveredEfforts } from "./agent-discovery.ts";
@@ -126,13 +126,23 @@ import type {
   GlobalEvent,
   RunEvent,
   RunStatus,
+  SentFileEntry,
   Task,
+  ToolResultAttachment,
   WorktreeGitStatus,
   WorktreeInfo,
   WorktreeStaleReason,
   WorktreeTeardownResult,
 } from "../shared/types.ts";
 import { WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
+import {
+  SENT_FILES_DELIVERED_RE,
+  parseSentFilesToolResult,
+  parseSentFilesToolUse,
+  sanitizeToolResultAttachments,
+  toolResultText,
+  type SentFilesRequest,
+} from "../shared/sent-files.ts";
 import { appendReferences } from "../shared/refs.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
 import { expandAtReferencesDetailed } from "./project-files.ts";
@@ -1320,6 +1330,205 @@ function maybeTrackClaudePlan(taskId: string, runId: string, stream: RunEvent["s
   if (next !== task!.plans) tasks.update(taskId, { plans: next });
 }
 
+/** Literal envelope substring for a `SendUserFile` tool_use chunk (see
+ *  `claude-tmux.ts`'s unspaced `JSON.stringify({ id, name, input, … })`) —
+ *  same cheap-prefilter idea as `TODO_FAMILY_TOOL_USE_MARKERS`, keeping the
+ *  common case (every other tool) a single `includes` away from a no-op. */
+const SENT_FILES_TOOL_USE_MARKER = '"name":"SendUserFile"';
+
+/** Loose substring pre-check on a `tool_result` chunk's raw JSON, cheaper
+ *  than `JSON.parse` + `toolResultText` — a real delivery message always
+ *  contains this phrase (`SENT_FILES_DELIVERED_RE` anchors on it), so a
+ *  `tool_result` chunk lacking it can only matter when a `tool_use` for the
+ *  SAME run is still pending in {@link pendingSentFilesByRun} (checked
+ *  first, and cheaply, in `maybeTrackSentFiles` below). */
+const SENT_FILES_RESULT_TEXT_MARKER = "delivered to user";
+
+/** Per-run, in-memory `toolUseId → SentFilesRequest` scratch space — plan §3
+ *  decision 4. Populated from a `SendUserFile` `tool_use` chunk, consumed
+ *  (and removed) by its confirming `tool_result`. Capped at
+ *  {@link MAX_PENDING_SENT_FILES_PER_RUN} entries per run (oldest evicted
+ *  first via `Map`'s insertion-order iteration) so a pathological run that
+ *  never gets a matching result can't grow this unbounded; cleared entirely
+ *  once the run leaves `active` (both `attachDoneHandler` settle branches
+ *  below) since nothing can arrive for a run that's no longer running. */
+const pendingSentFilesByRun = new Map<string, Map<string, SentFilesRequest>>();
+const MAX_PENDING_SENT_FILES_PER_RUN = 64;
+
+function rememberSentFilesRequest(runId: string, toolUseId: string, req: SentFilesRequest): void {
+  let stash = pendingSentFilesByRun.get(runId);
+  if (!stash) {
+    stash = new Map();
+    pendingSentFilesByRun.set(runId, stash);
+  }
+  // A repeat tool_use id (shouldn't happen — ids are unique per call — but
+  // cheap to guard) re-inserts at the END of Map's iteration order, which is
+  // fine: it's still the same entry being tracked, just refreshed.
+  stash.delete(toolUseId);
+  stash.set(toolUseId, req);
+  if (stash.size > MAX_PENDING_SENT_FILES_PER_RUN) {
+    const oldestKey = stash.keys().next().value;
+    if (oldestKey !== undefined) stash.delete(oldestKey);
+  }
+}
+
+/**
+ * Detect and persist delivered `SendUserFile` files from the generic chunk
+ * stream — plan §3 decision 4, `docs/plans/send-files-to-user.md`. Runs for
+ * EVERY agent kind (unlike claude-only plan tracking): the fx driver emits
+ * a synthetic `SendUserFile` tool_use/tool_result pair in the exact same
+ * wire shape claude-tmux uses (`fx-acp.ts`'s dormant `resource_link`
+ * mapping), so gating this on `kind` would silently drop fx's sends.
+ *
+ * - `tool_use` whose data matches {@link SENT_FILES_TOOL_USE_MARKER} and
+ *   parses via `parseSentFilesToolUse` is stashed in
+ *   {@link pendingSentFilesByRun} keyed by its tool_use id — nothing is
+ *   persisted yet (persisting on request, not delivery, would count files
+ *   that were never actually delivered).
+ * - `tool_result` looks up its `toolUseId` in the stash first (the common
+ *   case — same run, no restart in between). On a miss, falls back to
+ *   `runs.findToolUseEvent` (a restart or reattach-replay dropped the
+ *   in-memory stash) — re-parsing the original tool_use from `run_events` —
+ *   but only when the result text itself looks like a delivery
+ *   confirmation ({@link SENT_FILES_DELIVERED_RE}), so an ordinary
+ *   tool_result for some unrelated tool never pays for the DB lookup. A
+ *   still-unresolved `toolUseId` (map miss + fallback miss, e.g. a
+ *   coincidental "delivered to user" phrase in some other tool's output
+ *   with no matching `SendUserFile` request) is a silent no-op.
+ * - A resolved, non-error result persists one {@link SentFileEntry} per
+ *   requested path via `tasks.mergeSentFiles` (dedupes by path — a replayed
+ *   pair, or the same file delivered twice, is idempotent) and fires the
+ *   live-only `files-sent` `GlobalEvent`. An error result (`is_error`)
+ *   persists nothing and fires nothing — a failed send shouldn't inflate
+ *   the badge.
+ *
+ * Relative paths in `req.files` resolve against the run's cwd
+ * (`task.worktreePath ?? task.workdir` — the same precedence `/open-path`
+ * uses); an already-absolute path passes through unchanged.
+ * `size`/`mediaType`/`isImage` come from the tool_result's forwarded
+ * `attachments[]` (matched by exact path, tried against both the raw and
+ * the resolved form — claude's own attachments carry the same path it put
+ * in `input.files`, so this is mostly a defensive fallback), else `null`.
+ *
+ * Gated on `eventId !== null` at the very top: `null` means
+ * `runs.appendEvent`'s dedup path found the row already persisted (a
+ * reattach replay re-delivering a line this process already streamed
+ * before a restart) — that pair was already handled the first time
+ * through, so re-running detection here would be redundant work at best
+ * and, for the `tool_use` stash, would re-add an entry nothing will ever
+ * consume (its `tool_result` was already deduped away too, on the same
+ * replay). Never throws — the caller wraps this in try/catch, same
+ * "detection bugs must never break run settlement" contract as
+ * `maybeUpdateTodoProgress`/`maybeTrackClaudePlan` above.
+ */
+function maybeTrackSentFiles(
+  taskId: string,
+  runId: string,
+  stream: RunEvent["stream"],
+  data: string,
+  eventId: number | null,
+): void {
+  if (eventId === null) return;
+
+  if (stream === "tool_use") {
+    if (!data.includes(SENT_FILES_TOOL_USE_MARKER)) return;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (!parsed || typeof parsed !== "object") return;
+    const chunk = parsed as Record<string, unknown>;
+    const toolUseId = chunk.id;
+    const name = chunk.name;
+    if (typeof toolUseId !== "string" || toolUseId.length === 0) return;
+    if (typeof name !== "string") return;
+
+    const req = parseSentFilesToolUse(name, chunk.input);
+    if (!req) return;
+    rememberSentFilesRequest(runId, toolUseId, req);
+    return;
+  }
+
+  if (stream !== "tool_result") return;
+
+  const stash = pendingSentFilesByRun.get(runId);
+  const hasPending = !!stash && stash.size > 0;
+  if (!hasPending && !data.includes(SENT_FILES_RESULT_TEXT_MARKER)) return;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return;
+  }
+  if (!parsed || typeof parsed !== "object") return;
+  const chunk = parsed as Record<string, unknown>;
+  const toolUseId = chunk.toolUseId;
+  if (typeof toolUseId !== "string" || toolUseId.length === 0) return;
+
+  let req: SentFilesRequest | null = stash?.get(toolUseId) ?? null;
+  if (req) {
+    stash!.delete(toolUseId);
+  } else {
+    if (!SENT_FILES_DELIVERED_RE.test(toolResultText(chunk.content))) return;
+    const fallback = runs.findToolUseEvent(runId, toolUseId);
+    if (!fallback) return;
+
+    let fallbackParsed: unknown;
+    try {
+      fallbackParsed = JSON.parse(fallback.data);
+    } catch {
+      return;
+    }
+    if (!fallbackParsed || typeof fallbackParsed !== "object") return;
+    const fallbackChunk = fallbackParsed as Record<string, unknown>;
+    const fallbackName = fallbackChunk.name;
+    if (typeof fallbackName !== "string") return;
+    req = parseSentFilesToolUse(fallbackName, fallbackChunk.input);
+    if (!req) return;
+  }
+
+  const isError = chunk.isError === true;
+  const attachments = sanitizeToolResultAttachments(chunk.attachments) ?? [];
+  const res = parseSentFilesToolResult(chunk.content, isError, attachments);
+  if (!res.delivered) return;
+
+  const task = tasks.get(taskId);
+  if (!task) return;
+  const cwd = task.worktreePath ?? task.workdir;
+
+  const attachmentByPath = new Map<string, ToolResultAttachment>();
+  for (const a of res.attachments) attachmentByPath.set(a.path, a);
+
+  const now = Date.now();
+  const entries: SentFileEntry[] = req.files.map((rawPath) => {
+    const resolvedPath = isAbsolute(rawPath) ? rawPath : resolve(cwd, rawPath);
+    const attachment = attachmentByPath.get(rawPath) ?? attachmentByPath.get(resolvedPath) ?? null;
+    return {
+      path: resolvedPath,
+      size: attachment?.size ?? null,
+      mediaType: attachment?.mediaType ?? null,
+      isImage: attachment?.isImage ?? null,
+      sentAt: now,
+      runId,
+    };
+  });
+
+  tasks.mergeSentFiles(taskId, entries);
+  emitGlobal({
+    kind: "files-sent",
+    taskId,
+    runId,
+    count: entries.length,
+    caption: req.caption,
+    proactive: req.status === "proactive",
+    ts: now,
+  });
+}
+
 /**
  * Per-run chunk handler. Appends every event to `run_events`, fans out to
  * SSE listeners, and runs the claude API-error → `blocked` flip.
@@ -1384,6 +1593,13 @@ function makeChunkHandler(
       } catch {
         // Never let plan-history tracking break run settlement.
       }
+    }
+    // Sent-files ("Files sent to you" cards): SendUserFile tool_use/
+    // tool_result pairs, every agent kind (fx synthesizes the same pair).
+    try {
+      maybeTrackSentFiles(taskId, runId, stream, data, eventId);
+    } catch {
+      // Never let sent-files detection break run settlement.
     }
     // Claude API-error path: claude-tmux emits a sentinel status chunk on
     // synthetic `isApiErrorMessage` lines (529, 400, …) and resolves the
@@ -1558,6 +1774,9 @@ function attachDoneHandler(
       const wasSessionDied = handle?.sessionDied ?? false;
       const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
+      // Nothing can arrive for a run that's no longer running — drop its
+      // sent-files scratch space (plan §3 decision 4) so it can't leak.
+      pendingSentFilesByRun.delete(runId);
 
       // API error / session-death / unknown-command override the exit-code
       // mapping: the driver resolves the turn with code 0 (a clean end_turn
@@ -1665,6 +1884,7 @@ function attachDoneHandler(
       const wasSessionDied = handle?.sessionDied ?? false;
       const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
+      pendingSentFilesByRun.delete(runId);
       const newStatus: RunStatus = wasCancelled ? "cancelled" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: -1 });
       const task = tasks.get(taskId);

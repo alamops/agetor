@@ -12,6 +12,7 @@ export function makeTestNative(over: Partial<ApiNative> = {}): ApiNative {
   return {
     openFileDialog: async () => [],
     openPath: () => true,
+    revealPath: () => true,
     openExternal: () => true,
     showNotification: () => {},
     // Matches the headless/no-window reality: `false` means "no window to

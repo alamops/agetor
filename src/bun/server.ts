@@ -512,6 +512,14 @@ export interface ApiNative {
     allowsMultipleSelection: boolean;
   }): Promise<string[]>;
   openPath(p: string): boolean;
+  /** Reveal `p` in the OS file manager (Finder on macOS, the only release
+   *  target) with the item itself selected, rather than opening it with its
+   *  default application the way `openPath` does. Backs `POST /reveal-path`
+   *  (a `SendUserFile` tile's "Reveal in Finder" menu item). Returns
+   *  whether the reveal command was successfully dispatched, not whether
+   *  Finder actually surfaced the item — same "best-effort boolean" contract
+   *  as `openPath`/`openExternal`. */
+  revealPath(p: string): boolean;
   openExternal(url: string): boolean;
   showNotification(n: {
     title: string;
@@ -3978,6 +3986,49 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (!native) return notAvailableHeadless(req);
           const ok = native.openPath(abs);
           return json({ opened: ok, path: abs }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Reveal a file or directory in the OS file manager (Finder), with the
+      // item itself selected, via Electrobun's native bridge — the
+      // `SendUserFile` tile's "Reveal in Finder" menu item (plan §3 decision
+      // 7, `docs/plans/send-files-to-user.md`). Same abs-or-task-relative +
+      // `existsSync` + 501-headless contract as `/open-path` above — kept as
+      // a distinct route (rather than an `/open-path?reveal=1` flag) so
+      // headless behaves identically to `/open-path` (both 501 without
+      // `native`) and both are independently testable through
+      // `makeTestNative`.
+      "/reveal-path": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            taskId?: string;
+          };
+          const raw = typeof body.path === "string" ? body.path.trim() : "";
+          if (!raw) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          let abs = raw;
+          if (!path.isAbsolute(abs)) {
+            const t = body.taskId ? tasks.get(body.taskId) : null;
+            const cwd = t?.worktreePath ?? t?.workdir;
+            if (!cwd) {
+              return json(
+                { error: "relative path requires a taskId with a known cwd" },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            abs = path.resolve(cwd, abs);
+          }
+          if (!existsSync(abs)) {
+            return json(
+              { error: `path does not exist: ${abs}` },
+              { status: 404, headers: corsHeaders(req) },
+            );
+          }
+          if (!native) return notAvailableHeadless(req);
+          const ok = native.revealPath(abs);
+          return json({ revealed: ok, path: abs }, { headers: corsHeaders(req) });
         }),
       },
 
