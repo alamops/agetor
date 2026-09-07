@@ -1,3 +1,4 @@
+import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";import { cursorModelArg, FX_PROVIDER_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
 import { GEMINI_PROMPT_ARGV_MAX_BYTES } from "../shared/prompt-limits.ts";
 import { settleSubagentById } from "./claude-subagents.ts";
@@ -816,6 +817,20 @@ export function __getFakeDriver(taskId: string): FakeDriverInstance | undefined 
  */
 export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
 
+/**
+ * Prompt-marker trigger for the `SendUserFile` fake-driver scenario (see
+ * `makeFakeAgent` below): a substring in the *prompt* rather than an env var,
+ * same rationale as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER} above — the e2e
+ * suite's worker-scoped backend fixture (`e2e/fixtures.ts`) spawns one
+ * `headless.ts` per worker with a single fixed env block shared by every
+ * test/task in that worker, so a spec can't get its own env var into that
+ * already-running process, but CAN put anything it wants in `task.prompt` at
+ * task-create time. Exported so `e2e/sent-files.spec.ts` can reference the
+ * exact string instead of duplicating it (that spec can't `import` from
+ * `src/bun/*`, so it keeps a **literal copy** of this string).
+ */
+export const FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER = "__agetor_fake_claude_sent_files__";
+
 /** * Prompt-marker trigger for the `fx_permission` card scenario (see
  * `makeFakeAgent` below), same rationale as `FAKE_CLAUDE_TODOS_PROMPT_MARKER`
  * above: the e2e suite's worker-scoped backend fixture spawns one
@@ -864,7 +879,7 @@ function makeFakeAgent(
   taskId: string,
   prompt: string,
   onChunk: ChunkHandler,
-  fakeOpts: { runId?: string; mode?: string; kind?: AgentKind } = {},
+  fakeOpts: { runId?: string; mode?: string; kind?: AgentKind; cwd?: string } = {},
 ): SpawnedAgent {  const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
   const done = new Promise<number>((res) => { resolveDone = res; });
@@ -1028,7 +1043,123 @@ function makeFakeAgent(
       );
     });
     after(23, () => onChunk("assistant", "Starting Phase 1 — Investigate now."));
-    after(26, () => { onChunk("status", "turn complete"); resolveDone(0); });  } else if (prompt.includes(FAKE_CLAUDE_MONITOR_PROMPT_MARKER)) {
+    after(26, () => { onChunk("status", "turn complete"); resolveDone(0); });
+  } else if (
+    process.env.AGETOR_FAKE_CLAUDE_SENT_FILES === "1"
+    || prompt.includes(FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER)
+  ) {
+    // Test hook: simulate a `SendUserFile` session (see
+    // docs/plans/send-files-to-user.md) so orchestrator/RunPanel/board-badge/
+    // CLI tests can drive the sent-files card, the board's paperclip badge,
+    // and the error-card path end to end without a real claude CLI. Chunk
+    // shapes match exactly what claude-tmux.ts's real mapper produces: a
+    // `tool_use` chunk's `data` is `{id, name, input, serverSide}` and its
+    // matching `tool_result` chunk's `data` is `{toolUseId, content,
+    // isError, attachments?}` — `attachments` (T3, `claude-tmux.ts`) is
+    // present only on a successful result (claude's structured
+    // `toolUseResult.attachments`, sanitized via
+    // `sanitizeToolResultAttachments`); an errored result's `toolUseResult`
+    // is a bare string, so nothing is forwarded there.
+    //
+    // The scenario exercises the three states the card/badge need to cover:
+    //   1. A delivered `SendUserFile` call for two REAL files (a PNG and a
+    //      Markdown report, actually written under `<cwd>/agetor-sent/` so
+    //      the card's `/files/preview` image tile and its stat-driven file
+    //      tile have something real on disk to render) — the "2 files
+    //      delivered" card with an image tile (PNG) and a generic file tile
+    //      (Markdown), which is also what bumps `tasks.sent_files` / the
+    //      board's paperclip badge to a count of 2.
+    //   2. A second, ERRORED `SendUserFile` call pointed at the
+    //      `agetor-sent` DIRECTORY itself — mirrors the real, live-probed
+    //      claude behavior of rejecting a directory with
+    //      `<tool_use_error>Attachment "<path>" is not a regular file.
+    //      </tool_use_error>` (see `src/shared/sent-files.ts`'s header
+    //      comment) — the error card, whose lone tile renders folder-shaped
+    //      (stat-driven: the path IS a directory on disk).
+    //   3. The first tool_result's `attachments[]` gives the card real
+    //      `size`/`isImage`/`mediaType` metadata to render immediately,
+    //      without waiting on a live `/refs/resolve` stat round-trip.
+    //
+    // Only turn 1 (a fresh spawn) runs this scenario — same convention as
+    // every other canned scenario in this driver: a follow-up turn's prompt
+    // won't carry the marker unless the caller re-includes it.
+    const sentCwd = fakeOpts.cwd ?? process.cwd();
+    const sentDir = path.join(sentCwd, "agetor-sent");
+    mkdirSync(sentDir, { recursive: true });
+    const pngPath = path.join(sentDir, "chart.png");
+    const mdPath = path.join(sentDir, "report.md");
+    // A real, valid 1×1 transparent PNG (not just arbitrary bytes with a
+    // `.png` extension) — small, but enough for `/files/preview` and an
+    // `<img>` tile to actually decode and render it.
+    const pngBuffer = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+      "base64",
+    );
+    const mdContent = "# Fake report\n\nDelivered by the fake claude driver.\n";
+    writeFileSync(pngPath, pngBuffer);
+    writeFileSync(mdPath, mdContent);
+
+    after(5, () => onChunk("assistant", "Sending you the files."));
+    after(8, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "toolu_fake_sent_1",
+          name: "SendUserFile",
+          input: {
+            files: [pngPath, mdPath],
+            caption: "Fake delivery — a chart and its report",
+            status: "normal",
+            display: "render",
+          },
+          serverSide: false,
+        }),
+        "fake-sent-files-tu-1",
+      );
+    });
+    after(11, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({
+          toolUseId: "toolu_fake_sent_1",
+          content:
+            "2 files delivered to user.\n  " + pngPath + " → file_uuid: 00000000-0000-4000-8000-000000000001\n  "
+              + mdPath + " → file_uuid: 00000000-0000-4000-8000-000000000002",
+          isError: false,
+          attachments: [
+            { path: pngPath, size: pngBuffer.length, isImage: true, mediaType: "image/png" },
+            { path: mdPath, size: Buffer.byteLength(mdContent), isImage: false, mediaType: null },
+          ],
+        }),
+        "fake-sent-files-tr-1",
+      );
+    });
+    after(14, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "toolu_fake_sent_2",
+          name: "SendUserFile",
+          input: { files: [sentDir], caption: "Trying to send the whole folder", status: "normal" },
+          serverSide: false,
+        }),
+        "fake-sent-files-tu-2",
+      );
+    });
+    after(17, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({
+          toolUseId: "toolu_fake_sent_2",
+          content: `<tool_use_error>Attachment "${sentDir}" is not a regular file.</tool_use_error>`,
+          isError: true,
+        }),
+        "fake-sent-files-tr-2",
+      );
+    });
+    after(20, () => onChunk("assistant", "Done."));
+    after(23, () => { onChunk("status", "turn complete"); resolveDone(0); });
+  } else if (prompt.includes(FAKE_CLAUDE_MONITOR_PROMPT_MARKER)) {
     // Test hook: simulate arming a Claude Code `Monitor` and later ending it
     // — see FAKE_CLAUDE_MONITOR_PROMPT_MARKER's doc comment above for why
     // this scenario inserts/settles the `subagents` row itself instead of
@@ -1348,7 +1479,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     if (process.env.AGETOR_CLAUDE_DRIVER === "fake") {
       // Build the command anyway so the fake records the prompt going by;
       // the fake's behaviour doesn't depend on the argv shape.
-      buildCommand(harness, prompt, opts);      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });    }
+      buildCommand(harness, prompt, opts);      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto", cwd });    }
     // Pre-generate a session uuid when we're not resuming. The driver will
     // expect claude to write its JSONL at the deterministic path derived
     // from cwd + this uuid, replacing the previous mtime-poll race.
@@ -1386,7 +1517,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       // behavior is unchanged (see `makeFakeCursorPlanAgent`'s header).
       if (process.env.AGETOR_FAKE_CURSOR_PLAN === "1") {
         return makeFakeCursorPlanAgent(taskId, prompt, onChunk);
-      }      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });    }
+      }      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto", cwd });    }
     const built = buildCommand(harness, prompt, opts);
     return await spawnCursorViaTmux({
       taskId,
@@ -1409,7 +1540,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       // value tests can assert on (mirrors codex's fake `thread.started`
       // stand-in, `fake-codex-thread-${taskId}`).
       const sessionId = opts.resumeSessionId ?? `fake-gemini-session-${taskId}`;
-      onSessionId?.(sessionId);      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });    }
+      onSessionId?.(sessionId);      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto", cwd });    }
     // Pre-generate a session uuid when we're not resuming — mirrors claude's
     // pattern (`--session-id` up front) rather than codex's discover-later
     // pattern, even though the tmux HOSTING strategy below (one-shot per
@@ -1445,7 +1576,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       // (see the `onSessionId` doc on `SpawnAgentArgs`), not claude/gemini's
       // pre-generated-uuid pattern.
       onSessionId?.(`fake-fx-session-${taskId}`);
-      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto", kind: "fx" });
+      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto", kind: "fx", cwd });
     }
     const built = buildCommand(harness, prompt, { ...opts, runId });
     return spawnFxViaAcp({
@@ -1470,7 +1601,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     // Hand the orchestrator a thread id so it persists `codex_session_id` and
     // can route follow-ups through `codex exec resume` — mirrors what a real
     // `thread.started` event would deliver.
-    onSessionId?.(`fake-codex-thread-${taskId}`);    return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });  }
+    onSessionId?.(`fake-codex-thread-${taskId}`);    return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto", cwd });  }
   // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
   // worktree) so a codex `auto` run that has to write there escalates its
   // sandbox to full access. Computed here — the single choke point every codex

@@ -161,6 +161,10 @@ Assumptions proceeding on:
 | `/files/preview` size cap / cwd containment hardening | **out of scope** — pre-existing route posture, not made untrue by this change |
 | Windows/Linux reveal | **out of scope** — arm64 macOS is the only release target |
 | Subagent sends counted in the badge | **out of scope** — structural boundary shared with the todo tracker; cards still render in subagent tabs |
-| README mention | **out of scope** — README is reserved for headline capabilities (history brief); CLAUDE.md carries the architecture |
+| README mention | **in** — the README enumerates every CLI command and a curated route table, so `agetor files` and `POST /reveal-path` were added there at the Wave 3 checkpoint (and `/open-path`'s description corrected); a headline/Highlights blurb stays **out of scope** |
 
 Owner-deferred: none.
+
+## Status
+
+Waves 1–3 landed.
