@@ -182,6 +182,54 @@ test("event stream: an fx_permission interaction renders generically, sentinel s
   unmount();
 });
 
+test("event stream: a SendUserFile tool_use renders 📎 sending…, then folds its tool_result into 📎 sent … (size) with no ↳ result line", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const base = { runId: "runA", taskId: "taskA" };
+  const push = onTaskEvents!;
+  push({
+    ...base, stream: "tool_use",
+    data: JSON.stringify({
+      id: "toolu_1", name: "SendUserFile",
+      input: { files: ["/tmp/a.png", "/tmp/b.md"], caption: "here", status: "normal" },
+    }),
+    ts: 1,
+  });
+  await wait(80);
+
+  let frame = lastFrame() ?? "";
+  expect(frame).toContain("📎 sending 2 files: a.png, b.md");
+  expect(frame).not.toContain("▸ SendUserFile");
+
+  push({
+    ...base, stream: "tool_result",
+    data: JSON.stringify({
+      toolUseId: "toolu_1",
+      content: "2 files delivered to user.\n  /tmp/a.png → file_uuid: abc\n  /tmp/b.md → file_uuid: def",
+      isError: false,
+      attachments: [
+        { path: "/tmp/a.png", size: 2048, isImage: true, media_type: "image/png" },
+        { path: "/tmp/b.md", size: null, isImage: false, media_type: null },
+      ],
+    }),
+    ts: 2,
+  });
+  await wait(80);
+
+  frame = lastFrame() ?? "";
+  expect(frame).toContain("📎 sent 2 files: a.png (2.0 KB), b.md");
+  expect(frame).not.toContain("↳ result");
+  unmount();
+});
+
 // ── @ file autocomplete wiring (compose mode → Composer's fileEntries) ──────
 
 test("opening the composer fetches the task's project-file listing and feeds the @ popover", async () => {

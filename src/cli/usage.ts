@@ -71,6 +71,11 @@ export const USAGE: Record<string, string> = {
   the task succeeds / fails / starts waiting on you (macOS). --rebuild prints the
   latest run reconstructed from the on-disk claude JSONL (recovery).`,
 
+  files: `usage: agetor files <task-id> [--json]
+
+  List files the agent has sent you (SendUserFile) — basename, size, sent time,
+  and full path, newest first. --json prints the raw array (empty when none).`,
+
   cancel: `usage: agetor cancel <task-id>
 
   Stop the active run. The session stays alive for follow-ups (claude-code).`,
@@ -167,6 +172,7 @@ const ALIASES: Record<string, string> = {
   delete: "rm",
   harnesses: "harness",
   project: "projects",
+  sent: "files",
 };
 
 /** Resolve a command alias to its canonical name (for USAGE lookup). */

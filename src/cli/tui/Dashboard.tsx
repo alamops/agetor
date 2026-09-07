@@ -4,6 +4,14 @@ import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task, RunEvent } from "../../shared/types.ts";
 import { commitPushPrompt, isInternalStatusSentinel } from "../../shared/types.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
+import {
+  parseSentFilesToolUse,
+  parseSentFilesToolResult,
+  sanitizeToolResultAttachments,
+  sentFilesSummaryLine,
+  type SentFilesRequest,
+  type SentFilesResult,
+} from "../../shared/sent-files.ts";
 import { useTasks } from "./useTasks.ts";
 import { useCoalescedStream, eventKey } from "./useCoalescedStream.ts";
 import { useSpinner } from "./useSpinner.ts";
@@ -428,6 +436,14 @@ const TaskRow = memo(function TaskRow({
 });
 
 function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
+  // One pass over the visible window pairs every `SendUserFile` tool_use
+  // with its (possibly not-yet-arrived) tool_result — `EventLine` is
+  // per-event and can't see its neighbors, so the pairing has to happen
+  // here, above the map. Keyed by `toolUseId`: the paired `tool_result`
+  // line renders nothing (the tool_use line already covers it once a
+  // result exists), and the tool_use line itself renders `sending …` /
+  // `sent …` / `send failed …` in place of the generic `▸ SendUserFile`.
+  const sentFiles = useMemo(() => buildSentFilesIndex(events), [events]);
   return (
     <Box flexDirection="column">
       <Text wrap="truncate">
@@ -441,14 +457,64 @@ function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
         {events.length === 0 ? (
           <Text dimColor>no events yet</Text>
         ) : (
-          events.map((e) => <EventLine key={eventKey(e)} e={e} />)
+          events.map((e) => <EventLine key={eventKey(e)} e={e} sentFiles={sentFiles} />)
         )}
       </Box>
     </Box>
   );
 }
 
-const EventLine = memo(function EventLine({ e }: { e: RunEvent }) {
+/** `toolUseId → { req, result }` for every `SendUserFile` tool_use visible in
+ *  `events`, `result` being `null` until a matching `tool_result` arrives.
+ *  Mirrors `agetor logs`' closure map (`src/cli/commands/logs.ts`) but as a
+ *  pure one-shot pass over a fixed window rather than a streaming reducer —
+ *  the dashboard re-derives it every time the visible window changes instead
+ *  of mutating a map incrementally. */
+/** Shape of a `tool_result` event's parsed JSON, minus `toolUseId` (added
+ *  separately where the caller needs to key on it). */
+interface RawToolResult {
+  content?: unknown;
+  isError?: boolean;
+  attachments?: unknown;
+}
+
+function buildSentFilesIndex(
+  events: RunEvent[],
+): Map<string, { req: SentFilesRequest; result: SentFilesResult | null }> {
+  const reqById = new Map<string, SentFilesRequest>();
+  const rawResultById = new Map<string, RawToolResult>();
+
+  for (const e of events) {
+    if (e.stream === "tool_use") {
+      const t = tryParseJson(e.data) as { id?: string; name?: string; input?: unknown } | null;
+      if (t?.id && t.name) {
+        const req = parseSentFilesToolUse(t.name, t.input);
+        if (req) reqById.set(t.id, req);
+      }
+    } else if (e.stream === "tool_result") {
+      const t = tryParseJson(e.data) as (RawToolResult & { toolUseId?: string }) | null;
+      if (t?.toolUseId) rawResultById.set(t.toolUseId, t);
+    }
+  }
+
+  const index = new Map<string, { req: SentFilesRequest; result: SentFilesResult | null }>();
+  for (const [id, req] of reqById) {
+    const raw = rawResultById.get(id);
+    const result = raw
+      ? parseSentFilesToolResult(raw.content, raw.isError, sanitizeToolResultAttachments(raw.attachments))
+      : null;
+    index.set(id, { req, result });
+  }
+  return index;
+}
+
+const EventLine = memo(function EventLine({
+  e,
+  sentFiles,
+}: {
+  e: RunEvent;
+  sentFiles: Map<string, { req: SentFilesRequest; result: SentFilesResult | null }>;
+}) {
   switch (e.stream) {
     // `userMessageLines` (src/shared/user-message.ts) is the single source of
     // truth for rendering a raw user-turn string across all three surfaces —
@@ -490,14 +556,32 @@ const EventLine = memo(function EventLine({ e }: { e: RunEvent }) {
           {e.data}
         </Text>
       );
-    case "tool_use":
+    case "tool_use": {
+      // Full `JSON.parse` (not `jsonField`'s top-level string pluck) — a
+      // `SendUserFile` request lives in the nested `input` object, which
+      // `jsonField` can't reach.
+      const t = tryParseJson(e.data) as { id?: string; name?: string; input?: unknown } | null;
+      const paired = t?.id ? sentFiles.get(t.id) : undefined;
+      if (paired) {
+        return (
+          <Text color="magenta" wrap="truncate-end">
+            📎 {sentFilesSummaryLine(paired.req, paired.result)}
+          </Text>
+        );
+      }
       return (
         <Text color="magenta" wrap="truncate-end">
-          ▸ {jsonField(e.data, "name") ?? "tool"}
+          ▸ {t?.name ?? "tool"}
         </Text>
       );
-    case "tool_result":
+    }
+    case "tool_result": {
+      const t = tryParseJson(e.data) as { toolUseId?: string } | null;
+      // A `SendUserFile` result is folded into its paired tool_use line
+      // above (once it arrives) — nothing to render here for that pair.
+      if (t?.toolUseId && sentFiles.has(t.toolUseId)) return null;
       return <Text dimColor>  ↳ result</Text>;
+    }
     case "interaction":
       return (
         <Text color="yellow" wrap="truncate-end">
@@ -594,11 +678,10 @@ function unresolvedWarningFragment(tokens: string[]): string {
   return ` · ⚠ ${n} @ ref${n === 1 ? "" : "s"} won't resolve: ${preview}`;
 }
 
-function jsonField(s: string, field: string): string | undefined {
+function tryParseJson(s: string): unknown {
   try {
-    const v = JSON.parse(s) as Record<string, unknown>;
-    return typeof v[field] === "string" ? (v[field] as string) : undefined;
+    return JSON.parse(s);
   } catch {
-    return undefined;
+    return null;
   }
 }

@@ -228,3 +228,102 @@ test("logs --rebuild: a slash-command whose args contain a tag renders you›/na
   ]);
   expect(outputs[0]).not.toContain("<context>");
 });
+
+// --- SendUserFile pairing (src/shared/sent-files.ts) -----------------------
+// A `SendUserFile` tool_use always renders its "sending" form on its own
+// line; when a later `tool_result` event carries the matching `toolUseId`,
+// that tool_result line renders the final `sent …` / `send failed …` form
+// INSTEAD of the generic `↳ result`/`↳ error` — both lines print (this is a
+// scrolling log, not a live-redrawn card), which is what lets `--rebuild`
+// and `--follow` show progress the same way.
+
+test("logs --rebuild: a SendUserFile tool_use renders a 'sending' line", async () => {
+  outputs.length = 0;
+  const e: RunEvent = {
+    runId: "run1", taskId: "t1", stream: "tool_use",
+    data: JSON.stringify({
+      id: "toolu_1", name: "SendUserFile",
+      input: { files: ["/tmp/a.png", "/tmp/b.md"], caption: "here", status: "normal" },
+    }),
+    ts: 1,
+  };
+  currentClient = makeClient([e]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]).toBe("📎 sending 2 files: a.png, b.md");
+});
+
+test("logs --rebuild: a SendUserFile tool_use paired with a delivered tool_result renders 'sending' then 'sent … (size)'", async () => {
+  outputs.length = 0;
+  const events: RunEvent[] = [
+    {
+      runId: "run1", taskId: "t1", stream: "tool_use",
+      data: JSON.stringify({
+        id: "toolu_1", name: "SendUserFile",
+        input: { files: ["/tmp/a.png", "/tmp/b.md"], caption: "here", status: "normal" },
+      }),
+      ts: 1,
+    },
+    {
+      runId: "run1", taskId: "t1", stream: "tool_result",
+      data: JSON.stringify({
+        toolUseId: "toolu_1",
+        content: "2 files delivered to user.\n  /tmp/a.png → file_uuid: abc\n  /tmp/b.md → file_uuid: def",
+        isError: false,
+        attachments: [
+          { path: "/tmp/a.png", size: 2048, isImage: true, media_type: "image/png" },
+          { path: "/tmp/b.md", size: null, isImage: false, media_type: null },
+        ],
+      }),
+      ts: 2,
+    },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(2);
+  expect(outputs[0]).toBe("📎 sending 2 files: a.png, b.md");
+  expect(outputs[1]).toBe("📎 sent 2 files: a.png (2.0 KB), b.md");
+});
+
+test("logs --rebuild: a SendUserFile tool_use paired with an errored tool_result renders 'send failed (…): <error>' instead of ↳ error", async () => {
+  outputs.length = 0;
+  const events: RunEvent[] = [
+    {
+      runId: "run1", taskId: "t1", stream: "tool_use",
+      data: JSON.stringify({
+        id: "toolu_2", name: "SendUserFile",
+        input: { files: ["/tmp/dir"], status: "normal" },
+      }),
+      ts: 1,
+    },
+    {
+      runId: "run1", taskId: "t1", stream: "tool_result",
+      data: JSON.stringify({
+        toolUseId: "toolu_2",
+        content: '<tool_use_error>Attachment "/tmp/dir" is not a regular file.</tool_use_error>',
+        isError: true,
+      }),
+      ts: 2,
+    },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(2);
+  expect(outputs[0]).toBe("📎 sending 1 file: dir");
+  expect(outputs[1]).toBe('📎 send failed (dir): Attachment "/tmp/dir" is not a regular file.');
+  expect(outputs[1]).not.toContain("↳");
+  expect(outputs[1]).not.toContain("<tool_use_error>");
+});
+
+test("logs --rebuild: an ordinary (non-SendUserFile) tool_use/tool_result pair is unaffected", async () => {
+  outputs.length = 0;
+  const events: RunEvent[] = [
+    { runId: "run1", taskId: "t1", stream: "tool_use", data: JSON.stringify({ id: "toolu_9", name: "Bash", input: { command: "ls" } }), ts: 1 },
+    { runId: "run1", taskId: "t1", stream: "tool_result", data: JSON.stringify({ toolUseId: "toolu_9", content: "ok", isError: false }), ts: 2 },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(2);
+  expect(outputs[0]).toBe("▸ Bash");
+  expect(outputs[1]).toBe("  ↳ result");
+});
