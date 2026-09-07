@@ -2,8 +2,14 @@
 // surface (`AttachmentChips`, `SentFilesCard`): the path is genuinely gone
 // (a 404 from the server) vs. the server found it but couldn't open it (OS
 // declined, headless 501, a relative path with no resolvable cwd, a network
-// error). Extracted verbatim out of `AttachmentChips.tsx` so both surfaces
-// render byte-identical copy/markup/ids instead of drifting apart.
+// error). Extracted out of `AttachmentChips.tsx` so both surfaces render
+// identical copy/markup/ids instead of drifting apart — NOT a behavior-
+// preserving extraction, though: both dialogs' own Close button now routes
+// through the same `onClose` prop callers already wire up for Escape/
+// backdrop dismissal, where before the Close button had its own separate
+// handler. In `AttachmentChips.tsx` this means clicking Close now also
+// clears that chip's remembered 404 mark, which previously happened only
+// via Escape/backdrop — a deliberate unification, not an accident.
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 

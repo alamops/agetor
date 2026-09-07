@@ -437,13 +437,17 @@ const TaskRow = memo(function TaskRow({
 
 function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
   // One pass over the visible window pairs every `SendUserFile` tool_use
-  // with its (possibly not-yet-arrived) tool_result — `EventLine` is
-  // per-event and can't see its neighbors, so the pairing has to happen
-  // here, above the map. Keyed by `toolUseId`: the paired `tool_result`
-  // line renders nothing (the tool_use line already covers it once a
-  // result exists), and the tool_use line itself renders `sending …` /
-  // `sent …` / `send failed …` in place of the generic `▸ SendUserFile`.
-  const sentFiles = useMemo(() => buildSentFilesIndex(events), [events]);
+  // with its (possibly not-yet-arrived) tool_result and formats the result
+  // as a PRIMITIVE per event — never a Map. `events` (the `visible` slice in
+  // the parent) is a new array reference on every coalesced flush even when
+  // its content is unchanged, so a Map computed from it and handed to every
+  // `EventLine` as a prop would also be a new reference every flush,
+  // defeating `EventLine`'s `memo` for the entire (up to 500-line) window and
+  // re-running `tryParseJson` on every tool_use/tool_result each time
+  // (review finding). A primitive (`string | null | undefined`) compares by
+  // value, so an unrelated line's `sentLine` prop stays `undefined` across
+  // flushes and `EventLine`'s shallow memo bails out for it.
+  const sentLines = useMemo(() => buildSentFilesLines(events), [events]);
   return (
     <Box flexDirection="column">
       <Text wrap="truncate">
@@ -457,19 +461,15 @@ function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
         {events.length === 0 ? (
           <Text dimColor>no events yet</Text>
         ) : (
-          events.map((e) => <EventLine key={eventKey(e)} e={e} sentFiles={sentFiles} />)
+          events.map((e) => (
+            <EventLine key={eventKey(e)} e={e} sentLine={sentLines.get(eventKey(e))} />
+          ))
         )}
       </Box>
     </Box>
   );
 }
 
-/** `toolUseId → { req, result }` for every `SendUserFile` tool_use visible in
- *  `events`, `result` being `null` until a matching `tool_result` arrives.
- *  Mirrors `agetor logs`' closure map (`src/cli/commands/logs.ts`) but as a
- *  pure one-shot pass over a fixed window rather than a streaming reducer —
- *  the dashboard re-derives it every time the visible window changes instead
- *  of mutating a map incrementally. */
 /** Shape of a `tool_result` event's parsed JSON, minus `toolUseId` (added
  *  separately where the caller needs to key on it). */
 interface RawToolResult {
@@ -478,23 +478,48 @@ interface RawToolResult {
   attachments?: unknown;
 }
 
+/** Cheap literal substring every raw `SendUserFile` tool_use JSON blob
+ *  contains — checked before `JSON.parse` so an unrelated tool_use event
+ *  (`TodoWrite`, `Bash`, `Read`, …) never pays a parse here. */
+const SEND_USER_FILE_MARKER = '"name":"SendUserFile"';
+
+/** Extracts a `tool_result`'s `toolUseId` without a full `JSON.parse` — lets
+ *  callers skip parsing a result that can't possibly pair with a known
+ *  `SendUserFile` tool_use id. */
+const TOOL_RESULT_ID_RE = /"toolUseId":"([^"]*)"/;
+
+/** `toolUseId → { req, result }` for every `SendUserFile` tool_use visible in
+ *  `events`, `result` being `null` until a matching `tool_result` arrives.
+ *  Mirrors `agetor logs`' closure map (`src/cli/commands/logs.ts`) but as a
+ *  pure one-shot pass over a fixed window rather than a streaming reducer —
+ *  the dashboard re-derives it every time the visible window changes instead
+ *  of mutating a map incrementally. Every event outside this pairing is
+ *  skipped without a `JSON.parse`: a `tool_use` must contain
+ *  {@link SEND_USER_FILE_MARKER} before it's parsed, and a `tool_result` is
+ *  parsed only once its (regex-extracted) `toolUseId` matches one of the ids
+ *  collected from the first pass — a `bash`/`Read`/`TodoWrite` tool line
+ *  never reaches `JSON.parse` here. */
 function buildSentFilesIndex(
   events: RunEvent[],
 ): Map<string, { req: SentFilesRequest; result: SentFilesResult | null }> {
   const reqById = new Map<string, SentFilesRequest>();
-  const rawResultById = new Map<string, RawToolResult>();
-
   for (const e of events) {
-    if (e.stream === "tool_use") {
-      const t = tryParseJson(e.data) as { id?: string; name?: string; input?: unknown } | null;
-      if (t?.id && t.name) {
-        const req = parseSentFilesToolUse(t.name, t.input);
-        if (req) reqById.set(t.id, req);
-      }
-    } else if (e.stream === "tool_result") {
-      const t = tryParseJson(e.data) as (RawToolResult & { toolUseId?: string }) | null;
-      if (t?.toolUseId) rawResultById.set(t.toolUseId, t);
+    if (e.stream !== "tool_use" || !e.data.includes(SEND_USER_FILE_MARKER)) continue;
+    const t = tryParseJson(e.data) as { id?: string; name?: string; input?: unknown } | null;
+    if (t?.id && t.name) {
+      const req = parseSentFilesToolUse(t.name, t.input);
+      if (req) reqById.set(t.id, req);
     }
+  }
+  if (reqById.size === 0) return new Map();
+
+  const rawResultById = new Map<string, RawToolResult>();
+  for (const e of events) {
+    if (e.stream !== "tool_result") continue;
+    const id = TOOL_RESULT_ID_RE.exec(e.data)?.[1];
+    if (!id || !reqById.has(id)) continue;
+    const t = tryParseJson(e.data) as (RawToolResult & { toolUseId?: string }) | null;
+    if (t?.toolUseId) rawResultById.set(t.toolUseId, t);
   }
 
   const index = new Map<string, { req: SentFilesRequest; result: SentFilesResult | null }>();
@@ -508,12 +533,39 @@ function buildSentFilesIndex(
   return index;
 }
 
+/** `eventKey(e) → already-formatted "📎 …" line` for a `SendUserFile`
+ *  tool_use, `null` for its paired tool_result (renders nothing — the
+ *  tool_use line already covers it), or simply ABSENT from the map for
+ *  every unrelated event. That absence is what makes this safe to hand to
+ *  `EventLine` as a prop: `Map.get` on a missing key always returns the same
+ *  `undefined` primitive, so an unrelated line's prop is value-equal across
+ *  flushes even though the Map itself is a fresh object every time —
+ *  exported for the primitive-prop shape assertion in Dashboard.test.tsx. */
+export function buildSentFilesLines(events: RunEvent[]): Map<string, string | null> {
+  const index = buildSentFilesIndex(events);
+  if (index.size === 0) return new Map();
+
+  const lines = new Map<string, string | null>();
+  for (const e of events) {
+    if (e.stream === "tool_use") {
+      if (!e.data.includes(SEND_USER_FILE_MARKER)) continue;
+      const t = tryParseJson(e.data) as { id?: string } | null;
+      const entry = t?.id ? index.get(t.id) : undefined;
+      if (entry) lines.set(eventKey(e), `📎 ${sentFilesSummaryLine(entry.req, entry.result)}`);
+    } else if (e.stream === "tool_result") {
+      const id = TOOL_RESULT_ID_RE.exec(e.data)?.[1];
+      if (id && index.has(id)) lines.set(eventKey(e), null);
+    }
+  }
+  return lines;
+}
+
 const EventLine = memo(function EventLine({
   e,
-  sentFiles,
+  sentLine,
 }: {
   e: RunEvent;
-  sentFiles: Map<string, { req: SentFilesRequest; result: SentFilesResult | null }>;
+  sentLine: string | null | undefined;
 }) {
   switch (e.stream) {
     // `userMessageLines` (src/shared/user-message.ts) is the single source of
@@ -557,18 +609,18 @@ const EventLine = memo(function EventLine({
         </Text>
       );
     case "tool_use": {
-      // Full `JSON.parse` (not `jsonField`'s top-level string pluck) — a
-      // `SendUserFile` request lives in the nested `input` object, which
-      // `jsonField` can't reach.
-      const t = tryParseJson(e.data) as { id?: string; name?: string; input?: unknown } | null;
-      const paired = t?.id ? sentFiles.get(t.id) : undefined;
-      if (paired) {
+      // `sentLine` is the already-formatted "📎 …" text for a `SendUserFile`
+      // call (computed once, above, in `buildSentFilesLines`) — `undefined`
+      // for every other tool, in which case fall back to the generic
+      // `▸ <name>` line (a fresh, but cheap, per-line parse just for the name).
+      if (typeof sentLine === "string") {
         return (
           <Text color="magenta" wrap="truncate-end">
-            📎 {sentFilesSummaryLine(paired.req, paired.result)}
+            {sentLine}
           </Text>
         );
       }
+      const t = tryParseJson(e.data) as { name?: string } | null;
       return (
         <Text color="magenta" wrap="truncate-end">
           ▸ {t?.name ?? "tool"}
@@ -576,10 +628,10 @@ const EventLine = memo(function EventLine({
       );
     }
     case "tool_result": {
-      const t = tryParseJson(e.data) as { toolUseId?: string } | null;
       // A `SendUserFile` result is folded into its paired tool_use line
-      // above (once it arrives) — nothing to render here for that pair.
-      if (t?.toolUseId && sentFiles.has(t.toolUseId)) return null;
+      // above (once it arrives) — `sentLine === null` marks that pairing;
+      // nothing to render here for it.
+      if (sentLine === null) return null;
       return <Text dimColor>  ↳ result</Text>;
     }
     case "interaction":

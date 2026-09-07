@@ -7,14 +7,22 @@ function req(files: string[], overrides: Partial<SentFilesRequest> = {}): SentFi
 }
 
 function result(overrides: Partial<SentFilesResult> = {}): SentFilesResult {
-  return { delivered: true, deliveredCount: null, error: null, attachments: [], ...overrides };
+  return { delivered: true, deliveredCount: null, error: null, isError: false, attachments: [], ...overrides };
 }
 
 describe("buildSentFileTiles", () => {
   test("image kind: from isImagePath when no attachment/stat says otherwise", () => {
     const tiles = buildSentFileTiles(req(["/tmp/chart.png"]), null, null);
     expect(tiles).toEqual([
-      { path: "/tmp/chart.png", name: "chart.png", kind: "image", exists: null, size: null, mediaType: null },
+      {
+        path: "/tmp/chart.png",
+        name: "chart.png",
+        kind: "image",
+        previewable: true,
+        exists: null,
+        size: null,
+        mediaType: null,
+      },
     ]);
   });
 
@@ -30,6 +38,31 @@ describe("buildSentFileTiles", () => {
     });
     const tiles = buildSentFileTiles(req(["/tmp/blob"]), r, null);
     expect(tiles[0]?.kind).toBe("image");
+  });
+
+  test("previewable: true when kind is image and the path itself has a canonical image extension", () => {
+    const tiles = buildSentFileTiles(req(["/tmp/chart.png"]), null, null);
+    expect(tiles[0]?.previewable).toBe(true);
+  });
+
+  test("previewable: false when kind is image but the path's extension isn't a canonical image one — attachment/mediaType said 'image', extension didn't", () => {
+    const r = result({ attachments: [{ path: "/tmp/blob", size: null, isImage: true, mediaType: null }] });
+    const tiles = buildSentFileTiles(req(["/tmp/blob"]), r, null);
+    expect(tiles[0]?.kind).toBe("image");
+    expect(tiles[0]?.previewable).toBe(false);
+  });
+
+  test("previewable: false for a non-image kind", () => {
+    const tiles = buildSentFileTiles(req(["/tmp/report.md"]), null, null);
+    expect(tiles[0]?.kind).toBe("file");
+    expect(tiles[0]?.previewable).toBe(false);
+  });
+
+  test("previewable: false for a folder kind even when the path looks like an image", () => {
+    const stats: PathStats = new Map([["/tmp/pictures.png", { isDirectory: true }]]);
+    const tiles = buildSentFileTiles(req(["/tmp/pictures.png"]), null, stats);
+    expect(tiles[0]?.kind).toBe("folder");
+    expect(tiles[0]?.previewable).toBe(false);
   });
 
   test("file kind: plain non-image path with no attachment/stat evidence", () => {
@@ -124,10 +157,30 @@ describe("sentFilesStatus", () => {
   });
 
   test("error: surfaces the tool's error text verbatim", () => {
-    const r = result({ delivered: false, error: "Attachment is not a regular file." });
+    const r = result({ delivered: false, isError: true, error: "Attachment is not a regular file." });
     expect(sentFilesStatus(req(["/tmp/dir"]), r)).toEqual({
       tone: "error",
       text: "Attachment is not a regular file.",
+    });
+  });
+
+  test("warning: a non-error, undelivered result (e.g. declined) renders 'Not delivered — <error>'", () => {
+    const r = result({
+      delivered: false,
+      isError: false,
+      error: "Declined — Claude is waiting for your direction.",
+    });
+    expect(sentFilesStatus(req(["/tmp/a.png"]), r)).toEqual({
+      tone: "warning",
+      text: "Not delivered — Declined — Claude is waiting for your direction.",
+    });
+  });
+
+  test("warning: falls back to 'Not delivered.' when a non-error, undelivered result carries no error text", () => {
+    const r = result({ delivered: false, isError: false, error: null });
+    expect(sentFilesStatus(req(["/tmp/a.png"]), r)).toEqual({
+      tone: "warning",
+      text: "Not delivered — Not delivered.",
     });
   });
 

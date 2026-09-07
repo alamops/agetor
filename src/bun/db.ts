@@ -1236,11 +1236,16 @@ export const runs = {
    * agetor restart mid-flight or a reattach replay can miss it, and this is
    * how the confirming `tool_result` re-derives the original request.
    *
-   * A SQL `LIKE '%"id":"<toolUseId>"%'` prefilter narrows the scan to the
-   * indexed `(run_id, stream)` rows (cheap; avoids a `JSON.parse` of every
-   * tool_use the run ever had) and the 5-row cap bounds the pathological
-   * case of many tool_use rows sharing a substring match; each candidate is
-   * then `JSON.parse`d and only the first whose parsed `id` field is an
+   * There is no index on `(run_id, stream)` — only `idx_run_events_run
+   * (run_id, id)` and the partial `idx_run_events_user_history` exist — so
+   * this scans the run's rows via `idx_run_events_run` and evaluates
+   * `stream = 'tool_use'` plus the `LIKE '%"id":"<toolUseId>"%'` prefilter
+   * against each row's `data` column-by-column; that's fine because this
+   * fallback is rare (the in-memory map-hit path above almost always
+   * resolves it first). The LIKE prefilter still avoids a `JSON.parse` of
+   * every tool_use the run ever had, and the 5-row cap bounds the
+   * pathological case of many tool_use rows sharing a substring match; each
+   * candidate is then `JSON.parse`d and only the first whose parsed `id` field is an
    * EXACT match to `toolUseId` is returned — the LIKE pattern is a filter,
    * never the source of truth, so a substring collision (one id embedded in
    * another) can't misattribute a delivery.

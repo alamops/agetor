@@ -185,6 +185,12 @@ test.describe("sent files to user", () => {
     await expect(folderTile).toHaveAttribute("data-kind", "folder");
     await expect(folderTile.getByText("agetor-sent", { exact: true })).toBeVisible();
 
+    // Evidence hook (opt-in): `AGETOR_E2E_SHOT_DIR=<dir>` saves a PNG of the
+    // run panel with both cards rendered, for reports/PR descriptions.
+    if (process.env.AGETOR_E2E_SHOT_DIR) {
+      await panel.screenshot({ path: `${process.env.AGETOR_E2E_SHOT_DIR}/sent-files-cards.png` });
+    }
+
     // --- (7) historical render: reload and re-open from persisted events --
     await page.reload();
     await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();

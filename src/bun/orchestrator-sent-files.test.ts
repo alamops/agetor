@@ -115,7 +115,7 @@ function collectFilesSentEvents(): { events: GlobalEvent[]; stop: () => void } {
 
 // --- Sent-files detection: delivered pair ----------------------------------
 
-test("a delivered SendUserFile tool_use/tool_result pair persists sentFiles (relative path resolved under the task's workdir) and fires one files-sent event", async () => {
+test("a delivered SendUserFile tool_use/tool_result pair persists sentFiles sourced from attachments (relative path resolved under the task's workdir) and fires one files-sent event", async () => {
   const { id, workdir } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
   const { events, stop } = collectFilesSentEvents();
@@ -132,6 +132,9 @@ test("a delivered SendUserFile tool_use/tool_result pair persists sentFiles (rel
       status: "proactive",
     }),
   );
+  // Both requested files have a matching attachment here (an attachment can
+  // itself carry a relative path — entries are sourced from attachments, so
+  // this also exercises relative-path resolution on that source).
   __dispatchChunkForTest(
     runId,
     id,
@@ -139,6 +142,7 @@ test("a delivered SendUserFile tool_use/tool_result pair persists sentFiles (rel
     "tool_result",
     toolResult("toolu_s1", "2 files delivered to user.", false, [
       { path: "/abs/a.png", size: 10, isImage: true, mediaType: "image/png" },
+      { path: "rel/b.md", size: 20, isImage: false, mediaType: "text/markdown" },
     ]),
   );
   stop();
@@ -157,9 +161,9 @@ test("a delivered SendUserFile tool_use/tool_result pair persists sentFiles (rel
   const resolvedB = path.resolve(workdir, "rel/b.md");
   const b = byPath.get(resolvedB);
   expect(b).toBeTruthy();
-  expect(b?.size).toBeNull();
-  expect(b?.mediaType).toBeNull();
-  expect(b?.isImage).toBeNull();
+  expect(b?.size).toBe(20);
+  expect(b?.mediaType).toBe("text/markdown");
+  expect(b?.isImage).toBe(false);
 
   expect(events.length).toBe(1);
   expect(events[0]).toMatchObject({
@@ -174,6 +178,75 @@ test("a delivered SendUserFile tool_use/tool_result pair persists sentFiles (rel
   // Server-managed delivery state — never bumps updated_at (same rationale
   // as markSeen/markUnread/noteAssistantEvent).
   expect(task.updatedAt).toBe(before.updatedAt);
+
+  await settle();
+  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+});
+
+test("attachments are the authoritative delivered set: a request for 2 files whose attachments only confirm 1 persists 1 entry, count 1", async () => {
+  const { id } = await newClaudeTask();
+  const runId = await startAndGetRunId(id);
+  const { events, stop } = collectFilesSentEvents();
+
+  __dispatchChunkForTest(
+    runId,
+    id,
+    "claude-code",
+    "tool_use",
+    toolUse("toolu_s1", "SendUserFile", { files: ["/abs/a.png", "/abs/b.md"], caption: null, status: null }),
+  );
+  __dispatchChunkForTest(
+    runId,
+    id,
+    "claude-code",
+    "tool_result",
+    // claude's own toolUseResult.attachments only reports one of the two
+    // requested paths — only that one should be persisted.
+    toolResult("toolu_s1", "2 files delivered to user.", false, [
+      { path: "/abs/a.png", size: 10, isImage: true, mediaType: "image/png" },
+    ]),
+  );
+  stop();
+
+  const task = tasks.get(id)!;
+  expect(task.sentFiles?.length).toBe(1);
+  expect(task.sentFiles?.[0]?.path).toBe("/abs/a.png");
+  expect(task.sentFiles?.[0]?.size).toBe(10);
+
+  expect(events.length).toBe(1);
+  expect(events[0]).toMatchObject({ count: 1 });
+
+  await settle();
+  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+});
+
+// --- Fix 1: a declined/interrupted (non-error) result is not delivered ------
+
+test("a non-error 'Declined' SendUserFile result (claude-tmux.ts's interrupt rewrite) persists nothing and fires no files-sent event", async () => {
+  const { id } = await newClaudeTask();
+  const runId = await startAndGetRunId(id);
+  const { events, stop } = collectFilesSentEvents();
+
+  __dispatchChunkForTest(
+    runId,
+    id,
+    "claude-code",
+    "tool_use",
+    toolUse("toolu_s1", "SendUserFile", { files: ["/abs/a.png"], caption: null, status: null }),
+  );
+  __dispatchChunkForTest(
+    runId,
+    id,
+    "claude-code",
+    "tool_result",
+    // isError: false — claude-tmux.ts rewrites an interrupted/declined
+    // SendUserFile tool_result to a non-error result with exactly this text.
+    toolResult("toolu_s1", "Declined — Claude is waiting for your direction.", false),
+  );
+  stop();
+
+  expect(tasks.get(id)!.sentFiles).toBeNull();
+  expect(events.length).toBe(0);
 
   await settle();
   db.run(`DELETE FROM tasks WHERE id = ?`, [id]);

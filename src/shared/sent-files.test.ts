@@ -69,16 +69,66 @@ describe("parseSentFilesToolResult — success", () => {
     expect(result.deliveredCount).toBe(1);
   });
 
-  test("non-error unrecognized text still counts as delivered, with a null count", () => {
-    const result = parseSentFilesToolResult("something unexpected happened", false, null);
+  test("non-error unrecognized text WITH non-empty attachments still counts as delivered, with a null count", () => {
+    const attachments: ToolResultAttachment[] = [
+      { path: "/abs/a.png", size: 10, isImage: true, mediaType: "image/png" },
+    ];
+    const result = parseSentFilesToolResult("something unexpected happened", false, attachments);
     expect(result.delivered).toBe(true);
     expect(result.deliveredCount).toBeNull();
     expect(result.error).toBeNull();
+    expect(result.isError).toBe(false);
+    expect(result.attachments).toEqual(attachments);
   });
 
   test("no attachments argument defaults to an empty array", () => {
     const result = parseSentFilesToolResult(successText(1, ["/a.png"]), false);
     expect(result.attachments).toEqual([]);
+  });
+
+  test("delivered results carry isError: false", () => {
+    const result = parseSentFilesToolResult(successText(1, ["/abs/a.png"]), false, null);
+    expect(result.isError).toBe(false);
+  });
+});
+
+describe("parseSentFilesToolResult — non-error, not delivered", () => {
+  test('a non-error "Declined" result (claude-tmux.ts\'s interrupt rewrite) is NOT delivered', () => {
+    const result = parseSentFilesToolResult(
+      "Declined — Claude is waiting for your direction.",
+      false,
+      null,
+    );
+    expect(result.delivered).toBe(false);
+    expect(result.deliveredCount).toBeNull();
+    expect(result.isError).toBe(false);
+    expect(result.error).toBe("Declined — Claude is waiting for your direction.");
+    expect(result.attachments).toEqual([]);
+  });
+
+  test("undefined isError with unrecognized text and no attachments is also NOT delivered", () => {
+    const result = parseSentFilesToolResult("something unexpected happened", undefined, null);
+    expect(result.delivered).toBe(false);
+    expect(result.isError).toBe(false);
+    expect(result.error).toBe("something unexpected happened");
+  });
+
+  test("empty text with no attachments falls back to a generic 'Not delivered.' message", () => {
+    const result = parseSentFilesToolResult("", false, null);
+    expect(result.delivered).toBe(false);
+    expect(result.isError).toBe(false);
+    expect(result.error).toBe("Not delivered.");
+  });
+
+  test("a non-empty attachments array overrides unrecognized text and IS delivered", () => {
+    const attachments: ToolResultAttachment[] = [
+      { path: "/abs/a.png", size: 10, isImage: true, mediaType: "image/png" },
+    ];
+    const result = parseSentFilesToolResult("Declined — Claude is waiting for your direction.", false, attachments);
+    expect(result.delivered).toBe(true);
+    expect(result.isError).toBe(false);
+    expect(result.error).toBeNull();
+    expect(result.attachments).toEqual(attachments);
   });
 });
 
@@ -89,6 +139,7 @@ describe("parseSentFilesToolResult — error", () => {
     expect(result.deliveredCount).toBeNull();
     expect(result.error).toBe('Attachment "/abs/dir" is not a regular file.');
     expect(result.attachments).toEqual([]);
+    expect(result.isError).toBe(true);
   });
 
   test("Error:-prefixed text strips the prefix", () => {
@@ -164,6 +215,22 @@ describe("parseSentFilesToolUse", () => {
       files: ["/abs/a.png", "", "   ", 42, null, "/abs/b.md"],
     });
     expect(req?.files).toEqual(["/abs/a.png", "/abs/b.md"]);
+  });
+
+  test("dedupes exact-string duplicates, keeping the first occurrence's position", () => {
+    const req = parseSentFilesToolUse(SENT_FILES_TOOL_NAME, {
+      files: ["/abs/a.png", "/abs/b.md", "/abs/a.png", "/abs/c.txt", "/abs/b.md"],
+    });
+    expect(req?.files).toEqual(["/abs/a.png", "/abs/b.md", "/abs/c.txt"]);
+  });
+
+  test("dedupe is exact-string only — pre-trim whitespace differences still collapse post-trim, but distinct paths never collide", () => {
+    const req = parseSentFilesToolUse(SENT_FILES_TOOL_NAME, {
+      files: ["  /abs/a.png  ", "/abs/a.png", "/abs/a.png/"],
+    });
+    // "  /abs/a.png  " trims to the same string as "/abs/a.png" (dupe,
+    // dropped); the trailing-slash variant is a distinct string and survives.
+    expect(req?.files).toEqual(["/abs/a.png", "/abs/a.png/"]);
   });
 
   test("rejects the wrong tool name", () => {
@@ -358,18 +425,38 @@ describe("sentFilesSummaryLine", () => {
       attachments: [
         { path: "/abs/a.png", size: 238784, isImage: true, mediaType: "image/png" },
       ],
+      isError: false,
     };
     expect(sentFilesSummaryLine(req, result)).toBe("sent 2 files: a.png (233.2 KB), b.md");
   });
 
   test("delivered singular form", () => {
     const single = { files: ["/abs/a.png"], caption: null, status: null, display: null };
-    const result = { delivered: true, deliveredCount: 1, error: null, attachments: [] };
+    const result = { delivered: true, deliveredCount: 1, error: null, attachments: [], isError: false };
     expect(sentFilesSummaryLine(single, result)).toBe("sent 1 file: a.png");
   });
 
-  test("error form includes the basenames and the error text", () => {
-    const result = { delivered: false, deliveredCount: null, error: "not a regular file", attachments: [] };
+  test("error form (isError: true) includes the basenames and the error text", () => {
+    const result = {
+      delivered: false,
+      deliveredCount: null,
+      error: "not a regular file",
+      attachments: [],
+      isError: true,
+    };
     expect(sentFilesSummaryLine(req, result)).toBe("send failed (a.png, b.md): not a regular file");
+  });
+
+  test("non-error, not-delivered form (isError: false, e.g. declined/interrupted) uses 'not delivered'", () => {
+    const result = {
+      delivered: false,
+      deliveredCount: null,
+      error: "Declined — Claude is waiting for your direction.",
+      attachments: [],
+      isError: false,
+    };
+    expect(sentFilesSummaryLine(req, result)).toBe(
+      "not delivered (a.png, b.md): Declined — Claude is waiting for your direction.",
+    );
   });
 });

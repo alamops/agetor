@@ -128,7 +128,6 @@ import type {
   RunStatus,
   SentFileEntry,
   Task,
-  ToolResultAttachment,
   WorktreeGitStatus,
   WorktreeInfo,
   WorktreeStaleReason,
@@ -1395,20 +1394,29 @@ function rememberSentFilesRequest(runId: string, toolUseId: string, req: SentFil
  *   still-unresolved `toolUseId` (map miss + fallback miss, e.g. a
  *   coincidental "delivered to user" phrase in some other tool's output
  *   with no matching `SendUserFile` request) is a silent no-op.
- * - A resolved, non-error result persists one {@link SentFileEntry} per
- *   requested path via `tasks.mergeSentFiles` (dedupes by path — a replayed
- *   pair, or the same file delivered twice, is idempotent) and fires the
- *   live-only `files-sent` `GlobalEvent`. An error result (`is_error`)
- *   persists nothing and fires nothing — a failed send shouldn't inflate
- *   the badge.
+ * - A delivered (non-error, {@link parseSentFilesToolResult}'s content-aware
+ *   `delivered` check) result persists one {@link SentFileEntry} per
+ *   ENTRY IN `res.attachments` when that array is non-empty — claude's own
+ *   structured, authoritative record of what actually went out — and falls
+ *   back to one entry per `req.files` path only when `res.attachments` is
+ *   empty (an unrecognized-but-attachment-less success shape). This means a
+ *   request for N files whose attachments only confirm M < N of them
+ *   persists M entries, not N — attachments are the ground truth for "what
+ *   was delivered", the request is only "what was asked for". Persistence
+ *   goes through `tasks.mergeSentFiles` (dedupes by path — a replayed pair,
+ *   or the same file delivered twice, is idempotent) and fires the
+ *   live-only `files-sent` `GlobalEvent` with `count = entries.length`
+ *   (reflecting whichever source produced the entries). A non-delivered
+ *   result (`is_error`, or a non-error result that still didn't deliver —
+ *   e.g. a declined/interrupted call, see `sent-files.ts`) persists nothing
+ *   and fires nothing — it shouldn't inflate the badge.
  *
- * Relative paths in `req.files` resolve against the run's cwd
- * (`task.worktreePath ?? task.workdir` — the same precedence `/open-path`
- * uses); an already-absolute path passes through unchanged.
- * `size`/`mediaType`/`isImage` come from the tool_result's forwarded
- * `attachments[]` (matched by exact path, tried against both the raw and
- * the resolved form — claude's own attachments carry the same path it put
- * in `input.files`, so this is mostly a defensive fallback), else `null`.
+ * Relative paths (in `res.attachments` paths, or in `req.files` on the
+ * fallback) resolve against the run's cwd (`task.worktreePath ??
+ * task.workdir` — the same precedence `/open-path` uses); an already-
+ * absolute path passes through unchanged. When sourced from attachments,
+ * `size`/`mediaType`/`isImage` come straight off that attachment; on the
+ * `req.files` fallback (no attachments at all) they're `null`.
  *
  * Gated on `eventId !== null` at the very top: `null` means
  * `runs.appendEvent`'s dedup path found the row already persisted (a
@@ -1500,22 +1508,34 @@ function maybeTrackSentFiles(
   if (!task) return;
   const cwd = task.worktreePath ?? task.workdir;
 
-  const attachmentByPath = new Map<string, ToolResultAttachment>();
-  for (const a of res.attachments) attachmentByPath.set(a.path, a);
-
   const now = Date.now();
-  const entries: SentFileEntry[] = req.files.map((rawPath) => {
-    const resolvedPath = isAbsolute(rawPath) ? rawPath : resolve(cwd, rawPath);
-    const attachment = attachmentByPath.get(rawPath) ?? attachmentByPath.get(resolvedPath) ?? null;
-    return {
-      path: resolvedPath,
-      size: attachment?.size ?? null,
-      mediaType: attachment?.mediaType ?? null,
-      isImage: attachment?.isImage ?? null,
-      sentAt: now,
-      runId,
-    };
-  });
+  const resolveAgainstCwd = (rawPath: string): string =>
+    isAbsolute(rawPath) ? rawPath : resolve(cwd, rawPath);
+
+  // res.attachments is claude's own structured, authoritative record of what
+  // was actually delivered — prefer it over the request whenever it's
+  // non-empty: a request for N files whose attachments only confirm M < N
+  // of them persists M entries, carrying each attachment's real size/type,
+  // not N entries padded with nulls for files that may never have gone out.
+  // Fall back to req.files (no metadata) only when the result reports no
+  // attachments at all.
+  const entries: SentFileEntry[] = res.attachments.length > 0
+    ? res.attachments.map((a) => ({
+        path: resolveAgainstCwd(a.path),
+        size: a.size,
+        mediaType: a.mediaType,
+        isImage: a.isImage,
+        sentAt: now,
+        runId,
+      }))
+    : req.files.map((rawPath) => ({
+        path: resolveAgainstCwd(rawPath),
+        size: null,
+        mediaType: null,
+        isImage: null,
+        sentAt: now,
+        runId,
+      }));
 
   tasks.mergeSentFiles(taskId, entries);
   emitGlobal({

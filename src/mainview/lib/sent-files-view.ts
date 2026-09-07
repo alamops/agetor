@@ -14,6 +14,15 @@ export interface SentFileTile {
   path: string;
   name: string;
   kind: "image" | "file" | "folder";
+  /** `true` only when `kind === "image"` AND `path` itself has a canonical
+   *  image extension ({@link isImagePath}) — i.e. the ONE condition under
+   *  which the card may point an `<img>` tag at `/files/preview`, which 400s
+   *  for any path `isImagePath` rejects regardless of what the tool_use/
+   *  tool_result claimed about it. A `kind === "image"` tile that isn't
+   *  `previewable` (an attachment/mediaType said "image" for a non-image
+   *  extension) still renders as an image-shaped tile, just via a generic
+   *  icon instead of a doomed thumbnail request. */
+  previewable: boolean;
   /** `null` while existence is unknown: `stats` hasn't come back yet, or
    *  `path` isn't absolute so there's nothing the client can key a stat
    *  lookup on. `true`/`false` once `stats` has answered for this path. */
@@ -61,6 +70,8 @@ function basename(path: string): string {
  * - `exists` is `null` while `stats` is `null` (pending) or `path` isn't
  *   absolute (nothing to stat client-side); `true` when `stats` has the
  *   path; `false` otherwise.
+ * - `previewable` is `kind === "image" && isImagePath(path)` — see
+ *   {@link SentFileTile.previewable}.
  */
 export function buildSentFileTiles(
   req: SentFilesRequest,
@@ -94,25 +105,48 @@ export function buildSentFileTiles(
     }
 
     const exists = stats === null || !isAbsolutePath(path) ? null : stats.has(path);
+    const previewable = kind === "image" && isImagePath(path);
 
-    tiles.push({ path, name: basename(path), kind, exists, size, mediaType });
+    tiles.push({ path, name: basename(path), kind, previewable, exists, size, mediaType });
   }
   return tiles;
 }
 
-/** Status-row tone + copy for a `SendUserFile` card. */
+/** Status-row tone + copy for a `SendUserFile` card.
+ *
+ * - `null` result (no tool_result yet): `"pending"`.
+ * - `result.isError` (a genuine tool error, e.g. a directory path):
+ *   `"error"`, text is the tool's own error message verbatim.
+ * - `!result.isError && !result.delivered` (a non-error, undelivered
+ *   outcome — e.g. Claude declined / the user is mid-approval): `"warning"`,
+ *   text is `"Not delivered — <error>"` so it reads distinctly from an
+ *   actual failure. (`parseSentFilesToolResult` guarantees `error` is set
+ *   whenever `delivered` is `false`, so the `?? "Not delivered."` fallback
+ *   here only guards against that contract ever loosening.)
+ * - otherwise delivered: `"success"`, count is `deliveredCount` when the
+ *   tool reported one, else `req.files.length` (deduped upstream, so this
+ *   always agrees with the tile grid's own count).
+ */
 export function sentFilesStatus(
   req: SentFilesRequest,
   result: SentFilesResult | null,
-): { tone: "success" | "pending" | "error"; text: string } {
+): { tone: "success" | "pending" | "error" | "warning"; text: string } {
   const total = req.files.length;
   const noun = total === 1 ? "file" : "files";
 
   if (result === null) {
     return { tone: "pending", text: `Sending ${total} ${noun}…` };
   }
-  if (result.error !== null) {
-    return { tone: "error", text: result.error };
+
+  if (!result.delivered) {
+    // `result.error` is effectively always set here — `parseSentFilesToolResult`
+    // guarantees a non-empty fallback ("Send failed." / "Not delivered.") for
+    // both undelivered shapes — but a defensive fallback matching the same
+    // convention keeps this function total even if that ever changes.
+    if (result.isError) {
+      return { tone: "error", text: result.error ?? "Send failed." };
+    }
+    return { tone: "warning", text: `Not delivered — ${result.error ?? "Not delivered."}` };
   }
 
   const count = result.deliveredCount ?? total;

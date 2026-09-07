@@ -1,4 +1,5 @@
 import { writeFileSync, existsSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
@@ -306,6 +307,9 @@ const native: ApiNative = {
   // the item in Finder, unlike a bare `open <path>` (which would launch it).
   // Fire-and-forget, same "best-effort boolean" contract as `openPath`.
   revealPath: (p) => {
+    // Defense in depth: a leading `-` must never reach `open` as a flag, even
+    // if a future caller skips the route's own absolute-path check.
+    if (!isAbsolute(p)) return false;
     try {
       Bun.spawn(["open", "-R", p], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
       return true;

@@ -5113,6 +5113,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           start(controller) {
             attachedClients++;
             const enc = new TextEncoder();
+            // Flush an initial frame immediately so a fresh client sees
+            // response bytes right away instead of waiting up to 15s for the
+            // first live event or the keepalive ping below — an SSE comment
+            // line (leading `:`), which `EventSource` silently ignores.
+            try {
+              controller.enqueue(enc.encode(": connected\n\n"));
+            } catch {
+              // Client already gone before the first byte — the abort
+              // handler below still fires and does the real cleanup.
+            }
             const send = (e: GlobalEvent | { type: "ping" }) => {
               try {
                 controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
@@ -5200,6 +5210,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           start(controller) {
             attachedClients++;
             const enc = new TextEncoder();
+            // Flush an initial frame immediately so a fresh client sees
+            // response bytes right away instead of waiting up to 15s for the
+            // first live event or the keepalive ping below — an SSE comment
+            // line (leading `:`), which `EventSource` silently ignores.
+            try {
+              controller.enqueue(enc.encode(": connected\n\n"));
+            } catch {
+              // Client already gone before the first byte — the abort
+              // handler below still fires and does the real cleanup.
+            }
             const send = (e: AppEvent | { type: "ping" }) => {
               try {
                 controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));

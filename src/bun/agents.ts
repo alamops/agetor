@@ -1044,121 +1044,6 @@ function makeFakeAgent(
     });
     after(23, () => onChunk("assistant", "Starting Phase 1 — Investigate now."));
     after(26, () => { onChunk("status", "turn complete"); resolveDone(0); });
-  } else if (
-    process.env.AGETOR_FAKE_CLAUDE_SENT_FILES === "1"
-    || prompt.includes(FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER)
-  ) {
-    // Test hook: simulate a `SendUserFile` session (see
-    // docs/plans/send-files-to-user.md) so orchestrator/RunPanel/board-badge/
-    // CLI tests can drive the sent-files card, the board's paperclip badge,
-    // and the error-card path end to end without a real claude CLI. Chunk
-    // shapes match exactly what claude-tmux.ts's real mapper produces: a
-    // `tool_use` chunk's `data` is `{id, name, input, serverSide}` and its
-    // matching `tool_result` chunk's `data` is `{toolUseId, content,
-    // isError, attachments?}` — `attachments` (T3, `claude-tmux.ts`) is
-    // present only on a successful result (claude's structured
-    // `toolUseResult.attachments`, sanitized via
-    // `sanitizeToolResultAttachments`); an errored result's `toolUseResult`
-    // is a bare string, so nothing is forwarded there.
-    //
-    // The scenario exercises the three states the card/badge need to cover:
-    //   1. A delivered `SendUserFile` call for two REAL files (a PNG and a
-    //      Markdown report, actually written under `<cwd>/agetor-sent/` so
-    //      the card's `/files/preview` image tile and its stat-driven file
-    //      tile have something real on disk to render) — the "2 files
-    //      delivered" card with an image tile (PNG) and a generic file tile
-    //      (Markdown), which is also what bumps `tasks.sent_files` / the
-    //      board's paperclip badge to a count of 2.
-    //   2. A second, ERRORED `SendUserFile` call pointed at the
-    //      `agetor-sent` DIRECTORY itself — mirrors the real, live-probed
-    //      claude behavior of rejecting a directory with
-    //      `<tool_use_error>Attachment "<path>" is not a regular file.
-    //      </tool_use_error>` (see `src/shared/sent-files.ts`'s header
-    //      comment) — the error card, whose lone tile renders folder-shaped
-    //      (stat-driven: the path IS a directory on disk).
-    //   3. The first tool_result's `attachments[]` gives the card real
-    //      `size`/`isImage`/`mediaType` metadata to render immediately,
-    //      without waiting on a live `/refs/resolve` stat round-trip.
-    //
-    // Only turn 1 (a fresh spawn) runs this scenario — same convention as
-    // every other canned scenario in this driver: a follow-up turn's prompt
-    // won't carry the marker unless the caller re-includes it.
-    const sentCwd = fakeOpts.cwd ?? process.cwd();
-    const sentDir = path.join(sentCwd, "agetor-sent");
-    mkdirSync(sentDir, { recursive: true });
-    const pngPath = path.join(sentDir, "chart.png");
-    const mdPath = path.join(sentDir, "report.md");
-    // A real, valid 1×1 transparent PNG (not just arbitrary bytes with a
-    // `.png` extension) — small, but enough for `/files/preview` and an
-    // `<img>` tile to actually decode and render it.
-    const pngBuffer = Buffer.from(
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
-      "base64",
-    );
-    const mdContent = "# Fake report\n\nDelivered by the fake claude driver.\n";
-    writeFileSync(pngPath, pngBuffer);
-    writeFileSync(mdPath, mdContent);
-
-    after(5, () => onChunk("assistant", "Sending you the files."));
-    after(8, () => {
-      onChunk(
-        "tool_use",
-        JSON.stringify({
-          id: "toolu_fake_sent_1",
-          name: "SendUserFile",
-          input: {
-            files: [pngPath, mdPath],
-            caption: "Fake delivery — a chart and its report",
-            status: "normal",
-            display: "render",
-          },
-          serverSide: false,
-        }),
-        "fake-sent-files-tu-1",
-      );
-    });
-    after(11, () => {
-      onChunk(
-        "tool_result",
-        JSON.stringify({
-          toolUseId: "toolu_fake_sent_1",
-          content:
-            "2 files delivered to user.\n  " + pngPath + " → file_uuid: 00000000-0000-4000-8000-000000000001\n  "
-              + mdPath + " → file_uuid: 00000000-0000-4000-8000-000000000002",
-          isError: false,
-          attachments: [
-            { path: pngPath, size: pngBuffer.length, isImage: true, mediaType: "image/png" },
-            { path: mdPath, size: Buffer.byteLength(mdContent), isImage: false, mediaType: null },
-          ],
-        }),
-        "fake-sent-files-tr-1",
-      );
-    });
-    after(14, () => {
-      onChunk(
-        "tool_use",
-        JSON.stringify({
-          id: "toolu_fake_sent_2",
-          name: "SendUserFile",
-          input: { files: [sentDir], caption: "Trying to send the whole folder", status: "normal" },
-          serverSide: false,
-        }),
-        "fake-sent-files-tu-2",
-      );
-    });
-    after(17, () => {
-      onChunk(
-        "tool_result",
-        JSON.stringify({
-          toolUseId: "toolu_fake_sent_2",
-          content: `<tool_use_error>Attachment "${sentDir}" is not a regular file.</tool_use_error>`,
-          isError: true,
-        }),
-        "fake-sent-files-tr-2",
-      );
-    });
-    after(20, () => onChunk("assistant", "Done."));
-    after(23, () => { onChunk("status", "turn complete"); resolveDone(0); });
   } else if (prompt.includes(FAKE_CLAUDE_MONITOR_PROMPT_MARKER)) {
     // Test hook: simulate arming a Claude Code `Monitor` and later ending it
     // — see FAKE_CLAUDE_MONITOR_PROMPT_MARKER's doc comment above for why
@@ -1308,7 +1193,136 @@ function makeFakeAgent(
         );
         resolveDone(1);
       }
-    }  } else {
+    }  } else if (
+    process.env.AGETOR_FAKE_CLAUDE_SENT_FILES === "1"
+    || prompt.includes(FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER)
+  ) {
+    // Test hook: simulate a `SendUserFile` session (see
+    // docs/plans/send-files-to-user.md) so orchestrator/RunPanel/board-badge/
+    // CLI tests can drive the sent-files card, the board's paperclip badge,
+    // and the error-card path end to end without a real claude CLI. Chunk
+    // shapes match exactly what claude-tmux.ts's real mapper produces: a
+    // `tool_use` chunk's `data` is `{id, name, input, serverSide}` and its
+    // matching `tool_result` chunk's `data` is `{toolUseId, content,
+    // isError, attachments?}` — `attachments` (T3, `claude-tmux.ts`) is
+    // present only on a successful result (claude's structured
+    // `toolUseResult.attachments`, sanitized via
+    // `sanitizeToolResultAttachments`); an errored result's `toolUseResult`
+    // is a bare string, so nothing is forwarded there.
+    //
+    // The scenario exercises the three states the card/badge need to cover:
+    //   1. A delivered `SendUserFile` call for two REAL files (a PNG and a
+    //      Markdown report, actually written under `<cwd>/agetor-sent/` so
+    //      the card's `/files/preview` image tile and its stat-driven file
+    //      tile have something real on disk to render) — the "2 files
+    //      delivered" card with an image tile (PNG) and a generic file tile
+    //      (Markdown), which is also what bumps `tasks.sent_files` / the
+    //      board's paperclip badge to a count of 2.
+    //   2. A second, ERRORED `SendUserFile` call pointed at the
+    //      `agetor-sent` DIRECTORY itself — mirrors the real, live-probed
+    //      claude behavior of rejecting a directory with
+    //      `<tool_use_error>Attachment "<path>" is not a regular file.
+    //      </tool_use_error>` (see `src/shared/sent-files.ts`'s header
+    //      comment) — the error card, whose lone tile renders folder-shaped
+    //      (stat-driven: the path IS a directory on disk).
+    //   3. The first tool_result's `attachments[]` gives the card real
+    //      `size`/`isImage`/`mediaType` metadata to render immediately,
+    //      without waiting on a live `/refs/resolve` stat round-trip.
+    //
+    // Only turn 1 (a fresh spawn) runs this scenario — same convention as
+    // every other canned scenario in this driver: a follow-up turn's prompt
+    // won't carry the marker unless the caller re-includes it.
+    //
+    // Deliberately the LAST marker-driven branch in this if/else chain (after
+    // TODOS, MONITOR, and FX_PERMISSION): its trigger is `||`-gated on a bare
+    // env var (`AGETOR_FAKE_CLAUDE_SENT_FILES=1`), same convention as
+    // `AGETOR_FAKE_CLAUDE_TODOS`, and a bare env var is process-wide — it
+    // can't be scoped to one test's prompt the way a marker substring can. If
+    // this branch sat ABOVE the monitor/fx-permission branches (as it
+    // originally did), setting the env var globally would hijack *every*
+    // fake-claude turn, including ones whose prompt carries
+    // `FAKE_CLAUDE_MONITOR_PROMPT_MARKER` or `FAKE_FX_PERMISSION_PROMPT_MARKER`
+    // and clearly wants a different canned scenario. Placing it last means
+    // those more specific, prompt-marker-gated branches are checked first in
+    // the `if`/`else if` chain and win on their own merits — ordering alone
+    // makes the env-var trigger safe, no extra exclusion condition needed.
+    const sentCwd = fakeOpts.cwd ?? process.cwd();
+    const sentDir = path.join(sentCwd, "agetor-sent");
+    mkdirSync(sentDir, { recursive: true });
+    const pngPath = path.join(sentDir, "chart.png");
+    const mdPath = path.join(sentDir, "report.md");
+    // A real, valid 1×1 transparent PNG (not just arbitrary bytes with a
+    // `.png` extension) — small, but enough for `/files/preview` and an
+    // `<img>` tile to actually decode and render it.
+    const pngBuffer = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+      "base64",
+    );
+    const mdContent = "# Fake report\n\nDelivered by the fake claude driver.\n";
+    writeFileSync(pngPath, pngBuffer);
+    writeFileSync(mdPath, mdContent);
+
+    after(5, () => onChunk("assistant", "Sending you the files."));
+    after(8, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "toolu_fake_sent_1",
+          name: "SendUserFile",
+          input: {
+            files: [pngPath, mdPath],
+            caption: "Fake delivery — a chart and its report",
+            status: "normal",
+            display: "render",
+          },
+          serverSide: false,
+        }),
+        "fake-sent-files-tu-1",
+      );
+    });
+    after(11, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({
+          toolUseId: "toolu_fake_sent_1",
+          content:
+            "2 files delivered to user.\n  " + pngPath + " → file_uuid: 00000000-0000-4000-8000-000000000001\n  "
+              + mdPath + " → file_uuid: 00000000-0000-4000-8000-000000000002",
+          isError: false,
+          attachments: [
+            { path: pngPath, size: pngBuffer.length, isImage: true, mediaType: "image/png" },
+            { path: mdPath, size: Buffer.byteLength(mdContent), isImage: false, mediaType: null },
+          ],
+        }),
+        "fake-sent-files-tr-1",
+      );
+    });
+    after(14, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "toolu_fake_sent_2",
+          name: "SendUserFile",
+          input: { files: [sentDir], caption: "Trying to send the whole folder", status: "normal" },
+          serverSide: false,
+        }),
+        "fake-sent-files-tu-2",
+      );
+    });
+    after(17, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({
+          toolUseId: "toolu_fake_sent_2",
+          content: `<tool_use_error>Attachment "${sentDir}" is not a regular file.</tool_use_error>`,
+          isError: true,
+        }),
+        "fake-sent-files-tr-2",
+      );
+    });
+    after(20, () => onChunk("assistant", "Done."));
+    after(23, () => { onChunk("status", "turn complete"); resolveDone(0); });
+  } else {
     // Generic fallback, shared with claude's fake driver — only fx turns get
     // the provider sentinel (mirrors `maybeEmitProvider` in fx-acp.ts; see
     // the fx-permission scenario above for the same comment in full).

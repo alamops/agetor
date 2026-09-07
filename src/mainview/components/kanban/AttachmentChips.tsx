@@ -28,9 +28,11 @@ export function AttachmentChips({
   // Paths whose thumbnail failed to load, or whose openPath call 404'd (path
   // genuinely gone) — once known missing we skip re-hitting the server on a
   // repeat click and go straight to the not-found dialog. Cleared when that
-  // dialog is dismissed so a later click retries rather than staying amber
-  // forever (e.g. the file reappeared, or the first check raced a slow
-  // mount).
+  // dialog is dismissed — by Escape, the backdrop, OR the dialog's own Close
+  // button, since `AttachmentNotFoundDialog` (`AttachmentDialogs.tsx`) wires
+  // its Close button to the very same `onClose` callback passed in here —
+  // so a later click retries rather than staying amber forever (e.g. the
+  // file reappeared, or the first check raced a slow mount).
   const [missing, setMissing] = useState<ReadonlySet<string>>(new Set());
   const [notFoundPath, setNotFoundPath] = useState<string | null>(null);
   // Distinct from `notFoundPath`: any *other* openPath failure (headless

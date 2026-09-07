@@ -161,10 +161,11 @@ Assumptions proceeding on:
 | `/files/preview` size cap / cwd containment hardening | **out of scope** — pre-existing route posture, not made untrue by this change |
 | Windows/Linux reveal | **out of scope** — arm64 macOS is the only release target |
 | Subagent sends counted in the badge | **out of scope** — structural boundary shared with the todo tracker; cards still render in subagent tabs |
+| `GET /events` / `GET /app/events` never flush an initial SSE frame (pre-existing; surfaced by the files-sent toast e2e — a fresh subscription is invisible until the first event or the 15 s keepalive) | **in** — pulled in at Phase 8 by the orchestrator because the new toast path rides that channel: both routes now enqueue an initial `: connected` comment frame, mirroring `/tasks/:id/events`'s replay-meta frame (owner may drop it; two lines + one test) |
 | README mention | **in** — the README enumerates every CLI command and a curated route table, so `agetor files` and `POST /reveal-path` were added there at the Wave 3 checkpoint (and `/open-path`'s description corrected); a headline/Highlights blurb stays **out of scope** |
 
 Owner-deferred: none.
 
 ## Status
 
-Waves 1–3 landed.
+Waves 1–3 landed (commits a4e9ade, ee011b0, 2bc3c6c, ae10b8b, a5ebd43). Phase 5 review (opus, `code-review` skill): 1 must-fix (a claude-tmux interrupt/declined rewrite — non-error "Declined — …" tool_result — was counted as delivered), 3 should-fix (per-chunk `/refs/resolve` refetch from unstable `call` identity; TUI `EventLine` memo defeated by a Map prop; `<img>` for `isImage`-flagged non-image extensions → `/files/preview` 400 → tile stuck "missing"), 9 nice-to-have — all folded into Phase 8 (fix agents F1 shared+bun, F2 card, F3 TUI+docs). Phase 6 e2e `e2e/sent-files.spec.ts`: 5 tests, 10/10 under `--repeat-each=2` (commit d9dc367).

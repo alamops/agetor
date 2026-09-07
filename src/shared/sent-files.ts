@@ -72,10 +72,19 @@ export function parseSentFilesToolUse(name: string, input: unknown): SentFilesRe
 
   const rawFiles = input.files;
   if (!Array.isArray(rawFiles)) return null;
-  const files = rawFiles
-    .filter((f): f is string => typeof f === "string")
-    .map((f) => f.trim())
-    .filter((f) => f.length > 0);
+  const seen = new Set<string>();
+  const files: string[] = [];
+  for (const f of rawFiles) {
+    if (typeof f !== "string") continue;
+    const trimmed = f.trim();
+    if (trimmed.length === 0) continue;
+    // Dedupe by exact string, first occurrence wins — keeps the card header,
+    // status row, CLI line and orchestrator persistence all agreeing on "how
+    // many files" a call requested.
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    files.push(trimmed);
+  }
   if (files.length === 0) return null;
 
   const rawCaption = input.caption;
@@ -112,12 +121,17 @@ export function toolResultText(content: unknown): string {
     .join("\n");
 }
 
-/** Parsed outcome of a `SendUserFile` tool_result. */
+/** Parsed outcome of a `SendUserFile` tool_result. `isError` is `true` only
+ *  when the tool_result itself was `is_error` — it's what distinguishes a
+ *  genuine send failure (`isError: true`) from a non-error result that still
+ *  didn't deliver anything, e.g. a user-declined/interrupted call (see
+ *  {@link parseSentFilesToolResult}'s doc comment). */
 export interface SentFilesResult {
   delivered: boolean;
   deliveredCount: number | null;
   error: string | null;
   attachments: ToolResultAttachment[];
+  isError: boolean;
 }
 
 const TOOL_USE_ERROR_WRAPPER_RE = /<tool_use_error>([\s\S]*?)<\/tool_use_error>/;
@@ -128,12 +142,27 @@ const ERROR_PREFIX_RE = /^Error:\s*/;
  * `<tool_use_error>…</tool_use_error>` tag (when present) is stripped down
  * to its inner text, a leading `"Error: "` prefix is stripped, and the
  * result is trimmed — an empty message (shouldn't happen, but tool text is
- * never fully trusted) falls back to `"Send failed."`. Otherwise the send is
- * treated as delivered: `deliveredCount` is the number captured by
- * {@link SENT_FILES_DELIVERED_RE} when the text matches, else `null` (an
- * unrecognized success shape still counts as delivered — just without a
- * known count), and `attachments` passes through the (already-sanitized)
- * array the caller supplies, defaulting to `[]`.
+ * never fully trusted) falls back to `"Send failed."`.
+ *
+ * Otherwise (`isError` falsy) delivery is judged by content, not merely by
+ * the absence of an error: `delivered` requires the text to match
+ * {@link SENT_FILES_DELIVERED_RE} OR `attachments` to be non-empty (claude's
+ * own structured, authoritative record of what actually went out). This
+ * matters because claude-tmux.ts deliberately rewrites a user-interrupted/
+ * declined `SendUserFile` tool_result to a non-error result whose content is
+ * "Declined — Claude is waiting for your direction." — without this check
+ * that text would satisfy the old "any non-error result is delivered" rule
+ * and get recorded as a successful send. A non-error result that fails the
+ * test returns `delivered: false` with `error` set to the trimmed text (or
+ * `"Not delivered."` when the text is empty) — mirroring the error-branch's
+ * "never surface a blank message" discipline — and an empty `attachments`.
+ *
+ * A result that DOES pass — either shape — counts as delivered:
+ * `deliveredCount` is the number captured by {@link SENT_FILES_DELIVERED_RE}
+ * when the text matches, else `null` (an unrecognized-but-attachment-backed
+ * success shape still counts as delivered — just without a known count), and
+ * `attachments` passes through the (already-sanitized) array the caller
+ * supplies, defaulting to `[]`.
  */
 export function parseSentFilesToolResult(
   content: unknown,
@@ -151,17 +180,33 @@ export function parseSentFilesToolResult(
       deliveredCount: null,
       error: message.length > 0 ? message : "Send failed.",
       attachments: [],
+      isError: true,
     };
   }
 
   const match = SENT_FILES_DELIVERED_RE.exec(text);
+  const resolvedAttachments = attachments ?? [];
+  const delivered = match !== null || resolvedAttachments.length > 0;
+
+  if (!delivered) {
+    const trimmed = text.trim();
+    return {
+      delivered: false,
+      deliveredCount: null,
+      error: trimmed.length > 0 ? trimmed : "Not delivered.",
+      attachments: [],
+      isError: false,
+    };
+  }
+
   const deliveredCount = match && match[1] !== undefined ? Number(match[1]) : null;
 
   return {
     delivered: true,
     deliveredCount,
     error: null,
-    attachments: attachments ?? [],
+    attachments: resolvedAttachments,
+    isError: false,
   };
 }
 
@@ -267,7 +312,9 @@ export function formatByteSize(bytes: number): string {
  *   - delivered: `"sent 2 files: a.png (233.2 KB), b.md"` — a file's size
  *     renders only when `result.attachments` has a matching (by exact path)
  *     entry with a known `size`; singular form for one file.
- *   - error: `"send failed (a.png, b.md): <error>"`
+ *   - error (`result.isError`): `"send failed (a.png, b.md): <error>"`
+ *   - non-error, not delivered (e.g. declined/interrupted):
+ *     `"not delivered (a.png, b.md): <error>"`
  */
 export function sentFilesSummaryLine(req: SentFilesRequest, result: SentFilesResult | null): string {
   const basenames = req.files.map(sentFileBasename);
@@ -279,7 +326,8 @@ export function sentFilesSummaryLine(req: SentFilesRequest, result: SentFilesRes
   }
 
   if (!result.delivered) {
-    return `send failed (${basenames.join(", ")}): ${result.error ?? "Send failed."}`;
+    const verb = result.isError ? "send failed" : "not delivered";
+    return `${verb} (${basenames.join(", ")}): ${result.error ?? "Send failed."}`;
   }
 
   const sizeByPath = new Map<string, number>();

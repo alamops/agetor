@@ -12,7 +12,7 @@
 // (`AttachmentOpenErrorDialog` — the OS declined, headless 501, a network
 // error — none of which mean the file is actually gone).
 import { useEffect, useMemo, useState } from "react";
-import { FileWarning, ImageOff, MoreHorizontal, Paperclip } from "lucide-react";
+import { FileImage, FileWarning, ImageOff, MoreHorizontal, Paperclip } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { iconForRef } from "@/lib/file-icons";
 import { cn } from "@/lib/utils";
@@ -67,8 +67,8 @@ function Pill({ children }: { children: React.ReactNode }) {
   );
 }
 
-function subLineFor(tile: SentFileTile, isMissing: boolean): string {
-  if (isMissing) return "missing";
+function subLineFor(tile: SentFileTile, isNotFound: boolean): string {
+  if (isNotFound) return "missing";
   if (tile.kind === "folder") return "folder";
   if (tile.size !== null) return formatByteSize(tile.size);
   return " ";
@@ -76,23 +76,34 @@ function subLineFor(tile: SentFileTile, isMissing: boolean): string {
 
 function Tile({
   tile,
-  isMissing,
-  onMarkMissing,
+  isNotFound,
+  isPreviewFailed,
+  onPreviewFail,
   onClick,
   onOpenMenu,
 }: {
   tile: SentFileTile;
-  isMissing: boolean;
-  onMarkMissing: (path: string) => void;
+  /** A confirmed-gone path (a 404 from openPath/revealPath, or a resolveRefs
+   *  stat that came back without this path) — gates the click to the
+   *  not-found dialog and drives the dimmed "missing" treatment. */
+  isNotFound: boolean;
+  /** The tile's own thumbnail failed to load, independent of whether the
+   *  file itself still exists. Swaps the glyph for `ImageOff` but never
+   *  gates the click or shows "missing" — a broken preview request is not
+   *  proof the underlying file is gone. */
+  isPreviewFailed: boolean;
+  onPreviewFail: (path: string) => void;
   onClick: () => void;
   onOpenMenu: (path: string, x: number, y: number) => void;
 }) {
   let preview: React.ReactNode;
-  if (isMissing) {
+  if (isNotFound) {
     const Icon = tile.kind === "image" ? ImageOff : FileWarning;
     preview = <Icon className="size-8 text-warning" aria-hidden />;
-  } else if (tile.kind === "image") {
-    preview = (
+  } else if (tile.previewable) {
+    preview = isPreviewFailed ? (
+      <ImageOff className="size-8 text-muted-foreground" aria-hidden />
+    ) : (
       <img
         src={api.filePreviewUrl(tile.path)}
         alt={tile.name}
@@ -100,9 +111,15 @@ function Tile({
         decoding="async"
         className="size-full object-contain"
         style={CHECKERBOARD_STYLE}
-        onError={() => onMarkMissing(tile.path)}
+        onError={() => onPreviewFail(tile.path)}
       />
     );
+  } else if (tile.kind === "image") {
+    // `kind === "image"` but the path's own extension isn't a canonical
+    // image one (an attachment/mediaType said "image" for e.g. an
+    // extensionless temp path) — `/files/preview` 400s on any path
+    // `isImagePath` rejects, so don't even attempt the thumbnail request.
+    preview = <FileImage className="size-8 text-muted-foreground" aria-hidden />;
   } else {
     const Icon = iconForRef({ path: tile.path, isDirectory: tile.kind === "folder" });
     preview = <Icon className="size-8 text-muted-foreground" aria-hidden />;
@@ -125,14 +142,14 @@ function Tile({
         }}
         className={cn(
           "flex w-full flex-col items-center gap-1 rounded-md border border-border/60 bg-muted/20 p-1.5 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-          isMissing && "opacity-70",
+          isNotFound && "opacity-70",
         )}
       >
         <div className="size-20 flex items-center justify-center overflow-hidden rounded">
           {preview}
         </div>
         <span className="w-full truncate text-center text-xs">{tile.name}</span>
-        <span className="text-[10px] text-muted-foreground">{subLineFor(tile, isMissing)}</span>
+        <span className="text-[10px] text-muted-foreground">{subLineFor(tile, isNotFound)}</span>
       </button>
       <button
         type="button"
@@ -165,12 +182,28 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
     [result?.toolUseId, result?.content, result?.isError, result?.attachments],
   );
 
+  // Stable primitive derived from `req` for the stat-fetch effect below.
+  // `req` itself is a fresh object every time RunPanel's blocks-memo
+  // recomputes (every streamed chunk re-parses the persisted tool_use JSON),
+  // so keying the effect on `req`'s identity would re-issue `/refs/resolve`
+  // on every chunk even when the file list never changed. `call.name` is
+  // constant for a mounted card, so joining `req.files` alone is enough to
+  // detect an actual change in the path set.
+  const filesKey = req ? req.files.join("\n") : "";
+
   const [stats, setStats] = useState<PathStats | null>(null);
-  // Paths a click has proven are gone (a 404 from openPath/revealPath) or
-  // whose thumbnail failed to load — mirrors `AttachmentChips`. Combined
-  // with the stat-derived `tile.exists === false` at render time so either
-  // signal renders the same "missing" state.
-  const [missing, setMissing] = useState<ReadonlySet<string>>(new Set());
+  // A path a click has proven is gone (a 404 from openPath/revealPath, or a
+  // `/refs/resolve` stat that came back without it) — gates the click to the
+  // not-found dialog and drives the dimmed "missing" sub-line. Cleared only
+  // when a later stat reports the path present again or an open/reveal
+  // succeeds — never merely by dismissing the not-found dialog (the file
+  // hasn't necessarily reappeared just because the dialog closed).
+  const [notFound, setNotFound] = useState<ReadonlySet<string>>(new Set());
+  // A path whose `<img>` thumbnail failed to load — independent of whether
+  // the file itself still exists (a corrupt/unsupported image, a transient
+  // `/files/preview` hiccup, …). Only swaps the tile's glyph to `ImageOff`;
+  // never gates the click and never renders the "missing" sub-line.
+  const [previewFailed, setPreviewFailed] = useState<ReadonlySet<string>>(new Set());
   const [notFoundPath, setNotFoundPath] = useState<string | null>(null);
   const [openError, setOpenError] = useState<{ path: string; message: string } | null>(null);
   const [menu, setMenu] = useState<{ path: string; x: number; y: number } | null>(null);
@@ -195,15 +228,47 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
     };
     // Re-stat once the send is confirmed delivered too — a temp file can
     // land on disk between the tool_use and its tool_result.
-  }, [req, res?.delivered]);
+  }, [filesKey, res?.delivered]);
+
+  // Once a fresh stat confirms a previously-notFound path is actually
+  // present again, drop it from `notFound` — the dialog-close path
+  // deliberately does NOT do this (see `notFound`'s own comment above).
+  useEffect(() => {
+    if (!stats || stats.size === 0) return;
+    setNotFound((prev) => {
+      if (prev.size === 0) return prev;
+      let changed = false;
+      const next = new Set(prev);
+      for (const path of prev) {
+        if (stats.has(path)) {
+          next.delete(path);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [stats]);
 
   if (!req) return null;
 
   const tiles = buildSentFileTiles(req, res, stats);
   const status = sentFilesStatus(req, res);
 
-  const markMissing = (path: string) => {
-    setMissing((prev) => (prev.has(path) ? prev : new Set(prev).add(path)));
+  const markNotFound = (path: string) => {
+    setNotFound((prev) => (prev.has(path) ? prev : new Set(prev).add(path)));
+  };
+
+  const clearNotFound = (path: string) => {
+    setNotFound((prev) => {
+      if (!prev.has(path)) return prev;
+      const next = new Set(prev);
+      next.delete(path);
+      return next;
+    });
+  };
+
+  const markPreviewFailed = (path: string) => {
+    setPreviewFailed((prev) => (prev.has(path) ? prev : new Set(prev).add(path)));
   };
 
   const handleOpenOrReveal = async (path: string, action: "open" | "reveal") => {
@@ -212,7 +277,12 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
         action === "open"
           ? (await api.openPath({ path, taskId })).opened
           : (await api.revealPath({ path, taskId })).revealed;
-      if (!ok) {
+      if (ok) {
+        // The path resolved and the OS accepted it — it's definitely not
+        // gone, even if it was previously marked `notFound` (the file may
+        // have reappeared, or the first check raced a slow mount).
+        clearNotFound(path);
+      } else {
         setOpenError({
           path,
           message:
@@ -226,7 +296,7 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
       // (headless 501, a relative path with no resolvable cwd, a network
       // failure) says nothing about whether the file exists.
       if (e instanceof ApiError && e.status === 404) {
-        markMissing(path);
+        markNotFound(path);
         setNotFoundPath(path);
       } else {
         const message = e instanceof Error ? e.message : String(e);
@@ -236,7 +306,7 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
   };
 
   const handleTileClick = (tile: SentFileTile) => {
-    if (missing.has(tile.path) || tile.exists === false) {
+    if (notFound.has(tile.path) || tile.exists === false) {
       setNotFoundPath(tile.path);
       return;
     }
@@ -265,11 +335,12 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
           id: "copy",
           label: "Copy path",
           onSelect: () => {
-            try {
-              void navigator.clipboard?.writeText(menu.path);
-            } catch {
+            // `writeText` returns a promise that rejects on a denied
+            // clipboard permission — a bare try/catch around the call
+            // doesn't catch that rejection, so chain `.catch` explicitly.
+            void navigator.clipboard?.writeText(menu.path).catch(() => {
               // Best-effort — no destination to report a clipboard failure to.
-            }
+            });
           },
         },
       ]
@@ -279,7 +350,11 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
     <div
       data-testid="sent-files-card"
       data-tool-use-id={call.id}
-      className={cn("rounded-md border border-border/60 bg-card p-3", res?.error && "border-danger/60")}
+      className={cn(
+        "rounded-md border border-border/60 bg-card p-3",
+        status.tone === "error" && "border-danger/60",
+        status.tone === "warning" && "border-warning/60",
+      )}
     >
       <div className="flex flex-wrap items-center gap-2">
         <Paperclip className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
@@ -298,8 +373,9 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
           <Tile
             key={tile.path}
             tile={tile}
-            isMissing={missing.has(tile.path) || tile.exists === false}
-            onMarkMissing={markMissing}
+            isNotFound={notFound.has(tile.path) || tile.exists === false}
+            isPreviewFailed={previewFailed.has(tile.path)}
+            onPreviewFail={markPreviewFailed}
             onClick={() => handleTileClick(tile)}
             onOpenMenu={openMenu}
           />
@@ -313,6 +389,7 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
           status.tone === "success" && "text-success",
           status.tone === "pending" && "text-muted-foreground",
           status.tone === "error" && "text-danger",
+          status.tone === "warning" && "text-warning",
         )}
       >
         {status.text}
@@ -330,15 +407,11 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
 
       <AttachmentNotFoundDialog
         path={notFoundPath}
-        onClose={() => {
-          setNotFoundPath(null);
-          setMissing((prev) => {
-            if (notFoundPath === null || !prev.has(notFoundPath)) return prev;
-            const next = new Set(prev);
-            next.delete(notFoundPath);
-            return next;
-          });
-        }}
+        // Deliberately does NOT clear `notFound` here — see that state's own
+        // comment above. Dismissing the dialog (Escape, backdrop, or the
+        // Close button) only closes it; the path stays remembered as gone
+        // until a fresh stat or a successful open proves otherwise.
+        onClose={() => setNotFoundPath(null)}
       />
       <AttachmentOpenErrorDialog
         path={openError?.path ?? null}
