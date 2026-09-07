@@ -288,8 +288,11 @@ test("049 leaves a lastModel:gemini pref that already points at a live model alo
   expect(prefs).toEqual([{ key: "lastModel:gemini", value: "gemini-3.7-flash" }]);
 });
 
-test("049 is registered last in the migrations index", () => {
+test("050 is registered last in the migrations index, right after 049", () => {
   const last = migrations[migrations.length - 1];
-  expect(last?.id).toBe("049_retire_gemini_3_pro_preview");
-  expect(last?.sql).toContain("gemini-3.1-pro-preview");
+  expect(last?.id).toBe("050_sent_files");
+  expect(last?.sql).toContain("ADD COLUMN sent_files TEXT");
+  const prev = migrations[migrations.length - 2];
+  expect(prev?.id).toBe("049_retire_gemini_3_pro_preview");
+  expect(prev?.sql).toContain("gemini-3.1-pro-preview");
 });

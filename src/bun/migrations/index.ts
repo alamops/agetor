@@ -64,6 +64,7 @@ import m046 from "./046_fx_harness.sql" with { type: "text" };
 import m047 from "./047_fx_session_id.sql" with { type: "text" };
 import m048 from "./048_issue_url.sql" with { type: "text" };
 import m049 from "./049_retire_gemini_3_pro_preview.sql" with { type: "text" };
+import m050 from "./050_sent_files.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -121,4 +122,5 @@ export const migrations: Migration[] = [
   { id: "047_fx_session_id", sql: m047, aliases: ["046_fx_session_id"] },
   { id: "048_issue_url", sql: m048 },
   { id: "049_retire_gemini_3_pro_preview", sql: m049 },
+  { id: "050_sent_files", sql: m050 },
 ];

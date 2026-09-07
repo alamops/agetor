@@ -52,7 +52,7 @@ import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand } from "@/lib/toasts";
+import { dismissPending, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
 import { parseThemePreference } from "@/lib/theme";
@@ -833,6 +833,24 @@ function AppInner() {
           });
         }
         // `cancelled` is intentionally silent — the user issued the cancel.
+        return;
+      }
+      if (ev.kind === "files-sent") {
+        // Live-only signal (a replayed historical send must not notify) — no
+        // optimistic board patch here, unlike `column`/`interaction` above:
+        // the board polls `task.sentFiles` every 2s already, and the badge
+        // count isn't time-sensitive the way a running/blocked column is.
+        notifyFilesSent({
+          taskId: ev.taskId,
+          title,
+          subtitle,
+          isSelected,
+          isFocused,
+          onOpen,
+          count: ev.count,
+          caption: ev.caption,
+          proactive: ev.proactive,
+        });
         return;
       }
       // column transitions. Patch `tasks` optimistically so the board and any

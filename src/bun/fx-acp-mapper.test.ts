@@ -2,6 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { FxTextCoalescer, extractFxProviderValue, isFxContextDiagnostic, mapFxUpdate } from "./fx-acp.ts";
 import { FX_USAGE_STATUS_PREFIX } from "../shared/types.ts";
 import { deriveTodoProgress } from "../shared/todo-progress.ts";
+import { SENT_FILES_TOOL_NAME, parseSentFilesToolUse } from "../shared/sent-files.ts";
 
 /**
  * Pure unit tests of `mapFxUpdate` — no child process, no tmpdir, no
@@ -183,6 +184,160 @@ describe("tool_call_update → tool_result", () => {
     const update = { sessionUpdate: "tool_call_update", toolCallId: "tc-z", status: "completed" };
     const bare = mapFxUpdate(update, ctx);
     expect(JSON.parse(bare[0]!.data).content).toEqual(update);
+  });
+});
+
+describe("tool_call_update → dormant resource_link → synthetic SendUserFile mapping", () => {
+  function resourceLinkUpdate(overrides: Record<string, unknown> = {}, links: Record<string, unknown>[]) {
+    return {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc-file",
+      status: "completed",
+      content: links.map((link) => ({ type: "content", content: link })),
+      ...overrides,
+    };
+  }
+
+  test("a completed update with one file:// resource_link emits the real tool_result plus a paired SendUserFile use/result", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate(
+      resourceLinkUpdate({ title: "Chart" }, [
+        {
+          type: "resource_link",
+          uri: "file:///tmp/chart.png",
+          name: "chart.png",
+          mimeType: "image/png",
+          size: 1234,
+        },
+      ]),
+      ctx,
+    );
+
+    expect(chunks).toHaveLength(3);
+
+    // Real tool_result, unchanged.
+    expect(chunks[0]!.stream).toBe("tool_result");
+    expect(chunks[0]!.lineUuid).toBe("fx:tool:tc-file:result");
+    expect(JSON.parse(chunks[0]!.data).toolUseId).toBe("tc-file");
+
+    // Synthetic tool_use.
+    const useChunk = chunks[1]!;
+    expect(useChunk.stream).toBe("tool_use");
+    expect(useChunk.lineUuid).toBe("fx:tool:tc-file:sent-files:use");
+    const use = JSON.parse(useChunk.data);
+    expect(use.id).toBe("tc-file:sent-files");
+    expect(use.name).toBe(SENT_FILES_TOOL_NAME);
+    expect(use.serverSide).toBe(false);
+    const parsedRequest = parseSentFilesToolUse(use.name, use.input);
+    expect(parsedRequest).toEqual({
+      files: ["/tmp/chart.png"],
+      caption: "Chart",
+      status: "normal",
+      display: null,
+    });
+
+    // Synthetic tool_result.
+    const resultChunk = chunks[2]!;
+    expect(resultChunk.stream).toBe("tool_result");
+    expect(resultChunk.lineUuid).toBe("fx:tool:tc-file:sent-files:result");
+    const result = JSON.parse(resultChunk.data);
+    expect(result.toolUseId).toBe("tc-file:sent-files");
+    expect(result.content).toBe("1 file delivered to user.");
+    expect(result.isError).toBe(false);
+    expect(result.attachments).toEqual([
+      { path: "/tmp/chart.png", size: 1234, isImage: true, mediaType: "image/png" },
+    ]);
+  });
+
+  test("an https:// resource_link is not a local file — only the normal tool_result is emitted", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate(
+      resourceLinkUpdate({}, [
+        { type: "resource_link", uri: "https://example.com/chart.png", name: "chart.png" },
+      ]),
+      ctx,
+    );
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]!.stream).toBe("tool_result");
+  });
+
+  test("an in_progress status with a resource_link emits nothing at all (not even the normal result)", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate(
+      resourceLinkUpdate({ status: "in_progress" }, [
+        { type: "resource_link", uri: "file:///tmp/chart.png" },
+      ]),
+      ctx,
+    );
+    expect(chunks).toEqual([]);
+  });
+
+  test("a failed status never adds the synthetic pair, even with a resource_link present", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate(
+      resourceLinkUpdate({ status: "failed" }, [
+        { type: "resource_link", uri: "file:///tmp/chart.png" },
+      ]),
+      ctx,
+    );
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]!.stream).toBe("tool_result");
+    expect(JSON.parse(chunks[0]!.data).isError).toBe(true);
+  });
+
+  test("a plain text content block is left alone — unchanged output, no synthetic pair", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate(
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc-text",
+        status: "completed",
+        content: [{ type: "content", content: { type: "text", text: "done" } }],
+      },
+      ctx,
+    );
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]!.stream).toBe("tool_result");
+  });
+
+  test("two resource_links produce files.length === 2 and a pluralized delivery message", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate(
+      resourceLinkUpdate({}, [
+        { type: "resource_link", uri: "file:///tmp/a.png" },
+        { type: "resource_link", uri: "file:///tmp/b.md" },
+      ]),
+      ctx,
+    );
+    expect(chunks).toHaveLength(3);
+    const use = JSON.parse(chunks[1]!.data);
+    expect(use.input.files).toEqual(["/tmp/a.png", "/tmp/b.md"]);
+    const result = JSON.parse(chunks[2]!.data);
+    expect(result.content).toBe("2 files delivered to user.");
+    expect(result.attachments).toHaveLength(2);
+  });
+
+  test("a percent-encoded file:// URI decodes to the literal path", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate(
+      resourceLinkUpdate({}, [{ type: "resource_link", uri: "file:///tmp/a%20b.png" }]),
+      ctx,
+    );
+    const use = JSON.parse(chunks[1]!.data);
+    expect(use.input.files).toEqual(["/tmp/a b.png"]);
+  });
+
+  test("mimeType absent falls back to isImagePath for the isImage flag, and no caption key when title is blank/absent", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate(
+      resourceLinkUpdate({ title: "   " }, [{ type: "resource_link", uri: "file:///tmp/photo.jpg" }]),
+      ctx,
+    );
+    const use = JSON.parse(chunks[1]!.data);
+    expect("caption" in use.input).toBe(false);
+    const result = JSON.parse(chunks[2]!.data);
+    expect(result.attachments[0].isImage).toBe(true);
+    expect(result.attachments[0].mediaType).toBeNull();
   });
 });
 

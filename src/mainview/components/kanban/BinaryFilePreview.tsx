@@ -54,7 +54,7 @@ export function binaryFileBasename(path: string): string {
  *  `hsl(var(--x) / <alpha>)` syntax (the CSS vars in index.css already
  *  store bare "H S% L%" triples), so it reads correctly in both themes
  *  without a bespoke token. */
-const CHECKERBOARD_STYLE: CSSProperties = {
+export const CHECKERBOARD_STYLE: CSSProperties = {
   backgroundImage: [
     "linear-gradient(45deg, hsl(var(--muted-foreground) / 0.14) 25%, transparent 25%)",
     "linear-gradient(-45deg, hsl(var(--muted-foreground) / 0.14) 25%, transparent 25%)",
