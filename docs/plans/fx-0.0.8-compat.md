@@ -1,0 +1,153 @@
+# Plan — fx 0.0.8 compatibility update
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-09-08 |
+| Source | agetor task "/implement support for Vercel fx.sh new version: v0.0.8" + https://fx.sh/changelog + https://github.com/vercel-labs/fx/releases/tag/v0.0.8 |
+| Config | AGENTS_CONFIG.yml (balanced) |
+| Flags | none |
+| Gates | grilled + approved by owner (6 questions over 2 passes; plan approved with the sweep-in of run titles + catalog refresh; answers in §8) |
+| Branch | feature/support-fx-v0-0-8 (pre-existing, agetor-created) |
+| Base SHA | 55c7d7e (release v0.1.6; tree clean at Phase 4 start) |
+
+## 1. Objective & success criteria
+
+Bring the fx harness's version-truth (driver header, probe/discovery comments, CLAUDE.md) up to fx 0.0.8, pick up the two streams 0.0.8 turned on (`usage_update`, `agent_thought_chunk`) plus the new per-turn token usage on `session/prompt`, and fix two latent driver defects the investigation surfaced (fx's real `stopReason` strings never matched; consecutive messages can only be split by a non-text chunk). Relabel the `yolo` mode to fx's new "Full access" name without changing its id. Success: typecheck green, full `bun test` green, Playwright green (fx specs + full suite), every "verified against 0.0.x" claim cites 0.0.8 with today's evidence, the RunPanel usage chip renders real 0.0.8 usage (context + per-turn tokens), and a post-green live smoke on the upgraded machine confirms the wire facts below.
+
+## 2. Context & constraints (Phase 1 evidence)
+
+Verified three ways on 2026-09-08: (1) binary probe of fx 0.0.8 (`build_revision 43c11dcc34a9`, from `https://releases.fx.sh/v0.0.8/fx-macos-aarch64.tar.gz`, isolated `HOME`, artifacts under `scratchpad/spikes/fx-008-probe/`); (2) full source-tarball diff of `github.com/vercel-labs/fx` v0.0.7…v0.0.8 (`scratchpad/spikes/fx-008-source/diffs/`); (3) the same ACP probe re-run against the installed 0.0.7 binary (`scratchpad/spikes/fx-007-cmp/`) to separate real deltas from pre-existing behavior.
+
+**Unchanged (integration-critical, binary + source agree):** `fx acp` flags are exactly `--model` and `--log-file` (`cli_surface.zig parseAcpArgs`); JSON-RPC framing (`jsonrpc.zig` byte-identical); method set; `session/new` params/result (`sessionId`, `modes`, `configOptions`); `session/resume` → `session/load` semantics and the `-32600` credential text at `initialize`/resume/load/prompt (byte-identical strings, same code); `configOptions.provider` values `gateway|codex|grok`; permission option kinds `allow_once`/`allow_always`/`reject_once`; `status --json` and `models --json` builders (`output_contracts.zig` byte-identical — every `auth` value, `auth_help` text, `auth_expired`/`auth_refreshable` semantics); `--help` "Fast, native coding agent for the terminal." (`FX_HELP_MARKER` safe); default model `moonshotai/kimi-k3`; all 8 `FX_*` env vars still read at the same call sites; still no `FX_HOME` (`profile_paths.zig root_dir_name = ".fx"`); `[context] ` diagnostics still ride `agent_message_chunk`; `--context-limit` is still global-only. **`FX_PERMISSION_MODE` still works with `yolo`/`auto`/`ask`; `full-access` is a new alias that parses to the same `.yolo` enum** (`config_runtime.zig parsePermissionMode`; README: "saved settings and JSON output retain `yolo`"). `--full-access` replaces the *UI/CLI* wording only.
+
+**Changed in 0.0.8 (needs attention):**
+- `session/update` writers went from six kinds to eight: **`agent_thought_chunk`** (reasoning deltas, `prompt.zig pushReasoningDelta`) and **`usage_update`** (once per completed turn, right before the `session/prompt` response, `prompt.zig:881-882` → `sessions.zig sendActiveSessionUsageUpdate`; emitted only when the model's context window is known) are now live. Wire shape is ACP-canonical `{"sessionUpdate":"usage_update","used":N,"size":N[,"cost":{"amount":F,"currency":"USD"}]}` (`types.zig writeUsageUpdate`) — exactly what `mapFxUpdate`'s dormant branch expects. `plan` and `current_mode_update` still have no writer.
+- `session/prompt` result gains `usage: {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens}` (each present only when known; `{}` observed on a refused turn) (`types.zig writePromptResponseWithUsage`).
+- `agent_message_chunk`/`user_message_chunk` carry a `messageId`, stable across one logical message and regenerated at message-kind boundaries (`prompt.zig:171-183`).
+- `tool_call` carries the real tool `name` plus inline `rawInput` on the initial update (`types.zig writeToolCall` signature change).
+- `session_info_update` gained a `{title, updatedAt}` shape fired at lifecycle points and after every turn.
+- Session ids are 12-char base64url (`session_layout.zig`); 0.0.7's 50-char ids still validate and resume — persisted `runs.fx_session_id` values survive the machine upgrade without migration.
+- New security gate: `session/prompt`/`cancel`/`set_mode`/`set_config_option` must name the process's active session (`server.zig decideSessionTarget`). Agetor uses one session per process, so this always resolves `.exact`.
+- `initialize`: `promptCapabilities.image` is now `true`; `protocolVersion` 999 was accepted (leniency; agetor keeps sending numeric 1).
+- `FX_AUTH_MODE=host-managed` (embedding hosts) → `status --json` `auth: "host managed"` — outside agetor's known set, handled by `probeStatus`'s fail-open fallthrough (`loggedIn: true`).
+- Tool inventory: `memory`, `terminal`, `skill_search`, `mcp_search_tools` removed; `shell` (3 actions: run/interact/stop), `capability_search`, `subagent` (2 actions) — rendered generically.
+- ACP cancel now stops the work; `--record` CLI flag removed; `fx ask` gained `--auto/--full-access/--yolo`.
+
+**Pre-existing facts the spikes surfaced (true on 0.0.7 and 0.0.8):**
+- fx's `stopReason` wire strings are `end_turn`, `max_output_tokens`, `max_model_turns`, `refused`, `cancelled` (`types.zig StopReason`, byte-identical both versions). `runFxTurn` names the ACP-canonical `max_tokens`/`max_turn_requests`/`refusal`, so those cases never matched — every such turn fell into the "unexpected stopReason" branch (still `settleFx(state, 1)`, so no run was mis-recorded).
+- An *invalid* (present but wrong) credential does not fail at `initialize`: `session/new` succeeds and `session/prompt` returns `{stopReason: "refused"}` with the reason ("AI_GATEWAY_API_KEY authentication failed · HTTP 401") delivered as an `agent_message_chunk`, i.e. assistant prose. A *missing* credential still fails `initialize` with `-32600`.
+- `session/new` already returned `provider`, `model` and `mode` configOptions and a `modes` block on 0.0.7 (the 0.0.7 dossier's "mode/model configOptions are TUI-only" claim was wrong — that probe never got past an unauthenticated `initialize`). `modes.currentModeId` reads `ask` regardless of `FX_PERMISSION_MODE`: it is a display default. The session's effective `permission_mode` is copied from startup config (`sessions.zig:63-73`, `server.zig:1857`), and `session/set_mode` overwrites it from the registry (`applySessionMode`: code→auto, ask→ask). So the driver's `auto`→`code` nudge is a no-op-by-value, and a hypothetical `yolo`→`code` nudge would downgrade yolo to auto — **never add one**.
+- `session/set_mode` returns `result: null` for any id, known or not (unknown ids are ignored).
+- `session/resume`/`load` on an unknown id answer `-32602 "Session not found"`.
+- The unauthenticated Gateway catalog reads 244 ids today on **both** binaries (`private_models_hidden: true`); the 234 recorded on 2026-08-31 was the catalog of that day, not a binary property. All 22 curated ids (16 standard + 6 `catalogOnly`) are present.
+
+**Live-login state on this machine (passive probe, 2026-09-08):** `auth: "fx login"`, `auth_expired: true`, `auth_refreshable: true`, `team` set — the post-green smoke may refresh on real use or may need `fx login` first.
+
+## 3. Approach & key decisions
+
+1. **Driver fixes are additive and evidence-based.** Accept both stop-reason vocabularies; split coalesced text on `messageId` change (falls back to today's heuristic when either side lacks one, i.e. 0.0.7); prefer fx's `tool_call.name` for the `tool_use` event name and carry the human `title` alongside; surface `session/prompt.usage` on the existing usage sentinel. No protocol-shape change anywhere.
+2. **One shared usage payload.** `FX_USAGE_STATUS_PREFIX` keeps its prefix; the JSON body becomes the additive `FxUsagePayload` (defined in `src/shared/types.ts`, spec in §4/T3). The driver emits `{used,size,cost?}` on `usage_update` (unchanged) and `{turn:{…}}` from the prompt result; RunPanel shallow-merges sentinels per run so order doesn't matter and 0.0.7 transcripts render exactly as before. Chip text stays `used/size`; the tooltip gains per-turn tokens; when only `turn` is known the chip shows a compact in/out form. CLI/TUI keep suppressing the sentinel via `isInternalStatusSentinel` — nothing to change there.
+3. **Yolo relabel, id unchanged** (owner, §8 Q2): `AGENT_OPTIONS.fx.modes` label "Full access", hint names fx's `--full-access` / `/permissions full-access` and the surviving `yolo` alias. Stored ids, env value, DB rows, `FxMode` type, fake driver all keep `yolo`.
+4. **No yolo `session/set_mode` nudge** (source-proven harmful, §2). Recorded as a driver comment so nobody re-adds it.
+5. **Fake driver parity** so the now-live streams are e2e-testable: the fake fx driver emits a `thinking` chunk and both usage sentinels per turn.
+6. **Machine upgrade + live smoke after green** (owner, §8 Q4/Q5): install 0.0.8 over `~/.local/bin/fx` pinned via fx.sh's setup script, verify `fx --version`, then run one yolo turn and one auto turn on `zai/glm-5.3-flash` with a tiny shell tool call in a scratch cwd, recording update kinds, `usage_update`, `tool_call.name`, whether `session/request_permission` fires under yolo, and the prompt-result usage. If the smoke contradicts §2 (yolo requests permission), stop and escalate rather than nudge.
+7. **Swept in at approval (owner, §8):** (S1) **fx session titles on the run row** — fx ≥0.0.8 sends `session_info_update {title, updatedAt}` after every turn; the driver forwards a real title (non-empty, not fx's placeholder "Untitled session", changed since the last one emitted this turn) as a new internal status sentinel `FX_SESSION_TITLE_STATUS_PREFIX = "fx-title: "` (sibling of the provider sentinel: same suppression via `isInternalStatusSentinel` in RunPanel/CLI/TUI, same per-run last-wins derivation), and RunPanel renders it as a muted chip beside the provider chip. (S2) **Curated catalog refresh** — six flagship ids present in today's 244-id unauth catalog join `AGENT_OPTIONS.fx.models` as `catalogOnly` rows (safe by construction: they render only when the signed-in account's discovered catalog has them): `anthropic/claude-fable-5.1` "Claude Fable 5.1", `anthropic/claude-haiku-4.5` "Claude Haiku 4.5", `openai/gpt-6-astra` "GPT-6 Astra", `openai/gpt-5.6-sol` "GPT-5.6 Sol", `zai/glm-5.3` "GLM-5.3", `deepseek/deepseek-v4-pro` "DeepSeek V4 Pro" — mirrored into every paired per-model structure (effort map, tests, the CLAUDE.md row list) exactly like the Gemini 3.8 Flash addition (commit c058957). Standard (non-gated) rows are untouched because the signed-in 158-id view is still unverifiable.
+8. House style: this plan is a new file; `fx-0.0.7-compat.md` stays as history. The fleet's 0.0.7 dossier gets a correction note (configOptions claim) and a new 0.0.8 dossier.
+
+### Shared spec (binding for T1, T3, T4, T6, TT1, TT2, TT5, TT6)
+
+```ts
+// src/shared/types.ts — additive; every field optional so 0.0.7 payloads still parse.
+export interface FxUsagePayload {
+  /** Context tokens used / window size — ACP `usage_update` (fx ≥0.0.8). */
+  used?: number;
+  size?: number;
+  cost?: { amount: number; currency: string };
+  /** Per-turn token counts from the `session/prompt` result (fx ≥0.0.8). */
+  turn?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    reasoningTokens?: number;
+  };
+}
+```
+- Driver: `usage_update` → `FX_USAGE_STATUS_PREFIX + JSON({used,size,cost?})` (unchanged). Prompt result `usage` → keep only finite-number fields; if at least one survives, emit `FX_USAGE_STATUS_PREFIX + JSON({turn:{…}})` *before* settling (so it's on the run). `{}` → no sentinel.
+- RunPanel merge per run: `{...prev, ...next}` (a later `turn` replaces an earlier `turn`; `used/size/cost` keep the latest values seen).
+- Chip text: `used`+`size` present → `${fmt(used)}/${fmt(size)}` (+ cost as today); else if `turn.inputTokens`/`outputTokens` present → `↑${fmt(in)} ↓${fmt(out)}`; else no chip. Tooltip: `fx usage: <used>/<size> tokens` line when present, `· cost` when present, then `turn: in <n> · out <n>[ · cache read <n>][ · cache write <n>][ · reasoning <n>]` when present.
+- Coalescer: `FxChunk` gains optional `messageId`; `push` flushes when buffered `messageId` and incoming `messageId` are both strings and differ. `emit` never forwards `messageId` to `onChunk`.
+- `tool_use` payload: `{id, name, input, serverSide:false, title?}` where `name` = `update.name` when a non-empty string else the existing `title (kind)` synthesis, and `title` = `update.title` when it's a non-empty string different from `name`.
+- Stop reasons: `end_turn` → 0; `cancelled` → 1 silent; `max_tokens`|`max_output_tokens`|`max_turn_requests`|`max_model_turns`|`refusal`|`refused` → status `fx turn ended: <reason>` + 1; anything else → today's "unexpected" status + 1.
+- Session title sentinel: `FX_SESSION_TITLE_STATUS_PREFIX + <title>` (plain text, no JSON). Driver emits on a `session_info_update` whose `title` is a non-empty string, not equal to "Untitled session", and different from the last title emitted in this turn. RunPanel derives `titleByRun` exactly like `providerByRun` (latest sentinel per run) and renders `<span title="fx session title">` muted, truncated to ~14rem, beside the provider chip. `isInternalStatusSentinel` gains the prefix so transcripts/CLI/TUI never print it.
+- Fake fx driver per turn (order): `thinking` "fake fx reasoning" → assistant text (unchanged) → usage sentinel `{used:1234,size:128000}` → usage sentinel `{turn:{inputTokens:42,outputTokens:7}}` → title sentinel `fx-title: Fake fx session` → existing provider sentinel/settlement. Expected chip text `1.2k/128k`, tooltip contains `in 42 · out 7`; run row shows `Fake fx session`.
+
+## 4. Work breakdown — implementation tasks
+
+**Wave 1 (file-disjoint, no dependencies):**
+- **T2 — probe/discovery/orchestrator version-truth** · owns `src/bun/agent-status.ts`, `src/bun/agent-discovery.ts`, `src/bun/orchestrator.ts` (comment-only). agent-status.ts: `FX_HELP_MARKER` re-verified 0.0.8; `probeStatus` doc gains the 0.0.8 facts (builder byte-identical; `auth` may read `"host managed"` under `FX_AUTH_MODE=host-managed` → fail-open true; `auth_expired` present only when true; `mcp_config_warning` conditional; `build_revision` 43c11dcc34a9; no top-level `version`). agent-discovery.ts: `models --json` shape re-verified 0.0.8; 244 unauth ids today on both 0.0.7 and 0.0.8 (Gateway-side, not binary); expired-login degradation still applies. orchestrator.ts:~999-1003 freshAuth comment → cite 0.0.8. Acceptance: comment-only hunks; typecheck green.
+- **T3 — shared types** · owns `src/shared/types.ts`. Add `FxUsagePayload` (spec above) next to `FX_USAGE_STATUS_PREFIX` with a doc comment; add `FX_SESSION_TITLE_STATUS_PREFIX = "fx-title: "` and include it in `isInternalStatusSentinel`; add the six S2 `catalogOnly` rows to `AGENT_OPTIONS.fx.models` (labels in §3, the existing premium hint text) and to every paired per-model map the existing catalogOnly rows appear in (the fx effort-support map etc. — grep for `google/gemini-3.8-flash` to find them all); relabel `AGENT_OPTIONS.fx.modes` `yolo` → label "Full access", hint "Disables fx's permission checks — what fx 0.0.8 calls --full-access / /permissions full-access; the yolo id is fx's surviving alias, and agetor keeps it as the stored value."; comment truth at lines ~45 (configOptions: provider/model/mode entries are all on the wire, 0.0.7+), ~157 (no FX_HOME re-verified 0.0.8), ~218 (`loggedIn` — "host managed" tolerated), ~1258/~1324/~1334/~2124-2134 (catalog: 244 unauth today on both binaries, all 22 curated present, signed-in view still unverifiable). Acceptance: typecheck green; the only executable change is the label/hint strings + the new exported interface.
+- **T5 — docs** · owns `CLAUDE.md`, `README.md`. CLAUDE.md fx bullet (line 51): verified versions add 0.0.8; "exactly six kinds … DORMANT" → eight kinds with `agent_thought_chunk`/`usage_update` live as of 0.0.8 (`plan`/`current_mode_update` still never emitted); `session/prompt` `usage` + the shared payload/merge design; `messageId` coalescer rule; `tool_call.name`; stop-reason vocabularies (fx wire vs ACP canonical); invalid-vs-missing credential shapes; 12-char ids (old ids resume); active-session gate; `--full-access` alias + "Full access" label with `yolo` id; `FX_AUTH_MODE` note; tool inventory; catalog "244 unauth today, Gateway-side"; correct the configOptions "trap" sentence (mode/model entries are real wire entries; only the *values* still don't reflect `FX_PERMISSION_MODE`, which is copied from startup config — and why a yolo nudge must never be added). Also: the catalogOnly row list/count in the fx bullet grows from six to twelve (the six S2 ids), and the new `fx-title` sentinel joins the provider/usage sentinel sentence (`isInternalStatusSentinel` now suppresses three fx sentinels). Line 53 defaults paragraph: "`yolo` (labelled Full access in the picker)". README: audit every fx mention; expected no-op unless a mode name appears. Acceptance: claims match §2 exactly; no stale "0.0.7 is latest" phrasing; the fx bullet still reads as one paragraph in house style.
+- **T6 — fake driver parity** · owns `src/bun/agents.ts`. In the fake fx driver (`makeFakeAgent` fx branch ~1113-1209) emit, per turn, the sequence in the shared spec (thinking chunk, then after the assistant text the two usage sentinels and the title sentinel) using `FX_USAGE_STATUS_PREFIX` + `JSON.stringify`; keep the permission scenario and provider sentinel intact. Update the `harnessEnv` fx comment (~326: no FX_HOME re-verified 0.0.8) and the fx `buildCommand` comment (`FX_PERMISSION_MODE` values; `full-access` alias exists but agetor sends `yolo`). Acceptance: `AGETOR_FX_DRIVER=fake` runs emit the new chunks in order; existing agents tests that don't pin the exact chunk sequence still pass (TT4 updates the ones that do).
+
+**Wave 2 (after Wave 1 — both import `FxUsagePayload` from `src/shared/types.ts`):**
+- **T1 — driver** · owns `src/bun/fx-acp.ts`. (a) stop-reason handling per spec; (b) `FxChunk.messageId` + coalescer flush rule; `mapFxUpdate` threads `messageId` from `agent_message_chunk`/`agent_thought_chunk` (thought chunks carry none today — tolerate absence); `emit` strips it; (c) `toolCallName` prefers `update.name`; `tool_use` payload gains `title`; (d) after `session/prompt` resolves, map `promptResult.usage` → `{turn}` sentinel per spec (before the stopReason switch settles); (d2) `session_info_update` → title sentinel per the shared spec (mapper branch + per-turn dedupe state); (e) header/comment truth: protocol index "verified against 0.0.4/0.0.6/0.0.7/0.0.8"; facts block rewritten for the §2 deltas (eight kinds, live usage/thought, prompt usage, messageId, tool_call name, 12-char ids, active-session gate, protocolVersion leniency, invalid-vs-missing credential shapes, stop-reason vocabularies, the configOptions correction + "never nudge yolo" rationale, tool inventory, `--full-access` alias); (f) `RpcError`/`-32600` comments cite 0.0.8. Acceptance: TT1/TT2 scenarios pass; existing fx-acp tests pass unchanged except where TT1 deliberately extends them; typecheck green.
+- **T4 — RunPanel usage chip + tool title** · owns `src/mainview/components/kanban/RunPanel.tsx` and NEW `src/mainview/lib/fx-usage.ts`. Move the payload parsing/merging/formatting into pure functions in `fx-usage.ts` (`parseFxUsage(json): FxUsagePayload | null`, `mergeFxUsage(prev, next)`, `fxUsageChipText(u): string | null`, `fxUsageTitle(u): string`, reusing the existing `formatUsageCount`); RunPanel's per-run derivation (~1446-1470) merges instead of last-wins; `UsageChip` renders via the helpers (chip hidden when `fxUsageChipText` is null); `ParsedToolUse` gains optional `title`, `ToolUseBlock` renders it muted after the name when present; `titleByRun` derived like `providerByRun` and a `SessionTitleChip` rendered beside `ProviderChip` in `RunsList`. Acceptance: 0.0.7-shaped `{used,size}` sentinels render identically to today; `{turn}`-only renders the in/out form; merged renders `used/size` with the turn tooltip; TT5 unit tests pass; typecheck green.
+
+## 5. Work breakdown — test tasks (Phase 6, one wave, file-disjoint)
+
+- **TT1** · owns `src/bun/fx-acp.test.ts`: fake ACP server scenarios `stopreason-refused`, `stopreason-max-output-tokens`, `stopreason-max-model-turns` (status `fx turn ended: <x>`, exit 1; keep `stopreason-refusal` passing); `prompt-usage` (prompt result carries `usage` → a `{turn}` sentinel on the run, numeric-only fields kept; `usage: {}` → no sentinel); `usage-update-then-prompt-usage` (both sentinels emitted, in order); `message-id-split` (two `agent_message_chunk`s with different `messageId` and no intervening chunk → two assistant events; same id → one; no id → one, as before); `tool-call-name` (tool_use `name` = fx name, `title` carried); `session-title` (a `session_info_update` with a real title → one `fx-title: ` status chunk; "Untitled session" and repeats → none).
+- **TT2** · owns `src/bun/fx-acp-mapper.test.ts`: pure tests for `toolCallName`/payload `title`, coalescer `messageId` rule (both directions + absence), `agent_thought_chunk` → `thinking` with messageId tolerance, `usage_update` cost/no-cost, `session_info_update {title, updatedAt}` → title sentinel rules (placeholder skipped, dedupe, missing title ignored).
+- **TT3** · owns `src/bun/agent-status.test.ts`, `src/bun/agent-discovery.test.ts`: a realistic 0.0.8 `status --json` payload (fields from the probe: `kind`, `model`, `update_channel`, `build_channel`, `build_revision: "43c11dcc34a9"`, `auth`, `auth_refreshable`, `permission_mode`, `workspace`, `history_turns`, `session_permission_grants`, `agent_step_limit`, `mcp{connection_check, servers, configuration_issues, inspection_error}`, no `version`) → `AI_GATEWAY_API_KEY` → true; `"host managed"` → true/null hint; `"missing"` + fx's 0.0.8 `auth_help` → false with that text; stub `--version` echoes `0.0.8` in one test. agent-discovery: `parseFxModels` on a 244-count 0.0.8 envelope.
+- **TT4** · owns `src/bun/agents.test.ts`, `src/shared/types.test.ts`, `src/cli/commands/add.test.ts`: fake fx driver emits thinking + both usage sentinels + the title sentinel in the spec order; `FX_PERMISSION_MODE` passthrough table unchanged; `AGENT_OPTIONS.fx.modes` yolo row label is "Full access" with id `yolo`; the six S2 catalogOnly rows are present, paired in the effort map, and gated by `mergeModelOptions` exactly like the existing six (extend whatever assertions c058957 added for gemini-3.8-flash); `isInternalStatusSentinel` suppresses `fx-title: `.
+- **TT5** · owns NEW `src/mainview/lib/fx-usage.test.ts`: parse/merge/chip-text/title matrix from the shared spec (0.0.7 shape, turn-only, merged, malformed cost, non-numeric fields dropped, `{}` → null).
+- **TT6 (e2e)** · owns `e2e/fx-interactions.spec.ts`, `e2e/fx-models.spec.ts`: under the fake fx driver, a completed run's row shows chip text `1.2k/128k` with a title containing `in 42 · out 7` and the session-title chip `Fake fx session`; the transcript shows a thinking block; the fx mode picker offers "Full access" (id `yolo`) in the New Task form; fx-models: a stub catalog containing `anthropic/claude-fable-5.1` surfaces that curated row while one without it hides it (extend the existing catalogOnly convergence assertions). Determinism via existing readiness waits; no sleeps.
+
+**E2e applies** (user-visible chip/label + fake-driver process boundary) and runs on the existing Playwright harness. Run recipe (Phase 1): `export PATH="$HOME/.bun/bin:$PATH"`; `bun run typecheck`; `bun test`; `bun node_modules/@playwright/test/cli.js test e2e/fx-interactions.spec.ts e2e/fx-models.spec.ts --reporter=list` then the full suite — never `bunx`, never two Playwright runs at once (per-worker headless backends on 4600+; GitHub stubs 4800+/4900+); the fixture plants its own fx stub (`e2e/fixtures.ts writeFxStubBin`) and sets `AGETOR_FX_DRIVER=fake`. No credentials needed.
+
+## 6. Execution waves
+
+- Phase 4 Wave 1: T2 ∥ T3 ∥ T5 ∥ T6 → typecheck → commit.
+- Phase 4 Wave 2: T1 ∥ T4 → typecheck → commit.
+- Phase 5: opus review of `git diff <base>...HEAD` → must-fixes queued for Phase 8.
+- Phase 6: TT1 ∥ TT2 ∥ TT3 ∥ TT4 ∥ TT5 ∥ TT6 → commit.
+- Phase 7: typecheck + `bun test` + Playwright (fx specs, then full suite). Phase 8: fix loop ≤3 rounds.
+- Post-green (owner-approved): upgrade `~/.local/bin/fx` to 0.0.8, live smoke (yolo + auto turns), record results in §8, final report, fleet workdone/knowledge updates.
+
+## 7. Blast radius & risks
+
+- `FX_USAGE_STATUS_PREFIX` consumers: RunPanel (chip — changed by design), CLI `logs.ts` and TUI `Dashboard.tsx` (suppress via `isInternalStatusSentinel` — unchanged, still suppressed), `fx-acp-mapper.test.ts`/`fx-acp.test.ts` (extended). Persisted 0.0.7-era sentinels keep parsing (all fields optional).
+- Stop-reason change only affects the status line text for turns that already failed; run status (`failed`) is unchanged.
+- `messageId` split only fires when both chunks carry ids (0.0.8+); 0.0.7 streams are untouched. Risk: fx regenerating ids mid-message would over-split — source shows regeneration only at kind boundaries.
+- `tool_use.name` now shows fx's tool id (`shell`, `read_file`…) instead of the synthesized `title (kind)`; the title is still rendered. Event dedup keys (`fx:tool:<id>:use`) unchanged.
+- Label change is display-only: `yolo` stays the id everywhere (DB rows, env var, `FxMode`, fake driver, CLI `agetor add --mode yolo`).
+- Machine upgrade: 0.0.8 rewrites `~/.fx` session files in place on first run (fx: history preserved); old ids stay resumable; rollback is re-running the setup script pinned to v0.0.7.
+- Rollback of the code: revert the branch commits; no migrations, no data-shape changes.
+
+## 8. Open questions / assumptions
+
+Plan approval (2026-09-08): "Approve, but also sweep the out-of-scope items in" → S1 session titles + S2 catalog refresh are in; the yolo nudge stays out (source-proven harmful), image prompts and host-managed auth stay out (not applicable to a CLI-spawning client). Owner grill (2026-09-08, answered live, two passes): **Q1 scope** → Full pass (docs + driver fixes + fake-driver/e2e parity + tests). **Q2 yolo label** → Relabel to "Full access", keep id `yolo`. **Q3 per-turn token usage** → Surface it on the existing chip (tooltip detail, chip text unchanged when used/size known). **Q4 machine** → Upgrade `~/.local/bin/fx` to 0.0.8 after green. **Q5 live smoke** → Run it if the login is valid (one yolo turn + one auto turn on glm-5.3-flash); stop and ask for `fx login` if credentials fail. **Q6 yolo nudge** → Only if proven needed; source has since proven it unnecessary and harmful (§2), so it is out.
+
+Assumptions: (A1) `usage_update` fires only when fx knows the model's context window — a model without one yields no `used/size`, and the chip then shows the per-turn form only; verified from source, live-checked in the smoke. (A2) `agent_thought_chunk` frequency depends on the model's reasoning output; the mapping is exercised by tests and the smoke, not guaranteed per turn. (A3) The `protocolVersion` string form was not actually exercised by the probe (its "string" scenario sent numeric 1); only numeric 999 acceptance is measured. Agetor keeps sending numeric 1, so nothing rides on it. (A4) The signed-in catalog view remains unverifiable until the owner's login is refreshed; curated rows unchanged (all present unauth).
+
+## 9. Completeness ledger
+
+| Candidate remainder | Disposition |
+| --- | --- |
+| Stop-reason vocabulary mismatch (pre-existing) | **In this run** — T1, TT1 |
+| Coalescer can't split back-to-back messages | **In this run** — T1 (`messageId`), TT1, TT2 |
+| `tool_call.name` ignored | **In this run** — T1, T4 (title render), TT1, TT2 |
+| `session/prompt.usage` unread | **In this run** — T1, T3, T4, TT1, TT5 |
+| Usage chip last-wins clobber between sentinels | **In this run** — T4, TT5 |
+| Fake fx driver never emits usage/thinking (chip untestable e2e) | **In this run** — T6, TT4, TT6 |
+| "Yolo" label vs fx's "Full access" | **In this run** — T3, T5 (CLAUDE.md), TT4, TT6 |
+| Yolo `session/set_mode code` nudge | **Out of scope** — source-proven harmful (would downgrade yolo → auto); recorded in T1/T5 comments instead |
+| Stale "six kinds / DORMANT / configOptions trap" claims in driver header + CLAUDE.md | **In this run** — T1, T5 |
+| Fleet 0.0.7 dossier's wrong configOptions claim | **In this run** — orchestrator corrects the knowledge entry |
+| `status --json` `"host managed"` auth value | **In this run** — T2 comment + TT3 test (no logic change: fail-open already covers it) |
+| `session_info_update {title, updatedAt}` (session titles on the run row) | **In this run** (swept in by owner at approval) — T1, T3, T4, T5, T6, TT1, TT2, TT4, TT6 |
+| ACP image prompts (`promptCapabilities.image: true`) | **Out of scope** — agetor's composer sends text + file references only; image attachments are a feature ticket |
+| `FX_AUTH_MODE=host-managed` | **Out of scope** — embedding-host feature; agetor spawns the CLI and lets fx own credentials |
+| Curated catalog refresh | **In this run** (swept in by owner at approval) — T3 (six catalogOnly rows), T5, TT4, TT6 |
+| README fx wording | **In this run** — T5 audits; expected no-op |
+| Machine upgrade + live smoke | **In this run** — post-green, owner-approved (Q4/Q5) |
