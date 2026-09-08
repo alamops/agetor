@@ -618,7 +618,15 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
  *  prose lands as ONE event. `flushText` is the explicit counterpart for
  *  the message boundaries that aren't chunks: an inbound permission
  *  request and settlement. */
-function emit(state: FxSessionState, stream: RunEventStream, data: string, lineUuid?: string): void {
+function emit(
+  state: FxSessionState,
+  stream: RunEventStream,
+  data: string,
+  lineUuid?: string,
+  // ACP `messageId` (fx ≥0.0.8) — consumed by the coalescer's flush-on-change
+  // rule only; `deliver` never forwards it (ChunkHandler is (stream, data, lineUuid)).
+  messageId?: string,
+): void {
   // A settled turn emits nothing: pumpStdout keeps dispatching whatever
   // lines remain in the pipe until SIGTERM actually closes the stream, and
   // those trailing updates would otherwise append events to a run the
@@ -628,7 +636,7 @@ function emit(state: FxSessionState, stream: RunEventStream, data: string, lineU
     if (state.seenLineUuids.has(lineUuid)) return;
     state.seenLineUuids.add(lineUuid);
   }
-  deliver(state, state.coalescer.push({ stream, data, lineUuid }));
+  deliver(state, state.coalescer.push({ stream, data, lineUuid, messageId }));
 }
 
 /** Deliver whatever text the coalescer is holding — a no-op when it holds
@@ -1246,7 +1254,7 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
 function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unknown>): void {
   const ctx: FxUpdateCtx = { runId: state.runId, nextSeq: () => state.seq++, lastTitle: state.lastTitle };
   for (const c of mapFxUpdate(update, ctx)) {
-    emit(state, c.stream, c.data, c.lineUuid);
+    emit(state, c.stream, c.data, c.lineUuid, c.messageId);
   }
   state.lastTitle = ctx.lastTitle;
 }

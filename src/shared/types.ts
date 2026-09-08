@@ -66,6 +66,25 @@ export interface FxUsagePayload {
 }
 
 /**
+ * The exact key set of `FxUsagePayload.turn`, as one shared tuple — the
+ * driver (`src/bun/fx-acp.ts`) uses it to pick fields out of fx's
+ * `session/prompt` result and the webview parser (`src/mainview/lib/
+ * fx-usage.ts`) uses it to validate the sentinel, so producer and consumer
+ * cannot drift. The `satisfies` clause below is the exhaustiveness check:
+ * adding a field to `turn` without listing it here fails typecheck.
+ */
+export const FX_TURN_KEYS = [
+  "inputTokens",
+  "outputTokens",
+  "cacheReadTokens",
+  "cacheWriteTokens",
+  "reasoningTokens",
+] as const satisfies ReadonlyArray<keyof NonNullable<FxUsagePayload["turn"]>>;
+type _FxTurnKeysExhaustive = Record<(typeof FX_TURN_KEYS)[number], unknown> extends Required<NonNullable<FxUsagePayload["turn"]>> ? true : never;
+const _fxTurnKeysExhaustive: _FxTurnKeysExhaustive = true;
+void _fxTurnKeysExhaustive;
+
+/**
  * Sentinel prefix for the `status` chunk fx-acp.ts emits once per turn with
  * the provider fx reports in its `session/new` / resume `configOptions`
  * (`{id:"provider", currentValue:"gateway"|"codex"|"grok"}` — fx ≥0.0.5
