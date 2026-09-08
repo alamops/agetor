@@ -486,6 +486,16 @@ async function discoverGemini(): Promise<DiscoveredModel[]> {
  * `private_models_hidden: true`; the reference signed-in (158-id) account's
  * view could not be re-measured this pass — the local `fx login` token had
  * expired, so there was no live authenticated account to probe.
+ *
+ * Re-verified against fx 0.0.8 (binary probe + full 0.0.7→0.0.8 source diff,
+ * 2026-09-08): the `models --json` shape is byte-identical. The
+ * unauthenticated (empty-`HOME`) catalog read 244 ids TODAY on **both** the
+ * 0.0.7 and 0.0.8 binaries (`private_models_hidden: true`) — i.e. the count
+ * that grew from 230→234→244 over these measurements is a property of the
+ * Gateway's catalog on the day measured, not of the binary version being
+ * probed. All 22 curated ids (16 standard + 6 `catalogOnly`) are present in
+ * that unauth catalog; the 158-id signed-in reference still couldn't be
+ * re-measured (no valid local login at measurement time).
  */
 function parseFxModels(stdout: string): DiscoveredModel[] {
   try {
@@ -533,6 +543,15 @@ function parseFxModels(stdout: string): DiscoveredModel[] {
  * (src/shared/model-options.ts) treats a harness whose `HarnessStatus.loggedIn
  * === false` as having no trustworthy discovered catalog, so `catalogOnly`
  * rows can't over-show from that degraded view.
+ *
+ * Re-verified against fx 0.0.8 (2026-09-08): still zero filesystem writes,
+ * and the unauth catalog reads 244 ids TODAY on both the 0.0.7 and 0.0.8
+ * binaries — confirming (per the `parseFxModels` doc comment above) that
+ * this count tracks the Gateway's catalog on the day probed, not which
+ * binary version is doing the probing. The expired-login degradation
+ * (silent fallback to the unauthenticated catalog, indistinguishable from a
+ * genuinely logged-out probe) still applies unchanged on 0.0.8; the
+ * `mergeModelOptions` compensation described above is unaffected.
  *
  * That account-scoping is exactly why `env` exists as a parameter here (and
  * threads through to `runProbe`): a harness with its own `HOME` override —

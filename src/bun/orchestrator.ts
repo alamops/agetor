@@ -996,16 +996,18 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
   }
   // Fail-open: only an explicit `false` means the CLI positively reported
   // it's logged out. `null` (not probed / unknown) must never block a run.
-  // Empirically (real fx v0.0.6 and v0.0.7, HOME pointed at an empty dir):
-  // env-var auth IS reflected by the probe (AI_GATEWAY_API_KEY /
-  // VERCEL_OIDC_TOKEN both report a non-"missing" `auth` value) — since the
-  // probe runs with the same harnessEnv(harness) a real spawn uses, a
-  // key-authenticated user is never gated out here. As of 0.0.7, that same
-  // explicit `false` can also come from an expired login that can't
-  // self-refresh (`auth_expired === true && auth_refreshable === false`) —
-  // but that gate explicitly exempts the env-key `auth` values above (see
-  // agent-status.ts's probeStatus doc comment for the full rationale), so
-  // the "never gated out" guarantee holds with no exception.
+  // Empirically (real fx v0.0.6, v0.0.7, and v0.0.8 — 0.0.8 re-verified
+  // 2026-09-08, HOME pointed at an empty dir): env-var auth IS reflected by
+  // the probe (AI_GATEWAY_API_KEY / VERCEL_OIDC_TOKEN both report a
+  // non-"missing" `auth` value) — since the probe runs with the same
+  // harnessEnv(harness) a real spawn uses, a key-authenticated user is never
+  // gated out here. As of 0.0.7 (unchanged in 0.0.8 — the credential
+  // re-check code paths are byte-identical 0.0.7→0.0.8), that same explicit
+  // `false` can also come from an expired login that can't self-refresh
+  // (`auth_expired === true && auth_refreshable === false`) — but that gate
+  // explicitly exempts the env-key `auth` values above (see agent-status.ts's
+  // probeStatus doc comment for the full rationale), so the "never gated
+  // out" guarantee holds with no exception.
   if (status.loggedIn === false) {
     return { error: `${harness.label} isn't logged in — ${status.authHelp ?? "run its login command"}` };
   }
