@@ -80,7 +80,11 @@ export const FX_TURN_KEYS = [
   "cacheWriteTokens",
   "reasoningTokens",
 ] as const satisfies ReadonlyArray<keyof NonNullable<FxUsagePayload["turn"]>>;
-type _FxTurnKeysExhaustive = Record<(typeof FX_TURN_KEYS)[number], unknown> extends Required<NonNullable<FxUsagePayload["turn"]>> ? true : never;
+// Every key of `turn` must appear in FX_TURN_KEYS (the `satisfies` above
+// guarantees the converse), so the Exclude below is `never` iff the list is
+// exhaustive — and `true` is only assignable when it is.
+type _FxTurnKeysExhaustive =
+  Exclude<keyof NonNullable<FxUsagePayload["turn"]>, (typeof FX_TURN_KEYS)[number]> extends never ? true : never;
 const _fxTurnKeysExhaustive: _FxTurnKeysExhaustive = true;
 void _fxTurnKeysExhaustive;
 
@@ -1395,8 +1399,8 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // (`~/.fx/settings.json` on the reference account). Ids are Vercel AI
   // Gateway ids, passed verbatim. fx is exempt from the "always default to
   // the best available model" rule above: the Gateway bills per token to the
-  // user's own account, and flagship tiers (opus-5, sonnet-5, gpt-5.5,
-  // gemini-3.1-pro-preview, gemini-3.8-flash, kimi-k3) stay one click away
+  // user's own account, and flagship tiers (the twelve `catalogOnly` rows in
+  // `AGENT_OPTIONS.fx.models`) stay one click away
   // in the picker as catalog-gated rows — offered only when the signed-in
   // account's catalog actually contains them (see `AgentOption.catalogOnly`).
   // Re-verified 2026-08-31 on fx 0.0.7: compiled default unchanged
