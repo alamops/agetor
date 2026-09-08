@@ -88,7 +88,7 @@ import {
  *   - `session/resume`/`load`       SCHEMA-DERIVED             resume falls back to load on -32601/-32602/-32600 alike (see runFxTurn)
  *   - `session/prompt`              SPIKE-VERIFIED shape       sole completion signal, no timeout (see runFxTurn); result gains a `usage` object as of 0.0.8
  *   - `session/update`              SPIKE-VERIFIED envelope    variant → chunk mapping (see mapFxUpdate); text deltas folded per message and (0.0.8+) per messageId (see FxTextCoalescer)
- *   - `session/request_permission`  SCHEMA-DERIVED, UNVERIFIED-LIVE card flow  (see respondPermissionRequest)
+ *   - `session/request_permission`  LIVE-VERIFIED 0.0.8 (ask mode)  card flow  (see respondPermissionRequest)
  *   - `session/cancel`              SCHEMA-DERIVED             notification, no reply expected (see cancelFxTurn); 0.0.8 spike confirms it now actually interrupts in-flight work
  *   - death                         —                          unexpected exit before settlement (see the `exited` watcher)
  *
