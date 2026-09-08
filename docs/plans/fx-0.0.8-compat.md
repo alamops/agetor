@@ -130,6 +130,12 @@ Plan approval (2026-09-08): "Approve, but also sweep the out-of-scope items in" 
 
 Assumptions: (A1) `usage_update` fires only when fx knows the model's context window — a model without one yields no `used/size`, and the chip then shows the per-turn form only; verified from source, live-checked in the smoke. (A2) `agent_thought_chunk` frequency depends on the model's reasoning output; the mapping is exercised by tests and the smoke, not guaranteed per turn. (A3) The `protocolVersion` string form was not actually exercised by the probe (its "string" scenario sent numeric 1); only numeric 999 acceptance is measured. Agetor keeps sending numeric 1, so nothing rides on it. (A4) The signed-in catalog view remains unverifiable until the owner's login is refreshed; curated rows unchanged (all present unauth).
 
+### Execution record (filled in as the run progressed)
+
+- Wave 1 `bdfe6c4`, wave 2 `4c285a8`, tests `bcb7db5`, review fixes `9254d07` + `d65e3a2` + `73175a0`.
+- **Phase 5 review** (opus, repo `code-review` skill): 1 critical — `emit()` re-packed chunks from scalar args and dropped `messageId` before the coalescer, so the split rule was dead end-to-end (also caught independently by TT1's fake-ACP `message-id-split` scenario; fixed by threading `messageId` through `emit`). 3 medium — session title unbounded at the driver (fixed: whitespace-collapsed, trimmed, capped at `FX_SESSION_TITLE_MAX_LEN = 200`, deduped on the normalized form, mirroring the provider sentinel's bound); internal sentinels still indexed by message search so Cmd+F could jump to an event with no DOM node (fixed: `searchableEventText` skips `isInternalStatusSentinel`); fx's tool `title` no longer searchable after the name change (fixed: indexed alongside `name`/`input`). 3 low — tool-title span could overflow the header row (fixed: `min-w-0 truncate`); three redundant full scans of `events` per render for fx tasks (fixed: one memo pass builds usage/provider/title maps); stale `DEFAULT_MODEL` comment + duplicated turn-key lists (fixed: `FX_TURN_KEYS` exported once from `src/shared/types.ts` with an exhaustiveness check, consumed by the driver and the webview parser).
+- Lesson recorded for the fleet: a new `FxChunk` field must be threaded through `emit()`, and driver-level behavior needs a fake-ACP-server scenario in `fx-acp.test.ts`, not only mapper unit tests.
+
 ## 9. Completeness ledger
 
 | Candidate remainder | Disposition |
