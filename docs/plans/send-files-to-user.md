@@ -157,7 +157,7 @@ Assumptions proceeding on:
 | CLAUDE.md derived-surface docs + stale PATCH sentence | **in** — T10 (owner pulled the stale line in) |
 | In-app lightbox for images | **out of scope** — owner chose OS open |
 | Clear-on-open badge (second watermark) | **out of scope** — owner chose persistent total |
-| Deleting/archiving a task also deleting sent files on disk | **out of scope** — never delete user files; the row's column goes with the task as today |
+| Deleting/archiving a task also deleting sent files on disk | **owner-decided 2026-09-08** — delete already removes everything under the worktree (`git worktree remove --force` + `rm -rf` fallback), sent files included, and the `sent_files` record goes with the task row; files sent from outside the worktree (scratchpad, `~/Downloads`) are never touched. Archive is deliberately unchanged: its dirty gate still counts an untracked sent file as uncommitted work, so such a worktree stays on disk until forced from the Worktrees page (owner chose to keep this over ignoring sent files in the gate) |
 | `/files/preview` size cap / cwd containment hardening | **out of scope** — pre-existing route posture, not made untrue by this change |
 | Windows/Linux reveal | **out of scope** — arm64 macOS is the only release target |
 | Subagent sends counted in the badge | **out of scope** — structural boundary shared with the todo tracker; cards still render in subagent tabs |
