@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { FxTextCoalescer, extractFxProviderValue, isFxContextDiagnostic, mapFxUpdate } from "./fx-acp.ts";
-import { FX_USAGE_STATUS_PREFIX } from "../shared/types.ts";
+import type { FxUpdateCtx } from "./fx-acp.ts";
+import { FX_USAGE_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX } from "../shared/types.ts";
 import { deriveTodoProgress } from "../shared/todo-progress.ts";
 
 /**
@@ -14,12 +15,18 @@ import { deriveTodoProgress } from "../shared/todo-progress.ts";
 /** A fresh `ctx` with its own independent seq counter, mirroring the
  *  `() => state.seq++` closure `dispatchSessionUpdate` passes in production.
  *  `current` exposes the counter's next value without consuming it, so a
- *  test can assert "the counter did not move" without guessing. */
-function makeCtx(runId = "run-1") {
+ *  test can assert "the counter did not move" without guessing. `lastTitle`
+ *  is a real, mutable field (typed via `FxUpdateCtx`, not just structurally
+ *  compatible with it) so the `session_info_update` dedupe tests can both
+ *  read it back after a call and assert it stays untouched when nothing was
+ *  emitted — mirroring how `dispatchSessionUpdate` carries `state.lastTitle`
+ *  across calls in production. */
+function makeCtx(runId = "run-1"): FxUpdateCtx & { readonly current: number } {
   let seq = 0;
   return {
     runId,
     nextSeq: () => seq++,
+    lastTitle: undefined,
     get current() {
       return seq;
     },
@@ -66,6 +73,34 @@ describe("agent_message_chunk / agent_thought_chunk", () => {
     expect(mapFxUpdate({ sessionUpdate: "agent_message_chunk" }, ctx)).toEqual([]);
     expect(
       mapFxUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "image" } }, ctx),
+    ).toEqual([]);
+    expect(ctx.current).toBe(0);
+  });
+
+  test("agent_thought_chunk carries a string messageId onto the mapped thinking chunk when fx sends one", () => {
+    const ctx = makeCtx("run-TH1");
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "reasoning…" }, messageId: "m1" },
+      ctx,
+    );
+    expect(chunks).toEqual([{ stream: "thinking", data: "reasoning…", lineUuid: "fx:run-TH1:0", messageId: "m1" }]);
+  });
+
+  test("agent_thought_chunk with no messageId (fx today) still maps cleanly, with the field undefined", () => {
+    const ctx = makeCtx("run-TH2");
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "reasoning…" } },
+      ctx,
+    );
+    expect(chunks).toEqual([{ stream: "thinking", data: "reasoning…", lineUuid: "fx:run-TH2:0" }]);
+    expect(chunks[0]!.messageId).toBeUndefined();
+  });
+
+  test("agent_thought_chunk with a non-text content block (or missing content) yields no chunk, and does not bump the seq counter", () => {
+    const ctx = makeCtx();
+    expect(mapFxUpdate({ sessionUpdate: "agent_thought_chunk" }, ctx)).toEqual([]);
+    expect(
+      mapFxUpdate({ sessionUpdate: "agent_thought_chunk", content: { type: "image" } }, ctx),
     ).toEqual([]);
     expect(ctx.current).toBe(0);
   });
@@ -129,6 +164,49 @@ describe("tool_call → tool_use", () => {
     const update = { sessionUpdate: "tool_call", toolCallId: "tc-6", title: "T" };
     const withoutRawInput = mapFxUpdate(update, ctx);
     expect(JSON.parse(withoutRawInput[0]!.data).input).toEqual(update);
+  });
+
+  test("fx ≥0.0.8's real `name` wins over the legacy title/kind synthesis, and a differing title rides alongside as `title`", () => {
+    const ctx = makeCtx("run-N1");
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "tool_call", toolCallId: "tc-n1", name: "shell", title: "Run ls", kind: "execute", rawInput: { cmd: "ls" } },
+      ctx,
+    );
+    expect(chunks).toHaveLength(1);
+    expect(JSON.parse(chunks[0]!.data)).toEqual({
+      id: "tc-n1",
+      name: "shell",
+      input: { cmd: "ls" },
+      serverSide: false,
+      title: "Run ls",
+    });
+  });
+
+  test("a real `name` equal to the title carries no separate `title` key — nothing new to say", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate({ sessionUpdate: "tool_call", toolCallId: "tc-n2", name: "shell", title: "shell" }, ctx);
+    const parsed = JSON.parse(chunks[0]!.data);
+    expect(parsed.name).toBe("shell");
+    expect("title" in parsed).toBe(false);
+  });
+
+  test("no `name` at all falls back to the legacy 'title (kind)' synthesis and never carries a `title` key — the title is already folded into `name`", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate({ sessionUpdate: "tool_call", toolCallId: "tc-n3", title: "Do thing", kind: "execute" }, ctx);
+    const parsed = JSON.parse(chunks[0]!.data);
+    expect(parsed.name).toBe("Do thing (execute)");
+    expect("title" in parsed).toBe(false);
+  });
+
+  test("an empty-string `name` is treated as absent — falls back to legacy synthesis, no `title` key", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "tool_call", toolCallId: "tc-n4", name: "", title: "Do thing", kind: "execute" },
+      ctx,
+    );
+    const parsed = JSON.parse(chunks[0]!.data);
+    expect(parsed.name).toBe("Do thing (execute)");
+    expect("title" in parsed).toBe(false);
   });
 });
 
@@ -302,6 +380,90 @@ describe("usage_update → FX_USAGE_STATUS_PREFIX status chunk", () => {
     expect(mapFxUpdate({ sessionUpdate: "usage_update", used: 10 }, ctx)).toEqual([]);
     expect(mapFxUpdate({ sessionUpdate: "usage_update" }, ctx)).toEqual([]);
   });
+
+  test("a small fractional cost amount ({amount: 0.0012, currency: 'USD'}) round-trips exactly into the {used,size,cost} payload", () => {
+    const ctx = makeCtx("run-U2");
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "usage_update", used: 500, size: 128000, cost: { amount: 0.0012, currency: "USD" } },
+      ctx,
+    );
+    expect(chunks).toHaveLength(1);
+    expect(JSON.parse(chunks[0]!.data.slice(FX_USAGE_STATUS_PREFIX.length))).toEqual({
+      used: 500,
+      size: 128000,
+      cost: { amount: 0.0012, currency: "USD" },
+    });
+  });
+});
+
+describe("session_info_update → FX_SESSION_TITLE_STATUS_PREFIX status chunk", () => {
+  test("a real, non-placeholder title emits one status chunk and records it onto ctx.lastTitle", () => {
+    const ctx = makeCtx("run-T1");
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "session_info_update", title: "Fix flaky worktree test", updatedAt: "2026-09-08T00:00:00Z" },
+      ctx,
+    );
+    expect(chunks).toEqual([
+      { stream: "status", data: FX_SESSION_TITLE_STATUS_PREFIX + "Fix flaky worktree test", lineUuid: "fx:run-T1:0" },
+    ]);
+    expect(ctx.lastTitle).toBe("Fix flaky worktree test");
+  });
+
+  test("fx's placeholder \"Untitled session\" never emits and leaves ctx.lastTitle untouched", () => {
+    const ctx = makeCtx();
+    expect(mapFxUpdate({ sessionUpdate: "session_info_update", title: "Untitled session" }, ctx)).toEqual([]);
+    expect(ctx.lastTitle).toBeUndefined();
+    expect(ctx.current).toBe(0);
+  });
+
+  test("an identical title repeated in the same ctx is silently deduped on the second (and further) occurrence", () => {
+    const ctx = makeCtx("run-T2");
+    const first = mapFxUpdate({ sessionUpdate: "session_info_update", title: "Same title" }, ctx);
+    expect(first).toEqual([
+      { stream: "status", data: FX_SESSION_TITLE_STATUS_PREFIX + "Same title", lineUuid: "fx:run-T2:0" },
+    ]);
+    const second = mapFxUpdate({ sessionUpdate: "session_info_update", title: "Same title" }, ctx);
+    const third = mapFxUpdate({ sessionUpdate: "session_info_update", title: "Same title" }, ctx);
+    expect(second).toEqual([]);
+    expect(third).toEqual([]);
+    // The seq counter never moved for either deduped (silent) call.
+    expect(ctx.current).toBe(1);
+    expect(ctx.lastTitle).toBe("Same title");
+  });
+
+  test("a genuinely changed title after an earlier one emits again and overwrites ctx.lastTitle", () => {
+    const ctx = makeCtx("run-T3");
+    mapFxUpdate({ sessionUpdate: "session_info_update", title: "First" }, ctx);
+    const changed = mapFxUpdate({ sessionUpdate: "session_info_update", title: "Second" }, ctx);
+    expect(changed).toEqual([
+      { stream: "status", data: FX_SESSION_TITLE_STATUS_PREFIX + "Second", lineUuid: "fx:run-T3:1" },
+    ]);
+    expect(ctx.lastTitle).toBe("Second");
+  });
+
+  test("an empty-string or non-string title is ignored — no chunk, ctx.lastTitle untouched", () => {
+    const ctx = makeCtx();
+    expect(mapFxUpdate({ sessionUpdate: "session_info_update", title: "" }, ctx)).toEqual([]);
+    expect(mapFxUpdate({ sessionUpdate: "session_info_update", title: 42 }, ctx)).toEqual([]);
+    expect(mapFxUpdate({ sessionUpdate: "session_info_update", title: null }, ctx)).toEqual([]);
+    expect(mapFxUpdate({ sessionUpdate: "session_info_update", title: { nested: true } }, ctx)).toEqual([]);
+    expect(mapFxUpdate({ sessionUpdate: "session_info_update" }, ctx)).toEqual([]);
+    expect(ctx.lastTitle).toBeUndefined();
+    expect(ctx.current).toBe(0);
+  });
+
+  test("the legacy pre-0.0.8 shape (_meta.fx.modelResponseRecovery, no title) emits nothing", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate(
+      {
+        sessionUpdate: "session_info_update",
+        _meta: { fx: { modelResponseRecovery: { attempted: true, succeeded: true } } },
+      },
+      ctx,
+    );
+    expect(chunks).toEqual([]);
+    expect(ctx.lastTitle).toBeUndefined();
+  });
 });
 
 describe("extractFxProviderValue", () => {
@@ -407,6 +569,21 @@ describe("unknown / forward-compat sessionUpdate variants", () => {
     }
     expect(ctx.current).toBe(0);
   });
+
+  test("the true default branch (no dedicated case at all) still returns [] for every known no-writer kind plus an unknown future one", () => {
+    const ctx = makeCtx();
+    const variants = [
+      "current_mode_update",
+      "available_commands_update",
+      "user_message_chunk",
+      "config_option_update",
+      "some_future_variant_2026",
+    ];
+    for (const kind of variants) {
+      expect(mapFxUpdate({ sessionUpdate: kind }, ctx)).toEqual([]);
+    }
+    expect(ctx.current).toBe(0);
+  });
 });
 
 describe("agent_message_chunk carrying fx [context] diagnostics", () => {
@@ -477,5 +654,75 @@ describe("FxTextCoalescer", () => {
     const status = { stream: "status" as const, data: "fx turn ended: max_tokens" };
     expect(c.push(status)).toEqual([{ stream: "assistant", data: "done", lineUuid: "fx:r:3" }, status]);
     expect(c.pending).toBe(false);
+  });
+
+  describe("messageId split rule (fx ≥0.0.8)", () => {
+    test("two assistant chunks with differing string messageIds ('a' then 'b') flush the first as soon as the second arrives", () => {
+      const c = new FxTextCoalescer();
+      const a = { stream: "assistant" as const, data: "first message", lineUuid: "fx:r:0", messageId: "a" };
+      const b = { stream: "assistant" as const, data: "second message", lineUuid: "fx:r:1", messageId: "b" };
+      expect(c.push(a)).toEqual([]);
+      // 'b' arriving is the boundary: 'a' flushes immediately, ahead of 'b'
+      // ever being delivered — 'b' is now the one buffered.
+      const onArrival = c.push(b);
+      expect(onArrival).toEqual([{ stream: "assistant", data: "first message", lineUuid: "fx:r:0" }]);
+      expect(c.pending).toBe(true);
+      const onExplicitFlush = c.flush();
+      expect(onExplicitFlush).toEqual([{ stream: "assistant", data: "second message", lineUuid: "fx:r:1" }]);
+      // Texts intact and un-mingled: two total outputs across the sequence,
+      // the first carrying 'a'-chunk's own lineUuid, the second 'b'-chunk's.
+      expect(onArrival[0]!.data).toBe(a.data);
+      expect(onExplicitFlush[0]!.data).toBe(b.data);
+      expect(onArrival[0]!.lineUuid).toBe(a.lineUuid);
+      expect(onExplicitFlush[0]!.lineUuid).toBe(b.lineUuid);
+    });
+
+    test("the same messageId across multiple deltas stays one buffered (unsplit) message", () => {
+      const c = new FxTextCoalescer();
+      expect(c.push({ stream: "assistant", data: "Hello ", lineUuid: "fx:r:0", messageId: "same" })).toEqual([]);
+      expect(c.push({ stream: "assistant", data: "world", lineUuid: "fx:r:1", messageId: "same" })).toEqual([]);
+      expect(c.flush()).toEqual([{ stream: "assistant", data: "Hello world", lineUuid: "fx:r:0" }]);
+    });
+
+    test("a messageId followed by a chunk with NO messageId does not split — a change requires BOTH sides to be strings", () => {
+      const c = new FxTextCoalescer();
+      expect(c.push({ stream: "assistant", data: "Hello ", lineUuid: "fx:r:0", messageId: "a" })).toEqual([]);
+      expect(c.push({ stream: "assistant", data: "world", lineUuid: "fx:r:1" })).toEqual([]);
+      expect(c.flush()).toEqual([{ stream: "assistant", data: "Hello world", lineUuid: "fx:r:0" }]);
+    });
+
+    test("no messageId followed by a chunk WITH one does not split either — same both-sides-string requirement", () => {
+      const c = new FxTextCoalescer();
+      expect(c.push({ stream: "assistant", data: "Hello ", lineUuid: "fx:r:0" })).toEqual([]);
+      expect(c.push({ stream: "assistant", data: "world", lineUuid: "fx:r:1", messageId: "b" })).toEqual([]);
+      expect(c.flush()).toEqual([{ stream: "assistant", data: "Hello world", lineUuid: "fx:r:0" }]);
+    });
+
+    test("the split rule applies identically to thinking chunks, not just assistant ones", () => {
+      const c = new FxTextCoalescer();
+      const a = { stream: "thinking" as const, data: "hmm ", lineUuid: "fx:r:0", messageId: "a" };
+      const b = { stream: "thinking" as const, data: "wait", lineUuid: "fx:r:1", messageId: "b" };
+      expect(c.push(a)).toEqual([]);
+      expect(c.push(b)).toEqual([{ stream: "thinking", data: "hmm ", lineUuid: "fx:r:0" }]);
+      expect(c.flush()).toEqual([{ stream: "thinking", data: "wait", lineUuid: "fx:r:1" }]);
+    });
+
+    // Per the task brief: verify what's actually true about whether a
+    // flushed FxChunk ever retains `messageId`, rather than assuming either
+    // way. Reading FxTextCoalescer.flush() (fx-acp.ts) shows it builds its
+    // output object literal from only `stream`/`data`/`lineUuid` — the
+    // buffered `messageId` is consulted for the split decision and then
+    // discarded, never copied onto the emitted chunk. So the fact to pin is
+    // at the coalescer itself, independent of `emit`/`deliver` (which are
+    // unexported and out of this pure-mapper file's reach): a flushed chunk
+    // never carries a `messageId` key, regardless of what the buffered
+    // input(s) carried.
+    test("a flushed chunk never carries a messageId field, even though the input chunk did", () => {
+      const c = new FxTextCoalescer();
+      c.push({ stream: "assistant", data: "hi", lineUuid: "fx:r:0", messageId: "a" });
+      const [flushed] = c.flush();
+      expect(flushed).toBeDefined();
+      expect("messageId" in flushed!).toBe(false);
+    });
   });
 });

@@ -6,10 +6,12 @@ import {
   CURSOR_MODEL_SPECS,
   DEFAULT_MODEL,
   FX_PROVIDER_STATUS_PREFIX,
+  FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   MODEL_EFFORT_SUPPORT,
   PERMISSION_MODE_STATUS_PREFIX,
   isInternalStatusSentinel,
+  supportedModes,
   type AgentKind,
 } from "./types.ts";
 
@@ -25,6 +27,18 @@ test("isInternalStatusSentinel: true for an fx-usage status chunk", () => {
 
 test("isInternalStatusSentinel: true for an fx-provider status chunk", () => {
   expect(isInternalStatusSentinel(`${FX_PROVIDER_STATUS_PREFIX}gateway`)).toBe(true);
+});
+
+test("isInternalStatusSentinel: true for an fx-title status chunk", () => {
+  expect(isInternalStatusSentinel(`${FX_SESSION_TITLE_STATUS_PREFIX}x`)).toBe(true);
+});
+
+test("isInternalStatusSentinel: false for text that merely looks like the fx-title prefix without its trailing space", () => {
+  expect(isInternalStatusSentinel("fx-title:x")).toBe(false);
+});
+
+test("isInternalStatusSentinel: false for ordinary text mentioning a session title", () => {
+  expect(isInternalStatusSentinel("Renamed the session title to x")).toBe(false);
 });
 
 test("isInternalStatusSentinel: false for a plain status line that merely mentions a provider", () => {
@@ -152,7 +166,7 @@ test("none of the seven previously-curated fx ids survives as an unconditional r
   expect(Object.keys(MODEL_EFFORT_SUPPORT.fx)).not.toContain("google/gemini-3-pro");
 });
 
-test("exactly the six premium Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
+test("exactly the twelve premium Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
   const expectedCatalogOnly = new Set([
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-5",
@@ -160,11 +174,21 @@ test("exactly the six premium Gateway ids are catalogOnly in AGENT_OPTIONS.fx, a
     "google/gemini-3.1-pro-preview",
     "google/gemini-3.8-flash",
     "moonshotai/kimi-k3",
+    // 2026-09-08 fx 0.0.8 catalog refresh (plan §3 S2) — six more premium
+    // rows drawn from the unauth catalog, same "offered only when the
+    // signed-in account's catalog includes it" treatment as the original six.
+    "anthropic/claude-fable-5.1",
+    "anthropic/claude-haiku-4.5",
+    "openai/gpt-6-astra",
+    "openai/gpt-5.6-sol",
+    "zai/glm-5.3",
+    "deepseek/deepseek-v4-pro",
   ]);
   const actualCatalogOnly = new Set(
     AGENT_OPTIONS.fx.models.filter((m) => m.catalogOnly).map((m) => m.id),
   );
   expect(actualCatalogOnly).toEqual(expectedCatalogOnly);
+  expect(actualCatalogOnly.size).toBe(12);
 
   for (const kind of KINDS) {
     if (kind === "fx") continue;
@@ -172,6 +196,32 @@ test("exactly the six premium Gateway ids are catalogOnly in AGENT_OPTIONS.fx, a
       expect(model.catalogOnly).toBeFalsy();
     }
   }
+});
+
+test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (twelve catalogOnly rows included)", () => {
+  // Narrower restatement of the bidirectional-keys test above, scoped to
+  // just the fx picker's own ids — guards specifically against a
+  // catalogOnly row landing in AGENT_OPTIONS.fx.models without a paired
+  // (empty) MODEL_EFFORT_SUPPORT.fx entry, or vice versa.
+  const catalogIds = AGENT_OPTIONS.fx.models.map((m) => m.id);
+  const effortKeys = Object.keys(MODEL_EFFORT_SUPPORT.fx);
+  for (const id of catalogIds) {
+    expect(effortKeys).toContain(id);
+  }
+  for (const key of effortKeys) {
+    expect(catalogIds).toContain(key);
+  }
+});
+
+test("AGENT_OPTIONS.fx.modes' yolo row is labelled 'Full access' with id 'yolo', and supportedModes('fx', null) still offers auto/yolo/ask", () => {
+  const yoloRow = AGENT_OPTIONS.fx.modes.find((m) => m.id === "yolo");
+  expect(yoloRow).toBeDefined();
+  expect(yoloRow?.label).toBe("Full access");
+
+  const offeredIds = supportedModes("fx", null).map((m) => m.id);
+  expect(offeredIds).toContain("auto");
+  expect(offeredIds).toContain("yolo");
+  expect(offeredIds).toContain("ask");
 });
 
 test("AGENT_OPTIONS.fx.models has unique ids, unique labels, and every id matches provider/model shape", () => {

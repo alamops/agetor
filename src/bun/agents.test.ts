@@ -2,7 +2,15 @@ import { test, expect, beforeEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { AGENT_OPTIONS, type AgentKind, type Harness } from "../shared/types.ts";
+import {
+  AGENT_OPTIONS,
+  FX_PROVIDER_STATUS_PREFIX,
+  FX_SESSION_TITLE_STATUS_PREFIX,
+  FX_USAGE_STATUS_PREFIX,
+  type AgentKind,
+  type Harness,
+  type RunEventStream,
+} from "../shared/types.ts";
 
 // agents.ts imports codex-tmux.ts/gemini-tmux.ts, both of which import
 // dataDir from db.ts — db.ts opens its sqlite connection at module-load
@@ -1149,6 +1157,105 @@ test("fx AGETOR_FX_DRIVER=fake still exercises buildCommand's validation (throws
       opts: { mode: "auto" },
     }),
   ).rejects.toThrow(/model is required for fx/);
+});
+
+test("fx buildCommand for mode 'yolo' sets FX_PERMISSION_MODE=yolo verbatim (never rewritten to 'full-access')", () => {
+  const { env } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, mode: "yolo" });
+  expect(env?.FX_PERMISSION_MODE).toBe("yolo");
+});
+
+/**
+ * docs/plans/fx-0.0.8-compat.md §3 "Fake fx driver per turn" — the fake fx
+ * driver (AGETOR_FX_DRIVER=fake) must emit, per completed turn: a `thinking`
+ * chunk ("fake fx reasoning"), then the turn's assistant/stdout text, then
+ * the two `fx-usage: ` sentinels (context used/size, then per-turn
+ * input/output tokens), then the `fx-title: ` session-title sentinel, then
+ * the existing "turn complete" status — with the `fx-provider: ` sentinel
+ * emitted somewhere in the stream (order-independent, per the shared spec).
+ * These tests assert relative order via indices into the collected chunk
+ * list rather than an exact total count, so they don't need updating if an
+ * unrelated status chunk is added to a scenario later.
+ */
+test("fx AGETOR_FX_DRIVER=fake plain-prompt turn: thinking -> text -> usage(used/size) -> usage(turn) -> title -> turn complete, provider sentinel present", async () => {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  const chunks: { stream: RunEventStream; data: string }[] = [];
+  const handle = await spawnAgent({
+    taskId: "task-fx-order-1",
+    runId: "run-fx-order-1",
+    harness: builtin("fx"),
+    prompt: "hi",
+    cwd: "/tmp",
+    onChunk: (stream, data) => { chunks.push({ stream, data }); },
+    opts: { ...fxDefaults, runId: "run-fx-order-1" },
+  });
+  await handle.done;
+
+  const usage1 = `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ used: 1234, size: 128000 })}`;
+  const usage2 = `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ turn: { inputTokens: 42, outputTokens: 7 } })}`;
+  const title = `${FX_SESSION_TITLE_STATUS_PREFIX}Fake fx session`;
+
+  const thinkingIdx = chunks.findIndex((c) => c.stream === "thinking" && c.data === "fake fx reasoning");
+  const textIdx = chunks.findIndex((c, i) => i > thinkingIdx && (c.stream === "assistant" || c.stream === "stdout"));
+  const usage1Idx = chunks.findIndex((c, i) => i > textIdx && c.stream === "status" && c.data === usage1);
+  const usage2Idx = chunks.findIndex((c, i) => i > usage1Idx && c.stream === "status" && c.data === usage2);
+  const titleIdx = chunks.findIndex((c, i) => i > usage2Idx && c.stream === "status" && c.data === title);
+  const completeIdx = chunks.findIndex((c, i) => i > titleIdx && c.stream === "status" && c.data === "turn complete");
+
+  expect(thinkingIdx).toBeGreaterThanOrEqual(0);
+  expect(textIdx).toBeGreaterThan(thinkingIdx);
+  expect(usage1Idx).toBeGreaterThan(textIdx);
+  expect(usage2Idx).toBeGreaterThan(usage1Idx);
+  expect(titleIdx).toBeGreaterThan(usage2Idx);
+  expect(completeIdx).toBeGreaterThan(titleIdx);
+
+  const providerIdx = chunks.findIndex((c) => c.stream === "status" && c.data === `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+  expect(providerIdx).toBeGreaterThanOrEqual(0);
+});
+
+test("fx AGETOR_FAKE_FX_PERMISSION=1 with mode 'yolo' auto-allows and still emits the same relative sentinel order, plus the provider sentinel", async () => {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  process.env.AGETOR_FAKE_FX_PERMISSION = "1";
+  const chunks: { stream: RunEventStream; data: string }[] = [];
+  try {
+    const handle = await spawnAgent({
+      taskId: "task-fx-yolo-perm-1",
+      runId: "run-fx-yolo-perm-1",
+      harness: builtin("fx"),
+      prompt: "hi",
+      cwd: "/tmp",
+      onChunk: (stream, data) => { chunks.push({ stream, data }); },
+      opts: { ...fxDefaults, mode: "yolo", runId: "run-fx-yolo-perm-1" },
+    });
+    await handle.done;
+  } finally {
+    delete process.env.AGETOR_FAKE_FX_PERMISSION;
+  }
+
+  const usage1 = `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ used: 1234, size: 128000 })}`;
+  const usage2 = `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ turn: { inputTokens: 42, outputTokens: 7 } })}`;
+  const title = `${FX_SESSION_TITLE_STATUS_PREFIX}Fake fx session`;
+
+  const thinkingIdx = chunks.findIndex((c) => c.stream === "thinking" && c.data === "fake fx reasoning");
+  const textIdx = chunks.findIndex((c, i) => i > thinkingIdx && c.stream === "assistant");
+  const usage1Idx = chunks.findIndex((c, i) => i > textIdx && c.stream === "status" && c.data === usage1);
+  const usage2Idx = chunks.findIndex((c, i) => i > usage1Idx && c.stream === "status" && c.data === usage2);
+  const titleIdx = chunks.findIndex((c, i) => i > usage2Idx && c.stream === "status" && c.data === title);
+  const completeIdx = chunks.findIndex((c, i) => i > titleIdx && c.stream === "status" && c.data === "turn complete");
+
+  expect(thinkingIdx).toBeGreaterThanOrEqual(0);
+  expect(textIdx).toBeGreaterThan(thinkingIdx);
+  expect(usage1Idx).toBeGreaterThan(textIdx);
+  expect(usage2Idx).toBeGreaterThan(usage1Idx);
+  expect(titleIdx).toBeGreaterThan(usage2Idx);
+  expect(completeIdx).toBeGreaterThan(titleIdx);
+
+  // Yolo never reaches the session/request_permission registry round-trip —
+  // no fx_permission card, so no "fake fx permission resolved: …" status.
+  expect(chunks.some((c) => c.data.startsWith("fake fx permission resolved:"))).toBe(false);
+  expect(chunks.some((c) => c.data === "fake fx permission auto-allowed (yolo)")).toBe(true);
+
+  const providerIdx = chunks.findIndex((c) => c.stream === "status" && c.data === `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+  expect(providerIdx).toBeGreaterThanOrEqual(0);
 });
 
 test("claude-code 'max' effort sets CLAUDE_CODE_EFFORT_LEVEL=max env", () => {

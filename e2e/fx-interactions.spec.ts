@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { test, expect, type APIRequestContext, type E2EBackend, type Page } from "./fixtures";
+import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp } from "./helpers";
 
 /**
@@ -133,6 +133,87 @@ async function openTask(page: Page, title: string) {
   const panel = runPanel(page);
   await expect(panel.locator("textarea")).toBeVisible();
   return panel;
+}
+
+/** The New Task form's `<aside>` — mounted first in App.tsx's JSX, ahead of
+ *  the run panel's own `<aside>` (`runPanel` above uses `.last()`). Mirrors
+ *  e2e/fx-models.spec.ts's identical helper. */
+function newTaskFormPanel(page: Page): Locator {
+  return page.locator("aside").first();
+}
+
+/** Clicks the given harness's button in the New Task form's Harness picker.
+ *  Only enabled harnesses render here (`availableHarnesses` in
+ *  NewTaskForm.tsx filters on `h.enabled`), so this doubles as an assertion
+ *  that the harness is actually enabled. Mirrors e2e/fx-models.spec.ts's
+ *  identical helper. */
+async function selectHarness(page: Page, label: string): Promise<void> {
+  const button = newTaskFormPanel(page).getByRole("button", { name: label, exact: true });
+  await expect(button).toBeVisible({ timeout: 20_000 });
+  await button.click();
+}
+
+/** Registers `backend.dataDir` (the worker's own headless-backend data
+ *  directory — already exists, non-git, and gets `rm -rf`'d for free by the
+ *  `backend` fixture's own teardown, so nothing here needs its own cleanup)
+ *  as a project under a distinctive name, so the New Task form's
+ *  ProjectPicker has something to select without touching the native folder
+ *  dialog (unavailable in this headless harness). Mirrors
+ *  e2e/identifier-inputs.spec.ts's identical `EXTENSIONS_TEST_PROJECT_NAME`
+ *  trick — searched for and clicked explicitly rather than relying on
+ *  `autoSelectFirst`, since sibling spec files sharing this worker may have
+ *  already registered their own projects. */
+async function registerDataDirProject(backend: E2EBackend, name: string): Promise<void> {
+  const res = await fetch(`${backend.apiBase}/projects`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${backend.apiToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ path: backend.dataDir, name }),
+  });
+  if (!res.ok) {
+    throw new Error(`POST /projects -> ${res.status}: ${await res.text()}`);
+  }
+}
+
+/** Selects `projectName` (registered via {@link registerDataDirProject}) in
+ *  the New Task form's ProjectPicker: opens the picker (located by its fixed
+ *  tooltip, same constant e2e/identifier-inputs.spec.ts pins), filters the
+ *  search box down to the one distinctively-named row, and clicks it. */
+async function selectProject(form: Locator, projectName: string): Promise<void> {
+  const trigger = form.getByTitle(
+    "Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list.",
+  );
+  await trigger.click();
+  const search = form.getByPlaceholder("Search projects…");
+  await expect(search).toBeVisible();
+  await search.fill(projectName);
+  const row = form.getByRole("button", { name: projectName });
+  await expect(row).toBeVisible();
+  await row.click();
+}
+
+interface TaskRowWithMode extends TaskRow {
+  mode: string | null;
+}
+
+/** Polls `GET /tasks` for a task with an exact title match — used after
+ *  driving the New Task form's "Run task" button, which doesn't hand back
+ *  the created task the way the direct `POST /tasks` helper above does.
+ *  Returns the full row (including `mode`) so the caller can assert the
+ *  server-persisted value, not just what the UI shows. */
+async function findTaskByTitle(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  title: string,
+): Promise<TaskRowWithMode | null> {
+  const res = await request.get(`${backend.apiBase}/tasks`, {
+    headers: { authorization: `Bearer ${backend.apiToken}` },
+  });
+  if (!res.ok()) return null;
+  const tasks = (await res.json()) as TaskRowWithMode[];
+  return tasks.find((t) => t.title === title) ?? null;
 }
 
 test.describe("fx interactions", () => {
@@ -281,5 +362,140 @@ test.describe("fx interactions", () => {
     // future change letting it leak back into the scrollback as a
     // StatusDivider.
     await expect(panel.getByText("fx-provider: gateway", { exact: true })).toHaveCount(0);
+  });
+
+  test("fx 0.0.8 usage/title/thinking: usage chip, session-title chip, and a thinking block render; raw sentinels stay out of the transcript", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = `fx-usage-title-thinking-e2e ${randomUUID()}`;
+    // No fake-driver marker — same generic fallback scenario as the
+    // provider-chip test above. That scenario's `after(5, …)` timer emits a
+    // `thinking` chunk then the "fake response to: <prompt>" echo; its later
+    // `after(20, …)` timer calls `emitFakeFxUsageAndTitle` (src/bun/
+    // agents.ts) — two usage sentinels ({used,size} then {turn:{in,out}})
+    // followed by the session-title sentinel — before settling the turn.
+    // Waiting on the echo text below is therefore a real readiness wait for
+    // the chip assertions, not a race against them.
+    await createAndStartFakeFxTask(request, backend, title);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+
+    await expect(panel.getByText(`fake response to: ${title}`, { exact: true })).toBeVisible();
+
+    // --- RunsList: usage chip ----------------------------------------------
+    // RunPanel merges both usage sentinels onto one payload
+    // (`mergeFxUsage`), so the chip prefers the `used/size` form
+    // (`fxUsageChipText`) — 1234/1000 rounds to "1.2k", 128000/1000 is a
+    // whole "128k" — while the tooltip (`fxUsageTitle`) also lists the
+    // per-turn breakdown.
+    const usageChip = panel.getByTestId("fx-usage-chip");
+    await expect(usageChip).toBeVisible();
+    await expect(usageChip).toHaveText("1.2k/128k");
+    await expect(usageChip).toHaveAttribute("title", /in 42 · out 7/);
+
+    // --- RunsList: session-title chip ---------------------------------------
+    const titleChip = panel.getByTestId("fx-session-title-chip");
+    await expect(titleChip).toBeVisible();
+    await expect(titleChip).toHaveText("Fake fx session");
+
+    // --- RunsList: provider chip is still there too (via its testid this
+    // time, rather than the text-based locator the older test above uses).
+    const providerChip = panel.getByTestId("fx-provider-chip");
+    await expect(providerChip).toBeVisible();
+    await expect(providerChip).toHaveText("gateway");
+
+    // --- Transcript: thinking block ------------------------------------------
+    // `ThinkingBlock` (RunPanel.tsx) has no testid; its toggle button's
+    // accessible name is "▶/▼ thinking" — substring-matched here — and the
+    // fake's "fake fx reasoning" text is short enough to already show in the
+    // collapsed preview, but this clicks the toggle open anyway so the
+    // assertion holds regardless of that preview-length coincidence.
+    const thinkingToggle = panel.getByRole("button", { name: "thinking" });
+    await expect(thinkingToggle).toBeVisible();
+    await thinkingToggle.click();
+    await expect(panel.getByText("fake fx reasoning", { exact: true })).toBeVisible();
+
+    // --- Transcript: raw sentinel strings never render as text --------------
+    // `isInternalStatusSentinel` (shared/types.ts) suppresses all three fx
+    // sentinel prefixes from the scrollback — mirrors the provider-sentinel
+    // test's identical rationale above, extended to the two sentinels this
+    // pass added.
+    await expect(panel.getByText("fx-usage:", { exact: false })).toHaveCount(0);
+    await expect(panel.getByText("fx-title:", { exact: false })).toHaveCount(0);
+    await expect(panel.getByText("fx-provider:", { exact: false })).toHaveCount(0);
+  });
+
+  test("New Task form: fx's mode picker offers 'Full access' (id yolo), never 'Yolo'; selecting it creates+starts a task that completes under the fake driver", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const projectName = `fx-mode-e2e-project-${randomUUID()}`;
+    await registerDataDirProject(backend, projectName);
+
+    await gotoApp(page, backend.bootBase);
+    const form = newTaskFormPanel(page);
+
+    await selectHarness(page, "fx.sh");
+    await selectProject(form, projectName);
+
+    // --- Mode picker: "Full access" present, "Yolo" nowhere -----------------
+    // AGENT_OPTIONS.fx.modes (src/shared/types.ts) relabels the `yolo` mode
+    // id "Full access" (fx 0.0.8's own --full-access / /permissions
+    // full-access naming) — the old "Yolo" label must not survive anywhere
+    // in the picker.
+    const modeLabel = form.getByText("Mode", { exact: true });
+    const modeTrigger = modeLabel.locator("xpath=following-sibling::div[2]//button").first();
+    await modeTrigger.click();
+
+    // `getByText(..., { exact: true })`, not `getByRole` — a popover row's
+    // accessible name concatenates the mode's label AND its hint text (both
+    // are text nodes inside the same `<button>`, per SearchSelect.tsx), and
+    // the "Full access" row's own hint prose deliberately says "…yolo is
+    // fx's surviving alias and stays agetor's stored id" (docs/plans/fx-
+    // 0.0.8-compat.md §3's relabel decision) — a substring/accessible-name
+    // check for "Yolo" would false-positive on that row. `getByText(exact:
+    // true)` instead only matches an element whose own normalized text
+    // content is exactly "Yolo", which the dedicated label `<span>` (item
+    // .label, separate from the hint `<span>`) would be if the label had
+    // never been changed from its pre-0.0.8-compat name.
+    await expect(form.getByText("Yolo", { exact: true })).toHaveCount(0);
+    const fullAccessOption = form.getByRole("button", { name: /^Full access\b/ });
+    await expect(fullAccessOption).toBeVisible();
+    await fullAccessOption.click();
+    await expect(modeTrigger).toHaveText("Full access");
+
+    // --- Create + start, then confirm the id round-trips as "yolo" ----------
+    const title = `fx-mode-full-access-e2e ${randomUUID()}`;
+    await form.getByPlaceholder("Short description").fill(title);
+    await form.getByTestId("prompt-textarea").fill(title);
+
+    // Isolation off — same "run directly in a plain non-git dir" shape the
+    // direct-API tests above use (`createAndStartFakeFxTask`'s `isolation:
+    // "none"`); the fake driver never touches the filesystem either way, and
+    // this sidesteps any worktree-branch bookkeeping that isn't this test's
+    // concern.
+    await form.getByTestId("worktree-options").getByTestId("isolate-toggle").uncheck();
+
+    const runButton = form.getByRole("button", { name: "Run task", exact: true });
+    await expect(runButton).toBeEnabled();
+    await runButton.click();
+
+    let task: TaskRowWithMode | null = null;
+    await expect(async () => {
+      task = await findTaskByTitle(request, backend, title);
+      expect(task).not.toBeNull();
+    }).toPass({ timeout: 15_000 });
+    createdTaskIds.push(task!.id);
+
+    // The stored id is still "yolo" — only the picker's label changed.
+    expect(task!.mode).toBe("yolo");
+
+    // --- The run actually completes under the fake driver --------------------
+    const panel = await openTask(page, title);
+    await expect(panel.getByText(`fake response to: ${title}`, { exact: true })).toBeVisible({ timeout: 15_000 });
   });
 });
