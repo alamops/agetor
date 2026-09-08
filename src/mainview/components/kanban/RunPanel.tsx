@@ -23,6 +23,7 @@ import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortc
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { shortenTaskPaths } from "@/lib/shorten-task-paths";
+import { fxUsageChipText, fxUsageTitle, mergeFxUsage, parseFxUsage } from "@/lib/fx-usage";
 import { reconcileById } from "@/lib/reconcile";
 import { RUN_PANEL_DEFAULT_WIDTH, RUN_PANEL_MIN_WIDTH, clampPanelWidth, readPanelWidth, writePanelWidth } from "@/lib/panel-width";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
@@ -43,6 +44,7 @@ import {
   DEFAULT_MODEL,
   EVENTS_WINDOW_MAX,
   FX_PROVIDER_STATUS_PREFIX,
+  FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   isInternalStatusSentinel,
   cursorModelIdCoveredByCatalog,
@@ -56,6 +58,7 @@ import {
   type AgentStatus,
   type Harness,
   type BacklogMessage,
+  type FxUsagePayload,
   type GitHubPullMergeability,
   type Run,
   type RunEvent,
@@ -245,28 +248,9 @@ function formatTime(ts: number): string {
   });
 }
 
-/** fx's `usage_update` payload, decoded from the `FX_USAGE_STATUS_PREFIX`
- *  sentinel — mirrors the ACP shape `{used, size, cost?: {amount, currency}}`
- *  (`src/bun/fx-acp.ts`). */
-interface FxUsageData {
-  used: number;
-  size: number;
-  cost?: { amount: number; currency: string };
-}
-
-/** Compact token-count formatting for the usage chip: 45_000 → "45k",
- *  1_200_000 → "1.2M". Whole thousands/millions drop the decimal. */
-function formatUsageCount(n: number): string {
-  if (n >= 1_000_000) {
-    const v = n / 1_000_000;
-    return `${Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)}M`;
-  }
-  if (n >= 1_000) {
-    const v = n / 1_000;
-    return `${Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)}k`;
-  }
-  return String(n);
-}
+// fx's usage payload (`FxUsagePayload`, imported from shared/types.ts) and
+// its parse/merge/format helpers now live in `@/lib/fx-usage` — pure, no
+// React, shared with bun-side tests.
 
 /**
  * Right-side overlay that shows a task's run history + the live log of the
@@ -1431,27 +1415,31 @@ function RunPanelBody({
    *  so it splices against these. */
   const mainEvents = useMemo(() => events.filter((e) => !e.subagentId), [events]);
 
-  /** Latest fx `usage_update` per run, keyed by `runId` — feeds the run-row
-   *  chip in `RunsList`. Sourced from the raw (unfiltered) `events` state
-   *  rather than `displayedEvents` so the chip stays correct regardless of
-   *  which subagent tab is active or whether a JSONL rebuild snapshot has
-   *  spliced the main stream. `events` arrives in arrival order, so a plain
-   *  overwrite-on-iterate naturally keeps the latest per run (fx's own
-   *  `usage_update` cadence is "MAY", snapshot semantics — most-recent wins).
-   *  Gated on `kind === "fx"` — every other agent kind never emits this
-   *  sentinel, so scanning the full (possibly windowed) event list on every
-   *  render for them is pure waste. Note the same windowing applies here as
-   *  everywhere else `events` is read: once an older run's events slide out
-   *  of the kept window (`eventWindowKeepCount`/`EVENTS_WINDOW_MAX`), its
-   *  usage chip disappears too — intended, not a bug to chase. */
+  /** Merged fx usage per run, keyed by `runId` — feeds the run-row chip in
+   *  `RunsList`. Sourced from the raw (unfiltered) `events` state rather
+   *  than `displayedEvents` so the chip stays correct regardless of which
+   *  subagent tab is active or whether a JSONL rebuild snapshot has spliced
+   *  the main stream. `events` arrives in arrival order, so folding every
+   *  sentinel through `mergeFxUsage` (a shallow `{...prev, ...next}`) in
+   *  order naturally keeps the latest value per key — the `usage_update`
+   *  half (`used`/`size`/`cost`) and the per-turn half (`turn`, from the
+   *  `session/prompt` result) can arrive as separate sentinel chunks on the
+   *  same run, so a plain last-wins overwrite would clobber whichever half
+   *  arrived first. Gated on `kind === "fx"` — every other agent kind never
+   *  emits this sentinel, so scanning the full (possibly windowed) event
+   *  list on every render for them is pure waste. Note the same windowing
+   *  applies here as everywhere else `events` is read: once an older run's
+   *  events slide out of the kept window (`eventWindowKeepCount`/
+   *  `EVENTS_WINDOW_MAX`), its usage chip disappears too — intended, not a
+   *  bug to chase. */
   const usageByRunId = useMemo(() => {
-    const m = new Map<string, FxUsageData>();
+    const m = new Map<string, FxUsagePayload>();
     if (kind !== "fx") return m;
     for (const e of events) {
       if (e.stream !== "status" || !e.data.startsWith(FX_USAGE_STATUS_PREFIX)) continue;
-      const parsed = safeParse<FxUsageData>(e.data.slice(FX_USAGE_STATUS_PREFIX.length));
-      if (!parsed || typeof parsed.used !== "number" || typeof parsed.size !== "number") continue;
-      m.set(e.runId, parsed);
+      const parsed = parseFxUsage(e.data.slice(FX_USAGE_STATUS_PREFIX.length));
+      if (!parsed) continue;
+      m.set(e.runId, mergeFxUsage(m.get(e.runId), parsed));
     }
     return m;
   }, [events, kind]);
@@ -1467,6 +1455,22 @@ function RunPanelBody({
     for (const e of events) {
       if (e.stream !== "status" || !e.data.startsWith(FX_PROVIDER_STATUS_PREFIX)) continue;
       const value = e.data.slice(FX_PROVIDER_STATUS_PREFIX.length).trim();
+      if (!value) continue;
+      m.set(e.runId, value);
+    }
+    return m;
+  }, [events, kind]);
+
+  /** Latest fx `fx-title: <value>` per run, keyed by `runId` — sibling
+   *  derivation to {@link providerByRunId} above, same fx gating and the
+   *  same windowed-events caveat. Feeds `RunsList`'s `SessionTitleChip`,
+   *  rendered beside the provider chip. */
+  const titleByRunId = useMemo(() => {
+    const m = new Map<string, string>();
+    if (kind !== "fx") return m;
+    for (const e of events) {
+      if (e.stream !== "status" || !e.data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX)) continue;
+      const value = e.data.slice(FX_SESSION_TITLE_STATUS_PREFIX.length).trim();
       if (!value) continue;
       m.set(e.runId, value);
     }
@@ -2961,7 +2965,7 @@ function RunPanelBody({
         tmuxSession={latestRun?.tmuxSession ?? null}
       />
 
-      <RunsList runs={runs} usageByRun={usageByRunId} providerByRun={providerByRunId} />
+      <RunsList runs={runs} usageByRun={usageByRunId} providerByRun={providerByRunId} titleByRun={titleByRunId} />
 
       <TerminalsSection task={task} />
 
@@ -3902,26 +3906,18 @@ function SubagentTabs({
  * prior run in reverse-chronological order.
  */
 /** Compact `used/size` (+ `· $cost`/`· cost CUR`) chip for an fx run's
- *  latest `usage_update`, rendered beside the duration/exit chips on a
- *  run-summary row. `title` carries the exact numbers on hover; the visible
- *  text is the abbreviated form. */
-function UsageChip({ usage }: { usage: FxUsageData }) {
-  // Sub-cent amounts round to "$0.00" under toFixed(2) — nearly every fx
-  // call at these token volumes costs a fraction of a cent, so that's the
-  // common case, not an edge case. Widen to 4 decimals below that threshold;
-  // the title tooltip below always carries the exact, unrounded amount.
-  const displayAmount = (amount: number) => amount < 0.01 ? amount.toFixed(4) : amount.toFixed(2);
-  const costText = usage.cost
-    ? usage.cost.currency === "USD"
-      ? ` · $${displayAmount(usage.cost.amount)}`
-      : ` · ${displayAmount(usage.cost.amount)} ${usage.cost.currency}`
-    : "";
-  const title = `fx usage: ${usage.used.toLocaleString()}/${usage.size.toLocaleString()} tokens`
-    + (usage.cost ? ` · ${usage.cost.amount} ${usage.cost.currency}` : "");
+ *  merged usage payload, rendered beside the duration/exit chips on a
+ *  run-summary row. Falls back to a compact `↑in ↓out` per-turn form when
+ *  only `turn` is known, and renders nothing at all when neither half is
+ *  known (see `fxUsageChipText`). `title` carries the exact numbers —
+ *  including any per-turn breakdown — on hover; the visible text is the
+ *  abbreviated form. */
+function UsageChip({ usage }: { usage: FxUsagePayload }) {
+  const text = fxUsageChipText(usage);
+  if (text === null) return null;
   return (
-    <span className="text-muted-foreground" title={title}>
-      {formatUsageCount(usage.used)}/{formatUsageCount(usage.size)}
-      {costText}
+    <span className="text-muted-foreground" title={fxUsageTitle(usage)} data-testid="fx-usage-chip">
+      {text}
     </span>
   );
 }
@@ -3935,8 +3931,25 @@ function ProviderChip({ provider }: { provider: string }) {
     <span
       className="inline-block max-w-[10rem] truncate align-bottom text-muted-foreground"
       title="fx provider"
+      data-testid="fx-provider-chip"
     >
       {provider}
+    </span>
+  );
+}
+
+/** Small muted chip naming the fx session title (`session_info_update`),
+ *  rendered beside {@link ProviderChip} on a run's summary row. Text is the
+ *  bare title fx reported — the driver already filters out fx's own
+ *  "Untitled session" placeholder before emitting the sentinel. */
+function SessionTitleChip({ title }: { title: string }) {
+  return (
+    <span
+      className="inline-block max-w-[14rem] truncate align-bottom text-muted-foreground"
+      title="fx session title"
+      data-testid="fx-session-title-chip"
+    >
+      {title}
     </span>
   );
 }
@@ -3945,10 +3958,12 @@ function RunsList({
   runs,
   usageByRun,
   providerByRun,
+  titleByRun,
 }: {
   runs: Run[];
-  usageByRun?: Map<string, FxUsageData>;
+  usageByRun?: Map<string, FxUsagePayload>;
   providerByRun?: Map<string, string>;
+  titleByRun?: Map<string, string>;
 }) {
   const [open, setOpen] = useState(false);
 
@@ -4007,6 +4022,7 @@ function RunsList({
           )}
           {usageByRun?.get(latest.id) && <UsageChip usage={usageByRun.get(latest.id)!} />}
           {providerByRun?.get(latest.id) && <ProviderChip provider={providerByRun.get(latest.id)!} />}
+          {titleByRun?.get(latest.id) && <SessionTitleChip title={titleByRun.get(latest.id)!} />}
           {canExpand && (
             <span className="text-muted-foreground">{open ? "▲" : "▼"}</span>
           )}
@@ -4045,6 +4061,7 @@ function RunsList({
                 </span>
                 {usageByRun?.get(r.id) && <UsageChip usage={usageByRun.get(r.id)!} />}
                 {providerByRun?.get(r.id) && <ProviderChip provider={providerByRun.get(r.id)!} />}
+                {titleByRun?.get(r.id) && <SessionTitleChip title={titleByRun.get(r.id)!} />}
               </span>
             </li>
           ))}
@@ -4386,10 +4403,14 @@ function RunEventList({
           // parent from the raw `events` state — not the transcript; fx's
           // `usage_update` cadence is unspecified ("MAY"), so leaving this
           // unsuppressed would spam a divider into the scrollback on every
-          // update), and `FX_PROVIDER_STATUS_PREFIX` (same story, one per
-          // turn — feeds `RunsList`'s `ProviderChip` via `providerByRunId`).
-          // Single shared predicate so a new sentinel can't leak
-          // into one surface while another suppresses it.
+          // update), `FX_PROVIDER_STATUS_PREFIX` (same story, one per turn —
+          // feeds `RunsList`'s `ProviderChip` via `providerByRunId`), and
+          // `FX_SESSION_TITLE_STATUS_PREFIX` (same story again — feeds
+          // `RunsList`'s `SessionTitleChip` via `titleByRunId`, one per turn
+          // at most since the driver already dedupes repeats and the
+          // "Untitled session" placeholder). Single shared predicate so a
+          // new sentinel can't leak into one surface while another
+          // suppresses it.
           if (isInternalStatusSentinel(e.data)) return [];
           return [wrap(key, evid, <StatusDivider text={e.data} />)];
         case "stderr":
@@ -4625,7 +4646,11 @@ function repairTruncatedJson(input: string): unknown | null {
   try { return JSON.parse(repaired); } catch { return null; }
 }
 
-interface ParsedToolUse { id: string; name: string; input: unknown; serverSide?: boolean }
+// `title` is additive, fx-only (`src/bun/fx-acp.ts` carries fx's own
+// `tool_call.title` alongside `name` when it differs) — every other agent
+// kind's `tool_use` JSON simply lacks the key, and `ToolUseBlock` only
+// renders it when present.
+interface ParsedToolUse { id: string; name: string; input: unknown; serverSide?: boolean; title?: string }
 interface ParsedToolResult { toolUseId: string; content: unknown; isError?: boolean }
 
 function safeParse<T>(s: string): T | null {
@@ -4987,6 +5012,9 @@ const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: Parsed
           </span>
         ) : (
           <span className="font-mono font-medium">{call.name}</span>
+        )}
+        {call.title && (
+          <span className="ml-2 text-muted-foreground" data-testid="tool-use-title">{call.title}</span>
         )}
         {call.serverSide && (
           <span className={cn(SECONDARY_BADGE_CLASS, "px-1 py-0 text-[9px] uppercase")}>server</span>

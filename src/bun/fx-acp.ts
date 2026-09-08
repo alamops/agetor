@@ -1,8 +1,13 @@
 import { existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import type { Subprocess } from "bun";
-import type { RunEventStream } from "../shared/types.ts";
-import { FX_PROVIDER_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
+import type { FxUsagePayload, RunEventStream } from "../shared/types.ts";
+import {
+  FX_PROVIDER_STATUS_PREFIX,
+  FX_SESSION_TITLE_STATUS_PREFIX,
+  FX_USAGE_STATUS_PREFIX,
+  SESSION_DIED_STATUS_PREFIX,
+} from "../shared/types.ts";
 import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
 import {
   answerFxPermission,
@@ -71,39 +76,47 @@ import {
  * in-branch reply never fires and `handleServerRequest`'s catch-all fallback
  * writes the sole reply instead.
  *
- * ── Protocol index (verified against fx v0.0.4, v0.0.6 and v0.0.7 + ACP's canonical schema.json) ──
+ * ── Protocol index (verified against fx v0.0.4, v0.0.6, v0.0.7 and v0.0.8 —
+ *    0.0.8 facts dated 2026-09-08: a binary probe of the v0.0.8 release, a
+ *    full source-tarball diff v0.0.7…v0.0.8, and the same ACP probe re-run
+ *    against the installed 0.0.7 binary to separate real 0.0.8 deltas from
+ *    pre-existing 0.0.7 behavior — + ACP's canonical schema.json) ──
  *
  *   - `initialize`                  SPIKE-VERIFIED             handshake; unauth fails here (see describeHandshakeFailure)
  *   - `session/new`                 SPIKE-VERIFIED             → {sessionId, modes?, configOptions?}; mode nudge is best-effort (see runFxTurn)
  *   - `session/resume`/`load`       SCHEMA-DERIVED             resume falls back to load on -32601/-32602/-32600 alike (see runFxTurn)
- *   - `session/prompt`              SPIKE-VERIFIED shape       sole completion signal, no timeout (see runFxTurn)
- *   - `session/update`              SPIKE-VERIFIED envelope    variant → chunk mapping (see mapFxUpdate); text deltas folded per message (see FxTextCoalescer)
+ *   - `session/prompt`              SPIKE-VERIFIED shape       sole completion signal, no timeout (see runFxTurn); result gains a `usage` object as of 0.0.8
+ *   - `session/update`              SPIKE-VERIFIED envelope    variant → chunk mapping (see mapFxUpdate); text deltas folded per message and (0.0.8+) per messageId (see FxTextCoalescer)
  *   - `session/request_permission`  SCHEMA-DERIVED, UNVERIFIED-LIVE card flow  (see respondPermissionRequest)
- *   - `session/cancel`              SCHEMA-DERIVED             notification, no reply expected (see cancelFxTurn)
+ *   - `session/cancel`              SCHEMA-DERIVED             notification, no reply expected (see cancelFxTurn); 0.0.8 spike confirms it now actually interrupts in-flight work
  *   - death                         —                          unexpected exit before settlement (see the `exited` watcher)
  *
- * ── Facts verified against fx 0.0.5/0.0.6/0.0.7 (spike + release notes + Zig source diff, 2026-08-31) ──
+ * ── Facts verified against fx 0.0.5 through 0.0.8 (spike + release notes +
+ *    Zig source diff; 0.0.5-0.0.7 facts dated 2026-08-31/09-01, 0.0.8 facts
+ *    dated 2026-09-08 per the three-way verification named above) ──
  *
  *   - **No sandbox since 0.0.5** — fx retired its command sandbox; approved
  *     tool calls run as ordinary host subprocesses. Agetor's permission mode
  *     (`session/set_mode` + this driver's `session/request_permission`
  *     policy, see `respondPermissionRequest`) is the ONLY gate fx has left —
  *     there is no `sandbox_denied` outcome to parse and never was one here.
- *     Still true at 0.0.7 — 0.0.7 even adds an fx-side test asserting legacy
- *     `sandbox` settings keys stay inert (spike + Zig source diff,
- *     2026-08-31).
+ *     Still true at 0.0.8 (0.0.7 even added an fx-side test asserting legacy
+ *     `sandbox` settings keys stay inert); 0.0.8's tool inventory changed
+ *     (see below) but the no-sandbox / permission-mode-is-the-only-gate
+ *     model did not.
  *   - **Credential re-checks on `session/prompt` AND `session/resume`
- *     (0.0.5+; re-check paths unchanged through 0.0.7 — `server.zig`/
- *     `jsonrpc.zig` are byte-identical 0.0.6→0.0.7)** — an unauthenticated/
+ *     (0.0.5+; re-check paths unchanged through 0.0.8 — `jsonrpc.zig` is
+ *     byte-identical 0.0.6→0.0.7→0.0.8; `server.zig` gained the new
+ *     active-session gate in 0.0.8, see below, but the credential-recheck
+ *     codepaths within it are unchanged)** — an unauthenticated/
  *     deauthorized binary no longer fails only at `initialize`; either call
  *     can return `-32600` mid-session with the same "fx needs access to
  *     Vercel AI Gateway…" text or a provider-specific variant (e.g. "fx
  *     needs a Codex subscription login for this model. Run fx login
- *     codex."). 0.0.7 recased these (and other) user-facing strings from
- *     "Fx" to lowercase "fx" — cosmetic only, no behavior change (spike +
- *     Zig source diff, 2026-08-31). `-32600` is JSON-RPC's generic "Invalid
- *     Request" code, not an auth-specific one — fx merely reuses it for
- *     credential failures — so `session/resume`'s `-32600` is treated
+ *     codex."), byte-identical through 0.0.8 (0.0.7 recased these from "Fx"
+ *     to lowercase "fx" — cosmetic only). `-32600` is JSON-RPC's generic
+ *     "Invalid Request" code, not an auth-specific one — fx merely reuses it
+ *     for credential failures — so `session/resume`'s `-32600` is treated
  *     exactly like its `-32601`/`-32602` siblings in `runFxTurn`: it falls
  *     through to the `session/load` fallback rather than failing the turn
  *     immediately. If `session/load` in turn also answers `-32600`, that's
@@ -115,7 +128,17 @@ import {
  *     failed to resume session…` wrapper. `session/prompt`'s `-32600` catch
  *     is unaffected by any of this — mid-turn there's nothing to fall back
  *     to, so it still fails the turn immediately, also surfacing fx's
- *     message verbatim via `rawMessage`.
+ *     message verbatim via `rawMessage`. **Invalid vs. missing credential
+ *     are different failures** (true on 0.0.7 and 0.0.8, spike-confirmed): a
+ *     *missing* credential still fails at `initialize` with `-32600` as
+ *     above, but an *invalid* (present but wrong) one does not —
+ *     `session/new` succeeds and `session/prompt` instead resolves normally
+ *     with `stopReason: "refused"`, delivering the reason (e.g.
+ *     "AI_GATEWAY_API_KEY authentication failed · HTTP 401") as ordinary
+ *     `agent_message_chunk` assistant prose rather than an RPC error — see
+ *     the stopReason switch in `runFxTurn`, which surfaces `refused` on the
+ *     shared "fx turn ended: …" status line same as any other non-`end_turn`
+ *     stop.
  *   - **`configOptions` on `session/new`/`session/resume`/`session/load`
  *     results (0.0.5+, additive)** — a `{id, name, category, type,
  *     currentValue, options}[]` array; an entry with `id: "provider"` names
@@ -125,43 +148,151 @@ import {
  *     `runFxTurn`) — RunPanel renders it as a small provider chip. Absence
  *     (0.0.4 binaries, or a response that omits the array) is tolerated
  *     silently; no chip that turn. `src/acp/server.zig` is byte-identical
- *     0.0.6→0.0.7 — the provider values are still exactly `"gateway"` |
- *     `"codex"` | `"grok"` (spike + Zig source diff, 2026-08-31). Trap:
- *     0.0.7's binary also compiles inline-menu TUI strings that look like
- *     mode/model configOptions entries — those are TUI-only, never on the
- *     wire; don't infer a protocol change from a `strings` scan alone.
- *   - **Exactly six `session/update` kinds are emitted, in 0.0.4, 0.0.6 and
- *     0.0.7**: `agent_message_chunk`, `user_message_chunk`, `tool_call`,
- *     `tool_call_update`, `available_commands_update`, `session_info_update`.
- *     Re-verified at 0.0.7 two ways — `src/acp/types.zig`'s writers have a
- *     0-line functional diff vs 0.0.6, and a binary `strings` scan still
- *     shows the same six with no `agent_thought_chunk`/`plan`/
- *     `usage_update` (spike + Zig source diff, 2026-08-31). `mapFxUpdate`'s
- *     `agent_thought_chunk`/`plan`/`usage_update` branches are ACP-spec-correct
- *     and stay (forward-compatible, unit-tested), but are DORMANT — fx has
- *     never been observed to send any of the three, so those three chunk
- *     kinds never reach a real run today.
+ *     0.0.6→0.0.7, and 0.0.8 keeps the same three provider values
+ *     (spike-confirmed). **`provider`, `model` AND `mode` entries are ALL
+ *     real wire entries, confirmed on 0.0.7 and 0.0.8 alike** — an earlier
+ *     dossier claimed the mode/model entries were TUI-only strings a
+ *     `strings` scan happened to pick up; that was wrong — that probe never
+ *     got past an unauthenticated `initialize` far enough to see a real
+ *     `session/new` result. `session/new` also returns a `modes` block whose
+ *     `currentModeId` (and the `mode` configOptions entry's `currentValue`)
+ *     reads `ask` regardless of `FX_PERMISSION_MODE` — that's just a display
+ *     default. The session's EFFECTIVE permission mode is copied from
+ *     startup config (`sessions.zig` `.permission_mode =
+ *     state.permission_mode`), and `session/set_mode` overwrites it via
+ *     `applySessionMode` (`code`→`auto`, `ask`→`ask`) — which is why
+ *     `acpModeIdFor` below maps `auto`→`code`, `ask`→`ask`, and deliberately
+ *     sends NO `session/set_mode` at all for `yolo` (see its own doc
+ *     comment): a `code` nudge would DOWNGRADE yolo to `auto` rather than
+ *     leaving it alone. Never add one.
+ *   - **Eight `session/update` kinds are emitted as of 0.0.8** — up from six
+ *     at 0.0.4/0.0.6/0.0.7 (`agent_message_chunk`, `user_message_chunk`,
+ *     `tool_call`, `tool_call_update`, `available_commands_update`,
+ *     `session_info_update`). 0.0.8 turns on the remaining two:
+ *     **`agent_thought_chunk`** (reasoning deltas, `prompt.zig
+ *     pushReasoningDelta`) and **`usage_update`** (once per completed turn,
+ *     emitted right before the `session/prompt` response resolves, ONLY when
+ *     the model's context window is known — `sessions.zig
+ *     sendActiveSessionUsageUpdate`). Both were previously documented
+ *     DORMANT (ACP-spec-correct `mapFxUpdate` branches fx never actually
+ *     sent) and are now live; the mapping itself is unchanged, it's just no
+ *     longer dormant. `plan` and `current_mode_update` still have no fx
+ *     writer at 0.0.8 — their `mapFxUpdate` branches (the former feeds the
+ *     TODO tracker) stay dormant.
+ *   - **`session/prompt`'s result gains a `usage` object (0.0.8)** —
+ *     `{inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
+ *     reasoningTokens}`, each key present only when known (`{}` observed on
+ *     a `refused` turn). `runFxTurn` reads it once the RPC resolves (before
+ *     the stopReason switch) and — keeping only the finite-number fields —
+ *     emits it as the `turn` half of the existing `FX_USAGE_STATUS_PREFIX`
+ *     sentinel (`FxUsagePayload`, `src/shared/types.ts`); the `used`/`size`/
+ *     `cost?` half still comes from the `usage_update` notification above.
+ *     RunPanel shallow-merges every `fx-usage: ` sentinel it sees per run
+ *     (see `src/mainview/lib/fx-usage.ts`), so the two halves can arrive as
+ *     separate chunks in either order.
+ *   - **`agent_message_chunk`/`user_message_chunk` carry a `messageId`
+ *     (0.0.8)**, stable across one logical message and regenerated only at
+ *     message-kind boundaries (`prompt.zig:171-183`) — `agent_thought_chunk`
+ *     carries none observed today; tolerated as absent. `mapFxUpdate` reads
+ *     it onto the mapped `assistant`/`thinking` chunk's `FxChunk.messageId`,
+ *     and `FxTextCoalescer.push` treats a `messageId` change (when BOTH the
+ *     buffered and incoming chunk carry a string id and they differ) as an
+ *     additional flush boundary alongside the existing stream-kind switch —
+ *     this is what lets two back-to-back same-stream messages split
+ *     correctly instead of merging into one bubble, which the old
+ *     stream-only heuristic couldn't do. Falls back to today's stream-only
+ *     behavior whenever either side lacks an id (i.e. against 0.0.7 and
+ *     earlier). `emit`/`deliver` never forward `messageId` to `onChunk` —
+ *     `ChunkHandler`'s contract stays `(stream, data, lineUuid?)`.
+ *   - **`tool_call` carries the real tool `name` plus inline `rawInput` on
+ *     the initial update (0.0.8, `types.zig writeToolCall` signature
+ *     change)** — `toolCallName` now prefers `update.name` when it's a
+ *     non-empty string over the old `title (kind)` synthesis (still the
+ *     fallback for a payload that omits `name`, i.e. 0.0.7 and earlier); the
+ *     `tool_use` chunk's JSON payload gains an optional `title` field (fx's
+ *     human-facing title, carried alongside the id-shaped `name` only when
+ *     it differs from it) — RunPanel renders it muted after the tool name.
+ *     Event dedup keys (`fx:tool:<id>:use`) are unchanged.
+ *   - **`session_info_update` gained a `{title, updatedAt}` shape (0.0.8)**,
+ *     fired at lifecycle points and after every turn — `mapFxUpdate` now has
+ *     a dedicated branch for it (previously silently ignored, see the
+ *     default case below): a non-empty `title` that isn't fx's "Untitled
+ *     session" placeholder and differs from the last title emitted this turn
+ *     becomes one `FX_SESSION_TITLE_STATUS_PREFIX` status chunk (`fx-title:
+ *     <title>`); RunPanel renders the latest one as a muted chip beside the
+ *     provider chip. The 0.0.7-era variant of this event (no `title`, just
+ *     `_meta.fx.modelResponseRecovery`) still carries no title and so still
+ *     emits nothing.
+ *   - **Session ids are 12-char base64url as of 0.0.8** (`session_layout.zig`,
+ *     down from 0.0.7's 50 characters) — 0.0.7's longer ids still validate
+ *     and resume against a 0.0.8 binary, so a persisted `runs.fx_session_id`
+ *     survives the machine upgrade with no migration.
+ *   - **New security gate: the target session must be the process's active
+ *     one (0.0.8)** — `session/prompt`/`cancel`/`set_mode`/
+ *     `set_config_option` now all reject a `sessionId` that isn't the
+ *     process's current session (`server.zig decideSessionTarget`). Agetor
+ *     spawns exactly one `fx acp` child per turn, holding exactly one
+ *     session, so this always resolves `.exact` — nothing for this driver to
+ *     change.
+ *   - **`initialize` leniency (0.0.8)** — `protocolVersion: 999` (a value fx
+ *     doesn't recognize) is accepted rather than rejected; this driver keeps
+ *     sending the number `1` regardless, so nothing here changes driver
+ *     behavior (see the inline comment on the `initialize` call in
+ *     `runFxTurn` — it used to also claim a *stringified* protocolVersion
+ *     gets rejected with -32602, but that was never actually spike-verified;
+ *     dropped). `promptCapabilities.image` in the `initialize` result is now
+ *     `true` (was previously unset/false) — agetor's composer sends text +
+ *     file references only, never an image content block, so this is inert
+ *     for us too.
+ *   - **Tool inventory changed (0.0.8)** — `memory`, `terminal`,
+ *     `skill_search`, and `mcp_search_tools` were removed; `shell` (three
+ *     actions: run/interact/stop), `capability_search`, and `subagent` (two
+ *     actions: run/message) are the new/renamed set. This driver renders
+ *     every `tool_call` generically regardless of tool identity (see
+ *     `toolCallName`/`toolCallInput`), so the inventory change needs no
+ *     driver code — noted here purely so a stale tool name in a transcript
+ *     or test fixture isn't mistaken for a bug.
+ *   - **`session/cancel` now actually stops the work (0.0.8)** — previously
+ *     schema-derived and unverified whether fx honored it; the 0.0.8 spike
+ *     confirms a cancelled turn's in-flight tool work stops rather than
+ *     running to completion in the background. No driver change — this
+ *     driver already treats `session/cancel` as fire-and-forget and races
+ *     `session/prompt`'s own resolution (see `cancelFxTurn`).
+ *   - **fx's wire `stopReason` strings never matched the ACP-canonical names
+ *     this driver used to switch on (pre-existing bug, true on 0.0.7 and
+ *     0.0.8 alike)** — fx's actual values are `end_turn`,
+ *     `max_output_tokens`, `max_model_turns`, `refused`, `cancelled`
+ *     (`types.zig StopReason`, byte-identical both versions); the driver's
+ *     switch named `max_tokens`/`max_turn_requests`/`refusal` instead, so
+ *     every such turn fell into the generic "unexpected stopReason" branch
+ *     (still correctly `settleFx(state, 1)`, so no run was ever
+ *     mis-recorded — only the status line's reason text was wrong). The
+ *     switch in `runFxTurn` now accepts BOTH vocabularies — fx's real wire
+ *     strings and the ACP-canonical names, the latter kept for forward
+ *     compatibility.
+ *   - **`FX_PERMISSION_MODE` still accepts exactly `yolo`/`auto`/`ask`
+ *     (0.0.8)** — `--full-access`/`/permissions full-access` is 0.0.8's new
+ *     UI/CLI wording for the same `.yolo` enum value
+ *     (`config_runtime.zig parsePermissionMode`; fx's own README: "saved
+ *     settings and JSON output retain `yolo`"); this driver keeps sending
+ *     the env var value `yolo` (see `AGENT_OPTIONS.fx.modes` in
+ *     `src/shared/types.ts` for the picker-facing "Full access" relabel —
+ *     the stored id is unchanged).
  *   - **`agent_message_chunk` carries raw Markdown, not rendered text
- *     (0.0.7)** — 0.0.6 streamed ANSI-stripped, already-rendered text and
- *     discarded the markdown source; 0.0.7 flips that (`src/acp/prompt.zig`):
- *     the chunk now carries the raw Markdown source instead. fx's changelog
- *     also notes a resumed response no longer repeats text already
+ *     (0.0.7+, unchanged at 0.0.8)** — 0.0.6 streamed ANSI-stripped,
+ *     already-rendered text and discarded the markdown source; 0.0.7 flips
+ *     that (`src/acp/prompt.zig`): the chunk now carries the raw Markdown
+ *     source instead, and a resumed response no longer repeats text already
  *     delivered. Neither needs a driver change here — chunks were already
- *     forwarded verbatim and rendered as markdown downstream by the webview
- *     — but a transcript captured against 0.0.7 carries markdown source
- *     where an 0.0.6 transcript carried pre-rendered text (spike + Zig
- *     source diff, 2026-08-31).
- *   - **Project `.mcp.json` merges into ACP sessions (0.0.7)** —
- *     `session/new` AND `session/resume` now merge the workspace's
+ *     forwarded verbatim and rendered as markdown downstream by the webview.
+ *   - **Project `.mcp.json` merges into ACP sessions (0.0.7+, unchanged at
+ *     0.0.8)** — `session/new` AND `session/resume` merge the workspace's
  *     project-level `.mcp.json` MCP servers into the session (trust-gated by
- *     fx's own approval flow / `allow_acp_mcp`; `sessions.zig` gained a new
- *     `invalid_params` error path, "MCP servers are unavailable in this
- *     runtime"). This driver still passes `mcpServers: []` on every
- *     `session/new`/`session/load` call below, but a task `workdir` that
- *     itself carries a `.mcp.json` can still introduce MCP tools into the
- *     session via that merge — their `tool_call`s render generically like
- *     any other tool call; no driver change needed (spike + Zig source diff,
- *     2026-08-31).
+ *     fx's own approval flow / `allow_acp_mcp`). This driver still passes
+ *     `mcpServers: []` on every `session/new`/`session/load` call below, but
+ *     a task `workdir` that itself carries a `.mcp.json` can still introduce
+ *     MCP tools into the session via that merge — their `tool_call`s render
+ *     generically like any other tool call; no driver change needed.
  *   - **`agent_message_chunk` is a token-level delta stream** — fx is the
  *     only agetor driver that streams sub-message deltas (claude's JSONL,
  *     codex's `item.completed`, gemini's `message` and cursor's `assistant`
@@ -172,21 +303,22 @@ import {
  *     `emit` routes through) buffers consecutive `assistant`/`thinking`
  *     deltas and delivers them as ONE event carrying the first delta's
  *     line_uuid, flushed by the next non-text chunk (a tool call, a status
- *     line), by an inbound `session/request_permission`
- *     (`respondPermissionRequest`), and at settlement (`settleFx`).
- *   - **fx's `[context] …` diagnostics ride `agent_message_chunk`** — ACP
- *     has no diagnostic channel, so 0.0.7's context-budget warnings
- *     (`[context] skill description "x" truncated: observed=… effective=1024
- *     bytes …; override with --context-limit skill_description_bytes=
- *     BYTES|off`, plus the project-instructions / skill-catalog / MCP
- *     siblings a binary `strings` scan shows) arrive as the turn's first
- *     "message" chunk: one chunk, one `[context] ` line per warning.
- *     `mapFxUpdate` demotes a chunk made only of such lines to one `status`
- *     line each (`isFxContextDiagnostic`) instead of assistant prose. The
- *     override is a *global* `fx [--context-limit …] <command>` flag —
- *     `fx acp --context-limit …` is rejected by the subcommand's own usage
- *     check (probed 2026-09-01) — so `AGETOR_FX_ARGS`, which lands after
- *     `acp`, cannot carry it today.
+ *     line), by a `messageId` change (0.0.8+, see above), by an inbound
+ *     `session/request_permission` (`respondPermissionRequest`), and at
+ *     settlement (`settleFx`).
+ *   - **fx's `[context] …` diagnostics ride `agent_message_chunk`
+ *     (unchanged at 0.0.8)** — ACP has no diagnostic channel, so 0.0.7's
+ *     context-budget warnings (`[context] skill description "x" truncated:
+ *     observed=… effective=1024 bytes …; override with --context-limit
+ *     skill_description_bytes=BYTES|off`, plus the project-instructions /
+ *     skill-catalog / MCP siblings a binary `strings` scan shows) arrive as
+ *     the turn's first "message" chunk: one chunk, one `[context] ` line per
+ *     warning. `mapFxUpdate` demotes a chunk made only of such lines to one
+ *     `status` line each (`isFxContextDiagnostic`) instead of assistant
+ *     prose. The override is a *global* `fx [--context-limit …] <command>`
+ *     flag — `fx acp --context-limit …` is rejected by the subcommand's own
+ *     usage check — so `AGETOR_FX_ARGS`, which lands after `acp`, cannot
+ *     carry it today.
  */
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -286,6 +418,13 @@ interface FxSessionState {
    *  messages — every chunk passes through it via `emit`; see the class
    *  doc for the flush boundaries. */
   coalescer: FxTextCoalescer;
+  /** Last non-placeholder `session_info_update` title emitted this turn —
+   *  carried forward across `dispatchSessionUpdate` calls (each of which
+   *  builds a fresh `FxUpdateCtx`, since `mapFxUpdate` itself is otherwise
+   *  pure) so a repeated identical title is deduped instead of re-emitted.
+   *  See the `session_info_update` case in `mapFxUpdate` and the file
+   *  header's session-title fact. */
+  lastTitle?: string;
 
   resolved: boolean;
   killRequested: boolean;
@@ -438,7 +577,7 @@ class RpcTimeoutError extends Error {}
 /** Rejection shape for a real JSON-RPC error reply from fx (as opposed to
  *  `RpcTimeoutError`, which is ours). `code` is the JSON-RPC error code —
  *  callers use it to distinguish a credential re-check failure (`-32600`,
- *  see the header's "Facts verified against fx 0.0.5/0.0.6/0.0.7" section)
+ *  see the header's "Facts verified against fx 0.0.5 through 0.0.8" section)
  *  from every other protocol error, without re-parsing `message`. The message
  *  text itself is UNCHANGED from before this class existed
  *  (`"<fx message> (code <n>)"`) so every existing message-based assertion
@@ -753,7 +892,17 @@ function extractText(content: unknown): string {
     .join("");
 }
 
+/** The `tool_use` chunk's `name` field. fx ≥0.0.8's `tool_call` update
+ *  carries the real tool id (`shell`, `capability_search`, `subagent`, …) in
+ *  `update.name` — prefer it when present. Falls back to the pre-0.0.8
+ *  `title (kind)` synthesis for a payload that omits `name` (0.0.7 and
+ *  earlier, or a forward-compat gap). The human-facing `title`, when it
+ *  differs from whichever name wins here, rides alongside as the `tool_use`
+ *  payload's own `title` field (see the `tool_call` case below) rather than
+ *  being folded into this string. */
 function toolCallName(update: Record<string, unknown>): string {
+  const name = typeof update.name === "string" && update.name.length > 0 ? update.name : null;
+  if (name) return name;
   const title = typeof update.title === "string" && update.title.length > 0 ? update.title : null;
   const kind = typeof update.kind === "string" && update.kind.length > 0 ? update.kind : null;
   if (title && kind) return `${title} (${kind})`;
@@ -779,11 +928,18 @@ function toolResultContent(update: Record<string, unknown>): unknown {
 }
 
 /** A chunk `mapFxUpdate` wants emitted — the pure equivalent of an `emit()`
- *  call, minus the dedup/settled-turn gating `emit` itself applies. */
+ *  call, minus the dedup/settled-turn gating `emit` itself applies.
+ *  `messageId` (fx ≥0.0.8, `agent_message_chunk`/`agent_thought_chunk` only
+ *  — `agent_thought_chunk` carries none observed today) is consumed
+ *  entirely internally by `FxTextCoalescer` to decide flush boundaries; it
+ *  is never forwarded to `onChunk` (`emit`/`deliver` only ever read
+ *  `stream`/`data`/`lineUuid` off a chunk) — `ChunkHandler`'s contract stays
+ *  `(stream, data, lineUuid?)`. */
 export interface FxChunk {
   stream: RunEventStream;
   data: string;
   lineUuid?: string;
+  messageId?: string;
 }
 
 /** fx tags its human-facing context-budget diagnostics with this prefix
@@ -792,7 +948,8 @@ export interface FxChunk {
  *  plus the project-instructions / skill-catalog / MCP siblings a binary
  *  `strings` scan shows) and — ACP having no diagnostic channel — ships them
  *  as the turn's first `agent_message_chunk`, one chunk with one line per
- *  warning. Observed live against 0.0.7 (2026-09-01). */
+ *  warning. Observed live against 0.0.7 (2026-09-01); unchanged at 0.0.8
+ *  (spike + source diff, 2026-09-08). */
 export const FX_CONTEXT_DIAGNOSTIC_PREFIX = "[context] ";
 
 /** True when every non-blank line of `text` is one of fx's `[context] …`
@@ -820,11 +977,16 @@ type FxTextStream = "assistant" | "thinking";
  * the `(run_id, line_uuid)` dedup index still holds).
  *
  * Message boundaries — where `push` flushes on its own: a delta on the
- * *other* text stream (assistant → thinking or back), and any non-text
- * chunk (tool_use/tool_result/status/…), which is delivered *after* the
- * flushed text so wire order is preserved. Boundaries that aren't chunks
- * (an inbound `session/request_permission`, settlement) call `flush`
- * explicitly via `flushText`.
+ * *other* text stream (assistant → thinking or back); a `messageId` change
+ * (fx ≥0.0.8 — when BOTH the buffered chunk and the incoming one carry a
+ * string `messageId` and they differ, see `prompt.zig:171-183`'s
+ * regenerate-at-message-boundary rule; a 0.0.7 stream, which carries no
+ * `messageId` at all, falls back to the stream-switch rule alone, same as
+ * before this existed); and any non-text chunk (tool_use/tool_result/
+ * status/…), which is delivered *after* the flushed text so wire order is
+ * preserved. Boundaries that aren't chunks (an inbound
+ * `session/request_permission`, settlement) call `flush` explicitly via
+ * `flushText`.
  *
  * Pure and exported for the same reason `mapFxUpdate` is: unit-testable
  * without a child process (see fx-acp-mapper.test.ts).
@@ -833,15 +995,23 @@ export class FxTextCoalescer {
   private stream: FxTextStream | null = null;
   private text = "";
   private lineUuid: string | undefined;
+  private messageId: string | undefined;
 
   /** Feed one mapped chunk; returns the chunks now ready to deliver, in
    *  order (possibly none — a buffered delta returns `[]`). */
   push(chunk: FxChunk): FxChunk[] {
     if (chunk.stream === "assistant" || chunk.stream === "thinking") {
-      const out = this.stream !== null && this.stream !== chunk.stream ? this.flush() : [];
+      const streamChanged = this.stream !== null && this.stream !== chunk.stream;
+      const messageIdChanged =
+        this.stream !== null &&
+        typeof this.messageId === "string" &&
+        typeof chunk.messageId === "string" &&
+        this.messageId !== chunk.messageId;
+      const out = streamChanged || messageIdChanged ? this.flush() : [];
       if (this.stream === null) {
         this.stream = chunk.stream;
         this.lineUuid = chunk.lineUuid;
+        this.messageId = chunk.messageId;
       }
       this.text += chunk.data;
       return out;
@@ -856,6 +1026,7 @@ export class FxTextCoalescer {
     this.stream = null;
     this.text = "";
     this.lineUuid = undefined;
+    this.messageId = undefined;
     return [out];
   }
 
@@ -865,15 +1036,31 @@ export class FxTextCoalescer {
   }
 }
 
+/** Context threaded through `mapFxUpdate` — `runId`/`nextSeq` are the
+ *  existing seq/line_uuid plumbing (`nextSeq` stands in for the stateful
+ *  `state.seq++` the inline version used; callers pass `() => state.seq++`
+ *  to keep the sequence shared across a whole run). `lastTitle` is the one
+ *  piece of genuine cross-call state `mapFxUpdate` needs: the last
+ *  non-placeholder `session_info_update` title it emitted, read AND mutated
+ *  by that branch to dedupe a repeated identical title. `mapFxUpdate` itself
+ *  stays otherwise pure — a caller that wants the dedupe to actually work
+ *  across a run's updates (rather than per-call) must pass the SAME ctx
+ *  object to every `mapFxUpdate` call for that run, or otherwise carry
+ *  `lastTitle` forward itself (see `dispatchSessionUpdate`, which does the
+ *  latter against `FxSessionState.lastTitle`). */
+export interface FxUpdateCtx {
+  runId: string;
+  nextSeq: () => number;
+  lastTitle?: string;
+}
+
 /**
  * Pure `session/update` → chunk(s) mapper — mirrors `mapCodexEvent` /
  * `mapCursorEvent` / `mapGeminiEvent` being exported, side-effect-free
  * functions the fake-server driver tests don't need to spawn a child to
- * exercise. `ctx.nextSeq` stands in for the stateful `state.seq++` the
- * inline version used; callers pass `() => state.seq++` to keep the
- * sequence shared across a whole run.
+ * exercise.
  */
-export function mapFxUpdate(update: Record<string, unknown>, ctx: { runId: string; nextSeq: () => number }): FxChunk[] {
+export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): FxChunk[] {
   const kind = update.sessionUpdate;
   switch (kind) {
     case "agent_message_chunk": {
@@ -883,7 +1070,10 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: { runId: strin
       // FX_CONTEXT_DIAGNOSTIC_PREFIX) and would otherwise render as the
       // model's opening paragraph. Demote a diagnostics-only chunk to one
       // `status` line per warning; the seq counter still advances per line
-      // so every line_uuid stays unique within the run.
+      // so every line_uuid stays unique within the run. Diagnostic lines
+      // never carry a `messageId` — they're not real assistant prose, and
+      // `status`-stream chunks bypass the coalescer's messageId-flush logic
+      // entirely (see FxTextCoalescer.push).
       if (isFxContextDiagnostic(text)) {
         return text
           .split("\n")
@@ -891,12 +1081,23 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: { runId: strin
           .filter((line) => line !== "")
           .map((line) => ({ stream: "status" as const, data: line, lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}` }));
       }
-      return [{ stream: "assistant", data: text, lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}` }];
+      // messageId (fx ≥0.0.8) is stable across one logical message and
+      // regenerated only at message-kind boundaries — threaded onto the
+      // chunk so FxTextCoalescer can split back-to-back same-stream
+      // messages it otherwise couldn't tell apart. Absent on 0.0.7 and
+      // earlier; tolerated as undefined.
+      const messageId = typeof update.messageId === "string" ? update.messageId : undefined;
+      return [{ stream: "assistant", data: text, lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`, messageId }];
     }
 
     case "agent_thought_chunk": {
       const text = extractText(update.content);
-      return text ? [{ stream: "thinking", data: text, lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}` }] : [];
+      if (!text) return [];
+      // No messageId observed on this variant to date (see the file
+      // header) — read defensively the same way, in case fx starts sending
+      // one; absence is tolerated identically to the assistant branch.
+      const messageId = typeof update.messageId === "string" ? update.messageId : undefined;
+      return [{ stream: "thinking", data: text, lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`, messageId }];
     }
 
     case "tool_call": {
@@ -908,10 +1109,20 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: { runId: strin
             // own), it just can never pair with a result (see the
             // tool_call_update branch).
             `seq${ctx.nextSeq()}`;
+      const name = toolCallName(update);
+      // fx's human-facing `title`, carried alongside `name` only when it
+      // actually adds information: fx ≥0.0.8 puts the real tool id in
+      // `name` (see toolCallName), so the title is a separate fact worth
+      // keeping; on a pre-0.0.8 update with no `name` the fallback already
+      // folds the title into the `title (kind)` name string, so carrying it
+      // again would just render it twice.
+      const hasRealName = typeof update.name === "string" && update.name.length > 0;
+      const rawTitle = typeof update.title === "string" && update.title.length > 0 ? update.title : undefined;
+      const title = hasRealName && rawTitle && rawTitle !== name ? rawTitle : undefined;
       return [
         {
           stream: "tool_use",
-          data: JSON.stringify({ id, name: toolCallName(update), input: toolCallInput(update), serverSide: false }),
+          data: JSON.stringify({ id, name, input: toolCallInput(update), serverSide: false, title }),
           lineUuid: `fx:tool:${id}:use`,
         },
       ];
@@ -994,22 +1205,50 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: { runId: strin
       ];
     }
 
+    case "session_info_update": {
+      // {title, updatedAt} (fx ≥0.0.8), fired at lifecycle points and after
+      // every turn — see the file header. Emit a title sentinel only for a
+      // real, non-placeholder, CHANGED title: fx's own placeholder
+      // ("Untitled session") and the pre-0.0.8-era variant of this event
+      // (no `title`, just `_meta.fx.modelResponseRecovery`) both carry no
+      // usable title and must emit nothing; a repeat of the same title
+      // already emitted this turn (via `ctx.lastTitle`, mutated below) is
+      // deduped rather than re-emitted.
+      const rawTitle = (update as { title?: unknown }).title;
+      if (typeof rawTitle !== "string" || rawTitle.length === 0) return [];
+      if (rawTitle === "Untitled session") return [];
+      if (rawTitle === ctx.lastTitle) return [];
+      ctx.lastTitle = rawTitle;
+      return [
+        {
+          stream: "status",
+          data: FX_SESSION_TITLE_STATUS_PREFIX + rawTitle,
+          lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`,
+        },
+      ];
+    }
+
     default:
       // current_mode_update, available_commands_update, user_message_chunk,
-      // session_info_update, config_option_update, and any future variant —
-      // silent forward-compat (v1 scope).
+      // config_option_update, and any future variant — silent forward-compat
+      // (v1 scope).
       return [];
   }
 }
 
 /** `dispatchSessionUpdate` is the stateful adapter around the pure
  *  `mapFxUpdate`: it supplies `ctx` from the session's own runId/seq
- *  counter and routes every resulting chunk through `emit` (dedup +
- *  settled-turn gating), same as before the extraction. */
+ *  counter (plus `lastTitle`, read from and written back to
+ *  `state.lastTitle` so the `session_info_update` dedupe persists across
+ *  calls — see `FxSessionState.lastTitle`) and routes every resulting chunk
+ *  through `emit` (dedup + settled-turn gating), same as before the
+ *  extraction. */
 function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unknown>): void {
-  for (const c of mapFxUpdate(update, { runId: state.runId, nextSeq: () => state.seq++ })) {
+  const ctx: FxUpdateCtx = { runId: state.runId, nextSeq: () => state.seq++, lastTitle: state.lastTitle };
+  for (const c of mapFxUpdate(update, ctx)) {
     emit(state, c.stream, c.data, c.lineUuid);
   }
+  state.lastTitle = ctx.lastTitle;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -1192,6 +1431,17 @@ async function cancelFxTurn(state: FxSessionState): Promise<void> {
  * The ACP conversation itself: handshake → (new | resume | load) → prompt.
  * ────────────────────────────────────────────────────────────────────────── */
 
+/** Maps agetor's permission mode to the mode id for the best-effort
+ *  post-`session/new` `session/set_mode` nudge (see `runFxTurn`): `auto` →
+ *  `code`, `ask` → `ask`. Returns `null` for `yolo` ON PURPOSE and this must
+ *  never change: fx's `session/set_mode` OVERWRITES the session's effective
+ *  permission mode (`applySessionMode`: `code`→`auto`, `ask`→`ask`) — there
+ *  is no mode id that means yolo, so a `code` nudge sent while in yolo would
+ *  DOWNGRADE it to `auto` rather than leaving it alone. Sending nothing at
+ *  all is what lets yolo's startup-config permission mode
+ *  (`FX_PERMISSION_MODE=yolo` → `sessions.zig .permission_mode`) survive
+ *  untouched. See the file header's configOptions fact for the full
+ *  source-level rationale — never add a yolo branch here. */
 function acpModeIdFor(mode: FxMode): string | null {
   if (mode === "auto") return "code";
   if (mode === "ask") return "ask";
@@ -1200,8 +1450,8 @@ function acpModeIdFor(mode: FxMode): string | null {
 
 /** Pull the active provider id out of a `session/new`/`session/resume`/
  *  `session/load` result's `configOptions` array (0.0.5+, additive — see
- *  the file header's "Facts verified against fx 0.0.5/0.0.6/0.0.7" section).
- *  Pure and exported for the same reason `mapFxUpdate` is: unit-testable
+ *  the file header's "Facts verified against fx 0.0.5 through 0.0.8"
+ *  section). Pure and exported for the same reason `mapFxUpdate` is: unit-testable
  *  against a raw result object without spawning a child. Tolerates a
  *  missing/non-array `configOptions` (0.0.4 binaries, or a response that
  *  omits it) and any entry shape ACP's schema doesn't guarantee — returns
@@ -1230,6 +1480,44 @@ export function extractFxProviderValue(result: unknown): string | null {
   return null;
 }
 
+/** The five keys `FxUsagePayload.turn` recognizes, in the order
+ *  `session/prompt`'s `usage` result carries them (fx ≥0.0.8, see the file
+ *  header). Shared between `maybeEmitPromptUsage` and its test so the list
+ *  can't drift out of sync with the type. */
+const FX_PROMPT_USAGE_KEYS = [
+  "inputTokens",
+  "outputTokens",
+  "cacheReadTokens",
+  "cacheWriteTokens",
+  "reasoningTokens",
+] as const satisfies ReadonlyArray<keyof NonNullable<FxUsagePayload["turn"]>>;
+
+/** Reads `session/prompt`'s (fx ≥0.0.8) `usage` object and, if at least one
+ *  of its five known keys is a finite number, emits it as the `turn` half of
+ *  the existing `FX_USAGE_STATUS_PREFIX` sentinel (see the file header and
+ *  `FxUsagePayload` in `src/shared/types.ts`) — mirroring the `usage_update`
+ *  mapper branch's own malformed-tolerant handling: a non-object, `{}`, or
+ *  an object with no finite-number field among the five emits nothing rather
+ *  than a chip with holes in it. Called from `runFxTurn` once
+ *  `session/prompt` resolves, before the stopReason switch, so it lands on
+ *  the run regardless of how the turn ended. */
+function maybeEmitPromptUsage(state: FxSessionState, usage: unknown): void {
+  if (!usage || typeof usage !== "object") return;
+  const raw = usage as Record<string, unknown>;
+  const turn: NonNullable<FxUsagePayload["turn"]> = {};
+  let any = false;
+  for (const key of FX_PROMPT_USAGE_KEYS) {
+    const value = raw[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      turn[key] = value;
+      any = true;
+    }
+  }
+  if (!any) return;
+  const payload: FxUsagePayload = { turn };
+  emit(state, "status", FX_USAGE_STATUS_PREFIX + JSON.stringify(payload), `fx:${state.runId}:${state.seq++}`);
+}
+
 async function runFxTurn(
   state: FxSessionState,
   opts: { cwd: string; promptText: string; resumeSessionId?: string },
@@ -1237,7 +1525,7 @@ async function runFxTurn(
   // Emits the `FX_PROVIDER_STATUS_PREFIX` status chunk at most once per
   // turn, from whichever of session/new|resume|load's results carries a
   // `configOptions` provider entry first — see the file header's "Facts
-  // verified against fx 0.0.5/0.0.6/0.0.7" section.
+  // verified against fx 0.0.5 through 0.0.8" section.
   let providerEmitted = false;
   function maybeEmitProvider(result: unknown): void {
     if (providerEmitted) return;
@@ -1252,8 +1540,15 @@ async function runFxTurn(
   try {
     await withTimeout(
       sendRpc(state, "initialize", {
-        // Must be the NUMBER 1, not the string "1" — fx replies -32602
-        // (Invalid params) to a stringified protocolVersion (SPIKE-VERIFIED).
+        // Send the NUMBER 1 — ACP's schema defines protocolVersion as a
+        // number and this driver has always sent one, so nothing here
+        // changes. (A prior version of this comment claimed fx rejects a
+        // *stringified* protocolVersion with -32602; that was never
+        // actually spike-verified — the probe scenario meant to test it
+        // sent numeric 1 by mistake — so the claim is dropped. What IS
+        // 0.0.8 spike-verified: an unrecognized numeric protocolVersion,
+        // e.g. 999, is accepted leniently rather than rejected. Neither
+        // fact changes what this driver sends.)
         protocolVersion: 1,
         clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
         clientInfo: { name: "agetor", version: "0" },
@@ -1287,8 +1582,8 @@ async function runFxTurn(
       // Method-not-found / invalid-params / -32600 (or any other resume
       // error) — fall back to session/load below. `-32600` is JSON-RPC's
       // generic "Invalid Request" code, not an auth-specific one — fx
-      // merely reuses it for credential failures (0.0.5+, see the file
-      // header) — so it gets no special early-exit here: whether this
+      // merely reuses it for credential failures (0.0.5+, confirmed through
+      // 0.0.8 — see the file header) — so it gets no special early-exit here: whether this
       // -32600 was the credential gate or fx rejecting resume as
       // unsupported, `session/load`'s own outcome (below) is what decides
       // the turn.
@@ -1312,8 +1607,8 @@ async function runFxTurn(
         if (isTimeoutError(err)) {
           failTurn(state, describeHandshakeFailure(err, "session/load", RPC_HANDSHAKE_TIMEOUT_MS));
         } else if (err instanceof RpcError && err.code === -32600) {
-          // Credential re-check failed here too (0.0.5+, see the file
-          // header) — authoritative either way it reads: the same gate
+          // Credential re-check failed here too (0.0.5+, confirmed through
+          // 0.0.8 — see the file header) — authoritative either way it reads: the same gate
           // resume just hit (load can't do better), or a non-auth "Invalid
           // Request" for which `session/load` was precisely the graceful
           // path to try. Surface fx's text verbatim, no wrapper.
@@ -1360,7 +1655,7 @@ async function runFxTurn(
   }
 
   // 3. session/prompt — the ONLY turn-completion signal; no timeout.
-  let promptResult: { stopReason?: string } | undefined;
+  let promptResult: { stopReason?: string; usage?: unknown } | undefined;
   try {
     promptResult = (await sendRpc(state, "session/prompt", {
       sessionId: state.sessionId,
@@ -1369,10 +1664,11 @@ async function runFxTurn(
   } catch (err) {
     if (state.resolved) return; // already settled via cancel/death
     if (err instanceof RpcError && err.code === -32600) {
-      // Credential re-check failed mid-prompt (0.0.5+, see the file
-      // header) — fx's text is user-actionable on its own; surface it
-      // verbatim (via rawMessage, with no "(code -32600)" suffix) instead
-      // of wrapping it in our own "session/prompt failed:" prefix.
+      // Credential re-check failed mid-prompt (0.0.5+, confirmed through
+      // 0.0.8 — see the file header) — fx's text is user-actionable on its
+      // own; surface it verbatim (via rawMessage, with no "(code -32600)"
+      // suffix) instead of wrapping it in our own "session/prompt failed:"
+      // prefix.
       failTurn(state, err.rawMessage);
     } else {
       failTurn(state, `fx acp: session/prompt failed: ${errMessage(err)}`);
@@ -1380,6 +1676,13 @@ async function runFxTurn(
     return;
   }
   if (state.resolved) return; // cancel/death already settled us
+
+  // fx ≥0.0.8's `usage` object on the prompt result — the `turn` half of
+  // the shared `FX_USAGE_STATUS_PREFIX` sentinel (see the file header).
+  // Read BEFORE the stopReason switch so it lands on the run regardless of
+  // how the turn ended (including a `refused` turn, whose `usage` is
+  // typically `{}` and so emits nothing).
+  maybeEmitPromptUsage(state, promptResult?.usage);
 
   const stopReason = promptResult?.stopReason ?? "unknown";
   switch (stopReason) {
@@ -1391,9 +1694,27 @@ async function runFxTurn(
       // `handle.cancelled` flag is authoritative for cancelled-vs-failed.
       settleFx(state, 1);
       return;
+    // fx's actual wire strings (`types.zig StopReason`, byte-identical
+    // 0.0.7→0.0.8): `max_output_tokens`, `max_model_turns`, `refused`. The
+    // ACP-canonical names (`max_tokens`, `max_turn_requests`, `refusal`)
+    // this switch used to check ALONE never matched anything fx actually
+    // sends — every real non-end_turn/non-cancelled stop fell through to
+    // the "unexpected stopReason" default below instead (still correctly
+    // `settleFx(state, 1)`, so no run was ever mis-recorded — only this
+    // status line's reason text was wrong). Both vocabularies are accepted
+    // here now; the ACP-canonical names are kept for forward compatibility.
+    // On a `refused` turn specifically, the reason has already arrived as
+    // ordinary `agent_message_chunk` assistant prose (e.g.
+    // "AI_GATEWAY_API_KEY authentication failed · HTTP 401" for an
+    // *invalid* key — a *missing* key instead fails `initialize` with
+    // -32600 and never reaches this switch at all) — this status line is
+    // supplementary, not the sole place the reason is surfaced.
     case "max_tokens":
+    case "max_output_tokens":
     case "max_turn_requests":
+    case "max_model_turns":
     case "refusal":
+    case "refused":
       emit(state, "status", `fx turn ended: ${stopReason}`);
       settleFx(state, 1);
       return;
@@ -1459,8 +1780,11 @@ export interface FxLaunchOptions {
  * Spawn one fx `acp` turn as a plain child process (no tmux — see the file
  * header for why) and drive it over stdio. Returns a `SpawnedAgent` whose
  * `done` resolves when the turn ends: 0 on `stopReason: "end_turn"`, 1 on
- * every other outcome (cancelled, refusal, max_tokens, max_turn_requests,
- * protocol error, or process death).
+ * every other outcome — `cancelled`; fx's real wire stop reasons
+ * (`max_output_tokens`, `max_model_turns`, `refused`); the ACP-canonical
+ * names kept for forward compatibility (`max_tokens`, `max_turn_requests`,
+ * `refusal`); a protocol error; or process death (see the stopReason switch
+ * in `runFxTurn` and the file header).
  */
 export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
   ensureLogDirForArgv(opts.argv);
