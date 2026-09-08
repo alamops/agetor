@@ -780,6 +780,14 @@ async function respondPermissionRequest(
 
   const options = Array.isArray(params?.options) ? params!.options! : [];
 
+  // Live caveat (fx 0.0.8, 2026-09-08): in `auto` mode fx runs its OWN
+  // review first, hard-wired to `openai/gpt-5.6-luna`; on an account that
+  // gets HTTP 403 for that tier fx answers `decision=unavailable →
+  // deny, recovery=agent_replan` and tells the model the action was held —
+  // it does NOT escalate a `session/request_permission`, so this handler
+  // never runs and no card appears. `ask` mode was verified live the same
+  // day (options allow_once / allow_always / reject_once), and `yolo` ran
+  // the tool with no request at all.
   if (state.mode === "yolo") {
     // Prefer allow_once over allow_always so an approval stays scoped to
     // this turn instead of writing a durable rule into the user's fx
