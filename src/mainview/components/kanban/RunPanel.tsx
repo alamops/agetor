@@ -1415,66 +1415,47 @@ function RunPanelBody({
    *  so it splices against these. */
   const mainEvents = useMemo(() => events.filter((e) => !e.subagentId), [events]);
 
-  /** Merged fx usage per run, keyed by `runId` — feeds the run-row chip in
-   *  `RunsList`. Sourced from the raw (unfiltered) `events` state rather
-   *  than `displayedEvents` so the chip stays correct regardless of which
-   *  subagent tab is active or whether a JSONL rebuild snapshot has spliced
-   *  the main stream. `events` arrives in arrival order, so folding every
-   *  sentinel through `mergeFxUsage` (a shallow `{...prev, ...next}`) in
-   *  order naturally keeps the latest value per key — the `usage_update`
-   *  half (`used`/`size`/`cost`) and the per-turn half (`turn`, from the
-   *  `session/prompt` result) can arrive as separate sentinel chunks on the
-   *  same run, so a plain last-wins overwrite would clobber whichever half
-   *  arrived first. Gated on `kind === "fx"` — every other agent kind never
-   *  emits this sentinel, so scanning the full (possibly windowed) event
-   *  list on every render for them is pure waste. Note the same windowing
-   *  applies here as everywhere else `events` is read: once an older run's
-   *  events slide out of the kept window (`eventWindowKeepCount`/
-   *  `EVENTS_WINDOW_MAX`), its usage chip disappears too — intended, not a
-   *  bug to chase. */
-  const usageByRunId = useMemo(() => {
-    const m = new Map<string, FxUsagePayload>();
-    if (kind !== "fx") return m;
+  /** Merged fx usage / provider / title per run, each keyed by `runId` —
+   *  feed the run-row chips in `RunsList`. Sourced from the raw
+   *  (unfiltered) `events` state rather than `displayedEvents` so the chips
+   *  stay correct regardless of which subagent tab is active or whether a
+   *  JSONL rebuild snapshot has spliced the main stream. `events` arrives in
+   *  arrival order, so folding every usage sentinel through `mergeFxUsage`
+   *  (a shallow `{...prev, ...next}`) in order naturally keeps the latest
+   *  value per key — the `usage_update` half (`used`/`size`/`cost`) and the
+   *  per-turn half (`turn`, from the `session/prompt` result) can arrive as
+   *  separate sentinel chunks on the same run, so a plain last-wins
+   *  overwrite would clobber whichever half arrived first — while the
+   *  provider/title maps are plain last-wins (`fx-provider:`/`fx-title:`
+   *  sentinels are each already a complete value). All three are gated on
+   *  `kind === "fx"` — every other agent kind never emits these sentinels,
+   *  so scanning the full (possibly windowed) event list on every render
+   *  for them is pure waste — and combined into a single pass over `events`
+   *  so a streamed fx task doesn't pay for three independent full scans of
+   *  the same (up to `EVENTS_WINDOW_MAX`-sized) array on every chunk. Note
+   *  the same windowing applies here as everywhere else `events` is read:
+   *  once an older run's events slide out of the kept window
+   *  (`eventWindowKeepCount`/`EVENTS_WINDOW_MAX`), its chips disappear too
+   *  — intended, not a bug to chase. */
+  const { usageByRunId, providerByRunId, titleByRunId } = useMemo(() => {
+    const usage = new Map<string, FxUsagePayload>();
+    const provider = new Map<string, string>();
+    const title = new Map<string, string>();
+    if (kind !== "fx") return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title };
     for (const e of events) {
-      if (e.stream !== "status" || !e.data.startsWith(FX_USAGE_STATUS_PREFIX)) continue;
-      const parsed = parseFxUsage(e.data.slice(FX_USAGE_STATUS_PREFIX.length));
-      if (!parsed) continue;
-      m.set(e.runId, mergeFxUsage(m.get(e.runId), parsed));
+      if (e.stream !== "status") continue;
+      if (e.data.startsWith(FX_USAGE_STATUS_PREFIX)) {
+        const parsed = parseFxUsage(e.data.slice(FX_USAGE_STATUS_PREFIX.length));
+        if (parsed) usage.set(e.runId, mergeFxUsage(usage.get(e.runId), parsed));
+      } else if (e.data.startsWith(FX_PROVIDER_STATUS_PREFIX)) {
+        const value = e.data.slice(FX_PROVIDER_STATUS_PREFIX.length).trim();
+        if (value) provider.set(e.runId, value);
+      } else if (e.data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX)) {
+        const value = e.data.slice(FX_SESSION_TITLE_STATUS_PREFIX.length).trim();
+        if (value) title.set(e.runId, value);
+      }
     }
-    return m;
-  }, [events, kind]);
-
-  /** Latest fx `fx-provider: <value>` per run, keyed by `runId` — sibling
-   *  derivation to {@link usageByRunId} above, same fx gating and the same
-   *  windowed-events caveat (an older run's chip disappears once its events
-   *  slide out of the kept window). Feeds the small provider chip in
-   *  `RunsList`, rendered beside the usage chip. */
-  const providerByRunId = useMemo(() => {
-    const m = new Map<string, string>();
-    if (kind !== "fx") return m;
-    for (const e of events) {
-      if (e.stream !== "status" || !e.data.startsWith(FX_PROVIDER_STATUS_PREFIX)) continue;
-      const value = e.data.slice(FX_PROVIDER_STATUS_PREFIX.length).trim();
-      if (!value) continue;
-      m.set(e.runId, value);
-    }
-    return m;
-  }, [events, kind]);
-
-  /** Latest fx `fx-title: <value>` per run, keyed by `runId` — sibling
-   *  derivation to {@link providerByRunId} above, same fx gating and the
-   *  same windowed-events caveat. Feeds `RunsList`'s `SessionTitleChip`,
-   *  rendered beside the provider chip. */
-  const titleByRunId = useMemo(() => {
-    const m = new Map<string, string>();
-    if (kind !== "fx") return m;
-    for (const e of events) {
-      if (e.stream !== "status" || !e.data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX)) continue;
-      const value = e.data.slice(FX_SESSION_TITLE_STATUS_PREFIX.length).trim();
-      if (!value) continue;
-      m.set(e.runId, value);
-    }
-    return m;
+    return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title };
   }, [events, kind]);
 
   /** Background/sub-agent events bucketed by subagent id, in arrival order. */
@@ -5014,7 +4995,7 @@ const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: Parsed
           <span className="font-mono font-medium">{call.name}</span>
         )}
         {call.title && (
-          <span className="ml-2 text-muted-foreground" data-testid="tool-use-title">{call.title}</span>
+          <span className="ml-2 min-w-0 truncate text-muted-foreground" data-testid="tool-use-title">{call.title}</span>
         )}
         {call.serverSide && (
           <span className={cn(SECONDARY_BADGE_CLASS, "px-1 py-0 text-[9px] uppercase")}>server</span>

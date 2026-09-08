@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test";
-import type { RunEventStream } from "../../shared/types.ts";
+import {
+  FX_PROVIDER_STATUS_PREFIX,
+  FX_SESSION_TITLE_STATUS_PREFIX,
+  FX_USAGE_STATUS_PREFIX,
+  PERMISSION_MODE_STATUS_PREFIX,
+  type RunEventStream,
+} from "../../shared/types.ts";
 import {
   findMatchingEventIds,
   NO_MATCHES,
@@ -35,6 +41,18 @@ test("searchableEventText: suppressed [Image: source: …] status breadcrumbs ar
   expect(searchableEventText("status", "background task: done")).toBe("background task: done");
 });
 
+test("searchableEventText: suppressed internal status sentinels are never searchable", () => {
+  // RunPanel renders no DOM block for any of these (isInternalStatusSentinel),
+  // so a match would navigate to an evid with no node.
+  expect(searchableEventText("status", `${PERMISSION_MODE_STATUS_PREFIX}plan`)).toBeNull();
+  expect(searchableEventText("status", `${FX_USAGE_STATUS_PREFIX}{"used":1234,"size":128000}`)).toBeNull();
+  expect(searchableEventText("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`)).toBeNull();
+  // The title sentinel is human prose and would otherwise match real queries.
+  expect(searchableEventText("status", `${FX_SESSION_TITLE_STATUS_PREFIX}Refactor the login flow`)).toBeNull();
+  // Ordinary status text is unaffected.
+  expect(searchableEventText("status", "session ended: tmux session gone")).toBe("session ended: tmux session gone");
+});
+
 test("searchableEventText: passthrough streams pass an empty string through unchanged", () => {
   expect(searchableEventText("assistant", "")).toBe("");
   expect(searchableEventText("stdout", "")).toBe("");
@@ -64,6 +82,30 @@ test("searchableEventText: tool_use with a string input is used as-is (not re-st
 test("searchableEventText: tool_use with only a name (no input) still surfaces the name", () => {
   const data = JSON.stringify({ id: "1", name: "Read" });
   expect(searchableEventText("tool_use", data)).toBe("Read");
+});
+
+test("searchableEventText: tool_use with a title matches on both title and name", () => {
+  const data = JSON.stringify({ id: "1", name: "shell", title: "Run ls", input: { command: "ls" } });
+  const text = searchableEventText("tool_use", data);
+  expect(text).toContain("Run ls");
+  expect(text).toContain("shell");
+});
+
+test("searchableEventText: tool_use without a title behaves as before (name + input only)", () => {
+  const data = JSON.stringify({ id: "1", name: "Read", input: { file_path: "/a/b.ts" } });
+  const text = searchableEventText("tool_use", data);
+  expect(text).toBe(`Read ${JSON.stringify({ file_path: "/a/b.ts" })}`);
+  expect(text).not.toContain("undefined");
+});
+
+test("searchableEventText: tool_use with a non-string title ignores it", () => {
+  const data = JSON.stringify({ id: "1", name: "shell", title: 42, input: "ls" });
+  expect(searchableEventText("tool_use", data)).toBe("shell ls");
+});
+
+test("searchableEventText: tool_use with an empty-string title ignores it", () => {
+  const data = JSON.stringify({ id: "1", name: "shell", title: "", input: "ls" });
+  expect(searchableEventText("tool_use", data)).toBe("shell ls");
 });
 
 test("searchableEventText: tool_use with empty name and input falls back to the raw payload", () => {
@@ -176,6 +218,12 @@ test("findMatchingEventIds: non-searchable streams never match, even when the ra
     ev("subagent", '{"description":"needle"}'),
   ];
   expect(findMatchingEventIds(events, "needle")).toBe(NO_MATCHES);
+});
+
+test("findMatchingEventIds: a tool_use with a title matches queries for both the title and the name", () => {
+  const events = [ev("tool_use", JSON.stringify({ id: "1", name: "shell", title: "Run ls", input: "ls" }))];
+  expect(findMatchingEventIds(events, "Run ls")).toEqual([0]);
+  expect(findMatchingEventIds(events, "shell")).toEqual([0]);
 });
 
 test("findMatchingEventIds: tool_result folds into an earlier owning tool_use and matches at the tool_use index", () => {

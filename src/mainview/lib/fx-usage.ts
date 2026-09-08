@@ -4,19 +4,11 @@
 // `session/prompt` result's per-turn `usage` object, mapped to `{turn}`).
 // No React here so both the webview and bun-side tests can import this
 // directly. RunPanel is the sole consumer today.
-import type { FxUsagePayload } from "../../shared/types.ts";
+import { FX_TURN_KEYS, type FxUsagePayload } from "../../shared/types.ts";
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
-
-const TURN_KEYS = [
-  "inputTokens",
-  "outputTokens",
-  "cacheReadTokens",
-  "cacheWriteTokens",
-  "reasoningTokens",
-] as const;
 
 /**
  * Parse a `FX_USAGE_STATUS_PREFIX` sentinel body into a validated
@@ -54,7 +46,7 @@ export function parseFxUsage(json: string): FxUsagePayload | null {
 
   if (isPlainObject(raw.turn)) {
     const turn: NonNullable<FxUsagePayload["turn"]> = {};
-    for (const key of TURN_KEYS) {
+    for (const key of FX_TURN_KEYS) {
       const value = raw.turn[key];
       if (typeof value === "number" && Number.isFinite(value)) turn[key] = value;
     }

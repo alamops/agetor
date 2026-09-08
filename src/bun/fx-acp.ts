@@ -5,6 +5,7 @@ import type { FxUsagePayload, RunEventStream } from "../shared/types.ts";
 import {
   FX_PROVIDER_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
+  FX_TURN_KEYS,
   FX_USAGE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
 } from "../shared/types.ts";
@@ -216,13 +217,16 @@ import {
  *   - **`session_info_update` gained a `{title, updatedAt}` shape (0.0.8)**,
  *     fired at lifecycle points and after every turn — `mapFxUpdate` now has
  *     a dedicated branch for it (previously silently ignored, see the
- *     default case below): a non-empty `title` that isn't fx's "Untitled
- *     session" placeholder and differs from the last title emitted this turn
- *     becomes one `FX_SESSION_TITLE_STATUS_PREFIX` status chunk (`fx-title:
- *     <title>`); RunPanel renders the latest one as a muted chip beside the
- *     provider chip. The 0.0.7-era variant of this event (no `title`, just
+ *     default case below): a non-empty `title`, normalized (whitespace
+ *     collapsed and trimmed) and bounded at `FX_SESSION_TITLE_MAX_LEN` chars
+ *     — fx session titles are model-generated text with no length guarantee
+ *     — that isn't fx's "Untitled session" placeholder and differs from the
+ *     last (normalized) title emitted this turn becomes one
+ *     `FX_SESSION_TITLE_STATUS_PREFIX` status chunk (`fx-title: <title>`);
+ *     RunPanel renders the latest one as a muted chip beside the provider
+ *     chip. The 0.0.7-era variant of this event (no `title`, just
  *     `_meta.fx.modelResponseRecovery`) still carries no title and so still
- *     emits nothing.
+ *     emits nothing, as does a title that normalizes to empty.
  *   - **Session ids are 12-char base64url as of 0.0.8** (`session_layout.zig`,
  *     down from 0.0.7's 50 characters) — 0.0.7's longer ids still validate
  *     and resume against a 0.0.8 binary, so a persisted `runs.fx_session_id`
@@ -341,6 +345,14 @@ const STDERR_RING_SIZE = 20;
  *  buffer without bound — fx's own inbound cap is 8 MiB; ours is a looser
  *  backstop purely against a runaway/misbehaving process. Treated as death. */
 const MAX_STDOUT_BUFFER_BYTES = 32 * 1024 * 1024;
+/** Bound on a `session_info_update` title before it's emitted as the
+ *  `FX_SESSION_TITLE_STATUS_PREFIX` sentinel — fx session titles are
+ *  model-generated text with no length guarantee, same rationale as
+ *  `extractFxProviderValue`'s 64-char provider-value bound below: an
+ *  absurdly long title (bug, or a hostile/misbehaving fx binary) rides
+ *  straight into a run-row chip with no truncation of its own. Exported for
+ *  the mapper test. */
+export const FX_SESSION_TITLE_MAX_LEN = 200;
 
 /** Agetor's permission mode, as agents.ts passes it through. Narrowed
  *  locally (not reused from shared/types.ts) so the policy switch in
@@ -998,6 +1010,14 @@ type FxTextStream = "assistant" | "thinking";
  *
  * Pure and exported for the same reason `mapFxUpdate` is: unit-testable
  * without a child process (see fx-acp-mapper.test.ts).
+ *
+ * Asymmetry: the buffered `messageId` is captured from a message's FIRST
+ * delta only (`push`, the `this.stream === null` branch below) — if that
+ * first delta lacks an id but a later delta in the same message carries
+ * one, the buffer stays id-less and `messageIdChanged` can never trip for
+ * it. Unreachable against fx 0.0.8 (every `agent_message_chunk` delta
+ * carries the id), and fails safe if it ever did happen: the deltas merge
+ * into one bubble rather than being over-split into two.
  */
 export class FxTextCoalescer {
   private stream: FxTextStream | null = null;
@@ -1215,22 +1235,27 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
 
     case "session_info_update": {
       // {title, updatedAt} (fx ≥0.0.8), fired at lifecycle points and after
-      // every turn — see the file header. Emit a title sentinel only for a
-      // real, non-placeholder, CHANGED title: fx's own placeholder
-      // ("Untitled session") and the pre-0.0.8-era variant of this event
-      // (no `title`, just `_meta.fx.modelResponseRecovery`) both carry no
-      // usable title and must emit nothing; a repeat of the same title
-      // already emitted this turn (via `ctx.lastTitle`, mutated below) is
-      // deduped rather than re-emitted.
+      // every turn — see the file header. Normalize before every check:
+      // collapse all whitespace (newlines/tabs/repeated spaces) to a single
+      // space, trim, then bound at FX_SESSION_TITLE_MAX_LEN — fx session
+      // titles are model-generated text with no length guarantee, mirroring
+      // extractFxProviderValue's 64-char provider-value bound below. The
+      // placeholder/dedupe checks run against the NORMALIZED title: fx's own
+      // placeholder ("Untitled session"), the pre-0.0.8-era variant of this
+      // event (no `title`, just `_meta.fx.modelResponseRecovery`), and a
+      // title that normalizes to empty all carry no usable title and must
+      // emit nothing; a repeat of the same normalized title already emitted
+      // this turn (via `ctx.lastTitle`, mutated below) is deduped rather
+      // than re-emitted.
       const rawTitle = (update as { title?: unknown }).title;
       if (typeof rawTitle !== "string" || rawTitle.length === 0) return [];
-      if (rawTitle === "Untitled session") return [];
-      if (rawTitle === ctx.lastTitle) return [];
-      ctx.lastTitle = rawTitle;
+      const title = rawTitle.replace(/\s+/g, " ").trim().slice(0, FX_SESSION_TITLE_MAX_LEN);
+      if (!title || title === "Untitled session" || title === ctx.lastTitle) return [];
+      ctx.lastTitle = title;
       return [
         {
           stream: "status",
-          data: FX_SESSION_TITLE_STATUS_PREFIX + rawTitle,
+          data: FX_SESSION_TITLE_STATUS_PREFIX + title,
           lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`,
         },
       ];
@@ -1488,33 +1513,21 @@ export function extractFxProviderValue(result: unknown): string | null {
   return null;
 }
 
-/** The five keys `FxUsagePayload.turn` recognizes, in the order
- *  `session/prompt`'s `usage` result carries them (fx ≥0.0.8, see the file
- *  header). Shared between `maybeEmitPromptUsage` and its test so the list
- *  can't drift out of sync with the type. */
-const FX_PROMPT_USAGE_KEYS = [
-  "inputTokens",
-  "outputTokens",
-  "cacheReadTokens",
-  "cacheWriteTokens",
-  "reasoningTokens",
-] as const satisfies ReadonlyArray<keyof NonNullable<FxUsagePayload["turn"]>>;
-
 /** Reads `session/prompt`'s (fx ≥0.0.8) `usage` object and, if at least one
- *  of its five known keys is a finite number, emits it as the `turn` half of
- *  the existing `FX_USAGE_STATUS_PREFIX` sentinel (see the file header and
- *  `FxUsagePayload` in `src/shared/types.ts`) — mirroring the `usage_update`
- *  mapper branch's own malformed-tolerant handling: a non-object, `{}`, or
- *  an object with no finite-number field among the five emits nothing rather
- *  than a chip with holes in it. Called from `runFxTurn` once
- *  `session/prompt` resolves, before the stopReason switch, so it lands on
- *  the run regardless of how the turn ended. */
+ *  of `FX_TURN_KEYS`' known keys is a finite number, emits it as the `turn`
+ *  half of the existing `FX_USAGE_STATUS_PREFIX` sentinel (see the file
+ *  header and `FxUsagePayload` in `src/shared/types.ts`) — mirroring the
+ *  `usage_update` mapper branch's own malformed-tolerant handling: a
+ *  non-object, `{}`, or an object with no finite-number field among those
+ *  keys emits nothing rather than a chip with holes in it. Called from
+ *  `runFxTurn` once `session/prompt` resolves, before the stopReason switch,
+ *  so it lands on the run regardless of how the turn ended. */
 function maybeEmitPromptUsage(state: FxSessionState, usage: unknown): void {
   if (!usage || typeof usage !== "object") return;
   const raw = usage as Record<string, unknown>;
   const turn: NonNullable<FxUsagePayload["turn"]> = {};
   let any = false;
-  for (const key of FX_PROMPT_USAGE_KEYS) {
+  for (const key of FX_TURN_KEYS) {
     const value = raw[key];
     if (typeof value === "number" && Number.isFinite(value)) {
       turn[key] = value;

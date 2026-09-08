@@ -1,5 +1,11 @@
 import { describe, test, expect } from "bun:test";
-import { FxTextCoalescer, extractFxProviderValue, isFxContextDiagnostic, mapFxUpdate } from "./fx-acp.ts";
+import {
+  FX_SESSION_TITLE_MAX_LEN,
+  FxTextCoalescer,
+  extractFxProviderValue,
+  isFxContextDiagnostic,
+  mapFxUpdate,
+} from "./fx-acp.ts";
 import type { FxUpdateCtx } from "./fx-acp.ts";
 import { FX_USAGE_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX } from "../shared/types.ts";
 import { deriveTodoProgress } from "../shared/todo-progress.ts";
@@ -396,6 +402,7 @@ describe("usage_update → FX_USAGE_STATUS_PREFIX status chunk", () => {
   });
 });
 
+
 describe("session_info_update → FX_SESSION_TITLE_STATUS_PREFIX status chunk", () => {
   test("a real, non-placeholder title emits one status chunk and records it onto ctx.lastTitle", () => {
     const ctx = makeCtx("run-T1");
@@ -462,6 +469,52 @@ describe("session_info_update → FX_SESSION_TITLE_STATUS_PREFIX status chunk", 
       ctx,
     );
     expect(chunks).toEqual([]);
+    expect(ctx.lastTitle).toBeUndefined();
+  });
+
+  test("newlines/tabs/double spaces and leading/trailing whitespace are collapsed and trimmed before emitting", () => {
+    const ctx = makeCtx("run-T4");
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "session_info_update", title: "  Fix   flaky\n\tworktree   test  " },
+      ctx,
+    );
+    expect(chunks).toEqual([
+      { stream: "status", data: FX_SESSION_TITLE_STATUS_PREFIX + "Fix flaky worktree test", lineUuid: "fx:run-T4:0" },
+    ]);
+    expect(ctx.lastTitle).toBe("Fix flaky worktree test");
+  });
+
+  test("a 500-char title emits exactly FX_SESSION_TITLE_MAX_LEN characters", () => {
+    const ctx = makeCtx("run-T5");
+    const longTitle = "x".repeat(500);
+    const chunks = mapFxUpdate({ sessionUpdate: "session_info_update", title: longTitle }, ctx);
+    expect(chunks).toHaveLength(1);
+    const emitted = chunks[0]!.data.slice(FX_SESSION_TITLE_STATUS_PREFIX.length);
+    expect(emitted).toHaveLength(FX_SESSION_TITLE_MAX_LEN);
+    expect(emitted).toBe("x".repeat(FX_SESSION_TITLE_MAX_LEN));
+  });
+
+  test("two raw titles differing only in whitespace normalize to the same string — the second call dedupes to nothing", () => {
+    const ctx = makeCtx("run-T6");
+    const first = mapFxUpdate({ sessionUpdate: "session_info_update", title: "Fix the bug" }, ctx);
+    expect(first).toEqual([
+      { stream: "status", data: FX_SESSION_TITLE_STATUS_PREFIX + "Fix the bug", lineUuid: "fx:run-T6:0" },
+    ]);
+    const second = mapFxUpdate({ sessionUpdate: "session_info_update", title: "Fix   the\nbug" }, ctx);
+    expect(second).toEqual([]);
+    expect(ctx.lastTitle).toBe("Fix the bug");
+  });
+
+  test("a title that normalizes to empty (all whitespace) is ignored — no chunk, ctx.lastTitle untouched", () => {
+    const ctx = makeCtx();
+    expect(mapFxUpdate({ sessionUpdate: "session_info_update", title: "   \n" }, ctx)).toEqual([]);
+    expect(ctx.lastTitle).toBeUndefined();
+    expect(ctx.current).toBe(0);
+  });
+
+  test("\"Untitled session\" padded with whitespace still normalizes to the placeholder and is dropped", () => {
+    const ctx = makeCtx();
+    expect(mapFxUpdate({ sessionUpdate: "session_info_update", title: "  Untitled session  " }, ctx)).toEqual([]);
     expect(ctx.lastTitle).toBeUndefined();
   });
 });
