@@ -6,6 +6,7 @@ import {
   CURSOR_MODEL_SPECS,
   DEFAULT_MODEL,
   FX_PROVIDER_STATUS_PREFIX,
+  FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   MODEL_EFFORT_SUPPORT,
@@ -31,6 +32,14 @@ test("isInternalStatusSentinel: true for an fx-provider status chunk", () => {
 
 test("isInternalStatusSentinel: true for an fx-title status chunk", () => {
   expect(isInternalStatusSentinel(`${FX_SESSION_TITLE_STATUS_PREFIX}x`)).toBe(true);
+});
+
+test("isInternalStatusSentinel: true for an fx-recovery status chunk", () => {
+  expect(isInternalStatusSentinel(`${FX_RECOVERY_STATUS_PREFIX}{}`)).toBe(true);
+});
+
+test("isInternalStatusSentinel: false for the plain 'fx turn ended: refused' status line — it's transcript-visible prose, not the sentinel channel", () => {
+  expect(isInternalStatusSentinel("fx turn ended: refused")).toBe(false);
 });
 
 test("isInternalStatusSentinel: false for text that merely looks like the fx-title prefix without its trailing space", () => {
@@ -222,6 +231,15 @@ test("AGENT_OPTIONS.fx.modes' yolo row is labelled 'Full access' with id 'yolo',
   expect(offeredIds).toContain("auto");
   expect(offeredIds).toContain("yolo");
   expect(offeredIds).toContain("ask");
+});
+
+test("AGENT_OPTIONS.fx.modes is ordered yolo, auto, ask — yolo ('Full access') first is fx's actual hands-off default (docs/plans/fix-fx-harness-rate-limit.md §3.7)", () => {
+  expect(AGENT_OPTIONS.fx.modes.map((m) => m.id)).toEqual(["yolo", "auto", "ask"]);
+  expect(AGENT_OPTIONS.fx.modes[0]?.label).toBe("Full access");
+});
+
+test("CODE_PLAN_MODE.fx pins Code to yolo (Full access) and Plan to ask, matching the reordered modes[0]", () => {
+  expect(CODE_PLAN_MODE.fx).toEqual({ code: "yolo", plan: "ask" });
 });
 
 test("AGENT_OPTIONS.fx.models has unique ids, unique labels, and every id matches provider/model shape", () => {

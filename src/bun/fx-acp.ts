@@ -10,7 +10,7 @@ import {
   FX_USAGE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
 } from "../shared/types.ts";
-import { fxRecoverySummaryLine, parseFxRecoveryMeta } from "../shared/fx-recovery.ts";
+import { fxRecoverySummaryLine, isFxRecoveryResumable, parseFxRecoveryMeta } from "../shared/fx-recovery.ts";
 import { isImagePath } from "../shared/attachments.ts";
 import { SENT_FILES_TOOL_NAME } from "../shared/sent-files.ts";
 import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
@@ -252,26 +252,39 @@ import {
  *     and `modelResponseRecovery:null` when fx drops the checkpoint. This
  *     driver maps it via `src/shared/fx-recovery.ts`'s `parseFxRecoveryMeta`
  *     to the `FX_RECOVERY_STATUS_PREFIX` sentinel (`src/shared/types.ts`),
- *     deduped against the last payload emitted this turn, plus a persisted,
- *     terminal-transition-only plain status line for `paused`/`recovered`
- *     (`fxRecoverySummaryLine`) — RunPanel derives a live progress notice
- *     and a Resume affordance from the sentinel stream, and the plain lines
- *     are what `agetor logs`/the TUI/the transcript show after the fact.
+ *     deduped against the last PLAIN payload emitted this turn (the dedupe
+ *     key never includes the `replayed` marker described below, so a live
+ *     payload byte-identical to a replayed one still dedupes/resets the same
+ *     way), plus a persisted, terminal-transition-only plain status line for
+ *     `paused`/`recovered` (`fxRecoverySummaryLine`) — RunPanel derives a
+ *     live progress notice and a Resume affordance from the sentinel stream,
+ *     and the plain lines are what `agetor logs`/the TUI/the transcript show
+ *     after the fact. **While replaying** (see the `session/resume` bullet
+ *     below), the EMITTED sentinel body additionally carries `replayed:
+ *     true` (never `replayed: false` — the field is simply absent on a live
+ *     sentinel) so downstream progress renderers can distinguish replayed
+ *     history from a fresh update.
  *   - **`session/resume` REPLAYS session history — including a `paused`
  *     recovery update — onto the NEW run, before the resume response
  *     itself resolves.** `runFxTurn` flags `state.replaying` for exactly
  *     that window (see `FxSessionState.replaying`'s doc): the recovery
  *     sentinel above still emits during replay (so this run's own live
- *     state stays correct), but the terminal summary line does not — it
- *     already reached the transcript on the run where the pause/recovery
- *     genuinely happened, and re-firing it on every resume would spam a
- *     stale explanation into each follow-up. A replayed `paused` update
- *     specifically sets `state.replayedPaused`; the next NORMAL (non
- *     -continue) prompt sent on that session consumes fx's checkpoint
- *     (fx closes the interrupted turn the moment an ordinary prompt runs),
- *     so `runFxTurn` emits a `{state:"cleared"}` sentinel right before
- *     sending it — otherwise a stale Resume affordance could survive past
- *     a succeeded, unrelated follow-up turn.
+ *     state stays correct, and now carries the `replayed: true` marker), but
+ *     the terminal summary line does not — it already reached the
+ *     transcript on the run where the pause/recovery genuinely happened,
+ *     and re-firing it on every resume would spam a stale explanation into
+ *     each follow-up. **The instant `state.replaying` flips back to `false`
+ *     (both the success and the error/fallback exit of the `session/resume`
+ *     call), `state.lastRecoveryJson` is reset to `undefined`** — without
+ *     this, a live update arriving right after the replay window that
+ *     happens to be byte-identical to the last replayed payload (e.g. a
+ *     `continueRecovery` turn that immediately re-pauses at the same
+ *     attempt/message) would be silently deduped against the replay and
+ *     never reach the user at all: no sentinel, no summary line, no
+ *     `state.lastRecovery` set for the `refused` enrichment below. A
+ *     replayed `paused` update specifically also sets `state.replayedPaused`
+ *     — read once `session/prompt` has actually RESOLVED (see below), not
+ *     before it's sent.
  *   - **`continueRecovery` (fx ≥0.0.8) resumes a paused response without
  *     re-sending the prompt** — `FxLaunchOptions.continueRecovery: true`
  *     (requires `resumeSessionId`; checked in `runFxTurn` before any RPC
@@ -284,9 +297,47 @@ import {
  *     session does not support durable recovery", "Recovery continuation
  *     cannot include a new prompt") — surfaced verbatim via `RpcError
  *     .rawMessage`, the same treatment `-32600` credential failures get.
- *     A `refused` stop whose LIVE (non-replayed) recovery state is `paused`
- *     gets its status line enriched with the attempt count and "resumable"
- *     — see the stopReason switch in `runFxTurn`.
+ *     A `refused` stop whose LIVE (non-replayed) recovery state is a
+ *     Resume-actionable `paused` checkpoint (`fxRefusedStatusLine`, which
+ *     defers to the shared `isFxRecoveryResumable` predicate — the SAME one
+ *     every Resume affordance gates on, not a bespoke `state === "paused"`
+ *     check) gets its status line enriched with the attempt count and
+ *     "resumable" — see the stopReason switch in `runFxTurn`.
+ *   - **A NORMAL (non-`continueRecovery`) prompt on a session whose replay
+ *     carried a `paused` checkpoint emits the `{state:"cleared"}` sentinel
+ *     only AFTER `session/prompt` RESOLVES with a result (any stopReason),
+ *     right before the stopReason switch — never before the prompt is
+ *     sent.** This used to fire pre-send, on the theory that fx consumes the
+ *     checkpoint the instant an ordinary prompt runs regardless of how the
+ *     turn ends (still true) — but pre-send emission meant a transport
+ *     -level failure of the `session/prompt` RPC itself (`-32600`, a
+ *     timeout, the process dying) left the transcript's last recovery
+ *     sentinel reading `cleared` while the checkpoint actually SURVIVES in
+ *     fx (the prompt never ran), so every Resume affordance vanished for a
+ *     still-resumable pause. Now: every RpcError/timeout/death path on
+ *     `session/prompt` `return`s before reaching this point, so those paths
+ *     correctly emit nothing and leave `state.replayedPaused` untouched for
+ *     a future retry to still see.
+ *   - **`tool_call_update`'s held/denied error content is an ACP
+ *     `ToolCallContent[]` array on real fx — never `rawOutput`.**
+ *     Source-verified against fx 0.0.8's `src/acp/types.zig
+ *     writeToolCallUpdate`: a `tool_call_update` carries only `toolCallId`,
+ *     `status`, `content:[{"type":"content","content":{"type":"text","text":
+ *     "<held JSON string>"}}]`, and an optional `command_result` — there is
+ *     no `rawOutput` field on this update kind at all, ever. The held/denied
+ *     text itself is `{"error":{"type":"tool_review_held"|
+ *     "tool_permission_denied","reason":"review_unavailable", …}}` (see the
+ *     `tool_call_update` case's "Held-tool guidance" comment). `toolResultContent`
+ *     (which builds the REAL `tool_result` chunk's `content` field and is
+ *     unaffected by this) used to hand `fxToolReviewError` the whole content
+ *     ARRAY, which it rejected outright — so this guidance never fired
+ *     against real fx traffic. `fxToolReviewError` now walks the
+ *     `ToolCallContent[]` shape (via `acpTextContentValue`, which also
+ *     tolerates a bare `{type:"text",text}` block with no wrapper),
+ *     `JSON.parse`s each item's text, and returns the first parsed
+ *     `{error:{...}}` match — while still accepting a plain string or an
+ *     already-parsed object for robustness (pre-existing shapes, never
+ *     actually seen on the wire, but harmless to keep).
  *   - **Session ids are 12-char base64url as of 0.0.8** (`session_layout.zig`,
  *     down from 0.0.7's 50 characters) — 0.0.7's longer ids still validate
  *     and resume against a 0.0.8 binary, so a persisted `runs.fx_session_id`
@@ -516,12 +567,17 @@ interface FxSessionState {
   replaying?: boolean;
   /** Set when a `paused` recovery update arrives while `replaying` is true
    *  — i.e. `session/resume` replayed a paused checkpoint onto this run.
-   *  Read once, right before a NORMAL (non-`continueRecovery`) prompt is
-   *  sent: fx consumes the checkpoint the moment an ordinary prompt runs
-   *  (`prompt.zig` closes the interrupted turn), so `runFxTurn` emits a
-   *  `{state:"cleared"}` sentinel and resets this flag first — otherwise a
-   *  succeeded follow-up turn would still show a stale Resume affordance
-   *  from the replayed pause. */
+   *  Read once a NORMAL (non-`continueRecovery`) `session/prompt` call has
+   *  actually RESOLVED with a result (any stopReason) — never before it's
+   *  sent, and never on an RpcError/timeout/death path, all of which
+   *  `return` before reaching that point and so correctly leave this flag
+   *  untouched: fx consumes the checkpoint the moment an ordinary prompt
+   *  runs (`prompt.zig` closes the interrupted turn), so `runFxTurn` emits a
+   *  `{state:"cleared"}` sentinel and resets this flag right after the
+   *  prompt resolves — otherwise a succeeded follow-up turn would still show
+   *  a stale Resume affordance from the replayed pause, and (the bug this
+   *  timing fixes) a transport-level prompt failure would wrongly clear the
+   *  Resume affordance for a checkpoint that's actually still intact in fx. */
   replayedPaused?: boolean;
   /** The last NON-replayed recovery payload observed this turn (i.e. one
    *  that arrived live, not via `session/resume`'s history replay) — read by
@@ -1051,21 +1107,79 @@ function toolResultContent(update: Record<string, unknown>): unknown {
   return update;
 }
 
+/** Pull the JSON-text payload out of one ACP `ToolCallContent` array item —
+ *  the wire shape `content` actually carries for a `tool_call_update` (see
+ *  {@link fxToolReviewError}'s doc comment). Two variants observed/schema
+ *  -valid: the documented wrapper `{ type: "content", content: { type:
+ *  "text", text } }`, and a bare `{ type: "text", text }` block in case a
+ *  future fx build (or another ACP-speaking harness) omits the wrapper.
+ *  `undefined` for anything else — a `diff`/`terminal` item, an
+ *  `image`/`resource_link` inner block, or a malformed item. */
+function acpTextContentValue(item: unknown): string | undefined {
+  if (!item || typeof item !== "object") return undefined;
+  const obj = item as Record<string, unknown>;
+  if (obj.type === "content" && obj.content && typeof obj.content === "object" && !Array.isArray(obj.content)) {
+    const inner = obj.content as Record<string, unknown>;
+    return inner.type === "text" && typeof inner.text === "string" ? inner.text : undefined;
+  }
+  if (obj.type === "text" && typeof obj.text === "string") return obj.text;
+  return undefined;
+}
+
+/** `{error:{type,reason}}` out of an already-parsed plain object — shared by
+ *  every {@link fxToolReviewError} input shape (object, string, and each
+ *  array item's decoded text) so the "what counts as a review-held error
+ *  object" rule lives in exactly one place. */
+function fxToolReviewErrorFromObject(parsed: unknown): { type?: unknown; reason?: unknown } | undefined {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const err = (parsed as Record<string, unknown>).error;
+  if (!err || typeof err !== "object" || Array.isArray(err)) return undefined;
+  return err as { type?: unknown; reason?: unknown };
+}
+
 /**
  * Best-effort detection of fx's review-held/permission-denied error shape
  * inside a completed-or-failed tool call's result content — see the
- * `tool_call_update` case's "Held-tool guidance" comment for the wire shape
- * and why this exists. `content` is whatever {@link toolResultContent}
- * produced for the paired `tool_result` chunk: usually a plain string (fx's
- * `toolUpdateContentText` serializes the error object to JSON text for the
- * model), but this also tolerates an already-parsed plain object in case a
- * future fx build stops stringifying it. Never throws — a non-string,
- * non-object `content`, a string that isn't valid JSON, or a parsed value
- * with no `error` object all yield `undefined`, which the caller reads the
- * same as "not a review-held error" rather than a `type`/`reason` it has to
- * separately null-check.
+ * `tool_call_update` case's "Held-tool guidance" comment for why this
+ * exists. `content` is whatever {@link toolResultContent} produced for the
+ * paired `tool_result` chunk, and its real wire shape (source-verified
+ * against fx 0.0.8's `src/acp/types.zig writeToolCallUpdate` — there is no
+ * `rawOutput` on a `tool_call_update` at all, ever) is an ACP
+ * `ToolCallContent[]` array: `[{ type: "content", content: { type: "text",
+ * text: "<held JSON string>" } }]`, where the held/denied text is
+ * `{"error":{"type":"tool_review_held"|"tool_permission_denied",
+ * "reason":"review_unavailable", …}}`. This function walks that array (via
+ * {@link acpTextContentValue}, which also tolerates a bare `{type:"text",
+ * text}` block with no wrapper), `JSON.parse`s each item's text, and returns
+ * the first parsed `{error:{...}}` match. It also still accepts a plain
+ * string (fx's error JSON with no ACP envelope around it at all, in case a
+ * future/alternate fx build stringifies directly) and an already-parsed
+ * plain object (e.g. via `rawOutput`, which this driver's own
+ * `toolResultContent` prefers when present) — both pre-existing shapes this
+ * driver has tolerated from the start, kept for robustness even though real
+ * fx 0.0.8 traffic only ever takes the array path. Never throws — a
+ * non-array/non-string/non-object `content`, an array with no text item that
+ * parses to `{error:{...}}`, a string that isn't valid JSON, or a parsed
+ * value with no `error` object all yield `undefined`, which the caller reads
+ * the same as "not a review-held error" rather than a `type`/`reason` it has
+ * to separately null-check.
  */
 function fxToolReviewError(content: unknown): { type?: unknown; reason?: unknown } | undefined {
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      const text = acpTextContentValue(item);
+      if (text === undefined) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        continue;
+      }
+      const err = fxToolReviewErrorFromObject(parsed);
+      if (err) return err;
+    }
+    return undefined;
+  }
   let parsed: unknown = content;
   if (typeof content === "string") {
     try {
@@ -1074,10 +1188,7 @@ function fxToolReviewError(content: unknown): { type?: unknown; reason?: unknown
       return undefined;
     }
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-  const err = (parsed as Record<string, unknown>).error;
-  if (!err || typeof err !== "object" || Array.isArray(err)) return undefined;
-  return err as { type?: unknown; reason?: unknown };
+  return fxToolReviewErrorFromObject(parsed);
 }
 
 /** One `file://` `resource_link` content block found in a completed tool
@@ -1530,12 +1641,29 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
       // nothing at all, not even a repeated sentinel.
       const recovery = parseFxRecoveryMeta(update);
       if (recovery != null) {
+        // Dedupe key is computed from the PLAIN payload — never including
+        // the `replayed` marker below — so a live payload that happens to
+        // be byte-identical to the last replayed one still dedupes/resets
+        // exactly per finding #2 (reset at replay close) rather than being
+        // treated as distinct merely because one carries the marker and the
+        // other doesn't.
         const recoveryJson = JSON.stringify(recovery);
         if (recoveryJson !== ctx.lastRecoveryJson) {
           ctx.lastRecoveryJson = recoveryJson;
+          // Finding #8: while replaying (`session/resume` replaying prior
+          // history onto a NEW run — see below), stamp the EMITTED sentinel
+          // body with `replayed: true` so downstream progress renderers
+          // (RunPanel's live notice, `agetor logs`, the TUI) can tell a
+          // replayed "attempt N/M" from a live one — replayed history is
+          // persisted onto this run's own event stream, so without a marker
+          // it would read as fresh progress. A live (non-replayed) sentinel
+          // carries no such field at all (not even `replayed: false`).
+          const emittedPayload: FxRecoveryPayload & { replayed?: boolean } = ctx.replaying
+            ? { ...recovery, replayed: true }
+            : recovery;
           chunks.push({
             stream: "status",
-            data: FX_RECOVERY_STATUS_PREFIX + recoveryJson,
+            data: FX_RECOVERY_STATUS_PREFIX + JSON.stringify(emittedPayload),
             lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`,
           });
           if (ctx.replaying) {
@@ -1962,10 +2090,19 @@ async function runFxTurn(
         "session/resume",
       );
       state.replaying = false;
+      // Reset the dedupe key the replay window just seeded — see finding #2
+      // ("replay-seeded dedupe can swallow the first live payload of a
+      // resumed turn") in the file header's recovery-channel facts. Without
+      // this, a live update right after replay that happens to be
+      // byte-identical to the last replayed one (e.g. a continueRecovery
+      // turn that immediately re-pauses at the same attempt/message) would
+      // be silently deduped against the replay and never reach the user.
+      state.lastRecoveryJson = undefined;
       maybeEmitProvider(resumeResult);
       resumed = true;
     } catch (err) {
       state.replaying = false;
+      state.lastRecoveryJson = undefined;
       if (isTimeoutError(err)) {
         failTurn(state, describeHandshakeFailure(err, "session/resume", RPC_HANDSHAKE_TIMEOUT_MS));
         return;
@@ -2045,24 +2182,6 @@ async function runFxTurn(
     }
   }
 
-  // A NORMAL (non-continue) prompt about to run on a session whose replay
-  // just carried a `paused` recovery checkpoint consumes that checkpoint —
-  // fx closes the interrupted turn the moment an ordinary prompt runs (see
-  // the file header). Emit the `{state:"cleared"}` sentinel BEFORE sending
-  // the prompt so a stale Resume affordance can't survive past this point
-  // even if this turn itself never reaches the stopReason switch below
-  // (e.g. it dies mid-flight) — and reset the two fields that fed it so a
-  // later replay in the SAME process (there isn't one today, but nothing
-  // here relies on that) can't re-trigger this branch a second time.
-  if (!opts.continueRecovery && state.replayedPaused) {
-    const cleared: FxRecoveryPayload = { state: "cleared" };
-    const clearedJson = JSON.stringify(cleared);
-    emit(state, "status", FX_RECOVERY_STATUS_PREFIX + clearedJson, `fx:${state.runId}:${state.seq++}`);
-    state.lastRecoveryJson = clearedJson;
-    state.lastRecovery = undefined;
-    state.replayedPaused = false;
-  }
-
   // 3. session/prompt — the ONLY turn-completion signal; no timeout. A
   // continue-recovery turn sends fx's documented `_meta.fx.continueRecovery`
   // shape instead of a normal text prompt: an EMPTY `prompt` array (fx
@@ -2100,6 +2219,32 @@ async function runFxTurn(
     return;
   }
   if (state.resolved) return; // cancel/death already settled us
+
+  // A NORMAL (non-continue) prompt just RAN on a session whose replay
+  // carried a `paused` recovery checkpoint — fx consumes that checkpoint the
+  // moment an ordinary prompt runs (see the file header), so by now it's
+  // genuinely gone regardless of this turn's own outcome. Emit the
+  // `{state:"cleared"}` sentinel here, only once `session/prompt` has
+  // actually RESOLVED with a result (any stopReason) — not before sending it
+  // (see finding #4 in the file header: emitting it pre-send made the
+  // transcript's last sentinel read "cleared" even when the RPC itself then
+  // failed at the transport/credential level, e.g. `-32600`/timeout/process
+  // death, which leaves the checkpoint intact in fx while every Resume
+  // affordance had already vanished from agetor) — and before the
+  // stopReason switch below, so it lands regardless of how the turn ended.
+  // The RpcError/timeout/death paths above all `return` before reaching
+  // here, so they correctly emit nothing and leave `replayedPaused` as-is.
+  // Reset the two fields that fed it so a later replay in the SAME process
+  // (there isn't one today, but nothing here relies on that) can't
+  // re-trigger this branch a second time.
+  if (!opts.continueRecovery && state.replayedPaused) {
+    const cleared: FxRecoveryPayload = { state: "cleared" };
+    const clearedJson = JSON.stringify(cleared);
+    emit(state, "status", FX_RECOVERY_STATUS_PREFIX + clearedJson, `fx:${state.runId}:${state.seq++}`);
+    state.lastRecoveryJson = clearedJson;
+    state.lastRecovery = undefined;
+    state.replayedPaused = false;
+  }
 
   // fx ≥0.0.8's `usage` object on the prompt result — the `turn` half of
   // the shared `FX_USAGE_STATUS_PREFIX` sentinel (see the file header).
@@ -2148,19 +2293,9 @@ async function runFxTurn(
       // (non-replayed) recovery update this turn (see the
       // `session_info_update` case in `mapFxUpdate`), so this only enriches
       // when THIS run is the one that actually paused, never a resumed
-      // follow-up merely replaying an old checkpoint. The attempt fraction
-      // is omitted entirely when either number is unknown, rather than
-      // printing a partial "N/undefined".
-      const recovery = state.lastRecovery;
-      let message = `fx turn ended: ${stopReason}`;
-      if (recovery?.state === "paused") {
-        const fraction =
-          typeof recovery.attempt === "number" && typeof recovery.attemptLimit === "number"
-            ? ` after ${recovery.attempt}/${recovery.attemptLimit} attempts`
-            : "";
-        message = `fx turn ended: ${stopReason} (response paused${fraction} — resumable)`;
-      }
-      emit(state, "status", message);
+      // follow-up merely replaying an old checkpoint. See
+      // `fxRefusedStatusLine` for the resumability check itself.
+      emit(state, "status", fxRefusedStatusLine(stopReason, state.lastRecovery));
       settleFx(state, 1);
       return;
     }
@@ -2168,6 +2303,31 @@ async function runFxTurn(
       emit(state, "status", `fx turn ended with unexpected stopReason: ${stopReason}`);
       settleFx(state, 1);
   }
+}
+
+/**
+ * The plain "fx turn ended: `<stopReason>`" status line emitted for a
+ * `refused`/`refusal` stop, enriched with the attempt count and a
+ * "resumable" note exactly when `recovery` is a paused checkpoint the
+ * Resume affordance can actually act on — i.e. {@link isFxRecoveryResumable}
+ * (`state === "paused"` AND `requiredAction` absent or `continue_later`),
+ * the SAME predicate every Resume affordance (RunPanel's paused notice, the
+ * CLI, the TUI) already gates on. Finding #3 in the file header: this used
+ * to check `recovery?.state === "paused"` alone, which could enrich a
+ * status line with "— resumable" for a pause Resume can't actually act on
+ * (e.g. `requiredAction: "inspect_uncertain_tool"`, which needs a human
+ * decision). Exported and pure so it's unit-testable without spawning a
+ * fake ACP server; the only caller is the stopReason switch in `runFxTurn`.
+ * The attempt fraction is omitted entirely when either number is unknown,
+ * rather than printing a partial "N/undefined".
+ */
+export function fxRefusedStatusLine(stopReason: string, recovery: FxRecoveryPayload | undefined): string {
+  if (!isFxRecoveryResumable(recovery)) return `fx turn ended: ${stopReason}`;
+  const fraction =
+    typeof recovery!.attempt === "number" && typeof recovery!.attemptLimit === "number"
+      ? ` after ${recovery!.attempt}/${recovery!.attemptLimit} attempts`
+      : "";
+  return `fx turn ended: ${stopReason} (response paused${fraction} — resumable)`;
 }
 
 function isTimeoutError(err: unknown): boolean {

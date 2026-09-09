@@ -176,6 +176,15 @@ export interface FxRecoveryPayload {
   /** fx's own human-readable label, verbatim, e.g. "⚠ Rate limited · HTTP
    *  429 · rate_limit_exceeded: … · retrying request in 8s · attempt 5/10". */
   message?: string;
+  /** Stamped by fx-acp.ts (never by fx — it is not a wire field) on every
+   *  sentinel emitted while `session/resume` was replaying the prior turn's
+   *  history onto the NEW run. Progress renderers (RunPanel's live notice,
+   *  `agetor logs`, the TUI) skip replayed entries so a stale "attempt 10/10"
+   *  never reads as live; `latestFxRecoveryByRun`/`isFxRecoveryResumable`
+   *  deliberately still honor a replayed `paused` (a resume run that died
+   *  before continuing leaves fx's checkpoint intact, so Resume stays
+   *  offered). Absent on live sentinels and on every pre-existing row. */
+  replayed?: boolean;
 }
 
 /**

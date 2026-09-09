@@ -117,9 +117,14 @@ function shouldSkipEvent(e: RunEvent): boolean {
  * (`paused`/`recovered`/`cleared`) — or a body that fails to parse — prints
  * NOTHING here: the driver already emits a separate, persisted PLAIN status
  * line at those terminal transitions (`fxRecoverySummaryLine`, see
- * fx-acp.ts), and rendering this sentinel too would double it. Any other
- * event falls through to the pre-existing `shouldSkipEvent` skip +
- * `formatEvent` render, unchanged.
+ * fx-acp.ts), and rendering this sentinel too would double it. A payload
+ * with `replayed === true` also prints NOTHING regardless of `state`: on
+ * `session/resume` fx replays the prior turn's recovery updates (including
+ * a terminal `active` one) onto the NEW run, and the driver stamps every
+ * replayed sentinel with `replayed: true` — printing that progress line
+ * again would read as live retry activity happening on a run that in fact
+ * hasn't made a single new attempt yet. Any other event falls through to
+ * the pre-existing `shouldSkipEvent` skip + `formatEvent` render, unchanged.
  */
 function createLineRenderer(
   formatEvent: (e: RunEvent) => string,
@@ -129,7 +134,9 @@ function createLineRenderer(
     if (json) return JSON.stringify(e);
     if (e.stream === "status" && e.data.startsWith(FX_RECOVERY_STATUS_PREFIX)) {
       const payload = parseFxRecoveryPayload(e.data.slice(FX_RECOVERY_STATUS_PREFIX.length));
-      return payload?.state === "active" ? c.yellow(fxRecoveryNoticeText(payload)) : null;
+      return payload && payload.state === "active" && !payload.replayed
+        ? c.yellow(fxRecoveryNoticeText(payload))
+        : null;
     }
     if (shouldSkipEvent(e)) return null;
     return formatEvent(e);

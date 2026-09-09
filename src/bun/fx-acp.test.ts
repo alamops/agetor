@@ -21,6 +21,7 @@ import {
 } from "./fx-acp.ts";
 import {
   FX_PROVIDER_STATUS_PREFIX,
+  FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
@@ -166,6 +167,16 @@ const FAKE_ACP_SERVER_SRC = [
   '    ok(id, { configOptions: [{ id: "provider", currentValue: "gateway", options: ["gateway", "codex", "grok"] }] });',
   "    return;",
   "  }",
+  '  if (scenario === "resume-replays-paused" || scenario === "resume-replays-paused-prompt-fails" || scenario === "resume-continue-repause") {',
+  "    // fx replays the session's prior history — including a still-paused",
+  "    // recovery checkpoint — onto the NEW run BEFORE the resume response",
+  "    // itself resolves (TT3 scenario 5; also shared by the finding #4",
+  "    // prompt-error variant and the finding #2 dedupe-reset scenario, both",
+  "    // of which need the identical replay to set up their own case).",
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "paused", kind: "terminal_provider_error", cause: "rate_limited", action: "paused", requiredAction: "continue_later", attempt: 10, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts" } } } } });',
+  "    ok(id, {});",
+  "    return;",
+  "  }",
   "  ok(id, {});",
   "}",
   "",
@@ -193,7 +204,7 @@ const FAKE_ACP_SERVER_SRC = [
   "function handlePrompt(id, params) {",
   "  promptId = id;",
   '  capture("session/prompt", params);',
-  '  if (scenario === "happy" || scenario === "resume" || scenario === "resume-fallback") {',
+  '  if (scenario === "happy" || scenario === "resume" || scenario === "resume-fallback" || scenario === "resume-replays-paused") {',
   "    streamHappyUpdates();",
   '    endTurn(id, 20, "end_turn");',
   "    return;",
@@ -400,6 +411,55 @@ const FAKE_ACP_SERVER_SRC = [
   '    endTurn(id, 15, "end_turn");',
   "    return;",
   "  }",
+  '  if (scenario === "recovery") {',
+  "    // TT3 scenario 1: 429 storm — two updates for attempt 1 (with/without",
+  "    // delaySeconds, mirroring fx's real per-attempt double-send), attempt",
+  "    // 2, then a terminal paused update, then a refused stopReason with an",
+  '    // empty usage object (fx\'s real shape on a refused turn).',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "active", kind: "auto_retry", cause: "rate_limited", action: "retrying_request", attempt: 1, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · retrying request · attempt 1/10" } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "active", kind: "auto_retry", cause: "rate_limited", action: "retrying_request", attempt: 1, attemptLimit: 10, delaySeconds: 1, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · retrying request in 1s · attempt 1/10" } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "active", kind: "auto_retry", cause: "rate_limited", action: "retrying_request", attempt: 2, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · retrying request · attempt 2/10" } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "paused", kind: "terminal_provider_error", cause: "rate_limited", action: "paused", requiredAction: "continue_later", attempt: 10, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts" } } } } });',
+  '    endTurnWithUsage(id, 15, "refused", {});',
+  "    return;",
+  "  }",
+  '  if (scenario === "continue") {',
+  "    // TT3 scenario 2: continueRecovery turn — fx resumes the paused",
+  "    // checkpoint and it succeeds on the first attempt.",
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "recovered", kind: "auto_recovered", attempt: 1, attemptLimit: 10, durable: true, message: "✓ recovered · succeeded on attempt 1/10" } } } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "continue-rejected") {',
+  "    // TT3 scenario 3: fx's own -32602 validation error for a second",
+  "    // continue against an already-consumed checkpoint.",
+  '    fail(id, -32602, "No paused model response to continue");',
+  "    return;",
+  "  }",
+  '  if (scenario === "prompt-invalid-params") {',
+  "    // TT3 scenario 6: a normal (non-continueRecovery) -32602 must NOT get",
+  "    // the continueRecovery-only verbatim treatment — still wrapped.",
+  '    fail(id, -32602, "Invalid params (fake, no continueRecovery carve-out)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-replays-paused-prompt-fails") {',
+  "    // Finding #4 regression: the NORMAL prompt that would otherwise",
+  "    // consume the replayed checkpoint fails at the transport level",
+  "    // instead of resolving — the cleared sentinel must NOT fire, since",
+  "    // fx never actually got to run the prompt that clears its checkpoint.",
+  '    fail(id, -32602, "Invalid params (fake, replayed-paused prompt error)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-continue-repause") {',
+  "    // Finding #2 regression: the continueRecovery turn immediately",
+  "    // re-pauses with a payload BYTE-IDENTICAL to the one just replayed",
+  "    // by session/resume above — without resetting the dedupe key at the",
+  "    // close of the replay window, this live update would be silently",
+  "    // swallowed as a duplicate of the replay.",
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "paused", kind: "terminal_provider_error", cause: "rate_limited", action: "paused", requiredAction: "continue_later", attempt: 10, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts" } } } } });',
+  '    endTurnWithUsage(id, 15, "refused", {});',
+  "    return;",
+  "  }",
   '  if (scenario === "stall-for-drop") {',
   "    return;",
   "  }",
@@ -529,7 +589,7 @@ function readCaptured(captureFile: string): Array<{ label: string; msg: unknown 
 
 function spawnFake(
   scenario: string,
-  opts: { mode?: FxMode; resumeSessionId?: string; env?: Record<string, string> } = {},
+  opts: { mode?: FxMode; resumeSessionId?: string; env?: Record<string, string>; continueRecovery?: boolean } = {},
 ) {
   const chunks: Chunk[] = [];
   const onChunk: FxLaunchOptions["onChunk"] = (stream, data, lineUuid) => chunks.push({ stream, data, lineUuid });
@@ -547,6 +607,7 @@ function spawnFake(
     promptText: "hello fx",
     mode: opts.mode ?? "auto",
     resumeSessionId: opts.resumeSessionId,
+    continueRecovery: opts.continueRecovery,
     onChunk,
     onSessionId: (id) => sessionIds.push(id),
   });
@@ -1696,4 +1757,310 @@ describe("signal handlers", () => {
     expect(process.listenerCount("SIGTERM")).toBeGreaterThanOrEqual(1);
     expect(process.listenerCount("SIGHUP")).toBeGreaterThanOrEqual(1);
   });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 14. Model-response-recovery channel (`_meta.fx.modelResponseRecovery`) —
+ *     docs/plans/fix-fx-harness-rate-limit.md TT3.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("recovery storm → paused → refused (scenario 1)", () => {
+  test(
+    "emits one FX_RECOVERY_STATUS_PREFIX sentinel per distinct payload (4, no dupes), exactly one paused summary line, and an enriched refused status; done=1",
+    async () => {
+      const { agent, chunks } = spawnFake("recovery");
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const payloads = recoveryChunks.map(
+        (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as Record<string, unknown>,
+      );
+      // Exactly one sentinel per distinct payload — the two attempt-1
+      // updates differ only by delaySeconds, so both emit (not deduped).
+      expect(payloads.map((p) => [p.state, p.attempt, p.delaySeconds ?? null])).toEqual([
+        ["active", 1, null],
+        ["active", 1, 1],
+        ["active", 2, null],
+        ["paused", 10, null],
+      ]);
+      expect(new Set(recoveryChunks.map((c) => c.data)).size).toBe(recoveryChunks.length);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      const summaryLines = statusChunks.filter((c) => c.data.includes("resume once the limit clears"));
+      expect(summaryLines).toHaveLength(1);
+      expect(summaryLines[0]!.data).toBe(
+        "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts"
+          + " — resume once the limit clears, or send a new message.",
+      );
+
+      expect(
+        statusChunks.some(
+          (c) => c.data === "fx turn ended: refused (response paused after 10/10 attempts — resumable)",
+        ),
+      ).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("continueRecovery — resumes a paused checkpoint without a new prompt (scenario 2)", () => {
+  test(
+    "sends session/prompt with an empty prompt array and continueRecovery:true (no text block); recovered sentinel + its plain summary; no cleared sentinel; done=0",
+    async () => {
+      const resumeId = "resume-continue-1";
+      const { agent, chunks, captureFile } = spawnFake("continue", {
+        resumeSessionId: resumeId,
+        continueRecovery: true,
+      });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const entries = readCaptured(captureFile);
+      const promptReq = entries.find((e) => e.label === "session/prompt");
+      expect(promptReq).toBeDefined();
+      // Exact captured session/prompt params for the continue turn — no
+      // `text` content block, matching fx's documented continueRecovery
+      // shape verbatim.
+      expect(promptReq!.msg).toEqual({
+        sessionId: resumeId,
+        prompt: [],
+        _meta: { fx: { continueRecovery: true } },
+      });
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      expect(recoveryChunks).toHaveLength(1);
+      const payload = JSON.parse(recoveryChunks[0]!.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string };
+      expect(payload.state).toBe("recovered");
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks.some((c) => c.data === "✓ recovered · succeeded on attempt 1/10")).toBe(true);
+
+      // No `{"state":"cleared"}` sentinel — this run's session/resume never
+      // replayed a paused checkpoint (a plain `ok(id, {})`, no recovery
+      // -shaped session/update during the resume window), so the
+      // pre-prompt "consume the checkpoint" branch has nothing to clear.
+      const clearedJson = `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify({ state: "cleared" })}`;
+      expect(chunks.some((c) => c.data === clearedJson)).toBe(false);
+    },
+    10_000,
+  );
+});
+
+describe("continueRecovery rejected by fx (-32602) (scenario 3)", () => {
+  test("surfaces fx's exact message verbatim — no 'fx acp: session/prompt failed:' wrapper, no '(code -32602)' suffix", async () => {
+    const resumeId = "resume-continue-rejected-1";
+    const { agent, chunks } = spawnFake("continue-rejected", { resumeSessionId: resumeId, continueRecovery: true });
+    const code = await agent.done;
+    expect(code).toBe(1);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks).toHaveLength(1);
+    expect(statusChunks[0]!.data).toBe("No paused model response to continue");
+  }, 10_000);
+});
+
+describe("continueRecovery without a prior session id (scenario 4)", () => {
+  test(
+    "fails immediately with a dedicated status message, before any RPC traffic — the fake server dispatches no session/resume|load|prompt call",
+    async () => {
+      // The scenario name is irrelevant here: runFxTurn's continueRecovery
+      // guard runs before the process ever writes a single JSON-RPC message
+      // to the child's stdin, so no scenario branch is ever reached.
+      const { agent, chunks, captureFile } = spawnFake("happy", { continueRecovery: true });
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks).toHaveLength(1);
+      expect(statusChunks[0]!.data).toBe("fx acp: continueRecovery requires a prior session id");
+
+      // The fake's `handleInitialize` never calls `capture(...)` (only
+      // resume/load/prompt/reply/sigterm do), so "the fake server never
+      // received `initialize`" isn't independently observable through this
+      // harness. What IS observable, and asserted here: no RPC method that
+      // DOES capture itself (session/resume, session/load, session/prompt,
+      // a reply to a server-initiated request) ever appears — proving the
+      // driver never got far enough to send a prompt or handshake. (A
+      // "sigterm" capture line is NOT waited on here — settleFx's killProc
+      // fires within milliseconds of spawn, frequently before the freshly
+      // -spawned child has finished loading this script and installed its
+      // own SIGTERM handler, so the OS's default SIGTERM-terminates
+      // behavior can win the race and no "sigterm" line is ever written;
+      // that race is a fake-harness artifact of this specific fast-fail
+      // scenario, not something the driver's behavior depends on.)
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => ["session/resume", "session/load", "session/prompt", "reply"].includes(e.label))).toBe(
+        false,
+      );
+    },
+    10_000,
+  );
+});
+
+describe("session/resume replays a paused checkpoint onto a NEW run (scenario 5)", () => {
+  test(
+    "the replayed paused sentinel carries replayed:true and its terminal summary line is suppressed; a NORMAL follow-up prompt emits a `cleared` sentinel — but only AFTER session/prompt resolves, so it lands after the turn's own content chunks, not before the RPC is sent (finding #4)",
+    async () => {
+      const resumeId = "resume-replays-paused-1";
+      const { agent, chunks, captureFile } = spawnFake("resume-replays-paused", { resumeSessionId: resumeId });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const payloads = recoveryChunks.map(
+        (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string; replayed?: boolean },
+      );
+      // The replayed paused sentinel, then the cleared sentinel emitted
+      // once the subsequent normal prompt has resolved.
+      expect(payloads.map((p) => p.state)).toEqual(["paused", "cleared"]);
+      // Finding #8: the replayed sentinel is marked; the cleared one (a
+      // LIVE, driver-synthesized event, not replayed history) is not.
+      expect(payloads[0]!.replayed).toBe(true);
+      expect(payloads[1]!.replayed).toBeUndefined();
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      // The paused terminal-summary PLAIN line must NOT reappear — it
+      // already reached the transcript on the run where the pause genuinely
+      // happened; a resume replay must not re-fire it.
+      expect(statusChunks.some((c) => c.data.includes("resume once the limit clears"))).toBe(false);
+
+      // The turn proceeded normally afterwards (the fake's shared "happy"
+      // response stream).
+      const assistantIndex = chunks.findIndex((c) => c.stream === "assistant" && c.data === "Hello world");
+      expect(assistantIndex).toBeGreaterThanOrEqual(0);
+
+      // Finding #4, directly observable now (previously the cleared
+      // sentinel fired BEFORE session/prompt was even sent, so it always
+      // preceded the turn's content by construction): the cleared sentinel
+      // is emitted only once session/prompt RESOLVES with a result — i.e.
+      // strictly AFTER every content chunk the fake streamed during that
+      // same prompt call, since those arrive as notifications on the wire
+      // before the RPC's own response line.
+      const clearedIndex = chunks.findIndex(
+        (c) => c.stream === "status" && c.data === FX_RECOVERY_STATUS_PREFIX + JSON.stringify({ state: "cleared" }),
+      );
+      expect(clearedIndex).toBeGreaterThan(assistantIndex);
+      // ...and it's the LAST recovery sentinel for the turn.
+      expect(recoveryChunks[recoveryChunks.length - 1]).toBe(chunks[clearedIndex]);
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "a NORMAL prompt after a replayed paused that fails with a -32602 (or any transport-level) prompt error emits NO cleared sentinel — the checkpoint is still intact in fx, so the Resume affordance must not vanish (finding #4)",
+    async () => {
+      const resumeId = "resume-replays-paused-prompt-fails-1";
+      const { agent, chunks, captureFile } = spawnFake("resume-replays-paused-prompt-fails", {
+        resumeSessionId: resumeId,
+      });
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const payloads = recoveryChunks.map(
+        (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string; replayed?: boolean },
+      );
+      // Only the replayed paused sentinel — no cleared sentinel, because the
+      // prompt call itself never resolved with a result.
+      expect(payloads.map((p) => p.state)).toEqual(["paused"]);
+      expect(payloads[0]!.replayed).toBe(true);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(
+        statusChunks.some(
+          (c) => c.data === FX_RECOVERY_STATUS_PREFIX + JSON.stringify({ state: "cleared" }),
+        ),
+      ).toBe(false);
+      // fx's own -32602 text surfaces verbatim (existing wrapper behavior
+      // for a normal, non-continueRecovery turn — see scenario 6 above).
+      expect(
+        statusChunks.some(
+          (c) => c.data === "fx acp: session/prompt failed: Invalid params (fake, replayed-paused prompt error) (code -32602)",
+        ),
+      ).toBe(true);
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("replay-seeded dedupe reset (finding #2): a live re-pause right after the replay window is not swallowed by the replayed one", () => {
+  test(
+    "session/resume replays a paused checkpoint, then the continueRecovery prompt immediately pushes a byte-identical LIVE paused update and answers refused — the live update still emits its own sentinel, summary line, and enriched refused status (not deduped against the replay)",
+    async () => {
+      const resumeId = "resume-continue-repause-1";
+      const { agent, chunks } = spawnFake("resume-continue-repause", {
+        resumeSessionId: resumeId,
+        continueRecovery: true,
+      });
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const payloads = recoveryChunks.map(
+        (c) =>
+          JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as {
+            state: string;
+            attempt?: number;
+            replayed?: boolean;
+          },
+      );
+      // Two DISTINCT-by-source sentinels, both "paused", byte-identical
+      // apart from the replay marker — without the dedupe-key reset at
+      // replay close, the second (live) one would have been silently
+      // swallowed and this array would have length 1.
+      expect(payloads).toHaveLength(2);
+      expect(payloads.every((p) => p.state === "paused" && p.attempt === 10)).toBe(true);
+      expect(payloads[0]!.replayed).toBe(true); // the replayed checkpoint
+      expect(payloads[1]!.replayed).toBeUndefined(); // the LIVE re-pause
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      // Exactly one persisted "resume once the limit clears" summary line —
+      // from the LIVE update only (replay summary lines stay suppressed).
+      const summaryLines = statusChunks.filter((c) => c.data.includes("resume once the limit clears"));
+      expect(summaryLines).toHaveLength(1);
+
+      // The enriched refused status line — proves ctx.lastRecovery got set
+      // from the LIVE paused update (not left stale/undefined by the
+      // dedupe bug), so `fxRefusedStatusLine` had a payload to enrich with.
+      expect(
+        statusChunks.some(
+          (c) => c.data === "fx turn ended: refused (response paused after 10/10 attempts — resumable)",
+        ),
+      ).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("session/prompt -32602 without continueRecovery keeps the existing wrapper (scenario 6)", () => {
+  test("wraps the message as 'fx acp: session/prompt failed: ...' — the continueRecovery-only verbatim carve-out doesn't apply to a normal turn", async () => {
+    const { agent, chunks } = spawnFake("prompt-invalid-params");
+    const code = await agent.done;
+    expect(code).toBe(1);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks).toHaveLength(1);
+    expect(statusChunks[0]!.data).toBe(
+      "fx acp: session/prompt failed: Invalid params (fake, no continueRecovery carve-out) (code -32602)",
+    );
+  }, 10_000);
 });

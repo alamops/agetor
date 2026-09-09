@@ -3286,7 +3286,15 @@ async function sendFxTurn(taskId: string, line: string): Promise<string | null> 
     emit({ runId, taskId, stream: "user", data, ts: Date.now() });
     return runId;
   }
-  return spawnFxRun(task, taskId, { line });
+  // `spawnFxRun` now returns `{ runId, spawned, error? }` (Phase 8 review
+  // #10) so `resumeFxRecovery` can tell a real spawn from a run row that's
+  // already `failed`; a follow-up send has no separate "spawn failed" status
+  // to report through — the failure is already visible on the run row and
+  // its `stderr`/status chunks, same as before this change — so this caller
+  // keeps returning the bare run id string, mapping `null` (already
+  // starting) through unchanged.
+  const result = await spawnFxRun(task, taskId, { line });
+  return result ? result.runId : null;
 }
 
 /**
@@ -3315,8 +3323,26 @@ type FxTurn = { line: string } | { continueRecovery: true };
  * `continueRecovery`; fx-acp.ts sends an empty `prompt` content array
  * downstream when `continueRecovery` is set, per ACP's continue-recovery
  * shape), and `opts.continueRecovery`.
+ *
+ * Return shape (Phase 8 review #10 fix): `null` still means "declined to
+ * mint a run because `startingTaskIds` was already claimed for this task" —
+ * the pre-existing "already starting" signal every caller already checks
+ * for. Every OTHER path now returns `{ runId, spawned, error? }` instead of
+ * a bare `runId` string, because the two failure branches below (missing
+ * harness; `spawnAgentOrFail` throw) used to return the SAME `newRunId` a
+ * successful spawn does, even though the run row they just wrote is already
+ * `failed` and no agent process is running. `resumeFxRecovery` used to take
+ * that truthy `runId` at face value and report `{ ok: true, runId }` for a
+ * resume that never started — see that function's doc for the HTTP-layer
+ * fallout. `spawned: false` carries a human-readable `error` (the harness
+ * text, or `spawnAgentOrFail`'s own `message`) so callers can surface real
+ * failure text instead of pretending the turn is running.
  */
-async function spawnFxRun(task: Task, taskId: string, turn: FxTurn): Promise<string | null> {
+async function spawnFxRun(
+  task: Task,
+  taskId: string,
+  turn: FxTurn,
+): Promise<{ runId: string; spawned: boolean; error?: string } | null> {
   // Claim the unified "starting" slot before touching the DB — see
   // `startingTaskIds`'s doc (near `startTask`) and the matching comment in
   // `spawnCodexTurnNow` for the double-mint race this closes. `null` is
@@ -3371,13 +3397,14 @@ async function spawnFxRun(task: Task, taskId: string, turn: FxTurn): Promise<str
     }
 
     if (!harness) {
-      onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+      const error = `harness "${task.agent}" not found — cannot resume`;
+      onChunk("stderr", error);
       runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
       tasks.update(taskId, { column: "ready", runId: null });
-      return newRunId;
+      return { runId: newRunId, spawned: false, error };
     }
 
-    const { agent } = await spawnAgentOrFail({
+    const { agent, message } = await spawnAgentOrFail({
       taskId,
       runId: newRunId,
       harness,
@@ -3403,11 +3430,15 @@ async function spawnFxRun(task: Task, taskId: string, turn: FxTurn): Promise<str
       // drainFxQueue) never runs, so drop the queue rather than let queued
       // follow-ups resurface out of order on a later turn.
       fxTurnQueue.delete(taskId);
-      return newRunId;
+      return {
+        runId: newRunId,
+        spawned: false,
+        error: message || "fx could not be started — see the run's status line",
+      };
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
-    return newRunId;
+    return { runId: newRunId, spawned: true };
   } finally {
     startingTaskIds.delete(taskId);
   }
@@ -3469,10 +3500,29 @@ function findLastFxSessionId(taskId: string): string | null {
  * paused response"), then in-flight (nothing to gate against once a turn is
  * already running), then the run/sentinel/session-id lookups that actually
  * decide resumability.
+ *
+ * `spawnFxRun` can still fail AFTER all of the above passes (missing
+ * harness — effectively unreachable here since the `kind !== "fx"` check
+ * just above resolves the identical harness synchronously, with no `await`
+ * in between for it to vanish; or `spawnAgentOrFail` throwing, e.g. a
+ * transient spawn error) — Phase 8 review #10: that failure used to be
+ * invisible, because `spawnFxRun` returned the SAME truthy `runId` a real
+ * spawn does even on those branches, so this function reported `{ ok: true,
+ * runId }` for a resume that never started. The caller (`POST
+ * /tasks/:id/fx-resume`, `agetor resume`, the webview's Resume button) has
+ * no way to see the run row's own `failed` status the way a live run panel
+ * does, so a `spawned: false` result is now surfaced as a real HTTP failure
+ * (500 — the request was well-formed and passed every gate, but the server
+ * genuinely couldn't start the turn) rather than a false 200. The run row
+ * `spawnFxRun` already wrote (status `failed`, with the failure reason on
+ * its `stderr`/status chunks) is kept as-is — it's the durable record of
+ * the failed resume attempt, not rolled back or deleted here.
  */
 export async function resumeFxRecovery(
   taskId: string,
-): Promise<{ ok: true; runId: string } | { ok: false; status: 400 | 404 | 409; error: string }> {
+): Promise<
+  { ok: true; runId: string } | { ok: false; status: 400 | 404 | 409 | 500; error: string }
+> {
   const task = tasks.get(taskId);
   if (!task) return { ok: false, status: 404, error: "not found" };
   if (task.archivedAt != null) return { ok: false, status: 400, error: "task is archived" };
@@ -3502,11 +3552,18 @@ export async function resumeFxRecovery(
     return { ok: false, status: 400, error: "no fx session to resume" };
   }
 
-  const runId = await spawnFxRun(task, taskId, { continueRecovery: true });
-  if (runId === null) {
+  const result = await spawnFxRun(task, taskId, { continueRecovery: true });
+  if (result === null) {
     return { ok: false, status: 409, error: "a turn is already starting for this task" };
   }
-  return { ok: true, runId };
+  if (!result.spawned) {
+    return {
+      ok: false,
+      status: 500,
+      error: result.error ?? "fx could not be started — see the run's status line",
+    };
+  }
+  return { ok: true, runId: result.runId };
 }
 
 /**
@@ -5152,3 +5209,20 @@ export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus |
 
   return { dirty: dirty0, ahead: aheadResult ?? 0, merged, ignored: false };
 }
+
+/**
+ * Test-only escape hatch (mirrors the `__testing` convention already used in
+ * agent-status.ts / interactions.ts / model-discovery.ts / agent-discovery.ts).
+ * Exposes `spawnFxRun` directly so its "harness not found" failure branch
+ * (Phase 8 review #10 — `spawned: false`, see that function's doc) can be
+ * exercised deterministically. That branch is NOT reachable through
+ * `resumeFxRecovery` itself: `resumeFxRecovery`'s own `kind !== "fx"` gate
+ * resolves the identical harness synchronously, with no `await` in between
+ * for the harness row to vanish before `spawnFxRun` re-resolves it — so any
+ * call that gets past that gate is guaranteed a resolvable harness. Calling
+ * `spawnFxRun` directly with a task whose `agent` doesn't resolve sidesteps
+ * that gate and hits the branch under test. See
+ * orchestrator-fx.test.ts's "spawnFxRun / resumeFxRecovery: not-spawned
+ * mapping" tests.
+ */
+export const __testing = { spawnFxRun };

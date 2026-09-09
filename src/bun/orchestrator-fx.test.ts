@@ -502,6 +502,11 @@ test("reconcileTaskSession resets mode to fx's own modes[0] when switching INTO 
 
   const updated = tasks.get(before.id)!;
   expect(updated.mode).toBe(AGENT_OPTIONS.fx.modes[0]?.id ?? "auto");
+  // Explicit literal too (TT4, docs/plans/fix-fx-harness-rate-limit.md §3.7):
+  // the whole point of the mode reorder is that fx's modes[0] IS "yolo" —
+  // the dynamic assertion above would pass just as well against the old
+  // "auto"-first ordering, so it alone can't catch a regression there.
+  expect(updated.mode).toBe("yolo");
   expect(updated.model).toBeNull();
   expect(updated.effort).toBeNull();
 });
@@ -825,4 +830,452 @@ test("spawn-throw hardening (gemini): an oversized prompt hits spawnAgentOrFail'
   const task = tasks.get(taskId);
   expect(task?.column).toBe("ready");
   expect(task?.runId).toBeNull();
+});
+
+/* ── TT4: resumeFxRecovery + spawnFxRun (docs/plans/fix-fx-harness-rate-
+ * limit.md §3.5, "Shared spec") ──────────────────────────────────────────
+ *
+ * Uses the fake fx driver's "recovery" scenario (agents.ts's
+ * FAKE_FX_RECOVERY_PROMPT_MARKER branch, `continueRecovery` unset): three
+ * FX_RECOVERY_STATUS_PREFIX sentinels (attempt 1/3, 2/3, 3/3) at ~5/400/800ms,
+ * then a `paused` sentinel + its persisted summary line + the enriched
+ * "refused" line at ~1500ms, resolving the turn with exit code 1 (failed).
+ * `resumeFxRecovery` then drives the "continue" variant (`continueRecovery:
+ * true`): a `recovered` sentinel + summary line at ~5ms, then an ordinary
+ * short turn (thinking/assistant/usage/title) resolving exit code 0
+ * (succeeded) at ~10ms. */
+
+/** Poll `runs.get(runId)` until its status leaves "running" — the fake
+ *  storm's terminal chunk lands at ~1.5s and the "continue" scenario's at
+ *  ~15ms, so a fixed `settle()` window would either be too slow (storm) or
+ *  needlessly slow this whole file down (continue). */
+async function waitForRunSettled(runId: string, timeoutMs = 5000) {
+  const { runs } = await import("./db.ts");
+  const start = Date.now();
+  for (;;) {
+    const r = runs.get(runId);
+    if (r && r.status !== "running") return r;
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`timed out waiting for run ${runId} to settle (last status: ${r?.status ?? "missing"})`);
+    }
+    await settle(30);
+  }
+}
+
+test("AGENT_OPTIONS.fx.modes[0] is 'yolo' (Full access) — the fix-fx-harness-rate-limit mode reorder", async () => {
+  const { AGENT_OPTIONS } = await import("../shared/types.ts");
+  expect(AGENT_OPTIONS.fx.modes[0]?.id).toBe("yolo");
+});
+
+test("resumeFxRecovery: storm → paused → resume happy path — the resumed run carries the same fx session, its transcript shows the recovered turn with no user bubble, and a second resume after that is gated (latest run succeeded)", async () => {
+  const { createTask, startTask, resumeFxRecovery } = await import("./orchestrator.ts");
+  const { tasks, runs, harnesses } = await import("./db.ts");
+  const { FAKE_FX_RECOVERY_PROMPT_MARKER } = await import("./agents.ts");
+  const { FX_RECOVERY_STATUS_PREFIX } = await import("../shared/types.ts");
+  const { parseFxRecoveryPayload } = await import("../shared/fx-recovery.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx recovery storm",
+    prompt: `hit the gateway limit ${FAKE_FX_RECOVERY_PROMPT_MARKER}`,
+    agent: "fx",
+    mode: "yolo",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  const firstRunId = "runId" in started ? started.runId : "";
+
+  const firstRun = await waitForRunSettled(firstRunId, 5000);
+  expect(firstRun.status).toBe("failed");
+  expect(tasks.get(taskId)?.column).toBe("ready");
+
+  const firstEvents = runs.eventsForTask(taskId).filter((e) => e.runId === firstRunId);
+  const sentinelPayloads = firstEvents
+    .filter((e) => e.stream === "status" && e.data.startsWith(FX_RECOVERY_STATUS_PREFIX))
+    .map((e) => parseFxRecoveryPayload(e.data.slice(FX_RECOVERY_STATUS_PREFIX.length)));
+  // 3 "active" retry attempts + 1 terminal "paused" == 4.
+  expect(sentinelPayloads.length).toBeGreaterThanOrEqual(4);
+  expect(sentinelPayloads.at(-1)?.state).toBe("paused");
+
+  expect(
+    firstEvents.some(
+      (e) =>
+        e.stream === "status"
+        && !e.data.startsWith(FX_RECOVERY_STATUS_PREFIX)
+        && e.data.includes("recovery paused after 3/3 attempts")
+        && e.data.includes("resume once the limit clears, or send a new message."),
+    ),
+  ).toBe(true);
+  expect(
+    firstEvents.some(
+      (e) => e.stream === "status" && e.data === "fx turn ended: refused (response paused after 3/3 attempts — resumable)",
+    ),
+  ).toBe(true);
+
+  const priorFxSessionId = runs.get(firstRunId)?.fxSessionId;
+  expect(priorFxSessionId).toBeTruthy();
+
+  const resumed = await resumeFxRecovery(taskId);
+  expect(resumed.ok).toBe(true);
+  if (!resumed.ok) throw new Error(resumed.error);
+  const secondRunId = resumed.runId;
+  expect(secondRunId).not.toBe(firstRunId);
+  expect(runs.get(secondRunId)?.fxSessionId).toBe(priorFxSessionId);
+  expect(tasks.get(taskId)?.column).toBe("running");
+
+  const secondRun = await waitForRunSettled(secondRunId, 3000);
+  expect(secondRun.status).toBe("succeeded");
+  expect(tasks.get(taskId)?.column).toBe("review");
+
+  const secondEvents = runs.eventsForTask(taskId).filter((e) => e.runId === secondRunId);
+  const recoveredPayload = secondEvents
+    .filter((e) => e.stream === "status" && e.data.startsWith(FX_RECOVERY_STATUS_PREFIX))
+    .map((e) => parseFxRecoveryPayload(e.data.slice(FX_RECOVERY_STATUS_PREFIX.length)))
+    .find((p) => p?.state === "recovered");
+  expect(recoveredPayload).toBeDefined();
+  expect(
+    secondEvents.some((e) => e.stream === "status" && e.data === "✓ recovered · succeeded on attempt 1/3"),
+  ).toBe(true);
+  expect(secondEvents.some((e) => e.stream === "assistant" && e.data === "recovered answer")).toBe(true);
+  expect(secondEvents.some((e) => e.stream === "user")).toBe(false);
+
+  // A second resume attempt now that the recovered turn has succeeded is
+  // gated by the same "no paused fx response to resume" check as any other
+  // fx task with no pending recovery.
+  const secondResume = await resumeFxRecovery(taskId);
+  expect(secondResume.ok).toBe(false);
+  if (!secondResume.ok) {
+    expect(secondResume.status).toBe(400);
+    expect(secondResume.error).toBe("no paused fx response to resume");
+  }
+});
+
+test("resumeFxRecovery: unknown task id → {ok:false, status:404}", async () => {
+  const { resumeFxRecovery } = await import("./orchestrator.ts");
+  const result = await resumeFxRecovery("does-not-exist-task-id");
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.status).toBe(404);
+    expect(result.error).toBe("not found");
+  }
+});
+
+test("resumeFxRecovery: a non-fx (claude-code) task → 400 'only fx tasks can resume a paused response'", async () => {
+  const { createTask, resumeFxRecovery } = await import("./orchestrator.ts");
+  const { harnesses } = await import("./db.ts");
+  harnesses.setEnabled("claude-code", true);
+
+  const created = await createTask({
+    title: "not an fx task",
+    prompt: "do a thing",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+
+  const result = await resumeFxRecovery(created.task.id);
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.status).toBe(400);
+    expect(result.error).toBe("only fx tasks can resume a paused response");
+  }
+});
+
+test("resumeFxRecovery: an archived fx task → 400 'task is archived'", async () => {
+  const { createTask, archiveTask, resumeFxRecovery } = await import("./orchestrator.ts");
+  const { harnesses } = await import("./db.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx archived",
+    prompt: "do a thing",
+    agent: "fx",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const archived = await archiveTask(taskId, { force: true });
+  if ("error" in archived) throw new Error(archived.error);
+
+  const result = await resumeFxRecovery(taskId);
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.status).toBe(400);
+    expect(result.error).toBe("task is archived");
+  }
+});
+
+test("resumeFxRecovery: an fx task whose latest run succeeded → 400 'no paused fx response to resume'", async () => {
+  const { createTask, startTask, resumeFxRecovery } = await import("./orchestrator.ts");
+  const { harnesses } = await import("./db.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx ordinary turn",
+    prompt: "just answer normally",
+    agent: "fx",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  const runId = "runId" in started ? started.runId : "";
+  const run = await waitForRunSettled(runId);
+  expect(run.status).toBe("succeeded");
+
+  const result = await resumeFxRecovery(taskId);
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.status).toBe(400);
+    expect(result.error).toBe("no paused fx response to resume");
+  }
+});
+
+test("resumeFxRecovery: an fx task with a failed run but no recovery sentinel → 400 'no paused fx response to resume'", async () => {
+  const { resumeFxRecovery } = await import("./orchestrator.ts");
+  const { tasks, runs, harnesses } = await import("./db.ts");
+  const { sessionNameFor } = await import("./claude-tmux.ts");
+  harnesses.setEnabled("fx", true);
+
+  const taskId = `task-fx-plain-fail-${crypto.randomUUID()}`;
+  const runId = `run-fx-plain-fail-${crypto.randomUUID()}`;
+  const now = Date.now();
+  tasks.insert(baseTask({
+    id: taskId,
+    column: "ready",
+    runId: null,
+    createdAt: now,
+    updatedAt: now,
+  }));
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "fx",
+    status: "failed",
+    startedAt: now,
+    endedAt: now,
+    exitCode: 1,
+    tmuxSession: sessionNameFor(taskId),
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+    fxSessionId: `fake-fx-session-${taskId}`,
+  });
+
+  const result = await resumeFxRecovery(taskId);
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.status).toBe(400);
+    expect(result.error).toBe("no paused fx response to resume");
+  }
+});
+
+test("resumeFxRecovery: a turn already in flight for the task → 409", async () => {
+  const { createTask, startTask, resumeFxRecovery } = await import("./orchestrator.ts");
+  const { harnesses } = await import("./db.ts");
+  const { FAKE_FX_RECOVERY_PROMPT_MARKER } = await import("./agents.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx storm still in flight",
+    prompt: `hit the gateway limit ${FAKE_FX_RECOVERY_PROMPT_MARKER}`,
+    agent: "fx",
+    mode: "yolo",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  const runId = "runId" in started ? started.runId : "";
+
+  // Called immediately — the storm's terminal chunk doesn't land for ~1.5s,
+  // so the run is still registered active and resumeFxRecovery's own
+  // in-flight gate (mirrored by the /fx-resume route's synchronous claim)
+  // must refuse rather than spawn a second run against the same task.
+  const result = await resumeFxRecovery(taskId);
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.status).toBe(409);
+    expect(result.error).toContain("already in flight");
+  }
+
+  // Drain the storm to completion so its timers don't leak past this test.
+  await waitForRunSettled(runId, 5000);
+});
+
+test("spawnFxRun refactor equivalence: an ordinary sendInput follow-up still echoes the user bubble, logs the 'resuming fx session …' status line, and carries fxSessionId forward — guards the spawnFxTurnNow → spawnFxRun refactor", async () => {
+  const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
+  const { runs, harnesses } = await import("./db.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx spawnFxRun equivalence",
+    prompt: "turn one",
+    agent: "fx",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  const firstRunId = "runId" in started ? started.runId : "";
+  await waitForRunSettled(firstRunId);
+  const priorFxSessionId = runs.get(firstRunId)?.fxSessionId;
+  expect(priorFxSessionId).toBeTruthy();
+
+  const res = await sendInput(firstRunId, "hello");
+  expect(res.delivered).toBe(true);
+  if (!res.delivered) throw new Error("expected delivered:true");
+  const secondRunId = res.runId;
+  expect(secondRunId).not.toBe(firstRunId);
+
+  await waitForRunSettled(secondRunId);
+  expect(runs.get(secondRunId)?.fxSessionId).toBe(priorFxSessionId);
+
+  const secondEvents = runs.eventsForTask(taskId).filter((e) => e.runId === secondRunId);
+  expect(secondEvents.some((e) => e.stream === "user" && e.data === "hello")).toBe(true);
+  expect(
+    secondEvents.some(
+      (e) =>
+        e.stream === "status"
+        && e.data.startsWith("resuming fx session ")
+        && e.data.includes((priorFxSessionId ?? "").slice(0, 8)),
+    ),
+  ).toBe(true);
+});
+
+/* ── Phase 8 review #10: spawnFxRun's "not spawned" branches ──────────────
+ *
+ * `spawnFxRun` used to return the SAME truthy `newRunId` on its two failure
+ * branches (missing harness; `spawnAgentOrFail` throwing) as it does on a
+ * real spawn — the run row it just wrote is already `failed`, but every
+ * caller (`sendFxTurn`, `drainFxQueue`, `resumeFxRecovery`) had no way to
+ * tell. `resumeFxRecovery` in particular would report `{ ok: true, runId }`
+ * for a resume that never started. The fix: `spawnFxRun` now returns
+ * `{ runId, spawned, error? }` (still `null` for the pre-existing "already
+ * starting" signal), and `resumeFxRecovery` maps `spawned: false` to a real
+ * `{ ok: false, status: 500, error }`.
+ *
+ * The missing-harness branch is exercised directly below via
+ * `__testing.spawnFxRun` — NOT through `resumeFxRecovery`, because
+ * `resumeFxRecovery`'s own `resolveHarness(task.agent)?.kind !== "fx"` gate
+ * resolves the identical harness synchronously (no `await` in between for
+ * the row to vanish before `spawnFxRun` re-resolves it), so any call that
+ * clears that gate is guaranteed a resolvable harness — the branch is
+ * provably unreachable from that caller. The other failure branch
+ * (`spawnAgentOrFail` throwing) has no reachable trigger under the fake fx
+ * driver either: `spawnFxRun` always resolves `model` via
+ * `task.model ?? DEFAULT_MODEL.fx` and always passes a real `runId`, and
+ * those are the only two conditions `buildCommand`'s fx branch throws on
+ * (agents.ts, outside this task's file ownership) — unlike gemini's
+ * argv-byte-cap throw (see the "spawn-throw hardening" test above), fx's
+ * `buildCommand` has no size-style validation to trip since the prompt
+ * never rides in argv. Exercising that second branch would require either
+ * modifying agents.ts (out of scope for this fix) or a process-wide
+ * `mock.module` override of `./agents.ts` in this shared, 1000+-line test
+ * file — risking every other fx test that runs after it in the same `bun
+ * test` process. Left untested per the task brief's own fallback
+ * instruction; `resumeFxRecovery`'s `spawned === false → 500` mapping is a
+ * two-line, directly-readable branch exercising the exact same shape the
+ * missing-harness test below proves `spawnFxRun` produces. */
+
+test("spawnFxRun (Phase 8 review #10): missing-harness branch returns { spawned: false, error } instead of a bare truthy runId for a run that never started", async () => {
+  const { __testing } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+  const { sessionNameFor } = await import("./claude-tmux.ts");
+
+  const taskId = `task-fx-missing-harness-${crypto.randomUUID()}`;
+  const now = Date.now();
+  const task = baseTask({
+    id: taskId,
+    // Not one of the five builtin kind literals `getByIdOrKind` falls back
+    // to, and no harness row exists with this id — `resolveHarness` (inside
+    // spawnFxRun) returns null.
+    agent: "definitely-not-a-real-fx-harness",
+    column: "ready",
+    runId: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+  tasks.insert(task);
+
+  const result = await __testing.spawnFxRun(task, taskId, { line: "hello" });
+  expect(result).not.toBeNull();
+  if (!result) throw new Error("expected a non-null result");
+  expect(result.spawned).toBe(false);
+  expect(result.error).toBe(`harness "${task.agent}" not found — cannot resume`);
+  expect(typeof result.runId).toBe("string");
+
+  // The run row this branch wrote is recorded `failed` — callers must be
+  // able to trust `spawned: false` without also re-deriving it from the run
+  // row's own status.
+  const run = runs.get(result.runId);
+  expect(run?.status).toBe("failed");
+  expect(run?.tmuxSession).toBe(sessionNameFor(taskId));
+
+  // The task bounced back to `ready` with no active run, same recovery path
+  // as every other spawnFxRun failure branch (and as `startTask`'s own
+  // spawn-throw hardening, pinned above for gemini).
+  const updated = tasks.get(taskId);
+  expect(updated?.column).toBe("ready");
+  expect(updated?.runId).toBeNull();
+});
+
+test("spawnFxRun (Phase 8 review #10): the ordinary spawn path still returns { spawned: true } (guards the string → object return-shape refactor for every caller)", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { __testing } = await import("./orchestrator.ts");
+  const { tasks, harnesses } = await import("./db.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx spawnFxRun spawned:true",
+    prompt: "turn one",
+    agent: "fx",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  // Drive it through the real startTask path first so `spawnFxRun` is
+  // exercised with the same task shape every other test uses, then call it
+  // again directly (idle at this point — no active run) to assert on its
+  // return value, which `startTask` itself doesn't expose.
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  await waitForRunSettled("runId" in started ? started.runId : "");
+
+  const task = tasks.get(taskId)!;
+  const result = await __testing.spawnFxRun(task, taskId, { line: "turn two" });
+  expect(result).not.toBeNull();
+  if (!result) throw new Error("expected a non-null result");
+  expect(result.spawned).toBe(true);
+  expect(result.error).toBeUndefined();
+  expect(typeof result.runId).toBe("string");
+
+  await waitForRunSettled(result.runId);
 });

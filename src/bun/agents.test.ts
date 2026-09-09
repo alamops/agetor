@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   AGENT_OPTIONS,
   FX_PROVIDER_STATUS_PREFIX,
+  FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   type AgentKind,
@@ -28,6 +29,8 @@ const {
   isValidEnvKey,
   toTerminalAppleScript,  claudeModelPickerFamily,
   spawnAgent,
+  FAKE_FX_RECOVERY_PROMPT_MARKER,
+  FAKE_FX_PERMISSION_PROMPT_MARKER,
 } = await import("./agents.ts");
 const { dataDir } = await import("./db.ts");
 
@@ -1256,6 +1259,189 @@ test("fx AGETOR_FAKE_FX_PERMISSION=1 with mode 'yolo' auto-allows and still emit
 
   const providerIdx = chunks.findIndex((c) => c.stream === "status" && c.data === `${FX_PROVIDER_STATUS_PREFIX}gateway`);
   expect(providerIdx).toBeGreaterThanOrEqual(0);
+});
+
+// --- fx model-response-recovery (docs/plans/fix-fx-harness-rate-limit.md TT3) ---
+// The fake driver's two recovery scenarios (see makeFakeAgent in agents.ts):
+// the "storm" variant (three retry attempts then a terminal paused update,
+// selected by AGETOR_FAKE_FX_RECOVERY=1 or the FAKE_FX_RECOVERY_PROMPT_MARKER
+// prompt substring) and the "continue" variant (opts.continueRecovery: true,
+// which always wins regardless of prompt content — checked first in the
+// scenario's own `||` condition).
+
+test(
+  "fx AGETOR_FX_DRIVER=fake recovery storm (prompt marker): provider sentinel, 3 active recovery sentinels (attempt 1/2/3, delaySeconds only on attempt 2), the paused sentinel, its plain summary line, the enriched refused status, exit code 1",
+  async () => {
+    process.env.AGETOR_FX_DRIVER = "fake";
+    const chunks: { stream: RunEventStream; data: string }[] = [];
+    const handle = await spawnAgent({
+      taskId: "task-fx-recovery-storm-1",
+      runId: "run-fx-recovery-storm-1",
+      harness: builtin("fx"),
+      prompt: `hi ${FAKE_FX_RECOVERY_PROMPT_MARKER}`,
+      cwd: "/tmp",
+      onChunk: (stream, data) => { chunks.push({ stream, data }); },
+      opts: { ...fxDefaults, runId: "run-fx-recovery-storm-1" },
+    });
+    const code = await handle.done;
+    expect(code).toBe(1);
+
+    const providerIdx = chunks.findIndex((c) => c.stream === "status" && c.data === `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+    expect(providerIdx).toBeGreaterThanOrEqual(0);
+
+    const recoveryChunks = chunks.filter((c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX));
+    const payloads = recoveryChunks.map(
+      (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as Record<string, unknown>,
+    );
+    // Three active attempts (delaySeconds only on attempt 2), then paused —
+    // exactly the shared spec's per-turn shape.
+    expect(payloads.map((p) => [p.state, p.attempt, p.delaySeconds ?? null])).toEqual([
+      ["active", 1, null],
+      ["active", 2, 1],
+      ["active", 3, null],
+      ["paused", 3, null],
+    ]);
+    expect(payloads[3]).toMatchObject({ attemptLimit: 3, requiredAction: "continue_later" });
+
+    // Provider sentinel precedes every recovery sentinel (emitted
+    // synchronously before the first `after()` timer fires).
+    expect(chunks.indexOf(recoveryChunks[0]!)).toBeGreaterThan(providerIdx);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    const summaryLines = statusChunks.filter((c) => c.data.includes("resume once the limit clears"));
+    expect(summaryLines).toHaveLength(1);
+
+    expect(
+      statusChunks.some((c) => c.data === "fx turn ended: refused (response paused after 3/3 attempts — resumable)"),
+    ).toBe(true);
+  },
+  8_000,
+);
+
+test(
+  "fx AGETOR_FX_DRIVER=fake continueRecovery scenario: recovered sentinel + its plain summary, thinking, assistant text, usage/title sentinels, exit code 0",
+  async () => {
+    process.env.AGETOR_FX_DRIVER = "fake";
+    const chunks: { stream: RunEventStream; data: string }[] = [];
+    const handle = await spawnAgent({
+      taskId: "task-fx-continue-1",
+      runId: "run-fx-continue-1",
+      harness: builtin("fx"),
+      // Empty prompt — a continueRecovery turn's prompt text is ignored
+      // entirely (see AgentRunOptions.continueRecovery's doc comment).
+      prompt: "",
+      cwd: "/tmp",
+      onChunk: (stream, data) => { chunks.push({ stream, data }); },
+      opts: {
+        ...fxDefaults,
+        runId: "run-fx-continue-1",
+        resumeSessionId: "prior-fx-session-1",
+        continueRecovery: true,
+      },
+    });
+    const code = await handle.done;
+    expect(code).toBe(0);
+
+    const recoveryChunks = chunks.filter((c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX));
+    expect(recoveryChunks).toHaveLength(1);
+    const payload = JSON.parse(recoveryChunks[0]!.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string };
+    expect(payload.state).toBe("recovered");
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data === "✓ recovered · succeeded on attempt 1/3")).toBe(true);
+
+    expect(chunks.some((c) => c.stream === "thinking" && c.data === "fake fx reasoning")).toBe(true);
+    expect(chunks.some((c) => c.stream === "assistant" && c.data === "recovered answer")).toBe(true);
+
+    const usage1 = `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ used: 1234, size: 128000 })}`;
+    const usage2 = `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ turn: { inputTokens: 42, outputTokens: 7 } })}`;
+    const title = `${FX_SESSION_TITLE_STATUS_PREFIX}Fake fx session`;
+    expect(statusChunks.some((c) => c.data === usage1)).toBe(true);
+    expect(statusChunks.some((c) => c.data === usage2)).toBe(true);
+    expect(statusChunks.some((c) => c.data === title)).toBe(true);
+  },
+  8_000,
+);
+
+test(
+  "fx AGETOR_FX_DRIVER=fake continueRecovery wins even when the prompt also carries the fx-permission marker",
+  async () => {
+    process.env.AGETOR_FX_DRIVER = "fake";
+    const chunks: { stream: RunEventStream; data: string }[] = [];
+    const handle = await spawnAgent({
+      taskId: "task-fx-continue-vs-permission-1",
+      runId: "run-fx-continue-vs-permission-1",
+      harness: builtin("fx"),
+      prompt: FAKE_FX_PERMISSION_PROMPT_MARKER,
+      cwd: "/tmp",
+      onChunk: (stream, data) => { chunks.push({ stream, data }); },
+      opts: {
+        ...fxDefaults,
+        runId: "run-fx-continue-vs-permission-1",
+        resumeSessionId: "prior-fx-session-2",
+        continueRecovery: true,
+      },
+    });
+    const code = await handle.done;
+    expect(code).toBe(0);
+
+    // The "continue" recovery variant ran (a single recovered sentinel) —
+    // not the fx_permission-card scenario the prompt marker would otherwise
+    // select. `makeFakeAgent`'s recovery branch is checked before the
+    // fx-permission branch, and `continueRecovery === true` is the first
+    // (short-circuiting) condition in its own `||` chain, so it wins
+    // regardless of prompt content.
+    const recoveryChunks = chunks.filter((c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX));
+    expect(recoveryChunks).toHaveLength(1);
+    expect(chunks.some((c) => c.data.startsWith("fake fx permission"))).toBe(false);
+  },
+  8_000,
+);
+
+test(
+  "fx AGETOR_FX_DRIVER=fake recovery storm: kill() mid-storm (200ms) settles immediately and never emits the paused/refused chunks afterwards",
+  async () => {
+    process.env.AGETOR_FX_DRIVER = "fake";
+    const chunks: { stream: RunEventStream; data: string }[] = [];
+    const handle = await spawnAgent({
+      taskId: "task-fx-recovery-kill-1",
+      runId: "run-fx-recovery-kill-1",
+      harness: builtin("fx"),
+      prompt: `hi ${FAKE_FX_RECOVERY_PROMPT_MARKER}`,
+      cwd: "/tmp",
+      onChunk: (stream, data) => { chunks.push({ stream, data }); },
+      opts: { ...fxDefaults, runId: "run-fx-recovery-kill-1" },
+    });
+
+    await new Promise((r) => setTimeout(r, 200));
+    handle.kill();
+    // makeFakeAgent's kill() clears every pending timer and resolves `done`
+    // with code 0 unconditionally (see agents.ts) — regardless of which
+    // scenario was mid-flight.
+    const code = await handle.done;
+    expect(code).toBe(0);
+
+    // Wait past when the storm's later timers (400ms/800ms/1500ms) would
+    // have fired had kill() not cleared them, then assert they never did.
+    await new Promise((r) => setTimeout(r, 1800));
+
+    const recoveryStates = chunks
+      .filter((c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX))
+      .map((c) => (JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string }).state);
+    expect(recoveryStates).not.toContain("paused");
+    expect(chunks.some((c) => c.data.includes("resume once the limit clears"))).toBe(false);
+    expect(chunks.some((c) => c.data.startsWith("fx turn ended: refused"))).toBe(false);
+  },
+  8_000,
+);
+
+test("AGENT_OPTIONS.fx.modes[0] is 'yolo' (Full access is the default mode)", () => {
+  expect(AGENT_OPTIONS.fx.modes[0]?.id).toBe("yolo");
+});
+
+test("fx buildCommand: a null stored mode still resolves to FX_PERMISSION_MODE=auto, not the new 'yolo' default (existing rows aren't silently escalated by the modes reorder)", () => {
+  const { env } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, mode: null });
+  expect(env?.FX_PERMISSION_MODE).toBe("auto");
 });
 
 test("claude-code 'max' effort sets CLAUDE_CODE_EFFORT_LEVEL=max env", () => {

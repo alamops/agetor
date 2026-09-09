@@ -97,7 +97,14 @@ export function parseFxRecoveryPayload(json: string): FxRecoveryPayload | null {
   }
   if (!isPlainObject(raw)) return null;
   if (!isFxRecoveryState(raw.state)) return null;
-  return { state: raw.state, ...extractFields(raw) };
+  const payload: FxRecoveryPayload = { state: raw.state, ...extractFields(raw) };
+  // `replayed` is agetor's own stamp (see `FxRecoveryPayload.replayed`), so it
+  // is honored only here — on a sentinel agetor wrote — and never by
+  // `parseFxRecoveryMeta`, which reads fx's wire object where the key has no
+  // meaning. Only a literal `true` survives; `false`/non-boolean is dropped
+  // so consumers can test `payload.replayed === true` or truthiness alike.
+  if (raw.replayed === true) payload.replayed = true;
+  return payload;
 }
 
 /** fx's own words for `cause` tags, used only when `message` is absent. */

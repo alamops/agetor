@@ -477,16 +477,28 @@ function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
   // "⚠ paused — press r to resume" header hint: resolvable only off the
   // NEWEST run visible in this window (`events`, already the "visible"
   // slice from the parent) — a resumable `paused` sentinel from an older,
-  // already-superseded run must not relight the hint. `task.column !==
-  // "running"` guards the moment between Resume being pressed and the new
-  // run's own events landing, so the hint can't keep showing "press r"
-  // while a resume (or a fresh send) is already in flight.
+  // already-superseded run must not relight the hint. Gated on `task.column
+  // === "ready"` — the column a failed fx settle actually leaves the card
+  // in (same invariant `resumeFxRecovery`/RunPanel's `pausedRecovery` lean
+  // on: a resumable sentinel only ever sits on the newest run, and that run
+  // is `failed` iff the card is back in `ready`). `!== "running"` used to
+  // be the guard here, which is too loose: fx replays a session's prior
+  // `paused` update on `session/resume`, and if a resumed turn later
+  // SUCCEEDS while that replayed `paused` sentinel is still the run's
+  // (only) recovery sentinel on record for it, the task settles into
+  // `review` — `!== "running"` would keep advertising the hint on that
+  // settled task, and pressing `r` would 400 (`resumeFxRecovery` requires
+  // the latest run to be `failed`). `=== "ready"` can't false-positive that
+  // way: a `review`/`done`/`blocked` task never has a resumable sentinel
+  // agreeing with it, and the moment between Resume being pressed and the
+  // new run's own events landing is still covered since the card leaves
+  // `ready` (→ `running`) as soon as the resume run is inserted.
   const lastRecoveryByRun = useMemo(() => latestFxRecoveryByRun(events), [events]);
   const lastEvent = events[events.length - 1];
   const showResumeHint =
     lastEvent != null &&
     isFxRecoveryResumable(lastRecoveryByRun.get(lastEvent.runId)) &&
-    task.column !== "running";
+    task.column === "ready";
   return (
     <Box flexDirection="column">
       <Text wrap="truncate">
@@ -617,22 +629,30 @@ export function buildSentFilesLines(events: RunEvent[]): Map<string, string | nu
  * usage/provider/title sentinels) EXCEPT the LAST `state === "active"`
  * sentinel per `runId`, which maps to `fxRecoveryNoticeText(p)` — fx's own
  * live retry-progress line, rendered in place of that one row instead of
- * being suppressed. A row whose body fails to parse renders as `null`.
- * Absent entirely (`undefined` on `.get`) for every non-recovery event,
- * same convention as `buildSentFilesLines`.
+ * being suppressed. A payload with `replayed === true` is treated exactly
+ * like `null` here — never eligible to become that run's "latest active"
+ * line: on `session/resume` fx replays the prior turn's recovery updates
+ * (including a terminal `active` one) onto the NEW run, and the driver
+ * stamps every replayed sentinel with `replayed: true`. Without this check
+ * a replayed `active` update would win the "last active sentinel" race for
+ * a run that hasn't actually made a new attempt yet, showing stale retry
+ * progress as if it were live. A row whose body fails to parse renders as
+ * `null`. Absent entirely (`undefined` on `.get`) for every non-recovery
+ * event, same convention as `buildSentFilesLines`.
  */
 export function buildFxRecoveryLines(events: RunEvent[]): Map<string, string | null> {
   const lines = new Map<string, string | null>();
-  // `runId → { key, text }` of the LAST active sentinel seen so far for that
-  // run — array order is wire/event order, so the final write per runId
-  // wins, matching `latestFxRecoveryByRun`'s "last sentinel per run wins".
+  // `runId → { key, text }` of the LAST live (non-replayed) active sentinel
+  // seen so far for that run — array order is wire/event order, so the
+  // final write per runId wins, matching `latestFxRecoveryByRun`'s "last
+  // sentinel per run wins".
   const lastActiveByRun = new Map<string, { key: string; text: string }>();
   for (const e of events) {
     if (e.stream !== "status" || !e.data.startsWith(FX_RECOVERY_STATUS_PREFIX)) continue;
     const key = eventKey(e);
     lines.set(key, null);
     const payload = parseFxRecoveryPayload(e.data.slice(FX_RECOVERY_STATUS_PREFIX.length));
-    if (payload?.state === "active") {
+    if (payload?.state === "active" && !payload.replayed) {
       lastActiveByRun.set(e.runId, { key, text: fxRecoveryNoticeText(payload) });
     }
   }

@@ -3,11 +3,18 @@ import {
   FX_SESSION_TITLE_MAX_LEN,
   FxTextCoalescer,
   extractFxProviderValue,
+  fxRefusedStatusLine,
   isFxContextDiagnostic,
   mapFxUpdate,
 } from "./fx-acp.ts";
 import type { FxUpdateCtx } from "./fx-acp.ts";
-import { FX_USAGE_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX } from "../shared/types.ts";
+import {
+  FX_USAGE_STATUS_PREFIX,
+  FX_SESSION_TITLE_STATUS_PREFIX,
+  FX_RECOVERY_STATUS_PREFIX,
+} from "../shared/types.ts";
+import type { FxRecoveryPayload } from "../shared/types.ts";
+import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
 import { deriveTodoProgress } from "../shared/todo-progress.ts";
 import { SENT_FILES_TOOL_NAME, parseSentFilesToolUse } from "../shared/sent-files.ts";
 
@@ -27,13 +34,25 @@ import { SENT_FILES_TOOL_NAME, parseSentFilesToolUse } from "../shared/sent-file
  *  compatible with it) so the `session_info_update` dedupe tests can both
  *  read it back after a call and assert it stays untouched when nothing was
  *  emitted — mirroring how `dispatchSessionUpdate` carries `state.lastTitle`
- *  across calls in production. */
+ *  across calls in production. The five recovery/review fields
+ *  (`lastRecoveryJson`, `replaying`, `replayedPaused`, `lastRecovery`,
+ *  `reviewHeldWarned`) mirror that exact pattern for the recovery channel and
+ *  the held-tool guidance: explicitly initialized (not just left off the
+ *  object, even though `FxUpdateCtx` types them optional) so a test can both
+ *  seed one before a call (e.g. `ctx.replaying = true`) and read it back
+ *  after, the same way `dispatchSessionUpdate` carries them across calls via
+ *  `FxSessionState` in production. */
 function makeCtx(runId = "run-1"): FxUpdateCtx & { readonly current: number } {
   let seq = 0;
   return {
     runId,
     nextSeq: () => seq++,
     lastTitle: undefined,
+    lastRecoveryJson: undefined,
+    replaying: undefined,
+    replayedPaused: undefined,
+    lastRecovery: undefined,
+    reviewHeldWarned: undefined,
     get current() {
       return seq;
     },
@@ -268,6 +287,199 @@ describe("tool_call_update → tool_result", () => {
     const update = { sessionUpdate: "tool_call_update", toolCallId: "tc-z", status: "completed" };
     const bare = mapFxUpdate(update, ctx);
     expect(JSON.parse(bare[0]!.data).content).toEqual(update);
+  });
+});
+
+describe("tool_call_update → held-tool review guidance (review_unavailable)", () => {
+  // fx's hard-wired auto-mode reviewer can be unavailable on an account
+  // (e.g. HTTP 403 for that tier); fx then holds/denies the call and tells
+  // the MODEL why via a JSON error object riding the tool_result content —
+  // `{"error":{"type":"tool_review_held"|"tool_permission_denied",
+  // "reason":"review_unavailable", …}}` — which agetor also surfaces to the
+  // USER, once per run, as a plain guidance status line.
+  const heldError = (overrides: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      error: {
+        type: "tool_review_held",
+        tool_name: "shell",
+        message: "The action did not run because safety review was unavailable — try again shortly.",
+        reason: "review_unavailable",
+        held: true,
+        ...overrides,
+      },
+    });
+
+  test("review_unavailable warns once per ctx: the tool_result chunk is followed by a warning status chunk; a second held call in the same ctx warns no further", () => {
+    const ctx = makeCtx("run-H1");
+    const content = heldError();
+    const first = mapFxUpdate(
+      { sessionUpdate: "tool_call_update", toolCallId: "tc-h1", status: "failed", content },
+      ctx,
+    );
+    expect(first).toHaveLength(2);
+    expect(first[0]!.stream).toBe("tool_result");
+    expect(first[0]!.lineUuid).toBe("fx:tool:tc-h1:result");
+    expect(JSON.parse(first[0]!.data)).toEqual({ toolUseId: "tc-h1", content, isError: true });
+    expect(first[1]!.stream).toBe("status");
+    expect(first[1]!.lineUuid).toBe("fx:run-H1:0");
+    expect(first[1]!.data.startsWith("⚠ fx held this tool call")).toBe(true);
+    expect(first[1]!.data).toContain("Switch this task's mode to Full access (or Ask)");
+    expect(ctx.reviewHeldWarned).toBe(true);
+
+    const second = mapFxUpdate(
+      { sessionUpdate: "tool_call_update", toolCallId: "tc-h2", status: "failed", content: heldError() },
+      ctx,
+    );
+    expect(second).toHaveLength(1);
+    expect(second[0]!.stream).toBe("tool_result");
+  });
+
+  test("type: tool_permission_denied + reason: review_unavailable also warns", () => {
+    const ctx = makeCtx("run-H2");
+    const content = JSON.stringify({
+      error: { type: "tool_permission_denied", tool_name: "shell", reason: "review_unavailable" },
+    });
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "tool_call_update", toolCallId: "tc-h3", status: "completed", content },
+      ctx,
+    );
+    expect(chunks).toHaveLength(2);
+    expect(chunks[1]!.stream).toBe("status");
+    expect(chunks[1]!.data.startsWith("⚠ fx held this tool call")).toBe(true);
+    expect(ctx.reviewHeldWarned).toBe(true);
+  });
+
+  test("reason: review_caution or user_denied never warns", () => {
+    for (const reason of ["review_caution", "user_denied"]) {
+      const ctx = makeCtx();
+      const content = JSON.stringify({ error: { type: "tool_review_held", reason } });
+      const chunks = mapFxUpdate(
+        { sessionUpdate: "tool_call_update", toolCallId: "tc-h4", status: "failed", content },
+        ctx,
+      );
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]!.stream).toBe("tool_result");
+      expect(ctx.reviewHeldWarned).toBeUndefined();
+    }
+  });
+
+  test("a `type` outside {tool_review_held, tool_permission_denied} never warns, even with reason: review_unavailable", () => {
+    const ctx = makeCtx();
+    const content = JSON.stringify({ error: { type: "some_other_error", reason: "review_unavailable" } });
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "tool_call_update", toolCallId: "tc-h5", status: "failed", content },
+      ctx,
+    );
+    expect(chunks).toHaveLength(1);
+    expect(ctx.reviewHeldWarned).toBeUndefined();
+  });
+
+  test("non-JSON content emits no warning and does not throw", () => {
+    const ctx = makeCtx();
+    expect(() =>
+      mapFxUpdate(
+        { sessionUpdate: "tool_call_update", toolCallId: "tc-h6", status: "failed", content: "not json at all" },
+        ctx,
+      ),
+    ).not.toThrow();
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "tool_call_update", toolCallId: "tc-h7", status: "failed", content: "still not json" },
+      ctx,
+    );
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]!.stream).toBe("tool_result");
+    expect(ctx.reviewHeldWarned).toBeUndefined();
+  });
+
+  test("an already-parsed plain-object content (via rawOutput, not stringified) is tolerated the same as a JSON string", () => {
+    const ctx = makeCtx();
+    const chunks = mapFxUpdate(
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc-h8",
+        status: "failed",
+        rawOutput: { error: { type: "tool_review_held", reason: "review_unavailable" } },
+      },
+      ctx,
+    );
+    expect(chunks).toHaveLength(2);
+    expect(chunks[1]!.data.startsWith("⚠ fx held this tool call")).toBe(true);
+    expect(ctx.reviewHeldWarned).toBe(true);
+  });
+
+  // ── Finding #1 (fix-fx-harness-rate-limit F1) ──
+  // Real fx 0.0.8 traffic never sends the string/rawOutput shapes above — a
+  // `tool_call_update`'s `content` is the ACP `ToolCallContent[]` array
+  // shape, source-verified against `src/acp/types.zig writeToolCallUpdate`:
+  // `[{"type":"content","content":{"type":"text","text":"<held JSON
+  // string>"}}]`, with no `rawOutput` field on this update kind at all. The
+  // string/object tests above pin pre-existing tolerance that stays for
+  // robustness; these pin the shape that actually fires against real fx.
+
+  test("real ACP ToolCallContent[] wire shape — [{type:\"content\", content:{type:\"text\", text: <held JSON>}}] — warns exactly like the string form, after the real tool_result chunk", () => {
+    const ctx = makeCtx("run-H9");
+    const content = [{ type: "content", content: { type: "text", text: heldError() } }];
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "tool_call_update", toolCallId: "tc-h9", status: "failed", content },
+      ctx,
+    );
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]!.stream).toBe("tool_result");
+    // toolResultContent (and so the real tool_result chunk's data) is
+    // unaffected by this fix — still the raw content array, verbatim.
+    expect(JSON.parse(chunks[0]!.data).content).toEqual(content);
+    expect(chunks[1]!.stream).toBe("status");
+    expect(chunks[1]!.lineUuid).toBe("fx:run-H9:0");
+    expect(chunks[1]!.data.startsWith("⚠ fx held this tool call")).toBe(true);
+    expect(chunks[1]!.data).toContain("Switch this task's mode to Full access (or Ask)");
+    expect(ctx.reviewHeldWarned).toBe(true);
+  });
+
+  test("a bare {type:\"text\", text} block with no {type:\"content\"} wrapper also warns", () => {
+    const ctx = makeCtx();
+    const content = [{ type: "text", text: heldError() }];
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "tool_call_update", toolCallId: "tc-h10", status: "failed", content },
+      ctx,
+    );
+    expect(chunks).toHaveLength(2);
+    expect(chunks[1]!.data.startsWith("⚠ fx held this tool call")).toBe(true);
+    expect(ctx.reviewHeldWarned).toBe(true);
+  });
+
+  test("an array of non-JSON / non-matching text content never warns, and never throws — including a non-text inner block and a non-content item mixed in", () => {
+    const ctx = makeCtx();
+    const content = [
+      { type: "content", content: { type: "text", text: "not json at all" } },
+      { type: "text", text: "still not json" },
+      { type: "content", content: { type: "image", uri: "file:///x.png" } }, // non-text inner block — ignored
+      { type: "diff", path: "/x", oldText: "a", newText: "b" }, // non-content item — ignored
+    ];
+    expect(() =>
+      mapFxUpdate({ sessionUpdate: "tool_call_update", toolCallId: "tc-h11", status: "failed", content }, ctx),
+    ).not.toThrow();
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "tool_call_update", toolCallId: "tc-h12", status: "failed", content },
+      ctx,
+    );
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]!.stream).toBe("tool_result");
+    expect(ctx.reviewHeldWarned).toBeUndefined();
+  });
+
+  test("walks past an earlier array item that parses to JSON but has no `error` key to find a later match", () => {
+    const ctx = makeCtx();
+    const content = [
+      { type: "content", content: { type: "text", text: JSON.stringify({ note: "not an error object" }) } },
+      { type: "content", content: { type: "text", text: heldError({ tool_name: "second" }) } },
+    ];
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "tool_call_update", toolCallId: "tc-h13", status: "failed", content },
+      ctx,
+    );
+    expect(chunks).toHaveLength(2);
+    expect(chunks[1]!.data.startsWith("⚠ fx held this tool call")).toBe(true);
+    expect(ctx.reviewHeldWarned).toBe(true);
   });
 });
 
@@ -614,18 +826,11 @@ describe("session_info_update → FX_SESSION_TITLE_STATUS_PREFIX status chunk", 
     expect(ctx.current).toBe(0);
   });
 
-  test("the legacy pre-0.0.8 shape (_meta.fx.modelResponseRecovery, no title) emits nothing", () => {
-    const ctx = makeCtx();
-    const chunks = mapFxUpdate(
-      {
-        sessionUpdate: "session_info_update",
-        _meta: { fx: { modelResponseRecovery: { attempted: true, succeeded: true } } },
-      },
-      ctx,
-    );
-    expect(chunks).toEqual([]);
-    expect(ctx.lastTitle).toBeUndefined();
-  });
+  // NOTE: a bare `_meta.fx.modelResponseRecovery` update with no `title` is
+  // covered in the dedicated "session_info_update → FX_RECOVERY_STATUS_PREFIX"
+  // describe block below — it does NOT emit nothing (the pre-Wave-2 pinning
+  // here was wrong: the recovery channel has been live since fx 0.0.7, see
+  // the plan's §2 and the file header on `fx-acp.ts`).
 
   test("newlines/tabs/double spaces and leading/trailing whitespace are collapsed and trimmed before emitting", () => {
     const ctx = makeCtx("run-T4");
@@ -671,6 +876,426 @@ describe("session_info_update → FX_SESSION_TITLE_STATUS_PREFIX status chunk", 
     const ctx = makeCtx();
     expect(mapFxUpdate({ sessionUpdate: "session_info_update", title: "  Untitled session  " }, ctx)).toEqual([]);
     expect(ctx.lastTitle).toBeUndefined();
+  });
+});
+
+describe("session_info_update → FX_RECOVERY_STATUS_PREFIX sentinel (model response recovery)", () => {
+  // Live wire shapes below are drawn from the plan's §2 (fx ACP spike,
+  // 2026-09-08/09, `docs/plans/fix-fx-harness-rate-limit.md`) — this is the
+  // channel fx has always used to stream Vercel AI Gateway rate-limit
+  // retry/pause/recovery progress over
+  // `session_info_update._meta.fx.modelResponseRecovery`. The prior test
+  // pinned here ("the legacy pre-0.0.8 shape … emits nothing") was wrong —
+  // the channel is live since fx 0.0.7 and `mapFxUpdate` now maps it.
+
+  /** Strips `FX_RECOVERY_STATUS_PREFIX` off a chunk's `data` and parses the
+   *  remainder — used instead of a raw string `toBe` for multi-field
+   *  payloads so a test doesn't have to hand-match `extractFields`' internal
+   *  key-insertion order to pass; `toEqual` below compares structurally. */
+  function parseRecoveryChunk(chunk: { data: string }): unknown {
+    expect(chunk.data.startsWith(FX_RECOVERY_STATUS_PREFIX)).toBe(true);
+    return JSON.parse(chunk.data.slice(FX_RECOVERY_STATUS_PREFIX.length));
+  }
+
+  test("a bare recovery object with no recognized fields (and no title) still emits exactly one sentinel chunk keyed off `state` alone, with a fx:<runId>:<seq> lineUuid, and records it onto ctx.lastRecovery/ctx.lastRecoveryJson", () => {
+    const ctx = makeCtx("run-R0");
+    const chunks = mapFxUpdate(
+      {
+        sessionUpdate: "session_info_update",
+        _meta: { fx: { modelResponseRecovery: { attempted: true, succeeded: true } } },
+      },
+      ctx,
+    );
+    // Neither `attempted` nor `succeeded` is a field `extractFields` knows,
+    // and there's no valid `state` string either, so the payload defaults to
+    // bare `{state:"active"}` (parseFxRecoveryMeta's documented fallback) —
+    // a single-key object, so a literal `JSON.stringify` comparison is
+    // unambiguous regardless of key-insertion order.
+    const expected: FxRecoveryPayload = { state: "active" };
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]!.stream).toBe("status");
+    expect(chunks[0]!.lineUuid).toBe("fx:run-R0:0");
+    expect(chunks[0]!.data).toBe(FX_RECOVERY_STATUS_PREFIX + JSON.stringify(expected));
+    expect(ctx.lastRecovery).toEqual(expected);
+    expect(ctx.lastRecoveryJson).toBe(JSON.stringify(expected));
+    expect(ctx.lastTitle).toBeUndefined();
+  });
+
+  test("an active update WITH delaySeconds after one WITHOUT emits two distinct sentinel chunks and no summary line; an identical consecutive update after that emits nothing", () => {
+    const ctx = makeCtx("run-R1");
+    const withoutDelay: FxRecoveryPayload = {
+      state: "active",
+      kind: "auto_retry",
+      cause: "rate_limited",
+      action: "retrying_request",
+      message:
+        "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: Free tier requests on this model are rate-limited. · retrying request · attempt 5/10",
+      attempt: 5,
+      attemptLimit: 10,
+      durable: true,
+    };
+    const withDelay: FxRecoveryPayload = {
+      ...withoutDelay,
+      delaySeconds: 8,
+      message:
+        "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: Free tier requests on this model are rate-limited. · retrying request in 8s · attempt 5/10",
+    };
+    const update = (payload: FxRecoveryPayload) => ({
+      sessionUpdate: "session_info_update",
+      _meta: { fx: { modelResponseRecovery: payload } },
+    });
+
+    const first = mapFxUpdate(update(withoutDelay), ctx);
+    expect(first).toHaveLength(1); // sentinel only — no summary line for `active`
+    expect(first[0]!.lineUuid).toBe("fx:run-R1:0");
+    expect(parseRecoveryChunk(first[0]!)).toEqual(withoutDelay);
+
+    const second = mapFxUpdate(update(withDelay), ctx);
+    expect(second).toHaveLength(1);
+    expect(second[0]!.lineUuid).toBe("fx:run-R1:1");
+    expect(parseRecoveryChunk(second[0]!)).toEqual(withDelay);
+    expect(second[0]!.data).not.toBe(first[0]!.data); // different JSON — delaySeconds + message changed
+
+    // An identical consecutive update (same payload again) is deduped — no
+    // chunk at all, and the seq counter doesn't move for a deduped call.
+    const third = mapFxUpdate(update(withDelay), ctx);
+    expect(third).toEqual([]);
+    expect(ctx.current).toBe(2);
+    expect(ctx.lastRecovery).toEqual(withDelay);
+  });
+
+  test("a `paused` update (not replaying) emits a sentinel chunk plus a persisted plain summary line equal to fxRecoverySummaryLine(payload), and records the payload onto ctx.lastRecovery", () => {
+    const ctx = makeCtx("run-R2");
+    const pausedPayload: FxRecoveryPayload = {
+      state: "paused",
+      kind: "terminal_provider_error",
+      cause: "rate_limited",
+      action: "paused",
+      requiredAction: "continue_later",
+      message:
+        "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: Free tier requests on this model are rate-limited. · recovery paused after 10/10 attempts",
+      attempt: 10,
+      attemptLimit: 10,
+      durable: true,
+    };
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: pausedPayload } } },
+      ctx,
+    );
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]!.stream).toBe("status");
+    expect(chunks[0]!.lineUuid).toBe("fx:run-R2:0");
+    expect(parseRecoveryChunk(chunks[0]!)).toEqual(pausedPayload);
+
+    const summary = fxRecoverySummaryLine(pausedPayload);
+    expect(summary).not.toBeNull();
+    expect(summary).toContain(" — resume once the limit clears, or send a new message.");
+    expect(chunks[1]!.stream).toBe("status");
+    expect(chunks[1]!.lineUuid).toBe("fx:run-R2:1");
+    expect(chunks[1]!.data).toBe(summary as string);
+
+    expect(ctx.lastRecovery).toEqual(pausedPayload);
+    expect(ctx.lastRecovery!.state).toBe("paused");
+  });
+
+  test("a `recovered` update emits a sentinel plus the plain line \"✓ recovered · succeeded on attempt 1/10\"", () => {
+    const ctx = makeCtx("run-R3");
+    const recoveredPayload: FxRecoveryPayload = {
+      state: "recovered",
+      kind: "auto_recovered",
+      message: "✓ recovered · succeeded on attempt 1/10",
+      attempt: 1,
+      attemptLimit: 10,
+      durable: true,
+    };
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: recoveredPayload } } },
+      ctx,
+    );
+    expect(chunks).toHaveLength(2);
+    expect(parseRecoveryChunk(chunks[0]!)).toEqual(recoveredPayload);
+    expect(chunks[1]!.data).toBe("✓ recovered · succeeded on attempt 1/10");
+    expect(fxRecoverySummaryLine(recoveredPayload)).toBe("✓ recovered · succeeded on attempt 1/10");
+    expect(ctx.lastRecovery).toEqual(recoveredPayload);
+  });
+
+  test("a `recovered` update with no `message` field falls back to the same computed \"✓ recovered · succeeded on attempt N/M\" text", () => {
+    const ctx = makeCtx("run-R3b");
+    const chunks = mapFxUpdate(
+      {
+        sessionUpdate: "session_info_update",
+        _meta: {
+          fx: { modelResponseRecovery: { state: "recovered", kind: "auto_recovered", attempt: 1, attemptLimit: 10 } },
+        },
+      },
+      ctx,
+    );
+    expect(chunks).toHaveLength(2);
+    expect(chunks[1]!.data).toBe("✓ recovered · succeeded on attempt 1/10");
+  });
+
+  test("`\"modelResponseRecovery\": null` clears the checkpoint — sentinel {state:\"cleared\"}, no plain line", () => {
+    const ctx = makeCtx("run-R4");
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: null } } },
+      ctx,
+    );
+    const expected: FxRecoveryPayload = { state: "cleared" };
+    expect(chunks).toHaveLength(1); // no summary line — fxRecoverySummaryLine(cleared) === null
+    expect(chunks[0]!.data).toBe(FX_RECOVERY_STATUS_PREFIX + JSON.stringify(expected));
+    expect(fxRecoverySummaryLine(expected)).toBeNull();
+    expect(ctx.lastRecovery).toEqual(expected);
+  });
+
+  test("ctx.replaying suppresses the summary line but not the sentinel, stamps the emitted body with replayed:true (finding #8), and flags ctx.replayedPaused for a paused update; ctx.lastRecovery is left untouched (undefined)", () => {
+    const ctx = makeCtx("run-R5");
+    ctx.replaying = true;
+    const pausedPayload: FxRecoveryPayload = {
+      state: "paused",
+      kind: "terminal_provider_error",
+      cause: "rate_limited",
+      action: "paused",
+      requiredAction: "continue_later",
+      message: "⚠ Rate limited · HTTP 429 · … · recovery paused after 7/10 attempts",
+      attempt: 7,
+      attemptLimit: 10,
+      durable: true,
+    };
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: pausedPayload } } },
+      ctx,
+    );
+    expect(chunks).toHaveLength(1); // sentinel only — no plain summary line while replaying
+    expect(chunks[0]!.stream).toBe("status");
+    // The EMITTED sentinel body carries the replay marker...
+    expect(parseRecoveryChunk(chunks[0]!)).toEqual({ ...pausedPayload, replayed: true });
+    expect(ctx.replayedPaused).toBe(true);
+    expect(ctx.lastRecovery).toBeUndefined(); // only set on the non-replaying branch
+    // ...but the dedupe key does NOT — it's computed from the plain payload,
+    // so a later byte-identical LIVE update still dedupes/resets correctly
+    // (finding #2) rather than being treated as distinct.
+    expect(ctx.lastRecoveryJson).toBe(JSON.stringify(pausedPayload));
+  });
+
+  test("an `active` update while replaying emits only the sentinel and never sets ctx.replayedPaused", () => {
+    const ctx = makeCtx("run-R6");
+    ctx.replaying = true;
+    const chunks = mapFxUpdate(
+      {
+        sessionUpdate: "session_info_update",
+        _meta: { fx: { modelResponseRecovery: { state: "active", attempt: 1, attemptLimit: 3 } } },
+      },
+      ctx,
+    );
+    expect(chunks).toHaveLength(1);
+    expect(ctx.replayedPaused).toBeUndefined();
+    expect(ctx.lastRecovery).toBeUndefined();
+  });
+
+  test("finding #8: the `replayed` marker appears ONLY on the emitted body while ctx.replaying is true — a live (non-replaying) sentinel for the identical payload carries no `replayed` key at all, not even `replayed: false`", () => {
+    const payload: FxRecoveryPayload = { state: "active", attempt: 4, attemptLimit: 10 };
+
+    const replayingCtx = makeCtx("run-R7a");
+    replayingCtx.replaying = true;
+    const replayed = mapFxUpdate(
+      { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: payload } } },
+      replayingCtx,
+    );
+    expect(replayed).toHaveLength(1);
+    const replayedBody = parseRecoveryChunk(replayed[0]!);
+    expect(replayedBody).toEqual({ ...payload, replayed: true });
+    expect((replayedBody as { replayed?: boolean }).replayed).toBe(true);
+
+    const liveCtxUndefined = makeCtx("run-R7b"); // ctx.replaying left undefined (the production default)
+    const live = mapFxUpdate(
+      { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: payload } } },
+      liveCtxUndefined,
+    );
+    expect(live).toHaveLength(1);
+    const liveBody = parseRecoveryChunk(live[0]!);
+    expect(liveBody).toEqual(payload);
+    expect("replayed" in (liveBody as object)).toBe(false);
+
+    const liveCtxFalse = makeCtx("run-R7c");
+    liveCtxFalse.replaying = false; // explicit false — same as undefined for this purpose
+    const liveExplicit = mapFxUpdate(
+      { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: payload } } },
+      liveCtxFalse,
+    );
+    const liveExplicitBody = parseRecoveryChunk(liveExplicit[0]!);
+    expect("replayed" in (liveExplicitBody as object)).toBe(false);
+  });
+
+  test("a {title, updatedAt} update still emits the title sentinel exactly as before, and no recovery chunk", () => {
+    const ctx = makeCtx("run-TI1");
+    const chunks = mapFxUpdate(
+      { sessionUpdate: "session_info_update", title: "Fix flaky worktree test", updatedAt: "2026-09-08T00:00:00Z" },
+      ctx,
+    );
+    expect(chunks).toEqual([
+      { stream: "status", data: FX_SESSION_TITLE_STATUS_PREFIX + "Fix flaky worktree test", lineUuid: "fx:run-TI1:0" },
+    ]);
+    expect(ctx.lastRecoveryJson).toBeUndefined();
+    expect(ctx.lastRecovery).toBeUndefined();
+  });
+
+  test("a recovery-only update never emits a title chunk, and never touches ctx.lastTitle", () => {
+    const ctx = makeCtx("run-TI2");
+    const chunks = mapFxUpdate(
+      {
+        sessionUpdate: "session_info_update",
+        _meta: { fx: { modelResponseRecovery: { state: "active", attempt: 1, attemptLimit: 3 } } },
+      },
+      ctx,
+    );
+    expect(chunks).toHaveLength(1);
+    expect(chunks.every((c) => !c.data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX))).toBe(true);
+    expect(ctx.lastTitle).toBeUndefined();
+  });
+
+  test("a synthetic update carrying both a title and a recovery meta emits both — recovery sentinel first, then the title sentinel", () => {
+    const ctx = makeCtx("run-TI3");
+    const chunks = mapFxUpdate(
+      {
+        sessionUpdate: "session_info_update",
+        title: "Both at once",
+        _meta: { fx: { modelResponseRecovery: { state: "active", attempt: 2, attemptLimit: 5 } } },
+      },
+      ctx,
+    );
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]!.data.startsWith(FX_RECOVERY_STATUS_PREFIX)).toBe(true);
+    expect(chunks[0]!.lineUuid).toBe("fx:run-TI3:0");
+    expect(chunks[1]!.data).toBe(FX_SESSION_TITLE_STATUS_PREFIX + "Both at once");
+    expect(chunks[1]!.lineUuid).toBe("fx:run-TI3:1");
+    expect(ctx.lastTitle).toBe("Both at once");
+    expect(ctx.lastRecovery).toEqual({ state: "active", attempt: 2, attemptLimit: 5 });
+  });
+});
+
+describe("fxRefusedStatusLine (finding #3: use the shared isFxRecoveryResumable predicate)", () => {
+  // Previously this enrichment checked `recovery?.state === "paused"` alone
+  // — every Resume affordance (RunPanel, CLI, TUI) instead gates on
+  // `isFxRecoveryResumable`, which additionally requires `requiredAction` to
+  // be absent or `continue_later`. A `paused` checkpoint needing a human
+  // decision (`inspect_uncertain_tool`, `change_request`) is NOT something
+  // Resume can act on, so its status line must stay plain, not claim
+  // "resumable".
+
+  test("paused + requiredAction: continue_later → enriched with the attempt fraction", () => {
+    const recovery: FxRecoveryPayload = {
+      state: "paused",
+      requiredAction: "continue_later",
+      attempt: 7,
+      attemptLimit: 10,
+    };
+    expect(fxRefusedStatusLine("refused", recovery)).toBe(
+      "fx turn ended: refused (response paused after 7/10 attempts — resumable)",
+    );
+  });
+
+  test("paused + requiredAction absent defaults to resumable (continue_later is the only variant observed live)", () => {
+    const recovery: FxRecoveryPayload = { state: "paused", attempt: 3, attemptLimit: 5 };
+    expect(fxRefusedStatusLine("refused", recovery)).toBe(
+      "fx turn ended: refused (response paused after 3/5 attempts — resumable)",
+    );
+  });
+
+  test("paused + requiredAction: inspect_uncertain_tool (needs a human decision, not Resume-able) → plain line", () => {
+    const recovery: FxRecoveryPayload = {
+      state: "paused",
+      requiredAction: "inspect_uncertain_tool",
+      attempt: 4,
+      attemptLimit: 10,
+    };
+    expect(fxRefusedStatusLine("refused", recovery)).toBe("fx turn ended: refused");
+  });
+
+  test("paused + requiredAction: change_request → plain line", () => {
+    const recovery: FxRecoveryPayload = { state: "paused", requiredAction: "change_request", attempt: 1 };
+    expect(fxRefusedStatusLine("refused", recovery)).toBe("fx turn ended: refused");
+  });
+
+  test("undefined recovery → plain line, for both the real wire reason and the ACP-canonical alias", () => {
+    expect(fxRefusedStatusLine("refused", undefined)).toBe("fx turn ended: refused");
+    expect(fxRefusedStatusLine("refusal", undefined)).toBe("fx turn ended: refusal");
+  });
+
+  test("attempt numbers omitted entirely (not \"N/undefined\") when either is unknown", () => {
+    const missingAttempt: FxRecoveryPayload = { state: "paused", requiredAction: "continue_later", attemptLimit: 10 };
+    expect(fxRefusedStatusLine("refused", missingAttempt)).toBe("fx turn ended: refused (response paused — resumable)");
+    const missingLimit: FxRecoveryPayload = { state: "paused", requiredAction: "continue_later", attempt: 3 };
+    expect(fxRefusedStatusLine("refused", missingLimit)).toBe("fx turn ended: refused (response paused — resumable)");
+    const missingBoth: FxRecoveryPayload = { state: "paused", requiredAction: "continue_later" };
+    expect(fxRefusedStatusLine("refused", missingBoth)).toBe("fx turn ended: refused (response paused — resumable)");
+  });
+
+  test("state other than paused (active/recovered/cleared) → plain line even with requiredAction: continue_later", () => {
+    for (const state of ["active", "recovered", "cleared"] as const) {
+      const recovery: FxRecoveryPayload = { state, requiredAction: "continue_later", attempt: 2, attemptLimit: 10 };
+      expect(fxRefusedStatusLine("refused", recovery)).toBe("fx turn ended: refused");
+    }
+  });
+});
+
+describe("mixed session_info_update / tool_call_update sequence — lineUuid uniqueness", () => {
+  test("a shared ctx across recovery, title, and tool_call_update chunks produces no duplicate lineUuids", () => {
+    const ctx = makeCtx("run-MIX");
+    const allChunks: { lineUuid?: string }[] = [];
+
+    allChunks.push(
+      ...mapFxUpdate(
+        {
+          sessionUpdate: "session_info_update",
+          _meta: { fx: { modelResponseRecovery: { state: "active", attempt: 1, attemptLimit: 3 } } },
+        },
+        ctx,
+      ),
+    );
+    allChunks.push(...mapFxUpdate({ sessionUpdate: "session_info_update", title: "Mixed sequence" }, ctx));
+    allChunks.push(
+      ...mapFxUpdate(
+        { sessionUpdate: "tool_call_update", toolCallId: "tc-mix", status: "completed", rawOutput: "ok" },
+        ctx,
+      ),
+    );
+    allChunks.push(
+      ...mapFxUpdate(
+        {
+          sessionUpdate: "session_info_update",
+          _meta: {
+            fx: {
+              modelResponseRecovery: {
+                state: "paused",
+                requiredAction: "continue_later",
+                message: "⚠ paused",
+                attempt: 3,
+                attemptLimit: 3,
+              },
+            },
+          },
+        },
+        ctx,
+      ),
+    );
+    allChunks.push(
+      ...mapFxUpdate(
+        {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tc-held",
+          status: "failed",
+          content: JSON.stringify({ error: { type: "tool_review_held", reason: "review_unavailable" } }),
+        },
+        ctx,
+      ),
+    );
+
+    // 1 (active recovery) + 1 (title) + 1 (tool_result) + 2 (paused sentinel
+    // + summary line) + 2 (tool_result + held-tool warning) = 7 chunks.
+    expect(allChunks).toHaveLength(7);
+    const lineUuids = allChunks.map((c) => c.lineUuid);
+    expect(lineUuids.every((id) => typeof id === "string")).toBe(true);
+    expect(new Set(lineUuids).size).toBe(lineUuids.length);
   });
 });
 

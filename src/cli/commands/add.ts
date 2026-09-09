@@ -165,6 +165,9 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
         "agetor add needs --title and --prompt (or --prompt-file), or --issue <url>, when not run interactively",
       );
     }
+    // An explicit `--mode` is never touched; only fill the gap a scripted
+    // add would otherwise leave (see `defaultNonInteractiveMode`'s doc).
+    if (!o.mode) o.mode = defaultNonInteractiveMode(o.agent);
     input = baseInput(o, o.title, prompt);
   } else {
     input = await wizard(client, o, prompt);
@@ -305,6 +308,36 @@ export function chooseAddPath(input: {
   json: boolean;
 }): "non-interactive" | "wizard" {
   return input.explicit || !input.isTTY || input.json ? "non-interactive" : "wizard";
+}
+
+/**
+ * The `mode` a non-interactive `agetor add` should store when `--mode`
+ * wasn't passed. Before this, the non-interactive path (`baseInput`)
+ * forwarded `o.mode` verbatim, so a scripted add with no `--mode` stored
+ * `null` and the task spawned on whatever bare fallback the driver picks at
+ * launch time rather than the picker's own default — for fx specifically
+ * that meant `auto` (its interactive-review mode, which stalls without a
+ * Gateway reviewer on most accounts) instead of `yolo` ("Full access"), even
+ * though `AGENT_OPTIONS.fx.modes[0]` is `yolo` and every picker (webview,
+ * the wizard below) defaults to it.
+ *
+ * Mirrors the exact expression the interactive wizard's own Mode picker
+ * seeds from (`AGENT_OPTIONS[kind].modes[0]?.id`, see the `pickOption`
+ * call in `wizard()` below) so a scripted add matches what a human would
+ * get from pressing Enter on that step. `agent` is a harness id — the raw
+ * `--agent` flag, or `undefined` when omitted. For every BUILT-IN harness
+ * (the normal `--agent fx` / `--agent codex` / … usage) the id equals its
+ * `AgentKind` verbatim (seeded that way by migrations 032/037/046), so no
+ * async harness lookup is needed here the way the wizard needs one; an
+ * unrecognized custom-account harness id, or an omitted `--agent`, falls
+ * back to `claude-code`'s modes — the same `?? "claude-code"` fallback the
+ * wizard uses when a harness can't be found by id. Every kind's mode list
+ * is non-empty today, so this returns `undefined` only in a hypothetical
+ * future kind with none configured.
+ */
+export function defaultNonInteractiveMode(agent: string | undefined): string | undefined {
+  const kind: AgentKind = (agent && agent in AGENT_OPTIONS ? agent : "claude-code") as AgentKind;
+  return AGENT_OPTIONS[kind].modes[0]?.id;
 }
 
 function baseInput(o: AddOpts, title: string, prompt: string): CreateTaskInput {
