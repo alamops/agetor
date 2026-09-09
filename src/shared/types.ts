@@ -40,31 +40,97 @@ export const PERMISSION_MODE_STATUS_PREFIX = "permission-mode: ";
 export const FX_USAGE_STATUS_PREFIX = "fx-usage: ";
 
 /**
+ * JSON body carried after `FX_USAGE_STATUS_PREFIX`. Additive over the fx
+ * 0.0.7 `{used, size, cost?}` shape — every field is optional so a
+ * previously-persisted 0.0.7 sentinel still parses. `used`/`size`/`cost`
+ * come from the ACP `usage_update` notification (live as of fx 0.0.8, fired
+ * once per completed turn); `turn` comes from the `session/prompt` result's
+ * `usage` object (fx ≥0.0.8), also once per turn. The two halves can arrive
+ * as separate sentinel chunks on the same run — RunPanel shallow-merges
+ * every `fx-usage: ` sentinel it sees per run (`{...prev, ...next}`), so
+ * order between them doesn't matter and either half can be absent.
+ */
+export interface FxUsagePayload {
+  /** Context tokens used / window size — ACP `usage_update` (fx ≥0.0.8). */
+  used?: number;
+  size?: number;
+  cost?: { amount: number; currency: string };
+  /** Per-turn token counts from the `session/prompt` result (fx ≥0.0.8). */
+  turn?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    reasoningTokens?: number;
+  };
+}
+
+/**
+ * The exact key set of `FxUsagePayload.turn`, as one shared tuple — the
+ * driver (`src/bun/fx-acp.ts`) uses it to pick fields out of fx's
+ * `session/prompt` result and the webview parser (`src/mainview/lib/
+ * fx-usage.ts`) uses it to validate the sentinel, so producer and consumer
+ * cannot drift. The `satisfies` clause below is the exhaustiveness check:
+ * adding a field to `turn` without listing it here fails typecheck.
+ */
+export const FX_TURN_KEYS = [
+  "inputTokens",
+  "outputTokens",
+  "cacheReadTokens",
+  "cacheWriteTokens",
+  "reasoningTokens",
+] as const satisfies ReadonlyArray<keyof NonNullable<FxUsagePayload["turn"]>>;
+// Every key of `turn` must appear in FX_TURN_KEYS (the `satisfies` above
+// guarantees the converse), so the Exclude below is `never` iff the list is
+// exhaustive — and `true` is only assignable when it is.
+type _FxTurnKeysExhaustive =
+  Exclude<keyof NonNullable<FxUsagePayload["turn"]>, (typeof FX_TURN_KEYS)[number]> extends never ? true : never;
+const _fxTurnKeysExhaustive: _FxTurnKeysExhaustive = true;
+void _fxTurnKeysExhaustive;
+
+/**
  * Sentinel prefix for the `status` chunk fx-acp.ts emits once per turn with
  * the provider fx reports in its `session/new` / resume `configOptions`
  * (`{id:"provider", currentValue:"gateway"|"codex"|"grok"}` — fx ≥0.0.5
- * multi-provider auth). Payload is the bare provider value. Suppressed from
+ * multi-provider auth; the same `configOptions` array also carries `model`
+ * and `mode` entries on the wire, confirmed live on fx 0.0.7+ — agetor reads
+ * only `provider`). Payload is the bare provider value. Suppressed from
  * transcripts via `isInternalStatusSentinel`; RunPanel derives a small
  * run-row chip from the latest one.
  */
 export const FX_PROVIDER_STATUS_PREFIX = "fx-provider: ";
 
 /**
+ * Sentinel prefix for the `status` chunk fx-acp.ts emits from a
+ * `session_info_update` notification (`{title, updatedAt}`, fx ≥0.0.8),
+ * fired at lifecycle points and after every turn. Payload is the plain-text
+ * title (no JSON) — emitted only when it is non-empty, not fx's
+ * "Untitled session" placeholder, and different from the last title emitted
+ * this turn. Suppressed from transcripts via `isInternalStatusSentinel`;
+ * RunPanel derives a run-row chip from the latest one, rendered beside the
+ * provider chip. Must never reach the transcript, CLI `agetor logs`, or the
+ * TUI dashboard.
+ */
+export const FX_SESSION_TITLE_STATUS_PREFIX = "fx-title: ";
+
+/**
  * True for `status`-stream chunks that are UI-internal sentinel channels, not
  * transcript content: currently `PERMISSION_MODE_STATUS_PREFIX` (fed a chip,
  * now suppressed-only), `FX_USAGE_STATUS_PREFIX` (feeds the run-row usage
- * chip), and `FX_PROVIDER_STATUS_PREFIX` (feeds the run-row provider chip).
- * Every renderer of raw status events — RunPanel's status dividers,
- * the CLI's `agetor logs` formatter, and the TUI dashboard — must consult
- * this ONE predicate instead of maintaining its own prefix list, so a new
- * sentinel can't silently leak verbatim into one surface while another
- * suppresses it.
+ * chip), `FX_PROVIDER_STATUS_PREFIX` (feeds the run-row provider chip), and
+ * `FX_SESSION_TITLE_STATUS_PREFIX` (feeds the run-row session-title chip) —
+ * three fx sentinels in all. Every renderer of raw status events —
+ * RunPanel's status dividers, the CLI's `agetor logs` formatter, and the TUI
+ * dashboard — must consult this ONE predicate instead of maintaining its own
+ * prefix list, so a new sentinel can't silently leak verbatim into one
+ * surface while another suppresses it.
  */
 export function isInternalStatusSentinel(data: string): boolean {
   return (
     data.startsWith(PERMISSION_MODE_STATUS_PREFIX) ||
     data.startsWith(FX_USAGE_STATUS_PREFIX) ||
-    data.startsWith(FX_PROVIDER_STATUS_PREFIX)
+    data.startsWith(FX_PROVIDER_STATUS_PREFIX) ||
+    data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX)
   );
 }
 
@@ -154,8 +220,9 @@ export interface Harness {
    *    is joined onto that), so unlike codex there's no need to touch the
    *    real `HOME` at all.
    *  - fx: emitted as a plain HOME=<home> override — fx has no dedicated
-   *    config-dir env var (verified against fx v0.0.4 and v0.0.6 — no FX_HOME
-   *    or FX_CONFIG_DIR in its strings), and its state lives hardcoded at
+   *    config-dir env var (verified against fx v0.0.4 and v0.0.6, re-verified
+   *    0.0.8 (2026-09-08) — no FX_HOME or FX_CONFIG_DIR in its strings), and
+   *    its state lives hardcoded at
    *    `~/.fx/*`, so isolating an additional account's login/config means
    *    re-homing the whole process, same approach as cursor.
    *  NULL means "inherit the agetor process env". */
@@ -217,8 +284,11 @@ export interface HarnessStatus {
    * fail-open: `false` ONLY when the probe positively reported `auth:
    * "missing"`, or (fx 0.0.7+) an expired non-refreshable login
    * (`auth_expired === true && auth_refreshable === false`); `true` for any
-   * other reported value; `null` when the kind has no login probe, the probe
-   * failed, or its output wasn't parseable — `null` must never block a run.
+   * other reported value — including fx 0.0.8's `auth: "host managed"`
+   * (`FX_AUTH_MODE=host-managed`), which the same fail-open fallthrough
+   * tolerates as logged-in rather than gaining a dedicated branch; `null`
+   * when the kind has no login probe, the probe failed, or its output
+   * wasn't parseable — `null` must never block a run.
    */
   loggedIn: boolean | null;
   /** Login guidance when `loggedIn === false`: fx's own `auth_help` when the
@@ -1307,7 +1377,9 @@ export interface AgentOption {
    * Used for fx's premium Gateway tiers, which a standard `fx login` team
    * account can't run: the Gateway catalog is account-scoped — 230 ids
    * unauthenticated vs 158 on a standard plan, measured 2026-08-27 on fx
-   * 0.0.6.
+   * 0.0.6. 2026-09-08: unauth catalog reads 244 on both 0.0.7 and 0.0.8
+   * (Gateway-side growth, not a binary property); all curated ids present;
+   * signed-in view still unverifiable (token expired).
    */
   catalogOnly?: boolean;
 }
@@ -1379,15 +1451,16 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // (`~/.fx/settings.json` on the reference account). Ids are Vercel AI
   // Gateway ids, passed verbatim. fx is exempt from the "always default to
   // the best available model" rule above: the Gateway bills per token to the
-  // user's own account, and flagship tiers (opus-5, sonnet-5, gpt-5.5,
-  // gemini-3.1-pro-preview, gemini-3.8-flash, kimi-k3) stay one click away
+  // user's own account, and flagship tiers (the twelve `catalogOnly` rows in
+  // `AGENT_OPTIONS.fx.models`) stay one click away
   // in the picker as catalog-gated rows — offered only when the signed-in
   // account's catalog actually contains them (see `AgentOption.catalogOnly`).
   // Re-verified 2026-08-31 on fx 0.0.7: compiled default unchanged
   // (moonshotai/kimi-k3 via empty-HOME `fx status --json`), zai/glm-5.3-flash
   // still present in the (grown to 234-id) unauth catalog — the reference
   // signed-in 158-id account could not be re-checked this pass (expired
-  // login token).
+  // login token). Re-verified 2026-09-08 and 0.0.8 (`builtins/gateway.zig
+  // default_model`): compiled default still moonshotai/kimi-k3, unchanged.
   "fx": "zai/glm-5.3-flash",
 };
 
@@ -1959,6 +2032,12 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "google/gemini-3.1-pro-preview": [],
     "google/gemini-3.8-flash": [],
     "moonshotai/kimi-k3": [],
+    "anthropic/claude-fable-5.1": [],
+    "anthropic/claude-haiku-4.5": [],
+    "openai/gpt-6-astra": [],
+    "openai/gpt-5.6-sol": [],
+    "zai/glm-5.3": [],
+    "deepseek/deepseek-v4-pro": [],
   },
 };
 
@@ -2186,6 +2265,13 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // 2026-09-02: google/gemini-3.8-flash added from fx 0.0.7's unauthenticated
     // catalog (`fx models --json` under an expired login); its presence in a
     // standard signed-in account's catalog is unverified, hence catalogOnly.
+    // 2026-09-08: unauth catalog reads 244 on both 0.0.7 and 0.0.8
+    // (Gateway-side growth, not a binary property); all curated ids present;
+    // signed-in view still unverifiable (token expired). Six more premium
+    // rows added this pass (anthropic/claude-fable-5.1, anthropic/claude-haiku-4.5,
+    // openai/gpt-6-astra, openai/gpt-5.6-sol, zai/glm-5.3, deepseek/deepseek-v4-pro),
+    // bringing catalogOnly to twelve rows total — same "offered only when the
+    // signed-in account's catalog includes it" treatment as the original six.
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
@@ -2209,10 +2295,16 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "google/gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "moonshotai/kimi-k3", label: "Kimi K3", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-fable-5.1", label: "Claude Fable 5.1", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-haiku-4.5", label: "Claude Haiku 4.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6-astra", label: "GPT-6 Astra", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "zai/glm-5.3", label: "GLM-5.3", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [
       { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; anything unresolved surfaces as an approval card." },
-      { id: "yolo", label: "Yolo", hint: "Disables fx permission checks — full access." },
+      { id: "yolo", label: "Full access", hint: "Disables fx's permission checks — what fx 0.0.8 calls --full-access / /permissions full-access; yolo is fx's surviving alias and stays agetor's stored id." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
     // No model in MODEL_EFFORT_SUPPORT.fx accepts the effort flag, so the

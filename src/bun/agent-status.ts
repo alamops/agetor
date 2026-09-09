@@ -49,7 +49,10 @@ async function probeVersion(bin: string, env: Record<string, string>): Promise<s
  * unique to Vercel's fx ("coding agent" — real fx v0.0.4 says "Fast, native
  * coding agent for the terminal"; the JSON viewer's says "Terminal JSON
  * viewer"; re-verified present on v0.0.6 and v0.0.7 — the marker probe is
- * still safe). Doesn't gate on exit code — some CLIs exit non-zero for --help.
+ * still safe; re-verified 0.0.8 (2026-09-08; `--help` still "Fast, native
+ * coding agent for the terminal.", `fx acp --help` still only
+ * `--model`/`--log-file`)). Doesn't gate on exit code — some CLIs exit
+ * non-zero for --help.
  */
 async function probeHelp(bin: string, env: Record<string, string>): Promise<string | null> {
   const proc = Bun.spawn([bin, "--help"], {
@@ -124,17 +127,17 @@ async function probeJson(bin: string, args: string[], env: Record<string, string
  * is treated as logged in, exactly as before:
  *   - `auth === "missing"` (from a real fx binary that answered the probe);
  *   - `auth !== "missing"` but `auth_expired === true` (strict boolean) AND
- *     `auth_refreshable === false` (strict boolean) — a 0.0.7+ expired,
- *     non-refreshable login. Real `fx acp` would fail this at `initialize`
- *     with fx's own raw -32600 anyway (see fx-acp.ts's `RpcError.rawMessage`
- *     passthrough for that same code), so a friendly pre-flight refusal here
- *     is strictly better than letting the run fail unexplained later. An
- *     expired login that's still refreshable (`auth_refreshable` anything but
- *     strict `false` — absent, non-boolean, or `true`) stays fail-open on
- *     purpose: fx may silently refresh the token on real use (`fx acp`), and
- *     this passive probe never attempts a refresh, so it can't prove the
- *     login is actually dead — blocking here would be a false "logged out"
- *     for a session fx would happily revive.
+ *     `auth_refreshable === false` (strict boolean) — a 0.0.7+ (unchanged in
+ *     0.0.8) expired, non-refreshable login. Real `fx acp` would fail this at
+ *     `initialize` with fx's own raw -32600 anyway (see fx-acp.ts's
+ *     `RpcError.rawMessage` passthrough for that same code), so a friendly
+ *     pre-flight refusal here is strictly better than letting the run fail
+ *     unexplained later. An expired login that's still refreshable
+ *     (`auth_refreshable` anything but strict `false` — absent, non-boolean,
+ *     or `true`) stays fail-open on purpose: fx may silently refresh the
+ *     token on real use (`fx acp`), and this passive probe never attempts a
+ *     refresh, so it can't prove the login is actually dead — blocking here
+ *     would be a false "logged out" for a session fx would happily revive.
  *
  * This expired-login gate is exempt entirely when `auth` is one of the
  * env-key values (`"AI_GATEWAY_API_KEY"` / `"VERCEL_OIDC_TOKEN"`) — those
@@ -170,6 +173,26 @@ async function probeJson(bin: string, args: string[], env: Record<string, string
  * the refreshable branch above, and in that state passive probes (this one
  * included) see the unauthenticated model catalog, which is a separate,
  * already-fail-open concern (`discoverFx`), not this gate's job.
+ *
+ * Re-verified against fx 0.0.8 (binary probe, 2026-09-08, build_revision
+ * 43c11dcc34a9): the `status --json` builder is byte-identical to 0.0.7
+ * (`output_contracts.zig`), so nothing above changes. Confirmed facts, not
+ * schema changes: `auth_expired` is present in the payload only when `true`
+ * (absent — not `false` — on a fresh/non-expired probe) and
+ * `mcp_config_warning` only when there's an actual warning, so their absence
+ * on a given probe is normal, not evidence of a dropped field. There's a new
+ * possible `auth` value, `"host managed"` (a space, not a hyphen), emitted
+ * when the fx process runs under `FX_AUTH_MODE=host-managed` (an
+ * embedding-host feature) — agetor never sets that var, and if it were ever
+ * seen here the existing "every other parseable value ⇒ loggedIn:true"
+ * fallthrough already handles it correctly: the embedding host owns
+ * credentials in that mode, so there's nothing for this gate to check. The
+ * payload carries `build_revision` (0.0.8 measured: `"43c11dcc34a9"`) but no
+ * top-level `version` field. The other always-present fields — `kind`,
+ * `update_channel`, `build_channel`, `permission_mode`, `workspace`,
+ * `history_turns`, `session_permission_grants`, `agent_step_limit`, and the
+ * `mcp{connection_check,servers,configuration_issues,inspection_error}`
+ * object — are, as before, ignored here by construction.
  */
 async function probeStatus(bin: string, env: Record<string, string>): Promise<{ loggedIn: boolean | null; authHelp: string | null }> {
   const out = await probeJson(bin, ["status", "--json"], env);
@@ -195,10 +218,11 @@ async function probeStatus(bin: string, env: Record<string, string>): Promise<{ 
     };
   }
 
-  // 0.0.7+: an authenticated-but-expired, non-refreshable login. Strict on
-  // both booleans by design — see the doc comment above for why every other
-  // combination (absent/non-boolean/`auth_refreshable !== false`) must stay
-  // fail-open instead of joining this branch. Env-key auth is exempt from
+  // 0.0.7+ (unchanged in 0.0.8): an authenticated-but-expired,
+  // non-refreshable login. Strict on both booleans by design — see the doc
+  // comment above for why every other combination
+  // (absent/non-boolean/`auth_refreshable !== false`) must stay fail-open
+  // instead of joining this branch. Env-key auth is exempt from
   // this gate entirely (see the doc comment above) — the active auth
   // mechanism there is the key, not a stored login, so a stale stored login
   // must never refuse a run that would authenticate via the key.

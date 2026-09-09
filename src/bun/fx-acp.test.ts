@@ -21,6 +21,7 @@ import {
 } from "./fx-acp.ts";
 import {
   FX_PROVIDER_STATUS_PREFIX,
+  FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
   type RunEventStream,
@@ -86,6 +87,14 @@ const FAKE_ACP_SERVER_SRC = [
   "function endTurn(id, ms, reason) {",
   "  setTimeout(function () {",
   '    ok(id, { stopReason: reason || "end_turn" });',
+  "  }, ms);",
+  "}",
+  "",
+  "// Same shape as endTurn, but the session/prompt result also carries fx",
+  "// >=0.0.8's `usage` object (0.0.7 responses never have this field).",
+  "function endTurnWithUsage(id, ms, reason, usage) {",
+  "  setTimeout(function () {",
+  '    ok(id, { stopReason: reason || "end_turn", usage: usage });',
   "  }, ms);",
   "}",
   "",
@@ -282,6 +291,74 @@ const FAKE_ACP_SERVER_SRC = [
   "  }",
   '  if (scenario === "stopreason-cancelled") {',
   '    endTurn(id, 10, "cancelled");',
+  "    return;",
+  "  }",
+  '  if (scenario === "stopreason-refused") {',
+  '    endTurn(id, 10, "refused");',
+  "    return;",
+  "  }",
+  '  if (scenario === "stopreason-max-output-tokens") {',
+  '    endTurn(id, 10, "max_output_tokens");',
+  "    return;",
+  "  }",
+  '  if (scenario === "stopreason-max-model-turns") {',
+  '    endTurn(id, 10, "max_model_turns");',
+  "    return;",
+  "  }",
+  '  if (scenario === "prompt-usage") {',
+  "    // Non-numeric cacheReadTokens and the unknown `bogus` key must be",
+  "    // dropped by the driver, keeping only inputTokens/outputTokens.",
+  '    endTurnWithUsage(id, 15, "end_turn", { inputTokens: 42, outputTokens: 7, cacheReadTokens: "x", bogus: 1 });',
+  "    return;",
+  "  }",
+  '  if (scenario === "prompt-usage-empty") {',
+  '    endTurnWithUsage(id, 15, "end_turn", {});',
+  "    return;",
+  "  }",
+  '  if (scenario === "usage-update-then-prompt-usage") {',
+  '    notify("session/update", { update: { sessionUpdate: "usage_update", used: 1234, size: 128000 } });',
+  '    endTurnWithUsage(id, 15, "end_turn", { inputTokens: 1, outputTokens: 2 });',
+  "    return;",
+  "  }",
+  '  if (scenario === "message-id-split") {',
+  "    // Two different messageIds, no intervening non-text chunk — the",
+  "    // coalescer must split these into two assistant events on messageId",
+  "    // change alone.",
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "m1", content: { type: "text", text: "First message" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "m2", content: { type: "text", text: "Second message" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "message-id-same") {',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "m1", content: { type: "text", text: "Hello " } } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "m1", content: { type: "text", text: "world" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "message-id-none") {',
+  "    // Legacy (pre-0.0.8) shape: no messageId field at all on either delta.",
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello " } } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "world" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "tool-call-name") {',
+  "    // First: fx >=0.0.8 shape (real name + rawInput + a title distinct",
+  "    // from the name). Second: legacy shape (title/kind only, no name).",
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "tc-name-1", name: "shell", title: "Run ls", kind: "execute", rawInput: { command: "ls" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "tc-name-2", title: "Run ls", kind: "execute", rawInput: { command: "ls" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "session-title") {',
+  "    // Placeholder (skipped), a real title (emitted), a repeat of the same",
+  "    // title (deduped), then a pre-0.0.8-shaped update with no title at all",
+  "    // (ignored) — exactly one status chunk should result.",
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", title: "Untitled session", updatedAt: "2026-09-08T00:00:00Z" } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", title: "Explain the repo", updatedAt: "2026-09-08T00:00:01Z" } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", title: "Explain the repo", updatedAt: "2026-09-08T00:00:02Z" } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: true } } } });',
+  '    endTurn(id, 15, "end_turn");',
   "    return;",
   "  }",
   '  if (scenario === "kill-cancel") {',
@@ -1081,6 +1158,171 @@ describe("usage_update session/update → status chunk", () => {
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *
+ * 4d. `session/prompt` result `usage` (fx >=0.0.8) → the `turn` half of the
+ *     FX_USAGE_STATUS_PREFIX sentinel, emitted before settlement.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("session/prompt usage → FX_USAGE_STATUS_PREFIX turn sentinel", () => {
+  test(
+    "emits exactly one turn sentinel, dropping the non-numeric and unknown-key fields, before the run settles",
+    async () => {
+      const { agent, chunks } = spawnFake("prompt-usage");
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const usageChunks = chunks.filter((c) => c.stream === "status" && c.data.startsWith(FX_USAGE_STATUS_PREFIX));
+      expect(usageChunks).toHaveLength(1);
+      expect(JSON.parse(usageChunks[0]!.data.slice(FX_USAGE_STATUS_PREFIX.length))).toEqual({
+        turn: { inputTokens: 42, outputTokens: 7 },
+      });
+
+      // "Before settlement" — this chunk must be observable on the run, i.e.
+      // it isn't the last thing the driver ever emits after resolving; the
+      // done promise having already resolved above is the settlement signal,
+      // and the chunk is present in the collected list regardless, so this
+      // also pins that maybeEmitPromptUsage doesn't run AFTER the process is
+      // torn down (it wouldn't be captured at all if so).
+      expect(usageChunks[0]!.lineUuid).toBeTruthy();
+    },
+    10_000,
+  );
+
+  test("an empty usage object ({}) emits no usage sentinel at all", async () => {
+    const { agent, chunks } = spawnFake("prompt-usage-empty");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    expect(chunks.some((c) => c.stream === "status" && c.data.startsWith(FX_USAGE_STATUS_PREFIX))).toBe(false);
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4e. Both usage sources in one turn — a `usage_update` notification during
+ *     the turn AND the terminal `session/prompt` result's `usage` — must
+ *     produce two separate sentinels, in wire order, never merged/clobbered.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("usage_update notification + session/prompt usage in the same turn", () => {
+  test("emits two usage sentinels in order: the usage_update payload, then the turn payload", async () => {
+    const { agent, chunks } = spawnFake("usage-update-then-prompt-usage");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const usageChunks = chunks
+      .filter((c) => c.stream === "status" && c.data.startsWith(FX_USAGE_STATUS_PREFIX))
+      .map((c) => JSON.parse(c.data.slice(FX_USAGE_STATUS_PREFIX.length)));
+
+    expect(usageChunks).toEqual([{ used: 1234, size: 128000 }, { turn: { inputTokens: 1, outputTokens: 2 } }]);
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4f. `agent_message_chunk.messageId` (fx >=0.0.8) coalescer split rule.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("agent_message_chunk messageId coalescer split", () => {
+  test("two different messageIds with no intervening non-text chunk split into two separate assistant events", async () => {
+    const { agent, chunks } = spawnFake("message-id-split");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+    expect(assistantChunks.map((c) => c.data)).toEqual(["First message", "Second message"]);
+    // Distinct line_uuids — two real events, not one over-flushed one.
+    expect(assistantChunks[0]!.lineUuid).not.toBe(assistantChunks[1]!.lineUuid);
+
+    // The onChunk contract is (stream, data, lineUuid) — messageId is never
+    // forwarded to it, so a persisted chunk can never carry the field.
+    for (const c of chunks) expect("messageId" in c).toBe(false);
+  }, 10_000);
+
+  test("the same messageId across deltas stays one concatenated assistant event", async () => {
+    const { agent, chunks } = spawnFake("message-id-same");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+    expect(assistantChunks.map((c) => c.data)).toEqual(["Hello world"]);
+    for (const c of chunks) expect("messageId" in c).toBe(false);
+  }, 10_000);
+
+  test("no messageId on either delta falls back to the legacy stream-switch-only rule — still one event", async () => {
+    const { agent, chunks } = spawnFake("message-id-none");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+    expect(assistantChunks.map((c) => c.data)).toEqual(["Hello world"]);
+    for (const c of chunks) expect("messageId" in c).toBe(false);
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4g. `tool_call.name` (fx >=0.0.8) preferred over the `title (kind)`
+ *     synthesis, with `title` carried alongside only when it adds
+ *     information.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("tool_call name / title", () => {
+  test("fx >=0.0.8 shape: name wins as the tool_use name, and a distinct title rides alongside it", async () => {
+    const { agent, chunks } = spawnFake("tool-call-name");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const toolUseChunks = chunks.filter((c) => c.stream === "tool_use");
+    expect(toolUseChunks).toHaveLength(2);
+
+    const withName = JSON.parse(toolUseChunks[0]!.data);
+    expect(withName).toEqual({
+      id: "tc-name-1",
+      name: "shell",
+      input: { command: "ls" },
+      serverSide: false,
+      title: "Run ls",
+    });
+  }, 10_000);
+
+  test("legacy shape (no name): falls back to the `title (kind)` synthesis and carries no `title` key", async () => {
+    const { agent, chunks } = spawnFake("tool-call-name");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const toolUseChunks = chunks.filter((c) => c.stream === "tool_use");
+    const legacy = JSON.parse(toolUseChunks[1]!.data);
+    expect(legacy).toEqual({
+      id: "tc-name-2",
+      name: "Run ls (execute)",
+      input: { command: "ls" },
+      serverSide: false,
+    });
+    expect("title" in legacy).toBe(false);
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4h. `session_info_update {title, updatedAt}` (fx >=0.0.8) → the
+ *     FX_SESSION_TITLE_STATUS_PREFIX sentinel, deduped per turn.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("session_info_update → FX_SESSION_TITLE_STATUS_PREFIX sentinel", () => {
+  test(
+    "placeholder title skipped, a real title emitted once, a repeat deduped, and a title-less update ignored",
+    async () => {
+      const { agent, chunks } = spawnFake("session-title");
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const titleChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX),
+      );
+      expect(titleChunks).toHaveLength(1);
+      expect(titleChunks[0]!.data).toBe(FX_SESSION_TITLE_STATUS_PREFIX + "Explain the repo");
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
  * 5. stopReason mapping.
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -1106,6 +1348,49 @@ describe("stopReason mapping", () => {
       // The driver leaves cancelled-vs-failed classification to the
       // orchestrator's own `handle.cancelled` flag — no status chunk here.
       expect(chunks.filter((c) => c.stream === "status")).toHaveLength(0);
+    },
+    10_000,
+  );
+
+  // fx's REAL wire strings (types.zig StopReason, byte-identical 0.0.7 and
+  // 0.0.8) are `refused`, `max_output_tokens`, `max_model_turns` — not the
+  // ACP-canonical `refusal`/`max_tokens`/`max_turn_requests` the switch used
+  // to check alone. These three pin the driver actually matching fx's real
+  // strings, on top of "stopreason-refusal" above pinning the ACP-canonical
+  // name is still accepted for forward compat.
+
+  test(
+    "refused (fx's real wire string) fails the turn and emits a status chunk naming it",
+    async () => {
+      const { agent, chunks } = spawnFake("stopreason-refused");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks.some((c) => c.data === "fx turn ended: refused")).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "max_output_tokens (fx's real wire string) fails the turn and emits a status chunk naming it",
+    async () => {
+      const { agent, chunks } = spawnFake("stopreason-max-output-tokens");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks.some((c) => c.data === "fx turn ended: max_output_tokens")).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "max_model_turns (fx's real wire string) fails the turn and emits a status chunk naming it",
+    async () => {
+      const { agent, chunks } = spawnFake("stopreason-max-model-turns");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks.some((c) => c.data === "fx turn ended: max_model_turns")).toBe(true);
     },
     10_000,
   );

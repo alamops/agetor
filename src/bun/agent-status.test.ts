@@ -435,6 +435,93 @@ test("fx status --json full realistic 0.0.7 payload with auth_refreshable:false 
   expect(status.authHelp).toBe("fx login has expired — run fx login to sign in again.");
 });
 
+// --- fx status --json 0.0.8 real-payload fixtures --------------------------
+// Copied verbatim (workspace path genericized) from a live binary probe of
+// fx 0.0.8 (build_revision 43c11dcc34a9, 2026-09-08) — see
+// docs/plans/fx-0.0.8-compat.md TT3 and its §2 evidence. probeStatus's own
+// doc comment already notes the `status --json` builder is byte-identical to
+// 0.0.7, so these are non-regression fixtures pinning the exact 0.0.8 field
+// set (no top-level `version`; no `auth_expired` on a non-expired probe)
+// against production code that reads only `auth`/`auth_help`/`auth_expired`/
+// `auth_refreshable`.
+
+function fx008StatusPayload(auth: string, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    kind: "status",
+    model: "moonshotai/kimi-k3",
+    update_channel: "stable",
+    build_channel: "stable",
+    build_revision: "43c11dcc34a9",
+    auth,
+    auth_refreshable: false,
+    permission_mode: "auto",
+    workspace: "/Users/dev/project",
+    history_turns: 0,
+    session_permission_grants: 0,
+    agent_step_limit: 0,
+    mcp: {
+      connection_check: "not_checked",
+      servers: [],
+      configuration_issues: [],
+      inspection_error: null,
+    },
+    ...extra,
+  });
+}
+
+/**
+ * Same shape as `plantFakeFxStatusBin` above, but with a caller-supplied
+ * `--version` string instead of the hardcoded "0.0.6" — needed to assert
+ * `checkHarness` reports the 0.0.8 stub's version verbatim.
+ */
+function plantFakeFxStatusBinVersioned(version: string, statusBody: string): string {
+  sandbox = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-008-"));
+  const bin = path.join(sandbox, "fx");
+  writeFileSync(
+    bin,
+    `#!/bin/sh\n`
+      + `if [ "$1" = "--version" ]; then echo "${version}"; exit 0; fi\n`
+      + `if [ "$1" = "--help" ]; then echo "Fast, native coding agent for the terminal"; exit 0; fi\n`
+      + `if [ "$1" = "status" ]; then\n  ${statusBody}\nfi\n`
+      + `exit 1\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+test("fx status --json realistic 0.0.8 payload (AI_GATEWAY_API_KEY, no top-level version, no auth_expired) -> loggedIn:true, authHelp:null; stub reports version 0.0.8", async () => {
+  const payload = fx008StatusPayload("AI_GATEWAY_API_KEY");
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.8", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.version).toBe("0.0.8");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test('fx status --json auth:"host managed" (FX_AUTH_MODE=host-managed, an embedding-host feature agetor never sets) -> fail-open fallthrough, loggedIn:true, authHelp:null', async () => {
+  const payload = fx008StatusPayload("host managed");
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.8", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json auth:missing with fx 0.0.8's real auth_help sentence -> loggedIn:false, authHelp verbatim", async () => {
+  const payload = fx008StatusPayload("missing", {
+    auth_help:
+      "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+  });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.8", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(false);
+  expect(status.authHelp).toBe(
+    "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+  );
+});
+
 // --- fx status cache (getCachedStatus / statusCache in agent-status.ts) ----
 // `checkHarness`'s fx-only auth pre-flight spawns `fx status --json`. Without
 // memoization the 15s `/harnesses` poll (App.tsx's checkAllHarnesses) would

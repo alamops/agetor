@@ -255,6 +255,52 @@ test("parseFxModels: full 0.0.7-shaped `models --json` payload (kind/count/shown
   ]);
 });
 
+test("parseFxModels: 0.0.8-shaped `models --json` envelope (kind/count/shown_count/more_count/private_models_hidden) -> ids parsed, deduped, extra fields ignored", () => {
+  // A dozen real ids (id subset) copied from a live binary probe of fx
+  // 0.0.8's unauthenticated 244-id Gateway catalog (2026-09-08) — see
+  // docs/plans/fx-0.0.8-compat.md TT3. The envelope shape itself is
+  // unchanged from 0.0.7 (§2 evidence: `output_contracts.zig` byte-identical
+  // both versions) — this pins the same unknown-fields-are-fine tolerance
+  // against the 0.0.8-measured count/ids.
+  const payload = {
+    kind: "models",
+    count: 244,
+    shown_count: 244,
+    more_count: 0,
+    private_models_hidden: true,
+    ids: [
+      "anthropic/claude-opus-5",
+      "anthropic/claude-sonnet-5",
+      "anthropic/claude-fable-5.1",
+      "anthropic/claude-haiku-4.5",
+      "openai/gpt-6-astra",
+      "openai/gpt-5.6-sol",
+      "zai/glm-5.3",
+      "zai/glm-5.3-flash",
+      "deepseek/deepseek-v4-pro",
+      "spacexai/grok-4.6",
+      "meta/llama-4-maverick",
+      "mistral/mistral-large-3",
+      "zai/glm-5.3", // duplicate — must be deduped, first occurrence wins
+    ],
+  };
+  const parsed = __testing.parseFxModels(JSON.stringify(payload));
+  expect(parsed.map((m) => m.id)).toEqual([
+    "anthropic/claude-opus-5",
+    "anthropic/claude-sonnet-5",
+    "anthropic/claude-fable-5.1",
+    "anthropic/claude-haiku-4.5",
+    "openai/gpt-6-astra",
+    "openai/gpt-5.6-sol",
+    "zai/glm-5.3",
+    "zai/glm-5.3-flash",
+    "deepseek/deepseek-v4-pro",
+    "spacexai/grok-4.6",
+    "meta/llama-4-maverick",
+    "mistral/mistral-large-3",
+  ]);
+});
+
 /* ── fx: discoverFx (exercised indirectly via refreshDiscoveredModels +
  * getDiscoveredModels, since discoverFx itself isn't exported — same
  * pattern the codex CLI-missing test above uses) ───────────────────────── */

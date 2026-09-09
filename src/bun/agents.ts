@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import path from "node:path";import { cursorModelArg, FX_PROVIDER_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
+import path from "node:path";import { cursorModelArg, FX_PROVIDER_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
 import { GEMINI_PROMPT_ARGV_MAX_BYTES } from "../shared/prompt-limits.ts";
 import { settleSubagentById } from "./claude-subagents.ts";
 import {
@@ -327,7 +327,8 @@ export function harnessEnv(harness: Harness): Record<string, string> {
       // v0.0.4 — no FX_HOME or FX_CONFIG_DIR in its strings); its state
       // lives hardcoded at `~/.fx/*`, so isolating an additional account's
       // login/config means a true HOME override, same approach as cursor's
-      // branch above.
+      // branch above. Re-verified 0.0.8 (2026-09-08; `profile_paths.zig
+      // root_dir_name = ".fx"`, hardcoded).
       env.HOME = harness.home;
     } else {
       // gemini: GEMINI_CLI_HOME is a dedicated home-override env var (verified
@@ -658,7 +659,9 @@ export function buildCommand(
     // that file's header). The prompt is NOT an argv element: it rides over
     // the `session/prompt` JSON-RPC call the driver issues after the
     // handshake, so unlike claude/gemini there's no tmux-imsg-cap-style
-    // argv-size budget to enforce here.
+    // argv-size budget to enforce here. `fx acp` flags re-verified 0.0.8:
+    // still exactly `--model` and `--log-file` (source: cli_surface.zig
+    // parseAcpArgs, byte-identical to 0.0.7).
     const extra = (process.env.AGETOR_FX_ARGS ?? "").split(/\s+/).filter(Boolean);
 
     if (!opts.model) {
@@ -683,6 +686,12 @@ export function buildCommand(
     // through since fx's own mode ids already match agetor's; any other
     // (future/unknown) mode id passes through verbatim, same convention as
     // every other kind's unknown-model/mode passthrough in this file.
+    // fx 0.0.8 also accepts `full-access` as a UI/CLI-wording alias of
+    // `yolo` (`--full-access` flag, `/permissions full-access`) — it parses
+    // to the identical `.yolo` enum value (config_runtime.zig
+    // parsePermissionMode; fx's README: "saved settings and JSON output
+    // retain `yolo`"), so agetor keeps sending the canonical `yolo` id here
+    // (and `auto`/`ask` for the other two modes) rather than the new alias.
     const mode = opts.mode ?? "auto";
     env.FX_PERMISSION_MODE = mode;
 
@@ -875,6 +884,28 @@ export const FAKE_CLAUDE_MONITOR_PROMPT_MARKER = "__agetor_fake_claude_monitor__
 const FAKE_CLAUDE_MONITOR_SETTLE_MS_RE = new RegExp(`${FAKE_CLAUDE_MONITOR_PROMPT_MARKER}:(\\d+)`);
 const FAKE_CLAUDE_MONITOR_DEFAULT_SETTLE_MS = 4000;
 const FAKE_CLAUDE_MONITOR_MIN_SETTLE_MS = 50;
+
+/**
+ * Emits the fx ≥0.0.8 usage + session-title sentinels the fake fx driver
+ * pairs with every completed turn, mirroring the real driver's
+ * `usage_update` sentinel, the `session/prompt.usage` → `{turn}` sentinel,
+ * and the `session_info_update` title sentinel (fx-acp.ts) — see the shared
+ * spec (`Fake fx driver per turn`) in docs/plans/fx-0.0.8-compat.md §3.
+ * Called just before the "turn complete" status + `resolveDone` in every fx
+ * fake-turn branch below. No `lineUuid` is passed, matching every other
+ * status chunk this fake driver already emits (e.g. the provider sentinel
+ * below) — per-line dedup only matters for a real, tailed/replayed JSONL
+ * stream, not this in-process fake.
+ */
+function emitFakeFxUsageAndTitle(onChunk: ChunkHandler): void {
+  onChunk("status", `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ used: 1234, size: 128000 })}`);
+  onChunk(
+    "status",
+    `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ turn: { inputTokens: 42, outputTokens: 7 } })}`,
+  );
+  onChunk("status", `${FX_SESSION_TITLE_STATUS_PREFIX}Fake fx session`);
+}
+
 function makeFakeAgent(
   taskId: string,
   prompt: string,
@@ -1144,7 +1175,13 @@ function makeFakeAgent(
     // chunk once per turn, emitted before any turn content, so the run-row
     // provider chip is e2e-visible under this fake too.
     if (fakeOpts.kind === "fx") onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
-    after(5, () => onChunk("assistant", "requesting permission…"));
+    after(5, () => {
+      // fx ≥0.0.8 mirror: an `agent_thought_chunk`-derived `thinking` chunk
+      // precedes the turn's assistant text — see `emitFakeFxUsageAndTitle`'s
+      // doc comment and the shared spec in docs/plans/fx-0.0.8-compat.md §3.
+      if (fakeOpts.kind === "fx") onChunk("thinking", "fake fx reasoning");
+      onChunk("assistant", "requesting permission…");
+    });
     if (fakeOpts.mode === "yolo") {
       // Mirror the real driver: `yolo` auto-allows client-side and answers
       // synchronously without ever reaching `session/request_permission`'s
@@ -1152,6 +1189,7 @@ function makeFakeAgent(
       // either — a yolo task should never surface an `fx_permission` card.
       after(8, () => {
         onChunk("status", "fake fx permission auto-allowed (yolo)");
+        if (fakeOpts.kind === "fx") emitFakeFxUsageAndTitle(onChunk);
         onChunk("status", "turn complete");
         resolveDone(0);
       });
@@ -1182,6 +1220,7 @@ function makeFakeAgent(
             // chunks against a run `kill()` already tore down.
             if (killed) return;
             onChunk("status", `fake fx permission resolved: ${"optionId" in a ? a.optionId : "cancelled"}`);
+            if (fakeOpts.kind === "fx") emitFakeFxUsageAndTitle(onChunk);
             onChunk("status", "turn complete");
             resolveDone(0);
           })
@@ -1327,8 +1366,18 @@ function makeFakeAgent(
     // the provider sentinel (mirrors `maybeEmitProvider` in fx-acp.ts; see
     // the fx-permission scenario above for the same comment in full).
     if (fakeOpts.kind === "fx") onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
-    after(5, () => onChunk("stdout", `fake response to: ${prompt}`));
-    after(20, () => { onChunk("status", "turn complete"); resolveDone(0); });
+    after(5, () => {
+      // fx ≥0.0.8 mirror: a `thinking` chunk precedes the turn's assistant
+      // text — see `emitFakeFxUsageAndTitle`'s doc comment and the shared
+      // spec in docs/plans/fx-0.0.8-compat.md §3.
+      if (fakeOpts.kind === "fx") onChunk("thinking", "fake fx reasoning");
+      onChunk("stdout", `fake response to: ${prompt}`);
+    });
+    after(20, () => {
+      if (fakeOpts.kind === "fx") emitFakeFxUsageAndTitle(onChunk);
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
   }
   const inst: FakeDriverInstance = {
     _record: record,

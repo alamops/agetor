@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp } from "./helpers";
 import { AGENT_OPTIONS } from "../src/shared/types.ts";
@@ -54,11 +56,25 @@ const FX_DEFAULT_MODEL_ID = "zai/glm-5.3-flash";
 
 /** Curated ids that must NOT survive the curated ∩ discovered filter against
  *  the 3-id stub catalog: two ordinary curated rows absent from the stub
- *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and four of the six
+ *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and five of the twelve
  *  `catalogOnly` premium rows (absent from the stub the same as any other
  *  id would be — catalogOnly gates them even harder, but plain absence
- *  already excludes them under the scoped merge). */
-const EXCLUDED_FX_OPTION_LABELS = ["Grok 4.6", "Kimi K2.7 Code", "Claude Opus 5", "GPT-5.5", "Gemini 3.8 Flash", "Kimi K3"];
+ *  already excludes them under the scoped merge). `Claude Fable 5.1`
+ *  (`anthropic/claude-fable-5.1`, docs/plans/fx-0.0.8-compat.md §3.7's S2
+ *  catalog refresh) joins this list for the same reason — this file's
+ *  worker-wide stub (`e2e/fixtures.ts writeFxStubBin`, frozen for this task)
+ *  only ever answers the fixed 3-id catalog above; the positive case (a
+ *  catalog that DOES contain it) is covered by the dedicated additional-
+ *  harness test below instead of a fourth id added to that frozen stub. */
+const EXCLUDED_FX_OPTION_LABELS = [
+  "Grok 4.6",
+  "Kimi K2.7 Code",
+  "Claude Opus 5",
+  "GPT-5.5",
+  "Gemini 3.8 Flash",
+  "Kimi K3",
+  "Claude Fable 5.1",
+];
 
 /** Mirrors `e2e/fx-interactions.spec.ts`'s identical helper. Duplicated
  *  locally rather than imported — this task's brief scopes edits to this
@@ -184,13 +200,60 @@ function detailsModelSelect(panel: Locator): Locator {
  * bounded 2s ready-retry (docs/plans/fx-model-catalog-refresh.md §3 D4/D5)
  * — never synchronously with whatever action triggered the probe.
  */
-async function expectConvergedFxOptions(select: Locator, timeout = 15_000): Promise<void> {
+async function expectConvergedFxOptions(
+  select: Locator,
+  expected: string[] = EXPECTED_FX_OPTION_LABELS,
+  timeout = 15_000,
+): Promise<void> {
   await expect
     .poll(async () => select.locator("option").allTextContents(), {
       timeout,
       message: "fx model picker never converged to curated ∩ discovered + discovered-only",
     })
-    .toEqual(EXPECTED_FX_OPTION_LABELS);
+    .toEqual(expected);
+}
+
+/**
+ * Writes a throwaway fx stub binary — independent of e2e/fixtures.ts's
+ * worker-wide `AGETOR_FX_BIN` stub (frozen for this task, and fixed to the
+ * 3-id catalog `EXPECTED_FX_OPTION_LABELS` converges to) — whose
+ * `models --json` catalog includes `anthropic/claude-fable-5.1` (the S2
+ * catalogOnly row added by docs/plans/fx-0.0.8-compat.md §3.7) alongside the
+ * curated default `zai/glm-5.3-flash`. Handed to a brand-new *additional* fx
+ * harness (`POST /harnesses`, its own `bin` field) below: `discoverFx`
+ * (agent-discovery.ts) prefers a harness's own `bin` outright over
+ * `AGETOR_FX_BIN`, so this harness's picker converges against this catalog
+ * instead of the frozen fixture's — proving the catalogOnly row surfaces
+ * when the signed-in account's discovered catalog actually contains it,
+ * mirroring `writeFxStubBin`'s shape (its `--help`/`--version` handlers
+ * matter for `checkHarness`'s FX_HELP_MARKER probe; `models --json` is all
+ * `discoverFx` itself reads). Written into a temp dir this test owns and
+ * removes itself in `finally` — not `e2e/fixtures.ts`, not `backend.dataDir`.
+ */
+function writeFableCatalogStubBin(dir: string): string {
+  const binPath = path.join(dir, "fx");
+  writeFileSync(
+    binPath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--help" ]; then',
+      '  echo "Fast, native coding agent for the terminal"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "--version" ]; then',
+      '  echo "0.0.8-fake"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "models" ] && [ "$2" = "--json" ]; then',
+      '  echo \'{"kind":"models","count":2,"shown_count":2,"more_count":0,"private_models_hidden":false,"ids":["zai/glm-5.3-flash","anthropic/claude-fable-5.1"]}\'',
+      "  exit 0",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(binPath, 0o755);
+  return binPath;
 }
 
 test.describe("fx model catalog picker", () => {
@@ -321,5 +384,54 @@ test.describe("fx model catalog picker", () => {
       headers: { authorization: `Bearer ${backend.apiToken}` },
     });
     expect(deleteRes.ok(), `DELETE /tasks/${task.id} -> ${deleteRes.status()}`).toBeTruthy();
+  });
+
+  test("Additional fx harness: a discovered catalog containing anthropic/claude-fable-5.1 surfaces the curated 'Claude Fable 5.1' row", async ({
+    page,
+    backend,
+  }) => {
+    // docs/plans/fx-0.0.8-compat.md TT6 (fx-models half): the S2 catalog
+    // refresh added `anthropic/claude-fable-5.1` ("Claude Fable 5.1") as a
+    // `catalogOnly` row — this test proves it surfaces when the signed-in
+    // account's discovered catalog actually contains it. The "without it"
+    // half is already covered above: `EXCLUDED_FX_OPTION_LABELS` (this
+    // file's frozen worker-wide fx.sh stub never returns this id) now
+    // includes "Claude Fable 5.1" alongside the other catalogOnly negatives.
+    const stubDir = mkdtempSync(path.join(tmpdir(), "agetor-e2e-fx-fable-"));
+    const binPath = writeFableCatalogStubBin(stubDir);
+    const harnessId = `fx-fable-e2e-${randomUUID()}`;
+    const harnessLabel = "fx.sh (fable catalog e2e)";
+    const auth = { authorization: `Bearer ${backend.apiToken}` };
+
+    try {
+      const createRes = await fetch(`${backend.apiBase}/harnesses`, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({
+          id: harnessId,
+          kind: "fx",
+          label: harnessLabel,
+          home: null,
+          bin: binPath,
+          env: {},
+        }),
+      });
+      expect(createRes.ok, `POST /harnesses -> ${createRes.status}: ${await createRes.text()}`).toBeTruthy();
+
+      await gotoApp(page, backend.bootBase);
+      await selectHarness(page, harnessLabel);
+
+      const modelSelect = newTaskModelSelect(page);
+      // This harness's own catalog (["zai/glm-5.3-flash",
+      // "anthropic/claude-fable-5.1"]) converges to exactly these two
+      // curated rows — one ordinary, one catalogOnly — in curated-list order
+      // (`AGENT_OPTIONS.fx.models`), same `mergeModelOptions` rules
+      // `expectConvergedFxOptions`'s default expectation exercises above,
+      // just against a different account's catalog.
+      await expectConvergedFxOptions(modelSelect, ["GLM 5.3 Flash", "Claude Fable 5.1"]);
+    } finally {
+      await fetch(`${backend.apiBase}/harnesses/${harnessId}`, { method: "DELETE", headers: auth }).catch(() => {});
+      rmSync(stubDir, { recursive: true, force: true });
+    }
   });
 });

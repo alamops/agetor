@@ -10,7 +10,7 @@
 // RunPanel.tsx), but a positional index scoped to "whatever's currently
 // displayed" is always available, and it's exactly what the log's
 // `data-evid` DOM attribute is keyed on too.
-import type { RunEventStream } from "../../shared/types.ts";
+import { isInternalStatusSentinel, type RunEventStream } from "../../shared/types.ts";
 import { isImageSourceMetaBreadcrumb } from "../../shared/attachments.ts";
 
 /** Best-effort JSON.parse that never throws — malformed/partial JSON (e.g. a
@@ -51,9 +51,12 @@ function textOf(value: unknown): string {
  *
  * `tool_use`/`tool_result` carry JSON (`{ id, name, input }` /
  * `{ toolUseId, content }` per the `RunEvent` doc comment in shared/types.ts);
- * malformed JSON (legacy truncated payloads, corrupt persisted rows) falls
- * back to the raw string rather than throwing, same as every other
- * best-effort JSON.parse over transcript data in this codebase.
+ * `tool_use` may additionally carry fx's human-facing `title` (fx ≥0.0.8,
+ * separate from its tool id `name`), included in the searchable text
+ * alongside `name` and `input` when it's a non-empty string. Malformed JSON
+ * (legacy truncated payloads, corrupt persisted rows) falls back to the raw
+ * string rather than throwing, same as every other best-effort JSON.parse
+ * over transcript data in this codebase.
  */
 export function searchableEventText(stream: RunEventStream, data: string): string | null {
   switch (stream) {
@@ -62,9 +65,10 @@ export function searchableEventText(stream: RunEventStream, data: string): strin
     case "subagent":
       return null;
     case "tool_use": {
-      const parsed = tryParseJson(data) as { name?: unknown; input?: unknown } | null;
+      const parsed = tryParseJson(data) as { name?: unknown; title?: unknown; input?: unknown } | null;
       if (!parsed || typeof parsed !== "object") return data;
-      const parts = [textOf(parsed.name), textOf(parsed.input)].filter((s) => s !== "");
+      const title = typeof parsed.title === "string" ? parsed.title : "";
+      const parts = [textOf(parsed.name), title, textOf(parsed.input)].filter((s) => s !== "");
       return parts.length > 0 ? parts.join(" ") : data;
     }
     case "tool_result": {
@@ -80,6 +84,11 @@ export function searchableEventText(stream: RunEventStream, data: string): strin
       // DOM node. Same "never rendered → never matches" rule as the streams
       // above.
       if (isImageSourceMetaBreadcrumb(data)) return null;
+      // fx/permission-mode/usage/provider/title sentinels are suppressed
+      // (RunPanel renders no block for them — see `isInternalStatusSentinel`),
+      // so a match here would navigate to an evid with no DOM node. Same
+      // "never rendered → never matches" rule as the breadcrumb above.
+      if (isInternalStatusSentinel(data)) return null;
       return data;
     case "user":
     case "assistant":
