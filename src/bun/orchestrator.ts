@@ -15,6 +15,7 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
+  FX_RECOVERY_STATUS_PREFIX,
   IDLE_SESSION_REAP_MS,
   SESSION_DIED_STATUS_PREFIX,
   TASK_TYPES,
@@ -27,6 +28,7 @@ import {
   type Harness,
   type TaskType,
 } from "../shared/types.ts";
+import { isFxRecoveryResumable, parseFxRecoveryPayload } from "../shared/fx-recovery.ts";
 
 /**
  * Resolve a task's harness id to its full row (falling back to a synthetic
@@ -3265,7 +3267,7 @@ const fxTurnQueue = new Map<string, string[]>();
  * resumed ACP turn (sequential-turn model, same as codex/cursor/gemini). When
  * a turn is already running, the message is queued; otherwise it spawns
  * immediately. Returns the run id the message was attached to, or null on
- * lookup failure — or when `spawnFxTurnNow` declined to mint a run because
+ * lookup failure — or when `spawnFxRun` declined to mint a run because
  * `startingTaskIds` was already claimed for this task (see that set's doc,
  * near `startTask`).
  */
@@ -3284,8 +3286,17 @@ async function sendFxTurn(taskId: string, line: string): Promise<string | null> 
     emit({ runId, taskId, stream: "user", data, ts: Date.now() });
     return runId;
   }
-  return spawnFxTurnNow(task, taskId, line);
+  return spawnFxRun(task, taskId, { line });
 }
+
+/**
+ * The two shapes `spawnFxRun` can start: an ordinary follow-up carrying a
+ * user-typed `line` (echoed as a `user` bubble, sent as the turn's prompt),
+ * or a `continueRecovery` turn that resumes a PAUSED model response (see
+ * `resumeFxRecovery`, plan §3.5) with no new prompt at all — fx's own
+ * checkpoint supplies the continuation.
+ */
+type FxTurn = { line: string } | { continueRecovery: true };
 
 /**
  * Spawn a fresh fx turn that resumes the task's prior conversation via fx's
@@ -3294,8 +3305,18 @@ async function sendFxTurn(taskId: string, line: string): Promise<string | null> 
  * thread id, fx's session id is DISCOVERED post-hoc (from ACP's `session/new`
  * response), so it's carried forward on the insert below and re-stamped
  * (idempotently) once `onSessionId` fires again for this turn.
+ *
+ * Handles both {@link FxTurn} variants; everything (the `startingTaskIds`
+ * claim, the run-row insert, the column flip/emit, `spawnAgentOrFail` /
+ * `registerActiveRun` / `attachDoneHandler`, and the queue-drop-on-spawn-
+ * failure) is identical between them. They differ only in: whether a `user`
+ * bubble is echoed (never for `continueRecovery` — nothing was typed), the
+ * status line, the prompt text handed to the driver (`""` for
+ * `continueRecovery`; fx-acp.ts sends an empty `prompt` content array
+ * downstream when `continueRecovery` is set, per ACP's continue-recovery
+ * shape), and `opts.continueRecovery`.
  */
-async function spawnFxTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+async function spawnFxRun(task: Task, taskId: string, turn: FxTurn): Promise<string | null> {
   // Claim the unified "starting" slot before touching the DB — see
   // `startingTaskIds`'s doc (near `startTask`) and the matching comment in
   // `spawnCodexTurnNow` for the double-mint race this closes. `null` is
@@ -3332,13 +3353,22 @@ async function spawnFxTurnNow(task: Task, taskId: string, line: string): Promise
 
     const kind: AgentKind = harness?.kind ?? "fx";
     const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
-    onChunk("user", normalizeUserText(line));
-    onChunk(
-      "status",
-      priorSessionId
-        ? `resuming fx session ${priorSessionId.slice(0, 8)}…`
-        : "no prior fx session — starting fresh",
-    );
+    if ("line" in turn) {
+      onChunk("user", normalizeUserText(turn.line));
+      onChunk(
+        "status",
+        priorSessionId
+          ? `resuming fx session ${priorSessionId.slice(0, 8)}…`
+          : "no prior fx session — starting fresh",
+      );
+    } else {
+      // `resumeFxRecovery` already checked `findLastFxSessionId(taskId)` is
+      // non-null before ever calling this — `priorSessionId` here is a
+      // fresh re-read of the same query, not the value that check saw, so
+      // the `?? ""` stays purely defensive against a same-instant race
+      // rather than a case this path expects to hit.
+      onChunk("status", `resuming paused fx response in session ${(priorSessionId ?? "").slice(0, 8)}…`);
+    }
 
     if (!harness) {
       onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
@@ -3351,7 +3381,7 @@ async function spawnFxTurnNow(task: Task, taskId: string, line: string): Promise
       taskId,
       runId: newRunId,
       harness,
-      prompt: line,
+      prompt: "line" in turn ? turn.line : "",
       cwd,
       onChunk,
       onSessionId: (sessionId) => {
@@ -3364,6 +3394,7 @@ async function spawnFxTurnNow(task: Task, taskId: string, line: string): Promise
         fast: task.fast,
         maxMode: task.maxMode,
         resumeSessionId: priorSessionId,
+        ...("continueRecovery" in turn ? { continueRecovery: true } : {}),
       },
     });
     if (!agent) {
@@ -3402,7 +3433,7 @@ async function drainFxQueue(taskId: string): Promise<void> {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) fxTurnQueue.delete(taskId);
-  if (next !== undefined) await spawnFxTurnNow(task, taskId, next);
+  if (next !== undefined) await spawnFxRun(task, taskId, { line: next });
 }
 
 /** Most-recent fx session id across the task's runs (for resume). */
@@ -3414,6 +3445,68 @@ function findLastFxSessionId(taskId: string): string | null {
      LIMIT 1`,
   ).get(taskId);
   return row?.fx_session_id ?? null;
+}
+
+/**
+ * Continue a PAUSED fx model response (plan `docs/plans/fix-fx-harness-rate-
+ * limit.md` §2 "Resume evidence", §3 decision 5) — the Vercel AI Gateway hit
+ * its free-tier rate limit, fx retried up to its attempt cap, and gave up
+ * with a durable, resumable checkpoint (`FxRecoveryPayload.state ===
+ * "paused"`, `requiredAction === "continue_later"`). Resuming replays that
+ * checkpoint via a fresh `session/resume` + `session/prompt {..,
+ * _meta:{fx:{continueRecovery:true}}}` turn (see `spawnFxRun`'s
+ * `continueRecovery` variant and fx-acp.ts) — no new prompt is sent, so the
+ * user's next real message still lands on the same conversation.
+ *
+ * Every gating check below runs BEFORE `spawnFxRun` is ever called, because
+ * an ungated call would spawn a real run row (flipping the card to
+ * `running`, opening a live fx ACP process) only to have fx's own
+ * `session/prompt` answer `-32602 "No paused model response to continue"` —
+ * a run failing for a reason agetor could have caught synchronously against
+ * data it already has. Order matters: existence and archival first (cheap,
+ * no DB scan), then the harness-kind check (a non-fx task can never have a
+ * recovery sentinel, but checking first gives a clearer error than "no
+ * paused response"), then in-flight (nothing to gate against once a turn is
+ * already running), then the run/sentinel/session-id lookups that actually
+ * decide resumability.
+ */
+export async function resumeFxRecovery(
+  taskId: string,
+): Promise<{ ok: true; runId: string } | { ok: false; status: 400 | 404 | 409; error: string }> {
+  const task = tasks.get(taskId);
+  if (!task) return { ok: false, status: 404, error: "not found" };
+  if (task.archivedAt != null) return { ok: false, status: 400, error: "task is archived" };
+  if (resolveHarness(task.agent)?.kind !== "fx") {
+    return { ok: false, status: 400, error: "only fx tasks can resume a paused response" };
+  }
+  if ((task.runId && active.has(task.runId)) || startingTaskIds.has(taskId)) {
+    return { ok: false, status: 409, error: "a turn is already in flight for this task" };
+  }
+
+  const latestRun = db.query<{ id: string; status: string }, [string]>(
+    `SELECT id, status FROM runs WHERE task_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`,
+  ).get(taskId);
+  if (!latestRun || latestRun.status !== "failed") {
+    return { ok: false, status: 400, error: "no paused fx response to resume" };
+  }
+
+  const sentinelRow = db.query<{ data: string }, [string, string]>(
+    `SELECT data FROM run_events WHERE run_id = ? AND stream = 'status' AND data LIKE ? ORDER BY id DESC LIMIT 1`,
+  ).get(latestRun.id, `${FX_RECOVERY_STATUS_PREFIX}%`);
+  const payload = sentinelRow ? parseFxRecoveryPayload(sentinelRow.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) : null;
+  if (!isFxRecoveryResumable(payload)) {
+    return { ok: false, status: 400, error: "no paused fx response to resume" };
+  }
+
+  if (findLastFxSessionId(taskId) === null) {
+    return { ok: false, status: 400, error: "no fx session to resume" };
+  }
+
+  const runId = await spawnFxRun(task, taskId, { continueRecovery: true });
+  if (runId === null) {
+    return { ok: false, status: 409, error: "a turn is already starting for this task" };
+  }
+  return { ok: true, runId };
 }
 
 /**

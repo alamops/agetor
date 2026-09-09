@@ -2,7 +2,13 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task, RunEvent } from "../../shared/types.ts";
-import { commitPushPrompt, isInternalStatusSentinel } from "../../shared/types.ts";
+import { FX_RECOVERY_STATUS_PREFIX, commitPushPrompt, isInternalStatusSentinel } from "../../shared/types.ts";
+import {
+  fxRecoveryNoticeText,
+  isFxRecoveryResumable,
+  latestFxRecoveryByRun,
+  parseFxRecoveryPayload,
+} from "../../shared/fx-recovery.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
 import {
   parseSentFilesToolUse,
@@ -300,6 +306,21 @@ export function Dashboard({
         setStatus("task is not running");
       }
     }
+    // Continue an fx response the Vercel AI Gateway (or another recoverable
+    // provider error) paused mid-turn — `docs/plans/
+    // fix-fx-harness-rate-limit.md` §3.5/T6. No gate on the key itself (a
+    // non-fx or non-paused task simply gets the server's `{error}` text back
+    // via the `.catch` below, same posture as every other one-shot action
+    // here) — the Detail header's "⚠ paused — press r to resume" hint is
+    // what tells the user when this key actually does something.
+    if (input === "r" && selected) {
+      const sid = selected.id.slice(0, 8);
+      void client
+        .resumeFxRecovery(selected.id)
+        .then((r) => setStatus(`▸ resuming ${sid} (run ${r.runId.slice(0, 8)})`))
+        .catch((e) => setStatus(`! ${(e as Error).message}`));
+      return;
+    }
   }, { isActive: mode === "nav" });
 
   const rows = process.stdout.rows || 30;
@@ -448,6 +469,24 @@ function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
   // value, so an unrelated line's `sentLine` prop stays `undefined` across
   // flushes and `EventLine`'s shallow memo bails out for it.
   const sentLines = useMemo(() => buildSentFilesLines(events), [events]);
+  // Same primitive-not-Map-lookup-in-render discipline as `sentLines` above
+  // (see its own doc comment) — `buildFxRecoveryLines` returns the per-event
+  // notice text (or `null`) already resolved, so `EventLine`'s memo isn't
+  // defeated by handing it a Map reference that's fresh every flush.
+  const recoveryLines = useMemo(() => buildFxRecoveryLines(events), [events]);
+  // "⚠ paused — press r to resume" header hint: resolvable only off the
+  // NEWEST run visible in this window (`events`, already the "visible"
+  // slice from the parent) — a resumable `paused` sentinel from an older,
+  // already-superseded run must not relight the hint. `task.column !==
+  // "running"` guards the moment between Resume being pressed and the new
+  // run's own events landing, so the hint can't keep showing "press r"
+  // while a resume (or a fresh send) is already in flight.
+  const lastRecoveryByRun = useMemo(() => latestFxRecoveryByRun(events), [events]);
+  const lastEvent = events[events.length - 1];
+  const showResumeHint =
+    lastEvent != null &&
+    isFxRecoveryResumable(lastRecoveryByRun.get(lastEvent.runId)) &&
+    task.column !== "running";
   return (
     <Box flexDirection="column">
       <Text wrap="truncate">
@@ -456,13 +495,19 @@ function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
         {task.pendingInteractionCount > 0 ? (
           <Text color="yellow"> · ! press g to answer</Text>
         ) : null}
+        {showResumeHint ? <Text color="yellow"> · ⚠ paused — press r to resume</Text> : null}
       </Text>
       <Box flexDirection="column" marginTop={1}>
         {events.length === 0 ? (
           <Text dimColor>no events yet</Text>
         ) : (
           events.map((e) => (
-            <EventLine key={eventKey(e)} e={e} sentLine={sentLines.get(eventKey(e))} />
+            <EventLine
+              key={eventKey(e)}
+              e={e}
+              sentLine={sentLines.get(eventKey(e))}
+              recoveryLine={recoveryLines.get(eventKey(e))}
+            />
           ))
         )}
       </Box>
@@ -560,12 +605,49 @@ export function buildSentFilesLines(events: RunEvent[]): Map<string, string | nu
   return lines;
 }
 
+/**
+ * `eventKey(e) → notice text | null` pre-pass for fx's model-response-
+ * recovery sentinel (`FX_RECOVERY_STATUS_PREFIX`, see `src/shared/
+ * fx-recovery.ts` and `docs/plans/fix-fx-harness-rate-limit.md`), mirroring
+ * `buildSentFilesLines` exactly — same primitive-per-event-key shape for
+ * the same reason (a Map handed to a memoized `EventLine` must compare by
+ * VALUE across flushes, not by a fresh-every-render Map reference). Every
+ * recovery-sentinel event maps to `null` (nothing to show — the `status`
+ * case already hides it via `isInternalStatusSentinel`, same as the
+ * usage/provider/title sentinels) EXCEPT the LAST `state === "active"`
+ * sentinel per `runId`, which maps to `fxRecoveryNoticeText(p)` — fx's own
+ * live retry-progress line, rendered in place of that one row instead of
+ * being suppressed. A row whose body fails to parse renders as `null`.
+ * Absent entirely (`undefined` on `.get`) for every non-recovery event,
+ * same convention as `buildSentFilesLines`.
+ */
+export function buildFxRecoveryLines(events: RunEvent[]): Map<string, string | null> {
+  const lines = new Map<string, string | null>();
+  // `runId → { key, text }` of the LAST active sentinel seen so far for that
+  // run — array order is wire/event order, so the final write per runId
+  // wins, matching `latestFxRecoveryByRun`'s "last sentinel per run wins".
+  const lastActiveByRun = new Map<string, { key: string; text: string }>();
+  for (const e of events) {
+    if (e.stream !== "status" || !e.data.startsWith(FX_RECOVERY_STATUS_PREFIX)) continue;
+    const key = eventKey(e);
+    lines.set(key, null);
+    const payload = parseFxRecoveryPayload(e.data.slice(FX_RECOVERY_STATUS_PREFIX.length));
+    if (payload?.state === "active") {
+      lastActiveByRun.set(e.runId, { key, text: fxRecoveryNoticeText(payload) });
+    }
+  }
+  for (const { key, text } of lastActiveByRun.values()) lines.set(key, text);
+  return lines;
+}
+
 const EventLine = memo(function EventLine({
   e,
   sentLine,
+  recoveryLine,
 }: {
   e: RunEvent;
   sentLine: string | null | undefined;
+  recoveryLine: string | null | undefined;
 }) {
   switch (e.stream) {
     // `userMessageLines` (src/shared/user-message.ts) is the single source of
@@ -591,7 +673,20 @@ const EventLine = memo(function EventLine({
           {e.data}
         </Text>
       );
-    case "status":
+    case "status": {
+      // `recoveryLine` (from `buildFxRecoveryLines`, computed once per
+      // window in `Detail`) is the already-formatted fx-recovery notice for
+      // an "active" sentinel, `null` for every other recovery sentinel
+      // (hidden), or simply `undefined` for a non-recovery status line —
+      // fall through to today's rendering for that last case.
+      if (typeof recoveryLine === "string") {
+        return (
+          <Text color="yellow" wrap="truncate-end">
+            {recoveryLine}
+          </Text>
+        );
+      }
+      if (recoveryLine === null) return null;
       // Internal-only sentinel status chunks (permission-mode chip, fx usage
       // chip, …) are UI-plumbing, not transcript content — see
       // `isInternalStatusSentinel` in shared/types.ts, the one predicate every
@@ -602,6 +697,7 @@ const EventLine = memo(function EventLine({
           • {e.data}
         </Text>
       );
+    }
     case "stderr":
       return (
         <Text color="red" wrap="truncate-end">
@@ -685,7 +781,7 @@ function Footer({
       ? "type a message · enter send · esc cancel"
       : mode === "answer"
         ? "↑/↓ move · space toggle · enter submit · esc cancel"
-        : "↑/↓ select · s run · x stop · m msg · c commit · g answer · q quit";
+        : "↑/↓ select · s run · x stop · m msg · c commit · g answer · r resume · q quit";
   return (
     <Box justifyContent="space-between" paddingX={1}>
       <Text dimColor>{hint}</Text>

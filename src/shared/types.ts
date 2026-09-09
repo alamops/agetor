@@ -114,23 +114,91 @@ export const FX_PROVIDER_STATUS_PREFIX = "fx-provider: ";
 export const FX_SESSION_TITLE_STATUS_PREFIX = "fx-title: ";
 
 /**
+ * Sentinel prefix for the `status` chunk fx-acp.ts emits per ACP
+ * `session_info_update` notification carrying `_meta.fx.modelResponseRecovery`
+ * — fx's retry-progress channel for a model call that hit a transient
+ * failure (rate limit, dropped connection, provider timeout, …), live since
+ * fx 0.0.7. One update is emitted per Gateway retry attempt, one more for the
+ * terminal paused state if fx exhausts its retry budget, one for a recovered
+ * state if a retry succeeds, and a final one when fx clears the checkpoint
+ * (`modelResponseRecovery: null`). Payload is JSON: `FxRecoveryPayload`.
+ * Suppressed from transcripts via `isInternalStatusSentinel`; RunPanel
+ * derives a live progress notice plus a Resume affordance from it, CLI
+ * `agetor logs` prints the active-state progress lines, and the TUI
+ * dashboard shows the latest one.
+ */
+export const FX_RECOVERY_STATUS_PREFIX = "fx-recovery: ";
+
+/** The lifecycle states fx reports on its recovery channel — see
+ *  {@link FxRecoveryPayload}. `"cleared"` is agetor's own label for a wire
+ *  `modelResponseRecovery: null` (fx has dropped the checkpoint), not a
+ *  state fx itself names. */
+export type FxRecoveryState = "active" | "paused" | "recovered" | "cleared";
+
+/**
+ * JSON body carried after `FX_RECOVERY_STATUS_PREFIX`. Mirrors fx's own
+ * `_meta.fx.modelResponseRecovery` wire shape (see `FX_RECOVERY_STATUS_PREFIX`
+ * for when it's emitted); every field beyond `state` is optional so a
+ * terse or forward-compat update still parses.
+ */
+export interface FxRecoveryPayload {
+  /** `"active"` while fx is mid-retry, `"paused"` once fx gives up and the
+   *  checkpoint is resumable, `"recovered"` once a retry succeeds, or
+   *  `"cleared"` for the wire's `modelResponseRecovery: null` (checkpoint
+   *  dropped — e.g. consumed by a normal follow-up prompt). */
+  state: FxRecoveryState;
+  /** Verbatim fx enum tags (forward-compat: unknown values pass through and
+   *  render as-is). `kind` distinguishes e.g. `auto_retry` from
+   *  `terminal_provider_error` from `auto_recovered`. */
+  kind?: string;
+  /** Why this attempt is happening, e.g. `rate_limited`, `network_interrupted`,
+   *  `response_interrupted`, `provider_stream_timeout`, `provider_unavailable`,
+   *  `system_resumed`, `authentication`, `request_limit_reached`. */
+  cause?: string;
+  /** What fx is doing about it, e.g. `retrying_request`, `continuing_response`,
+   *  `regenerating_tool`, `continuing_after_tool`, `reconciling_tool`,
+   *  `waiting_for_connectivity`, `paused`. */
+  action?: string;
+  /** Set only on a `paused` update: what the caller needs to do next, e.g.
+   *  `continue_later` (Resume applies), `inspect_uncertain_tool`,
+   *  `change_request`. */
+  requiredAction?: string;
+  /** 1-based retry attempt number and the configured cap for this recovery
+   *  episode (fx's `10/10` in "recovery paused after 10/10 attempts"). */
+  attempt?: number;
+  attemptLimit?: number;
+  /** Backoff delay in seconds before the next retry, when fx reports one. */
+  delaySeconds?: number;
+  /** Whether this checkpoint survives an `fx acp` process restart (true for
+   *  every update observed live) — informational only, agetor doesn't branch
+   *  on it. */
+  durable?: boolean;
+  /** fx's own human-readable label, verbatim, e.g. "⚠ Rate limited · HTTP
+   *  429 · rate_limit_exceeded: … · retrying request in 8s · attempt 5/10". */
+  message?: string;
+}
+
+/**
  * True for `status`-stream chunks that are UI-internal sentinel channels, not
  * transcript content: currently `PERMISSION_MODE_STATUS_PREFIX` (fed a chip,
  * now suppressed-only), `FX_USAGE_STATUS_PREFIX` (feeds the run-row usage
- * chip), `FX_PROVIDER_STATUS_PREFIX` (feeds the run-row provider chip), and
- * `FX_SESSION_TITLE_STATUS_PREFIX` (feeds the run-row session-title chip) —
- * three fx sentinels in all. Every renderer of raw status events —
- * RunPanel's status dividers, the CLI's `agetor logs` formatter, and the TUI
- * dashboard — must consult this ONE predicate instead of maintaining its own
- * prefix list, so a new sentinel can't silently leak verbatim into one
- * surface while another suppresses it.
+ * chip), `FX_PROVIDER_STATUS_PREFIX` (feeds the run-row provider chip),
+ * `FX_SESSION_TITLE_STATUS_PREFIX` (feeds the run-row session-title chip),
+ * and `FX_RECOVERY_STATUS_PREFIX` (feeds the live recovery notice, the
+ * paused/Resume affordance, and CLI/TUI progress lines) — four fx sentinels
+ * in all. Every renderer of raw status events — RunPanel's status dividers,
+ * the CLI's `agetor logs` formatter, and the TUI dashboard — must consult
+ * this ONE predicate instead of maintaining its own prefix list, so a new
+ * sentinel can't silently leak verbatim into one surface while another
+ * suppresses it.
  */
 export function isInternalStatusSentinel(data: string): boolean {
   return (
     data.startsWith(PERMISSION_MODE_STATUS_PREFIX) ||
     data.startsWith(FX_USAGE_STATUS_PREFIX) ||
     data.startsWith(FX_PROVIDER_STATUS_PREFIX) ||
-    data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX)
+    data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX) ||
+    data.startsWith(FX_RECOVERY_STATUS_PREFIX)
   );
 }
 
@@ -1878,14 +1946,18 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
   "gemini": { code: "auto", plan: "ask" },
   // fx has three of its own permission modes (yolo/auto/ask — see
   // AGENT_OPTIONS.fx.modes below). Like every other kind, Code resolves to
-  // modes[0] — "auto" (fx's LLM auto-review resolves most tool calls;
-  // anything unresolved surfaces as an approval card) — the
-  // hands-off-but-reviewed default, not "yolo" (permission checks disabled
-  // entirely): a Plan→Code pill round-trip must not escalate a task past
-  // what it started at. "yolo" stays reachable only as an explicit picker
-  // choice. Plan resolves to "ask" (only pre-approved rules run; everything
-  // else surfaces as an approval card).
-  "fx": { code: "auto", plan: "ask" },
+  // modes[0] — now "yolo" ("Full access"), fx's actual hands-off mode. On a
+  // standard-plan Gateway account fx's hard-wired auto-reviewer
+  // (openai/gpt-5.6-luna) answers 403, so "auto" holds every tool call
+  // instead of reviewing it and the agent replans into the free-tier rate
+  // limit chasing an approval that will never come (see
+  // docs/plans/fix-fx-harness-rate-limit.md). "auto" and "ask" stay reachable
+  // only as explicit picker choices. A `null` stored mode still spawns as
+  // "auto" (see `src/bun/agents.ts`'s `opts.mode ?? "auto"`), so an existing
+  // task is never silently escalated to Full access by this change. Plan
+  // still resolves to "ask" (only pre-approved rules run; everything else
+  // surfaces as an approval card).
+  "fx": { code: "yolo", plan: "ask" },
 };
 
 /**
@@ -2303,8 +2375,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [
-      { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; anything unresolved surfaces as an approval card." },
-      { id: "yolo", label: "Full access", hint: "Disables fx's permission checks — what fx 0.0.8 calls --full-access / /permissions full-access; yolo is fx's surviving alias and stays agetor's stored id." },
+      { id: "yolo", label: "Full access", hint: "Hands-off default — disables fx's permission checks entirely, so no tool call is ever held. What fx 0.0.8 calls --full-access / /permissions full-access; yolo is fx's surviving alias and stays agetor's stored id." },
+      { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
     // No model in MODEL_EFFORT_SUPPORT.fx accepts the effort flag, so the

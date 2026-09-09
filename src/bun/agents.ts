@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import path from "node:path";import { cursorModelArg, FX_PROVIDER_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
+import path from "node:path";import { cursorModelArg, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness } from "../shared/types.ts";
+import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
 import { GEMINI_PROMPT_ARGV_MAX_BYTES } from "../shared/prompt-limits.ts";
 import { settleSubagentById } from "./claude-subagents.ts";
 import {
@@ -132,6 +133,17 @@ export interface AgentRunOptions {
    * of getting its own `buildFxCommand` wrapper.
    */
   runId?: string | null;
+  /**
+   * fx-only: continue a response fx paused after exhausting its provider
+   * retries (see `FX_RECOVERY_STATUS_PREFIX` in shared/types.ts) instead of
+   * sending a new prompt. Requires `resumeSessionId` — there is no paused
+   * checkpoint to continue on a fresh session. When set, the driver sends
+   * the ACP `session/prompt` call with an empty `prompt: []` and
+   * `_meta.fx.continueRecovery: true`; the prompt text passed to
+   * `spawnAgent`/`buildCommand` is ignored for this turn. Every other agent
+   * kind ignores this field entirely.
+   */
+  continueRecovery?: boolean;
 }
 
 // Map friendly model ids to the exact strings the claude-code CLI expects.
@@ -851,6 +863,21 @@ export const FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER = "__agetor_fake_claude_sent_f
  */
 export const FAKE_FX_PERMISSION_PROMPT_MARKER = "__agetor_fake_fx_permission__";
 /**
+ * Prompt-marker trigger for the fx model-response-recovery scenario (see
+ * `makeFakeAgent` below and `docs/plans/fix-fx-harness-rate-limit.md` §3) —
+ * same rationale as {@link FAKE_FX_PERMISSION_PROMPT_MARKER}: puts the "storm"
+ * variant (a run of retry sentinels ending in `paused`) on the wire for an
+ * e2e spec that can't set a per-test env var against the worker-shared
+ * `headless.ts` backend. `AGETOR_FAKE_FX_RECOVERY=1` is the process-wide
+ * equivalent for unit/driver tests that don't need per-task scoping. Neither
+ * trigger matters when the launch itself carries
+ * `AgentRunOptions.continueRecovery: true` — that always selects the
+ * "continue" variant (a `recovered` sentinel followed by an ordinary turn)
+ * regardless of what the prompt says, since a continue turn's prompt text is
+ * ignored entirely (see `AgentRunOptions.continueRecovery`'s doc comment).
+ */
+export const FAKE_FX_RECOVERY_PROMPT_MARKER = "__agetor_fake_fx_recovery__";
+/**
  * Same prompt-marker trick as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER}, for the
  * "Claude Code Monitor" scenario (see
  * `docs/plans/claude-code-monitors-hold-running.md`): drives the real "held
@@ -910,7 +937,7 @@ function makeFakeAgent(
   taskId: string,
   prompt: string,
   onChunk: ChunkHandler,
-  fakeOpts: { runId?: string; mode?: string; kind?: AgentKind; cwd?: string } = {},
+  fakeOpts: { runId?: string; mode?: string; kind?: AgentKind; cwd?: string; continueRecovery?: boolean } = {},
 ): SpawnedAgent {  const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
   const done = new Promise<number>((res) => { resolveDone = res; });
@@ -1156,6 +1183,123 @@ function makeFakeAgent(
       settleSubagentById(monitorId, "completed", "receipt");
       record.push(`monitor:settled:${monitorId}`);
     });
+  } else if (
+    fakeOpts.kind === "fx"
+    && (
+      fakeOpts.continueRecovery === true
+      || process.env.AGETOR_FAKE_FX_RECOVERY === "1"
+      || prompt.includes(FAKE_FX_RECOVERY_PROMPT_MARKER)
+    )
+  ) {
+    // Test hook: simulate fx's model-response-recovery channel (the
+    // `_meta.fx.modelResponseRecovery` field on a `session_info_update`
+    // notification — see `FX_RECOVERY_STATUS_PREFIX`'s doc comment in
+    // shared/types.ts) so orchestrator/RunPanel/CLI/TUI tests and
+    // `e2e/fx-recovery.spec.ts` can drive the whole 429 → paused → Resume
+    // flow without a real Gateway rate limit. Mirrors the real driver's
+    // mapping in fx-acp.ts's `session_info_update` branch: each retry
+    // attempt becomes an `FX_RECOVERY_STATUS_PREFIX` sentinel `status` chunk
+    // (`{FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(payload)}`), and the two
+    // terminal transitions (`paused`, `recovered`) additionally get a plain,
+    // persisted `status` line via `fxRecoverySummaryLine` — see
+    // docs/plans/fix-fx-harness-rate-limit.md §3 for the full spec this
+    // mirrors chunk-for-chunk.
+    //
+    // `fakeOpts.continueRecovery === true` always wins over the two prompt/
+    // env triggers (checked first below) — a continue launch's prompt text
+    // is ignored by the real driver too (see `AgentRunOptions.continueRecovery`),
+    // so there's nothing to inspect the prompt for on that turn.
+    if (fakeOpts.continueRecovery === true) {
+      // "continue" variant: fx resumed a paused checkpoint and the retry
+      // succeeded on the first attempt — one `recovered` sentinel, its
+      // persisted summary line, then an ordinary short turn.
+      onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+      after(5, () => {
+        const recovered: FxRecoveryPayload = {
+          state: "recovered",
+          kind: "auto_recovered",
+          attempt: 1,
+          attemptLimit: 3,
+          durable: true,
+          message: "✓ recovered · succeeded on attempt 1/3",
+        };
+        onChunk("status", `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(recovered)}`);
+        const summary = fxRecoverySummaryLine(recovered);
+        if (summary) onChunk("status", summary);
+      });
+      after(10, () => {
+        onChunk("thinking", "fake fx reasoning");
+        onChunk("assistant", "recovered answer");
+        emitFakeFxUsageAndTitle(onChunk);
+        onChunk("status", "turn complete");
+        resolveDone(0);
+      });
+    } else {
+      // "recovery" storm variant: three retry attempts (the second carrying
+      // a `delaySeconds`, mirroring fx's real backoff reporting), then a
+      // terminal `paused` update once the fake attempt budget (3) is
+      // exhausted — fx's own real cap is 10, but a small fixed number keeps
+      // this scenario fast and deterministic.
+      onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+      after(5, () => {
+        const attempt1: FxRecoveryPayload = {
+          state: "active",
+          kind: "auto_retry",
+          cause: "rate_limited",
+          action: "retrying_request",
+          attempt: 1,
+          attemptLimit: 3,
+          durable: true,
+          message: "⚠ Rate limited · HTTP 429 · fake gateway limit · retrying request · attempt 1/3",
+        };
+        onChunk("status", `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(attempt1)}`);
+      });
+      after(400, () => {
+        const attempt2: FxRecoveryPayload = {
+          state: "active",
+          kind: "auto_retry",
+          cause: "rate_limited",
+          action: "retrying_request",
+          attempt: 2,
+          attemptLimit: 3,
+          delaySeconds: 1,
+          durable: true,
+          message: "⚠ Rate limited · HTTP 429 · fake gateway limit · retrying request in 1s · attempt 2/3",
+        };
+        onChunk("status", `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(attempt2)}`);
+      });
+      after(800, () => {
+        const attempt3: FxRecoveryPayload = {
+          state: "active",
+          kind: "auto_retry",
+          cause: "rate_limited",
+          action: "retrying_request",
+          attempt: 3,
+          attemptLimit: 3,
+          durable: true,
+          message: "⚠ Rate limited · HTTP 429 · fake gateway limit · retrying request · attempt 3/3",
+        };
+        onChunk("status", `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(attempt3)}`);
+      });
+      after(1500, () => {
+        const paused: FxRecoveryPayload = {
+          state: "paused",
+          kind: "terminal_provider_error",
+          cause: "rate_limited",
+          action: "paused",
+          requiredAction: "continue_later",
+          attempt: 3,
+          attemptLimit: 3,
+          durable: true,
+          message: "⚠ Rate limited · HTTP 429 · fake gateway limit · recovery paused after 3/3 attempts",
+        };
+        onChunk("status", `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(paused)}`);
+        const summary = fxRecoverySummaryLine(paused);
+        if (summary) onChunk("status", summary);
+        onChunk("status", "fx turn ended: refused (response paused after 3/3 attempts — resumable)");
+        resolveDone(1);
+      });
+    }
   } else if (
     process.env.AGETOR_FAKE_FX_PERMISSION === "1"
     || prompt.includes(FAKE_FX_PERMISSION_PROMPT_MARKER)
@@ -1639,7 +1783,13 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       // (see the `onSessionId` doc on `SpawnAgentArgs`), not claude/gemini's
       // pre-generated-uuid pattern.
       onSessionId?.(`fake-fx-session-${taskId}`);
-      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto", kind: "fx", cwd });
+      return makeFakeAgent(taskId, prompt, onChunk, {
+        runId,
+        mode: opts.mode ?? "auto",
+        kind: "fx",
+        cwd,
+        continueRecovery: opts.continueRecovery === true,
+      });
     }
     const built = buildCommand(harness, prompt, { ...opts, runId });
     return spawnFxViaAcp({
@@ -1651,6 +1801,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       promptText: prompt,
       mode: (opts.mode ?? "auto") as FxMode,
       resumeSessionId: opts.resumeSessionId ?? undefined,
+      continueRecovery: opts.continueRecovery === true,
       onChunk,
       onSessionId,
     });

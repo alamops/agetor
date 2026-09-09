@@ -195,6 +195,19 @@ export class AgetorClient {
   ): Promise<{ ok: boolean }> {
     return this.req("POST", `/fx-permissions/${id}/answer`, body);
   }
+  /** Continue an fx response a Vercel AI Gateway rate limit (or another
+   *  recoverable provider error) paused mid-turn — `docs/plans/
+   *  fix-fx-harness-rate-limit.md` §3.5. Sends no new prompt; the server
+   *  spawns a fresh run in the task's existing fx session with
+   *  `_meta.fx.continueRecovery: true`, resuming from fx's own checkpoint.
+   *  Only an fx task whose latest run ended with a resumable `paused`
+   *  recovery sentinel qualifies — the server 400s/404s/409s otherwise, and
+   *  that error text (including fx's own verbatim `-32602` message on a
+   *  rejected continue) propagates as a thrown `ApiError` like every other
+   *  call here. */
+  resumeFxRecovery(taskId: string): Promise<{ ok: true; runId: string }> {
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/fx-resume`);
+  }
 
   // ── projects ───────────────────────────────────────────────────────────────
   listProjects(): Promise<Project[]> {

@@ -22,7 +22,7 @@ import {
   dataDir,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
@@ -458,6 +458,15 @@ function planCursorKindGuard(req: Request, task: Task): Response | null {
  *  `taskId:planId` (not just `planId`, though plan ids are already unique)
  *  to read unambiguously in isolation. */
 const approvalsInFlight = new Set<string>();
+
+/** Concurrent-resume guard for `/tasks/:id/fx-resume`, same shape as
+ *  `approvalsInFlight` above: claimed synchronously before any `await` so
+ *  two POSTs racing in on the same task can't both pass
+ *  `resumeFxRecovery`'s in-flight check and both spawn a continue-recovery
+ *  run against fx's single checkpoint — the second is rejected with 409
+ *  before it calls into the orchestrator at all. Keyed on the task id
+ *  (there's only ever one paused response per task at a time). */
+const fxResumesInFlight = new Set<string>();
 
 /**
  * Coerce an untrusted request body into a well-formed BranchNamingConfig,
@@ -4886,6 +4895,37 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json(updated, { headers: corsHeaders(req) });
           } finally {
             approvalsInFlight.delete(key);
+          }
+        }),
+      },
+
+      // Resume a PAUSED fx model response (Vercel AI Gateway rate-limit
+      // recovery — see `resumeFxRecovery`'s doc in orchestrator.ts and plan
+      // `docs/plans/fix-fx-harness-rate-limit.md` §2/§3.5). Mirrors the
+      // approve route just above: a synchronous per-task claim before any
+      // `await` so two racing POSTs can't both pass `resumeFxRecovery`'s own
+      // in-flight check and both spawn a continue-recovery turn against
+      // fx's single checkpoint. All the real gating (task existence,
+      // archived, fx-only, in-flight, resumable-sentinel, session id) lives
+      // in `resumeFxRecovery` itself; this route just claims/releases and
+      // maps its result onto HTTP.
+      "/tasks/:id/fx-resume": {
+        POST: authed(async (req) => {
+          const taskId = req.params.id;
+          if (fxResumesInFlight.has(taskId)) {
+            return json(
+              { error: "a resume is already in flight for this task" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          fxResumesInFlight.add(taskId);
+          try {
+            const result = await resumeFxRecovery(taskId);
+            return result.ok
+              ? json(result, { headers: corsHeaders(req) })
+              : json({ error: result.error }, { status: result.status, headers: corsHeaders(req) });
+          } finally {
+            fxResumesInFlight.delete(taskId);
           }
         }),
       },

@@ -5,7 +5,8 @@ import { c, out, errln } from "../output.ts";
 import { usageError } from "../usage.ts";
 import { notifyFor, osNotify } from "../notify.ts";
 import type { RunEvent, GlobalEvent } from "../../shared/types.ts";
-import { isInternalStatusSentinel } from "../../shared/types.ts";
+import { FX_RECOVERY_STATUS_PREFIX, isInternalStatusSentinel } from "../../shared/types.ts";
+import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../../shared/fx-recovery.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
 import {
   parseSentFilesToolUse,
@@ -24,6 +25,7 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   const formatEvent = createEventFormatter();
+  const renderLine = createLineRenderer(formatEvent, flags.json);
 
   // --rebuild: reconstruct the latest run's events from the on-disk claude
   // JSONL (recovery when the live stream truncated) — a one-shot snapshot.
@@ -36,8 +38,8 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
     const { events, reason } = await client.rebuildEvents(run.id);
     if (reason) errln(c.dim(reason));
     for (const e of events) {
-      if (!flags.json && shouldSkipEvent(e)) continue;
-      out(flags.json ? JSON.stringify(e) : formatEvent(e));
+      const line = renderLine(e);
+      if (line !== null) out(line);
     }
     return;
   }
@@ -53,9 +55,8 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
       resolve();
     };
     const onEvent = (e: RunEvent) => {
-      if (flags.json || !shouldSkipEvent(e)) {
-        out(flags.json ? JSON.stringify(e) : formatEvent(e));
-      }
+      const line = renderLine(e);
+      if (line !== null) out(line);
       if (noFollow) {
         // Close once the replay burst goes quiet for a beat.
         if (quiet) clearTimeout(quiet);
@@ -97,6 +98,42 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
 // consumers; only the human-readable render skips it.
 function shouldSkipEvent(e: RunEvent): boolean {
   return e.stream === "status" && isInternalStatusSentinel(e.data);
+}
+
+/**
+ * Builds the per-event `RunEvent → string | null` renderer both the
+ * `--rebuild` loop and the streaming path share — `null` means "print
+ * nothing for this event". `--json` always wins (the raw event, unskipped,
+ * exactly as before this task's change) and short-circuits everything else.
+ *
+ * For the human-readable path, an `fx-recovery:` status sentinel is handled
+ * BEFORE the generic `shouldSkipEvent`/`isInternalStatusSentinel` check that
+ * would otherwise hide it unconditionally like every other internal fx
+ * sentinel (usage/provider/title): a `state === "active"` payload is fx's
+ * own live retry-progress line (e.g. "⚠ Rate limited · HTTP 429 · … ·
+ * retrying request in 8s · attempt 5/10") — the whole point of surfacing
+ * the Gateway rate-limit storm in `agetor logs` as it happens — so it
+ * prints in yellow via `fxRecoveryNoticeText`. Every other state
+ * (`paused`/`recovered`/`cleared`) — or a body that fails to parse — prints
+ * NOTHING here: the driver already emits a separate, persisted PLAIN status
+ * line at those terminal transitions (`fxRecoverySummaryLine`, see
+ * fx-acp.ts), and rendering this sentinel too would double it. Any other
+ * event falls through to the pre-existing `shouldSkipEvent` skip +
+ * `formatEvent` render, unchanged.
+ */
+function createLineRenderer(
+  formatEvent: (e: RunEvent) => string,
+  json: boolean,
+): (e: RunEvent) => string | null {
+  return (e: RunEvent): string | null => {
+    if (json) return JSON.stringify(e);
+    if (e.stream === "status" && e.data.startsWith(FX_RECOVERY_STATUS_PREFIX)) {
+      const payload = parseFxRecoveryPayload(e.data.slice(FX_RECOVERY_STATUS_PREFIX.length));
+      return payload?.state === "active" ? c.yellow(fxRecoveryNoticeText(payload)) : null;
+    }
+    if (shouldSkipEvent(e)) return null;
+    return formatEvent(e);
+  };
 }
 
 /**

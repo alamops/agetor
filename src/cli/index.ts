@@ -10,6 +10,7 @@ import { cmdShow } from "./commands/show.ts";
 import { cmdStart, cmdSend, cmdCancel, cmdRm } from "./commands/lifecycle.ts";
 import { cmdAdd } from "./commands/add.ts";
 import { cmdAnswer } from "./commands/answer.ts";
+import { cmdResume } from "./commands/resume.ts";
 import { cmdLogs } from "./commands/logs.ts";
 import { cmdFiles } from "./commands/files.ts";
 import { cmdEdit, cmdMove, cmdArchive, cmdUnarchive } from "./commands/manage.ts";
@@ -39,6 +40,7 @@ Commands:
   send <id> <msg…>    message a task (--ref <path> attaches files/images)
   commit <id>         ask the agent to commit all changes & push the branch
   answer <id>         answer a task that needs input (interactive)
+  resume <id>         resume an fx response paused by a Gateway rate limit
   commands <id>       list the agent's slash commands + extensions for the workdir
   logs <id>           stream a task's live conversation (--no-follow, --notify, --rebuild)
   files <id>          list files the agent sent you (SendUserFile)
@@ -147,6 +149,8 @@ async function main(): Promise<void> {
       return cmdCommit(args, flags);
     case "answer":
       return cmdAnswer(args, flags);
+    case "resume":
+      return cmdResume(args, flags);
     case "commands":
       return cmdCommands(args, flags);
     case "logs":

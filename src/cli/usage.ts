@@ -59,6 +59,13 @@ export const USAGE: Record<string, string> = {
   Answer a task that needs input — an interactive picker for AskUserQuestion
   options or a tmux prompt.`,
 
+  resume: `usage: agetor resume <task-id>
+
+  Continue an fx response paused after repeated Vercel AI Gateway rate-limit
+  (HTTP 429) retries. No new prompt is sent — fx resumes from its own
+  checkpoint. Only an fx task whose latest run ended paused this way
+  qualifies; sending a new message instead discards the paused response.`,
+
   commands: `usage: agetor commands <task-id>
 
   List the slash commands (/…) and MCP/skill extensions (@…) available to the
