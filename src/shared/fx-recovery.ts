@@ -5,7 +5,22 @@
 // imports here, so both the webview (RunPanel's live notice + Resume
 // affordance) and bun-side code (the driver, the CLI, the TUI) can import
 // this directly without pulling in either runtime.
-import { FX_RECOVERY_STATUS_PREFIX, type FxRecoveryPayload, type FxRecoveryState } from "./types.ts";
+//
+// Also holds the second, related lifecycle this module now covers: parsing
+// and formatting `task.fxRecovery` (`TaskFxRecovery`, the persisted pause +
+// auto-resume-schedule state) and the `fxAutoResume*` preference pair — see
+// `docs/plans/fx-recovery-follow-ups.md` §3 for the full design.
+import {
+  FX_AUTO_RESUME_DEFAULT_DELAY_SEC,
+  FX_AUTO_RESUME_DELAY_PREF,
+  FX_AUTO_RESUME_MAX_DELAY_SEC,
+  FX_AUTO_RESUME_MIN_DELAY_SEC,
+  FX_AUTO_RESUME_PREF,
+  FX_RECOVERY_STATUS_PREFIX,
+  type FxRecoveryPayload,
+  type FxRecoveryState,
+  type TaskFxRecovery,
+} from "./types.ts";
 
 /** The four values {@link FxRecoveryState} can take, as one tuple both the
  *  parsers below and any caller that wants to validate a state id can share
@@ -224,4 +239,142 @@ export function latestFxRecoveryByRun(
     if (payload) out.set(event.runId, payload);
   }
   return out;
+}
+
+/** The three values `TaskFxRecovery.autoResumeStopped` can take, as one
+ *  tuple both the parser below and any caller that wants to validate a
+ *  reason id can share — same pattern as `FX_RECOVERY_STATES` above. */
+const AUTO_RESUME_STOPPED_REASONS = ["exhausted", "cancelled", "disabled"] as const;
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+/** Parses the `autoResume` sub-object off a raw, already-JSON-parsed
+ *  `TaskFxRecovery` payload. Kept only when it is a plain object whose four
+ *  fields (`at`/`attempt`/`max`/`delaySec`) are all finite numbers — a
+ *  partially-typed or missing sub-object collapses to `null` wholesale
+ *  (there's nothing sane to default a missing schedule field to), mirroring
+ *  `parseTodoProgress`'s db.ts sibling rather than `parseSentFiles`'s
+ *  per-item tolerance. */
+function parseAutoResume(raw: unknown): TaskFxRecovery["autoResume"] {
+  if (!isPlainObject(raw)) return null;
+  const { at, attempt, max, delaySec } = raw;
+  if (!isFiniteNumber(at) || !isFiniteNumber(attempt) || !isFiniteNumber(max) || !isFiniteNumber(delaySec)) {
+    return null;
+  }
+  return { at, attempt, max, delaySec };
+}
+
+/**
+ * Parse a persisted `tasks.fx_recovery` JSON column value (see
+ * {@link TaskFxRecovery}) — tolerant, like every other parser in this
+ * codebase that reads a column another process wrote: `null`/empty/garbage
+ * JSON collapses to `null`. A well-formed envelope is required to have
+ * `state === "paused"` (the only state ever stored), a non-empty string
+ * `runId`, and a finite `pausedAt` — anything short of that is discarded
+ * wholesale (a row corrupt at that level isn't safely partially trusted).
+ * Once past that gate, the optional descriptive fields (`cause`/`message`
+ * as non-empty strings, `attempt`/`attemptLimit` as finite numbers) are each
+ * kept independently, `autoResume` is parsed via {@link parseAutoResume}
+ * (kept only when fully well-typed, else `null`), `autoResumeCount` defaults
+ * to `0` unless it's a finite non-negative integer, and `autoResumeStopped`
+ * is kept only when it is one of the three known reason strings.
+ */
+export function parseTaskFxRecovery(json: string | null | undefined): TaskFxRecovery | null {
+  if (!json) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(raw)) return null;
+  if (raw.state !== "paused") return null;
+
+  const runId = raw.runId;
+  if (typeof runId !== "string" || runId.length === 0) return null;
+
+  const pausedAt = raw.pausedAt;
+  if (!isFiniteNumber(pausedAt)) return null;
+
+  const out: TaskFxRecovery = {
+    state: "paused",
+    runId,
+    pausedAt,
+    autoResume: parseAutoResume(raw.autoResume),
+    autoResumeCount: 0,
+  };
+
+  if (typeof raw.cause === "string" && raw.cause.length > 0) out.cause = raw.cause;
+  if (typeof raw.message === "string" && raw.message.length > 0) out.message = raw.message;
+  if (isFiniteNumber(raw.attempt)) out.attempt = raw.attempt;
+  if (isFiniteNumber(raw.attemptLimit)) out.attemptLimit = raw.attemptLimit;
+
+  if (isFiniteNumber(raw.autoResumeCount) && Number.isInteger(raw.autoResumeCount) && raw.autoResumeCount >= 0) {
+    out.autoResumeCount = raw.autoResumeCount;
+  }
+
+  if (
+    typeof raw.autoResumeStopped === "string"
+    && (AUTO_RESUME_STOPPED_REASONS as readonly string[]).includes(raw.autoResumeStopped)
+  ) {
+    out.autoResumeStopped = raw.autoResumeStopped as TaskFxRecovery["autoResumeStopped"];
+  }
+
+  return out;
+}
+
+/**
+ * Parse the two `fxAutoResume*` preference values (opaque strings from the
+ * generic `preferences` k/v store, see `db.ts`) into their typed form.
+ *  - `enabled` is `false` ONLY when `prefs[FX_AUTO_RESUME_PREF]` is the
+ *    string `"off"` after trimming and lower-casing — anything else
+ *    (missing, `"on"`, garbage) reads as enabled, matching the "on by
+ *    default" decision in the plan.
+ *  - `delaySec` is `prefs[FX_AUTO_RESUME_DELAY_PREF]` parsed as an integer
+ *    and clamped to `[FX_AUTO_RESUME_MIN_DELAY_SEC,
+ *    FX_AUTO_RESUME_MAX_DELAY_SEC]`; missing or unparsable falls back to
+ *    `FX_AUTO_RESUME_DEFAULT_DELAY_SEC` (itself inside the clamp range, so
+ *    the fallback is never itself re-clamped).
+ */
+export function parseFxAutoResumePrefs(prefs: Record<string, string>): { enabled: boolean; delaySec: number } {
+  const rawEnabled = prefs[FX_AUTO_RESUME_PREF];
+  const enabled = typeof rawEnabled === "string" ? rawEnabled.trim().toLowerCase() !== "off" : true;
+
+  const rawDelay = prefs[FX_AUTO_RESUME_DELAY_PREF];
+  const parsedDelay = typeof rawDelay === "string" ? Number.parseInt(rawDelay, 10) : NaN;
+  const delaySec = Number.isFinite(parsedDelay)
+    ? Math.min(FX_AUTO_RESUME_MAX_DELAY_SEC, Math.max(FX_AUTO_RESUME_MIN_DELAY_SEC, parsedDelay))
+    : FX_AUTO_RESUME_DEFAULT_DELAY_SEC;
+
+  return { enabled, delaySec };
+}
+
+/**
+ * Render the time remaining until an auto-resume fires as `m:ss` (e.g.
+ * `"1:58"`, `"0:07"`), or `"now"` once `at` has passed (or arrived) —
+ * `Math.max(0, …)` guards against a stale `now` read racing a timer that
+ * already fired. Seconds are always zero-padded to two digits; minutes are
+ * not padded (matches every other duration readout in this codebase).
+ */
+export function fxAutoResumeCountdownText(at: number, now: number): string {
+  const remainingSec = Math.max(0, Math.ceil((at - now) / 1000));
+  if (remainingSec === 0) return "now";
+  const minutes = Math.floor(remainingSec / 60);
+  const seconds = remainingSec % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+/**
+ * Whether a task is currently sitting on a resumable fx pause — the gate the
+ * board card badge, the context-menu "Resume paused response" entry, and
+ * `isFxRecoveryResumable`'s callers all mirror. `column !== "running"` is
+ * load-bearing: the moment a resume run (or any new turn) starts, the task
+ * moves to `running` even before the orchestrator has cleared
+ * `fxRecovery` — without this check a card could flash the paused badge for
+ * one poll tick after the user already clicked Resume.
+ */
+export function isTaskFxPaused(task: { fxRecovery?: TaskFxRecovery | null; column: string }): boolean {
+  return task.fxRecovery?.state === "paused" && task.column !== "running";
 }

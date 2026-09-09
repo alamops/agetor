@@ -17,6 +17,7 @@ import { useTheme } from "@/components/theme-provider";
 import { isMacPlatform } from "@/lib/platform";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
+import { clampFxAutoResumeDelay, FX_AUTO_RESUME_MAX } from "@/lib/fx-auto-resume-prefs";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
   SETTINGS_SECTIONS,
@@ -34,6 +35,8 @@ import {
   FONT_SIZE_DEFAULT,
   FONT_SIZE_MAX,
   FONT_SIZE_MIN,
+  FX_AUTO_RESUME_MAX_DELAY_SEC,
+  FX_AUTO_RESUME_MIN_DELAY_SEC,
   HARNESS_TEMPLATES,
   THEME_PREFERENCES,
   type AgentKind,
@@ -65,6 +68,11 @@ interface Props {
   /** Whether sent user messages pin to the top of the transcript. */
   stickyUserMessages: boolean;
   onStickyUserMessagesChange: (sticky: boolean) => void;
+  /** Current fx auto-resume preference pair (`FX_AUTO_RESUME_PREF` /
+   *  `FX_AUTO_RESUME_DELAY_PREF`, parsed via `parseFxAutoResumePrefs`) —
+   *  see `docs/plans/fx-recovery-follow-ups.md` §3. */
+  fxAutoResume: { enabled: boolean; delaySec: number };
+  onFxAutoResumeChange: (next: { enabled: boolean; delaySec: number }) => void;
   /** Refresh agents/harnesses on the parent after CRUD operations. */
   onChange?: () => void;
   /** Resolved home dir from `GET /defaults` — used to expand `~` in templates. */
@@ -205,7 +213,7 @@ async function describeHarnessInUse(err: unknown): Promise<string | null> {
   return `In use by ${titles.length} ${noun}: ${titles.join(", ")}`;
 }
 
-export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, onChange, homeDir, dataDir, initialSection }: Props) {
+export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, fxAutoResume, onFxAutoResumeChange, onChange, homeDir, dataDir, initialSection }: Props) {
   const [version, setVersion] = useState<string>("");
   const [payload, setPayload] = useState<HarnessesPayload>({ harnesses: [], statuses: [] });
   const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
@@ -467,6 +475,8 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       onPickDefault={onPickDefault}
                       stickyUserMessages={stickyUserMessages}
                       onStickyUserMessagesChange={onStickyUserMessagesChange}
+                      fxAutoResume={fxAutoResume}
+                      onFxAutoResumeChange={onFxAutoResumeChange}
                       tmuxSource={tmuxSource}
                       bundledTmuxAvailable={bundledTmuxAvailable}
                       onPickTmuxSource={onPickTmuxSource}
@@ -607,6 +617,8 @@ function GeneralSection({
   onPickDefault,
   stickyUserMessages,
   onStickyUserMessagesChange,
+  fxAutoResume,
+  onFxAutoResumeChange,
   tmuxSource,
   bundledTmuxAvailable,
   onPickTmuxSource,
@@ -617,6 +629,8 @@ function GeneralSection({
   onPickDefault: (id: string) => void;
   stickyUserMessages: boolean;
   onStickyUserMessagesChange: (sticky: boolean) => void;
+  fxAutoResume: { enabled: boolean; delaySec: number };
+  onFxAutoResumeChange: (next: { enabled: boolean; delaySec: number }) => void;
   tmuxSource: "system" | "bundled";
   bundledTmuxAvailable: boolean;
   onPickTmuxSource: (source: "system" | "bundled") => void;
@@ -633,6 +647,23 @@ function GeneralSection({
   const canIncreaseFontSize = fontSizePercent < FONT_SIZE_MAX;
   const canResetFontSize = fontSizePercent !== FONT_SIZE_DEFAULT;
   const [replayingOnboarding, setReplayingOnboarding] = useState(false);
+  // Local text mirror of `fxAutoResume.delaySec` so the field can hold an
+  // in-progress keystroke (e.g. a momentarily-empty box while retyping)
+  // without that draft round-tripping through the parent/preferences store
+  // on every keystroke. Committed (clamped) on blur or Enter; resynced
+  // whenever the prop changes from outside (e.g. another Settings instance,
+  // or a revert on write failure).
+  const [fxDelayInput, setFxDelayInput] = useState(String(fxAutoResume.delaySec));
+  useEffect(() => {
+    setFxDelayInput(String(fxAutoResume.delaySec));
+  }, [fxAutoResume.delaySec]);
+  const commitFxDelay = () => {
+    const clamped = clampFxAutoResumeDelay(Number(fxDelayInput));
+    setFxDelayInput(String(clamped));
+    if (clamped !== fxAutoResume.delaySec) {
+      onFxAutoResumeChange({ ...fxAutoResume, delaySec: clamped });
+    }
+  };
   return (
     <div className="space-y-4 pt-3 text-sm">
       <section className="space-y-1">
@@ -754,6 +785,48 @@ function GeneralSection({
         <p className="text-[11px] text-muted-foreground">
           Keep your latest sent message visible while its response scrolls. Turn this off for a standard chat list.
         </p>
+      </section>
+
+      <section className="space-y-1">
+        <div className="flex items-center justify-between gap-4">
+          <label htmlFor="fx-auto-resume" className="text-xs text-muted-foreground">
+            Auto-resume fx after a rate limit
+          </label>
+          <Switch
+            id="fx-auto-resume"
+            data-testid="settings-fx-auto-resume"
+            checked={fxAutoResume.enabled}
+            onCheckedChange={(enabled) => onFxAutoResumeChange({ ...fxAutoResume, enabled })}
+            aria-label="Auto-resume fx after a rate limit"
+          />
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          When fx pauses after repeated Gateway 429s, Agetor resumes the response automatically, up to {FX_AUTO_RESUME_MAX} times per pause.
+        </p>
+        <div className="flex items-center justify-between gap-4 pt-1">
+          <label htmlFor="fx-auto-resume-delay" className="text-xs text-muted-foreground">
+            Auto-resume delay (seconds)
+          </label>
+          <Input
+            id="fx-auto-resume-delay"
+            data-testid="settings-fx-auto-resume-delay"
+            type="number"
+            min={FX_AUTO_RESUME_MIN_DELAY_SEC}
+            max={FX_AUTO_RESUME_MAX_DELAY_SEC}
+            step={10}
+            className="w-24"
+            disabled={!fxAutoResume.enabled}
+            value={fxDelayInput}
+            onChange={(e) => setFxDelayInput(e.target.value)}
+            onBlur={commitFxDelay}
+            onKeyDown={(e) => {
+              if (e.key !== "Enter") return;
+              e.preventDefault();
+              commitFxDelay();
+              e.currentTarget.blur();
+            }}
+          />
+        </div>
       </section>
 
       <section className="space-y-1">

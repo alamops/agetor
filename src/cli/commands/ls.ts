@@ -3,6 +3,7 @@ import { c, out, printJson, table } from "../output.ts";
 import type { Task } from "../../shared/types.ts";
 import { COLUMNS } from "../../shared/types.ts";
 import { flagValue } from "../args.ts";
+import { fxAutoResumeCountdownText, isTaskFxPaused } from "../../shared/fx-recovery.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id);
 
@@ -91,9 +92,29 @@ export async function cmdLs(
     truncate(t.title, 44),
     c.gray(t.agent ?? ""),
     colorColumn(t.column),
-    t.pendingInteractionCount > 0 ? c.yellow(`! ${t.pendingInteractionCount}`) : "",
+    needsCell(t),
   ]);
   out(table(["", "id", "title", "agent", "column", "needs"], rows));
+}
+
+/** The "needs" column: pending-interaction count first (unchanged), then an
+ *  fx-pause hint — `⏸ paused` (yellow) when the task is sitting on a
+ *  resumable fx pause with no auto-resume timer scheduled, or
+ *  `⏸ auto m:ss` (cyan) counting down to the next automatic resume
+ *  (`docs/plans/fx-recovery-follow-ups.md` §2). Joined with a space when
+ *  both apply. */
+function needsCell(t: Task): string {
+  const parts: string[] = [];
+  if (t.pendingInteractionCount > 0) parts.push(c.yellow(`! ${t.pendingInteractionCount}`));
+  if (isTaskFxPaused(t)) {
+    const autoResume = t.fxRecovery?.autoResume;
+    parts.push(
+      autoResume
+        ? c.cyan(`⏸ auto ${fxAutoResumeCountdownText(autoResume.at, Date.now())}`)
+        : c.yellow("⏸ paused"),
+    );
+  }
+  return parts.join(" ");
 }
 
 function glyph(t: Task): string {

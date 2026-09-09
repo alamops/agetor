@@ -4,9 +4,9 @@ import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task, RunEvent } from "../../shared/types.ts";
 import { FX_RECOVERY_STATUS_PREFIX, commitPushPrompt, isInternalStatusSentinel } from "../../shared/types.ts";
 import {
+  fxAutoResumeCountdownText,
   fxRecoveryNoticeText,
-  isFxRecoveryResumable,
-  latestFxRecoveryByRun,
+  isTaskFxPaused,
   parseFxRecoveryPayload,
 } from "../../shared/fx-recovery.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
@@ -76,6 +76,19 @@ export function Dashboard({
 
   const anyRunning = useMemo(() => sorted.some((t) => t.column === "running"), [sorted]);
   const frame = useSpinner(anyRunning);
+  // Countdown clock for the `⏸ auto-resume m:ss` row/detail hints
+  // (`docs/plans/fx-recovery-follow-ups.md` §2/T6) — same "decoupled from
+  // data, zero cost when idle" shape as `useSpinner`/`frame` above: only
+  // ticks (1/s) while some VISIBLE (non-archived, currently `sorted`) task
+  // has a pending `fxRecovery.autoResume` timer, and every countdown read
+  // (`fxAutoResumeCountdownText`) takes this shared `now` rather than
+  // calling `Date.now()` per row, so all rows/the detail pane repaint in
+  // lockstep on the same tick.
+  const hasPendingAutoResume = useMemo(
+    () => sorted.some((t) => t.fxRecovery?.autoResume != null),
+    [sorted],
+  );
+  const now = useClockTick(hasPendingAutoResume);
 
   // `@` file-reference listing for the composer's popover — see at-complete.ts
   // and CLAUDE.md §12. Cached by SCOPE (dir+ref), not by task id: a task
@@ -302,6 +315,15 @@ export function Dashboard({
           .cancelRun(selected.runId)
           .then(() => setStatus(`■ stopped ${sid}`))
           .catch((e) => setStatus(`! ${e.message}`));
+      } else if (selected.fxRecovery?.autoResume) {
+        // Not running (the branch above owns that case) but sitting on a
+        // pending fx auto-resume timer — `x` calls it off without resuming
+        // the paused response itself (`docs/plans/
+        // fx-recovery-follow-ups.md` §3.4/T6).
+        void client
+          .cancelFxAutoResume(selected.id)
+          .then(() => setStatus(`■ auto-resume cancelled ${sid}`))
+          .catch((e) => setStatus(`! ${e.message}`));
       } else {
         setStatus("task is not running");
       }
@@ -354,6 +376,7 @@ export function Dashboard({
                 task={t}
                 active={i === sel}
                 frame={frame}
+                now={now}
                 width={listWidth}
               />
             ))
@@ -368,7 +391,7 @@ export function Dashboard({
           overflow="hidden"
         >
           {selected ? (
-            <Detail task={selected} events={visible} />
+            <Detail task={selected} events={visible} now={now} />
           ) : (
             <Box flexDirection="column">
               <Logo maxWidth={detailWidth} />
@@ -429,22 +452,35 @@ const TaskRow = memo(function TaskRow({
   task,
   active,
   frame,
+  now,
   width,
 }: {
   task: Task;
   active: boolean;
   frame: string;
+  now: number;
   width: number;
 }) {
   const id = task.id.slice(0, 6);
   const needs = task.pendingInteractionCount;
+  // fx-pause hint (`docs/plans/fx-recovery-follow-ups.md` §2/T6), same gate
+  // as the board card badge and `agetor ls`'s "needs" column: `⏸ paused (r)`
+  // with no timer pending, `⏸ auto-resume m:ss` while one counts down.
+  const autoResume = task.fxRecovery?.autoResume;
+  const pauseText = isTaskFxPaused(task)
+    ? autoResume
+      ? `⏸ auto-resume ${fxAutoResumeCountdownText(autoResume.at, now)}`
+      : "⏸ paused (r)"
+    : null;
   // Budget the title so the row can never need to wrap, even if a glyph renders
   // a cell wider than measured in some terminal. The fixed prefix is the marker
-  // (2) + glyph (1) + " <id> " (id length + 2); the badge is " !N".
+  // (2) + glyph (1) + " <id> " (id length + 2); the badge is " !N"; the pause
+  // hint (when present) is " · <pauseText>".
   const inner = width - 4; // border (2) + paddingX (2)
   const prefixW = 2 + 1 + (id.length + 2);
   const badgeW = needs > 0 ? String(needs).length + 2 : 0;
-  const titleMax = Math.max(6, inner - prefixW - badgeW);
+  const pauseW = pauseText ? pauseText.length + 3 : 0;
+  const titleMax = Math.max(6, inner - prefixW - badgeW - pauseW);
   return (
     <Text wrap="truncate">
       <Text color="cyan">{active ? "▸ " : "  "}</Text>
@@ -452,11 +488,12 @@ const TaskRow = memo(function TaskRow({
       <Text dimColor> {id} </Text>
       <Text bold={active}>{truncate(task.title, titleMax)}</Text>
       {needs > 0 ? <Text color="yellow"> !{needs}</Text> : null}
+      {pauseText ? <Text color="yellow"> · {pauseText}</Text> : null}
     </Text>
   );
 });
 
-function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
+function Detail({ task, events, now }: { task: Task; events: RunEvent[]; now: number }) {
   // One pass over the visible window pairs every `SendUserFile` tool_use
   // with its (possibly not-yet-arrived) tool_result and formats the result
   // as a PRIMITIVE per event — never a Map. `events` (the `visible` slice in
@@ -474,31 +511,19 @@ function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
   // notice text (or `null`) already resolved, so `EventLine`'s memo isn't
   // defeated by handing it a Map reference that's fresh every flush.
   const recoveryLines = useMemo(() => buildFxRecoveryLines(events), [events]);
-  // "⚠ paused — press r to resume" header hint: resolvable only off the
-  // NEWEST run visible in this window (`events`, already the "visible"
-  // slice from the parent) — a resumable `paused` sentinel from an older,
-  // already-superseded run must not relight the hint. Gated on `task.column
-  // === "ready"` — the column a failed fx settle actually leaves the card
-  // in (same invariant `resumeFxRecovery`/RunPanel's `pausedRecovery` lean
-  // on: a resumable sentinel only ever sits on the newest run, and that run
-  // is `failed` iff the card is back in `ready`). `!== "running"` used to
-  // be the guard here, which is too loose: fx replays a session's prior
-  // `paused` update on `session/resume`, and if a resumed turn later
-  // SUCCEEDS while that replayed `paused` sentinel is still the run's
-  // (only) recovery sentinel on record for it, the task settles into
-  // `review` — `!== "running"` would keep advertising the hint on that
-  // settled task, and pressing `r` would 400 (`resumeFxRecovery` requires
-  // the latest run to be `failed`). `=== "ready"` can't false-positive that
-  // way: a `review`/`done`/`blocked` task never has a resumable sentinel
-  // agreeing with it, and the moment between Resume being pressed and the
-  // new run's own events landing is still covered since the card leaves
-  // `ready` (→ `running`) as soon as the resume run is inserted.
-  const lastRecoveryByRun = useMemo(() => latestFxRecoveryByRun(events), [events]);
-  const lastEvent = events[events.length - 1];
-  const showResumeHint =
-    lastEvent != null &&
-    isFxRecoveryResumable(lastRecoveryByRun.get(lastEvent.runId)) &&
-    task.column === "ready";
+  // "⚠ paused — press r to resume" header hint (`docs/plans/
+  // fx-recovery-follow-ups.md` §2/T6): now driven by the server-managed
+  // `task.fxRecovery` field (`isTaskFxPaused`) instead of rescanning this
+  // window's events for the newest run's recovery sentinel — the field is
+  // written by the SAME settlement path (`attachDoneHandler` →
+  // `tasks.setFxRecovery`) that used to be reconstructed here, so this is a
+  // read of the persisted result rather than a re-derivation, and it stays
+  // correct even when the window (`visible`, capped by terminal rows) has
+  // scrolled the relevant run's events out of view. `isTaskFxPaused` already
+  // encodes the same "not `running`" guard the old `=== "ready"` check was
+  // protecting.
+  const showResumeHint = isTaskFxPaused(task);
+  const autoResume = task.fxRecovery?.autoResume;
   return (
     <Box flexDirection="column">
       <Text wrap="truncate">
@@ -507,7 +532,17 @@ function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
         {task.pendingInteractionCount > 0 ? (
           <Text color="yellow"> · ! press g to answer</Text>
         ) : null}
-        {showResumeHint ? <Text color="yellow"> · ⚠ paused — press r to resume</Text> : null}
+        {showResumeHint ? (
+          autoResume ? (
+            <Text color="yellow">
+              {" "}
+              · ⏸ auto-resume in {fxAutoResumeCountdownText(autoResume.at, now)} — r resumes now,
+              x cancels
+            </Text>
+          ) : (
+            <Text color="yellow"> · ⚠ paused — press r to resume</Text>
+          )
+        ) : null}
       </Text>
       <Box flexDirection="column" marginTop={1}>
         {events.length === 0 ? (
@@ -814,6 +849,26 @@ function Footer({
       )}
     </Box>
   );
+}
+
+/** Ticks once per second, ONLY while `active` — the "decoupled from data,
+ *  zero cost when idle" shape `useSpinner` already uses for `frame`, reused
+ *  here so the `⏸ auto-resume m:ss` row/detail-pane countdowns
+ *  (`docs/plans/fx-recovery-follow-ups.md` §2/T6) repaint live without
+ *  spinning up a timer on a dashboard where nothing is currently paused
+ *  with a pending timer. Returns the epoch ms read at the moment the tick
+ *  fired, which is exactly what `fxAutoResumeCountdownText(at, now)` wants;
+ *  every row/detail pane reads the SAME `now` value from one shared timer
+ *  rather than each calling `Date.now()` independently, so they repaint in
+ *  lockstep. */
+function useClockTick(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [active]);
+  return now;
 }
 
 function columnGlyph(t: Task, frame: string) {

@@ -30,6 +30,7 @@ import {
   CATALOG_SCOPED_KINDS,
   supportedEfforts,
   cursorModelIdCoveredByCatalog,
+  defaultModeFor,
   type AgentKind,
 } from "../../shared/types.ts";
 import { mergeModelOptions, discoveredEffortsFor, type DiscoveredModel } from "../../shared/model-options.ts";
@@ -321,23 +322,30 @@ export function chooseAddPath(input: {
  * though `AGENT_OPTIONS.fx.modes[0]` is `yolo` and every picker (webview,
  * the wizard below) defaults to it.
  *
+ * Delegates to the shared `defaultModeFor(kind)` (`src/shared/types.ts`,
+ * `AGENT_OPTIONS[kind].modes[0]?.id ?? "auto"`) — the one place "what does
+ * an unset mode mean" lives, per `docs/plans/fx-recovery-follow-ups.md` §3.6
+ * (also used by `reconcileTaskSession`, the webview's `nullModeFallback` and
+ * `onAgentChange` reset, and every `buildCommand`/`spawnAgent` fallback).
  * Mirrors the exact expression the interactive wizard's own Mode picker
- * seeds from (`AGENT_OPTIONS[kind].modes[0]?.id`, see the `pickOption`
- * call in `wizard()` below) so a scripted add matches what a human would
- * get from pressing Enter on that step. `agent` is a harness id — the raw
- * `--agent` flag, or `undefined` when omitted. For every BUILT-IN harness
- * (the normal `--agent fx` / `--agent codex` / … usage) the id equals its
- * `AgentKind` verbatim (seeded that way by migrations 032/037/046), so no
- * async harness lookup is needed here the way the wizard needs one; an
- * unrecognized custom-account harness id, or an omitted `--agent`, falls
- * back to `claude-code`'s modes — the same `?? "claude-code"` fallback the
- * wizard uses when a harness can't be found by id. Every kind's mode list
- * is non-empty today, so this returns `undefined` only in a hypothetical
- * future kind with none configured.
+ * seeds from (see the `pickOption` call in `wizard()` below) so a scripted
+ * add matches what a human would get from pressing Enter on that step.
+ * `agent` is a harness id — the raw `--agent` flag, or `undefined` when
+ * omitted. For every BUILT-IN harness (the normal `--agent fx` / `--agent
+ * codex` / … usage) the id equals its `AgentKind` verbatim (seeded that way
+ * by migrations 032/037/046), so no async harness lookup is needed here the
+ * way the wizard needs one; an unrecognized custom-account harness id, or an
+ * omitted `--agent`, falls back to `claude-code`'s modes — the same `??
+ * "claude-code"` fallback the wizard uses when a harness can't be found by
+ * id. The declared return type stays `string | undefined` (matching the
+ * pre-`defaultModeFor` version of this function) even though the actual
+ * value is never `undefined` in practice — `defaultModeFor` itself falls
+ * back to `"auto"` for a hypothetical future kind with no modes configured,
+ * so this only ever widens, never narrows, what callers can rely on.
  */
 export function defaultNonInteractiveMode(agent: string | undefined): string | undefined {
   const kind: AgentKind = (agent && agent in AGENT_OPTIONS ? agent : "claude-code") as AgentKind;
-  return AGENT_OPTIONS[kind].modes[0]?.id;
+  return defaultModeFor(kind);
 }
 
 function baseInput(o: AddOpts, title: string, prompt: string): CreateTaskInput {

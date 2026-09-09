@@ -208,6 +208,15 @@ export class AgetorClient {
   resumeFxRecovery(taskId: string): Promise<{ ok: true; runId: string }> {
     return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/fx-resume`);
   }
+  /** Cancel a pending fx auto-resume timer (`docs/plans/
+   *  fx-recovery-follow-ups.md` §3.4) without resuming the paused response
+   *  itself — the task stays paused, `task.fxRecovery.autoResume` clears to
+   *  `null` with `autoResumeStopped: "cancelled"`. 400 when the task isn't
+   *  currently paused with a pending timer, 404 for a bad task id; both
+   *  propagate as a thrown `ApiError` like every other call here. */
+  cancelFxAutoResume(taskId: string): Promise<{ ok: true }> {
+    return this.req("DELETE", `/tasks/${encodeURIComponent(taskId)}/fx-auto-resume`);
+  }
 
   // ── projects ───────────────────────────────────────────────────────────────
   listProjects(): Promise<Project[]> {

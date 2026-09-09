@@ -40,7 +40,7 @@ Commands:
   send <id> <msg…>    message a task (--ref <path> attaches files/images)
   commit <id>         ask the agent to commit all changes & push the branch
   answer <id>         answer a task that needs input (interactive)
-  resume <id>         resume an fx response paused by a Gateway rate limit
+  resume <id> [--cancel]  resume an fx response paused by a Gateway rate limit (--cancel: call off a pending auto-resume)
   commands <id>       list the agent's slash commands + extensions for the workdir
   logs <id>           stream a task's live conversation (--no-follow, --notify, --rebuild)
   files <id>          list files the agent sent you (SendUserFile)

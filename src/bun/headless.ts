@@ -1,7 +1,7 @@
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN } from "./api-config.ts";
 import { db, dataDir, subagents } from "./db.ts";
-import { reconcileOrphans, reapIdleSessions } from "./orchestrator.ts";
+import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions } from "./orchestrator.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
 import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
@@ -124,6 +124,15 @@ export async function runDaemon(): Promise<void> {
   // no swallow.
   rehydratePath();
   await reconcileOrphans();
+  // Re-arm in-memory auto-resume timers for every fx task still carrying a
+  // pending schedule — same rationale as index.ts's desktop boot path (see
+  // its comment): an in-memory `setTimeout` handle never survives a process
+  // restart. `daemonLog`, not `console.log` — this process has no console a
+  // user can see.
+  const rearmedFxAutoResumeCount = await rearmFxAutoResumes();
+  if (rearmedFxAutoResumeCount > 0) {
+    daemonLog(`re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
+  }
   // Same boot-sweep + periodic-refresh pair as index.ts's desktop boot path
   // (see its comment for the full rationale) — the daemon needs the same
   // model-discovery freshness the app gets, and `startPeriodicDiscovery`'s

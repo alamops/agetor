@@ -1083,6 +1083,28 @@ export interface Task {
    */
   sentFiles?: SentFileEntry[] | null;
   /**
+   * fx's model-response-recovery state for this task, when it is currently
+   * paused on a resumable Gateway checkpoint — see {@link TaskFxRecovery}
+   * and `docs/plans/fx-recovery-follow-ups.md`. Set at settlement of a
+   * failed fx run whose last recovery sentinel (`FX_RECOVERY_STATUS_PREFIX`)
+   * is resumable, via `tasks.setFxRecovery` (a targeted `UPDATE`, no
+   * `updated_at` bump — same pattern as `sentFiles`/the unread watermarks
+   * above), and cleared back to `null` once the pause chain ends (a normal
+   * turn starts, the run recovers, or the row is torn down on
+   * archive/delete/agent-switch). Server-managed: not in
+   * `ALLOWED_PATCH_FIELDS`, and excluded from the generic `tasks.update` SET
+   * clause for the same "an unrelated PATCH must not clobber a live
+   * auto-resume schedule" reason `sent_files` is excluded. `null` for every
+   * task that isn't currently paused — including every task that has never
+   * paused at all.
+   *
+   * Optional (rather than required) for the same fixture-compatibility
+   * reason as `sentFiles`: the many hand-built `Task` fixtures across
+   * `src/bun/*.test.ts` predate this field — `db.ts` always populates it on
+   * read, so runtime code can treat a missing key the same as `null`.
+   */
+  fxRecovery?: TaskFxRecovery | null;
+  /**
    * Whether this task has assistant messages the user hasn't seen yet —
    * `last_assistant_event_id > last_seen_event_id` (both watermarks live on
    * the `tasks` row, migration 045), computed in `db.ts`'s `toTask` and
@@ -1439,6 +1461,91 @@ export interface SentFileEntry {
   /** Run whose tool_result confirmed delivery. */
   runId: string;
 }
+
+/**
+ * Persisted shape of `task.fxRecovery` (`tasks.fx_recovery` JSON column,
+ * migration 051) — fx's model-response-recovery state for one task, plus the
+ * orchestrator's own auto-resume schedule/counter layered on top. `"paused"`
+ * is the only state ever stored: the row is `null` (not an object with some
+ * other `state`) whenever the task isn't currently paused, so a consumer
+ * only ever needs to null-check, never switch on `state`. See
+ * `docs/plans/fx-recovery-follow-ups.md` §3 for the full design and
+ * `src/shared/fx-recovery.ts`'s `parseTaskFxRecovery` for the tolerant
+ * parser. Written only by `tasks.setFxRecovery` — see {@link Task.fxRecovery}
+ * for the write-path rules (targeted UPDATE, no `updated_at` bump, not
+ * patchable).
+ */
+export interface TaskFxRecovery {
+  /** The only value ever stored — a non-paused task has a `null` row
+   *  instead of an object with a different `state`. */
+  state: "paused";
+  /** The failed run whose last `FX_RECOVERY_STATUS_PREFIX` sentinel paused
+   *  (the run `resumeFxRecovery` acts on). */
+  runId: string;
+  /** Unix ms timestamp when this pause was recorded. */
+  pausedAt: number;
+  /** Copied verbatim from that sentinel's `FxRecoveryPayload` — see
+   *  {@link FxRecoveryPayload} for what each means. Omitted when the
+   *  sentinel didn't carry them. */
+  cause?: string;
+  attempt?: number;
+  attemptLimit?: number;
+  message?: string;
+  /** The orchestrator's pending auto-resume timer for this pause, or `null`
+   *  when none is scheduled (auto-resume off, the cap was hit, the user
+   *  cancelled it, or a continue-recovery run is currently in flight — see
+   *  `autoResumeStopped`). `at` is the fire time (ms epoch); `attempt` is
+   *  the 1-based auto-resume attempt this timer will fire as; `max` is
+   *  `FX_AUTO_RESUME_MAX` at schedule time; `delaySec` is the preference
+   *  value used to compute `at`, kept alongside it so a countdown can be
+   *  rendered without re-reading preferences. */
+  autoResume: { at: number; attempt: number; max: number; delaySec: number } | null;
+  /** Automatic resumes already fired in this pause chain (a chain is a
+   *  pause → auto-resume → pause → … run that hasn't yet recovered or been
+   *  cleared). Reset to 0 only when the row itself is cleared — a manual
+   *  Resume that re-pauses continues the same chain's count. */
+  autoResumeCount: number;
+  /** Why no auto-resume timer is currently pending — omitted (not present)
+   *  while one IS pending. `"exhausted"`: the chain hit `FX_AUTO_RESUME_MAX`.
+   *  `"cancelled"`: the user (or an implicit cancel — new message, manual
+   *  Resume, Stop, archive, delete, agent switch) cancelled it.
+   *  `"disabled"`: the `fxAutoResume` preference was off at schedule time. */
+  autoResumeStopped?: "exhausted" | "cancelled" | "disabled";
+}
+
+/**
+ * Preference key gating fx's automatic-resume engine
+ * (`docs/plans/fx-recovery-follow-ups.md`): value `"on"` (or missing — on by
+ * default) enables it, `"off"` disables it. Read via `parseFxAutoResumePrefs`
+ * in `src/shared/fx-recovery.ts`. Round-tripped by `agetor config` and the
+ * Settings → General switch (`settings-fx-auto-resume`).
+ */
+export const FX_AUTO_RESUME_PREF = "fxAutoResume";
+
+/**
+ * Preference key for the auto-resume delay, in whole seconds, clamped to
+ * `[FX_AUTO_RESUME_MIN_DELAY_SEC, FX_AUTO_RESUME_MAX_DELAY_SEC]`; missing or
+ * unparsable falls back to `FX_AUTO_RESUME_DEFAULT_DELAY_SEC`. Read via
+ * `parseFxAutoResumePrefs`; edited via the Settings → General number input
+ * (`settings-fx-auto-resume-delay`) or `agetor config`.
+ */
+export const FX_AUTO_RESUME_DELAY_PREF = "fxAutoResumeDelaySec";
+
+/** Default `fxAutoResumeDelaySec` when the preference is unset or
+ *  unparsable — chosen from a live smoke where a resume still absorbed
+ *  several more 429s before recovering (see the plan's §2 "Live facts"). */
+export const FX_AUTO_RESUME_DEFAULT_DELAY_SEC = 120;
+
+/** Lower clamp bound for `fxAutoResumeDelaySec`. */
+export const FX_AUTO_RESUME_MIN_DELAY_SEC = 10;
+
+/** Upper clamp bound for `fxAutoResumeDelaySec`. */
+export const FX_AUTO_RESUME_MAX_DELAY_SEC = 3600;
+
+/** Maximum automatic resumes fired per pause chain before the orchestrator
+ *  gives up and leaves `autoResumeStopped: "exhausted"` for the user to
+ *  resume manually. */
+export const FX_AUTO_RESUME_MAX = 3;
 
 export interface AgentOption {
   /** Stored on the task and passed to `buildCommand`. */
@@ -1961,11 +2068,13 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
   // instead of reviewing it and the agent replans into the free-tier rate
   // limit chasing an approval that will never come (see
   // docs/plans/fix-fx-harness-rate-limit.md). "auto" and "ask" stay reachable
-  // only as explicit picker choices. A `null` stored mode still spawns as
-  // "auto" (see `src/bun/agents.ts`'s `opts.mode ?? "auto"`), so an existing
-  // task is never silently escalated to Full access by this change. Plan
-  // still resolves to "ask" (only pre-approved rules run; everything else
-  // surfaces as an approval card).
+  // only as explicit picker choices. A `null` stored mode now ALSO spawns as
+  // "yolo" via the shared `defaultModeFor("fx")` (see that function below) —
+  // an owner-requested reversal of the earlier "no silent escalation" rule
+  // (docs/plans/fx-recovery-follow-ups.md §3.6): every fx task, including
+  // ones created before this change, now defaults to Full access unless it
+  // has an explicit stored mode. Plan still resolves to "ask" (only
+  // pre-approved rules run; everything else surfaces as an approval card).
   "fx": { code: "yolo", plan: "ask" },
 };
 
@@ -2240,6 +2349,30 @@ export function supportedModes(agent: AgentKind, model: string | null): AgentOpt
     ?? [],
   );
   return AGENT_OPTIONS[agent].modes.filter((m) => !deny.has(m.id));
+}
+
+/**
+ * The single spawn-time AND picker default for a stored `null` mode — every
+ * kind's `modes[0]` is `"auto"` except fx, whose `modes[0]` is `"yolo"`
+ * ("Full access"; see `AGENT_OPTIONS.fx.modes` and the `CODE_PLAN_MODE.fx`
+ * comment). Used by every spawn branch in `src/bun/agents.ts`'s
+ * `buildCommand`/`spawnAgent`, by `reconcileTaskSession`, by `agetor add`'s
+ * non-interactive default, and by the webview's mode dropdown fallback for a
+ * `null` row (RunPanel's `nullModeFallback`) and its reset on switching a
+ * task's agent kind. `createTask` still stores `null` for an unset mode —
+ * only resolution at spawn/display time changed — so this function, not a
+ * stored value, is the one place "what does null mean" can drift.
+ *
+ * This supersedes the earlier "a stored null still spawns as auto (even for
+ * fx)" rule: the owner explicitly asked for fx's hands-off default to
+ * escalate to Full access (`docs/plans/fx-recovery-follow-ups.md` §3.6),
+ * since fx's `auto` mode blocks on an interactive permission card whenever
+ * its hard-wired reviewer is unreachable (see the fx harness section of
+ * CLAUDE.md) — `auto` is not actually hands-off for fx the way it is for
+ * every other kind.
+ */
+export function defaultModeFor(kind: AgentKind): string {
+  return AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
 }
 
 export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
@@ -3317,6 +3450,36 @@ export type GlobalEvent =
       count: number;
       caption: string | null;
       proactive: boolean;
+      ts: number;
+    }
+  | {
+      /**
+       * fx auto-resume lifecycle transition for a paused task (see
+       * {@link TaskFxRecovery} and `docs/plans/fx-recovery-follow-ups.md`).
+       * Live-only — a replayed historical schedule/cancel must not
+       * re-notify — so the UI can drive a toast (`fired` → info,
+       * `exhausted` → error; `scheduled`/`cancelled`/`disabled` are silent
+       * on the toast layer, driving only the card/notice/context-menu state
+       * via the task's own `fxRecovery` field). Mirrors `files-sent`'s
+       * "live-only, never replayed" contract.
+       */
+      kind: "fx-auto-resume";
+      taskId: string;
+      /** `"scheduled"` — a timer was armed. `"fired"` — the timer fired and
+       *  a resume run was spawned. `"cancelled"` — the pending timer was
+       *  cancelled (explicitly or implicitly — new message, manual Resume,
+       *  Stop, archive, delete, agent switch). `"exhausted"` — the chain hit
+       *  `FX_AUTO_RESUME_MAX` with no further timer scheduled.
+       *  `"disabled"` — the `fxAutoResume` preference was off at schedule
+       *  time, so no timer was armed. */
+      state: "scheduled" | "fired" | "cancelled" | "exhausted" | "disabled";
+      /** Scheduled fire time (ms epoch) — present only for `state:
+       *  "scheduled"`. */
+      at?: number;
+      /** The auto-resume attempt this event concerns (1-based). */
+      attempt: number;
+      /** `FX_AUTO_RESUME_MAX` at the time this event fired. */
+      max: number;
       ts: number;
     };
 

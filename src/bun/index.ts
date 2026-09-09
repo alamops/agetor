@@ -4,7 +4,7 @@ import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } fr
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
-import { reconcileOrphans, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
+import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
 import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
@@ -131,6 +131,18 @@ rehydratePath();
 // fails boot loudly, matching that old synchronous-throw behavior — no
 // swallow.
 await reconcileOrphans();
+
+// Re-arm in-memory auto-resume timers for every fx task still carrying a
+// pending schedule (docs/plans/fx-recovery-follow-ups.md §3 T2 item 9) — an
+// in-memory `setTimeout` handle never survives a process restart, so without
+// this a pause recorded in a prior process would sit forever with a
+// persisted `autoResume.at` nothing will ever fire. Awaited, and placed right
+// after `reconcileOrphans` so reattach/orphan resolution — which can itself
+// flip a run's status — settles first.
+const rearmedFxAutoResumeCount = await rearmFxAutoResumes();
+if (rearmedFxAutoResumeCount > 0) {
+  console.log(`[agetor] re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
+}
 
 // Heal any archive/delete teardown (tmux kill, terminal shells, worktree
 // detach) that was deferred to the in-memory teardown queue but never ran

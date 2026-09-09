@@ -59,12 +59,14 @@ export const USAGE: Record<string, string> = {
   Answer a task that needs input — an interactive picker for AskUserQuestion
   options or a tmux prompt.`,
 
-  resume: `usage: agetor resume <task-id>
+  resume: `usage: agetor resume <task-id> [--cancel]
 
   Continue an fx response paused after repeated Vercel AI Gateway rate-limit
   (HTTP 429) retries. No new prompt is sent — fx resumes from its own
   checkpoint. Only an fx task whose latest run ended paused this way
-  qualifies; sending a new message instead discards the paused response.`,
+  qualifies; sending a new message instead discards the paused response.
+    --cancel   call off a pending automatic resume without resuming now —
+               the task stays paused`,
 
   commands: `usage: agetor commands <task-id>
 
@@ -168,7 +170,8 @@ export const USAGE: Record<string, string> = {
 
   View or set cross-session preferences stored in the core (the same store the
   app's settings use). No args lists all; one arg gets; key + value sets.
-  Common keys: defaultHarness, lastModel:<kind>, lastMode:<kind>, lastEffort:<kind>.`,
+  Common keys: defaultHarness, lastModel:<kind>, lastMode:<kind>, lastEffort:<kind>,
+  fxAutoResume (on|off — default on), fxAutoResumeDelaySec (10..3600, default 120).`,
 };
 
 const ALIASES: Record<string, string> = {
