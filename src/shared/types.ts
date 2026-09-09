@@ -917,6 +917,25 @@ export interface Task {
    */
   todoProgress?: { completed: number; total: number } | null;
   /**
+   * Files delivered to the user via `SendUserFile` (see
+   * `src/shared/sent-files.ts`), persisted server-side by the orchestrator's
+   * chunk handler once a matching tool_result confirms delivery (never on
+   * the tool_use alone — an undelivered request never lands here). Deduped
+   * by path (`mergeSentFiles`) and capped to the most recent
+   * `MAX_SENT_FILES`. Server-managed (not in the PATCH allow-list) and
+   * excluded from the generic `tasks.update` SET clause / `updated_at` bump,
+   * same as the unread watermarks — an unrelated PATCH must not clobber a
+   * concurrent send, and the board must not re-render every task on every
+   * poll. Drives the board card's paperclip badge.
+   *
+   * Optional (rather than required like `plans`) for the same fixture-
+   * compatibility reason as `todoProgress`: the many hand-built `Task`
+   * fixtures across `src/bun/*.test.ts` predate this field — `db.ts` always
+   * populates it on read, so runtime code can treat a missing key the same
+   * as `null`.
+   */
+  sentFiles?: SentFileEntry[] | null;
+  /**
    * Whether this task has assistant messages the user hasn't seen yet —
    * `last_assistant_event_id > last_seen_event_id` (both watermarks live on
    * the `tasks` row, migration 045), computed in `db.ts`'s `toTask` and
@@ -1239,6 +1258,39 @@ export interface TaskPlan {
    *  time (e.g. `.cursor/plans/<slug>_<id>.plan.md`), or null before
    *  approval. */
   filePath: string | null;
+}
+
+/**
+ * Sanitized copy of one item from Claude's structured `toolUseResult.
+ * attachments[]` array (present on a successful `SendUserFile` tool_result,
+ * see `src/shared/sent-files.ts`). Forwarded additively on a `tool_result`
+ * event's `data` as `attachments?: ToolResultAttachment[]` — never present
+ * for an errored result (claude's `toolUseResult` is a bare string then) or
+ * for a tool that doesn't report attachments.
+ */
+export interface ToolResultAttachment {
+  path: string;
+  size: number | null;
+  isImage: boolean | null;
+  mediaType: string | null;
+}
+
+/**
+ * One file Claude (or another harness) delivered to the user via
+ * `SendUserFile` (see `src/shared/sent-files.ts`), recorded on
+ * `task.sentFiles` once the tool_result confirms delivery. `size`/
+ * `mediaType`/`isImage` come from the forwarded {@link ToolResultAttachment}
+ * when available, else null (e.g. a map-miss fallback with no attachments).
+ */
+export interface SentFileEntry {
+  path: string;
+  size: number | null;
+  mediaType: string | null;
+  isImage: boolean | null;
+  /** Unix ms timestamp when delivery was detected. */
+  sentAt: number;
+  /** Run whose tool_result confirmed delivery. */
+  runId: string;
 }
 
 export interface AgentOption {
@@ -2890,7 +2942,10 @@ export interface GitHubNotificationsResult {
  *   assistant    — claude assistant text block (markdown)
  *   thinking     — claude extended-thinking block
  *   tool_use     — claude tool call (data = JSON { id, name, input })
- *   tool_result  — output of a tool call (data = JSON { toolUseId, content })
+ *   tool_result  — output of a tool call (data = JSON { toolUseId, content });
+ *                  may additionally carry `attachments?: ToolResultAttachment[]`
+ *                  when claude's own `toolUseResult` reported a structured
+ *                  attachments array (see `src/shared/sent-files.ts`)
  *   subagent     — background/sub-agent lifecycle delta (data = JSON
  *                  SubagentEvent). Live-only (never persisted to run_events):
  *                  the `/tasks/:id/subagents` snapshot covers panel reopen, so
@@ -3073,6 +3128,22 @@ export type GlobalEvent =
        *  live per task (several can stack) and clear the alert only once the
        *  last one resolves. */
       interactionId: string;
+      ts: number;
+    }
+  | {
+      /**
+       * A `SendUserFile` tool_result confirmed delivery (see
+       * `src/shared/sent-files.ts`). Live-only — a replayed historical send
+       * must not notify — so the UI can drive a toast ("Claude sent you N
+       * files") and, when the window is unfocused or `proactive` is true, a
+       * native OS notification.
+       */
+      kind: "files-sent";
+      taskId: string;
+      runId: string;
+      count: number;
+      caption: string | null;
+      proactive: boolean;
       ts: number;
     };
 

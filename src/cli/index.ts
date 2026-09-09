@@ -11,6 +11,7 @@ import { cmdStart, cmdSend, cmdCancel, cmdRm } from "./commands/lifecycle.ts";
 import { cmdAdd } from "./commands/add.ts";
 import { cmdAnswer } from "./commands/answer.ts";
 import { cmdLogs } from "./commands/logs.ts";
+import { cmdFiles } from "./commands/files.ts";
 import { cmdEdit, cmdMove, cmdArchive, cmdUnarchive } from "./commands/manage.ts";
 import { cmdDiff } from "./commands/diff.ts";
 import { cmdAttach } from "./commands/attach.ts";
@@ -40,6 +41,7 @@ Commands:
   answer <id>         answer a task that needs input (interactive)
   commands <id>       list the agent's slash commands + extensions for the workdir
   logs <id>           stream a task's live conversation (--no-follow, --notify, --rebuild)
+  files <id>          list files the agent sent you (SendUserFile)
   diff <id>           show the task's git diff
   attach <id>         attach your terminal to the live tmux session (claude-code)
   shell <id>          open a shell in the task's worktree (--print for the path)
@@ -150,6 +152,9 @@ async function main(): Promise<void> {
     case "logs":
     case "tail":
       return cmdLogs(args, flags);
+    case "files":
+    case "sent":
+      return cmdFiles(args, flags);
     case "cancel":
       return cmdCancel(args, flags);
     case "rm":

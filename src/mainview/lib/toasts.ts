@@ -1,5 +1,6 @@
 import { toast } from "sonner";
 import { api } from "./api";
+import { filesSentCopy, shouldNotifyOsFilesSent, shouldToastFilesSent } from "./files-sent-notify";
 
 /**
  * Args common to every toast helper. `isSelected` / `isFocused` are evaluated
@@ -35,8 +36,13 @@ function describe(args: ToastArgs): string {
   return args.subtitle ? `${args.title} · ${args.subtitle}` : args.title;
 }
 
-function maybeNotifyOS(args: ToastArgs, heading: string, detail?: string): void {
-  if (args.isFocused) return;
+function maybeNotifyOS(
+  args: ToastArgs,
+  heading: string,
+  detail?: string,
+  opts?: { force?: boolean },
+): void {
+  if (args.isFocused && !opts?.force) return;
   // Fire-and-forget — failure (e.g. user denied macOS permission) is silent.
   api.notifyOS({ title: heading, body: detail, taskId: args.taskId }).catch(() => { /* ignore */ });
 }
@@ -150,6 +156,35 @@ export function notifyWaitingInput(args: ToastArgs): void {
     },
   });
   pendingByTask.set(args.taskId, id);
+}
+
+/**
+ * Alert the user that Claude delivered files via `SendUserFile` (the
+ * `files-sent` `GlobalEvent` — see `src/shared/types.ts` and
+ * `src/mainview/lib/files-sent-notify.ts` for the pure decision logic this
+ * composes). Deliberately does **not** use `pendingByTask` — a delivered-
+ * files toast isn't "waiting on you" and has no blocked-column counterpart
+ * to auto-dismiss it, so it's a plain, self-dismissing `toast.info` like
+ * `toastSuccess`/`toastError`, not one of the `showBlockingToast` variants.
+ * The native notification bypasses the usual focused-window gate
+ * (`maybeNotifyOS`'s `force` option) for a `proactive` send — Claude
+ * volunteered the files unprompted, so there's no other signal something
+ * just landed, focused window or not.
+ */
+export function notifyFilesSent(
+  args: ToastArgs & { count: number; caption: string | null; proactive: boolean },
+): void {
+  const { title, body } = filesSentCopy({ count: args.count, caption: args.caption });
+  const description = body ? `${describe(args)} — ${body}` : describe(args);
+  if (shouldNotifyOsFilesSent({ isFocused: args.isFocused, proactive: args.proactive })) {
+    maybeNotifyOS(args, title, description, { force: args.proactive });
+  }
+  if (shouldToastFilesSent({ isSelected: args.isSelected, isFocused: args.isFocused })) {
+    toast.info(title, {
+      description,
+      action: { label: "Open", onClick: args.onOpen },
+    });
+  }
 }
 
 /** Clear the pending toast for a task (called when the task leaves `blocked`). */

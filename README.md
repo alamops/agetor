@@ -152,6 +152,7 @@ agetor commit <id>           # ask the agent to commit all changes & push the br
 agetor answer <id>           # answer a task that needs input (interactive picker)
 agetor commands <id>         # list the agent's slash commands + extensions (composer autocomplete)
 agetor logs <id>             # stream a task's live conversation (--no-follow snapshot · --notify on state change · --rebuild from JSONL)
+agetor files <id>            # files the agent sent you (name · size · when · path; alias: sent)
 agetor cancel <id>           # stop the active run
 agetor attach <id>           # attach your terminal to the live tmux session (claude-code)
 agetor shell <id>            # open a shell in the task's worktree (--print for the path)
@@ -302,7 +303,8 @@ The main process exposes a small JSON + SSE API on `127.0.0.1:$AGETOR_API_PORT`.
 | `GET` | `/tasks/:id/interactions/pending` | Anything currently blocking the task. |
 | `GET` / `POST` / `DELETE` | `/projects[...]` | Working-directory shortcuts shown in the New Task form. |
 | `GET` / `PATCH` | `/preferences[...]` | Per-user preferences (key/value). |
-| `POST` | `/open-path` | Reveal a path in Finder / Files. |
+| `POST` | `/open-path` | Open a file or folder with the OS default app. |
+| `POST` | `/reveal-path` | Reveal (select) a file or folder in Finder. |
 | `GET` | `/events` | SSE: global lifecycle stream (toasts, native notifications). |
 
 The full route list is in [`src/bun/server.ts`](./src/bun/server.ts).

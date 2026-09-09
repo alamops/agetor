@@ -1,13 +1,14 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Paperclip, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { abbreviateHome, cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { taskTypeMeta, type Task } from "../../../shared/types.ts";
+import { sentFileBasename } from "../../../shared/sent-files.ts";
 import { AgentIcon } from "./AgentIcon";
 
 interface Props {
@@ -172,6 +173,21 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               >
                 <ListTodo className="size-3" />
                 {task.todoProgress.completed}/{task.todoProgress.total}
+              </Badge>
+            )}
+            {task.sentFiles && task.sentFiles.length > 0 && (
+              <Badge
+                variant="outline"
+                className="gap-1 text-[10px] shrink-0"
+                data-testid="sent-files-badge"
+                title={`${task.sentFiles.length} file${task.sentFiles.length === 1 ? "" : "s"} sent · ${[...task.sentFiles]
+                  .sort((a, b) => b.sentAt - a.sentAt)
+                  .slice(0, 5)
+                  .map((f) => sentFileBasename(f.path))
+                  .join(", ")}`}
+              >
+                <Paperclip className="size-3" />
+                {task.sentFiles.length}
               </Badge>
             )}
           </div>

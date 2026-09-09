@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessQuota, HarnessUsage, Project, SavedPrompt, Task, TaskDraft, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessQuota, HarnessUsage, Project, SavedPrompt, SentFileEntry, Task, TaskDraft, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -88,6 +89,11 @@ type TaskRow = {
   draft: string | null;
   plans: string;
   todo_progress: string | null;
+  // Files delivered to the user via `SendUserFile` (migration 050). Written
+  // exclusively by `tasks.mergeSentFiles`'s targeted UPDATE, never by the
+  // generic `insert`/`update` paths below — see the comment on the `update`
+  // SET clause for why.
+  sent_files: string | null;
   // Unread-indicator watermark pair (migration 045). Not spread into `Task`
   // directly — only the derived `unread` boolean is (see `toTask`). Written
   // exclusively by `tasks.noteAssistantEvent` / `tasks.markSeen`, never by
@@ -255,6 +261,57 @@ const parseTodoProgress = (raw: string | null): Task["todoProgress"] => {
   } catch { return null; }
 };
 
+/** Parse the stored `sent_files` JSON, tolerating NULL (no `SendUserFile`
+ *  delivery observed yet), malformed JSON, and a non-array top level — all
+ *  collapse to `null`, same treatment as `parseTodoProgress`. Unlike that
+ *  parser, a well-formed array with some malformed items is partially
+ *  trusted: each item is validated independently and a malformed one is
+ *  dropped rather than invalidating the whole list (an array that ends up
+ *  empty after dropping still returns `[]`, not `null` — the distinction
+ *  `sanitizeToolResultAttachments` in `shared/sent-files.ts` also draws).
+ *  Field rules mirror `SentFileEntry`: `path` a non-empty string; `size` a
+ *  finite number `>= 0` else `null`; `mediaType` a string else `null`;
+ *  `isImage` a boolean else `null`; `sentAt` a finite number (required —
+ *  there's nothing sane to default a missing delivery timestamp to);
+ *  `runId` a string (required). */
+const parseSentFiles = (raw: unknown): SentFileEntry[] | null => {
+  if (raw === null || raw === undefined) return null;
+  let parsed: unknown;
+  try {
+    parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch { return null; }
+  if (!Array.isArray(parsed)) return null;
+
+  const out: SentFileEntry[] = [];
+  for (const item of parsed) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+
+    const path = rec.path;
+    if (typeof path !== "string" || path.length === 0) continue;
+
+    const rawSize = rec.size;
+    const size = typeof rawSize === "number" && Number.isFinite(rawSize) && rawSize >= 0
+      ? rawSize
+      : null;
+
+    const rawMediaType = rec.mediaType;
+    const mediaType = typeof rawMediaType === "string" ? rawMediaType : null;
+
+    const rawIsImage = rec.isImage;
+    const isImage = typeof rawIsImage === "boolean" ? rawIsImage : null;
+
+    const sentAt = rec.sentAt;
+    if (typeof sentAt !== "number" || !Number.isFinite(sentAt)) continue;
+
+    const runId = rec.runId;
+    if (typeof runId !== "string") continue;
+
+    out.push({ path, size, mediaType, isImage, sentAt, runId });
+  }
+  return out;
+};
+
 /** Optional pre-computed grouped counts, threaded in by `tasks.list()` so a
  *  multi-row query does one pass over each in-memory registry instead of a
  *  per-row `countPendingForTask`/`countTerminals` scan (289 tasks × 2 linear
@@ -298,6 +355,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   pendingInteractionCount: counts?.pending ? (counts.pending.get(r.id) ?? 0) : countPendingForTask(r.id),
   openTerminalCount: counts?.terminals ? (counts.terminals.get(r.id) ?? 0) : countTerminals(r.id),
   todoProgress: parseTodoProgress(r.todo_progress),
+  sentFiles: parseSentFiles(r.sent_files),
   // Derived, never stored: a monotonic-id watermark comparison, race-free by
   // construction (see migration 045's doc comment). NULL
   // `last_assistant_event_id` (no assistant event ever observed) always
@@ -370,7 +428,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, unread: false, hasAssistantMessages: false, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
@@ -383,6 +441,12 @@ export const tasks = {
     // ints, so there is nothing for a generic patch to carry for these
     // columns anyway; omitting them from the SET clause is what makes an
     // unrelated field edit (title, column, …) leave the watermark untouched.
+    // `sent_files` (migration 050) joins them as a third server-managed
+    // column this clause skips — it's written only by `tasks.mergeSentFiles`
+    // below via its own targeted UPDATE, on the same rationale: an unrelated
+    // PATCH must not clobber a concurrent `SendUserFile` delivery, and (like
+    // the watermarks) the write must not bump `updated_at` either, or the
+    // board would re-render every task on every 2s poll.
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
@@ -487,6 +551,34 @@ export const tasks = {
        WHERE id = ? AND (last_assistant_event_id IS NULL OR last_assistant_event_id < ?)`,
       [eventId, taskId, eventId],
     );
+  },
+  /**
+   * Merge newly delivered `SendUserFile` files into a task's persisted
+   * `sent_files` column — called by the orchestrator's chunk handler once a
+   * `tool_result` confirms delivery (never on the tool_use alone). Reads the
+   * row's current `sent_files`, merges via the shared
+   * {@link mergeSentFilesShared} (dedupe by path, latest `sentAt` wins,
+   * capped to `MAX_SENT_FILES`), and writes the result back with a single
+   * targeted `UPDATE` — same pattern as `markSeen`/`markUnread`/
+   * `noteAssistantEvent` above: no `updated_at` bump (this is server-managed
+   * delivery state, not a task mutation, and bumping it would re-render
+   * every task on every 2s poll), and it bypasses the generic `update`'s SET
+   * clause entirely so a concurrent unrelated PATCH can't race it. An empty
+   * `incoming` is a no-op that still returns the current `Task` (mirrors
+   * `mergeSentFilesShared([...], [])` returning `existing` unchanged, minus
+   * the wasted UPDATE). Returns `null` when the task doesn't exist.
+   */
+  mergeSentFiles(taskId: string, incoming: SentFileEntry[]): Task | null {
+    const current = this.get(taskId);
+    if (!current) return null;
+    if (incoming.length === 0) return current;
+
+    const merged = mergeSentFilesShared(current.sentFiles ?? [], incoming);
+    db.run(
+      `UPDATE tasks SET sent_files = ? WHERE id = ?`,
+      [JSON.stringify(merged), taskId],
+    );
+    return this.get(taskId);
   },
 };
 
@@ -1134,6 +1226,69 @@ export const runs = {
       `SELECT data FROM run_events WHERE run_id = ? AND stream = 'tool_use' AND subagent_id IS NULL ORDER BY id DESC LIMIT 1`,
     ).get(runId);
     return row ? row.data : null;
+  },
+  /**
+   * Find a run's persisted `tool_use` event by its `id` (claude-tmux's
+   * `{ id, name, input, serverSide }` shape — see the `case "tool_use"`
+   * branch in `claude-tmux.ts`). Backs the sent-files map-miss fallback in
+   * the orchestrator (plan §3, decision 4): the in-memory
+   * `toolUseId → SentFilesRequest` map is per-run and non-persistent, so an
+   * agetor restart mid-flight or a reattach replay can miss it, and this is
+   * how the confirming `tool_result` re-derives the original request.
+   *
+   * There is no index on `(run_id, stream)` — only `idx_run_events_run
+   * (run_id, id)` and the partial `idx_run_events_user_history` exist — so
+   * this scans the run's rows via `idx_run_events_run` and evaluates
+   * `stream = 'tool_use'` plus the `LIKE '%"id":"<toolUseId>"%'` prefilter
+   * against each row's `data` column-by-column; that's fine because this
+   * fallback is rare (the in-memory map-hit path above almost always
+   * resolves it first). The LIKE prefilter still avoids a `JSON.parse` of
+   * every tool_use the run ever had, and the 5-row cap bounds the
+   * pathological case of many tool_use rows sharing a substring match; each
+   * candidate is then `JSON.parse`d and only the first whose parsed `id` field is an
+   * EXACT match to `toolUseId` is returned — the LIKE pattern is a filter,
+   * never the source of truth, so a substring collision (one id embedded in
+   * another) can't misattribute a delivery.
+   *
+   * `toolUseId` is rejected (returns `null` without querying) when it
+   * contains `"` or `\` — either would corrupt the crafted `"id":"…"` JSON
+   * substring this pattern searches for, and no real claude tool_use id
+   * (`toolu_<hex>`, e.g. `toolu_01AbC…`) ever contains either, so this only
+   * ever declines a hostile/malformed id. `%` and `_` are SQL LIKE's own
+   * wildcard characters and — unlike `"`/`\` — DO legitimately appear in
+   * real ids (every claude tool_use id contains the underscore in its
+   * `toolu_` prefix; a reject-on-any-of-four guard, the naive reading, would
+   * make this prefilter a permanent no-op against every real id in
+   * production) — so instead of rejecting on them, they're escaped with a
+   * literal backslash (`ESCAPE '\'`) so LIKE matches them as ordinary
+   * characters rather than wildcards. This only narrows the prefilter
+   * either way: the loop below still requires an EXACT parsed-JSON `id`
+   * match before returning anything, so an unescaped wildcard could only
+   * ever widen the candidate set, never cause a wrong match.
+   */
+  findToolUseEvent(runId: string, toolUseId: string): { id: number; data: string } | null {
+    if (/["\\]/.test(toolUseId)) return null;
+    const likeSafe = toolUseId.replace(/[%_]/g, "\\$&");
+
+    const rows = db.query<{ id: number; data: string }, [string, string]>(
+      `SELECT id, data FROM run_events
+       WHERE run_id = ? AND stream = 'tool_use' AND data LIKE ? ESCAPE '\\'
+       ORDER BY id DESC
+       LIMIT 5`,
+    ).all(runId, `%"id":"${likeSafe}"%`);
+
+    for (const row of rows) {
+      try {
+        const parsed = JSON.parse(row.data) as { id?: unknown };
+        if (parsed && typeof parsed === "object" && parsed.id === toolUseId) {
+          return { id: row.id, data: row.data };
+        }
+      } catch {
+        // Malformed JSON on a LIKE-matched row — skip it, don't throw; the
+        // next candidate (or the eventual `null`) is the right outcome.
+      }
+    }
+    return null;
   },
   /** All events across every run of a task, in event-id order (which is
    *  chronological — id is autoincrement, ts can collide when bursts of

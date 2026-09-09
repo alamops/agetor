@@ -7,6 +7,13 @@ import { notifyFor, osNotify } from "../notify.ts";
 import type { RunEvent, GlobalEvent } from "../../shared/types.ts";
 import { isInternalStatusSentinel } from "../../shared/types.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
+import {
+  parseSentFilesToolUse,
+  parseSentFilesToolResult,
+  sanitizeToolResultAttachments,
+  sentFilesSummaryLine,
+  type SentFilesRequest,
+} from "../../shared/sent-files.ts";
 
 export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   const ref = args.find((a) => !a.startsWith("-"));
@@ -16,6 +23,7 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   if (!ref) throw usageError("logs");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
+  const formatEvent = createEventFormatter();
 
   // --rebuild: reconstruct the latest run's events from the on-disk claude
   // JSONL (recovery when the live stream truncated) — a one-shot snapshot.
@@ -91,49 +99,82 @@ function shouldSkipEvent(e: RunEvent): boolean {
   return e.stream === "status" && isInternalStatusSentinel(e.data);
 }
 
-function formatEvent(e: RunEvent): string {
-  switch (e.stream) {
-    // `userMessageLines` (src/shared/user-message.ts) is the single source of
-    // truth for rendering a raw user-turn string across all three surfaces —
-    // the webview's transcript bubble, this CLI render, and the TUI dashboard
-    // — so a tagged message (slash-command XML, local-command output, a
-    // forked-skill launch, a shell escape, …) prints labeled lines here
-    // instead of raw `<tag>` text. `--json` output is unaffected: it emits
-    // the raw event, never routing through this formatter.
-    case "user":
-      return userMessageLines(e.data).map((line) => `${colorLabel(line)} ${line.text}`).join("\n");
-    case "assistant":
-      return e.data;
-    case "thinking":
-      return c.dim(e.data);
-    case "status":
-      return c.dim(`• ${e.data}`);
-    case "stderr":
-      return c.red(e.data);
-    case "stdout":
-      return e.data;
-    case "tool_use": {
-      const t = tryJson(e.data) as { name?: string } | null;
-      return c.magenta(`▸ ${t?.name ?? "tool"}`);
-    }
-    case "tool_result": {
-      const t = tryJson(e.data) as { isError?: boolean } | null;
-      return c.dim(`  ↳ ${t?.isError ? "error" : "result"}`);
-    }
-    case "interaction": {
-      const r = tryJson(e.data) as { kind?: string } | null;
-      if (r?.kind === "fx_permission") {
-        return c.yellow(`! fx is requesting permission — agetor answer ${e.taskId.slice(0, 8)}`);
+/**
+ * Builds a `formatEvent` renderer with its own private `toolUseId → request`
+ * map for pairing a `SendUserFile` tool_use with its later tool_result — see
+ * the `tool_use`/`tool_result` cases below. One instance per `cmdLogs`
+ * invocation (never a module-level singleton): `--rebuild` and the
+ * streaming/`--follow` path are mutually exclusive within a single call, so
+ * one map safely covers whichever branch runs, and a fresh map per call
+ * means no state leaks between unrelated invocations (or test cases).
+ */
+function createEventFormatter(): (e: RunEvent) => string {
+  const pendingSentFiles = new Map<string, SentFilesRequest>();
+
+  return function formatEvent(e: RunEvent): string {
+    switch (e.stream) {
+      // `userMessageLines` (src/shared/user-message.ts) is the single source
+      // of truth for rendering a raw user-turn string across all three
+      // surfaces — the webview's transcript bubble, this CLI render, and the
+      // TUI dashboard — so a tagged message (slash-command XML,
+      // local-command output, a forked-skill launch, a shell escape, …)
+      // prints labeled lines here instead of raw `<tag>` text. `--json`
+      // output is unaffected: it emits the raw event, never routing through
+      // this formatter.
+      case "user":
+        return userMessageLines(e.data).map((line) => `${colorLabel(line)} ${line.text}`).join("\n");
+      case "assistant":
+        return e.data;
+      case "thinking":
+        return c.dim(e.data);
+      case "status":
+        return c.dim(`• ${e.data}`);
+      case "stderr":
+        return c.red(e.data);
+      case "stdout":
+        return e.data;
+      case "tool_use": {
+        const t = tryJson(e.data) as { id?: string; name?: string; input?: unknown } | null;
+        if (t?.id && t.name) {
+          const req = parseSentFilesToolUse(t.name, t.input);
+          if (req) {
+            pendingSentFiles.set(t.id, req);
+            return c.magenta(`📎 ${sentFilesSummaryLine(req, null)}`);
+          }
+        }
+        return c.magenta(`▸ ${t?.name ?? "tool"}`);
       }
-      return c.yellow(
-        `! needs answer (${r?.kind ?? "?"}) — agetor answer ${e.taskId.slice(0, 8)}`,
-      );
+      case "tool_result": {
+        const t = tryJson(e.data) as
+          | { toolUseId?: string; content?: unknown; isError?: boolean; attachments?: unknown }
+          | null;
+        const req = t?.toolUseId ? pendingSentFiles.get(t.toolUseId) : undefined;
+        if (req && t) {
+          pendingSentFiles.delete(t.toolUseId!);
+          const result = parseSentFilesToolResult(
+            t.content,
+            t.isError,
+            sanitizeToolResultAttachments(t.attachments),
+          );
+          return c.magenta(`📎 ${sentFilesSummaryLine(req, result)}`);
+        }
+        return c.dim(`  ↳ ${t?.isError ? "error" : "result"}`);
+      }
+      case "interaction": {
+        const r = tryJson(e.data) as { kind?: string } | null;
+        if (r?.kind === "fx_permission") {
+          return c.yellow(`! fx is requesting permission — agetor answer ${e.taskId.slice(0, 8)}`);
+        }
+        return c.yellow(
+          `! needs answer (${r?.kind ?? "?"}) — agetor answer ${e.taskId.slice(0, 8)}`,
+        );
+      }
+      case "interaction_resolved":
+        return c.dim("✓ interaction answered");
+      default:
+        return e.data;
     }
-    case "interaction_resolved":
-      return c.dim("✓ interaction answered");
-    default:
-      return e.data;
-  }
+  };
 }
 
 /** Color a `PlainLine`'s label by its tone — `user` cyan (matches today's

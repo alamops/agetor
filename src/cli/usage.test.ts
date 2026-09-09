@@ -3,7 +3,7 @@ import { USAGE, canonical, usageError, helpFor } from "./usage.ts";
 
 const COMMANDS = [
   "add", "ls", "ps", "show", "start", "send", "commit", "answer", "commands", "logs",
-  "cancel", "attach", "shell", "edit", "move", "archive", "unarchive", "diff", "rm",
+  "files", "cancel", "attach", "shell", "edit", "move", "archive", "unarchive", "diff", "rm",
   "projects", "harness", "daemon", "info", "config",
 ];
 
@@ -23,6 +23,7 @@ test("canonical resolves aliases and passes real names through", () => {
   expect(canonical("delete")).toBe("rm");
   expect(canonical("harnesses")).toBe("harness");
   expect(canonical("project")).toBe("projects");
+  expect(canonical("sent")).toBe("files");
   expect(canonical("commit")).toBe("commit");
 });
 
