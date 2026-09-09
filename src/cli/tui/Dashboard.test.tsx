@@ -1,6 +1,7 @@
 import { test, expect, mock, afterAll } from "bun:test";
 import { render } from "ink-testing-library";
-import { Dashboard } from "./Dashboard.tsx";
+import { Dashboard, buildSentFilesLines } from "./Dashboard.tsx";
+import { eventKey } from "./useCoalescedStream.ts";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task, RunEvent } from "../../shared/types.ts";
 import { commitPushPrompt, FX_USAGE_STATUS_PREFIX, PERMISSION_MODE_STATUS_PREFIX } from "../../shared/types.ts";
@@ -180,6 +181,109 @@ test("event stream: an fx_permission interaction renders generically, sentinel s
   // A plain status line still renders.
   expect(frame).toContain("plain status text");
   unmount();
+});
+
+test("event stream: a SendUserFile tool_use renders 📎 sending…, then folds its tool_result into 📎 sent … (size) with no ↳ result line", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const base = { runId: "runA", taskId: "taskA" };
+  const push = onTaskEvents!;
+  push({
+    ...base, stream: "tool_use",
+    data: JSON.stringify({
+      id: "toolu_1", name: "SendUserFile",
+      input: { files: ["/tmp/a.png", "/tmp/b.md"], caption: "here", status: "normal" },
+    }),
+    ts: 1,
+  });
+  await wait(80);
+
+  let frame = lastFrame() ?? "";
+  expect(frame).toContain("📎 sending 2 files: a.png, b.md");
+  expect(frame).not.toContain("▸ SendUserFile");
+
+  push({
+    ...base, stream: "tool_result",
+    data: JSON.stringify({
+      toolUseId: "toolu_1",
+      content: "2 files delivered to user.\n  /tmp/a.png → file_uuid: abc\n  /tmp/b.md → file_uuid: def",
+      isError: false,
+      attachments: [
+        { path: "/tmp/a.png", size: 2048, isImage: true, media_type: "image/png" },
+        { path: "/tmp/b.md", size: null, isImage: false, media_type: null },
+      ],
+    }),
+    ts: 2,
+  });
+  await wait(80);
+
+  frame = lastFrame() ?? "";
+  expect(frame).toContain("📎 sent 2 files: a.png (2.0 KB), b.md");
+  expect(frame).not.toContain("↳ result");
+  unmount();
+});
+
+// `buildSentFilesLines` is the perf fix's exported primitive-prop builder
+// (Dashboard.tsx): `EventLine` takes a `sentLine: string | null | undefined`
+// prop instead of the old whole-window Map, specifically so an unrelated
+// line's prop stays the SAME primitive (`undefined`) across two calls even
+// though the returned Map is a fresh object each time and the input array
+// grew (a coalesced flush always appends). ink-testing-library's `lastFrame()`
+// only exposes rendered text, not React element/prop identity, so this
+// asserts the primitive-shape contract the memo fix actually depends on
+// directly against the exported helper, rather than through a live render.
+test("buildSentFilesLines: an unrelated event's entry stays absent (undefined) across a flush that only appends", () => {
+  const before: RunEvent[] = [
+    { runId: "r", taskId: "t", stream: "assistant", data: "hello", ts: 1 },
+    { runId: "r", taskId: "t", stream: "tool_use", data: JSON.stringify({ id: "toolu_x", name: "Bash", input: { command: "ls" } }), ts: 2 },
+    { runId: "r", taskId: "t", stream: "tool_result", data: JSON.stringify({ toolUseId: "toolu_x", content: "ok" }), ts: 3 },
+  ];
+  const appended: RunEvent[] = [
+    ...before,
+    { runId: "r", taskId: "t", stream: "status", data: "another status line", ts: 4 },
+  ];
+
+  const linesBefore = buildSentFilesLines(before);
+  const linesAfter = buildSentFilesLines(appended);
+
+  // Two distinct Map objects (never the same reference)...
+  expect(linesBefore).not.toBe(linesAfter);
+  // ...but every unrelated event's value is the identical `undefined`
+  // primitive in both — exactly what lets `EventLine`'s shallow memo bail
+  // out for these lines despite the Map's own identity changing.
+  for (const e of before) {
+    expect(linesBefore.get(eventKey(e))).toBeUndefined();
+    expect(linesAfter.get(eventKey(e))).toBeUndefined();
+  }
+  // The newly appended, also-unrelated line is absent too, not merely `null`.
+  expect(linesAfter.has(eventKey(appended[appended.length - 1]!))).toBe(false);
+});
+
+test("buildSentFilesLines: a SendUserFile tool_use formats a stable 📎 string and its paired tool_result maps to null", () => {
+  const toolUse: RunEvent = {
+    runId: "r", taskId: "t", stream: "tool_use",
+    data: JSON.stringify({ id: "toolu_1", name: "SendUserFile", input: { files: ["/tmp/a.png"] } }),
+    ts: 1,
+  };
+  const toolResult: RunEvent = {
+    runId: "r", taskId: "t", stream: "tool_result",
+    data: JSON.stringify({ toolUseId: "toolu_1", content: "1 file delivered to user.\n  /tmp/a.png → file_uuid: abc", isError: false }),
+    ts: 2,
+  };
+  const unrelated: RunEvent = { runId: "r", taskId: "t", stream: "assistant", data: "hi", ts: 3 };
+
+  const lines = buildSentFilesLines([toolUse, toolResult, unrelated]);
+  expect(lines.get(eventKey(toolUse))).toBe("📎 sent 1 file: a.png");
+  expect(lines.get(eventKey(toolResult))).toBeNull();
+  expect(lines.has(eventKey(unrelated))).toBe(false);
 });
 
 // ── @ file autocomplete wiring (compose mode → Composer's fileEntries) ──────

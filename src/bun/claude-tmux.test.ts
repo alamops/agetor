@@ -1135,6 +1135,137 @@ test("dispatchLine: a user-INTERRUPT tool_result FIRES the staged turn-end (run 
   __forTest.uninstallSession(taskId);
 });
 
+test("dispatchLine: SendUserFile success tool_result forwards sanitized attachments from the top-level toolUseResult", async () => {
+  // Claude stamps a top-level `toolUseResult` object (sibling of `message`)
+  // on the `user` JSONL line alongside the `tool_result` content block.
+  // For SendUserFile it's `{ caption, display, attachments: [...] }` — the
+  // `attachments[]` array is what gets forwarded (sanitized), never the raw
+  // object wholesale. `pathValidated`/`file_uuid` are dropped by the
+  // sanitizer; `line_uuid` (the third onChunk arg) still threads through.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-sent-files-success";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string; lineUuid?: string }[] = [];
+  void __forTest.pushTurnSlot(state, (stream, data, lineUuid) => recorded.push({ stream, data, lineUuid }));
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user",
+    uuid: "sf-success-1",
+    message: {
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_sendfile_1",
+        content: "1 file delivered to user.\n  /private/tmp/claude-501/chart.png → file_uuid: file-abc-123\n",
+        is_error: false,
+      }],
+    },
+    toolUseResult: {
+      caption: "Here's the chart",
+      display: "render",
+      attachments: [{
+        path: "/private/tmp/claude-501/chart.png",
+        size: 2048,
+        isImage: true,
+        media_type: "image/png",
+        pathValidated: true,
+        file_uuid: "file-abc-123",
+      }],
+    },
+  }));
+
+  const evt = recorded.find((r) => r.stream === "tool_result");
+  expect(evt).toBeDefined();
+  expect(evt!.lineUuid).toBe("sf-success-1");
+  const parsed = JSON.parse(evt!.data);
+  expect(parsed).toEqual({
+    toolUseId: "toolu_sendfile_1",
+    content: "1 file delivered to user.\n  /private/tmp/claude-501/chart.png → file_uuid: file-abc-123\n",
+    isError: false,
+    attachments: [{
+      path: "/private/tmp/claude-501/chart.png",
+      size: 2048,
+      isImage: true,
+      mediaType: "image/png",
+    }],
+  });
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: SendUserFile error tool_result (string toolUseResult) never adds an attachments key", async () => {
+  // On error claude stamps a bare STRING at the top-level `toolUseResult`
+  // (not an object), e.g. because a directory path was rejected — there is
+  // nothing to sanitize, and the emitted JSON must omit the key entirely
+  // rather than carry `attachments: null` or similar.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-sent-files-error";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  void __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user",
+    uuid: "sf-error-1",
+    message: {
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_sendfile_2",
+        content: "<tool_use_error>Attachment \"/private/tmp/claude-501/agetor-sent\" is not a regular file.</tool_use_error>",
+        is_error: true,
+      }],
+    },
+    toolUseResult: "Error: Attachment \"/private/tmp/claude-501/agetor-sent\" is not a regular file.",
+  }));
+
+  const evt = recorded.find((r) => r.stream === "tool_result");
+  expect(evt).toBeDefined();
+  const parsed = JSON.parse(evt!.data);
+  expect(parsed.isError).toBe(true);
+  expect(parsed.content).toBe(
+    "<tool_use_error>Attachment \"/private/tmp/claude-501/agetor-sent\" is not a regular file.</tool_use_error>",
+  );
+  expect("attachments" in parsed).toBe(false);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: a tool_result whose object toolUseResult has no attachments array stays unchanged", async () => {
+  // Other tools' `toolUseResult` shapes are plain objects too (e.g. Read's
+  // file-content envelope) but carry no `attachments` field at all — the
+  // sanitizer returns null for a missing/non-array value, so the emitted
+  // event must be byte-identical to before this feature landed (no key).
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-sent-files-no-attachments";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  void __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user",
+    uuid: "sf-read-1",
+    message: {
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_read_1",
+        content: "line 1\nline 2\n",
+        is_error: false,
+      }],
+    },
+    toolUseResult: {
+      type: "text",
+      file: { filePath: "/private/tmp/claude-501/notes.txt", content: "line 1\nline 2\n", numLines: 2 },
+    },
+  }));
+
+  const evt = recorded.find((r) => r.stream === "tool_result");
+  expect(evt).toBeDefined();
+  const parsed = JSON.parse(evt!.data);
+  expect(parsed).toEqual({ toolUseId: "toolu_read_1", content: "line 1\nline 2\n", isError: false });
+  expect("attachments" in parsed).toBe(false);
+  __forTest.uninstallSession(taskId);
+});
+
 test("dispatchLine: end_turn staging — thinking/text split lines stage+cancel, real end fires on confirmation", async () => {
   // Reproduces the EXACT Guest Mode failure sequence:
   // line 120: end_turn [thinking]  → stage (was previously STILL_FIRES with hasPendingToolUse fix)

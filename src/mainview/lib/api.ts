@@ -1443,6 +1443,18 @@ export const api = {
     }),
 
   /**
+   * Reveal a file or directory in the Finder (`open -R`), same abs-or-
+   * task-relative + existsSync contract as `openPath`. macOS-only — the
+   * `POST /reveal-path` route (landing alongside this in the same branch)
+   * answers 501 under the headless backend, same as `/open-path`.
+   */
+  revealPath: (input: { path: string; taskId?: string }) =>
+    j<{ revealed: boolean; path: string }>(`/reveal-path`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  /**
    * Open an http(s) or mailto URL in the OS default browser. The webview is
    * sandboxed; `target="_blank"` does nothing, so anchor clicks need to
    * round-trip through the Bun main process to reach `Utils.openExternal`.

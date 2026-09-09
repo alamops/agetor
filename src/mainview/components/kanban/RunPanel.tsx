@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
@@ -69,8 +69,10 @@ import {
   type TaskEventsReplayMeta,
   type TaskPlan,
   type TaskReference,
+  type ToolResultAttachment,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
+import { parseSentFilesToolUse } from "../../../shared/sent-files.ts";
 import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
 import { parseIssueUrl } from "../../../shared/issue-task.ts";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
@@ -83,6 +85,7 @@ import { parseUserMessage, splitReferences, parseMessageSegments, type MessageSe
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
 import { AttachmentChips } from "./AttachmentChips";
+import { SentFilesCard } from "./SentFilesCard";
 import {
   ReferencesPicker,
   captureDroppedOrPastedItems,
@@ -4352,6 +4355,9 @@ function RunEventList({
             return [wrap(key, evid, <PlanCard plan={plan} onOpen={() => onOpenPlan?.(plan.id)} />)];
           }
           const result = resultByToolId.get(parsed.id);
+          if (parseSentFilesToolUse(parsed.name, parsed.input)) {
+            return [wrap(key, evid, <SentFilesCard call={parsed} result={result} taskId={taskId} />)];
+          }
           return [wrap(key, evid, <ToolUseBlock call={parsed} result={result} />)];
         }
         case "tool_result": {
@@ -4632,7 +4638,7 @@ function repairTruncatedJson(input: string): unknown | null {
 // kind's `tool_use` JSON simply lacks the key, and `ToolUseBlock` only
 // renders it when present.
 interface ParsedToolUse { id: string; name: string; input: unknown; serverSide?: boolean; title?: string }
-interface ParsedToolResult { toolUseId: string; content: unknown; isError?: boolean }
+interface ParsedToolResult { toolUseId: string; content: unknown; isError?: boolean; attachments?: ToolResultAttachment[] }
 
 function safeParse<T>(s: string): T | null {
   try { return JSON.parse(s) as T; } catch { return null; }
@@ -5467,6 +5473,8 @@ function toolIcon(name: string): ComponentType<{ className?: string; "aria-hidde
       return Slash;
     case "Skill":
       return Sparkles;
+    case "SendUserFile":
+      return Paperclip;
     default:
       // MCP tools get their own icon so the user can spot "this is a
       // third-party server's tool" at a glance.
@@ -5502,6 +5510,10 @@ function formatToolInputSummary(name: string, input: unknown): string {
   if (name === "SlashCommand" && typeof input.command === "string") return truncateString(input.command, 80);
   if (name === "Skill" && typeof input.skill === "string") return String(input.skill);
   if ((name === "BashOutput" || name === "KillShell") && typeof input.shell_id === "string") return String(input.shell_id);
+  // SentFilesCard renders the real card whenever `parseSentFilesToolUse`
+  // accepts the input; this only backstops the orphan/unknown-shape case
+  // where the card declines (see the tool_use case in RunEventList).
+  if (name === "SendUserFile" && Array.isArray(input.files)) return `${input.files.length} file(s)`;
   // MCP tools: the header already shows `mcp · server / tool` via a Badge
   // pair, so we leave the summary empty to avoid double-labeling.
   return "";

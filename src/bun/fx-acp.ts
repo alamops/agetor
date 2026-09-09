@@ -9,6 +9,8 @@ import {
   FX_USAGE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
 } from "../shared/types.ts";
+import { isImagePath } from "../shared/attachments.ts";
+import { SENT_FILES_TOOL_NAME } from "../shared/sent-files.ts";
 import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
 import {
   answerFxPermission,
@@ -955,6 +957,54 @@ function toolResultContent(update: Record<string, unknown>): unknown {
   return update;
 }
 
+/** One `file://` `resource_link` content block found in a completed tool
+ *  call's `content` array — see {@link extractFxResourceLinks}. */
+interface FxResourceLink {
+  path: string;
+  mimeType: string | null;
+  size: number | null;
+}
+
+/**
+ * Pull every `file://` `resource_link` out of a `ToolCallUpdate.content`
+ * array (ACP schema: `ToolCallContent[]`, each either `{ type: "content",
+ * content: ContentBlock }`, `{ type: "diff", … }` or `{ type: "terminal",
+ * … }`). Only `{ type: "content", content: { type: "resource_link", uri,
+ * … } }` items are relevant — diff/terminal entries and any other
+ * `ContentBlock` variant (`text`, `image`, …) are ignored — and only a
+ * `file://` `uri` converts to a local path (http(s)/data/other schemes
+ * aren't something `SendUserFile` can represent, so those links are
+ * dropped rather than mapped). An unparsable `uri` (malformed URL) is
+ * skipped individually rather than failing the whole array — one bad link
+ * shouldn't hide the rest.
+ */
+function extractFxResourceLinks(content: unknown): FxResourceLink[] {
+  if (!Array.isArray(content)) return [];
+  const out: FxResourceLink[] = [];
+  for (const item of content) {
+    if (!item || typeof item !== "object") continue;
+    const wrapper = item as Record<string, unknown>;
+    if (wrapper.type !== "content") continue;
+    const block = wrapper.content;
+    if (!block || typeof block !== "object") continue;
+    const b = block as Record<string, unknown>;
+    if (b.type !== "resource_link") continue;
+    if (typeof b.uri !== "string" || !b.uri.startsWith("file://")) continue;
+
+    let decodedPath: string;
+    try {
+      decodedPath = decodeURIComponent(new URL(b.uri).pathname);
+    } catch {
+      continue;
+    }
+
+    const mimeType = typeof b.mimeType === "string" && b.mimeType.trim().length > 0 ? b.mimeType.trim() : null;
+    const size = typeof b.size === "number" && Number.isFinite(b.size) && b.size >= 0 ? b.size : null;
+    out.push({ path: decodedPath, mimeType, size });
+  }
+  return out;
+}
+
 /** A chunk `mapFxUpdate` wants emitted — the pure equivalent of an `emit()`
  *  call, minus the dedup/settled-turn gating `emit` itself applies.
  *  `messageId` (fx ≥0.0.8, `agent_message_chunk`/`agent_thought_chunk` only
@@ -1173,13 +1223,66 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
       // so drop the event rather than emit an unpairable orphan.
       if (typeof update.toolCallId !== "string") return [];
       const id = update.toolCallId;
-      return [
+      const chunks: FxChunk[] = [
         {
           stream: "tool_result",
           data: JSON.stringify({ toolUseId: id, content: toolResultContent(update), isError: status === "failed" }),
           lineUuid: `fx:tool:${id}:result`,
         },
       ];
+
+      // ── Dormant: `resource_link` → synthetic `SendUserFile` tool_use/result ──
+      // fx 0.0.7's ACP implementation, source- and binary-string-verified
+      // 2026-09-07, emits only `text`/`image` content blocks — never
+      // `resource_link` — so this branch has no live fx traffic to exercise
+      // it today. It's spec-correct scaffolding, the same bet as the `plan`
+      // → `TodoWrite` and `usage_update` → status-chip mappings above: the
+      // ACP schema lets a completed tool call's `content` carry
+      // `{ type: "content", content: { type: "resource_link", uri, … } }`
+      // items describing files the tool produced or delivered, and if a
+      // future fx build (or another ACP-speaking harness this driver might
+      // one day serve) starts sending them, agetor should render that
+      // exactly like Claude's own `SendUserFile` tool — one shared
+      // card/badge/CLI line (`src/shared/sent-files.ts`), not a bespoke
+      // ACP-only surface. Only completed calls qualify (a failed call's
+      // links, if any, describe files that were never actually delivered);
+      // only `file://` URIs convert to a local path — `SendUserFile` is
+      // inherently about local filesystem delivery. Emitted strictly AFTER
+      // the real tool_result above so wire order is preserved (the tool's
+      // own result renders before the derived "files sent" pair).
+      if (status === "completed" && Array.isArray(update.content)) {
+        const links = extractFxResourceLinks(update.content);
+        if (links.length > 0) {
+          const sentFilesId = `${id}:sent-files`;
+          const title = typeof update.title === "string" ? update.title.trim() : "";
+          const input: Record<string, unknown> = { files: links.map((l) => l.path), status: "normal" };
+          if (title.length > 0) input.caption = title;
+          chunks.push({
+            stream: "tool_use",
+            data: JSON.stringify({ id: sentFilesId, name: SENT_FILES_TOOL_NAME, input, serverSide: false }),
+            lineUuid: `fx:tool:${id}:sent-files:use`,
+          });
+
+          const n = links.length;
+          chunks.push({
+            stream: "tool_result",
+            data: JSON.stringify({
+              toolUseId: sentFilesId,
+              content: `${n} file${n === 1 ? "" : "s"} delivered to user.`,
+              isError: false,
+              attachments: links.map((l) => ({
+                path: l.path,
+                size: l.size,
+                isImage: l.mimeType !== null ? l.mimeType.startsWith("image/") : isImagePath(l.path),
+                mediaType: l.mimeType,
+              })),
+            }),
+            lineUuid: `fx:tool:${id}:sent-files:result`,
+          });
+        }
+      }
+
+      return chunks;
     }
 
     case "plan": {

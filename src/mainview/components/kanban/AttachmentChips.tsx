@@ -13,11 +13,7 @@ import { ImageOff } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import { isImagePath } from "../../../shared/attachments.ts";
-import { Dialog } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
-
-const NOT_FOUND_TITLE_ID = "attachment-not-found-title";
-const OPEN_ERROR_TITLE_ID = "attachment-open-error-title";
+import { AttachmentNotFoundDialog, AttachmentOpenErrorDialog } from "./AttachmentDialogs";
 
 export function AttachmentChips({
   references,
@@ -32,9 +28,11 @@ export function AttachmentChips({
   // Paths whose thumbnail failed to load, or whose openPath call 404'd (path
   // genuinely gone) — once known missing we skip re-hitting the server on a
   // repeat click and go straight to the not-found dialog. Cleared when that
-  // dialog is dismissed so a later click retries rather than staying amber
-  // forever (e.g. the file reappeared, or the first check raced a slow
-  // mount).
+  // dialog is dismissed — by Escape, the backdrop, OR the dialog's own Close
+  // button, since `AttachmentNotFoundDialog` (`AttachmentDialogs.tsx`) wires
+  // its Close button to the very same `onClose` callback passed in here —
+  // so a later click retries rather than staying amber forever (e.g. the
+  // file reappeared, or the first check raced a slow mount).
   const [missing, setMissing] = useState<ReadonlySet<string>>(new Set());
   const [notFoundPath, setNotFoundPath] = useState<string | null>(null);
   // Distinct from `notFoundPath`: any *other* openPath failure (headless
@@ -110,8 +108,8 @@ export function AttachmentChips({
         })}
       </div>
 
-      <Dialog
-        open={notFoundPath !== null}
+      <AttachmentNotFoundDialog
+        path={notFoundPath}
         onClose={() => {
           setNotFoundPath(null);
           // Retry on a later click/render instead of staying permanently
@@ -123,41 +121,13 @@ export function AttachmentChips({
             return next;
           });
         }}
-        labelledBy={NOT_FOUND_TITLE_ID}
-        className="max-w-md"
-      >
-        <h2 id={NOT_FOUND_TITLE_ID} className="text-sm font-semibold">
-          Attachment not found
-        </h2>
-        <p className="mt-2 break-all font-mono text-xs text-muted-foreground">
-          {notFoundPath}
-        </p>
-        <div className="mt-4 flex justify-end">
-          <Button size="sm" variant="outline" onClick={() => setNotFoundPath(null)}>
-            Close
-          </Button>
-        </div>
-      </Dialog>
+      />
 
-      <Dialog
-        open={openError !== null}
+      <AttachmentOpenErrorDialog
+        path={openError?.path ?? null}
+        message={openError?.message ?? null}
         onClose={() => setOpenError(null)}
-        labelledBy={OPEN_ERROR_TITLE_ID}
-        className="max-w-md"
-      >
-        <h2 id={OPEN_ERROR_TITLE_ID} className="text-sm font-semibold">
-          Couldn't open attachment
-        </h2>
-        <p className="mt-2 break-all font-mono text-xs text-muted-foreground">
-          {openError?.path}
-        </p>
-        <p className="mt-2 text-xs text-muted-foreground">{openError?.message}</p>
-        <div className="mt-4 flex justify-end">
-          <Button size="sm" variant="outline" onClick={() => setOpenError(null)}>
-            Close
-          </Button>
-        </div>
-      </Dialog>
+      />
     </>
   );
 }

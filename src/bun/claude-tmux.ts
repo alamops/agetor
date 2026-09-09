@@ -49,6 +49,7 @@ import { detectAskModal, parseModalPane, type AskModalKind, type NavKey, type Pa
 import type { RunEventStream } from "../shared/types.ts";
 import { PERMISSION_MODE_STATUS_PREFIX, SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import { imageSourceMetaPath } from "../shared/attachments.ts";
+import { sanitizeToolResultAttachments } from "../shared/sent-files.ts";
 
 /**
  * Stream chunk callback. `lineUuid` is the JSONL line's `uuid` field (claude
@@ -576,7 +577,13 @@ interface UserMessage {
  *   image                 → `assistant` (placeholder text — UI doesn't inline)
  *
  * User content-block types we recognise:
- *   tool_result           → `tool_result` (data = { toolUseId, content, isError })
+ *   tool_result           → `tool_result` (data = { toolUseId, content, isError,
+ *                           attachments? }). `attachments` comes from the
+ *                           line's top-level `toolUseResult.attachments`
+ *                           (present for some tools, e.g. SendUserFile —
+ *                           absent, or a bare string, on error), sanitized
+ *                           down to `{ path, size, isImage, mediaType }` and
+ *                           included only when non-empty.
  *   image                 → silent (not currently surfaced)
  *   text                  → silent (echoed via send-input status)
  *
@@ -639,6 +646,15 @@ interface ParsedJsonlEvent {
   isApiErrorMessage?: boolean;
   /** HTTP status of the underlying API failure (paired with isApiErrorMessage). */
   apiErrorStatus?: number;
+  /** Top-level field claude stamps on a `user` line alongside a `tool_result`
+   *  content block — richer, tool-specific structured detail than the
+   *  `content` string carries. For `SendUserFile` it's an object
+   *  `{ caption, display, attachments: [{ path, size, isImage, media_type,
+   *  pathValidated, file_uuid }] }` on success, and a bare error STRING on
+   *  failure — other tools' shapes vary. Only `attachments` (sanitized via
+   *  `sanitizeToolResultAttachments`) is forwarded today; see the `case
+   *  "user"` tool_result branch. */
+  toolUseResult?: unknown;
 }
 
 /** Status-chunk prefix the orchestrator looks for to flip a claude task into
@@ -1218,10 +1234,26 @@ function mapParsedEventToChunks(
             const isInterrupt = USER_INTERRUPT_RE.test(toolResultText(block.content));
             const isError = (block.is_error ?? false)
               && !isInterrupt;
+            // `toolUseResult` (top-level, sibling of `message`) carries
+            // richer structured detail for some tools — e.g. SendUserFile's
+            // `attachments[]` — but only as a plain object; on error claude
+            // stamps a bare string there instead, and the interrupt rewrite
+            // above has nothing to do with the real tool outcome, so neither
+            // case has attachments worth forwarding. `sanitize…` returns
+            // `null` for a missing/malformed array, and `JSON.stringify`
+            // drops an `undefined`-valued key, so a null/empty result never
+            // adds `attachments` to the emitted JSON — existing events (no
+            // matching tool) stay byte-identical.
+            const toolUseResult = evt.toolUseResult;
+            const attachments = !isInterrupt
+              && typeof toolUseResult === "object" && toolUseResult !== null && !Array.isArray(toolUseResult)
+              ? sanitizeToolResultAttachments((toolUseResult as { attachments?: unknown }).attachments)
+              : null;
             onChunk("tool_result", JSON.stringify({
               toolUseId: block.tool_use_id ?? "",
               content: isInterrupt ? "Declined — Claude is waiting for your direction." : block.content,
               isError,
+              attachments: attachments && attachments.length > 0 ? attachments : undefined,
             }), uuid);
           } else if (block?.type === "text" && block.text) {
             onChunk("user", block.text.replace(/\r\n?/g, "\n"), uuid);
