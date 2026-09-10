@@ -1,14 +1,16 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Paperclip, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { abbreviateHome, cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
+import { useCountdown, fxPausedBadgeText, fxPausedBadgeTitle } from "@/lib/fx-auto-resume";
 import { taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { sentFileBasename } from "../../../shared/sent-files.ts";
+import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
 import { AgentIcon } from "./AgentIcon";
 
 interface Props {
@@ -35,6 +37,14 @@ interface Props {
 
 function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu }: Props) {
   const archived = task.archivedAt != null;
+  // `fx-paused-badge`'s live countdown (see the badge below) — called
+  // unconditionally, before any conditional return, so hook order stays
+  // stable whether or not this task is actually paused right now; ticks
+  // only while `task.fxRecovery.autoResume.at` is actually set (see
+  // `useCountdown`'s own doc comment). `task.fxRecovery` is server-managed
+  // — this card never inspects `task.agent` to decide whether to show it.
+  const fxAutoResumeAt = task.fxRecovery?.autoResume?.at ?? null;
+  const fxAutoResumeCountdown = useCountdown(fxAutoResumeAt);
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so
@@ -188,6 +198,25 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               >
                 <Paperclip className="size-3" />
                 {task.sentFiles.length}
+              </Badge>
+            )}
+            {/* fx's response is paused on a resumable Gateway checkpoint
+             *  (`Task.fxRecovery`, server-managed — see `TaskFxRecovery` in
+             *  shared/types.ts). Gated on the shared `isTaskFxPaused` helper,
+             *  never on `task.agent`, so it stays correct if fx is ever
+             *  aliased under a different harness id. Text/title come from
+             *  `fxPausedBadgeText`/`fxPausedBadgeTitle` (`@/lib/fx-auto-resume`)
+             *  — "paused" or a live "auto-resume m:ss" countdown, with a
+             *  tooltip explaining why (or why not) an auto-resume is pending. */}
+            {isTaskFxPaused(task) && task.fxRecovery && (
+              <Badge
+                variant="outline"
+                className="gap-1 text-[10px] shrink-0 text-warning border-warning/40"
+                data-testid="fx-paused-badge"
+                title={fxPausedBadgeTitle(task.fxRecovery)}
+              >
+                <PauseCircle className="size-3" />
+                {fxPausedBadgeText(task.fxRecovery, fxAutoResumeCountdown)}
               </Badge>
             )}
           </div>

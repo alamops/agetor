@@ -22,7 +22,7 @@ import {
   dataDir,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
@@ -4899,6 +4899,45 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           } finally {
             approvalsInFlight.delete(key);
           }
+        }),
+      },
+
+      // Resume a PAUSED fx model response (Vercel AI Gateway rate-limit
+      // recovery — see `resumeFxRecovery`'s doc in orchestrator.ts and plan
+      // `docs/plans/fix-fx-harness-rate-limit.md` §2/§3.5,
+      // `docs/plans/fx-recovery-follow-ups.md` §3). The synchronous per-task
+      // double-resume claim used to live here (`fxResumesInFlight`) — it now
+      // lives inside `resumeFxRecovery` itself (`resumingTaskIds`), so the
+      // auto-resume engine's own timer and every HTTP caller share ONE
+      // guard. This route just calls it (with no `opts` — always a manual
+      // resume) and maps the result onto HTTP.
+      "/tasks/:id/fx-resume": {
+        POST: authed(async (req) => {
+          const result = await resumeFxRecovery(req.params.id);
+          return result.ok
+            ? json(result, { headers: corsHeaders(req) })
+            : json({ error: result.error }, { status: result.status, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Cancel a pending fx auto-resume schedule (plan
+      // `docs/plans/fx-recovery-follow-ups.md` §3 T2 item 11) — the paused
+      // notice's Cancel button, the board card's context-menu
+      // "Cancel auto-resume" entry, and `agetor resume <id> --cancel`. All
+      // the real logic (clearing the timer, persisting the row, the status
+      // line, the `fx-auto-resume` event) lives in `cancelFxAutoResume`
+      // itself; this route just maps its boolean onto HTTP.
+      "/tasks/:id/fx-auto-resume": {
+        DELETE: authed((req) => {
+          const taskId = req.params.id;
+          if (!tasks.get(taskId)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const cancelled = cancelFxAutoResume(taskId, "cancelled");
+          if (!cancelled) {
+            return json({ error: "no auto-resume pending" }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
 

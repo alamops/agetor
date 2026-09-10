@@ -187,6 +187,40 @@ export function notifyFilesSent(
   }
 }
 
+/**
+ * Alert the user that the orchestrator's own `fx-auto-resume` engine fired a
+ * resume for a paused fx task (see `TaskFxRecovery` / the `fx-auto-resume`
+ * `GlobalEvent` in `src/shared/types.ts`). Live-only, like
+ * `notifyFilesSent` — a replayed historical `fired` must not re-toast — and
+ * deliberately does NOT call `maybeNotifyOS`: auto-resume outcomes are
+ * toast-only by design (the plan's §8 explicitly defers an OS notification).
+ * Self-dismissing (`toast.info`), matching `toastSuccess`.
+ */
+export function toastFxAutoResumeFired(args: ToastArgs & { attempt: number; max: number }): void {
+  if (args.isSelected) return;
+  toast.info(`Auto-resuming paused fx response (${args.attempt}/${args.max})…`, {
+    description: describe(args),
+    duration: 6000,
+    action: { label: "Open", onClick: args.onOpen },
+  });
+}
+
+/**
+ * Alert the user that the auto-resume chain hit `FX_AUTO_RESUME_MAX` with no
+ * further timer scheduled — the pause is still there, but only a manual
+ * Resume will clear it from here. Same live-only / no-OS-notification
+ * contract as `toastFxAutoResumeFired`; `duration: Infinity` (like
+ * `toastError`) since this needs the user to act, not just notice.
+ */
+export function toastFxAutoResumeExhausted(args: ToastArgs & { max: number }): void {
+  if (args.isSelected) return;
+  toast.error(`Auto-resume gave up after ${args.max} attempts — resume manually once the limit clears`, {
+    description: describe(args),
+    duration: Infinity,
+    action: { label: "Open", onClick: args.onOpen },
+  });
+}
+
 /** Clear the pending toast for a task (called when the task leaves `blocked`). */
 export function dismissPending(taskId: string): void {
   const id = pendingByTask.get(taskId);

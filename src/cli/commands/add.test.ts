@@ -3,7 +3,7 @@ import path from "node:path";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import type { Flags } from "../context.ts";
 import type { GitHubComment, GitHubIssueThreadResult, GitHubListItem, Task } from "../../shared/types.ts";
-import { DEFAULT_MODEL } from "../../shared/types.ts";
+import { AGENT_OPTIONS, DEFAULT_MODEL } from "../../shared/types.ts";
 import type { DiscoveredModel } from "../../shared/model-options.ts";
 import { buildIssueTaskPrompt, issueTaskTitle, renderIssueThreadMarkdown } from "../../shared/issue-task.ts";
 
@@ -56,7 +56,9 @@ afterAll(() => {
   mock.module("../output.ts", () => realOutputSnapshot);
 });
 
-const { parseAdd, cmdAdd, chooseAddPath, resolveInitialModel } = await import("./add.ts");
+const { parseAdd, cmdAdd, chooseAddPath, resolveInitialModel, defaultNonInteractiveMode } = await import(
+  "./add.ts"
+);
 
 // ── fixtures ─────────────────────────────────────────────────────────────
 
@@ -131,6 +133,21 @@ function makeClient(thread: GitHubIssueThreadResult) {
     },
   } as unknown as AgetorClient;
   return { client, getIssueThreadCalls, createTaskCalls, startTaskCalls, setNextTaskId: (id: string) => (nextTaskId = id) };
+}
+
+/** A minimal fake `AgetorClient` for the plain (no `--issue`) non-interactive
+ *  `cmdAdd` path — just `createTask`, with a call recorder, matching
+ *  `makeClient`'s `createTask` stub exactly but without the issue-thread
+ *  machinery those tests don't need. */
+function makePlainClient() {
+  const createTaskCalls: CreateTaskInput[] = [];
+  const client = {
+    createTask: async (input: CreateTaskInput) => {
+      createTaskCalls.push(input);
+      return { id: "plain-task-id", title: input.title } as unknown as Task;
+    },
+  } as unknown as AgetorClient;
+  return { client, createTaskCalls };
 }
 
 function flags(overrides: Partial<Flags> = {}): Flags {
@@ -498,4 +515,84 @@ test("resolveInitialModel: a logged-out harness's discovered catalog is not cons
   expect(resolveInitialModel("fx", "google/gemini-3.7-flash", discovered, true)).toBe("google/gemini-3.7-flash");
   expect(resolveInitialModel("fx", "google/gemini-3.7-flash", discovered, null)).toBe("google/gemini-3.7-flash");
   expect(resolveInitialModel("fx", "zai/glm-5v-turbo", discovered, false)).toBe("zai/glm-5v-turbo"); // curated row — kept even when logged out
+});
+
+// ── defaultNonInteractiveMode (pure) + cmdAdd mode seeding (Phase 8 F4,
+// docs/plans/fix-fx-harness-rate-limit.md §3 review finding #9) ────────────
+//
+// Before this fix, `baseInput` forwarded `o.mode` verbatim, so a scripted
+// (non-interactive) `agetor add` with no `--mode` stored a `null` mode and
+// the task spawned on whatever bare launch-time fallback the driver picks —
+// `auto` for fx specifically, its interactive-review mode that stalls
+// without a Gateway reviewer on most accounts — instead of the picker's own
+// default (`AGENT_OPTIONS[kind].modes[0]`, `yolo`/"Full access" for fx since
+// the wave-2 reorder). `defaultNonInteractiveMode` seeds the gap; an
+// explicit `--mode` is always preserved untouched.
+
+test("defaultNonInteractiveMode: fx → yolo (AGENT_OPTIONS.fx.modes[0])", () => {
+  expect(defaultNonInteractiveMode("fx")).toBe("yolo");
+  expect(AGENT_OPTIONS.fx.modes[0]?.id).toBe("yolo");
+});
+
+test("defaultNonInteractiveMode: codex/cursor/gemini/claude-code → auto (unchanged default)", () => {
+  expect(defaultNonInteractiveMode("codex")).toBe("auto");
+  expect(defaultNonInteractiveMode("cursor")).toBe("auto");
+  expect(defaultNonInteractiveMode("gemini")).toBe("auto");
+  expect(defaultNonInteractiveMode("claude-code")).toBe("auto");
+});
+
+test("defaultNonInteractiveMode: an omitted or unrecognized --agent falls back to claude-code's modes, like the wizard's own harness-not-found fallback", () => {
+  expect(defaultNonInteractiveMode(undefined)).toBe(AGENT_OPTIONS["claude-code"].modes[0]?.id);
+  expect(defaultNonInteractiveMode("")).toBe(AGENT_OPTIONS["claude-code"].modes[0]?.id);
+  // A custom additional-account harness id (not a built-in AgentKind) isn't
+  // resolvable without an async harness lookup here — falls back the same
+  // way, same as an unrecognized value.
+  expect(defaultNonInteractiveMode("fx-2")).toBe(AGENT_OPTIONS["claude-code"].modes[0]?.id);
+});
+
+test("cmdAdd: a scripted fx add with no --mode stores mode 'yolo' (Full access), not left unset", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.agent).toBe("fx");
+  expect(createTaskCalls[0]!.mode).toBe("yolo");
+});
+
+test("cmdAdd: a scripted codex add with no --mode stores mode 'auto', matching the picker default", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "codex"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.agent).toBe("codex");
+  expect(createTaskCalls[0]!.mode).toBe("auto");
+});
+
+test("cmdAdd: an explicit --mode is preserved verbatim, never overridden by the default seed", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx", "--mode", "ask"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.mode).toBe("ask");
+});
+
+test("cmdAdd: an add with no --agent at all defaults its mode via claude-code's modes[0] ('auto'), same as the wizard's fallback", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.agent).toBeUndefined();
+  expect(createTaskCalls[0]!.mode).toBe("auto");
 });

@@ -1,18 +1,22 @@
 import { test, expect, mock, afterAll } from "bun:test";
 import type { AgetorClient } from "./api-client.ts";
 import type { RunEvent } from "../shared/types.ts";
-import { FX_USAGE_STATUS_PREFIX, PERMISSION_MODE_STATUS_PREFIX } from "../shared/types.ts";
+import { FX_RECOVERY_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, PERMISSION_MODE_STATUS_PREFIX } from "../shared/types.ts";
+import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../shared/fx-recovery.ts";
 
 /**
- * `formatEvent`/`shouldSkipEvent` (in commands/logs.ts) aren't exported —
- * only `cmdLogs` is. Rather than exercise the SSE-follow path (which would
- * need to mock `../sse.ts` the way Dashboard.test.tsx does), this suite
- * drives `cmdLogs`'s `--rebuild` branch, which calls
- * `client.rebuildEvents(...)` once and formats the result synchronously —
- * no SSE involved, so only `./context.ts` (for `getClient`) and `./output.ts`
- * (to capture `out()`) need mocking.
+ * `formatEvent`/`shouldSkipEvent`/`createLineRenderer` (in commands/logs.ts)
+ * aren't exported — only `cmdLogs` is. Most of this suite drives `cmdLogs`'s
+ * `--rebuild` branch, which calls `client.rebuildEvents(...)` once and
+ * formats the result synchronously — no SSE involved, so only `./context.ts`
+ * (for `getClient`) and `./output.ts` (to capture `out()`) need mocking for
+ * those tests. A handful of fx-recovery tests below additionally exercise the
+ * streaming (`--no-follow`) path — proving `createLineRenderer` is the SAME
+ * renderer both branches share — by mocking `./sse.ts` the way
+ * `Dashboard.test.tsx` does, capturing the `/tasks/:id/events` subscription's
+ * `onEvent` callback so the test can push synthetic `RunEvent`s by hand.
  *
- * Both mocked modules are snapshotted before mocking and restored in
+ * All three mocked modules are snapshotted before mocking and restored in
  * `afterAll` — `mock.module` overwrites the module record in place (Bun's
  * documented behavior for already-loaded modules), and other test files in
  * the same `bun test` process import these same modules.
@@ -20,12 +24,15 @@ import { FX_USAGE_STATUS_PREFIX, PERMISSION_MODE_STATUS_PREFIX } from "../shared
 
 import * as realContext from "./context.ts";
 import * as realOutput from "./output.ts";
+import * as realSse from "./sse.ts";
 
 const realContextSnapshot = { ...realContext };
 const realOutputSnapshot = { ...realOutput };
+const realSseSnapshot = { ...realSse };
 
 let currentClient: AgetorClient | null = null;
 const outputs: string[] = [];
+let onTaskEvents: ((e: RunEvent) => void) | null = null;
 
 mock.module("./context.ts", () => ({
   ...realContextSnapshot,
@@ -54,9 +61,20 @@ mock.module("./output.ts", () => ({
   errln: () => {},
 }));
 
+mock.module("./sse.ts", () => ({
+  ...realSseSnapshot,
+  streamSse: (pathname: string, onEvent: (e: unknown) => void) => {
+    if (pathname.startsWith("/tasks/") && pathname.includes("/events")) {
+      onTaskEvents = onEvent as (e: RunEvent) => void;
+    }
+    return { close: () => {} };
+  },
+}));
+
 afterAll(() => {
   mock.module("./context.ts", () => realContextSnapshot);
   mock.module("./output.ts", () => realOutputSnapshot);
+  mock.module("./sse.ts", () => realSseSnapshot);
 });
 
 const { cmdLogs } = await import("./commands/logs.ts");
@@ -121,6 +139,140 @@ test("logs --rebuild --json: sentinel status events are still emitted raw for pr
   await cmdLogs(["t1", "--rebuild"], jsonFlags);
   expect(outputs).toHaveLength(1);
   expect(JSON.parse(outputs[0]!)).toEqual(events[0]);
+});
+
+// --- fx-recovery sentinel rendering (src/shared/fx-recovery.ts, docs/plans/
+// fix-fx-harness-rate-limit.md) --------------------------------------------
+// `createLineRenderer` special-cases `FX_RECOVERY_STATUS_PREFIX` BEFORE the
+// generic `shouldSkipEvent` check: an `active` payload is fx's own live
+// retry-progress line and prints in yellow; every other state
+// (`paused`/`recovered`/`cleared`) — or a body that fails to parse — prints
+// nothing, since the driver already persists a separate plain status line at
+// those terminal transitions (rendered by the ordinary "status" case, not
+// this branch). `--json` always emits the raw event regardless of state.
+
+function fxRecoveryEvent(payload: Record<string, unknown>, ts = 1): RunEvent {
+  return {
+    runId: "run1", taskId: "t1", stream: "status",
+    data: `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(payload)}`,
+    ts,
+  };
+}
+
+test("logs --rebuild: an fx-recovery 'active' sentinel renders one yellow line equal to fxRecoveryNoticeText(payload)", async () => {
+  outputs.length = 0;
+  const payload = {
+    state: "active", kind: "auto_retry", cause: "rate_limited", action: "retrying_request",
+    attempt: 5, attemptLimit: 10, delaySeconds: 8, durable: true,
+    message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: … · retrying request in 8s · attempt 5/10",
+  };
+  currentClient = makeClient([fxRecoveryEvent(payload)]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(1);
+  // `c.yellow` is mocked to identity above, so the printed line is exactly
+  // `fxRecoveryNoticeText`'s output (here, fx's own verbatim `message`).
+  expect(outputs[0]).toBe(fxRecoveryNoticeText(parseFxRecoveryPayload(JSON.stringify(payload))!));
+  expect(outputs[0]).toBe(payload.message);
+});
+
+test("logs --rebuild: paused/recovered/cleared fx-recovery sentinels render nothing; a plain status line still prints", async () => {
+  outputs.length = 0;
+  const events: RunEvent[] = [
+    fxRecoveryEvent({ state: "paused", message: "⚠ Rate limited · HTTP 429 · … · recovery paused after 10/10 attempts" }, 1),
+    fxRecoveryEvent({ state: "recovered", message: "✓ recovered · succeeded on attempt 3/10" }, 2),
+    fxRecoveryEvent({ state: "cleared" }, 3),
+    { runId: "run1", taskId: "t1", stream: "status", data: "plain status text", ts: 4 },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  // Only the plain status line survives the human-readable render — the
+  // driver's own persisted plain lines cover paused/recovered, and cleared
+  // has nothing to show at all.
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]).toContain("plain status text");
+});
+
+test("logs --rebuild: a REPLAYED fx-recovery 'active' sentinel renders nothing; a LIVE 'active' sentinel still renders", async () => {
+  outputs.length = 0;
+  const events: RunEvent[] = [
+    fxRecoveryEvent({ state: "active", message: "stale replayed attempt", replayed: true }, 1),
+    fxRecoveryEvent({ state: "paused", message: "stale replayed pause", replayed: true }, 2),
+    fxRecoveryEvent({ state: "active", message: "live attempt 1/3" }, 3),
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  // On `session/resume` fx replays the prior turn's recovery updates onto
+  // the new run, and the driver stamps those with `replayed: true` — they
+  // must not read as live retry progress. Only the LIVE active sentinel
+  // (no `replayed` flag) prints.
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]).toBe("live attempt 1/3");
+});
+
+test("logs --rebuild: a malformed fx-recovery sentinel body renders nothing and doesn't throw", async () => {
+  outputs.length = 0;
+  const bad: RunEvent = {
+    runId: "run1", taskId: "t1", stream: "status",
+    data: `${FX_RECOVERY_STATUS_PREFIX}not json`, ts: 1,
+  };
+  currentClient = makeClient([bad]);
+  await expect(cmdLogs(["t1", "--rebuild"], flags)).resolves.toBeUndefined();
+  expect(outputs).toHaveLength(0);
+});
+
+test("logs --rebuild --json: fx-recovery sentinels of every state (and a malformed one) are still emitted raw", async () => {
+  outputs.length = 0;
+  const events: RunEvent[] = [
+    fxRecoveryEvent({ state: "active", attempt: 1, attemptLimit: 3 }, 1),
+    fxRecoveryEvent({ state: "paused" }, 2),
+    fxRecoveryEvent({ state: "recovered" }, 3),
+    fxRecoveryEvent({ state: "cleared" }, 4),
+    { runId: "run1", taskId: "t1", stream: "status", data: `${FX_RECOVERY_STATUS_PREFIX}not json`, ts: 5 },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], jsonFlags);
+  expect(outputs).toHaveLength(events.length);
+  outputs.forEach((line, i) => expect(JSON.parse(line)).toEqual(events[i]));
+});
+
+test("logs (streaming, --no-follow): the fx-recovery renderer is the SAME as --rebuild's — an 'active' sentinel prints yellow, a plain status prints normally", async () => {
+  onTaskEvents = null;
+  outputs.length = 0;
+  currentClient = makeClient([]); // rebuildEvents unused on this path
+  const payload = { state: "active", cause: "rate_limited", action: "retrying_request", attempt: 2, attemptLimit: 3 };
+
+  const done = cmdLogs(["t1", "--no-follow"], flags);
+  // Let the promise executor run far enough to open the SSE subscription
+  // (a handful of already-resolved microtasks: `resolveTask`'s stubbed
+  // `listTasks()`, then the synchronous `streamSse` call inside the
+  // `new Promise` executor) before pushing synthetic events into it.
+  await new Promise((r) => setTimeout(r, 20));
+  expect(onTaskEvents).not.toBeNull();
+
+  onTaskEvents!(fxRecoveryEvent(payload));
+  onTaskEvents!({ runId: "run1", taskId: "t1", stream: "status", data: "plain status text", ts: 2 });
+  await done; // `--no-follow` resolves on its own once the replay burst goes quiet
+
+  expect(outputs).toEqual([
+    fxRecoveryNoticeText(parseFxRecoveryPayload(JSON.stringify(payload))!),
+    "• plain status text",
+  ]);
+});
+
+test("logs (streaming, --no-follow): a REPLAYED 'active' sentinel prints nothing on the streaming path either — same renderer as --rebuild", async () => {
+  onTaskEvents = null;
+  outputs.length = 0;
+  currentClient = makeClient([]); // rebuildEvents unused on this path
+
+  const done = cmdLogs(["t1", "--no-follow"], flags);
+  await new Promise((r) => setTimeout(r, 20));
+  expect(onTaskEvents).not.toBeNull();
+
+  onTaskEvents!(fxRecoveryEvent({ state: "active", message: "stale replayed attempt", replayed: true }, 1));
+  onTaskEvents!(fxRecoveryEvent({ state: "active", message: "live attempt 1/3" }, 2));
+  await done;
+
+  expect(outputs).toEqual(["live attempt 1/3"]);
 });
 
 // --- userMessageLines rendering (src/shared/user-message.ts) --------------

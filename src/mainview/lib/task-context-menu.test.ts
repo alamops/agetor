@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "./task-context-menu.ts";
-import type { Task } from "../../shared/types.ts";
+import type { Task, TaskFxRecovery } from "../../shared/types.ts";
 
 /** Minimal hand-built Task fixture, mirroring `task-unread.test.ts`'s
  *  `makeTaskRow` for the required fields. Defaults to a fresh backlog task
@@ -47,6 +47,8 @@ const ACTION_GROUP: Record<TaskMenuAction, TaskMenuGroup> = {
   open: "primary",
   start: "primary",
   stop: "primary",
+  "resume-recovery": "primary",
+  "cancel-auto-resume": "primary",
   "mark-done": "primary",
   archive: "primary",
   unarchive: "primary",
@@ -276,6 +278,115 @@ describe("buildTaskContextMenu", () => {
       const task = makeTask({ issueUrl: "https://github.com/o/r/issues/9" });
       const entries = buildTaskContextMenu(task, { isOpen: true });
       expect(actions(entries)).toContain("view-issue");
+    });
+  });
+
+  describe("resume-recovery / cancel-auto-resume (primary group, fx pause — docs/plans/fx-recovery-follow-ups.md)", () => {
+    // Minimal TaskFxRecovery fixture: `state: "paused"` plus `autoResume` are
+    // all `isTaskFxPaused`/`buildTaskContextMenu` actually read off it, but
+    // every field is required by the type.
+    function pausedFxRecovery(autoResume: TaskFxRecovery["autoResume"] = null): TaskFxRecovery {
+      return {
+        state: "paused",
+        runId: "run-1",
+        pausedAt: Date.now(),
+        autoResume,
+        autoResumeCount: 0,
+      };
+    }
+
+    test("shown for a paused fx task sitting in ready, right after Start (the task isn't awaiting/active/openable, so Start still shows too)", () => {
+      const task = makeTask({ column: "ready", fxRecovery: pausedFxRecovery() });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual(["open", "start", "resume-recovery", "diff", "open-in-finder", "delete"]);
+      const entry = entries.find((e) => e.action === "resume-recovery")!;
+      expect(entry.label).toBe("Resume paused response");
+      expect(entry.group).toBe("primary");
+    });
+
+    test("hidden when column is 'running' (isTaskFxPaused requires column !== running)", () => {
+      const task = makeTask({ column: "running", fxRecovery: pausedFxRecovery() });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).not.toContain("resume-recovery");
+      expect(actions(entries)).not.toContain("cancel-auto-resume");
+    });
+
+    test("hidden when fxRecovery is null", () => {
+      const task = makeTask({ column: "ready", fxRecovery: null });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).not.toContain("resume-recovery");
+      expect(actions(entries)).not.toContain("cancel-auto-resume");
+    });
+
+    test("hidden when fxRecovery is undefined (legacy fixture, field never set)", () => {
+      const task = makeTask({ column: "ready" });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).not.toContain("resume-recovery");
+      expect(actions(entries)).not.toContain("cancel-auto-resume");
+    });
+
+    test("hidden on an archived task, even with a paused fxRecovery", () => {
+      const task = makeTask({
+        column: "done",
+        hasOpenableRun: true,
+        archivedAt: Date.now(),
+        fxRecovery: pausedFxRecovery(),
+      });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).not.toContain("resume-recovery");
+      expect(actions(entries)).not.toContain("cancel-auto-resume");
+    });
+
+    test("cancel-auto-resume absent when fxRecovery.autoResume is null (no pending timer)", () => {
+      const task = makeTask({ column: "ready", fxRecovery: pausedFxRecovery(null) });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toContain("resume-recovery");
+      expect(actions(entries)).not.toContain("cancel-auto-resume");
+    });
+
+    test("cancel-auto-resume present, right after resume-recovery, when fxRecovery.autoResume is set", () => {
+      const task = makeTask({
+        column: "ready",
+        fxRecovery: pausedFxRecovery({ at: Date.now() + 60_000, attempt: 1, max: 3, delaySec: 120 }),
+      });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual([
+        "open",
+        "start",
+        "resume-recovery",
+        "cancel-auto-resume",
+        "diff",
+        "open-in-finder",
+        "delete",
+      ]);
+      const entry = entries.find((e) => e.action === "cancel-auto-resume")!;
+      expect(entry.label).toBe("Cancel auto-resume");
+      expect(entry.group).toBe("primary");
+    });
+
+    test("resume-recovery renders right after Stop when the task is also 'blocked' (awaiting + active)", () => {
+      // blocked -> active=true, awaiting=true -> Stop shows; a paused
+      // fxRecovery is an orthogonal field (column !== "running" still holds),
+      // so both entries appear together, Stop first.
+      const task = makeTask({ column: "blocked", fxRecovery: pausedFxRecovery() });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual([
+        "open",
+        "stop",
+        "resume-recovery",
+        "archive",
+        "diff",
+        "open-in-finder",
+        "delete",
+      ]);
     });
   });
 

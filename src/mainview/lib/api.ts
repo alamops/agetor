@@ -1422,6 +1422,30 @@ export const api = {
       method: "POST",
     }, { retry: false }),
 
+  /** Resume a PAUSED fx model response (Vercel AI Gateway rate-limit
+   *  recovery — see `resumeFxRecovery` in orchestrator.ts). Sends no new
+   *  prompt; fx continues from its own checkpoint. `retry: false` — like
+   *  `approvePlan`, a replay would spawn a second continue-recovery run
+   *  against a checkpoint the first request already consumed. Rejected
+   *  (400/404/409) via the thrown `ApiError` when the task isn't fx, is
+   *  archived, has no resumable paused response, or already has a turn
+   *  in flight. */
+  resumeFxRecovery: (taskId: string) =>
+    j<{ ok: true; runId: string }>(`/tasks/${encodeURIComponent(taskId)}/fx-resume`, {
+      method: "POST",
+    }, { retry: false }),
+
+  /** Cancel a pending fx auto-resume timer (`task.fxRecovery.autoResume`)
+   *  without touching the pause itself — the paused response stays paused,
+   *  resumable only via a manual `resumeFxRecovery` from here on. `retry:
+   *  false` — like `resumeFxRecovery`, a replay against an already-cancelled
+   *  (or already-fired) timer should surface as a real 400/404, not be
+   *  silently retried. */
+  cancelFxAutoResume: (taskId: string) =>
+    j<{ ok: true }>(`/tasks/${encodeURIComponent(taskId)}/fx-auto-resume`, {
+      method: "DELETE",
+    }, { retry: false }),
+
   // Composer draft — the single unsent text+refs autosaved from the task
   // details modal. Every mutation returns the full updated Task.
   setTaskDraft: (taskId: string, draft: { text: string; references: TaskReference[] }) =>
