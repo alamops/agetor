@@ -199,6 +199,81 @@ function highlightMarks(scope: Locator): Locator {
   return scope.getByTestId("at-highlight-mark");
 }
 
+/** Asserts the `AtHighlightBackdrop` mirror (`textarea`'s previous sibling
+ *  inside their shared `relative` wrapper — reached here via the parent, not
+ *  a sibling-combinator selector, since Playwright locators have no `+`)
+ *  reproduces the textarea's own computed font/box metrics. This is the
+ *  assertion that would have failed on the pre-fix code: on every surface
+ *  where the backdrop and its `<textarea>` co-mount in the same commit
+ *  (RunPanel send dock, backlog tray editor, DiffDialog composer, the issue/
+ *  resolve-conflicts dialogs), the backdrop's metrics-read effect ran before
+ *  the textarea's ref was attached, bailed on the null ref, and never
+ *  re-ran — `style` stayed `{}` forever, so the mirror inherited the
+ *  ambient 16px/24px/no-padding/no-border box instead of the textarea's own
+ *  12px/16px/8-32-8-12px/1px one (docs/plans/at-highlight-backdrop-co-mount-
+ *  metrics.md §2). Both sides are read via `getComputedStyle`, so the
+ *  strings compare format-for-format with no normalization needed. */
+async function expectBackdropMirrors(textarea: Locator): Promise<void> {
+  const backdrop = textarea.locator("xpath=..").getByTestId("at-highlight-backdrop");
+  const metrics = await textarea.evaluate((el) => {
+    const cs = getComputedStyle(el);
+    return {
+      "font-size": cs.fontSize,
+      "line-height": cs.lineHeight,
+      "font-family": cs.fontFamily,
+      "padding-top": cs.paddingTop,
+      "padding-right": cs.paddingRight,
+      "padding-left": cs.paddingLeft,
+      "border-left-width": cs.borderLeftWidth,
+    };
+  });
+  for (const [prop, value] of Object.entries(metrics)) {
+    await expect(backdrop).toHaveCSS(prop, value);
+  }
+}
+
+/** Cross-checks one `<mark>`'s bounding box against an independently
+ *  computed expectation for where `token` (preceded by literal text
+ *  `prefix`) should paint, using canvas `measureText` seeded from the
+ *  textarea's own computed font — the geometry half of the same co-mount
+ *  regression `expectBackdropMirrors` guards the style half of (on the
+ *  pre-fix code the mark would land ~70-95px right of this). Single-line
+ *  text only: canvas measurement is a per-line model and can't account for
+ *  wrapping. Tolerance is 3px (vs. the ~70px bug) to absorb Chromium font
+ *  hinting between DOM layout and canvas measurement. */
+async function expectMarkUnderToken(textarea: Locator, mark: Locator, prefix: string, token: string): Promise<void> {
+  const expected = await textarea.evaluate(
+    (el, args) => {
+      const cs = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d")!;
+      ctx.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+      const expectedLeft =
+        rect.left +
+        parseFloat(cs.borderLeftWidth) +
+        parseFloat(cs.paddingLeft) +
+        ctx.measureText(args.prefix).width -
+        el.scrollLeft;
+      const expectedWidth = ctx.measureText(args.token).width;
+      return { expectedLeft, expectedWidth };
+    },
+    { prefix, token },
+  );
+  const box = await mark.boundingBox();
+  expect(box, `no bounding box for the <mark> wrapping "${token}"`).not.toBeNull();
+  const dLeft = Math.abs(box!.x - expected.expectedLeft);
+  const dWidth = Math.abs(box!.width - expected.expectedWidth);
+  expect(
+    dLeft,
+    `mark x=${box!.x.toFixed(2)}px vs expected ${expected.expectedLeft.toFixed(2)}px (Δ${dLeft.toFixed(2)}px) for "${token}"`,
+  ).toBeLessThanOrEqual(3);
+  expect(
+    dWidth,
+    `mark width=${box!.width.toFixed(2)}px vs expected ${expected.expectedWidth.toFixed(2)}px (Δ${dWidth.toFixed(2)}px) for "${token}"`,
+  ).toBeLessThanOrEqual(3);
+}
+
 function taskCard(page: Page, title: string): Locator {
   return page.locator(".cursor-grab").filter({ has: page.getByText(title, { exact: true }) });
 }
@@ -356,6 +431,12 @@ test.describe("@ file references", () => {
 
     await expect(highlightMarks(form)).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
     await expect(highlightMarks(form)).toHaveText("@README.md");
+    // Pins the New Task form's late-mount path too: here the backdrop always
+    // mounted after its textarea already had a ref (fileScope only exists
+    // once a workdir is chosen), so this surface never showed the bug — but
+    // asserting it here guards against a future refactor collapsing the two
+    // mount orders together.
+    await expectBackdropMirrors(textarea);
 
     await textarea.fill("@nope.md");
     await textarea.dispatchEvent("keyup");
@@ -509,6 +590,17 @@ test.describe("@ file references", () => {
     await expect(textarea).toHaveValue("and @src/app.ts ");
     await expect(popover).toBeHidden();
 
+    // Co-mount regression coverage (docs/plans/at-highlight-backdrop-co-mount-
+    // metrics.md): the RunPanel send dock's `fileScope` is known at first
+    // render, so its backdrop and textarea mount in the same commit — exactly
+    // the case the pre-fix code got wrong. `highlightMarks(panel)` is scoped
+    // to the whole run panel, but the send box is the only composer holding a
+    // value at this point in the flow, so the single mark is unambiguously
+    // this one.
+    await expect(highlightMarks(panel)).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+    await expectBackdropMirrors(textarea);
+    await expectMarkUnderToken(textarea, highlightMarks(panel).first(), "and ", "@src/app.ts");
+
     // Second Enter now reaches RunPanel's own Enter-to-send handler.
     await page.keyboard.press("Enter");
 
@@ -596,6 +688,13 @@ test.describe("@ file references", () => {
     // the send box is empty, so the panel's one mark belongs to the editor.
     await expect(editor).toHaveValue("note to self @README.md ");
     await expect(highlightMarks(panel)).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+    // Co-mount regression coverage: the tray editor's backdrop mounts
+    // alongside its textarea exactly like the send dock (see the comment on
+    // the RunPanel scenario above). "note to self @README.md" is short
+    // enough not to wrap at the panel's `RUN_PANEL_MIN_WIDTH` (420px) or
+    // above, so the geometry check applies here too, not just parity.
+    await expectBackdropMirrors(editor);
+    await expectMarkUnderToken(editor, highlightMarks(panel).first(), "note to self ", "@README.md");
     await panel.getByRole("button", { name: "Cancel" }).click();
   });
 
@@ -627,6 +726,11 @@ test.describe("@ file references", () => {
     // draft is intact, highlighted, and the dialog is still open.
     await expect(composer).toHaveValue("@README.md ");
     await expect(dialog.getByTestId("at-highlight-mark")).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+    // Co-mount regression coverage: the compose-from-diff box's backdrop
+    // mounts alongside its textarea like the other dialog surfaces. No
+    // prefix here — the committed token is the entire value.
+    await expectBackdropMirrors(composer);
+    await expectMarkUnderToken(composer, dialog.getByTestId("at-highlight-mark").first(), "", "@README.md");
     await expect(dialog).toBeVisible();
   });
 
