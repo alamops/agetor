@@ -180,6 +180,13 @@ test("/tasks/:id/diff/blob 200s a PDF with application/pdf content-type", async 
   expect(res.headers.get("content-type")).toBe("application/pdf");
 });
 
+test("/tasks/:id/diff/blob sends the sandbox CSP header on the byte response", async () => {
+  const res = await withHeader(blobUrl(task.id, "logo.png", "new"));
+  expect(res.status).toBe(200);
+  expect(res.headers.get("content-security-policy")).toBe("sandbox; default-src 'none'");
+  expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+});
+
 test("/tasks/:id/diff/blob 304s on a matching If-None-Match with an empty body (new side)", async () => {
   const first = await withHeader(blobUrl(task.id, "logo.png", "new"));
   const etag = first.headers.get("etag");
