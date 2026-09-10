@@ -97,6 +97,7 @@ import { deriveTodoProgress } from "@/lib/todo-progress";
 import { TodoProgressCard } from "./TodoProgressCard";
 import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
 import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink } from "./md-components";
+import { MD_URL_TRANSFORM, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./md-components";
 import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent } from "./MessageSegments";
 
 /**
@@ -4142,7 +4143,9 @@ function RunEventList({
   /** The task's own filesystem roots (`worktreePath`, `workdir`) — used by
    *  `UserMessageBlock` for DISPLAY-ONLY folding of expanded absolute `@`
    *  paths back to the mention form the user typed. Never consulted for
-   *  chips/previews, which need the real absolute paths. */
+   *  chips/previews, which need the real absolute paths. Also consulted by
+   *  `MdImage` (via `MdImageScopeContext`, provided below) to resolve a
+   *  relative markdown image `src` against the task's roots. */
   pathRoots?: readonly (string | null | undefined)[];
   /** Plans detected on this task (`task.plans`) — Cursor's
    *  `createPlanToolCall` or claude-code's `ExitPlanMode`. Empty (`NO_PLANS`)
@@ -4488,12 +4491,23 @@ function RunEventList({
     return out;
   }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, pathRoots, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId, stickyUserMessages]);
 
+  // Scopes every `MdImage` under this list (assistant/user bubbles, tagged
+  // segments, the plan-approval preview) to this task's id + roots without
+  // threading props through each intermediate component. See
+  // `MdImageScopeContext`'s doc comment in `MdImage.tsx`.
+  const mdImageScope = useMemo<MdImageScope>(
+    () => ({ taskId, roots: pathRoots ?? EMPTY_MD_IMAGE_SCOPE.roots }),
+    [taskId, pathRoots],
+  );
+
   return (
-    <div className="flex flex-col gap-4">
-      {blocks}
-      {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
-      {holdSummary && <HoldingIndicator text={holdSummary} />}
-    </div>
+    <MdImageScopeContext.Provider value={mdImageScope}>
+      <div className="flex flex-col gap-4">
+        {blocks}
+        {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
+        {holdSummary && <HoldingIndicator text={holdSummary} />}
+      </div>
+    </MdImageScopeContext.Provider>
   );
 }
 
@@ -4828,7 +4842,11 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
               you
             </div>
             <div ref={contentRef} className={collapseClassName}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={USER_MD_COMPONENTS}
+                urlTransform={MD_URL_TRANSFORM}
+              >
                 {displayOrdinaryArgs}
               </ReactMarkdown>
             </div>
@@ -4852,7 +4870,11 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
 const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) {
   return (
     <div className="agetor-md text-foreground">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={ASSISTANT_MD_COMPONENTS}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={ASSISTANT_MD_COMPONENTS}
+        urlTransform={MD_URL_TRANSFORM}
+      >
         {text}
       </ReactMarkdown>
     </div>
@@ -6320,7 +6342,11 @@ function TmuxPromptCard({
         </p>
         {planMarkdown && (
           <div className="agetor-md mb-3 max-h-64 overflow-y-auto rounded-md border border-border/40 bg-muted/20 p-2 text-foreground">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={ASSISTANT_MD_COMPONENTS}>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={ASSISTANT_MD_COMPONENTS}
+              urlTransform={MD_URL_TRANSFORM}
+            >
               {planMarkdown}
             </ReactMarkdown>
           </div>

@@ -73,6 +73,8 @@ import { isMergedPull, mergedPullReplacement } from "@/lib/pull-merged";
 import { isCredentialError } from "@/lib/credential-error";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
+import { MD_URL_TRANSFORM } from "./md-components";
+import { MdImage } from "./MdImage";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
 import { sameIssueUrl } from "../../../shared/issue-task.ts";
 import { ResolveConflictsDialog, type ResolveConflictsContext } from "./ResolveConflictsDialog";
@@ -171,6 +173,11 @@ const ghMdCode: NonNullable<GhMdComponents["code"]> = ({ className, children, ..
 const GH_MD_COMPONENTS: GhMdComponents = {
   a: ghMdLink,
   code: ghMdCode,
+  // Same `img` override as the transcript's markdown maps (`md-components.tsx`)
+  // — GitHub CDN images still render inline, just with the shared 24rem cap
+  // and missing-file fallback chip. No scope provider here, so a relative
+  // ref (there's no task to resolve against) falls through to a `file` chip.
+  img: MdImage,
   pre: ({ children }) => (
     <pre className="overflow-x-auto rounded-md bg-muted/40 px-3 py-2">{children}</pre>
   ),
@@ -6436,7 +6443,13 @@ function DiscussionDetailView({
         <>
           {detail.body && (
             <div className="agetor-md mb-2 max-h-40 overflow-y-auto rounded border border-border/50 bg-background/40 px-2 py-1.5 text-xs">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={GH_MD_COMPONENTS}>{detail.body}</ReactMarkdown>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={GH_MD_COMPONENTS}
+                urlTransform={MD_URL_TRANSFORM}
+              >
+                {detail.body}
+              </ReactMarkdown>
             </div>
           )}
           <div className="space-y-1.5">
@@ -6550,7 +6563,13 @@ function DiscussionCommentRow({
         </div>
       </div>
       <div className="agetor-md text-xs">
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={GH_MD_COMPONENTS}>{comment.body}</ReactMarkdown>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={GH_MD_COMPONENTS}
+          urlTransform={MD_URL_TRANSFORM}
+        >
+          {comment.body}
+        </ReactMarkdown>
       </div>
       {error && (
         <div className="mt-1 flex items-center gap-1 text-[11px] text-danger">
@@ -6644,7 +6663,11 @@ function GitHubItemRow({
           )}
           {item.body && (
             <div className="agetor-md mt-2 max-h-28 overflow-hidden text-xs text-muted-foreground">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={GH_MD_COMPONENTS}>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={GH_MD_COMPONENTS}
+                urlTransform={MD_URL_TRANSFORM}
+              >
                 {item.body}
               </ReactMarkdown>
             </div>
@@ -6966,7 +6989,11 @@ function GitHubItemDetail({
       ) : (
         <div className="agetor-md max-h-64 overflow-y-auto rounded-md border border-border/50 bg-card px-3 py-2 text-sm">
           {item.body ? (
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={GH_MD_COMPONENTS}>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={GH_MD_COMPONENTS}
+              urlTransform={MD_URL_TRANSFORM}
+            >
               {item.body}
             </ReactMarkdown>
           ) : (
@@ -9203,8 +9230,12 @@ function EditableCommentBody({
       {body ? (
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
+          urlTransform={MD_URL_TRANSFORM}
           components={suggestion ? {
             a: ghMdLink,
+            // Same override as `GH_MD_COMPONENTS` — a suggestion comment's
+            // image must not lose the shared cap/fallback treatment.
+            img: MdImage,
             code({ className, children }) {
               if (typeof className === "string" && /language-suggestion/.test(className)) {
                 return (
