@@ -181,20 +181,54 @@ describe("classifyMdImageSrc", () => {
     });
   });
 
-  // Not a `remote` (no https? scheme) and not `^file:` either, so this falls
-  // through to the relative branch: it's neither stripped of an `@`/`./`
-  // prefix (it has none) nor found under any root, so with no roots it
-  // reports as `file` (no image extension) with the whole string as the
-  // display path and zero candidates. react-markdown's own default
-  // `urlTransform` would already have blanked a real `data:` src to `""`
-  // before it ever reaches this classifier (see the `mdUrlTransform` tests
-  // below) — this pins what `classifyMdImageSrc` does if one reaches it
-  // anyway (e.g. a future caller that skips `mdUrlTransform`).
-  test("a data: URI is not recognized as remote/file: and falls through to the relative branch", () => {
-    expect(classifyMdImageSrc("data:image/png;base64,AAAA", [])).toEqual({
-      kind: "file",
-      path: "data:image/png;base64,AAAA",
-      candidates: [],
+  // The classifier recognizes any URL-scheme prefix it doesn't explicitly
+  // understand (`URL_SCHEME_RE`) and blanks it directly — it must not
+  // depend on react-markdown's default `urlTransform` having already done
+  // so (see the `mdUrlTransform` tests below, which confirm that upstream
+  // blanking still also happens for real ReactMarkdown call sites).
+  test("a data: URI is empty (classifier does not depend on upstream blanking)", () => {
+    expect(classifyMdImageSrc("data:image/png;base64,AAAA", [])).toEqual({ kind: "empty" });
+  });
+
+  test("javascript: is empty", () => {
+    expect(classifyMdImageSrc("javascript:alert(1)", [])).toEqual({ kind: "empty" });
+  });
+
+  test("blob: is empty", () => {
+    expect(classifyMdImageSrc("blob:http://x/y", [])).toEqual({ kind: "empty" });
+  });
+
+  test("a bare Windows-style path (C:\\x.png) is empty", () => {
+    expect(classifyMdImageSrc("C:\\x.png", [])).toEqual({ kind: "empty" });
+  });
+
+  test("an unrecognized scheme (foo:bar.png) is empty", () => {
+    expect(classifyMdImageSrc("foo:bar.png", [])).toEqual({ kind: "empty" });
+  });
+
+  test("mailto: is empty for the classifier (mdUrlTransform on a/href still passes it through)", () => {
+    expect(classifyMdImageSrc("mailto:x@y", [])).toEqual({ kind: "empty" });
+  });
+
+  test("a relative path with a colon after its first slash is still local, not mistaken for a scheme", () => {
+    expect(classifyMdImageSrc("docs/a:b.png", ["/w"])).toEqual({
+      kind: "local",
+      path: "/w/docs/a:b.png",
+      candidates: ["/w/docs/a:b.png"],
+    });
+  });
+
+  test("a protocol-relative URL is remote, prefixed https:", () => {
+    expect(classifyMdImageSrc("//img.shields.io/badge.svg", [])).toEqual({
+      kind: "remote",
+      url: "https://img.shields.io/badge.svg",
+    });
+  });
+
+  test("a protocol-relative URL is remote regardless of extension (remote never inspects extensions)", () => {
+    expect(classifyMdImageSrc("//host/x.pdf", [])).toEqual({
+      kind: "remote",
+      url: "https://host/x.pdf",
     });
   });
 });

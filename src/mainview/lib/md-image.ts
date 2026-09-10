@@ -66,9 +66,12 @@ function normalizePosixPath(input: string): string {
  * can resolve. Accepts `file:///abs/path` and `file://localhost/abs/path`
  * (an empty or `localhost` host); any other host is foreign (a real remote
  * file server) and is rejected. `?query`/`#hash` are stripped before percent-
- * decoding (`decodeURIComponent`, `null` on a malformed escape); the decoded
- * result must start with `/` — this function must never fabricate a
- * relative path out of a `file:` URL.
+ * decoding (`decodeURIComponent`, `null` on a malformed escape) — unlike a
+ * bare absolute/relative path (see `classifyMdImageSrc`), where `?`/`#` are
+ * kept verbatim since a POSIX filename may legally contain either character.
+ * The regex's capture group always starts with a literal, unencoded `/`, so
+ * the decoded result is guaranteed to start with `/` too — this function can
+ * never fabricate a relative path out of a `file:` URL.
  */
 export function fileUrlToPath(value: string): string | null {
   const match = /^file:\/\/([^/]*)(\/.*)?$/i.exec(value.trim());
@@ -81,15 +84,22 @@ export function fileUrlToPath(value: string): string | null {
   if (hashIdx !== -1) rawPath = rawPath.slice(0, hashIdx);
   const queryIdx = rawPath.indexOf("?");
   if (queryIdx !== -1) rawPath = rawPath.slice(0, queryIdx);
-  let decoded: string;
   try {
-    decoded = decodeURIComponent(rawPath);
+    return decodeURIComponent(rawPath);
   } catch {
     return null;
   }
-  if (!decoded.startsWith("/")) return null;
-  return decoded;
 }
+
+/** Matches a URL scheme prefix (RFC 3986 `scheme:`), used to blank any
+ *  scheme this classifier doesn't explicitly understand — `data:`,
+ *  `javascript:`, `blob:`, a bare `C:\…`, etc. — mirroring
+ *  `defaultUrlTransform`'s own blanking of unsafe schemes (see the module
+ *  doc comment) so the classifier doesn't depend on an upstream caller
+ *  having already applied it. The character class deliberately excludes
+ *  `/`, so a colon that follows a path separator (`docs/a:b.png`) can never
+ *  match — that's a relative path, not a scheme. */
+const URL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:/i;
 
 /**
  * Classify a markdown image `src` against a task's known roots
@@ -100,10 +110,29 @@ export function fileUrlToPath(value: string): string | null {
  * Resolution order:
  *   1. blank/missing → `empty`.
  *   2. `^https?:` → `remote` (passthrough, untouched).
- *   3. `^file:` → unwrap via `fileUrlToPath`; `null` → `empty`; otherwise
- *      the unwrapped path is treated as absolute (step 4).
- *   4. a leading `/` → absolute: one candidate, the normalized value itself.
- *   5. otherwise relative: strip one leading `@` (the `@rel` mention form
+ *   3. `^file:` → unwrap via `fileUrlToPath` (which strips `?query`/`#hash`
+ *      before percent-decoding); `null` → `empty`; otherwise the unwrapped
+ *      path is treated as absolute (step 6).
+ *   4. `^//` (protocol-relative — no scheme, e.g. `//img.shields.io/b.svg`,
+ *      as GitHub issue/PR bodies and badge services commonly emit) →
+ *      `remote`, prefixed `https:`. This has no colon, so it survives
+ *      react-markdown's default `urlTransform` untouched and would
+ *      otherwise fall into the absolute-path branch below and misclassify
+ *      as a local file (`/img.shields.io/b.svg` → 404 → a misleading
+ *      "not found" chip).
+ *   5. any other URL-scheme prefix (`URL_SCHEME_RE`, e.g. `data:`,
+ *      `javascript:`, `blob:`, a bare `C:\…`) → `empty`, mirroring
+ *      `defaultUrlTransform`'s own blanking of unsafe schemes — a relative
+ *      path like `foo:bar.png` is therefore also `empty` here (consistent
+ *      with react-markdown blanking that same string upstream), while a
+ *      colon appearing after the first `/` (`docs/a:b.png`) does not match
+ *      and still resolves as relative (step 7).
+ *   6. a leading `/` → absolute: one candidate, the normalized value
+ *      itself. Unlike a `file:` URL, `?`/`#` are kept verbatim here (and in
+ *      the relative branch below) rather than stripped — a POSIX filename
+ *      may legally contain either character, so `/tmp/a.png?v=1` resolves
+ *      as the literal (non-image) path `/tmp/a.png?v=1`, not `/tmp/a.png`.
+ *   7. otherwise relative: strip one leading `@` (the `@rel` mention form
  *      `shortenTaskPaths` produces for a path the user typed under a task
  *      root — see `shorten-task-paths.ts`), then a leading `./`; join
  *      against each non-empty-string root in order, normalize, and dedupe
@@ -131,6 +160,10 @@ export function classifyMdImageSrc(
     if (unwrapped === null) return { kind: "empty" };
     displayPath = normalizePosixPath(unwrapped);
     candidates = [displayPath];
+  } else if (trimmed.startsWith("//")) {
+    return { kind: "remote", url: `https:${trimmed}` };
+  } else if (URL_SCHEME_RE.test(trimmed)) {
+    return { kind: "empty" };
   } else if (trimmed.startsWith("/")) {
     displayPath = normalizePosixPath(trimmed);
     candidates = [displayPath];

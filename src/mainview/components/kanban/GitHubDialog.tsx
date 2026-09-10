@@ -73,8 +73,7 @@ import { isMergedPull, mergedPullReplacement } from "@/lib/pull-merged";
 import { isCredentialError } from "@/lib/credential-error";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
-import { MD_URL_TRANSFORM } from "./md-components";
-import { MdImage } from "./MdImage";
+import { MD_URL_TRANSFORM, MdImage } from "./md-components";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
 import { sameIssueUrl } from "../../../shared/issue-task.ts";
 import { ResolveConflictsDialog, type ResolveConflictsContext } from "./ResolveConflictsDialog";
@@ -175,8 +174,11 @@ const GH_MD_COMPONENTS: GhMdComponents = {
   code: ghMdCode,
   // Same `img` override as the transcript's markdown maps (`md-components.tsx`)
   // — GitHub CDN images still render inline, just with the shared 24rem cap
-  // and missing-file fallback chip. No scope provider here, so a relative
-  // ref (there's no task to resolve against) falls through to a `file` chip.
+  // and missing-file fallback chip. No scope provider here, so this renders
+  // under `EMPTY_MD_IMAGE_SCOPE` (`allowLocal: false`): a third-party body's
+  // local/relative ref never touches the filesystem — it renders as a
+  // neutral, non-clickable `file` chip instead (see `MdImage.tsx`'s
+  // `!allowLocal` branch and file-header comment).
   img: MdImage,
   pre: ({ children }) => (
     <pre className="overflow-x-auto rounded-md bg-muted/40 px-3 py-2">{children}</pre>

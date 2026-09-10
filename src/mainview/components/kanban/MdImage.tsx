@@ -17,6 +17,19 @@
 // without prop drilling; `GitHubDialog` renders with the empty default scope
 // since it has no task.
 //
+// `MdImageScope.allowLocal` gates whether a `local`/`file` source may touch
+// the filesystem at all. Third-party markdown — a GitHub PR/issue/comment
+// body, rendered through `GitHubDialog`'s scope-less default — is a
+// different trust tier than the user's own agent transcript: a relative or
+// absolute local path embedded there must never turn into a real
+// `/files/preview` request or an `openPath` call, so it renders as a
+// neutral, non-clickable `file` chip instead (see the `!allowLocal` branch
+// below). `RunEventList` (RunPanel.tsx) and `PlanDialog` both scope their
+// own agent output with `allowLocal: true`; `EMPTY_MD_IMAGE_SCOPE`
+// (GitHubDialog's default) is `allowLocal: false` — fail-closed, no
+// provider means no filesystem access. Remote (`https?:`) images render the
+// same either way; there's no local-filesystem exposure to gate there.
+//
 // Only inline elements (`span`/`img`/`button`) are ever returned for the
 // image/chip content itself: the override renders inside a markdown `<p>`,
 // and a block-level element there would both be invalid DOM nesting and
@@ -42,17 +55,22 @@ import { classifyMdImageSrc } from "@/lib/md-image";
 import { AttachmentNotFoundDialog, AttachmentOpenErrorDialog } from "./AttachmentDialogs";
 import type { MdComponents } from "./md-components";
 
-/** Task-scoped context `MdImage` reads to resolve a relative `src` and to
- *  pass `taskId` through to `api.openPath`/`api.openExternal`. */
+/** Task-scoped context `MdImage` reads to resolve a relative `src`, to pass
+ *  `taskId` through to `api.openPath`/`api.openExternal`, and to gate
+ *  whether a `local`/`file` source may touch the filesystem at all
+ *  (`allowLocal` — see the file-header comment). */
 export interface MdImageScope {
   taskId?: string;
   roots: readonly (string | null | undefined)[];
+  allowLocal: boolean;
 }
 
 /** Default scope for a markdown surface with no task context (GitHub PR/
- *  issue/comment bodies) — relative refs there simply can't resolve and fall
- *  through to a `file` chip, matching A3 in the plan. */
-export const EMPTY_MD_IMAGE_SCOPE: MdImageScope = Object.freeze({ roots: [] });
+ *  issue/comment bodies) — fail-closed: no provider means no local
+ *  filesystem access, so a local/relative ref there renders as a neutral,
+ *  non-clickable `file` chip (the `!allowLocal` branch below) instead of
+ *  resolving against an empty root list. */
+export const EMPTY_MD_IMAGE_SCOPE: MdImageScope = Object.freeze({ roots: [], allowLocal: false });
 
 export const MdImageScopeContext = createContext<MdImageScope>(EMPTY_MD_IMAGE_SCOPE);
 
@@ -84,7 +102,7 @@ function isActivationKey(e: KeyboardEvent): boolean {
 }
 
 export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, node: _node }) => {
-  const { taskId, roots } = useContext(MdImageScopeContext);
+  const { taskId, roots, allowLocal } = useContext(MdImageScopeContext);
   const source = useMemo(() => classifyMdImageSrc(src, roots), [src, roots]);
 
   const [candidateIndex, setCandidateIndex] = useState(0);
@@ -92,12 +110,15 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
   const [notFoundPath, setNotFoundPath] = useState<string | null>(null);
   const [openError, setOpenError] = useState<{ path: string; message: string } | null>(null);
 
-  // A new `src` means a fresh classification — the previous candidate index
-  // / failed flag belonged to the old one.
+  // A new `source` means a fresh classification — either a new `src`, or the
+  // same `src` re-resolved against new `roots` (e.g. a task's worktree
+  // materializes mid-session, growing the candidate list) — so the previous
+  // candidate index / failed flag belonged to the old classification and
+  // must not survive as a permanent chip.
   useEffect(() => {
     setCandidateIndex(0);
     setFailed(false);
-  }, [src]);
+  }, [source]);
 
   const openLocalPath = async (path: string) => {
     try {
@@ -154,6 +175,7 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
             src={source.url}
             alt={alt ?? ""}
             title={title ?? source.url}
+            aria-label={alt || `Open ${refBasename(source.url)}`}
             loading="lazy"
             decoding="async"
             role="button"
@@ -173,6 +195,25 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
         </span>
       );
     }
+  } else if (!allowLocal && (source.kind === "file" || source.kind === "local")) {
+    // Different trust tier (see the file-header comment): a scope with
+    // `allowLocal: false` (GitHub PR/issue/comment bodies, via
+    // `EMPTY_MD_IMAGE_SCOPE`) must never resolve a local/relative path
+    // against the filesystem — no `api.filePreviewUrl`, no `openPath`. Render
+    // a neutral, non-interactive chip (a `<span>`, not a `<button>` — there
+    // is deliberately nothing to click) with the same styling as the
+    // ordinary non-image `file` chip below.
+    const Icon = iconForRef({ path: source.path, isDirectory: source.path.endsWith("/") });
+    content = (
+      <span
+        data-testid="md-image-file"
+        title={`Local file (not rendered here): ${source.path}`}
+        className={FILE_CHIP_CLASS}
+      >
+        <Icon className="size-3 shrink-0" aria-hidden />
+        <span className="truncate">{refBasename(source.path)}</span>
+      </span>
+    );
   } else if (source.kind === "file") {
     const Icon = iconForRef({ path: source.path, isDirectory: source.path.endsWith("/") });
     content = (
@@ -190,7 +231,8 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
       </button>
     );
   } else {
-    // source.kind === "local"
+    // source.kind === "local", allowLocal === true here (the branch above
+    // already caught the !allowLocal case for both "file" and "local").
     if (source.candidates.length === 0 || failed) {
       const path = source.path;
       content = (
@@ -219,6 +261,7 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
             src={api.filePreviewUrl(currentPath)}
             alt={alt ?? ""}
             title={title ?? currentPath}
+            aria-label={alt || `Open ${refBasename(currentPath)}`}
             loading="lazy"
             decoding="async"
             role="button"
@@ -228,12 +271,9 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
               if (isActivationKey(e)) stopAnd(e, () => void openLocalPath(currentPath));
             }}
             onError={() => {
-              setCandidateIndex((i) => {
-                const next = i + 1;
-                if (next < source.candidates.length) return next;
-                setFailed(true);
-                return i;
-              });
+              const next = candidateIndex + 1;
+              if (next < source.candidates.length) setCandidateIndex(next);
+              else setFailed(true);
             }}
             className={IMAGE_CLASS}
           />
@@ -253,21 +293,26 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
   // warns in dev), and a non-portaled `fixed` element under the RunPanel
   // `<aside>`'s `translate-x` transform would be positioned relative to the
   // aside, not the viewport (same reason `ui/context-menu.tsx` portals).
-  // While closed they render nothing, so the portal is inert.
+  // Both dialogs render nothing while closed, so gating the portal on
+  // whether either is actually open (rather than always mounting an inert
+  // one) skips a `createPortal` call — and the two dialog components' own
+  // no-op render — on every image/chip that never triggers one, which is
+  // the overwhelming majority.
   return (
     <>
       {content}
-      {createPortal(
-        <>
-          <AttachmentNotFoundDialog path={notFoundPath} onClose={() => setNotFoundPath(null)} />
-          <AttachmentOpenErrorDialog
-            path={openError?.path ?? null}
-            message={openError?.message ?? null}
-            onClose={() => setOpenError(null)}
-          />
-        </>,
-        document.body,
-      )}
+      {(notFoundPath !== null || openError !== null) &&
+        createPortal(
+          <>
+            <AttachmentNotFoundDialog path={notFoundPath} onClose={() => setNotFoundPath(null)} />
+            <AttachmentOpenErrorDialog
+              path={openError?.path ?? null}
+              message={openError?.message ?? null}
+              onClose={() => setOpenError(null)}
+            />
+          </>,
+          document.body,
+        )}
     </>
   );
 };

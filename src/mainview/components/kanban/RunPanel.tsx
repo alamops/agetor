@@ -96,8 +96,7 @@ import { TerminalView } from "./TerminalView";
 import { deriveTodoProgress } from "@/lib/todo-progress";
 import { TodoProgressCard } from "./TodoProgressCard";
 import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
-import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink } from "./md-components";
-import { MD_URL_TRANSFORM, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./md-components";
+import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink, MD_URL_TRANSFORM, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./md-components";
 import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent } from "./MessageSegments";
 
 /**
@@ -4494,9 +4493,11 @@ function RunEventList({
   // Scopes every `MdImage` under this list (assistant/user bubbles, tagged
   // segments, the plan-approval preview) to this task's id + roots without
   // threading props through each intermediate component. See
-  // `MdImageScopeContext`'s doc comment in `MdImage.tsx`.
+  // `MdImageScopeContext`'s doc comment in `MdImage.tsx`. `allowLocal: true`
+  // — this is the user's own agent transcript, a trusted source, unlike
+  // `GitHubDialog`'s scope-less (`allowLocal: false`) default.
   const mdImageScope = useMemo<MdImageScope>(
-    () => ({ taskId, roots: pathRoots ?? EMPTY_MD_IMAGE_SCOPE.roots }),
+    () => ({ taskId, roots: pathRoots ?? EMPTY_MD_IMAGE_SCOPE.roots, allowLocal: true }),
     [taskId, pathRoots],
   );
 

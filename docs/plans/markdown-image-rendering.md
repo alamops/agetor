@@ -49,7 +49,7 @@ Done means:
 | D5 | **Relative resolution = ordered candidates** `[worktreePath, workdir]` → `join(root, rel)` (leading `./` and a leading `@` mention marker stripped, `.`/`..` segments normalized, duplicate roots deduped); `MdImage` tries them in order via `onError`, then falls back to the chip. | Only the first root (misses a task whose worktree was torn down while the source repo still has the file). | Owner Q2. |
 | D6 | **Click = OS open.** `api.openPath({ path: <the absolute candidate that loaded, or the first>, taskId })`; 404 → `AttachmentNotFoundDialog`; any other failure → `AttachmentOpenErrorDialog`. Remote image click → `api.openExternal(url)`. `<img role="button" tabIndex=0>` + Enter/Space, no `<button>` wrapper (an image may sit inside a markdown link). | In-app lightbox (owner declined, consistent with #218). | Owner Q1. |
 | D7 | **Fallback chips, never a broken glyph**: non-image extension → `iconForRef` file chip (basename, tooltip = full path, click = openPath); image whose candidates all failed / no candidates → warning-tone `ImageOff` chip; blank `src` → muted `ImageOff` + alt text (no click). All inline elements. | Leave the browser's broken icon. | Owner Q3. |
-| D8 | **Sizing + caption via Tailwind classes on the `<img>`**: `max-h-96 max-w-full h-auto object-contain rounded-md border border-border/60 align-middle cursor-pointer`; alt text rendered as a small muted caption `<span>` under the image (inline-flex column wrapper) and as `title` fallback; markdown `title` wins for the tooltip when present. No `index.css` change. | A `.agetor-md img` CSS rule (also hits `<img>`s no one overrides, e.g. future raw HTML). | Owner Q4; `.agetor-md` gotchas. |
+| D8 | **Sizing + caption via Tailwind classes on the `<img>`**: `max-h-96 max-w-full h-auto object-contain rounded-md border border-border/60 align-middle cursor-pointer`; alt text renders only as a small muted caption `<span>` under the image (inline-flex column wrapper), never as the tooltip; the `title` is the markdown `title` when present, else the resolved absolute path (local) or the URL (remote). No `index.css` change. | A `.agetor-md img` CSS rule (also hits `<img>`s no one overrides, e.g. future raw HTML). | Owner Q4; `.agetor-md` gotchas. |
 | D9 | **CSP header on all three byte routes** — `content-security-policy: sandbox; default-src 'none'` on the 200 responses of `/files/preview`, `/tasks/:id/diff/blob`, `/github/pull-blob`. Ignored by `<img>` consumption, enforced if the URL is ever navigated to or framed. | Preview route only (inconsistent posture across identical routes). | Owner Q3; web brief Q4. |
 | D10 | **Fake-driver seam** `FAKE_CLAUDE_MD_IMAGE_PROMPT_MARKER = "__agetor_fake_claude_md_image__"`: writes `<cwd>/agetor-md-images/shot.png` (the same 1×1 PNG) and emits one assistant chunk carrying an absolute ref, a relative ref, a missing ref and a `.pdf` ref (exact text in T3). Placed before the env-gated sent-files branch, per that branch's ordering comment. | Prompt-echo only (never exercises `AssistantBlock`). | Owner Q3. |
 
@@ -126,7 +126,7 @@ Parallel, disjoint files. Unit tests use `bun:test`, e2e extends the existing Pl
 - **`<p>` content model**: `MdImage` returns only inline elements, so no DOM-nesting warnings and the `.agetor-md` owl spacing is unaffected.
 - **Memoized transcript blocks**: `AssistantBlock` stays `memo`'d on `text`; the context value is memoized on `taskId`/`pathRoots` so it only re-renders consumers when the task's roots change (rare).
 - **Network**: one lazy `<img>` request per local reference; a missing file costs a 404 per candidate, per mount. No polling, no new endpoints.
-- **Security**: agent-authored markdown can now point `/files/preview` at any image path on the machine — the same tier the route already granted `SendUserFile` paths (agent-chosen too) and `/open-path`. Rendering happens only inside the user's own local webview; the CSP header removes the one convention-only mitigation. `file://` unwrapping never reaches links.
+- **Security**: agent-authored markdown can now point `/files/preview` at any image path on the machine — the same tier the route already granted `SendUserFile` paths (agent-chosen too) and `/open-path`. Rendering happens only inside the user's own local webview; the CSP header removes the one convention-only mitigation. `file://` unwrapping never reaches links. The default scope (`EMPTY_MD_IMAGE_SCOPE`, `allowLocal: false`) is fail-closed: a surface that never opts in via `MdImageScopeContext` — today only `GitHubDialog`'s third-party bodies — can never have a local path reach `/files/preview`, so a future provider that forgets to set `allowLocal: true` degrades to remote-only rendering instead of silently granting local-file read access to untrusted markdown (review finding #4).
 - **GitHub bodies**: repo-relative image refs GitHub would have resolved itself now render as a basename chip (previously a broken image) — an improvement, noted in docs.
 - **Peer branch** (fix/fix-fx-harness) edits `RunPanel.tsx` elsewhere; our hunks are small and localized, merge risk low.
 - **Rollback**: revert the branch; no migrations, no persisted-shape changes.
@@ -146,7 +146,7 @@ Assumptions proceeding on:
 
 - A1 — `file://` unwrapping is `img`-only; `[text](file://…)` links keep today's blanked behavior.
 - A2 — A relative candidate that normalizes outside the roots (`../../x.png`) is still requested; `/files/preview` deliberately has no cwd containment (precedent #130/#172/#218).
-- A3 — `GitHubDialog` runs with the empty scope; relative refs there become chips.
+- A3 — *(amended in Phase 8 after review finding #4)* `MdImageScope` carries an `allowLocal` flag. `RunEventList` and `PlanDialog` set `allowLocal: true`; `GitHubDialog` runs with the default scope, `EMPTY_MD_IMAGE_SCOPE = { roots: [], allowLocal: false }`, since its bodies are third-party-authored — a local path there never reaches `/files/preview` regardless of roots, and renders as the neutral `md-image-file` chip; remote `https://` refs are unaffected. A relative ref in an `allowLocal: true` scope whose roots are all empty degrades to the `md-image-fallback` chip (not `md-image-file`), consistent with the classifier still returning `local` for an image extension with zero candidates.
 - A4 — e2e proves the assistant path through the claude fake driver; the cursor driver is unchanged and funnels through identical code, so no `AGETOR_CURSOR_DRIVER=fake` fixture wiring is added.
 - A5 — CSP value `sandbox; default-src 'none'`, applied to the 200 branches only (a 304 has no body).
 - A6 — `~/`-prefixed paths are not expanded (no HOME in the webview); they fall to the chip.
@@ -162,6 +162,7 @@ Assumptions proceeding on:
 | Relative paths, `@`-mention form, `file://` | in this run | T1 |
 | Non-image / missing / blank fallbacks + dialogs | in this run | T1 |
 | CSP header on `/files/preview` **and** the two blob routes | in this run | T2 |
+| `/github/pull-blob` CSP assertion | in this run | F3 (`server-pull-blob-csp.test.ts`) |
 | Fake-driver seam + unit test + e2e | in this run | T3, TT3, TT4 |
 | CLAUDE.md architecture entry | in this run | T5 |
 | CLI `agetor logs` / TUI | no change needed — they print the markdown text verbatim, which already reads as a path; verified in Phase 1 | — |
@@ -172,3 +173,21 @@ Assumptions proceeding on:
 | Remote-image privacy policy (agent output can embed a tracking pixel) | out of scope — pre-existing behavior, unchanged by this run | — |
 | `AGETOR_CURSOR_DRIVER=fake` e2e fixture wiring | out of scope — driver unchanged (A4) | — |
 | Owner-deferred | none | — |
+
+## 10. Review outcome
+
+Rubric: `code-review` skill (opus). Verdict: approve. 0 must-fix / 6 should-fix / 5 nice-to-have, all applied in Phase 8:
+
+- Impure setState updater.
+- Failed flag not reset on roots change.
+- Protocol-relative URLs misclassified as local.
+- GitHub bodies could render local files → `allowLocal`.
+- Title-fallback doc mismatch.
+- File-chip doc mismatch.
+- Duplicate RunPanel import.
+- Missing aria-label on the img button.
+- Portal created while dialogs closed.
+- `?`/`#` asymmetry undocumented.
+- `MdImage` not re-exported.
+
+Plus two unit-test flags: a dead branch in `fileUrlToPath`; non-http/file schemes fell through to the relative branch.

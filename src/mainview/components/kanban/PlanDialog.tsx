@@ -114,8 +114,10 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
   // roots — mirrors `RunEventList`'s `mdImageScope` in RunPanel.tsx, since
   // this dialog renders its own `ReactMarkdown` outside that provider. `task`
   // is a required prop here, so there's no empty-scope case to guard.
+  // `allowLocal: true`: a plan is the agent's own generated content, the same
+  // trusted tier as the transcript — not third-party markdown.
   const mdImageScope = useMemo<MdImageScope>(
-    () => ({ taskId: task.id, roots: [task.worktreePath, task.workdir] }),
+    () => ({ taskId: task.id, roots: [task.worktreePath, task.workdir], allowLocal: true }),
     [task.id, task.worktreePath, task.workdir],
   );
 
