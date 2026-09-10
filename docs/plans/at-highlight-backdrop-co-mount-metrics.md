@@ -190,3 +190,20 @@ nothing in `src/cli` is touched and that suite is known to stall under load.
 | Resolve-conflicts dialog e2e (`e2e/resolve-conflicts*.spec.ts`) has no @-highlight scenario | **Out of scope** — same shared code path as the issue dialog; adding a PR-conflict fixture flow for a parity assertion is a different ticket |
 | `font` shorthand in `MIRRORED_PROPERTIES` (engine-specific inline serialization) | **Out of scope** — spike-verified harmless; not created by this change |
 | Fleet knowledge entry for the sibling-ref ordering gotcha | **In this run** — orchestrator, after verification |
+
+## 10. Outcome (2026-09-09)
+
+- Commits on `fix/fix-file-reference-highlight-box`: `d3fe9e5` plan · `e768d8d` wave 1 (passive
+  metrics effect + withheld marks; CLAUDE.md §12; at-file-references.md §19) · `74648f0` review
+  fixes (scroll-sync effect also keys on `style`; doc wording) · `538cff1` wave 2 (e2e parity +
+  geometry). Base `c652464`.
+- Review (opus, `code-review` skill): 1 should-fix (treated as must-fix: the scroll-sync layout
+  effect shared the co-mount null-ref bail and only recovered on a `value` change) + 2 doc nits,
+  all applied. No TODO/FIXME/stub markers.
+- Verification on the final tree: `bun run typecheck` clean; `bun test src/mainview src/shared`
+  1615 pass / 0 fail; `e2e/at-file-autocomplete.spec.ts` 14/14 (Chromium). Measured mark
+  geometry deltas ≤ 0.01px on the dock, tray editor and diff composer.
+- Ledger: everything in §9 marked *in this run* landed; the two *out of scope* rows stand
+  (resolve-conflicts e2e fixture; `font` shorthand cleanup). Nothing owner-deferred.
+- Not done here: a live smoke in the packaged WKWebView app (Playwright's WebKit 26.5 stood
+  in for it in the spike and matched Chromium byte-for-byte).
