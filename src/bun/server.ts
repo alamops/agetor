@@ -990,6 +990,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               ...corsHeaders(req),
               "content-type": result.contentType,
               "x-content-type-options": "nosniff",
+              // Same CSP posture as /files/preview — see that route's comment.
+              "content-security-policy": "sandbox; default-src 'none'",
               "cache-control": "private, max-age=0, must-revalidate",
               etag,
             },
@@ -3762,6 +3764,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               ...corsHeaders(req),
               "content-type": blobContentType(relPath, kind),
               "x-content-type-options": "nosniff",
+              // Same CSP posture as /files/preview — see that route's comment.
+              "content-security-policy": "sandbox; default-src 'none'",
               // Neither side is content-addressed by URL: "new" is the
               // working tree (can change under the user's feet), and "old"
               // is pinned to `task.baseRef` which itself isn't stable — an
@@ -4342,7 +4346,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               // carry <script>) on the origin whose URL carries the API
               // token; nosniff + img-only consumption keeps active-content
               // risk down.
+              // The CSP header below makes that img-only mitigation
+              // self-enforcing: a browser ignores CSP on an <img> fetch, but
+              // if this token-bearing URL were ever navigated to or framed
+              // instead, `sandbox` + `default-src 'none'` block script
+              // execution in an SVG. Agent-authored markdown can now point
+              // this route anywhere (plan
+              // docs/plans/markdown-image-rendering.md D9).
               "x-content-type-options": "nosniff",
+              "content-security-policy": "sandbox; default-src 'none'",
               // Content at a given path can change (a screenshot re-saved in
               // place), so don't let the browser serve stale bytes without
               // asking; the ETag makes the revalidation cheap (304, no body).

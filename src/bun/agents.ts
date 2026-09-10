@@ -906,6 +906,31 @@ function emitFakeFxUsageAndTitle(onChunk: ChunkHandler): void {
   onChunk("status", `${FX_SESSION_TITLE_STATUS_PREFIX}Fake fx session`);
 }
 
+/**
+ * Prompt-marker trigger for the markdown-image fake-driver scenario (see
+ * `makeFakeAgent` below): a substring in the *prompt* rather than an env var,
+ * same rationale as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER} above — the e2e
+ * suite's worker-scoped backend fixture (`e2e/fixtures.ts`) spawns one
+ * `headless.ts` per worker with a single fixed env block shared by every
+ * test/task in that worker, so a spec can't get its own env var into that
+ * already-running process, but CAN put anything it wants in `task.prompt` at
+ * task-create time. Exported so `e2e/markdown-images.spec.ts` can reference
+ * the exact string instead of duplicating it (that spec can't `import` from
+ * `src/bun/*`, so it keeps a **literal copy** of this string). See
+ * `docs/plans/markdown-image-rendering.md` (D10, T3).
+ */
+export const FAKE_CLAUDE_MD_IMAGE_PROMPT_MARKER = "__agetor_fake_claude_md_image__";
+
+/**
+ * A real, valid 1×1 transparent PNG (not just arbitrary bytes with a `.png`
+ * extension) — small, but enough for `/files/preview` and an `<img>` tile to
+ * actually decode and render it. Module-scope so both the sent-files and the
+ * markdown-image fake-driver scenarios below can share one copy instead of
+ * each inlining the same base64 literal.
+ */
+const FAKE_PNG_1X1_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
 function makeFakeAgent(
   taskId: string,
   prompt: string,
@@ -1232,7 +1257,46 @@ function makeFakeAgent(
         );
         resolveDone(1);
       }
-    }  } else if (
+    }  } else if (prompt.includes(FAKE_CLAUDE_MD_IMAGE_PROMPT_MARKER)) {
+    // Test hook: simulate a plain markdown assistant reply carrying image
+    // references (see docs/plans/markdown-image-rendering.md, D10/T3) so
+    // RunPanel's `MdImage` `img` override can be exercised end to end
+    // without a real claude CLI. Unlike the `SendUserFile` scenario below,
+    // nothing here is a structured tool_use/tool_result — this is exactly
+    // what every harness (claude, cursor, codex, gemini, fx) actually puts
+    // on the wire: joined markdown text on the `assistant` stream (plan §2).
+    // A single `assistant` chunk carries four refs, one per path `MdImage`
+    // must handle:
+    //   - an ABSOLUTE ref to a real file → renders inline.
+    //   - a RELATIVE ref to that same real file → exercises the
+    //     worktree/workdir candidate-resolution order (plan D5): it only
+    //     resolves once a task root (worktreePath, then workdir) actually
+    //     contains `agetor-md-images/shot.png`, i.e. once `fakeOpts.cwd` is
+    //     the task's own cwd.
+    //   - an absolute ref to a file that is never written → the
+    //     `md-image-fallback` chip (missing image), not a broken-image
+    //     glyph.
+    //   - an absolute ref to a `.pdf` that is ALSO never written to disk →
+    //     the non-image `md-image-file` chip renders purely from the
+    //     extension and doesn't require the path to exist on disk.
+    //
+    // Only turn 1 (a fresh spawn) runs this scenario — same convention as
+    // every other canned scenario in this driver.
+    const mdImageCwd = fakeOpts.cwd ?? process.cwd();
+    const mdImageDir = path.join(mdImageCwd, "agetor-md-images");
+    mkdirSync(mdImageDir, { recursive: true });
+    writeFileSync(path.join(mdImageDir, "shot.png"), Buffer.from(FAKE_PNG_1X1_BASE64, "base64"));
+    after(5, () => {
+      onChunk(
+        "assistant",
+        `Here are the screenshots.\n\n![Absolute shot](${mdImageDir}/shot.png)\n\n![Relative shot](agetor-md-images/shot.png)\n\n![Missing shot](${mdImageDir}/missing.png)\n\n![The report](${mdImageDir}/report.pdf)`,
+      );
+    });
+    after(10, () => {
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+  } else if (
     process.env.AGETOR_FAKE_CLAUDE_SENT_FILES === "1"
     || prompt.includes(FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER)
   ) {
@@ -1273,7 +1337,7 @@ function makeFakeAgent(
     // won't carry the marker unless the caller re-includes it.
     //
     // Deliberately the LAST marker-driven branch in this if/else chain (after
-    // TODOS, MONITOR, and FX_PERMISSION): its trigger is `||`-gated on a bare
+    // TODOS, MONITOR, FX_PERMISSION, and MD_IMAGE): its trigger is `||`-gated on a bare
     // env var (`AGETOR_FAKE_CLAUDE_SENT_FILES=1`), same convention as
     // `AGETOR_FAKE_CLAUDE_TODOS`, and a bare env var is process-wide — it
     // can't be scoped to one test's prompt the way a marker substring can. If
@@ -1290,13 +1354,7 @@ function makeFakeAgent(
     mkdirSync(sentDir, { recursive: true });
     const pngPath = path.join(sentDir, "chart.png");
     const mdPath = path.join(sentDir, "report.md");
-    // A real, valid 1×1 transparent PNG (not just arbitrary bytes with a
-    // `.png` extension) — small, but enough for `/files/preview` and an
-    // `<img>` tile to actually decode and render it.
-    const pngBuffer = Buffer.from(
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
-      "base64",
-    );
+    const pngBuffer = Buffer.from(FAKE_PNG_1X1_BASE64, "base64");
     const mdContent = "# Fake report\n\nDelivered by the fake claude driver.\n";
     writeFileSync(pngPath, pngBuffer);
     writeFileSync(mdPath, mdContent);
