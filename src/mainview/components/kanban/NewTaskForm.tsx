@@ -26,6 +26,7 @@ import {
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
+  defaultModeFor,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -48,7 +49,7 @@ import {
   writeCollapsed,
 } from "@/lib/panel-collapse";
 
-const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
+const initialMode = (kind: AgentKind) => defaultModeFor(kind);
 
 interface Props {
   onSubmit: (

@@ -24,6 +24,14 @@ import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { shortenTaskPaths } from "@/lib/shorten-task-paths";
 import { fxUsageChipText, fxUsageTitle, mergeFxUsage, parseFxUsage } from "@/lib/fx-usage";
+import { useCountdown } from "@/lib/fx-auto-resume";
+import { renderLinkified } from "@/lib/linkify";
+import {
+  fxRecoveryNoticeText,
+  fxRecoverySummaryLine,
+  isFxRecoveryResumable,
+  parseFxRecoveryPayload,
+} from "../../../shared/fx-recovery.ts";
 import { reconcileById } from "@/lib/reconcile";
 import { RUN_PANEL_DEFAULT_WIDTH, RUN_PANEL_MIN_WIDTH, clampPanelWidth, readPanelWidth, writePanelWidth } from "@/lib/panel-width";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
@@ -42,8 +50,11 @@ import {
   CATALOG_SCOPED_KINDS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  defaultModeFor,
   EVENTS_WINDOW_MAX,
+  FX_AUTO_RESUME_MAX,
   FX_PROVIDER_STATUS_PREFIX,
+  FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   isInternalStatusSentinel,
@@ -58,6 +69,7 @@ import {
   type AgentStatus,
   type Harness,
   type BacklogMessage,
+  type FxRecoveryPayload,
   type FxUsagePayload,
   type GitHubPullMergeability,
   type Run,
@@ -67,6 +79,7 @@ import {
   type Task,
   type TaskDraft,
   type TaskEventsReplayMeta,
+  type TaskFxRecovery,
   type TaskPlan,
   type TaskReference,
   type ToolResultAttachment,
@@ -1418,8 +1431,10 @@ function RunPanelBody({
    *  so it splices against these. */
   const mainEvents = useMemo(() => events.filter((e) => !e.subagentId), [events]);
 
-  /** Merged fx usage / provider / title per run, each keyed by `runId` —
-   *  feed the run-row chips in `RunsList`. Sourced from the raw
+  /** Merged fx usage / provider / title / recovery per run, each keyed by
+   *  `runId` — feed the run-row chips in `RunsList` (usage/provider/title)
+   *  and the bottom-of-transcript recovery notices below (`recoveryByRunId`
+   *  — see `liveRecoveryNotice`/`pausedRecovery`). Sourced from the raw
    *  (unfiltered) `events` state rather than `displayedEvents` so the chips
    *  stay correct regardless of which subagent tab is active or whether a
    *  JSONL rebuild snapshot has spliced the main stream. `events` arrives in
@@ -1429,22 +1444,29 @@ function RunPanelBody({
    *  per-turn half (`turn`, from the `session/prompt` result) can arrive as
    *  separate sentinel chunks on the same run, so a plain last-wins
    *  overwrite would clobber whichever half arrived first — while the
-   *  provider/title maps are plain last-wins (`fx-provider:`/`fx-title:`
-   *  sentinels are each already a complete value). All three are gated on
-   *  `kind === "fx"` — every other agent kind never emits these sentinels,
-   *  so scanning the full (possibly windowed) event list on every render
-   *  for them is pure waste — and combined into a single pass over `events`
-   *  so a streamed fx task doesn't pay for three independent full scans of
-   *  the same (up to `EVENTS_WINDOW_MAX`-sized) array on every chunk. Note
-   *  the same windowing applies here as everywhere else `events` is read:
-   *  once an older run's events slide out of the kept window
-   *  (`eventWindowKeepCount`/`EVENTS_WINDOW_MAX`), its chips disappear too
-   *  — intended, not a bug to chase. */
-  const { usageByRunId, providerByRunId, titleByRunId } = useMemo(() => {
+   *  provider/title/recovery maps are plain last-wins (each sentinel —
+   *  `fx-provider:`/`fx-title:`/`fx-recovery:` — is already a complete
+   *  value; for recovery specifically, the newest sentinel for a run is
+   *  exactly the state that matters, since fx emits one per retry attempt
+   *  plus a final terminal one). All four are gated on `kind === "fx"` —
+   *  every other agent kind never emits these sentinels, so scanning the
+   *  full (possibly windowed) event list on every render for them is pure
+   *  waste — and combined into a single pass over `events` so a streamed fx
+   *  task doesn't pay for four independent full scans of the same (up to
+   *  `EVENTS_WINDOW_MAX`-sized) array on every chunk. Note the same
+   *  windowing applies here as everywhere else `events` is read: once an
+   *  older run's events slide out of the kept window
+   *  (`eventWindowKeepCount`/`EVENTS_WINDOW_MAX`), its chips (and any
+   *  recovery notice derived from it) disappear too — intended, not a bug
+   *  to chase. */
+  const { usageByRunId, providerByRunId, titleByRunId, recoveryByRunId } = useMemo(() => {
     const usage = new Map<string, FxUsagePayload>();
     const provider = new Map<string, string>();
     const title = new Map<string, string>();
-    if (kind !== "fx") return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title };
+    const recovery = new Map<string, FxRecoveryPayload>();
+    if (kind !== "fx") {
+      return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title, recoveryByRunId: recovery };
+    }
     for (const e of events) {
       if (e.stream !== "status") continue;
       if (e.data.startsWith(FX_USAGE_STATUS_PREFIX)) {
@@ -1456,9 +1478,12 @@ function RunPanelBody({
       } else if (e.data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX)) {
         const value = e.data.slice(FX_SESSION_TITLE_STATUS_PREFIX.length).trim();
         if (value) title.set(e.runId, value);
+      } else if (e.data.startsWith(FX_RECOVERY_STATUS_PREFIX)) {
+        const parsed = parseFxRecoveryPayload(e.data.slice(FX_RECOVERY_STATUS_PREFIX.length));
+        if (parsed) recovery.set(e.runId, parsed);
       }
     }
-    return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title };
+    return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title, recoveryByRunId: recovery };
   }, [events, kind]);
 
   /** Background/sub-agent events bucketed by subagent id, in arrival order. */
@@ -2029,6 +2054,190 @@ function RunPanelBody({
 
   const [sending, setSending] = useState(false);
   const [sendHint, setSendHint] = useState<string | null>(null);
+  // fx-only: true while a Resume click is in flight for this task's paused
+  // recovery checkpoint (`pausedRecovery` below). Disables the Resume button
+  // so a second click can't fire a second `resumeFxRecovery` call while the
+  // first is still resolving — the server also guards this with a synchronous
+  // in-flight claim, but this keeps the button honest client-side too.
+  const [resumeBusy, setResumeBusy] = useState(false);
+  // The `latestRun.id` this panel had at the moment Resume was clicked —
+  // read by the busy-clearing effect below to detect when the runs
+  // snapshot has actually caught up with the resume, rather than clearing
+  // busy the instant the server call resolves. `null` once there's nothing
+  // left to wait for (no run at click time, or the request itself failed).
+  const resumeClickedRunIdRef = useRef<string | null>(null);
+  // Resume a paused fx recovery checkpoint (see `pausedRecovery` below) —
+  // continues the SAME model turn via `_meta.fx.continueRecovery` server-side,
+  // no new user message. On success there's nothing else to do here: the runs
+  // poll + SSE pick up the new run row, `latestRun` changes, and
+  // `pausedRecovery` recomputes to `null` on its own — `runsPollKickRef` just
+  // short-circuits the up-to-2s poll delay so the notice clears immediately
+  // instead of lagging behind the click. A failure (e.g. fx's own
+  // "No paused model response to continue" `-32602`) surfaces through the
+  // same `sendHint` line every other send-path error uses, verbatim.
+  //
+  // Deliberately does NOT clear `resumeBusy` in a `.finally` on the request
+  // itself: the server accepting the resume only means a new run row now
+  // exists somewhere in the DB — it says nothing about whether THIS panel's
+  // `runs`/`latestRun` state (2s poll + SSE) has observed it yet. Clearing
+  // busy on request-success would re-enable the button for the ~1-2s window
+  // between "server accepted" and "this panel's snapshot caught up", during
+  // which `pausedRecovery` below could still be reading the OLD failed run
+  // as resumable and re-offer the very checkpoint that was just consumed —
+  // a second click would then race the first resume against fx's own
+  // "already resumed"/"no paused response" error. So busy is left `true` on
+  // success and only cleared by the effect below, once `latestRun.id` has
+  // actually moved on from what it was at click time; a request failure has
+  // nothing new to wait for, so it clears busy immediately instead.
+  const handleResumeFxRecovery = useCallback(() => {
+    resumeClickedRunIdRef.current = latestRun?.id ?? null;
+    setResumeBusy(true);
+    api.resumeFxRecovery(task.id)
+      .then(() => { runsPollKickRef.current(); })
+      .catch((e) => {
+        setSendHint(e instanceof Error ? e.message : String(e));
+        resumeClickedRunIdRef.current = null;
+        setResumeBusy(false);
+      });
+  }, [task.id, latestRun]);
+  // Clears `resumeBusy` once the runs snapshot has observed a run identity
+  // different from the one captured at click time (see the comment above) —
+  // i.e. the new resumed run has actually shown up in `runs`/`latestRun`,
+  // not merely that the resume request round-tripped. Paired with the
+  // `task.column !== "running"` guard added to `pausedRecovery` below: that
+  // guard hides the notice as soon as the column SSE event flips (usually
+  // faster than the 2s runs poll), and this effect is the backstop for the
+  // gap before either signal has caught up — without both, the button (or
+  // the whole notice, before the column fix) could stay clickable long
+  // enough for a second resume to fire against the same stale checkpoint.
+  useEffect(() => {
+    if (!resumeBusy) return;
+    if (latestRun?.id !== resumeClickedRunIdRef.current) {
+      resumeClickedRunIdRef.current = null;
+      setResumeBusy(false);
+    }
+  }, [resumeBusy, latestRun]);
+  // fx-only: true while a "Cancel" click is in flight for this task's
+  // pending auto-resume timer (`pausedRecovery.autoResume` below). Unlike
+  // `resumeBusy` above, cancelling doesn't spawn a new run to wait for — it
+  // only clears `task.fxRecovery.autoResume` server-side — so busy is
+  // simply cleared once the request settles either way (`.finally`), no
+  // run-identity bookkeeping needed. `runsPollKickRef` still short-circuits
+  // the up-to-2s task/runs poll so the countdown line disappears (or the
+  // "cancelled" reason appears) as soon as the server has actually applied
+  // it, rather than lagging behind the click.
+  const [cancelAutoBusy, setCancelAutoBusy] = useState(false);
+  const handleCancelFxAutoResume = useCallback(() => {
+    setCancelAutoBusy(true);
+    api.cancelFxAutoResume(task.id)
+      .then(() => { runsPollKickRef.current(); })
+      .catch((e) => {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => setCancelAutoBusy(false));
+  }, [task.id]);
+  /** Live fx recovery notice for the bottom-pinned heartbeat slot — fx's own
+   *  retry-progress line (e.g. "⚠ Rate limited · HTTP 429 · … · retrying
+   *  request in 8s · attempt 5/10"), rendered directly under
+   *  `RunningIndicator` while the CURRENT run is still mid-retry. It lives in
+   *  that slot (not as a transcript row) because it's ephemeral, in-place
+   *  progress — the same reason the heartbeat itself isn't a transcript row
+   *  — and updates live as new `fx-recovery:` sentinels arrive since
+   *  `recoveryByRunId` is derived from `events`. Gated on `kind === "fx"` and
+   *  `activeStream === "main"` (a background-agent tab never carries fx's own
+   *  retry loop — only the Main stream's turn does) same as `indicatorMode`/
+   *  `holdSummary` above. `null` whenever there's nothing live: wrong kind, a
+   *  subagent tab, no run currently `running`, or the latest run's newest
+   *  recovery sentinel isn't `state: "active"` — `paused` gets the notice
+   *  below instead, and `recovered`/`cleared` have nothing left to show here
+   *  (the persisted summary line for those transitions lives in the
+   *  transcript itself, written once by the driver, not derived on every
+   *  render by this memo). Ignores a `replayed: true` payload — on
+   *  `session/resume` fx replays the PRIOR turn's recovery updates onto the
+   *  new run before it starts making progress of its own, so a naive read
+   *  would flash a stale "attempt 10/10" (or worse, a stale `paused`) as if
+   *  it were live. `payload.replayed` is fx-acp.ts's own stamp, present only
+   *  while replay is in flight, never on a genuinely live sentinel — so this
+   *  memo simply reads as `null` (no live notice) until real progress on the
+   *  resumed turn arrives. `pausedRecovery` below deliberately does NOT
+   *  apply the same guard — see its comment. */
+  const liveRecoveryNotice = useMemo(() => {
+    if (kind !== "fx" || activeStream !== "main") return null;
+    if (!latestRun || latestRun.status !== "running") return null;
+    const payload = recoveryByRunId.get(latestRun.id);
+    if (!payload || payload.state !== "active" || payload.replayed === true) return null;
+    return fxRecoveryNoticeText(payload);
+  }, [kind, activeStream, latestRun, recoveryByRunId]);
+  /** Paused fx recovery notice + Resume affordance, same bottom slot as
+   *  `liveRecoveryNotice` (mutually exclusive with it — a run is either
+   *  `running` with an active retry or `failed` with a paused one, never
+   *  both). fx gave up after exhausting its retry budget: the run already
+   *  settled `failed` and the card is back off `running`, but the model's
+   *  mid-turn checkpoint is still resumable via `POST /tasks/:id/fx-resume`
+   *  as long as fx's own `requiredAction` says so (`isFxRecoveryResumable`).
+   *  `latestRun.status === "failed"` alone is enough to know no newer run is
+   *  in flight — `runs` is newest-first, so a failed `latestRun` IS the
+   *  newest run for this task. `null` for every non-fx kind, a subagent tab,
+   *  or an archived task (no mutation affordances on a frozen task — matches
+   *  every other archived-gated action in this panel), or once the latest
+   *  sentinel for that run no longer reads as resumable (e.g. a later
+   *  `cleared` sentinel from a normal follow-up prompt consuming the
+   *  checkpoint). The text itself (`fxRecoverySummaryLine`) is the same
+   *  "…resume once the limit clears, or send a new message." line the driver
+   *  already persisted into the transcript at the pause transition — this is
+   *  purely a live, disappearing-once-acted-on affordance layered on top,
+   *  not a second source of truth for what happened.
+   *
+   *  `latestRun.status === "failed"` alone is stale for up to the 2s runs-
+   *  poll interval after a new turn actually starts (Resume itself, or an
+   *  ordinary follow-up message sent from the composer): `runs` only
+   *  refreshes on that poll, so for that window `latestRun` can still be the
+   *  OLD failed run with its (still-resumable) payload even though a new run
+   *  is already `running` server-side — the button would stay clickable and
+   *  a second click could race the in-flight turn. `task.column !== "running"`
+   *  closes that window: the `column` field flips to `"running"` promptly via
+   *  the column SSE event (independent of the runs poll), so it's the
+   *  faster-arriving of the two signals here. The `resumeBusy`/
+   *  `resumeClickedRunIdRef` bookkeeping above is the complementary backstop
+   *  for a Resume click specifically (busy stays true until `latestRun.id`
+   *  itself has moved on) — this column check additionally covers an
+   *  ordinary new message reopening the same window.
+   *
+   *  Deliberately does NOT gate on `payload.replayed` the way
+   *  `liveRecoveryNotice` above does: a `paused` sentinel replayed onto a
+   *  resume run that itself died before making progress (e.g. the resume
+   *  turn's own connection dropped) is still an accurate description of
+   *  fx's checkpoint — fx never cleared it, so Resume must stay offered.
+   *  `liveRecoveryNotice` hides replayed sentinels because it renders
+   *  in-progress retry noise that goes stale the moment real progress
+   *  resumes; `pausedRecovery` renders a terminal state that stays true
+   *  until something explicit changes it (a `cleared` sentinel, or a
+   *  genuinely new run). */
+  // `autoResume`/`stopped` (below) are read straight off `task.fxRecovery` —
+  // the server-managed schedule/counter for THIS same paused checkpoint —
+  // rather than derived from the sentinel payload; the sentinel-derived
+  // `isFxRecoveryResumable` gate above still decides whether the notice
+  // shows at all, `task.fxRecovery` only adds the auto-resume-specific
+  // detail on top once it does.
+  const pausedRecovery = useMemo(() => {
+    if (kind !== "fx" || activeStream !== "main" || archived) return null;
+    if (task.column === "running") return null;
+    if (!latestRun || latestRun.status !== "failed") return null;
+    const payload = recoveryByRunId.get(latestRun.id);
+    if (!payload || !isFxRecoveryResumable(payload)) return null;
+    return {
+      text: fxRecoverySummaryLine(payload) ?? fxRecoveryNoticeText(payload),
+      busy: resumeBusy,
+      onResume: handleResumeFxRecovery,
+      autoResume: task.fxRecovery?.autoResume,
+      stopped: task.fxRecovery?.autoResumeStopped,
+      onCancelAuto: handleCancelFxAutoResume,
+      cancelBusy: cancelAutoBusy,
+    };
+  }, [
+    kind, activeStream, archived, task.column, latestRun, recoveryByRunId, resumeBusy,
+    handleResumeFxRecovery, task.fxRecovery, handleCancelFxAutoResume, cancelAutoBusy,
+  ]);
   // Messages backlog — saved, not-yet-sent drafts for this task. Seeded from
   // the task prop and kept in sync as the 2s task poll refreshes `task.backlog`;
   // each mutation also updates this optimistically from the endpoint's returned
@@ -3066,6 +3275,8 @@ function RunPanelBody({
                 runStatus={activeRunStatus}
                 indicatorMode={indicatorMode}
                 holdSummary={holdSummary}
+                recoveryNotice={liveRecoveryNotice}
+                pausedRecovery={pausedRecovery}
                 taskId={task.id}
                 pathRoots={pathRoots}
                 plans={kind === "cursor" || kind === "claude-code" ? plans : NO_PLANS}
@@ -4114,6 +4325,8 @@ function RunEventList({
   runStatus,
   indicatorMode = "off",
   holdSummary = null,
+  recoveryNotice = null,
+  pausedRecovery = null,
   taskId,
   plans = [],
   onOpenPlan,
@@ -4135,6 +4348,28 @@ function RunEventList({
    *  (`holdSummary` in `RunPanelBody`) since it needs `task.column` and
    *  `runs`, neither of which this component has. */
   holdSummary?: string | null;
+  /** fx's own live retry-progress line (`liveRecoveryNotice` in
+   *  `RunPanelBody`, e.g. "⚠ Rate limited · HTTP 429 · … · retrying request
+   *  in 8s · attempt 5/10"), rendered as a `RecoveryNotice` directly under
+   *  `RunningIndicator`/`HoldingIndicator` at the bottom of the transcript —
+   *  the same "what's happening right now, in place" slot the heartbeat
+   *  occupies, not a transcript row, because it's ephemeral progress that
+   *  keeps rewriting itself in place as fx retries. `null` whenever there's
+   *  nothing live to show (see the caller's doc comment for the full gate).
+   *  The persisted explanation of what actually happened (paused/recovered)
+   *  lives in the transcript itself, written once by the driver — this prop
+   *  is a separate, purely-derived, disappearing-on-its-own affordance. */
+  recoveryNotice?: string | null;
+  /** fx paused (exhausted its retry budget) and the checkpoint is still
+   *  resumable — rendered as a `PausedRecoveryNotice` + Resume button in the
+   *  same bottom slot, mutually exclusive with `recoveryNotice` (see the
+   *  caller's `pausedRecovery` doc comment for the full gate, including why
+   *  it's archived- and subagent-tab-gated). `text` is the driver's own
+   *  persisted "…resume once the limit clears…" line reused for the live
+   *  affordance's label; `busy` disables the button while a resume request is
+   *  in flight; `onResume` is the click handler. `null` when there's nothing
+   *  to resume. */
+  pausedRecovery?: { text: string; busy: boolean; onResume: () => void } | null;
   /** Threaded through to each `UserMessageBlock`'s `AttachmentChips` so a
    *  relative attachment ref can resolve against the task's worktree/workdir
    *  when the user clicks it. */
@@ -4493,6 +4728,8 @@ function RunEventList({
       {blocks}
       {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
       {holdSummary && <HoldingIndicator text={holdSummary} />}
+      {recoveryNotice && <RecoveryNotice text={recoveryNotice} />}
+      {pausedRecovery && <PausedRecoveryNotice {...pausedRecovery} />}
     </div>
   );
 }
@@ -4531,6 +4768,139 @@ function HoldingIndicator({ text }: { text: string }) {
     <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
       <span className="inline-flex size-2 shrink-0 rounded-full bg-info" />
       <span>{text}</span>
+    </div>
+  );
+}
+
+/**
+ * Pinned-at-bottom, in-place progress line for an fx model call that's
+ * mid-retry (`liveRecoveryNotice` in `RunPanelBody`, derived from the newest
+ * `fx-recovery:` sentinel on the currently-`running` run). Lives right below
+ * `RunningIndicator` — same reasoning as `HoldingIndicator`: this is "what's
+ * happening under the transcript right now", not conversation content, so it
+ * doesn't get a transcript row. It rewrites itself in place as new sentinels
+ * arrive (the caller's memo recomputes on `events`) rather than accumulating
+ * one row per retry attempt. The persisted "recovery paused …" / "✓
+ * recovered …" lines that explain the outcome AFTER the fact live in the
+ * transcript itself — written once by the driver at the terminal transition,
+ * never derived here — so this component only ever shows the transient
+ * in-progress state, never the aftermath. `title` carries the identical text
+ * (there's no separate "long form" to fall back to); the visible line itself
+ * is clamped to one row via `truncate` so a long fx message (which can run to
+ * a full sentence with an embedded Gateway URL) doesn't wrap and push the
+ * composer down — hovering it reveals the full line. The visible content
+ * goes through `renderLinkified` so an embedded `https://…` Gateway URL
+ * renders as a clickable link; `title` stays the plain `text` string (a
+ * link inside a native tooltip wouldn't be clickable anyway).
+ */
+function RecoveryNotice({ text }: { text: string }) {
+  return (
+    <div
+      data-testid="fx-recovery-notice"
+      title={text}
+      className="truncate rounded-md border border-warning/30 bg-warning/10 px-2 py-1 text-[11px] text-warning"
+    >
+      {renderLinkified(text)}
+    </div>
+  );
+}
+
+/**
+ * Pinned-at-bottom notice for a PAUSED fx recovery checkpoint (fx exhausted
+ * its retry budget) plus the Resume affordance — same bottom slot as
+ * `RecoveryNotice`, mutually exclusive with it (`pausedRecovery` in
+ * `RunPanelBody` only ever computes non-null once the run has settled
+ * `failed`, at which point no run is `running` any more so `recoveryNotice`
+ * is already `null`). Unlike `RecoveryNotice` this one is NOT purely
+ * ephemeral progress — it stays up until the user either resumes or sends a
+ * new message (which the driver's own `cleared` sentinel will reflect,
+ * collapsing this notice on the next render) — but it's still layered on top
+ * of, not a replacement for, the driver's own persisted "…resume once the
+ * limit clears…" transcript line reused here as `text` — rendered through
+ * `renderLinkified` so an embedded Gateway URL is clickable, same as
+ * `RecoveryNotice`. Clicking Resume calls `RunPanelBody`'s
+ * `handleResumeFxRecovery`, which posts to `POST /tasks/:id/fx-resume` and
+ * continues the SAME paused model turn — no new user-authored message is
+ * sent.
+ *
+ * `autoResume`/`stopped`/`onCancelAuto`/`cancelBusy` are the
+ * `Task.fxRecovery`-derived auto-resume state layered on top of that same
+ * checkpoint (`docs/plans/fx-recovery-follow-ups.md` §3.5): when
+ * `autoResume` is set, a second line renders the live `useCountdown`
+ * countdown plus a Cancel button that calls `RunPanelBody`'s
+ * `handleCancelFxAutoResume` (`DELETE /tasks/:id/fx-auto-resume`); when
+ * instead `stopped` is set (no timer currently pending, and a reason is on
+ * record for why), a plain reason line explains it. Neither prop is
+ * required — a caller with no auto-resume schedule at all (e.g. before T2's
+ * engine has run) renders just the base notice + Resume button, identical
+ * to before this field existed.
+ */
+function PausedRecoveryNotice({
+  text,
+  busy,
+  onResume,
+  autoResume,
+  stopped,
+  onCancelAuto,
+  cancelBusy,
+}: {
+  text: string;
+  busy: boolean;
+  onResume: () => void;
+  autoResume?: TaskFxRecovery["autoResume"];
+  stopped?: TaskFxRecovery["autoResumeStopped"];
+  onCancelAuto?: () => void;
+  cancelBusy?: boolean;
+}) {
+  const countdown = useCountdown(autoResume?.at ?? null);
+  return (
+    <div
+      data-testid="fx-recovery-paused"
+      className="flex flex-col gap-1.5 rounded-md border border-danger/30 bg-danger/10 px-2 py-1.5 text-[11px] text-danger"
+    >
+      <div className="flex items-start gap-2">
+        <span className="min-w-0 flex-1">{renderLinkified(text)}</span>
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          data-testid="fx-recovery-resume"
+          disabled={busy}
+          onClick={onResume}
+          className="h-6 shrink-0 px-2 text-[11px]"
+        >
+          Resume
+        </Button>
+      </div>
+      {autoResume && (
+        <div className="flex items-center gap-2">
+          <span data-testid="fx-recovery-countdown" className="min-w-0 flex-1">
+            {`Auto-resume in ${countdown} (${autoResume.attempt}/${autoResume.max})`}
+          </span>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            data-testid="fx-recovery-cancel-auto"
+            disabled={cancelBusy}
+            onClick={onCancelAuto}
+            className="h-6 shrink-0 px-2 text-[11px] text-danger hover:text-danger"
+          >
+            Cancel
+          </Button>
+        </div>
+      )}
+      {stopped && (
+        <span className="text-danger/80">
+          {stopped === "exhausted"
+            ? `Auto-resume gave up after ${FX_AUTO_RESUME_MAX} attempts.`
+            : stopped === "cancelled"
+              ? "Auto-resume cancelled."
+              : stopped === "failed"
+                ? "Auto-resume could not start — resume manually."
+                : "Auto-resume disabled in Settings."}
+        </span>
+      )}
     </div>
   );
 }
@@ -4880,11 +5250,22 @@ const ErrorBlock = memo(function ErrorBlock({ text }: { text: string }) {
   );
 });
 
+// `text` stays a plain `string` prop (not the `renderLinkified` output)
+// specifically so `memo`'s default shallow comparator actually catches a
+// same-text rerender: `renderLinkified` returns a freshly allocated array
+// whenever it finds a link, so passing its result as the prop would hand
+// this component a new-identity node on every parent render and defeat the
+// memo outright. Linkifying happens INSIDE the component instead, via
+// `useMemo` keyed on `text`, so a status line carrying a bare URL (e.g. an
+// fx recovery/auto-resume line) still renders it as a clickable
+// `ExternalLink`, and a no-URL line still renders the identical text node
+// across rerenders.
 const StatusDivider = memo(function StatusDivider({ text }: { text: string }) {
+  const content = useMemo(() => renderLinkified(text), [text]);
   return (
     <div className="flex items-center gap-2 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
       <span className="h-px flex-1 bg-border" />
-      <span>{text}</span>
+      <span>{content}</span>
       <span className="h-px flex-1 bg-border" />
     </div>
   );
@@ -5688,7 +6069,7 @@ function TaskDetails({
     // the user re-pick if they want something specific. Sent as one PATCH
     // so the server-side reconcile only fires once.
     const nextKind = harnessKindOf(nextId, harnesses);
-    const nextMode = AGENT_OPTIONS[nextKind].modes[0]?.id ?? "auto";
+    const nextMode = defaultModeFor(nextKind);
     const nextModel = DEFAULT_MODEL[nextKind];
     // Same merged-rows source `modelOptions` reads from (rule 7's
     // logged-out distrust), but for the harness being switched TO rather
@@ -5707,6 +6088,30 @@ function TaskDetails({
         : nextEfforts[0]!.id;
     void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, fast: false, maxMode: false });
   };
+
+  const modeOptions = supportedModes(kind, task.model);
+  // A stored `task.mode === null` resolves at spawn/display time via the
+  // single shared `defaultModeFor(kind)` (`AGENT_OPTIONS[kind].modes[0]?.id
+  // ?? "auto"`, `shared/types.ts`) — every driver's `buildCommand` now
+  // resolves a null mode the same way, so this dropdown's fallback and the
+  // actual spawn default can't drift apart. For every kind except fx this is
+  // `"auto"`, because `modes[0]` IS `"auto"`. fx is the one exception: 0.0.8
+  // reordered `AGENT_OPTIONS.fx.modes` to put `yolo` ("Full access") first —
+  // per the owner's explicit call in `docs/plans/fx-recovery-follow-ups.md`
+  // §3.6, a null-mode fx row now spawns (and this dropdown shows) "Full
+  // access", not "auto", superseding the earlier no-silent-escalation rule.
+  //
+  // `defaultModeFor(kind)` is a kind-wide default and doesn't know about
+  // per-model mode denials (`MODEL_MODE_DENY`) — `modeOptions` above already
+  // filtered those out. Every deny list is empty today, so this guard is
+  // latent, but the <Select> below must never be handed a value with no
+  // matching <option>, so fall back to the first still-offered mode (or, in
+  // the pathological all-denied case, a hardcoded safe default) rather than
+  // trusting the kind-wide default blindly.
+  const preferred = defaultModeFor(kind);
+  const nullModeFallback = modeOptions.some((m) => m.id === preferred)
+    ? preferred
+    : (modeOptions[0]?.id ?? "bypass");
 
   return (
     <details className="border-b border-border/60 px-3 py-2 text-xs">
@@ -5746,8 +6151,8 @@ function TaskDetails({
           <dd className="min-w-0">
             {editable ? (
               <CompactSelect
-                value={task.mode ?? supportedModes(kind, task.model)[0]?.id ?? "bypass"}
-                options={supportedModes(kind, task.model)}
+                value={task.mode ?? nullModeFallback}
+                options={modeOptions}
                 onChange={(mode) => void save({ mode })}
               />
             ) : (

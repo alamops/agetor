@@ -16,8 +16,10 @@ import {
   Mail,
   MailOpen,
   Play,
+  PlayCircle,
   Settings,
   Square,
+  TimerOff,
   Trash2,
   X,
   type LucideIcon,
@@ -52,7 +54,7 @@ import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand } from "@/lib/toasts";
+import { dismissPending, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
 import { parseThemePreference } from "@/lib/theme";
@@ -64,6 +66,8 @@ import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisi
 import type { SettingsSectionId } from "@/lib/settings-dialog-view";
 import { reconcileById } from "@/lib/reconcile";
 import { parseStickyUserMessagesPreference, STICKY_USER_MESSAGES_PREF } from "@/lib/user-message-display";
+import { FX_AUTO_RESUME_DELAY_PREF, FX_AUTO_RESUME_PREF } from "@/lib/fx-auto-resume-prefs";
+import { parseFxAutoResumePrefs } from "../shared/fx-recovery.ts";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
 /**
@@ -130,6 +134,8 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
   open: FolderOpen,
   start: Play,
   stop: Square,
+  "resume-recovery": PlayCircle,
+  "cancel-auto-resume": TimerOff,
   "mark-done": CheckCircle2,
   archive: Archive,
   unarchive: ArchiveRestore,
@@ -187,6 +193,11 @@ function AppInner() {
   // retain the last-sent-message reminder until they opt into the standard
   // scrolling chat list in Settings.
   const [stickyUserMessages, setStickyUserMessages] = useState(true);
+  // fx auto-resume prefs (`FX_AUTO_RESUME_PREF` / `FX_AUTO_RESUME_DELAY_PREF`
+  // — see `docs/plans/fx-recovery-follow-ups.md` §3). Missing preferences
+  // resolve to "on" / the default delay via `parseFxAutoResumePrefs`, same
+  // shape the orchestrator reads at schedule time.
+  const [fxAutoResumePrefs, setFxAutoResumePrefs] = useState(() => parseFxAutoResumePrefs({}));
   // Section the Settings dialog should land on when it next opens — set by
   // onboarding's "Enable in Settings…" deep link, cleared on close so the
   // plain gear-icon open still lands on General.
@@ -287,6 +298,7 @@ function AppInner() {
       // closes) re-reads just this key via the same route.
       setOnboardingDismissedPref(prefs[ONBOARDING_DISMISSED_PREF]);
       setStickyUserMessages(parseStickyUserMessagesPreference(prefs[STICKY_USER_MESSAGES_PREF]));
+      setFxAutoResumePrefs(parseFxAutoResumePrefs(prefs));
       setPrefsLoaded(true);
     }).catch(() => { /* keep the boot-seeded preferences; onboarding stays hidden (prefsLoaded=false) rather than guess */ });
     // Run once at boot only — intentionally not re-run when either local
@@ -853,6 +865,22 @@ function AppInner() {
         });
         return;
       }
+      if (ev.kind === "fx-auto-resume") {
+        // Live-only signal (a replayed historical schedule/cancel must not
+        // re-notify), same contract as `files-sent` above. Only the two
+        // outcomes worth interrupting the user for get a toast — `fired`
+        // (info: a resume just went out) and `exhausted` (error: the chain
+        // gave up, manual action needed). `scheduled`/`cancelled`/`disabled`
+        // drive only the card badge / RunPanel notice / context-menu state,
+        // all read from the task's own polled `fxRecovery` field, not this
+        // event — so they're silent here by design.
+        if (ev.state === "fired") {
+          toastFxAutoResumeFired({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen, attempt: ev.attempt, max: ev.max });
+        } else if (ev.state === "exhausted") {
+          toastFxAutoResumeExhausted({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen, max: ev.max });
+        }
+        return;
+      }
       // column transitions. Patch `tasks` optimistically so the board and any
       // open run panel (via the selected-sync effect) reflect the new column
       // the instant the backend pushes it — rather than waiting up to 2s for
@@ -1264,6 +1292,18 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         break;
       case "stop":
         void cancel(t);
+        break;
+      case "resume-recovery":
+        void api.resumeFxRecovery(t.id).catch((e: unknown) => {
+          const message = e instanceof Error ? e.message : String(e);
+          toast.error("Couldn't resume", { description: message });
+        });
+        break;
+      case "cancel-auto-resume":
+        void api.cancelFxAutoResume(t.id).catch((e: unknown) => {
+          const message = e instanceof Error ? e.message : String(e);
+          toast.error("Couldn't cancel auto-resume", { description: message });
+        });
         break;
       case "mark-done":
         void markDone(t);
@@ -1681,6 +1721,28 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             // a subsequent click must not be overwritten by an older request.
             setStickyUserMessages((current) => current === sticky ? !sticky : current);
           });
+        }}
+        fxAutoResume={fxAutoResumePrefs}
+        onFxAutoResumeChange={(next) => {
+          const prevEnabled = fxAutoResumePrefs.enabled;
+          const prevDelaySec = fxAutoResumePrefs.delaySec;
+          setFxAutoResumePrefs(next);
+          // Each field reverts independently (same "still the latest
+          // selection" guard as `onStickyUserMessagesChange` above) so a
+          // failed delay write can't also stomp an unrelated, already-
+          // succeeded toggle flip, and vice versa.
+          if (next.enabled !== prevEnabled) {
+            void api.setPreference(FX_AUTO_RESUME_PREF, next.enabled ? "on" : "off").catch(() => {
+              setFxAutoResumePrefs((current) =>
+                current.enabled === next.enabled ? { ...current, enabled: prevEnabled } : current);
+            });
+          }
+          if (next.delaySec !== prevDelaySec) {
+            void api.setPreference(FX_AUTO_RESUME_DELAY_PREF, String(next.delaySec)).catch(() => {
+              setFxAutoResumePrefs((current) =>
+                current.delaySec === next.delaySec ? { ...current, delaySec: prevDelaySec } : current);
+            });
+          }
         }}
         onClose={() => {
           setSettingsOpen(false);

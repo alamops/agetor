@@ -3,8 +3,9 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessQuota, HarnessUsage, Project, SavedPrompt, SentFileEntry, Task, TaskDraft, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessQuota, HarnessUsage, Project, SavedPrompt, SentFileEntry, Task, TaskDraft, TaskFxRecovery, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
+import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -94,6 +95,13 @@ type TaskRow = {
   // generic `insert`/`update` paths below — see the comment on the `update`
   // SET clause for why.
   sent_files: string | null;
+  // fx's paused-recovery state + auto-resume schedule (migration 051),
+  // `TaskFxRecovery` JSON — written exclusively by `tasks.setFxRecovery`'s
+  // targeted UPDATE, never by the generic `insert`/`update` paths below
+  // (same rationale as `sent_files` above: an unrelated PATCH must not
+  // clobber a live auto-resume timer). NULL for every task that isn't
+  // currently paused.
+  fx_recovery: string | null;
   // Unread-indicator watermark pair (migration 045). Not spread into `Task`
   // directly — only the derived `unread` boolean is (see `toTask`). Written
   // exclusively by `tasks.noteAssistantEvent` / `tasks.markSeen`, never by
@@ -356,6 +364,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   openTerminalCount: counts?.terminals ? (counts.terminals.get(r.id) ?? 0) : countTerminals(r.id),
   todoProgress: parseTodoProgress(r.todo_progress),
   sentFiles: parseSentFiles(r.sent_files),
+  fxRecovery: parseTaskFxRecovery(r.fx_recovery),
   // Derived, never stored: a monotonic-id watermark comparison, race-free by
   // construction (see migration 045's doc comment). NULL
   // `last_assistant_event_id` (no assistant event ever observed) always
@@ -428,7 +437,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, unread: false, hasAssistantMessages: false, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
@@ -447,6 +456,12 @@ export const tasks = {
     // PATCH must not clobber a concurrent `SendUserFile` delivery, and (like
     // the watermarks) the write must not bump `updated_at` either, or the
     // board would re-render every task on every 2s poll.
+    // `fx_recovery` (migration 051) joins the same skip list for the same
+    // reason again: it's written only by `tasks.setFxRecovery` below via its
+    // own targeted UPDATE, and a generic PATCH (title, column, mode, …)
+    // landing mid-pause must never silently cancel a live auto-resume
+    // schedule or wipe the paused badge — that write also never bumps
+    // `updated_at`.
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
@@ -579,6 +594,49 @@ export const tasks = {
       [JSON.stringify(merged), taskId],
     );
     return this.get(taskId);
+  },
+  /**
+   * Overwrite a task's persisted fx pause + auto-resume state in one
+   * targeted `UPDATE` — same pattern as `mergeSentFiles` above: no
+   * `updated_at` bump (server-managed state, not a task mutation — bumping
+   * it would re-render every task on every 2s poll) and it bypasses the
+   * generic `update`'s SET clause entirely so a concurrent unrelated PATCH
+   * can't race it. Called by the orchestrator at every point in the fx
+   * pause lifecycle (§3 of `docs/plans/fx-recovery-follow-ups.md`):
+   * recording a fresh pause, updating the `autoResume` schedule/counter as
+   * the auto-resume engine schedules/fires/cancels a timer, and clearing
+   * the row (`value: null`) once the pause chain ends. Doesn't check
+   * whether the task exists first — an `UPDATE ... WHERE id = ?` against a
+   * missing id simply matches zero rows, same as every other targeted
+   * UPDATE in this file.
+   */
+  setFxRecovery(taskId: string, value: TaskFxRecovery | null): void {
+    db.run(
+      `UPDATE tasks SET fx_recovery = ? WHERE id = ?`,
+      [value ? JSON.stringify(value) : null, taskId],
+    );
+  },
+  /**
+   * Every non-archived task currently carrying a persisted fx pause whose
+   * `autoResume` schedule is non-null — the boot-time re-arm input
+   * (`rearmFxAutoResumes` in the orchestrator re-schedules a timer for each
+   * one, since in-memory timers don't survive a process restart). A paused
+   * task with `autoResume: null` (auto-resume off, exhausted, or cancelled)
+   * is deliberately excluded — there is nothing to re-arm for it. Archived
+   * tasks are excluded too: archiving cancels any pending auto-resume (see
+   * the orchestrator's archive path), so a lingering row there would be
+   * stale by construction.
+   */
+  listFxAutoResumePending(): Array<{ id: string; fxRecovery: TaskFxRecovery }> {
+    const rows = db.query<{ id: string; fx_recovery: string | null }, []>(
+      `SELECT id, fx_recovery FROM tasks WHERE fx_recovery IS NOT NULL AND archived_at IS NULL`,
+    ).all();
+    const out: Array<{ id: string; fxRecovery: TaskFxRecovery }> = [];
+    for (const row of rows) {
+      const fxRecovery = parseTaskFxRecovery(row.fx_recovery);
+      if (fxRecovery && fxRecovery.autoResume) out.push({ id: row.id, fxRecovery });
+    }
+    return out;
   },
 };
 

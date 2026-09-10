@@ -10,6 +10,7 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   cursorModelIdCoveredByCatalog,
+  defaultModeFor,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -20,7 +21,7 @@ import {
 import { AgentIcon } from "./AgentIcon";
 import { HarnessAuthHint } from "./HarnessAuthHint";
 
-const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
+const initialMode = (kind: AgentKind) => defaultModeFor(kind);
 
 /**
  * Generic "create-and-start a task from a prefilled prompt" launch state —

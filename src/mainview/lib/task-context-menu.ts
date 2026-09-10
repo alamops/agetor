@@ -1,13 +1,18 @@
 import type { Task } from "../../shared/types.ts";
+import { isTaskFxPaused } from "../../shared/fx-recovery.ts";
 
 /** Every action the task context menu can offer. A subset of App.tsx's
  *  existing card callbacks (`start`/`cancel`/`markDone`/`archive`/
  *  `unarchive`/`del`), plus the details-panel actions the menu additionally
- *  surfaces as quick actions. T3 maps each id to its App.tsx handler. */
+ *  surfaces as quick actions. T3 maps each id to its App.tsx handler.
+ *  `resume-recovery`/`cancel-auto-resume` map to `api.resumeFxRecovery`/
+ *  `api.cancelFxAutoResume` — see `docs/plans/fx-recovery-follow-ups.md`. */
 export type TaskMenuAction =
   | "open"
   | "start"
   | "stop"
+  | "resume-recovery"
+  | "cancel-auto-resume"
   | "mark-done"
   | "archive"
   | "unarchive"
@@ -73,6 +78,17 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   }
   if (active && !archived) {
     entries.push({ action: "stop", label: "Stop", group: "primary" });
+  }
+  // A resumable fx pause (see TaskFxRecovery) offers its own quick actions
+  // right after Stop — "Resume paused response" whenever the task is
+  // sitting on one, and "Cancel auto-resume" additionally whenever the
+  // orchestrator has a pending timer armed for it (`fxRecovery.autoResume`
+  // non-null). Both are hidden once archived — archiving clears the row.
+  if (isTaskFxPaused(task) && !archived) {
+    entries.push({ action: "resume-recovery", label: "Resume paused response", group: "primary" });
+    if (task.fxRecovery?.autoResume) {
+      entries.push({ action: "cancel-auto-resume", label: "Cancel auto-resume", group: "primary" });
+    }
   }
   if (task.column === "review" && !archived) {
     entries.push({ action: "mark-done", label: "Mark done", group: "primary" });
