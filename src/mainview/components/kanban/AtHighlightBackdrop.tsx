@@ -152,7 +152,19 @@ export function AtHighlightBackdrop({ textareaRef, value, validPaths, className 
   // Keep the backdrop's scroll position glued to the textarea's — the
   // backdrop itself is `overflow-hidden` (never scrollable on its own), so
   // this is the only thing that keeps a highlight aligned once the user
-  // scrolls a tall composer.
+  // scrolls a tall composer. This one stays a layout effect on purpose: a
+  // `value` change can scroll the textarea synchronously (caret pushed into
+  // view) and the mirror has to follow before paint. It has the same
+  // co-mount exposure as the metrics effect above — on the first pass
+  // `textareaRef.current` is still null and it bails — which is why `style`
+  // is a dep: `style` flips `null` → object exactly once, after the passive
+  // effect ran (ref guaranteed attached) AND the children have rendered
+  // (a scrollTop assignment on an empty mirror is a no-op), so that re-run
+  // is what attaches the `scroll` listener and does the first real sync on
+  // a co-mounted surface — without it a tray editor opened on a multi-line
+  // saved draft would keep its marks whole lines off until the first
+  // keystroke changed `value`. `stylesEqual`'s identity preservation keeps
+  // `style` stable afterwards, so a `ResizeObserver` no-op can't churn this.
   useLayoutEffect(() => {
     const el = textareaRef.current;
     const backdrop = backdropRef.current;
@@ -164,7 +176,7 @@ export function AtHighlightBackdrop({ textareaRef, value, validPaths, className 
     sync();
     el.addEventListener("scroll", sync);
     return () => el.removeEventListener("scroll", sync);
-  }, [textareaRef, value]);
+  }, [textareaRef, value, style]);
 
   const segments = useMemo(
     () => computeAtHighlights(value, (p, isDirectory) => isListedPath(validPaths, p, isDirectory)),

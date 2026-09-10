@@ -88,6 +88,10 @@ Grounded findings (Phase 1 research + a live spike in both engines):
 2. **Paint no `<mark>` until the first metrics read succeeds** (owner-approved). `style`
    becomes `null` until read; the container `<div>` still renders (so `backdropRef` and the
    scroll-sync effect keep working), but its children render only once metrics are known.
+   Review finding folded in: the scroll-sync `useLayoutEffect` shares the co-mount null-ref
+   bail and only recovered on a `value` change, so it now also keys on `style` — the one
+   flip from `null` to an object happens after the ref is attached and the children exist,
+   which is exactly when the first real sync + `scroll` listener attach must run.
    A box can therefore never paint against the wrong metrics, even for the one frame a
    non-discrete mount could take.
 3. **Regression coverage that would have caught this** (owner-approved: geometry + style
@@ -104,7 +108,7 @@ Grounded findings (Phase 1 research + a live spike in both engines):
 
 | ID | Goal | Owns (exclusively) | Depends on | Acceptance |
 | --- | --- | --- | --- | --- |
-| T1 | Fix the metrics read timing + withhold marks until ready | `src/mainview/components/kanban/AtHighlightBackdrop.tsx` | — | Metrics read + `ResizeObserver` live in a `useEffect`; `style` state is `null` until the first successful read; children (marks/text/sentinel) render only when ready; container div always renders so scroll-sync keeps its ref; `stylesEqual` identity preservation kept; comment explains the sibling-ref ordering; typecheck green. No behavior change for the late-mount (New Task) path beyond the one-effect delay. |
+| T1 | Fix the metrics read timing + withhold marks until ready | `src/mainview/components/kanban/AtHighlightBackdrop.tsx` | — | Metrics read + `ResizeObserver` live in a `useEffect`; `style` state is `null` until the first successful read; children (marks/text/sentinel) render only when ready; container div always renders so scroll-sync keeps its ref, and scroll-sync keys on `style` too (review fix); `stylesEqual` identity preservation kept; comment explains the sibling-ref ordering; typecheck green. No behavior change for the late-mount (New Task) path beyond the one-effect delay. |
 | T2 | Update docs to match | `CLAUDE.md` (§12 sentence only), `docs/plans/at-file-references.md` (append §19 follow-up) | T1 (wording) | CLAUDE.md §12 states the metrics read is a passive effect, why (co-mount ref ordering, which surfaces co-mount), and that marks are withheld until the first read; plan addendum records the bug, cause, fix, and coverage. |
 
 T1 and T2 touch disjoint files; they run as one wave, grouped into a single agent brief
