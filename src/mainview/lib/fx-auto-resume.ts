@@ -49,10 +49,14 @@ export function fxPausedBadgeText(rec: TaskFxRecovery, countdown: string | null)
  * (`rec.autoResumeStopped`). `FX_AUTO_RESUME_MAX` (not `rec.autoResume?.max`)
  * backs the "gave up" wording because by the time a chain reads
  * `"exhausted"`, `autoResume` itself has already gone back to `null` — the
- * cap that was hit is a constant, not per-row state. When neither a
- * pending timer nor a stopped reason is recorded (e.g. the row was just
- * written and the orchestrator's scheduling decision hasn't landed yet),
- * the suffix falls back to a generic pointer at the task panel.
+ * cap that was hit is a constant, not per-row state. `"failed"` — a timer
+ * fired but the resume it tried to start couldn't (see
+ * `TaskFxRecovery.autoResumeStopped`'s doc) — is reported distinctly from
+ * `"cancelled"` so the tooltip never claims the user cancelled something
+ * that actually tried and failed to start. When neither a pending timer
+ * nor a stopped reason is recorded (e.g. the row was just written and the
+ * orchestrator's scheduling decision hasn't landed yet), the suffix falls
+ * back to a generic pointer at the task panel.
  */
 export function fxPausedBadgeTitle(rec: TaskFxRecovery): string {
   const suffix = rec.autoResume
@@ -63,6 +67,8 @@ export function fxPausedBadgeTitle(rec: TaskFxRecovery): string {
         ? "auto-resume cancelled"
         : rec.autoResumeStopped === "disabled"
           ? "auto-resume disabled in Settings"
-          : "resume from the task panel";
+          : rec.autoResumeStopped === "failed"
+            ? "auto-resume could not start"
+            : "resume from the task panel";
   return rec.message ? `${rec.message} — ${suffix}` : suffix;
 }

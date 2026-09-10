@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import { gotoApp, getPreferences, openSettingsGeneral } from "./helpers";
+// Pure constants/types only (no bun/node runtime imports — see
+// `src/shared/types.ts`'s own "Keep it free of runtime imports" rule), same
+// established pattern as `e2e/fx-models.spec.ts`'s `AGENT_OPTIONS` import —
+// safe for this Node-run Playwright process, unlike `src/bun/agents.ts`
+// (see the marker-literal comments below for why THOSE stay copied).
+import { FX_AUTO_RESUME_DELAY_PREF, FX_AUTO_RESUME_MAX, FX_AUTO_RESUME_PREF } from "../src/shared/types.ts";
 
 /**
  * Prompt-marker trigger for the fake fx model-response-recovery scenario
@@ -25,6 +31,21 @@ import { gotoApp } from "./helpers";
 const FAKE_FX_RECOVERY_PROMPT_MARKER = "__agetor_fake_fx_recovery__";
 
 /**
+ * Fake Gateway URL the fake fx driver splices onto every `active`/`paused`
+ * recovery message in this worker's backend — armed process-wide via
+ * `AGETOR_FAKE_FX_RECOVERY_URL=1` in `e2e/fixtures.ts` (mirrors
+ * `src/bun/agents.ts`'s `FAKE_FX_RECOVERY_URL_PROMPT_MARKER`/
+ * `emitFakeFxRecoveryStorm`'s `urlSuffix` parameter — copied as a literal for
+ * the same "can't import src/bun/agents.ts" reason as the marker above).
+ * Because the env var is on for the whole worker, it applies to EVERY fake
+ * fx recovery task this file creates, not just the ones written to test link
+ * rendering specifically — hence `PAUSED_MESSAGE`/`PAUSED_SUMMARY_LINE`
+ * below carry it unconditionally.
+ */
+const GATEWAY_URL = "https://example.invalid/upgrade";
+const GATEWAY_URL_SUFFIX = ` · upgrade at ${GATEWAY_URL}`;
+
+/**
  * The fake "storm" scenario's exact wire strings (`src/bun/agents.ts`,
  * mirrors `docs/plans/fix-fx-harness-rate-limit.md` §3's "Fake fx driver per
  * turn" spec) — copied here as literals for the same reason the marker above
@@ -32,8 +53,15 @@ const FAKE_FX_RECOVERY_PROMPT_MARKER = "__agetor_fake_fx_recovery__";
  * an explicit non-empty `message`, so `fxRecoveryNoticeText`
  * (`src/shared/fx-recovery.ts`) just returns it verbatim — nothing here
  * needs to reproduce that function's composition logic, only its inputs.
+ * `PAUSED_MESSAGE`/`PAUSED_SUMMARY_LINE` carry `GATEWAY_URL_SUFFIX` because
+ * `AGETOR_FAKE_FX_RECOVERY_URL=1` is set worker-wide (see `GATEWAY_URL`'s
+ * doc comment) — `RECOVERED_MESSAGE`/`REFUSED_STATUS_LINE` never carry it:
+ * the fake never appends the suffix to a `recovered` payload (see
+ * `emitFakeFxRecoveryStorm`'s doc comment), and the refused line is a fixed
+ * string independent of the recovery payload entirely.
  */
-const PAUSED_MESSAGE = "⚠ Rate limited · HTTP 429 · fake gateway limit · recovery paused after 3/3 attempts";
+const PAUSED_MESSAGE =
+  `⚠ Rate limited · HTTP 429 · fake gateway limit · recovery paused after 3/3 attempts${GATEWAY_URL_SUFFIX}`;
 const PAUSED_SUMMARY_LINE = `${PAUSED_MESSAGE} — resume once the limit clears, or send a new message.`;
 const REFUSED_STATUS_LINE = "fx turn ended: refused (response paused after 3/3 attempts — resumable)";
 const RECOVERED_MESSAGE = "✓ recovered · succeeded on attempt 1/3";
@@ -66,9 +94,27 @@ interface TaskRow {
   title: string;
 }
 
+/** Mirrors `TaskFxRecovery` (`src/shared/types.ts`) — the JSON shape
+ *  `GET /tasks/:id` returns on `fxRecovery` once a run has paused. Declared
+ *  locally (not imported) since it's a plain structural shape and the point
+ *  is to assert on the wire JSON, not share a type. */
+interface TaskFxRecoveryShape {
+  state: "paused";
+  runId: string;
+  pausedAt: number;
+  cause?: string;
+  attempt?: number;
+  attemptLimit?: number;
+  message?: string;
+  autoResume: { at: number; attempt: number; max: number; delaySec: number } | null;
+  autoResumeCount: number;
+  autoResumeStopped?: "exhausted" | "cancelled" | "disabled";
+}
+
 interface TaskDetail extends TaskRow {
   column: string;
   mode: string | null;
+  fxRecovery?: TaskFxRecoveryShape | null;
 }
 
 interface RunRow {
@@ -138,6 +184,22 @@ async function startFakeFxRecoveryTask(request: APIRequestContext, backend: E2EB
   ).toBeTruthy();
 }
 
+/** Create AND start a storm task in one call — for the auto-resume tests
+ *  below, which only care about the state the run settles into (paused,
+ *  then auto-resumed), never the ~1.5s live-retry window the split
+ *  create/start helpers above exist to catch (see
+ *  `createFakeFxRecoveryTask`'s doc comment). Mirrors
+ *  `e2e/fx-interactions.spec.ts`'s `createAndStartFakeFxTask`. */
+async function createAndStartFakeFxRecoveryTask(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  title: string,
+): Promise<TaskRow> {
+  const task = await createFakeFxRecoveryTask(request, backend, title);
+  await startFakeFxRecoveryTask(request, backend, task.id);
+  return task;
+}
+
 async function getTask(request: APIRequestContext, backend: E2EBackend, taskId: string): Promise<TaskDetail> {
   const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: authHeaders(backend) });
   expect(res.ok(), `GET /tasks/${taskId} -> ${res.status()}: ${await res.text()}`).toBeTruthy();
@@ -167,6 +229,101 @@ async function openTask(page: Page, title: string): Promise<Locator> {
   const panel = runPanel(page);
   await expect(panel.locator("textarea")).toBeVisible();
   return panel;
+}
+
+/**
+ * Closes the run panel via the backdrop button and waits for the exit
+ * transition to actually start — mirrors `e2e/board-search-shortcut.spec.ts`'s
+ * identical `closeTaskPanel` helper (see its doc comment for why a corner
+ * click, not the default center click, and why the backdrop button rather
+ * than Escape). Needed here because a card whose own run panel is open can
+ * sit directly under the panel `<aside>` (which covers the right ~35-45% of
+ * the board on a default-width viewport) — a product discovery made writing
+ * this file's context-menu tests: right-clicking such a card fails with
+ * "element ... intercepts pointer events" until the panel is out of the way.
+ */
+async function closeTaskPanel(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "Close task panel" }).click({ position: { x: 10, y: 10 } });
+  await expect(runPanel(page)).toHaveClass(/translate-x-full/);
+}
+
+/** Scopes a locator to the board `TaskCard` for the given exact title —
+ *  `TaskCard.tsx`'s root `<Card>` carries `cursor-grab` (drag handle
+ *  styling, unique to board cards), so this can't accidentally match
+ *  anything inside the run panel or the context menu. Mirrors
+ *  `e2e/task-context-menu.spec.ts`'s identical helper. */
+function taskCard(page: Page, title: string): Locator {
+  return page.locator(".cursor-grab").filter({ has: page.getByText(title, { exact: true }) });
+}
+
+/**
+ * Bring a card fully into view and let `.kanban-scroll`'s horizontal scroll
+ * settle before it gets right-clicked — mirrors
+ * `e2e/task-context-menu.spec.ts`'s identical helper (see that file's doc
+ * comment: no longer load-bearing against the menu closing, since it now
+ * dismisses on user `wheel` only, but still useful for deterministic click
+ * coordinates).
+ */
+async function scrollCardIntoView(page: Page, title: string): Promise<void> {
+  const card = taskCard(page, title);
+  await card.evaluate((el) => el.scrollIntoView({ block: "nearest", inline: "center" }));
+  await page.evaluate(async () => {
+    const el = document.querySelector(".kanban-scroll");
+    if (!el) return;
+    let last = el.scrollLeft;
+    let stable = 0;
+    while (stable < 5) {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      if (el.scrollLeft === last) {
+        stable++;
+      } else {
+        stable = 0;
+        last = el.scrollLeft;
+      }
+    }
+  });
+}
+
+/** Right-clicks a card by its exact title (after settling any horizontal
+ *  board scroll — see `scrollCardIntoView`). Unlike
+ *  `e2e/task-context-menu.spec.ts`'s identical-in-spirit helper (which
+ *  right-clicks via a bare `getByText(title).first()`, safe there since none
+ *  of its cases have a run panel open for the SAME task at click time), this
+ *  clicks within the `taskCard` scope specifically: several tests below
+ *  right-click a card while that task's own run panel is open, and the panel
+ *  also renders `task.title` as exact text (`RunPanel.tsx`'s header), so an
+ *  unscoped text match would be ambiguous. */
+async function rightClickCard(page: Page, title: string): Promise<void> {
+  await scrollCardIntoView(page, title);
+  await taskCard(page, title).click({ button: "right" });
+}
+
+/** The task context menu panel — `App.tsx` renders exactly one
+ *  `<ContextMenu testId="task-context-menu" …>` for the whole board.
+ *  Mirrors `e2e/task-context-menu.spec.ts`'s identical helper. */
+function contextMenu(page: Page): Locator {
+  return page.locator('[data-testid="task-context-menu"]');
+}
+
+/** One entry in the task context menu, by its `TaskMenuAction` id (e.g.
+ *  `"resume-recovery"`, `"cancel-auto-resume"`). Mirrors
+ *  `e2e/task-context-menu.spec.ts`'s identical `menuItem` helper. */
+function menuItem(page: Page, action: string): Locator {
+  return page.locator(`[data-testid="task-context-menu-${action}"]`);
+}
+
+/** Forces `App.tsx`'s own 2s `/tasks` poll (and RunPanel's own poll/kick, if
+ *  a panel happens to be open) to refresh immediately instead of waiting out
+ *  the natural interval — both `App.tsx`'s board-level `refresh()` and
+ *  RunPanel's internal `kick()` are wired to `window`'s native `focus`
+ *  event (`onVisible`/`onFocus` respectively), so one synthetic dispatch
+ *  nudges both. Same trick the live-recovery-notice test above already uses
+ *  to force RunPanel's own poll early; here it's what makes `task.fxRecovery`
+ *  (board badge, context-menu gating) observable well inside the 2s
+ *  `AGETOR_FX_AUTO_RESUME_DELAY_MS` auto-resume window instead of racing the
+ *  natural poll cadence against the auto-resume timer. */
+async function kickPolls(page: Page): Promise<void> {
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
 }
 
 /** The New Task form's `<aside>` — mounted first in App.tsx's JSX, ahead of
@@ -280,6 +437,93 @@ test.describe("fx recovery", () => {
       await expect(notice).toContainText("attempt");
       await expect(notice).toContainText("Rate limited");
     }).toPass({ timeout: 5_000, intervals: [50, 100, 200] });
+
+    // --- Paused notice + auto-resume countdown + board badge -----------------
+    // Deliberately continues within THIS SAME test rather than a fresh
+    // `gotoApp` in the next one: the run settles paused at a fixed ~1500ms
+    // mark and `AGETOR_FX_AUTO_RESUME_DELAY_MS=2000` (e2e/fixtures.ts) arms
+    // the auto-resume timer the INSTANT it does — both on the backend's own
+    // clock, independent of anything this test does. A fresh page load in a
+    // follow-on test (navigation + React mount + initial `/tasks` fetch)
+    // reliably burns past however much of that fixed 2000ms window is left
+    // by the time settlement happens, so the only reliable place to observe
+    // the countdown before it fires is right here, still inside the window
+    // the live-notice assertion above already proved is open. `kickPolls`
+    // forces both RunPanel's own poll/kick and App.tsx's board-level
+    // `/tasks` poll to refresh immediately rather than waiting out their
+    // natural 2s cadence — see its doc comment.
+    // Single combined poll loop (rather than sequential bounded waits) for
+    // "paused notice up" AND "countdown + badge both showing the schedule" —
+    // every extra `toPass` round-trip here eats into the fixed ~2000ms
+    // budget before the auto-resume timer fires, so this checks the whole
+    // target state in one loop instead of waiting out one condition before
+    // starting to poll for the next.
+    const paused = panel.getByTestId("fx-recovery-paused");
+    const countdown = panel.getByTestId("fx-recovery-countdown");
+    const badge = taskCard(page, stormTaskTitle).getByTestId("fx-paused-badge");
+    // Every inner `expect(locator)` call below is given an explicit SHORT
+    // timeout (200ms) — without one, a web-first assertion that's still
+    // false (e.g. the badge hasn't refreshed yet) retries internally for
+    // Playwright's default 5000ms before this outer `toPass` iteration even
+    // gets to retry, which single-handedly blows the ~2000ms real budget on
+    // ONE failing iteration. A short inner timeout is what makes the OUTER
+    // loop's own `intervals` (and repeated `kickPolls`) actually the thing
+    // doing the polling, the way the rest of this test relies on.
+    await expect(async () => {
+      await kickPolls(page);
+      await expect(paused).toBeVisible({ timeout: 200 });
+      await expect(countdown).toHaveText(
+        new RegExp(`^Auto-resume in \\d:\\d\\d \\(1/${FX_AUTO_RESUME_MAX}\\)$`),
+        { timeout: 200 },
+      );
+      await expect(badge).toHaveText(/auto-resume \d:\d\d/, { timeout: 200 });
+    }).toPass({ timeout: 3_000, intervals: [30, 60, 100, 150] });
+    await expect(paused).toContainText("recovery paused after 3/3 attempts");
+    await expect(paused).toContainText("resume once the limit clears");
+    // The live (active-state) notice is mutually exclusive with the paused one.
+    await expect(notice).toHaveCount(0);
+    await expect(badge).toHaveAttribute("title", /recovery paused after 3\/3 attempts/);
+
+    // --- Cancel the pending auto-resume RIGHT NOW, before doing anything
+    // else — a product bug surfaced while writing this test: the badge and
+    // countdown assertions above resolve quickly (often within one
+    // `kickPolls` round-trip, since RunPanel's own live SSE state already
+    // knows the run is paused well before any poll fires), but the fixed
+    // ~2000ms `AGETOR_FX_AUTO_RESUME_DELAY_MS` window can already be more
+    // than half spent by the time this test reaches this point (opening the
+    // panel, waiting for a live "attempt" sentinel, then this block) — an
+    // earlier version of this test that clicked the Gateway link BEFORE
+    // cancelling hit exactly that: the auto-resume fired mid-click and
+    // detached the notice out from under Playwright ("element was detached
+    // from the DOM, retrying"), hanging for the full 30s test timeout. See
+    // this file's header comment. Cancelling here removes the race for
+    // every slower assertion that follows (the link click + toast, plus
+    // whatever the next test does with this same task).
+    // `handleCancelFxAutoResume` (RunPanel.tsx) only kicks the RUNS poll on
+    // success, not the parent App.tsx `/tasks` poll `task.fxRecovery` itself
+    // comes from — so this still needs its own `kickPolls` loop rather than
+    // a bare assertion.
+    await panel.getByTestId("fx-recovery-cancel-auto").click();
+    await expect(async () => {
+      await kickPolls(page);
+      await expect(countdown).toHaveCount(0, { timeout: 200 });
+    }).toPass({ timeout: 5_000, intervals: [100, 200, 300] });
+    await expect(panel.getByText("Auto-resume cancelled.", { exact: true })).toBeVisible();
+
+    // --- The Gateway URL inside the notice is a real, clickable link that
+    // hands off to the OS default browser (never in-app navigation) via
+    // `POST /open-external` — 501 in this headless harness (no native
+    // bridge), surfaced as an error toast rather than a silent no-op. Safe
+    // to do now (no more race): cancelling only clears the countdown line,
+    // the notice (and its link) stays up until Resume or a new message.
+    const urlBefore = page.url();
+    const openExternalRequested = page.waitForRequest(
+      (r) => new URL(r.url()).pathname === "/open-external" && r.method() === "POST",
+    );
+    await paused.getByRole("link", { name: GATEWAY_URL }).click();
+    await openExternalRequested;
+    await expect(page.getByText("not available in headless mode")).toBeVisible();
+    expect(page.url()).toBe(urlBefore);
   });
 
   test("after settlement: paused notice + Resume, persisted lines, run failed, task ready", async ({
@@ -291,10 +535,13 @@ test.describe("fx recovery", () => {
     const panel = await openTask(page, stormTaskTitle);
 
     // --- Paused notice + Resume affordance ----------------------------------
+    // The auto-resume timer was already cancelled at the end of the previous
+    // test, so this state is stable — no race against the 2s auto-fire here.
     const paused = panel.getByTestId("fx-recovery-paused");
     await expect(paused).toBeVisible({ timeout: 10_000 });
     await expect(paused).toContainText("recovery paused after 3/3 attempts");
     await expect(paused).toContainText("resume once the limit clears");
+    await expect(panel.getByText("Auto-resume cancelled.", { exact: true })).toBeVisible();
 
     const resumeButton = panel.getByTestId("fx-recovery-resume");
     await expect(resumeButton).toBeVisible();
@@ -303,6 +550,8 @@ test.describe("fx recovery", () => {
     // The live (active-state) notice from the first test must be gone —
     // mutually exclusive with the paused notice.
     await expect(panel.getByTestId("fx-recovery-notice")).toHaveCount(0);
+    // No countdown any more — the schedule was cancelled.
+    await expect(panel.getByTestId("fx-recovery-countdown")).toHaveCount(0);
 
     // --- Persisted plain transcript lines (written once by the driver at
     // the terminal transition, distinct from the ephemeral notice widget
@@ -310,10 +559,16 @@ test.describe("fx recovery", () => {
     // since both come from the same `fxRecoverySummaryLine(payload)` call).
     await expect(panel.getByText(PAUSED_SUMMARY_LINE, { exact: true }).first()).toBeVisible();
     await expect(panel.getByText(REFUSED_STATUS_LINE, { exact: true })).toBeVisible();
+    await expect(panel.getByText("auto-resume cancelled", { exact: true })).toBeVisible();
 
     // --- The raw sentinel string must never render as transcript text ------
     // (`isInternalStatusSentinel` suppression, `shared/types.ts`).
     await expect(panel.getByText("fx-recovery:", { exact: false })).toHaveCount(0);
+
+    // --- Board badge reflects the cancelled (no-schedule) state: "paused",
+    // no countdown suffix.
+    const badge = taskCard(page, stormTaskTitle).getByTestId("fx-paused-badge");
+    await expect(badge).toHaveText("paused");
 
     // --- Server state: latest run failed, task back in Ready ---------------
     await expect(async () => {
@@ -323,6 +578,9 @@ test.describe("fx recovery", () => {
 
     const task = await getTask(request, backend, stormTaskId);
     expect(task.column).toBe("ready");
+    expect(task.fxRecovery?.state).toBe("paused");
+    expect(task.fxRecovery?.autoResume).toBeNull();
+    expect(task.fxRecovery?.autoResumeStopped).toBe("cancelled");
   });
 
   test("Resume: continues the same session with no new user bubble, and settles succeeded", async ({
@@ -368,7 +626,7 @@ test.describe("fx recovery", () => {
       const runs = await getRuns(request, backend, stormTaskId);
       expect(runs[0]?.id).not.toBe(runIdBefore);
       expect(runs[0]?.status).toBe("succeeded");
-    }).toPass({ timeout: 10_000 });
+    }).toPass({ timeout: 20_000 });
   });
 
   test("follow-up after resume: composer send settles a new run with no recovery notice", async ({
@@ -399,6 +657,258 @@ test.describe("fx recovery", () => {
 
     await expect(panel.getByTestId("fx-recovery-paused")).toHaveCount(0);
     await expect(panel.getByTestId("fx-recovery-notice")).toHaveCount(0);
+  });
+
+  test("auto-resume fires on its own, recovers, and clears the board badge", async ({ page, request, backend }) => {
+    const title = `fx-recovery-autofire-e2e ${randomUUID()}`;
+    const task = await createAndStartFakeFxRecoveryTask(request, backend, title);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+
+    const paused = panel.getByTestId("fx-recovery-paused");
+    await expect(paused).toBeVisible({ timeout: 10_000 });
+
+    const runsBefore = await getRuns(request, backend, task.id);
+    const pausedRunId = runsBefore[0]?.id;
+    expect(pausedRunId).toBeTruthy();
+
+    // Nothing is clicked here — `AGETOR_FX_AUTO_RESUME_DELAY_MS=2000`
+    // (e2e/fixtures.ts) means the orchestrator's own timer fires the resume.
+    // The opening status line on an auto-fired continue-recovery run is
+    // distinct from a manual one's (`turn.origin === "auto"` in
+    // `spawnFxRun`, orchestrator.ts).
+    await expect(
+      panel.getByText(`auto-resuming paused fx response (1/${FX_AUTO_RESUME_MAX})`, { exact: false }),
+    ).toBeVisible({ timeout: 8_000 });
+
+    // Transcript gains the recovered summary line + the assistant answer,
+    // same terminal shape as a manual Resume.
+    await expect(panel.getByText(RECOVERED_MESSAGE, { exact: true })).toBeVisible({ timeout: 10_000 });
+    await expect(panel.getByText(RECOVERED_ASSISTANT_TEXT, { exact: true })).toBeVisible();
+
+    // Paused notice is gone, and so is the board badge.
+    await expect(paused).toHaveCount(0);
+    await expect(async () => {
+      await kickPolls(page);
+      await expect(taskCard(page, title).getByTestId("fx-paused-badge")).toHaveCount(0, { timeout: 200 });
+    }).toPass({ timeout: 5_000, intervals: [100, 200, 300] });
+
+    // Server state: a NEW run id, settled succeeded; the fxRecovery row is
+    // cleared entirely (the chain recovered).
+    await expect(async () => {
+      const runs = await getRuns(request, backend, task.id);
+      expect(runs[0]?.id).not.toBe(pausedRunId);
+      expect(runs[0]?.status).toBe("succeeded");
+    }).toPass({ timeout: 10_000 });
+
+    const finalTask = await getTask(request, backend, task.id);
+    expect(finalTask.fxRecovery ?? null).toBeNull();
+  });
+
+  test("cancel via the paused notice, then Resume from the context menu", async ({ page, request, backend }) => {
+    const title = `fx-recovery-cancel-then-menu-e2e ${randomUUID()}`;
+    const task = await createFakeFxRecoveryTask(request, backend, title);
+
+    // Open the panel BEFORE starting — same reasoning as the live-notice
+    // test above: a fresh page load after starting would burn into the 2s
+    // AGETOR_FX_AUTO_RESUME_DELAY_MS window this test needs to click Cancel
+    // inside of.
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await startFakeFxRecoveryTask(request, backend, task.id);
+
+    // Combined loop (paused notice up AND countdown showing) for the same
+    // reason the live-notice test above does this: every extra `toPass`
+    // round-trip eats into the fixed ~2000ms budget before the auto-resume
+    // timer would fire on its own.
+    const paused = panel.getByTestId("fx-recovery-paused");
+    const countdown = panel.getByTestId("fx-recovery-countdown");
+    // Short inner timeouts (200ms) on every web-first assertion below — see
+    // the live-notice test's identical comment: without one, a still-false
+    // assertion retries internally for Playwright's default 5000ms before
+    // this outer loop even gets another `kickPolls`, which alone can blow
+    // the ~2000ms real budget.
+    await expect(async () => {
+      await kickPolls(page);
+      await expect(paused).toBeVisible({ timeout: 200 });
+      await expect(countdown).toBeVisible({ timeout: 200 });
+    }).toPass({ timeout: 3_500, intervals: [30, 60, 100, 150] });
+
+    await panel.getByTestId("fx-recovery-cancel-auto").click();
+    // `handleCancelFxAutoResume` only kicks the RUNS poll on success, not the
+    // parent App.tsx `/tasks` poll `task.fxRecovery` itself comes from.
+    await expect(async () => {
+      await kickPolls(page);
+      await expect(countdown).toHaveCount(0, { timeout: 200 });
+    }).toPass({ timeout: 5_000, intervals: [100, 200, 300] });
+    await expect(panel.getByText("Auto-resume cancelled.", { exact: true })).toBeVisible();
+    await expect(panel.getByText("auto-resume cancelled", { exact: true })).toBeVisible();
+
+    // Board badge: "paused", no countdown suffix.
+    const badge = taskCard(page, title).getByTestId("fx-paused-badge");
+    await expect(async () => {
+      await kickPolls(page);
+      await expect(badge).toHaveText("paused", { timeout: 200 });
+    }).toPass({ timeout: 3_000, intervals: [100, 200] });
+
+    // Server state confirms the cancel.
+    await expect(async () => {
+      const detail = await getTask(request, backend, task.id);
+      expect(detail.fxRecovery?.autoResumeStopped).toBe("cancelled");
+      expect(detail.fxRecovery?.autoResume).toBeNull();
+    }).toPass({ timeout: 3_000 });
+
+    // Close the run panel first — it covers the right ~35-45% of the board,
+    // and this card can sit directly underneath it, which would make the
+    // right-click below land on the panel instead (see `closeTaskPanel`'s
+    // doc comment: a real product discovery made writing this test).
+    await closeTaskPanel(page);
+
+    // Context menu: "Resume paused response" offered, "Cancel auto-resume"
+    // withheld (no schedule is pending any more).
+    await kickPolls(page);
+    await rightClickCard(page, title);
+    await expect(contextMenu(page)).toBeVisible();
+    await expect(menuItem(page, "resume-recovery")).toBeVisible();
+    await expect(menuItem(page, "cancel-auto-resume")).toHaveCount(0);
+
+    const runsBefore = await getRuns(request, backend, task.id);
+    const pausedRunId = runsBefore[0]?.id;
+
+    await menuItem(page, "resume-recovery").click();
+
+    // Resumes: a new run starts and recovers, same as a click on the
+    // notice's own Resume button — verified server-side (the panel is
+    // closed at this point, so there's no live transcript to read).
+    await expect(async () => {
+      const runs = await getRuns(request, backend, task.id);
+      expect(runs[0]?.id).not.toBe(pausedRunId);
+      expect(runs[0]?.status).toBe("succeeded");
+    }).toPass({ timeout: 10_000 });
+  });
+
+  test("context menu: Cancel auto-resume while the countdown is running", async ({ page, request, backend }) => {
+    const title = `fx-recovery-menu-cancel-e2e ${randomUUID()}`;
+    const task = await createFakeFxRecoveryTask(request, backend, title);
+
+    // No need to open the run panel this time — the context menu acts
+    // straight off the board card. `gotoApp` first so the board is already
+    // mounted (and polling) by the time the storm settles + schedules.
+    await gotoApp(page, backend.bootBase);
+    await startFakeFxRecoveryTask(request, backend, task.id);
+
+    // Wait for the BOARD's own (client-side) copy of `task.fxRecovery` to
+    // have caught up with the server-armed schedule — `buildTaskContextMenu`
+    // (task-context-menu.ts) builds its entries from App.tsx's polled
+    // `tasks` snapshot, so right-clicking before that snapshot refreshes
+    // would build a menu missing "Cancel auto-resume" even though the
+    // server-side schedule already exists. The badge showing the countdown
+    // pattern is a visible proxy for "the frontend's copy is fresh".
+    const badge = taskCard(page, title).getByTestId("fx-paused-badge");
+    await expect(async () => {
+      await kickPolls(page);
+      await expect(badge).toHaveText(/auto-resume \d:\d\d/, { timeout: 200 });
+    }).toPass({ timeout: 3_500, intervals: [30, 60, 100, 150] });
+
+    await rightClickCard(page, title);
+    await expect(contextMenu(page)).toBeVisible();
+    await expect(menuItem(page, "cancel-auto-resume")).toBeVisible();
+
+    await menuItem(page, "cancel-auto-resume").click();
+
+    await expect(async () => {
+      await kickPolls(page);
+      await expect(badge).toHaveText("paused", { timeout: 200 });
+    }).toPass({ timeout: 3_000, intervals: [100, 200] });
+
+    await expect(async () => {
+      const detail = await getTask(request, backend, task.id);
+      expect(detail.fxRecovery?.autoResumeStopped).toBe("cancelled");
+      expect(detail.fxRecovery?.autoResume).toBeNull();
+    }).toPass({ timeout: 3_000 });
+  });
+
+  test("Settings → General: fx auto-resume toggle and delay round-trip through preferences", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openSettingsGeneral(page);
+
+    const toggle = dialog.getByTestId("settings-fx-auto-resume");
+    await expect(toggle).toBeChecked(); // on by default — no earlier test in this worker wrote either pref key.
+
+    // Set the delay while the switch is ON — SettingsDialog.tsx disables the
+    // input while auto-resume is off, so this has to happen before toggling
+    // off below.
+    const delayInput = dialog.getByTestId("settings-fx-auto-resume-delay");
+    await expect(delayInput).toBeEnabled();
+    await delayInput.fill("45");
+    await delayInput.blur();
+    await expect(async () => {
+      const prefs = await getPreferences(request, backend);
+      expect(prefs[FX_AUTO_RESUME_DELAY_PREF]).toBe("45");
+    }).toPass({ timeout: 5_000 });
+
+    await toggle.click();
+    await expect(toggle).not.toBeChecked();
+    await expect(delayInput).toBeDisabled();
+    await expect(async () => {
+      const prefs = await getPreferences(request, backend);
+      expect(prefs[FX_AUTO_RESUME_PREF]).toBe("off");
+    }).toPass({ timeout: 5_000 });
+
+    // Restore: back on, delay back to the 120s default — this worker's
+    // backend is shared by every test in this file.
+    await toggle.click();
+    await expect(toggle).toBeChecked();
+    await expect(delayInput).toBeEnabled();
+    await delayInput.fill("120");
+    await delayInput.blur();
+    await expect(async () => {
+      const prefs = await getPreferences(request, backend);
+      expect(prefs[FX_AUTO_RESUME_PREF]).toBe("on");
+      expect(prefs[FX_AUTO_RESUME_DELAY_PREF]).toBe("120");
+    }).toPass({ timeout: 5_000 });
+  });
+
+  test("Task details: a null-mode fx task shows 'Full access' (yolo) in the Mode dropdown", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = `fx-recovery-null-mode-api-e2e ${randomUUID()}`;
+    const createRes = await request.post(`${backend.apiBase}/tasks`, {
+      headers: authHeaders(backend),
+      // No `mode` field at all — `createTask` stores `null` verbatim (plan
+      // §3.6: the "Full access"/yolo resolution happens at spawn time and at
+      // display time via `defaultModeFor`, never at create time).
+      data: { title, prompt: title, agent: "fx", isolation: "none", workdir: tmpdir() },
+    });
+    expect(createRes.ok(), `POST /tasks -> ${createRes.status()}: ${await createRes.text()}`).toBeTruthy();
+    const task = (await createRes.json()) as TaskDetail;
+    createdTaskIds.push(task.id);
+    expect(task.mode).toBeNull();
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+
+    // "Task details" is a native <details>/<summary> — collapsed by default.
+    await panel.getByText("Task details", { exact: true }).click();
+
+    // "Mode" (exact) is the <dt> label; its value lives in the immediately
+    // following <dd>'s <select> — mirrors the New Task form test below's
+    // xpath-sibling pattern, adapted for a dt/dd pair instead of a
+    // label/button pair.
+    const modeSelect = panel
+      .getByText("Mode", { exact: true })
+      .locator("xpath=following-sibling::dd[1]//select");
+    await expect(modeSelect).toBeVisible();
+    await expect(modeSelect).toHaveValue("yolo");
+    const label = await modeSelect.evaluate((el) => (el as HTMLSelectElement).selectedOptions[0]?.textContent);
+    expect(label).toBe("Full access");
   });
 
   test("New Task form: fx's mode picker defaults to 'Full access' (yolo) with no selection", async ({

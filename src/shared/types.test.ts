@@ -5,15 +5,18 @@ import {
   CODE_PLAN_MODE,
   CURSOR_MODEL_SPECS,
   DEFAULT_MODEL,
+  FX_AUTO_RESUME_MAX,
   FX_PROVIDER_STATUS_PREFIX,
   FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   MODEL_EFFORT_SUPPORT,
   PERMISSION_MODE_STATUS_PREFIX,
+  defaultModeFor,
   isInternalStatusSentinel,
   supportedModes,
   type AgentKind,
+  type GlobalEvent,
 } from "./types.ts";
 
 /* ── isInternalStatusSentinel ────────────────────────────────────────────── */
@@ -324,4 +327,86 @@ test("cursor picker lists Gemini Flash newest-first: 3.8 before 3.7 before 3.6",
     expect(spec?.fastId).toBeUndefined();
     expect(spec?.supportsMaxMode).toBeUndefined();
   }
+});
+
+/* ── defaultModeFor (docs/plans/fx-recovery-follow-ups.md §3.6) ─────────── */
+
+test("defaultModeFor: auto for every AgentKind except fx, which is yolo (Full access)", () => {
+  for (const kind of KINDS) {
+    expect(defaultModeFor(kind)).toBe(kind === "fx" ? "yolo" : "auto");
+  }
+  // Explicit, non-loop pins so a future kind added to the union can't
+  // silently change fx's own expectation without this test noticing.
+  expect(defaultModeFor("claude-code")).toBe("auto");
+  expect(defaultModeFor("codex")).toBe("auto");
+  expect(defaultModeFor("cursor")).toBe("auto");
+  expect(defaultModeFor("gemini")).toBe("auto");
+  expect(defaultModeFor("fx")).toBe("yolo");
+});
+
+test("defaultModeFor: always equals AGENT_OPTIONS[kind].modes[0].id — the single source of truth it's defined against", () => {
+  for (const kind of KINDS) {
+    const modesFirstId = AGENT_OPTIONS[kind].modes[0]?.id;
+    expect(modesFirstId).toBeDefined();
+    expect(defaultModeFor(kind)).toBe(modesFirstId as string);
+  }
+});
+
+/* ── GlobalEvent discriminated union — "fx-auto-resume" kind ────────────── */
+
+// Compile-time exhaustiveness guard: if a new GlobalEvent.kind is ever added
+// without a case here, `bun run typecheck` fails at the `default` branch
+// below (assertNever's `never` parameter rejects anything still assignable).
+// This is what proves the new "fx-auto-resume" kind — and every existing one
+// — type-checks cleanly in a discriminated switch, not just that an object
+// literal happens to satisfy the union.
+function assertNever(x: never): never {
+  throw new Error(`unhandled GlobalEvent kind: ${JSON.stringify(x)}`);
+}
+
+function describeGlobalEvent(event: GlobalEvent): string {
+  switch (event.kind) {
+    case "run-status":
+      return `run-status:${event.status}`;
+    case "column":
+      return `column:${event.column}`;
+    case "update":
+      return `update:${event.status}`;
+    case "interaction":
+      return `interaction:${event.state}`;
+    case "files-sent":
+      return `files-sent:${event.count}`;
+    case "fx-auto-resume":
+      return `fx-auto-resume:${event.state}`;
+    default:
+      return assertNever(event);
+  }
+}
+
+test("GlobalEvent: the \"fx-auto-resume\" kind type-checks in a discriminated switch alongside every other kind", () => {
+  const scheduled: GlobalEvent = {
+    kind: "fx-auto-resume",
+    taskId: "t1",
+    state: "scheduled",
+    at: Date.now() + 120_000,
+    attempt: 1,
+    max: FX_AUTO_RESUME_MAX,
+    ts: Date.now(),
+  };
+  expect(describeGlobalEvent(scheduled)).toBe("fx-auto-resume:scheduled");
+
+  // Every documented state value round-trips through the same switch with no
+  // cast required — `at` is intentionally omitted here (it's only present
+  // for `state: "scheduled"`), matching the field's own doc comment.
+  for (const state of ["scheduled", "fired", "cancelled", "exhausted", "disabled"] as const) {
+    const event: GlobalEvent = { kind: "fx-auto-resume", taskId: "t1", state, attempt: 1, max: FX_AUTO_RESUME_MAX, ts: 0 };
+    expect(describeGlobalEvent(event)).toBe(`fx-auto-resume:${state}`);
+  }
+
+  // Sanity: a couple of the pre-existing kinds still route through the same
+  // switch correctly, proving the new case was added without disturbing it.
+  expect(describeGlobalEvent({ kind: "run-status", taskId: "t1", runId: "r1", status: "succeeded", ts: 0 }))
+    .toBe("run-status:succeeded");
+  expect(describeGlobalEvent({ kind: "files-sent", taskId: "t1", runId: "r1", count: 2, caption: null, proactive: false, ts: 0 }))
+    .toBe("files-sent:2");
 });

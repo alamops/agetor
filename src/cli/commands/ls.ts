@@ -102,7 +102,20 @@ export async function cmdLs(
  *  resumable fx pause with no auto-resume timer scheduled, or
  *  `⏸ auto m:ss` (cyan) counting down to the next automatic resume
  *  (`docs/plans/fx-recovery-follow-ups.md` §2). Joined with a space when
- *  both apply. */
+ *  both apply.
+ *
+ *  Code-review check (the `⏸` double-width-glyph finding that required a
+ *  `pauseW` fix in Dashboard.tsx's `TaskRow`): `table()` (`output.ts`) pads
+ *  every column to `visibleLen` (a plain, non-wcwidth-aware `.length`), so
+ *  it under-measures this glyph by one cell too — but unlike the TUI's
+ *  fixed-width, `wrap="truncate"` row, `cmdLs`'s "needs" column is BOTH (a)
+ *  the table's last column, whose padding `table()`'s `fmt()` immediately
+ *  `.trimEnd()`s away, and (b) never consulted when budgeting the "title"
+ *  column (`truncate(t.title, 44)` above is a fixed, needs-independent
+ *  constant). So the same off-by-one has nothing to overflow into here — no
+ *  column-width accounting change was needed; `ls.test.ts` pins this
+ *  (alignment across rows holds, and a hint-bearing row's `⏸` is never cut
+ *  short). */
 function needsCell(t: Task): string {
   const parts: string[] = [];
   if (t.pendingInteractionCount > 0) parts.push(c.yellow(`! ${t.pendingInteractionCount}`));

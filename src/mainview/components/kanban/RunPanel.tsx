@@ -4634,7 +4634,7 @@ function RunEventList({
           // new sentinel can't leak into one surface while another
           // suppresses it.
           if (isInternalStatusSentinel(e.data)) return [];
-          return [wrap(key, evid, <StatusDivider text={renderLinkified(e.data)} />)];
+          return [wrap(key, evid, <StatusDivider text={e.data} />)];
         case "stderr":
           return [wrap(key, evid, <ErrorBlock text={e.data} />)];
         case "stdout":
@@ -4896,7 +4896,9 @@ function PausedRecoveryNotice({
             ? `Auto-resume gave up after ${FX_AUTO_RESUME_MAX} attempts.`
             : stopped === "cancelled"
               ? "Auto-resume cancelled."
-              : "Auto-resume disabled in Settings."}
+              : stopped === "failed"
+                ? "Auto-resume could not start — resume manually."
+                : "Auto-resume disabled in Settings."}
         </span>
       )}
     </div>
@@ -5248,16 +5250,22 @@ const ErrorBlock = memo(function ErrorBlock({ text }: { text: string }) {
   );
 });
 
-// `text` is `React.ReactNode`, not `string` — the call site passes
-// `renderLinkified(e.data)` so a status line carrying a bare URL (e.g. an
-// fx recovery/auto-resume line) renders it as a clickable `ExternalLink`;
-// `renderLinkified` returns the identical string unchanged when there's no
-// URL, so every other status line is byte-for-byte what rendered before.
-const StatusDivider = memo(function StatusDivider({ text }: { text: React.ReactNode }) {
+// `text` stays a plain `string` prop (not the `renderLinkified` output)
+// specifically so `memo`'s default shallow comparator actually catches a
+// same-text rerender: `renderLinkified` returns a freshly allocated array
+// whenever it finds a link, so passing its result as the prop would hand
+// this component a new-identity node on every parent render and defeat the
+// memo outright. Linkifying happens INSIDE the component instead, via
+// `useMemo` keyed on `text`, so a status line carrying a bare URL (e.g. an
+// fx recovery/auto-resume line) still renders it as a clickable
+// `ExternalLink`, and a no-URL line still renders the identical text node
+// across rerenders.
+const StatusDivider = memo(function StatusDivider({ text }: { text: string }) {
+  const content = useMemo(() => renderLinkified(text), [text]);
   return (
     <div className="flex items-center gap-2 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
       <span className="h-px flex-1 bg-border" />
-      <span>{text}</span>
+      <span>{content}</span>
       <span className="h-px flex-1 bg-border" />
     </div>
   );
@@ -6092,7 +6100,18 @@ function TaskDetails({
   // per the owner's explicit call in `docs/plans/fx-recovery-follow-ups.md`
   // §3.6, a null-mode fx row now spawns (and this dropdown shows) "Full
   // access", not "auto", superseding the earlier no-silent-escalation rule.
-  const nullModeFallback = defaultModeFor(kind);
+  //
+  // `defaultModeFor(kind)` is a kind-wide default and doesn't know about
+  // per-model mode denials (`MODEL_MODE_DENY`) — `modeOptions` above already
+  // filtered those out. Every deny list is empty today, so this guard is
+  // latent, but the <Select> below must never be handed a value with no
+  // matching <option>, so fall back to the first still-offered mode (or, in
+  // the pathological all-denied case, a hardcoded safe default) rather than
+  // trusting the kind-wide default blindly.
+  const preferred = defaultModeFor(kind);
+  const nullModeFallback = modeOptions.some((m) => m.id === preferred)
+    ? preferred
+    : (modeOptions[0]?.id ?? "bypass");
 
   return (
     <details className="border-b border-border/60 px-3 py-2 text-xs">

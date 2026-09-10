@@ -241,10 +241,10 @@ export function latestFxRecoveryByRun(
   return out;
 }
 
-/** The three values `TaskFxRecovery.autoResumeStopped` can take, as one
+/** The four values `TaskFxRecovery.autoResumeStopped` can take, as one
  *  tuple both the parser below and any caller that wants to validate a
  *  reason id can share — same pattern as `FX_RECOVERY_STATES` above. */
-const AUTO_RESUME_STOPPED_REASONS = ["exhausted", "cancelled", "disabled"] as const;
+const AUTO_RESUME_STOPPED_REASONS = ["exhausted", "cancelled", "disabled", "failed"] as const;
 
 function isFiniteNumber(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v);
@@ -279,7 +279,7 @@ function parseAutoResume(raw: unknown): TaskFxRecovery["autoResume"] {
  * kept independently, `autoResume` is parsed via {@link parseAutoResume}
  * (kept only when fully well-typed, else `null`), `autoResumeCount` defaults
  * to `0` unless it's a finite non-negative integer, and `autoResumeStopped`
- * is kept only when it is one of the three known reason strings.
+ * is kept only when it is one of the four known reason strings.
  */
 export function parseTaskFxRecovery(json: string | null | undefined): TaskFxRecovery | null {
   if (!json) return null;
@@ -325,12 +325,20 @@ export function parseTaskFxRecovery(json: string | null | undefined): TaskFxReco
   return out;
 }
 
+/** Values (after trimming + lower-casing) that disable auto-resume — see
+ *  {@link parseFxAutoResumePrefs}. `usage.ts`'s user-facing help text still
+ *  advertises just `on|off`; the extra synonyms are accepted so a value a
+ *  user might reasonably type by hand (or hand-edit into the sqlite row)
+ *  behaves the same as `"off"` rather than silently reading as enabled. */
+const AUTO_RESUME_DISABLED_VALUES = new Set(["off", "false", "0", "no"]);
+
 /**
  * Parse the two `fxAutoResume*` preference values (opaque strings from the
  * generic `preferences` k/v store, see `db.ts`) into their typed form.
- *  - `enabled` is `false` ONLY when `prefs[FX_AUTO_RESUME_PREF]` is the
- *    string `"off"` after trimming and lower-casing — anything else
- *    (missing, `"on"`, garbage) reads as enabled, matching the "on by
+ *  - `enabled` is `false` when `prefs[FX_AUTO_RESUME_PREF]`, trimmed and
+ *    lower-cased, is one of {@link AUTO_RESUME_DISABLED_VALUES} (`"off"`,
+ *    `"false"`, `"0"`, `"no"`) — anything else (missing, `"on"`, `"1"`,
+ *    `"true"`, `"yes"`, garbage) reads as enabled, matching the "on by
  *    default" decision in the plan.
  *  - `delaySec` is `prefs[FX_AUTO_RESUME_DELAY_PREF]` parsed as an integer
  *    and clamped to `[FX_AUTO_RESUME_MIN_DELAY_SEC,
@@ -340,7 +348,7 @@ export function parseTaskFxRecovery(json: string | null | undefined): TaskFxReco
  */
 export function parseFxAutoResumePrefs(prefs: Record<string, string>): { enabled: boolean; delaySec: number } {
   const rawEnabled = prefs[FX_AUTO_RESUME_PREF];
-  const enabled = typeof rawEnabled === "string" ? rawEnabled.trim().toLowerCase() !== "off" : true;
+  const enabled = typeof rawEnabled === "string" ? !AUTO_RESUME_DISABLED_VALUES.has(rawEnabled.trim().toLowerCase()) : true;
 
   const rawDelay = prefs[FX_AUTO_RESUME_DELAY_PREF];
   const parsedDelay = typeof rawDelay === "string" ? Number.parseInt(rawDelay, 10) : NaN;

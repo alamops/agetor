@@ -1,13 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
+  fxAutoResumeCountdownText,
   fxRecoveryNoticeText,
   fxRecoverySummaryLine,
   isFxRecoveryResumable,
+  isTaskFxPaused,
   latestFxRecoveryByRun,
+  parseFxAutoResumePrefs,
   parseFxRecoveryMeta,
   parseFxRecoveryPayload,
+  parseTaskFxRecovery,
 } from "./fx-recovery.ts";
-import { FX_RECOVERY_STATUS_PREFIX, type FxRecoveryPayload } from "./types.ts";
+import { FX_RECOVERY_STATUS_PREFIX, type FxRecoveryPayload, type TaskFxRecovery } from "./types.ts";
 
 // --- parseFxRecoveryMeta -------------------------------------------------
 
@@ -450,5 +454,261 @@ describe("replayed marker (agetor's own stamp, never a wire field)", () => {
     ]);
     expect(latest.get("r2")).toEqual(paused);
     expect(isFxRecoveryResumable(latest.get("r2"))).toBe(true);
+  });
+});
+
+// --- parseTaskFxRecovery ----------------------------------------------------
+
+describe("parseTaskFxRecovery", () => {
+  test("null/undefined/empty string input yields null", () => {
+    expect(parseTaskFxRecovery(null)).toBeNull();
+    expect(parseTaskFxRecovery(undefined)).toBeNull();
+    expect(parseTaskFxRecovery("")).toBeNull();
+  });
+
+  test("garbage JSON yields null", () => {
+    expect(parseTaskFxRecovery("{not valid json")).toBeNull();
+    expect(parseTaskFxRecovery("undefined")).toBeNull();
+  });
+
+  test("a JSON array or primitive (non-plain-object) yields null", () => {
+    expect(parseTaskFxRecovery("[1,2,3]")).toBeNull();
+    expect(parseTaskFxRecovery("42")).toBeNull();
+    expect(parseTaskFxRecovery('"hello"')).toBeNull();
+    expect(parseTaskFxRecovery("null")).toBeNull();
+    expect(parseTaskFxRecovery("true")).toBeNull();
+  });
+
+  test("a state other than \"paused\" (or a missing state) yields null", () => {
+    expect(parseTaskFxRecovery(JSON.stringify({ state: "active", runId: "r1", pausedAt: 1 }))).toBeNull();
+    expect(parseTaskFxRecovery(JSON.stringify({ state: "cleared", runId: "r1", pausedAt: 1 }))).toBeNull();
+    expect(parseTaskFxRecovery(JSON.stringify({ runId: "r1", pausedAt: 1 }))).toBeNull();
+  });
+
+  test("a missing, empty, or non-string runId yields null", () => {
+    expect(parseTaskFxRecovery(JSON.stringify({ state: "paused", pausedAt: 1 }))).toBeNull();
+    expect(parseTaskFxRecovery(JSON.stringify({ state: "paused", runId: "", pausedAt: 1 }))).toBeNull();
+    expect(parseTaskFxRecovery(JSON.stringify({ state: "paused", runId: 42, pausedAt: 1 }))).toBeNull();
+  });
+
+  test("a missing or non-finite pausedAt yields null", () => {
+    expect(parseTaskFxRecovery(JSON.stringify({ state: "paused", runId: "r1" }))).toBeNull();
+    expect(parseTaskFxRecovery(JSON.stringify({ state: "paused", runId: "r1", pausedAt: "soon" }))).toBeNull();
+    expect(parseTaskFxRecovery(JSON.stringify({ state: "paused", runId: "r1", pausedAt: null }))).toBeNull();
+  });
+
+  test("full round-trip with an active auto-resume schedule and every descriptive field populated", () => {
+    const full: TaskFxRecovery = {
+      state: "paused",
+      runId: "run-42",
+      pausedAt: 1_700_000_000_000,
+      cause: "rate_limited",
+      attempt: 10,
+      attemptLimit: 10,
+      message: "⚠ Rate limited · HTTP 429 · … · recovery paused after 10/10 attempts",
+      autoResume: { at: 1_700_000_120_000, attempt: 1, max: 3, delaySec: 120 },
+      autoResumeCount: 1,
+    };
+    expect(parseTaskFxRecovery(JSON.stringify(full))).toEqual(full);
+  });
+
+  test("full round-trip with no pending timer and an autoResumeStopped reason set", () => {
+    const stopped: TaskFxRecovery = {
+      state: "paused",
+      runId: "run-7",
+      pausedAt: 5000,
+      autoResume: null,
+      autoResumeCount: 3,
+      autoResumeStopped: "exhausted",
+    };
+    expect(parseTaskFxRecovery(JSON.stringify(stopped))).toEqual(stopped);
+  });
+
+  test("a partially-typed autoResume sub-object is dropped to null wholesale, not partially trusted", () => {
+    const missingDelaySec = JSON.stringify({
+      state: "paused",
+      runId: "r1",
+      pausedAt: 1,
+      autoResume: { at: 100, attempt: 1, max: 3 }, // delaySec missing
+    });
+    expect(parseTaskFxRecovery(missingDelaySec)?.autoResume).toBeNull();
+
+    const wrongFieldType = JSON.stringify({
+      state: "paused",
+      runId: "r1",
+      pausedAt: 1,
+      autoResume: { at: "soon", attempt: 1, max: 3, delaySec: 120 },
+    });
+    expect(parseTaskFxRecovery(wrongFieldType)?.autoResume).toBeNull();
+
+    const notAnObject = JSON.stringify({ state: "paused", runId: "r1", pausedAt: 1, autoResume: "none" });
+    expect(parseTaskFxRecovery(notAnObject)?.autoResume).toBeNull();
+
+    const missingEntirely = JSON.stringify({ state: "paused", runId: "r1", pausedAt: 1 });
+    expect(parseTaskFxRecovery(missingEntirely)?.autoResume).toBeNull();
+  });
+
+  test("autoResumeCount defaults to 0 when missing, negative, non-integer, or wrong-typed — a valid non-negative integer is kept", () => {
+    const base = { state: "paused", runId: "r1", pausedAt: 1 };
+    expect(parseTaskFxRecovery(JSON.stringify(base))?.autoResumeCount).toBe(0); // missing
+    expect(parseTaskFxRecovery(JSON.stringify({ ...base, autoResumeCount: -1 }))?.autoResumeCount).toBe(0); // negative
+    expect(parseTaskFxRecovery(JSON.stringify({ ...base, autoResumeCount: 1.5 }))?.autoResumeCount).toBe(0); // non-integer
+    expect(parseTaskFxRecovery(JSON.stringify({ ...base, autoResumeCount: "2" }))?.autoResumeCount).toBe(0); // wrong type
+    expect(parseTaskFxRecovery(JSON.stringify({ ...base, autoResumeCount: Number.NaN }))?.autoResumeCount).toBe(0); // non-finite
+    expect(parseTaskFxRecovery(JSON.stringify({ ...base, autoResumeCount: 2 }))?.autoResumeCount).toBe(2); // valid, sanity check
+    expect(parseTaskFxRecovery(JSON.stringify({ ...base, autoResumeCount: 0 }))?.autoResumeCount).toBe(0); // valid zero
+  });
+
+  test("an invalid autoResumeStopped reason is dropped, leaving the property entirely absent", () => {
+    const base = { state: "paused", runId: "r1", pausedAt: 1, autoResumeStopped: "bogus" };
+    const result = parseTaskFxRecovery(JSON.stringify(base));
+    expect(result).not.toBeNull();
+    expect(result?.autoResumeStopped).toBeUndefined();
+    expect(result && "autoResumeStopped" in result).toBe(false);
+  });
+
+  test("each of the four valid autoResumeStopped reasons is kept verbatim", () => {
+    for (const reason of ["exhausted", "cancelled", "disabled", "failed"] as const) {
+      const json = JSON.stringify({ state: "paused", runId: "r1", pausedAt: 1, autoResumeStopped: reason });
+      expect(parseTaskFxRecovery(json)?.autoResumeStopped).toBe(reason);
+    }
+  });
+
+  test("full round-trip with autoResumeStopped: \"failed\" — a fired auto-resume that could not start", () => {
+    const failed: TaskFxRecovery = {
+      state: "paused",
+      runId: "run-9",
+      pausedAt: 6000,
+      autoResume: null,
+      autoResumeCount: 2,
+      autoResumeStopped: "failed",
+    };
+    expect(parseTaskFxRecovery(JSON.stringify(failed))).toEqual(failed);
+  });
+});
+
+// --- parseFxAutoResumePrefs --------------------------------------------------
+
+describe("parseFxAutoResumePrefs", () => {
+  test("missing preferences default to enabled with the 120 s default delay", () => {
+    expect(parseFxAutoResumePrefs({})).toEqual({ enabled: true, delaySec: 120 });
+  });
+
+  test('"off" (and case/whitespace variants) disables auto-resume', () => {
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "off" }).enabled).toBe(false);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "OFF " }).enabled).toBe(false);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "Off" }).enabled).toBe(false);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "  off  " }).enabled).toBe(false);
+  });
+
+  test('each of "false"/"0"/"no" (trimmed + lower-cased) also disables auto-resume', () => {
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "false" }).enabled).toBe(false);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "False" }).enabled).toBe(false);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "0" }).enabled).toBe(false);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "no" }).enabled).toBe(false);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "No" }).enabled).toBe(false);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: " No " }).enabled).toBe(false);
+  });
+
+  test('"on" and any non-disabling value read as enabled — including "1"/"true"/"yes"', () => {
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "on" }).enabled).toBe(true);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "garbage" }).enabled).toBe(true);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "" }).enabled).toBe(true);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "offline" }).enabled).toBe(true);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "1" }).enabled).toBe(true);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "true" }).enabled).toBe(true);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "yes" }).enabled).toBe(true);
+  });
+
+  test("delay clamps to [10, 3600]", () => {
+    expect(parseFxAutoResumePrefs({ fxAutoResumeDelaySec: "5" }).delaySec).toBe(10);
+    expect(parseFxAutoResumePrefs({ fxAutoResumeDelaySec: "0" }).delaySec).toBe(10);
+    expect(parseFxAutoResumePrefs({ fxAutoResumeDelaySec: "-5" }).delaySec).toBe(10);
+    expect(parseFxAutoResumePrefs({ fxAutoResumeDelaySec: "3600" }).delaySec).toBe(3600);
+    expect(parseFxAutoResumePrefs({ fxAutoResumeDelaySec: "99999" }).delaySec).toBe(3600);
+    expect(parseFxAutoResumePrefs({ fxAutoResumeDelaySec: "500" }).delaySec).toBe(500);
+  });
+
+  test('"abc"/""/"12.7" fall back to the implemented rule: unparsable strings default to 120, but Number.parseInt floors a decimal string rather than rejecting it', () => {
+    expect(parseFxAutoResumePrefs({ fxAutoResumeDelaySec: "abc" }).delaySec).toBe(120);
+    expect(parseFxAutoResumePrefs({ fxAutoResumeDelaySec: "" }).delaySec).toBe(120);
+    // Number.parseInt("12.7", 10) === 12 (parses the leading digit run and stops
+    // at the decimal point) — a *finite* result, so it is clamped like any
+    // other parsed value rather than falling back to the 120 s default.
+    expect(parseFxAutoResumePrefs({ fxAutoResumeDelaySec: "12.7" }).delaySec).toBe(12);
+  });
+
+  test("missing delay key falls back to the 120 s default independent of the enabled flag", () => {
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "off" }).delaySec).toBe(120);
+    expect(parseFxAutoResumePrefs({ fxAutoResume: "on" }).delaySec).toBe(120);
+  });
+});
+
+// --- fxAutoResumeCountdownText -----------------------------------------------
+
+describe("fxAutoResumeCountdownText", () => {
+  test('118 s remaining renders "1:58"', () => {
+    expect(fxAutoResumeCountdownText(118_000, 0)).toBe("1:58");
+  });
+
+  test('7 s remaining renders zero-padded seconds "0:07"', () => {
+    expect(fxAutoResumeCountdownText(7_000, 0)).toBe("0:07");
+  });
+
+  test('at === now renders "now"', () => {
+    expect(fxAutoResumeCountdownText(1000, 1000)).toBe("now");
+  });
+
+  test('at already in the past (negative remaining) renders "now", never a negative countdown', () => {
+    expect(fxAutoResumeCountdownText(1000, 5000)).toBe("now");
+    expect(fxAutoResumeCountdownText(0, 999_999)).toBe("now");
+  });
+
+  test("999 ms remaining rounds UP to 1 s rather than down to \"now\"", () => {
+    expect(fxAutoResumeCountdownText(999, 0)).toBe("0:01");
+  });
+
+  test("exactly 1000 ms remaining also renders \"0:01\" (ceil, not floor)", () => {
+    expect(fxAutoResumeCountdownText(1000, 0)).toBe("0:01");
+  });
+
+  test("a full minute renders \"1:00\"", () => {
+    expect(fxAutoResumeCountdownText(60_000, 0)).toBe("1:00");
+  });
+
+  test("minutes are not zero-padded but seconds always are", () => {
+    expect(fxAutoResumeCountdownText(200_000, 0)).toBe("3:20");
+  });
+});
+
+// --- isTaskFxPaused ----------------------------------------------------------
+
+describe("isTaskFxPaused", () => {
+  const pausedRecovery: TaskFxRecovery = {
+    state: "paused",
+    runId: "r1",
+    pausedAt: 1,
+    autoResume: null,
+    autoResumeCount: 0,
+  };
+
+  test("paused + a non-running column (e.g. ready) is true", () => {
+    expect(isTaskFxPaused({ fxRecovery: pausedRecovery, column: "ready" })).toBe(true);
+  });
+
+  test("paused + column running is false — a just-started resume must not still show the badge", () => {
+    expect(isTaskFxPaused({ fxRecovery: pausedRecovery, column: "running" })).toBe(false);
+  });
+
+  test("no fxRecovery (null, undefined, or absent) is always false", () => {
+    expect(isTaskFxPaused({ fxRecovery: null, column: "ready" })).toBe(false);
+    expect(isTaskFxPaused({ fxRecovery: undefined, column: "ready" })).toBe(false);
+    expect(isTaskFxPaused({ column: "ready" })).toBe(false);
+  });
+
+  test("paused is true across every non-running column value", () => {
+    for (const column of ["backlog", "ready", "review", "blocked", "done"]) {
+      expect(isTaskFxPaused({ fxRecovery: pausedRecovery, column })).toBe(true);
+    }
   });
 });

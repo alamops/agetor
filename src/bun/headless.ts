@@ -1,7 +1,7 @@
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN } from "./api-config.ts";
 import { db, dataDir, subagents } from "./db.ts";
-import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions } from "./orchestrator.ts";
+import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
 import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
@@ -101,6 +101,14 @@ function shutdown(reason: string, code = 0): void {
   // reaping any live fx children — do it explicitly, before the rest of
   // teardown, rather than relying on fx-acp's handler to have done it.
   reapLiveFxProcs();
+  // Same reasoning for the auto-resume engine's in-memory timers (Phase 8
+  // review #7): `fxAutoResumeTimers` entries are `.unref()`'d so they never
+  // block a clean exit on their own, but stopping them explicitly here keeps
+  // shutdown from racing a timer that fires mid-teardown (spawning a new fx
+  // run against a process that's already tearing everything else down). Does
+  // not touch any persisted `fxRecovery` row — `rearmFxAutoResumes()` re-arms
+  // them from the DB on the next boot.
+  stopFxAutoResumeTimers();
   try {
     removeCoreCreds(dataDir);
   } catch {

@@ -1026,12 +1026,6 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
     return { error: `${harness.label} isn't logged in — ${status.authHelp ?? "run its login command"}` };
   }
 
-  // A fresh `startTask` (as opposed to `resumeFxRecovery`'s continue-recovery
-  // spawn) begins a brand-new turn, not a continuation of any pause — clear
-  // any leftover fx auto-resume schedule/row so it can't linger past the
-  // point it stopped being relevant (plan §3 T2 item 7).
-  if (harness.kind === "fx") clearFxRecovery(taskId);
-
   // Pass the branches other tasks have pinned. If materializing this task's
   // branch hits a create-time uniqueness race, the recovery re-pins to a name
   // that's free of both existing refs AND those not-yet-started pins.
@@ -1091,6 +1085,20 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
     const sha = await resolveRef(task.workdir, "HEAD");
     if (sha) tasks.update(taskId, { baseRef: sha });
   }
+
+  // A fresh `startTask` (as opposed to `resumeFxRecovery`'s continue-recovery
+  // spawn) begins a brand-new turn, not a continuation of any pause — clear
+  // any leftover fx auto-resume schedule/row so it can't linger past the
+  // point it stopped being relevant (plan §3 T2 item 7). Deliberately placed
+  // here, past every early `return { error }` above (harness availability,
+  // worktree prep, prompt budget) rather than at the top of the function
+  // (Phase 8 review #2): a pre-flight failure means no new turn ever started,
+  // so a paused row (and its still-resumable checkpoint / pending auto-resume
+  // timer) must survive an aborted Start — clearing it there would silently
+  // strand the user's only path back to the paused response. From this point
+  // on a run row WILL be inserted below, so the old pause is genuinely
+  // superseded regardless of whether the spawn itself goes on to succeed.
+  if (harness.kind === "fx") clearFxRecovery(taskId);
 
   const runId = randomUUID();
   const now = Date.now();
@@ -1172,7 +1180,12 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
     runId,
     taskId,
     stream: "status",
-    data: `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? "auto"}`,
+    // A stored `null` mode doesn't spawn as a literal "auto" for every kind
+    // (Phase 8 review #3) — `buildCommand` resolves it via `defaultModeFor`,
+    // which is `yolo` for fx since `AGENT_OPTIONS.fx.modes[0]` is "Full
+    // access", not "auto". Mirror that same resolution here so the opening
+    // breadcrumb reports what actually launched.
+    data: `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
     ts: now,
   });
 
@@ -1909,7 +1922,7 @@ function attachDoneHandler(
       // 4), since a queued follow-up's own spawn is what actually clears the
       // row once it drains, and `recordFxPause` needs to see the queue as it
       // stands right now to decide whether to skip scheduling.
-      noteFxRunSettled(taskId, runId, newStatus);
+      noteFxRunSettled(task, runId, newStatus);
       // Spawn the next queued codex/cursor/gemini/fx follow-up, if any (no-op
       // for a task of a different kind).
       await drainCodexQueue(taskId);
@@ -1947,7 +1960,7 @@ function attachDoneHandler(
       }
       // fx-only settlement hook — see the matching call/comment in the
       // `.then` branch above.
-      noteFxRunSettled(taskId, runId, newStatus);
+      noteFxRunSettled(task, runId, newStatus);
       // Spawn the next queued codex/cursor/gemini/fx follow-up, if any (no-op
       // for a task of a different kind).
       await drainCodexQueue(taskId);
@@ -3677,22 +3690,42 @@ function latestResumableFxPause(taskId: string): { runId: string; payload: FxRec
  * row lifecycle) always sees this hook's decision land first. A no-op for
  * every non-fx task.
  *
+ * Takes the already-fetched `task` from the caller (Phase 8 review #4) rather
+ * than re-reading by id — `attachDoneHandler` already has it in scope at both
+ * call sites, and a second unconditional `tasks.get` here was a redundant
+ * query on every single run settlement, fx or not. The kind check below reads
+ * from that (possibly a beat stale by the time earlier settlement steps ran)
+ * object — `task.agent`/its harness kind cannot change mid-settlement, so
+ * staleness there is harmless. Freshness only actually matters for the
+ * decision that follows, so THAT re-reads explicitly, right where it's used.
+ *
  * Two outcomes: the run that just settled IS the task's latest resumable
  * pause (`newStatus === "failed"` and `latestResumableFxPause` names this
  * exact `runId`) → `recordFxPause` records/schedules it. Otherwise, if the
  * task was carrying a stale `fxRecovery` row from an earlier pause in this
- * chain, it's cleared — a run that recovered, or failed for an unrelated
- * reason, or succeeded outright, all end the chain the same way.
+ * chain, it's cleared via `clearFxRecovery` (not a bare `tasks.setFxRecovery(
+ * taskId, null)` — Phase 8 review #5: a bare DB clear left the in-memory
+ * `fxAutoResumeTimers` entry armed, so a run that settled for an unrelated
+ * reason while an auto-resume timer from an earlier pause was still pending
+ * could let that timer fire later against a row that no longer says
+ * `autoResume`, doing nothing useful but leaking the timer past this task's
+ * own settlement) — a run that recovered, or failed for an unrelated reason,
+ * or succeeded outright, all end the chain the same way.
  */
-function noteFxRunSettled(taskId: string, runId: string, newStatus: RunStatus): void {
-  const task = tasks.get(taskId);
+function noteFxRunSettled(task: Task | null, runId: string, newStatus: RunStatus): void {
   if (!task || resolveHarness(task.agent)?.kind !== "fx") return;
+  const taskId = task.id;
   const pause = newStatus === "failed" ? latestResumableFxPause(taskId) : null;
   if (pause && pause.runId === runId) {
     recordFxPause(taskId, runId, pause.payload);
-  } else if (task.fxRecovery != null) {
-    tasks.setFxRecovery(taskId, null);
+    return;
   }
+  // Freshness matters here: `task.fxRecovery` may already be behind by the
+  // time this runs (earlier settlement steps in the same handler — column
+  // update, plan detection — could have touched the row), so re-read before
+  // deciding whether a stale row needs clearing.
+  const fresh = tasks.get(taskId);
+  if (fresh?.fxRecovery != null) clearFxRecovery(taskId);
 }
 
 /**
@@ -3707,6 +3740,23 @@ function noteFxRunSettled(taskId: string, runId: string, newStatus: RunStatus): 
  * rather than resetting to 0 (only a full `clearFxRecovery` — a normal turn,
  * recovery, archive/delete/switch — resets the count, by clearing the row
  * entirely).
+ *
+ * `attempt` convention (Phase 8 review #6) — every `fx-auto-resume`
+ * `GlobalEvent` and every `TaskFxRecovery.autoResume` row carries an
+ * `attempt` field, but what it COUNTS differs by state, so read it against
+ * the state it's attached to, not in isolation:
+ *   - `scheduled` / `fired` → the ordinal of the attempt being armed (here)
+ *     or fired (`fireFxAutoResume`) — i.e. `autoResumeCount + 1` at the
+ *     moment the timer is set, echoed back unchanged when it fires.
+ *   - `disabled` → the ordinal that WOULD have been scheduled had the
+ *     preference been on (`autoResumeCount + 1`) — there is no real attempt
+ *     to number, so this reports what was skipped.
+ *   - `exhausted` → always `FX_AUTO_RESUME_MAX` (the cap itself, same value
+ *     as `max`), not `autoResumeCount` — the row only reaches this branch
+ *     once `autoResumeCount` has already climbed to the cap, so the two are
+ *     numerically identical today, but pinning it to the named constant
+ *     documents the intent ("we stopped AT the cap") instead of leaning on
+ *     an incidental equality between a counter and a constant.
  */
 function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload): void {
   const prev = tasks.get(taskId)?.fxRecovery ?? null;
@@ -3737,6 +3787,8 @@ function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload
 
   const prefs = fxAutoResumePrefs();
   if (!prefs.enabled) {
+    // `disabled`: the ordinal that would have run — see this function's
+    // "attempt convention" doc.
     const attempt = autoResumeCount + 1;
     tasks.setFxRecovery(taskId, { ...base, autoResumeStopped: "disabled" });
     appendFxStatusLine(taskId, runId, "auto-resume disabled in Settings — resume manually");
@@ -3755,7 +3807,9 @@ function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload
       kind: "fx-auto-resume",
       taskId,
       state: "exhausted",
-      attempt: autoResumeCount,
+      // `exhausted`: the cap itself, not `autoResumeCount` — see this
+      // function's "attempt convention" doc.
+      attempt: FX_AUTO_RESUME_MAX,
       max: FX_AUTO_RESUME_MAX,
       ts: Date.now(),
     });
@@ -3765,6 +3819,8 @@ function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload
   const { delayMs } = prefs;
   const at = Date.now() + delayMs;
   const delaySec = Math.round(delayMs / 1000);
+  // `scheduled`: the ordinal being armed — see this function's "attempt
+  // convention" doc.
   const attempt = autoResumeCount + 1;
   tasks.setFxRecovery(taskId, { ...base, autoResume: { at, attempt, max: FX_AUTO_RESUME_MAX, delaySec } });
   appendFxStatusLine(taskId, runId, `auto-resume scheduled in ${delaySec} s (${attempt}/${FX_AUTO_RESUME_MAX})`);
@@ -3782,6 +3838,14 @@ function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload
  * changed or nulled it), the task must not be archived, and no turn may
  * already be in flight — all of which can legitimately have changed in the
  * time between arming and firing.
+ *
+ * The `attempt` this emits/persists is "the ordinal being fired" — see the
+ * convention note on `recordFxPause`. If `resumeFxRecovery` itself rejects
+ * the attempt (a gate flipped between arming and firing, or the spawn threw),
+ * that's a genuine failure of THIS auto-resume attempt, not a user cancel —
+ * the row is marked `autoResumeStopped: "failed"` (not `"cancelled"`, which
+ * is reserved for an explicit user/Stop cancel via `cancelFxAutoResume`) so
+ * the notice/badge can tell the two apart.
  */
 async function fireFxAutoResume(taskId: string, at: number): Promise<void> {
   const task = tasks.get(taskId);
@@ -3799,7 +3863,7 @@ async function fireFxAutoResume(taskId: string, at: number): Promise<void> {
   if (!result.ok) {
     appendFxStatusLine(taskId, rec.runId, `auto-resume could not start: ${result.error}`);
     const latest = tasks.get(taskId)?.fxRecovery;
-    if (latest) tasks.setFxRecovery(taskId, { ...latest, autoResumeStopped: "cancelled" });
+    if (latest) tasks.setFxRecovery(taskId, { ...latest, autoResumeStopped: "failed" });
   }
 }
 
@@ -3819,6 +3883,15 @@ async function fireFxAutoResume(taskId: string, at: number): Promise<void> {
  * both call sites mean the same thing to the schedule itself ("no timer is
  * pending because the user acted"), it just documents at the call site
  * *which* user action did it.
+ *
+ * Cancel semantics (Phase 8 review #8): this only cancels the ONE pending
+ * timer — it is not a durable "never auto-resume this task again" switch. If
+ * the same pause chain later produces another failed-and-resumable run (e.g.
+ * a manual Resume that itself re-pauses), `recordFxPause` schedules again
+ * from scratch, same as it would after any other terminal reason
+ * (`exhausted`/`disabled`) clears. The Settings `fxAutoResume` preference is
+ * the actual off switch — toggling it off is what stops every future
+ * schedule from being armed at all, on this task and every other one.
  */
 export function cancelFxAutoResume(taskId: string, reason: "cancelled" | "stopped"): boolean {
   const rec = tasks.get(taskId)?.fxRecovery ?? null;
@@ -5681,8 +5754,16 @@ export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus |
  * wasn't) armed/cancelled without reaching into the DB row alone (the row
  * can be in the "scheduled" shape even in the brief window before/after the
  * in-memory timer is armed — see `recordFxPause`/`cancelFxAutoResume`).
+ *
+ * `noteFxRunSettled` is exposed too (Phase 8 review #5's regression test):
+ * every REAL spawn path that could reach it (startTaskInner, both of
+ * `spawnFxRun`'s row lifecycles) already disarms any still-pending
+ * auto-resume timer for the task before its own run can settle, so there is
+ * no way to drive "a run settles while an unrelated timer from an earlier
+ * pause is still armed" through the public API alone — calling the hook
+ * directly is the only deterministic way to exercise that branch.
  */
 function pendingFxAutoResume(taskId: string): boolean {
   return fxAutoResumeTimers.has(taskId);
 }
-export const __testing = { spawnFxRun, pendingFxAutoResume };
+export const __testing = { spawnFxRun, pendingFxAutoResume, noteFxRunSettled };

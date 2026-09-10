@@ -127,6 +127,104 @@ test("resumeFxRecovery: a 400 {error} response rejects with that message", async
   }
 }, 30_000);
 
+// `cancelFxAutoResume` (docs/plans/fx-recovery-follow-ups.md §3.4/T6) —
+// mirrors `resumeFxRecovery`'s two-test shape immediately above: a stub
+// `Bun.serve` pins the request METHOD/PATH/parse contract, a real daemon +
+// a genuine (non-paused) task pins the server's actual 400 error text.
+test("cancelFxAutoResume: issues DELETE /tasks/<url-encoded id>/fx-auto-resume with no body, and parses {ok:true}", async () => {
+  let captured: { method: string; pathname: string; contentType: string | null; body: string } | null = null;
+  const server = Bun.serve({
+    port: 0,
+    fetch: async (req) => {
+      const url = new URL(req.url);
+      captured = {
+        method: req.method,
+        pathname: url.pathname,
+        contentType: req.headers.get("content-type"),
+        body: await req.text(),
+      };
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  try {
+    const client = new AgetorClient({ port: server.port!, token: "tok" });
+    const res = await client.cancelFxAutoResume("t 1");
+    expect(res).toEqual({ ok: true });
+    expect(captured).not.toBeNull();
+    expect(captured!.method).toBe("DELETE");
+    // The space in the task id must be percent-encoded into the path — a raw
+    // space would produce an invalid request line.
+    expect(captured!.pathname).toBe("/tasks/t%201/fx-auto-resume");
+    // No body/content-type: `cancelFxAutoResume` calls `req()` with no third
+    // argument, so `AgetorClient`'s body-presence check (`body !== undefined`)
+    // must not synthesize an empty JSON body.
+    expect(captured!.contentType).toBeNull();
+    expect(captured!.body).toBe("");
+  } finally {
+    server.stop(true);
+  }
+});
+
+// A 400 `{error}` response — the shape the route (`server.ts`'s
+// `/tasks/:id/fx-auto-resume` DELETE handler) returns when
+// `cancelFxAutoResume(taskId, "cancelled")` finds no pending timer — rejects
+// as an `ApiError` carrying that exact message. Driven against a real daemon
+// + a genuine (non-fx, never-paused) task, so this is the server's real
+// error text, not a stub's guess — mirrors the `resumeFxRecovery` 400 test.
+test("cancelFxAutoResume: a 400 {error} response (no auto-resume pending) rejects with that message", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-fxcancel-"));
+  const core = await ensureCore({ dataDir: dir, port: 4497 });
+  const client = new AgetorClient(core);
+  try {
+    const t = await client.createTask({
+      title: "Not paused",
+      prompt: "p",
+      agent: "claude-code",
+      isolation: "none",
+      workdir: dir,
+    });
+
+    let err: unknown;
+    try {
+      await client.cancelFxAutoResume(t.id);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(400);
+    expect((err as ApiError).message).toBe("no auto-resume pending");
+  } finally {
+    await stopDaemon(dir);
+    for (let i = 0; i < 30 && existsSync(coreCredsPath(dir)); i++) {
+      await Bun.sleep(100);
+    }
+  }
+}, 30_000);
+
+// A 404 for an unknown task id — the route's other error branch (`!tasks.get(taskId)`).
+test("cancelFxAutoResume: a 404 response (unknown task id) rejects as ApiError with status 404", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-fxcancel404-"));
+  const core = await ensureCore({ dataDir: dir, port: 4498 });
+  const client = new AgetorClient(core);
+  try {
+    let err: unknown;
+    try {
+      await client.cancelFxAutoResume("does-not-exist");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(404);
+  } finally {
+    await stopDaemon(dir);
+    for (let i = 0; i < 30 && existsSync(coreCredsPath(dir)); i++) {
+      await Bun.sleep(100);
+    }
+  }
+}, 30_000);
+
 test("edit/move/archive/unarchive round-trip returns the bare Task", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-mng-"));
   const core = await ensureCore({ dataDir: dir, port: 4495 });

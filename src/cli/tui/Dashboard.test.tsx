@@ -388,7 +388,20 @@ test("event stream: fx-recovery — the detail pane shows only the LATEST active
 
 test("event stream: a resumable paused fx-recovery sentinel on the newest run shows the '⚠ paused — press r to resume' header hint when the task isn't running", async () => {
   onTaskEvents = null;
-  const taskA = task({ id: "taskA", column: "ready", runId: null, title: "A" });
+  // The header hint is now driven by the server-managed `task.fxRecovery`
+  // field (`isTaskFxPaused`), not by rescanning the event window for the
+  // newest run's recovery sentinel (see `Detail`'s `showResumeHint` in
+  // Dashboard.tsx and docs/plans/fx-recovery-follow-ups.md §3) — so the
+  // fixture itself must carry a paused row; pushing the raw sentinel event
+  // (still done below, exercising the transcript-rendering path too) is no
+  // longer what flips the hint on.
+  const taskA = task({
+    id: "taskA",
+    column: "ready",
+    runId: null,
+    title: "A",
+    fxRecovery: { state: "paused", runId: "runA", pausedAt: 1, autoResume: null, autoResumeCount: 0 },
+  });
   const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
 
   const { lastFrame, unmount } = render(
@@ -515,6 +528,307 @@ test("the 'r' key shows '! <message>' when resumeFxRecovery rejects", async () =
   // trailing "resume" too.
   const frame = flatten(lastFrame() ?? "");
   expect(frame).toContain("! no paused fx response to");
+  unmount();
+});
+
+// ── fx auto-resume: row hint, detail hint, 'x' cancels, clock tick
+// (docs/plans/fx-recovery-follow-ups.md §2/T6) ──────────────────────────────
+
+function pausedFxRecovery(
+  autoResume: { at: number; attempt: number; max: number; delaySec: number } | null = null,
+): NonNullable<Task["fxRecovery"]> {
+  return { state: "paused", runId: "runA", pausedAt: Date.now(), autoResume, autoResumeCount: 0 };
+}
+
+test("row hint: '⏸ paused (r)' for a resumable pause with no auto-resume timer pending", async () => {
+  const taskA = task({
+    id: "taskA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery(null),
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+
+  expect(lastFrame() ?? "").toContain("⏸ paused (r)");
+  unmount();
+});
+
+// A short id/title (rather than the 8-char ids most other tests here use) is
+// deliberate for the next two tests: the list/detail panes are narrow fixed-
+// width boxes, and the fuller auto-resume hint strings ("⏸ auto-resume m:ss",
+// "⏸ auto-resume in m:ss — r resumes now, x cancels") only render un-
+// truncated when the row's other fixed-width content (id, title, column) is
+// short enough to leave room — see `TaskRow`'s `titleMax` budget math and
+// `Detail`'s header `wrap="truncate"` in Dashboard.tsx. A longer id here
+// would ellipsis the very text under test.
+test("row hint: '⏸ auto-resume m:ss' while an auto-resume timer is pending", async () => {
+  const taskA = task({
+    id: "tA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery({ at: Date.now() + 65_000, attempt: 1, max: 3, delaySec: 120 }),
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+
+  expect(lastFrame() ?? "").toMatch(/⏸ auto-resume \d:\d\d/);
+  unmount();
+});
+
+// Code-review fix: `⏸` (U+23F8 PAUSE SYMBOL) renders double-width in most
+// terminals, but `pauseText.length` (a UTF-16 code-unit count) counted it as
+// 1 — TaskRow's `titleMax` budget (`inner - prefixW - badgeW - pauseW`)
+// therefore used to allow the title one character MORE than the row can
+// actually fit once the pause hint is present. This test pins the fixed
+// `pauseW` (`pauseText.length + 3 + 1`) by observing its effect on
+// `titleMax` directly: with the test harness's fixed `listWidth=34` (real
+// `process.stdout.columns` is `undefined` under `bun test`, so `cols` falls
+// back to 90 — see `Dashboard.tsx`'s `cols`/`listWidth` computation) and a
+// short id ("tA", matching the sibling tests' convention above) plus the
+// SHORT "⏸ paused (r)" pause text (the long "⏸ auto-resume m:ss" form
+// already floors titleMax at its 6-char minimum in both the old and new
+// budget, which would make this off-by-one invisible), the pre-fix budget
+// allowed a 20-char title to truncate to "ABCDEFG…" (8 chars, titleMax=8);
+// the fixed budget truncates it one character shorter, to "ABCDEF…"
+// (7 chars, titleMax=7) — proving the extra glyph-width cell was actually
+// subtracted from the title's room, not silently absorbed by the floor.
+test("row title budget: the pause hint's double-width ⏸ glyph costs the title exactly one more character of truncation room", async () => {
+  const taskA = task({
+    id: "tA", column: "ready", runId: null,
+    title: "ABCDEFGHIJKLMNOPQRST", // 20 chars — truncates under either budget
+    fxRecovery: pausedFxRecovery(null), // short form: "⏸ paused (r)"
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("⏸ paused (r)");
+  // Fixed budget (titleMax=7): "ABCDEF" + "…".
+  expect(frame).toContain("ABCDEF…");
+  // Pre-fix budget would have produced "ABCDEFG…" (titleMax=8) instead —
+  // that extra 7th letter must not appear immediately before the ellipsis.
+  expect(frame).not.toContain("ABCDEFG…");
+  unmount();
+});
+
+test("detail hint: '⏸ auto-resume in m:ss — r resumes now, x cancels' while a timer is pending, replacing the plain '⚠ paused' hint", async () => {
+  const taskA = task({
+    id: "tA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery({ at: Date.now() + 65_000, attempt: 1, max: 3, delaySec: 120 }),
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("⏸ auto-resume in");
+  expect(frame).toContain("— r resumes now, x cancels");
+  // The plain (no-timer) hint text must not also be showing.
+  expect(frame).not.toContain("⚠ paused — press r to resume");
+  unmount();
+});
+
+test("'x' on a task sitting on a pending fx auto-resume timer (not running) calls client.cancelFxAutoResume and shows '■ auto-resume cancelled <id8>'", async () => {
+  const taskA = task({
+    id: "taskAbcdefgh12345", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery({ at: Date.now() + 65_000, attempt: 1, max: 3, delaySec: 120 }),
+  });
+  const seenIds: string[] = [];
+  const client = {
+    listTasks: async () => [taskA],
+    cancelFxAutoResume: async (id: string) => {
+      seenIds.push(id);
+      return { ok: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("x");
+  await wait(80);
+
+  expect(seenIds).toEqual([taskA.id]);
+  // Same footer wrap/interleaving as the "r" key's resume-status tests above
+  // (see `flatten`'s doc comment): the status text ("■ auto-resume cancelled
+  // <id8>") is itself long enough to wrap onto a second footer line, so
+  // assert the two halves that each stay contiguous on their own physical
+  // line rather than the single joined phrase.
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("■ auto-resume cancelled");
+  expect(frame).toContain(taskA.id.slice(0, 8));
+  unmount();
+});
+
+test("'x' on a task with a pending fx auto-resume timer shows '! <message>' when cancelFxAutoResume rejects", async () => {
+  const taskA = task({
+    id: "taskA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery({ at: Date.now() + 65_000, attempt: 1, max: 3, delaySec: 120 }),
+  });
+  const client = {
+    listTasks: async () => [taskA],
+    cancelFxAutoResume: async () => {
+      throw new Error("no auto-resume pending");
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("x");
+  await wait(80);
+
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("! no auto-resume pending");
+  unmount();
+});
+
+test("'x' on a plain non-running task (no active run, no pending fx auto-resume) still shows 'task is not running'", async () => {
+  const taskA = task({ id: "taskA", column: "ready", runId: null, title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("x");
+  await wait(80);
+
+  expect(lastFrame() ?? "").toContain("task is not running");
+  unmount();
+});
+
+test("'x' on a paused fx task with NO pending auto-resume timer still shows 'task is not running' (the auto-resume-cancel branch only engages when a timer is actually pending)", async () => {
+  const taskA = task({
+    id: "taskA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery(null),
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("x");
+  await wait(80);
+
+  expect(lastFrame() ?? "").toContain("task is not running");
+  unmount();
+});
+
+test("clock tick: the '⏸ auto-resume m:ss' countdown ticks down across a ~1.1s wait while a timer is pending (useClockTick only arms while one is)", async () => {
+  // Short id (see the row/detail hint tests' comment above) so the full
+  // "m:ss" text is never truncated by the row's fixed-width budget.
+  const taskA = task({
+    id: "tA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery({ at: Date.now() + 5_000, attempt: 1, max: 3, delaySec: 120 }),
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+
+  const firstMatch = (lastFrame() ?? "").match(/⏸ auto-resume (\d+):(\d\d)/);
+  expect(firstMatch).not.toBeNull();
+  const firstSeconds = Number(firstMatch![1]) * 60 + Number(firstMatch![2]);
+
+  await wait(1100);
+
+  const secondMatch = (lastFrame() ?? "").match(/⏸ auto-resume (\d+):(\d\d)/);
+  expect(secondMatch).not.toBeNull();
+  const secondSeconds = Number(secondMatch![1]) * 60 + Number(secondMatch![2]);
+
+  expect(secondSeconds).toBeLessThan(firstSeconds);
+  unmount();
+});
+
+test("clock tick: the '⏸ paused (r)' row hint (no timer pending) is unchanged across a ~1.1s wait (no countdown to tick — useClockTick never arms with nothing pending)", async () => {
+  const taskA = task({
+    id: "taskA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery(null),
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  const first = lastFrame() ?? "";
+  expect(first).toContain("⏸ paused (r)");
+
+  await wait(1100);
+
+  const second = lastFrame() ?? "";
+  expect(second).toBe(first);
+  unmount();
+});
+
+// Code-review fix: `useClockTick`'s `now` used to seed once, at Dashboard's
+// own mount (`useState(() => Date.now())`), and only get refreshed by the
+// 1s interval — which only arms once `active` (here, `hasPendingAutoResume`)
+// goes true. A task that starts with no pending schedule and only picks one
+// up on a LATER poll therefore had its first countdown paint computed
+// against a `now` that was stale by however long that gap was, understating
+// the elapsed time and OVERstating the remaining countdown, until the
+// interval's own first tick corrected it up to a second later. The fix
+// reseeds `now` synchronously the moment `active` flips true, before the
+// interval is armed, so the very first paint is already accurate.
+test("clock tick: the first countdown paint after a LATER-arriving schedule reflects the moment it armed, not Dashboard's stale mount-time `now`", async () => {
+  let call = 0;
+  const client = {
+    listTasks: async () => {
+      call++;
+      // First poll (immediate, at mount): nothing pending yet — `now`'s
+      // `useState` initializer runs around this same instant.
+      if (call === 1) {
+        return [task({ id: "tA", column: "ready", runId: null, title: "A", fxRecovery: null })];
+      }
+      // Second poll fires on useTasks' fixed 1.5s interval — real wall-clock
+      // time has genuinely moved on by ~1.5s from the mount-time `now` seed
+      // by the time this schedule "appears" and `active` flips true.
+      return [
+        task({
+          id: "tA", column: "ready", runId: null, title: "A",
+          fxRecovery: pausedFxRecovery({ at: Date.now() + 5_000, attempt: 1, max: 3, delaySec: 120 }),
+        }),
+      ];
+    },
+  } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+
+  // Land after the second poll resolves (~1.5s in) but well before the
+  // countdown's own interval could have ticked even once (that only arms
+  // once `active` goes true, so its first correction lands ~1s AFTER that
+  // — i.e. not until ~2.5s in). This window is exactly where a stale `now`
+  // would still be showing, if it weren't reseeded on activation.
+  await wait(1700);
+
+  const frame = lastFrame() ?? "";
+  const match = frame.match(/⏸ auto-resume (\d+):(\d\d)/);
+  expect(match).not.toBeNull();
+  const remainingSec = Number(match![1]) * 60 + Number(match![2]);
+  // Correct (reseeded `now`): ~5s remaining. A stale mount-time `now` (~1.5s
+  // behind) would instead read ~7s — well outside this margin.
+  expect(remainingSec).toBeLessThanOrEqual(6);
   unmount();
 });
 

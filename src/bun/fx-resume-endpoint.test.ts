@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll, afterAll, afterEach } from "bun:test";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -13,6 +13,17 @@ process.env.AGETOR_DATA_DIR = DATA_DIR;
 // same rationale as orchestrator-fx.test.ts.
 process.env.AGETOR_FX_DRIVER = "fake";
 process.env.AGETOR_API_PORT = "4413";
+// Auto-resume timer hygiene (docs/plans/fx-recovery-follow-ups.md §3 T2 /
+// TT3) — same rationale and same override as orchestrator-fx.test.ts's
+// identical top-of-file comment: without this, a paused storm here arms a
+// REAL 120s in-memory timer that can fire mid-run inside a later, unrelated
+// test file sharing this same `bun test` process (confirmed empirically:
+// `bun:sqlite`/orchestrator.ts module singletons — and therefore the whole
+// DB and in-memory timer/active-run state — are shared across every test
+// file in one `bun test` invocation, not just within a file, since Bun's ES
+// module cache runs a module's top-level init code once per process and
+// every later `import` of the same path returns that same cached instance).
+process.env.AGETOR_FX_AUTO_RESUME_DELAY_MS = "300";
 
 // `checkHarness`'s fx-only availability probe additionally requires the
 // binary's `--help` output contain "coding agent" (disambiguating Vercel's
@@ -49,21 +60,35 @@ let token: string;
 let createTask: typeof import("./orchestrator.ts").createTask;
 let startTask: typeof import("./orchestrator.ts").startTask;
 let runs: typeof import("./db.ts").runs;
+let tasks: typeof import("./db.ts").tasks;
+let preferences: typeof import("./db.ts").preferences;
 let harnesses: typeof import("./db.ts").harnesses;
 let FAKE_FX_RECOVERY_PROMPT_MARKER: string;
+let FX_AUTO_RESUME_PREF: string;
 
 beforeAll(async () => {
   ({ createTask, startTask } = await import("./orchestrator.ts"));
-  ({ runs, harnesses } = await import("./db.ts"));
+  ({ runs, tasks, preferences, harnesses } = await import("./db.ts"));
   ({ FAKE_FX_RECOVERY_PROMPT_MARKER } = await import("./agents.ts"));
+  ({ FX_AUTO_RESUME_PREF } = await import("../shared/types.ts"));
   harnesses.setEnabled("fx", true);
   const { startApiServer, API_TOKEN } = await import("./server.ts");
   server = startApiServer() as unknown as { stop: () => void };
   token = API_TOKEN;
 });
 
-afterAll(() => {
+afterAll(async () => {
   server?.stop?.();
+  const { stopFxAutoResumeTimers } = await import("./orchestrator.ts");
+  stopFxAutoResumeTimers();
+});
+
+// Belt-and-braces per-test cleanup — see orchestrator-fx.test.ts's identical
+// afterEach comment for the full rationale. Never touches a persisted DB
+// row; tests that need a clean row do that themselves.
+afterEach(async () => {
+  const { stopFxAutoResumeTimers } = await import("./orchestrator.ts");
+  stopFxAutoResumeTimers();
 });
 
 async function settle(ms = 30) {
@@ -114,6 +139,16 @@ function fxResume(taskId: string): Promise<Response> {
   return fetch(`${BASE}/tasks/${taskId}/fx-resume`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+  });
+}
+
+/** `DELETE /tasks/:id/fx-auto-resume` — cancel a pending auto-resume
+ *  schedule (docs/plans/fx-recovery-follow-ups.md §3 T2 item 11). `auth`
+ *  defaults to a valid bearer token; pass `false` to omit it (401 test). */
+function fxAutoResumeDelete(taskId: string, auth = true): Promise<Response> {
+  return fetch(`${BASE}/tasks/${taskId}/fx-auto-resume`, {
+    method: "DELETE",
+    headers: auth ? { authorization: `Bearer ${token}` } : {},
   });
 }
 
@@ -193,4 +228,104 @@ test("POST /tasks/:id/fx-resume — happy path: paused storm → 200 {ok:true, r
 
   // Drain the continue turn so its timers don't leak into a later test.
   await waitForRunSettled(body.runId, 3000);
+});
+
+/* ── TT3 (docs/plans/fx-recovery-follow-ups.md §3 T2 item 11):
+ * DELETE /tasks/:id/fx-auto-resume ───────────────────────────────────────── */
+
+test("DELETE /tasks/:id/fx-auto-resume — unknown task id → 404 {error}, with CORS headers on the error response", async () => {
+  const res = await fxAutoResumeDelete("does-not-exist-task-id");
+  expect(res.status).toBe(404);
+  const body = await res.json();
+  expect(typeof body.error).toBe("string");
+  expect(res.headers.get("access-control-allow-origin")).toBeTruthy();
+});
+
+test("DELETE /tasks/:id/fx-auto-resume — without a bearer token → 401, with CORS headers still present", async () => {
+  const res = await fxAutoResumeDelete("does-not-exist-task-id", false);
+  expect(res.status).toBe(401);
+  expect(res.headers.get("access-control-allow-origin")).toBeTruthy();
+});
+
+test("DELETE /tasks/:id/fx-auto-resume — a paused fx task with NO pending timer (auto-resume disabled) → 400 {error: 'no auto-resume pending'}", async () => {
+  // Disable the preference so the storm's pause records
+  // autoResumeStopped:'disabled' with no timer ever armed — the cleanest,
+  // fastest way to reach "paused but nothing pending" without first racing
+  // (or waiting out) a real timer.
+  preferences.set(FX_AUTO_RESUME_PREF, "off");
+  try {
+    const taskId = await newFxTask(` ${FAKE_FX_RECOVERY_PROMPT_MARKER}`);
+    const started = await startTask(taskId);
+    if ("error" in started) throw new Error(started.error);
+    const runId = "runId" in started ? started.runId : "";
+    const run = await waitForRunSettled(runId, 5000);
+    expect(run.status).toBe("failed");
+    expect(tasks.get(taskId)?.fxRecovery?.autoResumeStopped).toBe("disabled");
+    expect(tasks.get(taskId)?.fxRecovery?.autoResume).toBeNull();
+
+    const res = await fxAutoResumeDelete(taskId);
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("no auto-resume pending");
+  } finally {
+    preferences.set(FX_AUTO_RESUME_PREF, "on");
+  }
+});
+
+test("DELETE /tasks/:id/fx-auto-resume — a paused fx task WITH a pending timer → 200 {ok:true}; the row shows autoResumeStopped:'cancelled' and autoResume:null", async () => {
+  const taskId = await newFxTask(` ${FAKE_FX_RECOVERY_PROMPT_MARKER}`);
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  const runId = "runId" in started ? started.runId : "";
+  const run = await waitForRunSettled(runId, 5000);
+  expect(run.status).toBe("failed");
+  // The default preference (on) plus the file-level 300ms delay override
+  // means this pause armed a real, short-lived timer.
+  expect(tasks.get(taskId)?.fxRecovery?.autoResume).not.toBeNull();
+
+  const res = await fxAutoResumeDelete(taskId);
+  expect(res.status).toBe(200);
+  expect(res.headers.get("access-control-allow-origin")).toBeTruthy();
+  const body = await res.json();
+  expect(body.ok).toBe(true);
+
+  const rec = tasks.get(taskId)?.fxRecovery;
+  expect(rec?.state).toBe("paused"); // cancel clears the schedule, not the pause itself.
+  expect(rec?.autoResume).toBeNull();
+  expect(rec?.autoResumeStopped).toBe("cancelled");
+
+  // A second DELETE now finds nothing pending.
+  const second = await fxAutoResumeDelete(taskId);
+  expect(second.status).toBe(400);
+});
+
+test("POST /tasks/:id/fx-resume — two truly concurrent requests on the same paused task → exactly one 200 {ok:true}, the other 409 'already in flight'", async () => {
+  const taskId = await newFxTask(` ${FAKE_FX_RECOVERY_PROMPT_MARKER}`);
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  const firstRunId = "runId" in started ? started.runId : "";
+  const firstRun = await waitForRunSettled(firstRunId, 5000);
+  expect(firstRun.status).toBe("failed");
+
+  // Fired together via Promise.all (not sequentially) — resumeFxRecovery's
+  // `resumingTaskIds` claim is taken synchronously, before any `await`, so
+  // whichever request's handler starts executing first wins the claim before
+  // the second one can observe the pause as still resumable; the loser sees
+  // the claim already held and is refused with 409, never the "no paused
+  // response" 400 the sequential happy-path test above has to tolerate as a
+  // theoretical alternative.
+  const [a, b] = await Promise.all([fxResume(taskId), fxResume(taskId)]);
+  const statuses = [a.status, b.status].sort();
+  expect(statuses).toEqual([200, 409]);
+
+  const winner = a.status === 200 ? a : b;
+  const loser = a.status === 200 ? b : a;
+  const winnerBody = await winner.json();
+  expect(winnerBody.ok).toBe(true);
+  expect(typeof winnerBody.runId).toBe("string");
+  const loserBody = await loser.json();
+  expect(loserBody.error).toMatch(/already in flight/);
+
+  // Drain the winning continue turn so its timers don't leak into a later test.
+  await waitForRunSettled(winnerBody.runId, 3000);
 });

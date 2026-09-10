@@ -1,9 +1,10 @@
-import { test, expect, beforeEach } from "bun:test";
+import { test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   AGENT_OPTIONS,
+  defaultModeFor,
   FX_PROVIDER_STATUS_PREFIX,
   FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
@@ -31,6 +32,8 @@ const {
   spawnAgent,
   FAKE_FX_RECOVERY_PROMPT_MARKER,
   FAKE_FX_PERMISSION_PROMPT_MARKER,
+  FAKE_FX_REPAUSE_PROMPT_MARKER,
+  FAKE_FX_RECOVERY_URL_PROMPT_MARKER,
 } = await import("./agents.ts");
 const { dataDir } = await import("./db.ts");
 
@@ -51,6 +54,18 @@ beforeEach(() => {
   delete process.env.AGETOR_GEMINI_ARGS;
   delete process.env.AGETOR_FX_ARGS;
   delete process.env.AGETOR_FX_DRIVER;
+});
+
+// The fx repause/recovery-URL fake-driver toggles below are process-wide
+// (mirrors AGETOR_FAKE_FX_RECOVERY/AGETOR_FAKE_FX_PERMISSION) — reset them
+// unconditionally after every test so a test that sets one and then throws
+// (or simply forgets a `finally`) can't leak it into an unrelated later
+// test, the same hygiene `beforeEach` already applies to the bin/args vars
+// above.
+afterEach(() => {
+  delete process.env.AGETOR_FAKE_FX_REPAUSE;
+  delete process.env.AGETOR_FAKE_FX_RECOVERY_URL;
+  delete process.env.AGETOR_FAKE_FX_RECOVERY;
 });
 
 /** Build a built-in harness for tests — kind doubles as id, no overrides. */
@@ -1073,9 +1088,10 @@ test.each(["auto", "ask", "yolo"])(
   },
 );
 
-test("fx null mode defaults to FX_PERMISSION_MODE=auto, house convention", () => {
+test("fx null mode defaults to FX_PERMISSION_MODE=yolo via defaultModeFor(\"fx\") (Full access is now the house default — docs/plans/fx-recovery-follow-ups.md §3.6)", () => {
   const { env } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, mode: null });
-  expect(env?.FX_PERMISSION_MODE).toBe("auto");
+  expect(defaultModeFor("fx")).toBe("yolo");
+  expect(env?.FX_PERMISSION_MODE).toBe("yolo");
 });
 
 test("fx unknown mode id passes through verbatim to FX_PERMISSION_MODE", () => {
@@ -1435,13 +1451,274 @@ test(
   8_000,
 );
 
+// --- fx repause (FAKE_FX_REPAUSE_PROMPT_MARKER/AGETOR_FAKE_FX_REPAUSE) and
+// recovery-URL (FAKE_FX_RECOVERY_URL_PROMPT_MARKER/AGETOR_FAKE_FX_RECOVERY_URL)
+// fake-driver triggers — docs/plans/fx-recovery-follow-ups.md §3.6/T3.
+
+test(
+  "fx AGETOR_FX_DRIVER=fake continueRecovery under AGETOR_FAKE_FX_REPAUSE=1 storms and pauses again (3/3, refused, exit 1); the identical continueRecovery launch without it recovers (exit 0)",
+  async () => {
+    process.env.AGETOR_FX_DRIVER = "fake";
+
+    // Baseline first, with the repause toggle still off: a continueRecovery
+    // launch recovers, exactly like the "continueRecovery scenario" test
+    // above — asserted here again for the direct with/without contrast the
+    // test title promises.
+    const baselineChunks: { stream: RunEventStream; data: string }[] = [];
+    const baselineHandle = await spawnAgent({
+      taskId: "task-fx-repause-baseline-1",
+      runId: "run-fx-repause-baseline-1",
+      harness: builtin("fx"),
+      prompt: "",
+      cwd: "/tmp",
+      onChunk: (stream, data) => { baselineChunks.push({ stream, data }); },
+      opts: {
+        ...fxDefaults,
+        runId: "run-fx-repause-baseline-1",
+        resumeSessionId: "prior-fx-session-repause-baseline",
+        continueRecovery: true,
+      },
+    });
+    expect(await baselineHandle.done).toBe(0);
+    const baselineStates = baselineChunks
+      .filter((c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX))
+      .map((c) => (JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string }).state);
+    expect(baselineStates).toEqual(["recovered"]);
+    expect(baselineChunks.some((c) => c.data.startsWith("fx turn ended: refused"))).toBe(false);
+
+    // Now the same continueRecovery shape, but with the repause toggle on:
+    // makeFakeAgent's `repause` check wins over `continueRecovery` alone
+    // (see FAKE_FX_REPAUSE_PROMPT_MARKER's doc comment), so it re-storms
+    // instead of recovering — this is what makes the auto-resume cap
+    // (FX_AUTO_RESUME_MAX) exercisable without chaining three real pauses.
+    process.env.AGETOR_FAKE_FX_REPAUSE = "1";
+    const stormChunks: { stream: RunEventStream; data: string }[] = [];
+    const stormHandle = await spawnAgent({
+      taskId: "task-fx-repause-storm-1",
+      runId: "run-fx-repause-storm-1",
+      harness: builtin("fx"),
+      prompt: "",
+      cwd: "/tmp",
+      onChunk: (stream, data) => { stormChunks.push({ stream, data }); },
+      opts: {
+        ...fxDefaults,
+        runId: "run-fx-repause-storm-1",
+        resumeSessionId: "prior-fx-session-repause-storm",
+        continueRecovery: true,
+      },
+    });
+    expect(await stormHandle.done).toBe(1);
+
+    const recoveryChunks = stormChunks.filter(
+      (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+    );
+    const payloads = recoveryChunks.map(
+      (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as Record<string, unknown>,
+    );
+    expect(payloads.map((p) => [p.state, p.attempt, p.delaySeconds ?? null])).toEqual([
+      ["active", 1, null],
+      ["active", 2, 1],
+      ["active", 3, null],
+      ["paused", 3, null],
+    ]);
+    expect(payloads[3]).toMatchObject({ attemptLimit: 3, requiredAction: "continue_later" });
+
+    const stormStatusChunks = stormChunks.filter((c) => c.stream === "status");
+    const summaryLines = stormStatusChunks.filter((c) => c.data.includes("resume once the limit clears"));
+    expect(summaryLines).toHaveLength(1);
+    expect(
+      stormStatusChunks.some(
+        (c) => c.data === "fx turn ended: refused (response paused after 3/3 attempts — resumable)",
+      ),
+    ).toBe(true);
+  },
+  8_000,
+);
+
+test(
+  "fx AGETOR_FX_DRIVER=fake: a prompt carrying ONLY FAKE_FX_REPAUSE_PROMPT_MARKER (no FAKE_FX_RECOVERY_PROMPT_MARKER) storms on its very first, non-continue launch",
+  async () => {
+    process.env.AGETOR_FX_DRIVER = "fake";
+    const chunks: { stream: RunEventStream; data: string }[] = [];
+    const handle = await spawnAgent({
+      taskId: "task-fx-repause-first-run-1",
+      runId: "run-fx-repause-first-run-1",
+      harness: builtin("fx"),
+      // Only the repause marker — never the plain recovery marker — is
+      // present, per FAKE_FX_REPAUSE_PROMPT_MARKER's doc comment: it's also
+      // wired into the top-level scenario-selection condition, so a fresh
+      // (non-continue) launch storms on it alone.
+      prompt: `hi ${FAKE_FX_REPAUSE_PROMPT_MARKER}`,
+      cwd: "/tmp",
+      onChunk: (stream, data) => { chunks.push({ stream, data }); },
+      opts: { ...fxDefaults, runId: "run-fx-repause-first-run-1" },
+    });
+    const code = await handle.done;
+    expect(code).toBe(1);
+
+    const recoveryChunks = chunks.filter((c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX));
+    const states = recoveryChunks.map(
+      (c) => (JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string }).state,
+    );
+    expect(states).toEqual(["active", "active", "active", "paused"]);
+    expect(
+      chunks.some(
+        (c) => c.stream === "status" && c.data === "fx turn ended: refused (response paused after 3/3 attempts — resumable)",
+      ),
+    ).toBe(true);
+  },
+  8_000,
+);
+
+test(
+  "fx AGETOR_FX_DRIVER=fake recovery storm + AGETOR_FAKE_FX_RECOVERY_URL=1: every active/paused message carries ' · upgrade at https://example.invalid/upgrade', never a recovered message",
+  async () => {
+    process.env.AGETOR_FX_DRIVER = "fake";
+    process.env.AGETOR_FAKE_FX_RECOVERY_URL = "1";
+    const chunks: { stream: RunEventStream; data: string }[] = [];
+    const handle = await spawnAgent({
+      taskId: "task-fx-recovery-url-storm-1",
+      runId: "run-fx-recovery-url-storm-1",
+      harness: builtin("fx"),
+      prompt: `hi ${FAKE_FX_RECOVERY_PROMPT_MARKER}`,
+      cwd: "/tmp",
+      onChunk: (stream, data) => { chunks.push({ stream, data }); },
+      opts: { ...fxDefaults, runId: "run-fx-recovery-url-storm-1" },
+    });
+    expect(await handle.done).toBe(1);
+
+    const recoveryChunks = chunks.filter((c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX));
+    const payloads = recoveryChunks.map(
+      (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string; message: string },
+    );
+    expect(payloads).toHaveLength(4);
+    for (const p of payloads) {
+      expect(["active", "paused"]).toContain(p.state);
+      expect(p.message.endsWith(" · upgrade at https://example.invalid/upgrade")).toBe(true);
+    }
+  },
+  8_000,
+);
+
+test(
+  "fx AGETOR_FX_DRIVER=fake continueRecovery + AGETOR_FAKE_FX_RECOVERY_URL=1: the recovered message never carries the upgrade-URL suffix",
+  async () => {
+    process.env.AGETOR_FX_DRIVER = "fake";
+    process.env.AGETOR_FAKE_FX_RECOVERY_URL = "1";
+    const chunks: { stream: RunEventStream; data: string }[] = [];
+    const handle = await spawnAgent({
+      taskId: "task-fx-recovery-url-recovered-1",
+      runId: "run-fx-recovery-url-recovered-1",
+      harness: builtin("fx"),
+      prompt: "",
+      cwd: "/tmp",
+      onChunk: (stream, data) => { chunks.push({ stream, data }); },
+      opts: {
+        ...fxDefaults,
+        runId: "run-fx-recovery-url-recovered-1",
+        resumeSessionId: "prior-fx-session-recovery-url",
+        continueRecovery: true,
+      },
+    });
+    expect(await handle.done).toBe(0);
+
+    const recoveryChunks = chunks.filter((c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX));
+    expect(recoveryChunks).toHaveLength(1);
+    const payload = JSON.parse(recoveryChunks[0]!.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as {
+      state: string;
+      message: string;
+    };
+    expect(payload.state).toBe("recovered");
+    expect(payload.message).toBe("✓ recovered · succeeded on attempt 1/3");
+    expect(payload.message.includes("upgrade at")).toBe(false);
+  },
+  8_000,
+);
+
+test(
+  "fx AGETOR_FX_DRIVER=fake recovery storm WITHOUT AGETOR_FAKE_FX_RECOVERY_URL: messages stay byte-identical to the pre-existing (no-URL) expectations",
+  async () => {
+    process.env.AGETOR_FX_DRIVER = "fake";
+    const chunks: { stream: RunEventStream; data: string }[] = [];
+    const handle = await spawnAgent({
+      taskId: "task-fx-recovery-no-url-1",
+      runId: "run-fx-recovery-no-url-1",
+      harness: builtin("fx"),
+      prompt: `hi ${FAKE_FX_RECOVERY_PROMPT_MARKER}`,
+      cwd: "/tmp",
+      onChunk: (stream, data) => { chunks.push({ stream, data }); },
+      opts: { ...fxDefaults, runId: "run-fx-recovery-no-url-1" },
+    });
+    expect(await handle.done).toBe(1);
+
+    const recoveryChunks = chunks.filter((c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX));
+    const messages = recoveryChunks.map(
+      (c) => (JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { message: string }).message,
+    );
+    expect(messages).toEqual([
+      "⚠ Rate limited · HTTP 429 · fake gateway limit · retrying request · attempt 1/3",
+      "⚠ Rate limited · HTTP 429 · fake gateway limit · retrying request in 1s · attempt 2/3",
+      "⚠ Rate limited · HTTP 429 · fake gateway limit · retrying request · attempt 3/3",
+      "⚠ Rate limited · HTTP 429 · fake gateway limit · recovery paused after 3/3 attempts",
+    ]);
+  },
+  8_000,
+);
+
 test("AGENT_OPTIONS.fx.modes[0] is 'yolo' (Full access is the default mode)", () => {
   expect(AGENT_OPTIONS.fx.modes[0]?.id).toBe("yolo");
 });
 
-test("fx buildCommand: a null stored mode still resolves to FX_PERMISSION_MODE=auto, not the new 'yolo' default (existing rows aren't silently escalated by the modes reorder)", () => {
+test("fx buildCommand: a null stored mode now resolves to FX_PERMISSION_MODE=yolo via defaultModeFor (the owner's explicit reversal of the earlier no-silent-escalation decision — docs/plans/fx-recovery-follow-ups.md §3.6, item 6)", () => {
   const { env } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, mode: null });
-  expect(env?.FX_PERMISSION_MODE).toBe("auto");
+  expect(env?.FX_PERMISSION_MODE).toBe(defaultModeFor("fx"));
+  expect(env?.FX_PERMISSION_MODE).toBe("yolo");
+});
+
+// --- defaultModeFor(kind) parity across every kind's buildCommand branch --
+// docs/plans/fx-recovery-follow-ups.md §3.6, item 6: `defaultModeFor(kind)`
+// (`AGENT_OPTIONS[kind].modes[0]?.id ?? "auto"`) is now the single fallback
+// every buildCommand branch uses for `opts.mode ?? …` — not just fx's. A
+// stored `null` mode must therefore produce byte-identical argv/env to
+// passing that kind's default mode explicitly, for every kind, not only fx
+// (whose default happens to differ from "auto").
+
+test("claude-code: a null mode yields the exact same argv/env as passing defaultModeFor(\"claude-code\") explicitly", () => {
+  expect(defaultModeFor("claude-code")).toBe("auto");
+  const nullResult = buildCommand(builtin("claude-code"), "hi", { ...claudeDefaults, mode: null });
+  const explicitResult = buildCommand(builtin("claude-code"), "hi", {
+    ...claudeDefaults,
+    mode: defaultModeFor("claude-code"),
+  });
+  expect(nullResult).toEqual(explicitResult);
+});
+
+test("codex: a null mode yields the exact same argv/env as passing defaultModeFor(\"codex\") explicitly", () => {
+  expect(defaultModeFor("codex")).toBe("auto");
+  const nullResult = buildCommand(builtin("codex"), "hi", { ...codexDefaults, mode: null });
+  const explicitResult = buildCommand(builtin("codex"), "hi", { ...codexDefaults, mode: defaultModeFor("codex") });
+  expect(nullResult).toEqual(explicitResult);
+});
+
+test("cursor: a null mode yields the exact same argv/env as passing defaultModeFor(\"cursor\") explicitly", () => {
+  expect(defaultModeFor("cursor")).toBe("auto");
+  const nullResult = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: null });
+  const explicitResult = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: defaultModeFor("cursor") });
+  expect(nullResult).toEqual(explicitResult);
+});
+
+test("gemini: a null mode yields the exact same argv/env as passing defaultModeFor(\"gemini\") explicitly", () => {
+  expect(defaultModeFor("gemini")).toBe("auto");
+  const nullResult = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, mode: null });
+  const explicitResult = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, mode: defaultModeFor("gemini") });
+  expect(nullResult).toEqual(explicitResult);
+});
+
+test("fx: a null mode yields the exact same argv/env as passing defaultModeFor(\"fx\") explicitly (\"yolo\" — the one kind whose default isn't \"auto\")", () => {
+  expect(defaultModeFor("fx")).toBe("yolo");
+  const nullResult = buildCommand(builtin("fx"), "hi", { ...fxDefaults, mode: null });
+  const explicitResult = buildCommand(builtin("fx"), "hi", { ...fxDefaults, mode: defaultModeFor("fx") });
+  expect(nullResult).toEqual(explicitResult);
 });
 
 test("claude-code 'max' effort sets CLAUDE_CODE_EFFORT_LEVEL=max env", () => {

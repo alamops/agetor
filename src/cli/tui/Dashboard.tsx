@@ -475,11 +475,20 @@ const TaskRow = memo(function TaskRow({
   // Budget the title so the row can never need to wrap, even if a glyph renders
   // a cell wider than measured in some terminal. The fixed prefix is the marker
   // (2) + glyph (1) + " <id> " (id length + 2); the badge is " !N"; the pause
-  // hint (when present) is " · <pauseText>".
+  // hint (when present) is " · <pauseText>". `pauseText` always leads with a
+  // single "⏸" (U+23F8 PAUSE SYMBOL) — code-review fix: most terminals render
+  // it double-width, but `.length` (a UTF-16 code-unit count) counts it as 1,
+  // so the budget below used to underestimate the hint's true on-screen width
+  // by one column. Since `pauseText` is the LAST thing on the row and the row
+  // is `wrap="truncate"`, that off-by-one let `titleMax` overrun by one cell,
+  // and Ink's own (wcwidth-aware) truncation would then shear a column off
+  // whatever renders last — the countdown text itself (e.g. "⏸ auto-resume
+  // 1:5" missing its final digit) — rather than the title. The flat `+ 1`
+  // below accounts for that one double-width glyph.
   const inner = width - 4; // border (2) + paddingX (2)
   const prefixW = 2 + 1 + (id.length + 2);
   const badgeW = needs > 0 ? String(needs).length + 2 : 0;
-  const pauseW = pauseText ? pauseText.length + 3 : 0;
+  const pauseW = pauseText ? pauseText.length + 3 + 1 : 0;
   const titleMax = Math.max(6, inner - prefixW - badgeW - pauseW);
   return (
     <Text wrap="truncate">
@@ -860,11 +869,21 @@ function Footer({
  *  fired, which is exactly what `fxAutoResumeCountdownText(at, now)` wants;
  *  every row/detail pane reads the SAME `now` value from one shared timer
  *  rather than each calling `Date.now()` independently, so they repaint in
- *  lockstep. */
+ *  lockstep.
+ *
+ *  Code-review fix: `now`'s initial `useState` runs once, at Dashboard's own
+ *  mount — which can be long before `active` ever flips true (nothing was
+ *  paused yet when the dashboard opened). Without reseeding, the FIRST
+ *  countdown paint after a task pauses used that stale mount-time `now`
+ *  against a freshly-scheduled `at`, showing a wrong (too-long) duration for
+ *  up to a second until the interval's first tick corrected it. Seeding
+ *  `now` synchronously when `active` becomes true — before the interval is
+ *  armed — closes that window. */
 function useClockTick(active: boolean): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (!active) return;
+    setNow(Date.now());
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, [active]);

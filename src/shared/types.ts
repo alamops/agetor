@@ -1509,8 +1509,14 @@ export interface TaskFxRecovery {
    *  while one IS pending. `"exhausted"`: the chain hit `FX_AUTO_RESUME_MAX`.
    *  `"cancelled"`: the user (or an implicit cancel — new message, manual
    *  Resume, Stop, archive, delete, agent switch) cancelled it.
-   *  `"disabled"`: the `fxAutoResume` preference was off at schedule time. */
-  autoResumeStopped?: "exhausted" | "cancelled" | "disabled";
+   *  `"disabled"`: the `fxAutoResume` preference was off at schedule time.
+   *  `"failed"`: a timer DID fire, but the resume it tried to start
+   *  couldn't (`resumeFxRecovery`'s gate rejected it, or the spawn itself
+   *  threw) — surfaced as the persisted `auto-resume could not start: …`
+   *  status line. Distinct from `"cancelled"`, which is reserved for an
+   *  explicit user/Stop cancel via `cancelFxAutoResume`: a `"failed"` row
+   *  was never cancelled, it tried and couldn't start. */
+  autoResumeStopped?: "exhausted" | "cancelled" | "disabled" | "failed";
 }
 
 /**
@@ -3476,7 +3482,23 @@ export type GlobalEvent =
       /** Scheduled fire time (ms epoch) — present only for `state:
        *  "scheduled"`. */
       at?: number;
-      /** The auto-resume attempt this event concerns (1-based). */
+      /**
+       * The auto-resume attempt this event concerns (1-based) — but what it
+       * COUNTS differs by `state`, so read it against the state it's
+       * attached to, not in isolation (mirrors `TaskFxRecovery.autoResume`'s
+       * `attempt`; see `recordFxPause` in `src/bun/orchestrator.ts` for the
+       * canonical statement of this convention):
+       *  - `"scheduled"` / `"fired"` — the ordinal of the attempt being
+       *    armed or fired, i.e. `autoResumeCount + 1` at the moment the
+       *    timer was set, echoed back unchanged when it fires.
+       *  - `"disabled"` — the ordinal that WOULD have been scheduled had the
+       *    `fxAutoResume` preference been on (`autoResumeCount + 1`) — there
+       *    is no real attempt to number, so this reports what was skipped.
+       *  - `"exhausted"` — always `FX_AUTO_RESUME_MAX` (the cap itself, same
+       *    value as `max`), not `autoResumeCount` — pinned to the named
+       *    constant to document "we stopped AT the cap" rather than lean on
+       *    an incidental equality between a counter and a constant.
+       */
       attempt: number;
       /** `FX_AUTO_RESUME_MAX` at the time this event fired. */
       max: number;

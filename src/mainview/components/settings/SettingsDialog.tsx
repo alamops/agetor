@@ -17,7 +17,7 @@ import { useTheme } from "@/components/theme-provider";
 import { isMacPlatform } from "@/lib/platform";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
-import { clampFxAutoResumeDelay, FX_AUTO_RESUME_MAX } from "@/lib/fx-auto-resume-prefs";
+import { FX_AUTO_RESUME_MAX, parseFxAutoResumeDelayInput } from "@/lib/fx-auto-resume-prefs";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
   SETTINGS_SECTIONS,
@@ -658,7 +658,7 @@ function GeneralSection({
     setFxDelayInput(String(fxAutoResume.delaySec));
   }, [fxAutoResume.delaySec]);
   const commitFxDelay = () => {
-    const clamped = clampFxAutoResumeDelay(Number(fxDelayInput));
+    const clamped = parseFxAutoResumeDelayInput(fxDelayInput);
     setFxDelayInput(String(clamped));
     if (clamped !== fxAutoResume.delaySec) {
       onFxAutoResumeChange({ ...fxAutoResume, delaySec: clamped });

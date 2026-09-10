@@ -19,11 +19,18 @@ import { usageError } from "../usage.ts";
  * a pending automatic resume without resuming the paused response itself —
  * the task stays paused. `--json` and `--cancel` never combine with the
  * resume request; only one of the two branches runs.
+ *
+ * Any other dash-prefixed argument (a typo like `--cancle`, a stray `-c`) is
+ * rejected as a usage error rather than silently falling through to a real
+ * resume — global flags (`--json`, `--plain`, …) are already stripped out of
+ * `args` by `index.ts`'s top-level `parseArgs` before this command ever sees
+ * them, so nothing legitimate is left to whitelist here.
  */
 export async function cmdResume(args: string[], flags: Flags): Promise<void> {
   const ref = args.find((a) => !a.startsWith("-"));
   const cancel = args.includes("--cancel");
-  if (!ref) throw usageError("resume");
+  const unknown = args.filter((a) => a.startsWith("-") && a !== "--cancel");
+  if (!ref || unknown.length) throw usageError("resume");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
 
