@@ -98,6 +98,19 @@ test("/files/preview 200s with matching bytes, content-type, and cache headers",
   expect(res.headers.get("x-content-type-options")).toBe("nosniff");
 });
 
+test("/files/preview sends the sandbox CSP header on the byte response", async () => {
+  const res = await previewWithHeader(PNG_FILE);
+  expect(res.status).toBe(200);
+  expect(res.headers.get("content-security-policy")).toBe("sandbox; default-src 'none'");
+  expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+});
+
+test("/files/preview 404 does not carry the sandbox CSP header (only the byte response does)", async () => {
+  const res = await previewWithHeader(path.join(SCRATCH, "gone.png"));
+  expect(res.status).toBe(404);
+  expect(res.headers.get("content-security-policy")).toBeNull();
+});
+
 test("/files/preview 304s on a matching If-None-Match with an empty body", async () => {
   const first = await previewWithHeader(PNG_FILE);
   const etag = first.headers.get("etag");

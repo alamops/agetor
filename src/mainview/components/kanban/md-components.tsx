@@ -5,6 +5,7 @@ import { Check, Copy } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
+import { MdImage } from "./MdImage";
 
 /**
  * Shared `ReactMarkdown` renderer pieces (external-link handling, code-block
@@ -13,6 +14,14 @@ import { api } from "@/lib/api";
  * creating a circular dependency between the two — `PlanDialog` used to pull
  * `ASSISTANT_MD_COMPONENTS` back out of `RunPanel`, which imports `PlanDialog`
  * itself. See docs/plans/cursor-plan-approval.md code-review findings.
+ *
+ * Also the one leaf module every markdown-image consumer imports from:
+ * `MdImage` (the shared `img` override, added to both maps below and
+ * re-exported from `./MdImage`), `MdImageScopeContext`/
+ * `EMPTY_MD_IMAGE_SCOPE`/`MdImageScope` (also re-exported from `./MdImage`)
+ * and `MD_URL_TRANSFORM` (re-exported from `@/lib/md-image`, aliased so a
+ * call site only needs one import line for the `components`/`urlTransform`
+ * pair). See docs/plans/markdown-image-rendering.md D2/D3.
  */
 
 export type MdComponents = NonNullable<React.ComponentProps<typeof ReactMarkdown>["components"]>;
@@ -129,6 +138,7 @@ export function CodeBlock({
 export const USER_MD_COMPONENTS: MdComponents = {
   a: mdRenderLink,
   code: mdRenderCode,
+  img: MdImage,
   pre: ({ children }) => <CodeBlock bgClassName="bg-background/60">{children}</CodeBlock>,
 };
 
@@ -138,5 +148,13 @@ export const USER_MD_COMPONENTS: MdComponents = {
 export const ASSISTANT_MD_COMPONENTS: MdComponents = {
   a: mdRenderLink,
   code: mdRenderCode,
+  img: MdImage,
   pre: ({ children }) => <CodeBlock bgClassName="bg-muted/40">{children}</CodeBlock>,
 };
+
+// Re-exported so every markdown-image consumer (RunPanel, PlanDialog,
+// MessageSegments, GitHubDialog — T4) imports both the `components` map and
+// its scope/transform partners from this one leaf module instead of reaching
+// into `./MdImage` / `@/lib/md-image` directly.
+export { MdImage, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./MdImage";
+export { mdUrlTransform as MD_URL_TRANSFORM } from "@/lib/md-image";

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { AlertCircle, ClipboardList, Info, Loader2, X } from "lucide-react";
@@ -8,7 +8,12 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { api, ApiError } from "@/lib/api";
-import { ASSISTANT_MD_COMPONENTS } from "./md-components";
+import {
+  ASSISTANT_MD_COMPONENTS,
+  MD_URL_TRANSFORM,
+  MdImageScopeContext,
+  type MdImageScope,
+} from "./md-components";
 import type { AgentKind, Task, TaskPlan } from "../../../shared/types.ts";
 
 /** Status pill for a plan card / the PlanDialog header — same four-state
@@ -104,6 +109,17 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
   // `editable` (= cursor AND pending) rather than bare `pending`.
   const claude = agentKind === "claude-code";
   const editable = !claude && pending;
+
+  // Scopes this plan's `MdImage` overrides to the task's own worktree/workdir
+  // roots — mirrors `RunEventList`'s `mdImageScope` in RunPanel.tsx, since
+  // this dialog renders its own `ReactMarkdown` outside that provider. `task`
+  // is a required prop here, so there's no empty-scope case to guard.
+  // `allowLocal: true`: a plan is the agent's own generated content, the same
+  // trusted tier as the transcript — not third-party markdown.
+  const mdImageScope = useMemo<MdImageScope>(
+    () => ({ taskId: task.id, roots: [task.worktreePath, task.workdir], allowLocal: true }),
+    [task.id, task.worktreePath, task.workdir],
+  );
 
   // Local draft text — seeded once from the plan the dialog opened with (this
   // component is keyed by `plan.id` at the call site, so a genuine plan
@@ -391,11 +407,17 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
             className="min-h-[320px] font-mono text-xs"
           />
         ) : (
-          <div className="agetor-md text-foreground">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={ASSISTANT_MD_COMPONENTS}>
-              {pending ? text : effectiveContent}
-            </ReactMarkdown>
-          </div>
+          <MdImageScopeContext.Provider value={mdImageScope}>
+            <div className="agetor-md text-foreground">
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={ASSISTANT_MD_COMPONENTS}
+                urlTransform={MD_URL_TRANSFORM}
+              >
+                {pending ? text : effectiveContent}
+              </ReactMarkdown>
+            </div>
+          </MdImageScopeContext.Provider>
         )}
       </div>
 

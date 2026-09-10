@@ -36,7 +36,7 @@ import {
   type MessageSegment,
   type TagSegment,
 } from "../../../shared/user-message.ts";
-import { USER_MD_COMPONENTS } from "./md-components";
+import { USER_MD_COMPONENTS, MD_URL_TRANSFORM } from "./md-components";
 
 /** The existing 9px "you" / "command output" style label, hoisted here so
  *  every machine-emitted block (and `UserMessageBlock`'s own header) shares
@@ -191,7 +191,11 @@ export function GenericTagBlock({
           ) : depth < 3 ? (
             <MessageSegments segments={nestedSegments} depth={depth + 1} />
           ) : (
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={USER_MD_COMPONENTS}
+              urlTransform={MD_URL_TRANSFORM}
+            >
               {segment.body.trim()}
             </ReactMarkdown>
           )}
@@ -261,7 +265,12 @@ export function MessageSegments({
       {visibleSegments.map((seg, i) => {
         if (seg.kind === "text") {
           return (
-            <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
+            <ReactMarkdown
+              key={i}
+              remarkPlugins={[remarkGfm]}
+              components={USER_MD_COMPONENTS}
+              urlTransform={MD_URL_TRANSFORM}
+            >
               {seg.text}
             </ReactMarkdown>
           );
