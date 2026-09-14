@@ -3,6 +3,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AppEvent, Harness, HarnessQuota } from "../../shared/types.ts";
+import { USAGE_MIN_REFRESH_MS } from "../../shared/types.ts";
+import type { UsageProviderOpts } from "./poller.ts";
 
 // Set AGETOR_DATA_DIR before any import that pulls in db.ts. ES imports
 // hoist before top-level code, so we use dynamic `await import()` below
@@ -146,4 +148,87 @@ test("pollAllUsage no-ops on an overlapping call while a sweep is in flight", as
   await Promise.all([p1, p2]);
 
   expect(calls).toBe(1);
+});
+
+// `allowIdeRead` gating (macOS Sequoia TCC cross-app-data-read spam fix —
+// see refreshOne's doc in poller.ts and cursor-usage.ts's discoverCursorCookie).
+// Cursor is the only provider consuming this today, so these tests exercise
+// `refreshOne` against the "cursor" harness with a recording fake provider.
+test("refreshOne passes allowIdeRead:false when there's no prior snapshot and no force", async () => {
+  harnesses.setEnabled("cursor", true);
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+
+  await refreshOne("cursor");
+
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+});
+
+test("refreshOne passes allowIdeRead:true when a prior *successful* (ok) snapshot exists", async () => {
+  harnesses.setEnabled("cursor", true);
+  harnessUsage.upsert(
+    fakeQuota({
+      harnessId: "cursor",
+      kind: "cursor",
+      status: "ok",
+      fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000,
+    }),
+  );
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+
+  await refreshOne("cursor");
+
+  expect(capturedOpts?.allowIdeRead).toBe(true);
+});
+
+// Cold-start guarantee: the `unavailable` snapshot that the SKIP path itself
+// upserts (allowIdeRead:false → provider returns unavailable → refreshOne
+// stores it) must NOT re-open the cross-app read on the next sweep. Gating on
+// mere snapshot existence (`!= null`) would re-trip the TCC prompt one interval
+// after boot; gating on `status === "ok"` does not.
+test("refreshOne keeps allowIdeRead:false when the only prior snapshot is unavailable (skip-path)", async () => {
+  harnesses.setEnabled("cursor", true);
+  harnessUsage.upsert(
+    fakeQuota({
+      harnessId: "cursor",
+      kind: "cursor",
+      status: "unavailable",
+      meters: [],
+      reason: "skipped in background",
+      fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000,
+    }),
+  );
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor", status: "unavailable", meters: [] });
+  });
+
+  await refreshOne("cursor");
+
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+});
+
+test("refreshOne passes allowIdeRead:true when force:true, even with no prior snapshot", async () => {
+  harnesses.setEnabled("cursor", true);
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+
+  await refreshOne("cursor", { force: true });
+
+  expect(capturedOpts?.allowIdeRead).toBe(true);
 });

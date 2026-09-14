@@ -5,6 +5,7 @@ import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
 import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
@@ -130,6 +131,12 @@ rehydratePath();
 // blocking this whole script until it returned. An unhandled rejection here
 // fails boot loudly, matching that old synchronous-throw behavior — no
 // swallow.
+//
+// Must run before reconcileOrphans(): reconciliation issues `has-session`
+// probes against agetor's tmux socket, and the first tmux command to touch
+// a socket auto-starts its server — un-disclaimed, if this didn't run
+// first — leaving every session that server ever hosts un-disclaimed too.
+await ensureDisclaimedServer();
 await reconcileOrphans();
 
 // Re-arm in-memory auto-resume timers for every fx task still carrying a

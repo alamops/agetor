@@ -24,7 +24,7 @@ import {
   type AskQuestion,
   type TmuxPromptChoice,
 } from "./interactions.ts";
-import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
 import { detectAskModal, parseModalPane, type AskModalKind, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
@@ -6638,6 +6638,11 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   for (const [k, v] of Object.entries(fullEnv)) tmuxArgs.push("-e", `${k}=${v}`);
   tmuxArgs.push("--", ...opts.argv);
 
+  // Must run before the `new-session` below (the first tmux command that
+  // can auto-start the server on this socket) — a server that boots
+  // un-disclaimed can't be re-disclaimed afterward, and every session it
+  // hosts (this one included) would inherit Agetor's TCC responsibility.
+  await ensureDisclaimedServer();
   const launch = await tmux(tmuxArgs);
   if (!launch.ok) {
     const err = new Error(`tmux new-session failed: ${launch.stderr || launch.stdout}`);

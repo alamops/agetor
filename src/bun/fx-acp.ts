@@ -12,6 +12,7 @@ import {
 } from "../shared/types.ts";
 import { fxRecoverySummaryLine, isFxRecoveryResumable, parseFxRecoveryMeta } from "../shared/fx-recovery.ts";
 import { isImagePath } from "../shared/attachments.ts";
+import { disclaimArgv } from "./disclaim.ts";
 import { SENT_FILES_TOOL_NAME } from "../shared/sent-files.ts";
 import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
 import {
@@ -2410,7 +2411,12 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
     return { kill: () => { /* nothing to kill */ }, writeInput: () => false, done };
   }
 
-  const proc = Bun.spawn([bin, ...rest], {
+  // fx has no tmux server to disclaim (see the file header — plain
+  // Bun.spawn over piped stdio), so the child itself is wrapped directly.
+  // `disclaimArgv` exec-replaces via POSIX_SPAWN_SETEXEC, preserving Bun's
+  // own pid and the piped stdio fds into fx; it returns the argv unchanged
+  // when disclaim is disabled/unavailable/non-darwin.
+  const proc = Bun.spawn(disclaimArgv([bin, ...rest]), {
     cwd: opts.cwd,
     env,
     stdin: "pipe",

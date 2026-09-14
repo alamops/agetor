@@ -1,5 +1,23 @@
-import { describe, expect, test } from "bun:test";
-import { parseCursorUsage } from "./cursor-usage.ts";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import type { Harness } from "../../shared/types.ts";
+import { discoverCursorCookie, fetchCursorQuota, parseCursorUsage } from "./cursor-usage.ts";
+
+function fakeHarness(overrides: Partial<Harness> = {}): Harness {
+  return {
+    id: "cursor",
+    kind: "cursor",
+    label: "Cursor",
+    isBuiltin: true,
+    home: null,
+    bin: null,
+    env: {},
+    enabled: true,
+    ...overrides,
+  };
+}
 
 // `parseCursorUsage` is pure (no I/O, no network) — these tests are hermetic
 // and use only inline, synthetic (redacted) fixtures. Cursor's `usage-summary`
@@ -241,5 +259,62 @@ describe("parseCursorUsage — confirmed live shape (individualUsage, 2026-08)",
     );
     expect(meters).toEqual([]);
     expect(planType).toBe("pro");
+  });
+});
+
+// The `allowIdeRead` gate (macOS Sequoia TCC cross-app-data-read spam fix —
+// see the poller's `refreshOne` doc). These tests hit real I/O paths
+// (`discoverCursorCookie`/`fetchCursorQuota`, not the pure `parseCursorUsage`
+// above), so each mutates `process.env.HOME` for the duration of the test
+// and restores it afterward — this repo's other suites don't touch `HOME`,
+// so there's no shared-state risk with sibling files.
+describe("allowIdeRead gating (macOS TCC cross-app-read guard)", () => {
+  const harness = fakeHarness();
+  let originalHome: string | undefined;
+
+  beforeEach(() => {
+    originalHome = process.env.HOME;
+  });
+
+  afterEach(() => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  });
+
+  test("fetchCursorQuota({allowIdeRead:false}) resolves unavailable with the opt-in guidance reason, deterministically — never touches the IDE state DB, so it doesn't matter whether a real state.vscdb exists on this machine", async () => {
+    // Deliberately do NOT touch HOME here — the assertion is that the
+    // false-path result is identical regardless of what's really on disk.
+    const quota = await fetchCursorQuota(harness, { allowIdeRead: false });
+    expect(quota.status).toBe("unavailable");
+    expect(quota.meters).toEqual([]);
+    expect(quota.planType).toBeNull();
+    expect(quota.reason).toBe(
+      "Cursor usage isn't read in the background. Click Refresh to read " +
+        "Cursor's local login and show plan usage.",
+    );
+  });
+
+  test("discoverCursorCookie({allowIdeRead:false}) resolves null without reading the IDE state DB, even pointed at a HOME with no Cursor install", async () => {
+    process.env.HOME = mkdtempSync(path.join(tmpdir(), "agetor-cursor-usage-"));
+    const cookie = await discoverCursorCookie(harness, { allowIdeRead: false });
+    expect(cookie).toBeNull();
+  });
+
+  test("omitting opts behaves identically to an explicit {allowIdeRead:true} — existing default unchanged", async () => {
+    // Deliberately does NOT fake HOME or otherwise stub the IDE-DB read:
+    // Bun's `os.homedir()` reads the real OS user record rather than
+    // `process.env.HOME` (unlike Node), so faking HOME here can't isolate
+    // this from whatever `state.vscdb` actually exists on the dev/CI
+    // machine — and if a real, currently-valid Cursor login IS present,
+    // asserting a fixed "unavailable" reason would flakily fail by
+    // reaching cursor.com's live network endpoint and finding real usage.
+    // Instead this compares the two calls to EACH OTHER: since both take
+    // the identical code path (discoverCursorCookie with no gating), they
+    // must resolve to the same cookie discovery result regardless of what
+    // is or isn't on this machine — proving omitted opts defaults to
+    // allowIdeRead:true without depending on machine state or the network.
+    const withDefault = await discoverCursorCookie(harness);
+    const withExplicitTrue = await discoverCursorCookie(harness, { allowIdeRead: true });
+    expect(withDefault).toBe(withExplicitTrue);
   });
 });
