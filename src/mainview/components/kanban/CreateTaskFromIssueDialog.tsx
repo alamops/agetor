@@ -11,6 +11,7 @@ import {
   renderIssueThreadMarkdown,
   sameIssueUrl,
 } from "../../../shared/issue-task.ts";
+import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
 import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
@@ -153,7 +154,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
   const loading = launch.loading || threadLoading;
   const error = launch.loadError ?? threadError;
 
-  const overage = promptByteOverage(launch.kind, prompt);
+  const overage = promptByteOverage(launch.effectiveKind, composeLaunchPrompt(launch.selectedProfile, prompt));
   const selectedHarnessLabel = launch.harnesses.find((h) => h.id === launch.agent)?.label ?? launch.agent;
 
   const canSubmit =
@@ -162,7 +163,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
     prompt.trim().length > 0 &&
     !!launch.selectedStatus?.available &&
     !submitting &&
-    promptByteOverage(launch.kind, prompt) == null &&
+    overage == null &&
     wt.valid;
 
   const submit = async () => {
@@ -179,6 +180,9 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
         mode: launch.mode,
         model: launch.model,
         effort: launch.effort,
+        fast: launch.fast,
+        maxMode: launch.maxMode,
+        agentProfileId: launch.agentProfileId,
         column: "ready",
         references,
         taskType,

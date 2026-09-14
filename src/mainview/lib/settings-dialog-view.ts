@@ -4,6 +4,7 @@ import type { HarnessTemplate } from "../../shared/types.ts";
 export const SETTINGS_SECTIONS = [
   { id: "general", label: "General" },
   { id: "harnesses", label: "Harnesses" },
+  { id: "agents", label: "Agents" },
   { id: "git", label: "Git Integration" },
   { id: "prompts", label: "Saved Prompts" },
 ] as const;
@@ -13,11 +14,11 @@ export type SettingsSectionId = (typeof SETTINGS_SECTIONS)[number]["id"];
 /**
  * Discriminated-union view state for the Settings dialog's content pane,
  * mirroring `GitHubDialogView` in `github-dialog-view.ts` — "section" is one
- * of the three sidebar sections (General/Harnesses/Git Integration),
- * "templates" is the Add-harness template picker, and "editor" is the
- * harness create/edit form. The sidebar itself stays visible across all
- * three kinds (see `activeSection`), unlike the GitHub modal's full-panel
- * subpage replacement.
+ * of the sidebar sections (General/Harnesses/Agents/Git Integration/Saved
+ * Prompts — see `SETTINGS_SECTIONS`), "templates" is the Add-harness
+ * template picker, and "editor" is the harness create/edit form. The
+ * sidebar itself stays visible across all three kinds (see `activeSection`),
+ * unlike the GitHub modal's full-panel subpage replacement.
  */
 export type SettingsView =
   | { kind: "section"; section: SettingsSectionId }

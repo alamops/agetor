@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { api, type AgentModelMap } from "@/lib/api";
+import { useAgentProfiles } from "@/lib/agent-profiles";
 import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
 import {
   AGENT_OPTIONS,
@@ -10,15 +12,20 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   cursorModelIdCoveredByCatalog,
+  cursorModelSupportsFast,
+  cursorModelSupportsMaxMode,
   defaultModeFor,
   supportedEfforts,
   supportedModes,
   type AgentKind,
   type AgentOption,
+  type AgentProfile,
   type AgentStatus,
   type Harness,
 } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
+import { AgentProfileCard } from "./AgentProfileCard";
+import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
 
 const initialMode = (kind: AgentKind) => defaultModeFor(kind);
@@ -49,6 +56,17 @@ export interface TaskLaunch {
   mode: string;
   model: string;
   effort: string | null;
+  /** Cursor-only "fast variant" toggle — auto-clears to `false` whenever
+   *  `fastAvailable` goes false (kind/model/effort change), mirroring
+   *  `NewTaskForm`'s identical rule. */
+  fast: boolean;
+  /** Cursor-only "Max Mode" (extra context) toggle — same auto-clear rule
+   *  as `fast`, keyed on `maxModeAvailable`. */
+  maxMode: boolean;
+  setFast: (fast: boolean) => void;
+  setMaxMode: (maxMode: boolean) => void;
+  fastAvailable: boolean;
+  maxModeAvailable: boolean;
   models: AgentOption[];
   modes: AgentOption[];
   efforts: AgentOption[];
@@ -61,11 +79,50 @@ export interface TaskLaunch {
   switchAgent: (nextId: string) => void;
   /** Persists the current mode/model/effort as `lastMode/lastModel/lastEffort:<kind>`
    *  preferences — call this right after a successful `createAndStartTask()`,
-   *  mirroring `ResolveConflictsDialog`'s inline `setPreference` calls. */
+   *  mirroring `ResolveConflictsDialog`'s inline `setPreference` calls. A
+   *  no-op while a profile is selected (`agentProfileId !== null`) — the
+   *  launch didn't come from manually-picked values, so there's nothing of
+   *  the user's own intent to remember. */
   rememberPicks: () => void;
+  /** Selected {@link AgentProfile} id, or `null` for the manual
+   *  harness/mode/model/effort block (`useTaskLaunch`'s "one selection" —
+   *  plan D5). */
+  agentProfileId: string | null;
+  setAgentProfileId: (id: string | null) => void;
+  /** Live agent profiles — empty when `opts.withProfiles === false` (the
+   *  profile form itself doesn't need its own picker's list). */
+  profiles: AgentProfile[];
+  /** `profiles.find(p => p.id === agentProfileId)`, or `null`. */
+  selectedProfile: AgentProfile | null;
+  /** Refetch `profiles` (e.g. after a Settings → Agents create/edit/delete
+   *  elsewhere touches the module-cached list). */
+  refreshProfiles: () => Promise<void>;
+  /** The harness kind a launch will actually run under — the selected
+   *  profile's harness kind when one is selected (resolved through
+   *  `harnesses`, falling back to `"claude-code"` if that harness is gone),
+   *  else the manually-picked `kind`. Client-side prompt-budget pre-checks
+   *  (`promptByteOverage`) must use this, not the bare `kind`. */
+  effectiveKind: AgentKind;
+  /** The harness id a launch will actually run under — mirrors
+   *  `effectiveKind`. */
+  effectiveAgent: string;
+  /** Apply a batch of values onto the manual picker state — used by the
+   *  Agents Settings edit form to seed the picker from the profile being
+   *  edited. Applies `agent` first via the same reset-to-kind-defaults path
+   *  as `switchAgent`, then overrides whichever of the remaining fields are
+   *  present (fields omitted from `values` are left untouched). */
+  seed: (values: Partial<{
+    agent: string;
+    mode: string;
+    model: string;
+    effort: string | null;
+    fast: boolean;
+    maxMode: boolean;
+  }>) => void;
 }
 
-export function useTaskLaunch(open: boolean): TaskLaunch {
+export function useTaskLaunch(open: boolean, opts?: { withProfiles?: boolean }): TaskLaunch {
+  const withProfiles = opts?.withProfiles !== false;
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
@@ -86,6 +143,15 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
   const [mode, setMode] = useState<string>(initialMode("claude-code"));
   const [model, setModel] = useState<string>(DEFAULT_MODEL["claude-code"]);
   const [effort, setEffort] = useState<string | null>(DEFAULT_EFFORT["claude-code"]);
+  const [fast, setFast] = useState(false);
+  const [maxMode, setMaxMode] = useState(false);
+
+  const [agentProfileId, setAgentProfileId] = useState<string | null>(null);
+  const { profiles: fetchedProfiles, refresh: refreshProfiles } = useAgentProfiles({
+    enabled: open && withProfiles,
+  });
+  const profiles = withProfiles ? fetchedProfiles : [];
+  const selectedProfile = agentProfileId ? (profiles.find((p) => p.id === agentProfileId) ?? null) : null;
 
   // Self-fetch harness data on open — mirrors NewTaskForm/App.tsx's own
   // fetch, but scoped to whichever dialog mounts this hook (it's mounted
@@ -183,6 +249,8 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
   // so a logged-out harness's discovery is distrusted here too (rule 7).
   const efforts = supportedEfforts(kind, model, discoveredEffortsFor(models, model));
   const effortsKey = efforts.map((o) => o.id).join(",");
+  const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(model);
+  const fastAvailable = kind === "cursor" && cursorModelSupportsFast(model, effort);
 
   useEffect(() => {
     if (efforts.length === 0) {
@@ -194,6 +262,12 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
     setEffort(fallback);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, model, effortsKey]);
+  useEffect(() => {
+    if (!fastAvailable && fast) setFast(false);
+  }, [fastAvailable, fast]);
+  useEffect(() => {
+    if (!maxModeAvailable && maxMode) setMaxMode(false);
+  }, [maxModeAvailable, maxMode]);
   useEffect(() => {
     if (!modes.some((m) => m.id === mode)) {
       const fallback = modes[0]?.id;
@@ -214,11 +288,36 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
     }
   };
 
+  const seed = (values: Partial<{
+    agent: string;
+    mode: string;
+    model: string;
+    effort: string | null;
+    fast: boolean;
+    maxMode: boolean;
+  }>) => {
+    if (values.agent !== undefined) switchAgent(values.agent);
+    if (values.mode !== undefined) setMode(values.mode);
+    if (values.model !== undefined) setModel(values.model);
+    if (values.effort !== undefined) setEffort(values.effort);
+    if (values.fast !== undefined) setFast(values.fast);
+    if (values.maxMode !== undefined) setMaxMode(values.maxMode);
+  };
+
   const rememberPicks = () => {
+    // A profile-backed launch didn't come from manually-picked values —
+    // nothing of the user's own intent to remember (see the `TaskLaunch`
+    // doc comment).
+    if (agentProfileId) return;
     void api.setPreference(`lastMode:${kind}`, mode).catch(() => {});
     void api.setPreference(`lastModel:${kind}`, model).catch(() => {});
     if (effort !== null) void api.setPreference(`lastEffort:${kind}`, effort).catch(() => {});
   };
+
+  const effectiveAgent = selectedProfile ? selectedProfile.harness : agent;
+  const effectiveKind: AgentKind = selectedProfile
+    ? (harnesses.find((h) => h.id === selectedProfile.harness)?.kind ?? "claude-code")
+    : kind;
 
   return {
     loading,
@@ -234,6 +333,12 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
     mode,
     model,
     effort,
+    fast,
+    maxMode,
+    setFast,
+    setMaxMode,
+    fastAvailable,
+    maxModeAvailable,
     models,
     modes,
     efforts,
@@ -242,102 +347,204 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
     setEffort,
     switchAgent,
     rememberPicks,
+    agentProfileId,
+    setAgentProfileId,
+    profiles,
+    selectedProfile,
+    refreshProfiles,
+    effectiveKind,
+    effectiveAgent,
+    seed,
   };
 }
 
 /** Harness grid + Mode select + Model/Effort grid — the picker markup shared
- *  between `ResolveConflictsDialog` and `CreateTaskFromIssueDialog`. Renders
- *  nothing about loading/error states; the consumer owns those around it
- *  (they differ per dialog — e.g. the issue dialog also waits on a thread
- *  fetch). */
-export function TaskLaunchPickers({ launch }: { launch: TaskLaunch }) {
-  const { availableHarnesses, agents, agent, selectedStatus, mode, modes, model, models, effort, efforts, switchAgent, setMode, setModel, setEffort } = launch;
+ *  between `ResolveConflictsDialog` and `CreateTaskFromIssueDialog` (and, via
+ *  `hideProfilePicker`, the Agents Settings form itself). Renders nothing
+ *  about loading/error states; the consumer owns those around it (they
+ *  differ per dialog — e.g. the issue dialog also waits on a thread fetch).
+ *
+ *  Renders an `<AgentProfilePicker>` above the manual controls unless
+ *  `hideProfilePicker` is set. Once `launch.agentProfileId` names a profile,
+ *  the harness grid / mode / model / effort / fast / max-mode controls are
+ *  replaced by a single `<AgentProfileCard variant="selected">` — the
+ *  launch form's "one selection" rule (plan D5). */
+export function TaskLaunchPickers({
+  launch,
+  hideProfilePicker,
+  onManageProfiles,
+}: {
+  launch: TaskLaunch;
+  hideProfilePicker?: boolean;
+  onManageProfiles?: () => void;
+}) {
+  const {
+    harnesses,
+    availableHarnesses,
+    agents,
+    agent,
+    selectedStatus,
+    mode,
+    modes,
+    model,
+    models,
+    effort,
+    efforts,
+    fast,
+    maxMode,
+    setFast,
+    setMaxMode,
+    fastAvailable,
+    maxModeAvailable,
+    switchAgent,
+    setMode,
+    setModel,
+    setEffort,
+    agentProfileId,
+    setAgentProfileId,
+    profiles,
+    selectedProfile,
+    kind,
+  } = launch;
+
   return (
     <>
-      <div className="space-y-1">
-        <label className="text-muted-foreground">Harness</label>
-        <div className="grid grid-cols-2 gap-1">
-          {availableHarnesses.map((h) => {
-            const status = agents.find((s) => s.harnessId === h.id);
-            const available = status?.available ?? false;
-            const loggedOut = available && status?.loggedIn === false;
-            return (
-              <Button
-                key={h.id}
-                size="sm"
-                variant={agent === h.id ? "default" : "outline"}
-                onClick={() => switchAgent(h.id)}
-                title={
-                  [
-                    status?.reason,
-                    status?.loggedIn === false ? (status.authHelp ?? "Not logged in") : null,
-                    status?.path,
-                    status?.version,
-                  ]
-                    .filter(Boolean)
-                    .join(" — ") || h.id
-                }
-                className="justify-start"
-              >
-                <AgentIcon kind={h.kind} className="mr-1" />
-                <span className="truncate">{h.label}</span>
-                <span
-                  className={cn(
-                    "ml-auto inline-block size-1.5 rounded-full",
-                    !available ? "bg-danger-solid" : loggedOut ? "bg-warning-solid" : "bg-success-solid",
-                  )}
-                />
-              </Button>
-            );
-          })}
+      {!hideProfilePicker && (
+        <div className="space-y-1">
+          <label className="text-muted-foreground">Agent</label>
+          <AgentProfilePicker
+            value={agentProfileId}
+            onChange={setAgentProfileId}
+            profiles={profiles}
+            harnesses={harnesses}
+            onManage={onManageProfiles}
+          />
         </div>
-        {selectedStatus && !selectedStatus.available && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
-            <div className="font-medium">{selectedStatus.reason}</div>
-            {selectedStatus.installHint && (
-              <div className="mt-1 font-mono opacity-80">{selectedStatus.installHint}</div>
+      )}
+
+      {selectedProfile ? (
+        <AgentProfileCard profile={selectedProfile} harnesses={harnesses} variant="selected" />
+      ) : (
+        <>
+          <div className="space-y-1">
+            <label className="text-muted-foreground">Harness</label>
+            <div className="grid grid-cols-2 gap-1">
+              {availableHarnesses.map((h) => {
+                const status = agents.find((s) => s.harnessId === h.id);
+                const available = status?.available ?? false;
+                const loggedOut = available && status?.loggedIn === false;
+                return (
+                  <Button
+                    key={h.id}
+                    size="sm"
+                    variant={agent === h.id ? "default" : "outline"}
+                    onClick={() => switchAgent(h.id)}
+                    title={
+                      [
+                        status?.reason,
+                        status?.loggedIn === false ? (status.authHelp ?? "Not logged in") : null,
+                        status?.path,
+                        status?.version,
+                      ]
+                        .filter(Boolean)
+                        .join(" — ") || h.id
+                    }
+                    className="justify-start"
+                  >
+                    <AgentIcon kind={h.kind} className="mr-1" />
+                    <span className="truncate">{h.label}</span>
+                    <span
+                      className={cn(
+                        "ml-auto inline-block size-1.5 rounded-full",
+                        !available ? "bg-danger-solid" : loggedOut ? "bg-warning-solid" : "bg-success-solid",
+                      )}
+                    />
+                  </Button>
+                );
+              })}
+            </div>
+            {selectedStatus && !selectedStatus.available && (
+              <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
+                <div className="font-medium">{selectedStatus.reason}</div>
+                {selectedStatus.installHint && (
+                  <div className="mt-1 font-mono opacity-80">{selectedStatus.installHint}</div>
+                )}
+              </div>
             )}
+            <HarnessAuthHint status={selectedStatus} />
           </div>
-        )}
-        <HarnessAuthHint status={selectedStatus} />
-      </div>
 
-      <div className="space-y-1">
-        <label className="text-muted-foreground">Mode</label>
-        <Select value={mode} onChange={(e) => setMode(e.target.value)} className="h-8">
-          {modes.map((m) => (
-            <option key={m.id} value={m.id}>{m.label}</option>
-          ))}
-        </Select>
-      </div>
-
-      <div className="grid grid-cols-2 gap-2">
-        <div className="min-w-0 space-y-1">
-          <label className="text-muted-foreground">Model</label>
-          <Select value={model} onChange={(e) => setModel(e.target.value)} className="h-8">
-            {models.map((m) => (
-              <option key={m.id} value={m.id}>{m.label}</option>
-            ))}
-          </Select>
-        </div>
-        <div className="min-w-0 space-y-1">
-          <label className="text-muted-foreground">Effort</label>
-          <Select
-            value={effort ?? ""}
-            onChange={(e) => setEffort(e.target.value)}
-            disabled={efforts.length === 0}
-            className="h-8"
-          >
-            {efforts.length === 0 ? (
-              <option value="">n/a</option>
-            ) : (
-              efforts.map((m) => (
+          <div className="space-y-1">
+            <label className="text-muted-foreground">Mode</label>
+            <Select value={mode} onChange={(e) => setMode(e.target.value)} className="h-8">
+              {modes.map((m) => (
                 <option key={m.id} value={m.id}>{m.label}</option>
-              ))
-            )}
-          </Select>
-        </div>
-      </div>
+              ))}
+            </Select>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <div className="min-w-0 space-y-1">
+              <label className="text-muted-foreground">Model</label>
+              <Select value={model} onChange={(e) => setModel(e.target.value)} className="h-8">
+                {models.map((m) => (
+                  <option key={m.id} value={m.id}>{m.label}</option>
+                ))}
+              </Select>
+            </div>
+            <div className="min-w-0 space-y-1">
+              <label className="text-muted-foreground">Effort</label>
+              <Select
+                value={effort ?? ""}
+                onChange={(e) => setEffort(e.target.value)}
+                disabled={efforts.length === 0}
+                className="h-8"
+              >
+                {efforts.length === 0 ? (
+                  <option value="">n/a</option>
+                ) : (
+                  efforts.map((m) => (
+                    <option key={m.id} value={m.id}>{m.label}</option>
+                  ))
+                )}
+              </Select>
+            </div>
+          </div>
+
+          {kind === "cursor" && (maxModeAvailable || maxMode || fastAvailable || fast) && (
+            <div className="grid grid-cols-2 gap-2">
+              {(maxModeAvailable || maxMode) && (
+                <label
+                  data-testid="launch-max-mode-toggle"
+                  className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs"
+                >
+                  <span>Max Mode</span>
+                  <Switch
+                    checked={maxMode}
+                    onCheckedChange={setMaxMode}
+                    disabled={!maxModeAvailable}
+                    aria-label="Use Cursor Max Mode context"
+                  />
+                </label>
+              )}
+              {(fastAvailable || fast) && (
+                <label
+                  data-testid="launch-fast-toggle"
+                  className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs"
+                >
+                  <span>Fast</span>
+                  <Switch
+                    checked={fast}
+                    onCheckedChange={setFast}
+                    disabled={!fastAvailable}
+                    aria-label="Use Cursor fast variant"
+                  />
+                </label>
+              )}
+            </div>
+          )}
+        </>
+      )}
     </>
   );
 }

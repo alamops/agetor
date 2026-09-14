@@ -7,6 +7,7 @@ import {
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
+import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
@@ -66,10 +67,12 @@ import {
   supportedEfforts,
   supportedModes,
   type AgentKind,
+  type AgentProfile,
   type AgentStatus,
   type Harness,
   type BacklogMessage,
   type FxRecoveryPayload,
+  type AgentProfileSnapshot,
   type FxUsagePayload,
   type GitHubPullMergeability,
   type Run,
@@ -97,6 +100,7 @@ import { cleanPromptPane } from "@/lib/prompt-noise";
 import { parseUserMessage, splitReferences, parseMessageSegments, type MessageSegment } from "../../../shared/user-message.ts";
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
+import { AgentProfileCard } from "./AgentProfileCard";
 import { AttachmentChips } from "./AttachmentChips";
 import { SentFilesCard } from "./SentFilesCard";
 import {
@@ -172,6 +176,13 @@ interface Props {
   /** Registered harnesses — needed so the panel's agent dropdown can list
    *  every known harness (built-ins + aliases). */
   harnesses: Harness[];
+  /** Saved agent profiles — resolves the header chip (`resolveTaskProfileDisplay`)
+   *  and, in Task details, whether the agent/mode/model/effort(/fast/max)
+   *  controls are locked (`task.agentProfileId != null`). */
+  profiles: AgentProfile[];
+  /** "Manage agents…" — wired to the task-details Detach hint's sibling
+   *  affordance and the header chip, mirroring `NewTaskForm`'s own prop. */
+  onOpenSettingsAgents: () => void;
   agentModels: AgentModelMap;
   /** Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`
    *  on the api client. Preferred over `agentModels` for the task's own
@@ -274,7 +285,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, stickyUserMessages, agents, harnesses, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -474,6 +485,8 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, agentMod
           stickyUserMessages={stickyUserMessages}
           agents={agents}
           harnesses={harnesses}
+          profiles={profiles}
+          onOpenSettingsAgents={onOpenSettingsAgents}
           agentModels={agentModels}
           harnessModels={harnessModels}
           onRefreshModels={onRefreshModels}
@@ -502,6 +515,8 @@ function RunPanelBody({
   stickyUserMessages,
   agents,
   harnesses,
+  profiles,
+  onOpenSettingsAgents,
   agentModels,
   harnessModels,
   onRefreshModels,
@@ -520,6 +535,8 @@ function RunPanelBody({
   stickyUserMessages: boolean;
   agents: AgentStatus[];
   harnesses: Harness[];
+  profiles: AgentProfile[];
+  onOpenSettingsAgents: () => void;
   agentModels: AgentModelMap;
   harnessModels: Record<string, { id: string; label?: string }[]>;
   onRefreshModels: (harnessId?: string) => Promise<void>;
@@ -545,6 +562,16 @@ function RunPanelBody({
 }) {
   const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
+  // Agent-profile header chip: `resolveTaskProfileDisplay` gives the
+  // deleted flag + summary (live profile until the task's first run — plan
+  // D2 — else the frozen snapshot); `agentProfileForCard` resolves the
+  // richer object `AgentProfileCard` itself renders from (model/effort/
+  // mode/instructions/skills), same live-or-snapshot preference.
+  const agentProfileDisplay = resolveTaskProfileDisplay(task, profiles, harnesses);
+  const agentProfileForCard: AgentProfile | AgentProfileSnapshot | null =
+    (task.agentProfileId ? (profiles.find((p) => p.id === task.agentProfileId) ?? null) : null)
+    ?? task.agentProfile
+    ?? null;
   const [runs, setRuns] = useState<Run[]>([]);
   /** Structured event stream — one entry per claude JSONL block or per
    *  codex stdout/stderr chunk. The renderer dispatches on `stream` to
@@ -3075,11 +3102,23 @@ function RunPanelBody({
           </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
-        <div className="mt-0.5 truncate text-xs text-muted-foreground">
-          {task.agent} · {task.column}
-          {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
-          {task.baseRef && (
-            <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
+        <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
+          <span className="truncate">
+            {task.agent} · {task.column}
+            {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
+            {task.baseRef && (
+              <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
+            )}
+          </span>
+          {agentProfileDisplay && agentProfileForCard && (
+            <span data-testid="task-agent-profile-chip" title={agentProfileDisplay.summary} className="shrink-0">
+              <AgentProfileCard
+                profile={agentProfileForCard}
+                harnesses={harnesses}
+                variant="chip"
+                deleted={agentProfileDisplay.deleted}
+              />
+            </span>
           )}
         </div>
       </header>
@@ -3151,6 +3190,8 @@ function RunPanelBody({
         task={task}
         agents={agents}
         harnesses={harnesses}
+        agentProfileDisplay={agentProfileDisplay}
+        onOpenSettingsAgents={onOpenSettingsAgents}
         agentModels={agentModels}
         harnessModels={harnessModels}
         onRefreshModels={onRefreshModels}
@@ -5935,6 +5976,8 @@ function TaskDetails({
   task,
   agents,
   harnesses,
+  agentProfileDisplay,
+  onOpenSettingsAgents,
   agentModels,
   harnessModels,
   onRefreshModels,
@@ -5944,6 +5987,13 @@ function TaskDetails({
   task: Task;
   agents: AgentStatus[];
   harnesses: Harness[];
+  /** Resolved agent-profile chip data for this task (`null` when the task
+   *  was never bound to a profile) — see `RunPanelBody`'s own computation,
+   *  reused here so the lock/hint/Detach affordances below and the header
+   *  chip never disagree on the profile's name / deleted state. */
+  agentProfileDisplay: TaskProfileDisplay | null;
+  /** "Manage agents…" — the bound-profile hint's sibling link into Settings. */
+  onOpenSettingsAgents: () => void;
   agentModels: AgentModelMap;
   harnessModels: Record<string, { id: string; label?: string }[]>;
   onRefreshModels: (harnessId?: string) => Promise<void>;
@@ -5956,7 +6006,27 @@ function TaskDetails({
   // Spins the Model row's ↻ button while a manual `onRefreshModels` probe is
   // in flight for this task's harness — mirrors NewTaskForm's affordance.
   const [refreshingModels, setRefreshingModels] = useState(false);
-  const editable = task.column !== "running" && task.column !== "blocked";
+  // A task bound to an agent profile (plan D5) locks the four dropdowns
+  // (+ cursor fast/max) regardless of run state — only Detach unlocks them.
+  // `runningLock` alone (the pre-existing rule) still gates the Detach
+  // button itself, so a bound task can't be detached mid-run.
+  const runningLock = task.column === "running" || task.column === "blocked";
+  const profileLock = task.agentProfileId != null;
+  const editable = !runningLock && !profileLock;
+  const [detaching, setDetaching] = useState(false);
+  const detachProfile = async () => {
+    setDetaching(true);
+    try {
+      await api.detachTaskAgentProfile(task.id);
+      // No local merge — the parent's 2s task poll (`App.tsx`) picks the
+      // cleared `agentProfileId`/`agentProfile` back up on its next tick,
+      // same as every other field this panel PATCHes via `save()` below.
+    } catch (e) {
+      toast.error("Couldn't detach agent", { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setDetaching(false);
+    }
+  };
   const kind = harnessKindOf(task.agent, harnesses);
   const selectedStatus = agents.find((a) => a.harnessId === task.agent);
 
@@ -6148,9 +6218,36 @@ function TaskDetails({
         </div>
 
         {!editable && (
-          <p className="text-[10px] italic text-muted-foreground">
-            Stop the run to change agent / mode / model / effort.
+          <p
+            className="text-[10px] italic text-muted-foreground"
+            data-testid={profileLock ? "task-agent-profile-hint" : undefined}
+          >
+            {profileLock
+              ? `Bound to agent "${agentProfileDisplay?.name ?? task.agentProfile?.name ?? ""}" — detach to edit.`
+              : "Stop the run to change agent / mode / model / effort."}
           </p>
+        )}
+
+        {profileLock && (
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 px-2 text-[10px]"
+              data-testid="task-agent-profile-detach"
+              disabled={runningLock || detaching}
+              onClick={() => void detachProfile()}
+            >
+              Detach
+            </Button>
+            <button
+              type="button"
+              onClick={onOpenSettingsAgents}
+              className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            >
+              Manage agents…
+            </button>
+          </div>
         )}
 
         <dl className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1 text-[11px]">

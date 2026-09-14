@@ -41,6 +41,7 @@ import { isMacPlatform } from "@/lib/platform";
 import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
+import { useAgentProfiles } from "@/lib/agent-profiles";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { FontSizeProvider, useFontSize } from "@/components/font-size-provider";
 import { ThemeProvider, useTheme } from "@/components/theme-provider";
@@ -165,6 +166,11 @@ function AppInner() {
   // harness step tell "not loaded yet" (skip the disabled/enabled
   // distinction) apart from "loaded, and it happens to be empty".
   const [harnessesLoaded, setHarnessesLoaded] = useState(false);
+  // Module-cached agent-profile list, shared with every mounted picker
+  // (NewTaskForm, RunPanel's header chip + task-details lock) so switching
+  // tabs/panels never re-triggers a redundant `GET /agent-profiles` — see
+  // `useAgentProfiles`'s own doc comment.
+  const { profiles, refresh: refreshProfiles } = useAgentProfiles();
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
   // Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`.
   // `discoveryReady` mirrors the daemon's boot discovery sweep: false until
@@ -1002,6 +1008,10 @@ function AppInner() {
     setSettingsInitialSection("harnesses");
     setSettingsOpen(true);
   }, []);
+  const openSettingsAgents = useCallback(() => {
+    setSettingsInitialSection("agents");
+    setSettingsOpen(true);
+  }, []);
   const onFocusNewTask = useCallback(() => {
     setNewTaskFocusNonce((n) => n + 1);
   }, []);
@@ -1516,6 +1526,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         <NewTaskForm
           agents={agents}
           harnesses={harnesses}
+          profiles={profiles}
+          onOpenSettingsAgents={openSettingsAgents}
           agentModels={agentModels}
           harnessModels={harnessModels}
           onRefreshModels={onRefreshModels}
@@ -1658,6 +1670,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         stickyUserMessages={stickyUserMessages}
         agents={agents}
         harnesses={harnesses}
+        profiles={profiles}
+        onOpenSettingsAgents={openSettingsAgents}
         agentModels={agentModels}
         harnessModels={harnessModels}
         onRefreshModels={onRefreshModels}
@@ -1754,6 +1768,11 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           // simplest correct option without threading a dedicated callback
           // through SettingsDialog.
           refetchOnboardingPref();
+          // Same posture as harnesses/saved-prompts (A4: no SSE broadcast for
+          // profile CRUD) — refetch once on close so an already-open picker
+          // elsewhere (NewTaskForm, RunPanel) picks up a create/edit/delete
+          // made in the Agents section without a remount.
+          void refreshProfiles();
         }}
         onChange={refreshAgents}
         homeDir={homeDir}

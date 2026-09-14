@@ -92,12 +92,18 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
       try {
         await client.deleteHarness(id);
       } catch (e) {
-        // 409 = harness in use; surface the blocking task ids.
+        // 409 = harness in use; surface the blocking task ids and — since
+        // agent profiles reference a harness too (see `HarnessInUseError`'s
+        // `profileIds`) — the blocking agent ids, so the user knows which
+        // Settings → Agents rows to repoint or remove first.
         if (e instanceof ApiError && e.status === 409) {
-          const ids = (e.body as { taskIds?: string[] })?.taskIds ?? [];
-          throw new Error(
-            `${e.message}${ids.length ? ` (tasks: ${ids.map((t) => t.slice(0, 8)).join(", ")})` : ""}`,
-          );
+          const body = (e.body ?? {}) as { taskIds?: string[]; profileIds?: string[] };
+          const ids = body.taskIds ?? [];
+          const profileIds = body.profileIds ?? [];
+          const parts: string[] = [];
+          if (ids.length) parts.push(`tasks: ${ids.map((t) => t.slice(0, 8)).join(", ")}`);
+          if (profileIds.length) parts.push(`agents: ${profileIds.map((p) => p.slice(0, 8)).join(", ")}`);
+          throw new Error(`${e.message}${parts.length ? ` (${parts.join("; ")})` : ""}`);
         }
         throw e;
       }

@@ -27,12 +27,13 @@ function template(overrides: Partial<HarnessTemplate> = {}): HarnessTemplate {
   };
 }
 
-const SECTION_IDS: SettingsSectionId[] = ["general", "harnesses", "git", "prompts"];
+const SECTION_IDS: SettingsSectionId[] = ["general", "harnesses", "agents", "git", "prompts"];
 
-test("SETTINGS_SECTIONS lists the four sidebar sections in order", () => {
+test("SETTINGS_SECTIONS lists the five sidebar sections in order", () => {
   expect(SETTINGS_SECTIONS).toEqual([
     { id: "general", label: "General" },
     { id: "harnesses", label: "Harnesses" },
+    { id: "agents", label: "Agents" },
     { id: "git", label: "Git Integration" },
     { id: "prompts", label: "Saved Prompts" },
   ]);
