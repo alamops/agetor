@@ -3,9 +3,10 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessQuota, HarnessUsage, Project, SavedPrompt, SentFileEntry, Task, TaskDraft, TaskFxRecovery, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import type { AgentKind, AgentProfile, AgentProfileSnapshot, BacklogMessage, BranchNamingConfig, Harness, HarnessQuota, HarnessUsage, Project, SavedPrompt, SentFileEntry, Task, TaskDraft, TaskFxRecovery, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
+import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -102,6 +103,15 @@ type TaskRow = {
   // clobber a live auto-resume timer). NULL for every task that isn't
   // currently paused.
   fx_recovery: string | null;
+  // The agent profile this task was launched from (migration 053), if any —
+  // a soft reference to `agent_profiles.id` plus a point-in-time JSON
+  // snapshot (`AgentProfileSnapshot`). Written exclusively by `tasks.insert`
+  // (at create time) and `tasks.setAgentProfile`'s targeted UPDATE, never by
+  // the generic `insert`/`update` SET clause below — same rationale as
+  // `sent_files`/`fx_recovery` above: an unrelated PATCH landing mid-first-run
+  // must not clobber the snapshot. Both NULL means "no agent".
+  agent_profile_id: string | null;
+  agent_profile: string | null;
   // Unread-indicator watermark pair (migration 045). Not spread into `Task`
   // directly — only the derived `unread` boolean is (see `toTask`). Written
   // exclusively by `tasks.noteAssistantEvent` / `tasks.markSeen`, never by
@@ -320,6 +330,94 @@ const parseSentFiles = (raw: unknown): SentFileEntry[] | null => {
   return out;
 };
 
+/** Every {@link AgentKind} value a stored `harnessKind` may legitimately
+ *  carry — mirrors the union in `shared/types.ts`. A snapshot whose
+ *  `harnessKind` isn't one of these is treated as corrupt (see
+ *  {@link parseAgentProfileSnapshot}) rather than cast blindly, since it
+ *  drives `AgentIcon`/`defaultModeFor`-style lookups on the client. */
+const AGENT_KINDS = new Set<string>(["claude-code", "codex", "cursor", "gemini", "fx"]);
+
+/**
+ * Normalize a raw `skills` value (from a JSON blob — either an
+ * {@link AgentProfile} row or a task's {@link AgentProfileSnapshot}) into the
+ * same shape `agentProfiles.insert`/`update` enforce: each entry run through
+ * {@link normalizeSkillName} (dropping anything that normalizes to `""`),
+ * deduplicated (first occurrence wins), and capped at
+ * `AGENT_PROFILE_LIMITS.skills`. A non-array input yields `[]`.
+ */
+const sanitizeSkillsList = (raw: unknown): string[] => {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (typeof entry !== "string") continue;
+    const name = normalizeSkillName(entry);
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+    if (out.length >= AGENT_PROFILE_LIMITS.skills) break;
+  }
+  return out;
+};
+
+/**
+ * Parse a task's stored `agent_profile` JSON column into an
+ * {@link AgentProfileSnapshot}, tolerating NULL (no agent bound), malformed
+ * JSON, and unexpected shapes — all collapse to `null`, same treatment as
+ * `parseSentFiles`/`parseTaskFxRecovery`. Every field is validated
+ * defensively since the snapshot drives display (chip, transcript preamble)
+ * without any further lookup: `id`/`name`/`harness`/`harnessLabel`/`model`
+ * must be strings, `harnessKind` must be a known {@link AgentKind},
+ * `effort`/`mode` a string or `null`, `fast`/`maxMode` coerced to booleans,
+ * `instructions` a string (default `""`), `skills` sanitized via
+ * {@link sanitizeSkillsList}, and `capturedAt` a number (default `0`).
+ */
+const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | null => {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const rec = parsed as Record<string, unknown>;
+
+  const id = rec.id;
+  const name = rec.name;
+  const harness = rec.harness;
+  const harnessLabel = rec.harnessLabel;
+  const model = rec.model;
+  const harnessKind = rec.harnessKind;
+  if (typeof id !== "string" || !id) return null;
+  if (typeof name !== "string" || !name) return null;
+  if (typeof harness !== "string" || !harness) return null;
+  if (typeof harnessLabel !== "string" || !harnessLabel) return null;
+  if (typeof model !== "string" || !model) return null;
+  if (typeof harnessKind !== "string" || !AGENT_KINDS.has(harnessKind)) return null;
+
+  const effort = rec.effort;
+  const mode = rec.mode;
+  const instructions = rec.instructions;
+  const capturedAt = rec.capturedAt;
+
+  return {
+    id,
+    name,
+    harness,
+    harnessKind: harnessKind as AgentKind,
+    harnessLabel,
+    model,
+    effort: typeof effort === "string" ? effort : null,
+    mode: typeof mode === "string" ? mode : null,
+    fast: rec.fast === true,
+    maxMode: rec.maxMode === true,
+    instructions: typeof instructions === "string" ? instructions : "",
+    skills: sanitizeSkillsList(rec.skills),
+    capturedAt: typeof capturedAt === "number" ? capturedAt : 0,
+  };
+};
+
 /** Optional pre-computed grouped counts, threaded in by `tasks.list()` so a
  *  multi-row query does one pass over each in-memory registry instead of a
  *  per-row `countPendingForTask`/`countTerminals` scan (289 tasks × 2 linear
@@ -365,6 +463,8 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   todoProgress: parseTodoProgress(r.todo_progress),
   sentFiles: parseSentFiles(r.sent_files),
   fxRecovery: parseTaskFxRecovery(r.fx_recovery),
+  agentProfileId: r.agent_profile_id ?? null,
+  agentProfile: parseAgentProfileSnapshot(r.agent_profile),
   // Derived, never stored: a monotonic-id watermark comparison, race-free by
   // construction (see migration 045's doc comment). NULL
   // `last_assistant_event_id` (no assistant event ever observed) always
@@ -416,9 +516,10 @@ export const tasks = {
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
           branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans, todo_progress,
+          agent_profile_id, agent_profile,
           last_assistant_event_id, last_seen_event_id,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -428,6 +529,8 @@ export const tasks = {
         t.draft ? JSON.stringify(t.draft) : null,
         JSON.stringify(t.plans ?? []),
         t.todoProgress ? JSON.stringify(t.todoProgress) : null,
+        t.agentProfileId ?? null,
+        t.agentProfile ? JSON.stringify(t.agentProfile) : null,
         // A brand-new task has never had an assistant event or a mark-seen
         // — both start NULL, which `toTask` reads as `unread: false`.
         null, null,
@@ -437,7 +540,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, unread: false, hasAssistantMessages: false, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
@@ -462,6 +565,15 @@ export const tasks = {
     // landing mid-pause must never silently cancel a live auto-resume
     // schedule or wipe the paused badge — that write also never bumps
     // `updated_at`.
+    // `agent_profile_id`/`agent_profile` (migration 053) join the same skip
+    // list too: they're written only by `tasks.insert` (create time) and
+    // `tasks.setAgentProfile` below via its own targeted UPDATE. A generic
+    // PATCH must never clobber the point-in-time snapshot — most pointedly,
+    // the copy-down of the profile's own fields (agent/model/effort/mode/
+    // fast/maxMode) that `startTask` performs right before a task's first
+    // run must not race a concurrent unrelated edit into silently detaching
+    // the profile — and, like the watermarks/`sent_files`/`fx_recovery`,
+    // this write never bumps `updated_at` either.
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
@@ -615,6 +727,25 @@ export const tasks = {
       `UPDATE tasks SET fx_recovery = ? WHERE id = ?`,
       [value ? JSON.stringify(value) : null, taskId],
     );
+  },
+  /**
+   * Bind (or detach, when both arguments are `null`) a task's agent profile
+   * in one targeted `UPDATE` — same pattern as `setFxRecovery` above: no
+   * `updated_at` bump (server-managed state, not a task mutation) and it
+   * bypasses the generic `update`'s SET clause entirely so a concurrent
+   * unrelated PATCH can't race it. Callers: `createTask` (initial bind),
+   * `startTask` (freshening the snapshot from the live profile right before
+   * a task's first run — see `docs/plans/agent-profiles.md` D2), and the
+   * detach route (`profileId`/`snapshot` both `null`). Doesn't check whether
+   * the task exists first — an `UPDATE ... WHERE id = ?` against a missing
+   * id simply matches zero rows, same as every other targeted UPDATE here.
+   */
+  setAgentProfile(taskId: string, profileId: string | null, snapshot: AgentProfileSnapshot | null): Task | null {
+    db.run(
+      `UPDATE tasks SET agent_profile_id = ?, agent_profile = ? WHERE id = ?`,
+      [profileId, snapshot ? JSON.stringify(snapshot) : null, taskId],
+    );
+    return this.get(taskId);
   },
   /**
    * Every non-archived task currently carrying a persisted fx pause whose
@@ -864,9 +995,17 @@ const toHarness = (r: HarnessRow): Harness => {
 
 export class HarnessInUseError extends Error {
   taskIds: string[];
-  constructor(taskIds: string[]) {
-    super(`harness in use by ${taskIds.length} task(s)`);
+  /** Ids of the {@link AgentProfile} rows referencing this harness — a
+   *  profile delete never populates this list (deleting a profile always
+   *  succeeds; only deleting the harness it points at can be refused). */
+  profileIds: string[];
+  constructor(taskIds: string[], profileIds: string[] = []) {
+    const parts: string[] = [];
+    if (taskIds.length > 0) parts.push(`${taskIds.length} task(s)`);
+    if (profileIds.length > 0) parts.push(`${profileIds.length} agent(s)`);
+    super(`harness in use by ${parts.length > 0 ? parts.join(" and ") : "0 task(s)"}`);
     this.taskIds = taskIds;
+    this.profileIds = profileIds;
     this.name = "HarnessInUseError";
   }
 }
@@ -1008,8 +1147,13 @@ export const harnesses = {
         `SELECT id FROM tasks WHERE agent = ?`,
       )
       .all(id);
-    if (inUse.length > 0) {
-      throw new HarnessInUseError(inUse.map((r) => r.id));
+    const inUseByProfiles = db
+      .query<{ id: string }, [string]>(
+        `SELECT id FROM agent_profiles WHERE harness_id = ?`,
+      )
+      .all(id);
+    if (inUse.length > 0 || inUseByProfiles.length > 0) {
+      throw new HarnessInUseError(inUse.map((r) => r.id), inUseByProfiles.map((r) => r.id));
     }
     db.run(`DELETE FROM harnesses WHERE id = ?`, [id]);
     // Drop any cached usage snapshot so a deleted alias doesn't leave an
@@ -1176,6 +1320,222 @@ export const savedPrompts = {
   },
 };
 
+/** Thrown by `agentProfiles.insert`/`update` when the (trimmed,
+ *  case-insensitive) name collides with an existing profile — the `409` the
+ *  server maps this to, and what makes `agetor add --profile <name>`
+ *  unambiguous (`matchAgentProfileRef` in `shared/agent-profile.ts`). */
+export class AgentProfileNameError extends Error {
+  constructor(name: string) {
+    super(`agent name "${name}" is already in use`);
+    this.name = "AgentProfileNameError";
+  }
+}
+
+/** True for a bun:sqlite `UNIQUE` constraint violation — the backstop that
+ *  catches a name-key clash from a concurrent write that slipped past the
+ *  `findByName` pre-check below (there is no cross-process locking here, so
+ *  the pre-check alone can't be relied on to be race-free). */
+const isUniqueConstraintError = (e: unknown): boolean =>
+  e instanceof Error && "code" in e && (e as { code?: unknown }).code === "SQLITE_CONSTRAINT_UNIQUE";
+
+type AgentProfileRow = {
+  id: string;
+  name: string;
+  name_key: string;
+  harness_id: string;
+  model: string;
+  effort: string | null;
+  mode: string | null;
+  fast: number;
+  max_mode: number;
+  instructions: string;
+  skills_json: string;
+  created_at: number;
+  updated_at: number;
+};
+
+/** Parse the stored `skills_json` column through the same sanitizer
+ *  {@link parseAgentProfileSnapshot} uses, tolerating malformed JSON or a
+ *  non-array top level (both collapse to `[]` rather than throwing) — a
+ *  profile row is our own write, but defensive parsing here costs nothing
+ *  and matches every other JSON column in this file. */
+const parseSkillsJson = (raw: string): string[] => {
+  try {
+    return sanitizeSkillsList(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+};
+
+const toAgentProfile = (r: AgentProfileRow): AgentProfile => ({
+  id: r.id,
+  name: r.name,
+  harness: r.harness_id,
+  model: r.model,
+  effort: r.effort,
+  mode: r.mode,
+  fast: r.fast === 1,
+  maxMode: r.max_mode === 1,
+  instructions: r.instructions,
+  skills: parseSkillsJson(r.skills_json),
+  createdAt: r.created_at,
+  updatedAt: r.updated_at,
+});
+
+export interface AgentProfileInsertInput {
+  name: string;
+  harness: string;
+  model: string;
+  effort?: string | null;
+  mode?: string | null;
+  fast?: boolean;
+  maxMode?: boolean;
+  instructions?: string;
+  skills?: string[];
+}
+
+export interface AgentProfilePatch {
+  name?: string;
+  harness?: string;
+  model?: string;
+  effort?: string | null;
+  mode?: string | null;
+  fast?: boolean;
+  maxMode?: boolean;
+  instructions?: string;
+  skills?: string[];
+}
+
+/** Validate + normalize the name/instructions fields shared by `insert` and
+ *  `update`: trims the name, rejects empty or over `AGENT_PROFILE_LIMITS.name`
+ *  with a plain `Error` (mirrors `harnesses.insert`'s id-format check —
+ *  these are caller/validation errors, not name-clash errors, so they're
+ *  never `AgentProfileNameError`), and rejects instructions over
+ *  `AGENT_PROFILE_LIMITS.instructions`. Returns the trimmed name and its
+ *  lower-cased `name_key`. */
+const validateAgentProfileNameAndInstructions = (name: string, instructions: string): { name: string; nameKey: string } => {
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error("agent name is required");
+  if (trimmed.length > AGENT_PROFILE_LIMITS.name) {
+    throw new Error(`agent name must be ${AGENT_PROFILE_LIMITS.name} characters or fewer`);
+  }
+  if (instructions.length > AGENT_PROFILE_LIMITS.instructions) {
+    throw new Error(`agent instructions must be ${AGENT_PROFILE_LIMITS.instructions} characters or fewer`);
+  }
+  return { name: trimmed, nameKey: trimmed.toLowerCase() };
+};
+
+/**
+ * Reusable, named launch presets (`AgentProfile`, `shared/types.ts`) —
+ * see `docs/plans/agent-profiles.md` for the full design. `harness_id` is a
+ * soft reference: this module never validates that the harness exists (the
+ * server does, via `harnesses.getByIdOrKind`, before calling `insert`) — a
+ * profile pointing at a since-deleted harness id is expected once
+ * `harnesses.delete`'s guard is bypassed by hand-editing the DB, and the
+ * webview/CLI render it gracefully via the task-side snapshot's own
+ * `harnessKind`/`harnessLabel` copy.
+ */
+export const agentProfiles = {
+  list(): AgentProfile[] {
+    return db
+      .query<AgentProfileRow, []>(
+        `SELECT * FROM agent_profiles ORDER BY name_key ASC, id ASC`,
+      )
+      .all()
+      .map(toAgentProfile);
+  },
+  get(id: string): AgentProfile | null {
+    const row = db
+      .query<AgentProfileRow, [string]>(`SELECT * FROM agent_profiles WHERE id = ?`)
+      .get(id);
+    return row ? toAgentProfile(row) : null;
+  },
+  /** Case-insensitive, trimmed name lookup — the backing query for the
+   *  unique-name check in `insert`/`update` and for `matchAgentProfileRef`'s
+   *  CLI `<id|name>` resolution. */
+  findByName(name: string): AgentProfile | null {
+    const row = db
+      .query<AgentProfileRow, [string]>(`SELECT * FROM agent_profiles WHERE name_key = ?`)
+      .get(name.trim().toLowerCase());
+    return row ? toAgentProfile(row) : null;
+  },
+  insert(input: AgentProfileInsertInput): AgentProfile {
+    const instructions = input.instructions ?? "";
+    const { name, nameKey } = validateAgentProfileNameAndInstructions(input.name, instructions);
+    if (this.findByName(name)) throw new AgentProfileNameError(name);
+
+    const skills = sanitizeSkillsList(input.skills ?? []);
+    const id = randomUUID();
+    const now = Date.now();
+    try {
+      db.run(
+        `INSERT INTO agent_profiles
+           (id, name, name_key, harness_id, model, effort, mode, fast, max_mode, instructions, skills_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id, name, nameKey, input.harness, input.model,
+          input.effort ?? null, input.mode ?? null,
+          input.fast ? 1 : 0, input.maxMode ? 1 : 0,
+          instructions, JSON.stringify(skills), now, now,
+        ],
+      );
+    } catch (e) {
+      if (isUniqueConstraintError(e)) throw new AgentProfileNameError(name);
+      throw e;
+    }
+    return this.get(id) as AgentProfile;
+  },
+  update(id: string, patch: AgentProfilePatch): AgentProfile | null {
+    const current = this.get(id);
+    if (!current) return null;
+
+    const nextNameRaw = patch.name !== undefined ? patch.name : current.name;
+    const nextInstructions = patch.instructions !== undefined ? patch.instructions : current.instructions;
+    const { name, nameKey } = validateAgentProfileNameAndInstructions(nextNameRaw, nextInstructions);
+    if (patch.name !== undefined) {
+      const clash = this.findByName(name);
+      if (clash && clash.id !== id) throw new AgentProfileNameError(name);
+    }
+
+    const next = {
+      harness: patch.harness ?? current.harness,
+      model: patch.model ?? current.model,
+      effort: patch.effort !== undefined ? patch.effort : current.effort,
+      mode: patch.mode !== undefined ? patch.mode : current.mode,
+      fast: patch.fast ?? current.fast,
+      maxMode: patch.maxMode ?? current.maxMode,
+      skills: patch.skills !== undefined ? sanitizeSkillsList(patch.skills) : current.skills,
+    };
+
+    try {
+      db.run(
+        `UPDATE agent_profiles SET
+           name = ?, name_key = ?, harness_id = ?, model = ?, effort = ?, mode = ?, fast = ?, max_mode = ?, instructions = ?, skills_json = ?, updated_at = ?
+         WHERE id = ?`,
+        [
+          name, nameKey, next.harness, next.model, next.effort, next.mode,
+          next.fast ? 1 : 0, next.maxMode ? 1 : 0, nextInstructions, JSON.stringify(next.skills),
+          Date.now(), id,
+        ],
+      );
+    } catch (e) {
+      if (isUniqueConstraintError(e)) throw new AgentProfileNameError(name);
+      throw e;
+    }
+    return this.get(id);
+  },
+  /** Deleting a profile always succeeds — a task that was launched from it
+   *  keeps its own frozen snapshot (D7 in the plan), so there is nothing to
+   *  guard against here the way `harnesses.delete` must guard against
+   *  in-use tasks/profiles. */
+  delete(id: string): boolean {
+    const current = this.get(id);
+    if (!current) return false;
+    db.run(`DELETE FROM agent_profiles WHERE id = ?`, [id]);
+    return true;
+  },
+};
+
 type RunRow = {
   id: string; task_id: string; agent: string; status: string;
   started_at: number; ended_at: number | null; exit_code: number | null;
@@ -1210,6 +1570,20 @@ export const runs = {
     return db.query<RunRow, [string]>(
       `SELECT * FROM runs WHERE task_id = ? ORDER BY started_at DESC`,
     ).all(taskId).map(toRun);
+  },
+  /**
+   * Total run count for a task, across every status — the "has this task
+   * ever run" test `effectiveAgentProfile` (docs/plans/agent-profiles.md D2)
+   * uses to decide whether a bound agent profile is still "live" (follows
+   * edits) or frozen to its captured snapshot. A plain `COUNT(*)` rather
+   * than `listForTask(...).length` so the caller isn't paying to materialize
+   * every run row just to check the count.
+   */
+  countForTask(taskId: string): number {
+    const row = db.query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM runs WHERE task_id = ?`,
+    ).get(taskId);
+    return row?.n ?? 0;
   },
   get(id: string): Run | null {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);

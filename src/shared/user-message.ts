@@ -21,6 +21,7 @@
 // Regex-based, small pure functions, same convention as `prompt-noise.ts` /
 // `diff-selection.ts`.
 import { REFS_HEADING } from "./refs.ts";
+import { AGENT_INSTRUCTIONS_TAG } from "./agent-profile.ts";
 
 export interface CommandInvocation {
   /** Command name including the leading slash, e.g. "/implement". */
@@ -855,6 +856,10 @@ function segmentPlainLines(segments: readonly MessageSegment[]): PlainLine[] {
     if (seg.name === "bash-stderr") {
       const t = seg.body.trim();
       if (t) lines.push({ label: "err›", text: t, tone: "error" });
+      continue;
+    }
+    if (seg.name === AGENT_INSTRUCTIONS_TAG) {
+      lines.push({ label: "agent›", text: seg.body.trim(), tone: "tag" });
       continue;
     }
     lines.push({ label: `${seg.name}${seg.attrs ? ` ${seg.attrs}` : ""}›`, text: seg.body.trim(), tone: "tag" });

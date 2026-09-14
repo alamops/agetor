@@ -66,6 +66,8 @@ import m048 from "./048_issue_url.sql" with { type: "text" };
 import m049 from "./049_retire_gemini_3_pro_preview.sql" with { type: "text" };
 import m050 from "./050_sent_files.sql" with { type: "text" };
 import m051 from "./051_fx_recovery.sql" with { type: "text" };
+import m052 from "./052_agent_profiles.sql" with { type: "text" };
+import m053 from "./053_task_agent_profile.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -125,4 +127,6 @@ export const migrations: Migration[] = [
   { id: "049_retire_gemini_3_pro_preview", sql: m049 },
   { id: "050_sent_files", sql: m050 },
   { id: "051_fx_recovery", sql: m051 },
+  { id: "052_agent_profiles", sql: m052 },
+  { id: "053_task_agent_profile", sql: m053 },
 ];
