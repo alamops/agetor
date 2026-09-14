@@ -253,6 +253,24 @@ describe("supportedEfforts with discovered efforts", () => {
     const ids = supportedEfforts("cursor", "cursor-grok-4.6", ["low"]).map((o) => o.id);
     expect(ids).toEqual(["low"]);
   });
+
+  test("auto is dropped from a non-fx kind's discovered set — a discovered 'auto' never surfaces Model default on codex", () => {
+    const ids = supportedEfforts("codex", "gpt-6-astra", ["auto", "high", "low"]).map((o) => o.id);
+    expect(ids).toEqual(["high", "low"]);
+    expect(ids).not.toContain("auto");
+  });
+
+  test("auto-only discovery on a non-fx kind falls back to the curated table (nothing known after the drop)", () => {
+    const ids = supportedEfforts("claude-code", "opus-5", ["auto"]).map((o) => o.id);
+    const curated = supportedEfforts("claude-code", "opus-5").map((o) => o.id);
+    expect(ids).toEqual(curated);
+    expect(ids).not.toContain("auto");
+  });
+
+  test("fx keeps a discovered auto id", () => {
+    const ids = supportedEfforts("fx", "zai/glm-5.3-flash", ["auto", "low"]).map((o) => o.id);
+    expect(ids).toEqual(["low", "auto"]);
+  });
 });
 
 describe("AgentOption / ModelOption efforts field placement", () => {

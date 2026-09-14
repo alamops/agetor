@@ -2128,7 +2128,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
   { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where Cursor exposes it." },
   { id: "none", label: "No thinking", hint: "Skip thinking where the model exposes a no-thinking variant." },
-  { id: "auto", label: "Model default", hint: "Let the model/gateway pick its own reasoning level — fx only today (fx's `auto`, its 'default' option)." },
+  { id: "auto", label: "Model default", hint: "Let the model/gateway pick its own reasoning level — fx only today (fx's `auto`, its 'default' option). fx-only by construction: curated tables and the discovered branch both keep it off every other kind." },
 ];
 
 /**
@@ -2289,10 +2289,15 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
  * set for this exact model, when a caller has one (see `ModelOption.efforts`
  * and `discoveredEffortsFor` in `src/shared/model-options.ts`). Precedence:
  * a non-empty `discoveredEfforts` wins outright — the result is
- * `EFFORT_OPTIONS` filtered to it (canonical highest→lowest order) — unless
- * none of its ids are known to agetor, in which case we fall through to the
- * curated table below. `undefined`, `null`, or an empty array behave exactly
- * like the two-argument call (today's curated-table-only behaviour). The
+ * `EFFORT_OPTIONS` filtered to it (canonical highest→lowest order), with
+ * `auto` additionally dropped from the filter for every kind but fx (`auto`
+ * is fx-only by construction — see the `EFFORT_OPTIONS` row comment — so a
+ * non-fx harness that discovers an `auto` id, e.g. codex's `model/list
+ * supportedReasoningEfforts`, must never surface a "Model default" row) —
+ * unless that leaves none of its ids known to agetor, in which case we fall
+ * through to the curated table below. `undefined`, `null`, or an empty array
+ * behave exactly like the two-argument call (today's curated-table-only
+ * behaviour). The
  * curated table stays the fallback rather than the source of truth because
  * discovery is best-effort and account-scoped (a harness may be absent,
  * unauthenticated, or on an older CLI that can't discover at all): the
@@ -2313,7 +2318,14 @@ export function supportedEfforts(
   if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor)) return [];
   if (discoveredEfforts && discoveredEfforts.length > 0) {
     const discoveredAllowed = new Set(discoveredEfforts);
-    const fromDiscovery = EFFORT_OPTIONS.filter((o) => discoveredAllowed.has(o.id));
+    // `auto` is fx-only by construction (see the EFFORT_OPTIONS row comment):
+    // a non-fx harness that happens to discover an "auto" id (e.g. codex's
+    // `model/list supportedReasoningEfforts`) must not surface a "Model
+    // default" row or pass `auto` through to a flag that doesn't understand
+    // it, so it's dropped from the discovered set before filtering for every
+    // kind but fx.
+    const fromDiscovery = EFFORT_OPTIONS.filter((o) =>
+      discoveredAllowed.has(o.id) && (agent === "fx" || o.id !== "auto"));
     if (fromDiscovery.length > 0) return fromDiscovery;
   }
   const key = model ?? DEFAULT_MODEL[agent];

@@ -383,13 +383,18 @@ import {
  *     session, so this always resolves `.exact` — nothing for this driver to
  *     change.
  *   - **`initialize` leniency (0.0.8, unchanged through 0.0.10)** —
- *     `protocolVersion: 999` (a value fx doesn't recognize) is accepted
- *     rather than rejected; this driver keeps
- *     sending the number `1` regardless, so nothing here changes driver
- *     behavior (see the inline comment on the `initialize` call in
- *     `runFxTurn` — it used to also claim a *stringified* protocolVersion
- *     gets rejected with -32602, but that was never actually spike-verified;
- *     dropped). `promptCapabilities.image` in the `initialize` result is now
+ *     `protocolVersion: 999` (a value fx doesn't recognize but well-typed as
+ *     a number) is accepted rather than rejected; this driver keeps sending
+ *     the number `1` regardless, so nothing here changes driver behavior
+ *     (see the inline comment on the `initialize` call in `runFxTurn`).
+ *     **A *stringified* `protocolVersion` is rejected**, re-verified today
+ *     (2026-09-14) on both 0.0.10 and 0.0.8:
+ *     `{"protocolVersion":"1", …}` → `-32602 "Invalid initialize params"` on
+ *     each (`scratchpad/spikes/fx-0010-probe/acp-0.0.10-pv-str1-out.txt`,
+ *     `acp-0.0.8-pv-str1-out.txt`) — the driver has always sent the number,
+ *     so nothing changes here either; this just restores the fact after an
+ *     earlier pass wrongly dropped it as "never spike-verified".
+ *     `promptCapabilities.image` in the `initialize` result is now
  *     `true` (was previously unset/false) — agetor's composer sends text +
  *     file references only, never an image content block, so this is inert
  *     for us too.
@@ -494,16 +499,32 @@ import {
  *     12 advertise none. Example (the owner's default model): `zai/glm-5.3-
  *     flash` → `auto, low, high, max`. **`session/set_config_option
  *     {sessionId, configId:"effort", value}` sets it** (`server.zig:2222-
- *     2247`, see `applyFxEffort` below): `auto`/`adaptive`/`default` all
- *     parse to fx's own default; an unrecognized value → `-32602 "Invalid
- *     reasoning effort"`; a value the active model doesn't list → `-32602
- *     "Reasoning effort is not available for the active model"`; no option
- *     at all on the active model → `-32602 "Reasoning effort is unavailable
- *     for the active model"`. The set PERSISTS on the session
- *     (`commitActiveSessionEffort`) — a later `session/resume`/`session/load`
- *     reports the persisted value as `currentValue`, live-verified
- *     (`set_config_option effort=high` echoed back `currentValue:"high"` on
- *     a subsequent `session/resume`). **On a 0.0.8 binary the same call is a
+ *     2247`, see `applyFxEffort` below; `ReasoningEffort.parse` in
+ *     `src/core/shared/types.zig` accepts any ≤64-byte alphanumeric/`-_.`
+ *     name, so "unrecognized" and "not listed for this model" are the SAME
+ *     error path, live-verified: `configId:"effort", value:"bogus-value"`
+ *     against `zai/glm-5.3-flash` answered `-32602 "Reasoning effort is not
+ *     available for the active model"`, not "Invalid reasoning effort" —
+ *     `scratchpad/spikes/fx-0010-probe/acp-0.0.10-effort2-out.txt:9`).
+ *     `auto`/`adaptive`/`default` all parse to fx's own default; a value the
+ *     active model doesn't list — INCLUDING any unrecognized-but-well-formed
+ *     id — → `-32602 "Reasoning effort is not available for the active
+ *     model"`; a value fx's parser rejects outright (empty, over 64 bytes, or
+ *     containing a character outside alphanumeric/`-_.`) → `-32602 "Invalid
+ *     reasoning effort"`; no option at all on the active model → `-32602
+ *     "Reasoning effort is unavailable for the active model"`. The set
+ *     PERSISTS on the session (`commitActiveSessionEffort` → a
+ *     `preferences_changed` session event → `session_log.zig`'s projection,
+ *     re-emitted by `writeLoadSessionResponse`'s `configOptions`,
+ *     source-derived — the probe only ran `session/new` + two
+ *     `set_config_option` calls, never a subsequent `session/resume`/`load`
+ *     to observe the echoed value survive a round trip; that live check is
+ *     still open on the §3.6 live-smoke checklist. Live-verified today is
+ *     narrower: `set_config_option effort=high` echoes `currentValue:"high"`
+ *     back in ITS OWN response. Worst case if the persistence claim is wrong
+ *     is one redundant `set_config_option` RPC per turn — `applyFxEffort`
+ *     already re-sends whenever its locally-tracked `currentValue` disagrees,
+ *     so nothing breaks either way). **On a 0.0.8 binary the same call is a
  *     silent no-op** — no error, but `currentValue` never changes, because
  *     0.0.8 never advertises the `effort` configOptions entry at all (this
  *     driver's `parseFxEffortOption` returns `null` for such a result, which
@@ -721,8 +742,36 @@ interface FxSessionState {
    *  LINE is suppressed, since that line already reached the transcript on
    *  the run where the pause actually happened and re-firing it on every
    *  resume would spam a stale explanation into every follow-up turn) and
-   *  the session-title sentinel. */
+   *  the session-title sentinel.
+   *
+   *  **Cleared in `handleLine`, not in the `await sendRpc(...)` continuation
+   *  in `runFxTurn`.** `pumpStdout` drains a whole stdout chunk
+   *  synchronously, dispatching every complete line it contains to
+   *  `handleLine` in one pass; the `await` on the `session/resume` call only
+   *  resumes as a microtask AFTER that synchronous pass finishes. So a
+   *  `session/update` notification fx writes into the SAME stdout chunk as
+   *  the `session/resume` response — after the response line, still before
+   *  agetor's own `session/prompt` — would reach `handleServerNotification`
+   *  while `replaying` was still `true` if the flag were only flipped by the
+   *  awaiting code, dropping a genuinely-live update as if it were replay.
+   *  `handleLine`'s reply branch clears `replaying` (and `lastRecoveryJson`,
+   *  `replayRpcId`) the instant it observes the matching reply line, which
+   *  is correctly ordered relative to every other line in that same chunk;
+   *  `runFxTurn`'s resets after `await sendRpc(...)` resolves are kept as
+   *  belt-and-braces (idempotent — a no-op once `handleLine` already did it)
+   *  for the success/error/timeout paths that never reach `handleLine` at
+   *  all. Latent today — fx emits nothing between the `session/resume`
+   *  response and agetor's own `session/prompt` — but real for a future
+   *  0.0.9-style structured-replay frame that lands late. See
+   *  `replayRpcId`. */
   replaying?: boolean;
+  /** The JSON-RPC id of the in-flight `session/resume` call, set right
+   *  before `sendRpc(state, "session/resume", …)` is issued and read (then
+   *  cleared) by `handleLine`'s reply branch to know WHICH reply line means
+   *  "the replay window closed" — see `replaying`'s doc above for why that
+   *  can't just be "whenever `runFxTurn`'s await resumes". Cleared on both
+   *  the success and error reply paths. */
+  replayRpcId?: number;
   /** Set when a `paused` recovery update arrives while `replaying` is true
    *  — i.e. `session/resume` replayed a paused checkpoint onto this run.
    *  Read once a NORMAL (non-`continueRecovery`) `session/prompt` call has
@@ -994,6 +1043,17 @@ function handleLine(state: FxSessionState, line: string): void {
     const pending = state.pending.get(id);
     if (!pending) return; // stale/unknown id — ignore
     state.pending.delete(id);
+    // Close the `session/resume` replay window the instant its reply LINE
+    // is observed, not whenever `runFxTurn`'s `await sendRpc(...)` happens
+    // to resume as a microtask — see `FxSessionState.replaying`'s doc for
+    // why those can differ within one stdout chunk. Covers both the
+    // success and error reply shapes; `runFxTurn`'s own resets after the
+    // `await` are a harmless no-op once this has already run.
+    if (state.replaying && state.replayRpcId === id) {
+      state.replaying = false;
+      state.lastRecoveryJson = undefined;
+      state.replayRpcId = undefined;
+    }
     if (msg.error) {
       const rawMessage = msg.error.message ?? "fx acp error";
       pending.reject(
@@ -2166,10 +2226,13 @@ export function extractFxProviderValue(result: unknown): string | null {
  *  the file header's "Facts new in fx 0.0.9" section). Returns `null` when
  *  `configOptions` isn't an array, or carries no entry whose `id` is
  *  `"effort"` — the case on a 0.0.8 binary, and on any binary when the
- *  active model doesn't advertise efforts at all. Distinct from a present
- *  entry with an empty `values` array (a genuinely-offered-but-empty option
- *  list, which `applyFxEffort` treats the same as "not offered" for any
- *  concrete effort id). Pure and exported so the fake-ACP-server driver
+ *  active model doesn't advertise efforts at all. A present entry with an
+ *  empty `values` array (an `effort` id with nothing actually offered) is
+ *  returned as `{current, values: []}`, NOT folded into the `null` case
+ *  here — `applyFxEffort` is the one that treats the two as equivalent
+ *  ("option absent"), so a caller that wants to tell "no entry at all" from
+ *  "entry present but empty" apart can still do so. Pure and exported so the
+ *  fake-ACP-server driver
  *  tests can exercise it without spawning a child; tolerates every
  *  malformed shape without throwing: a non-string `currentValue` reads as
  *  `null`, a missing/non-array `options` reads as `values: []`, and a
@@ -2204,17 +2267,25 @@ export function parseFxEffortOption(configOptions: unknown): { current: string |
  *
  *  Decision table (see docs/plans/fx-0.0.10-compat.md §3.3):
  *    - `effort` null                                  → silent, no RPC.
- *    - `configOptions` carries no `effort` entry AND
+ *    - `configOptions` carries no `effort` entry, OR
+ *      carries one with an empty `values` list
+ *      ("option absent" — the two are treated the same,
+ *      see `parseFxEffortOption`'s doc) AND
  *      `effort !== "auto"`                             → status breadcrumb,
  *                                                          no RPC.
- *    - `configOptions` carries no `effort` entry AND
+ *    - "option absent" (as above) AND
  *      `effort === "auto"`                             → silent (fx's own
  *                                                          default needs no
  *                                                          nudge when the
  *                                                          model can't even
- *                                                          set one).
- *    - entry present but doesn't list `effort`          → status breadcrumb
- *                                                          naming the offered
+ *                                                          set one — this
+ *                                                          also covers a
+ *                                                          present-but-empty
+ *                                                          entry, not just a
+ *                                                          missing one).
+ *    - entry present, non-empty, but doesn't list `effort` → status
+ *                                                          breadcrumb naming
+ *                                                          the offered
  *                                                          values, no RPC.
  *    - entry present, lists `effort`,
  *      `currentValue === effort` already                → silent, no RPC.
@@ -2238,7 +2309,15 @@ async function applyFxEffort(
   const parsed = parseFxEffortOption(
     (sessionResult as { configOptions?: unknown } | undefined)?.configOptions,
   );
-  if (parsed === null) {
+  // A missing `effort` entry and a present-but-empty one (`values: []`,
+  // e.g. `auto` is the only thing fx would ever offer to begin with) are
+  // both "the model exposes no reasoning-effort setting" — neither has a
+  // concrete value for `effort` to match against or set, so both take the
+  // same silent-for-auto / breadcrumb-otherwise path (see the decision
+  // table above and Phase 5 review: this used to send an empty-`values`
+  // entry into the "isn't offered (offers: )" breadcrumb below instead,
+  // which is wrong even for `effort === "auto"`).
+  if (parsed === null || parsed.values.length === 0) {
     if (effort === "auto") return;
     emit(
       state,
@@ -2354,13 +2433,15 @@ async function runFxTurn(
       sendRpc(state, "initialize", {
         // Send the NUMBER 1 — ACP's schema defines protocolVersion as a
         // number and this driver has always sent one, so nothing here
-        // changes. (A prior version of this comment claimed fx rejects a
-        // *stringified* protocolVersion with -32602; that was never
-        // actually spike-verified — the probe scenario meant to test it
-        // sent numeric 1 by mistake — so the claim is dropped. What IS
-        // 0.0.8 spike-verified: an unrecognized numeric protocolVersion,
-        // e.g. 999, is accepted leniently rather than rejected. Neither
-        // fact changes what this driver sends.)
+        // changes. Re-verified 2026-09-14 on both 0.0.10 and 0.0.8: a
+        // *stringified* protocolVersion (`"1"`) IS rejected with
+        // `-32602 "Invalid initialize params"`
+        // (scratchpad/spikes/fx-0010-probe/acp-0.0.10-pv-str1-out.txt,
+        // acp-0.0.8-pv-str1-out.txt) — an earlier pass of this comment
+        // wrongly dropped that fact as "never spike-verified". Separately,
+        // an unrecognized but well-typed NUMERIC protocolVersion, e.g. 999,
+        // is accepted leniently rather than rejected. Neither fact changes
+        // what this driver sends.
         protocolVersion: 1,
         clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
         clientInfo: { name: "agetor", version: "0" },
@@ -2393,6 +2474,12 @@ async function runFxTurn(
     // instead (`state.suppressUpdates`, which drops EVERY kind including
     // `session_info_update`) and needs no flag of its own.
     state.replaying = true;
+    // Recorded so `handleLine`'s reply branch can close the replay window
+    // the instant it SEES this reply's line — see `FxSessionState.replaying`
+    // and `replayRpcId`'s docs. `sendRpc` assigns `state.nextRpcId` and
+    // increments it synchronously before this call returns, so reading it
+    // first is exactly the id the resume request goes out with.
+    state.replayRpcId = state.nextRpcId;
     let resumeResult: unknown;
     try {
       resumeResult = await withTimeout(
@@ -2400,7 +2487,13 @@ async function runFxTurn(
         RPC_HANDSHAKE_TIMEOUT_MS,
         "session/resume",
       );
-      state.replaying = false;
+      // Belt-and-braces: `handleLine`'s reply branch already cleared
+      // `replaying`/`lastRecoveryJson`/`replayRpcId` the instant it observed
+      // this reply's line (see its doc for why that matters within one
+      // stdout chunk) — these are a no-op on that path. They still matter
+      // on their own for a resolution that DIDN'T go through `handleLine`
+      // (none exist today, but keeping the resets here costs nothing and
+      // guards against future codepaths that resolve `sendRpc` another way).
       // Reset the dedupe key the replay window just seeded — see finding #2
       // ("replay-seeded dedupe can swallow the first live payload of a
       // resumed turn") in the file header's recovery-channel facts. Without
@@ -2408,12 +2501,15 @@ async function runFxTurn(
       // byte-identical to the last replayed one (e.g. a continueRecovery
       // turn that immediately re-pauses at the same attempt/message) would
       // be silently deduped against the replay and never reach the user.
+      state.replaying = false;
       state.lastRecoveryJson = undefined;
+      state.replayRpcId = undefined;
       maybeEmitProvider(resumeResult);
       resumed = true;
     } catch (err) {
       state.replaying = false;
       state.lastRecoveryJson = undefined;
+      state.replayRpcId = undefined;
       if (isTimeoutError(err)) {
         failTurn(state, describeHandshakeFailure(err, "session/resume", RPC_HANDSHAKE_TIMEOUT_MS));
         return;

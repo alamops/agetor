@@ -177,6 +177,21 @@ const FAKE_ACP_SERVER_SRC = [
   "  // \"effort-option-absent\" and everything else deliberately get no",
   "  // configOptions field at all — the 0.0.8-shaped result parseFxEffortOption",
   "  // must read as \"no effort entry\" (returns null).",
+  "  if (scenario === \"effort-option-empty\") {",
+  "    // Phase 5 review fix: a PRESENT effort entry with an empty options",
+  '    // list — genuinely-offered-but-nothing-to-offer — must be treated the',
+  '    // same as an absent entry by applyFxEffort, not routed into the',
+  '    // "isn\'t offered (offers: )" breadcrumb.',
+  "    result.configOptions = [{",
+  '      id: "effort",',
+  '      name: "Reasoning Effort",',
+  '      description: "Controls how much the model thinks before responding",',
+  '      category: "thought_level",',
+  '      type: "select",',
+  '      currentValue: "auto",',
+  "      options: []",
+  "    }];",
+  "  }",
   "  ok(id, result);",
   "}",
   "",
@@ -218,6 +233,23 @@ const FAKE_ACP_SERVER_SRC = [
   "    // Force the session/load fallback so the effort option is applied",
   "    // from the LOAD result instead of resume's (TT1 scenario 7).",
   '    fail(id, -32602, "Invalid params (fake, forcing fallback for effort-on-load)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-same-chunk-update") {',
+  "    // Phase 5 review fix: pumpStdout drains a whole stdout chunk",
+  "    // synchronously (handleLine called for every complete line in it)",
+  "    // before the driver's `await sendRpc(..., \"session/resume\")` ever",
+  "    // resumes as a microtask — so a session/update that fx writes into",
+  "    // the SAME chunk as the resume response must be judged by the line",
+  "    // ORDER within that chunk, not by whether the awaiting code has run",
+  "    // yet. One raw process.stdout.write call, three newline-terminated",
+  "    // JSON lines: a replayed tool_call (still inside the replay window —",
+  "    // must be dropped), the session/resume response itself (closes the",
+  "    // window), then a live agent_message_chunk (must NOT be dropped).",
+  "    var sameChunkToolCall = JSON.stringify({ jsonrpc: \"2.0\", method: \"session/update\", params: { update: { sessionUpdate: \"tool_call\", toolCallId: \"same-chunk-hist-1\", name: \"shell\", title: \"Run ls (replayed)\", kind: \"execute\", status: \"pending\", rawInput: { command: \"ls\" } } } });",
+  "    var sameChunkResponse = JSON.stringify({ jsonrpc: \"2.0\", id: id, result: {} });",
+  "    var sameChunkLiveUpdate = JSON.stringify({ jsonrpc: \"2.0\", method: \"session/update\", params: { update: { sessionUpdate: \"agent_message_chunk\", messageId: \"same-chunk-msg\", content: { type: \"text\", text: \"same-chunk live text\" } } } });",
+  '    process.stdout.write(sameChunkToolCall + "\\n" + sameChunkResponse + "\\n" + sameChunkLiveUpdate + "\\n");',
   "    return;",
   "  }",
   '  if (scenario === "resume-replay-structured") {',
@@ -524,6 +556,13 @@ const FAKE_ACP_SERVER_SRC = [
   "    return;",
   "  }",
   '  if (scenario === "stall-for-drop") {',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-same-chunk-update") {',
+  "    // Everything this scenario needs to prove was already sent, in one",
+  "    // stdout chunk, from handleSessionResume above — just end the turn so",
+  "    // the coalescer flushes and the run settles.",
+  '    endTurn(id, 15, "end_turn");',
   "    return;",
   "  }",
   '  if (scenario === "resume-replay-structured") {',
@@ -2276,6 +2315,45 @@ describe("applyFxEffort — configOptions carries no effort entry at all (0.0.8-
   }, 10_000);
 });
 
+describe("applyFxEffort — configOptions carries a PRESENT-but-EMPTY effort entry (Phase 5 review fix)", () => {
+  test("effort set → the same 'exposes no reasoning-effort setting' breadcrumb as an absent entry, no RPC", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-empty", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    const matching = statusChunks.filter(
+      (c) => c.data === "fx: zai/glm-5.3-flash exposes no reasoning-effort setting — running at fx's default",
+    );
+    expect(matching).toHaveLength(1);
+    // Regression guard: before the fix, a present-but-empty `values` list
+    // fell into the "isn't offered" breadcrumb instead, which would read
+    // "(offers: )" here.
+    expect(statusChunks.some((c) => c.data.includes("isn't offered"))).toBe(false);
+  }, 10_000);
+
+  test("effort 'auto' → silent (no breadcrumb, no RPC) — same as an absent entry", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-empty", {
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("reasoning-effort"))).toBe(false);
+  }, 10_000);
+});
+
 describe("applyFxEffort — session/set_config_option RPC error degrades to a breadcrumb (TT1 scenario 5)", () => {
   test("carries fx's own error message verbatim; session/prompt is still sent and the turn completes", async () => {
     const { agent, chunks, captureFile } = spawnFake("effort-set-error", {
@@ -2473,6 +2551,37 @@ describe("session/resume structured replay (0.0.9+) is suppressed except session
       // The LIVE assistant text DID arrive.
       const assistantChunks = chunks.filter((c) => c.stream === "assistant");
       expect(assistantChunks.some((c) => c.data === "live answer")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("session/resume replay window closes on the reply LINE, not on the awaiting microtask (Phase 5 review fix)", () => {
+  test(
+    "a live update in the SAME stdout chunk as the resume response reaches onChunk; a replayed update earlier in that same chunk is still dropped",
+    async () => {
+      const { agent, chunks } = spawnFake("resume-same-chunk-update", {
+        resumeSessionId: "resume-same-chunk-1",
+      });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      // The replayed tool_call, written BEFORE the resume response in the
+      // same raw stdout.write call, is still inside the replay window by
+      // line order and must be dropped exactly as it would be if it had
+      // arrived in its own separate chunk.
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:same-chunk-hist-1:use")).toBe(false);
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:same-chunk-hist-1:result")).toBe(false);
+
+      // The live agent_message_chunk, written AFTER the resume response in
+      // that SAME chunk, must reach onChunk as an assistant event — this is
+      // the regression the fix closes: before it, `state.replaying` was
+      // only cleared once `runFxTurn`'s `await sendRpc(...)` resumed as a
+      // microtask, which happens strictly after pumpStdout finishes
+      // draining every line already in the buffer, so this line would have
+      // been wrongly dropped as replay too.
+      const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+      expect(assistantChunks.some((c) => c.data === "same-chunk live text")).toBe(true);
     },
     10_000,
   );

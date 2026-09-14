@@ -100,13 +100,20 @@ async function enableFxHarness(backend: E2EBackend): Promise<void> {
  *  through `POST /tasks`' `Partial<Task>` body verbatim, per server.ts) —
  *  added for the effort-picker/breadcrumb tests below, which need a specific
  *  (model, effort) pair rather than the row's usual unset defaults; every
- *  existing call site omits `opts` and is unaffected. */
+ *  existing call site omits `opts` and is unaffected. `opts.mode` overrides
+ *  the row's stored `mode` the same way — needed by the permission-card
+ *  tests below now that `AGENT_OPTIONS.fx.modes` (and `defaultModeFor("fx")`)
+ *  default an unset mode to `yolo` ("Full access"): the fake permission
+ *  scenario (src/bun/agents.ts) mirrors the real driver's client-side
+ *  auto-allow under `yolo` and never registers a card for it, so a test that
+ *  wants the card must ask for `ask`/`auto` explicitly rather than rely on
+ *  the row's default. */
 async function createAndStartFakeFxTask(
   request: APIRequestContext,
   backend: E2EBackend,
   title: string,
   promptMarker?: string,
-  opts?: { model?: string; effort?: string | null },
+  opts?: { model?: string; effort?: string | null; mode?: string },
 ): Promise<TaskRow> {
   const auth = { authorization: `Bearer ${backend.apiToken}` };
   const prompt = promptMarker ? `${promptMarker} ${title}` : title;
@@ -120,6 +127,7 @@ async function createAndStartFakeFxTask(
       workdir: tmpdir(),
       ...(opts?.model !== undefined ? { model: opts.model } : {}),
       ...(opts?.effort !== undefined ? { effort: opts.effort } : {}),
+      ...(opts?.mode !== undefined ? { mode: opts.mode } : {}),
     },
   });
   expect(createRes.ok(), `POST /tasks -> ${createRes.status()}: ${await createRes.text()}`).toBeTruthy();
@@ -357,7 +365,11 @@ test.describe("fx interactions", () => {
     backend,
   }) => {
     const title = `fx-permission-allow-e2e ${randomUUID()}`;
-    await createAndStartFakeFxTask(request, backend, title, FAKE_FX_PERMISSION_PROMPT_MARKER);
+    // Explicit "ask" mode: an unset mode now defaults to "yolo" (Full
+    // access), under which the fake permission scenario auto-allows
+    // client-side and never registers a card — see createAndStartFakeFxTask's
+    // `opts.mode` doc comment above.
+    await createAndStartFakeFxTask(request, backend, title, FAKE_FX_PERMISSION_PROMPT_MARKER, { mode: "ask" });
 
     await gotoApp(page, backend.bootBase);
     const panel = await openTask(page, title);
@@ -380,7 +392,11 @@ test.describe("fx interactions", () => {
     backend,
   }) => {
     const title = `fx-permission-dismiss-e2e ${randomUUID()}`;
-    await createAndStartFakeFxTask(request, backend, title, FAKE_FX_PERMISSION_PROMPT_MARKER);
+    // Explicit "ask" mode — see the click-through test's identical comment
+    // above: an unset mode now defaults to "yolo" (Full access), under which
+    // the fake permission scenario auto-allows client-side and never
+    // registers a card.
+    await createAndStartFakeFxTask(request, backend, title, FAKE_FX_PERMISSION_PROMPT_MARKER, { mode: "ask" });
 
     await gotoApp(page, backend.bootBase);
     const panel = await openTask(page, title);
@@ -536,7 +552,15 @@ test.describe("fx interactions", () => {
     // .label, separate from the hint `<span>`) would be if the label had
     // never been changed from its pre-0.0.8-compat name.
     await expect(form.getByText("Yolo", { exact: true })).toHaveCount(0);
-    const fullAccessOption = form.getByRole("button", { name: /^Full access\b/ });
+    // Scoped to the open popover (`data-popover-open`, see search-select.tsx)
+    // rather than the whole form: the picker TRIGGER's own text already
+    // reads "Full access" (it's the default mode per `defaultModeFor("fx")`
+    // = "yolo"), so an unscoped `getByRole("button", { name: /^Full
+    // access\b/ })` resolves to both the trigger and the popover row and
+    // trips Playwright's strict-mode violation.
+    const fullAccessOption = form
+      .locator("[data-popover-open]")
+      .getByRole("button", { name: /^Full access\b/ });
     await expect(fullAccessOption).toBeVisible();
     await fullAccessOption.click();
     await expect(modeTrigger).toHaveText("Full access");
