@@ -265,4 +265,14 @@ File-ownership check: no file appears in two tasks of the same wave (T6/T7 split
 
 ## 10. Landed notes
 
-_(filled in after Phase 8)_
+Delivered on `feature/agents-creating-agents` (base `fe65199`), commits: `0d8cdbc` plan · `f110588` wave 1 · `b62d5b5` wave 2 · `9056190` wave 3 + docs · `cb1a4c7` tests + review fixes · a follow-up commit pinning one test precondition.
+
+**Review (Opus, `code-review` skill):** 1 critical, 3 major, 12 minor, 2 nits, 2 docs — all addressed in `cb1a4c7`:
+- critical: `POST /tasks` rejected `agentProfileId: null`, which every webview launch surface sent by default → server accepts null, clients omit the key when unset.
+- major: Settings edit-form seed race (`useTaskLaunch` open-effect overwrote the seed from `last*` prefs) → `useTaskLaunch(open, { initial })`, `loading` initialised to `open`; `SkillsPicker` committed the first suggestion on Tab/Enter → `active = -1` until navigated, empty text never `preventDefault`s; launch dialogs gated submit on the hidden manual harness → `effectiveAgent`/`effectiveStatus` on the hook, availability/auth hints rendered in the selected-card branch.
+- minor: drift check ignored nothing (`capturedAt` always differed) → `agentProfileSnapshotDrifted`; `[]` vs not-loaded → `useAgentProfiles().loaded`; RunPanel auto-clear effects on bound tasks → early-return; empty `harnessLabel` nulled the snapshot → defaults to the harness id; `AGENT_KINDS` derived from `AGENT_OPTIONS`; failed skill-suggestion fetch was cached → never cached; skills validation made strict (400 on non-string entry / >50 after normalisation); chip now snapshot-first with live list only deciding `deleted`; Detach merges the returned task optimistically via `onTaskFieldsChanged`; disabled-harness marker on cards; `--instructions-file` trims both channels; active-row reset on array identity; ARIA combobox wiring.
+- orchestrator-found: a profile with `effort: null` stranded the launch (`buildCommand` requires effort) → `defaultEffortFor` at both copy points.
+
+**Tests:** `bun run typecheck` clean. Full `bun test`: 5315 pass / 3 skip; the only branch-related failure was a precondition flake in `orchestrator-agent-profiles.test.ts` (assumed cursor disabled while `db.ts` is a process-wide singleton across files) — pinned explicitly. `src/bun/reconcile.test.ts` "startTask honors cancel" fails identically on the base commit in this environment (real tmux + codex cancel) and is unrelated. E2e: `e2e/agent-profiles.spec.ts` 4/4, plus `issue-task` / `resolve-conflicts` / `task-context-menu` 16/16.
+
+**Ledger outcome:** every "in this run" row landed; out-of-scope rows unchanged; no owner-deferred rows.

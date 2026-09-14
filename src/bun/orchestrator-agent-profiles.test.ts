@@ -219,7 +219,13 @@ test("startTaskInner's live-profile refresh is a no-op across repeated pre-fligh
   const { db, agentProfiles, tasks, harnesses } = await import("./db.ts");
   const cursorHarness = harnesses.getByIdOrKind("cursor");
   if (!cursorHarness) throw new Error("expected built-in cursor harness to resolve");
-  expect(cursorHarness.enabled).toBe(false); // ships disabled by default
+  // Cursor ships disabled by default (migration 024), which is the
+  // deterministic pre-flight failure this test leans on — but `db.ts` is a
+  // process-wide singleton across every file in one `bun test` run, and a
+  // sibling file may have enabled cursor for its own scenario. Pin the
+  // precondition explicitly and restore whatever we found afterwards.
+  const cursorWasEnabled = cursorHarness.enabled;
+  harnesses.setEnabled("cursor", false);
 
   const profile = agentProfiles.insert({
     name: uniqueProfileName("no-drift"),
@@ -265,6 +271,7 @@ test("startTaskInner's live-profile refresh is a no-op across repeated pre-fligh
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
     agentProfiles.delete(profile.id);
+    harnesses.setEnabled("cursor", cursorWasEnabled);
   }
 });
 
