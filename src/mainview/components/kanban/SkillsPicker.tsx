@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { api, type AvailableExtension } from "@/lib/api";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
@@ -19,14 +19,22 @@ async function fetchSkillSuggestions(harnessId: string): Promise<AvailableExtens
     inFlight = api
       .listAgentCapabilities({ agent: harnessId })
       .then(({ extensions }) => extensions.filter((e) => e.kind === "skill"))
-      // A fetch failure just means no suggestions — free text still works.
-      .catch(() => [] as AvailableExtension[]);
+      .then((result) => {
+        // Cache only on success — a failed fetch is never cached (matches
+        // the repo-wide rule), so the next mount/focus retries instead of
+        // being stuck on an empty suggestion list forever.
+        suggestionCache.set(harnessId, result);
+        return result;
+      })
+      // A fetch failure just means no suggestions this time — free text
+      // still works.
+      .catch(() => [] as AvailableExtension[])
+      .finally(() => {
+        suggestionInFlight.delete(harnessId);
+      });
     suggestionInFlight.set(harnessId, inFlight);
   }
-  const result = await inFlight;
-  suggestionCache.set(harnessId, result);
-  suggestionInFlight.delete(harnessId);
-  return result;
+  return inFlight;
 }
 
 interface SkillsPickerProps {
@@ -51,9 +59,13 @@ interface SkillsPickerProps {
 export function SkillsPicker({ value, onChange, harnessId, disabled, className }: SkillsPickerProps) {
   const [inputValue, setInputValue] = useState("");
   const [open, setOpen] = useState(false);
-  const [active, setActive] = useState(0);
+  // -1 = no row highlighted — Tab/Enter then commits the typed text, never a
+  // suggestion the user never navigated to. Set >=0 only via ArrowUp/Down or
+  // a row's `onMouseEnter`.
+  const [active, setActive] = useState(-1);
   const [suggestions, setSuggestions] = useState<AvailableExtension[]>([]);
   const rootRef = useRef<HTMLDivElement>(null);
+  const listboxId = useId();
 
   useEffect(() => {
     if (!harnessId) {
@@ -74,8 +86,21 @@ export function SkillsPicker({ value, onChange, harnessId, disabled, className }
     const onDown = (e: MouseEvent) => {
       if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
     };
+    // Document-level Escape (like `AgentProfilePicker`) so the popover
+    // closes before an enclosing Dialog's own Escape handler ever sees the
+    // key — see the `data-popover-open` contract (CLAUDE.md UI conventions
+    // / architecture item 11).
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      setOpen(false);
+    };
     document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
   }, [open]);
 
   const valueSet = useMemo(() => new Set(value), [value]);
@@ -86,9 +111,12 @@ export function SkillsPicker({ value, onChange, harnessId, disabled, className }
       .filter((s) => !q || s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q));
   }, [suggestions, inputValue, valueSet]);
 
+  // Reset the highlight whenever the candidate rows change identity (a new
+  // typed query, a fresh suggestion fetch, …) — see the "reset active row on
+  // the rows ARRAY's identity" rule (CLAUDE.md architecture item 12).
   useEffect(() => {
-    setActive(0);
-  }, [inputValue, filtered.length]);
+    setActive(-1);
+  }, [filtered]);
 
   const atLimit = value.length >= AGENT_PROFILE_LIMITS.skills;
 
@@ -98,35 +126,37 @@ export function SkillsPicker({ value, onChange, harnessId, disabled, className }
     if (!valueSet.has(name)) onChange([...value, name]);
     setInputValue("");
     setOpen(false);
+    setActive(-1);
   };
 
   const removeChip = (skill: string) => onChange(value.filter((s) => s !== skill));
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (atLimit) {
-      if (e.key === "Backspace" && inputValue.length === 0 && value.length > 0) {
-        e.preventDefault();
-        onChange(value.slice(0, -1));
-      }
-      return;
-    }
     if (e.key === "ArrowDown" && filtered.length > 0) {
       e.preventDefault();
       setOpen(true);
-      setActive((i) => (i + 1) % filtered.length);
+      setActive((i) => (i < 0 ? 0 : (i + 1) % filtered.length));
       return;
     }
     if (e.key === "ArrowUp" && filtered.length > 0) {
       e.preventDefault();
       setOpen(true);
-      setActive((i) => (i - 1 + filtered.length) % filtered.length);
+      setActive((i) => (i <= 0 ? filtered.length - 1 : i - 1));
       return;
     }
     if (e.key === "Enter" || e.key === "Tab" || e.key === ",") {
-      const suggestion = filtered[active];
+      // Shift+Tab must never commit — it's a backward focus move, not a
+      // commit gesture, regardless of what's typed or highlighted.
+      if (e.key === "Tab" && e.shiftKey) return;
+      // A suggestion is used only when the popover is open AND the user
+      // actually navigated to a row (active >= 0) — never the first
+      // suggestion by default, and never a stale row from a dismissed list.
+      const suggestion = open && active >= 0 ? filtered[active] : undefined;
       const raw = suggestion ? suggestion.name : inputValue;
       const name = normalizeSkillName(raw);
-      if (!name) return; // Nothing to commit — let Tab/Enter behave normally.
+      // Nothing to commit — don't preventDefault, so Tab/Shift+Tab still
+      // moves focus natively and Enter/`,` are no-ops.
+      if (!name) return;
       e.preventDefault();
       commit(raw);
       return;
@@ -134,17 +164,17 @@ export function SkillsPicker({ value, onChange, harnessId, disabled, className }
     if (e.key === "Backspace" && inputValue.length === 0 && value.length > 0) {
       e.preventDefault();
       onChange(value.slice(0, -1));
-      return;
-    }
-    if (e.key === "Escape" && open) {
-      // Close the suggestion list only — never the enclosing dialog.
-      e.preventDefault();
-      setOpen(false);
     }
   };
 
+  const onRootBlur = (e: React.FocusEvent<HTMLDivElement>) => {
+    if (!rootRef.current?.contains(e.relatedTarget as Node | null)) setOpen(false);
+  };
+
+  const activeOptionId = open && active >= 0 && filtered[active] ? `${listboxId}-option-${active}` : undefined;
+
   return (
-    <div ref={rootRef} data-testid="skills-picker" className={cn("relative", className)}>
+    <div ref={rootRef} data-testid="skills-picker" className={cn("relative", className)} onBlur={onRootBlur}>
       <div
         className={cn(
           "flex flex-wrap items-center gap-1 rounded-md border border-input bg-transparent px-2 py-1.5",
@@ -174,8 +204,14 @@ export function SkillsPicker({ value, onChange, harnessId, disabled, className }
         <input
           {...IDENTIFIER_INPUT_PROPS}
           data-testid="skills-picker-input"
+          role="combobox"
+          aria-expanded={open && !atLimit && filtered.length > 0}
+          aria-haspopup="listbox"
+          aria-autocomplete="list"
+          aria-controls={listboxId}
+          aria-activedescendant={activeOptionId}
           value={inputValue}
-          disabled={disabled || atLimit}
+          disabled={disabled}
           onChange={(e) => {
             setInputValue(e.target.value);
             setOpen(true);
@@ -196,6 +232,7 @@ export function SkillsPicker({ value, onChange, harnessId, disabled, className }
       )}
       {open && !atLimit && filtered.length > 0 && (
         <div
+          id={listboxId}
           data-popover-open=""
           data-popover-keys="escape-only"
           role="listbox"
@@ -204,6 +241,7 @@ export function SkillsPicker({ value, onChange, harnessId, disabled, className }
           {filtered.map((s, i) => (
             <button
               key={s.name}
+              id={`${listboxId}-option-${i}`}
               type="button"
               role="option"
               aria-selected={i === active}

@@ -170,7 +170,7 @@ function AppInner() {
   // (NewTaskForm, RunPanel's header chip + task-details lock) so switching
   // tabs/panels never re-triggers a redundant `GET /agent-profiles` — see
   // `useAgentProfiles`'s own doc comment.
-  const { profiles, refresh: refreshProfiles } = useAgentProfiles();
+  const { profiles, loaded: profilesLoaded, refresh: refreshProfiles } = useAgentProfiles();
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
   // Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`.
   // `discoveryReady` mirrors the daemon's boot discovery sweep: false until
@@ -598,6 +598,17 @@ function AppInner() {
     readStateGen.current.set(id, next);
     return next;
   }, []);
+
+  // Shared optimistic-merge helper: patches only the named fields of one
+  // task, never the whole snapshot — a wholesale replace could revert a
+  // concurrent optimistic patch (e.g. the SSE column handler's
+  // running→review flip, or another in-flight partial update). The
+  // mark-seen effect below is the original caller; RunPanel's
+  // `onTaskFieldsChanged` (e.g. an agent-profile Detach) reuses the same
+  // helper rather than growing its own merge logic.
+  const mergeTaskFields = useCallback((id: string, partial: Partial<Task>) => {
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, ...partial } : t)));
+  }, []);
   useEffect(() => {
     const currentId = selected?.id ?? null;
     const previousId = prevMarkSeenIdRef.current;
@@ -611,13 +622,12 @@ function AppInner() {
           // Stale response guard — see `readStateGen` above.
           if (readStateGen.current.get(id) !== gen) return;
           // Optimistic reconcile — don't wait for the next 2s poll to clear
-          // the dot. Merges ONLY the `unread` field: `updated` is a snapshot
-          // taken server-side at POST time and lands asynchronously, so a
-          // wholesale replace could revert a concurrent optimistic patch
-          // (e.g. the SSE column handler's running→review flip).
-          setTasks((prev) =>
-            prev.map((t) => (t.id === updated.id ? { ...t, unread: updated.unread } : t)),
-          );
+          // the dot. Merges ONLY the `unread` field via the shared helper
+          // above: `updated` is a snapshot taken server-side at POST time
+          // and lands asynchronously, so a wholesale replace could revert a
+          // concurrent optimistic patch (e.g. the SSE column handler's
+          // running→review flip).
+          mergeTaskFields(updated.id, { unread: updated.unread });
         })
         .catch((e) => {
           // Fire-and-forget: a failed mark-seen must never block or break
@@ -626,7 +636,7 @@ function AppInner() {
         });
     }
     prevMarkSeenIdRef.current = currentId;
-  }, [selected?.id, bumpReadStateGen]);
+  }, [selected?.id, bumpReadStateGen, mergeTaskFields]);
 
   // `panelMounted` follows `selected !== null` on open but lags by the
   // RunPanel's exit animation on close, so the Toaster doesn't snap back to
@@ -1670,12 +1680,13 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         stickyUserMessages={stickyUserMessages}
         agents={agents}
         harnesses={harnesses}
-        profiles={profiles}
+        profiles={profilesLoaded ? profiles : null}
         onOpenSettingsAgents={openSettingsAgents}
         agentModels={agentModels}
         harnessModels={harnessModels}
         onRefreshModels={onRefreshModels}
         homeDir={homeDir}
+        onTaskFieldsChanged={mergeTaskFields}
         onClose={() => setSelected(null)}
         onShowDiff={setDiffTask}
         onArchive={archive}

@@ -34,6 +34,7 @@ async function fetchProfiles(): Promise<void> {
     const profiles = await promise;
     cache = profiles;
     lastError = null;
+    loaded = true;
   } catch (err) {
     lastError = err instanceof Error ? err.message : String(err);
   } finally {
@@ -41,6 +42,12 @@ async function fetchProfiles(): Promise<void> {
     notify();
   }
 }
+
+// True once a fetch has succeeded at least once, across the whole app — a
+// failed initial fetch keeps this `false` (see `loaded` below). Distinct
+// from `cache !== null`, which flips even on a failed refetch that happened
+// to run after a prior success (stale-but-known cache stays in place).
+let loaded = false;
 
 /**
  * Module-cached `AgentProfile[]` list. The first mount (across the whole
@@ -50,12 +57,19 @@ async function fetchProfiles(): Promise<void> {
  * picker elsewhere picks up the change without remounting.
  *
  * `opts.enabled: false` (default `true`) skips fetching entirely and always
- * reports an empty, non-loading, error-free result — for a caller that only
- * conditionally needs the list (e.g. a collapsed section).
+ * reports an empty, non-loading, error-free, not-`loaded` result — for a
+ * caller that only conditionally needs the list (e.g. a collapsed section).
  */
 export function useAgentProfiles(opts?: { enabled?: boolean }): {
   profiles: AgentProfile[];
   loading: boolean;
+  /** `true` once a fetch has succeeded at least once — a caller that needs
+   *  to distinguish "still loading" / "failed and never loaded" from "loaded
+   *  (possibly stale after a later failed refresh)" should gate on this
+   *  rather than on `profiles.length` or `!loading`, so a bound task's chip
+   *  never flashes "(deleted)" while the very first fetch is still in
+   *  flight or has failed — see `resolveTaskProfileDisplay`. */
+  loaded: boolean;
   error: string | null;
   refresh: () => Promise<void>;
 } {
@@ -75,11 +89,12 @@ export function useAgentProfiles(opts?: { enabled?: boolean }): {
   const refresh = useCallback(() => fetchProfiles(), []);
 
   if (!enabled) {
-    return { profiles: [], loading: false, error: null, refresh };
+    return { profiles: [], loading: false, loaded: false, error: null, refresh };
   }
   return {
     profiles: cache ?? [],
     loading: cache === null && lastError === null,
+    loaded,
     error: lastError,
     refresh,
   };
@@ -120,25 +135,22 @@ export interface TaskProfileDisplay {
  * when the task carries neither `agentProfileId` nor `agentProfile` (never
  * bound to a profile).
  *
- * Prefers the **live** profile (matched by id in `live`) for
- * name/harness/model/effort/mode whenever it's present — a not-yet-started
- * task tracks live edits (see the plan's "freeze at first run" rule, D2) —
- * and falls back to the task's frozen `agentProfile` snapshot otherwise
- * (profile deleted, `live` not loaded yet, or the task already ran and the
- * live profile has since diverged from what it actually launched with —
- * this function doesn't know which case applies; callers that need "did
- * this task freeze" should consult run count separately).
+ * name/harnessKind/harnessLabel/model/effort/mode/summary ALWAYS come from
+ * the task's frozen `agentProfile` snapshot when one is present — the
+ * snapshot is what the task actually launched (or will launch) with, and
+ * must never flicker to reflect a concurrent live edit to the profile
+ * elsewhere in the app. Only when the task carries an `agentProfileId` with
+ * NO snapshot (a legacy/malformed row — every current write path always
+ * writes both together) does this fall back to the **live** profile's own
+ * values, resolving `harnessKind`/`harnessLabel` against `harnesses`.
  *
- * `deleted` is `true` exactly when a live list is available, the task names
- * a profile id, and that id no longer resolves in `live` — a `null` `live`
- * (not loaded yet) never reports `deleted`, matching the plan's exact
- * formula: `live !== null && task.agentProfileId != null &&
+ * `deleted` is resolved independently and is the ONLY thing the live list
+ * decides: `true` exactly when a live list is available, the task names a
+ * profile id, and that id no longer resolves in `live` — a `null` `live`
+ * (not loaded yet, or the caller opted out — see `useAgentProfiles`'s
+ * `loaded` flag) never reports `deleted`, matching the exact formula:
+ * `live !== null && task.agentProfileId != null &&
  * !live.some(p => p.id === task.agentProfileId)`.
- *
- * `harnessKind`/`harnessLabel` for a live profile are resolved against
- * `harnesses` (falling back to the snapshot's own recorded kind/label when
- * the harness itself can't be found there, or to a bare default when
- * neither is available).
  */
 export function resolveTaskProfileDisplay(
   task: Pick<Task, "agentProfileId" | "agentProfile">,
@@ -149,29 +161,42 @@ export function resolveTaskProfileDisplay(
   const snapshot = task.agentProfile ?? null;
   if (profileId == null && snapshot == null) return null;
 
-  const liveProfile = profileId != null ? (live?.find((p) => p.id === profileId) ?? null) : null;
   const deleted = live !== null && profileId != null && !live.some((p) => p.id === profileId);
 
-  const id = profileId ?? snapshot?.id ?? "";
-  const name = liveProfile?.name ?? snapshot?.name ?? "";
-  const model = liveProfile?.model ?? snapshot?.model ?? "";
-  const effort = liveProfile ? liveProfile.effort : (snapshot?.effort ?? null);
-  const mode = liveProfile ? liveProfile.mode : (snapshot?.mode ?? null);
+  if (snapshot) {
+    return {
+      id: profileId ?? snapshot.id,
+      name: snapshot.name,
+      harnessKind: snapshot.harnessKind,
+      harnessLabel: snapshot.harnessLabel,
+      summary: agentProfileSummary({
+        harnessLabel: snapshot.harnessLabel,
+        model: snapshot.model,
+        effort: snapshot.effort,
+        mode: snapshot.mode,
+      }),
+      deleted,
+    };
+  }
 
-  let harnessKind: AgentKind;
-  let harnessLabel: string;
+  // Legacy/malformed: an `agentProfileId` with no snapshot — nothing frozen
+  // to prefer, so fall back to the live profile's own values.
+  const liveProfile = profileId != null ? (live?.find((p) => p.id === profileId) ?? null) : null;
+  const model = liveProfile?.model ?? "";
+  const effort = liveProfile?.effort ?? null;
+  const mode = liveProfile?.mode ?? null;
+
+  let harnessKind: AgentKind = "claude-code";
+  let harnessLabel = "";
   if (liveProfile) {
     const harness = harnesses?.find((h) => h.id === liveProfile.harness);
-    harnessKind = harness?.kind ?? snapshot?.harnessKind ?? "claude-code";
-    harnessLabel = harness?.label ?? snapshot?.harnessLabel ?? liveProfile.harness;
-  } else {
-    harnessKind = snapshot?.harnessKind ?? "claude-code";
-    harnessLabel = snapshot?.harnessLabel ?? "";
+    harnessKind = harness?.kind ?? "claude-code";
+    harnessLabel = harness?.label ?? liveProfile.harness;
   }
 
   return {
-    id,
-    name,
+    id: profileId ?? "",
+    name: liveProfile?.name ?? "",
     harnessKind,
     harnessLabel,
     summary: agentProfileSummary({ harnessLabel, model, effort, mode }),

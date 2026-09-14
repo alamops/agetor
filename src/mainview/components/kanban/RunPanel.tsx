@@ -178,8 +178,17 @@ interface Props {
   harnesses: Harness[];
   /** Saved agent profiles — resolves the header chip (`resolveTaskProfileDisplay`)
    *  and, in Task details, whether the agent/mode/model/effort(/fast/max)
-   *  controls are locked (`task.agentProfileId != null`). */
-  profiles: AgentProfile[];
+   *  controls are locked (`task.agentProfileId != null`). `null` means the
+   *  first `GET /agent-profiles` fetch hasn't succeeded yet (see
+   *  `useAgentProfiles`'s `loaded` flag) — `resolveTaskProfileDisplay` never
+   *  reports `deleted` in that state, so a bound task's chip can't flash
+   *  "(deleted)" while loading or after a failed fetch. */
+  profiles: AgentProfile[] | null;
+  /** Optimistically merges partial fields into this task in the parent's
+   *  `tasks` state (e.g. after detaching an agent profile) — mirrors the
+   *  `unread`-only merge App.tsx already does on mark-seen, never a
+   *  wholesale Task replace (would revert a concurrent optimistic patch). */
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
   /** "Manage agents…" — wired to the task-details Detach hint's sibling
    *  affordance and the header chip, mirroring `NewTaskForm`'s own prop. */
   onOpenSettingsAgents: () => void;
@@ -285,7 +294,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -491,6 +500,7 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles
           harnessModels={harnessModels}
           onRefreshModels={onRefreshModels}
           homeDir={homeDir}
+          onTaskFieldsChanged={onTaskFieldsChanged}
           open={open}
           openRef={openRef}
           onClose={onClose}
@@ -521,6 +531,7 @@ function RunPanelBody({
   harnessModels,
   onRefreshModels,
   homeDir,
+  onTaskFieldsChanged,
   open,
   openRef,
   onClose,
@@ -535,12 +546,13 @@ function RunPanelBody({
   stickyUserMessages: boolean;
   agents: AgentStatus[];
   harnesses: Harness[];
-  profiles: AgentProfile[];
+  profiles: AgentProfile[] | null;
   onOpenSettingsAgents: () => void;
   agentModels: AgentModelMap;
   harnessModels: Record<string, { id: string; label?: string }[]>;
   onRefreshModels: (harnessId?: string) => Promise<void>;
   homeDir: string;
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
   /** Whether the panel is in its "open" (not mid-close-animation, not
    *  pre-mount) state — mirrors `RunPanel`'s own `open` state. Gates the
    *  Cmd/Ctrl+F listener below so it doesn't hijack the shortcut while the
@@ -569,7 +581,7 @@ function RunPanelBody({
   // mode/instructions/skills), same live-or-snapshot preference.
   const agentProfileDisplay = resolveTaskProfileDisplay(task, profiles, harnesses);
   const agentProfileForCard: AgentProfile | AgentProfileSnapshot | null =
-    (task.agentProfileId ? (profiles.find((p) => p.id === task.agentProfileId) ?? null) : null)
+    (task.agentProfileId ? (profiles?.find((p) => p.id === task.agentProfileId) ?? null) : null)
     ?? task.agentProfile
     ?? null;
   const [runs, setRuns] = useState<Run[]>([]);
@@ -3196,6 +3208,7 @@ function RunPanelBody({
         harnessModels={harnessModels}
         onRefreshModels={onRefreshModels}
         homeDir={homeDir}
+        onTaskFieldsChanged={onTaskFieldsChanged}
         tmuxSession={latestRun?.tmuxSession ?? null}
       />
 
@@ -5982,6 +5995,7 @@ function TaskDetails({
   harnessModels,
   onRefreshModels,
   homeDir,
+  onTaskFieldsChanged,
   tmuxSession,
 }: {
   task: Task;
@@ -5998,6 +6012,10 @@ function TaskDetails({
   harnessModels: Record<string, { id: string; label?: string }[]>;
   onRefreshModels: (harnessId?: string) => Promise<void>;
   homeDir: string;
+  /** Optimistically merges partial task fields into the parent's `tasks`
+   *  state — used by Detach below so the unlock is visible immediately
+   *  instead of waiting for the next 2s poll. */
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
   /** Tmux session name from the latest run (claude-code only). `null` when
    *  no run has spawned a session yet — the Tmux row hides itself in that
    *  case rather than presenting an Attach button that's guaranteed to 404. */
@@ -6017,10 +6035,15 @@ function TaskDetails({
   const detachProfile = async () => {
     setDetaching(true);
     try {
-      await api.detachTaskAgentProfile(task.id);
-      // No local merge — the parent's 2s task poll (`App.tsx`) picks the
-      // cleared `agentProfileId`/`agentProfile` back up on its next tick,
-      // same as every other field this panel PATCHes via `save()` below.
+      const updated = await api.detachTaskAgentProfile(task.id);
+      // Merge the returned task's cleared `agentProfileId`/`agentProfile`
+      // back optimistically — don't wait for the parent's 2s task poll
+      // (`App.tsx`) to unlock the dropdowns. Only these two fields, never
+      // the whole snapshot (would revert a concurrent optimistic patch).
+      onTaskFieldsChanged?.(task.id, {
+        agentProfileId: updated.agentProfileId,
+        agentProfile: updated.agentProfile,
+      });
     } catch (e) {
       toast.error("Couldn't detach agent", { description: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -6134,6 +6157,11 @@ function TaskDetails({
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
   const fastAvailable = kind === "cursor" && cursorModelSupportsFast(task.model, task.effort);
   useEffect(() => {
+    // A profile-bound task's effort is owned by the profile, not this
+    // cascade — mutating it here would PATCH a field the profile lock is
+    // supposed to keep the user's hands off (see the `profileLock`/`editable`
+    // rule above).
+    if (task.agentProfileId != null) return;
     if (task.effort && retainable.has(task.effort)) return;
     if (supportedEffortsForModel.length === 0) {
       if (task.effort !== null) void save({ effort: null });
@@ -6144,15 +6172,19 @@ function TaskDetails({
       : supportedEffortsForModel[0]!.id;
     if (task.effort !== fallback) void save({ effort: fallback });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel]);
+  }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel, task.agentProfileId]);
   useEffect(() => {
+    // Same profile-lock guard as the effort cascade above — `fast`/`maxMode`
+    // are also profile-owned fields once bound.
+    if (task.agentProfileId != null) return;
     if (task.fast && !fastAvailable) void save({ fast: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fastAvailable, task.fast]);
+  }, [fastAvailable, task.fast, task.agentProfileId]);
   useEffect(() => {
+    if (task.agentProfileId != null) return;
     if (task.maxMode && !maxModeAvailable) void save({ maxMode: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [maxModeAvailable, task.maxMode]);
+  }, [maxModeAvailable, task.maxMode, task.agentProfileId]);
 
   const onAgentChange = (nextId: string) => {
     if (nextId === task.agent) return;

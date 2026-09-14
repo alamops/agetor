@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Bot, ChevronDown, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -46,6 +46,7 @@ export function AgentProfilePicker({
   const [active, setActive] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const listboxId = useId();
 
   useEffect(() => {
     if (!open) return;
@@ -75,9 +76,13 @@ export function AgentProfilePicker({
   const filtered = useMemo(() => filterAgentProfiles(profiles, query), [profiles, query]);
   const rowCount = filtered.length + 1;
 
+  // Reset the highlight whenever the candidate rows change identity — see
+  // the "reset active row on the rows ARRAY's identity" rule (CLAUDE.md
+  // architecture item 12). `filtered` already changes identity on every
+  // `query`/`profiles` change, so depending on it alone is sufficient.
   useEffect(() => {
     setActive(0);
-  }, [query, filtered.length]);
+  }, [filtered]);
 
   const selectedProfile = value ? (profiles.find((p) => p.id === value) ?? null) : null;
 
@@ -156,7 +161,6 @@ export function AgentProfilePicker({
         <div
           data-popover-open=""
           data-testid="agent-profile-picker-popover"
-          role="listbox"
           className="absolute left-0 right-0 top-full z-50 mt-1 overflow-hidden rounded-md border border-border bg-card text-card-foreground shadow-xl"
         >
           <div className="border-b border-border/60 p-1.5">
@@ -164,6 +168,12 @@ export function AgentProfilePicker({
               ref={searchRef}
               {...IDENTIFIER_INPUT_PROPS}
               data-testid="agent-profile-picker-search"
+              role="combobox"
+              aria-expanded={open}
+              aria-haspopup="listbox"
+              aria-autocomplete="list"
+              aria-controls={listboxId}
+              aria-activedescendant={`${listboxId}-option-${active}`}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={onSearchKeyDown}
@@ -171,9 +181,10 @@ export function AgentProfilePicker({
               className="h-7 border-0 px-0 shadow-none focus-visible:ring-0"
             />
           </div>
-          <div className="max-h-72 overflow-y-auto py-1">
+          <div id={listboxId} role="listbox" className="max-h-72 overflow-y-auto py-1">
             <button
               type="button"
+              id={`${listboxId}-option-0`}
               role="option"
               aria-selected={active === 0}
               data-testid="agent-profile-picker-none"
@@ -201,6 +212,7 @@ export function AgentProfilePicker({
                 return (
                   <button
                     key={p.id}
+                    id={`${listboxId}-option-${idx}`}
                     type="button"
                     role="option"
                     aria-selected={idx === active}

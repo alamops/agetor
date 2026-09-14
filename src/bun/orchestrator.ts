@@ -1010,6 +1010,26 @@ export function effectiveAgentProfile(
   return { profile: task.agentProfile, source: "snapshot" };
 }
 
+/**
+ * Whether `next` (the live profile, converted to snapshot shape) differs
+ * meaningfully from `prior` (whatever's stored on the task row already) —
+ * "meaningfully" excluding `capturedAt`, which is stamped fresh on every call
+ * to {@link effectiveAgentProfile} and would otherwise make this always
+ * `true`, forcing `startTaskInner`'s live-refresh block to `tasks.update`
+ * (bumping `updated_at`) on every single Run click even when the bound
+ * profile hasn't changed at all. `prior === null` (never captured before)
+ * always counts as drifted.
+ */
+export function agentProfileSnapshotDrifted(
+  prior: AgentProfileSnapshot | null,
+  next: AgentProfileSnapshot,
+): boolean {
+  if (!prior) return true;
+  const { capturedAt: _priorCapturedAt, ...priorRest } = prior;
+  const { capturedAt: _nextCapturedAt, ...nextRest } = next;
+  return JSON.stringify(priorRest) !== JSON.stringify(nextRest);
+}
+
 export async function startTask(
   taskId: string,
 ): Promise<{ runId: string; unresolvedRefs?: string[] } | { error: string }> {
@@ -1050,21 +1070,26 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
   const resolvedProfile = effectiveAgentProfile(task);
   if (resolvedProfile?.source === "live") {
     const { profile } = resolvedProfile;
-    const priorSnapshotJson = task.agentProfile ? JSON.stringify(task.agentProfile) : null;
-    const liveSnapshotJson = JSON.stringify(profile);
+    // A profile's own `effort: null` means "no opinion" — but a model that
+    // requires an effort flag (`buildCommand`'s "effort is required for …"
+    // throw) must still get a real default here, same as the no-profile path
+    // in `createTask`. Only the resolved task-row `effort` gets this
+    // treatment; the stored snapshot (`profile`, and `task.agentProfile`
+    // below) keeps the profile's raw `null`.
+    const resolvedEffort = profile.effort ?? defaultEffortFor(profile.harnessKind, profile.model, profile.harness);
     const driftedFromRow =
       task.agent !== profile.harness ||
       task.model !== profile.model ||
-      task.effort !== profile.effort ||
+      task.effort !== resolvedEffort ||
       task.mode !== profile.mode ||
       task.fast !== profile.fast ||
       task.maxMode !== profile.maxMode ||
-      priorSnapshotJson !== liveSnapshotJson;
+      agentProfileSnapshotDrifted(task.agentProfile ?? null, profile);
     if (driftedFromRow) {
       task = tasks.update(taskId, {
         agent: profile.harness,
         model: profile.model,
-        effort: profile.effort,
+        effort: resolvedEffort,
         mode: profile.mode,
         fast: profile.fast,
         maxMode: profile.maxMode,
@@ -4855,6 +4880,25 @@ export interface CreateTaskInput extends Partial<Task> {
 }
 
 /**
+ * The kind-default effort id for `model` — "kind default if offered, else
+ * strongest offered id, else null" (mirrors the picker's own rule). Shared by
+ * `createTask` (no-profile, no-explicit-effort path) and by
+ * `startTaskInner`'s live-profile refresh, which both need to fill in an
+ * effort when neither the caller nor a bound {@link AgentProfile} supplied
+ * one — a profile's own `effort: null` means "no opinion", not "no effort
+ * flag", so a model that requires one (see `buildCommand`'s
+ * "effort is required for …" throw) must still get a real default here.
+ * Discovered efforts (e.g. Codex's own app-server catalog) win over the
+ * curated `MODEL_EFFORT_SUPPORT` table when the harness reported a non-empty
+ * list for this model — see `supportedEfforts`/`getDiscoveredEfforts`.
+ */
+function defaultEffortFor(kind: AgentKind, model: string, harnessId: string): string | null {
+  const support = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, harnessId));
+  if (support.length === 0) return null;
+  return support.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : support[0]!.id;
+}
+
+/**
  * Create a task. When `isolation === "worktree"` and `workdir` is a git repo,
  * resolves the requested base (default "HEAD") to a concrete sha now, so re-runs
  * always start from the same commit even after the source repo moves. Returns
@@ -4977,17 +5021,20 @@ export async function createTask(
   // the Settings form only ever offers `supportedEfforts` rows, so a stored
   // value is already sane, and re-validating here would just re-litigate the
   // same "discovered can understate the live API" problem the PATCH route's
-  // null-clear guard already carves an exception for.
+  // null-clear guard already carves an exception for. A profile whose own
+  // `effort` is `null` ("no opinion") still needs a real default when the
+  // model requires one — `buildCommand` throws "effort is required for …"
+  // otherwise — so it falls through to the same `defaultEffortFor` the
+  // no-profile path uses. Only the resolved task-row `effort` gets this
+  // treatment; `agentProfileSnapshot` below is built straight from `profile`
+  // and keeps the raw `null`.
   let effort: string | null;
   if (profile) {
-    effort = profile.effort;
+    effort = profile.effort ?? defaultEffortFor(kind, model, harness.id);
   } else if (input.effort !== undefined && input.effort !== null) {
     effort = input.effort;
   } else {
-    const support = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, harness.id));
-    effort = support.length === 0
-      ? null
-      : support.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : support[0]!.id;
+    effort = defaultEffortFor(kind, model, harness.id);
   }
 
   // Validate taskType against the known set so a bogus value can't poison

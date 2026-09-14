@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Plus } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
@@ -39,8 +39,10 @@ interface FormState {
  * form shared by create and edit) but the harness/mode/model/effort/fast/
  * maxMode fields are delegated entirely to `useTaskLaunch` +
  * `<TaskLaunchPickers hideProfilePicker />` (plan D9) rather than a second
- * hand-rolled picker block — editing seeds the hook from the profile's live
- * values once its own harness fetch resolves (see the seeding effect below).
+ * hand-rolled picker block — editing seeds the hook via `useTaskLaunch`'s
+ * `opts.initial` (see `editingProfile` below), not a second effect racing
+ * the hook's own open-effect (that used to be a real bug — see the comment
+ * on `TaskLaunchPickers`'s `initial` option for the full race).
  */
 export function AgentProfilesSection({ harnesses }: Props) {
   const { profiles, loading, error: loadError, refresh } = useAgentProfiles();
@@ -50,41 +52,37 @@ export function AgentProfilesSection({ harnesses }: Props) {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const confirm = useConfirm();
 
+  // The profile being edited, resolved synchronously from the already-
+  // loaded `profiles` list (the rows below are rendered from it, so it's
+  // guaranteed loaded before an Edit button exists to click) — `null` for
+  // a create form or while no form is open. Passed straight into
+  // `useTaskLaunch` as `opts.initial` so the hook's own open-effect seeds
+  // from it directly, in the SAME render where `form`/`open` transition,
+  // instead of via a second effect that raced the hook's async harness
+  // fetch (the bug this replaces — see `TaskLaunchPickers`'s `initial` doc
+  // comment for the full race). `editingProfile` and `open` change
+  // identity together in that one render, so the hook's effect body
+  // (which reads `initial` from its closure, not from a dep-array entry)
+  // always captures the matching value.
+  const editingProfile = form && form.id !== null ? (profiles.find((p) => p.id === form.id) ?? null) : null;
+
   // The form's own picker state — fetches harnesses only while a form is
   // actually open, mirrors `ResolveConflictsDialog`'s `useTaskLaunch(open)`.
   // `withProfiles: false` — this hook backs the *editor* for a profile, not
   // a picker over profiles, so it never needs its own `GET /agent-profiles`.
-  const launch = useTaskLaunch(form !== null, { withProfiles: false });
-
-  // Seed the picker from the profile being edited exactly once per opened
-  // edit form, and only once its own harness fetch has resolved (before
-  // that, `launch.agent`/`harnesses` are still defaults and `switchAgent`
-  // inside `seed` couldn't resolve the profile's harness kind). Resets
-  // whenever `form` changes identity (a different edit, a fresh create, or
-  // the form closing) via the `form?.id` dependency below — `form === null`
-  // reads as `undefined` there, distinct from a create form's `id: null`.
-  const [seededFor, setSeededFor] = useState<string | null>(null);
-  useEffect(() => {
-    setSeededFor(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [form?.id]);
-  useEffect(() => {
-    if (!form || form.id === null) return;
-    if (launch.loading) return;
-    if (seededFor === form.id) return;
-    const editing = profiles.find((p) => p.id === form.id);
-    if (!editing) return;
-    launch.seed({
-      agent: editing.harness,
-      ...(editing.mode !== null ? { mode: editing.mode } : {}),
-      model: editing.model,
-      effort: editing.effort,
-      fast: editing.fast,
-      maxMode: editing.maxMode,
-    });
-    setSeededFor(form.id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [form, launch.loading, profiles, seededFor]);
+  const launch = useTaskLaunch(form !== null, {
+    withProfiles: false,
+    initial: editingProfile
+      ? {
+          agent: editingProfile.harness,
+          mode: editingProfile.mode,
+          model: editingProfile.model,
+          effort: editingProfile.effort,
+          fast: editingProfile.fast,
+          maxMode: editingProfile.maxMode,
+        }
+      : undefined,
+  });
 
   const openCreate = () => setForm({ id: null, name: "", instructions: "", skills: [] });
   const openEdit = (p: AgentProfile) =>

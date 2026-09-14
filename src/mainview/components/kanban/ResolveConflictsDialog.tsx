@@ -76,10 +76,14 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
   }, [open, context, promptDirty]);
 
   const overage = promptByteOverage(launch.effectiveKind, composeLaunchPrompt(launch.selectedProfile, prompt));
-  const selectedHarnessLabel = launch.harnesses.find((h) => h.id === launch.agent)?.label ?? launch.agent;
+  // Names the harness a launch will ACTUALLY run under — the selected
+  // profile's harness when one is picked, else the manually-picked one
+  // (finding F2-3; `launch.agent`/`selectedStatus` stay pinned to the
+  // manual picker and go stale once a profile hides that block).
+  const selectedHarnessLabel = launch.harnesses.find((h) => h.id === launch.effectiveAgent)?.label ?? launch.effectiveAgent;
 
   const canSubmit =
-    !!context && prompt.trim().length > 0 && !!launch.selectedStatus?.available && !submitting && overage == null;
+    !!context && prompt.trim().length > 0 && !!launch.effectiveStatus?.available && !submitting && overage == null;
 
   const submit = async () => {
     if (!context || !canSubmit) return;
@@ -99,7 +103,9 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
         effort: launch.effort,
         fast: launch.fast,
         maxMode: launch.maxMode,
-        agentProfileId: launch.agentProfileId,
+        // Omit entirely when no profile is selected (finding F2-1) — see
+        // NewTaskForm.submit's matching comment.
+        ...(launch.agentProfileId ? { agentProfileId: launch.agentProfileId } : {}),
         column: "ready" as const,
       });
       launch.rememberPicks();

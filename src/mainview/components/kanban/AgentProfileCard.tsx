@@ -8,16 +8,24 @@ import { AgentIcon } from "./AgentIcon";
  *  live {@link AgentProfile} (harness id only — needs `harnesses` to resolve
  *  kind/label) or a frozen {@link AgentProfileSnapshot} (already carries its
  *  own `harnessKind`/`harnessLabel`, so display never depends on a harness
- *  row that may since have been deleted — see plan D14). */
+ *  row that may since have been deleted — see plan D14).
+ *
+ * `disabled` always comes from the LIVE `harnesses` row (looked up by
+ * `profile.harness`, which both shapes carry) regardless of which shape is
+ * being rendered — a frozen snapshot's own `harnessKind`/`harnessLabel`
+ * don't know whether an admin has since disabled that harness. `false` when
+ * the harness can't be resolved (not yet loaded, or genuinely gone — the
+ * "(deleted)" marker already covers that case). */
 function resolveHarnessDisplay(
   profile: AgentProfile | AgentProfileSnapshot,
   harnesses?: Harness[],
-): { kind: AgentKind; label: string } {
-  if ("harnessKind" in profile) {
-    return { kind: profile.harnessKind, label: profile.harnessLabel };
-  }
+): { kind: AgentKind; label: string; disabled: boolean } {
   const harness = harnesses?.find((h) => h.id === profile.harness);
-  return { kind: harness?.kind ?? "claude-code", label: harness?.label ?? profile.harness };
+  const disabled = harness?.enabled === false;
+  if ("harnessKind" in profile) {
+    return { kind: profile.harnessKind, label: profile.harnessLabel, disabled };
+  }
+  return { kind: harness?.kind ?? "claude-code", label: harness?.label ?? profile.harness, disabled };
 }
 
 interface AgentProfileCardProps {
@@ -47,7 +55,7 @@ interface AgentProfileCardProps {
  * CLAUDE.md's UI conventions.
  */
 export function AgentProfileCard({ profile, harnesses, variant, deleted, className }: AgentProfileCardProps) {
-  const { kind, label } = resolveHarnessDisplay(profile, harnesses);
+  const { kind, label, disabled: harnessDisabled } = resolveHarnessDisplay(profile, harnesses);
   const summary = agentProfileSummary({
     harnessLabel: label,
     model: profile.model,
@@ -62,12 +70,15 @@ export function AgentProfileCard({ profile, harnesses, variant, deleted, classNa
   );
 
   if (variant === "chip") {
+    // Chip is compact — a disabled harness only shows up in the tooltip, not
+    // as its own visible span.
+    const title = harnessDisabled ? `${summary} (harness disabled)` : summary;
     return (
       <Badge
         variant="secondary"
         data-testid="agent-profile-card"
         data-profile-id={profile.id}
-        title={summary}
+        title={title}
         className={cn("inline-flex min-w-0 max-w-full items-center gap-1.5 font-normal", className)}
       >
         <AgentIcon kind={kind} className="shrink-0" />
@@ -80,6 +91,11 @@ export function AgentProfileCard({ profile, harnesses, variant, deleted, classNa
   const instructions = profile.instructions.trim();
   const shownSkills = profile.skills.slice(0, 4);
   const overflow = profile.skills.length - shownSkills.length;
+  const harnessDisabledMarker = harnessDisabled && (
+    <span className="text-warning" data-testid="agent-profile-card-harness-disabled">
+      (harness disabled)
+    </span>
+  );
 
   const body = (
     <div className="flex min-w-0 items-start gap-2">
@@ -89,7 +105,10 @@ export function AgentProfileCard({ profile, harnesses, variant, deleted, classNa
           <span className="truncate font-medium">{profile.name}</span>
           {deletedMarker}
         </div>
-        <div className="truncate text-xs text-muted-foreground">{summary}</div>
+        <div className="truncate text-xs text-muted-foreground">
+          {summary}
+          {harnessDisabledMarker && <> {harnessDisabledMarker}</>}
+        </div>
         {instructions.length > 0 && (
           <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{instructions}</p>
         )}

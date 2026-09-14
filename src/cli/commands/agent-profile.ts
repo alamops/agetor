@@ -166,14 +166,22 @@ function oneLine(s: string, n: number): string {
   return flat.length > n ? flat.slice(0, n - 1) + "…" : flat;
 }
 
+/** Canonicalize instructions text read from any `--instructions-file`
+ *  delivery channel (a real path or the `-` stdin marker) so the stored
+ *  value doesn't depend on which one was used — a pure, exported helper so
+ *  it's unit-testable without touching the filesystem/stdin. */
+export function canonicalInstructions(text: string): string {
+  return text.trim();
+}
+
 /** Read `--instructions-file` (a real path, or `-` for stdin) when given,
  *  else pass `--instructions` through verbatim, else `undefined` (caller
  *  decides the "unset" behavior — `""` on create, "don't touch" on edit). */
 async function resolveInstructions(f: AgentProfileFlags): Promise<string | undefined> {
   if (f.instructionsFile !== undefined) {
-    return f.instructionsFile === "-"
-      ? (await Bun.stdin.text()).trim()
-      : readFileSync(f.instructionsFile, "utf8");
+    const raw =
+      f.instructionsFile === "-" ? await Bun.stdin.text() : readFileSync(f.instructionsFile, "utf8");
+    return canonicalInstructions(raw);
   }
   return f.instructions;
 }

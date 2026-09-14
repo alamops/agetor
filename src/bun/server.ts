@@ -193,7 +193,7 @@ import type {
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 import { consumePendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
-import { AGENT_PROFILE_LIMITS } from "../shared/agent-profile.ts";
+import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import type { AgentProfilePatch } from "./db.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
@@ -507,6 +507,38 @@ function coerceBranchConfig(raw: unknown): { config: BranchNamingConfig } | { er
   const v = validateBranchConfig(config);
   if (!v.ok) return { error: v.reason };
   return { config };
+}
+
+/**
+ * Validate + normalize an agent profile's `skills` field for the
+ * `POST`/`PATCH /agent-profiles` routes (docs/plans/agent-profiles.md). Unlike
+ * `sanitizeSkillsList` in db.ts (a defensive parse-path normalizer that
+ * silently drops/truncates malformed input from the DB), this is the wire
+ * validator — it must be HONEST about what it does: a non-array, or an array
+ * containing anything that isn't a string, 400s rather than silently
+ * filtering; the array is normalized via `normalizeSkillName` (trim,
+ * strip-leading-slash, collapse whitespace, drop-if-empty) and deduplicated
+ * (first occurrence wins) BEFORE the length is checked against
+ * `AGENT_PROFILE_LIMITS.skills`, so a caller that sends 60 raw entries which
+ * normalize/dedupe down to 40 unique names is accepted, while one that still
+ * has 51 after normalization is rejected instead of silently truncated.
+ */
+function parseSkillsBody(raw: unknown): { skills: string[] } | { error: string } {
+  if (!Array.isArray(raw) || raw.some((s) => typeof s !== "string")) {
+    return { error: "skills must be an array of strings" };
+  }
+  const seen = new Set<string>();
+  const skills: string[] = [];
+  for (const entry of raw as string[]) {
+    const name = normalizeSkillName(entry);
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    skills.push(name);
+  }
+  if (skills.length > AGENT_PROFILE_LIMITS.skills) {
+    return { error: `at most ${AGENT_PROFILE_LIMITS.skills} skills` };
+  }
+  return { skills };
 }
 
 /**
@@ -3207,10 +3239,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // route that accepts one. `effort`/`mode` are string-or-null
       // passthrough — same null-clear-only philosophy as the task PATCH route
       // (see its own comment on the subject) — and are never validated
-      // against a model's supported-effort catalog here. `skills`
-      // normalization (trim/strip-leading-slash/dedupe/cap) happens entirely
-      // in `agentProfiles.insert`/`update` (`sanitizeSkillsList` in db.ts) —
-      // this route only checks the wire shape (must be an array).
+      // against a model's supported-effort catalog here. `skills` is
+      // validated HONESTLY by `parseSkillsBody` below (400 on a non-string
+      // entry, 400 past the cap) rather than silently filtering/truncating —
+      // `agentProfiles.insert`/`update` (`sanitizeSkillsList` in db.ts) keeps
+      // its own defensive normalize+cap for the parse path (direct DB writes,
+      // migrations), but the HTTP route now rejects instead of mangling.
       "/agent-profiles": {
         GET: authed((req) => json(agentProfiles.list(), { headers: corsHeaders(req) })),
         POST: authed(async (req) => {
@@ -3254,12 +3288,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             );
           }
 
-          if (body.skills !== undefined && !Array.isArray(body.skills)) {
-            return json({ error: "skills must be an array of strings" }, { status: 400, headers: corsHeaders(req) });
+          let skills: string[] = [];
+          if (body.skills !== undefined) {
+            const parsedSkills = parseSkillsBody(body.skills);
+            if ("error" in parsedSkills) {
+              return json({ error: parsedSkills.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            skills = parsedSkills.skills;
           }
-          const skills = Array.isArray(body.skills)
-            ? body.skills.filter((s): s is string => typeof s === "string")
-            : [];
 
           try {
             const created = agentProfiles.insert({
@@ -3352,10 +3388,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             patch.instructions = instructions;
           }
           if ("skills" in body) {
-            if (!Array.isArray(body.skills)) {
-              return json({ error: "skills must be an array of strings" }, { status: 400, headers: corsHeaders(req) });
+            const parsedSkills = parseSkillsBody(body.skills);
+            if ("error" in parsedSkills) {
+              return json({ error: parsedSkills.error }, { status: 400, headers: corsHeaders(req) });
             }
-            patch.skills = body.skills.filter((s): s is string => typeof s === "string");
+            patch.skills = parsedSkills.skills;
           }
 
           try {
@@ -3633,7 +3670,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // `createTask` resolves it and overrides agent/model/effort/mode/
           // fast/maxMode from the profile — this route only checks the
           // wire shape, same division of labor as every other field here.
-          if (body.agentProfileId !== undefined && typeof body.agentProfileId !== "string") {
+          // `null` is accepted as "no profile", matching createTask's own
+          // `input.agentProfileId?.trim()` handling.
+          if (
+            body.agentProfileId !== undefined &&
+            body.agentProfileId !== null &&
+            typeof body.agentProfileId !== "string"
+          ) {
             return json({ error: "agentProfileId must be a string" }, { status: 400, headers: corsHeaders(req) });
           }
           if (body.issueSnapshot !== undefined) {

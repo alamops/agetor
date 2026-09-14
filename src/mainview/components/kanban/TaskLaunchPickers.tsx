@@ -106,6 +106,13 @@ export interface TaskLaunch {
   /** The harness id a launch will actually run under — mirrors
    *  `effectiveKind`. */
   effectiveAgent: string;
+  /** `agents.find(a => a.harnessId === effectiveAgent)` — the availability/
+   *  auth status for whichever harness a launch will actually run under.
+   *  Consumers must gate submit and render the availability/auth hint off
+   *  THIS, not `selectedStatus` (which only ever reflects the manual
+   *  picker and goes stale — silently — once a profile is selected and
+   *  hides that block). */
+  effectiveStatus: AgentStatus | undefined;
   /** Apply a batch of values onto the manual picker state — used by the
    *  Agents Settings edit form to seed the picker from the profile being
    *  edited. Applies `agent` first via the same reset-to-kind-defaults path
@@ -121,13 +128,58 @@ export interface TaskLaunch {
   }>) => void;
 }
 
-export function useTaskLaunch(open: boolean, opts?: { withProfiles?: boolean }): TaskLaunch {
+export function useTaskLaunch(
+  open: boolean,
+  opts?: {
+    withProfiles?: boolean;
+    /**
+     * Seed values for the manual harness/mode/model/effort/fast/maxMode
+     * block, resolved by the open-effect INSTEAD OF `prefs.defaultHarness` /
+     * `lastMode:<kind>` / `lastModel:<kind>` / `lastEffort:<kind>` — for a
+     * caller seeding the picker from an already-fully-formed object (e.g.
+     * Settings → Agents editing an existing `AgentProfile`), where falling
+     * back to the user's ambient last-picked defaults would silently
+     * overwrite the very thing being edited.
+     *
+     * Fixes a real race (phase 8 finding F2): the open-effect below used to
+     * ALWAYS resolve from prefs, and `AgentProfilesSection` compensated with
+     * its own second effect that re-seeded from the profile afterward,
+     * gated on `!launch.loading`. That guard didn't work: `loading` starts
+     * `false`, and on the render where `open` flips true, BOTH effects run
+     * in the same commit (this hook's fetch effect first, since it's
+     * declared earlier in the calling component's hook-call order) — the
+     * fetch effect's `setLoading(true)` doesn't take effect until the next
+     * render, so the seeding effect still reads the stale `loading === false`
+     * and reseeds immediately. Its seed then loses the race against this
+     * effect's own async `Promise.all(...).then(...)`, which resolves later
+     * and overwrites the profile's values with `prefs.defaultHarness`/
+     * `last*:<kind>`. Passing `initial` in here instead means there is only
+     * ONE place that ever resolves the "what should the picker show" answer
+     * for an edit — inside this same `.then()`, atomically with the harness
+     * fetch it depends on to resolve the profile's harness kind — so there
+     * is nothing left to race.
+     */
+    initial?: {
+      agent: string;
+      mode: string | null;
+      model: string;
+      effort: string | null;
+      fast: boolean;
+      maxMode: boolean;
+    };
+  },
+): TaskLaunch {
   const withProfiles = opts?.withProfiles !== false;
+  const initial = opts?.initial;
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
   const [harnessModels, setHarnessModels] = useState<Record<string, { id: string; label?: string }[]>>({});
-  const [loading, setLoading] = useState(false);
+  // Seeded from `open` (not a bare `false`) so a hook whose owning component
+  // mounts already-open is truthful on its very first render instead of
+  // reporting "not loading" for one paint before the effect below flips it —
+  // the same class of desync as the seed race this option fixes.
+  const [loading, setLoading] = useState(open);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const availableHarnesses = useMemo(() => harnesses.filter((h) => h.enabled), [harnesses]);
@@ -169,6 +221,27 @@ export function useTaskLaunch(open: boolean, opts?: { withProfiles?: boolean }):
         setAgentModels(models);
         setHarnessModels(harnessModelPayload.byHarness);
         const enabled = payload.harnesses.filter((h) => h.enabled);
+
+        if (initial) {
+          // See `initial`'s doc comment above: resolve straight from the
+          // caller-provided values instead of `prefs`. Deliberately do NOT
+          // require `initial.agent` to be a member of `enabled` — a profile
+          // can reference a harness that's since been disabled or deleted,
+          // and the form must keep showing exactly what the profile
+          // references (the picker/card renders its own disabled/missing
+          // marker) rather than silently swapping in a different harness.
+          const nextAgent = initial.agent;
+          const nextHarness = payload.harnesses.find((h) => h.id === nextAgent);
+          const nextKind: AgentKind = nextHarness?.kind ?? "claude-code";
+          setAgent(nextAgent);
+          setMode(initial.mode ?? initialMode(nextKind));
+          setModel(initial.model);
+          setEffort(initial.effort);
+          setFast(initial.fast);
+          setMaxMode(initial.maxMode);
+          return;
+        }
+
         const want = prefs.defaultHarness;
         const nextAgent =
           want && enabled.some((h) => h.id === want)
@@ -318,6 +391,13 @@ export function useTaskLaunch(open: boolean, opts?: { withProfiles?: boolean }):
   const effectiveKind: AgentKind = selectedProfile
     ? (harnesses.find((h) => h.id === selectedProfile.harness)?.kind ?? "claude-code")
     : kind;
+  // `AgentStatus` for whichever harness a launch will ACTUALLY run under —
+  // the selected profile's harness when one is picked, else the manually-
+  // picked `agent`. Callers must gate submit / render availability+auth
+  // hints off this, not the bare `selectedStatus` (which stays pinned to
+  // the manual picker and is invisible once a profile hides that block) —
+  // finding F2-3.
+  const effectiveStatus = agents.find((a) => a.harnessId === effectiveAgent);
 
   return {
     loading,
@@ -354,6 +434,7 @@ export function useTaskLaunch(open: boolean, opts?: { withProfiles?: boolean }):
     refreshProfiles,
     effectiveKind,
     effectiveAgent,
+    effectiveStatus,
     seed,
   };
 }
@@ -384,6 +465,7 @@ export function TaskLaunchPickers({
     agents,
     agent,
     selectedStatus,
+    effectiveStatus,
     mode,
     modes,
     model,
@@ -423,7 +505,22 @@ export function TaskLaunchPickers({
       )}
 
       {selectedProfile ? (
-        <AgentProfileCard profile={selectedProfile} harnesses={harnesses} variant="selected" />
+        <>
+          <AgentProfileCard profile={selectedProfile} harnesses={harnesses} variant="selected" />
+          {/* Same availability/auth hint the manual branch below shows,
+           *  but keyed off `effectiveStatus` (the PROFILE's harness) — a
+           *  profile whose harness is unavailable or logged out must not
+           *  block Start with no visible reason (finding F2-3). */}
+          {effectiveStatus && !effectiveStatus.available && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
+              <div className="font-medium">{effectiveStatus.reason}</div>
+              {effectiveStatus.installHint && (
+                <div className="mt-1 font-mono opacity-80">{effectiveStatus.installHint}</div>
+              )}
+            </div>
+          )}
+          <HarnessAuthHint status={effectiveStatus} />
+        </>
       ) : (
         <>
           <div className="space-y-1">

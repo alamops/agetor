@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, AgentProfile, AgentProfileSnapshot, BacklogMessage, BranchNamingConfig, Harness, HarnessQuota, HarnessUsage, Project, SavedPrompt, SentFileEntry, Task, TaskDraft, TaskFxRecovery, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import { AGENT_OPTIONS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Harness, type HarnessQuota, type HarnessUsage, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Subagent, type SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
@@ -331,11 +331,14 @@ const parseSentFiles = (raw: unknown): SentFileEntry[] | null => {
 };
 
 /** Every {@link AgentKind} value a stored `harnessKind` may legitimately
- *  carry — mirrors the union in `shared/types.ts`. A snapshot whose
+ *  carry — derived from {@link AGENT_OPTIONS}'s own keys rather than
+ *  hardcoded, so a sixth agent kind can't silently null every existing
+ *  snapshot (`AGENT_OPTIONS` is the single source of truth `AgentKind`
+ *  itself is keyed against in `shared/types.ts`). A snapshot whose
  *  `harnessKind` isn't one of these is treated as corrupt (see
  *  {@link parseAgentProfileSnapshot}) rather than cast blindly, since it
  *  drives `AgentIcon`/`defaultModeFor`-style lookups on the client. */
-const AGENT_KINDS = new Set<string>(["claude-code", "codex", "cursor", "gemini", "fx"]);
+const AGENT_KINDS = new Set<string>(Object.keys(AGENT_OPTIONS));
 
 /**
  * Normalize a raw `skills` value (from a JSON blob — either an
@@ -366,11 +369,14 @@ const sanitizeSkillsList = (raw: unknown): string[] => {
  * JSON, and unexpected shapes — all collapse to `null`, same treatment as
  * `parseSentFiles`/`parseTaskFxRecovery`. Every field is validated
  * defensively since the snapshot drives display (chip, transcript preamble)
- * without any further lookup: `id`/`name`/`harness`/`harnessLabel`/`model`
- * must be strings, `harnessKind` must be a known {@link AgentKind},
- * `effort`/`mode` a string or `null`, `fast`/`maxMode` coerced to booleans,
- * `instructions` a string (default `""`), `skills` sanitized via
- * {@link sanitizeSkillsList}, and `capturedAt` a number (default `0`).
+ * without any further lookup: `id`/`name`/`harness`/`model` must be strings,
+ * `harnessKind` must be a known {@link AgentKind}, `harnessLabel` is a
+ * cosmetic display string that must not be load-bearing — a missing or
+ * non-string value falls back to the (already-validated) `harness` id rather
+ * than nulling the whole snapshot, `effort`/`mode` a string or `null`,
+ * `fast`/`maxMode` coerced to booleans, `instructions` a string (default
+ * `""`), `skills` sanitized via {@link sanitizeSkillsList}, and `capturedAt`
+ * a number (default `0`).
  */
 const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | null => {
   if (!raw) return null;
@@ -386,16 +392,15 @@ const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | n
   const id = rec.id;
   const name = rec.name;
   const harness = rec.harness;
-  const harnessLabel = rec.harnessLabel;
   const model = rec.model;
   const harnessKind = rec.harnessKind;
   if (typeof id !== "string" || !id) return null;
   if (typeof name !== "string" || !name) return null;
   if (typeof harness !== "string" || !harness) return null;
-  if (typeof harnessLabel !== "string" || !harnessLabel) return null;
   if (typeof model !== "string" || !model) return null;
   if (typeof harnessKind !== "string" || !AGENT_KINDS.has(harnessKind)) return null;
 
+  const harnessLabel = typeof rec.harnessLabel === "string" && rec.harnessLabel ? rec.harnessLabel : harness;
   const effort = rec.effort;
   const mode = rec.mode;
   const instructions = rec.instructions;

@@ -462,6 +462,15 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   const effectiveHarnessLabel = selectedProfile
     ? (selectedProfileHarness?.label ?? selectedProfile.harness)
     : selectedHarnessLabel;
+  // `AgentStatus` for whichever harness a launch will ACTUALLY run under —
+  // mirrors `useTaskLaunch`'s `effectiveStatus` (finding F2-3). NewTaskForm
+  // keeps its own state instead of the shared hook, so this is the local
+  // equivalent: `selectedStatus` stays pinned to the manual `agent` picker
+  // and goes stale once a profile hides that block, so the availability/
+  // auth hint below must read from this instead.
+  const effectiveStatus = selectedProfile
+    ? agents.find((a) => a.harnessId === selectedProfile.harness)
+    : selectedStatus;
 
   // Gemini's one-shot tmux launch has no deferred-paste fallback for an
   // oversized prompt — surfaced here (and blocking submit) rather than
@@ -500,7 +509,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
         maxMode: selectedProfile ? selectedProfile.maxMode : (kind === "cursor" ? maxMode : false),
         references,
         taskType,
-        agentProfileId,
+        // Omit entirely when no profile is selected — an explicit `null`
+        // still round-trips through the server's own accept-null handling,
+        // but a body that never mentions the key at all is the simplest
+        // contract for every consumer of this payload shape (finding F2-1).
+        ...(agentProfileId ? { agentProfileId } : {}),
       },
       { start },
     );
@@ -693,7 +706,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                   value={agentProfileId}
                   onChange={setAgentProfileId}
                   profiles={profiles}
-                  harnesses={availableHarnesses}
+                  // Full list, not `availableHarnesses` — the picker/card
+                  // resolve each profile's icon+label from this and need to
+                  // resolve a disabled harness too so they can render the
+                  // "(harness disabled)" marker rather than falling back to
+                  // a bare id (finding F2-4; the harness BUTTON grid a few
+                  // lines below stays scoped to `availableHarnesses` on
+                  // purpose — you can't launch onto a disabled harness).
+                  harnesses={harnesses}
                   onManage={onOpenSettingsAgents}
                 />
               </div>
@@ -703,7 +723,25 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                   below with its own card — nothing under here is read from
                   when `selectedProfile` is set (see `submit`). */}
               {selectedProfile ? (
-                <AgentProfileCard profile={selectedProfile} harnesses={harnesses} variant="selected" />
+                <>
+                  <AgentProfileCard profile={selectedProfile} harnesses={harnesses} variant="selected" />
+                  {/* Same availability/auth hint the manual branch below
+                   *  shows, but keyed off `effectiveStatus` (the PROFILE's
+                   *  harness) — a profile whose harness is unavailable or
+                   *  logged out must not leave a blocked Start with no
+                   *  visible reason (finding F2-3). */}
+                  {effectiveStatus && !effectiveStatus.available && (
+                    <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
+                      <div className="font-medium">{effectiveStatus.reason}</div>
+                      {effectiveStatus.installHint && (
+                        <div className="mt-1 font-mono opacity-80">
+                          {effectiveStatus.installHint}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  <HarnessAuthHint status={effectiveStatus} />
+                </>
               ) : (
               <>
               <div className="space-y-1">
