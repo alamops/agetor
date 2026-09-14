@@ -516,15 +516,15 @@ import {
  *     PERSISTS on the session (`commitActiveSessionEffort` → a
  *     `preferences_changed` session event → `session_log.zig`'s projection,
  *     re-emitted by `writeLoadSessionResponse`'s `configOptions`,
- *     source-derived — the probe only ran `session/new` + two
- *     `set_config_option` calls, never a subsequent `session/resume`/`load`
- *     to observe the echoed value survive a round trip; that live check is
- *     still open on the §3.6 live-smoke checklist. Live-verified today is
- *     narrower: `set_config_option effort=high` echoes `currentValue:"high"`
- *     back in ITS OWN response. Worst case if the persistence claim is wrong
- *     is one redundant `set_config_option` RPC per turn — `applyFxEffort`
- *     already re-sends whenever its locally-tracked `currentValue` disagrees,
- *     so nothing breaks either way). **On a 0.0.8 binary the same call is a
+ *     source-derived AND live-verified 2026-09-14 on the upgraded 0.0.10
+ *     with a real `fx login` (`deepseek/deepseek-v4-flash`): turn 1 set
+ *     `effort=high` (its own response echoed `currentValue:"high"`, and fx's
+ *     log shows `provider_options … effort=high reasoning=selected` on the
+ *     Gateway request); a fresh process's `session/resume` of that session
+ *     then reported the `effort` option with `currentValue:"high"` — the
+ *     round trip holds, so `applyFxEffort`'s "silent when `currentValue`
+ *     already matches" shortcut skips exactly one redundant RPC per
+ *     follow-up turn). **On a 0.0.8 binary the same call is a
  *     silent no-op** — no error, but `currentValue` never changes, because
  *     0.0.8 never advertises the `effort` configOptions entry at all (this
  *     driver's `parseFxEffortOption` returns `null` for such a result, which
