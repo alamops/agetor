@@ -178,7 +178,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   const [workdir, setWorkdir] = useState("");
   // Owns the isolate toggle, base-ref, and branch-name field state/derivations
   // — see `WorktreeOptions.tsx`. Declared here (before the mode/model state)
-  // since `wt.baseRef` is read further down by `<PromptComposer branch={…}>`.
+  // since `wt.isolate`/`wt.baseRef` are read further down by the `fileScope`
+  // memo passed to `<PromptComposer fileScope={…}>`.
   const wt = useWorktreeOptions({ workdir, title, taskType });
   const [mode, setMode] = useState<string>(initialMode("claude-code"));
   const [model, setModel] = useState<string>(DEFAULT_MODEL["claude-code"]);
@@ -588,7 +589,6 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                 onChange={setPrompt}
                 agent={agent}
                 workdir={workdir}
-                branch={wt.baseRef}
                 references={references}
                 onReferencesChange={setReferences}
                 fileScope={fileScope}

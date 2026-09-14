@@ -3384,7 +3384,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const url = new URL(req.url);
           const agentParam = url.searchParams.get("agent");
           const workdir = url.searchParams.get("workdir");
-          const branch = url.searchParams.get("branch");
+          const branch = url.searchParams.get("branch")?.trim() || null;
           if (!agentParam) {
             return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
           }

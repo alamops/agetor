@@ -182,7 +182,6 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
                 onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
                 agent={launch.agent}
                 workdir={context.path}
-                branch={context.headRef}
                 references={references}
                 onReferencesChange={setReferences}
                 setReferences={setReferences}

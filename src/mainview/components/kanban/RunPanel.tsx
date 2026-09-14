@@ -2843,21 +2843,6 @@ function RunPanelBody({
     setReferences: setSendRefs,
     onReport: setSendHint,
   });
-  // Hoisted above the composer's own internal calls (passed down via
-  // `capabilities`/`savedPrompts` below) so the dock's Main ↔ subagent tab
-  // switches and the archived-without-canSend swap — which unmount and
-  // remount `<PromptComposer>` — don't refire the capabilities disk walk or
-  // the saved-prompts fetch on every round trip. See the comment above
-  // `sendRef`.
-  const capabilities = useAgentCapabilities(task.agent, task.workdir, task.branch ?? undefined);
-  const savedPromptsState = useSavedPrompts();
-  // Stable identity for RunEventList/UserMessageBlock's display-only path
-  // shortening (see the `pathRoots` prop doc) — both are memoized, so a
-  // fresh array each render would defeat them.
-  const pathRoots = useMemo(
-    () => [task.worktreePath, task.workdir],
-    [task.worktreePath, task.workdir],
-  );
   // Which tree the `@` file popover lists/validates against — must match what
   // the server will expand against at send time (`task.worktreePath ?? task.workdir`,
   // see orchestrator `sendInput`): the live worktree once it exists; before the
@@ -2866,7 +2851,10 @@ function RunPanelBody({
   // `task.branch` when this task is pinned to a pre-existing branch
   // (`branchSource === "existing"`, e.g. a PR's head branch), else the
   // pinned `baseRef` a freshly-created branch will be cut from; a plain
-  // workdir otherwise.
+  // workdir otherwise. Declared above the `capabilities` hoist below — it
+  // feeds `useAgentCapabilities` the same scope, so project-level skill/
+  // command/MCP discovery reads exactly this tree too, never a stale
+  // `task.branch`-against-the-source-repo scope.
   const fileScope = useMemo<FileScope>(() => (
     task.worktreePath
       ? { dir: task.worktreePath }
@@ -2877,6 +2865,22 @@ function RunPanelBody({
           }
         : { dir: task.workdir }
   ), [task.worktreePath, task.isolation, task.workdir, task.baseRef, task.branchSource, task.branch]);
+  // Hoisted above the composer's own internal calls (passed down via
+  // `capabilities`/`savedPrompts` below) so the dock's Main ↔ subagent tab
+  // switches and the archived-without-canSend swap — which unmount and
+  // remount `<PromptComposer>` — don't refire the capabilities disk walk or
+  // the saved-prompts fetch on every round trip. See the comment above
+  // `sendRef`. Scoped by `fileScope` (the same `{dir, ref?}` pair the `@`
+  // popover uses), not a separate workdir/branch pair — see that memo above.
+  const capabilities = useAgentCapabilities(task.agent, fileScope);
+  const savedPromptsState = useSavedPrompts();
+  // Stable identity for RunEventList/UserMessageBlock's display-only path
+  // shortening (see the `pathRoots` prop doc) — both are memoized, so a
+  // fresh array each render would defeat them.
+  const pathRoots = useMemo(
+    () => [task.worktreePath, task.workdir],
+    [task.worktreePath, task.workdir],
+  );
   const onSendDragOver = (e: React.DragEvent) => {
     if (!e.dataTransfer.types.includes("Files")) return;
     // Always preventDefault on a file dragover so WKWebView doesn't fall back
@@ -3368,7 +3372,6 @@ function RunPanelBody({
             onChange={setInput}
             agent={task.agent}
             workdir={task.workdir}
-            branch={task.branch ?? undefined}
             references={sendRefs}
             onReferencesChange={setSendRefs}
             setReferences={setSendRefs}
