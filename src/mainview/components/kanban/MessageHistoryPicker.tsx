@@ -179,6 +179,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
     <div ref={rootRef} className={cn("relative", className)}>
       <button
         type="button"
+        data-testid="message-history-trigger"
         disabled={disabled}
         onClick={() => setOpen((o) => !o)}
         title="Insert a past message"
@@ -199,6 +200,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
           // Marker for RunPanel's global Escape handler so it yields to this
           // popover instead of closing the whole panel underneath it.
           data-popover-open=""
+          data-testid="message-history-popover"
           // This repo defines no `bg-popover`/`text-popover-foreground`
           // tokens (see tailwind.config.js / index.css) — those classes emit
           // no CSS and rendered the dropdown transparent. `bg-card` /
@@ -223,6 +225,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
                 <li key={item.key} role="option" aria-selected={false}>
                   <button
                     type="button"
+                    data-testid="message-history-item"
                     onClick={() => {
                       onPick(item.text);
                       setOpen(false);

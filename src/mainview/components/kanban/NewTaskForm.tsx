@@ -731,7 +731,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                    *  logged out must not leave a blocked Start with no
                    *  visible reason (finding F2-3). */}
                   {effectiveStatus && !effectiveStatus.available && (
-                    <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
+                    <div
+                      data-testid="agent-profile-harness-unavailable"
+                      className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground"
+                    >
                       <div className="font-medium">{effectiveStatus.reason}</div>
                       {effectiveStatus.installHint && (
                         <div className="mt-1 font-mono opacity-80">

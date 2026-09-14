@@ -273,6 +273,37 @@ test.afterAll(async ({ backend }) => {
       headers: auth(backend),
     }).catch(() => { /* best-effort cleanup */ });
   }
+  // Belt-and-suspenders: the "Delete profile" test (test 4) deletes this
+  // file's one shared profile itself via the UI, but if an earlier test
+  // fails before that step runs, the profile (created under "Reviewer",
+  // possibly still under that name or renamed to PROFILE_NAME) would
+  // otherwise leak into whatever spec file's worker-shared backend runs
+  // next and break its own absolute-count assertions. Best-effort by id
+  // (if scenario 2 got far enough to resolve it) and by name (covers both
+  // "Reviewer" and the renamed "Reviewer v2", in case the rename in test 1
+  // itself never completed).
+  if (profileId) {
+    await fetch(`${backend.apiBase}/agent-profiles/${profileId}`, {
+      method: "DELETE",
+      headers: auth(backend),
+    }).catch(() => {});
+  }
+  for (const name of ["Reviewer", PROFILE_NAME]) {
+    try {
+      const res = await fetch(`${backend.apiBase}/agent-profiles`, { headers: auth(backend) });
+      if (!res.ok) continue;
+      const list = (await res.json()) as { id: string; name: string }[];
+      const found = list.find((p) => p.name === name);
+      if (found) {
+        await fetch(`${backend.apiBase}/agent-profiles/${found.id}`, {
+          method: "DELETE",
+          headers: auth(backend),
+        }).catch(() => {});
+      }
+    } catch {
+      // best-effort cleanup
+    }
+  }
   await rm(projectDir, { recursive: true, force: true });
 });
 
@@ -328,8 +359,13 @@ test.describe("agent profiles", () => {
     await dupForm.getByTestId("agent-profile-name").fill("reviewer v2");
     await dupForm.getByTestId("agent-profile-save").click();
     await expect(dupForm.getByTestId("agent-profile-form-error")).toContainText("already in use");
-    // No second row was created.
-    await expect(section.locator('[data-testid="agent-profile-row"]')).toHaveCount(1);
+    // No second row was created — scoped to this spec's own name family
+    // ("Reviewer" was renamed to "Reviewer v2" above) rather than the whole
+    // list, which may also hold profiles left behind by another spec file
+    // sharing this worker's backend.
+    await expect(
+      section.locator('[data-testid="agent-profile-row"]').filter({ hasText: "Reviewer" }),
+    ).toHaveCount(1);
     await dupForm.getByTestId("agent-profile-cancel").click();
     await expect(dupForm).toBeHidden();
   });
@@ -485,7 +521,9 @@ test.describe("agent profiles", () => {
     await expect(confirmDialog).toContainText("2 tasks are bound to it and keep their own frozen copy");
     await confirmDialog.getByRole("button", { name: "Delete", exact: true }).click();
 
-    await expect(section.locator('[data-testid="agent-profile-row"]')).toHaveCount(0);
+    // Assert the specific row is gone, not that the whole list is empty —
+    // another spec file sharing this worker's backend may still have rows.
+    await expect(row).toHaveCount(0);
 
     await dialog.getByRole("button", { name: "Close", exact: true }).click();
     await expect(dialog).toBeHidden();

@@ -184,7 +184,16 @@ export function useTaskLaunch(
 
   const availableHarnesses = useMemo(() => harnesses.filter((h) => h.enabled), [harnesses]);
 
-  const [agent, setAgent] = useState<string>("claude-code");
+  // When `initial` is supplied (the Settings edit form), seed the six launch
+  // values from it SYNCHRONOUSLY so the very first paint already shows the
+  // record being edited — the open-effect below re-applies the same values
+  // once harnesses have loaded (resolving the kind properly). Without this
+  // the form flashed the claude-code defaults until the harness fetch
+  // resolved, which under load lasted long enough to read as "the edit form
+  // shows the wrong model". `initial.mode === null` can't be resolved to a
+  // kind default before harnesses load unless the id IS a built-in kind
+  // name; the effect fixes that up, and it's only a placeholder until then.
+  const [agent, setAgent] = useState<string>(initial?.agent ?? "claude-code");
   const selectedHarness = useMemo(
     () => harnesses.find((h) => h.id === agent) ?? null,
     [harnesses, agent],
@@ -192,11 +201,18 @@ export function useTaskLaunch(
   const kind: AgentKind = selectedHarness?.kind ?? "claude-code";
   const selectedStatus = agents.find((a) => a.harnessId === agent);
 
-  const [mode, setMode] = useState<string>(initialMode("claude-code"));
-  const [model, setModel] = useState<string>(DEFAULT_MODEL["claude-code"]);
-  const [effort, setEffort] = useState<string | null>(DEFAULT_EFFORT["claude-code"]);
-  const [fast, setFast] = useState(false);
-  const [maxMode, setMaxMode] = useState(false);
+  const [mode, setMode] = useState<string>(() => {
+    if (!initial) return initialMode("claude-code");
+    if (initial.mode) return initial.mode;
+    const guessKind = (Object.keys(AGENT_OPTIONS) as AgentKind[]).includes(initial.agent as AgentKind)
+      ? (initial.agent as AgentKind)
+      : "claude-code";
+    return initialMode(guessKind);
+  });
+  const [model, setModel] = useState<string>(initial?.model ?? DEFAULT_MODEL["claude-code"]);
+  const [effort, setEffort] = useState<string | null>(initial ? initial.effort : DEFAULT_EFFORT["claude-code"]);
+  const [fast, setFast] = useState(initial?.fast ?? false);
+  const [maxMode, setMaxMode] = useState(initial?.maxMode ?? false);
 
   const [agentProfileId, setAgentProfileId] = useState<string | null>(null);
   const { profiles: fetchedProfiles, refresh: refreshProfiles } = useAgentProfiles({
@@ -512,7 +528,10 @@ export function TaskLaunchPickers({
            *  profile whose harness is unavailable or logged out must not
            *  block Start with no visible reason (finding F2-3). */}
           {effectiveStatus && !effectiveStatus.available && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
+            <div
+              data-testid="launch-agent-unavailable-hint"
+              className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground"
+            >
               <div className="font-medium">{effectiveStatus.reason}</div>
               {effectiveStatus.installHint && (
                 <div className="mt-1 font-mono opacity-80">{effectiveStatus.installHint}</div>
@@ -561,7 +580,10 @@ export function TaskLaunchPickers({
               })}
             </div>
             {selectedStatus && !selectedStatus.available && (
-              <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
+              <div
+                data-testid="launch-agent-unavailable-hint"
+                className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground"
+              >
                 <div className="font-medium">{selectedStatus.reason}</div>
                 {selectedStatus.installHint && (
                   <div className="mt-1 font-mono opacity-80">{selectedStatus.installHint}</div>
