@@ -19,6 +19,8 @@ import {
   HarnessBuiltinError,
   HarnessInUseError,
   savedPrompts,
+  agentProfiles,
+  AgentProfileNameError,
   dataDir,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
@@ -191,6 +193,8 @@ import type {
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 import { consumePendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
+import { AGENT_PROFILE_LIMITS } from "../shared/agent-profile.ts";
+import type { AgentProfilePatch } from "./db.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
 // `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
@@ -371,7 +375,17 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
   return ((req: Request) => (isAuthorized(req) ? fn(req) : unauthorized(req))) as F;
 }
 
-/** Fields callers may patch on a task. Everything else is server-managed. */
+/**
+ * Fields callers may patch on a task. Everything else is server-managed —
+ * including, additively, `agentProfileId`/`agentProfile` (docs/plans/
+ * agent-profiles.md D1): they're create-only (via `POST /tasks`'s
+ * `agentProfileId`) or targeted-UPDATE-only (`tasks.setAgentProfile`, called
+ * from `startTask`'s live-profile refresh and the detach route below),
+ * never through this generic PATCH. See the bound-agent 409 guard in
+ * `PATCH /tasks/:id` for the other half of that lock: even a listed field
+ * here (`agent`/`mode`/`model`/`effort`/`fast`/`maxMode`) is refused once a
+ * task is bound to a profile, until it's detached.
+ */
 const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
   "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "fast", "maxMode", "taskType",
 ]);
@@ -3120,7 +3134,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           } catch (e) {
             if (e instanceof HarnessInUseError) {
               return json(
-                { error: e.message, taskIds: e.taskIds },
+                { error: e.message, taskIds: e.taskIds, profileIds: e.profileIds },
                 { status: 409, headers: corsHeaders(req) },
               );
             }
@@ -3179,6 +3193,189 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
         DELETE: authed((req) => {
           const removed = savedPrompts.delete(req.params.id);
+          return removed
+            ? json({ ok: true }, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Reusable, named launch presets (docs/plans/agent-profiles.md) — the
+      // "Agents" the New Task picker and `agetor agent`/`agetor add --profile`
+      // work against. Validation style mirrors /saved-prompts above: a
+      // non-object body 400s, strings are trimmed, and the harness reference
+      // is resolved via `harnesses.getByIdOrKind` exactly like every other
+      // route that accepts one. `effort`/`mode` are string-or-null
+      // passthrough — same null-clear-only philosophy as the task PATCH route
+      // (see its own comment on the subject) — and are never validated
+      // against a model's supported-effort catalog here. `skills`
+      // normalization (trim/strip-leading-slash/dedupe/cap) happens entirely
+      // in `agentProfiles.insert`/`update` (`sanitizeSkillsList` in db.ts) —
+      // this route only checks the wire shape (must be an array).
+      "/agent-profiles": {
+        GET: authed((req) => json(agentProfiles.list(), { headers: corsHeaders(req) })),
+        POST: authed(async (req) => {
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+
+          const name = typeof body.name === "string" ? body.name.trim() : "";
+          if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+          if (name.length > AGENT_PROFILE_LIMITS.name) {
+            return json(
+              { error: `agent name must be ${AGENT_PROFILE_LIMITS.name} characters or fewer` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+
+          const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
+          if (!harnessRef) return json({ error: "harness required" }, { status: 400, headers: corsHeaders(req) });
+          const harness = harnesses.getByIdOrKind(harnessRef);
+          if (!harness) {
+            return json({ error: `unknown harness "${harnessRef}"` }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          const model = typeof body.model === "string" ? body.model.trim() : "";
+          if (!model) return json({ error: "model required" }, { status: 400, headers: corsHeaders(req) });
+
+          if (body.effort !== undefined && body.effort !== null && typeof body.effort !== "string") {
+            return json({ error: "effort must be a string or null" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.mode !== undefined && body.mode !== null && typeof body.mode !== "string") {
+            return json({ error: "mode must be a string or null" }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          const instructions = typeof body.instructions === "string" ? body.instructions : "";
+          if (instructions.length > AGENT_PROFILE_LIMITS.instructions) {
+            return json(
+              { error: `agent instructions must be ${AGENT_PROFILE_LIMITS.instructions} characters or fewer` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+
+          if (body.skills !== undefined && !Array.isArray(body.skills)) {
+            return json({ error: "skills must be an array of strings" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const skills = Array.isArray(body.skills)
+            ? body.skills.filter((s): s is string => typeof s === "string")
+            : [];
+
+          try {
+            const created = agentProfiles.insert({
+              name,
+              harness: harness.id,
+              model,
+              effort: (body.effort as string | null | undefined) ?? null,
+              mode: (body.mode as string | null | undefined) ?? null,
+              fast: body.fast === true,
+              maxMode: body.maxMode === true,
+              instructions,
+              skills,
+            });
+            return json(created, { headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof AgentProfileNameError) {
+              return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+      },
+
+      "/agent-profiles/:id": {
+        GET: authed((req) => {
+          const p = agentProfiles.get(req.params.id);
+          return p
+            ? json(p, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PATCH: authed(async (req) => {
+          const current = agentProfiles.get(req.params.id);
+          if (!current) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+          const patch: AgentProfilePatch = {};
+
+          if ("name" in body) {
+            const name = typeof body.name === "string" ? body.name.trim() : "";
+            if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+            if (name.length > AGENT_PROFILE_LIMITS.name) {
+              return json(
+                { error: `agent name must be ${AGENT_PROFILE_LIMITS.name} characters or fewer` },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            patch.name = name;
+          }
+          if ("harness" in body) {
+            const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
+            if (!harnessRef) return json({ error: "harness required" }, { status: 400, headers: corsHeaders(req) });
+            const harness = harnesses.getByIdOrKind(harnessRef);
+            if (!harness) {
+              return json({ error: `unknown harness "${harnessRef}"` }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.harness = harness.id;
+          }
+          if ("model" in body) {
+            const model = typeof body.model === "string" ? body.model.trim() : "";
+            if (!model) return json({ error: "model required" }, { status: 400, headers: corsHeaders(req) });
+            patch.model = model;
+          }
+          if ("effort" in body) {
+            if (body.effort !== null && typeof body.effort !== "string") {
+              return json({ error: "effort must be a string or null" }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.effort = body.effort;
+          }
+          if ("mode" in body) {
+            if (body.mode !== null && typeof body.mode !== "string") {
+              return json({ error: "mode must be a string or null" }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.mode = body.mode;
+          }
+          if ("fast" in body) patch.fast = body.fast === true;
+          if ("maxMode" in body) patch.maxMode = body.maxMode === true;
+          if ("instructions" in body) {
+            const instructions = typeof body.instructions === "string" ? body.instructions : "";
+            if (instructions.length > AGENT_PROFILE_LIMITS.instructions) {
+              return json(
+                { error: `agent instructions must be ${AGENT_PROFILE_LIMITS.instructions} characters or fewer` },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            patch.instructions = instructions;
+          }
+          if ("skills" in body) {
+            if (!Array.isArray(body.skills)) {
+              return json({ error: "skills must be an array of strings" }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.skills = body.skills.filter((s): s is string => typeof s === "string");
+          }
+
+          try {
+            const updated = agentProfiles.update(req.params.id, patch);
+            return updated
+              ? json(updated, { headers: corsHeaders(req) })
+              : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof AgentProfileNameError) {
+              return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+        DELETE: authed((req) => {
+          // Deleting a profile always succeeds — a task already launched from
+          // it keeps its own frozen snapshot (D7), so there's nothing to
+          // guard against the way `/harnesses/:id` DELETE must guard against
+          // in-use tasks/profiles.
+          const removed = agentProfiles.delete(req.params.id);
           return removed
             ? json({ ok: true }, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -3432,6 +3629,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (body.issueUrl !== undefined && typeof body.issueUrl !== "string") {
             return json({ error: "issueUrl must be a string" }, { status: 400, headers: corsHeaders(req) });
           }
+          // Additive agent-profile binding (docs/plans/agent-profiles.md):
+          // `createTask` resolves it and overrides agent/model/effort/mode/
+          // fast/maxMode from the profile — this route only checks the
+          // wire shape, same division of labor as every other field here.
+          if (body.agentProfileId !== undefined && typeof body.agentProfileId !== "string") {
+            return json({ error: "agentProfileId must be a string" }, { status: 400, headers: corsHeaders(req) });
+          }
           if (body.issueSnapshot !== undefined) {
             if (typeof body.issueSnapshot !== "string") {
               return json({ error: "issueSnapshot must be a string" }, { status: 400, headers: corsHeaders(req) });
@@ -3498,6 +3702,28 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             );
           }
           const patch = filterPatch(await req.json());
+          // A task bound to an agent profile (docs/plans/agent-profiles.md
+          // D5) has its agent/mode/model/effort/fast/maxMode locked — the
+          // profile owns those six fields, and the only sanctioned way to
+          // change them is to detach first (`DELETE /tasks/:id/agent-profile`)
+          // or edit the profile itself. Refuse the whole PATCH with 409 if it
+          // touches any of the six with a value that actually differs from
+          // what's already on the row — a same-value resend (e.g. a stale
+          // form re-submitting unchanged fields) is allowed through rather
+          // than punishing a no-op.
+          if (before.agentProfileId) {
+            const boundFields = ["agent", "mode", "model", "effort", "fast", "maxMode"] as const;
+            const touchesBoundField = boundFields.some(
+              (field) => field in patch && patch[field] !== before[field],
+            );
+            if (touchesBoundField) {
+              const profileName = before.agentProfile?.name ?? before.agentProfileId;
+              return json(
+                { error: `task is bound to agent "${profileName}" — detach it first` },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+          }
           // Prevent workdir from being swapped after a worktree has been
           // materialized. The worktree is registered against the original repo;
           // changing workdir would make removeWorktree run git ops against the
@@ -4662,6 +4888,31 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const updated = backlog.remove(req.params.id, req.params.itemId);
           return updated
             ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Detach a task from its bound agent profile (docs/plans/
+      // agent-profiles.md D5): clears both `agentProfileId` and the frozen
+      // `agentProfile` snapshot via `tasks.setAgentProfile`, which unlocks
+      // the agent/mode/model/effort/fast/maxMode dropdowns (the values
+      // themselves are left exactly as they were — "detach" keeps state,
+      // it doesn't revert it) and lifts the PATCH route's bound-agent 409
+      // guard above. Archived-gated (409, not 400 — unlike `backlogGuard`'s
+      // 400 for the same condition) since detaching is a task mutation the
+      // archived freeze already covers everywhere else.
+      "/tasks/:id/agent-profile": {
+        DELETE: authed((req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (task.archivedAt != null) {
+            return json({ error: "task is archived" }, { status: 409, headers: corsHeaders(req) });
+          }
+          const updated = tasks.setAgentProfile(req.params.id, null, null);
+          return updated
+            ? json(withRunningSubagents(updated), { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
       },

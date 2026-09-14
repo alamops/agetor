@@ -12,6 +12,7 @@ import type {
   HarnessStatus,
   HarnessUsage,
   AgentKind,
+  AgentProfile,
   BranchInfo,
   TaskReference,
   TaskDiff,
@@ -293,6 +294,37 @@ export class AgetorClient {
     return this.req("GET", "/defaults");
   }
 
+  // ── agent profiles ──────────────────────────────────────────────────────
+  /** `GET /agent-profiles` — every profile, name ASC. */
+  listAgentProfiles(): Promise<AgentProfile[]> {
+    return this.req("GET", "/agent-profiles");
+  }
+  /** `GET /agent-profiles/:id` — 404 propagates as a thrown `ApiError`. */
+  getAgentProfile(id: string): Promise<AgentProfile> {
+    return this.req("GET", `/agent-profiles/${encodeURIComponent(id)}`);
+  }
+  /** `POST /agent-profiles` — 400 unknown/invalid harness, 409 duplicate
+   *  (case-insensitive, trimmed) name; both propagate as a thrown `ApiError`. */
+  createAgentProfile(input: AgentProfileInput): Promise<AgentProfile> {
+    return this.req("POST", "/agent-profiles", input);
+  }
+  /** `PATCH /agent-profiles/:id` — same validation as create. */
+  patchAgentProfile(id: string, patch: Partial<AgentProfileInput>): Promise<AgentProfile> {
+    return this.req("PATCH", `/agent-profiles/${encodeURIComponent(id)}`, patch);
+  }
+  /** `DELETE /agent-profiles/:id` — never blocked; tasks that already ran
+   *  keep their snapshot. */
+  deleteAgentProfile(id: string): Promise<void> {
+    return this.req("DELETE", `/agent-profiles/${encodeURIComponent(id)}`);
+  }
+  /** `DELETE /tasks/:id/agent-profile` — detach a bound task from its
+   *  profile (keeps the copied agent/model/effort/mode/fast/maxMode values,
+   *  unlocks them for PATCH). Returns the full updated `Task`; 404 unknown
+   *  task, 409 archived. */
+  detachTaskAgentProfile(taskId: string): Promise<Task> {
+    return this.req("DELETE", `/tasks/${encodeURIComponent(taskId)}/agent-profile`);
+  }
+
   // ── preferences (cross-session key/value store) ────────────────────────────
   getPreferences(): Promise<Record<string, string>> {
     return this.req("GET", "/preferences");
@@ -369,6 +401,28 @@ export interface CreateTaskInput {
   issueUrl?: string;
   /** Rendered issue + comment-thread snapshot; requires `issueUrl`. */
   issueSnapshot?: string;
+  /** Id of an {@link AgentProfile} to launch from (create-only) — the server
+   *  resolves it and overrides `agent`/`model`/`effort`/`mode`/`fast`/
+   *  `maxMode` from the profile; 400 on an unknown id. Mutually exclusive
+   *  with setting those six fields yourself — the CLI (`agetor add
+   *  --profile`) enforces that client-side before this ever reaches the
+   *  wire. */
+  agentProfileId?: string;
+}
+
+/** Body shared by `POST /agent-profiles` and `PATCH /agent-profiles/:id`
+ *  (partial there). Mirrors {@link AgentProfile} minus its server-assigned
+ *  `id`/`createdAt`/`updatedAt`. */
+export interface AgentProfileInput {
+  name: string;
+  harness: string;
+  model: string;
+  effort: string | null;
+  mode: string | null;
+  fast: boolean;
+  maxMode: boolean;
+  instructions: string;
+  skills: string[];
 }
 
 /** Server-side allow-list for PATCH /tasks/:id. */

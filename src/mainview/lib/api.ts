@@ -1,5 +1,6 @@
 import type {
   AgentKind,
+  AgentProfile,
   AgentStatus,
   AppEvent,
   BranchInfo,
@@ -417,6 +418,23 @@ export interface HarnessInput {
   env: Record<string, string>;
 }
 
+/** Body shape for `POST /agent-profiles` / `PATCH /agent-profiles/:id` — see
+ *  `docs/plans/agent-profiles.md` §3 for the full contract. `harness` is a
+ *  harness id (same semantics as `Task.agent` / `createTask`'s `agent`).
+ *  `effort`/`mode` follow the task PATCH guard's null-clear-only philosophy;
+ *  `skills` are bare names (no leading `/`), normalized server-side. */
+export interface AgentProfileInput {
+  name: string;
+  harness: string;
+  model: string;
+  effort: string | null;
+  mode: string | null;
+  fast: boolean;
+  maxMode: boolean;
+  instructions: string;
+  skills: string[];
+}
+
 export const api = {
   defaults: () => j<AppDefaults>("/defaults"),
   info: () => j<{ version: string }>("/info"),
@@ -479,6 +497,22 @@ export const api = {
     }),
   deleteSavedPrompt: (id: string) =>
     j<{ ok: true }>(`/saved-prompts/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  listAgentProfiles: () => j<AgentProfile[]>("/agent-profiles"),
+  getAgentProfile: (id: string) => j<AgentProfile>(`/agent-profiles/${encodeURIComponent(id)}`),
+  createAgentProfile: (input: AgentProfileInput) =>
+    j<AgentProfile>("/agent-profiles", { method: "POST", body: JSON.stringify(input) }),
+  updateAgentProfile: (id: string, patch: Partial<AgentProfileInput>) =>
+    j<AgentProfile>(`/agent-profiles/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteAgentProfile: (id: string) =>
+    j<void>(`/agent-profiles/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  /** Detach a task from its bound agent profile — the values it copied stay
+   *  on the task row, but the four dropdowns (+ cursor fast/max) unlock.
+   *  404 unknown task, 409 archived. */
+  detachTaskAgentProfile: (taskId: string) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/agent-profile`, { method: "DELETE" }),
   listAgentModels: () => j<AgentModelMap>("/agent-models"),
   /** Per-harness model catalog (fx account-scoped, one entry per enabled
    *  harness) — see `HarnessModelMap`. */
@@ -1157,11 +1191,15 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ value }),
     }),
-  listAgentCapabilities: (opts: { agent: string; workdir: string; branch?: string }) => {
+  listAgentCapabilities: (opts: { agent: string; workdir?: string | null; branch?: string }) => {
     // Slash commands/skills + MCP/skill/plugin extensions in one fetch. `agent`
     // is a harness id (built-ins use id-equals-kind, so "claude-code" / "codex"
     // still works). The server resolves to the harness via getByIdOrKind and
-    // reads from the harness's own home when set.
+    // reads from the harness's own home when set. `workdir` is optional — the
+    // server always includes user-level entries + plugins even without one
+    // (project-level commands/skills only exist once a workdir is known);
+    // omitted/empty means "no workdir" rather than an empty-string one, same
+    // convention as `listProjectFiles`'s `ref`.
     const q = new URLSearchParams({ agent: opts.agent });
     if (opts.workdir) q.set("workdir", opts.workdir);
     if (opts.branch) q.set("branch", opts.branch);
@@ -1231,6 +1269,11 @@ export const api = {
      *  a per-task file and attached as a reference. Only meaningful
      *  alongside `issueUrl`. */
     issueSnapshot?: string;
+    /** Id of an {@link AgentProfile} to launch from — the server resolves it
+     *  and overrides `agent`/`model`/`effort`/`mode`/`fast`/`maxMode` from the
+     *  profile (body-provided values for those fields are ignored); 400 on an
+     *  unknown id. */
+    agentProfileId?: string | null;
   }) =>
     // retry: false — a replay would create a duplicate task + branch.
     j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }, { retry: false }),

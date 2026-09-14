@@ -90,11 +90,24 @@ export async function cmdLs(
     glyph(t),
     c.dim(t.id.slice(0, 8)),
     truncate(t.title, 44),
-    c.gray(t.agent ?? ""),
+    agentCell(t),
     colorColumn(t.column),
     needsCell(t),
   ]);
   out(table(["", "id", "title", "agent", "column", "needs"], rows));
+}
+
+/** Agent column: a task bound to an agent profile shows its name (bold) plus
+ *  the dim harness id from the snapshot — reads the same whether the profile
+ *  is still live or has since been deleted, since it's rendered from the
+ *  task's own captured snapshot, not a fresh lookup. Otherwise the raw
+ *  harness id, as before. The `--agent` filter above still matches on
+ *  `t.agent` (the harness id) regardless of what this column displays. */
+function agentCell(t: Task): string {
+  if (t.agentProfile) {
+    return `${c.bold(t.agentProfile.name)} ${c.dim(`(${t.agentProfile.harness})`)}`;
+  }
+  return c.gray(t.agent ?? "");
 }
 
 /** The "needs" column: pending-interaction count first (unchanged), then an
