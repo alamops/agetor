@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { c, errln } from "./output.ts";
 import { findAtTokens, isListedPath } from "../shared/at-refs.ts";
+import { discoveryParamsForTask } from "../shared/file-scope.ts";
 import type { AgetorClient } from "./api-client.ts";
 import type { Task } from "../shared/types.ts";
 
@@ -179,18 +180,24 @@ export async function verifyTokensViaSearch<T extends { path: string; isDirector
  *  `@name` mention syntax — e.g. `@github` — is never a file reference).
  *  Shared by `add.ts` (`cmdAdd`'s pre-check and `--start`) and
  *  `lifecycle.ts` (`cmdSend`, `cmdStart`) so there's one copy of this
- *  fail-open lookup rather than one per caller. A discovery failure must not
- *  block or fail the caller's own operation: falls back to an empty set
- *  (over-warn rather than crash) — the network call itself is the only
- *  non-injectable part, reached through the passed-in `client` so a test can
- *  swap in a fake `agentDiscovery` that throws or returns a controlled list
- *  without a real server. */
+ *  fail-open lookup rather than one per caller. Discovery params come from
+ *  `discoveryParamsForTask` (`src/shared/file-scope.ts`) — the same
+ *  worktree-vs-committed-ref rule the webview's `RunPanel`/the TUI/the `@`
+ *  file listing use (CLAUDE.md §12), not the raw `task.workdir`/`branch`
+ *  pair, so a materialized worktree reads its own live tree instead of the
+ *  source repo's committed ref. A discovery failure must not block or fail
+ *  the caller's own operation: falls back to an empty set (over-warn rather
+ *  than crash) — the network call itself is the only non-injectable part,
+ *  reached through the passed-in `client` so a test can swap in a fake
+ *  `agentDiscovery` that throws or returns a controlled list without a real
+ *  server. */
 export async function discoveredExtensionNames(
   client: AgetorClient,
-  task: Pick<Task, "agent" | "workdir" | "branch">,
+  task: Pick<Task, "agent" | "workdir" | "worktreePath" | "isolation" | "baseRef" | "branchSource" | "branch">,
 ): Promise<Set<string>> {
   try {
-    const { extensions } = await client.agentDiscovery(task.agent, task.workdir, task.branch ?? null);
+    const { workdir, branch } = discoveryParamsForTask(task);
+    const { extensions } = await client.agentDiscovery(task.agent, workdir, branch);
     return new Set(extensions.map((e) => (e.insert.startsWith("@") ? e.insert.slice(1) : e.name)));
   } catch {
     return new Set();

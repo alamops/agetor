@@ -63,9 +63,14 @@ import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub"
  * `listAgentCapabilities`'s claude-code discovery (src/bun/commands.ts) has
  * something project-scoped to surface in the composer test's extension
  * picker, plus a `develop` branch (one commit ahead of `main`) for the
- * branch-from test's Branch picker. Discovery reads the *source* repo on
- * disk (the dialog's `workdir`), not a worktree, and needs no claude binary
- * — `CLAUDE_BUILTINS` (e.g. `/code-review`) are always listed regardless.
+ * branch-from test's Branch picker. With Isolate on (the dialog's default),
+ * discovery reads the selected ref's COMMITTED tree — the dialog's
+ * `fileScope` carries `ref: baseRef || "HEAD"` (`src/shared/file-scope.ts`'s
+ * `fileScopeForTask`, the same table `GET /agent-discovery`'s `branch` param
+ * now honors as a git ref) rather than the live working tree — so these
+ * fixtures must be committed, not just present on disk; needs no claude
+ * binary — `CLAUDE_BUILTINS` (e.g. `/code-review`) are always listed
+ * regardless.
  *
  * `openGitDialog` explicitly selects this spec's project in the dialog's
  * Project combobox — see `pr-merged-state.spec.ts`'s file header for why
@@ -119,14 +124,17 @@ async function initRepo(): Promise<string> {
   await writeFile(path.join(dir, "README.md"), "e2e fixture repo\n");
 
   // Discovery fixtures for the composer test — listAvailableCommands /
-  // discoverMcpAndPluginExtensions (src/bun/commands.ts) read these straight
-  // off this SOURCE repo on disk, not a worktree. A project skill's
-  // slash-invokable name is its folder name (discoverSkills) — the SKILL.md
-  // frontmatter only needs `description:` — and a project .mcp.json's
-  // `mcpServers` keys surface as `@name` mention extensions
-  // (mcpServersToExtensions). Planted and committed on `main` (before the
-  // `develop` branch below forks off it, so it inherits them too) so `git
-  // status` stays clean for the worktree machinery.
+  // discoverMcpAndPluginExtensions (src/bun/commands.ts) read these off the
+  // git ref the dialog's `fileScope` resolves to (with Isolate on, that's
+  // `baseRef || "HEAD"`'s COMMITTED tree, not this working tree — see the
+  // file header). A project skill's slash-invokable name is its folder name
+  // (discoverSkills) — the SKILL.md frontmatter only needs `description:` —
+  // and a project .mcp.json's `mcpServers` keys surface as `@name` mention
+  // extensions (mcpServersToExtensions). COMMITTING these before the
+  // `develop` branch below forks off `main` (so it inherits them too) is
+  // load-bearing, not just tidy — an uncommitted fixture would be invisible
+  // to a ref-scoped discovery read; committing incidentally also keeps `git
+  // status` clean for the worktree machinery.
   await mkdir(path.join(dir, ".claude", "skills", "e2e-skill"), { recursive: true });
   await writeFile(
     path.join(dir, ".claude", "skills", "e2e-skill", "SKILL.md"),

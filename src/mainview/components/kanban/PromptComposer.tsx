@@ -273,7 +273,6 @@ export interface PromptComposerProps {
   value: string;
   onChange: (next: string) => void;
   agent: string;
-  workdir: string;
   references: TaskReference[];
   onReferencesChange: (refs: TaskReference[]) => void;
   /**
@@ -282,13 +281,17 @@ export interface PromptComposerProps {
    * the branch-scoped-capabilities work, the same scope `useAgentCapabilities`
    * reads project-level skills/commands/MCP/plugin-enablement from, so the
    * `/` autocomplete and the Extensions picker can never disagree with the
-   * `@` file listing about which tree they're describing. `{ dir }` for a
-   * live tree — an existing worktree, or an isolation=none task's workdir.
-   * `{ dir, ref }` for a not-yet-created worktree, listing tracked files (and
-   * reading project-level capabilities) at the pinned base ref (the shape
-   * the worktree will actually have once `startTask` materializes it).
-   * `null`/omitted disables the `@` popover, highlighting, and project-level
-   * capability discovery entirely — no fetch is made for either.
+   * `@` file listing about which tree they're describing. It's also the sole
+   * gate for the Extensions picker's enabled state (`disabled` below) — a
+   * consumer with no `fileScope.dir` gets a disabled-but-otherwise-inert
+   * picker rather than one enabled with nothing to discover against.
+   * `{ dir }` for a live tree — an existing worktree, or an isolation=none
+   * task's workdir. `{ dir, ref }` for a not-yet-created worktree, listing
+   * tracked files (and reading project-level capabilities) at the pinned
+   * base ref (the shape the worktree will actually have once `startTask`
+   * materializes it). `null`/omitted disables the `@` popover, highlighting,
+   * the Extensions picker, and project-level capability discovery entirely —
+   * no fetch is made for any of them.
    */
   fileScope?: FileScope | null;
   /** Opaque token whose CHANGE triggers a listing `refresh()` — RunPanel
@@ -437,7 +440,6 @@ export function PromptComposer({
   value,
   onChange,
   agent,
-  workdir,
   references,
   onReferencesChange,
   setReferences,
@@ -855,7 +857,7 @@ export function PromptComposer({
               textareaRef={ref}
               placement={placement}
               align={actions ? "left" : "right"}
-              disabled={disabled || !workdir.trim()}
+              disabled={disabled || !fileScope?.dir?.trim()}
             />
             {actions && <div className="flex items-center gap-2">{actions}</div>}
           </div>

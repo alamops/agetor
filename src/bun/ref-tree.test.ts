@@ -196,6 +196,12 @@ describe("resolution failures return null (never throw)", () => {
     expect(await loadRefProjectTree(repo, "--output=x")).toBeNull();
   });
 
+  test("a ref containing a newline/CR/NUL is rejected without spawning git", async () => {
+    expect(await loadRefProjectTree(repo, "main\nrm -rf /")).toBeNull();
+    expect(await loadRefProjectTree(repo, "main\r")).toBeNull();
+    expect(await loadRefProjectTree(repo, "main\0x")).toBeNull();
+  });
+
   test("non-git directory", async () => {
     const plain = mkdtempSync(path.join(tmpRoot, "not-a-repo-"));
     const tree = await loadRefProjectTree(plain, "main");
@@ -205,6 +211,63 @@ describe("resolution failures return null (never throw)", () => {
   test("nonexistent directory", async () => {
     const tree = await loadRefProjectTree(path.join(tmpRoot, "does-not-exist-at-all"), "main");
     expect(tree).toBeNull();
+  });
+});
+
+// --- cat-file --batch request/record desync guard (path containing \n) -------
+//
+// A git filename can legitimately contain a literal newline; `ls-tree -z`
+// emits it raw (NUL-terminated, not newline-terminated, so the listing
+// itself is unaffected). But `batchCatFile` writes one `${ref}:${p}\n`
+// request line per path to `git cat-file --batch`'s stdin — a `\n` inside
+// `p` there splits into two request lines, and every later response record
+// (batch preserves input order) is then attributed to the wrong path. The
+// reviewer reproduced this live: with `foo\nbar` in the request stream,
+// `uni` read back null and `zzz` read back `uni`'s content. The fix excludes
+// any path containing `\n`/`\0` from `toRead` (stays LISTED, `read()` just
+// returns null for it) — this pins that both the desync can't happen and the
+// documented "listed but not fetched" contract still holds for such a path.
+describe("cat-file --batch request/record desync guard", () => {
+  let desyncRepo: string;
+
+  beforeAll(() => {
+    desyncRepo = mkdtempSync(path.join(tmpRoot, "batch-desync-"));
+    git(["init", "-q", "-b", "main"], desyncRepo);
+    git(["config", "user.email", "test@example.com"], desyncRepo);
+    git(["config", "user.name", "test"], desyncRepo);
+    git(["config", "commit.gpgsign", "false"], desyncRepo);
+
+    const writeSkill = (name: string, body: string) => {
+      const skillDir = path.join(desyncRepo, ".claude/skills", name);
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(path.join(skillDir, "SKILL.md"), body);
+    };
+
+    writeSkill("empty", "---\ndescription: Empty\n---\n");
+    // The skill whose name itself carries a literal newline — created
+    // directly (not via `writeSkill`) since `path.join`'s last segment here
+    // is a single directory name containing an embedded LF, per the
+    // reviewer's repro recipe.
+    mkdirSync(path.join(desyncRepo, ".claude/skills/foo\nbar"), { recursive: true });
+    writeFileSync(path.join(desyncRepo, ".claude/skills/foo\nbar/SKILL.md"), "---\ndescription: Foo bar\n---\nbody\n");
+    writeSkill("uni", "---\ndescription: descrição — ✓\n---\nüñî body → ✓\n");
+    writeSkill("zzz", "---\ndescription: Zzz\n---\nzzz body\n");
+
+    git(["add", "."], desyncRepo);
+    git(["commit", "-q", "-m", "init"], desyncRepo);
+  });
+
+  test("uni and zzz round-trip their exact bodies; foo\\nbar is listed but reads null", async () => {
+    const tree = await loadRefProjectTree(desyncRepo, "main");
+    expect(tree).not.toBeNull();
+
+    const names = tree!.list(".claude/skills").map((e) => e.name).sort();
+    expect(names).toEqual(["empty", "foo\nbar", "uni", "zzz"]);
+
+    expect(tree!.read(".claude/skills/uni/SKILL.md")).toBe("---\ndescription: descrição — ✓\n---\nüñî body → ✓\n");
+    expect(tree!.read(".claude/skills/zzz/SKILL.md")).toBe("---\ndescription: Zzz\n---\nzzz body\n");
+    // Excluded from `toRead` (its path contains `\n`) -> listed, never fetched.
+    expect(tree!.read(".claude/skills/foo\nbar/SKILL.md")).toBeNull();
   });
 });
 

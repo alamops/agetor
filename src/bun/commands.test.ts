@@ -814,8 +814,8 @@ describe("branch-scoped capability discovery (ref mode)", () => {
     expect(commands.some((c) => c.name === "/init" && c.source === "builtin")).toBe(true);
   });
 
-  // `resolveProjectTree` (commands.ts) does `const branch = opts.branch?.trim()`
-  // itself before deciding disk-vs-ref and before calling `loadRefProjectTree` —
+  // `resolveProjectTree` (commands.ts) does `branch?.trim()` itself before
+  // deciding disk-vs-ref and before calling `loadRefProjectTree` —
   // i.e. the FUNCTION trims, not just the HTTP route's query-param handling.
   // This pins that observed contract (whitespace-padded branch behaves exactly
   // like the trimmed form) rather than assuming the plan's phrasing ("the

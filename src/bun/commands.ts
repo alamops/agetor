@@ -105,6 +105,15 @@ function discoverCommands(tree: ProjectTree, relDir: string, source: EntrySource
 /**
  * A "skill" is a folder under `skills/` containing a SKILL.md file. The folder
  * name is the slash-invokable name.
+ *
+ * Gates on `tree.read(...) != null`, not on the file merely existing: a
+ * `SKILL.md` that exists but can't be produced as text (unreadable due to
+ * permissions, or a directory named `SKILL.md`) is now omitted entirely
+ * rather than listed with an empty description — an intentional behavior
+ * change from the pre-`ProjectTree` walk. `ProjectTree` has no separate
+ * "exists" notion distinct from "read successfully" (see `list`/`read` on
+ * the interface), and a skill agetor can't describe isn't one worth
+ * offering in the autocomplete.
  */
 function discoverSkills(tree: ProjectTree, relDir: string, source: EntrySource): AvailableCommand[] {
   const out: AvailableCommand[] = [];
@@ -215,8 +224,10 @@ function isDiscoveredCapabilityPath(relPath: string): boolean {
  * Resolve the `ProjectTree` capability discovery should read project-level
  * entries from: `null` when there's no root at all (matches today's "no
  * workdir ⇒ no project entries"); the ref's committed tree — scoped to
- * `CAPABILITY_READ_PATTERNS` — when `opts.branch` is a non-empty ref;
- * otherwise live disk, byte-identical to pre-ref-mode behavior.
+ * `CAPABILITY_READ_PATTERNS` — when `branch` is a non-empty ref; otherwise
+ * live disk, byte-identical to pre-ref-mode behavior. Takes `branch` directly
+ * (not an `opts` bag) — `workdir` was accepted here once but never read;
+ * `root` (already resolved from `workdir` by the caller) is what matters.
  *
  * An unresolvable ref (unknown ref, `root` not a git repo) deliberately
  * degrades to `emptyProjectTree()` rather than falling back to disk — the
@@ -224,13 +235,13 @@ function isDiscoveredCapabilityPath(relPath: string): boolean {
  * project rows, not a possibly-misleading disk snapshot.
  */
 export async function resolveProjectTree(
-  opts: { workdir: string | null; branch?: string | null },
+  branch: string | null | undefined,
   root: string | null,
 ): Promise<ProjectTree | null> {
   if (root == null) return null;
-  const branch = opts.branch?.trim();
-  if (!branch) return diskProjectTree(root);
-  const tree = await loadRefProjectTree(root, branch, { shouldRead: isDiscoveredCapabilityPath });
+  const trimmedBranch = branch?.trim();
+  if (!trimmedBranch) return diskProjectTree(root);
+  const tree = await loadRefProjectTree(root, trimmedBranch, { shouldRead: isDiscoveredCapabilityPath });
   return tree ?? emptyProjectTree();
 }
 
@@ -286,7 +297,7 @@ export async function listAvailableCommands(
     // Plugins apply regardless of workdir (user-scoped ones are global), so
     // resolve the repo root up front — it's also reused for project entries.
     const root = opts.workdir ? (await repoRoot(opts.workdir)) ?? opts.workdir : null;
-    const projectTree = ctx?.projectTree !== undefined ? ctx.projectTree : await resolveProjectTree(opts, root);
+    const projectTree = ctx?.projectTree !== undefined ? ctx.projectTree : await resolveProjectTree(opts.branch, root);
     if (projectTree) {
       all.push(...discoverCommands(projectTree, ".claude/commands", "project"));
       all.push(...discoverSkills(projectTree, ".claude/skills", "project"));
@@ -302,7 +313,7 @@ export async function listAvailableCommands(
     all.push(...discoverCommands(userTree, "prompts", "user"));
     all.push(...discoverSkills(userTree, "skills", "user"));
     const root = opts.workdir ? (await repoRoot(opts.workdir)) ?? opts.workdir : null;
-    const projectTree = ctx?.projectTree !== undefined ? ctx.projectTree : await resolveProjectTree(opts, root);
+    const projectTree = ctx?.projectTree !== undefined ? ctx.projectTree : await resolveProjectTree(opts.branch, root);
     if (projectTree) {
       all.push(...discoverCommands(projectTree, ".codex/prompts", "project"));
       all.push(...discoverSkills(projectTree, ".codex/skills", "project"));
@@ -462,7 +473,12 @@ interface ActivePlugin {
  * User settings are machine-local and always read from disk. Project
  * settings go through `projectTree` (live disk, or a git ref's committed
  * tree — see `resolveProjectTree`) so the enabled-plugin view matches
- * whichever tree the rest of project discovery is reading.
+ * whichever tree the rest of project discovery is reading. The two project
+ * `settings.json`/`settings.local.json` reads deliberately bypass
+ * `jsonStatCache` (unlike `userSettingsPath` above): the tree may be a git
+ * ref, where there's no meaningful on-disk path/mtime to key a stat cache
+ * by. They're tiny files and the request rate is bounded by picker changes
+ * (agent/workdir/branch), so re-parsing them every call is cheap enough.
  */
 function readEnabledPlugins(harnessHome: string | null, projectTree: ProjectTree | null): Map<string, boolean> {
   const merged = new Map<string, boolean>();
@@ -724,7 +740,7 @@ export async function listAgentCapabilities(opts: DiscoveryOpts): Promise<{
   // memoized, so `listAvailableCommands` re-deriving root internally (when
   // called directly, without this ctx) is a hit.
   const root = opts.workdir ? (await repoRoot(opts.workdir)) ?? opts.workdir : null;
-  const projectTree = await resolveProjectTree(opts, root);
+  const projectTree = await resolveProjectTree(opts.branch, root);
   const active = resolveActivePlugins(opts, root, projectTree);
   const commands = await listAvailableCommands(opts, { activePlugins: active, projectTree });
   const skillExts: AvailableExtension[] = commands

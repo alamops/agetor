@@ -140,7 +140,14 @@ interface GitResult {
   exitCode: number;
 }
 
-const GIT_TIMEOUT_MS = 30_000;
+// This path serves an interactive `/`/`@`-autocomplete whose fallback (no
+// project-level rows) is a perfectly fine degraded state — unlike
+// `worktree.ts`'s 30s (where the operation being timed out actually matters
+// to the task), so this budget is deliberately tighter. Requests here can
+// chain up to 3 deep (an unresolvable ref retried against
+// `refs/remotes/origin/<ref>`, then a `cat-file --batch`), and a slow/hung
+// git process shouldn't stall a keystroke-driven UI for tens of seconds.
+const GIT_TIMEOUT_MS = 8_000;
 
 /**
  * Run `git` against a working directory. Never throws — callers inspect
@@ -150,14 +157,15 @@ const GIT_TIMEOUT_MS = 30_000;
  * growing a shared "git utils" module every file depends on.
  */
 async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<GitResult> {
+  let proc: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined;
   try {
-    const proc = Bun.spawn(["git", ...args], {
+    proc = Bun.spawn(["git", ...args], {
       cwd,
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
     });
-    const timer = setTimeout(() => proc.kill(), timeoutMs);
+    const timer = setTimeout(() => proc!.kill(), timeoutMs);
     try {
       const [stdout, stderr, exitCode] = await Promise.all([
         new Response(proc.stdout).text(),
@@ -170,6 +178,11 @@ async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Pro
       return { ok: exitCode === 0, stdout, stderr: stderr.trim(), exitCode };
     } finally {
       clearTimeout(timer);
+      // A throw between spawn and here (e.g. the `Promise.all` above
+      // rejecting for a reason other than a normal exit) would otherwise
+      // leave this child running forever — nothing else ever calls
+      // `.kill()` on it once we've left this function.
+      if (proc.exitCode === null && proc.signalCode === null) proc.kill();
     }
   } catch {
     return { ok: false, stdout: "", stderr: "spawn failed", exitCode: -1 };
@@ -190,26 +203,36 @@ function splitNulTerminated(out: string): string[] {
  * wrong for non-ASCII content that spans the header/body boundary oddly.
  */
 async function runCatFileBatch(cwd: string, requestText: string, timeoutMs = GIT_TIMEOUT_MS): Promise<Buffer | null> {
+  let proc: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
   try {
-    const proc = Bun.spawn(["git", "cat-file", "--batch"], {
+    proc = Bun.spawn(["git", "cat-file", "--batch"], {
       cwd,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
     });
-    const timer = setTimeout(() => proc.kill(), timeoutMs);
+    const timer = setTimeout(() => proc!.kill(), timeoutMs);
     try {
-      proc.stdin.write(requestText);
-      proc.stdin.end();
+      // `.write()`/`.end()` on a Bun `FileSink` can return promises (e.g.
+      // under backpressure); if the child dies mid-write those reject as an
+      // unhandled rejection outside this try/catch unless we chain and
+      // swallow them here.
+      const writeDone = Promise.resolve(proc.stdin.write(requestText))
+        .then(() => proc!.stdin.end())
+        .catch(() => {});
       const [stdoutBuf, , exitCode] = await Promise.all([
         new Response(proc.stdout).arrayBuffer(),
         new Response(proc.stderr).text(),
         proc.exited,
+        writeDone,
       ]);
       if (exitCode !== 0) return null;
       return Buffer.from(stdoutBuf);
     } finally {
       clearTimeout(timer);
+      // Same leak guard as `git()` above — a throw after spawn must not
+      // leave a `git cat-file --batch` blocked on stdin forever.
+      if (proc.exitCode === null && proc.signalCode === null) proc.kill();
     }
   } catch {
     return null;
@@ -303,6 +326,12 @@ export async function loadRefProjectTree(
   // A "-"-leading ref would be parsed as a git flag rather than a revision —
   // same guard `project-files.ts`'s `rawListing` uses.
   if (ref.startsWith("-")) return null;
+  // `ref` is caller-controlled (an HTTP query param), and a `\n`/`\r`/`\0`
+  // would land inside a `cat-file --batch` request line (`${ref}:${p}\n`)
+  // and desync the request/record correlation the same way a `\n` in `p`
+  // does below — a real git ref name can never contain a control character,
+  // so this can only be a hostile or malformed caller, never a legitimate ref.
+  if (/[\n\r\0]/.test(ref)) return null;
 
   const pathspecs = opts?.pathspecs ?? DEFAULT_PATHSPECS;
   const shouldRead = opts?.shouldRead ?? (() => true);
@@ -321,7 +350,17 @@ export async function loadRefProjectTree(
   const files = new Map<string, string | null>();
   for (const p of paths) files.set(p, null);
 
-  const toRead = paths.filter((p) => shouldRead(p));
+  // `batchCatFile` writes one `${ref}:${p}\n` request line per path and
+  // correlates responses back to paths purely by order — a path containing
+  // `\n` (git filenames may legitimately contain one; `ls-tree -z` emits it
+  // raw) would split into two request lines, shifting every subsequent
+  // record onto the wrong path. A `\0` would corrupt the line the same way
+  // if it ever appeared (it can't survive `splitNulTerminated` above, but
+  // the guard costs nothing and states the invariant explicitly). Excluding
+  // such a path from `toRead` keeps it LISTED with `read() -> null` — the
+  // documented "listed but not fetched" contract — rather than risking a
+  // cross-attribution bug.
+  const toRead = paths.filter((p) => shouldRead(p) && !/[\n\0]/.test(p));
   if (toRead.length > 0) {
     const contents = await batchCatFile(dir, resolvedRef, toRead);
     for (const [p, content] of contents) files.set(p, content);

@@ -588,7 +588,6 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                 value={prompt}
                 onChange={setPrompt}
                 agent={agent}
-                workdir={workdir}
                 references={references}
                 onReferencesChange={setReferences}
                 fileScope={fileScope}

@@ -18,6 +18,7 @@ import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
 import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { fileScopeForTask } from "../../../shared/file-scope.ts";
 import { isMacPlatform } from "@/lib/platform";
 import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
@@ -2843,28 +2844,17 @@ function RunPanelBody({
     setReferences: setSendRefs,
     onReport: setSendHint,
   });
-  // Which tree the `@` file popover lists/validates against — must match what
-  // the server will expand against at send time (`task.worktreePath ?? task.workdir`,
-  // see orchestrator `sendInput`): the live worktree once it exists; before the
-  // first run of an isolated task, the source repo at whatever ref
-  // `prepareWorkdir` (worktree.ts) will actually check the worktree out on —
-  // `task.branch` when this task is pinned to a pre-existing branch
-  // (`branchSource === "existing"`, e.g. a PR's head branch), else the
-  // pinned `baseRef` a freshly-created branch will be cut from; a plain
-  // workdir otherwise. Declared above the `capabilities` hoist below — it
-  // feeds `useAgentCapabilities` the same scope, so project-level skill/
-  // command/MCP discovery reads exactly this tree too, never a stale
-  // `task.branch`-against-the-source-repo scope.
-  const fileScope = useMemo<FileScope>(() => (
-    task.worktreePath
-      ? { dir: task.worktreePath }
-      : task.isolation === "worktree"
-        ? {
-            dir: task.workdir,
-            ref: task.branchSource === "existing" && task.branch ? task.branch : (task.baseRef ?? "HEAD"),
-          }
-        : { dir: task.workdir }
-  ), [task.worktreePath, task.isolation, task.workdir, task.baseRef, task.branchSource, task.branch]);
+  // Which tree the `@` file popover lists/validates against — derived via
+  // the shared `fileScopeForTask` (src/shared/file-scope.ts), the single
+  // source of truth for this rule across the webview, TUI and CLI. Declared
+  // above the `capabilities` hoist below — it feeds `useAgentCapabilities`
+  // the same scope, so project-level skill/command/MCP discovery reads
+  // exactly this tree too, never a stale `task.branch`-against-the-source-repo
+  // scope.
+  const fileScope = useMemo<FileScope>(() => {
+    const scope = fileScopeForTask(task);
+    return scope.ref ? { dir: scope.dir, ref: scope.ref } : { dir: scope.dir };
+  }, [task.worktreePath, task.isolation, task.workdir, task.baseRef, task.branchSource, task.branch]);
   // Hoisted above the composer's own internal calls (passed down via
   // `capabilities`/`savedPrompts` below) so the dock's Main ↔ subagent tab
   // switches and the archived-without-canSend swap — which unmount and
@@ -3371,7 +3361,6 @@ function RunPanelBody({
             value={input}
             onChange={setInput}
             agent={task.agent}
-            workdir={task.workdir}
             references={sendRefs}
             onReferencesChange={setSendRefs}
             setReferences={setSendRefs}
