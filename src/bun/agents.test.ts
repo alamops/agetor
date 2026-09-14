@@ -34,6 +34,7 @@ const {
   FAKE_FX_PERMISSION_PROMPT_MARKER,
   FAKE_FX_REPAUSE_PROMPT_MARKER,
   FAKE_FX_RECOVERY_URL_PROMPT_MARKER,
+  FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER,
 } = await import("./agents.ts");
 const { dataDir } = await import("./db.ts");
 
@@ -66,6 +67,7 @@ afterEach(() => {
   delete process.env.AGETOR_FAKE_FX_REPAUSE;
   delete process.env.AGETOR_FAKE_FX_RECOVERY_URL;
   delete process.env.AGETOR_FAKE_FX_RECOVERY;
+  delete process.env.AGETOR_FAKE_FX_EFFORT_UNOFFERED;
 });
 
 /** Build a built-in harness for tests — kind doubles as id, no overrides. */
@@ -1099,10 +1101,11 @@ test("fx unknown mode id passes through verbatim to FX_PERMISSION_MODE", () => {
   expect(env?.FX_PERMISSION_MODE).toBe("some-future-mode");
 });
 
-test("fx ignores effort — no effort-shaped flag in argv, no effort env var, regardless of value", () => {
+test("fx buildCommand still emits no argv/env for effort (fx ≥0.0.9: effort rides over ACP via fx-acp.ts's applyFxEffort/session-set_config_option, not argv/env — see agents.ts's buildCommand fx branch comment)", () => {
   const { cmd, env } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, effort: "max" });
   expect(cmd.join(" ")).not.toMatch(/effort/i);
   expect(env?.CLAUDE_CODE_EFFORT_LEVEL).toBeUndefined();
+  expect(Object.keys(env ?? {})).not.toContain("FX_EFFORT");
 });
 
 test("fx throws when model is missing", () => {
@@ -1229,6 +1232,76 @@ test("fx AGETOR_FX_DRIVER=fake plain-prompt turn: thinking -> text -> usage(used
 
   const providerIdx = chunks.findIndex((c) => c.stream === "status" && c.data === `${FX_PROVIDER_STATUS_PREFIX}gateway`);
   expect(providerIdx).toBeGreaterThanOrEqual(0);
+});
+
+/**
+ * docs/plans/fx-0.0.10-compat.md §3.7 / shared spec — the fake fx driver
+ * mirrors `applyFxEffort`'s (fx-acp.ts) "isn't offered" breadcrumb: when the
+ * prompt carries FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER (or the env twin),
+ * it emits exactly one status chunk naming the task's effort/model, right
+ * after the provider sentinel and before the thinking chunk — otherwise the
+ * fake stays silent about effort, mirroring the real driver's success path.
+ */
+test("fx AGETOR_FX_DRIVER=fake with the effort-unoffered marker in the prompt: one breadcrumb naming the requested effort, after the provider sentinel and before the thinking chunk", async () => {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  const chunks: { stream: RunEventStream; data: string }[] = [];
+  const handle = await spawnAgent({
+    taskId: "task-fx-effort-1",
+    runId: "run-fx-effort-1",
+    harness: builtin("fx"),
+    prompt: `do the thing ${FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER}`,
+    cwd: "/tmp",
+    onChunk: (stream, data) => { chunks.push({ stream, data }); },
+    opts: { ...fxDefaults, runId: "run-fx-effort-1", effort: "high", model: "zai/glm-5.3-flash" },
+  });
+  await handle.done;
+
+  const expected = "fx: effort high isn't offered for zai/glm-5.3-flash (offers: auto, low, high, max) — running at fx's default";
+  const breadcrumbs = chunks.filter((c) => c.stream === "status" && c.data === expected);
+  expect(breadcrumbs.length).toBe(1);
+
+  const providerIdx = chunks.findIndex((c) => c.stream === "status" && c.data === `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+  const breadcrumbIdx = chunks.findIndex((c) => c.stream === "status" && c.data === expected);
+  const thinkingIdx = chunks.findIndex((c) => c.stream === "thinking" && c.data === "fake fx reasoning");
+  expect(providerIdx).toBeGreaterThanOrEqual(0);
+  expect(breadcrumbIdx).toBeGreaterThan(providerIdx);
+  expect(thinkingIdx).toBeGreaterThan(breadcrumbIdx);
+});
+
+test("fx AGETOR_FX_DRIVER=fake with the effort-unoffered ENV twin (AGETOR_FAKE_FX_EFFORT_UNOFFERED=1) and no explicit opts.effort: the breadcrumb says 'effort auto'", async () => {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  process.env.AGETOR_FAKE_FX_EFFORT_UNOFFERED = "1";
+  const chunks: { stream: RunEventStream; data: string }[] = [];
+  const handle = await spawnAgent({
+    taskId: "task-fx-effort-2",
+    runId: "run-fx-effort-2",
+    harness: builtin("fx"),
+    prompt: "do the thing",
+    cwd: "/tmp",
+    onChunk: (stream, data) => { chunks.push({ stream, data }); },
+    opts: { ...fxDefaults, runId: "run-fx-effort-2", model: "zai/glm-5.3-flash" },
+  });
+  await handle.done;
+
+  const expected = "fx: effort auto isn't offered for zai/glm-5.3-flash (offers: auto, low, high, max) — running at fx's default";
+  expect(chunks.some((c) => c.stream === "status" && c.data === expected)).toBe(true);
+});
+
+test("fx AGETOR_FX_DRIVER=fake plain turn with no marker and no env twin: no 'running at fx's default' breadcrumb at all", async () => {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  const chunks: { stream: RunEventStream; data: string }[] = [];
+  const handle = await spawnAgent({
+    taskId: "task-fx-effort-3",
+    runId: "run-fx-effort-3",
+    harness: builtin("fx"),
+    prompt: "do the thing, no marker here",
+    cwd: "/tmp",
+    onChunk: (stream, data) => { chunks.push({ stream, data }); },
+    opts: { ...fxDefaults, runId: "run-fx-effort-3", effort: "high" },
+  });
+  await handle.done;
+
+  expect(chunks.some((c) => c.stream === "status" && c.data.includes("running at fx's default"))).toBe(false);
 });
 
 test("fx AGETOR_FAKE_FX_PERMISSION=1 with mode 'yolo' auto-allows and still emits the same relative sentinel order, plus the provider sentinel", async () => {

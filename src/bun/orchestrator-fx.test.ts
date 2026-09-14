@@ -128,7 +128,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000, intervalMs = 
   }
 }
 
-test("createTask (fx) defaults model to zai/glm-5.3-flash, no effort, and lands in backlog", async () => {
+test("createTask (fx) defaults model to zai/glm-5.3-flash, effort 'auto' (fx's own default), and lands in backlog", async () => {
   const { createTask } = await import("./orchestrator.ts");
 
   const created = await createTask({
@@ -143,11 +143,48 @@ test("createTask (fx) defaults model to zai/glm-5.3-flash, no effort, and lands 
 
   expect(created.task.agent).toBe("fx");
   expect(created.task.model).toBe("zai/glm-5.3-flash");
-  // fx has no per-invocation effort flag — every model in MODEL_EFFORT_SUPPORT.fx
-  // reports an empty supported-effort list, so createTask leaves effort null
-  // rather than defaulting it (see orchestrator.ts's createTask default logic).
-  expect(created.task.effort).toBeNull();
+  // zai/glm-5.3-flash advertises [max, high, low, auto] (docs/plans/
+  // fx-0.0.10-compat.md §3 shared spec) — DEFAULT_EFFORT.fx ("auto") is
+  // among the offered ids, so createTask picks it, mirroring the picker's
+  // own "kind default if offered, else first row" rule.
+  expect(created.task.effort).toBe("auto");
   expect(created.task.column).toBe("backlog");
+});
+
+test("createTask (fx) on a no-effort model (zai/glm-4.7) stores effort null — its offered-effort set is empty", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+
+  const created = await createTask({
+    title: "fx no-effort model",
+    prompt: "do a thing",
+    agent: "fx",
+    model: "zai/glm-4.7",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+
+  expect(created.task.model).toBe("zai/glm-4.7");
+  expect(created.task.effort).toBeNull();
+});
+
+test("createTask (fx) with an explicit effort keeps it verbatim, not overridden by DEFAULT_EFFORT.fx", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+
+  const created = await createTask({
+    title: "fx explicit effort",
+    prompt: "do a thing",
+    agent: "fx",
+    effort: "high",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+
+  expect(created.task.model).toBe("zai/glm-5.3-flash");
+  expect(created.task.effort).toBe("high");
 });
 
 /* ── T5: startTask's logged-out pre-flight (orchestrator.ts's

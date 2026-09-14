@@ -185,6 +185,18 @@ test("ultra is Codex-only — never offered on claude-code, cursor, gemini, or f
   }
 });
 
+// docs/plans/fx-0.0.10-compat.md §3 — `auto` ("Model default") is the one
+// EFFORT_OPTIONS row every kind but fx must never offer, mirroring the
+// ultra/Codex-only test above.
+test("auto is fx-only — never offered on claude-code, codex, cursor, or gemini", () => {
+  expect(supportedEfforts("claude-code", "opus-5").map((o) => o.id)).not.toContain("auto");
+  expect(supportedEfforts("codex", "gpt-6-astra").map((o) => o.id)).not.toContain("auto");
+  expect(supportedEfforts("cursor", "cursor-grok-4.6").map((o) => o.id)).not.toContain("auto");
+  for (const model of AGENT_OPTIONS.gemini.models) {
+    expect(supportedEfforts("gemini", model.id).map((o) => o.id)).not.toContain("auto");
+  }
+});
+
 describe("supportedEfforts with discovered efforts", () => {
   test("a non-empty discovered list wins outright, returned in canonical order", () => {
     const ids = supportedEfforts("codex", "gpt-6-astra", ["low", "high"]).map((o) => o.id);

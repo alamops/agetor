@@ -522,6 +522,82 @@ test("fx status --json auth:missing with fx 0.0.8's real auth_help sentence -> l
   );
 });
 
+// --- fx status --json 0.0.10 real-payload fixtures -------------------------
+// Copied verbatim (workspace path genericized) from a live binary probe of
+// fx 0.0.10 (build_revision 1210c2756ea8, 2026-09-14) — see
+// docs/plans/fx-0.0.10-compat.md TT3 and §2; the builder is byte-identical
+// to 0.0.8 (output_contracts.zig) — same field set (no top-level `version`;
+// no `auth_expired` on a non-expired probe), so these are non-regression
+// fixtures pinning the exact 0.0.10 field set (`build_revision` bumped to
+// "1210c2756ea8") against production code that reads only
+// `auth`/`auth_help`/`auth_expired`/`auth_refreshable`.
+
+function fx010StatusPayload(auth: string, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    kind: "status",
+    model: "moonshotai/kimi-k3",
+    update_channel: "stable",
+    build_channel: "stable",
+    build_revision: "1210c2756ea8",
+    auth,
+    auth_refreshable: false,
+    permission_mode: "auto",
+    workspace: "/Users/dev/project",
+    history_turns: 0,
+    session_permission_grants: 0,
+    agent_step_limit: 0,
+    mcp: {
+      connection_check: "not_checked",
+      servers: [],
+      configuration_issues: [],
+      inspection_error: null,
+    },
+    ...extra,
+  });
+}
+
+test("fx status --json realistic 0.0.10 payload (AI_GATEWAY_API_KEY, build_revision 1210c2756ea8) -> loggedIn:true, authHelp:null; stub reports version 0.0.10", async () => {
+  const payload = fx010StatusPayload("AI_GATEWAY_API_KEY");
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.10", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.version).toBe("0.0.10");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test('fx status --json 0.0.10 auth:"host managed" (FX_AUTH_MODE=host-managed) -> fail-open fallthrough, loggedIn:true, authHelp:null', async () => {
+  const payload = fx010StatusPayload("host managed");
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.10", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json 0.0.10 auth:missing with fx 0.0.10's real auth_help sentence -> loggedIn:false, authHelp verbatim", async () => {
+  const payload = fx010StatusPayload("missing", {
+    auth_help:
+      "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+  });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.10", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(false);
+  expect(status.authHelp).toBe(
+    "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+  );
+});
+
+test("fx status --json 0.0.10 payload with permission_mode:\"yolo\" (the live full-access probe's on-wire value, full-access -> yolo) -> probeStatus ignores permission_mode, loggedIn unaffected", async () => {
+  const payload = fx010StatusPayload("AI_GATEWAY_API_KEY", { permission_mode: "yolo" });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.10", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
 // --- fx status cache (getCachedStatus / statusCache in agent-status.ts) ----
 // `checkHarness`'s fx-only auth pre-flight spawns `fx status --json`. Without
 // memoization the 15s `/harnesses` poll (App.tsx's checkAllHarnesses) would
