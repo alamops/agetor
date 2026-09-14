@@ -352,6 +352,18 @@ export interface AgentProfile {
   skills: string[]; // bare skill names, no leading "/", deduped, max 50, each ≤ 100 chars
   createdAt: number;
   updatedAt: number;
+  /**
+   * Number of tasks currently BOUND to this profile — `tasks.agent_profile_id
+   * = this.id`, every column including archived. Server-derived on every
+   * `/agent-profiles*` HTTP response (`src/bun/server.ts`'s `withTaskCount`/
+   * `withTaskCounts`, backed by `agentProfiles.taskCount`/`taskCounts` in
+   * `src/bun/db.ts`); optional at the type level only because raw db-layer
+   * callers (`agentProfiles.list`/`get`/`insert`/`update` themselves) don't
+   * populate it. Detaching a task (`DELETE /tasks/:id/agent-profile`) or
+   * deleting the task lowers this automatically — a task that only keeps a
+   * frozen `agentProfile` snapshot after detaching is not counted.
+   */
+  taskCount?: number;
 }
 
 /**

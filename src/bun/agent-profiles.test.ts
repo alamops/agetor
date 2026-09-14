@@ -576,3 +576,95 @@ test("harnesses.delete succeeds once the referencing profile is deleted", () => 
   expect(() => harnesses.delete(harnessId)).not.toThrow();
   expect(harnesses.get(harnessId)).toBeNull();
 });
+
+// ---------------------------------------------------------------------------
+// agentProfiles.taskCounts / taskCount ("used by N tasks" follow-up,
+// docs/plans/agent-profiles.md)
+// ---------------------------------------------------------------------------
+
+test("taskCount/taskCounts: 0 for a fresh profile with no bound tasks", () => {
+  const profile = agentProfiles.insert({ name: `Fresh ${randomUUID().slice(0, 8)}`, harness: "claude-code", model: "m" });
+  try {
+    expect(agentProfiles.taskCount(profile.id)).toBe(0);
+    expect(agentProfiles.taskCounts().get(profile.id)).toBeUndefined();
+  } finally {
+    agentProfiles.delete(profile.id);
+  }
+});
+
+test("taskCount/taskCounts: counts across two profiles with 0/1/3 bound tasks", () => {
+  const zero = agentProfiles.insert({ name: `Zero ${randomUUID().slice(0, 8)}`, harness: "claude-code", model: "m" });
+  const one = agentProfiles.insert({ name: `One ${randomUUID().slice(0, 8)}`, harness: "claude-code", model: "m" });
+  const three = agentProfiles.insert({ name: `Three ${randomUUID().slice(0, 8)}`, harness: "claude-code", model: "m" });
+  const snapshot = makeSnapshot({ id: three.id });
+  const taskIds = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+  try {
+    tasks.insert(makeTaskRow(taskIds[0]!, { agentProfileId: one.id, agentProfile: makeSnapshot({ id: one.id }) }));
+    tasks.insert(makeTaskRow(taskIds[1]!, { agentProfileId: three.id, agentProfile: snapshot }));
+    tasks.insert(makeTaskRow(taskIds[2]!, { agentProfileId: three.id, agentProfile: snapshot }));
+    tasks.insert(makeTaskRow(taskIds[3]!, { agentProfileId: three.id, agentProfile: snapshot }));
+
+    expect(agentProfiles.taskCount(zero.id)).toBe(0);
+    expect(agentProfiles.taskCount(one.id)).toBe(1);
+    expect(agentProfiles.taskCount(three.id)).toBe(3);
+
+    const counts = agentProfiles.taskCounts();
+    expect(counts.get(zero.id)).toBeUndefined();
+    expect(counts.get(one.id)).toBe(1);
+    expect(counts.get(three.id)).toBe(3);
+  } finally {
+    for (const id of taskIds) db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+    agentProfiles.delete(zero.id);
+    agentProfiles.delete(one.id);
+    agentProfiles.delete(three.id);
+  }
+});
+
+test("taskCount: detaching via tasks.setAgentProfile(id, null, null) lowers the count", () => {
+  const profile = agentProfiles.insert({ name: `Detach ${randomUUID().slice(0, 8)}`, harness: "claude-code", model: "m" });
+  const taskId = randomUUID();
+  try {
+    tasks.insert(makeTaskRow(taskId, { agentProfileId: profile.id, agentProfile: makeSnapshot({ id: profile.id }) }));
+    expect(agentProfiles.taskCount(profile.id)).toBe(1);
+
+    tasks.setAgentProfile(taskId, null, null);
+    expect(agentProfiles.taskCount(profile.id)).toBe(0);
+    // The task keeps no frozen snapshot after detach — it is not counted.
+    expect(tasks.get(taskId)?.agentProfile).toBeNull();
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    agentProfiles.delete(profile.id);
+  }
+});
+
+test("taskCount: deleting the bound task lowers the count", () => {
+  const profile = agentProfiles.insert({ name: `TaskDelete ${randomUUID().slice(0, 8)}`, harness: "claude-code", model: "m" });
+  const taskId = randomUUID();
+  try {
+    tasks.insert(makeTaskRow(taskId, { agentProfileId: profile.id, agentProfile: makeSnapshot({ id: profile.id }) }));
+    expect(agentProfiles.taskCount(profile.id)).toBe(1);
+
+    tasks.delete(taskId);
+    expect(agentProfiles.taskCount(profile.id)).toBe(0);
+  } finally {
+    agentProfiles.delete(profile.id);
+  }
+});
+
+test("taskCount: an archived task is still counted (the definition is column-agnostic)", () => {
+  const profile = agentProfiles.insert({ name: `Archived ${randomUUID().slice(0, 8)}`, harness: "claude-code", model: "m" });
+  const taskId = randomUUID();
+  try {
+    tasks.insert(
+      makeTaskRow(taskId, {
+        agentProfileId: profile.id,
+        agentProfile: makeSnapshot({ id: profile.id }),
+        archivedAt: Date.now(),
+      }),
+    );
+    expect(agentProfiles.taskCount(profile.id)).toBe(1);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    agentProfiles.delete(profile.id);
+  }
+});

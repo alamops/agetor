@@ -175,6 +175,7 @@ import {
 } from "../shared/types.ts";
 import type {
   AgentKind,
+  AgentProfile,
   AppEvent,
   BranchNamingConfig,
   GitHubItemKind,
@@ -539,6 +540,23 @@ function parseSkillsBody(raw: unknown): { skills: string[] } | { error: string }
     return { error: `at most ${AGENT_PROFILE_LIMITS.skills} skills` };
   }
   return { skills };
+}
+
+/**
+ * Stamp an {@link AgentProfile}'s server-derived `taskCount` (docs/plans/
+ * agent-profiles.md — "used by N tasks"). `withTaskCount` does a single
+ * targeted `agentProfiles.taskCount` query, for the single-resource
+ * GET/POST/PATCH `/agent-profiles/:id` responses; `withTaskCounts` uses one
+ * grouped `agentProfiles.taskCounts()` map so the `GET /agent-profiles` list
+ * route never issues N queries for N profiles. A profile with no bound tasks
+ * simply isn't a key in the map, hence the `?? 0` default.
+ */
+function withTaskCount(p: AgentProfile): AgentProfile {
+  return { ...p, taskCount: agentProfiles.taskCount(p.id) };
+}
+function withTaskCounts(list: AgentProfile[]): AgentProfile[] {
+  const counts = agentProfiles.taskCounts();
+  return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
 }
 
 /**
@@ -3246,7 +3264,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // its own defensive normalize+cap for the parse path (direct DB writes,
       // migrations), but the HTTP route now rejects instead of mangling.
       "/agent-profiles": {
-        GET: authed((req) => json(agentProfiles.list(), { headers: corsHeaders(req) })),
+        GET: authed((req) => json(withTaskCounts(agentProfiles.list()), { headers: corsHeaders(req) })),
         POST: authed(async (req) => {
           const raw = await req.json().catch(() => null);
           if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -3309,7 +3327,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               instructions,
               skills,
             });
-            return json(created, { headers: corsHeaders(req) });
+            return json(withTaskCount(created), { headers: corsHeaders(req) });
           } catch (e) {
             if (e instanceof AgentProfileNameError) {
               return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
@@ -3323,7 +3341,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         GET: authed((req) => {
           const p = agentProfiles.get(req.params.id);
           return p
-            ? json(p, { headers: corsHeaders(req) })
+            ? json(withTaskCount(p), { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
         PATCH: authed(async (req) => {
@@ -3398,7 +3416,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           try {
             const updated = agentProfiles.update(req.params.id, patch);
             return updated
-              ? json(updated, { headers: corsHeaders(req) })
+              ? json(withTaskCount(updated), { headers: corsHeaders(req) })
               : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           } catch (e) {
             if (e instanceof AgentProfileNameError) {

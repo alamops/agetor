@@ -14,6 +14,16 @@ import { SkillsPicker } from "@/components/kanban/SkillsPicker";
 import { TaskLaunchPickers, useTaskLaunch, type TaskLaunch } from "@/components/kanban/TaskLaunchPickers";
 import { useAgentProfiles } from "@/lib/agent-profiles";
 
+/** Render `p.taskCount` (server-derived, rides on the same `/agent-profiles`
+ *  payload `useAgentProfiles` already fetches — no extra request) as the
+ *  row's "Used by N task(s)" line. `undefined` (a payload from a server that
+ *  predates this field) reads as 0 rather than blank. */
+function taskCountLabel(taskCount: number | undefined): string {
+  const n = taskCount ?? 0;
+  if (n === 0) return "Not used by any task yet";
+  return `Used by ${n} task${n === 1 ? "" : "s"}`;
+}
+
 interface Props {
   /** Live harness rows — resolves each row's icon/label (a live
    *  `AgentProfile` carries only a harness id, not its kind/label — see
@@ -121,9 +131,13 @@ export function AgentProfilesSection({ harnesses }: Props) {
   };
 
   const remove = async (p: AgentProfile) => {
+    const n = p.taskCount ?? 0;
     const ok = await confirm({
       title: `Delete agent "${p.name}"?`,
-      description: "Tasks that already used it keep their own copy.",
+      description:
+        n > 0
+          ? `${n} task${n === 1 ? "" : "s"} are bound to it and keep their own frozen copy; they will show it as deleted.`
+          : "Tasks that already used it keep their own copy.",
       confirmLabel: "Delete",
       variant: "destructive",
     });
@@ -168,7 +182,12 @@ export function AgentProfilesSection({ harnesses }: Props) {
               data-profile-id={p.id}
               className="flex items-start gap-2 rounded-md border border-border/60 px-3 py-2"
             >
-              <AgentProfileCard profile={p} harnesses={harnesses} variant="row" className="min-w-0 flex-1" />
+              <div className="min-w-0 flex-1">
+                <AgentProfileCard profile={p} harnesses={harnesses} variant="row" />
+                <p data-testid="agent-profile-task-count" className="mt-1 text-xs text-muted-foreground">
+                  {taskCountLabel(p.taskCount)}
+                </p>
+              </div>
               <div className="flex shrink-0 items-center gap-1 pt-0.5">
                 <Button
                   size="sm"

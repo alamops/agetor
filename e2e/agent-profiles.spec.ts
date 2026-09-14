@@ -473,10 +473,16 @@ test.describe("agent profiles", () => {
     const section = dialog.getByTestId("agent-profiles-section");
     const row = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: PROFILE_NAME });
     await expect(row).toBeVisible();
+    // Two tasks are still bound at this point: "taskRan" and task B from
+    // scenario 3 (both created with `agentProfileId: profileId` and never
+    // detached). Task A from scenario 2 was explicitly detached at the end
+    // of that scenario, so it doesn't count.
+    await expect(row.getByTestId("agent-profile-task-count")).toHaveText("Used by 2 tasks");
     await row.getByTestId("agent-profile-delete").click();
 
     const confirmDialog = page.getByRole("dialog").filter({ hasText: `Delete agent "${PROFILE_NAME}"` });
     await expect(confirmDialog).toBeVisible();
+    await expect(confirmDialog).toContainText("2 tasks are bound to it and keep their own frozen copy");
     await confirmDialog.getByRole("button", { name: "Delete", exact: true }).click();
 
     await expect(section.locator('[data-testid="agent-profile-row"]')).toHaveCount(0);

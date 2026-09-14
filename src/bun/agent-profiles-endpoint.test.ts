@@ -583,3 +583,69 @@ test("DELETE /harnesses/:id → 409 with profileIds when a non-builtin harness i
   const secondDeleteRes = await call(`/harnesses/${harness.id}`, { method: "DELETE" });
   expect(secondDeleteRes.status).toBe(204);
 });
+
+// ---------------------------------------------------------------------------
+// taskCount — "used by N tasks" follow-up (docs/plans/agent-profiles.md)
+// ---------------------------------------------------------------------------
+
+test("GET /agent-profiles list carries taskCount: 0 for a fresh profile", async () => {
+  await createProfile({ name: "Fresh" });
+  const res = await call("/agent-profiles");
+  const list = (await res.json()) as AgentProfile[];
+  expect(list).toHaveLength(1);
+  expect(list[0]!.taskCount).toBe(0);
+});
+
+test("GET /agent-profiles/:id carries taskCount too", async () => {
+  const profile = await createProfile({ name: "Solo" });
+  const res = await call(`/agent-profiles/${profile.id}`);
+  expect(res.status).toBe(200);
+  const fetched = (await res.json()) as AgentProfile;
+  expect(fetched.taskCount).toBe(0);
+});
+
+test("taskCount goes to 1 after POST /tasks with agentProfileId, back to 0 after DELETE /tasks/:id/agent-profile", async () => {
+  const profile = await createProfile({ name: "Bound" });
+
+  const task = await createTask({ agentProfileId: profile.id });
+  expect(task.agentProfileId).toBe(profile.id);
+
+  const afterBind = (await (await call(`/agent-profiles/${profile.id}`)).json()) as AgentProfile;
+  expect(afterBind.taskCount).toBe(1);
+
+  const listAfterBind = (await (await call("/agent-profiles")).json()) as AgentProfile[];
+  expect(listAfterBind.find((p) => p.id === profile.id)?.taskCount).toBe(1);
+
+  const detachRes = await call(`/tasks/${task.id}/agent-profile`, { method: "DELETE" });
+  expect(detachRes.status).toBe(200);
+
+  const afterDetach = (await (await call(`/agent-profiles/${profile.id}`)).json()) as AgentProfile;
+  expect(afterDetach.taskCount).toBe(0);
+});
+
+test("taskCount goes back to 0 after the bound task is deleted", async () => {
+  const profile = await createProfile({ name: "TaskDeleted" });
+  const task = await createTask({ agentProfileId: profile.id });
+
+  const afterBind = (await (await call(`/agent-profiles/${profile.id}`)).json()) as AgentProfile;
+  expect(afterBind.taskCount).toBe(1);
+
+  const deleteRes = await call(`/tasks/${task.id}`, { method: "DELETE" });
+  expect(deleteRes.status).toBe(204);
+
+  const afterDelete = (await (await call(`/agent-profiles/${profile.id}`)).json()) as AgentProfile;
+  expect(afterDelete.taskCount).toBe(0);
+});
+
+test("POST /agent-profiles and PATCH /agent-profiles/:id responses also carry taskCount: 0 for a brand-new profile", async () => {
+  const created = await createProfile({ name: "CreatedFresh" });
+  expect(created.taskCount).toBe(0);
+
+  const patchRes = await call(`/agent-profiles/${created.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ model: "claude-sonnet-5" }),
+  });
+  expect(patchRes.status).toBe(200);
+  const patched = (await patchRes.json()) as AgentProfile;
+  expect(patched.taskCount).toBe(0);
+});

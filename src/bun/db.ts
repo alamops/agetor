@@ -1539,6 +1539,27 @@ export const agentProfiles = {
     db.run(`DELETE FROM agent_profiles WHERE id = ?`, [id]);
     return true;
   },
+  /** profileId -> count of tasks currently bound to it (`agent_profile_id =
+   *  profileId`, every column including archived). One grouped query, the
+   *  batch form the `GET /agent-profiles` list route uses so listing N
+   *  profiles never issues N count queries. Detaching a task
+   *  (`tasks.setAgentProfile(id, null, null)`) or deleting it lowers the
+   *  count automatically since both clear/remove `agent_profile_id`. */
+  taskCounts(): Map<string, number> {
+    const rows = db.query<{ agent_profile_id: string; n: number }, []>(
+      `SELECT agent_profile_id, COUNT(*) AS n FROM tasks WHERE agent_profile_id IS NOT NULL GROUP BY agent_profile_id`,
+    ).all();
+    return new Map(rows.map((r) => [r.agent_profile_id, r.n]));
+  },
+  /** Single-profile count of tasks currently bound to it — for a
+   *  single-resource response (GET/POST/PATCH `/agent-profiles/:id`) where a
+   *  full grouped scan would be wasteful. */
+  taskCount(id: string): number {
+    const row = db.query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM tasks WHERE agent_profile_id = ?`,
+    ).get(id);
+    return row?.n ?? 0;
+  },
 };
 
 type RunRow = {

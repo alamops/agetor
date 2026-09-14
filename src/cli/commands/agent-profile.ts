@@ -19,16 +19,8 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
         out(c.dim("no agents defined — create one: agetor agent add <name> --harness <id> --model <id>"));
         return;
       }
-      const rows = profiles.map((pr) => [
-        c.bold(pr.name),
-        c.gray(pr.harness),
-        pr.model,
-        pr.effort ?? "-",
-        pr.mode ?? "-",
-        String(pr.skills.length),
-        c.dim(oneLine(pr.instructions, 60)),
-      ]);
-      out(table(["name", "harness", "model", "effort", "mode", "skills", "instructions"], rows));
+      const rows = profiles.map((pr) => formatAgentProfileListRow(pr));
+      out(table(["name", "harness", "model", "effort", "mode", "skills", "tasks", "instructions"], rows));
       return;
     }
     case "show": {
@@ -45,6 +37,7 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       out(
         `  ${label("skills")} ${profile.skills.length ? profile.skills.map((s) => `/${s}`).join(", ") : c.dim("none")}`,
       );
+      out(`  ${label("used by")} ${taskCountText(profile.taskCount ?? 0)}`);
       out(`  ${label("instructions")}${profile.instructions ? "" : ` ${c.dim("none")}`}`);
       if (profile.instructions) {
         for (const line of profile.instructions.split("\n")) out(`    ${line}`);
@@ -164,6 +157,32 @@ function label(s: string): string {
 function oneLine(s: string, n: number): string {
   const flat = s.replace(/\s+/g, " ").trim();
   return flat.length > n ? flat.slice(0, n - 1) + "…" : flat;
+}
+
+/** `"N task"` / `"N tasks"` — the singular/plural form both `agent ls`'s
+ *  `tasks` column and `agent show`'s `used by:` line render. `taskCount` is
+ *  server-derived (`docs/plans/agent-profiles.md`'s "used by N tasks"
+ *  counter) and may be `undefined` on a payload from an older server; the
+ *  call sites default it to `0` before calling this, so this itself just
+ *  pluralizes a plain number. */
+export function taskCountText(n: number): string {
+  return `${n} task${n === 1 ? "" : "s"}`;
+}
+
+/** Pure row formatter for `agetor agent ls`'s table — one exported function
+ *  so the `tasks` column (placed after `skills`, ahead of `instructions`)
+ *  is unit-testable without a client/daemon. */
+export function formatAgentProfileListRow(pr: AgentProfile): string[] {
+  return [
+    c.bold(pr.name),
+    c.gray(pr.harness),
+    pr.model,
+    pr.effort ?? "-",
+    pr.mode ?? "-",
+    String(pr.skills.length),
+    String(pr.taskCount ?? 0),
+    c.dim(oneLine(pr.instructions, 60)),
+  ];
 }
 
 /** Canonicalize instructions text read from any `--instructions-file`

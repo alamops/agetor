@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
-import { canonicalInstructions, parseAgentProfileFlags } from "./agent-profile.ts";
+import { canonicalInstructions, formatAgentProfileListRow, parseAgentProfileFlags, taskCountText } from "./agent-profile.ts";
+import type { AgentProfile } from "../../shared/types.ts";
 
 /**
  * `cmdAgentProfile` itself obtains its client via `getClient(flags)` (like
@@ -222,4 +223,62 @@ test("canonicalInstructions: whitespace-only input canonicalizes to an empty str
 
 test("canonicalInstructions: already-trimmed text is unchanged", () => {
   expect(canonicalInstructions("Be thorough.")).toBe("Be thorough.");
+});
+
+// ── taskCountText / formatAgentProfileListRow (docs/plans/agent-profiles.md
+// "used by N tasks" counter, follow-up) ─────────────────────────────────
+
+test("taskCountText: singular for 1", () => {
+  expect(taskCountText(1)).toBe("1 task");
+});
+
+test("taskCountText: plural for 0 and N>1", () => {
+  expect(taskCountText(0)).toBe("0 tasks");
+  expect(taskCountText(3)).toBe("3 tasks");
+});
+
+function fakeProfile(overrides: Partial<AgentProfile> = {}): AgentProfile {
+  return {
+    id: "p1",
+    name: "Reviewer",
+    harness: "codex",
+    model: "gpt-6-astra",
+    effort: "high",
+    mode: "auto",
+    fast: false,
+    maxMode: false,
+    instructions: "Be thorough and check for regressions carefully across the whole diff.",
+    skills: ["code-review", "security-review"],
+    createdAt: 0,
+    updatedAt: 0,
+    ...overrides,
+  };
+}
+
+test("formatAgentProfileListRow: places the tasks column after skills, before instructions", () => {
+  const row = formatAgentProfileListRow(fakeProfile({ taskCount: 5 }));
+  // name, harness, model, effort, mode, skills, tasks, instructions
+  expect(row).toHaveLength(8);
+  expect(row[5]).toBe("2"); // skills.length
+  expect(row[6]).toBe("5"); // taskCount
+});
+
+test("formatAgentProfileListRow: undefined taskCount (older server payload) renders as 0", () => {
+  const row = formatAgentProfileListRow(fakeProfile({ taskCount: undefined }));
+  expect(row[6]).toBe("0");
+});
+
+test("formatAgentProfileListRow: name/harness/model/effort/mode come through verbatim", () => {
+  const row = formatAgentProfileListRow(fakeProfile({ taskCount: 0 }));
+  expect(row[0]).toBe("Reviewer");
+  expect(row[1]).toBe("codex");
+  expect(row[2]).toBe("gpt-6-astra");
+  expect(row[3]).toBe("high");
+  expect(row[4]).toBe("auto");
+});
+
+test("formatAgentProfileListRow: null effort/mode render as '-'", () => {
+  const row = formatAgentProfileListRow(fakeProfile({ effort: null, mode: null, taskCount: 0 }));
+  expect(row[3]).toBe("-");
+  expect(row[4]).toBe("-");
 });
