@@ -339,7 +339,8 @@ export function harnessEnv(harness: Harness): Record<string, string> {
       // v0.0.4 — no FX_HOME or FX_CONFIG_DIR in its strings); its state
       // lives hardcoded at `~/.fx/*`, so isolating an additional account's
       // login/config means a true HOME override, same approach as cursor's
-      // branch above. Re-verified 0.0.8 (2026-09-08; `profile_paths.zig
+      // branch above. Re-verified 0.0.10 — all 60 FX_* env vars identical
+      // across 0.0.8/0.0.9/0.0.10, still no FX_HOME (`profile_paths.zig
       // root_dir_name = ".fx"`, hardcoded).
       env.HOME = harness.home;
     } else {
@@ -671,9 +672,10 @@ export function buildCommand(
     // that file's header). The prompt is NOT an argv element: it rides over
     // the `session/prompt` JSON-RPC call the driver issues after the
     // handshake, so unlike claude/gemini there's no tmux-imsg-cap-style
-    // argv-size budget to enforce here. `fx acp` flags re-verified 0.0.8:
-    // still exactly `--model` and `--log-file` (source: cli_surface.zig
-    // parseAcpArgs, byte-identical to 0.0.7).
+    // argv-size budget to enforce here. `fx acp` flags re-verified 0.0.9 and
+    // 0.0.10 (binary probe 2026-09-14): still exactly `--model` and
+    // `--log-file` (source: cli_surface.zig parseAcpArgs, byte-identical
+    // across 0.0.7/0.0.8/0.0.9/0.0.10).
     const extra = (process.env.AGETOR_FX_ARGS ?? "").split(/\s+/).filter(Boolean);
 
     if (!opts.model) {
@@ -713,10 +715,14 @@ export function buildCommand(
     const mode = opts.mode ?? defaultModeFor(harness.kind);
     env.FX_PERMISSION_MODE = mode;
 
-    // fx has no per-invocation effort/reasoning flag — its models route
-    // through the Vercel AI Gateway verbatim, with no CLI-level effort knob
-    // (mirrors gemini's silent-ignore of opts.effort above, not codex's
-    // required-effort throw).
+    // Effort is NOT an argv/env knob for fx — there's no CLI-level flag and
+    // never has been. Since fx 0.0.9 it rides over ACP instead:
+    // fx-acp.ts's `applyFxEffort` sends `session/set_config_option
+    // {configId:"effort", value}` after `session/new`/`resume`/`load`, driven
+    // by `FxLaunchOptions.effort` (threaded through from `opts.effort` at the
+    // `spawnFxViaAcp` call site below `buildCommand`). So `buildCommand`
+    // still emits nothing for `opts.effort` here — a 0.0.8-or-earlier binary
+    // silently ignores the ACP call and just keeps its own default.
 
     return { cmd: args, env: Object.keys(env).length ? env : undefined };
   }
@@ -920,6 +926,23 @@ export const FAKE_FX_REPAUSE_PROMPT_MARKER = "__agetor_fake_fx_repause__";
  */
 export const FAKE_FX_RECOVERY_URL_PROMPT_MARKER = "__agetor_fake_fx_recovery_url__";
 /**
+ * Prompt-marker trigger for the fx effort-"isn't offered" breadcrumb scenario
+ * (see the generic fake-fx turn in `makeFakeAgent` below and
+ * `docs/plans/fx-0.0.10-compat.md` §3/§3.7/T4) — mirrors fx-acp.ts's real
+ * `applyFxEffort`, which emits a status breadcrumb when the session's
+ * `configOptions[{id:"effort"}]` entry (fx ≥0.0.9) reports the task's
+ * requested effort isn't in the model's offered set. The real driver only
+ * knows the *actual* offered list from fx's own wire response, but the fake
+ * has no live fx to ask, so it reports a fixed offered list
+ * (`auto, low, high, max`) instead — good enough for an e2e spec asserting
+ * the breadcrumb shape without a real fx. `AGETOR_FAKE_FX_EFFORT_UNOFFERED=1`
+ * is the process-wide equivalent, same rationale as
+ * {@link FAKE_FX_RECOVERY_PROMPT_MARKER}'s `AGETOR_FAKE_FX_RECOVERY=1`. The
+ * real driver's success path is silent (no breadcrumb when the effort IS
+ * offered), so the fake emits nothing unless this marker/env is present.
+ */
+export const FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER = "__agetor_fake_fx_effort_unoffered__";
+/**
  * Same prompt-marker trick as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER}, for the
  * "Claude Code Monitor" scenario (see
  * `docs/plans/claude-code-monitors-hold-running.md`): drives the real "held
@@ -1087,7 +1110,15 @@ function makeFakeAgent(
   taskId: string,
   prompt: string,
   onChunk: ChunkHandler,
-  fakeOpts: { runId?: string; mode?: string; kind?: AgentKind; cwd?: string; continueRecovery?: boolean } = {},
+  fakeOpts: {
+    runId?: string;
+    mode?: string;
+    kind?: AgentKind;
+    cwd?: string;
+    continueRecovery?: boolean;
+    effort?: string | null;
+    model?: string;
+  } = {},
 ): SpawnedAgent {  const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
   const done = new Promise<number>((res) => { resolveDone = res; });
@@ -1660,6 +1691,23 @@ function makeFakeAgent(
     // the provider sentinel (mirrors `maybeEmitProvider` in fx-acp.ts; see
     // the fx-permission scenario above for the same comment in full).
     if (fakeOpts.kind === "fx") onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+    // fx ≥0.0.9 mirror: `applyFxEffort` (fx-acp.ts) emits an "isn't offered"
+    // breadcrumb when the task's requested effort isn't in the model's
+    // offered set — see FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER's doc comment.
+    // Exactly once per turn, right after the provider sentinel and before the
+    // thinking chunk (mirrors the real driver's post-session/new ordering).
+    if (
+      fakeOpts.kind === "fx"
+      && (prompt.includes(FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER)
+        || process.env.AGETOR_FAKE_FX_EFFORT_UNOFFERED === "1")
+    ) {
+      onChunk(
+        "status",
+        `fx: effort ${fakeOpts.effort ?? "auto"} isn't offered for ${
+          fakeOpts.model ?? "zai/glm-5.3-flash"
+        } (offers: auto, low, high, max) — running at fx's default`,
+      );
+    }
     after(5, () => {
       // fx ≥0.0.8 mirror: a `thinking` chunk precedes the turn's assistant
       // text — see `emitFakeFxUsageAndTitle`'s doc comment and the shared
@@ -1939,6 +1987,8 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
         kind: "fx",
         cwd,
         continueRecovery: opts.continueRecovery === true,
+        effort: opts.effort ?? null,
+        model: opts.model ?? undefined,
       });
     }
     const built = buildCommand(harness, prompt, { ...opts, runId });
@@ -1952,6 +2002,8 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       mode: (opts.mode ?? defaultModeFor(harness.kind)) as FxMode,
       resumeSessionId: opts.resumeSessionId ?? undefined,
       continueRecovery: opts.continueRecovery === true,
+      effort: opts.effort ?? null,
+      model: opts.model ?? undefined,
       onChunk,
       onSessionId,
     });
