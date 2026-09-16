@@ -247,7 +247,12 @@ async function killGracefully(child: ChildProcess): Promise<void> {
  * per test; see that fixture's doc comment for why it exists) below.
  * `logLabel` only affects log/error messages (e.g. "worker 2" vs a test
  * title) so a startup failure or mid-suite-death report points at the right
- * instance.
+ * instance. `extraEnv` (default `{}`) is merged on top of the base env
+ * below — additive, spread last so a spec-supplied value always wins — for
+ * a test that needs a seam env var (e.g.
+ * `AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS`, see `docs/plans/task-details-blank-
+ * while-session-restores.md` §5 E1) on its own dedicated backend rather than
+ * the worker-shared one. See the `backendEnv` fixture option below.
  */
 async function provisionBackend(
   apiPort: number,
@@ -255,6 +260,7 @@ async function provisionBackend(
   githubStubPort: number,
   logLabel: string,
   use: (backend: E2EBackend) => Promise<void>,
+  extraEnv: Record<string, string> = {},
 ): Promise<void> {
   const apiBase = `http://127.0.0.1:${apiPort}`;
 
@@ -357,6 +363,9 @@ async function provisionBackend(
       // shells out to `gh auth token` on the dev machine (which could hang,
       // fail, or leak a real token into a test run).
       GITHUB_TOKEN: "e2e-github-token",
+      // Spec-supplied overrides/additions (see `extraEnv`'s doc above) —
+      // spread last so they can override any of the defaults above too.
+      ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -477,7 +486,10 @@ const FRESH_BASE_API_PORT = 4700;
 const GITHUB_STUB_BASE_PORT = 4800;
 const FRESH_GITHUB_STUB_BASE_PORT = 4900;
 
-export const test = base.extend<{ freshBackend: E2EBackend }, { backend: E2EBackend }>({
+export const test = base.extend<
+  { freshBackend: E2EBackend; backendEnv: Record<string, string> },
+  { backend: E2EBackend }
+>({
   backend: [
     async ({}, use, workerInfo) => {
       // `parallelIndex` is the stable 0..(workers-1) slot this worker
@@ -513,10 +525,17 @@ export const test = base.extend<{ freshBackend: E2EBackend }, { backend: E2EBack
   // independently (fresh welcome dialog, skip-then-persist, existing-user
   // auto-dismiss), so each gets its own virgin backend instead of fighting
   // over one shared DB.
-  freshBackend: async ({}, use, testInfo) => {
+  // Additive test option (not a fixture with real setup/teardown of its
+  // own — `{ option: true }` makes it configurable via
+  // `test.use({ backendEnv: {...} })`), consumed by `freshBackend` below.
+  // Defaults to `{}` so every existing `freshBackend` consumer spawns its
+  // backend exactly as before.
+  backendEnv: [{}, { option: true }],
+
+  freshBackend: async ({ backendEnv }, use, testInfo) => {
     const apiPort = FRESH_BASE_API_PORT + testInfo.parallelIndex;
     const apiToken = `e2e-fresh-w${testInfo.parallelIndex}-${randomUUID()}`;
     const githubStubPort = FRESH_GITHUB_STUB_BASE_PORT + testInfo.parallelIndex;
-    await provisionBackend(apiPort, apiToken, githubStubPort, `test "${testInfo.title}"`, use);
+    await provisionBackend(apiPort, apiToken, githubStubPort, `test "${testInfo.title}"`, use, backendEnv);
   },
 });

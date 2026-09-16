@@ -120,3 +120,13 @@ E2e applies: it is the only layer that exercises WebKit-free Chromium *and* the 
 | Per-event truncation with "show full" | out of scope — total-byte windows achieve the goal without touching dedup/quote/search/CLI paths |
 | tmux op timeout (#213 §8) | out of scope — declined by owner in #213, not needed here |
 | Unmerged `381b6d1` (reaper breadcrumb spam on tmux 3.6a) | out of scope — different ticket |
+
+## 10. Delivery record (2026-09-16)
+
+Commits on `fix/agetor-task-details-stuck-while-task-ses` off `857bef3`: plan → wave 1 (T1, T2, T4, T5, T6) → wave 2 (T3) + docs → unit tests (U1–U4) → review fixes (opus, `code-review` skill: 2 must-fix, 5 should-fix, 6 nice-to-have, all applied) → e2e (E1).
+
+Review fixes beyond the original breakdown: the loading skeleton yields to a replay that arrives before `listRuns`; every async panel handler (send, rebuild, backlog CRUD, commit-push, resolve-conflicts, drop, fx resume/cancel, ask-card withheld, load-earlier) captures its task id and skips state writes after a switch (`currentTaskIdRef`); `prStatusSeqRef` is bumped on switch; `TerminalsSection` mounts `TerminalView` only after the stream-ready gate; a poll kick that lands during an in-flight request is retried once; the ownership guard also trips on `archivedAt`; the continuation carries a `catch`; the slow-launch breadcrumb fires even when `tmux new-session` fails; the no-`limit` rebuild path is byte-capped (adds `hasMore: true` only when it cut); `agetor start`/`send` print a distinct line and carry `pending` in `--json`; `refreshProjects`/`onVisible` are deduped too.
+
+Verification: `bun run typecheck` clean; `bun test` 5,247 pass / 0 fail / 3 environmental skips (247 files, 328 s); `e2e/task-switch-during-restore.spec.ts` 3 passed (48.9 s) — send to A under a 6 s fake spawn, open B, B renders within 2 s with Send enabled, A's follow-up still settles; API-level `pending: true` in under 3 s; terminals disclosure re-seeds per task. The e2e fixture gained an additive `backendEnv` test option (`test.use({ backendEnv: {...} })`) that feeds extra env to a spec's dedicated backend.
+
+Still open (§8 Q1): the packaged app's 5–31 s `tmux new-session` resolution. T2's breadcrumb will name the stage on the next occurrence; the read-only probes armed on the owner's machine during this run (health latency, connection count, main-thread sampler) can be stopped with `pkill -f live-probe.ts; pkill -f sampler.sh; pkill -f conns.sh`.
