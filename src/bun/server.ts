@@ -20,6 +20,7 @@ import {
   HarnessInUseError,
   savedPrompts,
   dataDir,
+  clampWindowByBytes,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
@@ -165,7 +166,10 @@ import {
 } from "./interactions.ts";
 import {
   DEFAULT_BRANCH_CONFIG,
+  EVENTS_PAGE_MAX_BYTES,
   EVENTS_REPLAY_LIMIT,
+  EVENTS_REPLAY_MAX_BYTES,
+  MIN_REPLAY_EVENTS,
   TASK_EVENTS_REPLAY_META_EVENT,
   TASK_TYPES,
   supportedEfforts,
@@ -5095,8 +5099,24 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           };
           rebuildEventsFromJsonl(readFileSync(jsonlPath, "utf8"), onChunk);
           if (hasLimit) {
-            const hasMore = events.length > limit;
-            const windowed = hasMore ? events.slice(events.length - limit) : events;
+            // Two cuts, both from the END (newest events), same as the SSE
+            // replay / page routes above: first the event-count cap
+            // (`limit`), then a byte budget (`EVENTS_REPLAY_MAX_BYTES`,
+            // floor `MIN_REPLAY_EVENTS`) on top of it — a rebuilt JSONL
+            // transcript can weigh just as much as the persisted one, and
+            // this route feeds the RunPanel's auto-rebuild on opening a
+            // finished claude task, so it needs the same protection. `hasMore`
+            // is true whenever EITHER cut actually removed events; the
+            // no-`limit` response shape below is unchanged (additive-only
+            // contract, per the route's own comment above).
+            const hasCountCut = events.length > limit;
+            const countWindowed = hasCountCut ? events.slice(events.length - limit) : events;
+            const rowsDesc = countWindowed
+              .map((ev, idx) => ({ id: idx, len: ev.data.length }))
+              .reverse();
+            const cutIdx = clampWindowByBytes(rowsDesc, EVENTS_REPLAY_MAX_BYTES, MIN_REPLAY_EVENTS) ?? 0;
+            const windowed = cutIdx > 0 ? countWindowed.slice(cutIdx) : countWindowed;
+            const hasMore = hasCountCut || windowed.length < countWindowed.length;
             return json({ events: windowed, hasMore, source: jsonlPath }, { headers: corsHeaders(req) });
           }
           return json({ events, source: jsonlPath }, { headers: corsHeaders(req) });
@@ -5405,6 +5425,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // required — this is a backward-paging cursor, not a general listing
       // endpoint. Ascending order, same event shape as the SSE frames (plus
       // `id`, which is handy for chaining the next `beforeId`).
+      //
+      // Byte-budgeted like the SSE replay window below (`EVENTS_PAGE_MAX_BYTES`,
+      // smaller than the replay budget since this is a foreground click the
+      // user is waiting on, not a background connect) — `eventsForTask`'s
+      // `maxBytes` walk may raise the effective `beforeId`-to-`earliestId`
+      // floor above what `limit` alone would have returned, in which case
+      // `hasMore` (derived from the returned window's own `earliestId`, same
+      // as always) correctly reports more history to page through even
+      // though the `limit`-worth of rows technically existed.
       "/tasks/:id/events/page": {
         GET: authed((req) => {
           const taskId = req.params.id;
@@ -5424,7 +5453,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const limit = Number.isFinite(limitRaw) && limitRaw > 0
             ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
             : EVENTS_REPLAY_LIMIT;
-          const rows = runs.eventsForTask(taskId, { beforeId: beforeIdRaw, limit });
+          const rows = runs.eventsForTask(taskId, {
+            beforeId: beforeIdRaw,
+            limit,
+            maxBytes: EVENTS_PAGE_MAX_BYTES,
+            minEvents: MIN_REPLAY_EVENTS,
+          });
           const events = rows.map((ev) => ({
             id: ev.id,
             runId: ev.runId,
@@ -5517,7 +5551,21 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             // of the task's full history — a task with thousands of events
             // used to replay every one of them on every SSE (re)connect.
             // Older history is fetched on demand via /tasks/:id/events/page.
-            const window = runs.eventsForTask(taskId, { limit: EVENTS_REPLAY_LIMIT });
+            // Also cap it in BYTES (EVENTS_REPLAY_MAX_BYTES): the event-count
+            // cap alone still let a replay window weigh tens of MB on large
+            // transcripts (measured 61 MB — see
+            // docs/plans/task-details-blank-while-session-restores.md §2/§3.3),
+            // which is what made opening a task with a big transcript stall.
+            // `eventsForTask` may raise the window's floor above what `limit`
+            // alone would keep, never below MIN_REPLAY_EVENTS; `hasMore` below
+            // still derives from the returned window's own earliest id, so it
+            // correctly flips true whenever the byte cut (not just the count
+            // cap) dropped older events.
+            const window = runs.eventsForTask(taskId, {
+              limit: EVENTS_REPLAY_LIMIT,
+              maxBytes: EVENTS_REPLAY_MAX_BYTES,
+              minEvents: MIN_REPLAY_EVENTS,
+            });
             const earliestId = window.length > 0 ? window[0]!.id : null;
             const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
             sendNamed(TASK_EVENTS_REPLAY_META_EVENT, { earliestId, hasMore } satisfies TaskEventsReplayMeta);

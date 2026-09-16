@@ -1188,6 +1188,38 @@ type RunRow = {
   origin: string | null;
 };
 
+/**
+ * Given rows in DESC (newest-first) id order — each carrying its `data`
+ * column's `LENGTH()` as `len` — finds the id of the oldest row to keep
+ * under a byte budget, walking newest → oldest and accumulating `len`.
+ * Always keeps at least `minEvents` rows before the budget can cut anything
+ * off (the `MIN_REPLAY_EVENTS` floor — see
+ * `docs/plans/task-details-blank-while-session-restores.md` §3.3), and
+ * always keeps at least ONE row regardless of `minEvents`, so a caller can
+ * never get back an empty window from a non-empty input. `LENGTH()` on a
+ * SQLite TEXT column counts characters; for our UTF-8-ish event payloads
+ * that's an adequate proxy for bytes — the budget just needs to keep the
+ * SSE replay / page / rebuild windows from weighing tens of MB, not be
+ * byte-exact. Returns `null` only when `rowsDesc` is empty. Pure and
+ * DB-free so it's unit-testable on its own.
+ */
+export function clampWindowByBytes(
+  rowsDesc: Array<{ id: number; len: number }>,
+  maxBytes: number,
+  minEvents: number,
+): number | null {
+  if (rowsDesc.length === 0) return null;
+  let accumulated = 0;
+  let count = 0;
+  for (const row of rowsDesc) {
+    if (count >= minEvents && accumulated + row.len > maxBytes) break;
+    accumulated += row.len;
+    count++;
+  }
+  if (count === 0) count = 1;
+  return rowsDesc[count - 1]!.id;
+}
+
 const toRun = (r: RunRow): Run => ({
   id: r.id,
   taskId: r.task_id,
@@ -1386,10 +1418,22 @@ export const runs = {
    *  same task with an id inside `[minId, taskMax]` but still `>= beforeId`
    *  — would wrongly re-enter the page. `id >= minId` alone only bounds the
    *  page from below; `beforeId` is what bounds it from above, exactly as it
-   *  did in the one-query version. */
+   *  did in the one-query version.
+   *
+   *  `opts.maxBytes` layers a BYTE budget on top of `opts.limit`'s event-count
+   *  cap (see `EVENTS_REPLAY_MAX_BYTES` / `EVENTS_PAGE_MAX_BYTES` in
+   *  `shared/types.ts`): step 1 additionally selects each row's
+   *  `LENGTH(data)`, then `clampWindowByBytes` walks the DESC id rows
+   *  newest → oldest accumulating that length and raises `minId` to stop
+   *  once the budget would be exceeded — never below `opts.minEvents`
+   *  (`MIN_REPLAY_EVENTS`) rows, so a task whose newest event alone exceeds
+   *  the budget still returns something. Step 2 is otherwise unchanged: it
+   *  just ends up scanning a narrower `[minId, taskMax]` range. When
+   *  `opts.maxBytes` is omitted the byte walk never runs — this path is
+   *  byte-identical to before it existed. */
   eventsForTask(
     taskId: string,
-    opts?: { beforeId?: number; limit?: number },
+    opts?: { beforeId?: number; limit?: number; maxBytes?: number; minEvents?: number },
   ): Array<{ id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null }> {
     type Row = { id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null };
     if (opts?.limit) {
@@ -1400,8 +1444,8 @@ export const runs = {
         idParams.push(opts.beforeId);
       }
       idParams.push(opts.limit);
-      const idRows = db.query<{ id: number }, Array<string | number>>(
-        `SELECT run_events.id as id
+      const idRows = db.query<{ id: number; len: number }, Array<string | number>>(
+        `SELECT run_events.id as id, LENGTH(run_events.data) as len
          FROM run_events
          JOIN runs ON runs.id = run_events.run_id
          WHERE ${idConditions.join(" AND ")}
@@ -1410,7 +1454,11 @@ export const runs = {
       ).all(...idParams);
       if (idRows.length === 0) return [];
       // DESC order — the last row is the smallest id in the page.
-      const minId = idRows[idRows.length - 1]!.id;
+      let minId = idRows[idRows.length - 1]!.id;
+      if (opts.maxBytes != null) {
+        const clampedId = clampWindowByBytes(idRows, opts.maxBytes, opts.minEvents ?? 1);
+        if (clampedId != null) minId = clampedId;
+      }
 
       const rowConditions = ["runs.task_id = ?", "run_events.id >= ?"];
       const rowParams: Array<string | number> = [taskId, minId];

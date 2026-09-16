@@ -3340,6 +3340,41 @@ export type RunEventStream =
  *  via `GET /tasks/:id/events/page`. */
 export const EVENTS_REPLAY_LIMIT = 800;
 
+/**
+ * Byte budget for the SSE replay window (`GET /tasks/:id/events`), applied
+ * ON TOP OF `EVENTS_REPLAY_LIMIT` — the two caps are ANDed, whichever binds
+ * first wins. Measured on the owner's live tasks: the 800-event count cap
+ * alone let a replay window weigh 61 MB, 4.9 MB or 4.5 MB (single events up
+ * to 1.37 MB), which is what made opening a task with a large transcript
+ * feel like it hung (`docs/plans/task-details-blank-while-session-restores.md`
+ * §2, §3.3). The budget applies to the SUM of the window's event `data`
+ * lengths, not to any individual event — no single event is ever truncated
+ * to fit. Older history stays reachable via "Load earlier"
+ * (`GET /tasks/:id/events/page`, budgeted separately by
+ * `EVENTS_PAGE_MAX_BYTES`).
+ */
+export const EVENTS_REPLAY_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Byte budget for one "Load earlier" page (`GET /tasks/:id/events/page`).
+ * Smaller than `EVENTS_REPLAY_MAX_BYTES` because a page fetch is a
+ * foreground, user-triggered wait (the click), where the initial replay is a
+ * background SSE connect the user isn't staring at a spinner for. Same
+ * whole-window-only semantics: individual events are never truncated.
+ */
+export const EVENTS_PAGE_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Floor on how many events a byte-budgeted window (replay, page, or
+ * rebuild) always keeps, regardless of `EVENTS_REPLAY_MAX_BYTES` /
+ * `EVENTS_PAGE_MAX_BYTES`. Without this floor, a task whose single newest
+ * event alone exceeds the byte budget (a large tool_result, a long pasted
+ * diff, …) would clamp its window to zero events and render nothing — the
+ * floor guarantees at least this many of the newest events always show, even
+ * if that means exceeding the byte budget for that one window.
+ */
+export const MIN_REPLAY_EVENTS = 20;
+
 /** Max number of events the run panel keeps in webview memory for one task.
  *  When live streaming pushes past this, the oldest events are trimmed and the
  *  "Load earlier" affordance re-appears. */
