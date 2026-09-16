@@ -4,7 +4,9 @@ import {
   CATALOG_SCOPED_KINDS,
   CODE_PLAN_MODE,
   CURSOR_MODEL_SPECS,
+  DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  EFFORT_OPTIONS,
   FX_AUTO_RESUME_MAX,
   FX_PROVIDER_STATUS_PREFIX,
   FX_RECOVERY_STATUS_PREFIX,
@@ -14,6 +16,8 @@ import {
   PERMISSION_MODE_STATUS_PREFIX,
   defaultModeFor,
   isInternalStatusSentinel,
+  retainableEfforts,
+  supportedEfforts,
   supportedModes,
   type AgentKind,
   type GlobalEvent,
@@ -150,10 +154,100 @@ test("MODEL_EFFORT_SUPPORT.fx's keys exactly match AGENT_OPTIONS.fx.models' ids 
   expect(effortKeys.size).toBe(catalogIds.size);
 });
 
-test("MODEL_EFFORT_SUPPORT.fx reports no supported efforts for any model — fx has no per-invocation effort/reasoning flag", () => {
-  for (const supported of Object.values(MODEL_EFFORT_SUPPORT.fx)) {
-    expect(supported).toEqual([]);
+/* ── fx effort (docs/plans/fx-0.0.10-compat.md §3 shared spec / T1) ──────── */
+
+// The 16 effort-advertising ids, live-probed on fx 0.0.10 (spike
+// fx-0010-efforts, 2026-09-14) — copied verbatim from the plan's shared-spec
+// table (§3). Every row ends in "auto" (fx's own default, off-scale).
+const FX_EFFORT_MODELS: Record<string, string[]> = {
+  "zai/glm-5.3-flash": ["max", "high", "low", "auto"],
+  "openai/gpt-5.2": ["xhigh", "high", "medium", "low", "none", "auto"],
+  "openai/gpt-5.1-codex-max": ["xhigh", "high", "medium", "low", "auto"],
+  "openai/gpt-5.4-mini": ["xhigh", "high", "medium", "low", "none", "auto"],
+  "deepseek/deepseek-v4-flash": ["xhigh", "high", "auto"],
+  "anthropic/claude-opus-5": ["max", "xhigh", "high", "medium", "low", "auto"],
+  "anthropic/claude-sonnet-5": ["xhigh", "high", "medium", "low", "auto"],
+  "openai/gpt-5.5": ["xhigh", "high", "medium", "low", "none", "auto"],
+  "google/gemini-3.1-pro-preview": ["high", "medium", "low", "auto"],
+  "google/gemini-3.8-flash": ["high", "medium", "low", "auto"],
+  "moonshotai/kimi-k3": ["max", "high", "low", "auto"],
+  "anthropic/claude-fable-5.1": ["xhigh", "high", "medium", "low", "auto"],
+  "openai/gpt-6-astra": ["max", "xhigh", "high", "medium", "low", "auto"],
+  "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+  "zai/glm-5.3": ["max", "high", "low", "auto"],
+  "deepseek/deepseek-v4-pro": ["xhigh", "high", "auto"],
+};
+
+// The 12 no-effort ids — their Gateway catalog entry carries no
+// reasoning_options at all, same treatment as every gemini model.
+const FX_NO_EFFORT_MODELS = [
+  "zai/glm-5v-turbo",
+  "zai/glm-4.7",
+  "spacexai/grok-4.6",
+  "spacexai/grok-build-0.1",
+  "moonshotai/kimi-k2.7-code",
+  "minimax/minimax-m3",
+  "alibaba/qwen3.8-flash",
+  "alibaba/qwen3-coder-plus",
+  "mistral/devstral-2",
+  "google/gemini-2.5-flash",
+  "anthropic/claude-3-haiku",
+  "anthropic/claude-haiku-4.5",
+];
+
+test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan §3 shared spec) — 16 effort models each end in auto, 12 named models are empty", () => {
+  for (const [id, expected] of Object.entries(FX_EFFORT_MODELS)) {
+    expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual(expected);
+    expect(expected[expected.length - 1]).toBe("auto");
   }
+  for (const id of FX_NO_EFFORT_MODELS) {
+    expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual([]);
+  }
+  // The two lists above are exactly the 28 curated fx ids, no more no less.
+  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(16);
+  expect(FX_NO_EFFORT_MODELS.length).toBe(12);
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(28);
+});
+
+test("DEFAULT_EFFORT.fx is 'auto' (fx's own default — owner decision D1, docs/plans/fx-0.0.10-compat.md §8)", () => {
+  expect(DEFAULT_EFFORT.fx).toBe("auto");
+});
+
+test("EFFORT_OPTIONS: ultra is first, auto ('Model default') is last", () => {
+  expect(EFFORT_OPTIONS[0]?.id).toBe("ultra");
+  const last = EFFORT_OPTIONS[EFFORT_OPTIONS.length - 1];
+  expect(last?.id).toBe("auto");
+  expect(last?.label).toBe("Model default");
+});
+
+test("no non-fx kind's MODEL_EFFORT_SUPPORT table lists 'auto' — it is fx-only", () => {
+  for (const kind of KINDS) {
+    if (kind === "fx") continue;
+    for (const ids of Object.values(MODEL_EFFORT_SUPPORT[kind])) {
+      expect(ids).not.toContain("auto");
+    }
+  }
+});
+
+test("supportedEfforts('fx', 'zai/glm-5.3-flash') returns exactly [max, high, low, auto] in canonical order", () => {
+  const ids = supportedEfforts("fx", "zai/glm-5.3-flash").map((o) => o.id);
+  expect(ids).toEqual(["max", "high", "low", "auto"]);
+});
+
+test("supportedEfforts('fx', 'zai/glm-4.7') is empty (no-effort model)", () => {
+  expect(supportedEfforts("fx", "zai/glm-4.7")).toEqual([]);
+});
+
+test("supportedEfforts('fx', <unknown id>) falls back to DEFAULT_MODEL.fx's set (zai/glm-5.3-flash's)", () => {
+  const fallback = supportedEfforts("fx", "vendor/unknown-model").map((o) => o.id);
+  const curated = supportedEfforts("fx", DEFAULT_MODEL.fx).map((o) => o.id);
+  expect(fallback).toEqual(curated);
+  expect(fallback).toEqual(["max", "high", "low", "auto"]);
+});
+
+test("retainableEfforts('fx', 'zai/glm-5.3-flash') contains 'auto'", () => {
+  const retained = retainableEfforts("fx", "zai/glm-5.3-flash");
+  expect(retained.has("auto")).toBe(true);
 });
 
 test("none of the seven previously-curated fx ids survives as an unconditional row — each is either absent or catalogOnly — and the nonexistent google/gemini-3-pro id is gone entirely", () => {

@@ -18,6 +18,7 @@ import {
   type HarnessTarget,
 } from "./agent-discovery.ts";
 import { plantFakeCodexAppServer } from "./test-codex-app-server.ts";
+import { AGENT_OPTIONS } from "../shared/types.ts";
 
 /* ── codex: parseCodexModelList (pure) ───────────────────────────────────
  * `discoverCodex` speaks `codex app-server`'s JSON-RPC `model/list` and hands
@@ -299,6 +300,42 @@ test("parseFxModels: 0.0.8-shaped `models --json` envelope (kind/count/shown_cou
     "meta/llama-4-maverick",
     "mistral/mistral-large-3",
   ]);
+});
+
+test("parseFxModels: 0.0.10-shaped envelope (247 ids, private_models_hidden true, 2026-09-14 — identical on the 0.0.8/0.0.9/0.0.10 binaries, i.e. Gateway-side)", () => {
+  // Real fx 0.0.10 `models --json` (build_revision 1210c2756ea8) returns an
+  // unauthenticated Gateway catalog of 247 ids — grown from 0.0.8's 244
+  // (docs/plans/fx-0.0.8-compat.md) purely Gateway-side: the same probe pass
+  // measured 247 identically against the 0.0.8, 0.0.9, and 0.0.10 binaries
+  // (docs/plans/fx-0.0.10-compat.md §2) — see
+  // scratchpad/spikes/fx-0010-probe/models-0.0.10.json, whose `count`/
+  // `shown_count`/`more_count`/`private_models_hidden` fields are mirrored
+  // below. Rather than inline all 247 real ids, generate a list that
+  // contains every curated AGENT_OPTIONS.fx.models id (all 28 confirmed
+  // present in the real payload) padded out with synthetic filler ids to
+  // the real count, and assert both the exact count and full curated
+  // coverage — the envelope's unknown-fields-are-fine tolerance is already
+  // pinned by the 0.0.7/0.0.8 tests above.
+  const curatedIds = AGENT_OPTIONS.fx.models.map((m) => m.id);
+  const filler = Array.from(
+    { length: 247 - curatedIds.length },
+    (_, i) => `vendor/filler-model-${i}`,
+  );
+  const ids = [...curatedIds, ...filler];
+  const payload = {
+    kind: "models",
+    count: 247,
+    shown_count: 247,
+    more_count: 0,
+    private_models_hidden: true,
+    ids,
+  };
+  const parsed = __testing.parseFxModels(JSON.stringify(payload));
+  expect(parsed.length).toBe(247);
+  const parsedIds = new Set(parsed.map((m) => m.id));
+  for (const id of curatedIds) {
+    expect(parsedIds.has(id)).toBe(true);
+  }
 });
 
 /* ── fx: discoverFx (exercised indirectly via refreshDiscoveredModels +

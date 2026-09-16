@@ -3,7 +3,7 @@ import path from "node:path";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import type { Flags } from "../context.ts";
 import type { GitHubComment, GitHubIssueThreadResult, GitHubListItem, Task } from "../../shared/types.ts";
-import { AGENT_OPTIONS, DEFAULT_MODEL } from "../../shared/types.ts";
+import { AGENT_OPTIONS, DEFAULT_MODEL, supportedEfforts } from "../../shared/types.ts";
 import type { DiscoveredModel } from "../../shared/model-options.ts";
 import { buildIssueTaskPrompt, issueTaskTitle, renderIssueThreadMarkdown } from "../../shared/issue-task.ts";
 
@@ -560,6 +560,50 @@ test("cmdAdd: a scripted fx add with no --mode stores mode 'yolo' (Full access),
   expect(createTaskCalls.length).toBe(1);
   expect(createTaskCalls[0]!.agent).toBe("fx");
   expect(createTaskCalls[0]!.mode).toBe("yolo");
+});
+
+// docs/plans/fx-0.0.10-compat.md §5 TT4 — a scripted (non-interactive, no
+// --effort) fx add leaves `effort` unset on the createTask payload: the
+// scripted path (`baseInput` in add.ts) only ever forwards `o.effort`, which
+// is `undefined` unless `--effort` was passed — the server (createTask's own
+// `input.effort ?? …` default, see orchestrator-fx.test.ts) is what resolves
+// the null case to DEFAULT_EFFORT.fx ("auto"), not the CLI. This mirrors the
+// scripted-mode test above: baseInput leaves the field to the server default
+// rather than pre-resolving it client-side.
+test("cmdAdd: a scripted fx add with no --effort leaves effort undefined on the createTask payload (the daemon's createTask resolves the default, not the CLI)", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.agent).toBe("fx");
+  expect(createTaskCalls[0]!.effort).toBeUndefined();
+});
+
+test("cmdAdd: a scripted fx add with an explicit --effort forwards it verbatim on the createTask payload", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx", "--effort", "high"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.effort).toBe("high");
+});
+
+// The interactive wizard's Effort step (add.ts's `wizard()`, ~line 508-512)
+// seeds its `pickOption("Effort", efforts, …)` call from exactly this
+// `supportedEfforts(kind, model, …)` expression. This suite's other tests
+// can't drive `@clack/prompts` end to end (see the chooseAddPath comment
+// block above — cmdAdd always runs with the mocked `isTTY: false`), so this
+// pins the data the picker would render for fx's default model instead of
+// driving the wizard itself.
+test("the interactive picker's effort data for zai/glm-5.3-flash (fx's DEFAULT_MODEL) is exactly Max / High / Low / Model default, in that order", () => {
+  const efforts = supportedEfforts("fx", "zai/glm-5.3-flash");
+  expect(efforts.map((o) => o.id)).toEqual(["max", "high", "low", "auto"]);
+  expect(efforts.map((o) => o.label)).toEqual(["Max thinking", "High", "Low", "Model default"]);
 });
 
 test("cmdAdd: a scripted codex add with no --mode stores mode 'auto', matching the picker default", async () => {

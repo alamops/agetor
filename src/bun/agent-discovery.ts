@@ -496,6 +496,19 @@ async function discoverGemini(): Promise<DiscoveredModel[]> {
  * probed. All 22 curated ids (16 standard + 6 `catalogOnly`) are present in
  * that unauth catalog; the 158-id signed-in reference still couldn't be
  * re-measured (no valid local login at measurement time).
+ *
+ * Re-verified through fx 0.0.10 (binary probes of the 0.0.9 and 0.0.10
+ * release builds + a full v0.0.8→v0.0.10 source diff, 2026-09-14): the
+ * `models --json` shape is still unchanged. The unauthenticated catalog
+ * read 247 ids on 2026-09-14 — byte-identical id sets across the 0.0.8,
+ * 0.0.9, AND 0.0.10 binaries — confirming (as the prior
+ * 244-on-0.0.7-and-0.0.8 measurement already suggested) that this count is
+ * a Gateway-side (server) property, not a property of the binary doing the
+ * probing; the 244 recorded on 2026-09-08 was simply that day's catalog.
+ * All 28 curated `AGENT_OPTIONS.fx.models` ids (16 standard + 12
+ * `catalogOnly`) are present in the unauth catalog; the signed-in reference
+ * account still couldn't be re-measured (no valid local login at
+ * measurement time).
  */
 function parseFxModels(stdout: string): DiscoveredModel[] {
   try {
@@ -552,6 +565,16 @@ function parseFxModels(stdout: string): DiscoveredModel[] {
  * (silent fallback to the unauthenticated catalog, indistinguishable from a
  * genuinely logged-out probe) still applies unchanged on 0.0.8; the
  * `mergeModelOptions` compensation described above is unaffected.
+ *
+ * Re-verified through fx 0.0.10 (2026-09-14): still zero filesystem writes,
+ * and the unauth catalog reads 247 ids on 2026-09-14 — identical across the
+ * 0.0.8, 0.0.9, and 0.0.10 binaries — reconfirming (per the `parseFxModels`
+ * doc comment above) that this count tracks the Gateway's catalog on the
+ * day probed, not which binary version is doing the probing. The
+ * expired-login degradation (silent fallback to the unauthenticated
+ * catalog, indistinguishable from a genuinely logged-out probe) still
+ * applies unchanged on 0.0.9 and 0.0.10; the `mergeModelOptions`
+ * compensation described above is unaffected.
  *
  * That account-scoping is exactly why `env` exists as a parameter here (and
  * threads through to `runProbe`): a harness with its own `HOME` override —

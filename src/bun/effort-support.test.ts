@@ -185,6 +185,18 @@ test("ultra is Codex-only — never offered on claude-code, cursor, gemini, or f
   }
 });
 
+// docs/plans/fx-0.0.10-compat.md §3 — `auto` ("Model default") is the one
+// EFFORT_OPTIONS row every kind but fx must never offer, mirroring the
+// ultra/Codex-only test above.
+test("auto is fx-only — never offered on claude-code, codex, cursor, or gemini", () => {
+  expect(supportedEfforts("claude-code", "opus-5").map((o) => o.id)).not.toContain("auto");
+  expect(supportedEfforts("codex", "gpt-6-astra").map((o) => o.id)).not.toContain("auto");
+  expect(supportedEfforts("cursor", "cursor-grok-4.6").map((o) => o.id)).not.toContain("auto");
+  for (const model of AGENT_OPTIONS.gemini.models) {
+    expect(supportedEfforts("gemini", model.id).map((o) => o.id)).not.toContain("auto");
+  }
+});
+
 describe("supportedEfforts with discovered efforts", () => {
   test("a non-empty discovered list wins outright, returned in canonical order", () => {
     const ids = supportedEfforts("codex", "gpt-6-astra", ["low", "high"]).map((o) => o.id);
@@ -240,6 +252,24 @@ describe("supportedEfforts with discovered efforts", () => {
   test("cursor unknown-id guard only affects unknown ids — a known cursor id still honours a discovered list", () => {
     const ids = supportedEfforts("cursor", "cursor-grok-4.6", ["low"]).map((o) => o.id);
     expect(ids).toEqual(["low"]);
+  });
+
+  test("auto is dropped from a non-fx kind's discovered set — a discovered 'auto' never surfaces Model default on codex", () => {
+    const ids = supportedEfforts("codex", "gpt-6-astra", ["auto", "high", "low"]).map((o) => o.id);
+    expect(ids).toEqual(["high", "low"]);
+    expect(ids).not.toContain("auto");
+  });
+
+  test("auto-only discovery on a non-fx kind falls back to the curated table (nothing known after the drop)", () => {
+    const ids = supportedEfforts("claude-code", "opus-5", ["auto"]).map((o) => o.id);
+    const curated = supportedEfforts("claude-code", "opus-5").map((o) => o.id);
+    expect(ids).toEqual(curated);
+    expect(ids).not.toContain("auto");
+  });
+
+  test("fx keeps a discovered auto id", () => {
+    const ids = supportedEfforts("fx", "zai/glm-5.3-flash", ["auto", "low"]).map((o) => o.id);
+    expect(ids).toEqual(["low", "auto"]);
   });
 });
 

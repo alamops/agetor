@@ -298,8 +298,9 @@ export interface Harness {
    *    real `HOME` at all.
    *  - fx: emitted as a plain HOME=<home> override — fx has no dedicated
    *    config-dir env var (verified against fx v0.0.4 and v0.0.6, re-verified
-   *    0.0.8 (2026-09-08) — no FX_HOME or FX_CONFIG_DIR in its strings), and
-   *    its state lives hardcoded at
+   *    0.0.8 (2026-09-08) and 0.0.9/0.0.10 (2026-09-14) — no FX_HOME or
+   *    FX_CONFIG_DIR among all 60 FX_* env vars, identical across
+   *    0.0.8/0.0.9/0.0.10), and its state lives hardcoded at
    *    `~/.fx/*`, so isolating an additional account's login/config means
    *    re-homing the whole process, same approach as cursor.
    *  NULL means "inherit the agetor process env". */
@@ -363,7 +364,9 @@ export interface HarnessStatus {
    * (`auth_expired === true && auth_refreshable === false`); `true` for any
    * other reported value — including fx 0.0.8's `auth: "host managed"`
    * (`FX_AUTH_MODE=host-managed`), which the same fail-open fallthrough
-   * tolerates as logged-in rather than gaining a dedicated branch; `null`
+   * tolerates as logged-in rather than gaining a dedicated branch; the
+   * `status --json` field set and this `auth` vocabulary are unchanged
+   * through 0.0.9 and 0.0.10 (re-verified 2026-09-14); `null`
    * when the kind has no login probe, the probe failed, or its output
    * wasn't parseable — `null` must never block a run.
    */
@@ -1568,8 +1571,10 @@ export interface AgentOption {
    * account can't run: the Gateway catalog is account-scoped — 230 ids
    * unauthenticated vs 158 on a standard plan, measured 2026-08-27 on fx
    * 0.0.6. 2026-09-08: unauth catalog reads 244 on both 0.0.7 and 0.0.8
-   * (Gateway-side growth, not a binary property); all curated ids present;
-   * signed-in view still unverifiable (token expired).
+   * (Gateway-side growth, not a binary property); all curated ids present.
+   * Latest: 2026-09-14, unauth catalog reads 247 on 0.0.8, 0.0.9 and 0.0.10
+   * alike (Gateway-side, not client-version-dependent); all 28 curated ids
+   * still present; signed-in view still unverifiable (token expired).
    */
   catalogOnly?: boolean;
 }
@@ -1651,6 +1656,9 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // signed-in 158-id account could not be re-checked this pass (expired
   // login token). Re-verified 2026-09-08 and 0.0.8 (`builtins/gateway.zig
   // default_model`): compiled default still moonshotai/kimi-k3, unchanged.
+  // Latest: 2026-09-14 on 0.0.9 and 0.0.10 — compiled default still
+  // moonshotai/kimi-k3, unauth catalog grown to 247 ids, zai/glm-5.3-flash
+  // still present; signed-in 158-id account still unverifiable.
   "fx": "zai/glm-5.3-flash",
 };
 
@@ -1682,11 +1690,16 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   // concurrent tasks). MODEL_EFFORT_SUPPORT.gemini is empty for every model
   // so the picker collapses; this default is unused but kept for symmetry.
   "gemini": "high",
-  // fx has no per-invocation effort/reasoning flag (its models are routed
-  // through the Vercel AI Gateway verbatim, with no CLI-level effort knob).
-  // MODEL_EFFORT_SUPPORT.fx is empty for every model so the picker collapses;
-  // this default is unused but kept for symmetry.
-  "fx": "high",
+  // fx's own default reasoning level (owner decision D1,
+  // docs/plans/fx-0.0.10-compat.md §8): a new fx task runs exactly as fx
+  // itself would — `auto` is what every effort-advertising fx model reports
+  // as `currentValue` on `session/new`, and the driver only sends
+  // `set_config_option effort=auto` when a resumed session's persisted
+  // value has drifted from it. `high`/`max`/… stay one explicit click away
+  // in the picker; this is deliberately not the house `high` convention the
+  // other four kinds use, since that would silently change every fx run's
+  // cost/latency on the owner's rate-limited free-tier Gateway account.
+  "fx": "auto",
 };
 
 export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
@@ -2085,8 +2098,10 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
 };
 
 /**
- * Canonical effort levels exposed in the UI, ordered **highest → lowest**.
- * Not every (agent, model) combo accepts every level — see
+ * Canonical effort levels exposed in the UI, ordered **highest → lowest**,
+ * with one exception: `auto` is off-scale (it doesn't sit on the
+ * high↔low ladder — it means "let the model/gateway decide") and is always
+ * listed last. Not every (agent, model) combo accepts every level — see
  * `MODEL_EFFORT_SUPPORT` below.
  *
  * Mapping per agent (see `src/bun/agents.ts`):
@@ -2095,8 +2110,14 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  *                   low → "think"        medium → "think hard"
  *                   high → "think harder" xhigh → "think very hard"
  *                   max → "ultrathink"
+ *   fx          → `session/set_config_option {configId:"effort", value:<id>}`
+ *                   over ACP (fx ≥0.0.9); ids map to fx's own values verbatim.
  *
- * `none` is currently used only by GPT-5.6-family Codex models.
+ * `none` is currently used only by GPT-5.6-family Codex models and by
+ * effort-advertising fx models whose Gateway catalog entry lists it.
+ * `auto` is used only by fx tables (`MODEL_EFFORT_SUPPORT.fx`) — no other
+ * kind's model lists it, and `DEFAULT_EFFORT.fx` is the only default that
+ * resolves to it.
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "ultra", label: "Ultra", hint: "Codex's top tier — maximum reasoning plus automatic delegation to internal sub-agents. Several times Max's usage; Codex-only today." },
@@ -2107,6 +2128,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
   { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where Cursor exposes it." },
   { id: "none", label: "No thinking", hint: "Skip thinking where the model exposes a no-thinking variant." },
+  { id: "auto", label: "Model default", hint: "Let the model/gateway pick its own reasoning level — fx only today (fx's `auto`, its 'default' option). fx-only by construction: curated tables and the discovered branch both keep it off every other kind." },
 ];
 
 /**
@@ -2202,38 +2224,54 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gemini-3.5-flash": [],
     "gemini-2.5-flash": [],
   },
-  // Empty for every model: fx has no per-invocation effort/reasoning flag —
-  // its models route through the Vercel AI Gateway verbatim with no CLI-level
-  // knob to tune. Same treatment as gemini above.
+  // fx ≥0.0.9 exposes reasoning effort per ACP session: `session/new`,
+  // `session/resume` and `session/load` results carry a third
+  // `configOptions` entry (`{id:"effort", currentValue, options:[...]}`)
+  // whenever the active model's Gateway catalog entry advertises
+  // `reasoning_options`, and `session/set_config_option
+  // {configId:"effort", value}` sets it — driven by `src/bun/fx-acp.ts`.
+  // This table is the per-model set **live-probed on fx 0.0.10** (spike
+  // `fx-0010-efforts`, 2026-09-14) across all 28 curated ids: 16 models
+  // advertise an effort set (always ending in `auto`, fx's own default —
+  // what every effort-advertising model reports as `currentValue`), 12
+  // advertise none — their Gateway catalog entry carries no
+  // `reasoning_options` at all — and stay `[]`, same treatment as gemini
+  // above (the picker collapses). An unknown/discovered-only fx id falls
+  // back to `DEFAULT_MODEL.fx`'s set via `supportedEfforts`, and the driver
+  // validates at runtime against whatever `effort` option fx actually
+  // returns for that session — so drift between this curated table and the
+  // live Gateway catalog is only a picker-hint problem, never a failed run
+  // (an unoffered value degrades to a status breadcrumb). Ids map to fx's
+  // own values verbatim (`low|medium|high|xhigh|max|none|auto`).
   fx: {
-    "zai/glm-5.3-flash": [],
+    "zai/glm-5.3-flash": ["max", "high", "low", "auto"],
     "zai/glm-5v-turbo": [],
     "zai/glm-4.7": [],
-    "openai/gpt-5.2": [],
-    "openai/gpt-5.1-codex-max": [],
-    "openai/gpt-5.4-mini": [],
+    "openai/gpt-5.2": ["xhigh", "high", "medium", "low", "none", "auto"],
+    "openai/gpt-5.1-codex-max": ["xhigh", "high", "medium", "low", "auto"],
+    "openai/gpt-5.4-mini": ["xhigh", "high", "medium", "low", "none", "auto"],
     "spacexai/grok-4.6": [],
     "spacexai/grok-build-0.1": [],
     "moonshotai/kimi-k2.7-code": [],
-    "deepseek/deepseek-v4-flash": [],
+    "deepseek/deepseek-v4-flash": ["xhigh", "high", "auto"],
     "minimax/minimax-m3": [],
     "alibaba/qwen3.8-flash": [],
     "alibaba/qwen3-coder-plus": [],
     "mistral/devstral-2": [],
     "google/gemini-2.5-flash": [],
     "anthropic/claude-3-haiku": [],
-    "anthropic/claude-opus-5": [],
-    "anthropic/claude-sonnet-5": [],
-    "openai/gpt-5.5": [],
-    "google/gemini-3.1-pro-preview": [],
-    "google/gemini-3.8-flash": [],
-    "moonshotai/kimi-k3": [],
-    "anthropic/claude-fable-5.1": [],
+    "anthropic/claude-opus-5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "anthropic/claude-sonnet-5": ["xhigh", "high", "medium", "low", "auto"],
+    "openai/gpt-5.5": ["xhigh", "high", "medium", "low", "none", "auto"],
+    "google/gemini-3.1-pro-preview": ["high", "medium", "low", "auto"],
+    "google/gemini-3.8-flash": ["high", "medium", "low", "auto"],
+    "moonshotai/kimi-k3": ["max", "high", "low", "auto"],
+    "anthropic/claude-fable-5.1": ["xhigh", "high", "medium", "low", "auto"],
     "anthropic/claude-haiku-4.5": [],
-    "openai/gpt-6-astra": [],
-    "openai/gpt-5.6-sol": [],
-    "zai/glm-5.3": [],
-    "deepseek/deepseek-v4-pro": [],
+    "openai/gpt-6-astra": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "zai/glm-5.3": ["max", "high", "low", "auto"],
+    "deepseek/deepseek-v4-pro": ["xhigh", "high", "auto"],
   },
 };
 
@@ -2251,10 +2289,15 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
  * set for this exact model, when a caller has one (see `ModelOption.efforts`
  * and `discoveredEffortsFor` in `src/shared/model-options.ts`). Precedence:
  * a non-empty `discoveredEfforts` wins outright — the result is
- * `EFFORT_OPTIONS` filtered to it (canonical highest→lowest order) — unless
- * none of its ids are known to agetor, in which case we fall through to the
- * curated table below. `undefined`, `null`, or an empty array behave exactly
- * like the two-argument call (today's curated-table-only behaviour). The
+ * `EFFORT_OPTIONS` filtered to it (canonical highest→lowest order), with
+ * `auto` additionally dropped from the filter for every kind but fx (`auto`
+ * is fx-only by construction — see the `EFFORT_OPTIONS` row comment — so a
+ * non-fx harness that discovers an `auto` id, e.g. codex's `model/list
+ * supportedReasoningEfforts`, must never surface a "Model default" row) —
+ * unless that leaves none of its ids known to agetor, in which case we fall
+ * through to the curated table below. `undefined`, `null`, or an empty array
+ * behave exactly like the two-argument call (today's curated-table-only
+ * behaviour). The
  * curated table stays the fallback rather than the source of truth because
  * discovery is best-effort and account-scoped (a harness may be absent,
  * unauthenticated, or on an older CLI that can't discover at all): the
@@ -2275,7 +2318,14 @@ export function supportedEfforts(
   if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor)) return [];
   if (discoveredEfforts && discoveredEfforts.length > 0) {
     const discoveredAllowed = new Set(discoveredEfforts);
-    const fromDiscovery = EFFORT_OPTIONS.filter((o) => discoveredAllowed.has(o.id));
+    // `auto` is fx-only by construction (see the EFFORT_OPTIONS row comment):
+    // a non-fx harness that happens to discover an "auto" id (e.g. codex's
+    // `model/list supportedReasoningEfforts`) must not surface a "Model
+    // default" row or pass `auto` through to a flag that doesn't understand
+    // it, so it's dropped from the discovered set before filtering for every
+    // kind but fx.
+    const fromDiscovery = EFFORT_OPTIONS.filter((o) =>
+      discoveredAllowed.has(o.id) && (agent === "fx" || o.id !== "auto"));
     if (fromDiscovery.length > 0) return fromDiscovery;
   }
   const key = model ?? DEFAULT_MODEL[agent];
@@ -2492,6 +2542,10 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // openai/gpt-6-astra, openai/gpt-5.6-sol, zai/glm-5.3, deepseek/deepseek-v4-pro),
     // bringing catalogOnly to twelve rows total — same "offered only when the
     // signed-in account's catalog includes it" treatment as the original six.
+    // Latest: 2026-09-14, unauth catalog reads 247 ids on 0.0.8, 0.0.9 and
+    // 0.0.10 alike (Gateway-side, not client-version-dependent); all 28
+    // curated ids (16 standard + 12 catalogOnly) still present; signed-in
+    // view still unverifiable (token expired).
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
@@ -2523,12 +2577,15 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [
-      { id: "yolo", label: "Full access", hint: "Hands-off default — disables fx's permission checks entirely, so no tool call is ever held. What fx 0.0.8 calls --full-access / /permissions full-access; yolo is fx's surviving alias and stays agetor's stored id." },
+      { id: "yolo", label: "Full access", hint: "Hands-off default — disables fx's permission checks entirely, so no tool call is ever held. What fx 0.0.8 calls --full-access / /permissions full-access (still true on 0.0.10); yolo is fx's surviving alias and stays agetor's stored id." },
       { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
-    // No model in MODEL_EFFORT_SUPPORT.fx accepts the effort flag, so the
-    // picker collapses for every model — see EFFORT_OPTIONS list comment.
+    // 16 of the 28 curated models accept the effort flag (see
+    // MODEL_EFFORT_SUPPORT.fx — live-probed on fx 0.0.10); the other 12
+    // report an empty set and the picker collapses for those, same as any
+    // other kind's no-effort models. Every id-supported model always
+    // includes `auto` (fx's own default) last, per EFFORT_OPTIONS.
     efforts: EFFORT_OPTIONS,
   },
 };

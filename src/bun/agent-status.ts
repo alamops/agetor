@@ -51,7 +51,11 @@ async function probeVersion(bin: string, env: Record<string, string>): Promise<s
  * viewer"; re-verified present on v0.0.6 and v0.0.7 — the marker probe is
  * still safe; re-verified 0.0.8 (2026-09-08; `--help` still "Fast, native
  * coding agent for the terminal.", `fx acp --help` still only
- * `--model`/`--log-file`)). Doesn't gate on exit code — some CLIs exit
+ * `--model`/`--log-file`)); re-verified through fx 0.0.10 (binary probes of
+ * the 0.0.9 and 0.0.10 release builds, 2026-09-14): the marker line is
+ * unchanged on both — only the banner and the `-c`/`--continue` copy
+ * shifted ("latest" session → "remembered workspace session"), neither of
+ * which this probe reads. Doesn't gate on exit code — some CLIs exit
  * non-zero for --help.
  */
 async function probeHelp(bin: string, env: Record<string, string>): Promise<string | null> {
@@ -127,8 +131,8 @@ async function probeJson(bin: string, args: string[], env: Record<string, string
  * is treated as logged in, exactly as before:
  *   - `auth === "missing"` (from a real fx binary that answered the probe);
  *   - `auth !== "missing"` but `auth_expired === true` (strict boolean) AND
- *     `auth_refreshable === false` (strict boolean) — a 0.0.7+ (unchanged in
- *     0.0.8) expired, non-refreshable login. Real `fx acp` would fail this at
+ *     `auth_refreshable === false` (strict boolean) — a 0.0.7+ (unchanged
+ *     through 0.0.10) expired, non-refreshable login. Real `fx acp` would fail this at
  *     `initialize` with fx's own raw -32600 anyway (see fx-acp.ts's
  *     `RpcError.rawMessage` passthrough for that same code), so a friendly
  *     pre-flight refusal here is strictly better than letting the run fail
@@ -193,6 +197,19 @@ async function probeJson(bin: string, args: string[], env: Record<string, string
  * `history_turns`, `session_permission_grants`, `agent_step_limit`, and the
  * `mcp{connection_check,servers,configuration_issues,inspection_error}`
  * object — are, as before, ignored here by construction.
+ *
+ * Re-verified through fx 0.0.10 (binary probes of the 0.0.9 and 0.0.10
+ * release builds + a full v0.0.8→v0.0.10 source diff, 2026-09-14): the
+ * `status --json` builder is still unchanged (the only diff in
+ * `output_contracts.zig` across the whole range removed a dead helper) —
+ * every field, the `auth` vocabulary, the `auth_help` text, and the
+ * fail-open contract above all hold as written. Still no top-level
+ * `version` field. `build_revision` reads `"e26e97ec4040"` on 0.0.9 and
+ * `"1210c2756ea8"` on 0.0.10 (distinct per build, as expected).
+ * `permission_mode` echoes `yolo`/`auto`/`ask` exactly as before,
+ * `full-access` still reads back as `yolo`, and an invalid
+ * `FX_PERMISSION_MODE` still falls back silently to `auto` (no error) —
+ * identical on 0.0.8, 0.0.9, and 0.0.10.
  */
 async function probeStatus(bin: string, env: Record<string, string>): Promise<{ loggedIn: boolean | null; authHelp: string | null }> {
   const out = await probeJson(bin, ["status", "--json"], env);
@@ -218,7 +235,7 @@ async function probeStatus(bin: string, env: Record<string, string>): Promise<{ 
     };
   }
 
-  // 0.0.7+ (unchanged in 0.0.8): an authenticated-but-expired,
+  // 0.0.7+ (unchanged through 0.0.10): an authenticated-but-expired,
   // non-refreshable login. Strict on both booleans by design — see the doc
   // comment above for why every other combination
   // (absent/non-boolean/`auth_refreshable !== false`) must stay fail-open

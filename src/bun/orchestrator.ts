@@ -1010,13 +1010,17 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
   }
   // Fail-open: only an explicit `false` means the CLI positively reported
   // it's logged out. `null` (not probed / unknown) must never block a run.
-  // Empirically (real fx v0.0.6, v0.0.7, and v0.0.8 — 0.0.8 re-verified
-  // 2026-09-08, HOME pointed at an empty dir): env-var auth IS reflected by
+  // Empirically (real fx v0.0.6, v0.0.7, v0.0.8, v0.0.9, and v0.0.10 — 0.0.8
+  // re-verified 2026-09-08, 0.0.9 and 0.0.10 re-verified 2026-09-14, HOME
+  // pointed at an empty dir): env-var auth IS reflected by
   // the probe (AI_GATEWAY_API_KEY / VERCEL_OIDC_TOKEN both report a
   // non-"missing" `auth` value) — since the probe runs with the same
   // harnessEnv(harness) a real spawn uses, a key-authenticated user is never
-  // gated out here. As of 0.0.7 (unchanged in 0.0.8 — the credential
-  // re-check code paths are byte-identical 0.0.7→0.0.8), that same explicit
+  // gated out here. As of 0.0.7 (unchanged through 0.0.10 — the credential
+  // re-check BEHAVIOUR and its `-32600` texts are unchanged 0.0.7→0.0.10;
+  // 0.0.10's only change is a `verified_recently` short-circuit inside
+  // `refreshModelCredential` (`server.zig`, `auth_runtime.requestPathCredentialVerifiedRecently`)
+  // that skips redundant refreshes and has no observable effect here), that same explicit
   // `false` can also come from an expired login that can't self-refresh
   // (`auth_expired === true && auth_refreshable === false`) — but that gate
   // explicitly exempts the env-key `auth` values above (see agent-status.ts's
@@ -4828,13 +4832,19 @@ export async function createTask(
   // effort support list is empty either way) sends null effort.
   //
   // Deliberate side effect versus the old direct-table read: an *unlisted*
-  // gemini/fx model id used to store `high` here (`MODEL_EFFORT_SUPPORT[kind][model]`
+  // gemini model id used to store `high` here (`MODEL_EFFORT_SUPPORT[kind][model]`
   // read `undefined` for an unknown key, which failed the `Array.isArray`
   // check and fell through to `DEFAULT_EFFORT[kind]`), while a *listed*
-  // gemini/fx model (whose curated set is `[]`) stored `null`. Routing
-  // through `supportedEfforts` makes both cases resolve to `null` — that's
+  // gemini model (whose curated set is `[]`) stored `null`. Routing through
+  // `supportedEfforts` makes both cases resolve to `null` for gemini — that's
   // what the PATCH null-clear guard and every picker already compute for an
-  // unknown id, so this closes a known inconsistency, on purpose.
+  // unknown id, so this closes a known inconsistency, on purpose. fx is
+  // different: 16 of its 28 curated models advertise real efforts (live-probed
+  // 2026-09-14), so both a listed and an unlisted fx model resolve through
+  // `supportedEfforts` to `DEFAULT_EFFORT.fx` (`"auto"`) whenever the model —
+  // or the `DEFAULT_MODEL.fx` fallback used for an unlisted id — is one of
+  // those 16; only the remaining 12 no-effort fx models (e.g. `zai/glm-4.7`)
+  // resolve to `null`.
   const support = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, harness.id));
   const effort = input.effort
     ?? (support.length === 0

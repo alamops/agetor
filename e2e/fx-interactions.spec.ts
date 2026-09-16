@@ -4,7 +4,7 @@ import { test, expect, type APIRequestContext, type E2EBackend, type Locator, ty
 import { gotoApp } from "./helpers";
 
 /**
- * Mirrors two prompt-embedded fake-driver markers exported from
+ * Mirrors three prompt-embedded fake-driver markers exported from
  * `src/bun/agents.ts` (kept as literals, not imports — same rationale as
  * `todo-progress.spec.ts`'s identical comment: `src/bun/*.ts` pulls in
  * `bun:sqlite`/tmux-driver modules that Node's ESM loader, which is what
@@ -21,9 +21,18 @@ import { gotoApp } from "./helpers";
  * card via `registerFxPermission` and blocks the fake turn until the card is
  * answered (by this spec's own HTTP call through the UI, or by `kill()` on
  * teardown), mirroring the real ACP driver's registry-awaiter discipline.
+ * `FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER` (docs/plans/fx-0.0.10-compat.md
+ * §3.7/TT5) triggers the generic fallback turn's fx-only "isn't offered"
+ * breadcrumb — the fake's stand-in for `fx-acp.ts`'s real `applyFxEffort`,
+ * which emits the same status line when the session's `configOptions
+ * [{id:"effort"}]` entry (fx ≥0.0.9) reports the task's requested effort
+ * isn't in the model's offered set. The fake has no live fx to ask, so it
+ * always reports a fixed offered list (`auto, low, high, max`) regardless of
+ * the task's actual model.
  */
 const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
 const FAKE_FX_PERMISSION_PROMPT_MARKER = "__agetor_fake_fx_permission__";
+const FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER = "__agetor_fake_fx_effort_unoffered__";
 
 /**
  * E2E coverage for fx's ACP-native interaction surfaces (docs/plans/fx-
@@ -86,18 +95,40 @@ async function enableFxHarness(backend: E2EBackend): Promise<void> {
  *  `FAKE_CLAUDE_TODOS_PROMPT_MARKER` nor `FAKE_FX_PERMISSION_PROMPT_MARKER`,
  *  so `makeFakeAgent` (src/bun/agents.ts) falls through to its generic
  *  echo-back scenario — the one used below to exercise the provider chip
- *  without pulling in either marked scenario. */
+ *  without pulling in either marked scenario. `opts.model`/`opts.effort` are
+ *  optional overrides for the row's stored `model`/`effort` (both pass
+ *  through `POST /tasks`' `Partial<Task>` body verbatim, per server.ts) —
+ *  added for the effort-picker/breadcrumb tests below, which need a specific
+ *  (model, effort) pair rather than the row's usual unset defaults; every
+ *  existing call site omits `opts` and is unaffected. `opts.mode` overrides
+ *  the row's stored `mode` the same way — needed by the permission-card
+ *  tests below now that `AGENT_OPTIONS.fx.modes` (and `defaultModeFor("fx")`)
+ *  default an unset mode to `yolo` ("Full access"): the fake permission
+ *  scenario (src/bun/agents.ts) mirrors the real driver's client-side
+ *  auto-allow under `yolo` and never registers a card for it, so a test that
+ *  wants the card must ask for `ask`/`auto` explicitly rather than rely on
+ *  the row's default. */
 async function createAndStartFakeFxTask(
   request: APIRequestContext,
   backend: E2EBackend,
   title: string,
   promptMarker?: string,
+  opts?: { model?: string; effort?: string | null; mode?: string },
 ): Promise<TaskRow> {
   const auth = { authorization: `Bearer ${backend.apiToken}` };
   const prompt = promptMarker ? `${promptMarker} ${title}` : title;
   const createRes = await request.post(`${backend.apiBase}/tasks`, {
     headers: auth,
-    data: { title, prompt, agent: "fx", isolation: "none", workdir: tmpdir() },
+    data: {
+      title,
+      prompt,
+      agent: "fx",
+      isolation: "none",
+      workdir: tmpdir(),
+      ...(opts?.model !== undefined ? { model: opts.model } : {}),
+      ...(opts?.effort !== undefined ? { effort: opts.effort } : {}),
+      ...(opts?.mode !== undefined ? { mode: opts.mode } : {}),
+    },
   });
   expect(createRes.ok(), `POST /tasks -> ${createRes.status()}: ${await createRes.text()}`).toBeTruthy();
   const task = (await createRes.json()) as TaskRow;
@@ -151,6 +182,56 @@ async function selectHarness(page: Page, label: string): Promise<void> {
   const button = newTaskFormPanel(page).getByRole("button", { name: label, exact: true });
   await expect(button).toBeVisible({ timeout: 20_000 });
   await button.click();
+}
+
+/**
+ * The New Task form's Model `<select>` — mirrors e2e/fx-models.spec.ts's
+ * identical `newTaskModelSelect` helper (duplicated locally rather than
+ * imported; every e2e spec file in this repo owns its own small helpers —
+ * see that file's `enableFxHarness`/`createFxTask` duplication rationale).
+ * There is no `htmlFor`/`aria-labelledby` wiring the "Model" `<label>` to
+ * the `<select>` in NewTaskForm.tsx, so this locates structurally instead:
+ * the "Refresh model list" button (`data-testid="refresh-models"`) sits in a
+ * small flex row that is the immediate previous sibling of the `<Select>`,
+ * both children of one shared `space-y-1` wrapper. Two levels up from the
+ * button lands on that wrapper; `select` inside it is the Model dropdown.
+ */
+function newTaskModelSelect(page: Page): Locator {
+  return newTaskFormPanel(page).getByTestId("refresh-models").locator("xpath=../..").locator("select");
+}
+
+/**
+ * The New Task form's Effort `<select>` (NewTaskForm.tsx, the "Effort"
+ * `<label>` + `<Select>` pair right beside Model). Unlike Mode — a
+ * `SearchSelect` popover-trigger `<button>` — Effort renders as a plain
+ * native `<select>` via the shared `Select` wrapper (src/mainview/
+ * components/ui/select.tsx), so there's no popover to open: every option is
+ * already present in the DOM, and the "selected" one is just whichever
+ * `<option>` carries the `selected`/`:checked` state. Located the same
+ * structural way `newTaskModelSelect` above locates Model: the "Effort"
+ * `<label>`'s parent `space-y-1` div also contains the `<Select>`'s wrapping
+ * `<div class="relative">`, so walking to the label's parent and searching
+ * for a descendant `select` lands on it. Exactly one "Effort" text node
+ * exists in this form (RunPanel's task-details editor uses a `<dt>`, not a
+ * `<label>`, and lives in the run panel's own `<aside>` — see
+ * `detailsEffortSelect` below).
+ */
+function newTaskEffortSelect(page: Page): Locator {
+  return newTaskFormPanel(page).getByText("Effort", { exact: true }).locator("xpath=..").locator("select");
+}
+
+/**
+ * The task-details inline editor's Effort `<select>` (RunPanel.tsx, a
+ * `CompactSelect` — itself a thin wrapper around the same shared `Select` —
+ * rendered in the `<dd>` right after the `<dt>Effort</dt>` cell). Mirrors
+ * e2e/fx-models.spec.ts's `detailsModelSelect` idiom, anchored on the
+ * "Effort" text node directly (rather than a refresh-button testid, since
+ * Effort has no refresh affordance): `panel` must already have "Task
+ * details" expanded — it's a closed-by-default native `<details>` — or this
+ * resolves to a detached/hidden node.
+ */
+function detailsEffortSelect(panel: Locator): Locator {
+  return panel.getByText("Effort", { exact: true }).locator("xpath=following-sibling::dd[1]").locator("select");
 }
 
 /** Registers `backend.dataDir` (the worker's own headless-backend data
@@ -284,7 +365,11 @@ test.describe("fx interactions", () => {
     backend,
   }) => {
     const title = `fx-permission-allow-e2e ${randomUUID()}`;
-    await createAndStartFakeFxTask(request, backend, title, FAKE_FX_PERMISSION_PROMPT_MARKER);
+    // Explicit "ask" mode: an unset mode now defaults to "yolo" (Full
+    // access), under which the fake permission scenario auto-allows
+    // client-side and never registers a card — see createAndStartFakeFxTask's
+    // `opts.mode` doc comment above.
+    await createAndStartFakeFxTask(request, backend, title, FAKE_FX_PERMISSION_PROMPT_MARKER, { mode: "ask" });
 
     await gotoApp(page, backend.bootBase);
     const panel = await openTask(page, title);
@@ -307,7 +392,11 @@ test.describe("fx interactions", () => {
     backend,
   }) => {
     const title = `fx-permission-dismiss-e2e ${randomUUID()}`;
-    await createAndStartFakeFxTask(request, backend, title, FAKE_FX_PERMISSION_PROMPT_MARKER);
+    // Explicit "ask" mode — see the click-through test's identical comment
+    // above: an unset mode now defaults to "yolo" (Full access), under which
+    // the fake permission scenario auto-allows client-side and never
+    // registers a card.
+    await createAndStartFakeFxTask(request, backend, title, FAKE_FX_PERMISSION_PROMPT_MARKER, { mode: "ask" });
 
     await gotoApp(page, backend.bootBase);
     const panel = await openTask(page, title);
@@ -463,7 +552,15 @@ test.describe("fx interactions", () => {
     // .label, separate from the hint `<span>`) would be if the label had
     // never been changed from its pre-0.0.8-compat name.
     await expect(form.getByText("Yolo", { exact: true })).toHaveCount(0);
-    const fullAccessOption = form.getByRole("button", { name: /^Full access\b/ });
+    // Scoped to the open popover (`data-popover-open`, see search-select.tsx)
+    // rather than the whole form: the picker TRIGGER's own text already
+    // reads "Full access" (it's the default mode per `defaultModeFor("fx")`
+    // = "yolo"), so an unscoped `getByRole("button", { name: /^Full
+    // access\b/ })` resolves to both the trigger and the popover row and
+    // trips Playwright's strict-mode violation.
+    const fullAccessOption = form
+      .locator("[data-popover-open]")
+      .getByRole("button", { name: /^Full access\b/ });
     await expect(fullAccessOption).toBeVisible();
     await fullAccessOption.click();
     await expect(modeTrigger).toHaveText("Full access");
@@ -497,5 +594,176 @@ test.describe("fx interactions", () => {
     // --- The run actually completes under the fake driver --------------------
     const panel = await openTask(page, title);
     await expect(panel.getByText(`fake response to: ${title}`, { exact: true })).toBeVisible({ timeout: 15_000 });
+  });
+
+  test("fx 0.0.10 effort picker: New Task form offers Model default / Max thinking / High / Low for zai/glm-5.3-flash and defaults to Model default", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+
+    await selectHarness(page, "fx.sh");
+
+    // --- Default model + default effort --------------------------------------
+    // DEFAULT_MODEL.fx (src/shared/types.ts) is "zai/glm-5.3-flash"; picking
+    // fx as the harness doesn't require a project to be selected first (the
+    // Model/Effort row isn't gated on Project — see NewTaskForm.tsx's JSX
+    // order), so no `selectProject` call is needed for this test, which
+    // never submits the form.
+    const modelSelect = newTaskModelSelect(page);
+    await expect(modelSelect).toHaveValue("zai/glm-5.3-flash");
+
+    // DEFAULT_EFFORT.fx = "auto" ("Model default") — fx's own default, per
+    // docs/plans/fx-0.0.10-compat.md D1 — so a freshly-selected fx harness
+    // shows "Model default" without the user picking anything.
+    const effortSelect = newTaskEffortSelect(page);
+    await expect(effortSelect).toHaveValue("auto");
+    await expect(effortSelect.locator("option:checked")).toHaveText("Model default");
+
+    // --- Offered rows: MODEL_EFFORT_SUPPORT.fx["zai/glm-5.3-flash"] is
+    // exactly ["max", "high", "low", "auto"], rendered through EFFORT_OPTIONS
+    // in that canonical (highest → lowest, "auto" last) order — "Medium" is
+    // never one of them for this model (it's an id other kinds' tables use,
+    // and other fx models like GPT-5.2 do list it, but not this one).
+    const optionTexts = await effortSelect.locator("option").allTextContents();
+    expect(optionTexts).toEqual(["Max thinking", "High", "Low", "Model default"]);
+    // `getByText(..., { exact: true })` scoped to the whole form, not just
+    // the select — same exact-match rationale as the mode picker test above
+    // ("Full access" vs "Yolo"): a substring match could false-positive on
+    // an unrelated hint elsewhere in the form, though here it mainly just
+    // double-checks the `optionTexts` assertion via a second code path.
+    await expect(newTaskFormPanel(page).getByText("Medium", { exact: true })).toHaveCount(0);
+
+    // --- Picking a row updates the trigger --------------------------------
+    await effortSelect.selectOption({ label: "High" });
+    await expect(effortSelect).toHaveValue("high");
+    await expect(effortSelect.locator("option:checked")).toHaveText("High");
+
+    // --- A no-effort model collapses/disables the picker --------------------
+    // MODEL_EFFORT_SUPPORT.fx["zai/glm-4.7"] is `[]` (one of the twelve
+    // curated fx models with no reasoning-effort setting at all) — the same
+    // "efforts.length === 0" branch NewTaskForm.tsx/RunPanel.tsx render for
+    // e.g. claude's Haiku 4.5 collapses the Effort `<select>` to a single
+    // disabled "n/a" option. This deliberately does NOT drive the New Task
+    // form's own Model `<select>` to "zai/glm-4.7": fx is the one
+    // `CATALOG_SCOPED_KINDS` member, and e2e/fixtures.ts's worker-wide fx
+    // stub (`writeFxStubBin`, frozen for this task — out of scope to edit)
+    // answers `fx models --json` with a fixed 3-id catalog
+    // (`zai/glm-5.3-flash`, `openai/gpt-5.2`, `e2e/discovered-only`) that
+    // does not include `zai/glm-4.7` — under the scoped curated ∩ discovered
+    // merge (`mergeModelOptions`, src/shared/model-options.ts) that model
+    // never appears as a selectable `<option>` in this e2e environment, so
+    // driving the picker there would time out (confirmed live: `selectOption
+    // ({label:"GLM 4.7"})` on the New Task form's Model select times out
+    // with "did not find some options"). Instead, this creates a second task
+    // directly on that model (bypassing the picker's option list entirely,
+    // exactly like `createAndStartFakeFxTask`'s `opts.model` override two
+    // tests below) and reads the SAME collapse logic off the task-details
+    // inline editor (RunPanel.tsx's `CompactSelect`), which derives
+    // `supportedEffortsForModel` from `task.model` directly — never from
+    // whichever ids the Model `<select>` happens to be showing — so this is
+    // still exercising the real product code path, just via the
+    // already-created-task surface rather than a live model switch.
+    const auth = { authorization: `Bearer ${backend.apiToken}` };
+    const noEffortTitle = `fx-no-effort-model-e2e ${randomUUID()}`;
+    const createRes = await request.post(`${backend.apiBase}/tasks`, {
+      headers: auth,
+      data: {
+        title: noEffortTitle,
+        prompt: noEffortTitle,
+        agent: "fx",
+        isolation: "none",
+        workdir: tmpdir(),
+        model: "zai/glm-4.7",
+      },
+    });
+    expect(createRes.ok(), `POST /tasks -> ${createRes.status()}: ${await createRes.text()}`).toBeTruthy();
+    const noEffortTask = (await createRes.json()) as TaskRow;
+    createdTaskIds.push(noEffortTask.id);
+
+    const noEffortPanel = await openTask(page, noEffortTitle);
+    // "Task details" is a closed-by-default native <details> — see
+    // e2e/fx-models.spec.ts's identical comment on its own details test.
+    await noEffortPanel.getByText("Task details", { exact: true }).click();
+    const detailsEffort = detailsEffortSelect(noEffortPanel);
+    await expect(detailsEffort).toBeDisabled();
+    await expect(detailsEffort).toHaveValue("");
+    await expect(detailsEffort.locator("option:checked")).toHaveText("n/a");
+  });
+
+  test("fx 0.0.10 effort breadcrumb: a task whose effort isn't offered shows one 'running at fx's default' status line", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = `fx-effort-unoffered-e2e ${randomUUID()}`;
+    await createAndStartFakeFxTask(request, backend, title, FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER, {
+      model: "zai/glm-5.3-flash",
+      effort: "high",
+    });
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+
+    // Readiness wait: the generic fallback scenario's turn-settling timer
+    // only fires after the assistant echo has already streamed, and the
+    // breadcrumb itself is emitted synchronously, before either fires — same
+    // "whole turn streamed and was persisted" rationale as the "fx 0.0.8
+    // usage/title/thinking" test's identical wait above.
+    await expect(
+      panel.getByText(`fake response to: ${FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER} ${title}`, { exact: true }),
+    ).toBeVisible({ timeout: 15_000 });
+
+    // --- Exactly one breadcrumb status line -----------------------------------
+    // Mirrors the fake's exact template string (src/bun/agents.ts, right
+    // beside FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER's doc comment): fakeOpts
+    // .effort is the task's stored "high", fakeOpts.model the task's stored
+    // "zai/glm-5.3-flash", and the offered list is the fake's fixed
+    // "auto, low, high, max" stand-in for whatever fx's real `configOptions`
+    // would report.
+    const breadcrumb = panel.getByText(
+      /fx: effort high isn't offered for zai\/glm-5\.3-flash \(offers: auto, low, high, max\) — running at fx's default/,
+    );
+    await expect(breadcrumb).toHaveCount(1);
+
+    // --- Task details: the Effort select still shows the task's own stored
+    // value and stays enabled — the breadcrumb is advisory only, it never
+    // rewrites `task.effort`, and a settled (non-running, non-blocked) task
+    // is `editable` (RunPanel.tsx).
+    await panel.getByText("Task details", { exact: true }).click();
+    const effortSelect = detailsEffortSelect(panel);
+    await expect(effortSelect).toBeEnabled();
+    await expect(effortSelect).toHaveValue("high");
+    await expect(effortSelect.locator("option:checked")).toHaveText("High");
+
+    // --- A second task, same (model, effort), but no marker: the fake's
+    // success path is silent — no breadcrumb line at all, mirroring the real
+    // driver (an offered effort never produces a status line). Closes the
+    // first task's panel first (its own `<aside>` otherwise overlaps the
+    // board and intercepts the next `openTask`'s card click) rather than
+    // re-navigating — `page.goto` back to the identical boot URL doesn't
+    // reliably reset in-page React state here (confirmed live: the prior
+    // task's panel was still fully rendered afterwards), so closing via the
+    // panel's own affordance is the deterministic way to get back to a
+    // clean board.
+    await panel.getByRole("button", { name: "Close task details" }).click();
+    // `runPanel`'s `.locator("aside").last()` would just re-resolve onto the
+    // New Task form's own always-mounted `<aside>` once the run panel
+    // unmounts, so this checks for the run panel's close button specifically
+    // (scoped to the whole page — nothing else in this app carries this
+    // accessible name) rather than asserting on `panel`/`runPanel(page)`.
+    await expect(page.getByRole("button", { name: "Close task details" })).toHaveCount(0);
+
+    const titleNoMarker = `fx-effort-offered-e2e ${randomUUID()}`;
+    await createAndStartFakeFxTask(request, backend, titleNoMarker, undefined, {
+      model: "zai/glm-5.3-flash",
+      effort: "high",
+    });
+    const panel2 = await openTask(page, titleNoMarker);
+    await expect(panel2.getByText(`fake response to: ${titleNoMarker}`, { exact: true })).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect(panel2.getByText("running at fx's default", { exact: false })).toHaveCount(0);
   });
 });
