@@ -305,3 +305,45 @@ test("needs column: a long title truncates identically with or without the pause
   expect(row).not.toContain("X".repeat(44));
   expect(row).toContain("⏸ auto 1:05");
 });
+
+// ── agent / profile columns (docs/plans/task-details-agent-row.md D5) ─────
+// The `agent` column always shows the raw harness id; a separate `profile`
+// column shows the bound agent profile's snapshot name, or `-` when unbound.
+
+test("agent/profile columns: a task with no agent profile shows the harness id in 'agent' and '-' in 'profile'", async () => {
+  currentClient = makeClient([task({ agent: "claude-code" })]);
+  await cmdLs([], flags);
+
+  const row = dataRowLine();
+  expect(row).toContain("claude-code");
+  expect(row).toContain("-");
+});
+
+test("agent/profile columns: a task bound to an agent profile shows the harness id in 'agent' and the profile's snapshot name in 'profile'", async () => {
+  currentClient = makeClient([
+    task({
+      agent: "claude-code",
+      agentProfileId: "prof-1",
+      agentProfile: {
+        id: "prof-1",
+        name: "Reviewer",
+        harness: "claude-code",
+        harnessKind: "claude-code",
+        harnessLabel: "claude-code",
+        model: "opus-5",
+        effort: null,
+        mode: null,
+        fast: false,
+        maxMode: false,
+        instructions: "",
+        skills: [],
+        capturedAt: 0,
+      },
+    }),
+  ]);
+  await cmdLs([], flags);
+
+  const row = dataRowLine();
+  expect(row).toContain("claude-code");
+  expect(row).toContain("Reviewer");
+});

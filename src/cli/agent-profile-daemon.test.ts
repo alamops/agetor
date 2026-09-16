@@ -223,11 +223,11 @@ test("cmdAgentProfile rm: the profile is gone from ls afterward", async () => {
   expect(list.find((p) => p.id === createdProfileId)).toBeUndefined();
 });
 
-test("agetor show <task>: prints the frozen 'agent profile:' line with a '(deleted)' suffix now that the live profile is gone", async () => {
+test("agetor show <task>: prints the frozen 'profile:' line with a '(deleted)' suffix now that the live profile is gone", async () => {
   reset();
   await cmdShow([createdTaskId], flags());
   const rendered = outputs.join("\n");
-  expect(rendered).toContain("agent profile:");
+  expect(rendered).toContain("profile:");
   expect(rendered).toContain(PROFILE_NAME_V2);
   expect(rendered).toContain("(deleted)");
 });

@@ -54,7 +54,7 @@ Commands:
   info                show the connected core's version
   daemon <sub>        start | stop | status of the background core
   harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
-  agent <sub>         list | show | add | edit | rm reusable agent profiles
+  profile <sub>       list | show | add | edit | rm reusable agent profiles
   projects <sub>      list | add | rm | branches (project folders)
   config [k] [v]      view / set core preferences (defaultHarness, last model…)
   help                show this help
@@ -184,8 +184,8 @@ async function main(): Promise<void> {
     case "harness":
     case "harnesses":
       return cmdHarness(args, flags);
-    case "agent":
-    case "agents":
+    case "profile":
+    case "profiles":
       return cmdAgentProfile(args, flags);
     case "projects":
     case "project":

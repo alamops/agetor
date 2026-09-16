@@ -16,7 +16,7 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       const profiles = await client.listAgentProfiles();
       if (flags.json) return printJson(profiles);
       if (profiles.length === 0) {
-        out(c.dim("no agents defined — create one: agetor agent add <name> --harness <id> --model <id>"));
+        out(c.dim("no profiles defined — create one: agetor profile add <name> --harness <id> --model <id>"));
         return;
       }
       const rows = profiles.map((pr) => formatAgentProfileListRow(pr));
@@ -25,7 +25,7 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
     }
     case "show": {
       const ref = args[1];
-      if (!ref) throw usageError("agent");
+      if (!ref) throw usageError("profile");
       const profile = await resolveProfile(client, ref);
       if (flags.json) return printJson(profile);
       out(`${c.bold(profile.name)}  ${c.dim(profile.id)}`);
@@ -46,9 +46,9 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
     }
     case "add": {
       const name = args[1];
-      if (!name || name.startsWith("-")) throw usageError("agent add");
+      if (!name || name.startsWith("-")) throw usageError("profile add");
       const f = parseAgentProfileFlags(args.slice(2));
-      if (!f.harness || !f.model) throw usageError("agent add");
+      if (!f.harness || !f.model) throw usageError("profile add");
       const instructions = await resolveInstructions(f);
       const input: AgentProfileInput = {
         name,
@@ -63,12 +63,12 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       };
       const created = await client.createAgentProfile(input);
       if (flags.json) return printJson(created);
-      out(`${c.green("✓")} created agent ${c.bold(created.name)} (${c.dim(created.id)})`);
+      out(`${c.green("✓")} created profile ${c.bold(created.name)} (${c.dim(created.id)})`);
       return;
     }
     case "edit": {
       const ref = args[1];
-      if (!ref) throw usageError("agent edit");
+      if (!ref) throw usageError("profile edit");
       const f = parseAgentProfileFlags(args.slice(2));
       const hasAnyFlag =
         f.name !== undefined ||
@@ -105,28 +105,38 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       }
       const updated = await client.patchAgentProfile(profile.id, patch);
       if (flags.json) return printJson(updated);
-      out(`${c.green("✓")} updated agent ${c.bold(updated.name)} (${c.dim(updated.id)})`);
+      out(`${c.green("✓")} updated profile ${c.bold(updated.name)} (${c.dim(updated.id)})`);
       return;
     }
     case "rm":
     case "delete": {
       const ref = args[1];
-      if (!ref) throw usageError("agent");
+      if (!ref) throw usageError("profile");
       const profile = await resolveProfile(client, ref);
       await client.deleteAgentProfile(profile.id);
       if (flags.json) return printJson({ removed: profile.id });
-      out(`${c.red("✗")} removed agent ${c.bold(profile.name)} — existing tasks keep their snapshot`);
+      out(`${c.red("✗")} removed profile ${c.bold(profile.name)} — existing tasks keep their snapshot`);
       return;
     }
     default:
-      throw new Error(`unknown agent subcommand: ${sub} (use ls | show | add | edit | rm)`);
+      throw new Error(`unknown profile subcommand: ${sub} (use ls | show | add | edit | rm)`);
   }
+}
+
+/** `matchAgentProfileRef` (shared/agent-profile.ts) says "agent" in its
+ *  `unknown`/`ambiguous` error text by design — other, non-CLI consumers
+ *  still use that vocabulary. The CLI's own decision is `agent` = harness,
+ *  `profile` = agent profile (docs/plans/task-details-agent-row.md D4), so
+ *  this rewrites just the leading word at the CLI boundary rather than
+ *  editing the shared matcher. */
+function asProfileError(message: string): string {
+  return message.replace(/^(unknown|ambiguous) agent\b/, "$1 profile");
 }
 
 async function resolveProfile(client: AgetorClient, ref: string): Promise<AgentProfile> {
   const profiles = await client.listAgentProfiles();
   const result = matchAgentProfileRef(profiles, ref);
-  if ("error" in result) throw new Error(result.error);
+  if ("error" in result) throw new Error(asProfileError(result.error));
   return result.profile;
 }
 
@@ -159,8 +169,8 @@ function oneLine(s: string, n: number): string {
   return flat.length > n ? flat.slice(0, n - 1) + "…" : flat;
 }
 
-/** `"N task"` / `"N tasks"` — the singular/plural form both `agent ls`'s
- *  `tasks` column and `agent show`'s `used by:` line render. `taskCount` is
+/** `"N task"` / `"N tasks"` — the singular/plural form both `profile ls`'s
+ *  `tasks` column and `profile show`'s `used by:` line render. `taskCount` is
  *  server-derived (`docs/plans/agent-profiles.md`'s "used by N tasks"
  *  counter) and may be `undefined` on a payload from an older server; the
  *  call sites default it to `0` before calling this, so this itself just
@@ -169,7 +179,7 @@ export function taskCountText(n: number): string {
   return `${n} task${n === 1 ? "" : "s"}`;
 }
 
-/** Pure row formatter for `agetor agent ls`'s table — one exported function
+/** Pure row formatter for `agetor profile ls`'s table — one exported function
  *  so the `tasks` column (placed after `skills`, ahead of `instructions`)
  *  is unit-testable without a client/daemon. */
 export function formatAgentProfileListRow(pr: AgentProfile): string[] {
@@ -219,7 +229,7 @@ export interface AgentProfileFlags {
   clearSkills?: boolean;
 }
 
-/** Pure flag parser for `agetor agent add|edit` — no I/O (the
+/** Pure flag parser for `agetor profile add|edit` — no I/O (the
  *  `--instructions-file`/stdin read happens in `resolveInstructions`, kept
  *  out of here so this stays unit-testable without touching the filesystem,
  *  mirroring `parseHarnessFlags`). */

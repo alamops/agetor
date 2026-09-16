@@ -29,7 +29,7 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   if (task.issueUrl) out(`  ${label("issue")} ${task.issueUrl}`);
   if (task.agentProfile) {
     const deletedSuffix = await agentProfileDeletedSuffix(client, task);
-    out(`  ${label("agent profile")} ${task.agentProfile.name} (${task.agentProfile.id})${deletedSuffix}`);
+    out(`  ${label("profile")} ${task.agentProfile.name} (${task.agentProfile.id})${deletedSuffix}`);
   }
   out(`  ${label("prompt")} ${c.dim(truncate(task.prompt, 240))}`);
   if (pending.length > 0) {

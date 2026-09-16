@@ -91,23 +91,25 @@ export async function cmdLs(
     c.dim(t.id.slice(0, 8)),
     truncate(t.title, 44),
     agentCell(t),
+    profileCell(t),
     colorColumn(t.column),
     needsCell(t),
   ]);
-  out(table(["", "id", "title", "agent", "column", "needs"], rows));
+  out(table(["", "id", "title", "agent", "profile", "column", "needs"], rows));
 }
 
-/** Agent column: a task bound to an agent profile shows its name (bold) plus
- *  the dim harness id from the snapshot — reads the same whether the profile
- *  is still live or has since been deleted, since it's rendered from the
- *  task's own captured snapshot, not a fresh lookup. Otherwise the raw
- *  harness id, as before. The `--agent` filter above still matches on
- *  `t.agent` (the harness id) regardless of what this column displays. */
+/** Agent column: the raw harness id — always, regardless of whether the task
+ *  is bound to an agent profile. The `--agent` filter above matches on the
+ *  same `t.agent` field this renders. */
 function agentCell(t: Task): string {
-  if (t.agentProfile) {
-    return `${c.bold(t.agentProfile.name)} ${c.dim(`(${t.agentProfile.harness})`)}`;
-  }
   return c.gray(t.agent ?? "");
+}
+
+/** Profile column: the bound agent profile's name (from the task's own
+ *  frozen snapshot — reads the same whether the profile is still live or has
+ *  since been deleted), or `-` when the task isn't bound to one. */
+function profileCell(t: Task): string {
+  return t.agentProfile ? c.bold(t.agentProfile.name) : c.dim("-");
 }
 
 /** The "needs" column: pending-interaction count first (unchanged), then an

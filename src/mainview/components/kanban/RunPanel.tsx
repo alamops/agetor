@@ -101,6 +101,7 @@ import { parseUserMessage, splitReferences, parseMessageSegments, type MessageSe
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
 import { AgentProfileCard } from "./AgentProfileCard";
+import { AgentProfileDetailsDialog } from "./AgentProfileDetailsDialog";
 import { AttachmentChips } from "./AttachmentChips";
 import { SentFilesCard } from "./SentFilesCard";
 import {
@@ -3203,6 +3204,7 @@ function RunPanelBody({
         agents={agents}
         harnesses={harnesses}
         agentProfileDisplay={agentProfileDisplay}
+        agentProfileForCard={agentProfileForCard}
         onOpenSettingsAgents={onOpenSettingsAgents}
         agentModels={agentModels}
         harnessModels={harnessModels}
@@ -3210,6 +3212,21 @@ function RunPanelBody({
         homeDir={homeDir}
         onTaskFieldsChanged={onTaskFieldsChanged}
         tmuxSession={latestRun?.tmuxSession ?? null}
+        // "Has this task ever run" for the Agent-details dialog's status
+        // line — the union of every signal in scope, since each is
+        // individually incomplete: `runs` (this component's own polled
+        // `GET /tasks/:id/runs` history) is the most truthful match for the
+        // orchestrator's own freeze gate (`runs.countForTask(task.id) === 0`,
+        // CLAUDE.md item 15) because it counts a run regardless of outcome,
+        // but reads empty for one brief tick after a task remount before its
+        // first poll lands; `task.hasOpenableRun` is available immediately
+        // from the task row itself (no fetch race) but excludes
+        // failed/cancelled runs, so a task whose only run failed would read
+        // as "never run" even though the profile is already frozen;
+        // `task.runId` only reflects a currently in-flight run and reverts
+        // to null once it settles. ORing all three means any one of them
+        // proving a run happened is enough.
+        hasRun={runs.length > 0 || task.hasOpenableRun || task.runId != null}
       />
 
       <RunsList runs={runs} usageByRun={usageByRunId} providerByRun={providerByRunId} titleByRun={titleByRunId} />
@@ -5990,6 +6007,7 @@ function TaskDetails({
   agents,
   harnesses,
   agentProfileDisplay,
+  agentProfileForCard,
   onOpenSettingsAgents,
   agentModels,
   harnessModels,
@@ -5997,6 +6015,7 @@ function TaskDetails({
   homeDir,
   onTaskFieldsChanged,
   tmuxSession,
+  hasRun,
 }: {
   task: Task;
   agents: AgentStatus[];
@@ -6006,6 +6025,12 @@ function TaskDetails({
    *  reused here so the lock/hint/Detach affordances below and the header
    *  chip never disagree on the profile's name / deleted state. */
   agentProfileDisplay: TaskProfileDisplay | null;
+  /** The richer live-or-snapshot object `AgentProfileCard` itself renders
+   *  from (model/effort/mode/instructions/skills) — same object the header
+   *  chip uses (`RunPanelBody`'s `agentProfileForCard`), reused here for the
+   *  Agent row's chip so the two never disagree. `null` alongside
+   *  `agentProfileDisplay` when the task was never bound to a profile. */
+  agentProfileForCard: AgentProfile | AgentProfileSnapshot | null;
   /** "Manage agents…" — the bound-profile hint's sibling link into Settings. */
   onOpenSettingsAgents: () => void;
   agentModels: AgentModelMap;
@@ -6020,6 +6045,10 @@ function TaskDetails({
    *  no run has spawned a session yet — the Tmux row hides itself in that
    *  case rather than presenting an Attach button that's guaranteed to 404. */
   tmuxSession: string | null;
+  /** Whether this task has ever run — see the call site's doc comment
+   *  (`RunPanelBody`) for how this is derived. Threaded through to
+   *  `AgentProfileDetailsDialog`'s status line only. */
+  hasRun: boolean;
 }) {
   // Spins the Model row's ↻ button while a manual `onRefreshModels` probe is
   // in flight for this task's harness — mirrors NewTaskForm's affordance.
@@ -6032,6 +6061,14 @@ function TaskDetails({
   const profileLock = task.agentProfileId != null;
   const editable = !runningLock && !profileLock;
   const [detaching, setDetaching] = useState(false);
+  // Agent-details modal (plan D2), opened by clicking the chip in the Agent
+  // row below. Closed defensively if the task becomes unbound while open —
+  // Detach clears `task.agentProfileId`/`agentProfile` out from under it, and
+  // a still-open dialog would otherwise render a suddenly-empty snapshot.
+  const [profileDialogOpen, setProfileDialogOpen] = useState(false);
+  useEffect(() => {
+    if (profileDialogOpen && !profileLock) setProfileDialogOpen(false);
+  }, [profileDialogOpen, profileLock]);
   const detachProfile = async () => {
     setDetaching(true);
     try {
@@ -6239,6 +6276,7 @@ function TaskDetails({
     : (modeOptions[0]?.id ?? "bypass");
 
   return (
+    <>
     <details className="border-b border-border/60 px-3 py-2 text-xs">
       <summary className="cursor-pointer text-muted-foreground">
         <span className="text-[10px] uppercase tracking-wide">Task details</span>
@@ -6260,30 +6298,53 @@ function TaskDetails({
           </p>
         )}
 
-        {profileLock && (
-          <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-6 px-2 text-[10px]"
-              data-testid="task-agent-profile-detach"
-              disabled={runningLock || detaching}
-              onClick={() => void detachProfile()}
-            >
-              Detach
-            </Button>
-            <button
-              type="button"
-              onClick={onOpenSettingsAgents}
-              className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-            >
-              Manage agents…
-            </button>
-          </div>
-        )}
-
         <dl className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1 text-[11px]">
           <dt className="text-muted-foreground">Agent</dt>
+          <dd className="min-w-0">
+            {agentProfileDisplay && agentProfileForCard ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  data-testid="task-agent-profile-open"
+                  aria-haspopup="dialog"
+                  title="View agent details"
+                  onClick={() => setProfileDialogOpen(true)}
+                  className="min-w-0 max-w-full rounded-full transition-opacity hover:opacity-80"
+                >
+                  <AgentProfileCard
+                    variant="chip"
+                    profile={agentProfileForCard}
+                    harnesses={harnesses}
+                    deleted={agentProfileDisplay.deleted}
+                  />
+                </button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6 px-2 text-[10px]"
+                  data-testid="task-agent-profile-detach"
+                  disabled={runningLock || detaching}
+                  onClick={() => void detachProfile()}
+                >
+                  Detach
+                </Button>
+                <button
+                  type="button"
+                  data-testid="task-agent-profile-manage"
+                  onClick={onOpenSettingsAgents}
+                  className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                >
+                  Manage agents…
+                </button>
+              </div>
+            ) : (
+              <span data-testid="task-agent-profile-none" className="text-muted-foreground">
+                None
+              </span>
+            )}
+          </dd>
+
+          <dt className="text-muted-foreground">Harness</dt>
           <dd className="min-w-0">
             {editable ? (
               <AgentSelect
@@ -6489,6 +6550,17 @@ function TaskDetails({
         </dl>
       </div>
     </details>
+    <AgentProfileDetailsDialog
+      open={profileDialogOpen}
+      onClose={() => setProfileDialogOpen(false)}
+      task={task}
+      display={agentProfileDisplay}
+      deleted={agentProfileDisplay?.deleted ?? false}
+      hasRun={hasRun}
+      harnesses={harnesses}
+      onOpenSettingsAgents={onOpenSettingsAgents}
+    />
+    </>
   );
 }
 
