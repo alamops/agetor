@@ -555,6 +555,19 @@ function RunPanelBody({
 }) {
   const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
+  /** The task id this render's async handlers should be writing state for.
+   *  RunPanelBody is NOT remounted on task switch (see `RunPanel`'s call
+   *  site in App.tsx), so an async handler (`send`, `saveForLater`,
+   *  `rebuildFromJsonl`, the backlog CRUD helpers, …) that captured task A's
+   *  id before an `await` must not write its post-await result into state
+   *  once the panel has moved on to task B. Written synchronously at the top
+   *  of the `[task.id]` reset effect below — a ref, not state, so the write
+   *  is visible to an already-in-flight async closure the instant the reset
+   *  effect runs, with no render latency. Handlers capture `task.id` into a
+   *  local (e.g. `sentTaskId`) before their first `await`, then compare it
+   *  against `currentTaskIdRef.current` after every `await` before writing
+   *  shared per-task state. */
+  const currentTaskIdRef = useRef(task.id);
   const [runs, setRuns] = useState<Run[]>([]);
   /** Structured event stream — one entry per claude JSONL block or per
    *  codex stdout/stderr chunk. The renderer dispatches on `stream` to
@@ -730,6 +743,7 @@ function RunPanelBody({
   // that nothing task A produced (an in-flight send, a busy flag, cached
   // git/PR status) is visible while task B's panel is still catching up.
   useEffect(() => {
+    currentTaskIdRef.current = task.id;
     setEvents([]);
     eventsRef.current = [];
     prevEventIdRef.current = -1;
@@ -767,6 +781,12 @@ function RunPanelBody({
     setPrStatus(null);
     setPrStatusError(null);
     setPrStatusLoading(false);
+    // Invalidate any in-flight `fetchPrStatus` (including a pending self-heal
+    // retry) task A's effects left running — without this, a slow response
+    // that lands after the switch would pass its own `requestId !==
+    // prStatusSeqRef.current` staleness check (it captured the pre-bump
+    // value) and write task A's mergeability into task B's `prStatus`.
+    prStatusSeqRef.current++;
     setResolveConflictsSent(false);
     setResolvingConflicts(false);
     setSending(false);
@@ -794,10 +814,13 @@ function RunPanelBody({
 
   const rebuildFromJsonl = async () => {
     if (!latestRun || !latestRun.claudeSessionId || rebuildBusy) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setRebuildBusy(true);
     setRebuildNote(null);
     try {
       const res = await api.rebuildRunEvents(latestRun.id);
+      if (currentTaskIdRef.current !== sentTaskId) return;
       if (res.events.length === 0) {
         setRebuildNote(res.reason ?? "no events found in JSONL");
         return;
@@ -810,9 +833,10 @@ function RunPanelBody({
       });
       setRebuildNote(`Loaded ${res.events.length} events from session JSONL.`);
     } catch (e) {
+      if (currentTaskIdRef.current !== sentTaskId) return;
       setRebuildNote(`rebuild failed: ${(e as Error).message}`);
     } finally {
-      setRebuildBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setRebuildBusy(false);
     }
   };
 
@@ -1157,8 +1181,13 @@ function RunPanelBody({
     // implicitly (the effect instance, and this closure's `inFlight`, don't
     // survive past task switch anyway).
     let inFlight = false;
+    // A `kick()` (SSE live sign / focus / visibility) that arrives while a
+    // load is already in flight would otherwise be silently dropped — record
+    // it here and replay it once, right after the in-flight load settles, so
+    // the signal that prompted the kick isn't lost.
+    let pendingKick = false;
     const load = async () => {
-      if (inFlight) return;
+      if (inFlight) { pendingKick = true; return; }
       inFlight = true;
       try {
         const list = await api.listRuns(task.id);
@@ -1169,7 +1198,13 @@ function RunPanelBody({
         // bails out a same-value `setState(true)` without a re-render.
         setRunsLoaded(true);
       } catch { /* task may have been deleted */ }
-      finally { inFlight = false; }
+      finally {
+        inFlight = false;
+        if (pendingKick && !cancelled) {
+          pendingKick = false;
+          void load();
+        }
+      }
     };
     const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
     const startTimer = () => {
@@ -1225,8 +1260,11 @@ function RunPanelBody({
     // See the runs-poll effect above for why a tick is skipped while the
     // previous `load()` is still in flight.
     let inFlight = false;
+    // See the runs-poll effect above for why a kick that arrives mid-flight
+    // is recorded and replayed once, rather than silently dropped.
+    let pendingKick = false;
     const load = async () => {
-      if (inFlight) return;
+      if (inFlight) { pendingKick = true; return; }
       inFlight = true;
       try {
         const list = await api.listSubagents(task.id);
@@ -1248,7 +1286,13 @@ function RunPanelBody({
           );
         });
       } catch { /* task may have been deleted */ }
-      finally { inFlight = false; }
+      finally {
+        inFlight = false;
+        if (pendingKick && !cancelled) {
+          pendingKick = false;
+          void load();
+        }
+      }
     };
     const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
     const startTimer = () => {
@@ -1303,9 +1347,15 @@ function RunPanelBody({
   const loadEarlierEvents = useCallback(() => {
     if (earliestId == null || !hasMoreEarlier || loadingEarlier) return;
     const el = logRef.current;
+    // Captured before the request — see `currentTaskIdRef`'s doc comment.
+    // The panel isn't remounted on task switch, so a slow page fetch
+    // resolving after the user has moved to a different task must not
+    // prepend task A's history into task B's transcript state.
+    const sentTaskId = task.id;
     setLoadingEarlier(true);
-    void api.fetchTaskEventsPage(task.id, earliestId)
+    void api.fetchTaskEventsPage(sentTaskId, earliestId)
       .then((page) => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
         // Defensive dedupe: `earliestId` can point past events this panel
         // already holds — e.g. an SSE reconnect moved it backward (see the
         // `replay_meta` handler's "never move forward" comment above), so a
@@ -1337,7 +1387,9 @@ function RunPanelBody({
         setHasMoreEarlier(page.hasMore);
       })
       .catch(() => { /* transient failure — button stays enabled to retry */ })
-      .finally(() => setLoadingEarlier(false));
+      .finally(() => {
+        if (currentTaskIdRef.current === sentTaskId) setLoadingEarlier(false);
+      });
   }, [task.id, earliestId, hasMoreEarlier, loadingEarlier]);
 
   // Restores scroll position after "Load earlier" prepends older events above
@@ -2213,11 +2265,20 @@ function RunPanelBody({
   // actually moved on from what it was at click time; a request failure has
   // nothing new to wait for, so it clears busy immediately instead.
   const handleResumeFxRecovery = useCallback(() => {
+    // Captured before the request — see `currentTaskIdRef`'s doc comment.
+    // The panel isn't remounted on task switch, so a slow `resumeFxRecovery`
+    // resolving/rejecting after the user has moved to a different task must
+    // not touch task B's `resumeBusy`/`sendHint`/click-tracking state.
+    const sentTaskId = task.id;
     resumeClickedRunIdRef.current = latestRun?.id ?? null;
     setResumeBusy(true);
-    api.resumeFxRecovery(task.id)
-      .then(() => { runsPollKickRef.current(); })
+    api.resumeFxRecovery(sentTaskId)
+      .then(() => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
+        runsPollKickRef.current();
+      })
       .catch((e) => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
         setSendHint(e instanceof Error ? e.message : String(e));
         resumeClickedRunIdRef.current = null;
         setResumeBusy(false);
@@ -2251,13 +2312,21 @@ function RunPanelBody({
   // it, rather than lagging behind the click.
   const [cancelAutoBusy, setCancelAutoBusy] = useState(false);
   const handleCancelFxAutoResume = useCallback(() => {
+    // Captured before the request — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setCancelAutoBusy(true);
-    api.cancelFxAutoResume(task.id)
-      .then(() => { runsPollKickRef.current(); })
+    api.cancelFxAutoResume(sentTaskId)
+      .then(() => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
+        runsPollKickRef.current();
+      })
       .catch((e) => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
         setSendHint(e instanceof Error ? e.message : String(e));
       })
-      .finally(() => setCancelAutoBusy(false));
+      .finally(() => {
+        if (currentTaskIdRef.current === sentTaskId) setCancelAutoBusy(false);
+      });
   }, [task.id]);
   /** Live fx recovery notice for the bottom-pinned heartbeat slot — fx's own
    *  retry-progress line (e.g. "⚠ Rate limited · HTTP 429 · … · retrying
@@ -2630,14 +2699,22 @@ function RunPanelBody({
     // same text) is mid-flight — otherwise a fast Enter could both send and
     // save the same message.
     if (sending || backlogBusy) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    // The panel isn't remounted on task switch, so a slow `sendRunInput` (or
+    // its follow-up `listRuns`/`getTask` refresh) resolving after the user
+    // has moved on to a different task must not write task A's response into
+    // task B's composer/transcript state.
+    const sentTaskId = task.id;
     setSending(true);
     setSendHint(null);
     const body = appendReferences(line, sendRefs);
     try {
       const res = await api.sendRunInput(resumableRunId, body);
       if (res.delivered) {
-        setInput("");
-        setSendRefs([]);
+        if (currentTaskIdRef.current === sentTaskId) {
+          setInput("");
+          setSendRefs([]);
+        }
         // The composer is now empty — clear the persisted draft so it can't
         // resurrect on next open. Cancel any pending autosave first, then
         // bump the write generation *before* firing the clear so an
@@ -2646,31 +2723,47 @@ function RunPanelBody({
         // review finding #4). Also drop pristine: the composer was just
         // consumed, so nothing should reseed it from a stale poll that still
         // shows the pre-clear draft (finding #2's adopt effects check this).
-        cancelDraftSaveTimer();
-        draftGenRef.current++;
-        lastSavedDraftRef.current = null;
-        draftPristineRef.current = false;
-        void api.clearTaskDraft(task.id).catch(() => {});
+        // These refs track THIS panel's currently-displayed task's draft, so
+        // they must only be touched when the panel hasn't moved on.
+        if (currentTaskIdRef.current === sentTaskId) {
+          cancelDraftSaveTimer();
+          draftGenRef.current++;
+          lastSavedDraftRef.current = null;
+          draftPristineRef.current = false;
+        }
+        // Task A's persisted draft is cleared regardless of whether the panel
+        // has since switched away — the message was sent, so A's stashed
+        // draft should go either way. `sentTaskId` (not the possibly-stale
+        // `task.id` closure) is what was actually sent to.
+        void api.clearTaskDraft(sentTaskId).catch(() => {});
         // Drop the frozen JSONL snapshot — the auto-rebuild effect set
         // it from the last finished run, and the live SSE stream now
         // carries the new turn's events. Without this, the display
         // stays pinned on the pre-send transcript and the user's own
         // message never appears.
-        setRebuilt(null);
-        setRebuildNote(null);
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
         // Refresh the runs list right away so the new run row appears
         // immediately, rather than waiting up to 2s for the next poll.
-        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
         // Pin the view to the newest content the moment the message is
         // accepted — the user's own message lands first, followed by
         // streamed assistant chunks. The unified task-level stream picks
         // up the new turn's events automatically; no run-switching needed.
         // Flip nearBottom so the streamed chunks that follow keep auto-
         // scrolling until the user manually scrolls up again.
-        nearBottomRef.current = true;
-        requestAnimationFrame(() => {
-          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-        });
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+        }
       } else if (res.withheld && res.savedToBacklog) {
         // Claude is showing a modal — the paste was withheld and the server
         // already re-stashed this exact message into the task's backlog tray
@@ -2681,22 +2774,34 @@ function RunPanelBody({
         // instead of waiting for the next 2s task poll, and toast the
         // outcome — there's no run/turn here to carry a status line the way
         // a mid-turn withhold would.
-        setInput("");
-        setSendRefs([]);
-        cancelDraftSaveTimer();
-        draftGenRef.current++;
-        lastSavedDraftRef.current = null;
-        draftPristineRef.current = false;
-        void api.clearTaskDraft(task.id).catch(() => {});
-        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          setInput("");
+          setSendRefs([]);
+          cancelDraftSaveTimer();
+          draftGenRef.current++;
+          lastSavedDraftRef.current = null;
+          draftPristineRef.current = false;
+        }
+        void api.clearTaskDraft(sentTaskId).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
+        // Not per-task display state — surface regardless of which task the
+        // panel is showing now, same as any other toast.
         toast(res.reason);
-      } else {
+      } else if (currentTaskIdRef.current === sentTaskId) {
         setSendHint(res.reason);
       }
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setSending(false);
+      // Do not clear task B's `sending` flag from task A's `finally` — if the
+      // panel has moved on, the reset effect already cleared it for B (or B
+      // has its own send in flight that owns it).
+      if (currentTaskIdRef.current === sentTaskId) setSending(false);
     }
   };
 
@@ -2715,28 +2820,34 @@ function RunPanelBody({
   const saveForLater = async () => {
     const text = input.trim();
     if (!text && !sendRefs.length) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setBacklogBusy(true);
     setSendHint(null);
     try {
-      const updated = await api.addBacklogItem(task.id, { text, references: sendRefs });
-      setBacklogItems(updated.backlog);
-      setInput("");
-      setSendRefs([]);
-      // Stashed into the backlog — clear the draft slot so it doesn't also
-      // resurrect in the composer on next open. Cancel any pending autosave
-      // first, then bump the write generation before firing the clear so an
-      // in-flight autosave PUT can't win the race and resurrect the
-      // just-stashed text (code review finding #4), and drop pristine so a
-      // stale poll can't reseed it either (finding #2).
-      cancelDraftSaveTimer();
-      draftGenRef.current++;
-      lastSavedDraftRef.current = null;
-      draftPristineRef.current = false;
-      void api.clearTaskDraft(task.id).catch(() => {});
+      const updated = await api.addBacklogItem(sentTaskId, { text, references: sendRefs });
+      if (currentTaskIdRef.current === sentTaskId) {
+        setBacklogItems(updated.backlog);
+        setInput("");
+        setSendRefs([]);
+        // Stashed into the backlog — clear the draft slot so it doesn't also
+        // resurrect in the composer on next open. Cancel any pending autosave
+        // first, then bump the write generation before firing the clear so an
+        // in-flight autosave PUT can't win the race and resurrect the
+        // just-stashed text (code review finding #4), and drop pristine so a
+        // stale poll can't reseed it either (finding #2).
+        cancelDraftSaveTimer();
+        draftGenRef.current++;
+        lastSavedDraftRef.current = null;
+        draftPristineRef.current = false;
+      }
+      void api.clearTaskDraft(sentTaskId).catch(() => {});
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
     }
   };
 
@@ -2747,6 +2858,8 @@ function RunPanelBody({
   // item once the send is actually accepted.
   const sendBacklogItem = async (item: BacklogMessage) => {
     if (!resumableRunId || sending || backlogBusy || modalPending) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setSending(true);
     setBacklogBusy(true);
     setSendHint(null);
@@ -2755,22 +2868,32 @@ function RunPanelBody({
       const res = await api.sendRunInput(resumableRunId, body);
       if (res.delivered) {
         try {
-          const updated = await api.deleteBacklogItem(task.id, item.id);
-          setBacklogItems(updated.backlog);
+          const updated = await api.deleteBacklogItem(sentTaskId, item.id);
+          if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
         } catch {
           // The send landed; if the consume call fails, drop it locally so the
           // user doesn't accidentally resend. The next task poll reconciles.
-          setBacklogItems((prev) => prev.filter((m) => m.id !== item.id));
+          if (currentTaskIdRef.current === sentTaskId) {
+            setBacklogItems((prev) => prev.filter((m) => m.id !== item.id));
+          }
         }
-        setRebuilt(null);
-        setRebuildNote(null);
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
         // No optimistic git-status touch here (main's #94 dropped that): the
         // git-status polling effect keeps `gitStatus` current on its own.
-        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
-        nearBottomRef.current = true;
-        requestAnimationFrame(() => {
-          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-        });
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+        }
       } else if (res.withheld && res.savedToBacklog) {
         // `item` was never deleted above (delivery failed), so it's still
         // sitting in `backlogItems` — do NOT delete it here. The server's
@@ -2780,16 +2903,23 @@ function RunPanelBody({
         // already present and does NOT write a duplicate entry — no local
         // filtering needed here any more. Just refetch and adopt whatever the
         // server has.
-        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
         toast(res.reason);
-      } else {
+      } else if (currentTaskIdRef.current === sentTaskId) {
         setSendHint(res.reason);
       }
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setSending(false);
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSending(false);
+        setBacklogBusy(false);
+      }
     }
   };
 
@@ -2797,31 +2927,39 @@ function RunPanelBody({
     itemId: string,
     patch: { text?: string; references?: TaskReference[] },
   ) => {
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setBacklogBusy(true);
     setSendHint(null);
     try {
-      const updated = await api.updateBacklogItem(task.id, itemId, patch);
-      setBacklogItems(updated.backlog);
+      const updated = await api.updateBacklogItem(sentTaskId, itemId, patch);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
     }
   };
 
   const removeBacklogItem = async (itemId: string) => {
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setBacklogBusy(true);
     setSendHint(null);
     const prev = backlogItems;
     setBacklogItems((p) => p.filter((m) => m.id !== itemId)); // optimistic
     try {
-      const updated = await api.deleteBacklogItem(task.id, itemId);
-      setBacklogItems(updated.backlog);
+      const updated = await api.deleteBacklogItem(sentTaskId, itemId);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
     } catch (e) {
-      setBacklogItems(prev); // roll back
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setBacklogItems(prev); // roll back
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
     }
   };
 
@@ -2832,6 +2970,8 @@ function RunPanelBody({
     const idx = backlogItems.findIndex((m) => m.id === itemId);
     const to = idx + dir;
     if (idx < 0 || to < 0 || to >= backlogItems.length) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     const next = [...backlogItems];
     const [moved] = next.splice(idx, 1);
     next.splice(to, 0, moved!);
@@ -2839,12 +2979,14 @@ function RunPanelBody({
     setBacklogBusy(true);
     setSendHint(null);
     try {
-      const updated = await api.reorderBacklog(task.id, next.map((m) => m.id));
-      setBacklogItems(updated.backlog);
+      const updated = await api.reorderBacklog(sentTaskId, next.map((m) => m.id));
+      if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
     }
   };
 
@@ -2857,6 +2999,8 @@ function RunPanelBody({
     // prefix and the push hint names the real branch. Shared with the CLI's
     // `agetor commit` / dashboard `c` so every surface sends the same text.
     const message = commitPushPrompt(task);
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     // Intentionally leaves `input` / `sendRefs` alone — Commit & push is a
     // side action that shouldn't discard text the user has typed for the
     // next turn. `send()` clears those because it consumed them.
@@ -2865,28 +3009,41 @@ function RunPanelBody({
     try {
       const res = await api.sendRunInput(resumableRunId, message);
       if (res.delivered) {
-        setRebuilt(null);
-        setRebuildNote(null);
-        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
-        nearBottomRef.current = true;
-        requestAnimationFrame(() => {
-          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-        });
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+        }
       } else if (res.withheld && res.savedToBacklog) {
         // Claude is showing a modal — the canned commit/push message was
         // withheld and stashed into the backlog tray instead of being lost.
         // Refresh the tray right away and toast the outcome; there's no
         // run/turn here to carry a status line the way a mid-turn withhold
         // would.
-        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
         toast(res.reason);
-      } else {
+      } else if (currentTaskIdRef.current === sentTaskId) {
         setSendHint(res.reason);
       }
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setSending(false);
+      if (currentTaskIdRef.current === sentTaskId) setSending(false);
     }
   };
 
@@ -2928,31 +3085,44 @@ function RunPanelBody({
       headRef: prStatus.headRef,
       baseRef: prStatus.baseRef,
     });
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setResolvingConflicts(true);
     setSendHint(null);
     try {
       const res = await api.sendRunInput(resumableRunId, prompt);
       if (res.delivered) {
-        setRebuilt(null);
-        setRebuildNote(null);
-        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
-        nearBottomRef.current = true;
-        requestAnimationFrame(() => {
-          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-        });
-        if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
-        setResolveConflictsSent(true);
-        resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+          if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+          setResolveConflictsSent(true);
+          resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
+        }
       } else if (res.withheld && res.savedToBacklog) {
         // Claude is showing a modal — the merge/resolve-conflicts prompt was
         // withheld and stashed into the backlog tray instead of being lost.
         // Refresh the tray right away; toast (not toast.error — nothing
         // failed, the message just landed somewhere other than the agent)
         // since the button can be hidden by the time this resolves.
-        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
         toast(res.reason);
       } else {
-        setSendHint(res.reason);
+        if (currentTaskIdRef.current === sentTaskId) setSendHint(res.reason);
         // The button can be hidden by the time this resolves — archived,
         // a subagent tab (dock-level), or the mergeability re-fetch clearing
         // `prStatus` — any of which would make `sendHint` invisible, so
@@ -2961,10 +3131,10 @@ function RunPanelBody({
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      setSendHint(msg);
+      if (currentTaskIdRef.current === sentTaskId) setSendHint(msg);
       toast.error(msg);
     } finally {
-      setResolvingConflicts(false);
+      if (currentTaskIdRef.current === sentTaskId) setResolvingConflicts(false);
     }
   };
 
@@ -3037,7 +3207,13 @@ function RunPanelBody({
     setSendDragging(false);
     if (!canSend) return;
     setSendHint(null);
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    // `capture.handleResult` writes into this composer's `setInput`/
+    // `setSendRefs`/`setSendHint`, which belong to whichever task is
+    // currently displayed — not necessarily the one the drop happened on.
+    const sentTaskId = task.id;
     const result = await captureDroppedOrPastedItems(e.dataTransfer, { kind: "drop" });
+    if (currentTaskIdRef.current !== sentTaskId) return;
     capture.handleResult(result);
   };
 
@@ -3307,7 +3483,7 @@ function RunPanelBody({
           from the new task's `openTerminalCount` and, via `TerminalView`'s
           own unmount, closes the previous task's terminal sockets instead of
           leaking them across the switch. */}
-      <TerminalsSection key={task.id} task={task} />
+      <TerminalsSection key={task.id} task={task} awaitReady={awaitStreamReady} />
 
       {showSubagentTabs && (
         <SubagentTabs
@@ -3388,11 +3564,17 @@ function RunPanelBody({
               </Button>
             </div>
           )}
-          {!runsLoaded ? (
+          {!runsLoaded && displayedEvents.length === 0 ? (
+            // Gated on BOTH `runsLoaded` and `displayedEvents.length` — the SSE
+            // subscription is now issued before `listRuns` (see the stream-first
+            // task-switch work), so a replay can land its events before the
+            // slower `listRuns` response arrives. Showing the skeleton on
+            // `!runsLoaded` alone would hide those already-rendered events
+            // behind "Loading messages…" until `listRuns` finally resolves.
             <div className="text-muted-foreground" data-testid="transcript-loading">Loading messages…</div>
-          ) : runs.length === 0 ? (
+          ) : runsLoaded && runs.length === 0 ? (
             <div className="text-muted-foreground">(no runs yet — press Run to start the agent)</div>
-          ) : displayedEvents.length === 0 ? (
+          ) : runsLoaded && displayedEvents.length === 0 ? (
             <div className="text-muted-foreground">Waiting for the first event…</div>
           ) : (
             <>
@@ -3439,7 +3621,14 @@ function RunPanelBody({
                   // backlog tray instead of losing it. Refresh the tray right
                   // away and toast (not toast.error — nothing failed).
                   toast(reason);
-                  void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+                  // Captured before the async gap — see `currentTaskIdRef`'s
+                  // doc comment: this panel may have switched to a different
+                  // task by the time `getTask` resolves.
+                  const sentTaskId = task.id;
+                  void api.getTask(sentTaskId).then((fresh) => {
+                    if (currentTaskIdRef.current !== sentTaskId) return;
+                    setBacklogItems(fresh.backlog);
+                  }).catch(() => {});
                 }}
               />
             </>
@@ -4425,7 +4614,7 @@ function RunsList({
  * themselves live on the bun side and survive the panel closing entirely.
  * Defaults open when the task already has terminals (`openTerminalCount`).
  */
-function TerminalsSection({ task }: { task: Task }) {
+function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: () => Promise<void> }) {
   const count = task.openTerminalCount;
   // Seed open from the count at mount, then let the user own the toggle —
   // binding `open` to the polled count would re-expand the section whenever
@@ -4436,6 +4625,30 @@ function TerminalsSection({ task }: { task: Task }) {
   // closed state and closes the previous task's terminal sockets instead of
   // carrying them over.
   const [open, setOpen] = useState(count > 0);
+  // Defer mounting `TerminalView` (and its `listTerminals` fetch) until the
+  // stream-first gate opens — same non-essential-fetch deferral as the
+  // git-status/PR-mergeability effects in `RunPanelBody` (see plan
+  // §3.4(c)): without this, a terminal list request competes with the SSE
+  // subscription for the webview's shared per-host connection budget in the
+  // task-switch burst. Seeded false and re-resolved on every mount because
+  // this component is keyed on `task.id` at its call site, so each task gets
+  // its own fresh `ready` gate.
+  const [ready, setReady] = useState(false);
+  // `awaitReady` (RunPanelBody's `awaitStreamReady`) is a plain function
+  // recreated every parent render, not a stable `useCallback` — captured in
+  // a ref (same pattern as `onCloseRef` above) so this effect doesn't tear
+  // down and re-run on every RunPanelBody re-render (e.g. the 2s kanban
+  // poll). This component is keyed on `task.id` at its call site, so it
+  // mounts fresh — and re-awaits — once per task regardless.
+  const awaitReadyRef = useRef(awaitReady);
+  awaitReadyRef.current = awaitReady;
+  useEffect(() => {
+    let cancelled = false;
+    void awaitReadyRef.current().then(() => {
+      if (!cancelled) setReady(true);
+    });
+    return () => { cancelled = true; };
+  }, []);
   return (
     <details
       className="border-b border-border/60"
@@ -4448,7 +4661,7 @@ function TerminalsSection({ task }: { task: Task }) {
         </span>
       </summary>
       <div className="h-80 border-t border-border/60">
-        <TerminalView taskId={task.id} />
+        {ready && <TerminalView taskId={task.id} />}
       </div>
     </details>
   );

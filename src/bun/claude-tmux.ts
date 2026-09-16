@@ -6681,18 +6681,18 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
 
   const launch = await tmux(tmuxArgs);
   const afterNewSessionAt = performance.now();
-  if (!launch.ok) {
-    const err = new Error(`tmux new-session failed: ${launch.stderr || launch.stdout}`);
-    opts.onChunk("stderr", err.message);
-    return rejectedAgent(opts.taskId, err);
-  }
 
   // Name the slow stage(s), if any, now that all three pre-launch awaits have
-  // settled. Deliberately placed here — before the boot IIFE further down
-  // emits its own `status` chunks (e.g. "ready (jsonl: …)") — so this
-  // breadcrumb, when it fires, is always the first status line on the run
-  // rather than being sandwiched after "ready"; it fires synchronously right
-  // after `launch` resolves, well before that IIFE's first await.
+  // settled — computed and (if over threshold) emitted BEFORE the
+  // `!launch.ok` early return below, so a `tmux new-session` that hangs and
+  // then fails still produces this breadcrumb instead of nothing. Previously
+  // this block sat after the early return and was skipped entirely on a
+  // launch failure. Otherwise unchanged: still placed here — before the boot
+  // IIFE further down emits its own `status` chunks (e.g. "ready (jsonl:
+  // …)") — so this breadcrumb, when it fires, is always the first status
+  // line on the run rather than being sandwiched after "ready"; it fires
+  // synchronously right after `launch` resolves, well before that IIFE's
+  // first await.
   const killMs = Math.round(afterKillAt - spawnStageStart);
   const settingsMs = Math.round(afterSettingsAt - afterKillAt);
   const newSessionMs = Math.round(afterNewSessionAt - afterSettingsAt);
@@ -6701,6 +6701,12 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
       `[claude-tmux] slow launch for ${sessionName}: kill ${killMs}ms · settings ${settingsMs}ms · tmux new-session ${newSessionMs}ms`,
     );
     opts.onChunk("status", formatSlowLaunchStatus({ killMs, settingsMs, newSessionMs }));
+  }
+
+  if (!launch.ok) {
+    const err = new Error(`tmux new-session failed: ${launch.stderr || launch.stdout}`);
+    opts.onChunk("stderr", err.message);
+    return rejectedAgent(opts.taskId, err);
   }
 
   // The JSONL path is deterministic from cwd + session uuid (we passed

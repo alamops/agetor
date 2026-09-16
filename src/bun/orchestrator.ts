@@ -935,6 +935,20 @@ async function raceSpawnBudget<T>(
   p: Promise<T>,
   ms: number,
 ): Promise<{ settled: true; value: T } | { settled: false }> {
+  // Defensive, belt-and-braces: `p` is documented above to never reject, but
+  // if that invariant is ever broken by a bug upstream, this attaches a
+  // rejection handler directly to `p` — separate from the `.then()`
+  // derivation below that `Promise.race` actually consumes — so a rejection
+  // arriving after the timeout has already won the race can never surface as
+  // a process-level unhandledRejection; it only logs. This handler is
+  // fire-and-forget and never rethrows, so it can't itself produce a
+  // rejection to go unhandled. Race semantics are unchanged: if `p` rejects
+  // BEFORE the timeout, `settled` below still rejects and `Promise.race`
+  // still rejects this function's own promise, exactly as before — every
+  // caller already wraps that.
+  p.catch((err) => {
+    console.error("[agetor] spawn continuation rejected:", err);
+  });
   let timer: ReturnType<typeof setTimeout>;
   const timeout = new Promise<{ settled: false }>((resolve) => {
     timer = setTimeout(() => resolve({ settled: false }), ms);
@@ -1257,12 +1271,15 @@ async function startTaskInner(
       if (!agent) return { ok: false as const, message: message ?? "unknown error" };
 
       // Ownership guard: by the time the spawn settles the task may have
-      // been deleted, or this run may no longer be the task's current run
-      // (replaced by a later send/start, or cancelled) while the spawn was
-      // still in flight. Registering against a stale task would leak a live
-      // session nothing else knows about.
+      // been deleted, archived, or this run may no longer be the task's
+      // current run (replaced by a later send/start, or cancelled) while the
+      // spawn was still in flight. Registering against a stale or archived
+      // task would leak a live session nothing else knows about — a
+      // force-archive (`archiveTask`'s `active.has(task.runId)` guard is
+      // false during this exact pending window, since `registerActiveRun`
+      // hasn't run yet) must be treated the same as delete/replace here.
       const fresh = tasks.get(taskId);
-      if (!fresh || fresh.runId !== runId) {
+      if (!fresh || fresh.archivedAt != null || fresh.runId !== runId) {
         agent.kill();
         if (harness.kind === "claude-code") await dropSession(taskId);
         runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
@@ -4898,12 +4915,15 @@ async function spawnResumedSessionInner(
       if (!agent) return;
 
       // Ownership guard: by the time the spawn settles the task may have
-      // been deleted, or this run may no longer be the task's current run
-      // (replaced by a later send/start, or cancelled) while the spawn was
-      // still in flight. Registering against a stale task would leak a live
-      // tmux session nothing else knows about.
+      // been deleted, archived, or this run may no longer be the task's
+      // current run (replaced by a later send/start, or cancelled) while the
+      // spawn was still in flight. Registering against a stale or archived
+      // task would leak a live tmux session nothing else knows about — a
+      // force-archive (`archiveTask`'s `active.has(task.runId)` guard is
+      // false during this exact pending window, since `registerActiveRun`
+      // hasn't run yet) must be treated the same as delete/replace here.
       const fresh = tasks.get(taskId);
-      if (!fresh || fresh.runId !== newRunId) {
+      if (!fresh || fresh.archivedAt != null || fresh.runId !== newRunId) {
         agent.kill();
         await dropSession(taskId);
         runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });

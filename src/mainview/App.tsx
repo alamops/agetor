@@ -326,6 +326,7 @@ function AppInner() {
   // resolved yet, so a slow request never stacks with the next tick's.
   const refreshPollInFlightRef = useRef(false);
   const refreshAgentsPollInFlightRef = useRef(false);
+  const refreshProjectsPollInFlightRef = useRef(false);
 
   /** Re-list tasks. Returns the fetched list so callers that need to inspect a
    *  task right after a mutation don't have to issue a second GET. `null` on
@@ -478,7 +479,12 @@ function AppInner() {
           refreshPollInFlightRef.current = true;
           void refresh().finally(() => { refreshPollInFlightRef.current = false; });
         }
-        void refreshProjects();
+        // Same guard, its own ref — a slow `/projects` fetch must not stack
+        // with the next 2s tick either.
+        if (!refreshProjectsPollInFlightRef.current) {
+          refreshProjectsPollInFlightRef.current = true;
+          void refreshProjects().finally(() => { refreshProjectsPollInFlightRef.current = false; });
+        }
       }
     }, 2000);
     const a = setInterval(() => {
@@ -489,7 +495,13 @@ function AppInner() {
     }, 15_000);
     const onVisible = () => {
       if (document.hidden) return;
-      void refresh();
+      // Route through the same in-flight guard the interval poll uses — a
+      // focus/visibility event landing mid-poll must not stack a second
+      // `/tasks` request on top of one already in flight.
+      if (!refreshPollInFlightRef.current) {
+        refreshPollInFlightRef.current = true;
+        void refresh().finally(() => { refreshPollInFlightRef.current = false; });
+      }
       void refreshProjects();
       void refreshAgents();
       // fx login (and any other harness auth flow) often happens in a

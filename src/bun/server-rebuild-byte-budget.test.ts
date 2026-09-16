@@ -355,7 +355,11 @@ test("/runs/:id/rebuild-events?limit=N slices the byte-budgeted window from the 
   expect(body.hasMore).toBe(true);
 });
 
-test("/runs/:id/rebuild-events without `limit` returns the full mapped list, no `hasMore` key", async () => {
+test("/runs/:id/rebuild-events without `limit` is byte-budgeted from the END and gains `hasMore` only when the cut removed events", async () => {
+  // Same over-budget fixture as the `?limit=90` test: 100 × 50 KB = 5 MB
+  // exceeds EVENTS_REPLAY_MAX_BYTES, so the no-limit path (the panel's manual
+  // "Rebuild from session JSONL" button) must clamp exactly like the limited
+  // one (review finding #4) and advertise the cut via `hasMore: true`.
   const { runId } = seedRebuildFixture(REBUILD_LINE_COUNT, REBUILD_LINE_LEN);
 
   const res = await authedFetch(`/runs/${runId}/rebuild-events`);
@@ -363,8 +367,26 @@ test("/runs/:id/rebuild-events without `limit` returns the full mapped list, no 
   const body = await res.json() as Record<string, unknown>;
   const events = body.events as Array<{ data: string }>;
 
-  expect(events.length).toBe(REBUILD_LINE_COUNT);
-  expect(events[0]!.data.startsWith("L000-")).toBe(true);
+  expect(events.length).toBe(83); // 4 MiB / 50 KB → 83 newest lines fit
+  expect(events[0]!.data.startsWith("L017-")).toBe(true);
   expect(events[events.length - 1]!.data.startsWith("L099-")).toBe(true);
+  expect(events.reduce((n, e) => n + e.data.length, 0)).toBeLessThanOrEqual(EVENTS_REPLAY_MAX_BYTES);
+  expect(body.hasMore).toBe(true);
+});
+
+test("/runs/:id/rebuild-events without `limit` keeps the bare `{events, source}` shape when everything fits", async () => {
+  // Under budget: 10 × 1 KB. Nothing is cut, so the additive-only contract
+  // holds — no `hasMore` key at all, full list in order.
+  const { runId } = seedRebuildFixture(10, 1000);
+
+  const res = await authedFetch(`/runs/${runId}/rebuild-events`);
+  expect(res.status).toBe(200);
+  const body = await res.json() as Record<string, unknown>;
+  const events = body.events as Array<{ data: string }>;
+
+  expect(events.length).toBe(10);
+  expect(events[0]!.data.startsWith("L000-")).toBe(true);
+  expect(events[events.length - 1]!.data.startsWith("L009-")).toBe(true);
   expect("hasMore" in body).toBe(false);
+  expect(typeof body.source).toBe("string");
 });

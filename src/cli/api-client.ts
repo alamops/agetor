@@ -136,8 +136,11 @@ export class AgetorClient {
   /** `unresolvedRefs` (omitted when empty) lists the raw `@`-tokens (verbatim,
    *  `@` included) in the task's prompt that didn't resolve to a real file
    *  under the freshly-materialized worktree/workdir — CLAUDE.md §12's
-   *  send-time expansion contract. Advisory only; the run still starts. */
-  startTask(id: string): Promise<{ runId: string; unresolvedRefs?: string[] }> {
+   *  send-time expansion contract. Advisory only; the run still starts.
+   *  `pending` (omitted when falsy): spawn hasn't settled yet — run row exists, agent launch continues detached (plan §3.1). */
+  startTask(
+    id: string,
+  ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true }> {
     return this.req("POST", `/tasks/${id}/start`, undefined, START_TIMEOUT_MS);
   }
   archiveTask(id: string): Promise<Task> {
@@ -159,11 +162,18 @@ export class AgetorClient {
   // ── runs ─────────────────────────────────────────────────────────────────
   /** `unresolvedRefs` (omitted when empty) mirrors `startTask`'s field — the
    *  raw `@`-tokens in `line` that didn't resolve against the task's live
-   *  cwd. Advisory only; delivery isn't blocked on it. */
+   *  cwd. Advisory only; delivery isn't blocked on it.
+   *  `pending` (omitted when falsy): spawn hasn't settled yet — run row exists, agent launch continues detached (plan §3.1). */
   sendInput(
     runId: string,
     line: string,
-  ): Promise<{ delivered: boolean; runId?: string; reason?: string; unresolvedRefs?: string[] }> {
+  ): Promise<{
+    delivered: boolean;
+    runId?: string;
+    reason?: string;
+    unresolvedRefs?: string[];
+    pending?: true;
+  }> {
     return this.req("POST", `/runs/${runId}/input`, { line });
   }
   cancelRun(runId: string): Promise<{ ok?: boolean; cancelled?: boolean }> {

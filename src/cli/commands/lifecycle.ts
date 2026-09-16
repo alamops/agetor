@@ -58,7 +58,14 @@ export async function cmdStart(args: string[], flags: Flags): Promise<void> {
     }
     warnUnresolvedRefs(filterUnresolvedRefs(tokens, { extensionNames, restrictTo: null }));
   }
-  out(`${c.cyan("▸")} started ${c.dim(short)} — run ${res.runId.slice(0, 8)}`);
+  if (res.pending) {
+    out(
+      `${c.yellow("▸")} starting ${c.dim(short)} — run ${res.runId.slice(0, 8)} ` +
+        c.dim("(agent launch still in progress; check `agetor logs " + short + "`)"),
+    );
+  } else {
+    out(`${c.cyan("▸")} started ${c.dim(short)} — run ${res.runId.slice(0, 8)}`);
+  }
 }
 
 export async function cmdSend(args: string[], flags: Flags): Promise<void> {
@@ -113,7 +120,14 @@ export async function cmdSend(args: string[], flags: Flags): Promise<void> {
     warnUnresolvedRefs(filterUnresolvedRefs(res.unresolvedRefs, { extensionNames }));
   }
   const refNote = refPaths.length ? c.dim(` (+${refPaths.length} ref${refPaths.length > 1 ? "s" : ""})`) : "";
-  out(`${c.green("→")} sent to ${c.dim(short)}${refNote}`);
+  if (res.pending) {
+    out(
+      `${c.yellow("→")} accepted by ${c.dim(short)}${refNote} ` +
+        c.dim("(session is still launching; the message will be delivered once it's up)"),
+    );
+  } else {
+    out(`${c.green("→")} sent to ${c.dim(short)}${refNote}`);
+  }
 }
 
 export async function cmdCancel(args: string[], flags: Flags): Promise<void> {
