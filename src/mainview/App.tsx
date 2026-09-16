@@ -320,6 +320,12 @@ function AppInner() {
   // function's doc comment. A ref (not state) since it's pure bookkeeping
   // that must survive across polls without itself triggering a render.
   const taskReconcileCacheRef = useRef(new Map<string, { obj: Task; json: string }>());
+  // In-flight guards for the 2s `refresh()` / 15s `refreshAgents()` interval
+  // pollers below (task-details-blank-while-session-restores.md §3.1/§3.4):
+  // a tick is skipped while the previous poll of the same kind hasn't
+  // resolved yet, so a slow request never stacks with the next tick's.
+  const refreshPollInFlightRef = useRef(false);
+  const refreshAgentsPollInFlightRef = useRef(false);
 
   /** Re-list tasks. Returns the fetched list so callers that need to inspect a
    *  task right after a mutation don't have to issue a second GET. `null` on
@@ -466,11 +472,21 @@ function AppInner() {
     // bug previously fixed there.
     const t = setInterval(() => {
       if (!document.hidden) {
-        void refresh();
+        // Skip this tick if the previous `refresh()` poll is still in
+        // flight — see `refreshPollInFlightRef`'s comment above.
+        if (!refreshPollInFlightRef.current) {
+          refreshPollInFlightRef.current = true;
+          void refresh().finally(() => { refreshPollInFlightRef.current = false; });
+        }
         void refreshProjects();
       }
     }, 2000);
-    const a = setInterval(() => { if (!document.hidden) void refreshAgents(); }, 15_000);
+    const a = setInterval(() => {
+      if (!document.hidden && !refreshAgentsPollInFlightRef.current) {
+        refreshAgentsPollInFlightRef.current = true;
+        void refreshAgents().finally(() => { refreshAgentsPollInFlightRef.current = false; });
+      }
+    }, 15_000);
     const onVisible = () => {
       if (document.hidden) return;
       void refresh();

@@ -222,6 +222,15 @@ export const EXIT_DURATION_MS = 250;
 // fire inconsistently depending on which path last updated `nearBottomRef`.
 const NEAR_BOTTOM_PX = 80;
 
+// Upper bound on how long the git-status and PR-mergeability fetches (each
+// declared further down `RunPanelBody`) wait behind the SSE subscription's
+// first `replay_meta` frame before firing anyway — see `markStreamReady`/
+// `awaitStreamReady` near `runsLoaded`. A dead task (no SSE endpoint
+// reachable at all) or an unusually slow replay must not starve those
+// fetches forever; 400ms is comfortably above a normal replay's latency
+// while still well inside "the switch burst" the deferral exists to avoid.
+const STREAM_READY_FALLBACK_MS = 400;
+
 // Computed once at module load — see `lib/platform.ts`; used by the Cmd/Ctrl+F handler below.
 const IS_MAC_PLATFORM = isMacPlatform();
 
@@ -672,11 +681,54 @@ function RunPanelBody({
    *  earlier" button together with `earliestId !== null`. */
   const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  /** True once the FIRST `listRuns` response for the CURRENT task has
+   *  landed (see the runs-poll effect below, which sets this — guarded by
+   *  that effect's own `cancelled` flag, so a late response for a task the
+   *  user has already switched away from can never flip it). Drives the
+   *  transcript's loading skeleton: `runs.length === 0` and
+   *  `displayedEvents.length === 0` both read as "nothing here" whether the
+   *  task genuinely has no runs yet or its runs just haven't loaded — this
+   *  flag is what tells those two states apart so a freshly opened task
+   *  shows "Loading messages…" instead of a premature "no runs yet". */
+  const [runsLoaded, setRunsLoaded] = useState(false);
+  // ── Stream-first gating for non-essential fetches ─────────────────────────
+  // Git status and PR-mergeability (below, each declared later in this
+  // component) must not fire in the same burst as a task switch — they'd
+  // otherwise compete with the SSE subscription for the webview's shared
+  // per-host connection budget. Both wait on this gate instead: ready the
+  // instant the SSE subscription effect's `replay_meta` frame arrives for
+  // THIS task, or after STREAM_READY_FALLBACK_MS, whichever comes first
+  // (both signals are owned by the SSE subscription effect below). Refs,
+  // not state: `markStreamReady`/`awaitStreamReady` are called from inside
+  // async closures set up by effects declared later in the component, and a
+  // ref mutation is visible to those closures the instant it happens — no
+  // render latency — which matters because the reset effect right below and
+  // the SSE effect that marks readiness both fire within the same
+  // task-switch commit; a state-based gate could still be read stale by an
+  // effect that re-runs in that same commit before the state update lands.
+  const streamReadyRef = useRef(false);
+  const streamReadyWaitersRef = useRef<Array<() => void>>([]);
+  const markStreamReady = () => {
+    if (streamReadyRef.current) return;
+    streamReadyRef.current = true;
+    const waiters = streamReadyWaitersRef.current;
+    streamReadyWaitersRef.current = [];
+    for (const resolve of waiters) resolve();
+  };
+  const awaitStreamReady = (): Promise<void> => {
+    if (streamReadyRef.current) return Promise.resolve();
+    return new Promise<void>((resolve) => { streamReadyWaitersRef.current.push(resolve); });
+  };
 
-  // Reset on task switch (no remount because we no longer key on task.id).
-  // Re-arm the auto-scroll heuristic so opening a different task pins the
-  // viewport to the most recent message instead of inheriting the previous
-  // task's scrolled-up position.
+  // Reset on task switch (no remount because we no longer key on task.id —
+  // see `RunPanelBody`'s call site in `App.tsx`). Re-arm the auto-scroll
+  // heuristic so opening a different task pins the viewport to the most
+  // recent message instead of inheriting the previous task's scrolled-up
+  // position. This effect resets every piece of state in `RunPanelBody`
+  // that isn't itself keyed by task id or re-seeded from `task` via its own
+  // `useEffect` (`backlogItems`/`plans` above do that already) — the goal is
+  // that nothing task A produced (an in-flight send, a busy flag, cached
+  // git/PR status) is visible while task B's panel is still catching up.
   useEffect(() => {
     setEvents([]);
     eventsRef.current = [];
@@ -694,6 +746,15 @@ function RunPanelBody({
     setSearchQuery("");
     setActiveMatchId(null);
     nearBottomRef.current = true;
+    setRuns([]);
+    setRunsLoaded(false);
+    // Resolve any waiters a still-tearing-down previous task's git-status/
+    // PR-mergeability effects left pending — each one's own `cancelled` flag
+    // (captured in its effect's cleanup) makes the resume a no-op, so this
+    // just prevents the promise from dangling forever unresolved.
+    for (const resolve of streamReadyWaitersRef.current) resolve();
+    streamReadyWaitersRef.current = [];
+    streamReadyRef.current = false;
     // Old task's PR mergeability (and "Resolve Conflicts" send confirmation)
     // must not survive into the new task: RunPanelBody isn't remounted on
     // task switch, so without this a stale `prStatus` from task A could sit
@@ -705,7 +766,22 @@ function RunPanelBody({
     // executed at least once.
     setPrStatus(null);
     setPrStatusError(null);
+    setPrStatusLoading(false);
     setResolveConflictsSent(false);
+    setResolvingConflicts(false);
+    setSending(false);
+    setSendHint(null);
+    setBacklogBusy(false);
+    setRebuildBusy(false);
+    // fx-only busy flags (Resume / Cancel auto-resume buttons) — same per-task
+    // scope as `sending`: a click on task A must not leave B's button disabled.
+    setResumeBusy(false);
+    setCancelAutoBusy(false);
+    setGitStatus(null);
+    // `editingId` (the backlog tray's inline-editor state) lives inside the
+    // `BacklogTray` child component, not here — it's reset by keying that
+    // component on `task.id` at its call site below instead (a fresh mount
+    // per task), which is simpler than plumbing a reset callback down.
     if (prStatusRetryTimerRef.current) clearTimeout(prStatusRetryTimerRef.current);
     prStatusRetryTimerRef.current = null;
     if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
@@ -740,183 +816,31 @@ function RunPanelBody({
     }
   };
 
-  // Bootstrap any interactions that fired before the panel opened (race
-  // between claude tool calls and the panel mount). The SSE subscription
-  // picks up new ones from here on.
-  useEffect(() => {
-    let cancelled = false;
-    void api.listPendingInteractions(task.id).then((list) => {
-      if (cancelled) return;
-      setInteractions(list);
-    }).catch(() => { /* ignore — empty start is fine */ });
-    return () => { cancelled = true; };
-  }, [task.id]);
-
-  // Stable identity so RunEventList's memoized block tree isn't invalidated
-  // on every parent re-render (e.g. the 2s runs poll). `setInteractions` is a
-  // stable setter, so the empty dep list is correct.
-  const dismissInteraction = useCallback(
-    (id: string) => setInteractions((cur) => cur.filter((x) => x.id !== id)),
-    [],
-  );
-
-  // ── Poll gating (runs + subagents) ────────────────────────────────────────
-  // Both 2s polls below share the same "is there any reason to keep looking"
-  // condition: a run in flight, a subagent running, or an interaction waiting
-  // on the user. These booleans are read by each poll's own `evaluate()`
-  // (defined inside the effect so it can start/stop that effect's own timer)
-  // — refs, not plain closures, because `latestRun`/`subagentList`/
-  // `interactions` change on every render without re-running the poll effects
-  // (whose deps are just `[task.id, task.runId]` / `[task.id]`, deliberately,
-  // so an interaction resolving doesn't reset an in-flight interval). The
-  // kick/evaluate refs let the activity-change effect and the SSE handler
-  // below reach into a poll effect that was set up earlier without needing it
-  // in their own dependency arrays.
-  const runActiveRef = useRef(false);
-  const subagentActiveRef = useRef(false);
-  const interactionPendingRef = useRef(false);
-  const runsPollKickRef = useRef<() => void>(() => {});
-  const subagentsPollKickRef = useRef<() => void>(() => {});
-  const runsPollEvaluateRef = useRef<() => void>(() => {});
-  const subagentsPollEvaluateRef = useRef<() => void>(() => {});
-
-  useEffect(() => {
-    runActiveRef.current = latestRun?.status === "running";
-    subagentActiveRef.current = subagentList.some((s) => s.status === "running");
-    interactionPendingRef.current = interactions.length > 0;
-    // Re-arm (or re-suspend) both polls now that the activity picture changed
-    // — e.g. the latest run just resolved (stop) or a subagent just finished
-    // while the run was already idle (also stop; the reverse case, a run/
-    // subagent starting, is normally already covered by `task.runId`/mount
-    // effects below, but this keeps both polls honest either way).
-    runsPollEvaluateRef.current();
-    subagentsPollEvaluateRef.current();
-  }, [latestRun?.status, subagentList, interactions.length]);
-
-  useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
-    const load = async () => {
-      try {
-        const list = await api.listRuns(task.id);
-        if (cancelled) return;
-        setRuns((prev) => reconcileById(prev, list, (r) => r.id));
-      } catch { /* task may have been deleted */ }
-    };
-    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
-    const startTimer = () => {
-      if (timer) return;
-      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
-    };
-    // Mirrors whether the timer is currently (supposed to be) running.
-    // `evaluate()` is called on every SSE frame during a mid-turn flood (see
-    // the subscription effect's `runsPollEvaluateRef.current()` calls) — the
-    // early return below skips the `document.hidden`/ref reads and the
-    // start/stop call entirely once the desired state already matches,
-    // rather than re-deriving and re-applying the same state on every event.
-    let armed = false;
-    // Paused while the window is hidden (nothing to repaint) or once the task
-    // has gone fully idle (terminal run, no subagent running, no pending
-    // interaction) — resumed by `kick()` below on visible/focus or a live-sign
-    // SSE event, so a change on the server side is never missed for long.
-    const evaluate = () => {
-      const shouldRun = !document.hidden
-        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
-      if (shouldRun === armed) return;
-      armed = shouldRun;
-      if (shouldRun) startTimer(); else stopTimer();
-    };
-    const kick = () => {
-      if (!document.hidden) void load();
-      evaluate();
-    };
-    runsPollKickRef.current = kick;
-    runsPollEvaluateRef.current = evaluate;
-    void load(); // initial load on mount always happens, regardless of gating
-    evaluate();
-    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
-    const onFocus = () => kick();
-    document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", onFocus);
-    return () => {
-      cancelled = true;
-      stopTimer();
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", onFocus);
-    };
-  }, [task.id, task.runId]);
-
-  // Snapshot + poll the task's background/sub agents. The SSE `subagent` deltas
-  // keep this fresh live; the poll is a reopen/reconnect backstop (mirrors the
-  // runs poll). Merge rather than replace so an in-flight SSE delta isn't
-  // clobbered by a slightly-stale poll. Same visibility/idle gating as the
-  // runs poll above (own timer, shared activity refs).
-  useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
-    const load = async () => {
-      try {
-        const list = await api.listSubagents(task.id);
-        if (cancelled) return;
-        setSubagentList((cur) => {
-          // Union by id: the poll (DB) is authoritative on status, but keep any
-          // id we only know from a just-arrived SSE delta that the poll query
-          // raced. Sort by spawn order so tabs don't reshuffle.
-          const byId = new Map<string, Subagent>();
-          for (const s of cur) byId.set(s.id, s);
-          for (const s of list) byId.set(s.id, s);
-          // Identity-preserving: hand back `cur` itself when nothing changed,
-          // so this backstop poll can't re-render the whole open panel every
-          // 2s while a run merely streams (see `reconcileById`).
-          return reconcileById(
-            cur,
-            [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1)),
-            (s) => s.id,
-          );
-        });
-      } catch { /* task may have been deleted */ }
-    };
-    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
-    const startTimer = () => {
-      if (timer) return;
-      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
-    };
-    // See the runs-poll effect above for why this early-returns on a no-op
-    // state transition instead of re-deriving/re-applying on every call.
-    let armed = false;
-    const evaluate = () => {
-      const shouldRun = !document.hidden
-        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
-      if (shouldRun === armed) return;
-      armed = shouldRun;
-      if (shouldRun) startTimer(); else stopTimer();
-    };
-    const kick = () => {
-      if (!document.hidden) void load();
-      evaluate();
-    };
-    subagentsPollKickRef.current = kick;
-    subagentsPollEvaluateRef.current = evaluate;
-    void load();
-    evaluate();
-    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
-    const onFocus = () => kick();
-    document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", onFocus);
-    return () => {
-      cancelled = true;
-      stopTimer();
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", onFocus);
-    };
-  }, [task.id]);
-
   // One unified task-level stream: every event from every run, merged in
   // chronological order. Replaces the old per-run subscription so the
   // panel shows the whole conversation as a single scrollback.
+  //
+  // Declared BEFORE listPendingInteractions/listRuns/listSubagents (below)
+  // and every other one-shot fetch in this component — deliberately.
+  // Passive effects commit in declaration order, so on a task switch this
+  // effect's `api.subscribeTask` call (which opens the EventSource) fires
+  // before any of those `fetch()` calls are issued. The webview has a
+  // small, shared per-host connection budget (WKWebView observed at 6 at
+  // rest), and a switch used to fire ~8 one-shot requests ahead of the new
+  // task's own event stream — starving it behind whatever else was still
+  // in flight (e.g. another task's slow session restore). This effect also
+  // owns the `markStreamReady`/`awaitStreamReady` gate (declared above,
+  // near `runsLoaded`) that the git-status and PR-mergeability effects
+  // further below wait on before firing their own requests — see the
+  // `readyTimer` and the `meta` callback's `markStreamReady()` call below.
   useEffect(() => {
     setEvents([]);
     nextEventIdRef.current = 0;
+    // Fallback half of the stream-ready gate (see the comment above): if
+    // `replay_meta` (below) hasn't arrived within STREAM_READY_FALLBACK_MS,
+    // let the deferred fetches go anyway rather than waiting on a stream
+    // that may never connect (task deleted mid-switch, backend down).
+    const readyTimer = setTimeout(markStreamReady, STREAM_READY_FALLBACK_MS);
     // Collapse the dual-emit + replay duplicates the server stream carries
     // (live echo + JSONL twin per user message; full-history replay on every
     // reconnect). The deduper keeps `user` keys in a never-trimmed set so a
@@ -1131,6 +1055,12 @@ function RunPanelBody({
         buffer.push({ ...e, id: nextEventIdRef.current++, dbId });
       },
       (meta) => {
+        // First (successful) half of the stream-ready gate: this frame is
+        // always the very first thing the server sends on (re)connect (see
+        // below), so it's the earliest reliable signal that this task's
+        // stream is actually live — clear the deferral for git-status/
+        // PR-mergeability now instead of waiting out the fallback timer.
+        markStreamReady();
         // The server sends `replay_meta` as the FIRST frame of every (re)connect
         // — including an EventSource-internal reconnect after a network blip,
         // which reuses this same subscription/effect instance rather than
@@ -1155,11 +1085,203 @@ function RunPanelBody({
       },
     );
     return () => {
+      clearTimeout(readyTimer);
       buffer.dispose();
       if (kickTimer) clearTimeout(kickTimer);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onFocus);
       unsub();
+    };
+  }, [task.id]);
+
+  // Bootstrap any interactions that fired before the panel opened (race
+  // between claude tool calls and the panel mount). The SSE subscription
+  // picks up new ones from here on.
+  useEffect(() => {
+    let cancelled = false;
+    void api.listPendingInteractions(task.id).then((list) => {
+      if (cancelled) return;
+      setInteractions(list);
+    }).catch(() => { /* ignore — empty start is fine */ });
+    return () => { cancelled = true; };
+  }, [task.id]);
+
+  // Stable identity so RunEventList's memoized block tree isn't invalidated
+  // on every parent re-render (e.g. the 2s runs poll). `setInteractions` is a
+  // stable setter, so the empty dep list is correct.
+  const dismissInteraction = useCallback(
+    (id: string) => setInteractions((cur) => cur.filter((x) => x.id !== id)),
+    [],
+  );
+
+  // ── Poll gating (runs + subagents) ────────────────────────────────────────
+  // Both 2s polls below share the same "is there any reason to keep looking"
+  // condition: a run in flight, a subagent running, or an interaction waiting
+  // on the user. These booleans are read by each poll's own `evaluate()`
+  // (defined inside the effect so it can start/stop that effect's own timer)
+  // — refs, not plain closures, because `latestRun`/`subagentList`/
+  // `interactions` change on every render without re-running the poll effects
+  // (whose deps are just `[task.id, task.runId]` / `[task.id]`, deliberately,
+  // so an interaction resolving doesn't reset an in-flight interval). The
+  // kick/evaluate refs let the activity-change effect and the SSE handler
+  // below reach into a poll effect that was set up earlier without needing it
+  // in their own dependency arrays.
+  const runActiveRef = useRef(false);
+  const subagentActiveRef = useRef(false);
+  const interactionPendingRef = useRef(false);
+  const runsPollKickRef = useRef<() => void>(() => {});
+  const subagentsPollKickRef = useRef<() => void>(() => {});
+  const runsPollEvaluateRef = useRef<() => void>(() => {});
+  const subagentsPollEvaluateRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    runActiveRef.current = latestRun?.status === "running";
+    subagentActiveRef.current = subagentList.some((s) => s.status === "running");
+    interactionPendingRef.current = interactions.length > 0;
+    // Re-arm (or re-suspend) both polls now that the activity picture changed
+    // — e.g. the latest run just resolved (stop) or a subagent just finished
+    // while the run was already idle (also stop; the reverse case, a run/
+    // subagent starting, is normally already covered by `task.runId`/mount
+    // effects below, but this keeps both polls honest either way).
+    runsPollEvaluateRef.current();
+    subagentsPollEvaluateRef.current();
+  }, [latestRun?.status, subagentList, interactions.length]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    // Skips a tick while the previous `load()` for this same task is still
+    // in flight — a slow response (e.g. the server itself busy with another
+    // task's session restore) must not let ticks pile up into a burst of
+    // overlapping requests once it finally resolves. Reset on cleanup only
+    // implicitly (the effect instance, and this closure's `inFlight`, don't
+    // survive past task switch anyway).
+    let inFlight = false;
+    const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const list = await api.listRuns(task.id);
+        if (cancelled) return;
+        setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        // First response for this task — flips the transcript's loading
+        // skeleton off. Safe to call on every subsequent tick too: React
+        // bails out a same-value `setState(true)` without a re-render.
+        setRunsLoaded(true);
+      } catch { /* task may have been deleted */ }
+      finally { inFlight = false; }
+    };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // Mirrors whether the timer is currently (supposed to be) running.
+    // `evaluate()` is called on every SSE frame during a mid-turn flood (see
+    // the subscription effect's `runsPollEvaluateRef.current()` calls) — the
+    // early return below skips the `document.hidden`/ref reads and the
+    // start/stop call entirely once the desired state already matches,
+    // rather than re-deriving and re-applying the same state on every event.
+    let armed = false;
+    // Paused while the window is hidden (nothing to repaint) or once the task
+    // has gone fully idle (terminal run, no subagent running, no pending
+    // interaction) — resumed by `kick()` below on visible/focus or a live-sign
+    // SSE event, so a change on the server side is never missed for long.
+    const evaluate = () => {
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    runsPollKickRef.current = kick;
+    runsPollEvaluateRef.current = evaluate;
+    void load(); // initial load on mount always happens, regardless of gating
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [task.id, task.runId]);
+
+  // Snapshot + poll the task's background/sub agents. The SSE `subagent` deltas
+  // keep this fresh live; the poll is a reopen/reconnect backstop (mirrors the
+  // runs poll). Merge rather than replace so an in-flight SSE delta isn't
+  // clobbered by a slightly-stale poll. Same visibility/idle gating as the
+  // runs poll above (own timer, shared activity refs).
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    // See the runs-poll effect above for why a tick is skipped while the
+    // previous `load()` is still in flight.
+    let inFlight = false;
+    const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const list = await api.listSubagents(task.id);
+        if (cancelled) return;
+        setSubagentList((cur) => {
+          // Union by id: the poll (DB) is authoritative on status, but keep any
+          // id we only know from a just-arrived SSE delta that the poll query
+          // raced. Sort by spawn order so tabs don't reshuffle.
+          const byId = new Map<string, Subagent>();
+          for (const s of cur) byId.set(s.id, s);
+          for (const s of list) byId.set(s.id, s);
+          // Identity-preserving: hand back `cur` itself when nothing changed,
+          // so this backstop poll can't re-render the whole open panel every
+          // 2s while a run merely streams (see `reconcileById`).
+          return reconcileById(
+            cur,
+            [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1)),
+            (s) => s.id,
+          );
+        });
+      } catch { /* task may have been deleted */ }
+      finally { inFlight = false; }
+    };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // See the runs-poll effect above for why this early-returns on a no-op
+    // state transition instead of re-deriving/re-applying on every call.
+    let armed = false;
+    const evaluate = () => {
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    subagentsPollKickRef.current = kick;
+    subagentsPollEvaluateRef.current = evaluate;
+    void load();
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
     };
   }, [task.id]);
 
@@ -2339,9 +2461,19 @@ function RunPanelBody({
   // Deps are `[task.id]` ONLY — App.tsx polls /tasks every 2s and rebuilds
   // the task object each tick, so depending on `latestRun`/`task` fields
   // here would restart this effect (and its poll cadence) every 2s.
+  //
+  // The first fetch waits on `awaitStreamReady()` (declared near
+  // `runsLoaded`, above) — a non-essential request like this one must not
+  // compete with the new task's SSE connection in the switch burst; see the
+  // subscription effect's leading comment. Deferring the loop's START this
+  // way (rather than adding `streamReady` to the dependency array) keeps the
+  // 5s cadence itself untouched once the loop is running, and keeps this
+  // effect's deps exactly as they were.
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
+      await awaitStreamReady();
+      if (cancelled) return;
       while (!cancelled) {
         try {
           const res = await api.getTaskGitStatus(task.id);
@@ -2430,6 +2562,14 @@ function RunPanelBody({
   // rebuilds the task object every tick, and depending on the whole object
   // (or on `task.workdir`, read via closure below) would refetch on every
   // poll tick instead of only on an actual task/PR change.
+  //
+  // The "no PR" branch clears state immediately (there's no request to
+  // defer); the actual `fetchPrStatus` call waits on `awaitStreamReady()`
+  // (same non-essential-fetch deferral as the git-status effect above) so it
+  // doesn't compete with the new task's SSE connection in the switch burst.
+  // `cancelled` guards against a task switch (or a `task.prUrl` change)
+  // landing between the await and the fetch — `fetchPrStatus` itself would
+  // otherwise fire for a task this effect instance no longer represents.
   useEffect(() => {
     const parsed = parsePrUrl(task.prUrl);
     if (!parsed) {
@@ -2440,8 +2580,13 @@ function RunPanelBody({
       setPrStatusError(null);
       return;
     }
+    let cancelled = false;
     prStatusRetriesRef.current = 0;
-    fetchPrStatus(task.workdir, parsed.number);
+    void awaitStreamReady().then(() => {
+      if (cancelled) return;
+      fetchPrStatus(task.workdir, parsed.number);
+    });
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.id, task.prUrl]);
 
@@ -3154,7 +3299,15 @@ function RunPanelBody({
 
       <RunsList runs={runs} usageByRun={usageByRunId} providerByRun={providerByRunId} titleByRun={titleByRunId} />
 
-      <TerminalsSection task={task} />
+      {/* Keyed on task id: RunPanelBody itself isn't remounted on a task
+          switch (see the `[task.id]` reset effect above), so without this key
+          `TerminalsSection` — and the `TerminalView` it mounts — would keep
+          the previous task's open/closed state and sockets. Keying forces a
+          fresh mount per task, which both re-seeds the open/closed toggle
+          from the new task's `openTerminalCount` and, via `TerminalView`'s
+          own unmount, closes the previous task's terminal sockets instead of
+          leaking them across the switch. */}
+      <TerminalsSection key={task.id} task={task} />
 
       {showSubagentTabs && (
         <SubagentTabs
@@ -3235,7 +3388,9 @@ function RunPanelBody({
               </Button>
             </div>
           )}
-          {runs.length === 0 ? (
+          {!runsLoaded ? (
+            <div className="text-muted-foreground" data-testid="transcript-loading">Loading messages…</div>
+          ) : runs.length === 0 ? (
             <div className="text-muted-foreground">(no runs yet — press Run to start the agent)</div>
           ) : displayedEvents.length === 0 ? (
             <div className="text-muted-foreground">Waiting for the first event…</div>
@@ -3301,6 +3456,12 @@ function RunPanelBody({
           view-only (`readOnly`), so saved drafts aren't silently invisible. */}
       {activeStream === "main" && backlogItems.length > 0 && (
         <BacklogTray
+          // Keyed on task id so a switch between two tasks that both have
+          // backlog items remounts the tray instead of carrying over its
+          // internal `editingId` (RunPanelBody itself isn't remounted — see
+          // the `[task.id]` reset effect above, which resets everything IT
+          // owns but can't reach into a child's local state without this).
+          key={task.id}
           fileScope={fileScope}
           items={backlogItems}
           canSend={canSend && !modalPending}
@@ -4268,8 +4429,12 @@ function TerminalsSection({ task }: { task: Task }) {
   const count = task.openTerminalCount;
   // Seed open from the count at mount, then let the user own the toggle —
   // binding `open` to the polled count would re-expand the section whenever
-  // the count changes (e.g. closing one of two terminals). RunPanel remounts
-  // on task switch (keyed by id), so this re-seeds per task.
+  // the count changes (e.g. closing one of two terminals). `RunPanelBody`
+  // itself is NOT remounted on a task switch, but this section is keyed on
+  // `task.id` at its call site above, so it (and the `TerminalView` it
+  // mounts) gets a fresh instance per task — that's what re-seeds this open/
+  // closed state and closes the previous task's terminal sockets instead of
+  // carrying them over.
   const [open, setOpen] = useState(count > 0);
   return (
     <details

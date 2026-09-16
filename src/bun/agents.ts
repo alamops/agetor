@@ -1884,7 +1884,23 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     if (process.env.AGETOR_CLAUDE_DRIVER === "fake") {
       // Build the command anyway so the fake records the prompt going by;
       // the fake's behaviour doesn't depend on the argv shape.
-      buildCommand(harness, prompt, opts);      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });    }
+      buildCommand(harness, prompt, opts);
+      // Test hook: delay the SPAWN itself — i.e. the promise `spawnAgent`
+      // returns — rather than anything the fake agent emits afterward. This
+      // is distinct from `AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS` above, which
+      // delays a turn's *resolution* once the fake agent is already running;
+      // this one delays the caller (`startTask`/`sendInput`) from ever
+      // getting a `SpawnedAgent` back, reproducing a slow `spawnClaudeViaTmux`
+      // (e.g. a slow `tmux new-session`) without touching tmux at all. Exists
+      // for `docs/plans/task-details-blank-while-session-restores.md`'s
+      // bounded-spawn-await work (§3.1) and its tests. Unset/0/non-finite →
+      // no delay, byte-identical to today.
+      const spawnDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS ?? 0);
+      if (Number.isFinite(spawnDelayMs) && spawnDelayMs > 0) {
+        await Bun.sleep(spawnDelayMs);
+      }
+      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });
+    }
     // Pre-generate a session uuid when we're not resuming. The driver will
     // expect claude to write its JSONL at the deterministic path derived
     // from cwd + this uuid, replacing the previous mtime-poll race.

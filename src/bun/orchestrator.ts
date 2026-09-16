@@ -18,6 +18,7 @@ import {
   FX_RECOVERY_STATUS_PREFIX,
   IDLE_SESSION_REAP_MS,
   SESSION_DIED_STATUS_PREFIX,
+  SPAWN_RESPONSE_BUDGET_MS,
   TASK_TYPES,
   branchPattern,
   defaultModeFor,
@@ -917,6 +918,34 @@ async function spawnAgentOrFail(
 }
 
 /**
+ * Race a spawn-in-progress continuation promise against
+ * `SPAWN_RESPONSE_BUDGET_MS` (see that constant's doc) so a slow agent
+ * launch never holds an HTTP response open. Clears its timer on whichever
+ * side wins — the same discipline `resolveClaudeTurnOutcome` uses below for
+ * `PASTE_OUTCOME_TIMEOUT_MS` — so a settled-early spawn doesn't leave a
+ * timer running (which would otherwise hold the Bun test runner open for up
+ * to `ms` past the real settle on every test exercising this path).
+ *
+ * `p` must never reject — every caller here builds it from a continuation
+ * that already catches its own errors (mirroring `spawnAgentOrFail`, which
+ * never throws either), so a rejection reaching this helper would be a bug
+ * upstream, not something this helper papers over.
+ */
+async function raceSpawnBudget<T>(
+  p: Promise<T>,
+  ms: number,
+): Promise<{ settled: true; value: T } | { settled: false }> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<{ settled: false }>((resolve) => {
+    timer = setTimeout(() => resolve({ settled: false }), ms);
+  });
+  const settled = p.then((value): { settled: true; value: T } => ({ settled: true, value }));
+  const result = await Promise.race([settled, timeout]);
+  clearTimeout(timer!);
+  return result;
+}
+
+/**
  * Guards against two overlapping "mint a fresh run for this task" calls
  * racing each other. The same failure shape shows up at every entry point
  * that (a) reads `task.runId && active.has(task.runId)` (or, for claude,
@@ -957,25 +986,55 @@ async function spawnAgentOrFail(
  * / un-sendable for the remaining lifetime of the process — strictly better
  * than the old app-wide synchronous hang this replaced, and scoped to one
  * task rather than the whole app. Revisit if/when that op grows a timeout.
+ *
+ * `SPAWN_RESPONSE_BUDGET_MS` (see that constant's doc) does NOT shrink the
+ * window this claim closes: `startTaskInner` and `spawnResumedSession`
+ * (claude's fresh-spawn path) both respond to their HTTP caller once the
+ * budget elapses, before the underlying `spawnAgentOrFail` has necessarily
+ * settled, but the claim itself is released by the detached continuation's
+ * own `finally` once the spawn actually settles — not by the wrapper that
+ * took the claim returning early. A second overlapping call during that
+ * still-pending stretch keeps hitting the "already starting" guard above for
+ * as long as the real spawn takes, exactly as it did before the budget was
+ * bounded.
  */
 const startingTaskIds = new Set<string>();
 
+/**
+ * Start (or restart) a task's agent. Bounded per `SPAWN_RESPONSE_BUDGET_MS`
+ * (see that constant's doc): once the run row exists, the task has flipped
+ * to `running`, and the initial prompt has been echoed as a `user` event,
+ * this responds as soon as either the spawn settles OR the budget elapses —
+ * whichever comes first. On the fast path (spawn settles within budget) the
+ * result is byte-identical to before this bound existed. On the slow path
+ * the result additionally carries `pending: true`: the spawn is still
+ * running detached, and the caller learns the real outcome (success,
+ * failure, session-died, …) from the task's normal event stream rather than
+ * from this HTTP response. See `startingTaskIds`'s doc above for how the
+ * "already starting" claim survives past this function returning early.
+ */
 export async function startTask(
   taskId: string,
-): Promise<{ runId: string; unresolvedRefs?: string[] } | { error: string }> {
+): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
   if (startingTaskIds.has(taskId)) return { error: "task is already starting" };
   startingTaskIds.add(taskId);
-  try {
-    return await startTaskInner(taskId, task);
-  } finally {
-    startingTaskIds.delete(taskId);
-  }
+  return startTaskInner(taskId, task);
 }
 
-async function startTaskInner(taskId: string, task: Task): Promise<{ runId: string; unresolvedRefs?: string[] } | { error: string }> {
+async function startTaskInner(
+  taskId: string,
+  task: Task,
+): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string }> {
+  // Whether ownership of releasing the `startingTaskIds` claim (added by
+  // `startTask` above) has been handed off to the detached spawn
+  // continuation created further down (see its own `finally`). Every return
+  // path ABOVE that point (harness checks, worktree prep, prompt budget, …)
+  // still owns the release itself, via the `finally` below.
+  let claimTransferred = false;
+  try {
   // startTask auto-unarchives and materializes the worktree below — it must
   // not race a teardown archiveTask (or deleteTask) deferred for this task,
   // or a `detachWorktree`/`removeWorktree` still in flight could yank the
@@ -1158,7 +1217,7 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
   // up.
   onChunk("user", normalizeUserText(promptWithRefs));
 
-  const { agent, message } = await spawnAgentOrFail({
+  const spawnArgs: SpawnAgentArgs = {
     taskId,
     runId,
     harness,
@@ -1177,25 +1236,82 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
         : { fxSessionId: sessionId });
     },
     opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, fast: task.fast, maxMode: task.maxMode },
-  });
-  if (!agent) return { error: `failed to start agent: ${message}` };
-  registerActiveRun(runId, taskId, task, agent);
-  emit({
-    runId,
-    taskId,
-    stream: "status",
-    // A stored `null` mode doesn't spawn as a literal "auto" for every kind
-    // (Phase 8 review #3) — `buildCommand` resolves it via `defaultModeFor`,
-    // which is `yolo` for fx since `AGENT_OPTIONS.fx.modes[0]` is "Full
-    // access", not "auto". Mirror that same resolution here so the opening
-    // breadcrumb reports what actually launched.
-    data: `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
-    ts: now,
-  });
+  };
 
-  attachDoneHandler(runId, taskId, agent);
+  // Everything from here on — the actual spawn and everything that depends
+  // on its result — runs as a detached continuation raced against
+  // `SPAWN_RESPONSE_BUDGET_MS` (see that constant's doc). The run row, the
+  // `running` column flip and the `user` echo above are already persisted,
+  // which is all a caller needs to render this task — a slow spawn (claude
+  // `--resume` alone can take 5-30s in practice) no longer holds this HTTP
+  // response open waiting for it. Ownership of releasing the
+  // `startingTaskIds` claim moves to the continuation's own `finally` right
+  // here — NOT when this function returns, and NOT when the race below
+  // resolves via the budget timing out — so a second overlapping start for
+  // this task keeps hitting the "already starting" guard for as long as the
+  // real spawn takes.
+  claimTransferred = true;
+  const continuation: Promise<{ ok: true } | { ok: false; message: string }> = (async () => {
+    try {
+      const { agent, message } = await spawnAgentOrFail(spawnArgs);
+      if (!agent) return { ok: false as const, message: message ?? "unknown error" };
 
+      // Ownership guard: by the time the spawn settles the task may have
+      // been deleted, or this run may no longer be the task's current run
+      // (replaced by a later send/start, or cancelled) while the spawn was
+      // still in flight. Registering against a stale task would leak a live
+      // session nothing else knows about.
+      const fresh = tasks.get(taskId);
+      if (!fresh || fresh.runId !== runId) {
+        agent.kill();
+        if (harness.kind === "claude-code") await dropSession(taskId);
+        runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+        return { ok: true as const };
+      }
+
+      registerActiveRun(runId, taskId, fresh, agent);
+      emit({
+        runId,
+        taskId,
+        stream: "status",
+        // A stored `null` mode doesn't spawn as a literal "auto" for every
+        // kind (Phase 8 review #3) — `buildCommand` resolves it via
+        // `defaultModeFor`, which is `yolo` for fx since
+        // `AGENT_OPTIONS.fx.modes[0]` is "Full access", not "auto". Mirror
+        // that same resolution here so the opening breadcrumb reports what
+        // actually launched.
+        data: `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
+        ts: now,
+      });
+      attachDoneHandler(runId, taskId, agent);
+      return { ok: true as const };
+    } catch (err) {
+      // `spawnAgentOrFail` never throws (it catches internally and already
+      // records the run failed / bounces the task to `ready`) — this is
+      // belt-and-braces against a throw anywhere else in this continuation,
+      // e.g. the ownership-guard cleanup above.
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[agetor] detached spawn continuation failed for task ${taskId} run ${runId}:`, err);
+      return { ok: false as const, message };
+    } finally {
+      startingTaskIds.delete(taskId);
+    }
+  })();
+
+  const raced = await raceSpawnBudget(continuation, SPAWN_RESPONSE_BUDGET_MS);
+  if (!raced.settled) {
+    // Spawn is still running detached — `spawnAgentOrFail`'s existing
+    // failure handling (run `failed`, task back to `ready`, stderr chunk)
+    // simply happens after this response now, same as the ownership-guard
+    // cleanup above; the caller learns either outcome from the task's event
+    // stream / column, not from this result.
+    return { runId, pending: true, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
+  }
+  if (!raced.value.ok) return { error: `failed to start agent: ${raced.value.message}` };
   return { runId, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
+  } finally {
+    if (!claimTransferred) startingTaskIds.delete(taskId);
+  }
 }
 
 /** Cheap pre-filter before doing the more expensive JSON-parse + DB query a
@@ -2595,9 +2711,19 @@ export async function cancelRun(runId: string): Promise<boolean> {
  * cwd — a typo, a file not present in this cwd's tree, or an `@name`
  * extension mention (`@github`) are all indistinguishable here; the server
  * reports the fact, callers decide what's noise.
+ *
+ * `pending` (delivered variant only, omitted whenever falsy): set when
+ * claude's dead/no-session mint path (`sendClaudeTurn` → `spawnResumedSession`)
+ * responded before its underlying `claude --resume` spawn actually settled —
+ * see `SPAWN_RESPONSE_BUDGET_MS`'s doc. The run row, the `running` column
+ * flip and the `user` event are already persisted at that point (this is
+ * still `delivered: true`, not a new outcome kind); the spawn keeps running
+ * detached and the caller learns its real outcome from the task's normal
+ * event stream. Every other dispatch path (fold-while-busy, codex/cursor/
+ * gemini/fx's queue-and-resume) is unaffected and never sets this.
  */
 export type SendInputResult =
-  | { delivered: true; runId: string; unresolvedRefs?: string[] }
+  | { delivered: true; runId: string; unresolvedRefs?: string[]; pending?: true }
   | { delivered: false; reason: string; withheld?: true; savedToBacklog?: true };
 
 /**
@@ -2640,6 +2766,17 @@ export type SendInputResult =
  * (e.g. the branch was deleted or checked out elsewhere) is surfaced as a
  * `delivered: false` result rather than silently falling back to an
  * unisolated cwd.
+ *
+ * Bounded wait: claude's dead/no-session mint path (idle send with no live
+ * tmux session — `sendClaudeTurn` → `spawnResumedSession`) never holds this
+ * promise open past `SPAWN_RESPONSE_BUDGET_MS` waiting for the underlying
+ * `claude --resume` spawn, which has taken 5-30s in practice (see that
+ * constant's doc). When the spawn hasn't settled by then, this resolves
+ * `{ delivered: true, runId, pending: true }` — the run row, column flip and
+ * `user` event are already persisted, which is what the caller needs to
+ * render — and the spawn keeps running detached. Every other path (folding
+ * into an active run, and codex/cursor/gemini/fx's queue-and-resume) is
+ * unaffected and never sets `pending`.
  */
 export async function sendInput(runId: string, line: string): Promise<SendInputResult> {
   const row = db.query<{ task_id: string; agent: string }, [string]>(
@@ -2736,7 +2873,12 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
       }
       return { delivered: false, reason: result.reason };
     }
-    return { delivered: true, runId: result.runId, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
+    return {
+      delivered: true,
+      runId: result.runId,
+      ...(unresolvedRefs.length ? { unresolvedRefs } : {}),
+      ...(result.pending ? { pending: true as const } : {}),
+    };
   }
   // The four `send*Turn` helpers below return `null` in two cases: the task
   // vanished between `sendInput`'s own lookup above and their internal
@@ -4101,7 +4243,14 @@ export async function resumeFxRecovery(
  *
  *   • `delivered: true` — the paste landed (or no `pasteOutcome` was offered
  *     to await, e.g. `spawnResumedSession`'s fresh-spawn path, which has no
- *     live modal to withhold against).
+ *     live modal to withhold against). `pending: true` rides along on this
+ *     variant only, and only from `spawnResumedSession`'s fresh-spawn path:
+ *     the message WAS recorded (run row inserted, task flipped to `running`,
+ *     `user` event appended) but the actual `claude --resume` process spawn
+ *     is still running detached past `SPAWN_RESPONSE_BUDGET_MS` — see that
+ *     constant's doc. Omitted (never `false`) whenever the spawn settled
+ *     within budget, so this result stays byte-identical to before the
+ *     budget existed on the fast path.
  *   • `delivered: false; withheld: true` — the underlying `PasteOutcome` was
  *     specifically the modal-guard withhold (a blocking claude modal was
  *     still on the pane when the paste's grace window elapsed). This is the
@@ -4117,7 +4266,7 @@ export async function resumeFxRecovery(
  *     withheld/savedToBacklog framing.
  */
 type ClaudeTurnResult =
-  | { runId: string; delivered: true }
+  | { runId: string; delivered: true; pending?: true }
   | { runId: string; delivered: false; withheld: true }
   | { runId: string; delivered: false; withheld: false; reason: string };
 
@@ -4225,6 +4374,13 @@ async function resolveClaudeTurnOutcome(
  * (there are none in production — `sendInput` always passes it — but keeping
  * it optional avoids forcing every test/helper caller to thread a value that
  * happens to equal `line` anyway).
+ *
+ * The dead/no-session mint branch (`spawnResumedSession`) may resolve before
+ * its underlying `claude --resume` spawn has actually settled — bounded by
+ * `SPAWN_RESPONSE_BUDGET_MS` — in which case the returned `ClaudeTurnResult`
+ * carries `pending: true` alongside `delivered: true`. The fold-while-busy
+ * paste path (`pasteFollowUp`, above) never does this — a live-session paste
+ * is fast and has no comparable spawn to bound.
  */
 async function sendClaudeTurn(taskId: string, line: string, rawLine?: string): Promise<ClaudeTurnResult | null> {
   const task = tasks.get(taskId);
@@ -4261,13 +4417,19 @@ async function sendClaudeTurn(taskId: string, line: string, rawLine?: string): P
     };
   }
   startingTaskIds.add(taskId);
-  try {
-    // A fresh spawn has no live modal to withhold a keystroke against, so
-    // there's no `pasteOutcome` to await here — always delivered.
-    return { runId: await spawnResumedSession(task, taskId, line), delivered: true };
-  } finally {
-    startingTaskIds.delete(taskId);
-  }
+  // A fresh spawn has no live modal to withhold a keystroke against, so
+  // there's no `pasteOutcome` to await here — always delivered. Unlike
+  // before `SPAWN_RESPONSE_BUDGET_MS` existed, this call is NOT wrapped in a
+  // `try/finally` that releases the `startingTaskIds` claim once it returns:
+  // `spawnResumedSession` may now return before its underlying spawn has
+  // settled (see `pending` below), and releasing the claim here would let a
+  // second overlapping send start racing behind a spawn that's still in
+  // flight. `spawnResumedSession` itself owns releasing the claim — via its
+  // detached continuation's own `finally` on the slow path, or synchronously
+  // before returning on every path that never reaches that continuation
+  // (missing harness, a synchronous throw during its own setup).
+  const { runId, pending } = await spawnResumedSession(task, taskId, line);
+  return { runId, delivered: true, ...(pending ? { pending: true as const } : {}) };
 }
 
 /**
@@ -4617,8 +4779,48 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
  *
  * Reuses the existing worktree (`task.worktreePath`) so the agent operates
  * on the same checkout as before.
+ *
+ * Only the run-row insert, the column flip and the `user`/`status` echoes
+ * are synchronous. The actual `claude --resume` spawn — which in practice
+ * has taken 5-30s in the packaged app (see
+ * `docs/plans/task-details-blank-while-session-restores.md` §2) — runs as a
+ * detached continuation raced against `SPAWN_RESPONSE_BUDGET_MS`: this
+ * function returns as soon as either the spawn settles or the budget
+ * elapses, whichever comes first. `sendClaudeTurn` (this function's only
+ * caller) has already claimed `startingTaskIds` for `taskId` before calling
+ * in; releasing that claim is THIS function's responsibility on every
+ * return path — either synchronously (missing-harness branch) or via the
+ * continuation's own `finally` once the real spawn settles, never merely
+ * once this promise resolves. See `startingTaskIds`'s doc (near `startTask`)
+ * for why the claim must outlive a budget-triggered early return.
  */
-async function spawnResumedSession(task: Task, taskId: string, line: string): Promise<string> {
+async function spawnResumedSession(
+  task: Task,
+  taskId: string,
+  line: string,
+): Promise<{ runId: string; pending?: true }> {
+  try {
+    return await spawnResumedSessionInner(task, taskId, line);
+  } catch (err) {
+    // A synchronous throw anywhere before the continuation was created
+    // (below) means no continuation exists to release the claim in its own
+    // `finally` — release it here instead, matching this function's
+    // pre-budget behavior, where any such throw propagated straight through
+    // `sendClaudeTurn`'s old `finally { startingTaskIds.delete(taskId) }`.
+    // Once the continuation exists, `raceSpawnBudget` never rejects (it
+    // never throws itself, and the continuation catches its own errors), so
+    // this catch can't fire for anything the continuation is responsible
+    // for — no double-delete risk.
+    startingTaskIds.delete(taskId);
+    throw err;
+  }
+}
+
+async function spawnResumedSessionInner(
+  task: Task,
+  taskId: string,
+  line: string,
+): Promise<{ runId: string; pending?: true }> {
   const priorSessionId = findLastClaudeSessionId(taskId);
   const cwd = task.worktreePath ?? task.workdir;
 
@@ -4660,34 +4862,68 @@ async function spawnResumedSession(task: Task, taskId: string, line: string): Pr
     onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
     runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
     tasks.update(taskId, { column: "ready", runId: null });
-    return newRunId;
+    // No continuation was ever created for this run — release the claim
+    // `sendClaudeTurn` took before calling in, right here.
+    startingTaskIds.delete(taskId);
+    return { runId: newRunId };
   }
-  const { agent } = await spawnAgentOrFail({
-    taskId,
-    runId: newRunId,
-    harness,
-    prompt: line,
-    cwd,
-    onChunk,
-    onSessionId: (sessionId) => {
-      runs.update(newRunId, { claudeSessionId: sessionId });
-    },
-    opts: {
-      mode: task.mode,
-      model: task.model ?? DEFAULT_MODEL[harness.kind],
-      effort: task.effort,
-      fast: task.fast,
-      maxMode: task.maxMode,
-      resumeSessionId: priorSessionId,
-    },
-  });
-  // claude has no turn queue (spawnResumedSession is only reached from the
-  // idle branch of sendInput) — nothing to drop on failure here.
-  if (!agent) return newRunId;
 
-  registerActiveRun(newRunId, taskId, task, agent);
-  attachDoneHandler(newRunId, taskId, agent);
-  return newRunId;
+  // Everything past this point — the spawn itself and everything that
+  // depends on its result — is the detached continuation raced below.
+  const continuation: Promise<void> = (async () => {
+    try {
+      const { agent } = await spawnAgentOrFail({
+        taskId,
+        runId: newRunId,
+        harness,
+        prompt: line,
+        cwd,
+        onChunk,
+        onSessionId: (sessionId) => {
+          runs.update(newRunId, { claudeSessionId: sessionId });
+        },
+        opts: {
+          mode: task.mode,
+          model: task.model ?? DEFAULT_MODEL[harness.kind],
+          effort: task.effort,
+          fast: task.fast,
+          maxMode: task.maxMode,
+          resumeSessionId: priorSessionId,
+        },
+      });
+      // claude has no turn queue (spawnResumedSession is only reached from
+      // the idle branch of sendInput) — nothing to drop on failure here;
+      // `spawnAgentOrFail`'s own catch already recorded the run failed and
+      // bounced the task back to `ready`.
+      if (!agent) return;
+
+      // Ownership guard: by the time the spawn settles the task may have
+      // been deleted, or this run may no longer be the task's current run
+      // (replaced by a later send/start, or cancelled) while the spawn was
+      // still in flight. Registering against a stale task would leak a live
+      // tmux session nothing else knows about.
+      const fresh = tasks.get(taskId);
+      if (!fresh || fresh.runId !== newRunId) {
+        agent.kill();
+        await dropSession(taskId);
+        runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+        return;
+      }
+
+      registerActiveRun(newRunId, taskId, fresh, agent);
+      attachDoneHandler(newRunId, taskId, agent);
+    } catch (err) {
+      // `spawnAgentOrFail` never throws (it catches internally) — this is
+      // belt-and-braces against a throw anywhere else in this continuation,
+      // e.g. the ownership-guard cleanup above.
+      console.warn(`[agetor] detached claude resume spawn failed for task ${taskId} run ${newRunId}:`, err);
+    } finally {
+      startingTaskIds.delete(taskId);
+    }
+  })();
+
+  const raced = await raceSpawnBudget(continuation, SPAWN_RESPONSE_BUDGET_MS);
+  return raced.settled ? { runId: newRunId } : { runId: newRunId, pending: true };
 }
 
 /**

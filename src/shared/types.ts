@@ -3350,6 +3350,21 @@ export const EVENTS_WINDOW_MAX = 3000;
  *  listeners ignore it, so old clients are unaffected. */
 export const TASK_EVENTS_REPLAY_META_EVENT = "replay_meta";
 
+/**
+ * Bound on how long `POST /runs/:id/input` and `POST /tasks/:id/start` will
+ * hold their HTTP response waiting for the agent's spawn to settle (e.g. a
+ * claude `--resume` session boot, which can take 5–30s — see
+ * `docs/plans/task-details-blank-while-session-restores.md` §2). The run
+ * row, the `running` column flip and the initial `user` event are already
+ * persisted well before the spawn resolves, which is all the webview needs
+ * to render — so once this budget elapses the response returns immediately
+ * with `pending: true` and the spawn keeps running detached; the caller
+ * learns the outcome from the task/run's normal SSE stream instead of from
+ * the HTTP response. When the spawn settles inside the budget, the response
+ * is byte-identical to today's (no `pending` key at all).
+ */
+export const SPAWN_RESPONSE_BUDGET_MS = 1500;
+
 /** Payload of the {@link TASK_EVENTS_REPLAY_META_EVENT} frame. */
 export interface TaskEventsReplayMeta {
   /** DB id of the earliest event included in the replayed window, or null when

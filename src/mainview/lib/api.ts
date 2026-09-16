@@ -1239,7 +1239,9 @@ export const api = {
   moveTask: (id: string, column: ColumnId) =>
     j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify({ column }) }),
   deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),
-  startTask: (id: string) => j<{ runId: string }>(`/tasks/${id}/start`, { method: "POST" }),
+  // `pending: true` (optional): the server returned before the agent spawn
+  // finished; the run row already exists (task-details-blank-while-session-restores.md §3.1).
+  startTask: (id: string) => j<{ runId: string; pending?: true }>(`/tasks/${id}/start`, { method: "POST" }),
   /** `force: true` bypasses the done-column gate (still rejects an active
    *  run) — used by the Worktrees page's "Archive & delete" flow to archive
    *  a stale worktree's task regardless of its current column. `stopRun:
@@ -1354,7 +1356,9 @@ export const api = {
       // `unresolvedRefs` = raw `@` tokens the server-side expansion left
       // verbatim. The webview deliberately doesn't render it post-send —
       // PromptComposer's inline warning covers it pre-send.
-      | { delivered: true; runId: string; unresolvedRefs?: string[] }
+      // `pending: true` (optional): the server returned before the agent spawn
+      // finished; the run row already exists (task-details-blank-while-session-restores.md §3.1).
+      | { delivered: true; runId: string; unresolvedRefs?: string[]; pending?: true }
       | { delivered: false; reason: string; withheld?: boolean; savedToBacklog?: boolean }
     >(
       `/runs/${runId}/input`,

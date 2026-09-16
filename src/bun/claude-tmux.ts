@@ -6587,6 +6587,40 @@ const DEFERRED_PROMPT_POLL_MS = 400;
 const DEFERRED_PROMPT_TIMEOUT_MS = 30_000;
 
 /**
+ * Threshold (ms) for the combined time `spawnClaudeViaTmux` spends awaiting
+ * its three pre-launch stages — `killTaskSession`, `ensureInstalledForCwd`,
+ * `tmux new-session` — before the launch is flagged as slow. Headless
+ * measurements run this trio in 24–38ms; the owner's packaged app has been
+ * observed taking 5–31s on a resume with nothing today saying which stage
+ * was slow (docs/plans/task-details-blank-while-session-restores.md
+ * §2/§3.2). Crossing it only adds observability (a `console.warn` breakdown
+ * and one `status` chunk) — it never changes control flow or timing.
+ */
+export const SLOW_LAUNCH_WARN_MS = 5_000;
+let slowLaunchWarnMs: number = SLOW_LAUNCH_WARN_MS;
+/** Test seam for `SLOW_LAUNCH_WARN_MS`. Pass `null` to restore the default.
+ *  Returns the previous value — save/restore like `setContinuationWatchdogMs`
+ *  so one test's override can't leak into the next file's run. */
+export function setSlowLaunchWarnMs(ms: number | null): number {
+  const prev = slowLaunchWarnMs;
+  slowLaunchWarnMs = ms ?? SLOW_LAUNCH_WARN_MS;
+  return prev;
+}
+
+/** Pure formatter for the slow-launch `status` chunk text — kept free of any
+ *  side effect (no clock reads, no logging) so a unit test can pin the exact
+ *  string without spawning tmux. Stage values are expected pre-rounded to
+ *  whole milliseconds; the displayed total is their sum. */
+export function formatSlowLaunchStatus(stages: {
+  killMs: number;
+  settingsMs: number;
+  newSessionMs: number;
+}): string {
+  const totalMs = stages.killMs + stages.settingsMs + stages.newSessionMs;
+  return `session launch took ${(totalMs / 1000).toFixed(1)}s (kill ${stages.killMs}ms · settings ${stages.settingsMs}ms · tmux new-session ${stages.newSessionMs}ms)`;
+}
+
+/**
  * Start a new claude tmux session for the task. Two delivery modes for the
  * initial prompt, chosen by `agents.ts` before this is called:
  *
@@ -6600,7 +6634,11 @@ const DEFERRED_PROMPT_TIMEOUT_MS = 30_000;
  *     live-session follow-ups use — see the deferred-paste block below.
  *
  * Assumes `sessionExists(taskId)` is false; the caller (orchestrator) is
- * responsible for routing follow-up turns through `sendTurn`.
+ * responsible for routing follow-up turns through `sendTurn`. The three
+ * awaited pre-launch stages below are individually timed; if their combined
+ * total exceeds `SLOW_LAUNCH_WARN_MS` this logs a `console.warn` breakdown
+ * and emits one `status` chunk naming the slow stage(s), purely for
+ * observability — it never alters what gets spawned or when.
  */
 export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<SpawnedAgent> {
   const sessionName = sessionNameFor(opts.taskId);
@@ -6611,7 +6649,9 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // `reconcileOrphans`): an idle claude session survives a restart, so a fresh
   // run of the same task must reset it. Own-scoped (only this task's name) and
   // idempotent/silent on miss — mirrors codex's spawn pre-kill.
+  const spawnStageStart = performance.now();
   await killTaskSession(opts.taskId);
+  const afterKillAt = performance.now();
 
   // Clean up any stale agetor settings before tmux starts so claude reads a
   // tidy `.claude/settings.local.json` on launch. agetor is non-invasive: it
@@ -6622,6 +6662,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // self-heal-safe pass; user-repo cwds (isolation=none) get a merge pass
   // that preserves all existing user config.
   await ensureInstalledForCwd(opts.cwd, opts.mode);
+  const afterSettingsAt = performance.now();
 
   // Build the tmux command. `-e KEY=VAL` injects env vars into the new
   // session (so the spawned claude inherits them); `--` separates the tmux
@@ -6639,10 +6680,27 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   tmuxArgs.push("--", ...opts.argv);
 
   const launch = await tmux(tmuxArgs);
+  const afterNewSessionAt = performance.now();
   if (!launch.ok) {
     const err = new Error(`tmux new-session failed: ${launch.stderr || launch.stdout}`);
     opts.onChunk("stderr", err.message);
     return rejectedAgent(opts.taskId, err);
+  }
+
+  // Name the slow stage(s), if any, now that all three pre-launch awaits have
+  // settled. Deliberately placed here — before the boot IIFE further down
+  // emits its own `status` chunks (e.g. "ready (jsonl: …)") — so this
+  // breadcrumb, when it fires, is always the first status line on the run
+  // rather than being sandwiched after "ready"; it fires synchronously right
+  // after `launch` resolves, well before that IIFE's first await.
+  const killMs = Math.round(afterKillAt - spawnStageStart);
+  const settingsMs = Math.round(afterSettingsAt - afterKillAt);
+  const newSessionMs = Math.round(afterNewSessionAt - afterSettingsAt);
+  if (killMs + settingsMs + newSessionMs > slowLaunchWarnMs) {
+    console.warn(
+      `[claude-tmux] slow launch for ${sessionName}: kill ${killMs}ms · settings ${settingsMs}ms · tmux new-session ${newSessionMs}ms`,
+    );
+    opts.onChunk("status", formatSlowLaunchStatus({ killMs, settingsMs, newSessionMs }));
   }
 
   // The JSONL path is deterministic from cwd + session uuid (we passed
