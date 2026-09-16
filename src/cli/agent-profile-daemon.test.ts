@@ -230,4 +230,7 @@ test("agetor show <task>: prints the frozen 'profile:' line with a '(deleted)' s
   expect(rendered).toContain("profile:");
   expect(rendered).toContain(PROFILE_NAME_V2);
   expect(rendered).toContain("(deleted)");
+  // Pin the vocabulary rename (docs/plans/task-details-agent-row.md D4):
+  // the line is `profile: …`, not the pre-rename `agent profile: …`.
+  expect(rendered).not.toContain("agent profile:");
 });

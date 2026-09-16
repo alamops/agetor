@@ -442,17 +442,57 @@ test.describe("agent profiles", () => {
     await expect(bubble).toContainText("Your task:");
     await expect(bubble).toContainText("Do the thing");
 
-    // Task details: locked dropdowns + hint while bound.
+    // Task details: the Agent row's chip + Detach/Manage while bound; the
+    // Harness dropdown (the manual harness picker, renamed from "Agent" —
+    // docs/plans/task-details-agent-row.md D1/D3) has no <select> while
+    // locked, matching the hint text.
     await panel.getByText("Task details", { exact: true }).click();
     await expect(panel.getByTestId("task-agent-profile-hint")).toBeVisible();
-    await expect(detailsRow(panel, "Agent").locator("select")).toHaveCount(0);
+    const agentRow = detailsRow(panel, "Agent");
+    const detailsChip = agentRow.getByTestId("task-agent-profile-open");
+    await expect(detailsChip).toContainText(PROFILE_NAME);
+    await expect(agentRow.getByTestId("task-agent-profile-detach")).toBeVisible();
+    await expect(agentRow.getByTestId("task-agent-profile-manage")).toBeVisible();
+    await expect(detailsRow(panel, "Harness").locator("select")).toHaveCount(0);
     await expect(detailsRow(panel, "Model").locator("select")).toHaveCount(0);
+
+    // Clicking the chip opens the details dialog (D2) with the task's own
+    // frozen snapshot: name, harness, model, the full instructions, skills,
+    // and a "Frozen since the task's first run" status (the task has run).
+    await detailsChip.click();
+    const detailsDialog = page.getByTestId("agent-profile-details-dialog");
+    await expect(detailsDialog).toBeVisible();
+    await expect(detailsDialog).toContainText(PROFILE_NAME);
+    await expect(detailsDialog).toContainText("Claude Code");
+    await expect(detailsDialog).toContainText(PROFILE_INSTRUCTIONS);
+    await expect(detailsDialog).toContainText("/code-review");
+    await expect(detailsDialog).toContainText("/simplify");
+    await expect(detailsDialog.getByTestId("agent-profile-details-status")).toContainText(
+      "Frozen since the task's first run",
+    );
+
+    // "Edit in Settings" deep-links into Settings → Agents and closes the
+    // dialog on the way.
+    await detailsDialog.getByTestId("agent-profile-details-edit").click();
+    await expect(detailsDialog).toBeHidden();
+    const settingsDialog = page.getByRole("dialog");
+    await expect(settingsDialog.getByRole("heading", { name: "Settings" })).toBeVisible();
+    await expect(settingsDialog.getByTestId("agent-profiles-section")).toBeVisible();
+    await settingsDialog.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(settingsDialog).toBeHidden();
+
+    // Reopen the chip and close it via its own Close button this time.
+    await detailsChip.click();
+    await expect(detailsDialog).toBeVisible();
+    await detailsDialog.getByTestId("agent-profile-details-close").click();
+    await expect(detailsDialog).toBeHidden();
 
     // Detach unlocks them (allow the parent's 2s task poll to pick up the
     // server-side clear — RunPanel's own doc comment on `detachProfile`).
     await panel.getByTestId("task-agent-profile-detach").click();
     await expect(panel.getByTestId("task-agent-profile-hint")).toBeHidden({ timeout: 10_000 });
-    await expect(detailsRow(panel, "Agent").locator("select")).toBeEnabled({ timeout: 10_000 });
+    await expect(agentRow.getByTestId("task-agent-profile-none")).toHaveText("None");
+    await expect(detailsRow(panel, "Harness").locator("select")).toBeEnabled({ timeout: 10_000 });
   });
 
   test("Freeze after first run + live pickup on an unstarted task (REST)", async ({ page, request, backend }) => {
@@ -534,6 +574,27 @@ test.describe("agent profiles", () => {
     const chip = panel.getByTestId("task-agent-profile-chip");
     await expect(chip).toContainText(PROFILE_NAME);
     await expect(chip.getByTestId("agent-profile-card-deleted")).toBeVisible();
+
+    // Task details' own Agent-row chip carries the same "(deleted)" marker,
+    // and the details dialog reflects it too: a visible deleted badge and no
+    // "Edit in Settings" (there's nothing live left to edit).
+    await panel.getByText("Task details", { exact: true }).click();
+    const detailsChip = detailsRow(panel, "Agent").getByTestId("task-agent-profile-open");
+    await expect(detailsChip).toContainText(PROFILE_NAME);
+    await expect(detailsChip.getByTestId("agent-profile-card-deleted")).toBeVisible();
+    await detailsChip.click();
+    const detailsDialog = page.getByTestId("agent-profile-details-dialog");
+    await expect(detailsDialog).toBeVisible();
+    await expect(detailsDialog.getByTestId("agent-profile-details-deleted")).toBeVisible();
+    await expect(detailsDialog.getByTestId("agent-profile-details-edit")).toHaveCount(0);
+    // A deleted-profile task's status line leads with the deleted-profile
+    // copy regardless of run count (F1-3) — "no longer exists", not the
+    // ordinary frozen-since-first-run text.
+    await expect(detailsDialog.getByTestId("agent-profile-details-status")).toContainText(
+      "no longer exists",
+    );
+    await detailsDialog.getByTestId("agent-profile-details-close").click();
+    await expect(detailsDialog).toBeHidden();
 
     // Close the run panel first — its full-width backdrop otherwise
     // intercepts clicks meant for the New Task form underneath. The panel

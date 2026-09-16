@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import { Bot, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
@@ -27,15 +28,19 @@ const TITLE_ID = "agent-profile-details-title";
  * joined `summary` string), so that fallback path renders "—"/"none" for
  * those fields rather than guessing.
  *
- * Rendered directly (not portaled): `PlanDialog` and `AttachmentNotFoundDialog`
- * / `AttachmentOpenErrorDialog` — the closest analogs, also opened from
- * content inside `RunPanel`'s `<aside>` — render the shared `Dialog`
- * primitive in place too, with no `createPortal` escape hatch. `Dialog`'s
- * own `fixed inset-0` does get rebased under the aside's `translate-x`
- * transform the way CLAUDE.md's images section describes, but the effect is
- * simply that the overlay/panel are centered within the (wide) aside rather
- * than the full viewport — the same tradeoff those two dialogs already make,
- * so this one follows suit instead of introducing a new pattern.
+ * Portaled to `document.body`, mirroring `MdImage.tsx`'s pattern for its two
+ * attachment-failure dialogs (`AttachmentNotFoundDialog` /
+ * `AttachmentOpenErrorDialog`, portaled at their `MdImage` call site): this
+ * dialog is opened from content inside `RunPanel`'s `<aside>`, and a CSS
+ * transform on an ancestor — the aside's `translate-x` open/close
+ * transition — rebases a non-portaled `fixed` descendant to that ancestor
+ * instead of the viewport, so `Dialog`'s own `fixed inset-0` backdrop would
+ * end up centered within the (wide) aside rather than the full viewport.
+ * This is the same rule CLAUDE.md's task-context-menu section (item 9) and
+ * markdown-image-rendering section (item 14) both call out. `PlanDialog` is
+ * the one dialog opened from inside the aside that renders in place rather
+ * than portaling — not a pattern to follow here, since it predates both of
+ * those write-ups.
  */
 export function AgentProfileDetailsDialog({
   open,
@@ -70,8 +75,19 @@ export function AgentProfileDetailsDialog({
   const maxMode = snapshot?.maxMode ?? false;
   const instructions = (snapshot?.instructions ?? "").trim();
   const skills = snapshot?.skills ?? [];
+  // Status copy (finding F1-3): the orchestrator's `effectiveAgentProfile`
+  // freezes a task's profile as soon as EITHER the profile OR its harness no
+  // longer resolves — not only once the task has run — so `deleted` takes
+  // priority over the run-count-based copy below even at zero runs.
+  const statusText = deleted
+    ? "Frozen — the agent it was created from no longer exists."
+    : hasRun
+      ? "Frozen since the task's first run — edits to the agent no longer affect it."
+      : "Follows the live agent until the task's first run.";
 
-  return (
+  if (!open) return null;
+
+  return createPortal(
     <Dialog
       open={open}
       onClose={onClose}
@@ -91,9 +107,7 @@ export function AgentProfileDetailsDialog({
               )}
             </div>
             <p className="mt-1 text-[10px] text-muted-foreground" data-testid="agent-profile-details-status">
-              {hasRun
-                ? "Frozen since the task's first run — edits to the agent no longer affect it."
-                : "Follows the live agent until the task's first run."}
+              {statusText}
             </p>
           </div>
           <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close">
@@ -177,6 +191,7 @@ export function AgentProfileDetailsDialog({
           </Button>
         </div>
       </div>
-    </Dialog>
+    </Dialog>,
+    document.body,
   );
 }

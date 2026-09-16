@@ -314,9 +314,26 @@ test("agent/profile columns: a task with no agent profile shows the harness id i
   currentClient = makeClient([task({ agent: "claude-code" })]);
   await cmdLs([], flags);
 
-  const row = dataRowLine();
+  expect(outputs).toHaveLength(1);
+  const lines = outputs[0]!.split("\n");
+  const header = lines[0]!;
+  const row = lines[1]!;
+  expect(header).toContain("profile");
   expect(row).toContain("claude-code");
-  expect(row).toContain("-");
+
+  // Columns are fixed-width and left-aligned, so a column's header text and
+  // every row's cell text start at the same character offset — slice the
+  // row there and take up to the next column boundary (2+ spaces) to read
+  // the "profile" cell in isolation, rather than a bare `toContain("-")`
+  // that any row (e.g. the id column's dashes-free hex, or padding) could
+  // satisfy regardless of what the profile column actually renders.
+  const profileColStart = header.indexOf("profile");
+  expect(profileColStart).toBeGreaterThan(-1);
+  const profileCell = row.slice(profileColStart).split(/\s{2,}/)[0]!.trim();
+  expect(profileCell).toBe("-");
+  // Cross-checked against the name the sibling "bound" test below asserts
+  // renders for an actually-bound task — an unbound row must never show it.
+  expect(row).not.toContain("Reviewer");
 });
 
 test("agent/profile columns: a task bound to an agent profile shows the harness id in 'agent' and the profile's snapshot name in 'profile'", async () => {

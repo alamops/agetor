@@ -7,7 +7,7 @@
  * the bun-side orchestrator (`startTask`'s launch-prompt assembly and the
  * `/agent-profiles` route validation), the webview's client-side gemini
  * argv-budget pre-check (`promptByteOverage` must see the same text the
- * server will actually send), and the CLI (`agetor agent`/`agetor add
+ * server will actually send), and the CLI (`agetor profile`/`agetor add
  * --profile`). Kept free of runtime imports from either process side — see
  * `docs/plans/agent-profiles.md` for the full design.
  */
@@ -135,10 +135,10 @@ export function agentProfileSummary(p: {
 }
 
 /**
- * Resolve a user-typed `<id|name>` reference (CLI `--profile`, `agetor agent
- * show <ref>`, …) against a list of profiles. An exact `id` match wins
- * outright; otherwise a case-insensitive, trimmed `name` match is tried —
- * exactly one hit resolves, several is `"ambiguous agent \"<ref>\": matches
+ * Resolve a user-typed `<id|name>` reference (CLI `--profile`, `agetor
+ * profile show <ref>`, …) against a list of profiles. An exact `id` match
+ * wins outright; otherwise a case-insensitive, trimmed `name` match is tried
+ * — exactly one hit resolves, several is `"ambiguous agent \"<ref>\": matches
  * <names>"` (comma-and-space joined, in list order), and none is
  * `"unknown agent \"<ref>\""`. `ref` is trimmed before either comparison.
  */
@@ -161,6 +161,20 @@ export function matchAgentProfileRef(
     return { error: `ambiguous agent "${trimmed}": matches ${byName.map((p) => p.name).join(", ")}` };
   }
   return { error: `unknown agent "${trimmed}"` };
+}
+
+/**
+ * Rewrite a {@link matchAgentProfileRef} error's leading `unknown`/`ambiguous
+ * agent` to `… profile` — `matchAgentProfileRef` says "agent" in its error
+ * text by design (other, non-CLI consumers still use that vocabulary), but
+ * the CLI's own vocabulary is `agent` = harness, `profile` = agent profile
+ * (docs/plans/task-details-agent-row.md D4). Every CLI call site that
+ * surfaces a `matchAgentProfileRef` error to the user (`agetor profile`,
+ * `agetor add --profile`) must wrap it with this rather than let "unknown
+ * agent" leak through where "unknown profile" is meant.
+ */
+export function asProfileError(message: string): string {
+  return message.replace(/^(unknown|ambiguous) agent\b/, "$1 profile");
 }
 
 /**

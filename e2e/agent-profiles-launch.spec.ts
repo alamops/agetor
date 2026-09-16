@@ -547,6 +547,66 @@ test.describe("agent profiles: launch surfaces", () => {
     const bubble = panel.locator("div.rounded-br-md").filter({ hasText: BETA_PROMPT });
     await expect(bubble).toBeVisible();
     await expect(bubble.locator(".agetor-md")).toHaveText(BETA_PROMPT);
+
+    // Task details' Agent-row chip still names the (empty-instructions,
+    // no-skills) profile, and its details dialog reads "none" for both
+    // Skills and Instructions rather than rendering blank.
+    await panel.getByText("Task details", { exact: true }).click();
+    const detailsChip = detailsRow(panel, "Agent").getByTestId("task-agent-profile-open");
+    await expect(detailsChip).toContainText(BETA_NAME);
+    await detailsChip.click();
+    const detailsDialog = page.getByTestId("agent-profile-details-dialog");
+    await expect(detailsDialog).toBeVisible();
+    await expect(detailsDialog).toContainText(BETA_NAME);
+    await expect(detailsRow(detailsDialog, "Skills")).toHaveText("none");
+    const instructionsValue = detailsDialog
+      .getByText("Instructions", { exact: true })
+      .locator("xpath=following-sibling::*[1]");
+    await expect(instructionsValue).toHaveText("none");
+    await detailsDialog.getByTestId("agent-profile-details-close").click();
+    await expect(detailsDialog).toBeHidden();
+  });
+
+  test("Task details Agent row: unbound shows None; a not-yet-run bound task follows the live agent", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    // Unbound: no `agentProfileId` at all — the Agent row reads "None".
+    const plainTitle = `agent-profile-launch-plain ${randomUUID()}`;
+    const plainRes = await request.post(`${backend.apiBase}/tasks`, {
+      headers: auth(backend),
+      data: { title: plainTitle, prompt: "Do the thing", isolation: "none", workdir: tmpdir() },
+    });
+    expect(plainRes.ok(), `POST /tasks -> ${plainRes.status()}: ${await plainRes.text()}`).toBeTruthy();
+    const plainTask = (await plainRes.json()) as TaskRow;
+    createdTaskIds.push(plainTask.id);
+
+    await gotoApp(page, backend.bootBase);
+    const plainPanel = await openTask(page, plainTitle);
+    await plainPanel.getByText("Task details", { exact: true }).click();
+    await expect(detailsRow(plainPanel, "Agent").getByTestId("task-agent-profile-none")).toHaveText("None");
+    await closeTaskPanel(page, plainPanel);
+
+    // Bound but never started: the details dialog's status line says it
+    // still follows the LIVE profile, not a frozen snapshot (D2/A1).
+    const unstartedTitle = `agent-profile-launch-unstarted ${randomUUID()}`;
+    await createTaskWithProfile(request, backend, unstartedTitle, alphaId, "Do the thing");
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, unstartedTitle);
+    await panel.getByText("Task details", { exact: true }).click();
+    const detailsChip = detailsRow(panel, "Agent").getByTestId("task-agent-profile-open");
+    await expect(detailsChip).toContainText(ALPHA_NAME);
+    await detailsChip.click();
+    const detailsDialog = page.getByTestId("agent-profile-details-dialog");
+    await expect(detailsDialog).toBeVisible();
+    await expect(detailsDialog.getByTestId("agent-profile-details-status")).toContainText(
+      "Follows the live agent until the task's first run",
+    );
+    await detailsDialog.getByTestId("agent-profile-details-close").click();
+    await expect(detailsDialog).toBeHidden();
+    await closeTaskPanel(page, panel);
   });
 
   test("Task details bound state (Alpha): locked controls, hint, chip, fast Detach", async ({
@@ -570,16 +630,37 @@ test.describe("agent profiles: launch surfaces", () => {
     await panel.getByText("Task details", { exact: true }).click();
     await expect(panel.getByTestId("task-agent-profile-hint")).toBeVisible();
     await expect(panel.getByTestId("task-agent-profile-hint")).toContainText(ALPHA_NAME);
-    await expect(detailsRow(panel, "Agent").locator("select")).toHaveCount(0);
+    const agentRow = detailsRow(panel, "Agent");
+    const detailsChip = agentRow.getByTestId("task-agent-profile-open");
+    await expect(detailsChip).toContainText(ALPHA_NAME);
+    await expect(agentRow.getByTestId("task-agent-profile-detach")).toBeVisible();
+    await expect(agentRow.getByTestId("task-agent-profile-manage")).toBeVisible();
+    await expect(detailsRow(panel, "Harness").locator("select")).toHaveCount(0);
     await expect(detailsRow(panel, "Model").locator("select")).toHaveCount(0);
-    await expect(detailsRow(panel, "Agent")).toContainText("claude-code");
+    await expect(detailsRow(panel, "Harness")).toContainText("claude-code");
+
+    // Clicking the chip opens the details dialog (D2) with the task's own
+    // frozen snapshot.
+    await detailsChip.click();
+    const detailsDialog = page.getByTestId("agent-profile-details-dialog");
+    await expect(detailsDialog).toBeVisible();
+    await expect(detailsDialog).toContainText(ALPHA_NAME);
+    await expect(detailsDialog).toContainText("Claude Code");
+    await expect(detailsDialog).toContainText(ALPHA_INSTRUCTIONS);
+    await expect(detailsDialog).toContainText("/code-review");
+    await expect(detailsDialog.getByTestId("agent-profile-details-status")).toContainText(
+      "Frozen since the task's first run",
+    );
+    await detailsDialog.getByTestId("agent-profile-details-close").click();
+    await expect(detailsDialog).toBeHidden();
 
     // Detach merges the returned task's cleared fields optimistically — it
     // must not wait on the parent's 2s task poll (RunPanel's own
     // `detachProfile` doc comment).
     await panel.getByTestId("task-agent-profile-detach").click();
     await expect(panel.getByTestId("task-agent-profile-hint")).toBeHidden({ timeout: 500 });
-    await expect(detailsRow(panel, "Agent").locator("select")).toBeEnabled({ timeout: 500 });
+    await expect(agentRow.getByTestId("task-agent-profile-none")).toHaveText("None", { timeout: 500 });
+    await expect(detailsRow(panel, "Harness").locator("select")).toBeEnabled({ timeout: 500 });
   });
 
   test("Message history: picker strips the injected preamble before offering resend", async ({ page, backend }) => {

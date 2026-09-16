@@ -3250,7 +3250,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       },
 
       // Reusable, named launch presets (docs/plans/agent-profiles.md) — the
-      // "Agents" the New Task picker and `agetor agent`/`agetor add --profile`
+      // "Agents" the New Task picker and `agetor profile`/`agetor add --profile`
       // work against. Validation style mirrors /saved-prompts above: a
       // non-object body 400s, strings are trimmed, and the harness reference
       // is resolved via `harnesses.getByIdOrKind` exactly like every other

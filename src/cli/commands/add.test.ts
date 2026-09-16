@@ -773,9 +773,12 @@ describe("--profile", () => {
     const { client, createTaskCalls } = makeProfileClient([makeAgentProfile({ name: "Reviewer" })]);
     currentClient = client;
 
+    // `matchAgentProfileRef` itself says "agent" (shared, non-CLI vocabulary)
+    // — `cmdAdd` must rewrite it to "profile" via `asProfileError` before it
+    // reaches the user, same as `agetor profile`'s CLI boundary.
     await expect(
       cmdAdd(["--title", "T", "--prompt", "P", "--profile", "does-not-exist"], flags()),
-    ).rejects.toThrow(/unknown agent "does-not-exist"/);
+    ).rejects.toThrow(/unknown profile "does-not-exist"/);
     expect(createTaskCalls).toEqual([]);
   });
 
@@ -789,7 +792,7 @@ describe("--profile", () => {
 
     await expect(
       cmdAdd(["--title", "T", "--prompt", "P", "--profile", "Reviewer"], flags()),
-    ).rejects.toThrow(/ambiguous agent "Reviewer"/);
+    ).rejects.toThrow(/ambiguous profile "Reviewer"/);
     expect(createTaskCalls).toEqual([]);
   });
 

@@ -76,4 +76,10 @@
 
 ## 10. Landed notes
 
-_(after Phase 8)_
+Delivered on `feature/agents-creating-agents`: `5a3bd3c` plan · `3980a01` wave 1 (webview row + `AgentProfileDetailsDialog`, CLI `agetor profile` vocabulary, CLAUDE.md vocabulary paragraph + README Agents section) · the following commit: review fixes + e2e updates.
+
+**Review (Opus, `code-review` skill):** 0 critical · 1 major · 3 medium · 5 minor · 2 nits — all addressed: the Agent row's action cluster is gated on `profileLock || agentProfileDisplay` so Detach can never vanish while the lock holds (an unreadable snapshot now shows an "Unknown agent" marker, `task-agent-profile-unknown`, and a name-less hint); the details dialog is portaled to `document.body` (RunPanel's `<aside>` transform rebases `position: fixed` — `MdImage` precedent, not `PlanDialog`); the status line has a third "Frozen — the agent it was created from no longer exists." state; the chip button uses `aria-label`/`aria-expanded`; `asProfileError` moved to `src/shared/agent-profile.ts` and applied at both `agetor add --profile` throw sites; the wizard's profile step is labeled "Profile"; `agetor edit` rewords the server's `bound to agent` 409 to `bound to profile … (agetor edit <id> --detach-profile)` at the CLI boundary; stale `agetor agent` comments fixed; weak `ls`/daemon assertions tightened.
+
+**Tests:** typecheck clean; 2094 unit/integration tests pass (mainview, shared, CLI, bun agent-profile suites); all five agent-profile e2e specs 33/33 with `--workers=1`. Test ids: `task-agent-profile-open/none/unknown/detach/manage`, `agent-profile-details-dialog/-status/-deleted/-edit/-close`.
+
+**Ledger:** every in-run row landed; HTTP/JSON `agent` field kept as the harness id (documented in CLAUDE.md item 15's Vocabulary paragraph); board card unchanged.

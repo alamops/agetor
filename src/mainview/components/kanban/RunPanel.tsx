@@ -6274,292 +6274,316 @@ function TaskDetails({
   const nullModeFallback = modeOptions.some((m) => m.id === preferred)
     ? preferred
     : (modeOptions[0]?.id ?? "bypass");
+  // Hint-line name fallback (finding F1-1): prefer the resolved display's
+  // name, then the raw frozen snapshot's own name, and only fall back to
+  // "an unknown agent" copy when neither yields anything — never interpolate
+  // an empty quoted name into the sentence.
+  const agentProfileHintName = agentProfileDisplay?.name || task.agentProfile?.name || null;
+  // Action-cluster gate (finding F1-1): a task can be locked
+  // (`task.agentProfileId != null`) with no readable snapshot AND no
+  // matching live profile — malformed snapshot JSON, or a retired harness
+  // kind — in which case `agentProfileForCard` is null even though the row
+  // is very much bound to *something*. Gating on `profileLock` in addition
+  // to `agentProfileDisplay` (which is itself already non-null whenever
+  // `profileLock` is true — see `resolveTaskProfileDisplay`) keeps the
+  // Detach/Manage affordances reachable in that case instead of stranding
+  // the user behind a "None" row they can't escape.
+  const showAgentProfileActions = profileLock || agentProfileDisplay != null;
 
   return (
     <>
-    <details className="border-b border-border/60 px-3 py-2 text-xs">
-      <summary className="cursor-pointer text-muted-foreground">
-        <span className="text-[10px] uppercase tracking-wide">Task details</span>
-      </summary>
-      <div className="mt-2 space-y-2">
-        <div>
-          <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Prompt</div>
-          <p className="max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] leading-snug">{task.prompt}</p>
-        </div>
+      <details className="border-b border-border/60 px-3 py-2 text-xs">
+        <summary className="cursor-pointer text-muted-foreground">
+          <span className="text-[10px] uppercase tracking-wide">Task details</span>
+        </summary>
+        <div className="mt-2 space-y-2">
+          <div>
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Prompt</div>
+            <p className="max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] leading-snug">{task.prompt}</p>
+          </div>
 
-        {!editable && (
-          <p
-            className="text-[10px] italic text-muted-foreground"
-            data-testid={profileLock ? "task-agent-profile-hint" : undefined}
-          >
-            {profileLock
-              ? `Bound to agent "${agentProfileDisplay?.name ?? task.agentProfile?.name ?? ""}" — detach to edit.`
-              : "Stop the run to change agent / mode / model / effort."}
-          </p>
-        )}
+          {!editable && (
+            <p
+              className="text-[10px] italic text-muted-foreground"
+              data-testid={profileLock ? "task-agent-profile-hint" : undefined}
+            >
+              {profileLock
+                ? (agentProfileHintName
+                  ? `Bound to agent "${agentProfileHintName}" — detach to edit.`
+                  : "Bound to an unknown agent — detach to edit.")
+                : "Stop the run to change agent / mode / model / effort."}
+            </p>
+          )}
 
-        <dl className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1 text-[11px]">
-          <dt className="text-muted-foreground">Agent</dt>
-          <dd className="min-w-0">
-            {agentProfileDisplay && agentProfileForCard ? (
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  data-testid="task-agent-profile-open"
-                  aria-haspopup="dialog"
-                  title="View agent details"
-                  onClick={() => setProfileDialogOpen(true)}
-                  className="min-w-0 max-w-full rounded-full transition-opacity hover:opacity-80"
-                >
-                  <AgentProfileCard
-                    variant="chip"
-                    profile={agentProfileForCard}
-                    harnesses={harnesses}
-                    deleted={agentProfileDisplay.deleted}
-                  />
-                </button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-6 px-2 text-[10px]"
-                  data-testid="task-agent-profile-detach"
-                  disabled={runningLock || detaching}
-                  onClick={() => void detachProfile()}
-                >
-                  Detach
-                </Button>
-                <button
-                  type="button"
-                  data-testid="task-agent-profile-manage"
-                  onClick={onOpenSettingsAgents}
-                  className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                >
-                  Manage agents…
-                </button>
-              </div>
-            ) : (
-              <span data-testid="task-agent-profile-none" className="text-muted-foreground">
-                None
-              </span>
-            )}
-          </dd>
-
-          <dt className="text-muted-foreground">Harness</dt>
-          <dd className="min-w-0">
-            {editable ? (
-              <AgentSelect
-                value={task.agent}
-                harnesses={harnesses}
-                agents={agents}
-                onChange={onAgentChange}
-              />
-            ) : (
-              <span className="inline-flex items-center gap-1">
-                <AgentIcon kind={kind} className="size-3" /> {task.agent}
-              </span>
-            )}
-          </dd>
-
-          <dt className="text-muted-foreground">Mode</dt>
-          <dd className="min-w-0">
-            {editable ? (
-              <CompactSelect
-                value={task.mode ?? nullModeFallback}
-                options={modeOptions}
-                onChange={(mode) => void save({ mode })}
-              />
-            ) : (
-              <span>{task.mode ?? "—"}</span>
-            )}
-          </dd>
-
-          <dt className="flex items-center gap-1 text-muted-foreground">
-            Model
-            {editable && (
-              <Tooltip label="Refresh model list">
-                <button
-                  type="button"
-                  aria-label="Refresh model list"
-                  data-testid="refresh-models-details"
-                  disabled={refreshingModels}
-                  className={cn(
-                    "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
-                    refreshingModels && "animate-spin",
+          <dl className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1 text-[11px]">
+            <dt className="text-muted-foreground">Agent</dt>
+            <dd className="min-w-0">
+              {showAgentProfileActions ? (
+                <div className="flex flex-wrap items-center gap-2">
+                  {agentProfileForCard ? (
+                    <button
+                      type="button"
+                      data-testid="task-agent-profile-open"
+                      aria-haspopup="dialog"
+                      aria-expanded={profileDialogOpen}
+                      aria-label="View agent details"
+                      onClick={() => setProfileDialogOpen(true)}
+                      className="min-w-0 max-w-full rounded-full transition-opacity hover:opacity-80"
+                    >
+                      <AgentProfileCard
+                        variant="chip"
+                        profile={agentProfileForCard}
+                        harnesses={harnesses}
+                        deleted={agentProfileDisplay?.deleted ?? true}
+                      />
+                    </button>
+                  ) : (
+                    <span data-testid="task-agent-profile-unknown" className="text-warning">
+                      Unknown agent
+                    </span>
                   )}
-                  onClick={async () => {
-                    setRefreshingModels(true);
-                    try {
-                      await onRefreshModels(task.agent);
-                    } catch {
-                      // The SSE / ready-retry paths also refetch.
-                    } finally {
-                      setRefreshingModels(false);
-                    }
-                  }}
-                >
-                  <RefreshCw className="size-3" />
-                </button>
-              </Tooltip>
-            )}
-          </dt>
-          <dd className="min-w-0">
-            {editable ? (
-              <CompactSelect
-                value={task.model ?? DEFAULT_MODEL[kind]}
-                options={modelOptions}
-                onChange={(model) => void save({ model })}
-              />
-            ) : (
-              <span>{task.model ?? "—"}</span>
-            )}
-          </dd>
-
-          <dt className="text-muted-foreground">Effort</dt>
-          <dd className="min-w-0">
-            {editable ? (
-              <CompactSelect
-                value={task.effort ?? ""}
-                options={effortSelectOptions}
-                onChange={(effort) => void save({ effort })}
-                disabled={supportedEffortsForModel.length === 0}
-                placeholder="n/a"
-              />
-            ) : (
-              <span>{task.effort ?? "—"}</span>
-            )}
-          </dd>
-
-          {kind === "cursor" && (maxModeAvailable || task.maxMode) && (
-            <>
-              <dt className="text-muted-foreground">Max Mode</dt>
-              <dd className="min-w-0">
-                {editable ? (
-                  <Switch
-                    checked={task.maxMode}
-                    onCheckedChange={(maxMode) => void save({ maxMode })}
-                    disabled={!maxModeAvailable}
-                    aria-label="Use Cursor Max Mode context"
-                  />
-                ) : (
-                  <span>{task.maxMode ? "on" : "off"}</span>
-                )}
-              </dd>
-            </>
-          )}
-
-          {kind === "cursor" && (fastAvailable || task.fast) && (
-            <>
-              <dt className="text-muted-foreground">Fast</dt>
-              <dd className="min-w-0">
-                {editable ? (
-                  <Switch
-                    checked={task.fast}
-                    onCheckedChange={(fast) => void save({ fast })}
-                    disabled={!fastAvailable}
-                    aria-label="Use Cursor fast variant"
-                  />
-                ) : (
-                  <span>{task.fast ? "on" : "off"}</span>
-                )}
-              </dd>
-            </>
-          )}
-
-          <dt className="text-muted-foreground">Project</dt>
-          <dd className="min-w-0 truncate font-mono" title={task.workdir}>
-            {abbreviateHome(task.workdir, homeDir)}
-          </dd>
-
-          <dt className="text-muted-foreground">Isolation</dt>
-          <dd className="min-w-0">{task.isolation}</dd>
-
-          {task.branch && (
-            <>
-              <dt className="text-muted-foreground">Branch</dt>
-              <dd className="min-w-0 truncate font-mono">{task.branch}</dd>
-            </>
-          )}
-          {task.baseRef && (
-            <>
-              <dt className="text-muted-foreground">Base</dt>
-              <dd className="min-w-0 truncate font-mono">{task.baseRef.slice(0, 12)}</dd>
-            </>
-          )}
-          {kind === "claude-code" && tmuxSession && (
-            <>
-              <dt className="text-muted-foreground">Tmux</dt>
-              <dd className="flex min-w-0 items-center justify-between gap-2">
-                <span className="min-w-0 truncate font-mono" title={tmuxSession}>
-                  {tmuxSession}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 px-2 text-[10px]"
+                    data-testid="task-agent-profile-detach"
+                    disabled={runningLock || detaching}
+                    onClick={() => void detachProfile()}
+                  >
+                    Detach
+                  </Button>
+                  <button
+                    type="button"
+                    data-testid="task-agent-profile-manage"
+                    onClick={onOpenSettingsAgents}
+                    className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                  >
+                    Manage agents…
+                  </button>
+                </div>
+              ) : (
+                <span data-testid="task-agent-profile-none" className="text-muted-foreground">
+                  None
                 </span>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-6 shrink-0 px-2 text-[11px]"
-                  onClick={() => {
-                    void api.openTmux(task.id).catch((err: unknown) => {
-                      const msg = err instanceof Error ? err.message : "Could not attach to tmux session";
-                      toast.error(msg);
-                    });
-                  }}
-                  title={`Attach to the tmux session in a new Terminal window (tmux attach -t ${tmuxSession})`}
-                >
-                  <Terminal className="mr-1 size-3" /> Attach
-                </Button>
-              </dd>
-            </>
-          )}
-          {task.references.length > 0 && (
-            <>
-              <dt className="text-muted-foreground self-start">Files</dt>
-              <dd className="min-w-0">
-                <details open>
-                  <summary className="cursor-pointer text-muted-foreground">
-                    <span className="font-mono">({task.references.length})</span>{" "}
-                    files / folders
-                  </summary>
-                  <ul className="mt-1 space-y-0.5">
-                    {task.references.map((r) => {
-                      const Icon = iconForRef(r);
-                      return (
-                        <li
-                          key={r.path}
-                          title={r.path}
-                          className="flex items-center gap-1"
-                        >
-                          <Icon className="size-3 shrink-0 opacity-70" />
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void api
-                                .openPath({ path: r.path, taskId: task.id })
-                                .catch(() => {})
-                            }
-                            className="truncate font-mono text-left hover:underline"
+              )}
+            </dd>
+
+            <dt className="text-muted-foreground">Harness</dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <AgentSelect
+                  value={task.agent}
+                  harnesses={harnesses}
+                  agents={agents}
+                  onChange={onAgentChange}
+                />
+              ) : (
+                <span className="inline-flex items-center gap-1">
+                  <AgentIcon kind={kind} className="size-3" /> {task.agent}
+                </span>
+              )}
+            </dd>
+
+            <dt className="text-muted-foreground">Mode</dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <CompactSelect
+                  value={task.mode ?? nullModeFallback}
+                  options={modeOptions}
+                  onChange={(mode) => void save({ mode })}
+                />
+              ) : (
+                <span>{task.mode ?? "—"}</span>
+              )}
+            </dd>
+
+            <dt className="flex items-center gap-1 text-muted-foreground">
+              Model
+              {editable && (
+                <Tooltip label="Refresh model list">
+                  <button
+                    type="button"
+                    aria-label="Refresh model list"
+                    data-testid="refresh-models-details"
+                    disabled={refreshingModels}
+                    className={cn(
+                      "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
+                      refreshingModels && "animate-spin",
+                    )}
+                    onClick={async () => {
+                      setRefreshingModels(true);
+                      try {
+                        await onRefreshModels(task.agent);
+                      } catch {
+                        // The SSE / ready-retry paths also refetch.
+                      } finally {
+                        setRefreshingModels(false);
+                      }
+                    }}
+                  >
+                    <RefreshCw className="size-3" />
+                  </button>
+                </Tooltip>
+              )}
+            </dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <CompactSelect
+                  value={task.model ?? DEFAULT_MODEL[kind]}
+                  options={modelOptions}
+                  onChange={(model) => void save({ model })}
+                />
+              ) : (
+                <span>{task.model ?? "—"}</span>
+              )}
+            </dd>
+
+            <dt className="text-muted-foreground">Effort</dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <CompactSelect
+                  value={task.effort ?? ""}
+                  options={effortSelectOptions}
+                  onChange={(effort) => void save({ effort })}
+                  disabled={supportedEffortsForModel.length === 0}
+                  placeholder="n/a"
+                />
+              ) : (
+                <span>{task.effort ?? "—"}</span>
+              )}
+            </dd>
+
+            {kind === "cursor" && (maxModeAvailable || task.maxMode) && (
+              <>
+                <dt className="text-muted-foreground">Max Mode</dt>
+                <dd className="min-w-0">
+                  {editable ? (
+                    <Switch
+                      checked={task.maxMode}
+                      onCheckedChange={(maxMode) => void save({ maxMode })}
+                      disabled={!maxModeAvailable}
+                      aria-label="Use Cursor Max Mode context"
+                    />
+                  ) : (
+                    <span>{task.maxMode ? "on" : "off"}</span>
+                  )}
+                </dd>
+              </>
+            )}
+
+            {kind === "cursor" && (fastAvailable || task.fast) && (
+              <>
+                <dt className="text-muted-foreground">Fast</dt>
+                <dd className="min-w-0">
+                  {editable ? (
+                    <Switch
+                      checked={task.fast}
+                      onCheckedChange={(fast) => void save({ fast })}
+                      disabled={!fastAvailable}
+                      aria-label="Use Cursor fast variant"
+                    />
+                  ) : (
+                    <span>{task.fast ? "on" : "off"}</span>
+                  )}
+                </dd>
+              </>
+            )}
+
+            <dt className="text-muted-foreground">Project</dt>
+            <dd className="min-w-0 truncate font-mono" title={task.workdir}>
+              {abbreviateHome(task.workdir, homeDir)}
+            </dd>
+
+            <dt className="text-muted-foreground">Isolation</dt>
+            <dd className="min-w-0">{task.isolation}</dd>
+
+            {task.branch && (
+              <>
+                <dt className="text-muted-foreground">Branch</dt>
+                <dd className="min-w-0 truncate font-mono">{task.branch}</dd>
+              </>
+            )}
+            {task.baseRef && (
+              <>
+                <dt className="text-muted-foreground">Base</dt>
+                <dd className="min-w-0 truncate font-mono">{task.baseRef.slice(0, 12)}</dd>
+              </>
+            )}
+            {kind === "claude-code" && tmuxSession && (
+              <>
+                <dt className="text-muted-foreground">Tmux</dt>
+                <dd className="flex min-w-0 items-center justify-between gap-2">
+                  <span className="min-w-0 truncate font-mono" title={tmuxSession}>
+                    {tmuxSession}
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 shrink-0 px-2 text-[11px]"
+                    onClick={() => {
+                      void api.openTmux(task.id).catch((err: unknown) => {
+                        const msg = err instanceof Error ? err.message : "Could not attach to tmux session";
+                        toast.error(msg);
+                      });
+                    }}
+                    title={`Attach to the tmux session in a new Terminal window (tmux attach -t ${tmuxSession})`}
+                  >
+                    <Terminal className="mr-1 size-3" /> Attach
+                  </Button>
+                </dd>
+              </>
+            )}
+            {task.references.length > 0 && (
+              <>
+                <dt className="text-muted-foreground self-start">Files</dt>
+                <dd className="min-w-0">
+                  <details open>
+                    <summary className="cursor-pointer text-muted-foreground">
+                      <span className="font-mono">({task.references.length})</span>{" "}
+                      files / folders
+                    </summary>
+                    <ul className="mt-1 space-y-0.5">
+                      {task.references.map((r) => {
+                        const Icon = iconForRef(r);
+                        return (
+                          <li
+                            key={r.path}
+                            title={r.path}
+                            className="flex items-center gap-1"
                           >
-                            {refBasename(r.path)}{r.isDirectory ? "/" : ""}
-                          </button>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </details>
-              </dd>
-            </>
-          )}
-        </dl>
-      </div>
-    </details>
-    <AgentProfileDetailsDialog
-      open={profileDialogOpen}
-      onClose={() => setProfileDialogOpen(false)}
-      task={task}
-      display={agentProfileDisplay}
-      deleted={agentProfileDisplay?.deleted ?? false}
-      hasRun={hasRun}
-      harnesses={harnesses}
-      onOpenSettingsAgents={onOpenSettingsAgents}
-    />
+                            <Icon className="size-3 shrink-0 opacity-70" />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void api
+                                  .openPath({ path: r.path, taskId: task.id })
+                                  .catch(() => {})
+                              }
+                              className="truncate font-mono text-left hover:underline"
+                            >
+                              {refBasename(r.path)}{r.isDirectory ? "/" : ""}
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </details>
+                </dd>
+              </>
+            )}
+          </dl>
+        </div>
+      </details>
+      <AgentProfileDetailsDialog
+        open={profileDialogOpen}
+        onClose={() => setProfileDialogOpen(false)}
+        task={task}
+        display={agentProfileDisplay}
+        deleted={agentProfileDisplay?.deleted ?? false}
+        hasRun={hasRun}
+        harnesses={harnesses}
+        onOpenSettingsAgents={onOpenSettingsAgents}
+      />
     </>
   );
 }

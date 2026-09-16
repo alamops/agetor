@@ -37,7 +37,7 @@ import {
 import { mergeModelOptions, discoveredEffortsFor, type DiscoveredModel } from "../../shared/model-options.ts";
 import { buildFileEntries } from "../../shared/at-file-filter.ts";
 import { unresolvedAtTokens } from "../../shared/at-refs.ts";
-import { agentProfileSummary, matchAgentProfileRef } from "../../shared/agent-profile.ts";
+import { agentProfileSummary, asProfileError, matchAgentProfileRef } from "../../shared/agent-profile.ts";
 
 interface AddOpts {
   title?: string;
@@ -204,7 +204,7 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     let profileId: string | undefined;
     if (o.profile) {
       const result = matchAgentProfileRef(await client.listAgentProfiles(), o.profile);
-      if ("error" in result) throw new Error(result.error);
+      if ("error" in result) throw new Error(asProfileError(result.error));
       profileId = result.profile.id;
     }
     input = baseInput(o, o.title, prompt, profileId);
@@ -485,7 +485,7 @@ async function wizard(
     .harnessModels()
     .catch(() => ({ ready: true, byHarness: {} as Record<string, DiscoveredModel[]> }));
 
-  // Agent-profile step: a first "Agent" pick over saved profiles (plus a
+  // Agent-profile step: a first "Profile" pick over saved profiles (plus a
   // "Pick harness manually" escape hatch), shown only when at least one
   // profile exists and `--profile` wasn't already given on the command line.
   // Picking a profile skips the harness/model/mode/effort steps below
@@ -496,14 +496,14 @@ async function wizard(
       await client.listAgentProfiles().catch(() => [] as AgentProfile[]),
       o.profile,
     );
-    if ("error" in result) throw new Error(result.error);
+    if ("error" in result) throw new Error(asProfileError(result.error));
     profileId = result.profile.id;
   } else {
     const profiles = await client.listAgentProfiles().catch(() => [] as AgentProfile[]);
     if (profiles.length > 0) {
       const MANUAL = "__manual__";
       const pick = await p.select({
-        message: "Agent",
+        message: "Profile",
         options: [
           ...profiles.map((pr) => ({
             value: pr.id,

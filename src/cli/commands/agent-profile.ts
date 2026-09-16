@@ -4,7 +4,7 @@ import { c, out, printJson, table } from "../output.ts";
 import { flagValue } from "../args.ts";
 import type { AgetorClient, AgentProfileInput } from "../api-client.ts";
 import { usageError } from "../usage.ts";
-import { matchAgentProfileRef, normalizeSkillName } from "../../shared/agent-profile.ts";
+import { asProfileError, matchAgentProfileRef, normalizeSkillName } from "../../shared/agent-profile.ts";
 import type { AgentProfile } from "../../shared/types.ts";
 
 export async function cmdAgentProfile(args: string[], flags: Flags): Promise<void> {
@@ -121,16 +121,6 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
     default:
       throw new Error(`unknown profile subcommand: ${sub} (use ls | show | add | edit | rm)`);
   }
-}
-
-/** `matchAgentProfileRef` (shared/agent-profile.ts) says "agent" in its
- *  `unknown`/`ambiguous` error text by design — other, non-CLI consumers
- *  still use that vocabulary. The CLI's own decision is `agent` = harness,
- *  `profile` = agent profile (docs/plans/task-details-agent-row.md D4), so
- *  this rewrites just the leading word at the CLI boundary rather than
- *  editing the shared matcher. */
-function asProfileError(message: string): string {
-  return message.replace(/^(unknown|ambiguous) agent\b/, "$1 profile");
 }
 
 async function resolveProfile(client: AgetorClient, ref: string): Promise<AgentProfile> {
