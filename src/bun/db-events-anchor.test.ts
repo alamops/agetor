@@ -274,6 +274,34 @@ test("(b) eventsForTask anchor.maxEvents too small (500 < 901-event span) falls 
   expect(withAnchor).toEqual(noAnchor);
 });
 
+test("(b2) exact count boundary through the SQL glue: a 901-event span with anchor.maxEvents 900 falls back (the below-floor read returns exactly `room` rows), with 901 it extends to all 901", () => {
+  // Pins the `room = maxEvents + 1 - windowRows` arithmetic in
+  // `eventsForTask`, not just `resolveAnchoredMinId`'s pure boundary: with a
+  // default window of 800 rows and maxEvents 900, `room` is 101 and the
+  // below-floor read returns exactly 101 rows (the user event + 100
+  // assistant rows), so the span is 901 > 900 -> fallback. With maxEvents
+  // 901, `room` is 102, the read still returns 101 (that's all there is),
+  // and the span is 901 <= 901 -> anchored.
+  const { taskId, ids } = seedUserFirstTask(900, 5);
+  const noAnchor = runs.eventsForTask(taskId, {
+    limit: DEFAULT_LIMIT, maxBytes: DEFAULT_MAX_BYTES, minEvents: DEFAULT_MIN_EVENTS,
+  });
+  const oneShort = runs.eventsForTask(taskId, {
+    limit: DEFAULT_LIMIT,
+    maxBytes: DEFAULT_MAX_BYTES,
+    minEvents: DEFAULT_MIN_EVENTS,
+    anchor: { maxEvents: 900, maxBytes: ANCHOR_MAX_BYTES },
+  });
+  expect(oneShort).toEqual(noAnchor);
+  const exactFit = runs.eventsForTask(taskId, {
+    limit: DEFAULT_LIMIT,
+    maxBytes: DEFAULT_MAX_BYTES,
+    minEvents: DEFAULT_MIN_EVENTS,
+    anchor: { maxEvents: 901, maxBytes: ANCHOR_MAX_BYTES },
+  });
+  expect(exactFit.map((e) => e.id)).toEqual(ids);
+});
+
 test("(c) eventsForTask anchor.maxBytes smaller than the span's total bytes falls back to the default window, identical to no-anchor", () => {
   const { taskId, ids } = seedUserFirstTask(900, 5);
   const noAnchor = runs.eventsForTask(taskId, {

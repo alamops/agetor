@@ -5364,7 +5364,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // (`clampWindowByBytes`/`EVENTS_REPLAY_MAX_BYTES`/`MIN_REPLAY_EVENTS`,
           // below) — so the RunPanel's auto-rebuild on opening a finished
           // claude task doesn't defeat the SSE replay window by pulling
-          // unbounded full JSONL history; `hasMore` reports either cut. Absent
+          // unbounded full JSONL history; `hasMore` reports either cut. One
+          // deliberate exception to "caps at N": the last-user-message anchor
+          // (further down) may extend the window PAST `limit`, up to
+          // `EVENTS_REPLAY_ANCHOR_MAX_EVENTS` events / `_MAX_BYTES`, when the
+          // newest `user` line sits before the cut — same rule as the SSE
+          // replay route, so a caller passing a small `limit` can still get
+          // up to that ceiling back. Absent
           // `limit` (the panel's manual "Rebuild from session JSONL" button
           // and the CLI) the response is the COMPLETE history in its
           // pre-existing shape (bare `events`/`source`, never `hasMore`) —

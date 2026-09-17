@@ -3635,6 +3635,7 @@ function RunPanelBody({
         // rest of the panel's life — this property, together with
         // converting path 1 to a layout effect (see the pin-paths comment
         // above), is what closes that hole.
+        data-testid="transcript-log"
         className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 text-xs leading-relaxed [overflow-anchor:none]"
       >
         <div ref={logContentRef}>

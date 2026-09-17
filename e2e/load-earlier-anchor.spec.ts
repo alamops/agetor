@@ -91,6 +91,22 @@ function authHeaders(backend: E2EBackend): Record<string, string> {
   return { authorization: `Bearer ${backend.apiToken}` };
 }
 
+// Every task this spec creates, deleted in `afterAll` — the `backend`
+// fixture is WORKER-scoped and shared by every spec file in the worker (see
+// `e2e/fixtures.ts`), and the 900-event task seeded below is heavier than
+// most leftovers: later specs would keep polling `/tasks` with it present,
+// and absolute-count assertions elsewhere break on stray rows. Uses raw
+// `fetch` rather than the test-scoped `request` fixture, mirroring
+// `e2e/agent-profiles-api.spec.ts`'s own afterAll hook. Never blocks teardown.
+const createdTaskIds: string[] = [];
+
+test.afterAll(async ({ backend }) => {
+  const headers = { authorization: `Bearer ${backend.apiToken}` };
+  for (const id of createdTaskIds.splice(0)) {
+    await fetch(`${backend.apiBase}/tasks/${id}`, { method: "DELETE", headers }).catch(() => {});
+  }
+});
+
 /** Create (isolation "none", a plain temp dir workdir — the fake driver
  *  never touches the filesystem) and start a task in one call. Mirrors
  *  `e2e/tagged-user-messages.spec.ts`'s identical helper. */
@@ -107,6 +123,7 @@ async function createAndStartTask(
   });
   expect(createRes.ok(), `POST /tasks -> ${createRes.status()}: ${await createRes.text()}`).toBeTruthy();
   const task = (await createRes.json()) as TaskRow;
+  createdTaskIds.push(task.id);
 
   const startRes = await request.post(`${backend.apiBase}/tasks/${task.id}/start`, { headers: auth });
   expect(
@@ -174,17 +191,14 @@ async function openTask(page: Page, title: string): Promise<Locator> {
   return panel;
 }
 
-/** The scrollable message-log container (`RunPanel.tsx`'s className
- *  `"min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 …"` — no
- *  dedicated `data-testid`, but this class combination is unique within the
- *  panel). Scoping assertions to this element (rather than the whole
- *  `panel`) is load-bearing: the collapsible "Task details" section also
- *  renders the raw prompt text verbatim in its own `<p>` (a *different*
- *  `overflow-y-auto` element, `max-h-48 overflow-y-auto whitespace-pre-wrap
- *  …`), so an unscoped `panel.getByText(promptPrefix)` resolves to two
- *  elements and Playwright's strict mode throws — live-verified below. */
+/** The scrollable message-log container (`data-testid="transcript-log"` on
+ *  RunPanel.tsx's log `<div>`). Scoping assertions to this element (rather
+ *  than the whole `panel`) is load-bearing: the collapsible "Task details"
+ *  section also renders the raw prompt text verbatim in its own `<p>`, so an
+ *  unscoped `panel.getByText(promptPrefix)` resolves to two elements and
+ *  Playwright's strict mode throws — live-verified. */
 function transcript(panel: Locator): Locator {
-  return panel.locator("div.overflow-y-auto.overflow-x-hidden.p-3");
+  return panel.getByTestId("transcript-log");
 }
 
 /**
