@@ -23,6 +23,7 @@ import {
   AgentProfileNameError,
   dataDir,
   clampWindowByBytes,
+  resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
@@ -170,6 +171,8 @@ import {
 import {
   DEFAULT_BRANCH_CONFIG,
   EVENTS_PAGE_MAX_BYTES,
+  EVENTS_REPLAY_ANCHOR_MAX_BYTES,
+  EVENTS_REPLAY_ANCHOR_MAX_EVENTS,
   EVENTS_REPLAY_LIMIT,
   EVENTS_REPLAY_MAX_BYTES,
   MIN_REPLAY_EVENTS,
@@ -5435,8 +5438,48 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               .map((ev, idx) => ({ id: idx, len: Buffer.byteLength(ev.data, "utf8") }))
               .reverse();
             const cutIdx = clampWindowByBytes(rowsDesc, EVENTS_REPLAY_MAX_BYTES, MIN_REPLAY_EVENTS) ?? 0;
-            const windowed = cutIdx > 0 ? countWindowed.slice(cutIdx) : countWindowed;
-            const hasMore = hasCountCut || windowed.length < countWindowed.length;
+            // Index into the FULL `events` array (mapped JSONL, oldest to
+            // newest) where the count+byte window above currently starts.
+            let start = events.length - countWindowed.length + cutIdx;
+            // Anchor extension: same first-load rule as the SSE replay route
+            // (docs/plans/first-load-reaches-last-user-message.md §3),
+            // applied here over the in-memory mapped events (`id` = array
+            // index) via the shared `resolveAnchoredMinId`, instead of a
+            // second, route-local copy of the fit/no-fit decision. Find the
+            // newest main-stream `user` event in the WHOLE mapped transcript
+            // (scanning from the end — the newest occurrence), and — only
+            // when it sits before the window's current start — extend back
+            // to it as long as the span `[userIdx, events.length)` fits
+            // EVENTS_REPLAY_ANCHOR_MAX_EVENTS/_BYTES. All-or-nothing: either
+            // `start` becomes `userIdx`, or it's left exactly as computed
+            // above.
+            let userIdx = -1;
+            for (let i = events.length - 1; i >= 0; i--) {
+              if (events[i]!.stream === "user") {
+                userIdx = i;
+                break;
+              }
+            }
+            if (userIdx >= 0 && userIdx < start) {
+              // DESC (newest-first) span rows, capped at
+              // `EVENTS_REPLAY_ANCHOR_MAX_EVENTS + 1` — enough for
+              // `resolveAnchoredMinId` to tell "fits" from "exceeds the
+              // count ceiling" without ever walking the whole transcript.
+              const spanRowsDesc: Array<{ id: number; len: number }> = [];
+              for (let i = events.length - 1; i >= userIdx; i--) {
+                spanRowsDesc.push({ id: i, len: Buffer.byteLength(events[i]!.data, "utf8") });
+                if (spanRowsDesc.length >= EVENTS_REPLAY_ANCHOR_MAX_EVENTS + 1) break;
+              }
+              start = resolveAnchoredMinId({
+                minId: start,
+                anchorId: userIdx,
+                spanRowsDesc,
+                maxEvents: EVENTS_REPLAY_ANCHOR_MAX_EVENTS,
+                maxBytes: EVENTS_REPLAY_ANCHOR_MAX_BYTES,
+              });
+            }
+            const windowed = events.slice(start);
+            const hasMore = start > 0;
             return json({ events: windowed, hasMore, source: jsonlPath }, { headers: corsHeaders(req) });
           }
           // No `?limit=`: the panel's manual "Rebuild from session JSONL"
@@ -5891,10 +5934,18 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             // still derives from the returned window's own earliest id, so it
             // correctly flips true whenever the byte cut (not just the count
             // cap) dropped older events.
+            // `anchor` extends that floor BACK DOWN to the newest main-stream
+            // `user` event when the span to it fits under
+            // EVENTS_REPLAY_ANCHOR_MAX_EVENTS/_BYTES, so opening a task shows
+            // at least the user's last message without a "Load earlier" click
+            // — see docs/plans/first-load-reaches-last-user-message.md. All
+            // or nothing: over either ceiling, the plain count/byte window
+            // above stands unchanged.
             const window = runs.eventsForTask(taskId, {
               limit: EVENTS_REPLAY_LIMIT,
               maxBytes: EVENTS_REPLAY_MAX_BYTES,
               minEvents: MIN_REPLAY_EVENTS,
+              anchor: { maxEvents: EVENTS_REPLAY_ANCHOR_MAX_EVENTS, maxBytes: EVENTS_REPLAY_ANCHOR_MAX_BYTES },
             });
             const earliestId = window.length > 0 ? window[0]!.id : null;
             const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);

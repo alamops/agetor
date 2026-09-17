@@ -1097,6 +1097,40 @@ function emitFakeFxRecoveryStorm(
 export const FAKE_CLAUDE_MD_IMAGE_PROMPT_MARKER = "__agetor_fake_claude_md_image__";
 
 /**
+ * Test hook for the "anchored first-load window" work
+ * (`docs/plans/first-load-reaches-last-user-message.md`): makes the fake
+ * claude driver emit more `assistant` chunks in one turn than
+ * `EVENTS_REPLAY_LIMIT` (800, `src/shared/types.ts`), so an e2e spec can
+ * produce a task whose prompt echo would land outside the SSE replay's
+ * un-anchored newest-N window and prove the anchor pulls it back in on first
+ * open, without a real claude CLI. Same prompt-marker trick as
+ * {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER} above, for the same reason: the
+ * e2e suite's worker-shared backend fixture can't set a per-test env var, but
+ * a spec can put anything it wants in `task.prompt`.
+ *
+ * Optional `:<count>` suffix overrides how many `assistant` chunks are
+ * emitted — e.g. `__agetor_fake_claude_long_reply__:1200` — parsed the same
+ * way {@link FAKE_CLAUDE_MONITOR_PROMPT_MARKER}'s `:<ms>` suffix is (see
+ * `FAKE_CLAUDE_MONITOR_SETTLE_MS_RE` above). Defaults to
+ * {@link FAKE_CLAUDE_LONG_REPLY_DEFAULT_COUNT} (900 — deliberately above
+ * `EVENTS_REPLAY_LIMIT`'s 800 so, pre-fix, the prompt echo falls outside the
+ * replay window) and is clamped to `[1, FAKE_CLAUDE_LONG_REPLY_MAX_COUNT]`
+ * (5000) so a malformed or malicious suffix can't spin up an unbounded loop.
+ *
+ * Exported (like the TODOS/MONITOR/MD_IMAGE markers) so
+ * `e2e/load-earlier-anchor.spec.ts` can drive this scenario from a task's
+ * prompt; per that same fixture constraint, the e2e spec can't `import` from
+ * `src/bun/*` and must keep a **literal copy** of this exact string.
+ */
+export const FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER = "__agetor_fake_claude_long_reply__";
+/** No regex-special characters appear in {@link FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER}
+ *  (letters/underscores only), so it's safe to splice directly into a pattern
+ *  without escaping — mirrors `FAKE_CLAUDE_MONITOR_SETTLE_MS_RE` above. */
+const FAKE_CLAUDE_LONG_REPLY_COUNT_RE = new RegExp(`${FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER}:(\\d+)`);
+const FAKE_CLAUDE_LONG_REPLY_DEFAULT_COUNT = 900;
+const FAKE_CLAUDE_LONG_REPLY_MAX_COUNT = 5000;
+
+/**
  * A real, valid 1×1 transparent PNG (not just arbitrary bytes with a `.png`
  * extension) — small, but enough for `/files/preview` and an `<img>` tile to
  * actually decode and render it. Module-scope so both the sent-files and the
@@ -1560,6 +1594,34 @@ function makeFakeAgent(
       );
     });
     after(10, () => {
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+  } else if (prompt.includes(FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER)) {
+    // Test hook: emit a reply long enough (in event count) to overflow
+    // EVENTS_REPLAY_LIMIT (800) in one turn — see
+    // FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER's doc comment above for the full
+    // rationale (docs/plans/first-load-reaches-last-user-message.md). Each
+    // `onChunk("assistant", …)` call below becomes its own persisted
+    // `run_events` row, which is the point: with the default count (900)
+    // there are more assistant rows after the prompt echo than
+    // EVENTS_REPLAY_LIMIT admits, so pre-fix the un-anchored SSE replay
+    // window drops the user's own prompt bubble on first open.
+    //
+    // Only turn 1 (a fresh spawn) runs this scenario — same convention as
+    // every other canned scenario in this driver: a follow-up turn's prompt
+    // won't carry the marker unless the caller re-includes it.
+    const countMatch = prompt.match(FAKE_CLAUDE_LONG_REPLY_COUNT_RE);
+    const parsedCount = countMatch ? Number(countMatch[1]) : NaN;
+    const longReplyCount = Number.isFinite(parsedCount)
+      ? Math.min(FAKE_CLAUDE_LONG_REPLY_MAX_COUNT, Math.max(1, parsedCount))
+      : FAKE_CLAUDE_LONG_REPLY_DEFAULT_COUNT;
+    after(5, () => {
+      for (let i = 0; i < longReplyCount; i++) {
+        onChunk("assistant", `long reply chunk ${i + 1}/${longReplyCount}`);
+      }
+    });
+    after(20, () => {
       onChunk("status", "turn complete");
       resolveDone(0);
     });

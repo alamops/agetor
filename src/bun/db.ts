@@ -1607,6 +1607,50 @@ export function clampWindowByBytes(
   return rowsDesc[count - 1]!.id;
 }
 
+/**
+ * Decides whether a first-load window should be extended back to an anchor
+ * event (the newest main-stream `user` event) — see
+ * `docs/plans/first-load-reaches-last-user-message.md` §3. The extension is
+ * ALL-OR-NOTHING: either the whole span `[anchorId, beforeId)` fits under
+ * both ceilings and `anchorId` becomes the new floor, or the caller's
+ * existing `minId` (the default count/byte-budgeted window) stands unchanged
+ * — there is no partial extension.
+ *
+ * - `anchorId == null` (no user event at all, e.g. a task with only status
+ *   breadcrumbs) → `minId` unchanged.
+ * - `anchorId >= minId` — the anchor already sits inside (or exactly at the
+ *   edge of) the default window → `minId` unchanged; nothing to extend.
+ * - Otherwise `spanRowsDesc` — the DESC (newest-first) `{id, len}` rows of
+ *   the span `id >= anchorId` (and `id < beforeId` when the caller has one),
+ *   capped by the CALLER at `maxEvents + 1` rows — decides it:
+ *   - `spanRowsDesc.length > maxEvents` → the span holds MORE than
+ *     `maxEvents` events (the `+1` the caller fetched proves it, without
+ *     this function ever seeing an unbounded row set) → `minId` unchanged.
+ *   - else sum every row's `len`; `> maxBytes` → `minId` unchanged;
+ *     otherwise → `anchorId` (the window now starts at the anchor).
+ *
+ * Both callers (the SSE replay route via `eventsForTask`'s `opts.anchor`,
+ * and the `?limit=` rebuild-snapshot route directly, over its in-memory
+ * mapped events with `id` = array index) share this one rule and its unit
+ * tests, so "does the span fit" can't drift between the two surfaces. Pure
+ * and DB-free, like `clampWindowByBytes`.
+ */
+export function resolveAnchoredMinId(args: {
+  minId: number;
+  anchorId: number | null;
+  spanRowsDesc: Array<{ id: number; len: number }>;
+  maxEvents: number;
+  maxBytes: number;
+}): number {
+  const { minId, anchorId, spanRowsDesc, maxEvents, maxBytes } = args;
+  if (anchorId == null || anchorId >= minId) return minId;
+  if (spanRowsDesc.length > maxEvents) return minId;
+  let total = 0;
+  for (const row of spanRowsDesc) total += row.len;
+  if (total > maxBytes) return minId;
+  return anchorId;
+}
+
 const toRun = (r: RunRow): Run => ({
   id: r.id,
   taskId: r.task_id,
@@ -1831,10 +1875,37 @@ export const runs = {
    *  the budget still returns something. Step 2 is otherwise unchanged: it
    *  just ends up scanning a narrower `[minId, taskMax]` range. When
    *  `opts.maxBytes` is omitted the byte walk never runs — this path is
-   *  byte-identical to before it existed. */
+   *  byte-identical to before it existed.
+   *
+   *  `opts.anchor` (additive, only meaningful together with `opts.limit`)
+   *  extends the window's floor back to the newest main-stream `user` event
+   *  when that fits under `anchor.maxEvents`/`anchor.maxBytes` — see
+   *  `docs/plans/first-load-reaches-last-user-message.md` §3 and
+   *  `resolveAnchoredMinId` above, which makes the actual fit/no-fit call.
+   *  After the byte walk settles `minId`: look up the anchor id via
+   *  `lastUserEventId(taskId, opts.beforeId)` (same cursor the rest of this
+   *  call already respects); if it exists and sits BEFORE `minId` (i.e. the
+   *  default window doesn't already reach it), fetch the DESC `{id, len}`
+   *  rows of the span `[anchorId, minId)` — capped at `anchor.maxEvents + 1`
+   *  rows so the fetch itself can never be unbounded — and hand them to
+   *  `resolveAnchoredMinId`. Its return either leaves `minId` alone (span
+   *  too large in count or bytes) or lowers it to `anchorId`.
+   *  Step 2's `LIMIT` becomes `max(opts.limit, opts.anchor.maxEvents)` in
+   *  that case: the `[minId, beforeId)` range fetched by step 2 is already
+   *  exact once `minId` is anchored, so `LIMIT` is only a defensive cap —
+   *  leaving it at the plain `opts.limit` would truncate the NEWEST rows of
+   *  a window that just grew past that count. Without `opts.anchor` this
+   *  function is byte-identical to before the option existed, including
+   *  step 2's `LIMIT opts.limit`. */
   eventsForTask(
     taskId: string,
-    opts?: { beforeId?: number; limit?: number; maxBytes?: number; minEvents?: number },
+    opts?: {
+      beforeId?: number;
+      limit?: number;
+      maxBytes?: number;
+      minEvents?: number;
+      anchor?: { maxEvents: number; maxBytes: number };
+    },
   ): Array<{ id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null }> {
     type Row = { id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null };
     if (opts?.limit) {
@@ -1861,13 +1932,48 @@ export const runs = {
         if (clampedId != null) minId = clampedId;
       }
 
+      if (opts.anchor) {
+        const anchorId = runs.lastUserEventId(taskId, opts.beforeId);
+        if (anchorId != null && anchorId < minId) {
+          const spanConditions = ["runs.task_id = ?", "run_events.id >= ?"];
+          const spanParams: Array<string | number> = [taskId, anchorId];
+          if (opts.beforeId != null) {
+            spanConditions.push("run_events.id < ?");
+            spanParams.push(opts.beforeId);
+          }
+          // At most `maxEvents + 1` rows — enough for `resolveAnchoredMinId`
+          // to tell "fits" from "exceeds the count ceiling" without ever
+          // fetching an unbounded span.
+          spanParams.push(opts.anchor.maxEvents + 1);
+          const spanRowsDesc = db.query<{ id: number; len: number }, Array<string | number>>(
+            `SELECT run_events.id as id, LENGTH(CAST(run_events.data AS BLOB)) as len
+             FROM run_events
+             JOIN runs ON runs.id = run_events.run_id
+             WHERE ${spanConditions.join(" AND ")}
+             ORDER BY run_events.id DESC
+             LIMIT ?`,
+          ).all(...spanParams);
+          minId = resolveAnchoredMinId({
+            minId,
+            anchorId,
+            spanRowsDesc,
+            maxEvents: opts.anchor.maxEvents,
+            maxBytes: opts.anchor.maxBytes,
+          });
+        }
+      }
+
       const rowConditions = ["runs.task_id = ?", "run_events.id >= ?"];
       const rowParams: Array<string | number> = [taskId, minId];
       if (opts.beforeId != null) {
         rowConditions.push("run_events.id < ?");
         rowParams.push(opts.beforeId);
       }
-      rowParams.push(opts.limit);
+      // Once `opts.anchor` may have lowered `minId` past `opts.limit` events
+      // back, the exact `[minId, beforeId)` range must not be truncated by a
+      // `LIMIT` still pinned at the pre-anchor count — see the doc comment
+      // above `eventsForTask`.
+      rowParams.push(opts.anchor ? Math.max(opts.limit, opts.anchor.maxEvents) : opts.limit);
       return db.query<Row, Array<string | number>>(
         `SELECT run_events.id as id, run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
          FROM run_events
@@ -1970,6 +2076,37 @@ export const runs = {
        LIMIT 1`,
     ).get(taskId, beforeId);
     return row !== null;
+  },
+  /**
+   * The id of the newest MAIN-stream `user` event for a task — the "last
+   * user sent message" anchor for the first-load window extension (see
+   * `resolveAnchoredMinId` above and
+   * `docs/plans/first-load-reaches-last-user-message.md`), or `null` when
+   * the task has no such event (e.g. only status breadcrumbs so far).
+   * `subagent_id IS NULL` (main-stream only) matches `lastEventData`'s
+   * rationale — a background subagent's own `user` turns are its own
+   * conversation, not the primary task's. `beforeId`, when given, excludes
+   * events at or after that id, mirroring every other paging cursor in this
+   * file. Backed by migration 039's partial index
+   * `idx_run_events_user_history (stream, id DESC) WHERE subagent_id IS NULL`,
+   * so this is an index-only lookup even on a task with a long history.
+   */
+  lastUserEventId(taskId: string, beforeId?: number): number | null {
+    const conditions = ["runs.task_id = ?", "run_events.stream = 'user'", "run_events.subagent_id IS NULL"];
+    const params: Array<string | number> = [taskId];
+    if (beforeId != null) {
+      conditions.push("run_events.id < ?");
+      params.push(beforeId);
+    }
+    const row = db.query<{ id: number }, Array<string | number>>(
+      `SELECT run_events.id as id
+       FROM run_events
+       JOIN runs ON runs.id = run_events.run_id
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY run_events.id DESC
+       LIMIT 1`,
+    ).get(...params);
+    return row ? row.id : null;
   },
   /**
    * Returns the inserted row's `id`, or `null` when nothing was actually

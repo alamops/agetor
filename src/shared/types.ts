@@ -3504,6 +3504,37 @@ export const MIN_REPLAY_EVENTS = 20;
  *  "Load earlier" affordance re-appears. */
 export const EVENTS_WINDOW_MAX = 3000;
 
+/**
+ * Event-count ceiling on extending the first-load window (SSE replay and the
+ * `?limit=` auto-rebuild snapshot) back to the newest main-stream `user`
+ * event, so opening a task shows at least the user's most recent message
+ * without a "Load earlier" click — see
+ * `docs/plans/first-load-reaches-last-user-message.md`. Deliberately equal
+ * to `EVENTS_WINDOW_MAX`: the webview's own SSE-flush trim
+ * (`eventWindowKeepCount` in RunPanel) caps rendered history at that many
+ * events anyway, so a larger anchored window could never actually be shown —
+ * extending past it would only cost bytes on the wire for nothing. The
+ * extension is ALL-OR-NOTHING: when the span from the anchor event to the
+ * newest event exceeds this many events (or `EVENTS_REPLAY_ANCHOR_MAX_BYTES`
+ * below), the default window (`EVENTS_REPLAY_LIMIT` / `EVENTS_REPLAY_MAX_BYTES`,
+ * floor `MIN_REPLAY_EVENTS`) is returned unchanged rather than partially
+ * extended — a partial extension still leaves the user clicking, for extra
+ * complexity with no real payoff.
+ */
+export const EVENTS_REPLAY_ANCHOR_MAX_EVENTS = EVENTS_WINDOW_MAX;
+
+/**
+ * Byte ceiling for the same first-load anchor extension described above —
+ * ANDed with `EVENTS_REPLAY_ANCHOR_MAX_EVENTS` (both must fit, or the
+ * default window stands). Four times `EVENTS_REPLAY_MAX_BYTES`: a generous
+ * worst case for the one-time cost of showing the user's last message
+ * inline, while the pathological transcript that motivated the byte budget
+ * in the first place (measured 61 MB on an 800-event window — see
+ * `EVENTS_REPLAY_MAX_BYTES` above) still falls back to today's 4 MB window
+ * rather than shipping tens of megabytes on open.
+ */
+export const EVENTS_REPLAY_ANCHOR_MAX_BYTES = 16 * 1024 * 1024;
+
 /** Named SSE event (`event: replay_meta`) sent as the FIRST frame of
  *  `GET /tasks/:id/events`, before the replayed window. Unnamed `message`
  *  listeners ignore it, so old clients are unaffected. */
