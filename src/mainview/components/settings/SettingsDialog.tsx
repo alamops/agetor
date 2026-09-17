@@ -10,6 +10,7 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
+import { AgentProfilesSection } from "@/components/settings/AgentProfilesSection";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
 import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
 import { useFontSize } from "@/components/font-size-provider";
@@ -187,30 +188,53 @@ function uniqueHarnessId(base: string, existing: Set<string>): string {
   return `${prefix}${n}`;
 }
 
-/** If `err` is the server's "harness in use" 409 (which carries a structured
- *  `taskIds` list), resolve those ids to titles and return a human-readable
- *  description for the failure toast. Returns null if the error isn't that
- *  shape — caller falls back to the raw `error` message. */
+/** If `err` is the server's "harness in use" 409 (which carries structured
+ *  `taskIds` and/or `profileIds` lists — a harness delete is refused when
+ *  either a task or an agent profile still references it, see
+ *  `HarnessInUseError`), resolve those ids to names and return a
+ *  human-readable description for the failure toast. Returns null if the
+ *  error isn't that shape (or carries neither list) — caller falls back to
+ *  the raw `error` message. */
 async function describeHarnessInUse(err: unknown): Promise<string | null> {
   if (!(err instanceof ApiError)) return null;
   const body = err.body;
   if (!body || typeof body !== "object") return null;
-  const taskIds = (body as { taskIds?: unknown }).taskIds;
-  if (!Array.isArray(taskIds) || taskIds.length === 0) return null;
-  const ids = taskIds.filter((x): x is string => typeof x === "string");
-  if (ids.length === 0) return null;
-  let titles: string[];
-  try {
-    const tasks = await api.listTasks();
-    const byId = new Map(tasks.map((t) => [t.id, t.title]));
-    titles = ids.map((id) => byId.get(id) ?? `${id.slice(0, 8)}…`);
-  } catch {
-    // Listing tasks failed — fall back to id prefixes so the toast still
-    // identifies *which* tasks are blocking, even if not by name.
-    titles = ids.map((id) => `${id.slice(0, 8)}…`);
+  const rawTaskIds = (body as { taskIds?: unknown }).taskIds;
+  const rawProfileIds = (body as { profileIds?: unknown }).profileIds;
+  const taskIds = Array.isArray(rawTaskIds) ? rawTaskIds.filter((x): x is string => typeof x === "string") : [];
+  const profileIds = Array.isArray(rawProfileIds)
+    ? rawProfileIds.filter((x): x is string => typeof x === "string")
+    : [];
+  if (taskIds.length === 0 && profileIds.length === 0) return null;
+
+  const segments: string[] = [];
+  if (taskIds.length > 0) {
+    let titles: string[];
+    try {
+      const tasks = await api.listTasks();
+      const byId = new Map(tasks.map((t) => [t.id, t.title]));
+      titles = taskIds.map((id) => byId.get(id) ?? `${id.slice(0, 8)}…`);
+    } catch {
+      // Listing tasks failed — fall back to id prefixes so the toast still
+      // identifies *which* tasks are blocking, even if not by name.
+      titles = taskIds.map((id) => `${id.slice(0, 8)}…`);
+    }
+    const noun = titles.length === 1 ? "task" : "tasks";
+    segments.push(`${titles.length} ${noun}: ${titles.join(", ")}`);
   }
-  const noun = titles.length === 1 ? "task" : "tasks";
-  return `In use by ${titles.length} ${noun}: ${titles.join(", ")}`;
+  if (profileIds.length > 0) {
+    let names: string[];
+    try {
+      const profiles = await api.listAgentProfiles();
+      const byId = new Map(profiles.map((p) => [p.id, p.name]));
+      names = profileIds.map((id) => byId.get(id) ?? `${id.slice(0, 8)}…`);
+    } catch {
+      names = profileIds.map((id) => `${id.slice(0, 8)}…`);
+    }
+    const noun = names.length === 1 ? "agent" : "agents";
+    segments.push(`${names.length} ${noun}: ${names.join(", ")}`);
+  }
+  return `In use by ${segments.join(" and ")}`;
 }
 
 export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, fxAutoResume, onFxAutoResumeChange, onChange, homeDir, dataDir, initialSection }: Props) {
@@ -530,6 +554,9 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       pendingToggle={pendingToggle}
                     />
                   );
+                case "agents":
+                  // Rendered by the always-mounted div below instead.
+                  return null;
                 case "git":
                   // Rendered by the always-mounted div below instead.
                   return null;
@@ -543,6 +570,17 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                 }
               }
             })()}
+
+          {/* Same treatment as GitHubTokensSection/SavedPromptsSection below
+              — kept mounted regardless of the active section so an
+              in-progress agent-profile create/edit form survives switching
+              sections instead of being destroyed on unmount. No wrapper
+              spacing classes here (unlike the GitHubTokensSection div
+              below) since AgentProfilesSection's own root already applies
+              "space-y-4 pt-3 text-sm". */}
+          <div className={cn(!(view.kind === "section" && view.section === "agents") && "hidden")}>
+            <AgentProfilesSection harnesses={payload.harnesses} />
+          </div>
 
           {/* Kept mounted regardless of the active section (unlike the
               switch above) so an unsaved host/label/token draft in

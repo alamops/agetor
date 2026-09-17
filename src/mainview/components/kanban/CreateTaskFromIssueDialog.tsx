@@ -11,6 +11,7 @@ import {
   renderIssueThreadMarkdown,
   sameIssueUrl,
 } from "../../../shared/issue-task.ts";
+import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
 import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
@@ -153,16 +154,20 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
   const loading = launch.loading || threadLoading;
   const error = launch.loadError ?? threadError;
 
-  const overage = promptByteOverage(launch.kind, prompt);
-  const selectedHarnessLabel = launch.harnesses.find((h) => h.id === launch.agent)?.label ?? launch.agent;
+  const overage = promptByteOverage(launch.effectiveKind, composeLaunchPrompt(launch.selectedProfile, prompt));
+  // Names the harness a launch will ACTUALLY run under — the selected
+  // profile's harness when one is picked, else the manually-picked one
+  // (finding F2-3; `launch.agent`/`selectedStatus` stay pinned to the
+  // manual picker and go stale once a profile hides that block).
+  const selectedHarnessLabel = launch.harnesses.find((h) => h.id === launch.effectiveAgent)?.label ?? launch.effectiveAgent;
 
   const canSubmit =
     !!context &&
     !!thread &&
     prompt.trim().length > 0 &&
-    !!launch.selectedStatus?.available &&
+    !!launch.effectiveStatus?.available &&
     !submitting &&
-    promptByteOverage(launch.kind, prompt) == null &&
+    overage == null &&
     wt.valid;
 
   const submit = async () => {
@@ -179,6 +184,11 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
         mode: launch.mode,
         model: launch.model,
         effort: launch.effort,
+        fast: launch.fast,
+        maxMode: launch.maxMode,
+        // Omit entirely when no profile is selected (finding F2-1) — see
+        // NewTaskForm.submit's matching comment.
+        ...(launch.agentProfileId ? { agentProfileId: launch.agentProfileId } : {}),
         column: "ready",
         references,
         taskType,
@@ -300,7 +310,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
               <PromptComposer
                 value={prompt}
                 onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
-                agent={launch.agent}
+                agent={launch.effectiveAgent}
                 references={references}
                 onReferencesChange={setReferences}
                 setReferences={setReferences}

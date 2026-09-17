@@ -20,10 +20,10 @@
 // classes — per the repo's dark/light theming convention (CLAUDE.md "UI
 // conventions").
 import type React from "react";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { GitFork, Terminal } from "lucide-react";
+import { ChevronRight, GitFork, Terminal } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   isMachineEmittedMessage,
@@ -36,6 +36,7 @@ import {
   type MessageSegment,
   type TagSegment,
 } from "../../../shared/user-message.ts";
+import { AGENT_INSTRUCTIONS_TAG } from "../../../shared/agent-profile.ts";
 import { USER_MD_COMPONENTS, MD_URL_TRANSFORM } from "./md-components";
 
 /** The existing 9px "you" / "command output" style label, hoisted here so
@@ -132,6 +133,49 @@ export function ShellOutputBlock({
       >
         {trimmed}
       </div>
+    </div>
+  );
+}
+
+/** An `<agent_instructions_defined_by_the_user>` tag — the preamble
+ *  `composeLaunchPrompt` (`shared/agent-profile.ts`) injects ahead of a
+ *  task's first-run prompt when it was launched from a saved agent profile
+ *  (plan `agent-profiles.md` D3/D11). Collapsed by default: the text after
+ *  the closing tag ("Your task:" + the actual prompt) renders as ordinary
+ *  user text via the normal segment flow right below this block, same as
+ *  any other tag — this component only owns the instructions body itself. */
+export function AgentInstructionsBlock({ body }: { body: string }) {
+  const [open, setOpen] = useState(false);
+  const trimmed = body.trim();
+  return (
+    <div
+      data-testid="agent-instructions-block"
+      data-state={open ? "expanded" : "collapsed"}
+      className="my-1 rounded-md border border-border bg-muted/30"
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-1.5 px-2 py-1 text-left text-[9px] font-semibold uppercase tracking-wide text-primary/80 hover:bg-muted/40"
+      >
+        <ChevronRight
+          className={cn("size-3 shrink-0 transition-transform", open && "rotate-90")}
+          aria-hidden
+        />
+        Agent instructions
+      </button>
+      {open && trimmed && (
+        <div className="agetor-md px-2 pb-1.5 pt-0.5">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={USER_MD_COMPONENTS}
+            urlTransform={MD_URL_TRANSFORM}
+          >
+            {trimmed}
+          </ReactMarkdown>
+        </div>
+      )}
     </div>
   );
 }
@@ -304,6 +348,10 @@ export function MessageSegments({
 
         if (seg.name === "bash-stderr") {
           return <ShellOutputBlock key={i} kind="stderr" body={seg.body} />;
+        }
+
+        if (seg.name === AGENT_INSTRUCTIONS_TAG) {
+          return <AgentInstructionsBlock key={i} body={seg.body} />;
         }
 
         return <GenericTagBlock key={i} segment={seg} depth={depth} />;

@@ -9,6 +9,7 @@ import {
 import { api, type AgentModelMap } from "@/lib/api";
 import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
+import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -30,6 +31,7 @@ import {
   supportedEfforts,
   supportedModes,
   type AgentKind,
+  type AgentProfile,
   type AgentStatus,
   type Harness,
   type Isolation,
@@ -37,6 +39,8 @@ import {
   type TaskType,
 } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
+import { AgentProfileCard } from "./AgentProfileCard";
+import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
 import { ProjectPicker } from "./ProjectPicker";
 import { TaskTypePicker } from "./TaskTypePicker";
@@ -71,6 +75,13 @@ interface Props {
       maxMode: boolean;
       references: TaskReference[];
       taskType: TaskType;
+      /** Id of the {@link AgentProfile} this task launches from, or null —
+       *  see `AgentProfilePicker` above the harness grid. The server
+       *  resolves it and overrides `agent`/`model`/`effort`/`mode`/`fast`/
+       *  `maxMode` from the profile; this form already sends the profile's
+       *  own values for those fields (see `submit`), so the override is a
+       *  no-op in practice but keeps a body-only consumer honest. */
+      agentProfileId?: string | null;
     },
     options: { start: boolean },
   ) => void;
@@ -78,6 +89,13 @@ interface Props {
   /** Registered harnesses — built-ins plus user aliases. The agent picker
    *  renders one button per harness. */
   harnesses: Harness[];
+  /** Saved agent profiles — powers the `AgentProfilePicker` above the
+   *  harness grid ("one selection": picking one hides the manual
+   *  harness/mode/model/effort block). */
+  profiles: AgentProfile[];
+  /** "Manage agents…" footer row in the profile picker's popover — opens
+   *  Settings on the Agents section. */
+  onOpenSettingsAgents: () => void;
   /** Kind-level models discovered from each agent's CLI, refreshed by the
    *  triggers documented on `onRefreshModels` below. Merged with the static
    *  AGENT_OPTIONS list — used as the fallback when `harnessModels` has
@@ -105,7 +123,7 @@ interface Props {
   focusNonce?: number;
 }
 
-export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
+export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
   // Collapsed = thin icon rail; the board's `flex-1` <main> takes the freed
   // width on its own. Seeded synchronously from localStorage (lazy initial
   // state) so a restart repaints in the state the user left it in — an async
@@ -150,6 +168,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [taskType, setTaskType] = useState<TaskType>(DEFAULT_TASK_TYPE);
+  // Selected agent profile ("one selection" — see `AgentProfilePicker`):
+  // null means "No agent — pick harness manually", the form's default (no
+  // last-used-profile preference — plan D12). Reset to null after a
+  // successful submit, same as every other field below.
+  const [agentProfileId, setAgentProfileId] = useState<string | null>(null);
   // Soft-deleted harnesses are excluded from the picker and the default-
   // fallback logic. The full `harnesses` list is still used for
   // `selectedHarness` lookup so the resolved kind stays correct even for a
@@ -413,11 +436,53 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
     setMode(codePlan.plan);
   };
 
+  const selectedHarnessLabel = selectedHarness?.label ?? agent;
+
+  // "One selection" (plan D5): a chosen profile replaces the manual
+  // harness/mode/model/effort block everywhere below. `selectedProfile` is
+  // `null` both for "no agent picked" and for a stale id the picker's own
+  // effect is about to clear.
+  const selectedProfile = agentProfileId ? (profiles.find((p) => p.id === agentProfileId) ?? null) : null;
+  // A profile can disappear out from under an open form (deleted in
+  // Settings elsewhere) — fall back to "No agent" rather than submit a
+  // dangling id. Guarded on a non-empty `profiles` so the brief
+  // not-yet-loaded window (cache still `[]`) can't spuriously clear a
+  // selection the user just made.
+  useEffect(() => {
+    if (agentProfileId && profiles.length > 0 && !profiles.some((p) => p.id === agentProfileId)) {
+      setAgentProfileId(null);
+    }
+  }, [profiles, agentProfileId]);
+  const selectedProfileHarness = selectedProfile
+    ? (harnesses.find((h) => h.id === selectedProfile.harness) ?? null)
+    : null;
+  // Resolve the kind/label the launch actually uses: the selected profile's
+  // harness when one is picked, else the manually-picked harness — read by
+  // the gemini argv-budget check right below and by the overage warning.
+  // The harness id a launch will ACTUALLY run under — the composer's
+  // skills/MCP/slash discovery and the submit payload must both read this,
+  // never the hidden manual `agent`, while a profile is selected.
+  const effectiveAgent = selectedProfile ? selectedProfile.harness : agent;
+  const effectiveKind: AgentKind = selectedProfile ? (selectedProfileHarness?.kind ?? "claude-code") : kind;
+  const effectiveHarnessLabel = selectedProfile
+    ? (selectedProfileHarness?.label ?? selectedProfile.harness)
+    : selectedHarnessLabel;
+  // `AgentStatus` for whichever harness a launch will ACTUALLY run under —
+  // mirrors `useTaskLaunch`'s `effectiveStatus` (finding F2-3). NewTaskForm
+  // keeps its own state instead of the shared hook, so this is the local
+  // equivalent: `selectedStatus` stays pinned to the manual `agent` picker
+  // and goes stale once a profile hides that block, so the availability/
+  // auth hint below must read from this instead.
+  const effectiveStatus = selectedProfile
+    ? agents.find((a) => a.harnessId === selectedProfile.harness)
+    : selectedStatus;
+
   // Gemini's one-shot tmux launch has no deferred-paste fallback for an
   // oversized prompt — surfaced here (and blocking submit) rather than
   // letting it fail at spawn time. Mirrors CreateTaskFromIssueDialog's guard.
-  const promptOverage = promptByteOverage(kind, prompt);
-  const selectedHarnessLabel = selectedHarness?.label ?? agent;
+  // Includes the agent-instructions preamble (`composeLaunchPrompt`) so this
+  // pre-check sees the same bytes `startTask` will actually send.
+  const promptOverage = promptByteOverage(effectiveKind, composeLaunchPrompt(selectedProfile, prompt));
 
   const canSubmit =
     title.trim() && prompt.trim() && workdir.trim() && wt.valid
@@ -429,7 +494,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
       {
         title: title.trim(),
         prompt: prompt.trim(),
-        agent,
+        // When a profile is selected, the manual agent/mode/model/effort/
+        // fast/maxMode state above is hidden and stale — send the profile's
+        // own values instead. The server re-resolves and overrides these
+        // from the profile anyway (`createTask`); sending them here too
+        // keeps the request body self-consistent for any other consumer.
+        agent: effectiveAgent,
         workdir: workdir.trim(),
         // The branch is only meaningful under worktree isolation — see
         // `worktreePayload` for the isolation/baseRef/branch mapping this
@@ -437,31 +507,41 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
         ...wt.payload(),
         // model is always an explicit option id. effort is too, except for
         // the Haiku-style "model doesn't accept effort" case which sends null.
-        mode,
-        model,
-        effort,
-        fast: kind === "cursor" ? fast : false,
-        maxMode: kind === "cursor" ? maxMode : false,
+        mode: selectedProfile ? selectedProfile.mode : mode,
+        model: selectedProfile ? selectedProfile.model : model,
+        effort: selectedProfile ? selectedProfile.effort : effort,
+        fast: selectedProfile ? selectedProfile.fast : (kind === "cursor" ? fast : false),
+        maxMode: selectedProfile ? selectedProfile.maxMode : (kind === "cursor" ? maxMode : false),
         references,
         taskType,
+        // Omit entirely when no profile is selected — an explicit `null`
+        // still round-trips through the server's own accept-null handling,
+        // but a body that never mentions the key at all is the simplest
+        // contract for every consumer of this payload shape (finding F2-1).
+        ...(agentProfileId ? { agentProfileId } : {}),
       },
       { start },
     );
     // Remember the model + effort for next time, per kind (aliases of the
     // same kind share cache). Fire-and-forget — preferences failures
     // shouldn't block the user. Also write into the in-memory cache so a
-    // same-session agent switch sees the latest pick.
-    agentCache.current[kind] = { mode, model, effort, fast, maxMode };
-    void api.setPreference(`lastMode:${kind}`, mode).catch(() => {});
-    void api.setPreference(`lastModel:${kind}`, model).catch(() => {});
-    if (effort !== null) void api.setPreference(`lastEffort:${kind}`, effort).catch(() => {});
-    void api.setPreference(`lastFast:${kind}`, String(kind === "cursor" && fast)).catch(() => {});
-    void api.setPreference(`lastMaxMode:${kind}`, String(kind === "cursor" && maxMode)).catch(() => {});
+    // same-session agent switch sees the latest pick. Skipped entirely while
+    // a profile is selected — those aren't the user's manual picks, and
+    // there's no "last used profile" preference (plan D12).
+    if (!selectedProfile) {
+      agentCache.current[kind] = { mode, model, effort, fast, maxMode };
+      void api.setPreference(`lastMode:${kind}`, mode).catch(() => {});
+      void api.setPreference(`lastModel:${kind}`, model).catch(() => {});
+      if (effort !== null) void api.setPreference(`lastEffort:${kind}`, effort).catch(() => {});
+      void api.setPreference(`lastFast:${kind}`, String(kind === "cursor" && fast)).catch(() => {});
+      void api.setPreference(`lastMaxMode:${kind}`, String(kind === "cursor" && maxMode)).catch(() => {});
+    }
     setTitle("");
     setPrompt("");
     setReferences([]);
     capture.clearDropHint();
     wt.resetAfterSubmit();
+    setAgentProfileId(null);
     // Keep `workdir`, `model`, `effort`, `mode` set on purpose — the next
     // task should default to the same project + picks the user just used.
   };
@@ -587,7 +667,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
               <PromptComposer
                 value={prompt}
                 onChange={setPrompt}
-                agent={agent}
+                agent={effectiveAgent}
                 references={references}
                 onReferencesChange={setReferences}
                 fileScope={fileScope}
@@ -596,7 +676,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                 startingFolder={workdir || undefined}
                 footer={promptOverage && (
                   <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
-                    This prompt is {Math.ceil(promptOverage.bytes / 1024)} KB — {selectedHarnessLabel}'s
+                    This prompt is {Math.ceil(promptOverage.bytes / 1024)} KB — {effectiveHarnessLabel}'s
                     one-shot launch caps prompts at {Math.floor(promptOverage.limit / 1024)} KB. Pick
                     another harness or trim the prompt.
                   </div>
@@ -623,6 +703,53 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
               </div>
               <WorktreeOptions state={wt} />
 
+              <div className="space-y-1">
+                <label className="text-muted-foreground">Agent</label>
+                <AgentProfilePicker
+                  value={agentProfileId}
+                  onChange={setAgentProfileId}
+                  profiles={profiles}
+                  // Full list, not `availableHarnesses` — the picker/card
+                  // resolve each profile's icon+label from this and need to
+                  // resolve a disabled harness too so they can render the
+                  // "(harness disabled)" marker rather than falling back to
+                  // a bare id (finding F2-4; the harness BUTTON grid a few
+                  // lines below stays scoped to `availableHarnesses` on
+                  // purpose — you can't launch onto a disabled harness).
+                  harnesses={harnesses}
+                  onManage={onOpenSettingsAgents}
+                />
+              </div>
+
+              {/* "One selection" (plan D5): a picked profile replaces the
+                  entire manual harness/mode/model/effort(/fast/max) block
+                  below with its own card — nothing under here is read from
+                  when `selectedProfile` is set (see `submit`). */}
+              {selectedProfile ? (
+                <>
+                  <AgentProfileCard profile={selectedProfile} harnesses={harnesses} variant="selected" />
+                  {/* Same availability/auth hint the manual branch below
+                   *  shows, but keyed off `effectiveStatus` (the PROFILE's
+                   *  harness) — a profile whose harness is unavailable or
+                   *  logged out must not leave a blocked Start with no
+                   *  visible reason (finding F2-3). */}
+                  {effectiveStatus && !effectiveStatus.available && (
+                    <div
+                      data-testid="agent-profile-harness-unavailable"
+                      className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground"
+                    >
+                      <div className="font-medium">{effectiveStatus.reason}</div>
+                      {effectiveStatus.installHint && (
+                        <div className="mt-1 font-mono opacity-80">
+                          {effectiveStatus.installHint}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  <HarnessAuthHint status={effectiveStatus} />
+                </>
+              ) : (
+              <>
               <div className="space-y-1">
                 <label className="text-muted-foreground">Harness</label>
                 <div className="grid grid-cols-2 gap-1">
@@ -835,6 +962,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                   reports the actionable error if the turn actually needs
                   credentials. This is a heads-up, not a disable. */}
               <HarnessAuthHint status={selectedStatus} />
+              </>
+              )}
             </div>
 
             <div className="flex shrink-0 gap-2 border-t border-border/60 px-4 py-3">

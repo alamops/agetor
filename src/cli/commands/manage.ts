@@ -3,7 +3,7 @@ import path from "node:path";
 import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
-import type { PatchTaskInput } from "../api-client.ts";
+import { ApiError, type PatchTaskInput } from "../api-client.ts";
 import { COLUMNS } from "../../shared/types.ts";
 import { flagValue } from "../args.ts";
 import { usageError } from "../usage.ts";
@@ -14,6 +14,7 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
   if (!ref) throw usageError("edit");
   const patch: PatchTaskInput = {};
+  let detachProfile = false;
   for (let i = 1; i < args.length; i++) {
     const a = args[i]!;
     const val = (allowDash = false) => flagValue(args, ++i, a, allowDash);
@@ -38,12 +39,13 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
       case "--no-max-mode": patch.maxMode = false; break;
       case "--type": patch.taskType = val(); break;
       case "--column": patch.column = val(); break;
+      case "--detach-profile": detachProfile = true; break;
       default: break;
     }
   }
-  if (Object.keys(patch).length === 0) {
+  if (Object.keys(patch).length === 0 && !detachProfile) {
     throw new Error(
-      "nothing to edit — pass at least one of --title/--prompt/--agent/--workdir/--model/--mode/--effort/--fast/--no-fast/--max-mode/--no-max-mode/--type/--column",
+      "nothing to edit — pass at least one of --title/--prompt/--agent/--workdir/--model/--mode/--effort/--fast/--no-fast/--max-mode/--no-max-mode/--type/--column/--detach-profile",
     );
   }
   if (patch.column && !COLUMN_IDS.includes(patch.column as (typeof COLUMN_IDS)[number])) {
@@ -51,11 +53,32 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   }
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
-  const updated = await client.patchTask(task.id, patch);
+  // Detach first so a combined `--detach-profile --model …` unlocks the
+  // bound fields before the patch that wants to change them — the server
+  // 409s a PATCH that touches agent/mode/model/effort/fast/maxMode while
+  // still bound. That 409's message says "agent" (the server's own
+  // vocabulary — "agent" = harness there), which would read as nonsense at
+  // the CLI boundary where "agent" = harness and "profile" = agent profile
+  // (docs/plans/task-details-agent-row.md D4); rewrite it in place rather
+  // than change the server string, which the webview also reads verbatim.
+  // Every other error this command can raise still propagates unmodified.
+  let updated = detachProfile ? await client.detachTaskAgentProfile(task.id) : task;
+  if (Object.keys(patch).length > 0) {
+    try {
+      updated = await client.patchTask(updated.id, patch);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409 && err.message.startsWith("task is bound to agent")) {
+        const rewritten = err.message.replace(/^task is bound to agent/, "task is bound to profile");
+        throw new Error(`${rewritten} (agetor edit ${task.id.slice(0, 8)} --detach-profile)`);
+      }
+      throw err;
+    }
+  }
   if (flags.json) return printJson(updated);
   // model/mode/effort changes are forwarded to a live claude session by the
   // server (reconcileTaskSession sends /model, /effort, cycles mode).
-  out(`${c.green("✓")} updated ${c.dim(updated.id.slice(0, 8))} — ${Object.keys(patch).join(", ")}`);
+  const changed = [...(detachProfile ? ["detach-profile"] : []), ...Object.keys(patch)];
+  out(`${c.green("✓")} updated ${c.dim(updated.id.slice(0, 8))} — ${changed.join(", ")}`);
 }
 
 export async function cmdMove(args: string[], flags: Flags): Promise<void> {

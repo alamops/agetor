@@ -220,10 +220,27 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               </Badge>
             )}
           </div>
-          <Badge variant="secondary" className="gap-1 shrink-0">
-            <AgentIcon kind={task.agent} className="size-3" />
-            {task.agent}
-          </Badge>
+          {/* When the task was launched from a saved agent profile, show its
+           *  name (with the harness id as the tooltip) instead of the raw
+           *  harness id — the snapshot is server-managed and always present
+           *  once `agentProfileId` is set (plan D1/D14), so no live profile
+           *  lookup is needed here. */}
+          {task.agentProfile ? (
+            <Badge
+              variant="secondary"
+              className="gap-1 shrink-0"
+              data-testid="task-card-agent-profile"
+              title={task.agent}
+            >
+              <AgentIcon kind={task.agentProfile.harnessKind} className="size-3" />
+              {task.agentProfile.name}
+            </Badge>
+          ) : (
+            <Badge variant="secondary" className="gap-1 shrink-0">
+              <AgentIcon kind={task.agent} className="size-3" />
+              {task.agent}
+            </Badge>
+          )}
         </div>
         {(task.model || task.mode) && (
           <span className="self-end text-[10px] font-mono text-muted-foreground">

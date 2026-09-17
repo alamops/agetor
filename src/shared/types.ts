@@ -351,6 +351,65 @@ export interface SavedPrompt {
   updatedAt: number;
 }
 
+/**
+ * A reusable, named bundle of harness + model + effort + mode + fast/maxMode
+ * + free-text instructions + skills, picked on task launch instead of
+ * choosing each field by hand. Persisted in the `agent_profiles` table
+ * (`src/bun/db.ts`'s `agentProfiles` module); names are unique
+ * case-insensitively (trimmed). A task created from a profile copies these
+ * fields onto its own row and keeps a point-in-time {@link AgentProfileSnapshot}
+ * — see `Task.agentProfileId` / `Task.agentProfile` below and
+ * `docs/plans/agent-profiles.md` for the full freeze-at-first-run design.
+ */
+export interface AgentProfile {
+  id: string; // uuid
+  name: string; // unique, trimmed, case-insensitive
+  harness: string; // harness id (Task.agent semantics)
+  model: string;
+  effort: string | null;
+  mode: string | null; // null ⇒ defaultModeFor(kind) at spawn
+  fast: boolean; // cursor only
+  maxMode: boolean; // cursor only
+  instructions: string; // may be ""
+  skills: string[]; // bare skill names, no leading "/", deduped, max 50, each ≤ 100 chars
+  createdAt: number;
+  updatedAt: number;
+  /**
+   * Number of tasks currently BOUND to this profile — `tasks.agent_profile_id
+   * = this.id`, every column including archived. Server-derived on every
+   * `/agent-profiles*` HTTP response (`src/bun/server.ts`'s `withTaskCount`/
+   * `withTaskCounts`, backed by `agentProfiles.taskCount`/`taskCounts` in
+   * `src/bun/db.ts`); optional at the type level only because raw db-layer
+   * callers (`agentProfiles.list`/`get`/`insert`/`update` themselves) don't
+   * populate it. Detaching a task (`DELETE /tasks/:id/agent-profile`) or
+   * deleting the task lowers this automatically — a task that only keeps a
+   * frozen `agentProfile` snapshot after detaching is not counted.
+   */
+  taskCount?: number;
+}
+
+/**
+ * What a task keeps: the {@link AgentProfile} as it was when captured, plus
+ * the resolved harness identity (`harnessKind`/`harnessLabel`) so a task
+ * whose profile — or whose profile's harness — has since been deleted can
+ * still render its chip and re-inject its preamble without any lookups.
+ */
+export interface AgentProfileSnapshot {
+  id: string;
+  name: string;
+  harness: string;
+  harnessKind: AgentKind;
+  harnessLabel: string;
+  model: string;
+  effort: string | null;
+  mode: string | null;
+  fast: boolean;
+  maxMode: boolean;
+  instructions: string;
+  skills: string[];
+  capturedAt: number;
+}
+
 export interface HarnessUsage {
   /** Harness id this usage report is for. */
   harnessId: string;
@@ -966,6 +1025,37 @@ export interface Task {
    * `toTask` always sets it.
    */
   issueUrl?: string | null;
+  /**
+   * Id of the {@link AgentProfile} this task was launched from, or null.
+   * Set only at create time by `createTask` from `POST /tasks`'s
+   * `agentProfileId` (400 on an unknown id); never patchable (kept out of
+   * `ALLOWED_PATCH_FIELDS` — `PATCH /tasks/:id` instead 409s when it would
+   * touch agent/mode/model/effort/fast/maxMode while this is set). Refreshed
+   * — together with `agentProfile` and the six copied fields — by
+   * `startTask`, but only before the task's first run (the "live-until-
+   * first-run" rule: a not-yet-started task tracks live profile edits,
+   * including a harness change; once a run exists the task is frozen to its
+   * snapshot). Cleared (set to null, alongside `agentProfile`) by
+   * `DELETE /tasks/:id/agent-profile` (archived-guarded). Both this field and
+   * `agentProfile` are written only by `tasks.setAgentProfile` — a targeted
+   * `UPDATE` that never bumps `updated_at` — and are skipped by the generic
+   * `tasks.update` SET clause, same treatment as `sentFiles`/`fxRecovery`.
+   * Optional at the type level only for fixture compatibility (same reason
+   * as `issueUrl`) — `toTask` always sets it.
+   */
+  agentProfileId?: string | null;
+  /**
+   * Point-in-time capture of the profile named by `agentProfileId`, taken
+   * the moment it was bound to this task (see {@link AgentProfileSnapshot}).
+   * This is what the task actually launches with once it has run at least
+   * once — edits or deletion of the live profile afterward have no effect.
+   * Kept in lockstep with `agentProfileId` by the same `tasks.setAgentProfile`
+   * targeted UPDATE (never patchable, excluded from the generic `tasks.update`
+   * SET clause). Null whenever `agentProfileId` is null. Optional at the type
+   * level only for fixture compatibility (same reason as `issueUrl`) —
+   * `toTask` always sets it.
+   */
+  agentProfile?: AgentProfileSnapshot | null;
   /**
    * Friendly mode id ("auto", "ask", "acceptEdits", "plan", …). Maps to
    * agent-specific CLI flags in `src/bun/agents.ts`. NULL means "use the

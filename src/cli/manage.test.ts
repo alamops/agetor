@@ -5,7 +5,9 @@ import path from "node:path";
 import { ensureCore, stopDaemon } from "./daemon/supervisor.ts";
 import { AgetorClient, ApiError } from "./api-client.ts";
 import { cmdConfig } from "./commands/config.ts";
+import { cmdEdit } from "./commands/manage.ts";
 import { coreCredsPath } from "../bun/core-creds.ts";
+import { DEFAULT_MODEL } from "../shared/types.ts";
 
 async function withClient(
   port: number,
@@ -267,5 +269,57 @@ test("getGitStatus: ahead reflects commits made after a pinned baseRef", async (
 
     await client.deleteTask(t.id);
     rmSync(repo, { recursive: true, force: true });
+  });
+}, 30_000);
+
+test("cmdEdit: the server's 'bound to agent' 409 is reworded to 'profile' at the CLI boundary", async () => {
+  await withClient(4538, async (client, dir) => {
+    const workdir = mkdtempSync(path.join(tmpdir(), "agetor-mg-profile-"));
+
+    const profile = await client.createAgentProfile({
+      name: "P1",
+      harness: "claude-code",
+      model: DEFAULT_MODEL["claude-code"],
+      effort: null,
+      mode: null,
+      fast: false,
+      maxMode: false,
+      instructions: "",
+      skills: [],
+    });
+
+    const t = await client.createTask({
+      title: "Bound", prompt: "p", isolation: "none", workdir, agentProfileId: profile.id,
+    });
+    expect(t.agentProfileId).toBe(profile.id);
+
+    // The server's own 409 message says "agent" (its vocabulary: "agent" =
+    // harness there) — the CLI's own decision is "agent" = harness,
+    // "profile" = agent profile, so cmdEdit rewrites the message rather than
+    // letting the server's wording leak through.
+    let threw: unknown;
+    try {
+      await cmdEdit([t.id, "--model", "sonnet-5"], { dataDir: dir, json: false, plain: true, noDaemon: false });
+    } catch (err) {
+      threw = err;
+    }
+    expect(threw).toBeInstanceOf(Error);
+    expect((threw as Error).message).not.toContain("bound to agent");
+    expect((threw as Error).message).toBe(
+      `task is bound to profile "P1" — detach it first (agetor edit ${t.id.slice(0, 8)} --detach-profile)`,
+    );
+
+    // Combined with --detach-profile the edit should succeed — detach runs
+    // first, unlocking the bound fields before the rest of the patch.
+    await cmdEdit([t.id, "--detach-profile", "--title", "Bound (detached)"], {
+      dataDir: dir, json: false, plain: true, noDaemon: false,
+    });
+    const after = await client.getTask(t.id);
+    expect(after.agentProfileId).toBeNull();
+    expect(after.title).toBe("Bound (detached)");
+
+    await client.deleteAgentProfile(profile.id);
+    await client.deleteTask(t.id);
+    rmSync(workdir, { recursive: true, force: true });
   });
 }, 30_000);

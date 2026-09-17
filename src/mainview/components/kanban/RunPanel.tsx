@@ -7,6 +7,7 @@ import {
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
+import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
@@ -67,10 +68,12 @@ import {
   supportedEfforts,
   supportedModes,
   type AgentKind,
+  type AgentProfile,
   type AgentStatus,
   type Harness,
   type BacklogMessage,
   type FxRecoveryPayload,
+  type AgentProfileSnapshot,
   type FxUsagePayload,
   type GitHubPullMergeability,
   type Run,
@@ -98,6 +101,8 @@ import { cleanPromptPane } from "@/lib/prompt-noise";
 import { parseUserMessage, splitReferences, parseMessageSegments, type MessageSegment } from "../../../shared/user-message.ts";
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
+import { AgentProfileCard } from "./AgentProfileCard";
+import { AgentProfileDetailsDialog } from "./AgentProfileDetailsDialog";
 import { AttachmentChips } from "./AttachmentChips";
 import { SentFilesCard } from "./SentFilesCard";
 import {
@@ -173,6 +178,22 @@ interface Props {
   /** Registered harnesses — needed so the panel's agent dropdown can list
    *  every known harness (built-ins + aliases). */
   harnesses: Harness[];
+  /** Saved agent profiles — resolves the header chip (`resolveTaskProfileDisplay`)
+   *  and, in Task details, whether the agent/mode/model/effort(/fast/max)
+   *  controls are locked (`task.agentProfileId != null`). `null` means the
+   *  first `GET /agent-profiles` fetch hasn't succeeded yet (see
+   *  `useAgentProfiles`'s `loaded` flag) — `resolveTaskProfileDisplay` never
+   *  reports `deleted` in that state, so a bound task's chip can't flash
+   *  "(deleted)" while loading or after a failed fetch. */
+  profiles: AgentProfile[] | null;
+  /** Optimistically merges partial fields into this task in the parent's
+   *  `tasks` state (e.g. after detaching an agent profile) — mirrors the
+   *  `unread`-only merge App.tsx already does on mark-seen, never a
+   *  wholesale Task replace (would revert a concurrent optimistic patch). */
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
+  /** "Manage agents…" — wired to the task-details Detach hint's sibling
+   *  affordance and the header chip, mirroring `NewTaskForm`'s own prop. */
+  onOpenSettingsAgents: () => void;
   agentModels: AgentModelMap;
   /** Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`
    *  on the api client. Preferred over `agentModels` for the task's own
@@ -284,7 +305,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, stickyUserMessages, agents, harnesses, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -484,10 +505,13 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, agentMod
           stickyUserMessages={stickyUserMessages}
           agents={agents}
           harnesses={harnesses}
+          profiles={profiles}
+          onOpenSettingsAgents={onOpenSettingsAgents}
           agentModels={agentModels}
           harnessModels={harnessModels}
           onRefreshModels={onRefreshModels}
           homeDir={homeDir}
+          onTaskFieldsChanged={onTaskFieldsChanged}
           open={open}
           openRef={openRef}
           onClose={onClose}
@@ -512,10 +536,13 @@ function RunPanelBody({
   stickyUserMessages,
   agents,
   harnesses,
+  profiles,
+  onOpenSettingsAgents,
   agentModels,
   harnessModels,
   onRefreshModels,
   homeDir,
+  onTaskFieldsChanged,
   open,
   openRef,
   onClose,
@@ -530,10 +557,13 @@ function RunPanelBody({
   stickyUserMessages: boolean;
   agents: AgentStatus[];
   harnesses: Harness[];
+  profiles: AgentProfile[] | null;
+  onOpenSettingsAgents: () => void;
   agentModels: AgentModelMap;
   harnessModels: Record<string, { id: string; label?: string }[]>;
   onRefreshModels: (harnessId?: string) => Promise<void>;
   homeDir: string;
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
   /** Whether the panel is in its "open" (not mid-close-animation, not
    *  pre-mount) state — mirrors `RunPanel`'s own `open` state. Gates the
    *  Cmd/Ctrl+F listener below so it doesn't hijack the shortcut while the
@@ -568,6 +598,16 @@ function RunPanelBody({
    *  against `currentTaskIdRef.current` after every `await` before writing
    *  shared per-task state. */
   const currentTaskIdRef = useRef(task.id);
+  // Agent-profile header chip: `resolveTaskProfileDisplay` gives the
+  // deleted flag + summary (live profile until the task's first run — plan
+  // D2 — else the frozen snapshot); `agentProfileForCard` resolves the
+  // richer object `AgentProfileCard` itself renders from (model/effort/
+  // mode/instructions/skills), same live-or-snapshot preference.
+  const agentProfileDisplay = resolveTaskProfileDisplay(task, profiles, harnesses);
+  const agentProfileForCard: AgentProfile | AgentProfileSnapshot | null =
+    (task.agentProfileId ? (profiles?.find((p) => p.id === task.agentProfileId) ?? null) : null)
+    ?? task.agentProfile
+    ?? null;
   const [runs, setRuns] = useState<Run[]>([]);
   /** Structured event stream — one entry per claude JSONL block or per
    *  codex stdout/stderr chunk. The renderer dispatches on `stream` to
@@ -3415,11 +3455,23 @@ function RunPanelBody({
           </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
-        <div className="mt-0.5 truncate text-xs text-muted-foreground">
-          {task.agent} · {task.column}
-          {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
-          {task.baseRef && (
-            <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
+        <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
+          <span className="truncate">
+            {task.agent} · {task.column}
+            {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
+            {task.baseRef && (
+              <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
+            )}
+          </span>
+          {agentProfileDisplay && agentProfileForCard && (
+            <span data-testid="task-agent-profile-chip" title={agentProfileDisplay.summary} className="shrink-0">
+              <AgentProfileCard
+                profile={agentProfileForCard}
+                harnesses={harnesses}
+                variant="chip"
+                deleted={agentProfileDisplay.deleted}
+              />
+            </span>
           )}
         </div>
       </header>
@@ -3491,11 +3543,30 @@ function RunPanelBody({
         task={task}
         agents={agents}
         harnesses={harnesses}
+        agentProfileDisplay={agentProfileDisplay}
+        agentProfileForCard={agentProfileForCard}
+        onOpenSettingsAgents={onOpenSettingsAgents}
         agentModels={agentModels}
         harnessModels={harnessModels}
         onRefreshModels={onRefreshModels}
         homeDir={homeDir}
+        onTaskFieldsChanged={onTaskFieldsChanged}
         tmuxSession={latestRun?.tmuxSession ?? null}
+        // "Has this task ever run" for the Agent-details dialog's status
+        // line — the union of every signal in scope, since each is
+        // individually incomplete: `runs` (this component's own polled
+        // `GET /tasks/:id/runs` history) is the most truthful match for the
+        // orchestrator's own freeze gate (`runs.countForTask(task.id) === 0`,
+        // CLAUDE.md item 15) because it counts a run regardless of outcome,
+        // but reads empty for one brief tick after a task remount before its
+        // first poll lands; `task.hasOpenableRun` is available immediately
+        // from the task row itself (no fetch race) but excludes
+        // failed/cancelled runs, so a task whose only run failed would read
+        // as "never run" even though the profile is already frozen;
+        // `task.runId` only reflects a currently in-flight run and reverts
+        // to null once it settles. ORing all three means any one of them
+        // proving a run happened is enough.
+        hasRun={runs.length > 0 || task.hasOpenableRun || task.runId != null}
       />
 
       <RunsList runs={runs} usageByRun={usageByRunId} providerByRun={providerByRunId} titleByRun={titleByRunId} />
@@ -6335,28 +6406,87 @@ function TaskDetails({
   task,
   agents,
   harnesses,
+  agentProfileDisplay,
+  agentProfileForCard,
+  onOpenSettingsAgents,
   agentModels,
   harnessModels,
   onRefreshModels,
   homeDir,
+  onTaskFieldsChanged,
   tmuxSession,
+  hasRun,
 }: {
   task: Task;
   agents: AgentStatus[];
   harnesses: Harness[];
+  /** Resolved agent-profile chip data for this task (`null` when the task
+   *  was never bound to a profile) — see `RunPanelBody`'s own computation,
+   *  reused here so the lock/hint/Detach affordances below and the header
+   *  chip never disagree on the profile's name / deleted state. */
+  agentProfileDisplay: TaskProfileDisplay | null;
+  /** The richer live-or-snapshot object `AgentProfileCard` itself renders
+   *  from (model/effort/mode/instructions/skills) — same object the header
+   *  chip uses (`RunPanelBody`'s `agentProfileForCard`), reused here for the
+   *  Agent row's chip so the two never disagree. `null` alongside
+   *  `agentProfileDisplay` when the task was never bound to a profile. */
+  agentProfileForCard: AgentProfile | AgentProfileSnapshot | null;
+  /** "Manage agents…" — the bound-profile hint's sibling link into Settings. */
+  onOpenSettingsAgents: () => void;
   agentModels: AgentModelMap;
   harnessModels: Record<string, { id: string; label?: string }[]>;
   onRefreshModels: (harnessId?: string) => Promise<void>;
   homeDir: string;
+  /** Optimistically merges partial task fields into the parent's `tasks`
+   *  state — used by Detach below so the unlock is visible immediately
+   *  instead of waiting for the next 2s poll. */
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
   /** Tmux session name from the latest run (claude-code only). `null` when
    *  no run has spawned a session yet — the Tmux row hides itself in that
    *  case rather than presenting an Attach button that's guaranteed to 404. */
   tmuxSession: string | null;
+  /** Whether this task has ever run — see the call site's doc comment
+   *  (`RunPanelBody`) for how this is derived. Threaded through to
+   *  `AgentProfileDetailsDialog`'s status line only. */
+  hasRun: boolean;
 }) {
   // Spins the Model row's ↻ button while a manual `onRefreshModels` probe is
   // in flight for this task's harness — mirrors NewTaskForm's affordance.
   const [refreshingModels, setRefreshingModels] = useState(false);
-  const editable = task.column !== "running" && task.column !== "blocked";
+  // A task bound to an agent profile (plan D5) locks the four dropdowns
+  // (+ cursor fast/max) regardless of run state — only Detach unlocks them.
+  // `runningLock` alone (the pre-existing rule) still gates the Detach
+  // button itself, so a bound task can't be detached mid-run.
+  const runningLock = task.column === "running" || task.column === "blocked";
+  const profileLock = task.agentProfileId != null;
+  const editable = !runningLock && !profileLock;
+  const [detaching, setDetaching] = useState(false);
+  // Agent-details modal (plan D2), opened by clicking the chip in the Agent
+  // row below. Closed defensively if the task becomes unbound while open —
+  // Detach clears `task.agentProfileId`/`agentProfile` out from under it, and
+  // a still-open dialog would otherwise render a suddenly-empty snapshot.
+  const [profileDialogOpen, setProfileDialogOpen] = useState(false);
+  useEffect(() => {
+    if (profileDialogOpen && !profileLock) setProfileDialogOpen(false);
+  }, [profileDialogOpen, profileLock]);
+  const detachProfile = async () => {
+    setDetaching(true);
+    try {
+      const updated = await api.detachTaskAgentProfile(task.id);
+      // Merge the returned task's cleared `agentProfileId`/`agentProfile`
+      // back optimistically — don't wait for the parent's 2s task poll
+      // (`App.tsx`) to unlock the dropdowns. Only these two fields, never
+      // the whole snapshot (would revert a concurrent optimistic patch).
+      onTaskFieldsChanged?.(task.id, {
+        agentProfileId: updated.agentProfileId,
+        agentProfile: updated.agentProfile,
+      });
+    } catch (e) {
+      toast.error("Couldn't detach agent", { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setDetaching(false);
+    }
+  };
   const kind = harnessKindOf(task.agent, harnesses);
   const selectedStatus = agents.find((a) => a.harnessId === task.agent);
 
@@ -6464,6 +6594,11 @@ function TaskDetails({
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
   const fastAvailable = kind === "cursor" && cursorModelSupportsFast(task.model, task.effort);
   useEffect(() => {
+    // A profile-bound task's effort is owned by the profile, not this
+    // cascade — mutating it here would PATCH a field the profile lock is
+    // supposed to keep the user's hands off (see the `profileLock`/`editable`
+    // rule above).
+    if (task.agentProfileId != null) return;
     if (task.effort && retainable.has(task.effort)) return;
     if (supportedEffortsForModel.length === 0) {
       if (task.effort !== null) void save({ effort: null });
@@ -6474,15 +6609,19 @@ function TaskDetails({
       : supportedEffortsForModel[0]!.id;
     if (task.effort !== fallback) void save({ effort: fallback });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel]);
+  }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel, task.agentProfileId]);
   useEffect(() => {
+    // Same profile-lock guard as the effort cascade above — `fast`/`maxMode`
+    // are also profile-owned fields once bound.
+    if (task.agentProfileId != null) return;
     if (task.fast && !fastAvailable) void save({ fast: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fastAvailable, task.fast]);
+  }, [fastAvailable, task.fast, task.agentProfileId]);
   useEffect(() => {
+    if (task.agentProfileId != null) return;
     if (task.maxMode && !maxModeAvailable) void save({ maxMode: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [maxModeAvailable, task.maxMode]);
+  }, [maxModeAvailable, task.maxMode, task.agentProfileId]);
 
   const onAgentChange = (nextId: string) => {
     if (nextId === task.agent) return;
@@ -6535,231 +6674,317 @@ function TaskDetails({
   const nullModeFallback = modeOptions.some((m) => m.id === preferred)
     ? preferred
     : (modeOptions[0]?.id ?? "bypass");
+  // Hint-line name fallback (finding F1-1): prefer the resolved display's
+  // name, then the raw frozen snapshot's own name, and only fall back to
+  // "an unknown agent" copy when neither yields anything — never interpolate
+  // an empty quoted name into the sentence.
+  const agentProfileHintName = agentProfileDisplay?.name || task.agentProfile?.name || null;
+  // Action-cluster gate (finding F1-1): a task can be locked
+  // (`task.agentProfileId != null`) with no readable snapshot AND no
+  // matching live profile — malformed snapshot JSON, or a retired harness
+  // kind — in which case `agentProfileForCard` is null even though the row
+  // is very much bound to *something*. Gating on `profileLock` in addition
+  // to `agentProfileDisplay` (which is itself already non-null whenever
+  // `profileLock` is true — see `resolveTaskProfileDisplay`) keeps the
+  // Detach/Manage affordances reachable in that case instead of stranding
+  // the user behind a "None" row they can't escape.
+  const showAgentProfileActions = profileLock || agentProfileDisplay != null;
 
   return (
-    <details className="border-b border-border/60 px-3 py-2 text-xs">
-      <summary className="cursor-pointer text-muted-foreground">
-        <span className="text-[10px] uppercase tracking-wide">Task details</span>
-      </summary>
-      <div className="mt-2 space-y-2">
-        <div>
-          <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Prompt</div>
-          <p className="max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] leading-snug">{task.prompt}</p>
-        </div>
+    <>
+      <details className="border-b border-border/60 px-3 py-2 text-xs">
+        <summary className="cursor-pointer text-muted-foreground">
+          <span className="text-[10px] uppercase tracking-wide">Task details</span>
+        </summary>
+        <div className="mt-2 space-y-2">
+          <div>
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Prompt</div>
+            <p className="max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] leading-snug">{task.prompt}</p>
+          </div>
 
-        {!editable && (
-          <p className="text-[10px] italic text-muted-foreground">
-            Stop the run to change agent / mode / model / effort.
-          </p>
-        )}
+          {!editable && (
+            <p
+              className="text-[10px] italic text-muted-foreground"
+              data-testid={profileLock ? "task-agent-profile-hint" : undefined}
+            >
+              {profileLock
+                ? (agentProfileHintName
+                  ? `Bound to agent "${agentProfileHintName}" — detach to edit.`
+                  : "Bound to an unknown agent — detach to edit.")
+                : "Stop the run to change agent / mode / model / effort."}
+            </p>
+          )}
 
-        <dl className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1 text-[11px]">
-          <dt className="text-muted-foreground">Agent</dt>
-          <dd className="min-w-0">
-            {editable ? (
-              <AgentSelect
-                value={task.agent}
-                harnesses={harnesses}
-                agents={agents}
-                onChange={onAgentChange}
-              />
-            ) : (
-              <span className="inline-flex items-center gap-1">
-                <AgentIcon kind={kind} className="size-3" /> {task.agent}
-              </span>
-            )}
-          </dd>
-
-          <dt className="text-muted-foreground">Mode</dt>
-          <dd className="min-w-0">
-            {editable ? (
-              <CompactSelect
-                value={task.mode ?? nullModeFallback}
-                options={modeOptions}
-                onChange={(mode) => void save({ mode })}
-              />
-            ) : (
-              <span>{task.mode ?? "—"}</span>
-            )}
-          </dd>
-
-          <dt className="flex items-center gap-1 text-muted-foreground">
-            Model
-            {editable && (
-              <Tooltip label="Refresh model list">
-                <button
-                  type="button"
-                  aria-label="Refresh model list"
-                  data-testid="refresh-models-details"
-                  disabled={refreshingModels}
-                  className={cn(
-                    "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
-                    refreshingModels && "animate-spin",
+          <dl className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1 text-[11px]">
+            <dt className="text-muted-foreground">Agent</dt>
+            <dd className="min-w-0">
+              {showAgentProfileActions ? (
+                <div className="flex flex-wrap items-center gap-2">
+                  {agentProfileForCard ? (
+                    <button
+                      type="button"
+                      data-testid="task-agent-profile-open"
+                      aria-haspopup="dialog"
+                      aria-expanded={profileDialogOpen}
+                      aria-label="View agent details"
+                      onClick={() => setProfileDialogOpen(true)}
+                      className="min-w-0 max-w-full rounded-full transition-opacity hover:opacity-80"
+                    >
+                      <AgentProfileCard
+                        variant="chip"
+                        profile={agentProfileForCard}
+                        harnesses={harnesses}
+                        deleted={agentProfileDisplay?.deleted ?? true}
+                      />
+                    </button>
+                  ) : (
+                    <span data-testid="task-agent-profile-unknown" className="text-warning">
+                      Unknown agent
+                    </span>
                   )}
-                  onClick={async () => {
-                    setRefreshingModels(true);
-                    try {
-                      await onRefreshModels(task.agent);
-                    } catch {
-                      // The SSE / ready-retry paths also refetch.
-                    } finally {
-                      setRefreshingModels(false);
-                    }
-                  }}
-                >
-                  <RefreshCw className="size-3" />
-                </button>
-              </Tooltip>
-            )}
-          </dt>
-          <dd className="min-w-0">
-            {editable ? (
-              <CompactSelect
-                value={task.model ?? DEFAULT_MODEL[kind]}
-                options={modelOptions}
-                onChange={(model) => void save({ model })}
-              />
-            ) : (
-              <span>{task.model ?? "—"}</span>
-            )}
-          </dd>
-
-          <dt className="text-muted-foreground">Effort</dt>
-          <dd className="min-w-0">
-            {editable ? (
-              <CompactSelect
-                value={task.effort ?? ""}
-                options={effortSelectOptions}
-                onChange={(effort) => void save({ effort })}
-                disabled={supportedEffortsForModel.length === 0}
-                placeholder="n/a"
-              />
-            ) : (
-              <span>{task.effort ?? "—"}</span>
-            )}
-          </dd>
-
-          {kind === "cursor" && (maxModeAvailable || task.maxMode) && (
-            <>
-              <dt className="text-muted-foreground">Max Mode</dt>
-              <dd className="min-w-0">
-                {editable ? (
-                  <Switch
-                    checked={task.maxMode}
-                    onCheckedChange={(maxMode) => void save({ maxMode })}
-                    disabled={!maxModeAvailable}
-                    aria-label="Use Cursor Max Mode context"
-                  />
-                ) : (
-                  <span>{task.maxMode ? "on" : "off"}</span>
-                )}
-              </dd>
-            </>
-          )}
-
-          {kind === "cursor" && (fastAvailable || task.fast) && (
-            <>
-              <dt className="text-muted-foreground">Fast</dt>
-              <dd className="min-w-0">
-                {editable ? (
-                  <Switch
-                    checked={task.fast}
-                    onCheckedChange={(fast) => void save({ fast })}
-                    disabled={!fastAvailable}
-                    aria-label="Use Cursor fast variant"
-                  />
-                ) : (
-                  <span>{task.fast ? "on" : "off"}</span>
-                )}
-              </dd>
-            </>
-          )}
-
-          <dt className="text-muted-foreground">Project</dt>
-          <dd className="min-w-0 truncate font-mono" title={task.workdir}>
-            {abbreviateHome(task.workdir, homeDir)}
-          </dd>
-
-          <dt className="text-muted-foreground">Isolation</dt>
-          <dd className="min-w-0">{task.isolation}</dd>
-
-          {task.branch && (
-            <>
-              <dt className="text-muted-foreground">Branch</dt>
-              <dd className="min-w-0 truncate font-mono">{task.branch}</dd>
-            </>
-          )}
-          {task.baseRef && (
-            <>
-              <dt className="text-muted-foreground">Base</dt>
-              <dd className="min-w-0 truncate font-mono">{task.baseRef.slice(0, 12)}</dd>
-            </>
-          )}
-          {kind === "claude-code" && tmuxSession && (
-            <>
-              <dt className="text-muted-foreground">Tmux</dt>
-              <dd className="flex min-w-0 items-center justify-between gap-2">
-                <span className="min-w-0 truncate font-mono" title={tmuxSession}>
-                  {tmuxSession}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 px-2 text-[10px]"
+                    data-testid="task-agent-profile-detach"
+                    disabled={runningLock || detaching}
+                    onClick={() => void detachProfile()}
+                  >
+                    Detach
+                  </Button>
+                  <button
+                    type="button"
+                    data-testid="task-agent-profile-manage"
+                    onClick={onOpenSettingsAgents}
+                    className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                  >
+                    Manage agents…
+                  </button>
+                </div>
+              ) : (
+                <span data-testid="task-agent-profile-none" className="text-muted-foreground">
+                  None
                 </span>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-6 shrink-0 px-2 text-[11px]"
-                  onClick={() => {
-                    void api.openTmux(task.id).catch((err: unknown) => {
-                      const msg = err instanceof Error ? err.message : "Could not attach to tmux session";
-                      toast.error(msg);
-                    });
-                  }}
-                  title={`Attach to the tmux session in a new Terminal window (tmux attach -t ${tmuxSession})`}
-                >
-                  <Terminal className="mr-1 size-3" /> Attach
-                </Button>
-              </dd>
-            </>
-          )}
-          {task.references.length > 0 && (
-            <>
-              <dt className="text-muted-foreground self-start">Files</dt>
-              <dd className="min-w-0">
-                <details open>
-                  <summary className="cursor-pointer text-muted-foreground">
-                    <span className="font-mono">({task.references.length})</span>{" "}
-                    files / folders
-                  </summary>
-                  <ul className="mt-1 space-y-0.5">
-                    {task.references.map((r) => {
-                      const Icon = iconForRef(r);
-                      return (
-                        <li
-                          key={r.path}
-                          title={r.path}
-                          className="flex items-center gap-1"
-                        >
-                          <Icon className="size-3 shrink-0 opacity-70" />
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void api
-                                .openPath({ path: r.path, taskId: task.id })
-                                .catch(() => {})
-                            }
-                            className="truncate font-mono text-left hover:underline"
+              )}
+            </dd>
+
+            <dt className="text-muted-foreground">Harness</dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <AgentSelect
+                  value={task.agent}
+                  harnesses={harnesses}
+                  agents={agents}
+                  onChange={onAgentChange}
+                />
+              ) : (
+                <span className="inline-flex items-center gap-1">
+                  <AgentIcon kind={kind} className="size-3" /> {task.agent}
+                </span>
+              )}
+            </dd>
+
+            <dt className="text-muted-foreground">Mode</dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <CompactSelect
+                  value={task.mode ?? nullModeFallback}
+                  options={modeOptions}
+                  onChange={(mode) => void save({ mode })}
+                />
+              ) : (
+                <span>{task.mode ?? "—"}</span>
+              )}
+            </dd>
+
+            <dt className="flex items-center gap-1 text-muted-foreground">
+              Model
+              {editable && (
+                <Tooltip label="Refresh model list">
+                  <button
+                    type="button"
+                    aria-label="Refresh model list"
+                    data-testid="refresh-models-details"
+                    disabled={refreshingModels}
+                    className={cn(
+                      "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
+                      refreshingModels && "animate-spin",
+                    )}
+                    onClick={async () => {
+                      setRefreshingModels(true);
+                      try {
+                        await onRefreshModels(task.agent);
+                      } catch {
+                        // The SSE / ready-retry paths also refetch.
+                      } finally {
+                        setRefreshingModels(false);
+                      }
+                    }}
+                  >
+                    <RefreshCw className="size-3" />
+                  </button>
+                </Tooltip>
+              )}
+            </dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <CompactSelect
+                  value={task.model ?? DEFAULT_MODEL[kind]}
+                  options={modelOptions}
+                  onChange={(model) => void save({ model })}
+                />
+              ) : (
+                <span>{task.model ?? "—"}</span>
+              )}
+            </dd>
+
+            <dt className="text-muted-foreground">Effort</dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <CompactSelect
+                  value={task.effort ?? ""}
+                  options={effortSelectOptions}
+                  onChange={(effort) => void save({ effort })}
+                  disabled={supportedEffortsForModel.length === 0}
+                  placeholder="n/a"
+                />
+              ) : (
+                <span>{task.effort ?? "—"}</span>
+              )}
+            </dd>
+
+            {kind === "cursor" && (maxModeAvailable || task.maxMode) && (
+              <>
+                <dt className="text-muted-foreground">Max Mode</dt>
+                <dd className="min-w-0">
+                  {editable ? (
+                    <Switch
+                      checked={task.maxMode}
+                      onCheckedChange={(maxMode) => void save({ maxMode })}
+                      disabled={!maxModeAvailable}
+                      aria-label="Use Cursor Max Mode context"
+                    />
+                  ) : (
+                    <span>{task.maxMode ? "on" : "off"}</span>
+                  )}
+                </dd>
+              </>
+            )}
+
+            {kind === "cursor" && (fastAvailable || task.fast) && (
+              <>
+                <dt className="text-muted-foreground">Fast</dt>
+                <dd className="min-w-0">
+                  {editable ? (
+                    <Switch
+                      checked={task.fast}
+                      onCheckedChange={(fast) => void save({ fast })}
+                      disabled={!fastAvailable}
+                      aria-label="Use Cursor fast variant"
+                    />
+                  ) : (
+                    <span>{task.fast ? "on" : "off"}</span>
+                  )}
+                </dd>
+              </>
+            )}
+
+            <dt className="text-muted-foreground">Project</dt>
+            <dd className="min-w-0 truncate font-mono" title={task.workdir}>
+              {abbreviateHome(task.workdir, homeDir)}
+            </dd>
+
+            <dt className="text-muted-foreground">Isolation</dt>
+            <dd className="min-w-0">{task.isolation}</dd>
+
+            {task.branch && (
+              <>
+                <dt className="text-muted-foreground">Branch</dt>
+                <dd className="min-w-0 truncate font-mono">{task.branch}</dd>
+              </>
+            )}
+            {task.baseRef && (
+              <>
+                <dt className="text-muted-foreground">Base</dt>
+                <dd className="min-w-0 truncate font-mono">{task.baseRef.slice(0, 12)}</dd>
+              </>
+            )}
+            {kind === "claude-code" && tmuxSession && (
+              <>
+                <dt className="text-muted-foreground">Tmux</dt>
+                <dd className="flex min-w-0 items-center justify-between gap-2">
+                  <span className="min-w-0 truncate font-mono" title={tmuxSession}>
+                    {tmuxSession}
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 shrink-0 px-2 text-[11px]"
+                    onClick={() => {
+                      void api.openTmux(task.id).catch((err: unknown) => {
+                        const msg = err instanceof Error ? err.message : "Could not attach to tmux session";
+                        toast.error(msg);
+                      });
+                    }}
+                    title={`Attach to the tmux session in a new Terminal window (tmux attach -t ${tmuxSession})`}
+                  >
+                    <Terminal className="mr-1 size-3" /> Attach
+                  </Button>
+                </dd>
+              </>
+            )}
+            {task.references.length > 0 && (
+              <>
+                <dt className="text-muted-foreground self-start">Files</dt>
+                <dd className="min-w-0">
+                  <details open>
+                    <summary className="cursor-pointer text-muted-foreground">
+                      <span className="font-mono">({task.references.length})</span>{" "}
+                      files / folders
+                    </summary>
+                    <ul className="mt-1 space-y-0.5">
+                      {task.references.map((r) => {
+                        const Icon = iconForRef(r);
+                        return (
+                          <li
+                            key={r.path}
+                            title={r.path}
+                            className="flex items-center gap-1"
                           >
-                            {refBasename(r.path)}{r.isDirectory ? "/" : ""}
-                          </button>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </details>
-              </dd>
-            </>
-          )}
-        </dl>
-      </div>
-    </details>
+                            <Icon className="size-3 shrink-0 opacity-70" />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void api
+                                  .openPath({ path: r.path, taskId: task.id })
+                                  .catch(() => {})
+                              }
+                              className="truncate font-mono text-left hover:underline"
+                            >
+                              {refBasename(r.path)}{r.isDirectory ? "/" : ""}
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </details>
+                </dd>
+              </>
+            )}
+          </dl>
+        </div>
+      </details>
+      <AgentProfileDetailsDialog
+        open={profileDialogOpen}
+        onClose={() => setProfileDialogOpen(false)}
+        task={task}
+        display={agentProfileDisplay}
+        deleted={agentProfileDisplay?.deleted ?? false}
+        hasRun={hasRun}
+        harnesses={harnesses}
+        onOpenSettingsAgents={onOpenSettingsAgents}
+      />
+    </>
   );
 }
 

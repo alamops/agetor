@@ -14,6 +14,7 @@ import {
   userMessageLines,
 } from "./user-message.ts";
 import { appendReferences } from "./refs.ts";
+import { composeLaunchPrompt } from "./agent-profile.ts";
 import type { TaskReference } from "./types.ts";
 
 const REFS: TaskReference[] = [
@@ -1094,6 +1095,50 @@ describe("userMessageLines — generic tag label includes attrs when present (Fi
   test("a generic tag with no attributes keeps the plain '<name>›' label (no regression)", () => {
     expect(userMessageLines("<context>hello</context>")).toEqual([
       { label: "context›", text: "hello", tone: "tag" },
+    ]);
+  });
+});
+
+describe("agent instructions tag", () => {
+  test("composeLaunchPrompt output (instructions + skills) renders as an agent› line for the tag body, then a you› line with 'Your task:' + the prompt", () => {
+    const composed = composeLaunchPrompt({ instructions: "Be nice", skills: ["a", "b"] }, "do X");
+    expect(userMessageLines(composed)).toEqual([
+      {
+        label: "agent›",
+        text:
+          "Be nice\n\nSkills to use for this task (invoke each with its skill tool before starting): /a, /b",
+        tone: "tag",
+      },
+      { label: "you›", text: "Your task:\ndo X", tone: "user" },
+    ]);
+  });
+
+  test("instructions-only preamble (no skills line) still renders as agent› followed by you›", () => {
+    const composed = composeLaunchPrompt({ instructions: "Be nice", skills: [] }, "hello");
+    expect(userMessageLines(composed)).toEqual([
+      { label: "agent›", text: "Be nice", tone: "tag" },
+      { label: "you›", text: "Your task:\nhello", tone: "user" },
+    ]);
+  });
+
+  test("skills-only preamble (blank instructions) still renders as agent› followed by you›", () => {
+    const composed = composeLaunchPrompt({ instructions: "", skills: ["only-one"] }, "hello");
+    expect(userMessageLines(composed)).toEqual([
+      {
+        label: "agent›",
+        text: "Skills to use for this task (invoke each with its skill tool before starting): /only-one",
+        tone: "tag",
+      },
+      { label: "you›", text: "Your task:\nhello", tone: "user" },
+    ]);
+  });
+
+  test("no profile (or blank instructions + no skills): composeLaunchPrompt returns the prompt unchanged, so it renders as an ordinary you› line with no agent› line at all", () => {
+    expect(userMessageLines(composeLaunchPrompt(null, "just a message"))).toEqual([
+      { label: "you›", text: "just a message", tone: "user" },
+    ]);
+    expect(userMessageLines(composeLaunchPrompt({ instructions: "  ", skills: [] }, "just a message"))).toEqual([
+      { label: "you›", text: "just a message", tone: "user" },
     ]);
   });
 });

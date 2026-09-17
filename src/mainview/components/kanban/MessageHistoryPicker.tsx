@@ -3,6 +3,7 @@ import { History } from "lucide-react";
 import { api, type SentMessageItem } from "@/lib/api";
 import { isMachineEmittedMessage, parseUserMessage, splitReferences } from "../../../shared/user-message.ts";
 import { canonicalizeAttachmentText } from "../../../shared/attachments.ts";
+import { stripAgentInstructionsPreamble } from "../../../shared/agent-profile.ts";
 import { cn } from "@/lib/utils";
 
 /** Server-side fetch clamp is 200 (see `api.fetchMessageHistory`); the list
@@ -48,7 +49,13 @@ interface CleanedItem {
  *  history reproduces the original prompt byte-for-byte rather than losing
  *  the tags the user relied on. */
 function cleanMessageText(raw: string): string {
-  const text = canonicalizeAttachmentText(raw.replace(/\r\n?/g, "\n"));
+  // Strip a launched-from-profile preamble before anything else — resending
+  // this message must not re-inject it a second time (`startTask` adds its
+  // own fresh copy). Stripping first also means every branch below reparses
+  // exactly what the user actually typed ("Your task:\n{prompt}" minus the
+  // wrapper reduces to `prompt` itself), so this is the one place the strip
+  // needs to happen.
+  const text = stripAgentInstructionsPreamble(canonicalizeAttachmentText(raw.replace(/\r\n?/g, "\n")));
   const parsed = parseUserMessage(text);
   let display: string;
   if (parsed?.kind === "command") {
@@ -172,6 +179,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
     <div ref={rootRef} className={cn("relative", className)}>
       <button
         type="button"
+        data-testid="message-history-trigger"
         disabled={disabled}
         onClick={() => setOpen((o) => !o)}
         title="Insert a past message"
@@ -192,6 +200,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
           // Marker for RunPanel's global Escape handler so it yields to this
           // popover instead of closing the whole panel underneath it.
           data-popover-open=""
+          data-testid="message-history-popover"
           // This repo defines no `bg-popover`/`text-popover-foreground`
           // tokens (see tailwind.config.js / index.css) — those classes emit
           // no CSS and rendered the dropdown transparent. `bg-card` /
@@ -216,6 +225,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
                 <li key={item.key} role="option" aria-selected={false}>
                   <button
                     type="button"
+                    data-testid="message-history-item"
                     onClick={() => {
                       onPick(item.text);
                       setOpen(false);

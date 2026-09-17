@@ -17,6 +17,9 @@ export const USAGE: Record<string, string> = {
     --agent <id>       harness id          --workdir <path>   git repo to run in
     --isolation <m>    worktree | none     --base-ref <ref>   branch base (default HEAD)
     --model <id>   --mode <id>   --effort <id>
+    --profile <id|name>  launch from a saved agent profile (agetor profile ls) —
+                        cannot combine with --agent/--model/--mode/--effort/
+                        --fast/--max-mode, the profile defines them
     --type <t>         task | subtask | epic | feature | bug | spike
     --ref <path>       attach a file/folder reference (repeatable)
     --issue <url>      seed title/prompt from a GitHub/GitLab issue + its thread
@@ -104,8 +107,11 @@ export const USAGE: Record<string, string> = {
   edit: `usage: agetor edit <task-id> [flags]   (at least one flag)
 
   Patch a task. Changing model / mode / effort applies to a live session mid-run.
+  A task bound to an agent profile refuses agent/mode/model/effort/fast/max-mode
+  edits (409) — pass --detach-profile first (or alongside) to unlock them.
     --title <s>   --prompt <s> | --prompt-file <p>   --agent <id>   --workdir <p>
-    --model <id>   --mode <id>   --effort <id>   --type <t>   --column <c>`,
+    --model <id>   --mode <id>   --effort <id>   --type <t>   --column <c>
+    --detach-profile   unbind from the task's agent profile (keeps its values)`,
 
   move: `usage: agetor move <task-id> <column>   (columns: ${COLUMN_IDS})
 
@@ -137,6 +143,13 @@ export const USAGE: Record<string, string> = {
   Run 'agetor harness add --help' / 'edit --help' for their flags;
   'agetor harness shell <id>' opens a shell with the harness env for login.`,
 
+  profile: `usage: agetor profile <ls | show <ref> | add <name> … | edit <ref> … | rm <ref>>
+
+  Manage agent profiles — a reusable harness + model + effort + mode +
+  instructions + skills preset — pick one at launch with 'agetor add --profile'.
+  <ref> is a profile id or its (unique, case-insensitive) name.
+  Run 'agetor profile add --help' / 'edit --help' for their flags.`,
+
   // Subcommand-keyed blocks ("<cmd> <sub>") back both `agetor <cmd> <sub> --help`
   // and that subcommand's bad-argument error. Trivial subcommands (harness
   // enable/disable/rm, projects rm/branches) fall back to the command block.
@@ -157,6 +170,16 @@ export const USAGE: Record<string, string> = {
   Open your shell with the harness's env applied (CLAUDE_CONFIG_DIR / HOME, custom
   env, bin on PATH). Run 'claude /login' (or 'codex login') here to authenticate a
   parallel account against its own config. Ctrl-D to exit.`,
+
+  "profile add": `usage: agetor profile add <name> --harness <id> --model <id> [--effort <id>] [--mode <id>] [--fast|--no-fast] [--max-mode|--no-max-mode] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …]
+
+  Create a reusable agent profile. --harness and --model are required.
+  --instructions-file - reads instructions from stdin. --skill is repeatable.`,
+
+  "profile edit": `usage: agetor profile edit <ref> [--name <new>] [--harness <id>] [--model <id>] [--effort <id>] [--mode <id>] [--fast|--no-fast] [--max-mode|--no-max-mode] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …] [--clear-skills]   (at least one flag)
+
+  Update a profile. --skill appends to the existing skill list unless
+  --clear-skills is also given (then the list is replaced).`,
 
   daemon: `usage: agetor daemon <status | start | stop>
 
@@ -181,6 +204,7 @@ const ALIASES: Record<string, string> = {
   tail: "logs",
   delete: "rm",
   harnesses: "harness",
+  profiles: "profile",
   project: "projects",
   sent: "files",
 };

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences } from "./db.ts";
+import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
@@ -129,6 +129,8 @@ import {
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import type {
+  AgentProfile,
+  AgentProfileSnapshot,
   ColumnId,
   FxRecoveryPayload,
   GlobalEvent,
@@ -154,6 +156,7 @@ import {
 import { appendReferences } from "../shared/refs.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
 import { expandAtReferencesDetailed } from "./project-files.ts";
+import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
 
 type Listener = (e: RunEvent) => void;
 const listeners = new Set<Listener>();
@@ -1018,7 +1021,7 @@ async function raceSpawnBudget<T>(
 const startingTaskIds = new Set<string>();
 /**
  * Runs the user asked to Stop while their spawn was still in flight (the
- * bounded-spawn pending window, CLAUDE.md item 15): the run row exists and
+ * bounded-spawn pending window, CLAUDE.md item 16): the run row exists and
  * is the task's current run, but no `active` handle is registered yet, so
  * `cancelRun` has nothing to kill. It records the intent here instead and
  * the detached continuation honors it on settle — kills the just-spawned
@@ -1063,6 +1066,73 @@ async function consumePendingCancel(
     updateColumn(taskId, runId, "ready");
   }
   return true;
+}
+
+/**
+ * Resolve which {@link AgentProfileSnapshot} a task should actually launch
+ * with right now — "live" (follows edits to the profile) before the task's
+ * first run, "snapshot" (frozen at whatever it captured) from the first run
+ * on, per the freeze-at-first-run rule (docs/plans/agent-profiles.md D2).
+ * Returns `null` when the task has never been bound to a profile at all
+ * (`agentProfileId` unset AND no stored snapshot — the common "no agent"
+ * case).
+ *
+ * "Live" requires both that `task.agentProfileId` still resolves to a real
+ * row (`agentProfiles.get`) AND that the task has never run
+ * (`runs.countForTask(task.id) === 0`) — a task that ran even once, or whose
+ * profile has since been deleted, falls back to the stored snapshot instead.
+ * The live profile is converted to a snapshot shape via
+ * {@link snapshotFromProfile} using the harness resolved right now
+ * (`resolveHarness(profile.harness)`) so a harness rename/relabel is
+ * reflected — if that harness no longer resolves (deleted out from under an
+ * otherwise-live profile), the stored snapshot is used instead, since there's
+ * no live harness identity left to capture.
+ *
+ * Callers needing to know whether they're looking at a live or frozen value
+ * (`startTaskInner`'s pre-first-run refresh) get that via `source`; callers
+ * that only want "the profile to inject/display right now" (the CLI, the
+ * webview) can just read `.profile`.
+ */
+export function effectiveAgentProfile(
+  task: Task,
+): { profile: AgentProfileSnapshot; source: "live" | "snapshot" } | null {
+  if (!task.agentProfileId && !task.agentProfile) return null;
+
+  if (task.agentProfileId && runs.countForTask(task.id) === 0) {
+    const profile: AgentProfile | null = agentProfiles.get(task.agentProfileId);
+    if (profile) {
+      const harness = resolveHarness(profile.harness);
+      if (harness) {
+        return {
+          profile: snapshotFromProfile(profile, { kind: harness.kind, label: harness.label }, Date.now()),
+          source: "live",
+        };
+      }
+    }
+  }
+
+  if (!task.agentProfile) return null;
+  return { profile: task.agentProfile, source: "snapshot" };
+}
+
+/**
+ * Whether `next` (the live profile, converted to snapshot shape) differs
+ * meaningfully from `prior` (whatever's stored on the task row already) —
+ * "meaningfully" excluding `capturedAt`, which is stamped fresh on every call
+ * to {@link effectiveAgentProfile} and would otherwise make this always
+ * `true`, forcing `startTaskInner`'s live-refresh block to `tasks.update`
+ * (bumping `updated_at`) on every single Run click even when the bound
+ * profile hasn't changed at all. `prior === null` (never captured before)
+ * always counts as drifted.
+ */
+export function agentProfileSnapshotDrifted(
+  prior: AgentProfileSnapshot | null,
+  next: AgentProfileSnapshot,
+): boolean {
+  if (!prior) return true;
+  const { capturedAt: _priorCapturedAt, ...priorRest } = prior;
+  const { capturedAt: _nextCapturedAt, ...nextRest } = next;
+  return JSON.stringify(priorRest) !== JSON.stringify(nextRest);
 }
 
 /**
@@ -1112,6 +1182,46 @@ async function startTaskInner(
   if (task.archivedAt != null) {
     task = tasks.update(taskId, { archivedAt: null }) ?? task;
   }
+
+  // Freeze-at-first-run (docs/plans/agent-profiles.md D2): resolve the
+  // task's agent profile — if any — BEFORE the harness pre-flight below, so
+  // a live profile edit (including a harness swap) is what actually gets
+  // resolved/checked/spawned, not whatever the task row was last left with.
+  // Only a "live" result (profile still exists AND the task has never run)
+  // triggers a copy-down; a "snapshot" result means the task already ran at
+  // least once and must launch with exactly what it launched with before —
+  // nothing to refresh, `effective` below just carries it through unchanged.
+  const resolvedProfile = effectiveAgentProfile(task);
+  if (resolvedProfile?.source === "live") {
+    const { profile } = resolvedProfile;
+    // A profile's own `effort: null` means "no opinion" — but a model that
+    // requires an effort flag (`buildCommand`'s "effort is required for …"
+    // throw) must still get a real default here, same as the no-profile path
+    // in `createTask`. Only the resolved task-row `effort` gets this
+    // treatment; the stored snapshot (`profile`, and `task.agentProfile`
+    // below) keeps the profile's raw `null`.
+    const resolvedEffort = profile.effort ?? defaultEffortFor(profile.harnessKind, profile.model, profile.harness);
+    const driftedFromRow =
+      task.agent !== profile.harness ||
+      task.model !== profile.model ||
+      task.effort !== resolvedEffort ||
+      task.mode !== profile.mode ||
+      task.fast !== profile.fast ||
+      task.maxMode !== profile.maxMode ||
+      agentProfileSnapshotDrifted(task.agentProfile ?? null, profile);
+    if (driftedFromRow) {
+      task = tasks.update(taskId, {
+        agent: profile.harness,
+        model: profile.model,
+        effort: resolvedEffort,
+        mode: profile.mode,
+        fast: profile.fast,
+        maxMode: profile.maxMode,
+      }) ?? task;
+      task = tasks.setAgentProfile(taskId, profile.id, profile) ?? task;
+    }
+  }
+  const effective: AgentProfileSnapshot | null = resolvedProfile?.profile ?? null;
 
   const harness = resolveHarness(task.agent);
   if (!harness) {
@@ -1190,14 +1300,30 @@ async function startTaskInner(
   // `spawnAgentOrFail`'s catch, exercised (with a run row landing `failed`)
   // by orchestrator-fx.test.ts's "spawn-throw hardening (gemini)" test —
   // so that pre-existing behavior/error text is unchanged by this feature.
-  const expandedOverage = promptByteOverage(harness.kind, appendReferences(expandedPrompt, task.references));
+  // Both budgets now include the agent-instructions preamble (`effective`,
+  // resolved above — null for a task with no bound profile, in which case
+  // `composeLaunchPrompt` is a no-op passthrough): the preamble is authored
+  // text that ships with every launch, so a profile whose instructions push
+  // an otherwise-fine prompt over budget must be caught by this same rule,
+  // and — since it's added identically to both sides — the
+  // `expandedOverage && !rawOverage` semantics (only the @-expansion itself
+  // pushed things over) are unchanged either way.
+  const expandedOverage = promptByteOverage(
+    harness.kind,
+    appendReferences(composeLaunchPrompt(effective, expandedPrompt), task.references),
+  );
   // Skip re-encoding the same text twice (R19, code review) when expansion
   // was a no-op — a prompt with no `@` tokens at all (or none that resolved)
   // has `expandedPrompt === task.prompt`, so `expandedOverage` already IS
-  // what re-running `promptByteOverage` on the raw prompt would compute.
+  // what re-running `promptByteOverage` on the raw prompt would compute
+  // (composing the same `effective` preamble around the same text again
+  // would only reproduce it).
   const rawOverage = expandedPrompt === task.prompt
     ? expandedOverage
-    : promptByteOverage(harness.kind, appendReferences(task.prompt, task.references));
+    : promptByteOverage(
+      harness.kind,
+      appendReferences(composeLaunchPrompt(effective, task.prompt), task.references),
+    );
   if (expandedOverage && !rawOverage) {
     return {
       error:
@@ -1271,7 +1397,14 @@ async function startTaskInner(
     emitGlobal({ kind: "column", taskId, runId, column: "running", prev: prevColumn, ts: now });
   }
 
-  const promptWithRefs = appendReferences(expandedPrompt, task.references);
+  // The agent-instructions preamble (from `effective`, if this task is bound
+  // to a profile) wraps the expanded prompt BEFORE references are appended —
+  // skills/instructions are authored text, references are file pointers, and
+  // the existing convention keeps references last (docs/plans/agent-profiles.md
+  // D3/D11). `composeLaunchPrompt` is a no-op passthrough when `effective` is
+  // null, so an unbound task's launch prompt is byte-identical to before this
+  // feature.
+  const promptWithRefs = appendReferences(composeLaunchPrompt(effective, expandedPrompt), task.references);
 
   const onChunk = makeChunkHandler(runId, taskId, harness.kind, task.mode);
   // Echo the initial prompt as a "user" event so the panel renders a
@@ -5118,6 +5251,37 @@ export interface CreateTaskInput extends Partial<Task> {
    * error) when `issueUrl` is absent or fails validation.
    */
   issueSnapshot?: string;
+  /**
+   * Bind this task to a reusable {@link AgentProfile} at create time
+   * (docs/plans/agent-profiles.md). When set to a resolvable profile id,
+   * `createTask` overrides the effective `agent`/`model`/`effort`/`mode`/
+   * `fast`/`maxMode` from the profile — any of those six fields also present
+   * in the body are ignored — and stores both the id and a point-in-time
+   * `AgentProfileSnapshot` on the new row. Also settable via the inherited
+   * `Partial<Task>` field; listed here too so its doc comment lives next to
+   * the override it triggers. An unresolvable id fails the whole create with
+   * `{ error }` rather than silently falling back to "no agent".
+   */
+  agentProfileId?: string | null;
+}
+
+/**
+ * The kind-default effort id for `model` — "kind default if offered, else
+ * strongest offered id, else null" (mirrors the picker's own rule). Shared by
+ * `createTask` (no-profile, no-explicit-effort path) and by
+ * `startTaskInner`'s live-profile refresh, which both need to fill in an
+ * effort when neither the caller nor a bound {@link AgentProfile} supplied
+ * one — a profile's own `effort: null` means "no opinion", not "no effort
+ * flag", so a model that requires one (see `buildCommand`'s
+ * "effort is required for …" throw) must still get a real default here.
+ * Discovered efforts (e.g. Codex's own app-server catalog) win over the
+ * curated `MODEL_EFFORT_SUPPORT` table when the harness reported a non-empty
+ * list for this model — see `supportedEfforts`/`getDiscoveredEfforts`.
+ */
+function defaultEffortFor(kind: AgentKind, model: string, harnessId: string): string | null {
+  const support = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, harnessId));
+  if (support.length === 0) return null;
+  return support.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : support[0]!.id;
 }
 
 /**
@@ -5193,17 +5357,34 @@ export async function createTask(
 
   const id = randomUUID();
 
+  // Agent profile override (docs/plans/agent-profiles.md D2/D3): resolved
+  // BEFORE the harness/model/effort defaulting below, since a bound profile
+  // wins outright over any of those six body-provided fields. An
+  // unresolvable id fails the whole create rather than silently degrading to
+  // "no agent" — the caller explicitly asked for a profile that doesn't
+  // exist (deleted between the picker fetching the list and the submit
+  // landing, or a typo'd CLI `--profile` id that bypassed `matchAgentProfileRef`).
+  let profile: AgentProfile | null = null;
+  const requestedProfileId = input.agentProfileId?.trim();
+  if (requestedProfileId) {
+    profile = agentProfiles.get(requestedProfileId);
+    if (!profile) {
+      return { error: `unknown agent profile "${requestedProfileId}"` };
+    }
+  }
+
   // Resolve the harness so we can default model/effort by kind. A bad alias
   // id is rejected up-front rather than persisted and surfacing as a launch
   // failure later. Falls back to the built-in claude-code id when the caller
-  // omits `agent` entirely.
-  const agentId = input.agent ?? "claude-code";
+  // omits `agent` entirely. A bound profile's own harness always wins over
+  // `input.agent`.
+  const agentId = profile ? profile.harness : (input.agent ?? "claude-code");
   const harness = resolveHarness(agentId);
   if (!harness) {
     return { error: `unknown harness "${agentId}"` };
   }
   const kind = harness.kind;
-  const model = input.model ?? DEFAULT_MODEL[kind];
+  const model = profile ? profile.model : (input.model ?? DEFAULT_MODEL[kind]);
   // Discovered efforts (e.g. Codex's own app-server catalog) win when the
   // harness reported a non-empty list for this model; the curated
   // MODEL_EFFORT_SUPPORT table is only the fallback (see
@@ -5226,12 +5407,27 @@ export async function createTask(
   // `supportedEfforts` to `DEFAULT_EFFORT.fx` (`"auto"`) whenever the model —
   // or the `DEFAULT_MODEL.fx` fallback used for an unlisted id — is one of
   // those 16; only the remaining 12 no-effort fx models (e.g. `zai/glm-4.7`)
-  // resolve to `null`.
-  const support = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, harness.id));
-  const effort = input.effort
-    ?? (support.length === 0
-      ? null
-      : support.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : support[0]!.id);
+  // resolve to `null`. That whole computation is `defaultEffortFor` below.
+  //
+  // A bound profile's `effort` is passthrough instead (D3/A5 in the plan) —
+  // the Settings form only ever offers `supportedEfforts` rows, so a stored
+  // value is already sane, and re-validating here would just re-litigate the
+  // same "discovered can understate the live API" problem the PATCH route's
+  // null-clear guard already carves an exception for. A profile whose own
+  // `effort` is `null` ("no opinion") still needs a real default when the
+  // model requires one — `buildCommand` throws "effort is required for …"
+  // otherwise — so it falls through to the same `defaultEffortFor` the
+  // no-profile path uses. Only the resolved task-row `effort` gets this
+  // treatment; `agentProfileSnapshot` below is built straight from `profile`
+  // and keeps the raw `null`.
+  let effort: string | null;
+  if (profile) {
+    effort = profile.effort ?? defaultEffortFor(kind, model, harness.id);
+  } else if (input.effort !== undefined && input.effort !== null) {
+    effort = input.effort;
+  } else {
+    effort = defaultEffortFor(kind, model, harness.id);
+  }
 
   // Validate taskType against the known set so a bogus value can't poison
   // the row (the picker only ever sends one of the canonical ids, but
@@ -5308,6 +5504,15 @@ export async function createTask(
     validatedIssueUrl = normalizeIssueUrl(rawIssueUrl);
   }
 
+  // Point-in-time capture of the bound profile (null when none). Taken here,
+  // right before insert, using the SAME `harness` this create already
+  // resolved above — never a second lookup — so the snapshot's
+  // `harnessKind`/`harnessLabel` can't drift from what the task row itself
+  // just got assigned.
+  const agentProfileSnapshot: AgentProfileSnapshot | null = profile
+    ? snapshotFromProfile(profile, { kind: harness.kind, label: harness.label }, now)
+    : null;
+
   const task = tasks.insert({
     id,
     title: input.title,
@@ -5324,11 +5529,13 @@ export async function createTask(
     // No PR exists for a brand-new task; set server-side by pull-create.
     prUrl: null,
     issueUrl: validatedIssueUrl,
-    mode: input.mode ?? null,
+    mode: profile ? profile.mode : (input.mode ?? null),
     model,
     effort,
-    fast: input.fast === true,
-    maxMode: input.maxMode === true,
+    fast: profile ? profile.fast : input.fast === true,
+    maxMode: profile ? profile.maxMode : input.maxMode === true,
+    agentProfileId: profile?.id ?? null,
+    agentProfile: agentProfileSnapshot,
     references: input.references ?? [],
     // Brand-new tasks start with an empty backlog; drafts are added later from
     // the run panel.

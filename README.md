@@ -15,6 +15,7 @@ It runs entirely on your machine. No cloud relay, no remote sandbox — agents e
 ## Highlights
 
 - **Multi-agent, multi-account.** Built-in support for five agent kinds: `claude-code`, `codex`, `cursor`, `gemini`, and `fx` (Vercel Labs' `fx.sh`, driven over the Agent Client Protocol rather than a tmux-hosted CLI — ships experimental and disabled by default until you enable it in Settings). Define additional *harnesses* to run a second account of any of them in parallel — each one gets a dedicated `$HOME` so logins, history, and config never collide.
+- **Agents.** Save a harness + model + effort + mode + free-text instructions + a skills list as a named, reusable **Agent** in Settings → Agents, then pick it on task launch instead of choosing each field by hand. Its instructions are injected into the launch prompt; a task follows the live agent until its first run, then keeps exactly what it launched with even if the agent changes later. See [Agents](#agents) below.
 - **Per-task git worktrees.** Every task runs on its own branch (`agetor/<short-id>-<slug>`) in a dedicated worktree under `~/.agetor/worktrees/`. Two agents can hammer the same repo simultaneously without stepping on each other. Base ref is pinned at create time, so re-runs always start from the same commit.
 - **Interactive Claude sessions.** Claude Code is hosted in a per-task `tmux` session that stays alive across multiple turns. Follow up on a task without losing the conversation. Output is streamed by tailing Claude's own JSONL transcript, so assistant text, thinking blocks, tool calls, and tool results all render with their own UI components.
 - **Approvals and questions, lifted out of the TUI.** Agetor watches Claude's tmux pane and JSONL transcript to detect `AskUserQuestion` / `ExitPlanMode` modals and tool-permission prompts, and surfaces them in the run panel as structured cards — radios, checkboxes, free-text. It's fully non-invasive: it registers no MCP server and installs no hook (it only strips stale entries left by older builds). Codex prompts are detected heuristically from stdout and surfaced the same way.
@@ -141,6 +142,7 @@ agetor                       # full-screen live dashboard (board + streaming det
 # create · inspect
 agetor add                   # create a task (guided wizard, or --title/--prompt[/--start])
 agetor add --issue <url>     # seed a task from a GitHub/GitLab issue + its thread (uses --workdir or the cwd)
+agetor add --profile <id|name>  # launch from a saved Agent instead of picking --agent/--model/--mode/--effort by hand
 agetor ls [filters]          # list tasks (--column/--agent/--type/--repo/--search/--archived/--all)
 agetor ps                    # list running / blocked tasks only
 agetor show <id>             # details, runs, pending interactions
@@ -159,6 +161,7 @@ agetor shell <id>            # open a shell in the task's worktree (--print for 
 
 # manage
 agetor edit <id> [flags]     # change title/prompt/agent/workdir/model/mode/effort/type/column
+agetor edit <id> --detach-profile  # unbind a task from its Agent, keeping its current values
 agetor move <id> <column>    # move between columns (mark done = move <id> done)
 agetor archive <id>          # archive a done task · unarchive <id> to restore
 agetor diff <id>             # show the task's git diff
@@ -167,10 +170,13 @@ agetor rm <id> --yes         # delete a task (worktree + branch)
 # setup
 agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
 agetor harness <sub>         # list | add | edit | enable | disable | rm | shell  (aliases / accounts; shell = log in)
+agetor profile <sub>         # ls | show <ref> | add <name> | edit <ref> | rm <ref>  (alias: profiles — saved launch presets, see Agents above)
 agetor daemon status|start|stop
 agetor info                  # the connected core's version
 agetor config [k] [v]        # view / set core preferences (defaultHarness, last model/mode/effort)
 ```
+
+Vocabulary note: in the CLI, `--agent` / the `agent` column always mean the **harness** (the CLI being driven); an **Agent** (the saved harness+model+effort+mode+instructions+skills preset) is always called a **profile** — `agetor profile …`, `--profile`, `--detach-profile`.
 
 **Dashboard keys:** `↑/↓` (or `j/k`) select · `s` run · `x` stop · `m` message · `c` commit & push · `g` answer · `q` quit. Messages and answers happen inline; run-status toasts flash on success / failure / needs-you.
 
@@ -242,6 +248,14 @@ A **run** is a single invocation of the agent on a task. Tasks accumulate run hi
 A **harness** is a named agent configuration. The two built-ins (`claude-code`, `codex`) wrap each CLI directly. User-defined harnesses are *aliases* that wrap the same underlying kind with extra env, an alternate binary, or — most usefully — a per-account `$HOME` override. That last knob lets you run a second Claude or Codex account in parallel without their logins overwriting each other.
 
 Add a harness from **Settings → Harnesses**. Templates pre-fill common patterns.
+
+### Agents
+
+An **Agent** is a named, reusable launch preset — a harness + model + effort + mode (+ Cursor's fast/max-mode toggles) + free-text instructions + a list of skills — bundled up so you stop re-picking the same five fields on every task. Create, edit, and delete them from **Settings → Agents**; each row shows how many tasks are currently bound to it ("Used by N tasks").
+
+Pick an Agent from the picker on any launch surface (New Task form, the Resolve-Conflicts and Create-from-issue dialogs) instead of choosing harness/mode/model/effort by hand — its instructions get injected into the launch prompt, and its skills are suggested to the agent up front. A task follows its *live* agent (so an edit to the agent in Settings is reflected) right up until the task's first run, then freezes: from then on the task keeps exactly what it launched with, even if you later edit or delete the agent.
+
+Task details shows the bound agent as a compact chip in its own **Agent** row (the harness picker next to it is labeled **Harness**, since "agent" here means the profile, not the CLI). Click the chip to open a details dialog with the task's frozen snapshot — name, harness, model, effort, mode, instructions, skills — plus a status line telling you whether it's still following the live agent or frozen since the first run, and a link back to Settings to edit it. **Detach** unbinds the task from the agent (keeping its current values) and unlocks the harness/mode/model/effort pickers again.
 
 ### Modes, models, and effort
 

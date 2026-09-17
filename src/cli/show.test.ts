@@ -207,6 +207,39 @@ test("show --json: never calls listHarnesses (mode resolution is a human-output-
   expect(parsed.task.mode).toBeNull();
 });
 
+test("show: a task bound to an agent profile prints a 'profile:' line (not 'agent profile:') with the snapshot name/id", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(
+    task({
+      agent: "claude-code",
+      mode: "auto",
+      agentProfileId: "prof-1",
+      agentProfile: {
+        id: "prof-1",
+        name: "Reviewer",
+        harness: "claude-code",
+        harnessKind: "claude-code",
+        harnessLabel: "claude-code",
+        model: "opus-5",
+        effort: null,
+        mode: null,
+        fast: false,
+        maxMode: false,
+        instructions: "",
+        skills: [],
+        capturedAt: 0,
+      },
+    }),
+    { harnesses: [harness("claude-code", "claude-code")] },
+  );
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("profile: Reviewer (prof-1)");
+  expect(rendered).not.toContain("agent profile:");
+});
+
 test("show: missing task-id argument throws the usage error", async () => {
   outputs.length = 0;
   currentClient = makeClient(task());

@@ -1,8 +1,14 @@
-import { test, expect, mock, afterAll } from "bun:test";
+import { test, expect, mock, afterAll, describe } from "bun:test";
 import path from "node:path";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import type { Flags } from "../context.ts";
-import type { GitHubComment, GitHubIssueThreadResult, GitHubListItem, Task } from "../../shared/types.ts";
+import type {
+  AgentProfile,
+  GitHubComment,
+  GitHubIssueThreadResult,
+  GitHubListItem,
+  Task,
+} from "../../shared/types.ts";
 import { AGENT_OPTIONS, DEFAULT_MODEL, supportedEfforts } from "../../shared/types.ts";
 import type { DiscoveredModel } from "../../shared/model-options.ts";
 import { buildIssueTaskPrompt, issueTaskTitle, renderIssueThreadMarkdown } from "../../shared/issue-task.ts";
@@ -148,6 +154,47 @@ function makePlainClient() {
     },
   } as unknown as AgetorClient;
   return { client, createTaskCalls };
+}
+
+function makeAgentProfile(overrides: Partial<AgentProfile> = {}): AgentProfile {
+  return {
+    id: "profile-1",
+    name: "Reviewer",
+    harness: "codex",
+    model: "gpt-6-astra",
+    effort: "high",
+    mode: "auto",
+    fast: false,
+    maxMode: false,
+    instructions: "Be thorough.",
+    skills: ["code-review"],
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  };
+}
+
+/** A fake `AgetorClient` for the `--profile` non-interactive `cmdAdd` path —
+ *  `listAgentProfiles` (for `matchAgentProfileRef` resolution) plus
+ *  `createTask`, both with call recorders. */
+function makeProfileClient(profiles: AgentProfile[]) {
+  const createTaskCalls: CreateTaskInput[] = [];
+  let listAgentProfilesCalls = 0;
+  const client = {
+    listAgentProfiles: async () => {
+      listAgentProfilesCalls++;
+      return profiles;
+    },
+    createTask: async (input: CreateTaskInput) => {
+      createTaskCalls.push(input);
+      return { id: "profile-task-id", title: input.title } as unknown as Task;
+    },
+  } as unknown as AgetorClient;
+  return {
+    client,
+    createTaskCalls,
+    getListAgentProfilesCalls: () => listAgentProfilesCalls,
+  };
 }
 
 function flags(overrides: Partial<Flags> = {}): Flags {
@@ -639,4 +686,214 @@ test("cmdAdd: an add with no --agent at all defaults its mode via claude-code's 
   expect(createTaskCalls.length).toBe(1);
   expect(createTaskCalls[0]!.agent).toBeUndefined();
   expect(createTaskCalls[0]!.mode).toBe("auto");
+});
+
+// ── --profile (docs/plans/agent-profiles.md §3 D13, TT6) ────────────────
+//
+// `--profile <id|name>` launches a task from a saved AgentProfile instead of
+// picking harness/model/mode/effort by hand. `assertProfileFlagCombo` (not
+// exported — checked through `cmdAdd`'s thrown usage error) rejects
+// combining it with any of the six manual fields; `baseInput` (not exported
+// either) sends only `agentProfileId` and omits agent/model/mode/effort/
+// fast/maxMode entirely when a profile id is present; ref resolution goes
+// through the already-unit-tested `matchAgentProfileRef`.
+
+describe("--profile", () => {
+  // ── parseAdd ───────────────────────────────────────────────────────────
+
+  test("parseAdd: --profile <ref> sets profile", () => {
+    const o = parseAdd(["--profile", "Reviewer"]);
+    expect(o.profile).toBe("Reviewer");
+  });
+
+  test("parseAdd: no --profile leaves profile undefined", () => {
+    const o = parseAdd(["--title", "T", "--prompt", "P"]);
+    expect(o.profile).toBeUndefined();
+  });
+
+  // ── assertProfileFlagCombo, exercised through cmdAdd's thrown usage error ──
+  //
+  // The guard fires before `getClient` is ever called (it's the first thing
+  // `cmdAdd` does after `parseAdd`), so no fake client / --title / --prompt
+  // is needed to observe it — the promise rejects synchronously-caused
+  // before any await that would need one.
+
+  test("cmdAdd: --profile combined with --agent throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--profile", "Reviewer", "--agent", "codex"], flags()),
+    ).rejects.toThrow(/--profile cannot be combined with --agent\/--model\/--mode\/--effort\/--fast\/--max-mode/);
+  });
+
+  test("cmdAdd: --profile combined with --model throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--profile", "Reviewer", "--model", "gpt-6-astra"], flags()),
+    ).rejects.toThrow(/--profile cannot be combined/);
+  });
+
+  test("cmdAdd: --profile combined with --mode throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--profile", "Reviewer", "--mode", "auto"], flags()),
+    ).rejects.toThrow(/--profile cannot be combined/);
+  });
+
+  test("cmdAdd: --profile combined with --effort throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--profile", "Reviewer", "--effort", "high"], flags()),
+    ).rejects.toThrow(/--profile cannot be combined/);
+  });
+
+  test("cmdAdd: --profile combined with --fast throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--fast"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile combined with --no-fast throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--no-fast"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile combined with --max-mode throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--max-mode"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile combined with --no-max-mode throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--no-max-mode"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile alone (no conflicting flags) passes the combo guard and proceeds to resolve it", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile()]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--profile", "Reviewer"], flags());
+
+    // Reaching createTask at all proves the combo guard didn't throw.
+    expect(createTaskCalls.length).toBe(1);
+  });
+
+  // ── ref resolution (matchAgentProfileRef, already unit-tested elsewhere —
+  // one integration-style assertion each for id and name is enough here) ──
+
+  test("cmdAdd: --profile resolves by exact id", async () => {
+    reset();
+    const profile = makeAgentProfile({ id: "abc-123", name: "Reviewer" });
+    const { client, createTaskCalls } = makeProfileClient([profile]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--profile", "abc-123"], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.agentProfileId).toBe("abc-123");
+  });
+
+  test("cmdAdd: --profile resolves by case-insensitive, trimmed name", async () => {
+    reset();
+    const profile = makeAgentProfile({ id: "abc-123", name: "Reviewer" });
+    const { client, createTaskCalls } = makeProfileClient([profile]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--profile", "  REVIEWER  "], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.agentProfileId).toBe("abc-123");
+  });
+
+  test("cmdAdd: --profile with an unknown ref throws, never calling createTask", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile({ name: "Reviewer" })]);
+    currentClient = client;
+
+    // `matchAgentProfileRef` itself says "agent" (shared, non-CLI vocabulary)
+    // — `cmdAdd` must rewrite it to "profile" via `asProfileError` before it
+    // reaches the user, same as `agetor profile`'s CLI boundary.
+    await expect(
+      cmdAdd(["--title", "T", "--prompt", "P", "--profile", "does-not-exist"], flags()),
+    ).rejects.toThrow(/unknown profile "does-not-exist"/);
+    expect(createTaskCalls).toEqual([]);
+  });
+
+  test("cmdAdd: --profile with an ambiguous name throws, never calling createTask", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([
+      makeAgentProfile({ id: "a", name: "Reviewer" }),
+      makeAgentProfile({ id: "b", name: "Reviewer" }),
+    ]);
+    currentClient = client;
+
+    await expect(
+      cmdAdd(["--title", "T", "--prompt", "P", "--profile", "Reviewer"], flags()),
+    ).rejects.toThrow(/ambiguous profile "Reviewer"/);
+    expect(createTaskCalls).toEqual([]);
+  });
+
+  // ── baseInput's profile branch: agentProfileId replaces the whole manual
+  // agent/model/mode/effort/fast/maxMode block ────────────────────────────
+
+  test("cmdAdd: a --profile task carries agentProfileId and omits agent/model/mode/effort/fast/maxMode entirely", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile({ id: "abc-123", name: "Reviewer" })]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--profile", "Reviewer"], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    const input = createTaskCalls[0]!;
+    expect(input.agentProfileId).toBe("abc-123");
+    expect(input.agent).toBeUndefined();
+    expect(input.model).toBeUndefined();
+    expect(input.effort).toBeUndefined();
+    expect(input.fast).toBeUndefined();
+    expect(input.maxMode).toBeUndefined();
+    // Also proves `defaultNonInteractiveMode`'s fill-the-gap fallback is
+    // skipped for a profile add (`if (!o.mode && !o.profile) …`) — a manual
+    // add with no --agent stores mode "auto" (see the test above), but a
+    // profile add must leave mode alone entirely, letting the profile supply
+    // it server-side.
+    expect(input.mode).toBeUndefined();
+  });
+
+  test("cmdAdd: --profile still carries workdir/isolation/baseRef/taskType/references through baseInput normally", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile({ id: "abc-123", name: "Reviewer" })]);
+    currentClient = client;
+
+    await cmdAdd(
+      [
+        "--title",
+        "T",
+        "--prompt",
+        "P",
+        "--profile",
+        "Reviewer",
+        "--workdir",
+        "/tmp/acme-widgets",
+        "--isolation",
+        "none",
+        "--type",
+        "bug",
+      ],
+      flags(),
+    );
+
+    expect(createTaskCalls.length).toBe(1);
+    const input = createTaskCalls[0]!;
+    expect(input.agentProfileId).toBe("abc-123");
+    expect(input.workdir).toBe("/tmp/acme-widgets");
+    expect(input.isolation).toBe("none");
+    expect(input.taskType).toBe("bug");
+  });
 });

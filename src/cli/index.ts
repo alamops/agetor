@@ -17,6 +17,7 @@ import { cmdEdit, cmdMove, cmdArchive, cmdUnarchive } from "./commands/manage.ts
 import { cmdDiff } from "./commands/diff.ts";
 import { cmdAttach } from "./commands/attach.ts";
 import { cmdHarness } from "./commands/harness.ts";
+import { cmdAgentProfile } from "./commands/agent-profile.ts";
 import { cmdProjects } from "./commands/projects.ts";
 import { cmdCommit } from "./commands/commit.ts";
 import { cmdConfig } from "./commands/config.ts";
@@ -53,6 +54,7 @@ Commands:
   info                show the connected core's version
   daemon <sub>        start | stop | status of the background core
   harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
+  profile <sub>       list | show | add | edit | rm reusable agent profiles
   projects <sub>      list | add | rm | branches (project folders)
   config [k] [v]      view / set core preferences (defaultHarness, last model…)
   help                show this help
@@ -182,6 +184,9 @@ async function main(): Promise<void> {
     case "harness":
     case "harnesses":
       return cmdHarness(args, flags);
+    case "profile":
+    case "profiles":
+      return cmdAgentProfile(args, flags);
     case "projects":
     case "project":
       return cmdProjects(args, flags);

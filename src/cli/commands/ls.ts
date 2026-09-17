@@ -90,11 +90,26 @@ export async function cmdLs(
     glyph(t),
     c.dim(t.id.slice(0, 8)),
     truncate(t.title, 44),
-    c.gray(t.agent ?? ""),
+    agentCell(t),
+    profileCell(t),
     colorColumn(t.column),
     needsCell(t),
   ]);
-  out(table(["", "id", "title", "agent", "column", "needs"], rows));
+  out(table(["", "id", "title", "agent", "profile", "column", "needs"], rows));
+}
+
+/** Agent column: the raw harness id — always, regardless of whether the task
+ *  is bound to an agent profile. The `--agent` filter above matches on the
+ *  same `t.agent` field this renders. */
+function agentCell(t: Task): string {
+  return c.gray(t.agent ?? "");
+}
+
+/** Profile column: the bound agent profile's name (from the task's own
+ *  frozen snapshot — reads the same whether the profile is still live or has
+ *  since been deleted), or `-` when the task isn't bound to one. */
+function profileCell(t: Task): string {
+  return t.agentProfile ? c.bold(t.agentProfile.name) : c.dim("-");
 }
 
 /** The "needs" column: pending-interaction count first (unchanged), then an

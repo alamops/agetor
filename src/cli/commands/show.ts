@@ -2,8 +2,8 @@ import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
 import { usageError } from "../usage.ts";
-import type { AgetorClient } from "../api-client.ts";
-import { AGENT_OPTIONS, defaultModeFor, type AgentKind, type Run } from "../../shared/types.ts";
+import { ApiError, type AgetorClient } from "../api-client.ts";
+import { AGENT_OPTIONS, defaultModeFor, type AgentKind, type Run, type Task } from "../../shared/types.ts";
 
 export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -27,6 +27,10 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
   if (task.branch) out(`  ${label("branch")} ${task.branch}`);
   if (task.issueUrl) out(`  ${label("issue")} ${task.issueUrl}`);
+  if (task.agentProfile) {
+    const deletedSuffix = await agentProfileDeletedSuffix(client, task);
+    out(`  ${label("profile")} ${task.agentProfile.name} (${task.agentProfile.id})${deletedSuffix}`);
+  }
   out(`  ${label("prompt")} ${c.dim(truncate(task.prompt, 240))}`);
   if (pending.length > 0) {
     out(
@@ -76,6 +80,23 @@ async function resolveAgentKind(client: AgetorClient, agentId: string): Promise<
     // rather than failing the whole `show` command over a display nicety.
   }
   return agentId in AGENT_OPTIONS ? (agentId as AgentKind) : null;
+}
+
+/** ` (deleted)` when the task's bound profile no longer exists — checked
+ *  only when `agentProfileId` is set (a task can carry an `agentProfile`
+ *  snapshot with a null id after `DELETE /tasks/:id/agent-profile`, though
+ *  that route clears the snapshot too; this guard is defensive either way).
+ *  Any error other than a clean 404 is swallowed — a flaky lookup must not
+ *  make a live profile look deleted. */
+async function agentProfileDeletedSuffix(client: AgetorClient, task: Task): Promise<string> {
+  if (!task.agentProfileId) return "";
+  try {
+    await client.getAgentProfile(task.agentProfileId);
+    return "";
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return c.dim(" (deleted)");
+    return "";
+  }
 }
 
 function label(s: string): string {
