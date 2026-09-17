@@ -310,7 +310,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
               <PromptComposer
                 value={prompt}
                 onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
-                agent={launch.agent}
+                agent={launch.effectiveAgent}
                 references={references}
                 onReferencesChange={setReferences}
                 setReferences={setReferences}

@@ -459,6 +459,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // Resolve the kind/label the launch actually uses: the selected profile's
   // harness when one is picked, else the manually-picked harness — read by
   // the gemini argv-budget check right below and by the overage warning.
+  // The harness id a launch will ACTUALLY run under — the composer's
+  // skills/MCP/slash discovery and the submit payload must both read this,
+  // never the hidden manual `agent`, while a profile is selected.
+  const effectiveAgent = selectedProfile ? selectedProfile.harness : agent;
   const effectiveKind: AgentKind = selectedProfile ? (selectedProfileHarness?.kind ?? "claude-code") : kind;
   const effectiveHarnessLabel = selectedProfile
     ? (selectedProfileHarness?.label ?? selectedProfile.harness)
@@ -495,7 +499,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
         // own values instead. The server re-resolves and overrides these
         // from the profile anyway (`createTask`); sending them here too
         // keeps the request body self-consistent for any other consumer.
-        agent: selectedProfile ? selectedProfile.harness : agent,
+        agent: effectiveAgent,
         workdir: workdir.trim(),
         // The branch is only meaningful under worktree isolation — see
         // `worktreePayload` for the isolation/baseRef/branch mapping this
@@ -663,7 +667,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
               <PromptComposer
                 value={prompt}
                 onChange={setPrompt}
-                agent={agent}
+                agent={effectiveAgent}
                 references={references}
                 onReferencesChange={setReferences}
                 fileScope={fileScope}

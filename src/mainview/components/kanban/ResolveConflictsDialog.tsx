@@ -190,7 +190,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
               <PromptComposer
                 value={prompt}
                 onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
-                agent={launch.agent}
+                agent={launch.effectiveAgent}
                 references={references}
                 onReferencesChange={setReferences}
                 setReferences={setReferences}
