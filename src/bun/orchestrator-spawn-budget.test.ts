@@ -326,3 +326,36 @@ test("delete mid-spawn: deleting the task before a slow spawn settles leaves no 
 // it is included here; its behavior (racing a detached continuation against
 // `SPAWN_RESPONSE_BUDGET_MS`, asserted against directly above) is covered
 // indirectly by tests 2-5, which all depend on it behaving correctly.
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 8 — Stop during the pending window: `cancelRun` has no `active` handle yet,
+ *     records the intent, and the continuation honors it on settle — the run
+ *     ends `cancelled`, the task returns to `ready`, nothing registers.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("cancel mid-spawn: Stop during the pending window is honored once the spawn settles", async () => {
+  process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS = String(SLOW_SPAWN_DELAY_MS);
+  try {
+    const { startTask, cancelRun } = await import("./orchestrator.ts");
+    const { tasks, runs } = await import("./db.ts");
+
+    const taskId = await makeTask("cancel-mid-spawn");
+    const res = await startTask(taskId);
+    expect("error" in res).toBe(false);
+    if ("error" in res) return;
+    expect(res.pending).toBe(true);
+    const runId = res.runId;
+
+    // Before the fix this returned false ("nothing to stop") and the spawn
+    // registered a live run the user had already stopped.
+    expect(await cancelRun(runId)).toBe(true);
+
+    await waitFor(() => runs.get(runId)?.status === "cancelled", SLOW_SPAWN_DELAY_MS + 3000);
+    expect(tasks.get(taskId)?.column).toBe("ready");
+    // Nothing registered: a second Stop finds no active handle and no
+    // pending run to record (the run is no longer `running`).
+    expect(await cancelRun(runId)).toBe(false);
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS;
+  }
+});

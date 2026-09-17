@@ -502,8 +502,14 @@ function AppInner() {
         refreshPollInFlightRef.current = true;
         void refresh().finally(() => { refreshPollInFlightRef.current = false; });
       }
-      void refreshProjects();
-      void refreshAgents();
+      if (!refreshProjectsPollInFlightRef.current) {
+        refreshProjectsPollInFlightRef.current = true;
+        void refreshProjects().finally(() => { refreshProjectsPollInFlightRef.current = false; });
+      }
+      if (!refreshAgentsPollInFlightRef.current) {
+        refreshAgentsPollInFlightRef.current = true;
+        void refreshAgents().finally(() => { refreshAgentsPollInFlightRef.current = false; });
+      }
       // fx login (and any other harness auth flow) often happens in a
       // separate window/terminal — returning focus to agetor should reflect
       // whatever the account's catalog looks like now, not whatever it was

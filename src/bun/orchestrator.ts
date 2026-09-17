@@ -1013,6 +1013,17 @@ async function raceSpawnBudget<T>(
  * bounded.
  */
 const startingTaskIds = new Set<string>();
+/**
+ * Runs the user asked to Stop while their spawn was still in flight (the
+ * bounded-spawn pending window, CLAUDE.md item 15): the run row exists and
+ * is the task's current run, but no `active` handle is registered yet, so
+ * `cancelRun` has nothing to kill. It records the intent here instead and
+ * the detached continuation honors it on settle — kills the just-spawned
+ * agent, drops the claude session, records the run `cancelled` and returns
+ * the task to `ready` — rather than registering a run the user already
+ * stopped. Consumed (deleted) by the continuation on every settle path.
+ */
+const pendingCancelRunIds = new Set<string>();
 
 /**
  * Start (or restart) a task's agent. Bounded per `SPAWN_RESPONSE_BUDGET_MS`
@@ -1268,6 +1279,9 @@ async function startTaskInner(
   const continuation: Promise<{ ok: true } | { ok: false; message: string }> = (async () => {
     try {
       const { agent, message } = await spawnAgentOrFail(spawnArgs);
+      // Consume a Stop that landed while the spawn was in flight (see
+      // `pendingCancelRunIds`) on every settle path, agent or not.
+      const cancelledWhilePending = pendingCancelRunIds.delete(runId);
       if (!agent) return { ok: false as const, message: message ?? "unknown error" };
 
       // Ownership guard: by the time the spawn settles the task may have
@@ -1279,10 +1293,17 @@ async function startTaskInner(
       // false during this exact pending window, since `registerActiveRun`
       // hasn't run yet) must be treated the same as delete/replace here.
       const fresh = tasks.get(taskId);
-      if (!fresh || fresh.archivedAt != null || fresh.runId !== runId) {
+      if (!fresh || fresh.archivedAt != null || fresh.runId !== runId || cancelledWhilePending) {
         agent.kill();
         if (harness.kind === "claude-code") await dropSession(taskId);
         runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+        if (cancelledWhilePending && fresh && fresh.runId === runId) {
+          // A user Stop, not a delete/replace: settle the task like the done
+          // handler would for a cancelled run (`ready`, this run stays its
+          // latest) and say why nothing ran.
+          spawnArgs.onChunk("status", "cancelled by user before the agent launched");
+          updateColumn(taskId, runId, "ready");
+        }
         return { ok: true as const };
       }
 
@@ -2696,6 +2717,16 @@ export async function cancelRun(runId: string): Promise<boolean> {
     // cancel the schedule rather than reporting failure.
     if (fxAutoResumeTimers.has(taskId)) {
       return cancelFxAutoResume(taskId, "stopped");
+    }
+    // Bounded-spawn pending window: the run is the task's current run and
+    // still `running`, but its agent hasn't registered yet. Record the
+    // cancel for the continuation (see `pendingCancelRunIds`) instead of
+    // reporting "nothing to stop".
+    const run = runs.get(runId);
+    if (run && run.status === "running" && tasks.get(taskId)?.runId === runId) {
+      pendingCancelRunIds.add(runId);
+      cancelPendingForTask(taskId, "cancelled by user");
+      return true;
     }
     return false;
   }
@@ -4912,6 +4943,9 @@ async function spawnResumedSessionInner(
       // the idle branch of sendInput) — nothing to drop on failure here;
       // `spawnAgentOrFail`'s own catch already recorded the run failed and
       // bounced the task back to `ready`.
+      // Consume a Stop that landed while the spawn was in flight (see
+      // `pendingCancelRunIds`) on every settle path, agent or not.
+      const cancelledWhilePending = pendingCancelRunIds.delete(newRunId);
       if (!agent) return;
 
       // Ownership guard: by the time the spawn settles the task may have
@@ -4923,10 +4957,14 @@ async function spawnResumedSessionInner(
       // false during this exact pending window, since `registerActiveRun`
       // hasn't run yet) must be treated the same as delete/replace here.
       const fresh = tasks.get(taskId);
-      if (!fresh || fresh.archivedAt != null || fresh.runId !== newRunId) {
+      if (!fresh || fresh.archivedAt != null || fresh.runId !== newRunId || cancelledWhilePending) {
         agent.kill();
         await dropSession(taskId);
         runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+        if (cancelledWhilePending && fresh && fresh.runId === newRunId) {
+          onChunk("status", "cancelled by user before the agent launched");
+          updateColumn(taskId, newRunId, "ready");
+        }
         return;
       }
 

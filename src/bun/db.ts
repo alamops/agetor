@@ -1196,11 +1196,12 @@ type RunRow = {
  * off (the `MIN_REPLAY_EVENTS` floor — see
  * `docs/plans/task-details-blank-while-session-restores.md` §3.3), and
  * always keeps at least ONE row regardless of `minEvents`, so a caller can
- * never get back an empty window from a non-empty input. `LENGTH()` on a
- * SQLite TEXT column counts characters; for our UTF-8-ish event payloads
- * that's an adequate proxy for bytes — the budget just needs to keep the
- * SSE replay / page / rebuild windows from weighing tens of MB, not be
- * byte-exact. Returns `null` only when `rowsDesc` is empty. Pure and
+ * never get back an empty window from a non-empty input. `len` is the
+ * UTF-8 byte length of each event's `data` — `eventsForTask` selects
+ * `LENGTH(CAST(data AS BLOB))` (bytes; plain `LENGTH()` on TEXT would count
+ * characters) and the rebuild route uses `Buffer.byteLength`, so the
+ * budgets count what actually goes over the wire. Returns `null` only when
+ * `rowsDesc` is empty. Pure and
  * DB-free so it's unit-testable on its own.
  */
 export function clampWindowByBytes(
@@ -1445,7 +1446,7 @@ export const runs = {
       }
       idParams.push(opts.limit);
       const idRows = db.query<{ id: number; len: number }, Array<string | number>>(
-        `SELECT run_events.id as id, LENGTH(run_events.data) as len
+        `SELECT run_events.id as id, LENGTH(CAST(run_events.data AS BLOB)) as len
          FROM run_events
          JOIN runs ON runs.id = run_events.run_id
          WHERE ${idConditions.join(" AND ")}

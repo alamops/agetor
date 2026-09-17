@@ -5119,7 +5119,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             const hasCountCut = events.length > limit;
             const countWindowed = hasCountCut ? events.slice(events.length - limit) : events;
             const rowsDesc = countWindowed
-              .map((ev, idx) => ({ id: idx, len: ev.data.length }))
+              .map((ev, idx) => ({ id: idx, len: Buffer.byteLength(ev.data, "utf8") }))
               .reverse();
             const cutIdx = clampWindowByBytes(rowsDesc, EVENTS_REPLAY_MAX_BYTES, MIN_REPLAY_EVENTS) ?? 0;
             const windowed = cutIdx > 0 ? countWindowed.slice(cutIdx) : countWindowed;
@@ -5140,7 +5140,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // route's own doc comment above.
           {
             const rowsDesc = events
-              .map((ev, idx) => ({ id: idx, len: ev.data.length }))
+              .map((ev, idx) => ({ id: idx, len: Buffer.byteLength(ev.data, "utf8") }))
               .reverse();
             const cutIdx = clampWindowByBytes(rowsDesc, EVENTS_REPLAY_MAX_BYTES, MIN_REPLAY_EVENTS) ?? 0;
             const windowed = cutIdx > 0 ? events.slice(cutIdx) : events;

@@ -719,18 +719,31 @@ function RunPanelBody({
   // the SSE effect that marks readiness both fire within the same
   // task-switch commit; a state-based gate could still be read stale by an
   // effect that re-runs in that same commit before the state update lands.
-  const streamReadyRef = useRef(false);
-  const streamReadyWaitersRef = useRef<Array<() => void>>([]);
+  //
+  // The gate is keyed by TASK ID, not a bare boolean: `streamReadyForRef`
+  // holds the id of the task whose stream is ready (or null), and every
+  // waiter records which task it is waiting for. This matters for children
+  // keyed on `task.id` (`TerminalsSection`): React runs a child's mount
+  // effect BEFORE the parent's effects in the same commit, so on a switch
+  // the new task's section mounts and asks the gate before the reset effect
+  // below has cleared it — a bare boolean would still read the PREVIOUS
+  // task's `true` and let the terminal list fetch into the switch burst.
+  const streamReadyForRef = useRef<string | null>(null);
+  const streamReadyWaitersRef = useRef<Array<{ taskId: string; resolve: () => void }>>([]);
   const markStreamReady = () => {
-    if (streamReadyRef.current) return;
-    streamReadyRef.current = true;
+    const forTaskId = currentTaskIdRef.current;
+    if (streamReadyForRef.current === forTaskId) return;
+    streamReadyForRef.current = forTaskId;
     const waiters = streamReadyWaitersRef.current;
-    streamReadyWaitersRef.current = [];
-    for (const resolve of waiters) resolve();
+    streamReadyWaitersRef.current = waiters.filter((w) => w.taskId !== forTaskId);
+    for (const w of waiters) if (w.taskId === forTaskId) w.resolve();
   };
-  const awaitStreamReady = (): Promise<void> => {
-    if (streamReadyRef.current) return Promise.resolve();
-    return new Promise<void>((resolve) => { streamReadyWaitersRef.current.push(resolve); });
+  /** Resolves once the stream is ready for `forTaskId` (default: the task
+   *  currently mounted in this body). Callers keyed per task (children that
+   *  remount on switch) MUST pass their own `task.id` — see the note above. */
+  const awaitStreamReady = (forTaskId: string = currentTaskIdRef.current): Promise<void> => {
+    if (streamReadyForRef.current === forTaskId) return Promise.resolve();
+    return new Promise<void>((resolve) => { streamReadyWaitersRef.current.push({ taskId: forTaskId, resolve }); });
   };
 
   // Reset on task switch (no remount because we no longer key on task.id —
@@ -766,9 +779,13 @@ function RunPanelBody({
     // PR-mergeability effects left pending — each one's own `cancelled` flag
     // (captured in its effect's cleanup) makes the resume a no-op, so this
     // just prevents the promise from dangling forever unresolved.
-    for (const resolve of streamReadyWaitersRef.current) resolve();
-    streamReadyWaitersRef.current = [];
-    streamReadyRef.current = false;
+    // Only waiters for OTHER tasks are stale here: a waiter the incoming
+    // task's own keyed child already registered (its mount effect ran before
+    // this parent effect) must stay queued until this task's stream is ready.
+    const staleWaiters = streamReadyWaitersRef.current.filter((w) => w.taskId !== task.id);
+    streamReadyWaitersRef.current = streamReadyWaitersRef.current.filter((w) => w.taskId === task.id);
+    for (const w of staleWaiters) w.resolve();
+    streamReadyForRef.current = null;
     // Old task's PR mergeability (and "Resolve Conflicts" send confirmation)
     // must not survive into the new task: RunPanelBody isn't remounted on
     // task switch, so without this a stale `prStatus` from task A could sit
@@ -831,7 +848,15 @@ function RunPanelBody({
         // "Everything observed so far" — see `nextEventIdRef`.
         maxLiveEventIdAtSnapshot: nextEventIdRef.current - 1,
       });
-      setRebuildNote(`Loaded ${res.events.length} events from session JSONL.`);
+      // The route byte-budgets the snapshot (newest events first); when it
+      // had to cut older ones it says so, and "Load earlier" pages the rest
+      // — same handling as the auto-rebuild effect below.
+      if (res.hasMore) setHasMoreEarlier(true);
+      setRebuildNote(
+        res.hasMore
+          ? `Loaded the most recent ${res.events.length} events from session JSONL — older history is available via "Load earlier messages".`
+          : `Loaded ${res.events.length} events from session JSONL.`,
+      );
     } catch (e) {
       if (currentTaskIdRef.current !== sentTaskId) return;
       setRebuildNote(`rebuild failed: ${(e as Error).message}`);
@@ -4614,7 +4639,7 @@ function RunsList({
  * themselves live on the bun side and survive the panel closing entirely.
  * Defaults open when the task already has terminals (`openTerminalCount`).
  */
-function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: () => Promise<void> }) {
+function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: (forTaskId: string) => Promise<void> }) {
   const count = task.openTerminalCount;
   // Seed open from the count at mount, then let the user own the toggle —
   // binding `open` to the polled count would re-expand the section whenever
@@ -4644,11 +4669,16 @@ function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: () => 
   awaitReadyRef.current = awaitReady;
   useEffect(() => {
     let cancelled = false;
-    void awaitReadyRef.current().then(() => {
+    // Pass this section's own task id: the gate is task-keyed because this
+    // mount effect runs BEFORE RunPanelBody's reset effect on a task switch,
+    // so a bare "is the stream ready" boolean would still be the previous
+    // task's answer here.
+    const forTaskId = task.id;
+    void awaitReadyRef.current(forTaskId).then(() => {
       if (!cancelled) setReady(true);
     });
     return () => { cancelled = true; };
-  }, []);
+  }, [task.id]);
   return (
     <details
       className="border-b border-border/60"
