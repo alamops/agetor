@@ -5045,18 +5045,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       "/runs/:id/rebuild-events": { GET: authed((req) => {
         try {
           // Optional `?limit=` caps the response to the most recent N mapped
-          // events (ascending) plus an event-count cut, so the RunPanel's
-          // auto-rebuild on opening a finished claude task doesn't defeat the
-          // SSE replay window by pulling unbounded full JSONL history. Absent
-          // `limit` (the panel's manual "Rebuild from session JSONL" button),
-          // the response is now ALSO byte-budgeted (Phase 8 review #4) — a
-          // rebuilt JSONL transcript can weigh just as much as the persisted
-          // one — via the same `clampWindowByBytes`/`EVENTS_REPLAY_MAX_BYTES`/
-          // `MIN_REPLAY_EVENTS` used below; the response keeps its
-          // pre-existing shape (bare `events`/`source`, no `hasMore` key) for
-          // any caller whose rebuild already fits the budget, and gains
-          // `hasMore: true` only when the byte cut actually removed events —
-          // additive-only either way.
+          // events (ascending) — an event-count cut AND a byte budget
+          // (`clampWindowByBytes`/`EVENTS_REPLAY_MAX_BYTES`/`MIN_REPLAY_EVENTS`,
+          // below) — so the RunPanel's auto-rebuild on opening a finished
+          // claude task doesn't defeat the SSE replay window by pulling
+          // unbounded full JSONL history; `hasMore` reports either cut. Absent
+          // `limit` (the panel's manual "Rebuild from session JSONL" button
+          // and the CLI) the response is the COMPLETE history in its
+          // pre-existing shape (bare `events`/`source`, never `hasMore`) —
+          // see the comment on that branch for why it must stay unbounded.
           const url = new URL(req.url);
           const limitParam = url.searchParams.get("limit");
           const hasLimit = limitParam !== null;
@@ -5130,30 +5127,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             const hasMore = hasCountCut || windowed.length < countWindowed.length;
             return json({ events: windowed, hasMore, source: jsonlPath }, { headers: corsHeaders(req) });
           }
-          // No `?limit=` (the panel's manual "Rebuild from session JSONL"
-          // button calls the route this way) — this branch used to return
-          // the full mapped list completely unbounded, byte-wise: a rebuilt
-          // JSONL transcript can weigh just as many MB as the persisted one
-          // (Phase 8 review #4). Apply the same byte budget as the `limit`
-          // branch above, sliced from the END (newest events), with no
-          // event-count cut first since there was no `limit` to cut by.
-          // `hasMore` is added ONLY when the byte cut actually removed
-          // events, so a rebuild that already fits the budget keeps the
-          // exact pre-existing response shape (`{ events, source }`, no
-          // `hasMore` key) for any other caller — additive-only, per the
-          // route's own doc comment above.
-          {
-            const rowsDesc = events
-              .map((ev, idx) => ({ id: idx, len: Buffer.byteLength(ev.data, "utf8") }))
-              .reverse();
-            const cutIdx = clampWindowByBytes(rowsDesc, EVENTS_REPLAY_MAX_BYTES, MIN_REPLAY_EVENTS) ?? 0;
-            const windowed = cutIdx > 0 ? events.slice(cutIdx) : events;
-            const trimmed = windowed.length < events.length;
-            return json(
-              { events: windowed, source: jsonlPath, ...(trimmed ? { hasMore: true } : {}) },
-              { headers: corsHeaders(req) },
-            );
-          }
+          // No `?limit=`: the panel's manual "Rebuild from session JSONL"
+          // button and the CLI call the route this way, and both are
+          // deliberate, one-off user actions taken precisely when the
+          // persisted `run_events` may be wrong or incomplete — so this path
+          // returns the COMPLETE mapped history, unbounded. The byte budget
+          // lives on the `?limit=` branch above only (the auto-rebuild that
+          // fires on every panel open): capping here would drop the oldest
+          // JSONL-only events with no way to page them back, since "Load
+          // earlier" reads the persisted rows, not the JSONL (review finding
+          // on PR #230). Response shape unchanged: `{ events, source }`.
+          return json({ events, source: jsonlPath }, { headers: corsHeaders(req) });
         } catch (e) {
           const msg = (e as Error).message ?? String(e);
           console.error("[agetor] /runs/:id/rebuild-events failed:", e);

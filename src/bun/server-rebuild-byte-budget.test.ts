@@ -355,11 +355,12 @@ test("/runs/:id/rebuild-events?limit=N slices the byte-budgeted window from the 
   expect(body.hasMore).toBe(true);
 });
 
-test("/runs/:id/rebuild-events without `limit` is byte-budgeted from the END and gains `hasMore` only when the cut removed events", async () => {
+test("/runs/:id/rebuild-events without `limit` returns the COMPLETE mapped history even past the byte budget, no `hasMore` key", async () => {
   // Same over-budget fixture as the `?limit=90` test: 100 × 50 KB = 5 MB
-  // exceeds EVENTS_REPLAY_MAX_BYTES, so the no-limit path (the panel's manual
-  // "Rebuild from session JSONL" button) must clamp exactly like the limited
-  // one (review finding #4) and advertise the cut via `hasMore: true`.
+  // exceeds EVENTS_REPLAY_MAX_BYTES. The no-limit path (the panel's manual
+  // "Rebuild from session JSONL" button and the CLI) must NOT be capped:
+  // it is the one way to see JSONL-only events the persisted rows lack, and
+  // "Load earlier" cannot page the JSONL (review finding on PR #230).
   const { runId } = seedRebuildFixture(REBUILD_LINE_COUNT, REBUILD_LINE_LEN);
 
   const res = await authedFetch(`/runs/${runId}/rebuild-events`);
@@ -367,11 +368,11 @@ test("/runs/:id/rebuild-events without `limit` is byte-budgeted from the END and
   const body = await res.json() as Record<string, unknown>;
   const events = body.events as Array<{ data: string }>;
 
-  expect(events.length).toBe(83); // 4 MiB / 50 KB → 83 newest lines fit
-  expect(events[0]!.data.startsWith("L017-")).toBe(true);
+  expect(events.length).toBe(REBUILD_LINE_COUNT);
+  expect(events[0]!.data.startsWith("L000-")).toBe(true);
   expect(events[events.length - 1]!.data.startsWith("L099-")).toBe(true);
-  expect(events.reduce((n, e) => n + e.data.length, 0)).toBeLessThanOrEqual(EVENTS_REPLAY_MAX_BYTES);
-  expect(body.hasMore).toBe(true);
+  expect(events.reduce((n, e) => n + e.data.length, 0)).toBeGreaterThan(EVENTS_REPLAY_MAX_BYTES);
+  expect("hasMore" in body).toBe(false);
 });
 
 test("/runs/:id/rebuild-events without `limit` keeps the bare `{events, source}` shape when everything fits", async () => {
