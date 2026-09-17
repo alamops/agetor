@@ -5453,10 +5453,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             // EVENTS_REPLAY_ANCHOR_MAX_EVENTS/_BYTES. All-or-nothing: either
             // `start` becomes `userIdx`, or it's left exactly as computed
             // above.
+            // (`idx`, not `i`: the outer `i` is the live counter `onChunk`
+            // closes over for its synthetic `ts`, and must not be shadowed.)
             let userIdx = -1;
-            for (let i = events.length - 1; i >= 0; i--) {
-              if (events[i]!.stream === "user") {
-                userIdx = i;
+            for (let idx = events.length - 1; idx >= 0; idx--) {
+              if (events[idx]!.stream === "user") {
+                userIdx = idx;
                 break;
               }
             }
@@ -5466,8 +5468,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               // `resolveAnchoredMinId` to tell "fits" from "exceeds the
               // count ceiling" without ever walking the whole transcript.
               const spanRowsDesc: Array<{ id: number; len: number }> = [];
-              for (let i = events.length - 1; i >= userIdx; i--) {
-                spanRowsDesc.push({ id: i, len: Buffer.byteLength(events[i]!.data, "utf8") });
+              for (let idx = events.length - 1; idx >= userIdx; idx--) {
+                spanRowsDesc.push({ id: idx, len: Buffer.byteLength(events[idx]!.data, "utf8") });
                 if (spanRowsDesc.length >= EVENTS_REPLAY_ANCHOR_MAX_EVENTS + 1) break;
               }
               start = resolveAnchoredMinId({
@@ -5884,6 +5886,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/events": authed((req) => {
         const taskId = req.params.id;
+        // `?anchor=0` opts the replay window out of the last-user-message
+        // extension below. The webview and `agetor logs` want it (they render
+        // everything replayed); the TUI dashboard does not — it keeps only its
+        // newest 500 lines (`MAX_LINES` in `useCoalescedStream`), so an
+        // anchored window of up to 3000 events / 16 MB would be paid for and
+        // immediately discarded there. Anything but the literal `0` keeps the
+        // default (anchored) behaviour, so older clients are unaffected.
+        const anchorReplay = new URL(req.url).searchParams.get("anchor") !== "0";
         const stream = new ReadableStream({
           start(controller) {
             attachedClients++;
@@ -5940,12 +5950,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             // at least the user's last message without a "Load earlier" click
             // — see docs/plans/first-load-reaches-last-user-message.md. All
             // or nothing: over either ceiling, the plain count/byte window
-            // above stands unchanged.
+            // above stands unchanged. Skipped entirely on `?anchor=0` (see
+            // `anchorReplay` above).
             const window = runs.eventsForTask(taskId, {
               limit: EVENTS_REPLAY_LIMIT,
               maxBytes: EVENTS_REPLAY_MAX_BYTES,
               minEvents: MIN_REPLAY_EVENTS,
-              anchor: { maxEvents: EVENTS_REPLAY_ANCHOR_MAX_EVENTS, maxBytes: EVENTS_REPLAY_ANCHOR_MAX_BYTES },
+              ...(anchorReplay
+                ? { anchor: { maxEvents: EVENTS_REPLAY_ANCHOR_MAX_EVENTS, maxBytes: EVENTS_REPLAY_ANCHOR_MAX_BYTES } }
+                : {}),
             });
             const earliestId = window.length > 0 ? window[0]!.id : null;
             const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);

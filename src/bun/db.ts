@@ -1885,9 +1885,12 @@ export const runs = {
    *  After the byte walk settles `minId`: look up the anchor id via
    *  `lastUserEventId(taskId, opts.beforeId)` (same cursor the rest of this
    *  call already respects); if it exists and sits BEFORE `minId` (i.e. the
-   *  default window doesn't already reach it), fetch the DESC `{id, len}`
-   *  rows of the span `[anchorId, minId)` — capped at `anchor.maxEvents + 1`
-   *  rows so the fetch itself can never be unbounded — and hand them to
+   *  default window doesn't already reach it), assemble the DESC `{id, len}`
+   *  rows of the whole span `[anchorId, beforeId)` — anchor to newest, since
+   *  the ceilings must cover the entire resulting window, not just the part
+   *  below the old floor — from step 1's own rows (`[minId, beforeId)`, already
+   *  in memory) plus one bounded read of `[anchorId, minId)`, capped so the
+   *  total never exceeds `anchor.maxEvents + 1` rows, and hand them to
    *  `resolveAnchoredMinId`. Its return either leaves `minId` alone (span
    *  too large in count or bytes) or lowers it to `anchorId`.
    *  Step 2's `LIMIT` becomes `max(opts.limit, opts.anchor.maxEvents)` in
@@ -1935,24 +1938,31 @@ export const runs = {
       if (opts.anchor) {
         const anchorId = runs.lastUserEventId(taskId, opts.beforeId);
         if (anchorId != null && anchorId < minId) {
-          const spanConditions = ["runs.task_id = ?", "run_events.id >= ?"];
-          const spanParams: Array<string | number> = [taskId, anchorId];
-          if (opts.beforeId != null) {
-            spanConditions.push("run_events.id < ?");
-            spanParams.push(opts.beforeId);
+          // The span `resolveAnchoredMinId` judges is `[anchorId, beforeId)`
+          // — anchor to newest — but its upper part, `[minId, beforeId)`, is
+          // exactly the default window step 1 already fetched (with `len`),
+          // so only the part BELOW the current floor, `[anchorId, minId)`, is
+          // read from the DB. Its LIMIT is the remaining room under the count
+          // ceiling (+1, so a span that overflows it is detectable by length
+          // alone) — the returned row count is bounded by that, though the
+          // ORDER BY still sorts every task row in the range through a temp
+          // b-tree (same plan shape as step 1, over a strict subset of its
+          // rows). No room left means the window alone already exceeds the
+          // ceiling: skip the read, `resolveAnchoredMinId` rejects on count.
+          const windowRowsDesc = idRows.filter((r) => r.id >= minId);
+          const room = opts.anchor.maxEvents + 1 - windowRowsDesc.length;
+          let spanRowsDesc = windowRowsDesc;
+          if (room > 0) {
+            const belowRowsDesc = db.query<{ id: number; len: number }, Array<string | number>>(
+              `SELECT run_events.id as id, LENGTH(CAST(run_events.data AS BLOB)) as len
+               FROM run_events
+               JOIN runs ON runs.id = run_events.run_id
+               WHERE runs.task_id = ? AND run_events.id >= ? AND run_events.id < ?
+               ORDER BY run_events.id DESC
+               LIMIT ?`,
+            ).all(taskId, anchorId, minId, room);
+            spanRowsDesc = windowRowsDesc.concat(belowRowsDesc);
           }
-          // At most `maxEvents + 1` rows — enough for `resolveAnchoredMinId`
-          // to tell "fits" from "exceeds the count ceiling" without ever
-          // fetching an unbounded span.
-          spanParams.push(opts.anchor.maxEvents + 1);
-          const spanRowsDesc = db.query<{ id: number; len: number }, Array<string | number>>(
-            `SELECT run_events.id as id, LENGTH(CAST(run_events.data AS BLOB)) as len
-             FROM run_events
-             JOIN runs ON runs.id = run_events.run_id
-             WHERE ${spanConditions.join(" AND ")}
-             ORDER BY run_events.id DESC
-             LIMIT ?`,
-          ).all(...spanParams);
           minId = resolveAnchoredMinId({
             minId,
             anchorId,
@@ -2087,9 +2097,17 @@ export const runs = {
    * rationale — a background subagent's own `user` turns are its own
    * conversation, not the primary task's. `beforeId`, when given, excludes
    * events at or after that id, mirroring every other paging cursor in this
-   * file. Backed by migration 039's partial index
-   * `idx_run_events_user_history (stream, id DESC) WHERE subagent_id IS NULL`,
-   * so this is an index-only lookup even on a task with a long history.
+   * file. SQLite serves this from migration 039's partial index
+   * `idx_run_events_user_history (stream, id DESC) WHERE subagent_id IS NULL`
+   * (verified with EXPLAIN QUERY PLAN): it walks main-stream `user` rows
+   * newest-first ACROSS EVERY TASK, probing `runs` by primary key on each
+   * until one belongs to this task — the index carries no run/task column,
+   * so the cost is bounded by how many user messages landed anywhere since
+   * this task's last one, NOT by this task's own history length. User rows
+   * are sparse (a few thousand across a multi-hundred-thousand-event DB) and
+   * every started task has at least its prompt echo, so this is a few ms in
+   * practice; a partial index on `(run_id, stream, id DESC)` would make it
+   * terminate inside the task's own runs if that ever changes.
    */
   lastUserEventId(taskId: string, beforeId?: number): number | null {
     const conditions = ["runs.task_id = ?", "run_events.stream = 'user'", "run_events.subagent_id IS NULL"];

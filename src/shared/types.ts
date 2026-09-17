@@ -3519,7 +3519,14 @@ export const EVENTS_WINDOW_MAX = 3000;
  * below), the default window (`EVENTS_REPLAY_LIMIT` / `EVENTS_REPLAY_MAX_BYTES`,
  * floor `MIN_REPLAY_EVENTS`) is returned unchanged rather than partially
  * extended — a partial extension still leaves the user clicking, for extra
- * complexity with no real payoff.
+ * complexity with no real payoff. On a task that is still RUNNING the
+ * guarantee is first-paint only: the same `EVENTS_WINDOW_MAX` trim drops the
+ * oldest event for every live event that arrives past the cap, so an anchored
+ * window that arrived at (or near) the ceiling loses its anchor as the agent
+ * keeps streaming — inherent to any bounded window, and the reason a finished
+ * task is the case this ceiling is tuned for. The route also takes
+ * `?anchor=0` to skip the extension (used by the TUI dashboard, which keeps
+ * far fewer lines than this and would only pay for bytes it discards).
  */
 export const EVENTS_REPLAY_ANCHOR_MAX_EVENTS = EVENTS_WINDOW_MAX;
 

@@ -48,8 +48,11 @@ export function useCoalescedStream(
       setEvents(trimmed);
     }, TICK_MS);
 
+    // `?anchor=0`: skip the server's last-user-message window extension
+    // (up to 3000 events / 16 MB on the webview's behalf) — this hook keeps
+    // only MAX_LINES, so the extra history would be fetched and discarded.
     const handle: SseHandle = streamSse<RunEvent>(
-      `/tasks/${taskId}/events`,
+      `/tasks/${taskId}/events?anchor=0`,
       (e) => {
         const key = eventKey(e);
         if (seen.current.has(key)) return;

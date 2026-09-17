@@ -208,6 +208,32 @@ test("SSE replay anchors to the last user message: 1 user + 900 assistant -> ear
 });
 
 // ---------------------------------------------------------------------------
+// 1b. `?anchor=0` opts the replay out of the extension (the TUI dashboard's
+//     `useCoalescedStream` passes it — it keeps only 500 lines, so an anchored
+//     window would be fetched and discarded). Same seed as test 1: the
+//     un-anchored window is the newest 800, the user event is NOT in it, and
+//     `hasMore` is true because it (and nothing else) lies before the window.
+// ---------------------------------------------------------------------------
+
+test("SSE replay with ?anchor=0 skips the last-user-message extension: 1 user + 900 assistant -> newest 800 only, hasMore true", async () => {
+  const spec: RunEventStream[] = ["user", ...Array(900).fill("assistant" as RunEventStream)];
+  const { taskId, ids } = seedEventsTask(spec);
+  const userId = ids[0]!;
+
+  const url = `${BASE()}/tasks/${taskId}/events?anchor=0&token=${encodeURIComponent(token)}`;
+  const frames = await readSseFrames(url, 801, 20_000);
+
+  expect(frames.length).toBe(801);
+  const [metaFrame, ...dataFrames] = frames;
+  expect(metaFrame!.event).toBe(TASK_EVENTS_REPLAY_META_EVENT);
+  expect(metaFrame!.data.earliestId).toBe(ids[ids.length - 800]);
+  expect(metaFrame!.data.earliestId).not.toBe(userId);
+  expect(metaFrame!.data.hasMore).toBe(true);
+  expect(dataFrames.length).toBe(800);
+  expect(dataFrames.every((f) => f.data.stream === "assistant")).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
 // 2. SSE replay ceiling fallback: 1 user + 3100 assistant events. The span
 //    from the user event to the newest event (3101 events) exceeds
 //    EVENTS_REPLAY_ANCHOR_MAX_EVENTS (3000), so the default 800-event window
