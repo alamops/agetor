@@ -7,6 +7,8 @@ import { existsSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 
+import { verifyVendorSigning } from "./verify-vendor-signing.ts";
+
 const APP_NAME = "Agetor";
 
 function fail(msg: string): never {
@@ -63,25 +65,27 @@ for (const dmgName of dmgs) {
   }
   console.log("    codesign:  app satisfies its Designated Requirement");
 
-  // Walk every binary we ship under Contents/Resources/app/bin/ and confirm
-  // each one is signed by our Developer ID — not ad-hoc, not unsigned. This
-  // catches the failure mode where fetch-tmux runs without
-  // ELECTROBUN_DEVELOPER_ID and ships ad-hoc-signed nested binaries that
-  // notarytool accepted (because --deep checks the bundle as a whole) but
-  // Gatekeeper might reject case-by-case on first launch.
-  const binDir = join(app, "Contents", "Resources", "app", "bin");
-  if (existsSync(binDir)) {
-    const binFiles = await readdir(binDir);
-    for (const f of binFiles) {
-      const target = join(binDir, f);
-      const dvv = await run(["codesign", "-dvv", target]);
-      const authority = dvv.match(/Authority=(.+)/)?.[1] ?? "(none)";
-      if (!authority.startsWith("Developer ID Application")) {
-        fail(`bundled ${f} is signed by "${authority}", expected Developer ID Application`);
-      }
-    }
-    console.log(`    nested:    ${binFiles.length} binar(y/ies) under bin/ signed by Developer ID`);
+  // The nested binaries we ship under Contents/Resources/app/bin/ (tmux + its
+  // dylibs, AgetorNotifier.app, disclaim) are NOT signed by electrobun — its
+  // codesign pass covers Frameworks, Contents/MacOS/**, Resources/app/bun/
+  // *.node, the launcher and the outer bundle, without --deep. They must
+  // therefore be Developer ID + hardened runtime + secure timestamp before the
+  // build, or notarization fails against those paths.
+  //
+  // This used to walk Contents/Resources/app/bin/ in the built .app, which
+  // could never fire: by this point electrobun has packed the whole
+  // Resources/app tree into a .tar.zst (read at runtime via libasar), so the
+  // directory doesn't exist and existsSync() skipped the check silently —
+  // which is exactly how an ad-hoc-signed disclaim reached Apple. Verify
+  // vendor/ instead: the same bytes, still on disk, shared with the pre-build
+  // gate (`bun run verify:vendor`) so the two can't drift.
+  const vendor = await verifyVendorSigning({ requireDeveloperId: true });
+  if (vendor.problems.length) {
+    fail(`vendored binaries are not notarization-ready:\n   • ${vendor.problems.join("\n   • ")}`);
   }
+  console.log(
+    `    nested:    ${vendor.checked} vendored binar(y/ies) signed by Developer ID (runtime + timestamp)`,
+  );
 
   const spctl = await run(["spctl", "--assess", "--type", "execute", "-vv", app]);
   if (!spctl.includes("accepted") || !spctl.includes("Notarized Developer ID")) {
