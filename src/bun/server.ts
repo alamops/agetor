@@ -3636,13 +3636,33 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const url = new URL(req.url);
           const agentParam = url.searchParams.get("agent");
           const workdir = url.searchParams.get("workdir");
-          const branch = url.searchParams.get("branch");
+          const branch = url.searchParams.get("branch")?.trim() || null;
           if (!agentParam) {
             return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
           }
           const harness = harnesses.getByIdOrKind(agentParam);
           if (!harness) {
             return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // `workdir` is caller-controlled, and in ref mode it becomes a
+          // `cwd` a git process actually spawns in (`resolveProjectTree` ->
+          // `loadRefProjectTree`) — defense-in-depth mirroring
+          // `project-files.ts`'s `validateScope`. Deliberately NOT a 4xx:
+          // this route silently backs the `/`/`@` picker with no error
+          // surface in the UI, so a stale/deleted-worktree `workdir` should
+          // degrade to "no capabilities" rather than surface an error the
+          // caller can't show. `workdir === null` (no workdir picked yet)
+          // keeps today's user-level-only behavior untouched.
+          if (workdir != null) {
+            let workdirOk: boolean;
+            try {
+              workdirOk = path.isAbsolute(workdir) && statSync(workdir).isDirectory();
+            } catch {
+              workdirOk = false;
+            }
+            if (!workdirOk) {
+              return json({ commands: [], extensions: [] }, { headers: corsHeaders(req) });
+            }
           }
           return json(
             await listAgentCapabilities({

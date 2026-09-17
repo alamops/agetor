@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import path from "node:path";
@@ -685,4 +685,227 @@ test("an explicitly enabled plugin contributes its self-row + content", async ()
   const selfRow = extensions.find((e) => e.name === "on" && e.kind === "plugin");
   expect(selfRow).toBeDefined();
   expect(selfRow!.description).toBe("An enabled plugin");
+});
+
+// --- Branch-scoped (git ref) discovery --------------------------------------
+//
+// listAvailableCommands/listAgentCapabilities accept a `branch` option that,
+// when set, reads project-level entries from that git ref's COMMITTED tree
+// (via resolveProjectTree -> ref-tree.ts) instead of live disk. One fixture
+// repo covers all these tests: `main` carries only a README; `feature/skills`
+// commits the branch-only entries (claude + codex); back on `main`, untracked
+// disk-only entries prove the ref mode ignores them while disk mode sees them.
+
+/** Run git in `cwd`, returning ok/stdout/stderr rather than throwing. */
+async function branchGit(args: string[], cwd: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { ok: exitCode === 0, stdout, stderr };
+}
+
+/** Same as `branchGit`, but throws (with stderr) on a non-zero exit — for
+ *  fixture setup steps that must succeed. */
+async function branchGitOk(args: string[], cwd: string): Promise<string> {
+  const res = await branchGit(args, cwd);
+  if (!res.ok) throw new Error(`git ${args.join(" ")} (cwd=${cwd}) failed: ${res.stderr}`);
+  return res.stdout;
+}
+
+let branchRepo: string;
+
+describe("branch-scoped capability discovery (ref mode)", () => {
+  beforeAll(async () => {
+    branchRepo = mkdtempSync(path.join(tmpRoot, "branch-repo-"));
+    await branchGitOk(["init", "-q", "-b", "main"], branchRepo);
+    await branchGitOk(["config", "user.email", "test@example.com"], branchRepo);
+    await branchGitOk(["config", "user.name", "test"], branchRepo);
+    await branchGitOk(["config", "commit.gpgsign", "false"], branchRepo);
+
+    writeCmd(branchRepo, "README.md", "hello\n");
+    await branchGitOk(["add", "."], branchRepo);
+    await branchGitOk(["commit", "-q", "-m", "init"], branchRepo);
+
+    // feature/skills adds everything ref-mode discovery should surface.
+    await branchGitOk(["checkout", "-q", "-b", "feature/skills"], branchRepo);
+    writeCmd(
+      path.join(branchRepo, ".claude", "skills", "only-on-feature"),
+      "SKILL.md",
+      "---\ndescription: Feature-only skill\n---\nbody",
+    );
+    writeCmd(path.join(branchRepo, ".claude", "commands", "nested"), "cmd.md", "nested command body");
+    writeCmd(
+      branchRepo,
+      ".mcp.json",
+      JSON.stringify({ mcpServers: { "feature-mcp": { command: "x" } } }),
+    );
+    // Disables the "demo@mkt" plugin at the PROJECT scope, only on this ref —
+    // `main` never gets a settings.json, so the plugin is enabled there.
+    writeCmd(
+      path.join(branchRepo, ".claude"),
+      "settings.json",
+      JSON.stringify({ enabledPlugins: { "demo@mkt": false } }),
+    );
+    // Project-overrides-user precedence, exercised through ref mode.
+    writeCmd(path.join(branchRepo, ".claude", "skills", "dup"), "SKILL.md", "---\ndescription: Project dup\n---\nbody");
+    writeCmd(path.join(branchRepo, ".codex", "prompts"), "feat-prompt.md", "---\ndescription: Feature prompt\n---\nbody");
+    writeCmd(
+      path.join(branchRepo, ".codex", "skills", "codex-feat"),
+      "SKILL.md",
+      "---\ndescription: Codex feature skill\n---\nbody",
+    );
+    writeCmd(path.join(branchRepo, ".codex"), "config.toml", `[mcp_servers.feat-server]\ncommand = "npx"\n`);
+    await branchGitOk(["add", "."], branchRepo);
+    await branchGitOk(["commit", "-q", "-m", "add feature entries"], branchRepo);
+
+    await branchGitOk(["checkout", "-q", "main"], branchRepo);
+
+    // Untracked disk-only entries: visible with no `branch` (live disk),
+    // invisible under any ref (including `main`, which never committed them).
+    writeCmd(path.join(branchRepo, ".claude", "skills", "untracked"), "SKILL.md", "---\ndescription: Untracked\n---\nbody");
+    writeCmd(branchRepo, ".mcp.json", JSON.stringify({ mcpServers: { "disk-mcp": { command: "y" } } }));
+  });
+
+  test("branch set to a side branch: only that ref's committed entries show", async () => {
+    const { commands, extensions } = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+      branch: "feature/skills",
+    });
+    expect(commands.some((c) => c.name === "/only-on-feature" && c.kind === "skill" && c.source === "project")).toBe(true);
+    expect(commands.some((c) => c.name === "/nested:cmd" && c.source === "project")).toBe(true);
+    expect(extensions.some((e) => e.name === "feature-mcp" && e.kind === "mcp" && e.source === "project")).toBe(true);
+    expect(extensions.some((e) => e.name === "only-on-feature" && e.kind === "skill")).toBe(true);
+    // Untracked disk-only entries never show through a ref.
+    expect(commands.some((c) => c.name === "/untracked")).toBe(false);
+    expect(extensions.some((e) => e.name === "disk-mcp")).toBe(false);
+  });
+
+  test("branch set to main: no project-sourced rows at all (committed-on-feature and untracked-on-disk both absent)", async () => {
+    const { commands, extensions } = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+      branch: "main",
+    });
+    expect(commands.some((c) => c.source === "project")).toBe(false);
+    expect(extensions.some((e) => e.source === "project")).toBe(false);
+  });
+
+  test("no branch: reads live disk, so untracked entries show", async () => {
+    const { commands, extensions } = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+    });
+    expect(commands.some((c) => c.name === "/untracked" && c.source === "project")).toBe(true);
+    expect(extensions.some((e) => e.name === "disk-mcp" && e.kind === "mcp" && e.source === "project")).toBe(true);
+  });
+
+  test("branch set to an unknown ref: zero project rows, builtin rows still present", async () => {
+    const { commands, extensions } = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+      branch: "does-not-exist",
+    });
+    expect(commands.some((c) => c.source === "project")).toBe(false);
+    expect(extensions.some((e) => e.source === "project")).toBe(false);
+    expect(commands.some((c) => c.name === "/init" && c.source === "builtin")).toBe(true);
+  });
+
+  // `resolveProjectTree` (commands.ts) does `branch?.trim()` itself before
+  // deciding disk-vs-ref and before calling `loadRefProjectTree` —
+  // i.e. the FUNCTION trims, not just the HTTP route's query-param handling.
+  // This pins that observed contract (whitespace-padded branch behaves exactly
+  // like the trimmed form) rather than assuming the plan's phrasing ("the
+  // route trims; the function may not") without checking.
+  test("branch with surrounding whitespace resolves the same as the trimmed ref (function itself trims)", async () => {
+    const { commands } = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+      branch: "  feature/skills  ",
+    });
+    expect(commands.some((c) => c.name === "/only-on-feature" && c.source === "project")).toBe(true);
+    expect(commands.some((c) => c.name === "/nested:cmd" && c.source === "project")).toBe(true);
+  });
+
+  test("codex: project prompts/skills/config.toml MCP servers are ref-scoped", async () => {
+    const harness = mkdtempSync(path.join(tmpRoot, "branch-codex-harness-"));
+
+    const feat = await listAvailableCommands({
+      agent: "codex",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "feature/skills",
+    });
+    expect(feat.some((c) => c.name === "/feat-prompt" && c.source === "project")).toBe(true);
+    expect(feat.some((c) => c.name === "/codex-feat" && c.kind === "skill" && c.source === "project")).toBe(true);
+    const featExts = await listExtensions({
+      agent: "codex",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "feature/skills",
+    });
+    expect(featExts.some((e) => e.name === "feat-server" && e.kind === "mcp" && e.source === "project")).toBe(true);
+
+    const main = await listAvailableCommands({
+      agent: "codex",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "main",
+    });
+    expect(main.some((c) => c.name === "/feat-prompt")).toBe(false);
+    expect(main.some((c) => c.name === "/codex-feat")).toBe(false);
+    const mainExts = await listExtensions({
+      agent: "codex",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "main",
+    });
+    expect(mainExts.some((e) => e.name === "feat-server")).toBe(false);
+  });
+
+  test("claude-code plugin: a settings.json committed at the ref disables a plugin that's enabled at every other scope", async () => {
+    const harness = mkdtempSync(path.join(tmpRoot, "branch-plugin-harness-"));
+    installPlugin(harness, "demo@mkt", {
+      commands: { "hello.md": "---\ndescription: Say hello\n---\nbody" },
+      manifest: { name: "demo", description: "Demo plugin" },
+    });
+
+    const feat = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "feature/skills",
+    });
+    expect(feat.commands.some((c) => c.name === "/demo:hello")).toBe(false);
+    expect(feat.extensions.some((e) => e.name === "demo" && e.kind === "plugin")).toBe(false);
+
+    // `main` never committed a settings.json, so the same plugin (still
+    // installed at the same harness) is enabled there.
+    const main = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "main",
+    });
+    expect(main.commands.some((c) => c.name === "/demo:hello")).toBe(true);
+    expect(main.extensions.some((e) => e.name === "demo" && e.kind === "plugin")).toBe(true);
+  });
+
+  test("project entry at the ref still overrides a same-named user-scoped entry", async () => {
+    const harness = mkdtempSync(path.join(tmpRoot, "branch-precedence-harness-"));
+    writeCmd(path.join(harness, "skills", "dup"), "SKILL.md", "---\ndescription: User dup\n---\nbody");
+
+    const all = await listAvailableCommands({
+      agent: "claude-code",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "feature/skills",
+    });
+    const dup = all.find((c) => c.name === "/dup");
+    expect(dup).toBeDefined();
+    expect(dup!.source).toBe("project");
+  });
 });

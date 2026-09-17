@@ -2,6 +2,7 @@ import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN } from "./api-config.ts";
 import { db, dataDir, subagents } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
 import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
@@ -131,6 +132,12 @@ export async function runDaemon(): Promise<void> {
   // fails boot loudly, same as the old synchronous `reconcileOrphans` did —
   // no swallow.
   rehydratePath();
+  // Must run before reconcileOrphans(): reconciliation issues `has-session`
+  // probes against agetor's tmux socket, and the first tmux command to
+  // touch a socket auto-starts its server — un-disclaimed, if this didn't
+  // run first — leaving every session that server ever hosts un-disclaimed
+  // too.
+  await ensureDisclaimedServer();
   await reconcileOrphans();
   // Re-arm in-memory auto-resume timers for every fx task still carrying a
   // pending schedule — same rationale as index.ts's desktop boot path (see

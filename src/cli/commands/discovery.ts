@@ -2,6 +2,7 @@ import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
 import { usageError } from "../usage.ts";
+import { discoveryParamsForTask } from "../../shared/file-scope.ts";
 
 /**
  * List the slash commands and MCP/skill extensions available to a task's agent
@@ -12,12 +13,8 @@ export async function cmdCommands(args: string[], flags: Flags): Promise<void> {
   if (!ref) throw usageError("commands");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
-  const workdir = task.worktreePath ?? task.workdir;
-  const { commands, extensions } = await client.agentDiscovery(
-    task.agent ?? "claude-code",
-    workdir,
-    task.branch,
-  );
+  const { workdir, branch } = discoveryParamsForTask(task);
+  const { commands, extensions } = await client.agentDiscovery(task.agent ?? "claude-code", workdir, branch);
 
   if (flags.json) return printJson({ commands, extensions });
   if (commands.length === 0 && extensions.length === 0) {

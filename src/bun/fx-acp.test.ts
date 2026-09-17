@@ -14,6 +14,7 @@ import path from "node:path";
 import {
   dropFxSession,
   fxSessionActive,
+  parseFxEffortOption,
   reapLiveFxProcs,
   spawnFxViaAcp,
   type FxLaunchOptions,
@@ -99,6 +100,30 @@ const FAKE_ACP_SERVER_SRC = [
   "  }, ms);",
   "}",
   "",
+  "// fx >=0.0.9's `configOptions[{id:\"effort\"}]` shape (TT1) — a real",
+  "// `session/new`/`resume`/`load` result carries this entry only when the",
+  "// active model advertises efforts (see docs/plans/fx-0.0.10-compat.md §3,",
+  "// the zai/glm-5.3-flash row: [max, high, low, auto]); the fake always",
+  "// offers auto/low/high/max in that order (matching the plan's example",
+  "// breadcrumb text 'offers: auto, low, high, max') so every TT1 scenario's",
+  "// expected text is stable regardless of which currentValue it starts at.",
+  "function effortOption(currentValue) {",
+  "  return {",
+  '    id: "effort",',
+  '    name: "Reasoning Effort",',
+  '    description: "Controls how much the model thinks before responding",',
+  '    category: "thought_level",',
+  '    type: "select",',
+  "    currentValue: currentValue,",
+  "    options: [",
+  '      { value: "auto", name: "default" },',
+  '      { value: "low", name: "low" },',
+  '      { value: "high", name: "high" },',
+  '      { value: "max", name: "max" }',
+  "    ]",
+  "  };",
+  "}",
+  "",
   'process.on("SIGTERM", function () {',
   '  capture("sigterm", {});',
   "  process.exit(0);",
@@ -146,6 +171,27 @@ const FAKE_ACP_SERVER_SRC = [
   '  if (scenario === "provider") {',
   '    result.configOptions = [{ id: "provider", currentValue: "gateway", options: ["gateway", "codex", "grok"] }];',
   "  }",
+  "  if (scenario === \"effort-set\" || scenario === \"effort-auto-default\" || scenario === \"effort-not-offered\" || scenario === \"effort-set-error\") {",
+  '    result.configOptions = [effortOption("auto")];',
+  "  }",
+  "  // \"effort-option-absent\" and everything else deliberately get no",
+  "  // configOptions field at all — the 0.0.8-shaped result parseFxEffortOption",
+  "  // must read as \"no effort entry\" (returns null).",
+  "  if (scenario === \"effort-option-empty\") {",
+  "    // Phase 5 review fix: a PRESENT effort entry with an empty options",
+  '    // list — genuinely-offered-but-nothing-to-offer — must be treated the',
+  '    // same as an absent entry by applyFxEffort, not routed into the',
+  '    // "isn\'t offered (offers: )" breadcrumb.',
+  "    result.configOptions = [{",
+  '      id: "effort",',
+  '      name: "Reasoning Effort",',
+  '      description: "Controls how much the model thinks before responding",',
+  '      category: "thought_level",',
+  '      type: "select",',
+  '      currentValue: "auto",',
+  "      options: []",
+  "    }];",
+  "  }",
   "  ok(id, result);",
   "}",
   "",
@@ -177,6 +223,49 @@ const FAKE_ACP_SERVER_SRC = [
   "    ok(id, {});",
   "    return;",
   "  }",
+  '  if (scenario === "effort-on-resume") {',
+  "    // Persisted currentValue from a prior turn — TT1 scenario 6 (and its",
+  '    // effort-auto-reset variant) reuse this one server-side shape.',
+  '    ok(id, { configOptions: [effortOption("high")] });',
+  "    return;",
+  "  }",
+  '  if (scenario === "effort-on-load") {',
+  "    // Force the session/load fallback so the effort option is applied",
+  "    // from the LOAD result instead of resume's (TT1 scenario 7).",
+  '    fail(id, -32602, "Invalid params (fake, forcing fallback for effort-on-load)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-same-chunk-update") {',
+  "    // Phase 5 review fix: pumpStdout drains a whole stdout chunk",
+  "    // synchronously (handleLine called for every complete line in it)",
+  "    // before the driver's `await sendRpc(..., \"session/resume\")` ever",
+  "    // resumes as a microtask — so a session/update that fx writes into",
+  "    // the SAME chunk as the resume response must be judged by the line",
+  "    // ORDER within that chunk, not by whether the awaiting code has run",
+  "    // yet. One raw process.stdout.write call, three newline-terminated",
+  "    // JSON lines: a replayed tool_call (still inside the replay window —",
+  "    // must be dropped), the session/resume response itself (closes the",
+  "    // window), then a live agent_message_chunk (must NOT be dropped).",
+  "    var sameChunkToolCall = JSON.stringify({ jsonrpc: \"2.0\", method: \"session/update\", params: { update: { sessionUpdate: \"tool_call\", toolCallId: \"same-chunk-hist-1\", name: \"shell\", title: \"Run ls (replayed)\", kind: \"execute\", status: \"pending\", rawInput: { command: \"ls\" } } } });",
+  "    var sameChunkResponse = JSON.stringify({ jsonrpc: \"2.0\", id: id, result: {} });",
+  "    var sameChunkLiveUpdate = JSON.stringify({ jsonrpc: \"2.0\", method: \"session/update\", params: { update: { sessionUpdate: \"agent_message_chunk\", messageId: \"same-chunk-msg\", content: { type: \"text\", text: \"same-chunk live text\" } } } });",
+  '    process.stdout.write(sameChunkToolCall + "\\n" + sameChunkResponse + "\\n" + sameChunkLiveUpdate + "\\n");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-replay-structured") {',
+  "    // TT1 scenario 9: 0.0.9+ structured replay of a paused checkpoint —",
+  "    // real tool_call/tool_call_update frames plus assistant text and a",
+  "    // title update, all sent BEFORE the resume response itself, while",
+  "    // the driver's `state.replaying` window is open.",
+  '    notify("session/update", { update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "replayed user text" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "hist-1", name: "shell", title: "Run ls", kind: "execute", status: "pending", rawInput: { command: "ls" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call_update", toolCallId: "hist-1", status: "completed", content: [{ type: "content", content: { type: "text", text: "ok" } }] } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "hist-msg", content: { type: "text", text: "partial answer" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "paused", kind: "terminal_provider_error", cause: "rate_limited", action: "paused", requiredAction: "continue_later", attempt: 10, attemptLimit: 10, durable: true, message: "⚠ Rate limited" } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", title: "Replayed title" } });',
+  "    ok(id, {});",
+  "    return;",
+  "  }",
   "  ok(id, {});",
   "}",
   "",
@@ -196,6 +285,12 @@ const FAKE_ACP_SERVER_SRC = [
   "  }",
   '  if (scenario === "resume-auth-error-load-ok") {',
   "    ok(id, {});",
+  "    return;",
+  "  }",
+  '  if (scenario === "effort-on-load") {',
+  "    // TT1 scenario 7: the effort option arrives on the LOAD result (not",
+  "    // resume's, which failed above), currentValue still at fx's default.",
+  '    ok(id, { configOptions: [effortOption("auto")] });',
   "    return;",
   "  }",
   "  ok(id, {});",
@@ -463,8 +558,34 @@ const FAKE_ACP_SERVER_SRC = [
   '  if (scenario === "stall-for-drop") {',
   "    return;",
   "  }",
+  '  if (scenario === "resume-same-chunk-update") {',
+  "    // Everything this scenario needs to prove was already sent, in one",
+  "    // stdout chunk, from handleSessionResume above — just end the turn so",
+  "    // the coalescer flushes and the run settles.",
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-replay-structured") {',
+  "    // The LIVE half of TT1 scenario 9 — a real tool call/result pair and",
+  "    // assistant text sent AFTER session/resume resolved (state.replaying",
+  "    // is false by now), which must reach onChunk normally.",
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "live-1", name: "shell", title: "Run pwd", kind: "execute", status: "pending", rawInput: { command: "pwd" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call_update", toolCallId: "live-1", status: "completed", content: [{ type: "content", content: { type: "text", text: "/tmp" } }] } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "live-msg", content: { type: "text", text: "live answer" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
   "  streamHappyUpdates();",
   '  endTurn(id, 20, "end_turn");',
+  "}",
+  "",
+  "function handleSetConfigOption(id, params) {",
+  '  capture("session/set_config_option", params);',
+  '  if (scenario === "effort-set-error") {',
+  '    fail(id, -32602, "Reasoning effort is not available for the active model");',
+  "    return;",
+  "  }",
+  "  ok(id, { configOptions: [effortOption(params.value)] });",
   "}",
   "",
   "function handleCancel(params) {",
@@ -521,6 +642,7 @@ const FAKE_ACP_SERVER_SRC = [
   '  if (method === "session/resume") { handleSessionResume(id, params); return; }',
   '  if (method === "session/load") { handleSessionLoad(id, params); return; }',
   '  if (method === "session/set_mode") { ok(id, {}); return; }',
+  '  if (method === "session/set_config_option") { handleSetConfigOption(id, params); return; }',
   '  if (method === "session/prompt") { handlePrompt(id, params); return; }',
   '  if (method === "session/cancel") { handleCancel(params); return; }',
   '  fail(id, -32601, "method not found (fake): " + method);',
@@ -589,7 +711,22 @@ function readCaptured(captureFile: string): Array<{ label: string; msg: unknown 
 
 function spawnFake(
   scenario: string,
-  opts: { mode?: FxMode; resumeSessionId?: string; env?: Record<string, string>; continueRecovery?: boolean } = {},
+  opts: {
+    mode?: FxMode;
+    resumeSessionId?: string;
+    env?: Record<string, string>;
+    continueRecovery?: boolean;
+    /** Agetor's stored effort id for the task — threaded straight through to
+     *  `FxLaunchOptions.effort` (TT1). `null` is a distinct, intentional
+     *  value from `undefined` (both mean "no RPC", but tests exercise both
+     *  spellings — see the "effort-null" describe block). */
+    effort?: string | null;
+    /** `FxLaunchOptions.model` — the fake's argv carries no `--model` flag
+     *  (unlike a real launch via `buildCommand`), so any test that asserts
+     *  on `applyFxEffort`'s breadcrumb text must pass this explicitly or
+     *  the breadcrumb falls back to the generic "the active model" phrase. */
+    model?: string;
+  } = {},
 ) {
   const chunks: Chunk[] = [];
   const onChunk: FxLaunchOptions["onChunk"] = (stream, data, lineUuid) => chunks.push({ stream, data, lineUuid });
@@ -608,6 +745,8 @@ function spawnFake(
     mode: opts.mode ?? "auto",
     resumeSessionId: opts.resumeSessionId,
     continueRecovery: opts.continueRecovery,
+    effort: opts.effort,
+    model: opts.model,
     onChunk,
     onSessionId: (id) => sessionIds.push(id),
   });
@@ -2063,4 +2202,387 @@ describe("session/prompt -32602 without continueRecovery keeps the existing wrap
       "fx acp: session/prompt failed: Invalid params (fake, no continueRecovery carve-out) (code -32602)",
     );
   }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * TT1 (docs/plans/fx-0.0.10-compat.md §5) — fx 0.0.9+ reasoning-effort
+ * config option and the 0.0.9+ structured session/resume replay. Every
+ * `effort-*` scenario below models the 0.0.10 `session/new`/`resume`/`load`
+ * result's `configOptions[{id:"effort"}]` entry via the fake server's
+ * `effortOption(currentValue)` helper (auto/low/high/max, in that order —
+ * see its own comment), and threads `opts.effort`/`opts.model` through
+ * `spawnFake` into `FxLaunchOptions.effort`/`.model` so `applyFxEffort`'s
+ * breadcrumb text names a real model instead of falling back to the
+ * generic "the active model" phrase.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("applyFxEffort — session/new applies the task's stored effort (TT1 scenario 1)", () => {
+  test("sends exactly one session/set_config_option before session/prompt; no breadcrumb", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-set", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const setCalls = entries.filter((e) => e.label === "session/set_config_option");
+    expect(setCalls).toHaveLength(1);
+    expect(setCalls[0]!.msg).toMatchObject({ configId: "effort", value: "high" });
+
+    const setIndex = entries.findIndex((e) => e.label === "session/set_config_option");
+    const promptIndex = entries.findIndex((e) => e.label === "session/prompt");
+    expect(promptIndex).toBeGreaterThan(setIndex);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("running at fx's default"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxEffort — effort 'auto' matches currentValue 'auto' (TT1 scenario 2)", () => {
+  test("no RPC, no breadcrumb", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-auto-default", {
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("running at fx's default"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxEffort — effort not in the offered list (TT1 scenario 3)", () => {
+  test("emits one breadcrumb naming the offers, sends no RPC, and the turn still completes normally", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-not-offered", {
+      effort: "medium",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+    expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    const matching = statusChunks.filter(
+      (c) =>
+        c.data ===
+        "fx: effort medium isn't offered for zai/glm-5.3-flash (offers: auto, low, high, max) — running at fx's default",
+    );
+    expect(matching).toHaveLength(1);
+  }, 10_000);
+});
+
+describe("applyFxEffort — configOptions carries no effort entry at all (0.0.8-shaped result / no-effort model, TT1 scenario 4)", () => {
+  test("effort set → one breadcrumb naming the model, no RPC", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-absent", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(
+      statusChunks.some(
+        (c) => c.data === "fx: zai/glm-5.3-flash exposes no reasoning-effort setting — running at fx's default",
+      ),
+    ).toBe(true);
+  }, 10_000);
+
+  test("effort 'auto' → silent (no breadcrumb, no RPC) — the model can't even set one, so auto needs no nudge", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-absent", {
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("reasoning-effort"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxEffort — configOptions carries a PRESENT-but-EMPTY effort entry (Phase 5 review fix)", () => {
+  test("effort set → the same 'exposes no reasoning-effort setting' breadcrumb as an absent entry, no RPC", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-empty", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    const matching = statusChunks.filter(
+      (c) => c.data === "fx: zai/glm-5.3-flash exposes no reasoning-effort setting — running at fx's default",
+    );
+    expect(matching).toHaveLength(1);
+    // Regression guard: before the fix, a present-but-empty `values` list
+    // fell into the "isn't offered" breadcrumb instead, which would read
+    // "(offers: )" here.
+    expect(statusChunks.some((c) => c.data.includes("isn't offered"))).toBe(false);
+  }, 10_000);
+
+  test("effort 'auto' → silent (no breadcrumb, no RPC) — same as an absent entry", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-empty", {
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("reasoning-effort"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxEffort — session/set_config_option RPC error degrades to a breadcrumb (TT1 scenario 5)", () => {
+  test("carries fx's own error message verbatim; session/prompt is still sent and the turn completes", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-set-error", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(true);
+    expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(
+      statusChunks.some(
+        (c) =>
+          c.data ===
+          "fx: couldn't set effort high — Reasoning effort is not available for the active model — running at fx's default",
+      ),
+    ).toBe(true);
+  }, 10_000);
+});
+
+describe("applyFxEffort — session/resume result carries the persisted effort (TT1 scenario 6)", () => {
+  test("stored effort already matches the persisted currentValue 'high' → no RPC", async () => {
+    const { agent, captureFile } = spawnFake("effort-on-resume", {
+      resumeSessionId: "resume-effort-1",
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+  }, 10_000);
+
+  test("variant effort-auto-reset: stored effort 'auto' differs from the persisted 'high' → one set call resetting to auto", async () => {
+    const { agent, captureFile } = spawnFake("effort-on-resume", {
+      resumeSessionId: "resume-effort-2",
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const setCalls = entries.filter((e) => e.label === "session/set_config_option");
+    expect(setCalls).toHaveLength(1);
+    expect(setCalls[0]!.msg).toMatchObject({ configId: "effort", value: "auto" });
+  }, 10_000);
+});
+
+describe("applyFxEffort — resume falls back to session/load; effort applied from load's result (TT1 scenario 7)", () => {
+  test("one set call after load, before prompt", async () => {
+    const { agent, captureFile } = spawnFake("effort-on-load", {
+      resumeSessionId: "resume-effort-load-1",
+      effort: "max",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const setCalls = entries.filter((e) => e.label === "session/set_config_option");
+    expect(setCalls).toHaveLength(1);
+    expect(setCalls[0]!.msg).toMatchObject({ configId: "effort", value: "max" });
+
+    const loadIndex = entries.findIndex((e) => e.label === "session/load");
+    const setIndex = entries.findIndex((e) => e.label === "session/set_config_option");
+    const promptIndex = entries.findIndex((e) => e.label === "session/prompt");
+    expect(loadIndex).toBeGreaterThanOrEqual(0);
+    expect(setIndex).toBeGreaterThan(loadIndex);
+    expect(promptIndex).toBeGreaterThan(setIndex);
+  }, 10_000);
+});
+
+describe("applyFxEffort — no stored effort at all (TT1 scenario 8)", () => {
+  test("effort: null → no RPC, no breadcrumb, even though the option is present", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-set", {
+      effort: null,
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(
+      statusChunks.some(
+        (c) => c.data.includes("reasoning-effort") || c.data.includes("running at fx's default"),
+      ),
+    ).toBe(false);
+  }, 10_000);
+
+  test("effort: undefined (never threaded) → same as null", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-set", {
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(
+      statusChunks.some(
+        (c) => c.data.includes("reasoning-effort") || c.data.includes("running at fx's default"),
+      ),
+    ).toBe(false);
+  }, 10_000);
+});
+
+describe("parseFxEffortOption — pure helper matrix", () => {
+  test("null configOptions / non-array → null", () => {
+    expect(parseFxEffortOption(undefined)).toBeNull();
+    expect(parseFxEffortOption(null)).toBeNull();
+    expect(parseFxEffortOption("not an array")).toBeNull();
+    expect(parseFxEffortOption({})).toBeNull();
+  });
+
+  test("array with no id:'effort' entry → null", () => {
+    expect(
+      parseFxEffortOption([{ id: "provider", currentValue: "gateway" }, { id: "mode", currentValue: "code" }]),
+    ).toBeNull();
+  });
+
+  test("present entry → current + values, non-string option values dropped", () => {
+    expect(
+      parseFxEffortOption([
+        {
+          id: "effort",
+          currentValue: "high",
+          options: [{ value: "auto" }, { value: "low" }, { value: 7 }, "not-an-object", { value: "high" }],
+        },
+      ]),
+    ).toEqual({ current: "high", values: ["auto", "low", "high"] });
+  });
+
+  test("non-string currentValue reads as null; missing/non-array options reads as []", () => {
+    expect(parseFxEffortOption([{ id: "effort", currentValue: 7 }])).toEqual({ current: null, values: [] });
+    expect(parseFxEffortOption([{ id: "effort" }])).toEqual({ current: null, values: [] });
+    expect(parseFxEffortOption([{ id: "effort", currentValue: "auto", options: "nope" }])).toEqual({
+      current: "auto",
+      values: [],
+    });
+  });
+});
+
+describe("session/resume structured replay (0.0.9+) is suppressed except session_info_update (TT1 scenario 9)", () => {
+  test(
+    "replayed tool_call/tool_call_update/assistant content never reach onChunk; the recovery (replayed:true) and title sentinels do; the live turn's own tool call and assistant text after session/prompt arrive normally",
+    async () => {
+      const { agent, chunks } = spawnFake("resume-replay-structured", {
+        resumeSessionId: "resume-replay-structured-1",
+      });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      // Nothing from the replayed history reached onChunk.
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:hist-1:use")).toBe(false);
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:hist-1:result")).toBe(false);
+      expect(chunks.some((c) => c.stream === "assistant" && c.data.includes("partial answer"))).toBe(false);
+
+      // The recovery sentinel DID arrive, marked replayed — followed by the
+      // live "cleared" sentinel once the normal follow-up prompt resolves
+      // (same two-sentinel shape as the existing "resume-replays-paused"
+      // scenario above — see finding #4/#8 in the file header).
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const recoveryPayloads = recoveryChunks.map(
+        (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string; replayed?: boolean },
+      );
+      expect(recoveryPayloads.map((p) => p.state)).toEqual(["paused", "cleared"]);
+      expect(recoveryPayloads[0]!.replayed).toBe(true);
+      expect(recoveryPayloads[1]!.replayed).toBeUndefined();
+
+      // The title sentinel arrived too, exactly once.
+      const titleChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX),
+      );
+      expect(titleChunks).toHaveLength(1);
+      expect(titleChunks[0]!.data).toBe(FX_SESSION_TITLE_STATUS_PREFIX + "Replayed title");
+
+      // The LIVE tool call/result pair (sent after session/prompt, once
+      // state.replaying is back to false) DID arrive.
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:live-1:use")).toBe(true);
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:live-1:result")).toBe(true);
+
+      // The LIVE assistant text DID arrive.
+      const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+      expect(assistantChunks.some((c) => c.data === "live answer")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("session/resume replay window closes on the reply LINE, not on the awaiting microtask (Phase 5 review fix)", () => {
+  test(
+    "a live update in the SAME stdout chunk as the resume response reaches onChunk; a replayed update earlier in that same chunk is still dropped",
+    async () => {
+      const { agent, chunks } = spawnFake("resume-same-chunk-update", {
+        resumeSessionId: "resume-same-chunk-1",
+      });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      // The replayed tool_call, written BEFORE the resume response in the
+      // same raw stdout.write call, is still inside the replay window by
+      // line order and must be dropped exactly as it would be if it had
+      // arrived in its own separate chunk.
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:same-chunk-hist-1:use")).toBe(false);
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:same-chunk-hist-1:result")).toBe(false);
+
+      // The live agent_message_chunk, written AFTER the resume response in
+      // that SAME chunk, must reach onChunk as an assistant event — this is
+      // the regression the fix closes: before it, `state.replaying` was
+      // only cleared once `runFxTurn`'s `await sendRpc(...)` resumed as a
+      // microtask, which happens strictly after pumpStdout finishes
+      // draining every line already in the buffer, so this line would have
+      // been wrongly dropped as replay too.
+      const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+      expect(assistantChunks.some((c) => c.data === "same-chunk live text")).toBe(true);
+    },
+    10_000,
+  );
 });

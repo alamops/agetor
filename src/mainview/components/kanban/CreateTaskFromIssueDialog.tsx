@@ -311,8 +311,6 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
                 value={prompt}
                 onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
                 agent={launch.agent}
-                workdir={context.path}
-                branch={wt.baseRef || undefined}
                 references={references}
                 onReferencesChange={setReferences}
                 setReferences={setReferences}

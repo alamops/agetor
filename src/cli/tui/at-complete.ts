@@ -3,7 +3,7 @@
 // `src/mainview/components/kanban/AtFileAutocomplete.tsx`). Pure and
 // DOM-free by design (no ink here) so it's unit-testable without rendering
 // anything; `Composer.tsx` is the only consumer of the two suggestion
-// functions, `Dashboard.tsx` the only consumer of `fileScopeForTask`.
+// functions.
 //
 // The TUI composer is a single append-only line — there is no way to move
 // the caret to the middle of the text — so unlike the webview's
@@ -15,7 +15,6 @@
 import type { FileEntry } from "../../shared/at-file-filter.ts";
 import { descendInto, filterFileEntries } from "../../shared/at-file-filter.ts";
 import { findActiveAtQuery, formatAtToken } from "../../shared/at-refs.ts";
-import type { Task } from "../../shared/types.ts";
 
 /** How many rows the composer's popover shows at once. */
 const MAX_SUGGESTIONS = 5;
@@ -23,24 +22,12 @@ const MAX_SUGGESTIONS = 5;
 /**
  * The project scope (`GET /files/index` params) a task's `@` popover should
  * list/validate against — EXACTLY the table `RunPanel.tsx`'s `fileScope`
- * memo uses (see CLAUDE.md §12): the live worktree once it exists; before
- * the first run of an isolated task, the source repo at whatever ref
- * `prepareWorkdir` will actually check the worktree out on (`task.branch`
- * when pinned to a pre-existing branch, else the pinned `baseRef`); a plain
- * workdir otherwise.
+ * memo uses (see CLAUDE.md §12). Moved to `src/shared/file-scope.ts` (the
+ * single source of truth shared by the webview, the TUI, and the CLI's
+ * capability discovery) — re-exported here since `Dashboard.tsx` and
+ * `commands/add.ts` still import it from this module.
  */
-export function fileScopeForTask(
-  task: Pick<Task, "workdir" | "worktreePath" | "isolation" | "baseRef" | "branchSource" | "branch">,
-): { dir: string; ref?: string | null } {
-  if (task.worktreePath) return { dir: task.worktreePath };
-  if (task.isolation === "worktree") {
-    return {
-      dir: task.workdir,
-      ref: task.branchSource === "existing" && task.branch ? task.branch : (task.baseRef ?? "HEAD"),
-    };
-  }
-  return { dir: task.workdir };
-}
+export { fileScopeForTask } from "../../shared/file-scope.ts";
 
 /** The active `@`-query slice at the end of `text`, plus its top suggestion
  *  rows. `null` when there's no active query (no `@`, or the token already

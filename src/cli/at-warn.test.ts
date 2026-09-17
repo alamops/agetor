@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgetorClient } from "./api-client.ts";
+import type { Task } from "../shared/types.ts";
 
 /**
  * `warnUnresolvedRefs` writes through `./output.ts`'s `errln` — mocked here
@@ -226,8 +227,25 @@ test("existsInLiveScope: false for an empty path", () => {
 
 // ── discoveredExtensionNames ──────────────────────────────────────────────
 
-function fakeTask(): { agent: string; workdir: string; branch: string | null } {
-  return { agent: "claude-code", workdir: "/tmp/whatever", branch: null };
+type ScopeTask = Pick<
+  Task,
+  "agent" | "workdir" | "worktreePath" | "isolation" | "baseRef" | "branchSource" | "branch"
+>;
+
+/** Defaults to a plain, non-isolated task (no worktree, no ref) — the
+ *  simplest scope — with per-test overrides for the fields that drive
+ *  `fileScopeForTask`/`discoveryParamsForTask` (`src/shared/file-scope.ts`). */
+function fakeTask(overrides: Partial<ScopeTask> = {}): ScopeTask {
+  return {
+    agent: "claude-code",
+    workdir: "/tmp/whatever",
+    worktreePath: null,
+    isolation: "none",
+    baseRef: null,
+    branchSource: "created",
+    branch: null,
+    ...overrides,
+  };
 }
 
 test("discoveredExtensionNames: maps `@`-prefixed inserts by stripping the leading `@`, others by name", async () => {
@@ -256,7 +274,7 @@ test("discoveredExtensionNames: a discovery failure fails open to an empty set",
   expect(names).toEqual(new Set());
 });
 
-test("discoveredExtensionNames: passes agent/workdir/branch through to agentDiscovery verbatim", async () => {
+test("discoveredExtensionNames: passes the task's agent through to agentDiscovery verbatim", async () => {
   const calls: Array<[string, string, string | null]> = [];
   const client = {
     agentDiscovery: async (agent: string, workdir: string, branch: string | null) => {
@@ -265,8 +283,94 @@ test("discoveredExtensionNames: passes agent/workdir/branch through to agentDisc
     },
   } as unknown as AgetorClient;
 
-  await discoveredExtensionNames(client, { agent: "codex", workdir: "/x", branch: "feature/y" });
-  expect(calls).toEqual([["codex", "/x", "feature/y"]]);
+  await discoveredExtensionNames(client, fakeTask({ agent: "codex", workdir: "/x" }));
+  expect(calls).toEqual([["codex", "/x", null]]);
+});
+
+// `discoveredExtensionNames` derives `agentDiscovery`'s workdir/branch args via
+// `discoveryParamsForTask` (`src/shared/file-scope.ts`), NOT the task's raw
+// `workdir`/`branch` fields — this is the fix for the defect where
+// `agetor send`/`start`/`add --start` and the TUI warned on the wrong tree
+// for a materialized worktree (reading the agetor branch's committed tree in
+// the source repo instead of the live worktree) or a not-yet-started
+// isolated task (reading `task.branch`, which is only set once a worktree
+// materializes, instead of the pinned `baseRef`). These four cases mirror
+// `at-complete.test.ts`'s `fileScopeForTask` coverage, one per scope shape.
+test("discoveredExtensionNames: a materialized worktree reads the live worktree, no ref", async () => {
+  const calls: Array<[string, string, string | null]> = [];
+  const client = {
+    agentDiscovery: async (agent: string, workdir: string, branch: string | null) => {
+      calls.push([agent, workdir, branch]);
+      return { commands: [], extensions: [] };
+    },
+  } as unknown as AgetorClient;
+
+  await discoveredExtensionNames(
+    client,
+    fakeTask({
+      workdir: "/repo",
+      worktreePath: "/worktrees/t1",
+      isolation: "worktree",
+      baseRef: "main",
+      branch: "agetor/t1-slug",
+    }),
+  );
+  expect(calls).toEqual([["claude-code", "/worktrees/t1", null]]);
+});
+
+test("discoveredExtensionNames: an isolated task with no worktree yet reads workdir @ baseRef", async () => {
+  const calls: Array<[string, string, string | null]> = [];
+  const client = {
+    agentDiscovery: async (agent: string, workdir: string, branch: string | null) => {
+      calls.push([agent, workdir, branch]);
+      return { commands: [], extensions: [] };
+    },
+  } as unknown as AgetorClient;
+
+  await discoveredExtensionNames(
+    client,
+    fakeTask({ workdir: "/repo", worktreePath: null, isolation: "worktree", baseRef: "main" }),
+  );
+  expect(calls).toEqual([["claude-code", "/repo", "main"]]);
+});
+
+test("discoveredExtensionNames: an existing-branch task (e.g. a PR head) reads workdir @ branch, not baseRef", async () => {
+  const calls: Array<[string, string, string | null]> = [];
+  const client = {
+    agentDiscovery: async (agent: string, workdir: string, branch: string | null) => {
+      calls.push([agent, workdir, branch]);
+      return { commands: [], extensions: [] };
+    },
+  } as unknown as AgetorClient;
+
+  await discoveredExtensionNames(
+    client,
+    fakeTask({
+      workdir: "/repo",
+      worktreePath: null,
+      isolation: "worktree",
+      branchSource: "existing",
+      branch: "pr-123",
+      baseRef: "main",
+    }),
+  );
+  expect(calls).toEqual([["claude-code", "/repo", "pr-123"]]);
+});
+
+test("discoveredExtensionNames: isolation none reads the plain workdir, no ref", async () => {
+  const calls: Array<[string, string, string | null]> = [];
+  const client = {
+    agentDiscovery: async (agent: string, workdir: string, branch: string | null) => {
+      calls.push([agent, workdir, branch]);
+      return { commands: [], extensions: [] };
+    },
+  } as unknown as AgetorClient;
+
+  await discoveredExtensionNames(
+    client,
+    fakeTask({ workdir: "/repo", worktreePath: null, isolation: "none", baseRef: "main", branch: "agetor/old" }),
+  );
+  expect(calls).toEqual([["claude-code", "/repo", null]]);
 });
 
 // ── verifyTokensViaSearch ─────────────────────────────────────────────────

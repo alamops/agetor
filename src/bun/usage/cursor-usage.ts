@@ -229,7 +229,16 @@ function readBrowserCookie(_harness: Harness): string | null {
 /**
  * Best-effort discovery of the Cursor web session cookie
  * (`WorkosCursorSessionToken`), tried in order:
- *  1. Cursor IDE `state.vscdb` (read-only SQLite read).
+ *  1. Cursor IDE `state.vscdb` (read-only SQLite read) — a **cross-app data
+ *     read** under `~/Library/Application Support/Cursor`, which on macOS
+ *     Sequoia trips the `kTCCServiceSystemPolicyAppData` "Agetor would like
+ *     to access data from other apps" prompt. Gated on `opts.allowIdeRead`
+ *     (default `true` when `opts` is omitted, so a direct caller or the
+ *     explicit-refresh path behaves exactly as before): when it's `false`,
+ *     this step — including the `existsSync` probe itself — is skipped
+ *     entirely, so agetor's process never touches that directory. See
+ *     `fetchCursorQuota` / `src/bun/usage/poller.ts`'s `refreshOne` for the
+ *     policy that decides when `allowIdeRead` is true.
  *  2. Browser cookie store (stubbed — always `null` in v1, see
  *     `readBrowserCookie`).
  * Every step is wrapped so a failure in one falls through to the next
@@ -238,12 +247,17 @@ function readBrowserCookie(_harness: Harness): string | null {
  */
 export async function discoverCursorCookie(
   harness: Harness,
+  opts?: { allowIdeRead?: boolean },
 ): Promise<string | null> {
-  try {
-    const ideCookie = readCursorIdeCookie();
-    if (ideCookie) return ideCookie;
-  } catch {
-    // fall through
+  const allowIdeRead = opts?.allowIdeRead ?? true;
+
+  if (allowIdeRead) {
+    try {
+      const ideCookie = readCursorIdeCookie();
+      if (ideCookie) return ideCookie;
+    } catch {
+      // fall through
+    }
   }
 
   try {
@@ -523,17 +537,28 @@ async function fetchJson(
  * single entry point the poller (`src/bun/usage/poller.ts`) calls, and the
  * plan is explicit (section 3, section 7) that a Cursor fetch must never
  * throw, prompt, or block. Resolution order:
- *  1. `discoverCursorCookie(harness)` — if it yields nothing, resolve
- *     `status:"unavailable"` immediately with a reason explaining what's
- *     needed, no network call attempted.
+ *  1. `discoverCursorCookie(harness, { allowIdeRead })` — if it yields
+ *     nothing, resolve `status:"unavailable"` immediately with a reason
+ *     explaining what's needed, no network call attempted.
  *  2. With a cookie, fetch `usage-summary` and `auth/me` in parallel (each
  *     under a ~5s timeout) and parse via `parseCursorUsage`. Empty meters
  *     still resolves `status:"unavailable"` (we got a response but
  *     recognized nothing in it); non-empty meters resolve `status:"ok"`.
  *  3. Any thrown error (network, timeout, non-2xx, JSON parse) is caught
  *     and resolves `status:"error"` with a short reason — never propagated.
+ *
+ * `opts.allowIdeRead` (default `true` when `opts` is omitted, preserving
+ * today's behavior for any direct caller and the explicit-refresh path)
+ * gates the cross-app read of the Cursor IDE's `state.vscdb` inside
+ * `discoverCursorCookie` — see that function's doc and
+ * `src/bun/usage/poller.ts`'s `refreshOne` for why a background sweep with
+ * no prior snapshot passes `false`.
  */
-export async function fetchCursorQuota(harness: Harness): Promise<HarnessQuota> {
+export async function fetchCursorQuota(
+  harness: Harness,
+  opts?: { allowIdeRead?: boolean },
+): Promise<HarnessQuota> {
+  const allowIdeRead = opts?.allowIdeRead ?? true;
   const fetchedAtMs = Date.now();
   const base: Omit<HarnessQuota, "status" | "meters" | "reason" | "planType"> = {
     harnessId: harness.id,
@@ -544,7 +569,7 @@ export async function fetchCursorQuota(harness: Harness): Promise<HarnessQuota> 
 
   let cookie: string | null = null;
   try {
-    cookie = await discoverCursorCookie(harness);
+    cookie = await discoverCursorCookie(harness, { allowIdeRead });
   } catch {
     cookie = null;
   }
@@ -557,10 +582,14 @@ export async function fetchCursorQuota(harness: Harness): Promise<HarnessQuota> 
       meters: [],
       // Actionable guidance — rendered verbatim in the topbar popover, so
       // tell the user exactly how to make usage appear rather than just
-      // stating that it can't.
-      reason:
-        "No Cursor session found. Open the Cursor desktop app and sign in, " +
-        "then Refresh here — Agetor reads Cursor's local login to fetch plan usage.",
+      // stating that it can't. When the IDE read itself was skipped (no
+      // prior consent/snapshot yet), say so explicitly rather than implying
+      // a login problem — the fix here is clicking Refresh, not signing in.
+      reason: allowIdeRead
+        ? "No Cursor session found. Open the Cursor desktop app and sign in, " +
+          "then Refresh here — Agetor reads Cursor's local login to fetch plan usage."
+        : "Cursor usage isn't read in the background. Click Refresh to read " +
+          "Cursor's local login and show plan usage.",
     };
   }
 

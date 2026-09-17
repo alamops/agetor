@@ -6,6 +6,7 @@ import {
   fxRefusedStatusLine,
   isFxContextDiagnostic,
   mapFxUpdate,
+  parseFxEffortOption,
 } from "./fx-acp.ts";
 import type { FxUpdateCtx } from "./fx-acp.ts";
 import {
@@ -1557,5 +1558,217 @@ describe("FxTextCoalescer", () => {
       expect(flushed).toBeDefined();
       expect("messageId" in flushed!).toBe(false);
     });
+  });
+});
+
+describe("parseFxEffortOption", () => {
+  // Verbatim `session/new` result for `zai/glm-5.3-flash`, fx 0.0.10,
+  // live-probed 2026-09-14 (spike fx-0010-efforts,
+  // session-new-v0010-zai__glm-5.3-flash.json) — the huge `model` option
+  // list (200+ catalog entries) is trimmed to a few representative rows;
+  // `provider`/`mode`/`effort` are byte-verbatim from the probe.
+  const ZAI_GLM_FLASH_CONFIG_OPTIONS = [
+    {
+      id: "provider",
+      name: "Provider",
+      category: "model",
+      type: "select",
+      currentValue: "gateway",
+      options: [
+        { value: "gateway", name: "Vercel AI Gateway" },
+        { value: "codex", name: "Codex subscription" },
+        { value: "grok", name: "Grok subscription" },
+      ],
+    },
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: "zai/glm-5.3-flash",
+      options: [
+        { value: "anthropic/claude-opus-5", name: "anthropic/claude-opus-5" },
+        { value: "openai/gpt-5.6-sol", name: "openai/gpt-5.6-sol" },
+        { value: "zai/glm-5.3-flash", name: "zai/glm-5.3-flash" },
+      ],
+    },
+    {
+      id: "mode",
+      name: "Session Mode",
+      description: "Controls how the agent requests permission",
+      category: "mode",
+      type: "select",
+      currentValue: "ask",
+      options: [
+        { value: "code", name: "Code", description: "Write and modify code with full tool access", permissionMode: "auto" },
+        { value: "ask", name: "Ask", description: "Request permission before making any changes", permissionMode: "ask" },
+      ],
+    },
+    {
+      id: "effort",
+      name: "Reasoning Effort",
+      description: "Controls how much the model thinks before responding",
+      category: "thought_level",
+      type: "select",
+      currentValue: "auto",
+      options: [
+        { value: "auto", name: "default" },
+        { value: "low", name: "low" },
+        { value: "high", name: "high" },
+        { value: "max", name: "max" },
+      ],
+    },
+  ];
+
+  // Same probe, `openai/gpt-5.6-sol` — fx 0.0.10, live-probed 2026-09-14
+  // (spike fx-0010-efforts, session-new-v0010-openai__gpt-5.6-sol.json).
+  // Only the `effort` entry matters here; the sibling entries are omitted
+  // since parseFxEffortOption looks at `id: "effort"` only.
+  const GPT_5_6_SOL_CONFIG_OPTIONS = [
+    { id: "provider", currentValue: "gateway", options: [{ value: "gateway", name: "Vercel AI Gateway" }] },
+    { id: "model", currentValue: "openai/gpt-5.6-sol", options: [{ value: "openai/gpt-5.6-sol", name: "openai/gpt-5.6-sol" }] },
+    { id: "mode", currentValue: "ask", options: [{ value: "code", name: "Code" }, { value: "ask", name: "Ask" }] },
+    {
+      id: "effort",
+      name: "Reasoning Effort",
+      description: "Controls how much the model thinks before responding",
+      category: "thought_level",
+      type: "select",
+      currentValue: "auto",
+      options: [
+        { value: "auto", name: "default" },
+        { value: "none", name: "none" },
+        { value: "low", name: "low" },
+        { value: "medium", name: "medium" },
+        { value: "high", name: "high" },
+        { value: "xhigh", name: "xhigh" },
+        { value: "max", name: "max" },
+      ],
+    },
+  ];
+
+  test("zai/glm-5.3-flash's verbatim (trimmed) session/new configOptions parses to auto/low/high/max, current auto", () => {
+    expect(parseFxEffortOption(ZAI_GLM_FLASH_CONFIG_OPTIONS)).toEqual({
+      current: "auto",
+      values: ["auto", "low", "high", "max"],
+    });
+  });
+
+  test("openai/gpt-5.6-sol's verbatim configOptions parses to the full seven-value set, current auto", () => {
+    expect(parseFxEffortOption(GPT_5_6_SOL_CONFIG_OPTIONS)).toEqual({
+      current: "auto",
+      values: ["auto", "none", "low", "medium", "high", "xhigh", "max"],
+    });
+  });
+
+  test("0.0.8-shaped configOptions (provider/model/mode only, no effort entry) returns null", () => {
+    // fx 0.0.8 never sends an `effort` entry at all — this is the shape a
+    // 0.0.8 binary (or any model that doesn't advertise efforts) actually
+    // returns. `applyFxEffort` treats null as "option absent", distinct from
+    // a present-but-empty entry (case below).
+    const configOptionsV008 = [
+      { id: "provider", currentValue: "gateway", options: [{ value: "gateway", name: "Vercel AI Gateway" }] },
+      { id: "model", currentValue: "zai/glm-5.3-flash", options: [{ value: "zai/glm-5.3-flash", name: "zai/glm-5.3-flash" }] },
+      { id: "mode", currentValue: "ask", options: [{ value: "code", name: "Code" }, { value: "ask", name: "Ask" }] },
+    ];
+    expect(parseFxEffortOption(configOptionsV008)).toBeNull();
+  });
+
+  test("configOptions that isn't an array (or is missing) returns null rather than throwing", () => {
+    expect(parseFxEffortOption(undefined)).toBeNull();
+    expect(parseFxEffortOption(null)).toBeNull();
+    expect(parseFxEffortOption("not-an-array")).toBeNull();
+    expect(parseFxEffortOption(42)).toBeNull();
+    expect(parseFxEffortOption({ id: "effort", currentValue: "auto", options: [] })).toBeNull();
+  });
+
+  test("an effort entry with options missing (or non-array) reads as values: []", () => {
+    expect(parseFxEffortOption([{ id: "effort", currentValue: "auto" }])).toEqual({
+      current: "auto",
+      values: [],
+    });
+    expect(parseFxEffortOption([{ id: "effort", currentValue: "auto", options: "not-an-array" }])).toEqual({
+      current: "auto",
+      values: [],
+    });
+    expect(parseFxEffortOption([{ id: "effort", currentValue: "auto", options: null }])).toEqual({
+      current: "auto",
+      values: [],
+    });
+  });
+
+  test("non-string option values are skipped; non-object option entries are skipped", () => {
+    expect(
+      parseFxEffortOption([
+        {
+          id: "effort",
+          currentValue: "auto",
+          options: [
+            { value: "auto", name: "default" },
+            { value: 42, name: "not-a-string" },
+            { value: null, name: "null-value" },
+            null,
+            "a bare string entry",
+            123,
+            { name: "missing value key" },
+            { value: "high", name: "high" },
+          ],
+        },
+      ]),
+    ).toEqual({ current: "auto", values: ["auto", "high"] });
+  });
+
+  test("a non-string currentValue (or a missing one) reads as current: null", () => {
+    expect(parseFxEffortOption([{ id: "effort", currentValue: 42, options: [] }])).toEqual({
+      current: null,
+      values: [],
+    });
+    expect(parseFxEffortOption([{ id: "effort", currentValue: null, options: [] }])).toEqual({
+      current: null,
+      values: [],
+    });
+    expect(parseFxEffortOption([{ id: "effort", currentValue: undefined, options: [] }])).toEqual({
+      current: null,
+      values: [],
+    });
+    expect(parseFxEffortOption([{ id: "effort", options: [] }])).toEqual({ current: null, values: [] });
+  });
+
+  test("a persisted-effort session/resume shape reports the persisted value as currentValue, not auto", () => {
+    // Per the plan's §3 note: "the set persists on the session
+    // (commitActiveSessionEffort), so a resumed session reports the
+    // persisted value as currentValue" — live-verified on 0.0.10
+    // (set_config_option effort=high echoed currentValue:"high" on the next
+    // session/resume). Same options list as the zai/glm-5.3-flash probe
+    // above, just with currentValue advanced past "auto".
+    const resumedConfigOptions = [
+      {
+        id: "effort",
+        name: "Reasoning Effort",
+        currentValue: "high",
+        options: [
+          { value: "auto", name: "default" },
+          { value: "low", name: "low" },
+          { value: "high", name: "high" },
+          { value: "max", name: "max" },
+        ],
+      },
+    ];
+    expect(parseFxEffortOption(resumedConfigOptions)).toEqual({
+      current: "high",
+      values: ["auto", "low", "high", "max"],
+    });
+  });
+
+  test("a duplicate id:\"effort\" entry: the first one in the array wins (Array.prototype.find semantics)", () => {
+    // Not an observed real-fx shape — fx only ever sends one `effort` entry
+    // — but parseFxEffortOption uses `configOptions.find(...)`, which always
+    // resolves to the first match, so a malformed/duplicated array is
+    // documented here rather than left to guesswork.
+    const duplicated = [
+      { id: "effort", currentValue: "low", options: [{ value: "low", name: "low" }] },
+      { id: "effort", currentValue: "max", options: [{ value: "max", name: "max" }] },
+    ];
+    expect(parseFxEffortOption(duplicated)).toEqual({ current: "low", values: ["low"] });
   });
 });

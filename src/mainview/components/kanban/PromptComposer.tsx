@@ -85,10 +85,18 @@ const EMPTY_PATH_SET: ReadonlySet<string> = new Set();
 
 /**
  * Fetches the `/` autocomplete commands and Extensions-picker entries
- * reachable for a given agent + workdir (+ optional branch) — lifted from
- * `NewTaskForm`'s identical effect verbatim. Empty/whitespace `workdir`
- * short-circuits to empty lists without a fetch; a failed fetch also
- * resolves to empty lists (no autocomplete is no worse than none).
+ * reachable for a given agent, scoped by the SAME `{ dir, ref? }` pair the
+ * `@` file popover already derives per surface (`FileScope` from
+ * `use-project-files`) — lifted from `NewTaskForm`'s identical effect
+ * verbatim, then rekeyed off `scope` instead of a separate `workdir`/`branch`
+ * pair so every composer shares one derivation and can't drift from the `@`
+ * listing's rule: `{dir}` for a live tree (an existing worktree, or an
+ * isolation=none workdir) reads the working copy on disk; `{dir, ref}` for a
+ * not-yet-created worktree reads project-level skills/commands/MCP at the
+ * pinned ref — what the worktree will actually contain once it exists;
+ * `null`/undefined `scope` (or a blank `scope.dir`) short-circuits to empty
+ * lists without a fetch. A failed fetch also resolves to empty lists (no
+ * autocomplete is no worse than none).
  *
  * `opts.enabled` (default `true`) lets a caller that hoists this hook above
  * a conditionally-mounted `PromptComposer` skip the disk walk entirely when
@@ -99,23 +107,24 @@ const EMPTY_PATH_SET: ReadonlySet<string> = new Set();
  */
 export function useAgentCapabilities(
   agent: string,
-  workdir: string,
-  branch?: string,
+  scope: FileScope | null | undefined,
   opts?: { enabled?: boolean },
 ): { commands: AvailableCommand[]; extensions: AvailableExtension[] } {
   const enabled = opts?.enabled ?? true;
   const [commands, setCommands] = useState<AvailableCommand[]>([]);
   const [extensions, setExtensions] = useState<AvailableExtension[]>([]);
+  const dir = scope?.dir;
+  const ref = scope?.ref;
 
   useEffect(() => {
-    if (!enabled || !workdir.trim()) { setCommands([]); setExtensions([]); return; }
+    if (!enabled || !dir || !dir.trim()) { setCommands([]); setExtensions([]); return; }
     let cancelled = false;
     // Pass the harness id (not just the kind) so aliased multi-account
     // harnesses read their own per-harness commands/skills — the server
     // resolves it via getByIdOrKind, so a built-in's id-equals-kind is still
     // honored unchanged.
     api
-      .listAgentCapabilities({ agent, workdir: workdir.trim(), branch: branch?.trim() || undefined })
+      .listAgentCapabilities({ agent, workdir: dir.trim(), branch: ref?.trim() || undefined })
       .then(({ commands, extensions }) => {
         if (cancelled) return;
         setCommands(commands);
@@ -123,7 +132,9 @@ export function useAgentCapabilities(
       })
       .catch(() => { if (!cancelled) { setCommands([]); setExtensions([]); } });
     return () => { cancelled = true; };
-  }, [agent, workdir, branch, enabled]);
+    // Deps are primitives (dir/ref strings), not the `scope` object, so a
+    // fresh-identity scope with equal fields never refetches.
+  }, [agent, dir, ref, enabled]);
 
   return { commands, extensions };
 }
@@ -262,18 +273,25 @@ export interface PromptComposerProps {
   value: string;
   onChange: (next: string) => void;
   agent: string;
-  workdir: string;
-  branch?: string;
   references: TaskReference[];
   onReferencesChange: (refs: TaskReference[]) => void;
   /**
    * Which project tree the `@` popover (`AtFileAutocomplete`) lists and the
-   * in-field highlight (`AtHighlightBackdrop`) validates against. `{ dir }`
-   * for a live tree — an existing worktree, or an isolation=none task's
-   * workdir. `{ dir, ref }` for a not-yet-created worktree, listing tracked
-   * files at the pinned base ref (the shape the worktree will actually have
-   * once `startTask` materializes it). `null`/omitted disables the `@`
-   * popover and highlighting entirely — no fetch is made.
+   * in-field highlight (`AtHighlightBackdrop`) validates against — AND, as of
+   * the branch-scoped-capabilities work, the same scope `useAgentCapabilities`
+   * reads project-level skills/commands/MCP/plugin-enablement from, so the
+   * `/` autocomplete and the Extensions picker can never disagree with the
+   * `@` file listing about which tree they're describing. It's also the sole
+   * gate for the Extensions picker's enabled state (`disabled` below) — a
+   * consumer with no `fileScope.dir` gets a disabled-but-otherwise-inert
+   * picker rather than one enabled with nothing to discover against.
+   * `{ dir }` for a live tree — an existing worktree, or an isolation=none
+   * task's workdir. `{ dir, ref }` for a not-yet-created worktree, listing
+   * tracked files (and reading project-level capabilities) at the pinned
+   * base ref (the shape the worktree will actually have once `startTask`
+   * materializes it). `null`/omitted disables the `@` popover, highlighting,
+   * the Extensions picker, and project-level capability discovery entirely —
+   * no fetch is made for any of them.
    */
   fileScope?: FileScope | null;
   /** Opaque token whose CHANGE triggers a listing `refresh()` — RunPanel
@@ -422,8 +440,6 @@ export function PromptComposer({
   value,
   onChange,
   agent,
-  workdir,
-  branch,
   references,
   onReferencesChange,
   setReferences,
@@ -465,7 +481,7 @@ export function PromptComposer({
   // `capabilities`/`savedPrompts` (see those props' docs for why a caller
   // would hoist them). `?? internal` below picks whichever the caller
   // actually wants driving this render.
-  const internalCapabilities = useAgentCapabilities(agent, workdir, branch, { enabled: !capabilities });
+  const internalCapabilities = useAgentCapabilities(agent, fileScope ?? null, { enabled: !capabilities });
   const { commands, extensions } = capabilities ?? internalCapabilities;
   const internalSavedPrompts = useSavedPrompts({ enabled: !savedPromptsProp });
   const { savedPrompts, reload } = savedPromptsProp ?? internalSavedPrompts;
@@ -841,7 +857,7 @@ export function PromptComposer({
               textareaRef={ref}
               placement={placement}
               align={actions ? "left" : "right"}
-              disabled={disabled || !workdir.trim()}
+              disabled={disabled || !fileScope?.dir?.trim()}
             />
             {actions && <div className="flex items-center gap-2">{actions}</div>}
           </div>

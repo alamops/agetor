@@ -1,7 +1,8 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { AgentKind } from "../shared/types.ts";
+import { diskProjectTree, emptyProjectTree, loadRefProjectTree, type ProjectTree } from "./ref-tree.ts";
 import { repoRoot } from "./worktree.ts";
 
 /**
@@ -72,52 +73,57 @@ function safeReadFile(p: string): string {
   try { return readFileSync(p, "utf8"); } catch { return ""; }
 }
 
-function safeListDir(p: string): string[] {
-  try { return readdirSync(p); } catch { return []; }
-}
-
 /**
- * Walk a commands directory, treating nested folders as `parent:child` namespaces
- * (the convention both Claude Code and `bunx claudeup`-style tooling adopt).
+ * Walk a commands directory (`relDir`, root-relative to `tree`), treating
+ * nested folders as `parent:child` namespaces (the convention both Claude
+ * Code and `bunx claudeup`-style tooling adopt). Reads through a
+ * `ProjectTree` rather than the filesystem directly so the exact same walk
+ * serves live disk, a git ref, or a plugin's install dir.
  */
-function discoverCommands(dir: string, source: EntrySource): AvailableCommand[] {
-  if (!existsSync(dir)) return [];
+function discoverCommands(tree: ProjectTree, relDir: string, source: EntrySource): AvailableCommand[] {
   const out: AvailableCommand[] = [];
-  const walk = (cur: string, prefix: string) => {
-    for (const name of safeListDir(cur)) {
-      const p = path.join(cur, name);
-      let s;
-      try { s = statSync(p); } catch { continue; }
-      if (s.isDirectory()) {
-        walk(p, prefix + name + ":");
-      } else if (name.endsWith(".md")) {
-        const cmdName = prefix + name.slice(0, -3);
+  const walk = (curRel: string, prefix: string) => {
+    for (const entry of tree.list(curRel)) {
+      const p = curRel ? `${curRel}/${entry.name}` : entry.name;
+      if (entry.isDir) {
+        walk(p, prefix + entry.name + ":");
+      } else if (entry.name.endsWith(".md")) {
+        const cmdName = prefix + entry.name.slice(0, -3);
         out.push({
           name: "/" + cmdName,
-          description: readMdSummary(safeReadFile(p)),
+          description: readMdSummary(tree.read(p) ?? ""),
           source,
           kind: "command",
         });
       }
     }
   };
-  walk(dir, "");
+  walk(relDir, "");
   return out;
 }
 
 /**
  * A "skill" is a folder under `skills/` containing a SKILL.md file. The folder
  * name is the slash-invokable name.
+ *
+ * Gates on `tree.read(...) != null`, not on the file merely existing: a
+ * `SKILL.md` that exists but can't be produced as text (unreadable due to
+ * permissions, or a directory named `SKILL.md`) is now omitted entirely
+ * rather than listed with an empty description — an intentional behavior
+ * change from the pre-`ProjectTree` walk. `ProjectTree` has no separate
+ * "exists" notion distinct from "read successfully" (see `list`/`read` on
+ * the interface), and a skill agetor can't describe isn't one worth
+ * offering in the autocomplete.
  */
-function discoverSkills(dir: string, source: EntrySource): AvailableCommand[] {
-  if (!existsSync(dir)) return [];
+function discoverSkills(tree: ProjectTree, relDir: string, source: EntrySource): AvailableCommand[] {
   const out: AvailableCommand[] = [];
-  for (const name of safeListDir(dir)) {
-    const skillFile = path.join(dir, name, "SKILL.md");
-    if (!existsSync(skillFile)) continue;
+  for (const entry of tree.list(relDir)) {
+    if (!entry.isDir) continue;
+    const text = tree.read(`${relDir}/${entry.name}/SKILL.md`);
+    if (text == null) continue;
     out.push({
-      name: "/" + name,
-      description: readMdSummary(safeReadFile(skillFile)),
+      name: "/" + entry.name,
+      description: readMdSummary(text),
       source,
       kind: "skill",
     });
@@ -186,9 +192,57 @@ function codexHome(opts: { harnessHome?: string | null; harnessEnv?: Record<stri
 }
 
 function codexSystemSkills(home: string): AvailableCommand[] {
-  const primary = discoverSkills(path.join(home, "skills", ".system"), "builtin");
+  const primary = discoverSkills(diskProjectTree(home), "skills/.system", "builtin");
   if (primary.length > 0 || home === defaultCodexHome()) return primary;
-  return discoverSkills(path.join(defaultCodexHome(), "skills", ".system"), "builtin");
+  return discoverSkills(diskProjectTree(defaultCodexHome()), "skills/.system", "builtin");
+}
+
+/**
+ * Root-relative paths capability discovery ever reads at a git ref, as
+ * glob-equivalent regexes. Kept tight (rather than reading every `.claude`/
+ * `.codex` file `loadRefProjectTree`'s default pathspecs would list) so a
+ * ref checkout never pulls in unrelated project files — mirrors exactly
+ * what `listAvailableCommands`/`readEnabledPlugins`/
+ * `discoverMcpAndPluginExtensions` read from disk today.
+ */
+const CAPABILITY_READ_PATTERNS: RegExp[] = [
+  /^\.claude\/commands\/.+\.md$/,
+  /^\.claude\/skills\/[^/]+\/SKILL\.md$/,
+  /^\.claude\/settings\.json$/,
+  /^\.claude\/settings\.local\.json$/,
+  /^\.mcp\.json$/,
+  /^\.codex\/prompts\/.+\.md$/,
+  /^\.codex\/skills\/[^/]+\/SKILL\.md$/,
+  /^\.codex\/config\.toml$/,
+];
+
+function isDiscoveredCapabilityPath(relPath: string): boolean {
+  return CAPABILITY_READ_PATTERNS.some((re) => re.test(relPath));
+}
+
+/**
+ * Resolve the `ProjectTree` capability discovery should read project-level
+ * entries from: `null` when there's no root at all (matches today's "no
+ * workdir ⇒ no project entries"); the ref's committed tree — scoped to
+ * `CAPABILITY_READ_PATTERNS` — when `branch` is a non-empty ref; otherwise
+ * live disk, byte-identical to pre-ref-mode behavior. Takes `branch` directly
+ * (not an `opts` bag) — `workdir` was accepted here once but never read;
+ * `root` (already resolved from `workdir` by the caller) is what matters.
+ *
+ * An unresolvable ref (unknown ref, `root` not a git repo) deliberately
+ * degrades to `emptyProjectTree()` rather than falling back to disk — the
+ * owner's call: a ref-scoped request that can't be honored should show no
+ * project rows, not a possibly-misleading disk snapshot.
+ */
+export async function resolveProjectTree(
+  branch: string | null | undefined,
+  root: string | null,
+): Promise<ProjectTree | null> {
+  if (root == null) return null;
+  const trimmedBranch = branch?.trim();
+  if (!trimmedBranch) return diskProjectTree(root);
+  const tree = await loadRefProjectTree(root, trimmedBranch, { shouldRead: isDiscoveredCapabilityPath });
+  return tree ?? emptyProjectTree();
 }
 
 /**
@@ -205,12 +259,18 @@ function codexSystemSkills(home: string): AvailableCommand[] {
  *  - NULL: fall back to the agetor process homedir + the default `.claude/`
  *    or `.codex/` layout.
  *
- * Branch is accepted but not used to swap filesystem views — when the user
- * picks a different branch, the worktree will be checked out from that branch
- * at task-start, but for autocomplete we read what the user currently has on
- * disk in the source repo. That matches what the user "sees" right now and
- * avoids spawning git per keystroke. The branch field is wired through so a
- * future enhancement can git-ls-tree without breaking the API shape.
+ * `branch` is a git ref. When set, project-level entries (everything under
+ * `.claude/` or `.codex/` in the repo root, plus `.mcp.json`) are read from
+ * that ref's COMMITTED tree via `ref-tree.ts`'s `loadRefProjectTree`, not
+ * from whatever happens to be checked out on disk — so the autocomplete
+ * shows exactly what a worktree cut from that ref will contain; an
+ * uncommitted skill sitting on disk is deliberately not offered. Resolution
+ * mirrors the `@` file listing: `--full-tree` root-relative paths, and a
+ * ref with no local match is retried once as `refs/remotes/origin/<ref>`
+ * (PR head branches and other remote-only refs). An unknown ref (or a
+ * non-git workdir) yields NO project-level rows rather than falling back to
+ * disk — user-level, plugin, and builtin rows still show. With no `branch`,
+ * behavior is unchanged: project entries come from live disk.
  */
 export async function listAvailableCommands(
   opts: {
@@ -220,38 +280,43 @@ export async function listAvailableCommands(
     harnessHome?: string | null;
     harnessEnv?: Record<string, string> | null;
   },
-  // Pre-resolved active plugins, threaded in by `listAgentCapabilities` so the
-  // (settings + installed_plugins) resolution runs once per capabilities request
-  // instead of once here and again in `discoverMcpAndPluginExtensions`. Omitted
-  // by direct callers (e.g. tests), who get a self-contained resolve.
-  activePlugins?: ActivePlugin[],
+  // Pre-resolved active plugins + project tree, threaded in by
+  // `listAgentCapabilities` so the (settings + installed_plugins + ref/disk)
+  // resolution runs once per capabilities request instead of once here and
+  // again in `discoverMcpAndPluginExtensions`. Omitted by direct callers
+  // (e.g. tests), who get a self-contained resolve.
+  ctx?: { activePlugins?: ActivePlugin[]; projectTree?: ProjectTree | null },
 ): Promise<AvailableCommand[]> {
   const all: AvailableCommand[] = [];
 
   if (opts.agent === "claude-code") {
     const userCmdRoot = opts.harnessHome ?? path.join(homedir(), ".claude");
-    all.push(...discoverCommands(path.join(userCmdRoot, "commands"), "user"));
-    all.push(...discoverSkills(path.join(userCmdRoot, "skills"), "user"));
+    const userTree = diskProjectTree(userCmdRoot);
+    all.push(...discoverCommands(userTree, "commands", "user"));
+    all.push(...discoverSkills(userTree, "skills", "user"));
     // Plugins apply regardless of workdir (user-scoped ones are global), so
     // resolve the repo root up front — it's also reused for project entries.
     const root = opts.workdir ? (await repoRoot(opts.workdir)) ?? opts.workdir : null;
-    if (root) {
-      all.push(...discoverCommands(path.join(root, ".claude", "commands"), "project"));
-      all.push(...discoverSkills(path.join(root, ".claude", "skills"), "project"));
+    const projectTree = ctx?.projectTree !== undefined ? ctx.projectTree : await resolveProjectTree(opts.branch, root);
+    if (projectTree) {
+      all.push(...discoverCommands(projectTree, ".claude/commands", "project"));
+      all.push(...discoverSkills(projectTree, ".claude/skills", "project"));
     }
     // Enabled plugins contribute namespaced `/<plugin>:<name>` commands + skills.
-    all.push(...pluginCommands(activePlugins ?? resolveActivePlugins(opts, root)));
+    all.push(...pluginCommands(ctx?.activePlugins ?? resolveActivePlugins(opts, root, projectTree)));
     // Binary built-ins go LAST so any same-named user/project/plugin entry above
     // wins the dedupe and built-ins only ever fill a gap (matches the CLI).
     all.push(...builtinCommands(opts.agent));
   } else if (opts.agent === "codex") {
     const userCmdRoot = codexHome(opts);
-    all.push(...discoverCommands(path.join(userCmdRoot, "prompts"), "user"));
-    all.push(...discoverSkills(path.join(userCmdRoot, "skills"), "user"));
-    if (opts.workdir) {
-      const root = (await repoRoot(opts.workdir)) ?? opts.workdir;
-      all.push(...discoverCommands(path.join(root, ".codex", "prompts"), "project"));
-      all.push(...discoverSkills(path.join(root, ".codex", "skills"), "project"));
+    const userTree = diskProjectTree(userCmdRoot);
+    all.push(...discoverCommands(userTree, "prompts", "user"));
+    all.push(...discoverSkills(userTree, "skills", "user"));
+    const root = opts.workdir ? (await repoRoot(opts.workdir)) ?? opts.workdir : null;
+    const projectTree = ctx?.projectTree !== undefined ? ctx.projectTree : await resolveProjectTree(opts.branch, root);
+    if (projectTree) {
+      all.push(...discoverCommands(projectTree, ".codex/prompts", "project"));
+      all.push(...discoverSkills(projectTree, ".codex/skills", "project"));
     }
     all.push(...builtinCommands(opts.agent));
     all.push(...codexSystemSkills(userCmdRoot));
@@ -286,6 +351,13 @@ export async function listAvailableCommands(
 
 function safeReadJson(p: string): any {
   const text = safeReadFile(p);
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+/** Same as `safeReadJson`, but for text already in hand (e.g. from a
+ *  `ProjectTree.read()` call) rather than an absolute disk path. */
+function safeParseJson(text: string | null): any {
   if (!text) return null;
   try { return JSON.parse(text); } catch { return null; }
 }
@@ -341,12 +413,14 @@ function mcpServersToExtensions(
 }
 
 /**
- * Parse `[mcp_servers.<name>]` section headers out of a codex `config.toml`.
- * A deliberately tiny scanner — we only need the server names, not the full
- * TOML, and pulling in a TOML parser for this would be overkill.
+ * Parse `[mcp_servers.<name>]` section headers out of codex `config.toml`
+ * TEXT already in hand. A deliberately tiny scanner — we only need the
+ * server names, not the full TOML, and pulling in a TOML parser for this
+ * would be overkill. Split out from `codexTomlMcpServers` (the disk-reading
+ * wrapper) so both the user path (always disk) and the project path (disk
+ * or a `ProjectTree.read()` result) share one parser.
  */
-function codexTomlMcpServers(tomlPath: string, source: "user" | "project"): AvailableExtension[] {
-  const text = safeReadFile(tomlPath);
+function codexTomlMcpServersFromText(text: string | null, source: "user" | "project"): AvailableExtension[] {
   if (!text) return [];
   const out: AvailableExtension[] = [];
   const seen = new Set<string>();
@@ -362,6 +436,12 @@ function codexTomlMcpServers(tomlPath: string, source: "user" | "project"): Avai
     out.push({ name, insert: "@" + name, description: "MCP server", source, kind: "mcp" });
   }
   return out;
+}
+
+/** Disk-reading wrapper around `codexTomlMcpServersFromText` for an absolute
+ *  `config.toml` path (the user-scoped codex home, always on disk). */
+function codexTomlMcpServers(tomlPath: string, source: "user" | "project"): AvailableExtension[] {
+  return codexTomlMcpServersFromText(safeReadFile(tomlPath) || null, source);
 }
 
 /**
@@ -389,23 +469,33 @@ interface ActivePlugin {
  * are booleans. A plugin absent from every map is treated as enabled (claude
  * adds an explicit `true` on install, so "absent" means "no opinion recorded"),
  * but an explicit `false` at any scope hides it.
+ *
+ * User settings are machine-local and always read from disk. Project
+ * settings go through `projectTree` (live disk, or a git ref's committed
+ * tree — see `resolveProjectTree`) so the enabled-plugin view matches
+ * whichever tree the rest of project discovery is reading. The two project
+ * `settings.json`/`settings.local.json` reads deliberately bypass
+ * `jsonStatCache` (unlike `userSettingsPath` above): the tree may be a git
+ * ref, where there's no meaningful on-disk path/mtime to key a stat cache
+ * by. They're tiny files and the request rate is bounded by picker changes
+ * (agent/workdir/branch), so re-parsing them every call is cheap enough.
  */
-function readEnabledPlugins(harnessHome: string | null, root: string | null): Map<string, boolean> {
+function readEnabledPlugins(harnessHome: string | null, projectTree: ProjectTree | null): Map<string, boolean> {
   const merged = new Map<string, boolean>();
-  const apply = (p: string) => {
-    const ep = safeReadJsonCached(p)?.enabledPlugins;
+  const apply = (ep: unknown) => {
     if (ep && typeof ep === "object") {
-      for (const [k, v] of Object.entries(ep)) {
+      for (const [k, v] of Object.entries(ep as Record<string, unknown>)) {
         if (typeof v === "boolean") merged.set(k, v);
       }
     }
   };
   // harnessHome IS the CLAUDE_CONFIG_DIR, so settings.json sits directly under
   // it (mirroring how commands/skills live there sans `.claude/` segment).
-  apply(harnessHome ? path.join(harnessHome, "settings.json") : path.join(homedir(), ".claude", "settings.json"));
-  if (root) {
-    apply(path.join(root, ".claude", "settings.json"));
-    apply(path.join(root, ".claude", "settings.local.json"));
+  const userSettingsPath = harnessHome ? path.join(harnessHome, "settings.json") : path.join(homedir(), ".claude", "settings.json");
+  apply(safeReadJsonCached(userSettingsPath)?.enabledPlugins);
+  if (projectTree) {
+    apply(safeParseJson(projectTree.read(".claude/settings.json"))?.enabledPlugins);
+    apply(safeParseJson(projectTree.read(".claude/settings.local.json"))?.enabledPlugins);
   }
   return merged;
 }
@@ -415,14 +505,18 @@ function readEnabledPlugins(harnessHome: string | null, root: string | null): Ma
  * applicable install record (user-scoped always; project-scoped only when its
  * `projectPath` matches the repo) AND not explicitly disabled via
  * `enabledPlugins`. claude-code only — codex has no plugin system.
+ *
+ * Plugin install RECORDS and their `installPath` contents stay disk-only —
+ * they're machine-local, not tracked files — but which plugins are enabled
+ * can be overridden by a project `settings.json` at a ref, hence `projectTree`.
  */
-function resolveActivePlugins(opts: DiscoveryOpts, root: string | null): ActivePlugin[] {
+function resolveActivePlugins(opts: DiscoveryOpts, root: string | null, projectTree: ProjectTree | null): ActivePlugin[] {
   if (opts.agent !== "claude-code") return [];
   const configDir = opts.harnessHome ?? path.join(homedir(), ".claude");
   const installed = safeReadJsonCached(path.join(configDir, "plugins", "installed_plugins.json"));
   const plugins = installed?.plugins;
   if (!plugins || typeof plugins !== "object") return [];
-  const enabled = readEnabledPlugins(opts.harnessHome ?? null, root);
+  const enabled = readEnabledPlugins(opts.harnessHome ?? null, projectTree);
   const roots = new Set([root, opts.workdir].filter(Boolean) as string[]);
   const out: ActivePlugin[] = [];
   for (const [key, recordsRaw] of Object.entries(plugins as Record<string, unknown>)) {
@@ -498,9 +592,12 @@ function pluginSelfExtensions(active: ActivePlugin[]): AvailableExtension[] {
 function pluginCommands(active: ActivePlugin[]): AvailableCommand[] {
   const out: AvailableCommand[] = [];
   for (const p of active) {
+    // Plugin install dirs are machine-local (not tracked in the project
+    // repo), so they always read from disk regardless of any ref in play.
+    const tree = diskProjectTree(p.installPath);
     const contributed = [
-      ...discoverCommands(path.join(p.installPath, "commands"), "plugin"),
-      ...discoverSkills(path.join(p.installPath, "skills"), "plugin"),
+      ...discoverCommands(tree, "commands", "plugin"),
+      ...discoverSkills(tree, "skills", "plugin"),
     ];
     for (const c of contributed) {
       out.push({ ...c, name: `/${p.name}:${c.name.slice(1)}` });
@@ -542,8 +639,19 @@ interface DiscoveryOpts {
  * picker *except* skills. Split out from skill discovery so the combined
  * `listAgentCapabilities` can reuse the skills `listAvailableCommands` already
  * walked instead of walking the `skills/` tree a second time.
+ *
+ * `projectTree` is `resolveProjectTree`'s result — live disk or a git ref's
+ * committed tree — and backs only the tracked project files (`.mcp.json`,
+ * `.codex/config.toml`); `~/.claude.json`'s per-project MCP block stays
+ * disk-only regardless (it's machine-local, keyed by the cwd claude ran in,
+ * not a file the ref would carry).
  */
-function discoverMcpAndPluginExtensions(opts: DiscoveryOpts, root: string | null, active: ActivePlugin[]): AvailableExtension[] {
+function discoverMcpAndPluginExtensions(
+  opts: DiscoveryOpts,
+  root: string | null,
+  active: ActivePlugin[],
+  projectTree: ProjectTree | null,
+): AvailableExtension[] {
   const all: AvailableExtension[] = [];
   if (opts.agent === "claude-code") {
     // harnessHome (CLAUDE_CONFIG_DIR) replaces ~/.claude; the big config blob
@@ -561,7 +669,7 @@ function discoverMcpAndPluginExtensions(opts: DiscoveryOpts, root: string | null
       for (const key of new Set([root, opts.workdir].filter(Boolean) as string[])) {
         all.push(...mcpServersToExtensions(projects?.[key]?.mcpServers, "project"));
       }
-      all.push(...mcpServersToExtensions(safeReadJson(path.join(root, ".mcp.json"))?.mcpServers, "project"));
+      all.push(...mcpServersToExtensions(safeParseJson(projectTree?.read(".mcp.json") ?? null)?.mcpServers, "project"));
     }
 
     // Plugins (claude-code only): the `@plugin` rows plus the MCP servers each
@@ -573,7 +681,7 @@ function discoverMcpAndPluginExtensions(opts: DiscoveryOpts, root: string | null
     const userCodexHome = codexHome(opts);
     all.push(...codexTomlMcpServers(path.join(userCodexHome, "config.toml"), "user"));
     if (root) {
-      all.push(...codexTomlMcpServers(path.join(root, ".codex", "config.toml"), "project"));
+      all.push(...codexTomlMcpServersFromText(projectTree?.read(".codex/config.toml") ?? null, "project"));
     }
   } else if (opts.agent === "cursor") {
     // No MCP-config parsing for cursor in v1 (plan §8 assumption) — no
@@ -626,12 +734,15 @@ export async function listAgentCapabilities(opts: DiscoveryOpts): Promise<{
   commands: AvailableCommand[];
   extensions: AvailableExtension[];
 }> {
-  // Resolve repo root + active plugins once, then thread both into the command
-  // and extension passes so neither re-reads settings/installed_plugins. repoRoot
-  // is memoized, so `listAvailableCommands` re-deriving root internally is a hit.
+  // Resolve repo root + project tree + active plugins once, then thread all
+  // three into the command and extension passes so neither re-reads
+  // settings/installed_plugins or re-resolves the ref/disk tree. repoRoot is
+  // memoized, so `listAvailableCommands` re-deriving root internally (when
+  // called directly, without this ctx) is a hit.
   const root = opts.workdir ? (await repoRoot(opts.workdir)) ?? opts.workdir : null;
-  const active = resolveActivePlugins(opts, root);
-  const commands = await listAvailableCommands(opts, active);
+  const projectTree = await resolveProjectTree(opts.branch, root);
+  const active = resolveActivePlugins(opts, root, projectTree);
+  const commands = await listAvailableCommands(opts, { activePlugins: active, projectTree });
   const skillExts: AvailableExtension[] = commands
     .filter((c) => c.kind === "skill")
     .map((c) => ({
@@ -643,7 +754,7 @@ export async function listAgentCapabilities(opts: DiscoveryOpts): Promise<{
     }));
   const extensions = dedupeAndSortExtensions([
     ...skillExts,
-    ...discoverMcpAndPluginExtensions(opts, root, active),
+    ...discoverMcpAndPluginExtensions(opts, root, active, projectTree),
   ]);
   return { commands, extensions };
 }
