@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { preferences } from "./db.ts";
+import { dataDir, preferences } from "./db.ts";
+import { disclaimArgv } from "./disclaim.ts";
 
 export const TMUX_SOURCE_KEY = "tmux_source";
 export type TmuxSource = "system" | "bundled";
@@ -71,8 +72,24 @@ export function bundledTmuxAvailable(): boolean {
 }
 
 /**
+ * Derive a stable per-instance tmux socket name from the data dir — pure so
+ * it's unit-testable without touching env/preferences. `~/.agetor` ->
+ * `"agetor"`, `~/.agetor-dev` -> `"agetor-dev"`: strip leading dot(s) off
+ * the basename, replace any char outside `[A-Za-z0-9_-]` with `-`, and fall
+ * back to `"agetor"` if that leaves nothing.
+ */
+export function deriveTmuxSocketName(dataDirPath: string): string {
+  const base = path.basename(dataDirPath).replace(/^\.+/, "");
+  // Strip a leading dash after sanitizing too: a socket name beginning with
+  // `-` would be parsed by tmux as an option (`tmux -L -weird …` fails), which
+  // a data dir like `/x/-weird` or `/x/.-y` (→ `-y`) would otherwise produce.
+  const sanitized = base.replace(/[^A-Za-z0-9_-]/g, "-").replace(/^-+/, "");
+  return sanitized || "agetor";
+}
+
+/**
  * Which tmux server socket to talk to, or `null` for tmux's own default
- * socket (`/tmp/tmux-<uid>/default`) — i.e. today's byte-identical behavior.
+ * socket (`/tmp/tmux-<uid>/default`).
  *
  * This exists because of a real incident: `bun test` (including a zombie
  * agent dogfooding agetor on itself) ran on the user's shared default tmux
@@ -82,6 +99,19 @@ export function bundledTmuxAvailable(): boolean {
  * session on it down with it. Socket isolation makes the whole test suite
  * structurally unable to reach the production socket, regardless of which
  * test forgets to scope itself.
+ *
+ * The production branch (below) ALSO gets its own dedicated socket, derived
+ * from the data dir, rather than tmux's shared default socket — two reasons:
+ * (1) it means agetor always *owns* (and, per `ensureDisclaimedServer()`
+ * below, starts) its own tmux server rather than sometimes attaching to a
+ * server some other process on the machine already started undisclaimed,
+ * which is what makes the disclaim-at-server-start trick reliably cover
+ * every session agetor hosts; (2) it isolates agetor's sessions from the
+ * user's own terminal tmux usage on the same machine. One-time upgrade
+ * cost: sessions still running on the OLD shared default socket at upgrade
+ * time become unreachable from the new socket — handled non-destructively
+ * by the existing `orphaned` -> `ready` boot reconciliation path (they're
+ * just dead sessions from the new socket's point of view, same as a crash).
  *
  * Precedence, read at CALL time (no module-level caching) so tests can
  * flip `AGETOR_TMUX_SOCKET`/`NODE_ENV` between cases without a restart:
@@ -93,13 +123,14 @@ export function bundledTmuxAvailable(): boolean {
  *      safety net. Catches every test file, including ones that never
  *      import this module directly, as long as they route through the
  *      `tmux()` runner in claude-tmux.ts.
- *   3. Otherwise `null` — production default socket, unchanged.
+ *   3. Otherwise, a per-instance socket derived from `dataDir` (e.g.
+ *      `"agetor"` for the packaged app, `"agetor-dev"` under `bun run dev`).
  */
 export function tmuxSocketName(): string | null {
   const override = process.env.AGETOR_TMUX_SOCKET;
   if (override) return override === "default" ? null : override;
   if (process.env.NODE_ENV === "test") return "agetor-test";
-  return null;
+  return deriveTmuxSocketName(dataDir);
 }
 
 /** `["-L", <socket>]` for `tmuxSocketName()`, or `[]` to use tmux's default
@@ -108,6 +139,44 @@ export function tmuxSocketName(): string | null {
 export function tmuxSocketArgs(): string[] {
   const name = tmuxSocketName();
   return name ? ["-L", name] : [];
+}
+
+/**
+ * Build the argv for a disclaimed `tmux start-server` on agetor's own
+ * socket — pure so it's unit-testable without spawning anything. `tmuxBin`
+ * is the caller-resolved tmux binary (`resolveTmuxBin()`); wrapping happens
+ * via `disclaimArgv`, which itself returns the argv unchanged when disclaim
+ * is disabled/unavailable/non-darwin.
+ */
+export function buildEnsureServerArgv(tmuxBin: string): string[] {
+  return disclaimArgv([tmuxBin, ...tmuxSocketArgs(), "start-server"]);
+}
+
+/**
+ * Best-effort: start agetor's dedicated tmux server through the disclaim
+ * helper, so the server daemon — and every session it goes on to host —
+ * inherits self-responsibility instead of Agetor's. `start-server` is
+ * idempotent (a no-op against an already-live server), so this is safe to
+ * call defensively before every new session, not just once at boot.
+ *
+ * Must run before ANY other tmux command touches this socket: a plain
+ * `has-session`/`new-session` issued first would auto-start the server
+ * un-disclaimed, and there's no way to re-disclaim a server after the fact
+ * (`start-server` on an already-running server is a no-op, not a restart).
+ * Never throws — a disclaim/tmux hiccup here must not block a run; worst
+ * case is the pre-fix TCC-spam behavior, not a broken spawn.
+ */
+export async function ensureDisclaimedServer(): Promise<void> {
+  try {
+    const argv = buildEnsureServerArgv(resolveTmuxBin());
+    // Ignore stdio rather than pipe: `start-server` emits nothing and this is
+    // best-effort, so there's no output to capture and a drain-free pipe is
+    // pointless. `disclaim`'s exec-replace preserves these fd choices.
+    const proc = Bun.spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    await proc.exited;
+  } catch {
+    // Best-effort — swallow. See doc comment above.
+  }
 }
 
 /**
@@ -132,6 +201,7 @@ export async function spawnTmuxNewSession(
   tmux: string,
   args: string[],
 ): Promise<{ status: number | null; stderr: string }> {
+  await ensureDisclaimedServer();
   try {
     const proc = Bun.spawn([tmux, ...args], {
       stdin: "ignore",

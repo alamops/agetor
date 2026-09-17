@@ -20,6 +20,15 @@ import { fetchCursorQuota } from "./cursor-usage.ts";
  */
 
 /**
+ * A provider's optional second argument. `allowIdeRead` is Cursor-specific
+ * today (gates the cross-app read of the Cursor IDE's `state.vscdb` — see
+ * `cursor-usage.ts` and `refreshOne` below) but lives on the shared type
+ * since every provider has the same `(h, opts?)` shape; providers that don't
+ * care simply ignore it.
+ */
+export type UsageProviderOpts = { allowIdeRead?: boolean };
+
+/**
  * Registry mapping `AgentKind` → provider fetcher. Deliberately a `Partial`
  * — gemini and grok have no usage provider yet (plan §1 "Non-goals": no
  * live gemini/grok data), so harnesses of those kinds are skipped by both
@@ -29,8 +38,10 @@ import { fetchCursorQuota } from "./cursor-usage.ts";
  * the key type below is derived from that list so the webview's
  * supported-kind messaging can't drift from this registry.
  */
-export const USAGE_PROVIDERS: Partial<Record<AgentKind, (h: Harness) => Promise<HarnessQuota>>> &
-  Record<(typeof USAGE_SUPPORTED_KINDS)[number], (h: Harness) => Promise<HarnessQuota>> = {
+export type UsageProvider = (h: Harness, opts?: UsageProviderOpts) => Promise<HarnessQuota>;
+
+export const USAGE_PROVIDERS: Partial<Record<AgentKind, UsageProvider>> &
+  Record<(typeof USAGE_SUPPORTED_KINDS)[number], UsageProvider> = {
   "claude-code": fetchClaudeQuota,
   codex: fetchCodexQuota,
   cursor: fetchCursorQuota,
@@ -45,16 +56,16 @@ export const USAGE_PROVIDERS: Partial<Record<AgentKind, (h: Harness) => Promise<
 // touching `USAGE_PROVIDERS` itself. With an empty override map (the default
 // in production), `resolveProvider` is byte-for-byte equivalent to reading
 // `USAGE_PROVIDERS[kind]` directly.
-const providerOverrides = new Map<AgentKind, (h: Harness) => Promise<HarnessQuota>>();
+const providerOverrides = new Map<AgentKind, UsageProvider>();
 
-function resolveProvider(kind: AgentKind): ((h: Harness) => Promise<HarnessQuota>) | undefined {
+function resolveProvider(kind: AgentKind): UsageProvider | undefined {
   return providerOverrides.get(kind) ?? USAGE_PROVIDERS[kind];
 }
 
 /** Test-only: override the provider for a kind (pass null to clear). Never use in production. */
 export function __setUsageProviderForTest(
   kind: AgentKind,
-  fn: ((h: Harness) => Promise<HarnessQuota>) | null,
+  fn: UsageProvider | null,
 ): void {
   if (fn) providerOverrides.set(kind, fn);
   else providerOverrides.delete(kind);
@@ -96,9 +107,23 @@ export async function refreshOne(
     }
   }
 
+  // Cross-app-read gate (currently Cursor-only — see cursor-usage.ts): allow
+  // it on an explicit user refresh, or when a prior *successful* (`ok`)
+  // snapshot exists for this harness — that's the only proof the cross-app
+  // read actually happened once (so the macOS TCC grant was given and now
+  // persists). A merely-existing snapshot is NOT enough: `refreshOne` upserts
+  // every result, INCLUDING the `unavailable` one the skip path itself writes
+  // (and the browser-cookie fallback is stubbed, so `ok` is only reachable via
+  // a real IDE read). Gating on `!= null` would let the very snapshot produced
+  // by skipping re-open the read on the next sweep, re-tripping the prompt for
+  // an un-consented user. A first-ever background sweep has no `ok` snapshot,
+  // so it stays false and the provider skips the cross-app read.
+  const allowIdeRead =
+    Boolean(opts?.force) || harnessUsage.get(harness.id)?.status === "ok";
+
   let quota: HarnessQuota;
   try {
-    quota = await provider(harness);
+    quota = await provider(harness, { allowIdeRead });
   } catch (err) {
     // Belt-and-braces: providers are documented to always resolve, never
     // throw. If one regresses, synthesize an error snapshot rather than

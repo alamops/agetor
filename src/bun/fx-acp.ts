@@ -12,6 +12,7 @@ import {
 } from "../shared/types.ts";
 import { fxRecoverySummaryLine, isFxRecoveryResumable, parseFxRecoveryMeta } from "../shared/fx-recovery.ts";
 import { isImagePath } from "../shared/attachments.ts";
+import { disclaimArgv } from "./disclaim.ts";
 import { SENT_FILES_TOOL_NAME } from "../shared/sent-files.ts";
 import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
 import {
@@ -2855,10 +2856,17 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
   // `opts.model` isn't threaded through from `agents.ts` until wave 2 (see
   // `FxLaunchOptions.model`'s doc) — fall back to the argv's own `--model`
   // value so `applyFxEffort`'s breadcrumb names a real model in the
-  // meantime, and forever after for any caller that omits it.
+  // meantime, and forever after for any caller that omits it. Note this
+  // reads `opts.argv`, the ORIGINAL fx argv — the disclaim wrap below only
+  // changes what is handed to `Bun.spawn`, so model recovery is unaffected.
   const model = opts.model ?? argvValueAfter(opts.argv, "--model");
 
-  const proc = Bun.spawn([bin, ...rest], {
+  // fx has no tmux server to disclaim (see the file header — plain
+  // Bun.spawn over piped stdio), so the child itself is wrapped directly.
+  // `disclaimArgv` exec-replaces via POSIX_SPAWN_SETEXEC, preserving Bun's
+  // own pid and the piped stdio fds into fx; it returns the argv unchanged
+  // when disclaim is disabled/unavailable/non-darwin.
+  const proc = Bun.spawn(disclaimArgv([bin, ...rest]), {
     cwd: opts.cwd,
     env,
     stdin: "pipe",

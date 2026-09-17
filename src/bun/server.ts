@@ -26,6 +26,7 @@ import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { stalledSince } from "./stall-registry.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -244,7 +245,10 @@ function blobContentType(relPath: string, kind: "image" | "pdf"): string {
 // query instead of calling this per row.
 function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   const runningSubagents = subagents.listForTask(t.id).filter((s) => s.status === "running").length;
-  return { ...t, runningSubagents };
+  // `stalledSince` rides the same decoration: transient in-memory server
+  // state (the turn-stall watchdog's mark) that the DB-derived Task can't
+  // carry — see stall-registry.ts.
+  return { ...t, runningSubagents, stalledSince: stalledSince(t.id) };
 }
 
 // Turn raw path strings into references: keep only existing absolute paths,
@@ -3433,7 +3437,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         GET: authed((req) => {
           const counts = subagents.runningCountsByTask();
           return json(
-            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0 })),
+            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0, stalledSince: stalledSince(t.id) })),
             { headers: corsHeaders(req) },
           );
         }),

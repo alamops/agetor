@@ -219,6 +219,10 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
   const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
   const [tmuxSource, setTmuxSource] = useState<"system" | "bundled">("system");
   const [bundledTmuxAvailable, setBundledTmuxAvailable] = useState(false);
+  // Default-on kill switch for spawning agents through the macOS "disclaim"
+  // helper — see src/bun/disclaim.ts. Only the literal stored value "false"
+  // turns it off; unset/anything-else reads as on, matching disclaimEnabled().
+  const [disclaimSpawnedAgents, setDisclaimSpawnedAgents] = useState(true);
   const [view, setView] = useState<SettingsView>(initialView());
   // Mirrors `view` for use inside async callbacks (e.g. the Editor's
   // onSubmit) so they can tell, after an await, whether the user navigated
@@ -265,6 +269,8 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
     }
     setTmuxSource(tmux.source);
     setBundledTmuxAvailable(tmux.bundledAvailable);
+    // keep in sync with DISCLAIM_PREF_KEY in src/bun/disclaim.ts
+    setDisclaimSpawnedAgents(prefs["disclaimSpawnedAgents"] !== "false");
   };
 
   const onPickTmuxSource = async (source: "system" | "bundled") => {
@@ -291,6 +297,17 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
     const map = new Map(payload.statuses.map((s) => [s.harnessId, s]));
     return map;
   }, [payload.statuses]);
+
+  const onDisclaimSpawnedAgentsChange = (enabled: boolean) => {
+    setDisclaimSpawnedAgents(enabled);
+    // keep in sync with DISCLAIM_PREF_KEY in src/bun/disclaim.ts
+    void api.setPreference("disclaimSpawnedAgents", String(enabled)).catch(() => {
+      // Revert only if this failed write is still the latest selection —
+      // mirrors App.tsx's onStickyUserMessagesChange guard so a subsequent
+      // click can't be stomped by an older, now-resolving request.
+      setDisclaimSpawnedAgents((current) => current === enabled ? !enabled : current);
+    });
+  };
 
   const onPickDefault = async (id: string) => {
     setDefaultHarness(id);
@@ -480,6 +497,8 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       tmuxSource={tmuxSource}
                       bundledTmuxAvailable={bundledTmuxAvailable}
                       onPickTmuxSource={onPickTmuxSource}
+                      disclaimSpawnedAgents={disclaimSpawnedAgents}
+                      onDisclaimSpawnedAgentsChange={onDisclaimSpawnedAgentsChange}
                       onClose={onClose}
                     />
                   );
@@ -622,6 +641,8 @@ function GeneralSection({
   tmuxSource,
   bundledTmuxAvailable,
   onPickTmuxSource,
+  disclaimSpawnedAgents,
+  onDisclaimSpawnedAgentsChange,
   onClose,
 }: {
   payload: HarnessesPayload;
@@ -634,6 +655,8 @@ function GeneralSection({
   tmuxSource: "system" | "bundled";
   bundledTmuxAvailable: boolean;
   onPickTmuxSource: (source: "system" | "bundled") => void;
+  disclaimSpawnedAgents: boolean;
+  onDisclaimSpawnedAgentsChange: (enabled: boolean) => void;
   /** Closes the Settings dialog — used by "Show getting started guide" so the
    *  onboarding checklist underneath is visible after replaying it. */
   onClose: () => void;
@@ -784,6 +807,26 @@ function GeneralSection({
         </div>
         <p className="text-[11px] text-muted-foreground">
           Keep your latest sent message visible while its response scrolls. Turn this off for a standard chat list.
+        </p>
+      </section>
+
+      <section className="space-y-1">
+        <div className="flex items-center justify-between gap-4">
+          <label htmlFor="disclaim-spawned-agents" className="text-xs text-muted-foreground">
+            Isolate agent permissions from Agetor (macOS)
+          </label>
+          <Switch
+            id="disclaim-spawned-agents"
+            checked={disclaimSpawnedAgents}
+            // keep in sync with DISCLAIM_PREF_KEY in src/bun/disclaim.ts
+            onCheckedChange={onDisclaimSpawnedAgentsChange}
+            aria-label="Isolate agent permissions from Agetor (macOS)"
+          />
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Spawned agents ask for macOS permissions under their own name instead of Agetor's, so the "access data
+          from other apps" prompt stops naming Agetor and sticks after you Allow it once. Turn off to revert to the
+          previous behavior.
         </p>
       </section>
 

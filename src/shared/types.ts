@@ -18,6 +18,27 @@ export const TMUX_MISSING_REASON = "tmux is required to drive claude-code intera
 export const SESSION_DIED_STATUS_PREFIX = "session ended: ";
 
 /**
+ * Sentinel prefix for the `status` chunk the turn-stall watchdog emits when
+ * a turn is in flight but the JSONL transcript has been silent past
+ * `AGETOR_TURN_STALL_MS` (default 10 min) with no subagent activity either —
+ * the signature of an interactive TUI dialog the pane scraper's matchers
+ * don't know (an unrecognized modal can freeze a turn indefinitely while
+ * the card still shows a healthy "running"). Unlike the death/API-error
+ * sentinels this does NOT settle the turn or move the card — the session is
+ * alive, just possibly wedged — it only marks the task "may be stuck"
+ * (orchestrator's stall registry → `Task.stalledSince` → amber card state)
+ * until activity resumes or the turn ends. */
+export const TURN_STALLED_STATUS_PREFIX = "turn stalled: ";
+
+/**
+ * Companion sentinel to {@link TURN_STALLED_STATUS_PREFIX}: emitted when
+ * transcript activity resumes while the same turn is still in flight, so the
+ * orchestrator clears the stall mark without waiting for the turn to end.
+ * (A turn that ends while marked is cleared by the done handler instead —
+ * no resume event is emitted after the fact.) */
+export const TURN_STALL_RESUMED_STATUS_PREFIX = "turn resumed: ";
+
+/**
  * Sentinel prefix for the `status` chunk claude-tmux emits whenever the
  * JSONL reports a permission-mode change (plan/auto/acceptEdits/…). Emitted
  * only on change (not per-line), so the run panel's mode chip can derive its
@@ -1148,6 +1169,19 @@ export interface Task {
    *  request by the server (never persisted, never patchable). Absent on payloads
    *  that don't join the subagents table. */
   runningSubagents?: number;
+  /**
+   * Transient (in-memory on the server, decorated onto API responses — never
+   * persisted): `Date.now()` when the turn-stall watchdog flagged this
+   * task's in-flight turn as possibly stuck (see
+   * {@link TURN_STALLED_STATUS_PREFIX}). Cleared only when the driver itself
+   * emits the companion "resumed" sentinel (transcript activity picked back
+   * up) — a settled or cancelled turn is not explicitly cleared here; the
+   * mark is transient in-memory state that a server restart also resets by
+   * design, and the watchdog re-fires within one threshold window if the
+   * session is still wedged after a reattach. Null/absent means not
+   * stalled.
+   */
+  stalledSince?: number | null;
 }
 
 /** Why a worktree is flagged `stale` in {@link WorktreeInfo}. A worktree can
