@@ -1029,6 +1029,43 @@ const startingTaskIds = new Set<string>();
 const pendingCancelRunIds = new Set<string>();
 
 /**
+ * Consume a Stop recorded in `pendingCancelRunIds` right before a run would
+ * register — the one hook every spawn path that inserts a run row BEFORE an
+ * `await` must call (`startTaskInner`/`spawnResumedSessionInner` do it
+ * inline, `spawnCodexTurnNow`/`spawnCursorTurnNow`/`spawnGeminiTurnNow`/
+ * `spawnFxRun` and the claude idle mint in `sendTurnInExistingSession` call
+ * this). Returns `false` — nothing consumed — in the common case. When a
+ * Stop was recorded: kills the just-spawned agent (`dropClaudeSession`
+ * additionally tears down a claude tmux session that was created for this
+ * run only — NOT for a turn pasted into a pre-existing live session, where
+ * Stop means "interrupt", same as `stopActiveHandle`), records the run
+ * `cancelled`, and — when the run is still the task's current one — returns
+ * the task to `ready` with a status line. The caller must then skip
+ * `registerActiveRun`/`attachDoneHandler` and settle its own follow-up queue
+ * exactly as it does for a failed spawn.
+ */
+async function consumePendingCancel(
+  runId: string,
+  taskId: string,
+  agent: SpawnedAgent,
+  onChunk: (stream: "status", data: string) => void,
+  opts: { dropClaudeSession: boolean },
+): Promise<boolean> {
+  if (!pendingCancelRunIds.delete(runId)) return false;
+  // Nothing will ever attach a handler to this agent's `done` — swallow the
+  // rejection a kill/drop may produce so it can't become an unhandledRejection.
+  agent.done.catch(() => {});
+  agent.kill();
+  if (opts.dropClaudeSession) await dropSession(taskId);
+  runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+  if (tasks.get(taskId)?.runId === runId) {
+    onChunk("status", "cancelled by user before the agent launched");
+    updateColumn(taskId, runId, "ready");
+  }
+  return true;
+}
+
+/**
  * Start (or restart) a task's agent. Bounded per `SPAWN_RESPONSE_BUDGET_MS`
  * (see that constant's doc): once the run row exists, the task has flipped
  * to `running`, and the initial prompt has been echoed as a `user` event,
@@ -3123,6 +3160,13 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
       codexTurnQueue.delete(taskId);
       return newRunId;
     }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the run is settled `cancelled` and, as in the `!agent` branch above,
+      // attachDoneHandler never runs, so drop the queue the same way.
+      codexTurnQueue.delete(taskId);
+      return newRunId;
+    }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
@@ -3295,6 +3339,13 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       cursorTurnQueue.delete(taskId);
       return newRunId;
     }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the run is settled `cancelled` and, as in the `!agent` branch above,
+      // attachDoneHandler never runs, so drop the queue the same way.
+      cursorTurnQueue.delete(taskId);
+      return newRunId;
+    }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
@@ -3464,6 +3515,13 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
       // drainGeminiQueue) never runs, so drop the queue rather than let queued
       // follow-ups resurface out of order on a later turn. Reachable in
       // practice via GEMINI_PROMPT_ARGV_MAX_BYTES on a long follow-up.
+      geminiTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the run is settled `cancelled` and, as in the `!agent` branch above,
+      // attachDoneHandler never runs, so drop the queue the same way.
       geminiTurnQueue.delete(taskId);
       return newRunId;
     }
@@ -3821,6 +3879,13 @@ async function spawnFxRun(
         spawned: false,
         error: message || "fx could not be started — see the run's status line",
       };
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // settled `cancelled`; attachDoneHandler never runs, so drop the queue
+      // exactly like the `!agent` branch above.
+      fxTurnQueue.delete(taskId);
+      return { runId: newRunId, spawned: false, error: "cancelled by user before the agent launched" };
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
@@ -4601,6 +4666,13 @@ async function sendTurnInExistingSession(
     const agent = await sendTurn(taskId, line, onChunk, {
       onPasteFailure: (outcome) => handlePasteWithheld(taskId, newRunId, rawLine ?? line, outcome),
     });
+    // Stop landed while the paste was in flight (see `pendingCancelRunIds`):
+    // interrupt the turn (Ctrl+C, the session stays alive — same as a normal
+    // Stop) and settle the run `cancelled` instead of registering it. The
+    // message was already pasted, so `delivered` stays truthful.
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      return { runId: newRunId, delivered: true };
+    }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return resolveClaudeTurnOutcome(newRunId, agent.pasteOutcome);
