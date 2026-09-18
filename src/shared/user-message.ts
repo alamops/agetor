@@ -927,6 +927,14 @@ export const AGETOR_PASTE_LEAD_INS: readonly string[] = [AGETOR_PASTE_LEAD_IN];
  *     `LEADIN\nbody`) collapses to exactly the typed-after-lead-in text,
  *     since there's nothing left for `unwrapPastedContent` to do.
  *
+ * The two steps run to a FIXPOINT (bounded), not once: a user whose own
+ * message starts with the lead-in phrase (dogfooding sessions quote it) has
+ * an echo of `LEADIN\nbody` and a twin of `LEADIN` + wrapper around
+ * `LEADIN\nbody` — a single pass reduces those to different strings, so the
+ * two copies stop deduping and the twin shows the lead-in. Iterating also
+ * makes the function idempotent, which callers rely on: `UserMessageBlock`
+ * normalizes once itself and `parseUserMessage` normalizes again inside.
+ *
  * Returns the SAME string reference as `text` when neither step applies —
  * required so `canonicalizeUserText`'s "identity for ordinary messages"
  * contract (which this function now sits in front of) still holds.
@@ -938,16 +946,31 @@ export const AGETOR_PASTE_LEAD_INS: readonly string[] = [AGETOR_PASTE_LEAD_IN];
  * preserved verbatim in the returned text, same as they always have been.
  */
 export function normalizeDeliveredUserText(text: string): string {
-  let stripped = text;
+  let current = text;
+  for (let pass = 0; pass < NORMALIZE_DELIVERED_MAX_PASSES; pass++) {
+    const next = unwrapPastedContent(stripPasteLeadIn(current));
+    if (next === current) break;
+    current = next;
+  }
+  return current;
+}
+
+/** Bound on `normalizeDeliveredUserText`'s fixpoint loop — each pass peels one
+ *  lead-in and/or one nesting level of `<pasted_content>`; real traffic needs
+ *  one, a message that itself quotes a delivered twin needs two. */
+const NORMALIZE_DELIVERED_MAX_PASSES = 4;
+
+/** Step 1 of `normalizeDeliveredUserText`: drop a known lead-in line (and the
+ *  one line break after it — `\n`, `\r`, or `\r\n`) from the very start of
+ *  `text`; same reference when there is none. */
+function stripPasteLeadIn(text: string): string {
   for (const leadIn of AGETOR_PASTE_LEAD_INS) {
     if (!text.startsWith(leadIn)) continue;
-    const next = text[leadIn.length];
-    if (next === "\n" || next === "\r") {
-      stripped = text.slice(leadIn.length + 1);
-      break;
-    }
+    const at = leadIn.length;
+    if (text.startsWith("\r\n", at)) return text.slice(at + 2);
+    if (text[at] === "\n" || text[at] === "\r") return text.slice(at + 1);
   }
-  return unwrapPastedContent(stripped);
+  return text;
 }
 
 /**
@@ -1118,6 +1141,9 @@ function segmentPlainLines(segments: readonly MessageSegment[]): PlainLine[] {
  */
 export function userMessageLines(text: string): PlainLine[] {
   const parsed = parseUserMessage(text);
+  // No CR normalization here — an ordinary message prints byte-identical to
+  // what was stored; `stripPasteLeadIn` consumes a `\r\n` after the lead-in
+  // itself, which is the only place a CR could leave a stray blank line.
   if (parsed === null) return [{ label: "you›", text: normalizeDeliveredUserText(text), tone: "user" }];
   if (parsed.kind === "command") {
     const { command } = parsed;

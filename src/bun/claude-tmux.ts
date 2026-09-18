@@ -8936,6 +8936,14 @@ export const __forTest = {
     return prev;
   },
   getBracketedEnterGapMs(): number { return bracketedEnterGapMs; },
+  /** Pin the bracketed-paste lead-in on/off (`null` = defer to the
+   *  `AGETOR_CLAUDE_PASTE_LEAD_IN` env kill switch). Returns the previous
+   *  value so a test file can restore it in `afterAll`. */
+  setPasteLeadInEnabled(enabled: boolean | null): boolean | null {
+    const prev = pasteLeadInOverride;
+    pasteLeadInOverride = enabled;
+    return prev;
+  },
   /** Override the image-attach settle window — the per-image delay used
    *  when the paste contains image file paths. Tests shrink it to ~0 to
    *  avoid sleeping per image-path assertion. Returns the previous value
@@ -9357,6 +9365,11 @@ let bracketedEnterGapMs = 80;
  *  scheduler load). Never read by production code. */
 let lastBracketedGapMs: number | null = null;
 
+/** Test seam (`__forTest.setPasteLeadInEnabled`): `null` defers to the env
+ *  kill switch below; a boolean pins the lead-in on/off for a test file
+ *  without mutating process-global env that another file would inherit. */
+let pasteLeadInOverride: boolean | null = null;
+
 /**
  * Kill switch for the paste lead-in (docs/plans/pasted-content-tags.md D1) —
  * `0` / `false` / `off` / `no` (case-insensitive) disables it, restoring the
@@ -9366,6 +9379,7 @@ let lastBracketedGapMs: number | null = null;
  * cases without re-importing the module.
  */
 function pasteLeadInDisabled(): boolean {
+  if (pasteLeadInOverride !== null) return !pasteLeadInOverride;
   const raw = process.env.AGETOR_CLAUDE_PASTE_LEAD_IN;
   if (raw === undefined) return false;
   return ["0", "false", "off", "no"].includes(raw.trim().toLowerCase());
@@ -9380,7 +9394,13 @@ function pasteLeadInDisabled(): boolean {
  *  - the `AGETOR_CLAUDE_PASTE_LEAD_IN` kill switch is set (see
  *    `pasteLeadInDisabled` above);
  *  - `text`'s first non-whitespace character is `/` or `!` — a slash-command
- *    invocation or a `!` shell escape. Spike-verified (docs/plans/
+ *    invocation or a `!` shell escape. Deliberately MORE permissive than
+ *    `slashTokenOf` (which does not trim): with leading whitespace claude may
+ *    or may not still treat the send as a command, and losing the lead-in on
+ *    a send claude then wraps is the cheaper mistake — the tags stay hidden
+ *    client-side either way, whereas a lead-in above a real command breaks
+ *    it outright. The dock composer trims, so only `agetor send` / backlog
+ *    text can reach here with leading whitespace at all. Spike-verified (docs/plans/
  *    pasted-content-tags.md §2): claude-code recognizes either shape from
  *    the pasted buffer itself and never wraps it in `<pasted_content>`
  *    regardless of length, so there is no trust downgrade to counter here —
@@ -9945,6 +9965,32 @@ function queuePaste(
           if (expectedState) expectedState.composerHoldsText = true;
           report(outcome);
           return;
+        }
+        // Two awaited tmux round-trips have gone by since the guards above
+        // last looked at the pane — the same kind of window the
+        // composer-clear delay opens — so re-gate before the paste itself: a
+        // `dropSession` + respawn reuses this `sessionName` (the paste would
+        // land in the NEW pane), and a modal raised meanwhile would otherwise
+        // go unseen until the pre-Enter re-check, after the text had landed.
+        if (!stillCurrent()) return;
+        if (expectedState && !opts.skipModalGuard) {
+          const blocked = await stillBlocking(expectedState);
+          if (!stillCurrent()) return;
+          if (blocked) {
+            // The message itself was never pasted (`pre-paste`, so the
+            // orchestrator re-stashes it), but the typed lead-in may be
+            // sitting in the composer — flag it so the next send clears it.
+            expectedState.composerHoldsText = true;
+            const outcome: Extract<PasteOutcome, { ok: false }> =
+              { ok: false, op: "modal-guard", phase: "pre-paste", stderr: "claude modal on pane" };
+            const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
+            const message =
+              "paste withheld: claude is waiting on a prompt — answer it in the card or the terminal and resend";
+            onChunk?.("status", message);
+            console.error(`[claude-tmux] ${message} (task ${taskId})`);
+            report(outcome);
+            return;
+          }
         }
       }
       if (expectedState) bumpKeystroke(expectedState);

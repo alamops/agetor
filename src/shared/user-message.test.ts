@@ -1372,3 +1372,39 @@ describe("userMessageLines — pasted-content wiring", () => {
     ]);
   });
 });
+
+describe("normalizeDeliveredUserText — fixpoint (review follow-up)", () => {
+  const wrap = (id: string, body: string) => `\n\n<pasted_content id="${id}">\n${body}\n</pasted_content id="${id}">\n`;
+
+  test("a user message that itself starts with the lead-in reduces identically as echo and as twin", () => {
+    const echo = `${AGETOR_PASTE_LEAD_IN}\nplease review this`;
+    const twin = `${AGETOR_PASTE_LEAD_IN}\n${wrap("1b6a", echo)}`;
+    expect(normalizeDeliveredUserText(echo)).toBe("please review this");
+    expect(normalizeDeliveredUserText(twin)).toBe("please review this");
+    expect(canonicalizeUserText(twin)).toBe(canonicalizeUserText(echo));
+  });
+
+  test("same for the unwrapped twin shape (claude's flag off / short message)", () => {
+    const echo = `${AGETOR_PASTE_LEAD_IN}\nok`;
+    const twin = `${AGETOR_PASTE_LEAD_IN}\n${echo}`;
+    expect(normalizeDeliveredUserText(twin)).toBe(normalizeDeliveredUserText(echo));
+  });
+
+  test("is idempotent, including for a body that quotes a whole delivered twin", () => {
+    const inner = `${AGETOR_PASTE_LEAD_IN}\n${wrap("0a7d", "inner body")}`;
+    const outer = `${AGETOR_PASTE_LEAD_IN}\n${wrap("1b6a", inner.trim())}`;
+    const once = normalizeDeliveredUserText(outer);
+    expect(once).not.toContain("pasted_content");
+    expect(normalizeDeliveredUserText(once)).toBe(once);
+  });
+
+  test("a CRLF after the lead-in is consumed as ONE line break", () => {
+    expect(normalizeDeliveredUserText(`${AGETOR_PASTE_LEAD_IN}\r\nshort msg`)).toBe("short msg");
+  });
+
+  test("userMessageLines leaves no stray blank line for a CRLF after the lead-in", () => {
+    expect(userMessageLines(`${AGETOR_PASTE_LEAD_IN}\r\nshort msg`)).toEqual([
+      { label: "you›", text: "short msg", tone: "user" },
+    ]);
+  });
+});

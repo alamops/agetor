@@ -54,7 +54,9 @@ const normalizeForKey = (s: string) => s.replace(/\r\n?/g, "\n");
  *
  * Consequence of the ts-less `user` key: two genuinely-identical user sends in
  * the SAME run (e.g. folding `"continue"` twice into one in-flight turn) share
- * a key and render as a single bubble. This is intentional — there is no
+ * a key and render as a single bubble — and, since the key is `trim()`med,
+ * so do two sends that differ only in boundary whitespace (`"ok"` then
+ * `"ok\n"`). This is intentional — there is no
  * disambiguator that survives the live-echo↔JSONL-twin collapse — and harmless:
  * both sends are still delivered to claude (the tmux paste is independent of UI
  * dedup). Distinct runs get distinct keys via `runId`, so repeated idle

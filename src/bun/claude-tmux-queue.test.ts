@@ -1034,6 +1034,11 @@ test("queuePaste(bracketed): trailing Enter is skipped when the session is dispo
   await withRecordingTmuxBin(async (logPath) => {
     const prevGap = __forTest.setBracketedEnterGapMs(GAP);
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    // Lead-in pinned off: this test times its teardown against the
+    // paste → Enter gap, and the lead-in's extra round-trips (plus the
+    // post-lead-in re-gate, which has its own test below) would move the
+    // teardown in front of the paste instead.
+    const prevLeadIn = __forTest.setPasteLeadInEnabled(false);
     const { taskId, jsonlPath } = freshSession();
     const state = __forTest.installSession(taskId, jsonlPath);
     try {
@@ -1070,13 +1075,7 @@ test("queuePaste(bracketed): trailing Enter is skipped when the session is dispo
       const firstNonCapture = cmds.findIndex((c) => c !== "capture-pane");
       expect(firstNonCapture).toBeGreaterThan(0);
       expect(cmds.slice(0, firstNonCapture).every((c) => c === "capture-pane")).toBe(true);
-      // Two leading `send-keys` are the lead-in (`-l <text>` then `C-j`) —
-      // NOT the trailing Enter, which is what the re-gate actually drops.
-      // The paste body itself (load-buffer/paste-buffer/delete-buffer)
-      // follows, then nothing else.
       expect(cmds.slice(firstNonCapture)).toEqual([
-        "send-keys",
-        "send-keys",
         "load-buffer",
         "paste-buffer",
         "delete-buffer",
@@ -1087,6 +1086,7 @@ test("queuePaste(bracketed): trailing Enter is skipped when the session is dispo
       expect(enterCalls.length).toBe(0);
     } finally {
       __forTest.uninstallSession(taskId);
+      __forTest.setPasteLeadInEnabled(prevLeadIn);
       __forTest.setBracketedEnterGapMs(prevGap);
       __forTest.setSlashCommandSettleMs(prevSettle);
     }
@@ -1370,6 +1370,45 @@ test("queuePaste(bracketed): the lead-in lands, but a later load-buffer/paste-bu
     if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
     else process.env.AGETOR_TMUX_BIN = prevBin;
   }
+});
+
+test("queuePaste(bracketed): a modal that appears while the lead-in is being typed withholds the paste (pre-paste) and flags the composer", async () => {
+  // The lead-in's two `send-keys` round-trips open a window after the
+  // pre-paste guards — the post-lead-in re-gate must catch a prompt raised
+  // inside it BEFORE the message body lands. Deterministic, not timed: the
+  // fake pane turns into a blocking modal the moment the recorded tmux log
+  // shows the lead-in's `C-j`.
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevGrace = __forTest.setPasteModalGraceMs(20);
+    const prevPoll = __forTest.setPasteModalPollMs(5);
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    const prevCapture = __forTest.setCapturePastePane(async () =>
+      readTmuxLog(logPath).some((e) => e.argv.includes("C-j")) ? BLOCKING_MODAL_PANE : "",
+    );
+    const outcomes: unknown[] = [];
+    try {
+      await __forTest.queuePaste(taskId, state.sessionName, "a message claude would wrap as pasted", 0, state, {
+        bracketed: true,
+        onPasteOutcome: (o) => outcomes.push(o),
+      });
+      expect(outcomes.length).toBe(1);
+      expect(outcomes[0]).toMatchObject({ ok: false, op: "modal-guard", phase: "pre-paste" });
+      const argv0 = readTmuxLog(logPath).map((e) => e.argv[0]);
+      expect(argv0.filter((c) => c === "send-keys").length).toBe(2); // lead-in text + C-j, no Enter
+      expect(argv0).not.toContain("load-buffer");
+      expect(argv0).not.toContain("paste-buffer");
+      // The typed lead-in may be sitting in the composer — the next send must clear it first.
+      expect(state.composerHoldsText).toBe(true);
+    } finally {
+      __forTest.setCapturePastePane(prevCapture);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+      __forTest.setPasteModalPollMs(prevPoll);
+      __forTest.setPasteModalGraceMs(prevGrace);
+      __forTest.uninstallSession(taskId);
+    }
+  });
 });
 
 test("queuePaste(non-bracketed): keeps the original synchronous load-buffer → paste-buffer → delete-buffer → send-keys Enter shape (no gap)", async () => {

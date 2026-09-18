@@ -1787,14 +1787,20 @@ function RunPanelBody({
   // event's `data` normalized the same way — same length and order, so the
   // positional ids `findMatchingEventIds`/`data-evid` rely on are unaffected;
   // every other stream is passed through untouched.
+  // Skipped while the query is blank: `findMatchingEventIds` early-returns
+  // then, and `displayedEvents` changes on every SSE frame — no point
+  // re-mapping thousands of events for a closed search bar.
+  const searchActive = searchQuery.trim() !== "";
   const searchableEvents = useMemo(
     () =>
-      displayedEvents.map((e) =>
-        e.stream === "user"
-          ? { ...e, data: normalizeDeliveredUserText(e.data.replace(/\r\n?/g, "\n")) }
-          : e,
-      ),
-    [displayedEvents],
+      !searchActive
+        ? displayedEvents
+        : displayedEvents.map((e) =>
+            e.stream === "user"
+              ? { ...e, data: normalizeDeliveredUserText((e.data ?? "").replace(/\r\n?/g, "\n")) }
+              : e,
+          ),
+    [displayedEvents, searchActive],
   );
 
   const matches = useMemo(
