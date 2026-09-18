@@ -1,9 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { History } from "lucide-react";
 import { api, type SentMessageItem } from "@/lib/api";
-import { isMachineEmittedMessage, parseUserMessage, splitReferences } from "../../../shared/user-message.ts";
-import { canonicalizeAttachmentText } from "../../../shared/attachments.ts";
-import { stripAgentInstructionsPreamble } from "../../../shared/agent-profile.ts";
+import { cleanMessageText } from "@/lib/message-history";
 import { cn } from "@/lib/utils";
 
 /** Server-side fetch clamp is 200 (see `api.fetchMessageHistory`); the list
@@ -27,53 +25,6 @@ interface CleanedItem {
   taskTitle: string;
   project: string;
   agent: string;
-}
-
-/** Reduce a raw sent-message payload to display text: normalize CR newlines,
- *  canonicalize the image-attachment twin shapes (shared with
- *  `eventDedupKey` in `lib/event-dedup.ts`) BEFORE parsing so an
- *  image-attached send's live copy and its JSONL twin — which otherwise
- *  diverge via a `[Image #N]` prefix and a blanked reference-bullet path —
- *  reduce to identical text and collapse under the caller's dedup-by-text
- *  loop, then unwrap a slash-command XML expansion back to its plain
- *  "/cmd args" echo (same shape `parseUserMessage`/`canonicalizeUserText`
- *  use elsewhere for the run stream, both from `src/shared/user-message.ts`),
- *  then strip a trailing "Referenced files" block via the shared splitter so
- *  its heading text never gets re-typed here. A `tagged` message whose
- *  segments are ALL machine-emitted (a `<local-command-stdout>` +
- *  `<forked-skill-launch>` pair after a background skill launch, a `!`
- *  shell-escape's `<bash-*>` lines) is not user-authored either and is
- *  dropped the same way; a message that mixes in (or is entirely)
- *  user-authored prose or tags — e.g. `<context>…</context>` pasted ahead of
- *  typed text — is kept VERBATIM, tags included, so re-inserting it from
- *  history reproduces the original prompt byte-for-byte rather than losing
- *  the tags the user relied on. */
-function cleanMessageText(raw: string): string {
-  // Strip a launched-from-profile preamble before anything else — resending
-  // this message must not re-inject it a second time (`startTask` adds its
-  // own fresh copy). Stripping first also means every branch below reparses
-  // exactly what the user actually typed ("Your task:\n{prompt}" minus the
-  // wrapper reduces to `prompt` itself), so this is the one place the strip
-  // needs to happen.
-  const text = stripAgentInstructionsPreamble(canonicalizeAttachmentText(raw.replace(/\r\n?/g, "\n")));
-  const parsed = parseUserMessage(text);
-  let display: string;
-  if (parsed?.kind === "command") {
-    display = parsed.command.args
-      ? `${parsed.command.name} ${parsed.command.args}`
-      : parsed.command.name;
-    return display.trim();
-  }
-  if (parsed?.kind === "command-output") {
-    // Local-command stdout is not a user-authored message — drop it (the
-    // caller's `if (!text) continue` filter relies on the empty string).
-    return "";
-  }
-  if (parsed?.kind === "tagged") {
-    return isMachineEmittedMessage(parsed.segments) ? "" : parsed.text.trim();
-  }
-  const { args } = splitReferences(text);
-  return args.trim();
 }
 
 function formatTime(ts: number): string {

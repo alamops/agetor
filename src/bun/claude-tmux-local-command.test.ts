@@ -1,4 +1,4 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, afterAll } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -12,6 +12,22 @@ import { registerTmuxPrompt, activeTmuxPromptsForTask } from "./interactions.ts"
 // static import would be hoisted above this assignment and capture the
 // wrong data dir (db.ts reads the env var at module load).
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-tmux-local-cmd-"));
+// This suite exercises queuePaste's modal-guard / composer-clear /
+// local-command / model-picker mechanics — none of it is about the paste
+// lead-in itself (docs/plans/pasted-content-tags.md D1). Disable it so
+// every existing bracketed-paste tmux-call assertion here keeps its
+// pre-lead-in shape; `claude-tmux-queue.test.ts` is where the lead-in's own
+// call sequence and failure semantics are pinned. Restored in `afterAll` —
+// `bun test` runs every file in one process, so an unrestored override here
+// would leak into whichever test file happens to run next (observed: it
+// silently broke claude-tmux-queue.test.ts's own lead-in assertions when
+// both files ran in the same invocation).
+const PREV_PASTE_LEAD_IN_ENV = process.env.AGETOR_CLAUDE_PASTE_LEAD_IN;
+process.env.AGETOR_CLAUDE_PASTE_LEAD_IN = "0";
+afterAll(() => {
+  if (PREV_PASTE_LEAD_IN_ENV === undefined) delete process.env.AGETOR_CLAUDE_PASTE_LEAD_IN;
+  else process.env.AGETOR_CLAUDE_PASTE_LEAD_IN = PREV_PASTE_LEAD_IN_ENV;
+});
 
 const {
   __forTest,

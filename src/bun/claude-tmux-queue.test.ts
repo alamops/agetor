@@ -16,8 +16,9 @@ import { randomUUID } from "node:crypto";
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-tmux-queue-"));
 
-const { __forTest, dismissTmuxPrompt, pasteFollowUp, cycleToMode, sendTurn, sendModalKeys } =
+const { __forTest, dismissTmuxPrompt, pasteFollowUp, cycleToMode, sendTurn, sendModalKeys, pasteLeadInFor } =
   await import("./claude-tmux.ts");
+const { AGETOR_PASTE_LEAD_IN } = await import("../shared/user-message.ts");
 
 // Real type for a withheld-paste outcome, derived from `pasteFollowUp`'s own
 // `onPasteFailure` parameter — `PasteOutcome` itself isn't exported, so this
@@ -967,12 +968,13 @@ test("countImagePaths: counts each image reference for settle-window scaling", (
 // branch, re-gating the Enter through `stillCurrent()` so a dispose during
 // the gap can't leak the keystroke into a respawned pane. ───
 
-test("queuePaste(bracketed): emits load-buffer → paste-buffer -p → delete-buffer → (gap) → send-keys Enter", async () => {
-  // Order proves the bracketed split was wired correctly; the timing
-  // floor on the send-keys Enter proves the gap was honored. Cold-start
-  // of the sub-bun tmux process is additive on top of the gap, so the
-  // delta-ms assertion is a lower bound — tolerance only guards against
-  // a slow timer wake-up, never against the sleep being skipped.
+test("queuePaste(bracketed): types the lead-in (send-keys -l + C-j), then load-buffer → paste-buffer -p → delete-buffer → (gap) → send-keys Enter", async () => {
+  // Order proves the lead-in (docs/plans/pasted-content-tags.md D1) and the
+  // bracketed split were both wired correctly; the timing floor on the
+  // send-keys Enter proves the gap was honored. Cold-start of the sub-bun
+  // tmux process is additive on top of the gap, so the delta-ms assertion
+  // is a lower bound — tolerance only guards against a slow timer wake-up,
+  // never against the sleep being skipped.
   const GAP = 60;
   const TOLERANCE = 30;
   await withRecordingTmuxBin(async (logPath) => {
@@ -991,15 +993,22 @@ test("queuePaste(bracketed): emits load-buffer → paste-buffer -p → delete-bu
       const entries = readTmuxLog(logPath);
       const cmds = entries.map((e) => e.argv[0]);
       expect(cmds).toEqual([
+        "send-keys", // lead-in text (`-l`)
+        "send-keys", // lead-in newline (`C-j`)
         "load-buffer",
         "paste-buffer",
         "delete-buffer",
-        "send-keys",
+        "send-keys", // Enter
       ]);
+      const leadInText = entries[0]!;
+      expect(leadInText.argv).toContain("-l");
+      expect(leadInText.argv[leadInText.argv.length - 1]).toBe(AGETOR_PASTE_LEAD_IN);
+      const leadInNewline = entries[1]!;
+      expect(leadInNewline.argv[leadInNewline.argv.length - 1]).toBe("C-j");
       // paste-buffer carries the `-p` (bracketed-paste) flag.
-      const pasteBuffer = entries[1]!;
-      const deleteBuffer = entries[2]!;
-      const sendKeys = entries[3]!;
+      const pasteBuffer = entries[3]!;
+      const deleteBuffer = entries[4]!;
+      const sendKeys = entries[5]!;
       expect(pasteBuffer.argv).toContain("-p");
       // The trailing send-keys is the Enter, not a stray modal keystroke.
       expect(sendKeys.argv[sendKeys.argv.length - 1]).toBe("Enter");
@@ -1061,14 +1070,306 @@ test("queuePaste(bracketed): trailing Enter is skipped when the session is dispo
       const firstNonCapture = cmds.findIndex((c) => c !== "capture-pane");
       expect(firstNonCapture).toBeGreaterThan(0);
       expect(cmds.slice(0, firstNonCapture).every((c) => c === "capture-pane")).toBe(true);
-      expect(cmds.slice(firstNonCapture)).toEqual(["load-buffer", "paste-buffer", "delete-buffer"]);
-      expect(cmds).not.toContain("send-keys");
+      // Two leading `send-keys` are the lead-in (`-l <text>` then `C-j`) —
+      // NOT the trailing Enter, which is what the re-gate actually drops.
+      // The paste body itself (load-buffer/paste-buffer/delete-buffer)
+      // follows, then nothing else.
+      expect(cmds.slice(firstNonCapture)).toEqual([
+        "send-keys",
+        "send-keys",
+        "load-buffer",
+        "paste-buffer",
+        "delete-buffer",
+      ]);
+      const enterCalls = readTmuxLog(logPath).filter(
+        (e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "Enter",
+      );
+      expect(enterCalls.length).toBe(0);
     } finally {
       __forTest.uninstallSession(taskId);
       __forTest.setBracketedEnterGapMs(prevGap);
       __forTest.setSlashCommandSettleMs(prevSettle);
     }
   });
+});
+
+// ─── paste lead-in (docs/plans/pasted-content-tags.md D1) — claude-code
+// wraps a bracketed paste in `<pasted_content id="…">…</pasted_content
+// id="…">` and treats the wrapped text as lower-trust; typing a fixed
+// own-words line (via `send-keys -l` + a `C-j` newline) immediately before
+// the paste gives claude something of the user's own to read the pasted
+// block as directed by. `pasteLeadInFor` decides whether a given send gets
+// one; `queuePaste`'s bracketed branch is the only caller that types it. ───
+
+test("pasteLeadInFor: ordinary prose returns AGETOR_PASTE_LEAD_IN", () => {
+  expect(pasteLeadInFor("fix the bug in foo.ts")).toBe(AGETOR_PASTE_LEAD_IN);
+  expect(pasteLeadInFor("hello\nworld")).toBe(AGETOR_PASTE_LEAD_IN);
+});
+
+test("pasteLeadInFor: a slash-command send (leading '/', incl. leading whitespace/newlines) returns null", () => {
+  expect(pasteLeadInFor("/model claude-opus-4-7")).toBeNull();
+  expect(pasteLeadInFor("  /model claude-opus-4-7")).toBeNull();
+  expect(pasteLeadInFor("\n\n/plan")).toBeNull();
+  expect(pasteLeadInFor("/multi\nline\ncommand")).toBeNull();
+});
+
+test("pasteLeadInFor: a '!' shell-escape send (incl. leading whitespace/newlines) returns null", () => {
+  expect(pasteLeadInFor("!echo hi")).toBeNull();
+  expect(pasteLeadInFor("   !echo hi")).toBeNull();
+  expect(pasteLeadInFor("\n!ls -la")).toBeNull();
+});
+
+test("pasteLeadInFor: a mid-message '/' or '!' (not the first non-blank char) still gets the lead-in", () => {
+  expect(pasteLeadInFor("see /tmp/foo.png")).toBe(AGETOR_PASTE_LEAD_IN);
+  expect(pasteLeadInFor("run this: !echo hi")).toBe(AGETOR_PASTE_LEAD_IN);
+});
+
+test("pasteLeadInFor: AGETOR_CLAUDE_PASTE_LEAD_IN=0/false/off/no (case-insensitive) disables it even for ordinary prose", () => {
+  const prev = process.env.AGETOR_CLAUDE_PASTE_LEAD_IN;
+  try {
+    for (const value of ["0", "false", "off", "no", "OFF", "  No  "]) {
+      process.env.AGETOR_CLAUDE_PASTE_LEAD_IN = value;
+      expect(pasteLeadInFor("ordinary prose")).toBeNull();
+    }
+  } finally {
+    if (prev === undefined) delete process.env.AGETOR_CLAUDE_PASTE_LEAD_IN;
+    else process.env.AGETOR_CLAUDE_PASTE_LEAD_IN = prev;
+  }
+});
+
+test("pasteLeadInFor: an unrecognized AGETOR_CLAUDE_PASTE_LEAD_IN value does NOT disable it", () => {
+  const prev = process.env.AGETOR_CLAUDE_PASTE_LEAD_IN;
+  try {
+    process.env.AGETOR_CLAUDE_PASTE_LEAD_IN = "1";
+    expect(pasteLeadInFor("ordinary prose")).toBe(AGETOR_PASTE_LEAD_IN);
+  } finally {
+    if (prev === undefined) delete process.env.AGETOR_CLAUDE_PASTE_LEAD_IN;
+    else process.env.AGETOR_CLAUDE_PASTE_LEAD_IN = prev;
+  }
+});
+
+test("queuePaste(bracketed) with a '/cmd' send: no lead-in send-keys at all — load-buffer → paste-buffer → delete-buffer → (gap) → send-keys Enter", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevGap = __forTest.setBracketedEnterGapMs(0);
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    try {
+      const taskId = randomUUID();
+      await __forTest.queuePaste(taskId, "sess-x", "/model claude-opus-4-7", 0, undefined, { bracketed: true });
+      const cmds = readTmuxLog(logPath).map((e) => e.argv[0]);
+      // Exactly the pre-lead-in bracketed shape — no lead-in typed.
+      expect(cmds).toEqual(["load-buffer", "paste-buffer", "delete-buffer", "send-keys"]);
+    } finally {
+      __forTest.setBracketedEnterGapMs(prevGap);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+    }
+  });
+});
+
+test("queuePaste(bracketed) with a '!cmd' send (leading whitespace/newlines too): no lead-in send-keys at all", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevGap = __forTest.setBracketedEnterGapMs(0);
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    try {
+      const taskId = randomUUID();
+      await __forTest.queuePaste(taskId, "sess-x", "\n  !echo hi", 0, undefined, { bracketed: true });
+      const cmds = readTmuxLog(logPath).map((e) => e.argv[0]);
+      expect(cmds).toEqual(["load-buffer", "paste-buffer", "delete-buffer", "send-keys"]);
+    } finally {
+      __forTest.setBracketedEnterGapMs(prevGap);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+    }
+  });
+});
+
+test("queuePaste(non-bracketed) never types a lead-in, even for ordinary prose", async () => {
+  // The lead-in only ever applies to the bracketed path — non-bracketed
+  // pastes (slash-command mirrors like `/model`) stream as plain keystrokes,
+  // and `pasteLeadInFor` is never even consulted on that branch.
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    try {
+      const taskId = randomUUID();
+      await __forTest.queuePaste(taskId, "sess-x", "ordinary prose, not a command", 0);
+      const cmds = readTmuxLog(logPath).map((e) => e.argv[0]);
+      expect(cmds).toEqual(["load-buffer", "paste-buffer", "delete-buffer", "send-keys"]);
+    } finally {
+      __forTest.setSlashCommandSettleMs(prevSettle);
+    }
+  });
+});
+
+test("queuePaste(bracketed) with AGETOR_CLAUDE_PASTE_LEAD_IN=0: no lead-in send-keys, ordinary prose still delivered", async () => {
+  const prevEnv = process.env.AGETOR_CLAUDE_PASTE_LEAD_IN;
+  process.env.AGETOR_CLAUDE_PASTE_LEAD_IN = "0";
+  try {
+    await withRecordingTmuxBin(async (logPath) => {
+      const prevGap = __forTest.setBracketedEnterGapMs(0);
+      const prevSettle = __forTest.setSlashCommandSettleMs(0);
+      try {
+        const taskId = randomUUID();
+        await __forTest.queuePaste(taskId, "sess-x", "ordinary prose", 0, undefined, { bracketed: true });
+        const cmds = readTmuxLog(logPath).map((e) => e.argv[0]);
+        expect(cmds).toEqual(["load-buffer", "paste-buffer", "delete-buffer", "send-keys"]);
+      } finally {
+        __forTest.setBracketedEnterGapMs(prevGap);
+        __forTest.setSlashCommandSettleMs(prevSettle);
+      }
+    });
+  } finally {
+    if (prevEnv === undefined) delete process.env.AGETOR_CLAUDE_PASTE_LEAD_IN;
+    else process.env.AGETOR_CLAUDE_PASTE_LEAD_IN = prevEnv;
+  }
+});
+
+/**
+ * Recording tmux stub that also fails a chosen ordinal `send-keys`
+ * invocation (ANY `send-keys` call, not just an Enter — unlike
+ * `withFailingNthEnterTmuxBin` in claude-tmux-local-command.test.ts, which
+ * targets only `send-keys ... Enter` calls). The lead-in's two keystrokes
+ * (`-l <text>`, then `C-j`) are both plain `send-keys` invocations with no
+ * `Enter` at the end, so failing them needs a broader net: ordinal position
+ * among ALL `send-keys` calls, not just Enter ones.
+ */
+function withFailingNthSendKeysTmuxBin<T>(targetOrdinal: number, fn: (logPath: string) => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-failsk-"));
+  const binPath = path.join(dir, "tmux");
+  const logPath = path.join(dir, "log.jsonl");
+  const counterPath = path.join(dir, "send-keys-count");
+  writeFileSync(counterPath, "0");
+  writeFileSync(
+    binPath,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync, readFileSync, writeFileSync } from "node:fs";\n` +
+      `const argv = process.argv.slice(2);\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ ms: Date.now(), argv }) + "\\n");\n` +
+      `const isSendKeys = argv.includes("send-keys");\n` +
+      `if (isSendKeys) {\n` +
+      `  const n = parseInt(readFileSync(${JSON.stringify(counterPath)}, "utf8"), 10) + 1;\n` +
+      `  writeFileSync(${JSON.stringify(counterPath)}, String(n));\n` +
+      `  if (n === ${targetOrdinal}) process.exit(1);\n` +
+      `}\n`,
+  );
+  chmodSync(binPath, 0o755);
+  const prevBin = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = binPath;
+  return fn(logPath).finally(() => {
+    if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevBin;
+  });
+}
+
+test("queuePaste(bracketed): a failed lead-in send-keys (-l) reports a plain send-keys failure, no paste attempted, composerHoldsText stays false", async () => {
+  await withFailingNthSendKeysTmuxBin(1, async (logPath) => {
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    const failures: PasteFailureOutcome[] = [];
+    try {
+      expect(state.composerHoldsText).toBe(false);
+      await __forTest.queuePaste(taskId, state.sessionName, "ordinary prose", 0, state, {
+        bracketed: true,
+        onPasteFailure: (outcome) => failures.push(outcome),
+      });
+
+      expect(failures.length).toBe(1);
+      const failure = failures[0]!;
+      expect(failure.op).toBe("send-keys");
+      // Nothing landed in the composer — the very first keystroke of the
+      // whole sequence failed — so the flag must stay false.
+      expect(state.composerHoldsText).toBe(false);
+
+      // No paste was attempted at all: the lead-in failure short-circuits
+      // before load-buffer ever runs.
+      const cmds = readTmuxLog(logPath).map((e) => e.argv[0]);
+      expect(cmds).not.toContain("load-buffer");
+      expect(cmds).not.toContain("paste-buffer");
+    } finally {
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("queuePaste(bracketed): a failed lead-in newline (C-j) after the text landed reports send-keys failure and sets composerHoldsText true", async () => {
+  await withFailingNthSendKeysTmuxBin(2, async (logPath) => {
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    const failures: PasteFailureOutcome[] = [];
+    try {
+      expect(state.composerHoldsText).toBe(false);
+      await __forTest.queuePaste(taskId, state.sessionName, "ordinary prose", 0, state, {
+        bracketed: true,
+        onPasteFailure: (outcome) => failures.push(outcome),
+      });
+
+      expect(failures.length).toBe(1);
+      const failure = failures[0]!;
+      expect(failure.op).toBe("send-keys");
+      // The lead-in TEXT (the 1st send-keys) already landed even though the
+      // newline (the 2nd) failed — the composer holds it.
+      expect(state.composerHoldsText).toBe(true);
+
+      // Still no paste attempt — the lead-in as a whole failed before
+      // load-buffer.
+      const cmds = readTmuxLog(logPath).map((e) => e.argv[0]);
+      expect(cmds).not.toContain("load-buffer");
+      expect(cmds).not.toContain("paste-buffer");
+    } finally {
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("queuePaste(bracketed): the lead-in lands, but a later load-buffer/paste-buffer failure still sets composerHoldsText true", async () => {
+  // A recording stub that fails the FIRST `load-buffer` call outright — the
+  // lead-in's two send-keys calls (which run before it) must still land
+  // successfully.
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-fail-loadbuf-"));
+  const binPath = path.join(dir, "tmux");
+  const logPath = path.join(dir, "log.jsonl");
+  writeFileSync(
+    binPath,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync } from "node:fs";\n` +
+      `const argv = process.argv.slice(2);\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ ms: Date.now(), argv }) + "\\n");\n` +
+      `if (argv.includes("load-buffer")) process.exit(1);\n`,
+  );
+  chmodSync(binPath, 0o755);
+  const prevBin = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = binPath;
+
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  const failures: PasteFailureOutcome[] = [];
+  try {
+    expect(state.composerHoldsText).toBe(false);
+    await __forTest.queuePaste(taskId, state.sessionName, "ordinary prose", 0, state, {
+      bracketed: true,
+      onPasteFailure: (outcome) => failures.push(outcome),
+    });
+
+    expect(failures.length).toBe(1);
+    const failure = failures[0]!;
+    expect(failure.op).toBe("load-buffer");
+    // The lead-in already landed before load-buffer ever ran — its failure
+    // strands that lead-in text in the composer exactly like any other
+    // landed-but-unsubmitted partial send.
+    expect(state.composerHoldsText).toBe(true);
+
+    const cmds = readTmuxLog(logPath).map((e) => e.argv[0]);
+    const loadBufferIdx = cmds.indexOf("load-buffer");
+    expect(loadBufferIdx).toBeGreaterThan(-1);
+    // Everything before load-buffer is either the modal guard's own
+    // pre-paste `capture-pane` reads (this default-capture stub answers ""
+    // to those, so the guard falls through immediately) or the lead-in's
+    // two `send-keys` calls — and exactly two of the latter landed.
+    const beforeLoadBuffer = cmds.slice(0, loadBufferIdx);
+    expect(beforeLoadBuffer.every((c) => c === "send-keys" || c === "capture-pane")).toBe(true);
+    expect(beforeLoadBuffer.filter((c) => c === "send-keys").length).toBe(2);
+  } finally {
+    __forTest.uninstallSession(taskId);
+    if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevBin;
+  }
 });
 
 test("queuePaste(non-bracketed): keeps the original synchronous load-buffer → paste-buffer → delete-buffer → send-keys Enter shape (no gap)", async () => {
@@ -1136,9 +1437,18 @@ test("queuePaste(image): single-image paste replaces the base gap with the longe
       );
       const entries = readTmuxLog(logPath);
       const cmds = entries.map((e) => e.argv[0]);
-      expect(cmds).toEqual(["load-buffer", "paste-buffer", "delete-buffer", "send-keys"]);
-      const deleteBuffer = entries[2]!;
-      const sendKeys = entries[3]!;
+      // Two leading send-keys are the lead-in (`-l` + `C-j`) — see the
+      // dedicated lead-in ordering test; unaffected by the image gap.
+      expect(cmds).toEqual([
+        "send-keys",
+        "send-keys",
+        "load-buffer",
+        "paste-buffer",
+        "delete-buffer",
+        "send-keys",
+      ]);
+      const deleteBuffer = entries[4]!;
+      const sendKeys = entries[5]!;
       expect(sendKeys.argv[sendKeys.argv.length - 1]).toBe("Enter");
       const deltaMs = sendKeys.ms - deleteBuffer.ms;
       expect(deltaMs).toBeGreaterThanOrEqual(IMG - TOLERANCE);
@@ -1170,8 +1480,11 @@ test("queuePaste(image): gap scales linearly with the number of image paths", as
         { bracketed: true },
       );
       const entries = readTmuxLog(logPath);
-      const deleteBuffer = entries[2]!;
-      const sendKeys = entries[3]!;
+      // Two leading send-keys are the lead-in (`-l` + `C-j`) — shifts
+      // delete-buffer/send-keys(Enter) two slots later than the pre-lead-in
+      // shape.
+      const deleteBuffer = entries[4]!;
+      const sendKeys = entries[5]!;
       const deltaMs = sendKeys.ms - deleteBuffer.ms;
       expect(deltaMs).toBeGreaterThanOrEqual(IMG * 2.5);
     } finally {
