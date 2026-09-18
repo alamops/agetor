@@ -1,7 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { createEventDeduper, eventDedupKey } from "./event-dedup.ts";
 import { appendReferences } from "../../shared/refs.ts";
+import { AGETOR_PASTE_LEAD_IN } from "../../shared/user-message.ts";
 import type { RunEvent, TaskReference } from "../../shared/types.ts";
+
+/** Build claude's own `<pasted_content>` wrapper shape — see the identical
+ *  helper's doc comment in src/shared/user-message.test.ts. */
+function wrapPastedContent(id: string, body: string): string {
+  const padded = body.endsWith("\n") ? body : `${body}\n`;
+  return `\n\n<pasted_content id="${id}">\n${padded}</pasted_content id="${id}">\n`;
+}
 
 const ev = (e: Partial<RunEvent>): RunEvent => ({
   runId: "run-1",
@@ -237,6 +245,57 @@ describe("eventDedupKey / createEventDeduper — image-attachment echo/twin coll
 
     const d = createEventDeduper();
     expect(d.accept(liveEv)).toBe(true);
+    expect(d.accept(twinEv)).toBe(false);
+  });
+});
+
+describe("eventDedupKey / createEventDeduper — pasted-content echo/twin collapse", () => {
+  test("live echo (raw body) collapses with its lead-in + wrapped JSONL twin", () => {
+    const body = "a pasted paragraph long enough for claude to wrap in a pasted_content block";
+    const twin = `${AGETOR_PASTE_LEAD_IN}\n${wrapPastedContent("f00d", body)}`;
+
+    const live = ev({ stream: "user", data: body, ts: 1, runId: "run-paste" });
+    const twinEv = ev({ stream: "user", data: twin, ts: 99999, runId: "run-paste" });
+    expect(eventDedupKey(live)).toBe(eventDedupKey(twinEv));
+
+    const d = createEventDeduper();
+    expect(d.accept(live)).toBe(true);
+    expect(d.accept(twinEv)).toBe(false);
+  });
+
+  test("an echo that kept boundary whitespace (CLI send / backlog item) still collapses with its twin — claude trim()s the pasted body", () => {
+    const body = "a short untrimmed send";
+    const twin = `${AGETOR_PASTE_LEAD_IN}\n${wrapPastedContent("0a7d", body)}`;
+
+    const live = ev({ stream: "user", data: `  ${body}\n`, ts: 1, runId: "run-paste-ws" });
+    const twinEv = ev({ stream: "user", data: twin, ts: 2, runId: "run-paste-ws" });
+    expect(eventDedupKey(live)).toBe(eventDedupKey(twinEv));
+  });
+
+  test("live echo also collapses with a wrapped-only twin (no lead-in — e.g. claude's wrapping flag firing on a send that predates the lead-in feature, or a non-claude-tmux send path)", () => {
+    const body = "another pasted paragraph, long enough to get wrapped on its own";
+    const twin = wrapPastedContent("beef", body);
+
+    const live = ev({ stream: "user", data: body, ts: 1, runId: "run-paste-2" });
+    const twinEv = ev({ stream: "user", data: twin, ts: 2, runId: "run-paste-2" });
+    expect(eventDedupKey(live)).toBe(eventDedupKey(twinEv));
+
+    const d = createEventDeduper();
+    expect(d.accept(live)).toBe(true);
+    expect(d.accept(twinEv)).toBe(false);
+  });
+
+  test("collapse still holds when the twin's pasted body carries bare \\r newlines (tmux paste-buffer artifact) — the wrapper's own newlines stay \\n", () => {
+    const bodyLF = "line one of a multi-line paste\nline two of a multi-line paste";
+    const bodyCR = bodyLF.replace(/\n/g, "\r");
+    const twinCR = `${AGETOR_PASTE_LEAD_IN}\n${wrapPastedContent("cafe", bodyCR)}`;
+
+    const live = ev({ stream: "user", data: bodyLF, ts: 1, runId: "run-paste-cr" });
+    const twinEv = ev({ stream: "user", data: twinCR, ts: 2, runId: "run-paste-cr" });
+    expect(eventDedupKey(live)).toBe(eventDedupKey(twinEv));
+
+    const d = createEventDeduper();
+    expect(d.accept(live)).toBe(true);
     expect(d.accept(twinEv)).toBe(false);
   });
 });

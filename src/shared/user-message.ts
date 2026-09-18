@@ -743,6 +743,213 @@ export function tryParseJsonBody(body: string): unknown {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Pasted-content unwrapping (Claude Code's own bracketed-paste wrapper)
+//
+// Background: Claude Code's CLI wraps an inline bracketed paste of >= 20
+// trimmed chars in `<pasted_content id="hhhh">\n{body}\n</pasted_content
+// id="hhhh">` before writing it into the session JSONL — a real, shipped
+// shape as of 2.1.277, gated by a server-side flag that can flip mid-session
+// (see docs/plans/pasted-content-tags.md §2). The closing tag repeats the
+// `id` attribute, so it is NOT a well-formed XML close and
+// `parseMessageSegments` above can never pair it; rendered verbatim the tags
+// show as literal noise in the "you" bubble and, worse, the live echo (raw
+// sent text) and this JSONL twin (wrapped) diverge byte-for-byte, so dedup
+// fails and the message shows twice. Separately, agetor types a fixed
+// "lead-in" line ahead of a bracketed paste (see claude-tmux.ts's
+// `queuePaste`) so claude reads the pasted block as the user's own directed
+// request rather than merely embedded, lower-trust text — that lead-in must
+// also be stripped from the delivered text before display/dedup.
+//
+// `segmentPastedContent` below is a faithful, unit-tested port of Claude
+// CLI's OWN segmenter (captured from the 2.1.277 binary — see the plan for
+// the minified source), so the unwrap agrees with what claude itself would
+// reconstruct. Any well-formed 4-lowercase-hex `id` is accepted (the client
+// has no session id to compare against, and a mismatched display is not a
+// security concern) as long as a block's own open and close ids match.
+
+export type PastedContentSegment =
+  | { kind: "text"; text: string }
+  | { kind: "block"; id: string; body: string };
+
+const PASTED_CONTENT_OPEN_PREFIX = '<pasted_content id="';
+const PASTED_CONTENT_ID_RE = /^[0-9a-f]{4}$/;
+
+/**
+ * Port of Claude CLI's own `<pasted_content>` segmenter (minified as `Get` in
+ * the 2.1.277 binary — see docs/plans/pasted-content-tags.md §2 for the
+ * source). Scans `text` left to right for well-formed
+ * `<pasted_content id="hhhh">\n{body}\n</pasted_content id="hhhh">` blocks —
+ * open tag immediately followed by `\n`, close tag immediately preceded by
+ * `\n` and carrying the SAME 4-lowercase-hex id — and returns the alternating
+ * text/block runs. Up to two newlines immediately before an open tag and
+ * immediately after a close tag are swallowed (excluded from both the
+ * neighboring text run and the block's own `body`) — this is what lets
+ * `unwrapPastedContent`'s joiner reconstruct the original spacing rather than
+ * accumulating the wrapper's own padding newlines.
+ *
+ * A candidate open tag that fails to parse (bad/short/uppercase id, or not
+ * immediately followed by `">\n`) is skipped over — the scan resumes just
+ * past its id, so a well-formed block LATER in the same text is still found.
+ * A candidate whose id parses but whose matching close tag (same id) is never
+ * found is different: claude's own segmenter treats that as "this text isn't
+ * really block-shaped past this point" and stops the scan entirely, so
+ * everything is returned as a single (unmodified) trailing text run — same
+ * outcome as if no candidate had matched at all.
+ *
+ * With no well-formed block anywhere, returns a single `{kind:"text"}`
+ * segment covering the whole, unmodified input — never an empty array.
+ */
+export function segmentPastedContent(text: string): PastedContentSegment[] {
+  const result: PastedContentSegment[] = [];
+  let n = 0; // start of the next unconsumed text run
+  let o = 0; // search cursor for the next open-tag candidate
+  for (;;) {
+    const a = text.indexOf(PASTED_CONTENT_OPEN_PREFIX, o);
+    if (a === -1) break;
+    const s = a + PASTED_CONTENT_OPEN_PREFIX.length;
+    const id = text.slice(s, s + 4);
+    if (!PASTED_CONTENT_ID_RE.test(id) || !text.startsWith('">\n', s + 4)) {
+      // Not a well-formed open tag — resume scanning just past this
+      // candidate's id for a later block, rather than bailing outright.
+      o = s;
+      continue;
+    }
+    const bodyStart = s + 4 + 3; // past the id, the closing `"`, `>`, and `\n`
+    const closeTag = `</pasted_content id="${id}">`;
+    const closeAt = text.indexOf(`\n${closeTag}`, bodyStart - 1);
+    if (closeAt === -1) break; // no matching close anywhere — stop the scan
+    const closeTagStart = closeAt + 1; // skip the leading `\n` we searched for
+
+    // Back up over up to two newlines immediately before the open tag — they
+    // belong to the wrapper's own padding, not to the preceding text.
+    let textEnd = a;
+    for (let m = 0; m < 2 && textEnd > n && text[textEnd - 1] === "\n"; m++) textEnd--;
+    if (textEnd > n) result.push({ kind: "text", text: text.slice(n, textEnd) });
+
+    n = closeTagStart + closeTag.length;
+    // Swallow up to two newlines immediately after the close tag too.
+    for (let m = 0; m < 2 && text[n] === "\n"; m++) n++;
+    result.push({ kind: "block", id, body: text.slice(bodyStart, closeTagStart - 1) });
+    o = n;
+  }
+  if (n < text.length) result.push({ kind: "text", text: text.slice(n) });
+  return result;
+}
+
+/** Reverse `<\pasted_content` / `<\/pasted_content` escaping (claude's own
+ *  escaping of a literal occurrence of either string inside a pasted body, so
+ *  it can't be mis-parsed as a nested tag). Applied ONLY to a block's own
+ *  `body` — that's the only place claude ever writes the escaped form. */
+function unescapePastedContentBody(body: string): string {
+  return body
+    .replace(/<\\\/pasted_content/g, "</pasted_content")
+    .replace(/<\\pasted_content/g, "<pasted_content");
+}
+
+/**
+ * Reconstruct the text a user would recognize as "what they sent" from a
+ * `<pasted_content>`-wrapped JSONL twin — the inverse of claude's own
+ * wrapper, using claude's own join rule: text and block-body parts are joined
+ * with a single `\n`; a TEXT part that isn't first has its leading whitespace
+ * stripped, a TEXT part that isn't last has its trailing whitespace stripped
+ * (a block's `body` is never re-trimmed here — claude already `trim()`med it
+ * before wrapping), and a text part that's empty after trimming contributes
+ * nothing to the join. This is what turns
+ * `"My message:\n\n\n<pasted_content id=\"…\">\nbody\n</pasted_content
+ * id=\"…\">"` back into `"My message:\nbody"` — the wrapper's own padding
+ * newlines are discarded, not accumulated.
+ *
+ * Returns the SAME string reference as `text` when `segmentPastedContent`
+ * finds no well-formed block at all (ordinary messages, and every malformed
+ * shape `segmentPastedContent` already degrades to a single text run) — this
+ * is what keeps `normalizeDeliveredUserText`'s identity contract for
+ * non-pasted messages.
+ */
+export function unwrapPastedContent(text: string): string {
+  const segments = segmentPastedContent(text);
+  if (!segments.some((seg) => seg.kind === "block")) return text;
+
+  const parts: string[] = [];
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (!seg) continue; // unreachable — i is always within [0, segments.length)
+    if (seg.kind === "block") {
+      parts.push(unescapePastedContentBody(seg.body));
+      continue;
+    }
+    let t = seg.text;
+    if (i !== 0) t = t.trimStart();
+    if (i !== segments.length - 1) t = t.trimEnd();
+    if (t !== "") parts.push(t);
+  }
+  return parts.join("\n");
+}
+
+/**
+ * The fixed line agetor types (via `send-keys -l`) immediately before a
+ * bracketed-paste follow-up to a claude-code task, so claude reads the pasted
+ * block as the user's own directed request rather than merely "embedded
+ * pasted text" it should treat as lower-trust (see
+ * docs/plans/pasted-content-tags.md D1). Lives here rather than in
+ * claude-tmux.ts so the SAME string drives both the typing side and the
+ * stripping side below without a second copy to drift.
+ */
+export const AGETOR_PASTE_LEAD_IN = "My own message, sent from Agetor:";
+
+/**
+ * Every lead-in spelling agetor has ever shipped, in shipping order.
+ * APPEND-ONLY: persisted `run_events` rows are raw (see this module's header
+ * comment and CLAUDE.md items 13/14) — a rendering-only fix upgrades
+ * historical transcripts too, but only for spellings still listed here.
+ * Changing `AGETOR_PASTE_LEAD_IN`'s wording must ADD the new string to this
+ * list rather than replace the old one, or every already-persisted send using
+ * the old wording regresses back to showing the raw lead-in line.
+ */
+export const AGETOR_PASTE_LEAD_INS: readonly string[] = [AGETOR_PASTE_LEAD_IN];
+
+/**
+ * Reduce a user-turn string to the "delivered" text a user would recognize as
+ * what they actually sent, undoing two agetor/claude-code-specific
+ * transformations that can precede it:
+ *
+ *  1. agetor's own typed lead-in line (`AGETOR_PASTE_LEAD_IN` above) —
+ *     stripped only when it is the very first thing in `text`, immediately
+ *     followed by exactly one line break (`\n` or `\r`); that one line break
+ *     is consumed along with it. A lead-in string appearing anywhere else in
+ *     the text (mid-message) is left untouched — at that point it's just
+ *     prose, not agetor's own marker.
+ *  2. claude CLI's `<pasted_content id="hhhh">…</pasted_content id="hhhh">`
+ *     wrapper (`unwrapPastedContent` above) — applied to whatever remains
+ *     after step 1, so a lead-in followed by a wrapped paste collapses
+ *     straight to the pasted body, and a lead-in followed by an UNwrapped
+ *     paste (claude's wrapping flag off server-side, so the twin is just
+ *     `LEADIN\nbody`) collapses to exactly the typed-after-lead-in text,
+ *     since there's nothing left for `unwrapPastedContent` to do.
+ *
+ * Returns the SAME string reference as `text` when neither step applies —
+ * required so `canonicalizeUserText`'s "identity for ordinary messages"
+ * contract (which this function now sits in front of) still holds.
+ *
+ * Does not assume `text`'s newlines have already been normalized to `\n`:
+ * the WRAPPER's own newlines (its open/close tag boundaries) are always
+ * literal `\n` — claude writes them, not agetor — but a pasted BODY sourced
+ * from tmux's paste buffer can carry bare `\r` internally; those are
+ * preserved verbatim in the returned text, same as they always have been.
+ */
+export function normalizeDeliveredUserText(text: string): string {
+  let stripped = text;
+  for (const leadIn of AGETOR_PASTE_LEAD_INS) {
+    if (!text.startsWith(leadIn)) continue;
+    const next = text[leadIn.length];
+    if (next === "\n" || next === "\r") {
+      stripped = text.slice(leadIn.length + 1);
+      break;
+    }
+  }
+  return unwrapPastedContent(stripped);
+}
+
 /**
  * Recognize a user message as a slash-command invocation, local-command
  * output, or a tagged message carrying other recognized/generic tags, trying
@@ -752,11 +959,18 @@ export function tryParseJsonBody(body: string): unknown {
  * Newlines are normalized to `\n` up front: the JSONL twin of a send can carry
  * bare `\r` newlines (tmux's paste-buffer artifact — see event-dedup.ts), and
  * `splitReferences`' blank-line paragraph split needs real `\n`s to find a
- * trailing refs block. Rendering-only — `canonicalizeUserText` stays a strict
- * byte identity on non-command input and must not normalize.
+ * trailing refs block. `normalizeDeliveredUserText` runs right after — before
+ * any of the shape checks below — so a lead-in line and/or a
+ * `<pasted_content>` wrapper are undone first and every shape check operates
+ * on the same text a caller would see if the message had never been
+ * lead-in'd or wrapped at all. Rendering-only — `canonicalizeUserText` stays
+ * a strict identity on non-command, non-pasted input and must not normalize
+ * beyond what `normalizeDeliveredUserText` itself already guarantees is a
+ * no-op there.
  */
 export function parseUserMessage(text: string): ParsedUserMessage | null {
   text = text.replace(/\r\n?/g, "\n");
+  text = normalizeDeliveredUserText(text);
   const xml = tryParseCommandXml(text);
   if (xml) return { kind: "command", command: xml };
 
@@ -775,19 +989,33 @@ export function parseUserMessage(text: string): ParsedUserMessage | null {
 
 /**
  * Reduce a user message to the text form that would appear as the LIVE echo
- * of the same send. A slash-command send produces a live echo
- * ("/implement args…") the instant it's submitted, and later a JSONL twin —
- * claude CLI's `<command-name>`/`<command-args>` XML expansion of that same
- * send — whose text differs byte-for-byte from the echo. Canonicalizing the
- * XML shape back to the echo shape here lets `eventDedupKey`'s existing
- * echo-vs-twin key collapse the two into one bubble. For every other input
- * (including messages that merely resemble the XML shape but fail the strict
- * parse) this is the identity function — no trimming, no normalization — so
- * it must not shift the dedup key of ordinary messages.
+ * of the same send — undoing every claude-code-specific transformation that
+ * can separate a send's live echo from its later JSONL twin. The same send
+ * event is told twice: once live (agetor's own echo, emitted the instant the
+ * message is typed/sent) and once when claude CLI transcribes it into the
+ * session JSONL, where it can come out spelled differently:
+ *
+ *  - a slash-command send: the live echo is plain text ("/implement args…"),
+ *    the JSONL twin is claude CLI's `<command-name>`/`<command-args>` XML
+ *    expansion of that same send.
+ *  - a bracketed-paste follow-up: the live echo is the raw text agetor sent,
+ *    the JSONL twin is agetor's own typed lead-in line PLUS claude's
+ *    `<pasted_content id="…">…</pasted_content id="…">` wrapper around the
+ *    pasted body (see `normalizeDeliveredUserText` above).
+ *
+ * `eventDedupKey` (event-dedup.ts) feeds both copies of a send through this
+ * function before slicing its key, so the two collapse into one bubble
+ * instead of two. For every other input — including messages that merely
+ * resemble one of the shapes above but fail its strict parse — this is the
+ * identity function (same string reference): no trimming, no normalization
+ * beyond what `normalizeDeliveredUserText` itself already guarantees is a
+ * no-op for ordinary messages. It must not shift the dedup key of an
+ * ordinary message.
  */
 export function canonicalizeUserText(text: string): string {
-  const raw = matchCommandXml(text);
-  if (!raw) return text;
+  const normalized = normalizeDeliveredUserText(text);
+  const raw = matchCommandXml(normalized);
+  if (!raw) return normalized;
   return raw.argsRaw ? `${raw.name} ${raw.argsRaw}` : raw.name;
 }
 
@@ -870,7 +1098,10 @@ function segmentPlainLines(segments: readonly MessageSegment[]): PlainLine[] {
 /**
  * Render a raw user-turn string as one or more labeled plain-text lines.
  * Ordinary prose (parseUserMessage → null) yields exactly one `you›` line
- * with `text` untouched — byte-identical to today's CLI/TUI output. A
+ * with `text` run through `normalizeDeliveredUserText` — a lead-in line
+ * and/or a `<pasted_content>` wrapper are stripped, but otherwise
+ * byte-identical to today's CLI/TUI output (that normalization is a no-op for
+ * a message carrying neither). A
  * `command` whose args contain no tags keeps that same single `you› /name
  * args` line (byte-identical to today's output); a command whose args DO
  * contain tags instead renders a `you› /name` line followed by the same
@@ -887,7 +1118,7 @@ function segmentPlainLines(segments: readonly MessageSegment[]): PlainLine[] {
  */
 export function userMessageLines(text: string): PlainLine[] {
   const parsed = parseUserMessage(text);
-  if (parsed === null) return [{ label: "you›", text, tone: "user" }];
+  if (parsed === null) return [{ label: "you›", text: normalizeDeliveredUserText(text), tone: "user" }];
   if (parsed.kind === "command") {
     const { command } = parsed;
     const argSegments = parseMessageSegments(command.args);

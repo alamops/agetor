@@ -44,6 +44,14 @@ const normalizeForKey = (s: string) => s.replace(/\r\n?/g, "\n");
  * so the live echo and the JSONL twin of the same image-attached send
  * reduce to one identical string and collapse to a single bubble too.
  *
+ * A pasted send has a third split: claude wraps a bracketed paste in
+ * `<pasted_content id="…">` (behind agetor's own typed lead-in line), and
+ * `trim()`s the pasted body while doing so. `canonicalizeUserText` strips the
+ * lead-in + wrapper; the key is additionally `trim()`med on BOTH copies so an
+ * echo that kept boundary whitespace (`agetor send`, a backlog item, an
+ * ask-card free-text answer — none of which trim like the dock composer does)
+ * still meets its trimmed twin. Symmetric, and keys never leave memory.
+ *
  * Consequence of the ts-less `user` key: two genuinely-identical user sends in
  * the SAME run (e.g. folding `"continue"` twice into one in-flight turn) share
  * a key and render as a single bubble. This is intentional — there is no
@@ -54,7 +62,7 @@ const normalizeForKey = (s: string) => s.replace(/\r\n?/g, "\n");
  */
 export function eventDedupKey(e: RunEvent): string {
   return e.stream === "user"
-    ? `user|${e.runId}|${canonicalizeAttachmentText(canonicalizeUserText(normalizeForKey(e.data ?? ""))).slice(0, 200)}`
+    ? `user|${e.runId}|${canonicalizeAttachmentText(canonicalizeUserText(normalizeForKey(e.data ?? ""))).trim().slice(0, 200)}`
     : `${e.ts}|${e.runId}|${e.stream}|${(e.data ?? "").slice(0, 200)}`;
 }
 

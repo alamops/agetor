@@ -1,21 +1,35 @@
 import { describe, expect, test } from "bun:test";
 import {
+  AGETOR_PASTE_LEAD_IN,
+  AGETOR_PASTE_LEAD_INS,
   canonicalizeUserText,
   forkedSkillLabel,
   hasTagSegments,
   humanizeTagName,
   isMachineEmittedMessage,
+  normalizeDeliveredUserText,
   parseForkedSkillLaunch,
   parseMessageSegments,
   parseUserMessage,
+  segmentPastedContent,
   splitReferences,
   stripAnsiSgr,
   tryParseJsonBody,
+  unwrapPastedContent,
   userMessageLines,
 } from "./user-message.ts";
 import { appendReferences } from "./refs.ts";
 import { composeLaunchPrompt } from "./agent-profile.ts";
 import type { TaskReference } from "./types.ts";
+
+/** Build claude's own `<pasted_content>` wrapper shape (the `oKe` function in
+ *  the 2.1.277 binary — see docs/plans/pasted-content-tags.md §2): a leading
+ *  "\n\n", the open tag, `body` (padded with a trailing "\n" when it doesn't
+ *  already end with one), then the close tag and a trailing "\n". */
+function wrapPastedContent(id: string, body: string): string {
+  const padded = body.endsWith("\n") ? body : `${body}\n`;
+  return `\n\n<pasted_content id="${id}">\n${padded}</pasted_content id="${id}">\n`;
+}
 
 const REFS: TaskReference[] = [
   { path: "/a/b.png", isDirectory: false },
@@ -1139,6 +1153,222 @@ describe("agent instructions tag", () => {
     ]);
     expect(userMessageLines(composeLaunchPrompt({ instructions: "  ", skills: [] }, "just a message"))).toEqual([
       { label: "you›", text: "just a message", tone: "user" },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `<pasted_content>` unwrapping — docs/plans/pasted-content-tags.md T1.
+
+describe("segmentPastedContent — real captured shapes", () => {
+  test("whole message pasted (real 2.1.277 JSONL fixture): a single block, no surrounding text", () => {
+    const fixture =
+      '\n\n<pasted_content id="1b6a">\nfor the first post, I need more stunning impactful first line\n\nA truly living world\n</pasted_content id="1b6a">\n';
+    expect(segmentPastedContent(fixture)).toEqual([
+      {
+        kind: "block",
+        id: "1b6a",
+        body: "for the first post, I need more stunning impactful first line\n\nA truly living world",
+      },
+    ]);
+  });
+
+  test("lead-in typed + paste (real 2.1.277 JSONL fixture, no trailing newline): leading text run + one block", () => {
+    const fixture =
+      'My message:\n\n\n<pasted_content id="b826">\nD lead-in test line one.\nLine two: reply with OK.\n</pasted_content id="b826">';
+    expect(segmentPastedContent(fixture)).toEqual([
+      { kind: "text", text: "My message:\n" },
+      { kind: "block", id: "b826", body: "D lead-in test line one.\nLine two: reply with OK." },
+    ]);
+  });
+
+  test("no well-formed block anywhere: a single text segment covering the whole (unmodified) input", () => {
+    const text = "just an ordinary message, nothing pasted here at all";
+    expect(segmentPastedContent(text)).toEqual([{ kind: "text", text }]);
+  });
+});
+
+describe("unwrapPastedContent — real captured shapes", () => {
+  test("whole message pasted → just the body (wrapper's own leading/trailing newlines fully swallowed)", () => {
+    const fixture =
+      '\n\n<pasted_content id="1b6a">\nfor the first post, I need more stunning impactful first line\n\nA truly living world\n</pasted_content id="1b6a">\n';
+    expect(unwrapPastedContent(fixture)).toBe(
+      "for the first post, I need more stunning impactful first line\n\nA truly living world",
+    );
+  });
+
+  test("user-typed text + one block → text and body joined with a single newline (also serves as the lead-in-typed-and-pasted fixture, since \"My message:\" is not a recognized agetor lead-in)", () => {
+    const fixture =
+      'My message:\n\n\n<pasted_content id="b826">\nD lead-in test line one.\nLine two: reply with OK.\n</pasted_content id="b826">';
+    expect(unwrapPastedContent(fixture)).toBe(
+      "My message:\nD lead-in test line one.\nLine two: reply with OK.",
+    );
+  });
+
+  test("two blocks: each block's surrounding prose and body all collapse onto single-newline joins", () => {
+    const text =
+      "before text"
+      + wrapPastedContent("aaaa", "first chunk of pasted content here")
+      + "middle text"
+      + wrapPastedContent("bbbb", "second chunk of pasted content here");
+    expect(unwrapPastedContent(text)).toBe(
+      "before text\nfirst chunk of pasted content here\nmiddle text\nsecond chunk of pasted content here",
+    );
+  });
+
+  test("escaped inner tag-like text inside a block body is un-escaped", () => {
+    const escapedBody =
+      'note: <\\pasted_content id="dead"> stray text and <\\/pasted_content id="dead"> more stray text';
+    const wrapped = wrapPastedContent("dead", escapedBody);
+    expect(unwrapPastedContent(wrapped)).toBe(
+      'note: <pasted_content id="dead"> stray text and </pasted_content id="dead"> more stray text',
+    );
+  });
+
+  test("ordinary text with no pasted block is returned identically", () => {
+    const text = "just a normal reply with no tags or wrapper at all";
+    expect(unwrapPastedContent(text)).toBe(text);
+  });
+
+  describe("malformed shapes stay literal (identity)", () => {
+    test("unclosed block", () => {
+      const text = '\n\n<pasted_content id="1234">\nbody with no closing tag at all';
+      expect(unwrapPastedContent(text)).toBe(text);
+    });
+
+    test("non-hex id", () => {
+      const text = '\n\n<pasted_content id="ghij">\nbody\n</pasted_content id="ghij">\n';
+      expect(unwrapPastedContent(text)).toBe(text);
+    });
+
+    test("3-char id", () => {
+      const text = '\n\n<pasted_content id="abc">\nbody\n</pasted_content id="abc">\n';
+      expect(unwrapPastedContent(text)).toBe(text);
+    });
+
+    test("uppercase hex id", () => {
+      const text = '\n\n<pasted_content id="1B6A">\nbody\n</pasted_content id="1B6A">\n';
+      expect(unwrapPastedContent(text)).toBe(text);
+    });
+
+    test("open tag not immediately followed by a newline", () => {
+      const text = '\n\n<pasted_content id="1234">body\n</pasted_content id="1234">\n';
+      expect(unwrapPastedContent(text)).toBe(text);
+    });
+
+    test("mismatched close id (no matching close for the opened id anywhere)", () => {
+      const text = '\n\n<pasted_content id="1234">\nbody\n</pasted_content id="5678">\n';
+      expect(unwrapPastedContent(text)).toBe(text);
+    });
+  });
+});
+
+describe("AGETOR_PASTE_LEAD_IN / AGETOR_PASTE_LEAD_INS", () => {
+  test("the current lead-in is the sole (so far) entry in the append-only list", () => {
+    expect(AGETOR_PASTE_LEAD_INS).toEqual([AGETOR_PASTE_LEAD_IN]);
+  });
+});
+
+describe("normalizeDeliveredUserText", () => {
+  test("lead-in + wrapped block → just the body (both the lead-in line and the wrapper are stripped)", () => {
+    const body = "line one of the pasted body\nline two of the pasted body";
+    const fixture = `${AGETOR_PASTE_LEAD_IN}\n${wrapPastedContent("c0de", body)}`;
+    expect(normalizeDeliveredUserText(fixture)).toBe(body);
+  });
+
+  test("lead-in with claude's wrapping flag off (LEADIN\\nbody) → just the body", () => {
+    const fixture = `${AGETOR_PASTE_LEAD_IN}\nplain typed body, no wrapper at all`;
+    expect(normalizeDeliveredUserText(fixture)).toBe("plain typed body, no wrapper at all");
+  });
+
+  test("lead-in boundary also tolerates a bare \\r right after it", () => {
+    const fixture = `${AGETOR_PASTE_LEAD_IN}\rbody text after a bare CR`;
+    expect(normalizeDeliveredUserText(fixture)).toBe("body text after a bare CR");
+  });
+
+  test("wrapped-only (no lead-in) real fixture unwraps the same as unwrapPastedContent alone", () => {
+    const fixture =
+      '\n\n<pasted_content id="1b6a">\nfor the first post, I need more stunning impactful first line\n\nA truly living world\n</pasted_content id="1b6a">\n';
+    expect(normalizeDeliveredUserText(fixture)).toBe(
+      "for the first post, I need more stunning impactful first line\n\nA truly living world",
+    );
+  });
+
+  test("a lead-in string occurring mid-message (not at the very start) is left untouched", () => {
+    const text = `Some prose first.\n${AGETOR_PASTE_LEAD_IN}\nmore prose after`;
+    expect(normalizeDeliveredUserText(text)).toBe(text);
+  });
+
+  test("ordinary text (no lead-in, no wrapper) is returned by the same reference", () => {
+    const text = "just an ordinary reply, nothing special here";
+    expect(normalizeDeliveredUserText(text)).toBe(text);
+  });
+
+  test("a lead-in with no line break at all after it is left untouched (not a real lead-in line)", () => {
+    const text = `${AGETOR_PASTE_LEAD_IN} continued on the same line, no newline at all`;
+    expect(normalizeDeliveredUserText(text)).toBe(text);
+  });
+
+  test("newlines inside a wrapped body may be bare \\r without breaking the unwrap (wrapper's own newlines stay \\n)", () => {
+    const bodyLF = "line one of a multi-line paste\nline two of a multi-line paste";
+    const bodyCR = bodyLF.replace(/\n/g, "\r");
+    const fixture = `${AGETOR_PASTE_LEAD_IN}\n${wrapPastedContent("cafe", bodyCR)}`;
+    expect(normalizeDeliveredUserText(fixture)).toBe(bodyCR);
+  });
+});
+
+describe("canonicalizeUserText — pasted-content wiring", () => {
+  test("a lead-in + wrapped follow-up canonicalizes to the plain body", () => {
+    const body = "the actual pasted content the user cares about";
+    const fixture = `${AGETOR_PASTE_LEAD_IN}\n${wrapPastedContent("f00d", body)}`;
+    expect(canonicalizeUserText(fixture)).toBe(body);
+  });
+
+  test("ordinary text is still returned identically (pasted-content wiring is a no-op for it)", () => {
+    const text = "  just some ordinary reply with   odd spacing\n\n";
+    expect(canonicalizeUserText(text)).toBe(text);
+  });
+});
+
+describe("parseUserMessage — pasted-content wiring", () => {
+  test("a wrapped ordinary-prose message parses exactly like its unwrapped body (both null)", () => {
+    const body = "just some ordinary reply text, long enough to be pasted as a block by claude";
+    const wrapped = wrapPastedContent("feed", body);
+    expect(parseUserMessage(wrapped)).toBe(parseUserMessage(body));
+    expect(parseUserMessage(wrapped)).toBeNull();
+  });
+
+  test("a wrapped tagged-body message parses exactly like its unwrapped body (both tagged, same segments)", () => {
+    const body = "<bash-input>ls -la</bash-input>";
+    const wrapped = wrapPastedContent("cafe", body);
+    expect(parseUserMessage(wrapped)).toEqual(parseUserMessage(body));
+  });
+
+  test("a lead-in + wrapped slash command still parses as a plain echo command", () => {
+    const fixture = `${AGETOR_PASTE_LEAD_IN}\n${wrapPastedContent("beef", "/implement do the thing, in full detail please")}`;
+    expect(parseUserMessage(fixture)).toEqual({
+      kind: "command",
+      command: { name: "/implement", args: "do the thing, in full detail please", references: [] },
+    });
+  });
+});
+
+describe("userMessageLines — pasted-content wiring", () => {
+  test("renders only the pasted body — no wrapper tags, no lead-in line", () => {
+    const body = "the actual message content, long enough for claude to wrap it";
+    const wrapped = `${AGETOR_PASTE_LEAD_IN}\n${wrapPastedContent("babe", body)}`;
+    expect(userMessageLines(wrapped)).toEqual([{ label: "you›", text: body, tone: "user" }]);
+  });
+
+  test("wrapped-only real fixture prints just the body", () => {
+    const fixture =
+      '\n\n<pasted_content id="1b6a">\nfor the first post, I need more stunning impactful first line\n\nA truly living world\n</pasted_content id="1b6a">\n';
+    expect(userMessageLines(fixture)).toEqual([
+      {
+        label: "you›",
+        text: "for the first post, I need more stunning impactful first line\n\nA truly living world",
+        tone: "user",
+      },
     ]);
   });
 });
