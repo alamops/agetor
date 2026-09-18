@@ -402,7 +402,9 @@ test.describe("terminals section is scoped per task", () => {
     expect(seeded.ok(), `POST /tasks/${task.id}/backlog -> ${seeded.status()}`).toBeTruthy();
 
     // The e2e webview is Vite's dev build, so React reports a sibling key
-    // collision on the console — assert on it as the direct symptom.
+    // collision on the console — assert on it as the direct symptom. The
+    // listener is page-wide on purpose: a collision anywhere in the app
+    // fails here, not only one inside the run panel.
     const keyWarnings: string[] = [];
     page.on("console", (msg) => {
       if (/same key/i.test(msg.text())) keyWarnings.push(msg.text());
@@ -422,9 +424,6 @@ test.describe("terminals section is scoped per task", () => {
     await expect(composer).toHaveValue("re-render me");
 
     await expect(panel.getByTestId("terminals-section")).toHaveCount(1);
-    expect(keyWarnings, "React must not report colliding sibling keys in the run panel").toEqual([]);
-
-    // Leave no unsent draft behind for later tests on this worker's backend.
-    await composer.fill("");
+    expect(keyWarnings, "React must not report colliding sibling keys anywhere in the app").toEqual([]);
   });
 });

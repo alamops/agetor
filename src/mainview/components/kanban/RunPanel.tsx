@@ -3585,9 +3585,13 @@ function RunPanelBody({
           keyed per task too. Sibling keys share one namespace, and React's
           keyed reconciliation keeps a single old fiber per key — with two
           `key={task.id}` siblings the tray's fiber shadowed this one, so
-          every re-render while the tray was mounted mounted a NEW section
-          and never deleted the old one (a growing stack of TERMINAL rows,
-          each holding a live `TerminalView`). See
+          every re-render on the reconciler's map-based slow path while the
+          tray was mounted — in practice all of them, since the normally
+          `false` `{searchOpen && …}` child above breaks the fast path —
+          mounted a NEW section and never deleted the old one (a growing
+          stack of TERMINAL rows, each holding a live `TerminalView`). The
+          rule for this fragment: every keyed child carries its component's
+          name in the key (`PlanDialog` below is the third one). See
           docs/plans/terminal-section-duplication.md. */}
       <TerminalsSection key={`terminals-${task.id}`} task={task} awaitReady={awaitStreamReady} />
 
@@ -4089,10 +4093,13 @@ function RunPanelBody({
       {/* Keyed by plan id (stable across in-place status/edit updates as
           `plans` refreshes from the poll or a mutation's returned Task) so
           the dialog's internal text/mode state resets on genuine plan
-          switches but survives its own plan being updated in place. */}
+          switches but survives its own plan being updated in place.
+          Namespaced (`plan-…`) like the other two keyed children of this
+          fragment (`TerminalsSection`, `BacklogTray`): no two children here
+          may ever share a key — see the comment on `TerminalsSection`. */}
       {openPlan && (
         <PlanDialog
-          key={openPlan.id}
+          key={`plan-${openPlan.id}`}
           task={task}
           plan={openPlan}
           agentKind={kind}

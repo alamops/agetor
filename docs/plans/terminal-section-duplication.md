@@ -23,8 +23,11 @@ are preserved.
 - `RunPanel.tsx:3582` renders `<TerminalsSection key={task.id} …/>` and
   `RunPanel.tsx:3749` renders `<BacklogTray key={task.id} …/>`. Both are
   direct children of the SAME fragment in `RunPanelBody`, and both keys were
-  introduced together in eb74ab5 (#230, shipped in v0.1.9). They are the only
-  two explicitly keyed non-list children in `src/mainview`.
+  introduced together in eb74ab5 (#230, shipped in v0.1.9). A third keyed
+  child lives in that same fragment: `<PlanDialog key={openPlan.id}>`
+  (`RunPanel.tsx:4095`). It cannot collide today — a plan id is 16 hex chars
+  of a sha256 (`src/bun/task-plans.ts:27`), never UUID-shaped — but it is the
+  same trap, found in review after the first sweep grepped only `task.id`.
 - React 19.2.8 reconciler, verified in
   `node_modules/react-dom/cjs/react-dom-client.development.js`:
   - `reconcileChildrenArray`'s fast path `break`s on the first `null`/`false`
@@ -49,8 +52,10 @@ are preserved.
 
 ## 3. Approach & key decisions
 
-Give the two children distinct, namespaced keys: `terminals-${task.id}` and
-`backlog-${task.id}`. Rests on the source reading above, proven by a
+Give the colliding children distinct, namespaced keys: `terminals-${task.id}`
+and `backlog-${task.id}`, and namespace the third keyed sibling the same way
+(`plan-${openPlan.id}`) so the fragment has one uniform rule — every keyed
+child carries its component's name. Rests on the source reading above, proven by a
 failing-then-passing e2e test. Alternatives passed on: dropping one key and
 resetting that child's state by effect (re-opens the leak #230 closed);
 wrapping each child in its own keyed Fragment (same effect, more noise).
@@ -60,8 +65,9 @@ depend on rendered uppercase text.
 
 ## 4. Work breakdown — implementation tasks
 
-- **I1** `src/mainview/components/kanban/RunPanel.tsx`: namespace both keys,
-  add the test id, extend both call-site comments with the sibling-key trap.
+- **I1** `src/mainview/components/kanban/RunPanel.tsx`: namespace all three
+  keys, add the test id, extend the call-site comments with the sibling-key
+  trap.
 - **I2** `CLAUDE.md` ("Things that will trip you up" RunPanel bullet): update
   the two key spellings and state the rule — sibling keys share one namespace,
   so never reuse a bare `task.id`.
@@ -71,8 +77,9 @@ depend on rendered uppercase text.
 - **T1** `e2e/task-switch-during-restore.spec.ts`, in the existing
   "terminals section is scoped per task" describe: start a fake claude task,
   seed a backlog draft via `POST /tasks/:id/backlog`, open the panel, force
-  re-renders (wait across several 2 s polls + toggle the message search), then
-  assert exactly one `terminals-section`, and no console message matching
+  re-renders deterministically by typing into `send-textarea` (the composer
+  draft is `RunPanelBody` state, so each keystroke re-renders it), then assert
+  exactly one `terminals-section`, and no page-wide console message matching
   `same key`. Must FAIL on the base SHA and pass after I1. The existing
   per-task-scope test in that describe keeps covering the remount semantics.
 - Unit layer: not applicable — the repo has no jsdom/testing-library; webview
@@ -103,7 +110,7 @@ with `task.id`. No server, DB, CLI or TUI surface is involved.
 | Why "random"? | Needs a saved backlog draft on the Main tab; grows per re-render | `RunPanel.tsx:3742` gate | high |
 | Must both children keep remounting per task? | Yes — #230 added the keys to stop state/socket leaks across task switches | `RunPanel.tsx` comments, plan for #230 | high |
 | Do leaked sections need server-side cleanup? | No — PTYs live bun-side by design; leaked webview sockets die with the page | `TerminalsSection` doc comment | medium |
-| Any other same-key siblings in the webview? | No — grep finds only these two non-list keys | grep over `src/mainview` | high |
+| Any other same-key siblings in the webview? | One more keyed sibling, `PlanDialog key={openPlan.id}`; no live collision, namespaced anyway. Every other `key=` is a `.map()` list key, which gets its own implicit fragment | review sweep of `src/mainview` | high |
 | Should every e2e spec fail on React key warnings? | Not in this run — separate hardening ticket with its own flake risk | judgment (narrower option) | medium |
 | Any one-way decision? | None | — | high |
 
@@ -112,6 +119,7 @@ with `task.id`. No server, DB, CLI or TUI surface is involved.
 | Candidate remainder | Disposition |
 | --- | --- |
 | Both colliding keys renamed, not just one | in this run — I1 |
+| Third keyed sibling `PlanDialog` left on a bare id (review finding) | in this run — I1 |
 | Regression test that seeds a draft (the gap that hid the bug) | in this run — T1 |
 | CLAUDE.md still documents the bare `key={task.id}` spellings | in this run — I2 |
 | Historical plan docs quoting the old keys | out of scope — point-in-time records of #230 |
