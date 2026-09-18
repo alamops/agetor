@@ -532,7 +532,11 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
     // fixed guess — see `waitForLog`'s doc for why a flat sleep here is the
     // documented flake class now that every tmux op is a real fork+exec
     // running alongside other concurrent pollers (death-watch, boot-wait).
-    await waitForLog(logPath, "send-keys");
+    // The token is the Enter itself, not a bare `send-keys`: the bracketed
+    // paste now types agetor's lead-in with `send-keys -l … / C-j` BEFORE
+    // `load-buffer` (docs/plans/pasted-content-tags.md), so the first
+    // `send-keys` no longer marks the end of the chain.
+    await waitForLog(logPath, "Enter");
 
     const entries = readLog(logPath);
 

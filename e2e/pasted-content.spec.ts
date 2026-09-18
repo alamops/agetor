@@ -63,12 +63,12 @@ async function openTask(page: Page, title: string) {
   return panel;
 }
 
-/** UserMessageBlock's own root is the nearest `rounded-2xl` ancestor. */
+/** UserMessageBlock's own root (`rounded-2xl rounded-br-md`, RunPanel.tsx),
+ *  picked by class rather than by walking up from a text match: the raw
+ *  prompt also lives in the collapsed Task-details editor and in the fake
+ *  driver's "fake response to: …" reply, and neither sits inside a bubble. */
 function bubbleOf(panel: ReturnType<typeof runPanel>, text: string) {
-  return panel
-    .getByText(text, { exact: false })
-    .first()
-    .locator("xpath=ancestor::div[contains(@class,'rounded-2xl')][1]");
+  return panel.locator("div.rounded-2xl.rounded-br-md").filter({ hasText: text }).first();
 }
 
 test.describe("pasted_content wrapper", () => {
