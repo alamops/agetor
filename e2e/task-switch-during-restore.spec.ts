@@ -317,23 +317,14 @@ test.describe("task details stay responsive while another task's session restore
 });
 
 test.describe("terminals section is scoped per task", () => {
-  /** The `<details>`/`<summary>` disclosure `TerminalsSection` renders
-   *  (RunPanel.tsx) — no dedicated test id. Root-caused live (via a debug
-   *  dump of `allInnerTexts()`): the summary's text renders through a
-   *  `uppercase` Tailwind class, and Playwright's text-matching reads the
-   *  RENDERED text — i.e. "TERMINAL", not the DOM's literal "Terminal" — so
-   *  a case-sensitive match against "Terminal" never matches. A direct
-   *  case-insensitive substring `hasText` filter on the `<details>` itself
-   *  (not a `.filter({ has: <nested summary locator> })` combinator, which
-   *  — even fixed for case — never actually matched live here, for reasons
-   *  that didn't repay further digging) is what reliably works: `hasText`
-   *  matches an element's full descendant-inclusive text, so `/terminal/i`
-   *  finds the one `<details>` whose `<summary>` text is "Terminal" without
-   *  anchoring — the only other disclosure in the panel is "Task details",
-   *  whose text never contains "terminal" as a substring, and the test's
-   *  own task titles are chosen (below) to avoid containing it too. */
+  /** The `<details>` disclosure `TerminalsSection` renders (RunPanel.tsx),
+   *  addressed by its `terminals-section` test id. Don't go back to matching
+   *  the summary text: it renders through an `uppercase` Tailwind class and
+   *  Playwright matches RENDERED text ("TERMINAL"), so a case-sensitive
+   *  "Terminal" never matches. The locator is strict, so it also fails
+   *  loudly if the section is ever duplicated. */
   function terminalsDetails(panel: Locator): Locator {
-    return panel.locator("details").filter({ hasText: /terminal/i });
+    return panel.getByTestId("terminals-section");
   }
 
   async function isTerminalsOpen(panel: Locator): Promise<boolean> {
@@ -385,5 +376,55 @@ test.describe("terminals section is scoped per task", () => {
       await isTerminalsOpen(panel),
       "D's terminals section is collapsed again on return — its earlier manual expand did not survive the remount",
     ).toBe(false);
+  });
+
+  test("a task with a saved backlog draft still renders exactly one terminals section across re-renders", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    // Regression: `TerminalsSection` and `BacklogTray` are siblings in
+    // `RunPanelBody`'s children list and both used to carry a bare
+    // `key={task.id}`. React's keyed reconciliation keeps ONE old fiber per
+    // key, so whenever the tray was mounted every panel re-render mounted a
+    // fresh `TerminalsSection` and never deleted the old one — the owner saw
+    // a growing stack of collapsed TERMINAL rows. The tray only mounts when
+    // the task has a saved draft, which is why the test above (no draft)
+    // never caught it. See docs/plans/terminal-section-duplication.md.
+    const title = `panel-dup-f-${randomUUID()}`;
+    const task = await createAndStartFakeClaudeTask(request, backend, title);
+    await waitForColumn(request, backend, task.id, "review", 10_000);
+
+    const seeded = await request.post(`${backend.apiBase}/tasks/${task.id}/backlog`, {
+      headers: authHeaders(backend),
+      data: { text: "draft that mounts the backlog tray" },
+    });
+    expect(seeded.ok(), `POST /tasks/${task.id}/backlog -> ${seeded.status()}`).toBeTruthy();
+
+    // The e2e webview is Vite's dev build, so React reports a sibling key
+    // collision on the console — assert on it as the direct symptom.
+    const keyWarnings: string[] = [];
+    page.on("console", (msg) => {
+      if (/same key/i.test(msg.text())) keyWarnings.push(msg.text());
+    });
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await expect(panel.getByText("draft that mounts the backlog tray")).toBeVisible();
+    await expect(panel.getByTestId("terminals-section")).toHaveCount(1);
+
+    // Every keystroke updates the composer draft held in `RunPanelBody`,
+    // i.e. one parent re-render each — 12 re-renders leaked 12 extra
+    // sections before the fix.
+    const composer = panel.getByTestId("send-textarea");
+    await composer.click();
+    await page.keyboard.type("re-render me", { delay: 20 });
+    await expect(composer).toHaveValue("re-render me");
+
+    await expect(panel.getByTestId("terminals-section")).toHaveCount(1);
+    expect(keyWarnings, "React must not report colliding sibling keys in the run panel").toEqual([]);
+
+    // Leave no unsent draft behind for later tests on this worker's backend.
+    await composer.fill("");
   });
 });
