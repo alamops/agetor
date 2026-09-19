@@ -13,6 +13,7 @@ import {
   searchableEventText,
   stepMatchIndex,
 } from "./event-search.ts";
+import { AGETOR_PASTE_LEAD_IN } from "../../shared/user-message.ts";
 
 type Ev = { stream: RunEventStream; data: string };
 
@@ -358,4 +359,31 @@ test("resolveActiveMatchIndex: prevActiveId still present keeps pointing at its 
 
 test("resolveActiveMatchIndex: prevActiveId no longer present defaults to the first match (position 0)", () => {
   expect(resolveActiveMatchIndex([5, 8, 12], 999)).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// user events match their DISPLAYED text (docs/plans/pasted-content-tags.md)
+// ---------------------------------------------------------------------------
+
+const PASTED_TWIN =
+  `${AGETOR_PASTE_LEAD_IN}\n\n\n<pasted_content id="0a7d">\nplease rename the billing module\n</pasted_content id="0a7d">\n`;
+
+test("searchableEventText: a pasted user twin is reduced to the body the bubble shows", () => {
+  expect(searchableEventText("user", PASTED_TWIN)).toBe("please rename the billing module");
+  // Bare-CR body newlines (tmux paste-buffer artifact) are normalized like the bubble does.
+  expect(searchableEventText("user", `\n\n<pasted_content id="1b6a">\nline one\rline two\n</pasted_content id="1b6a">\n`))
+    .toBe("line one\nline two");
+});
+
+test("findMatchingEventIds: wrapper markup and the lead-in never match; the body does, at its own index", () => {
+  const events = [ev("assistant", "earlier reply"), ev("user", PASTED_TWIN), ev("assistant", "done")];
+  expect(findMatchingEventIds(events, "pasted_content")).toBe(NO_MATCHES);
+  expect(findMatchingEventIds(events, "0a7d")).toBe(NO_MATCHES);
+  expect(findMatchingEventIds(events, "sent from Agetor")).toBe(NO_MATCHES);
+  expect(findMatchingEventIds(events, "billing module")).toEqual([1]);
+});
+
+test("findMatchingEventIds: only the USER stream is normalized — an assistant quoting the wrapper still matches", () => {
+  const events = [ev("assistant", "claude wraps pastes in <pasted_content id=\"0a7d\"> tags")];
+  expect(findMatchingEventIds(events, "pasted_content")).toEqual([0]);
 });

@@ -12,6 +12,7 @@
 // `data-evid` DOM attribute is keyed on too.
 import { isInternalStatusSentinel, type RunEventStream } from "../../shared/types.ts";
 import { isImageSourceMetaBreadcrumb } from "../../shared/attachments.ts";
+import { normalizeDeliveredUserText } from "../../shared/user-message.ts";
 
 /** Best-effort JSON.parse that never throws — malformed/partial JSON (e.g. a
  *  tool input truncated by an older agetor mapper) falls back to `null`
@@ -91,6 +92,13 @@ export function searchableEventText(stream: RunEventStream, data: string): strin
       if (isInternalStatusSentinel(data)) return null;
       return data;
     case "user":
+      // Match what the bubble SHOWS, not the raw wire text: `UserMessageBlock`
+      // strips agetor's typed paste lead-in and unwraps claude's
+      // `<pasted_content id="…">` wrapper (docs/plans/pasted-content-tags.md),
+      // so a raw match on `pasted_content` or the lead-in phrase would jump to
+      // a bubble containing neither. Same CR→LF-then-normalize order the
+      // bubble uses; same string back when there is nothing to strip.
+      return normalizeDeliveredUserText(data.replace(/\r\n?/g, "\n"));
     case "assistant":
     case "thinking":
     case "stderr":

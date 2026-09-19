@@ -1754,9 +1754,8 @@ function RunPanelBody({
    *  the wrong end of the transcript. */
   // `collapseRepeatedStatusChips` MUST run here — not inside `RunEventList`'s
   // `normalised` memo — because `findMatchingEventIds` below derives each
-  // match's id from an event's own position in `displayedEvents` (via the
-  // position-preserving `searchableEvents` map further down), and that same
-  // array (uncollapsed) is what supplied the `data-evid` index at render
+  // match's id from an event's own position in `displayedEvents`, and that
+  // same array (uncollapsed) is what supplied the `data-evid` index at render
   // time. Collapsing downstream of this memo would shorten the rendered
   // array while search still matched against the longer, uncollapsed one,
   // scrolling/highlighting the wrong block whenever history has duplicate
@@ -1776,36 +1775,15 @@ function RunPanelBody({
    *  recomputed on every SSE frame, so it must stay a single O(n) pass. */
   const todoProgress = useMemo(() => deriveTodoProgress(displayedEvents), [displayedEvents]);
 
-  // `findMatchingEventIds` (lib/event-search.ts) matches a `user` event's raw
-  // `data` verbatim — but the rendered bubble (`UserMessageBlock` above)
-  // normalizes that text first (strips agetor's paste lead-in, unwraps
-  // claude's `<pasted_content>` wrapper — see docs/plans/pasted-content-tags.md
-  // D2). Searching the raw text would let a query for e.g. `pasted_content`
-  // or the lead-in phrase match an event whose rendered bubble contains
-  // neither substring, jumping the log to a block with nothing to show for
-  // the match. `searchableEvents` is `displayedEvents` with each `user`
-  // event's `data` normalized the same way — same length and order, so the
-  // positional ids `findMatchingEventIds`/`data-evid` rely on are unaffected;
-  // every other stream is passed through untouched.
-  // Skipped while the query is blank: `findMatchingEventIds` early-returns
-  // then, and `displayedEvents` changes on every SSE frame — no point
-  // re-mapping thousands of events for a closed search bar.
-  const searchActive = searchQuery.trim() !== "";
-  const searchableEvents = useMemo(
-    () =>
-      !searchActive
-        ? displayedEvents
-        : displayedEvents.map((e) =>
-            e.stream === "user"
-              ? { ...e, data: normalizeDeliveredUserText((e.data ?? "").replace(/\r\n?/g, "\n")) }
-              : e,
-          ),
-    [displayedEvents, searchActive],
-  );
-
+  // `findMatchingEventIds` (lib/event-search.ts) takes `displayedEvents`
+  // straight — it derives each event's search id from its own position in
+  // the array, so there's no separate pre-mapped/id-tagged array to build
+  // or memoize here. (It matches a `user` event against its NORMALIZED text —
+  // lead-in stripped, `<pasted_content>` unwrapped — i.e. what the bubble
+  // actually shows; see `searchableEventText`.)
   const matches = useMemo(
-    () => findMatchingEventIds(searchableEvents, searchQuery),
-    [searchableEvents, searchQuery],
+    () => findMatchingEventIds(displayedEvents, searchQuery),
+    [displayedEvents, searchQuery],
   );
 
   // Derived purely for display — no state, so there's no "0/0" flash before

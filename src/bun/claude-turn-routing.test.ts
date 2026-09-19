@@ -3,6 +3,9 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+// Pure shared module (no db/env side effects), so a static import is safe here
+// unlike the `./db.ts`-dependent modules below.
+import { AGETOR_PASTE_LEAD_IN } from "../shared/user-message.ts";
 
 // Regression tests for the liveness-aware follow-up gate added to
 // orchestrator.ts's `sendClaudeTurn` (see docs/plans/tmux-sessions-killed-
@@ -552,6 +555,18 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
     const loadBufferEntries = entries.filter((e) => e.argv.includes("load-buffer"));
     expect(loadBufferEntries.length).toBeGreaterThan(0);
     expect(loadBufferEntries.some((e) => e.stdin === largePrompt)).toBe(true);
+
+    // The deferred first-prompt paste is a user message like any other, so it
+    // gets agetor's typed lead-in too (docs/plans/pasted-content-tags.md) —
+    // `send-keys -l <lead-in>` then `C-j`, both BEFORE the body's load-buffer;
+    // without it claude would treat the whole >4KB prompt as lower-trust
+    // pasted text.
+    const idxLeadIn = entries.findIndex((e) => e.argv.includes("-l") && e.argv.includes(AGETOR_PASTE_LEAD_IN));
+    const idxNewline = entries.findIndex((e) => e.argv.includes("send-keys") && e.argv.includes("C-j"));
+    const idxLoad = entries.findIndex((e) => e.argv.includes("load-buffer"));
+    expect(idxLeadIn).toBeGreaterThanOrEqual(0);
+    expect(idxNewline).toBeGreaterThan(idxLeadIn);
+    expect(idxLoad).toBeGreaterThan(idxNewline);
 
     // ...followed by a paste-buffer + Enter to actually submit it.
     const pasteBufferEntries = entries.filter((e) => e.argv.includes("paste-buffer"));
