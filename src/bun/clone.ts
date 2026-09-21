@@ -62,6 +62,28 @@ function sshAliasHint(rawHost: string, fullPath: string): string {
 }
 
 /**
+ * Guards the port on an https-form input that resolves to one of the three
+ * CLOUD hosts (`github.com`, `gitlab.com`, `bitbucket.org`) — self-hosted
+ * GitLab is exempt and keeps whatever port was pasted (see the self-hosted
+ * branch below). None of the three clouds serve from a non-default port, so
+ * a pasted port is only ever noise from the scheme's own default (`443` for
+ * `https`, `80` for `http`), silently dropped from the canonical URL; any
+ * other value names a real, different endpoint and is rejected outright
+ * rather than silently cloning from the wrong place. Returns the rejection
+ * error string, or `null` when there's nothing to reject.
+ */
+function rejectedCloudPort(
+  port: string | null,
+  scheme: "https" | "http" | null,
+  cloudHost: string,
+): string | null {
+  if (!port) return null;
+  const defaultPort = (scheme ?? "https") === "http" ? "80" : "443";
+  if (port === defaultPort) return null;
+  return `unexpected port :${port} for ${cloudHost}`;
+}
+
+/**
  * Layers the Git integration's real host-resolution rules
  * (docs/plans/clone-repository-all-providers.md §3 D2/D3) on top of the
  * shared syntactic parser (`parseCloneInput`). `shorthandProvider` is only
@@ -77,13 +99,25 @@ function sshAliasHint(rawHost: string, fullPath: string): string {
  *    instead (nothing to reject-with-detail, since ssh told us nothing).
  *  - **GitLab**: cloud (`gitlab.com`) clones as usual; a genuinely
  *    self-hosted instance (a dotted, non-`gitlab.com` resolution) keeps
- *    whatever scheme/host/port was pasted — self-hosted GitLab is
- *    first-class in the integration (`gitlabApiBase`), unlike GHES.
+ *    whatever scheme/port was pasted, but the HOST component is rewritten to
+ *    `ssh -G`'s resolution whenever that actively resolved an `~/.ssh/config`
+ *    alias to a different dotted host — mirroring the GitHub/Bitbucket
+ *    cloud-host rewrite above, since an alias like `gitlab-work` is never
+ *    itself a reachable https endpoint. `rawHost` (the token-store key)
+ *    always stays the host as pasted, so a stored per-alias credential still
+ *    resolves — self-hosted GitLab is first-class in the integration
+ *    (`gitlabApiBase`), unlike GHES.
  *  - **Bitbucket**: `bitbucketServerError` (the same guard every Bitbucket
  *    adapter call runs) rejects a genuine Server/Data Center domain up
  *    front; what's left after that guard passes is either `bitbucket.org`
  *    itself or a dotless alias, which gets the SSH hint (Bitbucket Cloud is
  *    the only https target this module knows how to build).
+ *
+ * A pasted port is only ever meaningful for self-hosted GitLab — every https
+ * clone that resolves to one of the three CLOUD hosts rejects any port other
+ * than the scheme's own default (`rejectedCloudPort`), since none of them
+ * serve from a non-default port and silently accepting one would clone from
+ * an endpoint the user didn't actually name.
  *
  * SSH-transport inputs (`scp`/`ssh-url` forms) skip host resolution
  * entirely for GitHub/GitLab (the integration has no ssh-side guard either —
@@ -159,6 +193,8 @@ export function resolveCloneRepo(
         error: `GitHub Enterprise Server ("${resolved}") isn't supported over https — only github.com. ${CLONE_SUPPORTED_HINT}`,
       };
     }
+    const githubPortError = rejectedCloudPort(v.port, v.scheme, "github.com");
+    if (githubPortError) return { ok: false, error: githubPortError };
     return {
       ok: true,
       repo: {
@@ -175,6 +211,8 @@ export function resolveCloneRepo(
 
   if (v.provider === "gitlab") {
     if (resolved === "gitlab.com") {
+      const gitlabPortError = rejectedCloudPort(v.port, v.scheme, "gitlab.com");
+      if (gitlabPortError) return { ok: false, error: gitlabPortError };
       return {
         ok: true,
         repo: {
@@ -189,10 +227,19 @@ export function resolveCloneRepo(
       };
     }
     if (!resolved.includes(".")) return { ok: false, error: sshAliasHint(rawHost, v.fullPath) };
-    // Self-hosted GitLab: keep whatever scheme/host/port was pasted. A
-    // plain `http://` clone never gets a credential attached — sending a
-    // token over an unencrypted origin would put it on the wire in the
-    // clear.
+    // Self-hosted GitLab: keep whatever scheme/port was pasted (never
+    // guarded the way the three cloud hosts are above — a self-hosted
+    // instance can legitimately run on any port). The HOST component,
+    // though, is `resolved` rather than `rawHost` whenever `ssh -G` actively
+    // rewrote it (an `~/.ssh/config` alias like `gitlab-work` resolving to
+    // `gitlab.internal.example.com`) — `rawHost` itself is never a reachable
+    // https endpoint in that case, exactly like the github/bitbucket
+    // cloud-host rewrites above. When there was no alias to resolve,
+    // `resolved === rawHost` (mod casing) and this is a no-op. `rawHost`
+    // stays the token-store key regardless, so a credential stored for the
+    // real host under `rawHost`'s alias still resolves. A plain `http://`
+    // clone never gets a credential attached — sending a token over an
+    // unencrypted origin would put it on the wire in the clear.
     const scheme = v.scheme ?? "https";
     const portSuffix = v.port ? `:${v.port}` : "";
     return {
@@ -203,8 +250,8 @@ export function resolveCloneRepo(
         rawHost,
         repo: v.repo,
         fullPath: v.fullPath,
-        cloneUrl: `${scheme}://${rawHost}${portSuffix}/${v.fullPath}.git`,
-        authOrigin: scheme === "https" ? `https://${rawHost}${portSuffix}/` : null,
+        cloneUrl: `${scheme}://${resolved}${portSuffix}/${v.fullPath}.git`,
+        authOrigin: scheme === "https" ? `https://${resolved}${portSuffix}/` : null,
       },
     };
   }
@@ -223,6 +270,8 @@ export function resolveCloneRepo(
     // so the only way to land here is a dotless, unresolved alias.
     return { ok: false, error: sshAliasHint(rawHost, v.fullPath) };
   }
+  const bitbucketPortError = rejectedCloudPort(v.port, v.scheme, "bitbucket.org");
+  if (bitbucketPortError) return { ok: false, error: bitbucketPortError };
   return {
     ok: true,
     repo: {
@@ -337,28 +386,31 @@ export function cloneAuthEnv(
 }
 
 /**
- * Maps git/ssh's LAST stderr line (matched under `LC_ALL=C`, so these
- * patterns hold regardless of the user's locale) to actionable, user-facing
- * copy — always keeping the original line first, then a hint sentence.
- * `ctx.usedToken`/`ctx.tokenAvailable` distinguish "no credential exists for
- * this host" from "the credential that exists was rejected", so the hint
- * always points at the right next step. Pure and exported for unit testing;
- * never throws. Falls through to the original line, unchanged, for anything
- * it doesn't recognize.
+ * Whether git/ssh's LAST stderr line (matched under `LC_ALL=C`, so these
+ * patterns hold regardless of the user's locale) *looks like* the clone
+ * failed for an authentication/authorization reason, as opposed to a local
+ * or network problem (bad local path, DNS failure, disk full, a genuinely
+ * missing binary, …). This is the ONE gate that decides whether it's worth
+ * resolving and retrying with a credential — used both by `cloneRepo` (to
+ * decide whether to call `opts.auth()` at all) and by `explainCloneFailure`
+ * (to decide which hint to show) so the two can never drift apart: a
+ * failure `cloneRepo` didn't consider worth a token retry can never later be
+ * explained as if a token retry happened, and vice versa. Pure, exported for
+ * unit testing, never throws.
+ *
+ * Patterns: git's own "no credential helper answered" lines (`could not read
+ * Username`/`Password`, `terminal prompts disabled`), an explicit auth
+ * rejection (`Authentication failed`, `access denied` — covers GitLab's `HTTP
+ * Basic: Access denied` verbatim), a repository the credential in hand
+ * can't see (`repository … not found` / `Repository not found` — providers
+ * deliberately 404 a private repo to an unauthorized caller rather than
+ * confirming it exists), and the raw HTTP status codes that mean the same
+ * thing (`401`/`403`/`404`).
  */
-export function explainCloneFailure(
-  stderrLine: string,
-  ctx: { transport: "https" | "ssh"; host: string; usedToken: boolean; tokenAvailable: boolean },
-): string {
-  const { host, usedToken, tokenAvailable } = ctx;
-
-  const authHint = (): string =>
-    tokenAvailable
-      ? `The stored token for ${host} was rejected — check it in Settings → Git host tokens.`
-      : `If this is a private repository, add a token for ${host} in Settings → Git host tokens, or paste the SSH URL.`;
-
-  if (
+export function isAuthShapedCloneFailure(stderrLine: string): boolean {
+  return (
     /could not read Username/i.test(stderrLine) ||
+    /could not read Password/i.test(stderrLine) ||
     /Authentication failed/i.test(stderrLine) ||
     /terminal prompts disabled/i.test(stderrLine) ||
     // Covers both GitHub's `remote: Repository not found.` line and the
@@ -367,9 +419,44 @@ export function explainCloneFailure(
     // words, so a literal "repository not found" substring match would miss
     // the fatal line.
     /repository.*not found/i.test(stderrLine) ||
-    /returned error: (401|403)\b/.test(stderrLine)
-  ) {
-    return `${stderrLine} — ${authHint()}`;
+    /returned error: (401|403|404)\b/.test(stderrLine) ||
+    // GitLab's own wording for an authenticated-but-unauthorized request;
+    // `access denied` alone (case-insensitive) already matches it, kept as
+    // one general pattern rather than two redundant ones.
+    /access denied/i.test(stderrLine)
+  );
+}
+
+/**
+ * Maps git/ssh's LAST stderr line (matched under `LC_ALL=C`, so these
+ * patterns hold regardless of the user's locale) to actionable, user-facing
+ * copy — always keeping the original line first, then a hint sentence. Pure
+ * and exported for unit testing; never throws. Falls through to the original
+ * line, unchanged, for anything it doesn't recognize.
+ *
+ * `ctx.usedToken` distinguishes "no credential attempt ran at all" (no
+ * resolver was given, or it resolved to nothing) from "the credential that
+ * was tried got rejected too", so the hint always points at the right next
+ * step. `ctx.transport` matters because the token hints are https-only — an
+ * ssh clone never has a stored token to blame or offer (`resolveCloneRepo`
+ * never hands out an `authOrigin` for ssh), so an auth-shaped ssh failure
+ * gets an SSH-key hint instead, and the DNS-failure hint's phrasing/next-step
+ * differs by transport too.
+ */
+export function explainCloneFailure(
+  stderrLine: string,
+  ctx: { transport: "https" | "ssh"; host: string; usedToken: boolean },
+): string {
+  const { host, usedToken, transport } = ctx;
+
+  if (isAuthShapedCloneFailure(stderrLine)) {
+    if (transport === "ssh") {
+      return `${stderrLine} — Your SSH key doesn't have access to this repository on ${host}, or the path is wrong — check the key loaded in your agent (ssh-add -l) and the repository path.`;
+    }
+    const authHint = usedToken
+      ? `The stored credential for ${host} was rejected or doesn't grant access to this repository — check it in Settings → Git host tokens, and check the repository path.`
+      : `If this is a private repository, add a token for ${host} in Settings → Git host tokens, or paste the SSH URL.`;
+    return `${stderrLine} — ${authHint}`;
   }
 
   const movedMatch = stderrLine.match(/returned error: (301|302|307|308)\b/);
@@ -387,8 +474,17 @@ export function explainCloneFailure(
     return `${stderrLine} — No SSH key was accepted for ${host} — load your key (ssh-add) or paste the https URL instead.`;
   }
 
-  if (/Could not resolve hostname/i.test(stderrLine)) {
-    return `${stderrLine} — "${host}" didn't resolve — if it's an SSH alias, check ~/.ssh/config.`;
+  // Widened beyond ssh's own "Could not resolve hostname" to also cover
+  // git's http backend, which reports a DNS failure as "Could not resolve
+  // host: <name>" (curl's wording) instead.
+  if (/Could not resolve host(name)?/i.test(stderrLine)) {
+    if (transport === "ssh") {
+      return `${stderrLine} — "${host}" didn't resolve — if it's an SSH alias, check ~/.ssh/config.`;
+    }
+    const dotless = host.length > 0 && !host.includes(".");
+    return `${stderrLine} — "${host}" didn't resolve — check the host name${
+      dotless ? " (an SSH alias only works with the SSH URL)" : ""
+    }.`;
   }
 
   return stderrLine;
@@ -410,11 +506,31 @@ export interface CloneResult {
 /** Clones are network-bound and can legitimately take minutes on big repos. */
 const CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** Retry floor (docs/plans/clone-repository-all-providers.md §3 D4). Once
+ *  less than this remains of the shared `timeoutMs` budget after attempt 1,
+ *  there isn't enough time left for a meaningful attempt 2 (git needs at
+ *  least long enough to open a connection and get a first response), so
+ *  `cloneRepo` skips the retry outright and reports a timeout instead of
+ *  spawning a second `git clone` that has no realistic chance to finish. */
+const RETRY_MIN_TIMEOUT_MS = 5_000;
+
 export interface CloneOptions {
+  /** The TOTAL wall-time budget for `cloneRepo`, shared across BOTH the
+   *  anonymous attempt and the token retry (default `CLONE_TIMEOUT_MS`, 10
+   *  minutes) — not a per-attempt timeout. Attempt 2 (if it runs at all)
+   *  gets whatever remains after attempt 1, floored by `RETRY_MIN_TIMEOUT_MS`
+   *  below which the retry is skipped and the failure is reported as a
+   *  timeout. `cloneRepo`'s own wall time is therefore bounded by
+   *  `timeoutMs` plus the (separately, already-bounded) time `opts.auth()`
+   *  itself takes to resolve — callers with their own outer timeout (the
+   *  CLI's 15-minute client timeout) must budget for both. */
   timeoutMs?: number;
-  /** Resolves the header line to retry with after an anonymous clone fails.
-   *  Never called on an anonymous SUCCESS. A rejection is swallowed (treated
-   *  as "no credential available") — see `cloneRepo`'s call site. */
+  /** Resolves the header line to retry with after an anonymous clone fails
+   *  for what looks like an auth/authorization reason (see
+   *  `isAuthShapedCloneFailure`) — never called for any other failure
+   *  shape, and never called on an anonymous SUCCESS. A rejection is
+   *  swallowed (treated as "no credential available") — see `cloneRepo`'s
+   *  call site. */
   auth?: () => Promise<CloneAuth | null>;
   /** Only used to build `explainCloneFailure`'s context on the final
    *  failure — has no effect on how the clone itself runs. */
@@ -427,10 +543,11 @@ export interface CloneOptions {
  *  them is `extraEnv`. Sets `GIT_TERMINAL_PROMPT=0` (never hang on a
  *  credential prompt agetor can't answer) and `LC_ALL=C` (so
  *  `explainCloneFailure`'s patterns match regardless of the user's locale).
- *  When neither `GIT_SSH_COMMAND` (env) nor `core.sshCommand` (git config) is
- *  already set, also sets `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` so an ssh
- *  clone can't hang on a host-key or passphrase prompt either — a user who
- *  already configured their own ssh command is left alone. */
+ *  When neither `GIT_SSH_COMMAND` (env) nor `core.sshCommand` (git config,
+ *  `--global`/`--system` scope only — see below) is already set, also sets
+ *  `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` so an ssh clone can't hang on a
+ *  host-key or passphrase prompt either — a user who already configured
+ *  their own ssh command is left alone. */
 async function runGitClone(
   source: string,
   dest: string,
@@ -444,8 +561,21 @@ async function runGitClone(
     ...extraEnv,
   };
   if (!process.env.GIT_SSH_COMMAND) {
-    const coreSshCommand = await run(["git", "config", "--get", "core.sshCommand"], undefined, 2_000);
-    if (!coreSshCommand.ok || !coreSshCommand.stdout) {
+    // Deliberately `--global`/`--system` only, NOT the scopeless `git config
+    // --get` this used to run: unscoped resolution also reads `--local`
+    // config off whatever repo happens to be at the daemon's cwd — a repo
+    // that has nothing to do with the one being cloned into `dest` (which
+    // doesn't exist as a git repo yet anyway). A user's own ssh setup lives
+    // at the global/system scope; probed concurrently since they're
+    // independent reads, each bounded by its own timeout exactly as before.
+    const [globalSshCommand, systemSshCommand] = await Promise.all([
+      run(["git", "config", "--global", "--get", "core.sshCommand"], undefined, 2_000),
+      run(["git", "config", "--system", "--get", "core.sshCommand"], undefined, 2_000),
+    ]);
+    const hasConfiguredSshCommand =
+      (globalSshCommand.ok && !!globalSshCommand.stdout) ||
+      (systemSshCommand.ok && !!systemSshCommand.stdout);
+    if (!hasConfiguredSshCommand) {
       env.GIT_SSH_COMMAND = "ssh -o BatchMode=yes";
     }
   }
@@ -470,39 +600,14 @@ async function runGitClone(
   }
 }
 
-/**
- * `git clone -- <url> <dest>`, with an anonymous-first / token-on-failure
- * retry (docs/plans/clone-repository-all-providers.md §3 D4). Never throws —
- * callers inspect `ok`/`error`.
- *
- * Refuses an existing non-empty destination up-front (git would too, but this
- * gives a clean message instead of git's stderr).
- *
- * Attempt 1 runs anonymously, exactly like a plain `git clone`. If it fails,
- * did NOT time out, and `opts.auth` is given, `opts.auth()` is awaited
- * (rejections swallowed to `null` — a credential-resolution hiccup should
- * degrade to "no credential", not blow up the clone) and, if it yields a
- * `CloneAuth`, attempt 2 re-runs with `cloneAuthEnv`'s additive
- * `GIT_CONFIG_*` env layered on top. The anonymous-success path never calls
- * `opts.auth` at all — a token must never be sent for a clone that already
- * worked without one (a public repo, or a private one already trusted via
- * the user's ambient git credential helper).
- *
- * Git itself cleans up between attempts: on a failed clone it removes any
- * destination directory IT created, and leaves a pre-existing empty
- * destination directory (the retry's `dest`) empty rather than partially
- * populated — verified locally against a failing clone (git 2.54) — so no
- * cleanup step is needed between attempt 1 and attempt 2 here.
- *
- * The final error always reflects the LAST attempt's stderr, run through
- * `explainCloneFailure` with `usedToken`/`tokenAvailable` set from whether a
- * retry actually happened.
- */
-export async function cloneRepo(
-  cloneUrl: string,
-  dest: string,
-  opts: CloneOptions = {},
-): Promise<CloneResult> {
+/** Refuses an existing non-empty destination (git would too, but this gives
+ *  a clean message instead of git's stderr); creates the destination's
+ *  parent directory otherwise. Shared by `cloneRepo`'s pre-attempt-1 check
+ *  and its pre-attempt-2 recheck (docs/plans/clone-repository-all-providers.md
+ *  §3 D4) — the second call is a no-op in the common case (git already left
+ *  `dest` exactly as this function would), and only matters when something
+ *  external changed `dest` between the two attempts. */
+function checkCloneDestination(dest: string): CloneResult {
   if (existsSync(dest)) {
     let empty = false;
     try {
@@ -511,49 +616,123 @@ export async function cloneRepo(
       return { ok: false, error: `destination is not a readable directory: ${dest}` };
     }
     if (!empty) return { ok: false, error: `destination already exists and is not empty: ${dest}` };
-  } else {
-    try {
-      mkdirSync(path.dirname(dest), { recursive: true });
-    } catch (err) {
-      return { ok: false, error: `cannot create parent directory: ${String(err)}` };
-    }
+    return { ok: true };
   }
+  try {
+    mkdirSync(path.dirname(dest), { recursive: true });
+  } catch (err) {
+    return { ok: false, error: `cannot create parent directory: ${String(err)}` };
+  }
+  return { ok: true };
+}
+
+/**
+ * `git clone -- <url> <dest>`, with an anonymous-first / token-on-failure
+ * retry (docs/plans/clone-repository-all-providers.md §3 D4). Never throws —
+ * callers inspect `ok`/`error`.
+ *
+ * Refuses an existing non-empty destination up-front via
+ * `checkCloneDestination` (git would too, but this gives a clean message
+ * instead of git's stderr).
+ *
+ * Attempt 1 runs anonymously, exactly like a plain `git clone`, against the
+ * FULL `timeoutMs` budget. If it fails and did NOT time out, the retry only
+ * happens when BOTH `opts.auth` is given AND the failure actually LOOKS
+ * auth-shaped (`isAuthShapedCloneFailure` on attempt 1's stderr line) — a
+ * non-auth failure (bad local path, DNS failure, disk full, …) never calls
+ * `opts.auth` and never shells out to whatever credential helper it uses
+ * (`gh`/`glab`/…). When the gate passes: `timeoutMs` is a budget SHARED by
+ * both attempts, not per-attempt — attempt 2 gets only what's left after
+ * attempt 1 (`Date.now()`-measured), floored by `RETRY_MIN_TIMEOUT_MS`; below
+ * that floor there isn't enough time left for a meaningful second attempt,
+ * so the retry is skipped entirely (no `opts.auth()` call either) and the
+ * failure is reported as a timeout. Otherwise `checkCloneDestination` is
+ * re-run first (in case attempt 1, or something external, left `dest` in a
+ * state a second `git clone` shouldn't run into — see below); if that fails,
+ * attempt 1's own failure is what gets reported (via `explainCloneFailure`,
+ * `usedToken: false` — no token attempt actually ran), not a destination
+ * error, since attempt 1's failure is the more useful thing to tell the
+ * user about. Only once both checks pass is `opts.auth()` awaited
+ * (rejections swallowed to `null` — a credential-resolution hiccup should
+ * degrade to "no credential", not blow up the clone); if it yields a
+ * `CloneAuth`, attempt 2 re-runs with `cloneAuthEnv`'s additive
+ * `GIT_CONFIG_*` env layered on top, budgeted with whatever time remained.
+ * The anonymous-success path never calls `opts.auth` at all — a token must
+ * never be sent for a clone that already worked without one (a public repo,
+ * or a private one already trusted via the user's ambient git credential
+ * helper).
+ *
+ * `cloneRepo`'s own wall time is therefore bounded by `opts.timeoutMs` (or
+ * `CLONE_TIMEOUT_MS`, 10 minutes, by default) plus whatever `opts.auth()`
+ * itself takes to resolve (already independently bounded by its own
+ * resolver) — a caller with its own outer deadline (the CLI's 15-minute
+ * client timeout) must budget for both.
+ *
+ * Git itself cleans up between attempts: on a failed clone it removes any
+ * destination directory IT created, and leaves a pre-existing empty
+ * destination directory (the retry's `dest`) empty rather than partially
+ * populated — verified locally against a failing clone (git 2.54) — which is
+ * why the pre-attempt-2 recheck above is normally a no-op and only earns its
+ * keep against something external changing `dest` mid-clone.
+ *
+ * The final error always reflects the LAST attempt's stderr, run through
+ * `explainCloneFailure` with `usedToken` set from whether a retry actually
+ * ran (`ctx.transport`/`ctx.host` come from `opts`, for its ssh-vs-https and
+ * hostname-specific copy).
+ */
+export async function cloneRepo(
+  cloneUrl: string,
+  dest: string,
+  opts: CloneOptions = {},
+): Promise<CloneResult> {
+  const destCheck1 = checkCloneDestination(dest);
+  if (!destCheck1.ok) return destCheck1;
 
   // Test seam, same philosophy as AGETOR_CLAUDE_BIN=/bin/echo elsewhere:
   // endpoint tests point this at a local fixture repo so the /projects/clone
   // route is exercised end to end without the network. Never set in production.
   const source = process.env.AGETOR_CLONE_SOURCE_OVERRIDE || cloneUrl;
   const timeoutMs = opts.timeoutMs ?? CLONE_TIMEOUT_MS;
-
-  const attempt1 = await runGitClone(source, dest, {}, timeoutMs);
-  if (attempt1.ok) return { ok: true };
-
   const host = opts.host ?? "";
   const transport = opts.transport ?? "https";
+  const timedOutResult = (): CloneResult => ({
+    ok: false,
+    error: `clone timed out after ${Math.round(timeoutMs / 60_000)} minutes`,
+  });
 
-  if (attempt1.timedOut) {
-    return { ok: false, error: `clone timed out after ${Math.round(timeoutMs / 60_000)} minutes` };
-  }
+  const startedAt = Date.now();
+  const attempt1 = await runGitClone(source, dest, {}, timeoutMs);
+  if (attempt1.ok) return { ok: true };
+  if (attempt1.timedOut) return timedOutResult();
 
   let usedToken = false;
-  let tokenAvailable = false;
   let last = attempt1;
-  if (opts.auth) {
+  if (opts.auth && isAuthShapedCloneFailure(attempt1.stderrLine)) {
+    const remainingMs = timeoutMs - (Date.now() - startedAt);
+    if (remainingMs < RETRY_MIN_TIMEOUT_MS) {
+      return timedOutResult();
+    }
+
+    const destCheck2 = checkCloneDestination(dest);
+    if (!destCheck2.ok) {
+      return {
+        ok: false,
+        error: `clone failed: ${explainCloneFailure(attempt1.stderrLine, { transport, host, usedToken: false })}`,
+      };
+    }
+
     const auth = await opts.auth().catch(() => null);
     if (auth) {
-      tokenAvailable = true;
       usedToken = true;
       const extraEnv = cloneAuthEnv(process.env as Record<string, string | undefined>, auth);
-      last = await runGitClone(source, dest, extraEnv, timeoutMs);
+      last = await runGitClone(source, dest, extraEnv, remainingMs);
       if (last.ok) return { ok: true };
-      if (last.timedOut) {
-        return { ok: false, error: `clone timed out after ${Math.round(timeoutMs / 60_000)} minutes` };
-      }
+      if (last.timedOut) return timedOutResult();
     }
   }
 
   return {
     ok: false,
-    error: `clone failed: ${explainCloneFailure(last.stderrLine, { transport, host, usedToken, tokenAvailable })}`,
+    error: `clone failed: ${explainCloneFailure(last.stderrLine, { transport, host, usedToken })}`,
   };
 }

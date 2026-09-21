@@ -33,6 +33,7 @@ import { accountUsageDays } from "./account-usage.ts";
 import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
 import { cloneAuthHeader, cloneRepo, defaultCloneDest, resolveCloneRepo } from "./clone.ts";
 import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
+import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -828,19 +829,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           };
           const url = typeof body.url === "string" ? body.url.trim() : "";
           if (!url) return json({ error: "url required" }, { status: 400, headers: corsHeaders(req) });
-          if (
-            body.provider !== undefined &&
-            body.provider !== null &&
-            body.provider !== "github" &&
-            body.provider !== "gitlab" &&
-            body.provider !== "bitbucket"
-          ) {
+          if (body.provider != null && !isGitProvider(body.provider)) {
             return json(
-              { error: "provider must be one of github, gitlab, bitbucket" },
+              { error: `provider must be one of ${CLONE_PROVIDERS.join(", ")}` },
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const shorthandProvider = (body.provider as "github" | "gitlab" | "bitbucket" | undefined | null) ?? "github";
+          const shorthandProvider = isGitProvider(body.provider) ? body.provider : "github";
           const resolvedInput = resolveCloneRepo(url, shorthandProvider);
           if (!resolvedInput.ok) {
             return json({ error: resolvedInput.error }, { status: 400, headers: corsHeaders(req) });

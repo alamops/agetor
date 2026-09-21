@@ -56,7 +56,13 @@ export async function cmdClone(args: string[], flags: Flags): Promise<void> {
 
   const { project, provider: resolvedProvider, eli5TaskId, eli5Error } = result;
   out(`${c.green("✓")} cloned ${c.bold(project.name)} ${c.dim(project.path)}`);
-  out(c.dim(`provider: ${PROVIDER_CAPS[resolvedProvider].providerName}`));
+  // `provider` is only present when talking to a daemon new enough to send it
+  // (the route change is additive) — an older already-running core clones
+  // fine but omits the field, and by this point the clone + project
+  // registration has already succeeded, so a missing/unknown provider must
+  // not throw here and crash after the fact. Just skip the line.
+  const providerName = resolvedProvider ? PROVIDER_CAPS[resolvedProvider]?.providerName : undefined;
+  if (providerName) out(c.dim(`provider: ${providerName}`));
   if (eli5TaskId) {
     out(`explainer task started: ${eli5TaskId} — agetor logs ${eli5TaskId}`);
   }

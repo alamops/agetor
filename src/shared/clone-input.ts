@@ -68,9 +68,9 @@ export interface ParsedCloneInput {
   /** The scheme as pasted — only set for `form === "https"` (distinguishes
    *  a plain `http://` paste from `https://`); `null` otherwise. */
   scheme: "https" | "http" | null;
-  /** Lowercased host as pasted, with a leading `"www."` stripped for
-   *  `form === "https"` only. `null` for `form === "shorthand"`, which
-   *  carries no host at all. */
+  /** Lowercased host as pasted, with one trailing FQDN `"."` stripped (any
+   *  form) and a leading `"www."` stripped for `form === "https"` only.
+   *  `null` for `form === "shorthand"`, which carries no host at all. */
   rawHost: string | null;
   /** Port digits as pasted (`"https"` or `"ssh-url"` forms only), else
    *  `null`. Never present on `"scp"` or `"shorthand"` — neither syntax has
@@ -89,12 +89,24 @@ export interface ParsedCloneInput {
   repo: string;
 }
 
+/** Machine-readable failure reason, alongside the human-facing `error`
+ *  string — so a caller (the clone dialog) can branch on *why* parsing
+ *  failed without string-matching `error`. `"empty"`: blank/whitespace-only
+ *  input. `"unrecognized"`: the input matches none of the four supported
+ *  shapes at all. `"unsupported-host"`: a full URL parsed structurally fine,
+ *  but its host doesn't name any of the three supported providers.
+ *  `"invalid"`: everything else — a malformed path/host/port/ssh-user, input
+ *  over `CLONE_INPUT_MAX_LEN`, an ambiguous/overlong shorthand or scp/ssh-url
+ *  path, etc. */
+export type CloneInputErrorCode = "empty" | "unrecognized" | "unsupported-host" | "invalid";
+
 /** `parseCloneInput`'s result: either a successfully parsed input, or a
- *  short, user-facing (lowercase-first, no leaked credentials) error
- *  string explaining why it wasn't. */
+ *  short, user-facing (lowercase-first, no leaked credentials) error string
+ *  explaining why it wasn't, plus a `code` classifying the failure (see
+ *  `CloneInputErrorCode`). */
 export type ParseCloneInputResult =
   | { ok: true; value: ParsedCloneInput }
-  | { ok: false; error: string };
+  | { ok: false; error: string; code: CloneInputErrorCode };
 
 /** One sentence naming every input shape this parser accepts, appended to
  *  the unsupported-host / unparseable-input error messages so the user
@@ -102,11 +114,23 @@ export type ParseCloneInputResult =
 export const CLONE_SUPPORTED_HINT =
   "use a GitHub, GitLab or Bitbucket Cloud URL (https://…, git@host:owner/repo.git, ssh://…) or owner/repo";
 
+/** Hard cap on the trimmed input length `parseCloneInput`/`detectCloneProvider`
+ *  will even attempt to parse. Defense in depth alongside the regex fixes
+ *  below: no legitimate paste (URL or shorthand) approaches this, and it
+ *  keeps any future regex regression from becoming a pathological-input
+ *  hang regardless. Input longer than this is rejected outright — code
+ *  `"invalid"` from `parseCloneInput`, `null` from `detectCloneProvider`. */
+export const CLONE_INPUT_MAX_LEN = 2048;
+
 /** Host charset: lowercase letters, digits, dot, hyphen — never a leading
- *  `-` or `.` (checked separately below, since the charset alone allows
- *  either at the start). */
+ *  `-` or `.`, and never a trailing `.` either (checked separately below,
+ *  since the charset alone allows any of those positions; the trailing-dot
+ *  exclusion is what makes a *double* trailing dot invalid after
+ *  `normalizeHost` has already peeled off one legal FQDN-terminating dot). */
 const HOST_RE = /^[a-z0-9.-]+$/;
-/** 1–5 decimal digits, as pasted after a `:` in an https or ssh:// input. */
+/** 1–5 decimal digits, as pasted after a `:` in an https or ssh:// input —
+ *  the syntactic pre-filter `isValidPort` runs before its numeric
+ *  1–65535-range + no-leading-zero check. */
 const PORT_RE = /^\d{1,5}$/;
 /** An ssh user: must start with a letter, digit or underscore, then any run
  *  of those plus dot/hyphen. */
@@ -119,9 +143,18 @@ const SEGMENT_RE = /^[A-Za-z0-9_.-]+$/;
  *  alphanumerics and hyphens in between. */
 const GITHUB_OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
 /** Bare `owner/repo` (or `group/.../project`) shorthand: one or more
- *  `/`-separated segments, none containing whitespace, `:` or `@` (which
- *  would make it a host:path or url-ish form instead). */
-const SHORTHAND_RE = /^[^\s:@]+(\/[^\s:@]+)+$/;
+ *  `/`-separated segments, none containing whitespace, `:`, `@` (which
+ *  would make it a host:path or url-ish form instead) or, critically, `/`
+ *  itself within a segment — excluding `/` from the segment charset (unlike
+ *  the pre-fix version, whose `[^\s:@]` let a segment swallow `/` too) is
+ *  what makes each `/`-split point unique: with overlapping segment/
+ *  separator charsets, a pathological input like `"a/".repeat(30_000) +
+ *  "a@"` (no closer match, so the engine must try every possible way of
+ *  partitioning the run before giving up) cost the old pattern ~470ms per
+ *  call, and the dialog calls this parser twice per keystroke. With
+ *  disjoint charsets there is exactly one way to split on `/`, so matching
+ *  (or failing to match) is linear in input length regardless of shape. */
+const SHORTHAND_RE = /^[^\s:@/]+(?:\/[^\s:@/]+)+$/;
 /** The traditional `[user@]host:path` scp-like git-over-ssh shorthand. Host
  *  and user both exclude `@`, whitespace, `/` and `:` — a `/` or `:` there
  *  would mean this isn't actually host:path. */
@@ -236,8 +269,19 @@ function parseFormStructure(raw: string): FormStructure | null {
   const scpMatch = raw.match(SCP_RE);
   if (scpMatch) {
     const host = scpMatch[2]!;
-    const rawPath = scpMatch[3] ?? "";
-    if (!rawPath.startsWith("/") && !SCP_SCHEME_LIKE_HOSTS.has(host.toLowerCase())) {
+    let rawPath = scpMatch[3] ?? "";
+    // A single leading `/` after the colon is the traditional scp
+    // absolute-path form (`git@gitlab.com:/group/proj.git` — an absolute
+    // path on the remote, vs. the relative `git@gitlab.com:group/proj.git`)
+    // and is legal; strip it before treating the rest as path segments. A
+    // *double* leading `/` (`host://…`) is what a real `scheme://` URL looks
+    // like once split on the first `:` — `https://…`/`ssh://…` never reach
+    // this branch (they're matched earlier above), but an arbitrary
+    // `scheme://…` string would, so `//` still disqualifies the scp
+    // interpretation and falls through below.
+    const looksLikeUrl = rawPath.startsWith("//");
+    if (!looksLikeUrl && !SCP_SCHEME_LIKE_HOSTS.has(host.toLowerCase())) {
+      if (rawPath.startsWith("/")) rawPath = rawPath.slice(1);
       return {
         form: "scp",
         scheme: null,
@@ -247,11 +291,10 @@ function parseFormStructure(raw: string): FormStructure | null {
         rawPath,
       };
     }
-    // Looks like `scheme:` (or `scheme://…`, already excluded above by the
-    // leading-`/` check) rather than an scp host:path — fall through to the
-    // shorthand check below, which will reject it too (a colon disqualifies
-    // the shorthand grammar), landing on the generic "not a repository URL"
-    // error.
+    // Looks like `scheme:` or `scheme://…` rather than an scp host:path —
+    // fall through to the shorthand check below, which will reject it too
+    // (a colon disqualifies the shorthand grammar), landing on the generic
+    // "not a repository URL" error.
   }
 
   if (SHORTHAND_RE.test(raw)) {
@@ -278,7 +321,44 @@ function detectProviderFromHost(host: string): GitProvider | null {
 }
 
 function isValidHost(host: string): boolean {
-  return HOST_RE.test(host) && !host.startsWith("-") && !host.startsWith(".");
+  return (
+    HOST_RE.test(host) &&
+    !host.startsWith("-") &&
+    !host.startsWith(".") &&
+    !host.endsWith(".")
+  );
+}
+
+/** True for a port string that's syntactically 1–5 decimal digits (per
+ *  `PORT_RE`), carries no leading zero unless it's the single digit `"0"`
+ *  (itself rejected below by the range check — `"0"`, `"00"`, `"007"` all
+ *  fail), and falls numerically within the valid TCP port range 1–65535
+ *  (`"0"` and `"99999"` both fail the upper/lower bound). */
+function isValidPort(port: string): boolean {
+  if (!PORT_RE.test(port)) return false;
+  if (port.length > 1 && port.startsWith("0")) return false;
+  const n = Number(port);
+  return n >= 1 && n <= 65535;
+}
+
+/** Strips exactly one trailing `.` off a host. `github.com.` is a legal
+ *  FQDN (the trailing dot marks it as already-absolute in DNS) that some
+ *  users paste; peeling off exactly one dot lets it parse identically to
+ *  `github.com`. Anything past a single trailing dot — `github.com..`, or a
+ *  bare `"."` — is deliberately left with a dangling `.` (or empty string)
+ *  for `isValidHost` to reject; this function never loops. */
+function stripTrailingDot(host: string): string {
+  return host.endsWith(".") ? host.slice(0, -1) : host;
+}
+
+/** The one host-normalization pipeline shared by `parseCloneInput` and
+ *  `detectCloneProvider`, so the two can't drift: lowercase, strip one
+ *  trailing FQDN dot (see `stripTrailingDot`), then — `form === "https"`
+ *  only, mirroring the pre-existing behavior — drop a leading `"www."`. */
+function normalizeHost(rawHost: string, form: CloneInputForm): string {
+  let host = stripTrailingDot(rawHost.toLowerCase());
+  if (form === "https" && host.startsWith("www.")) host = host.slice(4);
+  return host;
 }
 
 function splitSegments(rawPath: string): string[] {
@@ -291,22 +371,39 @@ function splitSegments(rawPath: string): string[] {
  * segments or a user-facing error. `rawSegments` (pre-trim) is what error
  * messages quote, so the user sees the path they actually pasted.
  *
- * - Bitbucket Server-shaped `/scm/proj/repo` paths (real Bitbucket Server
- *   URLs look like this) have the leading `"scm"` marker dropped first, so
- *   the generic 2-segment cut below lands on `<proj>/<repo>` instead of
- *   `<scm>/<proj>`. This module doesn't otherwise special-case Bitbucket
- *   Server — the server layer rejects it by resolved host; this only keeps
- *   the *parse* honest for a URL shaped that way.
- * - GitHub/Bitbucket keep exactly the first two segments (a deep link like
- *   `owner/repo/tree/main/src` still resolves to the repo) — except in
- *   shorthand form, where more than two segments is rejected outright (a
- *   bare `a/b/c` is ambiguous with no URL structure to disambiguate it).
- * - GitLab keeps nested groups, cutting only at the first `-` segment (its
- *   `/-/` separator) or the first GitLab-reserved project-page word
- *   (`tree`/`blob`/`raw`/`commits`/`blame`/`wikis`) at index ≥ 2 — never a
- *   real project name there.
+ * All the deep-link-trimming rules below are **`form === "https"` only** —
+ * `scp`/`ssh-url` paths have no URL deep-link structure (no `/tree/main`,
+ * no `/-/`, no `/scm/` prefix) to trim, so more than two path segments there
+ * is just ambiguous/wrong rather than something to truncate, and a GitLab
+ * scp/ssh-url path is taken verbatim, nested groups included. `shorthand`
+ * gets the same "reject, don't truncate" treatment for GitHub/Bitbucket, and
+ * — since it likewise carries no URL structure — is never cut for GitLab
+ * either.
+ *
+ * - Bitbucket Server-shaped `/scm/proj/repo` **https** paths (real Bitbucket
+ *   Server web URLs look like this) have the leading `"scm"` marker dropped
+ *   first, so the generic 2-segment cut below lands on `<proj>/<repo>`
+ *   instead of `<scm>/<proj>`. This module doesn't otherwise special-case
+ *   Bitbucket Server — the server layer rejects it by resolved host; this
+ *   only keeps the *parse* honest for a URL shaped that way. (A Bitbucket
+ *   Server *ssh* URL, e.g. `ssh://git@host:7999/proj/repo.git`, has no
+ *   `scm` segment to begin with, so this never applies there anyway.)
+ * - GitHub/Bitbucket: in `https` form, keep exactly the first two segments
+ *   (a deep link like `owner/repo/tree/main/src` still resolves to the
+ *   repo). In every other form (`shorthand`, `scp`, `ssh-url`), more than
+ *   two segments is rejected outright — code `"invalid"` — rather than
+ *   truncated (a bare `a/b/c`, or `git@github.com:2222/owner/repo`, is
+ *   ambiguous with no URL structure to disambiguate it; silently truncating
+ *   the latter used to resolve to the wrong repo, `2222/owner`).
+ * - GitLab: in `https` form only, keeps nested groups but cuts at the first
+ *   `-` segment (its `/-/` separator) or the first GitLab-reserved
+ *   project-page word (`tree`/`blob`/`raw`/`commits`/`blame`/`wikis`) at
+ *   index ≥ 2 — never a real project name there. In `shorthand`/`scp`/
+ *   `ssh-url` form, the path is kept exactly as pasted (after `.git`
+ *   stripping below) — e.g. `git@gitlab.com:group/tree/project.git` keeps
+ *   its literal `tree` segment rather than being cut.
  * - A trailing `.git` (case-insensitive) is stripped from the last segment
- *   only, after trimming.
+ *   only, after the above trimming.
  * - Every segment must match `SEGMENT_RE`, never be `.`/`..`, and never
  *   start with `-`; GitHub additionally requires the owner (segment 0) to
  *   match the stricter `GITHUB_OWNER_RE`.
@@ -315,22 +412,28 @@ function trimAndValidateSegments(
   rawSegments: string[],
   provider: GitProvider,
   form: CloneInputForm,
-): { ok: true; segments: string[] } | { ok: false; error: string } {
-  const invalidPath = (): { ok: false; error: string } => ({
+): { ok: true; segments: string[] } | { ok: false; error: string; code: CloneInputErrorCode } {
+  const invalidPath = (): { ok: false; error: string; code: CloneInputErrorCode } => ({
     ok: false,
     error: `invalid repository path "${rawSegments.join("/")}"`,
+    code: "invalid",
   });
 
   let segments = rawSegments;
+  const isHttps = form === "https";
 
-  if (provider === "bitbucket" && segments[0] === "scm" && segments.length >= 3) {
+  if (provider === "bitbucket" && isHttps && segments[0] === "scm" && segments.length >= 3) {
     segments = segments.slice(1);
   }
 
   if (provider === "github" || provider === "bitbucket") {
-    if (form === "shorthand" && segments.length > 2) return invalidPath();
-    segments = segments.slice(0, 2);
-  } else {
+    if (isHttps) {
+      segments = segments.slice(0, 2);
+    } else if (segments.length > 2) {
+      return invalidPath();
+    }
+  } else if (isHttps) {
+    // GitLab, https form only — see the doc comment above.
     let cut = segments.length;
     const dashIdx = segments.indexOf("-");
     if (dashIdx !== -1) cut = Math.min(cut, dashIdx);
@@ -367,20 +470,29 @@ function trimAndValidateSegments(
  * carries no host of its own — a full URL's own host always wins,
  * regardless of what's selected in the picker.
  *
- * Never throws; every failure path returns `{ ok: false; error }` with a
- * short, lowercase-first, user-facing message that never echoes back any
- * userinfo/password from the input (https userinfo is discarded before it's
- * ever inspected, let alone stored).
+ * Never throws; every failure path returns `{ ok: false; error; code }` —
+ * `error` a short, lowercase-first, user-facing message that never echoes
+ * back any userinfo/password from the input (https userinfo is discarded
+ * before it's ever inspected, let alone stored), `code` a
+ * `CloneInputErrorCode` classifying *why* (e.g. so the dialog can special-
+ * case `"unsupported-host"` without string-matching `error`). Input longer
+ * than `CLONE_INPUT_MAX_LEN` is rejected outright, before any parsing, as
+ * `code: "invalid"`.
  */
 export function parseCloneInput(
   input: string,
   shorthandProvider: GitProvider = "github",
 ): ParseCloneInputResult {
   const raw = input.trim();
-  if (!raw) return { ok: false, error: "repository required" };
+  if (!raw) return { ok: false, error: "repository required", code: "empty" };
+  if (raw.length > CLONE_INPUT_MAX_LEN) {
+    return { ok: false, error: "repository URL is too long", code: "invalid" };
+  }
 
   const structure = parseFormStructure(raw);
-  if (!structure) return { ok: false, error: `not a repository URL — ${CLONE_SUPPORTED_HINT}` };
+  if (!structure) {
+    return { ok: false, error: `not a repository URL — ${CLONE_SUPPORTED_HINT}`, code: "unrecognized" };
+  }
 
   if (structure.form === "shorthand") {
     const rawSegments = splitSegments(structure.rawPath);
@@ -404,18 +516,23 @@ export function parseCloneInput(
     };
   }
 
-  let host = structure.host.toLowerCase();
-  if (structure.form === "https" && host.startsWith("www.")) host = host.slice(4);
-  if (!isValidHost(host)) return { ok: false, error: `invalid host "${host}"` };
+  const host = normalizeHost(structure.host, structure.form);
+  if (!isValidHost(host)) return { ok: false, error: `invalid host "${host}"`, code: "invalid" };
 
   const provider = detectProviderFromHost(host);
-  if (!provider) return { ok: false, error: `unsupported host "${host}" — ${CLONE_SUPPORTED_HINT}` };
+  if (!provider) {
+    return {
+      ok: false,
+      error: `unsupported host "${host}" — ${CLONE_SUPPORTED_HINT}`,
+      code: "unsupported-host",
+    };
+  }
 
-  if (structure.port !== null && !PORT_RE.test(structure.port)) {
-    return { ok: false, error: `invalid port "${structure.port}"` };
+  if (structure.port !== null && !isValidPort(structure.port)) {
+    return { ok: false, error: `invalid port "${structure.port}"`, code: "invalid" };
   }
   if (structure.user !== null && !SSH_USER_RE.test(structure.user)) {
-    return { ok: false, error: `invalid ssh user "${structure.user}"` };
+    return { ok: false, error: `invalid ssh user "${structure.user}"`, code: "invalid" };
   }
 
   const rawSegments = splitSegments(structure.rawPath);
@@ -448,17 +565,16 @@ export function parseCloneInput(
  * Returns the provider as soon as the host names one, even mid-paste with an
  * empty or incomplete path (`"https://gitlab.com/"`, `"git@bitbucket.org:"`
  * both resolve). Returns `null` for shorthand (no host to detect from),
- * empty input, an unparseable input, or a host that names none of the three
- * supported providers.
+ * empty input, input over `CLONE_INPUT_MAX_LEN`, an unparseable input, or a
+ * host that names none of the three supported providers.
  */
 export function detectCloneProvider(input: string): GitProvider | null {
   const raw = input.trim();
-  if (!raw) return null;
+  if (!raw || raw.length > CLONE_INPUT_MAX_LEN) return null;
 
   const structure = parseFormStructure(raw);
   if (!structure || structure.form === "shorthand") return null;
 
-  let host = structure.host.toLowerCase();
-  if (structure.form === "https" && host.startsWith("www.")) host = host.slice(4);
+  const host = normalizeHost(structure.host, structure.form);
   return detectProviderFromHost(host);
 }

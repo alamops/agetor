@@ -85,6 +85,17 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
   const effectiveProvider = detected ?? provider;
   const parsed = parseCloneInput(url, effectiveProvider);
   const repo = parsed.ok ? parsed.value.repo : null;
+  // A full URL whose host names none of the three supported providers: the
+  // Provider select can't help (there's no shorthand to disambiguate), so it
+  // stays disabled and the helper explains why instead of implying a pick
+  // would fix it.
+  const unsupportedHost = !parsed.ok && parsed.code === "unsupported-host";
+  const providerHint =
+    detected !== null
+      ? `Detected from the URL: ${PROVIDER_CAPS[detected].providerName}`
+      : unsupportedHost
+        ? "Unrecognized host — only GitHub, GitLab and Bitbucket Cloud hosts are supported"
+        : "Used for owner/repo shorthand";
 
   const overage = eli5
     ? promptByteOverage(
@@ -210,8 +221,12 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
               id="clone-provider"
               data-testid="clone-provider"
               value={effectiveProvider}
-              onChange={(e) => setProvider(e.target.value as GitProvider)}
-              disabled={busy || detected !== null}
+              onChange={(e) => {
+                setProvider(e.target.value as GitProvider);
+                setError(null);
+              }}
+              disabled={busy || detected !== null || unsupportedHost}
+              aria-describedby="clone-provider-hint"
             >
               {CLONE_PROVIDERS.map((p) => (
                 <option key={p} value={p}>
@@ -219,8 +234,13 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
                 </option>
               ))}
             </Select>
-            <p className="text-[11px] text-muted-foreground" data-testid="clone-provider-detected">
-              {detected !== null ? "Detected from the URL" : "Used for owner/repo shorthand"}
+            <p
+              id="clone-provider-hint"
+              aria-live="polite"
+              className={unsupportedHost ? "text-[11px] text-warning" : "text-[11px] text-muted-foreground"}
+              data-testid="clone-provider-detected"
+            >
+              {providerHint}
             </p>
           </div>
 
@@ -233,7 +253,10 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
               data-testid="clone-url"
               ref={urlRef}
               value={url}
-              onChange={(e) => setUrl(e.target.value)}
+              onChange={(e) => {
+                setUrl(e.target.value);
+                setError(null);
+              }}
               onKeyDown={onEnter}
               placeholder={REPO_PLACEHOLDER[effectiveProvider]}
               spellCheck={false}
@@ -249,7 +272,10 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
               id="clone-dest"
               data-testid="clone-dest"
               value={dest}
-              onChange={(e) => setDest(e.target.value)}
+              onChange={(e) => {
+                setDest(e.target.value);
+                setError(null);
+              }}
               onKeyDown={onEnter}
               placeholder={repo ? `default: ~/${repo}` : "default: ~/<repo>"}
               spellCheck={false}

@@ -41,10 +41,12 @@ const START_TIMEOUT_MS = 60_000;
 const ISSUE_THREAD_TIMEOUT_MS = 60_000;
 /** `/projects/clone` runs a real `git clone` (network-bound, can take
  *  minutes on a large repo) and, on the server side, may retry it once with
- *  an auth header after an anonymous attempt 401s — the server itself allows
- *  up to 10 minutes per attempt, twice in that worst case. 15 minutes gives
- *  the whole round trip room without the CLI's default one-shot timeout
- *  aborting a legitimate long clone out from under it. */
+ *  an auth header after an anonymous attempt fails — but the server bounds
+ *  the *whole* clone (the anonymous attempt plus the optional token retry
+ *  together) to one shared 10-minute budget, plus a few seconds of
+ *  credential resolution. 15 minutes leaves headroom on top of that for the
+ *  explainer task's own create+start work, without the CLI's default
+ *  one-shot timeout aborting a legitimate long clone out from under it. */
 const CLONE_TIMEOUT_MS = 15 * 60_000;
 
 export class ApiError extends Error {
@@ -263,7 +265,16 @@ export class AgetorClient {
     provider?: GitProvider;
     dest?: string;
     eli5?: boolean;
-  }): Promise<{ project: Project; provider: GitProvider; eli5TaskId: string | null; eli5Error: string | null }> {
+  }): Promise<{
+    project: Project;
+    // Optional: the response field is additive, and this CLI talks to
+    // whatever core is already running rather than one it just built — an
+    // older daemon predating this field omits it, so callers must tolerate
+    // a clone succeeding with no `provider` back.
+    provider?: GitProvider;
+    eli5TaskId: string | null;
+    eli5Error: string | null;
+  }> {
     return this.req("POST", "/projects/clone", input, CLONE_TIMEOUT_MS);
   }
   /** List a scope's files for the `@`-mention picker (`GET /files/index`) —
