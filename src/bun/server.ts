@@ -592,8 +592,14 @@ function validateCloneLaunch(
     }
     const trimmed = body.agentProfileId.trim();
     if (trimmed) {
-      if (!agentProfiles.get(trimmed)) {
+      const profile = agentProfiles.get(trimmed);
+      if (!profile) {
         return { error: `unknown agent profile "${trimmed}"` };
+      }
+      // `createTask` resolves the profile's own harness and fails on a
+      // dangling one — catch that here too, before anything is cloned.
+      if (!harnesses.getByIdOrKind(profile.harness)) {
+        return { error: `unknown harness "${profile.harness}"` };
       }
       agentProfileId = trimmed;
     }
@@ -839,8 +845,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // Validate the launch selection before cloning anything to disk —
           // see validateCloneLaunch's doc comment. Only checked when eli5 is
           // actually going to run.
+          const runEli5 = body.eli5 !== false;
           const launch: ReturnType<typeof validateCloneLaunch> =
-            body.eli5 !== false ? validateCloneLaunch(body) : {};
+            runEli5 ? validateCloneLaunch(body) : {};
           if ("error" in launch) {
             return json({ error: launch.error }, { status: 400, headers: corsHeaders(req) });
           }
@@ -857,7 +864,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // rolls back the clone — the project is already usable.
           let eli5TaskId: string | null = null;
           let eli5Error: string | null = null;
-          if (body.eli5 !== false) {
+          if (runEli5) {
             const created = await createTask({
               title: eli5TaskTitle(parsed.repo),
               prompt: buildEli5Prompt(parsed.repo),

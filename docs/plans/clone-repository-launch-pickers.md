@@ -90,3 +90,11 @@ Assumptions: the Mode picker stays visible (it is part of the shared block; the 
 | Self-hosted GitLab / GHES hosts | out of scope — owner chose cloud hosts only; needs a per-host trust decision |
 | CLI `agetor` clone command | out of scope — no CLI surface exists for this flow today; a different ticket |
 | Letting the user edit the explainer prompt | out of scope — not asked |
+
+## 10. Review outcome (2026-09-21)
+
+Opus review using the `code-review` skill: no must-fix, 4 should-fix, 6 nits — all ten applied in the follow-up commit. Swept in: `retry: false` on `api.cloneProject`; Clone gated on `loggedIn !== false`; launch block frozen while busy; a "no enabled harness" hint; the selected profile's own harness validated before cloning; `eli5` read once (`runEli5`); selected profile cleared on each open; last "Checkout-from-GitHub" comment renamed; overage + toast copy; `role="status"`/`role="alert"` on the async regions; CLAUDE.md "fifth" → "fourth".
+
+Not covered by an automated test (no seam, both unreachable through the UI today): a profile whose harness row is gone (`harnesses.delete` refuses while a profile references it) and the logged-out gate (needs a harness stub that reports `auth: "missing"`).
+
+Final test run: `bun test src/shared/clone-eli5.test.ts src/bun/clone.test.ts src/bun/clone-endpoint.test.ts` → 32 pass; `bun node_modules/@playwright/test/cli.js test e2e/clone-project.spec.ts e2e/agent-profiles-dialogs.spec.ts` → 8 pass; `bun run typecheck` green.

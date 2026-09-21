@@ -52,13 +52,17 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
 
   // Fresh form every open — a stale URL from the previous clone is never
   // what the user wants pre-filled. Harness/model/prefs fetching is owned
-  // by useTaskLaunch.
+  // by useTaskLaunch, which re-seeds the manual block on every open but
+  // never clears the selected profile — and this dialog stays mounted
+  // (ProjectPicker renders it permanently), so clear it here too.
   useEffect(() => {
     if (!open) return;
     setUrl("");
     setDest("");
     setEli5(true);
     setError(null);
+    launch.setAgentProfileId(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   const repo = repoNameFrom(url);
@@ -77,7 +81,15 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
   const canSubmit =
     url.trim().length > 0 &&
     !busy &&
-    (!eli5 || (!launch.loading && !launch.loadError && !!launch.effectiveStatus?.available && overage == null));
+    (!eli5 ||
+      (!launch.loading &&
+        !launch.loadError &&
+        !!launch.effectiveStatus?.available &&
+        // `startTask` hard-refuses a logged-out harness. Everywhere else that
+        // costs a rolled-back task; here it would cost a finished clone plus a
+        // dead explainer task, so gate on it up front.
+        launch.effectiveStatus.loggedIn !== false &&
+        overage == null));
 
   const submit = async () => {
     const trimmed = url.trim();
@@ -112,7 +124,7 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
         description: result.eli5TaskId
           ? "Explainer task started — watch it on the board; it writes ELI5.md at the repo root."
           : result.eli5Error
-            ? `Clone succeeded, but the ELI5 task failed: ${result.eli5Error}`
+            ? `Clone succeeded, but the explainer task failed: ${result.eli5Error}`
             : result.project.path,
       });
     } catch (err) {
@@ -207,13 +219,13 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
           {eli5 && (
             <div data-testid="clone-launch" className="space-y-3">
               {launch.loading && (
-                <div className="flex items-center justify-center gap-2 py-4 text-xs text-muted-foreground">
+                <div role="status" className="flex items-center justify-center gap-2 py-4 text-xs text-muted-foreground">
                   <Loader2 className="size-4 animate-spin" /> Loading harnesses…
                 </div>
               )}
 
               {!launch.loading && launch.loadError && (
-                <div className="space-y-1 text-xs">
+                <div role="alert" className="space-y-1 text-xs">
                   <div className="flex items-center gap-2 text-danger">
                     <AlertCircle className="size-4 shrink-0" /> {launch.loadError}
                   </div>
@@ -224,17 +236,28 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
               )}
 
               {!launch.loading && !launch.loadError && (
-                <>
+                // Frozen while the (possibly multi-minute) clone is in flight:
+                // the payload is already sent, and `rememberPicks()` reads the
+                // live picker state afterwards — a mid-flight change would
+                // persist picks that never launched.
+                <fieldset disabled={busy} className="m-0 min-w-0 space-y-3 border-0 p-0">
                   <TaskLaunchPickers launch={launch} />
 
-                  {overage && (
-                    <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
-                      This prompt is {Math.ceil(overage.bytes / 1024)} KB — {selectedHarnessLabel}'s
-                      one-shot launch caps prompts at {Math.floor(overage.limit / 1024)} KB. Pick
-                      another harness.
+                  {!launch.effectiveStatus && (
+                    <div role="alert" className="text-[11px] text-muted-foreground">
+                      No enabled harness to run the explainer on — enable one in Settings → Harnesses,
+                      or turn off "Explain this repo" to clone without it.
                     </div>
                   )}
-                </>
+
+                  {overage && (
+                    <div role="alert" className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
+                      This prompt is {Math.ceil(overage.bytes / 1024)} KB — {selectedHarnessLabel}'s
+                      one-shot launch caps prompts at {Math.floor(overage.limit / 1024)} KB. Pick
+                      another agent or harness, or turn off "Explain this repo".
+                    </div>
+                  )}
+                </fieldset>
               )}
             </div>
           )}

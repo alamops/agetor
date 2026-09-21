@@ -564,9 +564,14 @@ export const api = {
     maxMode?: boolean;
     agentProfileId?: string;
   }) =>
+    // retry: false — a replay after a lost response would re-enter the route
+    // against a destination the first attempt already filled (502 "already
+    // exists") while that clone and its explainer task are live, or race a
+    // second `git clone` into the same directory.
     j<{ project: Project; eli5TaskId: string | null; eli5Error: string | null }>(
       "/projects/clone",
       { method: "POST", body: JSON.stringify(input) },
+      { retry: false },
     ),
   /** Per-project branch nomenclature. GET resolves to built-in defaults when the
    *  project has no stored config, so the form always gets a usable shape. */

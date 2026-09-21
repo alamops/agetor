@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 /**
- * Checkout-from-GitHub support for the Projects sidebar.
+ * Clone-repository support for the Projects sidebar.
  *
  * `POST /projects/clone` (server.ts) is the consumer: parse the user's input
  * into a canonical clone URL, clone it, and register the destination as a
