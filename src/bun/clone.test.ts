@@ -17,7 +17,9 @@ import {
   defaultCloneDest,
   explainCloneFailure,
   isAuthShapedCloneFailure,
+  pickCloneDisplayLine,
   resolveCloneRepo,
+  sanitizeCloneStderr,
 } from "./clone.ts";
 import { __clearApiHostCacheForTest } from "./git-provider.ts";
 import { setGitHubToken } from "./github-tokens.ts";
@@ -90,6 +92,14 @@ function writeAliasSshStub(): string {
       '  gitlab-work) echo "hostname gitlab.internal.example.com" ;;',
       '  gitlab-cloud-alias) echo "hostname gitlab.com" ;;',
       '  bitbucket-work) echo "hostname bitbucket.org" ;;',
+      // Fix 3 regression fixtures: a resolution that is itself malformed as
+      // a host (embeds a path/query — what a `ssh -G` config typo, or a
+      // hand-edited alias, could plausibly produce), and a gitlab-named
+      // alias whose config actually points at github.com (the provider-
+      // confusion case — must never end up cloning github.com under a
+      // GitLab credential origin).
+      '  gitlab-evil) echo "hostname evil.example.com/x?tok=1" ;;',
+      '  gitlab-confused) echo "hostname github.com" ;;',
       '  *) echo "hostname $host" ;;',
       "esac",
       "",
@@ -340,6 +350,26 @@ describe("resolveCloneRepo", () => {
       expect(result.repo.cloneUrl).toBe("https://gitlab.internal.example.com/group/proj.git");
       expect(result.repo.authOrigin).toBe("https://gitlab.internal.example.com/");
     });
+
+    // Review finding #3: `ssh -G`'s resolved host used to be spliced into
+    // `cloneUrl`/`authOrigin` with no validation at all.
+    test("a resolution that is itself malformed as a host (embeds a path/query) is rejected, never turned into a URL", () => {
+      const result = resolveCloneRepo("https://gitlab-evil/group/proj");
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error).toContain('"gitlab-evil" resolves to "evil.example.com/x?tok=1"');
+      expect(result.error).toContain("isn't a valid GitLab host");
+      // Never leaked into anything URL-shaped.
+      expect(result.error).not.toContain("://evil.example.com/x?tok=1");
+    });
+
+    test("a gitlab-named alias resolving to github.com is rejected — never clones github.com under a GitLab credential origin", () => {
+      const result = resolveCloneRepo("https://gitlab-confused/group/proj");
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error).toContain('"gitlab-confused" resolves to "github.com"');
+      expect(result.error).toContain("isn't a valid GitLab host");
+    });
   });
 
   describe("bitbucket https", () => {
@@ -486,14 +516,22 @@ describe("explainCloneFailure", () => {
   const originalLine = "fatal: could not read Username for 'https://github.com': terminal prompts disabled";
 
   test("auth-shaped + https + no token used yet: 'add a token' hint, original line kept first", () => {
-    const result = explainCloneFailure(originalLine, { transport: "https", host: "github.com", usedToken: false });
+    const result = explainCloneFailure(originalLine, originalLine, {
+      transport: "https",
+      host: "github.com",
+      usedToken: false,
+    });
     expect(result.startsWith(originalLine)).toBe(true);
     expect(result).toContain("add a token for github.com in Settings");
     expect(result).toContain("paste the SSH URL");
   });
 
   test("auth-shaped + https + a token WAS tried: 'rejected or doesn't grant access' hint", () => {
-    const result = explainCloneFailure(originalLine, { transport: "https", host: "github.com", usedToken: true });
+    const result = explainCloneFailure(originalLine, originalLine, {
+      transport: "https",
+      host: "github.com",
+      usedToken: true,
+    });
     expect(result.startsWith(originalLine)).toBe(true);
     expect(result).toContain("rejected or doesn't grant access");
     expect(result).toContain("Settings → Git host tokens");
@@ -501,7 +539,11 @@ describe("explainCloneFailure", () => {
 
   test("auth-shaped + ssh: SSH-key hint regardless of usedToken (ssh never has a stored-token retry)", () => {
     for (const usedToken of [true, false]) {
-      const result = explainCloneFailure(originalLine, { transport: "ssh", host: "gitlab.mycompany.com", usedToken });
+      const result = explainCloneFailure(originalLine, originalLine, {
+        transport: "ssh",
+        host: "gitlab.mycompany.com",
+        usedToken,
+      });
       expect(result.startsWith(originalLine)).toBe(true);
       expect(result).toContain("Your SSH key doesn't have access");
       expect(result).toContain("ssh-add -l");
@@ -510,58 +552,61 @@ describe("explainCloneFailure", () => {
 
   test("a moved (301/302/307/308) response after a token attempt: 'repository has moved' hint", () => {
     const line = "fatal: unable to access 'https://x/': The requested URL returned error: 301";
-    const result = explainCloneFailure(line, { transport: "https", host: "x", usedToken: true });
+    const result = explainCloneFailure(line, line, { transport: "https", host: "x", usedToken: true });
     expect(result.startsWith(line)).toBe(true);
     expect(result).toContain("repository has moved");
   });
 
   test("a moved response with NO token attempt is returned unchanged (nothing useful to add)", () => {
     const line = "fatal: unable to access 'https://x/': The requested URL returned error: 301";
-    const result = explainCloneFailure(line, { transport: "https", host: "x", usedToken: false });
+    const result = explainCloneFailure(line, line, { transport: "https", host: "x", usedToken: false });
     expect(result).toBe(line);
   });
 
   test("host key verification failed: trust hint naming the host", () => {
     const line = "Host key verification failed.";
-    const result = explainCloneFailure(line, { transport: "ssh", host: "gitlab.com", usedToken: false });
+    const result = explainCloneFailure(line, line, { transport: "ssh", host: "gitlab.com", usedToken: false });
     expect(result.startsWith(line)).toBe(true);
     expect(result).toContain('ssh -T git@gitlab.com');
   });
 
   test("permission denied (publickey): key/agent hint", () => {
     const line = "git@github.com: Permission denied (publickey).";
-    const result = explainCloneFailure(line, { transport: "ssh", host: "github.com", usedToken: false });
+    const result = explainCloneFailure(line, line, { transport: "ssh", host: "github.com", usedToken: false });
     expect(result.startsWith(line)).toBe(true);
     expect(result).toContain("No SSH key was accepted");
   });
 
   test("could not resolve host — ssh phrasing points at ~/.ssh/config", () => {
     const line = "ssh: Could not resolve hostname gitlab-alias: nodename nor servname provided, or not known";
-    const result = explainCloneFailure(line, { transport: "ssh", host: "gitlab-alias", usedToken: false });
+    const result = explainCloneFailure(line, line, { transport: "ssh", host: "gitlab-alias", usedToken: false });
     expect(result).toContain("didn't resolve");
     expect(result).toContain("~/.ssh/config");
   });
 
   test("could not resolve host — https phrasing differs for a dotless (alias-shaped) host vs a dotted one", () => {
-    const dotless = explainCloneFailure("fatal: unable to access 'https://x/': Could not resolve host: gitlab-alias", {
+    const dotlessLine = "fatal: unable to access 'https://x/': Could not resolve host: gitlab-alias";
+    const dotless = explainCloneFailure(dotlessLine, dotlessLine, {
       transport: "https",
       host: "gitlab-alias",
       usedToken: false,
     });
     expect(dotless).toContain("SSH alias only works with the SSH URL");
 
-    const dotted = explainCloneFailure(
-      "fatal: unable to access 'https://x/': Could not resolve host: gitlab.mycompany.com",
-      { transport: "https", host: "gitlab.mycompany.com", usedToken: false },
-    );
+    const dottedLine = "fatal: unable to access 'https://x/': Could not resolve host: gitlab.mycompany.com";
+    const dotted = explainCloneFailure(dottedLine, dottedLine, {
+      transport: "https",
+      host: "gitlab.mycompany.com",
+      usedToken: false,
+    });
     expect(dotted).not.toContain("SSH alias only works with the SSH URL");
     expect(dotted).toContain("didn't resolve");
   });
 
   test("an unrecognized line is returned completely unchanged", () => {
     const line = "fatal: some completely novel git error nobody mapped";
-    expect(explainCloneFailure(line, { transport: "https", host: "x", usedToken: true })).toBe(line);
-    expect(explainCloneFailure(line, { transport: "https", host: "x", usedToken: false })).toBe(line);
+    expect(explainCloneFailure(line, line, { transport: "https", host: "x", usedToken: true })).toBe(line);
+    expect(explainCloneFailure(line, line, { transport: "https", host: "x", usedToken: false })).toBe(line);
   });
 
   test("never receives (and so can never leak) a token — the function signature carries no token field", () => {
@@ -569,13 +614,201 @@ describe("explainCloneFailure", () => {
     // credential. Constructing every ctx shape above with a suspicious-looking
     // fake secret as `host` proves it only ever echoes host names, never a
     // token value that was never passed to it in the first place.
-    const result = explainCloneFailure(originalLine, {
+    const result = explainCloneFailure(originalLine, originalLine, {
       transport: "https",
       host: "github.com",
       usedToken: true,
     });
     expect(result).not.toContain("ghp_");
     expect(result).not.toContain("glpat-");
+  });
+
+  test("displayLine (not the full stderrText) leads the returned message", () => {
+    // stderrText carries the matching signal (auth-shaped), displayLine is a
+    // DIFFERENT, shorter string that must be what actually leads the output —
+    // proving the two params are genuinely independent, not just aliases of
+    // the same string in every test above.
+    const stderrText = "some noise line\nfatal: could not read Username for 'https://github.com': x";
+    const displayLine = "fatal: could not read Username for 'https://github.com': x";
+    const result = explainCloneFailure(stderrText, displayLine, {
+      transport: "https",
+      host: "github.com",
+      usedToken: false,
+    });
+    expect(result.startsWith(displayLine)).toBe(true);
+    expect(result.startsWith("some noise line")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pickCloneDisplayLine + the real ssh-epilogue-noise fix (review finding #1)
+// ---------------------------------------------------------------------------
+
+describe("pickCloneDisplayLine — real git-over-ssh epilogue noise", () => {
+  // Captured live (no network needed): `GIT_SSH_COMMAND="ssh -o
+  // BatchMode=yes -o ConnectTimeout=5" git clone
+  // ssh://git@127.0.0.1:2/does/not/exist.git <dest>` — connection refused.
+  // Raw stderr (git 2.51, macOS):
+  //   Cloning into 'testclone'...
+  //   ssh: connect to host 127.0.0.1 port 2: Connection refused\r
+  //   fatal: Could not read from remote repository.
+  //
+  //   Please make sure you have the correct access rights
+  //   and the repository exists.
+  // (note the trailing `\r` ssh itself emits on that one line — proof that
+  // control-character stripping matters even for a perfectly ordinary
+  // failure, not just an adversarial one.)
+  const CONNECTION_REFUSED_EPILOGUE =
+    "Cloning into 'testclone'...\n" +
+    "ssh: connect to host 127.0.0.1 port 2: Connection refused\r\n" +
+    "fatal: Could not read from remote repository.\n" +
+    "\n" +
+    "Please make sure you have the correct access rights\n" +
+    "and the repository exists.";
+
+  // Also captured live: an unresolvable hostname.
+  const COULD_NOT_RESOLVE_EPILOGUE =
+    "Cloning into 'testclone2'...\n" +
+    "ssh: Could not resolve hostname nope-invalid-agetor-test.example: nodename nor servname provided, or not known\r\n" +
+    "fatal: Could not read from remote repository.\n" +
+    "\n" +
+    "Please make sure you have the correct access rights\n" +
+    "and the repository exists.";
+
+  // Documented (well-known) shapes, same epilogue — not independently
+  // re-captured live since they need a real mismatched host key / a real
+  // rejecting remote, but the epilogue wrapper is identical.
+  const HOST_KEY_EPILOGUE =
+    "Cloning into 'exist'...\n" +
+    "Host key verification failed.\n" +
+    "fatal: Could not read from remote repository.\n" +
+    "\n" +
+    "Please make sure you have the correct access rights\n" +
+    "and the repository exists.";
+  const PERMISSION_DENIED_EPILOGUE =
+    "Cloning into 'exist'...\n" +
+    "git@github.com: Permission denied (publickey).\n" +
+    "fatal: Could not read from remote repository.\n" +
+    "\n" +
+    "Please make sure you have the correct access rights\n" +
+    "and the repository exists.";
+  const GITHUB_REPO_NOT_FOUND_EPILOGUE =
+    "Cloning into 'exist'...\n" +
+    "ERROR: Repository not found.\n" +
+    "fatal: Could not read from remote repository.\n" +
+    "\n" +
+    "Please make sure you have the correct access rights\n" +
+    "and the repository exists.";
+
+  test("connection refused: picks the ssh: line, not 'and the repository exists.'", () => {
+    const sanitized = sanitizeCloneStderr(CONNECTION_REFUSED_EPILOGUE);
+    expect(pickCloneDisplayLine(sanitized)).toBe("ssh: connect to host 127.0.0.1 port 2: Connection refused");
+  });
+
+  test("could not resolve hostname: picks the ssh: line", () => {
+    const sanitized = sanitizeCloneStderr(COULD_NOT_RESOLVE_EPILOGUE);
+    expect(pickCloneDisplayLine(sanitized)).toBe(
+      "ssh: Could not resolve hostname nope-invalid-agetor-test.example: nodename nor servname provided, or not known",
+    );
+  });
+
+  test("host key verification failed: picks that line, not the generic fatal closer", () => {
+    expect(pickCloneDisplayLine(HOST_KEY_EPILOGUE)).toBe("Host key verification failed.");
+  });
+
+  test("permission denied (publickey): picks that line", () => {
+    expect(pickCloneDisplayLine(PERMISSION_DENIED_EPILOGUE)).toBe("git@github.com: Permission denied (publickey).");
+  });
+
+  test("GitHub 'ERROR: Repository not found.' over ssh: picks that line", () => {
+    expect(pickCloneDisplayLine(GITHUB_REPO_NOT_FOUND_EPILOGUE)).toBe("ERROR: Repository not found.");
+  });
+
+  test("the generic fatal line survives when nothing more specific is underneath it", () => {
+    const onlyGeneric =
+      "Cloning into 'exist'...\n" +
+      "fatal: Could not read from remote repository.\n" +
+      "\n" +
+      "Please make sure you have the correct access rights\n" +
+      "and the repository exists.";
+    expect(pickCloneDisplayLine(onlyGeneric)).toBe("fatal: Could not read from remote repository.");
+  });
+
+  test("end-to-end via explainCloneFailure: the ssh-key hint fires for the real host-key/publickey fixtures (dead-code fix)", () => {
+    const hostKeyDisplay = pickCloneDisplayLine(HOST_KEY_EPILOGUE);
+    const hostKeyResult = explainCloneFailure(HOST_KEY_EPILOGUE, hostKeyDisplay, {
+      transport: "ssh",
+      host: "gitlab.com",
+      usedToken: false,
+    });
+    expect(hostKeyResult).toContain("ssh -T git@gitlab.com");
+    expect(hostKeyResult).not.toContain("and the repository exists");
+
+    const pkDisplay = pickCloneDisplayLine(PERMISSION_DENIED_EPILOGUE);
+    const pkResult = explainCloneFailure(PERMISSION_DENIED_EPILOGUE, pkDisplay, {
+      transport: "ssh",
+      host: "github.com",
+      usedToken: false,
+    });
+    expect(pkResult).toContain("No SSH key was accepted");
+    expect(pkResult).not.toContain("and the repository exists");
+  });
+
+  test("end-to-end: the connection-refused fixture is NOT auth-shaped and explainCloneFailure returns the display line unchanged", () => {
+    const sanitized = sanitizeCloneStderr(CONNECTION_REFUSED_EPILOGUE);
+    const displayLine = pickCloneDisplayLine(sanitized);
+    expect(isAuthShapedCloneFailure(sanitized)).toBe(false);
+    const result = explainCloneFailure(sanitized, displayLine, { transport: "ssh", host: "127.0.0.1", usedToken: false });
+    expect(result).toBe(displayLine);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sanitizeCloneStderr (review finding #2a) + ReDoS linearity (#2b)
+// ---------------------------------------------------------------------------
+
+describe("sanitizeCloneStderr", () => {
+  test("strips C0/C1 control characters (including a literal \\r a real ssh emits) and neutralizes ANSI escapes, keeps \\n/\\t", () => {
+    const withControlChars =
+      "fatal: \x1b[31mAuthentication failed\x1b[0m for 'https://x/'\r\n\x07bell\x1b]0;evil-title\x07done\tindented";
+    const sanitized = sanitizeCloneStderr(withControlChars);
+    expect(sanitized).not.toMatch(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/);
+    expect(sanitized).toContain("Authentication failed");
+    expect(sanitized).toContain("\n");
+    expect(sanitized).toContain("\t");
+  });
+
+  test("caps an oversized single line to CLONE_STDERR_MAX_LINE_CHARS", () => {
+    const hugeLine = "x".repeat(5_000);
+    expect(sanitizeCloneStderr(hugeLine).length).toBeLessThanOrEqual(500);
+  });
+
+  test("caps the number of lines, keeping the TAIL", () => {
+    const manyLines = Array.from({ length: 200 }, (_, i) => `line ${i}`).join("\n");
+    const lines = sanitizeCloneStderr(manyLines).split("\n");
+    expect(lines.length).toBe(50);
+    expect(lines[0]).toBe("line 150");
+    expect(lines[49]).toBe("line 199");
+  });
+});
+
+describe("ReDoS linearity (review finding #2b)", () => {
+  test("isAuthShapedCloneFailure and explainCloneFailure stay well under 200ms on a 200KB adversarial single line", () => {
+    // Many repeated "repository " occurrences with NO "not found" anywhere —
+    // the exact shape that made the old unbounded `/repository.*not
+    // found/i` pattern quadratic: each occurrence's failed `.*` scan used to
+    // walk all the way to the end of the (remote-controlled) line before
+    // giving up and trying the next occurrence.
+    const adversarial = "repository ".repeat(18_200); // ~200KB
+    expect(adversarial.length).toBeGreaterThan(200_000);
+
+    const start = performance.now();
+    const authShaped = isAuthShapedCloneFailure(adversarial);
+    explainCloneFailure(adversarial, adversarial, { transport: "https", host: "x", usedToken: false });
+    const elapsed = performance.now() - start;
+
+    expect(authShaped).toBe(false);
+    expect(elapsed).toBeLessThan(200);
   });
 });
 
@@ -947,6 +1180,67 @@ describe("cloneRepo", () => {
       } finally {
         redirector.stop();
         targetServer.stop();
+      }
+    },
+    30_000,
+  );
+
+  // -------------------------------------------------------------------------
+  // Timeout reporting (review finding #4).
+  // -------------------------------------------------------------------------
+
+  test(
+    "sub-minute timeout budget: attempt 1 itself times out, message is formatted in seconds (not '0 minutes')",
+    async () => {
+      const root = mkdtempSync(path.join(tmpdir(), "agetor-clone-timeout-fmt-"));
+      makeBareSourceRepo(root);
+      // A 300ms server-response delay against a 100ms clone budget forces
+      // attempt 1 itself to time out — the pre-existing timeout path, just
+      // with a sub-minute budget to exercise the formatting fix.
+      const server = startAuthGitServer(root, { delayMs: 300 });
+      try {
+        const dest = path.join(dir, "timeout-fmt-seconds");
+        const result = await cloneRepo(`${server.url}/repo.git`, dest, { timeoutMs: 100 });
+        expect(result.ok).toBe(false);
+        expect(result.error).toContain("clone timed out after");
+        expect(result.error).not.toContain("0 minutes");
+        expect(result.error).toMatch(/after \d+ seconds?$/);
+      } finally {
+        server.stop();
+      }
+    },
+    30_000,
+  );
+
+  test(
+    "attempt 1 fails auth-shaped but too little of the shared budget remains for a retry: attempt 1's own error is reported, NOT a fabricated timeout",
+    async () => {
+      const root = mkdtempSync(path.join(tmpdir(), "agetor-clone-noretry-budget-"));
+      makeBareSourceRepo(root);
+      const requireAuth = basicAuthValue("x-access-token:good-tok");
+      const server = startAuthGitServer(root, { requireAuth });
+      try {
+        let authCalls = 0;
+        const dest = path.join(dir, "noretry-budget");
+        // A local CGI server answers in well under a second — a 3s total
+        // budget leaves far less than RETRY_MIN_TIMEOUT_MS (5s) remaining
+        // after attempt 1 fails, but attempt 1 itself never times out.
+        const result = await cloneRepo(`${server.url}/repo.git`, dest, {
+          timeoutMs: 3_000,
+          auth: async () => {
+            authCalls++;
+            return { origin: `${server.url}/`, header: `Authorization: ${requireAuth}` };
+          },
+          transport: "https",
+          host: "127.0.0.1",
+        });
+        expect(result.ok).toBe(false);
+        expect(authCalls).toBe(0); // the retry — and so opts.auth() — never ran
+        expect(result.error).not.toContain("timed out");
+        expect(result.error).toContain("clone failed:");
+        expect(result.error).toContain("add a token for 127.0.0.1");
+      } finally {
+        server.stop();
       }
     },
     30_000,

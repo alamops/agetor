@@ -77,7 +77,12 @@ export interface ParsedCloneInput {
    *  a place for one. */
   port: string | null;
   /** The ssh user as pasted (e.g. `"git"`), case preserved. `null` when
-   *  absent, or when `form` isn't `"scp"`/`"ssh-url"`. */
+   *  absent, or when `form` isn't `"scp"`/`"ssh-url"`. A pasted
+   *  `user:password@host` userinfo has its password half silently dropped
+   *  here (see `splitSshUserinfo`) — ssh/git ignore a URL-embedded password
+   *  anyway (real auth is key-based), and keeping it around would be one
+   *  more place a secret could later get echoed or logged. Only the user
+   *  half is validated against `SSH_USER_RE` and kept. */
   user: string | null;
   /** Path segments (owner, …, repo) after deep-link trimming and `.git`
    *  stripping — always at least 2 entries. */
@@ -133,7 +138,9 @@ const HOST_RE = /^[a-z0-9.-]+$/;
  *  1–65535-range + no-leading-zero check. */
 const PORT_RE = /^\d{1,5}$/;
 /** An ssh user: must start with a letter, digit or underscore, then any run
- *  of those plus dot/hyphen. */
+ *  of those plus dot/hyphen. Applied only to the user half of a captured
+ *  userinfo — see `splitSshUserinfo` — so a `user:password` form's password
+ *  half is never checked against (or expected to match) this. */
 const SSH_USER_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
 /** Every path segment (owner, group, repo, …): letters, digits, `_`, `.`,
  *  `-` — `.`/`..` and a leading `-` are rejected separately below. */
@@ -155,10 +162,31 @@ const GITHUB_OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
  *  disjoint charsets there is exactly one way to split on `/`, so matching
  *  (or failing to match) is linear in input length regardless of shape. */
 const SHORTHAND_RE = /^[^\s:@/]+(?:\/[^\s:@/]+)+$/;
-/** The traditional `[user@]host:path` scp-like git-over-ssh shorthand. Host
- *  and user both exclude `@`, whitespace, `/` and `:` — a `/` or `:` there
- *  would mean this isn't actually host:path. */
-const SCP_RE = /^(?:([^@\s/:]+)@)?([^@\s/:]+):(.*)$/;
+/** The traditional `[userinfo@]host:path` scp-like git-over-ssh shorthand,
+ *  where `userinfo` is `user` or `user:password`. The userinfo group
+ *  excludes `@`, whitespace and `/` but — unlike the host group — *does*
+ *  allow `:`, so a URL-embedded password (`oauth2:token@host:path`) is
+ *  captured as part of userinfo rather than misread as the host:path
+ *  delimiter; `splitSshUserinfo` strips the password half back off before
+ *  anything inspects `user`. The host group excludes `@`, whitespace, `/`
+ *  and `:` — a `/` or `:` there would mean this isn't actually host:path.
+ *  Because the userinfo group is optional and gated behind a literal `@`
+ *  that must still occur before the first disallowed character, and the
+ *  host group's charset is disjoint from its own terminator (`:`), neither
+ *  group's backtracking depends on the other's length — still linear, not
+ *  quadratic, in input length. */
+const SCP_RE = /^(?:([^@\s/]+)@)?([^@\s/:]+):(.*)$/;
+/** Splits a captured ssh userinfo string (`user` or `user:password`) on its
+ *  first `:` and returns only the user half — a URL-embedded password is
+ *  discarded outright: ssh/git never authenticate off it (real auth is
+ *  key-based), and dropping it here, before it's validated or could ever
+ *  reach an error message, is what keeps a rejected `user:password` from
+ *  leaking the password (see `parseCloneInput`'s doc comment). A userinfo
+ *  with no `:` is returned unchanged. */
+function splitSshUserinfo(userinfo: string): string {
+  const colonIdx = userinfo.indexOf(":");
+  return colonIdx === -1 ? userinfo : userinfo.slice(0, colonIdx);
+}
 /** GitLab reserved project-page names that can never be a real project at
  *  path index ≥ 2 (`/group/project/tree/main` etc.) — a deep link into one
  *  of these views is cut at the first occurrence, same as GitHub/Bitbucket's
@@ -192,8 +220,15 @@ type FormStructure = HostFormStructure | { form: "shorthand"; rawPath: string };
  * discards userinfo entirely — a pasted `user:pass@` must never round-trip
  * anywhere in the result). Query strings and fragments are stripped from
  * `rawPath`. Returns `null` when there's no authority at all (e.g. bare
- * `"https://"`) or when the authority carries more than one `:` outside
- * userinfo (an unparseable host:port).
+ * `"https://"`), when the authority carries more than one `:` outside
+ * userinfo (an unparseable host:port), or when a stray second `@` survives
+ * into `hostport` (e.g. `ssh://a@b@c/x` — `captureUser`'s single-split-on-
+ * first-`@` leaves `"b@c"` as `hostport`, which is not a valid host[:port]
+ * shape) — that last check is what keeps a malformed multi-`@` authority
+ * from being misattributed into the `port`/`host` fields instead of being
+ * rejected outright, which would otherwise risk echoing attacker-controlled
+ * text (that a user might have intended as more userinfo) back through the
+ * `invalid port "…"` / `invalid host "…"` error messages below.
  */
 function parseAuthorityAndPath(
   rest: string,
@@ -216,7 +251,7 @@ function parseAuthorityAndPath(
     if (captureUser) user = authority.slice(0, atIdx);
     hostport = authority.slice(atIdx + 1);
   }
-  if (!hostport) return null;
+  if (!hostport || hostport.includes("@")) return null;
 
   let host = hostport;
   let port: string | null = null;
@@ -311,8 +346,12 @@ function parseFormStructure(raw: string): FormStructure | null {
  *  (`gitlab-work`, `github-personal`, …) that don't literally equal the
  *  cloud domain. Checked in this order — GitHub, then GitLab, then
  *  Bitbucket — so a (nonsensical) host matching more than one substring
- *  still resolves deterministically. */
-function detectProviderFromHost(host: string): GitProvider | null {
+ *  still resolves deterministically. Exported so `src/bun/clone.ts`'s
+ *  server-side host resolution can reuse the exact same classifier this
+ *  module already applies during parsing, instead of re-implementing the
+ *  substring check and risking drift. `host` need not be pre-normalized —
+ *  this lowercases its own copy. */
+export function cloneProviderForHost(host: string): GitProvider | null {
   const lower = host.toLowerCase();
   if (lower.includes("github")) return "github";
   if (lower.includes("gitlab")) return "gitlab";
@@ -320,7 +359,14 @@ function detectProviderFromHost(host: string): GitProvider | null {
   return null;
 }
 
-function isValidHost(host: string): boolean {
+/** True for a syntactically valid host: `HOST_RE`'s charset (lowercase
+ *  letters, digits, `.`, `-`), never starting with `-` or `.`, never ending
+ *  with `.`. Callers pass an already-lowercased host — this performs no
+ *  normalization of its own (compare `cloneProviderForHost`, which does).
+ *  Exported for the same drift-avoidance reason as `cloneProviderForHost`:
+ *  a server-side caller validating a resolved host should apply this exact
+ *  rule, not a hand-rolled copy of it. */
+export function isValidCloneHost(host: string): boolean {
   return (
     HOST_RE.test(host) &&
     !host.startsWith("-") &&
@@ -346,7 +392,7 @@ function isValidPort(port: string): boolean {
  *  users paste; peeling off exactly one dot lets it parse identically to
  *  `github.com`. Anything past a single trailing dot — `github.com..`, or a
  *  bare `"."` — is deliberately left with a dangling `.` (or empty string)
- *  for `isValidHost` to reject; this function never loops. */
+ *  for `isValidCloneHost` to reject; this function never loops. */
 function stripTrailingDot(host: string): string {
   return host.endsWith(".") ? host.slice(0, -1) : host;
 }
@@ -472,11 +518,17 @@ function trimAndValidateSegments(
  *
  * Never throws; every failure path returns `{ ok: false; error; code }` —
  * `error` a short, lowercase-first, user-facing message that never echoes
- * back any userinfo/password from the input (https userinfo is discarded
- * before it's ever inspected, let alone stored), `code` a
- * `CloneInputErrorCode` classifying *why* (e.g. so the dialog can special-
- * case `"unsupported-host"` without string-matching `error`). Input longer
- * than `CLONE_INPUT_MAX_LEN` is rejected outright, before any parsing, as
+ * back any userinfo/password from the input: https userinfo is discarded
+ * before it's ever inspected, let alone stored (`captureUser: false` in
+ * `parseAuthorityAndPath`), and an ssh-form (`scp`/`ssh-url`) userinfo's
+ * `user:password` shape has its password half discarded by
+ * `splitSshUserinfo` before the user half is ever validated or echoed — an
+ * invalid ssh user is reported as `"invalid ssh user in the URL"`, with no
+ * value interpolated, precisely so a rejected `user:password` can't leak the
+ * password through the error string. `code` a `CloneInputErrorCode`
+ * classifying *why* (e.g. so the dialog can special-case
+ * `"unsupported-host"` without string-matching `error`). Input longer than
+ * `CLONE_INPUT_MAX_LEN` is rejected outright, before any parsing, as
  * `code: "invalid"`.
  */
 export function parseCloneInput(
@@ -517,9 +569,23 @@ export function parseCloneInput(
   }
 
   const host = normalizeHost(structure.host, structure.form);
-  if (!isValidHost(host)) return { ok: false, error: `invalid host "${host}"`, code: "invalid" };
+  if (!isValidCloneHost(host)) return { ok: false, error: `invalid host "${host}"`, code: "invalid" };
 
-  const provider = detectProviderFromHost(host);
+  // No path segment has been typed at all yet — `https://gith`,
+  // `https://example.com`, `https://example.com/`, `git@example.com:` all
+  // land here. This is a mid-paste (or just-picked-a-host) state, not a
+  // wrong host, so it must resolve the same neutral "invalid" way regardless
+  // of whether `host` happens to name a supported provider — hence this runs
+  // *before* the provider check below, not after. Reported identically for
+  // every host-bearing form (https/ssh-url/scp); `shorthand` can't reach
+  // this branch (it never carries a host) and has its own "no `/` at all"
+  // rejection via `SHORTHAND_RE` (→ `code: "unrecognized"`).
+  const rawSegments = splitSegments(structure.rawPath);
+  if (rawSegments.length === 0) {
+    return { ok: false, error: "repository path required", code: "invalid" };
+  }
+
+  const provider = cloneProviderForHost(host);
   if (!provider) {
     return {
       ok: false,
@@ -531,11 +597,16 @@ export function parseCloneInput(
   if (structure.port !== null && !isValidPort(structure.port)) {
     return { ok: false, error: `invalid port "${structure.port}"`, code: "invalid" };
   }
-  if (structure.user !== null && !SSH_USER_RE.test(structure.user)) {
-    return { ok: false, error: `invalid ssh user "${structure.user}"`, code: "invalid" };
+  // A `user:password` userinfo has its password half dropped *before* the
+  // remaining user half is validated — an invalid user is reported with no
+  // value interpolated, so a rejected password can never round-trip through
+  // this error (see the doc comments on `splitSshUserinfo` and this
+  // function's own doc comment above).
+  const user = structure.user !== null ? splitSshUserinfo(structure.user) : null;
+  if (user !== null && !SSH_USER_RE.test(user)) {
+    return { ok: false, error: "invalid ssh user in the URL", code: "invalid" };
   }
 
-  const rawSegments = splitSegments(structure.rawPath);
   const trimmed = trimAndValidateSegments(rawSegments, provider, structure.form);
   if (!trimmed.ok) return trimmed;
   const segments = trimmed.segments;
@@ -550,7 +621,7 @@ export function parseCloneInput(
       scheme: structure.form === "https" ? structure.scheme : null,
       rawHost: host,
       port: structure.port,
-      user: structure.user,
+      user,
       segments,
       fullPath: segments.join("/"),
       repo: segments[segments.length - 1]!,
@@ -576,5 +647,5 @@ export function detectCloneProvider(input: string): GitProvider | null {
   if (!structure || structure.form === "shorthand") return null;
 
   const host = normalizeHost(structure.host, structure.form);
-  return detectProviderFromHost(host);
+  return cloneProviderForHost(host);
 }

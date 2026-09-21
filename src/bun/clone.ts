@@ -2,7 +2,13 @@ import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { GitProvider } from "../shared/types.ts";
-import { CLONE_CLOUD_HOST, CLONE_SUPPORTED_HINT, parseCloneInput } from "../shared/clone-input.ts";
+import {
+  CLONE_CLOUD_HOST,
+  CLONE_SUPPORTED_HINT,
+  cloneProviderForHost,
+  isValidCloneHost,
+  parseCloneInput,
+} from "../shared/clone-input.ts";
 import { apiHostForRemote, bitbucketCreds, gitlabToken } from "./git-provider.ts";
 import { githubToken, run } from "./github.ts";
 import { bitbucketServerError } from "./bitbucket.ts";
@@ -227,6 +233,31 @@ export function resolveCloneRepo(
       };
     }
     if (!resolved.includes(".")) return { ok: false, error: sshAliasHint(rawHost, v.fullPath) };
+    // `resolved` is `ssh -G`'s output for a HOST that reached this point
+    // because it merely *contains* "gitlab" (`cloneProviderForHost`'s cheap
+    // substring heuristic) — an `~/.ssh/config` alias can resolve its
+    // `HostName` to literally anything (a hand-edited config, or a stubbed
+    // `AGETOR_SSH_BIN` in tests). Unlike `rawHost` (already validated by
+    // `parseCloneInput`'s own host charset check), `resolved` has never been
+    // validated before this point, and it's about to be spliced directly
+    // into both `cloneUrl` and `authOrigin` below — so two things must hold
+    // before that happens: it must be a syntactically valid host at all
+    // (`isValidCloneHost`, imported from the shared parser so the two rules
+    // can't drift — a malformed resolution like `evil.example.com/x?tok=1`
+    // would otherwise smuggle an extra path/query segment into the URL), and
+    // it must not itself resolve to a github/bitbucket-shaped host
+    // (`cloneProviderForHost(resolved)` must be `"gitlab"` or `null` —
+    // "unrelated, no substring match" is fine, but a gitlab-named alias
+    // resolving to `github.com` must NOT clone from `github.com` carrying a
+    // GitLab credential origin). Neither check ever fires for the common
+    // case (no alias, or an alias resolving to a real dotted GitLab host).
+    const resolvedProvider = cloneProviderForHost(resolved);
+    if (!isValidCloneHost(resolved) || (resolvedProvider !== null && resolvedProvider !== "gitlab")) {
+      return {
+        ok: false,
+        error: `"${rawHost}" resolves to "${resolved}", which isn't a valid GitLab host — paste the repository's real https URL or its SSH URL`,
+      };
+    }
     // Self-hosted GitLab: keep whatever scheme/port was pasted (never
     // guarded the way the three cloud hosts are above — a self-hosted
     // instance can legitimately run on any port). The HOST component,
@@ -386,17 +417,34 @@ export function cloneAuthEnv(
 }
 
 /**
- * Whether git/ssh's LAST stderr line (matched under `LC_ALL=C`, so these
- * patterns hold regardless of the user's locale) *looks like* the clone
- * failed for an authentication/authorization reason, as opposed to a local
- * or network problem (bad local path, DNS failure, disk full, a genuinely
- * missing binary, …). This is the ONE gate that decides whether it's worth
- * resolving and retrying with a credential — used both by `cloneRepo` (to
- * decide whether to call `opts.auth()` at all) and by `explainCloneFailure`
- * (to decide which hint to show) so the two can never drift apart: a
- * failure `cloneRepo` didn't consider worth a token retry can never later be
+ * Whether a clone's FULL (sanitized, size-bounded — see `sanitizeCloneStderr`)
+ * stderr text (matched under `LC_ALL=C`, so these patterns hold regardless of
+ * the user's locale) *looks like* the clone failed for an
+ * authentication/authorization reason, as opposed to a local or network
+ * problem (bad local path, DNS failure, disk full, a genuinely missing
+ * binary, …). This is the ONE gate that decides whether it's worth resolving
+ * and retrying with a credential — used both by `cloneRepo` (to decide
+ * whether to call `opts.auth()` at all) and by `explainCloneFailure` (to
+ * decide which hint to show) so the two can never drift apart: a failure
+ * `cloneRepo` didn't consider worth a token retry can never later be
  * explained as if a token retry happened, and vice versa. Pure, exported for
  * unit testing, never throws.
+ *
+ * Takes the whole stderr blob rather than a single line — a real git-over-ssh
+ * failure always ends with a fixed multi-line epilogue (`fatal: Could not
+ * read from remote repository.` / blank / `Please make sure you have the
+ * correct access rights` / `and the repository exists.`), and the actual
+ * reason (a permission rejection, an auth rejection, a 404) sits on an
+ * EARLIER line that a last-line-only match would never see. `runGitClone`
+ * still derives a separate `displayLine` (via `pickCloneDisplayLine`) for
+ * user-facing text — this function only ever answers yes/no.
+ *
+ * Every pattern below is written to stay linear-time on an arbitrarily long,
+ * attacker-influenced line (a malicious remote controls its own `remote: …`
+ * text) — no `.*`/`.+` is left unbounded between two literals, since that
+ * turns a non-matching multi-megabyte line into a quadratic-time scan (every
+ * failed start position re-scans forward with no cap). See the timing
+ * regression test in `clone.test.ts`.
  *
  * Patterns: git's own "no credential helper answered" lines (`could not read
  * Username`/`Password`, `terminal prompts disabled`), an explicit auth
@@ -407,32 +455,46 @@ export function cloneAuthEnv(
  * confirming it exists), and the raw HTTP status codes that mean the same
  * thing (`401`/`403`/`404`).
  */
-export function isAuthShapedCloneFailure(stderrLine: string): boolean {
+export function isAuthShapedCloneFailure(stderrText: string): boolean {
   return (
-    /could not read Username/i.test(stderrLine) ||
-    /could not read Password/i.test(stderrLine) ||
-    /Authentication failed/i.test(stderrLine) ||
-    /terminal prompts disabled/i.test(stderrLine) ||
+    /could not read Username/i.test(stderrText) ||
+    /could not read Password/i.test(stderrText) ||
+    /Authentication failed/i.test(stderrText) ||
+    /terminal prompts disabled/i.test(stderrText) ||
     // Covers both GitHub's `remote: Repository not found.` line and the
-    // `fatal: repository '<url>' not found` line git itself prints last (the
-    // one `runGitClone` actually keeps) — the quoted URL sits between the two
-    // words, so a literal "repository not found" substring match would miss
-    // the fatal line.
-    /repository.*not found/i.test(stderrLine) ||
-    /returned error: (401|403|404)\b/.test(stderrLine) ||
+    // `fatal: repository '<url>' not found` line git itself prints (the
+    // quoted URL sits between the two words, so a literal "repository not
+    // found" substring match would miss it) — bounded to a same-line,
+    // ≤300-char gap (`[^\n]{0,300}?`) rather than an unbounded `.*`, which is
+    // what makes this linear-time on a long single line (see the doc comment
+    // above).
+    /repository\b[^\n]{0,300}?not found/i.test(stderrText) ||
+    /returned error: (401|403|404)\b/.test(stderrText) ||
     // GitLab's own wording for an authenticated-but-unauthorized request;
     // `access denied` alone (case-insensitive) already matches it, kept as
     // one general pattern rather than two redundant ones.
-    /access denied/i.test(stderrLine)
+    /access denied/i.test(stderrText)
   );
 }
 
 /**
- * Maps git/ssh's LAST stderr line (matched under `LC_ALL=C`, so these
- * patterns hold regardless of the user's locale) to actionable, user-facing
- * copy — always keeping the original line first, then a hint sentence. Pure
- * and exported for unit testing; never throws. Falls through to the original
- * line, unchanged, for anything it doesn't recognize.
+ * Maps a clone failure to actionable, user-facing copy — always keeping
+ * `displayLine` (see `pickCloneDisplayLine`) first, then a hint sentence.
+ * Pure and exported for unit testing; never throws. Falls through to
+ * `displayLine`, unchanged, for anything it doesn't recognize.
+ *
+ * `stderrText` (matched under `LC_ALL=C`, so these patterns hold regardless
+ * of the user's locale) is the FULL sanitized stderr — used only for
+ * MATCHING (the auth-shaped gate, the moved/host-key/publickey/DNS
+ * patterns), never shown to the user directly. `displayLine` is the single
+ * line `runGitClone` already picked out as the useful one, and is what
+ * actually leads the returned message — this split is what lets a real
+ * git-over-ssh failure (whose epilogue buries the actual reason a few lines
+ * above the generic `fatal: Could not read from remote repository.` closer)
+ * match correctly AND display the right line, instead of the two being
+ * forced to agree on one string. For every existing single-line test fixture
+ * `stderrText === displayLine`, so nothing about the single-line cases below
+ * changes.
  *
  * `ctx.usedToken` distinguishes "no credential attempt ran at all" (no
  * resolver was given, or it resolved to nothing) from "the credential that
@@ -444,50 +506,51 @@ export function isAuthShapedCloneFailure(stderrLine: string): boolean {
  * differs by transport too.
  */
 export function explainCloneFailure(
-  stderrLine: string,
+  stderrText: string,
+  displayLine: string,
   ctx: { transport: "https" | "ssh"; host: string; usedToken: boolean },
 ): string {
   const { host, usedToken, transport } = ctx;
 
-  if (isAuthShapedCloneFailure(stderrLine)) {
+  if (isAuthShapedCloneFailure(stderrText)) {
     if (transport === "ssh") {
-      return `${stderrLine} — Your SSH key doesn't have access to this repository on ${host}, or the path is wrong — check the key loaded in your agent (ssh-add -l) and the repository path.`;
+      return `${displayLine} — Your SSH key doesn't have access to this repository on ${host}, or the path is wrong — check the key loaded in your agent (ssh-add -l) and the repository path.`;
     }
     const authHint = usedToken
       ? `The stored credential for ${host} was rejected or doesn't grant access to this repository — check it in Settings → Git host tokens, and check the repository path.`
       : `If this is a private repository, add a token for ${host} in Settings → Git host tokens, or paste the SSH URL.`;
-    return `${stderrLine} — ${authHint}`;
+    return `${displayLine} — ${authHint}`;
   }
 
-  const movedMatch = stderrLine.match(/returned error: (301|302|307|308)\b/);
+  const movedMatch = stderrText.match(/returned error: (301|302|307|308)\b/);
   if (movedMatch) {
     return usedToken
-      ? `${stderrLine} — The repository has moved — paste its current URL.`
-      : stderrLine;
+      ? `${displayLine} — The repository has moved — paste its current URL.`
+      : displayLine;
   }
 
-  if (/Host key verification failed/i.test(stderrLine)) {
-    return `${stderrLine} — Run "ssh -T git@${host}" once in a terminal to trust the host, then retry.`;
+  if (/Host key verification failed/i.test(stderrText)) {
+    return `${displayLine} — Run "ssh -T git@${host}" once in a terminal to trust the host, then retry.`;
   }
 
-  if (/Permission denied \(publickey/i.test(stderrLine)) {
-    return `${stderrLine} — No SSH key was accepted for ${host} — load your key (ssh-add) or paste the https URL instead.`;
+  if (/Permission denied \(publickey/i.test(stderrText)) {
+    return `${displayLine} — No SSH key was accepted for ${host} — load your key (ssh-add) or paste the https URL instead.`;
   }
 
   // Widened beyond ssh's own "Could not resolve hostname" to also cover
   // git's http backend, which reports a DNS failure as "Could not resolve
   // host: <name>" (curl's wording) instead.
-  if (/Could not resolve host(name)?/i.test(stderrLine)) {
+  if (/Could not resolve host(name)?/i.test(stderrText)) {
     if (transport === "ssh") {
-      return `${stderrLine} — "${host}" didn't resolve — if it's an SSH alias, check ~/.ssh/config.`;
+      return `${displayLine} — "${host}" didn't resolve — if it's an SSH alias, check ~/.ssh/config.`;
     }
     const dotless = host.length > 0 && !host.includes(".");
-    return `${stderrLine} — "${host}" didn't resolve — check the host name${
+    return `${displayLine} — "${host}" didn't resolve — check the host name${
       dotless ? " (an SSH alias only works with the SSH URL)" : ""
     }.`;
   }
 
-  return stderrLine;
+  return displayLine;
 }
 
 /**
@@ -510,20 +573,36 @@ const CLONE_TIMEOUT_MS = 10 * 60 * 1000;
  *  less than this remains of the shared `timeoutMs` budget after attempt 1,
  *  there isn't enough time left for a meaningful attempt 2 (git needs at
  *  least long enough to open a connection and get a first response), so
- *  `cloneRepo` skips the retry outright and reports a timeout instead of
- *  spawning a second `git clone` that has no realistic chance to finish. */
+ *  `cloneRepo` skips the retry outright — reporting attempt 1's OWN
+ *  (non-timeout) failure, not a fabricated timeout, since attempt 1 itself
+ *  never ran out of time (see `cloneRepo`'s doc comment). */
 const RETRY_MIN_TIMEOUT_MS = 5_000;
+
+/** Renders a `cloneRepo` timeout budget as seconds below a minute (`"5
+ *  seconds"`) or whole minutes otherwise (`"10 minutes"`) — a sub-minute
+ *  `timeoutMs` (common in tests) used to round down to a useless "clone
+ *  timed out after 0 minutes". */
+function formatCloneTimeoutDuration(ms: number): string {
+  if (ms < 60_000) {
+    const seconds = Math.max(1, Math.round(ms / 1000));
+    return `${seconds} second${seconds === 1 ? "" : "s"}`;
+  }
+  const minutes = Math.round(ms / 60_000);
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
 
 export interface CloneOptions {
   /** The TOTAL wall-time budget for `cloneRepo`, shared across BOTH the
    *  anonymous attempt and the token retry (default `CLONE_TIMEOUT_MS`, 10
    *  minutes) — not a per-attempt timeout. Attempt 2 (if it runs at all)
    *  gets whatever remains after attempt 1, floored by `RETRY_MIN_TIMEOUT_MS`
-   *  below which the retry is skipped and the failure is reported as a
-   *  timeout. `cloneRepo`'s own wall time is therefore bounded by
-   *  `timeoutMs` plus the (separately, already-bounded) time `opts.auth()`
-   *  itself takes to resolve — callers with their own outer timeout (the
-   *  CLI's 15-minute client timeout) must budget for both. */
+   *  below which the retry is skipped outright — WITHOUT reporting a
+   *  timeout, since attempt 1 itself didn't time out (its own explained
+   *  failure is reported instead; see `cloneRepo`'s doc comment).
+   *  `cloneRepo`'s own wall time is therefore bounded by `timeoutMs` plus
+   *  the (separately, already-bounded) time `opts.auth()` itself takes to
+   *  resolve — callers with their own outer timeout (the CLI's 15-minute
+   *  client timeout) must budget for both. */
   timeoutMs?: number;
   /** Resolves the header line to retry with after an anonymous clone fails
    *  for what looks like an auth/authorization reason (see
@@ -538,6 +617,141 @@ export interface CloneOptions {
   host?: string;
 }
 
+/** C0 (`0x00`–`0x1F`) and C1 (`0x7F`, `0x80`–`0x9F`) control characters,
+ *  except `\n` (`0x0A`) and `\t` (`0x09`) — stripped from a clone's stderr
+ *  before it's ever matched against a pattern or shown to the user (fix for
+ *  a review finding: a malicious remote controls its own `remote: …` text,
+ *  which could otherwise carry a raw ANSI escape sequence — e.g. a color
+ *  code, or a cursor-movement sequence aimed at whatever terminal/log viewer
+ *  eventually renders it). Removing the ESC (`0x1B`) introducer is what
+ *  neutralizes an escape sequence: its trailing printable bytes (`[31m`, …)
+ *  survive as harmless literal text instead of a control sequence. */
+const CLONE_STDERR_CONTROL_CHARS_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g;
+
+/** Per-line and total-size caps applied to a clone's stderr AFTER control-
+ *  character stripping (see `CLONE_STDERR_CONTROL_CHARS_RE`) — belt-and-
+ *  suspenders alongside making every pattern in `isAuthShapedCloneFailure`/
+ *  `explainCloneFailure` linear-time (their own doc comments): a remote-
+ *  controlled line could otherwise be arbitrarily long, and even a linear
+ *  scan across several regexes on a multi-megabyte string isn't free.
+ *  `CLONE_STDERR_MAX_TOTAL_CHARS` is applied by keeping the TAIL
+ *  (`.slice(-N)`), since the actionable line is always near the end. */
+const CLONE_STDERR_MAX_LINE_CHARS = 500;
+const CLONE_STDERR_MAX_LINES = 50;
+const CLONE_STDERR_MAX_TOTAL_CHARS = 16 * 1024;
+
+/** Hard cap on how many raw bytes `readBoundedCloneStderr` accumulates from
+ *  the child's stderr pipe — independent of, and larger than,
+ *  `CLONE_STDERR_MAX_TOTAL_CHARS` above (which trims the already-decoded
+ *  text). This one bounds how much memory a single attempt's stderr reader
+ *  can hold in the first place, per the review finding that reading a
+ *  remote-controlled stream fully into memory before ever truncating it is
+ *  itself unbounded. Past the cap the reader keeps draining the stream (so
+ *  the child's pipe never backs up and blocks it) but stops accumulating —
+ *  nothing past this point could survive the tail-keeping trim below
+ *  anyway. */
+const CLONE_STDERR_READ_CAP_BYTES = 1 * 1024 * 1024;
+
+async function readBoundedCloneStderr(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value && total < CLONE_STDERR_READ_CAP_BYTES) {
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  }
+  if (chunks.length === 0) return "";
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
+}
+
+/**
+ * Sanitizes+bounds a clone's raw stderr exactly once, in `runGitClone`,
+ * before the result is ever handed to `isAuthShapedCloneFailure`,
+ * `explainCloneFailure`, or `pickCloneDisplayLine`: strips control
+ * characters (`CLONE_STDERR_CONTROL_CHARS_RE`), then caps each line to
+ * `CLONE_STDERR_MAX_LINE_CHARS` and the whole text to the last
+ * `CLONE_STDERR_MAX_LINES` lines / `CLONE_STDERR_MAX_TOTAL_CHARS`
+ * characters. Exported for the timing regression test only. Pure, never
+ * throws.
+ */
+export function sanitizeCloneStderr(raw: string): string {
+  const stripped = raw.replace(CLONE_STDERR_CONTROL_CHARS_RE, "");
+  const lines = stripped
+    .split("\n")
+    .map((line) => (line.length > CLONE_STDERR_MAX_LINE_CHARS ? line.slice(0, CLONE_STDERR_MAX_LINE_CHARS) : line));
+  const bounded = lines.length > CLONE_STDERR_MAX_LINES ? lines.slice(-CLONE_STDERR_MAX_LINES) : lines;
+  const joined = bounded.join("\n");
+  return joined.length > CLONE_STDERR_MAX_TOTAL_CHARS ? joined.slice(-CLONE_STDERR_MAX_TOTAL_CHARS) : joined;
+}
+
+/** The fixed epilogue line git's ssh/git-shell backend always closes a
+ *  failed fetch with — see `pickCloneDisplayLine`'s doc comment. Matched as
+ *  an exact (trimmed) line, never as a substring, so a DIFFERENT, more
+ *  specific `fatal:`-prefixed line (e.g. `fatal: repository '<url>' not
+ *  found`) is never mistaken for this generic one. */
+const CLONE_GENERIC_NO_REMOTE_FATAL = "fatal: Could not read from remote repository.";
+
+/** Git's own noise wrapper lines around the actual failure reason — see
+ *  `pickCloneDisplayLine`. Matched against an already-trimmed line. */
+function isNoiseCloneStderrLine(line: string): boolean {
+  return (
+    line === "Please make sure you have the correct access rights" ||
+    line === "and the repository exists." ||
+    line.startsWith("Cloning into '") ||
+    /^warning:/i.test(line)
+  );
+}
+
+/**
+ * Picks the single most useful line out of a clone's (already sanitized —
+ * see `sanitizeCloneStderr`) stderr for DISPLAY. Every git-over-ssh failure
+ * ends with a FIXED multi-line epilogue: `fatal: Could not read from remote
+ * repository.` / blank / `Please make sure you have the correct access
+ * rights` / `and the repository exists.` — so naively keeping "the last
+ * non-empty line" (the old behavior) always surfaces `and the repository
+ * exists.`, no matter what actually failed, and leaves every ssh-specific
+ * branch of `explainCloneFailure` (the auth hint, `Host key verification
+ * failed`, `Permission denied (publickey`, `Could not resolve hostname`)
+ * dead code.
+ *
+ * Scans non-empty (trimmed) lines from the END, skipping git's own noise
+ * wrapper lines (`isNoiseCloneStderrLine`); the generic
+ * `CLONE_GENERIC_NO_REMOTE_FATAL` closer is ALSO skipped, but only when a
+ * more specific, earlier (i.e. still-surviving after the noise skip) line
+ * remains underneath it — that earlier line is the actual reason the
+ * epilogue is wrapping (`Host key verification failed.` / `git@host:
+ * Permission denied (publickey).` / `ssh: Could not resolve hostname …` /
+ * `ERROR: Repository not found.`, …). When nothing more specific survives
+ * (the generic line is genuinely the only substantive one), it's returned
+ * as-is — better than nothing. Falls back to the whole trimmed text when
+ * every line was noise (defensive; a real failure always has at least one
+ * substantive line).
+ *
+ * Verified against two REAL captures (git 2.51, macOS, `GIT_SSH_COMMAND="ssh
+ * -o BatchMode=yes"`, no network required — see `clone.test.ts`): `git clone
+ * ssh://git@127.0.0.1:2/does/not/exist.git` (connection refused) and a
+ * clone against an unresolvable hostname, both of which print exactly this
+ * epilogue shape around the real ssh-layer error line.
+ */
+export function pickCloneDisplayLine(stderrText: string): string {
+  const lines = stderrText
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const substantive = lines.filter((line) => !isNoiseCloneStderrLine(line));
+  if (substantive.length === 0) return stderrText.trim();
+
+  let end = substantive.length;
+  while (end > 1 && substantive[end - 1] === CLONE_GENERIC_NO_REMOTE_FATAL) {
+    end--;
+  }
+  return substantive[end - 1]!;
+}
+
 /** One `git clone -- <url> <dest>` attempt. Shared by both the anonymous and
  *  the token-retry attempt in `cloneRepo` below — the only difference between
  *  them is `extraEnv`. Sets `GIT_TERMINAL_PROMPT=0` (never hang on a
@@ -547,13 +761,19 @@ export interface CloneOptions {
  *  `--global`/`--system` scope only — see below) is already set, also sets
  *  `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` so an ssh clone can't hang on a
  *  host-key or passphrase prompt either — a user who already configured
- *  their own ssh command is left alone. */
+ *  their own ssh command is left alone.
+ *
+ *  Returns BOTH the full sanitized+bounded stderr (`stderr`, for
+ *  `isAuthShapedCloneFailure`/`explainCloneFailure`'s pattern matching) and a
+ *  single `displayLine` (`pickCloneDisplayLine`, for the leading sentence of
+ *  a user-facing message) — see those functions' doc comments for why the
+ *  two are no longer the same string. */
 async function runGitClone(
   source: string,
   dest: string,
   extraEnv: Record<string, string>,
   timeoutMs: number,
-): Promise<{ ok: boolean; stderrLine: string; timedOut: boolean }> {
+): Promise<{ ok: boolean; stderr: string; displayLine: string; timedOut: boolean }> {
   const env: Record<string, string | undefined> = {
     ...process.env,
     GIT_TERMINAL_PROMPT: "0",
@@ -592,9 +812,10 @@ async function runGitClone(
     proc.kill();
   }, timeoutMs);
   try {
-    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-    const stderrLine = stderr.trim().split("\n").filter(Boolean).pop() ?? `git exited ${exitCode}`;
-    return { ok: exitCode === 0, stderrLine, timedOut };
+    const [rawStderr, exitCode] = await Promise.all([readBoundedCloneStderr(proc.stderr), proc.exited]);
+    const stderr = sanitizeCloneStderr(rawStderr);
+    const displayLine = stderr.trim() ? pickCloneDisplayLine(stderr) : `git exited ${exitCode}`;
+    return { ok: exitCode === 0, stderr, displayLine, timedOut };
   } finally {
     clearTimeout(timer);
   }
@@ -638,15 +859,17 @@ function checkCloneDestination(dest: string): CloneResult {
  * Attempt 1 runs anonymously, exactly like a plain `git clone`, against the
  * FULL `timeoutMs` budget. If it fails and did NOT time out, the retry only
  * happens when BOTH `opts.auth` is given AND the failure actually LOOKS
- * auth-shaped (`isAuthShapedCloneFailure` on attempt 1's stderr line) — a
- * non-auth failure (bad local path, DNS failure, disk full, …) never calls
+ * auth-shaped (`isAuthShapedCloneFailure` on attempt 1's FULL stderr text) —
+ * a non-auth failure (bad local path, DNS failure, disk full, …) never calls
  * `opts.auth` and never shells out to whatever credential helper it uses
  * (`gh`/`glab`/…). When the gate passes: `timeoutMs` is a budget SHARED by
  * both attempts, not per-attempt — attempt 2 gets only what's left after
  * attempt 1 (`Date.now()`-measured), floored by `RETRY_MIN_TIMEOUT_MS`; below
  * that floor there isn't enough time left for a meaningful second attempt,
- * so the retry is skipped entirely (no `opts.auth()` call either) and the
- * failure is reported as a timeout. Otherwise `checkCloneDestination` is
+ * so the retry is skipped entirely (no `opts.auth()` call either) — WITHOUT
+ * reporting a timeout, since attempt 1 itself never ran out of time; its own
+ * explained failure is reported instead, exactly as the destination-recheck
+ * branch immediately below already does. `checkCloneDestination` is
  * re-run first (in case attempt 1, or something external, left `dest` in a
  * state a second `git clone` shouldn't run into — see below); if that fails,
  * attempt 1's own failure is what gets reported (via `explainCloneFailure`,
@@ -678,7 +901,15 @@ function checkCloneDestination(dest: string): CloneResult {
  * The final error always reflects the LAST attempt's stderr, run through
  * `explainCloneFailure` with `usedToken` set from whether a retry actually
  * ran (`ctx.transport`/`ctx.host` come from `opts`, for its ssh-vs-https and
- * hostname-specific copy).
+ * hostname-specific copy). When the shared budget runs out BEFORE a retry
+ * ever starts (the `RETRY_MIN_TIMEOUT_MS` floor above), the error still
+ * reflects attempt 1's own (non-timeout) failure, never a fabricated
+ * timeout — attempt 1 itself didn't time out, so reporting one would be
+ * misleading; a genuine timeout is only ever reported when `runGitClone`
+ * itself says `timedOut: true` for the attempt that actually ran out of
+ * time. `formatCloneTimeoutDuration` renders that message in seconds below
+ * a minute (`"5 seconds"`) rather than rounding down to a useless "0
+ * minutes".
  */
 export async function cloneRepo(
   cloneUrl: string,
@@ -697,28 +928,40 @@ export async function cloneRepo(
   const transport = opts.transport ?? "https";
   const timedOutResult = (): CloneResult => ({
     ok: false,
-    error: `clone timed out after ${Math.round(timeoutMs / 60_000)} minutes`,
+    error: `clone timed out after ${formatCloneTimeoutDuration(timeoutMs)}`,
   });
 
   const startedAt = Date.now();
   const attempt1 = await runGitClone(source, dest, {}, timeoutMs);
   if (attempt1.ok) return { ok: true };
   if (attempt1.timedOut) return timedOutResult();
+  // Attempt 1's own (non-timeout) failure, run through `explainCloneFailure`
+  // with `usedToken: false` — reused by both early-return branches below
+  // (not enough budget left for a retry; `dest` no longer safe to retry
+  // into), since attempt 1's failure is the more useful thing to tell the
+  // user about than a destination error, and — per the fix below — a
+  // fabricated timeout is never useful when nothing actually timed out.
+  const attempt1FailureResult: CloneResult = {
+    ok: false,
+    error: `clone failed: ${explainCloneFailure(attempt1.stderr, attempt1.displayLine, { transport, host, usedToken: false })}`,
+  };
 
   let usedToken = false;
-  let last = attempt1;
-  if (opts.auth && isAuthShapedCloneFailure(attempt1.stderrLine)) {
+  let last: { ok: boolean; stderr: string; displayLine: string; timedOut: boolean } = attempt1;
+  if (opts.auth && isAuthShapedCloneFailure(attempt1.stderr)) {
     const remainingMs = timeoutMs - (Date.now() - startedAt);
     if (remainingMs < RETRY_MIN_TIMEOUT_MS) {
-      return timedOutResult();
+      // Attempt 1 itself did NOT time out (checked above) — there's simply
+      // not enough of the SHARED budget left for a meaningful retry. This
+      // used to report a timeout here regardless, which was wrong: nothing
+      // timed out, so surface attempt 1's own explained failure instead,
+      // exactly like the no-retry-attempted path below already does.
+      return attempt1FailureResult;
     }
 
     const destCheck2 = checkCloneDestination(dest);
     if (!destCheck2.ok) {
-      return {
-        ok: false,
-        error: `clone failed: ${explainCloneFailure(attempt1.stderrLine, { transport, host, usedToken: false })}`,
-      };
+      return attempt1FailureResult;
     }
 
     const auth = await opts.auth().catch(() => null);
@@ -733,6 +976,6 @@ export async function cloneRepo(
 
   return {
     ok: false,
-    error: `clone failed: ${explainCloneFailure(last.stderrLine, { transport, host, usedToken })}`,
+    error: `clone failed: ${explainCloneFailure(last.stderr, last.displayLine, { transport, host, usedToken })}`,
   };
 }

@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  cloneProviderForHost,
   CLONE_CLOUD_HOST,
   CLONE_INPUT_MAX_LEN,
   CLONE_PROVIDERS,
   CLONE_SUPPORTED_HINT,
   detectCloneProvider,
   isGitProvider,
+  isValidCloneHost,
   parseCloneInput,
   type ParsedCloneInput,
 } from "./clone-input.ts";
@@ -807,5 +809,225 @@ describe("detectCloneProvider", () => {
   test("uppercase host is detected case-insensitively", () => {
     expect(detectCloneProvider("https://GITHUB.com/owner/repo")).toBe("github");
     expect(detectCloneProvider("HTTPS://GitLab.COM/owner/repo")).toBe("gitlab");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// exported host helpers (isValidCloneHost / cloneProviderForHost)
+// ---------------------------------------------------------------------------
+
+describe("isValidCloneHost", () => {
+  test("true for ordinary hosts", () => {
+    expect(isValidCloneHost("github.com")).toBe(true);
+    expect(isValidCloneHost("gitlab.mycompany.com")).toBe(true);
+    expect(isValidCloneHost("gitlab-work")).toBe(true);
+    expect(isValidCloneHost("a")).toBe(true);
+  });
+
+  test("false for a leading dash or dot, a trailing dot, or a disallowed character", () => {
+    expect(isValidCloneHost("-oProxyCommand=x")).toBe(false);
+    expect(isValidCloneHost(".github.com")).toBe(false);
+    expect(isValidCloneHost("github.com.")).toBe(false);
+    expect(isValidCloneHost("git_hub.com")).toBe(false);
+    expect(isValidCloneHost("")).toBe(false);
+  });
+});
+
+describe("cloneProviderForHost", () => {
+  test("substring match for each provider, checked GitHub then GitLab then Bitbucket", () => {
+    expect(cloneProviderForHost("github.com")).toBe("github");
+    expect(cloneProviderForHost("gitlab.com")).toBe("gitlab");
+    expect(cloneProviderForHost("bitbucket.org")).toBe("bitbucket");
+    expect(cloneProviderForHost("gitlab-work")).toBe("gitlab");
+    expect(cloneProviderForHost("github-work.internal.example.com")).toBe("github");
+  });
+
+  test("case-insensitive", () => {
+    expect(cloneProviderForHost("GitHub.COM")).toBe("github");
+  });
+
+  test("null for a host naming no supported provider", () => {
+    expect(cloneProviderForHost("example.com")).toBeNull();
+    expect(cloneProviderForHost("gogs.example.com")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ssh userinfo password is dropped, never validated, never echoed
+// ---------------------------------------------------------------------------
+
+describe("parseCloneInput — ssh userinfo password is dropped", () => {
+  test("ssh-url: user:password parses ok with the password silently dropped", () => {
+    const v = expectOk("ssh://oauth2:s3cr3t-token@gitlab.com/g/p.git");
+    expect(v.user).toBe("oauth2");
+    expect(v.provider).toBe("gitlab");
+    const serialized = JSON.stringify(v);
+    expect(serialized).not.toContain("s3cr3t-token");
+  });
+
+  test("scp: user:password parses ok with the password silently dropped", () => {
+    const v = expectOk("oauth2:s3cr3t-token@gitlab.com:g/p.git");
+    expect(v.user).toBe("oauth2");
+    expect(v.provider).toBe("gitlab");
+    const serialized = JSON.stringify(v);
+    expect(serialized).not.toContain("s3cr3t-token");
+  });
+
+  test("an invalid user (password present) is reported with no value interpolated", () => {
+    const r = expectErr("ssh://-x:s3cr3t-token@github.com/o/r");
+    expect(r.code).toBe("invalid");
+    expect(r.error).toBe("invalid ssh user in the URL");
+    expect(r.error).not.toContain("s3cr3t-token");
+    expect(r.error).not.toContain("-x");
+  });
+
+  test("an invalid scp user (password present) is reported with no value interpolated", () => {
+    const r = expectErr("-x:s3cr3t-token@github.com:o/r");
+    expect(r.code).toBe("invalid");
+    expect(r.error).toBe("invalid ssh user in the URL");
+    expect(r.error).not.toContain("s3cr3t-token");
+    expect(r.error).not.toContain("-x");
+  });
+
+  test("a user with no password is unaffected (no colon to split on)", () => {
+    const v = expectOk("ssh://git@github.com/o/r");
+    expect(v.user).toBe("git");
+  });
+
+  test("https userinfo (already covered) is unaffected by the ssh-user split", () => {
+    const v = expectOk("https://user:pass@github.com/o/r");
+    expect(v.user).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// no path typed yet reports "invalid", never "unsupported-host"
+// ---------------------------------------------------------------------------
+
+describe("parseCloneInput — no path typed yet is 'invalid', not 'unsupported-host'", () => {
+  test("https host fragment with no path at all (unsupported host)", () => {
+    const r = expectErr("https://gith");
+    expect(r.code).toBe("invalid");
+    expect(r.error).toBe("repository path required");
+  });
+
+  test("https full unsupported host, no path, no trailing slash", () => {
+    const r = expectErr("https://example.com");
+    expect(r.code).toBe("invalid");
+    expect(r.error).toBe("repository path required");
+  });
+
+  test("https full unsupported host, trailing slash, no path", () => {
+    const r = expectErr("https://example.com/");
+    expect(r.code).toBe("invalid");
+    expect(r.error).toBe("repository path required");
+  });
+
+  test("scp unsupported host with a trailing colon and no path", () => {
+    const r = expectErr("git@example.com:");
+    expect(r.code).toBe("invalid");
+    expect(r.error).toBe("repository path required");
+  });
+
+  test("the same 'no path yet' shapes against a SUPPORTED host are equally 'invalid'", () => {
+    for (const input of ["https://github.com", "https://github.com/", "git@github.com:", "ssh://git@github.com"]) {
+      const r = expectErr(input);
+      expect(r.code).toBe("invalid");
+      expect(r.error).toBe("repository path required");
+    }
+  });
+
+  test("once a path segment exists, an unsupported host reports 'unsupported-host' as before", () => {
+    const r = expectErr("https://gith/o");
+    expect(r.code).toBe("unsupported-host");
+  });
+
+  test("keystroke progression: every prefix of a full github https URL never reports 'unsupported-host'", () => {
+    const full = "https://github.com/owner/repo";
+    for (let i = 1; i <= full.length; i++) {
+      const prefix = full.slice(0, i);
+      const result = parseCloneInput(prefix);
+      if (!result.ok) expect(result.code).not.toBe("unsupported-host");
+    }
+  });
+
+  test("keystroke progression: every prefix of a full gitlab scp URL never reports 'unsupported-host'", () => {
+    const full = "git@gitlab.com:group/project.git";
+    for (let i = 1; i <= full.length; i++) {
+      const prefix = full.slice(0, i);
+      const result = parseCloneInput(prefix);
+      if (!result.ok) expect(result.code).not.toBe("unsupported-host");
+    }
+  });
+
+  test("keystroke progression against an UNSUPPORTED host only flips to 'unsupported-host' once a path segment exists", () => {
+    // Typing "https://example.com/o" one character at a time: every prefix
+    // before the first non-empty path segment must be "invalid" (mid-typing
+    // neutral), never "unsupported-host" — the flip happens only once a `/`
+    // is followed by at least one path character.
+    const full = "https://example.com/o";
+    let sawUnsupported = false;
+    for (let i = 1; i <= full.length; i++) {
+      const prefix = full.slice(0, i);
+      const result = parseCloneInput(prefix);
+      if (!result.ok && result.code === "unsupported-host") sawUnsupported = true;
+      if (!result.ok && !sawUnsupported) expect(result.code).not.toBe("unsupported-host");
+    }
+    expect(sawUnsupported).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// property-style: a secret in the userinfo/password position never leaks,
+// across every form and every reachable error code (plus the ok path).
+// ---------------------------------------------------------------------------
+
+describe("parseCloneInput — userinfo/password never leaks (property-style)", () => {
+  const SECRET = "s3cr3t-t0ken-9f8e7d";
+
+  function assertNoLeak(input: string, expectedCode?: CloneInputErrorCodeLike) {
+    const result = parseCloneInput(input);
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(SECRET);
+    if (expectedCode === "ok") {
+      expect(result.ok).toBe(true);
+    } else if (expectedCode && !result.ok) {
+      expect(result.code).toBe(expectedCode);
+    }
+    return result;
+  }
+
+  type CloneInputErrorCodeLike = "ok" | "empty" | "unrecognized" | "unsupported-host" | "invalid";
+
+  test("https — ok, unsupported-host, invalid (bad path), unrecognized (malformed authority)", () => {
+    assertNoLeak(`https://user:${SECRET}@github.com/o/r`, "ok");
+    assertNoLeak(`https://user:${SECRET}@evil.example.com/o/r`, "unsupported-host");
+    assertNoLeak(`https://user:${SECRET}@github.com/owner/..`, "invalid");
+    assertNoLeak(`https://user:${SECRET}@host:1:2/o/r`, "unrecognized");
+  });
+
+  test("ssh-url — ok, unsupported-host, invalid (bad user), invalid (too many segments), unrecognized", () => {
+    assertNoLeak(`ssh://user:${SECRET}@github.com/o/r`, "ok");
+    assertNoLeak(`ssh://user:${SECRET}@evil.example.com/o/r`, "unsupported-host");
+    assertNoLeak(`ssh://-x:${SECRET}@github.com/o/r`, "invalid");
+    assertNoLeak(`ssh://user:${SECRET}@github.com/owner/middle/repo`, "invalid");
+    assertNoLeak(`ssh://user:${SECRET}@host:1:2/o/r`, "unrecognized");
+  });
+
+  test("scp — ok, unsupported-host, invalid (bad user), invalid (too many segments), unrecognized", () => {
+    assertNoLeak(`user:${SECRET}@github.com:o/r`, "ok");
+    assertNoLeak(`user:${SECRET}@evil.example.com:o/r`, "unsupported-host");
+    assertNoLeak(`-x:${SECRET}@github.com:o/r`, "invalid");
+    assertNoLeak(`user:${SECRET}@github.com:owner/middle/repo`, "invalid");
+    assertNoLeak(`user:${SECRET}@mailto:x`, "unrecognized");
+  });
+
+  test("a stray second '@' after the authority (malformed) never leaks either", () => {
+    // `ssh://a@github:SECRET@evil.com/o/r` would, without the
+    // stray-second-`@` guard in `parseAuthorityAndPath`, misattribute
+    // "SECRET@evil.com" into the `port` field and echo it via "invalid port
+    // \"…\"". The guard rejects the whole authority instead (unrecognized).
+    const r = assertNoLeak(`ssh://a@github:${SECRET}@evil.com/o/r`, "unrecognized");
+    expect(r.ok).toBe(false);
   });
 });
