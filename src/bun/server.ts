@@ -31,7 +31,8 @@ import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./tas
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
 import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
-import { buildEli5Prompt, cloneRepo, defaultCloneDest, eli5TaskTitle, parseGitHubRepo } from "./clone.ts";
+import { cloneRepo, defaultCloneDest, parseGitHubRepo } from "./clone.ts";
+import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -574,6 +575,72 @@ function withTaskCounts(list: AgentProfile[]): AgentProfile[] {
 }
 
 /**
+ * Validate the optional launch-picker fields on `POST /projects/clone`
+ * (docs/plans/clone-repository-launch-pickers.md D3) BEFORE `cloneRepo` runs,
+ * so a bad profile/harness id 400s with nothing cloned to disk instead of
+ * cloning and then reporting `eli5Error`. Mirrors `createTask`'s own
+ * precedence: a resolvable `agentProfileId` wins and the six manual fields
+ * are not forwarded to it.
+ */
+function validateCloneLaunch(
+  body: Record<string, unknown>,
+): { agentProfileId?: string; agent?: string; mode?: string; model?: string; effort?: string | null; fast?: boolean; maxMode?: boolean } | { error: string } {
+  let agentProfileId: string | undefined;
+  if (body.agentProfileId !== undefined && body.agentProfileId !== null) {
+    if (typeof body.agentProfileId !== "string") {
+      return { error: "agentProfileId must be a string" };
+    }
+    const trimmed = body.agentProfileId.trim();
+    if (trimmed) {
+      const profile = agentProfiles.get(trimmed);
+      if (!profile) {
+        return { error: `unknown agent profile "${trimmed}"` };
+      }
+      // `createTask` resolves the profile's own harness and fails on a
+      // dangling one — catch that here too, before anything is cloned.
+      if (!harnesses.getByIdOrKind(profile.harness)) {
+        return { error: `unknown harness "${profile.harness}"` };
+      }
+      agentProfileId = trimmed;
+    }
+  }
+
+  if (body.agent !== undefined && typeof body.agent !== "string") {
+    return { error: "agent must be a string" };
+  }
+  if (body.mode !== undefined && typeof body.mode !== "string") {
+    return { error: "mode must be a string" };
+  }
+  if (body.model !== undefined && typeof body.model !== "string") {
+    return { error: "model must be a string" };
+  }
+  if (body.effort !== undefined && body.effort !== null && typeof body.effort !== "string") {
+    return { error: "effort must be a string or null" };
+  }
+  if (body.fast !== undefined && typeof body.fast !== "boolean") {
+    return { error: "fast must be a boolean" };
+  }
+  if (body.maxMode !== undefined && typeof body.maxMode !== "boolean") {
+    return { error: "maxMode must be a boolean" };
+  }
+
+  if (agentProfileId) return { agentProfileId };
+
+  if (typeof body.agent === "string" && !harnesses.getByIdOrKind(body.agent)) {
+    return { error: `unknown harness "${body.agent}"` };
+  }
+
+  const out: { agent?: string; mode?: string; model?: string; effort?: string | null; fast?: boolean; maxMode?: boolean } = {};
+  if (typeof body.agent === "string") out.agent = body.agent;
+  if (typeof body.mode === "string") out.mode = body.mode;
+  if (typeof body.model === "string") out.model = body.model;
+  if (body.effort !== undefined) out.effort = body.effort as string | null;
+  if (typeof body.fast === "boolean") out.fast = body.fast;
+  if (typeof body.maxMode === "boolean") out.maxMode = body.maxMode;
+  return out;
+}
+
+/**
  * Native-host capabilities the API needs but that only exist inside the
  * Electrobun app: file/folder dialogs, OS notifications, open-in-Finder /
  * open-in-browser, the self-updater, and app quit. The Electrobun entry
@@ -734,11 +801,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
-      // Checkout an existing GitHub repo as a new project: clone it, register
-      // the destination in the projects list, and (unless eli5:false) create +
-      // start a claude-code task that writes an ELI5.md explainer at the clone's
-      // root. The explainer goes through agetor's own agent driver — never a
-      // direct LLM API call — so it shows up on the board like any other task.
+      // Clone repository: clone an existing GitHub repo, register the
+      // destination in the projects list, and (unless eli5:false) create +
+      // start a task that writes an ELI5.md explainer at the clone's root,
+      // on the caller's selected agent profile / harness (default: the
+      // built-in claude-code). The explainer goes through agetor's own agent
+      // driver — never a direct LLM API call — so it shows up on the board
+      // like any other task.
       "/projects/clone": {
         POST: authed(async (req) => {
           // Clones are network-bound and can take minutes; disable the
@@ -748,6 +817,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             url?: unknown;
             dest?: unknown;
             eli5?: unknown;
+            agent?: unknown;
+            mode?: unknown;
+            model?: unknown;
+            effort?: unknown;
+            fast?: unknown;
+            maxMode?: unknown;
+            agentProfileId?: unknown;
           };
           const url = typeof body.url === "string" ? body.url.trim() : "";
           if (!url) return json({ error: "url required" }, { status: 400, headers: corsHeaders(req) });
@@ -765,6 +841,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (!path.isAbsolute(dest)) {
             return json({ error: "dest must be an absolute path" }, { status: 400, headers: corsHeaders(req) });
           }
+
+          // Validate the launch selection before cloning anything to disk —
+          // see validateCloneLaunch's doc comment. Only checked when eli5 is
+          // actually going to run.
+          const runEli5 = body.eli5 !== false;
+          const launch: ReturnType<typeof validateCloneLaunch> =
+            runEli5 ? validateCloneLaunch(body) : {};
+          if ("error" in launch) {
+            return json({ error: launch.error }, { status: 400, headers: corsHeaders(req) });
+          }
+
           const cloned = await cloneRepo(parsed.cloneUrl, dest);
           if (!cloned.ok) {
             return json({ error: cloned.error }, { status: 502, headers: corsHeaders(req) });
@@ -777,12 +864,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // rolls back the clone — the project is already usable.
           let eli5TaskId: string | null = null;
           let eli5Error: string | null = null;
-          if (body.eli5 !== false) {
+          if (runEli5) {
             const created = await createTask({
               title: eli5TaskTitle(parsed.repo),
               prompt: buildEli5Prompt(parsed.repo),
               workdir: dest,
               isolation: "none",
+              ...launch,
             });
             if ("error" in created) {
               eli5Error = created.error;
