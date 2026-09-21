@@ -3,14 +3,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from "node:
 import { homedir, tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
-import {
-  ELI5_FILENAME,
-  buildEli5Prompt,
-  cloneRepo,
-  defaultCloneDest,
-  eli5TaskTitle,
-  parseGitHubRepo,
-} from "./clone.ts";
+import { cloneRepo, defaultCloneDest, parseGitHubRepo } from "./clone.ts";
+import { ELI5_FILENAME, buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 
 // clone.ts has no db.ts dependency, so no AGETOR_DATA_DIR dance is needed.
 
