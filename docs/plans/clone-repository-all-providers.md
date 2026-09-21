@@ -7,8 +7,8 @@
 | Config | AGENTS_CONFIG.yml (balanced, v1 schema) — host `claude_code` |
 | Flags | none |
 | Gates | grilled by owner (two passes, answers in §8) + plan approval by owner |
-| Branch | TBD — set in Phase 4 |
-| Base SHA | TBD — set in Phase 4 |
+| Branch | `feature/git-checkout-modal-support-all-git-provi`, **stacked on** `feature/add-profile-and-harnesses-selection-to-g` (owner decision — see §2 "Peer overlap") |
+| Base SHA | `1bef09d` (merge of the peer branch @ `2b67dfb` onto the plan commit; pre-merge main base `11c954f`) — review diffs against `1bef09d` |
 
 ## 1. Objective & success criteria
 
@@ -76,8 +76,16 @@ Done means:
   backend is a per-worker `bun src/bun/headless.ts` child whose env is fixed at spawn
   (`e2e/fixtures.ts:290-361`), so `AGETOR_CLONE_SOURCE_OVERRIDE` can only be set worker-wide.
 - **Peer overlap:** session `warm-sea-299c` (branch `feature/add-profile-and-harnesses-selection-to-g`)
-  is adding harness/profile pickers to this same modal's ELI5 step. Notified; this plan leaves the ELI5
-  switch block in the dialog and the `createTask` call in the route byte-identical to keep hunks apart.
+  added harness/profile pickers to this same modal's ELI5 step and landed the provider-neutral rename
+  (title "Clone repository", menu "Clone repository…", button "Clone", toast "Cloned <name>"), the
+  `api.cloneProject` options object (`retry: false`), test ids (`project-clone-open`,
+  `clone-project-dialog`, `clone-url`, `clone-dest`, `clone-eli5-switch`, `clone-launch`, `clone-submit`),
+  `validateCloneLaunch` in the route, the ELI5 helpers' move to `src/shared/clone-eli5.ts`, an e2e spec
+  (`e2e/clone-project.spec.ts`, using the existing `test.use({ backendEnv })` + `freshBackend` seam for
+  `AGETOR_CLONE_SOURCE_OVERRIDE`) and CLAUDE.md item 18. **Post-approval amendment (owner decision):** this
+  branch is stacked on that one (merged at `1bef09d`), so the parts of D7/D9/T3/T5/T6 that duplicated it
+  are already done — what remains is listed in the amended tasks below. The ELI5/launch block in the
+  dialog and the `validateCloneLaunch`/`createTask` code in the route stay untouched.
 
 ## 3. Approach & key decisions
 
@@ -167,10 +175,18 @@ ELI5 block untouched.
 `src/cli/index.ts` (help line + dispatch), `src/cli/usage.ts` (entry), `README.md` (one command line).
 Depends on the D6 contract only. Acceptance: D8.
 
-**T5 — e2e seam.** Owns `e2e/fixtures.ts`. Acceptance: D9; existing specs unaffected.
+**T5 — e2e seam.** ~~Owns `e2e/fixtures.ts`.~~ **Dropped after stacking:** `e2e/fixtures.ts` already
+exposes `backendEnv`/`freshBackend`, which the peer's spec uses to set `AGETOR_CLONE_SOURCE_OVERRIDE`
+per file. No fixture change needed.
 
-**T6 — docs.** Owns `CLAUDE.md` (new orchestration-flow item documenting the feature, its host rules,
-the token/redirect rule and the test seams) — written last so it describes what actually landed.
+**T6 — docs.** Owns `CLAUDE.md` — **extends the existing item 18** (added by the peer branch) with the
+provider parsing/host rules, the token/redirect rule, the ssh BatchMode rule, the CLI command and the test
+seams — written last so it describes what actually landed.
+
+**Amendments to T3 after stacking:** title/menu/button/toast strings, the options-object `cloneProject`
+and most test ids already exist. T3 now = add `provider` to `api.cloneProject`'s input + response type;
+replace `repoNameFrom` with the shared parser; add the Provider select (`clone-provider`), per-provider
+placeholder, `data-testid="clone-error"` on the error paragraph. `ProjectPicker.tsx` needs no change.
 
 ## 5. Work breakdown — test tasks
 
@@ -188,18 +204,20 @@ the token/redirect rule and the test seams) — written last so it describes wha
   `provider` + shorthand; response carries `provider`; nested GitLab registers the last segment as name.
 - **TT4 (CLI, covers T4):** `src/cli/clone.test.ts` (new), mocking idiom of `files.test.ts` — flags → client
   call, `--json`, usage error without a url, bad `--provider`.
-- **TT5 (e2e, covers T3+T5 and the assembled flow):** `e2e/clone-project.spec.ts` (new). **E2E applies** —
+- **TT5 (e2e, covers T3 and the assembled flow):** `e2e/clone-providers.spec.ts` (new — separate from the
+  peer's `e2e/clone-project.spec.ts`, which keeps passing unchanged since GitHub shorthand is still the
+  default; same `test.use({ backendEnv: { AGETOR_CLONE_SOURCE_OVERRIDE } })` seam). **E2E applies** —
   user-visible flow crossing webview → API → git → DB. Flows: open from the project picker; pasting a
   GitLab nested URL locks the provider select to GitLab and previews `~/project`; shorthand + Bitbucket
   selection; successful clone into a temp dest registers the project (ELI5 off); an unsupported host shows
   the inline error and keeps the dialog open. Run recipe: `bun node_modules/@playwright/test/cli.js test
-  e2e/clone-project.spec.ts` — the harness boots Vite + a headless backend itself; no credentials needed.
+  e2e/clone-providers.spec.ts e2e/clone-project.spec.ts` — the harness boots Vite + a headless backend itself; no credentials needed.
 
 ## 6. Execution waves
 
 - **Wave 1:** T1. *(barrier: exports exist + typecheck)*
-- **Wave 2:** T2 ∥ T3 ∥ T4 ∥ T5 — file sets are disjoint (checked: `server.ts`/`clone.ts`/`bitbucket.ts` ·
-  dialog/picker/`api.ts` · `src/cli/*` + README · `e2e/fixtures.ts`). *(barrier: typecheck, commit)*
+- **Wave 2:** T2 ∥ T3 ∥ T4 — file sets are disjoint (checked: `server.ts`/`clone.ts`/`bitbucket.ts` ·
+  dialog/`api.ts` · `src/cli/*` + README). *(barrier: typecheck, commit)*
 - **Review (Phase 5)**, then **Wave 3 (tests):** TT1 ∥ TT2 ∥ TT3 ∥ TT4 ∥ TT5 — disjoint test files.
 - **Run → fix loop**, then **T6 docs** last.
 
@@ -255,8 +273,9 @@ Assumptions proceeding on:
 | `api.cloneProject` signature + its one caller | in this run — T3 |
 | Tests asserting the GitHub-only contract rewritten, not just extended | in this run — TT2, TT3 |
 | Reachable failure states: unsupported host, Bitbucket Server, dotless-alias-over-https, auth failure with/without token, moved repo on token attempt, ssh host-key / publickey, timeout | in this run — T2 (`explainCloneFailure`), TT2 |
-| Test ids for the dialog (none exist) | in this run — T3 |
-| e2e coverage (none exists for this feature) | in this run — T5, TT5 |
+| Test ids for the new controls (`clone-provider`, `clone-error`) | in this run — T3 |
+| e2e coverage of the provider flows (the peer's spec covers only the launch pickers, GitHub shorthand) | in this run — TT5 |
+| Peer spec's header comment calling multi-provider parsing "out of scope" / naming `parseGitHubRepo` — untrue once this lands | in this run — TT5 (comment-only edit to `e2e/clone-project.spec.ts`) |
 | CLI parity | in this run — T4, TT4 (owner swept it in) |
 | README command list + CLAUDE.md feature documentation | in this run — T4, T6 |
 | Stale `git-provider.ts:203-206` comment calling self-hosted GitLab "out of scope" | out of scope — pre-existing doc drift in a file this change doesn't otherwise touch; different ticket |
