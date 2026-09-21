@@ -466,7 +466,8 @@ export function cycleDistance(cycle: string[], current: string, target: string):
 
 /**
  * Encode an absolute filesystem path the way Claude Code does for its project
- * directory name under `~/.claude/projects/`. Every `/` AND `.` becomes `-` —
+ * directory name under `~/.claude/projects/`. Every character that is not an
+ * ASCII letter or digit (`/`, `.`, `_`, spaces…) becomes `-` —
  * so `/Users/me/.agetor/x` collapses to `-Users-me--agetor-x` (note the
  * double dash where `/.` appeared). Missed the dot rule originally and JSONL
  * discovery silently looked at the wrong directory for any path containing
@@ -474,10 +475,11 @@ export function cycleDistance(cycle: string[], current: string, target: string):
  *
  *   /Users/foo/bar             → -Users-foo-bar
  *   /Users/foo/.agetor/x       → -Users-foo--agetor-x
+ *   /Users/foo/my_repo         → -Users-foo-my-repo
  *   /                          → -
  */
 export function encodeProjectPath(cwd: string): string {
-  return cwd.replace(/[/.]/g, "-");
+  return cwd.replace(/[^a-zA-Z0-9]/g, "-");
 }
 
 /** Tmux-safe session name derived from a task id. */
