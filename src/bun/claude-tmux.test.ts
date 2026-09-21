@@ -65,6 +65,14 @@ test("encodeProjectPath turns every slash and dot into a dash", () => {
   expect(encodeProjectPath("/x/y.z/q")).toBe("-x-y-z-q");
 });
 
+test("encodeProjectPath also replaces underscores and other non-alphanumerics", () => {
+  // Claude Code names the dir with every non-alphanumeric char turned into `-`;
+  // keeping `_` made JSONL discovery time out for repos like `my_repo`.
+  expect(encodeProjectPath("/Users/foo/git/my_repo"))
+    .toBe("-Users-foo-git-my-repo");
+  expect(encodeProjectPath("/Users/foo/my repo")).toBe("-Users-foo-my-repo");
+});
+
 test("sessionNameFor uses the first 12 chars of the task id", () => {
   expect(sessionNameFor("abcdef0123456789-rest")).toBe("agetor-abcdef012345");
 });
