@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { AGENT_OPTIONS, DEFAULT_MODEL } from "../shared/types.ts";
 import type { AgentProfile, Project, Task } from "../shared/types.ts";
+import { CLONE_PROVIDERS } from "../shared/clone-input.ts";
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-clone-endpoint-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
@@ -22,6 +23,8 @@ let server: { stop: () => void };
 let token: string;
 let tasks: typeof import("./db.ts").tasks;
 let agentProfiles: typeof import("./db.ts").agentProfiles;
+let clearApiHostCacheForTest: () => void;
+let savedSshBin: string | undefined;
 
 beforeAll(async () => {
   ({ tasks, agentProfiles } = await import("./db.ts"));
@@ -43,10 +46,32 @@ beforeAll(async () => {
   git("add", ".");
   git("commit", "-q", "-m", "init");
   process.env.AGETOR_CLONE_SOURCE_OVERRIDE = source;
+
+  // Deterministic host resolution for the multi-provider tests below (GHES /
+  // dotless-alias / Bitbucket-Server rejection): point AGETOR_SSH_BIN at a
+  // throwaway identity stub instead of letting `apiHostForRemote` shell out
+  // to the real `ssh` and this machine's actual ~/.ssh/config — same idiom
+  // as `git-provider.test.ts`. An identity stub (`ssh -G -- <host>` just
+  // echoes `<host>` back as `hostname <host>`) is enough for every case
+  // here: none of these hostnames have a real alias to resolve, the point is
+  // only to make "no matching config entry" deterministic across machines
+  // rather than dependent on whatever the CI/dev box's real ssh reports.
+  const { __clearApiHostCacheForTest } = await import("./git-provider.ts");
+  clearApiHostCacheForTest = __clearApiHostCacheForTest;
+  savedSshBin = process.env.AGETOR_SSH_BIN;
+  const sshStubDir = path.join(WORK_DIR, "ssh-stub");
+  mkdirSync(sshStubDir);
+  const sshStubPath = path.join(sshStubDir, "ssh");
+  writeFileSync(sshStubPath, '#!/bin/sh\necho "hostname $3"\n', { mode: 0o755 });
+  process.env.AGETOR_SSH_BIN = sshStubPath;
+  clearApiHostCacheForTest();
 });
 
 afterAll(() => {
   delete process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+  if (savedSshBin === undefined) delete process.env.AGETOR_SSH_BIN;
+  else process.env.AGETOR_SSH_BIN = savedSshBin;
+  clearApiHostCacheForTest?.();
   server?.stop?.();
   rmSync(WORK_DIR, { recursive: true, force: true });
 });
@@ -67,13 +92,18 @@ test("POST /projects/clone without url returns 400", async () => {
   expect(((await res.json()) as { error: string }).error).toContain("url required");
 });
 
-test("POST /projects/clone rejects a non-GitHub url", async () => {
+test("POST /projects/clone rejects an unsupported host", async () => {
+  const projectsBefore = (await (await call("/projects")).json()) as Project[];
   const res = await call("/projects/clone", {
     method: "POST",
-    body: JSON.stringify({ url: "https://gitlab.com/foo/bar" }),
+    body: JSON.stringify({ url: "https://example.com/foo/bar" }),
   });
   expect(res.status).toBe(400);
-  expect(((await res.json()) as { error: string }).error).toContain("GitHub");
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain('unsupported host "example.com"');
+  expect(body.error).toContain("GitHub, GitLab or Bitbucket Cloud");
+  const projectsAfter = (await (await call("/projects")).json()) as Project[];
+  expect(projectsAfter.length).toBe(projectsBefore.length);
 });
 
 test("POST /projects/clone rejects a relative dest", async () => {
@@ -151,7 +181,8 @@ test("a failing clone returns 502 and registers nothing", async () => {
       body: JSON.stringify({ url: "someowner/deadrepo", dest }),
     });
     expect(res.status).toBe(502);
-    expect(((await res.json()) as { error: string }).error).toContain("clone failed");
+    const failBody = (await res.json()) as { error: string };
+    expect(failBody.error.startsWith("clone failed:")).toBe(true);
     const listed = (await (await call("/projects")).json()) as Project[];
     expect(listed.some((p) => p.path === dest)).toBe(false);
   } finally {
@@ -326,4 +357,202 @@ test("agentProfileId: null is accepted as no profile", async () => {
   const task = tasks.get(body.eli5TaskId!)!;
   expect(task).not.toBeNull();
   expect(task.agentProfileId ?? null).toBeNull();
+});
+
+// --- Multi-provider clone support (docs/plans/clone-repository-all-providers.md
+// §3 D6, §5 TT3): every host/transport/shorthand combination the shared
+// parser + resolveCloneRepo accept, the provider field in the route's
+// response, and the rejection paths (unsupported host, Bitbucket Server,
+// dotless-alias-over-https, bad `provider` values, cloud-port guard). All of
+// these still go through AGETOR_CLONE_SOURCE_OVERRIDE — no real network
+// clone ever happens — and the AGETOR_SSH_BIN identity stub installed in
+// beforeAll makes the host-resolution-dependent rejections deterministic. ---
+
+test("GitLab https URL with nested groups clones, registers the last segment as the project name, and reports provider gitlab", async () => {
+  const dest = path.join(WORK_DIR, "clone-gitlab-nested");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://gitlab.com/group/sub/project", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { project: Project; provider: string };
+  expect(body.provider).toBe("gitlab");
+  expect(body.project.name).toBe("project");
+  expect(body.project.path).toBe(dest);
+  expect(existsSync(path.join(dest, "README.md"))).toBe(true);
+});
+
+test("Bitbucket https URL clones and reports provider bitbucket", async () => {
+  const dest = path.join(WORK_DIR, "clone-bitbucket");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://bitbucket.org/someowner/bbrepo", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { project: Project; provider: string };
+  expect(body.provider).toBe("bitbucket");
+  expect(body.project.name).toBe("bbrepo");
+  expect(existsSync(path.join(dest, "README.md"))).toBe(true);
+});
+
+test("scp-form GitHub URL clones through the override and reports provider github", async () => {
+  const dest = path.join(WORK_DIR, "clone-github-scp");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "git@github.com:foo/bar.git", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { project: Project; provider: string };
+  expect(body.provider).toBe("github");
+  expect(body.project.name).toBe("bar");
+  expect(existsSync(path.join(dest, "README.md"))).toBe(true);
+});
+
+test("shorthand + provider: gitlab accepts a nested group path", async () => {
+  const dest = path.join(WORK_DIR, "clone-shorthand-gitlab");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "group/sub/project", provider: "gitlab", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { project: Project; provider: string };
+  expect(body.provider).toBe("gitlab");
+  expect(body.project.name).toBe("project");
+});
+
+test("the same 3-segment shorthand with no provider defaults to github and is rejected", async () => {
+  const dest = path.join(WORK_DIR, "clone-shorthand-no-provider");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "group/sub/project", dest }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("invalid repository path");
+  expect(existsSync(dest)).toBe(false);
+});
+
+test('provider: "svn" is rejected as an unsupported provider value', async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "foo/bar", provider: "svn" }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toBe(`provider must be one of ${CLONE_PROVIDERS.join(", ")}`);
+});
+
+test("provider: 42 (non-string) is rejected the same way", async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "foo/bar", provider: 42 }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toBe(`provider must be one of ${CLONE_PROVIDERS.join(", ")}`);
+});
+
+test("provider: null is treated as absent (defaults to github)", async () => {
+  const dest = path.join(WORK_DIR, "clone-provider-null");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/nullprovider", provider: null, dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { provider: string };
+  expect(body.provider).toBe("github");
+});
+
+test("a full URL's detected provider wins over a conflicting provider body field", async () => {
+  const dest = path.join(WORK_DIR, "clone-provider-conflict");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://gitlab.com/g/p", provider: "github", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { provider: string; project: Project };
+  expect(body.provider).toBe("gitlab");
+  expect(body.project.name).toBe("p");
+});
+
+test("Bitbucket Server / Data Center is rejected up front, nothing on disk", async () => {
+  const projectsBefore = (await (await call("/projects")).json()) as Project[];
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://bitbucket.company.com/scm/proj/repo.git" }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("Bitbucket Server / Data Center is not supported");
+  const projectsAfter = (await (await call("/projects")).json()) as Project[];
+  expect(projectsAfter.length).toBe(projectsBefore.length);
+});
+
+test("GitHub Enterprise Server over https is rejected", async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://github.mycompany.com/o/r" }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("GitHub Enterprise Server");
+});
+
+test("a dotless ssh-alias host over https is rejected with the SSH-URL hint", async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://github-work/o/r" }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("looks like an SSH alias");
+  expect(body.error).toContain("paste the SSH URL instead");
+});
+
+test("a non-default port on a cloud host is rejected", async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://gitlab.com:8443/g/p" }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("unexpected port");
+});
+
+test("an invalid launch selection still 400s before cloning, even for a non-GitHub URL", async () => {
+  const dest = path.join(WORK_DIR, "clone-order-multiprovider");
+  const before = tasks.list().length;
+  const projectsBefore = (await (await call("/projects")).json()) as Project[];
+
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({
+      url: "https://gitlab.com/someowner/ordertest",
+      dest,
+      agentProfileId: "no-such-profile",
+    }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("unknown agent profile");
+
+  expect(existsSync(dest)).toBe(false);
+  const projectsAfter = (await (await call("/projects")).json()) as Project[];
+  expect(projectsAfter.some((p) => p.path === dest)).toBe(false);
+  expect(projectsAfter.length).toBe(projectsBefore.length);
+  expect(tasks.list().length).toBe(before);
+});
+
+test("a successful clone's response is exactly {project, provider, eli5TaskId, eli5Error}", async () => {
+  const dest = path.join(WORK_DIR, "clone-response-shape");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/shaperepo", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as Record<string, unknown>;
+  expect(Object.keys(body).sort()).toEqual(["eli5Error", "eli5TaskId", "project", "provider"]);
+  expect(body.provider).toBe("github");
+  expect(body.eli5TaskId).toBeNull();
+  expect(body.eli5Error).toBeNull();
 });

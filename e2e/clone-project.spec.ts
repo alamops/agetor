@@ -20,11 +20,13 @@ import { gotoApp } from "./helpers";
  * No network is used: `POST /projects/clone` (server.ts) shells out to
  * `git clone -- <url> <dest>`, but `src/bun/clone.ts`'s `cloneRepo` honors
  * `AGETOR_CLONE_SOURCE_OVERRIDE` as a test seam — when set, that local path
- * is cloned instead of the URL's real remote. The dialog's own URL field
- * still has to parse as a GitHub URL (`parseGitHubRepo`, GitHub-only by
- * design) — multi-provider parsing is explicitly out of scope for this run
- * (plan §8's re-scope), so every test here types an `owner/repo`-shaped
- * string even though the actual bytes come from the local fixture repo.
+ * is cloned instead of the URL's real remote. The dialog's own URL field is
+ * parsed by the shared, provider-generic `src/shared/clone-input.ts` parser
+ * (`parseCloneInput`/`detectCloneProvider`) — every test here still types a
+ * GitHub `owner/repo`-shaped string, since GitHub is the dialog's default
+ * provider and that's all this file's scenarios (the launch pickers) need;
+ * the Provider select, host detection, and the other two forges' parsing are
+ * covered separately in `e2e/clone-providers.spec.ts`.
  *
  * Each test gets its OWN `freshBackend` (via `AGETOR_CLONE_SOURCE_OVERRIDE`
  * on `backendEnv`, e2e/fixtures.ts's `provisionBackend`/`freshBackend`
@@ -66,10 +68,11 @@ test.afterAll(async () => {
 
 const CONVERGE_TIMEOUT = 20_000;
 
-// The URL typed into the dialog — must parse as `owner/repo` shorthand
-// (parseGitHubRepo) regardless of AGETOR_CLONE_SOURCE_OVERRIDE actually
-// supplying the bytes. Repo name "somerepo" drives the ELI5 task's title
-// (`eli5TaskTitle` = "ELI5: somerepo") and the registered project's name.
+// The URL typed into the dialog — parsed by the shared `clone-input.ts`
+// parser as GitHub `owner/repo` shorthand (the dialog's default provider)
+// regardless of AGETOR_CLONE_SOURCE_OVERRIDE actually supplying the bytes.
+// Repo name "somerepo" drives the ELI5 task's title (`eli5TaskTitle` =
+// "ELI5: somerepo") and the registered project's name.
 const CLONE_URL = "someowner/somerepo";
 const ELI5_TITLE = "ELI5: somerepo";
 
