@@ -31,7 +31,7 @@ import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./tas
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
 import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
-import { cloneRepo, defaultCloneDest, parseGitHubRepo } from "./clone.ts";
+import { cloneAuthHeader, cloneRepo, defaultCloneDest, resolveCloneRepo } from "./clone.ts";
 import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
@@ -815,6 +815,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           server.timeout(req, 0);
           const body = (await req.json().catch(() => ({}))) as {
             url?: unknown;
+            provider?: unknown;
             dest?: unknown;
             eli5?: unknown;
             agent?: unknown;
@@ -827,17 +828,28 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           };
           const url = typeof body.url === "string" ? body.url.trim() : "";
           if (!url) return json({ error: "url required" }, { status: 400, headers: corsHeaders(req) });
-          const parsed = parseGitHubRepo(url);
-          if (!parsed) {
+          if (
+            body.provider !== undefined &&
+            body.provider !== null &&
+            body.provider !== "github" &&
+            body.provider !== "gitlab" &&
+            body.provider !== "bitbucket"
+          ) {
             return json(
-              { error: `not a GitHub repo — use https://github.com/owner/repo, git@github.com:owner/repo.git, or owner/repo` },
+              { error: "provider must be one of github, gitlab, bitbucket" },
               { status: 400, headers: corsHeaders(req) },
             );
           }
+          const shorthandProvider = (body.provider as "github" | "gitlab" | "bitbucket" | undefined | null) ?? "github";
+          const resolvedInput = resolveCloneRepo(url, shorthandProvider);
+          if (!resolvedInput.ok) {
+            return json({ error: resolvedInput.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const resolved = resolvedInput.repo;
           const dest =
             typeof body.dest === "string" && body.dest.trim()
               ? body.dest.trim()
-              : defaultCloneDest(parsed.repo);
+              : defaultCloneDest(resolved.repo);
           if (!path.isAbsolute(dest)) {
             return json({ error: "dest must be an absolute path" }, { status: 400, headers: corsHeaders(req) });
           }
@@ -852,11 +864,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: launch.error }, { status: 400, headers: corsHeaders(req) });
           }
 
-          const cloned = await cloneRepo(parsed.cloneUrl, dest);
+          const cloned = await cloneRepo(resolved.cloneUrl, dest, {
+            transport: resolved.transport,
+            host: resolved.rawHost,
+            auth: resolved.authOrigin
+              ? async () => {
+                  const header = await cloneAuthHeader(resolved.provider, resolved.rawHost);
+                  return header ? { origin: resolved.authOrigin!, header } : null;
+                }
+              : undefined,
+          });
           if (!cloned.ok) {
             return json({ error: cloned.error }, { status: 502, headers: corsHeaders(req) });
           }
-          const project = projects.upsert(dest, parsed.repo);
+          const project = projects.upsert(dest, resolved.repo);
 
           // The explainer task runs with isolation "none" so ELI5.md lands
           // directly in the clone the user just registered, not on a branch in
@@ -866,8 +887,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           let eli5Error: string | null = null;
           if (runEli5) {
             const created = await createTask({
-              title: eli5TaskTitle(parsed.repo),
-              prompt: buildEli5Prompt(parsed.repo),
+              title: eli5TaskTitle(resolved.repo),
+              prompt: buildEli5Prompt(resolved.repo),
               workdir: dest,
               isolation: "none",
               ...launch,
@@ -880,7 +901,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               if ("error" in started) eli5Error = started.error;
             }
           }
-          return json({ project, eli5TaskId, eli5Error }, { headers: corsHeaders(req) });
+          return json({ project, provider: resolved.provider, eli5TaskId, eli5Error }, { headers: corsHeaders(req) });
         }),
       },
 

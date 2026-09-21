@@ -168,6 +168,7 @@ agetor diff <id>             # show the task's git diff
 agetor rm <id> --yes         # delete a task (worktree + branch)
 
 # setup
+agetor clone <url>           # clone a GitHub/GitLab/Bitbucket repo as a new project (--provider, --dest, --no-eli5)
 agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
 agetor harness <sub>         # list | add | edit | enable | disable | rm | shell  (aliases / accounts; shell = log in)
 agetor profile <sub>         # ls | show <ref> | add <name> | edit <ref> | rm <ref>  (alias: profiles — saved launch presets, see Agents above)

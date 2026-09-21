@@ -18,6 +18,7 @@ import type {
   TaskDiff,
   TaskGitStatus,
   GitHubIssueThreadResult,
+  GitProvider,
 } from "../shared/types.ts";
 import type { AnyRequest, AskQuestionsAnswer } from "../bun/interactions.ts";
 import type { AvailableCommand, AvailableExtension } from "../bun/commands.ts";
@@ -38,6 +39,13 @@ const START_TIMEOUT_MS = 60_000;
  *  long comment thread across pages, can comfortably exceed the default 15s
  *  budget. Mirrors `START_TIMEOUT_MS`'s rationale. */
 const ISSUE_THREAD_TIMEOUT_MS = 60_000;
+/** `/projects/clone` runs a real `git clone` (network-bound, can take
+ *  minutes on a large repo) and, on the server side, may retry it once with
+ *  an auth header after an anonymous attempt 401s — the server itself allows
+ *  up to 10 minutes per attempt, twice in that worst case. 15 minutes gives
+ *  the whole round trip room without the CLI's default one-shot timeout
+ *  aborting a legitimate long clone out from under it. */
+const CLONE_TIMEOUT_MS = 15 * 60_000;
 
 export class ApiError extends Error {
   constructor(
@@ -241,6 +249,22 @@ export class AgetorClient {
   }
   listBranches(path: string): Promise<BranchInfo[]> {
     return this.req("GET", `/projects/branches?path=${encodeURIComponent(path)}`);
+  }
+  /** Clone a GitHub/GitLab/Bitbucket repo as a new project (`POST
+   *  /projects/clone`, plan `docs/plans/clone-repository-all-providers.md`
+   *  §3 D6). `provider` only matters for `owner/repo` shorthand — a full
+   *  URL's own detected provider wins server-side; `dest` must already be
+   *  absolute (the CLI resolves it against its own cwd before calling this).
+   *  `eli5` defaults server-side to `true` (create + start an explainer
+   *  task); pass `false` to skip it. Uses {@link CLONE_TIMEOUT_MS} instead of
+   *  the default budget — see its doc comment. */
+  cloneProject(input: {
+    url: string;
+    provider?: GitProvider;
+    dest?: string;
+    eli5?: boolean;
+  }): Promise<{ project: Project; provider: GitProvider; eli5TaskId: string | null; eli5Error: string | null }> {
+    return this.req("POST", "/projects/clone", input, CLONE_TIMEOUT_MS);
   }
   /** List a scope's files for the `@`-mention picker (`GET /files/index`) —
    *  the same route the webview's `useProjectFiles` calls. Two modes,

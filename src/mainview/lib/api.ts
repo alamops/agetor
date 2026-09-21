@@ -554,6 +554,7 @@ export const api = {
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
   cloneProject: (input: {
     url: string;
+    provider?: GitProvider;
     dest?: string;
     eli5?: boolean;
     agent?: string;
@@ -568,7 +569,7 @@ export const api = {
     // against a destination the first attempt already filled (502 "already
     // exists") while that clone and its explainer task are live, or race a
     // second `git clone` into the same directory.
-    j<{ project: Project; eli5TaskId: string | null; eli5Error: string | null }>(
+    j<{ project: Project; provider: GitProvider; eli5TaskId: string | null; eli5Error: string | null }>(
       "/projects/clone",
       { method: "POST", body: JSON.stringify(input) },
       { retry: false },

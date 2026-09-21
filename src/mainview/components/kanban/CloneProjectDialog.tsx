@@ -5,10 +5,13 @@ import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { buildEli5Prompt } from "../../../shared/clone-eli5.ts";
+import { CLONE_PROVIDERS, detectCloneProvider, parseCloneInput } from "../../../shared/clone-input.ts";
+import { PROVIDER_CAPS, type GitProvider } from "../../../shared/types.ts";
 import { TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
 
 interface Props {
@@ -18,32 +21,40 @@ interface Props {
   onCloned: () => void;
 }
 
-/** Client-side mirror of the server's repo-name extraction — used only to
- *  preview the default destination in the placeholder. The server re-parses
- *  and is the authority. */
-const repoNameFrom = (url: string): string | null => {
-  const m = url
-    .trim()
-    .match(/(?:github\.com[:/][^/\s]+\/|^[^/\s:@]+\/)([^/\s:@]+?)(?:\.git)?\/?$/i);
-  return m ? (m[1] ?? null) : null;
+/** Repository-field placeholder, one per provider — shown for whichever
+ *  provider is currently effective (detected from the URL, or picked in the
+ *  Provider select). */
+const REPO_PLACEHOLDER: Record<GitProvider, string> = {
+  github: "https://github.com/owner/repo, git@github.com:owner/repo.git or owner/repo",
+  gitlab: "https://gitlab.com/group/project, git@gitlab.com:group/project.git or group/project",
+  bitbucket: "https://bitbucket.org/workspace/repo, git@bitbucket.org:workspace/repo.git or workspace/repo",
 };
 
 /**
- * "Clone repository" flow for the Projects sidebar: paste a repo URL (or
- * owner/repo), optionally override the destination folder, and choose whether
- * agetor should auto-run an explainer task that writes ELI5.md at the clone's
- * root. While that switch is on, the same shared launch pickers the other
- * launch dialogs use (`useTaskLaunch`/`TaskLaunchPickers`) let the user pick
- * an Agent profile or a manual Harness/Mode/Model/Effort for the explainer
- * task — mirroring `ResolveConflictsDialog`. With the switch off, a plain
- * clone is always possible even if harness data failed to load. The clone
- * request stays in flight while the dialog shows a busy state — big repos
- * can take a while.
+ * "Clone repository" flow for the Projects sidebar: paste a GitHub, GitLab or
+ * Bitbucket Cloud repository URL in https/ssh form (or bare `owner/repo`
+ * shorthand, resolved against the Provider select below), optionally
+ * override the destination folder, and choose whether agetor should auto-run
+ * an explainer task that writes ELI5.md at the clone's root. Parsing and
+ * provider detection come from the shared, pure `src/shared/clone-input.ts`
+ * parser — one implementation the server also uses, so "what counts as a
+ * valid clone input" can't drift between the two; the server remains the
+ * authority and layers the git integration's real host-resolution rules
+ * (ssh alias resolution, Bitbucket Server rejection, per-host GitLab token
+ * scoping) on top of what this dialog can check client-side. While the
+ * explainer switch is on, the same shared launch pickers the other launch
+ * dialogs use (`useTaskLaunch`/`TaskLaunchPickers`) let the user pick an
+ * Agent profile or a manual Harness/Mode/Model/Effort for the explainer task
+ * — mirroring `ResolveConflictsDialog`. With the switch off, a plain clone is
+ * always possible even if harness data failed to load. The clone request
+ * stays in flight while the dialog shows a busy state — big repos can take a
+ * while.
  */
 export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
   const launch = useTaskLaunch(open);
 
   const [url, setUrl] = useState("");
+  const [provider, setProvider] = useState<GitProvider>("github");
   const [dest, setDest] = useState("");
   const [eli5, setEli5] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -58,6 +69,7 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
   useEffect(() => {
     if (!open) return;
     setUrl("");
+    setProvider("github");
     setDest("");
     setEli5(true);
     setError(null);
@@ -65,7 +77,14 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  const repo = repoNameFrom(url);
+  // `detected` locks the Provider select to whatever a full URL's own host
+  // names (a full URL's host always wins); `provider` is the user's own pick,
+  // used only for shorthand — kept separate so typing a full URL and then
+  // deleting it back to shorthand doesn't lose a manual pick.
+  const detected = detectCloneProvider(url);
+  const effectiveProvider = detected ?? provider;
+  const parsed = parseCloneInput(url, effectiveProvider);
+  const repo = parsed.ok ? parsed.value.repo : null;
 
   const overage = eli5
     ? promptByteOverage(
@@ -93,12 +112,22 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
 
   const submit = async () => {
     const trimmed = url.trim();
-    if (!trimmed || !canSubmit) return;
+    if (!trimmed) return;
+    // The client-side parser is non-blocking while typing (a half-typed URL
+    // is always "invalid"), but a click/Enter with an unparseable value must
+    // surface the parser's own error rather than silently doing nothing —
+    // the server stays the ultimate authority and still re-parses on its own.
+    if (!parsed.ok) {
+      setError(parsed.error);
+      return;
+    }
+    if (!canSubmit) return;
     setBusy(true);
     setError(null);
     try {
       const result = await api.cloneProject({
         url: trimmed,
+        provider: effectiveProvider,
         dest: dest.trim() || undefined,
         eli5,
         // Only forward launch fields when the explainer is actually
@@ -174,6 +203,28 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4 text-sm">
           <div className="space-y-1.5">
+            <label htmlFor="clone-provider" className="text-xs font-medium text-muted-foreground">
+              Provider
+            </label>
+            <Select
+              id="clone-provider"
+              data-testid="clone-provider"
+              value={effectiveProvider}
+              onChange={(e) => setProvider(e.target.value as GitProvider)}
+              disabled={busy || detected !== null}
+            >
+              {CLONE_PROVIDERS.map((p) => (
+                <option key={p} value={p}>
+                  {PROVIDER_CAPS[p].providerName}
+                </option>
+              ))}
+            </Select>
+            <p className="text-[11px] text-muted-foreground" data-testid="clone-provider-detected">
+              {detected !== null ? "Detected from the URL" : "Used for owner/repo shorthand"}
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
             <label htmlFor="clone-url" className="text-xs font-medium text-muted-foreground">
               Repository
             </label>
@@ -184,7 +235,7 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               onKeyDown={onEnter}
-              placeholder="https://github.com/owner/repo or owner/repo"
+              placeholder={REPO_PLACEHOLDER[effectiveProvider]}
               spellCheck={false}
               disabled={busy}
             />
@@ -263,7 +314,11 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
           )}
 
           {error && (
-            <p role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            <p
+              role="alert"
+              data-testid="clone-error"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+            >
               {error}
             </p>
           )}
