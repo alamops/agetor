@@ -582,6 +582,18 @@ function withTaskCounts(list: AgentProfile[]): AgentProfile[] {
  *  (a client could reasonably uppercase one). */
 const CLONE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** Route-level bookkeeping for `POST /projects/clone`'s own duplicate-id
+ *  guard — distinct from clone.ts's `activeClones` registry (which keys off
+ *  the actual running `git clone` child process, one attempt at a time).
+ *  This set spans the whole request, from just before `cloneRepo` is called
+ *  through every exit path after it, so a second POST reusing the same
+ *  client-minted `cloneId` while the first is still in flight can't overwrite
+ *  the first's registry handle (which would make a cancel kill the wrong
+ *  clone, or interleave two clones' progress events under one id). Entries
+ *  are removed in a `finally`, so the id is free to reuse on any later POST
+ *  once the earlier request has settled — success, failure, or cancel. */
+const inFlightCloneIds = new Set<string>();
+
 /**
  * Validate the optional launch-picker fields on `POST /projects/clone`
  * (docs/plans/clone-repository-launch-pickers.md D3) BEFORE `cloneRepo` runs,
@@ -827,7 +839,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // mints one itself; either way it's echoed on every response this
       // route can return (success AND every error after the id is minted),
       // so a client that generated the id can always correlate progress
-      // events / a cancel attempt with this specific request.
+      // events / a cancel attempt with this specific request. A DELETE that
+      // arrives before git has even spawned, or in the brief gap between
+      // `cloneRepo`'s two attempts, is still honored — clone.ts latches the
+      // cancellation and the still-held POST resolves 409 `cancelled: true`
+      // below — so a 404 from the DELETE route means the id was never
+      // recognized at all (unknown, or already settled), not a missed
+      // narrow window.
       "/projects/clone": {
         POST: authed(async (req) => {
           // Clones are network-bound and can take minutes; disable the
@@ -869,6 +887,18 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             cloneId = crypto.randomUUID();
           }
 
+          // Reject a duplicate in-flight cloneId up front — see
+          // inFlightCloneIds's own doc comment. This is a route-level guard
+          // (never touches clone.ts's registry) and is checked before any
+          // other validation so a racing second POST can't slip past it by
+          // arriving while the first request is still mid-clone.
+          if (inFlightCloneIds.has(cloneId)) {
+            return json(
+              { error: "a clone with that id is already in flight", cloneId },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+
           const shorthandProvider = isGitProvider(body.provider) ? body.provider : "github";
           const resolvedInput = resolveCloneRepo(url, shorthandProvider);
           if (!resolvedInput.ok) {
@@ -893,79 +923,92 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: launch.error, cloneId }, { status: 400, headers: corsHeaders(req) });
           }
 
-          const cloned = await cloneRepo(resolved.cloneUrl, dest, {
-            transport: resolved.transport,
-            host: resolved.rawHost,
-            cloneId,
-            onProgress: (p) =>
-              broadcastAppEvent({
-                type: "clone_progress",
-                cloneId,
-                phase: p.phase,
-                percent: p.percent,
-                line: p.line,
-                ts: Date.now(),
-              }),
-            auth: resolved.authOrigin
-              ? async () => {
-                  const header = await cloneAuthHeader(resolved.provider, resolved.rawHost);
-                  return header ? { origin: resolved.authOrigin!, header } : null;
-                }
-              : undefined,
-          });
-          if (cloned.cancelled) {
-            // cloneRepo already restored `dest` to absent/empty and reported
-            // its own terminal "cancelled" progress event — nothing here is
-            // registered, mirroring the "a failing clone registers nothing"
-            // behavior above. 409, not 502: the request wasn't refused by
-            // the remote or by validation, it was called off by the caller
-            // itself (or another client racing the same cloneId).
-            return json({ error: "clone cancelled", cancelled: true, cloneId }, { status: 409, headers: corsHeaders(req) });
-          }
-          if (!cloned.ok) {
-            return json({ error: cloned.error, cloneId }, { status: 502, headers: corsHeaders(req) });
-          }
-          const project = projects.upsert(dest, resolved.repo);
-
-          // The explainer task runs with isolation "none" so ELI5.md lands
-          // directly in the clone the user just registered, not on a branch in
-          // a worktree. Task-creation failure downgrades the response, never
-          // rolls back the clone — the project is already usable.
-          let eli5TaskId: string | null = null;
-          let eli5Error: string | null = null;
-          if (runEli5) {
-            const created = await createTask({
-              title: eli5TaskTitle(resolved.repo),
-              prompt: buildEli5Prompt(resolved.repo),
-              workdir: dest,
-              isolation: "none",
-              ...launch,
+          inFlightCloneIds.add(cloneId);
+          try {
+            const cloned = await cloneRepo(resolved.cloneUrl, dest, {
+              transport: resolved.transport,
+              host: resolved.rawHost,
+              cloneId,
+              onProgress: (p) =>
+                broadcastAppEvent({
+                  type: "clone_progress",
+                  cloneId,
+                  phase: p.phase,
+                  percent: p.percent,
+                  line: p.line,
+                  ts: Date.now(),
+                }),
+              auth: resolved.authOrigin
+                ? async () => {
+                    const header = await cloneAuthHeader(resolved.provider, resolved.rawHost);
+                    return header ? { origin: resolved.authOrigin!, header } : null;
+                  }
+                : undefined,
             });
-            if ("error" in created) {
-              eli5Error = created.error;
-            } else {
-              eli5TaskId = created.task.id;
-              const started = await startTask(created.task.id);
-              if ("error" in started) eli5Error = started.error;
+            if (cloned.cancelled) {
+              // cloneRepo already restored `dest` to absent/empty and reported
+              // its own terminal "cancelled" progress event — nothing here is
+              // registered, mirroring the "a failing clone registers nothing"
+              // behavior above. 409, not 502: the request wasn't refused by
+              // the remote or by validation, it was called off by the caller
+              // itself (or another client racing the same cloneId).
+              return json({ error: "clone cancelled", cancelled: true, cloneId }, { status: 409, headers: corsHeaders(req) });
             }
+            if (!cloned.ok) {
+              return json({ error: cloned.error, cloneId }, { status: 502, headers: corsHeaders(req) });
+            }
+            const project = projects.upsert(dest, resolved.repo);
+
+            // The explainer task runs with isolation "none" so ELI5.md lands
+            // directly in the clone the user just registered, not on a branch in
+            // a worktree. Task-creation failure downgrades the response, never
+            // rolls back the clone — the project is already usable.
+            let eli5TaskId: string | null = null;
+            let eli5Error: string | null = null;
+            if (runEli5) {
+              const created = await createTask({
+                title: eli5TaskTitle(resolved.repo),
+                prompt: buildEli5Prompt(resolved.repo),
+                workdir: dest,
+                isolation: "none",
+                ...launch,
+              });
+              if ("error" in created) {
+                eli5Error = created.error;
+              } else {
+                eli5TaskId = created.task.id;
+                const started = await startTask(created.task.id);
+                if ("error" in started) eli5Error = started.error;
+              }
+            }
+            return json(
+              { project, provider: resolved.provider, cloneId, eli5TaskId, eli5Error },
+              { headers: corsHeaders(req) },
+            );
+          } finally {
+            inFlightCloneIds.delete(cloneId);
           }
-          return json(
-            { project, provider: resolved.provider, cloneId, eli5TaskId, eli5Error },
-            { headers: corsHeaders(req) },
-          );
         }),
       },
 
       // Cancels the clone identified by `cloneId` (the id echoed by
       // `POST /projects/clone`, or a caller-minted one that was sent on that
       // POST's body) — see that route's own doc comment for the id
-      // round-trip. `cancelClone` only finds a match while `cloneRepo` has a
-      // git process actually running for this id (its own doc comment in
-      // clone.ts); anything else — an unknown id, or one whose clone already
-      // settled — 404s. `cancelClone`'s `true` return doesn't mean the held
-      // POST has resolved yet, only that its git process was just killed;
-      // the POST itself answers 409 once `cloneRepo` observes the kill (see
-      // above).
+      // round-trip. `cancelClone` matches any clone `cloneRepo` has announced
+      // as in flight for this id — even before the git child process has
+      // actually spawned (its own doc comment in clone.ts) — and returns
+      // `false` for an unknown id or one whose clone already settled, which
+      // is what 404s below. `cancelClone`'s `true` return doesn't mean the
+      // held POST has resolved yet, only that the in-flight attempt was told
+      // to stop; the POST itself answers 409 once `cloneRepo` observes the
+      // cancellation (see above).
+      //
+      // `cloneId` is NOT a secret: `clone_progress` AppEvents broadcast it to
+      // every `/app/events` subscriber, so any authed client — same user,
+      // same machine, gated only by the per-launch bearer token (the same
+      // trust tier as `/open-path` and `DELETE /tasks/:id`) — can cancel any
+      // clone whose id it has observed. The token is the guard here, not the
+      // id's obscurity.
       "/projects/clone/:cloneId": {
         DELETE: authed((req) => {
           const { cloneId } = req.params;

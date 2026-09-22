@@ -6,6 +6,8 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp } from "./helpers";
+import { makeBareSourceRepo } from "../src/bun/clone-test-util.ts";
+import { startSlowGitServer } from "./slow-git-server.ts";
 
 /**
  * E2e coverage for docs/plans/clone-repository-all-providers.md (§3 D7, §5
@@ -46,6 +48,31 @@ const CLONE_ROOT = mkdtempSync(path.join(tmpdir(), "agetor-e2e-clone-providers-r
 const SSH_STUB_DIR = mkdtempSync(path.join(tmpdir(), "agetor-e2e-clone-providers-sshstub-"));
 const SSH_STUB_BIN = path.join(SSH_STUB_DIR, "ssh");
 
+// Second, SEPARATE clone source for the "progress streaming and cancel"
+// describe block below (Addendum A) — those tests need the clone to
+// actually take multi-second, OBSERVABLE wall-clock time (to see the
+// progress row update, and to have a real window to click Cancel in), which
+// a same-machine local-path clone (SOURCE_REPO_DIR above) can never provide:
+// git's local-clone fast path hard-links objects and skips the whole
+// `remote: …`/`Receiving objects: NN%` progress protocol entirely — verified
+// empirically while building this fixture (`git clone --progress -- <local
+// path> dest` completes in well under a second with only a single "Cloning
+// into … done." line, no percentage lines at all). `startSlowGitServer`
+// (./slow-git-server.ts) instead serves a bare repo over REAL smart-HTTP,
+// with the response for the data-carrying request deliberately paced over a
+// few seconds — see that module's own doc comment for why
+// `startAuthGitServer`'s (clone-test-util.ts) `delayMs` option can't do this
+// (it delays the response START, not the transfer, and a fully-computed CGI
+// response then arrives in one instantaneous burst over loopback regardless
+// of how long the wait was). Bound synchronously (`Bun.serve`'s ephemeral
+// port is available the instant it returns — see that module's own doc
+// comment), so the URL is ready in time for the `test.use({ backendEnv })`
+// below.
+const SLOW_SOURCE_ROOT = mkdtempSync(path.join(tmpdir(), "agetor-e2e-clone-providers-slowsrc-"));
+makeBareSourceRepo(SLOW_SOURCE_ROOT);
+const slowGitServer = startSlowGitServer(SLOW_SOURCE_ROOT, { transferDelayMs: 3000, chunkCount: 15 });
+const SLOW_CLONE_URL = `${slowGitServer.url}/repo.git`;
+
 function git(cwd: string, args: string[]): void {
   execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
 }
@@ -74,9 +101,11 @@ chmodSync(SSH_STUB_BIN, 0o755);
 test.use({ backendEnv: { AGETOR_CLONE_SOURCE_OVERRIDE: SOURCE_REPO_DIR } });
 
 test.afterAll(async () => {
+  slowGitServer.stop();
   await rm(SOURCE_REPO_DIR, { recursive: true, force: true }).catch(() => {});
   await rm(CLONE_ROOT, { recursive: true, force: true }).catch(() => {});
   await rm(SSH_STUB_DIR, { recursive: true, force: true }).catch(() => {});
+  await rm(SLOW_SOURCE_ROOT, { recursive: true, force: true }).catch(() => {});
 });
 
 const CONVERGE_TIMEOUT = 20_000;
@@ -401,5 +430,147 @@ test.describe("Clone repository dialog — server-side host rejection", () => {
     await expect(error).toContainText("Bitbucket Server");
     await expect(dialog).toBeVisible();
     expect(existsSync(dest)).toBe(false);
+  });
+});
+
+/** The dialog's single live-progress paragraph (docs/plans/clone-repository
+ *  -all-providers.md Addendum A) — `aria-live="polite"` text inside the
+ *  `clone-progress` row, e.g. "Starting…" / "Counting objects…" /
+ *  "Receiving objects…". */
+function progressPhaseText(dialog: Locator): Locator {
+  return dialog.getByTestId("clone-progress").locator('p[aria-live="polite"]');
+}
+
+test.describe("Clone repository dialog — progress streaming and cancel", () => {
+  // Addendum A. Points AGETOR_CLONE_SOURCE_OVERRIDE at the paced slow-git
+  // server (module scope above) instead of the plain local SOURCE_REPO_DIR
+  // every other describe block in this file uses — a nested `test.use`
+  // REPLACES the whole backendEnv object, so this describe block gets none
+  // of the other blocks' env keys (it needs none of them: AGETOR_SSH_BIN is
+  // only for the Bitbucket-Server-rejection test above).
+  test.use({ backendEnv: { AGETOR_CLONE_SOURCE_OVERRIDE: SLOW_CLONE_URL } });
+
+  test("a progress row with a live phase label and bar appears while the clone runs, then it completes and registers the project", async ({
+    page,
+    request,
+    freshBackend,
+  }) => {
+    test.setTimeout(60_000);
+    const dest = uniqueDest("progress-row");
+    await gotoApp(page, freshBackend.bootBase);
+    const dialog = await openCloneDialog(page);
+
+    await dialog.getByTestId("clone-url").fill("someowner/somerepo-progress");
+    await dialog.getByTestId("clone-dest").fill(dest);
+    await turnEli5Off(dialog);
+
+    const submit = dialog.getByTestId("clone-submit");
+    const cancel = dialog.getByTestId("clone-cancel");
+    await expect(submit).toBeEnabled();
+    await submit.click();
+
+    // The Clone button is replaced in place (same test id, new copy) rather
+    // than removed — see CloneProjectDialog.tsx's footer: it always renders
+    // `clone-submit`, just disabled with "Cloning…" text while busy, since
+    // `canSubmit` is false whenever `busy` is true.
+    await expect(submit).toHaveText("Cloning…");
+    await expect(submit).toBeDisabled();
+    await expect(cancel).toBeVisible();
+    await expect(cancel).toBeEnabled();
+    await expect(cancel).toHaveText("Cancel clone");
+
+    const progressRow = dialog.getByTestId("clone-progress");
+    await expect(progressRow).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(dialog.getByTestId("clone-progress-bar")).toBeVisible();
+
+    await expect(dialog).toBeHidden({ timeout: 30_000 });
+    const toaster = page.locator("[data-sonner-toaster]");
+    await expect(toaster.getByText("Cloned somerepo-progress")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    const project = await awaitProjectRegistered(request, freshBackend, dest);
+    expect(project.name).toBe("somerepo-progress");
+    expect(existsSync(path.join(dest, "README.md"))).toBe(true);
+  });
+
+  test("the live phase text advances beyond Starting… while the clone is in flight", async ({
+    page,
+    freshBackend,
+  }) => {
+    test.setTimeout(60_000);
+    const dest = uniqueDest("phase-text");
+    await gotoApp(page, freshBackend.bootBase);
+    const dialog = await openCloneDialog(page);
+
+    await dialog.getByTestId("clone-url").fill("someowner/somerepo-phase");
+    await dialog.getByTestId("clone-dest").fill(dest);
+    await turnEli5Off(dialog);
+
+    const submit = dialog.getByTestId("clone-submit");
+    await expect(submit).toBeEnabled();
+    await submit.click();
+
+    await expect(dialog.getByTestId("clone-progress")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    const phaseText = progressPhaseText(dialog);
+    // Starts on the synthetic "starting" phase (no real progress event has
+    // necessarily arrived yet) …
+    await expect(phaseText).toHaveText("Starting…");
+    // … and — proof that `clone_progress` AppEvents actually reach the
+    // dialog over `/app/events`, not just that the row renders a static
+    // fallback — moves on to a real phase (`CLONE_PHASE_LABEL` in
+    // CloneProjectDialog.tsx: "Counting objects…" / "Compressing
+    // objects…" / "Receiving objects…" / "Resolving deltas…" / "Checking
+    // out files…") well before the clone (and thus the dialog) closes.
+    await expect(phaseText).not.toHaveText("Starting…", { timeout: 20_000 });
+
+    // Let the clone finish so the fixture doesn't leak a running clone into
+    // the next test.
+    await expect(dialog).toBeHidden({ timeout: 30_000 });
+  });
+
+  test("Cancel stops an in-flight clone, cleans up the destination, and shows an info toast", async ({
+    page,
+    request,
+    freshBackend,
+  }) => {
+    test.setTimeout(60_000);
+    const dest = uniqueDest("cancel");
+    await gotoApp(page, freshBackend.bootBase);
+    const dialog = await openCloneDialog(page);
+
+    await dialog.getByTestId("clone-url").fill("someowner/somerepo-cancel");
+    await dialog.getByTestId("clone-dest").fill(dest);
+    await turnEli5Off(dialog);
+
+    const submit = dialog.getByTestId("clone-submit");
+    await expect(submit).toBeEnabled();
+    await submit.click();
+
+    const cancel = dialog.getByTestId("clone-cancel");
+    await expect(cancel).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(cancel).toBeEnabled();
+    // Deliberately not asserting the transient "Cancelling…"/disabled state
+    // here (CloneProjectDialog.tsx's `cancelling` flag) — against this
+    // fixture, killing the local `git clone` process and the server
+    // round-tripping the held `POST /projects/clone`'s 409 both resolve
+    // well inside a single browser tick, so that state's visible window
+    // turned out to be sub-frame and inherently un-observable from outside
+    // the page: every polling strategy tried while writing this test
+    // (sequential `expect(...).toHaveText()`/`toBeDisabled()`, a combined
+    // `evaluate()` right after the click, and a `page.waitForFunction`
+    // poll) found the button either not yet updated or already gone,
+    // depending on exactly how much round-trip time it added. What's
+    // actually load-bearing — the outcome a real user cares about — is
+    // asserted below: the dialog closes, an info toast fires, and nothing
+    // is left behind or registered.
+    await cancel.click();
+
+    await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    const toaster = page.locator("[data-sonner-toaster]");
+    await expect(toaster.getByText("Clone cancelled")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    // Cancelled: nothing is left behind, and nothing was registered.
+    expect(existsSync(dest)).toBe(false);
+    const projects = await listProjects(request, freshBackend);
+    expect(projects.find((p) => p.path === dest)).toBeUndefined();
   });
 });

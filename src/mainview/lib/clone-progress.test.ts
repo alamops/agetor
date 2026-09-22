@@ -119,7 +119,7 @@ test("a terminal phase (cancelled) is also cleaned up", async () => {
   expect(latestCloneProgress("clone-1")).toBeNull();
 });
 
-test("a non-terminal phase is never scheduled for cleanup", async () => {
+test("a non-terminal phase is unaffected by the short cleanupDelayMs (it uses the separate, longer staleReclaimMs timer instead)", async () => {
   __forTest.setCleanupDelayMs(20);
   publishCloneProgress(ev({ phase: "receiving", percent: 50 }));
   await new Promise((r) => setTimeout(r, 60));
@@ -150,4 +150,70 @@ test("__forTest.reset clears all entries and restores the default cleanup delay"
   publishCloneProgress(ev({ phase: "done", percent: 100 }));
   await new Promise((r) => setTimeout(r, 30));
   expect(latestCloneProgress("clone-1")).not.toBeNull();
+});
+
+// --- Leak-cleanup coverage (review H3) ---------------------------------
+//
+// Two cases the module used to leak an entry forever: (a) a placeholder
+// that never saw a single `clone_progress` event (the request that would
+// have produced them 400s before `cloneRepo` even runs), and (b) a
+// non-terminal `latest` whose daemon died mid-clone, so no further publish
+// ever arrives to schedule a cleanup. `__forTest.entryCount()` is the
+// leak-detection seam: it reports the map's raw size regardless of whether
+// anything is still subscribed.
+
+test("a placeholder entry with zero events is dropped as soon as its only subscriber unsubscribes", () => {
+  const unsubscribe = subscribeCloneProgress("clone-1", () => {});
+  expect(__forTest.entryCount()).toBe(1);
+  unsubscribe();
+  expect(__forTest.entryCount()).toBe(0);
+  expect(latestCloneProgress("clone-1")).toBeNull();
+});
+
+test("an entry whose latest event is terminal is dropped synchronously (not just after the cleanup timer) once its last subscriber unsubscribes", () => {
+  // Default (long) cleanupDelayMs on purpose — proves the drop happens on
+  // unsubscribe itself, not by coincidentally outracing the timer.
+  const unsubscribe = subscribeCloneProgress("clone-1", () => {});
+  publishCloneProgress(ev({ phase: "done", percent: 100 }));
+  expect(__forTest.entryCount()).toBe(1);
+  unsubscribe();
+  expect(__forTest.entryCount()).toBe(0);
+});
+
+test("an entry whose latest event is non-terminal survives its last subscriber unsubscribing (reclaimed later by the stale timer instead)", async () => {
+  __forTest.setStaleReclaimMs(20);
+  const unsubscribe = subscribeCloneProgress("clone-1", () => {});
+  publishCloneProgress(ev({ phase: "receiving", percent: 50 }));
+  unsubscribe();
+  // Not dropped immediately — a daemon that's still running (or a dialog
+  // the user merely closed early) shouldn't lose its live snapshot the
+  // instant the one subscriber detaches.
+  expect(__forTest.entryCount()).toBe(1);
+  await new Promise((r) => setTimeout(r, 60));
+  // But it doesn't live forever either — the stale-reclaim timer armed by
+  // the `publishCloneProgress` call above eventually sweeps it.
+  expect(__forTest.entryCount()).toBe(0);
+});
+
+test("a non-terminal entry with no subscriber at all is still reclaimed by the stale timer (e.g. the daemon died mid-clone)", async () => {
+  __forTest.setStaleReclaimMs(20);
+  publishCloneProgress(ev({ phase: "receiving", percent: 10 }));
+  expect(__forTest.entryCount()).toBe(1);
+  await new Promise((r) => setTimeout(r, 60));
+  expect(__forTest.entryCount()).toBe(0);
+  expect(latestCloneProgress("clone-1")).toBeNull();
+});
+
+test("a fresh non-terminal publish re-arms the stale-reclaim timer, same as a terminal publish re-arms the cleanup timer", async () => {
+  __forTest.setStaleReclaimMs(40);
+  publishCloneProgress(ev({ phase: "counting", percent: null }));
+  // Re-published before the first timer would have fired — must not be
+  // reclaimed at the original deadline.
+  await new Promise((r) => setTimeout(r, 20));
+  publishCloneProgress(ev({ phase: "receiving", percent: 5 }));
+  await new Promise((r) => setTimeout(r, 30));
+  expect(__forTest.entryCount()).toBe(1);
+  // But the re-armed timer still fires eventually.
+  await new Promise((r) => setTimeout(r, 30));
+  expect(__forTest.entryCount()).toBe(0);
 });

@@ -17,8 +17,9 @@ import { TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
 
 /** Human copy for each in-progress `CloneProgressPhase` — the two terminal
  *  phases the dialog can actually observe live (`failed`/`cancelled`) never
- *  reach this map because the dialog stops rendering the progress row the
- *  moment `submit()`'s `await` settles (an error, or a close-on-cancel). */
+ *  reach this map because `submit()`'s `finally` clears `progress` back to
+ *  `null` (and the row goes back to its visually-hidden, non-`busy` state)
+ *  the moment its `await` settles (an error, or a close-on-cancel). */
 const CLONE_PHASE_LABEL: Record<Exclude<CloneProgressEvent["phase"], "failed" | "cancelled">, string> = {
   starting: "Starting…",
   counting: "Counting objects…",
@@ -44,6 +45,22 @@ function isCancelledCloneError(body: unknown): boolean {
  *  component and clears `progress`. */
 function cloneProgressLabel(e: CloneProgressEvent): string {
   return (CLONE_PHASE_LABEL as Partial<Record<CloneProgressEvent["phase"], string>>)[e.phase] ?? e.line;
+}
+
+/** Folds a freshly-published `clone_progress` event onto the previous one for
+ *  the progress bar's `value` — git's own stderr lines don't carry a percent
+ *  on every line (a phase-change banner, a "done" summary, …), and without
+ *  this a percent-bearing line followed by a percent-less one on the SAME
+ *  phase would flip the `<progress>` bar back to indeterminate and then
+ *  forward again, reading as the clone stalling and restarting. Carries the
+ *  last known percent forward only within a phase; a genuine phase change
+ *  (git counts, compresses, then receives — each its own 0-100% span)
+ *  always resets to whatever the new event reports, indeterminate included. */
+function mergeCloneProgress(prev: CloneProgressEvent | null, next: CloneProgressEvent): CloneProgressEvent {
+  if (prev && prev.phase === next.phase && next.percent == null && prev.percent != null) {
+    return { ...next, percent: prev.percent };
+  }
+  return next;
 }
 
 interface Props {
@@ -187,7 +204,7 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
     const cloneId = crypto.randomUUID();
     cloneIdRef.current = cloneId;
     setProgress(latestCloneProgress(cloneId));
-    const unsubscribe = subscribeCloneProgress(cloneId, setProgress);
+    const unsubscribe = subscribeCloneProgress(cloneId, (e) => setProgress((prev) => mergeCloneProgress(prev, e)));
     try {
       const result = await api.cloneProject({
         url: trimmed,
@@ -438,28 +455,41 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
             </p>
           )}
 
-          {busy && (
-            // Rides the `clone_progress` AppEvent forwarded through
-            // clone-progress.ts's module store (see the import above) —
-            // never its own EventSource, per the store's own doc comment.
-            // `progress` starts `null` (no event yet, e.g. the server
-            // hasn't started `git clone` itself) — the phase label falls
-            // back to "Starting…" and the bar renders indeterminate.
-            <div
-              data-testid="clone-progress"
-              className="space-y-1.5 rounded-md border border-border/60 bg-muted/30 px-3 py-2"
-            >
-              <p aria-live="polite" className="text-xs text-muted-foreground">
-                {progress ? cloneProgressLabel(progress) : "Starting…"}
-              </p>
-              <progress
-                data-testid="clone-progress-bar"
-                max={100}
-                value={progress?.percent ?? undefined}
-                className="h-1.5 w-full accent-primary"
-              />
-            </div>
-          )}
+          {/* Rides the `clone_progress` AppEvent forwarded through
+           *  clone-progress.ts's module store (see the import above) — never
+           *  its own EventSource, per the store's own doc comment. `progress`
+           *  starts `null` (no event yet, e.g. the server hasn't started
+           *  `git clone` itself) — the phase label falls back to "Starting…"
+           *  and the bar renders indeterminate.
+           *
+           *  Mounted unconditionally (visually hidden via `sr-only` while
+           *  `!busy`) rather than only while busy: an `aria-live` region
+           *  that's inserted into the DOM already containing its first bit
+           *  of text is a mount, not an update, and screen readers skip a
+           *  live region's initial content on mount — only SUBSEQUENT
+           *  changes to an already-present region get announced. Keeping it
+           *  in the DOM from the start means the very first phase text still
+           *  lands as a real update. */}
+          <div
+            data-testid="clone-progress"
+            className={
+              busy
+                ? "space-y-1.5 rounded-md border border-border/60 bg-muted/30 px-3 py-2"
+                : "sr-only"
+            }
+          >
+            <p aria-live="polite" className="text-xs text-muted-foreground">
+              {busy ? (progress ? cloneProgressLabel(progress) : "Starting…") : ""}
+            </p>
+            <progress
+              data-testid="clone-progress-bar"
+              max={100}
+              value={busy ? progress?.percent ?? undefined : undefined}
+              aria-label="Clone progress"
+              aria-valuetext={busy ? (progress ? cloneProgressLabel(progress) : "Starting…") : undefined}
+              className="h-1.5 w-full accent-primary"
+            />
+          </div>
         </div>
 
         <div className="flex shrink-0 justify-end gap-2 border-t border-border/60 px-4 py-3">

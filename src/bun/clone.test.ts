@@ -6,6 +6,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -13,6 +14,7 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import {
   cancelClone,
+  CLONE_PROGRESS_MAX_EVENTS,
   cloneAuthEnv,
   cloneAuthHeader,
   cloneRepo,
@@ -899,14 +901,50 @@ describe("parseCloneProgress", () => {
     expect(parseCloneProgress(overlong)).toBeNull();
   });
 
-  test("an overlong PROGRESS-shaped line is recognized (phase/percent survive) and its `line` is capped at 200 chars", () => {
-    const record = "Receiving objects:  42% (10/20)" + "z".repeat(5_000);
+  test("an overlong but WELL-FORMED progress line (huge object counts, still anchored end-to-end) is recognized and its `line` is capped at 200 chars", () => {
+    // Real git output is unbounded in the (a/b) object counts, not just the
+    // percent digits — a huge repo can legitimately produce a long line
+    // that still matches the anchored shape exactly (fix 6 below is about
+    // trailing content that DOESN'T fit the shape, not about length alone).
+    const record = `Receiving objects:  42% (${"1".repeat(90)}/${"2".repeat(90)})`;
+    expect(record.length).toBeGreaterThan(200);
     const result = parseCloneProgress(record);
     expect(result).not.toBeNull();
     expect(result!.phase).toBe("receiving");
     expect(result!.percent).toBe(42);
     expect(result!.line.length).toBe(200);
-    expect(result!.line.startsWith("Receiving objects:  42% (10/20)")).toBe(true);
+    expect(result!.line.startsWith("Receiving objects:  42% (11111")).toBe(true);
+  });
+
+  // Review finding #6: the OLD prefix-only patterns matched a percent/count
+  // group followed by ANYTHING, silently classifying a line like
+  // `remote: Counting objects: 50% (1/2) error: repository is archived` as
+  // progress and dropping the actual error text. The patterns are now
+  // anchored end-to-end (`$`), so trailing content that isn't one of the
+  // real suffix shapes (an optional `(a/b)` count, `Receiving objects`'s
+  // throughput suffix, an optional `, done.`) makes the WHOLE record fall
+  // through as non-progress instead.
+  test("fix 6: a percent-shaped line followed by trailing prose is NOT recognized as progress — it's junk to this function, so the caller can preserve it as error text", () => {
+    expect(parseCloneProgress("remote: Counting objects:  50% (1/2) error: repository is archived")).toBeNull();
+    expect(parseCloneProgress("Receiving objects: 100% (2/2) fatal: unexpected disconnect")).toBeNull();
+    expect(parseCloneProgress("remote: Enumerating objects: 5, done. error: repository is archived")).toBeNull();
+  });
+
+  // The anchored patterns still stay linear-time (no catastrophic
+  // backtracking) — but note the input to them is already capped to
+  // `CLONE_PROGRESS_LINE_MAX_CHARS` (200) by `sanitizeCloneProgressLine`
+  // BEFORE any pattern ever runs, so this is really exercising that cap
+  // plus the anchoring together, not a from-scratch ReDoS probe the way
+  // `isAuthShapedCloneFailure`'s own linearity test (over the FULL,
+  // uncapped stderr text) has to be.
+  test("fix 6: a long adversarial tail after a valid percent/count prefix is rejected fast (capped before matching, then falls through as junk)", () => {
+    const adversarial = "Receiving objects:  50% (1/2)" + " error: repository is archived".repeat(10_000);
+    expect(adversarial.length).toBeGreaterThan(200_000);
+    const start = performance.now();
+    const result = parseCloneProgress(adversarial);
+    const elapsed = performance.now() - start;
+    expect(result).toBeNull();
+    expect(elapsed).toBeLessThan(50);
   });
 
   test("a malformed 4-digit percent capture clamps to 100 rather than overflowing", () => {
@@ -1056,9 +1094,99 @@ describe("readCloneStderrStream", () => {
     // Progress recorded before the stream ever crosses the cap still forwards.
     expect(events.length).toBeGreaterThanOrEqual(1);
     expect(events[0]!.percent).toBe(1);
-    // The reader stopped decoding/accumulating well before the full input —
-    // bounded memory, not "read everything, then truncate at the end".
+    // The reader stopped ACCUMULATING (into the returned error text) well
+    // before the full input — bounded memory, not "read everything, then
+    // truncate at the end". (Classification/decoding of every chunk still
+    // happens regardless — see the fix 1 test below for why that matters.)
     expect(stderr.length).toBeLessThan(totalInputBytes / 2);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Review finding #1: the rate limiter's own "always forward on phase
+  // change or 100%" exceptions are bypassable by a remote-controlled stream —
+  // neither exception is time-gated. `CLONE_PROGRESS_MAX_EVENTS` plus an
+  // exact-repeat dedup close both bypass shapes.
+  // ---------------------------------------------------------------------------
+
+  test("fix 1: a remote parked on ONE phase at 100% forever forwards it exactly once, not once per record (the exact-repeat dedup)", async () => {
+    const events: CloneProgress[] = [];
+    const flood = Array.from({ length: 5_000 }, () => "remote: Counting objects: 100% (2/2), done.").join("\r") + "\r";
+    await readCloneStderrStream(streamOfChunks([flood]), (p) => events.push(p));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({ phase: "counting", percent: 100, line: "remote: Counting objects: 100% (2/2), done." });
+  });
+
+  test(
+    "fix 1: a remote alternating between two DIFFERENT phases every record — each a phase change, each exempt from the time-based rate limit — is still bounded by CLONE_PROGRESS_MAX_EVENTS, and a trailing fatal line after the flood survives",
+    async () => {
+      const events: CloneProgress[] = [];
+      const floodLines: string[] = [];
+      for (let i = 0; i < 20_000; i++) {
+        floodLines.push(
+          i % 2 === 0
+            ? "remote: Counting objects: 100% (2/2), done."
+            : "remote: Compressing objects: 100% (2/2), done.",
+        );
+      }
+      const text = floodLines.join("\r") + "\r" + "fatal: boom\n";
+
+      const stderr = await readCloneStderrStream(streamOfChunks([text]), (p) => events.push(p));
+
+      // Old behavior (unbounded): 20,000 records → 20,000 broadcasts, since
+      // every record is a phase change relative to the previous one.
+      expect(events.length).toBeGreaterThan(0);
+      expect(events.length).toBeLessThanOrEqual(CLONE_PROGRESS_MAX_EVENTS);
+      // The progress flood never touches the error-text budget — the
+      // trailing failure line (tiny) survives regardless of how big the
+      // flood in front of it was.
+      expect(stderr).toContain("fatal: boom");
+    },
+    20_000,
+  );
+
+  test("fix 1: a genuinely DIFFERENT percent on the same phase is never treated as a repeat (dedup is exact-match only, not phase-only)", async () => {
+    const events: CloneProgress[] = [];
+    await readCloneStderrStream(
+      streamOfChunks(
+        [
+          "Receiving objects:  10% (1/10)\r",
+          "Receiving objects:  10% (1/10)\r",
+          "Receiving objects:  11% (2/10)\r",
+        ],
+        150,
+      ),
+      (p) => events.push(p),
+    );
+    // First 10% forwards (phase change). The exact-repeat second 10% is
+    // dropped by the dedup rule REGARDLESS of the 150ms gap that would
+    // otherwise let the time-based limiter forward it too. 11% differs from
+    // the immediately preceding record, so it is never treated as a repeat
+    // and forwards once its own 150ms gap has elapsed.
+    expect(events.map((e) => e.percent)).toEqual([10, 11]);
+  });
+
+  // Review finding #6, exercised through the full streaming reader (not
+  // just `parseCloneProgress` directly): a percent-shaped prefix followed by
+  // real error prose must fall through to the returned error text instead
+  // of being silently classified (and dropped) as progress.
+  test("fix 6: a percent-shaped record with trailing error prose is preserved in the returned error text, not swallowed as progress", async () => {
+    const events: CloneProgress[] = [];
+    const stderr = await readCloneStderrStream(
+      streamOfChunks(["remote: Counting objects: 50% (1/2) error: repository is archived\n"]),
+      (p) => events.push(p),
+    );
+    expect(events).toHaveLength(0);
+    expect(stderr).toContain("error: repository is archived");
+  });
+
+  // Review finding #7: `onProgress` is caller-supplied and must never be
+  // able to abort stderr reading (or, transitively, the clone itself).
+  test("fix 7: a throwing onProgress callback never escapes readCloneStderrStream — reading completes and the rest of the text is still returned", async () => {
+    const text = "Receiving objects:  50% (1/2)\r" + "fatal: boom\n";
+    const stderr = await readCloneStderrStream(streamOfChunks([text]), () => {
+      throw new Error("boom from a broken onProgress callback");
+    });
+    expect(stderr).toContain("fatal: boom");
   });
 });
 
@@ -1729,16 +1857,264 @@ describe("cloneRepo", () => {
     },
   );
 
-  // "A cancel arriving BETWEEN cloneRepo's two attempts" is NOT independently
-  // testable from outside `cloneRepo` (same shape as the destination-race
-  // note above this section): `runGitClone`'s `finally` removes attempt 1's
-  // registry entry, and — only if a retry actually runs — a fresh entry for
-  // attempt 2 is registered inside the NEXT `runGitClone` call, but there is
-  // no `await` in `cloneRepo` between those two points that anything
-  // outside the function could schedule a `cancelClone` call into. This is
-  // therefore covered by reasoning only, the same treatment the pre-existing
-  // destination-race note above gives its own untestable race: a
-  // `cancelClone` call landing in that window finds no registry entry (the
-  // same code path already exercised by "an unknown cloneId is always a
-  // no-op" above) and correctly returns `false`.
+  // Review finding #2: a `cancelClone` call landing before a git child
+  // process exists — before attempt 1 spawns, between attempt 1 and a
+  // retry, or while `opts.auth()` is resolving — used to be a silent no-op
+  // (nothing in `activeClones` to kill). It no longer is: `cloneRepo`
+  // announces every clone it's given an id for via `pendingCloneIds` for
+  // the WHOLE call, and latches an early cancellation (`cancelRequested`)
+  // that `cloneRepo`/`runGitClone` consume at every one of those gaps. The
+  // tests below exercise exactly those gaps, not just the "git child is
+  // already running" case the earlier tests above already covered.
+
+  test(
+    "cancel (fix 2): calling cancelClone synchronously right after cloneRepo starts — before it has yielded even once — is still honored; the clone is announced before any process exists",
+    async () => {
+      // Force the GIT_SSH_COMMAND config-lookup probe in `runGitClone` to
+      // actually run (an async gap) rather than being skipped — see that
+      // function's own `if (!process.env.GIT_SSH_COMMAND)` branch. Without
+      // this, an ambient `GIT_SSH_COMMAND` in the test environment could let
+      // `Bun.spawn` happen synchronously, before this test's own
+      // `cancelClone` call ever gets a turn.
+      const savedSsh = process.env.GIT_SSH_COMMAND;
+      delete process.env.GIT_SSH_COMMAND;
+      try {
+        const dest = path.join(dir, "cancel-before-first-tick");
+        const cloneId = "cancel-before-first-tick-id";
+        const clonePromise = cloneRepo(sourceRepo, dest, { cloneId });
+        // No `await` yet — this executes in the SAME synchronous tick
+        // `cloneRepo` was invoked in, well before `Bun.spawn` ever runs.
+        expect(cancelClone(cloneId)).toBe(true);
+
+        const result = await clonePromise;
+        expect(result).toEqual({ ok: false, cancelled: true, error: "clone cancelled" });
+        expect(existsSync(dest)).toBe(false);
+      } finally {
+        if (savedSsh === undefined) delete process.env.GIT_SSH_COMMAND;
+        else process.env.GIT_SSH_COMMAND = savedSsh;
+      }
+    },
+  );
+
+  test(
+    "cancel (fix 2): a cancellation that arrives while a slow opts.auth() is still resolving is honored — the token retry never spawns",
+    async () => {
+      const root = mkdtempSync(path.join(tmpdir(), "agetor-clone-cancel-during-auth-"));
+      makeBareSourceRepo(root);
+      const requireAuth = basicAuthValue("x-access-token:good-tok");
+      // Anonymous-open-gated server: attempt 1 401s immediately (fast,
+      // local), which is auth-shaped and would normally trigger a retry.
+      const server = startAuthGitServer(root, { requireAuth });
+      try {
+        const cloneId = "cancel-during-auth-id";
+        const dest = path.join(dir, "cancel-during-auth-dest");
+        let authCalls = 0;
+        const clonePromise = cloneRepo(`${server.url}/repo.git`, dest, {
+          cloneId,
+          auth: async () => {
+            authCalls++;
+            // Simulates a slow `gh auth token` shellout.
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            return { origin: `${server.url}/`, header: `Authorization: ${requireAuth}` };
+          },
+          transport: "https",
+          host: "127.0.0.1",
+        });
+
+        // Give attempt 1 time to fail and opts.auth() to actually start.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(cancelClone(cloneId)).toBe(true);
+
+        const result = await clonePromise;
+        expect(result).toEqual({ ok: false, cancelled: true, error: "clone cancelled" });
+        // auth() DID get called and DID resolve — just too late; the retry
+        // itself (a second `runGitClone` call) never ran.
+        expect(authCalls).toBe(1);
+        expect(existsSync(dest)).toBe(false);
+      } finally {
+        server.stop();
+      }
+    },
+    30_000,
+  );
+
+  test(
+    "cancel (fix 2): cancelClone is true for an id cloneRepo has announced but not yet spawned a process for, false for an unknown id, and false once the clone has settled",
+    async () => {
+      expect(cancelClone("cancel-tri-state-unknown-id")).toBe(false);
+
+      const root = mkdtempSync(path.join(tmpdir(), "agetor-clone-tristate-"));
+      makeBareSourceRepo(root);
+      // Slow enough that the clone is still running well past the point we
+      // check `cancelClone`'s return value.
+      const server = startAuthGitServer(root, { delayMs: 1_000 });
+      try {
+        const cloneId = "cancel-tri-state-id";
+        const dest = path.join(dir, "cancel-tri-state-dest");
+        const clonePromise = cloneRepo(`${server.url}/repo.git`, dest, { cloneId });
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(cancelClone(cloneId)).toBe(true);
+
+        const result = await clonePromise;
+        expect(result.cancelled).toBe(true);
+        expect(cancelClone(cloneId)).toBe(false);
+        expect(cancelClone("totally-unrelated-unknown-id")).toBe(false);
+      } finally {
+        server.stop();
+      }
+    },
+    30_000,
+  );
+
+  // Review finding #3: `cleanupCancelledCloneDest` used to delete EVERY
+  // entry of a pre-existing destination unconditionally, including a file
+  // that merely APPEARED after `checkCloneDestination`'s emptiness check —
+  // even one that has nothing to do with this clone. The fix scopes removal
+  // to `.git` (always) plus entries whose own birth time is at-or-after the
+  // attempt's `startedAt`. `startedAt` is captured right AFTER the
+  // synthetic `starting` progress event (see `cloneRepoInner`'s own doc
+  // comment on that ordering) — so anything a caller's `onProgress`
+  // callback does synchronously in response to THAT event necessarily
+  // predates it. Cancelling synchronously from within the same callback
+  // (rather than racing a real, slow, in-flight clone) is deliberate: real
+  // `git clone` refuses outright the instant it sees a non-empty `dest`
+  // (verified locally, git 2.51/2.54), so a stray file dropped where git
+  // could ever observe it would never reach a genuinely cancellable
+  // in-flight state at all — cancelling before attempt 1 ever spawns is the
+  // only way to test "an old file survives" without also fighting git's own
+  // up-front emptiness check.
+  test(
+    "cancel (fix 3, TOCTOU): a file dropped into a pre-existing dest right as `startedAt` is about to be captured survives cleanup",
+    async () => {
+      const cloneId = "cancel-toctou-id";
+      const dest = path.join(dir, "cancel-toctou-dest");
+      mkdirSync(dest);
+      const droppedFile = path.join(dest, "unrelated-user-file.txt");
+      const clonePromise = cloneRepo(sourceRepo, dest, {
+        cloneId,
+        onProgress: (p) => {
+          if (p.phase === "starting") {
+            // Drop the file AND cancel synchronously, from within this one
+            // callback — both land strictly before `startedAt`, and this
+            // attempt never reaches `runGitClone` at all (the cancellation
+            // latch is consumed right after `startedAt` is captured). A
+            // brief synchronous busy-wait guarantees the file's birth time
+            // and `startedAt` (`Date.now()`, both millisecond-resolution)
+            // land in DIFFERENT milliseconds — otherwise a same-millisecond
+            // tie would be indistinguishable from "created during the
+            // attempt" under the `>=` comparison `cleanupCancelledCloneDest`
+            // uses (deliberately: a real git-written file racing to the
+            // same millisecond as `startedAt` must still be removed).
+            writeFileSync(droppedFile, "not created by git\n");
+            const until = Date.now() + 5;
+            while (Date.now() < until) {
+              // Busy-wait — see comment above.
+            }
+            cancelClone(cloneId);
+          }
+        },
+      });
+
+      const result = await clonePromise;
+      expect(result).toEqual({ ok: false, cancelled: true, error: "clone cancelled" });
+      expect(existsSync(droppedFile)).toBe(true);
+    },
+  );
+
+  test(
+    "cancel (fix 3): a dest this call created is left alone — never recursed into — if something replaces it with a symlink before cleanup runs",
+    async () => {
+      const cloneId = "cancel-symlink-guard-id";
+      const dest = path.join(dir, "cancel-symlink-guard-dest");
+      const sensitiveTarget = path.join(dir, "cancel-symlink-guard-sensitive");
+      mkdirSync(sensitiveTarget);
+      writeFileSync(path.join(sensitiveTarget, "keep-me.txt"), "do not delete\n");
+      const clonePromise = cloneRepo(sourceRepo, dest, {
+        cloneId,
+        onProgress: (p) => {
+          if (p.phase === "starting") {
+            // `dest` does not exist yet at this point — `checkCloneDestination`
+            // already ran and only created its PARENT directory. Swap it for
+            // a symlink to somewhere that must never be touched by cleanup,
+            // then cancel synchronously so this attempt never actually
+            // spawns git (which would otherwise resolve straight through the
+            // symlink and write real files into `sensitiveTarget`).
+            symlinkSync(sensitiveTarget, dest);
+            cancelClone(cloneId);
+          }
+        },
+      });
+
+      const result = await clonePromise;
+      expect(result).toEqual({ ok: false, cancelled: true, error: "clone cancelled" });
+      // Cleanup must never follow the symlink at `dest`'s own path — the
+      // real target directory's contents survive untouched.
+      expect(existsSync(path.join(sensitiveTarget, "keep-me.txt"))).toBe(true);
+    },
+  );
+
+  // Review finding #5: a `cancelClone` call racing in AFTER git has already
+  // exited 0, but BEFORE `runGitClone`'s stderr reader has observed EOF,
+  // used to leave `cancelled: true` set alongside `ok: true` — a completed
+  // clone reported as cancelled. Reproduced with a `git` stub that performs
+  // a REAL clone via the real binary, then exits immediately while a
+  // detached background process keeps this process's stderr pipe open a
+  // little longer, widening the (normally sub-millisecond) real race into a
+  // reliably hittable window.
+  test(
+    "cancel (fix 5): a cancelClone call that races in after git has already exited 0 never reports { ok:true, cancelled:true } together",
+    async () => {
+      const realGit = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim();
+      expect(realGit.length).toBeGreaterThan(0);
+      const stubDir = mkdtempSync(path.join(tmpdir(), "agetor-clone-race-stub-"));
+      const gitStub = path.join(stubDir, "git");
+      writeFileSync(
+        gitStub,
+        [
+          "#!/bin/sh",
+          // Run the REAL git command, then exit immediately while a
+          // backgrounded, detached process keeps THIS process's stderr fd
+          // open a little longer — reproducing the real-world race where
+          // `proc.exited` resolves before `readCloneStderrStream` observes
+          // EOF on stderr.
+          `"${realGit}" "$@"`,
+          "code=$?",
+          'if [ "$1" = "clone" ]; then',
+          "  sleep 1.2 >&2 &",
+          "fi",
+          "exit $code",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      const originalPath = process.env.PATH;
+      process.env.PATH = `${stubDir}:${originalPath}`;
+      try {
+        const root = mkdtempSync(path.join(tmpdir(), "agetor-clone-race-src-"));
+        const barePath = makeBareSourceRepo(root);
+        const cloneId = "cancel-ok-race-id";
+        const dest = path.join(dir, "cancel-ok-race-dest");
+        const clonePromise = cloneRepo(`file://${barePath}`, dest, { cloneId });
+
+        // `runGitClone` probes `git config --global/--system --get
+        // core.sshCommand` (through this same stubbed PATH, fast, no sleep
+        // — only the actual "clone" subcommand backgrounds one) before ever
+        // spawning the real clone, so the tiny local clone itself doesn't
+        // actually exit until somewhat after this call started. 800ms
+        // comfortably clears that plus the clone's own (near-instant) run,
+        // while staying well inside the stub's 1.2s stderr-hold window.
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        const cancelled = cancelClone(cloneId);
+        expect(cancelled).toBe(true);
+
+        const result = await clonePromise;
+        expect(result.ok).toBe(true);
+        expect(result.cancelled).toBeUndefined();
+        expect(existsSync(path.join(dest, "README.md"))).toBe(true);
+      } finally {
+        process.env.PATH = originalPath;
+      }
+    },
+    30_000,
+  );
 });

@@ -291,13 +291,15 @@ Owner asked to sweep in two items §9 had ruled out of scope. Grilled (this sess
 existing `streamSse`), and the dialog gets a **Cancel** button while cloning.
 
 **Design.**
-- `POST /projects/clone` accepts an optional client-minted `cloneId` (UUID, validated `^[0-9a-f-]{36}$`;
+- `POST /projects/clone` accepts an optional client-minted `cloneId` (UUID, validated case-insensitively against the 8-4-4-4-12 hex shape;
   the server mints one when absent and echoes it in the response). While `git clone --progress` runs,
   the server broadcasts `AppEvent { type: "clone_progress", cloneId, phase, percent, line, ts }` —
   parsed from git's `\r`-separated stderr progress records (`Cloning into`, `remote: Enumerating/Counting/
   Compressing objects`, `Receiving objects: NN% (a/b)`, `Resolving deltas: NN% (a/b)`, `Updating files: NN%`)
-  by a pure exported `parseCloneProgress(record)`; rate-limited to ≤ 10 events/s per clone, always
-  emitting phase changes and 100 %. A final `phase: "done" | "failed" | "cancelled"` event closes it.
+  by a pure exported `parseCloneProgress(record)`; forwarding is bounded — ≤ 1 event/100 ms per phase, phase
+  changes and 100 % pass the timer but never as consecutive duplicates, and a hard per-clone event budget caps
+  what a hostile remote's `remote:` lines can broadcast (review finding: the unbounded fast path let a remote
+  push 20k events). A final `phase: "done" | "failed" | "cancelled"` event closes it.
   Progress text is sanitized by the same control-char strip as error stderr and never carries a token.
 - The progress reader replaces `readBoundedCloneStderr`: it splits on `\r`/`\n` incrementally, feeds
   records to the parser, and still accumulates the bounded stderr the failure copy needs (a record that

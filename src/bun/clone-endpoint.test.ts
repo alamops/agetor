@@ -710,6 +710,81 @@ test(
   30_000,
 );
 
+test(
+  "a duplicate in-flight cloneId 409s the second POST, doesn't disturb the first, and frees up once the first settles",
+  async () => {
+    const sourceRoot = mkdtempSync(path.join(tmpdir(), "agetor-clone-endpoint-dup-src-"));
+    makeBareSourceRepo(sourceRoot);
+    // Same idiom as the cancel tests above: a generous per-request delay
+    // keeps the first POST's clone in flight long enough to fire the
+    // duplicate POST and the cancelling DELETE against it.
+    const gitServer = startAuthGitServer(sourceRoot, { delayMs: 4_000 });
+    const prevOverride = process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+    process.env.AGETOR_CLONE_SOURCE_OVERRIDE = `${gitServer.url}/repo.git`;
+    try {
+      const cloneId = crypto.randomUUID();
+      const dest1 = path.join(WORK_DIR, "clone-dup-id-1");
+      const dest2 = path.join(WORK_DIR, "clone-dup-id-2");
+
+      const firstPostPromise = call("/projects/clone", {
+        method: "POST",
+        body: JSON.stringify({ url: "someowner/dupclonefirst", dest: dest1, eli5: false, cloneId }),
+      });
+
+      // Give git a moment to actually spawn, connect, and issue its first
+      // request — same wait as the cancel tests — before racing the
+      // duplicate POST and the DELETE against the same id.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // A second POST reusing the same in-flight cloneId is rejected...
+      const dupRes = await call("/projects/clone", {
+        method: "POST",
+        body: JSON.stringify({ url: "someowner/dupclonesecond", dest: dest2, eli5: false, cloneId }),
+      });
+      expect(dupRes.status).toBe(409);
+      expect(await dupRes.json()).toEqual({
+        error: "a clone with that id is already in flight",
+        cloneId,
+      });
+      // ...and nothing was cloned/registered for the rejected duplicate.
+      expect(existsSync(dest2)).toBe(false);
+
+      // The DELETE still targets the FIRST (real) clone under that id, not
+      // the rejected duplicate — cancelling it still works exactly as
+      // before the duplicate-guard existed.
+      const delRes = await call(`/projects/clone/${cloneId}`, { method: "DELETE" });
+      expect(delRes.status).toBe(200);
+      expect(await delRes.json()).toEqual({ ok: true });
+
+      const firstRes = await firstPostPromise;
+      expect(firstRes.status).toBe(409);
+      expect(await firstRes.json()).toEqual({ error: "clone cancelled", cancelled: true, cloneId });
+      expect(existsSync(dest1)).toBe(false);
+
+      // The id is free again now that the first request has settled: a
+      // fresh POST reusing it succeeds (or fails) on its own merits, never
+      // with the duplicate-in-flight error. Point the source override back
+      // at the fast fixture repo from beforeAll (rather than the slow git
+      // server) so this assertion doesn't also pay the 4s-per-request delay.
+      process.env.AGETOR_CLONE_SOURCE_OVERRIDE = prevOverride;
+      const dest3 = path.join(WORK_DIR, "clone-dup-id-reused");
+      const reusedRes = await call("/projects/clone", {
+        method: "POST",
+        body: JSON.stringify({ url: "someowner/dupclonereused", dest: dest3, eli5: false, cloneId }),
+      });
+      expect(reusedRes.status).not.toBe(409);
+      const reusedBody = (await reusedRes.json()) as { error?: string; cloneId?: string };
+      expect(reusedBody.error).not.toBe("a clone with that id is already in flight");
+    } finally {
+      if (prevOverride === undefined) delete process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+      else process.env.AGETOR_CLONE_SOURCE_OVERRIDE = prevOverride;
+      gitServer.stop();
+      rmSync(sourceRoot, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
+
 test("a second DELETE for an already-settled cloneId 404s (the registry entry is gone)", async () => {
   const sourceRoot = mkdtempSync(path.join(tmpdir(), "agetor-clone-endpoint-cancel-src2-"));
   makeBareSourceRepo(sourceRoot);

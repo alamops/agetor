@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { CloneProgressPhase, GitProvider } from "../shared/types.ts";
@@ -576,7 +576,19 @@ export interface CloneResult {
    *  in-flight git process for this clone — never set alongside `ok: true`,
    *  and never for an ordinary (non-cancelled) failure or timeout. Absent
    *  (not `false`) in every other case, so `result.cancelled` can be used as
-   *  a truthy check without also checking `!result.ok`. */
+   *  a truthy check without also checking `!result.ok`.
+   *
+   *  This is a real invariant, not just a convention: a `cancelClone` call
+   *  can race in AFTER the underlying `git` process has already exited 0 but
+   *  BEFORE `runGitClone` has finished draining its stderr pipe (the two are
+   *  awaited together, and pipe EOF can lag process exit) — `handle.kill()`
+   *  would set its local `cancelled` flag regardless of the exit code that
+   *  already happened. `runGitClone` clears that flag whenever
+   *  `exitCode === 0` (a clone that actually completed is never "cancelled",
+   *  no matter what raced in against it — the project it produced is
+   *  already usable), and `cloneRepo` additionally checks `ok` before
+   *  `cancelled` at every branch point as a second, defensive line against
+   *  the same shape of bug. */
   cancelled?: true;
 }
 
@@ -631,17 +643,29 @@ export interface CloneOptions {
   host?: string;
   /** Receives every progress update for this clone — one call per parsed
    *  git `--progress` record that survives the streaming reader's rate
-   *  limit (`readCloneStderrStream`), plus `cloneRepo`'s own synthetic
-   *  `starting` (before attempt 1, and again before a token retry) and
-   *  terminal `done`/`failed`/`cancelled` events (never rate-limited — see
-   *  `cloneRepo`'s doc comment). Never receives a credential: git's
+   *  limit AND its hard per-clone forward budget (`readCloneStderrStream`,
+   *  `CLONE_PROGRESS_MAX_EVENTS` — a remote that keeps a phase pinned at
+   *  100% or alternates phases every record can otherwise force a forward
+   *  on every single record, which the time-based rate limit alone does
+   *  NOT catch), plus `cloneRepo`'s own synthetic `starting` (before
+   *  attempt 1, and again before a token retry) and terminal
+   *  `done`/`failed`/`cancelled` events (never rate-limited or budgeted —
+   *  see `cloneRepo`'s doc comment). A throwing callback is swallowed at
+   *  every call site (`readCloneStderrStream`'s `forward`, and `cloneRepo`'s
+   *  own `emitProgress`) — this option must never be able to abort the
+   *  clone or orphan the git child. Never receives a credential: git's
    *  progress lines never carry one, and `cloneRepo`'s own synthetic lines
-   *  are static, credential-free text. */
+   *  are static, credential-free text; every line — including one built
+   *  from a failure message — is capped and control-character-stripped via
+   *  `sanitizeCloneProgressLine` before it ever reaches this callback. */
   onProgress?: (progress: CloneProgress) => void;
   /** Registry key for `cancelClone` — when omitted, this clone can never be
    *  cancelled (there is nothing for `cancelClone` to look up). Callers that
    *  want cancellation must mint a stable id themselves and pass the SAME
-   *  one on any matching `cancelClone(cloneId)` call. */
+   *  one on any matching `cancelClone(cloneId)` call. `cancelClone` honors
+   *  this id for the FULL lifetime of the matching `cloneRepo` call — not
+   *  just while a git child process happens to be running — see
+   *  `pendingCloneIds`/`cancelRequested`. */
   cloneId?: string;
 }
 
@@ -668,20 +692,25 @@ const CLONE_STDERR_MAX_LINE_CHARS = 500;
 const CLONE_STDERR_MAX_LINES = 50;
 const CLONE_STDERR_MAX_TOTAL_CHARS = 16 * 1024;
 
-/** Hard cap on how many raw bytes `readCloneStderrStream` accumulates from
- *  the child's stderr pipe — independent of, and larger than,
- *  `CLONE_STDERR_MAX_TOTAL_CHARS` above (which trims the already-decoded,
- *  already-record-split, non-progress text). This one bounds how much
- *  memory a single attempt's stderr reader can hold in the first place, per
- *  the review finding that reading a remote-controlled stream fully into
- *  memory before ever truncating it is itself unbounded. Past the cap the
- *  reader keeps draining the stream (so the child's pipe never backs up and
- *  blocks it) but stops decoding/matching/accumulating anything further —
- *  nothing past this point could survive the tail-keeping trim below
- *  anyway. Mirrors `readBoundedCloneStderr`'s original cap exactly (same
- *  constant, same semantics: a chunk that was already in flight when the
- *  cap was crossed is still processed in full, only LATER chunks are
- *  dropped). */
+/** Hard cap on how many bytes of NON-progress ("error-candidate") text
+ *  `readCloneStderrStream` accumulates into its returned error text —
+ *  independent of, and larger than, `CLONE_STDERR_MAX_TOTAL_CHARS` above
+ *  (which trims the already-decoded, already-record-split text one more
+ *  time, and is what actually produces the final ~16 KB tail). This cap is
+ *  scoped to non-progress bytes ONLY (review finding #1's fix): a record
+ *  that parses as progress (`parseCloneProgress`) is forwarded to
+ *  `onProgress` and NEVER counted against it and never accumulated at all —
+ *  so an arbitrarily long flood of progress-shaped lines can never crowd out
+ *  a real, later failure line the way it could when this cap gated the raw
+ *  stream-read loop itself (the old behavior: once ANY 1 MB of raw bytes had
+ *  been read, decoding stopped outright, discarding whatever arrived after —
+ *  including a trailing `fatal: …` that happened to land after a big enough
+ *  progress flood). Every record — progress or not — is still classified
+ *  (`parseCloneProgress`, cheap, O(1)) for as long as the stream has more
+ *  data; only the ACCUMULATION of non-progress text into the returned
+ *  string stops once this cap is reached, which is deliberately acceptable
+ *  (“keep parsing to classify-and-drop” — O(records), not O(bytes) of
+ *  decode-and-store). */
 const CLONE_STDERR_READ_CAP_BYTES = 1 * 1024 * 1024;
 
 /**
@@ -749,29 +778,58 @@ const CLONE_PROGRESS_LINE_MAX_CHARS = 200;
  *  this phase never carries a percentage). */
 const CLONE_PROGRESS_STARTING_RE = /^Cloning into /;
 
-/** `remote: Enumerating objects: N, done.` — reports a raw object count, not
- *  a percentage (git only starts showing a percentage once it knows the
+/** `remote: Enumerating objects: N[, done.]` — reports a raw object count,
+ *  not a percentage (git only starts showing a percentage once it knows the
  *  total, which Enumerating is still discovering) — mapped to the same
  *  `"counting"` phase as `remote: Counting objects: NN%` below, per the
  *  plan's phase table. No capture group; `percent` is always `null` for a
- *  line this pattern matches. */
-const CLONE_PROGRESS_ENUMERATING_RE = /^remote: Enumerating objects\b/;
+ *  line this pattern matches. Anchored end-to-end (review finding #6, same
+ *  reasoning as the percent patterns below) — a REAL `remote: …` line this
+ *  otherwise resembles but whose tail carries something else entirely (an
+ *  attacker-appended error) must fall through to the error text instead of
+ *  being swallowed as progress. */
+const CLONE_PROGRESS_ENUMERATING_RE = /^remote: Enumerating objects:\s*\d+(?:,\s*done\.?)?\s*$/;
 
 /** The five percentage-carrying phases below all share one shape:
- *  `<fixed label>: NN% (a/b)[, …][, done.]` — a fixed literal prefix,
- *  optional run-of-spaces padding (git pads with spaces to erase a longer
- *  previous line when a terminal is attached; `--progress` without a tty
- *  still writes them), then 1–3 percent digits. Every pattern here is
- *  anchored at the start of the (already trimmed) line and separates its
- *  literal prefix from `\d` with only `\s*` in between — two disjoint
- *  character classes can't backtrack against each other, so these stay
- *  linear-time regardless of how long an adversarial line's TAIL (after the
- *  percentage, never captured) is. */
-const CLONE_PROGRESS_COUNTING_RE = /^remote: Counting objects:\s*(\d{1,3})%/;
-const CLONE_PROGRESS_COMPRESSING_RE = /^remote: Compressing objects:\s*(\d{1,3})%/;
-const CLONE_PROGRESS_RECEIVING_RE = /^Receiving objects:\s*(\d{1,3})%/;
-const CLONE_PROGRESS_RESOLVING_RE = /^Resolving deltas:\s*(\d{1,3})%/;
-const CLONE_PROGRESS_CHECKING_OUT_RE = /^Updating files:\s*(\d{1,3})%/;
+ *  `<fixed label>: NN% (a/b)[, <throughput>][, done.]` — a fixed literal
+ *  prefix, optional run-of-spaces padding (git pads with spaces to erase a
+ *  longer previous line when a terminal is attached; `--progress` without a
+ *  tty still writes them), then 1–3 percent digits, an optional `(a/b)`
+ *  object count, an optional throughput suffix (`Receiving objects` only —
+ *  e.g. `, 2.67 MiB | 40.26 MiB/s`, real captures in `clone.test.ts`), and an
+ *  optional `, done.` closer — anchored end-to-end with `$` (review finding
+ *  #6): the OLD prefix-only patterns matched `remote: Counting objects:
+ *  50% (1/2) error: repository is archived` just as happily as a real
+ *  progress line, silently dropping the ` error: …` tail from the returned
+ *  error text. Anchoring closes that: any trailing content that isn't one of
+ *  the shapes git itself actually emits now falls through and the WHOLE
+ *  record is treated as (potential) error text instead. Every pattern here
+ *  still separates each literal/character-class boundary with only `\s*`
+ *  or a single alternation — no unbounded `.*`/`.+`, and no two adjacent
+ *  quantified groups that could backtrack against each other — so these
+ *  stay linear-time regardless of how long an adversarial line is (see the
+ *  ReDoS linearity test in `clone.test.ts`). */
+const CLONE_PROGRESS_DONE_SUFFIX = String.raw`(?:,\s*done\.?)?\s*$`;
+const CLONE_PROGRESS_COUNT_SUFFIX = String.raw`(?:\s*\(\d+\/\d+\))?`;
+/** `, 2.67 MiB | 40.26 MiB/s` — the throughput suffix git appends only to
+ *  `Receiving objects` (a raw byte/rate pair; `KMGT` size prefix and the
+ *  `iB`/`bytes` unit are the two real shapes captured live). */
+const CLONE_PROGRESS_THROUGHPUT_SUFFIX = String.raw`(?:,\s*[\d.]+\s*(?:[KMGT]iB|bytes)(?:\s*\|\s*[\d.]+\s*[KMGT]iB\/s)?)?`;
+const CLONE_PROGRESS_COUNTING_RE = new RegExp(
+  String.raw`^remote: Counting objects:\s*(\d{1,3})%${CLONE_PROGRESS_COUNT_SUFFIX}${CLONE_PROGRESS_DONE_SUFFIX}`,
+);
+const CLONE_PROGRESS_COMPRESSING_RE = new RegExp(
+  String.raw`^remote: Compressing objects:\s*(\d{1,3})%${CLONE_PROGRESS_COUNT_SUFFIX}${CLONE_PROGRESS_DONE_SUFFIX}`,
+);
+const CLONE_PROGRESS_RECEIVING_RE = new RegExp(
+  String.raw`^Receiving objects:\s*(\d{1,3})%${CLONE_PROGRESS_COUNT_SUFFIX}${CLONE_PROGRESS_THROUGHPUT_SUFFIX}${CLONE_PROGRESS_DONE_SUFFIX}`,
+);
+const CLONE_PROGRESS_RESOLVING_RE = new RegExp(
+  String.raw`^Resolving deltas:\s*(\d{1,3})%${CLONE_PROGRESS_COUNT_SUFFIX}${CLONE_PROGRESS_DONE_SUFFIX}`,
+);
+const CLONE_PROGRESS_CHECKING_OUT_RE = new RegExp(
+  String.raw`^Updating files:\s*(\d{1,3})%${CLONE_PROGRESS_COUNT_SUFFIX}${CLONE_PROGRESS_DONE_SUFFIX}`,
+);
 
 /** Clamps a percent-pattern capture group (always 1–3 ASCII digits per the
  *  regexes above, so always a finite, non-negative integer) to 0–100 — the
@@ -786,13 +844,33 @@ function clampCloneProgressPercent(raw: string): number {
 /** Strips control characters (`CLONE_STDERR_CONTROL_CHARS_RE` — same rule
  *  `sanitizeCloneStderr` applies, so an ANSI-colored or otherwise
  *  control-character-laden record can't smuggle anything through either
- *  path), trims git's own line-clearing space padding from both ends, and
- *  caps the result to `CLONE_PROGRESS_LINE_MAX_CHARS`. */
+ *  path) and trims git's own line-clearing space padding from both ends —
+ *  deliberately WITHOUT capping length. `parseCloneProgress` matches its
+ *  anchored (`$`-terminated) patterns against this UNCAPPED text on
+ *  purpose: capping first, then anchor-matching the capped remainder, would
+ *  make a genuinely well-formed but long record (git's own object counts
+ *  are not bounded to any particular width) fail to match simply because
+ *  its tail got truncated out from under the `$` anchor — the display cap
+ *  belongs on the OUTPUT, not on what gets pattern-matched. */
+function stripAndTrimProgressRecord(record: string): string {
+  return record.replace(CLONE_STDERR_CONTROL_CHARS_RE, "").trim();
+}
+
+/** Caps a (already stripped/trimmed) line to `CLONE_PROGRESS_LINE_MAX_CHARS`
+ *  — see `CloneProgress.line`'s own doc comment. Split out from
+ *  `sanitizeCloneProgressLine` below so `parseCloneProgress` can apply it
+ *  only to the OUTPUT, after matching against the uncapped text. */
+function capProgressLineLength(line: string): string {
+  return line.length > CLONE_PROGRESS_LINE_MAX_CHARS ? line.slice(0, CLONE_PROGRESS_LINE_MAX_CHARS) : line;
+}
+
+/** Strip + trim + cap in one call — for every caller that has no matching
+ *  to do first (`cloneRepo`'s own synthetic/failure lines, which are never
+ *  matched against a pattern, only ever displayed). `parseCloneProgress`
+ *  does NOT use this — see `stripAndTrimProgressRecord`'s own doc comment
+ *  for why matching needs the uncapped text. */
 function sanitizeCloneProgressLine(record: string): string {
-  const stripped = record.replace(CLONE_STDERR_CONTROL_CHARS_RE, "").trim();
-  return stripped.length > CLONE_PROGRESS_LINE_MAX_CHARS
-    ? stripped.slice(0, CLONE_PROGRESS_LINE_MAX_CHARS)
-    : stripped;
+  return capProgressLineLength(stripAndTrimProgressRecord(record));
 }
 
 /**
@@ -809,27 +887,37 @@ function sanitizeCloneProgressLine(record: string): string {
  * construction (each has a distinct fixed literal prefix), so checking them
  * in any order yields the same result — listed here in the order git itself
  * emits them during a normal clone.
+ *
+ * Matches against the UNCAPPED, stripped/trimmed text
+ * (`stripAndTrimProgressRecord`) — every pattern is anchored end-to-end
+ * (review finding #6), so capping length BEFORE matching would make an
+ * otherwise well-formed but long record (a huge repo's object counts have
+ * no fixed width) fail to match purely because its closing `)`/`done.`/`$`
+ * got truncated away. The returned `line` is capped separately
+ * (`capProgressLineLength`), on the OUTPUT only, once a match is already
+ * decided.
  */
 export function parseCloneProgress(record: string): CloneProgress | null {
-  const line = sanitizeCloneProgressLine(record);
-  if (!line) return null;
+  const full = stripAndTrimProgressRecord(record);
+  if (!full) return null;
+  const line = capProgressLineLength(full);
 
-  if (CLONE_PROGRESS_STARTING_RE.test(line)) return { phase: "starting", percent: null, line };
-  if (CLONE_PROGRESS_ENUMERATING_RE.test(line)) return { phase: "counting", percent: null, line };
+  if (CLONE_PROGRESS_STARTING_RE.test(full)) return { phase: "starting", percent: null, line };
+  if (CLONE_PROGRESS_ENUMERATING_RE.test(full)) return { phase: "counting", percent: null, line };
 
-  const counting = line.match(CLONE_PROGRESS_COUNTING_RE);
+  const counting = full.match(CLONE_PROGRESS_COUNTING_RE);
   if (counting) return { phase: "counting", percent: clampCloneProgressPercent(counting[1]!), line };
 
-  const compressing = line.match(CLONE_PROGRESS_COMPRESSING_RE);
+  const compressing = full.match(CLONE_PROGRESS_COMPRESSING_RE);
   if (compressing) return { phase: "compressing", percent: clampCloneProgressPercent(compressing[1]!), line };
 
-  const receiving = line.match(CLONE_PROGRESS_RECEIVING_RE);
+  const receiving = full.match(CLONE_PROGRESS_RECEIVING_RE);
   if (receiving) return { phase: "receiving", percent: clampCloneProgressPercent(receiving[1]!), line };
 
-  const resolving = line.match(CLONE_PROGRESS_RESOLVING_RE);
+  const resolving = full.match(CLONE_PROGRESS_RESOLVING_RE);
   if (resolving) return { phase: "resolving", percent: clampCloneProgressPercent(resolving[1]!), line };
 
-  const checkingOut = line.match(CLONE_PROGRESS_CHECKING_OUT_RE);
+  const checkingOut = full.match(CLONE_PROGRESS_CHECKING_OUT_RE);
   if (checkingOut) return { phase: "checking-out", percent: clampCloneProgressPercent(checkingOut[1]!), line };
 
   return null;
@@ -841,6 +929,26 @@ export function parseCloneProgress(record: string): CloneProgress | null {
  *  `percent === 100`) that always forward immediately regardless of this
  *  interval. */
 const CLONE_PROGRESS_MIN_INTERVAL_MS = 100;
+
+/** Hard ceiling on how many progress events ONE `readCloneStderrStream` call
+ *  (one clone attempt) will ever forward through `onProgress`, regardless of
+ *  how the time-based rate limit above would otherwise decide (review
+ *  finding #1). The time-based limiter alone is bypassable by a
+ *  remote-controlled stream: a phase CHANGE and `percent === 100` are always
+ *  forwarded immediately, with no interval check at all — so a remote that
+ *  keeps alternating between two phases (`remote: Counting objects: 100%` /
+ *  `remote: Compressing objects: 100%`, …) every record is a phase change on
+ *  EVERY record, forwarding every single one no matter how fast they arrive
+ *  (measured: 20,000 such records → 20,000 broadcasts). Past this budget,
+ *  `readCloneStderrStream` forwards NOTHING further for the rest of this
+ *  call — records keep being classified (cheap) and, if non-progress, still
+ *  accumulate into the returned error text up to `CLONE_STDERR_READ_CAP_BYTES`
+ *  — the only thing that stops is the `onProgress` broadcast. The one
+ *  terminal event a caller is always guaranteed (`done`/`failed`/`cancelled`)
+ *  is emitted directly by `cloneRepo` itself, not through this budget, so a
+ *  caller never loses the ability to observe how the clone actually ended
+ *  even after this ceiling is hit. */
+export const CLONE_PROGRESS_MAX_EVENTS = 400;
 
 /** A single pending (not-yet-`\r`/`\n`-terminated) record in
  *  `readCloneStderrStream` is force-flushed once it grows past this many
@@ -872,26 +980,42 @@ const CLONE_PROGRESS_MAX_PENDING_CHARS = 4096;
  * never dropped); every other record is forwarded only if at least
  * `CLONE_PROGRESS_MIN_INTERVAL_MS` has passed since the last one that WAS
  * forwarded — everything else in between is silently dropped, not
- * buffered. State (`lastPhase`/`lastEmitAt`) is local to this one call (one
- * attempt's stderr stream), not shared across `cloneRepo`'s two attempts or
- * with its own synthetic events — see `cloneRepo`'s doc comment for why
- * those are never rate-limited at all.
+ * buffered. Two further guards close review finding #1's bypass, which the
+ * time-based limiter alone does not catch: (1) a record whose `{phase,
+ * percent}` is IDENTICAL to the immediately preceding record is never
+ * forwarded, regardless of timing — a remote parked on `remote: Counting
+ * objects: 100%` forever forwards it exactly once; (2) a hard ceiling,
+ * `CLONE_PROGRESS_MAX_EVENTS`, on how many events this call will EVER
+ * forward — closing the OTHER bypass: alternating between two DIFFERENT
+ * phases every record, e.g. Counting/Compressing both pinned at 100%, is a
+ * phase change on every single record and would otherwise forward all of
+ * them unconditionally. State (`lastPhase`/`lastPercent`/`lastEmitAt`/
+ * `forwardedCount`) is local to this one call (one attempt's stderr
+ * stream), not shared across `cloneRepo`'s two attempts or with its own
+ * synthetic events — see `cloneRepo`'s doc comment for why those are never
+ * rate-limited or budgeted at all.
  *
- * Memory is bounded the same way `readBoundedCloneStderr` bounded it (the
- * review finding that motivated `CLONE_STDERR_READ_CAP_BYTES` in the first
- * place): once the raw byte count read from `stream` reaches the cap, later
- * chunks are still drained (so the child's stderr pipe never backs up and
- * blocks it) but are no longer decoded, matched, or accumulated.
- * `CLONE_PROGRESS_MAX_PENDING_CHARS` additionally force-flushes a single
- * record that never sees a `\r`/`\n` terminator at all, so the OTHER
- * direction — one enormous unterminated line — can't grow the pending-record
- * buffer without bound either.
+ * Memory is bounded, but SCOPED to non-progress ("error-candidate") text
+ * only (review finding #1's other half, `CLONE_STDERR_READ_CAP_BYTES`'s own
+ * doc comment) — every chunk read off `stream` is always decoded and fed to
+ * the record splitter for as long as the stream has data, so a long flood of
+ * PROGRESS-shaped records preceding a real failure line can never prevent
+ * that later line from being seen and classified; only the ACCUMULATION of
+ * non-progress text into the returned string stops once that cap is
+ * reached. `CLONE_PROGRESS_MAX_PENDING_CHARS` additionally force-flushes a
+ * single record that never sees a `\r`/`\n` terminator at all, so one
+ * enormous unterminated line can't grow the pending-record buffer without
+ * bound either.
  *
  * Decodes with a single streaming `TextDecoder` across the whole read loop
  * (`{ stream: true }`, flushed once at EOF) rather than decoding each chunk
  * independently, so a multi-byte UTF-8 character split across two `read()`
  * chunks decodes correctly instead of producing replacement characters at
  * the boundary.
+ *
+ * A throwing `onProgress` callback is swallowed (review finding #7) — this
+ * function's contract is to keep draining and classifying `stream` no
+ * matter what the caller's own broadcast side-channel does.
  */
 export async function readCloneStderrStream(
   stream: ReadableStream<Uint8Array>,
@@ -901,18 +1025,34 @@ export async function readCloneStderrStream(
   const decoder = new TextDecoder("utf-8");
   const errorLines: string[] = [];
   let pending = "";
-  let totalBytes = 0;
+  let errorTextBytes = 0;
   let lastPhase: CloneProgressPhase | null = null;
+  let lastPercent: number | null = null;
   let lastEmitAt = 0;
+  let forwardedCount = 0;
 
   const forward = (progress: CloneProgress) => {
     if (!onProgress) return;
-    const now = Date.now();
+    const isExactRepeat = progress.phase === lastPhase && progress.percent === lastPercent;
     const phaseChanged = progress.phase !== lastPhase;
     lastPhase = progress.phase;
+    lastPercent = progress.percent;
+    // Never forward an exact back-to-back repeat, regardless of timing —
+    // closes the "parked at 100%" bypass (review finding #1).
+    if (isExactRepeat) return;
+    // Hard per-call ceiling — closes the "alternating phases" bypass, which
+    // a phase-change-always-forwards rule alone cannot catch.
+    if (forwardedCount >= CLONE_PROGRESS_MAX_EVENTS) return;
+    const now = Date.now();
     if (phaseChanged || progress.percent === 100 || now - lastEmitAt >= CLONE_PROGRESS_MIN_INTERVAL_MS) {
       lastEmitAt = now;
-      onProgress(progress);
+      forwardedCount++;
+      try {
+        onProgress(progress);
+      } catch {
+        // A throwing onProgress must never abort stderr reading (review
+        // finding #7) — see this function's own doc comment.
+      }
     }
   };
 
@@ -922,7 +1062,14 @@ export async function readCloneStderrStream(
       forward(progress);
       return;
     }
-    if (record.length > 0) errorLines.push(record);
+    if (record.length === 0) return;
+    // Scoped to NON-progress bytes only — see `CLONE_STDERR_READ_CAP_BYTES`'s
+    // own doc comment (review finding #1). Past the cap, records are still
+    // classified above (cheap, O(1)) but no longer accumulated here.
+    if (errorTextBytes < CLONE_STDERR_READ_CAP_BYTES) {
+      errorTextBytes += Buffer.byteLength(record, "utf8");
+      errorLines.push(record);
+    }
   };
 
   const feed = (text: string) => {
@@ -944,14 +1091,7 @@ export async function readCloneStderrStream(
     const { done, value } = await reader.read();
     if (done) break;
     if (!value) continue;
-    // Mirrors `readBoundedCloneStderr`'s original cap check exactly: a
-    // chunk already in flight when the cap is crossed is still processed
-    // in full (checked BEFORE adding this chunk's length), only chunks
-    // that arrive once the cap has already been reached are dropped.
-    if (totalBytes < CLONE_STDERR_READ_CAP_BYTES) {
-      totalBytes += value.byteLength;
-      feed(decoder.decode(value, { stream: true }));
-    }
+    feed(decoder.decode(value, { stream: true }));
   }
   feed(decoder.decode());
   if (pending.length > 0) flushRecord(pending);
@@ -969,32 +1109,97 @@ interface ActiveCloneHandle {
  *  clone `cloneRepo` was given an `opts.cloneId` for. An entry exists ONLY
  *  while a `git clone` child process is actually running for that id —
  *  `runGitClone` registers it right after spawning and removes it in a
- *  `finally` right before returning, so there is a real (if usually
- *  sub-millisecond) window BETWEEN `cloneRepo`'s two attempts, and after the
- *  whole call settles, where the id resolves to nothing at all — a
- *  `cancelClone` call landing in either window is therefore a correct no-op
- *  (`false`), not a bug, per this module's own cancel-race contract. */
+ *  `finally` right before returning. There IS a real window BETWEEN
+ *  `cloneRepo`'s two attempts (and before attempt 1 ever spawns, and while
+ *  `opts.auth()` itself is resolving — a `gh auth token` shellout can take
+ *  hundreds of ms) where this map alone has nothing to kill — but that
+ *  window is no longer a `cancelClone` no-op (review finding #2): see
+ *  `pendingCloneIds`/`cancelRequested` below, which is what makes
+ *  `cancelClone` correct for exactly that gap instead of merely documenting
+ *  it away. */
 const activeClones = new Map<string, ActiveCloneHandle>();
 
+/** `cloneId → ` announced, for the FULL lifetime of one `cloneRepo` call
+ *  that was given that id — from `beginClone` (the very first line of the
+ *  function body) to `endClone` in its `finally` (the very last thing that
+ *  runs before the call settles), regardless of whether a git child process
+ *  happens to be running at any given instant. This is what lets
+ *  `cancelClone` answer `true` for a clone that's genuinely in flight but
+ *  has no LIVE process yet — before attempt 1 spawns, between attempt 1 and
+ *  a token retry, or while `opts.auth()` is still resolving (review finding
+ *  #2) — distinct from `activeClones`, which only ever reflects a process
+ *  that actually exists right now. */
+const pendingCloneIds = new Set<string>();
+
+/** `cloneId → ` a `cancelClone` call landed for this id while nothing in
+ *  `activeClones` could act on it directly (see `pendingCloneIds` above).
+ *  `cloneRepo` (and `runGitClone`, right after spawning) consume this via
+ *  `consumeCancelRequest` at every point a cancellation could otherwise be
+ *  lost: before attempt 1 ever calls `runGitClone`, right after `opts.auth()`
+ *  resolves (before the retry's `runGitClone` call), and inside `runGitClone`
+ *  itself immediately after `Bun.spawn` (covering the async GIT_SSH_COMMAND
+ *  probe that can run before a process exists to kill directly). Entries are
+ *  removed by `consumeCancelRequest` on the read that finds one, and
+ *  defensively by `endClone` too, so a cancellation can never leak from one
+ *  clone into a LATER call that happens to reuse the same id. */
+const cancelRequested = new Set<string>();
+
+/** Announces `cloneId` as in flight (see `pendingCloneIds`) for the
+ *  duration of one `cloneRepo` call — a no-op when `cloneId` is omitted
+ *  (that clone can never be cancelled at all, exactly as before). */
+function beginClone(cloneId: string | undefined): void {
+  if (cloneId) pendingCloneIds.add(cloneId);
+}
+
+/** The other half of `beginClone` — always run from `cloneRepo`'s `finally`,
+ *  regardless of how the call settled, so neither set can ever leak past
+ *  one clone's lifetime. */
+function endClone(cloneId: string | undefined): void {
+  if (!cloneId) return;
+  pendingCloneIds.delete(cloneId);
+  cancelRequested.delete(cloneId);
+}
+
+/** Consumes (deletes) a pending cancellation latch for `cloneId` set by
+ *  `cancelClone`, returning whether one was set. See `cancelRequested`'s own
+ *  doc comment for the exact points `cloneRepo`/`runGitClone` call this. */
+function consumeCancelRequest(cloneId: string | undefined): boolean {
+  if (!cloneId) return false;
+  return cancelRequested.delete(cloneId);
+}
+
 /**
- * Kills the currently-running `git clone` process registered under
- * `cloneId` (see `activeClones`) and returns `true` — or returns `false`,
- * doing nothing, when `cloneId` names no CURRENTLY-running attempt: an
- * unknown id, one whose clone already finished, or one caught in the brief
- * gap between `cloneRepo`'s two attempts (see `activeClones`'s doc comment).
+ * Stops the clone registered under `cloneId` and returns `true` — or
+ * returns `false`, doing nothing, when `cloneId` names no in-flight clone at
+ * all: an unknown id, or one whose `cloneRepo` call has already settled.
  * Never throws.
  *
- * Idempotent in the sense that matters: once an attempt has been killed,
- * its `runGitClone` call's `finally` removes the registry entry before
- * `cloneRepo` returns, so a SECOND `cancelClone(cloneId)` call made after
- * `cloneRepo`'s promise has settled correctly returns `false` — there is
- * nothing left to cancel.
+ * Two cases, both `true`:
+ *  - A git child process is CURRENTLY running for this id (`activeClones`)
+ *    — killed directly, exactly as before.
+ *  - No process is running yet/right now, but a `cloneRepo` call for this
+ *    id is still in flight (`pendingCloneIds`) — before attempt 1 spawns,
+ *    between attempt 1 and a token retry, or while `opts.auth()` is
+ *    resolving. The cancellation is LATCHED (`cancelRequested`) and honored
+ *    the moment `cloneRepo`/`runGitClone` next check for it (review finding
+ *    #2 — this is what closes the old "brief gap" no-op).
+ *
+ * Idempotent in the sense that matters: once a clone's `cloneRepo` call has
+ * settled, `endClone` has removed both the pending and the requested entry,
+ * so a SECOND `cancelClone(cloneId)` call after that point correctly returns
+ * `false` — there is nothing left to cancel.
  */
 export function cancelClone(cloneId: string): boolean {
   const handle = activeClones.get(cloneId);
-  if (!handle) return false;
-  handle.kill();
-  return true;
+  if (handle) {
+    handle.kill();
+    return true;
+  }
+  if (pendingCloneIds.has(cloneId)) {
+    cancelRequested.add(cloneId);
+    return true;
+  }
+  return false;
 }
 
 /** The fixed epilogue line git's ssh/git-shell backend always closes a
@@ -1005,7 +1210,17 @@ export function cancelClone(cloneId: string): boolean {
 const CLONE_GENERIC_NO_REMOTE_FATAL = "fatal: Could not read from remote repository.";
 
 /** Git's own noise wrapper lines around the actual failure reason — see
- *  `pickCloneDisplayLine`. Matched against an already-trimmed line. */
+ *  `pickCloneDisplayLine`. Matched against an already-trimmed line.
+ *
+ *  The `"Cloning into '"` branch is dead in production as of Addendum A:
+ *  `readCloneStderrStream` now recognizes that exact line as a `starting`
+ *  progress record (`CLONE_PROGRESS_STARTING_RE`) and excludes it from the
+ *  text this function ever sees at all. It's kept (a) so a direct unit-test
+ *  call to `pickCloneDisplayLine`/`isNoiseCloneStderrLine` with a raw,
+ *  hand-built stderr string — bypassing the streaming reader entirely, as
+ *  several existing fixtures in `clone.test.ts` do — still behaves exactly
+ *  as documented, and (b) as a defensive no-op should some future caller
+ *  ever feed this function un-stripped stderr again. */
 function isNoiseCloneStderrLine(line: string): boolean {
   return (
     line === "Please make sure you have the correct access rights" ||
@@ -1144,6 +1359,12 @@ async function runGitClone(
       },
     };
     activeClones.set(opts.cloneId, handle);
+    // A cancellation could have been REQUESTED (review finding #2) any time
+    // between `cloneRepo` announcing this id and this exact line — most
+    // notably during the async GIT_SSH_COMMAND probe above, which has
+    // nothing in `activeClones` to kill while it runs. Consume that latch
+    // now that a real process exists to act on.
+    if (consumeCancelRequest(opts.cloneId)) handle.kill();
   }
   try {
     const [rawStderr, exitCode] = await Promise.all([
@@ -1152,7 +1373,13 @@ async function runGitClone(
     ]);
     const stderr = sanitizeCloneStderr(rawStderr);
     const displayLine = stderr.trim() ? pickCloneDisplayLine(stderr) : `git exited ${exitCode}`;
-    return { ok: exitCode === 0, stderr, displayLine, timedOut, cancelled };
+    // A `cancelClone` call can race in AFTER `proc.exited` has already
+    // resolved 0 but BEFORE this `Promise.all` itself resolves (stderr EOF
+    // can lag process exit) — `handle.kill()` would have set `cancelled`
+    // regardless. A clone that actually completed is never "cancelled",
+    // no matter what raced in against it (review finding #5).
+    const reportedCancelled = cancelled && exitCode !== 0;
+    return { ok: exitCode === 0, stderr, displayLine, timedOut, cancelled: reportedCancelled };
   } finally {
     clearTimeout(timer);
     // Only remove OUR OWN registration — a fresh attempt (the retry) may
@@ -1205,27 +1432,61 @@ function checkCloneDestination(dest: string): CloneResult {
  *
  * `preExisted` is `dest`'s state from BEFORE `cloneRepo` ever ran (captured
  * once, at the very top of `cloneRepo`, before `checkCloneDestination`'s own
- * side-effecting `mkdirSync`):
+ * side-effecting `mkdirSync`); `startedAt` is that same call's own
+ * `Date.now()`, captured just before attempt 1 ever spawns:
  *  - When `dest` did NOT pre-exist, this call (directly, or via
- *    `runGitClone`'s `git clone`) is what created it, so the whole directory
- *    is removed — `dest` ends up ABSENT, as if the clone had never been
- *    attempted.
+ *    `runGitClone`'s `git clone`) is what created it — but ONLY if it's
+ *    still, right now, a real directory and not a symlink (review finding
+ *    #3): something else could have swapped `dest` out from under a
+ *    long-running clone between `checkCloneDestination` and this point, and
+ *    blindly recursing through whatever now sits at that path — possibly a
+ *    symlink to somewhere that has nothing to do with this clone — would be
+ *    a TOCTOU deletion of arbitrary attacker-chosen content. `lstatSync`
+ *    (never `statSync`) is what makes the check about `dest`'s OWN identity
+ *    rather than whatever it might point to. When the guard passes, `dest`
+ *    ends up ABSENT, as if the clone had never been attempted.
  *  - When `dest` DID pre-exist, the directory ENTRY itself is left alone —
  *    never removed or recreated, since it may be a deliberately chosen
- *    mount point, a symlink, or simply the user's own folder — but every
- *    entry git wrote INTO it is removed, restoring the EMPTY state
- *    `checkCloneDestination` observed there before this call started.
+ *    mount point, a symlink, or simply the user's own folder. Its CONTENTS
+ *    are pruned back toward the empty state `checkCloneDestination` observed
+ *    there before this call started, but — review finding #3's TOCTOU fix —
+ *    only entries this clone attempt could plausibly have written are
+ *    removed: `.git` unconditionally (git always names it exactly that,
+ *    every time), and any OTHER entry only when its own `lstatSync` (never
+ *    followed through a symlink) birth time — `ctime` as the fallback on a
+ *    platform/filesystem that doesn't report `birthtime`, e.g. most Linux
+ *    filesystems — is at or after `startedAt`. An entry that was already
+ *    sitting in `dest` before this attempt ever started (impossible via the
+ *    up-front emptiness check, but reachable if something else populated
+ *    `dest` mid-clone with an OLD file, e.g. by moving one in from
+ *    elsewhere) survives untouched.
  *
- * Best-effort: a removal that itself throws (a permissions quirk, a file
- * that vanished between the listing and the removal) is swallowed rather
- * than surfaced — cancellation must not itself fail the caller.
+ *    Residual risk, documented rather than silently assumed away: the age
+ *    check is a PROXY for "git wrote this," not a real identity check —
+ *    this module has no way to enumerate exactly which top-level entries a
+ *    checkout wrote. Something else that writes a NEW file into `dest`
+ *    during the narrow window this clone attempt is actually running will
+ *    still be swept up by the age check, exactly as it always was before
+ *    this fix. What changed is narrower and still real: a file that was
+ *    already there — the case the old code deleted unconditionally and
+ *    silently — now survives.
+ *
+ * Best-effort: a removal (or a stat) that itself throws (a permissions
+ * quirk, a file that vanished between the listing and the removal) is
+ * swallowed rather than surfaced — cancellation must not itself fail the
+ * caller.
  */
-function cleanupCancelledCloneDest(dest: string, preExisted: boolean): void {
+function cleanupCancelledCloneDest(dest: string, preExisted: boolean, startedAt: number): void {
   if (!preExisted) {
     try {
-      rmSync(dest, { recursive: true, force: true });
+      const st = lstatSync(dest);
+      if (st.isDirectory() && !st.isSymbolicLink()) {
+        rmSync(dest, { recursive: true, force: true });
+      }
     } catch {
-      // Best-effort — see doc comment above.
+      // Best-effort — see doc comment above (also covers `dest` never
+      // having existed at all, e.g. a cancellation before git ever wrote
+      // anything).
     }
     return;
   }
@@ -1236,8 +1497,17 @@ function cleanupCancelledCloneDest(dest: string, preExisted: boolean): void {
     return;
   }
   for (const entry of entries) {
+    const entryPath = path.join(dest, entry);
     try {
-      rmSync(path.join(dest, entry), { recursive: true, force: true });
+      if (entry === ".git") {
+        rmSync(entryPath, { recursive: true, force: true });
+        continue;
+      }
+      const st = lstatSync(entryPath);
+      const createdAt = st.birthtimeMs > 0 ? st.birthtimeMs : st.ctimeMs;
+      if (createdAt >= startedAt) {
+        rmSync(entryPath, { recursive: true, force: true });
+      }
     } catch {
       // Best-effort — see doc comment above.
     }
@@ -1309,23 +1579,39 @@ function cleanupCancelledCloneDest(dest: string, preExisted: boolean): void {
  * minutes".
  *
  * Addendum A (progress + cancel): emits a synthetic `starting` progress
- * event (`opts.onProgress`, never rate-limited — there are at most four of
- * these for the whole call) before attempt 1 begins, and again right before
- * a token retry actually starts (i.e. only once `opts.auth()` has resolved
- * a real credential — never for a retry that doesn't happen). Every git
- * `--progress` record parsed out of either attempt's stderr is forwarded
- * too, through `runGitClone`/`readCloneStderrStream`. Exactly one terminal
- * `done`/`failed`/`cancelled` event is emitted for every possible return —
- * the `finish` wrapper below is what guarantees this regardless of which
- * branch produced the result, so a caller (`server.ts`) never has to guess
- * whether more progress is coming. When `opts.cloneId` is given, either
- * attempt's underlying `git clone` process can be killed via
- * `cancelClone(opts.cloneId)`; a cancelled attempt short-circuits — no
- * retry, no `explainCloneFailure` copy — straight to `{ ok: false,
- * cancelled: true, error: "clone cancelled" }`, after `cleanupCancelledCloneDest`
- * restores `dest` to absent-or-empty (git's own on-failure clean-up, relied
- * on elsewhere in this doc comment, does NOT apply to a `SIGTERM` — see that
- * function's own doc comment).
+ * event (`opts.onProgress`, never rate-limited or budgeted — there are at
+ * most four of these for the whole call) before attempt 1 begins, and again
+ * right before a token retry actually starts (i.e. only once `opts.auth()`
+ * has resolved a real credential — never for a retry that doesn't happen).
+ * Every git `--progress` record parsed out of either attempt's stderr is
+ * forwarded too, through `runGitClone`/`readCloneStderrStream`. Exactly one
+ * terminal `done`/`failed`/`cancelled` event is emitted for every possible
+ * return — the `finish` wrapper below is what guarantees this regardless of
+ * which branch produced the result, so a caller (`server.ts`) never has to
+ * guess whether more progress is coming. A `failed` event's line is built
+ * from the last attempt's own (short, git-produced) `displayLine` rather
+ * than the full user-facing `error` text (review finding #4 — that text can
+ * carry a hint sentence plus up to ~500 chars of remote-controlled prose),
+ * and every synthetic line here — `starting`/`done`/`failed`/`cancelled`
+ * alike — is run through the same `sanitizeCloneProgressLine` cap git's own
+ * progress lines get, via the `emitProgress` helper below, which also
+ * swallows a throwing `onProgress` (review finding #7) so a broadcaster bug
+ * can never abort the clone or orphan the git child.
+ *
+ * When `opts.cloneId` is given, this id is announced as in flight
+ * (`beginClone`/`endClone`, review finding #2) for the WHOLE duration of
+ * this call, not just while a git child process happens to exist — so
+ * `cancelClone(opts.cloneId)` is honored even before attempt 1 spawns, in
+ * the gap between attempt 1 and a token retry, and while `opts.auth()`
+ * itself is resolving (a `gh auth token` shellout can take hundreds of ms).
+ * `cloneRepo` (and `runGitClone`, right after `Bun.spawn`) consume that
+ * latch at every one of those points via `consumeCancelRequest`. A
+ * cancelled attempt short-circuits — no retry, no `explainCloneFailure`
+ * copy — straight to `{ ok: false, cancelled: true, error: "clone
+ * cancelled" }`, after `cleanupCancelledCloneDest` restores `dest` to
+ * absent-or-empty (git's own on-failure clean-up, relied on elsewhere in
+ * this doc comment, does NOT apply to a `SIGTERM` — see that function's own
+ * doc comment).
  */
 export async function cloneRepo(
   cloneUrl: string,
@@ -1333,27 +1619,79 @@ export async function cloneRepo(
   opts: CloneOptions = {},
 ): Promise<CloneResult> {
   const { onProgress, cloneId } = opts;
+  beginClone(cloneId);
+  try {
+    return await cloneRepoInner(cloneUrl, dest, opts, onProgress, cloneId);
+  } finally {
+    endClone(cloneId);
+  }
+}
+
+/** The actual body of `cloneRepo`, split out only so `beginClone`/`endClone`
+ *  can wrap it unconditionally via `try`/`finally` regardless of which
+ *  branch below returns. See `cloneRepo`'s own doc comment for the full
+ *  design. */
+async function cloneRepoInner(
+  cloneUrl: string,
+  dest: string,
+  opts: CloneOptions,
+  onProgress: ((progress: CloneProgress) => void) | undefined,
+  cloneId: string | undefined,
+): Promise<CloneResult> {
   const destPreExisted = existsSync(dest);
 
-  // Never rate-limited — see this function's own doc comment above.
-  onProgress?.({ phase: "starting", percent: null, line: "Cloning …" });
+  /** Never lets a throwing `onProgress` escape `cloneRepo` (review finding
+   *  #7) — the git child (if any) has already been spawned or killed by the
+   *  time this fires either way, so swallowing here only ever loses one
+   *  broadcast, never the clone itself. */
+  const emitProgress = (progress: CloneProgress): void => {
+    if (!onProgress) return;
+    try {
+      onProgress(progress);
+    } catch {
+      // See doc comment above.
+    }
+  };
 
   /** Wraps every return value below to also emit the ONE terminal progress
    *  event (`done`/`failed`/`cancelled`) a caller is guaranteed to see
-   *  regardless of which branch produced the result. */
-  const finish = (result: CloneResult): CloneResult => {
-    if (result.cancelled) {
-      onProgress?.({ phase: "cancelled", percent: null, line: result.error ?? "clone cancelled" });
-    } else if (result.ok) {
-      onProgress?.({ phase: "done", percent: 100, line: "clone complete" });
+   *  regardless of which branch produced the result. `displayLine`, when
+   *  given, is the last attempt's own short git-produced line — preferred
+   *  over the full `result.error` text for a `failed` event (review finding
+   *  #4); both are sanitized/capped regardless. `ok` is checked first
+   *  (review finding #5) as a second, defensive line against `result` ever
+   *  carrying both `ok: true` and `cancelled: true` (the actual fix is in
+   *  `runGitClone`; this ordering costs nothing and documents the same
+   *  invariant here too). */
+  const finish = (result: CloneResult, displayLine?: string): CloneResult => {
+    if (result.ok) {
+      emitProgress({ phase: "done", percent: 100, line: sanitizeCloneProgressLine("clone complete") });
+    } else if (result.cancelled) {
+      emitProgress({
+        phase: "cancelled",
+        percent: null,
+        line: sanitizeCloneProgressLine(result.error ?? "clone cancelled"),
+      });
     } else {
-      onProgress?.({ phase: "failed", percent: null, line: result.error ?? "clone failed" });
+      const failLine = displayLine ? `clone failed: ${displayLine}` : result.error ?? "clone failed";
+      emitProgress({ phase: "failed", percent: null, line: sanitizeCloneProgressLine(failLine) });
     }
     return result;
   };
 
   const destCheck1 = checkCloneDestination(dest);
   if (!destCheck1.ok) return finish(destCheck1);
+
+  // Never rate-limited or budgeted — see this function's own doc comment
+  // above. Sanitized/capped like every other synthetic line here (review
+  // finding #4), though this particular constant string never needs it.
+  // Deliberately emitted AFTER `checkCloneDestination`, not before it: a
+  // caller never sees "starting" for an attempt that immediately refuses on
+  // a bad destination, and — just as importantly for `startedAt` below —
+  // this is the ONE hook a caller has to observe (and act on, e.g. via
+  // `cancelClone`) the exact instant `checkCloneDestination` finished
+  // validating `dest`, before this attempt has done anything else at all.
+  emitProgress({ phase: "starting", percent: null, line: sanitizeCloneProgressLine("Cloning …") });
 
   // Test seam, same philosophy as AGETOR_CLAUDE_BIN=/bin/echo elsewhere:
   // endpoint tests point this at a local fixture repo so the /projects/clone
@@ -1362,19 +1700,30 @@ export async function cloneRepo(
   const timeoutMs = opts.timeoutMs ?? CLONE_TIMEOUT_MS;
   const host = opts.host ?? "";
   const transport = opts.transport ?? "https";
+  // Captured AFTER the `starting` emit above (review finding #3): anything
+  // a caller's `onProgress` callback did synchronously in response to that
+  // event — including `cleanupCancelledCloneDest`'s TOCTOU guard's exact
+  // scenario, a file dropped into `dest` right then — necessarily predates
+  // this timestamp, so `cleanupCancelledCloneDest` can tell it apart from
+  // anything THIS attempt (git, or a retry) goes on to create afterward.
+  const startedAt = Date.now();
   const timedOutResult = (): CloneResult => ({
     ok: false,
     error: `clone timed out after ${formatCloneTimeoutDuration(timeoutMs)}`,
   });
   const cancelledResult = (): CloneResult => {
-    cleanupCancelledCloneDest(dest, destPreExisted);
+    cleanupCancelledCloneDest(dest, destPreExisted, startedAt);
     return { ok: false, cancelled: true, error: "clone cancelled" };
   };
 
-  const startedAt = Date.now();
+  // Review finding #2: a cancellation requested before attempt 1 ever
+  // spawns (this clone was already announced as pending by `cloneRepo`
+  // above) is honored right here — no git child is spawned at all.
+  if (consumeCancelRequest(cloneId)) return finish(cancelledResult());
+
   const attempt1 = await runGitClone(source, dest, {}, timeoutMs, { cloneId, onProgress });
-  if (attempt1.cancelled) return finish(cancelledResult());
   if (attempt1.ok) return finish({ ok: true });
+  if (attempt1.cancelled) return finish(cancelledResult());
   if (attempt1.timedOut) return finish(timedOutResult());
   // Attempt 1's own (non-timeout) failure, run through `explainCloneFailure`
   // with `usedToken: false` — reused by both early-return branches below
@@ -1390,6 +1739,11 @@ export async function cloneRepo(
   let usedToken = false;
   let last: { ok: boolean; stderr: string; displayLine: string; timedOut: boolean; cancelled: boolean } = attempt1;
   if (opts.auth && isAuthShapedCloneFailure(attempt1.stderr)) {
+    // Review finding #2: a cancellation that arrived any time during
+    // attempt 1 but after attempt 1 itself already settled (non-cancelled)
+    // is honored here, before doing any more work toward a retry.
+    if (consumeCancelRequest(cloneId)) return finish(cancelledResult());
+
     const remainingMs = timeoutMs - (Date.now() - startedAt);
     if (remainingMs < RETRY_MIN_TIMEOUT_MS) {
       // Attempt 1 itself did NOT time out (checked above) — there's simply
@@ -1397,30 +1751,42 @@ export async function cloneRepo(
       // used to report a timeout here regardless, which was wrong: nothing
       // timed out, so surface attempt 1's own explained failure instead,
       // exactly like the no-retry-attempted path below already does.
-      return finish(attempt1FailureResult);
+      return finish(attempt1FailureResult, attempt1.displayLine);
     }
 
     const destCheck2 = checkCloneDestination(dest);
     if (!destCheck2.ok) {
-      return finish(attempt1FailureResult);
+      return finish(attempt1FailureResult, attempt1.displayLine);
     }
 
     const auth = await opts.auth().catch(() => null);
+    // Review finding #2: `opts.auth()` can itself take hundreds of ms (a
+    // `gh auth token` shellout) — a cancellation that arrived while it was
+    // resolving is honored here, before the retry's `runGitClone` call,
+    // regardless of whether a credential actually came back.
+    if (consumeCancelRequest(cloneId)) return finish(cancelledResult());
     if (auth) {
       usedToken = true;
       // Only emitted once a real credential resolved — never for a retry
       // that, per the gates above, isn't actually about to run.
-      onProgress?.({ phase: "starting", percent: null, line: "Retrying with stored credentials…" });
+      emitProgress({
+        phase: "starting",
+        percent: null,
+        line: sanitizeCloneProgressLine("Retrying with stored credentials…"),
+      });
       const extraEnv = cloneAuthEnv(process.env as Record<string, string | undefined>, auth);
       last = await runGitClone(source, dest, extraEnv, remainingMs, { cloneId, onProgress });
-      if (last.cancelled) return finish(cancelledResult());
       if (last.ok) return finish({ ok: true });
+      if (last.cancelled) return finish(cancelledResult());
       if (last.timedOut) return finish(timedOutResult());
     }
   }
 
-  return finish({
-    ok: false,
-    error: `clone failed: ${explainCloneFailure(last.stderr, last.displayLine, { transport, host, usedToken })}`,
-  });
+  return finish(
+    {
+      ok: false,
+      error: `clone failed: ${explainCloneFailure(last.stderr, last.displayLine, { transport, host, usedToken })}`,
+    },
+    last.displayLine,
+  );
 }

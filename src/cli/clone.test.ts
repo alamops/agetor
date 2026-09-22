@@ -643,6 +643,55 @@ test("SIGINT calls client.cancelClone with the minted cloneId; a 404 response is
   await p;
 });
 
+test("SIGINT latch: a second SIGINT prints 'aborted' and calls process.exit(130) without re-calling cancelClone", async () => {
+  reset();
+  const calls: CloneInput[] = [];
+  const cancelCalls: string[] = [];
+  const exitCalls: number[] = [];
+  const origExit = process.exit;
+  process.exit = ((code?: number) => {
+    exitCalls.push(code ?? 0);
+    return undefined as never;
+  }) as typeof process.exit;
+
+  let resolveClone!: (v: CloneResult) => void;
+  const pending = new Promise<CloneResult>((res) => {
+    resolveClone = res;
+  });
+  const stderr = spyStderr();
+  try {
+    currentClient = {
+      cloneProject: async (input: CloneInput) => {
+        calls.push(input);
+        // First SIGINT: cancel + notice, no exit. Second: abort + exit(130).
+        process.emit("SIGINT", "SIGINT");
+        process.emit("SIGINT", "SIGINT");
+        return pending;
+      },
+      cancelClone: async (cloneId: string) => {
+        cancelCalls.push(cloneId);
+        return { ok: true };
+      },
+    } as unknown as AgetorClient;
+
+    const p = cmdClone(["owner/repo"], flags);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(cancelCalls).toHaveLength(1);
+    expect(exitCalls).toEqual([130]);
+    expect(
+      stderr.writes.some((l) => l.includes("cancelling… (press Ctrl+C again to abort")),
+    ).toBe(true);
+    expect(stderr.writes.some((l) => l.includes("aborted"))).toBe(true);
+
+    resolveClone({ project: project(), provider: "github", eli5TaskId: null, eli5Error: null });
+    await p;
+  } finally {
+    process.exit = origExit;
+    stderr.restore();
+  }
+});
+
 // ── formatCloneProgressLine / CloneProgressPrinter ──────────────────────────
 
 const ALL_PHASES: CloneProgressPhase[] = [
@@ -749,6 +798,76 @@ test("CloneProgressPrinter (non-TTY): prints one line per phase change only, no 
     "resolving deltas 20%\n",
     "done 100%\n",
   ]);
+});
+
+test("CloneProgressPrinter (TTY): truncates the rendered text to the injected columns width, and later padding uses the truncated length", () => {
+  const writes: string[] = [];
+  const columns = 20;
+  const printer = new CloneProgressPrinter({ isTTY: true, write: (s) => writes.push(s), columns });
+
+  const ev1 = { phase: "failed" as const, percent: null, line: "x".repeat(100) };
+  const full1 = formatCloneProgressLine(ev1);
+  const expected1 = full1.slice(0, columns - 1);
+  expect(expected1.length).toBeLessThan(full1.length);
+  expect(expected1.length).toBe(columns - 1);
+
+  printer.update(ev1);
+  expect(writes[0]).toBe(`\r${expected1}`);
+  // `failed` is a terminal phase, so it emits its trailing newline too.
+  expect(writes[1]).toBe("\n");
+
+  const ev2 = { phase: "done" as const, percent: 100, line: "" };
+  const text2 = formatCloneProgressLine(ev2);
+  expect(text2.length).toBeLessThan(expected1.length);
+
+  printer.update(ev2);
+  // Padded against the *truncated* previous line's length, not the full,
+  // untruncated `full1.length`.
+  expect(writes[2]).toBe(`\r${text2.padEnd(expected1.length)}`);
+});
+
+test("CloneProgressPrinter: columns <= 1 disables truncation rather than slicing to a negative/zero length", () => {
+  const writes: string[] = [];
+  const printer = new CloneProgressPrinter({ isTTY: true, write: (s) => writes.push(s), columns: 0 });
+  const ev = { phase: "failed" as const, percent: null, line: "some detail" };
+  const full = formatCloneProgressLine(ev);
+
+  printer.update(ev);
+
+  expect(writes[0]).toBe(`\r${full}`);
+});
+
+test("CloneProgressPrinter.notice(): terminates an unfinished \\r progress line with \\n before printing", () => {
+  const writes: string[] = [];
+  const printer = new CloneProgressPrinter({ isTTY: true, write: (s) => writes.push(s) });
+  const ev = { phase: "receiving" as const, percent: 50, line: "" };
+
+  printer.update(ev); // non-terminal → leaves an unfinished `\r` line pending
+  printer.notice("cancelling…");
+
+  expect(writes[0]).toBe(`\r${formatCloneProgressLine(ev)}`);
+  expect(writes[1]).toBe("\n");
+  expect(writes[2]).toBe("cancelling…\n");
+});
+
+test("CloneProgressPrinter.notice(): no extra terminator when there's no pending line (fresh printer, after a terminal update, or non-TTY)", () => {
+  const writes1: string[] = [];
+  new CloneProgressPrinter({ isTTY: true, write: (s) => writes1.push(s) }).notice("hello");
+  expect(writes1).toEqual(["hello\n"]);
+
+  const writes2: string[] = [];
+  const p2 = new CloneProgressPrinter({ isTTY: true, write: (s) => writes2.push(s) });
+  p2.update({ phase: "done", percent: 100, line: "" });
+  writes2.length = 0; // discard the update's own writes; only assert on notice()
+  p2.notice("hello");
+  expect(writes2).toEqual(["hello\n"]);
+
+  const writes3: string[] = [];
+  const p3 = new CloneProgressPrinter({ isTTY: false, write: (s) => writes3.push(s) });
+  p3.update({ phase: "receiving", percent: 50, line: "" });
+  writes3.length = 0;
+  p3.notice("hello");
+  expect(writes3).toEqual(["hello\n"]);
 });
 
 // ── AgetorClient.cloneProject request shape ─────────────────────────────────

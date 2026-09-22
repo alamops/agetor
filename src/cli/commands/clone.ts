@@ -69,32 +69,58 @@ export async function cmdClone(args: string[], flags: Flags): Promise<void> {
   const cloneId = randomUUID();
 
   let progress: SseHandle | undefined;
+  let printer: CloneProgressPrinter | undefined;
   if (!flags.json) {
-    const printer = new CloneProgressPrinter({
+    printer = new CloneProgressPrinter({
       isTTY: Boolean(process.stderr.isTTY),
       write: (s) => process.stderr.write(s),
+      columns: process.stderr.columns,
     });
     progress = streamSse<AppEvent>(
       "/app/events",
       (e) => {
-        if (e.type === "clone_progress" && e.cloneId === cloneId) printer.update(e);
+        if (e.type === "clone_progress" && e.cloneId === cloneId) printer!.update(e);
       },
       { dataDir: flags.dataDir },
     );
   }
 
-  // A once-handler: Ctrl+C asks the core to kill the in-flight git process
+  // A *latched* handler (this is `process.on`, not `process.once` — it fires
+  // on every SIGINT, and deliberately behaves differently the second time):
+  // the first Ctrl+C asks the core to kill the in-flight git process
   // (swallowing a 404 — the clone may have already settled on its own) and
-  // lets the pending `cloneProject` call below settle on the core's own 409
-  // rejection, rather than tearing the CLI process down mid-request.
+  // then returns, letting the pending `cloneProject` call below settle on
+  // its own — the core's 409 cancellation rejection, a genuine success/
+  // failure, or (if the cancel request itself failed) whatever the clone
+  // eventually does on its own — rather than tearing the CLI process down
+  // mid-request. Without the latch, a second (or third, impatient) Ctrl+C
+  // would just re-issue the same cancel and the process would still block
+  // on the held POST (up to 15 minutes) with no way out. So a second Ctrl+C
+  // instead aborts the CLI outright: the server-side clone may keep running
+  // to completion (or get cancelled on its own next tick) but the user gets
+  // their terminal back. The handler is installed right before the POST is
+  // sent — with the server now announcing a clone (and answering its
+  // `DELETE` with `{ok:true}`) as soon as it's in flight, before git even
+  // spawns, a SIGINT landing in the brief window between "handler
+  // installed" and "POST sent" is still honored correctly by the pending
+  // `cancelClone` call once it goes out.
+  let sigintCount = 0;
   const onSigint = () => {
-    if (!flags.json) errln(c.dim("cancelling…"));
-    void client.cancelClone(cloneId).catch((e) => {
-      if (e instanceof ApiError && e.status === 404) return;
-      // Any other cancel-request failure isn't fatal here — the pending
-      // clone below still settles (success, a real failure, or the core
-      // eventually noticing the request end) and drives the exit path.
-    });
+    sigintCount++;
+    if (sigintCount === 1) {
+      printer?.notice(
+        c.dim("cancelling… (press Ctrl+C again to abort; the server-side clone may keep running)"),
+      );
+      void client.cancelClone(cloneId).catch((e) => {
+        if (e instanceof ApiError && e.status === 404) return;
+        // Any other cancel-request failure isn't fatal here — the pending
+        // clone below still settles (success, a real failure, or the core
+        // eventually noticing the request end) and drives the exit path.
+      });
+      return;
+    }
+    printer?.notice(c.dim("aborted"));
+    process.exit(130);
   };
   process.on("SIGINT", onSigint);
 
@@ -188,29 +214,70 @@ export function formatCloneProgressLine(ev: {
 
 /**
  * Renders a stream of `clone_progress` events to a single status line on
- * stderr — a small closure-like class over an injected `{ isTTY, write }` so
- * it never touches `process` directly and is unit-testable without a real
- * terminal. TTY: overwrites in place (`\r` + the line, padded to at least
- * the previous line's length so a shorter new line fully erases a longer
- * old one) and emits no `\n` until a terminal phase, which gets one so the
- * cursor moves past the finished progress line. Non-TTY: prints one line
- * per phase change only — no per-percent spam scrolling a redirected log.
+ * stderr — a small closure-like class over an injected `{ isTTY, write,
+ * columns }` so it never touches `process` directly and is unit-testable
+ * without a real terminal. TTY: overwrites in place (`\r` + the line,
+ * padded to at least the previous line's length so a shorter new line
+ * fully erases a longer old one) and emits no `\n` until a terminal phase,
+ * which gets one so the cursor moves past the finished progress line.
+ * Non-TTY: prints one line per phase change only — no per-percent spam
+ * scrolling a redirected log.
+ *
+ * `columns` (the caller's `process.stderr.columns`, injected rather than
+ * read directly so this stays unit-testable) bounds the rendered text to
+ * `(columns ?? 80) - 1` — one short of the terminal width, so a `padEnd`
+ * write can never itself trigger a soft-wrap that would leave a stray
+ * second line behind. `lastLineLength` (used for that padding) is tracked
+ * in terms of the already-truncated string, matching what's actually on
+ * screen.
  */
 export class CloneProgressPrinter {
   private lastPhase: CloneProgressPhase | null = null;
   private lastLineLength = 0;
+  /** True (TTY only) while the last write left an unfinished `\r`-updated
+   *  line on screen with no trailing `\n` yet — i.e. between a non-terminal
+   *  `update()` and either the terminal `update()` or a `notice()`. */
+  private pendingLine = false;
 
-  constructor(private readonly opts: { isTTY: boolean; write: (s: string) => void }) {}
+  constructor(
+    private readonly opts: { isTTY: boolean; write: (s: string) => void; columns?: number },
+  ) {}
+
+  private truncate(text: string): string {
+    const max = (this.opts.columns ?? 80) - 1;
+    return max > 0 && text.length > max ? text.slice(0, max) : text;
+  }
 
   update(ev: { phase: CloneProgressPhase; percent: number | null; line: string }): void {
-    const text = formatCloneProgressLine(ev);
+    const text = this.truncate(formatCloneProgressLine(ev));
     if (this.opts.isTTY) {
       this.opts.write(`\r${text.padEnd(this.lastLineLength)}`);
       this.lastLineLength = text.length;
-      if (isTerminalCloneProgressPhase(ev.phase)) this.opts.write("\n");
+      if (isTerminalCloneProgressPhase(ev.phase)) {
+        this.opts.write("\n");
+        this.pendingLine = false;
+      } else {
+        this.pendingLine = true;
+      }
     } else if (ev.phase !== this.lastPhase) {
       this.opts.write(`${text}\n`);
     }
     this.lastPhase = ev.phase;
+  }
+
+  /**
+   * Prints a standalone notice line (e.g. the SIGINT cancel/abort
+   * messages) that must never land mid-line: if a `\r`-updated progress
+   * line is still unfinished (TTY only), first terminates it with a `\n`
+   * so the notice starts on its own fresh line, then writes the notice
+   * itself followed by `\n`.
+   */
+  notice(text: string): void {
+    if (this.opts.isTTY && this.pendingLine) {
+      this.opts.write("\n");
+      this.pendingLine = false;
+      this.lastLineLength = 0;
+    }
+    this.opts.write(`${text}\n`);
   }
 }
