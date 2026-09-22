@@ -22,12 +22,36 @@ let server: { stop: () => void };
 let token: string;
 let tasks: typeof import("./db.ts").tasks;
 let agentProfiles: typeof import("./db.ts").agentProfiles;
+let harnesses: typeof import("./db.ts").harnesses;
+
+// Fake codex binary whose `--version` echoes back the current value of
+// `FAKE_CODEX_VERSION`, mirroring orchestrator-min-cli-version.test.ts's own
+// fixture. Set on AGETOR_CODEX_BIN once here; FAKE_CODEX_VERSION varies per
+// test. Setup must happen before any test calls the route — codex's
+// `resolveBin` reads AGETOR_CODEX_BIN by kind-level env override regardless
+// of whether the harness row exists/is enabled in the DB (`getByIdOrKind`
+// synthesizes a default row for a known AgentKind id).
+const codexBinDir = mkdtempSync(path.join(tmpdir(), "agetor-clone-endpoint-codex-bin-"));
+const fakeCodexBin = path.join(codexBinDir, "codex");
+writeFileSync(
+  fakeCodexBin,
+  `#!/bin/sh\n`
+    + `if [ "$1" = "--version" ]; then echo "$FAKE_CODEX_VERSION"; exit 0; fi\n`
+    + `exit 0\n`,
+  { mode: 0o755 },
+);
 
 beforeAll(async () => {
-  ({ tasks, agentProfiles } = await import("./db.ts"));
+  ({ tasks, agentProfiles, harnesses } = await import("./db.ts"));
   const { startApiServer, API_TOKEN } = await import("./server.ts");
   server = startApiServer() as unknown as { stop: () => void };
   token = API_TOKEN;
+  harnesses.setEnabled("codex", true);
+  process.env.AGETOR_CODEX_BIN = fakeCodexBin;
+  // The codex counterpart test's eli5:false clone doesn't touch the floor
+  // check at all, but the eli5:true refused case must never reach
+  // AGETOR_CODEX_DRIVER — the floor check runs (and 400s) before startTask
+  // would ever spawn anything, so no fake-driver env is needed for codex.
 
   // Local fixture repo standing in for GitHub via AGETOR_CLONE_SOURCE_OVERRIDE.
   const source = path.join(WORK_DIR, "source");
@@ -311,6 +335,56 @@ test("eli5:false ignores launch fields entirely, even invalid ones", async () =>
   expect(body.eli5Error).toBeNull();
   expect(existsSync(path.join(dest, "README.md"))).toBe(true);
   expect(tasks.list().length).toBe(before);
+});
+
+// --- Pre-flight 1b on the clone route (§8b finding 7): the explainer's
+// launch selection is validated against the minimum-CLI-version floor
+// BEFORE the clone side effect, exactly like the unknown-profile/harness
+// checks above. ---
+
+test("codex + gpt-6-sol on a too-old CLI 400s before cloning anything", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.147.0";
+  const dest = path.join(WORK_DIR, "clone-codex-too-old");
+  const before = tasks.list().length;
+
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/codextooold", dest, agent: "codex", model: "gpt-6-sol" }),
+  });
+  expect(res.status).toBe(400);
+  const json = (await res.json()) as { error: string };
+  expect(json.error).toContain("0.155.0");
+  expect(json.error).toContain("0.147.0");
+
+  // No clone side effect at all — the destination was never created.
+  expect(existsSync(dest)).toBe(false);
+  const projectsAfter = (await (await call("/projects")).json()) as Project[];
+  expect(projectsAfter.some((p) => p.path === dest)).toBe(false);
+  expect(tasks.list().length).toBe(before);
+});
+
+test("codex + gpt-6-sol on a too-old CLI is NOT refused when eli5:false (the floor check is only run when the explainer is actually launched)", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.147.0";
+  const dest = path.join(WORK_DIR, "clone-codex-too-old-no-eli5");
+
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({
+      url: "someowner/codextoooldnoeli5",
+      dest,
+      eli5: false,
+      agent: "codex",
+      model: "gpt-6-sol",
+    }),
+  });
+  // Whatever the route otherwise returns for a valid clone (200) — the point
+  // under test is that it is NOT the floor's 400.
+  expect(res.status).not.toBe(400);
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { eli5TaskId: string | null; eli5Error: string | null };
+  expect(body.eli5TaskId).toBeNull();
+  expect(body.eli5Error).toBeNull();
+  expect(existsSync(path.join(dest, "README.md"))).toBe(true);
 });
 
 test("agentProfileId: null is accepted as no profile", async () => {

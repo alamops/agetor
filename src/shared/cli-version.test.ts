@@ -23,8 +23,14 @@ describe("parseCliVersion", () => {
     expect(parseCliVersion("gemini 0.54.0 (abc)")).toEqual({ major: 0, minor: 54, patch: 0 });
   });
 
-  test("ignores a pre-release/build suffix after the third number", () => {
-    expect(parseCliVersion("0.155.1-beta.2")).toEqual({ major: 0, minor: 155, patch: 1 });
+  test("captures a pre-release/build suffix after the third number into `prerelease`", () => {
+    expect(parseCliVersion("0.155.1-beta.2")).toEqual({ major: 0, minor: 155, patch: 1, prerelease: "beta.2" });
+  });
+
+  test("a plain release has no `prerelease` key at all (not undefined-as-a-value)", () => {
+    const parsed = parseCliVersion("0.155.1");
+    expect(parsed).toEqual({ major: 0, minor: 155, patch: 1 });
+    expect(parsed && "prerelease" in parsed).toBe(false);
   });
 
   test("returns null for a line with no major.minor.patch run", () => {
@@ -117,6 +123,24 @@ describe("cliVersionSatisfies", () => {
   test("null when the installed raw is null", () => {
     expect(cliVersionSatisfies(null, "0.155.0")).toBeNull();
   });
+
+  // Pre-release-at-the-exact-floor: unknown whether the server-side catalog
+  // gate already opens for it, so it must fail open (null), never block.
+  test("null when a pre-release sits exactly AT the floor on major.minor.patch", () => {
+    expect(cliVersionSatisfies("0.155.0-alpha.3", "0.155.0")).toBeNull();
+  });
+
+  test("false when a pre-release is numerically below the floor", () => {
+    expect(cliVersionSatisfies("0.154.0-alpha.1", "0.155.0")).toBe(false);
+  });
+
+  test("true when a pre-release is numerically above the floor", () => {
+    expect(cliVersionSatisfies("0.156.0-rc1", "0.155.0")).toBe(true);
+  });
+
+  test("true for a labeled pre-release probe line numerically above the floor", () => {
+    expect(cliVersionSatisfies("codex-cli 0.155.1-beta.2", "0.155.0")).toBe(true);
+  });
 });
 
 describe("formatMinCliVersionError", () => {
@@ -157,5 +181,17 @@ describe("formatMinCliVersionError", () => {
       installHint: null,
     });
     expect(message).toBe("Codex --version can't run GPT-6 Sol — it needs codex CLI ≥ 0.155.0.");
+  });
+
+  test("a pre-release installedRaw renders with its '-<prerelease>' suffix, not the bare release", () => {
+    const message = formatMinCliVersionError({
+      harnessLabel: "Codex",
+      installedRaw: "codex-cli 0.155.0-alpha.3",
+      modelLabel: "GPT-6 Sol",
+      kind: "codex",
+      floor: "0.155.0",
+      installHint: null,
+    });
+    expect(message).toBe("Codex 0.155.0-alpha.3 can't run GPT-6 Sol — it needs codex CLI ≥ 0.155.0.");
   });
 });

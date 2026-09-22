@@ -177,3 +177,119 @@ test("boundary: codex exactly at the 0.155.0 floor + gpt-6-luna is allowed to st
   await settle();
   expect(runs.listForTask(taskId).length).toBe(1);
 });
+
+// --- Pre-flight 1b review fixes ---------------------------------------------
+// §8b findings 2, 3, 4: the follow-up spawn path (spawnCodexTurnNow, reached
+// by every sendInput) is gated the same way the first run is, the escape
+// hatch disables the whole check, and a pre-release build sitting exactly AT
+// the floor fails open rather than being treated as "the release".
+
+test("follow-up gate: a codex task started on a satisfying version, then switched to a too-old version + a GPT-6 model, is refused on sendInput with no new run row or user event — then re-probing on a satisfying version delivers and mints a second run", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.155.1";
+  const { startTask, sendInput } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const taskId = await createCodexTask("gpt-5.6-sol"); // no floor, starts cleanly
+  const started = await startTask(taskId);
+  expect("error" in started).toBe(false);
+  if ("error" in started) throw new Error(started.error);
+  const firstRunId = started.runId;
+
+  await settle();
+  expect(runs.listForTask(taskId).length).toBe(1);
+
+  // Now move the task onto a floored model and drop the installed CLI below
+  // the floor — codex is one-shot per turn and PATCH-able between turns, so
+  // this must be re-checked on the follow-up, not just at first-run time.
+  tasks.update(taskId, { model: "gpt-6-sol" });
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.147.0";
+
+  const userEventsBefore = runs.eventsForTask(taskId).filter((e) => e.stream === "user").length;
+
+  const result = await sendInput(firstRunId, "follow up");
+  expect(result.delivered).toBe(false);
+  if (!result.delivered) {
+    expect(result.reason).toContain("0.147.0");
+    expect(result.reason).toContain("GPT-6 Sol");
+    expect(result.reason).toContain("0.155.0");
+    expect(result.reason).toContain("npm i -g @openai/codex");
+  }
+
+  // No run row minted for the refused follow-up.
+  expect(runs.listForTask(taskId).length).toBe(1);
+  // No new `user` event recorded anywhere for this task — the decline
+  // happens before any state mutation, so the follow-up text is dropped
+  // rather than landing as an orphaned bubble (count unchanged from before
+  // the refused sendInput — the original prompt's own user event is
+  // already there).
+  const userEventsAfterRefusal = runs.eventsForTask(taskId).filter((e) => e.stream === "user").length;
+  expect(userEventsAfterRefusal).toBe(userEventsBefore);
+
+  // Fix the version and resend the same follow-up — the gate re-probes per
+  // turn, so this now succeeds and mints a second run row.
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.155.1";
+  const retried = await sendInput(firstRunId, "follow up");
+  expect(retried.delivered).toBe(true);
+
+  await settle();
+  expect(runs.listForTask(taskId).length).toBe(2);
+});
+
+test("escape hatch: AGETOR_SKIP_CLI_VERSION_FLOOR=1 disables Pre-flight 1b even on a too-old CLI + GPT-6 model", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.147.0";
+  process.env.AGETOR_SKIP_CLI_VERSION_FLOOR = "1";
+  try {
+    const { startTask } = await import("./orchestrator.ts");
+    const { runs } = await import("./db.ts");
+
+    const taskId = await createCodexTask("gpt-6-sol");
+    const started = await startTask(taskId);
+    expect("error" in started).toBe(false);
+
+    await settle();
+    expect(runs.listForTask(taskId).length).toBe(1);
+  } finally {
+    delete process.env.AGETOR_SKIP_CLI_VERSION_FLOOR;
+  }
+});
+
+test("escape hatch: AGETOR_SKIP_CLI_VERSION_FLOOR='off' does NOT disable the check (only the recognized truthy spellings do)", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.147.0";
+  process.env.AGETOR_SKIP_CLI_VERSION_FLOOR = "off";
+  try {
+    const { startTask } = await import("./orchestrator.ts");
+
+    const taskId = await createCodexTask("gpt-6-sol");
+    const started = await startTask(taskId);
+    expect("error" in started).toBe(true);
+    if ("error" in started) {
+      expect(started.error).toContain("0.155.0");
+    }
+  } finally {
+    delete process.env.AGETOR_SKIP_CLI_VERSION_FLOOR;
+  }
+});
+
+test("a pre-release build sitting exactly AT the floor ('0.155.0-alpha.3' vs the 0.155.0 floor) fails open and is allowed to start", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.155.0-alpha.3";
+  const { startTask } = await import("./orchestrator.ts");
+  const { runs } = await import("./db.ts");
+
+  const taskId = await createCodexTask("gpt-6-sol");
+  const started = await startTask(taskId);
+  expect("error" in started).toBe(false);
+
+  await settle();
+  expect(runs.listForTask(taskId).length).toBe(1);
+});
+
+// Queued-drain case (a follow-up sent WHILE a codex turn is in flight, so it
+// goes through codexTurnQueue/drainCodexQueue rather than spawnCodexTurnNow
+// directly): the fake codex driver's turn resolves in ~20ms with no seam to
+// hold it open deterministically (AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS-style
+// hooks exist for claude, not for codex's fake driver), so a queued-follow-up
+// gate test would have to race a real in-flight window with a sleep — that's
+// a flake, not a test. Skipped per the brief's own guidance rather than
+// writing a timing-dependent case; `drainCodexQueue`'s stranded-message
+// handling (moving every queued message behind a refused one to the backlog
+// tray) is documented in orchestrator.ts but not covered here.
