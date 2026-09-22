@@ -118,7 +118,7 @@ Run recipe (from Phase 1): `bun run typecheck`; targeted `bun test src/shared/ty
 
 7 findings: 1 must-fix, 2 should-fix, 4 nice-to-have; all seven addressed in Phase 8, none deferred.
 1. must-fix — the upgrade hint never appeared (`status.installHint` is null once the availability gate passed) → fallback to the kind's install/upgrade command; pinned by `orchestrator-min-cli-version.test.ts`.
-2. should-fix — follow-up codex turns (`spawnCodexTurnNow`, reached by every `sendInput`) skipped the floor although the model is PATCH-able between turns → extracted `minCliVersionError(harness, model, status?)` and gated the follow-up spawn before its run row.
+2. should-fix — follow-up codex turns (`spawnCodexTurnNow`, reached by every `sendInput`) skipped the floor although the model is PATCH-able between turns → extracted `minCliVersionError(harness, model, status?)` and gated the follow-up spawn before its run row; a follow-up already *queued* behind an in-flight turn that the drain then refuses is restashed to the backlog (all stranded lines, in send order — `backlog.add` prepends) with a status line on the run, pinned by `orchestrator-codex-queue-floor.test.ts`.
 3. should-fix — API-key accounts unverified → A5 + `AGETOR_SKIP_CLI_VERSION_FLOOR` escape hatch.
 4. nice — `0.155.0-alpha.3` counted as the release → a pre-release tag on the exact floor version now yields `null` (fail-open).
 5. nice — `npm i -g` is the wrong upgrade for a Homebrew install → `upgradeHintFor(kind, path)`.
