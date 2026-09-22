@@ -283,3 +283,49 @@ Assumptions proceeding on:
 | Bitbucket Server clones | out of scope — owner chose to mirror the integration's rejection |
 | TUI dashboard entry point for cloning | out of scope — the TUI has no project-management surface at all (projects are CLI-subcommand only) |
 | Progress streaming for long clones | out of scope — pre-existing UX of #235, unrelated to provider parity |
+
+## Addendum A (2026-09-21) — clone progress streaming + cancel, and the stale `providerForHost` comment
+
+Owner asked to sweep in two items §9 had ruled out of scope. Grilled (this session): progress rides
+**`/app/events`** (no new SSE connection from the webview — WKWebView's ~6/host cap; the CLI uses the
+existing `streamSse`), and the dialog gets a **Cancel** button while cloning.
+
+**Design.**
+- `POST /projects/clone` accepts an optional client-minted `cloneId` (UUID, validated `^[0-9a-f-]{36}$`;
+  the server mints one when absent and echoes it in the response). While `git clone --progress` runs,
+  the server broadcasts `AppEvent { type: "clone_progress", cloneId, phase, percent, line, ts }` —
+  parsed from git's `\r`-separated stderr progress records (`Cloning into`, `remote: Enumerating/Counting/
+  Compressing objects`, `Receiving objects: NN% (a/b)`, `Resolving deltas: NN% (a/b)`, `Updating files: NN%`)
+  by a pure exported `parseCloneProgress(record)`; rate-limited to ≤ 10 events/s per clone, always
+  emitting phase changes and 100 %. A final `phase: "done" | "failed" | "cancelled"` event closes it.
+  Progress text is sanitized by the same control-char strip as error stderr and never carries a token.
+- The progress reader replaces `readBoundedCloneStderr`: it splits on `\r`/`\n` incrementally, feeds
+  records to the parser, and still accumulates the bounded stderr the failure copy needs (a record that
+  parses as progress is NOT part of the error text — git's progress lines would otherwise crowd the
+  16 KB tail out).
+- **Cancel**: `DELETE /projects/clone/:cloneId` (authed) → an in-memory registry `activeClones`
+  (`cloneId → { kill() }`) kills the running git process; `cloneRepo` reports `{ ok: false, cancelled: true }`
+  (no token retry, no error copy), the route answers the held POST with 409 `{ error: "clone cancelled",
+  cancelled: true }` and removes a destination git created (an existing empty dir stays), registers nothing.
+  Unknown/finished id → 404. Registry entries are removed on settle; the second attempt re-registers
+  under the same id.
+- Dialog: while `busy`, the Clone button is replaced by a progress row (phase label + `<progress>` bar,
+  `clone-progress`/`clone-progress-bar` test ids, `aria-live="polite"` on the phase text) and the Cancel
+  button becomes active (`clone-cancel`) → `api.cancelClone(cloneId)`; the POST's cancelled result closes
+  the dialog with an info toast. Progress reaches the dialog through App.tsx's single `subscribeAppEvents`
+  handler forwarding `clone_progress` into a tiny module store `src/mainview/lib/clone-progress.ts`
+  (`subscribeCloneProgress(cloneId, cb)`), so the dialog never opens its own EventSource.
+- CLI: `agetor clone` mints the id, opens `streamSse("/app/events")` for the clone's duration, redraws one
+  stderr status line (`\r`-overwritten when stderr is a TTY, one line per phase change otherwise), and
+  cancels on SIGINT (DELETE, then exits 130). `--json` prints no progress.
+- `git-provider.ts` `providerForHost` doc comment: self-hosted GitLab is supported (via `gitlabApiBase`);
+  only Bitbucket Server / unrelated hosts are out.
+
+**Tasks.** P1 `src/bun/clone.ts` (+ `clone.test.ts`) — parser, streaming reader, registry, cancel, `--progress`,
+`onProgress` option; P2 `src/shared/types.ts` (`clone_progress` AppEvent + `CloneProgressPhase`) and
+`src/bun/server.ts` (body `cloneId`, broadcast, DELETE route, response `cloneId`) (+ `clone-endpoint.test.ts`);
+P3 `src/mainview` (store, App.tsx forwarding, dialog UI, `api.cloneProject`/`cancelClone`); P4 `src/cli`
+(`api-client.cloneProject` id + `cancelClone`, `commands/clone.ts` progress + SIGINT) (+ `clone.test.ts`);
+P5 `git-provider.ts` comment; docs: CLAUDE.md item 18. Waves: P1 → (P2) → (P3 ∥ P4 ∥ P5). e2e: extend
+`e2e/clone-providers.spec.ts` with a progress-bar-visible + cancel flow using a slow fixture (a large
+synthetic repo, or `AGETOR_FAKE_CLONE_DELAY_MS` test seam if a real slow clone is impractical).
