@@ -178,8 +178,10 @@ const FX_EFFORT_MODELS: Record<string, string[]> = {
   "deepseek/deepseek-v4-pro": ["xhigh", "high", "auto"],
 };
 
-// The 12 no-effort ids — their Gateway catalog entry carries no
-// reasoning_options at all, same treatment as every gemini model.
+// The 13 no-effort ids — their Gateway catalog entry carries no
+// reasoning_options at all, same treatment as every gemini model. The first
+// twelve were live-probed on fx 0.0.10; spacexai/grok-4.7 (2026-09-21) rests
+// on the Gateway catalog entry alone (docs/plans/add-grok-4-7.md §8 A1).
 const FX_NO_EFFORT_MODELS = [
   "zai/glm-5v-turbo",
   "zai/glm-4.7",
@@ -193,9 +195,10 @@ const FX_NO_EFFORT_MODELS = [
   "google/gemini-2.5-flash",
   "anthropic/claude-3-haiku",
   "anthropic/claude-haiku-4.5",
+  "spacexai/grok-4.7",
 ];
 
-test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan §3 shared spec) — 16 effort models each end in auto, 12 named models are empty", () => {
+test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan §3 shared spec) — 16 effort models each end in auto, 13 named models are empty", () => {
   for (const [id, expected] of Object.entries(FX_EFFORT_MODELS)) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual(expected);
     expect(expected[expected.length - 1]).toBe("auto");
@@ -203,10 +206,10 @@ test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan
   for (const id of FX_NO_EFFORT_MODELS) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual([]);
   }
-  // The two lists above are exactly the 28 curated fx ids, no more no less.
+  // The two lists above are exactly the 29 curated fx ids, no more no less.
   expect(Object.keys(FX_EFFORT_MODELS).length).toBe(16);
-  expect(FX_NO_EFFORT_MODELS.length).toBe(12);
-  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(28);
+  expect(FX_NO_EFFORT_MODELS.length).toBe(13);
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(29);
 });
 
 test("DEFAULT_EFFORT.fx is 'auto' (fx's own default — owner decision D1, docs/plans/fx-0.0.10-compat.md §8)", () => {
@@ -272,7 +275,7 @@ test("none of the seven previously-curated fx ids survives as an unconditional r
   expect(Object.keys(MODEL_EFFORT_SUPPORT.fx)).not.toContain("google/gemini-3-pro");
 });
 
-test("exactly the twelve premium Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
+test("exactly the thirteen catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
   const expectedCatalogOnly = new Set([
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-5",
@@ -289,12 +292,15 @@ test("exactly the twelve premium Gateway ids are catalogOnly in AGENT_OPTIONS.fx
     "openai/gpt-5.6-sol",
     "zai/glm-5.3",
     "deepseek/deepseek-v4-pro",
+    // 2026-09-21 (docs/plans/add-grok-4-7.md) — signed-in presence unverified,
+    // same reason google/gemini-3.8-flash is gated.
+    "spacexai/grok-4.7",
   ]);
   const actualCatalogOnly = new Set(
     AGENT_OPTIONS.fx.models.filter((m) => m.catalogOnly).map((m) => m.id),
   );
   expect(actualCatalogOnly).toEqual(expectedCatalogOnly);
-  expect(actualCatalogOnly.size).toBe(12);
+  expect(actualCatalogOnly.size).toBe(13);
 
   for (const kind of KINDS) {
     if (kind === "fx") continue;
@@ -304,7 +310,7 @@ test("exactly the twelve premium Gateway ids are catalogOnly in AGENT_OPTIONS.fx
   }
 });
 
-test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (twelve catalogOnly rows included)", () => {
+test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (thirteen catalogOnly rows included)", () => {
   // Narrower restatement of the bidirectional-keys test above, scoped to
   // just the fx picker's own ids — guards specifically against a
   // catalogOnly row landing in AGENT_OPTIONS.fx.models without a paired
