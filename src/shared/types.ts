@@ -1894,10 +1894,12 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
 /**
  * Minimum harness-CLI version a model needs, per kind, keyed by model id
  * (semver "major.minor.patch"; compared with `cliVersionSatisfies` in
- * `src/shared/cli-version.ts`). `startTask` refuses to start a run — before
- * any run row or worktree exists — when the probed CLI version parses AND
- * is below the floor; an unparseable/absent version never blocks (fail-open,
- * so `/bin/echo`-style test overrides and stub binaries are unaffected).
+ * `src/shared/cli-version.ts`). Pre-flight 1b (`minCliVersionError` in
+ * `src/bun/orchestrator.ts` — `startTask`, every follow-up codex turn, and
+ * the clone route's explainer launch) refuses the launch — before any run
+ * row or worktree exists — when the probed CLI version parses AND is below
+ * the floor; an unparseable/absent version never blocks (fail-open, so
+ * `/bin/echo`-style test overrides and stub binaries are unaffected).
  * Only codex has entries today: OpenAI's `chatgpt.com/backend-api/codex/models`
  * catalog is `client_version`-gated (NousResearch/hermes-agent#119412) and an
  * old CLI answers a 400 whose text blames the ChatGPT account, not the
@@ -1905,6 +1907,9 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
  * ChatGPT-plan account): gpt-6-sol/gpt-6-luna — 0.154.0 ✗ / 0.155.1 ✓
  * (the catalog gate is 0.155.0); gpt-6-astra — 0.147.0 ✗ / 0.153.0 ✓
  * (0.148–0.152 unprobed, so the true floor may be lower); Aeon mirrors Astra.
+ * The floors were verified on a ChatGPT-plan account; API-key accounts are
+ * assumed to be gated the same way, and `AGETOR_SKIP_CLI_VERSION_FLOOR=1` is
+ * the override when one isn't.
  * See docs/plans/add-gpt-6-sol-and-luna.md §3 D4.
  */
 export const MODEL_MIN_CLI_VERSION: Partial<Record<AgentKind, Record<string, string>>> = {

@@ -4,7 +4,7 @@ import { rm } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
-import { checkHarness, INSTALL_HINTS } from "./agent-status.ts";
+import { checkHarness, upgradeHintFor } from "./agent-status.ts";
 import { getDiscoveredEfforts } from "./agent-discovery.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
 import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progress.ts";
@@ -33,6 +33,7 @@ import {
   validateBranchName,
   type AgentKind,
   type Harness,
+  type HarnessStatus,
   type TaskType,
 } from "../shared/types.ts";
 import { cliVersionSatisfies, formatMinCliVersionError } from "../shared/cli-version.ts";
@@ -1267,35 +1268,13 @@ async function startTaskInner(
     return { error: `${harness.label} isn't logged in — ${status.authHelp ?? "run its login command"}` };
   }
 
-  // Pre-flight 3 — per-model minimum CLI version (MODEL_MIN_CLI_VERSION,
-  // today only codex's GPT-6 rows). OpenAI's codex model catalog is
-  // `client_version`-gated (NousResearch/hermes-agent#119412) and an old CLI
-  // answers a 400 whose text blames the ChatGPT account, so codex's own error
-  // can't be trusted as a diagnosis — and it would arrive only after the run
-  // row + worktree already exist. Refuse here instead, with the installed
-  // version, the floor and the install hint. Strictly FAIL-OPEN:
-  // `cliVersionSatisfies` returns null when the probed version doesn't parse
-  // (every `/bin/echo` test override, a stub binary) and null never blocks.
-  // See docs/plans/add-gpt-6-sol-and-luna.md §3 D4.
+  // Pre-flight 1b — per-model minimum CLI version. See `minCliVersionError`
+  // (below) for the rationale and the fail-open contract; this is the
+  // first-run half, reusing the status the availability gate just probed.
+  // The follow-up-turn half lives in `spawnCodexTurnNow`.
   {
-    const modelId = task.model ?? DEFAULT_MODEL[harness.kind];
-    const floor = MODEL_MIN_CLI_VERSION[harness.kind]?.[modelId];
-    if (floor !== undefined && cliVersionSatisfies(status.version, floor) === false) {
-      const modelLabel = AGENT_OPTIONS[harness.kind].models.find((m) => m.id === modelId)?.label ?? modelId;
-      return {
-        error: formatMinCliVersionError({
-          harnessLabel: harness.label,
-          installedRaw: status.version ?? "",
-          modelLabel,
-          kind: harness.kind,
-          floor,
-          // `status.installHint` is null for an available harness (the
-          // availability gate above already passed), so fall back to the
-          // kind's install command — it doubles as the upgrade command.
-          installHint: status.installHint ?? INSTALL_HINTS[harness.kind],
-        }),
-      };
-    }
+    const floorError = await minCliVersionError(harness, task.model ?? DEFAULT_MODEL[harness.kind], status);
+    if (floorError !== null) return { error: floorError };
   }
 
   // Pass the branches other tasks have pinned. If materializing this task's
@@ -3159,6 +3138,9 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   // while still being accurate ("try again") for the rare lookup race too.
   if (kind === "codex") {
     const result = await sendCodexTurn(row.task_id, line);
+    // Pre-flight 1b refused the turn before any run row was minted (see
+    // `minCliVersionError`) — surface its message as the decline reason.
+    if (result !== null && typeof result === "object") return { delivered: false, reason: result.declined };
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -3208,14 +3190,27 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
 const codexTurnQueue = new Map<string, string[]>();
 
 /**
+ * `spawnCodexTurnNow`'s "refused before minting a run" result — today only
+ * Pre-flight 1b (`minCliVersionError`): the task's model needs a newer codex
+ * CLI than the one installed. `declined` is the user-facing message.
+ * Distinct from the `null` "another turn is already starting" decline so
+ * `sendInput` can report the real reason.
+ */
+interface CodexTurnDecline {
+  declined: string;
+}
+
+/**
  * Send a follow-up to a codex task. Each follow-up is its own run row + its own
  * `codex exec resume <thread_id>` turn (sequential-turn model). When a turn is
  * already running, the message is queued; otherwise it spawns immediately.
  * Returns the run id the message was attached to, or null on lookup failure —
  * or when `spawnCodexTurnNow` declined to mint a run because `startingTaskIds`
  * was already claimed for this task (see that set's doc, near `startTask`).
+ * Returns a `CodexTurnDecline` when Pre-flight 1b refused the turn (no run
+ * row, no user event — the caller's draft is untouched).
  */
-async function sendCodexTurn(taskId: string, line: string): Promise<string | null> {
+async function sendCodexTurn(taskId: string, line: string): Promise<string | CodexTurnDecline | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
   if (task.runId && active.has(task.runId)) {
@@ -3233,12 +3228,91 @@ async function sendCodexTurn(taskId: string, line: string): Promise<string | nul
   return spawnCodexTurnNow(task, taskId, line);
 }
 
+/** Env escape hatch for `minCliVersionError` — see its doc. */
+const SKIP_CLI_VERSION_FLOOR_ENV = "AGETOR_SKIP_CLI_VERSION_FLOOR";
+
+/**
+ * Pre-flight 1b — per-model minimum CLI version (`MODEL_MIN_CLI_VERSION` in
+ * `shared/types.ts`, today only codex's GPT-6 rows). OpenAI's codex model
+ * catalog is `client_version`-gated (NousResearch/hermes-agent#119412) and an
+ * old CLI answers a 400 whose text blames the ChatGPT account, so codex's own
+ * error can't be trusted as a diagnosis — and it would arrive only after the
+ * run row (and, on a first run, the worktree) already exist. Callers refuse
+ * the launch up front with this message instead: the installed version, the
+ * floor, and an upgrade command (`status.installHint` when the probe offered
+ * one, else `upgradeHintFor(kind, status.path)`). See
+ * docs/plans/add-gpt-6-sol-and-luna.md §3 D4.
+ *
+ * Resolves the model's minimum-CLI-version verdict for a harness. Returns the
+ * user-facing error string when the probed CLI version parses AND is below
+ * `MODEL_MIN_CLI_VERSION[kind][model]`; null otherwise (no floor, unparseable
+ * version, or the `AGETOR_SKIP_CLI_VERSION_FLOOR` escape hatch). Never throws.
+ *
+ * Strictly FAIL-OPEN: `cliVersionSatisfies` returns null when the probed
+ * version doesn't parse (every `/bin/echo` test override, a stub binary), and
+ * null never blocks; a probe that throws is treated the same way.
+ * `AGETOR_SKIP_CLI_VERSION_FLOOR` set to `1`/`true`/`on`/`yes`
+ * (case-insensitive, read at call time) disables the check outright — the
+ * floors were verified on a ChatGPT-plan account, and an API-key codex
+ * account on an older CLI may not be gated the same way.
+ *
+ * `status` is the caller's already-probed `checkHarness` result; when omitted
+ * this probes itself — but only when the model actually has a floor (the
+ * version probe is cheap and isn't cached for codex).
+ *
+ * Callers — every path that can launch a floored model must call this before
+ * minting a run row: `startTaskInner` (a task's first run and every re-run),
+ * `spawnCodexTurnNow` (every follow-up codex turn — codex is one-shot per
+ * turn and the model is PATCH-able between turns with no live session to
+ * reconcile), and `POST /projects/clone` (the explainer launch, validated
+ * before the clone side effect). Only codex carries floors today, so only
+ * codex's one-shot spawn path is wired; a future floor for another kind
+ * (cursor/gemini/fx are one-shot per turn too) must wire that kind's own
+ * `spawn*TurnNow`/`spawnFxRun` the same way. claude-code's follow-ups paste
+ * into a live REPL whose model was fixed at spawn, so they'd need no check.
+ */
+export async function minCliVersionError(
+  harness: Harness,
+  modelId: string,
+  status?: HarnessStatus,
+): Promise<string | null> {
+  try {
+    const skip = process.env[SKIP_CLI_VERSION_FLOOR_ENV]?.trim().toLowerCase();
+    if (skip === "1" || skip === "true" || skip === "on" || skip === "yes") return null;
+    const floor = MODEL_MIN_CLI_VERSION[harness.kind]?.[modelId];
+    if (floor === undefined) return null;
+    const probed = status ?? await checkHarness(harness);
+    if (cliVersionSatisfies(probed.version, floor) !== false) return null;
+    const modelLabel = AGENT_OPTIONS[harness.kind]?.models.find((m) => m.id === modelId)?.label ?? modelId;
+    return formatMinCliVersionError({
+      harnessLabel: harness.label,
+      installedRaw: probed.version ?? "",
+      modelLabel,
+      kind: harness.kind,
+      floor,
+      // `installHint` is null for an available harness, so this is normally
+      // the path-aware upgrade command (brew vs npm vs self-update).
+      installHint: probed.installHint ?? upgradeHintFor(harness.kind, probed.path),
+    });
+  } catch (err) {
+    console.warn(`[agetor] minimum-CLI-version pre-flight failed open for ${harness.id}:`, err);
+    return null;
+  }
+}
+
 /**
  * Spawn a fresh codex turn that resumes the task's prior conversation via
  * `codex exec resume <thread_id>`. New run row, new tmux session (the previous
  * turn's exited), same `thread_id` carried forward.
+ *
+ * Re-runs Pre-flight 1b (`minCliVersionError`) before minting the run row:
+ * codex is one-shot per turn, so every follow-up spawns `codex exec --model
+ * <task.model>` afresh — and the model is PATCH-able between turns with no
+ * live session to reconcile — so a too-old CLI would otherwise hit codex's
+ * misleading ChatGPT-account 400 after the run row exists. A refusal returns
+ * a `CodexTurnDecline` with nothing written.
  */
-async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Promise<string | CodexTurnDecline | null> {
   // Claim the unified "starting" slot before touching the DB — see
   // `startingTaskIds`'s doc (near `startTask`) for the double-mint race this
   // closes: a second overlapping call could otherwise race in behind
@@ -3253,6 +3327,15 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
     const priorThreadId = findLastCodexSessionId(taskId);
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
+
+    // Pre-flight 1b — before any state mutation (see this function's doc).
+    // The `startingTaskIds` claim above is in-memory only and released by the
+    // `finally`, so an overlapping send still gets the "already starting"
+    // decline while the version probe runs.
+    if (harness) {
+      const floorError = await minCliVersionError(harness, task.model ?? DEFAULT_MODEL[harness.kind]);
+      if (floorError !== null) return { declined: floorError };
+    }
 
     const newRunId = randomUUID();
     const now = Date.now();
@@ -3363,7 +3446,26 @@ async function drainCodexQueue(taskId: string): Promise<void> {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) codexTurnQueue.delete(taskId);
-  if (next !== undefined) await spawnCodexTurnNow(task, taskId, next);
+  if (next === undefined) return;
+  const result = await spawnCodexTurnNow(task, taskId, next);
+  if (result === null || typeof result !== "object") return;
+  // Pre-flight 1b refused the queued follow-up (the task's model needs a
+  // newer codex CLI — e.g. the model was changed to a GPT-6 row while the
+  // previous turn ran). Every message still queued behind it would be
+  // refused the same way, so move them all — the refused one first — to the
+  // backlog tray (they were already shown as `user` bubbles when queued, so
+  // nothing is lost and they can be resent after upgrading) and explain why
+  // on the task's most recent run.
+  const stranded = [next, ...(codexTurnQueue.get(taskId) ?? [])];
+  codexTurnQueue.delete(taskId);
+  for (const text of stranded) restashPasteWithheldText(taskId, text);
+  const lastRunId = runs.listForTask(taskId)[0]?.id;
+  if (lastRunId) {
+    const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;
+    const data = `${what} — saved to your backlog; resend from the tray after upgrading. ${result.declined}`;
+    runs.appendEvent(lastRunId, "status", data);
+    emit({ runId: lastRunId, taskId, stream: "status", data, ts: Date.now() });
+  }
 }
 
 /** Most-recent codex thread id across the task's runs (for `resume`). */

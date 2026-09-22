@@ -26,7 +26,7 @@ import {
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
@@ -174,6 +174,7 @@ import {
 } from "./interactions.ts";
 import {
   DEFAULT_BRANCH_CONFIG,
+  DEFAULT_MODEL,
   EVENTS_PAGE_MAX_BYTES,
   EVENTS_REPLAY_ANCHOR_MAX_BYTES,
   EVENTS_REPLAY_ANCHOR_MAX_EVENTS,
@@ -850,6 +851,25 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             runEli5 ? validateCloneLaunch(body) : {};
           if ("error" in launch) {
             return json({ error: launch.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Pre-flight 1b (minimum CLI version for the explainer's model) —
+          // also before the clone, since `startTask` would otherwise refuse
+          // the explainer only after the repo is already on disk. Resolves
+          // the harness + model exactly as `createTask` will: a profile's
+          // own harness/model, else `agent` (default claude-code) and
+          // `model` (default the kind's DEFAULT_MODEL). Fail-open like the
+          // start-time check; validateCloneLaunch already proved the
+          // harness ids resolve.
+          if (runEli5) {
+            const profile = launch.agentProfileId ? agentProfiles.get(launch.agentProfileId) : null;
+            const launchHarness = harnesses.getByIdOrKind(profile ? profile.harness : (launch.agent ?? "claude-code"));
+            if (launchHarness) {
+              const launchModel = profile ? profile.model : (launch.model ?? DEFAULT_MODEL[launchHarness.kind]);
+              const floorError = await minCliVersionError(launchHarness, launchModel);
+              if (floorError !== null) {
+                return json({ error: floorError }, { status: 400, headers: corsHeaders(req) });
+              }
+            }
           }
 
           const cloned = await cloneRepo(parsed.cloneUrl, dest);

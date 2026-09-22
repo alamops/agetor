@@ -6,7 +6,7 @@
 | Source | Task "Add GPT-6 Sol and Luna to Codex harness and others that support it" + five reference URLs (OpenAI launch post, GPT-6 Astra system card + Sol/Luna appendix, `gpt-6-sol` / `gpt-6-luna` API model pages) |
 | Config | AGENTS_CONFIG.yml (balanced, v1 schema; host = claude_code) |
 | Flags | none |
-| Gates | grilled + approved by owner (grill answered 2026-09-22; plan approval pending) |
+| Gates | grilled + approved by owner (grill answered and plan approved 2026-09-22) |
 | Branch | feature/add-gpt-6-sol-and-luna |
 | Base SHA | 6bbe2f8 |
 
@@ -74,7 +74,7 @@ So the 09-03 "rejected on ChatGPT plans during the phased rollout" note on Astra
 | --- | --- | --- | --- | --- |
 | T1 | Catalog + contract edits in `src/shared/types.ts`: (a) `AGENT_OPTIONS.codex.models` rows in D2 order with D5 hints; (b) `DEFAULT_MODEL.codex = "gpt-6-sol"` + rewrite its rationale comment (today's evidence table in one paragraph); (c) `MODEL_EFFORT_SUPPORT.codex` rows for `gpt-6-sol` / `gpt-6-luna` + a dated paragraph in the evidence comment; (d) new exported `MODEL_MIN_CLI_VERSION` (D4) with a doc comment citing the spike + hermes-agent#119412; (e) fx: `MODEL_EFFORT_SUPPORT.fx` entries `"openai/gpt-6-sol": ["high","medium","low","none","auto"]`, `"openai/gpt-6-luna": [same]` with a dated comment, two `catalogOnly` rows appended after `spacexai/grok-4.7`, a dated 2026-09-22 paragraph in the fx history comment (255-id unauth catalog), and every count updated in lockstep — `AgentOption.catalogOnly` doc-comment (`:1834` "thirteen" → "fifteen"), fx history comment ("thirteen catalogOnly rows, 29 curated" → "fifteen … 31"), fx `efforts` comment ("16 of the 29 … other 13" → "18 of the 31 … other 13"). | `src/shared/types.ts` | — | `bun run typecheck` green; `grep -c catalogOnly: true` on the fx block = 15; all count comments agree (31 curated = 18 effort + 13 no-effort). |
 | T2 | New pure helper `src/shared/cli-version.ts` (D4): `parseCliVersion`, `cliVersionSatisfies`, plus `formatMinCliVersionError({ harnessLabel, installedRaw, modelLabel, kindLabel, floor, installHint })` that builds the exact user-facing string so the orchestrator and tests share one source. Zero runtime imports (shared-module rule). | `src/shared/cli-version.ts` | — | Module compiles standalone; `bun -e 'import …'` sanity; semantics per D4 (`null` on unparseable, numeric compare, `0.155.1 ≥ 0.155.0`, `0.9.0 < 0.155.0`). |
-| T3 | Wire the pre-flight in `src/bun/orchestrator.ts` `startTaskInner` right after the `loggedIn === false` gate (before `prepareWorkdir`), using T1's `MODEL_MIN_CLI_VERSION` + T2's helpers, with `status.installHint` as the upgrade hint and the model's picker label (`AGENT_OPTIONS[kind].models.find(...)?.label ?? id`). Add a doc comment explaining fail-open and why the 400 text can't be trusted. Also update the fx prose at `:5405-5409` (18 / 31 / 13). | `src/bun/orchestrator.ts` | T1, T2 | Typecheck green; manual reasoning check: with `AGETOR_CODEX_BIN=/bin/echo` no existing test path can trip the gate. |
+| T3 | Wire the pre-flight in `src/bun/orchestrator.ts` `startTaskInner` right after the `loggedIn === false` gate (before `prepareWorkdir`), using T1's `MODEL_MIN_CLI_VERSION` + T2's helpers, with `status.installHint ?? upgradeHintFor(kind, status.path)` as the upgrade hint (`status.installHint` is always null once the availability gate passed — `INSTALL_HINTS` is exported for that; a Homebrew-installed binary gets `brew upgrade <formula>`) and the model's picker label (`AGENT_OPTIONS[kind].models.find(...)?.label ?? id`). Add a doc comment explaining fail-open and why the 400 text can't be trusted. Also update the fx prose at `:5405-5409` (18 / 31 / 13). | `src/bun/orchestrator.ts` | T1, T2 | Typecheck green; manual reasoning check: with `AGETOR_CODEX_BIN=/bin/echo` no existing test path can trip the gate. |
 | T4 | Docs: `README.md:265` lineup sentence (GPT-6 Astra / Astra Aeon / **Sol (default)** / Luna, version floors, 5.6 rows superseded); `CLAUDE.md` codex bullet — `[--model gpt-6-sol]` example, replace the 2026-09-03 ChatGPT-account paragraph with the client-version-gate finding + the new pre-flight (D4), extend the `ultra` sentence ("offered for Astra/Aeon/Sol/GPT-6 Sol/Terra/Cyber, not either Luna"); `CLAUDE.md` fx bullet — "fifteen catalog-gated rows" enumeration gains `gpt-6-sol`, `gpt-6-luna` (2026-09-22) and the "16 of the 28/29" style counts move to 18/31; and this plan's Branch/Base rows are already filled. | `README.md`, `CLAUDE.md`, `docs/plans/add-gpt-6-sol-and-luna.md` | — | No remaining `grep -n "rejected on ChatGPT plans until" README.md CLAUDE.md` hits for Astra; fx counts in CLAUDE.md match T1. |
 
 ## 5. Work breakdown — test tasks (Wave 3, disjoint files)
@@ -110,8 +110,20 @@ Run recipe (from Phase 1): `bun run typecheck`; targeted `bun test src/shared/ty
 - **A1** — `none` on `gpt-6-sol` via codex is untested live (only `low`); it rests on the API page ("supports none") and the identical GPT-5.6 Sol precedent (`none` accepted live there despite the catalog omitting it). Consequence if wrong: the picker offers a value the API rejects — same class as the existing 5.6 rows; a live `codex exec -m gpt-6-sol -c model_reasoning_effort=none` would settle it in one call.
 - **A2** — Astra/Aeon floor `0.153.0` is the lowest *verified* working version (0.147.0 ✗, 0.153.0 ✓); 0.148–0.152 were not probed, so the true floor may be lower. Consequence if wrong: a user on 0.148–0.152 is told to upgrade one release early — actionable, not harmful.
 - **A3** — Luna's `0.155.0` floor mirrors Sol's (both are gated by the same `client_version` filter per hermes-agent#119412; only 0.147.0 ✗ / 0.155.1 ✓ were probed for Luna).
+- **A5** — Every version-floor measurement was made on a ChatGPT-plan codex login; the gated endpoint is the ChatGPT-auth backend, so an API-key account on an older CLI *might* run the GPT-6 ids and be refused by agetor anyway. Mitigation (review finding 3): the `AGETOR_SKIP_CLI_VERSION_FLOOR=1` escape hatch disables the pre-flight; the assumption stands until an API-key account is probed.
 - **A4** — Whether the owner's *signed-in* Gateway catalog includes the two OpenAI ids is unknown → `catalogOnly` (fail-closed, as with every premium row).
 - Grill Q&A (owner, 2026-09-22): Q1 default → Sol; Q2 order → yes; Q3 efforts → confirm; Q4 hints → in this run; Q5 fx → catalogOnly; Q6 → sweep in the pre-flight check.
+
+## 8b. Review outcome (Phase 5, opus, code-review skill — 2026-09-22)
+
+7 findings: 1 must-fix, 2 should-fix, 4 nice-to-have; all seven addressed in Phase 8, none deferred.
+1. must-fix — the upgrade hint never appeared (`status.installHint` is null once the availability gate passed) → fallback to the kind's install/upgrade command; pinned by `orchestrator-min-cli-version.test.ts`.
+2. should-fix — follow-up codex turns (`spawnCodexTurnNow`, reached by every `sendInput`) skipped the floor although the model is PATCH-able between turns → extracted `minCliVersionError(harness, model, status?)` and gated the follow-up spawn before its run row.
+3. should-fix — API-key accounts unverified → A5 + `AGETOR_SKIP_CLI_VERSION_FLOOR` escape hatch.
+4. nice — `0.155.0-alpha.3` counted as the release → a pre-release tag on the exact floor version now yields `null` (fail-open).
+5. nice — `npm i -g` is the wrong upgrade for a Homebrew install → `upgradeHintFor(kind, path)`.
+6. nice — three names for one check → "Pre-flight 1b" everywhere.
+7. nice — the clone route validates the explainer launch before cloning but not the floor → checked there too (400 before `cloneRepo`). The webview picker-level warning stays out of scope (ledger).
 
 ## 9. Completeness ledger
 
@@ -126,7 +138,7 @@ Run recipe (from Phase 1): `bun run typecheck`; targeted `bun test src/shared/ty
 | README / CLAUDE.md lineup + gate docs | **in this run** — T4 |
 | Cursor rows for GPT-6 Sol/Luna | **out of scope** — no such ids exist in cursor-agent 2026.09.18 (spike); nothing to add, no migration |
 | `gpt-6-terra` / `gpt-6-cyber` rows | **out of scope** — no such models exist (launch post: no GPT-6 Terra) |
-| A picker-level "your codex is too old" warning in the webview (beside the harness-availability hint) | **out of scope** — a separate UI ticket; the reachable failure state is handled by the pre-flight error the UI already toasts, and the row hint names the floor |
+| A picker-level "your codex is too old" warning in the webview (beside the harness-availability hint) | **out of scope** — a separate UI ticket; the reachable failure state is handled by the pre-flight error the UI already toasts (start AND every follow-up turn, plus the clone route's pre-validation), and the row hint names the floor |
 | Retiring `gpt-5.5` (codex says 2026-10-14) | **out of scope** — future dated event; retiring a curated id is its own three-store change (knowledge `c1efe6a2`) |
 | `openai/gpt-6-*-fast` fx rows | **out of scope** — `-fast` twins are discovery-only for every fx model today |
 | Historical "28 then-curated" prose in `agent-discovery.test.ts` | **out of scope** — dated measurement, not a live assertion; the filler test derives from `curatedIds` |

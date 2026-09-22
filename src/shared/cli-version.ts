@@ -27,24 +27,36 @@ export interface CliVersion {
   major: number;
   minor: number;
   patch: number;
+  /**
+   * Pre-release tag that immediately follows the patch number after a `-`
+   * ("0.155.0-alpha.3" → "alpha.3", "1.2.3-rc1" → "rc1"). Absent (the key
+   * isn't set at all) for a plain release. Informational for ordering —
+   * `compareCliVersions` stays numeric on major/minor/patch — but
+   * `cliVersionSatisfies` treats a pre-release sitting exactly AT a floor as
+   * unknown (see its doc).
+   */
+  prerelease?: string;
 }
 
-const VERSION_RE = /(\d+)\.(\d+)\.(\d+)/;
+const VERSION_RE = /(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/;
 
 /**
  * Extracts the first `\d+\.\d+\.\d+` run from a `--version`-style probe
  * line — tolerant of surrounding text ("codex-cli 0.155.1", "gemini 0.54.0
  * (abc)"), a leading "v" ("v1.2.3"), and a bare version with nothing else
- * ("0.147.0"). A pre-release/build suffix after the third number is ignored
- * ("0.155.1-beta.2" → 0.155.1 — only the leading three numeric groups are
- * captured). Returns `null` for `null`/`undefined`/empty input or a line
- * with no such run (e.g. "--version", "codex", "1.2").
+ * ("0.147.0"). A `-<tag>` pre-release suffix directly after the third number
+ * is captured into `prerelease` ("0.155.1-beta.2" → 0.155.1 + "beta.2");
+ * anything else after the version (a space, a "+build" suffix, a
+ * parenthesized commit) is ignored. Returns `null` for `null`/`undefined`/
+ * empty input or a line with no such run (e.g. "--version", "codex", "1.2").
  */
 export function parseCliVersion(raw: string | null | undefined): CliVersion | null {
   if (!raw) return null;
   const match = VERSION_RE.exec(raw);
   if (!match) return null;
-  return { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3]) };
+  const version: CliVersion = { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3]) };
+  if (match[4]) version.prerelease = match[4];
+  return version;
 }
 
 /**
@@ -62,12 +74,23 @@ export function compareCliVersions(a: CliVersion, b: CliVersion): number {
  * `true`/`false` when both sides parse, and `null` — fail-open — when
  * either doesn't. See the module doc comment above: callers must treat
  * `null` as "unknown, do not block."
+ *
+ * Pre-release builds: an installed version that EQUALS the floor on
+ * major/minor/patch but carries a pre-release tag ("0.155.0-alpha.3"
+ * against a "0.155.0" floor) is also `null`. By semver it sorts below the
+ * release, but codex ships `-alpha.N` builds ahead of each release and
+ * there's no way to know whether the server-side catalog gate already opens
+ * for them — so it's unknown, and unknown never blocks. A pre-release
+ * numerically above or below the floor is judged on its numbers alone
+ * ("0.156.0-alpha.1" satisfies a 0.155.0 floor; "0.154.0-alpha.1" doesn't).
  */
 export function cliVersionSatisfies(raw: string | null | undefined, min: string): boolean | null {
   const installed = parseCliVersion(raw);
   const floor = parseCliVersion(min);
   if (!installed || !floor) return null;
-  return compareCliVersions(installed, floor) >= 0;
+  const cmp = compareCliVersions(installed, floor);
+  if (cmp === 0 && installed.prerelease !== undefined) return null;
+  return cmp >= 0;
 }
 
 /** Input to `formatMinCliVersionError`. */
@@ -89,14 +112,16 @@ export interface MinCliVersionErrorInput {
 /**
  * Builds the single user-facing error string for a version-gated model
  * launch blocked by `cliVersionSatisfies` returning `false`. `installedRaw`
- * is rendered as its parsed "major.minor.patch" when it parses, else
+ * is rendered as its parsed "major.minor.patch" (plus "-<prerelease>" when
+ * present) when it parses, else
  * verbatim (defensive — this path is only reached when it already parsed,
  * but the fallback keeps the function safe to call standalone).
  */
 export function formatMinCliVersionError(input: MinCliVersionErrorInput): string {
   const parsedInstalled = parseCliVersion(input.installedRaw);
   const installedVersion = parsedInstalled
-    ? `${parsedInstalled.major}.${parsedInstalled.minor}.${parsedInstalled.patch}`
+    ? `${parsedInstalled.major}.${parsedInstalled.minor}.${parsedInstalled.patch}` +
+      (parsedInstalled.prerelease !== undefined ? `-${parsedInstalled.prerelease}` : "")
     : input.installedRaw;
   let message =
     `${input.harnessLabel} ${installedVersion} can't run ${input.modelLabel} — ` +
