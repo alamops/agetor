@@ -4,13 +4,14 @@ import { rm } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
-import { checkHarness } from "./agent-status.ts";
+import { checkHarness, INSTALL_HINTS } from "./agent-status.ts";
 import { getDiscoveredEfforts } from "./agent-discovery.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
 import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progress.ts";
 import { ISSUE_SNAPSHOT_FILENAME, normalizeIssueUrl, parseIssueUrl } from "../shared/issue-task.ts";
 import { providerRepoForDir } from "./git-provider.ts";
 import {
+  AGENT_OPTIONS,
   DEFAULT_BRANCH_CONFIG,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
@@ -18,6 +19,7 @@ import {
   FX_AUTO_RESUME_MAX,
   FX_RECOVERY_STATUS_PREFIX,
   IDLE_SESSION_REAP_MS,
+  MODEL_MIN_CLI_VERSION,
   SESSION_DIED_STATUS_PREFIX,
   SPAWN_RESPONSE_BUDGET_MS,
   TURN_STALLED_STATUS_PREFIX,
@@ -33,6 +35,7 @@ import {
   type Harness,
   type TaskType,
 } from "../shared/types.ts";
+import { cliVersionSatisfies, formatMinCliVersionError } from "../shared/cli-version.ts";
 import { isFxRecoveryResumable, parseFxAutoResumePrefs, parseFxRecoveryPayload } from "../shared/fx-recovery.ts";
 
 /**
@@ -1262,6 +1265,34 @@ async function startTaskInner(
   // out" guarantee holds with no exception.
   if (status.loggedIn === false) {
     return { error: `${harness.label} isn't logged in — ${status.authHelp ?? "run its login command"}` };
+  }
+
+  // Pre-flight 3 — per-model minimum CLI version (MODEL_MIN_CLI_VERSION,
+  // today only codex's GPT-6 rows). OpenAI's codex model catalog is
+  // `client_version`-gated (NousResearch/hermes-agent#119412) and an old CLI
+  // answers a 400 whose text blames the ChatGPT account, so codex's own error
+  // can't be trusted as a diagnosis — and it would arrive only after the run
+  // row + worktree already exist. Refuse here instead, with the installed
+  // version, the floor and the install hint. Strictly FAIL-OPEN:
+  // `cliVersionSatisfies` returns null when the probed version doesn't parse
+  // (every `/bin/echo` test override, a stub binary) and null never blocks.
+  // See docs/plans/add-gpt-6-sol-and-luna.md §3 D4.
+  {
+    const modelId = task.model ?? DEFAULT_MODEL[harness.kind];
+    const floor = MODEL_MIN_CLI_VERSION[harness.kind]?.[modelId];
+    if (floor !== undefined && cliVersionSatisfies(status.version, floor) === false) {
+      const modelLabel = AGENT_OPTIONS[harness.kind].models.find((m) => m.id === modelId)?.label ?? modelId;
+      return {
+        error: formatMinCliVersionError({
+          harnessLabel: harness.label,
+          installedRaw: status.version ?? "",
+          modelLabel,
+          kind: harness.kind,
+          floor,
+          installHint: status.installHint,
+        }),
+      };
+    }
   }
 
   // Pass the branches other tasks have pinned. If materializing this task's
@@ -5402,12 +5433,14 @@ export async function createTask(
   // `supportedEfforts` makes both cases resolve to `null` for gemini — that's
   // what the PATCH null-clear guard and every picker already compute for an
   // unknown id, so this closes a known inconsistency, on purpose. fx is
-  // different: 16 of its 29 curated models advertise real efforts (live-probed
-  // 2026-09-14), so both a listed and an unlisted fx model resolve through
-  // `supportedEfforts` to `DEFAULT_EFFORT.fx` (`"auto"`) whenever the model —
-  // or the `DEFAULT_MODEL.fx` fallback used for an unlisted id — is one of
-  // those 16; only the remaining 13 no-effort fx models (e.g. `zai/glm-4.7`)
-  // resolve to `null`. That whole computation is `defaultEffortFor` below.
+  // different: 18 of its 31 curated models advertise real efforts (16
+  // live-probed 2026-09-14, openai/gpt-6-sol and openai/gpt-6-luna from the
+  // Gateway catalog 2026-09-22), so both a listed and an unlisted fx model
+  // resolve through `supportedEfforts` to `DEFAULT_EFFORT.fx` (`"auto"`)
+  // whenever the model — or the `DEFAULT_MODEL.fx` fallback used for an
+  // unlisted id — is one of those 18; only the remaining 13 no-effort fx
+  // models (e.g. `zai/glm-4.7`) resolve to `null`. That whole computation is
+  // `defaultEffortFor` below.
   //
   // A bound profile's `effort` is passthrough instead (D3/A5 in the plan) —
   // the Settings form only ever offers `supportedEfforts` rows, so a stored

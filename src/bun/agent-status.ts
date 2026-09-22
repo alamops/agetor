@@ -9,7 +9,12 @@ import { resolveTmuxBin } from "./tmux-resolution.ts";
 
 const VERSION_PROBE_TIMEOUT_MS = 2000;
 
-const INSTALL_HINTS: Record<AgentKind, string> = {
+/**
+ * Per-kind install command. Surfaced on an unavailable harness's status
+ * (`installHint`) and reused by `startTask`'s minimum-CLI-version pre-flight
+ * as the upgrade hint — the same command upgrades an installed CLI.
+ */
+export const INSTALL_HINTS: Record<AgentKind, string> = {
   "claude-code": "npm i -g @anthropic-ai/claude-code",
   "codex": "npm i -g @openai/codex",
   "cursor": "curl https://cursor.com/install -fsS | bash",
