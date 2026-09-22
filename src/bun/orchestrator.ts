@@ -1289,7 +1289,10 @@ async function startTaskInner(
           modelLabel,
           kind: harness.kind,
           floor,
-          installHint: status.installHint,
+          // `status.installHint` is null for an available harness (the
+          // availability gate above already passed), so fall back to the
+          // kind's install command — it doubles as the upgrade command.
+          installHint: status.installHint ?? INSTALL_HINTS[harness.kind],
         }),
       };
     }

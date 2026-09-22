@@ -577,6 +577,30 @@ test("codex model 'gpt-6-astra-aeon' passes through verbatim as --model", () => 
   ]);
 });
 
+test("codex model 'gpt-6-sol' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-6-sol", mode: "auto" });
+  expect(cmd).toEqual([
+    "codex", "exec",
+    "--model", "gpt-6-sol",
+    "-c", "model_reasoning_effort=high",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
+  ]);
+});
+
+test("codex model 'gpt-6-luna' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-6-luna", mode: "auto" });
+  expect(cmd).toEqual([
+    "codex", "exec",
+    "--model", "gpt-6-luna",
+    "-c", "model_reasoning_effort=high",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
+  ]);
+});
+
 test("codex model 'gpt-5.5' passes through verbatim as --model", () => {
   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-5.5", mode: "auto" });
   expect(cmd).toEqual([
@@ -699,6 +723,28 @@ test("codex effort 'none' passes through verbatim on gpt-5.6-sol (-c model_reaso
   const { cmd } = buildCommand(builtin("codex"), "hi", {
     ...codexDefaults,
     model: "gpt-5.6-sol",
+    effort: "none",
+    mode: "auto",
+  });
+  expect(cmd).toContain("-c");
+  expect(cmd[cmd.indexOf("-c") + 1]).toBe("model_reasoning_effort=none");
+});
+
+test("codex effort 'ultra' passes through verbatim on gpt-6-sol (-c model_reasoning_effort=ultra)", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", {
+    ...codexDefaults,
+    model: "gpt-6-sol",
+    effort: "ultra",
+    mode: "auto",
+  });
+  expect(cmd).toContain("-c");
+  expect(cmd[cmd.indexOf("-c") + 1]).toBe("model_reasoning_effort=ultra");
+});
+
+test("codex effort 'none' passes through verbatim on gpt-6-luna (-c model_reasoning_effort=none)", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", {
+    ...codexDefaults,
+    model: "gpt-6-luna",
     effort: "none",
     mode: "auto",
   });
