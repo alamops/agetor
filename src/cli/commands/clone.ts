@@ -1,22 +1,40 @@
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { getClient, type Flags } from "../context.ts";
+import { ApiError } from "../api-client.ts";
 import { c, out, errln, printJson } from "../output.ts";
 import { flagValue } from "../args.ts";
 import { usageError } from "../usage.ts";
+import { streamSse, type SseHandle } from "../sse.ts";
 import { isGitProvider } from "../../shared/clone-input.ts";
-import { PROVIDER_CAPS, type GitProvider } from "../../shared/types.ts";
+import {
+  PROVIDER_CAPS,
+  type AppEvent,
+  type CloneProgressPhase,
+  type GitProvider,
+} from "../../shared/types.ts";
 
 /**
  * `agetor clone <url> [--provider github|gitlab|bitbucket] [--dest <path>]
  * [--no-eli5]` — clone a GitHub/GitLab/Bitbucket repo as a new registered
  * project, via the same `POST /projects/clone` route the app's "Clone
  * repository" dialog uses (plan `docs/plans/clone-repository-all-providers.md`
- * §3 D8). `--provider` only disambiguates bare `owner/repo` shorthand — a
- * full URL's own detected provider wins server-side regardless of what's
- * passed here. `--dest` is resolved against the CLI's own cwd (the daemon
- * may be a long-lived detached process with an unrelated one) since the
- * route requires an absolute path. `--no-eli5` skips creating + starting the
- * explainer task the route otherwise launches by default.
+ * §3 D8, progress + cancel per Addendum A). `--provider` only disambiguates
+ * bare `owner/repo` shorthand — a full URL's own detected provider wins
+ * server-side regardless of what's passed here. `--dest` is resolved
+ * against the CLI's own cwd (the daemon may be a long-lived detached
+ * process with an unrelated one) since the route requires an absolute
+ * path. `--no-eli5` skips creating + starting the explainer task the route
+ * otherwise launches by default.
+ *
+ * Progress: a `cloneId` is minted client-side and sent on the request body
+ * so the clone's `clone_progress` `AppEvent`s (broadcast on `GET
+ * /app/events`, the same channel the webview uses — no second SSE
+ * connection) can be correlated to this invocation. In `--json` mode no
+ * progress is rendered (and no SSE connection is opened at all) — only the
+ * final JSON result matters there. Ctrl+C during the clone cancels it via
+ * `DELETE /projects/clone/:cloneId` and lets the held POST settle on its own
+ * 409 rejection rather than killing the CLI process out from under it.
  */
 export async function cmdClone(args: string[], flags: Flags): Promise<void> {
   const url = args[0];
@@ -48,25 +66,151 @@ export async function cmdClone(args: string[], flags: Flags): Promise<void> {
   }
 
   const client = await getClient(flags);
-  if (!flags.json) errln(c.dim(`cloning ${url}…`));
+  const cloneId = randomUUID();
 
-  const result = await client.cloneProject({ url, provider, dest, eli5 });
-
-  if (flags.json) return printJson(result);
-
-  const { project, provider: resolvedProvider, eli5TaskId, eli5Error } = result;
-  out(`${c.green("✓")} cloned ${c.bold(project.name)} ${c.dim(project.path)}`);
-  // `provider` is only present when talking to a daemon new enough to send it
-  // (the route change is additive) — an older already-running core clones
-  // fine but omits the field, and by this point the clone + project
-  // registration has already succeeded, so a missing/unknown provider must
-  // not throw here and crash after the fact. Just skip the line.
-  const providerName = resolvedProvider ? PROVIDER_CAPS[resolvedProvider]?.providerName : undefined;
-  if (providerName) out(c.dim(`provider: ${providerName}`));
-  if (eli5TaskId) {
-    out(`explainer task started: ${eli5TaskId} — agetor logs ${eli5TaskId}`);
+  let progress: SseHandle | undefined;
+  if (!flags.json) {
+    const printer = new CloneProgressPrinter({
+      isTTY: Boolean(process.stderr.isTTY),
+      write: (s) => process.stderr.write(s),
+    });
+    progress = streamSse<AppEvent>(
+      "/app/events",
+      (e) => {
+        if (e.type === "clone_progress" && e.cloneId === cloneId) printer.update(e);
+      },
+      { dataDir: flags.dataDir },
+    );
   }
-  if (eli5Error) {
-    out(c.yellow(`clone succeeded, but the explainer task failed: ${eli5Error}`));
+
+  // A once-handler: Ctrl+C asks the core to kill the in-flight git process
+  // (swallowing a 404 — the clone may have already settled on its own) and
+  // lets the pending `cloneProject` call below settle on the core's own 409
+  // rejection, rather than tearing the CLI process down mid-request.
+  const onSigint = () => {
+    if (!flags.json) errln(c.dim("cancelling…"));
+    void client.cancelClone(cloneId).catch((e) => {
+      if (e instanceof ApiError && e.status === 404) return;
+      // Any other cancel-request failure isn't fatal here — the pending
+      // clone below still settles (success, a real failure, or the core
+      // eventually noticing the request end) and drives the exit path.
+    });
+  };
+  process.on("SIGINT", onSigint);
+
+  try {
+    const result = await client.cloneProject({ url, provider, dest, eli5, cloneId });
+
+    if (flags.json) return printJson(result);
+
+    const { project, provider: resolvedProvider, eli5TaskId, eli5Error } = result;
+    out(`${c.green("✓")} cloned ${c.bold(project.name)} ${c.dim(project.path)}`);
+    // `provider` is only present when talking to a daemon new enough to send it
+    // (the route change is additive) — an older already-running core clones
+    // fine but omits the field, and by this point the clone + project
+    // registration has already succeeded, so a missing/unknown provider must
+    // not throw here and crash after the fact. Just skip the line.
+    const providerName = resolvedProvider ? PROVIDER_CAPS[resolvedProvider]?.providerName : undefined;
+    if (providerName) out(c.dim(`provider: ${providerName}`));
+    if (eli5TaskId) {
+      out(`explainer task started: ${eli5TaskId} — agetor logs ${eli5TaskId}`);
+    }
+    if (eli5Error) {
+      out(c.yellow(`clone succeeded, but the explainer task failed: ${eli5Error}`));
+    }
+  } catch (e) {
+    if (isCancelledCloneError(e)) {
+      if (flags.json) printJson(e.body);
+      else errln(c.dim("clone cancelled"));
+      process.exitCode = 130;
+      return;
+    }
+    throw e;
+  } finally {
+    process.off("SIGINT", onSigint);
+    progress?.close();
+  }
+}
+
+/** The core's held-POST rejection for a clone that `cancelClone` killed
+ *  mid-flight — 409 `{ error: "clone cancelled", cancelled: true, cloneId }`
+ *  (Addendum A). Narrowed as a type guard so the catch branch above can read
+ *  `e.body` without a cast. */
+function isCancelledCloneError(e: unknown): e is ApiError & { body: { cancelled: true } } {
+  return (
+    e instanceof ApiError &&
+    e.status === 409 &&
+    typeof e.body === "object" &&
+    e.body !== null &&
+    (e.body as { cancelled?: unknown }).cancelled === true
+  );
+}
+
+/** Human-readable label per {@link CloneProgressPhase}, used by {@link
+ *  formatCloneProgressLine}. The three terminal phases only ever reach the
+ *  printer once (`cancelled`/`failed` can also arrive with a detail `line`,
+ *  rendered instead of a percent — see that function). */
+const CLONE_PHASE_LABELS: Record<CloneProgressPhase, string> = {
+  starting: "starting…",
+  counting: "counting objects",
+  compressing: "compressing objects",
+  receiving: "receiving objects",
+  resolving: "resolving deltas",
+  "checking-out": "checking out files",
+  done: "done",
+  failed: "failed",
+  cancelled: "cancelled",
+};
+
+/** `true` for the three phases that end a clone — no further `clone_progress`
+ *  event for this `cloneId` follows one of these. */
+function isTerminalCloneProgressPhase(phase: CloneProgressPhase): boolean {
+  return phase === "done" || phase === "failed" || phase === "cancelled";
+}
+
+/**
+ * Pure renderer for one `clone_progress` event → the single status line
+ * `agetor clone` shows for it: `"<phase label> NN%"` when the event carries
+ * a percent, else the phase label alone, or `"<phase label> — <line>"` when
+ * git (or the server's synthetic terminal event) attached a detail string
+ * (e.g. a failure's error text). Exported standalone, with no dependency on
+ * a terminal, so it's covered by a plain table test.
+ */
+export function formatCloneProgressLine(ev: {
+  phase: CloneProgressPhase;
+  percent: number | null;
+  line: string;
+}): string {
+  const label = CLONE_PHASE_LABELS[ev.phase];
+  if (ev.percent !== null) return `${label} ${ev.percent}%`;
+  return ev.line ? `${label} — ${ev.line}` : label;
+}
+
+/**
+ * Renders a stream of `clone_progress` events to a single status line on
+ * stderr — a small closure-like class over an injected `{ isTTY, write }` so
+ * it never touches `process` directly and is unit-testable without a real
+ * terminal. TTY: overwrites in place (`\r` + the line, padded to at least
+ * the previous line's length so a shorter new line fully erases a longer
+ * old one) and emits no `\n` until a terminal phase, which gets one so the
+ * cursor moves past the finished progress line. Non-TTY: prints one line
+ * per phase change only — no per-percent spam scrolling a redirected log.
+ */
+export class CloneProgressPrinter {
+  private lastPhase: CloneProgressPhase | null = null;
+  private lastLineLength = 0;
+
+  constructor(private readonly opts: { isTTY: boolean; write: (s: string) => void }) {}
+
+  update(ev: { phase: CloneProgressPhase; percent: number | null; line: string }): void {
+    const text = formatCloneProgressLine(ev);
+    if (this.opts.isTTY) {
+      this.opts.write(`\r${text.padEnd(this.lastLineLength)}`);
+      this.lastLineLength = text.length;
+      if (isTerminalCloneProgressPhase(ev.phase)) this.opts.write("\n");
+    } else if (ev.phase !== this.lastPhase) {
+      this.opts.write(`${text}\n`);
+    }
+    this.lastPhase = ev.phase;
   }
 }

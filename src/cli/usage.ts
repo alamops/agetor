@@ -149,7 +149,8 @@ export const USAGE: Record<string, string> = {
                       shorthand; a full URL's own detected provider wins
     --dest <path>     destination folder (default: ~/<repo-name>)
     --no-eli5         skip creating + starting the explainer task that
-                       otherwise writes ELI5.md at the clone's root`,
+                       otherwise writes ELI5.md at the clone's root
+  Ctrl+C cancels an in-flight clone (the partial checkout is removed).`,
 
   harness: `usage: agetor harness <ls | add <id> … | edit <id> … | enable <id> | disable <id> | rm <id> | shell <id>>
 

@@ -564,16 +564,32 @@ export const api = {
     fast?: boolean;
     maxMode?: boolean;
     agentProfileId?: string;
+    /** Client-minted uuid so the caller can subscribe to this clone's
+     *  `clone_progress` AppEvents (via `subscribeCloneProgress`) BEFORE
+     *  awaiting this call, and so `cancelClone` can name the right one.
+     *  The server mints its own when omitted and echoes it back either way. */
+    cloneId?: string;
   }) =>
     // retry: false — a replay after a lost response would re-enter the route
     // against a destination the first attempt already filled (502 "already
     // exists") while that clone and its explainer task are live, or race a
     // second `git clone` into the same directory.
-    j<{ project: Project; provider: GitProvider; eli5TaskId: string | null; eli5Error: string | null }>(
+    j<{ project: Project; provider: GitProvider; eli5TaskId: string | null; eli5Error: string | null; cloneId: string }>(
       "/projects/clone",
       { method: "POST", body: JSON.stringify(input) },
       { retry: false },
     ),
+  /** Kill the in-flight `git clone` behind `cloneId` (the id passed to, or
+   *  echoed back by, `cloneProject`). Resolves `{ ok: true }` on success; the
+   *  held `cloneProject` call then rejects with an `ApiError` whose
+   *  `.status === 409` and whose `.body` carries `{ cancelled: true }` —
+   *  `CloneProjectDialog` checks that shape to tell a user-initiated cancel
+   *  apart from a real clone failure. Throws (`ApiError`, `.status === 404`)
+   *  when nothing was in flight for that id — the clone may have just
+   *  finished on its own, which callers should treat as a benign race, not
+   *  a failure to report. */
+  cancelClone: (cloneId: string) =>
+    j<{ ok: true }>(`/projects/clone/${encodeURIComponent(cloneId)}`, { method: "DELETE" }),
   /** Per-project branch nomenclature. GET resolves to built-in defaults when the
    *  project has no stored config, so the form always gets a usable shape. */
   getProjectBranchConfig: (p: string) =>

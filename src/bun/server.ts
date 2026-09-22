@@ -31,7 +31,7 @@ import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./tas
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
 import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
-import { cloneAuthHeader, cloneRepo, defaultCloneDest, resolveCloneRepo } from "./clone.ts";
+import { cancelClone, cloneAuthHeader, cloneRepo, defaultCloneDest, resolveCloneRepo } from "./clone.ts";
 import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
 import { stalledSince } from "./stall-registry.ts";
@@ -575,6 +575,13 @@ function withTaskCounts(list: AgentProfile[]): AgentProfile[] {
   return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
 }
 
+/** Validates both a client-minted `cloneId` on `POST /projects/clone`'s body
+ *  and the `:cloneId` path param on `DELETE /projects/clone/:cloneId` — see
+ *  those routes' own doc comments (docs/plans/clone-repository-all-providers.md
+ *  Addendum A). Matches `crypto.randomUUID()`'s own shape, case-insensitively
+ *  (a client could reasonably uppercase one). */
+const CLONE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Validate the optional launch-picker fields on `POST /projects/clone`
  * (docs/plans/clone-repository-launch-pickers.md D3) BEFORE `cloneRepo` runs,
@@ -802,13 +809,25 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
-      // Clone repository: clone an existing GitHub repo, register the
-      // destination in the projects list, and (unless eli5:false) create +
-      // start a task that writes an ELI5.md explainer at the clone's root,
-      // on the caller's selected agent profile / harness (default: the
-      // built-in claude-code). The explainer goes through agetor's own agent
-      // driver — never a direct LLM API call — so it shows up on the board
-      // like any other task.
+      // Clone repository: clone an existing GitHub/GitLab/Bitbucket repo,
+      // register the destination in the projects list, and (unless
+      // eli5:false) create + start a task that writes an ELI5.md explainer
+      // at the clone's root, on the caller's selected agent profile /
+      // harness (default: the built-in claude-code). The explainer goes
+      // through agetor's own agent driver — never a direct LLM API call —
+      // so it shows up on the board like any other task.
+      //
+      // Addendum A (docs/plans/clone-repository-all-providers.md): the
+      // caller may mint its own `cloneId` up front (before this POST is even
+      // sent) so it can start listening on GET /app/events for this clone's
+      // `clone_progress` AppEvents and issue DELETE /projects/clone/:cloneId
+      // to cancel BEFORE the id round-trips back on this response — there is
+      // an inherent race between "POST is sent" and "id is known to the
+      // caller" otherwise. When the caller doesn't mint one, the server
+      // mints one itself; either way it's echoed on every response this
+      // route can return (success AND every error after the id is minted),
+      // so a client that generated the id can always correlate progress
+      // events / a cancel attempt with this specific request.
       "/projects/clone": {
         POST: authed(async (req) => {
           // Clones are network-bound and can take minutes; disable the
@@ -826,6 +845,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             fast?: unknown;
             maxMode?: unknown;
             agentProfileId?: unknown;
+            cloneId?: unknown;
           };
           const url = typeof body.url === "string" ? body.url.trim() : "";
           if (!url) return json({ error: "url required" }, { status: 400, headers: corsHeaders(req) });
@@ -835,10 +855,24 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               { status: 400, headers: corsHeaders(req) },
             );
           }
+
+          // Mint (or validate a client-supplied) cloneId right after the
+          // provider check, and before resolveCloneRepo — every response
+          // from here on, error or success, carries it.
+          let cloneId: string;
+          if (body.cloneId !== undefined) {
+            if (typeof body.cloneId !== "string" || !CLONE_ID_RE.test(body.cloneId)) {
+              return json({ error: "cloneId must be a UUID" }, { status: 400, headers: corsHeaders(req) });
+            }
+            cloneId = body.cloneId;
+          } else {
+            cloneId = crypto.randomUUID();
+          }
+
           const shorthandProvider = isGitProvider(body.provider) ? body.provider : "github";
           const resolvedInput = resolveCloneRepo(url, shorthandProvider);
           if (!resolvedInput.ok) {
-            return json({ error: resolvedInput.error }, { status: 400, headers: corsHeaders(req) });
+            return json({ error: resolvedInput.error, cloneId }, { status: 400, headers: corsHeaders(req) });
           }
           const resolved = resolvedInput.repo;
           const dest =
@@ -846,7 +880,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               ? body.dest.trim()
               : defaultCloneDest(resolved.repo);
           if (!path.isAbsolute(dest)) {
-            return json({ error: "dest must be an absolute path" }, { status: 400, headers: corsHeaders(req) });
+            return json({ error: "dest must be an absolute path", cloneId }, { status: 400, headers: corsHeaders(req) });
           }
 
           // Validate the launch selection before cloning anything to disk —
@@ -856,12 +890,22 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const launch: ReturnType<typeof validateCloneLaunch> =
             runEli5 ? validateCloneLaunch(body) : {};
           if ("error" in launch) {
-            return json({ error: launch.error }, { status: 400, headers: corsHeaders(req) });
+            return json({ error: launch.error, cloneId }, { status: 400, headers: corsHeaders(req) });
           }
 
           const cloned = await cloneRepo(resolved.cloneUrl, dest, {
             transport: resolved.transport,
             host: resolved.rawHost,
+            cloneId,
+            onProgress: (p) =>
+              broadcastAppEvent({
+                type: "clone_progress",
+                cloneId,
+                phase: p.phase,
+                percent: p.percent,
+                line: p.line,
+                ts: Date.now(),
+              }),
             auth: resolved.authOrigin
               ? async () => {
                   const header = await cloneAuthHeader(resolved.provider, resolved.rawHost);
@@ -869,8 +913,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
                 }
               : undefined,
           });
+          if (cloned.cancelled) {
+            // cloneRepo already restored `dest` to absent/empty and reported
+            // its own terminal "cancelled" progress event — nothing here is
+            // registered, mirroring the "a failing clone registers nothing"
+            // behavior above. 409, not 502: the request wasn't refused by
+            // the remote or by validation, it was called off by the caller
+            // itself (or another client racing the same cloneId).
+            return json({ error: "clone cancelled", cancelled: true, cloneId }, { status: 409, headers: corsHeaders(req) });
+          }
           if (!cloned.ok) {
-            return json({ error: cloned.error }, { status: 502, headers: corsHeaders(req) });
+            return json({ error: cloned.error, cloneId }, { status: 502, headers: corsHeaders(req) });
           }
           const project = projects.upsert(dest, resolved.repo);
 
@@ -896,7 +949,37 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               if ("error" in started) eli5Error = started.error;
             }
           }
-          return json({ project, provider: resolved.provider, eli5TaskId, eli5Error }, { headers: corsHeaders(req) });
+          return json(
+            { project, provider: resolved.provider, cloneId, eli5TaskId, eli5Error },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Cancels the clone identified by `cloneId` (the id echoed by
+      // `POST /projects/clone`, or a caller-minted one that was sent on that
+      // POST's body) — see that route's own doc comment for the id
+      // round-trip. `cancelClone` only finds a match while `cloneRepo` has a
+      // git process actually running for this id (its own doc comment in
+      // clone.ts); anything else — an unknown id, or one whose clone already
+      // settled — 404s. `cancelClone`'s `true` return doesn't mean the held
+      // POST has resolved yet, only that its git process was just killed;
+      // the POST itself answers 409 once `cloneRepo` observes the kill (see
+      // above).
+      "/projects/clone/:cloneId": {
+        DELETE: authed((req) => {
+          const { cloneId } = req.params;
+          if (!CLONE_ID_RE.test(cloneId)) {
+            return json({ error: "cloneId must be a UUID" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const cancelled = cancelClone(cloneId);
+          if (!cancelled) {
+            return json(
+              { error: "no clone in flight with that id" },
+              { status: 404, headers: corsHeaders(req) },
+            );
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
 

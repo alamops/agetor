@@ -4,8 +4,12 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { AGENT_OPTIONS, DEFAULT_MODEL } from "../shared/types.ts";
-import type { AgentProfile, Project, Task } from "../shared/types.ts";
+import type { AgentProfile, AppEvent, Project, Task } from "../shared/types.ts";
 import { CLONE_PROVIDERS } from "../shared/clone-input.ts";
+import { makeBareSourceRepo, startAuthGitServer } from "./clone-test-util.ts";
+import { subscribeAppEvents } from "./quit-guard.ts";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-clone-endpoint-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
@@ -543,7 +547,7 @@ test("an invalid launch selection still 400s before cloning, even for a non-GitH
   expect(tasks.list().length).toBe(before);
 });
 
-test("a successful clone's response is exactly {project, provider, eli5TaskId, eli5Error}", async () => {
+test("a successful clone's response is exactly {project, provider, cloneId, eli5TaskId, eli5Error}", async () => {
   const dest = path.join(WORK_DIR, "clone-response-shape");
   const res = await call("/projects/clone", {
     method: "POST",
@@ -551,8 +555,187 @@ test("a successful clone's response is exactly {project, provider, eli5TaskId, e
   });
   expect(res.status).toBe(200);
   const body = (await res.json()) as Record<string, unknown>;
-  expect(Object.keys(body).sort()).toEqual(["eli5Error", "eli5TaskId", "project", "provider"]);
+  expect(Object.keys(body).sort()).toEqual(["cloneId", "eli5Error", "eli5TaskId", "project", "provider"]);
   expect(body.provider).toBe("github");
+  expect(body.cloneId).toMatch(UUID_RE);
   expect(body.eli5TaskId).toBeNull();
   expect(body.eli5Error).toBeNull();
 });
+
+// --- Clone id round-trip + progress/cancel (docs/plans/
+// clone-repository-all-providers.md Addendum A, P2: the `cloneId` body/
+// response field, the `clone_progress` AppEvent broadcast, and
+// `DELETE /projects/clone/:cloneId`). ---
+
+test("a cloneId is minted and returned when the caller doesn't send one", async () => {
+  const dest = path.join(WORK_DIR, "clone-id-minted");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/cloneidminted", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { cloneId: string };
+  expect(body.cloneId).toMatch(UUID_RE);
+});
+
+test("a caller-minted cloneId is echoed back verbatim", async () => {
+  const dest = path.join(WORK_DIR, "clone-id-echoed");
+  const sent = crypto.randomUUID();
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/cloneidechoed", dest, eli5: false, cloneId: sent }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { cloneId: string };
+  expect(body.cloneId).toBe(sent);
+});
+
+test("a malformed cloneId is rejected with 400 before anything is resolved", async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/badcloneid", cloneId: "not-a-uuid" }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string; cloneId?: string };
+  expect(body.error).toBe("cloneId must be a UUID");
+  // The id was never accepted, so there's nothing to echo.
+  expect(body.cloneId).toBeUndefined();
+});
+
+test("a non-string cloneId is rejected with 400", async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/badcloneidtype", cloneId: 12345 }),
+  });
+  expect(res.status).toBe(400);
+  expect(((await res.json()) as { error: string }).error).toBe("cloneId must be a UUID");
+});
+
+test("clone_progress AppEvents are broadcast for a successful clone, tagged with the request's cloneId, starting with `starting` and ending with `done`, and never carry a credential-shaped line", async () => {
+  const cloneId = crypto.randomUUID();
+  const events: AppEvent[] = [];
+  const unsubscribe = subscribeAppEvents((e) => {
+    if (e.type === "clone_progress" && e.cloneId === cloneId) events.push(e);
+  });
+  try {
+    const dest = path.join(WORK_DIR, "clone-progress-events");
+    const res = await call("/projects/clone", {
+      method: "POST",
+      body: JSON.stringify({ url: "someowner/progressevents", dest, eli5: false, cloneId }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { cloneId: string };
+    expect(body.cloneId).toBe(cloneId);
+
+    expect(events.length).toBeGreaterThanOrEqual(2);
+    expect(events[0]).toMatchObject({ type: "clone_progress", cloneId, phase: "starting" });
+    expect(events.at(-1)).toMatchObject({ type: "clone_progress", cloneId, phase: "done" });
+    for (const e of events) {
+      if (e.type !== "clone_progress") continue;
+      expect(e.line).not.toMatch(/authorization|bearer|basic\s+[a-z0-9+/=]{8,}/i);
+    }
+  } finally {
+    unsubscribe();
+  }
+});
+
+test("DELETE /projects/clone/:cloneId for an unknown id returns 404", async () => {
+  const res = await call(`/projects/clone/${crypto.randomUUID()}`, { method: "DELETE" });
+  expect(res.status).toBe(404);
+  expect(((await res.json()) as { error: string }).error).toBe("no clone in flight with that id");
+});
+
+test("DELETE /projects/clone/:cloneId with a malformed id returns 400", async () => {
+  const res = await call("/projects/clone/not-a-uuid", { method: "DELETE" });
+  expect(res.status).toBe(400);
+  expect(((await res.json()) as { error: string }).error).toBe("cloneId must be a UUID");
+});
+
+test(
+  "cancelling an in-flight clone via DELETE resolves the held POST 409 { cancelled: true }, registers nothing, leaves the destination absent, and broadcasts a terminal `cancelled` progress event",
+  async () => {
+    const sourceRoot = mkdtempSync(path.join(tmpdir(), "agetor-clone-endpoint-cancel-src-"));
+    makeBareSourceRepo(sourceRoot);
+    // A generous per-request delay gives this test a wide window to send the
+    // DELETE while attempt 1's anonymous request is still held by the
+    // server — same idiom as clone.test.ts's own cancel tests.
+    const gitServer = startAuthGitServer(sourceRoot, { delayMs: 4_000 });
+    const prevOverride = process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+    process.env.AGETOR_CLONE_SOURCE_OVERRIDE = `${gitServer.url}/repo.git`;
+
+    const cloneId = crypto.randomUUID();
+    const events: AppEvent[] = [];
+    const unsubscribe = subscribeAppEvents((e) => {
+      if (e.type === "clone_progress" && e.cloneId === cloneId) events.push(e);
+    });
+
+    try {
+      const dest = path.join(WORK_DIR, "clone-cancel-endpoint");
+      const projectsBefore = (await (await call("/projects")).json()) as Project[];
+
+      const postPromise = call("/projects/clone", {
+        method: "POST",
+        body: JSON.stringify({ url: "someowner/cancelendpoint", dest, eli5: false, cloneId }),
+      });
+
+      // Give git a moment to actually spawn, connect, and issue its first
+      // request — then cancel while that request is still held by the
+      // server's delay.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const delRes = await call(`/projects/clone/${cloneId}`, { method: "DELETE" });
+      expect(delRes.status).toBe(200);
+      expect(await delRes.json()).toEqual({ ok: true });
+
+      const postRes = await postPromise;
+      expect(postRes.status).toBe(409);
+      expect(await postRes.json()).toEqual({ error: "clone cancelled", cancelled: true, cloneId });
+
+      // `dest` never pre-existed, so a cancelled clone leaves it absent
+      // entirely — see cloneRepo's own doc comment.
+      expect(existsSync(dest)).toBe(false);
+      const projectsAfter = (await (await call("/projects")).json()) as Project[];
+      expect(projectsAfter.length).toBe(projectsBefore.length);
+      expect(projectsAfter.some((p) => p.path === dest)).toBe(false);
+
+      expect(events.some((e) => e.type === "clone_progress" && e.phase === "cancelled")).toBe(true);
+      expect(events.at(-1)).toMatchObject({ type: "clone_progress", cloneId, phase: "cancelled" });
+    } finally {
+      unsubscribe();
+      if (prevOverride === undefined) delete process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+      else process.env.AGETOR_CLONE_SOURCE_OVERRIDE = prevOverride;
+      gitServer.stop();
+      rmSync(sourceRoot, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
+
+test("a second DELETE for an already-settled cloneId 404s (the registry entry is gone)", async () => {
+  const sourceRoot = mkdtempSync(path.join(tmpdir(), "agetor-clone-endpoint-cancel-src2-"));
+  makeBareSourceRepo(sourceRoot);
+  const gitServer = startAuthGitServer(sourceRoot, { delayMs: 4_000 });
+  const prevOverride = process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+  process.env.AGETOR_CLONE_SOURCE_OVERRIDE = `${gitServer.url}/repo.git`;
+  try {
+    const cloneId = crypto.randomUUID();
+    const dest = path.join(WORK_DIR, "clone-cancel-endpoint-twice");
+    const postPromise = call("/projects/clone", {
+      method: "POST",
+      body: JSON.stringify({ url: "someowner/cancelendpointtwice", dest, eli5: false, cloneId }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const firstDelete = await call(`/projects/clone/${cloneId}`, { method: "DELETE" });
+    expect(firstDelete.status).toBe(200);
+
+    await postPromise;
+
+    const secondDelete = await call(`/projects/clone/${cloneId}`, { method: "DELETE" });
+    expect(secondDelete.status).toBe(404);
+  } finally {
+    if (prevOverride === undefined) delete process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+    else process.env.AGETOR_CLONE_SOURCE_OVERRIDE = prevOverride;
+    gitServer.stop();
+    rmSync(sourceRoot, { recursive: true, force: true });
+  }
+}, 30_000);

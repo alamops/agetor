@@ -1,18 +1,50 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertCircle, Loader2, X } from "lucide-react";
 import { toast } from "sonner";
-import { api } from "@/lib/api";
+import { ApiError, api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { latestCloneProgress, subscribeCloneProgress, type CloneProgressEvent } from "@/lib/clone-progress";
 import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { buildEli5Prompt } from "../../../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, detectCloneProvider, parseCloneInput } from "../../../shared/clone-input.ts";
 import { PROVIDER_CAPS, type GitProvider } from "../../../shared/types.ts";
 import { TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
+
+/** Human copy for each in-progress `CloneProgressPhase` — the two terminal
+ *  phases the dialog can actually observe live (`failed`/`cancelled`) never
+ *  reach this map because the dialog stops rendering the progress row the
+ *  moment `submit()`'s `await` settles (an error, or a close-on-cancel). */
+const CLONE_PHASE_LABEL: Record<Exclude<CloneProgressEvent["phase"], "failed" | "cancelled">, string> = {
+  starting: "Starting…",
+  counting: "Counting objects…",
+  compressing: "Compressing objects…",
+  receiving: "Receiving objects…",
+  resolving: "Resolving deltas…",
+  "checking-out": "Checking out files…",
+  done: "Finishing…",
+};
+
+/** Narrows an `ApiError`'s parsed JSON body to the shape the 409 response
+ *  for a cancelled clone carries (`{ error, cancelled: true }`), so `submit`
+ *  can tell that apart from any other 409 the route might one day return. */
+function isCancelledCloneError(body: unknown): boolean {
+  return !!body && typeof body === "object" && (body as { cancelled?: unknown }).cancelled === true;
+}
+
+/** Phase label for the live progress row — falls back to the sanitized raw
+ *  `line` text for the two terminal phases (`failed`/`cancelled`) that
+ *  `CLONE_PHASE_LABEL` deliberately omits (see its own doc comment) but
+ *  which can, in a narrow race, still arrive over `/app/events` moments
+ *  before the held `cloneProject` POST's own rejection reaches this
+ *  component and clears `progress`. */
+function cloneProgressLabel(e: CloneProgressEvent): string {
+  return (CLONE_PHASE_LABEL as Partial<Record<CloneProgressEvent["phase"], string>>)[e.phase] ?? e.line;
+}
 
 interface Props {
   open: boolean;
@@ -59,6 +91,14 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
   const [eli5, setEli5] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The in-flight clone's live progress (`null` until the first event
+  // arrives) and whether a Cancel request is itself in flight — both reset
+  // per-open below and cleared in `submit()`'s `finally`. `cloneIdRef` is a
+  // ref, not state: it's minted once per submit, read by the Cancel handler,
+  // and never drives a render on its own.
+  const [progress, setProgress] = useState<CloneProgressEvent | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const cloneIdRef = useRef<string | null>(null);
   const urlRef = useRef<HTMLInputElement | null>(null);
 
   // Fresh form every open — a stale URL from the previous clone is never
@@ -73,6 +113,9 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
     setDest("");
     setEli5(true);
     setError(null);
+    setProgress(null);
+    setCancelling(false);
+    cloneIdRef.current = null;
     launch.setAgentProfileId(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -135,12 +178,23 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
     if (!canSubmit) return;
     setBusy(true);
     setError(null);
+    // Mint the id and subscribe BEFORE awaiting the clone request — the
+    // server can start emitting `clone_progress` events the moment it
+    // accepts the POST, and subscribing after the await would miss
+    // everything up to the first progress-triggered re-render (there isn't
+    // one, since nothing else about this call causes a render in between,
+    // but the ordering is the contract `clone-progress.ts` is written to).
+    const cloneId = crypto.randomUUID();
+    cloneIdRef.current = cloneId;
+    setProgress(latestCloneProgress(cloneId));
+    const unsubscribe = subscribeCloneProgress(cloneId, setProgress);
     try {
       const result = await api.cloneProject({
         url: trimmed,
         provider: effectiveProvider,
         dest: dest.trim() || undefined,
         eli5,
+        cloneId,
         // Only forward launch fields when the explainer is actually
         // running — and, when it is, a bound profile wins outright (never
         // send it alongside the manual fields, and never send it as null).
@@ -168,9 +222,44 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
             : result.project.path,
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // The 409 the server answers the held POST with once `cancelClone`
+      // kills the git process — a user-initiated cancel, not a failure, so
+      // it closes the dialog with an info toast instead of the inline
+      // `clone-error` banner every other failure gets.
+      if (err instanceof ApiError && err.status === 409 && isCancelledCloneError(err.body)) {
+        onClose();
+        toast.info("Clone cancelled");
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
+      unsubscribe();
+      cloneIdRef.current = null;
+      setProgress(null);
+      setCancelling(false);
       setBusy(false);
+    }
+  };
+
+  const cancelClone = async () => {
+    const id = cloneIdRef.current;
+    if (!id || cancelling) return;
+    setCancelling(true);
+    try {
+      await api.cancelClone(id);
+      // Success just means the kill was issued — the held `cloneProject`
+      // call above is what actually observes the outcome (its 409 catch
+      // branch closes the dialog and toasts). Nothing to do here but wait.
+    } catch (err) {
+      // A 404 means the clone already finished (succeeded or failed) on its
+      // own between the click and this request landing — a benign race,
+      // not something to surface. Anything else is unexpected but shouldn't
+      // block the user from trying again or waiting out the still-running
+      // clone, so it's a toast, not the inline banner.
+      if (!(err instanceof ApiError && err.status === 404)) {
+        toast.error(err instanceof Error ? err.message : String(err));
+      }
+      setCancelling(false);
     }
   };
 
@@ -348,12 +437,53 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
               {error}
             </p>
           )}
+
+          {busy && (
+            // Rides the `clone_progress` AppEvent forwarded through
+            // clone-progress.ts's module store (see the import above) —
+            // never its own EventSource, per the store's own doc comment.
+            // `progress` starts `null` (no event yet, e.g. the server
+            // hasn't started `git clone` itself) — the phase label falls
+            // back to "Starting…" and the bar renders indeterminate.
+            <div
+              data-testid="clone-progress"
+              className="space-y-1.5 rounded-md border border-border/60 bg-muted/30 px-3 py-2"
+            >
+              <p aria-live="polite" className="text-xs text-muted-foreground">
+                {progress ? cloneProgressLabel(progress) : "Starting…"}
+              </p>
+              <progress
+                data-testid="clone-progress-bar"
+                max={100}
+                value={progress?.percent ?? undefined}
+                className="h-1.5 w-full accent-primary"
+              />
+            </div>
+          )}
         </div>
 
         <div className="flex shrink-0 justify-end gap-2 border-t border-border/60 px-4 py-3">
-          <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
-            Cancel
-          </Button>
+          {busy ? (
+            // Replaces the plain "Cancel" (close) button's role while a
+            // clone is in flight — Escape/backdrop still can't abandon it
+            // (see the `onClose` prop above), so this is the only way out.
+            // Stays enabled (not tied to `canSubmit`) for the whole time a
+            // clone runs, including while the explainer-picker fieldset is
+            // disabled.
+            <Button
+              data-testid="clone-cancel"
+              variant="ghost"
+              size="sm"
+              onClick={() => void cancelClone()}
+              disabled={cancelling}
+            >
+              {cancelling ? "Cancelling…" : "Cancel clone"}
+            </Button>
+          ) : (
+            <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
+              Cancel
+            </Button>
+          )}
           <Button data-testid="clone-submit" size="sm" onClick={() => void submit()} disabled={!canSubmit}>
             {busy ? "Cloning…" : "Clone"}
           </Button>

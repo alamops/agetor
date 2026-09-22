@@ -254,17 +254,26 @@ export class AgetorClient {
   }
   /** Clone a GitHub/GitLab/Bitbucket repo as a new project (`POST
    *  /projects/clone`, plan `docs/plans/clone-repository-all-providers.md`
-   *  §3 D6). `provider` only matters for `owner/repo` shorthand — a full
-   *  URL's own detected provider wins server-side; `dest` must already be
-   *  absolute (the CLI resolves it against its own cwd before calling this).
-   *  `eli5` defaults server-side to `true` (create + start an explainer
-   *  task); pass `false` to skip it. Uses {@link CLONE_TIMEOUT_MS} instead of
-   *  the default budget — see its doc comment. */
+   *  §3 D6, progress + cancel per Addendum A). `provider` only matters for
+   *  `owner/repo` shorthand — a full URL's own detected provider wins
+   *  server-side; `dest` must already be absolute (the CLI resolves it
+   *  against its own cwd before calling this). `eli5` defaults server-side
+   *  to `true` (create + start an explainer task); pass `false` to skip it.
+   *  `cloneId` (a client-minted UUID) correlates this call with the
+   *  `clone_progress` `AppEvent`s broadcast on `GET /app/events` while the
+   *  clone is in flight, and is what {@link cancelClone} targets — the
+   *  server mints its own id and echoes it back when the caller omits one,
+   *  but every caller that wants to observe progress or cancel must pass
+   *  its own so it's known before the response arrives. Uses
+   *  {@link CLONE_TIMEOUT_MS} instead of the default budget — see its doc
+   *  comment. A cancelled clone rejects with a 409 `ApiError` whose `body`
+   *  carries `{ cancelled: true }` (see `cancelClone`). */
   cloneProject(input: {
     url: string;
     provider?: GitProvider;
     dest?: string;
     eli5?: boolean;
+    cloneId?: string;
   }): Promise<{
     project: Project;
     // Optional: the response field is additive, and this CLI talks to
@@ -274,8 +283,23 @@ export class AgetorClient {
     provider?: GitProvider;
     eli5TaskId: string | null;
     eli5Error: string | null;
+    // Optional for the same reason: an older daemon never echoes it back,
+    // and a caller that didn't pass one in already has whatever it minted.
+    cloneId?: string;
   }> {
     return this.req("POST", "/projects/clone", input, CLONE_TIMEOUT_MS);
+  }
+  /** Cancel the in-flight `POST /projects/clone` request identified by
+   *  `cloneId` (`DELETE /projects/clone/:cloneId`, Addendum A) — kills the
+   *  running `git clone` process server-side and removes any destination
+   *  directory it created (an existing empty dir it cloned into is left).
+   *  The held POST itself then rejects with a 409 `ApiError`, never this
+   *  call's own response. 404 (already settled, or an id nothing ever
+   *  registered) propagates as a thrown `ApiError` like every other call
+   *  here — `cmdClone`'s SIGINT handler is the caller that expects and
+   *  swallows that specific case. */
+  cancelClone(cloneId: string): Promise<{ ok: boolean }> {
+    return this.req("DELETE", `/projects/clone/${encodeURIComponent(cloneId)}`);
   }
   /** List a scope's files for the `@`-mention picker (`GET /files/index`) —
    *  the same route the webview's `useProjectFiles` calls. Two modes,
