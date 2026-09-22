@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { migrate, splitSqlStatements, type Migration } from "./migrate.ts";
 import reseedBuiltins from "./migrations/024_reseed_harness_builtins.sql" with { type: "text" };
 import retireGemini3ProPreview from "./migrations/049_retire_gemini_3_pro_preview.sql" with { type: "text" };
+import normalizeCursorGrok47 from "./migrations/055_normalize_cursor_grok_4_7.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
 
 // Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
@@ -288,14 +289,134 @@ test("049 leaves a lastModel:gemini pref that already points at a live model alo
   expect(prefs).toEqual([{ key: "lastModel:gemini", value: "gemini-3.7-flash" }]);
 });
 
-test("054 is registered last in the migrations index, right after 053", () => {
-  const last = migrations[migrations.length - 1];
-  expect(last?.id).toBe("054_account_usage");
+test("054 is registered right after 053 in the migrations index", () => {
+  // Located by id, not by distance from the end — 055 appended after it.
+  const at = migrations.findIndex((m) => m.id === "054_account_usage");
+  expect(at).toBeGreaterThan(0);
+  const last = migrations[at];
   expect(last?.sql).toContain("CREATE TABLE usage_files");
   expect(last?.sql).toContain("CREATE TABLE usage_daily");
   expect(last?.sql).toContain("CREATE TABLE usage_seen");
-  const prev = migrations[migrations.length - 2];
+  const prev = migrations[at - 1];
   expect(prev?.id).toBe("053_task_agent_profile");
   expect(prev?.sql).toContain("ADD COLUMN agent_profile_id TEXT");
   expect(prev?.sql).toContain("ADD COLUMN agent_profile TEXT");
+});
+
+test("055_normalize_cursor_grok_4_7 folds suffixed grok-4.7 variants into base id + effort + fast on cursor-kind tasks, agent profiles and the lastModel:cursor pref, idempotently", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL
+    );
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE agent_profiles (
+      id TEXT PRIMARY KEY,
+      harness_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
+  db.exec(`
+    INSERT INTO harnesses (id, kind) VALUES
+      ('cursor', 'cursor'), ('cursor-2', 'cursor'), ('fx', 'fx'), ('codex', 'codex');
+  `);
+
+  db.exec(`
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'cursor', 'grok-4.7-high', NULL, 0),
+      ('t02', 'cursor-2', 'grok-4.7-xhigh-fast', 'low', 0),
+      ('t03', 'cursor', 'grok-4.7-medium', 'medium', 1),
+      ('t04', 'cursor', 'grok-4.7-low-fast', NULL, 1),
+      ('t05', 'cursor', 'grok-4.7', 'high', 1),
+      ('t06', 'cursor', 'cursor-grok-4.6', 'xhigh', 0),
+      ('t07', 'cursor', 'cursor-grok-4.6-high', NULL, 0),
+      ('t08', 'fx', 'spacexai/grok-4.7', NULL, 0),
+      ('t09', 'codex', 'grok-4.7-high', 'high', 0),
+      ('t10', 'cursor', NULL, NULL, 0),
+      ('t11', 'cursor', 'grok-4.7-max', NULL, 0);
+  `);
+
+  db.exec(`
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'cursor', 'grok-4.7-xhigh', NULL, 0),
+      ('p02', 'cursor-2', 'grok-4.7-high-fast', 'high', 0),
+      ('p03', 'cursor', 'grok-4.7', 'medium', 0),
+      ('p04', 'codex', 'grok-4.7-low', NULL, 0);
+  `);
+
+  db.exec(`
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:cursor', 'grok-4.7-high-fast', 1),
+      ('lastModel:codex', 'grok-4.7-high', 1),
+      ('lastMode:cursor', 'auto', 1);
+  `);
+
+  const readTasks = () =>
+    db
+      .query<{ id: string; model: string | null; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM tasks ORDER BY id`,
+      )
+      .all();
+  const readProfiles = () =>
+    db
+      .query<{ id: string; model: string; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM agent_profiles ORDER BY id`,
+      )
+      .all();
+  const readPrefs = () =>
+    db
+      .query<{ key: string; value: string; updated_at: number }, []>(
+        `SELECT key, value, updated_at FROM preferences ORDER BY key`,
+      )
+      .all();
+
+  db.exec(normalizeCursorGrok47);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "grok-4.7", effort: "high", fast: 0 }, // variant → base + effort
+    { id: "t02", model: "grok-4.7", effort: "xhigh", fast: 1 }, // variant wins over a stale effort; -fast sets fast; additional cursor harness via the kind join
+    { id: "t03", model: "grok-4.7", effort: "medium", fast: 0 }, // stale fast=1 cleared — the verbatim id ran the regular tier
+    { id: "t04", model: "grok-4.7", effort: "low", fast: 1 },
+    { id: "t05", model: "grok-4.7", effort: "high", fast: 1 }, // untouched — already base + effort + fast
+    { id: "t06", model: "cursor-grok-4.6", effort: "xhigh", fast: 0 }, // untouched — other model
+    { id: "t07", model: "cursor-grok-4.6-high", effort: null, fast: 0 }, // untouched — 4.6 variants are out of scope
+    { id: "t08", model: "spacexai/grok-4.7", effort: null, fast: 0 }, // untouched — fx id
+    { id: "t09", model: "grok-4.7-high", effort: "high", fast: 0 }, // untouched — not a cursor-kind harness
+    { id: "t10", model: null, effort: null, fast: 0 }, // untouched — still NULL
+    { id: "t11", model: "grok-4.7-max", effort: null, fast: 0 }, // untouched — not a real variant id
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "grok-4.7", effort: "xhigh", fast: 0 },
+    { id: "p02", model: "grok-4.7", effort: "high", fast: 1 },
+    { id: "p03", model: "grok-4.7", effort: "medium", fast: 0 }, // untouched
+    { id: "p04", model: "grok-4.7-low", effort: null, fast: 0 }, // untouched — not a cursor-kind harness
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:cursor", value: "auto", updated_at: 1 }, // untouched — not a lastModel key
+    { key: "lastModel:codex", value: "grok-4.7-high", updated_at: 1 }, // untouched — other kind
+    { key: "lastModel:cursor", value: "grok-4.7", updated_at: 1 }, // variant → base
+  ]);
+
+  // Idempotent: re-applying against the already-normalized rows is a no-op.
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(normalizeCursorGrok47);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
 });

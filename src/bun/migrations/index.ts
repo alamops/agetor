@@ -72,6 +72,7 @@ import m053 from "./053_task_agent_profile.sql" with { type: "text" };
 // (pre-upstream-sync numbering); renumbered to 054 on port, original id kept
 // as an alias (same renumber-with-alias pattern used throughout this file).
 import m054 from "./054_account_usage.sql" with { type: "text" };
+import m055 from "./055_normalize_cursor_grok_4_7.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -134,4 +135,5 @@ export const migrations: Migration[] = [
   { id: "052_agent_profiles", sql: m052 },
   { id: "053_task_agent_profile", sql: m053 },
   { id: "054_account_usage", sql: m054, aliases: ["040_account_usage"] },
+  { id: "055_normalize_cursor_grok_4_7", sql: m055 },
 ];
