@@ -3,14 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from "node:
 import { homedir, tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
-import {
-  ELI5_FILENAME,
-  buildEli5Prompt,
-  cloneRepo,
-  defaultCloneDest,
-  eli5TaskTitle,
-  parseGitHubRepo,
-} from "./clone.ts";
+import { cloneRepo, defaultCloneDest, parseGitHubRepo } from "./clone.ts";
 
 // clone.ts has no db.ts dependency, so no AGETOR_DATA_DIR dance is needed.
 
@@ -89,19 +82,6 @@ describe("parseGitHubRepo", () => {
 describe("defaultCloneDest", () => {
   test("lands directly under $HOME", () => {
     expect(defaultCloneDest("bar")).toBe(path.join(homedir(), "bar"));
-  });
-});
-
-describe("buildEli5Prompt / eli5TaskTitle", () => {
-  test("prompt names the file, the repo, and forbids commits", () => {
-    const prompt = buildEli5Prompt("myrepo");
-    expect(prompt).toContain(ELI5_FILENAME);
-    expect(prompt).toContain("myrepo");
-    expect(prompt).toContain("do not commit");
-  });
-
-  test("title is stable and carries the repo name", () => {
-    expect(eli5TaskTitle("myrepo")).toBe("ELI5: myrepo");
   });
 });
 
