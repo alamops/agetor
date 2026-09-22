@@ -5,6 +5,7 @@ import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import { initPipelineRunner } from "./pipeline-runner.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
@@ -137,6 +138,13 @@ rehydratePath();
 // a socket auto-starts its server — un-disclaimed, if this didn't run
 // first — leaving every session that server ever hosts un-disclaimed too.
 await ensureDisclaimedServer();
+// Subscribe the pipeline runner to the global lifecycle stream BEFORE
+// reconcileOrphans() runs, so a step task's boot-time orphan→ready
+// transition (an ordinary `run-status` "orphaned" event, fired by
+// reconcileOrphans below) reaches the runner and flips its pipeline parent
+// back to ready/cancelled-with-retry instead of leaving it silently stuck
+// `running` forever (docs/plans/pipelines.md §3, T3).
+initPipelineRunner();
 await reconcileOrphans();
 
 // Re-arm in-memory auto-resume timers for every fx task still carrying a

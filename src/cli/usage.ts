@@ -20,6 +20,9 @@ export const USAGE: Record<string, string> = {
     --profile <id|name>  launch from a saved agent profile (agetor profile ls) —
                         cannot combine with --agent/--model/--mode/--effort/
                         --fast/--max-mode, the profile defines them
+    --pipeline <id|name> launch a pipeline (agetor pipeline ls) instead of a
+                        single agent — cannot combine with --profile or any
+                        of --agent/--model/--mode/--effort/--fast/--max-mode
     --type <t>         task | subtask | epic | feature | bug | spike
     --ref <path>       attach a file/folder reference (repeatable)
     --issue <url>      seed title/prompt from a GitHub/GitLab issue + its thread
@@ -30,7 +33,8 @@ export const USAGE: Record<string, string> = {
 
   List tasks. Filters combine (substring match for --repo/--search):
     --column <c>   --agent <id>   --type <t>   --repo <s>   --search <s>
-    --archived     archived only        --all   include archived`,
+    --archived     archived only        --all   include archived
+    --steps        also list hidden pipeline step tasks (hidden by default)`,
 
   ps: `usage: agetor ps
 
@@ -181,6 +185,23 @@ export const USAGE: Record<string, string> = {
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced).`,
 
+  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file>] | import <file> [--name <n>]>
+
+  Manage pipelines — named graphs of agent-profile-bound steps launched as
+  one board task (built in the app's Pipelines editor; the CLI moves them
+  around). <ref> is a pipeline id or its (unique, case-insensitive) name.
+  Launch one with 'agetor add --pipeline <id|name>'.`,
+
+  "pipeline export": `usage: agetor pipeline export <ref> [--out <file>]
+
+  Print (or write to --out) the pipeline as PipelineInput JSON
+  (name/description/graph/maxSteps) — re-importable with 'pipeline import'.`,
+
+  "pipeline import": `usage: agetor pipeline import <file|-> [--name <name>]
+
+  Create a pipeline from an exported JSON file ('-' reads stdin). --name
+  overrides the file's own name.`,
+
   daemon: `usage: agetor daemon <status | start | stop>
 
   Control the background headless core (used when the desktop app isn't open).`,
@@ -205,6 +226,7 @@ const ALIASES: Record<string, string> = {
   delete: "rm",
   harnesses: "harness",
   profiles: "profile",
+  pipelines: "pipeline",
   project: "projects",
   sent: "files",
 };

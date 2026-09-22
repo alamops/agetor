@@ -4,6 +4,7 @@ import type { Task } from "../../shared/types.ts";
 import { COLUMNS } from "../../shared/types.ts";
 import { flagValue } from "../args.ts";
 import { fxAutoResumeCountdownText, isTaskFxPaused } from "../../shared/fx-recovery.ts";
+import { pipelineStepProgress } from "../../shared/pipeline.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id);
 
@@ -24,10 +25,11 @@ interface LsFilters {
   search?: string;
   archived: boolean;
   all: boolean;
+  steps: boolean;
 }
 
 function parseLsFilters(args: string[]): LsFilters {
-  const f: LsFilters = { columns: [], archived: false, all: false };
+  const f: LsFilters = { columns: [], archived: false, all: false, steps: false };
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     const val = () => flagValue(args, ++i, a);
@@ -39,6 +41,7 @@ function parseLsFilters(args: string[]): LsFilters {
       case "--search": case "-q": f.search = val(); break;
       case "--archived": f.archived = true; break;
       case "--all": f.all = true; break;
+      case "--steps": f.steps = true; break;
       default: break;
     }
   }
@@ -61,6 +64,11 @@ export async function cmdLs(
   }
   const client = await getClient(flags);
   let tasks = await client.listTasks();
+  // `GET /tasks` also returns hidden pipeline step tasks (D11,
+  // docs/plans/pipelines.md) — hidden from `ls` by default, same as the
+  // board and the TUI, since they're an implementation detail of the
+  // pipeline's parent task; --steps opts back in.
+  if (!f.steps) tasks = tasks.filter((t) => t.pipelineParentId == null);
   // Archive view: active-only by default (matches the app); --archived shows
   // only archived, --all shows both.
   if (f.archived) tasks = tasks.filter((t) => t.archivedAt != null);
@@ -141,6 +149,12 @@ function needsCell(t: Task): string {
         ? c.cyan(`⏸ auto ${fxAutoResumeCountdownText(autoResume.at, Date.now())}`)
         : c.yellow("⏸ paused"),
     );
+  }
+  // A pipeline (parent) task whose run is blocked — extend the same "needs
+  // attention" cell rather than adding a column of its own, mirroring the
+  // fx-pause hint above. `pipelineRun` is only ever set on a parent task.
+  if (t.pipelineId && t.pipelineRun?.status === "blocked") {
+    parts.push(c.yellow(`pipeline blocked · ${pipelineStepProgress(t.pipelineRun).label}`));
   }
   return parts.join(" ");
 }

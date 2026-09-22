@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles } from "./db.ts";
+import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles, pipelines } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
@@ -34,6 +34,13 @@ import {
   type TaskType,
 } from "../shared/types.ts";
 import { isFxRecoveryResumable, parseFxAutoResumePrefs, parseFxRecoveryPayload } from "../shared/fx-recovery.ts";
+import { resolveStartStep } from "../shared/pipeline.ts";
+import {
+  cascadePipelineArchive,
+  cascadePipelineDelete,
+  initialPipelineRunState,
+  startPipelineRun,
+} from "./pipeline-runner.ts";
 
 /**
  * Resolve a task's harness id to its full row (falling back to a synthetic
@@ -134,6 +141,7 @@ import type {
   ColumnId,
   FxRecoveryPayload,
   GlobalEvent,
+  Pipeline,
   RunEvent,
   RunStatus,
   SentFileEntry,
@@ -406,7 +414,7 @@ function updateColumn(
   taskId: string,
   runId: string | null,
   next: ColumnId,
-  reason?: "api-error" | "approval" | "session-died" | "unknown-command",
+  reason?: "api-error" | "approval" | "session-died" | "unknown-command" | "pipeline",
 ): void {
   const before = tasks.get(taskId);
   const prev: ColumnId | null = before?.column ?? null;
@@ -414,6 +422,18 @@ function updateColumn(
   if (prev !== next) {
     emitGlobal({ kind: "column", taskId, runId, column: next, prev, ts: Date.now(), reason });
   }
+}
+
+/**
+ * Thin export of `updateColumn` (module-private otherwise) for
+ * `pipeline-runner.ts` — every column transition the runner drives (a step
+ * task settling to `done`, the parent mirroring running/blocked/review/
+ * ready) rides the `"pipeline"` reason so the UI/CLI can tell a
+ * runner-driven transition apart from an ordinary one (docs/plans/pipelines.md
+ * D12).
+ */
+export function pipelineUpdateColumn(taskId: string, runId: string | null, next: ColumnId): void {
+  updateColumn(taskId, runId, next, "pipeline");
 }
 
 /**
@@ -1098,6 +1118,17 @@ export function effectiveAgentProfile(
 ): { profile: AgentProfileSnapshot; source: "live" | "snapshot" } | null {
   if (!task.agentProfileId && !task.agentProfile) return null;
 
+  // Pipeline step tasks are frozen at launch (D8, docs/plans/pipelines.md):
+  // the parent's run snapshot already captured the profile as it was when
+  // the run started, and a step task's `agentProfile` is that exact frozen
+  // copy. Step tasks never enter the "live until first run" window below —
+  // even a fresh step task's very first run must launch with the snapshot,
+  // not a possibly-since-edited live profile.
+  if (task.pipelineParentId) {
+    if (!task.agentProfile) return null;
+    return { profile: task.agentProfile, source: "snapshot" };
+  }
+
   if (task.agentProfileId && runs.countForTask(task.id) === 0) {
     const profile: AgentProfile | null = agentProfiles.get(task.agentProfileId);
     if (profile) {
@@ -1181,6 +1212,19 @@ async function startTaskInner(
   // archive filter, which is confusing at best.
   if (task.archivedAt != null) {
     task = tasks.update(taskId, { archivedAt: null }) ?? task;
+  }
+
+  // Pipeline tasks never spawn an agent themselves — Run instead kicks off
+  // the pipeline runner, which materializes the shared worktree once and
+  // launches the graph's start step (or retries whatever's blocked/
+  // cancelled) as a hidden step task (D1/D9, docs/plans/pipelines.md).
+  // Placed after the pendingTeardown wait and auto-unarchive above (a
+  // pipeline task can be archived/unarchived like any other task) but
+  // before every harness/profile pre-flight below, none of which apply to
+  // the parent row itself — the runner does its own pre-flight per step via
+  // the ordinary `startTask` path for each child.
+  if (task.pipelineId) {
+    return startPipelineRun(task);
   }
 
   // Freeze-at-first-run (docs/plans/agent-profiles.md D2): resolve the
@@ -5263,6 +5307,18 @@ export interface CreateTaskInput extends Partial<Task> {
    * `{ error }` rather than silently falling back to "no agent".
    */
   agentProfileId?: string | null;
+  /**
+   * Bind this task to a {@link Pipeline} at create time (docs/plans/pipelines.md
+   * D1) — mutually exclusive with `agentProfileId` (`{ error }` when both are
+   * set). The created row is a **pipeline task**: `startTask` routes it to
+   * `startPipelineRun` instead of spawning an agent, and its own
+   * agent/model/effort/mode/fast/maxMode fields are cosmetic, mirroring the
+   * graph's start step (A1). Also settable via the inherited `Partial<Task>`
+   * field; listed here too so its doc comment lives next to the validation it
+   * triggers. An unresolvable id, a graph with no resolvable start step, or
+   * any step with no resolvable agent fails the whole create with `{ error }`.
+   */
+  pipelineId?: string | null;
 }
 
 /**
@@ -5278,7 +5334,7 @@ export interface CreateTaskInput extends Partial<Task> {
  * curated `MODEL_EFFORT_SUPPORT` table when the harness reported a non-empty
  * list for this model — see `supportedEfforts`/`getDiscoveredEfforts`.
  */
-function defaultEffortFor(kind: AgentKind, model: string, harnessId: string): string | null {
+export function defaultEffortFor(kind: AgentKind, model: string, harnessId: string): string | null {
   const support = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, harnessId));
   if (support.length === 0) return null;
   return support.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : support[0]!.id;
@@ -5357,6 +5413,33 @@ export async function createTask(
 
   const id = randomUUID();
 
+  // Pipeline binding (D1, docs/plans/pipelines.md): mutually exclusive with
+  // `agentProfileId` — a pipeline task never launches an agent of its own
+  // (the runner drives hidden step tasks instead), but its own
+  // agent/model/effort/mode/fast/maxMode fields still cosmetically mirror
+  // the graph's start step (A1) so every existing per-task surface that
+  // reads those fields (board filters, badges, CLI `ls`) keeps working
+  // unchanged. Validated up front, before `profile` below, so a bad
+  // pipeline id (or a step with no resolvable agent) fails the create
+  // outright, the same way a bad `agentProfileId` already does.
+  let pipeline: Pipeline | null = null;
+  const requestedPipelineId = input.pipelineId?.trim();
+  if (requestedPipelineId) {
+    if (input.agentProfileId?.trim()) {
+      return { error: "a task can't bind both a pipeline and an agent" };
+    }
+    pipeline = pipelines.get(requestedPipelineId);
+    if (!pipeline) return { error: "unknown pipeline" };
+    const start = resolveStartStep(pipeline.graph);
+    if (!start) return { error: "pipeline has no resolvable start step" };
+    for (const step of pipeline.graph.steps) {
+      if (!step.agentProfileId) return { error: `step "${step.name}" has no agent` };
+      if (!agentProfiles.get(step.agentProfileId)) {
+        return { error: `agent for step "${step.name}" no longer exists` };
+      }
+    }
+  }
+
   // Agent profile override (docs/plans/agent-profiles.md D2/D3): resolved
   // BEFORE the harness/model/effort defaulting below, since a bound profile
   // wins outright over any of those six body-provided fields. An
@@ -5372,19 +5455,31 @@ export async function createTask(
       return { error: `unknown agent profile "${requestedProfileId}"` };
     }
   }
+  // Cosmetic defaults source for agent/model/effort/mode/fast/maxMode: a
+  // bound profile wins as before; otherwise a pipeline task's start-step
+  // profile fills the same role (A1) — but `profile` itself stays null
+  // below, so the task row is never recorded as BOUND to that profile
+  // (`agentProfileId`/`agentProfile` stay null; only `pipelineId` marks
+  // this row as a pipeline task). Every step above already validated that
+  // `pipeline`'s start step has an `agentProfileId` that resolves, so the
+  // `agentProfiles.get` here can't fail.
+  const pipelineStartProfile: AgentProfile | null = pipeline
+    ? agentProfiles.get(resolveStartStep(pipeline.graph)!.agentProfileId!)
+    : null;
+  const defaultsProfile: AgentProfile | null = profile ?? pipelineStartProfile;
 
   // Resolve the harness so we can default model/effort by kind. A bad alias
   // id is rejected up-front rather than persisted and surfacing as a launch
   // failure later. Falls back to the built-in claude-code id when the caller
   // omits `agent` entirely. A bound profile's own harness always wins over
   // `input.agent`.
-  const agentId = profile ? profile.harness : (input.agent ?? "claude-code");
+  const agentId = defaultsProfile ? defaultsProfile.harness : (input.agent ?? "claude-code");
   const harness = resolveHarness(agentId);
   if (!harness) {
     return { error: `unknown harness "${agentId}"` };
   }
   const kind = harness.kind;
-  const model = profile ? profile.model : (input.model ?? DEFAULT_MODEL[kind]);
+  const model = defaultsProfile ? defaultsProfile.model : (input.model ?? DEFAULT_MODEL[kind]);
   // Discovered efforts (e.g. Codex's own app-server catalog) win when the
   // harness reported a non-empty list for this model; the curated
   // MODEL_EFFORT_SUPPORT table is only the fallback (see
@@ -5421,8 +5516,8 @@ export async function createTask(
   // treatment; `agentProfileSnapshot` below is built straight from `profile`
   // and keeps the raw `null`.
   let effort: string | null;
-  if (profile) {
-    effort = profile.effort ?? defaultEffortFor(kind, model, harness.id);
+  if (defaultsProfile) {
+    effort = defaultsProfile.effort ?? defaultEffortFor(kind, model, harness.id);
   } else if (input.effort !== undefined && input.effort !== null) {
     effort = input.effort;
   } else {
@@ -5529,13 +5624,22 @@ export async function createTask(
     // No PR exists for a brand-new task; set server-side by pull-create.
     prUrl: null,
     issueUrl: validatedIssueUrl,
-    mode: profile ? profile.mode : (input.mode ?? null),
+    mode: defaultsProfile ? defaultsProfile.mode : (input.mode ?? null),
     model,
     effort,
-    fast: profile ? profile.fast : input.fast === true,
-    maxMode: profile ? profile.maxMode : input.maxMode === true,
+    fast: defaultsProfile ? defaultsProfile.fast : input.fast === true,
+    maxMode: defaultsProfile ? defaultsProfile.maxMode : input.maxMode === true,
     agentProfileId: profile?.id ?? null,
     agentProfile: agentProfileSnapshot,
+    // Pipeline binding (D1): only the parent row carries `pipelineId` (set
+    // above once, validated) — a brand-new task is never itself a hidden
+    // step (`pipelineParentId`/`pipelineStepId` are only ever set by the
+    // runner's own `launchStep`, never by `createTask`). `pipelineRun`
+    // starts idle (`snapshot: null`) until the first Run.
+    pipelineId: pipeline?.id ?? null,
+    pipelineRun: pipeline ? initialPipelineRunState(pipeline) : null,
+    pipelineParentId: null,
+    pipelineStepId: null,
     references: input.references ?? [],
     // Brand-new tasks start with an empty backlog; drafts are added later from
     // the run panel.
@@ -5673,7 +5777,14 @@ function enqueueArchiveTeardown(
     else if (kind === "cursor") await dropCursorSession(cur.id);
     else if (kind === "gemini") await dropGeminiSession(cur.id);
     else if (kind === "fx") dropFxSession(cur.id); // fx has no tmux session — stays sync
-    result = await detachWorktree(cur, { force: opts?.force });
+    // Pipeline step rows share the parent's worktree (D2, docs/plans/pipelines.md)
+    // — a step's own archive teardown must never detach it out from under
+    // the parent (or any sibling step still using it). The parent's own
+    // teardown (this same function, called for the parent row) removes the
+    // worktree exactly as before; only a step row's call skips the detach.
+    result = cur.pipelineParentId
+      ? { removed: false, reason: "no-worktree" }
+      : await detachWorktree(cur, { force: opts?.force });
   });
   return { promise, result: () => result };
 }
@@ -5717,10 +5828,20 @@ function enqueueArchiveTeardown(
  */
 export async function archiveTask(
   taskId: string,
-  opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean },
+  opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean; fromPipeline?: boolean },
 ): Promise<{ task: Task; teardown?: WorktreeTeardownResult } | { error: string }> {
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
+  // Pipeline step tasks can't be archived individually (D9, docs/plans/pipelines.md)
+  // — their lifecycle belongs to the parent pipeline task. `fromPipeline` is
+  // set only by `cascadePipelineArchive` (pipeline-runner.ts), which is the
+  // one legitimate caller archiving a step row directly, as part of
+  // archiving the whole pipeline. `server.ts`'s route already 409s a direct
+  // step-archive request before ever reaching here; this is defense in
+  // depth against any other internal caller making the same mistake.
+  if (task.pipelineParentId && !opts?.fromPipeline) {
+    return { error: `step task belongs to a pipeline — act on the pipeline task ${task.pipelineParentId} instead` };
+  }
   if (task.column !== "done" && !opts?.force) {
     return { error: "only tasks in Done can be archived" };
   }
@@ -5779,6 +5900,14 @@ export async function archiveTask(
   }
   const updated = tasks.update(taskId, { archivedAt: Date.now() });
   if (!updated) return { error: "task not found" };
+  // Pipeline parent (D9, docs/plans/pipelines.md): archive every non-archived
+  // step task first — `cascadePipelineArchive` is best-effort per step (a
+  // step that fails to archive is logged, not thrown), so one stuck step
+  // never blocks the parent's own archive below. No-op for an ordinary task
+  // (`pipelineId` null).
+  if (updated.pipelineId) {
+    await cascadePipelineArchive(updated.id);
+  }
   // Turn queues are cheap in-memory bookkeeping (no I/O), so they're dropped
   // inline rather than folded into the deferred job.
   codexTurnQueue.delete(taskId);
@@ -5829,7 +5958,11 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
   await pendingTeardown(taskId);
   const updated = tasks.update(taskId, { archivedAt: null });
   if (!updated) return { error: "task not found" };
-  if (updated.worktreePath && updated.branch && !existsSync(updated.worktreePath)) {
+  // A step row's worktree belongs to its pipeline parent (D2) — restoring
+  // it here (were a step row ever unarchived on its own, which the normal
+  // UI never does) would be redundant at best and racy at worst against the
+  // parent's own restore; only the parent's own worktree is materialized.
+  if (updated.worktreePath && updated.branch && !updated.pipelineParentId && !existsSync(updated.worktreePath)) {
     try {
       const restored = await prepareWorkdir(updated);
       if ("error" in restored) {
@@ -5845,10 +5978,28 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
 /**
  * Delete a task and best-effort tear down its worktree. Kills any active run
  * first so we don't leave a stale process around.
+ *
+ * Pass `{ fromPipeline: true }` when the caller is `cascadePipelineDelete`
+ * (pipeline-runner.ts) deleting a step task as part of deleting the whole
+ * pipeline task — the one legitimate way a step row gets deleted directly.
+ * Without it, a step task (`pipelineParentId` set) is refused: delete the
+ * pipeline task instead (D9, docs/plans/pipelines.md). `server.ts`'s route
+ * already 409s a direct step-delete request before ever reaching here; this
+ * is defense in depth against any other internal caller making the same
+ * mistake. A pipeline PARENT task (`pipelineId` set) instead cascades —
+ * every step task is deleted first, best-effort, before the parent's own
+ * teardown below.
  */
-export async function deleteTask(taskId: string): Promise<void> {
+export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean }): Promise<void> {
   const task = tasks.get(taskId);
   if (!task) return;
+  if (task.pipelineParentId && !opts?.fromPipeline) {
+    console.warn(`[agetor] refusing to delete pipeline step task ${taskId} directly — delete the pipeline task ${task.pipelineParentId} instead`);
+    return;
+  }
+  if (task.pipelineId) {
+    await cascadePipelineDelete(taskId);
+  }
   if (task.runId && active.has(task.runId)) active.get(task.runId)?.kill();
   // Resolve any pending interactions for this task so hook scripts / MCP
   // children blocked on agetor unblock immediately. Done before dropSession
@@ -5889,7 +6040,10 @@ export async function deleteTask(taskId: string): Promise<void> {
     else if (deleteKind === "cursor") await dropCursorSession(taskId);
     else if (deleteKind === "gemini") await dropGeminiSession(taskId);
     else if (deleteKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
-    await removeWorktree(task);
+    // A step task's worktree is the shared parent's (D2) — never remove it
+    // out from under the parent (or any sibling step) just because one step
+    // row is being deleted as part of the parent's own cascade.
+    if (!task.pipelineParentId) await removeWorktree(task);
   });
   // Refs are otherwise path-only — agetor never copies anything to disk for
   // them — except the per-task issue-thread snapshot directory (written by
@@ -5932,6 +6086,11 @@ export function sweepArchivedTeardowns(): number {
   let enqueued = 0;
   for (const task of tasks.list()) {
     if (task.archivedAt == null) continue;
+    // A step task's `worktreePath` is a copy of its pipeline parent's — the
+    // parent's own row (also archived, also swept by this same loop) is
+    // what actually owns and tears it down; enqueuing a redundant no-op job
+    // per step just adds queue churn.
+    if (task.pipelineParentId) continue;
     if (!task.worktreePath) continue;
     if (!existsSync(task.worktreePath)) continue;
     // Defensive: an archived task shouldn't have a live run (archiveTask

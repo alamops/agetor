@@ -21,12 +21,15 @@ import {
   savedPrompts,
   agentProfiles,
   AgentProfileNameError,
+  pipelines,
+  PipelineNameError,
   dataDir,
   clampWindowByBytes,
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
@@ -180,6 +183,7 @@ import {
   EVENTS_REPLAY_LIMIT,
   EVENTS_REPLAY_MAX_BYTES,
   MIN_REPLAY_EVENTS,
+  PIPELINE_LIMITS,
   TASK_EVENTS_REPLAY_META_EVENT,
   TASK_TYPES,
   supportedEfforts,
@@ -197,6 +201,9 @@ import type {
   GitHubReactionContent,
   GitHubReactionSubject,
   GlobalEvent,
+  Handoff,
+  Pipeline,
+  PipelineInput,
   RunEvent,
   Task,
   TaskEventsReplayMeta,
@@ -207,6 +214,7 @@ import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guar
 import { consumePendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
+import { validatePipelineGraph } from "../shared/pipeline.ts";
 import type { AgentProfilePatch } from "./db.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
@@ -572,6 +580,41 @@ function withTaskCount(p: AgentProfile): AgentProfile {
 function withTaskCounts(list: AgentProfile[]): AgentProfile[] {
   const counts = agentProfiles.taskCounts();
   return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
+}
+
+/**
+ * Stamp a {@link Pipeline}'s server-derived `taskCount` (docs/plans/
+ * pipelines.md §3 routes table) — number of parent pipeline tasks currently
+ * bound to it (`tasks.pipeline_id = this.id`, every column including
+ * archived). Exact analog of `withTaskCount`/`withTaskCounts` above:
+ * `withPipelineTaskCount` does a single targeted `pipelines.taskCount` query
+ * for the single-resource GET/POST/PATCH `/pipelines/:id` responses;
+ * `withPipelineTaskCounts` uses one grouped `pipelines.taskCounts()` map so
+ * `GET /pipelines` never issues N queries for N pipelines.
+ */
+function withPipelineTaskCount(p: Pipeline): Pipeline {
+  return { ...p, taskCount: pipelines.taskCount(p.id) };
+}
+function withPipelineTaskCounts(list: Pipeline[]): Pipeline[] {
+  const counts = pipelines.taskCounts();
+  return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
+}
+
+/**
+ * Validate + normalize the `POST /pipelines` / `PATCH /pipelines/:id` body's
+ * `maxSteps` field: omitted is fine (the db layer defaults it via
+ * `PIPELINE_LIMITS.maxStepsDefault`), otherwise it must be an integer in
+ * `1..PIPELINE_LIMITS.maxStepsMax`. Returns `undefined` (meaning "omit the
+ * key") when the field wasn't present at all, so a PATCH that doesn't
+ * mention `maxSteps` leaves it untouched.
+ */
+function parsePipelineMaxSteps(body: Record<string, unknown>): { value: number | undefined } | { error: string } {
+  if (body.maxSteps === undefined) return { value: undefined };
+  const m = body.maxSteps;
+  if (typeof m !== "number" || !Number.isInteger(m) || m < 1 || m > PIPELINE_LIMITS.maxStepsMax) {
+    return { error: `maxSteps must be an integer between 1 and ${PIPELINE_LIMITS.maxStepsMax}` };
+  }
+  return { value: m };
 }
 
 /**
@@ -3617,6 +3660,147 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Named, reusable step graphs (docs/plans/pipelines.md §3) — the
+      // templates a pipeline task is launched from via `POST /tasks`'s
+      // `pipelineId`. Validation style mirrors `/agent-profiles*` above:
+      // `graph` is checked here with the SAME `validatePipelineGraph` the db
+      // layer (`pipelines.insert`/`update`) re-validates with, so a bad graph
+      // always 400s with the parser's own message rather than a generic db
+      // error; a name clash surfaces as 409 via `PipelineNameError`.
+      "/pipelines": {
+        GET: authed((req) => json(withPipelineTaskCounts(pipelines.list()), { headers: corsHeaders(req) })),
+        POST: authed(async (req) => {
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+
+          const name = typeof body.name === "string" ? body.name.trim() : "";
+          if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+          if (name.length > PIPELINE_LIMITS.name) {
+            return json(
+              { error: `pipeline name must be ${PIPELINE_LIMITS.name} characters or fewer` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+
+          const description = typeof body.description === "string" ? body.description : "";
+          if (description.length > PIPELINE_LIMITS.description) {
+            return json(
+              { error: `pipeline description must be ${PIPELINE_LIMITS.description} characters or fewer` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+
+          const graphResult = validatePipelineGraph(body.graph);
+          if (!graphResult.ok) {
+            return json({ error: graphResult.error }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          const maxStepsResult = parsePipelineMaxSteps(body);
+          if ("error" in maxStepsResult) {
+            return json({ error: maxStepsResult.error }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          try {
+            const input: PipelineInput = {
+              name,
+              description,
+              graph: graphResult.graph,
+              ...(maxStepsResult.value !== undefined ? { maxSteps: maxStepsResult.value } : {}),
+            };
+            const created = pipelines.insert(input);
+            return json(withPipelineTaskCount(created), { status: 201, headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof PipelineNameError) {
+              return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+      },
+
+      "/pipelines/:id": {
+        GET: authed((req) => {
+          const p = pipelines.get(req.params.id);
+          return p
+            ? json(withPipelineTaskCount(p), { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PATCH: authed(async (req) => {
+          const current = pipelines.get(req.params.id);
+          if (!current) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+          const patch: Partial<PipelineInput> = {};
+
+          if ("name" in body) {
+            const name = typeof body.name === "string" ? body.name.trim() : "";
+            if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+            if (name.length > PIPELINE_LIMITS.name) {
+              return json(
+                { error: `pipeline name must be ${PIPELINE_LIMITS.name} characters or fewer` },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            patch.name = name;
+          }
+          if ("description" in body) {
+            const description = typeof body.description === "string" ? body.description : "";
+            if (description.length > PIPELINE_LIMITS.description) {
+              return json(
+                { error: `pipeline description must be ${PIPELINE_LIMITS.description} characters or fewer` },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            patch.description = description;
+          }
+          if ("graph" in body) {
+            const graphResult = validatePipelineGraph(body.graph);
+            if (!graphResult.ok) {
+              return json({ error: graphResult.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.graph = graphResult.graph;
+          }
+          if ("maxSteps" in body) {
+            const maxStepsResult = parsePipelineMaxSteps(body);
+            if ("error" in maxStepsResult) {
+              return json({ error: maxStepsResult.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (maxStepsResult.value !== undefined) patch.maxSteps = maxStepsResult.value;
+          }
+
+          try {
+            const updated = pipelines.update(req.params.id, patch);
+            return updated
+              ? json(withPipelineTaskCount(updated), { headers: corsHeaders(req) })
+              : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof PipelineNameError) {
+              return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+        DELETE: authed((req) => {
+          // Deleting a pipeline always succeeds — a parent task already
+          // launched from it keeps its own frozen `pipelineRun.snapshot`
+          // (D8, docs/plans/pipelines.md), so there's nothing to guard
+          // against the way `/harnesses/:id` DELETE must guard against
+          // in-use harnesses/profiles.
+          const removed = pipelines.delete(req.params.id);
+          return removed
+            ? json({ ok: true }, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
       // Blast-radius probe for the disable-confirmation UI. Returns the
       // running task ids (so we can warn "N tasks are still using this")
       // plus the total task count for context.
@@ -3921,6 +4105,18 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           ) {
             return json({ error: "agentProfileId must be a string" }, { status: 400, headers: corsHeaders(req) });
           }
+          // Additive pipeline binding (docs/plans/pipelines.md D1/T4):
+          // `pipelineId` is tri-state (undefined = no pipeline, null = no
+          // pipeline, or a string id) — this route only checks the wire
+          // shape; `createTask` resolves the id (400 on unknown) and rejects
+          // the combination with `agentProfileId` (400) itself.
+          if (
+            body.pipelineId !== undefined &&
+            body.pipelineId !== null &&
+            typeof body.pipelineId !== "string"
+          ) {
+            return json({ error: "pipelineId must be a string" }, { status: 400, headers: corsHeaders(req) });
+          }
           if (body.issueSnapshot !== undefined) {
             if (typeof body.issueSnapshot !== "string") {
               return json({ error: "issueSnapshot must be a string" }, { status: 400, headers: corsHeaders(req) });
@@ -3987,6 +4183,19 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             );
           }
           const patch = filterPatch(await req.json());
+          // A pipeline step task's `column` is managed entirely by the
+          // pipeline runner (D9, docs/plans/pipelines.md) — it flips as the
+          // step's own run settles, and letting a direct PATCH drag it to a
+          // different column would desync the parent's `pipelineRun` state
+          // from what the board actually shows. Every OTHER field
+          // (title/prompt/etc.) stays patchable on a step task exactly like
+          // any other task — RunPanel edits it unchanged (D1).
+          if (isPipelineStepTask(before) && "column" in patch) {
+            return json(
+              { error: "step task's column is managed by its pipeline" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
           // A task bound to an agent profile (docs/plans/agent-profiles.md
           // D5) has its agent/mode/model/effort/fast/maxMode locked — the
           // profile owns those six fields, and the only sanctioned way to
@@ -4107,6 +4316,18 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return json(withRunningSubagents(updated), { headers: corsHeaders(req) });
         }),
         DELETE: authed(async (req) => {
+          // A pipeline step task can't be deleted on its own — the parent
+          // owns its lifecycle (D9, docs/plans/pipelines.md) and its
+          // teardown is what removes the shared worktree; deleting a step
+          // out from under a running pipeline would strand the parent's
+          // `pipelineRun` state. Delete/archive the pipeline task instead.
+          const existing = tasks.get(req.params.id);
+          if (existing && isPipelineStepTask(existing)) {
+            return json(
+              { error: "step task belongs to a pipeline — act on the pipeline task" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
           // Worktree teardown (`git worktree remove` + branch delete, with an
           // rm -rf fallback) can exceed even the 255s idleTimeout ceiling on
           // large repos — opt this request out of idle timeout entirely.
@@ -4128,6 +4349,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/archive": {
         POST: authed(async (req) => {
+          // Same pipeline-step guard as DELETE /tasks/:id above — a step
+          // task's archive/unarchive lifecycle is owned by its pipeline
+          // parent (D9, docs/plans/pipelines.md).
+          const existing = tasks.get(req.params.id);
+          if (existing && isPipelineStepTask(existing)) {
+            return json(
+              { error: "step task belongs to a pipeline — act on the pipeline task" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
           // Worktree teardown can now be awaited inline (`awaitTeardown`)
           // behind a real `git worktree remove`, which — like DELETE
           // /tasks/:id — can exceed the idle timeout ceiling on large repos.
@@ -4173,6 +4404,111 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const result = await unarchiveTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // A pipeline task's parent + its hidden step tasks, enriched the same
+      // way `GET /tasks`/`GET /tasks/:id` are (`withRunningSubagents`), so
+      // the run view can render step nodes with the same "N background
+      // agents"/stalled-since decorations any other task card would show.
+      // 400s for a task that was never bound to a pipeline (`pipelineId`
+      // null) — the run view has no business asking for one.
+      "/tasks/:id/pipeline": {
+        GET: authed((req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (!task.pipelineId) {
+            return json({ error: "task is not a pipeline task" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const steps = tasks.stepsForParent(task.id);
+          return json(
+            { task: withRunningSubagents(task), steps: steps.map(withRunningSubagents) },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Pipeline-run control routes (docs/plans/pipelines.md §3/D9) — all
+      // three delegate to `./pipeline-runner.ts`, which owns every rule
+      // about when an advance/retry/cancel is legal for the parent's current
+      // `pipelineRun.status` and returns the HTTP status to use on failure
+      // (400 bad request, 404 unknown parent, 409 wrong state) alongside the
+      // message, so this route layer only needs to translate that shape.
+      "/tasks/:id/pipeline/advance": {
+        POST: authed(async (req) => {
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+
+          if (!("nextStepIds" in body)) {
+            return json({ error: "nextStepIds required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          let nextStepIds: string[] | null;
+          if (body.nextStepIds === null) {
+            nextStepIds = null;
+          } else if (Array.isArray(body.nextStepIds) && body.nextStepIds.every((s) => typeof s === "string")) {
+            nextStepIds = body.nextStepIds as string[];
+          } else {
+            return json(
+              { error: "nextStepIds must be an array of strings or null" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+
+          let handoff: Partial<Handoff> | undefined;
+          if (body.handoff !== undefined) {
+            if (!body.handoff || typeof body.handoff !== "object" || Array.isArray(body.handoff)) {
+              return json({ error: "handoff must be an object" }, { status: 400, headers: corsHeaders(req) });
+            }
+            handoff = body.handoff as Partial<Handoff>;
+          }
+
+          let fromTaskId: string | undefined;
+          if (body.fromTaskId !== undefined) {
+            if (typeof body.fromTaskId !== "string") {
+              return json({ error: "fromTaskId must be a string" }, { status: 400, headers: corsHeaders(req) });
+            }
+            fromTaskId = body.fromTaskId;
+          }
+
+          const result = await advancePipeline(req.params.id, { nextStepIds, handoff, fromTaskId });
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/pipeline/retry": {
+        POST: authed(async (req) => {
+          const raw = await req.json().catch(() => ({}));
+          const body =
+            raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+
+          let taskId: string | undefined;
+          if (body.taskId !== undefined) {
+            if (typeof body.taskId !== "string") {
+              return json({ error: "taskId must be a string" }, { status: 400, headers: corsHeaders(req) });
+            }
+            taskId = body.taskId;
+          }
+
+          const result = await retryPipelineStep(req.params.id, { taskId });
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/pipeline/cancel": {
+        POST: authed(async (req) => {
+          const result = await cancelPipelineRun(req.params.id);
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },

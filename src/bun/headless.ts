@@ -2,6 +2,7 @@ import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN } from "./api-config.ts";
 import { db, dataDir, subagents } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import { initPipelineRunner } from "./pipeline-runner.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -138,6 +139,10 @@ export async function runDaemon(): Promise<void> {
   // run first — leaving every session that server ever hosts un-disclaimed
   // too.
   await ensureDisclaimedServer();
+  // Same ordering as index.ts's desktop boot path: wire the pipeline runner
+  // to the global lifecycle stream before reconcileOrphans() so a step
+  // task's boot-time orphan→ready transition reaches it too.
+  initPipelineRunner();
   await reconcileOrphans();
   // Re-arm in-memory auto-resume timers for every fx task still carrying a
   // pending schedule — same rationale as index.ts's desktop boot path (see

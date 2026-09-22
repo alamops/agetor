@@ -4,6 +4,7 @@ import { c, out, printJson } from "../output.ts";
 import { usageError } from "../usage.ts";
 import { ApiError, type AgetorClient } from "../api-client.ts";
 import { AGENT_OPTIONS, defaultModeFor, type AgentKind, type Run, type Task } from "../../shared/types.ts";
+import { pipelineStepProgress, stepNameById } from "../../shared/pipeline.ts";
 
 export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -30,6 +31,20 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   if (task.agentProfile) {
     const deletedSuffix = await agentProfileDeletedSuffix(client, task);
     out(`  ${label("profile")} ${task.agentProfile.name} (${task.agentProfile.id})${deletedSuffix}`);
+  }
+  if (task.pipelineId && task.pipelineRun) {
+    const progress = pipelineStepProgress(task.pipelineRun);
+    out(
+      `  ${label("pipeline")} ${task.pipelineRun.pipelineName} (${task.pipelineId})` +
+        `   ${label("status")} ${colorColumn(task.pipelineRun.status)}   ${label("steps")} ${progress.label}`,
+    );
+    for (const b of task.pipelineRun.blocked) {
+      out(c.yellow(`    ⚠ ${b.message}`));
+    }
+  }
+  if (task.pipelineParentId) {
+    const stepOf = await pipelineStepOfText(client, task);
+    if (stepOf) out(`  ${label("step of")} ${stepOf}`);
   }
   out(`  ${label("prompt")} ${c.dim(truncate(task.prompt, 240))}`);
   if (pending.length > 0) {
@@ -96,6 +111,30 @@ async function agentProfileDeletedSuffix(client: AgetorClient, task: Task): Prom
   } catch (e) {
     if (e instanceof ApiError && e.status === 404) return c.dim(" (deleted)");
     return "";
+  }
+}
+
+/**
+ * `"<parent title> (<parent id>) · step <step name>"` for a hidden pipeline
+ * step task (`task.pipelineParentId` set) — resolved via `GET /tasks/:id/
+ * pipeline` (`getPipelineRun`) on the parent id, which both confirms the
+ * parent is actually a pipeline task and returns its `pipelineRun.snapshot`
+ * graph (frozen at first Run) to resolve the step's display name from
+ * `task.pipelineStepId`. Falls back to the step task's own title when the
+ * snapshot or step id isn't available (e.g. an old run predating the
+ * snapshot), and returns null — rather than failing the whole `show` — on
+ * any lookup error, mirroring `agentProfileDeletedSuffix`'s swallow-and-
+ * degrade treatment of a flaky/absent related-record fetch.
+ */
+async function pipelineStepOfText(client: AgetorClient, task: Task): Promise<string | null> {
+  if (!task.pipelineParentId) return null;
+  try {
+    const { task: parent } = await client.getPipelineRun(task.pipelineParentId);
+    const graph = parent.pipelineRun?.snapshot?.graph;
+    const stepName = graph && task.pipelineStepId ? stepNameById(graph, task.pipelineStepId) : task.title;
+    return `${parent.title} (${parent.id}) · step ${stepName}`;
+  } catch {
+    return null;
   }
 }
 

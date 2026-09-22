@@ -14,6 +14,8 @@ import type {
   AgentKind,
   AgentProfile,
   BranchInfo,
+  Pipeline,
+  PipelineInput,
   TaskReference,
   TaskDiff,
   TaskGitStatus,
@@ -335,6 +337,48 @@ export class AgetorClient {
     return this.req("DELETE", `/tasks/${encodeURIComponent(taskId)}/agent-profile`);
   }
 
+  // ── pipelines ────────────────────────────────────────────────────────────
+  /** `GET /pipelines` — every pipeline, name ASC, with `taskCount`. */
+  listPipelines(): Promise<Pipeline[]> {
+    return this.req("GET", "/pipelines");
+  }
+  /** `GET /pipelines/:id` — 404 propagates as a thrown `ApiError`. */
+  getPipeline(id: string): Promise<Pipeline> {
+    return this.req("GET", `/pipelines/${encodeURIComponent(id)}`);
+  }
+  /** `POST /pipelines` — 400 invalid graph/limits, 409 duplicate
+   *  (case-insensitive, trimmed) name; both propagate as a thrown `ApiError`. */
+  createPipeline(input: PipelineInput): Promise<Pipeline> {
+    return this.req("POST", "/pipelines", input);
+  }
+  /** `PATCH /pipelines/:id` — same validation as create (partial body). */
+  updatePipeline(id: string, patch: Partial<PipelineInput>): Promise<Pipeline> {
+    return this.req("PATCH", `/pipelines/${encodeURIComponent(id)}`, patch);
+  }
+  /** `DELETE /pipelines/:id` — never blocked; tasks already launched from it
+   *  keep their frozen run snapshot. */
+  deletePipeline(id: string): Promise<void> {
+    return this.req("DELETE", `/pipelines/${encodeURIComponent(id)}`);
+  }
+  /** `GET /tasks/:id/pipeline` — `id` is a pipeline (parent) task's id; 404
+   *  unknown task, 400 the task isn't a pipeline task. Returns the parent
+   *  task (with its live `pipelineRun`) plus every hidden step task
+   *  (`pipelineParentId === id`) it has launched so far. */
+  getPipelineRun(taskId: string): Promise<{ task: Task; steps: Task[] }> {
+    return this.req("GET", `/tasks/${encodeURIComponent(taskId)}/pipeline`);
+  }
+  /** `POST /tasks/:id/pipeline/retry` — retry the current blocked/cancelled
+   *  step execution. 409 unless the pipeline run is actually blocked or
+   *  cancelled. */
+  retryPipeline(taskId: string): Promise<Task> {
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/retry`);
+  }
+  /** `POST /tasks/:id/pipeline/cancel` — stop every active step execution
+   *  and return the pipeline task to `ready`. */
+  cancelPipeline(taskId: string): Promise<Task> {
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/cancel`);
+  }
+
   // ── preferences (cross-session key/value store) ────────────────────────────
   getPreferences(): Promise<Record<string, string>> {
     return this.req("GET", "/preferences");
@@ -418,6 +462,14 @@ export interface CreateTaskInput {
    *  --profile`) enforces that client-side before this ever reaches the
    *  wire. */
   agentProfileId?: string;
+  /** Id of a {@link Pipeline} to launch this task from (create-only) — the
+   *  server validates it, seeds the parent's idle `pipelineRun` state, and
+   *  sets the (cosmetic — the parent never itself spawns an agent) `agent`
+   *  field from the pipeline's start step's harness. 400 on an unknown id,
+   *  and 400 when combined with `agentProfileId` — mutually exclusive, and
+   *  the CLI (`agetor add --pipeline`) enforces that client-side before this
+   *  ever reaches the wire, mirroring `agentProfileId`'s own guard. */
+  pipelineId?: string;
 }
 
 /** Body shared by `POST /agent-profiles` and `PATCH /agent-profiles/:id`

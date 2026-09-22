@@ -4,7 +4,7 @@ import { USAGE, canonical, usageError, helpFor } from "./usage.ts";
 const COMMANDS = [
   "add", "ls", "ps", "show", "start", "send", "commit", "answer", "commands", "logs",
   "files", "cancel", "attach", "shell", "edit", "move", "archive", "unarchive", "diff", "rm",
-  "projects", "harness", "profile", "daemon", "info", "config",
+  "projects", "harness", "profile", "pipeline", "daemon", "info", "config",
 ];
 
 test("every dispatched command has a USAGE block whose first line is its usage line", () => {
@@ -61,4 +61,26 @@ test("helpFor resolves command, subcommand, alias, and falls back", () => {
   expect(helpFor("projects", "add")).toBe(USAGE["projects add"]);
   expect(helpFor(undefined, undefined)).toBeUndefined();
   expect(helpFor("frobnicate", undefined)).toBeUndefined();
+});
+
+// T7 (CLI parity for pipelines, docs/plans/pipelines.md §3/D14): 'pipeline' /
+// 'pipelines' mirror 'profile' / 'profiles''s alias + subcommand-block shape.
+test("pipeline: 'pipelines' aliases to 'pipeline', with export/import subcommand blocks", () => {
+  expect(canonical("pipelines")).toBe("pipeline");
+  expect(USAGE["pipeline"]).toBeDefined();
+  expect(USAGE["pipeline"]!.split("\n", 1)[0]).toBe(
+    "usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file>] | import <file> [--name <n>]>",
+  );
+  expect(helpFor("pipelines", "export")).toBe(USAGE["pipeline export"]);
+  expect(helpFor("pipeline", "import")).toBe(USAGE["pipeline import"]);
+  expect(helpFor("pipeline", "rm")).toBe(USAGE["pipeline"]); // unknown sub → command block
+  expect(usageError("pipeline").message).toBe(USAGE["pipeline"]!.split("\n", 1)[0]!);
+});
+
+// ls/add doc lines reference the new --steps / --pipeline flags — a plain
+// grep-style assertion so a future rewrite of either help block can't
+// silently drop the flag's mention.
+test("ls usage mentions --steps; add usage mentions --pipeline", () => {
+  expect(USAGE["ls"]).toContain("--steps");
+  expect(USAGE["add"]).toContain("--pipeline");
 });

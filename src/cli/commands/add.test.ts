@@ -7,8 +7,10 @@ import type {
   GitHubComment,
   GitHubIssueThreadResult,
   GitHubListItem,
+  Pipeline,
   Task,
 } from "../../shared/types.ts";
+import { newStep } from "../../shared/pipeline.ts";
 import { AGENT_OPTIONS, DEFAULT_MODEL, supportedEfforts } from "../../shared/types.ts";
 import type { DiscoveredModel } from "../../shared/model-options.ts";
 import { buildIssueTaskPrompt, issueTaskTitle, renderIssueThreadMarkdown } from "../../shared/issue-task.ts";
@@ -194,6 +196,42 @@ function makeProfileClient(profiles: AgentProfile[]) {
     client,
     createTaskCalls,
     getListAgentProfilesCalls: () => listAgentProfilesCalls,
+  };
+}
+
+function makePipeline(overrides: Partial<Pipeline> = {}): Pipeline {
+  return {
+    id: "pipe-1",
+    name: "Bug fix flow",
+    description: "",
+    graph: { steps: [newStep({ id: "s1", name: "Investigate" })], edges: [], startStepId: "s1" },
+    maxSteps: 25,
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  };
+}
+
+/** A fake `AgetorClient` for the `--pipeline` non-interactive `cmdAdd` path —
+ *  `listPipelines` (for `matchPipelineRef` resolution) plus `createTask`,
+ *  both with call recorders. Mirrors `makeProfileClient`. */
+function makePipelineClient(pipelines: Pipeline[]) {
+  const createTaskCalls: CreateTaskInput[] = [];
+  let listPipelinesCalls = 0;
+  const client = {
+    listPipelines: async () => {
+      listPipelinesCalls++;
+      return pipelines;
+    },
+    createTask: async (input: CreateTaskInput) => {
+      createTaskCalls.push(input);
+      return { id: "pipeline-task-id", title: input.title } as unknown as Task;
+    },
+  } as unknown as AgetorClient;
+  return {
+    client,
+    createTaskCalls,
+    getListPipelinesCalls: () => listPipelinesCalls,
   };
 }
 
@@ -892,6 +930,217 @@ describe("--profile", () => {
     expect(createTaskCalls.length).toBe(1);
     const input = createTaskCalls[0]!;
     expect(input.agentProfileId).toBe("abc-123");
+    expect(input.workdir).toBe("/tmp/acme-widgets");
+    expect(input.isolation).toBe("none");
+    expect(input.taskType).toBe("bug");
+  });
+});
+
+// ── --pipeline (docs/plans/pipelines.md §3 T7) ───────────────────────────
+//
+// `--pipeline <id|name>` launches a task from a saved Pipeline instead of a
+// single agent — the created task becomes the pipeline's parent (board)
+// task. `assertPipelineFlagCombo` (not exported — checked through cmdAdd's
+// thrown usage error) rejects combining it with `--profile` or any of the
+// six manual-launch fields; `baseInput` (not exported either) sends only
+// `pipelineId` and omits agentProfileId/agent/model/mode/effort/fast/
+// maxMode entirely when a pipeline id is present; ref resolution goes
+// through the already-unit-tested `matchPipelineRef`.
+
+describe("--pipeline", () => {
+  // ── parseAdd ───────────────────────────────────────────────────────────
+
+  test("parseAdd: --pipeline <ref> sets pipeline", () => {
+    const o = parseAdd(["--pipeline", "Bug fix flow"]);
+    expect(o.pipeline).toBe("Bug fix flow");
+  });
+
+  test("parseAdd: no --pipeline leaves pipeline undefined", () => {
+    const o = parseAdd(["--title", "T", "--prompt", "P"]);
+    expect(o.pipeline).toBeUndefined();
+  });
+
+  // ── assertPipelineFlagCombo, exercised through cmdAdd's thrown usage error ──
+
+  test("cmdAdd: --pipeline combined with --profile throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--pipeline", "Bug fix flow", "--profile", "Reviewer"], flags()),
+    ).rejects.toThrow(/--pipeline cannot be combined with --profile\/--agent\/--model\/--mode\/--effort\/--fast\/--max-mode/);
+  });
+
+  test("cmdAdd: --pipeline combined with --agent throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--pipeline", "Bug fix flow", "--agent", "codex"], flags()),
+    ).rejects.toThrow(/--pipeline cannot be combined/);
+  });
+
+  test("cmdAdd: --pipeline combined with --model throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--pipeline", "Bug fix flow", "--model", "gpt-6-astra"], flags()),
+    ).rejects.toThrow(/--pipeline cannot be combined/);
+  });
+
+  test("cmdAdd: --pipeline combined with --mode throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--pipeline", "Bug fix flow", "--mode", "auto"], flags()),
+    ).rejects.toThrow(/--pipeline cannot be combined/);
+  });
+
+  test("cmdAdd: --pipeline combined with --effort throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--pipeline", "Bug fix flow", "--effort", "high"], flags()),
+    ).rejects.toThrow(/--pipeline cannot be combined/);
+  });
+
+  test("cmdAdd: --pipeline combined with --fast throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--pipeline", "Bug fix flow", "--fast"], flags())).rejects.toThrow(
+      /--pipeline cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --pipeline combined with --no-fast throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--pipeline", "Bug fix flow", "--no-fast"], flags())).rejects.toThrow(
+      /--pipeline cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --pipeline combined with --max-mode throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--pipeline", "Bug fix flow", "--max-mode"], flags())).rejects.toThrow(
+      /--pipeline cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --pipeline combined with --no-max-mode throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--pipeline", "Bug fix flow", "--no-max-mode"], flags())).rejects.toThrow(
+      /--pipeline cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --pipeline alone (no conflicting flags) passes the combo guard and proceeds to resolve it", async () => {
+    reset();
+    const { client, createTaskCalls } = makePipelineClient([makePipeline()]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--pipeline", "Bug fix flow"], flags());
+
+    // Reaching createTask at all proves the combo guard didn't throw.
+    expect(createTaskCalls.length).toBe(1);
+  });
+
+  // ── ref resolution (matchPipelineRef, already unit-tested elsewhere — one
+  // integration-style assertion each for id and name is enough here) ──────
+
+  test("cmdAdd: --pipeline resolves by exact id", async () => {
+    reset();
+    const pipeline = makePipeline({ id: "abc-123", name: "Bug fix flow" });
+    const { client, createTaskCalls } = makePipelineClient([pipeline]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--pipeline", "abc-123"], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.pipelineId).toBe("abc-123");
+  });
+
+  test("cmdAdd: --pipeline resolves by case-insensitive, trimmed name", async () => {
+    reset();
+    const pipeline = makePipeline({ id: "abc-123", name: "Bug fix flow" });
+    const { client, createTaskCalls } = makePipelineClient([pipeline]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--pipeline", "  BUG FIX FLOW  "], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.pipelineId).toBe("abc-123");
+  });
+
+  test("cmdAdd: --pipeline with an unknown ref throws, never calling createTask", async () => {
+    reset();
+    const { client, createTaskCalls } = makePipelineClient([makePipeline({ name: "Bug fix flow" })]);
+    currentClient = client;
+
+    await expect(
+      cmdAdd(["--title", "T", "--prompt", "P", "--pipeline", "does-not-exist"], flags()),
+    ).rejects.toThrow(/unknown pipeline "does-not-exist"/);
+
+    expect(createTaskCalls.length).toBe(0);
+  });
+
+  test("cmdAdd: --pipeline with an ambiguous name throws, never calling createTask", async () => {
+    reset();
+    const { client, createTaskCalls } = makePipelineClient([
+      makePipeline({ id: "a", name: "Bug fix flow" }),
+      makePipeline({ id: "b", name: "Bug fix flow" }),
+    ]);
+    currentClient = client;
+
+    await expect(
+      cmdAdd(["--title", "T", "--prompt", "P", "--pipeline", "Bug fix flow"], flags()),
+    ).rejects.toThrow(/ambiguous pipeline "Bug fix flow"/);
+
+    expect(createTaskCalls.length).toBe(0);
+  });
+
+  // ── baseInput's pipeline branch: pipelineId replaces the whole manual
+  // agent/model/mode/effort/fast/maxMode AND agentProfileId block ─────────
+
+  test("cmdAdd: a --pipeline task carries pipelineId and omits agentProfileId/agent/model/mode/effort/fast/maxMode entirely", async () => {
+    reset();
+    const { client, createTaskCalls } = makePipelineClient([makePipeline({ id: "abc-123", name: "Bug fix flow" })]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--pipeline", "Bug fix flow"], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    const input = createTaskCalls[0]!;
+    expect(input.pipelineId).toBe("abc-123");
+    expect(input.agentProfileId).toBeUndefined();
+    expect(input.agent).toBeUndefined();
+    expect(input.model).toBeUndefined();
+    expect(input.effort).toBeUndefined();
+    expect(input.fast).toBeUndefined();
+    expect(input.maxMode).toBeUndefined();
+    // Also proves the non-interactive mode-fill fallback is skipped for a
+    // pipeline add (`if (!o.mode && !o.profile && !o.pipeline) …`), same as
+    // for --profile — the pipeline supplies mode server-side (per step).
+    expect(input.mode).toBeUndefined();
+  });
+
+  test("cmdAdd: --pipeline still carries workdir/isolation/baseRef/taskType/references through baseInput normally", async () => {
+    reset();
+    const { client, createTaskCalls } = makePipelineClient([makePipeline({ id: "abc-123", name: "Bug fix flow" })]);
+    currentClient = client;
+
+    await cmdAdd(
+      [
+        "--title",
+        "T",
+        "--prompt",
+        "P",
+        "--pipeline",
+        "Bug fix flow",
+        "--workdir",
+        "/tmp/acme-widgets",
+        "--isolation",
+        "none",
+        "--type",
+        "bug",
+      ],
+      flags(),
+    );
+
+    expect(createTaskCalls.length).toBe(1);
+    const input = createTaskCalls[0]!;
+    expect(input.pipelineId).toBe("abc-123");
     expect(input.workdir).toBe("/tmp/acme-widgets");
     expect(input.isolation).toBe("none");
     expect(input.taskType).toBe("bug");

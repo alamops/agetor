@@ -10,6 +10,7 @@ import {
   parseFxRecoveryPayload,
 } from "../../shared/fx-recovery.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
+import { pipelineStepProgress } from "../../shared/pipeline.ts";
 import {
   parseSentFilesToolUse,
   parseSentFilesToolResult,
@@ -50,7 +51,12 @@ export function Dashboard({
   const sorted = useMemo(
     () =>
       tasks
-        .filter((t) => t.archivedAt == null)
+        // `GET /tasks` also returns hidden pipeline step tasks
+        // (`pipelineParentId` set) — docs/plans/pipelines.md D11 — hidden
+        // from the TUI dashboard by default, same as the board and `agetor
+        // ls`, since they're an implementation detail of the pipeline's
+        // parent task.
+        .filter((t) => t.archivedAt == null && t.pipelineParentId == null)
         .sort((a, b) => COLUMN_ORDER.indexOf(a.column) - COLUMN_ORDER.indexOf(b.column)),
     [tasks],
   );
@@ -472,6 +478,19 @@ const TaskRow = memo(function TaskRow({
       ? `⏸ auto-resume ${fxAutoResumeCountdownText(autoResume.at, now)}`
       : "⏸ paused (r)"
     : null;
+  // Pipeline (parent) progress hint — docs/plans/pipelines.md D11/T7,
+  // mirrors `agetor ls`'s "needs" column (`ls.ts`'s `needsCell`): `»
+  // <completed>/<total> · <active step name>`. `»` (U+00BB, a single-width
+  // ASCII-range glyph) is used instead of the plan's suggested "⛓" on
+  // purpose — this row already carries the double-width-glyph accounting
+  // documented above for `pauseText`'s "⏸", and a second double-width glyph
+  // sharing the same budget arithmetic would either need its own `+1` or
+  // risk the same one-cell truncation bug if a future edit forgot it; a
+  // plain-width marker sidesteps the whole class of bug. Shown for any
+  // pipeline task (not just a blocked one — unlike `ls.ts`'s "needs" cell,
+  // which only surfaces on `blocked` to keep that shared cell uncluttered)
+  // since this is this row's ONLY place pipeline progress renders at all.
+  const pipelineText = task.pipelineId && task.pipelineRun ? `» ${pipelineStepProgress(task.pipelineRun).label}` : null;
   // Budget the title so the row can never need to wrap, even if a glyph renders
   // a cell wider than measured in some terminal. The fixed prefix is the marker
   // (2) + glyph (1) + " <id> " (id length + 2); the badge is " !N"; the pause
@@ -484,12 +503,15 @@ const TaskRow = memo(function TaskRow({
   // and Ink's own (wcwidth-aware) truncation would then shear a column off
   // whatever renders last — the countdown text itself (e.g. "⏸ auto-resume
   // 1:5" missing its final digit) — rather than the title. The flat `+ 1`
-  // below accounts for that one double-width glyph.
+  // below accounts for that one double-width glyph. `pipelineText` needs no
+  // such `+1` (its "»" marker is single-width) and now sits between the
+  // needs badge and the pause hint, so it must be budgeted too.
   const inner = width - 4; // border (2) + paddingX (2)
   const prefixW = 2 + 1 + (id.length + 2);
   const badgeW = needs > 0 ? String(needs).length + 2 : 0;
+  const pipelineW = pipelineText ? pipelineText.length + 3 : 0;
   const pauseW = pauseText ? pauseText.length + 3 + 1 : 0;
-  const titleMax = Math.max(6, inner - prefixW - badgeW - pauseW);
+  const titleMax = Math.max(6, inner - prefixW - badgeW - pipelineW - pauseW);
   return (
     <Text wrap="truncate">
       <Text color="cyan">{active ? "▸ " : "  "}</Text>
@@ -497,6 +519,7 @@ const TaskRow = memo(function TaskRow({
       <Text dimColor> {id} </Text>
       <Text bold={active}>{truncate(task.title, titleMax)}</Text>
       {needs > 0 ? <Text color="yellow"> !{needs}</Text> : null}
+      {pipelineText ? <Text color="magenta"> · {pipelineText}</Text> : null}
       {pauseText ? <Text color="yellow"> · {pauseText}</Text> : null}
     </Text>
   );
