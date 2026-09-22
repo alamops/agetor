@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
 import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import {
   AlertTriangle,
@@ -21,6 +22,7 @@ import {
   Square,
   TimerOff,
   Trash2,
+  Workflow,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -42,6 +44,8 @@ import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortc
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { useAgentProfiles } from "@/lib/agent-profiles";
+import { usePipelines } from "@/lib/pipelines";
+import { PipelineEditor, PipelinesPage, PipelineRunView } from "@/components/pipelines";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { FontSizeProvider, useFontSize } from "@/components/font-size-provider";
 import { ThemeProvider, useTheme } from "@/components/theme-provider";
@@ -133,6 +137,7 @@ const EMPTY_COLUMN_HINT: Partial<Record<ColumnId, string>> = {
  *  as a type error here instead of rendering an icon-less menu item. */
 const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
   open: FolderOpen,
+  "open-pipeline": Workflow,
   start: Play,
   stop: Square,
   "resume-recovery": PlayCircle,
@@ -150,6 +155,21 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
   "copy-worktree-path": Copy,
   delete: Trash2,
 };
+
+/**
+ * Full-page view state (D5, `docs/plans/pipelines.md`) — the first true
+ * page-swap in the app. `board` is today's kanban board; `pipelines` is the
+ * pipelines list (`pipelineId: null`) or the canvas editor for one pipeline
+ * (`editing: true`, `pipelineId` the pipeline being edited or `null` for a
+ * blank draft); `pipeline-run` is the full-page live run view for one
+ * pipeline TASK (`taskId`, not a pipeline id). The header/NewTaskForm/
+ * dialogs/RunPanel/context menu stay mounted regardless of `view` — only
+ * `<main>`'s board-vs-page content swaps.
+ */
+type AppView =
+  | { kind: "board" }
+  | { kind: "pipelines"; pipelineId: string | null; editing: boolean }
+  | { kind: "pipeline-run"; taskId: string };
 
 /**
  * The actual app tree. Split out from the default-exported `App` so it can
@@ -185,6 +205,21 @@ function AppInner() {
   // below) — no polling here, the Bun-side poller drives freshness.
   const [usage, setUsage] = useState<Record<string, HarnessQuota>>({});
   const [selected, setSelected] = useState<Task | null>(null);
+  // Full-page view — see `AppView`'s doc comment above. Module-cached
+  // pipelines list (mirrors `useAgentProfiles`) shared with the New Task
+  // form, the header button's badge-free trigger, and every page view below
+  // — one `GET /pipelines` fetch backs all of them.
+  const [view, setView] = useState<AppView>({ kind: "board" });
+  const { pipelines, refresh: refreshPipelines } = usePipelines();
+  /** Switch the app-level `view` to a pipeline TASK's live run view — the
+   *  card-open / context-menu / RunPanel-strip destination for a pipeline
+   *  parent task (D5/D7, `docs/plans/pipelines.md`). Declared this early
+   *  (rather than beside its sibling `openPipelinesPage`/`openTask`
+   *  further down) because the app-wide global-events subscription effect
+   *  below reads it. */
+  const openPipelineRun = useCallback((taskId: string) => {
+    setView({ kind: "pipeline-run", taskId });
+  }, []);
   const [diffTask, setDiffTask] = useState<Task | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -735,6 +770,29 @@ function AppInner() {
     return () => document.removeEventListener("keydown", onKey);
   }, []);
 
+  // Escape returns a full-page view (pipelines list / pipeline run view) to
+  // the board (D5, `docs/plans/pipelines.md`) — only when no dialog/popover/
+  // RunPanel outranks it, same layer-precedence selector RunPanel's own
+  // Cmd/Ctrl+F handler uses (`data-quote-open`/`data-search-open` included).
+  // The pipeline EDITOR is deliberately excluded: it has its own unsaved-
+  // changes guard on Back (`handleBack` in PipelineEditor.tsx) and exposes
+  // no imperative "ask first" hook this effect could call instead of
+  // `setView` directly — driving Escape straight to `setView` here would
+  // silently discard an in-progress edit. The editor still handles its own
+  // Escape-deselect (clicking off a selected node) internally.
+  useEffect(() => {
+    if (view.kind === "board") return;
+    if (view.kind === "pipelines" && view.editing) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (selectedIdRef.current !== null) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open], [data-search-open]')) return;
+      setView({ kind: "board" });
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [view]);
+
   // Confirm-on-quit. The main process emits `quit_request` over the app
   // SSE channel when Cmd+Q / window close lands while runs are active. We
   // surface a modal explaining tasks will keep running detached; on "Quit
@@ -836,7 +894,16 @@ function AppInner() {
       const subtitle = task?.agent;
       const onOpen = () => {
         const fresh = tasksRef.current.find((t) => t.id === ev.taskId);
-        if (fresh) setSelected(fresh);
+        if (fresh) {
+          // A pipeline PARENT task opens the full-page run view instead of
+          // the run panel (D5, `docs/plans/pipelines.md`), same as a board
+          // card click — see `openTask`.
+          if (fresh.pipelineId) {
+            openPipelineRun(fresh.id);
+          } else {
+            setSelected(fresh);
+          }
+        }
         // Best-effort: bring the agetor window forward when the user clicks
         // through from a toast. Unlike the open_task handler above, nothing
         // else focuses the window on this path — a WKWebView's own
@@ -931,10 +998,21 @@ function AppInner() {
         }
         return;
       }
-      // Pipeline run-state changes ride their own kind; the run view
-      // subscribes to them itself (wave 3), and the parent's column still
-      // arrives as a normal `column` event below — nothing to toast here.
-      if (ev.kind === "pipeline") return;
+      // Pipeline run-state changes ride their own kind (D12,
+      // `docs/plans/pipelines.md`) — no toast here (the parent's own column
+      // still arrives as a normal `column` event below, handled there) and
+      // no optimistic patch, since the event only carries a status/active-
+      // step-ids summary, not the full `PipelineRunState` the board's
+      // `PipelineBadge` and an open run view need. Refetch just the parent
+      // task so both reflect the change at sub-poll latency; a failed
+      // refetch just leaves the 2s `/tasks` poll as the fallback (same
+      // degrade-gracefully posture as `refresh()` elsewhere in this file).
+      if (ev.kind === "pipeline") {
+        void api.getTask(ev.taskId)
+          .then((fresh) => setTasks((cur) => cur.map((t) => (t.id === fresh.id ? fresh : t))))
+          .catch(() => { /* 2s poll catches up */ });
+        return;
+      }
       // column transitions. Patch `tasks` optimistically so the board and any
       // open run panel (via the selected-sync effect) reflect the new column
       // the instant the backend pushes it — rather than waiting up to 2s for
@@ -944,13 +1022,20 @@ function AppInner() {
       setTasks((cur) =>
         cur.map((t) => (t.id === ev.taskId ? { ...t, column: ev.column } : t)),
       );
-      if (ev.column === "blocked") {
+      // A hidden pipeline STEP task's own `blocked` transition never toasts
+      // on its own — the pipeline PARENT's `blocked` column event (reason
+      // "pipeline") is the one the user should see, and toasting both would
+      // be a double notification for one underlying block (D9/D11).
+      const isPipelineStep = task?.pipelineParentId != null;
+      if (ev.column === "blocked" && !isPipelineStep) {
         if (ev.reason === "api-error") {
           toastApiError({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else if (ev.reason === "session-died") {
           toastSessionEnded({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else if (ev.reason === "unknown-command") {
           toastUnknownCommand({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        } else if (ev.reason === "pipeline") {
+          toastPending({ taskId: ev.taskId, title, subtitle: "Pipeline needs you", isSelected, isFocused, onOpen });
         } else {
           toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         }
@@ -962,7 +1047,10 @@ function AppInner() {
     };
     const cancel = api.subscribeGlobalEvents(handle);
     return cancel;
-  }, []);
+    // `openPipelineRun` has a stable identity (its own `useCallback` has an
+    // empty dep array) — listing it doesn't cause a resubscribe, it just
+    // keeps this effect honest about what it closes over.
+  }, [openPipelineRun]);
 
   // Text + repo filter applied here; status filter narrows the rendered
   // columns (not the task list) so an unselected status disappears entirely
@@ -970,6 +1058,12 @@ function AppInner() {
   const visibleTasks = useMemo(() => {
     const q = textQuery.trim().toLowerCase();
     return tasks.filter((t) => {
+      // Hidden pipeline STEP tasks never appear as their own board cards
+      // (D11, `docs/plans/pipelines.md`) — they're driven entirely from the
+      // pipeline run view, opened via the parent's `PipelineBadge`. `tasks`
+      // state itself still holds them (the run panel's `selected`-sync
+      // effect and `GET /tasks/:id/pipeline` both need the full list/row).
+      if (t.pipelineParentId != null) return false;
       if (q) {
         const hay = `${t.title}\n${t.prompt}\n${t.workdir}\n${t.branch ?? ""}`.toLowerCase();
         if (!hay.includes(q)) return false;
@@ -1060,6 +1154,32 @@ function AppInner() {
     setSettingsInitialSection("agents");
     setSettingsOpen(true);
   }, []);
+  /** Switch the app-level `view` to the full-page pipelines list. */
+  const openPipelinesPage = useCallback(() => {
+    setView({ kind: "pipelines", pipelineId: null, editing: false });
+  }, []);
+  /** Switch Settings' "Open pipelines page"/"Edit"/"New pipeline" affordances
+   *  to the matching app-level view — Settings closes itself in the same
+   *  gesture (see the `SettingsDialog` `onOpenPipelines` prop below). */
+  const onSettingsOpenPipelines = useCallback((id: string | null, editing: boolean) => {
+    setSettingsOpen(false);
+    setView({ kind: "pipelines", pipelineId: id, editing });
+  }, []);
+  /** Card click / row-open handler for every task in the board and every
+   *  other list that opens a task (Worktrees dialog, etc. still call
+   *  `setSelected` directly where a run panel is always the right target,
+   *  e.g. a step task). A pipeline PARENT task (`task.pipelineId` set)
+   *  opens the full-page run view instead of the run panel (D5); every
+   *  other task opens the run panel as before. Stable identity — passed to
+   *  `Column`/`TaskCard`, both memoized (see the `useCallback` block
+   *  comment further down). */
+  const openTask = useCallback((t: Task) => {
+    if (t.pipelineId) {
+      openPipelineRun(t.id);
+      return;
+    }
+    setSelected(t);
+  }, [openPipelineRun]);
   const onFocusNewTask = useCallback(() => {
     setNewTaskFocusNonce((n) => n + 1);
   }, []);
@@ -1134,6 +1254,22 @@ function AppInner() {
     }
   }, [startAndNotifyBranch, surfaceError, refreshAgents]);
   const cancel = useCallback(async (t: Task) => {
+    // A pipeline PARENT task has no `runId` of its own (only its active step
+    // tasks do) — stop every active execution via the dedicated pipeline
+    // route instead (D9, `docs/plans/pipelines.md`), then refresh so the
+    // parent's column/pipelineRun and every step task reflect the cancel —
+    // same "refresh after the mutation" idiom as `archive`/`unarchive`
+    // below, rather than a partial merge of just this one response.
+    if (t.pipelineId) {
+      try {
+        setError(null);
+        await api.cancelPipeline(t.id);
+        await refresh();
+      } catch (e) {
+        surfaceError(e);
+      }
+      return;
+    }
     if (!t.runId) return;
     try {
       setError(null);
@@ -1141,7 +1277,7 @@ function AppInner() {
     } catch (e) {
       surfaceError(e);
     }
-  }, [surfaceError]);
+  }, [surfaceError, refresh]);
   const markDone = useCallback(async (t: Task) => {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, column: "done" } : x)));
     try {
@@ -1345,6 +1481,9 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       case "open":
         setSelected(t);
         break;
+      case "open-pipeline":
+        openPipelineRun(t.id);
+        break;
       case "start":
         void start(t);
         break;
@@ -1416,7 +1555,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         return exhaustive;
       }
     }
-  }, [start, cancel, markDone, archive, unarchive, openInFinder, viewPullRequest, viewIssue, markRead, markUnread, copyToClipboard, del]);
+  }, [start, cancel, markDone, archive, unarchive, openInFinder, viewPullRequest, viewIssue, markRead, markUnread, copyToClipboard, del, openPipelineRun]);
 
   // Maps `buildTaskContextMenu`'s pure entries onto the primitive's
   // `ContextMenuItem[]`, inserting a separator whenever the group changes
@@ -1560,6 +1699,16 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             <FolderGit2 className="size-4" />
           </Button>
           <Button
+            variant={view.kind === "pipelines" || view.kind === "pipeline-run" ? "secondary" : "ghost"}
+            size="icon"
+            data-testid="pipelines-button"
+            onClick={openPipelinesPage}
+            aria-label="Pipelines"
+            title="Pipelines"
+          >
+            <Workflow className="size-4" />
+          </Button>
+          <Button
             variant="ghost"
             size="icon"
             onClick={() => setSettingsOpen(true)}
@@ -1576,6 +1725,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           harnesses={harnesses}
           profiles={profiles}
           onOpenSettingsAgents={openSettingsAgents}
+          pipelines={pipelines}
+          onOpenPipelines={openPipelinesPage}
           agentModels={agentModels}
           harnessModels={harnessModels}
           onRefreshModels={onRefreshModels}
@@ -1609,6 +1760,11 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           }}
         />
         <main className="flex min-w-0 flex-1 flex-col">
+          {/* Chrome that stays mounted regardless of `view` (D5,
+              docs/plans/pipelines.md): update/tmux banners and the global
+              error toast + Toaster are cross-cutting concerns, not
+              board-specific content. Only what's below (the board grid, or
+              the pipelines page/editor/run view) swaps. */}
           <UpdateBanner
             snapshot={updateSnapshot}
             onChange={() => { void api.getUpdateStatus().then(setUpdateSnapshot).catch(() => {}); }}
@@ -1617,100 +1773,166 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             show={isTmuxMissing(agents)}
             onResolve={() => setTmuxDialogOpen(true)}
           />
-          {onboardingVisibility.showChecklist && tasks.length > 0 && (
-            <div className="px-4 pt-3">
-              <OnboardingChecklist
-                steps={onboardingSteps}
-                statuses={agents}
-                harnessRows={harnessesLoaded ? harnesses : null}
-                compact
-                onOpenSettingsHarnesses={openSettingsHarnesses}
-                onFocusNewTask={onFocusNewTask}
-                onOpenTerminal={onOpenOnboardingTerminal}
-                onDismiss={dismissOnboarding}
-              />
-            </div>
-          )}
-          <KanbanFilters
-            searchInputRef={boardSearchRef}
-            textQuery={textQuery}
-            onTextQueryChange={setTextQuery}
-            repoFilter={repoFilter}
-            onRepoFilterChange={setRepoFilter}
-            statusFilter={statusFilter}
-            onStatusFilterChange={setStatusFilter}
-            archivedView={archivedView}
-            onArchivedViewChange={setArchivedView}
-            harnessFilter={harnessFilter}
-            onHarnessFilterChange={setHarnessFilter}
-            typeFilter={typeFilter}
-            onTypeFilterChange={setTypeFilter}
-            projects={projects}
-            harnesses={harnesses}
-            taskAgentIds={taskAgentIds}
-          />
           <ErrorToast error={error} onDismiss={() => setError(null)} />
           <Toaster panelOpen={panelMounted} />
-          {/* Kanban gets all remaining vertical space and scrolls horizontally
-              on its own — the bottom bar stays anchored regardless of column
-              count. */}
-          {/* Outer positioning context lives OUTSIDE the horizontal
-              scroller: the zero-task overlay below is absolutely positioned
-              against this div, not `.kanban-scroll`, so scrolling the board
-              horizontally can't carry the card off-screen with it (an
-              abs-positioned descendant of a scrolling containing block
-              scrolls along with it — the previous bug). */}
-          <div className="relative flex-1">
-            <div className="kanban-scroll absolute inset-0 overflow-x-scroll">
-              <DndContext sensors={sensors} onDragEnd={onDragEnd}>
-                <div className="flex gap-3 p-4">
-                  {visibleColumns.map((c) => (
-                    <Column
-                      key={c.id}
-                      id={c.id}
-                      label={c.label}
-                      tasks={visibleTasks.filter((t) => t.column === c.id)}
-                      homeDir={homeDir}
-                      onStart={start}
-                      onCancel={cancel}
-                      onDelete={del}
-                      onOpen={setSelected}
-                      onDiff={setDiffTask}
-                      onMarkDone={markDone}
-                      onArchive={archive}
-                      onUnarchive={unarchive}
-                      emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
-                      selectedTaskId={selected?.id ?? null}
-                      onContextMenu={openTaskMenu}
+          <AnimatePresence mode="wait">
+            {view.kind === "board" && (
+              <motion.div
+                key="board"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                {onboardingVisibility.showChecklist && tasks.length > 0 && (
+                  <div className="px-4 pt-3">
+                    <OnboardingChecklist
+                      steps={onboardingSteps}
+                      statuses={agents}
+                      harnessRows={harnessesLoaded ? harnesses : null}
+                      compact
+                      onOpenSettingsHarnesses={openSettingsHarnesses}
+                      onFocusNewTask={onFocusNewTask}
+                      onOpenTerminal={onOpenOnboardingTerminal}
+                      onDismiss={dismissOnboarding}
                     />
-                  ))}
+                  </div>
+                )}
+                <KanbanFilters
+                  searchInputRef={boardSearchRef}
+                  textQuery={textQuery}
+                  onTextQueryChange={setTextQuery}
+                  repoFilter={repoFilter}
+                  onRepoFilterChange={setRepoFilter}
+                  statusFilter={statusFilter}
+                  onStatusFilterChange={setStatusFilter}
+                  archivedView={archivedView}
+                  onArchivedViewChange={setArchivedView}
+                  harnessFilter={harnessFilter}
+                  onHarnessFilterChange={setHarnessFilter}
+                  typeFilter={typeFilter}
+                  onTypeFilterChange={setTypeFilter}
+                  projects={projects}
+                  harnesses={harnesses}
+                  taskAgentIds={taskAgentIds}
+                />
+                {/* Kanban gets all remaining vertical space and scrolls horizontally
+                    on its own — the bottom bar stays anchored regardless of column
+                    count. */}
+                {/* Outer positioning context lives OUTSIDE the horizontal
+                    scroller: the zero-task overlay below is absolutely positioned
+                    against this div, not `.kanban-scroll`, so scrolling the board
+                    horizontally can't carry the card off-screen with it (an
+                    abs-positioned descendant of a scrolling containing block
+                    scrolls along with it — the previous bug). */}
+                <div className="relative flex-1">
+                  <div className="kanban-scroll absolute inset-0 overflow-x-scroll">
+                    <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+                      <div className="flex gap-3 p-4">
+                        {visibleColumns.map((c) => (
+                          <Column
+                            key={c.id}
+                            id={c.id}
+                            label={c.label}
+                            tasks={visibleTasks.filter((t) => t.column === c.id)}
+                            homeDir={homeDir}
+                            onStart={start}
+                            onCancel={cancel}
+                            onDelete={del}
+                            onOpen={openTask}
+                            onDiff={setDiffTask}
+                            onMarkDone={markDone}
+                            onArchive={archive}
+                            onUnarchive={unarchive}
+                            emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
+                            selectedTaskId={selected?.id ?? null}
+                            onContextMenu={openTaskMenu}
+                          />
+                        ))}
+                      </div>
+                    </DndContext>
+                  </div>
+                  {/* Zero-task state: the full onboarding card sits above the
+                      (still-visible, still-empty) column grid rather than
+                      replacing it — dnd-kit's drop zones stay mounted underneath.
+                      Positioned against the outer `relative flex-1` div (a sibling
+                      of `.kanban-scroll`, not a descendant of it), so it stays
+                      visually centered over the viewport regardless of how far
+                      the board is scrolled horizontally. */}
+                  {onboardingVisibility.showChecklist && tasks.length === 0 && (
+                    <div className="pointer-events-none absolute inset-x-0 top-6 z-10 flex justify-center px-4">
+                      <div className="pointer-events-auto">
+                        <OnboardingChecklist
+                          steps={onboardingSteps}
+                          statuses={agents}
+                          harnessRows={harnessesLoaded ? harnesses : null}
+                          compact={false}
+                          onOpenSettingsHarnesses={openSettingsHarnesses}
+                          onFocusNewTask={onFocusNewTask}
+                          onOpenTerminal={onOpenOnboardingTerminal}
+                          onDismiss={dismissOnboarding}
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
-              </DndContext>
-            </div>
-            {/* Zero-task state: the full onboarding card sits above the
-                (still-visible, still-empty) column grid rather than
-                replacing it — dnd-kit's drop zones stay mounted underneath.
-                Positioned against the outer `relative flex-1` div (a sibling
-                of `.kanban-scroll`, not a descendant of it), so it stays
-                visually centered over the viewport regardless of how far
-                the board is scrolled horizontally. */}
-            {onboardingVisibility.showChecklist && tasks.length === 0 && (
-              <div className="pointer-events-none absolute inset-x-0 top-6 z-10 flex justify-center px-4">
-                <div className="pointer-events-auto">
-                  <OnboardingChecklist
-                    steps={onboardingSteps}
-                    statuses={agents}
-                    harnessRows={harnessesLoaded ? harnesses : null}
-                    compact={false}
-                    onOpenSettingsHarnesses={openSettingsHarnesses}
-                    onFocusNewTask={onFocusNewTask}
-                    onOpenTerminal={onOpenOnboardingTerminal}
-                    onDismiss={dismissOnboarding}
-                  />
-                </div>
-              </div>
+              </motion.div>
             )}
-          </div>
+
+            {view.kind === "pipelines" && !view.editing && (
+              <motion.div
+                key="pipelines-list"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                <PipelinesPage
+                  onOpenEditor={(id) => setView({ kind: "pipelines", pipelineId: id, editing: true })}
+                  onBack={() => setView({ kind: "board" })}
+                />
+              </motion.div>
+            )}
+
+            {view.kind === "pipelines" && view.editing && (
+              <motion.div
+                key={`pipelines-editor-${view.pipelineId ?? "new"}`}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                <PipelineEditor
+                  pipelineId={view.pipelineId}
+                  onBack={() => setView({ kind: "pipelines", pipelineId: null, editing: false })}
+                  onSaved={() => {
+                    setView({ kind: "pipelines", pipelineId: null, editing: false });
+                    void refreshPipelines();
+                  }}
+                />
+              </motion.div>
+            )}
+
+            {view.kind === "pipeline-run" && (
+              <motion.div
+                key={`pipeline-run-${view.taskId}`}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                <PipelineRunView
+                  taskId={view.taskId}
+                  onOpenTask={(t) => setSelected(t)}
+                  onBack={() => setView({ kind: "board" })}
+                />
+              </motion.div>
+            )}
+          </AnimatePresence>
         </main>
       </div>
       <RunPanel
@@ -1736,6 +1958,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         }}
         onViewPullRequest={viewPullRequest}
         onViewIssue={viewIssue}
+        onOpenPipeline={(parentTaskId) => openPipelineRun(parentTaskId)}
       />
       <DiffDialog
         open={!!diffTask}
@@ -1771,7 +1994,9 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         homeDir={homeDir}
         onOpenTask={(t) => {
           setWorktreesOpen(false);
-          setSelected(t);
+          // Routes a pipeline task to its full-page run view, everything
+          // else to the run panel — same decision the board's cards make.
+          openTask(t);
         }}
       />
       <SettingsDialog
@@ -1827,6 +2052,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         homeDir={homeDir}
         dataDir={dataDir}
         initialSection={settingsInitialSection}
+        onOpenPipelines={onSettingsOpenPipelines}
       />
       <TmuxInstallDialog
         open={tmuxDialogOpen}

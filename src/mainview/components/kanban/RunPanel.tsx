@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
-  Sparkles, Square, Terminal, Trash2, Wrench, X,
+  Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
 import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
@@ -90,6 +90,7 @@ import {
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
 import { parseSentFilesToolUse } from "../../../shared/sent-files.ts";
+import { stepNameById } from "../../../shared/pipeline.ts";
 import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
 import { parseIssueUrl } from "../../../shared/issue-task.ts";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
@@ -169,6 +170,18 @@ const CLAUDE_PLAN_PROMPT_RE = /written up a plan|Would you like to proceed/i;
  */
 type StreamEvent = RunEvent & { id: number; dbId?: number };
 
+/**
+ * Resolved display data for the pipeline strip (`run-panel-pipeline-strip`)
+ * a step task's panel renders under its header — the pipeline's name plus
+ * this step's name, fetched from the parent pipeline task via
+ * `api.getPipelineRun`. See `RunPanelBody`'s `pipelineStripCacheRef` /
+ * `pipelineStrip` state for how this is fetched and cached.
+ */
+interface PipelineStripInfo {
+  pipelineName: string;
+  stepName: string;
+}
+
 interface Props {
   /** When null, the panel slides off-screen and unmounts after the exit animation. */
   task: Task | null;
@@ -224,7 +237,18 @@ interface Props {
    *  `issueUrl` — see the header "View issue" affordance below. Same
    *  App-level-singleton ownership rationale as `onOpenPullRequest`. */
   onViewIssue: (input: { projectPath: string; issueUrl: string }) => void;
+  /** Opens the pipeline run view for a pipeline task — a step task's own
+   *  `pipelineParentId`, or a pipeline-parent task's own `id`. Backs the
+   *  "Open pipeline" button in the pipeline strip (see D7,
+   *  `docs/plans/pipelines.md`). Defaults to a no-op so `RunPanel` compiles
+   *  and renders standalone before `App.tsx` threads the real handler. */
+  onOpenPipeline?: (parentTaskId: string) => void;
 }
+
+/** No-op default for `Props.onOpenPipeline` — module-level so it's a stable
+ *  reference across renders (never triggers a memoized child to re-render
+ *  just because the caller omitted the prop). */
+function noOpOpenPipeline(): void {}
 
 const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" | "destructive"> = {
   running: "default",
@@ -305,7 +329,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -521,6 +545,7 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles
           onOpenPullRequest={onOpenPullRequest}
           onViewPullRequest={onViewPullRequest}
           onViewIssue={onViewIssue}
+          onOpenPipeline={onOpenPipeline}
         />
       </aside>
     </>
@@ -552,6 +577,7 @@ function RunPanelBody({
   onOpenPullRequest,
   onViewPullRequest,
   onViewIssue,
+  onOpenPipeline,
 }: {
   task: Task;
   stickyUserMessages: boolean;
@@ -582,6 +608,10 @@ function RunPanelBody({
   onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
   onViewPullRequest: (input: { projectPath: string; prUrl: string }) => void;
   onViewIssue: (input: { projectPath: string; issueUrl: string }) => void;
+  /** Opens the pipeline run view — see `Props.onOpenPipeline`'s doc comment
+   *  on the outer `RunPanel` component. Always a function by the time it
+   *  reaches here (defaulted at the `RunPanel` call site). */
+  onOpenPipeline: (parentTaskId: string) => void;
 }) {
   const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
@@ -826,6 +856,11 @@ function RunPanelBody({
     streamReadyWaitersRef.current = streamReadyWaitersRef.current.filter((w) => w.taskId === task.id);
     for (const w of staleWaiters) w.resolve();
     streamReadyForRef.current = null;
+    // Reset the pipeline-strip display state (the fetch/cache effect near
+    // `pipelineStripCacheRef` re-derives it, from the cache when possible,
+    // for whichever task this switch landed on). The cache itself (the ref)
+    // deliberately survives this reset — see that effect's doc comment.
+    setPipelineStrip(null);
     // Old task's PR mergeability (and "Resolve Conflicts" send confirmation)
     // must not survive into the new task: RunPanelBody isn't remounted on
     // task switch, so without this a stale `prStatus` from task A could sit
@@ -2626,6 +2661,49 @@ function RunPanelBody({
     return () => { cancelled = true; };
   }, [task.id]);
 
+  // Pipeline strip (T9, docs/plans/pipelines.md D7) — resolves a step
+  // task's pipeline name + step name for the "Part of pipeline …" strip
+  // rendered directly under the header. A step task (`pipelineParentId`
+  // set) doesn't carry its own pipeline name, so this fetches the PARENT
+  // pipeline task via `api.getPipelineRun` and reads `pipelineRun.pipelineName`
+  // plus `stepNameById` against the parent's frozen graph snapshot.
+  // `pipelineStripCacheRef` is a genuine cross-task cache, keyed by parent
+  // task id, so revisiting a step of a pipeline already looked up this
+  // session doesn't refetch — it's a ref (not React state) precisely so it
+  // survives the `[task.id]` reset effect above untouched. `pipelineStrip`
+  // itself IS reset there like every other per-task piece of state; this
+  // effect re-derives it (from the cache, or a fresh fetch) on every switch.
+  const pipelineStripCacheRef = useRef<Map<string, PipelineStripInfo>>(new Map());
+  const [pipelineStrip, setPipelineStrip] = useState<PipelineStripInfo | "loading" | "error" | null>(null);
+  useEffect(() => {
+    const parentId = task.pipelineParentId;
+    if (!parentId) return;
+    const cached = pipelineStripCacheRef.current.get(parentId);
+    if (cached) {
+      setPipelineStrip(cached);
+      return;
+    }
+    let cancelled = false;
+    setPipelineStrip("loading");
+    void (async () => {
+      try {
+        const { task: parentTask } = await api.getPipelineRun(parentId);
+        const graph = parentTask.pipelineRun?.snapshot?.graph ?? null;
+        const stepId = task.pipelineStepId;
+        const stepName = graph && stepId ? stepNameById(graph, stepId) : (stepId ?? "this step");
+        const pipelineName = parentTask.pipelineRun?.pipelineName || parentTask.title || "pipeline";
+        const info: PipelineStripInfo = { pipelineName, stepName };
+        pipelineStripCacheRef.current.set(parentId, info);
+        if (cancelled) return;
+        setPipelineStrip(info);
+      } catch {
+        if (cancelled) return;
+        setPipelineStrip("error");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [task.id, task.pipelineParentId, task.pipelineStepId]);
+
   // PR mergeability for the composer-row "Resolve Conflicts" button. `parsedPrUrl`
   // is derived once per `task.prUrl` change and reused for both the fetch
   // effect and the render-time gate (`canOfferResolveConflicts`).
@@ -3410,7 +3488,11 @@ function RunPanelBody({
               </Button>
             </Tooltip>
           )}
-          {!archived && (task.column === "done" || active) && (
+          {/* Step tasks can't be archived individually — the server 409s
+              it, since the parent pipeline task owns their lifecycle (D9,
+              docs/plans/pipelines.md). Gated out here rather than left to
+              fail on click. */}
+          {!task.pipelineParentId && !archived && (task.column === "done" || active) && (
             <Tooltip align="end" label={active ? "Stop the running agent and archive task" : "Archive task"}>
               <Button
                 size="icon"
@@ -3422,7 +3504,7 @@ function RunPanelBody({
               </Button>
             </Tooltip>
           )}
-          {archived && (
+          {!task.pipelineParentId && archived && (
             <Tooltip align="end" label="Unarchive task">
               <Button size="icon" variant="outline" onClick={() => onUnarchive(task)} aria-label="Unarchive">
                 <ArchiveRestore className="size-4" />
@@ -3477,6 +3559,63 @@ function RunPanelBody({
           )}
         </div>
       </header>
+
+      {/* Pipeline strip (T9, D7 in docs/plans/pipelines.md) — a step task's
+          panel gets a slim banner naming the pipeline + step it belongs to,
+          with a shortcut into the full-page run view; a pipeline-PARENT
+          task (normally never opened here — App routes those straight to
+          the run view — but reachable e.g. via the Worktrees dialog) gets
+          the same banner pointed at itself instead. The two are mutually
+          exclusive: a task is either a step (`pipelineParentId` set) or a
+          parent (`pipelineId` set), never both. */}
+      {task.pipelineParentId ? (
+        <div
+          data-testid="run-panel-pipeline-strip"
+          className="flex items-center justify-between gap-2 border-b border-border/60 bg-info/10 px-3 py-1.5 text-xs text-info"
+        >
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Workflow className="size-3.5 shrink-0" aria-hidden />
+            <span className="truncate">
+              {pipelineStrip && pipelineStrip !== "loading" && pipelineStrip !== "error" ? (
+                <>
+                  Part of pipeline <strong className="font-semibold">{pipelineStrip.pipelineName}</strong> · step{" "}
+                  <strong className="font-semibold">{pipelineStrip.stepName}</strong>
+                </>
+              ) : (
+                "Part of a pipeline"
+              )}
+            </span>
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 shrink-0 px-2 text-[10px]"
+            data-testid="run-panel-open-pipeline"
+            onClick={() => onOpenPipeline(task.pipelineParentId!)}
+          >
+            Open pipeline
+          </Button>
+        </div>
+      ) : task.pipelineId ? (
+        <div
+          data-testid="run-panel-pipeline-strip"
+          className="flex items-center justify-between gap-2 border-b border-border/60 bg-info/10 px-3 py-1.5 text-xs text-info"
+        >
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Workflow className="size-3.5 shrink-0" aria-hidden />
+            <span className="truncate">Pipeline task — open the pipeline view</span>
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 shrink-0 px-2 text-[10px]"
+            data-testid="run-panel-open-pipeline"
+            onClick={() => onOpenPipeline(task.id)}
+          >
+            Open pipeline
+          </Button>
+        </div>
+      ) : null}
 
       {searchOpen && (
         <div data-search-open="" className="flex items-center gap-2 border-b border-border/60 px-3 py-2">
@@ -3791,8 +3930,16 @@ function RunPanelBody({
           an idle one — the backend auto-unarchives and rematerializes the
           worktree on send (see the inline hint below); only a genuinely
           non-sendable archived task (no resumable run) falls back to the
-          static notice. */}
-      {archived && !canSend ? (
+          static notice. A pipeline-PARENT task (`task.pipelineId` set) is
+          checked first and takes priority over every other branch here —
+          the parent itself never runs an agent turn (D9,
+          docs/plans/pipelines.md), so there's nothing for a composer to
+          talk to regardless of column/archived state. */}
+      {task.pipelineId ? (
+        <div className="shrink-0 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
+          This is a pipeline task — open the pipeline view to talk to its steps.
+        </div>
+      ) : archived && !canSend ? (
         <div className="shrink-0 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
           This task is archived. Unarchive it to interact.
         </div>
@@ -6785,16 +6932,23 @@ function TaskDetails({
                       Unknown agent
                     </span>
                   )}
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-6 px-2 text-[10px]"
-                    data-testid="task-agent-profile-detach"
-                    disabled={runningLock || detaching}
-                    onClick={() => void detachProfile()}
-                  >
-                    Detach
-                  </Button>
+                  {/* A step task's profile is frozen — the parent pipeline
+                      snapshotted it at run start (D8/D9,
+                      docs/plans/pipelines.md), and there's no live task for
+                      the user to re-edit afterward, so Detach is hidden
+                      rather than offered and disabled. */}
+                  {!task.pipelineParentId && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 px-2 text-[10px]"
+                      data-testid="task-agent-profile-detach"
+                      disabled={runningLock || detaching}
+                      onClick={() => void detachProfile()}
+                    >
+                      Detach
+                    </Button>
+                  )}
                   <button
                     type="button"
                     data-testid="task-agent-profile-manage"

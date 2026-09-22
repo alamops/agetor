@@ -45,6 +45,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
  *  Used to assert every entry lands in the group the plan assigns it. */
 const ACTION_GROUP: Record<TaskMenuAction, TaskMenuGroup> = {
   open: "primary",
+  "open-pipeline": "primary",
   start: "primary",
   stop: "primary",
   "resume-recovery": "primary",
@@ -431,5 +432,60 @@ describe("buildTaskContextMenu", () => {
     const lastEntry = entries[entries.length - 1]!;
     expect(lastEntry.action).toBe("delete");
     expect(lastEntry.danger).toBe(true);
+  });
+
+  describe("pipeline tasks (docs/plans/pipelines.md D9/D11)", () => {
+    test("a pipeline PARENT task gets 'open-pipeline' instead of 'open details'", () => {
+      const task = makeTask({ pipelineId: "pipe-1" });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual(["open-pipeline", "start", "diff", "open-in-finder", "delete"]);
+      expect(entries.find((e) => e.action === "open-pipeline")?.label).toBe("Open pipeline");
+      for (const e of entries) {
+        expect(e.group).toBe(ACTION_GROUP[e.action]);
+      }
+    });
+
+    test("a pipeline PARENT task still gets archive/unarchive/delete like any other task", () => {
+      const running = buildTaskContextMenu(makeTask({ pipelineId: "pipe-1", column: "running" }), { isOpen: false });
+      expect(actions(running)).toContain("archive");
+      expect(actions(running)).toContain("delete");
+
+      const archived = buildTaskContextMenu(
+        makeTask({ pipelineId: "pipe-1", archivedAt: Date.now() }),
+        { isOpen: false },
+      );
+      expect(actions(archived)).toContain("unarchive");
+    });
+
+    test("a hidden STEP task hides archive/unarchive/delete — the parent owns its lifecycle", () => {
+      const running = buildTaskContextMenu(
+        makeTask({ pipelineParentId: "pipe-parent-1", column: "running" }),
+        { isOpen: false },
+      );
+      expect(actions(running)).toEqual(["open", "stop", "diff", "open-in-finder"]);
+      expect(actions(running)).not.toContain("archive");
+      expect(actions(running)).not.toContain("delete");
+
+      const done = buildTaskContextMenu(
+        makeTask({ pipelineParentId: "pipe-parent-1", column: "done" }),
+        { isOpen: false },
+      );
+      expect(actions(done)).not.toContain("archive");
+      expect(actions(done)).not.toContain("delete");
+
+      const archived = buildTaskContextMenu(
+        makeTask({ pipelineParentId: "pipe-parent-1", archivedAt: Date.now() }),
+        { isOpen: false },
+      );
+      expect(actions(archived)).not.toContain("unarchive");
+      expect(actions(archived)).not.toContain("delete");
+    });
+
+    test("a hidden STEP task still gets plain 'open' — it's not a pipeline parent", () => {
+      const task = makeTask({ pipelineParentId: "pipe-parent-1" });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+      expect(entries[0]).toEqual({ action: "open", label: "Open details", group: "primary" });
+    });
   });
 });

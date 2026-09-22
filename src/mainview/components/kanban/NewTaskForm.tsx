@@ -5,6 +5,7 @@ import {
   ClipboardList,
   Code2,
   RefreshCw,
+  Workflow,
 } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
@@ -35,6 +36,7 @@ import {
   type AgentStatus,
   type Harness,
   type Isolation,
+  type Pipeline,
   type TaskReference,
   type TaskType,
 } from "../../../shared/types.ts";
@@ -42,6 +44,7 @@ import { AgentIcon } from "./AgentIcon";
 import { AgentProfileCard } from "./AgentProfileCard";
 import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
+import { PipelinePicker } from "@/components/pipelines";
 import { ProjectPicker } from "./ProjectPicker";
 import { TaskTypePicker } from "./TaskTypePicker";
 import { captureDroppedOrPastedItems } from "./ReferencesPicker";
@@ -82,6 +85,12 @@ interface Props {
        *  own values for those fields (see `submit`), so the override is a
        *  no-op in practice but keeps a body-only consumer honest. */
       agentProfileId?: string | null;
+      /** Id of the {@link Pipeline} to launch this task as the parent run
+       *  of, or omitted for an ordinary task — see `PipelinePicker` above
+       *  the Agent picker. Mutually exclusive with `agentProfileId` (never
+       *  sent together); the server resolves the first step's harness for
+       *  `agent`, which this form already sends (see `submit`). */
+      pipelineId?: string;
     },
     options: { start: boolean },
   ) => void;
@@ -96,6 +105,13 @@ interface Props {
   /** "Manage agents…" footer row in the profile picker's popover — opens
    *  Settings on the Agents section. */
   onOpenSettingsAgents: () => void;
+  /** Saved pipelines — powers the `PipelinePicker` above the Agent picker
+   *  ("one selection" with the agent profile: picking a pipeline hides the
+   *  Agent picker and the manual harness/mode/model/effort block). */
+  pipelines: Pipeline[];
+  /** "Manage pipelines…" footer row in the pipeline picker's popover —
+   *  opens the full-page pipelines list. */
+  onOpenPipelines: () => void;
   /** Kind-level models discovered from each agent's CLI, refreshed by the
    *  triggers documented on `onRefreshModels` below. Merged with the static
    *  AGENT_OPTIONS list — used as the fallback when `harnessModels` has
@@ -123,7 +139,7 @@ interface Props {
   focusNonce?: number;
 }
 
-export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
+export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSettingsAgents, pipelines, onOpenPipelines, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
   // Collapsed = thin icon rail; the board's `flex-1` <main> takes the freed
   // width on its own. Seeded synchronously from localStorage (lazy initial
   // state) so a restart repaints in the state the user left it in — an async
@@ -173,6 +189,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // last-used-profile preference — plan D12). Reset to null after a
   // successful submit, same as every other field below.
   const [agentProfileId, setAgentProfileId] = useState<string | null>(null);
+  // Selected pipeline ("one selection" with the agent profile — D1/D5,
+  // docs/plans/pipelines.md): null means "no pipeline — pick an agent (or
+  // harness) manually". Reset to null after a successful submit, same as
+  // every other field below. Mutually exclusive with `agentProfileId` —
+  // each picker's `onChange` below clears the other.
+  const [pipelineId, setPipelineId] = useState<string | null>(null);
   // Soft-deleted harnesses are excluded from the picker and the default-
   // fallback logic. The full `harnesses` list is still used for
   // `selectedHarness` lookup so the resolved kind stays correct even for a
@@ -453,6 +475,32 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
       setAgentProfileId(null);
     }
   }, [profiles, agentProfileId]);
+
+  // "One selection" (plan D1/D5): a chosen pipeline replaces the Agent
+  // picker AND the manual harness/mode/model/effort block below with a
+  // compact summary card. Same stale-selection guard as the profile picker
+  // above — a pipeline deleted elsewhere falls back to "No pipeline".
+  const selectedPipeline = pipelineId ? (pipelines.find((p) => p.id === pipelineId) ?? null) : null;
+  useEffect(() => {
+    if (pipelineId && pipelines.length > 0 && !pipelines.some((p) => p.id === pipelineId)) {
+      setPipelineId(null);
+    }
+  }, [pipelines, pipelineId]);
+  // The pipeline's start step (editor-marked `startStepId`, falling back to
+  // the first step) and its bound agent profile — shown in the summary card
+  // and used to resolve the launch payload's `agent` field below (the
+  // server recomputes this from the pipeline itself; sending it here just
+  // keeps the request body self-consistent, same rationale as
+  // `selectedProfile`'s values above).
+  const pipelineStartStep = selectedPipeline
+    ? (() => {
+        const startId = selectedPipeline.graph.startStepId ?? selectedPipeline.graph.steps[0]?.id ?? null;
+        return startId ? (selectedPipeline.graph.steps.find((s) => s.id === startId) ?? null) : null;
+      })()
+    : null;
+  const pipelineStartStepProfile = pipelineStartStep?.agentProfileId
+    ? (profiles.find((p) => p.id === pipelineStartStep.agentProfileId) ?? null)
+    : null;
   const selectedProfileHarness = selectedProfile
     ? (harnesses.find((h) => h.id === selectedProfile.harness) ?? null)
     : null;
@@ -461,8 +509,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // the gemini argv-budget check right below and by the overage warning.
   // The harness id a launch will ACTUALLY run under — the composer's
   // skills/MCP/slash discovery and the submit payload must both read this,
-  // never the hidden manual `agent`, while a profile is selected.
-  const effectiveAgent = selectedProfile ? selectedProfile.harness : agent;
+  // never the hidden manual `agent`, while a profile OR a pipeline is
+  // selected. A pipeline task's `agent` is a best-effort echo of its start
+  // step's harness (the server recomputes it from the pipeline itself, see
+  // `startTask`) — falls back to the hidden manual `agent` picker when the
+  // start step has no resolvable profile yet.
+  const effectiveAgent = selectedPipeline
+    ? (pipelineStartStepProfile?.harness ?? agent)
+    : selectedProfile ? selectedProfile.harness : agent;
   const effectiveKind: AgentKind = selectedProfile ? (selectedProfileHarness?.kind ?? "claude-code") : kind;
   const effectiveHarnessLabel = selectedProfile
     ? (selectedProfileHarness?.label ?? selectedProfile.harness)
@@ -481,8 +535,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // oversized prompt — surfaced here (and blocking submit) rather than
   // letting it fail at spawn time. Mirrors CreateTaskFromIssueDialog's guard.
   // Includes the agent-instructions preamble (`composeLaunchPrompt`) so this
-  // pre-check sees the same bytes `startTask` will actually send.
-  const promptOverage = promptByteOverage(effectiveKind, composeLaunchPrompt(selectedProfile, prompt));
+  // pre-check sees the same bytes `startTask` will actually send. Skipped
+  // for a pipeline task — `effectiveKind` reflects the hidden manual
+  // harness picker, not any one step's harness (each step can run a
+  // different kind), and pipeline steps aren't gemini-argv one-shot
+  // launches the way a plain task's first turn is.
+  const promptOverage = selectedPipeline
+    ? null
+    : promptByteOverage(effectiveKind, composeLaunchPrompt(selectedProfile, prompt));
 
   const canSubmit =
     title.trim() && prompt.trim() && workdir.trim() && wt.valid
@@ -514,10 +574,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
         maxMode: selectedProfile ? selectedProfile.maxMode : (kind === "cursor" ? maxMode : false),
         references,
         taskType,
-        // Omit entirely when no profile is selected — an explicit `null`
-        // still round-trips through the server's own accept-null handling,
-        // but a body that never mentions the key at all is the simplest
-        // contract for every consumer of this payload shape (finding F2-1).
+        // Omit entirely when no profile/pipeline is selected — an explicit
+        // `null` still round-trips through the server's own accept-null
+        // handling, but a body that never mentions the key at all is the
+        // simplest contract for every consumer of this payload shape
+        // (finding F2-1). Mutually exclusive by construction — each
+        // picker's `onChange` clears the other — so at most one of these
+        // spreads ever contributes a key.
+        ...(pipelineId ? { pipelineId } : {}),
         ...(agentProfileId ? { agentProfileId } : {}),
       },
       { start },
@@ -526,9 +590,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     // same kind share cache). Fire-and-forget — preferences failures
     // shouldn't block the user. Also write into the in-memory cache so a
     // same-session agent switch sees the latest pick. Skipped entirely while
-    // a profile is selected — those aren't the user's manual picks, and
-    // there's no "last used profile" preference (plan D12).
-    if (!selectedProfile) {
+    // a profile or a pipeline is selected — those aren't the user's manual
+    // picks, and there's no "last used profile"/"last used pipeline"
+    // preference (plan D12).
+    if (!selectedProfile && !selectedPipeline) {
       agentCache.current[kind] = { mode, model, effort, fast, maxMode };
       void api.setPreference(`lastMode:${kind}`, mode).catch(() => {});
       void api.setPreference(`lastModel:${kind}`, model).catch(() => {});
@@ -542,6 +607,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     capture.clearDropHint();
     wt.resetAfterSubmit();
     setAgentProfileId(null);
+    setPipelineId(null);
     // Keep `workdir`, `model`, `effort`, `mode` set on purpose — the next
     // task should default to the same project + picks the user just used.
   };
@@ -703,11 +769,59 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
               </div>
               <WorktreeOptions state={wt} />
 
+              {/* "One selection" (plan D1/D5): a picked pipeline replaces
+                  the Agent picker AND the entire manual harness/mode/model/
+                  effort block below with a compact summary card — nothing
+                  under here is read from when `selectedPipeline` is set
+                  (see `submit`). Selecting a pipeline clears any selected
+                  agent profile (`onChange` below), and vice versa. */}
+              <div className="space-y-1" data-testid="new-task-pipeline-picker">
+                <label className="text-muted-foreground">Pipeline</label>
+                <PipelinePicker
+                  value={pipelineId}
+                  onChange={(id) => {
+                    setPipelineId(id);
+                    if (id) setAgentProfileId(null);
+                  }}
+                  pipelines={pipelines}
+                  onManage={onOpenPipelines}
+                />
+              </div>
+
+              {selectedPipeline ? (
+                <div
+                  data-testid="new-task-pipeline-summary"
+                  className="space-y-1 rounded-md border border-border bg-muted/30 p-2"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium">
+                      <Workflow className="size-3.5 shrink-0 text-info" aria-hidden />
+                      <span className="truncate">{selectedPipeline.name}</span>
+                    </span>
+                    <button
+                      type="button"
+                      data-testid="new-task-pipeline-clear"
+                      onClick={() => setPipelineId(null)}
+                      className="shrink-0 text-[11px] text-muted-foreground hover:text-foreground hover:underline"
+                    >
+                      Change
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-muted-foreground">
+                    {selectedPipeline.graph.steps.length} step{selectedPipeline.graph.steps.length === 1 ? "" : "s"}
+                    {pipelineStartStepProfile && <> · starts with {pipelineStartStepProfile.name}</>}
+                  </p>
+                </div>
+              ) : (
+              <>
               <div className="space-y-1">
                 <label className="text-muted-foreground">Agent</label>
                 <AgentProfilePicker
                   value={agentProfileId}
-                  onChange={setAgentProfileId}
+                  onChange={(id) => {
+                    setAgentProfileId(id);
+                    if (id) setPipelineId(null);
+                  }}
                   profiles={profiles}
                   // Full list, not `availableHarnesses` — the picker/card
                   // resolve each profile's icon+label from this and need to
@@ -968,6 +1082,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                   reports the actionable error if the turn actually needs
                   credentials. This is a heads-up, not a disable. */}
               <HarnessAuthHint status={selectedStatus} />
+              </>
+              )}
               </>
               )}
             </div>

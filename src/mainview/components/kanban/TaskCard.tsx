@@ -12,6 +12,7 @@ import { taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { sentFileBasename } from "../../../shared/sent-files.ts";
 import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
 import { AgentIcon } from "./AgentIcon";
+import { PipelineBadge } from "@/components/pipelines";
 
 interface Props {
   task: Task;
@@ -220,12 +221,18 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               </Badge>
             )}
           </div>
-          {/* When the task was launched from a saved agent profile, show its
-           *  name (with the harness id as the tooltip) instead of the raw
-           *  harness id — the snapshot is server-managed and always present
-           *  once `agentProfileId` is set (plan D1/D14), so no live profile
+          {/* A pipeline task's badge is the pipeline name + step progress
+           *  (D5/D9, docs/plans/pipelines.md) — the profile is per-step, not
+           *  per-task, so it replaces the agent-profile badge outright
+           *  rather than sitting alongside it. Otherwise: when the task was
+           *  launched from a saved agent profile, show its name (with the
+           *  harness id as the tooltip) instead of the raw harness id — the
+           *  snapshot is server-managed and always present once
+           *  `agentProfileId` is set (plan D1/D14), so no live profile
            *  lookup is needed here. */}
-          {task.agentProfile ? (
+          {task.pipelineRun ? (
+            <PipelineBadge run={task.pipelineRun} className="shrink-0" />
+          ) : task.agentProfile ? (
             <Badge
               variant="secondary"
               className="gap-1 shrink-0"
