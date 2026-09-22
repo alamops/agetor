@@ -3458,7 +3458,9 @@ async function drainCodexQueue(taskId: string): Promise<void> {
   // on the task's most recent run.
   const stranded = [next, ...(codexTurnQueue.get(taskId) ?? [])];
   codexTurnQueue.delete(taskId);
-  for (const text of stranded) restashPasteWithheldText(taskId, text);
+  // `backlog.add` PREPENDS (newest draft on top), so restash in reverse send
+  // order: the refused line lands on top and the tray reads chronologically.
+  for (const text of [...stranded].reverse()) restashPasteWithheldText(taskId, text);
   const lastRunId = runs.listForTask(taskId)[0]?.id;
   if (lastRunId) {
     const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;
