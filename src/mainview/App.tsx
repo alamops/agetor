@@ -931,6 +931,10 @@ function AppInner() {
         }
         return;
       }
+      // Pipeline run-state changes ride their own kind; the run view
+      // subscribes to them itself (wave 3), and the parent's column still
+      // arrives as a normal `column` event below — nothing to toast here.
+      if (ev.kind === "pipeline") return;
       // column transitions. Patch `tasks` optimistically so the board and any
       // open run panel (via the selected-sync effect) reflect the new column
       // the instant the backend pushes it — rather than waiting up to 2s for

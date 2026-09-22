@@ -88,9 +88,25 @@ export default {
           "0%, 100%": { opacity: "0.45" },
           "50%":      { opacity: "1" },
         },
+        // Pipelines canvas: a soft ring pulse around the node currently
+        // running/awaiting attention, using the --info token (blue) so it
+        // matches the rest of the app's "in progress" color language rather
+        // than introducing a new hue.
+        "pipeline-pulse": {
+          "0%, 100%": { boxShadow: "0 0 0 0 hsl(var(--info) / 0.55)" },
+          "50%":      { boxShadow: "0 0 0 6px hsl(var(--info) / 0)" },
+        },
+        // Pipelines canvas: animated "marching ants" dash offset for an
+        // in-flight edge (a step currently handing off to the next one).
+        "pipeline-dash": {
+          "0%":   { strokeDashoffset: "24" },
+          "100%": { strokeDashoffset: "0" },
+        },
       },
       animation: {
         "awaiting-pulse": "awaiting-pulse 2.4s ease-in-out infinite",
+        "pipeline-pulse": "pipeline-pulse 1.6s ease-in-out infinite",
+        "pipeline-dash": "pipeline-dash 1s linear infinite",
       },
     },
   },

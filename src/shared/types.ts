@@ -410,6 +410,249 @@ export interface AgentProfileSnapshot {
   capturedAt: number;
 }
 
+/**
+ * One node in a {@link PipelineGraph} — a named, agent-profile-bound unit of
+ * work. `name` is unique per pipeline (case-insensitive, trimmed): the
+ * agent's handoff `next` field targets a step by this name (or by an edge
+ * label), so renaming a step is how you'd break a running pipeline's
+ * in-flight `next` resolution — `resolveNextSteps` in `src/shared/
+ * pipeline.ts` is where that matching happens. `id` is a stable uuid that
+ * survives renames and is what edges/`startStepId`/handoff history actually
+ * reference. See `docs/plans/pipelines.md` (D3/D4) for the full design.
+ */
+export interface PipelineStep {
+  id: string;
+  name: string;
+  /** Step-specific prompt text, composed into the launch prompt by
+   *  `composeStepPrompt` alongside the pipeline goal and prior handoffs. */
+  instructions: string;
+  /** {@link AgentProfile} this step's task launches from, or null (the run
+   *  refuses to start a step with no profile — `profile-missing`). */
+  agentProfileId: string | null;
+  /** Canvas coordinates in the React Flow editor. Purely presentational. */
+  position: { x: number; y: number };
+  /** Agent profiles this step's agent may delegate to as subagents, plus an
+   *  optional cap on how many it may spawn (`null` = no limit). */
+  subagents: { profileIds: string[]; cap: number | null };
+  /** After this step settles: `"choose"` — the agent's handoff `next` field
+   *  picks exactly one outgoing edge (ignored when there's only one edge).
+   *  `"all"` — every outgoing step starts in parallel (fan-out), regardless
+   *  of `next`. */
+  transition: "choose" | "all";
+  /** How this step starts when it has multiple incoming edges: `"any"`
+   *  (default) — every arrival starts a new execution (how cycles work).
+   *  `"all"` — starts once every distinct incoming source has arrived in
+   *  this generation (fan-in / join), receiving all their handoffs. */
+  join: "any" | "all";
+}
+
+/** A directed connection between two {@link PipelineStep}s by id.
+ *  `label` is shown on the canvas and is one of the ways a `"choose"` step's
+ *  handoff `next` can target this edge's `to` step. */
+export interface PipelineEdge {
+  id: string;
+  from: string;
+  to: string;
+  label: string;
+}
+
+/** The full graph a {@link Pipeline} is built from. `startStepId` is the
+ *  editor-marked entry point; when unset, `resolveStartStep` falls back to
+ *  the unique step with no incoming edges. */
+export interface PipelineGraph {
+  steps: PipelineStep[];
+  edges: PipelineEdge[];
+  startStepId: string | null;
+}
+
+/**
+ * A named, reusable graph of steps (see {@link PipelineGraph}) — the
+ * template a pipeline task is launched from. Persisted in the `pipelines`
+ * table (`src/bun/db.ts`'s `pipelines` module); names are unique
+ * case-insensitively (trimmed), mirroring {@link AgentProfile}. Running a
+ * pipeline snapshots this graph (plus every referenced agent profile) onto
+ * the launched task's `pipelineRun.snapshot` at first Run — later edits to
+ * the pipeline never affect an already-started run (see D8,
+ * `docs/plans/pipelines.md`).
+ */
+export interface Pipeline {
+  id: string;
+  name: string;
+  description: string;
+  graph: PipelineGraph;
+  /** Cap on executions per run (1..200, default 25) — guards against a
+   *  runaway cycle. A run that would exceed it goes Blocked (`step-cap`). */
+  maxSteps: number;
+  createdAt: number;
+  updatedAt: number;
+  /** Number of parent pipeline tasks currently bound to this pipeline
+   *  (`tasks.pipeline_id = this.id`, every column including archived).
+   *  Server-derived like {@link AgentProfile.taskCount} — optional at the
+   *  type level only because raw db-layer callers don't populate it. */
+  taskCount?: number;
+}
+
+/** Body of `POST /pipelines` / `PATCH /pipelines/:id`. */
+export interface PipelineInput {
+  name: string;
+  description?: string;
+  graph: PipelineGraph;
+  maxSteps?: number;
+}
+
+/**
+ * The structured JSON a step's agent is asked to emit at the end of its
+ * final message, wrapped in a `<handoff>…</handoff>` tag (see {@link
+ * HANDOFF_TAG} in `src/shared/pipeline.ts`) — how one step tells the runner
+ * what it did and which step should run next. Parsed by `parseHandoff`.
+ */
+export interface Handoff {
+  schemaVersion: 1;
+  /** The overall task's purpose, restated — keeps a long-running pipeline
+   *  anchored to its original goal across many steps. */
+  purpose: string;
+  /** What this step did or found. */
+  summary: string;
+  /** Why the step is handing off now (done, or blocked and can't continue),
+   *  and what the next step should do with `summary`. */
+  reason: string;
+  /** Name of the next step to run (matched case-insensitively against a
+   *  step name, then a step id, then an edge label by `resolveNextSteps`),
+   *  or null when there's nothing left to hand off to (terminal step, or a
+   *  `transition: "all"` fan-out, where `next` is ignored entirely). */
+  next: string | null;
+  /** Paths or URLs the next step (or the user) may want to look at. */
+  artifacts: string[];
+  /** Unresolved questions the next step or the user should address. */
+  openQuestions: string[];
+  /** Optional outcome hint distinct from `reason`'s prose — `"blocked"`
+   *  signals the step could not complete even though it produced a
+   *  (possibly partial) handoff. */
+  status?: "done" | "blocked";
+}
+
+/** Lifecycle state of a {@link PipelineRunState}, mirrored by the parent
+ *  pipeline task's board column. */
+export type PipelineRunStatus = "idle" | "running" | "blocked" | "done" | "cancelled";
+
+/** Why a pipeline execution is Blocked — surfaced per-entry in
+ *  {@link PipelineRunState.blocked} and as the parent task's `column`
+ *  transition `reason` (`"pipeline"`). */
+export type PipelineBlockKind =
+  | "step-failed"
+  | "step-blocked"
+  | "handoff-missing"
+  | "handoff-invalid"
+  | "step-cap"
+  | "profile-missing"
+  | "join-incomplete";
+
+/** One currently-active step execution within a {@link PipelineRunState} —
+ *  a hidden step task whose turn is running or blocked. Several can coexist
+ *  after a `transition: "all"` fan-out. */
+export interface PipelineActiveStep {
+  stepId: string;
+  taskId: string;
+  /** This execution's position in `history` / overall step-cap accounting
+   *  (1-based, monotonically increasing per run). */
+  seq: number;
+}
+
+/** One incoming arrival recorded against a `join: "all"` step while it
+ *  waits for every distinct incoming source to arrive in the current
+ *  generation. See {@link PipelineRunState.joins}. */
+export interface PipelineJoinArrival {
+  fromStepId: string;
+  seq: number;
+  handoff: Handoff | null;
+}
+
+/** A single blocked pipeline execution (or a run-level block whose
+ *  `taskId`/`stepId` are null) awaiting either a fix (e.g. re-sending the
+ *  step so it emits a valid handoff) or a manual advance. */
+export interface PipelineBlock {
+  taskId: string | null;
+  stepId: string | null;
+  kind: PipelineBlockKind;
+  message: string;
+}
+
+/**
+ * A frozen copy of the {@link PipelineGraph} plus every agent profile it
+ * references, captured onto {@link PipelineRunState.snapshot} the moment a
+ * pipeline task first runs (D8, `docs/plans/pipelines.md`). Later edits to
+ * the live pipeline or its profiles never affect an already-started run.
+ */
+export interface PipelineRunSnapshot {
+  graph: PipelineGraph;
+  maxSteps: number;
+  /** Keyed by `AgentProfile.id` — every profile referenced by any step's
+   *  `agentProfileId` or `subagents.profileIds` at capture time. */
+  profiles: Record<string, AgentProfileSnapshot>;
+  capturedAt: number;
+}
+
+/**
+ * One completed (or cancelled) step execution, appended to {@link
+ * PipelineRunState.history} once its task settles. `nextStepIds` records
+ * what `resolveNextSteps` actually started from this execution's handoff —
+ * empty for a terminal step, a failed/cancelled execution, or one still
+ * awaiting resolution.
+ */
+export interface PipelineStepRecord {
+  seq: number;
+  stepId: string;
+  taskId: string;
+  startedAt: number;
+  endedAt: number | null;
+  outcome: "succeeded" | "failed" | "cancelled" | "advanced-manually" | null;
+  handoff: Handoff | null;
+  nextStepIds: string[];
+}
+
+/**
+ * Server-managed run state for a pipeline task, persisted on `Task.pipelineRun`
+ * (`tasks.pipeline_run`, written only by `tasks.setPipelineRun`'s targeted
+ * UPDATE — never patchable, excluded from the generic `tasks.update` SET
+ * clause). `snapshot` is null until the first Run (see {@link
+ * PipelineRunSnapshot}); every other field tracks the run's live progress —
+ * `active` holds one entry per currently-running/blocked step execution
+ * (several after a fan-out), `joins` holds partial fan-in state keyed by
+ * step id, and `blocked` holds one entry per execution that needs attention
+ * (or a run-level block with null ids).
+ */
+export interface PipelineRunState {
+  pipelineId: string;
+  pipelineName: string;
+  snapshot: PipelineRunSnapshot | null;
+  status: PipelineRunStatus;
+  active: PipelineActiveStep[];
+  joins: Record<string, { arrivals: PipelineJoinArrival[] }>;
+  blocked: PipelineBlock[];
+  history: PipelineStepRecord[];
+  /** Total executions started this run — what `maxSteps` caps. */
+  stepCount: number;
+  startedAt: number | null;
+  endedAt: number | null;
+}
+
+/** Field length/count caps enforced by both the server routes and the
+ *  pipeline editor UI — mirrors {@link AGENT_PROFILE_LIMITS}'s role for
+ *  agent profiles. */
+export const PIPELINE_LIMITS = {
+  name: 80,
+  description: 2000,
+  steps: 50,
+  edges: 200,
+  stepName: 60,
+  instructions: 20_000,
+  maxStepsDefault: 25,
+  maxStepsMax: 200,
+  handoffInlineMaxBytes: 16_384,
+  handoffField: 8_000,
+  handoffArray: 50,
+} as const;
+
 export interface HarnessUsage {
   /** Harness id this usage report is for. */
   harnessId: string;
@@ -1114,6 +1357,41 @@ export interface Task {
    * `toTask` always sets it.
    */
   agentProfile?: AgentProfileSnapshot | null;
+  /**
+   * Id of the {@link Pipeline} this task is the parent run of, or null for
+   * an ordinary task. Set only at create time (`POST /tasks`'s
+   * `pipelineId`); never patchable. A task with this set is a **pipeline
+   * task** — the board card shows a Pipeline badge with step progress, and
+   * clicking it opens the full-page run view instead of the run panel. See
+   * `docs/plans/pipelines.md` (D1/D5).
+   */
+  pipelineId?: string | null;
+  /**
+   * Server-managed run state for this pipeline task — null until the first
+   * Run, then tracks the whole run's progress (active step executions,
+   * partial joins, blocks, history). Written only by
+   * `tasks.setPipelineRun`'s targeted UPDATE (never bumps `updated_at`,
+   * skipped by the generic `tasks.update` SET clause, never patchable — same
+   * treatment as `sentFiles`/`fxRecovery`/`agentProfileId`). Always null for
+   * a task that isn't a pipeline task (`pipelineId` null).
+   */
+  pipelineRun?: PipelineRunState | null;
+  /**
+   * Id of the parent pipeline task this row is a hidden **step task** of, or
+   * null for an ordinary (including pipeline-parent) task. Step tasks are
+   * normal `tasks` rows in every other respect — RunPanel, ask cards, diff,
+   * backlog, CLI `show` all work unchanged — but are filtered out of the
+   * board and `agetor ls`/TUI by default (D11), can't be deleted/archived
+   * individually (409 — the parent owns their lifecycle), and share the
+   * parent's worktree rather than materializing their own (D2). Set only at
+   * insert time; never patchable.
+   */
+  pipelineParentId?: string | null;
+  /**
+   * Id of the {@link PipelineStep} this step task executes, or null for a
+   * non-step task. Set only at insert time; never patchable.
+   */
+  pipelineStepId?: string | null;
   /**
    * Friendly mode id ("auto", "ask", "acceptEdits", "plan", …). Maps to
    * agent-specific CLI flags in `src/bun/agents.ts`. NULL means "use the
@@ -3778,7 +4056,7 @@ export type GlobalEvent =
        *  than the generic "waiting on you" used for permission prompts.
        *  Unset for transitions whose reason is fully implied by the
        *  (prev, column) pair (e.g. plain success → review). */
-      reason?: "api-error" | "approval" | "session-died" | "unknown-command";
+      reason?: "api-error" | "approval" | "session-died" | "unknown-command" | "pipeline";
     }
   | {
       kind: "update";
@@ -3868,6 +4146,23 @@ export type GlobalEvent =
       attempt: number;
       /** `FX_AUTO_RESUME_MAX` at the time this event fired. */
       max: number;
+      ts: number;
+    }
+  | {
+      /**
+       * A pipeline task's run state changed — a step execution started,
+       * settled, or the run itself transitioned (blocked/done/cancelled).
+       * Drives the run view's sub-poll-latency animation (D12,
+       * `docs/plans/pipelines.md`): the webview refetches the parent task
+       * plus its step tasks on receipt, with the 2s `/tasks` poll as the
+       * fallback. `activeStepIds` mirrors `PipelineRunState.active` at the
+       * moment this fired.
+       */
+      kind: "pipeline";
+      taskId: string;
+      status: PipelineRunStatus;
+      activeStepIds: string[];
+      stepCount: number;
       ts: number;
     };
 
