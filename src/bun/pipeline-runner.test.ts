@@ -1,13 +1,15 @@
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, beforeAll, afterEach, afterAll } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 // Top-level: db.ts captures AGETOR_DATA_DIR at first import — set it (and
 // the fake-driver env) before any dynamic import touches db.ts/orchestrator.ts,
 // mirroring orchestrator-agent-profiles.test.ts's own bootstrap.
-process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-runner-"));
+const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-runner-"));
+process.env.AGETOR_DATA_DIR = DATA_DIR;
 
 process.env.AGETOR_CLAUDE_DRIVER = "fake";
 process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
@@ -21,6 +23,75 @@ process.env.AGETOR_TMUX_BIN = "/bin/echo"; // tmux -V probe in agent-status pass
 beforeAll(async () => {
   const { initPipelineRunner } = await import("./pipeline-runner.ts");
   initPipelineRunner();
+});
+
+// `bun test` runs every file listed on the command line in ONE process with
+// a shared module cache: `db.ts` opens `agetor.sqlite` exactly once, in
+// whichever *.test.ts file's AGETOR_DATA_DIR happened to be captured first —
+// see `test-data-dir.ts`'s doc comment. That means this file's fake-driver
+// timers (`makeFakeAgent`'s `after(ms, …)` closures in agents.ts) and this
+// runner's own async step-launch/settle continuations are NOT necessarily
+// scoped to this file's own process lifetime the way they'd be if each file
+// got its own DB: a timer left running past the end of a test here can fire
+// while a LATER *.test.ts file in the same invocation is mid-`beforeEach`
+// truncating shared tables, producing an unhandled `FOREIGN KEY constraint
+// failed` in `runs.appendEvent` that derails bun's test runner for every
+// file after it. `liveParentIds` + `waitUntilIdle` below exist to make sure
+// nothing is left running when a test returns.
+let liveParentIds: string[] = [];
+
+/** Wait until pipeline task `parentId` is fully idle: its own
+ *  `pipelineRun.status` isn't `"running"` AND no step task's `column` is
+ *  `"running"` either — the same test `cancelPipelineRun` itself uses
+ *  (`run.active.filter((a) => tasks.get(a.taskId)?.column === "running")`)
+ *  to decide what's still live. A task that no longer exists (already
+ *  deleted by the test itself) counts as idle. Every test that starts a run
+ *  must await this before returning — see the file-level comment above for
+ *  why a still-pending fake-driver timer is dangerous, not just untidy. */
+async function waitUntilIdle(parentId: string, timeoutMs = 5000): Promise<void> {
+  const { tasks } = await import("./db.ts");
+  await waitFor(() => {
+    const t = tasks.get(parentId);
+    if (!t) return true;
+    if (t.pipelineRun?.status === "running") return undefined;
+    if (tasks.stepsForParent(parentId).some((s) => s.column === "running")) return undefined;
+    return true;
+  }, timeoutMs);
+}
+
+// Safety net: even with every test awaiting `waitUntilIdle` on its own
+// happy path, an assertion that throws mid-test would skip that final wait
+// and leave a run mid-flight. `deleteTask` kills any active handle
+// (including a fake driver's pending timers) synchronously as part of its
+// own cascade, so it doubles as a forceful "make sure nothing is still
+// ticking" — safe to call on a task that's already idle or already deleted.
+afterEach(async () => {
+  const ids = liveParentIds;
+  liveParentIds = [];
+  const { tasks } = await import("./db.ts");
+  const { deleteTask } = await import("./orchestrator.ts");
+  for (const id of ids) {
+    if (!tasks.get(id)) continue;
+    await deleteTask(id).catch(() => {});
+  }
+});
+
+// Final sweep: delete anything `afterEach` didn't already remove (a test
+// that intentionally leaves its parent task around for its own assertions),
+// then every pipeline/profile row this file created, then give any
+// still-in-flight fake-driver timer/continuation one more beat to drain
+// before attempting to remove the data dir (a no-op when `agetor.sqlite` is
+// still open under another file's AGETOR_DATA_DIR — see `rmTestDataDir`).
+afterAll(async () => {
+  const { tasks, pipelines, agentProfiles } = await import("./db.ts");
+  const { deleteTask } = await import("./orchestrator.ts");
+  for (const t of tasks.list()) {
+    if (t.pipelineId && !t.pipelineParentId) await deleteTask(t.id).catch(() => {});
+  }
+  for (const p of pipelines.list()) pipelines.delete(p.id);
+  for (const p of agentProfiles.list()) agentProfiles.delete(p.id);
+  await new Promise((r) => setTimeout(r, 150));
+  rmTestDataDir(DATA_DIR);
 });
 
 function uniqueName(label: string): string {
@@ -105,6 +176,7 @@ test("linear A→B→C reaches review with 3 succeeded history records, handoff 
   });
   if ("error" in created) throw new Error(created.error);
   const parentId = created.task.id;
+  liveParentIds.push(parentId);
 
   const started = await startTask(parentId);
   if ("error" in started) throw new Error(started.error);
@@ -132,6 +204,7 @@ test("linear A→B→C reaches review with 3 succeeded history records, handoff 
   const dir = pipelineRunsDir(parentId);
   expect(existsSync(dir)).toBe(true);
   expect(readdirSync(dir).length).toBeGreaterThan(0);
+  await waitUntilIdle(parentId);
 });
 
 test("branching by name: A picks C over B via handoff.next", async () => {
@@ -157,6 +230,7 @@ test("branching by name: A picks C over B via handoff.next", async () => {
   const created = await createTask({ title: "branch run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
   if ("error" in created) throw new Error(created.error);
   const parentId = created.task.id;
+  liveParentIds.push(parentId);
   const started = await startTask(parentId);
   if ("error" in started) throw new Error(started.error);
 
@@ -170,6 +244,7 @@ test("branching by name: A picks C over B via handoff.next", async () => {
   expect(steps.length).toBe(2);
   expect(steps.some((s) => s.pipelineStepId === C.id)).toBe(true);
   expect(steps.some((s) => s.pipelineStepId === B.id)).toBe(false);
+  await waitUntilIdle(parentId);
 });
 
 test(":missing → blocked handoff-missing; advancePipeline(nextStepIds:[B]) continues to done", async () => {
@@ -188,6 +263,7 @@ test(":missing → blocked handoff-missing; advancePipeline(nextStepIds:[B]) con
   const created = await createTask({ title: "missing run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
   if ("error" in created) throw new Error(created.error);
   const parentId = created.task.id;
+  liveParentIds.push(parentId);
   const started = await startTask(parentId);
   if ("error" in started) throw new Error(started.error);
 
@@ -209,6 +285,7 @@ test(":missing → blocked handoff-missing; advancePipeline(nextStepIds:[B]) con
   expect(done.column).toBe("review");
   const advancedRecord = done.pipelineRun!.history.find((h) => h.stepId === A.id);
   expect(advancedRecord?.outcome).toBe("advanced-manually");
+  await waitUntilIdle(parentId);
 });
 
 test(":invalid → blocked handoff-invalid", async () => {
@@ -225,6 +302,7 @@ test(":invalid → blocked handoff-invalid", async () => {
   const created = await createTask({ title: "invalid run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
   if ("error" in created) throw new Error(created.error);
   const parentId = created.task.id;
+  liveParentIds.push(parentId);
   const started = await startTask(parentId);
   if ("error" in started) throw new Error(started.error);
 
@@ -233,6 +311,7 @@ test(":invalid → blocked handoff-invalid", async () => {
     return t?.pipelineRun?.status === "blocked" ? t : undefined;
   });
   expect(blocked.pipelineRun!.blocked.some((b) => b.kind === "handoff-invalid")).toBe(true);
+  await waitUntilIdle(parentId);
 });
 
 test("fan-out transition:\"all\" (A→B,C) then join:\"all\" (D) — both branches run in parallel, D starts once with two previous handoffs", async () => {
@@ -261,6 +340,7 @@ test("fan-out transition:\"all\" (A→B,C) then join:\"all\" (D) — both branch
   const created = await createTask({ title: "join-all run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
   if ("error" in created) throw new Error(created.error);
   const parentId = created.task.id;
+  liveParentIds.push(parentId);
   const started = await startTask(parentId);
   if ("error" in started) throw new Error(started.error);
 
@@ -279,6 +359,7 @@ test("fan-out transition:\"all\" (A→B,C) then join:\"all\" (D) — both branch
   expect(dSteps[0]!.prompt).toContain('From "C"');
   expect(finished.pipelineRun!.history.length).toBe(4);
   expect(Object.keys(finished.pipelineRun!.joins).length).toBe(0);
+  await waitUntilIdle(parentId);
 });
 
 test("join:\"any\" (D, default) starts twice — once per arrival", async () => {
@@ -307,6 +388,7 @@ test("join:\"any\" (D, default) starts twice — once per arrival", async () => 
   const created = await createTask({ title: "join-any run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
   if ("error" in created) throw new Error(created.error);
   const parentId = created.task.id;
+  liveParentIds.push(parentId);
   const started = await startTask(parentId);
   if ("error" in started) throw new Error(started.error);
 
@@ -319,6 +401,7 @@ test("join:\"any\" (D, default) starts twice — once per arrival", async () => 
   const dSteps = steps.filter((s) => s.pipelineStepId === D.id);
   expect(dSteps.length).toBe(2);
   expect(finished.pipelineRun!.history.length).toBe(5); // A, B, C, D, D
+  await waitUntilIdle(parentId);
 });
 
 test("join-incomplete when the other incoming path never arrives; manual advance launches the join with the partial arrival", async () => {
@@ -351,6 +434,7 @@ test("join-incomplete when the other incoming path never arrives; manual advance
   const created = await createTask({ title: "join-incomplete run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
   if ("error" in created) throw new Error(created.error);
   const parentId = created.task.id;
+  liveParentIds.push(parentId);
   const started = await startTask(parentId);
   if ("error" in started) throw new Error(started.error);
 
@@ -376,6 +460,7 @@ test("join-incomplete when the other incoming path never arrives; manual advance
   expect(dStep.prompt).toContain('From "B"');
   expect(dStep.prompt).not.toContain('From "C"');
   expect(Object.keys(finished.pipelineRun!.joins).length).toBe(0);
+  await waitUntilIdle(parentId);
 });
 
 test("step cap: A↔B cycle with maxSteps 3 blocks with step-cap after 3 executions", async () => {
@@ -400,6 +485,7 @@ test("step cap: A↔B cycle with maxSteps 3 blocks with step-cap after 3 executi
   const created = await createTask({ title: "cap run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
   if ("error" in created) throw new Error(created.error);
   const parentId = created.task.id;
+  liveParentIds.push(parentId);
   const started = await startTask(parentId);
   if ("error" in started) throw new Error(started.error);
 
@@ -410,6 +496,7 @@ test("step cap: A↔B cycle with maxSteps 3 blocks with step-cap after 3 executi
   expect(blocked.pipelineRun!.blocked.some((b) => b.kind === "step-cap")).toBe(true);
   expect(blocked.pipelineRun!.stepCount).toBe(3);
   expect(blocked.pipelineRun!.history.length).toBe(3);
+  await waitUntilIdle(parentId);
 });
 
 test("cancel mid-step then retry restarts the same step task", async () => {
@@ -429,6 +516,7 @@ test("cancel mid-step then retry restarts the same step task", async () => {
     const created = await createTask({ title: "cancel run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
     if ("error" in created) throw new Error(created.error);
     const parentId = created.task.id;
+    liveParentIds.push(parentId);
     const started = await startTask(parentId);
     if ("error" in started) throw new Error(started.error);
 
@@ -459,6 +547,16 @@ test("cancel mid-step then retry restarts the same step task", async () => {
     expect(runningAgain.pipelineRun!.active.length).toBe(1);
     // Retry re-runs the SAME step task, never inserts a second one.
     expect(tasks.stepsForParent(parentId).length).toBe(1);
+
+    // Let the retried run's fake-driver resolve (bounded by the 700ms delay
+    // above) actually fire before this test returns — the closure captured
+    // `resolveDelayMs` at spawn time, so deleting the env var in `finally`
+    // below does NOT stop it. Without this wait the retried run's turn
+    // resolves ~700ms after this test has already ended, well after this
+    // whole file's own tests may be done — see the file-level comment above
+    // `waitUntilIdle` for why a fake-driver timer that outlives its test is
+    // dangerous under a shared-process `bun test` invocation, not just untidy.
+    await waitUntilIdle(parentId);
   } finally {
     delete process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
   }
@@ -480,6 +578,7 @@ test("delete cascade removes step tasks + run dir; archive cascade archives step
   const created = await createTask({ title: "cascade run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
   if ("error" in created) throw new Error(created.error);
   const parentId = created.task.id;
+  liveParentIds.push(parentId);
   const started = await startTask(parentId);
   if ("error" in started) throw new Error(started.error);
 
@@ -521,6 +620,7 @@ test("delete cascade removes step tasks + run dir; archive cascade archives step
     expect(tasks.get(s.id)).toBeNull();
   }
   expect(existsSync(dir)).toBe(false);
+  await waitUntilIdle(parentId); // no-op here (parent already gone) — kept for consistency
 });
 
 test("createTask rejects pipelineId+agentProfileId together, an unknown pipeline, and a pipeline with a step that has no agent", async () => {
@@ -576,6 +676,7 @@ test("effectiveAgentProfile returns the frozen snapshot (never \"live\") for a s
   const created = await createTask({ title: "effective run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
   if ("error" in created) throw new Error(created.error);
   const parentId = created.task.id;
+  liveParentIds.push(parentId);
   const started = await startTask(parentId);
   if ("error" in started) throw new Error(started.error);
 
@@ -584,4 +685,9 @@ test("effectiveAgentProfile returns the frozen snapshot (never \"live\") for a s
   expect(resolved).not.toBeNull();
   expect(resolved!.source).toBe("snapshot");
   expect(resolved!.profile.id).toBe(profile.id);
+
+  // The step's fake handoff turn is still in flight at this point (only its
+  // task ROW has appeared, not its resolve) — let it finish before this
+  // test returns, same reasoning as every other test in this file.
+  await waitUntilIdle(parentId);
 });

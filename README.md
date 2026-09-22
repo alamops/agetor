@@ -16,6 +16,7 @@ It runs entirely on your machine. No cloud relay, no remote sandbox — agents e
 
 - **Multi-agent, multi-account.** Built-in support for five agent kinds: `claude-code`, `codex`, `cursor`, `gemini`, and `fx` (Vercel Labs' `fx.sh`, driven over the Agent Client Protocol rather than a tmux-hosted CLI — ships experimental and disabled by default until you enable it in Settings). Define additional *harnesses* to run a second account of any of them in parallel — each one gets a dedicated `$HOME` so logins, history, and config never collide.
 - **Agents.** Save a harness + model + effort + mode + free-text instructions + a skills list as a named, reusable **Agent** in Settings → Agents, then pick it on task launch instead of choosing each field by hand. Its instructions are injected into the launch prompt; a task follows the live agent until its first run, then keeps exactly what it launched with even if the agent changes later. See [Agents](#agents) below.
+- **Pipelines.** Chain several Agents into a named, reusable graph on a full-page canvas — each step hands the next one context via a small JSON handoff it emits at the end of its turn. Running a pipeline creates one board card; agetor drives its steps as hidden tasks sharing one worktree, animating the run live (active step, traversed edges, a token on each handoff) and stopping on `Blocked` whenever a step needs you. Supports branching (a step's agent picks the next step by name), parallel fan-out/fan-in, and cycles. See [Pipelines](#pipelines) below.
 - **Per-task git worktrees.** Every task runs on its own branch (`agetor/<short-id>-<slug>`) in a dedicated worktree under `~/.agetor/worktrees/`. Two agents can hammer the same repo simultaneously without stepping on each other. Base ref is pinned at create time, so re-runs always start from the same commit.
 - **Interactive Claude sessions.** Claude Code is hosted in a per-task `tmux` session that stays alive across multiple turns. Follow up on a task without losing the conversation. Output is streamed by tailing Claude's own JSONL transcript, so assistant text, thinking blocks, tool calls, and tool results all render with their own UI components.
 - **Approvals and questions, lifted out of the TUI.** Agetor watches Claude's tmux pane and JSONL transcript to detect `AskUserQuestion` / `ExitPlanMode` modals and tool-permission prompts, and surfaces them in the run panel as structured cards — radios, checkboxes, free-text. It's fully non-invasive: it registers no MCP server and installs no hook (it only strips stale entries left by older builds). Codex prompts are detected heuristically from stdout and surfaced the same way.
@@ -143,7 +144,9 @@ agetor                       # full-screen live dashboard (board + streaming det
 agetor add                   # create a task (guided wizard, or --title/--prompt[/--start])
 agetor add --issue <url>     # seed a task from a GitHub/GitLab issue + its thread (uses --workdir or the cwd)
 agetor add --profile <id|name>  # launch from a saved Agent instead of picking --agent/--model/--mode/--effort by hand
+agetor add --pipeline <id|name>  # launch a saved Pipeline instead — its steps supply every agent/model/mode/effort
 agetor ls [filters]          # list tasks (--column/--agent/--type/--repo/--search/--archived/--all)
+agetor ls --steps            # also list hidden pipeline step tasks (hidden by default)
 agetor ps                    # list running / blocked tasks only
 agetor show <id>             # details, runs, pending interactions
 
@@ -171,6 +174,7 @@ agetor rm <id> --yes         # delete a task (worktree + branch)
 agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
 agetor harness <sub>         # list | add | edit | enable | disable | rm | shell  (aliases / accounts; shell = log in)
 agetor profile <sub>         # ls | show <ref> | add <name> | edit <ref> | rm <ref>  (alias: profiles — saved launch presets, see Agents above)
+agetor pipeline <sub>        # ls | show <ref> | rm <ref> | export <ref> [--out f] | import <file>  (see Pipelines above)
 agetor daemon status|start|stop
 agetor info                  # the connected core's version
 agetor config [k] [v]        # view / set core preferences (defaultHarness, last model/mode/effort)
@@ -256,6 +260,37 @@ An **Agent** is a named, reusable launch preset — a harness + model + effort +
 Pick an Agent from the picker on any launch surface (New Task form, the Resolve-Conflicts and Create-from-issue dialogs) instead of choosing harness/mode/model/effort by hand — its instructions get injected into the launch prompt, and its skills are suggested to the agent up front. A task follows its *live* agent (so an edit to the agent in Settings is reflected) right up until the task's first run, then freezes: from then on the task keeps exactly what it launched with, even if you later edit or delete the agent.
 
 Task details shows the bound agent as a compact chip in its own **Agent** row (the harness picker next to it is labeled **Harness**, since "agent" here means the profile, not the CLI). Click the chip to open a details dialog with the task's frozen snapshot — name, harness, model, effort, mode, instructions, skills — plus a status line telling you whether it's still following the live agent or frozen since the first run, and a link back to Settings to edit it. **Detach** unbinds the task from the agent (keeping its current values) and unlocks the harness/mode/model/effort pickers again.
+
+### Pipelines
+
+A **pipeline** is a named, reusable graph of **steps**, each bound to an [Agent](#agents). Build one on the full-page canvas editor (the **Pipelines** button in the header, or Settings → Pipelines): drag out step nodes, connect them, and give each step its own instructions and agent. Running a pipeline creates one ordinary board card — agetor drives it by running each step as a hidden task that shares the pipeline card's worktree, one at a time (or several at once, for a branch that fans out).
+
+Each step ends its turn with a small JSON block telling agetor what happened and what should run next:
+
+```
+<handoff>
+{
+  "purpose": "Add CSV export to the reports page",
+  "summary": "Implemented the export endpoint and button; tests pass.",
+  "reason": "Ready for review — handing off to the QA step",
+  "next": "QA",
+  "artifacts": ["src/routes/export.ts"],
+  "openQuestions": []
+}
+</handoff>
+```
+
+`next` names the step to run next (by its name, or by an edge's label if you've given the connecting edge one). A step can instead be set to run **all** of its outgoing steps in parallel (fan-out), and a downstream step can wait for **any** one of its incoming steps to arrive (the default — this is also how loops/cycles work) or for **all** of them before it starts (a join, receiving every branch's handoff at once). A step with no outgoing edges ends that path.
+
+When a step doesn't emit a valid handoff, asks a question, or its run fails, the pipeline card goes to **Blocked** with a reason — you can **Retry** the stuck step, or **manually advance** it (pick which step runs next yourself, optionally with your own summary). A run-away cycle is capped (25 steps by default, configurable per pipeline).
+
+Click a pipeline card to open the full-page run view: the graph animates as it runs (the active step pulses, a token travels each edge on handoff), and clicking any step node opens that step's normal task details on top, exactly like any other task — you can read its full transcript, chat with it, or look at its diff.
+
+A step can also list which other Agents it's *allowed to delegate to* as subagents, with an optional cap — this is injected into the step's prompt as guidance; agetor doesn't enforce the cap itself.
+
+Deleting or archiving a pipeline task cascades to all of its step tasks; a step task can't be deleted or archived on its own — act on the pipeline task instead. Editing or deleting the underlying pipeline (or an agent it uses) never affects a run already in progress — everything is frozen the moment you click Run.
+
+**Caveat:** parallel steps (fan-out) share the *same* worktree — nothing stops two concurrent steps from editing the same files, so use fan-out for genuinely independent pieces of work (e.g. one step writing docs while another writes tests), not for steps racing over the same code.
 
 ### Modes, models, and effort
 
