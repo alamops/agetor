@@ -126,11 +126,12 @@ export function ProjectPicker({
             </button>
             <button
               type="button"
+              data-testid="project-clone-open"
               onClick={() => setCloneOpen(true)}
               className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-accent/60"
             >
               <GitBranch className="size-3.5" aria-hidden />
-              Checkout from GitHub…
+              Clone repository…
             </button>
           </>
         }
