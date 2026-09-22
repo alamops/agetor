@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -11,15 +12,19 @@ import { homedir, tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import {
+  cancelClone,
   cloneAuthEnv,
   cloneAuthHeader,
   cloneRepo,
   defaultCloneDest,
   explainCloneFailure,
   isAuthShapedCloneFailure,
+  parseCloneProgress,
   pickCloneDisplayLine,
+  readCloneStderrStream,
   resolveCloneRepo,
   sanitizeCloneStderr,
+  type CloneProgress,
 } from "./clone.ts";
 import { __clearApiHostCacheForTest } from "./git-provider.ts";
 import { setGitHubToken } from "./github-tokens.ts";
@@ -813,6 +818,251 @@ describe("ReDoS linearity (review finding #2b)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// parseCloneProgress (Addendum A) — table over REAL git 2.51 `--progress`
+// records, captured live against a local `file://` clone (no network) of
+// two generated repos: a 400-commit/400-file one (`bare`, small enough that
+// "Compressing objects"/"Resolving deltas" show a real percentage sweep) and
+// a 60,000-file single-commit one (`bare3`, large enough to trigger
+// "Updating files" — git only shows that phase once a checkout is slow
+// enough to clear its own progress-display delay). Every fixture below is
+// the EXACT string a real `git clone --progress` wrote to stderr for one
+// `\r`/`\n`-delimited record, trailing space padding (git's own
+// line-clearing) included — see docs/plans/clone-repository-all-providers.md
+// Addendum A.
+// ---------------------------------------------------------------------------
+
+describe("parseCloneProgress", () => {
+  const cases: Array<[string, { phase: string; percent: number | null }]> = [
+    ["Cloning into 'dest3'...", { phase: "starting", percent: null }],
+    ["remote: Enumerating objects: 60003, done.        ", { phase: "counting", percent: null }],
+    ["remote: Counting objects:   0% (1/60003)        ", { phase: "counting", percent: 0 }],
+    ["remote: Counting objects:  10% (6001/60003)        ", { phase: "counting", percent: 10 }],
+    ["remote: Counting objects: 100% (60003/60003)        ", { phase: "counting", percent: 100 }],
+    ["remote: Counting objects: 100% (60003/60003), done.        ", { phase: "counting", percent: 100 }],
+    ["remote: Compressing objects:  50% (1/2)        ", { phase: "compressing", percent: 50 }],
+    ["remote: Compressing objects: 100% (2/2)        ", { phase: "compressing", percent: 100 }],
+    ["remote: Compressing objects: 100% (2/2), done.        ", { phase: "compressing", percent: 100 }],
+    ["Receiving objects:   0% (1/60003)", { phase: "receiving", percent: 0 }],
+    ["Receiving objects:  10% (6001/60003)", { phase: "receiving", percent: 10 }],
+    ["Receiving objects: 100% (60003/60003)", { phase: "receiving", percent: 100 }],
+    [
+      "Receiving objects: 100% (60003/60003), 2.67 MiB | 40.26 MiB/s, done.",
+      { phase: "receiving", percent: 100 },
+    ],
+    ["Resolving deltas:   0% (0/664)", { phase: "resolving", percent: 0 }],
+    ["Resolving deltas:  10% (67/664)", { phase: "resolving", percent: 10 }],
+    ["Resolving deltas: 100% (664/664)", { phase: "resolving", percent: 100 }],
+    ["Resolving deltas: 100% (664/664), done.", { phase: "resolving", percent: 100 }],
+    ["Updating files:  17% (10347/60000)", { phase: "checking-out", percent: 17 }],
+    ["Updating files: 100% (60000/60000)", { phase: "checking-out", percent: 100 }],
+    ["Updating files: 100% (60000/60000), done.", { phase: "checking-out", percent: 100 }],
+  ];
+
+  for (const [record, expected] of cases) {
+    test(`recognizes: ${JSON.stringify(record)}`, () => {
+      const result = parseCloneProgress(record);
+      expect(result).not.toBeNull();
+      expect(result!.phase).toBe(expected.phase as CloneProgress["phase"]);
+      expect(result!.percent).toBe(expected.percent);
+      // The returned `line` is the sanitized (trimmed) record — every real
+      // fixture above round-trips exactly, modulo the trailing space padding
+      // git itself pads progress lines with for terminal-clearing purposes.
+      expect(result!.line).toBe(record.trim());
+    });
+  }
+
+  test("remote: Total … (git's one-off transfer summary) is NOT a progress record", () => {
+    // Real capture: interleaved mid-stream between two `Receiving objects`
+    // records on the SAME line in git's raw output (no `\r`/`\n` of its
+    // own separating it from the previous record) — but by the time this
+    // function ever sees it, `readCloneStderrStream` has already split it
+    // out as its own record.
+    expect(
+      parseCloneProgress("remote: Total 60003 (delta 0), reused 60003 (delta 0), pack-reused 0 (from 0)        "),
+    ).toBeNull();
+  });
+
+  test("junk / unrecognized text is null", () => {
+    expect(parseCloneProgress("fatal: Authentication failed for 'https://x/'")).toBeNull();
+    expect(parseCloneProgress("")).toBeNull();
+    expect(parseCloneProgress("   ")).toBeNull();
+    expect(parseCloneProgress("warning: redirecting to https://x/")).toBeNull();
+  });
+
+  test("ANSI escape sequences are neutralized (control chars stripped) and the result still doesn't match — junk, not a crash", () => {
+    const withAnsi = "\x1b[31msome random colored text\x1b[0m";
+    expect(parseCloneProgress(withAnsi)).toBeNull();
+  });
+
+  test("an overlong JUNK line (no recognized prefix) is null, regardless of length", () => {
+    const overlong = "x".repeat(10_000);
+    expect(parseCloneProgress(overlong)).toBeNull();
+  });
+
+  test("an overlong PROGRESS-shaped line is recognized (phase/percent survive) and its `line` is capped at 200 chars", () => {
+    const record = "Receiving objects:  42% (10/20)" + "z".repeat(5_000);
+    const result = parseCloneProgress(record);
+    expect(result).not.toBeNull();
+    expect(result!.phase).toBe("receiving");
+    expect(result!.percent).toBe(42);
+    expect(result!.line.length).toBe(200);
+    expect(result!.line.startsWith("Receiving objects:  42% (10/20)")).toBe(true);
+  });
+
+  test("a malformed 4-digit percent capture clamps to 100 rather than overflowing", () => {
+    // `\d{1,3}` never captures more than 3 digits by construction, but a
+    // pathological 3-digit value above 100 (git itself never emits one) must
+    // still clamp rather than propagate a nonsensical percent.
+    const result = parseCloneProgress("Receiving objects: 999% (1/1)");
+    expect(result).not.toBeNull();
+    expect(result!.percent).toBe(100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// readCloneStderrStream — the streaming reader (Addendum A)
+// ---------------------------------------------------------------------------
+
+/** Builds a `ReadableStream<Uint8Array>` that emits `chunks` (UTF-8 encoded)
+ *  in order, each after `delayMs` (default 0 — emitted as fast as possible,
+ *  all in one microtask turn) — used to control how much real wall time
+ *  `readCloneStderrStream`'s rate limiter sees between chunks. */
+function streamOfChunks(chunks: string[], delayMs = 0): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  let i = 0;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (i >= chunks.length) {
+        controller.close();
+        return;
+      }
+      if (delayMs > 0 && i > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      controller.enqueue(encoder.encode(chunks[i]));
+      i++;
+    },
+  });
+}
+
+describe("readCloneStderrStream", () => {
+  test("splits on both \\r and \\n, excludes progress records from the returned text, keeps non-progress lines", () => {
+    const text =
+      "Cloning into 'x'...\r" +
+      "remote: Counting objects:  50% (1/2)        \r" +
+      "remote: Total 2 (delta 0), reused 2 (delta 0), pack-reused 0 (from 0)        \n" +
+      "fatal: Authentication failed for 'https://x/'\n";
+    const events: CloneProgress[] = [];
+    return readCloneStderrStream(streamOfChunks([text]), (p) => events.push(p)).then((stderr) => {
+      expect(events.map((e) => e.phase)).toEqual(["starting", "counting"]);
+      expect(stderr).not.toContain("Cloning into");
+      expect(stderr).not.toContain("Counting objects");
+      expect(stderr).toContain("remote: Total 2");
+      expect(stderr).toContain("fatal: Authentication failed");
+    });
+  });
+
+  test("a trailing record with no terminating \\r/\\n is still flushed", async () => {
+    const events: CloneProgress[] = [];
+    const stderr = await readCloneStderrStream(
+      streamOfChunks(["Receiving objects:  50% (1/2)"]),
+      (p) => events.push(p),
+    );
+    expect(events).toHaveLength(1);
+    expect(events[0]!.phase).toBe("receiving");
+    expect(stderr).toBe("");
+  });
+
+  test("a single record split across two chunks (no separator in between) is reassembled correctly", async () => {
+    const events: CloneProgress[] = [];
+    const stderr = await readCloneStderrStream(
+      streamOfChunks(["Receiving objects:  5", "0% (1/2)\r"]),
+      (p) => events.push(p),
+    );
+    expect(events).toHaveLength(1);
+    expect(events[0]!.percent).toBe(50);
+    expect(stderr).toBe("");
+  });
+
+  test("a multi-byte UTF-8 character split across two chunks decodes correctly instead of producing replacement characters", async () => {
+    // "café" — the "é" is a 2-byte UTF-8 sequence; split the encoded bytes
+    // so the second chunk starts mid-character.
+    const encoded = new TextEncoder().encode("fatal: café is not a repository\n");
+    const first = encoded.slice(0, encoded.length - 1);
+    const second = encoded.slice(encoded.length - 1);
+    const chunks: Uint8Array[] = [first, second];
+    let i = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (i >= chunks.length) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(chunks[i]!);
+        i++;
+      },
+    });
+    const stderr = await readCloneStderrStream(stream);
+    expect(stderr).toBe("fatal: café is not a repository");
+  });
+
+  test("rate limiting: 1000 same-phase records fed in one synchronous chunk yield a bounded event count — the first (phase change) and the one 100% record always forward, everything else in between is dropped", async () => {
+    // Deliberately fed as ONE chunk so the whole feed loop runs
+    // synchronously with no `await` in between records — real elapsed time
+    // across the loop is far under the 100ms window, so this is a
+    // deterministic lower bound on how aggressively the limiter drops
+    // records, not a timing-flaky assertion.
+    const records: string[] = [];
+    for (let i = 0; i < 999; i++) {
+      records.push(`Receiving objects:  ${Math.min(99, i % 100)}% (${i}/1000)`);
+    }
+    records.push("Receiving objects: 100% (1000/1000)"); // the ONE 100% record
+    const text = records.join("\r") + "\r";
+
+    const events: CloneProgress[] = [];
+    await readCloneStderrStream(streamOfChunks([text]), (p) => events.push(p));
+
+    // Bounded — nowhere near the 1000 input records.
+    expect(events.length).toBeLessThan(10);
+    // The very first record (a phase change from "no phase yet") always
+    // forwards...
+    expect(events[0]!.phase).toBe("receiving");
+    expect(events[0]!.percent).toBe(0);
+    // ...and the 100% completion always forwards, never dropped.
+    expect(events.some((e) => e.percent === 100)).toBe(true);
+  });
+
+  test("rate limiting: a second same-phase record sent after the 100ms window elapses IS forwarded", async () => {
+    const events: CloneProgress[] = [];
+    await readCloneStderrStream(
+      streamOfChunks(["Receiving objects:  10% (1/10)\r", "Receiving objects:  20% (2/10)\r"], 150),
+      (p) => events.push(p),
+    );
+    // Both forwarded: the first is a phase change (always sent), the second
+    // arrives well past CLONE_PROGRESS_MIN_INTERVAL_MS (100ms) later.
+    expect(events.map((e) => e.percent)).toEqual([10, 20]);
+  });
+
+  test("the byte-read cap still applies: an oversized stream is drained without unbounded memory growth, and progress recorded before the cap still forwards", async () => {
+    const events: CloneProgress[] = [];
+    const chunkSize = 200_000;
+    const chunks = [
+      "Receiving objects:  1% (1/1000000)\r",
+      ...Array.from({ length: 20 }, () => "y".repeat(chunkSize)), // 4MB total, well past the 1MB cap
+    ];
+    const totalInputBytes = chunks.reduce((sum, c) => sum + Buffer.byteLength(c), 0);
+    expect(totalInputBytes).toBeGreaterThan(3 * 1024 * 1024);
+
+    const stderr = await readCloneStderrStream(streamOfChunks(chunks), (p) => events.push(p));
+
+    // Progress recorded before the stream ever crosses the cap still forwards.
+    expect(events.length).toBeGreaterThanOrEqual(1);
+    expect(events[0]!.percent).toBe(1);
+    // The reader stopped decoding/accumulating well before the full input —
+    // bounded memory, not "read everything, then truncate at the end".
+    expect(stderr.length).toBeLessThan(totalInputBytes / 2);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // cloneAuthHeader
 // ---------------------------------------------------------------------------
 
@@ -1310,4 +1560,185 @@ describe("cloneRepo", () => {
       else process.env.GIT_SSH_COMMAND = original;
     }
   }, 15_000);
+
+  // -------------------------------------------------------------------------
+  // Progress streaming + cancel (Addendum A,
+  // docs/plans/clone-repository-all-providers.md).
+  // -------------------------------------------------------------------------
+
+  test(
+    "progress: a real file:// clone yields progress events in phase order (starting first, done last), never rate-limited into silence",
+    async () => {
+      const root = mkdtempSync(path.join(tmpdir(), "agetor-clone-progress-"));
+      // `file://` (not a bare path) is what actually forces git to emit
+      // remote-side progress records — a plain path clone hard-links and
+      // prints far less (see this file's `parseCloneProgress` fixtures'
+      // header comment, and docs/plans/clone-repository-all-providers.md
+      // Addendum A).
+      const barePath = makeBareSourceRepo(root);
+      const dest = path.join(dir, "progress-file-clone");
+      const events: CloneProgress[] = [];
+      const result = await cloneRepo(`file://${barePath}`, dest, {
+        onProgress: (p) => events.push(p),
+      });
+      expect(result.ok).toBe(true);
+      expect(existsSync(path.join(dest, "README.md"))).toBe(true);
+
+      expect(events.length).toBeGreaterThan(0);
+      expect(events[0]!.phase).toBe("starting");
+      expect(events.at(-1)!.phase).toBe("done");
+      expect(events.at(-1)!.percent).toBe(100);
+
+      // Whatever subset of the known phase sequence actually occurred (a
+      // tiny one-commit repo may skip "compressing"/"resolving"/
+      // "checking-out" entirely — git only shows those once there's enough
+      // work to make displaying a percentage worthwhile), the phases that DID
+      // occur must appear in non-decreasing order against that sequence.
+      const order = ["starting", "counting", "compressing", "receiving", "resolving", "checking-out", "done"];
+      let lastIndex = -1;
+      for (const e of events) {
+        const idx = order.indexOf(e.phase);
+        expect(idx).toBeGreaterThanOrEqual(lastIndex);
+        lastIndex = idx;
+      }
+
+      // Never a credential in any progress line.
+      for (const e of events) {
+        expect(e.line).not.toContain("Authorization");
+        expect(e.line).not.toContain("token");
+      }
+    },
+    30_000,
+  );
+
+  test(
+    "progress: a failing clone still gets a terminal `failed` event carrying the same error text as the returned result",
+    async () => {
+      const dest = path.join(dir, "progress-failed-clone");
+      const events: CloneProgress[] = [];
+      const result = await cloneRepo(path.join(dir, "no-such-repo-for-progress"), dest, {
+        onProgress: (p) => events.push(p),
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error).toBeDefined();
+      expect(events[0]!.phase).toBe("starting");
+      const last = events.at(-1)!;
+      expect(last.phase).toBe("failed");
+      expect(last.line).toBe(result.error as string);
+    },
+  );
+
+  test(
+    "cancel: killing the in-flight anonymous attempt returns { ok:false, cancelled:true }, cleans up a freshly-created destination, never calls the auth resolver, empties the registry, and a second cancel or an unknown id is a no-op",
+    async () => {
+      const root = mkdtempSync(path.join(tmpdir(), "agetor-clone-cancel-"));
+      makeBareSourceRepo(root);
+      const requireAuth = basicAuthValue("x-access-token:good-tok");
+      // A generous per-request delay gives the test a wide window to send
+      // the cancel while attempt 1's anonymous request is still in flight,
+      // well before the server would even answer its 401.
+      const server = startAuthGitServer(root, { requireAuth, delayMs: 4_000 });
+      try {
+        const cloneId = "cancel-test-anon";
+        let authCalls = 0;
+        const dest = path.join(dir, "cancel-anon-fresh");
+        const events: CloneProgress[] = [];
+        const clonePromise = cloneRepo(`${server.url}/repo.git`, dest, {
+          cloneId,
+          onProgress: (p) => events.push(p),
+          auth: async () => {
+            authCalls++;
+            return { origin: `${server.url}/`, header: `Authorization: ${requireAuth}` };
+          },
+          transport: "https",
+          host: "127.0.0.1",
+        });
+
+        // Give git a moment to actually spawn, connect, and issue its first
+        // request — then cancel while that request is still held by the
+        // server's delay.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        expect(cancelClone(cloneId)).toBe(true);
+
+        const result = await clonePromise;
+        expect(result).toEqual({ ok: false, cancelled: true, error: "clone cancelled" });
+        expect(authCalls).toBe(0);
+        // `dest` did not pre-exist, so a cancelled clone leaves it ABSENT.
+        expect(existsSync(dest)).toBe(false);
+        expect(events.at(-1)).toEqual({ phase: "cancelled", percent: null, line: "clone cancelled" });
+
+        // The registry entry is gone once `cloneRepo` has settled — a
+        // second cancel, and an unrelated unknown id, are both no-ops.
+        expect(cancelClone(cloneId)).toBe(false);
+        expect(cancelClone("no-such-clone-id")).toBe(false);
+      } finally {
+        server.stop();
+      }
+    },
+    30_000,
+  );
+
+  test(
+    "cancel: a pre-existing empty destination is kept (never removed), but its partial contents are cleaned back to empty",
+    async () => {
+      const root = mkdtempSync(path.join(tmpdir(), "agetor-clone-cancel-preexist-"));
+      makeBareSourceRepo(root);
+      const server = startAuthGitServer(root, { delayMs: 4_000 }); // anonymous-open, just slow
+      try {
+        const cloneId = "cancel-test-preexisting";
+        const dest = path.join(dir, "cancel-preexisting-dest");
+        mkdirSync(dest);
+        const events: CloneProgress[] = [];
+        const clonePromise = cloneRepo(`${server.url}/repo.git`, dest, {
+          cloneId,
+          onProgress: (p) => events.push(p),
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        expect(cancelClone(cloneId)).toBe(true);
+
+        const result = await clonePromise;
+        expect(result).toEqual({ ok: false, cancelled: true, error: "clone cancelled" });
+        // The directory ENTRY itself survives...
+        expect(existsSync(dest)).toBe(true);
+        // ...but whatever git had already written into it is gone.
+        expect(readdirSync(dest)).toEqual([]);
+        expect(events.at(-1)!.phase).toBe("cancelled");
+      } finally {
+        server.stop();
+      }
+    },
+    30_000,
+  );
+
+  test("cancel: an unknown cloneId is always a no-op", () => {
+    expect(cancelClone("never-registered-anywhere")).toBe(false);
+  });
+
+  test(
+    "cancel: calling cancelClone after a clone has already settled successfully is a no-op (the post-settle race)",
+    async () => {
+      const dest = path.join(dir, "cancel-after-settle");
+      const cloneId = "cancel-after-settle-id";
+      const result = await cloneRepo(sourceRepo, dest, { cloneId });
+      expect(result.ok).toBe(true);
+      // `cloneRepo`'s promise has already resolved — `runGitClone`'s
+      // `finally` has already removed the registry entry for this id, so
+      // there is nothing left for `cancelClone` to act on.
+      expect(cancelClone(cloneId)).toBe(false);
+    },
+  );
+
+  // "A cancel arriving BETWEEN cloneRepo's two attempts" is NOT independently
+  // testable from outside `cloneRepo` (same shape as the destination-race
+  // note above this section): `runGitClone`'s `finally` removes attempt 1's
+  // registry entry, and — only if a retry actually runs — a fresh entry for
+  // attempt 2 is registered inside the NEXT `runGitClone` call, but there is
+  // no `await` in `cloneRepo` between those two points that anything
+  // outside the function could schedule a `cancelClone` call into. This is
+  // therefore covered by reasoning only, the same treatment the pre-existing
+  // destination-race note above gives its own untestable race: a
+  // `cancelClone` call landing in that window finds no registry entry (the
+  // same code path already exercised by "an unknown cloneId is always a
+  // no-op" above) and correctly returns `false`.
 });
