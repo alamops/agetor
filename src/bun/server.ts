@@ -26,7 +26,7 @@ import {
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
@@ -175,6 +175,7 @@ import {
 } from "./interactions.ts";
 import {
   DEFAULT_BRANCH_CONFIG,
+  DEFAULT_MODEL,
   EVENTS_PAGE_MAX_BYTES,
   EVENTS_REPLAY_ANCHOR_MAX_BYTES,
   EVENTS_REPLAY_ANCHOR_MAX_EVENTS,
@@ -922,6 +923,38 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if ("error" in launch) {
             return json({ error: launch.error, cloneId }, { status: 400, headers: corsHeaders(req) });
           }
+          // Resolve the explainer's profile ONCE, before the clone, and hand
+          // that same object to `createTask` afterwards (`resolvedAgentProfile`)
+          // — `cloneRepo` takes seconds, and a profile edited or deleted in
+          // that window would otherwise make `createTask`'s own re-read bind
+          // a different profile, or fail, after the clone already landed:
+          // exactly the post-side-effect failure this pre-validation exists
+          // to prevent.
+          let launchProfile: AgentProfile | null = null;
+          if (runEli5 && launch.agentProfileId) {
+            launchProfile = agentProfiles.get(launch.agentProfileId);
+            if (!launchProfile) {
+              return json({ error: `unknown agent profile "${launch.agentProfileId}"`, cloneId }, { status: 400, headers: corsHeaders(req) });
+            }
+          }
+          // Pre-flight 1b (minimum CLI version for the explainer's model) —
+          // also before the clone, since `startTask` would otherwise refuse
+          // the explainer only after the repo is already on disk. Resolves
+          // the harness + model exactly as `createTask` will: the profile's
+          // own harness/model, else `agent` (default claude-code) and
+          // `model` (default the kind's DEFAULT_MODEL). Fail-open like the
+          // start-time check; validateCloneLaunch already proved the
+          // harness ids resolve.
+          if (runEli5) {
+            const launchHarness = harnesses.getByIdOrKind(launchProfile ? launchProfile.harness : (launch.agent ?? "claude-code"));
+            if (launchHarness) {
+              const launchModel = launchProfile ? launchProfile.model : (launch.model ?? DEFAULT_MODEL[launchHarness.kind]);
+              const floorError = await minCliVersionError(launchHarness, launchModel);
+              if (floorError !== null) {
+                return json({ error: floorError, cloneId }, { status: 400, headers: corsHeaders(req) });
+              }
+            }
+          }
 
           inFlightCloneIds.add(cloneId);
           try {
@@ -972,6 +1005,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
                 workdir: dest,
                 isolation: "none",
                 ...launch,
+              }, {
+                // The profile validated before the clone, not a post-clone
+                // re-read — an internal argument, never a body field.
+                ...(launchProfile ? { resolvedAgentProfile: launchProfile } : {}),
               });
               if ("error" in created) {
                 eli5Error = created.error;

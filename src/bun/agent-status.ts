@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { TMUX_MISSING_REASON, type AgentKind, type ClaudeAccount, type Harness, type HarnessStatus } from "../shared/types.ts";
 import { resolveBin, harnessEnv } from "./agents.ts";
@@ -9,13 +9,79 @@ import { resolveTmuxBin } from "./tmux-resolution.ts";
 
 const VERSION_PROBE_TIMEOUT_MS = 2000;
 
-const INSTALL_HINTS: Record<AgentKind, string> = {
+/**
+ * Per-kind install command. Surfaced on an unavailable harness's status
+ * (`installHint`), and the fallback of `upgradeHintFor` below (for the npm /
+ * curl installers the install command also upgrades an installed CLI).
+ */
+export const INSTALL_HINTS: Record<AgentKind, string> = {
   "claude-code": "npm i -g @anthropic-ai/claude-code",
   "codex": "npm i -g @openai/codex",
   "cursor": "curl https://cursor.com/install -fsS | bash",
   "gemini": "npm i -g @google/gemini-cli",
   "fx": "curl -fsSL https://fx.sh/setup.sh | bash",
 };
+
+/**
+ * Homebrew formula/cask name per kind, for `upgradeHintFor`. Only kinds that
+ * are actually distributed through Homebrew; cursor and fx aren't, so a
+ * cursor/fx binary under a Homebrew prefix falls through to the kind's own
+ * self-update / reinstall command.
+ */
+const BREW_PACKAGES: Partial<Record<AgentKind, string>> = {
+  "codex": "codex",
+  "claude-code": "claude-code",
+  "gemini": "gemini-cli",
+};
+
+/**
+ * Whether `binPath` looks like a Homebrew-managed install — it sits under
+ * the Apple-silicon prefix (`/opt/homebrew/`) or the Intel Cellar /
+ * Caskroom. The path is also resolved through its symlinks (best-effort —
+ * a path that doesn't exist is judged on its literal spelling): a real path
+ * under `/usr/local/Cellar/` or `/usr/local/Caskroom/` catches an Intel
+ * `/usr/local/bin` symlink, and a real path inside a `node_modules`
+ * directory is an npm global install that merely lives under Homebrew's
+ * node prefix (`/opt/homebrew/bin/codex` → `…/lib/node_modules/@openai/codex/…`),
+ * for which `brew upgrade` would fail with "not installed".
+ */
+function isHomebrewInstall(binPath: string): boolean {
+  let real = binPath;
+  try {
+    real = realpathSync(binPath);
+  } catch {
+    // Missing / unreadable — judge the literal path.
+  }
+  if (real.includes("/node_modules/")) return false;
+  const underBrew = (p: string) =>
+    p.startsWith("/opt/homebrew/") || p.startsWith("/usr/local/Cellar/") || p.startsWith("/usr/local/Caskroom/");
+  return underBrew(binPath) || underBrew(real);
+}
+
+/**
+ * The command that UPGRADES an installed `kind` CLI found at `binPath` (the
+ * resolved path `checkHarness` reports as `HarnessStatus.path`, or null when
+ * unknown). Used as the "Upgrade with: …" hint of the per-model
+ * minimum-CLI-version pre-flight (`minCliVersionError` in orchestrator.ts),
+ * where the install command can be the wrong advice:
+ *   - a Homebrew-managed codex / claude-code / gemini → `brew upgrade <pkg>`
+ *     (`codex`, `claude-code`, `gemini-cli`) — reinstalling via npm would
+ *     leave a second, shadowed copy behind;
+ *   - claude-code otherwise → `claude update` (its self-updater covers both
+ *     the native and the npm install);
+ *   - cursor → `cursor-agent update`;
+ *   - anything else → the kind's `INSTALL_HINTS` entry (the npm / curl
+ *     installers upgrade in place).
+ */
+export function upgradeHintFor(kind: AgentKind, binPath: string | null): string {
+  if (binPath && isHomebrewInstall(binPath)) {
+    const pkg = BREW_PACKAGES[kind];
+    if (pkg) return `brew upgrade ${pkg}`;
+  }
+  if (kind === "claude-code") return "claude update";
+  if (kind === "cursor") return "cursor-agent update";
+  return INSTALL_HINTS[kind];
+}
 
 async function probeVersion(bin: string, env: Record<string, string>): Promise<string | null> {
   const proc = Bun.spawn([bin, "--version"], {

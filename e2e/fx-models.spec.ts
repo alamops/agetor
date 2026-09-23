@@ -78,6 +78,11 @@ const EXCLUDED_FX_OPTION_LABELS = [
   "Kimi K3",
   "Claude Fable 5.1",
   "Claude Opus 5.5",
+  // GPT-6 Sol / Luna (docs/plans/add-gpt-6-sol-and-luna.md, 2026-09-22) —
+  // catalogOnly rows, absent from this file's frozen 3-id fx stub catalog
+  // the same as every other premium row above.
+  "GPT-6 Sol",
+  "GPT-6 Luna",
 ];
 
 /** Mirrors `e2e/fx-interactions.spec.ts`'s identical helper. Duplicated

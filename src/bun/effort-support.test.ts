@@ -4,6 +4,7 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   EFFORT_OPTIONS,
+  MODEL_MIN_CLI_VERSION,
   cursorModelArg,
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
@@ -108,8 +109,10 @@ test("claude mythos-5.1 supports xhigh + max", () => {
   expect(ids).toContain("max");
 });
 
-test("codex DEFAULT_MODEL is GPT-6 Astra", () => {
-  expect(DEFAULT_MODEL.codex).toBe("gpt-6-astra");
+test("codex DEFAULT_MODEL is GPT-6 Sol", () => {
+  // Owner decision 2026-09-22 (docs/plans/add-gpt-6-sol-and-luna.md D1): Sol
+  // is codex's recommended daily driver, not Astra.
+  expect(DEFAULT_MODEL.codex).toBe("gpt-6-sol");
 });
 
 test("codex DEFAULT_EFFORT is high (ultra deliberately not the default)", () => {
@@ -135,11 +138,23 @@ test("codex GPT-5.6 Luna supports max through none, no ultra (catalog doesn't of
   expect(ids).toEqual(["max", "xhigh", "high", "medium", "low", "none"]);
 });
 
-test("codex model picker orders Astra, Aeon, Cyber, Sol, Terra, Luna first", () => {
+test("codex GPT-6 Sol supports ultra through none", () => {
+  const ids = supportedEfforts("codex", "gpt-6-sol").map((o) => o.id);
+  expect(ids).toEqual(["ultra", "max", "xhigh", "high", "medium", "low", "none"]);
+});
+
+test("codex GPT-6 Luna supports max through none, no ultra (catalog doesn't offer it there)", () => {
+  const ids = supportedEfforts("codex", "gpt-6-luna").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low", "none"]);
+});
+
+test("codex model picker orders Astra, Aeon, GPT-6 Sol, GPT-6 Luna, Cyber, 5.6 Sol, Terra, Luna first", () => {
   const ids = AGENT_OPTIONS.codex.models.map((m) => m.id);
-  expect(ids.slice(0, 6)).toEqual([
+  expect(ids.slice(0, 8)).toEqual([
     "gpt-6-astra",
     "gpt-6-astra-aeon",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-cyber",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
@@ -159,11 +174,32 @@ test("codex gpt-5 / gpt-5-codex support xhigh through low, no max/ultra/none (un
   }
 });
 
-test("unknown model falls back to the agent's DEFAULT_MODEL support set (Astra's)", () => {
-  // codex's default is now gpt-6-astra, so pasted future ids inherit its
-  // range — ultra through low, no none (Astra doesn't offer none).
+test("unknown model falls back to the agent's DEFAULT_MODEL support set (Sol's)", () => {
+  // codex's default is now gpt-6-sol, so pasted future ids inherit its
+  // range — ultra through none.
   const ids = supportedEfforts("codex", "future-codex-9000").map((o) => o.id);
-  expect(ids).toEqual(["ultra", "max", "xhigh", "high", "medium", "low"]);
+  expect(ids).toEqual(["ultra", "max", "xhigh", "high", "medium", "low", "none"]);
+});
+
+describe("MODEL_MIN_CLI_VERSION", () => {
+  test("only codex has entries; exactly the four GPT-6 ids, each floor major.minor.patch and each id a real codex model", () => {
+    expect(Object.keys(MODEL_MIN_CLI_VERSION)).toEqual(["codex"]);
+    const codexFloors = MODEL_MIN_CLI_VERSION.codex ?? {};
+    expect(Object.keys(codexFloors).sort()).toEqual(
+      ["gpt-6-astra", "gpt-6-astra-aeon", "gpt-6-luna", "gpt-6-sol"].sort(),
+    );
+    expect(codexFloors).toEqual({
+      "gpt-6-sol": "0.155.0",
+      "gpt-6-luna": "0.155.0",
+      "gpt-6-astra": "0.153.0",
+      "gpt-6-astra-aeon": "0.153.0",
+    });
+    const codexModelIds = new Set(AGENT_OPTIONS.codex.models.map((m) => m.id));
+    for (const [id, floor] of Object.entries(codexFloors)) {
+      expect(codexModelIds.has(id)).toBe(true);
+      expect(floor).toMatch(/^\d+\.\d+\.\d+$/);
+    }
+  });
 });
 
 test("ordered highest → lowest (no placeholder at the top)", () => {

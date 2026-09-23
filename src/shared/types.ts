@@ -1798,14 +1798,18 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // and Fable 5.1 / 5 still sit above it in the picker but cost 2x the usage,
   // so the default stays on the most-capable non-premium tier.
   "claude-code": "opus-5.5",
-  // Owner decision 2026-09-03: default to GPT-6 Astra, OpenAI's most capable
-  // model (released 2026-09-03). Live spike the same day on a ChatGPT-plan
-  // account: codex 0.147.0 and 0.153.0 both get HTTP 400 "The 'gpt-6-astra'
-  // model is not supported when using Codex with a ChatGPT account." during
-  // OpenAI's phased rollout (Trusted Access Program first, ChatGPT plans +
-  // API "in the coming days"). The picker hint carries the gate, and
-  // GPT-5.6 Sol (the previous default) stays one click away.
-  "codex": "gpt-6-astra",
+  // Owner decision 2026-09-22 (docs/plans/add-gpt-6-sol-and-luna.md): default
+  // to GPT-6 Sol, OpenAI's "daily driver for complex coding and agentic
+  // workflows" (released 2026-09-22), which replaces GPT-5.6 Sol. Astra stays
+  // one row above it in the picker as the most-capable-but-heavier tier. Live
+  // spike the same day on a ChatGPT-plan account: codex-cli 0.147.0 gets HTTP
+  // 400 on both Astra ("requires a newer version of Codex") and Sol/Luna
+  // ("not supported when using Codex with a ChatGPT account" — misleading
+  // text; the real gate is the client version). 0.153.0/0.154.0 run Astra but
+  // still 400 Sol; 0.155.1 runs all three. The catalog itself is
+  // `client_version`-gated (NousResearch/hermes-agent#119412). Hence
+  // `MODEL_MIN_CLI_VERSION` below and the `startTask` pre-flight.
+  "codex": "gpt-6-sol",
   // Grok 4.7 (high effort via DEFAULT_EFFORT) — agetor pins an explicit
   // flagship model rather than cursor-agent's own "auto". Owner decision
   // 2026-09-21 (docs/plans/add-grok-4-7.md): 4.7 replaces 4.6, the previous
@@ -1832,7 +1836,7 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // (`~/.fx/settings.json` on the reference account). Ids are Vercel AI
   // Gateway ids, passed verbatim. fx is exempt from the "always default to
   // the best available model" rule above: the Gateway bills per token to the
-  // user's own account, and flagship tiers (the fourteen `catalogOnly` rows in
+  // user's own account, and flagship tiers (the sixteen `catalogOnly` rows in
   // `AGENT_OPTIONS.fx.models`) stay one click away
   // in the picker as catalog-gated rows — offered only when the signed-in
   // account's catalog actually contains them (see `AgentOption.catalogOnly`).
@@ -1886,6 +1890,36 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   // other four kinds use, since that would silently change every fx run's
   // cost/latency on the owner's rate-limited free-tier Gateway account.
   "fx": "auto",
+};
+
+/**
+ * Minimum harness-CLI version a model needs, per kind, keyed by model id
+ * (semver "major.minor.patch"; compared with `cliVersionSatisfies` in
+ * `src/shared/cli-version.ts`). Pre-flight 1b (`minCliVersionError` in
+ * `src/bun/orchestrator.ts` — `startTask`, every follow-up codex turn, and
+ * the clone route's explainer launch) refuses the launch — before any run
+ * row or worktree exists — when the probed CLI version parses AND is below
+ * the floor; an unparseable/absent version never blocks (fail-open, so
+ * `/bin/echo`-style test overrides and stub binaries are unaffected).
+ * Only codex has entries today: OpenAI's `chatgpt.com/backend-api/codex/models`
+ * catalog is `client_version`-gated (NousResearch/hermes-agent#119412) and an
+ * old CLI answers a 400 whose text blames the ChatGPT account, not the
+ * version. Floors are the lowest versions verified live on 2026-09-22 (a
+ * ChatGPT-plan account): gpt-6-sol/gpt-6-luna — 0.154.0 ✗ / 0.155.1 ✓
+ * (the catalog gate is 0.155.0); gpt-6-astra — 0.147.0 ✗ / 0.153.0 ✓
+ * (0.148–0.152 unprobed, so the true floor may be lower); Aeon mirrors Astra.
+ * The floors were verified on a ChatGPT-plan account; API-key accounts are
+ * assumed to be gated the same way, and `AGETOR_SKIP_CLI_VERSION_FLOOR=1` is
+ * the override when one isn't.
+ * See docs/plans/add-gpt-6-sol-and-luna.md §3 D4.
+ */
+export const MODEL_MIN_CLI_VERSION: Partial<Record<AgentKind, Record<string, string>>> = {
+  codex: {
+    "gpt-6-sol": "0.155.0",
+    "gpt-6-luna": "0.155.0",
+    "gpt-6-astra": "0.153.0",
+    "gpt-6-astra-aeon": "0.153.0",
+  },
 };
 
 export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
@@ -2363,6 +2397,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  *   - Codex `model_reasoning_effort`:
  *       https://developers.openai.com/codex/config-advanced
  *     GPT-5.6 family → none/low/medium/high/xhigh/max
+ *     GPT-6 Sol/Luna → none/low/medium/high/xhigh/max (+ Codex-side ultra on Sol)
  *     gpt-5.5 / gpt-5 / gpt-5-codex → low/medium/high/xhigh
  *
  * An empty list means "this model does not accept the effort flag at all"
@@ -2423,8 +2458,18 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     // this account's catalog at all). Note: discovered efforts (see
     // `supportedEfforts`'s third argument) override this table whenever the
     // CLI itself reports a set for the model.
+    //
+    // 2026-09-22 — `codex app-server` catalog on 0.155.1 lists gpt-6-sol as
+    // low/medium/high/xhigh/max + ultra (default medium) and gpt-6-luna as
+    // low/medium/high/xhigh/max (no ultra, default medium); `none` accepted
+    // live on Luna via `codex exec` (0.155.1), on Sol it rests on OpenAI's
+    // model page ("supports none") + the GPT-5.6 Sol precedent; same rule as
+    // the 5.6 rows — `ultra` follows Codex's offering, `none` follows
+    // live/API acceptance.
     "gpt-6-astra": ["ultra", "max", "xhigh", "high", "medium", "low"],
     "gpt-6-astra-aeon": ["ultra", "max", "xhigh", "high", "medium", "low"],
+    "gpt-6-sol": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-cyber": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-sol": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-terra": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
@@ -2514,6 +2559,14 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     // fx's always-present auto, identical to the live-probed
     // anthropic/claude-opus-5 row. docs/plans/add-claude-opus-5-5.md §8 A1.
     "anthropic/claude-opus-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    // 2026-09-22: openai/gpt-6-sol + openai/gpt-6-luna (released that day) —
+    // from the public Gateway catalog's `reasoning_options` (effort values
+    // none/low/medium/high for BOTH — narrower than openai/gpt-5.6-sol's
+    // none…max and than OpenAI's own API page, which lists xhigh/max too;
+    // the Gateway is what fx sends, so its list wins). Not ACP-probed.
+    // docs/plans/add-gpt-6-sol-and-luna.md §2/§3 D6.
+    "openai/gpt-6-sol": ["high", "medium", "low", "none", "auto"],
+    "openai/gpt-6-luna": ["high", "medium", "low", "none", "auto"],
   },
 };
 
@@ -2705,13 +2758,15 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
-      { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "Recommended default — OpenAI's most capable model. Rolling out in phases; rejected on ChatGPT plans until OpenAI enables it for your account." },
-      { id: "gpt-6-astra-aeon", label: "GPT-6 Astra Aeon", hint: "Long-horizon Astra variant for multi-day tasks. Unverified id — not on OpenAI's model page yet; same rollout gate as Astra." },
+      { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "OpenAI's most capable model. Needs codex CLI ≥ 0.153 — older CLIs answer a 400 (\"requires a newer version of Codex\")." },
+      { id: "gpt-6-astra-aeon", label: "GPT-6 Astra Aeon", hint: "Long-horizon Astra variant for multi-day tasks. Unverified id — not on OpenAI's model page yet; same codex CLI ≥ 0.153 floor as Astra." },
+      { id: "gpt-6-sol", label: "GPT-6 Sol", hint: "Recommended default — OpenAI's daily driver for complex coding and agentic work; replaces GPT-5.6 Sol. Needs codex CLI ≥ 0.155 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
+      { id: "gpt-6-luna", label: "GPT-6 Luna", hint: "Fastest, lowest-cost GPT-6 for focused, high-volume tasks; replaces GPT-5.6 Luna. Needs codex CLI ≥ 0.155 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
       { id: "gpt-5.6-cyber", label: "GPT-5.6 Cyber", hint: "Cybersecurity-tuned GPT-5.6. Requires OpenAI Daybreak approval on an API-key account; rejected on ChatGPT plans." },
-      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Previous recommended default — flagship GPT-5.6; works on ChatGPT plans." },
-      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model for strong performance at lower cost." },
-      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model for high-volume workloads." },
-      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous-generation model — works on ChatGPT plans." },
+      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Previous-generation flagship — superseded by GPT-6 Sol (codex offers the upgrade in place); still works on ChatGPT plans." },
+      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model — superseded by GPT-6 Sol (codex offers the upgrade in place)." },
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model — superseded by GPT-6 Luna (codex offers the upgrade in place)." },
+      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous-generation model — works on ChatGPT plans; codex retires it on 2026-10-14 (switch to GPT-6 Sol)." },
       { id: "gpt-5-codex", label: "GPT-5 Codex", hint: "Requires an API-key account; rejected on ChatGPT plans." },
       { id: "gpt-5", label: "GPT-5", hint: "Requires an API-key account; rejected on ChatGPT plans." },
     ],
@@ -2808,6 +2863,11 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // in a standard signed-in account is unverified, hence catalogOnly —
     // fourteen catalogOnly rows, 30 curated ids total. 29 of the 30 are
     // present; mistral/devstral-2 is still absent (see the 2026-09-21 note).
+    // 2026-09-22: openai/gpt-6-sol and openai/gpt-6-luna (released the same
+    // day) added from fx 0.0.10's unauthenticated catalog (255 ids that day,
+    // up from 246; every prior curated id — opus-5.5 included — still present except
+    // mistral/devstral-2, still gone); signed-in presence unverified, hence
+    // catalogOnly — sixteen catalogOnly rows, 32 curated ids total.
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
@@ -2839,15 +2899,18 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "spacexai/grok-4.7", label: "Grok 4.7", hint: "500K context · 500K output — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "anthropic/claude-opus-5.5", label: "Claude Opus 5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6-sol", label: "GPT-6 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6-luna", label: "GPT-6 Luna", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [
       { id: "yolo", label: "Full access", hint: "Hands-off default — disables fx's permission checks entirely, so no tool call is ever held. What fx 0.0.8 calls --full-access / /permissions full-access (still true on 0.0.10); yolo is fx's surviving alias and stays agetor's stored id." },
       { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
-    // 17 of the 30 curated models accept the effort flag (see
+    // 19 of the 32 curated models accept the effort flag (see
     // MODEL_EFFORT_SUPPORT.fx — 16 live-probed on fx 0.0.10, plus
-    // anthropic/claude-opus-5.5 from its Gateway reasoning_options); the other 13
+    // anthropic/claude-opus-5.5, openai/gpt-6-sol and openai/gpt-6-luna from
+    // their Gateway reasoning_options, all 2026-09-22); the other 13
     // report an empty set and the picker collapses for those, same as any
     // other kind's no-effort models. Every id-supported model always
     // includes `auto` (fx's own default) last, per EFFORT_OPTIONS.
