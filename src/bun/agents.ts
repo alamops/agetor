@@ -13,7 +13,8 @@ import {
   type SpawnedAgent,
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
-import { spawnCursorViaTmux } from "./cursor-tmux.ts";import { dataDir, subagents as subagentsDb } from "./db.ts";
+import { spawnCursorViaTmux } from "./cursor-tmux.ts";
+import { dataDir, subagents as subagentsDb, tasks } from "./db.ts";
 import { spawnFxViaAcp, type FxMode } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
 import { answerFxPermission, registerFxPermission } from "./interactions.ts";
@@ -864,7 +865,26 @@ export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
  * handoff's `next` field (picking a named outgoing step). The **last**
  * occurrence in the prompt wins (`lastFakeHandoffSuffix` below) — the
  * overall goal text can carry a default suffix that a step's own
- * instructions override.
+ * instructions override. This "last occurrence wins" rule is resolved
+ * against whichever prompt actually carries the marker — see the two-turn
+ * suffixes below for what happens when the CURRENT turn's prompt carries no
+ * marker at all.
+ *
+ * Two-turn suffixes: `missing-then-done` and `invalid-then-done` behave like
+ * `missing`/`invalid` on the task's FIRST fake-driver turn and like `done`
+ * (a valid terminal handoff) on every turn after that; more generally
+ * `missing-then-<token>` / `invalid-then-<token>` behave like `missing`/
+ * `invalid` on turn 1 and like plain `<token>` (a `next`-field pick, or
+ * `done`) on turn 2+. These exist because the pipeline runner sends ONE
+ * automatic reminder — an ordinary follow-up `sendInput` turn on the step
+ * task — when a step's reply lacked a valid `<handoff>`; that reminder text
+ * never carries this marker itself. A per-task turn counter
+ * (`fakeHandoffTurnCounts` below) tracks which turn a given taskId is on,
+ * and when the CURRENT turn's `prompt` carries no marker at all (true for
+ * that reminder, and for any other marker-less follow-up), the driver falls
+ * back to the marker in the task's own stored `prompt` (its original,
+ * turn-1 text — via `tasks.get`) so the scenario still resolves the same way
+ * across the whole conversation, not just its first turn.
  */
 export const FAKE_CLAUDE_HANDOFF_PROMPT_MARKER = "__agetor_fake_claude_handoff__";
 /** No regex-special characters appear in {@link FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}
@@ -885,6 +905,75 @@ function lastFakeHandoffSuffix(prompt: string): string | null {
     if (match[0].length === 0) FAKE_CLAUDE_HANDOFF_SUFFIX_RE.lastIndex++;
   }
   return last ? (last[1] ?? null) : null;
+}
+
+/**
+ * Resolve which prompt text the handoff scenario should read its marker
+ * from for this spawn: the CURRENT turn's `prompt` when it carries the
+ * marker itself (the normal case — the first turn of a step, or any
+ * marker-carrying follow-up a test sends directly), else the task's own
+ * stored (turn-1) `prompt` when THAT carries the marker (the pipeline
+ * runner's automatic "no handoff found" reminder, and any other
+ * marker-less follow-up) — via a direct `tasks.get` import, safe because
+ * `db.ts` has no import of `agents.ts` in its own chain (no cycle). Returns
+ * `null` when neither carries the marker at all, i.e. this isn't a handoff
+ * scenario.
+ */
+function resolveFakeHandoffPromptSource(taskId: string, prompt: string): string | null {
+  if (prompt.includes(FAKE_CLAUDE_HANDOFF_PROMPT_MARKER)) return prompt;
+  const stored = tasks.get(taskId)?.prompt;
+  if (stored && stored.includes(FAKE_CLAUDE_HANDOFF_PROMPT_MARKER)) return stored;
+  return null;
+}
+
+/**
+ * Per-task turn counter for the handoff scenario only, bumped once per fake
+ * spawn that actually enters the handoff branch below (see
+ * `resolveFakeHandoffPromptSource`) — this is what lets `missing-then-done`
+ * / `invalid-then-done` (and `missing-then-<token>` / `invalid-then-<token>`)
+ * distinguish a task's first turn from every turn after it. Never cleared on
+ * `kill()` (a cancelled turn still counts as having happened — the counter
+ * isn't a "successful turns" count), and never explicitly cleared on task
+ * delete either (not observable from here); instead capped at
+ * `FAKE_HANDOFF_TURN_MAP_CAP` entries with FIFO eviction of the
+ * oldest-inserted taskId so a long-running test process can't leak memory
+ * across many short-lived fake tasks.
+ */
+const fakeHandoffTurnCounts = new Map<string, number>();
+const FAKE_HANDOFF_TURN_MAP_CAP = 1000;
+function bumpFakeHandoffTurn(taskId: string): number {
+  const isNewKey = !fakeHandoffTurnCounts.has(taskId);
+  const next = (fakeHandoffTurnCounts.get(taskId) ?? 0) + 1;
+  if (isNewKey && fakeHandoffTurnCounts.size >= FAKE_HANDOFF_TURN_MAP_CAP) {
+    const oldestKey = fakeHandoffTurnCounts.keys().next().value;
+    if (oldestKey !== undefined) fakeHandoffTurnCounts.delete(oldestKey);
+  }
+  fakeHandoffTurnCounts.set(taskId, next);
+  return next;
+}
+
+/**
+ * Two-turn suffix regex: `(missing|invalid)-then-<token>` where `<token>` is
+ * itself a valid ordinary suffix (letters/digits/-/_). Matches
+ * `missing-then-done`, `invalid-then-done`, and `missing-then-<StepName>`
+ * alike — `<token>` is used verbatim, same as a plain suffix would be.
+ */
+const FAKE_HANDOFF_TWO_TURN_RE = /^(missing|invalid)-then-(.+)$/;
+/**
+ * Resolve the raw suffix (from `lastFakeHandoffSuffix`) plus the current
+ * turn number into the EFFECTIVE suffix `makeFakeAgent`'s handoff branch
+ * should act on: an ordinary suffix (or no suffix) is turn-invariant and
+ * passes through unchanged; a two-turn suffix resolves to the "then"
+ * behavior — `missing`/`invalid` — on turn 1, and to the token after
+ * `-then-` on every later turn.
+ */
+function resolveFakeHandoffTurnSuffix(rawSuffix: string | null, turn: number): string | null {
+  if (!rawSuffix) return rawSuffix;
+  const match = FAKE_HANDOFF_TWO_TURN_RE.exec(rawSuffix);
+  if (!match) return rawSuffix;
+  const firstTurnBehavior: string = match[1] ?? rawSuffix;
+  const laterToken: string = match[2] ?? rawSuffix;
+  return turn <= 1 ? firstTurnBehavior : laterToken;
 }
 
 /**
@@ -1265,7 +1354,7 @@ function makeFakeAgent(
       );
     });
     after(resolveDelayMs, () => { resolveDone(0); });
-  } else if (prompt.includes(FAKE_CLAUDE_HANDOFF_PROMPT_MARKER)) {
+  } else if (resolveFakeHandoffPromptSource(taskId, prompt) !== null) {
     // Test hook: simulate a pipeline step's turn ending with a `<handoff>`
     // block (see docs/plans/pipelines.md D3, `src/shared/pipeline.ts`'s
     // `parseHandoff`) so `pipeline-runner.test.ts` can drive the runner's
@@ -1275,21 +1364,33 @@ function makeFakeAgent(
     // handoffs ahead of those three — they're mutually exclusive env-var
     // toggles, this is a prompt-marker), but before every OTHER marker
     // branch further down, so it wins if a test prompt somehow carries more
-    // than one marker. `lastFakeHandoffSuffix` finds the LAST
-    // occurrence in the prompt (a step's own instructions can override a
-    // default the overall goal text carries) and extracts its optional
-    // `:<token>` suffix — `done` (or no suffix) emits a valid terminal
-    // handoff, `missing` emits prose with no `<handoff>` tag at all,
-    // `invalid` emits a `<handoff>` tag whose body isn't valid JSON, and
-    // any other token is used verbatim as the handoff's `next` field (a
-    // `"choose"`-transition step picking a named outgoing step).
-    // `AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS` (same env var the api-error/
-    // session-died/unknown-command branches above already read) widens the
-    // window between "assistant text landed" and "turn resolved" — lets a
-    // test (`cancelRun`/`cancelPipelineRun` mid-step) reliably fire a Stop
-    // while the step is still genuinely `running`. Defaults to 30ms, same
-    // as this branch's original fixed delay.
-    const suffix = lastFakeHandoffSuffix(prompt);
+    // than one marker. The marker is read from the CURRENT turn's `prompt`
+    // when it carries one, else from the task's own stored (turn-1) prompt
+    // (`resolveFakeHandoffPromptSource`) — this is what lets a pipeline's
+    // automatic "no handoff found" reminder turn (a plain follow-up
+    // `sendInput` line with no marker of its own) still resolve against the
+    // scenario the step's ORIGINAL prompt selected. `lastFakeHandoffSuffix`
+    // then finds the LAST occurrence of the marker in THAT source prompt (a
+    // step's own instructions can override a default the overall goal text
+    // carries) and extracts its optional `:<token>` suffix — `done` (or no
+    // suffix) emits a valid terminal handoff, `missing` emits prose with no
+    // `<handoff>` tag at all, `invalid` emits a `<handoff>` tag whose body
+    // isn't valid JSON, `missing-then-<token>` / `invalid-then-<token>`
+    // behave like `missing`/`invalid` on this task's first fake-driver turn
+    // and like plain `<token>` (e.g. `done`, or a named outgoing step) on
+    // every turn after that — `bumpFakeHandoffTurn`/
+    // `resolveFakeHandoffTurnSuffix` resolve the two-turn form against a
+    // per-task turn counter — and any other plain token is used verbatim as
+    // the handoff's `next` field (a `"choose"`-transition step picking a
+    // named outgoing step). `AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS` (same env
+    // var the api-error/session-died/unknown-command branches above already
+    // read) widens the window between "assistant text landed" and "turn
+    // resolved" — lets a test (`cancelRun`/`cancelPipelineRun` mid-step)
+    // reliably fire a Stop while the step is still genuinely `running`.
+    // Defaults to 30ms, same as this branch's original fixed delay.
+    const handoffPromptSource = resolveFakeHandoffPromptSource(taskId, prompt) as string;
+    const turn = bumpFakeHandoffTurn(taskId);
+    const suffix = resolveFakeHandoffTurnSuffix(lastFakeHandoffSuffix(handoffPromptSource), turn);
     const resolveDelayMs = Math.max(20, Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 30) || 30);
     after(5, () => onChunk("status", "fake: working"));
     after(Math.min(20, resolveDelayMs - 10), () => {

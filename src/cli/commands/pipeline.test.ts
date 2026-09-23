@@ -688,6 +688,51 @@ test("pipelineStatusLines: an active step's own live column is shown when its st
   expect(lines.join("\n")).toContain("blocked");
 });
 
+test("pipelineStatusLines: history rows print the response kind and (reminded) when set", () => {
+  const t = task({
+    pipelineRun: pipelineRun({
+      history: [
+        {
+          seq: 1,
+          stepId: "s1",
+          taskId: "step-task-0",
+          startedAt: 0,
+          endedAt: 1,
+          outcome: "succeeded",
+          handoff: null,
+          nextStepIds: ["s2"],
+          responseKind: "handoff",
+        },
+        {
+          seq: 2,
+          stepId: "s2",
+          taskId: "step-task-1",
+          startedAt: 1,
+          endedAt: null,
+          outcome: null,
+          handoff: null,
+          nextStepIds: [],
+          responseKind: "handoff-missing",
+          reminder: { at: 5, reason: "handoff-missing", runId: "run-1", detail: "still no valid handoff" },
+        },
+      ],
+    }),
+  });
+  const text = pipelineStatusLines(t, []).join("\n");
+  expect(text).toContain("[handoff]");
+  expect(text).toContain("[handoff-missing]");
+  expect(text).toContain("(reminded)");
+});
+
+test("pipelineStatusLines: a history row with no responseKind/reminder omits both notes", () => {
+  const t = task({ pipelineRun: pipelineRun() });
+  const lines = pipelineStatusLines(t, []);
+  const historyLine = lines.find((l) => l.includes("1. Investigate"));
+  expect(historyLine).toBeDefined();
+  expect(historyLine).not.toContain("[");
+  expect(historyLine).not.toContain("(reminded)");
+});
+
 // ── cmdPipeline: retry (task-scoped) ─────────────────────────────────────
 
 test("cmdPipeline retry: missing ref throws the usage error", async () => {

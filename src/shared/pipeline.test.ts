@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
   HANDOFF_FILE_UNTRUSTED_WARNING,
+  HANDOFF_REMINDER_MARKER,
   HANDOFF_TAG,
   HANDOFF_UNTRUSTED_CONTENT_WARNING,
+  classifyStepResponse,
+  composeHandoffReminder,
   composeStepPrompt,
   deriveRunStatus,
   effectiveStepCap,
@@ -1750,5 +1753,230 @@ describe("pipelineStepProgress", () => {
     const progress = pipelineStepProgress(makeRun());
     expect(progress.total).toBe(0);
     expect(progress.label).toBe("0/0");
+  });
+});
+
+describe("classifyStepResponse", () => {
+  test("cancelled run -> cancelled, regardless of text", () => {
+    const result = classifyStepResponse({ runStatus: "cancelled", assistantText: "whatever", pendingInteractions: 0 });
+    expect(result).toEqual({ kind: "cancelled", handoff: null, error: null });
+  });
+
+  test("orphaned run -> cancelled", () => {
+    const result = classifyStepResponse({ runStatus: "orphaned", assistantText: "whatever", pendingInteractions: 0 });
+    expect(result).toEqual({ kind: "cancelled", handoff: null, error: null });
+  });
+
+  test("failed run -> error", () => {
+    const result = classifyStepResponse({ runStatus: "failed", assistantText: "whatever", pendingInteractions: 0 });
+    expect(result).toEqual({ kind: "error", handoff: null, error: null });
+  });
+
+  test("pending interactions -> user-ask, even with a valid handoff in the text", () => {
+    const handoffText = `<${HANDOFF_TAG}>${JSON.stringify(fullHandoffJsonObj())}</${HANDOFF_TAG}>`;
+    const result = classifyStepResponse({ runStatus: "succeeded", assistantText: handoffText, pendingInteractions: 2 });
+    expect(result).toEqual({ kind: "user-ask", handoff: null, error: null });
+  });
+
+  test("no <handoff> tag -> handoff-missing, with the parser's error", () => {
+    const result = classifyStepResponse({ runStatus: "succeeded", assistantText: "just some prose", pendingInteractions: 0 });
+    expect(result.kind).toBe("handoff-missing");
+    expect(result.handoff).toBeNull();
+    expect(result.error).toBeTruthy();
+  });
+
+  test("a <handoff> tag with unparsable JSON -> handoff-invalid, with the parser's error", () => {
+    const result = classifyStepResponse({
+      runStatus: "succeeded",
+      assistantText: `<${HANDOFF_TAG}>not json at all ???</${HANDOFF_TAG}>`,
+      pendingInteractions: 0,
+    });
+    expect(result.kind).toBe("handoff-invalid");
+    expect(result.handoff).toBeNull();
+    expect(result.error).toBeTruthy();
+  });
+
+  test("a valid handoff with status:blocked -> handoff-blocked, handoff carried through", () => {
+    const handoff = fullHandoffJsonObj({ status: "blocked" });
+    const handoffText = `<${HANDOFF_TAG}>${JSON.stringify(handoff)}</${HANDOFF_TAG}>`;
+    const result = classifyStepResponse({ runStatus: "succeeded", assistantText: handoffText, pendingInteractions: 0 });
+    expect(result.kind).toBe("handoff-blocked");
+    expect(result.handoff).toEqual(handoff);
+    expect(result.error).toBeNull();
+  });
+
+  test("a valid handoff with status:done (or no status) -> handoff, handoff carried through", () => {
+    const handoff = fullHandoffJsonObj({ status: "done" });
+    const handoffText = `<${HANDOFF_TAG}>${JSON.stringify(handoff)}</${HANDOFF_TAG}>`;
+    const result = classifyStepResponse({ runStatus: "succeeded", assistantText: handoffText, pendingInteractions: 0 });
+    expect(result.kind).toBe("handoff");
+    expect(result.handoff).toEqual(handoff);
+    expect(result.error).toBeNull();
+  });
+});
+
+describe("composeHandoffReminder", () => {
+  const outgoingOne = [{ name: "Review", label: "" }];
+  const outgoingMany = [
+    { name: "Fix", label: "needs work" },
+    { name: "Ship", label: "" },
+  ];
+
+  test("starts with HANDOFF_REMINDER_MARKER as the first line", () => {
+    const reminder = composeHandoffReminder({
+      stepName: "Step 1",
+      reason: "handoff-missing",
+      detail: null,
+      outgoing: outgoingOne,
+      transition: "choose",
+    });
+    expect(reminder.split("\n")[0]).toBe(HANDOFF_REMINDER_MARKER);
+  });
+
+  test("handoff-missing states no <handoff> block was found", () => {
+    const reminder = composeHandoffReminder({
+      stepName: "Step 1",
+      reason: "handoff-missing",
+      detail: null,
+      outgoing: outgoingOne,
+      transition: "choose",
+    });
+    expect(reminder).toContain("did not include the required <handoff> block");
+    expect(reminder).toContain('"Step 1"');
+  });
+
+  test("handoff-invalid states the parser's detail", () => {
+    const reminder = composeHandoffReminder({
+      stepName: "Step 1",
+      reason: "handoff-invalid",
+      detail: "handoff JSON could not be parsed: Unexpected token",
+      outgoing: outgoingOne,
+      transition: "choose",
+    });
+    expect(reminder).toContain("whose JSON could not be parsed: handoff JSON could not be parsed: Unexpected token");
+  });
+
+  test("contains the handoff schema/tag contract and the do-not-redo-the-work instruction", () => {
+    const reminder = composeHandoffReminder({
+      stepName: "Step 1",
+      reason: "handoff-missing",
+      detail: null,
+      outgoing: outgoingOne,
+      transition: "choose",
+    });
+    expect(reminder).toContain("Do not redo the work.");
+    expect(reminder).toContain(`<${HANDOFF_TAG}>`);
+    expect(reminder).toContain(`</${HANDOFF_TAG}>`);
+    expect(reminder).toContain('"schemaVersion":1');
+    expect(reminder).toContain("Do not put anything after the closing");
+    expect(reminder).toContain("say so in the handoff's status/openQuestions instead of asking a question");
+  });
+
+  test("single outgoing edge: next-rule text matches composeStepPrompt's rendering verbatim", () => {
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: makeStep({ id: "step-1" }),
+      stepIndex: 1,
+      stepCap: 25,
+      goal: "goal",
+      previous: [],
+      outgoing: outgoingOne,
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+    });
+    const reminder = composeHandoffReminder({
+      stepName: "Step 1",
+      reason: "handoff-missing",
+      detail: null,
+      outgoing: outgoingOne,
+      transition: "choose",
+    });
+    const nextRule = 'The next step is "Review"; set "next" to "Review".';
+    expect(prompt).toContain(nextRule);
+    expect(reminder).toContain(nextRule);
+  });
+
+  test("multiple outgoing edges (choose): next-rule text matches composeStepPrompt's rendering verbatim", () => {
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: makeStep({ id: "step-1" }),
+      stepIndex: 1,
+      stepCap: 25,
+      goal: "goal",
+      previous: [],
+      outgoing: outgoingMany,
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+    });
+    const reminder = composeHandoffReminder({
+      stepName: "Step 1",
+      reason: "handoff-invalid",
+      detail: "bad json",
+      outgoing: outgoingMany,
+      transition: "choose",
+    });
+    const nextRule = "Choose exactly one next step by name: Fix (needs work), Ship — and put that name in \"next\".";
+    expect(prompt).toContain(nextRule);
+    expect(reminder).toContain(nextRule);
+  });
+
+  test("transition:all: next-rule text matches composeStepPrompt's rendering verbatim", () => {
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: makeStep({ id: "step-1", transition: "all" }),
+      stepIndex: 1,
+      stepCap: 25,
+      goal: "goal",
+      previous: [],
+      outgoing: outgoingMany,
+      transition: "all",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+    });
+    const reminder = composeHandoffReminder({
+      stepName: "Step 1",
+      reason: "handoff-missing",
+      detail: null,
+      outgoing: outgoingMany,
+      transition: "all",
+    });
+    const nextRule = 'All of the following steps will run next in parallel; set "next" to null: Fix, Ship';
+    expect(prompt).toContain(nextRule);
+    expect(reminder).toContain(nextRule);
+  });
+
+  test("terminal step (no outgoing edges): next-rule text matches composeStepPrompt's rendering verbatim", () => {
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: makeStep({ id: "step-1" }),
+      stepIndex: 1,
+      stepCap: 25,
+      goal: "goal",
+      previous: [],
+      outgoing: [],
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+    });
+    const reminder = composeHandoffReminder({
+      stepName: "Step 1",
+      reason: "handoff-missing",
+      detail: null,
+      outgoing: [],
+      transition: "choose",
+    });
+    const nextRule = 'This is the last step: set "next" to null.';
+    expect(prompt).toContain(nextRule);
+    expect(reminder).toContain(nextRule);
   });
 });

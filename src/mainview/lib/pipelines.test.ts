@@ -5,6 +5,8 @@ import {
   edgeVisualState,
   graphFromFlow,
   latestTransition,
+  responseKindLabel,
+  stepReminded,
   stepTaskFor,
   stepVisualState,
   toFlowEdges,
@@ -423,5 +425,81 @@ describe("blockedSummary", () => {
       ],
     });
     expect(blockedSummary(run)).toBe("first (+2 more)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// responseKindLabel
+
+describe("responseKindLabel", () => {
+  test("null/undefined → null", () => {
+    expect(responseKindLabel(null)).toBeNull();
+    expect(responseKindLabel(undefined)).toBeNull();
+  });
+
+  test("maps every known kind to its display text + tone", () => {
+    expect(responseKindLabel("handoff")).toEqual({ text: "Handed off", tone: "success" });
+    expect(responseKindLabel("handoff-blocked")).toEqual({ text: "Reported blocked", tone: "warning" });
+    expect(responseKindLabel("handoff-missing")).toEqual({ text: "No handoff", tone: "warning" });
+    expect(responseKindLabel("handoff-invalid")).toEqual({ text: "Invalid handoff", tone: "warning" });
+    expect(responseKindLabel("user-ask")).toEqual({ text: "Asked you", tone: "warning" });
+    expect(responseKindLabel("error")).toEqual({ text: "Error", tone: "danger" });
+    expect(responseKindLabel("cancelled")).toEqual({ text: "Cancelled", tone: "muted" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stepReminded
+
+describe("stepReminded", () => {
+  test("no run → false", () => {
+    expect(stepReminded(null, "step-1")).toBe(false);
+  });
+
+  test("step not currently active → false, even if an old record was reminded", () => {
+    const run = makeRun({
+      history: [makeRecord({ stepId: "step-1", taskId: "task-1", reminder: { at: 1, reason: "handoff-missing", runId: null, detail: "d" } })],
+    });
+    expect(stepReminded(run, "step-1")).toBe(false);
+  });
+
+  test("active, and its own history record carries a reminder → true", () => {
+    const run = makeRun({
+      active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }],
+      history: [
+        makeRecord({
+          stepId: "step-1",
+          taskId: "task-1",
+          outcome: null,
+          reminder: { at: 5, reason: "handoff-invalid", runId: "run-1", detail: "still no handoff" },
+        }),
+      ],
+    });
+    expect(stepReminded(run, "step-1")).toBe(true);
+  });
+
+  test("active, but its own record has no reminder → false", () => {
+    const run = makeRun({
+      active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }],
+      history: [makeRecord({ stepId: "step-1", taskId: "task-1", outcome: null })],
+    });
+    expect(stepReminded(run, "step-1")).toBe(false);
+  });
+
+  test("a cycle: matches the ACTIVE execution's own record, not an earlier generation's", () => {
+    const run = makeRun({
+      active: [{ stepId: "step-1", taskId: "task-2", seq: 2 }],
+      history: [
+        makeRecord({
+          seq: 1,
+          stepId: "step-1",
+          taskId: "task-1",
+          outcome: "failed",
+          reminder: { at: 1, reason: "handoff-missing", runId: null, detail: "old" },
+        }),
+        makeRecord({ seq: 2, stepId: "step-1", taskId: "task-2", outcome: null }),
+      ],
+    });
+    expect(stepReminded(run, "step-1")).toBe(false);
   });
 });

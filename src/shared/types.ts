@@ -602,6 +602,39 @@ export interface PipelineRunSnapshot {
 }
 
 /**
+ * How a step execution's final response classified, per {@link
+ * classifyStepResponse} in `src/shared/pipeline.ts` — `"handoff"` (a valid,
+ * non-`blocked` handoff), `"handoff-blocked"` (a valid handoff whose own
+ * `status` is `"blocked"`), `"handoff-missing"` (no `<handoff>` tag at all),
+ * `"handoff-invalid"` (a tag whose body didn't parse), `"user-ask"` (the
+ * step's task has a pending interaction — the agent is waiting on the user,
+ * never a format failure), `"error"` (the run failed), or `"cancelled"` (the
+ * run was cancelled or orphaned).
+ */
+export type StepResponseKind =
+  | "handoff"
+  | "handoff-blocked"
+  | "handoff-missing"
+  | "handoff-invalid"
+  | "user-ask"
+  | "error"
+  | "cancelled";
+
+/**
+ * Records the single automatic follow-up the runner sends to a step whose
+ * final response was `"handoff-missing"` or `"handoff-invalid"` — one
+ * reminder max per execution; a second bad response blocks instead of
+ * reminding again. See `composeHandoffReminder` in `src/shared/pipeline.ts`.
+ */
+export interface PipelineStepReminder {
+  at: number;
+  reason: "handoff-missing" | "handoff-invalid";
+  runId: string | null;
+  /** The parser error / short reason the reminder was sent for. */
+  detail: string;
+}
+
+/**
  * One completed (or cancelled) step execution, appended to {@link
  * PipelineRunState.history} once its task settles. `nextStepIds` records
  * what `resolveNextSteps` actually started from this execution's handoff —
@@ -617,6 +650,15 @@ export interface PipelineStepRecord {
   outcome: "succeeded" | "failed" | "cancelled" | "advanced-manually" | null;
   handoff: Handoff | null;
   nextStepIds: string[];
+  /** How this execution's final response classified — see {@link
+   *  StepResponseKind}. Optional/additive: absent on a record written before
+   *  this field existed, and never set for an execution still awaiting
+   *  resolution. */
+  responseKind?: StepResponseKind | null;
+  /** The one automatic handoff-format reminder sent for this execution, if
+   *  any — one reminder max per execution (see {@link
+   *  PipelineStepReminder}). Optional/additive. */
+  reminder?: PipelineStepReminder | null;
 }
 
 /**

@@ -698,14 +698,57 @@ test("parsePipelineRunState: junk entries are dropped from active/blocked/histor
   expect(parsed?.history[0]).toEqual({
     seq: 1, stepId: "s1", taskId: "t1", startedAt: 100, endedAt: 200,
     outcome: "succeeded", handoff: { schemaVersion: 1, purpose: "p" }, nextStepIds: ["s2", "s3"],
+    responseKind: null, reminder: null,
   } as unknown as PipelineStepRecord);
   expect(parsed?.history[1]).toEqual({
     seq: 3, stepId: "s3", taskId: "t3", startedAt: 300, endedAt: null,
     outcome: null, handoff: null, nextStepIds: [],
+    responseKind: null, reminder: null,
   });
 
   expect(Object.keys(parsed?.joins ?? {})).toEqual(["s2"]);
   expect(parsed?.joins.s2?.arrivals).toEqual([{ fromStepId: "s1", seq: 1, handoff: null }]);
+});
+
+test("parsePipelineRunState: a history entry's `responseKind`/`reminder` round-trip; junk values collapse to null", () => {
+  const raw = {
+    pipelineId: "pipe-1",
+    history: [
+      {
+        // valid responseKind + a full, valid reminder object -> both survive.
+        seq: 1, stepId: "s1", taskId: "t1", startedAt: 100, endedAt: 200,
+        outcome: "succeeded",
+        responseKind: "handoff-missing",
+        reminder: { at: 150, reason: "handoff-missing", runId: "run-1", detail: "no <handoff> block was found" },
+      },
+      {
+        // unknown responseKind + malformed reminder (bad reason) -> both null.
+        seq: 2, stepId: "s2", taskId: "t2", startedAt: 100,
+        responseKind: "not-a-real-kind",
+        reminder: { at: 150, reason: "not-a-real-reason", runId: null, detail: "x" },
+      },
+      {
+        // reminder missing required fields -> null.
+        seq: 3, stepId: "s3", taskId: "t3", startedAt: 100,
+        reminder: { at: 150, reason: "handoff-invalid" },
+      },
+    ],
+  };
+
+  const parsed = parsePipelineRunState(JSON.stringify(raw));
+  expect(parsed).not.toBeNull();
+  expect(parsed?.history).toHaveLength(3);
+
+  expect(parsed?.history[0]?.responseKind).toBe("handoff-missing");
+  expect(parsed?.history[0]?.reminder).toEqual({
+    at: 150, reason: "handoff-missing", runId: "run-1", detail: "no <handoff> block was found",
+  });
+
+  expect(parsed?.history[1]?.responseKind).toBeNull();
+  expect(parsed?.history[1]?.reminder).toBeNull();
+
+  expect(parsed?.history[2]?.responseKind).toBeNull();
+  expect(parsed?.history[2]?.reminder).toBeNull();
 });
 
 test("parsePipelineRunState: a blocked entry's `pending` and the run's `capExtensions` round-trip, junk is dropped", () => {

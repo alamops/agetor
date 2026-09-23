@@ -40,19 +40,22 @@ import {
   isTaskRunLive,
   pipelineUpdateColumn,
   publishGlobalEvent,
+  sendInput,
   startTask,
   subscribeGlobal,
 } from "./orchestrator.ts";
+import { listPendingForTask } from "./interactions.ts";
 import { prepareWorkdir } from "./worktree.ts";
 import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
 import {
+  classifyStepResponse,
+  composeHandoffReminder,
   composeStepPrompt,
   deriveRunStatus,
   effectiveStepCap,
   incomingSteps,
   normalizeHandoff,
   outgoingSteps,
-  parseHandoff,
   renderHandoffFile,
   resolveNextSteps,
   resolveStartStep,
@@ -69,7 +72,6 @@ import type {
   Pipeline,
   PipelineActiveStep,
   PipelineBlock,
-  PipelineBlockKind,
   PipelineGraph,
   PipelineJoinArrival,
   PipelineRunSnapshot,
@@ -1364,6 +1366,18 @@ export async function cascadePipelineArchive(parentId: string): Promise<void> {
 // Settle/column event handling
 // ---------------------------------------------------------------------------
 
+/** Count of pending interactions registered against THIS settled run only,
+ *  not the whole task. `countPendingForTask` would include stale/unrelated
+ *  entries from an earlier run of the same step (a retry, or — in tests — a
+ *  fixture registered under a synthetic runId and never cleared), which
+ *  would misclassify a valid handoff as `user-ask` forever since nothing
+ *  ever removes those leftovers. Scoping to `runId` means only an
+ *  interaction actually raised by the run that just settled can suppress
+ *  its handoff classification. */
+function pendingInteractionsForRun(taskId: string, runId: string): number {
+  return listPendingForTask(taskId).filter((r) => r.runId === runId).length;
+}
+
 async function handleRunStatus(
   taskId: string,
   runId: string,
@@ -1386,14 +1400,97 @@ async function handleRunStatus(
       const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
 
       if (status === "succeeded") {
-        const parsed = parseHandoff(assistantTextForRun(runId));
-        if (!parsed.ok) {
-          const kind: PipelineBlockKind = parsed.raw === null ? "handoff-missing" : "handoff-invalid";
-          const detail = parsed.raw === null
+        // One-shot handoff reminder (owner request, `docs/plans/pipelines.md`):
+        // `classifyStepResponse` is the single decision point for what this
+        // execution's final response actually was. It's called on EVERY
+        // settle (not just this succeeded branch — see the failed/cancelled
+        // branches below) so `historyEntry.responseKind` always reflects the
+        // outcome, even for a settle that never reaches the reminder logic.
+        const assistantText = assistantTextForRun(runId);
+        const pendingInteractions = pendingInteractionsForRun(taskId, runId);
+        const classified = classifyStepResponse({ runStatus: status, assistantText, pendingInteractions });
+        if (historyEntry) historyEntry.responseKind = classified.kind;
+
+        if (classified.kind === "handoff-missing" || classified.kind === "handoff-invalid") {
+          const reason = classified.kind;
+          const baseMessage = reason === "handoff-missing"
             ? `step "${stepName}" finished but never emitted a <handoff> block`
-            : `step "${stepName}" emitted a <handoff> block agetor couldn't parse: ${parsed.error}`;
-          upsertBlocked(run, { taskId, stepId: activeEntry.stepId, kind, message: detail });
+            : `step "${stepName}" emitted a <handoff> block agetor couldn't parse: ${classified.error}`;
+
+          if (!historyEntry?.reminder) {
+            // Not blocked yet — send the ONE automatic reminder as an
+            // ordinary follow-up turn on the step's own run, rather than
+            // blocking the run over a step that may simply have forgotten
+            // the handoff format. `sendInput` folds into the live session
+            // (claude) or spawns a fresh turn (codex/cursor/gemini/fx) —
+            // either way it settles through this same `handleRunStatus`
+            // path again, which is what carries the execution to its next
+            // classification once the reminder turn finishes.
+            const stepObj = graph.steps.find((s) => s.id === activeEntry.stepId);
+            const outgoing = outgoingSteps(graph, activeEntry.stepId).map((o) => ({ name: o.step.name, label: o.edge.label }));
+            const transition = stepObj?.transition ?? "choose";
+            const detail = classified.error ?? (reason === "handoff-missing"
+              ? "no <handoff> block was found"
+              : "the handoff JSON could not be parsed");
+            const reminderText = composeHandoffReminder({ stepName, reason, detail, outgoing, transition });
+            const sent = await sendInput(runId, reminderText);
+            if (historyEntry) {
+              historyEntry.reminder = {
+                at: Date.now(),
+                reason,
+                runId: sent.delivered ? sent.runId : null,
+                detail,
+              };
+            }
+            if (sent.delivered) {
+              runs.appendEvent(
+                runId,
+                "status",
+                reason === "handoff-missing"
+                  ? "handoff missing — sent one automatic reminder; the next reply must contain the <handoff> block"
+                  : "handoff invalid — sent one automatic reminder; the next reply must contain a valid <handoff> block",
+              );
+              // No block recorded — the execution stays `active`, and
+              // `sendInput`'s own column flip back to `running` is left
+              // alone (nothing here fights it).
+              checkJoinIncomplete(run);
+              persist(parentId, run);
+              return;
+            }
+            // Could not deliver the reminder (withheld paste, dead session,
+            // …) — fall straight through to the ordinary blocked path,
+            // folding the send failure into the message so a human can see
+            // why no reminder went out.
+            upsertBlocked(run, {
+              taskId,
+              stepId: activeEntry.stepId,
+              kind: reason,
+              message: `${baseMessage} (automatic reminder could not be sent: ${sent.reason})`,
+            });
+            checkJoinIncomplete(run);
+            persist(parentId, run);
+            return;
+          }
+
+          // Already reminded once for this execution (retries don't reset
+          // it — see `PipelineStepReminder`'s doc) — a second bad response
+          // blocks instead of reminding again.
+          upsertBlocked(run, {
+            taskId,
+            stepId: activeEntry.stepId,
+            kind: reason,
+            message: `still no valid handoff after one reminder — ${baseMessage}`,
+          });
           checkJoinIncomplete(run);
+          persist(parentId, run);
+          return;
+        }
+
+        if (classified.kind === "user-ask") {
+          // The step's task already reflects a pending interaction through
+          // the ordinary interactions/column machinery — nothing
+          // pipeline-specific to block on here beyond the `responseKind`
+          // stamp above.
           persist(parentId, run);
           return;
         }
@@ -1404,24 +1501,43 @@ async function handleRunStatus(
         // are visible), but do NOT resolve/advance: the execution stays in
         // `run.active` exactly like an unresolved handoff, waiting on a
         // Retry (re-run the step) or a manual Advance.
-        if (parsed.handoff.status === "blocked") {
-          const oq = parsed.handoff.openQuestions.length > 0
-            ? ` (open questions: ${parsed.handoff.openQuestions.join("; ")})`
+        if (classified.kind === "handoff-blocked") {
+          const handoff = classified.handoff!;
+          const oq = handoff.openQuestions.length > 0
+            ? ` (open questions: ${handoff.openQuestions.join("; ")})`
             : "";
-          const reasonText = parsed.handoff.reason.trim().length > 0 ? parsed.handoff.reason : "no reason given";
+          const reasonText = handoff.reason.trim().length > 0 ? handoff.reason : "no reason given";
           upsertBlocked(run, {
             taskId,
             stepId: activeEntry.stepId,
             kind: "step-blocked",
             message: `step "${stepName}" reported it is blocked: ${reasonText}${oq}`,
           });
-          if (historyEntry) historyEntry.handoff = parsed.handoff;
+          if (historyEntry) historyEntry.handoff = handoff;
           checkJoinIncomplete(run);
           persist(parentId, run);
           return;
         }
 
-        const resolved = resolveNextSteps(graph, activeEntry.stepId, parsed.handoff);
+        if (classified.kind !== "handoff") {
+          // Defensive: `classifyStepResponse` only returns "error"/
+          // "cancelled" for the failed/cancelled/orphaned run statuses,
+          // never for "succeeded" — this can't actually be reached, but
+          // stay exhaustive rather than fall into `resolveNextSteps` with a
+          // null handoff.
+          upsertBlocked(run, {
+            taskId,
+            stepId: activeEntry.stepId,
+            kind: "step-failed",
+            message: `step "${stepName}" finished with an unexpected response`,
+          });
+          checkJoinIncomplete(run);
+          persist(parentId, run);
+          return;
+        }
+
+        const parsedHandoff = classified.handoff!;
+        const resolved = resolveNextSteps(graph, activeEntry.stepId, parsedHandoff);
         if (resolved.kind === "ambiguous" || resolved.kind === "unknown") {
           const candidates = resolved.candidates.join(", ") || "(no outgoing steps)";
           const message = resolved.kind === "ambiguous"
@@ -1441,7 +1557,7 @@ async function handleRunStatus(
         if (historyEntry) {
           historyEntry.endedAt = Date.now();
           historyEntry.outcome = "succeeded";
-          historyEntry.handoff = parsed.handoff;
+          historyEntry.handoff = parsedHandoff;
           historyEntry.nextStepIds = nextStepIds;
         }
         pipelineUpdateColumn(taskId, runId, "done");
@@ -1484,7 +1600,7 @@ async function handleRunStatus(
             const arrivals = addJoinArrival(run.joins[nid]?.arrivals ?? [], {
               fromStepId: activeEntry.stepId,
               seq: activeEntry.seq,
-              handoff: parsed.handoff,
+              handoff: parsedHandoff,
             });
             const incoming = incomingSteps(graph, nid);
             const arrivedIds = new Set(arrivals.map((a) => a.fromStepId));
@@ -1507,7 +1623,7 @@ async function handleRunStatus(
               run.joins[nid] = { arrivals };
             }
           } else {
-            const previousArr = [{ stepId: activeEntry.stepId, seq: activeEntry.seq, handoff: parsed.handoff }];
+            const previousArr = [{ stepId: activeEntry.stepId, seq: activeEntry.seq, handoff: parsedHandoff }];
             if (parentArchived) {
               holdForArchivedParent(run, targetStep, previousArr);
             } else {
@@ -1525,6 +1641,13 @@ async function handleRunStatus(
       }
 
       if (status === "failed") {
+        if (historyEntry) {
+          historyEntry.responseKind = classifyStepResponse({
+            runStatus: status,
+            assistantText: "",
+            pendingInteractions: pendingInteractionsForRun(taskId, runId),
+          }).kind;
+        }
         const tail = lastStatusLineForRun(runId);
         upsertBlocked(run, {
           taskId,
@@ -1553,6 +1676,11 @@ async function handleRunStatus(
       if (historyEntry) {
         historyEntry.endedAt = Date.now();
         historyEntry.outcome = "cancelled";
+        historyEntry.responseKind = classifyStepResponse({
+          runStatus: status,
+          assistantText: "",
+          pendingInteractions: pendingInteractionsForRun(taskId, runId),
+        }).kind;
       }
       const stillLiveSiblings = run.active.filter((a) => a.taskId !== taskId && isTaskRunLive(a.taskId));
       // Major 1 (round 3): a WHOLE-pipeline Stop on a fan-out must end

@@ -365,3 +365,63 @@ export function blockedSummary(run: PipelineRunState | null | undefined): string
   const suffix = rest.length > 0 ? ` (+${rest.length} more)` : "";
   return `${first!.message}${suffix}`;
 }
+
+// ---------------------------------------------------------------------------
+// Handoff-reminder display (the runner's one-automatic-reminder-turn flow)
+// ---------------------------------------------------------------------------
+
+/** Semantic tone for a {@link responseKindLabel} result — maps to the same
+ *  `--success`/`--warning`/`--danger` status tokens (plus a neutral
+ *  `"muted"`) every other badge in the app uses. */
+export type ResponseKindTone = "success" | "warning" | "danger" | "muted";
+
+const RESPONSE_KIND_DISPLAY: Record<
+  NonNullable<PipelineStepRecord["responseKind"]>,
+  { text: string; tone: ResponseKindTone }
+> = {
+  handoff: { text: "Handed off", tone: "success" },
+  "handoff-blocked": { text: "Reported blocked", tone: "warning" },
+  "handoff-missing": { text: "No handoff", tone: "warning" },
+  "handoff-invalid": { text: "Invalid handoff", tone: "warning" },
+  "user-ask": { text: "Asked you", tone: "warning" },
+  error: { text: "Error", tone: "danger" },
+  cancelled: { text: "Cancelled", tone: "muted" },
+};
+
+/**
+ * Display text + semantic tone for a step execution's
+ * `PipelineStepRecord.responseKind` — backs the run view's history-row chip.
+ * `null`/`undefined` (an older run recorded before `responseKind` existed,
+ * or a still-in-flight record) yields `null`, telling the caller to render
+ * no chip at all rather than a placeholder.
+ */
+export function responseKindLabel(
+  kind: PipelineStepRecord["responseKind"] | null | undefined,
+): { text: string; tone: ResponseKindTone } | null {
+  if (!kind) return null;
+  return RESPONSE_KIND_DISPLAY[kind] ?? null;
+}
+
+/**
+ * True exactly while the CURRENTLY ACTIVE execution of `stepId` has already
+ * received the runner's one automatic "no valid handoff yet" reminder turn
+ * (its `run.history` record — pushed at launch, before the execution
+ * settles — carries a non-null `reminder`) and hasn't settled yet. `false`
+ * once that execution ends (a later, unreminded record supersedes it, or
+ * the step is no longer in `run.active` at all) or if it was never
+ * reminded. Matches the record by BOTH `stepId` and the active entry's
+ * `taskId` so a step that's cycled (several `run.history` records share a
+ * `stepId`) always reads the in-progress execution's own record, not an
+ * earlier generation's.
+ */
+export function stepReminded(run: PipelineRunState | null | undefined, stepId: string): boolean {
+  if (!run) return false;
+  const activeEntry = run.active.find((a) => a.stepId === stepId);
+  if (!activeEntry) return false;
+
+  let latest: PipelineStepRecord | null = null;
+  for (const record of run.history) {
+    if (record.stepId === stepId && record.taskId === activeEntry.taskId) latest = record;
+  }
+  return !!latest?.reminder;
+}

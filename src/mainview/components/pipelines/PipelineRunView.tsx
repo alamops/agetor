@@ -14,11 +14,14 @@ import { api, ApiError } from "@/lib/api";
 import {
   edgeVisualState,
   latestTransition,
+  responseKindLabel,
+  stepReminded,
   stepTaskFor,
   stepVisualState,
   toFlowEdges,
   toFlowNodes,
   type EdgeVisualState,
+  type ResponseKindTone,
   type StepFlowEdge,
   type StepFlowNode,
   type StepVisualState,
@@ -56,6 +59,15 @@ const STATUS_CLASSES: Record<PipelineRunStatus, string> = {
   cancelled: "bg-muted text-muted-foreground",
 };
 
+/** Background/foreground pair for a {@link responseKindLabel}/reminder chip,
+ *  keyed by `ResponseKindTone` — mirrors `STATUS_CLASSES` above. */
+const TONE_CLASSES: Record<ResponseKindTone, string> = {
+  success: "bg-success/10 text-success",
+  warning: "bg-warning/10 text-warning",
+  danger: "bg-danger/10 text-danger",
+  muted: "bg-muted text-muted-foreground",
+};
+
 /** Statuses from which a run can be restarted from its start step,
  *  discarding the prior history — mirrors the server's own gate. */
 const RESTARTABLE_STATUSES: PipelineRunStatus[] = ["done", "cancelled", "blocked"];
@@ -87,6 +99,10 @@ interface PipelineRunViewProps {
   taskId: string;
   onOpenTask: (task: Task) => void;
   onBack: () => void;
+}
+
+function formatClockTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
 function formatDuration(ms: number): string {
@@ -328,7 +344,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
     if (!run) return "";
     const active = run.active.map((a) => `${a.stepId}:${a.taskId}`).join(",");
     const blocked = run.blocked.map((b) => `${b.stepId ?? ""}:${b.taskId ?? ""}`).join(",");
-    const history = run.history.map((h) => `${h.stepId}:${h.outcome ?? ""}`).join(",");
+    const history = run.history.map((h) => `${h.stepId}:${h.outcome ?? ""}:${h.reminder ? h.reminder.at : ""}`).join(",");
     const columns = steps.map((t) => `${t.id}:${t.column}`).join(",");
     return `${active}|${blocked}|${history}|${columns}`;
   }, [run, steps]);
@@ -358,9 +374,10 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
       let changed = false;
       const next = ns.map((n) => {
         const visual: StepVisualState = stepVisualState(r, n.id, s);
-        if (n.data.visual === visual) return n;
+        const reminded = stepReminded(r, n.id);
+        if (n.data.visual === visual && n.data.reminded === reminded) return n;
         changed = true;
-        return { ...n, data: { ...n.data, visual } };
+        return { ...n, data: { ...n.data, visual, reminded } };
       });
       return changed ? next : ns;
     });
@@ -813,6 +830,7 @@ function HistoryRow({ record, graph }: { record: PipelineStepRecord; graph: Pipe
   const [open, setOpen] = useState(false);
   const stepName = graph ? stepNameById(graph, record.stepId) : record.stepId;
   const duration = record.endedAt != null ? formatDuration(record.endedAt - record.startedAt) : "—";
+  const kindInfo = responseKindLabel(record.responseKind);
 
   return (
     <li data-testid="pipeline-run-history-row" className="rounded-md border border-border p-2">
@@ -828,6 +846,28 @@ function HistoryRow({ record, graph }: { record: PipelineStepRecord; graph: Pipe
           {record.outcome ?? "…"} · {duration}
         </span>
       </button>
+      {(kindInfo || record.reminder) && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+          {kindInfo && (
+            <span
+              data-testid="pipeline-run-response-kind"
+              data-kind={record.responseKind}
+              className={`inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium ${TONE_CLASSES[kindInfo.tone]}`}
+            >
+              {kindInfo.text}
+            </span>
+          )}
+          {record.reminder && (
+            <span
+              data-testid="pipeline-run-reminder"
+              title={record.reminder.detail}
+              className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${TONE_CLASSES.warning}`}
+            >
+              Reminder sent · {formatClockTime(record.reminder.at)}
+            </span>
+          )}
+        </div>
+      )}
       {open && record.handoff && (
         <pre
           data-testid="pipeline-run-history-handoff"

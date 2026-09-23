@@ -16,6 +16,7 @@ import type {
   PipelineRunState,
   PipelineRunStatus,
   PipelineStep,
+  StepResponseKind,
 } from "./types.ts";
 import { PIPELINE_LIMITS } from "./types.ts";
 
@@ -25,6 +26,15 @@ import { PIPELINE_LIMITS } from "./types.ts";
  *  parseHandoff})'s tag matching; renamed from `agetor_handoff` per the
  *  owner's D3 pick. */
 export const HANDOFF_TAG = "handoff";
+
+/** Leading line of {@link composeHandoffReminder}'s message — the single
+ *  automatic follow-up the runner sends when a step's final response didn't
+ *  carry a valid `<handoff>` block. It's a `user` event (not assistant
+ *  text), so this marker exists purely for display (transcripts, `agetor
+ *  logs`, the TUI labeling it as a reminder rather than an ordinary typed
+ *  message) and so any caller inspecting message text can recognize it
+ *  without re-deriving the wording. */
+export const HANDOFF_REMINDER_MARKER = "[agetor handoff reminder]";
 
 /** Prepended immediately before a previous step's inlined (or file-pointer)
  *  handoff content in {@link composeStepPrompt}'s "Context from previous
@@ -495,6 +505,48 @@ export function parseHandoff(text: string): { ok: true; handoff: Handoff } | { o
 }
 
 /**
+ * Classify a step execution's final response into a {@link StepResponseKind}
+ * — the single decision point the runner uses to choose between advancing,
+ * sending the one automatic {@link composeHandoffReminder} follow-up, or
+ * blocking. Order of precedence: a cancelled/orphaned run is always
+ * `"cancelled"`; a failed run is always `"error"`; a step task with a
+ * pending interaction (an `AskUserQuestion`-style card, a plan approval, …)
+ * is `"user-ask"` — the agent is waiting on the user, which must never be
+ * mistaken for a handoff-format failure; otherwise the response is parsed
+ * via {@link parseHandoff}: a handoff whose own `status` is `"blocked"`
+ * classifies `"handoff-blocked"` (the handoff itself is still returned —
+ * the run just doesn't advance off it), a valid non-blocked handoff is
+ * `"handoff"`, no `<handoff>` tag at all is `"handoff-missing"`, and a tag
+ * that failed to parse is `"handoff-invalid"` — both of the latter two carry
+ * the parser's `error` string in `error`.
+ */
+export function classifyStepResponse(input: {
+  runStatus: "succeeded" | "failed" | "cancelled" | "orphaned";
+  assistantText: string;
+  pendingInteractions: number;
+}): { kind: StepResponseKind; handoff: Handoff | null; error: string | null } {
+  if (input.runStatus === "cancelled" || input.runStatus === "orphaned") {
+    return { kind: "cancelled", handoff: null, error: null };
+  }
+  if (input.runStatus === "failed") {
+    return { kind: "error", handoff: null, error: null };
+  }
+  if (input.pendingInteractions > 0) {
+    return { kind: "user-ask", handoff: null, error: null };
+  }
+
+  const parsed = parseHandoff(input.assistantText);
+  if (!parsed.ok) {
+    const kind: StepResponseKind = parsed.raw === null ? "handoff-missing" : "handoff-invalid";
+    return { kind, handoff: null, error: parsed.error };
+  }
+  if (parsed.handoff.status === "blocked") {
+    return { kind: "handoff-blocked", handoff: parsed.handoff, error: null };
+  }
+  return { kind: "handoff", handoff: parsed.handoff, error: null };
+}
+
+/**
  * Render the JSON a step's handoff is written to disk as (e.g.
  * `dataDir/pipeline-handoffs/<taskId>/handoff-<seq>.json`, written by the
  * runner) — pretty-printed with a leading `_untrusted` field carrying
@@ -599,6 +651,27 @@ export function effectiveStepCap(run: PipelineRunState): number {
   const maxSteps = run.snapshot?.maxSteps ?? PIPELINE_LIMITS.maxStepsDefault;
   const capExtensions = run.capExtensions ?? 0;
   return maxSteps * (1 + capExtensions);
+}
+
+/**
+ * The handoff schema + `next`-field rule, rendered identically wherever a
+ * step's agent needs to be told the exact contract — {@link
+ * composeStepPrompt}'s "## Handoff (required)" section and {@link
+ * composeHandoffReminder}'s follow-up message. Extracted so the two callers
+ * can't drift on the JSON shape or the `next` rule; each caller wraps this
+ * with its own framing (a fresh instruction vs. a corrective one).
+ */
+function renderHandoffContract(outgoing: { name: string; label: string }[], transition: "choose" | "all"): string[] {
+  return [
+    `Format: exactly one block — \`<${HANDOFF_TAG}>\` followed by a newline, the JSON, a newline, then ` +
+      `\`</${HANDOFF_TAG}>\`.`,
+    'Schema: {"schemaVersion":1,"purpose":"…the main purpose of the overall task, restated…",' +
+      '"summary":"…what you did / found…","reason":"…why you are handing off now and what the next step ' +
+      'should do…","next":<see below>,"artifacts":["paths or URLs"],"openQuestions":["…"],' +
+      '"status":"done"|"blocked"}',
+    nextRuleText(outgoing, transition),
+    `Do not put anything after the closing </${HANDOFF_TAG}> tag.`,
+  ];
 }
 
 function nextRuleText(outgoing: { name: string; label: string }[], transition: "choose" | "all"): string {
@@ -735,20 +808,45 @@ export function composeStepPrompt(input: {
   parts.push("## Handoff (required)");
   parts.push(
     "When your work for this step is complete — or you are blocked and cannot continue — end your FINAL " +
-      `message with exactly one block: \`<${HANDOFF_TAG}>\` followed by a newline, the JSON, a newline, then ` +
-      `\`</${HANDOFF_TAG}>\`.`,
+      "message with the handoff block described below.",
   );
-  parts.push(
-    'Schema: {"schemaVersion":1,"purpose":"…the main purpose of the overall task, restated…",' +
-      '"summary":"…what you did / found…","reason":"…why you are handing off now and what the next step ' +
-      'should do…","next":<see below>,"artifacts":["paths or URLs"],"openQuestions":["…"],' +
-      '"status":"done"|"blocked"}',
-  );
-  parts.push(nextRuleText(input.outgoing, input.transition));
-  parts.push(
-    `Do not put anything after the closing </${HANDOFF_TAG}> tag. If you need the user's input, ask before ` +
-      "writing the handoff.",
-  );
+  parts.push(...renderHandoffContract(input.outgoing, input.transition));
+  parts.push("If you need the user's input, ask before writing the handoff.");
+
+  return parts.join("\n\n");
+}
+
+/**
+ * Compose the single automatic follow-up message the runner sends, as an
+ * ordinary user turn, when a step's final response was `"handoff-missing"`
+ * or `"handoff-invalid"` (see {@link classifyStepResponse}) — one reminder
+ * max per execution; a second bad response blocks instead of reminding
+ * again (the caller is responsible for that one-shot rule via {@link
+ * PipelineStepReminder} on the `PipelineStepRecord`, not this function).
+ * Starts with {@link HANDOFF_REMINDER_MARKER}, states what happened, then
+ * repeats the exact handoff contract via {@link renderHandoffContract} (the
+ * same rendering `composeStepPrompt` used originally) so the corrective
+ * message can't drift from the schema the step was first given.
+ */
+export function composeHandoffReminder(input: {
+  stepName: string;
+  reason: "handoff-missing" | "handoff-invalid";
+  detail: string | null;
+  outgoing: { name: string; label: string }[];
+  transition: "choose" | "all";
+}): string {
+  const parts: string[] = [HANDOFF_REMINDER_MARKER];
+
+  if (input.reason === "handoff-missing") {
+    parts.push(`Your last message for step "${input.stepName}" did not include the required <handoff> block.`);
+  } else {
+    const detail = input.detail ?? "the JSON could not be parsed";
+    parts.push(`Your last message for step "${input.stepName}" included a <handoff> block whose JSON could not be parsed: ${detail}`);
+  }
+
+  parts.push("Do not redo the work. Reply with ONLY the handoff block, in exactly this format:");
+  parts.push(...renderHandoffContract(input.outgoing, input.transition));
+  parts.push("If you are blocked or need the user's input, say so in the handoff's status/openQuestions instead of asking a question.");
 
   return parts.join("\n\n");
 }

@@ -446,7 +446,11 @@ export function pipelineStatusLines(task: Task, steps: Task[]): string[] {
     lines.push(`  ${c.dim("history (oldest first):")}`);
     for (const h of run.history) {
       const stepName = run.snapshot ? stepNameById(run.snapshot.graph, h.stepId) : h.stepId;
-      lines.push(`    ${h.seq}. ${stepName}  ${historyGlyph(h.outcome)}  ${c.dim(h.taskId.slice(0, 8))}`);
+      const kindNote = h.responseKind ? `  ${c.dim(`[${h.responseKind}]`)}` : "";
+      const remindedNote = h.reminder ? `  ${c.yellow("(reminded)")}` : "";
+      lines.push(
+        `    ${h.seq}. ${stepName}  ${historyGlyph(h.outcome)}${kindNote}${remindedNote}  ${c.dim(h.taskId.slice(0, 8))}`,
+      );
     }
   }
 

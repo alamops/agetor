@@ -12,6 +12,7 @@ import {
   type AgentKind,
   type Harness,
   type RunEventStream,
+  type Task,
 } from "../shared/types.ts";
 
 // agents.ts imports codex-tmux.ts/gemini-tmux.ts, both of which import
@@ -35,8 +36,9 @@ const {
   FAKE_FX_REPAUSE_PROMPT_MARKER,
   FAKE_FX_RECOVERY_URL_PROMPT_MARKER,
   FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER,
+  FAKE_CLAUDE_HANDOFF_PROMPT_MARKER,
 } = await import("./agents.ts");
-const { dataDir } = await import("./db.ts");
+const { dataDir, tasks } = await import("./db.ts");
 
 beforeEach(() => {
   // Force the literal "claude" / "codex" names in argv. Production
@@ -68,6 +70,7 @@ afterEach(() => {
   delete process.env.AGETOR_FAKE_FX_RECOVERY_URL;
   delete process.env.AGETOR_FAKE_FX_RECOVERY;
   delete process.env.AGETOR_FAKE_FX_EFFORT_UNOFFERED;
+  delete process.env.AGETOR_CLAUDE_DRIVER;
 });
 
 /** Build a built-in harness for tests — kind doubles as id, no overrides. */
@@ -1907,4 +1910,155 @@ test("toTerminalAppleScript escapes quotes/backslashes and wraps in do script + 
   const script = toTerminalAppleScript('echo "hi"; cd /x\\y');
   expect(script).toContain('do script "echo \\"hi\\"; cd /x\\\\y"');
   expect(script).toContain('activate application "Terminal"');
+});
+
+// --- AGETOR_CLAUDE_DRIVER=fake pipeline-handoff two-turn suffixes -----------
+// See docs/plans/pipelines.md and agents.ts's FAKE_CLAUDE_HANDOFF_PROMPT_MARKER
+// doc comment: the pipeline runner sends ONE automatic reminder (a plain
+// follow-up sendInput turn, no marker of its own) when a step's reply lacked
+// a valid <handoff>, and `missing-then-done` / `invalid-then-done` /
+// `missing-then-<StepName>` model "fail the first turn, succeed after the
+// reminder" so pipeline-runner.test.ts (owned elsewhere) can exercise that
+// recovery path against the fake driver. These tests drive `spawnAgent`
+// directly against the claude-code fake driver, mirroring the fx fake-driver
+// tests above.
+
+/** Minimal hand-built Task fixture — mirrors db-sent-files.test.ts's
+ *  makeTaskRow. Only `prompt` matters here: it's what
+ *  `resolveFakeHandoffPromptSource` falls back to when a follow-up turn's
+ *  own prompt carries no marker. */
+function makeHandoffTaskRow(taskId: string, prompt: string): Task {
+  return {
+    id: taskId,
+    title: "t",
+    prompt,
+    agent: "claude-code",
+    workdir: "/tmp",
+    isolation: "none",
+    taskType: "task",
+    branch: null,
+    branchSource: "created",
+    worktreePath: null,
+    baseRef: null,
+    prUrl: null,
+    mode: null,
+    model: null,
+    effort: null,
+    fast: false,
+    maxMode: false,
+    references: [],
+    backlog: [],
+    plans: [],
+    draft: null,
+    column: "ready",
+    runId: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    hasOpenableRun: false,
+    pendingInteractionCount: 0,
+    openTerminalCount: 0,
+    archivedAt: null,
+  };
+}
+
+/** Spawn one fake claude-code handoff turn for `taskId` with the given
+ *  `prompt`, collect its assistant text, and return whether a <handoff> tag
+ *  was present in it — `"missing"` (no tag at all), `"invalid"` (tag present
+ *  but JSON.parse fails), or the parsed handoff object. */
+async function runFakeHandoffTurn(
+  taskId: string,
+  prompt: string,
+): Promise<"missing" | "invalid" | { next: string | null }> {
+  process.env.AGETOR_CLAUDE_DRIVER = "fake";
+  let assistantText = "";
+  const handle = await spawnAgent({
+    taskId,
+    runId: `run-${taskId}-${Date.now()}-${Math.random()}`,
+    harness: builtin("claude-code"),
+    prompt,
+    cwd: "/tmp",
+    onChunk: (stream, data) => { if (stream === "assistant") assistantText += data; },
+    opts: { model: "claude-opus-4-7", effort: "high" },
+  });
+  await handle.done;
+  if (!assistantText.includes("<handoff>")) return "missing";
+  const match = /<handoff>\n([\s\S]*?)\n<\/handoff>/.exec(assistantText);
+  if (!match) return "invalid";
+  try {
+    return JSON.parse(match[1] as string) as { next: string | null };
+  } catch {
+    return "invalid";
+  }
+}
+
+test("claude fake driver: missing-then-done emits no handoff on turn 1 and a valid handoff on turn 2 for the same taskId", async () => {
+  const taskId = "task-handoff-missing-then-done";
+  const prompt = `Do the step. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing-then-done`;
+  const turn1 = await runFakeHandoffTurn(taskId, prompt);
+  expect(turn1).toBe("missing");
+  const turn2 = await runFakeHandoffTurn(taskId, prompt);
+  expect(turn2).not.toBe("missing");
+  expect(turn2).not.toBe("invalid");
+  expect((turn2 as { next: string | null }).next).toBeNull();
+});
+
+test("claude fake driver: invalid-then-done emits an unparsable handoff on turn 1 and a valid handoff on turn 2", async () => {
+  const taskId = "task-handoff-invalid-then-done";
+  const prompt = `Do the step. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:invalid-then-done`;
+  const turn1 = await runFakeHandoffTurn(taskId, prompt);
+  expect(turn1).toBe("invalid");
+  const turn2 = await runFakeHandoffTurn(taskId, prompt);
+  expect((turn2 as { next: string | null }).next).toBeNull();
+});
+
+test("claude fake driver: missing-then-<StepName> emits no handoff on turn 1 and a handoff naming that step on turn 2", async () => {
+  const taskId = "task-handoff-missing-then-step";
+  const prompt = `Do the step. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing-then-StepB`;
+  const turn1 = await runFakeHandoffTurn(taskId, prompt);
+  expect(turn1).toBe("missing");
+  const turn2 = await runFakeHandoffTurn(taskId, prompt);
+  expect((turn2 as { next: string | null }).next).toBe("StepB");
+});
+
+test("claude fake driver: a follow-up prompt without a marker inherits the task's original stored-prompt marker", async () => {
+  const taskId = "task-handoff-inherit-plain";
+  tasks.insert(makeHandoffTaskRow(taskId, `Do the step. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:StepC`));
+  // The follow-up line itself (e.g. a real pipeline-runner reminder, or any
+  // other marker-less resend) carries no marker at all.
+  const result = await runFakeHandoffTurn(taskId, "please try again and include a <handoff> block");
+  expect(result).not.toBe("missing");
+  expect(result).not.toBe("invalid");
+  expect((result as { next: string | null }).next).toBe("StepC");
+});
+
+test("claude fake driver: a follow-up without a marker plus an unstarted/unknown taskId never enters the handoff branch", async () => {
+  process.env.AGETOR_CLAUDE_DRIVER = "fake";
+  let assistantText = "";
+  const handle = await spawnAgent({
+    taskId: "task-handoff-unknown-no-marker",
+    runId: "run-handoff-unknown-no-marker",
+    harness: builtin("claude-code"),
+    prompt: "plain follow-up with no marker and no task row",
+    cwd: "/tmp",
+    onChunk: (stream, data) => { if (stream === "assistant") assistantText += data; },
+    opts: { model: "claude-opus-4-7", effort: "high" },
+  });
+  await handle.done;
+  expect(assistantText).not.toContain("<handoff>");
+  expect(assistantText).not.toContain("I finished the work but forgot the handoff.");
+});
+
+test("claude fake driver: two-turn inheritance combines with a task's stored marker (turn 1 missing, turn 2 done via reminder-style follow-up)", async () => {
+  const taskId = "task-handoff-inherit-two-turn";
+  const original = `Do the step. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing-then-done`;
+  tasks.insert(makeHandoffTaskRow(taskId, original));
+  // Turn 1: launched with the task's own original prompt (as the real
+  // pipeline runner does on first launch).
+  const turn1 = await runFakeHandoffTurn(taskId, original);
+  expect(turn1).toBe("missing");
+  // Turn 2: the runner's automatic reminder — no marker of its own —
+  // inherits the ORIGINAL prompt's marker/suffix and, since this is now
+  // turn 2 for this taskId, resolves to the "then" (done) behavior.
+  const turn2 = await runFakeHandoffTurn(taskId, "no <handoff> was found in your last reply — please retry");
+  expect((turn2 as { next: string | null }).next).toBeNull();
 });

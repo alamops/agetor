@@ -1,6 +1,6 @@
 import { memo } from "react";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
-import { Merge, Play, Plus, Split } from "lucide-react";
+import { Merge, Play, Plus, RefreshCw, Split } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { StepVisualState } from "@/lib/pipelines";
 import type { PipelineStep } from "../../../shared/types.ts";
@@ -20,6 +20,11 @@ export type StepNodeData = Record<string, unknown> & {
   visual?: StepVisualState;
   /** Read-only (run view): hides the "+" append affordance. */
   readOnly?: boolean;
+  /** Run view only: the step's currently active execution has already
+   *  received the runner's automatic "no valid handoff yet" reminder turn
+   *  and hasn't settled since — see `stepReminded` in `@/lib/pipelines`.
+   *  Renders a small glyph while `visual === "active"`. */
+  reminded?: boolean;
   /** Appends a new step connected to this one's output — omit (or pair
    *  with `readOnly: true`) to hide the "+" button entirely. */
   onAppend?: (stepId: string) => void;
@@ -37,7 +42,7 @@ const VISUAL_CLASSES: Record<StepVisualState, string> = {
 };
 
 function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
-  const { step, visual = "idle", readOnly, onAppend } = data;
+  const { step, visual = "idle", readOnly, reminded, onAppend } = data;
   const { startStepId, resolveProfile } = usePipelineCanvasContext();
   const { profile, profileDeleted } = resolveProfile(step.agentProfileId ?? null);
   const isStart = startStepId === step.id;
@@ -80,6 +85,15 @@ function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
         )}
         {step.join === "all" && (
           <Merge className="size-3.5 shrink-0 text-muted-foreground" aria-label="Waits for every incoming step" />
+        )}
+        {visual === "active" && reminded && (
+          <span
+            data-testid="pipeline-step-reminded"
+            title="Reminder sent — waiting for the handoff"
+            className="inline-flex shrink-0 items-center text-warning"
+          >
+            <RefreshCw className="size-3.5" aria-hidden />
+          </span>
         )}
       </div>
 

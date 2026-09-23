@@ -514,6 +514,42 @@ const sanitizeBlock = (raw: unknown): PipelineBlock | null => {
 
 const STEP_RECORD_OUTCOMES = new Set<string>(["succeeded", "failed", "cancelled", "advanced-manually"]);
 
+/** {@link PipelineStepRecord.responseKind}'s value set — see {@link
+ *  StepResponseKind} in `src/shared/types.ts`. */
+const STEP_RESPONSE_KINDS = new Set<string>([
+  "handoff", "handoff-blocked", "handoff-missing", "handoff-invalid", "user-ask", "error", "cancelled",
+]);
+
+/** An unrecognized/malformed `responseKind` collapses to `null` (same as a
+ *  record written before this field existed) rather than dropping the whole
+ *  history entry — it's purely a UI label, never consulted for control flow
+ *  by `resolveNextSteps`/`deriveRunStatus`/etc. */
+const sanitizeResponseKind = (raw: unknown): NonNullable<PipelineStepRecord["responseKind"]> | null =>
+  typeof raw === "string" && STEP_RESPONSE_KINDS.has(raw)
+    ? (raw as NonNullable<PipelineStepRecord["responseKind"]>)
+    : null;
+
+const STEP_REMINDER_REASONS = new Set<string>(["handoff-missing", "handoff-invalid"]);
+
+/** {@link PipelineStepRecord.reminder} — the one-shot automatic handoff
+ *  reminder the runner records against an execution (`pipeline-runner.ts`'s
+ *  `handleRunStatus`). A malformed value collapses to `null` (treated the
+ *  same as "never reminded") rather than dropping the whole history entry —
+ *  the worst case is one extra reminder attempt, never a control-flow bug. */
+const sanitizeStepReminder = (raw: unknown): NonNullable<PipelineStepRecord["reminder"]> | null => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const at = rec.at;
+  const reason = rec.reason;
+  const detail = rec.detail;
+  const runId = rec.runId;
+  if (!isFiniteNumber(at)) return null;
+  if (typeof reason !== "string" || !STEP_REMINDER_REASONS.has(reason)) return null;
+  if (typeof detail !== "string") return null;
+  if (runId !== null && typeof runId !== "string") return null;
+  return { at, reason: reason as "handoff-missing" | "handoff-invalid", runId: runId ?? null, detail };
+};
+
 /** One completed/cancelled execution in `PipelineRunState.history` — dropped
  *  wholesale when its identity fields (`stepId`/`taskId`/`seq`/`startedAt`)
  *  are malformed, since a history entry with no usable identity can't be
@@ -542,6 +578,8 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
     seq, stepId, taskId, startedAt, endedAt, outcome,
     handoff: sanitizeStoredHandoff(rec.handoff),
     nextStepIds,
+    responseKind: sanitizeResponseKind(rec.responseKind),
+    reminder: sanitizeStepReminder(rec.reminder),
   };
 };
 
