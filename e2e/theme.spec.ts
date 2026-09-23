@@ -198,6 +198,14 @@ test.describe("theme: token layer is live", () => {
 
     await setThemePreference(request, backend, "dark");
     await gotoApp(page, backend);
+    // The Vite/e2e boot path carries no `&theme=` on the URL hash (only the
+    // packaged app's index.ts adds it), so the page first paints from
+    // `matchMedia` and flips to the persisted Dark only once App's
+    // `listPreferences` fetch lands — under parallel-run load that fetch can
+    // take seconds, and reading the token before the flip compares Light
+    // against Light. Wait for the flip; the no-flash guarantee is the
+    // packaged app's, not this path's.
+    await expect.poll(() => isDark(page), { message: "expected the persisted Dark preference to apply" }).toBe(true);
     const dangerDark = await readDanger();
 
     const dialog = await openSettingsGeneral(page);

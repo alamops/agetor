@@ -317,8 +317,11 @@ async function openIssueTaskDialog(page: Page): Promise<Locator> {
   const issueTaskDialog = page.getByTestId("issue-task-dialog");
   await expect(issueTaskDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 
+  // Mounts only after the issue thread AND the launch pickers' harness
+  // statuses load (see e2e/issue-task.spec.ts's twin helper) — under
+  // parallel-run load that outlasts the 5s default.
   const promptTextarea = issueTaskDialog.getByTestId("prompt-textarea");
-  await expect(promptTextarea).toBeVisible();
+  await expect(promptTextarea).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   await expect(async () => {
     const value = await promptTextarea.inputValue();
     expect(value).toContain(`Issue #${ISSUE_NUMBER}`);

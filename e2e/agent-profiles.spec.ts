@@ -601,9 +601,20 @@ test.describe("agent profiles", () => {
     // stays mounted and slides off-screen via a CSS transform (not
     // `display:none`), so wait for the backdrop button itself to go
     // pointer-events-none rather than asserting the `<aside>` hidden.
+    // …and once the exit animation ends the panel — backdrop included —
+    // unmounts outright (`if (!mountedTask) return null`), so under load the
+    // CSS check can find no backdrop at all: accept either state.
     const backdrop = page.getByRole("button", { name: "Close task panel" });
     await panel.getByRole("button", { name: "Close task details" }).click();
-    await expect(backdrop).toHaveCSS("pointer-events", "none");
+    await expect
+      .poll(
+        async () => {
+          if ((await backdrop.count()) === 0) return true;
+          return (await backdrop.evaluate((el) => getComputedStyle(el).pointerEvents)) === "none";
+        },
+        { message: "expected the run panel backdrop to go inert or unmount" },
+      )
+      .toBe(true);
 
     // New Task picker no longer lists it.
     const form = newTaskForm(page);

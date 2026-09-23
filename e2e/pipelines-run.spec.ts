@@ -38,11 +38,11 @@ import { gotoApp } from "./helpers";
  */
 
 const FAKE_CLAUDE_HANDOFF_PROMPT_MARKER = "__agetor_fake_claude_handoff__";
-// Wide enough that `openPipelineRunFromBoard`'s full page (re)load — which
-// happens AFTER `startTaskRest` already kicked the first step off — can't
-// race past the step's "active" state before this test ever gets to observe
-// it; the fake driver's default (~30ms) resolves long before a page load
-// would even finish.
+// Wide enough that a step's "active" visual is observable at all — the fake
+// driver's default (~30ms) resolves before the run view could even poll it.
+// Tests that assert on "active" additionally open the run view BEFORE
+// starting the task (see the linear scenario), since even 3s is not enough
+// headroom for a full page load under parallel-run load.
 const RESOLVE_DELAY_MS = "3000";
 const CONVERGE_TIMEOUT = 20_000;
 // A "handoff-missing"/"handoff-invalid" classification now costs TWO
@@ -312,9 +312,13 @@ test.describe("pipelines run: executing a run", () => {
       pipelineId,
       `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
     );
-    await startTaskRest(backend, task.id);
-
+    // Open the run view FIRST (a pipeline card routes to the run view even
+    // before its first run — the view falls back to the live graph until a
+    // snapshot exists), THEN start: otherwise the page load can outlast the
+    // fake driver's RESOLVE_DELAY_MS under parallel-run load and the first
+    // step is already "done" by the time this test looks for "active".
     await openPipelineRunFromBoard(page, backend, title);
+    await startTaskRest(backend, task.id);
 
     // Node visuals cycle: A active, then B active (A done), then C active
     // (B done), then all done.
@@ -578,9 +582,13 @@ test.describe("pipelines run: executing a run", () => {
     );
     const title = `Missing Then Done ${randomUUID()}`;
     const task = await createPipelineTaskRest(backend, title, pipelineId, "Do the thing.");
-    await startTaskRest(backend, task.id);
-
+    // Open the run view FIRST (a pipeline card routes to the run view even
+    // before its first run — the view falls back to the live graph until a
+    // snapshot exists), THEN start: otherwise the page load can outlast the
+    // fake driver's RESOLVE_DELAY_MS under parallel-run load and the first
+    // step is already "done" by the time this test looks for "active".
     await openPipelineRunFromBoard(page, backend, title);
+    await startTaskRest(backend, task.id);
 
     // A goes active, misses the handoff on its first reply, and gets
     // reminded while still active — the glyph only renders on an ACTIVE
@@ -686,9 +694,13 @@ test.describe("pipelines run: executing a run", () => {
       pipelineId,
       `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
     );
-    await startTaskRest(backend, task.id);
-
+    // Open the run view FIRST (a pipeline card routes to the run view even
+    // before its first run — the view falls back to the live graph until a
+    // snapshot exists), THEN start: otherwise the page load can outlast the
+    // fake driver's RESOLVE_DELAY_MS under parallel-run load and the first
+    // step is already "done" by the time this test looks for "active".
     await openPipelineRunFromBoard(page, backend, title);
+    await startTaskRest(backend, task.id);
 
     // A active, then fans out: both B and C active at the same time.
     await expect(stepNode(page, A.id)).toHaveAttribute("data-visual", "active", { timeout: CONVERGE_TIMEOUT });
@@ -722,9 +734,13 @@ test.describe("pipelines run: executing a run", () => {
       pipelineId,
       `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
     );
-    await startTaskRest(backend, task.id);
-
+    // Open the run view FIRST (a pipeline card routes to the run view even
+    // before its first run — the view falls back to the live graph until a
+    // snapshot exists), THEN start: otherwise the page load can outlast the
+    // fake driver's RESOLVE_DELAY_MS under parallel-run load and the first
+    // step is already "done" by the time this test looks for "active".
     await openPipelineRunFromBoard(page, backend, title);
+    await startTaskRest(backend, task.id);
     await expect(stepNode(page, A.id)).toHaveAttribute("data-visual", "active", { timeout: CONVERGE_TIMEOUT });
 
     await page.getByTestId("pipeline-run-stop").click();

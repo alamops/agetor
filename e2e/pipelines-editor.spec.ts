@@ -21,6 +21,11 @@ import { gotoApp } from "./helpers";
 
 test.describe.configure({ mode: "serial" });
 
+// Headroom for React Flow + the editor's own debounced validation to catch
+// up under parallel-run load, where a Chromium tab can be starved for
+// seconds at a time.
+const CONVERGE_TIMEOUT = 20_000;
+
 function auth(backend: E2EBackend): { authorization: string; "content-type": string } {
   return { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
 }
@@ -366,7 +371,9 @@ test.describe("pipelines editor", () => {
     const dupPanel = await openStepPanel(editor2, stepBNode);
     await dupPanel.getByTestId("pipeline-step-name").fill("");
     await dupPanel.getByTestId("pipeline-step-name").fill("StepA");
-    await expect(editor2.getByTestId("pipeline-validation-error")).toContainText("duplicate step name");
+    await expect(editor2.getByTestId("pipeline-validation-error")).toContainText("duplicate step name", {
+      timeout: CONVERGE_TIMEOUT,
+    });
     await expect(editor2.getByTestId("pipeline-save")).toBeDisabled();
     // Restore the unique name.
     await dupPanel.getByTestId("pipeline-step-name").fill("");
