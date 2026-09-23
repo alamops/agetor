@@ -622,16 +622,26 @@ export type StepResponseKind =
 
 /**
  * Records the single automatic follow-up the runner sends to a step whose
- * final response was `"handoff-missing"` or `"handoff-invalid"` — one
- * reminder max per execution; a second bad response blocks instead of
- * reminding again. See `composeHandoffReminder` in `src/shared/pipeline.ts`.
+ * final response was `"handoff-missing"`, `"handoff-invalid"`, or a parsed
+ * handoff whose `next` didn't resolve to a real outgoing step
+ * (`"handoff-next-unknown"`, from `resolveNextSteps`'s `"ambiguous"`/
+ * `"unknown"` outcomes) — one reminder max per execution; a second bad
+ * response blocks instead of reminding again. See `composeHandoffReminder`
+ * in `src/shared/pipeline.ts`.
  */
 export interface PipelineStepReminder {
   at: number;
-  reason: "handoff-missing" | "handoff-invalid";
+  reason: "handoff-missing" | "handoff-invalid" | "handoff-next-unknown";
   runId: string | null;
   /** The parser error / short reason the reminder was sent for. */
   detail: string;
+  /** Whether the reminder message was actually delivered to the agent (a
+   *  `sendInput` call that succeeds). `false` is never persisted today — the
+   *  runner only records a reminder once it has been sent — but the field is
+   *  required rather than defaulted so a future delivery-failure path can
+   *  record an honest `false` without a schema change, and so any UI reading
+   *  this record doesn't have to assume delivery. */
+  delivered: boolean;
 }
 
 /**

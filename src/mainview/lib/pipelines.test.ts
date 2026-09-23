@@ -458,7 +458,7 @@ describe("stepReminded", () => {
 
   test("step not currently active → false, even if an old record was reminded", () => {
     const run = makeRun({
-      history: [makeRecord({ stepId: "step-1", taskId: "task-1", reminder: { at: 1, reason: "handoff-missing", runId: null, detail: "d" } })],
+      history: [makeRecord({ stepId: "step-1", taskId: "task-1", reminder: { at: 1, reason: "handoff-missing", runId: null, detail: "d", delivered: true } })],
     });
     expect(stepReminded(run, "step-1")).toBe(false);
   });
@@ -471,7 +471,7 @@ describe("stepReminded", () => {
           stepId: "step-1",
           taskId: "task-1",
           outcome: null,
-          reminder: { at: 5, reason: "handoff-invalid", runId: "run-1", detail: "still no handoff" },
+          reminder: { at: 5, reason: "handoff-invalid", runId: "run-1", detail: "still no handoff", delivered: true },
         }),
       ],
     });
@@ -495,7 +495,7 @@ describe("stepReminded", () => {
           stepId: "step-1",
           taskId: "task-1",
           outcome: "failed",
-          reminder: { at: 1, reason: "handoff-missing", runId: null, detail: "old" },
+          reminder: { at: 1, reason: "handoff-missing", runId: null, detail: "old", delivered: true },
         }),
         makeRecord({ seq: 2, stepId: "step-1", taskId: "task-2", outcome: null }),
       ],

@@ -30,8 +30,9 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { agentProfiles, dataDir, harnesses, pipelines, runs, tasks } from "./db.ts";
+import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, tasks } from "./db.ts";
 import {
+  appendRunStatusLine,
   archiveTask,
   cancelRun,
   defaultEffortFor,
@@ -78,6 +79,7 @@ import type {
   PipelineRunState,
   PipelineRunStatus,
   PipelineStep,
+  PipelineStepRecord,
   Task,
   TaskReference,
 } from "../shared/types.ts";
@@ -285,6 +287,27 @@ function finalizeCancelled(parentId: string, run: PipelineRunState): void {
   } else {
     persist(parentId, run);
   }
+}
+
+/**
+ * Whether `run` is already mid a DELIBERATE whole-run stop as far as
+ * `excludeTaskId`'s own execution is concerned — either `run.status` was
+ * already forced to `"cancelled"` (`cancelPipelineRun` does this via
+ * `finalizeCancelled` BEFORE any live sibling's own settle event reaches
+ * this module, per Major 1 round 3's doc on `handleRunStatus`'s
+ * cancelled/orphaned branch), or every OTHER still-live sibling is itself
+ * mid-cancellation (`isTaskRunCancelling` — e.g. each active execution was
+ * cancelled individually rather than through the pipeline-level cancel
+ * route, so none of them is a normally-running sibling worth waiting on).
+ * Shared by the cancelled/orphaned settle branch below and the succeeded
+ * branch's handoff-reminder gate (round 4, Major 2): a step that finished
+ * with a bad/ambiguous handoff while the whole run is being torn down must
+ * not have its one automatic reminder revive the run back into `running`.
+ */
+function isDeliberateWholeRunStop(run: PipelineRunState, excludeTaskId: string): boolean {
+  if (run.status === "cancelled") return true;
+  const stillLiveSiblings = run.active.filter((a) => a.taskId !== excludeTaskId && isTaskRunLive(a.taskId));
+  return stillLiveSiblings.length > 0 && stillLiveSiblings.every((a) => isTaskRunCancelling(a.taskId));
 }
 
 /** Re-read a FRESH copy of the parent's run from the DB and record a
@@ -1378,6 +1401,191 @@ function pendingInteractionsForRun(taskId: string, runId: string): number {
   return listPendingForTask(taskId).filter((r) => r.runId === runId).length;
 }
 
+/** Reasons `attemptHandoffReminderOrBlock` can be asked to send the one
+ *  automatic reminder for — mirrors {@link PipelineStepReminder}'s own
+ *  `reason` union. */
+type HandoffReminderReason = "handoff-missing" | "handoff-invalid" | "handoff-next-unknown";
+
+/** The status line appended to the step's run (and broadcast live via
+ *  {@link appendRunStatusLine}) once a reminder is actually delivered — one
+ *  per {@link HandoffReminderReason}. */
+function reminderSentStatusLine(reason: HandoffReminderReason): string {
+  switch (reason) {
+    case "handoff-missing":
+      return "handoff missing — sent one automatic reminder; the next reply must contain the <handoff> block";
+    case "handoff-invalid":
+      return "handoff invalid — sent one automatic reminder; the next reply must contain a valid <handoff> block";
+    case "handoff-next-unknown":
+      return "handoff next-step unclear — sent one automatic reminder; the next reply must name exactly one outgoing step";
+  }
+}
+
+/** The `PipelineBlock.kind` a reminder-eligible response falls back to
+ *  whenever no reminder actually goes out (never attempted, already used
+ *  once, or delivery failed). `"handoff-next-unknown"` isn't itself a block
+ *  kind — a `next` that didn't resolve to a real outgoing step is really a
+ *  malformed/ambiguous handoff — so it maps onto `"handoff-invalid"`, the
+ *  same kind `resolveNextSteps`'s ambiguous/unknown outcomes blocked with
+ *  before this reminder existed (round 4, Low finding). */
+function reminderBlockKind(reason: HandoffReminderReason): "handoff-missing" | "handoff-invalid" {
+  return reason === "handoff-missing" ? "handoff-missing" : "handoff-invalid";
+}
+
+/**
+ * Attempt the single automatic handoff-format reminder for `taskId`'s
+ * just-succeeded (but not yet resolvable) execution, falling back to an
+ * ordinary retryable block whenever a reminder either isn't warranted right
+ * now or couldn't be delivered. Handles its own `checkJoinIncomplete` +
+ * `persist` on every path — the caller just awaits this and returns.
+ *
+ * Order of checks (round 4 review fixes):
+ *  - Already reminded once for this execution (`historyEntry.reminder` set,
+ *    for ANY reason — one reminder max per execution) blocks immediately,
+ *    ahead of every other check below: there's nothing left to attempt.
+ *  - Major 1: re-reads the parent AND the step task fresh — the copies
+ *    `handleRunStatus` captured at the top of its turn can be stale, since
+ *    an `archiveTask`/delete cascade races in through this exact same
+ *    per-parent lock (`archiveTask` sets `archivedAt` on the parent row
+ *    BEFORE it ever acquires the lock, per `persist`'s "m8" doc). A
+ *    tombstoned/missing/archived parent, or an archived step task, must
+ *    never reach `sendInput` — it falls straight to the ordinary block.
+ *  - Major 2: `isDeliberateWholeRunStop` — a step that finished with a bad
+ *    handoff while the whole run is being torn down (`cancelPipelineRun`,
+ *    or every other live sibling already mid-cancellation) must not have
+ *    the reminder revive the run back into `running`.
+ *  - Otherwise: send it. Medium 3 — the reminder is recorded onto
+ *    `historyEntry.reminder` ONLY when `sendInput` reports
+ *    `delivered: true` (with `delivered: true` stamped on the record
+ *    itself); a failed/withheld send records NOTHING there, so the NEXT
+ *    settle may still try once, and folds the failure reason into the
+ *    ordinary block's message instead. A claude modal-guard withhold that
+ *    stashed the (undelivered) reminder text into the step's own backlog
+ *    tray (`sendInput`'s `withheld`/`savedToBacklog` pair) has that stashed
+ *    draft removed right away, best-effort — otherwise the tray silently
+ *    fills with machine-generated reminder text the user never typed.
+ */
+async function attemptHandoffReminderOrBlock(input: {
+  parentId: string;
+  run: PipelineRunState;
+  taskId: string;
+  runId: string;
+  activeEntry: PipelineActiveStep;
+  historyEntry: PipelineStepRecord | undefined;
+  graph: PipelineGraph;
+  stepName: string;
+  reason: HandoffReminderReason;
+  detail: string;
+  baseMessage: string;
+}): Promise<void> {
+  const { parentId, run, taskId, runId, activeEntry, historyEntry, graph, stepName, reason, detail, baseMessage } = input;
+  const blockKind = reminderBlockKind(reason);
+
+  if (historyEntry?.reminder) {
+    // Already reminded once for this execution (retries don't reset it —
+    // see `PipelineStepReminder`'s doc) — a second bad response blocks
+    // instead of reminding again.
+    upsertBlocked(run, {
+      taskId,
+      stepId: activeEntry.stepId,
+      kind: blockKind,
+      message: `still no valid handoff after one reminder — ${baseMessage}`,
+    });
+    checkJoinIncomplete(run);
+    persist(parentId, run);
+    return;
+  }
+
+  // Major 1: re-read fresh — see this function's doc for why the top-of-turn
+  // copies can be stale.
+  const parentFresh = tasks.get(parentId);
+  const parentGone = tombstonedPipelineParents.has(parentId) || !parentFresh;
+  const parentArchived = !parentGone && parentFresh!.archivedAt != null;
+  const stepFresh = tasks.get(taskId);
+  const stepArchived = stepFresh != null && stepFresh.archivedAt != null;
+  // Major 2: never revive a run that's already being deliberately stopped.
+  const deliberateStop = isDeliberateWholeRunStop(run, taskId);
+
+  const skipReason = parentGone
+    ? "the pipeline task no longer exists"
+    : parentArchived
+      ? "the pipeline task is archived"
+      : stepArchived
+        ? "the step task is archived"
+        : deliberateStop
+          ? "the pipeline run is stopping"
+          : null;
+
+  if (skipReason) {
+    upsertBlocked(run, {
+      taskId,
+      stepId: activeEntry.stepId,
+      kind: blockKind,
+      message: `${baseMessage} (automatic reminder skipped — ${skipReason})`,
+    });
+    checkJoinIncomplete(run);
+    persist(parentId, run);
+    return;
+  }
+
+  const stepObj = graph.steps.find((s) => s.id === activeEntry.stepId);
+  const outgoing = outgoingSteps(graph, activeEntry.stepId).map((o) => ({ name: o.step.name, label: o.edge.label }));
+  const transition = stepObj?.transition ?? "choose";
+  const reminderText = composeHandoffReminder({ stepName, reason, detail, outgoing, transition });
+  const sent = await sendInput(runId, reminderText);
+
+  if (sent.delivered) {
+    if (historyEntry) {
+      historyEntry.reminder = {
+        at: Date.now(),
+        reason,
+        // The run this reminder actually landed on — for claude, the SAME
+        // run that just settled (a fold-while-busy paste into the still-live
+        // session); for the one-shot harnesses (codex/cursor/gemini/fx) a
+        // FRESH run row `sendInput` minted, which may itself already be busy
+        // again by the time anything reads this back (Medium 5).
+        runId: sent.runId,
+        detail,
+        delivered: true,
+      };
+    }
+    appendRunStatusLine(taskId, runId, reminderSentStatusLine(reason));
+    // No block recorded — the execution stays `active`, and `sendInput`'s
+    // own column flip back to `running` is left alone (nothing here fights
+    // it).
+    checkJoinIncomplete(run);
+    persist(parentId, run);
+    return;
+  }
+
+  // Medium 3: a claude modal-guard withhold stashes the (undelivered)
+  // reminder text into the step task's own backlog tray — remove it right
+  // away so the tray doesn't silently fill with machine-generated text the
+  // user never typed. Best-effort: a lookup/remove failure here must never
+  // block recording the ordinary blocked-path outcome below.
+  if (sent.withheld && sent.savedToBacklog) {
+    try {
+      const stashed = tasks.get(taskId);
+      const item = stashed?.backlog.find((b) => b.text === reminderText);
+      if (item) backlog.remove(taskId, item.id);
+    } catch (err) {
+      console.warn(`[agetor] pipeline runner: failed to remove stashed reminder draft for task ${taskId}:`, err);
+    }
+  }
+
+  // Could not deliver the reminder — fall straight through to the ordinary
+  // blocked path, folding the send failure into the message so a human can
+  // see why no reminder went out. Medium 3: nothing is recorded onto
+  // `historyEntry.reminder` here, so the NEXT settle may still try once.
+  upsertBlocked(run, {
+    taskId,
+    stepId: activeEntry.stepId,
+    kind: blockKind,
+    message: `${baseMessage} (automatic reminder could not be sent: ${sent.reason})`,
+  });
+  checkJoinIncomplete(run);
+  persist(parentId, run);
+}
+
 async function handleRunStatus(
   taskId: string,
   runId: string,
@@ -1412,85 +1620,48 @@ async function handleRunStatus(
         if (historyEntry) historyEntry.responseKind = classified.kind;
 
         if (classified.kind === "handoff-missing" || classified.kind === "handoff-invalid") {
+          // Not blocked yet — attempt the ONE automatic reminder as an
+          // ordinary follow-up turn on the step's own run, rather than
+          // blocking the run over a step that may simply have forgotten the
+          // handoff format. `sendInput` folds into the live session (claude)
+          // or spawns a fresh turn (codex/cursor/gemini/fx) — either way it
+          // settles through this same `handleRunStatus` path again, which is
+          // what carries the execution to its next classification once the
+          // reminder turn finishes. See `attemptHandoffReminderOrBlock` for
+          // the round-4 review-fix conditions (archived/tombstoned parent or
+          // step, a run that's being deliberately stopped, delivery
+          // failure) that instead fall straight to an ordinary block.
           const reason = classified.kind;
           const baseMessage = reason === "handoff-missing"
             ? `step "${stepName}" finished but never emitted a <handoff> block`
             : `step "${stepName}" emitted a <handoff> block agetor couldn't parse: ${classified.error}`;
-
-          if (!historyEntry?.reminder) {
-            // Not blocked yet — send the ONE automatic reminder as an
-            // ordinary follow-up turn on the step's own run, rather than
-            // blocking the run over a step that may simply have forgotten
-            // the handoff format. `sendInput` folds into the live session
-            // (claude) or spawns a fresh turn (codex/cursor/gemini/fx) —
-            // either way it settles through this same `handleRunStatus`
-            // path again, which is what carries the execution to its next
-            // classification once the reminder turn finishes.
-            const stepObj = graph.steps.find((s) => s.id === activeEntry.stepId);
-            const outgoing = outgoingSteps(graph, activeEntry.stepId).map((o) => ({ name: o.step.name, label: o.edge.label }));
-            const transition = stepObj?.transition ?? "choose";
-            const detail = classified.error ?? (reason === "handoff-missing"
-              ? "no <handoff> block was found"
-              : "the handoff JSON could not be parsed");
-            const reminderText = composeHandoffReminder({ stepName, reason, detail, outgoing, transition });
-            const sent = await sendInput(runId, reminderText);
-            if (historyEntry) {
-              historyEntry.reminder = {
-                at: Date.now(),
-                reason,
-                runId: sent.delivered ? sent.runId : null,
-                detail,
-              };
-            }
-            if (sent.delivered) {
-              runs.appendEvent(
-                runId,
-                "status",
-                reason === "handoff-missing"
-                  ? "handoff missing — sent one automatic reminder; the next reply must contain the <handoff> block"
-                  : "handoff invalid — sent one automatic reminder; the next reply must contain a valid <handoff> block",
-              );
-              // No block recorded — the execution stays `active`, and
-              // `sendInput`'s own column flip back to `running` is left
-              // alone (nothing here fights it).
-              checkJoinIncomplete(run);
-              persist(parentId, run);
-              return;
-            }
-            // Could not deliver the reminder (withheld paste, dead session,
-            // …) — fall straight through to the ordinary blocked path,
-            // folding the send failure into the message so a human can see
-            // why no reminder went out.
-            upsertBlocked(run, {
-              taskId,
-              stepId: activeEntry.stepId,
-              kind: reason,
-              message: `${baseMessage} (automatic reminder could not be sent: ${sent.reason})`,
-            });
-            checkJoinIncomplete(run);
-            persist(parentId, run);
-            return;
-          }
-
-          // Already reminded once for this execution (retries don't reset
-          // it — see `PipelineStepReminder`'s doc) — a second bad response
-          // blocks instead of reminding again.
-          upsertBlocked(run, {
-            taskId,
-            stepId: activeEntry.stepId,
-            kind: reason,
-            message: `still no valid handoff after one reminder — ${baseMessage}`,
+          const detail = classified.error ?? (reason === "handoff-missing"
+            ? "no <handoff> block was found"
+            : "the handoff JSON could not be parsed");
+          await attemptHandoffReminderOrBlock({
+            parentId, run, taskId, runId, activeEntry, historyEntry, graph, stepName, reason, detail, baseMessage,
           });
-          checkJoinIncomplete(run);
-          persist(parentId, run);
           return;
         }
 
         if (classified.kind === "user-ask") {
-          // The step's task already reflects a pending interaction through
-          // the ordinary interactions/column machinery — nothing
-          // pipeline-specific to block on here beyond the `responseKind`
-          // stamp above.
+          // Medium 4: the step's task already reflects a pending interaction
+          // through the ordinary interactions/column machinery — but a
+          // pending card must still surface as a retryable block on the
+          // RUN, not just on the task, so `deriveRunStatus` reads `blocked`
+          // (not a silent `running` with an execution nothing will ever
+          // advance on its own) until the user answers. The "running"-column
+          // handler already clears ANY block naming this task the moment the
+          // step task genuinely runs again (m11) — including this one —
+          // which is what happens once the user answers the card and the
+          // step's own turn resumes.
+          upsertBlocked(run, {
+            taskId,
+            stepId: activeEntry.stepId,
+            kind: "step-blocked",
+            message: `step "${stepName}" is waiting for you`,
+          });
+          checkJoinIncomplete(run);
           persist(parentId, run);
           return;
         }
@@ -1539,13 +1710,29 @@ async function handleRunStatus(
         const parsedHandoff = classified.handoff!;
         const resolved = resolveNextSteps(graph, activeEntry.stepId, parsedHandoff);
         if (resolved.kind === "ambiguous" || resolved.kind === "unknown") {
+          // Low: a parsed handoff whose `next` didn't resolve to a real
+          // outgoing step is a malformed handoff, not a valid one — override
+          // the `"handoff"` stamp `classifyStepResponse` gave this execution
+          // above (it can't have known about the graph). Gets the same one
+          // automatic reminder as handoff-missing/invalid (round 4).
+          if (historyEntry) historyEntry.responseKind = "handoff-invalid";
           const candidates = resolved.candidates.join(", ") || "(no outgoing steps)";
-          const message = resolved.kind === "ambiguous"
+          const baseMessage = resolved.kind === "ambiguous"
             ? `step "${stepName}" finished but didn't say which step comes next — choices: ${candidates}`
             : `step "${stepName}" asked for step "${resolved.next}", which doesn't match any of: ${candidates}`;
-          upsertBlocked(run, { taskId, stepId: activeEntry.stepId, kind: "handoff-invalid", message });
-          checkJoinIncomplete(run);
-          persist(parentId, run);
+          await attemptHandoffReminderOrBlock({
+            parentId,
+            run,
+            taskId,
+            runId,
+            activeEntry,
+            historyEntry,
+            graph,
+            stepName,
+            reason: "handoff-next-unknown",
+            detail: `choose exactly one of: ${candidates}`,
+            baseMessage,
+          });
           return;
         }
 
@@ -1694,10 +1881,10 @@ async function handleRunStatus(
       // (`isTaskRunCancelling`) — e.g. each active execution was cancelled
       // individually rather than through `cancelPipelineRun` — since none of
       // them is a normally-running sibling this execution would otherwise
-      // need to wait on.
-      const deliberateWholeRunStop =
-        run.status === "cancelled" ||
-        (stillLiveSiblings.length > 0 && stillLiveSiblings.every((a) => isTaskRunCancelling(a.taskId)));
+      // need to wait on. `isDeliberateWholeRunStop` is the shared detector
+      // (round 4, Major 2 also gates the succeeded branch's handoff-reminder
+      // send on it).
+      const deliberateWholeRunStop = isDeliberateWholeRunStop(run, taskId);
       if (stillLiveSiblings.length > 0 && !deliberateWholeRunStop) {
         // Major 1: this execution stopped (or orphaned) but a SIBLING is
         // still genuinely running normally — the whole run must not
@@ -1777,15 +1964,19 @@ async function handleColumnChange(
         // not just a column-reasoned `step-blocked` one, since a
         // handoff-missing/invalid/step-cap-adjacent block naming this task
         // is equally stale the moment it's actually running again — and
-        // resets its history record's outcome/endedAt so it reads as
-        // in-flight, not as whatever it last settled as.
+        // resets its history record's outcome/endedAt/responseKind (Low,
+        // round 4: `responseKind` is stamped fresh by the next settle's own
+        // `classifyStepResponse` call — a stale value from the PREVIOUS
+        // attempt must not linger and read as this attempt's outcome) so it
+        // reads as in-flight, not as whatever it last settled as.
         const beforeLen = run.blocked.length;
         run.blocked = run.blocked.filter((b) => b.taskId !== taskId);
         let changed = run.blocked.length !== beforeLen;
         const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
-        if (historyEntry && (historyEntry.outcome !== null || historyEntry.endedAt !== null)) {
+        if (historyEntry && (historyEntry.outcome !== null || historyEntry.endedAt !== null || (historyEntry.responseKind ?? null) !== null)) {
           historyEntry.outcome = null;
           historyEntry.endedAt = null;
+          historyEntry.responseKind = null;
           changed = true;
         }
         if (changed) persist(parentId, run);

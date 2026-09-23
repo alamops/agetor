@@ -861,9 +861,13 @@ function HistoryRow({ record, graph }: { record: PipelineStepRecord; graph: Pipe
             <span
               data-testid="pipeline-run-reminder"
               title={record.reminder.detail}
-              className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${TONE_CLASSES.warning}`}
+              data-delivered={record.reminder.delivered !== false}
+              className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
+                record.reminder.delivered === false ? TONE_CLASSES.danger : TONE_CLASSES.warning
+              }`}
             >
-              Reminder sent · {formatClockTime(record.reminder.at)}
+              {record.reminder.delivered === false ? "Reminder failed" : "Reminder sent"} ·{" "}
+              {formatClockTime(record.reminder.at)}
             </span>
           )}
         </div>

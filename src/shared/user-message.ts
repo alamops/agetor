@@ -22,6 +22,7 @@
 // `diff-selection.ts`.
 import { REFS_HEADING } from "./refs.ts";
 import { AGENT_INSTRUCTIONS_TAG } from "./agent-profile.ts";
+import { HANDOFF_REMINDER_MARKER } from "./pipeline.ts";
 
 export interface CommandInvocation {
   /** Command name including the leading slash, e.g. "/implement". */
@@ -1137,9 +1138,33 @@ function segmentPlainLines(segments: readonly MessageSegment[]): PlainLine[] {
  * non-empty `references` list appends a trailing `refs›` line. If every
  * segment produces no visible line (e.g. a message that's only an empty
  * `<bash-stdout>`), falls back to a single `cmd› —` line so callers never
- * have to handle an empty result.
+ * have to handle an empty result. An ordinary message whose first line is
+ * exactly {@link HANDOFF_REMINDER_MARKER} — Agetor's own automatic
+ * handoff-format reminder, see `composeHandoffReminder` in
+ * `shared/pipeline.ts` — is not the user's own words, and is labeled
+ * `agetor›` instead of `you›`, with the marker line itself stripped (mirrors
+ * how `agent›` labels the `agent_instructions_defined_by_the_user` preamble
+ * in `segmentPlainLines` above).
  */
 export function userMessageLines(text: string): PlainLine[] {
+  // A handoff reminder (see HANDOFF_REMINDER_MARKER / composeHandoffReminder
+  // in shared/pipeline.ts) is intercepted BEFORE parseUserMessage runs, not
+  // routed through its normal command/tagged detection: the reminder's own
+  // body legitimately names an unbalanced `<handoff>`/`</handoff>` pair (it
+  // tells the agent what tag it forgot, then repeats the contract, which
+  // mentions the closing form again) that parseMessageSegments would
+  // otherwise mis-detect as one top-level tag spanning most of the message.
+  // The whole thing always renders as a single plain `agetor›` line instead.
+  const normalizedForReminder = normalizeDeliveredUserText(text);
+  const reminderNl = normalizedForReminder.indexOf("\n");
+  const reminderFirstLine =
+    reminderNl === -1 ? normalizedForReminder : normalizedForReminder.slice(0, reminderNl);
+  if (reminderFirstLine === HANDOFF_REMINDER_MARKER) {
+    const rest =
+      reminderNl === -1 ? "" : normalizedForReminder.slice(reminderNl + 1).replace(/^\n+/, "");
+    return [{ label: "agetor›", text: rest, tone: "machine" }];
+  }
+
   const parsed = parseUserMessage(text);
   // No CR normalization here — an ordinary message prints byte-identical to
   // what was stored; `stripPasteLeadIn` consumes a `\r\n` after the lead-in

@@ -3914,13 +3914,24 @@ function clearFxRecovery(taskId: string): void {
   tasks.setFxRecovery(taskId, null);
 }
 
-/** Append a plain status line to an already-settled run and broadcast it —
- *  the same `runs.appendEvent` + `emit` pair used post-hoc elsewhere (e.g.
- *  `pullBackParkedTask`), for auto-resume breadcrumbs landing on a run that
- *  finished before this code runs. */
-function appendFxStatusLine(taskId: string, runId: string, data: string): void {
+/** Append a plain status line to an already-settled (or otherwise
+ *  not-currently-spawning) run and broadcast it live over the run's SSE
+ *  channel — the same `runs.appendEvent` + `emit` pair used post-hoc
+ *  elsewhere (e.g. `pullBackParkedTask`, fx's auto-resume breadcrumbs) for a
+ *  status line landing on a run with no active `onChunk` handler in scope.
+ *  Exported for `pipeline-runner.ts`'s handoff-reminder status lines, which
+ *  land on a step task's run from outside any spawn — `runs.appendEvent`
+ *  alone would persist the line but never reach a live SSE subscriber. */
+export function appendRunStatusLine(taskId: string, runId: string, data: string): void {
   runs.appendEvent(runId, "status", data);
   emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+}
+
+/** @deprecated thin fx-named alias of {@link appendRunStatusLine} — kept so
+ *  every existing fx call site reads unchanged; new callers should use the
+ *  generic export directly. */
+function appendFxStatusLine(taskId: string, runId: string, data: string): void {
+  appendRunStatusLine(taskId, runId, data);
 }
 
 /**

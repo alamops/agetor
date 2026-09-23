@@ -715,7 +715,9 @@ test("parsePipelineRunState: a history entry's `responseKind`/`reminder` round-t
     pipelineId: "pipe-1",
     history: [
       {
-        // valid responseKind + a full, valid reminder object -> both survive.
+        // valid responseKind + a full, valid reminder object (no `delivered`,
+        // as every reminder persisted before that field existed) -> both
+        // survive, `delivered` defaults to true.
         seq: 1, stepId: "s1", taskId: "t1", startedAt: 100, endedAt: 200,
         outcome: "succeeded",
         responseKind: "handoff-missing",
@@ -732,16 +734,28 @@ test("parsePipelineRunState: a history entry's `responseKind`/`reminder` round-t
         seq: 3, stepId: "s3", taskId: "t3", startedAt: 100,
         reminder: { at: 150, reason: "handoff-invalid" },
       },
+      {
+        // the new "handoff-next-unknown" reason, with an explicit `delivered`
+        // value -> both survive verbatim.
+        seq: 4, stepId: "s4", taskId: "t4", startedAt: 100,
+        reminder: { at: 150, reason: "handoff-next-unknown", runId: "run-4", detail: "next \"foo\" not found", delivered: false },
+      },
+      {
+        // `delivered` present but the wrong type -> the whole reminder is
+        // malformed, collapses to null (same as any other bad field).
+        seq: 5, stepId: "s5", taskId: "t5", startedAt: 100,
+        reminder: { at: 150, reason: "handoff-invalid", runId: null, detail: "x", delivered: "yes" },
+      },
     ],
   };
 
   const parsed = parsePipelineRunState(JSON.stringify(raw));
   expect(parsed).not.toBeNull();
-  expect(parsed?.history).toHaveLength(3);
+  expect(parsed?.history).toHaveLength(5);
 
   expect(parsed?.history[0]?.responseKind).toBe("handoff-missing");
   expect(parsed?.history[0]?.reminder).toEqual({
-    at: 150, reason: "handoff-missing", runId: "run-1", detail: "no <handoff> block was found",
+    at: 150, reason: "handoff-missing", runId: "run-1", detail: "no <handoff> block was found", delivered: true,
   });
 
   expect(parsed?.history[1]?.responseKind).toBeNull();
@@ -749,6 +763,12 @@ test("parsePipelineRunState: a history entry's `responseKind`/`reminder` round-t
 
   expect(parsed?.history[2]?.responseKind).toBeNull();
   expect(parsed?.history[2]?.reminder).toBeNull();
+
+  expect(parsed?.history[3]?.reminder).toEqual({
+    at: 150, reason: "handoff-next-unknown", runId: "run-4", detail: "next \"foo\" not found", delivered: false,
+  });
+
+  expect(parsed?.history[4]?.reminder).toBeNull();
 });
 
 test("parsePipelineRunState: a blocked entry's `pending` and the run's `capExtensions` round-trip, junk is dropped", () => {

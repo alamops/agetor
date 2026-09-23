@@ -50,6 +50,23 @@ export function MachineLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
+/** Badge shown above a user bubble's body when the message is one of
+ *  Agetor's own automatic handoff-format reminders (`HANDOFF_REMINDER_MARKER`
+ *  / `composeHandoffReminder` in `shared/pipeline.ts`) rather than something
+ *  the user typed — `UserMessageBlock` strips the marker line itself from
+ *  the rendered body and shows this instead, display-only, so the raw
+ *  persisted event is untouched. */
+export function HandoffReminderBadge() {
+  return (
+    <div
+      data-testid="handoff-reminder-badge"
+      className="mb-1 inline-flex w-fit items-center gap-1 rounded-md bg-muted/60 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-muted-foreground"
+    >
+      Automatic handoff reminder
+    </div>
+  );
+}
+
 /** Body of a `command-output` message / `local-command-stdout` tag — mono,
  *  muted, whitespace preserved. `output` is expected pre-cleaned (ANSI
  *  stripped, trimmed) by the caller; an empty string renders as "—". */

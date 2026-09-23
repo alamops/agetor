@@ -101,6 +101,7 @@ import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
 import { parseUserMessage, splitReferences, parseMessageSegments, normalizeDeliveredUserText, type MessageSegment } from "../../../shared/user-message.ts";
+import { HANDOFF_REMINDER_MARKER } from "../../../shared/pipeline.ts";
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
 import { AgentProfileCard } from "./AgentProfileCard";
@@ -118,7 +119,7 @@ import { deriveTodoProgress } from "@/lib/todo-progress";
 import { TodoProgressCard } from "./TodoProgressCard";
 import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
 import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink, MD_URL_TRANSFORM, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./md-components";
-import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent } from "./MessageSegments";
+import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent, HandoffReminderBadge } from "./MessageSegments";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -5762,14 +5763,43 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
     [text],
   );
 
+  // Agetor's own automatic handoff-format reminder (see
+  // HANDOFF_REMINDER_MARKER / composeHandoffReminder in shared/pipeline.ts)
+  // is a `user` event Agetor sent, not the user's own words — a `user`
+  // message whose first line is exactly the marker. Display-only: strip
+  // that marker line before parsing/rendering (the badge below substitutes
+  // for it) and never touch the raw persisted event.
+  const isHandoffReminder = useMemo(() => {
+    const nl = normalizedText.indexOf("\n");
+    const firstLine = nl === -1 ? normalizedText : normalizedText.slice(0, nl);
+    return firstLine === HANDOFF_REMINDER_MARKER;
+  }, [normalizedText]);
+  const displayText = useMemo(() => {
+    if (!isHandoffReminder) return normalizedText;
+    const nl = normalizedText.indexOf("\n");
+    const rest = nl === -1 ? "" : normalizedText.slice(nl + 1);
+    return rest.replace(/^\n+/, "");
+  }, [normalizedText, isHandoffReminder]);
+
   // Recognize slash-command invocations (XML expansion or plain echo),
   // `<local-command-stdout>` blocks, and (see `src/shared/user-message.ts`'s
   // "tagged" kind) any other message carrying balanced top-level tags — a
   // background skill launch, a shell escape, or a user's own prompt tags —
   // so all of these render as structured UI instead of literal `<tag>` text.
   // `null` for an ordinary message — the fallback branch below renders
-  // exactly what this component always has.
-  const parsed = useMemo(() => parseUserMessage(normalizedText), [normalizedText]);
+  // exactly what this component always has. Fed `displayText` (the marker
+  // line already stripped for a handoff reminder) rather than
+  // `normalizedText` directly. A handoff reminder is forced to `null`
+  // (skipping `parseUserMessage` entirely) rather than run through it: its
+  // body legitimately contains an unbalanced `<handoff>`/`</handoff>` pair
+  // (the reminder text names the tag, and the repeated contract mentions its
+  // closing form) that would otherwise be mis-detected as a top-level tag
+  // spanning most of the message — it should always render as plain
+  // markdown, never segmented.
+  const parsed = useMemo(
+    () => (isHandoffReminder ? null : parseUserMessage(displayText)),
+    [isHandoffReminder, displayText],
+  );
 
   // For an ordinary (non-command) message, split off a trailing "Referenced
   // files/folders:" block the same way the command branch already does, so
@@ -5779,7 +5809,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   // unchanged and an empty `references` array, so this is a no-op split for
   // the common case.
   const ordinary = useMemo(
-    () => splitReferences(normalizedText),
+    () => splitReferences(displayText),
     [normalizedText],
   );
 
@@ -5878,6 +5908,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   return (
     <div className="flex justify-end">
       <div ref={bubbleRef} className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/30 bg-card px-3 py-1.5 text-foreground shadow-sm">
+        {isHandoffReminder && <HandoffReminderBadge />}
         {parsed?.kind === "command-output" ? (
           <>
             <MachineLabel>command output</MachineLabel>

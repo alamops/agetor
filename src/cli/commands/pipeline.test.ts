@@ -713,7 +713,7 @@ test("pipelineStatusLines: history rows print the response kind and (reminded) w
           handoff: null,
           nextStepIds: [],
           responseKind: "handoff-missing",
-          reminder: { at: 5, reason: "handoff-missing", runId: "run-1", detail: "still no valid handoff" },
+          reminder: { at: 5, reason: "handoff-missing", runId: "run-1", detail: "still no valid handoff", delivered: true },
         },
       ],
     }),
@@ -721,7 +721,31 @@ test("pipelineStatusLines: history rows print the response kind and (reminded) w
   const text = pipelineStatusLines(t, []).join("\n");
   expect(text).toContain("[handoff]");
   expect(text).toContain("[handoff-missing]");
-  expect(text).toContain("(reminded)");
+  expect(text).toContain("(reminder sent)");
+});
+
+test("pipelineStatusLines: a reminder recorded with delivered:false prints (reminder failed) instead", () => {
+  const t = task({
+    pipelineRun: pipelineRun({
+      history: [
+        {
+          seq: 1,
+          stepId: "s1",
+          taskId: "step-task-0",
+          startedAt: 0,
+          endedAt: null,
+          outcome: null,
+          handoff: null,
+          nextStepIds: [],
+          responseKind: "handoff-missing",
+          reminder: { at: 5, reason: "handoff-missing", runId: "run-1", detail: "still no valid handoff", delivered: false },
+        },
+      ],
+    }),
+  });
+  const text = pipelineStatusLines(t, []).join("\n");
+  expect(text).toContain("(reminder failed)");
+  expect(text).not.toContain("(reminder sent)");
 });
 
 test("pipelineStatusLines: a history row with no responseKind/reminder omits both notes", () => {

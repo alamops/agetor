@@ -529,13 +529,17 @@ const sanitizeResponseKind = (raw: unknown): NonNullable<PipelineStepRecord["res
     ? (raw as NonNullable<PipelineStepRecord["responseKind"]>)
     : null;
 
-const STEP_REMINDER_REASONS = new Set<string>(["handoff-missing", "handoff-invalid"]);
+const STEP_REMINDER_REASONS = new Set<string>(["handoff-missing", "handoff-invalid", "handoff-next-unknown"]);
 
 /** {@link PipelineStepRecord.reminder} — the one-shot automatic handoff
  *  reminder the runner records against an execution (`pipeline-runner.ts`'s
  *  `handleRunStatus`). A malformed value collapses to `null` (treated the
  *  same as "never reminded") rather than dropping the whole history entry —
- *  the worst case is one extra reminder attempt, never a control-flow bug. */
+ *  the worst case is one extra reminder attempt, never a control-flow bug.
+ *  `delivered` defaults to `true` for a row written before that field
+ *  existed — every reminder ever persisted so far was in fact delivered (the
+ *  runner only records one once `sendInput` succeeds), so a missing value is
+ *  a pre-field row, not evidence of a failed send. */
 const sanitizeStepReminder = (raw: unknown): NonNullable<PipelineStepRecord["reminder"]> | null => {
   if (!isPlainObject(raw)) return null;
   const rec = raw as Record<string, unknown>;
@@ -543,11 +547,20 @@ const sanitizeStepReminder = (raw: unknown): NonNullable<PipelineStepRecord["rem
   const reason = rec.reason;
   const detail = rec.detail;
   const runId = rec.runId;
+  const deliveredRaw = rec.delivered;
   if (!isFiniteNumber(at)) return null;
   if (typeof reason !== "string" || !STEP_REMINDER_REASONS.has(reason)) return null;
   if (typeof detail !== "string") return null;
   if (runId !== null && typeof runId !== "string") return null;
-  return { at, reason: reason as "handoff-missing" | "handoff-invalid", runId: runId ?? null, detail };
+  if (deliveredRaw !== undefined && typeof deliveredRaw !== "boolean") return null;
+  const delivered = typeof deliveredRaw === "boolean" ? deliveredRaw : true;
+  return {
+    at,
+    reason: reason as "handoff-missing" | "handoff-invalid" | "handoff-next-unknown",
+    runId: runId ?? null,
+    detail,
+    delivered,
+  };
 };
 
 /** One completed/cancelled execution in `PipelineRunState.history` — dropped

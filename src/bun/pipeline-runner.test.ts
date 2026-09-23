@@ -1999,3 +1999,415 @@ test("a stale pending interaction registered under a DIFFERENT runId does not tu
 
   await waitUntilIdle(parentId);
 });
+
+// ---------------------------------------------------------------------------
+// Round-4 review-fix regression coverage (handoff-reminder flow)
+// ---------------------------------------------------------------------------
+
+test("Major 1: a handoff-missing settle is blocked (never reminded) once the parent — and, via the archive cascade, the step task itself — is archived", async () => {
+  const { createTask, startTask, archiveTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines, runs } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { __forTest } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("archived-no-reminder");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing` });
+  const graph = { steps: [A], edges: [], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("archived-no-remind-pipe"), graph, maxSteps: 25 });
+
+  const created = await createTask({
+    title: "archived no reminder run",
+    prompt: "goal",
+    workdir: freshWorkdir(),
+    isolation: "none",
+    pipelineId: pipeline.id,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  let stepAId = "";
+  let stepARunId = "";
+  __forTest.setListenerEnabled(false);
+  try {
+    const started = await startTask(parentId);
+    if ("error" in started) throw new Error(started.error);
+
+    const stepA = await waitFor(() => tasks.stepsForParent(parentId)[0]);
+    stepAId = stepA!.id;
+    const runRow = await waitFor(() => {
+      const r = runs.listForTask(stepAId)[0];
+      return r && r.status !== "running" ? r : undefined;
+    });
+    stepARunId = runRow.id;
+
+    // Archive the pipeline task WHILE the listener is disabled — the step's
+    // own settle event (fired for real, but never delivered to this module)
+    // is "queued" exactly like a genuine archive-races-a-settle scenario.
+    // `cascadePipelineArchive` also archives every non-archived step task,
+    // so this single archive covers BOTH halves of the Major 1 guard (an
+    // archived parent, and an archived step task).
+    const archived = await archiveTask(parentId, { force: true });
+    if ("error" in archived) throw new Error(archived.error);
+    expect(tasks.get(stepAId)?.archivedAt).not.toBeNull();
+
+    await __forTest.handleRunStatus(stepAId, stepARunId, "succeeded");
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+
+  const parent = tasks.get(parentId)!;
+  const run = parent.pipelineRun!;
+  expect(run.status).toBe("blocked");
+  const block = run.blocked.find((b) => b.taskId === stepAId);
+  expect(block?.kind).toBe("handoff-missing");
+  expect(block?.message).toContain("automatic reminder skipped");
+
+  const record = run.history.find((h) => h.stepId === A.id);
+  expect(record?.reminder ?? null).toBeNull();
+
+  // No reminder follow-up run was ever created — `sendInput` was never
+  // called.
+  const stepARuns = runs.listForTask(stepAId);
+  expect(stepARuns.length).toBe(1);
+
+  await waitUntilIdle(parentId);
+});
+
+test("Major 2: a step that finished with a bad handoff while the whole run is being deliberately stopped is blocked without ever sending a reminder", async () => {
+  process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = "2000";
+  try {
+    const { createTask, startTask } = await import("./orchestrator.ts");
+    const { tasks, pipelines, runs } = await import("./db.ts");
+    const { newStep } = await import("../shared/pipeline.ts");
+    const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+    const { cancelPipelineRun, __forTest } = await import("./pipeline-runner.ts");
+
+    const profile = await makeProfile("stop-while-succeeding");
+    const Root = newStep({ name: "Root", agentProfileId: profile.id, transition: "all", instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+    const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing` });
+    const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+    const graph = {
+      steps: [Root, A, B],
+      edges: [
+        { id: "e1", from: Root.id, to: A.id, label: "" },
+        { id: "e2", from: Root.id, to: B.id, label: "" },
+      ],
+      startStepId: Root.id,
+    };
+    const pipeline = pipelines.insert({ name: uniqueName("stop-while-live-pipe"), graph, maxSteps: 25 });
+
+    const created = await createTask({
+      title: "stop-while-succeeding run",
+      prompt: "goal",
+      workdir: freshWorkdir(),
+      isolation: "none",
+      pipelineId: pipeline.id,
+    });
+    if ("error" in created) throw new Error(created.error);
+    const parentId = created.task.id;
+    liveParentIds.push(parentId);
+
+    let stepAId = "";
+    __forTest.setListenerEnabled(false);
+    try {
+      const started = await startTask(parentId);
+      if ("error" in started) throw new Error(started.error);
+
+      const rootTask = await waitFor(() => tasks.stepsForParent(parentId)[0]);
+      const rootRun = await waitFor(() => {
+        const r = runs.listForTask(rootTask!.id)[0];
+        return r && r.status !== "running" ? r : undefined;
+      }, 8000);
+
+      // Root's fan-out is normally driven by the listener — drive it
+      // manually (listener disabled) so this test controls exactly when A
+      // and B get launched, and when each of their own settles is
+      // processed.
+      await __forTest.handleRunStatus(rootTask!.id, rootRun.id, "succeeded");
+
+      const stepA = await waitFor(() => tasks.stepsForParent(parentId).find((s) => s.pipelineStepId === A.id));
+      stepAId = stepA!.id;
+      const stepB = await waitFor(() => tasks.stepsForParent(parentId).find((s) => s.pipelineStepId === B.id));
+
+      // A's assistant text (no `<handoff>` tag) lands ~20ms into its turn
+      // regardless of the 3s resolve delay above — wait for it so the
+      // manual "succeeded" settle below has something real to classify.
+      const aRunRow = await waitFor(() => {
+        const r = runs.listForTask(stepAId)[0];
+        if (!r) return undefined;
+        return runs.events(r.id).some((e) => e.stream === "assistant") ? r : undefined;
+      });
+      await waitFor(() => runs.listForTask(stepB!.id)[0]);
+
+      expect(tasks.get(stepAId)?.column).toBe("running");
+      expect(tasks.get(stepB!.id)?.column).toBe("running");
+
+      // Stop the WHOLE pipeline (not one step's own panel) while both A and
+      // B are still genuinely live — `cancelPipelineRun` forces
+      // `run.status = "cancelled"` synchronously, before either step's real
+      // settle event has a chance to reach this module. Both A's and B's
+      // real cancellation land (via `stopActiveHandle`) essentially
+      // immediately, but with the listener disabled neither is EVER
+      // re-delivered later just by re-enabling the listener — a dropped
+      // event isn't queued for replay, it's simply gone (the same reason
+      // `reconcilePipelineRuns` exists for a boot-time sweep). So this test
+      // drives both settles manually, deterministically, instead of racing
+      // real timing against the listener's on/off state.
+      const cancelled = await cancelPipelineRun(parentId);
+      if ("error" in cancelled) throw new Error(cancelled.error);
+      expect(tasks.get(parentId)!.pipelineRun!.status).toBe("cancelled");
+
+      const bRunRow = await waitFor(() => {
+        const r = runs.listForTask(stepB!.id)[0];
+        return r && r.status !== "running" ? r : undefined;
+      });
+
+      // A's own "succeeded" settle — it had already finished its turn with
+      // a bad handoff (its assistant text was already persisted above) —
+      // reaches this handler only now, AFTER the whole-run stop already
+      // forced `status: "cancelled"`. It must not send the automatic
+      // reminder and must not revive the run back into `running`.
+      await __forTest.handleRunStatus(stepAId, aRunRow.id, "succeeded");
+      // B's own real cancellation, fed through the same path a live
+      // listener would have used.
+      await __forTest.handleRunStatus(stepB!.id, bRunRow.id, "cancelled");
+    } finally {
+      __forTest.setListenerEnabled(true);
+    }
+
+    const parent = tasks.get(parentId)!;
+    const run = parent.pipelineRun!;
+    expect(run.status === "cancelled" || run.status === "blocked").toBe(true);
+    expect(run.status).not.toBe("running");
+
+    const record = run.history.find((h) => h.stepId === A.id);
+    expect(record?.reminder ?? null).toBeNull();
+
+    // No reminder follow-up run was ever created for A.
+    const stepARuns = runs.listForTask(stepAId);
+    expect(stepARuns.length).toBe(1);
+
+    await waitUntilIdle(parentId);
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
+  }
+}, 15000);
+
+test("Medium 3: a reminder that fails to deliver records nothing on `reminder` (so the next settle may try again) and folds the failure into the block message", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines, runs, db } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { __forTest } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("delivery-fails");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing` });
+  const graph = { steps: [A], edges: [], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("delivery-fails-pipeline"), graph, maxSteps: 25 });
+
+  const created = await createTask({
+    title: "delivery fails run",
+    prompt: "goal",
+    workdir: freshWorkdir(),
+    isolation: "none",
+    pipelineId: pipeline.id,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  let stepAId = "";
+  __forTest.setListenerEnabled(false);
+  try {
+    const started = await startTask(parentId);
+    if ("error" in started) throw new Error(started.error);
+
+    const stepA = await waitFor(() => tasks.stepsForParent(parentId)[0]);
+    stepAId = stepA!.id;
+    const runRow = await waitFor(() => {
+      const r = runs.listForTask(stepAId)[0];
+      return r && r.status !== "running" ? r : undefined;
+    });
+
+    // Force `sendInput`'s own reminder-delivery attempt to fail
+    // deterministically: delete the run row it would target. The FK
+    // cascade also wipes its `run_events` — harmless here, since the
+    // classification above is already forced to "handoff-missing" by the
+    // step's own `:missing` marker, and an empty `assistantTextForRun`
+    // classifies exactly the same way.
+    db.run("DELETE FROM runs WHERE id = ?", [runRow.id]);
+
+    await __forTest.handleRunStatus(stepAId, runRow.id, "succeeded");
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+
+  const parent = tasks.get(parentId)!;
+  const run = parent.pipelineRun!;
+  const block = run.blocked.find((b) => b.taskId === stepAId);
+  expect(block?.kind).toBe("handoff-missing");
+  expect(block?.message).toContain("automatic reminder could not be sent");
+  expect(block?.message).toContain("run not found");
+
+  const record = run.history.find((h) => h.stepId === A.id);
+  // Medium 3: nothing recorded on `reminder` when delivery fails — the NEXT
+  // settle for this execution may still try once.
+  expect(record?.reminder ?? null).toBeNull();
+
+  await waitUntilIdle(parentId);
+});
+
+test("Medium 4: a response with no valid handoff but a pending interaction blocks the run as step-blocked (not silently active), and the block clears once the step genuinely runs again", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines, runs } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  const { __forTest, retryPipelineStep } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("user-ask-block");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing` });
+  const graph = { steps: [A], edges: [], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("user-ask-block-pipeline"), graph, maxSteps: 25 });
+
+  const created = await createTask({
+    title: "user-ask-block run",
+    prompt: "goal",
+    workdir: freshWorkdir(),
+    isolation: "none",
+    pipelineId: pipeline.id,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  let stepAId = "";
+  __forTest.setListenerEnabled(false);
+  try {
+    const started = await startTask(parentId);
+    if ("error" in started) throw new Error(started.error);
+
+    const stepA = await waitFor(() => tasks.stepsForParent(parentId)[0]);
+    stepAId = stepA!.id;
+    const runRow = await waitFor(() => {
+      const r = runs.listForTask(stepAId)[0];
+      return r && r.status !== "running" ? r : undefined;
+    });
+
+    registerTmuxPrompt({
+      taskId: stepAId,
+      runId: runRow.id,
+      paneText: "pane",
+      choices: [{ key: "1", label: "Yes" }],
+      fingerprint: `fp-user-ask-${stepAId}`,
+    });
+
+    await __forTest.handleRunStatus(stepAId, runRow.id, "succeeded");
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+
+  const blocked = tasks.get(parentId)!;
+  const run = blocked.pipelineRun!;
+  expect(run.status).toBe("blocked");
+  const block = run.blocked.find((b) => b.taskId === stepAId);
+  expect(block?.kind).toBe("step-blocked");
+  expect(block?.message).toContain("is waiting for you");
+
+  const record = run.history.find((h) => h.stepId === A.id);
+  expect(record?.responseKind).toBe("user-ask");
+  expect(record?.reminder ?? null).toBeNull(); // no automatic reminder for a pending card
+
+  // Once the step task genuinely runs again, the "running"-column handler
+  // (m11) clears ANY block naming it — including this one — and resets the
+  // stale history outcome/endedAt/responseKind. `retryPipelineStep`'s own
+  // in-memory `run.blocked` filter (for a single targeted taskId) is never
+  // itself persisted, so this is a real exercise of that handler, not of
+  // retry's own bookkeeping.
+  const retried = await retryPipelineStep(parentId, { taskId: stepAId });
+  if ("error" in retried) throw new Error(retried.error);
+
+  await waitFor(() => {
+    const t = tasks.get(parentId);
+    const stillBlocked = t?.pipelineRun?.blocked.some((b) => b.taskId === stepAId);
+    return stillBlocked === false ? t : undefined;
+  });
+  const afterRunning = tasks.get(parentId)!.pipelineRun!;
+  const recordAfterRunning = afterRunning.history.find((h) => h.stepId === A.id);
+  expect(recordAfterRunning?.responseKind ?? null).toBeNull();
+  expect(recordAfterRunning?.outcome ?? null).toBeNull();
+  expect(recordAfterRunning?.endedAt ?? null).toBeNull();
+
+  await waitUntilIdle(parentId);
+});
+
+test("Low: a handoff whose `next` doesn't resolve to a real step gets the one reminder (reason handoff-next-unknown), then blocks with responseKind overridden to \"handoff-invalid\"", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines, runs } = await import("./db.ts");
+  const { newStep, HANDOFF_REMINDER_MARKER } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+
+  const profile = await makeProfile("next-unknown");
+  const A = newStep({ name: "A", agentProfileId: profile.id, transition: "choose", instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:nope` });
+  const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const C = newStep({ name: "C", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const graph = {
+    steps: [A, B, C],
+    edges: [
+      { id: "e1", from: A.id, to: B.id, label: "" },
+      { id: "e2", from: A.id, to: C.id, label: "" },
+    ],
+    startStepId: A.id,
+  };
+  const pipeline = pipelines.insert({ name: uniqueName("next-unknown-pipeline"), graph, maxSteps: 25 });
+
+  const created = await createTask({
+    title: "next-unknown run",
+    prompt: "goal",
+    workdir: freshWorkdir(),
+    isolation: "none",
+    pipelineId: pipeline.id,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  const stepA = await waitFor(() => tasks.stepsForParent(parentId)[0]);
+
+  const blockedTask = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "blocked" ? t : undefined;
+  }, 8000);
+  const run = blockedTask.pipelineRun!;
+  expect(run.active.length).toBe(1);
+  expect(run.active[0]!.taskId).toBe(stepA.id);
+  // B and C were never launched — the graph never resolved to either.
+  expect(tasks.stepsForParent(parentId).length).toBe(1);
+
+  const block = run.blocked.find((b) => b.taskId === stepA.id);
+  expect(block?.kind).toBe("handoff-invalid");
+  expect(block?.message).toContain("still no valid handoff after one reminder");
+  expect(block?.message).toContain('asked for step "nope"');
+
+  const record = run.history.find((h) => h.stepId === A.id);
+  // Overridden from `classifyStepResponse`'s own "handoff" stamp — an
+  // unresolved `next` is a malformed handoff, not a valid one.
+  expect(record?.responseKind).toBe("handoff-invalid");
+  expect(record?.reminder).not.toBeNull();
+  expect(record?.reminder?.reason).toBe("handoff-next-unknown");
+  expect(record?.reminder?.delivered).toBe(true);
+  expect(record?.reminder?.runId).not.toBeNull();
+
+  const stepRuns = runs.listForTask(stepA.id);
+  expect(stepRuns.length).toBe(2); // the original turn + the one reminder follow-up
+  const reminderEvents = stepRuns
+    .flatMap((r) => runs.events(r.id))
+    .filter((e) => e.stream === "user" && e.data.includes(HANDOFF_REMINDER_MARKER));
+  expect(reminderEvents.length).toBe(1);
+
+  await waitUntilIdle(parentId);
+});
