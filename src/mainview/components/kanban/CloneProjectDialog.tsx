@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { AlertCircle, Loader2, X } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError, api } from "@/lib/api";
@@ -280,7 +280,7 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
     }
   };
 
-  const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  const onEnter = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key !== "Enter") return;
     e.preventDefault();
     if (canSubmit) void submit();

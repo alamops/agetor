@@ -5402,11 +5402,11 @@ export async function createTask(
   // `supportedEfforts` makes both cases resolve to `null` for gemini — that's
   // what the PATCH null-clear guard and every picker already compute for an
   // unknown id, so this closes a known inconsistency, on purpose. fx is
-  // different: 16 of its 28 curated models advertise real efforts (live-probed
+  // different: 16 of its 29 curated models advertise real efforts (live-probed
   // 2026-09-14), so both a listed and an unlisted fx model resolve through
   // `supportedEfforts` to `DEFAULT_EFFORT.fx` (`"auto"`) whenever the model —
   // or the `DEFAULT_MODEL.fx` fallback used for an unlisted id — is one of
-  // those 16; only the remaining 12 no-effort fx models (e.g. `zai/glm-4.7`)
+  // those 16; only the remaining 13 no-effort fx models (e.g. `zai/glm-4.7`)
   // resolve to `null`. That whole computation is `defaultEffortFor` below.
   //
   // A bound profile's `effort` is passthrough instead (D3/A5 in the plan) —

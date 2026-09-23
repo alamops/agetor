@@ -1805,9 +1805,12 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // API "in the coming days"). The picker hint carries the gate, and
   // GPT-5.6 Sol (the previous default) stays one click away.
   "codex": "gpt-6-astra",
-  // Grok 4.6 (high effort via DEFAULT_EFFORT) — replaces cursor-agent's own
-  // "auto" as agetor's default so new tasks pin an explicit flagship model.
-  "cursor": "cursor-grok-4.6",
+  // Grok 4.7 (high effort via DEFAULT_EFFORT) — agetor pins an explicit
+  // flagship model rather than cursor-agent's own "auto". Owner decision
+  // 2026-09-21 (docs/plans/add-grok-4-7.md): 4.7 replaces 4.6, the previous
+  // default, which stays one click away. Note the key is cursor-agent's own
+  // unprefixed base — unlike `cursor-grok-4.6` / `cursor-grok-4.5`.
+  "cursor": "grok-4.7",
   // gemini-3.1-pro-preview is Google's current flagship Pro. It replaced
   // gemini-3-pro-preview (agetor's default until 2026-09), which Google shut
   // down on 2026-03-09 — ai.google.dev/gemini-api/docs/deprecations names
@@ -1828,7 +1831,7 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // (`~/.fx/settings.json` on the reference account). Ids are Vercel AI
   // Gateway ids, passed verbatim. fx is exempt from the "always default to
   // the best available model" rule above: the Gateway bills per token to the
-  // user's own account, and flagship tiers (the twelve `catalogOnly` rows in
+  // user's own account, and flagship tiers (the thirteen `catalogOnly` rows in
   // `AGENT_OPTIONS.fx.models`) stay one click away
   // in the picker as catalog-gated rows — offered only when the signed-in
   // account's catalog actually contains them (see `AgentOption.catalogOnly`).
@@ -1885,13 +1888,31 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
 };
 
 export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
+  // Ids verified against `cursor-agent models` (CLI 2026.09.18): grok 4.7 ships
+  // as grok-4.7-{low,medium,high,xhigh} plus -fast variants of all four — NOT
+  // `cursor-` prefixed like 4.6/4.5, and with no bare id, no max tier, no
+  // 1M/Max-Mode variant. Every tier carries its own label ("Grok 4.7 High", …),
+  // so there is no unsuffixed row; High is the default via DEFAULT_EFFORT.
+  // The label mirrors cursor-agent's own unprefixed naming on purpose
+  // ("Grok 4.7 High", not "Cursor Grok 4.7") — don't "fix" it to match 4.6/4.5.
+  "grok-4.7": {
+    label: "Grok 4.7",
+    hint: "Recommended default — Cursor-hosted Grok 4.7. Needs cursor-agent 2026.09.18 or newer; older builds reject the id (pick Cursor Grok 4.6 there).",
+    effortIds: {
+      xhigh: "grok-4.7-xhigh",
+      high: "grok-4.7-high",
+      medium: "grok-4.7-medium",
+      low: "grok-4.7-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low"],
+  },
   // Ids verified against `cursor-agent models` (CLI 2026.08.11): grok 4.6 ships
   // as cursor-grok-4.6-{low,medium,high,xhigh} plus -fast variants of all four —
   // no bare id, no max tier, no 1M/Max-Mode variant. The unsuffixed "Cursor
   // Grok 4.6" label is the high tier, same convention as 4.5.
   "cursor-grok-4.6": {
     label: "Cursor Grok 4.6",
-    hint: "Recommended default — Cursor-hosted Grok 4.6.",
+    hint: "Cursor-hosted Grok 4.6 — the previous default.",
     effortIds: {
       xhigh: "cursor-grok-4.6-xhigh",
       high: "cursor-grok-4.6-high",
@@ -2418,13 +2439,15 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // what every effort-advertising model reports as `currentValue`), 12
   // advertise none — their Gateway catalog entry carries no
   // `reasoning_options` at all — and stay `[]`, same treatment as gemini
-  // above (the picker collapses). An unknown/discovered-only fx id falls
-  // back to `DEFAULT_MODEL.fx`'s set via `supportedEfforts`, and the driver
-  // validates at runtime against whatever `effort` option fx actually
-  // returns for that session — so drift between this curated table and the
-  // live Gateway catalog is only a picker-hint problem, never a failed run
-  // (an unoffered value degrades to a status breadcrumb). Ids map to fx's
-  // own values verbatim (`low|medium|high|xhigh|max|none|auto`).
+  // above (the picker collapses). A 29th id, spacexai/grok-4.7, joined the
+  // no-effort group on 2026-09-21 (see its row below). An
+  // unknown/discovered-only fx id falls back to `DEFAULT_MODEL.fx`'s set via
+  // `supportedEfforts`, and the driver validates at runtime against whatever
+  // `effort` option fx actually returns for that session — so drift between
+  // this curated table and the live Gateway catalog is only a picker-hint
+  // problem, never a failed run (an unoffered value degrades to a status
+  // breadcrumb). Ids map to fx's own values verbatim
+  // (`low|medium|high|xhigh|max|none|auto`).
   fx: {
     "zai/glm-5.3-flash": ["max", "high", "low", "auto"],
     "zai/glm-5v-turbo": [],
@@ -2454,6 +2477,10 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
     "zai/glm-5.3": ["max", "high", "low", "auto"],
     "deepseek/deepseek-v4-pro": ["xhigh", "high", "auto"],
+    // 2026-09-21: not ACP-probed (no fx credentials that pass) — `[]` rests on
+    // the public Gateway catalog entry, which carries no `reasoning_options`,
+    // exactly like spacexai/grok-4.6. docs/plans/add-grok-4-7.md §8 A1.
+    "spacexai/grok-4.7": [],
   },
 };
 
@@ -2728,6 +2755,17 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // 0.0.10 alike (Gateway-side, not client-version-dependent); all 28
     // curated ids (16 standard + 12 catalogOnly) still present; signed-in
     // view still unverifiable (token expired).
+    // 2026-09-21: spacexai/grok-4.7 (released the same day) added from fx
+    // 0.0.10's unauthenticated catalog; its presence in a standard signed-in
+    // account is unverified (`fx status` reads auth: missing), hence
+    // catalogOnly — thirteen catalogOnly rows, 29 curated ids total. That
+    // catalog reads 246 ids, one fewer than 2026-09-14's 247 despite the
+    // addition: 28 of the 29 curated ids are present, and mistral/devstral-2
+    // is gone from both `fx models --json` and the public Gateway catalog
+    // (Gateway-side retirement). The row is left in place here — retiring a
+    // curated id is its own change (picker + tasks.model + lastModel pref);
+    // the curated ∩ discovered merge already hides it wherever discovery
+    // works.
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
@@ -2757,14 +2795,15 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "openai/gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "zai/glm-5.3", label: "GLM-5.3", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "spacexai/grok-4.7", label: "Grok 4.7", hint: "500K context · 500K output — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [
       { id: "yolo", label: "Full access", hint: "Hands-off default — disables fx's permission checks entirely, so no tool call is ever held. What fx 0.0.8 calls --full-access / /permissions full-access (still true on 0.0.10); yolo is fx's surviving alias and stays agetor's stored id." },
       { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
-    // 16 of the 28 curated models accept the effort flag (see
-    // MODEL_EFFORT_SUPPORT.fx — live-probed on fx 0.0.10); the other 12
+    // 16 of the 29 curated models accept the effort flag (see
+    // MODEL_EFFORT_SUPPORT.fx — live-probed on fx 0.0.10); the other 13
     // report an empty set and the picker collapses for those, same as any
     // other kind's no-effort models. Every id-supported model always
     // includes `auto` (fx's own default) last, per EFFORT_OPTIONS.

@@ -105,7 +105,7 @@ const claudeDefaults = { mode: "auto", model: "opus-4.7", effort: "high" } as co
 const codexDefaults = { mode: "auto", model: "gpt-6-astra", effort: "high" } as const;
 // Cursor's effort rides inside the --model id (`cursorModelArg` composes
 // model + effort + fast into one string), not a separate flag.
-const cursorDefaults = { mode: "auto", model: "cursor-grok-4.6", effort: "high" } as const;
+const cursorDefaults = { mode: "auto", model: "grok-4.7", effort: "high" } as const;
 // Gemini has no effort flag at all (see MODEL_EFFORT_SUPPORT.gemini in
 // shared/types.ts) — buildCommand's gemini branch never reads opts.effort.
 const geminiDefaults = { mode: "auto", model: "gemini-3.1-pro-preview" } as const;
@@ -723,12 +723,12 @@ test("codex throws when effort is missing for a model that supports it", () => {
 // spawn time via its own injection-safe quoting. `buildCommand`'s job is just
 // the flags: -p stream-json, --model, the auto/ask force+sandbox posture, and
 // --resume. Cursor effort/Fast/Max Mode are composed into the --model id.
-test("cursor with defaults emits -p --output-format stream-json --model cursor-grok-4.6-high --force --sandbox disabled", () => {
+test("cursor with defaults emits -p --output-format stream-json --model grok-4.7-high --force --sandbox disabled", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults });
   expect(cmd).toEqual([
     "cursor-agent",
     "-p", "--output-format", "stream-json",
-    "--model", "cursor-grok-4.6-high",
+    "--model", "grok-4.7-high",
     "--force", "--sandbox", "disabled",
   ]);
 });
@@ -738,7 +738,7 @@ test("cursor 'ask' mode emits no --force / --sandbox flags (propose-only — cur
   expect(cmd).toEqual([
     "cursor-agent",
     "-p", "--output-format", "stream-json",
-    "--model", "cursor-grok-4.6-high",
+    "--model", "grok-4.7-high",
   ]);
   expect(cmd).not.toContain("--force");
   expect(cmd).not.toContain("--sandbox");
@@ -897,7 +897,7 @@ test("AGETOR_CURSOR_ARGS extra args land after the mode flags and before --resum
   expect(cmd).toEqual([
     "cursor-agent",
     "-p", "--output-format", "stream-json",
-    "--model", "cursor-grok-4.6-high",
+    "--model", "grok-4.7-high",
     "--force", "--sandbox", "disabled",
     "--verbose", "--foo",
     "--resume", "sess-1",

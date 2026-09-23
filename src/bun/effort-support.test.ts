@@ -346,8 +346,8 @@ test("gemini default model gemini-3.1-pro-preview exposes no effort options", ()
 
 // --- cursor: model thinking modes + fast variants -----------------------------
 
-test("cursor DEFAULT_MODEL is Grok 4.6 (explicit flagship pin, not cursor-agent's 'auto')", () => {
-  expect(DEFAULT_MODEL.cursor).toBe("cursor-grok-4.6");
+test("cursor DEFAULT_MODEL is Grok 4.7 (explicit flagship pin, not cursor-agent's 'auto')", () => {
+  expect(DEFAULT_MODEL.cursor).toBe("grok-4.7");
 });
 
 test("cursor DEFAULT_EFFORT is high for parameterized non-Auto models", () => {
@@ -357,7 +357,9 @@ test("cursor DEFAULT_EFFORT is high for parameterized non-Auto models", () => {
 test("cursor model catalog includes the screenshot/default surface", () => {
   const ids = AGENT_OPTIONS.cursor.models.map((m) => m.id);
   // The recommended default tops the list (same convention as codex/gemini).
-  expect(ids[0]).toBe("cursor-grok-4.6");
+  expect(ids[0]).toBe("grok-4.7");
+  // The previous default stays one click away, right below the new one.
+  expect(ids[1]).toBe("cursor-grok-4.6");
   expect(ids).toContain("auto");
   expect(ids).toContain("gpt-5.3-codex");
   expect(ids).toContain("cursor-grok-4.5");
@@ -374,8 +376,15 @@ test("cursor Auto model reports zero efforts", () => {
   expect(supportedEfforts("cursor", "auto")).toEqual([]);
 });
 
-test("cursor null model resolves to the Grok 4.6 default effort surface", () => {
+test("cursor null model resolves to the Grok 4.7 default effort surface", () => {
   expect(supportedEfforts("cursor", null).map((o) => o.id)).toEqual(["xhigh", "high", "medium", "low"]);
+});
+
+test("cursor Grok 4.7 exposes Extra High but no Max or Max Mode (ids verified via `cursor-agent models`, CLI 2026.09.18)", () => {
+  const ids = supportedEfforts("cursor", "grok-4.7").map((o) => o.id);
+  expect(ids).toEqual(["xhigh", "high", "medium", "low"]);
+  expect(cursorModelSupportsMaxMode("grok-4.7")).toBe(false);
+  for (const effort of ids) expect(cursorModelSupportsFast("grok-4.7", effort)).toBe(true);
 });
 
 test("cursor Grok 4.6 exposes Extra High but no Max (ids verified via `cursor-agent models`)", () => {
@@ -441,6 +450,12 @@ test("cursorModelArg composes known model, effort, and fast variants", () => {
   expect(cursorModelArg("cursor-grok-4.6", null, false)).toBe("cursor-grok-4.6-high");
   expect(cursorModelArg("cursor-grok-4.6", "xhigh", true)).toBe("cursor-grok-4.6-xhigh-fast");
   expect(cursorModelArg("cursor-grok-4.6", "low", false)).toBe("cursor-grok-4.6-low");
+  // Grok 4.7: same ladder, but cursor-agent's ids carry no `cursor-` prefix.
+  expect(cursorModelArg("grok-4.7", null, false)).toBe("grok-4.7-high");
+  expect(cursorModelArg("grok-4.7", "xhigh", true)).toBe("grok-4.7-xhigh-fast");
+  expect(cursorModelArg("grok-4.7", "low", false)).toBe("grok-4.7-low");
+  // No Max-Mode bracket syntax — maxMode is ignored, fast still applies.
+  expect(cursorModelArg("grok-4.7", "medium", true, true)).toBe("grok-4.7-medium-fast");
 });
 
 test("cursor Fable 5.1 exposes the full max/xhigh/high/medium/low ladder", () => {
@@ -459,6 +474,17 @@ test("cursorModelArg composes Fable 5.1 efforts with no -fast variant (catalog h
 
 test("cursorModelIdCoveredByCatalog recognizes a Fable 5.1 effort variant", () => {
   expect(cursorModelIdCoveredByCatalog("claude-fable-5-1-high")).toBe(true);
+});
+
+// These are the ids migration 055 folds into base id + effort + fast — a
+// discovered `cursor-agent models` row for any of them must stay hidden.
+test("cursorModelIdCoveredByCatalog recognizes every Grok 4.7 variant, fast forms included", () => {
+  for (const tier of ["xhigh", "high", "medium", "low"]) {
+    expect(cursorModelIdCoveredByCatalog(`grok-4.7-${tier}`)).toBe(true);
+    expect(cursorModelIdCoveredByCatalog(`grok-4.7-${tier}-fast`)).toBe(true);
+  }
+  expect(cursorModelIdCoveredByCatalog("grok-4.7")).toBe(true);
+  expect(cursorModelIdCoveredByCatalog("grok-4.7-max")).toBe(false);
 });
 
 test("cursor supportedModes returns the auto/ask pair (no per-model mode carve-outs)", () => {
