@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, useEffect, useRef } from "react";
 import {
   BaseEdge,
   EdgeLabelRenderer,
@@ -57,6 +57,16 @@ function StepEdgeImpl({
   });
   const visual = data?.visual ?? "idle";
   const showLabelPill = !!(data?.label || (data?.onDelete && !data?.readOnly));
+  const animateRef = useRef<SVGAnimateMotionElement>(null);
+
+  // The token's `<animateMotion>` runs with `begin="indefinite"` (never
+  // auto-starts) and is replayed imperatively via `beginElement()` whenever
+  // `data.tokenKey` changes — including a repeat transition over the SAME
+  // edge (a cycle), which a `key`-based remount can't reliably replay for a
+  // SMIL animation embedded in an SVG that itself never unmounts.
+  useEffect(() => {
+    if (data?.token) animateRef.current?.beginElement();
+  }, [data?.tokenKey]);
 
   return (
     <>
@@ -65,13 +75,17 @@ function StepEdgeImpl({
         path={edgePath}
         markerEnd={markerEnd}
         style={style}
+        // A real `stroke-dasharray` attribute is required for the
+        // `animate-pipeline-dash` keyframes (which only animate
+        // `stroke-dashoffset`) to visibly "march" — see M13.
+        strokeDasharray={visual === "flowing" ? "6 6" : undefined}
         className={cn(STROKE_CLASSES[visual])}
         data-testid="pipeline-step-edge"
         data-visual={visual}
       />
       {data?.token && (
-        <circle key={data.tokenKey ?? id} r={5} className="fill-info" data-testid="pipeline-step-edge-token">
-          <animateMotion dur="1.2s" repeatCount="1" fill="freeze" path={edgePath} />
+        <circle r={5} className="fill-info" data-testid="pipeline-step-edge-token">
+          <animateMotion ref={animateRef} begin="indefinite" dur="1.2s" repeatCount="1" fill="freeze" path={edgePath} />
         </circle>
       )}
       {showLabelPill && (

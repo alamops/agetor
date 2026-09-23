@@ -4,9 +4,17 @@ import { c, out, printJson, table } from "../output.ts";
 import { flagValue } from "../args.ts";
 import type { AgetorClient } from "../api-client.ts";
 import { usageError } from "../usage.ts";
+import { resolveTask } from "../resolve.ts";
 import { taskCountText } from "./agent-profile.ts";
-import { matchPipelineRef, outgoingSteps, resolveStartStep, validatePipelineGraph } from "../../shared/pipeline.ts";
-import type { Pipeline, PipelineInput } from "../../shared/types.ts";
+import {
+  matchPipelineRef,
+  outgoingSteps,
+  pipelineStepProgress,
+  resolveStartStep,
+  stepNameById,
+  validatePipelineGraph,
+} from "../../shared/pipeline.ts";
+import type { Pipeline, PipelineGraph, PipelineInput, Task } from "../../shared/types.ts";
 
 export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
   const sub = args[0] ?? "ls";
@@ -82,9 +90,93 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       out(`${c.green("✓")} imported pipeline ${c.bold(created.name)} (${c.dim(created.id)})`);
       return;
     }
+
+    // ── task-scoped subcommands below: <ref> is a pipeline TASK (the board
+    // task launched from a pipeline), not the pipeline template itself, and
+    // is resolved by id/short-id via `resolveTask` exactly like every other
+    // task-targeting command (start/send/cancel/…). ──────────────────────
+    case "retry": {
+      const ref = args[1];
+      if (!ref) throw usageError("pipeline retry");
+      const task = await resolvePipelineTask(client, ref);
+      const updated = await client.retryPipeline(task.id);
+      if (flags.json) return printJson(updated);
+      out(`${c.cyan("↻")} retrying pipeline for ${c.dim(task.id.slice(0, 8))}`);
+      return;
+    }
+
+    case "advance": {
+      const ref = args[1];
+      if (!ref) throw usageError("pipeline advance");
+      const task = await resolvePipelineTask(client, ref);
+      const f = parseAdvanceFlags(args.slice(2));
+      if (f.finish && f.next.length > 0) {
+        throw new Error("pipeline advance: --next and --finish are mutually exclusive");
+      }
+      if (!f.finish && f.next.length === 0) throw usageError("pipeline advance");
+
+      let nextStepIds: string[] | null;
+      if (f.finish) {
+        nextStepIds = null;
+      } else {
+        const graph = task.pipelineRun?.snapshot?.graph;
+        if (!graph) throw new Error("pipeline has no run snapshot yet — nothing to advance");
+        nextStepIds = f.next.map((name) => resolveStepRef(graph, name));
+      }
+
+      const body: { nextStepIds: string[] | null; fromTaskId?: string } = { nextStepIds };
+      if (f.from) body.fromTaskId = f.from;
+      const updated = await client.advancePipeline(task.id, body);
+      if (flags.json) return printJson(updated);
+      out(`${c.green("▸")} advanced pipeline for ${c.dim(task.id.slice(0, 8))}`);
+      return;
+    }
+
+    case "restart": {
+      const ref = args[1];
+      if (!ref) throw usageError("pipeline restart");
+      const task = await resolvePipelineTask(client, ref);
+      // Mirrors `startTask`'s own response shape (this launches the start
+      // step's agent synchronously, same as a plain Run) rather than
+      // returning the task — see `POST /tasks/:id/pipeline/restart`.
+      const res = await client.restartPipeline(task.id);
+      if (flags.json) return printJson(res);
+      if (res.pending) {
+        out(
+          `${c.yellow("▸")} restarting pipeline for ${c.dim(task.id.slice(0, 8))} — run ${res.runId.slice(0, 8)} ` +
+            c.dim("(agent launch still in progress)"),
+        );
+      } else {
+        out(`${c.cyan("↻")} restarted pipeline for ${c.dim(task.id.slice(0, 8))} — run ${res.runId.slice(0, 8)}`);
+      }
+      return;
+    }
+
+    case "status": {
+      const ref = args[1];
+      if (!ref) throw usageError("pipeline status");
+      const task = await resolvePipelineTask(client, ref);
+      const { task: fresh, steps } = await client.getPipelineRun(task.id);
+      if (flags.json) return printJson({ task: fresh, steps });
+      for (const line of pipelineStatusLines(fresh, steps)) out(line);
+      return;
+    }
+
     default:
-      throw new Error(`unknown pipeline subcommand: ${sub} (use ls | show | rm | export | import)`);
+      throw new Error(
+        "unknown pipeline subcommand: " +
+          sub +
+          " (use ls | show | rm | export | import | retry | advance | restart | status)",
+      );
   }
+}
+
+/** Resolve `ref` to a task and confirm it's actually a pipeline (parent)
+ *  task — shared by the four task-scoped subcommands below. */
+async function resolvePipelineTask(client: AgetorClient, ref: string): Promise<Task> {
+  const task = await resolveTask(client, ref);
+  if (!task.pipelineId) throw new Error(`task "${ref}" is not a pipeline task`);
+  return task;
 }
 
 async function resolvePipeline(client: AgetorClient, ref: string): Promise<Pipeline> {
@@ -120,6 +212,58 @@ export function parseImportFlags(args: string[]): ImportFlags {
     if (a === "--name") f.name = flagValue(args, ++i, a);
   }
   return f;
+}
+
+interface AdvanceFlags {
+  /** `--next <step>` — repeatable; each value is a step name or id, resolved
+   *  against the run's snapshot graph by `resolveStepRef`. */
+  next: string[];
+  /** `--finish` — end the run here (maps to `nextStepIds: null`); mutually
+   *  exclusive with `--next`. */
+  finish: boolean;
+  /** `--from <task-id>` — the specific blocked/awaiting step execution to
+   *  advance, when more than one is in play. */
+  from?: string;
+}
+
+/** Pure flag parser for `agetor pipeline advance` — `--next <step>`
+ *  (repeatable), `--finish`, `--from <task-id>`. Exclusivity between
+ *  `--next` and `--finish`, and requiring one of them, is checked by the
+ *  caller (`cmdPipeline`'s "advance" case) since that needs a usage-error
+ *  vs. a plain error distinction this pure parser has no business making. */
+export function parseAdvanceFlags(args: string[]): AdvanceFlags {
+  const f: AdvanceFlags = { next: [], finish: false };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--next") f.next.push(flagValue(args, ++i, a));
+    else if (a === "--finish") f.finish = true;
+    else if (a === "--from") f.from = flagValue(args, ++i, a);
+  }
+  return f;
+}
+
+/**
+ * Resolve a `--next`/`--from` step reference against a pipeline run's
+ * snapshot graph — exact step id first, then a unique case-insensitive,
+ * trimmed step name — mirroring {@link matchPipelineRef}'s own id-then-name
+ * precedence. Throws (listing every step name as candidates) on an unknown
+ * or ambiguous reference, since the graph enforces unique names so ambiguity
+ * can't actually happen for a name match — but the check stays defensive.
+ */
+export function resolveStepRef(graph: PipelineGraph, ref: string): string {
+  const trimmed = ref.trim();
+  const byId = graph.steps.find((s) => s.id === trimmed);
+  if (byId) return byId.id;
+
+  const lower = trimmed.toLowerCase();
+  const matches = graph.steps.filter((s) => s.name.trim().toLowerCase() === lower);
+  if (matches.length === 1) return matches[0]!.id;
+
+  const candidates = graph.steps.map((s) => s.name).join(", ") || "(none)";
+  if (matches.length > 1) {
+    throw new Error(`ambiguous step "${trimmed}": matches ${matches.map((s) => s.name).join(", ")}`);
+  }
+  throw new Error(`unknown step "${trimmed}" — steps: ${candidates}`);
 }
 
 /** Pure row formatter for `agetor pipeline ls`'s table: id (short), name,
@@ -171,6 +315,79 @@ export function pipelineShowLines(p: Pipeline): string[] {
     }
   });
   return lines;
+}
+
+/**
+ * Pure line-by-line renderer for `agetor pipeline status <task>` — the
+ * pipeline task's overall status/progress, every blocked entry, every
+ * currently-active step execution (with its own task's live column), and
+ * the full step history (oldest first, matching `PipelineRunState.history`'s
+ * `seq` order). `steps` is the parent's hidden step tasks (from
+ * `GET /tasks/:id/pipeline`), consulted only to show an active execution's
+ * live column — history rows show just the recorded outcome, since a
+ * settled step task's own column may have moved on (e.g. archived).
+ */
+export function pipelineStatusLines(task: Task, steps: Task[]): string[] {
+  const lines: string[] = [];
+  lines.push(`${c.bold(task.title)}  ${c.dim(task.id)}`);
+  const run = task.pipelineRun;
+  if (!run) {
+    lines.push(`  ${c.dim("pipeline has never run")}`);
+    return lines;
+  }
+
+  const progress = pipelineStepProgress(run);
+  lines.push(
+    `  ${label("pipeline")} ${run.pipelineName}   ${label("status")} ${colorRunStatus(run.status)}` +
+      `   ${label("steps")} ${progress.label}`,
+  );
+
+  if (run.blocked.length > 0) {
+    lines.push("");
+    lines.push(`  ${c.yellow("blocked")}:`);
+    for (const b of run.blocked) {
+      const stepName = run.snapshot && b.stepId ? stepNameById(run.snapshot.graph, b.stepId) : b.stepId;
+      const who = b.taskId ? ` (${stepName ?? "?"} · ${c.dim(b.taskId.slice(0, 8))})` : "";
+      lines.push(`    ${c.yellow("⚠")} [${b.kind}]${who} ${b.message}`);
+    }
+  }
+
+  if (run.active.length > 0) {
+    lines.push("");
+    lines.push(`  ${c.cyan("active")}:`);
+    for (const a of run.active) {
+      const stepName = run.snapshot ? stepNameById(run.snapshot.graph, a.stepId) : a.stepId;
+      const stepTask = steps.find((s) => s.id === a.taskId);
+      const columnNote = stepTask ? `  ${c.dim(stepTask.column)}` : "";
+      lines.push(`    ${c.cyan("▸")} ${stepName}  ${c.dim(a.taskId.slice(0, 8))}${columnNote}`);
+    }
+  }
+
+  if (run.history.length > 0) {
+    lines.push("");
+    lines.push(`  ${c.dim("history (oldest first):")}`);
+    for (const h of run.history) {
+      const stepName = run.snapshot ? stepNameById(run.snapshot.graph, h.stepId) : h.stepId;
+      lines.push(`    ${h.seq}. ${stepName}  ${historyGlyph(h.outcome)}  ${c.dim(h.taskId.slice(0, 8))}`);
+    }
+  }
+
+  return lines;
+}
+
+function colorRunStatus(status: string): string {
+  if (status === "running") return c.cyan(status);
+  if (status === "blocked") return c.yellow(status);
+  if (status === "done") return c.green(status);
+  if (status === "cancelled") return c.yellow(status);
+  return status;
+}
+
+function historyGlyph(outcome: string | null): string {
+  if (outcome === "succeeded" || outcome === "advanced-manually") return c.green(outcome);
+  if (outcome === "failed") return c.red("failed");
+  if (outcome === "cancelled") return c.yellow("cancelled");
+  return c.dim("pending");
 }
 
 /**

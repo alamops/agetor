@@ -2,7 +2,7 @@ import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN } from "./api-config.ts";
 import { db, dataDir, subagents } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
-import { initPipelineRunner } from "./pipeline-runner.ts";
+import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -144,6 +144,14 @@ export async function runDaemon(): Promise<void> {
   // task's boot-time orphan→ready transition reaches it too.
   initPipelineRunner();
   await reconcileOrphans();
+  // M16: same ordering as index.ts's desktop boot path — reconcile every
+  // pipeline parent left mid-flight by a prior crash/restart right after
+  // reconcileOrphans() resolves every step task's own orphan→ready
+  // transition. `daemonLog`, not `console.log` — see the rearm comment below.
+  const reconciledPipelineRunCount = await reconcilePipelineRuns();
+  if (reconciledPipelineRunCount > 0) {
+    daemonLog(`reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
+  }
   // Re-arm in-memory auto-resume timers for every fx task still carrying a
   // pending schedule — same rationale as index.ts's desktop boot path (see
   // its comment): an in-memory `setTimeout` handle never survives a process

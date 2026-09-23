@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgetorClient } from "../api-client.ts";
-import type { Pipeline, PipelineGraph, PipelineInput } from "../../shared/types.ts";
+import type { Pipeline, PipelineGraph, PipelineInput, PipelineRunState, Task } from "../../shared/types.ts";
 import { newStep } from "../../shared/pipeline.ts";
 
 /**
@@ -64,9 +64,12 @@ const {
   cmdPipeline,
   formatPipelineListRow,
   pipelineShowLines,
+  pipelineStatusLines,
   parsePipelineFile,
   parseExportFlags,
   parseImportFlags,
+  parseAdvanceFlags,
+  resolveStepRef,
 } = await import("./pipeline.ts");
 
 const flags = { json: false, plain: true, noDaemon: true } as unknown as Parameters<typeof cmdPipeline>[1];
@@ -111,6 +114,59 @@ function makeClient(over: Partial<AgetorClient> = {}): AgetorClient {
     listPipelines: async () => [],
     ...over,
   } as unknown as AgetorClient;
+}
+
+// ── task-scoped subcommand fixtures (retry/advance/restart/status) ────────
+// `resolveTask` (shared by every task-targeting command) resolves through
+// `client.listTasks()`, so these tests stub that instead of `listPipelines`.
+
+function task(over: Partial<Task> = {}): Task {
+  return {
+    id: "parent-1",
+    title: "Fix the login bug",
+    prompt: "p",
+    agent: "claude-code",
+    column: "running",
+    workdir: "/tmp",
+    isolation: "worktree",
+    taskType: "task",
+    archivedAt: null,
+    pendingInteractionCount: 0,
+    hasOpenableRun: false,
+    pipelineId: "pipe-1",
+    ...over,
+  } as unknown as Task;
+}
+
+function pipelineRun(overrides: Partial<PipelineRunState> = {}): PipelineRunState {
+  return {
+    pipelineId: "pipe-1",
+    pipelineName: "Bug fix flow",
+    snapshot: {
+      graph: {
+        steps: [
+          { id: "s1", name: "Investigate", instructions: "", agentProfileId: null, position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any" },
+          { id: "s2", name: "Fix", instructions: "", agentProfileId: null, position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any" },
+        ],
+        edges: [{ id: "e1", from: "s1", to: "s2", label: "" }],
+        startStepId: "s1",
+      },
+      maxSteps: 25,
+      profiles: {},
+      capturedAt: 0,
+    },
+    status: "blocked",
+    active: [{ stepId: "s2", taskId: "step-task-1", seq: 2 }],
+    joins: {},
+    blocked: [{ taskId: "step-task-1", stepId: "s2", kind: "handoff-missing", message: "no <handoff> block found" }],
+    history: [
+      { seq: 1, stepId: "s1", taskId: "step-task-0", startedAt: 0, endedAt: 1, outcome: "succeeded", handoff: null, nextStepIds: ["s2"] },
+    ],
+    stepCount: 2,
+    startedAt: 0,
+    endedAt: null,
+    ...overrides,
+  };
 }
 
 // ── formatPipelineListRow ────────────────────────────────────────────────
@@ -477,4 +533,272 @@ test("cmdPipeline import: an invalid file throws without calling createPipeline"
 test("cmdPipeline: an unrecognized subcommand throws", async () => {
   currentClient = makeClient();
   await expect(cmdPipeline(["frobnicate"], flags)).rejects.toThrow(/unknown pipeline subcommand: frobnicate/);
+});
+
+// ── resolveStepRef ───────────────────────────────────────────────────────
+
+test("resolveStepRef: resolves by exact step id", () => {
+  const g = pipelineRun().snapshot!.graph;
+  expect(resolveStepRef(g, "s2")).toBe("s2");
+});
+
+test("resolveStepRef: resolves by case-insensitive, trimmed name", () => {
+  const g = pipelineRun().snapshot!.graph;
+  expect(resolveStepRef(g, "  fix  ")).toBe("s2");
+});
+
+test("resolveStepRef: an unknown ref throws, listing every step name", () => {
+  const g = pipelineRun().snapshot!.graph;
+  expect(() => resolveStepRef(g, "nope")).toThrow(/unknown step "nope" — steps: Investigate, Fix/);
+});
+
+test("resolveStepRef: an ambiguous name throws listing the matches", () => {
+  const g: PipelineGraph = {
+    steps: [
+      newStep({ id: "a1", name: "Review" }),
+      newStep({ id: "a2", name: "review" }), // duplicate name at the graph level isn't possible via
+    ],                                        // validatePipelineGraph, but resolveStepRef stays defensive
+    edges: [],
+    startStepId: "a1",
+  };
+  expect(() => resolveStepRef(g, "review")).toThrow(/ambiguous step "review"/);
+});
+
+// ── parseAdvanceFlags ────────────────────────────────────────────────────
+
+test("parseAdvanceFlags: --next is repeatable", () => {
+  expect(parseAdvanceFlags(["--next", "Fix", "--next", "Verify"])).toEqual({
+    next: ["Fix", "Verify"],
+    finish: false,
+  });
+});
+
+test("parseAdvanceFlags: --finish sets the flag", () => {
+  expect(parseAdvanceFlags(["--finish"])).toEqual({ next: [], finish: true });
+});
+
+test("parseAdvanceFlags: --from <task-id>", () => {
+  expect(parseAdvanceFlags(["--from", "step-task-1"])).toEqual({ next: [], finish: false, from: "step-task-1" });
+});
+
+test("parseAdvanceFlags: no flags -> empty next, finish false, from undefined", () => {
+  expect(parseAdvanceFlags([])).toEqual({ next: [], finish: false });
+});
+
+// ── pipelineStatusLines ──────────────────────────────────────────────────
+
+test("pipelineStatusLines: a task that never ran its pipeline reports so", () => {
+  const lines = pipelineStatusLines(task({ pipelineRun: null }), []);
+  expect(lines.join("\n")).toContain("pipeline has never run");
+});
+
+test("pipelineStatusLines: status/progress header, blocked, active, and history sections", () => {
+  const t = task({ pipelineRun: pipelineRun() });
+  const lines = pipelineStatusLines(t, []);
+  const text = lines.join("\n");
+  expect(text).toContain("Fix the login bug");
+  expect(text).toContain("Bug fix flow");
+  expect(text).toContain("blocked");
+  expect(text).toContain("no <handoff> block found");
+  expect(text).toContain("active");
+  expect(text).toContain("Fix"); // active step s2's name
+  expect(text).toContain("history");
+  expect(text).toContain("Investigate"); // history entry s1's name
+  expect(text).toContain("succeeded");
+});
+
+test("pipelineStatusLines: an active step's own live column is shown when its step task is known", () => {
+  const t = task({ pipelineRun: pipelineRun() });
+  const steps = [task({ id: "step-task-1", column: "blocked", pipelineId: undefined })];
+  const lines = pipelineStatusLines(t, steps);
+  expect(lines.join("\n")).toContain("blocked");
+});
+
+// ── cmdPipeline: retry (task-scoped) ─────────────────────────────────────
+
+test("cmdPipeline retry: missing ref throws the usage error", async () => {
+  currentClient = makeClient({ listTasks: async () => [] });
+  await expect(cmdPipeline(["retry"], flags)).rejects.toThrow(/usage: agetor pipeline retry/);
+});
+
+test("cmdPipeline retry: a non-pipeline task throws", async () => {
+  currentClient = makeClient({ listTasks: async () => [task({ pipelineId: null })] });
+  await expect(cmdPipeline(["retry", "parent-1"], flags)).rejects.toThrow(/is not a pipeline task/);
+});
+
+test("cmdPipeline retry: resolves the task and calls retryPipeline", async () => {
+  const retried: string[] = [];
+  currentClient = makeClient({
+    listTasks: async () => [task()],
+    retryPipeline: async (id: string) => {
+      retried.push(id);
+      return task();
+    },
+  });
+  await cmdPipeline(["retry", "parent-1"], flags);
+  expect(retried).toEqual(["parent-1"]);
+  expect(outputs[0]).toContain("retrying pipeline");
+});
+
+test("cmdPipeline retry --json: prints the raw task", async () => {
+  const updated = task({ column: "running" });
+  currentClient = makeClient({ listTasks: async () => [task()], retryPipeline: async () => updated });
+  await cmdPipeline(["retry", "parent-1"], jsonFlags);
+  expect(jsonOutputs).toEqual([updated]);
+});
+
+// ── cmdPipeline: advance (task-scoped) ───────────────────────────────────
+
+test("cmdPipeline advance: missing ref throws the usage error", async () => {
+  currentClient = makeClient({ listTasks: async () => [] });
+  await expect(cmdPipeline(["advance"], flags)).rejects.toThrow(/usage: agetor pipeline advance/);
+});
+
+test("cmdPipeline advance: neither --next nor --finish throws the usage error", async () => {
+  currentClient = makeClient({ listTasks: async () => [task({ pipelineRun: pipelineRun() })] });
+  await expect(cmdPipeline(["advance", "parent-1"], flags)).rejects.toThrow(/usage: agetor pipeline advance/);
+});
+
+test("cmdPipeline advance: --next and --finish together throws", async () => {
+  currentClient = makeClient({ listTasks: async () => [task({ pipelineRun: pipelineRun() })] });
+  await expect(
+    cmdPipeline(["advance", "parent-1", "--next", "Fix", "--finish"], flags),
+  ).rejects.toThrow(/mutually exclusive/);
+});
+
+test("cmdPipeline advance: --finish sends nextStepIds: null", async () => {
+  const bodies: unknown[] = [];
+  currentClient = makeClient({
+    listTasks: async () => [task({ pipelineRun: pipelineRun() })],
+    advancePipeline: async (id: string, body: unknown) => {
+      bodies.push({ id, body });
+      return task();
+    },
+  });
+  await cmdPipeline(["advance", "parent-1", "--finish"], flags);
+  expect(bodies).toEqual([{ id: "parent-1", body: { nextStepIds: null } }]);
+  expect(outputs[0]).toContain("advanced pipeline");
+});
+
+test("cmdPipeline advance: --next <name> resolves against the run's snapshot graph", async () => {
+  const bodies: unknown[] = [];
+  currentClient = makeClient({
+    listTasks: async () => [task({ pipelineRun: pipelineRun() })],
+    advancePipeline: async (id: string, body: unknown) => {
+      bodies.push({ id, body });
+      return task();
+    },
+  });
+  await cmdPipeline(["advance", "parent-1", "--next", "Fix"], flags);
+  expect(bodies).toEqual([{ id: "parent-1", body: { nextStepIds: ["s2"] } }]);
+});
+
+test("cmdPipeline advance: --next by step id works too", async () => {
+  const bodies: unknown[] = [];
+  currentClient = makeClient({
+    listTasks: async () => [task({ pipelineRun: pipelineRun() })],
+    advancePipeline: async (id: string, body: unknown) => {
+      bodies.push({ id, body });
+      return task();
+    },
+  });
+  await cmdPipeline(["advance", "parent-1", "--next", "s2"], flags);
+  expect(bodies).toEqual([{ id: "parent-1", body: { nextStepIds: ["s2"] } }]);
+});
+
+test("cmdPipeline advance: an unknown --next step name throws, listing candidates", async () => {
+  currentClient = makeClient({ listTasks: async () => [task({ pipelineRun: pipelineRun() })] });
+  await expect(cmdPipeline(["advance", "parent-1", "--next", "Nope"], flags)).rejects.toThrow(
+    /unknown step "Nope" — steps: Investigate, Fix/,
+  );
+});
+
+test("cmdPipeline advance: --from is forwarded as fromTaskId", async () => {
+  const bodies: unknown[] = [];
+  currentClient = makeClient({
+    listTasks: async () => [task({ pipelineRun: pipelineRun() })],
+    advancePipeline: async (id: string, body: unknown) => {
+      bodies.push({ id, body });
+      return task();
+    },
+  });
+  await cmdPipeline(["advance", "parent-1", "--finish", "--from", "step-task-1"], flags);
+  expect(bodies).toEqual([{ id: "parent-1", body: { nextStepIds: null, fromTaskId: "step-task-1" } }]);
+});
+
+test("cmdPipeline advance: --next before a first Run (no snapshot) throws", async () => {
+  currentClient = makeClient({ listTasks: async () => [task({ pipelineRun: null })] });
+  await expect(cmdPipeline(["advance", "parent-1", "--next", "Fix"], flags)).rejects.toThrow(
+    /no run snapshot yet/,
+  );
+});
+
+// ── cmdPipeline: restart (task-scoped) ───────────────────────────────────
+
+test("cmdPipeline restart: missing ref throws the usage error", async () => {
+  currentClient = makeClient({ listTasks: async () => [] });
+  await expect(cmdPipeline(["restart"], flags)).rejects.toThrow(/usage: agetor pipeline restart/);
+});
+
+test("cmdPipeline restart: resolves the task and calls restartPipeline", async () => {
+  const restarted: string[] = [];
+  currentClient = makeClient({
+    listTasks: async () => [task()],
+    restartPipeline: async (id: string) => {
+      restarted.push(id);
+      return { runId: "run-1" };
+    },
+  });
+  await cmdPipeline(["restart", "parent-1"], flags);
+  expect(restarted).toEqual(["parent-1"]);
+  expect(outputs[0]).toContain("restarted pipeline");
+  expect(outputs[0]).toContain("run-1".slice(0, 8));
+});
+
+test("cmdPipeline restart: pending: true prints the still-launching message", async () => {
+  currentClient = makeClient({
+    listTasks: async () => [task()],
+    restartPipeline: async () => ({ runId: "run-1", pending: true as const }),
+  });
+  await cmdPipeline(["restart", "parent-1"], flags);
+  expect(outputs[0]).toContain("restarting pipeline");
+  expect(outputs[0]).toContain("still in progress");
+});
+
+test("cmdPipeline restart --json: prints the raw { runId, pending? } response", async () => {
+  const res = { runId: "run-1", pending: true as const };
+  currentClient = makeClient({ listTasks: async () => [task()], restartPipeline: async () => res });
+  await cmdPipeline(["restart", "parent-1"], jsonFlags);
+  expect(jsonOutputs).toEqual([res]);
+});
+
+// ── cmdPipeline: status (task-scoped) ────────────────────────────────────
+
+test("cmdPipeline status: missing ref throws the usage error", async () => {
+  currentClient = makeClient({ listTasks: async () => [] });
+  await expect(cmdPipeline(["status"], flags)).rejects.toThrow(/usage: agetor pipeline status/);
+});
+
+test("cmdPipeline status: resolves the task, fetches the pipeline run, and renders pipelineStatusLines", async () => {
+  const t = task({ pipelineRun: pipelineRun() });
+  currentClient = makeClient({
+    listTasks: async () => [t],
+    getPipelineRun: async (id: string) => {
+      expect(id).toBe("parent-1");
+      return { task: t, steps: [] };
+    },
+  });
+  await cmdPipeline(["status", "parent-1"], flags);
+  expect(outputs).toEqual(pipelineStatusLines(t, []));
+});
+
+test("cmdPipeline status --json: prints { task, steps }", async () => {
+  const t = task({ pipelineRun: pipelineRun() });
+  const steps = [task({ id: "step-task-1" })];
+  currentClient = makeClient({
+    listTasks: async () => [t],
+    getPipelineRun: async () => ({ task: t, steps }),
+  });
+  await cmdPipeline(["status", "parent-1"], jsonFlags);
+  expect(jsonOutputs).toEqual([{ task: t, steps }]);
 });

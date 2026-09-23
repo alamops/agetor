@@ -188,6 +188,30 @@ test("insert/update throw a plain Error on an invalid graph", () => {
   expect(pipelines.get(ok.id)?.graph.steps.length).toBe(2);
 });
 
+test("pipelines.get(): a stored graph that parses but fails validatePipelineGraph is returned unmodified, not silently emptied (m21)", () => {
+  // insert()/update() still validate and reject a bad graph outright (the
+  // test above) — this covers the OTHER way a bad graph can reach the
+  // column: on-disk corruption, or a shape a newer/older validator no
+  // longer accepts. Written directly via SQL, bypassing pipelines.update's
+  // own validation, to simulate exactly that.
+  const p = pipelines.insert({ name: "Drifted Graph", graph: makeGraph() });
+  const dupNameGraph = { steps: [{ id: "s1", name: "Dup" }, { id: "s2", name: "dup" }], edges: [], startStepId: null } as unknown as PipelineGraph;
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify(dupNameGraph), p.id]);
+
+  // Returned AS-IS rather than collapsed to the empty graph: the editor
+  // reads this value straight through, and an editor session that opens,
+  // makes an unrelated change, and saves would otherwise silently overwrite
+  // the user's real graph with nothing.
+  expect(pipelines.get(p.id)?.graph).toEqual(dupNameGraph);
+});
+
+test("pipelines.get(): unparseable JSON in the graph column collapses to the empty graph (m21)", () => {
+  const p = pipelines.insert({ name: "Broken JSON Graph", graph: makeGraph() });
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, ["{not json", p.id]);
+
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+});
+
 test("insert normalizes the graph, filling defaults for omitted step fields", () => {
   const rawGraph = {
     steps: [
@@ -432,6 +456,77 @@ test("tasks.list() folds each step task's pending-interaction count onto its par
   expect(byId.get(plainId)?.pendingInteractionCount).toBe(1);
 });
 
+test("tasks.get() aggregates a pipeline parent's step pending-interaction counts, same as tasks.list() (M17)", () => {
+  const pipeline = pipelines.insert({ name: "M17 Get Aggregation", graph: makeGraph() });
+  const parentId = randomUUID();
+  tasks.insert(makeTaskRow(parentId, { pipelineId: pipeline.id }));
+
+  const step1Id = randomUUID();
+  const step2Id = randomUUID();
+  tasks.insert(makeTaskRow(step1Id, { pipelineParentId: parentId, pipelineStepId: "step-1" }));
+  tasks.insert(makeTaskRow(step2Id, { pipelineParentId: parentId, pipelineStepId: "step-2" }));
+
+  // No interactions yet: a single-task read agrees with the batched one.
+  expect(tasks.get(parentId)?.pendingInteractionCount).toBe(0);
+
+  registerTmuxPrompt({
+    taskId: step1Id,
+    runId: "get-run-1",
+    paneText: "pane",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "get-fp-1",
+  });
+  registerTmuxPrompt({
+    taskId: step2Id,
+    runId: "get-run-2",
+    paneText: "pane",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "get-fp-2",
+  });
+  registerTmuxPrompt({
+    taskId: step2Id,
+    runId: "get-run-2",
+    paneText: "pane 2",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "get-fp-3",
+  });
+
+  // `tasks.get` aggregates the same way `tasks.list()`'s batched pass does
+  // (1 + 2 = 3), even though the parent has no interactions of its own.
+  expect(tasks.get(parentId)?.pendingInteractionCount).toBe(3);
+  // Each step's own single-task read is unaffected — aggregation is additive
+  // onto the parent, not a transfer off the step.
+  expect(tasks.get(step1Id)?.pendingInteractionCount).toBe(1);
+  expect(tasks.get(step2Id)?.pendingInteractionCount).toBe(2);
+  // And the aggregated list() view agrees with the single-task get() view.
+  const listed = new Map(tasks.list().map((t) => [t.id, t]));
+  expect(tasks.get(parentId)?.pendingInteractionCount).toBe(listed.get(parentId)?.pendingInteractionCount);
+});
+
+test("tasks.get() does NOT aggregate step counts onto a row with no pipeline_id set (M17 perf gate)", () => {
+  // A row with children pointing at it via `pipelineParentId` but no
+  // `pipelineId` of its own shouldn't happen for a real pipeline parent in
+  // practice, but `tasks.get`'s aggregation is deliberately gated on
+  // `pipeline_id` (cheap to check, always set on a real parent) rather than
+  // "does anything point at me" (which would cost every ordinary task's
+  // `get` an extra query) — this pins that gate.
+  const parentId = randomUUID();
+  tasks.insert(makeTaskRow(parentId));
+  const stepId = randomUUID();
+  tasks.insert(makeTaskRow(stepId, { pipelineParentId: parentId, pipelineStepId: "step-1" }));
+
+  registerTmuxPrompt({
+    taskId: stepId,
+    runId: "get-run-3",
+    paneText: "pane",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "get-fp-4",
+  });
+
+  expect(tasks.get(parentId)?.pendingInteractionCount).toBe(0);
+  expect(tasks.get(stepId)?.pendingInteractionCount).toBe(1);
+});
+
 // ---------------------------------------------------------------------------
 // parsePipelineRunState
 // ---------------------------------------------------------------------------
@@ -530,13 +625,71 @@ test("parsePipelineRunState: junk entries are dropped from active/blocked/histor
   expect(parsed?.joins.s2?.arrivals).toEqual([{ fromStepId: "s1", seq: 1, handoff: null }]);
 });
 
-test("parsePipelineRunState: an invalid snapshot.graph nulls the whole snapshot but keeps the rest of the run", () => {
+test("parsePipelineRunState: a blocked entry's `pending` and the run's `capExtensions` round-trip, junk is dropped", () => {
+  const raw = {
+    pipelineId: "pipe-1",
+    capExtensions: 2,
+    blocked: [
+      {
+        // valid `pending` — its `arrivals` reuse the same junk-filtering as
+        // `joins` above (a malformed arrival is dropped, a valid one kept).
+        taskId: null, stepId: "s1", kind: "step-cap", message: "capped",
+        pending: {
+          stepId: "s1",
+          arrivals: [{ fromStepId: "s0", seq: 1, handoff: null }, { fromStepId: "s0" }, "junk"],
+        },
+      },
+      {
+        // `pending` missing its own `stepId` -> the whole `pending` sub-shape
+        // is dropped (never persisted half-valid), the block itself is kept.
+        taskId: null, stepId: "s2", kind: "join-incomplete", message: "waiting",
+        pending: { arrivals: [] },
+      },
+      {
+        // `pending` isn't even an object -> dropped, block kept.
+        taskId: null, stepId: "s3", kind: "join-incomplete", message: "waiting too",
+        pending: "not-an-object",
+      },
+    ],
+  };
+
+  const parsed = parsePipelineRunState(JSON.stringify(raw));
+  expect(parsed?.capExtensions).toBe(2);
+  expect(parsed?.blocked).toEqual([
+    {
+      taskId: null, stepId: "s1", kind: "step-cap", message: "capped",
+      pending: { stepId: "s1", arrivals: [{ fromStepId: "s0", seq: 1, handoff: null }] },
+    },
+    { taskId: null, stepId: "s2", kind: "join-incomplete", message: "waiting" },
+    { taskId: null, stepId: "s3", kind: "join-incomplete", message: "waiting too" },
+  ]);
+
+  // capExtensions omits the key (not just nulls it) when absent or invalid,
+  // so a pre-existing equality check against a run with no `capExtensions`
+  // field never sees a stray new key.
+  expect(parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1" }))?.capExtensions).toBeUndefined();
+  expect(
+    parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", capExtensions: -1 }))?.capExtensions,
+  ).toBeUndefined();
+  expect(
+    parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", capExtensions: "nope" }))?.capExtensions,
+  ).toBeUndefined();
+});
+
+test("parsePipelineRunState: a snapshot.graph that's shape-valid but semantically invalid is trusted as-is (m18 — no deep re-validation on read)", () => {
+  // A run snapshot is captured exactly once, at run-start, by `buildSnapshot`'s
+  // own `validatePipelineGraph` call — nothing ever mutates it afterward, so
+  // `sanitizeRunSnapshot` no longer re-runs full validation on every read.
+  // Duplicate step names would fail `validatePipelineGraph`, but the shape
+  // itself (`steps`/`edges` arrays) is fine, so it's trusted through
+  // unchanged rather than collapsed to `null`.
+  const dupNameGraph = { steps: [{ id: "s1", name: "Dup" }, { id: "s2", name: "dup" }], edges: [], startStepId: null } as unknown as PipelineGraph;
   const raw = {
     pipelineId: "pipe-1",
     pipelineName: "My Pipe",
     status: "running",
     snapshot: {
-      graph: { steps: [{ id: "s1", name: "Dup" }, { id: "s2", name: "dup" }], edges: [], startStepId: null },
+      graph: dupNameGraph,
       maxSteps: 10,
       profiles: { "profile-1": { id: "profile-1", name: "Agent" } },
       capturedAt: 123,
@@ -545,7 +698,9 @@ test("parsePipelineRunState: an invalid snapshot.graph nulls the whole snapshot 
   const parsed = parsePipelineRunState(JSON.stringify(raw));
   expect(parsed?.pipelineName).toBe("My Pipe");
   expect(parsed?.status).toBe("running");
-  expect(parsed?.snapshot).toBeNull(); // dup step names -> validatePipelineGraph rejects it
+  expect(parsed?.snapshot?.graph).toEqual(dupNameGraph);
+  expect(parsed?.snapshot?.maxSteps).toBe(10);
+  expect(parsed?.snapshot?.capturedAt).toBe(123);
 
   const validGraph = makeGraph();
   const validRaw = {
@@ -561,4 +716,28 @@ test("parsePipelineRunState: an invalid snapshot.graph nulls the whole snapshot 
   expect(validParsed?.snapshot?.profiles).toEqual(
     { "profile-1": { id: "profile-1" } } as unknown as PipelineRunSnapshotProfiles,
   );
+});
+
+test("parsePipelineRunState: a snapshot.graph that isn't even shape-valid (non-array steps/edges, or not an object) nulls the whole snapshot but keeps the rest of the run", () => {
+  const rawNonArraySteps = {
+    pipelineId: "pipe-1",
+    status: "running",
+    snapshot: { graph: { steps: "nope", edges: [], startStepId: null }, maxSteps: 10, profiles: {}, capturedAt: 1 },
+  };
+  const parsedNonArraySteps = parsePipelineRunState(JSON.stringify(rawNonArraySteps));
+  expect(parsedNonArraySteps?.snapshot).toBeNull();
+  expect(parsedNonArraySteps?.pipelineId).toBe("pipe-1");
+  expect(parsedNonArraySteps?.status).toBe("running");
+
+  const rawNonArrayEdges = {
+    pipelineId: "pipe-1",
+    snapshot: { graph: { steps: [], edges: "nope", startStepId: null }, maxSteps: 10, profiles: {}, capturedAt: 1 },
+  };
+  expect(parsePipelineRunState(JSON.stringify(rawNonArrayEdges))?.snapshot).toBeNull();
+
+  const rawNonObjectGraph = {
+    pipelineId: "pipe-1",
+    snapshot: { graph: "not-an-object", maxSteps: 10, profiles: {}, capturedAt: 1 },
+  };
+  expect(parsePipelineRunState(JSON.stringify(rawNonObjectGraph))?.snapshot).toBeNull();
 });

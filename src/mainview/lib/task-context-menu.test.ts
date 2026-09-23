@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "./task-context-menu.ts";
-import type { Task, TaskFxRecovery } from "../../shared/types.ts";
+import type { PipelineRunState, Task, TaskFxRecovery } from "../../shared/types.ts";
 
 /** Minimal hand-built Task fixture, mirroring `task-unread.test.ts`'s
  *  `makeTaskRow` for the required fields. Defaults to a fresh backlog task
@@ -486,6 +486,59 @@ describe("buildTaskContextMenu", () => {
       const task = makeTask({ pipelineParentId: "pipe-parent-1" });
       const entries = buildTaskContextMenu(task, { isOpen: false });
       expect(entries[0]).toEqual({ action: "open", label: "Open details", group: "primary" });
+    });
+
+    // M15 (review): a pipeline parent with run history is "openable" — Run
+    // must not show alongside Open pipeline once there's something to open.
+    function pipelineRun(overrides: Partial<PipelineRunState> = {}): PipelineRunState {
+      return {
+        pipelineId: "pipe-1",
+        pipelineName: "Pipe",
+        snapshot: null,
+        status: "idle",
+        active: [],
+        joins: {},
+        blocked: [],
+        history: [],
+        stepCount: 0,
+        startedAt: null,
+        endedAt: null,
+        ...overrides,
+      };
+    }
+
+    test("M15: a pipeline parent with pipelineRun.history.length > 0 omits 'start' — Retry/Restart live in the run view", () => {
+      const task = makeTask({
+        pipelineId: "pipe-1",
+        column: "ready",
+        pipelineRun: pipelineRun({
+          status: "done",
+          history: [
+            { seq: 1, stepId: "s1", taskId: "step-task-1", startedAt: Date.now(), endedAt: Date.now(), outcome: "succeeded", handoff: null, nextStepIds: [] },
+          ],
+        }),
+      });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual(["open-pipeline", "diff", "open-in-finder", "delete"]);
+      expect(actions(entries)).not.toContain("start");
+    });
+
+    test("M15: an idle pipeline parent (pipelineRun set, empty history) still shows 'start'", () => {
+      const task = makeTask({
+        pipelineId: "pipe-1",
+        pipelineRun: pipelineRun(),
+      });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual(["open-pipeline", "start", "diff", "open-in-finder", "delete"]);
+    });
+
+    test("M15: a pipeline parent with no pipelineRun at all (never run) still shows 'start'", () => {
+      const task = makeTask({ pipelineId: "pipe-1", pipelineRun: null });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual(["open-pipeline", "start", "diff", "open-in-finder", "delete"]);
     });
   });
 });

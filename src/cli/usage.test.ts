@@ -69,12 +69,33 @@ test("pipeline: 'pipelines' aliases to 'pipeline', with export/import subcommand
   expect(canonical("pipelines")).toBe("pipeline");
   expect(USAGE["pipeline"]).toBeDefined();
   expect(USAGE["pipeline"]!.split("\n", 1)[0]).toBe(
-    "usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file>] | import <file> [--name <n>]>",
+    "usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file>] | import <file> [--name <n>] | retry <task> | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>",
   );
   expect(helpFor("pipelines", "export")).toBe(USAGE["pipeline export"]);
   expect(helpFor("pipeline", "import")).toBe(USAGE["pipeline import"]);
   expect(helpFor("pipeline", "rm")).toBe(USAGE["pipeline"]); // unknown sub → command block
   expect(usageError("pipeline").message).toBe(USAGE["pipeline"]!.split("\n", 1)[0]!);
+});
+
+// m7 review fix: retry/advance/restart/status are task-scoped subcommands
+// (control a pipeline TASK's run), distinct from the pipeline-template
+// subcommands above — each gets its own USAGE block, same shape as
+// "pipeline export"/"pipeline import".
+test("pipeline: retry/advance/restart/status each have their own subcommand block", () => {
+  for (const sub of ["retry", "advance", "restart", "status"]) {
+    const block = USAGE[`pipeline ${sub}`];
+    expect(block, sub).toBeDefined();
+    expect(block!.split("\n", 1)[0]!.startsWith(`usage: agetor pipeline ${sub} <task-id>`), sub).toBe(true);
+    expect(helpFor("pipeline", sub)).toBe(block);
+    expect(helpFor("pipelines", sub)).toBe(block); // alias resolves too
+  }
+});
+
+// m7 review fix: `agetor cancel` routes a pipeline task through the pipeline
+// cancel path instead of the generic "task is not running" error — see
+// lifecycle.test.ts / cmdCancel. Documented here too.
+test("cancel usage mentions pipeline-task routing", () => {
+  expect(USAGE["cancel"]).toContain("pipeline task");
 });
 
 // ls/add doc lines reference the new --steps / --pipeline flags — a plain

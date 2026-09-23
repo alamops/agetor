@@ -28,8 +28,8 @@ import {
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
-import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep } from "./pipeline-runner.ts";
+import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
@@ -4321,8 +4321,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // teardown is what removes the shared worktree; deleting a step
           // out from under a running pipeline would strand the parent's
           // `pipelineRun` state. Delete/archive the pipeline task instead.
+          // M7: exempt an ORPHANED step (its parent row no longer exists) —
+          // there is no pipeline task left to redirect to, so refusing here
+          // would leave the row permanently undeletable (orphan cleanup).
           const existing = tasks.get(req.params.id);
-          if (existing && isPipelineStepTask(existing)) {
+          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
             return json(
               { error: "step task belongs to a pipeline — act on the pipeline task" },
               { status: 409, headers: corsHeaders(req) },
@@ -4351,9 +4354,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         POST: authed(async (req) => {
           // Same pipeline-step guard as DELETE /tasks/:id above — a step
           // task's archive/unarchive lifecycle is owned by its pipeline
-          // parent (D9, docs/plans/pipelines.md).
+          // parent (D9, docs/plans/pipelines.md). M7: same orphan exemption
+          // too.
           const existing = tasks.get(req.params.id);
-          if (existing && isPipelineStepTask(existing)) {
+          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
             return json(
               { error: "step task belongs to a pipeline — act on the pipeline task" },
               { status: 409, headers: corsHeaders(req) },
@@ -4510,6 +4514,34 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return "error" in result
             ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // M15: restart a pipeline run that's already finished (`done` in
+      // `pipelineRun.status`) — plain `POST /tasks/:id/start` on a pipeline
+      // parent still routes through `startTaskInner` → `startPipelineRun(task)`
+      // with no `restart` flag, which `startPipelineRun` now errors out on
+      // once a run is `done` (there's nothing left `active`/blocked to retry
+      // and no fresh run was explicitly asked for) — this route is the
+      // explicit "yes, run it again from the top" action. 404 for an unknown
+      // task, 400 for a task that was never bound to a pipeline at all
+      // (mirrors `GET /tasks/:id/pipeline`'s own 400), 409 for every other
+      // failure `startPipelineRun` reports (already running, snapshot
+      // build failed, …).
+      "/tasks/:id/pipeline/restart": {
+        POST: authed(async (req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (!task.pipelineId) {
+            return json({ error: "task is not a pipeline task" }, { status: 400, headers: corsHeaders(req) });
+          }
+          server.timeout(req, 0);
+          const result = await startPipelineRun(task, { restart: true });
+          return "error" in result
+            ? json({ error: result.error }, { status: 409, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
         }),
       },
 

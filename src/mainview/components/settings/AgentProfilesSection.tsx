@@ -142,7 +142,11 @@ export function AgentProfilesSection({ harnesses }: Props) {
       )}
 
       {form && (
+        // Keyed by the profile being edited (or "new" for a create) so
+        // switching Edit from profile A straight to profile B remounts the
+        // form instead of reusing A's stale internal state (nit7).
         <AgentProfileForm
+          key={form.id ?? "new"}
           profileId={form.id}
           onSaved={closeForm}
           onCancel={closeForm}

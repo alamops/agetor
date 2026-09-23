@@ -135,6 +135,17 @@ export async function cmdCancel(args: string[], flags: Flags): Promise<void> {
   if (!ref) throw usageError("cancel");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
+  // A pipeline (parent) task never carries its own `runId` — only its hidden
+  // step tasks do, one at a time — so the generic `!task.runId` check below
+  // always fails for one even while its run is genuinely active (`column`
+  // mirrors `pipelineRun.status`). Route it to the pipeline cancel route
+  // instead, which stops every currently-active step execution.
+  if (task.pipelineId) {
+    const res = await client.cancelPipeline(task.id);
+    if (flags.json) return printJson(res);
+    out(`${c.yellow("■")} cancel requested for ${c.dim(task.id.slice(0, 8))}`);
+    return;
+  }
   // Stop is only meaningful while active (running/blocked) — same as the app.
   if (runControl(task) !== "stop" || !task.runId) {
     throw new Error("task is not running");

@@ -1270,9 +1270,12 @@ function makeFakeAgent(
     // block (see docs/plans/pipelines.md D3, `src/shared/pipeline.ts`'s
     // `parseHandoff`) so `pipeline-runner.test.ts` can drive the runner's
     // settle/resolve/join logic end to end without a real claude CLI.
-    // Deliberately checked BEFORE every other marker branch below (per its
-    // own doc comment) so it always wins if a test prompt somehow carries
-    // more than one marker. `lastFakeHandoffSuffix` finds the LAST
+    // Checked after the api-error/session-died/unknown-command branches
+    // above (this fake driver has no reason to special-case pipeline
+    // handoffs ahead of those three — they're mutually exclusive env-var
+    // toggles, this is a prompt-marker), but before every OTHER marker
+    // branch further down, so it wins if a test prompt somehow carries more
+    // than one marker. `lastFakeHandoffSuffix` finds the LAST
     // occurrence in the prompt (a step's own instructions can override a
     // default the overall goal text carries) and extracts its optional
     // `:<token>` suffix — `done` (or no suffix) emits a valid terminal

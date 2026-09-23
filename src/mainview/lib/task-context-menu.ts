@@ -68,7 +68,15 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   const archived = task.archivedAt != null;
   const active = task.column === "running" || task.column === "blocked";
   const awaiting = task.pendingInteractionCount > 0 || task.column === "blocked";
-  const openable = task.hasOpenableRun;
+  // A pipeline PARENT never gets its own `runId`/`hasOpenableRun` — only its
+  // step tasks do (see `isPipelineParent` below) — so `hasOpenableRun` alone
+  // would forever gate the "Run" entry open even once the pipeline has
+  // actually executed. `hasOpenablePipelineRun` is the parent-shaped
+  // equivalent: once any step execution has landed in history, there's
+  // something worth opening the run view for, and Retry/Restart live there
+  // instead of the card (M15, docs/plans/pipelines.md review).
+  const hasOpenablePipelineRun = !!task.pipelineRun && task.pipelineRun.history.length > 0;
+  const openable = task.hasOpenableRun || hasOpenablePipelineRun;
   // A pipeline PARENT task (`pipelineId` set) opens the full-page run view
   // instead of the run panel — "Open pipeline" replaces "Open details" as
   // the first entry (App.tsx maps it to `openPipelineRun`). A hidden STEP

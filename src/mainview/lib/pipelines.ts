@@ -97,6 +97,16 @@ export function usePipelines(opts?: { enabled?: boolean }): {
   };
 }
 
+/**
+ * Module-level refetch, callable from outside a `usePipelines()` consumer
+ * (e.g. `App.tsx` after creating a pipeline task, to pick up the bound
+ * pipeline's freshly-bumped `taskCount`) — identical to the `refresh()`
+ * returned by the hook, just reachable without mounting one.
+ */
+export function refreshPipelines(): Promise<void> {
+  return fetchPipelines();
+}
+
 // ---------------------------------------------------------------------------
 // Visual state derivation
 // ---------------------------------------------------------------------------

@@ -6,11 +6,20 @@ const BELL = String.fromCharCode(7);
  * Map a global event to a desktop notification — only for the given task, and
  * only for state changes worth interrupting the user (terminal status + the
  * "needs you" block). Returns null otherwise.
+ *
+ * `opts.hidden` — true when `taskId` names a pipeline's hidden step task
+ * (`pipelineParentId` set, docs/plans/pipelines.md D11) — suppresses the
+ * notification even for a step task the caller explicitly resolved (e.g.
+ * `agetor logs <stepTaskId> --notify`): the pipeline's parent task's own
+ * `column`/pipeline-run transitions already cover the same information at
+ * the level a step id, an implementation detail, isn't meaningful outside.
  */
 export function notifyFor(
   e: GlobalEvent,
   taskId: string,
+  opts?: { hidden?: boolean },
 ): { title: string; body: string } | null {
+  if (opts?.hidden) return null;
   const short = taskId.slice(0, 8);
   if (e.kind === "run-status" && e.taskId === taskId) {
     if (e.status === "succeeded") return { title: "Agetor — succeeded", body: short };

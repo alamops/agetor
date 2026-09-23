@@ -40,6 +40,7 @@ import {
   cascadePipelineDelete,
   initialPipelineRunState,
   startPipelineRun,
+  withPipelineLock,
 } from "./pipeline-runner.ts";
 
 /**
@@ -434,6 +435,21 @@ function updateColumn(
  */
 export function pipelineUpdateColumn(taskId: string, runId: string | null, next: ColumnId): void {
   updateColumn(taskId, runId, next, "pipeline");
+}
+
+/**
+ * M7: true when `task` is a pipeline step row (`pipelineParentId` set) whose
+ * parent pipeline task no longer exists — the parent row was itself deleted
+ * (`deleteTask` cascades every step first, but a step can also be left
+ * behind by a bug, a partial cascade failure, or on-disk state predating
+ * this fix) with no legitimate way left to "act on the pipeline task
+ * instead". The ordinary step-task guards on `deleteTask`/`archiveTask` (and
+ * `server.ts`'s matching route checks) exempt exactly this case: routing the
+ * user at a parent that's already gone would leave the orphaned step
+ * permanently undeletable/unarchivable.
+ */
+export function isOrphanedPipelineStep(task: Task): boolean {
+  return task.pipelineParentId != null && tasks.get(task.pipelineParentId) == null;
 }
 
 /**
@@ -1167,6 +1183,25 @@ export function agentProfileSnapshotDrifted(
 }
 
 /**
+ * True when `taskId` currently has a live run in flight — mirrors the exact
+ * check `startTask` itself uses to refuse a double-start: either an
+ * `active`-registered handle for the task's current `runId`, or a spawn
+ * claim still held in `startingTaskIds` (the window between `startTask`
+ * minting the claim and the spawn actually registering — including the
+ * bounded-pending continuation described in `startingTaskIds`'s own doc,
+ * where the HTTP response has already returned but the real spawn hasn't
+ * settled yet). Callers that need "is this task actually busy right now" —
+ * as opposed to `task.column === 'running'`, which can lag a beat behind a
+ * just-started or just-settled spawn — should use this instead of
+ * re-deriving the same check inline.
+ */
+export function isTaskRunLive(taskId: string): boolean {
+  if (startingTaskIds.has(taskId)) return true;
+  const task = tasks.get(taskId);
+  return !!(task?.runId && active.has(task.runId));
+}
+
+/**
  * Start (or restart) a task's agent. Bounded per `SPAWN_RESPONSE_BUDGET_MS`
  * (see that constant's doc): once the run row exists, the task has flipped
  * to `running`, and the initial prompt has been echoed as a `user` event,
@@ -1306,6 +1341,32 @@ async function startTaskInner(
   // out" guarantee holds with no exception.
   if (status.loggedIn === false) {
     return { error: `${harness.label} isn't logged in — ${status.authHelp ?? "run its login command"}` };
+  }
+
+  // M6: a worktree-isolated pipeline step task shares its parent's worktree
+  // (D2, docs/plans/pipelines.md) — `launchStep` copies `worktreePath`/
+  // `branch` straight from the parent row at insert time, and the parent's
+  // own `startPipelineRun` is what materializes that worktree, once, up
+  // front. Such a step task must NEVER fall through to `prepareWorkdir`
+  // below on its own: `prepareWorkdir`'s reuse branch only fires when
+  // `worktreePath` is both set AND present on disk — anything else (a step
+  // row inserted with no worktree yet, or one whose directory has since
+  // been removed, e.g. a stray retry racing the parent's own teardown)
+  // falls through to its "materialize a brand-new worktree" path, which
+  // would silently give this ONE step its own private checkout instead of
+  // the shared one every other step (and the parent) is using. Refuse
+  // instead — the pipeline task itself is what re-materializes the shared
+  // worktree on Run/Retry. Gated on `isolation === "worktree"`: an
+  // `isolation: "none"` step legitimately carries a `null` `worktreePath`
+  // forever (copied from an equally `null` parent) and `prepareWorkdir`
+  // never reaches the worktree-creation branch for it at all — that's not
+  // a missing worktree, it's the correct shape for that isolation mode.
+  if (
+    task.pipelineParentId
+    && task.isolation === "worktree"
+    && (!task.worktreePath || !existsSync(task.worktreePath))
+  ) {
+    return { error: "step task's worktree is missing — run the pipeline task instead" };
   }
 
   // Pass the branches other tasks have pinned. If materializing this task's
@@ -5839,7 +5900,10 @@ export async function archiveTask(
   // archiving the whole pipeline. `server.ts`'s route already 409s a direct
   // step-archive request before ever reaching here; this is defense in
   // depth against any other internal caller making the same mistake.
-  if (task.pipelineParentId && !opts?.fromPipeline) {
+  // M7: exempt an ORPHANED step (its parent row no longer exists) — there is
+  // no pipeline task left to "act on instead", so refusing here would leave
+  // it permanently unarchivable.
+  if (task.pipelineParentId && !opts?.fromPipeline && !isOrphanedPipelineStep(task)) {
     return { error: `step task belongs to a pipeline — act on the pipeline task ${task.pipelineParentId} instead` };
   }
   if (task.column !== "done" && !opts?.force) {
@@ -5904,9 +5968,12 @@ export async function archiveTask(
   // step task first — `cascadePipelineArchive` is best-effort per step (a
   // step that fails to archive is logged, not thrown), so one stuck step
   // never blocks the parent's own archive below. No-op for an ordinary task
-  // (`pipelineId` null).
+  // (`pipelineId` null). M7: run under this parent's `withPipelineLock` so
+  // the cascade can't interleave its per-step archive calls with a live
+  // settle/advance event (pipeline-runner.ts's own `runExclusive`) racing to
+  // read-modify-write the same `pipelineRun` JSON blob.
   if (updated.pipelineId) {
-    await cascadePipelineArchive(updated.id);
+    await withPipelineLock(updated.id, () => cascadePipelineArchive(updated.id));
   }
   // Turn queues are cheap in-memory bookkeeping (no I/O), so they're dropped
   // inline rather than folded into the deferred job.
@@ -5993,12 +6060,18 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
 export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean }): Promise<void> {
   const task = tasks.get(taskId);
   if (!task) return;
-  if (task.pipelineParentId && !opts?.fromPipeline) {
+  // M7: exempt an ORPHANED step (its parent row no longer exists) — same
+  // rationale as the matching exemption in `archiveTask`.
+  if (task.pipelineParentId && !opts?.fromPipeline && !isOrphanedPipelineStep(task)) {
     console.warn(`[agetor] refusing to delete pipeline step task ${taskId} directly — delete the pipeline task ${task.pipelineParentId} instead`);
     return;
   }
   if (task.pipelineId) {
-    await cascadePipelineDelete(taskId);
+    // M7: run under this parent's `withPipelineLock` so the cascade can't
+    // interleave its per-step delete calls with a live settle/advance event
+    // (pipeline-runner.ts's own `runExclusive`) racing to read-modify-write
+    // the same `pipelineRun` JSON blob.
+    await withPipelineLock(taskId, () => cascadePipelineDelete(taskId));
   }
   if (task.runId && active.has(task.runId)) active.get(task.runId)?.kill();
   // Resolve any pending interactions for this task so hook scripts / MCP

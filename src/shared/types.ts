@@ -575,6 +575,14 @@ export interface PipelineBlock {
   stepId: string | null;
   kind: PipelineBlockKind;
   message: string;
+  /** The run-level launch (re-attempting a step, or advancing past a step
+   *  cap) this block is waiting to retry — populated only on a run-level
+   *  block (`taskId`/`stepId` both null: `step-cap`/`profile-missing`/
+   *  `join-incomplete`), so a Retry action can re-attempt the exact same
+   *  launch instead of re-deriving it. `stepId` here is the step the pending
+   *  launch targets; `arrivals` is the join state (if any) it would launch
+   *  with. */
+  pending?: { stepId: string; arrivals: PipelineJoinArrival[] };
 }
 
 /**
@@ -634,6 +642,12 @@ export interface PipelineRunState {
   stepCount: number;
   startedAt: number | null;
   endedAt: number | null;
+  /** Times a `step-cap` block has been extended via Retry. Each extension
+   *  doubles the running allowance: the effective cap is
+   *  `snapshot.maxSteps * (1 + capExtensions)` — see {@link
+   *  effectiveStepCap} in `src/shared/pipeline.ts`. Undefined/0 before the
+   *  first extension. */
+  capExtensions?: number;
 }
 
 /** Field length/count caps enforced by both the server routes and the
@@ -651,6 +665,18 @@ export const PIPELINE_LIMITS = {
   handoffInlineMaxBytes: 16_384,
   handoffField: 8_000,
   handoffArray: 50,
+  /** Max length of an edge's display `label`. */
+  edgeLabel: 120,
+  /** Max length of a step or edge `id`. */
+  id: 128,
+  /** Max entries in a step's `subagents.profileIds`. */
+  subagentProfiles: 20,
+  /** Max value of a step's `subagents.cap`. */
+  subagentCap: 1000,
+  /** Max absolute value of a step's canvas `position.x`/`.y` — out-of-range
+   *  or non-finite values are clamped into `[-positionAbs, positionAbs]`
+   *  rather than rejected. */
+  positionAbs: 1_000_000,
 } as const;
 
 export interface HarnessUsage {

@@ -1,6 +1,6 @@
 import { test, expect, mock, afterAll } from "bun:test";
 import type { AgetorClient } from "./api-client.ts";
-import type { RunEvent } from "../shared/types.ts";
+import type { RunEvent, Task } from "../shared/types.ts";
 import { FX_RECOVERY_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, PERMISSION_MODE_STATUS_PREFIX } from "../shared/types.ts";
 import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../shared/fx-recovery.ts";
 
@@ -77,7 +77,7 @@ afterAll(() => {
   mock.module("./sse.ts", () => realSseSnapshot);
 });
 
-const { cmdLogs } = await import("./commands/logs.ts");
+const { cmdLogs, pipelineLogsHint } = await import("./commands/logs.ts");
 
 function makeClient(events: RunEvent[]): AgetorClient {
   return {
@@ -89,6 +89,76 @@ function makeClient(events: RunEvent[]): AgetorClient {
 
 const flags = { json: false, plain: true, noDaemon: true } as unknown as Parameters<typeof cmdLogs>[1];
 const jsonFlags = { ...flags, json: true } as unknown as Parameters<typeof cmdLogs>[1];
+
+// --- pipelineLogsHint / cmdLogs on a pipeline (parent) task ----------------
+// m7 review fix: a pipeline parent task never runs an agent of its own —
+// only its hidden step tasks do — so `/tasks/:id/events` yields nothing for
+// it; `agetor logs <parent>` prints a one-line hint instead of silence.
+
+test("pipelineLogsHint: lists every step task's title + short id", async () => {
+  const client = {
+    getPipelineRun: async () => ({
+      task: { id: "parent-1" },
+      steps: [
+        { id: "step-task-1", title: "Bug fix flow · Investigate" },
+        { id: "step-task-2", title: "Bug fix flow · Fix" },
+      ],
+    }),
+  } as unknown as AgetorClient;
+  const hint = await pipelineLogsHint(client, { id: "parent-1" } as unknown as Task);
+  expect(hint).toContain("pipeline task");
+  expect(hint).toContain("agetor logs <stepTaskId>");
+  expect(hint).toContain("Bug fix flow · Investigate (step-tas");
+  expect(hint).toContain("Bug fix flow · Fix (step-tas");
+});
+
+test("pipelineLogsHint: no step tasks yet -> 'none yet'", async () => {
+  const client = {
+    getPipelineRun: async () => ({ task: { id: "parent-1" }, steps: [] }),
+  } as unknown as AgetorClient;
+  const hint = await pipelineLogsHint(client, { id: "parent-1" } as unknown as Task);
+  expect(hint).toContain("steps: none yet");
+});
+
+test("pipelineLogsHint: degrades to the plain hint (never throws) if the pipeline lookup fails", async () => {
+  const client = {
+    getPipelineRun: async () => {
+      throw new Error("boom");
+    },
+  } as unknown as AgetorClient;
+  const hint = await pipelineLogsHint(client, { id: "parent-1" } as unknown as Task);
+  expect(hint).toContain("pipeline task");
+  expect(hint).not.toContain("steps:");
+});
+
+test("logs: a pipeline (parent) task prints the hint before its (empty) run history — --rebuild path", async () => {
+  outputs.length = 0;
+  currentClient = {
+    listTasks: async () => [{ id: "parent-1", title: "T", pipelineId: "pipe-1" }],
+    getRuns: async () => [],
+    getPipelineRun: async () => ({
+      task: { id: "parent-1" },
+      steps: [{ id: "step-task-1", title: "Bug fix flow · Fix" }],
+    }),
+  } as unknown as AgetorClient;
+  await cmdLogs(["parent-1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(2);
+  expect(outputs[0]).toContain("pipeline task");
+  expect(outputs[0]).toContain("Bug fix flow · Fix");
+  expect(outputs[1]).toContain("no runs to rebuild");
+});
+
+test("logs --json: a pipeline (parent) task prints no hint (json output is unaffected)", async () => {
+  outputs.length = 0;
+  currentClient = {
+    listTasks: async () => [{ id: "parent-1", title: "T", pipelineId: "pipe-1" }],
+    getRuns: async () => [],
+    getPipelineRun: async () => ({ task: { id: "parent-1" }, steps: [] }),
+  } as unknown as AgetorClient;
+  await cmdLogs(["parent-1", "--rebuild"], jsonFlags);
+  // --json still short-circuits on "no runs" the same as ever — no hint text.
+  expect(outputs.join("\n")).not.toContain("pipeline task");
+});
 
 test("logs --rebuild: an fx_permission interaction gets the fx-specific line", async () => {
   outputs.length = 0;

@@ -6,12 +6,10 @@ import {
   MiniMap,
   ReactFlow,
   ReactFlowProvider,
-  applyEdgeChanges,
-  applyNodeChanges,
+  useNodesState,
+  useEdgesState,
   useReactFlow,
   type Connection,
-  type EdgeChange,
-  type NodeChange,
 } from "@xyflow/react";
 import { AnimatePresence, motion } from "motion/react";
 import { ArrowLeft, LayoutGrid, Maximize2, Plus, Save } from "lucide-react";
@@ -23,15 +21,16 @@ import { useAgentProfiles } from "@/lib/agent-profiles";
 import { api, ApiError } from "@/lib/api";
 import {
   autoLayout,
+  graphFromFlow,
   toFlowEdges,
   toFlowNodes,
   type StepFlowEdge,
   type StepFlowNode,
-  type StepVisualState,
 } from "@/lib/pipelines";
 import { newStep, validatePipelineGraph } from "../../../shared/pipeline.ts";
 import { PIPELINE_LIMITS } from "../../../shared/types.ts";
 import type { Harness, Pipeline, PipelineEdge, PipelineGraph, PipelineInput, PipelineStep } from "../../../shared/types.ts";
+import { PipelineCanvasContext, type PipelineCanvasContextValue, type StepProfileResolution } from "./pipeline-canvas-context";
 import { StepEdge } from "./StepEdge";
 import { StepNode } from "./StepNode";
 import { StepPanel } from "./StepPanel";
@@ -44,6 +43,11 @@ interface PipelineEditorProps {
   pipelineId: string | null;
   onBack: () => void;
   onSaved: (pipeline: Pipeline) => void;
+  /** Fires whenever the unsaved-changes flag flips (including the initial
+   *  `false` once a draft/pipeline finishes loading) — lets a host that can
+   *  navigate away some other way (e.g. a tab switch) reuse the same
+   *  discard-guard the in-editor Back button already applies. */
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 function snapshotOf(name: string, description: string, maxSteps: number, graph: PipelineGraph): string {
@@ -58,6 +62,23 @@ function uniqueStepName(existing: PipelineStep[]): string {
   return `New step ${n}`;
 }
 
+/** Single-edge counterpart of `toFlowEdges` — used whenever the editor adds
+ *  exactly one new edge, so it doesn't have to round-trip the whole edge
+ *  array through `toFlowEdges` just to get one item's shape. `onDelete` is
+ *  baked in at creation time since it's a STABLE callback (see the M11 note
+ *  on `appendStep` below) — it never needs to be refreshed later. */
+function edgeToFlow(edge: PipelineEdge, onDelete: (edgeId: string) => void): StepFlowEdge {
+  return {
+    id: edge.id,
+    type: "step",
+    source: edge.from,
+    target: edge.to,
+    sourceHandle: "out",
+    targetHandle: "in",
+    data: { label: edge.label, onDelete },
+  };
+}
+
 function blankGraph(): { graph: PipelineGraph; step: PipelineStep } {
   const step = newStep({ position: { x: 0, y: 0 } });
   return { graph: { steps: [step], edges: [], startStepId: step.id }, step };
@@ -68,6 +89,25 @@ function blankGraph(): { graph: PipelineGraph; step: PipelineStep } {
  * step nodes, drag-to-connect (or "Connect to…"-select) edges, a per-step
  * side panel, Auto-arrange (dagre), Fit view, keyboard delete, and an
  * unsaved-changes guard on Back. See `docs/plans/pipelines.md` D5/D6/D13.
+ *
+ * Node/edge state lives in React Flow's own controlled arrays
+ * (`useNodesState`/`useEdgesState`) rather than being rebuilt from a
+ * `PipelineGraph` on every render — review finding M11. A `PipelineGraph`
+ * is only derived FROM that state (via `graphFromFlow`, memoized) for
+ * validation/save/the step panel, and nodes are only rebuilt wholesale from
+ * a `PipelineGraph` on load, auto-arrange, or the initial add of a step —
+ * never on a keystroke or an unrelated `agent-profiles` refetch. Per-step
+ * data updates (rename, profile change, transition/join) mutate just the
+ * affected node's `data` via `setNodes(ns => ns.map(...))`, which preserves
+ * every OTHER node's object identity (and therefore React Flow's internal
+ * `measured` state for it) — the fix for the "trying to drag a node that is
+ * not initialized" warning / a sibling node stuck `visibility: hidden`
+ * documented in `e2e/pipelines-editor.spec.ts`'s `test.fixme`. The agent
+ * profile lookup and the start-step flag are read by `StepNode` from
+ * `PipelineCanvasContext` instead of node `data` for the same reason: a
+ * `profiles` refetch (or a "Set as start" click) changes a context value's
+ * identity, which only re-renders the `StepNode` components — it never
+ * touches the node objects React Flow itself tracks.
  */
 export function PipelineEditor(props: PipelineEditorProps) {
   return (
@@ -77,11 +117,11 @@ export function PipelineEditor(props: PipelineEditorProps) {
   );
 }
 
-function PipelineEditorInner({ pipelineId, onBack, onSaved }: PipelineEditorProps) {
+function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: PipelineEditorProps) {
   const confirm = useConfirm();
   const { resolved } = useTheme();
   const { fitView } = useReactFlow();
-  const { profiles, refresh: refreshProfiles } = useAgentProfiles();
+  const { profiles, loaded: profilesLoaded, refresh: refreshProfiles } = useAgentProfiles();
 
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   useEffect(() => {
@@ -96,23 +136,184 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved }: PipelineEditorProp
     };
   }, []);
 
-  // Computed at most once (never on a later render) so the draft's single
-  // step and `selectedStepId` always agree on the same generated id — two
-  // independent `blankGraph()` calls would each mint their own uuid.
-  const initialDraftRef = useRef<{ graph: PipelineGraph; step: PipelineStep } | null>(null);
-  if (initialDraftRef.current === null) initialDraftRef.current = blankGraph();
-  const initialDraft = initialDraftRef.current;
-
-  const [loading, setLoading] = useState(pipelineId != null);
+  const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [maxSteps, setMaxSteps] = useState<number>(PIPELINE_LIMITS.maxStepsDefault);
-  const [graph, setGraph] = useState<PipelineGraph>(initialDraft.graph);
-  const [selectedStepId, setSelectedStepId] = useState<string | null>(initialDraft.step.id);
+  const [startStepId, setStartStepId] = useState<string | null>(null);
+  const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
-  const initialSnapshotRef = useRef<string>(snapshotOf("", "", PIPELINE_LIMITS.maxStepsDefault, initialDraft.graph));
+  const initialSnapshotRef = useRef<string>(
+    snapshotOf("", "", PIPELINE_LIMITS.maxStepsDefault, { steps: [], edges: [], startStepId: null }),
+  );
+
+  const [nodes, setNodes, onNodesChange] = useNodesState<StepFlowNode>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<StepFlowEdge>([]);
+
+  // Mirrors of the latest committed nodes/edges for callbacks that get
+  // baked permanently into node/edge `data` at creation time (`onAppend`,
+  // an edge's `onDelete`) and therefore must stay referentially STABLE —
+  // they read current state through these refs instead of depending on
+  // `nodes`/`edges` directly, which would force them to be recreated (and
+  // every node/edge's embedded copy along with them) on every change.
+  const nodesRef = useRef<StepFlowNode[]>([]);
+  const edgesRef = useRef<StepFlowEdge[]>([]);
+  useEffect(() => {
+    nodesRef.current = nodes;
+  }, [nodes]);
+  useEffect(() => {
+    edgesRef.current = edges;
+  }, [edges]);
+
+  // Escape deselects the current step (closes the panel) — but yields to
+  // any open modal dialog or popover (AgentProfilePicker's search box, the
+  // subagent multi-select, the "New agent…" dialog, …) per the app's
+  // `data-popover-open`/`role="dialog"` conventions, so a picker's or
+  // dialog's own Escape-to-close isn't shadowed by this full-page view's
+  // Escape handler.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      setSelectedStepId(null);
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  const profileById = useMemo(() => new Map(profiles.map((p) => [p.id, p])), [profiles]);
+
+  const resolveProfile = useCallback(
+    (agentProfileId: string | null): StepProfileResolution => {
+      if (!agentProfileId) return { profile: null, profileDeleted: false };
+      const profile = profileById.get(agentProfileId) ?? null;
+      // Only report "deleted" once profiles have loaded at least once — a
+      // still-in-flight or perpetually-failed first fetch must never flash
+      // every bound step as "Deleted agent".
+      return { profile, profileDeleted: profilesLoaded ? !profile : false };
+    },
+    [profileById, profilesLoaded],
+  );
+
+  const canvasContextValue = useMemo<PipelineCanvasContextValue>(
+    () => ({ startStepId, resolveProfile }),
+    [startStepId, resolveProfile],
+  );
+
+  // ---- Edge mutations (defined first: appendStep/addEdgeToGraph below
+  // embed `removeEdge` into a newly-created edge's `data.onDelete`). ----
+
+  const removeEdge = useCallback(
+    (edgeId: string) => {
+      setEdges((es) => es.filter((e) => e.id !== edgeId));
+    },
+    [setEdges],
+  );
+
+  const onEdgeLabel = useCallback(
+    (edgeId: string, label: string) => {
+      setEdges((es) => es.map((e) => (e.id === edgeId ? { ...e, data: { ...e.data, label } } : e)));
+    },
+    [setEdges],
+  );
+
+  const addEdgeToGraph = useCallback(
+    (from: string, to: string) => {
+      if (!from || !to || from === to) return;
+      if (edgesRef.current.some((e) => e.source === from && e.target === to)) return;
+      if (edgesRef.current.length >= PIPELINE_LIMITS.edges) return;
+      const edge: PipelineEdge = { id: crypto.randomUUID(), from, to, label: "" };
+      setEdges((es) => [...es, edgeToFlow(edge, removeEdge)]);
+    },
+    [setEdges, removeEdge],
+  );
+
+  // ---- Node mutations. `appendStep`/`addStep` bake `onAppend: appendStep`
+  // into every node's `data` — `appendStep` itself has an empty-ish,
+  // STABLE dependency list (only `setNodes`/`setEdges`/`removeEdge`, none
+  // of which ever change identity), so it never needs to be refreshed on
+  // existing nodes once set. ----
+
+  const appendStep = useCallback(
+    (fromId: string) => {
+      if (nodesRef.current.length >= PIPELINE_LIMITS.steps) return;
+      const id = crypto.randomUUID();
+      const fromNode = nodesRef.current.find((n) => n.id === fromId);
+      const base = fromNode?.position ?? { x: 0, y: 0 };
+      const step = newStep({
+        id,
+        position: { x: base.x + 300, y: base.y },
+        name: uniqueStepName(nodesRef.current.map((n) => n.data.step)),
+      });
+      setNodes((ns) => [...ns, { id, type: "step", position: step.position, data: { step, onAppend: appendStep } }]);
+      if (edgesRef.current.length < PIPELINE_LIMITS.edges) {
+        const edge: PipelineEdge = { id: crypto.randomUUID(), from: fromId, to: id, label: "" };
+        setEdges((es) => [...es, edgeToFlow(edge, removeEdge)]);
+      }
+      setSelectedStepId(id);
+    },
+    [setNodes, setEdges, removeEdge],
+  );
+
+  const addStep = useCallback(() => {
+    if (nodesRef.current.length >= PIPELINE_LIMITS.steps) return;
+    const id = crypto.randomUUID();
+    const maxX = nodesRef.current.reduce((m, n) => Math.max(m, n.position.x), -300);
+    const step = newStep({
+      id,
+      position: { x: maxX + 300, y: 0 },
+      name: uniqueStepName(nodesRef.current.map((n) => n.data.step)),
+    });
+    setNodes((ns) => [...ns, { id, type: "step", position: step.position, data: { step, onAppend: appendStep } }]);
+    setStartStepId((s) => s ?? id);
+    setSelectedStepId(id);
+  }, [setNodes, appendStep]);
+
+  const updateStep = useCallback(
+    (updated: PipelineStep) => {
+      setNodes((ns) => ns.map((n) => (n.id === updated.id ? { ...n, data: { ...n.data, step: updated } } : n)));
+    },
+    [setNodes],
+  );
+
+  const deleteStep = useCallback(
+    (stepId: string) => {
+      setNodes((ns) => ns.filter((n) => n.id !== stepId));
+      setEdges((es) => es.filter((e) => e.source !== stepId && e.target !== stepId));
+      setStartStepId((s) => (s === stepId ? (nodesRef.current.find((n) => n.id !== stepId)?.id ?? null) : s));
+      setSelectedStepId((id) => (id === stepId ? null : id));
+    },
+    [setNodes, setEdges],
+  );
+
+  const setStart = useCallback((stepId: string) => {
+    setStartStepId(stepId);
+  }, []);
+
+  const onConnect = useCallback(
+    (connection: Connection) => {
+      if (connection.source && connection.target) addEdgeToGraph(connection.source, connection.target);
+    },
+    [addEdgeToGraph],
+  );
+
+  // React Flow's own removal (Delete key / programmatic) is already applied
+  // to `nodes` by the hook's built-in `onNodesChange`; this only handles
+  // the graph-level cascade — connected edges, `startStepId`, selection.
+  const onNodesDelete = useCallback(
+    (deleted: StepFlowNode[]) => {
+      const ids = new Set(deleted.map((n) => n.id));
+      setEdges((es) => es.filter((e) => !ids.has(e.source) && !ids.has(e.target)));
+      setStartStepId((s) => (s && ids.has(s) ? (nodesRef.current.find((n) => !ids.has(n.id))?.id ?? null) : s));
+      setSelectedStepId((id) => (id && ids.has(id) ? null : id));
+    },
+    [setEdges],
+  );
+
+  // ---- Load: the ONE place nodes/edges are rebuilt wholesale from a
+  // `PipelineGraph` on a task/pipeline switch (plus auto-arrange below). ----
 
   useEffect(() => {
     let cancelled = false;
@@ -123,7 +324,9 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved }: PipelineEditorProp
         setName("");
         setDescription("");
         setMaxSteps(PIPELINE_LIMITS.maxStepsDefault);
-        setGraph(g);
+        setNodes(toFlowNodes(g, () => ({ onAppend: appendStep })));
+        setEdges(toFlowEdges(g).map((e) => ({ ...e, data: { ...e.data, onDelete: removeEdge } })));
+        setStartStepId(g.startStepId);
         setSelectedStepId(step.id);
         initialSnapshotRef.current = snapshotOf("", "", PIPELINE_LIMITS.maxStepsDefault, g);
         setLoading(false);
@@ -138,7 +341,9 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved }: PipelineEditorProp
         setName(pipeline.name);
         setDescription(pipeline.description);
         setMaxSteps(pipeline.maxSteps);
-        setGraph(pipeline.graph);
+        setNodes(toFlowNodes(pipeline.graph, () => ({ onAppend: appendStep })));
+        setEdges(toFlowEdges(pipeline.graph).map((e) => ({ ...e, data: { ...e.data, onDelete: removeEdge } })));
+        setStartStepId(pipeline.graph.startStepId);
         setSelectedStepId(pipeline.graph.steps[0]?.id ?? null);
         initialSnapshotRef.current = snapshotOf(pipeline.name, pipeline.description, pipeline.maxSteps, pipeline.graph);
       } catch (err) {
@@ -151,165 +356,35 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved }: PipelineEditorProp
     return () => {
       cancelled = true;
     };
-  }, [pipelineId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- appendStep/removeEdge are referentially stable.
+  }, [pipelineId, setNodes, setEdges]);
 
-  // Escape deselects the current step (closes the panel) — but yields to any
-  // open popover inside the panel (AgentProfilePicker's search box, the
-  // subagent multi-select, …) per the app's `data-popover-open` convention,
-  // so a picker's own Escape-to-close isn't shadowed by this full-page
-  // view's Escape handler.
-  useEffect(() => {
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key !== "Escape" || e.defaultPrevented) return;
-      if (document.querySelector("[data-popover-open]")) return;
-      setSelectedStepId(null);
-    }
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, []);
-
-  const profileById = useMemo(() => new Map(profiles.map((p) => [p.id, p])), [profiles]);
-
-  const appendStep = useCallback((fromId: string) => {
-    const id = crypto.randomUUID();
-    setGraph((g) => {
-      if (g.steps.length >= PIPELINE_LIMITS.steps) return g;
-      const fromStep = g.steps.find((s) => s.id === fromId);
-      const base = fromStep?.position ?? { x: 0, y: 0 };
-      const step = newStep({ id, position: { x: base.x + 300, y: base.y }, name: uniqueStepName(g.steps) });
-      const edge: PipelineEdge = { id: crypto.randomUUID(), from: fromId, to: step.id, label: "" };
-      return { ...g, steps: [...g.steps, step], edges: [...g.edges, edge] };
-    });
-    setSelectedStepId(id);
-  }, []);
-
-  const addStep = useCallback(() => {
-    const id = crypto.randomUUID();
-    setGraph((g) => {
-      if (g.steps.length >= PIPELINE_LIMITS.steps) return g;
-      const maxX = g.steps.reduce((m, s) => Math.max(m, s.position.x), -300);
-      const step = newStep({ id, position: { x: maxX + 300, y: 0 }, name: uniqueStepName(g.steps) });
-      return { steps: [...g.steps, step], edges: g.edges, startStepId: g.startStepId ?? step.id };
-    });
-    setSelectedStepId(id);
-  }, []);
-
-  const updateStep = useCallback((updated: PipelineStep) => {
-    setGraph((g) => ({ ...g, steps: g.steps.map((s) => (s.id === updated.id ? updated : s)) }));
-  }, []);
-
-  const deleteStep = useCallback((stepId: string) => {
-    setGraph((g) => {
-      const steps = g.steps.filter((s) => s.id !== stepId);
-      const edges = g.edges.filter((e) => e.from !== stepId && e.to !== stepId);
-      const startStepId = g.startStepId === stepId ? (steps[0]?.id ?? null) : g.startStepId;
-      return { steps, edges, startStepId };
-    });
-    setSelectedStepId((id) => (id === stepId ? null : id));
-  }, []);
-
-  const setStart = useCallback((stepId: string) => {
-    setGraph((g) => ({ ...g, startStepId: stepId }));
-  }, []);
-
-  const addEdgeToGraph = useCallback((from: string, to: string) => {
-    if (!from || !to || from === to) return;
-    setGraph((g) => {
-      if (g.edges.some((e) => e.from === from && e.to === to)) return g;
-      if (g.edges.length >= PIPELINE_LIMITS.edges) return g;
-      const edge: PipelineEdge = { id: crypto.randomUUID(), from, to, label: "" };
-      return { ...g, edges: [...g.edges, edge] };
-    });
-  }, []);
-
-  const removeEdge = useCallback((edgeId: string) => {
-    setGraph((g) => ({ ...g, edges: g.edges.filter((e) => e.id !== edgeId) }));
-  }, []);
-
-  const onEdgeLabel = useCallback((edgeId: string, label: string) => {
-    setGraph((g) => ({ ...g, edges: g.edges.map((e) => (e.id === edgeId ? { ...e, label } : e)) }));
-  }, []);
-
-  const onConnect = useCallback((connection: Connection) => {
-    if (connection.source && connection.target) addEdgeToGraph(connection.source, connection.target);
-  }, [addEdgeToGraph]);
-
-  const onNodesDelete = useCallback((deleted: StepFlowNode[]) => {
-    const ids = new Set(deleted.map((n) => n.id));
-    setGraph((g) => {
-      const steps = g.steps.filter((s) => !ids.has(s.id));
-      const edges = g.edges.filter((e) => !ids.has(e.from) && !ids.has(e.to));
-      const startStepId = g.startStepId && ids.has(g.startStepId) ? (steps[0]?.id ?? null) : g.startStepId;
-      return { steps, edges, startStepId };
-    });
-    setSelectedStepId((id) => (id && ids.has(id) ? null : id));
-  }, []);
-
-  const onEdgesDelete = useCallback((deleted: StepFlowEdge[]) => {
-    const ids = new Set(deleted.map((e) => e.id));
-    setGraph((g) => ({ ...g, edges: g.edges.filter((e) => !ids.has(e.id)) }));
-  }, []);
-
-  // React Flow's controlled-component contract: apply library-side changes
-  // (drag positions, dimension measurement) via the library's own reducer,
-  // then fold resulting positions back into `graph` — the single source of
-  // truth every other handler above also reads/writes. Removal is handled
-  // by `onNodesDelete`/`onEdgesDelete`, not here.
-  const onNodesChange = useCallback((changes: NodeChange<StepFlowNode>[]) => {
-    setGraph((g) => {
-      const current = toFlowNodes(g);
-      const next = applyNodeChanges(changes, current);
-      const positionById = new Map(next.map((n) => [n.id, n.position]));
-      let changed = false;
-      const steps = g.steps.map((s) => {
-        const pos = positionById.get(s.id);
-        if (pos && (pos.x !== s.position.x || pos.y !== s.position.y)) {
-          changed = true;
-          return { ...s, position: pos };
-        }
-        return s;
-      });
-      return changed ? { ...g, steps } : g;
-    });
-  }, []);
-
-  const onEdgesChange = useCallback((changes: EdgeChange<StepFlowEdge>[]) => {
-    // Edge geometry/label is re-derived from `graph` every render and edge
-    // selection isn't persisted state; this keeps React Flow's controlled
-    // contract honest without a second source of truth. Actual removal is
-    // `onEdgesDelete`.
-    applyEdgeChanges(changes, toFlowEdges(graph));
-  }, [graph]);
-
-  const nodes = useMemo<StepFlowNode[]>(
-    () =>
-      toFlowNodes(graph, (step) => ({
-        profile: step.agentProfileId ? (profileById.get(step.agentProfileId) ?? null) : null,
-        profileDeleted: step.agentProfileId != null && !profileById.has(step.agentProfileId),
-        isStart: graph.startStepId === step.id,
-        visual: "idle" as StepVisualState,
-        parallelWarning: step.transition === "all",
-        onAppend: appendStep,
-      })).map((n) => ({ ...n, selected: n.id === selectedStepId })),
-    [graph, profileById, selectedStepId, appendStep],
+  // Selection is applied as an overlay over the raw node array rather than
+  // stored on it, so selecting a step never touches `data` (only `selected`,
+  // for at most the two nodes whose selection flag actually flips).
+  const nodesWithSelection = useMemo(
+    () => nodes.map((n) => (n.selected === (n.id === selectedStepId) ? n : { ...n, selected: n.id === selectedStepId })),
+    [nodes, selectedStepId],
   );
 
-  const edges = useMemo<StepFlowEdge[]>(
-    () => toFlowEdges(graph).map((e) => ({ ...e, data: { ...e.data, onDelete: removeEdge } })),
-    [graph, removeEdge],
-  );
+  const derivedGraph = useMemo(() => graphFromFlow(nodes, edges, startStepId), [nodes, edges, startStepId]);
 
   const selectedStep = useMemo(
-    () => (selectedStepId ? (graph.steps.find((s) => s.id === selectedStepId) ?? null) : null),
-    [graph, selectedStepId],
+    () => (selectedStepId ? (derivedGraph.steps.find((s) => s.id === selectedStepId) ?? null) : null),
+    [derivedGraph, selectedStepId],
   );
 
-  const liveValidation = useMemo(() => validatePipelineGraph(graph), [graph]);
-  const isDirty = snapshotOf(name, description, maxSteps, graph) !== initialSnapshotRef.current;
+  const liveValidation = useMemo(() => validatePipelineGraph(derivedGraph), [derivedGraph]);
+  const isDirty = snapshotOf(name, description, maxSteps, derivedGraph) !== initialSnapshotRef.current;
+
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+  }, [isDirty, onDirtyChange]);
 
   const handleAutoArrange = useCallback(() => {
-    setGraph((g) => autoLayout(g));
-  }, []);
+    const laidOut = autoLayout(derivedGraph);
+    setNodes(toFlowNodes(laidOut, () => ({ onAppend: appendStep })));
+  }, [derivedGraph, appendStep, setNodes]);
 
   const handleFitView = useCallback(() => {
     void fitView({ duration: 300 });
@@ -342,7 +417,7 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved }: PipelineEditorProp
       setValidationError(`Max steps must be between 1 and ${PIPELINE_LIMITS.maxStepsMax}.`);
       return;
     }
-    const validated = validatePipelineGraph(graph);
+    const validated = validatePipelineGraph(derivedGraph);
     if (!validated.ok) {
       setValidationError(validated.error);
       return;
@@ -364,7 +439,7 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved }: PipelineEditorProp
     } finally {
       setSaving(false);
     }
-  }, [name, description, maxSteps, graph, pipelineId, onSaved]);
+  }, [name, description, maxSteps, derivedGraph, pipelineId, onSaved]);
 
   const displayedError = validationError ?? (!liveValidation.ok ? liveValidation.error : null);
 
@@ -466,36 +541,37 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved }: PipelineEditorProp
 
       <div className="relative flex min-h-0 flex-1">
         <div data-testid="pipeline-canvas" className="relative min-w-0 flex-1">
-          {graph.steps.length === 0 && (
+          {nodes.length === 0 && (
             <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
               <p className="rounded-md border border-dashed border-border bg-card/80 px-4 py-2 text-sm text-muted-foreground">
                 Add a step to get started.
               </p>
             </div>
           )}
-          <ReactFlow
-            nodes={nodes}
-            edges={edges}
-            nodeTypes={NODE_TYPES}
-            edgeTypes={EDGE_TYPES}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            onConnect={onConnect}
-            onNodesDelete={onNodesDelete}
-            onEdgesDelete={onEdgesDelete}
-            onNodeClick={(_, node) => setSelectedStepId(node.id)}
-            onPaneClick={() => setSelectedStepId(null)}
-            deleteKeyCode={["Backspace", "Delete"]}
-            fitView
-            colorMode={resolved}
-            proOptions={{ hideAttribution: true }}
-            snapToGrid
-            snapGrid={[16, 16]}
-          >
-            <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
-            <MiniMap pannable zoomable />
-            <Controls showInteractive={false} />
-          </ReactFlow>
+          <PipelineCanvasContext.Provider value={canvasContextValue}>
+            <ReactFlow
+              nodes={nodesWithSelection}
+              edges={edges}
+              nodeTypes={NODE_TYPES}
+              edgeTypes={EDGE_TYPES}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              onConnect={onConnect}
+              onNodesDelete={onNodesDelete}
+              onNodeClick={(_, node) => setSelectedStepId(node.id)}
+              onPaneClick={() => setSelectedStepId(null)}
+              deleteKeyCode={["Backspace", "Delete"]}
+              fitView
+              colorMode={resolved}
+              proOptions={{ hideAttribution: true }}
+              snapToGrid
+              snapGrid={[16, 16]}
+            >
+              <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
+              <MiniMap pannable zoomable />
+              <Controls showInteractive={false} />
+            </ReactFlow>
+          </PipelineCanvasContext.Provider>
         </div>
 
         <AnimatePresence>
@@ -510,7 +586,7 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved }: PipelineEditorProp
             >
               <StepPanel
                 step={selectedStep}
-                graph={graph}
+                graph={derivedGraph}
                 profiles={profiles}
                 harnesses={harnesses}
                 onChange={updateStep}

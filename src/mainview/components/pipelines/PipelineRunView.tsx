@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ReactFlow, ReactFlowProvider, Background, BackgroundVariant, Controls } from "@xyflow/react";
+import { ReactFlow, ReactFlowProvider, Background, BackgroundVariant, Controls, useNodesState, useEdgesState } from "@xyflow/react";
 import { AnimatePresence, motion } from "motion/react";
 import { ArrowLeft, ChevronDown, RotateCcw, Square, Workflow } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { useConfirm } from "@/components/ui/confirm";
 import { MultiSearchSelect, type MultiSearchSelectItem } from "@/components/ui/multi-search-select";
 import { useTheme } from "@/components/theme-provider";
 import { useAgentProfiles } from "@/lib/agent-profiles";
@@ -17,17 +18,21 @@ import {
   stepVisualState,
   toFlowEdges,
   toFlowNodes,
+  type EdgeVisualState,
   type StepFlowEdge,
   type StepFlowNode,
+  type StepVisualState,
 } from "@/lib/pipelines";
 import { pipelineStepProgress, stepNameById } from "../../../shared/pipeline.ts";
 import type {
   Handoff,
+  PipelineBlockKind,
   PipelineGraph,
   PipelineRunStatus,
   PipelineStepRecord,
   Task,
 } from "../../../shared/types.ts";
+import { PipelineCanvasContext, type PipelineCanvasContextValue, type StepProfileResolution } from "./pipeline-canvas-context";
 import { StepEdge } from "./StepEdge";
 import { StepNode } from "./StepNode";
 
@@ -50,6 +55,25 @@ const STATUS_CLASSES: Record<PipelineRunStatus, string> = {
   cancelled: "bg-muted text-muted-foreground",
 };
 
+/** Statuses from which a run can be restarted from its start step,
+ *  discarding the prior history — mirrors the server's own gate. */
+const RESTARTABLE_STATUSES: PipelineRunStatus[] = ["done", "cancelled", "blocked"];
+
+/** Block kinds Retry can re-attempt — everything except a missing/invalid
+ *  handoff, which Retry can't fix (re-running the same step reproduces the
+ *  same non-handoff, or the same malformed one) — those need Advance. */
+const RETRY_BLOCK_KINDS: PipelineBlockKind[] = [
+  "step-failed",
+  "step-blocked",
+  "step-cap",
+  "profile-missing",
+  "join-incomplete",
+];
+/** Block kinds Advance can resolve by manually picking (or skipping) the
+ *  next step(s) — a missing/invalid handoff, an incomplete join the user
+ *  wants to force past, or a step reported as blocked. */
+const ADVANCE_BLOCK_KINDS: PipelineBlockKind[] = ["handoff-missing", "handoff-invalid", "join-incomplete", "step-blocked"];
+
 interface PipelineRunViewProps {
   taskId: string;
   onOpenTask: (task: Task) => void;
@@ -65,6 +89,18 @@ function formatDuration(ms: number): string {
   return `${minutes}m ${seconds}s`;
 }
 
+/** Any execution's step task is actively running or currently blocked
+ *  (awaiting a decision) — used to decide whether Stop should be offered.
+ *  Distinct from `run.status === "running"`: a run can be mid-block on one
+ *  branch while another branch is still actively executing. */
+function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } | null): boolean {
+  if (!run) return false;
+  return run.active.some((entry) => {
+    const stepTask = steps.find((t) => t.id === entry.taskId);
+    return stepTask ? stepTask.column === "running" || stepTask.column === "blocked" : false;
+  });
+}
+
 /**
  * Full-page, live-animated view of one pipeline TASK's run: the active step
  * pulses, traversed edges paint, and a token travels the edge on each
@@ -74,10 +110,20 @@ function formatDuration(ms: number): string {
  * with a 2s poll as the fallback, and lets the caller handle navigation
  * (`onOpenTask` for a step click, `onBack` for the header button). See
  * `docs/plans/pipelines.md` D5/D9/D12.
+ *
+ * Nodes/edges live in `useNodesState`/`useEdgesState` (review M11) and are
+ * only rebuilt wholesale from a `PipelineGraph` when the graph's own
+ * CONTENT changes (`graphSignature`, a structural key — not the graph
+ * object's reference, which is a fresh JSON-fetched object on every poll
+ * even when nothing changed). Per-poll visual updates (`stepVisualState`/
+ * `edgeVisualState`/token) are merged into the existing arrays by id, only
+ * replacing a node/edge's `data` when its computed visual actually changed
+ * — never a full `toFlowNodes`/`toFlowEdges` rebuild on every poll.
  */
 export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewProps) {
   const { resolved } = useTheme();
   const { profiles: liveProfiles } = useAgentProfiles();
+  const confirm = useConfirm();
 
   const [task, setTask] = useState<Task | null>(null);
   const [steps, setSteps] = useState<Task[]>([]);
@@ -89,7 +135,16 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
   const [notStartedStepName, setNotStartedStepName] = useState<string | null>(null);
 
   const fetchingRef = useRef(false);
+  // Set when a refetch is requested (an event, or the 2s poll) WHILE a
+  // fetch is already in flight — rather than dropping it, `load` runs
+  // exactly one trailing refetch once the in-flight one settles, so a
+  // burst of events during a slow request never loses the freshest state
+  // (review M17).
+  const dirtyRef = useRef(false);
   const stepIdsRef = useRef<Set<string>>(new Set());
+
+  const [nodes, setNodes] = useNodesState<StepFlowNode>([]);
+  const [edges, setEdges] = useEdgesState<StepFlowEdge>([]);
 
   // Reset on task switch, before the loader effect below re-fetches.
   useEffect(() => {
@@ -98,11 +153,18 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
     setLoadError(null);
     setNotStartedStepName(null);
     stepIdsRef.current = new Set();
-  }, [taskId]);
+    dirtyRef.current = false;
+    setNodes([]);
+    setEdges([]);
+  }, [taskId, setNodes, setEdges]);
 
   const load = useCallback(async () => {
-    if (fetchingRef.current) return;
+    if (fetchingRef.current) {
+      dirtyRef.current = true;
+      return;
+    }
     fetchingRef.current = true;
+    dirtyRef.current = false;
     try {
       const result = await api.getPipelineRun(taskId);
       setTask(result.task);
@@ -113,6 +175,10 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
       setLoadError(err instanceof ApiError ? err.message : "Failed to load pipeline run.");
     } finally {
       fetchingRef.current = false;
+      if (dirtyRef.current) {
+        dirtyRef.current = false;
+        void load();
+      }
     }
   }, [taskId]);
 
@@ -170,42 +236,67 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
   const progress = run ? pipelineStepProgress(run) : null;
   const transition = latestTransition(run);
 
-  const nodes = useMemo<StepFlowNode[]>(() => {
-    if (!effectiveGraph) return [];
-    return toFlowNodes(effectiveGraph, (step) => {
-      const snapshotProfile = step.agentProfileId ? (run?.snapshot?.profiles[step.agentProfileId] ?? null) : null;
-      const liveProfile = !snapshotProfile && step.agentProfileId
-        ? (liveProfiles.find((p) => p.id === step.agentProfileId) ?? null)
-        : null;
-      const profile = snapshotProfile ?? liveProfile;
-      return {
-        profile,
-        profileDeleted: step.agentProfileId != null && !profile,
-        isStart: effectiveGraph.startStepId === step.id,
-        visual: stepVisualState(run, step.id, steps),
-        parallelWarning: step.transition === "all",
-        readOnly: true,
-      };
-    });
-  }, [effectiveGraph, run, steps, liveProfiles]);
+  // A stable CONTENT key for `effectiveGraph` — `run.snapshot.graph` is a
+  // fresh object from every poll's JSON response even when its content is
+  // byte-identical (the snapshot is frozen once a run starts), so keying
+  // the rebuild effect on the object reference would rebuild every node on
+  // every 2s poll. Content, not identity, decides when a rebuild is due.
+  const graphSignature = useMemo(() => (effectiveGraph ? JSON.stringify(effectiveGraph) : null), [effectiveGraph]);
+  const effectiveGraphRef = useRef<PipelineGraph | null>(null);
+  effectiveGraphRef.current = effectiveGraph;
 
-  const edges = useMemo<StepFlowEdge[]>(() => {
-    if (!effectiveGraph) return [];
-    return toFlowEdges(effectiveGraph).map((e) => {
-      const visual = edgeVisualState(run, { id: e.id, from: e.source, to: e.target, label: e.data?.label ?? "" });
-      const isTokenEdge = !!transition && transition.fromStepId === e.source && transition.toStepId === e.target;
-      return {
-        ...e,
-        data: {
-          ...e.data,
-          visual,
-          readOnly: true,
-          token: isTokenEdge,
-          tokenKey: isTokenEdge ? transition!.seq : undefined,
-        },
-      };
-    });
-  }, [effectiveGraph, run, transition]);
+  // ---- Full rebuild: only on a genuine graph-content change. ----
+  useEffect(() => {
+    const g = effectiveGraphRef.current;
+    if (!g) {
+      setNodes([]);
+      setEdges([]);
+      return;
+    }
+    setNodes(toFlowNodes(g));
+    setEdges(toFlowEdges(g).map((e) => ({ ...e, data: { ...e.data, readOnly: true } })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content (graphSignature), not the graph object's identity.
+  }, [graphSignature, setNodes, setEdges]);
+
+  // ---- Per-poll merge: replace a node's `data.visual` only when it
+  // actually changed, so most nodes keep their exact object identity. ----
+  useEffect(() => {
+    setNodes((ns) =>
+      ns.map((n) => {
+        const visual: StepVisualState = stepVisualState(run, n.id, steps);
+        if (n.data.visual === visual) return n;
+        return { ...n, data: { ...n.data, visual } };
+      }),
+    );
+  }, [run, steps, setNodes]);
+
+  useEffect(() => {
+    setEdges((es) =>
+      es.map((e) => {
+        const visual: EdgeVisualState = edgeVisualState(run, { id: e.id, from: e.source, to: e.target, label: e.data?.label ?? "" });
+        const isTokenEdge = !!transition && transition.fromStepId === e.source && transition.toStepId === e.target;
+        const tokenKey = isTokenEdge ? transition!.seq : undefined;
+        if (e.data?.visual === visual && e.data?.token === isTokenEdge && e.data?.tokenKey === tokenKey) return e;
+        return { ...e, data: { ...e.data, visual, token: isTokenEdge, tokenKey } };
+      }),
+    );
+  }, [run, transition, setEdges]);
+
+  const resolveProfile = useCallback(
+    (agentProfileId: string | null): StepProfileResolution => {
+      if (!agentProfileId) return { profile: null, profileDeleted: false };
+      const snapshotProfile = run?.snapshot?.profiles[agentProfileId] ?? null;
+      if (snapshotProfile) return { profile: snapshotProfile, profileDeleted: false };
+      const liveProfile = liveProfiles.find((p) => p.id === agentProfileId) ?? null;
+      return { profile: liveProfile, profileDeleted: !liveProfile };
+    },
+    [run?.snapshot, liveProfiles],
+  );
+
+  const canvasContextValue = useMemo<PipelineCanvasContextValue>(
+    () => ({ startStepId: effectiveGraph?.startStepId ?? null, resolveProfile }),
+    [effectiveGraph?.startStepId, resolveProfile],
+  );
 
   const onNodeClick = useCallback(
     (_: unknown, node: StepFlowNode) => {
@@ -262,6 +353,25 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
     [taskId, load],
   );
 
+  const handleRestart = useCallback(async () => {
+    const ok = await confirm({
+      title: "Restart this pipeline?",
+      description: "This starts a fresh run from the start step — the previous run's history stays on record but a new one begins.",
+      confirmLabel: "Restart",
+    });
+    if (!ok) return;
+    setActionBusy(true);
+    setActionError(null);
+    try {
+      await api.restartPipeline(taskId);
+      await load();
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : "Failed to restart the run.");
+    } finally {
+      setActionBusy(false);
+    }
+  }, [taskId, load, confirm]);
+
   if (loadError && !task) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center gap-3 text-sm text-danger">
@@ -282,6 +392,16 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
   }
 
   const candidates = (effectiveGraph?.steps ?? []).map((s) => ({ value: s.id, label: s.name }));
+  const showStop = hasLiveExecution(steps, run);
+  const showRestart = RESTARTABLE_STATUSES.includes(run.status);
+  // An active execution whose step task already finished (board column
+  // `review`) but the pipeline hasn't advanced past it — e.g. `transition:
+  // "choose"` with no agent-emitted handoff yet resolved. Distinct from
+  // `run.blocked`: nothing failed, it's just waiting on a manual decision.
+  const reviewActive = run.active.flatMap((active) => {
+    const stepTask = steps.find((t) => t.id === active.taskId);
+    return stepTask && stepTask.column === "review" ? [{ active, task: stepTask }] : [];
+  });
 
   return (
     <div data-testid="pipeline-run-view" className="flex h-full min-h-0 w-full flex-col">
@@ -304,7 +424,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
         {progress && <span className="text-xs text-muted-foreground">{progress.label}</span>}
         <div className="ml-auto flex items-center gap-2">
           {actionError && <span className="text-xs text-danger">{actionError}</span>}
-          {run.status === "running" && (
+          {showStop && (
             <Button
               type="button"
               variant="outline"
@@ -332,28 +452,44 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
               Retry
             </Button>
           )}
+          {showRestart && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-testid="pipeline-run-restart"
+              disabled={actionBusy}
+              onClick={() => void handleRestart()}
+              className="gap-1.5"
+            >
+              <RotateCcw className="size-3.5" aria-hidden />
+              Restart
+            </Button>
+          )}
         </div>
       </div>
 
       <div className="relative flex min-h-0 flex-1">
         <div className="relative min-w-0 flex-1">
           <ReactFlowProvider>
-            <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              nodeTypes={NODE_TYPES}
-              edgeTypes={EDGE_TYPES}
-              onNodeClick={onNodeClick}
-              nodesDraggable={false}
-              nodesConnectable={false}
-              elementsSelectable
-              fitView
-              colorMode={resolved}
-              proOptions={{ hideAttribution: true }}
-            >
-              <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
-              <Controls showInteractive={false} />
-            </ReactFlow>
+            <PipelineCanvasContext.Provider value={canvasContextValue}>
+              <ReactFlow
+                nodes={nodes}
+                edges={edges}
+                nodeTypes={NODE_TYPES}
+                edgeTypes={EDGE_TYPES}
+                onNodeClick={onNodeClick}
+                nodesDraggable={false}
+                nodesConnectable={false}
+                elementsSelectable
+                fitView
+                colorMode={resolved}
+                proOptions={{ hideAttribution: true }}
+              >
+                <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
+                <Controls showInteractive={false} />
+              </ReactFlow>
+            </PipelineCanvasContext.Provider>
           </ReactFlowProvider>
           {notStartedStepName && (
             <div
@@ -386,12 +522,12 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
           {run.blocked.length > 0 && (
             <div data-testid="pipeline-run-blocked" className="mb-3 flex flex-col gap-2">
               <AnimatePresence initial={false}>
-                {run.blocked.map((entry, i) => {
+                {run.blocked.map((entry) => {
                   const stepName = entry.stepId && effectiveGraph ? stepNameById(effectiveGraph, entry.stepId) : entry.stepId;
                   const stepTask = entry.taskId ? (steps.find((t) => t.id === entry.taskId) ?? null) : null;
                   return (
                     <motion.div
-                      key={`${entry.taskId ?? "run"}-${entry.stepId ?? "none"}-${i}`}
+                      key={`${entry.kind}:${entry.taskId ?? entry.stepId ?? "run"}`}
                       initial={{ opacity: 0, y: -4 }}
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0 }}
@@ -415,22 +551,65 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
                             Open step
                           </Button>
                         )}
+                        {RETRY_BLOCK_KINDS.includes(entry.kind) && (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            data-testid="pipeline-run-retry-entry"
+                            disabled={actionBusy}
+                            onClick={() => void handleRetry(entry.taskId ?? undefined)}
+                            className="h-7 text-xs"
+                          >
+                            Retry
+                          </Button>
+                        )}
+                      </div>
+                      {ADVANCE_BLOCK_KINDS.includes(entry.kind) && (
+                        <AdvanceForm
+                          candidates={candidates}
+                          busy={actionBusy}
+                          onSubmit={(nextStepIds, handoff) => void handleAdvance(entry.taskId, nextStepIds, handoff)}
+                        />
+                      )}
+                    </motion.div>
+                  );
+                })}
+              </AnimatePresence>
+            </div>
+          )}
+
+          {reviewActive.length > 0 && (
+            <div data-testid="pipeline-run-review" className="mb-3 flex flex-col gap-2">
+              <p className="text-xs font-medium text-muted-foreground">Awaiting review</p>
+              <AnimatePresence initial={false}>
+                {reviewActive.map(({ active, task: stepTask }) => {
+                  const stepName = effectiveGraph ? stepNameById(effectiveGraph, active.stepId) : active.stepId;
+                  return (
+                    <motion.div
+                      key={`active-review:${active.taskId}`}
+                      initial={{ opacity: 0, y: -4 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0 }}
+                      className="rounded-md border border-info/40 bg-info/10 p-2.5"
+                    >
+                      <p className="text-xs font-medium text-info">{stepName} — finished, awaiting next step</p>
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
                         <Button
                           type="button"
                           variant="outline"
                           size="sm"
-                          data-testid="pipeline-run-retry-entry"
-                          disabled={actionBusy}
-                          onClick={() => void handleRetry(entry.taskId ?? undefined)}
+                          data-testid="pipeline-run-open-step"
+                          onClick={() => onOpenTask(stepTask)}
                           className="h-7 text-xs"
                         >
-                          Retry
+                          Open step
                         </Button>
                       </div>
                       <AdvanceForm
                         candidates={candidates}
                         busy={actionBusy}
-                        onSubmit={(nextStepIds, handoff) => void handleAdvance(entry.taskId, nextStepIds, handoff)}
+                        onSubmit={(nextStepIds, handoff) => void handleAdvance(active.taskId, nextStepIds, handoff)}
                       />
                     </motion.div>
                   );

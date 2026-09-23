@@ -775,3 +775,174 @@ test("POST /tasks/:id/pipeline/retry with no body at all → treated as {} (not 
   // the request shape itself must not 400.
   expect(res.status).toBe(409);
 });
+
+// ---------------------------------------------------------------------------
+// M15: POST /tasks/:id/pipeline/restart — status-code matrix + a real
+// restart-after-done round trip.
+// ---------------------------------------------------------------------------
+
+test("POST /tasks/:id/pipeline/restart on an unknown task → 404", async () => {
+  const res = await call("/tasks/does-not-exist/pipeline/restart", { method: "POST" });
+  expect(res.status).toBe(404);
+});
+
+test("POST /tasks/:id/pipeline/restart on a plain (non-pipeline) task → 400", async () => {
+  const task = await createTask();
+  const res = await call(`/tasks/${task.id}/pipeline/restart`, { method: "POST" });
+  expect(res.status).toBe(400);
+  expect((await res.json()).error).toContain("not a pipeline task");
+});
+
+test("POST /tasks/:id/pipeline/restart on an already-running pipeline → 409", async () => {
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  // Widen the window between "turn started" and "turn resolved" so the
+  // restart call below reliably lands while the run is still genuinely
+  // `"running"` — same technique pipeline-runner.test.ts's cancel/retry
+  // tests use.
+  process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = "700";
+  try {
+    const profile = await createProfile();
+    const graph = oneStepGraph(profile.id, { instructions: `Do it. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+    const pipeline = await createPipeline(profile.id, { graph });
+    const task = await createTask({ pipelineId: pipeline.id, workdir: WORKDIR, isolation: "none" });
+
+    const startRes = await call(`/tasks/${task.id}/start`, { method: "POST" });
+    expect(startRes.status).toBe(200);
+
+    const restartRes = await call(`/tasks/${task.id}/pipeline/restart`, { method: "POST" });
+    expect(restartRes.status).toBe(409);
+
+    await waitForPipelineSettled(task.id);
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
+  }
+}, 20_000);
+
+test("POST /tasks/:id/pipeline/restart runs a finished (done) pipeline again from the top; plain start on it 400s", async () => {
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const profile = await createProfile();
+  const graph = oneStepGraph(profile.id, { instructions: `Do it. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const pipeline = await createPipeline(profile.id, { graph });
+  const task = await createTask({ pipelineId: pipeline.id, workdir: WORKDIR, isolation: "none" });
+
+  const startRes = await call(`/tasks/${task.id}/start`, { method: "POST" });
+  expect(startRes.status).toBe(200);
+  await waitForPipelineSettled(task.id);
+
+  const settled = (await (await call(`/tasks/${task.id}/pipeline`)).json()) as { task: Task };
+  expect(settled.task.pipelineRun?.status).toBe("done");
+  const firstStartedAt = settled.task.pipelineRun?.startedAt;
+
+  // Once a pipeline run is done, `POST /tasks/:id/start` (plain startTask →
+  // startPipelineRun with no restart flag) errors out — only the explicit
+  // restart route may run it again from the top.
+  const plainStartRes = await call(`/tasks/${task.id}/start`, { method: "POST" });
+  expect(plainStartRes.status).toBe(400);
+
+  const restartRes = await call(`/tasks/${task.id}/pipeline/restart`, { method: "POST" });
+  expect(restartRes.status).toBe(200);
+  const restarted = (await restartRes.json()) as { runId?: string; pending?: true };
+  expect(typeof restarted.runId === "string" || restarted.pending === true).toBe(true);
+
+  await waitForPipelineSettled(task.id);
+  const resettled = (await (await call(`/tasks/${task.id}/pipeline`)).json()) as { task: Task };
+  expect(resettled.task.pipelineRun?.status).toBe("done");
+  // A genuine restart, not a no-op: the run started over, so its
+  // `startedAt` moved forward.
+  expect(resettled.task.pipelineRun?.startedAt).not.toBe(firstStartedAt);
+}, 20_000);
+
+// ---------------------------------------------------------------------------
+// M7: an orphaned step (its pipeline parent row no longer exists) can be
+// deleted/archived directly — there's no parent left to redirect the caller
+// to, so the ordinary "act on the pipeline task instead" guard would
+// otherwise leave the row stuck forever.
+// ---------------------------------------------------------------------------
+
+test("DELETE /tasks/:id on an orphaned pipeline step (parent row gone) is allowed", async () => {
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const parent = await createTask({ pipelineId: pipeline.id, workdir: WORKDIR, isolation: "none" });
+
+  const startRes = await call(`/tasks/${parent.id}/start`, { method: "POST" });
+  expect(startRes.status).toBe(200);
+  const { steps } = await waitForSteps(parent.id);
+  const step = steps[0]!;
+  await waitForPipelineSettled(parent.id);
+
+  // Simulate the parent row having vanished out from under the step (a
+  // partial cascade failure, or on-disk state predating this fix) — raw SQL,
+  // bypassing `deleteTask`'s own cascade, so the step is left a genuine
+  // orphan with no parent left to route the caller to.
+  db.run(`DELETE FROM tasks WHERE id = ?`, [parent.id]);
+
+  const deleteRes = await call(`/tasks/${step.id}`, { method: "DELETE" });
+  expect(deleteRes.status).toBe(204);
+
+  const getRes = await call(`/tasks/${step.id}`);
+  expect(getRes.status).toBe(404);
+}, 20_000);
+
+test("POST /tasks/:id/archive on an orphaned pipeline step (parent row gone) is allowed", async () => {
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const profile = await createProfile();
+  const graph = oneStepGraph(profile.id, { instructions: `Do it. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const pipeline = await createPipeline(profile.id, { graph });
+  const parent = await createTask({ pipelineId: pipeline.id, workdir: WORKDIR, isolation: "none" });
+
+  const startRes = await call(`/tasks/${parent.id}/start`, { method: "POST" });
+  expect(startRes.status).toBe(200);
+  const { steps } = await waitForSteps(parent.id);
+  const step = steps[0]!;
+  await waitForPipelineSettled(parent.id);
+  // The step's own handoff resolved terminal, so its column already settled
+  // to "done" — `archiveTask` requires that (or `force`) before proceeding.
+  expect((await (await call(`/tasks/${step.id}`)).json() as Task).column).toBe("done");
+
+  db.run(`DELETE FROM tasks WHERE id = ?`, [parent.id]);
+
+  const archiveRes = await call(`/tasks/${step.id}/archive`, { method: "POST" });
+  expect(archiveRes.status).toBe(200);
+  const archived = (await archiveRes.json()) as Task;
+  expect(archived.archivedAt).not.toBeNull();
+}, 20_000);
+
+// ---------------------------------------------------------------------------
+// M17: GET /tasks/:id aggregates a pipeline parent's step pending-interaction
+// counts, the same way the batched `tasks.list()` pass already does (D11).
+// ---------------------------------------------------------------------------
+
+test("GET /tasks/:id aggregates pipeline step pending-interaction counts onto the parent", async () => {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const parent = await createTask({ pipelineId: pipeline.id, workdir: WORKDIR, isolation: "none" });
+
+  const startRes = await call(`/tasks/${parent.id}/start`, { method: "POST" });
+  expect(startRes.status).toBe(200);
+  const { steps } = await waitForSteps(parent.id);
+  const step = steps[0]!;
+
+  registerTmuxPrompt({
+    taskId: step.id,
+    runId: "fake-run-1",
+    paneText: "pane",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: `fp-${step.id}-1`,
+  });
+  registerTmuxPrompt({
+    taskId: step.id,
+    runId: "fake-run-1",
+    paneText: "pane 2",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: `fp-${step.id}-2`,
+  });
+
+  const parentTask = (await (await call(`/tasks/${parent.id}`)).json()) as Task;
+  expect(parentTask.pendingInteractionCount).toBe(2);
+
+  const stepTask = (await (await call(`/tasks/${step.id}`)).json()) as Task;
+  expect(stepTask.pendingInteractionCount).toBe(2);
+
+  await waitForPipelineSettled(parent.id);
+}, 20_000);

@@ -107,20 +107,29 @@ export function parseAdd(args: string[]): AddOpts {
   return o;
 }
 
+/** Whether any of the six manual harness/model/mode/effort/fast/maxMode
+ *  flags were given — the block `--profile`/`--pipeline` each replace
+ *  wholesale. Shared by `assertProfileFlagCombo`/`assertPipelineFlagCombo`
+ *  (flag-vs-flag conflicts) and the wizard's Pipeline-step gating below (m20
+ *  review fix) so the two can't drift. */
+function hasManualLaunchFlags(o: AddOpts): boolean {
+  return (
+    o.agent !== undefined ||
+    o.model !== undefined ||
+    o.mode !== undefined ||
+    o.effort !== undefined ||
+    o.fast !== undefined ||
+    o.maxMode !== undefined
+  );
+}
+
 /** `--profile` replaces the whole harness/model/mode/effort/fast/maxMode
  *  block — the profile defines those — so combining it with any of the six
  *  flags that set them by hand is a usage error, in both the non-interactive
  *  and wizard paths (checked once, up front, before either runs). */
 function assertProfileFlagCombo(o: AddOpts): void {
   if (!o.profile) return;
-  const conflicting =
-    o.agent !== undefined ||
-    o.model !== undefined ||
-    o.mode !== undefined ||
-    o.effort !== undefined ||
-    o.fast !== undefined ||
-    o.maxMode !== undefined;
-  if (conflicting) {
+  if (hasManualLaunchFlags(o)) {
     throw new Error(
       "--profile cannot be combined with --agent/--model/--mode/--effort/--fast/--max-mode (the agent defines them)",
     );
@@ -134,15 +143,7 @@ function assertProfileFlagCombo(o: AddOpts): void {
  *  `assertProfileFlagCombo`. */
 function assertPipelineFlagCombo(o: AddOpts): void {
   if (!o.pipeline) return;
-  const conflicting =
-    o.profile !== undefined ||
-    o.agent !== undefined ||
-    o.model !== undefined ||
-    o.mode !== undefined ||
-    o.effort !== undefined ||
-    o.fast !== undefined ||
-    o.maxMode !== undefined;
-  if (conflicting) {
+  if (o.profile !== undefined || hasManualLaunchFlags(o)) {
     throw new Error(
       "--pipeline cannot be combined with --profile/--agent/--model/--mode/--effort/--fast/--max-mode (the pipeline defines the launch)",
     );
@@ -539,16 +540,22 @@ async function wizard(
 
   // Pipeline step: a first "Pipeline" pick over saved pipelines (plus a
   // "None — launch a single agent" escape hatch), shown only when at least
-  // one pipeline exists and `--pipeline` wasn't already given on the command
-  // line. Picking a pipeline skips the Profile step and the harness/model/
-  // mode/effort steps below entirely — the pipeline's steps supply all of
-  // it, the created task is just the pipeline's parent (board) task.
+  // one pipeline exists, `--pipeline` wasn't already given on the command
+  // line, AND neither `--profile` nor any manual harness/model/mode/effort/
+  // fast/max-mode flag was given (m20 review fix) — mirroring
+  // `assertPipelineFlagCombo`'s exclusivity: those flags already commit the
+  // task to a single-agent launch, so offering a Pipeline pick here would
+  // let a wizard answer silently override (or conflict with) a flag the
+  // user already set on the command line. Picking a pipeline skips the
+  // Profile step and the harness/model/mode/effort steps below entirely —
+  // the pipeline's steps supply all of it, the created task is just the
+  // pipeline's parent (board) task.
   let pipelineId: string | undefined;
   if (o.pipeline) {
     const result = matchPipelineRef(await client.listPipelines().catch(() => [] as Pipeline[]), o.pipeline);
     if (!result.ok) throw new Error(result.error);
     pipelineId = result.pipeline.id;
-  } else {
+  } else if (!o.profile && !hasManualLaunchFlags(o)) {
     const pipelines = await client.listPipelines().catch(() => [] as Pipeline[]);
     if (pipelines.length > 0) {
       const NONE = "__none__";

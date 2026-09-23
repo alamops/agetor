@@ -16,6 +16,7 @@ import type {
   BranchInfo,
   Pipeline,
   PipelineInput,
+  Handoff,
   TaskReference,
   TaskDiff,
   TaskGitStatus,
@@ -377,6 +378,29 @@ export class AgetorClient {
    *  and return the pipeline task to `ready`. */
   cancelPipeline(taskId: string): Promise<Task> {
     return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/cancel`);
+  }
+  /** `POST /tasks/:id/pipeline/advance` — manually resolve whatever the run
+   *  is currently waiting on: `nextStepIds: null` ends the run here
+   *  (terminal), a non-empty array launches each named step id. `fromTaskId`
+   *  targets a specific blocked/awaiting execution when more than one is in
+   *  play (e.g. a fan-out); omitted, the sole such execution is used. 400
+   *  bad body, 404 unknown parent, 409 wrong run state — all propagate as a
+   *  thrown `ApiError`. */
+  advancePipeline(
+    taskId: string,
+    body: { nextStepIds: string[] | null; handoff?: Partial<Handoff>; fromTaskId?: string },
+  ): Promise<Task> {
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/advance`, body);
+  }
+  /** `POST /tasks/:id/pipeline/restart` — restart a pipeline run from its
+   *  start step (e.g. one that already finished `done`), discarding current
+   *  progress. Mirrors `startTask`'s own response shape (it launches the
+   *  first step's agent synchronously, same as a plain start) rather than
+   *  returning the task — 404 unknown parent, 400 not a pipeline task, 409
+   *  every other failure (already running, snapshot build failed, …), all
+   *  propagating as a thrown `ApiError`. */
+  restartPipeline(taskId: string): Promise<{ runId: string; pending?: true }> {
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/restart`, undefined, START_TIMEOUT_MS);
   }
 
   // ── preferences (cross-session key/value store) ────────────────────────────

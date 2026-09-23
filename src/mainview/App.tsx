@@ -210,16 +210,7 @@ function AppInner() {
   // form, the header button's badge-free trigger, and every page view below
   // — one `GET /pipelines` fetch backs all of them.
   const [view, setView] = useState<AppView>({ kind: "board" });
-  const { pipelines, refresh: refreshPipelines } = usePipelines();
-  /** Switch the app-level `view` to a pipeline TASK's live run view — the
-   *  card-open / context-menu / RunPanel-strip destination for a pipeline
-   *  parent task (D5/D7, `docs/plans/pipelines.md`). Declared this early
-   *  (rather than beside its sibling `openPipelinesPage`/`openTask`
-   *  further down) because the app-wide global-events subscription effect
-   *  below reads it. */
-  const openPipelineRun = useCallback((taskId: string) => {
-    setView({ kind: "pipeline-run", taskId });
-  }, []);
+  const { pipelines, loaded: pipelinesLoaded, refresh: refreshPipelines } = usePipelines();
   const [diffTask, setDiffTask] = useState<Task | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -292,6 +283,83 @@ function AppInner() {
   const [dataDir, setDataDir] = useState<string>("");
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
   const confirm = useConfirm();
+
+  // True while the pipeline canvas editor has unsaved changes — set via the
+  // `onDirtyChange` prop `<PipelineEditor>` calls below (m2,
+  // docs/plans/pipelines.md review). `navigate` below is the single place
+  // that reads it: PipelineEditor's own Back button already runs its own
+  // confirm-then-`onBack` before ever reaching `navigate`, so `onBack`/
+  // `onSaved` still call `setView` directly (a second confirm there would
+  // double-prompt) — every OTHER way to leave the editor (header button,
+  // Settings' "Open pipelines"/"Edit"/"New pipeline", a toast's onOpen,
+  // `openPipelineRun`, Escape) goes through `navigate` instead.
+  const [pipelineEditorDirty, setPipelineEditorDirty] = useState(false);
+  // Mirrored into refs so `navigate` below can read the latest `view`/
+  // `pipelineEditorDirty` without depending on them directly — keeping
+  // `navigate` (and everything chained off it: `openPipelineRun`,
+  // `openTask`) referentially stable across renders, same idiom as
+  // `tasksRef`/`selectedIdRef` elsewhere in this file. Without this, a
+  // `view`-keyed `navigate` would change identity on every navigation,
+  // which would in turn destabilize `openTask`/`openPipelineRun` — both
+  // passed to memoized `Column`/`TaskCard` and read by effect dep arrays
+  // that assume a stable identity.
+  const viewRef = useRef(view);
+  useEffect(() => { viewRef.current = view; }, [view]);
+  const pipelineEditorDirtyRef = useRef(pipelineEditorDirty);
+  useEffect(() => { pipelineEditorDirtyRef.current = pipelineEditorDirty; }, [pipelineEditorDirty]);
+  /** Central app-level navigation: switches `view`, confirming first when
+   *  leaving the pipeline editor with unsaved changes. Every `view` change
+   *  that isn't PipelineEditor's own `onBack`/`onSaved` callback (which
+   *  handle — or don't need — the guard themselves, see
+   *  `pipelineEditorDirty` above) must go through this rather than calling
+   *  `setView` directly, so a stray click while mid-edit can't silently
+   *  discard the draft. */
+  const navigate = useCallback((next: AppView) => {
+    const current = viewRef.current;
+    if (current.kind === "pipelines" && current.editing && pipelineEditorDirtyRef.current) {
+      void confirm({
+        title: "Discard unsaved pipeline changes?",
+        confirmLabel: "Discard",
+        cancelLabel: "Keep editing",
+        variant: "destructive",
+      }).then((ok) => {
+        if (!ok) return;
+        setPipelineEditorDirty(false);
+        setView(next);
+      });
+      return;
+    }
+    setView(next);
+  }, [confirm]);
+  /** Switch the app-level `view` to a pipeline TASK's live run view — the
+   *  card-open / context-menu / RunPanel-strip destination for a pipeline
+   *  parent task (D5/D7, `docs/plans/pipelines.md`). Declared this early
+   *  (rather than beside its sibling `openPipelinesPage`/`openTask`
+   *  further down) because the app-wide global-events subscription effect
+   *  below reads it. Routes through `navigate` (m2) so leaving a dirty
+   *  editor for a run view still confirms. */
+  const openPipelineRun = useCallback((taskId: string) => {
+    navigate({ kind: "pipeline-run", taskId });
+  }, [navigate]);
+  /** Card click / row-open handler for every task in the board and every
+   *  other list that opens a task (Worktrees dialog, etc. still call
+   *  `setSelected` directly where a run panel is always the right target,
+   *  e.g. a step task). A pipeline PARENT task (`task.pipelineId` set)
+   *  opens the full-page run view instead of the run panel (D5); every
+   *  other task opens the run panel as before. Declared here (rather than
+   *  beside `onFocusNewTask` further down) so the app-events subscription
+   *  effect below — and the native-notification `open_task` deep link
+   *  handler in particular (m5) — can call it instead of duplicating the
+   *  pipelineId branch inline. Stable identity — passed to `Column`/
+   *  `TaskCard`, both memoized (see the `useCallback` block comment further
+   *  down). */
+  const openTask = useCallback((t: Task) => {
+    if (t.pipelineId) {
+      openPipelineRun(t.id);
+      return;
+    }
+    setSelected(t);
+  }, [openPipelineRun]);
 
   // Fade out the boot splash (defined in index.html) once React has mounted,
   // with a minimum dwell so fast machines don't flash a 200ms splash. Not
@@ -774,12 +842,13 @@ function AppInner() {
   // the board (D5, `docs/plans/pipelines.md`) — only when no dialog/popover/
   // RunPanel outranks it, same layer-precedence selector RunPanel's own
   // Cmd/Ctrl+F handler uses (`data-quote-open`/`data-search-open` included).
-  // The pipeline EDITOR is deliberately excluded: it has its own unsaved-
-  // changes guard on Back (`handleBack` in PipelineEditor.tsx) and exposes
-  // no imperative "ask first" hook this effect could call instead of
-  // `setView` directly — driving Escape straight to `setView` here would
-  // silently discard an in-progress edit. The editor still handles its own
-  // Escape-deselect (clicking off a selected node) internally.
+  // Routed through `navigate` (m2) for consistency with every other
+  // board-return path, though this listener is never even attached while
+  // `view.editing` is true (see below) — the pipeline EDITOR is deliberately
+  // excluded here: it has its own Escape-deselect (clicking off a selected
+  // node) to preserve, and its own Back button already confirms before
+  // calling `onBack` (see `pipelineEditorDirty`'s doc comment above), so a
+  // second guard here would double-prompt.
   useEffect(() => {
     if (view.kind === "board") return;
     if (view.kind === "pipelines" && view.editing) return;
@@ -787,11 +856,11 @@ function AppInner() {
       if (e.key !== "Escape") return;
       if (selectedIdRef.current !== null) return;
       if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open], [data-search-open]')) return;
-      setView({ kind: "board" });
+      navigate({ kind: "board" });
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [view]);
+  }, [view, navigate]);
 
   // Confirm-on-quit. The main process emits `quit_request` over the app
   // SSE channel when Cmd+Q / window close lands while runs are active. We
@@ -813,18 +882,20 @@ function AppInner() {
       }
       if (ev.type === "open_task") {
         // A native notification deep-link (`agetor://task/<id>`) was
-        // clicked. Open that task's RunPanel, fetching a fresh task list
-        // first if it isn't loaded yet (e.g. the task was just created and
-        // hasn't been picked up by the 2s poll). Mirrors the onOpen idiom
-        // in the GlobalEvent handler below, but this handler closes over
-        // its own scope, so the fresh list has to be fetched directly
-        // rather than relying on `tasksRef` updating synchronously after
-        // `setTasks`. No focusWindow() call here: this handler only fires
-        // after the main process has already handled `open-url` and focused
-        // the window itself, so a second call would be redundant.
+        // clicked. Open that task via `openTask` (m5) — a pipeline PARENT
+        // routes to its full-page run view instead of the run panel, same
+        // as a board card click — fetching a fresh task list first if it
+        // isn't loaded yet (e.g. the task was just created and hasn't been
+        // picked up by the 2s poll). Mirrors the onOpen idiom in the
+        // GlobalEvent handler below, but this handler closes over its own
+        // scope, so the fresh list has to be fetched directly rather than
+        // relying on `tasksRef` updating synchronously after `setTasks`. No
+        // focusWindow() call here: this handler only fires after the main
+        // process has already handled `open-url` and focused the window
+        // itself, so a second call would be redundant.
         const fresh = findTaskById(tasksRef.current, ev.taskId);
         if (fresh) {
-          setSelected(fresh);
+          openTask(fresh);
           return;
         }
         void (async () => {
@@ -833,7 +904,7 @@ function AppInner() {
             setTasks(list);
             const found = findTaskById(list, ev.taskId);
             if (found) {
-              setSelected(found);
+              openTask(found);
             }
             // else: silently no-op — the task doesn't exist (deleted?).
           } catch {
@@ -869,7 +940,7 @@ function AppInner() {
       });
     });
     return cancel;
-  }, [confirm, refreshAgentModels, refreshHarnessModels]);
+  }, [confirm, refreshAgentModels, refreshHarnessModels, openTask]);
 
   // App-wide lifecycle subscription. Drives toasts + native notifications.
   useEffect(() => {
@@ -894,16 +965,10 @@ function AppInner() {
       const subtitle = task?.agent;
       const onOpen = () => {
         const fresh = tasksRef.current.find((t) => t.id === ev.taskId);
-        if (fresh) {
-          // A pipeline PARENT task opens the full-page run view instead of
-          // the run panel (D5, `docs/plans/pipelines.md`), same as a board
-          // card click — see `openTask`.
-          if (fresh.pipelineId) {
-            openPipelineRun(fresh.id);
-          } else {
-            setSelected(fresh);
-          }
-        }
+        // `openTask` routes a pipeline PARENT task to its full-page run view
+        // instead of the run panel (D5, `docs/plans/pipelines.md`), same as
+        // a board card click.
+        if (fresh) openTask(fresh);
         // Best-effort: bring the agetor window forward when the user clicks
         // through from a toast. Unlike the open_task handler above, nothing
         // else focuses the window on this path — a WKWebView's own
@@ -948,18 +1013,26 @@ function AppInner() {
         // first-prompt alert for this task's next run.
         dismissPending(ev.taskId);
         pendingInputRef.current.clearTask(ev.taskId);
-        if (ev.status === "succeeded") {
-          toastSuccess({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
-        } else if (ev.status === "failed" || ev.status === "orphaned") {
-          toastError({
-            taskId: ev.taskId,
-            title,
-            subtitle,
-            isSelected,
-            isFocused,
-            onOpen,
-            reason: ev.status === "orphaned" ? "agetor restarted while running" : undefined,
-          });
+        // A hidden pipeline STEP task's own run settling never toasts (or OS-
+        // notifies, via `toastSuccess`/`toastError`'s internal
+        // `maybeNotifyOS`) on its own — the parent's own column/pipeline
+        // events are the user-facing signal (m3, mirrors the `blocked`
+        // suppression for `isPipelineStep` further down).
+        const isStepTask = task?.pipelineParentId != null;
+        if (!isStepTask) {
+          if (ev.status === "succeeded") {
+            toastSuccess({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+          } else if (ev.status === "failed" || ev.status === "orphaned") {
+            toastError({
+              taskId: ev.taskId,
+              title,
+              subtitle,
+              isSelected,
+              isFocused,
+              onOpen,
+              reason: ev.status === "orphaned" ? "agetor restarted while running" : undefined,
+            });
+          }
         }
         // `cancelled` is intentionally silent — the user issued the cancel.
         return;
@@ -1009,7 +1082,19 @@ function AppInner() {
       // degrade-gracefully posture as `refresh()` elsewhere in this file).
       if (ev.kind === "pipeline") {
         void api.getTask(ev.taskId)
-          .then((fresh) => setTasks((cur) => cur.map((t) => (t.id === fresh.id ? fresh : t))))
+          .then((fresh) => setTasks((cur) => cur.map((t) => {
+            if (t.id !== fresh.id) return t;
+            // M17 (client-side half — the server-side fix is F2's): an
+            // `interaction` event above can optimistically bump a pipeline
+            // PARENT's `pendingInteractionCount` faster than this refetch
+            // resolves. Never let a lower fetched count regress it for a
+            // parent — defensively keep the higher of the two rather than
+            // trust whichever response landed last.
+            if (fresh.pipelineId != null && fresh.pendingInteractionCount < t.pendingInteractionCount) {
+              return { ...fresh, pendingInteractionCount: t.pendingInteractionCount };
+            }
+            return fresh;
+          })))
           .catch(() => { /* 2s poll catches up */ });
         return;
       }
@@ -1047,10 +1132,23 @@ function AppInner() {
     };
     const cancel = api.subscribeGlobalEvents(handle);
     return cancel;
-    // `openPipelineRun` has a stable identity (its own `useCallback` has an
-    // empty dep array) — listing it doesn't cause a resubscribe, it just
-    // keeps this effect honest about what it closes over.
-  }, [openPipelineRun]);
+    // `openTask` has a stable identity (it, `openPipelineRun`, and `navigate`
+    // all read `view`/`pipelineEditorDirty` via refs rather than depending on
+    // them directly — see `viewRef`'s doc comment above) — listing it doesn't
+    // cause a resubscribe, it just keeps this effect honest about what it
+    // closes over.
+  }, [openTask]);
+
+  // Hidden pipeline STEP tasks never count toward anything user-facing (D11,
+  // `docs/plans/pipelines.md`) — the header's "N of M tasks" count and the
+  // harness filter's option set (m4) must both be computed over this, not
+  // the raw `tasks` state, or a running pipeline's hidden steps would
+  // silently inflate the total and spam the harness filter with ids the
+  // user never picked.
+  const nonStepTasks = useMemo(
+    () => tasks.filter((t) => t.pipelineParentId == null),
+    [tasks],
+  );
 
   // Text + repo filter applied here; status filter narrows the rendered
   // columns (not the task list) so an unselected status disappears entirely
@@ -1082,11 +1180,15 @@ function AppInner() {
     [statusFilter],
   );
 
-  // Distinct harness ids referenced by any task — feeds the harness filter so
-  // ids belonging to removed harnesses still show up as filter options.
+  // Distinct harness ids referenced by any (non-step) task — feeds the
+  // harness filter so ids belonging to removed harnesses still show up as
+  // filter options. Computed over `nonStepTasks` (m4) so a pipeline's
+  // hidden step tasks — which can run under a different harness per step —
+  // can't add filter options for harnesses the user never launched a
+  // visible task on.
   const taskAgentIds = useMemo(
-    () => Array.from(new Set(tasks.map((t) => t.agent))),
-    [tasks],
+    () => Array.from(new Set(nonStepTasks.map((t) => t.agent))),
+    [nonStepTasks],
   );
 
   // --- Onboarding derivation (pure lib/onboarding.ts, thin wiring here) ---
@@ -1154,32 +1256,21 @@ function AppInner() {
     setSettingsInitialSection("agents");
     setSettingsOpen(true);
   }, []);
-  /** Switch the app-level `view` to the full-page pipelines list. */
+  /** Switch the app-level `view` to the full-page pipelines list — the
+   *  header's Pipelines button (m2: routed through `navigate` so leaving a
+   *  dirty editor confirms first). */
   const openPipelinesPage = useCallback(() => {
-    setView({ kind: "pipelines", pipelineId: null, editing: false });
-  }, []);
+    navigate({ kind: "pipelines", pipelineId: null, editing: false });
+  }, [navigate]);
   /** Switch Settings' "Open pipelines page"/"Edit"/"New pipeline" affordances
    *  to the matching app-level view — Settings closes itself in the same
-   *  gesture (see the `SettingsDialog` `onOpenPipelines` prop below). */
+   *  gesture (see the `SettingsDialog` `onOpenPipelines` prop below). Routed
+   *  through `navigate` (m2) — Settings can be opened while mid-edit (the
+   *  gear icon stays live), so this can also be leaving a dirty editor. */
   const onSettingsOpenPipelines = useCallback((id: string | null, editing: boolean) => {
     setSettingsOpen(false);
-    setView({ kind: "pipelines", pipelineId: id, editing });
-  }, []);
-  /** Card click / row-open handler for every task in the board and every
-   *  other list that opens a task (Worktrees dialog, etc. still call
-   *  `setSelected` directly where a run panel is always the right target,
-   *  e.g. a step task). A pipeline PARENT task (`task.pipelineId` set)
-   *  opens the full-page run view instead of the run panel (D5); every
-   *  other task opens the run panel as before. Stable identity — passed to
-   *  `Column`/`TaskCard`, both memoized (see the `useCallback` block
-   *  comment further down). */
-  const openTask = useCallback((t: Task) => {
-    if (t.pipelineId) {
-      openPipelineRun(t.id);
-      return;
-    }
-    setSelected(t);
-  }, [openPipelineRun]);
+    navigate({ kind: "pipelines", pipelineId: id, editing });
+  }, [navigate]);
   const onFocusNewTask = useCallback(() => {
     setNewTaskFocusNonce((n) => n + 1);
   }, []);
@@ -1289,6 +1380,20 @@ function AppInner() {
       await refresh();
     }
   }, [refresh, surfaceError]);
+  // m6: clears the open run panel when it's showing a hidden pipeline STEP
+  // task whose parent is `parentId` — archiving/deleting a pipeline parent
+  // can cascade its steps out from under an open panel that was pointed at
+  // one directly (e.g. via the pipeline run view). Deliberately does NOT
+  // clear when `selected` IS `parentId` itself — archiving (unlike delete)
+  // doesn't remove the row, and the panel staying open on the now-archived
+  // task is the existing, still-correct behavior. Reads refs rather than
+  // `selected` directly so `archive`/`del` keep a stable identity.
+  const clearSelectedStepOf = useCallback((parentId: string) => {
+    const openId = selectedIdRef.current;
+    if (!openId) return;
+    const open = tasksRef.current.find((x) => x.id === openId);
+    if (open?.pipelineParentId === parentId) setSelected(null);
+  }, []);
   const archive = useCallback(async (t: Task) => {
     const active = t.column === "running" || t.column === "blocked";
     if (active) {
@@ -1306,12 +1411,13 @@ function AppInner() {
     try {
       setError(null);
       await api.archiveTask(t.id, active ? { force: true, stopRun: true } : undefined);
+      clearSelectedStepOf(t.id);
       await refresh();
     } catch (e) {
       surfaceError(e);
       await refresh();
     }
-  }, [confirm, refresh, surfaceError]);
+  }, [confirm, refresh, surfaceError, clearSelectedStepOf]);
   const unarchive = useCallback(async (t: Task) => {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: null } : x)));
     try {
@@ -1346,13 +1452,23 @@ function AppInner() {
       setError(null);
       await api.deleteTask(t.id);
       if (selectedIdRef.current === t.id) setSelected(null);
+      // m6: a step task's own panel can't outlive its deleted parent either.
+      clearSelectedStepOf(t.id);
+      // m6: the full-page pipeline run view has nothing left to show once
+      // its own task is gone — back to the board. Reads `viewRef` (not
+      // `view` directly) so `del` keeps a stable identity; `navigate` is
+      // used (rather than a bare `setView`) purely for consistency — there's
+      // no pipeline-editor dirty state to protect on this path.
+      if (viewRef.current.kind === "pipeline-run" && viewRef.current.taskId === t.id) {
+        navigate({ kind: "board" });
+      }
       await refresh();
     } catch (e) {
       surfaceError(e);
       // Refresh anyway so the UI matches the server.
       await refresh();
     }
-  }, [confirm, refresh, surfaceError]);
+  }, [confirm, refresh, surfaceError, clearSelectedStepOf, navigate]);
 
   // Best-effort "reveal in Finder" — same fire-and-forget idiom as
   // RunPanel's own Open button (`RunPanel.tsx`'s `api.openPath` call): a
@@ -1676,9 +1792,11 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         </div>
         <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2">
           <span className="text-xs text-muted-foreground">
-            {visibleTasks.length === tasks.length
-              ? `${tasks.length} tasks`
-              : `${visibleTasks.length} of ${tasks.length} tasks`}
+            {/* m4: counted over `nonStepTasks`, not raw `tasks` — a hidden
+                pipeline step must not inflate the total. */}
+            {visibleTasks.length === nonStepTasks.length
+              ? `${nonStepTasks.length} tasks`
+              : `${visibleTasks.length} of ${nonStepTasks.length} tasks`}
           </span>
           <Button
             variant="ghost"
@@ -1726,6 +1844,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           profiles={profiles}
           onOpenSettingsAgents={openSettingsAgents}
           pipelines={pipelines}
+          pipelinesLoaded={pipelinesLoaded}
           onOpenPipelines={openPipelinesPage}
           agentModels={agentModels}
           harnessModels={harnessModels}
@@ -1749,6 +1868,11 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               if (input.branch && created.branch && created.branch !== input.branch) {
                 toast(`Branch set to “${created.branch}” to keep it unique.`);
               }
+              // nit8: keep the picker's per-pipeline `taskCount` fresh right
+              // away rather than waiting on Settings/the editor's own
+              // refetch triggers — fire-and-forget, same posture as every
+              // other best-effort refresh in this handler.
+              if (input.pipelineId) void refreshPipelines();
               await refresh();
               if (start) {
                 // Refreshes internally, so no second refresh here.
@@ -1907,11 +2031,23 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               >
                 <PipelineEditor
                   pipelineId={view.pipelineId}
-                  onBack={() => setView({ kind: "pipelines", pipelineId: null, editing: false })}
+                  // Set directly (not `navigate`) — the editor's own Back
+                  // button already ran its own confirm-then-call before
+                  // reaching here (see `pipelineEditorDirty`'s doc comment
+                  // above); a second guard would double-prompt. Reset the
+                  // dirty flag defensively so a NEXT editor session doesn't
+                  // inherit a stale `true` if `onDirtyChange(false)` didn't
+                  // already fire before this callback ran.
+                  onBack={() => {
+                    setPipelineEditorDirty(false);
+                    setView({ kind: "pipelines", pipelineId: null, editing: false });
+                  }}
                   onSaved={() => {
+                    setPipelineEditorDirty(false);
                     setView({ kind: "pipelines", pipelineId: null, editing: false });
                     void refreshPipelines();
                   }}
+                  onDirtyChange={setPipelineEditorDirty}
                 />
               </motion.div>
             )}

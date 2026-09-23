@@ -3,29 +3,21 @@ import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
 import { Merge, Play, Plus, Split } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { StepVisualState } from "@/lib/pipelines";
-import type { AgentProfile, AgentProfileSnapshot, PipelineStep } from "../../../shared/types.ts";
+import type { PipelineStep } from "../../../shared/types.ts";
 import { AgentProfileCard } from "../kanban/AgentProfileCard";
+import { usePipelineCanvasContext } from "./pipeline-canvas-context";
 
 /** Node `data` shape for the pipelines canvas's custom `"step"` node type —
- *  everything {@link StepNode} needs to render one step, resolved by the
- *  caller (editor or run view) from the live/frozen graph plus whatever
- *  agent-profile/visual-state lookups it has on hand. An intersection with
- *  `Record<string, unknown>` (not `interface … extends Record<…>`, which
- *  TS rejects for a mapped type) so it satisfies React Flow's
- *  `Node<NodeData extends Record<string, unknown>>` constraint. */
+ *  everything {@link StepNode} needs to render one step, EXCEPT the agent
+ *  profile lookup and the start-step flag, which come from
+ *  {@link usePipelineCanvasContext} instead of `data` on purpose (review
+ *  M11 — see `pipeline-canvas-context.tsx`'s doc comment for why). An
+ *  intersection with `Record<string, unknown>` (not `interface … extends
+ *  Record<…>`, which TS rejects for a mapped type) so it satisfies React
+ *  Flow's `Node<NodeData extends Record<string, unknown>>` constraint. */
 export type StepNodeData = Record<string, unknown> & {
   step: PipelineStep;
-  /** The step's bound agent profile — live `AgentProfile` in the editor,
-   *  frozen `AgentProfileSnapshot` in a started run's read-only view — or
-   *  `null` when the step has no profile bound yet. */
-  profile: AgentProfileSnapshot | AgentProfile | null;
-  /** The step names a profile id that no longer resolves (editor: deleted
-   *  from Settings; run view: not in the frozen snapshot). */
-  profileDeleted: boolean;
-  isStart: boolean;
   visual?: StepVisualState;
-  /** `transition: "all"` fan-out — the shared-worktree caution note. */
-  parallelWarning?: boolean;
   /** Read-only (run view): hides the "+" append affordance. */
   readOnly?: boolean;
   /** Appends a new step connected to this one's output — omit (or pair
@@ -45,7 +37,11 @@ const VISUAL_CLASSES: Record<StepVisualState, string> = {
 };
 
 function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
-  const { step, profile, profileDeleted, isStart, visual = "idle", parallelWarning, readOnly, onAppend } = data;
+  const { step, visual = "idle", readOnly, onAppend } = data;
+  const { startStepId, resolveProfile } = usePipelineCanvasContext();
+  const { profile, profileDeleted } = resolveProfile(step.agentProfileId ?? null);
+  const isStart = startStepId === step.id;
+  const parallelWarning = step.transition === "all";
 
   return (
     <div
@@ -90,6 +86,10 @@ function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
       <div className="mt-1.5 min-w-0">
         {profile ? (
           <AgentProfileCard profile={profile} variant="chip" deleted={profileDeleted} className="max-w-full" />
+        ) : profileDeleted ? (
+          <span data-testid="pipeline-step-profile-deleted" className="text-xs text-danger">
+            Deleted agent
+          </span>
         ) : (
           <span className="text-xs text-warning">No agent</span>
         )}
@@ -105,7 +105,7 @@ function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
         type="source"
         id="out"
         position={Position.Right}
-        className="!size-2.5 !border-2 !border-background !bg-info"
+        className="!-right-1.5 !size-2.5 !border-2 !border-background !bg-info"
       />
 
       {!readOnly && onAppend && (
@@ -114,7 +114,7 @@ function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
           data-testid="pipeline-step-append"
           title="Add a connected step"
           onClick={() => onAppend(step.id)}
-          className="absolute -right-3 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-card text-muted-foreground shadow-sm hover:bg-accent hover:text-foreground"
+          className="absolute -right-9 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-card text-muted-foreground shadow-sm hover:bg-accent hover:text-foreground"
         >
           <Plus className="size-3.5" aria-hidden />
         </button>

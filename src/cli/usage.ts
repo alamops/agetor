@@ -94,7 +94,8 @@ export const USAGE: Record<string, string> = {
 
   cancel: `usage: agetor cancel <task-id>
 
-  Stop the active run. The session stays alive for follow-ups (claude-code).`,
+  Stop the active run. The session stays alive for follow-ups (claude-code).
+  On a pipeline task, stops every currently-active step execution instead.`,
 
   attach: `usage: agetor attach <task-id>
 
@@ -185,12 +186,17 @@ export const USAGE: Record<string, string> = {
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced).`,
 
-  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file>] | import <file> [--name <n>]>
+  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file>] | import <file> [--name <n>] | retry <task> | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>
 
   Manage pipelines — named graphs of agent-profile-bound steps launched as
   one board task (built in the app's Pipelines editor; the CLI moves them
-  around). <ref> is a pipeline id or its (unique, case-insensitive) name.
-  Launch one with 'agetor add --pipeline <id|name>'.`,
+  around) — and control a pipeline TASK's run.
+    ls / show / rm / export / import   take a pipeline <ref> (id, or its
+                                        unique case-insensitive name)
+    retry / advance / restart / status take a pipeline TASK <ref> (id or
+                                        short-id prefix, like every other
+                                        task-targeting command)
+  Launch a pipeline with 'agetor add --pipeline <id|name>'.`,
 
   "pipeline export": `usage: agetor pipeline export <ref> [--out <file>]
 
@@ -201,6 +207,29 @@ export const USAGE: Record<string, string> = {
 
   Create a pipeline from an exported JSON file ('-' reads stdin). --name
   overrides the file's own name.`,
+
+  "pipeline retry": `usage: agetor pipeline retry <task-id>
+
+  Retry the pipeline run's currently blocked (or cancelled) step
+  execution(s). 409 unless the run is actually blocked or cancelled.`,
+
+  "pipeline advance": `usage: agetor pipeline advance <task-id> [--next <step-name-or-id> …] [--finish] [--from <step-task-id>]
+
+  Manually resolve what a pipeline run is currently waiting on. --next
+  (repeatable) names the step(s) to run next — matched by name, then id,
+  against the run's snapshot graph; --finish ends the run here with no next
+  step. Exactly one of --next / --finish is required. --from targets a
+  specific blocked/awaiting execution when more than one is in play (e.g. a
+  fan-out); omitted, the sole such execution is used.`,
+
+  "pipeline restart": `usage: agetor pipeline restart <task-id>
+
+  Restart the pipeline run from its start step, discarding current progress.`,
+
+  "pipeline status": `usage: agetor pipeline status <task-id>
+
+  Print the pipeline task's run status, blocked entries, active step
+  executions, and full step history.`,
 
   daemon: `usage: agetor daemon <status | start | stop>
 

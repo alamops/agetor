@@ -691,3 +691,500 @@ test("effectiveAgentProfile returns the frozen snapshot (never \"live\") for a s
   // test returns, same reasoning as every other test in this file.
   await waitUntilIdle(parentId);
 });
+
+// ---------------------------------------------------------------------------
+// Review-fix regression coverage (M1-M16, m8-m13)
+// ---------------------------------------------------------------------------
+
+test("M1: handoff status:\"blocked\" records a step-blocked entry without advancing; advancePipeline resolves it", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines, runs } = await import("./db.ts");
+  const { newStep, HANDOFF_TAG } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { advancePipeline, __forTest } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("blocked-status");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const graph = { steps: [A, B], edges: [{ id: "e1", from: A.id, to: B.id, label: "" }], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("blocked-status-pipeline"), graph, maxSteps: 25 });
+
+  const created = await createTask({ title: "blocked-status run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  let stepA: ReturnType<typeof tasks.get> = null;
+  __forTest.setListenerEnabled(false);
+  try {
+    const started = await startTask(parentId);
+    if ("error" in started) throw new Error(started.error);
+
+    stepA = await waitFor(() => tasks.stepsForParent(parentId)[0]);
+    const runRow = await waitFor(() => {
+      const r = runs.listForTask(stepA!.id)[0];
+      return r && r.status !== "running" ? r : undefined;
+    });
+
+    // Simulate A's OWN turn ending with a well-formed handoff whose
+    // `status` is `"blocked"` (a real handoff, just one reporting it
+    // couldn't finish) — appended after the fake driver's own `:done`
+    // handoff so `parseHandoff`'s "last block wins" picks this one up.
+    const blockedHandoff = {
+      schemaVersion: 1,
+      purpose: "p",
+      summary: "s",
+      reason: "waiting on a decision",
+      next: null,
+      artifacts: [] as string[],
+      openQuestions: ["which approach?"],
+      status: "blocked" as const,
+    };
+    runs.appendEvent(runRow.id, "assistant", `Done.\n<${HANDOFF_TAG}>\n${JSON.stringify(blockedHandoff)}\n</${HANDOFF_TAG}>`);
+    await __forTest.handleRunStatus(stepA.id, runRow.id, "succeeded");
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+
+  const afterBlock = tasks.get(parentId)!;
+  const run = afterBlock.pipelineRun!;
+  const block = run.blocked.find((b) => b.taskId === stepA!.id);
+  expect(block?.kind).toBe("step-blocked");
+  expect(block?.message).toContain("reported it is blocked");
+  expect(block?.message).toContain("which approach?");
+  // Not advanced — the execution is still sitting in `active`, not resolved.
+  expect(run.active.length).toBe(1);
+  expect(run.active[0]!.taskId).toBe(stepA!.id);
+  const historyA = run.history.find((h) => h.taskId === stepA!.id);
+  expect(historyA?.outcome).toBeNull();
+  expect(historyA?.endedAt).toBeNull();
+  expect(historyA?.handoff?.status).toBe("blocked");
+
+  const advanced = await advancePipeline(parentId, { nextStepIds: [B.id] });
+  if ("error" in advanced) throw new Error(advanced.error);
+
+  const done = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" ? t : undefined;
+  });
+  expect(done.column).toBe("review");
+  const advancedRecord = done.pipelineRun!.history.find((h) => h.taskId === stepA!.id);
+  expect(advancedRecord?.outcome).toBe("advanced-manually");
+  await waitUntilIdle(parentId);
+});
+
+test("M2: a step-cap block carries a pending launch; retryPipelineStep extends the cap and continues", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { retryPipelineStep } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("cap-retry");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const graph = {
+    steps: [A, B],
+    edges: [
+      { id: "e1", from: A.id, to: B.id, label: "" },
+      { id: "e2", from: B.id, to: A.id, label: "" },
+    ],
+    startStepId: A.id,
+  };
+  const pipeline = pipelines.insert({ name: uniqueName("cap-retry-pipeline"), graph, maxSteps: 3 });
+
+  const created = await createTask({ title: "cap-retry run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  const blocked = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "blocked" ? t : undefined;
+  });
+  const capBlock = blocked.pipelineRun!.blocked.find((b) => b.kind === "step-cap");
+  expect(capBlock).toBeTruthy();
+  expect(capBlock?.pending).toBeTruthy();
+  expect(blocked.pipelineRun!.stepCount).toBe(3);
+
+  const retried = await retryPipelineStep(parentId);
+  if ("error" in retried) throw new Error(retried.error);
+
+  // capExtensions doubles the allowance (3 -> 6), so the run keeps going
+  // (steps 4, 5, 6) before blocking on step-cap again at 6.
+  const blockedAgain = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "blocked" && t.pipelineRun.stepCount > 3 ? t : undefined;
+  }, 8000);
+  expect(blockedAgain.pipelineRun!.stepCount).toBe(6);
+  expect(blockedAgain.pipelineRun!.capExtensions).toBe(1);
+  expect(blockedAgain.pipelineRun!.blocked.some((b) => b.kind === "step-cap")).toBe(true);
+  await waitUntilIdle(parentId);
+});
+
+test("M2: a finished pipeline refuses a plain Run (\"restart it explicitly\"); startPipelineRun({restart:true}) starts fresh", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { startPipelineRun } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("restart");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const graph = { steps: [A], edges: [], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("restart-pipeline"), graph, maxSteps: 25 });
+
+  const created = await createTask({ title: "restart run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  const finished = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" ? t : undefined;
+  });
+  expect(finished.column).toBe("review");
+  expect(finished.pipelineRun!.history.length).toBe(1);
+
+  const plainRun = await startTask(parentId);
+  expect("error" in plainRun).toBe(true);
+  if ("error" in plainRun) expect(plainRun.error).toContain("restart it explicitly");
+  // Refusing must not have mutated anything.
+  expect(tasks.get(parentId)!.pipelineRun!.status).toBe("done");
+
+  const restarted = await startPipelineRun(tasks.get(parentId)!, { restart: true });
+  if ("error" in restarted) throw new Error(restarted.error);
+
+  const finishedAgain = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" && t.pipelineRun.startedAt !== finished.pipelineRun!.startedAt ? t : undefined;
+  });
+  // A fresh run — history reset to exactly this run's one execution, not
+  // accumulated on top of the prior run's.
+  expect(finishedAgain.pipelineRun!.history.length).toBe(1);
+  await waitUntilIdle(parentId);
+});
+
+test("M4: advancePipeline refuses (409) while the target step is still genuinely live", async () => {
+  process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = "700";
+  try {
+    const { createTask, startTask } = await import("./orchestrator.ts");
+    const { tasks, pipelines } = await import("./db.ts");
+    const { newStep } = await import("../shared/pipeline.ts");
+    const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+    const { advancePipeline } = await import("./pipeline-runner.ts");
+
+    const profile = await makeProfile("advance-live-guard");
+    const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+    const graph = { steps: [A], edges: [], startStepId: A.id };
+    const pipeline = pipelines.insert({ name: uniqueName("advance-live-pipeline"), graph, maxSteps: 25 });
+
+    const created = await createTask({ title: "advance-live run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+    if ("error" in created) throw new Error(created.error);
+    const parentId = created.task.id;
+    liveParentIds.push(parentId);
+    const started = await startTask(parentId);
+    if ("error" in started) throw new Error(started.error);
+
+    const stepA = await waitFor(() => {
+      const s = tasks.stepsForParent(parentId)[0];
+      return s?.column === "running" ? s : undefined;
+    });
+
+    const result = await advancePipeline(parentId, { fromTaskId: stepA.id, nextStepIds: null });
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.status).toBe(409);
+      expect(result.error).toContain("still running");
+    }
+    await waitUntilIdle(parentId);
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
+  }
+});
+
+test("M5: stopping one step directly (not the whole pipeline) doesn't cancel a still-live sibling", async () => {
+  process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = "700";
+  try {
+    const { createTask, startTask, cancelRun } = await import("./orchestrator.ts");
+    const { tasks, pipelines } = await import("./db.ts");
+    const { newStep } = await import("../shared/pipeline.ts");
+    const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+    const { advancePipeline } = await import("./pipeline-runner.ts");
+
+    const profile = await makeProfile("stop-one-of-two");
+    const A = newStep({ name: "A", agentProfileId: profile.id, transition: "all", instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+    const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+    const C = newStep({ name: "C", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+    const graph = {
+      steps: [A, B, C],
+      edges: [
+        { id: "e1", from: A.id, to: B.id, label: "" },
+        { id: "e2", from: A.id, to: C.id, label: "" },
+      ],
+      startStepId: A.id,
+    };
+    const pipeline = pipelines.insert({ name: uniqueName("stop-one-pipeline"), graph, maxSteps: 25 });
+
+    const created = await createTask({ title: "stop-one run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+    if ("error" in created) throw new Error(created.error);
+    const parentId = created.task.id;
+    liveParentIds.push(parentId);
+    const started = await startTask(parentId);
+    if ("error" in started) throw new Error(started.error);
+
+    await waitFor(() => {
+      const steps = tasks.stepsForParent(parentId).filter((s) => s.pipelineStepId !== A.id);
+      return steps.length === 2 && steps.every((s) => s.column === "running") ? steps : undefined;
+    }, 8000);
+    const stepB = tasks.stepsForParent(parentId).find((s) => s.pipelineStepId === B.id)!;
+
+    await cancelRun(stepB.runId!);
+
+    // Wait on the PIPELINE RUN's own reflection of the stop, not just B's
+    // task column — `updateColumn` (sync) and this runner's own
+    // `handleRunStatus` (dispatched via `void handleRunStatus(...)`, so
+    // genuinely async relative to the column flip) are two separate
+    // observers of the same settle event, and the column can flip to
+    // `ready` a beat before the pipeline history entry is updated.
+    const afterStop = await waitFor(() => {
+      const t = tasks.get(parentId);
+      const h = t?.pipelineRun?.history.find((x) => x.taskId === stepB.id);
+      return h?.outcome === "cancelled" ? t : undefined;
+    });
+    // The whole run must NOT have been cancelled — C is still live.
+    expect(afterStop!.pipelineRun!.status).not.toBe("cancelled");
+    expect(afterStop!.column).not.toBe("ready");
+    const runAfterStop = afterStop!.pipelineRun!;
+    expect(runAfterStop.active.some((a) => a.taskId === stepB.id)).toBe(true);
+    const bHistory = runAfterStop.history.find((h) => h.taskId === stepB.id);
+    expect(bHistory?.outcome).toBe("cancelled");
+
+    // Clean up the dangling stopped-but-not-resolved step so the run can
+    // reach a terminal state (mirrors what a user would do from the UI:
+    // Advance it to a dead end since it wasn't going to be retried).
+    const resolvedB = await advancePipeline(parentId, { fromTaskId: stepB.id, nextStepIds: null });
+    if ("error" in resolvedB) throw new Error(resolvedB.error);
+
+    const finished = await waitFor(() => {
+      const t = tasks.get(parentId);
+      return t?.pipelineRun?.status === "done" ? t : undefined;
+    }, 8000);
+    expect(finished.column).toBe("review");
+    await waitUntilIdle(parentId);
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
+  }
+});
+
+test("M3: join-incomplete advance with nextStepIds:null drops the partial join and finishes without launching it", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { advancePipeline } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("join-incomplete-null");
+  const A = newStep({ name: "A", agentProfileId: profile.id, transition: "all", instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  // C never actually hands off to D — it picks E instead (marker :E).
+  const C = newStep({ name: "C", agentProfileId: profile.id, transition: "choose", instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:E` });
+  const D = newStep({ name: "D", agentProfileId: profile.id, join: "all", instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const E = newStep({ name: "E", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const graph = {
+    steps: [A, B, C, D, E],
+    edges: [
+      { id: "e1", from: A.id, to: B.id, label: "" },
+      { id: "e2", from: A.id, to: C.id, label: "" },
+      { id: "e3", from: B.id, to: D.id, label: "" },
+      { id: "e4", from: C.id, to: D.id, label: "" },
+      { id: "e5", from: C.id, to: E.id, label: "" },
+    ],
+    startStepId: A.id,
+  };
+  const pipeline = pipelines.insert({ name: uniqueName("join-null-pipeline"), graph, maxSteps: 25 });
+
+  const created = await createTask({ title: "join-incomplete-null run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  const blocked = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "blocked" ? t : undefined;
+  }, 8000);
+  expect(blocked.pipelineRun!.blocked.some((b) => b.kind === "join-incomplete")).toBe(true);
+
+  const advanced = await advancePipeline(parentId, { nextStepIds: null });
+  if ("error" in advanced) throw new Error(advanced.error);
+
+  const finished = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" ? t : undefined;
+  }, 8000);
+  const steps = tasks.stepsForParent(parentId);
+  expect(steps.some((s) => s.pipelineStepId === D.id)).toBe(false);
+  expect(Object.keys(finished.pipelineRun!.joins).length).toBe(0);
+  await waitUntilIdle(parentId);
+});
+
+test("M10: step tasks carry the parent's own references plus the handoff file reference", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+
+  const profile = await makeProfile("refs-propagation");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const graph = { steps: [A, B], edges: [{ id: "e1", from: A.id, to: B.id, label: "" }], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("refs-pipeline"), graph, maxSteps: 25 });
+
+  const parentRefPath = path.join(freshWorkdir(), "notes.md");
+  const created = await createTask({
+    title: "refs run",
+    prompt: "goal",
+    workdir: freshWorkdir(),
+    isolation: "none",
+    pipelineId: pipeline.id,
+    references: [{ path: parentRefPath, isDirectory: false }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  expect(created.task.references).toEqual([{ path: parentRefPath, isDirectory: false }]);
+
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  const finished = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" ? t : undefined;
+  });
+  expect(finished.column).toBe("review");
+
+  const steps = tasks.stepsForParent(parentId);
+  const stepA = steps.find((s) => s.pipelineStepId === A.id)!;
+  const stepB = steps.find((s) => s.pipelineStepId === B.id)!;
+
+  // A is the first step — no prior handoff, so its references are just the
+  // parent's own.
+  expect(stepA.references).toEqual([{ path: parentRefPath, isDirectory: false }]);
+
+  // B's references carry the parent's own reference PLUS a handoff file
+  // reference written from A's handoff.
+  expect(stepB.references.some((r) => r.path === parentRefPath)).toBe(true);
+  expect(stepB.references.length).toBeGreaterThan(1);
+  expect(stepB.references.some((r) => r.path.includes("handoff-") && r.path.endsWith(".json"))).toBe(true);
+
+  await waitUntilIdle(parentId);
+});
+
+test("M16: reconcilePipelineRuns catches a step settle the listener never saw", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines, runs } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { reconcilePipelineRuns, __forTest } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("reconcile-missed");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const graph = { steps: [A, B], edges: [{ id: "e1", from: A.id, to: B.id, label: "" }], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("reconcile-pipeline"), graph, maxSteps: 25 });
+
+  const created = await createTask({ title: "reconcile run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  let stepA: ReturnType<typeof tasks.get> = null;
+  __forTest.setListenerEnabled(false);
+  try {
+    const started = await startTask(parentId);
+    if ("error" in started) throw new Error(started.error);
+
+    stepA = await waitFor(() => tasks.stepsForParent(parentId)[0]);
+    await waitFor(() => {
+      const r = runs.listForTask(stepA!.id)[0];
+      return r && r.status === "succeeded" ? r : undefined;
+    });
+
+    // The listener never processed this settle — the parent is still
+    // "running" with A sitting in `active` even though its real run has
+    // already succeeded.
+    expect(tasks.get(parentId)!.pipelineRun!.active.length).toBe(1);
+    expect(tasks.get(parentId)!.pipelineRun!.status).toBe("running");
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+
+  const reconciledCount = await reconcilePipelineRuns();
+  expect(reconciledCount).toBeGreaterThanOrEqual(1);
+
+  const finished = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" ? t : undefined;
+  });
+  expect(finished.column).toBe("review");
+  await waitUntilIdle(parentId);
+});
+
+test("archived pipeline parent refuses start/advance/retry with archived-guard errors", async () => {
+  const { createTask, startTask, archiveTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { advancePipeline, retryPipelineStep, startPipelineRun } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("archived-guard");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing` });
+  const graph = { steps: [A], edges: [], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("archived-pipeline"), graph, maxSteps: 25 });
+
+  const created = await createTask({ title: "archived run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  const blocked = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "blocked" ? t : undefined;
+  });
+  expect(blocked.pipelineRun!.blocked.some((b) => b.kind === "handoff-missing")).toBe(true);
+
+  const archived = await archiveTask(parentId, { force: true });
+  if ("error" in archived) throw new Error(archived.error);
+  expect(tasks.get(parentId)!.archivedAt).not.toBeNull();
+
+  const advanceResult = await advancePipeline(parentId, { nextStepIds: null });
+  expect("error" in advanceResult).toBe(true);
+  if ("error" in advanceResult) {
+    expect(advanceResult.status).toBe(409);
+    expect(advanceResult.error).toContain("archived");
+  }
+
+  const retryResult = await retryPipelineStep(parentId);
+  expect("error" in retryResult).toBe(true);
+  if ("error" in retryResult) {
+    expect(retryResult.status).toBe(409);
+    expect(retryResult.error).toContain("archived");
+  }
+
+  // `startTask` itself auto-unarchives ANY task (including a pipeline
+  // parent) before dispatching, by design — so the archived guard here is
+  // only reachable via a caller that bypasses that, exactly like the real
+  // `POST /tasks/:id/pipeline/restart` route does (it calls
+  // `startPipelineRun` directly, never through `startTaskInner`).
+  const startResult = await startPipelineRun(tasks.get(parentId)!, { restart: true });
+  expect("error" in startResult).toBe(true);
+  if ("error" in startResult) expect(startResult.error).toContain("archived");
+});

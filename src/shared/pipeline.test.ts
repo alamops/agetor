@@ -1,14 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import {
   HANDOFF_TAG,
+  HANDOFF_UNTRUSTED_CONTENT_WARNING,
   composeStepPrompt,
   deriveRunStatus,
+  effectiveStepCap,
   incomingSteps,
   matchPipelineRef,
   newStep,
+  normalizeHandoff,
   outgoingSteps,
   parseHandoff,
   pipelineStepProgress,
+  renderHandoffFile,
   resolveNextSteps,
   resolveStartStep,
   stepNameById,
@@ -23,6 +27,7 @@ import type {
   PipelineRunState,
   PipelineStep,
 } from "./types.ts";
+import { PIPELINE_LIMITS } from "./types.ts";
 
 function makeStep(overrides: Partial<PipelineStep> = {}): PipelineStep {
   return {
@@ -324,6 +329,126 @@ describe("validatePipelineGraph", () => {
     const result = validatePipelineGraph({ steps, edges });
     expect(result.ok).toBe(false);
   });
+
+  test("rejects a step id over PIPELINE_LIMITS.id chars", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "x".repeat(PIPELINE_LIMITS.id + 1) })],
+      edges: [],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/step id .* exceeds/);
+  });
+
+  test("accepts a step id exactly at PIPELINE_LIMITS.id chars", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "x".repeat(PIPELINE_LIMITS.id) })],
+      edges: [],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test("rejects an edge id over PIPELINE_LIMITS.id chars", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" })],
+      edges: [makeEdge({ id: "e".repeat(PIPELINE_LIMITS.id + 1), from: "a", to: "b" })],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/edge id .* exceeds/);
+  });
+
+  test("rejects an edge label over PIPELINE_LIMITS.edgeLabel chars", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" })],
+      edges: [makeEdge({ id: "e1", from: "a", to: "b", label: "x".repeat(PIPELINE_LIMITS.edgeLabel + 1) })],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/label exceeds/);
+  });
+
+  test("accepts an edge label exactly at PIPELINE_LIMITS.edgeLabel chars", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" })],
+      edges: [makeEdge({ id: "e1", from: "a", to: "b", label: "x".repeat(PIPELINE_LIMITS.edgeLabel) })],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test("rejects more than PIPELINE_LIMITS.subagentProfiles profile ids", () => {
+    const profileIds = Array.from({ length: PIPELINE_LIMITS.subagentProfiles + 1 }, (_, i) => `p${i}`);
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a", subagents: { profileIds, cap: null } })],
+      edges: [],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/subagents\.profileIds exceeds/);
+  });
+
+  test("accepts exactly PIPELINE_LIMITS.subagentProfiles profile ids", () => {
+    const profileIds = Array.from({ length: PIPELINE_LIMITS.subagentProfiles }, (_, i) => `p${i}`);
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a", subagents: { profileIds, cap: null } })],
+      edges: [],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test("rejects a subagents.cap over PIPELINE_LIMITS.subagentCap", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a", subagents: { profileIds: [], cap: PIPELINE_LIMITS.subagentCap + 1 } })],
+      edges: [],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/subagents\.cap exceeds/);
+  });
+
+  test("accepts a subagents.cap exactly at PIPELINE_LIMITS.subagentCap", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a", subagents: { profileIds: [], cap: PIPELINE_LIMITS.subagentCap } })],
+      edges: [],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test("clamps an out-of-range finite position into [-positionAbs, positionAbs]", () => {
+    const result = validatePipelineGraph({
+      steps: [{ ...makeStep({ id: "a" }), position: { x: PIPELINE_LIMITS.positionAbs * 2, y: -PIPELINE_LIMITS.positionAbs * 2 } }],
+      edges: [],
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.graph.steps[0]!.position).toEqual({
+        x: PIPELINE_LIMITS.positionAbs,
+        y: -PIPELINE_LIMITS.positionAbs,
+      });
+    }
+  });
+
+  test("accepts a position exactly at positionAbs unchanged", () => {
+    const result = validatePipelineGraph({
+      steps: [{ ...makeStep({ id: "a" }), position: { x: PIPELINE_LIMITS.positionAbs, y: 0 } }],
+      edges: [],
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.graph.steps[0]!.position).toEqual({ x: PIPELINE_LIMITS.positionAbs, y: 0 });
+  });
+
+  test("rejects a step with a missing/empty id even when other fields are otherwise valid", () => {
+    const result = validatePipelineGraph({
+      steps: [{ ...makeStep({}), id: "" }],
+      edges: [],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/non-empty id/);
+  });
+
+  test("rejects an edge with a missing/empty id", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" })],
+      edges: [{ ...makeEdge({}), id: "" }],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/non-empty id/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -568,6 +693,67 @@ describe("parseHandoff", () => {
 });
 
 // ---------------------------------------------------------------------------
+// normalizeHandoff
+
+describe("normalizeHandoff", () => {
+  test("normalizes a well-formed object exactly like parseHandoff's own normalization", () => {
+    const raw = JSON.parse(fullHandoffJson());
+    const handoff = normalizeHandoff(raw);
+    expect(handoff.purpose).toBe("Ship the feature");
+    expect(handoff.next).toBe("Step 2");
+    expect(handoff.artifacts).toEqual(["src/foo.ts"]);
+    expect(handoff.status).toBe("done");
+    expect(handoff.schemaVersion).toBe(1);
+  });
+
+  test("non-object input normalizes to all-defaults with status undefined", () => {
+    for (const input of [null, undefined, "nope", 42, [], true]) {
+      const handoff = normalizeHandoff(input);
+      expect(handoff).toEqual({
+        schemaVersion: 1,
+        purpose: "",
+        summary: "",
+        reason: "",
+        next: null,
+        artifacts: [],
+        openQuestions: [],
+      });
+      expect(handoff.status).toBeUndefined();
+    }
+  });
+
+  test("caps a string field and an array field the same as parseHandoff", () => {
+    const handoff = normalizeHandoff({ summary: "x".repeat(9000), artifacts: Array.from({ length: 60 }, (_, i) => `f${i}`) });
+    expect(handoff.summary.length).toBe(PIPELINE_LIMITS.handoffField);
+    expect(handoff.artifacts).toHaveLength(PIPELINE_LIMITS.handoffArray);
+  });
+
+  test("never throws on hostile input", () => {
+    expect(() => normalizeHandoff({ next: 123, artifacts: "not-an-array", status: {} })).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderHandoffFile
+
+describe("renderHandoffFile", () => {
+  test("includes the untrusted-content warning, step name, seq, and the handoff itself", () => {
+    const handoff = fullHandoffJsonObj({ summary: "Found the bug" });
+    const rendered = renderHandoffFile({ fromStepName: "Investigate", seq: 3, handoff });
+    const parsed = JSON.parse(rendered);
+    expect(parsed._untrusted).toBe(HANDOFF_UNTRUSTED_CONTENT_WARNING);
+    expect(parsed.fromStep).toBe("Investigate");
+    expect(parsed.seq).toBe(3);
+    expect(parsed.handoff).toEqual(handoff);
+  });
+
+  test("is pretty-printed JSON", () => {
+    const rendered = renderHandoffFile({ fromStepName: "S", seq: 1, handoff: fullHandoffJsonObj() });
+    expect(rendered).toContain("\n  ");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // resolveNextSteps
 
 describe("resolveNextSteps", () => {
@@ -715,6 +901,37 @@ describe("deriveRunStatus", () => {
 });
 
 // ---------------------------------------------------------------------------
+// effectiveStepCap
+
+describe("effectiveStepCap", () => {
+  test("falls back to PIPELINE_LIMITS.maxStepsDefault with no snapshot", () => {
+    expect(effectiveStepCap(makeRun())).toBe(PIPELINE_LIMITS.maxStepsDefault);
+  });
+
+  test("uses the snapshot's maxSteps with no extensions", () => {
+    const run = makeRun({
+      snapshot: { graph: makeGraph(), maxSteps: 10, profiles: {}, capturedAt: 0 },
+    });
+    expect(effectiveStepCap(run)).toBe(10);
+  });
+
+  test("scales by (1 + capExtensions)", () => {
+    const run = makeRun({
+      snapshot: { graph: makeGraph(), maxSteps: 10, profiles: {}, capturedAt: 0 },
+      capExtensions: 2,
+    });
+    expect(effectiveStepCap(run)).toBe(30);
+  });
+
+  test("undefined capExtensions behaves like 0", () => {
+    const run = makeRun({
+      snapshot: { graph: makeGraph(), maxSteps: 5, profiles: {}, capturedAt: 0 },
+    });
+    expect(effectiveStepCap(run)).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // composeStepPrompt
 
 describe("composeStepPrompt", () => {
@@ -779,6 +996,146 @@ describe("composeStepPrompt", () => {
     expect(prompt).toContain('From "Investigate"');
     expect(prompt).toContain("Found the bug in auth.ts");
     expect(prompt).toContain('"schemaVersion": 1');
+  });
+
+  test("carries the untrusted-content warning when there is prior handoff context", () => {
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: baseStep,
+      stepIndex: 2,
+      stepCap: 25,
+      goal: "goal",
+      previous: [{ stepName: "Investigate", handoff: fullHandoffJsonObj(), filePath: "/tmp/handoff-1.json" }],
+      outgoing: [],
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+    });
+    expect(prompt).toContain(HANDOFF_UNTRUSTED_CONTENT_WARNING);
+  });
+
+  test("omits the untrusted-content warning on the first step (no prior handoff)", () => {
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: baseStep,
+      stepIndex: 1,
+      stepCap: 25,
+      goal: "goal",
+      previous: [],
+      outgoing: [],
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+    });
+    expect(prompt).not.toContain(HANDOFF_UNTRUSTED_CONTENT_WARNING);
+  });
+
+  test("inline byte budget: a later entry that would exceed the cap falls back to its file pointer", () => {
+    const bigA = "A".repeat(10_000);
+    const bigB = "B".repeat(10_000);
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: baseStep,
+      stepIndex: 3,
+      stepCap: 25,
+      goal: "goal",
+      previous: [
+        { stepName: "First", handoff: fullHandoffJsonObj({ summary: bigA }), filePath: "/tmp/h1.json" },
+        { stepName: "Second", handoff: fullHandoffJsonObj({ summary: bigB }), filePath: "/tmp/h2.json" },
+      ],
+      outgoing: [],
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+    });
+    expect(prompt).toContain(bigA);
+    expect(prompt).not.toContain(bigB);
+    expect(prompt).toContain("(handoff too large to inline — saved to /tmp/h2.json)");
+  });
+
+  test("inline byte budget: falls back to the no-file message when a too-large entry has no filePath", () => {
+    const bigA = "A".repeat(10_000);
+    const bigB = "B".repeat(10_000);
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: baseStep,
+      stepIndex: 3,
+      stepCap: 25,
+      goal: "goal",
+      previous: [
+        { stepName: "First", handoff: fullHandoffJsonObj({ summary: bigA }), filePath: null },
+        { stepName: "Second", handoff: fullHandoffJsonObj({ summary: bigB }), filePath: null },
+      ],
+      outgoing: [],
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+    });
+    expect(prompt).toContain(bigA);
+    expect(prompt).not.toContain(bigB);
+    expect(prompt).toContain("(handoff too large to inline; no file available)");
+  });
+
+  test("inline byte budget boundary: exactly at the cap inlines, one byte over falls back", () => {
+    const encoder = new TextEncoder();
+    const baseBytes = encoder.encode(JSON.stringify(fullHandoffJsonObj({ summary: "" }), null, 2)).length;
+    const fillAtCap = "x".repeat(PIPELINE_LIMITS.handoffInlineMaxBytes - baseBytes);
+    const commonArgs = {
+      pipelineName: "P",
+      step: baseStep,
+      stepIndex: 2,
+      stepCap: 25,
+      goal: "goal",
+      outgoing: [],
+      transition: "choose" as const,
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+    };
+
+    const atCapPrompt = composeStepPrompt({
+      ...commonArgs,
+      previous: [{ stepName: "Prev", handoff: fullHandoffJsonObj({ summary: fillAtCap }), filePath: "/tmp/h.json" }],
+    });
+    expect(atCapPrompt).toContain(fillAtCap);
+    expect(atCapPrompt).not.toContain("too large to inline");
+
+    const overCapPrompt = composeStepPrompt({
+      ...commonArgs,
+      previous: [{ stepName: "Prev", handoff: fullHandoffJsonObj({ summary: `${fillAtCap}x` }), filePath: "/tmp/h.json" }],
+    });
+    expect(overCapPrompt).toContain("(handoff too large to inline — saved to /tmp/h.json)");
+    expect(overCapPrompt).not.toContain(`${fillAtCap}x`);
+  });
+
+  test("inline byte budget still applies with inlineHandoff:false (gemini path) — nothing ever inlines", () => {
+    const bigA = "A".repeat(10_000);
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: baseStep,
+      stepIndex: 2,
+      stepCap: 25,
+      goal: "goal",
+      previous: [{ stepName: "First", handoff: fullHandoffJsonObj({ summary: bigA }), filePath: "/tmp/h1.json" }],
+      outgoing: [],
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: false,
+      parallelSiblings: [],
+    });
+    expect(prompt).not.toContain(bigA);
+    expect(prompt).toContain("(handoff saved to /tmp/h1.json)");
+    expect(prompt).not.toContain("too large to inline");
   });
 
   test("points at the file path instead of inlining when inlineHandoff is false", () => {

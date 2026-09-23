@@ -484,6 +484,22 @@ const sanitizeJoins = (raw: unknown): PipelineRunState["joins"] => {
   return out;
 };
 
+/** `PipelineBlock.pending` — the run-level launch (a step-cap/profile-missing
+ *  retry, or a join-incomplete launch) Retry would re-attempt. Dropped
+ *  wholesale (never persisted as a half-valid shape) when `stepId` is
+ *  missing/empty; `arrivals` reuses `sanitizeJoinArrival`, same as
+ *  `sanitizeJoins` above, silently dropping any junk entry. */
+const sanitizeBlockPending = (raw: unknown): { stepId: string; arrivals: PipelineJoinArrival[] } | null => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const stepId = rec.stepId;
+  if (typeof stepId !== "string" || !stepId) return null;
+  const arrivals = Array.isArray(rec.arrivals)
+    ? rec.arrivals.map(sanitizeJoinArrival).filter((a): a is PipelineJoinArrival => a !== null)
+    : [];
+  return { stepId, arrivals };
+};
+
 const sanitizeBlock = (raw: unknown): PipelineBlock | null => {
   if (!isPlainObject(raw)) return null;
   const rec = raw as Record<string, unknown>;
@@ -492,7 +508,8 @@ const sanitizeBlock = (raw: unknown): PipelineBlock | null => {
   const taskId = typeof rec.taskId === "string" ? rec.taskId : null;
   const stepId = typeof rec.stepId === "string" ? rec.stepId : null;
   const message = typeof rec.message === "string" ? rec.message : "";
-  return { taskId, stepId, kind: kind as PipelineBlockKind, message };
+  const pending = sanitizeBlockPending(rec.pending);
+  return { taskId, stepId, kind: kind as PipelineBlockKind, message, ...(pending ? { pending } : {}) };
 };
 
 const STEP_RECORD_OUTCOMES = new Set<string>(["succeeded", "failed", "cancelled", "advanced-manually"]);
@@ -529,19 +546,31 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
 };
 
 /** Sanitize a `PipelineRunState.snapshot`-shaped value: `null`/non-object
- *  collapses to `null` (no snapshot yet — the run hasn't been started), and
- *  a `graph` that doesn't pass {@link validatePipelineGraph} likewise
- *  collapses the whole snapshot to `null` (an un-runnable snapshot is as
- *  good as none). `profiles` is kept lenient — "a record of objects" per
- *  the design, not re-validated field-by-field against
- *  `AgentProfileSnapshot` — since it was written by our own
- *  `snapshotFromProfile` and deep-validating it here would only duplicate
- *  that call site. */
+ *  collapses to `null` (no snapshot yet — the run hasn't been started).
+ *  `profiles` is kept lenient — "a record of objects" per the design, not
+ *  re-validated field-by-field against `AgentProfileSnapshot` — since it was
+ *  written by our own `snapshotFromProfile` and deep-validating it here
+ *  would only duplicate that call site.
+ *
+ *  m18: unlike `parsePipelineGraph` (the `pipelines` table's own live `graph`
+ *  column, still deep-validated via `validatePipelineGraph` on every read —
+ *  see that function's doc), a run snapshot's `graph` was captured exactly
+ *  once, at run-start time, by `buildSnapshot`'s own `validatePipelineGraph`
+ *  call, and nothing ever mutates a `pipeline_run` column's snapshot after
+ *  it's written — re-validating the whole graph on every read (every task
+ *  poll, every pipeline route) only spends cycles re-checking something that
+ *  can't have changed. Only shape-check enough to make it safe to hand to
+ *  the step-resolution helpers (`resolveNextSteps`/`stepNameById`/…), which
+ *  just index into `.steps`/`.edges` arrays: a `graph` that isn't even an
+ *  object with array `steps`/`edges` collapses the whole snapshot to `null`
+ *  (an un-runnable snapshot is as good as none) exactly like before. */
 const sanitizeRunSnapshot = (raw: unknown): PipelineRunSnapshot | null => {
   if (!isPlainObject(raw)) return null;
   const rec = raw as Record<string, unknown>;
-  const validated = validatePipelineGraph(rec.graph);
-  if (!validated.ok) return null;
+  if (!isPlainObject(rec.graph) || !Array.isArray(rec.graph.steps) || !Array.isArray(rec.graph.edges)) {
+    return null;
+  }
+  const graph = rec.graph as unknown as PipelineGraph;
 
   const profiles: PipelineRunSnapshot["profiles"] = {};
   if (isPlainObject(rec.profiles)) {
@@ -553,7 +582,7 @@ const sanitizeRunSnapshot = (raw: unknown): PipelineRunSnapshot | null => {
   const maxSteps = isFiniteNumber(rec.maxSteps) ? rec.maxSteps : PIPELINE_LIMITS.maxStepsDefault;
   const capturedAt = isFiniteNumber(rec.capturedAt) ? rec.capturedAt : 0;
 
-  return { graph: validated.graph, profiles, maxSteps, capturedAt };
+  return { graph, profiles, maxSteps, capturedAt };
 };
 
 /**
@@ -613,6 +642,7 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
     stepCount,
     startedAt,
     endedAt,
+    capExtensions: isFiniteNumber(rec.capExtensions) && rec.capExtensions >= 0 ? rec.capExtensions : undefined,
   };
 };
 
@@ -724,7 +754,22 @@ export const tasks = {
          WHERE tasks.id = ?
          GROUP BY tasks.id`,
     ).get(id);
-    return row ? toTask(row) : null;
+    if (!row) return null;
+    const task = toTask(row);
+    // M17: a single-task read must show the same honest "waiting on you"
+    // total `list()` already computes in its batched D11 pass above — every
+    // consumer of `GET /tasks/:id` (and anything built on it, like
+    // `withRunningSubagents` or `GET /tasks/:id/pipeline`) would otherwise
+    // disagree with the board's 2s `/tasks` poll about whether a pipeline
+    // parent has anything pending. Gated on `pipeline_id` (only ever set on
+    // a real pipeline parent row, never on a step) so an ordinary task's
+    // `get` pays no extra query.
+    if (!row.pipeline_id) return task;
+    let stepPending = 0;
+    for (const step of this.stepsForParent(id)) stepPending += step.pendingInteractionCount;
+    return stepPending > 0
+      ? { ...task, pendingInteractionCount: task.pendingInteractionCount + stepPending }
+      : task;
   },
   /** Every hidden step task of a pipeline parent (`pipeline_parent_id =
    *  parentId`), oldest first — the order steps were inserted in, which is
@@ -1846,22 +1891,35 @@ type PipelineRow = {
   updated_at: number;
 };
 
-/** Parse a pipeline row's stored `graph` JSON, tolerating malformed JSON or
- *  a shape `validatePipelineGraph` rejects — both collapse to the empty
- *  graph `{steps:[],edges:[],startStepId:null}` rather than throwing. This
- *  is our own write (produced by `validatePipelineGraph` at insert/update
- *  time), so this only ever fires against on-disk corruption, but every
- *  other JSON column in this file is parsed defensively and `pipelines` is
- *  no exception. */
+/** Parse a pipeline row's stored `graph` JSON. This is our own write
+ *  (produced by `validatePipelineGraph` at insert/update time), so this only
+ *  ever fires against on-disk corruption or a shape an older/newer validator
+ *  no longer accepts, but every other JSON column in this file is parsed
+ *  defensively and `pipelines` is no exception.
+ *
+ *  m21: unparseable JSON still collapses to the empty graph
+ *  `{steps:[],edges:[],startStepId:null}` (there's nothing else to return),
+ *  logged via `console.warn` so the corruption is visible. But a value that
+ *  parses fine yet fails today's `validatePipelineGraph` is returned
+ *  AS-IS (also warned) rather than collapsed to empty: the pipeline editor
+ *  reads this value straight through, and an editor session that opens,
+ *  makes an unrelated change, and saves would otherwise silently overwrite
+ *  the user's real graph with nothing. Trusting the stored shape here is the
+ *  same call `sanitizeRunSnapshot` makes for a run's frozen snapshot, for a
+ *  different reason — this one is "don't destroy data", not "don't
+ *  re-validate a graph that already validated once". */
 const parsePipelineGraph = (raw: string): PipelineGraph => {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch {
+  } catch (err) {
+    console.warn(`[agetor] pipeline graph column is not valid JSON — falling back to an empty graph:`, err);
     return { steps: [], edges: [], startStepId: null };
   }
   const validated = validatePipelineGraph(parsed);
-  return validated.ok ? validated.graph : { steps: [], edges: [], startStepId: null };
+  if (validated.ok) return validated.graph;
+  console.warn(`[agetor] stored pipeline graph failed validation (${validated.error}) — returning it unmodified`);
+  return parsed as PipelineGraph;
 };
 
 const toPipeline = (r: PipelineRow): Pipeline => ({

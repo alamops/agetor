@@ -11,6 +11,7 @@ import { api, type AgentModelMap } from "@/lib/api";
 import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
+import { resolveStartStep } from "../../../shared/pipeline.ts";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -109,6 +110,14 @@ interface Props {
    *  ("one selection" with the agent profile: picking a pipeline hides the
    *  Agent picker and the manual harness/mode/model/effort block). */
   pipelines: Pipeline[];
+  /** True once `pipelines` has resolved at least once (mirrors
+   *  `usePipelines()`'s own `loaded` flag) — lets the stale-selection guard
+   *  below (m19) tell "not fetched yet" apart from "fetched, and it's
+   *  genuinely empty" so a fast picker click can't be raced by a still-empty
+   *  cache and cleared right back out. Optional for callers that don't
+   *  thread it through — an empty, not-yet-`loaded` list is then treated the
+   *  same as a loaded empty list (the pre-existing behavior). */
+  pipelinesLoaded?: boolean;
   /** "Manage pipelines…" footer row in the pipeline picker's popover —
    *  opens the full-page pipelines list. */
   onOpenPipelines: () => void;
@@ -139,7 +148,7 @@ interface Props {
   focusNonce?: number;
 }
 
-export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSettingsAgents, pipelines, onOpenPipelines, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
+export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSettingsAgents, pipelines, pipelinesLoaded, onOpenPipelines, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
   // Collapsed = thin icon rail; the board's `flex-1` <main> takes the freed
   // width on its own. Seeded synchronously from localStorage (lazy initial
   // state) so a restart repaints in the state the user left it in — an async
@@ -481,23 +490,30 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // compact summary card. Same stale-selection guard as the profile picker
   // above — a pipeline deleted elsewhere falls back to "No pipeline".
   const selectedPipeline = pipelineId ? (pipelines.find((p) => p.id === pipelineId) ?? null) : null;
+  // (m19) Stale-selection guard: clear a selected pipeline that no longer
+  // exists once we actually KNOW the list doesn't contain it — gated on the
+  // `pipelinesLoaded` flag rather than `pipelines.length > 0`, since the old
+  // length check could never fire while the loaded list was genuinely empty
+  // (a deleted-out-from-under-us pipeline leaving zero rows behind would
+  // never get cleared). A caller that doesn't thread `pipelinesLoaded`
+  // through falls back to treating an empty list as "loaded and not
+  // present" (clears), same as before for the common empty case, but still
+  // won't clear against a non-empty not-yet-fetched list.
+  const pipelinesKnownLoaded = pipelinesLoaded ?? pipelines.length === 0;
   useEffect(() => {
-    if (pipelineId && pipelines.length > 0 && !pipelines.some((p) => p.id === pipelineId)) {
+    if (pipelineId && pipelinesKnownLoaded && !pipelines.some((p) => p.id === pipelineId)) {
       setPipelineId(null);
     }
-  }, [pipelines, pipelineId]);
-  // The pipeline's start step (editor-marked `startStepId`, falling back to
-  // the first step) and its bound agent profile — shown in the summary card
-  // and used to resolve the launch payload's `agent` field below (the
-  // server recomputes this from the pipeline itself; sending it here just
-  // keeps the request body self-consistent, same rationale as
-  // `selectedProfile`'s values above).
-  const pipelineStartStep = selectedPipeline
-    ? (() => {
-        const startId = selectedPipeline.graph.startStepId ?? selectedPipeline.graph.steps[0]?.id ?? null;
-        return startId ? (selectedPipeline.graph.steps.find((s) => s.id === startId) ?? null) : null;
-      })()
-    : null;
+  }, [pipelines, pipelineId, pipelinesKnownLoaded]);
+  // The pipeline's start step — `resolveStartStep` (nit4) handles the
+  // ambiguous-graph case (no `startStepId` and either zero or multiple
+  // no-incoming-edge candidates) by returning `null` instead of guessing at
+  // `steps[0]`, matching the runner's own entry-point resolution — and its
+  // bound agent profile, shown in the summary card and used to resolve the
+  // launch payload's `agent` field below (the server recomputes this from
+  // the pipeline itself; sending it here just keeps the request body
+  // self-consistent, same rationale as `selectedProfile`'s values above).
+  const pipelineStartStep = selectedPipeline ? resolveStartStep(selectedPipeline.graph) : null;
   const pipelineStartStepProfile = pipelineStartStep?.agentProfileId
     ? (profiles.find((p) => p.id === pipelineStartStep.agentProfileId) ?? null)
     : null;

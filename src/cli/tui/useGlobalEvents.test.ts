@@ -24,3 +24,22 @@ test("toastFor ignores update events", () => {
     toastFor({ kind: "update", status: "available", version: "1.2.3", message: null, ts: 1 } as unknown as GlobalEvent),
   ).toBeNull();
 });
+
+// m3 review fix (docs/plans/pipelines.md D11): a hidden pipeline step task's
+// run-status/blocked events must never surface a board-wide toast naming a
+// task id the TUI hides from its board — the parent's own column/pipeline
+// events cover the same information.
+test("toastFor: hiddenTaskIds suppresses run-status and blocked-column toasts for that task", () => {
+  const hidden = new Set([ID]);
+  expect(toastFor({ kind: "run-status", taskId: ID, runId: "r", status: "succeeded", ts: 1 }, hidden)).toBeNull();
+  expect(
+    toastFor({ kind: "column", taskId: ID, runId: "r", column: "blocked", prev: "running", ts: 1 }, hidden),
+  ).toBeNull();
+});
+
+test("toastFor: hiddenTaskIds doesn't affect other tasks' toasts", () => {
+  const hidden = new Set(["some-other-task"]);
+  expect(toastFor({ kind: "run-status", taskId: ID, runId: "r", status: "succeeded", ts: 1 }, hidden)?.color).toBe(
+    "green",
+  );
+});

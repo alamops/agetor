@@ -72,7 +72,15 @@ export function Dashboard({
   // so runId / pendingInteractionCount stay fresh but the task can't change.
   const [targetId, setTargetId] = useState<string | null>(null);
   const target = targetId ? sorted.find((t) => t.id === targetId) ?? null : null;
-  const toast = useGlobalEvents(dataDir);
+  // Hidden pipeline step tasks (D11, docs/plans/pipelines.md) — same tasks
+  // `sorted` already filters off the board — so a step succeeding/failing/
+  // blocking mid-pipeline never pops a toast naming a task id the user has
+  // no way to find; the parent's own column transitions still toast.
+  const hiddenTaskIds = useMemo(
+    () => new Set(tasks.filter((t) => t.pipelineParentId != null).map((t) => t.id)),
+    [tasks],
+  );
+  const toast = useGlobalEvents(dataDir, hiddenTaskIds);
 
   // Never let a mode get stranded (and the keyboard dead) if the target task
   // disappears from the board while composing / answering.

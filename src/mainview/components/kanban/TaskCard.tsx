@@ -67,7 +67,14 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   //    something worth re-reading; Run stays reachable from inside the panel.
   //  - Run otherwise (no openable history yet, or only failed/cancelled).
   const active = task.column === "running" || task.column === "blocked";
-  const openable = task.hasOpenableRun;
+  // A pipeline PARENT never gets its own `runId`/`hasOpenableRun` — only its
+  // step tasks do — so `hasOpenableRun` alone would forever gate the button
+  // on "Run" even once the pipeline has actually executed. Once any step
+  // execution has landed in `pipelineRun.history`, there's something worth
+  // opening the run view for; Retry/Restart live there, not on the card
+  // (M15, docs/plans/pipelines.md review). Mirrored in `buildTaskContextMenu`.
+  const hasOpenablePipelineRun = !!task.pipelineRun && task.pipelineRun.history.length > 0;
+  const openable = task.hasOpenableRun || hasOpenablePipelineRun;
   // Combine structured interactions with codex's narrative `blocked` signal.
   // The latter has no answerable payload — the user resolves it from the run
   // panel — but it represents the same "waiting on you" state to the user.

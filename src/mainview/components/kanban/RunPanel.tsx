@@ -76,6 +76,8 @@ import {
   type AgentProfileSnapshot,
   type FxUsagePayload,
   type GitHubPullMergeability,
+  type PipelineGraph,
+  type PipelineStepRecord,
   type Run,
   type RunEvent,
   type Subagent,
@@ -176,10 +178,20 @@ type StreamEvent = RunEvent & { id: number; dbId?: number };
  * this step's name, fetched from the parent pipeline task via
  * `api.getPipelineRun`. See `RunPanelBody`'s `pipelineStripCacheRef` /
  * `pipelineStrip` state for how this is fetched and cached.
+ *
+ * `stepIndex`/`stepTotal` back the D7 "(k/N)" suffix (`docs/plans/
+ * pipelines.md` line 209): `stepTotal` is the frozen graph's step count,
+ * and `stepIndex` is this step's 1-based execution position — resolved
+ * from `pipelineRun.history` by matching `taskId` when available, else
+ * (the currently-active execution isn't in `history` yet, and the cached
+ * first paint below has no history at all) this step's position within
+ * the graph. `null` when neither source can place it.
  */
 interface PipelineStripInfo {
   pipelineName: string;
   stepName: string;
+  stepIndex: number | null;
+  stepTotal: number;
 }
 
 interface Props {
@@ -2662,43 +2674,70 @@ function RunPanelBody({
   }, [task.id]);
 
   // Pipeline strip (T9, docs/plans/pipelines.md D7) — resolves a step
-  // task's pipeline name + step name for the "Part of pipeline …" strip
-  // rendered directly under the header. A step task (`pipelineParentId`
-  // set) doesn't carry its own pipeline name, so this fetches the PARENT
-  // pipeline task via `api.getPipelineRun` and reads `pipelineRun.pipelineName`
-  // plus `stepNameById` against the parent's frozen graph snapshot.
-  // `pipelineStripCacheRef` is a genuine cross-task cache, keyed by parent
-  // task id, so revisiting a step of a pipeline already looked up this
-  // session doesn't refetch — it's a ref (not React state) precisely so it
-  // survives the `[task.id]` reset effect above untouched. `pipelineStrip`
-  // itself IS reset there like every other per-task piece of state; this
-  // effect re-derives it (from the cache, or a fresh fetch) on every switch.
-  const pipelineStripCacheRef = useRef<Map<string, PipelineStripInfo>>(new Map());
+  // task's pipeline name + step name (+ "(k/N)" progress) for the "Part of
+  // pipeline …" strip rendered directly under the header. A step task
+  // (`pipelineParentId` set) doesn't carry its own pipeline name, so this
+  // fetches the PARENT pipeline task via `api.getPipelineRun` and reads
+  // `pipelineRun.pipelineName` plus `stepNameById`/history against the
+  // parent's frozen graph snapshot. `pipelineStripCacheRef` caches only the
+  // STABLE part — `pipelineName` + the frozen `graph` — keyed by parent task
+  // id; it deliberately never caches a derived step name (M14: every step of
+  // the same pipeline used to show whichever step name was cached first) or
+  // the dynamic `history` (a run's progress keeps changing). It's a ref (not
+  // React state) precisely so it survives the `[task.id]` reset effect above
+  // untouched. `pipelineStrip` itself IS reset there like every other
+  // per-task piece of state; this effect always re-fetches on a task switch
+  // (a `pipeline` global event for the parent has no other way to reach this
+  // panel, so a stale cached name/graph must not be trusted indefinitely) —
+  // the cache only fast-paths the FIRST paint of a switch, from which the
+  // real fetch's result then supersedes it.
+  const pipelineStripCacheRef = useRef<Map<string, { pipelineName: string; graph: PipelineGraph | null }>>(new Map());
   const [pipelineStrip, setPipelineStrip] = useState<PipelineStripInfo | "loading" | "error" | null>(null);
   useEffect(() => {
     const parentId = task.pipelineParentId;
     if (!parentId) return;
+    const stepId = task.pipelineStepId;
+    const buildInfo = (
+      pipelineName: string,
+      graph: PipelineGraph | null,
+      history: PipelineStepRecord[] | null,
+    ): PipelineStripInfo => {
+      const stepName = graph && stepId ? stepNameById(graph, stepId) : (stepId ?? "this step");
+      const stepTotal = graph?.steps.length ?? 0;
+      let stepIndex: number | null = null;
+      if (history) {
+        const histIdx = history.findIndex((h) => h.taskId === task.id);
+        if (histIdx >= 0) stepIndex = histIdx + 1;
+      }
+      if (stepIndex === null && graph && stepId) {
+        const pos = graph.steps.findIndex((s) => s.id === stepId);
+        if (pos >= 0) stepIndex = pos + 1;
+      }
+      return { pipelineName, stepName, stepIndex, stepTotal };
+    };
+
     const cached = pipelineStripCacheRef.current.get(parentId);
     if (cached) {
-      setPipelineStrip(cached);
-      return;
+      // Immediate first paint from the cache — no `history` is cached, so
+      // this approximates progress from the step's position in the frozen
+      // graph until the background refetch below lands the real count.
+      setPipelineStrip(buildInfo(cached.pipelineName, cached.graph, null));
+    } else {
+      setPipelineStrip("loading");
     }
     let cancelled = false;
-    setPipelineStrip("loading");
     void (async () => {
       try {
         const { task: parentTask } = await api.getPipelineRun(parentId);
-        const graph = parentTask.pipelineRun?.snapshot?.graph ?? null;
-        const stepId = task.pipelineStepId;
-        const stepName = graph && stepId ? stepNameById(graph, stepId) : (stepId ?? "this step");
-        const pipelineName = parentTask.pipelineRun?.pipelineName || parentTask.title || "pipeline";
-        const info: PipelineStripInfo = { pipelineName, stepName };
-        pipelineStripCacheRef.current.set(parentId, info);
+        const run = parentTask.pipelineRun ?? null;
+        const graph = run?.snapshot?.graph ?? null;
+        const pipelineName = run?.pipelineName || parentTask.title || "pipeline";
+        pipelineStripCacheRef.current.set(parentId, { pipelineName, graph });
         if (cancelled) return;
-        setPipelineStrip(info);
+        setPipelineStrip(buildInfo(pipelineName, graph, run?.history ?? null));
       } catch {
         if (cancelled) return;
-        setPipelineStrip("error");
+        if (!cached) setPipelineStrip("error");
       }
     })();
     return () => { cancelled = true; };
@@ -3580,6 +3619,9 @@ function RunPanelBody({
                 <>
                   Part of pipeline <strong className="font-semibold">{pipelineStrip.pipelineName}</strong> · step{" "}
                   <strong className="font-semibold">{pipelineStrip.stepName}</strong>
+                  {pipelineStrip.stepIndex !== null && pipelineStrip.stepTotal > 0
+                    ? ` (${pipelineStrip.stepIndex}/${pipelineStrip.stepTotal})`
+                    : null}
                 </>
               ) : (
                 "Part of a pipeline"
@@ -3591,7 +3633,13 @@ function RunPanelBody({
             variant="outline"
             className="h-6 shrink-0 px-2 text-[10px]"
             data-testid="run-panel-open-pipeline"
-            onClick={() => onOpenPipeline(task.pipelineParentId!)}
+            onClick={() => {
+              // Close first — otherwise the run view opens behind this
+              // non-portaled `fixed` <aside> (z-40 > the page views' < 30)
+              // and reads as if the click did nothing (m22b).
+              onClose();
+              onOpenPipeline(task.pipelineParentId!);
+            }}
           >
             Open pipeline
           </Button>
@@ -3610,7 +3658,11 @@ function RunPanelBody({
             variant="outline"
             className="h-6 shrink-0 px-2 text-[10px]"
             data-testid="run-panel-open-pipeline"
-            onClick={() => onOpenPipeline(task.id)}
+            onClick={() => {
+              // Same close-before-open rationale as the step-task button above.
+              onClose();
+              onOpenPipeline(task.id);
+            }}
           >
             Open pipeline
           </Button>

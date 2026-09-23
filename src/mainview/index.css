@@ -259,9 +259,11 @@
   fill: none;
 }
 /* React Flow's MIT license permits removing the on-canvas attribution as
-   long as attribution is retained elsewhere (see README/NOTICE); this is a
-   desktop app, not a public web deployment, so the corner watermark is
-   suppressed here. Attribution: React Flow / @xyflow, MIT License,
+   long as attribution is retained elsewhere; this is a desktop app, not a
+   public web deployment, so the corner watermark is suppressed here.
+   Attribution is retained via `package.json`'s dependency list
+   (`@xyflow/react`) rather than the README, which doesn't name the
+   library. Attribution: React Flow / @xyflow, MIT License,
    https://github.com/xyflow/xyflow. */
 .react-flow__attribution {
   display: none;
