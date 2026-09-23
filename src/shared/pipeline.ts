@@ -823,7 +823,11 @@ export function composeStepPrompt(input: {
       if (p.skills.length > 0) lines.push(`  skills: ${p.skills.map((s) => `/${s}`).join(", ")}`);
       parts.push(lines.join("\n"));
     }
-    parts.push("When you spawn a subagent for one of these personas, brief it with that persona's instructions and skills.");
+    parts.push(
+      "When you spawn a subagent for one of these personas, brief it with that persona's instructions and skills, "
+        + "and start the subagent's description with the persona's name (for example "
+        + `"${input.subagentProfiles[0]!.name}: <what it should do>") so its work can be attributed to that persona.`,
+    );
   } else {
     parts.push("Do not spawn subagents for this step.");
   }

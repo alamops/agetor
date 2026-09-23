@@ -14,17 +14,27 @@ import { api, ApiError } from "@/lib/api";
 import {
   edgeVisualState,
   latestTransition,
+  reconcileFlowItems,
   responseKindLabel,
+  satellitesSignature,
   stepReminded,
   stepTaskFor,
   stepVisualState,
+  subagentEdgeKey,
+  subagentNodeKey,
+  subagentSatellites,
   toFlowEdges,
   toFlowNodes,
+  toSubagentFlowEdges,
+  toSubagentFlowNodes,
   type EdgeVisualState,
   type ResponseKindTone,
   type StepFlowEdge,
   type StepFlowNode,
   type StepVisualState,
+  type SubagentFlowEdge,
+  type SubagentFlowNode,
+  type SubagentSatellite,
 } from "@/lib/pipelines";
 import { pipelineStepProgress, stepNameById } from "../../../shared/pipeline.ts";
 import type {
@@ -34,14 +44,30 @@ import type {
   PipelineRunState,
   PipelineRunStatus,
   PipelineStepRecord,
+  Subagent,
   Task,
 } from "../../../shared/types.ts";
 import { PipelineCanvasContext, type PipelineCanvasContextValue, type StepProfileResolution } from "./pipeline-canvas-context";
 import { StepEdge } from "./StepEdge";
 import { StepNode } from "./StepNode";
+import { SubagentEdge } from "./SubagentEdge";
+import { SubagentNode } from "./SubagentNode";
 
-const NODE_TYPES = { step: StepNode };
-const EDGE_TYPES = { step: StepEdge };
+const NODE_TYPES = { step: StepNode, subagent: SubagentNode };
+const EDGE_TYPES = { step: StepEdge, subagent: SubagentEdge };
+
+/** State-held step nodes/edges plus the DERIVED subagent satellites. */
+type CanvasNode = StepFlowNode | SubagentFlowNode;
+type CanvasEdge = StepFlowEdge | SubagentFlowEdge;
+
+/** Content signature of an observed-subagents map — what the satellite
+ *  derivation keys on, so a poll that changed nothing keeps every
+ *  satellite's identity. */
+function liveSubagentsSignature(map: Map<string, Subagent[]>): string {
+  const parts: string[] = [];
+  for (const [taskId, list] of map) parts.push(`${taskId}=${list.map((s) => `${s.id}:${s.status}`).join(",")}`);
+  return parts.sort().join("|");
+}
 
 const STATUS_LABEL: Record<PipelineRunStatus, string> = {
   idle: "Not started",
@@ -187,6 +213,16 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
   const [actionError, setActionError] = useState<string | null>(null);
   const [showGoal, setShowGoal] = useState(false);
   const [notStartedStepName, setNotStartedStepName] = useState<string | null>(null);
+  // Subagents observed on each step task (`GET /tasks/:id/subagents`), keyed
+  // by step TASK id. Refreshed for every currently-active execution on each
+  // poll; entries for executions that have since settled are kept as last
+  // observed, so a finished step's satellites keep reading "finished"
+  // rather than snapping back to idle. Reset on task switch.
+  const [liveSubagents, setLiveSubagents] = useState<Map<string, Subagent[]>>(() => new Map());
+  // Latest-value mirror for `load` (declared below, before this state's
+  // consumers) — assigned every render, like the other refs in this view.
+  const liveSubagentsRef = useRef(liveSubagents);
+  liveSubagentsRef.current = liveSubagents;
 
   const fetchingRef = useRef(false);
   // Set when a refetch is requested (an event, or the 2s poll) WHILE a
@@ -206,6 +242,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
     setSteps([]);
     setLoadError(null);
     setNotStartedStepName(null);
+    setLiveSubagents(new Map());
     stepIdsRef.current = new Set();
     dirtyRef.current = false;
     setNodes([]);
@@ -225,6 +262,29 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
       setSteps(result.steps);
       stepIdsRef.current = new Set(result.steps.map((s) => s.id));
       setLoadError(null);
+      // Live subagents ride the per-task SSE, not the global bus, so the run
+      // view refreshes them here, on the same cadence as everything else —
+      // for executions still active (a handful at most), PLUS any task
+      // whose last-observed list still shows a running subagent: a step's
+      // helper settles moments before the step itself hands off, and once
+      // the step leaves `run.active` nothing else would ever re-read it, so
+      // its satellite would stay "working" forever. A failed listing keeps
+      // that task's last-known list.
+      const activeTaskIds = result.task.pipelineRun?.active.map((a) => a.taskId) ?? [];
+      const toRefresh = new Set(activeTaskIds);
+      for (const [id, list] of liveSubagentsRef.current) {
+        if (list.some((sub) => sub.status === "running")) toRefresh.add(id);
+      }
+      if (toRefresh.size > 0) {
+        const lists = await Promise.all(
+          [...toRefresh].map((id) => api.listSubagents(id).then((l) => [id, l] as const).catch(() => null)),
+        );
+        setLiveSubagents((prev) => {
+          const next = new Map(prev);
+          for (const entry of lists) if (entry) next.set(entry[0], entry[1]);
+          return liveSubagentsSignature(next) === liveSubagentsSignature(prev) ? prev : next;
+        });
+      }
     } catch (err) {
       setLoadError(err instanceof ApiError ? err.message : "Failed to load pipeline run.");
     } finally {
@@ -418,17 +478,58 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
     [effectiveGraph?.startStepId, resolveProfile],
   );
 
+  // ---- Subagent satellites (see PipelineEditor's twin block): one node
+  // per persona each step may delegate to, plus a transient one per
+  // running subagent that matched no persona. `visual` comes from the
+  // subagents observed on the step's CURRENT task (`subagentSatellites`):
+  // working / done / idle. Derived, identity-reconciled, never in state. ----
+  const liveSubagentsKey = useMemo(() => liveSubagentsSignature(liveSubagents), [liveSubagents]);
+  const satellites = useMemo<SubagentSatellite[]>(() => {
+    const g = effectiveGraphRef.current;
+    if (!g) return [];
+    const r = runRef.current;
+    const s = stepsRef.current;
+    const live = liveSubagentsRef.current;
+    return g.steps.flatMap((step) => {
+      const stepTask = stepTaskFor(s, r, step.id);
+      const observed = stepTask ? (live.get(stepTask.id) ?? []) : [];
+      return subagentSatellites(step, observed, (id) => resolveProfile(id).profile?.name ?? null);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content signatures (graph, node visuals, observed subagents), not the churning run/steps/graph objects; the refs carry current values.
+  }, [graphSignature, nodeVisualSignature, liveSubagentsKey, resolveProfile]);
+  const satelliteNodeMemory = useRef(new Map<string, { key: string; item: SubagentFlowNode }>());
+  const satelliteEdgeMemory = useRef(new Map<string, { key: string; item: SubagentFlowEdge }>());
+  const satellitesKey = satellitesSignature(satellites);
+  const subagentNodes = useMemo(
+    () => reconcileFlowItems(satelliteNodeMemory.current, toSubagentFlowNodes(satellites, () => ({ readOnly: true })), subagentNodeKey),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content (satellitesKey).
+    [satellitesKey],
+  );
+  const subagentEdges = useMemo(
+    () => reconcileFlowItems(satelliteEdgeMemory.current, toSubagentFlowEdges(satellites), subagentEdgeKey),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content (satellitesKey).
+    [satellitesKey],
+  );
+  const canvasNodes = useMemo<CanvasNode[]>(() => [...nodes, ...subagentNodes], [nodes, subagentNodes]);
+  const canvasEdges = useMemo<CanvasEdge[]>(() => [...edges, ...subagentEdges], [edges, subagentEdges]);
+
   const onNodeClick = useCallback(
-    (_: unknown, node: StepFlowNode) => {
-      const stepTask = stepTaskFor(steps, run, node.id);
+    (_: unknown, node: CanvasNode) => {
+      // A satellite opens the step it hangs from (its subagent's transcript
+      // is a tab inside that step task's own panel).
+      const stepId = node.type === "subagent" ? node.data.stepId : node.id;
+      const stepTask = stepTaskFor(steps, run, stepId);
       if (stepTask) {
         setNotStartedStepName(null);
         onOpenTask(stepTask);
       } else {
-        setNotStartedStepName(node.data.step.name);
+        const stepName = node.type === "subagent"
+          ? (effectiveGraph?.steps.find((st) => st.id === stepId)?.name ?? stepId)
+          : node.data.step.name;
+        setNotStartedStepName(stepName);
       }
     },
-    [steps, run, onOpenTask],
+    [steps, run, onOpenTask, effectiveGraph],
   );
 
   const handleStop = useCallback(async () => {
@@ -601,9 +702,9 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
         <div className="relative min-w-0 flex-1">
           <ReactFlowProvider>
             <PipelineCanvasContext.Provider value={canvasContextValue}>
-              <ReactFlow
-                nodes={nodes}
-                edges={edges}
+              <ReactFlow<CanvasNode, CanvasEdge>
+                nodes={canvasNodes}
+                edges={canvasEdges}
                 nodeTypes={NODE_TYPES}
                 edgeTypes={EDGE_TYPES}
                 onNodeClick={onNodeClick}

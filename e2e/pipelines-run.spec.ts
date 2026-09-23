@@ -38,6 +38,14 @@ import { gotoApp } from "./helpers";
  */
 
 const FAKE_CLAUDE_HANDOFF_PROMPT_MARKER = "__agetor_fake_claude_handoff__";
+// Mirrors `FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER` in `src/bun/agents.ts` (literal
+// copy — see that constant's doc comment): inside a fake handoff turn, spawn
+// one subagent row for `:<ms>` described as `[<text>]`, then hand off.
+const FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER = "__agetor_fake_claude_subagent__";
+// Long enough that the run view's 2s poll (+ its per-active-step
+// `listSubagents` fetch) reliably observes the satellite in its "working"
+// state before the fake subagent settles, even under load.
+const SUBAGENT_RUN_MS = 6000;
 // Wide enough that a step's "active" visual is observable at all — the fake
 // driver's default (~30ms) resolves before the run view could even poll it.
 // Tests that assert on "active" additionally open the run view BEFORE
@@ -393,6 +401,10 @@ test.describe("pipelines run: executing a run", () => {
       id: randomUUID(),
       name: "A",
       agentProfileId: profileId,
+      // A's own instructions also make the fake driver "spawn" one subagent
+      // whose description names Helper One — the run view attributes it to
+      // that persona's satellite.
+      instructions: `${FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER}:${SUBAGENT_RUN_MS}[Helper One: review the tests]`,
       subagents: { profileIds: [helperOneId, helperTwoId], cap: 2 },
     });
     const B = makeStep({ id: randomUUID(), name: "B", agentProfileId: profileId });
@@ -404,11 +416,31 @@ test.describe("pipelines run: executing a run", () => {
       pipelineId,
       `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
     );
+    // Open the run view FIRST (see the linear scenario for why), then start.
+    await openPipelineRunFromBoard(page, backend, title);
+    // Satellites render from the pipeline's graph before the first run:
+    // A's two personas + none for B, all idle, each linked to its step.
+    const helperOneNode = page.locator(`[data-testid="pipeline-subagent-node"][data-profile-id="${helperOneId}"]`);
+    const helperTwoNode = page.locator(`[data-testid="pipeline-subagent-node"][data-profile-id="${helperTwoId}"]`);
+    await expect(helperOneNode).toHaveAttribute("data-step-id", A.id);
+    await expect(helperTwoNode).toHaveAttribute("data-visual", "idle");
+    await expect(page.locator(`[data-testid="pipeline-subagent-node"][data-step-id="${B.id}"]`)).toHaveCount(0);
+    await expect(page.locator('[data-testid="pipeline-subagent-edge"]')).toHaveCount(2);
     await startTaskRest(backend, task.id);
 
-    await openPipelineRunFromBoard(page, backend, title);
+    // While A's fake subagent runs, Helper One's satellite (and only that
+    // one) animates as working — its edge marches too — then reads done
+    // once the subagent settled, and stays done after the whole run ends.
+    await expect(helperOneNode).toHaveAttribute("data-visual", "working", { timeout: CONVERGE_TIMEOUT });
+    await expect(helperTwoNode).toHaveAttribute("data-visual", "idle");
+    await expect(
+      page.locator(`[data-testid="pipeline-subagent-edge"][data-visual="working"]`),
+    ).toHaveCount(1);
+    await expect(helperOneNode).toHaveAttribute("data-visual", "done", { timeout: CONVERGE_TIMEOUT });
     await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done", { timeout: CONVERGE_TIMEOUT });
     await waitForColumn(backend, task.id, "review");
+    await expect(helperOneNode).toHaveAttribute("data-visual", "done");
+    await expect(helperTwoNode).toHaveAttribute("data-visual", "idle");
 
     // B allows no delegates -> the explicit "do not spawn" line, and none
     // of A's helper names leak into B's prompt.

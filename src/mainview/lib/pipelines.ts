@@ -19,6 +19,7 @@ import type {
   PipelineRunState,
   PipelineStep,
   PipelineStepRecord,
+  Subagent,
   Task,
 } from "../../shared/types.ts";
 
@@ -291,6 +292,23 @@ export function graphFromFlow(nodes: StepFlowNode[], edges: StepFlowEdge[], star
 const LAYOUT_NODE_WIDTH = 240;
 const LAYOUT_NODE_HEIGHT = 96;
 
+/** Layout footprint of one step INCLUDING the row(s) of subagent satellite
+ *  nodes hanging beneath it (see {@link subagentSatellitePosition}) — what
+ *  dagre must reserve so a step's satellites never overlap a neighbouring
+ *  rank or a sibling in the same rank. A step with no subagents keeps the
+ *  bare {@link LAYOUT_NODE_WIDTH}×{@link LAYOUT_NODE_HEIGHT}. */
+export function stepLayoutFootprint(step: PipelineStep): { width: number; height: number } {
+  const count = step.subagents.profileIds.length;
+  if (count === 0) return { width: LAYOUT_NODE_WIDTH, height: LAYOUT_NODE_HEIGHT };
+  const perRow = Math.min(count, SUBAGENT_NODES_PER_ROW);
+  const rows = Math.ceil(count / SUBAGENT_NODES_PER_ROW);
+  const rowWidth = perRow * SUBAGENT_NODE_WIDTH + (perRow - 1) * SUBAGENT_NODE_GAP;
+  return {
+    width: Math.max(LAYOUT_NODE_WIDTH, rowWidth),
+    height: LAYOUT_NODE_HEIGHT + SUBAGENT_ROW_TOP + rows * (SUBAGENT_NODE_HEIGHT + SUBAGENT_NODE_GAP),
+  };
+}
+
 /**
  * Re-position every step in `graph` via dagre's left-to-right layered
  * layout (the editor's "Auto-arrange" button). Edges referencing a step not
@@ -307,7 +325,7 @@ export function autoLayout(graph: PipelineGraph): PipelineGraph {
 
   const stepIds = new Set(graph.steps.map((s) => s.id));
   for (const step of graph.steps) {
-    g.setNode(step.id, { width: LAYOUT_NODE_WIDTH, height: LAYOUT_NODE_HEIGHT });
+    g.setNode(step.id, stepLayoutFootprint(step));
   }
   for (const edge of graph.edges) {
     if (stepIds.has(edge.from) && stepIds.has(edge.to)) g.setEdge(edge.from, edge.to);
@@ -318,10 +336,277 @@ export function autoLayout(graph: PipelineGraph): PipelineGraph {
   const steps = graph.steps.map((step) => {
     const pos = g.node(step.id) as { x: number; y: number } | undefined;
     if (!pos) return step;
-    return { ...step, position: { x: pos.x - LAYOUT_NODE_WIDTH / 2, y: pos.y - LAYOUT_NODE_HEIGHT / 2 } };
+    // dagre centres each node on (x, y) within the footprint it was given;
+    // the step card itself is always LAYOUT_NODE_WIDTH×LAYOUT_NODE_HEIGHT
+    // at the footprint's top-left, with any satellites hanging below it.
+    const footprint = stepLayoutFootprint(step);
+    return { ...step, position: { x: pos.x - footprint.width / 2, y: pos.y - footprint.height / 2 } };
   });
 
   return { ...graph, steps };
+}
+
+// ---------------------------------------------------------------------------
+// Subagent satellites — one small node per profile a step may delegate to,
+// hanging beneath the step and linked to it by a dashed "delegate" edge.
+// Pure derivations shared by the editor (static: what the step is
+// configured with) and the run view (live: which persona is at work).
+// ---------------------------------------------------------------------------
+
+export const SUBAGENT_NODE_WIDTH = 150;
+export const SUBAGENT_NODE_HEIGHT = 40;
+export const SUBAGENT_NODE_GAP = 8;
+/** Satellites wrap into rows of this many beneath their step. */
+export const SUBAGENT_NODES_PER_ROW = 3;
+/** Vertical gap between the bottom of the step card and the first row. */
+export const SUBAGENT_ROW_TOP = 32;
+
+/** `idle` — configured on the step, nothing observed for it; `working` — a
+ *  live subagent attributed to this persona is running right now; `done` —
+ *  one ran and finished during the step's current execution. */
+export type SubagentVisualState = "idle" | "working" | "done";
+
+/** Node `data` for the canvas's `"subagent"` node type. `kind: "profile"`
+ *  is a persona the step is configured to delegate to (always rendered,
+ *  editor and run view alike); `kind: "live"` is a running subagent the run
+ *  view observed on the step's task that matched NO configured persona —
+ *  rendered transiently, labelled from the subagent's own description. */
+export type SubagentNodeData = Record<string, unknown> & {
+  stepId: string;
+  kind: "profile" | "live";
+  /** `kind: "profile"` only — the agent profile id. */
+  profileId?: string;
+  /** `kind: "live"` only — the observed subagent's id and display label. */
+  subagentId?: string;
+  label?: string;
+  visual?: SubagentVisualState;
+  readOnly?: boolean;
+};
+export type SubagentFlowNode = Node<SubagentNodeData, "subagent">;
+export type SubagentFlowEdgeData = Record<string, unknown> & { visual?: SubagentVisualState };
+export type SubagentFlowEdge = Edge<SubagentFlowEdgeData, "subagent">;
+
+export function subagentNodeId(stepId: string, profileId: string): string {
+  return `sub:${stepId}:${profileId}`;
+}
+export function liveSubagentNodeId(stepId: string, subagentId: string): string {
+  return `live:${stepId}:${subagentId}`;
+}
+export function subagentEdgeId(nodeId: string): string {
+  return `edge:${nodeId}`;
+}
+
+/**
+ * Position of the `index`-th of `count` satellites, RELATIVE to its step
+ * node's top-left (React Flow `parentId` semantics — the satellite then
+ * follows the step when it's dragged): rows of {@link SUBAGENT_NODES_PER_ROW},
+ * each row centred under the 240px step card, starting
+ * {@link SUBAGENT_ROW_TOP} below the card's bottom edge.
+ */
+export function subagentSatellitePosition(index: number, count: number): { x: number; y: number } {
+  const row = Math.floor(index / SUBAGENT_NODES_PER_ROW);
+  const col = index % SUBAGENT_NODES_PER_ROW;
+  const rowStart = row * SUBAGENT_NODES_PER_ROW;
+  const inRow = Math.min(SUBAGENT_NODES_PER_ROW, count - rowStart);
+  const rowWidth = inRow * SUBAGENT_NODE_WIDTH + (inRow - 1) * SUBAGENT_NODE_GAP;
+  const x = (LAYOUT_NODE_WIDTH - rowWidth) / 2 + col * (SUBAGENT_NODE_WIDTH + SUBAGENT_NODE_GAP);
+  const y = LAYOUT_NODE_HEIGHT + SUBAGENT_ROW_TOP + row * (SUBAGENT_NODE_HEIGHT + SUBAGENT_NODE_GAP);
+  return { x, y };
+}
+
+/** One satellite to render, as {@link subagentSatellites} derives them. */
+export interface SubagentSatellite {
+  nodeId: string;
+  stepId: string;
+  kind: "profile" | "live";
+  profileId: string | null;
+  subagentId: string | null;
+  /** Display label for a `live` satellite (a `profile` one renders its
+   *  profile chip instead). */
+  label: string | null;
+  visual: SubagentVisualState;
+}
+
+/**
+ * Attribute an observed subagent to one of the step's configured personas,
+ * or `null`. Matching is by name, case-insensitively: the subagent's
+ * `description` (what the spawning `Agent` tool call said it was for — the
+ * step prompt asks the agent to start it with the persona's name) or its
+ * registered `agentType` must CONTAIN the profile name; when several
+ * profiles match, the longest name wins so "Reviewer Pro" beats "Reviewer".
+ */
+export function matchSubagentToProfile(
+  subagent: Pick<Subagent, "description" | "agentType">,
+  profiles: readonly { id: string; name: string }[],
+): string | null {
+  const haystacks = [subagent.description, subagent.agentType]
+    .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+    .map((s) => s.toLowerCase());
+  if (haystacks.length === 0) return null;
+  let best: { id: string; len: number } | null = null;
+  for (const p of profiles) {
+    const needle = p.name.trim().toLowerCase();
+    if (needle.length === 0) continue;
+    if (!haystacks.some((h) => h.includes(needle))) continue;
+    if (!best || needle.length > best.len) best = { id: p.id, len: needle.length };
+  }
+  return best?.id ?? null;
+}
+
+/**
+ * The satellites for one step: every configured persona (in
+ * `step.subagents.profileIds` order, `idle` unless a live subagent was
+ * attributed to it — `working` while that subagent runs, `done` once it
+ * finished), followed by one transient `live` satellite per RUNNING
+ * subagent that matched no persona. Finished unmatched subagents are not
+ * shown (nothing to attribute them to). `liveSubagents` is whatever the
+ * run view observed on the step's current task — pass `[]` for the editor.
+ */
+export function subagentSatellites(
+  step: PipelineStep,
+  liveSubagents: readonly Subagent[],
+  profileName: (profileId: string) => string | null,
+): SubagentSatellite[] {
+  const profiles = step.subagents.profileIds
+    .map((id) => ({ id, name: profileName(id) ?? "" }))
+    .filter((p) => p.name.length > 0);
+  const byProfile = new Map<string, SubagentVisualState>();
+  const unmatchedRunning: Subagent[] = [];
+  for (const sub of liveSubagents) {
+    const matched = matchSubagentToProfile(sub, profiles);
+    if (!matched) {
+      if (sub.status === "running") unmatchedRunning.push(sub);
+      continue;
+    }
+    const prev = byProfile.get(matched) ?? "idle";
+    // A running attribution always wins over an earlier finished one.
+    if (sub.status === "running") byProfile.set(matched, "working");
+    else if (prev !== "working") byProfile.set(matched, "done");
+  }
+  const out: SubagentSatellite[] = step.subagents.profileIds.map((profileId) => ({
+    nodeId: subagentNodeId(step.id, profileId),
+    stepId: step.id,
+    kind: "profile",
+    profileId,
+    subagentId: null,
+    label: null,
+    visual: byProfile.get(profileId) ?? "idle",
+  }));
+  for (const sub of unmatchedRunning) {
+    out.push({
+      nodeId: liveSubagentNodeId(step.id, sub.id),
+      stepId: step.id,
+      kind: "live",
+      profileId: null,
+      subagentId: sub.id,
+      label: (sub.description ?? sub.agentType ?? "Subagent").trim() || "Subagent",
+      visual: "working",
+    });
+  }
+  return out;
+}
+
+/**
+ * React Flow nodes for a step's satellites. Each is a CHILD of its step
+ * (`parentId`, position relative to the step's top-left via
+ * {@link subagentSatellitePosition}) so it follows drags for free; never
+ * draggable/selectable/connectable on its own. Callers must append these
+ * AFTER the step nodes in the array React Flow receives — it requires a
+ * parent to precede its children.
+ */
+export function toSubagentFlowNodes(
+  satellites: readonly SubagentSatellite[],
+  extra?: (satellite: SubagentSatellite) => Record<string, unknown>,
+): SubagentFlowNode[] {
+  // Positions are per STEP (index within that step's own satellites, out
+  // of that step's count) — the input may interleave several steps.
+  const countByStep = new Map<string, number>();
+  for (const sat of satellites) countByStep.set(sat.stepId, (countByStep.get(sat.stepId) ?? 0) + 1);
+  const seenByStep = new Map<string, number>();
+  return satellites.map((sat) => {
+    const index = seenByStep.get(sat.stepId) ?? 0;
+    seenByStep.set(sat.stepId, index + 1);
+    return {
+    id: sat.nodeId,
+    type: "subagent",
+    parentId: sat.stepId,
+    position: subagentSatellitePosition(index, countByStep.get(sat.stepId) ?? 1),
+    draggable: false,
+    selectable: false,
+    connectable: false,
+    data: {
+      stepId: sat.stepId,
+      kind: sat.kind,
+      ...(sat.profileId ? { profileId: sat.profileId } : {}),
+      ...(sat.subagentId ? { subagentId: sat.subagentId } : {}),
+      ...(sat.label ? { label: sat.label } : {}),
+      visual: sat.visual,
+      ...(extra ? extra(sat) : {}),
+    },
+    };
+  });
+}
+
+/**
+ * Identity-preserving merge for a DERIVED (not state-held) React Flow
+ * node/edge list: returns each fresh item, except that an item whose
+ * `keyOf` content key is unchanged since the previous call is replaced by
+ * the previous object, so React Flow sees the same object identity and
+ * never re-measures it (see `pipeline-canvas-context.tsx` for why identity
+ * churn is harmful). `memory` is the caller-owned map that carries state
+ * between calls; it's rewritten in place to hold exactly the current items.
+ */
+export function reconcileFlowItems<T extends { id: string }>(
+  memory: Map<string, { key: string; item: T }>,
+  fresh: readonly T[],
+  keyOf: (item: T) => string,
+): T[] {
+  const next = new Map<string, { key: string; item: T }>();
+  const out = fresh.map((f) => {
+    const key = keyOf(f);
+    const prev = memory.get(f.id);
+    const item = prev && prev.key === key ? prev.item : f;
+    next.set(f.id, { key, item });
+    return item;
+  });
+  memory.clear();
+  for (const [id, entry] of next) memory.set(id, entry);
+  return out;
+}
+
+/** Content key for {@link reconcileFlowItems} over satellite nodes. */
+export function subagentNodeKey(node: SubagentFlowNode): string {
+  return `${node.id}|${node.parentId ?? ""}|${node.position.x},${node.position.y}|${JSON.stringify(node.data)}`;
+}
+/** Content key for {@link reconcileFlowItems} over satellite edges. */
+export function subagentEdgeKey(edge: SubagentFlowEdge): string {
+  return `${edge.id}|${edge.source}|${edge.target}|${edge.data?.visual ?? ""}`;
+}
+
+/** The dashed "delegate" edge from a step's bottom handle to each of its
+ *  satellites; `data.visual` mirrors the satellite's own state so the edge
+ *  can march while its persona works. */
+export function toSubagentFlowEdges(satellites: readonly SubagentSatellite[]): SubagentFlowEdge[] {
+  return satellites.map((sat) => ({
+    id: subagentEdgeId(sat.nodeId),
+    type: "subagent",
+    source: sat.stepId,
+    target: sat.nodeId,
+    sourceHandle: "delegate",
+    targetHandle: "in",
+    selectable: false,
+    focusable: false,
+    data: { visual: sat.visual },
+  }));
+}
+
+/** A primitive, content-derived key for a satellite list — what a memoised
+ *  node/edge derivation keys on, so a re-render or a poll that changes
+ *  nothing observable keeps every satellite node's object identity (React
+ *  Flow re-measures a node whose object changes; see
+ *  `pipeline-canvas-context.tsx`). */
+export function satellitesSignature(satellites: readonly SubagentSatellite[]): string {
+  return satellites.map((s) => `${s.nodeId}:${s.visual}:${s.label ?? ""}`).join("|");
 }
 
 // ---------------------------------------------------------------------------

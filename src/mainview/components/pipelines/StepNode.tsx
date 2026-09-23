@@ -121,6 +121,21 @@ function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
         position={Position.Right}
         className="!-right-1.5 !size-2.5 !border-2 !border-background !bg-info"
       />
+      {/* Anchor for the dashed "delegate" edges down to this step's
+          subagent satellites (SubagentNode/SubagentEdge). Never a
+          drag-to-connect source — pipeline edges only ever leave via
+          `out` — and invisible when the step lists no personas, so the
+          card's silhouette is unchanged for the common case. */}
+      <Handle
+        type="source"
+        id="delegate"
+        position={Position.Bottom}
+        isConnectable={false}
+        className={cn(
+          "!size-1.5 !border-0 !bg-muted-foreground/60",
+          step.subagents.profileIds.length === 0 && "!opacity-0",
+        )}
+      />
 
       {!readOnly && onAppend && (
         <button

@@ -10,6 +10,8 @@ import {
   useEdgesState,
   useReactFlow,
   type Connection,
+  type EdgeChange,
+  type NodeChange,
 } from "@xyflow/react";
 import { AnimatePresence, motion } from "motion/react";
 import { ArrowLeft, LayoutGrid, Maximize2, Plus, Save } from "lucide-react";
@@ -22,10 +24,20 @@ import { api, ApiError } from "@/lib/api";
 import {
   autoLayout,
   graphFromFlow,
+  reconcileFlowItems,
+  satellitesSignature,
+  subagentEdgeKey,
+  subagentNodeKey,
+  subagentSatellites,
   toFlowEdges,
   toFlowNodes,
+  toSubagentFlowEdges,
+  toSubagentFlowNodes,
   type StepFlowEdge,
   type StepFlowNode,
+  type SubagentFlowEdge,
+  type SubagentFlowNode,
+  type SubagentSatellite,
 } from "@/lib/pipelines";
 import { newStep, validatePipelineGraph } from "../../../shared/pipeline.ts";
 import { PIPELINE_LIMITS } from "../../../shared/types.ts";
@@ -34,9 +46,17 @@ import { PipelineCanvasContext, type PipelineCanvasContextValue, type StepProfil
 import { StepEdge } from "./StepEdge";
 import { StepNode } from "./StepNode";
 import { StepPanel } from "./StepPanel";
+import { SubagentEdge } from "./SubagentEdge";
+import { SubagentNode } from "./SubagentNode";
 
-const NODE_TYPES = { step: StepNode };
-const EDGE_TYPES = { step: StepEdge };
+const NODE_TYPES = { step: StepNode, subagent: SubagentNode };
+const EDGE_TYPES = { step: StepEdge, subagent: SubagentEdge };
+
+/** Everything the canvas renders: the state-held step nodes/edges plus the
+ *  DERIVED subagent satellites (never stored in `useNodesState` — see the
+ *  satellites block in `PipelineEditorInner`). */
+type CanvasNode = StepFlowNode | SubagentFlowNode;
+type CanvasEdge = StepFlowEdge | SubagentFlowEdge;
 
 interface PipelineEditorProps {
   /** Existing pipeline to load, or `null` to start a blank draft. */
@@ -375,6 +395,63 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
     [nodes, selectedStepId],
   );
 
+  // ---- Subagent satellites: one small node per persona a step may
+  // delegate to, hanging beneath it (`SubagentNode`, `parentId` = the
+  // step, so it follows drags) and linked by a dashed `SubagentEdge`.
+  // DERIVED from the step nodes' `data.step.subagents`, never stored in
+  // `nodes`/`edges` state — so `graphFromFlow`, save, delete-cascade and
+  // the step panel keep seeing exactly the step graph, and the satellites
+  // can't drift from what the panel's picker says. Recomputed from `nodes`
+  // itself (a fresh array on every drag frame — the flatMap is trivial;
+  // NOT from `nodesRef`, which an effect only catches up AFTER the render
+  // that changed the config, so a load-from-REST would derive against the
+  // previous, empty node list and render no satellites at all) and then
+  // identity-reconciled (`reconcileFlowItems`, keyed on the satellites'
+  // content signature) so an unchanged satellite keeps its node object
+  // across renders — React Flow re-measures a node whose object identity
+  // changes. ----
+  const profileNameById = useCallback((id: string) => profileById.get(id)?.name ?? null, [profileById]);
+  const satellites = useMemo<SubagentSatellite[]>(
+    () => nodes.flatMap((n) => subagentSatellites(n.data.step, [], profileNameById)),
+    [nodes, profileNameById],
+  );
+  const satelliteNodeMemory = useRef(new Map<string, { key: string; item: SubagentFlowNode }>());
+  const satelliteEdgeMemory = useRef(new Map<string, { key: string; item: SubagentFlowEdge }>());
+  const satellitesKey = satellitesSignature(satellites);
+  const subagentNodes = useMemo(
+    () => reconcileFlowItems(satelliteNodeMemory.current, toSubagentFlowNodes(satellites), subagentNodeKey),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content (satellitesKey), not the satellites array identity.
+    [satellitesKey],
+  );
+  const subagentEdges = useMemo(
+    () => reconcileFlowItems(satelliteEdgeMemory.current, toSubagentFlowEdges(satellites), subagentEdgeKey),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- same content key as subagentNodes.
+    [satellitesKey],
+  );
+  // React Flow requires a parent to precede its children — satellites go
+  // last, after every step node.
+  const canvasNodes = useMemo<CanvasNode[]>(() => [...nodesWithSelection, ...subagentNodes], [nodesWithSelection, subagentNodes]);
+  const canvasEdges = useMemo<CanvasEdge[]>(() => [...edges, ...subagentEdges], [edges, subagentEdges]);
+
+  // Satellites are never in state, so their own change events (dimension
+  // measurements, mostly) have nothing to apply to — forward only the
+  // step-typed changes to the hooks' reducers. A satellite click selects
+  // the step it belongs to.
+  const onCanvasNodesChange = useCallback(
+    (changes: NodeChange<CanvasNode>[]) => {
+      const stepChanges = changes.filter((c) => !("id" in c) || !c.id.startsWith("sub:") && !c.id.startsWith("live:"));
+      if (stepChanges.length > 0) onNodesChange(stepChanges as NodeChange<StepFlowNode>[]);
+    },
+    [onNodesChange],
+  );
+  const onCanvasEdgesChange = useCallback(
+    (changes: EdgeChange<CanvasEdge>[]) => {
+      const stepChanges = changes.filter((c) => !("id" in c) || !c.id.startsWith("edge:sub:") && !c.id.startsWith("edge:live:"));
+      if (stepChanges.length > 0) onEdgesChange(stepChanges as EdgeChange<StepFlowEdge>[]);
+    },
+    [onEdgesChange],
+  );
+
   const derivedGraph = useMemo(() => graphFromFlow(nodes, edges, startStepId), [nodes, edges, startStepId]);
 
   const selectedStep = useMemo(
@@ -588,16 +665,16 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
             </div>
           )}
           <PipelineCanvasContext.Provider value={canvasContextValue}>
-            <ReactFlow
-              nodes={nodesWithSelection}
-              edges={edges}
+            <ReactFlow<CanvasNode, CanvasEdge>
+              nodes={canvasNodes}
+              edges={canvasEdges}
               nodeTypes={NODE_TYPES}
               edgeTypes={EDGE_TYPES}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
+              onNodesChange={onCanvasNodesChange}
+              onEdgesChange={onCanvasEdgesChange}
               onConnect={onConnect}
-              onNodesDelete={onNodesDelete}
-              onNodeClick={(_, node) => setSelectedStepId(node.id)}
+              onNodesDelete={(deleted) => onNodesDelete(deleted.filter((n): n is StepFlowNode => n.type === "step"))}
+              onNodeClick={(_, node) => setSelectedStepId(node.type === "subagent" ? node.data.stepId : node.id)}
               onPaneClick={() => setSelectedStepId(null)}
               deleteKeyCode={["Backspace", "Delete"]}
               fitView

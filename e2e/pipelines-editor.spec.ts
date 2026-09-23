@@ -277,7 +277,10 @@ test.describe("pipelines editor", () => {
     // + fit-view before falling back to the deterministic select path, so
     // the fallback never has to fight over a node a failed drag displaced.
     for (let attempt = 0; attempt < 2 && !dragConnected; attempt++) {
-      const src = await node0.locator(".react-flow__handle.source").boundingBox();
+      // The step's RIGHT `out` handle — not its bottom `delegate` handle,
+      // which only anchors the subagent satellites and is never a drag
+      // source (`isConnectable={false}`).
+      const src = await node0.locator('.react-flow__handle.source[data-handleid="out"]').boundingBox();
       const dst = await node2.locator(".react-flow__handle.target").boundingBox();
       if (src && dst) {
         const sx = src.x + src.width / 2;
@@ -432,6 +435,15 @@ test.describe("pipelines editor", () => {
     await trigger.click(); // toggles the popover closed
     await expect(trigger).toContainText("2 selected");
 
+    // The canvas mirrors the picker: one satellite node per persona hangs
+    // under the step, each linked by a "delegate" edge, idle in the editor.
+    const satellites = editor.locator(`[data-testid="pipeline-subagent-node"][data-step-id="${id0}"]`);
+    await expect(satellites).toHaveCount(2);
+    await expect(satellites.filter({ hasText: helperOne.name })).toHaveCount(1);
+    await expect(satellites.filter({ hasText: helperTwo.name })).toHaveCount(1);
+    await expect(satellites.first()).toHaveAttribute("data-visual", "idle");
+    await expect(editor.locator('[data-testid="pipeline-subagent-edge"]')).toHaveCount(2);
+
     // Turn the "No limit" switch off -> the cap input appears (seeded at 1);
     // set it to 3.
     await panel.getByTestId("pipeline-step-cap-unlimited").click();
@@ -472,6 +484,14 @@ test.describe("pipelines editor", () => {
     await expect(trigger2).toContainText("2 selected");
     await expect(panel.getByTestId("pipeline-step-cap-unlimited")).not.toBeChecked();
     await expect(panel.getByTestId("pipeline-step-cap")).toHaveValue("3");
+
+    // Satellites are rebuilt from the saved graph on reload too, and a
+    // satellite click selects its step (the panel stays on that step).
+    const satellites2 = editor2.locator(`[data-testid="pipeline-subagent-node"][data-step-id="${id0}"]`);
+    await expect(satellites2).toHaveCount(2);
+    await expect(editor2.locator('[data-testid="pipeline-subagent-edge"]')).toHaveCount(2);
+    await satellites2.first().click({ force: true });
+    await expect(editor2.locator('[data-testid="pipeline-step-panel"]')).toHaveCount(1);
 
     // The popover shows both picked profiles as checked (the check glyph is
     // rendered opaque only on an active row).

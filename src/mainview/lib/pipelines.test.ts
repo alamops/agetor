@@ -5,12 +5,27 @@ import {
   edgeVisualState,
   graphFromFlow,
   latestTransition,
+  matchSubagentToProfile,
+  reconcileFlowItems,
   responseKindLabel,
+  satellitesSignature,
+  stepLayoutFootprint,
   stepReminded,
   stepTaskFor,
   stepVisualState,
+  subagentEdgeKey,
+  subagentNodeKey,
+  subagentSatellitePosition,
+  subagentSatellites,
   toFlowEdges,
   toFlowNodes,
+  toSubagentFlowEdges,
+  toSubagentFlowNodes,
+  SUBAGENT_NODE_GAP,
+  SUBAGENT_NODE_HEIGHT,
+  SUBAGENT_NODE_WIDTH,
+  SUBAGENT_NODES_PER_ROW,
+  SUBAGENT_ROW_TOP,
 } from "./pipelines.ts";
 import type {
   PipelineEdge,
@@ -18,6 +33,7 @@ import type {
   PipelineRunState,
   PipelineStep,
   PipelineStepRecord,
+  Subagent,
   Task,
 } from "../../shared/types.ts";
 
@@ -501,5 +517,228 @@ describe("stepReminded", () => {
       ],
     });
     expect(stepReminded(run, "step-1")).toBe(false);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Subagent satellites
+// ---------------------------------------------------------------------------
+
+function makeSubagent(overrides: Partial<Subagent> = {}): Subagent {
+  return {
+    id: overrides.id ?? "sub-1",
+    taskId: overrides.taskId ?? "task-1",
+    runId: overrides.runId ?? "run-1",
+    parentKind: overrides.parentKind ?? "subagent",
+    agentType: overrides.agentType ?? "general-purpose",
+    description: overrides.description ?? null,
+    spawnDepth: 1,
+    sourcePath: "",
+    toolUseId: null,
+    status: overrides.status ?? "running",
+    startedAt: 1,
+    endedAt: overrides.endedAt ?? null,
+  };
+}
+
+const NAMES: Record<string, string> = { p1: "Helper One", p2: "Helper Two", p3: "Reviewer", p4: "Reviewer Pro" };
+const nameOf = (id: string) => NAMES[id] ?? null;
+
+describe("subagentSatellitePosition", () => {
+  test("a single satellite is centred under the 240px step card, one row below it", () => {
+    const pos = subagentSatellitePosition(0, 1);
+    expect(pos.x).toBe((240 - SUBAGENT_NODE_WIDTH) / 2);
+    expect(pos.y).toBe(96 + SUBAGENT_ROW_TOP);
+  });
+
+  test("wraps into rows of SUBAGENT_NODES_PER_ROW; a partial last row is centred on its own", () => {
+    const count = SUBAGENT_NODES_PER_ROW + 1;
+    const first = subagentSatellitePosition(0, count);
+    const last = subagentSatellitePosition(SUBAGENT_NODES_PER_ROW, count);
+    expect(last.y).toBe(first.y + SUBAGENT_NODE_HEIGHT + SUBAGENT_NODE_GAP);
+    // The lone item on row 2 sits centred, like the single-satellite case.
+    expect(last.x).toBe((240 - SUBAGENT_NODE_WIDTH) / 2);
+    // Full row 1 is centred as a block, so its first column starts left of centre.
+    expect(first.x).toBeLessThan(last.x);
+  });
+});
+
+describe("stepLayoutFootprint / autoLayout with satellites", () => {
+  test("a step without subagents keeps the bare card footprint", () => {
+    expect(stepLayoutFootprint(makeStep())).toEqual({ width: 240, height: 96 });
+  });
+
+  test("satellite rows grow the footprint, and dagre spacing honours it", () => {
+    const withSubs = makeStep({ id: "a", subagents: { profileIds: ["p1", "p2", "p3", "p4"], cap: null } });
+    const fp = stepLayoutFootprint(withSubs);
+    expect(fp.width).toBe(3 * SUBAGENT_NODE_WIDTH + 2 * SUBAGENT_NODE_GAP);
+    expect(fp.height).toBe(96 + SUBAGENT_ROW_TOP + 2 * (SUBAGENT_NODE_HEIGHT + SUBAGENT_NODE_GAP));
+
+    // Two steps stacked in the same rank (no edge between them): the second
+    // must start below the first one's satellites, not below its card.
+    const plain = makeStep({ id: "b" });
+    const laidOut = autoLayout({ steps: [withSubs, plain], edges: [], startStepId: "a" });
+    const a = laidOut.steps.find((s) => s.id === "a")!;
+    const b = laidOut.steps.find((s) => s.id === "b")!;
+    const [top, bottom] = a.position.y < b.position.y ? [a, b] : [b, a];
+    const topFootprint = stepLayoutFootprint(top);
+    expect(bottom.position.y).toBeGreaterThanOrEqual(top.position.y + topFootprint.height);
+  });
+});
+
+describe("matchSubagentToProfile", () => {
+  const profiles = [
+    { id: "p1", name: "Helper One" },
+    { id: "p3", name: "Reviewer" },
+    { id: "p4", name: "Reviewer Pro" },
+  ];
+
+  test("matches by description, case-insensitively", () => {
+    expect(matchSubagentToProfile(makeSubagent({ description: "helper one: review the tests" }), profiles)).toBe("p1");
+  });
+
+  test("matches by agentType when the description says nothing", () => {
+    expect(matchSubagentToProfile(makeSubagent({ description: null, agentType: "Helper One" }), profiles)).toBe("p1");
+  });
+
+  test("the longest matching name wins", () => {
+    expect(matchSubagentToProfile(makeSubagent({ description: "Reviewer Pro: check style" }), profiles)).toBe("p4");
+    expect(matchSubagentToProfile(makeSubagent({ description: "Reviewer: check style" }), profiles)).toBe("p3");
+  });
+
+  test("no match → null; empty inputs → null", () => {
+    expect(matchSubagentToProfile(makeSubagent({ description: "Explore the repo" }), profiles)).toBeNull();
+    expect(matchSubagentToProfile(makeSubagent({ description: null, agentType: null }), profiles)).toBeNull();
+    expect(matchSubagentToProfile(makeSubagent({ description: "Helper One" }), [])).toBeNull();
+  });
+});
+
+describe("subagentSatellites", () => {
+  const step = makeStep({ id: "a", subagents: { profileIds: ["p1", "p2"], cap: 2 } });
+
+  test("editor case: every configured persona, idle, in configured order", () => {
+    const sats = subagentSatellites(step, [], nameOf);
+    expect(sats.map((s) => [s.kind, s.profileId, s.visual])).toEqual([
+      ["profile", "p1", "idle"],
+      ["profile", "p2", "idle"],
+    ]);
+    expect(sats[0]!.nodeId).toBe("sub:a:p1");
+  });
+
+  test("a running subagent attributed to a persona makes it working; a finished one makes it done", () => {
+    const sats = subagentSatellites(
+      step,
+      [
+        makeSubagent({ id: "s1", description: "Helper One: tests", status: "running" }),
+        makeSubagent({ id: "s2", description: "Helper Two: docs", status: "completed", endedAt: 2 }),
+      ],
+      nameOf,
+    );
+    expect(sats.map((s) => s.visual)).toEqual(["working", "done"]);
+  });
+
+  test("running beats done for the same persona, regardless of order", () => {
+    const sats = subagentSatellites(
+      step,
+      [
+        makeSubagent({ id: "s1", description: "Helper One: first pass", status: "completed", endedAt: 2 }),
+        makeSubagent({ id: "s2", description: "Helper One: second pass", status: "running" }),
+      ],
+      nameOf,
+    );
+    expect(sats[0]!.visual).toBe("working");
+  });
+
+  test("an unmatched RUNNING subagent becomes a transient live satellite; an unmatched finished one is dropped", () => {
+    const sats = subagentSatellites(
+      step,
+      [
+        makeSubagent({ id: "s9", description: "Explore the repo", status: "running" }),
+        makeSubagent({ id: "s8", description: "old scout", status: "completed", endedAt: 2 }),
+      ],
+      nameOf,
+    );
+    expect(sats).toHaveLength(3);
+    const live = sats[2]!;
+    expect(live.kind).toBe("live");
+    expect(live.nodeId).toBe("live:a:s9");
+    expect(live.label).toBe("Explore the repo");
+    expect(live.visual).toBe("working");
+    expect(live.subagentId).toBe("s9");
+  });
+
+  test("a deleted persona (no name) still renders as an idle satellite and never matches", () => {
+    const withGhost = makeStep({ id: "a", subagents: { profileIds: ["ghost"], cap: null } });
+    const sats = subagentSatellites(withGhost, [makeSubagent({ description: "ghost: hi", status: "running" })], nameOf);
+    expect(sats.map((s) => [s.kind, s.profileId, s.visual])).toEqual([
+      ["profile", "ghost", "idle"],
+      ["live", null, "working"],
+    ]);
+  });
+});
+
+describe("toSubagentFlowNodes / toSubagentFlowEdges", () => {
+  test("nodes are non-interactive children of their step, positioned per step", () => {
+    const a = makeStep({ id: "a", subagents: { profileIds: ["p1", "p2"], cap: null } });
+    const b = makeStep({ id: "b", subagents: { profileIds: ["p3"], cap: null } });
+    const sats = [...subagentSatellites(a, [], nameOf), ...subagentSatellites(b, [], nameOf)];
+    const nodes = toSubagentFlowNodes(sats, () => ({ readOnly: true }));
+    expect(nodes.map((n) => n.parentId)).toEqual(["a", "a", "b"]);
+    expect(nodes.every((n) => n.type === "subagent" && n.draggable === false && n.selectable === false)).toBe(true);
+    // b's lone satellite is centred like a single one, not placed as the
+    // third of a three-wide row.
+    expect(nodes[2]!.position).toEqual(subagentSatellitePosition(0, 1));
+    expect(nodes[0]!.position).toEqual(subagentSatellitePosition(0, 2));
+    expect(nodes[1]!.position).toEqual(subagentSatellitePosition(1, 2));
+    expect(nodes[0]!.data).toMatchObject({ stepId: "a", kind: "profile", profileId: "p1", visual: "idle", readOnly: true });
+
+    const edges = toSubagentFlowEdges(sats);
+    expect(edges.map((e) => [e.source, e.target, e.sourceHandle, e.targetHandle])).toEqual([
+      ["a", "sub:a:p1", "delegate", "in"],
+      ["a", "sub:a:p2", "delegate", "in"],
+      ["b", "sub:b:p3", "delegate", "in"],
+    ]);
+    expect(edges[0]!.id).toBe("edge:sub:a:p1");
+    expect(edges[0]!.data?.visual).toBe("idle");
+  });
+
+  test("satellitesSignature changes with visual state and label, not otherwise", () => {
+    const step = makeStep({ id: "a", subagents: { profileIds: ["p1"], cap: null } });
+    const idle = satellitesSignature(subagentSatellites(step, [], nameOf));
+    const idleAgain = satellitesSignature(subagentSatellites(step, [], nameOf));
+    const working = satellitesSignature(
+      subagentSatellites(step, [makeSubagent({ description: "Helper One", status: "running" })], nameOf),
+    );
+    expect(idle).toBe(idleAgain);
+    expect(working).not.toBe(idle);
+  });
+});
+
+describe("reconcileFlowItems", () => {
+  test("keeps the previous object for an unchanged key and takes the fresh one otherwise", () => {
+    const memory = new Map<string, { key: string; item: { id: string; v: number } }>();
+    const first = reconcileFlowItems(memory, [{ id: "x", v: 1 }, { id: "y", v: 1 }], (i) => `${i.id}:${i.v}`);
+    const second = reconcileFlowItems(memory, [{ id: "x", v: 1 }, { id: "y", v: 2 }], (i) => `${i.id}:${i.v}`);
+    expect(second[0]).toBe(first[0]);
+    expect(second[1]).not.toBe(first[1]);
+    expect(second[1]!.v).toBe(2);
+    // Items that vanished are forgotten.
+    reconcileFlowItems(memory, [], (i) => `${i.id}:${i.v}`);
+    expect(memory.size).toBe(0);
+  });
+
+  test("subagentNodeKey / subagentEdgeKey cover position, parent, data and visual", () => {
+    const step = makeStep({ id: "a", subagents: { profileIds: ["p1"], cap: null } });
+    const [n1] = toSubagentFlowNodes(subagentSatellites(step, [], nameOf));
+    const [n2] = toSubagentFlowNodes(
+      subagentSatellites(step, [makeSubagent({ description: "Helper One", status: "running" })], nameOf),
+    );
+    expect(subagentNodeKey(n1!)).not.toBe(subagentNodeKey(n2!));
+    const [e1] = toSubagentFlowEdges(subagentSatellites(step, [], nameOf));
+    const [e2] = toSubagentFlowEdges(
+      subagentSatellites(step, [makeSubagent({ description: "Helper One", status: "running" })], nameOf),
+    );
+    expect(subagentEdgeKey(e1!)).not.toBe(subagentEdgeKey(e2!));
   });
 });

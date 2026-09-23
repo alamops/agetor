@@ -892,6 +892,39 @@ export const FAKE_CLAUDE_HANDOFF_PROMPT_MARKER = "__agetor_fake_claude_handoff__
  *  pattern without escaping — mirrors {@link FAKE_CLAUDE_MONITOR_PROMPT_MARKER}'s
  *  own suffix regex below. */
 const FAKE_CLAUDE_HANDOFF_SUFFIX_RE = new RegExp(`${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}(?::([\\w-]+))?`, "g");
+
+/**
+ * Companion to {@link FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}: when a pipeline
+ * step's prompt ALSO carries this marker, the fake handoff turn first
+ * "spawns" one subagent — a `subagents` row inserted directly, exactly like
+ * the Monitor scenario does (this fake driver writes no session JSONL for
+ * `claude-subagents.ts` to discover it from) — keeps it `running` for
+ * `:<ms>` (default {@link FAKE_CLAUDE_SUBAGENT_DEFAULT_RUN_MS}), settles it
+ * `completed`, and only THEN emits the handoff and resolves the turn (the
+ * orchestrator's `subagents.hasRunning` hold would otherwise keep the step
+ * `running` past the turn). The optional `[<description>]` sets the row's
+ * `description` — the run view attributes a live subagent to a configured
+ * persona by name (`matchSubagentToProfile`), so a test names the persona
+ * there: `__agetor_fake_claude_subagent__:4500[Helper One: review tests]`.
+ * Exported for `e2e/pipelines-run.spec.ts`, which keeps a literal copy.
+ */
+export const FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER = "__agetor_fake_claude_subagent__";
+export const FAKE_CLAUDE_SUBAGENT_DEFAULT_RUN_MS = 1500;
+const FAKE_CLAUDE_SUBAGENT_MIN_RUN_MS = 50;
+const FAKE_CLAUDE_SUBAGENT_RE = new RegExp(
+  `${FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER}(?::(\\d+))?(?:\\[([^\\]\\n]+)\\])?`,
+);
+/** Parse the LAST subagent marker in `prompt` (a step's own instructions win
+ *  over the goal text, same rule as `lastFakeHandoffSuffix`). */
+function parseFakeSubagentMarker(prompt: string): { runMs: number; description: string } | null {
+  const idx = prompt.lastIndexOf(FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER);
+  if (idx === -1) return null;
+  const m = FAKE_CLAUDE_SUBAGENT_RE.exec(prompt.slice(idx));
+  const parsed = m?.[1] ? Number(m[1]) : NaN;
+  const runMs = Number.isFinite(parsed) ? Math.max(FAKE_CLAUDE_SUBAGENT_MIN_RUN_MS, parsed) : FAKE_CLAUDE_SUBAGENT_DEFAULT_RUN_MS;
+  const description = m?.[2]?.trim() || "Fake subagent";
+  return { runMs, description };
+}
 /** Find the LAST occurrence of {@link FAKE_CLAUDE_HANDOFF_PROMPT_MARKER} in
  *  `prompt` and return its optional `:<token>` suffix (letters/digits/-/_ ;
  *  stops at whitespace/`:`), or `null` when the marker carries no suffix
@@ -1391,9 +1424,59 @@ function makeFakeAgent(
     const handoffPromptSource = resolveFakeHandoffPromptSource(taskId, prompt) as string;
     const turn = bumpFakeHandoffTurn(taskId);
     const suffix = resolveFakeHandoffTurnSuffix(lastFakeHandoffSuffix(handoffPromptSource), turn);
-    const resolveDelayMs = Math.max(20, Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 30) || 30);
+    // A `FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER` in the same source prompt (turn
+    // 1 only — a real agent spawns its helpers while doing the work, not on
+    // a reminder round-trip) adds a "spawned a subagent" phase ahead of the
+    // handoff: the row runs for `runMs`, then settles, and the handoff +
+    // resolve are pushed out past that settle so the orchestrator's
+    // subagent hold never outlives the turn.
+    const subagentSpec = turn <= 1 ? parseFakeSubagentMarker(handoffPromptSource) : null;
+    const baseResolveDelayMs = Math.max(20, Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 30) || 30);
+    const resolveDelayMs = subagentSpec ? Math.max(baseResolveDelayMs, subagentSpec.runMs + 60) : baseResolveDelayMs;
     after(5, () => onChunk("status", "fake: working"));
-    after(Math.min(20, resolveDelayMs - 10), () => {
+    if (subagentSpec) {
+      // Keyed on the RUN (same reasoning as the Monitor scenario's id):
+      // `insertIfAbsent` is INSERT OR IGNORE, so a task-keyed id would
+      // collide with a previous run's already-completed row on a re-run.
+      const subagentId = `fake-subagent-${fakeOpts.runId ?? taskId}`;
+      after(8, () => {
+        onChunk(
+          "tool_use",
+          JSON.stringify({
+            id: "fake-subagent-1",
+            name: "Agent",
+            input: { subagent_type: "general-purpose", description: subagentSpec.description, prompt: "do the delegated part" },
+            serverSide: false,
+          }),
+          "fake-subagent-1-tu",
+        );
+        subagentsDb.insertIfAbsent({
+          id: subagentId,
+          taskId,
+          runId: fakeOpts.runId ?? null,
+          parentKind: "subagent",
+          agentType: "general-purpose",
+          description: subagentSpec.description,
+          spawnDepth: 1,
+          sourcePath: "",
+          toolUseId: "fake-subagent-1",
+          status: "running",
+          startedAt: Date.now(),
+          endedAt: null,
+        });
+        record.push(`subagent:spawned:${subagentId}`);
+      });
+      after(8 + subagentSpec.runMs, () => {
+        settleSubagentById(subagentId, "completed", "receipt");
+        onChunk(
+          "tool_result",
+          JSON.stringify({ toolUseId: "fake-subagent-1", content: "delegated part done", isError: false }),
+          "fake-subagent-1-tr",
+        );
+        record.push(`subagent:settled:${subagentId}`);
+      });
+    }
+    after(subagentSpec ? subagentSpec.runMs + 30 : Math.min(20, resolveDelayMs - 10), () => {
       if (suffix === "missing") {
         onChunk("assistant", "I finished the work but forgot the handoff.");
       } else if (suffix === "invalid") {
