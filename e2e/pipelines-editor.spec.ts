@@ -435,101 +435,103 @@ test.describe("pipelines editor", () => {
     ).toBeVisible();
   });
 
-  // PRODUCT BUG (not a test issue — root-caused via a throwaway diagnostic
-  // spec, deleted after use): using the step panel's "New agent…" inline
+  // PRODUCT BUG, now FIXED (root-caused via a throwaway diagnostic spec,
+  // deleted after use): using the step panel's "New agent…" inline
   // profile-creation dialog (`AgentProfileFormDialog`, opened from
-  // `StepPanel.tsx`'s "New agent…" button) on one step can leave a SIBLING
-  // step node permanently unclickable afterward.
+  // `StepPanel.tsx`'s "New agent…" button) on one step used to leave a
+  // SIBLING step node permanently unclickable afterward.
   //
-  // Repro (confirmed deterministic across several runs): with >= 2 step
-  // nodes already assigned an agent profile via the `AgentProfilePicker`
-  // (not via "New agent…"), select a third/different step and use ITS
-  // "New agent…" button to create + assign a brand-new profile. The dialog
-  // closes, the new chip renders correctly on that step's node, and the
-  // React Flow viewport itself is untouched (`.react-flow__viewport`'s
-  // `transform` stays byte-identical, confirmed by polling it for a full
-  // second after the dialog closes) — but a SIBLING node (one of the ones
-  // assigned earlier via the picker) gets stuck with `visibility: hidden`
-  // on its `.react-flow__node` wrapper (confirmed via
-  // `getComputedStyle` — `display: "block"`, `opacity: "1"`, only
-  // `visibility: "hidden"`), even though its bounding box/position stay
-  // exactly where they were. `document.elementFromPoint` at that node's own
-  // center hits `.react-flow__pane` instead of the node. It is also the
-  // reproducible trigger for the console warning "[React Flow]: It seems
-  // that you are trying to drag a node that is not initialized." seen while
-  // building this spec — React Flow's own signal that a node's internal
-  // "measured" state never got (re)set. The node stays permanently inert —
-  // it never self-recovers, not even after several more seconds — so any
-  // later interaction with that sibling (select it, connect an edge from
-  // it, delete it) is impossible without a full page reload.
+  // Repro (was deterministic across several runs): with >= 2 step nodes
+  // already assigned an agent profile via the `AgentProfilePicker` (not via
+  // "New agent…"), select a third/different step and use ITS "New agent…"
+  // button to create + assign a brand-new profile. The dialog closed, the
+  // new chip rendered correctly on that step's node, and the React Flow
+  // viewport itself was untouched — but a SIBLING node (one of the ones
+  // assigned earlier via the picker) got stuck with `visibility: hidden` on
+  // its `.react-flow__node` wrapper, even though its bounding box/position
+  // stayed exactly where they were, making it permanently inert (any later
+  // interaction impossible without a full page reload).
   //
-  // Likely cause (not fixed here — out of scope for a test-authoring pass):
-  // `StepPanel`'s "New agent…" `onSaved` calls `onProfilesChanged()`
-  // (`PipelineEditor.tsx`'s `refreshProfiles`), which changes the
-  // `profiles` array's identity; `PipelineEditorInner`'s `nodes` useMemo
-  // depends on `profileById` (derived from `profiles`), so EVERY node's
-  // `data` object is recreated with a new identity on that refetch — not
-  // just the edited step's. React Flow appears to interpret that as a
-  // reason to re-measure every node, and for at least one sibling the
-  // remeasure pass never completes, leaving it hidden.
-  //
-  // This is exactly the interaction the "build a 3-step graph" test above
-  // deliberately avoids (it uses the picker for every step, including the
-  // step a real user might use "New agent…" for) so the rest of that test
-  // isn't flaky on an unrelated, already-diagnosed bug. Once fixed, this
-  // test's body is the assertion the product SHOULD satisfy.
-  test.fixme(
-    "New agent… inline creation on one step does not leave a sibling step node stuck unclickable",
-    async ({ page, backend }) => {
-      const alpha = await createProfileRest(backend, `New-Agent-Bug Alpha ${randomUUID()}`);
-      createdProfileIds.push(alpha.id);
-      await page.setViewportSize({ width: 1600, height: 900 });
+  // Root cause: `StepPanel`'s "New agent…" `onSaved` called
+  // `onProfilesChanged()` (`PipelineEditor.tsx`'s `refreshProfiles`), which
+  // changed the `profiles` array's identity; `PipelineEditorInner`'s `nodes`
+  // useMemo depended on `profileById` (derived from `profiles`), so EVERY
+  // node's `data` object was recreated with a new identity on that refetch —
+  // not just the edited step's, causing React Flow to botch a remeasure of
+  // at least one sibling. Fixed by moving profile resolution into
+  // `pipeline-canvas-context.tsx` so nodes stay owned by `useNodesState` and
+  // a profiles refetch no longer recreates every node's `data` object.
+  test("New agent… inline creation on one step does not leave a sibling step node stuck unclickable", async ({
+    page,
+    backend,
+  }) => {
+    const alpha = await createProfileRest(backend, `New-Agent-Bug Alpha ${randomUUID()}`);
+    createdProfileIds.push(alpha.id);
+    await page.setViewportSize({ width: 1600, height: 900 });
 
-      await gotoApp(page, backend.bootBase);
-      await pipelinesButton(page).click();
-      await page.getByTestId("pipelines-new").click();
-      const editor = page.getByTestId("pipeline-editor");
-      await expect(editor).toBeVisible();
-      await editor.getByTestId("pipeline-add-step").click();
-      await editor.getByTestId("pipeline-add-step").click();
-      await expect(editor.locator('[data-testid="pipeline-step-node"]')).toHaveCount(3);
+    await gotoApp(page, backend.bootBase);
+    await pipelinesButton(page).click();
+    await page.getByTestId("pipelines-new").click();
+    const editor = page.getByTestId("pipeline-editor");
+    await expect(editor).toBeVisible();
+    await editor.getByTestId("pipeline-add-step").click();
+    await editor.getByTestId("pipeline-add-step").click();
+    await expect(editor.locator('[data-testid="pipeline-step-node"]')).toHaveCount(3);
 
-      const [id0, id1, id2] = await nodeIds(page);
-      const node0 = stepNode(page, id0!);
-      const node1 = stepNode(page, id1!);
-      const node2 = stepNode(page, id2!);
+    const [id0, id1, id2] = await nodeIds(page);
+    const node0 = stepNode(page, id0!);
+    const node1 = stepNode(page, id1!);
+    const node2 = stepNode(page, id2!);
 
-      // Assign Alpha to the first two steps via the picker (the sibling
-      // that ends up stuck).
-      let panel = await openStepPanel(editor, node0);
-      let picker = panel.getByTestId("agent-profile-picker");
-      await picker.getByTestId("agent-profile-picker-trigger").click();
-      await picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
+    // Assign Alpha to the first two steps via the picker — these are the
+    // siblings that used to end up stuck. Capture each step's own name
+    // along the way so the later "panel shows its name" assertion has
+    // something distinctive to check for.
+    let panel = await openStepPanel(editor, node0);
+    const name0 = await panel.getByTestId("pipeline-step-name").inputValue();
+    let picker = panel.getByTestId("agent-profile-picker");
+    await picker.getByTestId("agent-profile-picker-trigger").click();
+    await picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
+    await expect(node0.locator('[data-testid="agent-profile-card"]')).toContainText(alpha.name);
 
-      panel = await openStepPanel(editor, node2);
-      picker = panel.getByTestId("agent-profile-picker");
-      await picker.getByTestId("agent-profile-picker-trigger").click();
-      await picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
+    panel = await openStepPanel(editor, node2);
+    const name2 = await panel.getByTestId("pipeline-step-name").inputValue();
+    picker = panel.getByTestId("agent-profile-picker");
+    await picker.getByTestId("agent-profile-picker-trigger").click();
+    await picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
+    await expect(node2.locator('[data-testid="agent-profile-card"]')).toContainText(alpha.name);
 
-      // Use "New agent…" on the THIRD step.
-      panel = await openStepPanel(editor, node1);
-      await panel.getByTestId("pipeline-step-new-agent").click();
-      const newAgentDialog = page.getByTestId("agent-profile-form-dialog");
-      await expect(newAgentDialog).toBeVisible();
-      const newAgentName = `New-Agent-Bug Inline ${randomUUID()}`;
-      await newAgentDialog.getByTestId("agent-profile-name").fill(newAgentName);
-      await newAgentDialog.getByTestId("agent-profile-save").click();
-      await expect(newAgentDialog).toBeHidden();
-      createdProfileIds.push(await findAgentProfileIdByName(backend, newAgentName));
+    // Use "New agent…" on the THIRD step.
+    panel = await openStepPanel(editor, node1);
+    await panel.getByTestId("pipeline-step-new-agent").click();
+    const newAgentDialog = page.getByTestId("agent-profile-form-dialog");
+    await expect(newAgentDialog).toBeVisible();
+    const newAgentName = `New-Agent-Bug Inline ${randomUUID()}`;
+    await newAgentDialog.getByTestId("agent-profile-name").fill(newAgentName);
+    await newAgentDialog.getByTestId("agent-profile-save").click();
+    await expect(newAgentDialog).toBeHidden();
+    createdProfileIds.push(await findAgentProfileIdByName(backend, newAgentName));
 
-      // What SHOULD hold: every sibling node stays clickable (its
-      // `.react-flow__node` wrapper never gets stuck `visibility: hidden`),
-      // so selecting it opens its panel like any other click.
-      await page.waitForTimeout(1000); // let any async remeasure settle
-      await node0.click({ timeout: 5000 });
-      await expect(editor.locator('[data-testid="pipeline-step-panel"]')).toHaveCount(1);
-    },
-  );
+    // The third step's own node shows the freshly-created profile's chip.
+    await expect(node1.locator('[data-testid="agent-profile-card"]')).toContainText(newAgentName);
+
+    // Every sibling node stays clickable (its `.react-flow__node` wrapper
+    // never gets stuck `visibility: hidden`), so selecting it opens its
+    // panel like any other click, and the panel it opens is the RIGHT
+    // step's — not some stale/empty one.
+    await page.waitForTimeout(1000); // let any async remeasure settle
+
+    const hiddenNodes = await page
+      .locator(".react-flow__node")
+      .evaluateAll((els) => els.filter((el) => getComputedStyle(el).visibility === "hidden").length);
+    expect(hiddenNodes).toBe(0);
+
+    const panel0 = await openStepPanel(editor, node0);
+    await expect(panel0.getByTestId("pipeline-step-name")).toHaveValue(name0);
+
+    const panel2 = await openStepPanel(editor, node2);
+    await expect(panel2.getByTestId("pipeline-step-name")).toHaveValue(name2);
+  });
 });
 
 async function findAgentProfileIdByName(backend: E2EBackend, name: string): Promise<string> {

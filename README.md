@@ -174,7 +174,7 @@ agetor rm <id> --yes         # delete a task (worktree + branch)
 agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
 agetor harness <sub>         # list | add | edit | enable | disable | rm | shell  (aliases / accounts; shell = log in)
 agetor profile <sub>         # ls | show <ref> | add <name> | edit <ref> | rm <ref>  (alias: profiles — saved launch presets, see Agents above)
-agetor pipeline <sub>        # ls | show <ref> | rm <ref> | export <ref> [--out f] | import <file>  (see Pipelines above)
+agetor pipeline <sub>        # ls | show <ref> | rm <ref> | export <ref> [--out f] | import <file> | retry <ref> | advance <ref> --next <step>|--finish | restart <ref> | status <ref>  (see Pipelines above)
 agetor daemon status|start|stop
 agetor info                  # the connected core's version
 agetor config [k] [v]        # view / set core preferences (defaultHarness, last model/mode/effort)
@@ -282,7 +282,7 @@ Each step ends its turn with a small JSON block telling agetor what happened and
 
 `next` names the step to run next (by its name, or by an edge's label if you've given the connecting edge one). A step can instead be set to run **all** of its outgoing steps in parallel (fan-out), and a downstream step can wait for **any** one of its incoming steps to arrive (the default — this is also how loops/cycles work) or for **all** of them before it starts (a join, receiving every branch's handoff at once). A step with no outgoing edges ends that path.
 
-When a step doesn't emit a valid handoff, asks a question, or its run fails, the pipeline card goes to **Blocked** with a reason — you can **Retry** the stuck step, or **manually advance** it (pick which step runs next yourself, optionally with your own summary). A run-away cycle is capped (25 steps by default, configurable per pipeline).
+When a step doesn't emit a valid handoff, reports itself blocked, asks a question, or its run fails, the pipeline card goes to **Blocked** with a reason — you can **Retry** the stuck step (also available from the CLI, `agetor pipeline retry <ref>`), or **manually advance** it (pick which step runs next yourself, optionally with your own summary; `agetor pipeline advance <ref> --next <step>` or `--finish`). A run-away cycle is capped (25 steps by default, configurable per pipeline) — hitting the cap is itself just another Blocked reason, and Retry there doubles the run's allowance instead of being a dead end, so a long-running pipeline can keep going for as long as you keep retrying past the cap. Retry always picks up where a blocked or cancelled run left off — it never restarts from scratch. A **finished** pipeline is different: Run refuses on a completed pipeline, and re-running it from the top is a separate, explicit action — **Restart** in the run view, or `agetor pipeline restart <ref>` — since it discards the completed run's place in history otherwise. `agetor pipeline status <ref>` prints the run's overall status, progress, and every blocked entry from the terminal.
 
 Click a pipeline card to open the full-page run view: the graph animates as it runs (the active step pulses, a token travels each edge on handoff), and clicking any step node opens that step's normal task details on top, exactly like any other task — you can read its full transcript, chat with it, or look at its diff.
 

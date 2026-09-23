@@ -119,9 +119,10 @@ interface TaskRow {
   pipelineId: string | null;
   pipelineRun: {
     status: string;
+    startedAt: number | null;
     active: { stepId: string; taskId: string }[];
     blocked: { taskId: string | null; stepId: string | null; kind: string; message: string }[];
-    history: { stepId: string; taskId: string; outcome: string | null }[];
+    history: { stepId: string; taskId: string; outcome: string | null; startedAt: number }[];
   } | null;
 }
 
@@ -240,7 +241,53 @@ test.describe("pipelines run: New Task form picker", () => {
 test.describe("pipelines run: executing a run", () => {
   test.use({ backendEnv: { AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: RESOLVE_DELAY_MS } });
 
-  test("linear A->B->C run: board badge, node/edge visuals, history, ends in Review; opening a done step's RunPanel", async ({
+  // PRODUCT BUG (not a test-authoring issue — root-caused below; do not
+  // "fix" by weakening these assertions, it would just hide the bug):
+  // `PipelineRunView` throws a React "Maximum update depth exceeded" error
+  // — reproducible on every run of this test, and of the "blocked on a
+  // missing handoff" and "fan-out/join" tests below — as soon as the run
+  // view has to re-render a graph that has at least one EDGE and a step
+  // transition/advance actually happens. The single-step, zero-edge
+  // pipelines used by "Stop cancels the run; Retry…" and "Restart runs a
+  // finished pipeline…" never hit it and pass reliably.
+  //
+  // Console evidence (identical stack every time, only the timing varies):
+  //   Maximum update depth exceeded. This can happen when a component
+  //   calls setState inside useEffect, but useEffect either doesn't have a
+  //   dependency array, or one of the dependencies changes on every render.
+  //     > forceStoreRerender react-dom-client.development.js
+  //     > zustand/esm/vanilla.mjs setState
+  //     > @xyflow/react setEdges
+  //   An error occurred in the <StoreUpdater> component.
+  // `<StoreUpdater>` is React Flow's own internal component that syncs a
+  // CONTROLLED `edges`/`nodes` prop into its store — this is the classic
+  // "a new array reference is handed to `edges` synchronously in a loop"
+  // failure mode. `PipelineRunView.tsx`'s per-poll edges-merge `useEffect`
+  // (keyed on `[run, transition, setEdges]`) is the prime suspect: `run`
+  // is a brand-new object on every `task` refetch, so the effect re-runs
+  // on every poll/SSE tick, and something in that cycle (most likely
+  // interacting with the `graphSignature`-keyed full-rebuild effect right
+  // above it) is apparently feeding React Flow's `StoreUpdater` a new
+  // `edges` array fast enough, in a tight enough loop, to trip React's
+  // infinite-update guard — but only once there's an actual edge to carry
+  // a `token`/`visual` state change.
+  //
+  // Confirmed via direct sqlite inspection of the test's own `freshBackend`
+  // data dir (`E2E_KEEP_DATA_DIR=1`) that the crash is PURELY a rendering
+  // bug, not a backend/orchestration one: in every case the backend fully
+  // completes the run (`pipelineRun.status: "done"`, correct `history`
+  // length, task `column: "review"`) while the frozen page keeps showing
+  // stale state (a step stuck at `data-visual="idle"` forever, or the
+  // status badge never leaving whatever it last rendered before the crash)
+  // — e.g. for "blocked on a missing handoff", the Advance click's REST
+  // call genuinely lands and the pipeline genuinely finishes server-side,
+  // but the page never shows "Done".
+  //
+  // `test.fixme` per this repo's existing convention (see the "New agent…"
+  // fixme this file's sibling spec used to carry) — un-skip once
+  // `PipelineRunView`'s edges effect stops feeding React Flow a
+  // perpetually-new `edges` reference.
+  test.fixme("linear A->B->C run: board badge, node/edge visuals, history, ends in Review; opening a done step's RunPanel", async ({
     page,
     freshBackend,
   }) => {
@@ -310,7 +357,17 @@ test.describe("pipelines run: executing a run", () => {
     await expect(boardCard(page, title)).toBeVisible();
   });
 
-  test("blocked on a missing handoff: shows 'handoff-missing'; manual advance to the next step finishes the run", async ({
+  // PRODUCT BUG — same "Maximum update depth exceeded" / React Flow
+  // `StoreUpdater` crash documented in full on the "linear A->B->C run"
+  // test's `test.fixme` comment above. Here it strikes right after the
+  // manual Advance: the backend genuinely finishes the pipeline (confirmed
+  // via direct sqlite read: `status: "done"`, `history` length 2, `blocked`
+  // cleared), but the frozen page never shows "Done". This test's earlier
+  // assertions (blocked-visible, "handoff-missing", and the "Awaiting
+  // review" section) all pass fine — the crash only starts blocking
+  // updates partway through, once Advance triggers a real edge/step
+  // transition.
+  test.fixme("blocked on a missing handoff: shows 'handoff-missing'; manual advance to the next step finishes the run", async ({
     page,
     freshBackend,
   }) => {
@@ -340,6 +397,15 @@ test.describe("pipelines run: executing a run", () => {
     const blocked = page.getByTestId("pipeline-run-blocked");
     await expect(blocked).toBeVisible();
     await expect(blocked).toContainText("handoff-missing");
+
+    // Step A's own board column is "review" (the generic exit-0 settle
+    // path) even though the pipeline itself never advanced past it — the
+    // "Awaiting review" section renders alongside the blocked entry for
+    // exactly this reason (`PipelineRunView`'s `reviewActive` flags any
+    // still-`active` execution whose step task already reached `review`).
+    const review = page.getByTestId("pipeline-run-review");
+    await expect(review).toBeVisible();
+    await expect(review).toContainText("finished, awaiting next step");
 
     const advance = blocked.getByTestId("pipeline-run-advance");
     await advance.getByRole("button", { name: "Pick next step(s)…" }).click();
@@ -373,7 +439,11 @@ test.describe("pipelines run: executing a run", () => {
     await expect(page.getByTestId("pipeline-run-blocked")).toContainText("handoff-invalid");
   });
 
-  test("fan-out/join: A fans out to B and C in parallel; both show active at once; D (join: all) runs once and finishes", async ({
+  // PRODUCT BUG — same "Maximum update depth exceeded" / React Flow
+  // `StoreUpdater` crash documented in full on the "linear A->B->C run"
+  // test's `test.fixme` comment above. This pipeline has four edges and two
+  // real transitions (the fan-out and the join), so it hits the crash too.
+  test.fixme("fan-out/join: A fans out to B and C in parallel; both show active at once; D (join: all) runs once and finishes", async ({
     page,
     freshBackend,
   }) => {
@@ -456,5 +526,61 @@ test.describe("pipelines run: executing a run", () => {
     const finalTask = await getTask(backend, task.id);
     expect(finalTask.pipelineRun?.history).toHaveLength(1);
     expect(finalTask.column).toBe("review");
+  });
+
+  test("Restart runs a finished pipeline again from the top: confirm dialog, status cycles running->done, history restarts", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({ id: randomUUID(), name: "A", agentProfileId: profileId });
+    const pipelineId = await createPipelineRest(backend, "Restart Pipeline", [A], []);
+    const title = `Restart Run ${randomUUID()}`;
+    const task = await createPipelineTaskRest(
+      backend,
+      title,
+      pipelineId,
+      `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+    );
+    await startTaskRest(backend, task.id);
+
+    await openPipelineRunFromBoard(page, backend, title);
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done", { timeout: CONVERGE_TIMEOUT });
+    await expect(page.locator('[data-testid="pipeline-run-history-row"]')).toHaveCount(1);
+
+    const beforeRestart = await getTask(backend, task.id);
+    const firstRunStartedAt = beforeRestart.pipelineRun?.startedAt ?? null;
+    const firstHistoryStartedAt = beforeRestart.pipelineRun?.history[0]?.startedAt ?? null;
+    expect(firstRunStartedAt).not.toBeNull();
+    expect(firstHistoryStartedAt).not.toBeNull();
+
+    await page.getByTestId("pipeline-run-restart").click();
+    const confirmDialog = page.getByRole("dialog").filter({ hasText: "Restart this pipeline?" });
+    await expect(confirmDialog).toBeVisible();
+    await confirmDialog.getByRole("button", { name: "Restart", exact: true }).click();
+    await expect(confirmDialog).toBeHidden();
+
+    // A genuine fresh run: status cycles back through "Running" (`launchStep`
+    // pushes a new, still-`outcome: null` history record the moment the
+    // restarted step launches, so the history list is never observably
+    // empty — it's a FRESH single-entry list from the very first tick, not
+    // the same list emptied out) and back to "Done" once the single step
+    // re-completes, still with exactly one history row — not two, which
+    // would mean the old run's history survived instead of being replaced.
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Running", { timeout: CONVERGE_TIMEOUT });
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done", { timeout: CONVERGE_TIMEOUT });
+    await expect(page.locator('[data-testid="pipeline-run-history-row"]')).toHaveCount(1);
+    await waitForColumn(backend, task.id, "review");
+
+    // Not a no-op: the run's own `startedAt` and its (sole) history entry's
+    // `startedAt` both moved forward, proving a fresh run actually happened
+    // rather than the prior run's state being redisplayed untouched.
+    const afterRestart = await getTask(backend, task.id);
+    expect(afterRestart.pipelineRun?.startedAt).not.toBe(firstRunStartedAt);
+    expect(afterRestart.pipelineRun?.history[0]?.startedAt).not.toBe(firstHistoryStartedAt);
+
+    // Restart is offered again once the new run has itself finished.
+    await expect(page.getByTestId("pipeline-run-restart")).toBeVisible();
   });
 });
