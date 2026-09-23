@@ -7,10 +7,11 @@ import { AGETOR_PASTE_LEAD_IN } from "../src/shared/user-message.ts";
 /**
  * E2E coverage for docs/plans/pasted-content-tags.md: Claude Code (2.1.277+,
  * server-side rollout) wraps a bracketed paste in
- * `<pasted_content id="hhhh">…</pasted_content id="hhhh">`, and agetor types
- * its own lead-in line ahead of that paste — so the JSONL twin of every
- * agetor send carries both. The run panel's "you" bubble must show only what
- * the user actually wrote.
+ * `<pasted_content id="hhhh">…</pasted_content id="hhhh">`, and agetor
+ * formerly typed its own lead-in line ahead of that paste (retired —
+ * docs/plans/remove-paste-lead-in.md — but events persisted while it was
+ * typed still carry both). The run panel's "you" bubble must show only what
+ * the user actually wrote, for new and for historical events alike.
  *
  * Same harness as e2e/tagged-user-messages.spec.ts: under the fake claude
  * driver `startTask` echoes the task's own prompt as a `user` stream event,
@@ -110,7 +111,7 @@ test.describe("pasted_content wrapper", () => {
     expect(bubbleText).not.toContain(AGETOR_PASTE_LEAD_IN);
   });
 
-  test("a lead-in send claude did not wrap (short message / flag off) hides the lead-in", async ({
+  test("a legacy lead-in send claude did not wrap (short message) hides the lead-in", async ({
     page,
     request,
     backend,
