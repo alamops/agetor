@@ -3036,6 +3036,21 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   const task = tasks.get(row.task_id);
   if (!task) return { delivered: false, reason: "task not found" };
 
+  // Pre-flight 1b for a one-shot kind (today codex) BEFORE any side effect
+  // below — the archivedAt clear and the worktree restore both mutate state,
+  // and a follow-up the CLI floor is going to refuse must not un-archive the
+  // task or re-create its worktree on the way to that refusal.
+  // `spawnCodexTurnNow` re-checks right before minting the run (the model is
+  // PATCH-able while a message sits in the queue), so this is the early
+  // gate, not the only one.
+  {
+    const taskHarness = resolveHarness(task.agent);
+    if (taskHarness?.kind === "codex") {
+      const floorError = await minCliVersionError(taskHarness, task.model ?? DEFAULT_MODEL[taskHarness.kind]);
+      if (floorError !== null) return { delivered: false, reason: floorError };
+    }
+  }
+
   if (task.archivedAt != null) {
     tasks.update(row.task_id, { archivedAt: null });
   }
@@ -3139,7 +3154,7 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   // it — matching the wording claude's own idle-mint guard already uses —
   // while still being accurate ("try again") for the rare lookup race too.
   if (kind === "codex") {
-    const result = await sendCodexTurn(row.task_id, line);
+    const result = await sendCodexTurn(row.task_id, line, rawLine);
     // Pre-flight 1b refused the turn before any run row was minted (see
     // `minCliVersionError`) — surface its message as the decline reason.
     if (result !== null && typeof result === "object") return { delivered: false, reason: result.declined };
@@ -3189,7 +3204,21 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
  * — but codex turns are discrete processes, so it's a real FIFO, not a
  * paste-into-the-live-session fold.
  */
-const codexTurnQueue = new Map<string, string[]>();
+const codexTurnQueue = new Map<string, QueuedCodexLine[]>();
+
+/**
+ * One queued codex follow-up. `expanded` is what the turn executes (the
+ * `@`-token-expanded text `sendInput` produced); `raw` is the pre-expansion
+ * text the user typed, kept so a refused queued turn can be restashed into
+ * the backlog tray under the exact text a draft/tray item was saved with —
+ * `restashPasteWithheldText` dedupes on byte equality, and the expanded
+ * absolute paths would never match (same rule as claude's withheld pastes,
+ * see `sendInput`'s `rawLine`).
+ */
+interface QueuedCodexLine {
+  raw: string;
+  expanded: string;
+}
 
 /**
  * `spawnCodexTurnNow`'s "refused before minting a run" result — today only
@@ -3212,12 +3241,12 @@ interface CodexTurnDecline {
  * Returns a `CodexTurnDecline` when Pre-flight 1b refused the turn (no run
  * row, no user event — the caller's draft is untouched).
  */
-async function sendCodexTurn(taskId: string, line: string): Promise<string | CodexTurnDecline | null> {
+async function sendCodexTurn(taskId: string, line: string, rawLine: string = line): Promise<string | CodexTurnDecline | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
   if (task.runId && active.has(task.runId)) {
     const q = codexTurnQueue.get(taskId) ?? [];
-    q.push(line);
+    q.push({ raw: rawLine, expanded: line });
     codexTurnQueue.set(taskId, q);
     // Record the user bubble on the active run so the panel reflects it right
     // away; the queued turn that answers it lands as a later run row.
@@ -3449,7 +3478,7 @@ async function drainCodexQueue(taskId: string): Promise<void> {
   const next = q.shift();
   if (q.length === 0) codexTurnQueue.delete(taskId);
   if (next === undefined) return;
-  const result = await spawnCodexTurnNow(task, taskId, next);
+  const result = await spawnCodexTurnNow(task, taskId, next.expanded);
   if (result === null || typeof result !== "object") return;
   // Pre-flight 1b refused the queued follow-up (the task's model needs a
   // newer codex CLI — e.g. the model was changed to a GPT-6 row while the
@@ -3462,7 +3491,9 @@ async function drainCodexQueue(taskId: string): Promise<void> {
   codexTurnQueue.delete(taskId);
   // `backlog.add` PREPENDS (newest draft on top), so restash in reverse send
   // order: the refused line lands on top and the tray reads chronologically.
-  for (const text of [...stranded].reverse()) restashPasteWithheldText(taskId, text);
+  // Restash the RAW text (see `QueuedCodexLine`) so the tray's dedupe matches
+  // a draft saved with the same `@token`s.
+  for (const item of [...stranded].reverse()) restashPasteWithheldText(taskId, item.raw);
   const lastRunId = runs.listForTask(taskId)[0]?.id;
   if (lastRunId) {
     const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;

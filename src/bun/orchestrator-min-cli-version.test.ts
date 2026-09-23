@@ -87,6 +87,34 @@ test("codex 0.147.0 + gpt-6-sol is refused before any run row is created", async
   expect(runs.listForTask(taskId).length).toBe(0);
 });
 
+// PR #243 review: the floor is checked BEFORE `sendInput`'s side effects —
+// a refused follow-up must not un-archive the task (nor restore its worktree)
+// on the way to the refusal.
+test("a refused follow-up on an archived codex task leaves it archived (floor checked before the archivedAt clear)", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.155.1";
+  const { startTask, sendInput, archiveTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const taskId = await createCodexTask("gpt-5.6-sol");
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  await settle(150);
+  expect(runs.listForTask(taskId).length).toBe(1);
+
+  const archived = await archiveTask(taskId, { force: true }); // column gate only; the run already settled
+  if ("error" in archived) throw new Error(archived.error);
+  expect(tasks.get(taskId)?.archivedAt).not.toBeNull();
+
+  tasks.update(taskId, { model: "gpt-6-sol" });
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.147.0";
+  const res = await sendInput(started.runId, "follow up on an archived task");
+  expect(res.delivered).toBe(false);
+  if (!res.delivered) expect(res.reason).toContain("0.155.0");
+  // Still archived, still one run row.
+  expect(tasks.get(taskId)?.archivedAt).not.toBeNull();
+  expect(runs.listForTask(taskId).length).toBe(1);
+});
+
 test("codex 0.155.1 + gpt-6-sol is allowed to start", async () => {
   process.env.FAKE_CODEX_VERSION = "codex-cli 0.155.1";
   const { startTask } = await import("./orchestrator.ts");

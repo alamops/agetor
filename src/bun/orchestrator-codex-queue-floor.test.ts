@@ -151,6 +151,38 @@ test("a queued codex follow-up refused by Pre-flight 1b is restashed to the back
   expect(finalBacklogTexts).not.toContain("after upgrade");
 });
 
+// PR #243 review: the queue carries the RAW text alongside the expanded one,
+// so a refused queued turn is restashed under exactly what the user typed —
+// `restashPasteWithheldText` dedupes on byte equality against tray drafts,
+// and the `@`-expanded absolute path would never match.
+test("a refused queued follow-up is restashed with its RAW @token text, not the expanded absolute path", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.155.1";
+  const { startTask, sendInput } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+
+  const taskId = await createCodexTask("gpt-5.6-sol");
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+
+  // README.md exists in this cwd, so `@README.md` expands to an absolute path
+  // for execution — the tray must still see the raw mention.
+  const raw = "queued follow-up mentioning @README.md";
+  const queued = await sendInput(started.runId, raw);
+  expect(queued.delivered).toBe(true);
+
+  tasks.update(taskId, { model: "gpt-6-sol" });
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.147.0";
+
+  let backlogTexts: string[] = [];
+  for (let i = 0; i < 120; i++) {
+    await settle(25);
+    backlogTexts = (tasks.get(taskId)?.backlog ?? []).map((item) => item.text);
+    if (backlogTexts.length > 0) break;
+  }
+  expect(backlogTexts).toEqual([raw]);
+  expect(backlogTexts[0]).not.toContain(process.cwd());
+});
+
 test("control: a queued codex follow-up on a non-floored model drains normally into a second run, with an empty backlog", async () => {
   process.env.FAKE_CODEX_VERSION = "codex-cli 0.155.1";
   const { startTask, sendInput } = await import("./orchestrator.ts");
