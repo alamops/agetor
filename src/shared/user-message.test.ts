@@ -1195,6 +1195,9 @@ describe("pipeline handoff reminder marker", () => {
   });
 
   test("a user-typed message whose first line happens to equal the marker exactly is still treated as the automatic reminder (marker is first-line-only, not authorship-aware)", () => {
+    expect(userMessageLines("[agetor handoff reminder]\n\nlegacy body")).toEqual([
+      { label: "agetor›", text: "legacy body", tone: "machine" },
+    ]);
     expect(userMessageLines(`${HANDOFF_REMINDER_MARKER}\nhello`)).toEqual([
       { label: "agetor›", text: "hello", tone: "machine" },
     ]);

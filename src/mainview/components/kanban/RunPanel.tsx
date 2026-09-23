@@ -101,7 +101,7 @@ import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
 import { parseUserMessage, splitReferences, parseMessageSegments, normalizeDeliveredUserText, type MessageSegment } from "../../../shared/user-message.ts";
-import { HANDOFF_REMINDER_MARKER } from "../../../shared/pipeline.ts";
+import { isHandoffReminderMarker } from "../../../shared/pipeline.ts";
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
 import { AgentProfileCard } from "./AgentProfileCard";
@@ -5766,13 +5766,15 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   // Agetor's own automatic handoff-format reminder (see
   // HANDOFF_REMINDER_MARKER / composeHandoffReminder in shared/pipeline.ts)
   // is a `user` event Agetor sent, not the user's own words — a `user`
-  // message whose first line is exactly the marker. Display-only: strip
+  // message whose first line is exactly the marker (any spelling in
+  // HANDOFF_REMINDER_MARKERS — older persisted reminders keep rendering).
+  // Display-only: strip
   // that marker line before parsing/rendering (the badge below substitutes
   // for it) and never touch the raw persisted event.
   const isHandoffReminder = useMemo(() => {
     const nl = normalizedText.indexOf("\n");
     const firstLine = nl === -1 ? normalizedText : normalizedText.slice(0, nl);
-    return firstLine === HANDOFF_REMINDER_MARKER;
+    return isHandoffReminderMarker(firstLine);
   }, [normalizedText]);
   const displayText = useMemo(() => {
     if (!isHandoffReminder) return normalizedText;

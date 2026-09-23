@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   HANDOFF_FILE_UNTRUSTED_WARNING,
   HANDOFF_REMINDER_MARKER,
+  HANDOFF_REMINDER_MARKERS,
+  isHandoffReminderMarker,
   HANDOFF_TAG,
   HANDOFF_UNTRUSTED_CONTENT_WARNING,
   classifyStepResponse,
@@ -1847,6 +1849,45 @@ describe("composeHandoffReminder", () => {
     { name: "Fix", label: "needs work" },
     { name: "Ship", label: "" },
   ];
+
+  test("never names the product: the step prompt, the reminder and the marker carry no 'agetor'", () => {
+    const reminder = composeHandoffReminder({
+      stepName: "Step 1",
+      reason: "handoff-invalid",
+      detail: "Unexpected token",
+      outgoing: outgoingMany,
+      transition: "choose",
+    });
+    expect(reminder).not.toMatch(/agetor/i);
+    expect(HANDOFF_REMINDER_MARKER).not.toMatch(/agetor/i);
+    const step = newStep({ name: "A" });
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      stepIndex: 1,
+      stepCap: 25,
+      step,
+      goal: "Do the thing.",
+      previous: [],
+      subagentProfiles: [
+        makeProfileSnapshot({ name: "Helper", instructions: "Be careful.", skills: ["code-review"] }),
+      ],
+      subagentCap: 2,
+      outgoing: outgoingMany,
+      transition: "choose",
+      inlineHandoff: true,
+      parallelSiblings: ["B"],
+      nonce: "deadbeef",
+    });
+    expect(prompt).not.toMatch(/agetor/i);
+  });
+
+  test("HANDOFF_REMINDER_MARKERS is append-only and ends with the current spelling", () => {
+    expect(HANDOFF_REMINDER_MARKERS[0]).toBe("[agetor handoff reminder]");
+    expect(HANDOFF_REMINDER_MARKERS[HANDOFF_REMINDER_MARKERS.length - 1]).toBe(HANDOFF_REMINDER_MARKER);
+    expect(isHandoffReminderMarker("[agetor handoff reminder]")).toBe(true);
+    expect(isHandoffReminderMarker(HANDOFF_REMINDER_MARKER)).toBe(true);
+    expect(isHandoffReminderMarker("[handoff reminder] x")).toBe(false);
+  });
 
   test("starts with HANDOFF_REMINDER_MARKER as the first line", () => {
     const reminder = composeHandoffReminder({

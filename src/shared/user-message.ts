@@ -22,7 +22,7 @@
 // `diff-selection.ts`.
 import { REFS_HEADING } from "./refs.ts";
 import { AGENT_INSTRUCTIONS_TAG } from "./agent-profile.ts";
-import { HANDOFF_REMINDER_MARKER } from "./pipeline.ts";
+import { HANDOFF_REMINDER_MARKER, isHandoffReminderMarker } from "./pipeline.ts";
 
 export interface CommandInvocation {
   /** Command name including the leading slash, e.g. "/implement". */
@@ -1139,7 +1139,8 @@ function segmentPlainLines(segments: readonly MessageSegment[]): PlainLine[] {
  * segment produces no visible line (e.g. a message that's only an empty
  * `<bash-stdout>`), falls back to a single `cmd› —` line so callers never
  * have to handle an empty result. An ordinary message whose first line is
- * exactly {@link HANDOFF_REMINDER_MARKER} — Agetor's own automatic
+ * exactly {@link HANDOFF_REMINDER_MARKER} (or an older spelling listed in
+ * `HANDOFF_REMINDER_MARKERS`) — Agetor's own automatic
  * handoff-format reminder, see `composeHandoffReminder` in
  * `shared/pipeline.ts` — is not the user's own words, and is labeled
  * `agetor›` instead of `you›`, with the marker line itself stripped (mirrors
@@ -1159,7 +1160,7 @@ export function userMessageLines(text: string): PlainLine[] {
   const reminderNl = normalizedForReminder.indexOf("\n");
   const reminderFirstLine =
     reminderNl === -1 ? normalizedForReminder : normalizedForReminder.slice(0, reminderNl);
-  if (reminderFirstLine === HANDOFF_REMINDER_MARKER) {
+  if (isHandoffReminderMarker(reminderFirstLine)) {
     const rest =
       reminderNl === -1 ? "" : normalizedForReminder.slice(reminderNl + 1).replace(/^\n+/, "");
     return [{ label: "agetor›", text: rest, tone: "machine" }];

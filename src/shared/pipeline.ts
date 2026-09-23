@@ -36,7 +36,21 @@ export const HANDOFF_TAG = "handoff";
  *  to render the message as a labeled reminder rather than an ordinary typed
  *  message, and any other caller inspecting message text can recognize it
  *  without re-deriving the wording. */
-export const HANDOFF_REMINDER_MARKER = "[agetor handoff reminder]";
+export const HANDOFF_REMINDER_MARKER = "[handoff reminder]";
+
+/** Every marker spelling ever shipped, in shipping order. APPEND-ONLY:
+ *  persisted `run_events` rows are raw, so the display-side interception in
+ *  `userMessageLines` / RunPanel's `UserMessageBlock` must keep recognizing
+ *  a reminder sent under an older spelling, or those historical bubbles
+ *  regress to showing the raw marker line. The first spelling named the
+ *  product; it was dropped because nothing agetor injects into an agent's
+ *  prompt should name agetor (same rule as the retired paste lead-in). */
+export const HANDOFF_REMINDER_MARKERS: readonly string[] = ["[agetor handoff reminder]", HANDOFF_REMINDER_MARKER];
+
+/** True when `firstLine` is any {@link HANDOFF_REMINDER_MARKERS} spelling. */
+export function isHandoffReminderMarker(firstLine: string): boolean {
+  return HANDOFF_REMINDER_MARKERS.includes(firstLine);
+}
 
 /** Prepended immediately before a previous step's inlined (or file-pointer)
  *  handoff content in {@link composeStepPrompt}'s "Context from previous
@@ -735,7 +749,7 @@ export function composeStepPrompt(input: {
 
   parts.push(`# Pipeline "${input.pipelineName}" — step ${input.stepIndex} of at most ${input.stepCap}: ${input.step.name}`);
   parts.push(
-    "You are one step of an agetor pipeline. You work in a shared worktree alongside the other steps of " +
+    "You are one step of a multi-step pipeline. You work in a shared worktree alongside the other steps of " +
       "this pipeline, and you are responsible for finishing this step's part of the work only — not the " +
       "whole pipeline.",
   );
