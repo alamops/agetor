@@ -852,19 +852,32 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if ("error" in launch) {
             return json({ error: launch.error }, { status: 400, headers: corsHeaders(req) });
           }
+          // Resolve the explainer's profile ONCE, before the clone, and hand
+          // that same object to `createTask` afterwards (`resolvedAgentProfile`)
+          // — `cloneRepo` takes seconds, and a profile edited or deleted in
+          // that window would otherwise make `createTask`'s own re-read bind
+          // a different profile, or fail, after the clone already landed:
+          // exactly the post-side-effect failure this pre-validation exists
+          // to prevent.
+          let launchProfile: AgentProfile | null = null;
+          if (runEli5 && launch.agentProfileId) {
+            launchProfile = agentProfiles.get(launch.agentProfileId);
+            if (!launchProfile) {
+              return json({ error: `unknown agent profile "${launch.agentProfileId}"` }, { status: 400, headers: corsHeaders(req) });
+            }
+          }
           // Pre-flight 1b (minimum CLI version for the explainer's model) —
           // also before the clone, since `startTask` would otherwise refuse
           // the explainer only after the repo is already on disk. Resolves
-          // the harness + model exactly as `createTask` will: a profile's
+          // the harness + model exactly as `createTask` will: the profile's
           // own harness/model, else `agent` (default claude-code) and
           // `model` (default the kind's DEFAULT_MODEL). Fail-open like the
           // start-time check; validateCloneLaunch already proved the
           // harness ids resolve.
           if (runEli5) {
-            const profile = launch.agentProfileId ? agentProfiles.get(launch.agentProfileId) : null;
-            const launchHarness = harnesses.getByIdOrKind(profile ? profile.harness : (launch.agent ?? "claude-code"));
+            const launchHarness = harnesses.getByIdOrKind(launchProfile ? launchProfile.harness : (launch.agent ?? "claude-code"));
             if (launchHarness) {
-              const launchModel = profile ? profile.model : (launch.model ?? DEFAULT_MODEL[launchHarness.kind]);
+              const launchModel = launchProfile ? launchProfile.model : (launch.model ?? DEFAULT_MODEL[launchHarness.kind]);
               const floorError = await minCliVersionError(launchHarness, launchModel);
               if (floorError !== null) {
                 return json({ error: floorError }, { status: 400, headers: corsHeaders(req) });
@@ -891,6 +904,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               workdir: dest,
               isolation: "none",
               ...launch,
+              // The profile validated before the clone, not a post-clone re-read.
+              ...(launchProfile ? { resolvedAgentProfile: launchProfile } : {}),
             });
             if ("error" in created) {
               eli5Error = created.error;

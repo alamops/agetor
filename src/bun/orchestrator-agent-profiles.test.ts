@@ -114,6 +114,63 @@ test("createTask({agentProfileId}) copies harness/model/effort/mode/fast/maxMode
   }
 });
 
+// PR #243 review: `POST /projects/clone` validates the profile BEFORE the
+// multi-second clone and must bind the explainer to that same profile
+// afterwards — `resolvedAgentProfile` makes `createTask` use the supplied
+// object instead of re-reading `agentProfiles.get(agentProfileId)`, so a
+// profile deleted (or edited) between validation and create still yields the
+// validated binding; without it the same id fails as before.
+test("createTask({agentProfileId, resolvedAgentProfile}) binds the supplied profile even after the row was deleted; without it the deleted id still fails", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { db, agentProfiles } = await import("./db.ts");
+
+  const profile = agentProfiles.insert({
+    name: uniqueProfileName("resolved"),
+    harness: "claude-code",
+    model: "profile-model-resolved",
+    effort: "high",
+    mode: "auto",
+    fast: false,
+    maxMode: false,
+    instructions: "Validated before a slow side effect.",
+    skills: [],
+  });
+  // Simulate the profile vanishing between the caller's validation and the
+  // create (what a Settings delete during `cloneRepo` would do).
+  agentProfiles.delete(profile.id);
+  expect(agentProfiles.get(profile.id)).toBeNull();
+
+  const created = await createTask({
+    title: "resolved profile",
+    prompt: "noop",
+    workdir: process.cwd(),
+    isolation: "none",
+    agentProfileId: profile.id,
+    resolvedAgentProfile: profile,
+    model: "ignored-body-model",
+  });
+  if ("error" in created) throw new Error(created.error);
+  try {
+    expect(created.task.agentProfileId).toBe(profile.id);
+    expect(created.task.agent).toBe("claude-code");
+    expect(created.task.model).toBe("profile-model-resolved");
+    expect(created.task.agentProfile?.name).toBe(profile.name);
+    expect(created.task.agentProfile?.instructions).toBe("Validated before a slow side effect.");
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [created.task.id]);
+  }
+
+  const reread = await createTask({
+    title: "deleted profile, no snapshot",
+    prompt: "noop",
+    workdir: process.cwd(),
+    isolation: "none",
+    agentProfileId: profile.id,
+  });
+  expect("error" in reread).toBe(true);
+  if ("error" in reread) expect(reread.error).toMatch(/unknown agent profile/i);
+});
+
 // Review fix F1 finding 2: a profile's own `effort: null` means "no opinion"
 // (D3/A5 passthrough), but a model that requires an effort flag must still
 // get a real default — both at `createTask` time AND at `startTaskInner`'s

@@ -5403,6 +5403,18 @@ export interface CreateTaskInput extends Partial<Task> {
    * `{ error }` rather than silently falling back to "no agent".
    */
   agentProfileId?: string | null;
+  /**
+   * A profile the caller has ALREADY resolved and validated (e.g.
+   * `POST /projects/clone`, which checks the profile's harness and the
+   * model's CLI floor BEFORE the multi-second `cloneRepo` side effect). When
+   * present it is used as-is and `agentProfileId` is taken from it, so the
+   * task binds to exactly the profile that was validated even if the row was
+   * edited or deleted in the meantime — otherwise `createTask` would re-read
+   * `agentProfiles.get(agentProfileId)` after the side effect and could bind
+   * a different profile (or fail) after the clone already happened. Absent
+   * it, `agentProfileId` is looked up as before, unknown ids still fail.
+   */
+  resolvedAgentProfile?: AgentProfile;
 }
 
 /**
@@ -5506,7 +5518,10 @@ export async function createTask(
   // landing, or a typo'd CLI `--profile` id that bypassed `matchAgentProfileRef`).
   let profile: AgentProfile | null = null;
   const requestedProfileId = input.agentProfileId?.trim();
-  if (requestedProfileId) {
+  if (input.resolvedAgentProfile) {
+    // Caller-validated snapshot wins over a re-read (see CreateTaskInput).
+    profile = input.resolvedAgentProfile;
+  } else if (requestedProfileId) {
     profile = agentProfiles.get(requestedProfileId);
     if (!profile) {
       return { error: `unknown agent profile "${requestedProfileId}"` };
