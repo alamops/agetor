@@ -328,6 +328,11 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
         setEdges(toFlowEdges(g).map((e) => ({ ...e, data: { ...e.data, onDelete: removeEdge } })));
         setStartStepId(g.startStepId);
         setSelectedStepId(step.id);
+        // Seed the debounced graph immediately for a wholesale rebuild —
+        // otherwise `isDirty`/`liveValidation` would read against the STALE
+        // pre-load debounced value for up to 150ms and could flash "dirty"
+        // right after this fresh, intentionally-clean draft loads.
+        setDebouncedGraph(g);
         initialSnapshotRef.current = snapshotOf("", "", PIPELINE_LIMITS.maxStepsDefault, g);
         setLoading(false);
         setLoadError(null);
@@ -345,6 +350,8 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
         setEdges(toFlowEdges(pipeline.graph).map((e) => ({ ...e, data: { ...e.data, onDelete: removeEdge } })));
         setStartStepId(pipeline.graph.startStepId);
         setSelectedStepId(pipeline.graph.steps[0]?.id ?? null);
+        // Same immediate-seed rationale as the blank-draft branch above.
+        setDebouncedGraph(pipeline.graph);
         initialSnapshotRef.current = snapshotOf(pipeline.name, pipeline.description, pipeline.maxSteps, pipeline.graph);
       } catch (err) {
         if (!cancelled) setLoadError(err instanceof ApiError ? err.message : "Failed to load pipeline.");
@@ -374,8 +381,28 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
     [derivedGraph, selectedStepId],
   );
 
-  const liveValidation = useMemo(() => validatePipelineGraph(derivedGraph), [derivedGraph]);
-  const isDirty = snapshotOf(name, description, maxSteps, derivedGraph) !== initialSnapshotRef.current;
+  // `derivedGraph` recomputes on every node-position change — including
+  // every pointermove frame of a drag — so recomputing `validatePipelineGraph`
+  // (a full graph walk) and `snapshotOf` (a full JSON.stringify) directly
+  // from it on every render was doing that work at drag-frame rate for no
+  // UI benefit (neither the validation banner nor the dirty flag needs
+  // sub-frame freshness). Both are instead derived from a `debouncedGraph`
+  // that only catches up 150ms after node/edge changes go quiet. `handleSave`
+  // deliberately does NOT use this debounced value — it re-validates
+  // `derivedGraph` itself synchronously at submit time, so Save always acts
+  // on the truly-latest graph even if a debounce cycle hasn't settled yet.
+  const [debouncedGraph, setDebouncedGraph] = useState<PipelineGraph>(derivedGraph);
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedGraph(derivedGraph), 150);
+    return () => clearTimeout(t);
+  }, [derivedGraph]);
+
+  const liveValidation = useMemo(() => validatePipelineGraph(debouncedGraph), [debouncedGraph]);
+  const debouncedSnapshot = useMemo(
+    () => snapshotOf(name, description, maxSteps, debouncedGraph),
+    [name, description, maxSteps, debouncedGraph],
+  );
+  const isDirty = debouncedSnapshot !== initialSnapshotRef.current;
 
   useEffect(() => {
     onDirtyChange?.(isDirty);
@@ -384,6 +411,10 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
   const handleAutoArrange = useCallback(() => {
     const laidOut = autoLayout(derivedGraph);
     setNodes(toFlowNodes(laidOut, () => ({ onAppend: appendStep })));
+    // A deliberate, one-shot repositioning — not a drag frame — so there's
+    // no reason to make the validation banner / dirty flag wait out the
+    // debounce for it.
+    setDebouncedGraph(laidOut);
   }, [derivedGraph, appendStep, setNodes]);
 
   const handleFitView = useCallback(() => {

@@ -77,7 +77,6 @@ import {
   type FxUsagePayload,
   type GitHubPullMergeability,
   type PipelineGraph,
-  type PipelineStepRecord,
   type Run,
   type RunEvent,
   type Subagent,
@@ -181,11 +180,11 @@ type StreamEvent = RunEvent & { id: number; dbId?: number };
  *
  * `stepIndex`/`stepTotal` back the D7 "(k/N)" suffix (`docs/plans/
  * pipelines.md` line 209): `stepTotal` is the frozen graph's step count,
- * and `stepIndex` is this step's 1-based execution position — resolved
- * from `pipelineRun.history` by matching `taskId` when available, else
- * (the currently-active execution isn't in `history` yet, and the cached
- * first paint below has no history at all) this step's position within
- * the graph. `null` when neither source can place it.
+ * and `stepIndex` is this step's 1-based POSITION WITHIN THE GRAPH (not an
+ * execution ordinal) — a cycle can revisit the same step several times, and
+ * indexing by `pipelineRun.history` position produced nonsensical values
+ * like "(7/3)" for a step's 7th execution in a 3-step graph. `null` when the
+ * step id can't be found in the graph (or there's no graph yet).
  */
 interface PipelineStripInfo {
   pipelineName: string;
@@ -2697,19 +2696,11 @@ function RunPanelBody({
     const parentId = task.pipelineParentId;
     if (!parentId) return;
     const stepId = task.pipelineStepId;
-    const buildInfo = (
-      pipelineName: string,
-      graph: PipelineGraph | null,
-      history: PipelineStepRecord[] | null,
-    ): PipelineStripInfo => {
+    const buildInfo = (pipelineName: string, graph: PipelineGraph | null): PipelineStripInfo => {
       const stepName = graph && stepId ? stepNameById(graph, stepId) : (stepId ?? "this step");
       const stepTotal = graph?.steps.length ?? 0;
       let stepIndex: number | null = null;
-      if (history) {
-        const histIdx = history.findIndex((h) => h.taskId === task.id);
-        if (histIdx >= 0) stepIndex = histIdx + 1;
-      }
-      if (stepIndex === null && graph && stepId) {
+      if (graph && stepId) {
         const pos = graph.steps.findIndex((s) => s.id === stepId);
         if (pos >= 0) stepIndex = pos + 1;
       }
@@ -2718,10 +2709,10 @@ function RunPanelBody({
 
     const cached = pipelineStripCacheRef.current.get(parentId);
     if (cached) {
-      // Immediate first paint from the cache — no `history` is cached, so
-      // this approximates progress from the step's position in the frozen
-      // graph until the background refetch below lands the real count.
-      setPipelineStrip(buildInfo(cached.pipelineName, cached.graph, null));
+      // Immediate first paint from the cache — identical shape to the
+      // background refetch below since `stepIndex` is derived purely from
+      // the (frozen, cacheable) graph, not the ever-changing history.
+      setPipelineStrip(buildInfo(cached.pipelineName, cached.graph));
     } else {
       setPipelineStrip("loading");
     }
@@ -2734,7 +2725,7 @@ function RunPanelBody({
         const pipelineName = run?.pipelineName || parentTask.title || "pipeline";
         pipelineStripCacheRef.current.set(parentId, { pipelineName, graph });
         if (cancelled) return;
-        setPipelineStrip(buildInfo(pipelineName, graph, run?.history ?? null));
+        setPipelineStrip(buildInfo(pipelineName, graph));
       } catch {
         if (cancelled) return;
         if (!cached) setPipelineStrip("error");

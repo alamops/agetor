@@ -554,13 +554,14 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
  *
  *  m18: unlike `parsePipelineGraph` (the `pipelines` table's own live `graph`
  *  column, still deep-validated via `validatePipelineGraph` on every read —
- *  see that function's doc), a run snapshot's `graph` was captured exactly
- *  once, at run-start time, by `buildSnapshot`'s own `validatePipelineGraph`
- *  call, and nothing ever mutates a `pipeline_run` column's snapshot after
- *  it's written — re-validating the whole graph on every read (every task
- *  poll, every pipeline route) only spends cycles re-checking something that
- *  can't have changed. Only shape-check enough to make it safe to hand to
- *  the step-resolution helpers (`resolveNextSteps`/`stepNameById`/…), which
+ *  see that function's doc), a run snapshot's `graph` is validated at run
+ *  start by `startPipelineRun` (which refuses to start the run at all on a
+ *  bad graph) and captured exactly once at that point, and nothing ever
+ *  mutates a `pipeline_run` column's snapshot after it's written —
+ *  re-validating the whole graph on every read (every task poll, every
+ *  pipeline route) only spends cycles re-checking something that can't have
+ *  changed. Only shape-check enough to make it safe to hand to the
+ *  step-resolution helpers (`resolveNextSteps`/`stepNameById`/…), which
  *  just index into `.steps`/`.edges` arrays: a `graph` that isn't even an
  *  object with array `steps`/`edges` collapses the whole snapshot to `null`
  *  (an un-runnable snapshot is as good as none) exactly like before. */
@@ -1899,15 +1900,22 @@ type PipelineRow = {
  *
  *  m21: unparseable JSON still collapses to the empty graph
  *  `{steps:[],edges:[],startStepId:null}` (there's nothing else to return),
- *  logged via `console.warn` so the corruption is visible. But a value that
- *  parses fine yet fails today's `validatePipelineGraph` is returned
- *  AS-IS (also warned) rather than collapsed to empty: the pipeline editor
- *  reads this value straight through, and an editor session that opens,
- *  makes an unrelated change, and saves would otherwise silently overwrite
- *  the user's real graph with nothing. Trusting the stored shape here is the
- *  same call `sanitizeRunSnapshot` makes for a run's frozen snapshot, for a
- *  different reason — this one is "don't destroy data", not "don't
- *  re-validate a graph that already validated once". */
+ *  logged via `console.warn` so the corruption is visible. A value that
+ *  parses fine yet fails today's `validatePipelineGraph` is returned AS-IS
+ *  (also warned) ONLY when it's still shaped safely enough to hand to the
+ *  pipeline editor and the step-resolution helpers — a plain object with
+ *  array `steps`/`edges` and a `startStepId` that's a string, `null`, or
+ *  `undefined`. That's deliberately lenient (not full `validatePipelineGraph`
+ *  again): the pipeline editor reads this value straight through, and an
+ *  editor session that opens, makes an unrelated change, and saves would
+ *  otherwise silently overwrite the user's real graph with nothing.
+ *  Anything looser than that minimal shape (not an object, non-array
+ *  `steps`/`edges`, a `startStepId` of some other type) collapses to the
+ *  empty graph instead — there's nothing safe to index into otherwise.
+ *  Trusting the stored shape here is the same call `sanitizeRunSnapshot`
+ *  makes for a run's frozen snapshot, for a different reason — this one is
+ *  "don't destroy data", not "don't re-validate a graph that already
+ *  validated once". */
 const parsePipelineGraph = (raw: string): PipelineGraph => {
   let parsed: unknown;
   try {
@@ -1918,8 +1926,16 @@ const parsePipelineGraph = (raw: string): PipelineGraph => {
   }
   const validated = validatePipelineGraph(parsed);
   if (validated.ok) return validated.graph;
-  console.warn(`[agetor] stored pipeline graph failed validation (${validated.error}) — returning it unmodified`);
-  return parsed as PipelineGraph;
+  console.warn(`[agetor] stored pipeline graph failed validation (${validated.error}) — returning it unmodified if shape-safe`);
+  if (isPlainObject(parsed)) {
+    const rec = parsed as Record<string, unknown>;
+    const startStepIdOk = rec.startStepId === undefined || rec.startStepId === null || typeof rec.startStepId === "string";
+    if (Array.isArray(rec.steps) && Array.isArray(rec.edges) && startStepIdOk) {
+      return parsed as unknown as PipelineGraph;
+    }
+  }
+  console.warn(`[agetor] stored pipeline graph shape is unsafe to return as-is — falling back to an empty graph`);
+  return { steps: [], edges: [], startStepId: null };
 };
 
 const toPipeline = (r: PipelineRow): Pipeline => ({

@@ -28,6 +28,7 @@ import type {
   Handoff,
   PipelineBlockKind,
   PipelineGraph,
+  PipelineRunState,
   PipelineRunStatus,
   PipelineStepRecord,
   Task,
@@ -89,15 +90,19 @@ function formatDuration(ms: number): string {
   return `${minutes}m ${seconds}s`;
 }
 
-/** Any execution's step task is actively running or currently blocked
- *  (awaiting a decision) — used to decide whether Stop should be offered.
- *  Distinct from `run.status === "running"`: a run can be mid-block on one
- *  branch while another branch is still actively executing. */
+/** Any execution's step task is actively running, or blocked with a
+ *  genuinely pending interaction — used to decide whether Stop should be
+ *  offered. A `blocked` column with nothing pending (e.g. it already got
+ *  answered and is between ticks) has nothing left to stop. Distinct from
+ *  `run.status === "running"`: a run can be mid-block on one branch while
+ *  another branch is still actively executing. */
 function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } | null): boolean {
   if (!run) return false;
   return run.active.some((entry) => {
     const stepTask = steps.find((t) => t.id === entry.taskId);
-    return stepTask ? stepTask.column === "running" || stepTask.column === "blocked" : false;
+    if (!stepTask) return false;
+    if (stepTask.column === "running") return true;
+    return stepTask.column === "blocked" && stepTask.pendingInteractionCount > 0;
   });
 }
 
@@ -119,6 +124,31 @@ function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } |
  * `edgeVisualState`/token) are merged into the existing arrays by id, only
  * replacing a node/edge's `data` when its computed visual actually changed
  * — never a full `toFlowNodes`/`toFlowEdges` rebuild on every poll.
+ *
+ * **Regression fixed here (React Flow `<StoreUpdater>` "Maximum update
+ * depth exceeded")**: `latestTransition(run)` returns a brand-new object
+ * literal on every call. It used to be computed directly in the render
+ * body (`const transition = latestTransition(run)`), so EVERY re-render —
+ * including the ones the per-poll edges-merge effect's own `setEdges` call
+ * caused — hands that effect's `[run, transition, setEdges]` dependency
+ * array a new `transition` reference, even when `run` itself hasn't
+ * changed. React sees a changed dependency, re-runs the effect, calls
+ * `setEdges` again, re-renders, computes a new `transition` again — an
+ * unbounded synchronous loop the instant a run has ≥1 edge to animate a
+ * token across (a run with no edges never has a non-null `transition`, so
+ * the reference churn was invisible — matching the symptom that only
+ * edge-bearing pipelines crashed). The fix has three parts: (1) `transition`
+ * is now derived from a primitive, content-stable signature so it's only a
+ * new reference when the underlying data actually changes, not every
+ * render; (2) both merge effects are keyed on primitive signatures
+ * (`nodeVisualSignature`/`edgeVisualSignature`/`transitionKey`) instead of
+ * the `run`/`steps`/`transition` object references, which are fresh
+ * objects on every poll/task-refetch even when nothing they carry changed;
+ * (3) the merge updaters are identity-stable — they return the SAME
+ * `ns`/`es` array reference untouched when no node/edge's computed visual
+ * actually changed, so React's `Object.is` bail-out on `setState` skips the
+ * re-render (and therefore `<StoreUpdater>`'s own `setEdges`/`setNodes`
+ * sync) entirely when a poll turns up nothing new to paint.
  */
 export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewProps) {
   const { resolved } = useTheme();
@@ -234,14 +264,35 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
 
   const effectiveGraph = run?.snapshot?.graph ?? pipelineGraph;
   const progress = run ? pipelineStepProgress(run) : null;
-  const transition = latestTransition(run);
+
+  // Latest refs for values the effects below read but must NOT depend on
+  // directly (their object identity churns every poll/render even when
+  // nothing they carry changed — see the class doc comment above for why
+  // that broke React Flow). Assigning unconditionally on every render
+  // (rather than in their own effect) means the ref is always current by
+  // the time an effect actually runs, mirroring `effectiveGraphRef` below.
+  const runRef = useRef<PipelineRunState | null>(null);
+  runRef.current = run;
+  const stepsRef = useRef<Task[]>([]);
+  stepsRef.current = steps;
 
   // A stable CONTENT key for `effectiveGraph` — `run.snapshot.graph` is a
   // fresh object from every poll's JSON response even when its content is
   // byte-identical (the snapshot is frozen once a run starts), so keying
   // the rebuild effect on the object reference would rebuild every node on
   // every 2s poll. Content, not identity, decides when a rebuild is due.
-  const graphSignature = useMemo(() => (effectiveGraph ? JSON.stringify(effectiveGraph) : null), [effectiveGraph]);
+  // `run.snapshot.capturedAt` alone is enough once a run has started — the
+  // snapshot is frozen at that instant and never mutated in place — so the
+  // common (post-first-run) case needs no stringify at all; only the
+  // pre-first-run fallback (the live, editable pipeline graph) still needs
+  // a cheap structural fingerprint instead of a full JSON.stringify of the
+  // whole graph on every 2s poll.
+  const snapshotCapturedAt = run?.snapshot?.capturedAt ?? null;
+  const graphSignature = useMemo(() => {
+    if (!effectiveGraph) return null;
+    if (snapshotCapturedAt != null) return `snap:${snapshotCapturedAt}`;
+    return `live:${effectiveGraph.steps.map((s) => s.id).join(",")}:${effectiveGraph.edges.map((e) => e.id).join(",")}`;
+  }, [effectiveGraph, snapshotCapturedAt]);
   const effectiveGraphRef = useRef<PipelineGraph | null>(null);
   effectiveGraphRef.current = effectiveGraph;
 
@@ -258,29 +309,73 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content (graphSignature), not the graph object's identity.
   }, [graphSignature, setNodes, setEdges]);
 
+  // Primitive, content-derived signatures the two per-poll merge effects
+  // below key on INSTEAD OF the `run`/`steps`/`transition` object
+  // references (which are brand-new objects on every poll/task-refetch
+  // even when nothing in them changed — see the class doc comment). A
+  // string/number dependency only "changes" (by `Object.is`) when its
+  // VALUE differs, so an unrelated refetch that changes nothing these
+  // signatures read never re-triggers the merge.
+  const nodeVisualSignature = useMemo(() => {
+    if (!run) return "";
+    const active = run.active.map((a) => `${a.stepId}:${a.taskId}`).join(",");
+    const blocked = run.blocked.map((b) => `${b.stepId ?? ""}:${b.taskId ?? ""}`).join(",");
+    const history = run.history.map((h) => `${h.stepId}:${h.outcome ?? ""}`).join(",");
+    const columns = steps.map((t) => `${t.id}:${t.column}`).join(",");
+    return `${active}|${blocked}|${history}|${columns}`;
+  }, [run, steps]);
+
+  const edgeVisualSignature = useMemo(() => {
+    if (!run) return "";
+    const active = run.active.map((a) => a.stepId).join(",");
+    const history = run.history.map((h) => `${h.stepId}:${h.nextStepIds.join("+")}`).join(",");
+    return `${active}|${history}`;
+  }, [run]);
+
+  const transition = useMemo(() => latestTransition(run), [run]);
+  const transitionRef = useRef<ReturnType<typeof latestTransition>>(null);
+  transitionRef.current = transition;
+  const transitionKey = transition ? `${transition.fromStepId}>${transition.toStepId}#${transition.seq}` : "";
+
   // ---- Per-poll merge: replace a node's `data.visual` only when it
-  // actually changed, so most nodes keep their exact object identity. ----
+  // actually changed, so most nodes keep their exact object identity —
+  // and, whenever NO node's visual changed, hand `setNodes` back the exact
+  // same array reference so React's `Object.is` bail-out skips the
+  // re-render entirely instead of feeding React Flow a perpetually-new
+  // (but content-identical) `nodes` array. ----
   useEffect(() => {
-    setNodes((ns) =>
-      ns.map((n) => {
-        const visual: StepVisualState = stepVisualState(run, n.id, steps);
+    const r = runRef.current;
+    const s = stepsRef.current;
+    setNodes((ns) => {
+      let changed = false;
+      const next = ns.map((n) => {
+        const visual: StepVisualState = stepVisualState(r, n.id, s);
         if (n.data.visual === visual) return n;
+        changed = true;
         return { ...n, data: { ...n.data, visual } };
-      }),
-    );
-  }, [run, steps, setNodes]);
+      });
+      return changed ? next : ns;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content (nodeVisualSignature), not run/steps object identity; runRef/stepsRef carry the current values.
+  }, [nodeVisualSignature, setNodes]);
 
   useEffect(() => {
-    setEdges((es) =>
-      es.map((e) => {
-        const visual: EdgeVisualState = edgeVisualState(run, { id: e.id, from: e.source, to: e.target, label: e.data?.label ?? "" });
-        const isTokenEdge = !!transition && transition.fromStepId === e.source && transition.toStepId === e.target;
-        const tokenKey = isTokenEdge ? transition!.seq : undefined;
+    const r = runRef.current;
+    const t = transitionRef.current;
+    setEdges((es) => {
+      let changed = false;
+      const next = es.map((e) => {
+        const visual: EdgeVisualState = edgeVisualState(r, { id: e.id, from: e.source, to: e.target, label: e.data?.label ?? "" });
+        const isTokenEdge = !!t && t.fromStepId === e.source && t.toStepId === e.target;
+        const tokenKey = isTokenEdge ? t!.seq : undefined;
         if (e.data?.visual === visual && e.data?.token === isTokenEdge && e.data?.tokenKey === tokenKey) return e;
+        changed = true;
         return { ...e, data: { ...e.data, visual, token: isTokenEdge, tokenKey } };
-      }),
-    );
-  }, [run, transition, setEdges]);
+      });
+      return changed ? next : es;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content (edgeVisualSignature/transitionKey), not run/transition object identity; runRef/transitionRef carry the current values.
+  }, [edgeVisualSignature, transitionKey, setEdges]);
 
   const resolveProfile = useCallback(
     (agentProfileId: string | null): StepProfileResolution => {
@@ -356,8 +451,9 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
   const handleRestart = useCallback(async () => {
     const ok = await confirm({
       title: "Restart this pipeline?",
-      description: "This starts a fresh run from the start step — the previous run's history stays on record but a new one begins.",
+      description: "This starts a fresh run from the start step. Previous run history will be cleared.",
       confirmLabel: "Restart",
+      variant: "destructive",
     });
     if (!ok) return;
     setActionBusy(true);
@@ -398,9 +494,16 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
   // `review`) but the pipeline hasn't advanced past it — e.g. `transition:
   // "choose"` with no agent-emitted handoff yet resolved. Distinct from
   // `run.blocked`: nothing failed, it's just waiting on a manual decision.
+  // Excludes any execution that ALSO has a `run.blocked` entry (by
+  // `taskId`) — that execution already renders its own Advance form in the
+  // blocked section above, so listing it here too would show two Advance
+  // forms for the same execution (Minor 8).
   const reviewActive = run.active.flatMap((active) => {
     const stepTask = steps.find((t) => t.id === active.taskId);
-    return stepTask && stepTask.column === "review" ? [{ active, task: stepTask }] : [];
+    if (!stepTask || stepTask.column !== "review") return [];
+    const alreadyBlocked = run.blocked.some((b) => b.taskId != null && b.taskId === active.taskId);
+    if (alreadyBlocked) return [];
+    return [{ active, task: stepTask }];
   });
 
   return (

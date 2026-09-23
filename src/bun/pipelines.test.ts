@@ -212,6 +212,29 @@ test("pipelines.get(): unparseable JSON in the graph column collapses to the emp
   expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
 });
 
+test("pipelines.get(): a stored value that fails validatePipelineGraph AND isn't even shaped like a graph collapses to the empty graph, not returned as-is", () => {
+  // Distinguishes the "return unmodified" case above (shape-safe: a plain
+  // object with array steps/edges and a string|null|undefined startStepId)
+  // from a value too loose to safely hand to the editor or the
+  // step-resolution helpers, which just index into `.steps`/`.edges`.
+  const p = pipelines.insert({ name: "Unsafe Shape Graph", graph: makeGraph() });
+
+  // Not a plain object at all.
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify(["not", "an", "object"]), p.id]);
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // A plain object, but `steps`/`edges` aren't arrays.
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify({ steps: "nope", edges: [], startStepId: null }), p.id]);
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify({ steps: [], edges: "nope", startStepId: null }), p.id]);
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // Arrays present, but `startStepId` is neither a string, null, nor
+  // undefined.
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify({ steps: [], edges: [], startStepId: 42 }), p.id]);
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+});
+
 test("insert normalizes the graph, filling defaults for omitted step fields", () => {
   const rawGraph = {
     steps: [

@@ -14,7 +14,7 @@ import {
   stepNameById,
   validatePipelineGraph,
 } from "../../shared/pipeline.ts";
-import type { Pipeline, PipelineGraph, PipelineInput, Task } from "../../shared/types.ts";
+import type { Pipeline, PipelineGraph, PipelineInput, PipelineRunState, Task } from "../../shared/types.ts";
 
 export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
   const sub = args[0] ?? "ls";
@@ -99,7 +99,13 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       const ref = args[1];
       if (!ref) throw usageError("pipeline retry");
       const task = await resolvePipelineTask(client, ref);
-      const updated = await client.retryPipeline(task.id);
+      const f = parseRetryFlags(args.slice(2));
+      let targetTaskId: string | undefined;
+      if (f.from) {
+        if (!task.pipelineRun) throw new Error("pipeline has never run — nothing to retry");
+        targetTaskId = resolveActiveStepRef(task.pipelineRun, f.from);
+      }
+      const updated = await client.retryPipeline(task.id, targetTaskId);
       if (flags.json) return printJson(updated);
       out(`${c.cyan("↻")} retrying pipeline for ${c.dim(task.id.slice(0, 8))}`);
       return;
@@ -125,7 +131,10 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       }
 
       const body: { nextStepIds: string[] | null; fromTaskId?: string } = { nextStepIds };
-      if (f.from) body.fromTaskId = f.from;
+      if (f.from) {
+        if (!task.pipelineRun) throw new Error("pipeline has never run — nothing to advance");
+        body.fromTaskId = resolveActiveStepRef(task.pipelineRun, f.from);
+      }
       const updated = await client.advancePipeline(task.id, body);
       if (flags.json) return printJson(updated);
       out(`${c.green("▸")} advanced pipeline for ${c.dim(task.id.slice(0, 8))}`);
@@ -222,7 +231,10 @@ interface AdvanceFlags {
    *  exclusive with `--next`. */
   finish: boolean;
   /** `--from <task-id>` — the specific blocked/awaiting step execution to
-   *  advance, when more than one is in play. */
+   *  advance, when more than one is in play. Accepts a full task id or a
+   *  unique prefix of one (resolved against the run's active executions by
+   *  `resolveActiveStepRef`), same as every other task-id reference in the
+   *  CLI. */
   from?: string;
 }
 
@@ -242,13 +254,36 @@ export function parseAdvanceFlags(args: string[]): AdvanceFlags {
   return f;
 }
 
+interface RetryFlags {
+  /** `--from <task-id-or-prefix>` — narrow the retry to one specific active
+   *  execution (the route's optional body `taskId`), resolved against the
+   *  run's active executions by `resolveActiveStepRef`. Omitted, every
+   *  eligible active execution plus every pending run-level block is
+   *  retried, same as a bare `agetor pipeline retry <task>`. */
+  from?: string;
+}
+
+/** Pure flag parser for `agetor pipeline retry` — just `--from <task-id>`. */
+export function parseRetryFlags(args: string[]): RetryFlags {
+  const f: RetryFlags = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--from") f.from = flagValue(args, ++i, a);
+  }
+  return f;
+}
+
 /**
- * Resolve a `--next`/`--from` step reference against a pipeline run's
- * snapshot graph — exact step id first, then a unique case-insensitive,
- * trimmed step name — mirroring {@link matchPipelineRef}'s own id-then-name
- * precedence. Throws (listing every step name as candidates) on an unknown
- * or ambiguous reference, since the graph enforces unique names so ambiguity
- * can't actually happen for a name match — but the check stays defensive.
+ * Resolve a `--next` step reference against a pipeline run's snapshot
+ * graph — exact step id first, then a unique case-insensitive, trimmed step
+ * name — mirroring {@link matchPipelineRef}'s own id-then-name precedence.
+ * Throws (listing every step name as candidates) on an unknown or ambiguous
+ * reference, since the graph enforces unique names so ambiguity can't
+ * actually happen for a name match — but the check stays defensive.
+ *
+ * NOT used for `--from` — that resolves against a run's currently ACTIVE
+ * step executions (task ids), not the graph's step ids/names; see
+ * {@link resolveActiveStepRef} below.
  */
 export function resolveStepRef(graph: PipelineGraph, ref: string): string {
   const trimmed = ref.trim();
@@ -264,6 +299,32 @@ export function resolveStepRef(graph: PipelineGraph, ref: string): string {
     throw new Error(`ambiguous step "${trimmed}": matches ${matches.map((s) => s.name).join(", ")}`);
   }
   throw new Error(`unknown step "${trimmed}" — steps: ${candidates}`);
+}
+
+/**
+ * Resolve `agetor pipeline advance --from`/`agetor pipeline retry --from`
+ * against a running pipeline's currently ACTIVE step executions
+ * (`run.active[].taskId`) — exact task id first, then a unique prefix match,
+ * mirroring `resolveTask`'s own id-then-prefix precedence for board tasks
+ * elsewhere in the CLI. Throws on an unknown or ambiguous reference, listing
+ * every active execution's short task id plus its step name as candidates
+ * so the error is actionable without a separate `pipeline status` call.
+ */
+export function resolveActiveStepRef(run: PipelineRunState, ref: string): string {
+  const trimmed = ref.trim();
+  const exact = run.active.find((a) => a.taskId === trimmed);
+  if (exact) return exact.taskId;
+
+  const matches = run.active.filter((a) => a.taskId.startsWith(trimmed));
+  const candidates =
+    run.active
+      .map((a) => `${a.taskId.slice(0, 8)} (${run.snapshot ? stepNameById(run.snapshot.graph, a.stepId) : a.stepId})`)
+      .join(", ") || "(no active executions)";
+  if (matches.length === 1) return matches[0]!.taskId;
+  if (matches.length > 1) {
+    throw new Error(`"${trimmed}" is ambiguous among active executions — candidates: ${candidates}`);
+  }
+  throw new Error(`no active execution matches "${trimmed}" — candidates: ${candidates}`);
 }
 
 /** Pure row formatter for `agetor pipeline ls`'s table: id (short), name,

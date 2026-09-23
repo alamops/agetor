@@ -584,10 +584,12 @@ export const api = {
     j<Task>(`/tasks/${encodeURIComponent(taskId)}/pipeline/cancel`, { method: "POST" }, { retry: false }),
   /** Restart a finished pipeline run (`done`/`cancelled`/`blocked`) from its
    *  start step, discarding the prior run's history — a fresh execution of
-   *  the same parent task. `retry: false` to match every other run-mutating
-   *  pipeline route. */
+   *  the same parent task. Mirrors `startPipelineRun`'s own return shape
+   *  (same as `/tasks/:id/start`'s bounded-spawn-await shape, item 16) —
+   *  NOT a `Task`: the route hands back the server result verbatim.
+   *  `retry: false` to match every other run-mutating pipeline route. */
   restartPipeline: (taskId: string) =>
-    j<Task>(`/tasks/${encodeURIComponent(taskId)}/pipeline/restart`, { method: "POST" }, { retry: false }),
+    j<{ runId: string; pending?: true }>(`/tasks/${encodeURIComponent(taskId)}/pipeline/restart`, { method: "POST" }, { retry: false }),
   listAgentModels: () => j<AgentModelMap>("/agent-models"),
   /** Per-harness model catalog (fx account-scoped, one entry per enabled
    *  harness) — see `HarnessModelMap`. */

@@ -69,7 +69,9 @@ const {
   parseExportFlags,
   parseImportFlags,
   parseAdvanceFlags,
+  parseRetryFlags,
   resolveStepRef,
+  resolveActiveStepRef,
 } = await import("./pipeline.ts");
 
 const flags = { json: false, plain: true, noDaemon: true } as unknown as Parameters<typeof cmdPipeline>[1];
@@ -564,6 +566,46 @@ test("resolveStepRef: an ambiguous name throws listing the matches", () => {
   expect(() => resolveStepRef(g, "review")).toThrow(/ambiguous step "review"/);
 });
 
+// ── resolveActiveStepRef ─────────────────────────────────────────────────
+
+test("resolveActiveStepRef: resolves by exact task id", () => {
+  const run = pipelineRun({ active: [{ stepId: "s2", taskId: "step-task-12345678", seq: 2 }] });
+  expect(resolveActiveStepRef(run, "step-task-12345678")).toBe("step-task-12345678");
+});
+
+test("resolveActiveStepRef: resolves by a unique prefix of an active task id", () => {
+  const run = pipelineRun({ active: [{ stepId: "s2", taskId: "step-task-12345678", seq: 2 }] });
+  expect(resolveActiveStepRef(run, "step-task-1234")).toBe("step-task-12345678");
+});
+
+test("resolveActiveStepRef: an ambiguous prefix throws, listing every active execution's short id + step name", () => {
+  const run = pipelineRun({
+    active: [
+      { stepId: "s1", taskId: "step-task-aaa111", seq: 1 },
+      { stepId: "s2", taskId: "step-task-aaa222", seq: 2 },
+    ],
+  });
+  expect(() => resolveActiveStepRef(run, "step-task-aaa")).toThrow(/is ambiguous among active executions/);
+  try {
+    resolveActiveStepRef(run, "step-task-aaa");
+    throw new Error("expected to throw");
+  } catch (err) {
+    const msg = (err as Error).message;
+    expect(msg).toContain("Investigate");
+    expect(msg).toContain("Fix");
+  }
+});
+
+test("resolveActiveStepRef: no matching active execution throws, listing candidates", () => {
+  const run = pipelineRun({ active: [{ stepId: "s2", taskId: "step-task-12345678", seq: 2 }] });
+  expect(() => resolveActiveStepRef(run, "nope")).toThrow(/no active execution matches "nope"/);
+});
+
+test("resolveActiveStepRef: no active executions at all reports '(no active executions)'", () => {
+  const run = pipelineRun({ active: [] });
+  expect(() => resolveActiveStepRef(run, "nope")).toThrow(/\(no active executions\)/);
+});
+
 // ── parseAdvanceFlags ────────────────────────────────────────────────────
 
 test("parseAdvanceFlags: --next is repeatable", () => {
@@ -583,6 +625,16 @@ test("parseAdvanceFlags: --from <task-id>", () => {
 
 test("parseAdvanceFlags: no flags -> empty next, finish false, from undefined", () => {
   expect(parseAdvanceFlags([])).toEqual({ next: [], finish: false });
+});
+
+// ── parseRetryFlags ──────────────────────────────────────────────────────
+
+test("parseRetryFlags: --from <task-id>", () => {
+  expect(parseRetryFlags(["--from", "step-task-1"])).toEqual({ from: "step-task-1" });
+});
+
+test("parseRetryFlags: no flags -> from undefined", () => {
+  expect(parseRetryFlags([])).toEqual({});
 });
 
 // ── pipelineStatusLines ──────────────────────────────────────────────────
@@ -645,6 +697,59 @@ test("cmdPipeline retry --json: prints the raw task", async () => {
   currentClient = makeClient({ listTasks: async () => [task()], retryPipeline: async () => updated });
   await cmdPipeline(["retry", "parent-1"], jsonFlags);
   expect(jsonOutputs).toEqual([updated]);
+});
+
+test("cmdPipeline retry --from <task-id>: resolves against the run's active executions and forwards it", async () => {
+  const calls: Array<{ id: string; targetTaskId: string | undefined }> = [];
+  currentClient = makeClient({
+    listTasks: async () => [task({ pipelineRun: pipelineRun() })],
+    retryPipeline: async (id: string, targetTaskId?: string) => {
+      calls.push({ id, targetTaskId });
+      return task();
+    },
+  });
+  await cmdPipeline(["retry", "parent-1", "--from", "step-task-1"], flags);
+  expect(calls).toEqual([{ id: "parent-1", targetTaskId: "step-task-1" }]);
+});
+
+test("cmdPipeline retry --from <prefix>: a unique prefix of an active task id resolves too", async () => {
+  const calls: Array<{ id: string; targetTaskId: string | undefined }> = [];
+  currentClient = makeClient({
+    listTasks: async () => [task({ pipelineRun: pipelineRun() })],
+    retryPipeline: async (id: string, targetTaskId?: string) => {
+      calls.push({ id, targetTaskId });
+      return task();
+    },
+  });
+  await cmdPipeline(["retry", "parent-1", "--from", "step-task-"], flags);
+  expect(calls).toEqual([{ id: "parent-1", targetTaskId: "step-task-1" }]);
+});
+
+test("cmdPipeline retry --from with no matching active execution throws", async () => {
+  currentClient = makeClient({ listTasks: async () => [task({ pipelineRun: pipelineRun() })] });
+  await expect(cmdPipeline(["retry", "parent-1", "--from", "nope"], flags)).rejects.toThrow(
+    /no active execution matches "nope"/,
+  );
+});
+
+test("cmdPipeline retry --from before a first Run (no pipelineRun) throws", async () => {
+  currentClient = makeClient({ listTasks: async () => [task({ pipelineRun: null })] });
+  await expect(cmdPipeline(["retry", "parent-1", "--from", "step-task-1"], flags)).rejects.toThrow(
+    /pipeline has never run — nothing to retry/,
+  );
+});
+
+test("cmdPipeline retry without --from omits targetTaskId (retries everything eligible)", async () => {
+  const calls: Array<{ id: string; targetTaskId: string | undefined }> = [];
+  currentClient = makeClient({
+    listTasks: async () => [task({ pipelineRun: pipelineRun() })],
+    retryPipeline: async (id: string, targetTaskId?: string) => {
+      calls.push({ id, targetTaskId });
+      return task();
+    },
+  });
+  await cmdPipeline(["retry", "parent-1"], flags);
+  expect(calls).toEqual([{ id: "parent-1", targetTaskId: undefined }]);
 });
 
 // ── cmdPipeline: advance (task-scoped) ───────────────────────────────────
@@ -724,6 +829,33 @@ test("cmdPipeline advance: --from is forwarded as fromTaskId", async () => {
   });
   await cmdPipeline(["advance", "parent-1", "--finish", "--from", "step-task-1"], flags);
   expect(bodies).toEqual([{ id: "parent-1", body: { nextStepIds: null, fromTaskId: "step-task-1" } }]);
+});
+
+test("cmdPipeline advance: --from accepts a unique prefix of an active task id", async () => {
+  const bodies: unknown[] = [];
+  currentClient = makeClient({
+    listTasks: async () => [task({ pipelineRun: pipelineRun() })],
+    advancePipeline: async (id: string, body: unknown) => {
+      bodies.push({ id, body });
+      return task();
+    },
+  });
+  await cmdPipeline(["advance", "parent-1", "--finish", "--from", "step-task-"], flags);
+  expect(bodies).toEqual([{ id: "parent-1", body: { nextStepIds: null, fromTaskId: "step-task-1" } }]);
+});
+
+test("cmdPipeline advance: --from with no matching active execution throws, listing candidates", async () => {
+  currentClient = makeClient({ listTasks: async () => [task({ pipelineRun: pipelineRun() })] });
+  await expect(
+    cmdPipeline(["advance", "parent-1", "--finish", "--from", "nope"], flags),
+  ).rejects.toThrow(/no active execution matches "nope"/);
+});
+
+test("cmdPipeline advance: --from before a first Run (no pipelineRun) throws", async () => {
+  currentClient = makeClient({ listTasks: async () => [task({ pipelineRun: null })] });
+  await expect(
+    cmdPipeline(["advance", "parent-1", "--finish", "--from", "step-task-1"], flags),
+  ).rejects.toThrow(/pipeline has never run — nothing to advance/);
 });
 
 test("cmdPipeline advance: --next before a first Run (no snapshot) throws", async () => {

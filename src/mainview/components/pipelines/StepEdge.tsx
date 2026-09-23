@@ -84,7 +84,11 @@ function StepEdgeImpl({
         data-visual={visual}
       />
       {data?.token && (
-        <circle r={5} className="fill-info" data-testid="pipeline-step-edge-token">
+        // `cx`/`cy` seed the circle at the edge's own source point so it
+        // never flashes at the SVG origin (0,0) for the one frame before
+        // `beginElement()` (fired from the effect above) hands it off to
+        // `<animateMotion>`.
+        <circle cx={sourceX} cy={sourceY} r={5} className="fill-info" data-testid="pipeline-step-edge-token">
           <animateMotion ref={animateRef} begin="indefinite" dur="1.2s" repeatCount="1" fill="freeze" path={edgePath} />
         </circle>
       )}

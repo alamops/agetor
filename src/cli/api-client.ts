@@ -369,10 +369,17 @@ export class AgetorClient {
     return this.req("GET", `/tasks/${encodeURIComponent(taskId)}/pipeline`);
   }
   /** `POST /tasks/:id/pipeline/retry` — retry the current blocked/cancelled
-   *  step execution. 409 unless the pipeline run is actually blocked or
-   *  cancelled. */
-  retryPipeline(taskId: string): Promise<Task> {
-    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/retry`);
+   *  step execution(s). 409 unless the pipeline run is actually blocked or
+   *  cancelled. `targetTaskId` narrows the retry to one specific active
+   *  execution's task id (the route's optional body `taskId`) — omitted,
+   *  every eligible active execution plus every pending run-level block is
+   *  retried, same as before this parameter existed. */
+  retryPipeline(taskId: string, targetTaskId?: string): Promise<Task> {
+    return this.req(
+      "POST",
+      `/tasks/${encodeURIComponent(taskId)}/pipeline/retry`,
+      targetTaskId !== undefined ? { taskId: targetTaskId } : undefined,
+    );
   }
   /** `POST /tasks/:id/pipeline/cancel` — stop every active step execution
    *  and return the pipeline task to `ready`. */

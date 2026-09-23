@@ -577,11 +577,12 @@ export interface PipelineBlock {
   message: string;
   /** The run-level launch (re-attempting a step, or advancing past a step
    *  cap) this block is waiting to retry — populated only on a run-level
-   *  block (`taskId`/`stepId` both null: `step-cap`/`profile-missing`/
+   *  block (`taskId` on the block is null: `step-cap`/`profile-missing`/
    *  `join-incomplete`), so a Retry action can re-attempt the exact same
-   *  launch instead of re-deriving it. `stepId` here is the step the pending
-   *  launch targets; `arrivals` is the join state (if any) it would launch
-   *  with. */
+   *  launch instead of re-deriving it. `stepId` on the block itself is
+   *  always set for these blocks (the step the pending launch targets, same
+   *  value as `pending.stepId` here); `arrivals` is the join state (if any)
+   *  it would launch with. */
   pending?: { stepId: string; arrivals: PipelineJoinArrival[] };
 }
 

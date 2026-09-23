@@ -1081,20 +1081,13 @@ function AppInner() {
       // refetch just leaves the 2s `/tasks` poll as the fallback (same
       // degrade-gracefully posture as `refresh()` elsewhere in this file).
       if (ev.kind === "pipeline") {
+        // M17's regression risk is now handled server-side (F2): the server
+        // aggregates a pipeline parent's `pendingInteractionCount` across its
+        // steps before answering `GET /tasks/:id`, so this refetch's value is
+        // already authoritative — no client-side "keep the higher of the
+        // two" patch needed (or possible to get wrong) here.
         void api.getTask(ev.taskId)
-          .then((fresh) => setTasks((cur) => cur.map((t) => {
-            if (t.id !== fresh.id) return t;
-            // M17 (client-side half — the server-side fix is F2's): an
-            // `interaction` event above can optimistically bump a pipeline
-            // PARENT's `pendingInteractionCount` faster than this refetch
-            // resolves. Never let a lower fetched count regress it for a
-            // parent — defensively keep the higher of the two rather than
-            // trust whichever response landed last.
-            if (fresh.pipelineId != null && fresh.pendingInteractionCount < t.pendingInteractionCount) {
-              return { ...fresh, pendingInteractionCount: t.pendingInteractionCount };
-            }
-            return fresh;
-          })))
+          .then((fresh) => setTasks((cur) => cur.map((t) => (t.id === fresh.id ? fresh : t))))
           .catch(() => { /* 2s poll catches up */ });
         return;
       }

@@ -1386,6 +1386,126 @@ describe("composeStepPrompt", () => {
     expect(prompt).toContain(`</${HANDOFF_TAG}>`);
     expect(prompt).toContain("Do not put anything after the closing");
   });
+
+  test("fences an inlined handoff between BEGIN/END untrusted markers", () => {
+    const handoff = fullHandoffJsonObj({ summary: "Found the bug in auth.ts" });
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: baseStep,
+      stepIndex: 2,
+      stepCap: 25,
+      goal: "goal",
+      previous: [{ stepName: "Investigate", handoff, filePath: "/tmp/handoff-1.json" }],
+      outgoing: [],
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+    });
+    const beginMarker = '--- BEGIN untrusted handoff from "Investigate" ---';
+    const endMarker = "--- END untrusted handoff ---";
+    const warningIdx = prompt.indexOf(HANDOFF_UNTRUSTED_CONTENT_WARNING);
+    const beginIdx = prompt.indexOf(beginMarker);
+    const jsonIdx = prompt.indexOf('"schemaVersion": 1');
+    const endIdx = prompt.indexOf(endMarker);
+    const yourStepIdx = prompt.indexOf("## Your step");
+
+    expect(warningIdx).toBeGreaterThanOrEqual(0);
+    expect(beginIdx).toBeGreaterThan(warningIdx);
+    expect(jsonIdx).toBeGreaterThan(beginIdx);
+    expect(endIdx).toBeGreaterThan(jsonIdx);
+    expect(yourStepIdx).toBeGreaterThan(endIdx);
+  });
+
+  test("fences the too-large-with-file-pointer placeholder between BEGIN/END markers", () => {
+    const bigA = "A".repeat(10_000);
+    const bigB = "B".repeat(10_000);
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: baseStep,
+      stepIndex: 3,
+      stepCap: 25,
+      goal: "goal",
+      previous: [
+        { stepName: "First", handoff: fullHandoffJsonObj({ summary: bigA }), filePath: "/tmp/h1.json" },
+        { stepName: "Second", handoff: fullHandoffJsonObj({ summary: bigB }), filePath: "/tmp/h2.json" },
+      ],
+      outgoing: [],
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+    });
+    const beginMarker = '--- BEGIN untrusted handoff from "Second" ---';
+    const placeholder = "(handoff too large to inline — saved to /tmp/h2.json)";
+    const endMarker = "--- END untrusted handoff ---";
+    const beginIdx = prompt.indexOf(beginMarker);
+    const placeholderIdx = prompt.indexOf(placeholder);
+    const lastEndIdx = prompt.lastIndexOf(endMarker);
+
+    expect(beginIdx).toBeGreaterThanOrEqual(0);
+    expect(placeholderIdx).toBeGreaterThan(beginIdx);
+    expect(lastEndIdx).toBeGreaterThan(placeholderIdx);
+  });
+
+  test("fences the file-pointer placeholder (inlineHandoff:false) between BEGIN/END markers", () => {
+    const handoff = fullHandoffJsonObj();
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: baseStep,
+      stepIndex: 2,
+      stepCap: 25,
+      goal: "goal",
+      previous: [{ stepName: "Investigate", handoff, filePath: "/tmp/handoff-1.json" }],
+      outgoing: [],
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: false,
+      parallelSiblings: [],
+    });
+    const beginMarker = '--- BEGIN untrusted handoff from "Investigate" ---';
+    const placeholder = "(handoff saved to /tmp/handoff-1.json)";
+    const endMarker = "--- END untrusted handoff ---";
+    const beginIdx = prompt.indexOf(beginMarker);
+    const placeholderIdx = prompt.indexOf(placeholder);
+    const endIdx = prompt.indexOf(endMarker);
+
+    expect(beginIdx).toBeGreaterThanOrEqual(0);
+    expect(placeholderIdx).toBeGreaterThan(beginIdx);
+    expect(endIdx).toBeGreaterThan(placeholderIdx);
+  });
+
+  test("does not fence the no-handoff-provided placeholder (nothing untrusted to mark)", () => {
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step: baseStep,
+      stepIndex: 2,
+      stepCap: 25,
+      goal: "goal",
+      previous: [{ stepName: "Investigate", handoff: null, filePath: null }],
+      outgoing: [],
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+    });
+    expect(prompt).toContain("(no handoff was provided)");
+    expect(prompt).not.toContain("--- BEGIN untrusted handoff");
+    expect(prompt).not.toContain("--- END untrusted handoff ---");
+  });
+
+  test("untrusted-content warning references the BEGIN/END markers and calls out sections outside them as authoritative", () => {
+    expect(HANDOFF_UNTRUSTED_CONTENT_WARNING).toContain("BEGIN untrusted handoff");
+    expect(HANDOFF_UNTRUSTED_CONTENT_WARNING).toContain("END untrusted handoff");
+    expect(HANDOFF_UNTRUSTED_CONTENT_WARNING).toContain("Overall goal");
+    expect(HANDOFF_UNTRUSTED_CONTENT_WARNING).toContain("Your step");
+    expect(HANDOFF_UNTRUSTED_CONTENT_WARNING).toContain("Delegation");
+    expect(HANDOFF_UNTRUSTED_CONTENT_WARNING).toContain("Handoff");
+  });
 });
 
 // ---------------------------------------------------------------------------

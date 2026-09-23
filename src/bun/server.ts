@@ -4443,6 +4443,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // message, so this route layer only needs to translate that shape.
       "/tasks/:id/pipeline/advance": {
         POST: authed(async (req) => {
+          // Launching the next step (or steps) can itself materialize/verify
+          // a worktree — same rationale as /tasks/:id/start — so this opts
+          // out of the idle timeout like the other launch routes.
+          server.timeout(req, 0);
           const raw = await req.json().catch(() => null);
           if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
             return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
@@ -4489,6 +4493,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/pipeline/retry": {
         POST: authed(async (req) => {
+          // Same rationale as /tasks/:id/pipeline/advance above — a retry
+          // can (re-)launch a step, which can (re-)materialize a worktree.
+          server.timeout(req, 0);
           const raw = await req.json().catch(() => ({}));
           const body =
             raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};

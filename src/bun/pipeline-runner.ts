@@ -56,6 +56,7 @@ import {
   resolveNextSteps,
   resolveStartStep,
   stepNameById,
+  validatePipelineGraph,
 } from "../shared/pipeline.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
 import { appendReferences } from "../shared/refs.ts";
@@ -67,6 +68,7 @@ import type {
   Pipeline,
   PipelineBlock,
   PipelineBlockKind,
+  PipelineGraph,
   PipelineJoinArrival,
   PipelineRunSnapshot,
   PipelineRunState,
@@ -259,6 +261,28 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
   } satisfies GlobalEvent);
 }
 
+/**
+ * Force `run.status = "cancelled"` and persist it that way — UNLESS
+ * something is still genuinely blocked (Minor 6), in which case persisting
+ * normally (letting `deriveRunStatus` recompute) keeps that blocked reason
+ * visible instead of silently overwriting it with a bare, unexplained
+ * "cancelled" — `deriveRunStatus` already treats `blocked` as
+ * higher-priority than `cancelled`/`idle`, so this is a no-op change in
+ * outcome for the "nothing blocked" case and a strict improvement for the
+ * "something's blocked" one. Shared by `cancelPipelineRun` and
+ * `handleRunStatus`'s cancelled/orphaned-with-nothing-else-live branch —
+ * and, transitively, `reconcilePipelineRuns`, which drives missed settles
+ * through that same `handleRunStatus` path at boot.
+ */
+function finalizeCancelled(parentId: string, run: PipelineRunState): void {
+  if (run.blocked.length === 0) {
+    run.status = "cancelled";
+    persist(parentId, run, { preserveStatus: true });
+  } else {
+    persist(parentId, run);
+  }
+}
+
 /** Re-read a FRESH copy of the parent's run from the DB and record a
  *  `step-failed` block for `taskId`'s active execution with `err`'s message
  *  (M16) — the fallback every event handler below reaches for when its own
@@ -337,15 +361,22 @@ function reasonMessage(reason: string | undefined, stepName: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Freeze `pipeline`'s graph plus every agent profile any step (or any
- * step's `subagents.profileIds`) references, at `now`. Fails — refusing to
- * start the run at all, per D8/Done-criteria #7 — when any step has no
+ * Freeze `graph` plus every agent profile any step (or any step's
+ * `subagents.profileIds`) references, at `now`. Fails — refusing to start
+ * the run at all, per D8/Done-criteria #7 — when any step has no
  * `agentProfileId`, a referenced profile no longer exists, or that
- * profile's own harness no longer resolves.
+ * profile's own harness no longer resolves. `graph` is expected to already
+ * be the NORMALIZED output of {@link validatePipelineGraph} (Major 5) — the
+ * caller runs that validation, since it also needs to decide what to do
+ * with an invalid stored graph before ever reaching this far.
  */
-function buildSnapshot(pipeline: Pipeline, now: number): { snapshot: PipelineRunSnapshot } | { error: string } {
+function buildSnapshot(
+  graph: PipelineGraph,
+  maxSteps: number,
+  now: number,
+): { snapshot: PipelineRunSnapshot } | { error: string } {
   const neededIds = new Set<string>();
-  for (const step of pipeline.graph.steps) {
+  for (const step of graph.steps) {
     if (!step.agentProfileId) return { error: `step "${step.name}" has no agent` };
     neededIds.add(step.agentProfileId);
     for (const id of step.subagents.profileIds) neededIds.add(id);
@@ -354,7 +385,7 @@ function buildSnapshot(pipeline: Pipeline, now: number): { snapshot: PipelineRun
   for (const id of neededIds) {
     const profile = agentProfiles.get(id);
     if (!profile) {
-      const owner = pipeline.graph.steps.find((s) => s.agentProfileId === id)?.name;
+      const owner = graph.steps.find((s) => s.agentProfileId === id)?.name;
       return {
         error: owner
           ? `agent "${id}" for step "${owner}" no longer exists`
@@ -366,7 +397,7 @@ function buildSnapshot(pipeline: Pipeline, now: number): { snapshot: PipelineRun
     profiles[id] = snapshotFromProfile(profile, { kind: harness.kind, label: harness.label }, now);
   }
   return {
-    snapshot: { graph: pipeline.graph, maxSteps: pipeline.maxSteps, profiles, capturedAt: now },
+    snapshot: { graph, maxSteps, profiles, capturedAt: now },
   };
 }
 
@@ -408,6 +439,33 @@ function propagateWorktreeToActiveSteps(parent: Task, run: PipelineRunState): vo
 
 type LaunchResult = { ok: true; runId: string; pending?: true } | { ok: false };
 
+/** Record a retryable run-level hold for `step` instead of launching it —
+ *  used whenever the pipeline's parent task turns out to be archived (Major
+ *  2): the settle/advance that would otherwise launch this step still has
+ *  to land somewhere persistable, but must never insert a new step task or
+ *  touch the parent's worktree while it's archived. `pending` carries
+ *  `previous`'s arrivals so a later Retry (once the task is unarchived)
+ *  re-attempts the exact same launch. Note `pending.stepId` (throughout this
+ *  module) is always set — every call site that builds a `pending` block
+ *  names the step the retry should re-launch; nothing ever constructs one
+ *  without it. */
+function holdForArchivedParent(
+  run: PipelineRunState,
+  step: PipelineStep,
+  previous: { stepId: string; seq: number; handoff: Handoff | null }[],
+): void {
+  upsertBlocked(run, {
+    taskId: null,
+    stepId: step.id,
+    kind: "step-failed",
+    message: `step "${step.name}" is ready to launch, but the pipeline task is archived — unarchive it and retry`,
+    pending: {
+      stepId: step.id,
+      arrivals: previous.map((p) => ({ fromStepId: p.stepId, seq: p.seq, handoff: p.handoff })),
+    },
+  });
+}
+
 /**
  * Launch one step execution: re-verifies the shared worktree (M6), writes
  * every non-null `previous` handoff to `pipelineRunsDir(parent.id)` (via
@@ -429,16 +487,20 @@ type LaunchResult = { ok: true; runId: string; pending?: true } | { ok: false };
  * launched in the same fan-out batch as this one — passed by the caller
  * up front, before any of them have actually landed in `run.active` yet, so
  * every prompt in the batch sees the full sibling set instead of only
- * whichever ones happened to launch earlier in the loop. Mutates `run` and
- * calls `persist` itself — callers don't need to persist again around this
- * (though doing so is harmless/idempotent).
+ * whichever ones happened to launch earlier in the loop. `opts.
+ * skipWorktreeRefresh` (Minor 15) lets a caller that already refreshed the
+ * parent's worktree ONCE for a whole batch of targets (a fan-out settle, or
+ * `advancePipeline`'s own up-front refresh) skip this function's own
+ * redundant per-call refresh — `parent` is then trusted to already be
+ * current. Mutates `run` and calls `persist` itself — callers don't need to
+ * persist again around this (though doing so is harmless/idempotent).
  */
 async function launchStep(
   parent: Task,
   run: PipelineRunState,
   step: PipelineStep,
   previous: { stepId: string; seq: number; handoff: Handoff | null }[],
-  opts?: { batchSiblingStepIds?: string[] },
+  opts?: { batchSiblingStepIds?: string[]; skipWorktreeRefresh?: boolean },
 ): Promise<LaunchResult> {
   const snapshot = run.snapshot;
   if (!snapshot) {
@@ -449,29 +511,39 @@ async function launchStep(
 
   const pendingArrivals: PipelineJoinArrival[] = previous.map((p) => ({ fromStepId: p.stepId, seq: p.seq, handoff: p.handoff }));
 
-  // M6: re-verify the shared worktree right before materializing a new step
-  // row against it — a run that's been sitting blocked for a while may have
-  // had its worktree cleaned up out from under it.
-  const prepared = await refreshParentWorktree(parent);
-  if ("error" in prepared) {
-    upsertBlocked(run, {
-      taskId: null,
-      stepId: step.id,
-      kind: "step-failed",
-      message: `could not prepare the pipeline's worktree: ${prepared.error}`,
-      pending: { stepId: step.id, arrivals: pendingArrivals },
-    });
+  // Minor 7 / Major 2: check the parent still exists, isn't mid-delete, and
+  // isn't archived BEFORE touching its worktree at all — a delete cascade or
+  // an archive that raced this launch through the same per-parent lock (or,
+  // belt-and-braces, landed outside it) must never have a step inserted, or
+  // the worktree refreshed, behind its back.
+  const currentParent = tasks.get(parent.id);
+  if (tombstonedPipelineParents.has(parent.id) || !currentParent) {
+    return { ok: false };
+  }
+  if (currentParent.archivedAt != null) {
+    holdForArchivedParent(run, step, previous);
     persist(parent.id, run);
     return { ok: false };
   }
-  parent = prepared.parent;
+  parent = currentParent;
 
-  // M7: bail before creating anything if the parent has been (or is being)
-  // deleted — a delete cascade that raced this launch through the same
-  // per-parent lock will have already removed every step; don't add a new
-  // one behind its back.
-  if (tombstonedPipelineParents.has(parent.id) || !tasks.get(parent.id)) {
-    return { ok: false };
+  // M6: re-verify the shared worktree right before materializing a new step
+  // row against it — a run that's been sitting blocked for a while may have
+  // had its worktree cleaned up out from under it.
+  if (!opts?.skipWorktreeRefresh) {
+    const prepared = await refreshParentWorktree(parent);
+    if ("error" in prepared) {
+      upsertBlocked(run, {
+        taskId: null,
+        stepId: step.id,
+        kind: "step-failed",
+        message: `could not prepare the pipeline's worktree: ${prepared.error}`,
+        pending: { stepId: step.id, arrivals: pendingArrivals },
+      });
+      persist(parent.id, run);
+      return { ok: false };
+    }
+    parent = prepared.parent;
   }
 
   if (run.stepCount >= effectiveStepCap(run)) {
@@ -623,6 +695,43 @@ async function launchStep(
   return { ok: true, runId: started.runId, ...(started.pending ? { pending: true as const } : {}) };
 }
 
+/**
+ * `launchStep` wrapped so a throw from the launch itself can never abort the
+ * rest of a multi-target batch (Minor 14) — used by every loop that can
+ * resolve to more than one next step from a single settle or manual advance
+ * (a `transition: "all"` fan-out, several hand-picked `advancePipeline`
+ * targets, or a join that just completed alongside other targets in the
+ * same batch). A throw is recorded as a run-level `step-failed` block
+ * carrying `pending`, so Retry can re-attempt just that one target — the
+ * other targets in the batch, already launched or about to be, are
+ * unaffected. Return value is intentionally discarded by callers (same as
+ * calling `launchStep` directly in a loop) — its effect is entirely via
+ * mutating `run`.
+ */
+async function launchTarget(
+  parent: Task,
+  run: PipelineRunState,
+  step: PipelineStep,
+  previous: { stepId: string; seq: number; handoff: Handoff | null }[],
+  opts?: { batchSiblingStepIds?: string[]; skipWorktreeRefresh?: boolean },
+): Promise<void> {
+  try {
+    await launchStep(parent, run, step, previous, opts);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    upsertBlocked(run, {
+      taskId: null,
+      stepId: step.id,
+      kind: "step-failed",
+      message: `step "${step.name}" failed to launch: ${message}`,
+      pending: {
+        stepId: step.id,
+        arrivals: previous.map((p) => ({ fromStepId: p.stepId, seq: p.seq, handoff: p.handoff })),
+      },
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Retry (shared by startPipelineRun's "retry a blocked/cancelled run" branch
 // and retryPipelineStep)
@@ -676,18 +785,42 @@ async function retryPendingBlocks(
 ): Promise<{ runId: string; pending?: true } | null> {
   const pendingBlocks = run.blocked.filter((b) => b.taskId === null && b.pending);
   let first: { runId: string; pending?: true } | null = null;
+  // Minor 10: extend the cap ONCE per retry call, not once per pending
+  // `step-cap` block found — the formula stays `maxSteps * (1 +
+  // capExtensions)` either way, but a run that somehow queued more than one
+  // `step-cap` block must not have this single Retry click silently apply
+  // several extensions at once.
+  let capExtended = false;
   for (const block of pendingBlocks) {
     const pending = block.pending;
     if (!pending) continue;
-    if (block.kind === "step-cap") {
+    if (block.kind === "step-cap" && !capExtended) {
       run.capExtensions = (run.capExtensions ?? 0) + 1;
+      capExtended = true;
     }
     run.blocked = run.blocked.filter((b) => b !== block);
     if (block.kind === "join-incomplete") delete run.joins[pending.stepId];
     const step = run.snapshot?.graph.steps.find((s) => s.id === pending.stepId);
-    if (!step) continue;
+    if (!step) {
+      // Nit: never silently drop a pending block whose step vanished from
+      // the frozen snapshot (shouldn't normally happen — the snapshot is
+      // captured once at first Run — but a corrupted/hand-edited row must
+      // not lose the block outright with no trace left for a human to act
+      // on) — re-record it, profile-missing-style, instead.
+      upsertBlocked(run, {
+        taskId: null,
+        stepId: pending.stepId,
+        kind: "profile-missing",
+        message: `step "${pending.stepId}" no longer exists in this run's snapshot`,
+        pending,
+      });
+      continue;
+    }
     const previous = pending.arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }));
-    const launched = await launchStep(parent, run, step, previous);
+    // Minor 15: `parent` here was already freshly refreshed once by this
+    // call's sole caller, `performPipelineRetry` — skip `launchStep`'s own
+    // redundant per-call refresh.
+    const launched = await launchStep(parent, run, step, previous, { skipWorktreeRefresh: true });
     if (launched.ok && !first) first = { runId: launched.runId, ...(launched.pending ? { pending: true as const } : {}) };
   }
   return first;
@@ -719,11 +852,13 @@ async function performPipelineRetry(
   let result: { runId: string; pending?: true } | null = "error" in activeResult ? null : activeResult;
 
   if (!onlyTaskId) {
+    // Nit: `retryPendingBlocks` can mutate `run` (clear/re-add blocks,
+    // drop/re-add `run.joins` entries) even when it returns `null` — always
+    // persist afterward rather than the old `pendingResult ||
+    // pendingResult === null` check, which was vacuously true either way.
     const pendingResult = await retryPendingBlocks(parentRow, run);
-    if (pendingResult || pendingResult === null) {
-      checkJoinIncomplete(run);
-      persist(parentRow.id, run);
-    }
+    checkJoinIncomplete(run);
+    persist(parentRow.id, run);
     if (pendingResult && !result) result = pendingResult;
   }
 
@@ -775,29 +910,57 @@ export async function startPipelineRun(
 
     if (run.status === "running") return { error: "pipeline is already running" };
 
-    // M2: blocked/cancelled is ALWAYS a retry-in-place, whether or not
-    // anything is currently sitting in `run.active` — a run-level pending
-    // block (step-cap, profile-missing, join-incomplete) with zero active
-    // executions used to fall through to the "fresh run" branch below,
-    // silently discarding history and re-snapshotting from scratch.
-    if (run.status === "blocked" || run.status === "cancelled") {
+    if (opts?.restart) {
+      // Major 3: `restart` means "fresh run from the start step," for ANY
+      // non-running status — blocked, cancelled, done, or even idle (a
+      // harmless no-op request in that last case, since idle already falls
+      // through to the very same fresh-run code below with nothing to
+      // cancel). This used to only take effect for `done`; a restart
+      // requested on a blocked/cancelled run fell into the M2 retry-in-place
+      // branch below instead and silently became a retry, not a restart.
+      // Cancel whatever's still genuinely live first (best-effort — a step
+      // whose turn is mid-flight has nothing useful to hand off to a fresh
+      // run that's about to discard this run's history anyway).
+      for (const a of run.active) {
+        if (!isTaskRunLive(a.taskId)) continue;
+        const stepRunId = tasks.get(a.taskId)?.runId;
+        if (stepRunId) await cancelRun(stepRunId);
+      }
+    } else if (run.status === "blocked" || run.status === "cancelled") {
+      // M2: absent an explicit restart, blocked/cancelled is ALWAYS a
+      // retry-in-place, whether or not anything is currently sitting in
+      // `run.active` — a run-level pending block (step-cap, profile-missing,
+      // join-incomplete) with zero active executions used to fall through
+      // to the "fresh run" branch below, silently discarding history and
+      // re-snapshotting from scratch.
       return performPipelineRetry(fresh, run);
-    }
-
-    if (run.status === "done" && !opts?.restart) {
+    } else if (run.status === "done") {
       return { error: "pipeline already finished — restart it explicitly" };
     }
 
-    // Fresh run (idle, or an explicit restart of a finished run): re-resolve
-    // the pipeline and (re-)snapshot it.
+    // Fresh run (idle, or an explicit restart of any other status):
+    // re-resolve the pipeline and (re-)snapshot it. Major 5: the stored
+    // graph must be validated (and normalized) before it's ever captured
+    // onto a run's frozen snapshot — an edited-in-place or otherwise
+    // corrupted graph must fail the run start with a clear error instead of
+    // reaching `buildSnapshot`/the runner with malformed shape.
     const pipeline = pipelines.get(fresh.pipelineId);
     let snapshot: PipelineRunSnapshot;
     if (pipeline) {
-      const built = buildSnapshot(pipeline, Date.now());
+      const validated = validatePipelineGraph(pipeline.graph);
+      if (!validated.ok) return { error: `pipeline graph is invalid: ${validated.error}` };
+      const built = buildSnapshot(validated.graph, pipeline.maxSteps, Date.now());
       if ("error" in built) return { error: built.error };
       snapshot = built.snapshot;
     } else if (run.snapshot) {
-      snapshot = run.snapshot;
+      // The pipeline row itself is gone (deleted) — the only graph left to
+      // run is the one already frozen on this task's previous snapshot.
+      // Validate that too: it was built from a real pipeline once, but
+      // nothing stops a hand-edited DB row (or a future schema slip) from
+      // having corrupted it since.
+      const validated = validatePipelineGraph(run.snapshot.graph);
+      if (!validated.ok) return { error: `pipeline graph is invalid: ${validated.error}` };
+      snapshot = { ...run.snapshot, graph: validated.graph };
     } else {
       return { error: "pipeline no longer exists, and this task has never run it" };
     }
@@ -832,7 +995,7 @@ export async function startPipelineRun(
     pipelineUpdateColumn(parentRow.id, null, "running");
     parentRow = tasks.get(parentRow.id) ?? parentRow;
 
-    const result = await launchStep(parentRow, run, startStep, []);
+    const result = await launchStep(parentRow, run, startStep, [], { skipWorktreeRefresh: true });
     checkJoinIncomplete(run);
     persist(parentRow.id, run);
     if (!result.ok) {
@@ -935,7 +1098,14 @@ export async function advancePipeline(
         const previous = nid === joinStepId
           ? arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }))
           : [];
-        await launchStep(parentRow, run, targetStep, previous, { batchSiblingStepIds: joinTargets });
+        // Minor 14/15: `launchTarget` catches a per-target throw into a
+        // retryable block instead of aborting the rest of the batch;
+        // `parentRow` was already freshly refreshed once, above, for this
+        // whole call — skip `launchStep`'s own redundant per-call refresh.
+        await launchTarget(parentRow, run, targetStep, previous, {
+          batchSiblingStepIds: joinTargets,
+          skipWorktreeRefresh: true,
+        });
       }
 
       checkJoinIncomplete(run);
@@ -997,12 +1167,24 @@ export async function advancePipeline(
         const complete = incoming.every((i) => arrivedIds.has(i.step.id));
         if (complete) {
           delete run.joins[nid];
-          await launchStep(parentRow, run, targetStep, arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff })), { batchSiblingStepIds: nextStepIds });
+          await launchTarget(
+            parentRow,
+            run,
+            targetStep,
+            arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff })),
+            { batchSiblingStepIds: nextStepIds, skipWorktreeRefresh: true },
+          );
         } else {
           run.joins[nid] = { arrivals };
         }
       } else {
-        await launchStep(parentRow, run, targetStep, [{ stepId: activeEntry.stepId, seq: activeEntry.seq, handoff }], { batchSiblingStepIds: nextStepIds });
+        await launchTarget(
+          parentRow,
+          run,
+          targetStep,
+          [{ stepId: activeEntry.stepId, seq: activeEntry.seq, handoff }],
+          { batchSiblingStepIds: nextStepIds, skipWorktreeRefresh: true },
+        );
       }
     }
 
@@ -1057,8 +1239,7 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
       if (runId) await cancelRun(runId);
     }
 
-    run.status = "cancelled";
-    persist(parentId, run, { preserveStatus: true });
+    finalizeCancelled(parentId, run);
     return { task: tasks.get(parentId)! };
   });
 }
@@ -1185,7 +1366,30 @@ async function handleRunStatus(
         }
         pipelineUpdateColumn(taskId, runId, "done");
 
+        // Major 2: re-read the parent fresh — it may have been archived
+        // between this settle firing and this handler acquiring the
+        // per-parent lock (an `archiveTask` cascade races through the same
+        // lock, but sets `archivedAt` on the row BEFORE it ever acquires
+        // it). An archived parent must never have this settle spawn a new
+        // step task or touch its worktree — every resolved next step is
+        // recorded as a retryable pending hold instead of launched.
         const parentForLaunch = tasks.get(parentId) ?? parent;
+        const parentArchived = parentForLaunch.archivedAt != null;
+        // Minor 15: refresh the shared worktree ONCE for this whole batch (a
+        // fan-out can resolve several next steps from one settle) instead of
+        // once per `launchStep` call — a failed batch refresh here just
+        // falls back to `launchStep`'s own per-call refresh (and its own
+        // per-target error handling) for every target in the loop below.
+        let batchParent = parentForLaunch;
+        let worktreeReady = false;
+        if (!parentArchived && nextStepIds.length > 0) {
+          const refreshedBatch = await refreshParentWorktree(parentForLaunch);
+          if (!("error" in refreshedBatch)) {
+            batchParent = refreshedBatch.parent;
+            worktreeReady = true;
+          }
+        }
+
         for (const nid of nextStepIds) {
           const targetStep = graph.steps.find((s) => s.id === nid);
           if (!targetStep) continue;
@@ -1200,24 +1404,31 @@ async function handleRunStatus(
             const complete = incoming.every((i) => arrivedIds.has(i.step.id));
             if (complete) {
               delete run.joins[nid];
-              await launchStep(
-                parentForLaunch,
-                run,
-                targetStep,
-                arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff })),
-                { batchSiblingStepIds: nextStepIds },
-              );
+              const previousArr = arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }));
+              if (parentArchived) {
+                holdForArchivedParent(run, targetStep, previousArr);
+              } else {
+                // Minor 14: a per-target throw is caught and recorded as its
+                // own retryable block instead of aborting the rest of this
+                // fan-out batch.
+                await launchTarget(batchParent, run, targetStep, previousArr, {
+                  batchSiblingStepIds: nextStepIds,
+                  skipWorktreeRefresh: worktreeReady,
+                });
+              }
             } else {
               run.joins[nid] = { arrivals };
             }
           } else {
-            await launchStep(
-              parentForLaunch,
-              run,
-              targetStep,
-              [{ stepId: activeEntry.stepId, seq: activeEntry.seq, handoff: parsed.handoff }],
-              { batchSiblingStepIds: nextStepIds },
-            );
+            const previousArr = [{ stepId: activeEntry.stepId, seq: activeEntry.seq, handoff: parsed.handoff }];
+            if (parentArchived) {
+              holdForArchivedParent(run, targetStep, previousArr);
+            } else {
+              await launchTarget(batchParent, run, targetStep, previousArr, {
+                batchSiblingStepIds: nextStepIds,
+                skipWorktreeRefresh: worktreeReady,
+              });
+            }
           }
         }
 
@@ -1258,10 +1469,25 @@ async function handleRunStatus(
       }
       const otherLive = run.active.some((a) => a.taskId !== taskId && isTaskRunLive(a.taskId));
       if (otherLive) {
+        // Major 1: this execution stopped (or orphaned) but a SIBLING is
+        // still genuinely running — the whole run must not silently read as
+        // `running` with a dead-end execution sitting in `active` with no
+        // block to surface it (`deriveRunStatus` would otherwise see
+        // `blocked.length === 0` and `active.length > 0` and call it
+        // `running`, forever, since nothing is ever going to advance this
+        // execution on its own again). Record a retryable block for it now,
+        // so `deriveRunStatus` reads `blocked` immediately — and still reads
+        // `blocked` once the sibling finishes too, since this block is
+        // still sitting there.
+        upsertBlocked(run, {
+          taskId,
+          stepId: activeEntry.stepId,
+          kind: "step-failed",
+          message: `step "${stepName}" was stopped — retry it or advance past it`,
+        });
         persist(parentId, run);
       } else {
-        run.status = "cancelled";
-        persist(parentId, run, { preserveStatus: true });
+        finalizeCancelled(parentId, run);
       }
     } catch (err) {
       persistReconcileFailure(parentId, taskId, err);
@@ -1288,6 +1514,14 @@ async function handleColumnChange(
 
   await runExclusive(parentId, async () => {
     try {
+      // Major 2: re-read the parent fresh (same rationale as
+      // `handleRunStatus`) — an archive can race this event through the
+      // same per-parent lock. Unlike `handleRunStatus`, nothing below this
+      // point ever calls `launchStep` or touches the worktree — both
+      // branches only ever record/clear a block or reset a history entry —
+      // so an archived parent still gets its state recorded correctly with
+      // no extra guard needed; `persist` itself already skips column
+      // mirroring/event publish for an archived parent (m8).
       const parent = tasks.get(parentId);
       if (!parent || !parent.pipelineRun) return;
       const run = parent.pipelineRun;

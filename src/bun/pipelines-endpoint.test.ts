@@ -852,6 +852,50 @@ test("POST /tasks/:id/pipeline/restart runs a finished (done) pipeline again fro
   expect(resettled.task.pipelineRun?.startedAt).not.toBe(firstStartedAt);
 }, 20_000);
 
+test("POST /tasks/:id/pipeline/restart on a blocked run also runs it again from the top (Major 3) — a plain start retries in place instead", async () => {
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const profile = await createProfile();
+  // `:missing` emits prose with no `<handoff>` block at all, which the
+  // runner records as a `handoff-missing` block and settles the run
+  // `blocked` — see `agents.ts`'s `lastFakeHandoffSuffix` doc comment.
+  const graph = oneStepGraph(profile.id, { instructions: `Do it. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing` });
+  const pipeline = await createPipeline(profile.id, { graph });
+  const task = await createTask({ pipelineId: pipeline.id, workdir: WORKDIR, isolation: "none" });
+
+  const startRes = await call(`/tasks/${task.id}/start`, { method: "POST" });
+  expect(startRes.status).toBe(200);
+  await waitForPipelineSettled(task.id);
+
+  const settled = (await (await call(`/tasks/${task.id}/pipeline`)).json()) as { task: Task };
+  expect(settled.task.pipelineRun?.status).toBe("blocked");
+  const firstStartedAt = settled.task.pipelineRun?.startedAt;
+  const firstHistoryLength = settled.task.pipelineRun?.history.length ?? 0;
+
+  // A plain start on a blocked run retries in place (M2) — same run,
+  // `startedAt` untouched, history preserved (it'll just re-block the same
+  // way, since the step still emits no handoff).
+  const plainStartRes = await call(`/tasks/${task.id}/start`, { method: "POST" });
+  expect(plainStartRes.status).toBe(200);
+  await waitForPipelineSettled(task.id);
+  const retried = (await (await call(`/tasks/${task.id}/pipeline`)).json()) as { task: Task };
+  expect(retried.task.pipelineRun?.status).toBe("blocked");
+  expect(retried.task.pipelineRun?.startedAt).toBe(firstStartedAt);
+
+  // The explicit restart route, in contrast, discards history and starts
+  // over from the top even though the run is `blocked`, not `done` — the
+  // route's own semantics ("fresh run for any status except running").
+  const restartRes = await call(`/tasks/${task.id}/pipeline/restart`, { method: "POST" });
+  expect(restartRes.status).toBe(200);
+  const restarted = (await restartRes.json()) as { runId?: string; pending?: true };
+  expect(typeof restarted.runId === "string" || restarted.pending === true).toBe(true);
+
+  await waitForPipelineSettled(task.id);
+  const resettled = (await (await call(`/tasks/${task.id}/pipeline`)).json()) as { task: Task };
+  expect(resettled.task.pipelineRun?.status).toBe("blocked");
+  expect(resettled.task.pipelineRun?.startedAt).not.toBe(firstStartedAt);
+  expect(resettled.task.pipelineRun?.history.length).toBe(firstHistoryLength);
+}, 20_000);
+
 // ---------------------------------------------------------------------------
 // M7: an orphaned step (its pipeline parent row no longer exists) can be
 // deleted/archived directly — there's no parent left to redirect the caller
