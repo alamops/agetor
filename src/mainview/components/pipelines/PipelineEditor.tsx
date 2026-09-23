@@ -329,9 +329,10 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
         setStartStepId(g.startStepId);
         setSelectedStepId(step.id);
         // Seed the debounced graph immediately for a wholesale rebuild —
-        // otherwise `isDirty`/`liveValidation` would read against the STALE
-        // pre-load debounced value for up to 150ms and could flash "dirty"
-        // right after this fresh, intentionally-clean draft loads.
+        // otherwise `liveValidation` would read against the STALE pre-load
+        // debounced value for up to 150ms right after this fresh,
+        // intentionally-clean draft loads. (`isDirty` is unaffected by this
+        // debounce — it's derived straight from `derivedGraph`.)
         setDebouncedGraph(g);
         initialSnapshotRef.current = snapshotOf("", "", PIPELINE_LIMITS.maxStepsDefault, g);
         setLoading(false);
@@ -383,14 +384,21 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
 
   // `derivedGraph` recomputes on every node-position change — including
   // every pointermove frame of a drag — so recomputing `validatePipelineGraph`
-  // (a full graph walk) and `snapshotOf` (a full JSON.stringify) directly
-  // from it on every render was doing that work at drag-frame rate for no
-  // UI benefit (neither the validation banner nor the dirty flag needs
-  // sub-frame freshness). Both are instead derived from a `debouncedGraph`
-  // that only catches up 150ms after node/edge changes go quiet. `handleSave`
+  // (a full graph walk) directly from it on every render was doing that work
+  // at drag-frame rate for no UI benefit (the validation banner doesn't need
+  // sub-frame freshness). That one is derived from a `debouncedGraph` that
+  // only catches up 150ms after node/edge changes go quiet. `handleSave`
   // deliberately does NOT use this debounced value — it re-validates
   // `derivedGraph` itself synchronously at submit time, so Save always acts
   // on the truly-latest graph even if a debounce cycle hasn't settled yet.
+  //
+  // `isDirty` used to be derived from `debouncedGraph` too, which meant Back
+  // (and `App.tsx`'s `navigate` unsaved-changes guard, fed via
+  // `onDirtyChange`) could see a stale "clean" state for up to 150ms after
+  // an edit — a quick edit-then-Back could slip through with no confirm.
+  // It's computed straight from `derivedGraph` instead, so it (and
+  // `onDirtyChange`) update in the same render as the edit; only
+  // `liveValidation`'s banner keeps the debounce.
   const [debouncedGraph, setDebouncedGraph] = useState<PipelineGraph>(derivedGraph);
   useEffect(() => {
     const t = setTimeout(() => setDebouncedGraph(derivedGraph), 150);
@@ -398,11 +406,11 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
   }, [derivedGraph]);
 
   const liveValidation = useMemo(() => validatePipelineGraph(debouncedGraph), [debouncedGraph]);
-  const debouncedSnapshot = useMemo(
-    () => snapshotOf(name, description, maxSteps, debouncedGraph),
-    [name, description, maxSteps, debouncedGraph],
+  const liveSnapshot = useMemo(
+    () => snapshotOf(name, description, maxSteps, derivedGraph),
+    [name, description, maxSteps, derivedGraph],
   );
-  const isDirty = debouncedSnapshot !== initialSnapshotRef.current;
+  const isDirty = liveSnapshot !== initialSnapshotRef.current;
 
   useEffect(() => {
     onDirtyChange?.(isDirty);
@@ -412,8 +420,8 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
     const laidOut = autoLayout(derivedGraph);
     setNodes(toFlowNodes(laidOut, () => ({ onAppend: appendStep })));
     // A deliberate, one-shot repositioning — not a drag frame — so there's
-    // no reason to make the validation banner / dirty flag wait out the
-    // debounce for it.
+    // no reason to make the validation banner wait out the debounce for it.
+    // (`isDirty` already updates immediately via `derivedGraph`.)
     setDebouncedGraph(laidOut);
   }, [derivedGraph, appendStep, setNodes]);
 

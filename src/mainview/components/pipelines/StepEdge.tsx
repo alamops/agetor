@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import {
   BaseEdge,
   EdgeLabelRenderer,
@@ -58,6 +58,23 @@ function StepEdgeImpl({
   const visual = data?.visual ?? "idle";
   const showLabelPill = !!(data?.label || (data?.onDelete && !data?.readOnly));
   const animateRef = useRef<SVGAnimateMotionElement>(null);
+  // Whether the token circle should actually be painted. `<animateMotion>`
+  // translates its target element ON TOP OF that element's own `cx`/`cy` —
+  // it does not reset it to the path's start — so seeding `cx`/`cy` at the
+  // edge's source point (the previous approach) double-offsets the circle
+  // once the motion begins, parking it near source+target instead of on
+  // the edge. The fix is to keep `cx`/`cy` at the origin (0, 0) — where
+  // `<animateMotion>` expects its target to start from — and drive
+  // visibility with plain React state instead of leaning on SMIL's
+  // `begin="<id>.begin"` syncbase (unreliable across engines for a
+  // programmatically-triggered `beginElement()`, per the SMIL spec note
+  // that event-value timing is sensitive to how the referenced timed
+  // element was started). `beginElement()` runs synchronously — the SMIL
+  // timeline is already ticking from the path's start point before the
+  // `setTokenVisible(true)` update below is even scheduled — so the
+  // circle's very first painted frame is already correctly positioned by
+  // the animation, never a static frame at (0, 0).
+  const [tokenVisible, setTokenVisible] = useState(false);
 
   // The token's `<animateMotion>` runs with `begin="indefinite"` (never
   // auto-starts) and is replayed imperatively via `beginElement()` whenever
@@ -65,8 +82,13 @@ function StepEdgeImpl({
   // edge (a cycle), which a `key`-based remount can't reliably replay for a
   // SMIL animation embedded in an SVG that itself never unmounts.
   useEffect(() => {
-    if (data?.token) animateRef.current?.beginElement();
-  }, [data?.tokenKey]);
+    if (data?.token) {
+      animateRef.current?.beginElement();
+      setTokenVisible(true);
+    } else {
+      setTokenVisible(false);
+    }
+  }, [data?.tokenKey, data?.token]);
 
   return (
     <>
@@ -84,11 +106,20 @@ function StepEdgeImpl({
         data-visual={visual}
       />
       {data?.token && (
-        // `cx`/`cy` seed the circle at the edge's own source point so it
-        // never flashes at the SVG origin (0,0) for the one frame before
-        // `beginElement()` (fired from the effect above) hands it off to
-        // `<animateMotion>`.
-        <circle cx={sourceX} cy={sourceY} r={5} className="fill-info" data-testid="pipeline-step-edge-token">
+        // `cx`/`cy` stay at the origin — `<animateMotion>` offsets FROM
+        // there, so this is the coordinate space the `path` above is
+        // already drawn in (starting at `sourceX`/`sourceY`). `opacity` is
+        // gated on `tokenVisible`, flipped only once `beginElement()` has
+        // already started the timeline (see the effect above), so this
+        // element is never painted sitting statically at (0,0).
+        <circle
+          cx={0}
+          cy={0}
+          r={5}
+          opacity={tokenVisible ? 1 : 0}
+          className="fill-info"
+          data-testid="pipeline-step-edge-token"
+        >
           <animateMotion ref={animateRef} begin="indefinite" dur="1.2s" repeatCount="1" fill="freeze" path={edgePath} />
         </circle>
       )}

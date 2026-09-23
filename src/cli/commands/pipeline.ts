@@ -242,7 +242,12 @@ interface AdvanceFlags {
  *  (repeatable), `--finish`, `--from <task-id>`. Exclusivity between
  *  `--next` and `--finish`, and requiring one of them, is checked by the
  *  caller (`cmdPipeline`'s "advance" case) since that needs a usage-error
- *  vs. a plain error distinction this pure parser has no business making. */
+ *  vs. a plain error distinction this pure parser has no business making.
+ *  An unrecognized flag DOES throw here (unlike `parseHarnessFlags`/
+ *  `parseAgentProfileFlags`, which silently ignore one per house
+ *  convention): a typo'd `--frmo` here would otherwise silently run
+ *  `advance` with none of the caller's intended args applied, against a
+ *  live pipeline run — worth a hard stop rather than a surprising no-op. */
 export function parseAdvanceFlags(args: string[]): AdvanceFlags {
   const f: AdvanceFlags = { next: [], finish: false };
   for (let i = 0; i < args.length; i++) {
@@ -250,6 +255,7 @@ export function parseAdvanceFlags(args: string[]): AdvanceFlags {
     if (a === "--next") f.next.push(flagValue(args, ++i, a));
     else if (a === "--finish") f.finish = true;
     else if (a === "--from") f.from = flagValue(args, ++i, a);
+    else throw usageError("pipeline advance");
   }
   return f;
 }
@@ -263,12 +269,16 @@ interface RetryFlags {
   from?: string;
 }
 
-/** Pure flag parser for `agetor pipeline retry` — just `--from <task-id>`. */
+/** Pure flag parser for `agetor pipeline retry` — just `--from <task-id>`.
+ *  An unrecognized flag throws (see `parseAdvanceFlags`'s doc for why this
+ *  pair departs from `parseHarnessFlags`/`parseAgentProfileFlags`'s
+ *  silently-ignore convention). */
 export function parseRetryFlags(args: string[]): RetryFlags {
   const f: RetryFlags = {};
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     if (a === "--from") f.from = flagValue(args, ++i, a);
+    else throw usageError("pipeline retry");
   }
   return f;
 }
@@ -309,9 +319,16 @@ export function resolveStepRef(graph: PipelineGraph, ref: string): string {
  * elsewhere in the CLI. Throws on an unknown or ambiguous reference, listing
  * every active execution's short task id plus its step name as candidates
  * so the error is actionable without a separate `pipeline status` call.
+ *
+ * An empty/whitespace-only ref is rejected outright rather than falling
+ * through to the prefix match below — `"".startsWith("")` (and
+ * `anything.startsWith("")`) is always true, so an accidentally-blank
+ * `--from ""` would otherwise match every active execution and "resolve" to
+ * the first one instead of erroring.
  */
 export function resolveActiveStepRef(run: PipelineRunState, ref: string): string {
   const trimmed = ref.trim();
+  if (!trimmed) throw new Error("--from requires a non-empty task id");
   const exact = run.active.find((a) => a.taskId === trimmed);
   if (exact) return exact.taskId;
 

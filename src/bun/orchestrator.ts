@@ -1202,6 +1202,23 @@ export function isTaskRunLive(taskId: string): boolean {
 }
 
 /**
+ * True when `taskId`'s current run has been stopped (`stopActiveHandle`
+ * flagged its `active` handle `cancelled`) but the handle hasn't been
+ * removed from `active` yet — the async window between `kill()` being
+ * called and the exit handler's `active.delete` actually running (see the
+ * "live-run check keys on `cancelled`, NOT on `active.has`" note near
+ * `enqueueArchiveTeardown`'s worktree-removal guard for the same window
+ * from the other side). A handle that's absent, or present but not
+ * cancelled, is not "cancelling" — it's either idle or a genuinely live run.
+ */
+export function isTaskRunCancelling(taskId: string): boolean {
+  const task = tasks.get(taskId);
+  if (!task?.runId) return false;
+  const handle = active.get(task.runId);
+  return !!handle?.cancelled;
+}
+
+/**
  * Start (or restart) a task's agent. Bounded per `SPAWN_RESPONSE_BUDGET_MS`
  * (see that constant's doc): once the run row exists, the task has flipped
  * to `running`, and the initial prompt has been echoed as a `user` event,

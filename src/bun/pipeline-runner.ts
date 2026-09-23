@@ -36,6 +36,7 @@ import {
   cancelRun,
   defaultEffortFor,
   deleteTask,
+  isTaskRunCancelling,
   isTaskRunLive,
   pipelineUpdateColumn,
   publishGlobalEvent,
@@ -66,6 +67,7 @@ import type {
   GlobalEvent,
   Handoff,
   Pipeline,
+  PipelineActiveStep,
   PipelineBlock,
   PipelineBlockKind,
   PipelineGraph,
@@ -701,12 +703,21 @@ async function launchStep(
  * resolve to more than one next step from a single settle or manual advance
  * (a `transition: "all"` fan-out, several hand-picked `advancePipeline`
  * targets, or a join that just completed alongside other targets in the
- * same batch). A throw is recorded as a run-level `step-failed` block
- * carrying `pending`, so Retry can re-attempt just that one target — the
- * other targets in the batch, already launched or about to be, are
- * unaffected. Return value is intentionally discarded by callers (same as
- * calling `launchStep` directly in a loop) — its effect is entirely via
- * mutating `run`.
+ * same batch), and by `retryPendingBlocks` (Minor 7) for the exact same
+ * throw-safety. Distinguishes WHERE the throw landed (Minor 6): if
+ * `launchStep` had already inserted the step task (visible as a new entry
+ * in `run.active` for `step.id` that wasn't there before this call), the
+ * block is recorded against THAT task (`taskId: <inserted>`, no `pending`)
+ * so Retry re-runs the already-inserted execution in place instead of
+ * inserting a duplicate one on top of it; a throw before the insert instead
+ * keeps the old run-level `pending` block (Retry re-attempts the same
+ * launch from scratch), and — since `launchStep` bumps `run.stepCount`
+ * before it ever reaches the insert — rolls that increment back so a
+ * pre-insert throw can never leave the step-cap accounting inflated by a
+ * step that was never actually created. Returns `launchStep`'s own result
+ * on success (used by `retryPendingBlocks` to report the first successful
+ * launch); most callers discard it, same as calling `launchStep` directly
+ * in a loop.
  */
 async function launchTarget(
   parent: Task,
@@ -714,21 +725,35 @@ async function launchTarget(
   step: PipelineStep,
   previous: { stepId: string; seq: number; handoff: Handoff | null }[],
   opts?: { batchSiblingStepIds?: string[]; skipWorktreeRefresh?: boolean },
-): Promise<void> {
+): Promise<LaunchResult> {
+  const activeIdsBefore = new Set(run.active.map((a) => a.taskId));
+  const stepCountBefore = run.stepCount;
   try {
-    await launchStep(parent, run, step, previous, opts);
+    return await launchStep(parent, run, step, previous, opts);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    upsertBlocked(run, {
-      taskId: null,
-      stepId: step.id,
-      kind: "step-failed",
-      message: `step "${step.name}" failed to launch: ${message}`,
-      pending: {
+    const inserted = run.active.find((a) => a.stepId === step.id && !activeIdsBefore.has(a.taskId));
+    if (inserted) {
+      upsertBlocked(run, {
+        taskId: inserted.taskId,
         stepId: step.id,
-        arrivals: previous.map((p) => ({ fromStepId: p.stepId, seq: p.seq, handoff: p.handoff })),
-      },
-    });
+        kind: "step-failed",
+        message: `step "${step.name}" failed to launch: ${message}`,
+      });
+    } else {
+      if (run.stepCount > stepCountBefore) run.stepCount = stepCountBefore;
+      upsertBlocked(run, {
+        taskId: null,
+        stepId: step.id,
+        kind: "step-failed",
+        message: `step "${step.name}" failed to launch: ${message}`,
+        pending: {
+          stepId: step.id,
+          arrivals: previous.map((p) => ({ fromStepId: p.stepId, seq: p.seq, handoff: p.handoff })),
+        },
+      });
+    }
+    return { ok: false };
   }
 }
 
@@ -743,13 +768,24 @@ async function retryActiveExecutions(
   onlyTaskId?: string,
 ): Promise<{ runId: string; pending?: true } | { error: string }> {
   const targets = run.active.filter((a) => {
-    if (onlyTaskId && a.taskId !== onlyTaskId) return false;
     // M5: never re-`startTask` an execution whose task is genuinely still
     // live (a fan-out with one branch blocked and another still mid-turn,
     // or a spawn still settling) — `isTaskRunLive` is the authoritative
     // "is this actually busy right now" check, not `column === "running"`,
     // which can lag a beat behind a just-started/just-settled spawn.
-    return !isTaskRunLive(a.taskId);
+    if (isTaskRunLive(a.taskId)) return false;
+    if (onlyTaskId) return a.taskId === onlyTaskId;
+    // Minor 9: an un-targeted, RUN-LEVEL retry (no `onlyTaskId`) only
+    // touches an execution that's actually stuck — one carrying its own
+    // blocked entry, or whose latest history outcome recorded a failure or
+    // a cancellation — never one quietly sitting in `review` awaiting a
+    // human's manual Advance decision (no block, no failed/cancelled
+    // outcome — there's nothing broken to retry). A specific `onlyTaskId`
+    // retry (the per-step Retry button) is unaffected by this and still
+    // fires on the named execution unconditionally, as before.
+    if (run.blocked.some((b) => b.taskId === a.taskId)) return true;
+    const historyEntry = run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq);
+    return historyEntry?.outcome === "failed" || historyEntry?.outcome === "cancelled";
   });
   if (targets.length === 0) return { error: "nothing to retry" };
 
@@ -819,8 +855,10 @@ async function retryPendingBlocks(
     const previous = pending.arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }));
     // Minor 15: `parent` here was already freshly refreshed once by this
     // call's sole caller, `performPipelineRetry` — skip `launchStep`'s own
-    // redundant per-call refresh.
-    const launched = await launchStep(parent, run, step, previous, { skipWorktreeRefresh: true });
+    // redundant per-call refresh. Minor 7: go through `launchTarget`, not
+    // `launchStep` directly, so a throw here is caught into a retryable
+    // block instead of aborting the rest of this pending-block sweep.
+    const launched = await launchTarget(parent, run, step, previous, { skipWorktreeRefresh: true });
     if (launched.ok && !first) first = { runId: launched.runId, ...(launched.pending ? { pending: true as const } : {}) };
   }
   return first;
@@ -840,6 +878,12 @@ async function performPipelineRetry(
   run: PipelineRunState,
   onlyTaskId?: string,
 ): Promise<{ runId: string; pending?: true } | { error: string }> {
+  // Minor 5: a delete cascade tombstones the parent (and removes its row)
+  // before tearing down any step task — a retry racing in through this same
+  // per-parent lock must bail before ever touching the worktree.
+  if (tombstonedPipelineParents.has(parent.id) || !tasks.get(parent.id)) {
+    return { error: "pipeline task no longer exists" };
+  }
   if (parent.archivedAt != null) {
     return { error: "pipeline task is archived — unarchive it first" };
   }
@@ -890,6 +934,12 @@ export async function startPipelineRun(
   opts?: { restart?: boolean },
 ): Promise<{ runId: string; pending?: true } | { error: string }> {
   return runExclusive(parent.id, async () => {
+    // Minor 5: a delete cascade tombstones the parent (and removes its row)
+    // before tearing down any step task — a start/restart racing in through
+    // this same per-parent lock must bail before touching the worktree.
+    if (tombstonedPipelineParents.has(parent.id) || !tasks.get(parent.id)) {
+      return { error: "pipeline task no longer exists" };
+    }
     const fresh = tasks.get(parent.id) ?? parent;
     if (!fresh.pipelineId) return { error: "not a pipeline task" };
     if (fresh.archivedAt != null) return { error: "pipeline task is archived — unarchive it first" };
@@ -910,32 +960,31 @@ export async function startPipelineRun(
 
     if (run.status === "running") return { error: "pipeline is already running" };
 
-    if (opts?.restart) {
-      // Major 3: `restart` means "fresh run from the start step," for ANY
-      // non-running status — blocked, cancelled, done, or even idle (a
-      // harmless no-op request in that last case, since idle already falls
-      // through to the very same fresh-run code below with nothing to
-      // cancel). This used to only take effect for `done`; a restart
-      // requested on a blocked/cancelled run fell into the M2 retry-in-place
-      // branch below instead and silently became a retry, not a restart.
-      // Cancel whatever's still genuinely live first (best-effort — a step
-      // whose turn is mid-flight has nothing useful to hand off to a fresh
-      // run that's about to discard this run's history anyway).
-      for (const a of run.active) {
-        if (!isTaskRunLive(a.taskId)) continue;
-        const stepRunId = tasks.get(a.taskId)?.runId;
-        if (stepRunId) await cancelRun(stepRunId);
+    // Major 3 / Minor 3: `restart` means "fresh run from the start step,"
+    // for ANY non-running status — blocked, cancelled, done, or even idle (a
+    // harmless no-op request in that last case, since idle already falls
+    // through to the very same fresh-run code below with nothing to
+    // cancel). This used to only take effect for `done`; a restart requested
+    // on a blocked/cancelled run fell into the M2 retry-in-place branch
+    // below instead and silently became a retry, not a restart. Whatever's
+    // still genuinely live from the run being replaced is cancelled further
+    // down — only once the fresh run has been validated as startable
+    // (Minor 3: a restart that turns out to fail — invalid graph, missing
+    // profile, worktree failure — must never have killed the still-live
+    // executions it would have replaced).
+    const restartTargets: PipelineActiveStep[] = opts?.restart ? run.active.slice() : [];
+    if (!opts?.restart) {
+      if (run.status === "blocked" || run.status === "cancelled") {
+        // M2: absent an explicit restart, blocked/cancelled is ALWAYS a
+        // retry-in-place, whether or not anything is currently sitting in
+        // `run.active` — a run-level pending block (step-cap,
+        // profile-missing, join-incomplete) with zero active executions used
+        // to fall through to the "fresh run" branch below, silently
+        // discarding history and re-snapshotting from scratch.
+        return performPipelineRetry(fresh, run);
+      } else if (run.status === "done") {
+        return { error: "pipeline already finished — restart it explicitly" };
       }
-    } else if (run.status === "blocked" || run.status === "cancelled") {
-      // M2: absent an explicit restart, blocked/cancelled is ALWAYS a
-      // retry-in-place, whether or not anything is currently sitting in
-      // `run.active` — a run-level pending block (step-cap, profile-missing,
-      // join-incomplete) with zero active executions used to fall through
-      // to the "fresh run" branch below, silently discarding history and
-      // re-snapshotting from scratch.
-      return performPipelineRetry(fresh, run);
-    } else if (run.status === "done") {
-      return { error: "pipeline already finished — restart it explicitly" };
     }
 
     // Fresh run (idle, or an explicit restart of any other status):
@@ -968,6 +1017,28 @@ export async function startPipelineRun(
     const startStep = resolveStartStep(snapshot.graph);
     if (!startStep) return { error: "pipeline has no resolvable start step" };
 
+    // Materialize the shared worktree ONCE, here — every step task inserted
+    // below copies `branch`/`worktreePath`/`baseRef` straight from the
+    // parent, so `prepareWorkdir` on each step hits the reuse branch with no
+    // further git calls (D2). `launchStep` re-verifies this itself too
+    // (M6), but doing it up front also lets us flip the parent to `running`
+    // before the first step lands.
+    const prepared = await refreshParentWorktree(fresh);
+    if ("error" in prepared) return { error: prepared.error };
+    let parentRow = prepared.parent;
+
+    // Minor 3: only now — graph validated, snapshot built, start step
+    // resolved, worktree prepared, so this restart is known startable —
+    // cancel whatever was still genuinely live from the run being replaced
+    // (best-effort: a step whose turn is mid-flight has nothing useful to
+    // hand off to a fresh run that's about to discard this run's history
+    // anyway).
+    for (const a of restartTargets) {
+      if (!isTaskRunLive(a.taskId)) continue;
+      const stepRunId = tasks.get(a.taskId)?.runId;
+      if (stepRunId) await cancelRun(stepRunId);
+    }
+
     run = {
       pipelineId: fresh.pipelineId,
       pipelineName: pipeline?.name ?? run.pipelineName,
@@ -981,16 +1052,6 @@ export async function startPipelineRun(
       startedAt: Date.now(),
       endedAt: null,
     };
-
-    // Materialize the shared worktree ONCE, here — every step task inserted
-    // below copies `branch`/`worktreePath`/`baseRef` straight from the
-    // parent, so `prepareWorkdir` on each step hits the reuse branch with no
-    // further git calls (D2). `launchStep` re-verifies this itself too
-    // (M6), but doing it up front also lets us flip the parent to `running`
-    // before the first step lands.
-    const prepared = await refreshParentWorktree(fresh);
-    if ("error" in prepared) return { error: prepared.error };
-    let parentRow = prepared.parent;
 
     pipelineUpdateColumn(parentRow.id, null, "running");
     parentRow = tasks.get(parentRow.id) ?? parentRow;
@@ -1027,6 +1088,12 @@ export async function advancePipeline(
   return runExclusive(parentId, async () => {
     const parent = tasks.get(parentId);
     if (!parent || !parent.pipelineId) return { error: "not a pipeline task", status: 404 as const };
+    // Minor 5: a delete cascade tombstones the parent before tearing down
+    // any step task — an advance racing in through this same per-parent
+    // lock must bail before ever touching the worktree.
+    if (tombstonedPipelineParents.has(parentId)) {
+      return { error: "pipeline task no longer exists", status: 404 as const };
+    }
     if (parent.archivedAt != null) {
       return { error: "pipeline task is archived — unarchive it first", status: 409 as const };
     }
@@ -1054,9 +1121,22 @@ export async function advancePipeline(
       // valid) handoff is recorded as a `step-blocked` entry WITH a taskId —
       // fold it into the same auto-detect set as an unparsable handoff, so
       // a lone blocked-on-handoff execution resolves the same way regardless
-      // of which of the three reasons produced it.
+      // of which of the three reasons produced it. Minor 8: a task-level
+      // `step-failed` block (a step that failed its own turn, was stopped
+      // while a fan-out sibling kept going, or hit a post-insert launch
+      // throw) is folded in too, but ONLY once its task genuinely isn't
+      // live any more — a `step-failed` block can in principle name a task
+      // whose replacement turn is already running again (Retry re-sends,
+      // the block just hasn't been cleared yet), and hand-picking a next
+      // step for THAT would race the same turn `advancePipeline`'s own M4
+      // check below refuses for an explicit `fromTaskId`.
       const handoffBlocks = run.blocked.filter(
-        (b) => b.taskId !== null && (b.kind === "handoff-missing" || b.kind === "handoff-invalid" || b.kind === "step-blocked"),
+        (b) =>
+          b.taskId !== null &&
+          (b.kind === "handoff-missing" ||
+            b.kind === "handoff-invalid" ||
+            b.kind === "step-blocked" ||
+            (b.kind === "step-failed" && !isTaskRunLive(b.taskId))),
       );
       const joinBlocks = run.blocked.filter((b) => b.taskId === null && b.kind === "join-incomplete");
       if (handoffBlocks.length === 1 && joinBlocks.length === 0) {
@@ -1375,6 +1455,13 @@ async function handleRunStatus(
         // recorded as a retryable pending hold instead of launched.
         const parentForLaunch = tasks.get(parentId) ?? parent;
         const parentArchived = parentForLaunch.archivedAt != null;
+        // Minor 5: same tombstone/existence guard as every other locked body
+        // that refreshes the worktree — a delete cascade racing in through
+        // this same per-parent lock must never have this settle's batch
+        // refresh touch the worktree (`launchStep`/`launchTarget` below
+        // still bail on this independently, this just skips the redundant
+        // refresh call).
+        const parentGone = tombstonedPipelineParents.has(parentId) || !tasks.get(parentId);
         // Minor 15: refresh the shared worktree ONCE for this whole batch (a
         // fan-out can resolve several next steps from one settle) instead of
         // once per `launchStep` call — a failed batch refresh here just
@@ -1382,7 +1469,7 @@ async function handleRunStatus(
         // per-target error handling) for every target in the loop below.
         let batchParent = parentForLaunch;
         let worktreeReady = false;
-        if (!parentArchived && nextStepIds.length > 0) {
+        if (!parentArchived && !parentGone && nextStepIds.length > 0) {
           const refreshedBatch = await refreshParentWorktree(parentForLaunch);
           if (!("error" in refreshedBatch)) {
             batchParent = refreshedBatch.parent;
@@ -1467,18 +1554,33 @@ async function handleRunStatus(
         historyEntry.endedAt = Date.now();
         historyEntry.outcome = "cancelled";
       }
-      const otherLive = run.active.some((a) => a.taskId !== taskId && isTaskRunLive(a.taskId));
-      if (otherLive) {
+      const stillLiveSiblings = run.active.filter((a) => a.taskId !== taskId && isTaskRunLive(a.taskId));
+      // Major 1 (round 3): a WHOLE-pipeline Stop on a fan-out must end
+      // `cancelled`, not `blocked` — `cancelPipelineRun` sends the cancel
+      // signal to every live sibling and forces `run.status = "cancelled"`
+      // (via `finalizeCancelled`) BEFORE any of those siblings' own settle
+      // events actually arrive here, so `run.status === "cancelled"` on
+      // entry is the signal that THIS settle is part of a deliberate
+      // whole-run stop, not an isolated one-step Stop. The same holds when
+      // every other still-live sibling is itself mid-cancellation
+      // (`isTaskRunCancelling`) — e.g. each active execution was cancelled
+      // individually rather than through `cancelPipelineRun` — since none of
+      // them is a normally-running sibling this execution would otherwise
+      // need to wait on.
+      const deliberateWholeRunStop =
+        run.status === "cancelled" ||
+        (stillLiveSiblings.length > 0 && stillLiveSiblings.every((a) => isTaskRunCancelling(a.taskId)));
+      if (stillLiveSiblings.length > 0 && !deliberateWholeRunStop) {
         // Major 1: this execution stopped (or orphaned) but a SIBLING is
-        // still genuinely running — the whole run must not silently read as
-        // `running` with a dead-end execution sitting in `active` with no
-        // block to surface it (`deriveRunStatus` would otherwise see
-        // `blocked.length === 0` and `active.length > 0` and call it
-        // `running`, forever, since nothing is ever going to advance this
-        // execution on its own again). Record a retryable block for it now,
-        // so `deriveRunStatus` reads `blocked` immediately — and still reads
-        // `blocked` once the sibling finishes too, since this block is
-        // still sitting there.
+        // still genuinely running normally — the whole run must not
+        // silently read as `running` with a dead-end execution sitting in
+        // `active` with no block to surface it (`deriveRunStatus` would
+        // otherwise see `blocked.length === 0` and `active.length > 0` and
+        // call it `running`, forever, since nothing is ever going to
+        // advance this execution on its own again). Record a retryable
+        // block for it now, so `deriveRunStatus` reads `blocked`
+        // immediately — and still reads `blocked` once the sibling finishes
+        // too, since this block is still sitting there.
         upsertBlocked(run, {
           taskId,
           stepId: activeEntry.stepId,
@@ -1487,6 +1589,10 @@ async function handleRunStatus(
         });
         persist(parentId, run);
       } else {
+        // Either nothing else is live, or every other live sibling is also
+        // being deliberately stopped as part of the same whole-run Stop —
+        // either way this settle must never add a "was stopped" block of
+        // its own; `finalizeCancelled` (idempotent) is the whole story.
         finalizeCancelled(parentId, run);
       }
     } catch (err) {

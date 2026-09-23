@@ -72,8 +72,16 @@ const RETRY_BLOCK_KINDS: PipelineBlockKind[] = [
 ];
 /** Block kinds Advance can resolve by manually picking (or skipping) the
  *  next step(s) — a missing/invalid handoff, an incomplete join the user
- *  wants to force past, or a step reported as blocked. */
-const ADVANCE_BLOCK_KINDS: PipelineBlockKind[] = ["handoff-missing", "handoff-invalid", "join-incomplete", "step-blocked"];
+ *  wants to force past, a step reported as blocked, or (for a task-level
+ *  block, `taskId != null`) a step that was stopped — Advance lets the
+ *  user skip past it instead of only retrying the same step. */
+const ADVANCE_BLOCK_KINDS: PipelineBlockKind[] = [
+  "handoff-missing",
+  "handoff-invalid",
+  "join-incomplete",
+  "step-blocked",
+  "step-failed",
+];
 
 interface PipelineRunViewProps {
   taskId: string;
@@ -668,7 +676,8 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
                           </Button>
                         )}
                       </div>
-                      {ADVANCE_BLOCK_KINDS.includes(entry.kind) && (
+                      {ADVANCE_BLOCK_KINDS.includes(entry.kind) &&
+                        (entry.kind !== "step-failed" || entry.taskId != null) && (
                         <AdvanceForm
                           candidates={candidates}
                           busy={actionBusy}

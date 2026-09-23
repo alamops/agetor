@@ -606,6 +606,19 @@ test("resolveActiveStepRef: no active executions at all reports '(no active exec
   expect(() => resolveActiveStepRef(run, "nope")).toThrow(/\(no active executions\)/);
 });
 
+test("resolveActiveStepRef: an empty or whitespace-only ref is rejected outright, not matched against everything", () => {
+  // `"anything".startsWith("")` is always true, so a blank `--from ""` must
+  // not silently "resolve" to the first active execution.
+  const run = pipelineRun({
+    active: [
+      { stepId: "s1", taskId: "step-task-aaa111", seq: 1 },
+      { stepId: "s2", taskId: "step-task-aaa222", seq: 2 },
+    ],
+  });
+  expect(() => resolveActiveStepRef(run, "")).toThrow(/non-empty task id/);
+  expect(() => resolveActiveStepRef(run, "   ")).toThrow(/non-empty task id/);
+});
+
 // ── parseAdvanceFlags ────────────────────────────────────────────────────
 
 test("parseAdvanceFlags: --next is repeatable", () => {
@@ -627,6 +640,11 @@ test("parseAdvanceFlags: no flags -> empty next, finish false, from undefined", 
   expect(parseAdvanceFlags([])).toEqual({ next: [], finish: false });
 });
 
+test("parseAdvanceFlags: an unknown flag throws the pipeline-advance usage error, instead of being silently ignored", () => {
+  expect(() => parseAdvanceFlags(["--frmo", "step-task-1"])).toThrow(/usage: agetor pipeline advance/);
+  expect(() => parseAdvanceFlags(["--next", "Fix", "--bogus"])).toThrow(/usage: agetor pipeline advance/);
+});
+
 // ── parseRetryFlags ──────────────────────────────────────────────────────
 
 test("parseRetryFlags: --from <task-id>", () => {
@@ -635,6 +653,10 @@ test("parseRetryFlags: --from <task-id>", () => {
 
 test("parseRetryFlags: no flags -> from undefined", () => {
   expect(parseRetryFlags([])).toEqual({});
+});
+
+test("parseRetryFlags: an unknown flag throws the pipeline-retry usage error, instead of being silently ignored", () => {
+  expect(() => parseRetryFlags(["--bogus"])).toThrow(/usage: agetor pipeline retry/);
 });
 
 // ── pipelineStatusLines ──────────────────────────────────────────────────

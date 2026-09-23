@@ -1916,6 +1916,26 @@ type PipelineRow = {
  *  makes for a run's frozen snapshot, for a different reason — this one is
  *  "don't destroy data", not "don't re-validate a graph that already
  *  validated once". */
+
+/** Minimal shape check for one `PipelineGraph.steps` entry — a plain object
+ *  with a string `id` and a `position` that's a plain object with numeric
+ *  `x`/`y`. Anything else (a bare string, `null`, a step missing `position`,
+ *  a `position` with non-numeric coordinates) is unsafe to hand to the
+ *  pipeline editor or the step-resolution helpers, which index into both
+ *  fields unconditionally. */
+const isShapeSafePipelineStep = (x: unknown): boolean => {
+  if (!isPlainObject(x)) return false;
+  if (typeof x.id !== "string") return false;
+  const pos = x.position;
+  if (!isPlainObject(pos)) return false;
+  return isFiniteNumber(pos.x) && isFiniteNumber(pos.y);
+};
+
+/** Minimal shape check for one `PipelineGraph.edges` entry — a plain object
+ *  with string `from`/`to`. */
+const isShapeSafePipelineEdge = (x: unknown): boolean =>
+  isPlainObject(x) && typeof x.from === "string" && typeof x.to === "string";
+
 const parsePipelineGraph = (raw: string): PipelineGraph => {
   let parsed: unknown;
   try {
@@ -1930,7 +1950,13 @@ const parsePipelineGraph = (raw: string): PipelineGraph => {
   if (isPlainObject(parsed)) {
     const rec = parsed as Record<string, unknown>;
     const startStepIdOk = rec.startStepId === undefined || rec.startStepId === null || typeof rec.startStepId === "string";
-    if (Array.isArray(rec.steps) && Array.isArray(rec.edges) && startStepIdOk) {
+    if (
+      Array.isArray(rec.steps) &&
+      Array.isArray(rec.edges) &&
+      startStepIdOk &&
+      rec.steps.every(isShapeSafePipelineStep) &&
+      rec.edges.every(isShapeSafePipelineEdge)
+    ) {
       return parsed as unknown as PipelineGraph;
     }
   }

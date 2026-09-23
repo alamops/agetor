@@ -1415,3 +1415,93 @@ test("Major 5: an invalid stored pipeline graph is rejected at run start, never 
   expect(after.pipelineRun?.status ?? "idle").toBe("idle");
   expect(tasks.stepsForParent(parentId).length).toBe(0);
 });
+
+// Round-3 review-fix regression coverage (Major 1, Minor 3/5/6/7/8/9)
+
+test("Major 1 (round 3): a WHOLE-pipeline Stop on a fan-out ends cancelled — not blocked — with no \"was stopped\" entries; retry then finishes it", async () => {
+  process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = "700";
+  try {
+    const { createTask, startTask } = await import("./orchestrator.ts");
+    const { tasks, pipelines } = await import("./db.ts");
+    const { newStep } = await import("../shared/pipeline.ts");
+    const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+    const { cancelPipelineRun, retryPipelineStep } = await import("./pipeline-runner.ts");
+
+    const profile = await makeProfile("whole-run-stop");
+    const A = newStep({ name: "A", agentProfileId: profile.id, transition: "all", instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+    const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+    const C = newStep({ name: "C", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+    const graph = {
+      steps: [A, B, C],
+      edges: [
+        { id: "e1", from: A.id, to: B.id, label: "" },
+        { id: "e2", from: A.id, to: C.id, label: "" },
+      ],
+      startStepId: A.id,
+    };
+    const pipeline = pipelines.insert({ name: uniqueName("whole-run-stop-pipeline"), graph, maxSteps: 25 });
+
+    const created = await createTask({ title: "whole-run-stop run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+    if ("error" in created) throw new Error(created.error);
+    const parentId = created.task.id;
+    liveParentIds.push(parentId);
+    const started = await startTask(parentId);
+    if ("error" in started) throw new Error(started.error);
+
+    await waitFor(() => {
+      const steps = tasks.stepsForParent(parentId).filter((s) => s.pipelineStepId !== A.id);
+      return steps.length === 2 && steps.every((s) => s.column === "running") ? steps : undefined;
+    }, 8000);
+
+    // Stop the WHOLE pipeline (not one step's own panel) while both B and C
+    // are still genuinely live.
+    const cancelled = await cancelPipelineRun(parentId);
+    if ("error" in cancelled) throw new Error(cancelled.error);
+
+    const afterCancel = await waitFor(() => {
+      const t = tasks.get(parentId);
+      return t?.pipelineRun?.status === "cancelled" ? t : undefined;
+    });
+    expect(afterCancel.column).toBe("ready");
+    expect(afterCancel.pipelineRun!.active.length).toBe(2);
+    expect(afterCancel.pipelineRun!.blocked.length).toBe(0);
+
+    // Wait for BOTH B's and C's own async settle events (dispatched via the
+    // run-status listener, genuinely concurrent with `cancelPipelineRun`
+    // itself having already forced `status: "cancelled"`) to land. Neither
+    // must ever add a "was stopped" step-failed block — that's exactly the
+    // bug: a deliberate whole-run Stop must never end up reading `blocked`.
+    const bothSettled = await waitFor(() => {
+      const t = tasks.get(parentId);
+      const run = t?.pipelineRun;
+      if (!run) return undefined;
+      const bDone = run.history.some((h) => h.stepId === B.id && h.outcome === "cancelled");
+      const cDone = run.history.some((h) => h.stepId === C.id && h.outcome === "cancelled");
+      return bDone && cDone ? t : undefined;
+    }, 8000);
+    expect(bothSettled.pipelineRun!.status).toBe("cancelled");
+    expect(bothSettled.column).toBe("ready");
+    expect(bothSettled.pipelineRun!.blocked.length).toBe(0);
+
+    // Retry brings both stopped executions back and the run finishes.
+    const retried = await retryPipelineStep(parentId);
+    if ("error" in retried) throw new Error(retried.error);
+
+    const runningAgain = await waitFor(() => {
+      const t = tasks.get(parentId);
+      return t?.pipelineRun?.status === "running" ? t : undefined;
+    }, 8000);
+    expect(runningAgain.pipelineRun!.active.length).toBe(2);
+    // Retry re-ran the SAME two step tasks, never inserted duplicates.
+    expect(tasks.stepsForParent(parentId).length).toBe(3);
+
+    const finished = await waitFor(() => {
+      const t = tasks.get(parentId);
+      return t?.pipelineRun?.status === "done" ? t : undefined;
+    }, 8000);
+    expect(finished.column).toBe("review");
+    await waitUntilIdle(parentId);
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
+  }
+});

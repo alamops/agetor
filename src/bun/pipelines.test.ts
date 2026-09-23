@@ -195,7 +195,19 @@ test("pipelines.get(): a stored graph that parses but fails validatePipelineGrap
   // longer accepts. Written directly via SQL, bypassing pipelines.update's
   // own validation, to simulate exactly that.
   const p = pipelines.insert({ name: "Drifted Graph", graph: makeGraph() });
-  const dupNameGraph = { steps: [{ id: "s1", name: "Dup" }, { id: "s2", name: "dup" }], edges: [], startStepId: null } as unknown as PipelineGraph;
+  // Steps still need a shape-safe `position` (string `id` + numeric x/y) —
+  // that's the minimal-shape bar `parsePipelineGraph` enforces regardless of
+  // whether the graph passes full semantic validation — but the duplicate
+  // step names below still fail `validatePipelineGraph`, which is the case
+  // this test is about: returned unmodified, not collapsed to empty.
+  const dupNameGraph = {
+    steps: [
+      { id: "s1", name: "Dup", position: { x: 0, y: 0 } },
+      { id: "s2", name: "dup", position: { x: 10, y: 20 } },
+    ],
+    edges: [],
+    startStepId: null,
+  } as unknown as PipelineGraph;
   db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify(dupNameGraph), p.id]);
 
   // Returned AS-IS rather than collapsed to the empty graph: the editor
@@ -233,6 +245,54 @@ test("pipelines.get(): a stored value that fails validatePipelineGraph AND isn't
   // undefined.
   db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify({ steps: [], edges: [], startStepId: 42 }), p.id]);
   expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+});
+
+test("pipelines.get(): a step/edge that isn't shape-safe on its own also collapses the whole graph to empty, not returned as-is", () => {
+  // Arrays present and `startStepId` is fine, but an individual step/edge
+  // entry is missing what the editor and step-resolution helpers index into
+  // unconditionally (`id`/`position.x`/`position.y` for a step, `from`/`to`
+  // for an edge) — this is stricter than "steps/edges are arrays" and is
+  // what keeps a single corrupt entry from reaching the editor.
+  const p = pipelines.insert({ name: "Unsafe Entry Graph", graph: makeGraph() });
+
+  // A null entry in `steps`.
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify({ steps: [null], edges: [], startStepId: null }), p.id]);
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // A step that's a plain object but missing `id`/`position` entirely.
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify({ steps: [{}], edges: [], startStepId: null }), p.id]);
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // A step with a string id but a non-object `position`.
+  db.run(
+    `UPDATE pipelines SET graph = ? WHERE id = ?`,
+    [JSON.stringify({ steps: [{ id: "s1", position: "nope" }], edges: [], startStepId: null }), p.id],
+  );
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // A step with a `position` whose x/y aren't numbers.
+  db.run(
+    `UPDATE pipelines SET graph = ? WHERE id = ?`,
+    [JSON.stringify({ steps: [{ id: "s1", position: { x: "0", y: 0 } }], edges: [], startStepId: null }), p.id],
+  );
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // An edge missing `to`.
+  db.run(
+    `UPDATE pipelines SET graph = ? WHERE id = ?`,
+    [JSON.stringify({ steps: [], edges: [{ id: "e1", from: "s1" }], startStepId: null }), p.id],
+  );
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // A step that IS shape-safe still returns as-is (sanity check that the
+  // stricter guard doesn't over-reject a valid-shaped, semantically-fine
+  // entry — this graph has no duplicate names or other validation issue, so
+  // it round-trips through `validatePipelineGraph` successfully instead of
+  // hitting the as-is fallback at all).
+  const safe = { steps: [{ id: "s1", name: "Solo", position: { x: 5, y: 5 } }], edges: [], startStepId: "s1" } as unknown as PipelineGraph;
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify(safe), p.id]);
+  expect(pipelines.get(p.id)?.graph.steps).toHaveLength(1);
+  expect(pipelines.get(p.id)?.graph.steps[0]?.id).toBe("s1");
 });
 
 test("insert normalizes the graph, filling defaults for omitted step fields", () => {
