@@ -851,6 +851,17 @@ describe("parseCloneProgress", () => {
       "Receiving objects: 100% (60003/60003), 2.67 MiB | 40.26 MiB/s, done.",
       { phase: "receiving", percent: 100 },
     ],
+    // git's `strbuf_humanise_rate` prints a sub-KiB/s transfer as `bytes/s`
+    // (and a sub-KiB total as `bytes`) — a slow clone must still count as
+    // progress, not fall through to the error text.
+    [
+      "Receiving objects:  42% (12/28), 3.10 KiB | 512 bytes/s",
+      { phase: "receiving", percent: 42 },
+    ],
+    [
+      "Receiving objects: 100% (3/3), 215 bytes | 215.00 KiB/s, done.",
+      { phase: "receiving", percent: 100 },
+    ],
     ["Resolving deltas:   0% (0/664)", { phase: "resolving", percent: 0 }],
     ["Resolving deltas:  10% (67/664)", { phase: "resolving", percent: 10 }],
     ["Resolving deltas: 100% (664/664)", { phase: "resolving", percent: 100 }],
@@ -1686,6 +1697,35 @@ describe("cloneRepo", () => {
     } finally {
       if (original === undefined) delete process.env.GIT_SSH_COMMAND;
       else process.env.GIT_SSH_COMMAND = original;
+    }
+  }, 15_000);
+
+  test("a configured GIT_ASKPASS helper is never invoked — an empty GIT_ASKPASS disables the askpass lookup on every attempt", async () => {
+    // `GIT_TERMINAL_PROMPT=0` alone only silences the tty prompt: git consults
+    // `GIT_ASKPASS` / `core.askPass` / `SSH_ASKPASS` BEFORE the terminal, so an
+    // inherited helper could pop a GUI dialog or block the daemon on the
+    // anonymous attempt. `runGitClone` sets `GIT_ASKPASS=""`, which git treats
+    // as "askpass disabled" (a set-but-empty value wins over `core.askPass`).
+    const stubDir = mkdtempSync(path.join(tmpdir(), "agetor-clone-askpass-"));
+    const marker = path.join(stubDir, "invoked");
+    const askpass = path.join(stubDir, "fake-askpass.sh");
+    writeFileSync(askpass, `#!/bin/sh\ntouch "${marker}"\necho nope\n`, { mode: 0o755 });
+    const root = mkdtempSync(path.join(tmpdir(), "agetor-clone-askpass-repo-"));
+    makeBareSourceRepo(root);
+    const server = startAuthGitServer(root, { requireAuth: basicAuthValue("x-access-token:good-tok") });
+    const original = process.env.GIT_ASKPASS;
+    process.env.GIT_ASKPASS = askpass;
+    try {
+      const dest = path.join(dir, "askpass-never-invoked");
+      const result = await cloneRepo(`${server.url}/repo.git`, dest, { transport: "https", host: "127.0.0.1" });
+      expect(result.ok).toBe(false);
+      // The 401 was answered by git failing fast, not by prompting our helper.
+      expect(existsSync(marker)).toBe(false);
+      expect(result.error).toContain("clone failed:");
+    } finally {
+      if (original === undefined) delete process.env.GIT_ASKPASS;
+      else process.env.GIT_ASKPASS = original;
+      server.stop();
     }
   }, 15_000);
 

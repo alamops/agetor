@@ -812,9 +812,12 @@ const CLONE_PROGRESS_ENUMERATING_RE = /^remote: Enumerating objects:\s*\d+(?:,\s
 const CLONE_PROGRESS_DONE_SUFFIX = String.raw`(?:,\s*done\.?)?\s*$`;
 const CLONE_PROGRESS_COUNT_SUFFIX = String.raw`(?:\s*\(\d+\/\d+\))?`;
 /** `, 2.67 MiB | 40.26 MiB/s` — the throughput suffix git appends only to
- *  `Receiving objects` (a raw byte/rate pair; `KMGT` size prefix and the
- *  `iB`/`bytes` unit are the two real shapes captured live). */
-const CLONE_PROGRESS_THROUGHPUT_SUFFIX = String.raw`(?:,\s*[\d.]+\s*(?:[KMGT]iB|bytes)(?:\s*\|\s*[\d.]+\s*[KMGT]iB\/s)?)?`;
+ *  `Receiving objects` (a raw byte/rate pair). Both halves take the same
+ *  unit set — a `KMGT`-prefixed `iB` or plain `bytes` — because git's
+ *  `strbuf_humanise_rate` prints a sub-KiB/s transfer as `NNN bytes/s`, not
+ *  `0.xx KiB/s`, so a slow clone's records would otherwise fall through to
+ *  the error text as "not progress". */
+const CLONE_PROGRESS_THROUGHPUT_SUFFIX = String.raw`(?:,\s*[\d.]+\s*(?:[KMGT]iB|bytes)(?:\s*\|\s*[\d.]+\s*(?:[KMGT]iB|bytes)\/s)?)?`;
 const CLONE_PROGRESS_COUNTING_RE = new RegExp(
   String.raw`^remote: Counting objects:\s*(\d{1,3})%${CLONE_PROGRESS_COUNT_SUFFIX}${CLONE_PROGRESS_DONE_SUFFIX}`,
 );
@@ -1278,8 +1281,9 @@ export function pickCloneDisplayLine(stderrText: string): string {
 
 /** One `git clone -- <url> <dest>` attempt. Shared by both the anonymous and
  *  the token-retry attempt in `cloneRepo` below — the only difference between
- *  them is `extraEnv`. Sets `GIT_TERMINAL_PROMPT=0` (never hang on a
- *  credential prompt agetor can't answer) and `LC_ALL=C` (so
+ *  them is `extraEnv`. Sets `GIT_TERMINAL_PROMPT=0` plus an empty
+ *  `GIT_ASKPASS` (never hang on a credential prompt agetor can't answer —
+ *  neither the tty one nor a configured askpass helper) and `LC_ALL=C` (so
  *  `explainCloneFailure`'s patterns match regardless of the user's locale).
  *  When neither `GIT_SSH_COMMAND` (env) nor `core.sshCommand` (git config,
  *  `--global`/`--system` scope only — see below) is already set, also sets
@@ -1315,6 +1319,15 @@ async function runGitClone(
   const env: Record<string, string | undefined> = {
     ...process.env,
     GIT_TERMINAL_PROMPT: "0",
+    // `GIT_TERMINAL_PROMPT=0` only silences the tty prompt. A configured
+    // askpass helper — `GIT_ASKPASS`, `core.askPass`, or `SSH_ASKPASS` — is
+    // consulted BEFORE the terminal and would still fire (a GUI credential
+    // dialog, or a helper that blocks). An EMPTY `GIT_ASKPASS` short-circuits
+    // that whole lookup in git (`credential.c`: a set-but-empty value wins
+    // over `core.askPass`/`SSH_ASKPASS` and disables the prompt), so the
+    // anonymous attempt fails fast and the token retry path stays the only
+    // way a credential ever reaches the clone.
+    GIT_ASKPASS: "",
     LC_ALL: "C",
     ...extraEnv,
   };
