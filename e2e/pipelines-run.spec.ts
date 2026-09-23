@@ -7,7 +7,8 @@ import { gotoApp } from "./helpers";
  * E2e coverage for actually RUNNING a pipeline (docs/plans/pipelines.md
  * §5 row E2): New Task's Pipeline picker, the board's pipeline badge,
  * the full-page run view (node/edge visual states, history, blocked +
- * manual advance, Stop + Retry, fan-out/join), clicking a step node to open
+ * manual advance, Stop + Retry, fan-out/join, per-step subagent delegation
+ * guidance in the composed step prompt), clicking a step node to open
  * its RunPanel with the pipeline strip, and Settings' pipelines link.
  *
  * `e2e/pipelines-editor.spec.ts` owns building/saving/deleting pipelines in
@@ -63,6 +64,7 @@ interface StepInput {
   agentProfileId: string;
   transition?: "choose" | "all";
   join?: "any" | "all";
+  subagents?: { profileIds: string[]; cap: number | null };
 }
 
 function makeStep(input: StepInput) {
@@ -72,17 +74,27 @@ function makeStep(input: StepInput) {
     instructions: input.instructions ?? "",
     agentProfileId: input.agentProfileId,
     position: { x: 0, y: 0 },
-    subagents: { profileIds: [], cap: null },
+    subagents: input.subagents ?? { profileIds: [], cap: null },
     transition: input.transition ?? "choose",
     join: input.join ?? "any",
   };
 }
 
-async function createProfileRest(backend: E2EBackend, name: string): Promise<string> {
+async function createProfileRest(
+  backend: E2EBackend,
+  name: string,
+  opts: { instructions?: string; skills?: string[] } = {},
+): Promise<string> {
   const res = await fetch(`${backend.apiBase}/agent-profiles`, {
     method: "POST",
     headers: auth(backend),
-    body: JSON.stringify({ name, harness: "claude-code", model: "opus-5", instructions: "", skills: [] }),
+    body: JSON.stringify({
+      name,
+      harness: "claude-code",
+      model: "opus-5",
+      instructions: opts.instructions ?? "",
+      skills: opts.skills ?? [],
+    }),
   });
   if (!res.ok) throw new Error(`POST /agent-profiles -> ${res.status}: ${await res.text()}`);
   return ((await res.json()) as { id: string }).id;
@@ -351,6 +363,80 @@ test.describe("pipelines run: executing a run", () => {
     // Back to board -> card is visible (in Review).
     await page.getByTestId("pipeline-run-back").click();
     await expect(boardCard(page, title)).toBeVisible();
+  });
+
+  // Per-step subagent delegation is prompt-injected guidance only (agetor
+  // never controls a harness's real subagents — docs/plans/pipelines.md
+  // D6): the step task's composed prompt carries a `## Delegation` section
+  // naming each allowed profile (name / harness / model / effort /
+  // instructions / skills) and the cap, or "Do not spawn subagents for
+  // this step." when the step allows none. The composed prompt is what
+  // `startTask`'s prompt echo renders as the step task's first user bubble,
+  // so opening a step's RunPanel from the run view is the one surface that
+  // proves what the agent was actually told.
+  test("step subagents: the step task's prompt carries the injected Delegation guidance (allowed profiles + cap), and none for a step without delegates", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const helperOneId = await createProfileRest(backend, "Helper One", {
+      instructions: "Review every test file twice before reporting.",
+      skills: ["code-review"],
+    });
+    const helperTwoId = await createProfileRest(backend, "Helper Two");
+    const A = makeStep({
+      id: randomUUID(),
+      name: "A",
+      agentProfileId: profileId,
+      subagents: { profileIds: [helperOneId, helperTwoId], cap: 2 },
+    });
+    const B = makeStep({ id: randomUUID(), name: "B", agentProfileId: profileId });
+    const pipelineId = await createPipelineRest(backend, "Delegation Pipeline", [A, B], [{ from: A.id, to: B.id }]);
+    const title = `Delegation Run ${randomUUID()}`;
+    const task = await createPipelineTaskRest(
+      backend,
+      title,
+      pipelineId,
+      `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+    );
+    await startTaskRest(backend, task.id);
+
+    await openPipelineRunFromBoard(page, backend, title);
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done", { timeout: CONVERGE_TIMEOUT });
+    await waitForColumn(backend, task.id, "review");
+
+    // B allows no delegates -> the explicit "do not spawn" line, and none
+    // of A's helper names leak into B's prompt.
+    await stepNode(page, B.id).click();
+    let panel = page.locator("aside").last();
+    await expect(panel.getByTestId("run-panel-pipeline-strip")).toContainText("B");
+    let log = panel.getByTestId("transcript-log");
+    await expect(log).toContainText("Do not spawn subagents for this step.", { timeout: CONVERGE_TIMEOUT });
+    await expect(log).not.toContainText("Helper One");
+    await panel.getByTestId("run-panel-open-pipeline").click();
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+
+    // A: the cap line plus one row per allowed profile, with Helper One's
+    // instructions and skill rendered so the step can brief its subagents.
+    await stepNode(page, A.id).click();
+    panel = page.locator("aside").last();
+    await expect(panel.getByTestId("run-panel-pipeline-strip")).toContainText("A");
+    log = panel.getByTestId("transcript-log");
+    await expect(log).toContainText("Delegation", { timeout: CONVERGE_TIMEOUT });
+    await expect(log).toContainText("You may delegate to subagents. Limit: 2 subagent(s).");
+    await expect(log).toContainText("Helper One");
+    await expect(log).toContainText("Helper Two");
+    await expect(log).toContainText("Review every test file twice before reporting.");
+    await expect(log).toContainText("/code-review");
+    await expect(log).not.toContainText("Do not spawn subagents for this step.");
+
+    // Leave the guidance on screen for the end-of-test screenshot: expand
+    // the (long) prompt bubble if it's folded, then scroll the section into
+    // view.
+    const showMore = log.getByRole("button", { name: "Show more", exact: true });
+    if ((await showMore.count()) > 0) await showMore.first().click();
+    await log.getByText("You may delegate to subagents. Limit: 2 subagent(s).").scrollIntoViewIfNeeded();
   });
 
   // Fixed regression (was `test.fixme`) — same "Maximum update depth

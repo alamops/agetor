@@ -389,6 +389,93 @@ test.describe("pipelines editor", () => {
     await expect(page.getByTestId("pipelines-back")).toBeVisible();
   });
 
+  test("step subagents: pick allowed delegate profiles + a cap in the step panel; save, reload, and REST all agree", async ({
+    page,
+    backend,
+  }) => {
+    const helperOne = await createProfileRest(backend, `Editor Helper One ${randomUUID()}`);
+    const helperTwo = await createProfileRest(backend, `Editor Helper Two ${randomUUID()}`);
+    createdProfileIds.push(helperOne.id, helperTwo.id);
+
+    await gotoApp(page, backend.bootBase);
+    await pipelinesButton(page).click();
+    await page.getByTestId("pipelines-new").click();
+    const editor = page.getByTestId("pipeline-editor");
+    await expect(editor).toBeVisible();
+
+    const pipelineName = `E2E Subagents Pipeline ${randomUUID()}`;
+    await editor.getByTestId("pipeline-name").fill(pipelineName);
+
+    const [id0] = await nodeIds(page);
+    const node0 = stepNode(page, id0!);
+    let panel = await openStepPanel(editor, node0);
+
+    // Default: no delegates, no cap.
+    const subagents = panel.getByTestId("pipeline-step-subagents");
+    const trigger = subagents.getByRole("button").first();
+    await expect(trigger).toContainText("No subagents allowed");
+    await expect(panel.getByTestId("pipeline-step-cap-unlimited")).toBeChecked();
+    await expect(panel.getByTestId("pipeline-step-cap")).toHaveCount(0);
+
+    // Pick two delegate profiles from the multi-select (the popover lists
+    // every profile except the step's own bound agent).
+    await trigger.click();
+    await subagents.getByRole("button", { name: helperOne.name }).click();
+    await subagents.getByRole("button", { name: helperTwo.name }).click();
+    await trigger.click(); // toggles the popover closed
+    await expect(trigger).toContainText("2 selected");
+
+    // Turn the "No limit" switch off -> the cap input appears (seeded at 1);
+    // set it to 3.
+    await panel.getByTestId("pipeline-step-cap-unlimited").click();
+    await expect(panel.getByTestId("pipeline-step-cap-unlimited")).not.toBeChecked();
+    const cap = panel.getByTestId("pipeline-step-cap");
+    await expect(cap).toHaveValue("1");
+    await cap.fill("3");
+    await expect(cap).toHaveValue("3");
+
+    // ---- Save ----
+    await editor.getByTestId("pipeline-save").click();
+    await expect(page.getByTestId("pipelines-back")).toBeVisible();
+    const pipelineId = await findPipelineIdByName(backend, pipelineName);
+    createdPipelineIds.push(pipelineId);
+
+    // REST sees exactly what the panel showed.
+    const res = await fetch(`${backend.apiBase}/pipelines/${pipelineId}`, { headers: auth(backend) });
+    expect(res.ok, `GET /pipelines/${pipelineId} -> ${res.status}`).toBeTruthy();
+    const saved = (await res.json()) as {
+      graph: { steps: { id: string; subagents: { profileIds: string[]; cap: number | null } }[] };
+    };
+    expect(saved.graph.steps).toHaveLength(1);
+    expect(saved.graph.steps[0]!.subagents).toEqual({ profileIds: [helperOne.id, helperTwo.id], cap: 3 });
+
+    // ---- Reload + reopen: the panel round-trips the same settings ----
+    await page.reload();
+    await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+    await pipelinesButton(page).click();
+    const row = page.locator(`[data-testid="pipelines-row"][data-pipeline-id="${pipelineId}"]`);
+    await expect(row).toBeVisible();
+    await row.getByTestId("pipelines-edit").click();
+    const editor2 = page.getByTestId("pipeline-editor");
+    await expect(editor2).toBeVisible();
+    await expect(editor2.locator('[data-testid="pipeline-step-node"]')).toHaveCount(1);
+    panel = await openStepPanel(editor2, stepNode(page, id0!));
+    const subagents2 = panel.getByTestId("pipeline-step-subagents");
+    const trigger2 = subagents2.getByRole("button").first();
+    await expect(trigger2).toContainText("2 selected");
+    await expect(panel.getByTestId("pipeline-step-cap-unlimited")).not.toBeChecked();
+    await expect(panel.getByTestId("pipeline-step-cap")).toHaveValue("3");
+
+    // The popover shows both picked profiles as checked (the check glyph is
+    // rendered opaque only on an active row).
+    await trigger2.click();
+    for (const helper of [helperOne, helperTwo]) {
+      const item = subagents2.getByRole("button", { name: helper.name });
+      await expect(item).toBeVisible();
+      await expect(item.locator("svg").first()).toHaveClass(/opacity-100/);
+    }
+  });
+
   test("delete pipeline from the list", async ({ page, backend }) => {
     const name = `E2E Delete Me ${randomUUID()}`;
     const created = await createPipelineRest(backend, name);
