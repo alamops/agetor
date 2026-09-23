@@ -241,53 +241,17 @@ test.describe("pipelines run: New Task form picker", () => {
 test.describe("pipelines run: executing a run", () => {
   test.use({ backendEnv: { AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: RESOLVE_DELAY_MS } });
 
-  // PRODUCT BUG (not a test-authoring issue — root-caused below; do not
-  // "fix" by weakening these assertions, it would just hide the bug):
-  // `PipelineRunView` throws a React "Maximum update depth exceeded" error
-  // — reproducible on every run of this test, and of the "blocked on a
-  // missing handoff" and "fan-out/join" tests below — as soon as the run
-  // view has to re-render a graph that has at least one EDGE and a step
-  // transition/advance actually happens. The single-step, zero-edge
-  // pipelines used by "Stop cancels the run; Retry…" and "Restart runs a
-  // finished pipeline…" never hit it and pass reliably.
-  //
-  // Console evidence (identical stack every time, only the timing varies):
-  //   Maximum update depth exceeded. This can happen when a component
-  //   calls setState inside useEffect, but useEffect either doesn't have a
-  //   dependency array, or one of the dependencies changes on every render.
-  //     > forceStoreRerender react-dom-client.development.js
-  //     > zustand/esm/vanilla.mjs setState
-  //     > @xyflow/react setEdges
-  //   An error occurred in the <StoreUpdater> component.
-  // `<StoreUpdater>` is React Flow's own internal component that syncs a
-  // CONTROLLED `edges`/`nodes` prop into its store — this is the classic
-  // "a new array reference is handed to `edges` synchronously in a loop"
-  // failure mode. `PipelineRunView.tsx`'s per-poll edges-merge `useEffect`
-  // (keyed on `[run, transition, setEdges]`) is the prime suspect: `run`
-  // is a brand-new object on every `task` refetch, so the effect re-runs
-  // on every poll/SSE tick, and something in that cycle (most likely
-  // interacting with the `graphSignature`-keyed full-rebuild effect right
-  // above it) is apparently feeding React Flow's `StoreUpdater` a new
-  // `edges` array fast enough, in a tight enough loop, to trip React's
-  // infinite-update guard — but only once there's an actual edge to carry
-  // a `token`/`visual` state change.
-  //
-  // Confirmed via direct sqlite inspection of the test's own `freshBackend`
-  // data dir (`E2E_KEEP_DATA_DIR=1`) that the crash is PURELY a rendering
-  // bug, not a backend/orchestration one: in every case the backend fully
-  // completes the run (`pipelineRun.status: "done"`, correct `history`
-  // length, task `column: "review"`) while the frozen page keeps showing
-  // stale state (a step stuck at `data-visual="idle"` forever, or the
-  // status badge never leaving whatever it last rendered before the crash)
-  // — e.g. for "blocked on a missing handoff", the Advance click's REST
-  // call genuinely lands and the pipeline genuinely finishes server-side,
-  // but the page never shows "Done".
-  //
-  // `test.fixme` per this repo's existing convention (see the "New agent…"
-  // fixme this file's sibling spec used to carry) — un-skip once
-  // `PipelineRunView`'s edges effect stops feeding React Flow a
-  // perpetually-new `edges` reference.
-  test.fixme("linear A->B->C run: board badge, node/edge visuals, history, ends in Review; opening a done step's RunPanel", async ({
+  // Fixed regression (was `test.fixme`): `PipelineRunView` used to throw a
+  // React "Maximum update depth exceeded" error — reproducible on every run
+  // of this test, and of the "blocked on a missing handoff" and
+  // "fan-out/join" tests below — as soon as the run view had to re-render a
+  // graph with at least one EDGE and a step transition/advance actually
+  // happened (React Flow's `<StoreUpdater>` fed a perpetually-new `edges`
+  // reference because `latestTransition(run)` was computed inline in the
+  // render body). Root-caused and fixed in `PipelineRunView.tsx` — see its
+  // class doc comment for the full three-part fix (content-stable
+  // `transition`, signature-keyed merge effects, identity-stable mergers).
+  test("linear A->B->C run: board badge, node/edge visuals, history, ends in Review; opening a done step's RunPanel", async ({
     page,
     freshBackend,
   }) => {
@@ -348,26 +312,23 @@ test.describe("pipelines run: executing a run", () => {
     await expect(panel.getByTestId("run-panel-pipeline-strip")).toBeVisible();
     await expect(panel.getByTestId("run-panel-pipeline-strip")).toContainText("Linear Pipeline");
     await expect(panel.getByTestId("run-panel-pipeline-strip")).toContainText("A");
+    // "Open pipeline" closes the RunPanel before navigating (m22b: the
+    // run view would otherwise open behind the non-portaled `<aside>`,
+    // reading as if the click did nothing) — so there's no panel left to
+    // close afterward; go straight back to the board.
     await panel.getByTestId("run-panel-open-pipeline").click();
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
-    await panel.getByRole("button", { name: "Close task details" }).click();
 
     // Back to board -> card is visible (in Review).
     await page.getByTestId("pipeline-run-back").click();
     await expect(boardCard(page, title)).toBeVisible();
   });
 
-  // PRODUCT BUG — same "Maximum update depth exceeded" / React Flow
-  // `StoreUpdater` crash documented in full on the "linear A->B->C run"
-  // test's `test.fixme` comment above. Here it strikes right after the
-  // manual Advance: the backend genuinely finishes the pipeline (confirmed
-  // via direct sqlite read: `status: "done"`, `history` length 2, `blocked`
-  // cleared), but the frozen page never shows "Done". This test's earlier
-  // assertions (blocked-visible, "handoff-missing", and the "Awaiting
-  // review" section) all pass fine — the crash only starts blocking
-  // updates partway through, once Advance triggers a real edge/step
-  // transition.
-  test.fixme("blocked on a missing handoff: shows 'handoff-missing'; manual advance to the next step finishes the run", async ({
+  // Fixed regression (was `test.fixme`) — same "Maximum update depth
+  // exceeded" / React Flow `StoreUpdater` crash documented on the "linear
+  // A->B->C run" test above, which used to strike right after the manual
+  // Advance here (a real edge/step transition).
+  test("blocked on a missing handoff: shows 'handoff-missing'; manual advance to the next step finishes the run", async ({
     page,
     freshBackend,
   }) => {
@@ -399,13 +360,14 @@ test.describe("pipelines run: executing a run", () => {
     await expect(blocked).toContainText("handoff-missing");
 
     // Step A's own board column is "review" (the generic exit-0 settle
-    // path) even though the pipeline itself never advanced past it — the
-    // "Awaiting review" section renders alongside the blocked entry for
-    // exactly this reason (`PipelineRunView`'s `reviewActive` flags any
-    // still-`active` execution whose step task already reached `review`).
-    const review = page.getByTestId("pipeline-run-review");
-    await expect(review).toBeVisible();
-    await expect(review).toContainText("finished, awaiting next step");
+    // path) even though the pipeline itself never advanced past it — but
+    // `PipelineRunView`'s `reviewActive` deliberately excludes any active
+    // execution that ALSO has a `run.blocked` entry for the same taskId (a
+    // fixed dedup finding: it used to render a second "Awaiting review"
+    // Advance form for the same execution already shown in the blocked
+    // section above). So the "Awaiting review" section does NOT appear
+    // here — only the one Advance form, inside the blocked entry itself.
+    await expect(page.getByTestId("pipeline-run-review")).toHaveCount(0);
 
     const advance = blocked.getByTestId("pipeline-run-advance");
     await advance.getByRole("button", { name: "Pick next step(s)…" }).click();
@@ -439,11 +401,11 @@ test.describe("pipelines run: executing a run", () => {
     await expect(page.getByTestId("pipeline-run-blocked")).toContainText("handoff-invalid");
   });
 
-  // PRODUCT BUG — same "Maximum update depth exceeded" / React Flow
-  // `StoreUpdater` crash documented in full on the "linear A->B->C run"
-  // test's `test.fixme` comment above. This pipeline has four edges and two
-  // real transitions (the fan-out and the join), so it hits the crash too.
-  test.fixme("fan-out/join: A fans out to B and C in parallel; both show active at once; D (join: all) runs once and finishes", async ({
+  // Fixed regression (was `test.fixme`) — same "Maximum update depth
+  // exceeded" / React Flow `StoreUpdater` crash documented on the "linear
+  // A->B->C run" test above. This pipeline has four edges and two real
+  // transitions (the fan-out and the join), so it used to hit the crash too.
+  test("fan-out/join: A fans out to B and C in parallel; both show active at once; D (join: all) runs once and finishes", async ({
     page,
     freshBackend,
   }) => {
