@@ -4,13 +4,14 @@ import { rm } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles, pipelines } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
-import { checkHarness } from "./agent-status.ts";
+import { checkHarness, upgradeHintFor } from "./agent-status.ts";
 import { getDiscoveredEfforts } from "./agent-discovery.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
 import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progress.ts";
 import { ISSUE_SNAPSHOT_FILENAME, normalizeIssueUrl, parseIssueUrl } from "../shared/issue-task.ts";
 import { providerRepoForDir } from "./git-provider.ts";
 import {
+  AGENT_OPTIONS,
   DEFAULT_BRANCH_CONFIG,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
@@ -18,6 +19,7 @@ import {
   FX_AUTO_RESUME_MAX,
   FX_RECOVERY_STATUS_PREFIX,
   IDLE_SESSION_REAP_MS,
+  MODEL_MIN_CLI_VERSION,
   SESSION_DIED_STATUS_PREFIX,
   SPAWN_RESPONSE_BUDGET_MS,
   TURN_STALLED_STATUS_PREFIX,
@@ -31,8 +33,10 @@ import {
   validateBranchName,
   type AgentKind,
   type Harness,
+  type HarnessStatus,
   type TaskType,
 } from "../shared/types.ts";
+import { cliVersionSatisfies, formatMinCliVersionError } from "../shared/cli-version.ts";
 import { isFxRecoveryResumable, parseFxAutoResumePrefs, parseFxRecoveryPayload } from "../shared/fx-recovery.ts";
 import { resolveStartStep } from "../shared/pipeline.ts";
 import {
@@ -1360,6 +1364,15 @@ async function startTaskInner(
     return { error: `${harness.label} isn't logged in — ${status.authHelp ?? "run its login command"}` };
   }
 
+  // Pre-flight 1b — per-model minimum CLI version. See `minCliVersionError`
+  // (below) for the rationale and the fail-open contract; this is the
+  // first-run half, reusing the status the availability gate just probed.
+  // The follow-up-turn half lives in `spawnCodexTurnNow`.
+  {
+    const floorError = await minCliVersionError(harness, task.model ?? DEFAULT_MODEL[harness.kind], status);
+    if (floorError !== null) return { error: floorError };
+  }
+
   // M6: a worktree-isolated pipeline step task shares its parent's worktree
   // (D2, docs/plans/pipelines.md) — `launchStep` copies `worktreePath`/
   // `branch` straight from the parent row at insert time, and the parent's
@@ -2529,7 +2542,9 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
   // (`Opus`/`Sonnet`/`Fable`/`Haiku`); an id the 2.1.246 picker can't select
   // exactly (an older pinned version within a family the picker only offers
   // the CURRENT release of — including the now-superseded `fable-5`, demoted
-  // once `fable-5.1` took over the "Fable" row — `mythos-5`, `mythos-5.1`, or
+  // once `fable-5.1` took over the "Fable" row, and `opus-5`, demoted once
+  // `opus-5.5` took over the "Opus" row on claude 2.1.280 — `mythos-5`,
+  // `mythos-5.1`, or
   // an unknown id) is a live-session no-op — the row already has the new id,
   // only the mirror into the running session is skipped.
   // `mirrorModelViaPicker`'s own resolved result already
@@ -3143,6 +3158,21 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   const task = tasks.get(row.task_id);
   if (!task) return { delivered: false, reason: "task not found" };
 
+  // Pre-flight 1b for a one-shot kind (today codex) BEFORE any side effect
+  // below — the archivedAt clear and the worktree restore both mutate state,
+  // and a follow-up the CLI floor is going to refuse must not un-archive the
+  // task or re-create its worktree on the way to that refusal.
+  // `spawnCodexTurnNow` re-checks right before minting the run (the model is
+  // PATCH-able while a message sits in the queue), so this is the early
+  // gate, not the only one.
+  {
+    const taskHarness = resolveHarness(task.agent);
+    if (taskHarness?.kind === "codex") {
+      const floorError = await minCliVersionError(taskHarness, task.model ?? DEFAULT_MODEL[taskHarness.kind]);
+      if (floorError !== null) return { delivered: false, reason: floorError };
+    }
+  }
+
   if (task.archivedAt != null) {
     tasks.update(row.task_id, { archivedAt: null });
   }
@@ -3246,7 +3276,10 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   // it — matching the wording claude's own idle-mint guard already uses —
   // while still being accurate ("try again") for the rare lookup race too.
   if (kind === "codex") {
-    const result = await sendCodexTurn(row.task_id, line);
+    const result = await sendCodexTurn(row.task_id, line, rawLine);
+    // Pre-flight 1b refused the turn before any run row was minted (see
+    // `minCliVersionError`) — surface its message as the decline reason.
+    if (result !== null && typeof result === "object") return { delivered: false, reason: result.declined };
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -3293,7 +3326,32 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
  * — but codex turns are discrete processes, so it's a real FIFO, not a
  * paste-into-the-live-session fold.
  */
-const codexTurnQueue = new Map<string, string[]>();
+const codexTurnQueue = new Map<string, QueuedCodexLine[]>();
+
+/**
+ * One queued codex follow-up. `expanded` is what the turn executes (the
+ * `@`-token-expanded text `sendInput` produced); `raw` is the pre-expansion
+ * text the user typed, kept so a refused queued turn can be restashed into
+ * the backlog tray under the exact text a draft/tray item was saved with —
+ * `restashPasteWithheldText` dedupes on byte equality, and the expanded
+ * absolute paths would never match (same rule as claude's withheld pastes,
+ * see `sendInput`'s `rawLine`).
+ */
+interface QueuedCodexLine {
+  raw: string;
+  expanded: string;
+}
+
+/**
+ * `spawnCodexTurnNow`'s "refused before minting a run" result — today only
+ * Pre-flight 1b (`minCliVersionError`): the task's model needs a newer codex
+ * CLI than the one installed. `declined` is the user-facing message.
+ * Distinct from the `null` "another turn is already starting" decline so
+ * `sendInput` can report the real reason.
+ */
+interface CodexTurnDecline {
+  declined: string;
+}
 
 /**
  * Send a follow-up to a codex task. Each follow-up is its own run row + its own
@@ -3302,13 +3360,15 @@ const codexTurnQueue = new Map<string, string[]>();
  * Returns the run id the message was attached to, or null on lookup failure —
  * or when `spawnCodexTurnNow` declined to mint a run because `startingTaskIds`
  * was already claimed for this task (see that set's doc, near `startTask`).
+ * Returns a `CodexTurnDecline` when Pre-flight 1b refused the turn (no run
+ * row, no user event — the caller's draft is untouched).
  */
-async function sendCodexTurn(taskId: string, line: string): Promise<string | null> {
+async function sendCodexTurn(taskId: string, line: string, rawLine: string = line): Promise<string | CodexTurnDecline | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
   if (task.runId && active.has(task.runId)) {
     const q = codexTurnQueue.get(taskId) ?? [];
-    q.push(line);
+    q.push({ raw: rawLine, expanded: line });
     codexTurnQueue.set(taskId, q);
     // Record the user bubble on the active run so the panel reflects it right
     // away; the queued turn that answers it lands as a later run row.
@@ -3321,12 +3381,91 @@ async function sendCodexTurn(taskId: string, line: string): Promise<string | nul
   return spawnCodexTurnNow(task, taskId, line);
 }
 
+/** Env escape hatch for `minCliVersionError` — see its doc. */
+const SKIP_CLI_VERSION_FLOOR_ENV = "AGETOR_SKIP_CLI_VERSION_FLOOR";
+
+/**
+ * Pre-flight 1b — per-model minimum CLI version (`MODEL_MIN_CLI_VERSION` in
+ * `shared/types.ts`, today only codex's GPT-6 rows). OpenAI's codex model
+ * catalog is `client_version`-gated (NousResearch/hermes-agent#119412) and an
+ * old CLI answers a 400 whose text blames the ChatGPT account, so codex's own
+ * error can't be trusted as a diagnosis — and it would arrive only after the
+ * run row (and, on a first run, the worktree) already exist. Callers refuse
+ * the launch up front with this message instead: the installed version, the
+ * floor, and an upgrade command (`status.installHint` when the probe offered
+ * one, else `upgradeHintFor(kind, status.path)`). See
+ * docs/plans/add-gpt-6-sol-and-luna.md §3 D4.
+ *
+ * Resolves the model's minimum-CLI-version verdict for a harness. Returns the
+ * user-facing error string when the probed CLI version parses AND is below
+ * `MODEL_MIN_CLI_VERSION[kind][model]`; null otherwise (no floor, unparseable
+ * version, or the `AGETOR_SKIP_CLI_VERSION_FLOOR` escape hatch). Never throws.
+ *
+ * Strictly FAIL-OPEN: `cliVersionSatisfies` returns null when the probed
+ * version doesn't parse (every `/bin/echo` test override, a stub binary), and
+ * null never blocks; a probe that throws is treated the same way.
+ * `AGETOR_SKIP_CLI_VERSION_FLOOR` set to `1`/`true`/`on`/`yes`
+ * (case-insensitive, read at call time) disables the check outright — the
+ * floors were verified on a ChatGPT-plan account, and an API-key codex
+ * account on an older CLI may not be gated the same way.
+ *
+ * `status` is the caller's already-probed `checkHarness` result; when omitted
+ * this probes itself — but only when the model actually has a floor (the
+ * version probe is cheap and isn't cached for codex).
+ *
+ * Callers — every path that can launch a floored model must call this before
+ * minting a run row: `startTaskInner` (a task's first run and every re-run),
+ * `spawnCodexTurnNow` (every follow-up codex turn — codex is one-shot per
+ * turn and the model is PATCH-able between turns with no live session to
+ * reconcile), and `POST /projects/clone` (the explainer launch, validated
+ * before the clone side effect). Only codex carries floors today, so only
+ * codex's one-shot spawn path is wired; a future floor for another kind
+ * (cursor/gemini/fx are one-shot per turn too) must wire that kind's own
+ * `spawn*TurnNow`/`spawnFxRun` the same way. claude-code's follow-ups paste
+ * into a live REPL whose model was fixed at spawn, so they'd need no check.
+ */
+export async function minCliVersionError(
+  harness: Harness,
+  modelId: string,
+  status?: HarnessStatus,
+): Promise<string | null> {
+  try {
+    const skip = process.env[SKIP_CLI_VERSION_FLOOR_ENV]?.trim().toLowerCase();
+    if (skip === "1" || skip === "true" || skip === "on" || skip === "yes") return null;
+    const floor = MODEL_MIN_CLI_VERSION[harness.kind]?.[modelId];
+    if (floor === undefined) return null;
+    const probed = status ?? await checkHarness(harness);
+    if (cliVersionSatisfies(probed.version, floor) !== false) return null;
+    const modelLabel = AGENT_OPTIONS[harness.kind]?.models.find((m) => m.id === modelId)?.label ?? modelId;
+    return formatMinCliVersionError({
+      harnessLabel: harness.label,
+      installedRaw: probed.version ?? "",
+      modelLabel,
+      kind: harness.kind,
+      floor,
+      // `installHint` is null for an available harness, so this is normally
+      // the path-aware upgrade command (brew vs npm vs self-update).
+      installHint: probed.installHint ?? upgradeHintFor(harness.kind, probed.path),
+    });
+  } catch (err) {
+    console.warn(`[agetor] minimum-CLI-version pre-flight failed open for ${harness.id}:`, err);
+    return null;
+  }
+}
+
 /**
  * Spawn a fresh codex turn that resumes the task's prior conversation via
  * `codex exec resume <thread_id>`. New run row, new tmux session (the previous
  * turn's exited), same `thread_id` carried forward.
+ *
+ * Re-runs Pre-flight 1b (`minCliVersionError`) before minting the run row:
+ * codex is one-shot per turn, so every follow-up spawns `codex exec --model
+ * <task.model>` afresh — and the model is PATCH-able between turns with no
+ * live session to reconcile — so a too-old CLI would otherwise hit codex's
+ * misleading ChatGPT-account 400 after the run row exists. A refusal returns
+ * a `CodexTurnDecline` with nothing written.
  */
-async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Promise<string | CodexTurnDecline | null> {
   // Claim the unified "starting" slot before touching the DB — see
   // `startingTaskIds`'s doc (near `startTask`) for the double-mint race this
   // closes: a second overlapping call could otherwise race in behind
@@ -3341,6 +3480,15 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
     const priorThreadId = findLastCodexSessionId(taskId);
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
+
+    // Pre-flight 1b — before any state mutation (see this function's doc).
+    // The `startingTaskIds` claim above is in-memory only and released by the
+    // `finally`, so an overlapping send still gets the "already starting"
+    // decline while the version probe runs.
+    if (harness) {
+      const floorError = await minCliVersionError(harness, task.model ?? DEFAULT_MODEL[harness.kind]);
+      if (floorError !== null) return { declined: floorError };
+    }
 
     const newRunId = randomUUID();
     const now = Date.now();
@@ -3451,7 +3599,30 @@ async function drainCodexQueue(taskId: string): Promise<void> {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) codexTurnQueue.delete(taskId);
-  if (next !== undefined) await spawnCodexTurnNow(task, taskId, next);
+  if (next === undefined) return;
+  const result = await spawnCodexTurnNow(task, taskId, next.expanded);
+  if (result === null || typeof result !== "object") return;
+  // Pre-flight 1b refused the queued follow-up (the task's model needs a
+  // newer codex CLI — e.g. the model was changed to a GPT-6 row while the
+  // previous turn ran). Every message still queued behind it would be
+  // refused the same way, so move them all — the refused one first — to the
+  // backlog tray (they were already shown as `user` bubbles when queued, so
+  // nothing is lost and they can be resent after upgrading) and explain why
+  // on the task's most recent run.
+  const stranded = [next, ...(codexTurnQueue.get(taskId) ?? [])];
+  codexTurnQueue.delete(taskId);
+  // `backlog.add` PREPENDS (newest draft on top), so restash in reverse send
+  // order: the refused line lands on top and the tray reads chronologically.
+  // Restash the RAW text (see `QueuedCodexLine`) so the tray's dedupe matches
+  // a draft saved with the same `@token`s.
+  for (const item of [...stranded].reverse()) restashPasteWithheldText(taskId, item.raw);
+  const lastRunId = runs.listForTask(taskId)[0]?.id;
+  if (lastRunId) {
+    const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;
+    const data = `${what} — saved to your backlog; resend from the tray after upgrading. ${result.declined}`;
+    runs.appendEvent(lastRunId, "status", data);
+    emit({ runId: lastRunId, taskId, stream: "status", data, ts: Date.now() });
+  }
 }
 
 /** Most-recent codex thread id across the task's runs (for `resume`). */
@@ -5411,6 +5582,27 @@ export interface CreateTaskInput extends Partial<Task> {
 }
 
 /**
+ * Server-internal knobs for {@link createTask} that must never be reachable
+ * from a request body — `POST /tasks` spreads its JSON body straight into
+ * `CreateTaskInput`, so anything on that type is client-supplied.
+ */
+export interface CreateTaskInternal {
+  /**
+   * A profile the caller has ALREADY resolved and validated (e.g.
+   * `POST /projects/clone`, which checks the profile's harness and the
+   * model's CLI floor BEFORE the multi-second `cloneRepo` side effect). When
+   * present it is used as-is and the bound `agentProfileId` is taken from
+   * it, so the task binds to exactly the profile that was validated even if
+   * the row was edited or deleted in the meantime — otherwise `createTask`
+   * would re-read `agentProfiles.get(agentProfileId)` after the side effect
+   * and could bind a different profile (or fail) after the clone already
+   * happened. Absent it, `input.agentProfileId` is looked up as before and
+   * an unknown id still fails the create.
+   */
+  resolvedAgentProfile?: AgentProfile;
+}
+
+/**
  * The kind-default effort id for `model` — "kind default if offered, else
  * strongest offered id, else null" (mirrors the picker's own rule). Shared by
  * `createTask` (no-profile, no-explicit-effort path) and by
@@ -5438,6 +5630,7 @@ export function defaultEffortFor(kind: AgentKind, model: string, harnessId: stri
  */
 export async function createTask(
   input: CreateTaskInput,
+  internal: CreateTaskInternal = {},
 ): Promise<{ task: Task } | { error: string }> {
   const now = Date.now();
   // Only the trimmed, explicitly-provided workdir counts as user intent. We
@@ -5538,7 +5731,10 @@ export async function createTask(
   // landing, or a typo'd CLI `--profile` id that bypassed `matchAgentProfileRef`).
   let profile: AgentProfile | null = null;
   const requestedProfileId = input.agentProfileId?.trim();
-  if (requestedProfileId) {
+  if (internal.resolvedAgentProfile) {
+    // Caller-validated snapshot wins over a re-read (see CreateTaskInternal).
+    profile = internal.resolvedAgentProfile;
+  } else if (requestedProfileId) {
     profile = agentProfiles.get(requestedProfileId);
     if (!profile) {
       return { error: `unknown agent profile "${requestedProfileId}"` };
@@ -5586,11 +5782,13 @@ export async function createTask(
   // `supportedEfforts` makes both cases resolve to `null` for gemini — that's
   // what the PATCH null-clear guard and every picker already compute for an
   // unknown id, so this closes a known inconsistency, on purpose. fx is
-  // different: 16 of its 29 curated models advertise real efforts (live-probed
-  // 2026-09-14), so both a listed and an unlisted fx model resolve through
+  // different: 19 of its 32 curated models advertise real efforts (16
+  // live-probed 2026-09-14, plus anthropic/claude-opus-5.5, openai/gpt-6-sol
+  // and openai/gpt-6-luna from their Gateway catalog entries on 2026-09-22),
+  // so both a listed and an unlisted fx model resolve through
   // `supportedEfforts` to `DEFAULT_EFFORT.fx` (`"auto"`) whenever the model —
   // or the `DEFAULT_MODEL.fx` fallback used for an unlisted id — is one of
-  // those 16; only the remaining 13 no-effort fx models (e.g. `zai/glm-4.7`)
+  // those 19; only the remaining 13 no-effort fx models (e.g. `zai/glm-4.7`)
   // resolve to `null`. That whole computation is `defaultEffortFor` below.
   //
   // A bound profile's `effort` is passthrough instead (D3/A5 in the plan) —

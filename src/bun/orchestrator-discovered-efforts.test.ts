@@ -126,7 +126,7 @@ function authedFetch(p: string, init: RequestInit = {}): Promise<Response> {
 
 /* ── Case 1: discovery empty — createTask falls back to the curated table ── */
 
-test("createTask (codex, discovery empty): unknown model id falls back to gpt-6-astra's curated effort set, defaulting to 'high'", async () => {
+test("createTask (codex, discovery empty): unknown model id falls back to gpt-6-sol's curated effort set, defaulting to 'high'", async () => {
   discoveryTesting.resetForTests();
   const created = await createTask({
     title: "case1-unknown-model",
@@ -140,12 +140,12 @@ test("createTask (codex, discovery empty): unknown model id falls back to gpt-6-
   if ("error" in created) throw new Error(created.error);
   expect(created.task.model).toBe("gpt-9-test");
   // supportedEfforts("codex", "gpt-9-test", null) — unknown key falls back to
-  // MODEL_EFFORT_SUPPORT.codex[DEFAULT_MODEL.codex] (Astra's curated set,
+  // MODEL_EFFORT_SUPPORT.codex[DEFAULT_MODEL.codex] (Sol's curated set,
   // which includes "high" == DEFAULT_EFFORT.codex).
   expect(created.task.effort).toBe("high");
 });
 
-test("createTask (codex, discovery empty): no model given → DEFAULT_MODEL.codex ('gpt-6-astra'), effort 'high'", async () => {
+test("createTask (codex, discovery empty): no model given → DEFAULT_MODEL.codex ('gpt-6-sol'), effort 'high'", async () => {
   discoveryTesting.resetForTests();
   const created = await createTask({
     title: "case1-no-model",
@@ -156,7 +156,7 @@ test("createTask (codex, discovery empty): no model given → DEFAULT_MODEL.code
     taskType: "task",
   });
   if ("error" in created) throw new Error(created.error);
-  expect(created.task.model).toBe("gpt-6-astra");
+  expect(created.task.model).toBe("gpt-6-sol");
   expect(created.task.effort).toBe("high");
 });
 
@@ -288,10 +288,12 @@ test("PATCH /tasks/:id (codex, discovered efforts): a non-null effort id is neve
   });
   if ("error" in created) throw new Error(created.error);
 
-  // "none" is in neither the discovered set ({low, medium}) nor the curated
-  // Astra-fallback set ({ultra, max, xhigh, high, medium, low}) that
-  // "gpt-9-test" would otherwise resolve to — proving the guard really only
-  // blocks the null-clear case, not arbitrary non-null ids.
+  // PATCH accepts "none" unconditionally — it never validates a non-null
+  // effort id against either the discovered set ({low, medium}) or the
+  // curated fallback set "gpt-9-test" would otherwise resolve to (now
+  // Sol's, {ultra, max, xhigh, high, medium, low, none} — which happens to
+  // include "none" too, but that's beside the point: the guard blocks only
+  // the null-clear case, not arbitrary non-null ids).
   const res = await authedFetch(`/tasks/${created.task.id}`, {
     method: "PATCH",
     body: JSON.stringify({ effort: "none" }),
@@ -313,7 +315,7 @@ test("PATCH /tasks/:id (codex, discovery empty): the curated table alone still b
     taskType: "task",
   });
   if ("error" in created) throw new Error(created.error);
-  expect(created.task.model).toBe("gpt-6-astra");
+  expect(created.task.model).toBe("gpt-6-sol");
 
   const res = await authedFetch(`/tasks/${created.task.id}`, {
     method: "PATCH",
@@ -321,7 +323,7 @@ test("PATCH /tasks/:id (codex, discovery empty): the curated table alone still b
   });
   expect(res.status).toBe(400);
   const body = (await res.json()) as { error: string };
-  expect(body.error).toBe(`effort cannot be cleared for model "gpt-6-astra"`);
+  expect(body.error).toBe(`effort cannot be cleared for model "gpt-6-sol"`);
 });
 
 /* ── Case 4: an unlisted gemini model id, no discovery ── */

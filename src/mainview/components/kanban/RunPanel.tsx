@@ -5775,7 +5775,8 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   // Normalize once, up front, and feed every branch below from this single
   // string instead of the raw wire `text`: CR→LF (tmux's paste-buffer
   // artifact — see event-dedup.ts) then `normalizeDeliveredUserText`
-  // (shared/user-message.ts) — which strips agetor's own typed lead-in line
+  // (shared/user-message.ts) — which strips agetor's former typed lead-in
+  // line (retired; only historical events carry it)
   // and unwraps claude CLI's `<pasted_content id="…">…</pasted_content
   // id="…">` wrapper around a bracketed-paste follow-up (see
   // docs/plans/pasted-content-tags.md D1/D2). Without this, a pasted send's

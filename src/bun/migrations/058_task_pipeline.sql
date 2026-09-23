@@ -5,7 +5,7 @@
 --
 --   * `pipeline_id` / `pipeline_run` live on the PARENT (board) task — the
 --     one the user sees as a Pipeline card. `pipeline_id` is a soft
---     reference to `pipelines.id` (migration 056; no FK, same rationale as
+--     reference to `pipelines.id` (migration 057; no FK, same rationale as
 --     `agent_profiles.harness_id` and `tasks.agent_profile_id` — a deleted
 --     pipeline must not strand an already-started run, which lives entirely
 --     off the frozen `pipeline_run.snapshot`). `pipeline_run` is the JSON

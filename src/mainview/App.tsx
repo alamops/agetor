@@ -62,6 +62,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { dismissPending, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
+import { publishCloneProgress } from "@/lib/clone-progress";
 import { parseThemePreference } from "@/lib/theme";
 import { parsePullNumber } from "@/lib/pr-url";
 import { hasTextSelection, keepsNativeContextMenu } from "@/lib/context-menu";
@@ -879,6 +880,12 @@ function AppInner() {
     const cancel = api.subscribeAppEvents((ev) => {
       if (ev.type === "harness_usage") {
         setUsage((prev) => ({ ...prev, [ev.quota.harnessId]: ev.quota }));
+        return;
+      }
+      if (ev.type === "clone_progress") {
+        // Forwarded to the module store CloneProjectDialog subscribes to —
+        // never opens its own EventSource (see clone-progress.ts for why).
+        publishCloneProgress(ev);
         return;
       }
       if (ev.type === "agent_models_changed") {

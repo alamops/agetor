@@ -506,7 +506,8 @@ async function discoverGemini(): Promise<DiscoveredModel[]> {
  * a Gateway-side (server) property, not a property of the binary doing the
  * probing; the 244 recorded on 2026-09-08 was simply that day's catalog.
  * All 28 then-curated `AGENT_OPTIONS.fx.models` ids (16 standard + 12
- * `catalogOnly`; spacexai/grok-4.7, curated since 2026-09-21, postdates this
+ * `catalogOnly`; spacexai/grok-4.7 (curated since 2026-09-21) and
+ * anthropic/claude-opus-5.5 (curated since 2026-09-22) postdate this
  * measurement) are present in the unauth catalog; the signed-in reference
  * account still couldn't be re-measured (no valid local login at
  * measurement time).

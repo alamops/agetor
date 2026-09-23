@@ -756,11 +756,11 @@ export function tryParseJsonBody(body: string): unknown {
 // `parseMessageSegments` above can never pair it; rendered verbatim the tags
 // show as literal noise in the "you" bubble and, worse, the live echo (raw
 // sent text) and this JSONL twin (wrapped) diverge byte-for-byte, so dedup
-// fails and the message shows twice. Separately, agetor types a fixed
-// "lead-in" line ahead of a bracketed paste (see claude-tmux.ts's
-// `queuePaste`) so claude reads the pasted block as the user's own directed
-// request rather than merely embedded, lower-trust text — that lead-in must
-// also be stripped from the delivered text before display/dedup.
+// fails and the message shows twice. Separately, agetor FORMERLY typed a
+// fixed "lead-in" line ahead of a bracketed paste (retired — see
+// docs/plans/remove-paste-lead-in.md); events persisted while it was typed
+// still carry it, so it must still be stripped from the delivered text
+// before display/dedup.
 //
 // `segmentPastedContent` below is a faithful, unit-tested port of Claude
 // CLI's OWN segmenter (captured from the 2.1.277 binary — see the plan for
@@ -888,24 +888,24 @@ export function unwrapPastedContent(text: string): string {
 }
 
 /**
- * The fixed line agetor types (via `send-keys -l`) immediately before a
- * bracketed-paste follow-up to a claude-code task, so claude reads the pasted
- * block as the user's own directed request rather than merely "embedded
- * pasted text" it should treat as lower-trust (see
- * docs/plans/pasted-content-tags.md D1). Lives here rather than in
- * claude-tmux.ts so the SAME string drives both the typing side and the
- * stripping side below without a second copy to drift.
+ * LEGACY — no longer typed. Between 2026-09-18 and the retirement in
+ * docs/plans/remove-paste-lead-in.md, agetor typed this line (via
+ * `send-keys -l`) immediately before every bracketed-paste follow-up to a
+ * claude-code task, as a counter to claude's `<pasted_content>` trust
+ * downgrade (docs/plans/pasted-content-tags.md D1). Agetor now sends the
+ * user's text with nothing of its own in front of it — no driver references
+ * this constant any more. It survives ONLY so `stripPasteLeadIn` below keeps
+ * hiding the line in transcripts persisted while it was still being typed
+ * (`run_events` rows are raw; the rendering-only strip is what cleans them).
  */
 export const AGETOR_PASTE_LEAD_IN = "My own message, sent from Agetor:";
 
 /**
- * Every lead-in spelling agetor has ever shipped, in shipping order.
- * APPEND-ONLY: persisted `run_events` rows are raw (see this module's header
- * comment and CLAUDE.md items 13/14) — a rendering-only fix upgrades
- * historical transcripts too, but only for spellings still listed here.
- * Changing `AGETOR_PASTE_LEAD_IN`'s wording must ADD the new string to this
- * list rather than replace the old one, or every already-persisted send using
- * the old wording regresses back to showing the raw lead-in line.
+ * Every lead-in spelling agetor has ever shipped, in shipping order — all
+ * of them retired. APPEND-ONLY, never pruned: persisted `run_events` rows are
+ * raw (see this module's header comment and CLAUDE.md items 13/14), so a
+ * spelling removed from this list would resurface verbatim in every
+ * historical transcript that carries it.
  */
 export const AGETOR_PASTE_LEAD_INS: readonly string[] = [AGETOR_PASTE_LEAD_IN];
 
@@ -914,7 +914,8 @@ export const AGETOR_PASTE_LEAD_INS: readonly string[] = [AGETOR_PASTE_LEAD_IN];
  * what they actually sent, undoing two agetor/claude-code-specific
  * transformations that can precede it:
  *
- *  1. agetor's own typed lead-in line (`AGETOR_PASTE_LEAD_IN` above) —
+ *  1. agetor's former typed lead-in line (`AGETOR_PASTE_LEAD_IN` above —
+ *     retired, but still present in historical persisted events) —
  *     stripped only when it is the very first thing in `text`, immediately
  *     followed by exactly one line break (`\n` or `\r`); that one line break
  *     is consumed along with it. A lead-in string appearing anywhere else in
@@ -1023,9 +1024,10 @@ export function parseUserMessage(text: string): ParsedUserMessage | null {
  *    the JSONL twin is claude CLI's `<command-name>`/`<command-args>` XML
  *    expansion of that same send.
  *  - a bracketed-paste follow-up: the live echo is the raw text agetor sent,
- *    the JSONL twin is agetor's own typed lead-in line PLUS claude's
- *    `<pasted_content id="…">…</pasted_content id="…">` wrapper around the
- *    pasted body (see `normalizeDeliveredUserText` above).
+ *    the JSONL twin is claude's `<pasted_content id="…">…</pasted_content
+ *    id="…">` wrapper around the pasted body — preceded, on events persisted
+ *    while agetor still typed its (since retired) lead-in line, by that line
+ *    (see `normalizeDeliveredUserText` above).
  *
  * `eventDedupKey` (event-dedup.ts) feeds both copies of a send through this
  * function before slicing its key, so the two collapse into one bubble

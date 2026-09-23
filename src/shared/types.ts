@@ -2149,19 +2149,24 @@ export interface CursorModelSpec {
  * CLI happens to default to.
  */
 export const DEFAULT_MODEL: Record<AgentKind, string> = {
-  // Default to Opus 5 — the most-capable Opus, priced identically to Opus 4.8
-  // ($5/$25 per MTok). Mythos 5.1 / 5 and Fable 5.1 / 5 sit above it in the picker but
-  // cost 2x the usage, so the default stays on the most-capable non-premium
-  // tier.
-  "claude-code": "opus-5",
-  // Owner decision 2026-09-03: default to GPT-6 Astra, OpenAI's most capable
-  // model (released 2026-09-03). Live spike the same day on a ChatGPT-plan
-  // account: codex 0.147.0 and 0.153.0 both get HTTP 400 "The 'gpt-6-astra'
-  // model is not supported when using Codex with a ChatGPT account." during
-  // OpenAI's phased rollout (Trusted Access Program first, ChatGPT plans +
-  // API "in the coming days"). The picker hint carries the gate, and
-  // GPT-5.6 Sol (the previous default) stays one click away.
-  "codex": "gpt-6-astra",
+  // Default to Opus 5.5 — claude CLI 2.1.280 makes it the default Opus model,
+  // and it's $4/$20 per MTok (20% below Opus 5's $5/$25) while landing at
+  // roughly Fable-5.1-level on most work per the announcement. Mythos 5.1 / 5
+  // and Fable 5.1 / 5 still sit above it in the picker but cost 2x the usage,
+  // so the default stays on the most-capable non-premium tier.
+  "claude-code": "opus-5.5",
+  // Owner decision 2026-09-22 (docs/plans/add-gpt-6-sol-and-luna.md): default
+  // to GPT-6 Sol, OpenAI's "daily driver for complex coding and agentic
+  // workflows" (released 2026-09-22), which replaces GPT-5.6 Sol. Astra stays
+  // one row above it in the picker as the most-capable-but-heavier tier. Live
+  // spike the same day on a ChatGPT-plan account: codex-cli 0.147.0 gets HTTP
+  // 400 on both Astra ("requires a newer version of Codex") and Sol/Luna
+  // ("not supported when using Codex with a ChatGPT account" — misleading
+  // text; the real gate is the client version). 0.153.0/0.154.0 run Astra but
+  // still 400 Sol; 0.155.1 runs all three. The catalog itself is
+  // `client_version`-gated (NousResearch/hermes-agent#119412). Hence
+  // `MODEL_MIN_CLI_VERSION` below and the `startTask` pre-flight.
+  "codex": "gpt-6-sol",
   // Grok 4.7 (high effort via DEFAULT_EFFORT) — agetor pins an explicit
   // flagship model rather than cursor-agent's own "auto". Owner decision
   // 2026-09-21 (docs/plans/add-grok-4-7.md): 4.7 replaces 4.6, the previous
@@ -2188,7 +2193,7 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // (`~/.fx/settings.json` on the reference account). Ids are Vercel AI
   // Gateway ids, passed verbatim. fx is exempt from the "always default to
   // the best available model" rule above: the Gateway bills per token to the
-  // user's own account, and flagship tiers (the thirteen `catalogOnly` rows in
+  // user's own account, and flagship tiers (the sixteen `catalogOnly` rows in
   // `AGENT_OPTIONS.fx.models`) stay one click away
   // in the picker as catalog-gated rows — offered only when the signed-in
   // account's catalog actually contains them (see `AgentOption.catalogOnly`).
@@ -2242,6 +2247,36 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   // other four kinds use, since that would silently change every fx run's
   // cost/latency on the owner's rate-limited free-tier Gateway account.
   "fx": "auto",
+};
+
+/**
+ * Minimum harness-CLI version a model needs, per kind, keyed by model id
+ * (semver "major.minor.patch"; compared with `cliVersionSatisfies` in
+ * `src/shared/cli-version.ts`). Pre-flight 1b (`minCliVersionError` in
+ * `src/bun/orchestrator.ts` — `startTask`, every follow-up codex turn, and
+ * the clone route's explainer launch) refuses the launch — before any run
+ * row or worktree exists — when the probed CLI version parses AND is below
+ * the floor; an unparseable/absent version never blocks (fail-open, so
+ * `/bin/echo`-style test overrides and stub binaries are unaffected).
+ * Only codex has entries today: OpenAI's `chatgpt.com/backend-api/codex/models`
+ * catalog is `client_version`-gated (NousResearch/hermes-agent#119412) and an
+ * old CLI answers a 400 whose text blames the ChatGPT account, not the
+ * version. Floors are the lowest versions verified live on 2026-09-22 (a
+ * ChatGPT-plan account): gpt-6-sol/gpt-6-luna — 0.154.0 ✗ / 0.155.1 ✓
+ * (the catalog gate is 0.155.0); gpt-6-astra — 0.147.0 ✗ / 0.153.0 ✓
+ * (0.148–0.152 unprobed, so the true floor may be lower); Aeon mirrors Astra.
+ * The floors were verified on a ChatGPT-plan account; API-key accounts are
+ * assumed to be gated the same way, and `AGETOR_SKIP_CLI_VERSION_FLOOR=1` is
+ * the override when one isn't.
+ * See docs/plans/add-gpt-6-sol-and-luna.md §3 D4.
+ */
+export const MODEL_MIN_CLI_VERSION: Partial<Record<AgentKind, Record<string, string>>> = {
+  codex: {
+    "gpt-6-sol": "0.155.0",
+    "gpt-6-luna": "0.155.0",
+    "gpt-6-astra": "0.153.0",
+    "gpt-6-astra-aeon": "0.153.0",
+  },
 };
 
 export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
@@ -2305,6 +2340,24 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
     label: "Composer 2.5",
     hint: "Cursor's own fast agentic model.",
     fastId: "composer-2.5-fast",
+  },
+  // Ids verified against `cursor-agent models` (CLI 2026.09.18-9a7762b, 245
+  // rows, 2026-09-22): claude-opus-5-5-{low,medium,high,xhigh,max}, each with
+  // a -fast variant; the unsuffixed "Claude Opus 5.5 1M" row is the -medium
+  // id (Cursor's own default tier). Unlike claude-opus-5 there are NO
+  // -thinking- variants — same shape as the Opus 4.8 spec below.
+  "claude-opus-5-5": {
+    label: "Opus 5.5",
+    hint: "Anthropic Opus 5.5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-opus-5-5-max",
+      xhigh: "claude-opus-5-5-xhigh",
+      high: "claude-opus-5-5-high",
+      medium: "claude-opus-5-5-medium",
+      low: "claude-opus-5-5-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
   },
   "claude-opus-5": {
     label: "Opus 5",
@@ -2682,8 +2735,8 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "ultra", label: "Ultra", hint: "Codex's top tier — maximum reasoning plus automatic delegation to internal sub-agents. Several times Max's usage; Codex-only today." },
   { id: "max", label: "Max thinking", hint: "Absolute maximum reasoning effort. Separate from Cursor Max Mode context." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5.1 / 5 / Mythos 5.1 / 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
-  { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5.1 / 5 / Mythos 5.1 / 5 / Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
+  { id: "high", label: "High", hint: "Deep reasoning. The API default on most models (Opus 5.5 defaults to medium)." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
   { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where Cursor exposes it." },
@@ -2701,6 +2754,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  *   - Codex `model_reasoning_effort`:
  *       https://developers.openai.com/codex/config-advanced
  *     GPT-5.6 family → none/low/medium/high/xhigh/max
+ *     GPT-6 Sol/Luna → none/low/medium/high/xhigh/max (+ Codex-side ultra on Sol)
  *     gpt-5.5 / gpt-5 / gpt-5-codex → low/medium/high/xhigh
  *
  * An empty list means "this model does not accept the effort flag at all"
@@ -2710,7 +2764,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
   // effort parameter is API-supported on Fable 5.1 / 5 / Mythos 5.1 / 5 /
-  // Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is
+  // Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is
   // Fable-, Mythos-, Opus-, and Sonnet-5-only; Sonnet 4.6 has no xhigh;
   // Haiku 4.5 doesn't support effort at all). The `/effort` CLI command
   // accepts more levels but the underlying API request would fail for
@@ -2726,6 +2780,12 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "fable-5.1": ["max", "xhigh", "high", "medium", "low"],
     // Fable 5 shares Opus 4.7/4.8's request surface (effort low→max, xhigh).
     "fable-5": ["max", "xhigh", "high", "medium", "low"],
+    // Opus 5.5's docs: thinking can't be disabled ({type:"disabled"} and
+    // budget_tokens both 400 per the migration guide), so effort is the only
+    // control and there is deliberately no "none" row. API default is
+    // "medium" (Opus 5's is "high"); agetor still pins
+    // CLAUDE_CODE_EFFORT_LEVEL from DEFAULT_EFFORT at spawn.
+    "opus-5.5": ["max", "xhigh", "high", "medium", "low"],
     // Opus 5 supports the full effort ladder incl. xhigh (per claude-api skill).
     "opus-5": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.8": ["max", "xhigh", "high", "medium", "low"],
@@ -2755,8 +2815,18 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     // this account's catalog at all). Note: discovered efforts (see
     // `supportedEfforts`'s third argument) override this table whenever the
     // CLI itself reports a set for the model.
+    //
+    // 2026-09-22 — `codex app-server` catalog on 0.155.1 lists gpt-6-sol as
+    // low/medium/high/xhigh/max + ultra (default medium) and gpt-6-luna as
+    // low/medium/high/xhigh/max (no ultra, default medium); `none` accepted
+    // live on Luna via `codex exec` (0.155.1), on Sol it rests on OpenAI's
+    // model page ("supports none") + the GPT-5.6 Sol precedent; same rule as
+    // the 5.6 rows — `ultra` follows Codex's offering, `none` follows
+    // live/API acceptance.
     "gpt-6-astra": ["ultra", "max", "xhigh", "high", "medium", "low"],
     "gpt-6-astra-aeon": ["ultra", "max", "xhigh", "high", "medium", "low"],
+    "gpt-6-sol": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-cyber": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-sol": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-terra": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
@@ -2797,7 +2867,9 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // advertise none — their Gateway catalog entry carries no
   // `reasoning_options` at all — and stay `[]`, same treatment as gemini
   // above (the picker collapses). A 29th id, spacexai/grok-4.7, joined the
-  // no-effort group on 2026-09-21 (see its row below). An
+  // no-effort group on 2026-09-21 (see its row below), and a 30th,
+  // anthropic/claude-opus-5.5, joined the effort group on 2026-09-22 on its
+  // Gateway `reasoning_options` alone (not ACP-probed — see its row). An
   // unknown/discovered-only fx id falls back to `DEFAULT_MODEL.fx`'s set via
   // `supportedEfforts`, and the driver validates at runtime against whatever
   // `effort` option fx actually returns for that session — so drift between
@@ -2838,6 +2910,20 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     // the public Gateway catalog entry, which carries no `reasoning_options`,
     // exactly like spacexai/grok-4.6. docs/plans/add-grok-4-7.md §8 A1.
     "spacexai/grok-4.7": [],
+    // 2026-09-22: not ACP-probed (no fx credentials that pass) — rests on the
+    // public Gateway catalog entry's reasoning_options (effort
+    // low/medium/high/xhigh/max, no none: thinking can't be disabled) plus
+    // fx's always-present auto, identical to the live-probed
+    // anthropic/claude-opus-5 row. docs/plans/add-claude-opus-5-5.md §8 A1.
+    "anthropic/claude-opus-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    // 2026-09-22: openai/gpt-6-sol + openai/gpt-6-luna (released that day) —
+    // from the public Gateway catalog's `reasoning_options` (effort values
+    // none/low/medium/high for BOTH — narrower than openai/gpt-5.6-sol's
+    // none…max and than OpenAI's own API page, which lists xhigh/max too;
+    // the Gateway is what fx sends, so its list wins). Not ACP-probed.
+    // docs/plans/add-gpt-6-sol-and-luna.md §2/§3 D6.
+    "openai/gpt-6-sol": ["high", "medium", "low", "none", "auto"],
+    "openai/gpt-6-luna": ["high", "medium", "low", "none", "auto"],
   },
 };
 
@@ -2947,6 +3033,7 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
     "mythos-5": [],
     "fable-5.1": [],
     "fable-5": [],
+    "opus-5.5": [],
     "opus-5": [],
     "opus-4.8": [],
     "opus-4.7": [],
@@ -3004,7 +3091,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "mythos-5", label: "Mythos 5", hint: "Prior Mythos release — Fable 5's twin; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
       { id: "fable-5.1", label: "Fable 5.1", hint: "Most capable widely released model — above Opus. Uses 2x the usage of Opus." },
       { id: "fable-5", label: "Fable 5", hint: "Prior Fable release — above Opus. Uses 2x the usage of Opus." },
-      { id: "opus-5", label: "Opus 5", hint: "Most capable Opus; same usage cost as 4.8." },
+      { id: "opus-5.5", label: "Opus 5.5", hint: "Default — Fable 5.1-level on most work; API list price $4/$20 per MTok (Opus 5: $5/$25). Thinking is always on; effort is the only control (the model's own default is medium)." },
+      { id: "opus-5", label: "Opus 5", hint: "Prior Opus release ($5/$25 per MTok)." },
       { id: "opus-4.8", label: "Opus 4.8", hint: "Prior Opus flagship." },
       { id: "opus-4.7", label: "Opus 4.7", hint: "Prior flagship; same effort range as 4.8." },
       { id: "opus-4.6", label: "Opus 4.6", hint: "Earlier Opus generation." },
@@ -3027,13 +3115,15 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
-      { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "Recommended default — OpenAI's most capable model. Rolling out in phases; rejected on ChatGPT plans until OpenAI enables it for your account." },
-      { id: "gpt-6-astra-aeon", label: "GPT-6 Astra Aeon", hint: "Long-horizon Astra variant for multi-day tasks. Unverified id — not on OpenAI's model page yet; same rollout gate as Astra." },
+      { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "OpenAI's most capable model. Needs codex CLI ≥ 0.153 — older CLIs answer a 400 (\"requires a newer version of Codex\")." },
+      { id: "gpt-6-astra-aeon", label: "GPT-6 Astra Aeon", hint: "Long-horizon Astra variant for multi-day tasks. Unverified id — not on OpenAI's model page yet; same codex CLI ≥ 0.153 floor as Astra." },
+      { id: "gpt-6-sol", label: "GPT-6 Sol", hint: "Recommended default — OpenAI's daily driver for complex coding and agentic work; replaces GPT-5.6 Sol. Needs codex CLI ≥ 0.155 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
+      { id: "gpt-6-luna", label: "GPT-6 Luna", hint: "Fastest, lowest-cost GPT-6 for focused, high-volume tasks; replaces GPT-5.6 Luna. Needs codex CLI ≥ 0.155 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
       { id: "gpt-5.6-cyber", label: "GPT-5.6 Cyber", hint: "Cybersecurity-tuned GPT-5.6. Requires OpenAI Daybreak approval on an API-key account; rejected on ChatGPT plans." },
-      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Previous recommended default — flagship GPT-5.6; works on ChatGPT plans." },
-      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model for strong performance at lower cost." },
-      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model for high-volume workloads." },
-      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous-generation model — works on ChatGPT plans." },
+      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Previous-generation flagship — superseded by GPT-6 Sol (codex offers the upgrade in place); still works on ChatGPT plans." },
+      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model — superseded by GPT-6 Sol (codex offers the upgrade in place)." },
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model — superseded by GPT-6 Luna (codex offers the upgrade in place)." },
+      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous-generation model — works on ChatGPT plans; codex retires it on 2026-10-14 (switch to GPT-6 Sol)." },
       { id: "gpt-5-codex", label: "GPT-5 Codex", hint: "Requires an API-key account; rejected on ChatGPT plans." },
       { id: "gpt-5", label: "GPT-5", hint: "Requires an API-key account; rejected on ChatGPT plans." },
     ],
@@ -3123,6 +3213,18 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // curated id is its own change (picker + tasks.model + lastModel pref);
     // the curated ∩ discovered merge already hides it wherever discovery
     // works.
+    // 2026-09-22: anthropic/claude-opus-5.5 (released the same day) added
+    // from fx 0.0.10's unauthenticated catalog (`fx models --json`, 251 ids,
+    // auth: missing — the -fast twin anthropic/claude-opus-5.5-fast is also
+    // listed and stays discovery-only like claude-opus-5-fast); its presence
+    // in a standard signed-in account is unverified, hence catalogOnly —
+    // fourteen catalogOnly rows, 30 curated ids total. 29 of the 30 are
+    // present; mistral/devstral-2 is still absent (see the 2026-09-21 note).
+    // 2026-09-22: openai/gpt-6-sol and openai/gpt-6-luna (released the same
+    // day) added from fx 0.0.10's unauthenticated catalog (255 ids that day,
+    // up from 246; every prior curated id — opus-5.5 included — still present except
+    // mistral/devstral-2, still gone); signed-in presence unverified, hence
+    // catalogOnly — sixteen catalogOnly rows, 32 curated ids total.
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
@@ -3153,14 +3255,19 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "zai/glm-5.3", label: "GLM-5.3", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "spacexai/grok-4.7", label: "Grok 4.7", hint: "500K context · 500K output — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-opus-5.5", label: "Claude Opus 5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6-sol", label: "GPT-6 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6-luna", label: "GPT-6 Luna", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [
       { id: "yolo", label: "Full access", hint: "Hands-off default — disables fx's permission checks entirely, so no tool call is ever held. What fx 0.0.8 calls --full-access / /permissions full-access (still true on 0.0.10); yolo is fx's surviving alias and stays agetor's stored id." },
       { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
-    // 16 of the 29 curated models accept the effort flag (see
-    // MODEL_EFFORT_SUPPORT.fx — live-probed on fx 0.0.10); the other 13
+    // 19 of the 32 curated models accept the effort flag (see
+    // MODEL_EFFORT_SUPPORT.fx — 16 live-probed on fx 0.0.10, plus
+    // anthropic/claude-opus-5.5, openai/gpt-6-sol and openai/gpt-6-luna from
+    // their Gateway reasoning_options, all 2026-09-22); the other 13
     // report an empty set and the picker collapses for those, same as any
     // other kind's no-effort models. Every id-supported model always
     // includes `auto` (fx's own default) last, per EFFORT_OPTIONS.
@@ -4246,6 +4353,42 @@ export type GlobalEvent =
     };
 
 /**
+ * Phase of an in-progress `git clone`, as parsed from git's own `--progress`
+ * stderr output by `parseCloneProgress` (`src/bun/clone.ts`,
+ * docs/plans/clone-repository-all-providers.md Addendum A). Shared here
+ * because it also rides the `clone_progress` AppEvent below (server.ts
+ * broadcasts one per parsed/synthetic progress record; the webview and the
+ * CLI both consume it over `GET /app/events`).
+ *
+ *   starting     — before the transfer begins — git's own "Cloning into
+ *                  '<dest>'..." line, AND the synthetic event `cloneRepo`
+ *                  emits itself before attempt 1 and before a token retry
+ *                  (neither of those two carries a real git process yet).
+ *   counting     — `remote: Enumerating objects` / `remote: Counting
+ *                  objects: NN%`.
+ *   compressing  — `remote: Compressing objects: NN%`.
+ *   receiving    — `Receiving objects: NN%` — the actual object transfer.
+ *   resolving    — `Resolving deltas: NN%`.
+ *   checking-out — `Updating files: NN%` — writing the working tree.
+ *   done         — `cloneRepo`'s own synthetic terminal event: the clone
+ *                  succeeded.
+ *   failed       — `cloneRepo`'s own synthetic terminal event: the clone
+ *                  failed (see the accompanying `CloneProgress.line`).
+ *   cancelled    — `cloneRepo`'s own synthetic terminal event: `cancelClone`
+ *                  killed the in-flight git process for this clone.
+ */
+export type CloneProgressPhase =
+  | "starting"
+  | "counting"
+  | "compressing"
+  | "receiving"
+  | "resolving"
+  | "checking-out"
+  | "done"
+  | "failed"
+  | "cancelled";
+
+/**
  * App-level events the webview subscribes to over `GET /app/events`. Used
  * for cross-cutting flows that aren't tied to a single task — currently:
  *
@@ -4260,6 +4403,15 @@ export type GlobalEvent =
  *   agent_models_changed — the model-discovery scheduler re-probed one or
  *                  more harnesses' CLI model catalogs and at least one list
  *                  changed. Webview refetches `GET /agent-models/harnesses`.
+ *   clone_progress — one progress update (or a terminal done/failed/
+ *                  cancelled) for the in-flight `POST /projects/clone`
+ *                  identified by `cloneId` — see `CloneProgressPhase` above.
+ *                  `percent` is `null` whenever git's own output didn't
+ *                  carry one for that record (e.g. `remote: Enumerating
+ *                  objects` and every synthetic phase but `done`). `line` is
+ *                  already sanitized/length-capped and never carries a
+ *                  credential (docs/plans/clone-repository-all-providers.md
+ *                  Addendum A).
  */
 export type AppEvent =
   | {
@@ -4281,6 +4433,14 @@ export type AppEvent =
   | {
       type: "agent_models_changed";
       harnessIds: string[];
+      ts: number;
+    }
+  | {
+      type: "clone_progress";
+      cloneId: string;
+      phase: CloneProgressPhase;
+      percent: number | null;
+      line: string;
       ts: number;
     };
 

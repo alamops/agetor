@@ -1,7 +1,7 @@
 // DB-level tests for pipelines (docs/plans/pipelines.md §3/T2): the
 // `pipelines` CRUD module, the task-side pipeline columns
 // (`pipeline_id`/`pipeline_run`/`pipeline_parent_id`/`pipeline_step_id`,
-// migration 057) round-tripping through `tasks.insert`/`tasks.update`/
+// migration 058) round-tripping through `tasks.insert`/`tasks.update`/
 // `tasks.setPipelineRun`, `tasks.stepsForParent`, `tasks.list()`'s
 // parent/step pending-interaction aggregation (D11), and the defensive
 // `parsePipelineRunState` parser. Mirrors agent-profiles.test.ts's

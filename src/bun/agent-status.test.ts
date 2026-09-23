@@ -1,4 +1,4 @@
-import { test, expect, beforeEach, afterEach, setSystemTime } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, setSystemTime } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -11,7 +11,7 @@ import type { AgentKind, Harness } from "../shared/types.ts";
 // Without this, this file (or whichever file `bun test` loads first) can
 // silently open the real ~/.agetor-dev database.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-db-"));
-const { checkHarness, __testing } = await import("./agent-status.ts");
+const { checkHarness, upgradeHintFor, INSTALL_HINTS, __testing } = await import("./agent-status.ts");
 
 function builtin(kind: AgentKind): Harness {
   return { id: kind, kind, label: kind, isBuiltin: true, home: null, bin: null, env: {}, enabled: true };
@@ -665,6 +665,70 @@ test("checkHarness({ freshAuth: true }) bypasses the cache and re-spawns status 
   } finally {
     rmSync(counterDir, { recursive: true, force: true });
   }
+});
+
+// --- upgradeHintFor (path-aware upgrade command, review finding #5) --------
+// Used with NON-EXISTENT paths throughout so realpathSync throws and the
+// literal path is judged instead — this keeps results machine-independent
+// (no dependency on what's actually installed under /opt/homebrew or
+// /usr/local on the machine running the tests).
+
+describe("upgradeHintFor", () => {
+  test("codex under /opt/homebrew -> brew upgrade codex", () => {
+    expect(upgradeHintFor("codex", "/opt/homebrew/bin/codex-x")).toBe("brew upgrade codex");
+  });
+
+  test("codex under a Cellar path -> brew upgrade codex", () => {
+    expect(upgradeHintFor("codex", "/usr/local/Cellar/codex/1/bin/codex-x")).toBe("brew upgrade codex");
+  });
+
+  test("codex under /usr/local/bin (not Homebrew-managed) -> npm install hint", () => {
+    expect(upgradeHintFor("codex", "/usr/local/bin/codex-x")).toBe("npm i -g @openai/codex");
+  });
+
+  test("codex with a null path -> npm install hint", () => {
+    expect(upgradeHintFor("codex", null)).toBe("npm i -g @openai/codex");
+  });
+
+  test("claude-code under a brew path -> brew upgrade claude-code", () => {
+    expect(upgradeHintFor("claude-code", "/opt/homebrew/bin/claude-x")).toBe("brew upgrade claude-code");
+  });
+
+  test("claude-code under a non-brew path -> claude update (self-updater)", () => {
+    expect(upgradeHintFor("claude-code", "/usr/local/bin/claude-x")).toBe("claude update");
+  });
+
+  test("claude-code with a null path -> claude update (self-updater)", () => {
+    expect(upgradeHintFor("claude-code", null)).toBe("claude update");
+  });
+
+  test("gemini under a brew path -> brew upgrade gemini-cli", () => {
+    expect(upgradeHintFor("gemini", "/opt/homebrew/bin/gemini-x")).toBe("brew upgrade gemini-cli");
+  });
+
+  test("gemini under a non-brew path -> npm install hint (gemini isn't in BREW_PACKAGES' claude/cursor-style fallback)", () => {
+    expect(upgradeHintFor("gemini", "/usr/local/bin/gemini-x")).toBe(INSTALL_HINTS.gemini);
+  });
+
+  test("cursor under a brew-looking path still -> cursor-agent update (cursor isn't Homebrew-distributed)", () => {
+    expect(upgradeHintFor("cursor", "/opt/homebrew/bin/cursor-agent-x")).toBe("cursor-agent update");
+  });
+
+  test("cursor with a null path -> cursor-agent update", () => {
+    expect(upgradeHintFor("cursor", null)).toBe("cursor-agent update");
+  });
+
+  test("fx under any path -> the fx.sh install/self-update command", () => {
+    expect(upgradeHintFor("fx", "/opt/homebrew/bin/fx-x")).toContain("fx.sh");
+  });
+
+  test("fx with a null path -> the fx.sh install/self-update command", () => {
+    expect(upgradeHintFor("fx", null)).toContain("fx.sh");
+  });
+
+  test("INSTALL_HINTS.codex is the npm install command (the fallback upgradeHintFor uses for a non-brew codex)", () => {
+    expect(INSTALL_HINTS.codex).toBe("npm i -g @openai/codex");
+  });
 });
 
 test("checkHarness re-probes once the cached entry's TTL has expired (stale-cache-then-fresh)", async () => {

@@ -171,6 +171,7 @@ agetor diff <id>             # show the task's git diff
 agetor rm <id> --yes         # delete a task (worktree + branch)
 
 # setup
+agetor clone <url>           # clone a GitHub/GitLab/Bitbucket repo as a new project (--provider, --dest, --no-eli5)
 agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
 agetor harness <sub>         # list | add | edit | enable | disable | rm | shell  (aliases / accounts; shell = log in)
 agetor profile <sub>         # ls | show <ref> | add <name> | edit <ref> | rm <ref>  (alias: profiles — saved launch presets, see Agents above)
@@ -297,7 +298,7 @@ Deleting or archiving a pipeline task cascades to all of its step tasks; a step 
 Each task picks:
 
 - a **mode** — how much permission the agent has (`auto`, `ask`, `acceptEdits`, `plan`, `bypass` — exposed per agent),
-- a **model** — Opus / Sonnet / Haiku for Claude, GPT-6 Astra / Astra Aeon (rolling out in phases; rejected on ChatGPT plans until OpenAI enables them for your account), GPT-5.6 Sol / Terra / Luna (plus the access-gated GPT-5.6 Cyber), and earlier GPT-5 options for Codex,
+- a **model** — Opus / Sonnet / Haiku for Claude, GPT-6 Sol (the default) / Luna / Astra / Astra Aeon (Sol and Luna need codex CLI ≥ 0.155, Astra and Aeon ≥ 0.153 — on an older CLI agetor refuses to start the run with an upgrade hint instead of letting codex answer a misleading 400), the superseded GPT-5.6 Sol / Terra / Luna (plus the access-gated GPT-5.6 Cyber), and earlier GPT-5 options for Codex,
 - an **effort** level — reasoning depth, where the model supports it, up to Codex's `Ultra` delegation tier where offered; Codex's effort menu follows what the signed-in account's Codex CLI actually reports.
 
 The picker filters incompatible combinations (e.g. effort is hidden on Haiku 4.5 because Anthropic's API doesn't accept it there).

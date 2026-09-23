@@ -232,6 +232,16 @@ test("claude-code 'opus-4.8' maps to --model claude-opus-4-8", () => {
   ]);
 });
 
+test("claude-code 'opus-5.5' maps to --model claude-opus-5-5", () => {
+  const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "opus-5.5", mode: "auto" });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-opus-5-5",
+    "--permission-mode", "auto",
+    "--", "do thing",
+  ]);
+});
+
 test("claude-code 'opus-5' maps to --model claude-opus-5", () => {
   const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "opus-5", mode: "auto" });
   expect(cmd).toEqual([
@@ -301,7 +311,7 @@ test("claude-code 'sonnet-5' maps to --model claude-sonnet-5", () => {
 // ---------------------------------------------------------------------------
 
 test("claudeModelPickerFamily maps each current-release id to its picker row family", () => {
-  expect(claudeModelPickerFamily("opus-5")).toBe("Opus");
+  expect(claudeModelPickerFamily("opus-5.5")).toBe("Opus");
   expect(claudeModelPickerFamily("sonnet-5")).toBe("Sonnet");
   expect(claudeModelPickerFamily("fable-5.1")).toBe("Fable");
   expect(claudeModelPickerFamily("haiku-4.5")).toBe("Haiku");
@@ -317,6 +327,10 @@ test("claudeModelPickerFamily returns null for ids the picker's single per-famil
   expect(claudeModelPickerFamily("sonnet-4.6")).toBeNull();
   // fable-5 is now superseded by fable-5.1 — same "wrong version" hazard.
   expect(claudeModelPickerFamily("fable-5")).toBeNull();
+  // opus-5 is now superseded by opus-5.5 — claude 2.1.280 makes
+  // claude-opus-5-5 the default Opus model, so the picker's Opus row would
+  // land on the wrong version.
+  expect(claudeModelPickerFamily("opus-5")).toBeNull();
   // No picker row at all for either Mythos id.
   expect(claudeModelPickerFamily("mythos-5")).toBeNull();
   expect(claudeModelPickerFamily("mythos-5.1")).toBeNull();
@@ -580,6 +594,30 @@ test("codex model 'gpt-6-astra-aeon' passes through verbatim as --model", () => 
   ]);
 });
 
+test("codex model 'gpt-6-sol' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-6-sol", mode: "auto" });
+  expect(cmd).toEqual([
+    "codex", "exec",
+    "--model", "gpt-6-sol",
+    "-c", "model_reasoning_effort=high",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
+  ]);
+});
+
+test("codex model 'gpt-6-luna' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-6-luna", mode: "auto" });
+  expect(cmd).toEqual([
+    "codex", "exec",
+    "--model", "gpt-6-luna",
+    "-c", "model_reasoning_effort=high",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
+  ]);
+});
+
 test("codex model 'gpt-5.5' passes through verbatim as --model", () => {
   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-5.5", mode: "auto" });
   expect(cmd).toEqual([
@@ -702,6 +740,28 @@ test("codex effort 'none' passes through verbatim on gpt-5.6-sol (-c model_reaso
   const { cmd } = buildCommand(builtin("codex"), "hi", {
     ...codexDefaults,
     model: "gpt-5.6-sol",
+    effort: "none",
+    mode: "auto",
+  });
+  expect(cmd).toContain("-c");
+  expect(cmd[cmd.indexOf("-c") + 1]).toBe("model_reasoning_effort=none");
+});
+
+test("codex effort 'ultra' passes through verbatim on gpt-6-sol (-c model_reasoning_effort=ultra)", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", {
+    ...codexDefaults,
+    model: "gpt-6-sol",
+    effort: "ultra",
+    mode: "auto",
+  });
+  expect(cmd).toContain("-c");
+  expect(cmd[cmd.indexOf("-c") + 1]).toBe("model_reasoning_effort=ultra");
+});
+
+test("codex effort 'none' passes through verbatim on gpt-6-luna (-c model_reasoning_effort=none)", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", {
+    ...codexDefaults,
+    model: "gpt-6-luna",
     effort: "none",
     mode: "auto",
   });

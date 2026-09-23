@@ -113,7 +113,7 @@ type TaskRow = {
   // must not clobber the snapshot. Both NULL means "no agent".
   agent_profile_id: string | null;
   agent_profile: string | null;
-  // Pipeline binding (migration 057) — see the migration's doc comment for
+  // Pipeline binding (migration 058) — see the migration's doc comment for
   // the full split. `pipeline_id`/`pipeline_run` live on a pipeline PARENT
   // task, written by `tasks.insert` (create time) and `tasks.setPipelineRun`
   // (targeted UPDATE); `pipeline_parent_id`/`pipeline_step_id` live on a
@@ -908,7 +908,7 @@ export const tasks = {
     // the profile — and, like the watermarks/`sent_files`/`fx_recovery`,
     // this write never bumps `updated_at` either.
     // `pipeline_id`/`pipeline_run`/`pipeline_parent_id`/`pipeline_step_id`
-    // (migration 057) join the same skip list: the first two are written
+    // (migration 058) join the same skip list: the first two are written
     // only by `tasks.insert` (create time) and `tasks.setPipelineRun` below
     // via its own targeted UPDATE, the last two only by `tasks.insert` and
     // never change again. A generic PATCH must never clobber a live run's
@@ -1090,7 +1090,7 @@ export const tasks = {
   },
   /**
    * Overwrite a pipeline PARENT task's `pipeline_run` state (`PipelineRunState`
-   * JSON, migration 057) in one targeted `UPDATE` — same pattern as
+   * JSON, migration 058) in one targeted `UPDATE` — same pattern as
    * `setAgentProfile`/`setFxRecovery` above: no `updated_at` bump (this is
    * server-managed run progress, not a task mutation — the runner calls this
    * on every state transition, and bumping `updated_at` on each one would

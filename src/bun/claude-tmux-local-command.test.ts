@@ -1,4 +1,4 @@
-import { test, expect, describe, afterAll } from "bun:test";
+import { test, expect, describe } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -24,19 +24,6 @@ const {
   CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
   CLAUDE_API_ERROR_STATUS_PREFIX,
 } = await import("./claude-tmux.ts");
-
-// This suite exercises queuePaste's modal-guard / composer-clear /
-// local-command / model-picker mechanics — none of it is about the paste
-// lead-in itself (docs/plans/pasted-content-tags.md D1). Pin it off so every
-// bracketed-paste tmux-call assertion here keeps its pre-lead-in shape;
-// `claude-tmux-queue.test.ts` is where the lead-in's own call sequence and
-// failure semantics are pinned. Restored in `afterAll` — `bun test` shares
-// one process (and this module instance) across files, so an unrestored
-// override would leak into whichever file runs next.
-const PREV_PASTE_LEAD_IN = __forTest.setPasteLeadInEnabled(false);
-afterAll(() => {
-  __forTest.setPasteLeadInEnabled(PREV_PASTE_LEAD_IN);
-});
 
 const {
   isLocalCommandStdoutEvent,

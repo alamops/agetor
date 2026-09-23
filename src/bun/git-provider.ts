@@ -201,9 +201,14 @@ export function apiHostForRemote(remoteHost: string): string {
 }
 
 /** Map a canonical provider host (as produced by `canonicalGitHost`) to the
- *  `GitProvider` it identifies, or null when it's none of the three supported
- *  cloud forges (self-hosted GitLab/Bitbucket Server, or an unrelated host —
- *  both out of scope per the plan). */
+ *  `GitProvider` it identifies, or null for an unrelated host. Because
+ *  `canonicalGitHost` collapses ANY host containing "gitlab" to `gitlab.com`,
+ *  a self-hosted GitLab (`gitlab.mycompany.com`) classifies as `gitlab` here
+ *  too and is fully supported — its real API host is resolved separately
+ *  from `ProviderRepoInfo.remoteHost` via `apiHostForRemote` (see
+ *  `gitlabApiBase` in gitlab.ts). Bitbucket Server / Data Center likewise
+ *  classifies as `bitbucket` and is then rejected by `bitbucketServerError`
+ *  (bitbucket.ts), since its REST API has a different shape. */
 export function providerForHost(canonicalHost: string): GitProvider | null {
   switch (canonicalHost) {
     case "github.com":

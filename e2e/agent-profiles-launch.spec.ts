@@ -59,7 +59,7 @@ const ALPHA_INSTRUCTIONS = "Investigate thoroughly before making any change.";
 // Comfortably over gemini's 4096-byte one-shot argv cap once the preamble
 // wrapper + a short prompt are added on top (plan §2 "Gemini argv budget").
 const GAMMA_INSTRUCTIONS = "g".repeat(4000);
-const CLAUDE_MODEL = "opus-5"; // DEFAULT_MODEL["claude-code"] (src/shared/types.ts)
+const CLAUDE_MODEL = "opus-5.5"; // DEFAULT_MODEL["claude-code"] (src/shared/types.ts)
 const GEMINI_MODEL = "gemini-3.1-pro-preview";
 const CURSOR_MODEL = "cursor-grok-4.6";
 
