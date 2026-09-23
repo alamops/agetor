@@ -5434,16 +5434,25 @@ export interface CreateTaskInput extends Partial<Task> {
    * `{ error }` rather than silently falling back to "no agent".
    */
   agentProfileId?: string | null;
+}
+
+/**
+ * Server-internal knobs for {@link createTask} that must never be reachable
+ * from a request body — `POST /tasks` spreads its JSON body straight into
+ * `CreateTaskInput`, so anything on that type is client-supplied.
+ */
+export interface CreateTaskInternal {
   /**
    * A profile the caller has ALREADY resolved and validated (e.g.
    * `POST /projects/clone`, which checks the profile's harness and the
    * model's CLI floor BEFORE the multi-second `cloneRepo` side effect). When
-   * present it is used as-is and `agentProfileId` is taken from it, so the
-   * task binds to exactly the profile that was validated even if the row was
-   * edited or deleted in the meantime — otherwise `createTask` would re-read
-   * `agentProfiles.get(agentProfileId)` after the side effect and could bind
-   * a different profile (or fail) after the clone already happened. Absent
-   * it, `agentProfileId` is looked up as before, unknown ids still fail.
+   * present it is used as-is and the bound `agentProfileId` is taken from
+   * it, so the task binds to exactly the profile that was validated even if
+   * the row was edited or deleted in the meantime — otherwise `createTask`
+   * would re-read `agentProfiles.get(agentProfileId)` after the side effect
+   * and could bind a different profile (or fail) after the clone already
+   * happened. Absent it, `input.agentProfileId` is looked up as before and
+   * an unknown id still fails the create.
    */
   resolvedAgentProfile?: AgentProfile;
 }
@@ -5476,6 +5485,7 @@ function defaultEffortFor(kind: AgentKind, model: string, harnessId: string): st
  */
 export async function createTask(
   input: CreateTaskInput,
+  internal: CreateTaskInternal = {},
 ): Promise<{ task: Task } | { error: string }> {
   const now = Date.now();
   // Only the trimmed, explicitly-provided workdir counts as user intent. We
@@ -5549,9 +5559,9 @@ export async function createTask(
   // landing, or a typo'd CLI `--profile` id that bypassed `matchAgentProfileRef`).
   let profile: AgentProfile | null = null;
   const requestedProfileId = input.agentProfileId?.trim();
-  if (input.resolvedAgentProfile) {
-    // Caller-validated snapshot wins over a re-read (see CreateTaskInput).
-    profile = input.resolvedAgentProfile;
+  if (internal.resolvedAgentProfile) {
+    // Caller-validated snapshot wins over a re-read (see CreateTaskInternal).
+    profile = internal.resolvedAgentProfile;
   } else if (requestedProfileId) {
     profile = agentProfiles.get(requestedProfileId);
     if (!profile) {

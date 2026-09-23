@@ -1005,7 +1005,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
                 workdir: dest,
                 isolation: "none",
                 ...launch,
-                // The profile validated before the clone, not a post-clone re-read.
+              }, {
+                // The profile validated before the clone, not a post-clone
+                // re-read — an internal argument, never a body field.
                 ...(launchProfile ? { resolvedAgentProfile: launchProfile } : {}),
               });
               if ("error" in created) {

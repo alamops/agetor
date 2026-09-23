@@ -1784,7 +1784,17 @@ function makeFakeAgent(
       if (fakeOpts.kind === "fx") onChunk("thinking", "fake fx reasoning");
       onChunk("stdout", `fake response to: ${prompt}`);
     });
-    after(20, () => {
+    // Test seam: `AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS` holds a fake CODEX turn
+    // in flight for that long (default 20ms — the historical timing every
+    // other consumer relies on), so a test can deterministically queue
+    // follow-ups behind it and mutate the task (model, CLI version) before
+    // `drainCodexQueue` runs. Read at call time; codex only, so claude/fx
+    // fake turns keep their own timing.
+    const resolveAfterMs =
+      fakeOpts.kind === "codex"
+        ? (Number(process.env.AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS ?? 20) || 20)
+        : 20;
+    after(resolveAfterMs, () => {
       if (fakeOpts.kind === "fx") emitFakeFxUsageAndTitle(onChunk);
       onChunk("status", "turn complete");
       resolveDone(0);

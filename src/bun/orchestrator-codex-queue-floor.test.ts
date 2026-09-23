@@ -11,19 +11,12 @@ process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-codex-queu
 // Drive codex through the in-process fake (no tmux, no real CLI).
 process.env.AGETOR_CODEX_DRIVER = "fake";
 
-// NOTE on AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: this env var only gates the
-// AGETOR_FAKE_CLAUDE_API_ERROR / _SESSION_DIED / _UNKNOWN_COMMAND scenario
-// branches inside `makeFakeAgent` (src/bun/agents.ts:1194/1208/1222) — none
-// of which apply to a plain codex fake run. The generic fallback branch that
-// an ordinary codex fake turn actually takes (agents.ts ~1751-1785) resolves
-// on a HARD-CODED `after(20, ...)` with no env-var seam at all. Setting this
-// var here is a documented no-op for this file's purposes (kept only in case
-// a future refactor wires it up); the "turn still in flight" window this
-// file relies on is instead the same one `orchestrator-codex.test.ts`'s
-// "sendInput (codex, busy) queues the follow-up" test already exploits:
-// call `sendInput` synchronously, with no `settle()`, right after `startTask`
-// resolves, before the fake's ~20ms timer fires.
-process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = "600";
+// Hold every fake CODEX turn in flight for 400ms (the generic fake branch's
+// `AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS` seam in src/bun/agents.ts; default
+// 20ms) so the queued follow-ups AND the model/CLI-version mutations below
+// deterministically land before `drainCodexQueue` runs — no race against a
+// hard-coded timer.
+process.env.AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS = "400";
 
 // Plant a fake codex binary whose `--version` echoes back whatever
 // `FAKE_CODEX_VERSION` is currently set to, and exits 0 for anything else —
@@ -87,10 +80,9 @@ test("a queued codex follow-up refused by Pre-flight 1b is restashed to the back
   if ("error" in started) throw new Error(started.error);
   const firstRunId = started.runId;
 
-  // Queue two follow-ups WHILE the first turn is still in flight (no settle
-  // in between — exploits the same ~20ms fake-resolve window
-  // orchestrator-codex.test.ts's "sendInput (codex, busy)" test already
-  // relies on). Both should fold into the active run's queue.
+  // Queue two follow-ups WHILE the first turn is still in flight (held open
+  // by AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS above). Both should fold into the
+  // active run's queue.
   const res1 = await sendInput(firstRunId, "queued follow-up");
   expect(res1.delivered).toBe(true);
   if (res1.delivered) expect(res1.runId).toBe(firstRunId);

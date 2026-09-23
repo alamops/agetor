@@ -120,7 +120,7 @@ test("createTask({agentProfileId}) copies harness/model/effort/mode/fast/maxMode
 // object instead of re-reading `agentProfiles.get(agentProfileId)`, so a
 // profile deleted (or edited) between validation and create still yields the
 // validated binding; without it the same id fails as before.
-test("createTask({agentProfileId, resolvedAgentProfile}) binds the supplied profile even after the row was deleted; without it the deleted id still fails", async () => {
+test("createTask(input, { resolvedAgentProfile }) binds the supplied profile even after the row was deleted; without it the deleted id still fails, and a body-supplied resolvedAgentProfile is ignored", async () => {
   const { createTask } = await import("./orchestrator.ts");
   const { db, agentProfiles } = await import("./db.ts");
 
@@ -146,9 +146,8 @@ test("createTask({agentProfileId, resolvedAgentProfile}) binds the supplied prof
     workdir: process.cwd(),
     isolation: "none",
     agentProfileId: profile.id,
-    resolvedAgentProfile: profile,
     model: "ignored-body-model",
-  });
+  }, { resolvedAgentProfile: profile });
   if ("error" in created) throw new Error(created.error);
   try {
     expect(created.task.agentProfileId).toBe(profile.id);
@@ -169,6 +168,20 @@ test("createTask({agentProfileId, resolvedAgentProfile}) binds the supplied prof
   });
   expect("error" in reread).toBe(true);
   if ("error" in reread) expect(reread.error).toMatch(/unknown agent profile/i);
+
+  // The snapshot is an INTERNAL argument, not a CreateTaskInput field:
+  // `POST /tasks` spreads its JSON body into the input, so a client-supplied
+  // `resolvedAgentProfile` must be ignored and the deleted id must still fail.
+  const smuggled = await createTask({
+    title: "smuggled profile snapshot",
+    prompt: "noop",
+    workdir: process.cwd(),
+    isolation: "none",
+    agentProfileId: profile.id,
+    ...({ resolvedAgentProfile: profile } as Record<string, unknown>),
+  });
+  expect("error" in smuggled).toBe(true);
+  if ("error" in smuggled) expect(smuggled.error).toMatch(/unknown agent profile/i);
 });
 
 // Review fix F1 finding 2: a profile's own `effort: null` means "no opinion"

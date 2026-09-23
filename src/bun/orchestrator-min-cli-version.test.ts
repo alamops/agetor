@@ -313,11 +313,7 @@ test("a pre-release build sitting exactly AT the floor ('0.155.0-alpha.3' vs the
 
 // Queued-drain case (a follow-up sent WHILE a codex turn is in flight, so it
 // goes through codexTurnQueue/drainCodexQueue rather than spawnCodexTurnNow
-// directly): the fake codex driver's turn resolves in ~20ms with no seam to
-// hold it open deterministically (AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS-style
-// hooks exist for claude, not for codex's fake driver), so a queued-follow-up
-// gate test would have to race a real in-flight window with a sleep — that's
-// a flake, not a test. Skipped per the brief's own guidance rather than
-// writing a timing-dependent case; `drainCodexQueue`'s stranded-message
-// handling (moving every queued message behind a refused one to the backlog
-// tray) is documented in orchestrator.ts but not covered here.
+// directly) lives in orchestrator-codex-queue-floor.test.ts, which holds the
+// fake turn open via the AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS seam and pins
+// `drainCodexQueue`'s stranded-message handling (every queued line behind a
+// refused one restashed to the backlog tray, raw text, send order).
