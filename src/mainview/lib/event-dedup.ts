@@ -45,7 +45,8 @@ const normalizeForKey = (s: string) => s.replace(/\r\n?/g, "\n");
  * reduce to one identical string and collapse to a single bubble too.
  *
  * A pasted send has a third split: claude wraps a bracketed paste in
- * `<pasted_content id="…">` (behind agetor's own typed lead-in line), and
+ * `<pasted_content id="…">` (historically behind agetor's own typed lead-in
+ * line, since retired — legacy events still carry it), and
  * `trim()`s the pasted body while doing so. `canonicalizeUserText` strips the
  * lead-in + wrapper; the key is additionally `trim()`med on BOTH copies so an
  * echo that kept boundary whitespace (`agetor send`, a backlog item, an

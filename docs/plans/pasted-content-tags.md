@@ -10,6 +10,12 @@
 | Branch | fix/pasted-text-tags-in-claude-code |
 | Base SHA | 4f2624d |
 
+> **Status (2026-09-21): D1 (the typed lead-in) was RETIRED** — see `docs/plans/remove-paste-lead-in.md`. The owner does not want
+> any Agetor-branded prefix/suffix delivered to a harness, trust gap accepted. `queuePaste` runs the plain bracketed
+> sequence again; `pasteLeadInFor`, the `AGETOR_CLAUDE_PASTE_LEAD_IN` kill switch and `__forTest.setPasteLeadInEnabled`
+> are gone. D2 (the client-side unwrap + lead-in strip) stays exactly as described below, because events persisted while
+> the lead-in was typed are raw and still need the strip. Everything below is the historical record of that run.
+
 ## 1. Objective & success criteria
 
 Claude Code started wrapping pasted prompt text in `<pasted_content id="…">…</pasted_content id="…">`. agetor

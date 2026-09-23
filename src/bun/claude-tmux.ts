@@ -55,7 +55,6 @@ import {
 } from "../shared/types.ts";
 import { imageSourceMetaPath } from "../shared/attachments.ts";
 import { sanitizeToolResultAttachments } from "../shared/sent-files.ts";
-import { AGETOR_PASTE_LEAD_IN } from "../shared/user-message.ts";
 
 /**
  * Stream chunk callback. `lineUuid` is the JSONL line's `uuid` field (claude
@@ -2666,8 +2665,11 @@ interface SessionState {
    * bare prompt row) before the next paste; a live Escape-Escape clear
    * succeeds; or any paste's own Enter goes out successfully (submitting
    * whatever was in the composer, including a message this flag was set
-   * for). Never set by anything else — a paste that fails at the PRE-paste
-   * guard (before any text reached the composer) has nothing to flag.
+   * for). Also set by a tmux-level failure of the trailing Enter on either
+   * paste path (the body landed, the submit didn't). Never set by anything
+   * else — a paste that fails at the PRE-paste guard, or at `load-buffer` /
+   * `paste-buffer` (before any text reached the composer), has nothing to
+   * flag.
    */
   composerHoldsText: boolean;
   /**
@@ -2795,11 +2797,8 @@ const sessions = new Map<string, SessionState>(); // taskId → state
  * non-bracketed slash commands send `load-buffer + paste-buffer +
  * delete-buffer + send-keys Enter` back-to-back with no deliberate gap
  * (each still its own awaited `tmux()` round-trip — see `pastePrompt`),
- * while bracketed user pastes first type a fixed lead-in line (`send-keys
- * -l` + a `C-j` newline — docs/plans/pasted-content-tags.md D1, see
- * `pasteLeadInFor`) before the load-buffer/paste-buffer sequence, then
- * split the trailing Enter out with a small `bracketedEnterGapMs` sleep
- * in between. See `queuePaste`.)
+ * while bracketed user pastes split the trailing Enter out with a small
+ * `bracketedEnterGapMs` sleep in between. See `queuePaste`.)
  *
  * The map's value is the tail promise of the in-flight chain; new ops
  * append via `queueTmuxOp`. Entries self-evict on completion when no
@@ -8938,14 +8937,6 @@ export const __forTest = {
     return prev;
   },
   getBracketedEnterGapMs(): number { return bracketedEnterGapMs; },
-  /** Pin the bracketed-paste lead-in on/off (`null` = defer to the
-   *  `AGETOR_CLAUDE_PASTE_LEAD_IN` env kill switch). Returns the previous
-   *  value so a test file can restore it in `afterAll`. */
-  setPasteLeadInEnabled(enabled: boolean | null): boolean | null {
-    const prev = pasteLeadInOverride;
-    pasteLeadInOverride = enabled;
-    return prev;
-  },
   /** Override the image-attach settle window — the per-image delay used
    *  when the paste contains image file paths. Tests shrink it to ~0 to
    *  avoid sleeping per image-path assertion. Returns the previous value
@@ -9213,12 +9204,6 @@ const IMAGE_ATTACH_SETTLE_MAX_MS = 3_000;
  * gap before the `send-keys Enter`. See `queuePaste`'s bracketed branch
  * for the rationale (and the image-attach scaling layered on top of it).
  *
- * On the bracketed path, `queuePaste` types a lead-in line (its own
- * `send-keys -l` + `C-j`, NOT part of this function) immediately before
- * calling this function — see `pasteLeadInFor` and docs/plans/
- * pasted-content-tags.md D1. This function itself is unaware of that: it
- * only ever sees `text`, the same as it always has.
- *
  * Callers go through `queuePaste` so back-to-back pastes for the same
  * task can't interleave at the tmux layer. See `queuePaste` for why.
  *
@@ -9367,63 +9352,6 @@ let bracketedEnterGapMs = 80;
  *  scheduler load). Never read by production code. */
 let lastBracketedGapMs: number | null = null;
 
-/** Test seam (`__forTest.setPasteLeadInEnabled`): `null` defers to the env
- *  kill switch below; a boolean pins the lead-in on/off for a test file
- *  without mutating process-global env that another file would inherit. */
-let pasteLeadInOverride: boolean | null = null;
-
-/**
- * Kill switch for the paste lead-in (docs/plans/pasted-content-tags.md D1) —
- * `0` / `false` / `off` / `no` (case-insensitive) disables it, restoring the
- * pre-lead-in bracketed-paste sequence (plain load-buffer + paste-buffer +
- * gap + Enter). Read at CALL TIME rather than cached at module load, same
- * spirit as every other `AGETOR_*` test seam, so a test can flip it between
- * cases without re-importing the module.
- */
-function pasteLeadInDisabled(): boolean {
-  if (pasteLeadInOverride !== null) return !pasteLeadInOverride;
-  const raw = process.env.AGETOR_CLAUDE_PASTE_LEAD_IN;
-  if (raw === undefined) return false;
-  return ["0", "false", "off", "no"].includes(raw.trim().toLowerCase());
-}
-
-/**
- * The lead-in line `queuePaste`'s bracketed branch types (via `send-keys
- * -l`, followed by a literal newline via `C-j`) immediately before pasting
- * `text`, or `null` when no lead-in should be typed for this send.
- *
- * `null` in two cases:
- *  - the `AGETOR_CLAUDE_PASTE_LEAD_IN` kill switch is set (see
- *    `pasteLeadInDisabled` above);
- *  - `text`'s first non-whitespace character is `/` or `!` — a slash-command
- *    invocation or a `!` shell escape. Deliberately MORE permissive than
- *    `slashTokenOf` (which does not trim): with leading whitespace claude may
- *    or may not still treat the send as a command, and losing the lead-in on
- *    a send claude then wraps is the cheaper mistake — the tags stay hidden
- *    client-side either way, whereas a lead-in above a real command breaks
- *    it outright. The dock composer trims, so only `agetor send` / backlog
- *    text can reach here with leading whitespace at all. Spike-verified (docs/plans/
- *    pasted-content-tags.md §2): claude-code recognizes either shape from
- *    the pasted buffer itself and never wraps it in `<pasted_content>`
- *    regardless of length, so there is no trust downgrade to counter here —
- *    and typing a lead-in line first would land as a stray line ABOVE the
- *    command in the same paste, breaking the command outright.
- *
- * Otherwise returns `AGETOR_PASTE_LEAD_IN` verbatim, unconditionally — NOT
- * gated on claude's own `<pasted_content>` length threshold (currently 20
- * trimmed characters, per the plan's spike notes): mirroring that threshold
- * here would mean a change to it on Anthropic's side silently re-opens the
- * trust gap for whatever length range claude stops wrapping. Always typing
- * the lead-in is the version of this fix that doesn't depend on staying in
- * sync with an implementation detail agetor doesn't control.
- */
-export function pasteLeadInFor(text: string): string | null {
-  if (pasteLeadInDisabled()) return null;
-  const first = text.trimStart()[0];
-  if (first === "/" || first === "!") return null;
-  return AGETOR_PASTE_LEAD_IN;
-}
-
 /**
  * Append a tmux operation to the per-task chain. The `fn` thunk runs
  * after every prior op for the same task has settled. Errors thrown by
@@ -9512,31 +9440,12 @@ function queueTmuxOp(
  * race this closes.
  *
  * When `opts.bracketed` is true, the queued op (after every guard below has
- * cleared) first types a fixed lead-in line — `send-keys -l <AGETOR_PASTE_
- * LEAD_IN>` followed by a literal newline (`send-keys C-j`) — immediately
- * before the load-buffer/paste-buffer sequence, UNLESS `pasteLeadInFor(text)`
- * returns `null` (the `AGETOR_CLAUDE_PASTE_LEAD_IN` kill switch, or `text`
- * starts with `/` or `!`). This is docs/plans/pasted-content-tags.md D1:
- * claude-code wraps a bracketed paste in `<pasted_content id="…">…
- * </pasted_content id="…">` and tells the model the wrapped text may be
- * lower-trust, to the point of sometimes refusing to act on it — typing the
- * lead-in first, as the user's own words, gives claude something of the
- * user's own to read the pasted block as directed by, spike-verified against
- * real claude-code (see the plan). The lead-in is stripped back off for
- * display/dedup by `normalizeDeliveredUserText` (`src/shared/user-
- * message.ts`); the persisted JSONL event still carries it verbatim, same as
- * every other raw-event design in this codebase. A failure typing either
- * half of the lead-in is reported exactly like any other paste failure (see
- * `pasteLeadInFor`'s call site below for the exact `composerHoldsText`
- * bookkeeping), and — once the lead-in landed — a subsequent failure
- * anywhere later in this same paste (including the load-buffer/paste-buffer
- * sequence itself) also flags `composerHoldsText`, since the lead-in text is
- * then sitting in claude's composer regardless of what failed after it.
- *
- * After the lead-in (or immediately, when none is typed), the trailing
- * `Enter` is split out of the paste body — load-buffer + paste-buffer land
- * back-to-back, each its own awaited `tmux()` round-trip, with no deliberate
- * gap between them — and sent after a small internal gap
+ * cleared) runs the load-buffer/paste-buffer sequence with nothing typed
+ * ahead of it — agetor never prefixes a user message with text of its own
+ * (the former paste lead-in was retired: docs/plans/remove-paste-lead-in.md).
+ * The trailing `Enter` is split out of the paste body — load-buffer +
+ * paste-buffer land back-to-back, each its own awaited `tmux()` round-trip,
+ * with no deliberate gap between them — and sent after a small internal gap
  * (`bracketedEnterGapMs`) so claude's Ink TUI commits the `ESC[200~ …
  * ESC[201~` paste event before the `\r` arrives — without that gap the
  * Enter is absorbed as part of the paste event and the queued bubble
@@ -9923,78 +9832,6 @@ function queuePaste(
       }
     }
     if (opts.bracketed) {
-      // Lead-in (docs/plans/pasted-content-tags.md D1): claude-code wraps a
-      // bracketed paste in `<pasted_content id="…">…</pasted_content
-      // id="…">` and tells the model the wrapped text is lower-trust — a
-      // fully-pasted agetor message can get refused outright on that basis
-      // alone. Typing a fixed own-words line right before the paste (its own
-      // `send-keys -l`, then a literal newline via `C-j`, THEN today's
-      // load-buffer/paste-buffer/delete-buffer sequence below) makes claude
-      // read the pasted block as directed by the user's own typed words
-      // instead of as bare embedded text — spike-verified end to end
-      // (docs/plans/pasted-content-tags.md §2). Skipped for `/`- and
-      // `!`-leading sends and disabled outright by
-      // `AGETOR_CLAUDE_PASTE_LEAD_IN` — see `pasteLeadInFor`. The typed line
-      // is stripped back off again for display/dedup by
-      // `normalizeDeliveredUserText` (`src/shared/user-message.ts`) — the
-      // persisted JSONL twin keeps it, same as every other raw-event design
-      // in this codebase, but nothing renders it.
-      const leadIn = pasteLeadInFor(text);
-      if (leadIn !== null) {
-        if (expectedState) bumpKeystroke(expectedState);
-        const leadInResult = await tmux(["send-keys", "-t", sessionName, "-l", leadIn]);
-        if (!leadInResult.ok) {
-          // Nothing has landed in claude's composer yet — this IS the first
-          // keystroke of the whole sequence — so an ordinary paste failure,
-          // not a "text is stranded in the composer" one: no
-          // `composerHoldsText` flip.
-          const outcome: TmuxPasteFailure =
-            { ok: false, op: "send-keys", stderr: leadInResult.stderr };
-          reportPasteFailure(taskId, expectedState, outcome);
-          report(outcome);
-          return;
-        }
-        if (expectedState) bumpKeystroke(expectedState);
-        const leadInNewline = await tmux(["send-keys", "-t", sessionName, "C-j"]);
-        if (!leadInNewline.ok) {
-          // The lead-in TEXT already landed (the `send-keys -l` above
-          // succeeded) even though the newline after it didn't — the
-          // composer holds it, exactly like any other landed-but-
-          // unsubmitted partial send below.
-          const outcome: TmuxPasteFailure =
-            { ok: false, op: "send-keys", stderr: leadInNewline.stderr };
-          reportPasteFailure(taskId, expectedState, outcome);
-          if (expectedState) expectedState.composerHoldsText = true;
-          report(outcome);
-          return;
-        }
-        // Two awaited tmux round-trips have gone by since the guards above
-        // last looked at the pane — the same kind of window the
-        // composer-clear delay opens — so re-gate before the paste itself: a
-        // `dropSession` + respawn reuses this `sessionName` (the paste would
-        // land in the NEW pane), and a modal raised meanwhile would otherwise
-        // go unseen until the pre-Enter re-check, after the text had landed.
-        if (!stillCurrent()) return;
-        if (expectedState && !opts.skipModalGuard) {
-          const blocked = await stillBlocking(expectedState);
-          if (!stillCurrent()) return;
-          if (blocked) {
-            // The message itself was never pasted (`pre-paste`, so the
-            // orchestrator re-stashes it), but the typed lead-in may be
-            // sitting in the composer — flag it so the next send clears it.
-            expectedState.composerHoldsText = true;
-            const outcome: Extract<PasteOutcome, { ok: false }> =
-              { ok: false, op: "modal-guard", phase: "pre-paste", stderr: "claude modal on pane" };
-            const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
-            const message =
-              "paste withheld: claude is waiting on a prompt — answer it in the card or the terminal and resend";
-            onChunk?.("status", message);
-            console.error(`[claude-tmux] ${message} (task ${taskId})`);
-            report(outcome);
-            return;
-          }
-        }
-      }
       if (expectedState) bumpKeystroke(expectedState);
       // No `stillCurrent()` gate right after this await (unlike the pane-read
       // awaits above): `pastePrompt` already ran its tmux calls against
@@ -10006,12 +9843,6 @@ function queuePaste(
       const result = await pastePrompt(sessionName, text, { bracketed: true, skipEnter: true });
       if (!result.ok) {
         reportPasteFailure(taskId, expectedState, result);
-        // The lead-in line (if one was typed above) already landed in
-        // claude's composer before this paste was even attempted — a
-        // failure here leaves it stranded there exactly like any other
-        // landed-but-unsubmitted partial send (see the Enter-failure and
-        // composer-clear branches elsewhere in this function).
-        if (leadIn !== null && expectedState) expectedState.composerHoldsText = true;
         report(result);
         return;
       }
