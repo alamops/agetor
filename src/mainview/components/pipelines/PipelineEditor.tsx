@@ -46,6 +46,7 @@ import { PipelineCanvasContext, type PipelineCanvasContextValue, type StepProfil
 import { StepEdge } from "./StepEdge";
 import { StepNode } from "./StepNode";
 import { StepPanel } from "./StepPanel";
+import { SubagentDetailsDialog } from "./SubagentDetailsDialog";
 import { SubagentEdge } from "./SubagentEdge";
 import { SubagentNode } from "./SubagentNode";
 
@@ -68,6 +69,8 @@ interface PipelineEditorProps {
    *  navigate away some other way (e.g. a tab switch) reuse the same
    *  discard-guard the in-editor Back button already applies. */
   onDirtyChange?: (dirty: boolean) => void;
+  /** Offered as "Edit in Settings" from a satellite's details dialog. */
+  onOpenSettingsAgents?: () => void;
 }
 
 function snapshotOf(name: string, description: string, maxSteps: number, graph: PipelineGraph): string {
@@ -137,7 +140,7 @@ export function PipelineEditor(props: PipelineEditorProps) {
   );
 }
 
-function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: PipelineEditorProps) {
+function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange, onOpenSettingsAgents }: PipelineEditorProps) {
   const confirm = useConfirm();
   const { resolved } = useTheme();
   const { fitView } = useReactFlow();
@@ -163,6 +166,8 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
   const [maxSteps, setMaxSteps] = useState<number>(PIPELINE_LIMITS.maxStepsDefault);
   const [startStepId, setStartStepId] = useState<string | null>(null);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
+  // Satellite whose persona details dialog is open (by node id).
+  const [detailsNodeId, setDetailsNodeId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
   const initialSnapshotRef = useRef<string>(
@@ -432,6 +437,12 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
   // last, after every step node.
   const canvasNodes = useMemo<CanvasNode[]>(() => [...nodesWithSelection, ...subagentNodes], [nodesWithSelection, subagentNodes]);
   const canvasEdges = useMemo<CanvasEdge[]>(() => [...edges, ...subagentEdges], [edges, subagentEdges]);
+  const detailsSatellite = useMemo(
+    () => (detailsNodeId ? (satellites.find((sat) => sat.nodeId === detailsNodeId) ?? null) : null),
+    [detailsNodeId, satellites],
+  );
+  const detailsStep = detailsSatellite ? (nodes.find((n) => n.id === detailsSatellite.stepId)?.data.step ?? null) : null;
+  const detailsStepName = detailsStep?.name ?? "";
 
   // Satellites are never in state, so their own change events (dimension
   // measurements, mostly) have nothing to apply to — forward only the
@@ -674,7 +685,15 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
               onEdgesChange={onCanvasEdgesChange}
               onConnect={onConnect}
               onNodesDelete={(deleted) => onNodesDelete(deleted.filter((n): n is StepFlowNode => n.type === "step"))}
-              onNodeClick={(_, node) => setSelectedStepId(node.type === "subagent" ? node.data.stepId : node.id)}
+              onNodeClick={(_, node) => {
+                if (node.type === "subagent") {
+                  // Select the step it hangs from AND open the persona's details.
+                  setSelectedStepId(node.data.stepId);
+                  setDetailsNodeId(node.id);
+                  return;
+                }
+                setSelectedStepId(node.id);
+              }}
               onPaneClick={() => setSelectedStepId(null)}
               deleteKeyCode={["Backspace", "Delete"]}
               fitView
@@ -689,6 +708,17 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange }: Pip
             </ReactFlow>
           </PipelineCanvasContext.Provider>
         </div>
+
+        <SubagentDetailsDialog
+          open={detailsSatellite != null}
+          onClose={() => setDetailsNodeId(null)}
+          satellite={detailsSatellite}
+          stepName={detailsStepName}
+          cap={detailsStep?.subagents.cap ?? null}
+          profile={detailsSatellite?.profileId ? (profileById.get(detailsSatellite.profileId) ?? null) : null}
+          profileDeleted={detailsSatellite?.profileId ? profilesLoaded && !profileById.has(detailsSatellite.profileId) : false}
+          onOpenSettingsAgents={onOpenSettingsAgents}
+        />
 
         <AnimatePresence>
           {selectedStep && (

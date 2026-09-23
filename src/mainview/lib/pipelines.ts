@@ -380,6 +380,9 @@ export type SubagentNodeData = Record<string, unknown> & {
   subagentId?: string;
   label?: string;
   visual?: SubagentVisualState;
+  /** Helpers observed for this persona in the current execution (0 in the
+   *  editor) — rendered as an `×N` badge past one. */
+  instanceCount?: number;
   readOnly?: boolean;
 };
 export type SubagentFlowNode = Node<SubagentNodeData, "subagent">;
@@ -425,6 +428,11 @@ export interface SubagentSatellite {
    *  profile chip instead). */
   label: string | null;
   visual: SubagentVisualState;
+  /** The observed helpers behind this satellite: every subagent attributed
+   *  to the persona (running first, in spawn order) for a `profile`
+   *  satellite, or the single helper itself for a `live` one. What the
+   *  details dialog lists and links to transcripts; `[]` in the editor. */
+  instances: Subagent[];
 }
 
 /**
@@ -471,6 +479,7 @@ export function subagentSatellites(
     .map((id) => ({ id, name: profileName(id) ?? "" }))
     .filter((p) => p.name.length > 0);
   const byProfile = new Map<string, SubagentVisualState>();
+  const instancesByProfile = new Map<string, Subagent[]>();
   const unmatchedRunning: Subagent[] = [];
   for (const sub of liveSubagents) {
     const matched = matchSubagentToProfile(sub, profiles);
@@ -478,20 +487,28 @@ export function subagentSatellites(
       if (sub.status === "running") unmatchedRunning.push(sub);
       continue;
     }
+    const list = instancesByProfile.get(matched) ?? [];
+    list.push(sub);
+    instancesByProfile.set(matched, list);
     const prev = byProfile.get(matched) ?? "idle";
     // A running attribution always wins over an earlier finished one.
     if (sub.status === "running") byProfile.set(matched, "working");
     else if (prev !== "working") byProfile.set(matched, "done");
   }
-  const out: SubagentSatellite[] = step.subagents.profileIds.map((profileId) => ({
-    nodeId: subagentNodeId(step.id, profileId),
-    stepId: step.id,
-    kind: "profile",
-    profileId,
-    subagentId: null,
-    label: null,
-    visual: byProfile.get(profileId) ?? "idle",
-  }));
+  const out: SubagentSatellite[] = step.subagents.profileIds.map((profileId) => {
+    const instances = instancesByProfile.get(profileId) ?? [];
+    return {
+      nodeId: subagentNodeId(step.id, profileId),
+      stepId: step.id,
+      kind: "profile",
+      profileId,
+      subagentId: null,
+      label: null,
+      visual: byProfile.get(profileId) ?? "idle",
+      // Running helpers first, each group in spawn order.
+      instances: [...instances.filter((i) => i.status === "running"), ...instances.filter((i) => i.status !== "running")],
+    };
+  });
   for (const sub of unmatchedRunning) {
     out.push({
       nodeId: liveSubagentNodeId(step.id, sub.id),
@@ -501,6 +518,7 @@ export function subagentSatellites(
       subagentId: sub.id,
       label: (sub.description ?? sub.agentType ?? "Subagent").trim() || "Subagent",
       visual: "working",
+      instances: [sub],
     });
   }
   return out;
@@ -541,6 +559,7 @@ export function toSubagentFlowNodes(
       ...(sat.subagentId ? { subagentId: sat.subagentId } : {}),
       ...(sat.label ? { label: sat.label } : {}),
       visual: sat.visual,
+      instanceCount: sat.instances.length,
       ...(extra ? extra(sat) : {}),
     },
     };
@@ -606,7 +625,9 @@ export function toSubagentFlowEdges(satellites: readonly SubagentSatellite[]): S
  *  Flow re-measures a node whose object changes; see
  *  `pipeline-canvas-context.tsx`). */
 export function satellitesSignature(satellites: readonly SubagentSatellite[]): string {
-  return satellites.map((s) => `${s.nodeId}:${s.visual}:${s.label ?? ""}`).join("|");
+  return satellites
+    .map((s) => `${s.nodeId}:${s.visual}:${s.label ?? ""}:${s.instances.map((i) => `${i.id}=${i.status}`).join(",")}`)
+    .join("|");
 }
 
 // ---------------------------------------------------------------------------

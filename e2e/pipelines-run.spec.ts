@@ -442,6 +442,39 @@ test.describe("pipelines run: executing a run", () => {
     await expect(helperOneNode).toHaveAttribute("data-visual", "done");
     await expect(helperTwoNode).toHaveAttribute("data-visual", "idle");
 
+    // Clicking a satellite opens that persona's details: its profile, the
+    // step that delegates to it, and every helper spawned for it — here the
+    // one fake helper, finished — each openable on its own transcript tab.
+    await helperOneNode.click({ force: true });
+    const details = page.getByTestId("subagent-details-dialog");
+    await expect(details).toBeVisible();
+    await expect(details.getByTestId("subagent-details-name")).toHaveText("Helper One");
+    await expect(details.getByTestId("subagent-details-instructions")).toContainText("Review every test file twice");
+    await expect(details).toContainText("at most 2 subagents");
+    const instance = details.locator('[data-testid="subagent-details-instance"]');
+    await expect(instance).toHaveCount(1);
+    await expect(instance).toHaveAttribute("data-status", "completed");
+    await expect(instance).toContainText("Helper One: review the tests");
+    const helperSubagentId = await instance.getAttribute("data-subagent-id");
+    await details.getByTestId("subagent-details-open-transcript").click();
+    await expect(details).toBeHidden();
+    // The step task's panel opens ON that helper's tab (kept visible even
+    // though everything has finished), not on the Main stream.
+    let helperPanel = page.locator("aside").last();
+    await expect(helperPanel.getByTestId("run-panel-pipeline-strip")).toContainText("A");
+    const helperTab = helperPanel.locator(`[data-testid="subagent-tab"][data-subagent-id="${helperSubagentId}"]`);
+    await expect(helperTab).toHaveAttribute("aria-selected", "true", { timeout: CONVERGE_TIMEOUT });
+    await helperPanel.getByTestId("run-panel-open-pipeline").click();
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+
+    // Helper Two never ran: its details say so and list no helpers.
+    await helperTwoNode.click({ force: true });
+    await expect(details).toBeVisible();
+    await expect(details.getByTestId("subagent-details-name")).toHaveText("Helper Two");
+    await expect(details.getByTestId("subagent-details-none")).toBeVisible();
+    await details.getByTestId("subagent-details-close").click();
+    await expect(details).toBeHidden();
+
     // B allows no delegates -> the explicit "do not spawn" line, and none
     // of A's helper names leak into B's prompt.
     await stepNode(page, B.id).click();

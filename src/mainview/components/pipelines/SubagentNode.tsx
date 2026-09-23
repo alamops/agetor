@@ -28,7 +28,7 @@ const VISUAL_CLASSES: Record<SubagentVisualState, string> = {
 };
 
 function SubagentNodeImpl({ data }: NodeProps<SubagentFlowNode>) {
-  const { stepId, kind, profileId, subagentId, label, visual = "idle" } = data;
+  const { stepId, kind, profileId, subagentId, label, visual = "idle", instanceCount = 0 } = data;
   const { resolveProfile } = usePipelineCanvasContext();
   const { profile, profileDeleted } = kind === "profile" ? resolveProfile(profileId ?? null) : { profile: null, profileDeleted: false };
   const name = kind === "live" ? (label ?? "Subagent") : (profile?.name ?? (profileDeleted ? "Deleted agent" : "Unknown agent"));
@@ -54,6 +54,7 @@ function SubagentNodeImpl({ data }: NodeProps<SubagentFlowNode>) {
       data-profile-id={profileId ?? undefined}
       data-subagent-id={subagentId ?? undefined}
       data-visual={visual}
+      data-instance-count={instanceCount}
       title={title}
       style={{ width: SUBAGENT_NODE_WIDTH }}
       className={cn(
@@ -82,6 +83,15 @@ function SubagentNodeImpl({ data }: NodeProps<SubagentFlowNode>) {
         <span className="block truncate font-medium leading-tight">{name}</span>
         {sub && <span className="block truncate text-[10px] leading-tight text-muted-foreground">{sub}</span>}
       </span>
+      {instanceCount > 1 && (
+        <span
+          data-testid="pipeline-subagent-count"
+          className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 font-mono text-[10px] leading-none text-muted-foreground"
+          title={`${instanceCount} helpers spawned for this persona`}
+        >
+          ×{instanceCount}
+        </span>
+      )}
     </div>
   );
 }

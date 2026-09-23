@@ -255,6 +255,13 @@ interface Props {
    *  `docs/plans/pipelines.md`). Defaults to a no-op so `RunPanel` compiles
    *  and renders standalone before `App.tsx` threads the real handler. */
   onOpenPipeline?: (parentTaskId: string) => void;
+  /** One-shot request to land on a specific subagent's tab once the panel
+   *  knows that subagent (the pipeline run view's "Open transcript" on a
+   *  satellite's helper). `nonce` makes each request distinct so the same
+   *  id can be re-requested; the panel honours a request exactly once and
+   *  never re-forces the tab on later polls. Also keeps the tab strip
+   *  visible for that helper even after everything has finished. */
+  focusSubagent?: { id: string; nonce: number } | null;
 }
 
 /** No-op default for `Props.onOpenPipeline` — module-level so it's a stable
@@ -341,7 +348,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline, focusSubagent = null }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -558,6 +565,7 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles
           onViewPullRequest={onViewPullRequest}
           onViewIssue={onViewIssue}
           onOpenPipeline={onOpenPipeline}
+          focusSubagent={focusSubagent}
         />
       </aside>
     </>
@@ -590,6 +598,7 @@ function RunPanelBody({
   onViewPullRequest,
   onViewIssue,
   onOpenPipeline,
+  focusSubagent,
 }: {
   task: Task;
   stickyUserMessages: boolean;
@@ -624,6 +633,8 @@ function RunPanelBody({
    *  on the outer `RunPanel` component. Always a function by the time it
    *  reaches here (defaulted at the `RunPanel` call site). */
   onOpenPipeline: (parentTaskId: string) => void;
+  /** See `Props.focusSubagent` on the outer `RunPanel`. */
+  focusSubagent: { id: string; nonce: number } | null;
 }) {
   const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
@@ -2077,9 +2088,14 @@ function RunPanelBody({
   // `shouldShowSubagentTabs`). Logic is extracted + unit-tested in
   // lib/subagent-tabs.ts (the repo has no DOM test harness).
   const parentRunRunning = useMemo(() => runs.some((r) => r.status === "running"), [runs]);
+  // A focus request for a helper this task actually has keeps the strip
+  // visible even once everything finished — otherwise a satellite's "Open
+  // transcript" on a done run would land on a collapsed strip and be forced
+  // straight back to Main by `resolveActiveStream`.
+  const focusedSubagentKnown = !!focusSubagent && subagentList.some((sub) => sub.id === focusSubagent.id);
   const showSubagentTabs = useMemo(
-    () => shouldShowSubagentTabs(subagentList, parentRunRunning),
-    [subagentList, parentRunRunning],
+    () => shouldShowSubagentTabs(subagentList, parentRunRunning) || focusedSubagentKnown,
+    [subagentList, parentRunRunning, focusedSubagentKnown],
   );
 
   // When the strip collapses (or the active subagent disappears), fall back to
@@ -2088,6 +2104,18 @@ function RunPanelBody({
     const resolved = resolveActiveStream(activeStream, showSubagentTabs, subagentList);
     if (resolved !== activeStream) setActiveStream(resolved);
   }, [showSubagentTabs, subagentList, activeStream]);
+
+  // Honour a `focusSubagent` request exactly once — as soon as the polled
+  // list knows the id (a freshly-opened panel may not have it on the first
+  // render). Keyed on the request's nonce so a later poll, or the user
+  // switching back to Main, never re-forces the tab.
+  const consumedFocusNonceRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!focusSubagent || consumedFocusNonceRef.current === focusSubagent.nonce) return;
+    if (!subagentList.some((sub) => sub.id === focusSubagent.id)) return;
+    consumedFocusNonceRef.current = focusSubagent.nonce;
+    setActiveStream(focusSubagent.id);
+  }, [focusSubagent, subagentList]);
 
   // Two separate affordances:
   //   • `canControl` — Stop button is only meaningful when there's an in-flight
@@ -4642,6 +4670,8 @@ function SubagentTab({ s, selected, onSelect }: { s: Subagent; selected: boolean
       type="button"
       role="tab"
       aria-selected={selected}
+      data-testid="subagent-tab"
+      data-subagent-id={s.id}
       onClick={() => onSelect(s.id)}
       title={s.description ?? label}
       className={cn(

@@ -50,6 +50,7 @@ import type {
 import { PipelineCanvasContext, type PipelineCanvasContextValue, type StepProfileResolution } from "./pipeline-canvas-context";
 import { StepEdge } from "./StepEdge";
 import { StepNode } from "./StepNode";
+import { SubagentDetailsDialog } from "./SubagentDetailsDialog";
 import { SubagentEdge } from "./SubagentEdge";
 import { SubagentNode } from "./SubagentNode";
 
@@ -123,8 +124,12 @@ const ADVANCE_BLOCK_KINDS: PipelineBlockKind[] = [
 
 interface PipelineRunViewProps {
   taskId: string;
-  onOpenTask: (task: Task) => void;
+  /** Open a step task's panel — optionally landing on one of its helpers'
+   *  transcript tabs (a satellite's "Open transcript"). */
+  onOpenTask: (task: Task, opts?: { subagentId?: string }) => void;
   onBack: () => void;
+  /** Offered as "Edit in Settings" from a satellite's details. */
+  onOpenSettingsAgents?: () => void;
 }
 
 function formatClockTime(ts: number): string {
@@ -200,7 +205,7 @@ function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } |
  * re-render (and therefore `<StoreUpdater>`'s own `setEdges`/`setNodes`
  * sync) entirely when a poll turns up nothing new to paint.
  */
-export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewProps) {
+export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents }: PipelineRunViewProps) {
   const { resolved } = useTheme();
   const { profiles: liveProfiles } = useAgentProfiles();
   const confirm = useConfirm();
@@ -213,6 +218,10 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
   const [actionError, setActionError] = useState<string | null>(null);
   const [showGoal, setShowGoal] = useState(false);
   const [notStartedStepName, setNotStartedStepName] = useState<string | null>(null);
+  // The satellite whose details dialog is open (by node id — re-resolved
+  // against the freshly-derived satellites every render, so the dialog
+  // tracks working → done live while it's up).
+  const [detailsNodeId, setDetailsNodeId] = useState<string | null>(null);
   // Subagents observed on each step task (`GET /tasks/:id/subagents`), keyed
   // by step TASK id. Refreshed for every currently-active execution on each
   // poll; entries for executions that have since settled are kept as last
@@ -242,6 +251,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
     setSteps([]);
     setLoadError(null);
     setNotStartedStepName(null);
+    setDetailsNodeId(null);
     setLiveSubagents(new Map());
     stepIdsRef.current = new Set();
     dirtyRef.current = false;
@@ -515,22 +525,32 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
 
   const onNodeClick = useCallback(
     (_: unknown, node: CanvasNode) => {
-      // A satellite opens the step it hangs from (its subagent's transcript
-      // is a tab inside that step task's own panel).
-      const stepId = node.type === "subagent" ? node.data.stepId : node.id;
-      const stepTask = stepTaskFor(steps, run, stepId);
+      // A satellite opens its own details (persona, status, the helpers
+      // spawned for it, each openable on its transcript tab); a step node
+      // opens the step task's panel.
+      if (node.type === "subagent") {
+        setNotStartedStepName(null);
+        setDetailsNodeId(node.id);
+        return;
+      }
+      const stepTask = stepTaskFor(steps, run, node.id);
       if (stepTask) {
         setNotStartedStepName(null);
         onOpenTask(stepTask);
       } else {
-        const stepName = node.type === "subagent"
-          ? (effectiveGraph?.steps.find((st) => st.id === stepId)?.name ?? stepId)
-          : node.data.step.name;
-        setNotStartedStepName(stepName);
+        setNotStartedStepName(node.data.step.name);
       }
     },
-    [steps, run, onOpenTask, effectiveGraph],
+    [steps, run, onOpenTask],
   );
+
+  const detailsSatellite = useMemo(
+    () => (detailsNodeId ? (satellites.find((sat) => sat.nodeId === detailsNodeId) ?? null) : null),
+    [detailsNodeId, satellites],
+  );
+  const detailsStep = detailsSatellite ? (effectiveGraph?.steps.find((st) => st.id === detailsSatellite.stepId) ?? null) : null;
+  const detailsStepTask = detailsSatellite ? stepTaskFor(steps, run, detailsSatellite.stepId) : null;
+  const detailsProfile = detailsSatellite?.profileId ? resolveProfile(detailsSatellite.profileId) : { profile: null, profileDeleted: false };
 
   const handleStop = useCallback(async () => {
     setActionBusy(true);
@@ -720,6 +740,32 @@ export function PipelineRunView({ taskId, onOpenTask, onBack }: PipelineRunViewP
               </ReactFlow>
             </PipelineCanvasContext.Provider>
           </ReactFlowProvider>
+          <SubagentDetailsDialog
+            open={detailsSatellite != null}
+            onClose={() => setDetailsNodeId(null)}
+            satellite={detailsSatellite}
+            stepName={detailsStep?.name ?? ""}
+            cap={detailsStep?.subagents.cap ?? null}
+            profile={detailsProfile.profile}
+            profileDeleted={detailsProfile.profileDeleted}
+            onOpenTranscript={
+              detailsStepTask
+                ? (subagentId) => {
+                    setDetailsNodeId(null);
+                    onOpenTask(detailsStepTask, { subagentId });
+                  }
+                : undefined
+            }
+            onOpenStep={
+              detailsStepTask
+                ? () => {
+                    setDetailsNodeId(null);
+                    onOpenTask(detailsStepTask);
+                  }
+                : undefined
+            }
+            onOpenSettingsAgents={onOpenSettingsAgents}
+          />
           {notStartedStepName && (
             <div
               data-testid="pipeline-run-node-not-started"

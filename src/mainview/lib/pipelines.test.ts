@@ -636,6 +636,38 @@ describe("subagentSatellites", () => {
       nameOf,
     );
     expect(sats.map((s) => s.visual)).toEqual(["working", "done"]);
+    expect(sats.map((s) => s.instances.map((i) => i.id))).toEqual([["s1"], ["s2"]]);
+  });
+
+  test("every helper attributed to a persona is carried as an instance, running first, and counted on the node", () => {
+    const sats = subagentSatellites(
+      step,
+      [
+        makeSubagent({ id: "a", description: "Helper One: first", status: "completed", endedAt: 2 }),
+        makeSubagent({ id: "b", description: "Helper One: second", status: "running" }),
+        makeSubagent({ id: "c", description: "helper one again", status: "completed", endedAt: 3 }),
+      ],
+      nameOf,
+    );
+    expect(sats[0]!.instances.map((i) => i.id)).toEqual(["b", "a", "c"]);
+    expect(sats[1]!.instances).toEqual([]);
+    const [node] = toSubagentFlowNodes(sats);
+    expect(node!.data.instanceCount).toBe(3);
+    // Instance status is part of the identity signature, so a helper
+    // finishing re-renders its satellite even when the visual stays put.
+    const before = satellitesSignature(sats);
+    const after = satellitesSignature(
+      subagentSatellites(
+        step,
+        [
+          makeSubagent({ id: "a", description: "Helper One: first", status: "completed", endedAt: 2 }),
+          makeSubagent({ id: "b", description: "Helper One: second", status: "running" }),
+          makeSubagent({ id: "c", description: "helper one again", status: "running" }),
+        ],
+        nameOf,
+      ),
+    );
+    expect(after).not.toBe(before);
   });
 
   test("running beats done for the same persona, regardless of order", () => {
@@ -666,6 +698,7 @@ describe("subagentSatellites", () => {
     expect(live.label).toBe("Explore the repo");
     expect(live.visual).toBe("working");
     expect(live.subagentId).toBe("s9");
+    expect(live.instances.map((i) => i.id)).toEqual(["s9"]);
   });
 
   test("a deleted persona (no name) still renders as an idle satellite and never matches", () => {

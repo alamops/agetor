@@ -490,8 +490,17 @@ test.describe("pipelines editor", () => {
     const satellites2 = editor2.locator(`[data-testid="pipeline-subagent-node"][data-step-id="${id0}"]`);
     await expect(satellites2).toHaveCount(2);
     await expect(editor2.locator('[data-testid="pipeline-subagent-edge"]')).toHaveCount(2);
-    await satellites2.first().click({ force: true });
+    // A satellite click selects its step AND opens the persona's details
+    // (read-only here: the profile, no helpers since nothing has run).
+    await satellites2.filter({ hasText: helperOne.name }).click({ force: true });
     await expect(editor2.locator('[data-testid="pipeline-step-panel"]')).toHaveCount(1);
+    const details = page.getByTestId("subagent-details-dialog");
+    await expect(details).toBeVisible();
+    await expect(details.getByTestId("subagent-details-name")).toHaveText(helperOne.name);
+    await expect(details).toContainText("at most 3 subagents");
+    await expect(details.getByTestId("subagent-details-edit")).toBeVisible();
+    await details.getByTestId("subagent-details-close").click();
+    await expect(details).toBeHidden();
 
     // The popover shows both picked profiles as checked (the check glyph is
     // rendered opaque only on an active row).

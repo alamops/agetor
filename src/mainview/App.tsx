@@ -205,6 +205,10 @@ function AppInner() {
   // below) — no polling here, the Bun-side poller drives freshness.
   const [usage, setUsage] = useState<Record<string, HarnessQuota>>({});
   const [selected, setSelected] = useState<Task | null>(null);
+  // One-shot "land on this subagent's tab" request for the run panel — set
+  // by the pipeline run view's satellite details ("Open transcript"), see
+  // `RunPanel`'s `focusSubagent` prop.
+  const [focusSubagent, setFocusSubagent] = useState<{ id: string; nonce: number } | null>(null);
   // Full-page view — see `AppView`'s doc comment above.
   const [view, setView] = useState<AppView>({ kind: "board" });
   const [diffTask, setDiffTask] = useState<Task | null>(null);
@@ -2029,6 +2033,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               >
                 <PipelineEditor
                   pipelineId={view.pipelineId}
+                  onOpenSettingsAgents={openSettingsAgents}
                   // Set directly (not `navigate`) — the editor's own Back
                   // button already ran its own confirm-then-call before
                   // reaching here (see `pipelineEditorDirty`'s doc comment
@@ -2061,7 +2066,11 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               >
                 <PipelineRunView
                   taskId={view.taskId}
-                  onOpenTask={(t) => setSelected(t)}
+                  onOpenTask={(t, opts) => {
+                    setFocusSubagent(opts?.subagentId ? { id: opts.subagentId, nonce: Date.now() } : null);
+                    setSelected(t);
+                  }}
+                  onOpenSettingsAgents={openSettingsAgents}
                   onBack={() => setView({ kind: "board" })}
                 />
               </motion.div>
@@ -2093,6 +2102,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         onViewPullRequest={viewPullRequest}
         onViewIssue={viewIssue}
         onOpenPipeline={(parentTaskId) => openPipelineRun(parentTaskId)}
+        focusSubagent={focusSubagent}
       />
       <DiffDialog
         open={!!diffTask}
