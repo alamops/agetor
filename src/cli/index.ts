@@ -19,6 +19,7 @@ import { cmdAttach } from "./commands/attach.ts";
 import { cmdHarness } from "./commands/harness.ts";
 import { cmdAgentProfile } from "./commands/agent-profile.ts";
 import { cmdProjects } from "./commands/projects.ts";
+import { cmdClone } from "./commands/clone.ts";
 import { cmdCommit } from "./commands/commit.ts";
 import { cmdConfig } from "./commands/config.ts";
 import { cmdShell } from "./commands/shell.ts";
@@ -55,6 +56,7 @@ Commands:
   daemon <sub>        start | stop | status of the background core
   harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
   profile <sub>       list | show | add | edit | rm reusable agent profiles
+  clone <url>         clone a repository as a new project (--provider, --dest, --no-eli5)
   projects <sub>      list | add | rm | branches (project folders)
   config [k] [v]      view / set core preferences (defaultHarness, last model…)
   help                show this help
@@ -190,6 +192,8 @@ async function main(): Promise<void> {
     case "projects":
     case "project":
       return cmdProjects(args, flags);
+    case "clone":
+      return cmdClone(args, flags);
     case "config":
       return cmdConfig(args, flags);
     case "info": {

@@ -137,6 +137,21 @@ export const USAGE: Record<string, string> = {
 
   Manage the registered project folders shown in the new-task picker.`,
 
+  clone: `usage: agetor clone <url> [--provider github|gitlab|bitbucket] [--dest <path>] [--no-eli5]
+
+  Clone a repository and register it as a new project — the CLI view of the
+  app's "Clone repository" dialog. <url> accepts https://…, git@host:owner/repo
+  (or ssh://…) for GitHub, GitLab (including self-hosted), and Bitbucket
+  Cloud, or bare 'owner/repo' shorthand (resolved against --provider, default
+  github). A private https repo falls back to the token stored in Settings →
+  Git host tokens when an anonymous clone is refused.
+    --provider <p>   github | gitlab | bitbucket — only disambiguates
+                      shorthand; a full URL's own detected provider wins
+    --dest <path>     destination folder (default: ~/<repo-name>)
+    --no-eli5         skip creating + starting the explainer task that
+                       otherwise writes ELI5.md at the clone's root
+  Ctrl+C cancels an in-flight clone (the partial checkout is removed).`,
+
   harness: `usage: agetor harness <ls | add <id> … | edit <id> … | enable <id> | disable <id> | rm <id> | shell <id>>
 
   Manage agent harnesses (aliases / parallel accounts).

@@ -120,8 +120,12 @@ const BITBUCKET_PAGELEN = 30;
  * Returns `null` (no error — proceed) on either allow path above; otherwise
  * the rejection message every call site returns verbatim in its own error
  * shape, before making any network call.
+ *
+ * Also called directly by `src/bun/clone.ts`'s `resolveCloneRepo`, which
+ * needs this exact Server/DC-rejection rule for a pasted clone URL before
+ * this adapter is ever reached.
  */
-function bitbucketServerError(repo: ProviderRepoInfo): string | null {
+export function bitbucketServerError(repo: ProviderRepoInfo): string | null {
   const resolved = apiHostForRemote(repo.remoteHost).toLowerCase();
   if (resolved === "bitbucket.org") return null;
   // Dotless: ssh has nothing to tell us (no matching config entry, no dot to
