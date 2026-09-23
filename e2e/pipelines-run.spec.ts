@@ -522,10 +522,14 @@ test.describe("pipelines run: executing a run", () => {
     await stepNode(page, A.id).click();
     const panel = page.locator("aside").last();
     await expect(panel.getByTestId("run-panel-pipeline-strip")).toBeVisible();
+    // The marker line itself is hidden from the rendered bubble (display-only);
+    // the bubble carries an "Automatic handoff reminder" badge instead, and
+    // the body still shows the contract the reminder repeats.
+    await expect(panel.getByTestId("handoff-reminder-badge").first()).toBeVisible();
     const reminderBubble = panel
       .locator("div.rounded-2xl.rounded-br-md")
-      .filter({ hasText: "[agetor handoff reminder]" });
-    await expect(reminderBubble).toBeVisible();
+      .filter({ hasText: "Reply with ONLY the handoff block" });
+    await expect(reminderBubble.first()).toBeVisible();
 
     await waitForColumn(backend, task.id, "review");
   });
