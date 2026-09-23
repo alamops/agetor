@@ -16,6 +16,15 @@ import {
 } from "../shared/types.ts";
 import type { ModelOption } from "../shared/model-options.ts";
 
+test("claude opus-5.5 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "opus-5.5").map((o) => o.id);
+  expect(ids).toContain("max");
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("high");
+  expect(ids).toContain("medium");
+  expect(ids).toContain("low");
+});
+
 test("claude opus-5 supports xhigh + max", () => {
   const ids = supportedEfforts("claude-code", "opus-5").map((o) => o.id);
   expect(ids).toContain("max");
@@ -66,10 +75,10 @@ test("claude haiku-4.5 exposes no effort options (CLI doesn't accept the flag)",
   expect(ids).toEqual([]);
 });
 
-test("claude null model falls back to DEFAULT_MODEL support set (opus-5)", () => {
+test("claude null model falls back to DEFAULT_MODEL support set (opus-5.5)", () => {
   // No model specified → use the agent's default model's support set. Since
-  // claude-code's DEFAULT_MODEL is opus-5, xhigh + max are both available.
-  expect(DEFAULT_MODEL["claude-code"]).toBe("opus-5");
+  // claude-code's DEFAULT_MODEL is opus-5.5, xhigh + max are both available.
+  expect(DEFAULT_MODEL["claude-code"]).toBe("opus-5.5");
   const ids = supportedEfforts("claude-code", null).map((o) => o.id);
   expect(ids).toContain("xhigh");
   expect(ids).toContain("max");
@@ -400,6 +409,7 @@ test("cursor model catalog includes the screenshot/default surface", () => {
   expect(ids).toContain("gpt-5.3-codex");
   expect(ids).toContain("cursor-grok-4.5");
   expect(ids).toContain("composer-2.5");
+  expect(ids).toContain("claude-opus-5-5");
   expect(ids).toContain("claude-opus-5");
   expect(ids).toContain("claude-opus-4-7");
   expect(ids).toContain("gpt-5.6-sol");
@@ -510,6 +520,29 @@ test("cursorModelArg composes Fable 5.1 efforts with no -fast variant (catalog h
 
 test("cursorModelIdCoveredByCatalog recognizes a Fable 5.1 effort variant", () => {
   expect(cursorModelIdCoveredByCatalog("claude-fable-5-1-high")).toBe(true);
+});
+
+test("cursor Opus 5.5 exposes the full max/xhigh/high/medium/low ladder", () => {
+  const ids = supportedEfforts("cursor", "claude-opus-5-5").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+});
+
+test("cursorModelArg composes Opus 5.5 efforts with -fast on every tier and the max-mode bracket", () => {
+  expect(cursorModelArg("claude-opus-5-5", "xhigh", false)).toBe("claude-opus-5-5-xhigh");
+  expect(cursorModelArg("claude-opus-5-5", "high", true)).toBe("claude-opus-5-5-high-fast");
+  expect(cursorModelSupportsFast("claude-opus-5-5", "max")).toBe(true);
+  expect(cursorModelArg("claude-opus-5-5", "xhigh", true, true)).toBe("claude-opus-5-5[context=1m,effort=xhigh,fast=true]");
+  expect(cursorModelArg("claude-opus-5-5", "medium", false, true)).toBe("claude-opus-5-5[context=1m,effort=medium,fast=false]");
+  expect(cursorModelSupportsMaxMode("claude-opus-5-5")).toBe(true);
+});
+
+test("cursorModelIdCoveredByCatalog recognizes Opus 5.5 effort variants (base, -fast) but not a -thinking- form", () => {
+  expect(cursorModelIdCoveredByCatalog("claude-opus-5-5-medium")).toBe(true);
+  expect(cursorModelIdCoveredByCatalog("claude-opus-5-5-max-fast")).toBe(true);
+  // No such Cursor id — Opus 5.5 has no -thinking- variants (unlike Opus 5).
+  expect(cursorModelIdCoveredByCatalog("claude-opus-5-5-thinking-high")).toBe(false);
+  // The Opus 5 spec still uses -thinking- ids — unaffected by the Opus 5.5 spec.
+  expect(cursorModelIdCoveredByCatalog("claude-opus-5-thinking-high")).toBe(true);
 });
 
 // These are the ids migration 055 folds into base id + effort + fast — a

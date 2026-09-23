@@ -12,7 +12,8 @@ import { stripAgentInstructionsPreamble } from "../../shared/agent-profile.ts";
  * canonicalize the image-attachment twin shapes (shared with `eventDedupKey`
  * in `lib/event-dedup.ts`), then undo agetor/claude-code-specific delivery
  * wrapping via `normalizeDeliveredUserText` (shared/user-message.ts) —
- * agetor's own typed lead-in line ahead of a bracketed-paste follow-up, and
+ * agetor's former typed lead-in line ahead of a bracketed-paste follow-up
+ * (retired; historical events only), and
  * claude CLI's `<pasted_content id="…">…</pasted_content id="…">` wrapper
  * around it (see docs/plans/pasted-content-tags.md D2) — BEFORE stripping a
  * launched-from-profile preamble: a first prompt over the argv budget is
@@ -40,8 +41,8 @@ import { stripAgentInstructionsPreamble } from "../../shared/agent-profile.ts";
  *
  * Normalizing before parsing/stripping also means a pasted send's live echo
  * (never wrapped — the wrapper is a JSONL-transcription artifact) and its
- * JSONL twin (lead-in + wrapped, or lead-in only when claude's wrapping gate
- * is off) both reduce to the exact same string here, so the caller's
+ * JSONL twin (wrapped — plus the legacy lead-in on events persisted while it
+ * was still typed) both reduce to the exact same string here, so the caller's
  * dedup-by-cleaned-text loop collapses them into one history entry instead
  * of two.
  */

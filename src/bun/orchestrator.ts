@@ -2420,7 +2420,9 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
   // (`Opus`/`Sonnet`/`Fable`/`Haiku`); an id the 2.1.246 picker can't select
   // exactly (an older pinned version within a family the picker only offers
   // the CURRENT release of — including the now-superseded `fable-5`, demoted
-  // once `fable-5.1` took over the "Fable" row — `mythos-5`, `mythos-5.1`, or
+  // once `fable-5.1` took over the "Fable" row, and `opus-5`, demoted once
+  // `opus-5.5` took over the "Opus" row on claude 2.1.280 — `mythos-5`,
+  // `mythos-5.1`, or
   // an unknown id) is a live-session no-op — the row already has the new id,
   // only the mirror into the running session is skipped.
   // `mirrorModelViaPicker`'s own resolved result already
@@ -5540,14 +5542,14 @@ export async function createTask(
   // `supportedEfforts` makes both cases resolve to `null` for gemini — that's
   // what the PATCH null-clear guard and every picker already compute for an
   // unknown id, so this closes a known inconsistency, on purpose. fx is
-  // different: 18 of its 31 curated models advertise real efforts (16
-  // live-probed 2026-09-14, openai/gpt-6-sol and openai/gpt-6-luna from the
-  // Gateway catalog 2026-09-22), so both a listed and an unlisted fx model
-  // resolve through `supportedEfforts` to `DEFAULT_EFFORT.fx` (`"auto"`)
-  // whenever the model — or the `DEFAULT_MODEL.fx` fallback used for an
-  // unlisted id — is one of those 18; only the remaining 13 no-effort fx
-  // models (e.g. `zai/glm-4.7`) resolve to `null`. That whole computation is
-  // `defaultEffortFor` below.
+  // different: 19 of its 32 curated models advertise real efforts (16
+  // live-probed 2026-09-14, plus anthropic/claude-opus-5.5, openai/gpt-6-sol
+  // and openai/gpt-6-luna from their Gateway catalog entries on 2026-09-22),
+  // so both a listed and an unlisted fx model resolve through
+  // `supportedEfforts` to `DEFAULT_EFFORT.fx` (`"auto"`) whenever the model —
+  // or the `DEFAULT_MODEL.fx` fallback used for an unlisted id — is one of
+  // those 19; only the remaining 13 no-effort fx models (e.g. `zai/glm-4.7`)
+  // resolve to `null`. That whole computation is `defaultEffortFor` below.
   //
   // A bound profile's `effort` is passthrough instead (D3/A5 in the plan) —
   // the Settings form only ever offers `supportedEfforts` rows, so a stored

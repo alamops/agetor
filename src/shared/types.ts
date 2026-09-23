@@ -1792,11 +1792,12 @@ export interface CursorModelSpec {
  * CLI happens to default to.
  */
 export const DEFAULT_MODEL: Record<AgentKind, string> = {
-  // Default to Opus 5 — the most-capable Opus, priced identically to Opus 4.8
-  // ($5/$25 per MTok). Mythos 5.1 / 5 and Fable 5.1 / 5 sit above it in the picker but
-  // cost 2x the usage, so the default stays on the most-capable non-premium
-  // tier.
-  "claude-code": "opus-5",
+  // Default to Opus 5.5 — claude CLI 2.1.280 makes it the default Opus model,
+  // and it's $4/$20 per MTok (20% below Opus 5's $5/$25) while landing at
+  // roughly Fable-5.1-level on most work per the announcement. Mythos 5.1 / 5
+  // and Fable 5.1 / 5 still sit above it in the picker but cost 2x the usage,
+  // so the default stays on the most-capable non-premium tier.
+  "claude-code": "opus-5.5",
   // Owner decision 2026-09-22 (docs/plans/add-gpt-6-sol-and-luna.md): default
   // to GPT-6 Sol, OpenAI's "daily driver for complex coding and agentic
   // workflows" (released 2026-09-22), which replaces GPT-5.6 Sol. Astra stays
@@ -1835,7 +1836,7 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // (`~/.fx/settings.json` on the reference account). Ids are Vercel AI
   // Gateway ids, passed verbatim. fx is exempt from the "always default to
   // the best available model" rule above: the Gateway bills per token to the
-  // user's own account, and flagship tiers (the fifteen `catalogOnly` rows in
+  // user's own account, and flagship tiers (the sixteen `catalogOnly` rows in
   // `AGENT_OPTIONS.fx.models`) stay one click away
   // in the picker as catalog-gated rows — offered only when the signed-in
   // account's catalog actually contains them (see `AgentOption.catalogOnly`).
@@ -1982,6 +1983,24 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
     label: "Composer 2.5",
     hint: "Cursor's own fast agentic model.",
     fastId: "composer-2.5-fast",
+  },
+  // Ids verified against `cursor-agent models` (CLI 2026.09.18-9a7762b, 245
+  // rows, 2026-09-22): claude-opus-5-5-{low,medium,high,xhigh,max}, each with
+  // a -fast variant; the unsuffixed "Claude Opus 5.5 1M" row is the -medium
+  // id (Cursor's own default tier). Unlike claude-opus-5 there are NO
+  // -thinking- variants — same shape as the Opus 4.8 spec below.
+  "claude-opus-5-5": {
+    label: "Opus 5.5",
+    hint: "Anthropic Opus 5.5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-opus-5-5-max",
+      xhigh: "claude-opus-5-5-xhigh",
+      high: "claude-opus-5-5-high",
+      medium: "claude-opus-5-5-medium",
+      low: "claude-opus-5-5-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
   },
   "claude-opus-5": {
     label: "Opus 5",
@@ -2359,8 +2378,8 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "ultra", label: "Ultra", hint: "Codex's top tier — maximum reasoning plus automatic delegation to internal sub-agents. Several times Max's usage; Codex-only today." },
   { id: "max", label: "Max thinking", hint: "Absolute maximum reasoning effort. Separate from Cursor Max Mode context." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5.1 / 5 / Mythos 5.1 / 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
-  { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5.1 / 5 / Mythos 5.1 / 5 / Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
+  { id: "high", label: "High", hint: "Deep reasoning. The API default on most models (Opus 5.5 defaults to medium)." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
   { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where Cursor exposes it." },
@@ -2388,7 +2407,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
   // effort parameter is API-supported on Fable 5.1 / 5 / Mythos 5.1 / 5 /
-  // Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is
+  // Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is
   // Fable-, Mythos-, Opus-, and Sonnet-5-only; Sonnet 4.6 has no xhigh;
   // Haiku 4.5 doesn't support effort at all). The `/effort` CLI command
   // accepts more levels but the underlying API request would fail for
@@ -2404,6 +2423,12 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "fable-5.1": ["max", "xhigh", "high", "medium", "low"],
     // Fable 5 shares Opus 4.7/4.8's request surface (effort low→max, xhigh).
     "fable-5": ["max", "xhigh", "high", "medium", "low"],
+    // Opus 5.5's docs: thinking can't be disabled ({type:"disabled"} and
+    // budget_tokens both 400 per the migration guide), so effort is the only
+    // control and there is deliberately no "none" row. API default is
+    // "medium" (Opus 5's is "high"); agetor still pins
+    // CLAUDE_CODE_EFFORT_LEVEL from DEFAULT_EFFORT at spawn.
+    "opus-5.5": ["max", "xhigh", "high", "medium", "low"],
     // Opus 5 supports the full effort ladder incl. xhigh (per claude-api skill).
     "opus-5": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.8": ["max", "xhigh", "high", "medium", "low"],
@@ -2485,7 +2510,9 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // advertise none — their Gateway catalog entry carries no
   // `reasoning_options` at all — and stay `[]`, same treatment as gemini
   // above (the picker collapses). A 29th id, spacexai/grok-4.7, joined the
-  // no-effort group on 2026-09-21 (see its row below). An
+  // no-effort group on 2026-09-21 (see its row below), and a 30th,
+  // anthropic/claude-opus-5.5, joined the effort group on 2026-09-22 on its
+  // Gateway `reasoning_options` alone (not ACP-probed — see its row). An
   // unknown/discovered-only fx id falls back to `DEFAULT_MODEL.fx`'s set via
   // `supportedEfforts`, and the driver validates at runtime against whatever
   // `effort` option fx actually returns for that session — so drift between
@@ -2526,6 +2553,12 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     // the public Gateway catalog entry, which carries no `reasoning_options`,
     // exactly like spacexai/grok-4.6. docs/plans/add-grok-4-7.md §8 A1.
     "spacexai/grok-4.7": [],
+    // 2026-09-22: not ACP-probed (no fx credentials that pass) — rests on the
+    // public Gateway catalog entry's reasoning_options (effort
+    // low/medium/high/xhigh/max, no none: thinking can't be disabled) plus
+    // fx's always-present auto, identical to the live-probed
+    // anthropic/claude-opus-5 row. docs/plans/add-claude-opus-5-5.md §8 A1.
+    "anthropic/claude-opus-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
     // 2026-09-22: openai/gpt-6-sol + openai/gpt-6-luna (released that day) —
     // from the public Gateway catalog's `reasoning_options` (effort values
     // none/low/medium/high for BOTH — narrower than openai/gpt-5.6-sol's
@@ -2643,6 +2676,7 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
     "mythos-5": [],
     "fable-5.1": [],
     "fable-5": [],
+    "opus-5.5": [],
     "opus-5": [],
     "opus-4.8": [],
     "opus-4.7": [],
@@ -2700,7 +2734,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "mythos-5", label: "Mythos 5", hint: "Prior Mythos release — Fable 5's twin; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
       { id: "fable-5.1", label: "Fable 5.1", hint: "Most capable widely released model — above Opus. Uses 2x the usage of Opus." },
       { id: "fable-5", label: "Fable 5", hint: "Prior Fable release — above Opus. Uses 2x the usage of Opus." },
-      { id: "opus-5", label: "Opus 5", hint: "Most capable Opus; same usage cost as 4.8." },
+      { id: "opus-5.5", label: "Opus 5.5", hint: "Default — Fable 5.1-level on most work; API list price $4/$20 per MTok (Opus 5: $5/$25). Thinking is always on; effort is the only control (the model's own default is medium)." },
+      { id: "opus-5", label: "Opus 5", hint: "Prior Opus release ($5/$25 per MTok)." },
       { id: "opus-4.8", label: "Opus 4.8", hint: "Prior Opus flagship." },
       { id: "opus-4.7", label: "Opus 4.7", hint: "Prior flagship; same effort range as 4.8." },
       { id: "opus-4.6", label: "Opus 4.6", hint: "Earlier Opus generation." },
@@ -2821,11 +2856,18 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // curated id is its own change (picker + tasks.model + lastModel pref);
     // the curated ∩ discovered merge already hides it wherever discovery
     // works.
+    // 2026-09-22: anthropic/claude-opus-5.5 (released the same day) added
+    // from fx 0.0.10's unauthenticated catalog (`fx models --json`, 251 ids,
+    // auth: missing — the -fast twin anthropic/claude-opus-5.5-fast is also
+    // listed and stays discovery-only like claude-opus-5-fast); its presence
+    // in a standard signed-in account is unverified, hence catalogOnly —
+    // fourteen catalogOnly rows, 30 curated ids total. 29 of the 30 are
+    // present; mistral/devstral-2 is still absent (see the 2026-09-21 note).
     // 2026-09-22: openai/gpt-6-sol and openai/gpt-6-luna (released the same
     // day) added from fx 0.0.10's unauthenticated catalog (255 ids that day,
-    // up from 246; every prior curated id still present except
+    // up from 246; every prior curated id — opus-5.5 included — still present except
     // mistral/devstral-2, still gone); signed-in presence unverified, hence
-    // catalogOnly — fifteen catalogOnly rows, 31 curated ids total.
+    // catalogOnly — sixteen catalogOnly rows, 32 curated ids total.
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
@@ -2856,6 +2898,7 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "zai/glm-5.3", label: "GLM-5.3", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "spacexai/grok-4.7", label: "Grok 4.7", hint: "500K context · 500K output — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-opus-5.5", label: "Claude Opus 5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "openai/gpt-6-sol", label: "GPT-6 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "openai/gpt-6-luna", label: "GPT-6 Luna", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
@@ -2864,8 +2907,10 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
-    // 18 of the 31 curated models accept the effort flag (see
-    // MODEL_EFFORT_SUPPORT.fx — live-probed on fx 0.0.10); the other 13
+    // 19 of the 32 curated models accept the effort flag (see
+    // MODEL_EFFORT_SUPPORT.fx — 16 live-probed on fx 0.0.10, plus
+    // anthropic/claude-opus-5.5, openai/gpt-6-sol and openai/gpt-6-luna from
+    // their Gateway reasoning_options, all 2026-09-22); the other 13
     // report an empty set and the picker collapses for those, same as any
     // other kind's no-effort models. Every id-supported model always
     // includes `auto` (fx's own default) last, per EFFORT_OPTIONS.

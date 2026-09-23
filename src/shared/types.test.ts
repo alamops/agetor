@@ -156,9 +156,12 @@ test("MODEL_EFFORT_SUPPORT.fx's keys exactly match AGENT_OPTIONS.fx.models' ids 
 
 /* ── fx effort (docs/plans/fx-0.0.10-compat.md §3 shared spec / T1) ──────── */
 
-// The 16 effort-advertising ids, live-probed on fx 0.0.10 (spike
+// The 17 effort-advertising ids, live-probed on fx 0.0.10 (spike
 // fx-0010-efforts, 2026-09-14) — copied verbatim from the plan's shared-spec
-// table (§3). Every row ends in "auto" (fx's own default, off-scale).
+// table (§3). Every row ends in "auto" (fx's own default, off-scale). The
+// 17th, anthropic/claude-opus-5.5 (2026-09-22), rests on the Gateway
+// catalog's reasoning_options rather than an ACP probe (no credentials) —
+// docs/plans/add-claude-opus-5-5.md §8 A1.
 const FX_EFFORT_MODELS: Record<string, string[]> = {
   "zai/glm-5.3-flash": ["max", "high", "low", "auto"],
   "openai/gpt-5.2": ["xhigh", "high", "medium", "low", "none", "auto"],
@@ -176,6 +179,7 @@ const FX_EFFORT_MODELS: Record<string, string[]> = {
   "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
   "zai/glm-5.3": ["max", "high", "low", "auto"],
   "deepseek/deepseek-v4-pro": ["xhigh", "high", "auto"],
+  "anthropic/claude-opus-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
   // 2026-09-22: from the public Gateway catalog's reasoning_options for both
   // ids (docs/plans/add-gpt-6-sol-and-luna.md).
   "openai/gpt-6-sol": ["high", "medium", "low", "none", "auto"],
@@ -202,7 +206,7 @@ const FX_NO_EFFORT_MODELS = [
   "spacexai/grok-4.7",
 ];
 
-test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan §3 shared spec) — 18 effort models each end in auto, 13 named models are empty", () => {
+test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan §3 shared spec) — 19 effort models each end in auto, 13 named models are empty", () => {
   for (const [id, expected] of Object.entries(FX_EFFORT_MODELS)) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual(expected);
     expect(expected[expected.length - 1]).toBe("auto");
@@ -210,10 +214,10 @@ test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan
   for (const id of FX_NO_EFFORT_MODELS) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual([]);
   }
-  // The two lists above are exactly the 31 curated fx ids, no more no less.
-  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(18);
+  // The two lists above are exactly the 32 curated fx ids, no more no less.
+  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(19);
   expect(FX_NO_EFFORT_MODELS.length).toBe(13);
-  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(31);
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(32);
 });
 
 test("DEFAULT_EFFORT.fx is 'auto' (fx's own default — owner decision D1, docs/plans/fx-0.0.10-compat.md §8)", () => {
@@ -279,7 +283,7 @@ test("none of the seven previously-curated fx ids survives as an unconditional r
   expect(Object.keys(MODEL_EFFORT_SUPPORT.fx)).not.toContain("google/gemini-3-pro");
 });
 
-test("exactly the fifteen catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
+test("exactly the sixteen catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
   const expectedCatalogOnly = new Set([
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-5",
@@ -299,6 +303,9 @@ test("exactly the fifteen catalog-gated Gateway ids are catalogOnly in AGENT_OPT
     // 2026-09-21 (docs/plans/add-grok-4-7.md) — signed-in presence unverified,
     // same reason google/gemini-3.8-flash is gated.
     "spacexai/grok-4.7",
+    // 2026-09-22 (docs/plans/add-claude-opus-5-5.md) — signed-in presence
+    // unverified, same reason as grok-4.7.
+    "anthropic/claude-opus-5.5",
     // 2026-09-22 (docs/plans/add-gpt-6-sol-and-luna.md) — released the same
     // day; signed-in presence unverified, same treatment as the rows above.
     "openai/gpt-6-sol",
@@ -308,7 +315,7 @@ test("exactly the fifteen catalog-gated Gateway ids are catalogOnly in AGENT_OPT
     AGENT_OPTIONS.fx.models.filter((m) => m.catalogOnly).map((m) => m.id),
   );
   expect(actualCatalogOnly).toEqual(expectedCatalogOnly);
-  expect(actualCatalogOnly.size).toBe(15);
+  expect(actualCatalogOnly.size).toBe(16);
 
   for (const kind of KINDS) {
     if (kind === "fx") continue;
@@ -318,7 +325,7 @@ test("exactly the fifteen catalog-gated Gateway ids are catalogOnly in AGENT_OPT
   }
 });
 
-test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (thirteen catalogOnly rows included)", () => {
+test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (sixteen catalogOnly rows included)", () => {
   // Narrower restatement of the bidirectional-keys test above, scoped to
   // just the fx picker's own ids — guards specifically against a
   // catalogOnly row landing in AGENT_OPTIONS.fx.models without a paired

@@ -93,7 +93,7 @@ export function searchableEventText(stream: RunEventStream, data: string): strin
       return data;
     case "user":
       // Match what the bubble SHOWS, not the raw wire text: `UserMessageBlock`
-      // strips agetor's typed paste lead-in and unwraps claude's
+      // strips agetor's former paste lead-in (legacy events only) and unwraps claude's
       // `<pasted_content id="…">` wrapper (docs/plans/pasted-content-tags.md),
       // so a raw match on `pasted_content` or the lead-in phrase would jump to
       // a bubble containing neither. Same CR→LF-then-normalize order the

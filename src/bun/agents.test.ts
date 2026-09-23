@@ -229,6 +229,16 @@ test("claude-code 'opus-4.8' maps to --model claude-opus-4-8", () => {
   ]);
 });
 
+test("claude-code 'opus-5.5' maps to --model claude-opus-5-5", () => {
+  const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "opus-5.5", mode: "auto" });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-opus-5-5",
+    "--permission-mode", "auto",
+    "--", "do thing",
+  ]);
+});
+
 test("claude-code 'opus-5' maps to --model claude-opus-5", () => {
   const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "opus-5", mode: "auto" });
   expect(cmd).toEqual([
@@ -298,7 +308,7 @@ test("claude-code 'sonnet-5' maps to --model claude-sonnet-5", () => {
 // ---------------------------------------------------------------------------
 
 test("claudeModelPickerFamily maps each current-release id to its picker row family", () => {
-  expect(claudeModelPickerFamily("opus-5")).toBe("Opus");
+  expect(claudeModelPickerFamily("opus-5.5")).toBe("Opus");
   expect(claudeModelPickerFamily("sonnet-5")).toBe("Sonnet");
   expect(claudeModelPickerFamily("fable-5.1")).toBe("Fable");
   expect(claudeModelPickerFamily("haiku-4.5")).toBe("Haiku");
@@ -314,6 +324,10 @@ test("claudeModelPickerFamily returns null for ids the picker's single per-famil
   expect(claudeModelPickerFamily("sonnet-4.6")).toBeNull();
   // fable-5 is now superseded by fable-5.1 — same "wrong version" hazard.
   expect(claudeModelPickerFamily("fable-5")).toBeNull();
+  // opus-5 is now superseded by opus-5.5 — claude 2.1.280 makes
+  // claude-opus-5-5 the default Opus model, so the picker's Opus row would
+  // land on the wrong version.
+  expect(claudeModelPickerFamily("opus-5")).toBeNull();
   // No picker row at all for either Mythos id.
   expect(claudeModelPickerFamily("mythos-5")).toBeNull();
   expect(claudeModelPickerFamily("mythos-5.1")).toBeNull();
