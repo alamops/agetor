@@ -3979,6 +3979,42 @@ export type GlobalEvent =
     };
 
 /**
+ * Phase of an in-progress `git clone`, as parsed from git's own `--progress`
+ * stderr output by `parseCloneProgress` (`src/bun/clone.ts`,
+ * docs/plans/clone-repository-all-providers.md Addendum A). Shared here
+ * because it also rides the `clone_progress` AppEvent below (server.ts
+ * broadcasts one per parsed/synthetic progress record; the webview and the
+ * CLI both consume it over `GET /app/events`).
+ *
+ *   starting     — before the transfer begins — git's own "Cloning into
+ *                  '<dest>'..." line, AND the synthetic event `cloneRepo`
+ *                  emits itself before attempt 1 and before a token retry
+ *                  (neither of those two carries a real git process yet).
+ *   counting     — `remote: Enumerating objects` / `remote: Counting
+ *                  objects: NN%`.
+ *   compressing  — `remote: Compressing objects: NN%`.
+ *   receiving    — `Receiving objects: NN%` — the actual object transfer.
+ *   resolving    — `Resolving deltas: NN%`.
+ *   checking-out — `Updating files: NN%` — writing the working tree.
+ *   done         — `cloneRepo`'s own synthetic terminal event: the clone
+ *                  succeeded.
+ *   failed       — `cloneRepo`'s own synthetic terminal event: the clone
+ *                  failed (see the accompanying `CloneProgress.line`).
+ *   cancelled    — `cloneRepo`'s own synthetic terminal event: `cancelClone`
+ *                  killed the in-flight git process for this clone.
+ */
+export type CloneProgressPhase =
+  | "starting"
+  | "counting"
+  | "compressing"
+  | "receiving"
+  | "resolving"
+  | "checking-out"
+  | "done"
+  | "failed"
+  | "cancelled";
+
+/**
  * App-level events the webview subscribes to over `GET /app/events`. Used
  * for cross-cutting flows that aren't tied to a single task — currently:
  *
@@ -3993,6 +4029,15 @@ export type GlobalEvent =
  *   agent_models_changed — the model-discovery scheduler re-probed one or
  *                  more harnesses' CLI model catalogs and at least one list
  *                  changed. Webview refetches `GET /agent-models/harnesses`.
+ *   clone_progress — one progress update (or a terminal done/failed/
+ *                  cancelled) for the in-flight `POST /projects/clone`
+ *                  identified by `cloneId` — see `CloneProgressPhase` above.
+ *                  `percent` is `null` whenever git's own output didn't
+ *                  carry one for that record (e.g. `remote: Enumerating
+ *                  objects` and every synthetic phase but `done`). `line` is
+ *                  already sanitized/length-capped and never carries a
+ *                  credential (docs/plans/clone-repository-all-providers.md
+ *                  Addendum A).
  */
 export type AppEvent =
   | {
@@ -4014,6 +4059,14 @@ export type AppEvent =
   | {
       type: "agent_models_changed";
       harnessIds: string[];
+      ts: number;
+    }
+  | {
+      type: "clone_progress";
+      cloneId: string;
+      phase: CloneProgressPhase;
+      percent: number | null;
+      line: string;
       ts: number;
     };
 

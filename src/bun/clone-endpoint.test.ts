@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { AGENT_OPTIONS, DEFAULT_MODEL } from "../shared/types.ts";
-import type { AgentProfile, Project, Task } from "../shared/types.ts";
+import type { AgentProfile, AppEvent, Project, Task } from "../shared/types.ts";
+import { CLONE_PROVIDERS } from "../shared/clone-input.ts";
+import { makeBareSourceRepo, startAuthGitServer } from "./clone-test-util.ts";
+import { subscribeAppEvents } from "./quit-guard.ts";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-clone-endpoint-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
@@ -40,6 +45,8 @@ writeFileSync(
     + `exit 0\n`,
   { mode: 0o755 },
 );
+let clearApiHostCacheForTest: () => void;
+let savedSshBin: string | undefined;
 
 beforeAll(async () => {
   ({ tasks, agentProfiles, harnesses } = await import("./db.ts"));
@@ -67,10 +74,32 @@ beforeAll(async () => {
   git("add", ".");
   git("commit", "-q", "-m", "init");
   process.env.AGETOR_CLONE_SOURCE_OVERRIDE = source;
+
+  // Deterministic host resolution for the multi-provider tests below (GHES /
+  // dotless-alias / Bitbucket-Server rejection): point AGETOR_SSH_BIN at a
+  // throwaway identity stub instead of letting `apiHostForRemote` shell out
+  // to the real `ssh` and this machine's actual ~/.ssh/config — same idiom
+  // as `git-provider.test.ts`. An identity stub (`ssh -G -- <host>` just
+  // echoes `<host>` back as `hostname <host>`) is enough for every case
+  // here: none of these hostnames have a real alias to resolve, the point is
+  // only to make "no matching config entry" deterministic across machines
+  // rather than dependent on whatever the CI/dev box's real ssh reports.
+  const { __clearApiHostCacheForTest } = await import("./git-provider.ts");
+  clearApiHostCacheForTest = __clearApiHostCacheForTest;
+  savedSshBin = process.env.AGETOR_SSH_BIN;
+  const sshStubDir = path.join(WORK_DIR, "ssh-stub");
+  mkdirSync(sshStubDir);
+  const sshStubPath = path.join(sshStubDir, "ssh");
+  writeFileSync(sshStubPath, '#!/bin/sh\necho "hostname $3"\n', { mode: 0o755 });
+  process.env.AGETOR_SSH_BIN = sshStubPath;
+  clearApiHostCacheForTest();
 });
 
 afterAll(() => {
   delete process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+  if (savedSshBin === undefined) delete process.env.AGETOR_SSH_BIN;
+  else process.env.AGETOR_SSH_BIN = savedSshBin;
+  clearApiHostCacheForTest?.();
   server?.stop?.();
   rmSync(WORK_DIR, { recursive: true, force: true });
 });
@@ -91,13 +120,18 @@ test("POST /projects/clone without url returns 400", async () => {
   expect(((await res.json()) as { error: string }).error).toContain("url required");
 });
 
-test("POST /projects/clone rejects a non-GitHub url", async () => {
+test("POST /projects/clone rejects an unsupported host", async () => {
+  const projectsBefore = (await (await call("/projects")).json()) as Project[];
   const res = await call("/projects/clone", {
     method: "POST",
-    body: JSON.stringify({ url: "https://gitlab.com/foo/bar" }),
+    body: JSON.stringify({ url: "https://example.com/foo/bar" }),
   });
   expect(res.status).toBe(400);
-  expect(((await res.json()) as { error: string }).error).toContain("GitHub");
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain('unsupported host "example.com"');
+  expect(body.error).toContain("GitHub, GitLab or Bitbucket Cloud");
+  const projectsAfter = (await (await call("/projects")).json()) as Project[];
+  expect(projectsAfter.length).toBe(projectsBefore.length);
 });
 
 test("POST /projects/clone rejects a relative dest", async () => {
@@ -175,7 +209,8 @@ test("a failing clone returns 502 and registers nothing", async () => {
       body: JSON.stringify({ url: "someowner/deadrepo", dest }),
     });
     expect(res.status).toBe(502);
-    expect(((await res.json()) as { error: string }).error).toContain("clone failed");
+    const failBody = (await res.json()) as { error: string };
+    expect(failBody.error.startsWith("clone failed:")).toBe(true);
     const listed = (await (await call("/projects")).json()) as Project[];
     expect(listed.some((p) => p.path === dest)).toBe(false);
   } finally {
@@ -401,3 +436,455 @@ test("agentProfileId: null is accepted as no profile", async () => {
   expect(task).not.toBeNull();
   expect(task.agentProfileId ?? null).toBeNull();
 });
+
+// --- Multi-provider clone support (docs/plans/clone-repository-all-providers.md
+// §3 D6, §5 TT3): every host/transport/shorthand combination the shared
+// parser + resolveCloneRepo accept, the provider field in the route's
+// response, and the rejection paths (unsupported host, Bitbucket Server,
+// dotless-alias-over-https, bad `provider` values, cloud-port guard). All of
+// these still go through AGETOR_CLONE_SOURCE_OVERRIDE — no real network
+// clone ever happens — and the AGETOR_SSH_BIN identity stub installed in
+// beforeAll makes the host-resolution-dependent rejections deterministic. ---
+
+test("GitLab https URL with nested groups clones, registers the last segment as the project name, and reports provider gitlab", async () => {
+  const dest = path.join(WORK_DIR, "clone-gitlab-nested");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://gitlab.com/group/sub/project", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { project: Project; provider: string };
+  expect(body.provider).toBe("gitlab");
+  expect(body.project.name).toBe("project");
+  expect(body.project.path).toBe(dest);
+  expect(existsSync(path.join(dest, "README.md"))).toBe(true);
+});
+
+test("Bitbucket https URL clones and reports provider bitbucket", async () => {
+  const dest = path.join(WORK_DIR, "clone-bitbucket");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://bitbucket.org/someowner/bbrepo", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { project: Project; provider: string };
+  expect(body.provider).toBe("bitbucket");
+  expect(body.project.name).toBe("bbrepo");
+  expect(existsSync(path.join(dest, "README.md"))).toBe(true);
+});
+
+test("scp-form GitHub URL clones through the override and reports provider github", async () => {
+  const dest = path.join(WORK_DIR, "clone-github-scp");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "git@github.com:foo/bar.git", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { project: Project; provider: string };
+  expect(body.provider).toBe("github");
+  expect(body.project.name).toBe("bar");
+  expect(existsSync(path.join(dest, "README.md"))).toBe(true);
+});
+
+test("shorthand + provider: gitlab accepts a nested group path", async () => {
+  const dest = path.join(WORK_DIR, "clone-shorthand-gitlab");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "group/sub/project", provider: "gitlab", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { project: Project; provider: string };
+  expect(body.provider).toBe("gitlab");
+  expect(body.project.name).toBe("project");
+});
+
+test("the same 3-segment shorthand with no provider defaults to github and is rejected", async () => {
+  const dest = path.join(WORK_DIR, "clone-shorthand-no-provider");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "group/sub/project", dest }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("invalid repository path");
+  expect(existsSync(dest)).toBe(false);
+});
+
+test('provider: "svn" is rejected as an unsupported provider value', async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "foo/bar", provider: "svn" }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toBe(`provider must be one of ${CLONE_PROVIDERS.join(", ")}`);
+});
+
+test("provider: 42 (non-string) is rejected the same way", async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "foo/bar", provider: 42 }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toBe(`provider must be one of ${CLONE_PROVIDERS.join(", ")}`);
+});
+
+test("provider: null is treated as absent (defaults to github)", async () => {
+  const dest = path.join(WORK_DIR, "clone-provider-null");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/nullprovider", provider: null, dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { provider: string };
+  expect(body.provider).toBe("github");
+});
+
+test("a full URL's detected provider wins over a conflicting provider body field", async () => {
+  const dest = path.join(WORK_DIR, "clone-provider-conflict");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://gitlab.com/g/p", provider: "github", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { provider: string; project: Project };
+  expect(body.provider).toBe("gitlab");
+  expect(body.project.name).toBe("p");
+});
+
+test("Bitbucket Server / Data Center is rejected up front, nothing on disk", async () => {
+  const projectsBefore = (await (await call("/projects")).json()) as Project[];
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://bitbucket.company.com/scm/proj/repo.git" }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("Bitbucket Server / Data Center is not supported");
+  const projectsAfter = (await (await call("/projects")).json()) as Project[];
+  expect(projectsAfter.length).toBe(projectsBefore.length);
+});
+
+test("GitHub Enterprise Server over https is rejected", async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://github.mycompany.com/o/r" }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("GitHub Enterprise Server");
+});
+
+test("a dotless ssh-alias host over https is rejected with the SSH-URL hint", async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://github-work/o/r" }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("looks like an SSH alias");
+  expect(body.error).toContain("paste the SSH URL instead");
+});
+
+test("a non-default port on a cloud host is rejected", async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "https://gitlab.com:8443/g/p" }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("unexpected port");
+});
+
+test("an invalid launch selection still 400s before cloning, even for a non-GitHub URL", async () => {
+  const dest = path.join(WORK_DIR, "clone-order-multiprovider");
+  const before = tasks.list().length;
+  const projectsBefore = (await (await call("/projects")).json()) as Project[];
+
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({
+      url: "https://gitlab.com/someowner/ordertest",
+      dest,
+      agentProfileId: "no-such-profile",
+    }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("unknown agent profile");
+
+  expect(existsSync(dest)).toBe(false);
+  const projectsAfter = (await (await call("/projects")).json()) as Project[];
+  expect(projectsAfter.some((p) => p.path === dest)).toBe(false);
+  expect(projectsAfter.length).toBe(projectsBefore.length);
+  expect(tasks.list().length).toBe(before);
+});
+
+test("a successful clone's response is exactly {project, provider, cloneId, eli5TaskId, eli5Error}", async () => {
+  const dest = path.join(WORK_DIR, "clone-response-shape");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/shaperepo", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as Record<string, unknown>;
+  expect(Object.keys(body).sort()).toEqual(["cloneId", "eli5Error", "eli5TaskId", "project", "provider"]);
+  expect(body.provider).toBe("github");
+  expect(body.cloneId).toMatch(UUID_RE);
+  expect(body.eli5TaskId).toBeNull();
+  expect(body.eli5Error).toBeNull();
+});
+
+// --- Clone id round-trip + progress/cancel (docs/plans/
+// clone-repository-all-providers.md Addendum A, P2: the `cloneId` body/
+// response field, the `clone_progress` AppEvent broadcast, and
+// `DELETE /projects/clone/:cloneId`). ---
+
+test("a cloneId is minted and returned when the caller doesn't send one", async () => {
+  const dest = path.join(WORK_DIR, "clone-id-minted");
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/cloneidminted", dest, eli5: false }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { cloneId: string };
+  expect(body.cloneId).toMatch(UUID_RE);
+});
+
+test("a caller-minted cloneId is echoed back verbatim", async () => {
+  const dest = path.join(WORK_DIR, "clone-id-echoed");
+  const sent = crypto.randomUUID();
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/cloneidechoed", dest, eli5: false, cloneId: sent }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { cloneId: string };
+  expect(body.cloneId).toBe(sent);
+});
+
+test("a malformed cloneId is rejected with 400 before anything is resolved", async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/badcloneid", cloneId: "not-a-uuid" }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string; cloneId?: string };
+  expect(body.error).toBe("cloneId must be a UUID");
+  // The id was never accepted, so there's nothing to echo.
+  expect(body.cloneId).toBeUndefined();
+});
+
+test("a non-string cloneId is rejected with 400", async () => {
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: "someowner/badcloneidtype", cloneId: 12345 }),
+  });
+  expect(res.status).toBe(400);
+  expect(((await res.json()) as { error: string }).error).toBe("cloneId must be a UUID");
+});
+
+test("clone_progress AppEvents are broadcast for a successful clone, tagged with the request's cloneId, starting with `starting` and ending with `done`, and never carry a credential-shaped line", async () => {
+  const cloneId = crypto.randomUUID();
+  const events: AppEvent[] = [];
+  const unsubscribe = subscribeAppEvents((e) => {
+    if (e.type === "clone_progress" && e.cloneId === cloneId) events.push(e);
+  });
+  try {
+    const dest = path.join(WORK_DIR, "clone-progress-events");
+    const res = await call("/projects/clone", {
+      method: "POST",
+      body: JSON.stringify({ url: "someowner/progressevents", dest, eli5: false, cloneId }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { cloneId: string };
+    expect(body.cloneId).toBe(cloneId);
+
+    expect(events.length).toBeGreaterThanOrEqual(2);
+    expect(events[0]).toMatchObject({ type: "clone_progress", cloneId, phase: "starting" });
+    expect(events.at(-1)).toMatchObject({ type: "clone_progress", cloneId, phase: "done" });
+    for (const e of events) {
+      if (e.type !== "clone_progress") continue;
+      expect(e.line).not.toMatch(/authorization|bearer|basic\s+[a-z0-9+/=]{8,}/i);
+    }
+  } finally {
+    unsubscribe();
+  }
+});
+
+test("DELETE /projects/clone/:cloneId for an unknown id returns 404", async () => {
+  const res = await call(`/projects/clone/${crypto.randomUUID()}`, { method: "DELETE" });
+  expect(res.status).toBe(404);
+  expect(((await res.json()) as { error: string }).error).toBe("no clone in flight with that id");
+});
+
+test("DELETE /projects/clone/:cloneId with a malformed id returns 400", async () => {
+  const res = await call("/projects/clone/not-a-uuid", { method: "DELETE" });
+  expect(res.status).toBe(400);
+  expect(((await res.json()) as { error: string }).error).toBe("cloneId must be a UUID");
+});
+
+test(
+  "cancelling an in-flight clone via DELETE resolves the held POST 409 { cancelled: true }, registers nothing, leaves the destination absent, and broadcasts a terminal `cancelled` progress event",
+  async () => {
+    const sourceRoot = mkdtempSync(path.join(tmpdir(), "agetor-clone-endpoint-cancel-src-"));
+    makeBareSourceRepo(sourceRoot);
+    // A generous per-request delay gives this test a wide window to send the
+    // DELETE while attempt 1's anonymous request is still held by the
+    // server — same idiom as clone.test.ts's own cancel tests.
+    const gitServer = startAuthGitServer(sourceRoot, { delayMs: 4_000 });
+    const prevOverride = process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+    process.env.AGETOR_CLONE_SOURCE_OVERRIDE = `${gitServer.url}/repo.git`;
+
+    const cloneId = crypto.randomUUID();
+    const events: AppEvent[] = [];
+    const unsubscribe = subscribeAppEvents((e) => {
+      if (e.type === "clone_progress" && e.cloneId === cloneId) events.push(e);
+    });
+
+    try {
+      const dest = path.join(WORK_DIR, "clone-cancel-endpoint");
+      const projectsBefore = (await (await call("/projects")).json()) as Project[];
+
+      const postPromise = call("/projects/clone", {
+        method: "POST",
+        body: JSON.stringify({ url: "someowner/cancelendpoint", dest, eli5: false, cloneId }),
+      });
+
+      // Give git a moment to actually spawn, connect, and issue its first
+      // request — then cancel while that request is still held by the
+      // server's delay.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const delRes = await call(`/projects/clone/${cloneId}`, { method: "DELETE" });
+      expect(delRes.status).toBe(200);
+      expect(await delRes.json()).toEqual({ ok: true });
+
+      const postRes = await postPromise;
+      expect(postRes.status).toBe(409);
+      expect(await postRes.json()).toEqual({ error: "clone cancelled", cancelled: true, cloneId });
+
+      // `dest` never pre-existed, so a cancelled clone leaves it absent
+      // entirely — see cloneRepo's own doc comment.
+      expect(existsSync(dest)).toBe(false);
+      const projectsAfter = (await (await call("/projects")).json()) as Project[];
+      expect(projectsAfter.length).toBe(projectsBefore.length);
+      expect(projectsAfter.some((p) => p.path === dest)).toBe(false);
+
+      expect(events.some((e) => e.type === "clone_progress" && e.phase === "cancelled")).toBe(true);
+      expect(events.at(-1)).toMatchObject({ type: "clone_progress", cloneId, phase: "cancelled" });
+    } finally {
+      unsubscribe();
+      if (prevOverride === undefined) delete process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+      else process.env.AGETOR_CLONE_SOURCE_OVERRIDE = prevOverride;
+      gitServer.stop();
+      rmSync(sourceRoot, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
+
+test(
+  "a duplicate in-flight cloneId 409s the second POST, doesn't disturb the first, and frees up once the first settles",
+  async () => {
+    const sourceRoot = mkdtempSync(path.join(tmpdir(), "agetor-clone-endpoint-dup-src-"));
+    makeBareSourceRepo(sourceRoot);
+    // Same idiom as the cancel tests above: a generous per-request delay
+    // keeps the first POST's clone in flight long enough to fire the
+    // duplicate POST and the cancelling DELETE against it.
+    const gitServer = startAuthGitServer(sourceRoot, { delayMs: 4_000 });
+    const prevOverride = process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+    process.env.AGETOR_CLONE_SOURCE_OVERRIDE = `${gitServer.url}/repo.git`;
+    try {
+      const cloneId = crypto.randomUUID();
+      const dest1 = path.join(WORK_DIR, "clone-dup-id-1");
+      const dest2 = path.join(WORK_DIR, "clone-dup-id-2");
+
+      const firstPostPromise = call("/projects/clone", {
+        method: "POST",
+        body: JSON.stringify({ url: "someowner/dupclonefirst", dest: dest1, eli5: false, cloneId }),
+      });
+
+      // Give git a moment to actually spawn, connect, and issue its first
+      // request — same wait as the cancel tests — before racing the
+      // duplicate POST and the DELETE against the same id.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // A second POST reusing the same in-flight cloneId is rejected...
+      const dupRes = await call("/projects/clone", {
+        method: "POST",
+        body: JSON.stringify({ url: "someowner/dupclonesecond", dest: dest2, eli5: false, cloneId }),
+      });
+      expect(dupRes.status).toBe(409);
+      expect(await dupRes.json()).toEqual({
+        error: "a clone with that id is already in flight",
+        cloneId,
+      });
+      // ...and nothing was cloned/registered for the rejected duplicate.
+      expect(existsSync(dest2)).toBe(false);
+
+      // The DELETE still targets the FIRST (real) clone under that id, not
+      // the rejected duplicate — cancelling it still works exactly as
+      // before the duplicate-guard existed.
+      const delRes = await call(`/projects/clone/${cloneId}`, { method: "DELETE" });
+      expect(delRes.status).toBe(200);
+      expect(await delRes.json()).toEqual({ ok: true });
+
+      const firstRes = await firstPostPromise;
+      expect(firstRes.status).toBe(409);
+      expect(await firstRes.json()).toEqual({ error: "clone cancelled", cancelled: true, cloneId });
+      expect(existsSync(dest1)).toBe(false);
+
+      // The id is free again now that the first request has settled: a
+      // fresh POST reusing it succeeds (or fails) on its own merits, never
+      // with the duplicate-in-flight error. Point the source override back
+      // at the fast fixture repo from beforeAll (rather than the slow git
+      // server) so this assertion doesn't also pay the 4s-per-request delay.
+      process.env.AGETOR_CLONE_SOURCE_OVERRIDE = prevOverride;
+      const dest3 = path.join(WORK_DIR, "clone-dup-id-reused");
+      const reusedRes = await call("/projects/clone", {
+        method: "POST",
+        body: JSON.stringify({ url: "someowner/dupclonereused", dest: dest3, eli5: false, cloneId }),
+      });
+      expect(reusedRes.status).not.toBe(409);
+      const reusedBody = (await reusedRes.json()) as { error?: string; cloneId?: string };
+      expect(reusedBody.error).not.toBe("a clone with that id is already in flight");
+    } finally {
+      if (prevOverride === undefined) delete process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+      else process.env.AGETOR_CLONE_SOURCE_OVERRIDE = prevOverride;
+      gitServer.stop();
+      rmSync(sourceRoot, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
+
+test("a second DELETE for an already-settled cloneId 404s (the registry entry is gone)", async () => {
+  const sourceRoot = mkdtempSync(path.join(tmpdir(), "agetor-clone-endpoint-cancel-src2-"));
+  makeBareSourceRepo(sourceRoot);
+  const gitServer = startAuthGitServer(sourceRoot, { delayMs: 4_000 });
+  const prevOverride = process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+  process.env.AGETOR_CLONE_SOURCE_OVERRIDE = `${gitServer.url}/repo.git`;
+  try {
+    const cloneId = crypto.randomUUID();
+    const dest = path.join(WORK_DIR, "clone-cancel-endpoint-twice");
+    const postPromise = call("/projects/clone", {
+      method: "POST",
+      body: JSON.stringify({ url: "someowner/cancelendpointtwice", dest, eli5: false, cloneId }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const firstDelete = await call(`/projects/clone/${cloneId}`, { method: "DELETE" });
+    expect(firstDelete.status).toBe(200);
+
+    await postPromise;
+
+    const secondDelete = await call(`/projects/clone/${cloneId}`, { method: "DELETE" });
+    expect(secondDelete.status).toBe(404);
+  } finally {
+    if (prevOverride === undefined) delete process.env.AGETOR_CLONE_SOURCE_OVERRIDE;
+    else process.env.AGETOR_CLONE_SOURCE_OVERRIDE = prevOverride;
+    gitServer.stop();
+    rmSync(sourceRoot, { recursive: true, force: true });
+  }
+}, 30_000);
