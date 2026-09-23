@@ -44,6 +44,13 @@ const FAKE_CLAUDE_HANDOFF_PROMPT_MARKER = "__agetor_fake_claude_handoff__";
 // would even finish.
 const RESOLVE_DELAY_MS = "3000";
 const CONVERGE_TIMEOUT = 20_000;
+// A "handoff-missing"/"handoff-invalid" classification now costs TWO
+// fake-driver turns before the run actually blocks (65f8a75): the original
+// turn, then the runner's one automatic reminder round-trip (a fresh
+// `sendInput` turn on the same step task, which itself pays the same
+// RESOLVE_DELAY_MS). Scenarios that exercise that reminder path need extra
+// headroom over the single-turn CONVERGE_TIMEOUT above.
+const REMINDER_TIMEOUT = 35_000;
 
 function auth(backend: E2EBackend): { authorization: string; "content-type": string } {
   return { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
@@ -178,6 +185,23 @@ function stepNode(page: Page, stepId: string): Locator {
   return page.locator(`[data-testid="pipeline-step-node"][data-step-id="${stepId}"]`);
 }
 
+// `run.history` renders newest-first (`[...run.history].reverse()` in
+// PipelineRunView), so a linear pipeline's history rows are NOT in step
+// execution order — pick a step's own row by the "#<seq> <stepName>" text
+// `HistoryRow` renders at the start of its button, rather than relying on
+// list position. No `\b`/whitespace after the step name: the button's
+// "#<seq> <stepName>" span and the outcome span right after it
+// (`succeeded · 3s`) are separate DOM text nodes with no literal space
+// between them, so `textContent` glues them together (e.g. "#1 Asucceeded
+// · 6s") — a trailing `\b` would never match. The step names used in this
+// file are single, non-prefixing letters (A/B/C/D), so a bare prefix match
+// is unambiguous.
+function historyRowFor(page: Page, stepName: string): Locator {
+  return page
+    .locator('[data-testid="pipeline-run-history-row"]')
+    .filter({ hasText: new RegExp(`^#\\d+ ${stepName}`) });
+}
+
 async function openPipelineRunFromBoard(page: Page, backend: E2EBackend, title: string): Promise<void> {
   await gotoApp(page, backend.bootBase);
   await boardCard(page, title).click();
@@ -292,7 +316,12 @@ test.describe("pipelines run: executing a run", () => {
 
     const historyRows = page.locator('[data-testid="pipeline-run-history-row"]');
     await expect(historyRows).toHaveCount(3);
-    await historyRows.first().click();
+    // 65f8a75 added a response-kind chip under each row's toggle button
+    // (`responseKind` is now stamped on every settled record, not just a
+    // reminded one), which grew the row's height enough that a plain
+    // click on the row's own center can miss the button — click the
+    // button itself instead of relying on that coincidence.
+    await historyRows.first().getByRole("button").first().click();
     await expect(historyRows.first().getByTestId("pipeline-run-history-handoff")).toBeVisible();
     await expect(historyRows.first().getByTestId("pipeline-run-history-handoff")).toContainText("schemaVersion");
 
@@ -328,7 +357,16 @@ test.describe("pipelines run: executing a run", () => {
   // exceeded" / React Flow `StoreUpdater` crash documented on the "linear
   // A->B->C run" test above, which used to strike right after the manual
   // Advance here (a real edge/step transition).
-  test("blocked on a missing handoff: shows 'handoff-missing'; manual advance to the next step finishes the run", async ({
+  //
+  // 65f8a75: a "handoff-missing" response no longer blocks the run
+  // immediately — the runner first sends ONE automatic reminder (an
+  // ordinary follow-up `sendInput` turn on A's own step task) and only
+  // blocks if A's NEXT reply still lacks a valid `<handoff>`. A's own
+  // `:missing` marker (from the goal text, unqualified by any
+  // `-then-<token>` suffix) behaves identically on every turn, so the
+  // reminder doesn't fix anything here — it just costs one extra
+  // RESOLVE_DELAY_MS round trip before the run actually blocks.
+  test("blocked on a missing handoff: sends one reminder, then blocks with 'handoff-missing'; manual advance to the next step finishes the run", async ({
     page,
     freshBackend,
   }) => {
@@ -354,10 +392,24 @@ test.describe("pipelines run: executing a run", () => {
     await startTaskRest(backend, task.id);
 
     await openPipelineRunFromBoard(page, backend, title);
-    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Blocked", { timeout: CONVERGE_TIMEOUT });
+
+    // The reminder round-trip: A's first reply lacks a `<handoff>`, so the
+    // runner sends the one automatic reminder and the execution stays
+    // active (no block yet) — the reminder chip lands on A's own history
+    // row well before the run ever reaches "Blocked".
+    await expect(page.getByTestId("pipeline-run-reminder")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(
+      page.locator('[data-testid="pipeline-run-response-kind"][data-kind="handoff-missing"]'),
+    ).toBeVisible();
+
+    // A's second reply is still marker-less (`:missing` has no `-then-`
+    // suffix, so it behaves the same on every turn) — the run now blocks,
+    // and the message is prefixed to say a reminder already went out.
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Blocked", { timeout: REMINDER_TIMEOUT });
     const blocked = page.getByTestId("pipeline-run-blocked");
     await expect(blocked).toBeVisible();
     await expect(blocked).toContainText("handoff-missing");
+    await expect(blocked).toContainText("after one reminder");
 
     // Step A's own board column is "review" (the generic exit-0 settle
     // path) even though the pipeline itself never advanced past it — but
@@ -381,7 +433,11 @@ test.describe("pipelines run: executing a run", () => {
     await waitForColumn(backend, task.id, "review");
   });
 
-  test("blocked on an invalid handoff shows 'handoff-invalid'", async ({ page, freshBackend }) => {
+  // 65f8a75: same one-reminder-then-block flow as the "missing handoff"
+  // scenario above — A's plain `:invalid` marker (no `-then-` suffix)
+  // behaves identically across both turns, so this still ends up blocked,
+  // just after one extra RESOLVE_DELAY_MS round trip for the reminder.
+  test("blocked on an invalid handoff shows 'handoff-invalid' after the one reminder", async ({ page, freshBackend }) => {
     const backend = freshBackend;
     const profileId = await createProfileRest(backend, "Runner");
     const A = makeStep({ id: randomUUID(), name: "A", agentProfileId: profileId });
@@ -397,8 +453,115 @@ test.describe("pipelines run: executing a run", () => {
     await startTaskRest(backend, task.id);
 
     await openPipelineRunFromBoard(page, backend, title);
-    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Blocked", { timeout: CONVERGE_TIMEOUT });
-    await expect(page.getByTestId("pipeline-run-blocked")).toContainText("handoff-invalid");
+    await expect(page.getByTestId("pipeline-run-reminder")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Blocked", { timeout: REMINDER_TIMEOUT });
+    const blocked = page.getByTestId("pipeline-run-blocked");
+    await expect(blocked).toContainText("handoff-invalid");
+    await expect(blocked).toContainText("after one reminder");
+  });
+
+  // 65f8a75: `:missing-then-done` behaves like `:missing` (no `<handoff>`
+  // block) on a step task's FIRST fake-driver turn, and like `:done` (a
+  // valid terminal handoff) on every turn after — i.e. exactly what the
+  // runner's one automatic reminder is supposed to fix. A only carries the
+  // marker via its own `instructions` (not the shared goal text), so B
+  // never sees it and needs its own `:done` override to finish cleanly.
+  test("missing-then-done: A gets one automatic reminder, then hands off cleanly with no blocked banner", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({
+      id: randomUUID(),
+      name: "A",
+      agentProfileId: profileId,
+      instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing-then-done`,
+    });
+    const B = makeStep({
+      id: randomUUID(),
+      name: "B",
+      agentProfileId: profileId,
+      instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+    });
+    const pipelineId = await createPipelineRest(
+      backend,
+      "Missing Then Done Pipeline",
+      [A, B],
+      [{ from: A.id, to: B.id }],
+    );
+    const title = `Missing Then Done ${randomUUID()}`;
+    const task = await createPipelineTaskRest(backend, title, pipelineId, "Do the thing.");
+    await startTaskRest(backend, task.id);
+
+    await openPipelineRunFromBoard(page, backend, title);
+
+    // A goes active, misses the handoff on its first reply, and gets
+    // reminded while still active — the glyph only renders on an ACTIVE
+    // node, so poll for it rather than a one-shot check.
+    await expect(stepNode(page, A.id)).toHaveAttribute("data-visual", "active", { timeout: CONVERGE_TIMEOUT });
+    await expect(stepNode(page, A.id).getByTestId("pipeline-step-reminded")).toBeVisible({
+      timeout: CONVERGE_TIMEOUT,
+    });
+
+    // The reminder fixes it: A's second reply carries a valid handoff, the
+    // run advances to B, and B finishes the whole thing — no blocked
+    // banner anywhere along the way.
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done", { timeout: REMINDER_TIMEOUT });
+    await expect(page.getByTestId("pipeline-run-blocked")).toHaveCount(0);
+    await expect(page.locator('[data-testid="pipeline-run-history-row"]')).toHaveCount(2);
+
+    const rowA = historyRowFor(page, "A");
+    await expect(rowA).toHaveCount(1);
+    await expect(rowA.getByTestId("pipeline-run-reminder")).toBeVisible();
+    await expect(rowA.locator('[data-testid="pipeline-run-response-kind"][data-kind="handoff"]')).toBeVisible();
+
+    // Opening A's step RunPanel shows the reminder itself as an ordinary
+    // user bubble — the runner delivers it through `sendInput`, exactly
+    // like a human-typed follow-up.
+    await stepNode(page, A.id).click();
+    const panel = page.locator("aside").last();
+    await expect(panel.getByTestId("run-panel-pipeline-strip")).toBeVisible();
+    const reminderBubble = panel
+      .locator("div.rounded-2xl.rounded-br-md")
+      .filter({ hasText: "[agetor handoff reminder]" });
+    await expect(reminderBubble).toBeVisible();
+
+    await waitForColumn(backend, task.id, "review");
+  });
+
+  // 65f8a75: `:invalid-then-done` is `:invalid`'s two-turn sibling — an
+  // unparsable `<handoff>` JSON on the first turn, a valid one on the
+  // second. Single-step pipeline (no B) so the final history record is
+  // unambiguous: one row, carrying both the reminder and the eventual
+  // "handoff" classification.
+  test("invalid-then-done: one automatic reminder after an unparsable handoff, then hands off cleanly", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({
+      id: randomUUID(),
+      name: "A",
+      agentProfileId: profileId,
+      instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:invalid-then-done`,
+    });
+    const pipelineId = await createPipelineRest(backend, "Invalid Then Done Pipeline", [A], []);
+    const title = `Invalid Then Done ${randomUUID()}`;
+    const task = await createPipelineTaskRest(backend, title, pipelineId, "Do the thing.");
+    await startTaskRest(backend, task.id);
+
+    await openPipelineRunFromBoard(page, backend, title);
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done", { timeout: REMINDER_TIMEOUT });
+    await expect(page.getByTestId("pipeline-run-blocked")).toHaveCount(0);
+
+    const rows = page.locator('[data-testid="pipeline-run-history-row"]');
+    await expect(rows).toHaveCount(1);
+    await expect(rows.locator('[data-testid="pipeline-run-response-kind"][data-kind="handoff"]')).toBeVisible();
+    await expect(rows.getByTestId("pipeline-run-reminder")).toBeVisible();
+
+    await waitForColumn(backend, task.id, "review");
   });
 
   // Fixed regression (was `test.fixme`) — same "Maximum update depth
