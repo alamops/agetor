@@ -205,12 +205,8 @@ function AppInner() {
   // below) — no polling here, the Bun-side poller drives freshness.
   const [usage, setUsage] = useState<Record<string, HarnessQuota>>({});
   const [selected, setSelected] = useState<Task | null>(null);
-  // Full-page view — see `AppView`'s doc comment above. Module-cached
-  // pipelines list (mirrors `useAgentProfiles`) shared with the New Task
-  // form, the header button's badge-free trigger, and every page view below
-  // — one `GET /pipelines` fetch backs all of them.
+  // Full-page view — see `AppView`'s doc comment above.
   const [view, setView] = useState<AppView>({ kind: "board" });
-  const { pipelines, loaded: pipelinesLoaded, refresh: refreshPipelines } = usePipelines();
   const [diffTask, setDiffTask] = useState<Task | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -241,6 +237,15 @@ function AppInner() {
   // needed here.
   const [onboardingDismissedPref, setOnboardingDismissedPref] = useState<string | undefined>(undefined);
   const [prefsLoaded, setPrefsLoaded] = useState(false);
+  // Saved pipelines (mirrors `useAgentProfiles`), shared with the New Task
+  // picker and Settings → Pipelines. Gated on `prefsLoaded` on purpose: this
+  // hook's fetch effect is declared before the boot `listPreferences` effect
+  // below, so an ungated `/pipelines` request went out ahead of the theme
+  // preference read and — under the browser's per-host connection cap, with
+  // two SSE channels already open — delayed the `dark` class past first
+  // paint (e2e/theme.spec.ts caught it). Nothing on the board needs the
+  // pipelines list in that first window.
+  const { pipelines, loaded: pipelinesLoaded, refresh: refreshPipelines } = usePipelines({ enabled: prefsLoaded });
   // First successful /tasks fetch — `resolveOnboardingVisibility`'s `loaded`
   // must not fire before this, or a genuinely-empty fresh board could flash
   // the welcome dialog for a beat before the first real fetch lands (same
