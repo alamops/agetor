@@ -155,6 +155,7 @@ const CLAUDE_MODEL_FLAG: Record<string, string> = {
   "fable-5.1": "claude-fable-5-1",
   "mythos-5": "claude-mythos-5",
   "fable-5": "claude-fable-5",
+  "opus-5.5": "claude-opus-5-5",
   "opus-5": "claude-opus-5",
   "opus-4.8": "claude-opus-4-8",
   "opus-4.7": "claude-opus-4-7",
@@ -212,16 +213,22 @@ export function claudeModelIdFromArg(arg: string): string | null {
  * Fable follows the same current-release convention as Opus: `fable-5.1`
  * owns the "Fable" row since the installed claude CLI (2.1.257) ships the
  * `claude-fable-5-1` model id, so the now-superseded `fable-5` maps to `null`
- * (next-run-only, same as any other superseded pinned id). `mythos-5` and
- * `mythos-5.1` both have no picker row at all — claude's picker has no
- * Mythos row of any kind. An unknown/future raw id also returns `null`
- * rather than guess. Sole caller: `reconcileTaskSession`'s model mirror
- * (`orchestrator.ts`), which feeds the result to `mirrorModelViaPicker`
- * (`claude-tmux.ts`).
+ * (next-run-only, same as any other superseded pinned id). Opus follows the
+ * same rule again: `opus-5.5` now owns the "Opus" row because claude 2.1.280
+ * ships `claude-opus-5-5` as its default Opus model (CHANGELOG "now the
+ * default Opus model"; the binary's alias table maps `opus` →
+ * `claude-opus-5-5` and the picker rows read "Opus 5.5 - best for everyday,
+ * complex tasks" / "Opus 5 - previous Opus version"), so `opus-5` joins
+ * `opus-4.8`, `opus-4.7`, `opus-4.6`, `sonnet-4.6` and `fable-5` in the null
+ * (next-run-only) bucket. `mythos-5` and `mythos-5.1` both have no picker row
+ * at all — claude's picker has no Mythos row of any kind. An unknown/future
+ * raw id also returns `null` rather than guess. Sole caller:
+ * `reconcileTaskSession`'s model mirror (`orchestrator.ts`), which feeds the
+ * result to `mirrorModelViaPicker` (`claude-tmux.ts`).
  */
 export function claudeModelPickerFamily(id: string): "Opus" | "Sonnet" | "Fable" | "Haiku" | null {
   switch (id) {
-    case "opus-5":
+    case "opus-5.5":
       return "Opus";
     case "sonnet-5":
       return "Sonnet";

@@ -73,6 +73,7 @@ import m053 from "./053_task_agent_profile.sql" with { type: "text" };
 // as an alias (same renumber-with-alias pattern used throughout this file).
 import m054 from "./054_account_usage.sql" with { type: "text" };
 import m055 from "./055_normalize_cursor_grok_4_7.sql" with { type: "text" };
+import m056 from "./056_normalize_cursor_opus_5_5.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -136,4 +137,5 @@ export const migrations: Migration[] = [
   { id: "053_task_agent_profile", sql: m053 },
   { id: "054_account_usage", sql: m054, aliases: ["040_account_usage"] },
   { id: "055_normalize_cursor_grok_4_7", sql: m055 },
+  { id: "056_normalize_cursor_opus_5_5", sql: m056 },
 ];

@@ -682,8 +682,8 @@ test("non-withheld send: delivered:true resolves promptly, driven by the paste's
  *  Cursor starts on the Sonnet row (index 3), matching `before.model:
  *  "sonnet-5"` below. */
 const MODEL_PICKER_PANE_CURSOR_ON_SONNET = [
-  "  1. Default (recommended)  Opus 5 with 1M context, best for complex work",
-  "  2. Opus (1M context)      Opus 5 with 1M context, cheaper for simple tasks",
+  "  1. Default (recommended)  Opus 5.5 with 1M context, best for complex work",
+  "  2. Opus (1M context)      Opus 5.5 with 1M context, cheaper for simple tasks",
   "  3. Fable                  Fable 5 — balanced speed and capability",
   "❯ 4. Sonnet ✔               Sonnet 5 — fast and cost-effective",
   "  5. Haiku                  Haiku 4.5 — fastest, most economical",
@@ -695,7 +695,7 @@ const MODEL_PICKER_PANE_CURSOR_ON_SONNET = [
 const SWITCH_MODEL_CONFIRM_PANE = [
   "Switch model?",
   "",
-  "❯ 1. Yes, switch to Opus 5 (1M context)",
+  "❯ 1. Yes, switch to Opus 5.5 (1M context)",
   "  2. No, go back",
 ].join("\n");
 
@@ -735,7 +735,11 @@ test("reconcileTaskSession: a full /model picker mirror walks the cursor, confir
   try {
     await withRecordingTmuxBin(async (logPath) => {
       const before = tasks.get(taskId)!;
-      const after = { ...before, model: "opus-5" };
+      // opus-5.5, not opus-5: claudeModelPickerFamily("opus-5") is now null
+      // (superseded — claude 2.1.280 makes claude-opus-5-5 the default Opus
+      // model, so only opus-5.5 still owns the "Opus" row and exercises the
+      // full picker walk at all).
+      const after = { ...before, model: "opus-5.5" };
       await reconcileTaskSession(taskId, before, after);
       // Belt-and-suspenders against any lingering chained op, mirroring this
       // file's other reconcileTaskSession tests, before reading the log.
@@ -827,6 +831,67 @@ test("reconcileTaskSession: a model id the picker can't select exactly (opus-4.8
   }
 }, 10_000);
 
+test("reconcileTaskSession: a superseded pinned id (opus-5) never drives the picker — next-run breadcrumb, no paste", async () => {
+  const { createTask, reconcileTaskSession } = await import("./orchestrator.ts");
+  const { db, tasks, runs } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "reconcile-model-opus-5-superseded",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+
+  const runId = randomUUID();
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    exitCode: 0,
+    tmuxSession: `agetor-test-${taskId}`,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+    fxSessionId: null,
+  });
+
+  try {
+    await withRecordingTmuxBin(async (logPath) => {
+      const before = tasks.get(taskId)!;
+      // opus-5 is now superseded by opus-5.5 as the "Opus" row's owner
+      // (claude 2.1.280 ships claude-opus-5-5 as its default Opus model), so
+      // claudeModelPickerFamily("opus-5") returns null — the mirror must
+      // skip the picker entirely, same as opus-4.8 above.
+      const after = { ...before, model: "opus-5" };
+      await reconcileTaskSession(taskId, before, after);
+
+      const log = readTmuxLog(logPath);
+      expect(log.some((e) => e.argv[0] === "load-buffer")).toBe(false);
+      expect(log.filter((e) => e.argv[0] === "send-keys")).toHaveLength(0);
+    });
+
+    const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(statusTexts).toContain(
+      "model opus-5 applies on the next run — claude's picker can't select it for this session",
+    );
+  } finally {
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
 /* ────────────────────────────────────────────────────────────────────────── *
  * 10 — Model mirror: the picker never renders (idle pane throughout) → poll
  * timeout → "picker not shown" breadcrumb, with no keystroke ever sent.
@@ -875,12 +940,15 @@ test("reconcileTaskSession: model mirror poll timeout when the picker never rend
 
   try {
     const before = tasks.get(taskId)!;
-    const after = { ...before, model: "opus-5" };
+    // opus-5.5, not opus-5: claudeModelPickerFamily("opus-5") is now null
+    // (superseded on claude 2.1.280) — the mirror never even starts for it,
+    // so only opus-5.5 exercises the "picker is up but never renders" path.
+    const after = { ...before, model: "opus-5.5" };
     await reconcileTaskSession(taskId, before, after);
 
     const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
     expect(statusTexts).toContain(
-      "⚠️ model change not applied — picker not shown; the task's model is opus-5 but the session kept its previous one",
+      "⚠️ model change not applied — picker not shown; the task's model is opus-5.5 but the session kept its previous one",
     );
   } finally {
     claudeTmux.__forTest.setCaptureConfirmPane(prevConfirmPane);
@@ -1157,11 +1225,19 @@ test("reconcileTaskSession: a model change with NO in-memory session state (even
 
   try {
     const before = tasks.get(taskId)!;
-    const after = { ...before, model: "opus-5" };
+    // opus-5.5, not opus-5: claudeModelPickerFamily("opus-5") is now null
+    // (superseded on claude 2.1.280), so reconcileTaskSession's family check
+    // short-circuits BEFORE ever calling mirrorModelViaPicker — the "no live
+    // session" reason this test pins lives inside mirrorModelViaPicker, so
+    // opus-5 can no longer reach it at all (it would instead hit the same
+    // "picker can't select it for this session" wording the superseded-id
+    // test above already pins). Only opus-5.5 still owns a real picker
+    // family and exercises this path.
+    const after = { ...before, model: "opus-5.5" };
     await reconcileTaskSession(taskId, before, after);
 
     const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
-    expect(statusTexts).toContain("model opus-5 applies on the next run — no live session");
+    expect(statusTexts).toContain("model opus-5.5 applies on the next run — no live session");
     expect(statusTexts.some((t) => t.startsWith("⚠️"))).toBe(false);
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
