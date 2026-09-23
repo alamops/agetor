@@ -43,6 +43,10 @@ test("claudeModelIdFromArg resolves the Fable 5.1 / Mythos 5.1 CLAUDE_MODEL_FLAG
   expect(claudeModelIdFromArg("claude-mythos-5-1")).toBe("mythos-5.1");
 });
 
+test("claudeModelIdFromArg resolves the Opus 5.5 CLAUDE_MODEL_FLAG value back to its agetor id", () => {
+  expect(claudeModelIdFromArg("claude-opus-5-5")).toBe("opus-5.5");
+});
+
 test("claudeModelIdFromArg passes an unrecognized raw claude-* id through verbatim", () => {
   expect(claudeModelIdFromArg("claude-opus-6")).toBe("claude-opus-6");
 });
@@ -74,6 +78,9 @@ test("model: an arg-less stdout display name resolves via AGENT_OPTIONS labels (
   expect(result).toEqual({ kind: "model", id: "sonnet-5" });
 });
 
+// 2.1.246-era fixture: on claude 2.1.280 the `opus` alias resolves to Opus 5.5,
+// but the parser follows the stdout display name, not the alias, so the
+// "Opus 5" stdout below still (correctly) reads as opus-5.
 test("model: 'opus' arg + ANSI-wrapped stdout display name resolves to opus-5", () => {
   const result = parseClaudeLocalSetting({
     setting: "model",
@@ -134,7 +141,7 @@ test("model: 'Kept model as …' is a real outcome, not a no-op — it's synced 
 
 test("model: a display name absent from AGENT_OPTIONS resolves to 'unrepresentable', not null", () => {
   // "Opus 6" isn't a curated AGENT_OPTIONS["claude-code"].models[].label
-  // (today's list tops out at Opus 5) and doesn't start with "claude-", so
+  // (today's list tops out at Opus 5.5) and doesn't start with "claude-", so
   // claudeModelIdFromDisplayName has nothing to match against. This is a
   // REAL value claude landed on that agetor simply can't store — it must be
   // surfaced (kind: "unrepresentable"), not silently dropped as if nothing
@@ -204,6 +211,43 @@ test("model: 'Kept model as Fable 5.1' parses as the kept/no-change outcome with
 });
 
 // ---------------------------------------------------------------------------
+// parseClaudeLocalSetting — Opus 5.5 (docs/plans/add-claude-opus-5-5.md).
+// Mirrors the Fable 5.1 "Set model to"/"Kept model as" cases above: claude
+// 2.1.280 makes claude-opus-5-5 the default Opus model, so opus-5.5 now owns
+// the "Opus" row the same way fable-5.1 owns the "Fable" row.
+// ---------------------------------------------------------------------------
+
+test("model: 'Set model to Opus 5.5' resolves to opus-5.5", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Opus 5.5 and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "opus-5.5" });
+});
+
+test("model: 'Set model to Opus 5.5' with appended qualifiers still resolves to opus-5.5", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Opus 5.5 (1M context) and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "opus-5.5" });
+});
+
+test("model: 'Kept model as Opus 5.5' parses as the kept/no-change outcome with id opus-5.5", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Kept model as Opus 5.5",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "opus-5.5", kept: true });
+});
+
+// ---------------------------------------------------------------------------
 // claudeModelIdFromDisplayName — word boundary after the label (finding #4,
 // docs/plans/model-effort-local-command-turns.md §10 re-review): a bare
 // `startsWith` would let a longer real model name that merely shares a
@@ -267,6 +311,32 @@ test("claudeModelIdFromDisplayName: 'Fable 5.1' does not word-boundary-match the
   // shorter, superseded "Fable 5" label.
   expect(claudeModelIdFromDisplayName("Fable 5.1")).not.toBe("fable-5");
   expect(claudeModelIdFromDisplayName("Fable 5.1 and saved as your default for new sessions")).toBe("fable-5.1");
+});
+
+// ---------------------------------------------------------------------------
+// claudeModelIdFromDisplayName — Opus 5.5 (docs/plans/add-claude-opus-5-5.md):
+// the same word-boundary guard now has to keep the NEW "Opus 5.5" label from
+// conflating with the EXISTING "Opus 5" label in both directions.
+// ---------------------------------------------------------------------------
+
+test("claudeModelIdFromDisplayName: 'Opus 5.5' resolves to opus-5.5", () => {
+  expect(claudeModelIdFromDisplayName("Opus 5.5")).toBe("opus-5.5");
+});
+
+test("claudeModelIdFromDisplayName: 'Opus 5.5 (1M context)' strips the qualifier and resolves to opus-5.5", () => {
+  expect(claudeModelIdFromDisplayName("Opus 5.5 (1M context)")).toBe("opus-5.5");
+});
+
+test("claudeModelIdFromDisplayName: 'Opus 5.5 and saved …' matches via the space word boundary and resolves to opus-5.5", () => {
+  expect(claudeModelIdFromDisplayName("Opus 5.5 and saved as your default for new sessions")).toBe("opus-5.5");
+});
+
+test("claudeModelIdFromDisplayName: 'Opus 5 and saved …' still resolves to opus-5, not opus-5.5", () => {
+  // Word-boundary guard, forward direction: "opus 5" must match the "Opus 5"
+  // label exactly, not get pulled onto the newer "Opus 5.5" label just
+  // because it shares a leading prefix.
+  expect(claudeModelIdFromDisplayName("Opus 5")).toBe("opus-5");
+  expect(claudeModelIdFromDisplayName("Opus 5 and saved as your default for new sessions")).toBe("opus-5");
 });
 
 test("model: 'Opus 5.1 (1M context) and saved …' resolves to 'unrepresentable' with a qualifier-stripped raw of 'Opus 5.1'", () => {

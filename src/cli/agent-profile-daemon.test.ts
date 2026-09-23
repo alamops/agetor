@@ -95,9 +95,9 @@ function reset(): void {
 
 const PROFILE_NAME = "Reviewer";
 const PROFILE_NAME_V2 = "Reviewer v2";
-// A curated claude-code model id (AGENT_OPTIONS["claude-code"].models —
-// DEFAULT_MODEL["claude-code"]) — not itself asserted on beyond "it's the
-// id we sent", so any curated id would do.
+// A curated claude-code model id (AGENT_OPTIONS["claude-code"].models; not
+// the kind's default) — not itself asserted on beyond "it's the id we
+// sent", so any curated id would do.
 const CURATED_CLAUDE_MODEL = "opus-5";
 
 let createdProfileId = "";
