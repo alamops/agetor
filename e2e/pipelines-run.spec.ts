@@ -338,6 +338,13 @@ test.describe("pipelines run: executing a run", () => {
     await expect(stepNode(page, C.id)).toHaveAttribute("data-visual", "done", { timeout: CONVERGE_TIMEOUT });
     await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done");
 
+    // The handoff token rides the LATEST transition's edge — after the run
+    // settles that's B->C (C's own record is terminal), so exactly one
+    // token is painted, on that edge, and both edges read traversed.
+    const tokens = page.locator('[data-testid="pipeline-step-edge-token"]');
+    await expect(tokens).toHaveCount(1);
+    await expect(page.locator('[data-testid="pipeline-step-edge"][data-visual="traversed"]')).toHaveCount(2);
+
     const historyRows = page.locator('[data-testid="pipeline-run-history-row"]');
     await expect(historyRows).toHaveCount(3);
     // 65f8a75 added a response-kind chip under each row's toggle button
@@ -777,6 +784,12 @@ test.describe("pipelines run: executing a run", () => {
       .toBe(2);
     await expect(stepNode(page, B.id)).toHaveAttribute("data-visual", "active");
     await expect(stepNode(page, C.id)).toHaveAttribute("data-visual", "active");
+    // One fan-out record launched BOTH branches, so a handoff token is
+    // painted on each of A's outgoing edges — not just the first target.
+    // Asserted in the same tick as the two-active observation above (the
+    // tokens derive from the same fetched run), before either branch can
+    // hand off to D and move the latest transition.
+    await expect(page.locator('[data-testid="pipeline-step-edge-token"]')).toHaveCount(2);
 
     // D only runs once both arrive, then the whole run finishes.
     await expect(stepNode(page, D.id)).toHaveAttribute("data-visual", "active", { timeout: CONVERGE_TIMEOUT });
@@ -785,6 +798,53 @@ test.describe("pipelines run: executing a run", () => {
 
     const finalTask = await getTask(backend, task.id);
     expect(finalTask.pipelineRun?.history.filter((h) => h.stepId === D.id)).toHaveLength(1);
+  });
+
+  // A running helper whose description names NO configured persona renders
+  // as a transient `kind="live"` satellite (labelled from its own
+  // description) for as long as it runs, then disappears — the configured
+  // persona it did NOT match stays idle throughout.
+  test("a running subagent matching no persona renders as a transient live satellite, gone once it finishes", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const helperOneId = await createProfileRest(backend, "Helper One");
+    const A = makeStep({
+      id: randomUUID(),
+      name: "A",
+      agentProfileId: profileId,
+      // "Scout" is nobody's persona name — the attribution must fail and
+      // fall through to a live satellite rather than claim Helper One.
+      instructions: `${FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER}:${SUBAGENT_RUN_MS}[Scout: look around the repo]`,
+      subagents: { profileIds: [helperOneId], cap: null },
+    });
+    const pipelineId = await createPipelineRest(backend, "Live Satellite Pipeline", [A], []);
+    const title = `Live Satellite Run ${randomUUID()}`;
+    const task = await createPipelineTaskRest(
+      backend,
+      title,
+      pipelineId,
+      `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+    );
+    await openPipelineRunFromBoard(page, backend, title);
+    const helperOneNode = page.locator(`[data-testid="pipeline-subagent-node"][data-profile-id="${helperOneId}"]`);
+    await expect(helperOneNode).toHaveAttribute("data-visual", "idle");
+    await startTaskRest(backend, task.id);
+
+    const live = page.locator(`[data-testid="pipeline-subagent-node"][data-kind="live"][data-step-id="${A.id}"]`);
+    await expect(live).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+    await expect(live).toHaveAttribute("data-visual", "working");
+    await expect(live).toContainText("Scout: look around the repo");
+    await expect(page.locator('[data-testid="pipeline-subagent-edge"][data-visual="working"]')).toHaveCount(1);
+    await expect(helperOneNode).toHaveAttribute("data-visual", "idle");
+
+    // Finished unmatched helpers aren't shown — nothing to attribute them to.
+    await expect(live).toHaveCount(0, { timeout: CONVERGE_TIMEOUT });
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done", { timeout: CONVERGE_TIMEOUT });
+    await expect(helperOneNode).toHaveAttribute("data-visual", "idle");
+    await expect(live).toHaveCount(0);
   });
 
   test("Stop cancels the run; Retry re-runs the same step task and it finishes", async ({ page, freshBackend }) => {
@@ -878,5 +938,91 @@ test.describe("pipelines run: executing a run", () => {
 
     // Restart is offered again once the new run has itself finished.
     await expect(page.getByTestId("pipeline-run-restart")).toBeVisible();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stopping ONE branch of a fan-out from that step's own RunPanel (the
+// ordinary per-task Stop, not the run view's whole-pipeline Stop): the
+// runner records a per-task `step-failed` "was stopped" block on that
+// execution so the run reads Blocked — never Cancelled (the sibling branch
+// is still genuinely live), and never a silently-stuck Running. Its own
+// describe so the fake driver's resolve delay can be widened well past the
+// other scenarios': the branch has to still be mid-turn when the panel's
+// Stop is clicked, after the run view observed both branches active and
+// the branch's RunPanel finished opening.
+// ---------------------------------------------------------------------------
+
+const BRANCH_STOP_RESOLVE_DELAY_MS = "10000";
+
+test.describe("pipelines run: stopping one fan-out branch", () => {
+  test.use({ backendEnv: { AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: BRANCH_STOP_RESOLVE_DELAY_MS } });
+
+  test("Stop on one branch's step task records a 'was stopped' block; the run reads Blocked while the sibling finishes", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({ id: randomUUID(), name: "A", agentProfileId: profileId, transition: "all" });
+    const B = makeStep({ id: randomUUID(), name: "B", agentProfileId: profileId });
+    const C = makeStep({ id: randomUUID(), name: "C", agentProfileId: profileId });
+    const pipelineId = await createPipelineRest(
+      backend,
+      "Branch Stop Pipeline",
+      [A, B, C],
+      [
+        { from: A.id, to: B.id },
+        { from: A.id, to: C.id },
+      ],
+    );
+    const title = `Branch Stop Run ${randomUUID()}`;
+    const task = await createPipelineTaskRest(
+      backend,
+      title,
+      pipelineId,
+      `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+    );
+    await openPipelineRunFromBoard(page, backend, title);
+    await startTaskRest(backend, task.id);
+
+    // A finishes (one resolve delay), then B and C run in parallel.
+    await expect
+      .poll(
+        async () => page.locator('[data-testid="pipeline-step-node"][data-visual="active"]').count(),
+        { timeout: CONVERGE_TIMEOUT },
+      )
+      .toBe(2);
+    await expect(stepNode(page, B.id)).toHaveAttribute("data-visual", "active");
+    await expect(stepNode(page, C.id)).toHaveAttribute("data-visual", "active");
+
+    // Open B's own RunPanel and press ITS Stop (the per-task cancel).
+    await stepNode(page, B.id).click();
+    const panel = page.locator("aside").last();
+    await expect(panel.getByTestId("run-panel-pipeline-strip")).toContainText("B");
+    await panel.getByRole("button", { name: "Stop", exact: true }).click();
+    // Back to the run view (the panel sits on top of it).
+    await panel.getByTestId("run-panel-open-pipeline").click();
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+
+    // The stopped branch is blocked with the runner's "was stopped" copy;
+    // the run reads Blocked — not Cancelled, since C is still live.
+    await expect(page.getByTestId("pipeline-run-blocked")).toContainText("was stopped", { timeout: CONVERGE_TIMEOUT });
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Blocked");
+    await expect(stepNode(page, B.id)).toHaveAttribute("data-visual", "blocked");
+    await expect(page.getByTestId("pipeline-run-stop")).toBeVisible(); // C is still running
+
+    // C finishes on its own; the block just sits there until a Retry or an
+    // Advance resolves it, so the run stays Blocked rather than flipping to
+    // Done or Cancelled.
+    await expect(stepNode(page, C.id)).toHaveAttribute("data-visual", "done", { timeout: CONVERGE_TIMEOUT });
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Blocked");
+    await expect(page.getByTestId("pipeline-run-blocked")).toContainText("was stopped");
+
+    const finalTask = await waitForPipelineStatus(backend, task.id, "blocked");
+    const stoppedBlock = finalTask.pipelineRun?.blocked.find((b) => b.message.includes("was stopped"));
+    expect(stoppedBlock?.taskId).toBeTruthy();
+    expect(stoppedBlock?.stepId).toBe(B.id);
+    expect(finalTask.pipelineRun?.status).toBe("blocked");
   });
 });

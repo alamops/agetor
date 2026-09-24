@@ -416,9 +416,9 @@ test("cmdLs: hides pipeline step tasks (pipelineParentId set) by default", async
   expect(lines[1]).not.toContain("Step");
 });
 
-test("cmdLs --steps: also lists pipeline step tasks", async () => {
+test("cmdLs --steps: also lists pipeline step tasks — `↳ `-prefixed title, parent short id in the needs cell; the parent row gets the `»` glyph", async () => {
   currentClient = makeClient([
-    task({ id: "parent01", title: "Parent" }),
+    task({ id: "parent01", title: "Parent", pipelineId: "pipe-1" }),
     task({ id: "stepaaaa", title: "Step", pipelineParentId: "parent01" }),
   ]);
   await cmdLs(["--steps"], flags);
@@ -426,9 +426,22 @@ test("cmdLs --steps: also lists pipeline step tasks", async () => {
   expect(outputs).toHaveLength(1);
   const lines = outputs[0]!.split("\n");
   expect(lines.length).toBe(3); // header + both rows
-  const rendered = lines.join("\n");
-  expect(rendered).toContain("Parent");
-  expect(rendered).toContain("Step");
+  const parentRow = lines.find((l) => l.includes("parent01"))!;
+  const stepRow = lines.find((l) => l.includes("stepaaaa"))!;
+  expect(parentRow.trimStart().startsWith("»")).toBe(true);
+  expect(parentRow).not.toContain("↳");
+  expect(stepRow).toContain("↳ Step");
+  expect(stepRow).toContain("step of parent01");
+  expect(stepRow.trimStart().startsWith("○")).toBe(true); // a step keeps its own column glyph
+});
+
+test("cmdLs: a plain task keeps its column glyph (no `»`) and no `↳`", async () => {
+  currentClient = makeClient([task({ id: "t1", title: "Plain", column: "running" })]);
+  await cmdLs([], flags);
+  const row = dataRowLine();
+  expect(row.trimStart().startsWith("▸")).toBe(true);
+  expect(row).not.toContain("↳");
+  expect(row).not.toContain("step of");
 });
 
 test("needs column: a pipeline (parent) task whose run is blocked shows 'pipeline blocked · <progress>'", async () => {

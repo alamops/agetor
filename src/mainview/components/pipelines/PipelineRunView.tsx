@@ -11,6 +11,7 @@ import { MultiSearchSelect, type MultiSearchSelectItem } from "@/components/ui/m
 import { useTheme } from "@/components/theme-provider";
 import { useAgentProfiles } from "@/lib/agent-profiles";
 import { api, ApiError } from "@/lib/api";
+import { subscribePipelineGlobalEvents } from "@/lib/pipeline-events";
 import {
   edgeVisualState,
   latestTransition,
@@ -68,6 +69,50 @@ function liveSubagentsSignature(map: Map<string, Subagent[]>): string {
   const parts: string[] = [];
   for (const [taskId, list] of map) parts.push(`${taskId}=${list.map((s) => `${s.id}:${s.status}`).join(",")}`);
   return parts.sort().join("|");
+}
+
+/** How many `GET /tasks/:id/subagents` requests one poll tick may have in
+ *  flight at once. WKWebView caps HTTP/1.1 connections per host at ~6 and
+ *  two are permanently spent on SSE channels (`/app/events` plus the open
+ *  task's `/tasks/:id/events`), so a fan-out with N active steps must not
+ *  fire N parallel listings every 2s — that starved the stream itself. */
+const SUBAGENT_LIST_CONCURRENCY = 2;
+
+/** `Promise.all` with at most `limit` `fn` calls in flight; results keep
+ *  input order. */
+async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await fn(items[index]!);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return results;
+}
+
+/** Keyboard activation of a focused React Flow node: Enter/Space on the
+ *  focused `.react-flow__node` (React Flow gives every node `tabIndex=0`
+ *  and a `data-id`) inside `container` yields that node's id, else `null`.
+ *  Text-entry targets and an open modal/popover layer never qualify. */
+function keyboardActivatedNodeId(e: KeyboardEvent, container: HTMLElement | null): string | null {
+  if (e.key !== "Enter" && e.key !== " ") return null;
+  if (e.defaultPrevented) return null;
+  if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return null;
+  if (!(e.target instanceof HTMLElement)) return null;
+  if (e.target.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return null;
+  const nodeEl = e.target.closest(".react-flow__node[data-id]");
+  if (!nodeEl || !container?.contains(nodeEl)) return null;
+  return nodeEl.getAttribute("data-id");
+}
+
+/** A run that will never launch another step on its own — nothing left to
+ *  observe live once its still-listed executions have been re-read. */
+function isTerminalRunStatus(status: PipelineRunStatus): boolean {
+  return status === "done" || status === "cancelled";
 }
 
 const STATUS_LABEL: Record<PipelineRunStatus, string> = {
@@ -226,7 +271,12 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   // by step TASK id. Refreshed for every currently-active execution on each
   // poll; entries for executions that have since settled are kept as last
   // observed, so a finished step's satellites keep reading "finished"
-  // rather than snapping back to idle. Reset on task switch.
+  // rather than snapping back to idle — and pruned of any task that's no
+  // longer one of this run's step tasks (a Restart replaces every step
+  // row). There is deliberately NO per-`taskId` reset effect in this view:
+  // `App.tsx` mounts it under a `pipeline-run-${taskId}` key, so switching
+  // pipeline tasks always remounts it with fresh state — a reset effect
+  // here would be dead code that only ever ran once, on mount.
   const [liveSubagents, setLiveSubagents] = useState<Map<string, Subagent[]>>(() => new Map());
   // Latest-value mirror for `load` (declared below, before this state's
   // consumers) — assigned every render, like the other refs in this view.
@@ -241,23 +291,26 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   // (review M17).
   const dirtyRef = useRef(false);
   const stepIdsRef = useRef<Set<string>>(new Set());
+  // `false` once this view has unmounted: an in-flight `load` then skips
+  // every setState and — more importantly — never fires its trailing
+  // refetch, so leaving the run view mid-request can't start a burst of
+  // requests against a view nobody is looking at.
+  const aliveRef = useRef(true);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+    };
+  }, []);
+  // `load` reads the task id through a ref rather than closing over the
+  // prop: its trailing refetch (`finally` below) re-invokes whatever `load`
+  // closure the FIRST call captured, and a ref keeps that honest even if
+  // the prop ever changed under a mounted instance.
+  const taskIdRef = useRef(taskId);
+  taskIdRef.current = taskId;
 
   const [nodes, setNodes] = useNodesState<StepFlowNode>([]);
   const [edges, setEdges] = useEdgesState<StepFlowEdge>([]);
-
-  // Reset on task switch, before the loader effect below re-fetches.
-  useEffect(() => {
-    setTask(null);
-    setSteps([]);
-    setLoadError(null);
-    setNotStartedStepName(null);
-    setDetailsNodeId(null);
-    setLiveSubagents(new Map());
-    stepIdsRef.current = new Set();
-    dirtyRef.current = false;
-    setNodes([]);
-    setEdges([]);
-  }, [taskId, setNodes, setEdges]);
 
   const load = useCallback(async () => {
     if (fetchingRef.current) {
@@ -267,10 +320,12 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     fetchingRef.current = true;
     dirtyRef.current = false;
     try {
-      const result = await api.getPipelineRun(taskId);
+      const result = await api.getPipelineRun(taskIdRef.current);
+      if (!aliveRef.current) return;
       setTask(result.task);
       setSteps(result.steps);
-      stepIdsRef.current = new Set(result.steps.map((s) => s.id));
+      const stepIds = new Set(result.steps.map((s) => s.id));
+      stepIdsRef.current = stepIds;
       setLoadError(null);
       // Live subagents ride the per-task SSE, not the global bus, so the run
       // view refreshes them here, on the same cadence as everything else —
@@ -278,33 +333,46 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
       // whose last-observed list still shows a running subagent: a step's
       // helper settles moments before the step itself hands off, and once
       // the step leaves `run.active` nothing else would ever re-read it, so
-      // its satellite would stay "working" forever. A failed listing keeps
-      // that task's last-known list.
-      const activeTaskIds = result.task.pipelineRun?.active.map((a) => a.taskId) ?? [];
-      const toRefresh = new Set(activeTaskIds);
+      // its satellite would stay "working" forever. Once the run is
+      // TERMINAL (done/cancelled), only a task whose last-observed list
+      // still shows a running helper is re-read — never the whole
+      // `run.active` list, which a cancelled run keeps populated forever
+      // (so Retry can re-attempt those executions) and which would
+      // otherwise be re-listed every 2s for as long as the view is open. A
+      // failed listing keeps that task's last-known list.
+      const pipelineRun = result.task.pipelineRun ?? null;
+      const terminal = pipelineRun ? isTerminalRunStatus(pipelineRun.status) : true;
+      const activeTaskIds = new Set(pipelineRun?.active.map((a) => a.taskId) ?? []);
+      const toRefresh = new Set<string>();
       for (const [id, list] of liveSubagentsRef.current) {
+        if (!stepIds.has(id)) continue;
         if (list.some((sub) => sub.status === "running")) toRefresh.add(id);
       }
-      if (toRefresh.size > 0) {
-        const lists = await Promise.all(
-          [...toRefresh].map((id) => api.listSubagents(id).then((l) => [id, l] as const).catch(() => null)),
-        );
-        setLiveSubagents((prev) => {
-          const next = new Map(prev);
-          for (const entry of lists) if (entry) next.set(entry[0], entry[1]);
-          return liveSubagentsSignature(next) === liveSubagentsSignature(prev) ? prev : next;
-        });
-      }
+      if (!terminal) for (const id of activeTaskIds) toRefresh.add(id);
+      const lists = toRefresh.size > 0
+        ? await mapWithConcurrency([...toRefresh], SUBAGENT_LIST_CONCURRENCY, (id) =>
+            api.listSubagents(id).then((l) => [id, l] as const).catch(() => null),
+          )
+        : [];
+      if (!aliveRef.current) return;
+      setLiveSubagents((prev) => {
+        const next = new Map<string, Subagent[]>();
+        // Prune: drop anything that isn't one of this run's step tasks any more.
+        for (const [id, list] of prev) if (stepIds.has(id)) next.set(id, list);
+        for (const entry of lists) if (entry) next.set(entry[0], entry[1]);
+        return liveSubagentsSignature(next) === liveSubagentsSignature(prev) ? prev : next;
+      });
     } catch (err) {
+      if (!aliveRef.current) return;
       setLoadError(err instanceof ApiError ? err.message : "Failed to load pipeline run.");
     } finally {
       fetchingRef.current = false;
-      if (dirtyRef.current) {
+      if (aliveRef.current && dirtyRef.current) {
         dirtyRef.current = false;
         void load();
       }
     }
-  }, [taskId]);
+  }, []);
 
   useEffect(() => {
     void load();
@@ -312,11 +380,16 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
 
   // D12: sub-poll-latency updates via the global event bus, 2s poll as the
   // documented fallback (skipping a tick while a request is already in
-  // flight, per the app's existing poll convention).
+  // flight, per the app's existing poll convention). The events arrive
+  // through `subscribePipelineGlobalEvents` — `App.tsx`'s ONE `/events`
+  // EventSource forwards every `pipeline`/`column`/`run-status` event into
+  // that module bus — rather than this view opening a second permanent
+  // EventSource of its own: WKWebView's ~6-connections-per-host budget
+  // already carries two SSE channels, and a third starved the rest.
   useEffect(() => {
-    const unsubscribe = api.subscribeGlobalEvents((e) => {
-      if (e.kind === "pipeline" && e.taskId === taskId) {
-        void load();
+    const unsubscribe = subscribePipelineGlobalEvents((e) => {
+      if (e.kind === "pipeline") {
+        if (e.taskId === taskId) void load();
         return;
       }
       if (
@@ -337,16 +410,23 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   }, [load]);
 
   const run = task?.pipelineRun ?? null;
+  // Primitive facts about the run the effects below key on — `run` itself
+  // is a fresh object from every poll's JSON even when nothing changed.
+  const runPipelineId = run?.pipelineId ?? null;
+  const snapshotCapturedAt = run?.snapshot?.capturedAt ?? null;
+  const hasRun = run != null;
 
   // Before the first Run, `run.snapshot` is null — fall back to the live
   // pipeline's own graph so the canvas still has something to render.
+  // Keyed on whether a snapshot EXISTS (`capturedAt`, frozen once a run
+  // starts) rather than the snapshot object, which churns every poll.
   useEffect(() => {
-    if (!run || run.snapshot) {
+    if (!hasRun || snapshotCapturedAt != null || !runPipelineId) {
       setPipelineGraph(null);
       return;
     }
     let cancelled = false;
-    api.getPipeline(run.pipelineId)
+    api.getPipeline(runPipelineId)
       .then((p) => {
         if (!cancelled) setPipelineGraph(p.graph);
       })
@@ -354,7 +434,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     return () => {
       cancelled = true;
     };
-  }, [run?.pipelineId, run?.snapshot]);
+  }, [hasRun, runPipelineId, snapshotCapturedAt]);
 
   const effectiveGraph = run?.snapshot?.graph ?? pipelineGraph;
   const progress = run ? pipelineStepProgress(run) : null;
@@ -381,7 +461,6 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   // pre-first-run fallback (the live, editable pipeline graph) still needs
   // a cheap structural fingerprint instead of a full JSON.stringify of the
   // whole graph on every 2s poll.
-  const snapshotCapturedAt = run?.snapshot?.capturedAt ?? null;
   const graphSignature = useMemo(() => {
     if (!effectiveGraph) return null;
     if (snapshotCapturedAt != null) return `snap:${snapshotCapturedAt}`;
@@ -429,7 +508,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   const transition = useMemo(() => latestTransition(run), [run]);
   const transitionRef = useRef<ReturnType<typeof latestTransition>>(null);
   transitionRef.current = transition;
-  const transitionKey = transition ? `${transition.fromStepId}>${transition.toStepId}#${transition.seq}` : "";
+  const transitionKey = transition ? `${transition.fromStepId}>${transition.toStepIds.join("+")}#${transition.seq}` : "";
 
   // ---- Per-poll merge: replace a node's `data.visual` only when it
   // actually changed, so most nodes keep their exact object identity —
@@ -461,7 +540,9 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
       let changed = false;
       const next = es.map((e) => {
         const visual: EdgeVisualState = edgeVisualState(r, { id: e.id, from: e.source, to: e.target, label: e.data?.label ?? "" });
-        const isTokenEdge = !!t && t.fromStepId === e.source && t.toStepId === e.target;
+        // Every edge the latest transition took gets a token — a fan-out
+        // launches several targets off one record, not just the first.
+        const isTokenEdge = !!t && t.fromStepId === e.source && t.toStepIds.includes(e.target);
         const tokenKey = isTokenEdge ? t!.seq : undefined;
         if (e.data?.visual === visual && e.data?.token === isTokenEdge && e.data?.tokenKey === tokenKey) return e;
         changed = true;
@@ -472,15 +553,21 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content (edgeVisualSignature/transitionKey), not run/transition object identity; runRef/transitionRef carry the current values.
   }, [edgeVisualSignature, transitionKey, setEdges]);
 
+  // Reads the frozen snapshot through `runRef` and is keyed on
+  // `snapshotCapturedAt` — the snapshot is captured exactly once at run
+  // start and never mutated, so `capturedAt` IS its identity; depending on
+  // `run.snapshot` (a fresh object every poll) would hand every `StepNode`
+  // a new `resolveProfile` on every tick for no reason.
   const resolveProfile = useCallback(
     (agentProfileId: string | null): StepProfileResolution => {
       if (!agentProfileId) return { profile: null, profileDeleted: false };
-      const snapshotProfile = run?.snapshot?.profiles[agentProfileId] ?? null;
+      const snapshotProfile = runRef.current?.snapshot?.profiles[agentProfileId] ?? null;
       if (snapshotProfile) return { profile: snapshotProfile, profileDeleted: false };
       const liveProfile = liveProfiles.find((p) => p.id === agentProfileId) ?? null;
       return { profile: liveProfile, profileDeleted: !liveProfile };
     },
-    [run?.snapshot, liveProfiles],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- snapshotCapturedAt stands in for runRef.current.snapshot (frozen per run, read via the ref).
+    [snapshotCapturedAt, liveProfiles],
   );
 
   const canvasContextValue = useMemo<PipelineCanvasContextValue>(
@@ -520,14 +607,31 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content (satellitesKey).
     [satellitesKey],
   );
-  const canvasNodes = useMemo<CanvasNode[]>(() => [...nodes, ...subagentNodes], [nodes, subagentNodes]);
-  const canvasEdges = useMemo<CanvasEdge[]>(() => [...edges, ...subagentEdges], [edges, subagentEdges]);
+  // Satellites are derived during render from the frozen graph, but the
+  // step nodes they hang from only land in `nodes` state once the graph
+  // effect above has run — so on the first frame after a run loads (and
+  // again after `setNodes([])` on a vanished graph) a satellite can
+  // precede its parent. React Flow drops such a child with a "Parent node
+  // … not found" console warning for that frame; gate satellites (and
+  // their edges) on the parent step actually being present instead.
+  const canvasNodes = useMemo<CanvasNode[]>(() => {
+    const stepIds = new Set(nodes.map((n) => n.id));
+    return [...nodes, ...subagentNodes.filter((n) => n.parentId != null && stepIds.has(n.parentId))];
+  }, [nodes, subagentNodes]);
+  const canvasEdges = useMemo<CanvasEdge[]>(() => {
+    const stepIds = new Set(nodes.map((n) => n.id));
+    return [...edges, ...subagentEdges.filter((e) => stepIds.has(e.source))];
+  }, [nodes, edges, subagentEdges]);
+  const canvasNodesRef = useRef<CanvasNode[]>([]);
+  canvasNodesRef.current = canvasNodes;
 
-  const onNodeClick = useCallback(
-    (_: unknown, node: CanvasNode) => {
-      // A satellite opens its own details (persona, status, the helpers
-      // spawned for it, each openable on its transcript tab); a step node
-      // opens the step task's panel.
+  // What activating a canvas node does — shared by a click and by
+  // Enter/Space on a focused node (see the keyboard effect below): a
+  // satellite opens its own details (persona, status, the helpers spawned
+  // for it, each openable on its transcript tab); a step node opens the
+  // step task's panel, or the "hasn't started yet" note when it has none.
+  const activateNode = useCallback(
+    (node: CanvasNode) => {
       if (node.type === "subagent") {
         setNotStartedStepName(null);
         setDetailsNodeId(node.id);
@@ -543,6 +647,26 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     },
     [steps, run, onOpenTask],
   );
+  const onNodeClick = useCallback((_: unknown, node: CanvasNode) => activateNode(node), [activateNode]);
+
+  // Enter/Space on a focused node (React Flow makes every node tabbable)
+  // activates it exactly like a click — the library's own Enter/Space only
+  // toggles its internal selection, which this read-only canvas has
+  // switched off (`elementsSelectable={false}`), so without this a
+  // keyboard user could reach a node but never open it.
+  const canvasRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      const nodeId = keyboardActivatedNodeId(e, canvasRef.current);
+      if (!nodeId) return;
+      const node = canvasNodesRef.current.find((n) => n.id === nodeId);
+      if (!node) return;
+      e.preventDefault(); // Space would otherwise scroll the pane.
+      activateNode(node);
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [activateNode]);
 
   const detailsSatellite = useMemo(
     () => (detailsNodeId ? (satellites.find((sat) => sat.nodeId === detailsNodeId) ?? null) : null),
@@ -719,7 +843,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
       </div>
 
       <div className="relative flex min-h-0 flex-1">
-        <div className="relative min-w-0 flex-1">
+        <div ref={canvasRef} className="relative min-w-0 flex-1">
           <ReactFlowProvider>
             <PipelineCanvasContext.Provider value={canvasContextValue}>
               <ReactFlow<CanvasNode, CanvasEdge>
@@ -730,7 +854,12 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
                 onNodeClick={onNodeClick}
                 nodesDraggable={false}
                 nodesConnectable={false}
-                elementsSelectable
+                // Read-only canvas with no `onNodesChange`: React Flow's
+                // selection would be a dead affordance (a `select` change
+                // it can never apply, plus a stray selection ring). Clicks
+                // still reach `onNodeClick` — selection isn't a
+                // prerequisite for it.
+                elementsSelectable={false}
                 fitView
                 colorMode={resolved}
                 proOptions={{ hideAttribution: true }}
@@ -797,12 +926,15 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
           {run.blocked.length > 0 && (
             <div data-testid="pipeline-run-blocked" className="mb-3 flex flex-col gap-2">
               <AnimatePresence initial={false}>
-                {run.blocked.map((entry) => {
+                {run.blocked.map((entry, index) => {
                   const stepName = entry.stepId && effectiveGraph ? stepNameById(effectiveGraph, entry.stepId) : entry.stepId;
                   const stepTask = entry.taskId ? (steps.find((t) => t.id === entry.taskId) ?? null) : null;
                   return (
                     <motion.div
-                      key={`${entry.kind}:${entry.taskId ?? entry.stepId ?? "run"}`}
+                      // Index-prefixed: two run-level blocks of the same
+                      // kind (e.g. two `step-failed` holds while the parent
+                      // was archived) share every other field.
+                      key={`${index}:${entry.kind}:${entry.stepId ?? entry.taskId ?? "run"}`}
                       initial={{ opacity: 0, y: -4 }}
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0 }}

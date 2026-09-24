@@ -206,6 +206,7 @@ import type {
   Handoff,
   Pipeline,
   PipelineInput,
+  PipelineRunState,
   RunEvent,
   Task,
   TaskEventsReplayMeta,
@@ -216,7 +217,7 @@ import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guar
 import { consumePendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
-import { validatePipelineGraph } from "../shared/pipeline.ts";
+import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import type { AgentProfilePatch } from "./db.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
@@ -619,6 +620,60 @@ function withPipelineTaskCount(p: Pipeline): Pipeline {
 function withPipelineTaskCounts(list: Pipeline[]): Pipeline[] {
   const counts = pipelines.taskCounts();
   return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
+}
+
+/**
+ * Validate the `POST /pipelines` / `PATCH /pipelines/:id` body's `name`:
+ * trimmed, required, `PIPELINE_LIMITS.name` cap, and (L-S1) no C0/DEL
+ * control characters — the same rule `validatePipelineGraph` applies to
+ * step names, since both are quoted verbatim into prompts and the run view.
+ */
+function parsePipelineName(body: Record<string, unknown>): { value: string } | { error: string } {
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  if (!name) return { error: "name required" };
+  if (name.length > PIPELINE_LIMITS.name) {
+    return { error: `pipeline name must be ${PIPELINE_LIMITS.name} characters or fewer` };
+  }
+  if (PIPELINE_CONTROL_CHAR_RE.test(name)) return { error: "pipeline name must not contain control characters" };
+  return { value: name };
+}
+
+/**
+ * Validate the `description` field when the body carries it: it must be a
+ * string (L-S6 — a non-string used to be silently read as `""`, so a PATCH
+ * with `description: 42` wiped the real description) within
+ * `PIPELINE_LIMITS.description`. Returns `undefined` when the key is absent.
+ */
+function parsePipelineDescription(body: Record<string, unknown>): { value: string | undefined } | { error: string } {
+  if (!("description" in body) || body.description === undefined) return { value: undefined };
+  if (typeof body.description !== "string") return { error: "description must be a string" };
+  if (body.description.length > PIPELINE_LIMITS.description) {
+    return { error: `pipeline description must be ${PIPELINE_LIMITS.description} characters or fewer` };
+  }
+  return { value: body.description };
+}
+
+/**
+ * The trimmed `Task.pipelineRun` variant `GET /tasks` ships (M-S3, see the
+ * field's doc in `shared/types.ts`): every persisted handoff (history and
+ * partial-join arrivals) is nulled and the frozen profile snapshots dropped,
+ * since the board/TUI/`agetor ls` only read `snapshot.graph`, `status`,
+ * `active`, `blocked`, history outcomes and `stepCount` — and the 2s poll
+ * was otherwise shipping every handoff of every pipeline task on every
+ * tick. `GET /tasks/:id` and `GET /tasks/:id/pipeline` still return the
+ * full state; the server's own `tasks.list()`/`get()` reads are untouched.
+ */
+function trimPipelineRunForList(run: PipelineRunState): PipelineRunState {
+  const joins: PipelineRunState["joins"] = {};
+  for (const [stepId, join] of Object.entries(run.joins)) {
+    joins[stepId] = { arrivals: join.arrivals.map((a) => ({ ...a, handoff: null })) };
+  }
+  return {
+    ...run,
+    snapshot: run.snapshot ? { ...run.snapshot, profiles: {} } : null,
+    history: run.history.map((h) => ({ ...h, handoff: null })),
+    joins,
+  };
 }
 
 /**
@@ -3855,22 +3910,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           const body = raw as Record<string, unknown>;
 
-          const name = typeof body.name === "string" ? body.name.trim() : "";
-          if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
-          if (name.length > PIPELINE_LIMITS.name) {
-            return json(
-              { error: `pipeline name must be ${PIPELINE_LIMITS.name} characters or fewer` },
-              { status: 400, headers: corsHeaders(req) },
-            );
+          const nameResult = parsePipelineName(body);
+          if ("error" in nameResult) {
+            return json({ error: nameResult.error }, { status: 400, headers: corsHeaders(req) });
           }
+          const name = nameResult.value;
 
-          const description = typeof body.description === "string" ? body.description : "";
-          if (description.length > PIPELINE_LIMITS.description) {
-            return json(
-              { error: `pipeline description must be ${PIPELINE_LIMITS.description} characters or fewer` },
-              { status: 400, headers: corsHeaders(req) },
-            );
+          const descriptionResult = parsePipelineDescription(body);
+          if ("error" in descriptionResult) {
+            return json({ error: descriptionResult.error }, { status: 400, headers: corsHeaders(req) });
           }
+          const description = descriptionResult.value ?? "";
 
           const graphResult = validatePipelineGraph(body.graph);
           if (!graphResult.ok) {
@@ -3920,25 +3970,18 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const patch: Partial<PipelineInput> = {};
 
           if ("name" in body) {
-            const name = typeof body.name === "string" ? body.name.trim() : "";
-            if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
-            if (name.length > PIPELINE_LIMITS.name) {
-              return json(
-                { error: `pipeline name must be ${PIPELINE_LIMITS.name} characters or fewer` },
-                { status: 400, headers: corsHeaders(req) },
-              );
+            const nameResult = parsePipelineName(body);
+            if ("error" in nameResult) {
+              return json({ error: nameResult.error }, { status: 400, headers: corsHeaders(req) });
             }
-            patch.name = name;
+            patch.name = nameResult.value;
           }
           if ("description" in body) {
-            const description = typeof body.description === "string" ? body.description : "";
-            if (description.length > PIPELINE_LIMITS.description) {
-              return json(
-                { error: `pipeline description must be ${PIPELINE_LIMITS.description} characters or fewer` },
-                { status: 400, headers: corsHeaders(req) },
-              );
+            const descriptionResult = parsePipelineDescription(body);
+            if ("error" in descriptionResult) {
+              return json({ error: descriptionResult.error }, { status: 400, headers: corsHeaders(req) });
             }
-            patch.description = description;
+            if (descriptionResult.value !== undefined) patch.description = descriptionResult.value;
           }
           if ("graph" in body) {
             const graphResult = validatePipelineGraph(body.graph);
@@ -4248,7 +4291,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         GET: authed((req) => {
           const counts = subagents.runningCountsByTask();
           return json(
-            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0, stalledSince: stalledSince(t.id) })),
+            tasks.list().map((t) => ({
+              ...t,
+              // M-S3: the list route ships the trimmed pipelineRun variant
+              // (no handoffs, no profile snapshots) — see the field's doc.
+              ...(t.pipelineRun ? { pipelineRun: trimPipelineRunForList(t.pipelineRun) } : {}),
+              runningSubagents: counts.get(t.id) ?? 0,
+              stalledSince: stalledSince(t.id),
+            })),
             { headers: corsHeaders(req) },
           );
         }),
@@ -4372,6 +4422,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (isPipelineStepTask(before) && "column" in patch) {
             return json(
               { error: "step task's column is managed by its pipeline" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          // M-S4: a pipeline PARENT's column mirrors its run status
+          // (`persist()` in pipeline-runner.ts — running/blocked/review/
+          // ready) — a manual drag would desync the card from the run and
+          // trip `handleColumnChange`. A same-value resend is a no-op and
+          // passes, like the profile-bound-field guard below.
+          if (before.pipelineId != null && "column" in patch && patch.column !== before.column) {
+            return json(
+              { error: "pipeline task's column is managed by its run" },
               { status: 409, headers: corsHeaders(req) },
             );
           }
@@ -4521,6 +4582,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/start": {
         POST: authed(async (req) => {
+          // M-R5: a hidden step task's launches are owned by its pipeline —
+          // the runner calls `orchestrator.startTask` DIRECTLY (never this
+          // route), so refusing here can't break a pipeline's own step
+          // (re)launches; it only stops a direct API caller / stale UI
+          // from spawning a step turn the parent's `pipelineRun` never
+          // asked for. Same orphan exemption as DELETE/archive: a step
+          // whose parent row is gone has no pipeline left to redirect to.
+          const existing = tasks.get(req.params.id);
+          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+            return json(
+              { error: "step task is managed by its pipeline — retry the pipeline task instead" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
           server.timeout(req, 0);
           const result = await startTask(req.params.id);
           return "error" in result
@@ -4657,8 +4732,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
           let fromTaskId: string | undefined;
           if (body.fromTaskId !== undefined) {
-            if (typeof body.fromTaskId !== "string") {
-              return json({ error: "fromTaskId must be a string" }, { status: 400, headers: corsHeaders(req) });
+            // An empty string would silently fall through the runner's
+            // `if (opts.fromTaskId)` into auto-detect — the caller named a
+            // target, so a blank one is a bad request, not "pick for me"
+            // (mirrors the CLI's own empty `--from` rejection).
+            if (typeof body.fromTaskId !== "string" || body.fromTaskId.length === 0) {
+              return json({ error: "fromTaskId must be a non-empty string" }, { status: 400, headers: corsHeaders(req) });
             }
             fromTaskId = body.fromTaskId;
           }
@@ -5641,8 +5720,22 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       },
 
       "/tasks/:id/interactions/pending": {
-        GET: authed((req) =>
-          json(listPendingForTask(req.params.id), { headers: corsHeaders(req) })),
+        GET: authed((req) => {
+          const id = req.params.id;
+          let pending = listPendingForTask(id);
+          // H4: a pipeline PARENT never has interactions registered against
+          // its own (hidden, agent-less) id — they live on its step tasks,
+          // whose counts `tasks.list()/get()` already fold into the parent's
+          // `pendingInteractionCount`. Union the steps' pending requests here
+          // too, so the id the board showed as "waiting on you" is the id
+          // whose pending list actually carries the cards to answer.
+          const task = tasks.get(id);
+          if (task?.pipelineId) {
+            for (const step of tasks.stepsForParent(id)) pending = pending.concat(listPendingForTask(step.id));
+            pending.sort((a, b) => a.createdAt - b.createdAt);
+          }
+          return json(pending, { headers: corsHeaders(req) });
+        }),
       },
 
       // Messages backlog — saved, not-yet-sent drafts for a task. Each mutation

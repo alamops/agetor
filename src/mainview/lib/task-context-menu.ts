@@ -86,6 +86,11 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   // renders a menu for a step row today (D11 hides them from the board).
   const isPipelineParent = task.pipelineId != null;
   const isStepTask = task.pipelineParentId != null;
+  // Stop is only honoured server-side for a pipeline PARENT while its run
+  // is genuinely `running` (`POST /tasks/:id/pipeline/cancel` 409s
+  // otherwise — e.g. a `blocked` run with nothing live), so the entry gates
+  // on `pipelineRun.status`, not the column (L-A1). Mirrors `TaskCard`.
+  const stoppable = isPipelineParent ? task.pipelineRun?.status === "running" : active;
 
   const entries: TaskMenuEntry[] = [];
 
@@ -98,7 +103,7 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   if (!archived && !awaiting && !active && !openable) {
     entries.push({ action: "start", label: "Run", group: "primary" });
   }
-  if (active && !archived) {
+  if (stoppable && !archived) {
     entries.push({ action: "stop", label: "Stop", group: "primary" });
   }
   // A resumable fx pause (see TaskFxRecovery) offers its own quick actions

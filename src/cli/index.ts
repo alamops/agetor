@@ -57,8 +57,8 @@ Commands:
   daemon <sub>        start | stop | status of the background core
   harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
   profile <sub>       list | show | add | edit | rm reusable agent profiles
-  pipeline <sub>      list | show | rm | export | import pipelines; retry | advance |
-                      restart | status control a pipeline task's run
+  pipeline <sub>      list | show | rm | export | import pipelines; retry [--from] |
+                      advance | restart | status control a pipeline task's run
   clone <url>         clone a repository as a new project (--provider, --dest, --no-eli5)
   projects <sub>      list | add | rm | branches (project folders)
   config [k] [v]      view / set core preferences (defaultHarness, last model…)

@@ -23,7 +23,9 @@ import { usePipelineCanvasContext } from "./pipeline-canvas-context";
  */
 const VISUAL_CLASSES: Record<SubagentVisualState, string> = {
   idle: "border-dashed border-border text-muted-foreground",
-  working: "border-info ring-2 ring-info text-foreground animate-pipeline-pulse",
+  // Outline-based pulse (see StepNode's `active` class / tailwind.config.js)
+  // so it never fights a box-shadow ring.
+  working: "border-info outline outline-2 outline-info text-foreground animate-pipeline-pulse",
   done: "border-success text-foreground",
 };
 

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { cleanMessageText } from "./message-history.ts";
 import { AGETOR_PASTE_LEAD_IN } from "../../shared/user-message.ts";
 import { composeLaunchPrompt } from "../../shared/agent-profile.ts";
+import { HANDOFF_REMINDER_MARKER, composeHandoffReminder } from "../../shared/pipeline.ts";
 
 /** Build claude's own `<pasted_content>` wrapper shape (the `oKe` function in
  *  the 2.1.277 binary — see docs/plans/pasted-content-tags.md §2 and the
@@ -14,6 +15,27 @@ function wrapPastedContent(id: string, body: string): string {
 }
 
 describe("cleanMessageText", () => {
+  test("L-A5: agetor's automatic handoff reminder (marker on the first line) is dropped — never offered for resend", () => {
+    const reminder = composeHandoffReminder({
+      stepName: "Implement",
+      reason: "handoff-missing",
+      detail: null,
+      outgoing: [{ name: "Review", label: "" }],
+      transition: "choose",
+    });
+    expect(reminder.startsWith(HANDOFF_REMINDER_MARKER)).toBe(true);
+    expect(cleanMessageText(reminder)).toBe("");
+    // The original spelling, as persisted by earlier releases.
+    expect(cleanMessageText("[agetor handoff reminder]\nYour last message ended without a <handoff> block.")).toBe("");
+    // A claude step receives the reminder by paste, so its JSONL twin is
+    // wrapped — the marker is only the first line once unwrapped.
+    expect(cleanMessageText(wrapPastedContent("ab12", reminder))).toBe("");
+    // A user who merely MENTIONS the marker mid-message is not a reminder.
+    expect(cleanMessageText(`please resend the ${HANDOFF_REMINDER_MARKER} text`)).toBe(
+      `please resend the ${HANDOFF_REMINDER_MARKER} text`,
+    );
+  });
+
   test("ordinary prose passes through trimmed", () => {
     expect(cleanMessageText("hello world")).toBe("hello world");
   });

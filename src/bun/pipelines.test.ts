@@ -320,24 +320,30 @@ test("insert normalizes the graph, filling defaults for omitted step fields", ()
   expect(pipelines.get(p.id)?.graph).toEqual(p.graph);
 });
 
-test("maxSteps is clamped to 1..maxStepsMax and defaults when omitted", () => {
+test("maxSteps defaults when omitted and is REJECTED (not clamped) outside 1..maxStepsMax — the db layer agrees with the route's 400 (L-S5)", () => {
   const noVal = pipelines.insert({ name: "No MaxSteps", graph: makeGraph() });
   expect(noVal.maxSteps).toBe(PIPELINE_LIMITS.maxStepsDefault);
 
-  const low = pipelines.insert({ name: "Low MaxSteps", graph: makeGraph(), maxSteps: 0 });
-  expect(low.maxSteps).toBe(1);
-
-  const negative = pipelines.insert({ name: "Negative MaxSteps", graph: makeGraph(), maxSteps: -5 });
-  expect(negative.maxSteps).toBe(1);
-
-  const high = pipelines.insert({ name: "High MaxSteps", graph: makeGraph(), maxSteps: 999 });
-  expect(high.maxSteps).toBe(PIPELINE_LIMITS.maxStepsMax);
+  const expectedError = `maxSteps must be an integer between 1 and ${PIPELINE_LIMITS.maxStepsMax}`;
+  expect(() => pipelines.insert({ name: "Low MaxSteps", graph: makeGraph(), maxSteps: 0 })).toThrow(expectedError);
+  expect(() => pipelines.insert({ name: "Negative MaxSteps", graph: makeGraph(), maxSteps: -5 })).toThrow(expectedError);
+  expect(() => pipelines.insert({ name: "High MaxSteps", graph: makeGraph(), maxSteps: 999 })).toThrow(expectedError);
+  expect(() => pipelines.insert({ name: "Fractional MaxSteps", graph: makeGraph(), maxSteps: 1.5 })).toThrow(expectedError);
+  expect(() => pipelines.insert({ name: "NaN MaxSteps", graph: makeGraph(), maxSteps: Number.NaN })).toThrow(expectedError);
+  // A rejected insert leaves nothing behind.
+  expect(pipelines.findByName("Low MaxSteps")).toBeNull();
 
   const exact = pipelines.insert({ name: "Exact MaxSteps", graph: makeGraph(), maxSteps: 50 });
   expect(exact.maxSteps).toBe(50);
+  const atMax = pipelines.insert({ name: "Max MaxSteps", graph: makeGraph(), maxSteps: PIPELINE_LIMITS.maxStepsMax });
+  expect(atMax.maxSteps).toBe(PIPELINE_LIMITS.maxStepsMax);
+  const atMin = pipelines.insert({ name: "Min MaxSteps", graph: makeGraph(), maxSteps: 1 });
+  expect(atMin.maxSteps).toBe(1);
 
-  const updated = pipelines.update(exact.id, { maxSteps: 1000 });
-  expect(updated?.maxSteps).toBe(PIPELINE_LIMITS.maxStepsMax);
+  expect(() => pipelines.update(exact.id, { maxSteps: 1000 })).toThrow(expectedError);
+  expect(pipelines.get(exact.id)?.maxSteps).toBe(50); // untouched by the rejected update
+  const updated = pipelines.update(exact.id, { maxSteps: 7 });
+  expect(updated?.maxSteps).toBe(7);
 });
 
 test("delete returns true once, then false", () => {
@@ -829,7 +835,16 @@ test("parsePipelineRunState: a snapshot.graph that's shape-valid but semanticall
   // Duplicate step names would fail `validatePipelineGraph`, but the shape
   // itself (`steps`/`edges` arrays) is fine, so it's trusted through
   // unchanged rather than collapsed to `null`.
-  const dupNameGraph = { steps: [{ id: "s1", name: "Dup" }, { id: "s2", name: "dup" }], edges: [], startStepId: null } as unknown as PipelineGraph;
+  // Each entry still has to pass the per-entry shape check (`id` + numeric
+  // `position` — L-S7), which is what "shape-valid" means here.
+  const dupNameGraph = {
+    steps: [
+      { id: "s1", name: "Dup", position: { x: 0, y: 0 } },
+      { id: "s2", name: "dup", position: { x: 10, y: 10 } },
+    ],
+    edges: [],
+    startStepId: null,
+  } as unknown as PipelineGraph;
   const raw = {
     pipelineId: "pipe-1",
     pipelineName: "My Pipe",
@@ -886,4 +901,75 @@ test("parsePipelineRunState: a snapshot.graph that isn't even shape-valid (non-a
     snapshot: { graph: "not-an-object", maxSteps: 10, profiles: {}, capturedAt: 1 },
   };
   expect(parsePipelineRunState(JSON.stringify(rawNonObjectGraph))?.snapshot).toBeNull();
+});
+
+test("parsePipelineRunState: a snapshot.graph entry that fails the per-entry shape check (L-S7 — same rule as parsePipelineGraph) nulls the whole snapshot", () => {
+  const base = { pipelineId: "pipe-1", status: "running" };
+  const snap = (graph: unknown) => ({ ...base, snapshot: { graph, maxSteps: 10, profiles: {}, capturedAt: 1 } });
+
+  // A step missing `position` entirely.
+  expect(
+    parsePipelineRunState(JSON.stringify(snap({ steps: [{ id: "s1", name: "A" }], edges: [], startStepId: null })))?.snapshot,
+  ).toBeNull();
+  // A step whose `position` has non-numeric coordinates.
+  expect(
+    parsePipelineRunState(
+      JSON.stringify(snap({ steps: [{ id: "s1", name: "A", position: { x: "0", y: 0 } }], edges: [], startStepId: null })),
+    )?.snapshot,
+  ).toBeNull();
+  // A bare string in `steps`.
+  expect(
+    parsePipelineRunState(JSON.stringify(snap({ steps: ["s1"], edges: [], startStepId: null })))?.snapshot,
+  ).toBeNull();
+  // A step with a non-string id.
+  expect(
+    parsePipelineRunState(
+      JSON.stringify(snap({ steps: [{ id: 7, name: "A", position: { x: 0, y: 0 } }], edges: [], startStepId: null })),
+    )?.snapshot,
+  ).toBeNull();
+  // An edge missing `to`.
+  const goodStep = { id: "s1", name: "A", position: { x: 0, y: 0 } };
+  expect(
+    parsePipelineRunState(
+      JSON.stringify(snap({ steps: [goodStep], edges: [{ id: "e1", from: "s1" }], startStepId: null })),
+    )?.snapshot,
+  ).toBeNull();
+  // A bare string in `edges`.
+  expect(
+    parsePipelineRunState(JSON.stringify(snap({ steps: [goodStep], edges: ["e1"], startStepId: null })))?.snapshot,
+  ).toBeNull();
+  // The rest of the run survives regardless.
+  const parsed = parsePipelineRunState(JSON.stringify(snap({ steps: ["s1"], edges: [], startStepId: null })));
+  expect(parsed?.pipelineId).toBe("pipe-1");
+  expect(parsed?.status).toBe("running");
+  // And a fully shape-safe graph is still trusted through unchanged.
+  const ok = { steps: [goodStep, { id: "s2", name: "B", position: { x: 1, y: 1 } }], edges: [{ id: "e1", from: "s1", to: "s2", label: "" }], startStepId: "s1" };
+  expect(parsePipelineRunState(JSON.stringify(snap(ok)))?.snapshot?.graph).toEqual(ok as unknown as PipelineGraph);
+});
+
+test("parsePipelineRunState: stepCount/capExtensions must be non-negative integers, and capExtensions is capped at PIPELINE_LIMITS.capExtensionsMax (L-S4)", () => {
+  const parse = (extra: Record<string, unknown>) => parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", ...extra }));
+  expect(parse({ stepCount: 3, capExtensions: 2 })).toMatchObject({ stepCount: 3, capExtensions: 2 });
+  // Fractional / negative / huge-float / non-numeric counters read as unset.
+  expect(parse({ stepCount: 1.5 })?.stepCount).toBe(0);
+  expect(parse({ stepCount: -1 })?.stepCount).toBe(0);
+  expect(parse({ stepCount: "7" })?.stepCount).toBe(0);
+  expect(parse({ stepCount: 1e300 })?.stepCount).toBe(0);
+  expect(parse({ capExtensions: 1.5 })?.capExtensions).toBeUndefined();
+  expect(parse({ capExtensions: -1 })?.capExtensions).toBeUndefined();
+  expect(parse({ capExtensions: "2" })?.capExtensions).toBeUndefined();
+  expect(parse({ capExtensions: 0 })?.capExtensions).toBe(0);
+  // A stored value past the cap is clamped down to it, not dropped.
+  expect(parse({ capExtensions: PIPELINE_LIMITS.capExtensionsMax })?.capExtensions).toBe(PIPELINE_LIMITS.capExtensionsMax);
+  expect(parse({ capExtensions: PIPELINE_LIMITS.capExtensionsMax + 1 })?.capExtensions).toBe(PIPELINE_LIMITS.capExtensionsMax);
+  expect(parse({ capExtensions: 1e12 })?.capExtensions).toBe(PIPELINE_LIMITS.capExtensionsMax);
+});
+
+test("pipelines.insert/update reject a name carrying control characters (L-S1)", () => {
+  for (const bad of ["Tab\tName", "New\nLine", "Bell\u0007", "Del\u007f"]) {
+    expect(() => pipelines.insert({ name: bad, graph: makeGraph() })).toThrow("control characters");
+  }
+  const p = pipelines.insert({ name: "Fine Name", graph: makeGraph() });
+  expect(() => pipelines.update(p.id, { name: "Also\u0000Bad" })).toThrow("control characters");
+  expect(pipelines.get(p.id)?.name).toBe("Fine Name");
 });

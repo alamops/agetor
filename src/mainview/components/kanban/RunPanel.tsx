@@ -6,7 +6,7 @@ import {
   Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
 } from "lucide-react";
-import { api, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
+import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
 import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
@@ -28,6 +28,7 @@ import { shortenTaskPaths } from "@/lib/shorten-task-paths";
 import { fxUsageChipText, fxUsageTitle, mergeFxUsage, parseFxUsage } from "@/lib/fx-usage";
 import { useCountdown } from "@/lib/fx-auto-resume";
 import { renderLinkified } from "@/lib/linkify";
+import { subscribePipelineGlobalEvents } from "@/lib/pipeline-events";
 import {
   fxRecoveryNoticeText,
   fxRecoverySummaryLine,
@@ -261,7 +262,13 @@ interface Props {
    *  id can be re-requested; the panel honours a request exactly once and
    *  never re-forces the tab on later polls. Also keeps the tab strip
    *  visible for that helper even after everything has finished. */
-  focusSubagent?: { id: string; nonce: number } | null;
+  focusSubagent?: { id: string; nonce: number; consumed?: boolean } | null;
+  /** Called with the request's `nonce` the moment the panel has actually
+   *  selected that helper's tab. App flips the request's `consumed` flag
+   *  in ITS state in response — the "already honoured" bookkeeping lives
+   *  there, not in a ref inside `RunPanelBody`, so a body remount can never
+   *  replay a nonce (M-A2). */
+  onFocusSubagentConsumed?: (nonce: number) => void;
 }
 
 /** No-op default for `Props.onOpenPipeline` — module-level so it's a stable
@@ -348,7 +355,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline, focusSubagent = null }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline, focusSubagent = null, onFocusSubagentConsumed }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -566,6 +573,7 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles
           onViewIssue={onViewIssue}
           onOpenPipeline={onOpenPipeline}
           focusSubagent={focusSubagent}
+          onFocusSubagentConsumed={onFocusSubagentConsumed}
         />
       </aside>
     </>
@@ -599,6 +607,7 @@ function RunPanelBody({
   onViewIssue,
   onOpenPipeline,
   focusSubagent,
+  onFocusSubagentConsumed,
 }: {
   task: Task;
   stickyUserMessages: boolean;
@@ -634,7 +643,9 @@ function RunPanelBody({
    *  reaches here (defaulted at the `RunPanel` call site). */
   onOpenPipeline: (parentTaskId: string) => void;
   /** See `Props.focusSubagent` on the outer `RunPanel`. */
-  focusSubagent: { id: string; nonce: number } | null;
+  focusSubagent: { id: string; nonce: number; consumed?: boolean } | null;
+  /** See `Props.onFocusSubagentConsumed` on the outer `RunPanel`. */
+  onFocusSubagentConsumed: ((nonce: number) => void) | undefined;
 }) {
   const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
@@ -2091,7 +2102,10 @@ function RunPanelBody({
   // A focus request for a helper this task actually has keeps the strip
   // visible even once everything finished — otherwise a satellite's "Open
   // transcript" on a done run would land on a collapsed strip and be forced
-  // straight back to Main by `resolveActiveStream`.
+  // straight back to Main by `resolveActiveStream`. Consumed or not, the
+  // request keeps the strip open for as long as App holds it — App clears it
+  // (→ `null`, and this stops force-showing the strip) the moment the panel
+  // closes or switches to another task (M-A2).
   const focusedSubagentKnown = !!focusSubagent && subagentList.some((sub) => sub.id === focusSubagent.id);
   const showSubagentTabs = useMemo(
     () => shouldShowSubagentTabs(subagentList, parentRunRunning) || focusedSubagentKnown,
@@ -2107,15 +2121,21 @@ function RunPanelBody({
 
   // Honour a `focusSubagent` request exactly once — as soon as the polled
   // list knows the id (a freshly-opened panel may not have it on the first
-  // render). Keyed on the request's nonce so a later poll, or the user
-  // switching back to Main, never re-forces the tab.
+  // render). The "already honoured" flag is the request's own `consumed`
+  // field, flipped by App via `onFocusSubagentConsumed` — NOT a ref in this
+  // body: `RunPanelBody` can remount (the panel's open/close animation, a
+  // stream re-issue) and a ref would reset with it and replay the nonce
+  // (M-A2). The local ref is only a belt-and-braces guard for a consumer
+  // that passes no callback, so a later poll (or the user switching back to
+  // Main) still never re-forces the tab.
   const consumedFocusNonceRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!focusSubagent || consumedFocusNonceRef.current === focusSubagent.nonce) return;
+    if (!focusSubagent || focusSubagent.consumed || consumedFocusNonceRef.current === focusSubagent.nonce) return;
     if (!subagentList.some((sub) => sub.id === focusSubagent.id)) return;
     consumedFocusNonceRef.current = focusSubagent.nonce;
     setActiveStream(focusSubagent.id);
-  }, [focusSubagent, subagentList]);
+    onFocusSubagentConsumed?.(focusSubagent.nonce);
+  }, [focusSubagent, subagentList, onFocusSubagentConsumed]);
 
   // Two separate affordances:
   //   • `canControl` — Stop button is only meaningful when there's an in-flight
@@ -2715,12 +2735,22 @@ function RunPanelBody({
   // React state) precisely so it survives the `[task.id]` reset effect above
   // untouched. `pipelineStrip` itself IS reset there like every other
   // per-task piece of state; this effect always re-fetches on a task switch
-  // (a `pipeline` global event for the parent has no other way to reach this
-  // panel, so a stale cached name/graph must not be trusted indefinitely) —
-  // the cache only fast-paths the FIRST paint of a switch, from which the
-  // real fetch's result then supersedes it.
+  // (belt and braces — the cache only fast-paths the FIRST paint of a
+  // switch, from which the real fetch's result then supersedes it), and a
+  // `pipeline` global event for the parent — delivered through the
+  // `subscribePipelineGlobalEvents` store App.tsx feeds from its single
+  // `/events` subscription, never a second EventSource — evicts that
+  // parent's entry outright (see the subscription right below), since a
+  // Restart re-captures the frozen graph and the cached one would then be
+  // wrong on the next switch. `"missing"` is the parent 404-ing (deleted out
+  // from under this step) — the strip then reads as an orphan and its "Open
+  // pipeline" button is disabled, since there's no run view left to open
+  // (L-A10); `"error"` is any other fetch failure.
   const pipelineStripCacheRef = useRef<Map<string, { pipelineName: string; graph: PipelineGraph | null }>>(new Map());
-  const [pipelineStrip, setPipelineStrip] = useState<PipelineStripInfo | "loading" | "error" | null>(null);
+  const [pipelineStrip, setPipelineStrip] = useState<PipelineStripInfo | "loading" | "error" | "missing" | null>(null);
+  useEffect(() => subscribePipelineGlobalEvents((ev) => {
+    if (ev.kind === "pipeline") pipelineStripCacheRef.current.delete(ev.taskId);
+  }), []);
   useEffect(() => {
     const parentId = task.pipelineParentId;
     if (!parentId) return;
@@ -2755,8 +2785,14 @@ function RunPanelBody({
         pipelineStripCacheRef.current.set(parentId, { pipelineName, graph });
         if (cancelled) return;
         setPipelineStrip(buildInfo(pipelineName, graph));
-      } catch {
+      } catch (e) {
         if (cancelled) return;
+        if (e instanceof ApiError && e.status === 404) {
+          // The parent is gone — nothing cached is worth showing either.
+          pipelineStripCacheRef.current.delete(parentId);
+          setPipelineStrip("missing");
+          return;
+        }
         if (!cached) setPipelineStrip("error");
       }
     })();
@@ -3635,7 +3671,7 @@ function RunPanelBody({
           <span className="flex min-w-0 items-center gap-1.5">
             <Workflow className="size-3.5 shrink-0" aria-hidden />
             <span className="truncate">
-              {pipelineStrip && pipelineStrip !== "loading" && pipelineStrip !== "error" ? (
+              {pipelineStrip && pipelineStrip !== "loading" && pipelineStrip !== "error" && pipelineStrip !== "missing" ? (
                 <>
                   Part of pipeline <strong className="font-semibold">{pipelineStrip.pipelineName}</strong> · step{" "}
                   <strong className="font-semibold">{pipelineStrip.stepName}</strong>
@@ -3643,6 +3679,8 @@ function RunPanelBody({
                     ? ` (${pipelineStrip.stepIndex}/${pipelineStrip.stepTotal})`
                     : null}
                 </>
+              ) : pipelineStrip === "missing" ? (
+                "Part of a pipeline whose task no longer exists"
               ) : (
                 "Part of a pipeline"
               )}
@@ -3653,6 +3691,10 @@ function RunPanelBody({
             variant="outline"
             className="h-6 shrink-0 px-2 text-[10px]"
             data-testid="run-panel-open-pipeline"
+            // The parent 404'd (L-A10) — there's no run view to open, and
+            // App's own vanished-row sync would bounce it straight back.
+            disabled={pipelineStrip === "missing"}
+            title={pipelineStrip === "missing" ? "The pipeline task was deleted" : undefined}
             onClick={() => {
               // Close first — otherwise the run view opens behind this
               // non-portaled `fixed` <aside> (z-40 > the page views' < 30)
@@ -5843,7 +5885,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   // the common case.
   const ordinary = useMemo(
     () => splitReferences(displayText),
-    [normalizedText],
+    [displayText],
   );
 
   // Strip `[Image #N]` placeholders only when the message actually carries

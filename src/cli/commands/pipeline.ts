@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, table } from "../output.ts";
 import { flagValue } from "../args.ts";
@@ -14,7 +14,14 @@ import {
   stepNameById,
   validatePipelineGraph,
 } from "../../shared/pipeline.ts";
-import type { Pipeline, PipelineGraph, PipelineInput, PipelineRunState, Task } from "../../shared/types.ts";
+import type {
+  AgentProfile,
+  Pipeline,
+  PipelineGraph,
+  PipelineInput,
+  PipelineRunState,
+  Task,
+} from "../../shared/types.ts";
 
 export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
   const sub = args[0] ?? "ls";
@@ -41,7 +48,11 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       if (!ref) throw usageError("pipeline");
       const pipeline = await resolvePipeline(client, ref);
       if (flags.json) return printJson(pipeline);
-      for (const line of pipelineShowLines(pipeline)) out(line);
+      // Resolve each step's bound profile id to its live name (and flag one
+      // that no longer exists) — best-effort: a failed listing prints the
+      // bare ids, exactly as before, rather than failing `show`.
+      const profiles = await listProfilesOrNull(client);
+      for (const line of pipelineShowLines(pipeline, profiles)) out(line);
       return;
     }
     case "rm":
@@ -60,6 +71,12 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       const ref = args[1];
       if (!ref) throw usageError("pipeline export");
       const f = parseExportFlags(args.slice(2));
+      // Refuse to clobber an existing file BEFORE any network round-trip —
+      // `--force` opts in; `--out -` is stdout (symmetry with `import -`).
+      const outPath = f.out && f.out !== "-" ? f.out : null;
+      if (outPath && !f.force && existsSync(outPath)) {
+        throw new Error(`refusing to overwrite ${outPath} — pass --force to replace it`);
+      }
       const pipeline = await resolvePipeline(client, ref);
       const input: PipelineInput = {
         name: pipeline.name,
@@ -67,11 +84,17 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
         graph: pipeline.graph,
         maxSteps: pipeline.maxSteps,
       };
-      const text = JSON.stringify(input, null, 2);
-      if (f.out) {
-        writeFileSync(f.out, text + "\n");
-        if (flags.json) return printJson({ written: f.out });
-        out(`${c.green("✓")} wrote ${c.bold(pipeline.name)} to ${f.out}`);
+      // Additive `profileName` / `subagents.profileNames` hints ride next to
+      // each profile id so `import` on another machine can remap by name
+      // (M-CLI4). The server's `validatePipelineGraph` drops unknown keys,
+      // so the hints are harmless to post back verbatim — but `import`
+      // reads them off the raw file and posts the normalized graph anyway.
+      const profiles = await listProfilesOrNull(client);
+      const text = JSON.stringify(profiles ? withProfileHints(input, profiles) : input, null, 2);
+      if (outPath) {
+        writeFileSync(outPath, text + "\n");
+        if (flags.json) return printJson({ written: outPath });
+        out(`${c.green("✓")} wrote ${c.bold(pipeline.name)} to ${outPath}`);
       } else {
         out(text);
       }
@@ -84,10 +107,30 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       const text = file === "-" ? await Bun.stdin.text() : readFileSync(file, "utf8");
       const parsed = parsePipelineFile(text);
       if (!parsed.ok) throw new Error(`invalid pipeline file: ${parsed.error}`);
-      const input: PipelineInput = f.name ? { ...parsed.input, name: f.name } : parsed.input;
-      const created = await client.createPipeline(input);
-      if (flags.json) return printJson(created);
+      const named: PipelineInput = f.name ? { ...parsed.input, name: f.name } : parsed.input;
+      // Dangling agent-profile references (M-CLI4): a step's `agentProfileId`
+      // — or a `subagents.profileIds` entry — that no profile on THIS machine
+      // carries is remapped by the exported `profileName` hint when exactly
+      // one live profile has that name, else warned about (the server never
+      // validates profile ids on create, so the run would only fail at Run
+      // time with `profile-missing`). A failed profile listing can't check
+      // anything, so it becomes its own warning instead of blocking.
+      const profiles = await listProfilesOrNull(client);
+      const resolved = profiles
+        ? resolveImportProfiles(named, parsed.hints, profiles)
+        : {
+            input: named,
+            remapped: [],
+            warnings: ["couldn't list this machine's agent profiles — step profile references were not checked"],
+          };
+      const created = await client.createPipeline(resolved.input);
+      if (flags.json) {
+        const warnings = [...resolved.remapped, ...resolved.warnings];
+        return printJson(warnings.length ? { ...created, warnings } : created);
+      }
       out(`${c.green("✓")} imported pipeline ${c.bold(created.name)} (${c.dim(created.id)})`);
+      for (const line of resolved.remapped) out(c.dim(`  ${line}`));
+      for (const line of resolved.warnings) out(c.yellow(`  ! ${line}`));
       return;
     }
 
@@ -98,8 +141,10 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
     case "retry": {
       const ref = args[1];
       if (!ref) throw usageError("pipeline retry");
-      const task = await resolvePipelineTask(client, ref);
+      // Flags are parsed BEFORE the task lookup so a typo'd flag fails fast
+      // without a network round-trip (L-CLI7).
       const f = parseRetryFlags(args.slice(2));
+      const task = await resolvePipelineTask(client, ref);
       let targetTaskId: string | undefined;
       if (f.from) {
         if (!task.pipelineRun) throw new Error("pipeline has never run — nothing to retry");
@@ -114,12 +159,14 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
     case "advance": {
       const ref = args[1];
       if (!ref) throw usageError("pipeline advance");
-      const task = await resolvePipelineTask(client, ref);
+      // Flags (and their exclusivity) are checked BEFORE the task lookup so
+      // a bad invocation fails fast without a network round-trip (L-CLI7).
       const f = parseAdvanceFlags(args.slice(2));
       if (f.finish && f.next.length > 0) {
         throw new Error("pipeline advance: --next and --finish are mutually exclusive");
       }
       if (!f.finish && f.next.length === 0) throw usageError("pipeline advance");
+      const task = await resolvePipelineTask(client, ref);
 
       let nextStepIds: string[] | null;
       if (f.finish) {
@@ -184,8 +231,27 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
  *  task — shared by the four task-scoped subcommands below. */
 async function resolvePipelineTask(client: AgetorClient, ref: string): Promise<Task> {
   const task = await resolveTask(client, ref);
+  // A hidden step task's id is the one most likely to be pasted here (it's
+  // what `agetor logs`/`show` print) — point at the parent instead of the
+  // opaque "not a pipeline task" (L-CLI8).
+  if (task.pipelineParentId) {
+    throw new Error(
+      `"${ref}" is a step task of pipeline task ${task.pipelineParentId.slice(0, 8)} — target that id instead`,
+    );
+  }
   if (!task.pipelineId) throw new Error(`task "${ref}" is not a pipeline task`);
   return task;
+}
+
+/** `client.listAgentProfiles()` or `null` when the listing fails — every
+ *  caller treats a profile list as a display/validation nicety that must
+ *  never fail the subcommand itself. */
+async function listProfilesOrNull(client: AgetorClient): Promise<AgentProfile[] | null> {
+  try {
+    return await client.listAgentProfiles();
+  } catch {
+    return null;
+  }
 }
 
 async function resolvePipeline(client: AgetorClient, ref: string): Promise<Pipeline> {
@@ -196,15 +262,21 @@ async function resolvePipeline(client: AgetorClient, ref: string): Promise<Pipel
 }
 
 interface ExportFlags {
+  /** `--out <file|->` — `-` (or omitted) prints to stdout. */
   out?: string;
+  /** `--force` — overwrite an existing `--out` file instead of refusing. */
+  force: boolean;
 }
 
-/** Pure flag parser for `agetor pipeline export` — just `--out <file>`. */
+/** Pure flag parser for `agetor pipeline export` — `--out <file|->` and
+ *  `--force`. The overwrite refusal itself lives in the caller (it needs
+ *  the filesystem). */
 export function parseExportFlags(args: string[]): ExportFlags {
-  const f: ExportFlags = {};
+  const f: ExportFlags = { force: false };
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
-    if (a === "--out") f.out = flagValue(args, ++i, a);
+    if (a === "--out") f.out = flagValue(args, ++i, a, /* allowDash */ true);
+    else if (a === "--force") f.force = true;
   }
   return f;
 }
@@ -285,11 +357,14 @@ export function parseRetryFlags(args: string[]): RetryFlags {
 
 /**
  * Resolve a `--next` step reference against a pipeline run's snapshot
- * graph — exact step id first, then a unique case-insensitive, trimmed step
- * name — mirroring {@link matchPipelineRef}'s own id-then-name precedence.
- * Throws (listing every step name as candidates) on an unknown or ambiguous
- * reference, since the graph enforces unique names so ambiguity can't
- * actually happen for a name match — but the check stays defensive.
+ * graph, with exactly the precedence the runner's own `resolveNextSteps`
+ * gives a handoff's `next` (L-CLI2 parity): a unique case-insensitive,
+ * trimmed step NAME first, then an exact step ID, then an edge LABEL
+ * (case-insensitive, trimmed) — the label resolves to the edge's target
+ * step. Throws (listing every step name as candidates) on an unknown or
+ * ambiguous reference; the graph enforces unique names, so a name match
+ * can't actually be ambiguous, but the check stays defensive, and a label
+ * shared by several edges into DIFFERENT targets is genuinely ambiguous.
  *
  * NOT used for `--from` — that resolves against a run's currently ACTIVE
  * step executions (task ids), not the graph's step ids/names; see
@@ -297,17 +372,29 @@ export function parseRetryFlags(args: string[]): RetryFlags {
  */
 export function resolveStepRef(graph: PipelineGraph, ref: string): string {
   const trimmed = ref.trim();
+  const lower = trimmed.toLowerCase();
+
+  const byName = graph.steps.filter((s) => s.name.trim().toLowerCase() === lower);
+  if (byName.length === 1) return byName[0]!.id;
+  if (byName.length > 1) {
+    throw new Error(`ambiguous step "${trimmed}": matches ${byName.map((s) => s.name).join(", ")}`);
+  }
+
   const byId = graph.steps.find((s) => s.id === trimmed);
   if (byId) return byId.id;
 
-  const lower = trimmed.toLowerCase();
-  const matches = graph.steps.filter((s) => s.name.trim().toLowerCase() === lower);
-  if (matches.length === 1) return matches[0]!.id;
+  if (lower) {
+    const targets = new Set(
+      graph.edges.filter((e) => e.label.trim().toLowerCase() === lower).map((e) => e.to),
+    );
+    if (targets.size === 1) return [...targets][0]!;
+    if (targets.size > 1) {
+      const names = [...targets].map((id) => stepNameById(graph, id)).join(", ");
+      throw new Error(`ambiguous edge label "${trimmed}": leads to ${names}`);
+    }
+  }
 
   const candidates = graph.steps.map((s) => s.name).join(", ") || "(none)";
-  if (matches.length > 1) {
-    throw new Error(`ambiguous step "${trimmed}": matches ${matches.map((s) => s.name).join(", ")}`);
-  }
   throw new Error(`unknown step "${trimmed}" — steps: ${candidates}`);
 }
 
@@ -358,12 +445,18 @@ function label(s: string): string {
 /**
  * Pure line-by-line renderer for `agetor pipeline show <ref>` — name/id,
  * description, max steps + start step + used-by count, then one block per
- * step (name/id, bound agent-profile id, transition/join mode, and its
- * outgoing edges by target step name, with the edge label in parens when
- * set — or "(terminal …)" for a step with no outgoing edges). Exported so
- * the render is testable without a client/daemon.
+ * step (name/id, bound agent profile, transition/join mode, allowed
+ * subagent profiles when any, and its outgoing edges by target step name,
+ * with the edge label in parens when set — or "(terminal …)" for a step
+ * with no outgoing edges). Exported so the render is testable without a
+ * client/daemon.
+ *
+ * `profiles` (the live `GET /agent-profiles` list) resolves each profile
+ * id to `<name> (<id>)`, or marks it `<id> (missing)` when no live profile
+ * carries that id (M-CLI4); `null` — listing failed — prints the bare id,
+ * exactly as before, never a false "missing".
  */
-export function pipelineShowLines(p: Pipeline): string[] {
+export function pipelineShowLines(p: Pipeline, profiles: AgentProfile[] | null = null): string[] {
   const lines: string[] = [];
   lines.push(`${c.bold(p.name)}  ${c.dim(p.id)}`);
   lines.push(`  ${label("description")} ${p.description ? p.description : c.dim("none")}`);
@@ -380,8 +473,15 @@ export function pipelineShowLines(p: Pipeline): string[] {
   p.graph.steps.forEach((step, i) => {
     const startMarker = start?.id === step.id ? c.cyan(" (start)") : "";
     lines.push(`  ${i + 1}. ${c.bold(step.name)}  ${c.dim(step.id)}${startMarker}`);
-    lines.push(`     ${label("profile")} ${step.agentProfileId ?? c.dim("none")}`);
+    lines.push(`     ${label("profile")} ${step.agentProfileId ? profileText(step.agentProfileId, profiles) : c.dim("none")}`);
     lines.push(`     ${label("transition")} ${step.transition}   ${label("join")} ${step.join}`);
+    if (step.subagents.profileIds.length > 0) {
+      const cap = step.subagents.cap === null ? "no cap" : `cap ${step.subagents.cap}`;
+      lines.push(
+        `     ${label("subagents")} ${step.subagents.profileIds.map((id) => profileText(id, profiles)).join(", ")}` +
+          `  ${c.dim(`(${cap})`)}`,
+      );
+    }
     const outgoing = outgoingSteps(p.graph, step.id);
     if (outgoing.length === 0) {
       lines.push(`     ${c.dim("(terminal — no outgoing edges)")}`);
@@ -461,7 +561,18 @@ export function pipelineStatusLines(task: Task, steps: Task[]): string[] {
   return lines;
 }
 
-function colorRunStatus(status: string): string {
+/** `<name> (<id>)` for a live profile, `<id> (missing)` when the id no longer
+ *  resolves against `profiles`, or the bare id when `profiles` is `null`
+ *  (listing failed — nothing to compare against). */
+function profileText(id: string, profiles: AgentProfile[] | null): string {
+  if (!profiles) return id;
+  const live = profiles.find((p) => p.id === id);
+  return live ? `${live.name} ${c.dim(`(${id})`)}` : `${id} ${c.yellow("(missing)")}`;
+}
+
+/** Color a `PipelineRunStatus` for the terminal — shared with `agetor show`
+ *  so the two surfaces can't drift (L-CLI4). */
+export function colorRunStatus(status: string): string {
   if (status === "running") return c.cyan(status);
   if (status === "blocked") return c.yellow(status);
   if (status === "done") return c.green(status);
@@ -477,16 +588,105 @@ function historyGlyph(outcome: string | null): string {
 }
 
 /**
+ * Per-step agent-profile NAME hints an exported file carries next to its
+ * profile ids (`profileName` on the step, `subagents.profileNames` parallel
+ * to `subagents.profileIds`) — additive, ignored by the server's validator,
+ * read here so `import` can remap an id that doesn't exist on this machine
+ * by name (M-CLI4). Keyed by step id; a missing/non-string hint is `null`.
+ */
+export type ProfileHints = Map<string, { profileName: string | null; subagentProfileNames: (string | null)[] }>;
+
+/**
+ * `agetor pipeline export`'s counterpart to {@link parsePipelineFile}'s hint
+ * extraction: returns a copy of `input` whose steps carry a `profileName`
+ * next to `agentProfileId` and a `subagents.profileNames` array parallel to
+ * `subagents.profileIds` (`null` for an id no live profile matches — kept
+ * positional so the import side can index by the same offset). Pure.
+ */
+export function withProfileHints(input: PipelineInput, profiles: AgentProfile[]): PipelineInput {
+  const nameOf = (id: string | null): string | null =>
+    id === null ? null : (profiles.find((p) => p.id === id)?.name ?? null);
+  return {
+    ...input,
+    graph: {
+      ...input.graph,
+      steps: input.graph.steps.map((step) => {
+        const hinted: Record<string, unknown> = { ...step };
+        const profileName = nameOf(step.agentProfileId);
+        if (profileName !== null) hinted.profileName = profileName;
+        if (step.subagents.profileIds.length > 0) {
+          hinted.subagents = { ...step.subagents, profileNames: step.subagents.profileIds.map(nameOf) };
+        }
+        return hinted as unknown as PipelineGraph["steps"][number];
+      }),
+    },
+  };
+}
+
+/**
+ * Pure import-side reconciliation of a parsed file's agent-profile ids
+ * against THIS machine's live `profiles` (M-CLI4). For each step
+ * `agentProfileId` and each `subagents.profileIds` entry that no live
+ * profile carries: when the file's hint names exactly one live profile
+ * (case-insensitive, trimmed — the same uniqueness the server enforces on
+ * `name_key`), the id is remapped to that profile's and the swap is
+ * reported in `remapped`; otherwise the dangling id is left as-is and
+ * reported in `warnings`. Ids that already resolve are untouched.
+ */
+export function resolveImportProfiles(
+  input: PipelineInput,
+  hints: ProfileHints,
+  profiles: AgentProfile[],
+): { input: PipelineInput; remapped: string[]; warnings: string[] } {
+  const remapped: string[] = [];
+  const warnings: string[] = [];
+  const liveIds = new Set(profiles.map((p) => p.id));
+  const byName = (name: string | null): AgentProfile | null => {
+    if (!name) return null;
+    const key = name.trim().toLowerCase();
+    const matches = profiles.filter((p) => p.name.trim().toLowerCase() === key);
+    return matches.length === 1 ? matches[0]! : null;
+  };
+  const resolve = (id: string, hint: string | null, what: string): string => {
+    if (liveIds.has(id)) return id;
+    const target = byName(hint);
+    if (target) {
+      remapped.push(`${what}: agent profile ${id} isn't defined here — remapped to "${target.name}" (${target.id})`);
+      return target.id;
+    }
+    warnings.push(
+      `${what}: agent profile ${id}${hint ? ` ("${hint}")` : ""} isn't defined on this machine — ` +
+        "assign one in the editor before running this pipeline",
+    );
+    return id;
+  };
+  const steps = input.graph.steps.map((step) => {
+    const hint = hints.get(step.id);
+    const agentProfileId =
+      step.agentProfileId === null
+        ? null
+        : resolve(step.agentProfileId, hint?.profileName ?? null, `step "${step.name}"`);
+    const profileIds = step.subagents.profileIds.map((id, i) =>
+      resolve(id, hint?.subagentProfileNames[i] ?? null, `step "${step.name}" subagent`),
+    );
+    return { ...step, agentProfileId, subagents: { ...step.subagents, profileIds } };
+  });
+  return { input: { ...input, graph: { ...input.graph, steps } }, remapped, warnings };
+}
+
+/**
  * Parse the JSON text of a `agetor pipeline export`ed file (or a hand-written
  * one) into a {@link PipelineInput} ready for `POST /pipelines`, validating
  * as it goes: valid JSON, a plain object, a non-empty `name`, a graph that
  * passes {@link validatePipelineGraph}, and (when present) an integer
  * `maxSteps`. Pure — no I/O — so `agetor pipeline import`'s file/stdin read
- * stays a thin wrapper around this.
+ * stays a thin wrapper around this. `hints` carries the file's additive
+ * profile-name hints (see {@link ProfileHints}); the returned `input.graph`
+ * is the validator's NORMALIZED graph, which has already dropped them.
  */
 export function parsePipelineFile(
   text: string,
-): { ok: true; input: PipelineInput } | { ok: false; error: string } {
+): { ok: true; input: PipelineInput; hints: ProfileHints } | { ok: false; error: string } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -516,5 +716,28 @@ export function parsePipelineFile(
   if (typeof obj.description === "string") input.description = obj.description;
   if (maxSteps !== undefined) input.maxSteps = maxSteps;
 
-  return { ok: true, input };
+  return { ok: true, input, hints: extractProfileHints(obj.graph) };
+}
+
+/** Pull the additive `profileName` / `subagents.profileNames` hints off a
+ *  RAW (pre-validation) graph object — the validator has already proven the
+ *  shape, so this only has to be defensive about the hint fields themselves. */
+function extractProfileHints(rawGraph: unknown): ProfileHints {
+  const hints: ProfileHints = new Map();
+  const g = rawGraph as { steps?: unknown };
+  if (!g || !Array.isArray(g.steps)) return hints;
+  for (const raw of g.steps as unknown[]) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const step = raw as { id?: unknown; profileName?: unknown; subagents?: unknown };
+    if (typeof step.id !== "string") continue;
+    const sub = (typeof step.subagents === "object" && step.subagents !== null ? step.subagents : {}) as {
+      profileNames?: unknown;
+    };
+    const names = Array.isArray(sub.profileNames) ? sub.profileNames : [];
+    hints.set(step.id, {
+      profileName: typeof step.profileName === "string" && step.profileName.trim() ? step.profileName : null,
+      subagentProfileNames: names.map((n) => (typeof n === "string" && n.trim() ? n : null)),
+    });
+  }
+  return hints;
 }

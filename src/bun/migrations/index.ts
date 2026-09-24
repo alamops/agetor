@@ -79,6 +79,7 @@ import m056 from "./056_normalize_cursor_opus_5_5.sql" with { type: "text" };
 // ids kept as aliases (same renumber-with-alias pattern as 054 above).
 import m057 from "./057_pipelines.sql" with { type: "text" };
 import m058 from "./058_task_pipeline.sql" with { type: "text" };
+import m059 from "./059_task_pipeline_id_index.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -145,4 +146,5 @@ export const migrations: Migration[] = [
   { id: "056_normalize_cursor_opus_5_5", sql: m056 },
   { id: "057_pipelines", sql: m057, aliases: ["056_pipelines"] },
   { id: "058_task_pipeline", sql: m058, aliases: ["057_task_pipeline"] },
+  { id: "059_task_pipeline_id_index", sql: m059 },
 ];

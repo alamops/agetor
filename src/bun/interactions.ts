@@ -1,4 +1,10 @@
 import { randomUUID } from "node:crypto";
+// Lazy cycle: db.ts imports `countPendingForTask`/`pendingCountsByTask` from
+// this module, and this module reads `tasks` back — safe ONLY because both
+// sides touch the other's exports from function bodies (never at module
+// scope). See the matching note at the top of db.ts before adding any
+// top-level use of `tasks` here.
+import { tasks } from "./db.ts";
 
 /**
  * In-process registry for user interactions an agent needs to drive through
@@ -63,6 +69,13 @@ export interface AskQuestionsRequest {
   id: string;
   taskId: string;
   runId: string;
+  /** Set when `taskId` is a hidden pipeline STEP task — that step's parent
+   *  (board card) id, resolved once at registration. Rides the per-task
+   *  `interaction` SSE payload and the app-level `interaction` GlobalEvent
+   *  so parent-scoped consumers (toasts, TUI rows, the parent's own pending
+   *  list) don't have to resolve the step row themselves. Absent for an
+   *  ordinary task. */
+  pipelineParentId?: string;
   questions: AskQuestion[];
   createdAt: number;
   /**
@@ -116,6 +129,13 @@ export interface TmuxPromptRequest {
   id: string;
   taskId: string;
   runId: string;
+  /** Set when `taskId` is a hidden pipeline STEP task — that step's parent
+   *  (board card) id, resolved once at registration. Rides the per-task
+   *  `interaction` SSE payload and the app-level `interaction` GlobalEvent
+   *  so parent-scoped consumers (toasts, TUI rows, the parent's own pending
+   *  list) don't have to resolve the step row themselves. Absent for an
+   *  ordinary task. */
+  pipelineParentId?: string;
   /** Verbatim trailing slice of the tmux pane that matched a known prompt
    *  signature. Rendered as monospace in the UI so the user sees exactly
    *  what claude is asking. */
@@ -216,6 +236,13 @@ export interface FxPermissionRequest {
   id: string;
   taskId: string;
   runId: string;
+  /** Set when `taskId` is a hidden pipeline STEP task — that step's parent
+   *  (board card) id, resolved once at registration. Rides the per-task
+   *  `interaction` SSE payload and the app-level `interaction` GlobalEvent
+   *  so parent-scoped consumers (toasts, TUI rows, the parent's own pending
+   *  list) don't have to resolve the step row themselves. Absent for an
+   *  ordinary task. */
+  pipelineParentId?: string;
   createdAt: number;
   toolCall: FxPermissionToolCall;
   options: FxPermissionOption[];
@@ -270,6 +297,8 @@ export interface InteractionResolved {
   taskId: string;
   runId: string;
   kind: InteractionKind;
+  /** Mirrors the request's `pipelineParentId` — see `AskQuestionsRequest`. */
+  pipelineParentId?: string;
 }
 
 type ResolveBroadcastFn = (res: InteractionResolved) => void;
@@ -300,7 +329,27 @@ export function setResolvedBroadcaster(fn: ResolveBroadcastFn): void {
  *  of the maps should call this with the request it removed so the UI
  *  hears about it. */
 function fanoutResolved(req: AnyRequest): void {
-  broadcastResolved({ id: req.id, taskId: req.taskId, runId: req.runId, kind: req.kind });
+  broadcastResolved({
+    id: req.id,
+    taskId: req.taskId,
+    runId: req.runId,
+    kind: req.kind,
+    ...(req.pipelineParentId !== undefined ? { pipelineParentId: req.pipelineParentId } : {}),
+  });
+}
+
+/** `tasks.get(taskId)?.pipelineParentId`, as the optional-field spread every
+ *  `register*` below stamps onto its request — `undefined` (key omitted, so
+ *  existing JSON shapes stay byte-identical) for an ordinary task, an
+ *  unknown task id, or when the db can't answer (never throws: a
+ *  registration must not fail because of a parent lookup). */
+function pipelineParentFor(taskId: string): { pipelineParentId?: string } {
+  try {
+    const parentId = tasks.get(taskId)?.pipelineParentId;
+    return typeof parentId === "string" && parentId.length > 0 ? { pipelineParentId: parentId } : {};
+  } catch {
+    return {};
+  }
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -326,6 +375,7 @@ export function registerScrapedAskQuestions(args: {
     id,
     taskId: args.taskId,
     runId: args.runId,
+    ...pipelineParentFor(args.taskId),
     questions: args.questions,
     createdAt: Date.now(),
     source: "scraper",
@@ -434,6 +484,7 @@ export function registerTmuxPrompt(args: {
     id,
     taskId: args.taskId,
     runId: args.runId,
+    ...pipelineParentFor(args.taskId),
     paneText: args.paneText,
     choices: args.choices,
     cursorIndex: args.cursorIndex,
@@ -524,6 +575,7 @@ export function registerFxPermission(args: {
     id,
     taskId: args.taskId,
     runId: args.runId,
+    ...pipelineParentFor(args.taskId),
     createdAt: Date.now(),
     toolCall: args.toolCall,
     options: args.options,

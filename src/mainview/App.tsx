@@ -59,10 +59,11 @@ import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand } from "@/lib/toasts";
+import { dismissPending, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
 import { publishCloneProgress } from "@/lib/clone-progress";
+import { publishPipelineGlobalEvent } from "@/lib/pipeline-events";
 import { parseThemePreference } from "@/lib/theme";
 import { parsePullNumber } from "@/lib/pr-url";
 import { hasTextSelection, keepsNativeContextMenu } from "@/lib/context-menu";
@@ -75,6 +76,29 @@ import { parseStickyUserMessagesPreference, STICKY_USER_MESSAGES_PREF } from "@/
 import { FX_AUTO_RESUME_DELAY_PREF, FX_AUTO_RESUME_PREF } from "@/lib/fx-auto-resume-prefs";
 import { parseFxAutoResumePrefs } from "../shared/fx-recovery.ts";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
+
+/** The `pipelineParentId` a `GlobalEvent` carries when it concerns a hidden
+ *  pipeline STEP task — the orchestrator stamps it on the `run-status`/
+ *  `column`/`interaction`/`files-sent`/`fx-auto-resume` kinds (the
+ *  `update`/`pipeline` kinds never carry one). The polled task list is the
+ *  caller's fallback for an older core (or a row not yet polled in). */
+function stepParentIdOf(ev: GlobalEvent): string | null {
+  if (!("pipelineParentId" in ev)) return null;
+  return ev.pipelineParentId ? ev.pipelineParentId : null;
+}
+
+/** Subtitle for a step task's toast once it's retargeted at its pipeline
+ *  parent (M-A3): the step's own name. A step row's title is
+ *  `<pipeline name> · <step name>` (`pipeline-runner.ts`), so the
+ *  pipeline-name prefix is trimmed whenever the parent's run confirms it —
+ *  the parent's title already leads the toast. */
+function stepSubtitle(step: Task | undefined, parent: Task | undefined): string | undefined {
+  if (!step) return undefined;
+  const prefix = parent?.pipelineRun?.pipelineName;
+  const sep = " · ";
+  if (prefix && step.title.startsWith(`${prefix}${sep}`)) return step.title.slice(prefix.length + sep.length);
+  return step.title;
+}
 
 /**
  * Floating top-right error toast. Auto-dismisses after 6s; the user can
@@ -208,8 +232,18 @@ function AppInner() {
   const [selected, setSelected] = useState<Task | null>(null);
   // One-shot "land on this subagent's tab" request for the run panel — set
   // by the pipeline run view's satellite details ("Open transcript"), see
-  // `RunPanel`'s `focusSubagent` prop.
-  const [focusSubagent, setFocusSubagent] = useState<{ id: string; nonce: number } | null>(null);
+  // `RunPanel`'s `focusSubagent` prop. `taskId` is the step task the request
+  // targets; `consumed` flips once the panel has actually selected the tab
+  // (`onFocusSubagentConsumed` below) — tracked HERE, in App state, rather
+  // than in a ref inside `RunPanelBody`, so a body remount can never replay
+  // an already-honoured nonce. The request stays non-null (consumed or not)
+  // for as long as that step task is the open panel — that's what keeps the
+  // panel's subagent tab strip visible for a finished helper — and is
+  // cleared the moment the panel closes or opens a different task (M-A2).
+  const [focusSubagent, setFocusSubagent] = useState<{ taskId: string; id: string; nonce: number; consumed: boolean } | null>(null);
+  const onFocusSubagentConsumed = useCallback((nonce: number) => {
+    setFocusSubagent((cur) => (cur && cur.nonce === nonce && !cur.consumed ? { ...cur, consumed: true } : cur));
+  }, []);
   // Full-page view — see `AppView`'s doc comment above.
   const [view, setView] = useState<AppView>({ kind: "board" });
   const [diffTask, setDiffTask] = useState<Task | null>(null);
@@ -368,6 +402,9 @@ function AppInner() {
       openPipelineRun(t.id);
       return;
     }
+    // A plain open never carries a subagent-focus request — clear any
+    // stale one so it can't force the tab strip on the wrong task (M-A2).
+    setFocusSubagent(null);
     setSelected(t);
   }, [openPipelineRun]);
 
@@ -706,12 +743,48 @@ function AppInner() {
     return () => document.removeEventListener("contextmenu", onCtx);
   }, []);
 
-  // Keep the selected task in sync as the list refreshes.
+  // Keep the selected task in sync as the list refreshes — and drop it when
+  // its row VANISHES between two successful polls (L-A10): a task deleted
+  // out from under us (the CLI, another agetor instance, a pipeline parent's
+  // delete cascade taking its step rows with it) would otherwise leave the
+  // run panel open on a ghost. "Vanished" is `prevIds.has(id) && !ids.has(id)`
+  // rather than a bare `!ids.has(id)`, so a task selected before its row was
+  // ever polled in (a just-created one, or a step task opened from the run
+  // view's own `getPipelineRun` fetch) is left alone until the list has
+  // actually seen and then lost it. `tasks` only changes on a successful
+  // `/tasks` fetch (a failed poll keeps the last snapshot) or an optimistic
+  // patch that preserves ids, so "vanished" is always a real server-side
+  // absence. The same rule sends the full-page pipeline run view back to the
+  // board when ITS parent task disappears (L-A11).
+  const prevTaskIdsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    if (!selected) return;
-    const fresh = tasks.find((t) => t.id === selected.id);
-    if (fresh && fresh !== selected) setSelected(fresh);
-  }, [tasks, selected]);
+    const prevIds = prevTaskIdsRef.current;
+    const ids = new Set(tasks.map((t) => t.id));
+    prevTaskIdsRef.current = ids;
+    const vanished = (id: string) => prevIds.has(id) && !ids.has(id);
+    if (selected) {
+      if (vanished(selected.id)) {
+        setSelected(null);
+      } else {
+        const fresh = tasks.find((t) => t.id === selected.id);
+        if (fresh && fresh !== selected) setSelected(fresh);
+      }
+    }
+    const v = viewRef.current;
+    if (v.kind === "pipeline-run" && vanished(v.taskId)) {
+      toast("That pipeline task no longer exists — back to the board.");
+      navigate({ kind: "board" });
+    }
+  }, [tasks, selected, navigate]);
+
+  // Backstop for the explicit clears in `openTask`/`onClose`: a subagent
+  // focus request is only ever meaningful for the step task it was raised
+  // for, so any switch of the open panel to a different task (or to none)
+  // drops it (M-A2). Keyed on `selected?.id`, not `selected`, so a poll's
+  // identity refresh of the same task doesn't touch it.
+  useEffect(() => {
+    if (focusSubagent && selected?.id !== focusSubagent.taskId) setFocusSubagent(null);
+  }, [selected?.id, focusSubagent]);
 
   // Once the user opens a task's panel, any "Waiting on you" toast for that
   // task is noise — they're already looking at the prompt. Clearing it also
@@ -865,6 +938,11 @@ function AppInner() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       if (selectedIdRef.current !== null) return;
+      // Escape inside a text field (the run view's Advance form, a search
+      // box) is the field's own — blur/clear — never a page-level "back to
+      // board" (M-A1). Same text-entry selector the native-context-menu
+      // suppressor keys on.
+      if (keepsNativeContextMenu(e.target)) return;
       if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open], [data-search-open]')) return;
       navigate({ kind: "board" });
     };
@@ -959,8 +1037,61 @@ function AppInner() {
   }, [confirm, refreshAgentModels, refreshHarnessModels, openTask]);
 
   // App-wide lifecycle subscription. Drives toasts + native notifications.
+  //
+  // Per-parent coalescing state for the `pipeline` event's refetch (L-A2):
+  // at most one in-flight `GET /tasks/:id` per parent id, with a single
+  // trailing re-fetch when further events landed while it was out — so a
+  // burst of step settles collapses to at most two round-trips, and the last
+  // one always reflects the newest state.
+  const pipelineRefetchRef = useRef(new Map<string, { pending: boolean }>());
+  // Last `pipeline`-event status seen per parent, so the "pipeline finished"
+  // toast fires exactly once, on the transition INTO `done` — `persist()`
+  // broadcasts on every run-state mutation, and a manual Advance that lands
+  // on an already-`done` run must not re-toast.
+  const pipelineStatusRef = useRef(new Map<string, string>());
   useEffect(() => {
+    /** Refetch just one pipeline parent and merge the three fields the
+     *  board's `PipelineBadge`, the card's column and the "needs input"
+     *  glow read — never the whole snapshot (a wholesale replace would
+     *  revert a concurrent optimistic patch, same rule `mergeTaskFields`'s
+     *  doc comment states). A failed refetch just leaves the 2s `/tasks`
+     *  poll as the fallback (the `refresh()` degrade-gracefully posture). */
+    const refetchPipelineParent = (id: string) => {
+      const inFlight = pipelineRefetchRef.current.get(id);
+      if (inFlight) {
+        inFlight.pending = true;
+        return;
+      }
+      const entry = { pending: false };
+      pipelineRefetchRef.current.set(id, entry);
+      const run = (): Promise<void> =>
+        api.getTask(id)
+          .then((fresh) => {
+            mergeTaskFields(id, {
+              pipelineRun: fresh.pipelineRun,
+              column: fresh.column,
+              pendingInteractionCount: fresh.pendingInteractionCount,
+            });
+          })
+          .catch(() => { /* 2s poll catches up */ })
+          .then(() => {
+            if (entry.pending) {
+              entry.pending = false;
+              return run();
+            }
+            pipelineRefetchRef.current.delete(id);
+          });
+      void run();
+    };
     const handle = (ev: GlobalEvent) => {
+      // Fan the pipeline-relevant kinds out to the module store FIRST —
+      // before any of the gating below — so the pipeline run view and the
+      // RunPanel's pipeline strip get every event without opening a second
+      // permanent `EventSource` (WKWebView's ~6-per-host connection cap; see
+      // `lib/pipeline-events.ts`).
+      if (ev.kind === "pipeline" || ev.kind === "column" || ev.kind === "run-status") {
+        publishPipelineGlobalEvent(ev);
+      }
       // Update events are app-scoped, not task-scoped — handle them before
       // reading any taskId-derived state.
       if (ev.kind === "update") {
@@ -972,7 +1103,14 @@ function AppInner() {
         });
         return;
       }
-      const isSelected = ev.taskId === selectedIdRef.current;
+      // "Already looking at it" — the run panel is open on the task, OR the
+      // full-page pipeline run view is showing it (L-A3: a pipeline parent
+      // never opens in the panel, so `selectedIdRef` alone would toast a
+      // block the user is literally watching happen on the canvas).
+      const viewingTask = (id: string) =>
+        id === selectedIdRef.current
+        || (viewRef.current.kind === "pipeline-run" && viewRef.current.taskId === id);
+      const isSelected = viewingTask(ev.taskId);
       const isFocused = document.hasFocus();
       // Resolve a display title from the latest tasks snapshot; fall back to
       // a short id slice if the row hasn't been polled in yet.
@@ -992,26 +1130,56 @@ function AppInner() {
         // to round-trip through the main process.
         void api.focusWindow();
       };
+      // A hidden pipeline STEP task's user-facing events are RETARGETED at
+      // its parent, never dropped and never shown under the step's own
+      // (hidden, meaningless-to-the-user) id (M-A3): the toast reads the
+      // parent's title with the step named in the subtitle, is keyed on the
+      // parent id so `pendingByTask` collapses/dismisses per pipeline, and
+      // opens the pipeline run view. The event's own `pipelineParentId`
+      // stamp is authoritative; the polled list is the fallback for an older
+      // core (or a row not yet polled in).
+      const stepParentId = stepParentIdOf(ev) ?? task?.pipelineParentId ?? null;
+      const target: ToastArgs = stepParentId
+        ? (() => {
+            const parent = tasksRef.current.find((t) => t.id === stepParentId);
+            return {
+              taskId: stepParentId,
+              title: parent?.title || `Pipeline ${stepParentId.slice(0, 7)}`,
+              subtitle: stepSubtitle(task, parent),
+              isSelected: viewingTask(stepParentId),
+              isFocused,
+              onOpen: () => {
+                openPipelineRun(stepParentId);
+                void api.focusWindow();
+              },
+            };
+          })()
+        : { taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen };
       if (ev.kind === "interaction") {
         // A question / permission prompt opened or closed. The tracker raises
         // the alert only on the first prompt for a task and clears it only when
-        // the last one resolves — stacked prompts don't re-alert.
+        // the last one resolves — stacked prompts don't re-alert. For a step
+        // task the tracker is keyed on the PARENT (via `target`), so several
+        // steps' prompts on one pipeline still alert once per pipeline.
         const tracker = pendingInputRef.current;
         if (ev.state === "pending") {
-          if (tracker.add(ev.taskId, ev.interactionId)) {
-            notifyWaitingInput({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+          if (tracker.add(target.taskId, ev.interactionId)) {
+            notifyWaitingInput(target);
           }
-        } else if (tracker.remove(ev.taskId, ev.interactionId)) {
-          dismissPending(ev.taskId);
+        } else if (tracker.remove(target.taskId, ev.interactionId)) {
+          dismissPending(target.taskId);
         }
         // Optimistically reflect the change in the card's pending count so the
         // "needs input" amber-pulse flag (TaskCard, gated on
         // pendingInteractionCount) appears the instant the prompt lands rather
         // than waiting up to 2s for the next /tasks poll, which then reconciles
-        // the true count.
+        // the true count. A step's prompt also bumps its PARENT's count — the
+        // server aggregates a parent's `pendingInteractionCount` across its
+        // steps, so the parent card's glow should move in the same beat.
+        const affected = new Set(stepParentId ? [ev.taskId, stepParentId] : [ev.taskId]);
         setTasks((cur) =>
           cur.map((t) => {
-            if (t.id !== ev.taskId) return t;
+            if (!affected.has(t.id)) return t;
             const next = ev.state === "pending"
               ? t.pendingInteractionCount + 1
               : Math.max(0, t.pendingInteractionCount - 1);
@@ -1031,11 +1199,14 @@ function AppInner() {
         pendingInputRef.current.clearTask(ev.taskId);
         // A hidden pipeline STEP task's own run settling never toasts (or OS-
         // notifies, via `toastSuccess`/`toastError`'s internal
-        // `maybeNotifyOS`) on its own — the parent's own column/pipeline
-        // events are the user-facing signal (m3, mirrors the `blocked`
-        // suppression for `isPipelineStep` further down).
-        const isStepTask = task?.pipelineParentId != null;
-        if (!isStepTask) {
+        // `maybeNotifyOS`) — the parent's own `pipeline`/column events are
+        // the user-facing signal (m3). Deliberately does NOT touch the
+        // parent's retargeted pending toast either: a step routinely settles
+        // with its card still pending (the runner's `user-ask` block), and
+        // the parent's `blocked` event follows right behind — clearing here
+        // would defeat the double-notify suppression below. The parent's own
+        // `pipeline` status transitions own that toast's lifecycle instead.
+        if (!stepParentId) {
           if (ev.status === "succeeded") {
             toastSuccess({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
           } else if (ev.status === "failed" || ev.status === "orphaned") {
@@ -1059,12 +1230,7 @@ function AppInner() {
         // the board polls `task.sentFiles` every 2s already, and the badge
         // count isn't time-sensitive the way a running/blocked column is.
         notifyFilesSent({
-          taskId: ev.taskId,
-          title,
-          subtitle,
-          isSelected,
-          isFocused,
-          onOpen,
+          ...target,
           count: ev.count,
           caption: ev.caption,
           proactive: ev.proactive,
@@ -1081,30 +1247,38 @@ function AppInner() {
         // all read from the task's own polled `fxRecovery` field, not this
         // event — so they're silent here by design.
         if (ev.state === "fired") {
-          toastFxAutoResumeFired({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen, attempt: ev.attempt, max: ev.max });
+          toastFxAutoResumeFired({ ...target, attempt: ev.attempt, max: ev.max });
         } else if (ev.state === "exhausted") {
-          toastFxAutoResumeExhausted({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen, max: ev.max });
+          toastFxAutoResumeExhausted({ ...target, max: ev.max });
         }
         return;
       }
       // Pipeline run-state changes ride their own kind (D12,
-      // `docs/plans/pipelines.md`) — no toast here (the parent's own column
-      // still arrives as a normal `column` event below, handled there) and
-      // no optimistic patch, since the event only carries a status/active-
+      // `docs/plans/pipelines.md`). The event only carries a status/active-
       // step-ids summary, not the full `PipelineRunState` the board's
-      // `PipelineBadge` and an open run view need. Refetch just the parent
-      // task so both reflect the change at sub-poll latency; a failed
-      // refetch just leaves the 2s `/tasks` poll as the fallback (same
-      // degrade-gracefully posture as `refresh()` elsewhere in this file).
+      // `PipelineBadge` and an open run view need, so the parent is
+      // refetched (coalesced per parent, see `refetchPipelineParent`) and
+      // only its run-derived fields merged in.
       if (ev.kind === "pipeline") {
-        // M17's regression risk is now handled server-side (F2): the server
-        // aggregates a pipeline parent's `pendingInteractionCount` across its
-        // steps before answering `GET /tasks/:id`, so this refetch's value is
-        // already authoritative — no client-side "keep the higher of the
-        // two" patch needed (or possible to get wrong) here.
-        void api.getTask(ev.taskId)
-          .then((fresh) => setTasks((cur) => cur.map((t) => (t.id === fresh.id ? fresh : t))))
-          .catch(() => { /* 2s poll catches up */ });
+        const prevStatus = pipelineStatusRef.current.get(ev.taskId) ?? task?.pipelineRun?.status ?? null;
+        pipelineStatusRef.current.set(ev.taskId, ev.status);
+        if (ev.status !== "blocked") {
+          // No block left on the run — a retargeted step "Waiting on you"
+          // toast (and its tracker entry) is stale now. This, not the step's
+          // own run-status, is what clears them: the next block on any step
+          // of this pipeline should alert afresh.
+          dismissPending(ev.taskId);
+          pendingInputRef.current.clearTask(ev.taskId);
+        }
+        // ONE "finished" toast + OS notification per run, on the transition
+        // into `done` (M-A3) — the outcome someone waiting on a long
+        // multi-step run actually wants to hear about; the parent's own
+        // `review` column event stays silent, as every plain success →
+        // review transition does.
+        if (ev.status === "done" && prevStatus !== "done") {
+          toastSuccess({ taskId: ev.taskId, title, subtitle: "Pipeline finished", isSelected, isFocused, onOpen });
+        }
+        refetchPipelineParent(ev.taskId);
         return;
       }
       // column transitions. Patch `tasks` optimistically so the board and any
@@ -1120,8 +1294,7 @@ function AppInner() {
       // on its own — the pipeline PARENT's `blocked` column event (reason
       // "pipeline") is the one the user should see, and toasting both would
       // be a double notification for one underlying block (D9/D11).
-      const isPipelineStep = task?.pipelineParentId != null;
-      if (ev.column === "blocked" && !isPipelineStep) {
+      if (ev.column === "blocked" && !stepParentId) {
         if (ev.reason === "api-error") {
           toastApiError({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else if (ev.reason === "session-died") {
@@ -1129,24 +1302,34 @@ function AppInner() {
         } else if (ev.reason === "unknown-command") {
           toastUnknownCommand({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else if (ev.reason === "pipeline") {
-          toastPending({ taskId: ev.taskId, title, subtitle: "Pipeline needs you", isSelected, isFocused, onOpen });
+          // Suppressed while a step's RETARGETED "Waiting on you" toast is
+          // already live for this parent (M-A3) — that toast already names
+          // the exact step and opens the same run view, so a second
+          // "Pipeline needs you" for the same block would be noise (and a
+          // second OS notification).
+          if (!hasPendingToast(ev.taskId)) {
+            toastPending({ taskId: ev.taskId, title, subtitle: "Pipeline needs you", isSelected, isFocused, onOpen });
+          }
         } else {
           toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         }
       } else if (ev.prev === "blocked") {
         // Auto-clear the pending toast once the agent unblocks (the user
-        // answered, the run was cancelled, etc.).
+        // answered, the run was cancelled, etc.). A pipeline parent also
+        // drops its (retargeted, parent-keyed) tracker entries here, so the
+        // next step's prompt alerts afresh.
         dismissPending(ev.taskId);
+        if (task?.pipelineId) pendingInputRef.current.clearTask(ev.taskId);
       }
     };
     const cancel = api.subscribeGlobalEvents(handle);
     return cancel;
-    // `openTask` has a stable identity (it, `openPipelineRun`, and `navigate`
-    // all read `view`/`pipelineEditorDirty` via refs rather than depending on
-    // them directly — see `viewRef`'s doc comment above) — listing it doesn't
-    // cause a resubscribe, it just keeps this effect honest about what it
-    // closes over.
-  }, [openTask]);
+    // `openTask`, `openPipelineRun` and `mergeTaskFields` all have stable
+    // identities (the first two read `view`/`pipelineEditorDirty` via refs
+    // rather than depending on them directly — see `viewRef`'s doc comment
+    // above) — listing them doesn't cause a resubscribe, it just keeps this
+    // effect honest about what it closes over.
+  }, [openTask, openPipelineRun, mergeTaskFields]);
 
   // Hidden pipeline STEP tasks never count toward anything user-facing (D11,
   // `docs/plans/pipelines.md`) — the header's "N of M tasks" count and the
@@ -1311,6 +1494,13 @@ function AppInner() {
     if (!col) return;
     const t = tasksRef.current.find((x) => x.id === id);
     if (!t || t.column === col) return;
+    // A pipeline PARENT's column is runner-owned (mirrors `pipelineRun.status`;
+    // the server 409s a `column` patch on it) — refuse the drop and say why,
+    // instead of an optimistic flip that snaps back with a raw 409 (L-A4).
+    if (t.pipelineId) {
+      toast("This pipeline task's column is managed by its run.");
+      return;
+    }
     setTasks((cur) => cur.map((x) => (x.id === id ? { ...x, column: col } : x)));
     try {
       setError(null);
@@ -1604,6 +1794,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
     const t = tasksRef.current.find((x) => x.id === snapshot.id) ?? snapshot;
     switch (action) {
       case "open":
+        setFocusSubagent(null);
         setSelected(t);
         break;
       case "open-pipeline":
@@ -2074,7 +2265,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 <PipelineRunView
                   taskId={view.taskId}
                   onOpenTask={(t, opts) => {
-                    setFocusSubagent(opts?.subagentId ? { id: opts.subagentId, nonce: Date.now() } : null);
+                    setFocusSubagent(opts?.subagentId ? { taskId: t.id, id: opts.subagentId, nonce: Date.now(), consumed: false } : null);
                     setSelected(t);
                   }}
                   onOpenSettingsAgents={openSettingsAgents}
@@ -2097,7 +2288,12 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         onRefreshModels={onRefreshModels}
         homeDir={homeDir}
         onTaskFieldsChanged={mergeTaskFields}
-        onClose={() => setSelected(null)}
+        onClose={() => {
+          setSelected(null);
+          // A closed panel has no tab to land on — drop the request so it
+          // can't force the strip open on the next task (M-A2).
+          setFocusSubagent(null);
+        }}
         onShowDiff={setDiffTask}
         onArchive={archive}
         onUnarchive={unarchive}
@@ -2110,6 +2306,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         onViewIssue={viewIssue}
         onOpenPipeline={(parentTaskId) => openPipelineRun(parentTaskId)}
         focusSubagent={focusSubagent}
+        onFocusSubagentConsumed={onFocusSubagentConsumed}
       />
       <DiffDialog
         open={!!diffTask}

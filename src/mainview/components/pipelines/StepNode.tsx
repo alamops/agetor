@@ -34,7 +34,11 @@ export type StepFlowNodeType = Node<StepNodeData, "step">;
 
 const VISUAL_CLASSES: Record<StepVisualState, string> = {
   idle: "border-border",
-  active: "border-info ring-2 ring-info animate-pipeline-pulse",
+  // The pulse is an OUTLINE animation (`pipeline-pulse` in
+  // tailwind.config.js), so it coexists with the `ring-primary` selection
+  // ring below — both used to be box-shadows, and the keyframe clobbered
+  // the ring. No static `ring-info` here: the animated outline IS the halo.
+  active: "border-info outline outline-2 outline-info animate-pipeline-pulse",
   done: "border-success",
   blocked: "border-warning",
   failed: "border-danger",

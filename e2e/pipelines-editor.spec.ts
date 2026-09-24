@@ -512,6 +512,131 @@ test.describe("pipelines editor", () => {
     }
   });
 
+  // H3: React Flow's built-in `deleteKeyCode` handler only guarded text
+  // inputs, so a Backspace/Delete aimed at an open dialog (the "Delete
+  // step" confirm, a satellite's details) deleted the selected step
+  // underneath it. The editor now owns Delete/Backspace itself, behind the
+  // same modal/popover layer selector its Escape handler uses.
+  test("Delete/Backspace inside a dialog never deletes the selected step; on a focused canvas node it does", async ({
+    page,
+    backend,
+  }) => {
+    const helper = await createProfileRest(backend, `Editor Delete-Guard Helper ${randomUUID()}`);
+    createdProfileIds.push(helper.id);
+    await page.setViewportSize({ width: 1600, height: 900 });
+
+    await gotoApp(page, backend.bootBase);
+    await pipelinesButton(page).click();
+    await page.getByTestId("pipelines-new").click();
+    const editor = page.getByTestId("pipeline-editor");
+    await expect(editor).toBeVisible();
+    await editor.getByTestId("pipeline-add-step").click();
+    const nodes = editor.locator('[data-testid="pipeline-step-node"]');
+    await expect(nodes).toHaveCount(2);
+    const [id0, id1] = await nodeIds(page);
+
+    // 1. The "Delete step" confirm is up: Backspace and Delete must neither
+    //    delete the step nor dismiss the dialog.
+    const panel = await openStepPanel(editor, stepNode(page, id0!));
+    await panel.getByTestId("pipeline-step-delete").click();
+    const confirmDialog = page.getByRole("dialog").filter({ hasText: "Delete step" });
+    await expect(confirmDialog).toBeVisible();
+    await page.keyboard.press("Backspace");
+    await page.keyboard.press("Delete");
+    await expect(confirmDialog).toBeVisible();
+    await expect(nodes).toHaveCount(2);
+    await confirmDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirmDialog).toBeHidden();
+    await expect(nodes).toHaveCount(2);
+
+    // 2. A satellite's details dialog is up (give the step one persona,
+    //    then click its satellite): Delete/Backspace leave the step alone.
+    const subagents = panel.getByTestId("pipeline-step-subagents");
+    const trigger = subagents.getByRole("button").first();
+    await trigger.click();
+    await subagents.getByRole("button", { name: helper.name }).click();
+    await trigger.click(); // toggles the popover closed
+    const satellite = editor.locator(`[data-testid="pipeline-subagent-node"][data-step-id="${id0}"]`);
+    await expect(satellite).toHaveCount(1);
+    await satellite.click({ force: true });
+    const details = page.getByTestId("subagent-details-dialog");
+    await expect(details).toBeVisible();
+    await page.keyboard.press("Delete");
+    await page.keyboard.press("Backspace");
+    await expect(details).toBeVisible();
+    await expect(nodes).toHaveCount(2);
+    await details.getByTestId("subagent-details-close").click();
+    await expect(details).toBeHidden();
+    await expect(nodes).toHaveCount(2);
+
+    // 3. Backspace inside the panel's name input edits the text — never the
+    //    graph.
+    const nameInput = panel.getByTestId("pipeline-step-name");
+    const nameBefore = await nameInput.inputValue();
+    await nameInput.click();
+    await page.keyboard.press("End");
+    await page.keyboard.press("Backspace");
+    await expect(nameInput).toHaveValue(nameBefore.slice(0, -1));
+    await expect(nodes).toHaveCount(2);
+
+    // 4. With the (still selected) step's own canvas node focused, Delete
+    //    removes it — and only it.
+    await page.locator(`.react-flow__node[data-id="${id0}"]`).focus();
+    await page.keyboard.press("Delete");
+    await expect(nodes).toHaveCount(1);
+    await expect(stepNode(page, id1!)).toBeVisible();
+    await expect(editor.locator('[data-testid="pipeline-step-panel"]')).toHaveCount(0);
+  });
+
+  test("Escape deselects the step (closes its panel); Enter on a focused node re-selects it", async ({ page, backend }) => {
+    await gotoApp(page, backend.bootBase);
+    await pipelinesButton(page).click();
+    await page.getByTestId("pipelines-new").click();
+    const editor = page.getByTestId("pipeline-editor");
+    await expect(editor).toBeVisible();
+    // A fresh draft's one default step starts selected.
+    const [id0] = await nodeIds(page);
+    await expect(editor.locator('[data-testid="pipeline-step-panel"]')).toHaveCount(1);
+
+    await page.keyboard.press("Escape");
+    await expect(editor.locator('[data-testid="pipeline-step-panel"]')).toHaveCount(0, { timeout: CONVERGE_TIMEOUT });
+    await expect(editor.locator('[data-testid="pipeline-step-node"]')).toHaveCount(1);
+
+    // Keyboard activation mirrors a click: focus the node (React Flow gives
+    // every node `tabIndex=0`) and press Enter.
+    await page.locator(`.react-flow__node[data-id="${id0}"]`).focus();
+    await page.keyboard.press("Enter");
+    await expect(editor.locator('[data-testid="pipeline-step-panel"]')).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+  });
+
+  test("header Pipelines button while the draft is dirty asks to discard: Keep editing stays, Discard leaves", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    await pipelinesButton(page).click();
+    await page.getByTestId("pipelines-new").click();
+    const editor = page.getByTestId("pipeline-editor");
+    await expect(editor).toBeVisible();
+    await editor.getByTestId("pipeline-name").fill(`E2E Dirty Draft ${randomUUID()}`);
+
+    // The header button routes through App's `navigate` guard.
+    await pipelinesButton(page).click();
+    const discardDialog = page.getByRole("dialog").filter({ hasText: "Discard unsaved pipeline changes?" });
+    await expect(discardDialog).toBeVisible();
+    await discardDialog.getByRole("button", { name: "Keep editing", exact: true }).click();
+    await expect(discardDialog).toBeHidden();
+    await expect(editor).toBeVisible();
+    await expect(page.getByTestId("pipelines-back")).toHaveCount(0);
+
+    await pipelinesButton(page).click();
+    await expect(discardDialog).toBeVisible();
+    await discardDialog.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(discardDialog).toBeHidden();
+    await expect(page.getByTestId("pipelines-back")).toBeVisible();
+    await expect(editor).toHaveCount(0);
+  });
+
   test("delete pipeline from the list", async ({ page, backend }) => {
     const name = `E2E Delete Me ${randomUUID()}`;
     const created = await createPipelineRest(backend, name);

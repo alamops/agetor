@@ -450,6 +450,9 @@ describe("buildTaskContextMenu", () => {
       const running = buildTaskContextMenu(makeTask({ pipelineId: "pipe-1", column: "running" }), { isOpen: false });
       expect(actions(running)).toContain("archive");
       expect(actions(running)).toContain("delete");
+      // L-A1: without a `running` pipelineRun there's nothing the cancel
+      // route would honour — no Stop, even though the column says running.
+      expect(actions(running)).not.toContain("stop");
 
       const archived = buildTaskContextMenu(
         makeTask({ pipelineId: "pipe-1", archivedAt: Date.now() }),
@@ -532,6 +535,26 @@ describe("buildTaskContextMenu", () => {
       const entries = buildTaskContextMenu(task, { isOpen: false });
 
       expect(actions(entries)).toEqual(["open-pipeline", "start", "diff", "open-in-finder", "delete"]);
+    });
+
+    test("L-A1: a pipeline parent's Stop gates on pipelineRun.status === 'running', not the column", () => {
+      const running = buildTaskContextMenu(
+        makeTask({ pipelineId: "pipe-1", column: "running", pipelineRun: pipelineRun({ status: "running", active: [{ stepId: "s1", taskId: "step-1", seq: 1 }] }) }),
+        { isOpen: false },
+      );
+      expect(actions(running)).toContain("stop");
+
+      // A `blocked` run with nothing live — the cancel route 409s
+      // ("pipeline is not running"), so the card/menu must not offer Stop.
+      const blocked = buildTaskContextMenu(
+        makeTask({ pipelineId: "pipe-1", column: "blocked", pipelineRun: pipelineRun({ status: "blocked", active: [{ stepId: "s1", taskId: "step-1", seq: 1 }] }) }),
+        { isOpen: false },
+      );
+      expect(actions(blocked)).not.toContain("stop");
+
+      // A plain (non-pipeline) blocked task keeps the column-based rule.
+      const plainBlocked = buildTaskContextMenu(makeTask({ column: "blocked" }), { isOpen: false });
+      expect(actions(plainBlocked)).toContain("stop");
     });
 
     test("M15: a pipeline parent with no pipelineRun at all (never run) still shows 'start'", () => {

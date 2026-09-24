@@ -26,6 +26,10 @@ export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
   }
 
   for (const req of pending) {
+    // A pipeline parent's pending list aggregates its hidden step tasks'
+    // cards — say which step task this one belongs to when it isn't the
+    // task the user named.
+    if (req.taskId !== task.id) out(c.dim(`↳ on step task ${req.taskId.slice(0, 8)}`));
     if (req.kind === "ask_questions") {
       const ok = await answerAsk(client, req);
       if (!ok) return; // cancelled

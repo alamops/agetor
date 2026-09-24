@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { notifyFor } from "./notify.ts";
+import { notifyFor, eventPipelineParentId } from "./notify.ts";
 import type { GlobalEvent } from "../shared/types.ts";
 
 const T = "task-abc-12345";
@@ -37,6 +37,23 @@ test("notifyFor: opts.hidden suppresses every notification for this task, even a
       { hidden: true },
     ),
   ).toBeNull();
+});
+
+// Cross-agent contract (a): the orchestrator stamps `pipelineParentId` on a
+// step task's own events — read straight off the event, so a step that
+// settles before the caller ever learned it was a step is still suppressed.
+test("notifyFor: an event carrying pipelineParentId is suppressed even without opts.hidden", () => {
+  const stamped = { kind: "run-status", taskId: T, runId: "r", status: "succeeded", ts: 1, pipelineParentId: "parent-1" } as unknown as GlobalEvent;
+  expect(notifyFor(stamped, T)).toBeNull();
+  const blocked = { kind: "column", taskId: T, runId: "r", column: "blocked", prev: "running", ts: 1, pipelineParentId: "parent-1" } as unknown as GlobalEvent;
+  expect(notifyFor(blocked, T)).toBeNull();
+});
+
+test("eventPipelineParentId: reads a non-empty string stamp, null otherwise (older core / null / empty)", () => {
+  expect(eventPipelineParentId({ kind: "run-status", taskId: T, runId: "r", status: "succeeded", ts: 1 })).toBeNull();
+  expect(eventPipelineParentId({ kind: "run-status", taskId: T, runId: "r", status: "succeeded", ts: 1, pipelineParentId: null } as unknown as GlobalEvent)).toBeNull();
+  expect(eventPipelineParentId({ kind: "run-status", taskId: T, runId: "r", status: "succeeded", ts: 1, pipelineParentId: "" } as unknown as GlobalEvent)).toBeNull();
+  expect(eventPipelineParentId({ kind: "run-status", taskId: T, runId: "r", status: "succeeded", ts: 1, pipelineParentId: "p1" } as unknown as GlobalEvent)).toBe("p1");
 });
 
 test("notifyFor: opts.hidden: false (or omitted) behaves exactly as before", () => {

@@ -434,10 +434,15 @@ export class AgetorClient {
    *  every eligible active execution plus every pending run-level block is
    *  retried, same as before this parameter existed. */
   retryPipeline(taskId: string, targetTaskId?: string): Promise<Task> {
+    // `START_TIMEOUT_MS`, like `startTask`/`restartPipeline`: the route
+    // re-verifies (and may re-materialize) the shared worktree before it
+    // relaunches a step, which is exactly the slow git work the generous
+    // start budget exists for.
     return this.req(
       "POST",
       `/tasks/${encodeURIComponent(taskId)}/pipeline/retry`,
       targetTaskId !== undefined ? { taskId: targetTaskId } : undefined,
+      START_TIMEOUT_MS,
     );
   }
   /** `POST /tasks/:id/pipeline/cancel` — stop every active step execution
@@ -456,7 +461,9 @@ export class AgetorClient {
     taskId: string,
     body: { nextStepIds: string[] | null; handoff?: Partial<Handoff>; fromTaskId?: string },
   ): Promise<Task> {
-    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/advance`, body);
+    // `START_TIMEOUT_MS` for the same reason as `retryPipeline`: advancing
+    // launches the named next step(s), refreshing the shared worktree first.
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/advance`, body, START_TIMEOUT_MS);
   }
   /** `POST /tasks/:id/pipeline/restart` — restart a pipeline run from its
    *  start step (e.g. one that already finished `done`), discarding current

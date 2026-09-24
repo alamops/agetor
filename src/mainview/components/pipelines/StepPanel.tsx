@@ -164,10 +164,13 @@ export function StepPanel({
             <Input
               type="number"
               min={1}
+              max={PIPELINE_LIMITS.subagentCap}
               data-testid="pipeline-step-cap"
               value={step.subagents.cap ?? 1}
               onChange={(e) => {
-                const n = Math.max(1, Math.floor(Number(e.target.value) || 1));
+                // Clamp into the server's own accepted range so a typed
+                // value can't make Save fail validation later.
+                const n = Math.min(PIPELINE_LIMITS.subagentCap, Math.max(1, Math.floor(Number(e.target.value) || 1)));
                 onChange({ ...step, subagents: { ...step.subagents, cap: n } });
               }}
               className="h-7 w-20"
@@ -238,6 +241,7 @@ export function StepPanel({
                 <Input
                   value={edge.label}
                   placeholder="label"
+                  maxLength={PIPELINE_LIMITS.edgeLabel}
                   onChange={(e) => onEdgeLabel(edge.id, e.target.value)}
                   className="h-7 w-24 text-xs"
                   data-testid="pipeline-step-edge-label"

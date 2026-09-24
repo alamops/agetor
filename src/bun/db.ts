@@ -7,7 +7,7 @@ import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
-import { validatePipelineGraph } from "../shared/pipeline.ts";
+import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -616,10 +616,41 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
  *  just index into `.steps`/`.edges` arrays: a `graph` that isn't even an
  *  object with array `steps`/`edges` collapses the whole snapshot to `null`
  *  (an un-runnable snapshot is as good as none) exactly like before. */
+/** Minimal shape check for one `PipelineGraph.steps` entry — a plain object
+ *  with a string `id` and a `position` that's a plain object with numeric
+ *  `x`/`y`. Anything else (a bare string, `null`, a step missing `position`,
+ *  a `position` with non-numeric coordinates) is unsafe to hand to the
+ *  pipeline editor or the step-resolution helpers (shared by `parsePipelineGraph`
+ *  below and `sanitizeRunSnapshot`), which index into both
+ *  fields unconditionally. */
+const isShapeSafePipelineStep = (x: unknown): boolean => {
+  if (!isPlainObject(x)) return false;
+  if (typeof x.id !== "string") return false;
+  const pos = x.position;
+  if (!isPlainObject(pos)) return false;
+  return isFiniteNumber(pos.x) && isFiniteNumber(pos.y);
+};
+
+/** Minimal shape check for one `PipelineGraph.edges` entry — a plain object
+ *  with string `from`/`to`. */
+const isShapeSafePipelineEdge = (x: unknown): boolean =>
+  isPlainObject(x) && typeof x.from === "string" && typeof x.to === "string";
+
 const sanitizeRunSnapshot = (raw: unknown): PipelineRunSnapshot | null => {
   if (!isPlainObject(raw)) return null;
   const rec = raw as Record<string, unknown>;
-  if (!isPlainObject(rec.graph) || !Array.isArray(rec.graph.steps) || !Array.isArray(rec.graph.edges)) {
+  // L-S7: the same per-entry shape checks `parsePipelineGraph` applies to
+  // the live template graph — a `steps` entry without a string `id` or a
+  // numeric `position`, or an `edges` entry without string `from`/`to`,
+  // collapses the whole snapshot to null rather than reaching the
+  // step-resolution helpers that index into those fields unconditionally.
+  if (
+    !isPlainObject(rec.graph) ||
+    !Array.isArray(rec.graph.steps) ||
+    !Array.isArray(rec.graph.edges) ||
+    !rec.graph.steps.every(isShapeSafePipelineStep) ||
+    !rec.graph.edges.every(isShapeSafePipelineEdge)
+  ) {
     return null;
   }
   const graph = rec.graph as unknown as PipelineGraph;
@@ -678,7 +709,12 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
     ? rec.history.map(sanitizeStepRecord).filter((h): h is PipelineStepRecord => h !== null)
     : [];
 
-  const stepCount = isFiniteNumber(rec.stepCount) && rec.stepCount >= 0 ? rec.stepCount : 0;
+  // L-S4: both counters are (safe) integers by construction — the runner
+  // only ever increments them by one — so a fractional, negative, or
+  // beyond-2^53 stored value is corruption, not a real run. `capExtensions` is additionally capped at
+  // `PIPELINE_LIMITS.capExtensionsMax` so `effectiveStepCap` can never scale
+  // a run's allowance by an absurd factor off a hand-edited row.
+  const stepCount = Number.isSafeInteger(rec.stepCount) && (rec.stepCount as number) >= 0 ? (rec.stepCount as number) : 0;
   const startedAt = isFiniteNumber(rec.startedAt) ? rec.startedAt : null;
   const endedAt = isFiniteNumber(rec.endedAt) ? rec.endedAt : null;
 
@@ -694,7 +730,9 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
     stepCount,
     startedAt,
     endedAt,
-    capExtensions: isFiniteNumber(rec.capExtensions) && rec.capExtensions >= 0 ? rec.capExtensions : undefined,
+    capExtensions: Number.isSafeInteger(rec.capExtensions) && (rec.capExtensions as number) >= 0
+      ? Math.min(rec.capExtensions as number, PIPELINE_LIMITS.capExtensionsMax)
+      : undefined,
   };
 };
 
@@ -1968,25 +2006,6 @@ type PipelineRow = {
  *  "don't destroy data", not "don't re-validate a graph that already
  *  validated once". */
 
-/** Minimal shape check for one `PipelineGraph.steps` entry — a plain object
- *  with a string `id` and a `position` that's a plain object with numeric
- *  `x`/`y`. Anything else (a bare string, `null`, a step missing `position`,
- *  a `position` with non-numeric coordinates) is unsafe to hand to the
- *  pipeline editor or the step-resolution helpers, which index into both
- *  fields unconditionally. */
-const isShapeSafePipelineStep = (x: unknown): boolean => {
-  if (!isPlainObject(x)) return false;
-  if (typeof x.id !== "string") return false;
-  const pos = x.position;
-  if (!isPlainObject(pos)) return false;
-  return isFiniteNumber(pos.x) && isFiniteNumber(pos.y);
-};
-
-/** Minimal shape check for one `PipelineGraph.edges` entry — a plain object
- *  with string `from`/`to`. */
-const isShapeSafePipelineEdge = (x: unknown): boolean =>
-  isPlainObject(x) && typeof x.from === "string" && typeof x.to === "string";
-
 const parsePipelineGraph = (raw: string): PipelineGraph => {
   let parsed: unknown;
   try {
@@ -2037,20 +2056,28 @@ const validatePipelineNameAndDescription = (name: string, description: string): 
   if (trimmed.length > PIPELINE_LIMITS.name) {
     throw new Error(`pipeline name must be ${PIPELINE_LIMITS.name} characters or fewer`);
   }
+  if (PIPELINE_CONTROL_CHAR_RE.test(trimmed)) {
+    throw new Error("pipeline name must not contain control characters");
+  }
   if (description.length > PIPELINE_LIMITS.description) {
     throw new Error(`pipeline description must be ${PIPELINE_LIMITS.description} characters or fewer`);
   }
   return { name: trimmed, nameKey: trimmed.toLowerCase() };
 };
 
-/** Clamp a requested `maxSteps` into `1..PIPELINE_LIMITS.maxStepsMax`,
- *  defaulting to `PIPELINE_LIMITS.maxStepsDefault` when absent or not a
- *  finite number — mirrors the leniency `validatePipelineGraph` already
- *  applies to individual step fields rather than rejecting the whole
- *  request over one out-of-range integer. */
-const clampMaxSteps = (raw: number | undefined): number => {
-  if (!isFiniteNumber(raw)) return PIPELINE_LIMITS.maxStepsDefault;
-  return Math.max(1, Math.min(PIPELINE_LIMITS.maxStepsMax, Math.trunc(raw)));
+/** Resolve a requested `maxSteps`: absent (`undefined`) defaults to
+ *  `PIPELINE_LIMITS.maxStepsDefault`; anything else must be an integer in
+ *  `1..PIPELINE_LIMITS.maxStepsMax` or this throws a plain `Error` (a
+ *  caller/validation error, like `validatePipelineNameAndDescription`'s).
+ *  L-S5: this used to CLAMP out-of-range values silently, which let the db
+ *  layer be handed exactly what the `/pipelines` routes 400 on — the two
+ *  layers now agree, and the route's error text is reused verbatim. */
+const resolveMaxSteps = (raw: number | undefined): number => {
+  if (raw === undefined) return PIPELINE_LIMITS.maxStepsDefault;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > PIPELINE_LIMITS.maxStepsMax) {
+    throw new Error(`maxSteps must be an integer between 1 and ${PIPELINE_LIMITS.maxStepsMax}`);
+  }
+  return raw;
 };
 
 /**
@@ -2095,7 +2122,7 @@ export const pipelines = {
     const validated = validatePipelineGraph(input.graph);
     if (!validated.ok) throw new Error(validated.error);
 
-    const maxSteps = clampMaxSteps(input.maxSteps);
+    const maxSteps = resolveMaxSteps(input.maxSteps);
     const id = randomUUID();
     const now = Date.now();
     try {
@@ -2126,7 +2153,7 @@ export const pipelines = {
     const validated = patch.graph !== undefined ? validatePipelineGraph(patch.graph) : { ok: true as const, graph: current.graph };
     if (!validated.ok) throw new Error(validated.error);
 
-    const maxSteps = patch.maxSteps !== undefined ? clampMaxSteps(patch.maxSteps) : current.maxSteps;
+    const maxSteps = patch.maxSteps !== undefined ? resolveMaxSteps(patch.maxSteps) : current.maxSteps;
 
     try {
       db.run(

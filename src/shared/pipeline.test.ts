@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  EFFECTIVE_STEP_CAP_MAX,
   HANDOFF_FILE_UNTRUSTED_WARNING,
+  PIPELINE_CONTROL_CHAR_RE,
+  stepNameKey,
   HANDOFF_REMINDER_MARKER,
   HANDOFF_REMINDER_MARKERS,
   isHandoffReminderMarker,
@@ -447,6 +450,166 @@ describe("validatePipelineGraph", () => {
     if (!result.ok) expect(result.error).toMatch(/non-empty id/);
   });
 
+  test("rejects a duplicate edge id (M-S5)", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" }), makeStep({ id: "c", name: "C" })],
+      edges: [
+        makeEdge({ id: "e1", from: "a", to: "b" }),
+        makeEdge({ id: "e1", from: "a", to: "c" }),
+      ],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toBe('duplicate edge id "e1"');
+  });
+
+  test("a duplicate edge id is rejected even when the pair itself would have been collapsed", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" })],
+      edges: [
+        makeEdge({ id: "e1", from: "a", to: "b" }),
+        makeEdge({ id: "e1", from: "a", to: "b" }),
+      ],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("duplicate edge id");
+  });
+
+  test("rejects two outgoing edges of one source with equal (trimmed, case-insensitive, NFC) labels (M-S6)", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" }), makeStep({ id: "c", name: "C" })],
+      edges: [
+        makeEdge({ id: "e1", from: "a", to: "b", label: "Happy  Path" }),
+        makeEdge({ id: "e2", from: "a", to: "c", label: " happy path " }),
+      ],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain('has two outgoing edges labeled');
+      expect(result.error).toContain('"e1"');
+      expect(result.error).toContain('"e2"');
+    }
+    // Same labels on DIFFERENT sources are fine.
+    const ok = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" }), makeStep({ id: "c", name: "C" })],
+      edges: [
+        makeEdge({ id: "e1", from: "a", to: "b", label: "go" }),
+        makeEdge({ id: "e2", from: "b", to: "c", label: "go" }),
+      ],
+    });
+    expect(ok.ok).toBe(true);
+    // Empty labels never clash with each other.
+    const okEmpty = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" }), makeStep({ id: "c", name: "C" })],
+      edges: [
+        makeEdge({ id: "e1", from: "a", to: "b", label: "" }),
+        makeEdge({ id: "e2", from: "a", to: "c", label: "  " }),
+      ],
+    });
+    expect(okEmpty.ok).toBe(true);
+  });
+
+  test("rejects an outgoing edge label that spells the NAME of a different target of the same source (M-S6)", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "Review" }), makeStep({ id: "c", name: "Ship" })],
+      edges: [
+        makeEdge({ id: "e1", from: "a", to: "b", label: "ship" }), // label == sibling target "Ship"
+        makeEdge({ id: "e2", from: "a", to: "c", label: "" }),
+      ],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain('edge "e1"');
+      expect(result.error).toContain("also the name of its sibling target");
+    }
+    // A label equal to its OWN target's name is redundant but harmless.
+    const ok = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "Review" }), makeStep({ id: "c", name: "Ship" })],
+      edges: [
+        makeEdge({ id: "e1", from: "a", to: "b", label: "review" }),
+        makeEdge({ id: "e2", from: "a", to: "c", label: "ship" }),
+      ],
+    });
+    expect(ok.ok).toBe(true);
+  });
+
+  test("rejects control characters in step names, step/edge ids and edge labels (L-S1)", () => {
+    const withStepName = (name: string) => validatePipelineGraph({ steps: [makeStep({ id: "a", name })], edges: [] });
+    for (const bad of ["Tab\there", "New\nline", "CR\rhere", "Bell\u0007", "NUL\u0000", "Del\u007f"]) {
+      const r = withStepName(bad);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toContain("control characters");
+    }
+    const badStepId = validatePipelineGraph({ steps: [makeStep({ id: "a\u0001" })], edges: [] });
+    expect(badStepId.ok).toBe(false);
+    if (!badStepId.ok) expect(badStepId.error).toBe("step ids must not contain control characters");
+    const badEdgeId = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" })],
+      edges: [makeEdge({ id: "e\u001f", from: "a", to: "b" })],
+    });
+    expect(badEdgeId.ok).toBe(false);
+    if (!badEdgeId.ok) expect(badEdgeId.error).toBe("edge ids must not contain control characters");
+    const badLabel = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" })],
+      edges: [makeEdge({ id: "e1", from: "a", to: "b", label: "ok\u0008" })],
+    });
+    expect(badLabel.ok).toBe(false);
+    if (!badLabel.ok) expect(badLabel.error).toContain('edge "e1" label must not contain control characters');
+    // Non-control non-ASCII is fine.
+    expect(withStepName("Étape — 日本語 ✓").ok).toBe(true);
+    // The exported regex is what every layer shares.
+    expect(PIPELINE_CONTROL_CHAR_RE.test("plain")).toBe(false);
+    expect(PIPELINE_CONTROL_CHAR_RE.test("x\u001fy")).toBe(true);
+  });
+
+  test("collapses internal whitespace runs in step names to one space, and dedupes on the collapsed key (L-S1)", () => {
+    const result = validatePipelineGraph({
+      steps: [makeStep({ id: "a", name: "  Build   the    thing  " })],
+      edges: [],
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.graph.steps[0]!.name).toBe("Build the thing");
+    const dup = validatePipelineGraph({
+      steps: [makeStep({ id: "a", name: "Build the thing" }), makeStep({ id: "b", name: "build   THE thing" })],
+      edges: [],
+    });
+    expect(dup.ok).toBe(false);
+    if (!dup.ok) expect(dup.error).toContain("duplicate step name");
+  });
+
+  test("step-name uniqueness is NFC-normalized (L-S9): precomposed vs. decomposed é collide", () => {
+    const precomposed = "Caf\u00e9"; // é
+    const decomposed = "Cafe\u0301"; // e + combining acute
+    expect(precomposed).not.toBe(decomposed);
+    expect(stepNameKey(precomposed)).toBe(stepNameKey(decomposed));
+    const dup = validatePipelineGraph({
+      steps: [makeStep({ id: "a", name: precomposed }), makeStep({ id: "b", name: decomposed })],
+      edges: [],
+    });
+    expect(dup.ok).toBe(false);
+    if (!dup.ok) expect(dup.error).toContain("duplicate step name");
+  });
+
+  test("rejects an agentProfileId or a subagents.profileIds entry over PIPELINE_LIMITS.id chars (L-S2)", () => {
+    const tooLong = "p".repeat(PIPELINE_LIMITS.id + 1);
+    const atLimit = "p".repeat(PIPELINE_LIMITS.id);
+    const badProfile = validatePipelineGraph({ steps: [makeStep({ id: "a", agentProfileId: tooLong })], edges: [] });
+    expect(badProfile.ok).toBe(false);
+    if (!badProfile.ok) expect(badProfile.error).toContain(`agentProfileId exceeds ${PIPELINE_LIMITS.id} chars`);
+    const okProfile = validatePipelineGraph({ steps: [makeStep({ id: "a", agentProfileId: atLimit })], edges: [] });
+    expect(okProfile.ok).toBe(true);
+    const badSub = validatePipelineGraph({
+      steps: [makeStep({ id: "a", subagents: { profileIds: ["fine", tooLong], cap: null } })],
+      edges: [],
+    });
+    expect(badSub.ok).toBe(false);
+    if (!badSub.ok) expect(badSub.error).toContain(`subagents.profileIds entry exceeds ${PIPELINE_LIMITS.id} chars`);
+    const okSub = validatePipelineGraph({
+      steps: [makeStep({ id: "a", subagents: { profileIds: ["fine", atLimit], cap: null } })],
+      edges: [],
+    });
+    expect(okSub.ok).toBe(true);
+  });
+
   test("rejects an edge with a missing/empty id", () => {
     const result = validatePipelineGraph({
       steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" })],
@@ -696,6 +859,188 @@ describe("parseHandoff", () => {
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.handoff.status).toBeUndefined();
   });
+
+  // ---- H2: linear scanner semantics + performance ----------------------
+
+  test("a valid block followed by an unclosed draft → the earlier valid block (H2 semantic pin)", () => {
+    const final = fullHandoffJson({ next: "Real target" });
+    const text = `<${HANDOFF_TAG}>${final}</${HANDOFF_TAG}>\n\nOne more thought:\n<${HANDOFF_TAG}>\n{"next": "half-written`;
+    const result = parseHandoff(text);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.handoff.next).toBe("Real target");
+  });
+
+  test("nested <handoff><handoff>{…}</handoff></handoff> pairs the outer open with the inner close and recovers the JSON (L-S10)", () => {
+    const inner = fullHandoffJson({ next: "Inner target" });
+    const text = `<${HANDOFF_TAG}><${HANDOFF_TAG}>${inner}</${HANDOFF_TAG}></${HANDOFF_TAG}>`;
+    const result = parseHandoff(text);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.handoff.next).toBe("Inner target");
+  });
+
+  test("a stray close tag after a complete block doesn't extend the block (regex parity)", () => {
+    const text = `<${HANDOFF_TAG}>${fullHandoffJson({ next: "A" })}</${HANDOFF_TAG}> trailing </${HANDOFF_TAG}>`;
+    const result = parseHandoff(text);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.handoff.next).toBe("A");
+  });
+
+  test("tag matching is case-insensitive, and `<handoffx>` is not an open tag", () => {
+    const upper = `<HANDOFF>${fullHandoffJson({ next: "Up" })}</Handoff>`;
+    const r1 = parseHandoff(upper);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) expect(r1.handoff.next).toBe("Up");
+    const notATag = `<${HANDOFF_TAG}x>${fullHandoffJson()}</${HANDOFF_TAG}>`;
+    const r2 = parseHandoff(notATag);
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.raw).toBeNull();
+  });
+
+  test("an open tag whose attributes never close matches nothing", () => {
+    const r = parseHandoff(`<${HANDOFF_TAG} attr="unterminated ${fullHandoffJson()}</${HANDOFF_TAG}`);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.raw).toBeNull();
+  });
+
+  test("only the trailing PIPELINE_LIMITS.handoffScanTailBytes of the text are scanned", () => {
+    const block = `<${HANDOFF_TAG}>${fullHandoffJson({ next: "Tail" })}</${HANDOFF_TAG}>`;
+    const padding = "x".repeat(PIPELINE_LIMITS.handoffScanTailBytes);
+    // Block entirely inside the tail → found.
+    const inTail = parseHandoff(`${padding}\n${block}`);
+    expect(inTail.ok).toBe(true);
+    // Block entirely before the tail → not found (contract: the block ends the message).
+    const beforeTail = parseHandoff(`${block}\n${padding}`);
+    expect(beforeTail.ok).toBe(false);
+    if (!beforeTail.ok) expect(beforeTail.raw).toBeNull();
+  });
+
+  test("50,000 unclosed <handoff> opens in ~500 KB parse in well under 100 ms (H2)", () => {
+    const text = `<${HANDOFF_TAG}>\n`.repeat(50_000); // ~500 KB, no close tag anywhere
+    expect(text.length).toBeGreaterThan(400_000);
+    const start = performance.now();
+    const result = parseHandoff(text);
+    const elapsed = performance.now() - start;
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.raw).toBeNull();
+    expect(elapsed).toBeLessThan(100);
+  });
+
+  test("pathological open-tag / close-tag shapes stay linear", () => {
+    // 50k `<handoff ` false-opens whose attributes never close, then one real block.
+    const falseOpens = `<${HANDOFF_TAG} a`.repeat(50_000);
+    const real = `<${HANDOFF_TAG}>${fullHandoffJson({ next: "Real" })}</${HANDOFF_TAG}>`;
+    let start = performance.now();
+    const r1 = parseHandoff(`${falseOpens}${real}`);
+    expect(performance.now() - start).toBeLessThan(100);
+    // The false opens' attributes swallow everything up to the first `>` —
+    // the real block's open tag — exactly as the old regex's `[^>]*` did;
+    // the body then reaches the real close, and JSON recovery finds the object.
+    expect(r1.ok).toBe(true);
+    if (r1.ok) expect(r1.handoff.next).toBe("Real");
+
+    // 50k stray close tags and no open tag.
+    start = performance.now();
+    const r2 = parseHandoff(`</${HANDOFF_TAG}>`.repeat(50_000));
+    expect(performance.now() - start).toBeLessThan(100);
+    expect(r2.ok).toBe(false);
+
+    // 50k `</` + whitespace runs (the close-tag whitespace tolerance).
+    start = performance.now();
+    const r3 = parseHandoff(`<${HANDOFF_TAG}>{}` + `</   `.repeat(50_000) + `</${HANDOFF_TAG}>`);
+    expect(performance.now() - start).toBeLessThan(100);
+    expect(r3.ok).toBe(true);
+  });
+
+  // ---- M-S2 / L-S3 / L-S10: caps and hostile keys ------------------------
+
+  test("caps every artifacts/openQuestions ELEMENT at PIPELINE_LIMITS.handoffField (M-S2)", () => {
+    const text = `<${HANDOFF_TAG}>${JSON.stringify({ artifacts: ["a".repeat(9000)], openQuestions: ["q".repeat(8001), "short"] })}</${HANDOFF_TAG}>`;
+    const result = parseHandoff(text);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.handoff.artifacts[0]!.length).toBe(PIPELINE_LIMITS.handoffField);
+      expect(result.handoff.openQuestions[0]!.length).toBe(PIPELINE_LIMITS.handoffField);
+      expect(result.handoff.openQuestions[1]).toBe("short");
+    }
+  });
+
+  test("the whole normalized handoff is bounded by PIPELINE_LIMITS.handoffTotalBytes — arrays trimmed first, then fields (M-S2)", () => {
+    const big = "x".repeat(PIPELINE_LIMITS.handoffField);
+    const raw = {
+      purpose: big,
+      summary: big,
+      reason: big,
+      next: "Step 2",
+      artifacts: Array.from({ length: PIPELINE_LIMITS.handoffArray }, (_, i) => `${i}-${big}`),
+      openQuestions: Array.from({ length: PIPELINE_LIMITS.handoffArray }, (_, i) => `${i}-${big}`),
+    };
+    const handoff = normalizeHandoff(raw);
+    const bytes = new TextEncoder().encode(JSON.stringify(handoff)).length;
+    expect(bytes).toBeLessThanOrEqual(PIPELINE_LIMITS.handoffTotalBytes);
+    // Arrays were trimmed down to fit before any field was touched: the
+    // three fields (3 × 8 KB) fit inside 64 KB on their own, so they survive
+    // intact and `next` is untouched.
+    expect(handoff.purpose).toBe(big);
+    expect(handoff.summary).toBe(big);
+    expect(handoff.reason).toBe(big);
+    expect(handoff.next).toBe("Step 2");
+    expect(handoff.artifacts.length + handoff.openQuestions.length).toBeLessThan(2 * PIPELINE_LIMITS.handoffArray);
+    // Entries are dropped from the END, so both arrays keep their heads
+    // (each head itself per-element-capped: `${i}-${big}` is 8002 chars).
+    expect(handoff.artifacts[0]!.startsWith("0-")).toBe(true);
+    expect(handoff.artifacts[0]!.length).toBe(PIPELINE_LIMITS.handoffField);
+    expect(handoff.openQuestions[0]!.startsWith("0-")).toBe(true);
+    expect(handoff.openQuestions[0]!.length).toBe(PIPELINE_LIMITS.handoffField);
+    // Result is well-formed and re-normalizes to itself (idempotent).
+    expect(normalizeHandoff(handoff)).toEqual(handoff);
+  });
+
+  test("total-bytes budget: multi-byte content counts in UTF-8, and fields shrink once arrays are empty", () => {
+    // 4-byte astral chars: 8000 code units = 4000 emoji = 16 KB per field,
+    // ×3 fields = 48 KB + `next` 16 KB > 64 KB with no arrays at all.
+    const emoji = "😀".repeat(PIPELINE_LIMITS.handoffField / 2);
+    const handoff = normalizeHandoff({ purpose: emoji, summary: emoji, reason: emoji, next: emoji, artifacts: [], openQuestions: [] });
+    const bytes = new TextEncoder().encode(JSON.stringify(handoff)).length;
+    expect(bytes).toBeLessThanOrEqual(PIPELINE_LIMITS.handoffTotalBytes);
+    for (const f of [handoff.purpose, handoff.summary, handoff.reason, handoff.next ?? ""]) {
+      expect(f.isWellFormed()).toBe(true);
+    }
+    // `next` is trimmed last — it still carries content while the longer
+    // prose fields absorbed the cut.
+    expect(handoff.next).not.toBeNull();
+  });
+
+  test("capField never splits a surrogate pair (L-S3)", () => {
+    // 7999 BMP chars + one astral char straddling the 8000 boundary.
+    const straddle = "a".repeat(PIPELINE_LIMITS.handoffField - 1) + "😀" + "tail";
+    const r = normalizeHandoff({ summary: straddle, artifacts: [straddle] });
+    expect(r.summary.isWellFormed()).toBe(true);
+    expect(r.summary.length).toBe(PIPELINE_LIMITS.handoffField - 1); // backed off one unit
+    expect(r.artifacts[0]!.isWellFormed()).toBe(true);
+    // An astral char that fits entirely is kept whole.
+    const fits = "a".repeat(PIPELINE_LIMITS.handoffField - 2) + "😀" + "tail";
+    const r2 = normalizeHandoff({ summary: fits });
+    expect(r2.summary.length).toBe(PIPELINE_LIMITS.handoffField);
+    expect(r2.summary.endsWith("😀")).toBe(true);
+    expect(r2.summary.isWellFormed()).toBe(true);
+  });
+
+  test("__proto__ / constructor keys in a handoff never pollute prototypes or leak into the result (L-S10)", () => {
+    const text = `<${HANDOFF_TAG}>{"__proto__":{"polluted":true},"constructor":{"prototype":{"polluted2":true}},"summary":"ok"}</${HANDOFF_TAG}>`;
+    const result = parseHandoff(text);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.handoff.summary).toBe("ok");
+      expect(Object.getPrototypeOf(result.handoff)).toBe(Object.prototype);
+      expect(Object.keys(result.handoff).sort()).toEqual(
+        ["artifacts", "next", "openQuestions", "purpose", "reason", "schemaVersion", "summary"],
+      );
+      expect((result.handoff as unknown as Record<string, unknown>).polluted).toBeUndefined();
+    }
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    expect(({} as Record<string, unknown>).polluted2).toBeUndefined();
+    expect((Object.prototype as unknown as Record<string, unknown>).polluted).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -849,6 +1194,44 @@ describe("resolveNextSteps", () => {
     });
   });
 
+  test("more than one match at the same tier → ambiguous, not first-wins (M-S6)", () => {
+    // A graph that predates the validator's duplicate-label rule (built
+    // directly, not through validatePipelineGraph).
+    const g = makeGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "Branch B" }), makeStep({ id: "c", name: "Branch C" })],
+      edges: [
+        makeEdge({ id: "e1", from: "a", to: "b", label: "go" }),
+        makeEdge({ id: "e2", from: "a", to: "c", label: "GO" }),
+      ],
+    });
+    const handoff = { ...fullHandoffJsonObj(), next: "go" };
+    expect(resolveNextSteps(g, "a", handoff)).toEqual({ kind: "ambiguous", candidates: ["Branch B", "Branch C"] });
+    // A label that collides with a sibling target's NAME: the name tier
+    // resolves first and uniquely, so the name wins.
+    const g2 = makeGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "Review" }), makeStep({ id: "c", name: "Ship" })],
+      edges: [
+        makeEdge({ id: "e1", from: "a", to: "b", label: "ship" }),
+        makeEdge({ id: "e2", from: "a", to: "c", label: "" }),
+      ],
+    });
+    expect(resolveNextSteps(g2, "a", { ...fullHandoffJsonObj(), next: "Ship" })).toEqual({ kind: "steps", stepIds: ["c"] });
+  });
+
+  test("name and label matching collapse whitespace and NFC-normalize (L-S9)", () => {
+    const g = makeGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "Caf\u00e9 Review" }), makeStep({ id: "c", name: "Ship" })],
+      edges: [
+        makeEdge({ id: "e1", from: "a", to: "b", label: "" }),
+        makeEdge({ id: "e2", from: "a", to: "c", label: "d\u00e9ploy now" }),
+      ],
+    });
+    // Decomposed é + doubled internal whitespace still matches the name.
+    expect(resolveNextSteps(g, "a", { ...fullHandoffJsonObj(), next: "cafe\u0301   review" })).toEqual({ kind: "steps", stepIds: ["b"] });
+    // Same for an edge label.
+    expect(resolveNextSteps(g, "a", { ...fullHandoffJsonObj(), next: "DE\u0301PLOY  NOW" })).toEqual({ kind: "steps", stepIds: ["c"] });
+  });
+
   test("transition:'all' starts every outgoing target regardless of next", () => {
     const g = makeGraph({
       steps: [
@@ -942,6 +1325,31 @@ describe("effectiveStepCap", () => {
       snapshot: { graph: makeGraph(), maxSteps: 5, profiles: {}, capturedAt: 0 },
     });
     expect(effectiveStepCap(run)).toBe(5);
+  });
+
+  test("clamps to a finite sane maximum (L-S4)", () => {
+    expect(EFFECTIVE_STEP_CAP_MAX).toBe(PIPELINE_LIMITS.maxStepsMax * (1 + PIPELINE_LIMITS.capExtensionsMax));
+    const absurd = makeRun({
+      snapshot: { graph: makeGraph(), maxSteps: 1e9, profiles: {}, capturedAt: 0 },
+      capExtensions: 1e9,
+    });
+    expect(effectiveStepCap(absurd)).toBe(EFFECTIVE_STEP_CAP_MAX);
+    const inf = makeRun({
+      snapshot: { graph: makeGraph(), maxSteps: Number.POSITIVE_INFINITY, profiles: {}, capturedAt: 0 },
+      capExtensions: Number.NaN,
+    });
+    expect(Number.isFinite(effectiveStepCap(inf))).toBe(true);
+    expect(effectiveStepCap(inf)).toBe(PIPELINE_LIMITS.maxStepsDefault); // non-finite maxSteps → default, NaN ext → 0
+    const negative = makeRun({
+      snapshot: { graph: makeGraph(), maxSteps: -3, profiles: {}, capturedAt: 0 },
+      capExtensions: -2,
+    });
+    expect(effectiveStepCap(negative)).toBe(1);
+    const fractional = makeRun({
+      snapshot: { graph: makeGraph(), maxSteps: 10.9, profiles: {}, capturedAt: 0 },
+      capExtensions: 1.9,
+    });
+    expect(effectiveStepCap(fractional)).toBe(20);
   });
 });
 
@@ -1380,9 +1788,11 @@ describe("composeStepPrompt", () => {
       inlineHandoff: true,
       parallelSiblings: [],
     });
-    expect(prompt).toContain("Choose exactly one next step by name:");
+    expect(prompt).toContain("Choose exactly one next step:");
     expect(prompt).toContain("Happy (happy path)");
     expect(prompt).toContain("Sad");
+    // M-S6: the model may answer with the step name OR the edge label.
+    expect(prompt).toContain("put its name, or the edge label shown in parentheses after it, in \"next\"");
   });
 
   test("mentions the handoff tag and the closing-tag warning", () => {
@@ -2033,7 +2443,9 @@ describe("composeHandoffReminder", () => {
       outgoing: outgoingMany,
       transition: "choose",
     });
-    const nextRule = "Choose exactly one next step by name: Fix (needs work), Ship — and put that name in \"next\".";
+    const nextRule =
+      "Choose exactly one next step: Fix (needs work), Ship — put its name, or the edge label shown in " +
+      "parentheses after it, in \"next\".";
     expect(prompt).toContain(nextRule);
     expect(reminder).toContain(nextRule);
   });

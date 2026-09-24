@@ -52,6 +52,33 @@ test("single-select: down then Enter submits the highlighted option", async () =
   expect(done).toBe("✓ answered");
 });
 
+// Cross-agent contract (b): a pipeline parent's pending list aggregates its
+// hidden step tasks' cards — the overlay names the step task the card
+// belongs to when it isn't the task `g` was pressed on.
+test("a card whose taskId differs from the overlay's taskId (a pipeline step's card) names that step task", async () => {
+  const req = {
+    kind: "ask_questions", id: "q1", taskId: "step-task-1abcdef", runId: "r1", createdAt: 0,
+    questions: [{ question: "Pick", options: [{ label: "A" }] }],
+  } as unknown as AnyRequest;
+  const { lastFrame } = render(
+    <AnswerOverlay client={fakeClient(req, () => {})} taskId="parent-1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  expect(lastFrame()).toContain("↳ on step task step-tas");
+});
+
+test("a card on the overlay's own task carries no step-task note", async () => {
+  const req = {
+    kind: "ask_questions", id: "q1", taskId: "t1", runId: "r1", createdAt: 0,
+    questions: [{ question: "Pick", options: [{ label: "A" }] }],
+  } as unknown as AnyRequest;
+  const { lastFrame } = render(
+    <AnswerOverlay client={fakeClient(req, () => {})} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  expect(lastFrame()).not.toContain("on step task");
+});
+
 test("multi-select: space toggles, Enter submits the set in pick order", async () => {
   let captured: unknown = null;
   const req = {

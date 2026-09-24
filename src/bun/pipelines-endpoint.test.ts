@@ -990,3 +990,326 @@ test("GET /tasks/:id aggregates pipeline step pending-interaction counts onto th
 
   await waitForPipelineSettled(parent.id);
 }, 20_000);
+
+// ---------------------------------------------------------------------------
+// Review-fix wave: H4 / M-S3 / M-S4 / M-R5 / L-S1 / L-S6 / L-S10 pins.
+// ---------------------------------------------------------------------------
+
+test("GET /tasks/:id/interactions/pending on a pipeline PARENT unions its step tasks' pending requests, and each request carries pipelineParentId (H4)", async () => {
+  const { registerTmuxPrompt, listPendingForTask } = await import("./interactions.ts");
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const parent = await createTask({ pipelineId: pipeline.id, workdir: WORKDIR, isolation: "none" });
+
+  const startRes = await call(`/tasks/${parent.id}/start`, { method: "POST" });
+  expect(startRes.status).toBe(200);
+  const { steps } = await waitForSteps(parent.id);
+  const step = steps[0]!;
+  await waitForPipelineSettled(parent.id);
+
+  const { req } = registerTmuxPrompt({
+    taskId: step.id,
+    runId: "fake-run-h4",
+    paneText: "pane",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: `fp-h4-${step.id}`,
+  });
+  // The registry stamps the step's parent onto the request itself, so the
+  // orchestrator's GlobalEvent bridge (and every SSE consumer) can scope it
+  // to the board card without a second lookup.
+  expect(req.pipelineParentId).toBe(parent.id);
+  // A plain task registers with no such key at all (shape unchanged).
+  const plain = await createTask();
+  const { req: plainReq } = registerTmuxPrompt({
+    taskId: plain.id,
+    runId: "fake-run-h4-plain",
+    paneText: "pane",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: `fp-h4-plain`,
+  });
+  expect("pipelineParentId" in plainReq).toBe(false);
+
+  // The parent's own registry list is empty (nothing registers against a
+  // parent id) — but the ROUTE answers with the step's card, since the
+  // parent is the id the board showed as "waiting on you".
+  expect(listPendingForTask(parent.id)).toHaveLength(0);
+  const viaParent = (await (await call(`/tasks/${parent.id}/interactions/pending`)).json()) as Array<{
+    id: string;
+    taskId: string;
+    pipelineParentId?: string;
+  }>;
+  expect(viaParent).toHaveLength(1);
+  expect(viaParent[0]!.id).toBe(req.id);
+  expect(viaParent[0]!.taskId).toBe(step.id);
+  expect(viaParent[0]!.pipelineParentId).toBe(parent.id);
+  // The step's own list still works unchanged.
+  const viaStep = (await (await call(`/tasks/${step.id}/interactions/pending`)).json()) as Array<{ id: string }>;
+  expect(viaStep.map((r) => r.id)).toEqual([req.id]);
+  // And a plain task's list is untouched by the union.
+  const viaPlain = (await (await call(`/tasks/${plain.id}/interactions/pending`)).json()) as Array<{ id: string }>;
+  expect(viaPlain.map((r) => r.id)).toEqual([plainReq.id]);
+}, 20_000);
+
+test("GET /tasks ships a trimmed pipelineRun (no handoffs, no profile snapshots); GET /tasks/:id and /tasks/:id/pipeline ship the full state (M-S3)", async () => {
+  const { tasks } = await import("./db.ts");
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const parent = await createTask({ pipelineId: pipeline.id });
+  const stepId = pipeline.graph.steps[0]!.id;
+
+  const handoff = {
+    schemaVersion: 1 as const,
+    purpose: "p",
+    summary: "big summary",
+    reason: "r",
+    next: null,
+    artifacts: ["a.ts"],
+    openQuestions: [],
+  };
+  // Shape-only fixture — `sanitizeRunSnapshot` keeps `profiles` as "a record
+  // of objects" without deep-validating against `AgentProfileSnapshot`.
+  const snapshotProfiles = { [profile.id]: { id: profile.id, name: profile.name } } as unknown as Record<
+    string,
+    import("../shared/types.ts").AgentProfileSnapshot
+  >;
+  // Seed a run state directly — what matters here is the wire shape, not
+  // how the runner got there.
+  tasks.setPipelineRun(parent.id, {
+    pipelineId: pipeline.id,
+    pipelineName: pipeline.name,
+    snapshot: {
+      graph: pipeline.graph,
+      maxSteps: 25,
+      profiles: snapshotProfiles,
+      capturedAt: 1,
+    },
+    status: "blocked",
+    active: [{ stepId, taskId: "step-task-1", seq: 1 }],
+    joins: { [stepId]: { arrivals: [{ fromStepId: stepId, seq: 1, handoff }] } },
+    blocked: [{ taskId: "step-task-1", stepId, kind: "handoff-invalid", message: "bad" }],
+    history: [
+      { seq: 1, stepId, taskId: "step-task-1", startedAt: 1, endedAt: 2, outcome: "succeeded", handoff, nextStepIds: [] },
+    ],
+    stepCount: 1,
+    startedAt: 1,
+    endedAt: null,
+  });
+
+  const list = (await (await call("/tasks")).json()) as Task[];
+  const listed = list.find((t) => t.id === parent.id)!;
+  expect(listed.pipelineRun).not.toBeNull();
+  const trimmed = listed.pipelineRun!;
+  // Trimmed: every persisted handoff nulled, profiles emptied…
+  expect(trimmed.history).toHaveLength(1);
+  expect(trimmed.history[0]!.handoff).toBeNull();
+  expect(trimmed.joins[stepId]!.arrivals[0]!.handoff).toBeNull();
+  expect(trimmed.snapshot!.profiles).toEqual({});
+  // …but everything the board/TUI/`agetor ls` read is intact.
+  expect(trimmed.snapshot!.graph).toEqual(pipeline.graph);
+  expect(trimmed.status).toBe("blocked");
+  expect(trimmed.active).toEqual([{ stepId, taskId: "step-task-1", seq: 1 }]);
+  expect(trimmed.blocked).toHaveLength(1);
+  expect(trimmed.history[0]!.outcome).toBe("succeeded");
+  expect(trimmed.stepCount).toBe(1);
+
+  const single = (await (await call(`/tasks/${parent.id}`)).json()) as Task;
+  expect(single.pipelineRun!.history[0]!.handoff).toEqual(handoff);
+  expect(single.pipelineRun!.joins[stepId]!.arrivals[0]!.handoff).toEqual(handoff);
+  expect(single.pipelineRun!.snapshot!.profiles).toEqual(snapshotProfiles);
+
+  const viaPipeline = (await (await call(`/tasks/${parent.id}/pipeline`)).json()) as { task: Task };
+  expect(viaPipeline.task.pipelineRun!.history[0]!.handoff).toEqual(handoff);
+  expect(viaPipeline.task.pipelineRun!.snapshot!.profiles).toEqual(snapshotProfiles);
+
+  // The server's own read is never trimmed either (the runner reads it).
+  expect(tasks.get(parent.id)!.pipelineRun!.history[0]!.handoff).toEqual(handoff);
+});
+
+test("PATCH /tasks/:id column on a pipeline PARENT → 409 when it differs; a same-value resend is a no-op 200 (M-S4)", async () => {
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const parent = await createTask({ pipelineId: pipeline.id });
+  expect(parent.column).toBe("backlog");
+
+  const moved = await call(`/tasks/${parent.id}`, { method: "PATCH", body: JSON.stringify({ column: "done" }) });
+  expect(moved.status).toBe(409);
+  expect((await moved.json()).error).toBe("pipeline task's column is managed by its run");
+  expect(((await (await call(`/tasks/${parent.id}`)).json()) as Task).column).toBe("backlog");
+
+  const same = await call(`/tasks/${parent.id}`, { method: "PATCH", body: JSON.stringify({ column: "backlog", title: "Renamed" }) });
+  expect(same.status).toBe(200);
+  expect(((await same.json()) as Task).title).toBe("Renamed");
+
+  // An ordinary task's column is still freely patchable.
+  const plain = await createTask();
+  const plainMoved = await call(`/tasks/${plain.id}`, { method: "PATCH", body: JSON.stringify({ column: "ready" }) });
+  expect(plainMoved.status).toBe(200);
+  expect(((await plainMoved.json()) as Task).column).toBe("ready");
+});
+
+test("POST /tasks/:id/start on a (non-orphaned) pipeline step task → 409 (M-R5)", async () => {
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const parent = await createTask({ pipelineId: pipeline.id, workdir: WORKDIR, isolation: "none" });
+
+  const startRes = await call(`/tasks/${parent.id}/start`, { method: "POST" });
+  expect(startRes.status).toBe(200);
+  const { steps } = await waitForSteps(parent.id);
+  const step = steps[0]!;
+  await waitForPipelineSettled(parent.id);
+
+  const before = (await (await call(`/tasks/${step.id}/runs`)).json()) as unknown[];
+  const res = await call(`/tasks/${step.id}/start`, { method: "POST" });
+  expect(res.status).toBe(409);
+  expect((await res.json()).error).toBe("step task is managed by its pipeline — retry the pipeline task instead");
+  // Nothing was spawned: the step's run history is unchanged.
+  const after = (await (await call(`/tasks/${step.id}/runs`)).json()) as unknown[];
+  expect(after.length).toBe(before.length);
+}, 20_000);
+
+test("POST/PATCH /pipelines reject a name with control characters (L-S1)", async () => {
+  for (const bad of ["Tab\tName", "New\nLine", "Bell\u0007", "Del\u007f"]) {
+    const res = await call("/pipelines", {
+      method: "POST",
+      body: JSON.stringify({ name: bad, graph: oneStepGraph() }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("pipeline name must not contain control characters");
+  }
+  const created = await createPipeline(null, { name: "Fine" });
+  const patched = await call(`/pipelines/${created.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name: "Not\u0000Fine" }),
+  });
+  expect(patched.status).toBe(400);
+  expect((await patched.json()).error).toBe("pipeline name must not contain control characters");
+  expect(((await (await call(`/pipelines/${created.id}`)).json()) as Pipeline).name).toBe("Fine");
+  // A graph step name with a control char is rejected by the same rule.
+  const badStep = await call("/pipelines", {
+    method: "POST",
+    body: JSON.stringify({ name: "Graph", graph: oneStepGraph(null, { name: "Step\u0001" }) }),
+  });
+  expect(badStep.status).toBe(400);
+  expect((await badStep.json()).error).toContain("control characters");
+});
+
+test("POST/PATCH /pipelines with a non-string description → 400 'description must be a string' (L-S6)", async () => {
+  const post = await call("/pipelines", {
+    method: "POST",
+    body: JSON.stringify({ name: "Desc", description: ["not", "a", "string"], graph: oneStepGraph() }),
+  });
+  expect(post.status).toBe(400);
+  expect((await post.json()).error).toBe("description must be a string");
+
+  const created = await createPipeline(null, { name: "Desc", description: "keep me" });
+  const patched = await call(`/pipelines/${created.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ description: 42 }),
+  });
+  expect(patched.status).toBe(400);
+  expect((await patched.json()).error).toBe("description must be a string");
+  // A rejected PATCH never wiped the real description (the old code read a
+  // non-string as "" and stored it).
+  expect(((await (await call(`/pipelines/${created.id}`)).json()) as Pipeline).description).toBe("keep me");
+  // `description: null` is treated like a non-string too — explicit, not silently "".
+  const nulled = await call(`/pipelines/${created.id}`, { method: "PATCH", body: JSON.stringify({ description: null }) });
+  expect(nulled.status).toBe(400);
+});
+
+test("POST /pipelines maxSteps 0 / maxStepsMax+1 / 1.5 → 400, boundary values 1 and maxStepsMax → 201 (L-S10)", async () => {
+  for (const bad of [0, PIPELINE_LIMITS.maxStepsMax + 1, 1.5, -1, "10"]) {
+    const res = await call("/pipelines", {
+      method: "POST",
+      body: JSON.stringify({ name: `Max ${String(bad)}`, graph: oneStepGraph(), maxSteps: bad }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe(`maxSteps must be an integer between 1 and ${PIPELINE_LIMITS.maxStepsMax}`);
+  }
+  const min = await createPipeline(null, { name: "Min", maxSteps: 1 });
+  expect(min.maxSteps).toBe(1);
+  const max = await createPipeline(null, { name: "Max", maxSteps: PIPELINE_LIMITS.maxStepsMax });
+  expect(max.maxSteps).toBe(PIPELINE_LIMITS.maxStepsMax);
+});
+
+test("every /pipelines* and /tasks/:id/pipeline* route is 401 without a bearer token (L-S10)", async () => {
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const task = await createTask({ pipelineId: pipeline.id });
+  const routes: Array<[string, string]> = [
+    ["GET", "/pipelines"],
+    ["POST", "/pipelines"],
+    ["GET", `/pipelines/${pipeline.id}`],
+    ["PATCH", `/pipelines/${pipeline.id}`],
+    ["DELETE", `/pipelines/${pipeline.id}`],
+    ["GET", `/tasks/${task.id}/pipeline`],
+    ["POST", `/tasks/${task.id}/pipeline/advance`],
+    ["POST", `/tasks/${task.id}/pipeline/retry`],
+    ["POST", `/tasks/${task.id}/pipeline/cancel`],
+    ["POST", `/tasks/${task.id}/pipeline/restart`],
+  ];
+  for (const [method, path] of routes) {
+    const res = await fetch(`${BASE}${path}`, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: method === "GET" || method === "DELETE" ? undefined : JSON.stringify({ nextStepIds: null }),
+    });
+    expect([method, path, res.status]).toEqual([method, path, 401]);
+  }
+  // Nothing was mutated by the unauthenticated calls.
+  expect((await (await call(`/pipelines/${pipeline.id}`)).json()).id).toBe(pipeline.id);
+});
+
+test("POST /tasks/:id/pipeline/advance: an unknown nextStepIds entry → 400, an empty array is accepted by the route, fromTaskId '' → 400 (L-S10)", async () => {
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const profile = await createProfile();
+  const graph = oneStepGraph(profile.id, { instructions: `Do it. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing` });
+  const pipeline = await createPipeline(profile.id, { graph });
+  const task = await createTask({ pipelineId: pipeline.id, workdir: WORKDIR, isolation: "none" });
+
+  // `fromTaskId: ""` is rejected at the route, before the runner could
+  // silently treat it as "auto-detect" — even on a never-started run.
+  const blank = await call(`/tasks/${task.id}/pipeline/advance`, {
+    method: "POST",
+    body: JSON.stringify({ nextStepIds: null, fromTaskId: "" }),
+  });
+  expect(blank.status).toBe(400);
+  expect((await blank.json()).error).toBe("fromTaskId must be a non-empty string");
+
+  // An empty array passes body validation (it's "advance to nothing", same
+  // as null) — on a never-started run it reaches the runner's 409, not a 400.
+  const emptyIdle = await call(`/tasks/${task.id}/pipeline/advance`, {
+    method: "POST",
+    body: JSON.stringify({ nextStepIds: [] }),
+  });
+  expect(emptyIdle.status).toBe(409);
+
+  // Now block the run on a missing handoff so the sole active execution is
+  // auto-detected as the advance target.
+  const startRes = await call(`/tasks/${task.id}/start`, { method: "POST" });
+  expect(startRes.status).toBe(200);
+  await waitForPipelineSettled(task.id);
+  const settled = (await (await call(`/tasks/${task.id}/pipeline`)).json()) as { task: Task };
+  expect(settled.task.pipelineRun?.status).toBe("blocked");
+
+  const unknown = await call(`/tasks/${task.id}/pipeline/advance`, {
+    method: "POST",
+    body: JSON.stringify({ nextStepIds: ["does-not-exist"] }),
+  });
+  expect(unknown.status).toBe(400);
+  expect((await unknown.json()).error).toBe('unknown step id "does-not-exist"');
+  // Still blocked — a rejected advance mutates nothing.
+  const still = (await (await call(`/tasks/${task.id}/pipeline`)).json()) as { task: Task };
+  expect(still.task.pipelineRun?.status).toBe("blocked");
+
+  // An empty array on the blocked run ends the path exactly like null does.
+  const emptyBlocked = await call(`/tasks/${task.id}/pipeline/advance`, {
+    method: "POST",
+    body: JSON.stringify({ nextStepIds: [] }),
+  });
+  expect(emptyBlocked.status).toBe(200);
+  const ended = (await emptyBlocked.json()) as Task;
+  expect(ended.pipelineRun?.status).toBe("done");
+  expect(ended.pipelineRun?.history.at(-1)?.outcome).toBe("advanced-manually");
+  expect(ended.pipelineRun?.history.at(-1)?.nextStepIds).toEqual([]);
+  await waitForPipelineSettled(task.id);
+}, 20_000);

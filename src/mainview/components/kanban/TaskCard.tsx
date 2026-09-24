@@ -75,6 +75,12 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   // (M15, docs/plans/pipelines.md review). Mirrored in `buildTaskContextMenu`.
   const hasOpenablePipelineRun = !!task.pipelineRun && task.pipelineRun.history.length > 0;
   const openable = task.hasOpenableRun || hasOpenablePipelineRun;
+  // Stop is only honoured server-side for a pipeline PARENT while its run
+  // is genuinely `running` (`POST /tasks/:id/pipeline/cancel` 409s
+  // otherwise — e.g. a `blocked` run with nothing live), so the card's Stop
+  // gates on `pipelineRun.status`, not the column (L-A1). Mirrored in
+  // `buildTaskContextMenu`. Every other task keeps the column-based rule.
+  const stoppable = task.pipelineId ? task.pipelineRun?.status === "running" : active;
   // Combine structured interactions with codex's narrative `blocked` signal.
   // The latter has no answerable payload — the user resolves it from the run
   // panel — but it represents the same "waiting on you" state to the user.
@@ -298,7 +304,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               {awaitingLabel}
               <ArrowRight className="size-3" />
             </Button>
-          ) : active ? (
+          ) : stoppable ? (
             <Button size="sm" variant="destructive" onClick={() => onCancel(task)}>
               <Square className="size-3" /> Stop
             </Button>
@@ -311,7 +317,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               <Play className="size-3" /> Run
             </Button>
           )}
-          {!archived && awaiting && active && (
+          {!archived && awaiting && stoppable && (
             <Button size="icon" variant="ghost" onClick={() => onCancel(task)} title="Stop">
               <Square className="size-3" />
             </Button>

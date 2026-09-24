@@ -323,6 +323,42 @@ test("cmdAdd: --issue --workdir --start --json also starts the created task", as
   expect(printed.task.id).toBe("started-task-id");
 });
 
+// L-CLI9: a `--start` whose start call fails (a pipeline step profile gone,
+// a logged-out harness, …) must not be swallowed into a bare `started: false`.
+test("cmdAdd --start: a failed start prints '! start failed: <reason>' in plain mode and still reports the created task", async () => {
+  reset();
+  const thread = makeThread();
+  const { client } = makeClient(thread);
+  (client as unknown as { startTask: (id: string) => Promise<never> }).startTask = async () => {
+    throw new Error("pipeline graph is invalid: step \"Fix\" has no agent profile");
+  };
+  currentClient = client;
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", "/tmp/acme-widgets", "--start"], flags());
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("✓ created");
+  expect(rendered).not.toContain("▸ started");
+  expect(rendered).toContain('! start failed: pipeline graph is invalid: step "Fix" has no agent profile');
+  expect(rendered).toContain("start it: agetor start");
+});
+
+test("cmdAdd --start --json: a failed start folds 'start failed: <reason>' into warnings with started: false", async () => {
+  reset();
+  const thread = makeThread();
+  const { client } = makeClient(thread);
+  (client as unknown as { startTask: (id: string) => Promise<never> }).startTask = async () => {
+    throw new Error("fx isn't logged in — run fx login");
+  };
+  currentClient = client;
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", "/tmp/acme-widgets", "--start"], flags({ json: true }));
+
+  const printed = jsonOutputs[0] as { started: boolean; warnings?: string[] };
+  expect(printed.started).toBe(false);
+  expect(printed.warnings).toContain("start failed: fx isn't logged in — run fx login");
+});
+
 test("cmdAdd: --issue plus explicit --title/--prompt keeps them, but still attaches issueUrl/issueSnapshot", async () => {
   reset();
   const thread = makeThread();

@@ -30,11 +30,19 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
 
   // A pipeline (parent) task never runs an agent of its own — only its
   // hidden step tasks do, one at a time — so `/tasks/:id/events` yields
-  // nothing for it and `agetor logs <parent>` used to print silence. Print a
-  // one-line hint pointing at the step tasks instead; the follow/--rebuild/
-  // --notify machinery below is left running unchanged (the parent's own
-  // status/column transitions still show up there, e.g. via `--notify`).
-  if (!flags.json && task.pipelineId) out(await pipelineLogsHint(client, task));
+  // nothing for it and `agetor logs <parent>` used to follow a stream that
+  // stays silent forever. Print the hint pointing at the step tasks (to
+  // stderr under --json, so stdout stays machine-readable) and RETURN —
+  // unless `--notify` was asked for, the one thing that still does
+  // something useful on a parent: the parent's own column transitions
+  // (blocked / done via the `pipeline` reason) ride the global event
+  // stream the --notify branch below subscribes to (L-CLI6).
+  if (task.pipelineId) {
+    const hint = await pipelineLogsHint(client, task);
+    if (flags.json) errln(hint);
+    else out(hint);
+    if (!notify || noFollow) return;
+  }
 
   const hidden = task.pipelineParentId != null;
 

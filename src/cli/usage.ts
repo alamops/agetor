@@ -201,7 +201,7 @@ export const USAGE: Record<string, string> = {
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced).`,
 
-  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file>] | import <file> [--name <n>] | retry <task> | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>
+  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>
 
   Manage pipelines — named graphs of agent-profile-bound steps launched as
   one board task (built in the app's Pipelines editor; the CLI moves them
@@ -210,30 +210,44 @@ export const USAGE: Record<string, string> = {
                                         unique case-insensitive name)
     retry / advance / restart / status take a pipeline TASK <ref> (id or
                                         short-id prefix, like every other
-                                        task-targeting command)
+                                        task-targeting command; a hidden
+                                        step task's id is refused — target
+                                        its pipeline task instead)
   Launch a pipeline with 'agetor add --pipeline <id|name>'.`,
 
-  "pipeline export": `usage: agetor pipeline export <ref> [--out <file>]
+  "pipeline export": `usage: agetor pipeline export <ref> [--out <file|->] [--force]
 
-  Print (or write to --out) the pipeline as PipelineInput JSON
-  (name/description/graph/maxSteps) — re-importable with 'pipeline import'.`,
+  Print (or write to --out; '-' is stdout) the pipeline as PipelineInput
+  JSON (name/description/graph/maxSteps) — re-importable with 'pipeline
+  import'. Refuses to overwrite an existing --out file unless --force.
+  Each step also carries a 'profileName' hint (and 'subagents.profileNames')
+  next to its agent-profile id so an import on another machine can remap
+  the profile by name.`,
 
   "pipeline import": `usage: agetor pipeline import <file|-> [--name <name>]
 
   Create a pipeline from an exported JSON file ('-' reads stdin). --name
-  overrides the file's own name.`,
+  overrides the file's own name. A step agent-profile id (or subagent
+  profile id) that doesn't exist on this machine is remapped to the unique
+  local profile named by the file's 'profileName' hint when there is one
+  (printed), else warned about (--json: folded into 'warnings') — assign a
+  profile in the editor before running such a pipeline.`,
 
-  "pipeline retry": `usage: agetor pipeline retry <task-id>
+  "pipeline retry": `usage: agetor pipeline retry <task-id> [--from <step-task-id-or-prefix>]
 
   Retry the pipeline run's currently blocked (or cancelled) step
-  execution(s). 409 unless the run is actually blocked or cancelled.`,
+  execution(s). 409 unless the run is actually blocked or cancelled. --from
+  narrows the retry to one specific active execution (its step task's id or
+  a unique prefix of it — 'agetor pipeline status' lists them); omitted,
+  every eligible execution plus every pending run-level block is retried.`,
 
   "pipeline advance": `usage: agetor pipeline advance <task-id> [--next <step-name-or-id> …] [--finish] [--from <step-task-id>]
 
   Manually resolve what a pipeline run is currently waiting on. --next
-  (repeatable) names the step(s) to run next — matched by name, then id,
-  against the run's snapshot graph; --finish ends the run here with no next
-  step. Exactly one of --next / --finish is required. --from targets a
+  (repeatable) names the step(s) to run next — matched against the run's
+  snapshot graph by step name, then step id, then an edge label (the same
+  precedence a step's own handoff 'next' gets); --finish ends the run here
+  with no next step. Exactly one of --next / --finish is required. --from targets a
   specific blocked/awaiting execution when more than one is in play (e.g. a
   fan-out); omitted, the sole such execution is used.`,
 

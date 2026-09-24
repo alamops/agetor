@@ -3,6 +3,20 @@ import type { GlobalEvent } from "../shared/types.ts";
 const BELL = String.fromCharCode(7);
 
 /**
+ * The orchestrator stamps an additive `pipelineParentId` onto the task-
+ * scoped `GlobalEvent` members (`run-status`, `column`, `interaction`,
+ * `files-sent`, `fx-auto-resume`) whenever the event's task is a hidden
+ * pipeline step, so a consumer can tell a step's event apart WITHOUT having
+ * polled that step's row first (a step that settles before the first poll
+ * would otherwise slip through a `hiddenTaskIds` lookup). Read defensively —
+ * an older core (or a member that never carries it) yields `null`.
+ */
+export function eventPipelineParentId(e: GlobalEvent): string | null {
+  const v = (e as { pipelineParentId?: unknown }).pipelineParentId;
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+/**
  * Map a global event to a desktop notification — only for the given task, and
  * only for state changes worth interrupting the user (terminal status + the
  * "needs you" block). Returns null otherwise.
@@ -20,6 +34,9 @@ export function notifyFor(
   opts?: { hidden?: boolean },
 ): { title: string; body: string } | null {
   if (opts?.hidden) return null;
+  // The event itself says it belongs to a hidden step task — same
+  // suppression, no caller lookup needed (see `eventPipelineParentId`).
+  if (eventPipelineParentId(e) !== null) return null;
   const short = taskId.slice(0, 8);
   if (e.kind === "run-status" && e.taskId === taskId) {
     if (e.status === "succeeded") return { title: "Agetor — succeeded", body: short };

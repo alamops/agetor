@@ -517,6 +517,9 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   const pipelineStartStepProfile = pipelineStartStep?.agentProfileId
     ? (profiles.find((p) => p.id === pipelineStartStep.agentProfileId) ?? null)
     : null;
+  const pipelineStartStepHarness = pipelineStartStepProfile
+    ? (harnesses.find((h) => h.id === pipelineStartStepProfile.harness) ?? null)
+    : null;
   const selectedProfileHarness = selectedProfile
     ? (harnesses.find((h) => h.id === selectedProfile.harness) ?? null)
     : null;
@@ -551,14 +554,26 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // oversized prompt — surfaced here (and blocking submit) rather than
   // letting it fail at spawn time. Mirrors CreateTaskFromIssueDialog's guard.
   // Includes the agent-instructions preamble (`composeLaunchPrompt`) so this
-  // pre-check sees the same bytes `startTask` will actually send. Skipped
-  // for a pipeline task — `effectiveKind` reflects the hidden manual
-  // harness picker, not any one step's harness (each step can run a
-  // different kind), and pipeline steps aren't gemini-argv one-shot
-  // launches the way a plain task's first turn is.
-  const promptOverage = selectedPipeline
+  // pre-check sees the same bytes `startTask` will actually send. For a
+  // pipeline task the manual `effectiveKind` is meaningless (each step runs
+  // its own profile's harness), so the check keys on the START step's bound
+  // profile instead (L-A8): a gemini-bound start step is still a one-shot
+  // `-p <prompt>` argv launch, and the raw prompt is a strict LOWER bound on
+  // what it will receive — `composeStepPrompt` wraps it with the handoff
+  // contract and delegation guidance — so a raw prompt already over the cap
+  // is guaranteed to fail at launch. No resolvable start-step profile yet →
+  // nothing to check.
+  const overageKind: AgentKind | null = selectedPipeline
+    ? (pipelineStartStepHarness?.kind ?? null)
+    : effectiveKind;
+  const overageLabel = selectedPipeline
+    ? (pipelineStartStepHarness?.label ?? pipelineStartStepProfile?.harness ?? "the start step's harness")
+    : effectiveHarnessLabel;
+  const promptOverage = overageKind === null
     ? null
-    : promptByteOverage(effectiveKind, composeLaunchPrompt(selectedProfile, prompt));
+    : selectedPipeline
+      ? promptByteOverage(overageKind, prompt)
+      : promptByteOverage(overageKind, composeLaunchPrompt(selectedProfile, prompt));
 
   const canSubmit =
     title.trim() && prompt.trim() && workdir.trim() && wt.valid
@@ -758,7 +773,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                 startingFolder={workdir || undefined}
                 footer={promptOverage && (
                   <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
-                    This prompt is {Math.ceil(promptOverage.bytes / 1024)} KB — {effectiveHarnessLabel}'s
+                    This prompt is {Math.ceil(promptOverage.bytes / 1024)} KB — {overageLabel}'s
                     one-shot launch caps prompts at {Math.floor(promptOverage.limit / 1024)} KB. Pick
                     another harness or trim the prompt.
                   </div>

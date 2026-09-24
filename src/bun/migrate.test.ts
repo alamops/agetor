@@ -553,5 +553,36 @@ test("056 (cursor Opus 5.5) sits right after 055, followed by the renumbered pip
   expect(migrations[at + 1]?.aliases).toEqual(["056_pipelines"]);
   expect(migrations[at + 2]?.id).toBe("058_task_pipeline");
   expect(migrations[at + 2]?.aliases).toEqual(["057_task_pipeline"]);
-  expect(at + 2).toBe(migrations.length - 1);
+  // 059 (L-S8): the partial `tasks(pipeline_id)` index the pipeline-parent
+  // lookups were missing — appended after the renumbered pair, and the
+  // last migration as of this writing.
+  expect(migrations[at + 3]?.id).toBe("059_task_pipeline_id_index");
+  expect(migrations[at + 3]?.aliases).toBeUndefined();
+  expect(migrations[at + 3]?.sql).toContain("CREATE INDEX IF NOT EXISTS idx_tasks_pipeline_id ON tasks(pipeline_id) WHERE pipeline_id IS NOT NULL");
+  expect(at + 3).toBe(migrations.length - 1);
+});
+
+test("059 creates the partial tasks(pipeline_id) index, is idempotent, and only indexes non-NULL pipeline_id rows", () => {
+  const db = new Database(":memory:");
+  migrate(db, migrations);
+  const idx = db
+    .query<{ name: string; sql: string }, []>(
+      `SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_tasks_pipeline_id'`,
+    )
+    .get();
+  expect(idx?.sql).toContain("WHERE pipeline_id IS NOT NULL");
+  // Re-running the migration set is a no-op (recorded in `_migrations`), and
+  // the statement itself is `IF NOT EXISTS`, so applying it a second time
+  // by hand doesn't throw either.
+  migrate(db, migrations);
+  db.exec(migrations.find((m) => m.id === "059_task_pipeline_id_index")!.sql);
+  // The query planner actually uses the partial index for the parent lookup
+  // `pipelines.taskCounts()` runs.
+  const plan = db
+    .query<{ detail: string }, []>(
+      `EXPLAIN QUERY PLAN SELECT pipeline_id, COUNT(*) FROM tasks WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id`,
+    )
+    .all();
+  expect(plan.some((row) => row.detail.includes("idx_tasks_pipeline_id"))).toBe(true);
+  db.close();
 });

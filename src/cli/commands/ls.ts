@@ -97,13 +97,20 @@ export async function cmdLs(
   const rows = tasks.map((t) => [
     glyph(t),
     c.dim(t.id.slice(0, 8)),
-    truncate(t.title, 44),
+    titleCell(t),
     agentCell(t),
     profileCell(t),
     colorColumn(t.column),
     needsCell(t),
   ]);
   out(table(["", "id", "title", "agent", "profile", "column", "needs"], rows));
+}
+
+/** Title column: a hidden pipeline step task (only ever listed under
+ *  `--steps`) is prefixed `↳ ` so it reads as belonging to the parent row
+ *  above it, mirroring the TUI's expanded step rows (L-CLI11). */
+function titleCell(t: Task): string {
+  return t.pipelineParentId ? `↳ ${truncate(t.title, 42)}` : truncate(t.title, 44);
 }
 
 /** Agent column: the raw harness id — always, regardless of whether the task
@@ -156,11 +163,17 @@ function needsCell(t: Task): string {
   if (t.pipelineId && t.pipelineRun?.status === "blocked") {
     parts.push(c.yellow(`pipeline blocked · ${pipelineStepProgress(t.pipelineRun).label}`));
   }
+  // A step task (listed only under `--steps`) names its parent here so the
+  // row is actionable — `agetor pipeline status <parent>` / `agetor show`.
+  if (t.pipelineParentId) parts.push(c.dim(`step of ${t.pipelineParentId.slice(0, 8)}`));
   return parts.join(" ");
 }
 
 function glyph(t: Task): string {
-  const g = COLUMN_GLYPH[t.column] ?? "·";
+  // A pipeline (parent) row gets the TUI's `»` marker (`Dashboard.tsx`'s
+  // `pipelineText`) instead of the column glyph, colored by column — the
+  // column cell still names the column, so nothing is lost (L-CLI11).
+  const g = t.pipelineId ? "»" : (COLUMN_GLYPH[t.column] ?? "·");
   if (t.column === "running") return c.cyan(g);
   if (t.column === "blocked") return c.yellow(g);
   if (t.column === "review" || t.column === "done") return c.green(g);

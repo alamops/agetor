@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -45,25 +45,99 @@ export interface AgentProfileFormProps {
  * skills. Extracted out of `AgentProfilesSection` (Settings → Agents) so a
  * second consumer (a pipeline step's inline "create an agent" affordance,
  * via `AgentProfileFormDialog` below) can reuse it verbatim rather than
- * duplicating the save/validation logic. Owns its own `useTaskLaunch` +
- * save/error state — every test id, label, placeholder and disabled rule
- * from the original inline form is preserved unchanged.
+ * duplicating the save/validation logic. Every test id, label, placeholder
+ * and disabled rule from the original inline form is preserved unchanged.
+ *
+ * This outer component only RESOLVES the profile being edited from the
+ * shared cache; the actual form (`AgentProfileFormBody`) is mounted only
+ * once that profile is known — keyed on its id — so its `useTaskLaunch`
+ * pickers and name/instructions/skills buffer are always seeded from the
+ * real row on their very first render (L-A9). Before this split the body
+ * mounted immediately with defaults and seeded from a `useEffect` once the
+ * list landed; a slow first `useAgentProfiles()` fetch left an edit form
+ * that could be Saved — overwriting the real profile with the defaults —
+ * before it had ever seeded. Now a not-yet-loaded edit target renders a
+ * "Loading…" line (no Save button at all) and a genuinely-missing one an
+ * error with only Cancel.
  */
 export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus }: AgentProfileFormProps) {
-  const { profiles, refresh } = useAgentProfiles();
-  const [form, setForm] = useState<FormState>(EMPTY_FORM);
+  const { profiles, loaded, refresh } = useAgentProfiles();
+
+  if (profileId === null) {
+    return (
+      <AgentProfileFormBody
+        key="new"
+        profileId={null}
+        editingProfile={null}
+        onSaved={onSaved}
+        onCancel={onCancel}
+        autoFocus={autoFocus}
+        refreshProfiles={refresh}
+      />
+    );
+  }
+
+  const editingProfile = profiles.find((p) => p.id === profileId) ?? null;
+  if (editingProfile) {
+    return (
+      <AgentProfileFormBody
+        key={editingProfile.id}
+        profileId={editingProfile.id}
+        editingProfile={editingProfile}
+        onSaved={onSaved}
+        onCancel={onCancel}
+        autoFocus={autoFocus}
+        refreshProfiles={refresh}
+      />
+    );
+  }
+
+  return (
+    <div data-testid="agent-profile-form" className="space-y-3 rounded-md border border-border/60 p-3">
+      {loaded ? (
+        <div
+          data-testid="agent-profile-form-error"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive-foreground"
+        >
+          This agent no longer exists — it may have been deleted elsewhere.
+        </div>
+      ) : (
+        <div data-testid="agent-profile-form-loading" className="text-xs text-muted-foreground">
+          Loading…
+        </div>
+      )}
+      <div className="flex justify-end gap-2">
+        <Button variant="outline" size="sm" data-testid="agent-profile-cancel" onClick={onCancel}>
+          Cancel
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+interface AgentProfileFormBodyProps extends AgentProfileFormProps {
+  /** The already-resolved row for an edit form — never `null` when
+   *  `profileId` isn't. The outer `AgentProfileForm` guarantees this by
+   *  only mounting the body once the profile is known (and keys it on the
+   *  id), so every `useState` initializer below can seed straight from it. */
+  editingProfile: AgentProfile | null;
+  refreshProfiles: () => Promise<void>;
+}
+
+function AgentProfileFormBody({ profileId, editingProfile, onSaved, onCancel, autoFocus, refreshProfiles }: AgentProfileFormBodyProps) {
+  const [form, setForm] = useState<FormState>(() =>
+    editingProfile
+      ? { name: editingProfile.name, instructions: editingProfile.instructions, skills: editingProfile.skills }
+      : EMPTY_FORM,
+  );
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  // The profile being edited, resolved from the already-loaded `profiles`
-  // list — `null` for a create form or before the list has loaded for an
-  // edit form. Passed straight into `useTaskLaunch` as `opts.initial` so the
-  // hook's own open-effect seeds from it directly in the same render where
-  // `profileId` is known, instead of via a second effect that could race the
-  // hook's async harness fetch — see `useTaskLaunch`'s `initial` doc comment
-  // for the full race this avoids.
-  const editingProfile = profileId !== null ? (profiles.find((p) => p.id === profileId) ?? null) : null;
-
+  // `editingProfile` is fixed for this body's lifetime (the parent keys the
+  // body on its id), so `opts.initial` is stable and `useTaskLaunch`'s own
+  // open-effect seeds the pickers from it in the same render where the
+  // profile is known — never via a later effect that could race the hook's
+  // async harness fetch (see `useTaskLaunch`'s `initial` doc comment).
   const launch = useTaskLaunch(true, {
     withProfiles: false,
     initial: editingProfile
@@ -77,21 +151,6 @@ export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus }: Ag
         }
       : undefined,
   });
-
-  // Seed the name/instructions/skills fields once the profile being edited
-  // resolves (or immediately, for a create form). Reruns only when the
-  // *target* profile identity changes — not on every `profiles` refresh —
-  // so mid-edit typing isn't clobbered by an unrelated background refetch.
-  useEffect(() => {
-    if (profileId === null) {
-      setForm(EMPTY_FORM);
-      return;
-    }
-    if (editingProfile) {
-      setForm({ name: editingProfile.name, instructions: editingProfile.instructions, skills: editingProfile.skills });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [profileId, editingProfile !== null]);
 
   const disabled = saving || !form.name.trim();
 
@@ -113,7 +172,7 @@ export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus }: Ag
         skills: form.skills,
       };
       const saved = profileId ? await api.updateAgentProfile(profileId, input) : await api.createAgentProfile(input);
-      await refresh();
+      await refreshProfiles();
       onSaved(saved);
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : String(e));

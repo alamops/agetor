@@ -131,24 +131,40 @@ test("pipelineLogsHint: degrades to the plain hint (never throws) if the pipelin
   expect(hint).not.toContain("steps:");
 });
 
-test("logs: a pipeline (parent) task prints the hint before its (empty) run history — --rebuild path", async () => {
+// L-CLI6: a parent's `/tasks/:id/events` stream is silent forever, so
+// `agetor logs <parent>` prints the hint and RETURNS instead of following
+// (or rebuilding) nothing — only `--notify` keeps a subscription open, since
+// the parent's own column transitions do ride the global event stream.
+
+test("logs: a pipeline (parent) task prints the hint and returns — no stream, no --rebuild fetch", async () => {
   outputs.length = 0;
+  onTaskEvents = null;
+  let rebuilt = false;
   currentClient = {
     listTasks: async () => [{ id: "parent-1", title: "T", pipelineId: "pipe-1" }],
-    getRuns: async () => [],
+    getRuns: async () => {
+      rebuilt = true;
+      return [];
+    },
     getPipelineRun: async () => ({
       task: { id: "parent-1" },
       steps: [{ id: "step-task-1", title: "Bug fix flow · Fix" }],
     }),
   } as unknown as AgetorClient;
   await cmdLogs(["parent-1", "--rebuild"], flags);
-  expect(outputs).toHaveLength(2);
+  expect(outputs).toHaveLength(1);
   expect(outputs[0]).toContain("pipeline task");
   expect(outputs[0]).toContain("Bug fix flow · Fix");
-  expect(outputs[1]).toContain("no runs to rebuild");
+  expect(rebuilt).toBe(false);
+
+  outputs.length = 0;
+  await cmdLogs(["parent-1"], flags); // would hang forever if it followed the (silent) stream
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]).toContain("pipeline task");
+  expect(onTaskEvents).toBeNull();
 });
 
-test("logs --json: a pipeline (parent) task prints no hint (json output is unaffected)", async () => {
+test("logs --json: a pipeline (parent) task prints the hint to stderr only (stdout stays machine-readable) and returns", async () => {
   outputs.length = 0;
   currentClient = {
     listTasks: async () => [{ id: "parent-1", title: "T", pipelineId: "pipe-1" }],
@@ -156,8 +172,26 @@ test("logs --json: a pipeline (parent) task prints no hint (json output is unaff
     getPipelineRun: async () => ({ task: { id: "parent-1" }, steps: [] }),
   } as unknown as AgetorClient;
   await cmdLogs(["parent-1", "--rebuild"], jsonFlags);
-  // --json still short-circuits on "no runs" the same as ever — no hint text.
-  expect(outputs.join("\n")).not.toContain("pipeline task");
+  // `errln` is mocked to a no-op, so nothing lands in `outputs` — stdout
+  // carries neither the hint nor a "no runs to rebuild" line.
+  expect(outputs).toHaveLength(0);
+});
+
+test("logs --notify: a pipeline (parent) task prints the hint AND keeps following (the parent's own transitions notify)", async () => {
+  outputs.length = 0;
+  onTaskEvents = null;
+  currentClient = {
+    listTasks: async () => [{ id: "parent-1", title: "T", pipelineId: "pipe-1" }],
+    getRuns: async () => [],
+    getPipelineRun: async () => ({ task: { id: "parent-1" }, steps: [] }),
+  } as unknown as AgetorClient;
+  // The streaming path resolves only via SIGINT / --no-follow's quiet timer;
+  // don't await it — just check the subscription was opened after the hint.
+  const p = cmdLogs(["parent-1", "--notify"], flags);
+  await new Promise((r) => setTimeout(r, 20));
+  expect(outputs[0]).toContain("pipeline task");
+  expect(onTaskEvents).not.toBeNull();
+  void p;
 });
 
 test("logs --rebuild: an fx_permission interaction gets the fx-specific line", async () => {

@@ -1,8 +1,8 @@
 /**
  * Barrel for the pipelines canvas/run-view component set (T5,
- * `docs/plans/pipelines.md`). Not yet wired into App/NewTaskForm/Settings —
- * that's T8/T9 (wave 3). Every export here compiles and renders standalone
- * given its documented props.
+ * `docs/plans/pipelines.md`). Consumed by `App.tsx` (the full-page
+ * `pipelines` / `pipeline-run` views), `NewTaskForm` (`PipelinePicker`),
+ * Settings → Pipelines (`PipelinesPage`) and `TaskCard` (`PipelineBadge`).
  */
 export { PipelineEditor } from "./PipelineEditor";
 export { PipelinesPage } from "./PipelinesPage";

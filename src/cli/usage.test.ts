@@ -69,7 +69,7 @@ test("pipeline: 'pipelines' aliases to 'pipeline', with export/import subcommand
   expect(canonical("pipelines")).toBe("pipeline");
   expect(USAGE["pipeline"]).toBeDefined();
   expect(USAGE["pipeline"]!.split("\n", 1)[0]).toBe(
-    "usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file>] | import <file> [--name <n>] | retry <task> | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>",
+    "usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>",
   );
   expect(helpFor("pipelines", "export")).toBe(USAGE["pipeline export"]);
   expect(helpFor("pipeline", "import")).toBe(USAGE["pipeline import"]);
@@ -92,8 +92,9 @@ test("pipeline: retry/advance/restart/status each have their own subcommand bloc
 });
 
 // m7 review fix: `agetor cancel` routes a pipeline task through the pipeline
-// cancel path instead of the generic "task is not running" error — see
-// lifecycle.test.ts / cmdCancel. Documented here too.
+// cancel path instead of the generic "task is not running" error — pinned
+// end to end in `src/cli/lifecycle.test.ts` (cmdCancel: parent →
+// cancelPipeline, step/plain task → cancelRun). Documented here too.
 test("cancel usage mentions pipeline-task routing", () => {
   expect(USAGE["cancel"]).toContain("pipeline task");
 });
@@ -101,6 +102,19 @@ test("cancel usage mentions pipeline-task routing", () => {
 // ls/add doc lines reference the new --steps / --pipeline flags — a plain
 // grep-style assertion so a future rewrite of either help block can't
 // silently drop the flag's mention.
+// L-CLI1/L-CLI2/L-CLI5: the retry block's usage line (what `usageError`
+// prints on a bad flag) must mention --from; advance's precedence wording
+// must match `resolveStepRef` (name → id → label); export documents
+// `--out -`/`--force`; import documents the profile remap/warn behaviour.
+test("pipeline subcommand blocks document --from, label matching, --out -/--force, and profile remapping", () => {
+  expect(USAGE["pipeline retry"]!.split("\n", 1)[0]).toContain("[--from <step-task-id-or-prefix>]");
+  expect(usageError("pipeline retry").message).toContain("--from");
+  expect(USAGE["pipeline advance"]).toContain("step name, then step id, then an edge label");
+  expect(USAGE["pipeline export"]).toContain("--force");
+  expect(USAGE["pipeline export"]).toContain("'-' is stdout");
+  expect(USAGE["pipeline import"]).toContain("profileName");
+});
+
 test("ls usage mentions --steps; add usage mentions --pipeline", () => {
   expect(USAGE["ls"]).toContain("--steps");
   expect(USAGE["add"]).toContain("--pipeline");

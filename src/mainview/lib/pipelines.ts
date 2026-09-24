@@ -195,19 +195,22 @@ export function edgeVisualState(run: PipelineRunState | null | undefined, edge: 
 
 /**
  * The most recent handoff transition recorded in `run.history` — the run
- * view animates a token along this edge, keyed by `seq` so a later
- * transition (even a repeat of the same edge on a cycle) replays the
- * animation. `null` before any transition has happened (empty history, or
- * every record so far was terminal/failed with no `nextStepIds`).
+ * view animates a token along EVERY edge it took (`fromStepId` → each of
+ * `toStepIds`, deduplicated: a `transition: "all"` fan-out launches several
+ * targets off one record, and each of those edges gets its own token),
+ * keyed by `seq` so a later transition (even a repeat of the same edge on a
+ * cycle) replays the animation. `null` before any transition has happened
+ * (empty history, or every record so far was terminal/failed with no
+ * `nextStepIds`).
  */
 export function latestTransition(
   run: PipelineRunState | null | undefined,
-): { fromStepId: string; toStepId: string; seq: number } | null {
+): { fromStepId: string; toStepIds: string[]; seq: number } | null {
   if (!run) return null;
   for (let i = run.history.length - 1; i >= 0; i -= 1) {
     const record = run.history[i]!;
     if (record.nextStepIds.length > 0) {
-      return { fromStepId: record.stepId, toStepId: record.nextStepIds[0]!, seq: record.seq };
+      return { fromStepId: record.stepId, toStepIds: [...new Set(record.nextStepIds)], seq: record.seq };
     }
   }
   return null;
@@ -289,24 +292,49 @@ export function graphFromFlow(nodes: StepFlowNode[], edges: StepFlowEdge[], star
 // Auto-layout (dagre, left-to-right)
 // ---------------------------------------------------------------------------
 
-const LAYOUT_NODE_WIDTH = 240;
-const LAYOUT_NODE_HEIGHT = 96;
+/** The step card's fixed width (`StepNode`'s `w-[240px]`). */
+export const LAYOUT_NODE_WIDTH = 240;
+/**
+ * Height dagre reserves for a step card whose real height isn't known yet
+ * (a fresh draft / a REST-built graph the canvas hasn't measured). Sized to
+ * the TALLEST `StepNode` variant, measured from its Tailwind classes: 2px
+ * border + 24px `p-3` + 20px title row (`text-sm`) + 6px `mt-1.5` + 22px
+ * profile chip (`Badge`: `text-xs` 16px + `py-0.5` 4px + 2px border) + 6px
+ * `mt-1.5` + 13px `transition: "all"` warning line (`text-[10px]
+ * leading-tight`) = 93px, plus headroom for sub-pixel line boxes. A
+ * measured height (React Flow's `node.measured.height`, passed via
+ * {@link autoLayout}'s `measured` option) always wins over this constant.
+ */
+export const LAYOUT_NODE_HEIGHT = 100;
 
 /** Layout footprint of one step INCLUDING the row(s) of subagent satellite
  *  nodes hanging beneath it (see {@link subagentSatellitePosition}) — what
  *  dagre must reserve so a step's satellites never overlap a neighbouring
  *  rank or a sibling in the same rank. A step with no subagents keeps the
  *  bare {@link LAYOUT_NODE_WIDTH}×{@link LAYOUT_NODE_HEIGHT}. */
-export function stepLayoutFootprint(step: PipelineStep): { width: number; height: number } {
+export function stepLayoutFootprint(
+  step: PipelineStep,
+  card: { width: number; height: number } = { width: LAYOUT_NODE_WIDTH, height: LAYOUT_NODE_HEIGHT },
+): { width: number; height: number } {
   const count = step.subagents.profileIds.length;
-  if (count === 0) return { width: LAYOUT_NODE_WIDTH, height: LAYOUT_NODE_HEIGHT };
+  if (count === 0) return { width: card.width, height: card.height };
   const perRow = Math.min(count, SUBAGENT_NODES_PER_ROW);
   const rows = Math.ceil(count / SUBAGENT_NODES_PER_ROW);
   const rowWidth = perRow * SUBAGENT_NODE_WIDTH + (perRow - 1) * SUBAGENT_NODE_GAP;
   return {
-    width: Math.max(LAYOUT_NODE_WIDTH, rowWidth),
-    height: LAYOUT_NODE_HEIGHT + SUBAGENT_ROW_TOP + rows * (SUBAGENT_NODE_HEIGHT + SUBAGENT_NODE_GAP),
+    width: Math.max(card.width, rowWidth),
+    height: card.height + SUBAGENT_ROW_TOP + rows * (SUBAGENT_NODE_HEIGHT + SUBAGENT_NODE_GAP),
   };
+}
+
+export interface AutoLayoutOptions {
+  /** The card's REAL on-canvas size for a step (React Flow's
+   *  `node.measured`), when the canvas has already measured it — wins over
+   *  the {@link LAYOUT_NODE_WIDTH}×{@link LAYOUT_NODE_HEIGHT} estimate, so a
+   *  card taller than the estimate (a long profile name that wrapped, a
+   *  future extra row) can't overlap the rank below it. Return `null` for a
+   *  step the canvas hasn't measured yet. */
+  measured?: (stepId: string) => { width: number; height: number } | null;
 }
 
 /**
@@ -318,14 +346,22 @@ export function stepLayoutFootprint(step: PipelineStep): { width: number; height
  * `PipelineGraph` with the same steps/edges/startStepId, only `position`
  * fields changed.
  */
-export function autoLayout(graph: PipelineGraph): PipelineGraph {
+export function autoLayout(graph: PipelineGraph, opts: AutoLayoutOptions = {}): PipelineGraph {
   const g = new dagre.graphlib.Graph();
   g.setGraph({ rankdir: "LR", nodesep: 40, ranksep: 120 });
   g.setDefaultEdgeLabel(() => ({}));
 
+  const cardFor = (step: PipelineStep): { width: number; height: number } => {
+    const m = opts.measured?.(step.id) ?? null;
+    if (m && Number.isFinite(m.width) && Number.isFinite(m.height) && m.width > 0 && m.height > 0) {
+      return { width: Math.max(LAYOUT_NODE_WIDTH, m.width), height: Math.max(LAYOUT_NODE_HEIGHT, m.height) };
+    }
+    return { width: LAYOUT_NODE_WIDTH, height: LAYOUT_NODE_HEIGHT };
+  };
+
   const stepIds = new Set(graph.steps.map((s) => s.id));
   for (const step of graph.steps) {
-    g.setNode(step.id, stepLayoutFootprint(step));
+    g.setNode(step.id, stepLayoutFootprint(step, cardFor(step)));
   }
   for (const edge of graph.edges) {
     if (stepIds.has(edge.from) && stepIds.has(edge.to)) g.setEdge(edge.from, edge.to);
@@ -337,9 +373,9 @@ export function autoLayout(graph: PipelineGraph): PipelineGraph {
     const pos = g.node(step.id) as { x: number; y: number } | undefined;
     if (!pos) return step;
     // dagre centres each node on (x, y) within the footprint it was given;
-    // the step card itself is always LAYOUT_NODE_WIDTH×LAYOUT_NODE_HEIGHT
-    // at the footprint's top-left, with any satellites hanging below it.
-    const footprint = stepLayoutFootprint(step);
+    // the step card itself sits at the footprint's top-left, with any
+    // satellites hanging below it.
+    const footprint = stepLayoutFootprint(step, cardFor(step));
     return { ...step, position: { x: pos.x - footprint.width / 2, y: pos.y - footprint.height / 2 } };
   });
 
@@ -436,26 +472,68 @@ export interface SubagentSatellite {
 }
 
 /**
+ * Claude Code's own built-in `agentType` ids (lowercased). A persona whose
+ * name collides with one of these can never be attributed by `agentType`
+ * equality — every ordinary `Agent` call carries one of these types, so a
+ * persona named "Explore" would otherwise claim every generic explorer the
+ * step spawned. Such a persona is still attributable by `description`.
+ */
+const BUILTIN_AGENT_TYPES: ReadonlySet<string> = new Set([
+  "general-purpose",
+  "explore",
+  "plan",
+  "bash",
+  "fork",
+  "claude",
+  "claude-code-guide",
+  "statusline-setup",
+  "output-style-setup",
+]);
+
+/** Shortest persona name {@link matchSubagentToProfile} will consider — a
+ *  one-character name ("A", "Q") would prefix-match far too much. */
+export const MATCH_PROFILE_NAME_MIN_LEN = 2;
+
+/** `true` when `text` starts with `name` (both already lowercased) and the
+ *  name ends on a word boundary: end of text, whitespace, or punctuation
+ *  (`:`, `-`, `—`, `,`, `(`, `/`, …) — anything that isn't a letter/digit.
+ *  So "QA: run tests" matches the persona "QA", but "QAnon investigation"
+ *  does not, and "Reviewer Pro: …" matches both "Reviewer" and "Reviewer
+ *  Pro" (the caller then picks the longer). */
+function startsWithOnWordBoundary(text: string, name: string): boolean {
+  if (!text.startsWith(name)) return false;
+  const next = text.charAt(name.length);
+  return next === "" || !/[\p{L}\p{N}]/u.test(next);
+}
+
+/**
  * Attribute an observed subagent to one of the step's configured personas,
- * or `null`. Matching is by name, case-insensitively: the subagent's
- * `description` (what the spawning `Agent` tool call said it was for — the
- * step prompt asks the agent to start it with the persona's name) or its
- * registered `agentType` must CONTAIN the profile name; when several
- * profiles match, the longest name wins so "Reviewer Pro" beats "Reviewer".
+ * or `null`. Matching is by name, case-insensitively, and deliberately
+ * anchored rather than a substring search (a persona named "Test" must not
+ * claim every helper whose description merely mentions tests): the
+ * subagent's `description` (what the spawning `Agent` tool call said it was
+ * for — the step prompt asks the agent to START it with the persona's name)
+ * must begin with the profile name on a word boundary, or — only for a
+ * persona whose name isn't itself one of Claude Code's built-in agent types
+ * ({@link BUILTIN_AGENT_TYPES}) — its registered `agentType` must EQUAL the
+ * name. Names shorter than {@link MATCH_PROFILE_NAME_MIN_LEN} never match.
+ * When several profiles match, the longest name wins so "Reviewer Pro"
+ * beats "Reviewer".
  */
 export function matchSubagentToProfile(
   subagent: Pick<Subagent, "description" | "agentType">,
   profiles: readonly { id: string; name: string }[],
 ): string | null {
-  const haystacks = [subagent.description, subagent.agentType]
-    .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
-    .map((s) => s.toLowerCase());
-  if (haystacks.length === 0) return null;
+  const description = typeof subagent.description === "string" ? subagent.description.trim().toLowerCase() : "";
+  const agentType = typeof subagent.agentType === "string" ? subagent.agentType.trim().toLowerCase() : "";
+  if (description.length === 0 && agentType.length === 0) return null;
   let best: { id: string; len: number } | null = null;
   for (const p of profiles) {
     const needle = p.name.trim().toLowerCase();
-    if (needle.length === 0) continue;
-    if (!haystacks.some((h) => h.includes(needle))) continue;
+    if (needle.length < MATCH_PROFILE_NAME_MIN_LEN) continue;
+    const byDescription = description.length > 0 && startsWithOnWordBoundary(description, needle);
+    const byAgentType = agentType.length > 0 && !BUILTIN_AGENT_TYPES.has(needle) && agentType === needle;
+    if (!byDescription && !byAgentType) continue;
     if (!best || needle.length > best.len) best = { id: p.id, len: needle.length };
   }
   return best?.id ?? null;

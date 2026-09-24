@@ -3,8 +3,9 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgetorClient } from "../api-client.ts";
-import type { Pipeline, PipelineGraph, PipelineInput, PipelineRunState, Task } from "../../shared/types.ts";
+import type { AgentProfile, Pipeline, PipelineGraph, PipelineInput, PipelineRunState, Task } from "../../shared/types.ts";
 import { newStep } from "../../shared/pipeline.ts";
+import { makeTask } from "../test-fixtures.ts";
 
 /**
  * `cmdPipeline` (this file's own `commands/pipeline.ts`) reaches for a client
@@ -72,6 +73,9 @@ const {
   parseRetryFlags,
   resolveStepRef,
   resolveActiveStepRef,
+  resolveImportProfiles,
+  withProfileHints,
+  colorRunStatus,
 } = await import("./pipeline.ts");
 
 const flags = { json: false, plain: true, noDaemon: true } as unknown as Parameters<typeof cmdPipeline>[1];
@@ -122,8 +126,10 @@ function makeClient(over: Partial<AgetorClient> = {}): AgetorClient {
 // `resolveTask` (shared by every task-targeting command) resolves through
 // `client.listTasks()`, so these tests stub that instead of `listPipelines`.
 
+// Typed via the shared `makeTask` (L-CLI13) — a `Task` field rename now
+// fails typecheck here instead of slipping through an `as unknown as Task`.
 function task(over: Partial<Task> = {}): Task {
-  return {
+  return makeTask({
     id: "parent-1",
     title: "Fix the login bug",
     prompt: "p",
@@ -131,13 +137,27 @@ function task(over: Partial<Task> = {}): Task {
     column: "running",
     workdir: "/tmp",
     isolation: "worktree",
-    taskType: "task",
-    archivedAt: null,
-    pendingInteractionCount: 0,
-    hasOpenableRun: false,
     pipelineId: "pipe-1",
     ...over,
-  } as unknown as Task;
+  });
+}
+
+function makeProfile(overrides: Partial<AgentProfile> = {}): AgentProfile {
+  return {
+    id: "prof-a",
+    name: "Investigator",
+    harness: "claude-code",
+    model: "opus-5",
+    effort: null,
+    mode: null,
+    fast: false,
+    maxMode: false,
+    instructions: "",
+    skills: [],
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  };
 }
 
 function pipelineRun(overrides: Partial<PipelineRunState> = {}): PipelineRunState {
@@ -230,6 +250,56 @@ test("pipelineShowLines: an edge with no label renders just the target name", ()
   expect(text).not.toContain("Fix (");
 });
 
+test("pipelineShowLines: with a live profile list, a step's profile renders as '<name> (<id>)' and a dangling id as '<id> (missing)'", () => {
+  const profiles = [makeProfile({ id: "prof-a", name: "Investigator" })]; // prof-b is NOT defined
+  const text = pipelineShowLines(makePipeline({ graph: twoStepGraph() }), profiles).join("\n");
+  expect(text).toContain("profile: Investigator (prof-a)");
+  expect(text).toContain("profile: prof-b (missing)");
+});
+
+test("pipelineShowLines: a null profile list (listing failed) prints bare ids, never a false '(missing)'", () => {
+  const text = pipelineShowLines(makePipeline({ graph: twoStepGraph() }), null).join("\n");
+  expect(text).toContain("profile: prof-a");
+  expect(text).not.toContain("(missing)");
+});
+
+test("pipelineShowLines: a step's subagent profiles render resolved by name with the cap", () => {
+  const g = twoStepGraph();
+  g.steps[0]!.subagents = { profileIds: ["prof-a", "prof-zzz"], cap: 3 };
+  const text = pipelineShowLines(makePipeline({ graph: g }), [makeProfile()]).join("\n");
+  expect(text).toContain("subagents: Investigator (prof-a), prof-zzz (missing)  (cap 3)");
+  // The step with no subagents prints no such line.
+  expect(text.split("subagents:").length).toBe(2);
+});
+
+test("cmdPipeline show: resolves profile names through listAgentProfiles, and degrades to bare ids when the listing fails", async () => {
+  const pipeline = makePipeline({ id: "p1", graph: twoStepGraph() });
+  currentClient = makeClient({
+    listPipelines: async () => [pipeline],
+    listAgentProfiles: async () => [makeProfile({ id: "prof-a", name: "Investigator" })],
+  });
+  await cmdPipeline(["show", "p1"], flags);
+  expect(outputs.join("\n")).toContain("profile: Investigator (prof-a)");
+  expect(outputs.join("\n")).toContain("profile: prof-b (missing)");
+
+  outputs.length = 0;
+  currentClient = makeClient({
+    listPipelines: async () => [pipeline],
+    listAgentProfiles: async () => {
+      throw new Error("boom");
+    },
+  });
+  await cmdPipeline(["show", "p1"], flags);
+  expect(outputs.join("\n")).toContain("profile: prof-a");
+  expect(outputs.join("\n")).not.toContain("(missing)");
+});
+
+test("colorRunStatus: is exported for `agetor show` (identity under the mocked palette)", () => {
+  expect(colorRunStatus("blocked")).toBe("blocked");
+  expect(colorRunStatus("done")).toBe("done");
+  expect(colorRunStatus("idle")).toBe("idle");
+});
+
 test("pipelineShowLines: a step with no bound profile prints 'none'", () => {
   const g = twoStepGraph();
   g.steps[0]!.agentProfileId = null;
@@ -293,11 +363,15 @@ test("parsePipelineFile: a non-integer maxSteps is rejected", () => {
 // ── parseExportFlags / parseImportFlags ──────────────────────────────────
 
 test("parseExportFlags: --out <file>", () => {
-  expect(parseExportFlags(["--out", "/tmp/x.json"])).toEqual({ out: "/tmp/x.json" });
+  expect(parseExportFlags(["--out", "/tmp/x.json"])).toEqual({ out: "/tmp/x.json", force: false });
 });
 
-test("parseExportFlags: no --out leaves it undefined", () => {
-  expect(parseExportFlags([])).toEqual({});
+test("parseExportFlags: no --out leaves it undefined; force defaults false", () => {
+  expect(parseExportFlags([])).toEqual({ force: false });
+});
+
+test("parseExportFlags: --force sets force; --out - is kept verbatim (stdout)", () => {
+  expect(parseExportFlags(["--out", "-", "--force"])).toEqual({ out: "-", force: true });
 });
 
 test("parseExportFlags: --out with nothing after it throws 'needs a value'", () => {
@@ -433,6 +507,66 @@ test("cmdPipeline export: no --out prints PipelineInput JSON to stdout", async (
   expect(parsed).not.toHaveProperty("taskCount");
 });
 
+test("cmdPipeline export: writes profileName / subagents.profileNames hints when the profile listing is available", async () => {
+  const g = twoStepGraph();
+  g.steps[0]!.subagents = { profileIds: ["prof-b", "prof-gone"], cap: null };
+  const pipeline = makePipeline({ id: "p1", name: "Flow A", graph: g });
+  currentClient = makeClient({
+    listPipelines: async () => [pipeline],
+    listAgentProfiles: async () => [
+      makeProfile({ id: "prof-a", name: "Investigator" }),
+      makeProfile({ id: "prof-b", name: "Fixer" }),
+    ],
+  });
+  await cmdPipeline(["export", "p1"], flags);
+  const parsed = JSON.parse(outputs[0]!) as { graph: { steps: Array<Record<string, unknown>> } };
+  expect(parsed.graph.steps[0]!.profileName).toBe("Investigator");
+  expect(parsed.graph.steps[0]!.subagents).toEqual({ profileIds: ["prof-b", "prof-gone"], cap: null, profileNames: ["Fixer", null] });
+  expect(parsed.graph.steps[1]!.profileName).toBe("Fixer");
+  expect(parsed.graph.steps[1]!.subagents).toEqual({ profileIds: [], cap: null }); // no ids → no profileNames key
+});
+
+test("withProfileHints: a step whose profile id matches no live profile gets no profileName key at all", () => {
+  const input: PipelineInput = { name: "P", graph: twoStepGraph() };
+  const hinted = withProfileHints(input, [makeProfile({ id: "prof-a", name: "Investigator" })]);
+  const steps = hinted.graph.steps as unknown as Array<Record<string, unknown>>;
+  expect(steps[0]!.profileName).toBe("Investigator");
+  expect(steps[1]).not.toHaveProperty("profileName");
+  // The original input is not mutated.
+  expect(input.graph.steps[0]).not.toHaveProperty("profileName");
+});
+
+test("cmdPipeline export --out <existing file>: refuses to overwrite without --force (and never hits the network)", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
+  const file = path.join(dir, "flow-a.json");
+  try {
+    await Bun.write(file, "{}");
+    let listed = false;
+    currentClient = makeClient({
+      listPipelines: async () => {
+        listed = true;
+        return [makePipeline({ id: "p1" })];
+      },
+    });
+    await expect(cmdPipeline(["export", "p1", "--out", file], flags)).rejects.toThrow(/refusing to overwrite .*--force/);
+    expect(listed).toBe(false);
+    expect(readFileSync(file, "utf8")).toBe("{}");
+
+    await cmdPipeline(["export", "p1", "--out", file, "--force"], flags);
+    expect((JSON.parse(readFileSync(file, "utf8")) as PipelineInput).name).toBe("Bug fix flow");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cmdPipeline export --out -: prints to stdout (symmetry with `import -`)", async () => {
+  currentClient = makeClient({ listPipelines: async () => [makePipeline({ id: "p1", name: "Flow A" })] });
+  await cmdPipeline(["export", "p1", "--out", "-"], flags);
+  expect(outputs).toHaveLength(1);
+  expect((JSON.parse(outputs[0]!) as PipelineInput).name).toBe("Flow A");
+  expect(outputs[0]).not.toContain("wrote");
+});
+
 test("cmdPipeline export: missing ref throws the usage error", async () => {
   currentClient = makeClient();
   await expect(cmdPipeline(["export"], flags)).rejects.toThrow(/usage: agetor pipeline export/);
@@ -510,6 +644,150 @@ test("cmdPipeline import: --name overrides the file's own name", async () => {
   }
 });
 
+test("cmdPipeline import: a dangling step profile id with a hint that names exactly one live profile is remapped (and reported)", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
+  const file = path.join(dir, "flow-a.json");
+  try {
+    const g = twoStepGraph(); // prof-a / prof-b — neither exists on "this machine"
+    const steps = g.steps as unknown as Array<Record<string, unknown>>;
+    steps[0]!.profileName = "Investigator";
+    steps[1]!.profileName = "Fixer";
+    await Bun.write(file, JSON.stringify({ name: "Flow A", graph: g }));
+    const created: PipelineInput[] = [];
+    currentClient = makeClient({
+      listAgentProfiles: async () => [makeProfile({ id: "local-1", name: "investigator" })], // case-insensitive
+      createPipeline: async (i: PipelineInput) => {
+        created.push(i);
+        return makePipeline({ id: "new-id", ...i });
+      },
+    });
+
+    await cmdPipeline(["import", file], flags);
+
+    expect(created[0]!.graph.steps[0]!.agentProfileId).toBe("local-1");
+    expect(created[0]!.graph.steps[1]!.agentProfileId).toBe("prof-b"); // no unique "Fixer" here — left dangling
+    // The posted graph is the validator's normalized shape — hints stripped.
+    expect(created[0]!.graph.steps[0]).not.toHaveProperty("profileName");
+    const rendered = outputs.join("\n");
+    expect(rendered).toContain("imported pipeline");
+    expect(rendered).toContain('step "Investigate": agent profile prof-a isn\'t defined here — remapped to "investigator" (local-1)');
+    expect(rendered).toContain('! step "Fix": agent profile prof-b ("Fixer") isn\'t defined on this machine');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cmdPipeline import --json: remaps and warnings fold into a `warnings` array on the created pipeline", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
+  const file = path.join(dir, "flow-a.json");
+  try {
+    await Bun.write(file, JSON.stringify({ name: "Flow A", graph: twoStepGraph() }));
+    currentClient = makeClient({
+      listAgentProfiles: async () => [makeProfile({ id: "prof-a" })], // prof-b dangling, no hint
+      createPipeline: async (i: PipelineInput) => makePipeline({ id: "new-id", ...i }),
+    });
+    await cmdPipeline(["import", file], jsonFlags);
+    const printed = jsonOutputs[0] as { id: string; warnings?: string[] };
+    expect(printed.id).toBe("new-id");
+    expect(printed.warnings).toEqual([
+      'step "Fix": agent profile prof-b isn\'t defined on this machine — assign one in the editor before running this pipeline',
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cmdPipeline import: every profile id resolving locally prints no warnings and no `warnings` key under --json", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
+  const file = path.join(dir, "flow-a.json");
+  try {
+    await Bun.write(file, JSON.stringify({ name: "Flow A", graph: twoStepGraph() }));
+    currentClient = makeClient({
+      listAgentProfiles: async () => [makeProfile({ id: "prof-a" }), makeProfile({ id: "prof-b", name: "Fixer" })],
+      createPipeline: async (i: PipelineInput) => makePipeline({ id: "new-id", ...i }),
+    });
+    await cmdPipeline(["import", file], jsonFlags);
+    expect(jsonOutputs[0] as object).not.toHaveProperty("warnings");
+    outputs.length = 0;
+    await cmdPipeline(["import", file], flags);
+    expect(outputs.join("\n")).not.toContain("!");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cmdPipeline import: a failed profile listing warns that references weren't checked, but still imports", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
+  const file = path.join(dir, "flow-a.json");
+  try {
+    await Bun.write(file, JSON.stringify({ name: "Flow A", graph: twoStepGraph() }));
+    let called = false;
+    currentClient = makeClient({
+      listAgentProfiles: async () => {
+        throw new Error("boom");
+      },
+      createPipeline: async (i: PipelineInput) => {
+        called = true;
+        return makePipeline({ id: "new-id", ...i });
+      },
+    });
+    await cmdPipeline(["import", file], flags);
+    expect(called).toBe(true);
+    expect(outputs.join("\n")).toContain("! couldn't list this machine's agent profiles");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveImportProfiles: subagents.profileIds entries remap by their positional profileNames hint and warn when dangling", () => {
+  const g = twoStepGraph();
+  g.steps[0]!.subagents = { profileIds: ["gone-1", "gone-2", "prof-a"], cap: 2 };
+  const hints = new Map([["s1", { profileName: null, subagentProfileNames: ["Fixer", null, null] }]]);
+  const profiles = [makeProfile({ id: "prof-a" }), makeProfile({ id: "prof-b", name: "Fixer" })];
+  const r = resolveImportProfiles({ name: "P", graph: g }, hints, profiles);
+  expect(r.input.graph.steps[0]!.subagents.profileIds).toEqual(["prof-b", "gone-2", "prof-a"]);
+  expect(r.remapped).toHaveLength(1);
+  expect(r.remapped[0]).toContain('step "Investigate" subagent: agent profile gone-1 isn\'t defined here — remapped to "Fixer" (prof-b)');
+  // gone-2 has no hint → warned; prof-a resolves → silent; s2's prof-b resolves → silent.
+  expect(r.warnings).toEqual([
+    'step "Investigate" subagent: agent profile gone-2 isn\'t defined on this machine — assign one in the editor before running this pipeline',
+  ]);
+  // Input is not mutated.
+  expect(g.steps[0]!.subagents.profileIds).toEqual(["gone-1", "gone-2", "prof-a"]);
+});
+
+test("resolveImportProfiles: an ambiguous hint (two live profiles with that name) is NOT remapped — warned instead", () => {
+  const hints = new Map([["s1", { profileName: "Dup", subagentProfileNames: [] }]]);
+  const profiles = [makeProfile({ id: "x1", name: "Dup" }), makeProfile({ id: "x2", name: "dup " })];
+  const r = resolveImportProfiles({ name: "P", graph: twoStepGraph() }, hints, profiles);
+  expect(r.input.graph.steps[0]!.agentProfileId).toBe("prof-a");
+  expect(r.remapped).toEqual([]);
+  expect(r.warnings.some((w) => w.includes('prof-a ("Dup")'))).toBe(true);
+});
+
+test("parsePipelineFile: profileName / subagents.profileNames hints are extracted per step id and stripped from the graph", () => {
+  const result = parsePipelineFile(
+    JSON.stringify({
+      name: "P",
+      graph: {
+        steps: [
+          { ...newStep({ id: "s1", name: "A", agentProfileId: "p1" }), profileName: "Alpha", subagents: { profileIds: ["q1"], cap: null, profileNames: ["Q"] } },
+          { ...newStep({ id: "s2", name: "B" }), profileName: 42 },
+        ],
+        edges: [],
+        startStepId: "s1",
+      },
+    }),
+  );
+  expect(result.ok).toBe(true);
+  if (result.ok) {
+    expect(result.hints.get("s1")).toEqual({ profileName: "Alpha", subagentProfileNames: ["Q"] });
+    expect(result.hints.get("s2")).toEqual({ profileName: null, subagentProfileNames: [] });
+    expect(result.input.graph.steps[0]).not.toHaveProperty("profileName");
+    expect(result.input.graph.steps[0]!.subagents).toEqual({ profileIds: ["q1"], cap: null });
+  }
+});
+
 test("cmdPipeline import: an invalid file throws without calling createPipeline", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
   const file = path.join(dir, "bad.json");
@@ -547,6 +825,38 @@ test("resolveStepRef: resolves by exact step id", () => {
 test("resolveStepRef: resolves by case-insensitive, trimmed name", () => {
   const g = pipelineRun().snapshot!.graph;
   expect(resolveStepRef(g, "  fix  ")).toBe("s2");
+});
+
+test("resolveStepRef: resolves by an edge label (case-insensitive, trimmed) to the edge's TARGET step — parity with resolveNextSteps", () => {
+  const g = twoStepGraph(); // e1: s1 → s2, label "done"
+  expect(resolveStepRef(g, " DONE ")).toBe("s2");
+});
+
+test("resolveStepRef: precedence is name, then id, then label", () => {
+  const g: PipelineGraph = {
+    steps: [
+      newStep({ id: "go", name: "Start" }),
+      newStep({ id: "s2", name: "go" }), // NAME "go" collides with step id "go" — name wins
+      newStep({ id: "s3", name: "Third" }),
+    ],
+    edges: [{ id: "e1", from: "go", to: "s3", label: "s2" }], // LABEL "s2" collides with step id "s2" — id wins
+    startStepId: "go",
+  };
+  expect(resolveStepRef(g, "go")).toBe("s2");
+  expect(resolveStepRef(g, "s2")).toBe("s2");
+  expect(resolveStepRef(g, "s3")).toBe("s3");
+});
+
+test("resolveStepRef: a label shared by edges into different targets is ambiguous", () => {
+  const g: PipelineGraph = {
+    steps: [newStep({ id: "a", name: "A" }), newStep({ id: "b", name: "B" }), newStep({ id: "c", name: "C" })],
+    edges: [
+      { id: "e1", from: "a", to: "b", label: "next" },
+      { id: "e2", from: "a", to: "c", label: "next" },
+    ],
+    startStepId: "a",
+  };
+  expect(() => resolveStepRef(g, "next")).toThrow(/ambiguous edge label "next": leads to B, C/);
 });
 
 test("resolveStepRef: an unknown ref throws, listing every step name", () => {
@@ -769,6 +1079,34 @@ test("cmdPipeline retry: a non-pipeline task throws", async () => {
   await expect(cmdPipeline(["retry", "parent-1"], flags)).rejects.toThrow(/is not a pipeline task/);
 });
 
+test("cmdPipeline retry: a bad flag fails BEFORE any task lookup (no network round-trip)", async () => {
+  let listed = false;
+  currentClient = makeClient({
+    listTasks: async () => {
+      listed = true;
+      return [task()];
+    },
+  });
+  await expect(cmdPipeline(["retry", "parent-1", "--bogus"], flags)).rejects.toThrow(/usage: agetor pipeline retry .*--from/);
+  expect(listed).toBe(false);
+});
+
+test("cmdPipeline retry: a step task id (pipelineParentId set) is refused, pointing at the parent", async () => {
+  currentClient = makeClient({
+    listTasks: async () => [task({ id: "step-task-1", pipelineId: null, pipelineParentId: "parent-12345678" })],
+  });
+  await expect(cmdPipeline(["retry", "step-task-1"], flags)).rejects.toThrow(
+    /"step-task-1" is a step task of pipeline task parent-1 — target that id instead/,
+  );
+});
+
+test("cmdPipeline status: a step task id is refused too (every task-scoped subcommand shares the guard)", async () => {
+  currentClient = makeClient({
+    listTasks: async () => [task({ id: "step-task-1", pipelineId: null, pipelineParentId: "parent-12345678" })],
+  });
+  await expect(cmdPipeline(["status", "step-task-1"], flags)).rejects.toThrow(/is a step task of pipeline task parent-1/);
+});
+
 test("cmdPipeline retry: resolves the task and calls retryPipeline", async () => {
   const retried: string[] = [];
   currentClient = makeClient({
@@ -900,6 +1238,44 @@ test("cmdPipeline advance: --next by step id works too", async () => {
   });
   await cmdPipeline(["advance", "parent-1", "--next", "s2"], flags);
   expect(bodies).toEqual([{ id: "parent-1", body: { nextStepIds: ["s2"] } }]);
+});
+
+test("cmdPipeline advance: --next by edge label resolves to the edge's target step", async () => {
+  const bodies: unknown[] = [];
+  const run = pipelineRun();
+  run.snapshot!.graph.edges[0]!.label = "fix it";
+  currentClient = makeClient({
+    listTasks: async () => [task({ pipelineRun: run })],
+    advancePipeline: async (id: string, body: unknown) => {
+      bodies.push({ id, body });
+      return task();
+    },
+  });
+  await cmdPipeline(["advance", "parent-1", "--next", "Fix It"], flags);
+  expect(bodies).toEqual([{ id: "parent-1", body: { nextStepIds: ["s2"] } }]);
+});
+
+test("cmdPipeline advance: a bad flag fails BEFORE any task lookup (no network round-trip)", async () => {
+  let listed = false;
+  currentClient = makeClient({
+    listTasks: async () => {
+      listed = true;
+      return [task({ pipelineRun: pipelineRun() })];
+    },
+  });
+  await expect(cmdPipeline(["advance", "parent-1", "--bogus"], flags)).rejects.toThrow(/usage: agetor pipeline advance/);
+  await expect(cmdPipeline(["advance", "parent-1", "--next", "Fix", "--finish"], flags)).rejects.toThrow(/mutually exclusive/);
+  await expect(cmdPipeline(["advance", "parent-1"], flags)).rejects.toThrow(/usage: agetor pipeline advance/);
+  expect(listed).toBe(false);
+});
+
+test("cmdPipeline advance: a step task id (pipelineParentId set) is refused, pointing at the parent", async () => {
+  currentClient = makeClient({
+    listTasks: async () => [task({ id: "step-task-1", pipelineId: null, pipelineParentId: "parent-12345678" })],
+  });
+  await expect(cmdPipeline(["advance", "step-task-1", "--finish"], flags)).rejects.toThrow(
+    /"step-task-1" is a step task of pipeline task parent-1 — target that id instead/,
+  );
 });
 
 test("cmdPipeline advance: an unknown --next step name throws, listing candidates", async () => {

@@ -21,6 +21,8 @@ import {
   toFlowNodes,
   toSubagentFlowEdges,
   toSubagentFlowNodes,
+  LAYOUT_NODE_HEIGHT,
+  LAYOUT_NODE_WIDTH,
   SUBAGENT_NODE_GAP,
   SUBAGENT_NODE_HEIGHT,
   SUBAGENT_NODE_WIDTH,
@@ -257,7 +259,7 @@ describe("latestTransition", () => {
     expect(latestTransition(run)).toBeNull();
   });
 
-  test("returns the most recent record with a non-empty nextStepIds, first target", () => {
+  test("returns the most recent record with a non-empty nextStepIds, EVERY target (a fan-out animates every edge)", () => {
     const run = makeRun({
       history: [
         makeRecord({ seq: 1, stepId: "a", nextStepIds: ["b"] }),
@@ -265,7 +267,12 @@ describe("latestTransition", () => {
         makeRecord({ seq: 3, stepId: "c", nextStepIds: ["d", "e"] }),
       ],
     });
-    expect(latestTransition(run)).toEqual({ fromStepId: "c", toStepId: "d", seq: 3 });
+    expect(latestTransition(run)).toEqual({ fromStepId: "c", toStepIds: ["d", "e"], seq: 3 });
+  });
+
+  test("deduplicates repeated targets", () => {
+    const run = makeRun({ history: [makeRecord({ seq: 1, stepId: "a", nextStepIds: ["b", "b"] })] });
+    expect(latestTransition(run)).toEqual({ fromStepId: "a", toStepIds: ["b"], seq: 1 });
   });
 
   test("skips trailing terminal records to find the latest real transition", () => {
@@ -275,7 +282,7 @@ describe("latestTransition", () => {
         makeRecord({ seq: 2, stepId: "b", nextStepIds: [] }),
       ],
     });
-    expect(latestTransition(run)).toEqual({ fromStepId: "a", toStepId: "b", seq: 1 });
+    expect(latestTransition(run)).toEqual({ fromStepId: "a", toStepIds: ["b"], seq: 1 });
   });
 });
 
@@ -548,8 +555,8 @@ const nameOf = (id: string) => NAMES[id] ?? null;
 describe("subagentSatellitePosition", () => {
   test("a single satellite is centred under the 240px step card, one row below it", () => {
     const pos = subagentSatellitePosition(0, 1);
-    expect(pos.x).toBe((240 - SUBAGENT_NODE_WIDTH) / 2);
-    expect(pos.y).toBe(96 + SUBAGENT_ROW_TOP);
+    expect(pos.x).toBe((LAYOUT_NODE_WIDTH - SUBAGENT_NODE_WIDTH) / 2);
+    expect(pos.y).toBe(LAYOUT_NODE_HEIGHT + SUBAGENT_ROW_TOP);
   });
 
   test("wraps into rows of SUBAGENT_NODES_PER_ROW; a partial last row is centred on its own", () => {
@@ -558,7 +565,7 @@ describe("subagentSatellitePosition", () => {
     const last = subagentSatellitePosition(SUBAGENT_NODES_PER_ROW, count);
     expect(last.y).toBe(first.y + SUBAGENT_NODE_HEIGHT + SUBAGENT_NODE_GAP);
     // The lone item on row 2 sits centred, like the single-satellite case.
-    expect(last.x).toBe((240 - SUBAGENT_NODE_WIDTH) / 2);
+    expect(last.x).toBe((LAYOUT_NODE_WIDTH - SUBAGENT_NODE_WIDTH) / 2);
     // Full row 1 is centred as a block, so its first column starts left of centre.
     expect(first.x).toBeLessThan(last.x);
   });
@@ -566,14 +573,31 @@ describe("subagentSatellitePosition", () => {
 
 describe("stepLayoutFootprint / autoLayout with satellites", () => {
   test("a step without subagents keeps the bare card footprint", () => {
-    expect(stepLayoutFootprint(makeStep())).toEqual({ width: 240, height: 96 });
+    expect(stepLayoutFootprint(makeStep())).toEqual({ width: LAYOUT_NODE_WIDTH, height: LAYOUT_NODE_HEIGHT });
+  });
+
+  test("the estimate covers the tallest card variant; a measured card size wins over it", () => {
+    // Tallest StepNode variant (title + profile chip + transition:"all"
+    // warning line) — see LAYOUT_NODE_HEIGHT's doc comment for the sum.
+    expect(LAYOUT_NODE_HEIGHT).toBeGreaterThanOrEqual(93);
+    const a = makeStep({ id: "a" });
+    const b = makeStep({ id: "b" });
+    const laidOut = autoLayout(
+      { steps: [a, b], edges: [], startStepId: "a" },
+      { measured: (id) => (id === "a" ? { width: 240, height: 180 } : null) },
+    );
+    const la = laidOut.steps.find((s) => s.id === "a")!;
+    const lb = laidOut.steps.find((s) => s.id === "b")!;
+    const [top, bottom] = la.position.y < lb.position.y ? [la, lb] : [lb, la];
+    const topHeight = top.id === "a" ? 180 : LAYOUT_NODE_HEIGHT;
+    expect(bottom.position.y).toBeGreaterThanOrEqual(top.position.y + topHeight);
   });
 
   test("satellite rows grow the footprint, and dagre spacing honours it", () => {
     const withSubs = makeStep({ id: "a", subagents: { profileIds: ["p1", "p2", "p3", "p4"], cap: null } });
     const fp = stepLayoutFootprint(withSubs);
     expect(fp.width).toBe(3 * SUBAGENT_NODE_WIDTH + 2 * SUBAGENT_NODE_GAP);
-    expect(fp.height).toBe(96 + SUBAGENT_ROW_TOP + 2 * (SUBAGENT_NODE_HEIGHT + SUBAGENT_NODE_GAP));
+    expect(fp.height).toBe(LAYOUT_NODE_HEIGHT + SUBAGENT_ROW_TOP + 2 * (SUBAGENT_NODE_HEIGHT + SUBAGENT_NODE_GAP));
 
     // Two steps stacked in the same rank (no edge between them): the second
     // must start below the first one's satellites, not below its card.
@@ -611,6 +635,45 @@ describe("matchSubagentToProfile", () => {
     expect(matchSubagentToProfile(makeSubagent({ description: "Explore the repo" }), profiles)).toBeNull();
     expect(matchSubagentToProfile(makeSubagent({ description: null, agentType: null }), profiles)).toBeNull();
     expect(matchSubagentToProfile(makeSubagent({ description: "Helper One" }), [])).toBeNull();
+  });
+
+  test("the description must START with the name — a mere mention elsewhere never attributes", () => {
+    expect(matchSubagentToProfile(makeSubagent({ description: "Ask Helper One to review the tests" }), profiles)).toBeNull();
+    expect(matchSubagentToProfile(makeSubagent({ description: "Please review (Reviewer)" }), profiles)).toBeNull();
+  });
+
+  test("the name must end on a word boundary: 'QA' matches 'QA: …' and 'QA — …', not 'QAnon …'", () => {
+    const qa = [{ id: "qa", name: "QA" }];
+    expect(matchSubagentToProfile(makeSubagent({ description: "QA: run the suite" }), qa)).toBe("qa");
+    expect(matchSubagentToProfile(makeSubagent({ description: "qa — run the suite" }), qa)).toBe("qa");
+    expect(matchSubagentToProfile(makeSubagent({ description: "QA" }), qa)).toBe("qa");
+    expect(matchSubagentToProfile(makeSubagent({ description: "QAnon investigation" }), qa)).toBeNull();
+    expect(matchSubagentToProfile(makeSubagent({ description: "Reviewer2: style" }), profiles)).toBeNull();
+  });
+
+  test("a one-character persona name never matches, even at the start", () => {
+    const a = [{ id: "a", name: "A" }];
+    expect(matchSubagentToProfile(makeSubagent({ description: "A: analyze the logs" }), a)).toBeNull();
+    expect(matchSubagentToProfile(makeSubagent({ description: null, agentType: "A" }), a)).toBeNull();
+  });
+
+  test("agentType attributes only by EQUALITY, never by containment", () => {
+    expect(matchSubagentToProfile(makeSubagent({ description: null, agentType: "helper one" }), profiles)).toBe("p1");
+    expect(matchSubagentToProfile(makeSubagent({ description: null, agentType: "Helper One Plus" }), profiles)).toBeNull();
+    expect(matchSubagentToProfile(makeSubagent({ description: null, agentType: "my-reviewer" }), profiles)).toBeNull();
+  });
+
+  test("a persona named after a built-in agent type is never attributed by agentType, only by description", () => {
+    const explore = [{ id: "ex", name: "Explore" }, { id: "gp", name: "general-purpose" }];
+    expect(matchSubagentToProfile(makeSubagent({ description: "Look around the repo", agentType: "Explore" }), explore)).toBeNull();
+    expect(matchSubagentToProfile(makeSubagent({ description: "scan tests", agentType: "general-purpose" }), explore)).toBeNull();
+    expect(matchSubagentToProfile(makeSubagent({ description: "Explore: map the repo", agentType: "Explore" }), explore)).toBe("ex");
+  });
+
+  test("the longest name still wins when both description and agentType match different personas", () => {
+    expect(
+      matchSubagentToProfile(makeSubagent({ description: "Reviewer Pro: check style", agentType: "Reviewer" }), profiles),
+    ).toBe("p4");
   });
 });
 

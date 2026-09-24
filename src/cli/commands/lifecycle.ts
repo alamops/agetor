@@ -22,6 +22,16 @@ export async function cmdStart(args: string[], flags: Flags): Promise<void> {
   // sending a message (the app resumes rather than starting a fresh run).
   const control = runControl(task);
   if (control === "stop") {
+    // A pipeline (parent) task never has a run of its own to answer or
+    // message — its steps do — so point at the pipeline-level controls
+    // instead of the generic cancel/answer/send trio (M-CLI2).
+    if (task.pipelineId) {
+      throw new Error(
+        `pipeline is already ${task.column === "blocked" ? "blocked" : "running"} — stop it with ` +
+          `'agetor pipeline cancel ${short}', or retry its blocked/cancelled step(s) with ` +
+          `'agetor pipeline retry ${short}'`,
+      );
+    }
     throw new Error(
       `task is already running — stop it with 'agetor cancel ${short}', ` +
         `answer with 'agetor answer ${short}', or continue with 'agetor send ${short} <message>'`,

@@ -28,9 +28,10 @@ const DEFAULT_CONTEXT_VALUE: PipelineCanvasContextValue = {
  * SAME render, and React Flow interprets that as a reason to re-measure
  * every node (root cause of the "trying to drag a node that is not
  * initialized" warning / a sibling node getting stuck `visibility: hidden`
- * — see `e2e/pipelines-editor.spec.ts`'s `test.fixme` comment). A context
- * value's identity is free to change every render; only the consuming
- * `StepNode` components re-render, and React Flow never sees it.
+ * — pinned by `e2e/pipelines-editor.spec.ts`'s "New agent… inline creation
+ * on one step does not leave a sibling step node stuck unclickable" test).
+ * A context value's identity is free to change every render; only the
+ * consuming `StepNode` components re-render, and React Flow never sees it.
  */
 export const PipelineCanvasContext = createContext<PipelineCanvasContextValue>(DEFAULT_CONTEXT_VALUE);
 

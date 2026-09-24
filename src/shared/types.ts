@@ -718,6 +718,24 @@ export const PIPELINE_LIMITS = {
   handoffInlineMaxBytes: 16_384,
   handoffField: 8_000,
   handoffArray: 50,
+  /** Hard bound on the JSON byte size of ONE normalized {@link Handoff} as
+   *  persisted into `PipelineRunState.history[].handoff` /
+   *  `joins[].arrivals[].handoff` — `normalizeHandoff` trims the arrays
+   *  first, then the string fields, until the whole object fits. Per-field
+   *  (`handoffField`) and per-array (`handoffArray`) caps alone still allowed
+   *  ~850 KB per handoff (7 × 8 KB fields + 2 × 50 × 8 KB entries). */
+  handoffTotalBytes: 65_536,
+  /** `parseHandoff` only ever scans the trailing `handoffScanTailBytes`
+   *  UTF-16 code units of a step's assistant text for its `<handoff>` block
+   *  — the contract says the block ENDS the final message, so anything
+   *  further back is prose, and bounding the scan keeps a pathological
+   *  transcript (e.g. 50k unclosed open tags) linear in the tail, not the
+   *  whole text. */
+  handoffScanTailBytes: 262_144,
+  /** Max `PipelineRunState.capExtensions` the run-state sanitizer accepts
+   *  (and `effectiveStepCap` scales by) — a Retry only ever increments by
+   *  one, so a stored value past this is corruption, not a real run. */
+  capExtensionsMax: 100,
   /** Max length of an edge's display `label`. */
   edgeLabel: 120,
   /** Max length of a step or edge `id`. */
@@ -1453,6 +1471,16 @@ export interface Task {
    * skipped by the generic `tasks.update` SET clause, never patchable — same
    * treatment as `sentFiles`/`fxRecovery`/`agentProfileId`). Always null for
    * a task that isn't a pipeline task (`pipelineId` null).
+   *
+   * **`GET /tasks` (the board's 2s poll) ships a TRIMMED variant** of this
+   * state: every `history[].handoff` and `joins[].arrivals[].handoff` is
+   * `null` and `snapshot.profiles` is `{}` — the board/TUI/`agetor ls` only
+   * need `snapshot.graph`, `status`, `active`, `blocked`, the history
+   * outcomes and `stepCount` (step progress, blocked banner, history
+   * length), and shipping every persisted handoff for every pipeline task
+   * on every poll was unbounded payload. The full state comes from
+   * `GET /tasks/:id` or `GET /tasks/:id/pipeline`; the server's own
+   * `tasks.list()`/`tasks.get()` reads are never trimmed.
    */
   pipelineRun?: PipelineRunState | null;
   /**
@@ -4228,6 +4256,12 @@ export type GlobalEvent =
       runId: string;
       status: "succeeded" | "failed" | "cancelled" | "orphaned";
       ts: number;
+      /** Set when `taskId` is a hidden pipeline STEP task — the id of its
+       *  pipeline parent (board card). Consumers that scope toasts /
+       *  notifications / TUI rows per parent read this instead of having to
+       *  resolve the step row themselves; absent for an ordinary task (and
+       *  on events from an older core, so always read it with a fallback). */
+      pipelineParentId?: string;
     }
   | {
       kind: "column";
@@ -4243,6 +4277,9 @@ export type GlobalEvent =
        *  Unset for transitions whose reason is fully implied by the
        *  (prev, column) pair (e.g. plain success → review). */
       reason?: "api-error" | "approval" | "session-died" | "unknown-command" | "pipeline";
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive. */
+      pipelineParentId?: string;
     }
   | {
       kind: "update";
@@ -4271,6 +4308,11 @@ export type GlobalEvent =
        *  last one resolves. */
       interactionId: string;
       ts: number;
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive; the interaction registry
+       *  (`src/bun/interactions.ts`) stamps it on the request/resolved
+       *  payloads it hands the orchestrator's bridge. */
+      pipelineParentId?: string;
     }
   | {
       /**
@@ -4287,6 +4329,9 @@ export type GlobalEvent =
       caption: string | null;
       proactive: boolean;
       ts: number;
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive. */
+      pipelineParentId?: string;
     }
   | {
       /**
@@ -4333,6 +4378,9 @@ export type GlobalEvent =
       /** `FX_AUTO_RESUME_MAX` at the time this event fired. */
       max: number;
       ts: number;
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive. */
+      pipelineParentId?: string;
     }
   | {
       /**

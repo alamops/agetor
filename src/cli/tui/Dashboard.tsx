@@ -37,6 +37,43 @@ type Mode = "nav" | "compose" | "answer";
 // Surface the most actionable columns first.
 const COLUMN_ORDER = ["running", "blocked", "review", "ready", "backlog", "done"];
 
+/** One board row: the task plus its nesting depth — `1` for a pipeline step
+ *  task listed under its expanded parent, `0` for everything else. */
+export interface DashboardRow {
+  task: Task;
+  depth: 0 | 1;
+}
+
+/**
+ * Pure board-row builder for the dashboard's task list (L-CLI10). Archived
+ * tasks are dropped; hidden pipeline step tasks (`pipelineParentId` set,
+ * docs/plans/pipelines.md D11) are dropped too UNLESS their parent's id is
+ * in `expandedParents` — then they render right under that parent, at
+ * `depth: 1`, in creation order, so a step can be selected and its
+ * transcript streamed (a parent never has a transcript of its own). Top-
+ * level rows keep the actionable-columns-first `COLUMN_ORDER` sort; a step
+ * row's own column never reorders it away from its parent. Orphaned steps
+ * (parent row gone) stay hidden — there is no parent row to expand them
+ * under; `agetor ls --steps` still lists them.
+ */
+export function dashboardRows(tasks: Task[], expandedParents: ReadonlySet<string>): DashboardRow[] {
+  const live = tasks.filter((t) => t.archivedAt == null);
+  const top = live
+    .filter((t) => t.pipelineParentId == null)
+    .sort((a, b) => COLUMN_ORDER.indexOf(a.column) - COLUMN_ORDER.indexOf(b.column));
+  const rows: DashboardRow[] = [];
+  for (const t of top) {
+    rows.push({ task: t, depth: 0 });
+    if (t.pipelineId && expandedParents.has(t.id)) {
+      const steps = live
+        .filter((s) => s.pipelineParentId === t.id)
+        .sort((a, b) => a.createdAt - b.createdAt);
+      for (const s of steps) rows.push({ task: s, depth: 1 });
+    }
+  }
+  return rows;
+}
+
 export function Dashboard({
   client,
   core,
@@ -48,22 +85,20 @@ export function Dashboard({
 }) {
   const { exit } = useApp();
   const tasks = useTasks(client);
-  const sorted = useMemo(
-    () =>
-      tasks
-        // `GET /tasks` also returns hidden pipeline step tasks
-        // (`pipelineParentId` set) — docs/plans/pipelines.md D11 — hidden
-        // from the TUI dashboard by default, same as the board and `agetor
-        // ls`, since they're an implementation detail of the pipeline's
-        // parent task.
-        .filter((t) => t.archivedAt == null && t.pipelineParentId == null)
-        .sort((a, b) => COLUMN_ORDER.indexOf(a.column) - COLUMN_ORDER.indexOf(b.column)),
-    [tasks],
-  );
+  // Pipeline parents whose step rows are currently shown inline (`p`
+  // toggles) — hidden by default, same as the board and `agetor ls`, since
+  // steps are an implementation detail of the parent (D11); expanding one
+  // is the only way to reach a step's transcript from the TUI.
+  const [expandedParents, setExpandedParents] = useState<ReadonlySet<string>>(() => new Set());
+  const boardRows = useMemo(() => dashboardRows(tasks, expandedParents), [tasks, expandedParents]);
+  const sorted = useMemo(() => boardRows.map((r) => r.task), [boardRows]);
   const [rawSel, setSel] = useState(0);
   const sel = sorted.length ? Math.min(rawSel, sorted.length - 1) : 0;
   const selected = sorted[sel];
-  const events = useCoalescedStream(selected?.id ?? null, dataDir);
+  // A pipeline parent never runs an agent of its own, so its event stream
+  // is always silent — don't spend a connection on it; the detail pane
+  // explains where the transcripts live instead.
+  const events = useCoalescedStream(selected && !selected.pipelineId ? selected.id : null, dataDir);
   const [status, setStatus] = useState("");
   const [mode, setMode] = useState<Mode>("nav");
   // The compose/answer target is PINNED by id when the mode opens — the 1.5s
@@ -290,6 +325,57 @@ export function Dashboard({
       sendMessage(selected, commitPushPrompt(selected), "→ commit & push requested");
       return;
     }
+    if (input === "p" && selected) {
+      // Toggle a pipeline parent's step rows (L-CLI10). On a step row, `p`
+      // collapses its parent and moves the cursor back onto it.
+      if (selected.pipelineId) {
+        const id = selected.id;
+        setExpandedParents((prev) => {
+          const next = new Set(prev);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          return next;
+        });
+      } else if (selected.pipelineParentId) {
+        const parentId = selected.pipelineParentId;
+        setExpandedParents((prev) => {
+          const next = new Set(prev);
+          next.delete(parentId);
+          return next;
+        });
+        const parentIdx = sorted.findIndex((t) => t.id === parentId);
+        if (parentIdx >= 0) setSel(parentIdx);
+      } else {
+        setStatus("not a pipeline task");
+      }
+      return;
+    }
+    if (input === "s" && selected && selected.pipelineId) {
+      // Pipeline (parent) task — mirror what plain Run does server-side
+      // (`startPipelineRun` routes a blocked/cancelled run to retry-in-
+      // place) but call the route that names the action honestly (M-CLI2):
+      // blocked/cancelled → retry; running → point at `x`; otherwise (idle,
+      // or done — where the server answers 409 "pipeline already finished —
+      // restart it explicitly", surfaced verbatim) → start.
+      const sid = selected.id.slice(0, 8);
+      const runStatus = selected.pipelineRun?.status;
+      if (runStatus === "blocked" || runStatus === "cancelled") {
+        void client
+          .retryPipeline(selected.id)
+          .then(() => setStatus(`↻ retrying ${sid}`))
+          .catch((e) => setStatus(`! ${(e as Error).message}`));
+        return;
+      }
+      if (runControl(selected) === "stop") {
+        setStatus("running — x stops");
+        return;
+      }
+      void client
+        .startTask(selected.id)
+        .then(() => setStatus(`▸ started pipeline ${sid}`))
+        .catch((e) => setStatus(`! ${(e as Error).message}`));
+      return;
+    }
     if (input === "s" && selected) {
       const sid = selected.id.slice(0, 8);
       const ctrl = runControl(selected);
@@ -321,6 +407,17 @@ export function Dashboard({
       } else {
         setStatus(`finished — continue with: agetor send ${sid}`);
       }
+    }
+    if (input === "x" && selected && selected.pipelineId) {
+      // A pipeline parent never carries its own `runId` — stop it through
+      // the pipeline cancel route, which stops every active step execution
+      // (M-CLI2); a 409 ("pipeline is not running") surfaces verbatim.
+      const sid = selected.id.slice(0, 8);
+      void client
+        .cancelPipeline(selected.id)
+        .then(() => setStatus(`■ stopped pipeline ${sid}`))
+        .catch((e) => setStatus(`! ${(e as Error).message}`));
+      return;
     }
     if (input === "x" && selected) {
       const sid = selected.id.slice(0, 8);
@@ -384,10 +481,11 @@ export function Dashboard({
           {sorted.length === 0 ? (
             <Text dimColor>no tasks — run 'agetor add'</Text>
           ) : (
-            sorted.map((t, i) => (
+            boardRows.map((r, i) => (
               <TaskRow
-                key={t.id}
-                task={t}
+                key={r.task.id}
+                task={r.task}
+                depth={r.depth}
                 active={i === sel}
                 frame={frame}
                 now={now}
@@ -405,7 +503,12 @@ export function Dashboard({
           overflow="hidden"
         >
           {selected ? (
-            <Detail task={selected} events={visible} now={now} />
+            <Detail
+              task={selected}
+              events={visible}
+              now={now}
+              expanded={expandedParents.has(selected.id)}
+            />
           ) : (
             <Box flexDirection="column">
               <Logo maxWidth={detailWidth} />
@@ -441,7 +544,12 @@ export function Dashboard({
           />
         </Box>
       ) : null}
-      <Footer status={status} toast={toast} mode={mode} />
+      <Footer
+        status={status}
+        toast={toast}
+        mode={mode}
+        pipelineSelected={Boolean(selected && (selected.pipelineId || selected.pipelineParentId))}
+      />
     </Box>
   );
 }
@@ -464,18 +572,23 @@ function Header({ core, count }: { core: CoreInfo; count: number }) {
 
 const TaskRow = memo(function TaskRow({
   task,
+  depth = 0,
   active,
   frame,
   now,
   width,
 }: {
   task: Task;
+  /** `1` for a pipeline step row shown under its expanded parent — rendered
+   *  with a `↳ ` lead-in (two single-width cells, budgeted below). */
+  depth?: 0 | 1;
   active: boolean;
   frame: string;
   now: number;
   width: number;
 }) {
   const id = task.id.slice(0, 6);
+  const indent = depth === 1 ? "↳ " : "";
   const needs = task.pendingInteractionCount;
   // fx-pause hint (`docs/plans/fx-recovery-follow-ups.md` §2/T6), same gate
   // as the board card badge and `agetor ls`'s "needs" column: `⏸ paused (r)`
@@ -515,7 +628,7 @@ const TaskRow = memo(function TaskRow({
   // such `+1` (its "»" marker is single-width) and now sits between the
   // needs badge and the pause hint, so it must be budgeted too.
   const inner = width - 4; // border (2) + paddingX (2)
-  const prefixW = 2 + 1 + (id.length + 2);
+  const prefixW = 2 + indent.length + 1 + (id.length + 2);
   const badgeW = needs > 0 ? String(needs).length + 2 : 0;
   const pipelineW = pipelineText ? pipelineText.length + 3 : 0;
   const pauseW = pauseText ? pauseText.length + 3 + 1 : 0;
@@ -523,6 +636,7 @@ const TaskRow = memo(function TaskRow({
   return (
     <Text wrap="truncate">
       <Text color="cyan">{active ? "▸ " : "  "}</Text>
+      {indent ? <Text dimColor>{indent}</Text> : null}
       {columnGlyph(task, frame)}
       <Text dimColor> {id} </Text>
       <Text bold={active}>{truncate(task.title, titleMax)}</Text>
@@ -533,7 +647,18 @@ const TaskRow = memo(function TaskRow({
   );
 });
 
-function Detail({ task, events, now }: { task: Task; events: RunEvent[]; now: number }) {
+function Detail({
+  task,
+  events,
+  now,
+  expanded,
+}: {
+  task: Task;
+  events: RunEvent[];
+  now: number;
+  /** Whether this (pipeline parent) task's step rows are currently shown. */
+  expanded: boolean;
+}) {
   // One pass over the visible window pairs every `SendUserFile` tool_use
   // with its (possibly not-yet-arrived) tool_result and formats the result
   // as a PRIMITIVE per event — never a Map. `events` (the `visible` slice in
@@ -585,7 +710,18 @@ function Detail({ task, events, now }: { task: Task; events: RunEvent[]; now: nu
         ) : null}
       </Text>
       <Box flexDirection="column" marginTop={1}>
-        {events.length === 0 ? (
+        {task.pipelineId ? (
+          // A pipeline parent never runs an agent of its own — its steps
+          // do — so instead of a silent "no events yet" pane, say where the
+          // transcripts live (the TUI mirror of `agetor logs`'s
+          // `pipelineLogsHint`, L-CLI10).
+          <Text dimColor wrap="wrap">
+            pipeline task — {task.pipelineRun ? `${pipelineStepProgress(task.pipelineRun).label} · ` : ""}
+            {expanded
+              ? "select a ↳ step row below it to watch that step's transcript (p hides them)"
+              : "press p to list its step tasks, then select one to watch its transcript"}
+          </Text>
+        ) : events.length === 0 ? (
           <Text dimColor>no events yet</Text>
         ) : (
           events.map((e) => (
@@ -866,17 +1002,25 @@ function Footer({
   status,
   toast,
   mode,
+  pipelineSelected,
 }: {
   status: string;
   toast: Toast | null;
   mode: Mode;
+  /** The cursor sits on a pipeline parent or one of its step rows — the
+   *  only rows where `p` does anything. The legend then swaps the fx-only
+   *  `r resume` (meaningless on a pipeline row) for `p steps` rather than
+   *  growing: the legend and the status line share one 100-column row in
+   *  narrow terminals (and ink-testing-library's fake stdout), and a longer
+   *  legend would push a short status onto a wrapped second line. */
+  pipelineSelected: boolean;
 }) {
   const hint =
     mode === "compose"
       ? "type a message · enter send · esc cancel"
       : mode === "answer"
         ? "↑/↓ move · space toggle · enter submit · esc cancel"
-        : "↑/↓ select · s run · x stop · m msg · c commit · g answer · r resume · q quit";
+        : `↑/↓ select · s run · x stop · m msg · c commit · g answer · ${pipelineSelected ? "p steps" : "r resume"} · q quit`;
   return (
     <Box justifyContent="space-between" paddingX={1}>
       <Text dimColor>{hint}</Text>

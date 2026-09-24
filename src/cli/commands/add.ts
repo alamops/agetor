@@ -282,6 +282,12 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   let unresolvedRefsWarning: string[] = [];
 
   let started = false;
+  // A failed start (e.g. a pipeline whose step profile was deleted, a
+  // logged-out harness, a missing binary) used to be swallowed into a bare
+  // `started: false` — the task exists, so the add itself isn't a failure,
+  // but the reason must reach the user (L-CLI9): a plain `! start failed:`
+  // line, or a `warnings` entry under --json.
+  let startError: string | null = null;
   if (o.start) {
     try {
       const startRes = await client.startTask(task.id);
@@ -290,8 +296,9 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
         const extensionNames = await discoveredExtensionNames(client, task);
         unresolvedRefsWarning = filterUnresolvedRefs(startRes.unresolvedRefs, { extensionNames, restrictTo });
       }
-    } catch {
+    } catch (e) {
       started = false;
+      startError = `start failed: ${(e as Error)?.message ?? String(e)}`;
     }
   } else if (restrictTo !== "" && input.prompt.includes("@")) {
     // Task wasn't started, so there's no server-side send-time expansion to
@@ -356,7 +363,7 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   }
 
   if (flags.json) {
-    const warnings = [issueWarning, unresolvedWarningLine(unresolvedRefsWarning)].filter(
+    const warnings = [issueWarning, unresolvedWarningLine(unresolvedRefsWarning), startError].filter(
       (w): w is string => Boolean(w),
     );
     return printJson(warnings.length ? { task, started, warnings } : { task, started });
@@ -365,6 +372,7 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     `${c.green("✓")} created ${c.dim(task.id.slice(0, 8))} — ${task.title}` +
       (started ? c.cyan("  ▸ started") : ""),
   );
+  if (startError) out(c.yellow(`  ! ${startError}`));
   warnUnresolvedRefs(unresolvedRefsWarning);
   if (!started) out(c.dim(`  start it: agetor start ${task.id.slice(0, 8)}`));
 }

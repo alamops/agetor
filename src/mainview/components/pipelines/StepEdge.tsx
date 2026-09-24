@@ -46,6 +46,7 @@ function StepEdgeImpl({
   markerEnd,
   style,
   data,
+  selected,
 }: EdgeProps<StepFlowEdgeType>) {
   const [edgePath, labelX, labelY] = getBezierPath({
     sourceX,
@@ -101,9 +102,15 @@ function StepEdgeImpl({
         // `animate-pipeline-dash` keyframes (which only animate
         // `stroke-dashoffset`) to visibly "march" — see M13.
         strokeDasharray={visual === "flowing" ? "6 6" : undefined}
-        className={cn(STROKE_CLASSES[visual])}
+        // The visual-state strokes are `!important` (they have to beat React
+        // Flow's own `.react-flow__edge-path` rule), which also beat the
+        // library's selected-edge stroke — so a clicked edge in the editor
+        // looked exactly like an unselected one. Paint selection ourselves,
+        // last, so it wins.
+        className={cn(STROKE_CLASSES[visual], selected && "!stroke-primary")}
         data-testid="pipeline-step-edge"
         data-visual={visual}
+        data-selected={selected ? "true" : undefined}
       />
       {data?.token && (
         // `cx`/`cy` stay at the origin — `<animateMotion>` offsets FROM
@@ -130,7 +137,10 @@ function StepEdgeImpl({
               position: "absolute",
               transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
             }}
-            className="pointer-events-auto flex items-center gap-1 rounded-full border border-border bg-card px-1.5 py-0.5 text-[10px] text-muted-foreground shadow-sm"
+            // `nopan nodrag`: React Flow's opt-out classes — a press on the
+            // pill (its × button, or just the label) must not start a pane
+            // pan / a node drag underneath it.
+            className="nopan nodrag pointer-events-auto flex items-center gap-1 rounded-full border border-border bg-card px-1.5 py-0.5 text-[10px] text-muted-foreground shadow-sm"
           >
             {data?.label && <span className="max-w-24 truncate">{data.label}</span>}
             {data?.onDelete && !data?.readOnly && (

@@ -144,10 +144,104 @@ function escapeHandoffMarkerPhrases(text: string): string {
     .replaceAll("END untrusted handoff", "END-untrusted-handoff");
 }
 
-const HANDOFF_BLOCK_RE = new RegExp(
-  `<${HANDOFF_TAG}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/\\s*${HANDOFF_TAG}\\s*>`,
-  "gi",
-);
+const HANDOFF_OPEN_PREFIX = `<${HANDOFF_TAG}`;
+
+/** ASCII/Unicode whitespace as JS's `\s` regex class sees it — the linear
+ *  handoff scanner below must agree with the old regex's `\s` for the
+ *  "whitespace around the close tag" tolerance. */
+function isWs(ch: string | undefined): boolean {
+  return ch !== undefined && /\s/.test(ch);
+}
+
+/** Match `</\s*handoff\s*>` at `p` (which must point at a `</`) in the
+ *  lower-cased text — returns the index just past the `>` or `-1`. Cost is
+ *  the two whitespace runs plus the tag name, never more. */
+function matchCloseTagAt(lower: string, p: number): number {
+  let i = p + 2;
+  while (isWs(lower[i])) i++;
+  if (!lower.startsWith(HANDOFF_TAG, i)) return -1;
+  i += HANDOFF_TAG.length;
+  while (isWs(lower[i])) i++;
+  return lower[i] === ">" ? i + 1 : -1;
+}
+
+/** First `</\s*handoff\s*>` at or after `from` — `{start, end}` or `null`.
+ *  Linear: every `</` candidate is checked once and the search resumes past
+ *  it, so a run of `</` + whitespace is walked exactly once. */
+function findCloseTag(lower: string, from: number): { start: number; end: number } | null {
+  let p = from;
+  for (;;) {
+    const at = lower.indexOf("</", p);
+    if (at === -1) return null;
+    const end = matchCloseTagAt(lower, at);
+    if (end !== -1) return { start: at, end };
+    p = at + 2;
+  }
+}
+
+/**
+ * Locate the LAST complete `<handoff …>…</handoff>` block in `text` and
+ * return its inner text — the linear replacement for the old global regex
+ * `<handoff(?:\s[^>]*)?>([\s\S]*?)<\/\s*handoff\s*>` (H2): that
+ * pattern's lazy body made a transcript with N unclosed open tags cost
+ * O(N × text) — 50k `<handoff>` opens in ~500 KB took seconds — because
+ * every open re-scanned to the end looking for a close that wasn't there.
+ *
+ * Semantics preserved exactly: the same non-overlapping forward tokenization
+ * the regex's `exec` loop did — an open tag (attributes allowed up to the
+ * next `>`, `<handoffx>` is not an open tag) pairs with the FIRST close tag
+ * after it, the scan resumes after that close, and the last such pair wins
+ * (so an earlier complete block followed by an unclosed draft yields the
+ * earlier block, and a nested `<handoff><handoff>{…}</handoff></handoff>`
+ * pairs the outer open with the inner close, leaving `{…}` to the
+ * brace-balanced fallback). Two things bound the work: only the trailing
+ * `PIPELINE_LIMITS.handoffScanTailBytes` code units of `text` are scanned
+ * at all (the contract says the block ENDS the final message, so anything
+ * further back is prose — a block whose open tag sits beyond that tail is
+ * not found), and the "first `>` after an open" lookup is memoized so a run
+ * of `<handoff ` false-opens with no `>` is walked once, not once per
+ * candidate.
+ */
+function findLastHandoffBlock(text: string): string | null {
+  const tail = text.length > PIPELINE_LIMITS.handoffScanTailBytes
+    ? text.slice(text.length - PIPELINE_LIMITS.handoffScanTailBytes)
+    : text;
+  const lower = tail.toLowerCase();
+  let cursor = 0;
+  let last: string | null = null;
+  // Memoized "first `>` at or after i" — valid for any i in [gtFrom, gt]
+  // (or any i >= gtFrom when gt === -1: no `>` remains at all).
+  let gtFrom = -1;
+  let gt = -1;
+  const firstGtAfter = (i: number): number => {
+    if (gtFrom !== -1 && i >= gtFrom && (gt === -1 || i <= gt)) return gt;
+    gtFrom = i;
+    gt = lower.indexOf(">", i);
+    return gt;
+  };
+  for (;;) {
+    const open = lower.indexOf(HANDOFF_OPEN_PREFIX, cursor);
+    if (open === -1) break;
+    const afterName = open + HANDOFF_OPEN_PREFIX.length;
+    const next = lower[afterName];
+    let openEnd: number;
+    if (next === ">") {
+      openEnd = afterName + 1;
+    } else if (isWs(next)) {
+      const g = firstGtAfter(afterName);
+      if (g === -1) break; // an open tag whose attributes never close — nothing after it can match either
+      openEnd = g + 1;
+    } else {
+      cursor = open + 1; // `<handoffx…` — not an open tag
+      continue;
+    }
+    const close = findCloseTag(lower, openEnd);
+    if (close === null) break; // no close after this open → no later open can have one either
+    last = tail.slice(openEnd, close.start);
+    cursor = close.end;
+  }
+  return last;
+}
 
 function isFiniteNumber(x: unknown): x is number {
   return typeof x === "number" && Number.isFinite(x);
@@ -166,6 +260,24 @@ function clampPosition(x: unknown): number {
 
 function isPlainObject(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null && !Array.isArray(x);
+}
+
+/** C0 controls (incl. tab/newline/CR) and DEL — rejected in every
+ *  identifier-ish pipeline string (step name, step/edge id, edge label,
+ *  pipeline name): they render invisibly or reflow the composed prompt and
+ *  the run view, and a step name is quoted into the agent's `next` rule
+ *  verbatim. Exported so the `/pipelines` routes and the db layer apply the
+ *  identical rule to the pipeline's own name. */
+export const PIPELINE_CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
+
+/** The key two step names are compared under for uniqueness, and the key
+ *  `resolveNextSteps` matches a handoff's `next` against a step name / edge
+ *  label with: trimmed, internal whitespace runs collapsed, NFC-normalized
+ *  (so a precomposed `é` and `e`+combining-acute compare equal), lower-cased.
+ *  Shared by both so the validator's "unique" and the resolver's "matches"
+ *  can never disagree. */
+export function stepNameKey(s: string): string {
+  return s.trim().replace(/\s+/g, " ").normalize("NFC").toLowerCase();
 }
 
 function dedupeStrings(arr: string[]): string[] {
@@ -228,15 +340,23 @@ export function validatePipelineGraph(
     const id = typeof rawStep.id === "string" && rawStep.id.length > 0 ? rawStep.id : null;
     if (id === null) return { ok: false, error: "each step must have a non-empty id" };
     if (id.length > PIPELINE_LIMITS.id) return { ok: false, error: `step id "${id}" exceeds ${PIPELINE_LIMITS.id} chars` };
+    if (PIPELINE_CONTROL_CHAR_RE.test(id)) return { ok: false, error: "step ids must not contain control characters" };
     if (seenIds.has(id)) return { ok: false, error: `duplicate step id "${id}"` };
     seenIds.add(id);
 
-    const name = typeof rawStep.name === "string" ? rawStep.name.trim() : "";
+    const rawName = typeof rawStep.name === "string" ? rawStep.name : "";
+    if (PIPELINE_CONTROL_CHAR_RE.test(rawName)) {
+      return { ok: false, error: `step "${id}" name must not contain control characters` };
+    }
+    // Trim + collapse internal whitespace runs to one space — stored that
+    // way too, so the name the editor shows is the name uniqueness and
+    // `next` matching are decided on.
+    const name = rawName.trim().replace(/\s+/g, " ");
     if (name.length === 0) return { ok: false, error: `step "${id}" has an empty name` };
     if (name.length > PIPELINE_LIMITS.stepName) {
       return { ok: false, error: `step "${name}" name exceeds ${PIPELINE_LIMITS.stepName} chars` };
     }
-    const nameKey = name.toLowerCase();
+    const nameKey = stepNameKey(name);
     if (seenNames.has(nameKey)) return { ok: false, error: `duplicate step name "${name}"` };
     seenNames.add(nameKey);
 
@@ -249,6 +369,9 @@ export function validatePipelineGraph(
       typeof rawStep.agentProfileId === "string" && rawStep.agentProfileId.length > 0
         ? rawStep.agentProfileId
         : null;
+    if (agentProfileId !== null && agentProfileId.length > PIPELINE_LIMITS.id) {
+      return { ok: false, error: `step "${name}" agentProfileId exceeds ${PIPELINE_LIMITS.id} chars` };
+    }
 
     const rawPos = isPlainObject(rawStep.position) ? rawStep.position : {};
     const position = {
@@ -261,6 +384,9 @@ export function validatePipelineGraph(
     const profileIds = dedupeStrings(
       profileIdsRaw.filter((x): x is string => typeof x === "string" && x.length > 0),
     );
+    if (profileIds.some((pid) => pid.length > PIPELINE_LIMITS.id)) {
+      return { ok: false, error: `step "${name}" subagents.profileIds entry exceeds ${PIPELINE_LIMITS.id} chars` };
+    }
     if (profileIds.length > PIPELINE_LIMITS.subagentProfiles) {
       return {
         ok: false,
@@ -299,8 +425,10 @@ export function validatePipelineGraph(
   }
 
   const stepIds = new Set(steps.map((s) => s.id));
+  const stepById = new Map(steps.map((s) => [s.id, s] as const));
   const edges: PipelineEdge[] = [];
   const seenPairs = new Set<string>();
+  const seenEdgeIds = new Set<string>();
 
   for (const rawEdge of rawEdges) {
     if (!isPlainObject(rawEdge)) return { ok: false, error: "each edge must be an object" };
@@ -308,6 +436,9 @@ export function validatePipelineGraph(
     const id = typeof rawEdge.id === "string" && rawEdge.id.length > 0 ? rawEdge.id : null;
     if (id === null) return { ok: false, error: "each edge must have a non-empty id" };
     if (id.length > PIPELINE_LIMITS.id) return { ok: false, error: `edge id "${id}" exceeds ${PIPELINE_LIMITS.id} chars` };
+    if (PIPELINE_CONTROL_CHAR_RE.test(id)) return { ok: false, error: "edge ids must not contain control characters" };
+    if (seenEdgeIds.has(id)) return { ok: false, error: `duplicate edge id "${id}"` };
+    seenEdgeIds.add(id);
 
     const from = typeof rawEdge.from === "string" ? rawEdge.from : "";
     const to = typeof rawEdge.to === "string" ? rawEdge.to : "";
@@ -325,7 +456,52 @@ export function validatePipelineGraph(
     if (label.length > PIPELINE_LIMITS.edgeLabel) {
       return { ok: false, error: `edge "${id}" label exceeds ${PIPELINE_LIMITS.edgeLabel} chars` };
     }
+    if (PIPELINE_CONTROL_CHAR_RE.test(label)) {
+      return { ok: false, error: `edge "${id}" label must not contain control characters` };
+    }
     edges.push({ id, from, to, label });
+  }
+
+  // Outgoing-edge labels are a `next` matching tier (`resolveNextSteps`):
+  // two labels on the same source that compare equal, or a label that
+  // spells the NAME of a different target of that same source, would make
+  // the agent's answer resolve to two steps — reject up front rather than
+  // let the run block on an ambiguous handoff later.
+  const labelsBySource = new Map<string, Map<string, PipelineEdge>>();
+  for (const edge of edges) {
+    if (edge.label.trim().length === 0) continue;
+    const key = stepNameKey(edge.label);
+    let seen = labelsBySource.get(edge.from);
+    if (!seen) {
+      seen = new Map();
+      labelsBySource.set(edge.from, seen);
+    }
+    const clash = seen.get(key);
+    if (clash) {
+      const fromName = stepById.get(edge.from)?.name ?? edge.from;
+      return {
+        ok: false,
+        error: `step "${fromName}" has two outgoing edges labeled "${edge.label}" (edges "${clash.id}" and "${edge.id}")`,
+      };
+    }
+    seen.set(key, edge);
+  }
+  for (const edge of edges) {
+    if (edge.label.trim().length === 0) continue;
+    const key = stepNameKey(edge.label);
+    for (const sibling of edges) {
+      if (sibling.from !== edge.from || sibling.to === edge.to) continue;
+      const siblingTarget = stepById.get(sibling.to);
+      if (siblingTarget && stepNameKey(siblingTarget.name) === key) {
+        const fromName = stepById.get(edge.from)?.name ?? edge.from;
+        return {
+          ok: false,
+          error:
+            `edge "${edge.id}" from step "${fromName}" is labeled "${edge.label}", which is also the name of ` +
+            `its sibling target "${siblingTarget.name}" — the agent's "next" answer would be ambiguous`,
+        };
+      }
+    }
   }
 
   let startStepId: string | null = null;
@@ -419,17 +595,90 @@ function extractBalancedObject(text: string): string | null {
   return null;
 }
 
-function capField(s: string): string {
-  return s.length > PIPELINE_LIMITS.handoffField ? s.slice(0, PIPELINE_LIMITS.handoffField) : s;
+/** Cut `s` to at most `max` UTF-16 code units WITHOUT splitting a surrogate
+ *  pair: when the cut would land between a high and a low surrogate, back
+ *  off one unit so the result stays well-formed (an astral character — an
+ *  emoji, a CJK extension ideograph — is either kept whole or dropped). */
+function capField(s: string, max: number = PIPELINE_LIMITS.handoffField): string {
+  if (s.length <= max) return s;
+  let cut = max;
+  const hi = s.charCodeAt(cut - 1);
+  if (hi >= 0xd800 && hi <= 0xdbff) cut--;
+  return s.slice(0, cut);
 }
 
 function capArray(arr: string[]): string[] {
   return arr.slice(0, PIPELINE_LIMITS.handoffArray);
 }
 
+/** Keep only the string entries, each capped at `handoffField` like every
+ *  other string field — an array element is as attacker-shaped as
+ *  `summary` is, and used to ride through uncapped. */
 function toStringArray(x: unknown): string[] {
   if (!Array.isArray(x)) return [];
-  return x.filter((v): v is string => typeof v === "string");
+  return x.filter((v): v is string => typeof v === "string").map((v) => capField(v));
+}
+
+const utf8Encoder = new TextEncoder();
+
+function utf8Bytes(s: string): number {
+  return utf8Encoder.encode(s).length;
+}
+
+/** UTF-8 bytes one array entry contributes to the handoff's JSON — its
+ *  quoted/escaped form plus the separating comma. */
+function entryBytes(entry: string): number {
+  return utf8Bytes(JSON.stringify(entry)) + 1;
+}
+
+/**
+ * Shrink an already field/array-capped handoff in place until its JSON fits
+ * `PIPELINE_LIMITS.handoffTotalBytes`: array entries go first (popped from
+ * the end of whichever of `openQuestions`/`artifacts` is longer, so both
+ * keep their head), then the string fields (the longest one is cut by the
+ * remaining overage each round — since one UTF-16 unit is at least one
+ * UTF-8 byte, a cut of `overage` units removes at least `overage` bytes, so
+ * this converges in a handful of rounds). `next` is trimmed last of all,
+ * since it's what routes the run.
+ */
+function fitHandoffToBudget(handoff: Handoff): void {
+  const budget = PIPELINE_LIMITS.handoffTotalBytes;
+  let bytes = utf8Bytes(JSON.stringify(handoff));
+  if (bytes <= budget) return;
+
+  while (bytes > budget && (handoff.openQuestions.length > 0 || handoff.artifacts.length > 0)) {
+    const arr = handoff.openQuestions.length >= handoff.artifacts.length ? handoff.openQuestions : handoff.artifacts;
+    const dropped = arr.pop()!;
+    bytes -= entryBytes(dropped);
+  }
+  if (bytes <= budget) return;
+
+  bytes = utf8Bytes(JSON.stringify(handoff));
+  const fields = ["summary", "reason", "purpose"] as const;
+  for (let round = 0; round < 16 && bytes > budget; round++) {
+    let longest: (typeof fields)[number] | "next" | null = null;
+    let longestLen = 0;
+    for (const f of fields) {
+      if (handoff[f].length > longestLen) {
+        longest = f;
+        longestLen = handoff[f].length;
+      }
+    }
+    if (longest === null && handoff.next !== null && handoff.next.length > 0) {
+      longest = "next";
+      longestLen = handoff.next.length;
+    }
+    if (longest === null) return; // nothing left to shrink — the base object itself fits by construction
+    const overage = bytes - budget;
+    const keep = Math.max(0, longestLen - overage);
+    if (longest === "next") {
+      const cut = capField(handoff.next ?? "", keep);
+      handoff.next = cut.length === 0 ? null : cut;
+    } else {
+      handoff[longest] = capField(handoff[longest], keep);
+    }
+    bytes = utf8Bytes(JSON.stringify(handoff));
+  }
 }
 
 function normalizeNext(x: unknown): string | null {
@@ -440,11 +689,17 @@ function normalizeNext(x: unknown): string | null {
 
 /**
  * Normalize an arbitrary (already-`JSON.parse`d, or otherwise untrusted)
- * value into a well-formed {@link Handoff}: every string field capped at
- * `PIPELINE_LIMITS.handoffField` chars and every array at
- * `PIPELINE_LIMITS.handoffArray` entries, missing fields defaulted to `""` /
- * `null` / `[]`, and `status` kept only when it's exactly `"done"` or
- * `"blocked"`. A non-object `input` (including `null`/arrays/primitives)
+ * value into a well-formed {@link Handoff}: every string field — including
+ * every `artifacts`/`openQuestions` ELEMENT — capped at
+ * `PIPELINE_LIMITS.handoffField` UTF-16 units (never splitting a surrogate
+ * pair), every array at `PIPELINE_LIMITS.handoffArray` entries, and the
+ * whole object's JSON bounded by `PIPELINE_LIMITS.handoffTotalBytes` (arrays
+ * trimmed first, then fields — see `fitHandoffToBudget`), so what lands in
+ * a persisted run state has a hard size bound. Missing fields default to
+ * `""` / `null` / `[]`, and `status` is kept only when it's exactly `"done"`
+ * or `"blocked"`. Only own, known keys are read (a `__proto__` or
+ * `constructor` key in the input is ignored, never assigned — the result is
+ * always a fresh plain object). A non-object `input` (including `null`/arrays/primitives)
  * normalizes to the same all-defaults shape with `status` left `undefined` —
  * this never throws. {@link parseHandoff} calls this after extracting and
  * `JSON.parse`ing a step's `<handoff>` block; it's exported separately so
@@ -463,6 +718,7 @@ export function normalizeHandoff(input: unknown): Handoff {
     openQuestions: capArray(toStringArray(parsed.openQuestions)),
   };
   if (parsed.status === "done" || parsed.status === "blocked") handoff.status = parsed.status;
+  fitHandoffToBudget(handoff);
   return handoff;
 }
 
@@ -474,28 +730,20 @@ export function normalizeHandoff(input: unknown): Handoff {
  * exists). The inner text is stripped of an optional ```json/``` fence, then
  * `JSON.parse`d; on failure, a brace-balanced `{…}` slice starting at the
  * first `{` is tried as a fallback (recovers from stray prose around an
- * otherwise-valid object). Every string field is capped at
- * `PIPELINE_LIMITS.handoffField` chars and every array at
- * `PIPELINE_LIMITS.handoffArray` entries; missing fields default to `""` /
- * `null` / `[]` as documented on {@link Handoff}.
+ * otherwise-valid object). The result goes through {@link normalizeHandoff}
+ * (per-field, per-element, per-array and whole-object caps; defaults).
+ * Only the trailing `PIPELINE_LIMITS.handoffScanTailBytes` code units of
+ * `text` are scanned — see `findLastHandoffBlock`.
  *
  * Returns `{ok:false, error, raw:null}` when no `<handoff>` tag is found at
  * all, or `{ok:false, error, raw:<inner text>}` when a tag was found but its
  * contents couldn't be parsed as an object.
  */
 export function parseHandoff(text: string): { ok: true; handoff: Handoff } | { ok: false; error: string; raw: string | null } {
-  HANDOFF_BLOCK_RE.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  let last: RegExpExecArray | null = null;
-  while ((match = HANDOFF_BLOCK_RE.exec(text)) !== null) {
-    last = match;
-    // Guard against a zero-width match looping forever (can't happen with
-    // this pattern, but cheap insurance against a future edit that adds one).
-    if (match[0].length === 0) HANDOFF_BLOCK_RE.lastIndex++;
-  }
-  if (last === null) return { ok: false, error: "no <handoff> block found", raw: null };
+  const block = findLastHandoffBlock(text);
+  if (block === null) return { ok: false, error: "no <handoff> block found", raw: null };
 
-  const inner = stripCodeFence(last[1] ?? "");
+  const inner = stripCodeFence(block);
 
   let parsed: unknown;
   try {
@@ -602,10 +850,13 @@ export function renderHandoffFile(input: { fromStepName: string; seq: number; ha
  * (deduplicated) regardless of `handoff.next`. Otherwise (`"choose"`): zero
  * outgoing edges is terminal; exactly one outgoing edge is taken
  * unconditionally (`next` is ignored); with several, `handoff.next` (trimmed,
- * case-insensitive) is matched against a target step's name, then its id
- * (exact), then the connecting edge's label — no `next` is `"ambiguous"`, a
- * `next` that matches nothing is `"unknown"`. Both failure kinds report
- * `candidates` as the outgoing steps' names, in edge order.
+ * whitespace-collapsed, NFC-normalized, case-insensitive — {@link
+ * stepNameKey}) is matched against a target step's name, then its id
+ * (exact), then the connecting edge's label — no `next` is `"ambiguous"`,
+ * MORE THAN ONE match at the same tier is `"ambiguous"` too (a graph that
+ * predates the validator's duplicate-label rule), and a `next` that matches
+ * nothing is `"unknown"`. Both failure kinds report `candidates` as the
+ * outgoing steps' names, in edge order.
  */
 export function resolveNextSteps(
   g: PipelineGraph,
@@ -634,13 +885,17 @@ export function resolveNextSteps(
   const next = handoff?.next?.trim();
   if (!next) return { kind: "ambiguous", candidates };
 
-  const nextLower = next.toLowerCase();
-  const byName = outgoing.find((o) => o.step.name.trim().toLowerCase() === nextLower);
-  if (byName) return { kind: "steps", stepIds: [byName.step.id] };
-  const byId = outgoing.find((o) => o.step.id === next);
-  if (byId) return { kind: "steps", stepIds: [byId.step.id] };
-  const byLabel = outgoing.find((o) => o.edge.label.trim().toLowerCase() === nextLower);
-  if (byLabel) return { kind: "steps", stepIds: [byLabel.step.id] };
+  const nextKey = stepNameKey(next);
+  const tiers: ((o: { step: PipelineStep; edge: PipelineEdge }) => boolean)[] = [
+    (o) => stepNameKey(o.step.name) === nextKey,
+    (o) => o.step.id === next,
+    (o) => stepNameKey(o.edge.label) === nextKey,
+  ];
+  for (const matches of tiers) {
+    const hits = dedupeStrings(outgoing.filter(matches).map((o) => o.step.id));
+    if (hits.length === 1) return { kind: "steps", stepIds: hits };
+    if (hits.length > 1) return { kind: "ambiguous", candidates };
+  }
 
   return { kind: "unknown", next, candidates };
 }
@@ -660,6 +915,11 @@ export function deriveRunStatus(run: PipelineRunState): PipelineRunStatus {
   return "done";
 }
 
+/** Upper bound of {@link effectiveStepCap}: the largest `maxSteps` a
+ *  pipeline can store, extended the most times a run-state sanitizer will
+ *  ever accept. */
+export const EFFECTIVE_STEP_CAP_MAX = PIPELINE_LIMITS.maxStepsMax * (1 + PIPELINE_LIMITS.capExtensionsMax);
+
 /**
  * The effective step-execution cap for a run: `snapshot.maxSteps` scaled by
  * how many times a `step-cap` block has been extended via Retry
@@ -668,13 +928,25 @@ export function deriveRunStatus(run: PipelineRunState): PipelineRunStatus {
  * of the original: `maxSteps * (1 + capExtensions)` (one extension is 2x
  * `maxSteps`, two extensions is 3x, not 4x). Falls back to
  * `PIPELINE_LIMITS.maxStepsDefault` when the run has no snapshot yet
- * (nothing has started, so there's no captured `maxSteps` to scale).
+ * (nothing has started, so there's no captured `maxSteps` to scale). The
+ * inputs are clamped defensively — `maxSteps` into
+ * `1..PIPELINE_LIMITS.maxStepsMax`, `capExtensions` into
+ * `0..PIPELINE_LIMITS.capExtensionsMax` (integers; a non-finite value reads
+ * as the default / 0) — so the result is always a finite integer no larger
+ * than {@link EFFECTIVE_STEP_CAP_MAX}.
  */
 export function effectiveStepCap(run: PipelineRunState): number {
-  const maxSteps = run.snapshot?.maxSteps ?? PIPELINE_LIMITS.maxStepsDefault;
-  const capExtensions = run.capExtensions ?? 0;
-  return maxSteps * (1 + capExtensions);
+  const rawMax = run.snapshot?.maxSteps;
+  const maxSteps = isFiniteNumber(rawMax)
+    ? Math.max(1, Math.min(PIPELINE_LIMITS.maxStepsMax, Math.trunc(rawMax)))
+    : PIPELINE_LIMITS.maxStepsDefault;
+  const rawExt = run.capExtensions;
+  const capExtensions = isFiniteNumber(rawExt)
+    ? Math.max(0, Math.min(PIPELINE_LIMITS.capExtensionsMax, Math.trunc(rawExt)))
+    : 0;
+  return Math.min(EFFECTIVE_STEP_CAP_MAX, maxSteps * (1 + capExtensions));
 }
+
 
 /**
  * The handoff schema + `next`-field rule, rendered identically wherever a
@@ -710,7 +982,10 @@ function nextRuleText(outgoing: { name: string; label: string }[], transition: "
     return `The next step is "${name}"; set "next" to "${name}".`;
   }
   const list = outgoing.map((o) => (o.label.trim().length > 0 ? `${o.name} (${o.label})` : o.name)).join(", ");
-  return `Choose exactly one next step by name: ${list} — and put that name in "next".`;
+  return (
+    `Choose exactly one next step: ${list} — put its name, or the edge label shown in parentheses after it, ` +
+    'in "next".'
+  );
 }
 
 const SUBAGENT_INSTRUCTIONS_PREVIEW_MAX = 2000;

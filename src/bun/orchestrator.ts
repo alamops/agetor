@@ -44,6 +44,7 @@ import {
   cascadePipelineDelete,
   initialPipelineRunState,
   startPipelineRun,
+  tombstonedPipelineParents,
   withPipelineLock,
 } from "./pipeline-runner.ts";
 
@@ -384,8 +385,57 @@ export function subscribeGlobal(fn: GlobalListener): () => void {
   return () => globalListeners.delete(fn);
 }
 
+/** `GlobalEvent` kinds that carry a per-task `taskId` and get stamped with
+ *  the task's `pipelineParentId` (when it's a hidden pipeline step row) so
+ *  consumers — the webview's toast/notification gates, the CLI's `--notify`,
+ *  the TUI — can scope a step's own lifecycle noise to its parent without a
+ *  DB round-trip of their own. `pipeline` events already name the parent as
+ *  their `taskId`, and `update` carries no task at all. */
+const PIPELINE_PARENT_STAMPED_KINDS = new Set<GlobalEvent["kind"]>([
+  "run-status",
+  "column",
+  "interaction",
+  "files-sent",
+  "fx-auto-resume",
+]);
+
+/** The pipeline parent id of a hidden step task, or `undefined` for an
+ *  ordinary task (including a pipeline PARENT — `pipelineParentId` is only
+ *  ever set on a step row). A cheap single-row read; the field is written
+ *  exactly once, at insert, so there's nothing to invalidate. */
+function stepParentOf(taskId: string): string | undefined {
+  return tasks.get(taskId)?.pipelineParentId ?? undefined;
+}
+
+/** Stamp `pipelineParentId` onto a per-task event (see
+ *  {@link PIPELINE_PARENT_STAMPED_KINDS}) unless the emitter already set it
+ *  (interactions.ts stamps its own `interaction` events). Built with
+ *  `Object.assign` rather than an object-literal spread so this compiles the
+ *  same whether or not the union member declares the optional field. */
+function stampPipelineParent(e: GlobalEvent): GlobalEvent {
+  if (!PIPELINE_PARENT_STAMPED_KINDS.has(e.kind) || !("taskId" in e)) return e;
+  if ((e as { pipelineParentId?: string }).pipelineParentId !== undefined) return e;
+  const pipelineParentId = stepParentOf(e.taskId);
+  if (pipelineParentId === undefined) return e;
+  return Object.assign({}, e, { pipelineParentId }) as GlobalEvent;
+}
+
+/** Fan an app-wide lifecycle event out to every subscriber. Each listener
+ *  is isolated (L-R8): a throw inside one — the pipeline runner's own
+ *  `handleRunStatus`/`handleColumnChange` dispatch, the SSE bridge, a test
+ *  hook — is logged and must never skip the listeners after it, nor unwind
+ *  into the emitter (the done handler's `noteFxRunSettled` and the four
+ *  `drain*Queue` calls run AFTER its `emitGlobal`, and would be silently
+ *  skipped otherwise). */
 function emitGlobal(e: GlobalEvent) {
-  for (const fn of globalListeners) fn(e);
+  const stamped = stampPipelineParent(e);
+  for (const fn of globalListeners) {
+    try {
+      fn(stamped);
+    } catch (err) {
+      console.error(`[agetor] global event listener threw on ${stamped.kind}:`, err);
+    }
+  }
 }
 
 /**
@@ -474,7 +524,11 @@ function isTaskHeldByBackgroundAgents(task: Task): boolean {
   return subagents.hasRunning(task.id);
 }
 
-function isHeldByBackgroundAgents(taskId: string): boolean {
+/** Exported for `pipeline-runner.ts` (M-R3): a step task whose turn
+ *  succeeded but whose background subagents are still running has NOT
+ *  settled as far as the pipeline is concerned — the runner keeps that
+ *  execution active until `maybeReleaseHeldTask` releases it. */
+export function isHeldByBackgroundAgents(taskId: string): boolean {
   const task = tasks.get(taskId);
   return task ? isTaskHeldByBackgroundAgents(task) : false;
 }
@@ -585,6 +639,9 @@ export function wireInteractionBroadcast(): void {
       state: "pending",
       interactionId: req.id,
       ts: req.createdAt,
+      // Forwarded off the request itself (interactions.ts stamps it at
+      // registration); `emitGlobal`'s own stamp only fills it when absent.
+      ...(req.pipelineParentId ? { pipelineParentId: req.pipelineParentId } : {}),
     });
   });
 
@@ -610,6 +667,7 @@ export function wireInteractionBroadcast(): void {
       state: "resolved",
       interactionId: res.id,
       ts: Date.now(),
+      ...(res.pipelineParentId ? { pipelineParentId: res.pipelineParentId } : {}),
     });
   });
 }
@@ -957,8 +1015,19 @@ async function spawnAgentOrFail(
     const { runId, taskId, onChunk } = args;
     const message = err instanceof Error ? err.message : String(err);
     onChunk("stderr", `failed to start agent: ${message}`);
+    // H1: capture "was this the task's current run" BEFORE the row update
+    // below clears `runId`, so the terminal `run-status` emit can be gated on
+    // exactly the condition the done handler's own `isTerminalRun` uses. No
+    // done handler will ever fire for this run (the agent never registered),
+    // so this is the ONLY terminal signal a subscriber — the pipeline
+    // runner, the UI's toasts — gets for a spawn that never started; without
+    // it a pipeline step whose spawn threw sat `running` forever.
+    const wasCurrentRun = tasks.get(taskId)?.runId === runId;
     runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
     tasks.update(taskId, { column: "ready", runId: null });
+    if (wasCurrentRun) {
+      emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now() });
+    }
     return { agent: null, message };
   }
 }
@@ -1104,6 +1173,11 @@ async function consumePendingCancel(
   if (tasks.get(taskId)?.runId === runId) {
     onChunk("status", "cancelled by user before the agent launched");
     updateColumn(taskId, runId, "ready");
+    // H1: no done handler will ever fire for this run (it never registered),
+    // so emit the terminal transition here — gated exactly like the done
+    // handler's `isTerminalRun` — or a pipeline step stopped mid-spawn would
+    // never reach the runner and its run would sit `running` forever.
+    emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
   }
   return true;
 }
@@ -1202,7 +1276,16 @@ export function agentProfileSnapshotDrifted(
 export function isTaskRunLive(taskId: string): boolean {
   if (startingTaskIds.has(taskId)) return true;
   const task = tasks.get(taskId);
-  return !!(task?.runId && active.has(task.runId));
+  if (!task) return false;
+  if (task.runId && active.has(task.runId)) return true;
+  // M-R3: a HELD task (terminal run succeeded, background subagents still
+  // running, card parked in `running` by the done handler) has no `active`
+  // handle, but its work genuinely isn't finished — `cancelRun` still has
+  // something to stop (`stopHeldTask`), and the pipeline runner must not
+  // Retry/Advance past it or advance the graph off its handoff until
+  // `maybeReleaseHeldTask` lets it go. Same DB-derived predicate the done
+  // handler and `cancelRun` already agree on.
+  return isTaskHeldByBackgroundAgents(task);
 }
 
 /**
@@ -1611,6 +1694,15 @@ async function startTaskInner(
           // latest) and say why nothing ran.
           spawnArgs.onChunk("status", "cancelled by user before the agent launched");
           updateColumn(taskId, runId, "ready");
+        }
+        // H1: this run never registers, so no done handler will ever emit
+        // its terminal transition — do it here whenever the run is still the
+        // task's current one (a user Stop, or a force-archive during the
+        // pending window), gated exactly like the done handler's
+        // `isTerminalRun`. A delete/replace (`fresh.runId !== runId`) is not
+        // terminal for the task and stays silent, as before.
+        if (fresh && fresh.runId === runId) {
+          emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
         }
         return { ok: true as const };
       }
@@ -3181,6 +3273,19 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   // still be removing this task's worktree — let it finish before the
   // existsSync check decides whether a restore is needed.
   await pendingTeardown(row.task_id);
+
+  // M-R5: a worktree-isolated pipeline step task shares its parent's worktree
+  // (D2) — the same refusal `startTaskInner`'s M6 guard makes. Restoring it
+  // from a follow-up send would hand this ONE step a private checkout
+  // (`prepareWorkdir`'s materialize branch) instead of the shared one; only
+  // the pipeline task's own Run/Retry re-materializes it.
+  if (
+    task.pipelineParentId
+    && task.isolation === "worktree"
+    && (!task.worktreePath || !existsSync(task.worktreePath))
+  ) {
+    return { delivered: false, reason: "step task's worktree is missing — run the pipeline task instead" };
+  }
 
   if (task.worktreePath && !existsSync(task.worktreePath)) {
     // Re-fetch so the restore sees the just-cleared archivedAt (prepareWorkdir
@@ -5490,6 +5595,11 @@ async function spawnResumedSessionInner(
           onChunk("status", "cancelled by user before the agent launched");
           updateColumn(taskId, newRunId, "ready");
         }
+        // H1: same terminal emit as `startTaskInner`'s continuation — this
+        // run never registers, so nothing else will ever announce it.
+        if (fresh && fresh.runId === newRunId) {
+          emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
+        }
         return;
       }
 
@@ -6292,7 +6402,17 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     console.warn(`[agetor] refusing to delete pipeline step task ${taskId} directly — delete the pipeline task ${task.pipelineParentId} instead`);
     return;
   }
-  if (task.pipelineId) {
+  // M-R7: `cascadePipelineDelete` tombstones the parent id FIRST (so a
+  // racing launch bails) — but a throw anywhere between that tombstone and
+  // the `tasks.delete` at the bottom (a step delete, a teardown, the issue
+  // snapshot removal) would otherwise leave a still-existing parent row
+  // permanently tombstoned: every later Run/Retry/Advance on it refused with
+  // "pipeline task no longer exists" while the card sat on the board. Undo
+  // the tombstone on any such throw and re-raise, so the parent stays
+  // launchable and the user can simply retry the delete.
+  const isPipelineParent = task.pipelineId != null;
+  try {
+  if (isPipelineParent) {
     // M7: run under this parent's `withPipelineLock` so the cascade can't
     // interleave its per-step delete calls with a live settle/advance event
     // (pipeline-runner.ts's own `runExclusive`) racing to read-modify-write
@@ -6356,6 +6476,10 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     console.warn(`[agetor] failed to remove issue thread snapshot dir for task ${taskId}:`, e);
   }
   tasks.delete(taskId);
+  } catch (err) {
+    if (isPipelineParent) tombstonedPipelineParents.delete(taskId);
+    throw err;
+  }
 }
 
 /**

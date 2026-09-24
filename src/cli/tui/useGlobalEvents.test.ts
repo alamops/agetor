@@ -37,6 +37,17 @@ test("toastFor: hiddenTaskIds suppresses run-status and blocked-column toasts fo
   ).toBeNull();
 });
 
+// Cross-agent contract (a): the event's own `pipelineParentId` stamp hides
+// it even when the dashboard's `hiddenTaskIds` set hasn't caught up (a step
+// that settled before its row was ever polled).
+test("toastFor: an event stamped with pipelineParentId is suppressed even when hiddenTaskIds doesn't know the task", () => {
+  const stamped = { kind: "run-status", taskId: ID, runId: "r", status: "failed", ts: 1, pipelineParentId: "parent-1" } as unknown as GlobalEvent;
+  expect(toastFor(stamped, new Set())).toBeNull();
+  expect(toastFor(stamped)).toBeNull();
+  const blocked = { kind: "column", taskId: ID, runId: "r", column: "blocked", prev: "running", ts: 1, pipelineParentId: "parent-1" } as unknown as GlobalEvent;
+  expect(toastFor(blocked)).toBeNull();
+});
+
 test("toastFor: hiddenTaskIds doesn't affect other tasks' toasts", () => {
   const hidden = new Set(["some-other-task"]);
   expect(toastFor({ kind: "run-status", taskId: ID, runId: "r", status: "succeeded", ts: 1 }, hidden)?.color).toBe(

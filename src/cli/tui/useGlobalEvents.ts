@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { streamSse } from "../sse.ts";
 import type { GlobalEvent } from "../../shared/types.ts";
+import { eventPipelineParentId } from "../notify.ts";
 
 export interface Toast {
   text: string;
@@ -54,15 +55,20 @@ export function useGlobalEvents(dataDir?: string, hiddenTaskIds?: ReadonlySet<st
 
 export function toastFor(e: GlobalEvent, hiddenTaskIds?: ReadonlySet<string>): Toast | null {
   const short = (id: string) => id.slice(0, 8);
+  // Hidden pipeline step task — the parent's own events cover it. The
+  // event's own `pipelineParentId` stamp is consulted FIRST so a step that
+  // settles before the dashboard ever polled its row is still hidden; the
+  // `hiddenTaskIds` lookup is the fallback for an older core.
+  const hidden = (taskId: string) => eventPipelineParentId(e) !== null || hiddenTaskIds?.has(taskId) === true;
   if (e.kind === "run-status") {
-    if (hiddenTaskIds?.has(e.taskId)) return null; // hidden pipeline step task — the parent's own events cover it
+    if (hidden(e.taskId)) return null;
     if (e.status === "succeeded") return { text: `✓ ${short(e.taskId)} succeeded`, color: "green" };
     if (e.status === "failed") return { text: `✗ ${short(e.taskId)} failed`, color: "red" };
     if (e.status === "orphaned") return { text: `… ${short(e.taskId)} orphaned`, color: "yellow" };
     return null; // cancelled — no toast (the user did it)
   }
   if (e.kind === "column" && e.column === "blocked") {
-    if (hiddenTaskIds?.has(e.taskId)) return null; // ditto
+    if (hidden(e.taskId)) return null;
     const why = e.reason === "api-error" ? " (API error)" : "";
     return { text: `! ${short(e.taskId)} needs you${why}`, color: "yellow" };
   }
