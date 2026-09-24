@@ -608,10 +608,8 @@ test.describe("agent profiles", () => {
     await panel.getByRole("button", { name: "Close task details" }).click();
     await expect
       .poll(
-        async () => {
-          if ((await backdrop.count()) === 0) return true;
-          return (await backdrop.evaluate((el) => getComputedStyle(el).pointerEvents)) === "none";
-        },
+        async () =>
+          backdrop.evaluateAll((els) => els.length === 0 || els.every((el) => getComputedStyle(el).pointerEvents === "none")),
         { message: "expected the run panel backdrop to go inert or unmount" },
       )
       .toBe(true);

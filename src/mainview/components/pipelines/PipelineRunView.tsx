@@ -252,7 +252,7 @@ function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } |
  */
 export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents }: PipelineRunViewProps) {
   const { resolved } = useTheme();
-  const { profiles: liveProfiles } = useAgentProfiles();
+  const { profiles: liveProfiles, loaded: liveProfilesLoaded } = useAgentProfiles();
   const confirm = useConfirm();
 
   const [task, setTask] = useState<Task | null>(null);
@@ -564,10 +564,13 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
       const snapshotProfile = runRef.current?.snapshot?.profiles[agentProfileId] ?? null;
       if (snapshotProfile) return { profile: snapshotProfile, profileDeleted: false };
       const liveProfile = liveProfiles.find((p) => p.id === agentProfileId) ?? null;
-      return { profile: liveProfile, profileDeleted: !liveProfile };
+      // "Deleted" is only a verdict once the live list has actually loaded —
+      // before that there is nothing to compare against (same rule as
+      // `resolveTaskProfileDisplay`'s null-list case).
+      return { profile: liveProfile, profileDeleted: liveProfilesLoaded && !liveProfile };
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- snapshotCapturedAt stands in for runRef.current.snapshot (frozen per run, read via the ref).
-    [snapshotCapturedAt, liveProfiles],
+    [snapshotCapturedAt, liveProfiles, liveProfilesLoaded],
   );
 
   const canvasContextValue = useMemo<PipelineCanvasContextValue>(

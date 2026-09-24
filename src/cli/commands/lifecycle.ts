@@ -28,7 +28,7 @@ export async function cmdStart(args: string[], flags: Flags): Promise<void> {
     if (task.pipelineId) {
       throw new Error(
         `pipeline is already ${task.column === "blocked" ? "blocked" : "running"} — stop it with ` +
-          `'agetor pipeline cancel ${short}', or retry its blocked/cancelled step(s) with ` +
+          `'agetor cancel ${short}', or retry its blocked/cancelled step(s) with ` +
           `'agetor pipeline retry ${short}'`,
       );
     }

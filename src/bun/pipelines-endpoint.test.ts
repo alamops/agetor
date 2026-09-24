@@ -765,6 +765,19 @@ test("POST /tasks/:id/pipeline/retry with a non-string taskId → 400", async ()
   expect(res.status).toBe(400);
 });
 
+test("POST /tasks/:id/pipeline/retry with an empty-string taskId → 400", async () => {
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const task = await createTask({ pipelineId: pipeline.id });
+
+  const res = await call(`/tasks/${task.id}/pipeline/retry`, {
+    method: "POST",
+    body: JSON.stringify({ taskId: "   " }),
+  });
+  expect(res.status).toBe(400);
+  expect(((await res.json()) as { error: string }).error).toBe("taskId must be a non-empty string");
+});
+
 test("POST /tasks/:id/pipeline/retry with no body at all → treated as {} (not a 400)", async () => {
   const profile = await createProfile();
   const pipeline = await createPipeline(profile.id);
@@ -925,6 +938,22 @@ test("DELETE /tasks/:id on an orphaned pipeline step (parent row gone) is allowe
 
   const getRes = await call(`/tasks/${step.id}`);
   expect(getRes.status).toBe(404);
+}, 20_000);
+
+test("POST /tasks/:id/unarchive on a (non-orphaned) pipeline step → 409, same as archive", async () => {
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const parent = await createTask({ pipelineId: pipeline.id, workdir: WORKDIR, isolation: "none" });
+
+  const startRes = await call(`/tasks/${parent.id}/start`, { method: "POST" });
+  expect(startRes.status).toBe(200);
+  const { steps } = await waitForSteps(parent.id);
+  const step = steps[0]!;
+  await waitForPipelineSettled(parent.id);
+
+  const res = await call(`/tasks/${step.id}/unarchive`, { method: "POST" });
+  expect(res.status).toBe(409);
+  expect(((await res.json()) as { error: string }).error).toBe("step task belongs to a pipeline — act on the pipeline task");
 }, 20_000);
 
 test("POST /tasks/:id/archive on an orphaned pipeline step (parent row gone) is allowed", async () => {

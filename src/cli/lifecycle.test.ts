@@ -142,13 +142,13 @@ test("cmdCancel: a plain task that isn't running throws 'task is not running'", 
 
 // ── cmdStart ─────────────────────────────────────────────────────────────
 
-test("cmdStart: a running pipeline (parent) task's error points at `agetor pipeline cancel|retry`, not cancel/answer/send", async () => {
+test("cmdStart: a running pipeline (parent) task's error points at `agetor cancel` / `agetor pipeline retry`, not cancel/answer/send", async () => {
   const parent = makeTask({ id: "parent-1", pipelineId: "pipe-1", column: "running", runId: null });
   const { client, startTaskCalls } = makeClient([parent]);
   currentClient = client;
 
   await expect(cmdStart(["parent-1"], flags)).rejects.toThrow(
-    /pipeline is already running — stop it with 'agetor pipeline cancel parent-1', or retry .* 'agetor pipeline retry parent-1'/,
+    /pipeline is already running — stop it with 'agetor cancel parent-1', or retry .* 'agetor pipeline retry parent-1'/,
   );
   expect(startTaskCalls).toEqual([]);
 });

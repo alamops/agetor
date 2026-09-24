@@ -957,6 +957,11 @@ const BRANCH_STOP_RESOLVE_DELAY_MS = "10000";
 
 test.describe("pipelines run: stopping one fan-out branch", () => {
   test.use({ backendEnv: { AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: BRANCH_STOP_RESOLVE_DELAY_MS } });
+  // Three fake turns of BRANCH_STOP_RESOLVE_DELAY_MS each (A, then the B/C
+  // fan-out) plus the settle round-trips already exceed the default 30 s
+  // budget under parallel-run load — the sibling C's "done" is the last
+  // thing asserted and lands ~25 s in on a quiet machine.
+  test.setTimeout(90_000);
 
   test("Stop on one branch's step task records a 'was stopped' block; the run reads Blocked while the sibling finishes", async ({
     page,

@@ -125,11 +125,8 @@ async function closeTaskPanel(page: Page, panel: Locator): Promise<void> {
   // `e2e/fx-recovery.spec.ts` / `e2e/run-panel-header.spec.ts`.
   await expect
     .poll(
-      async () => {
-        if ((await backdrop.count()) === 0) return true;
-        const pe = await backdrop.evaluate((el) => getComputedStyle(el).pointerEvents).catch(() => null);
-        return pe === "none" || pe === null;
-      },
+      async () =>
+        backdrop.evaluateAll((els) => els.length === 0 || els.every((el) => getComputedStyle(el).pointerEvents === "none")),
       { timeout: 10_000, message: "task panel did not close" },
     )
     .toBe(true);

@@ -372,11 +372,14 @@ export function autoLayout(graph: PipelineGraph, opts: AutoLayoutOptions = {}): 
   const steps = graph.steps.map((step) => {
     const pos = g.node(step.id) as { x: number; y: number } | undefined;
     if (!pos) return step;
-    // dagre centres each node on (x, y) within the footprint it was given;
-    // the step card itself sits at the footprint's top-left, with any
-    // satellites hanging below it.
-    const footprint = stepLayoutFootprint(step, cardFor(step));
-    return { ...step, position: { x: pos.x - footprint.width / 2, y: pos.y - footprint.height / 2 } };
+    // dagre centres each node on (x, y) within the footprint it was given.
+    // Satellites are laid out centred UNDER the card (`subagentSatellitePosition`),
+    // so a footprint wider than the card must centre the card horizontally
+    // inside it — otherwise the satellite rows overhang the reserved area on
+    // one side. Vertically the card sits at the footprint's top.
+    const card = cardFor(step);
+    const footprint = stepLayoutFootprint(step, card);
+    return { ...step, position: { x: pos.x - card.width / 2, y: pos.y - footprint.height / 2 } };
   });
 
   return { ...graph, steps };

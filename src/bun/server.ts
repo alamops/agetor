@@ -4658,6 +4658,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/unarchive": {
         POST: authed(async (req) => {
+          // Same pipeline-step guard as archive above: a step row's
+          // archive/unarchive lifecycle belongs to its pipeline parent, and
+          // an orphaned step (parent row gone) is the one exemption.
+          const existing = tasks.get(req.params.id);
+          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+            return json(
+              { error: "step task belongs to a pipeline — act on the pipeline task" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
           server.timeout(req, 0);
           const result = await unarchiveTask(req.params.id);
           return "error" in result
@@ -4760,8 +4770,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
           let taskId: string | undefined;
           if (body.taskId !== undefined) {
-            if (typeof body.taskId !== "string") {
-              return json({ error: "taskId must be a string" }, { status: 400, headers: corsHeaders(req) });
+            if (typeof body.taskId !== "string" || body.taskId.trim() === "") {
+              return json({ error: "taskId must be a non-empty string" }, { status: 400, headers: corsHeaders(req) });
             }
             taskId = body.taskId;
           }
