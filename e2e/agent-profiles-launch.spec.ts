@@ -117,7 +117,22 @@ async function reloadApp(page: Page): Promise<void> {
 async function closeTaskPanel(page: Page, panel: Locator): Promise<void> {
   const backdrop = page.getByRole("button", { name: "Close task panel" });
   await panel.getByRole("button", { name: "Close task details" }).click();
-  await expect(backdrop).toHaveCSS("pointer-events", "none");
+  // The panel slides out and then UNMOUNTS once its exit animation ends
+  // (`if (!mountedTask) return null` in RunPanel) — the backdrop button goes
+  // with it. A bare `toHaveCSS` on the backdrop races that unmount under
+  // load ("element(s) not found"), so "closed" is either state: the backdrop
+  // is inert (sliding out), or it is gone. Same idiom as
+  // `e2e/fx-recovery.spec.ts` / `e2e/run-panel-header.spec.ts`.
+  await expect
+    .poll(
+      async () => {
+        if ((await backdrop.count()) === 0) return true;
+        const pe = await backdrop.evaluate((el) => getComputedStyle(el).pointerEvents).catch(() => null);
+        return pe === "none" || pe === null;
+      },
+      { timeout: 10_000, message: "task panel did not close" },
+    )
+    .toBe(true);
 }
 
 /** Opens Settings and switches to the Agents section (mirrors
