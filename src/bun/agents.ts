@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";import { cursorModelArg, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness } from "../shared/types.ts";
 import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
+import { HANDOFF_TAG } from "../shared/pipeline.ts";
 import { GEMINI_PROMPT_ARGV_MAX_BYTES } from "../shared/prompt-limits.ts";
 import { settleSubagentById } from "./claude-subagents.ts";
 import {
@@ -12,7 +13,8 @@ import {
   type SpawnedAgent,
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
-import { spawnCursorViaTmux } from "./cursor-tmux.ts";import { dataDir, subagents as subagentsDb } from "./db.ts";
+import { spawnCursorViaTmux } from "./cursor-tmux.ts";
+import { dataDir, subagents as subagentsDb, tasks } from "./db.ts";
 import { spawnFxViaAcp, type FxMode } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
 import { answerFxPermission, registerFxPermission } from "./interactions.ts";
@@ -858,6 +860,163 @@ export function __getFakeDriver(taskId: string): FakeDriverInstance | undefined 
 export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
 
 /**
+ * Prompt-marker trigger for the pipeline-handoff fake-driver scenario (see
+ * `makeFakeAgent` below and `docs/plans/pipelines.md` §3/T3) — same
+ * rationale as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER}: `pipeline-runner.ts`
+ * composes each step's prompt server-side (`composeStepPrompt`), so a test
+ * drives this scenario by putting the marker in a step's `instructions`
+ * field, never via a process-wide env var. An optional `:<token>` suffix
+ * selects the outcome — `done` (or no suffix) ⇒ a valid terminal handoff,
+ * `missing` ⇒ no `<handoff>` tag at all, `invalid` ⇒ a `<handoff>` tag whose
+ * body isn't valid JSON, anything else ⇒ that literal token as the
+ * handoff's `next` field (picking a named outgoing step). The **last**
+ * occurrence in the prompt wins (`lastFakeHandoffSuffix` below) — the
+ * overall goal text can carry a default suffix that a step's own
+ * instructions override. This "last occurrence wins" rule is resolved
+ * against whichever prompt actually carries the marker — see the two-turn
+ * suffixes below for what happens when the CURRENT turn's prompt carries no
+ * marker at all.
+ *
+ * Two-turn suffixes: `missing-then-done` and `invalid-then-done` behave like
+ * `missing`/`invalid` on the task's FIRST fake-driver turn and like `done`
+ * (a valid terminal handoff) on every turn after that; more generally
+ * `missing-then-<token>` / `invalid-then-<token>` behave like `missing`/
+ * `invalid` on turn 1 and like plain `<token>` (a `next`-field pick, or
+ * `done`) on turn 2+. These exist because the pipeline runner sends ONE
+ * automatic reminder — an ordinary follow-up `sendInput` turn on the step
+ * task — when a step's reply lacked a valid `<handoff>`; that reminder text
+ * never carries this marker itself. A per-task turn counter
+ * (`fakeHandoffTurnCounts` below) tracks which turn a given taskId is on,
+ * and when the CURRENT turn's `prompt` carries no marker at all (true for
+ * that reminder, and for any other marker-less follow-up), the driver falls
+ * back to the marker in the task's own stored `prompt` (its original,
+ * turn-1 text — via `tasks.get`) so the scenario still resolves the same way
+ * across the whole conversation, not just its first turn.
+ */
+export const FAKE_CLAUDE_HANDOFF_PROMPT_MARKER = "__agetor_fake_claude_handoff__";
+/** No regex-special characters appear in {@link FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}
+ *  (letters/underscores only), so it's safe to splice directly into a
+ *  pattern without escaping — mirrors {@link FAKE_CLAUDE_MONITOR_PROMPT_MARKER}'s
+ *  own suffix regex below. */
+const FAKE_CLAUDE_HANDOFF_SUFFIX_RE = new RegExp(`${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}(?::([\\w-]+))?`, "g");
+
+/**
+ * Companion to {@link FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}: when a pipeline
+ * step's prompt ALSO carries this marker, the fake handoff turn first
+ * "spawns" one subagent — a `subagents` row inserted directly, exactly like
+ * the Monitor scenario does (this fake driver writes no session JSONL for
+ * `claude-subagents.ts` to discover it from) — keeps it `running` for
+ * `:<ms>` (default {@link FAKE_CLAUDE_SUBAGENT_DEFAULT_RUN_MS}), settles it
+ * `completed`, and only THEN emits the handoff and resolves the turn (the
+ * orchestrator's `subagents.hasRunning` hold would otherwise keep the step
+ * `running` past the turn). The optional `[<description>]` sets the row's
+ * `description` — the run view attributes a live subagent to a configured
+ * persona by name (`matchSubagentToProfile`), so a test names the persona
+ * there: `__agetor_fake_claude_subagent__:4500[Helper One: review tests]`.
+ * Exported for `e2e/pipelines-run.spec.ts`, which keeps a literal copy.
+ */
+export const FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER = "__agetor_fake_claude_subagent__";
+export const FAKE_CLAUDE_SUBAGENT_DEFAULT_RUN_MS = 1500;
+const FAKE_CLAUDE_SUBAGENT_MIN_RUN_MS = 50;
+const FAKE_CLAUDE_SUBAGENT_RE = new RegExp(
+  `${FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER}(?::(\\d+))?(?:\\[([^\\]\\n]+)\\])?`,
+);
+/** Parse the LAST subagent marker in `prompt` (a step's own instructions win
+ *  over the goal text, same rule as `lastFakeHandoffSuffix`). */
+function parseFakeSubagentMarker(prompt: string): { runMs: number; description: string } | null {
+  const idx = prompt.lastIndexOf(FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER);
+  if (idx === -1) return null;
+  const m = FAKE_CLAUDE_SUBAGENT_RE.exec(prompt.slice(idx));
+  const parsed = m?.[1] ? Number(m[1]) : NaN;
+  const runMs = Number.isFinite(parsed) ? Math.max(FAKE_CLAUDE_SUBAGENT_MIN_RUN_MS, parsed) : FAKE_CLAUDE_SUBAGENT_DEFAULT_RUN_MS;
+  const description = m?.[2]?.trim() || "Fake subagent";
+  return { runMs, description };
+}
+/** Find the LAST occurrence of {@link FAKE_CLAUDE_HANDOFF_PROMPT_MARKER} in
+ *  `prompt` and return its optional `:<token>` suffix (letters/digits/-/_ ;
+ *  stops at whitespace/`:`), or `null` when the marker carries no suffix
+ *  (bare `done` behavior) or isn't present at all. */
+function lastFakeHandoffSuffix(prompt: string): string | null {
+  FAKE_CLAUDE_HANDOFF_SUFFIX_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let last: RegExpExecArray | null = null;
+  while ((match = FAKE_CLAUDE_HANDOFF_SUFFIX_RE.exec(prompt)) !== null) {
+    last = match;
+    if (match[0].length === 0) FAKE_CLAUDE_HANDOFF_SUFFIX_RE.lastIndex++;
+  }
+  return last ? (last[1] ?? null) : null;
+}
+
+/**
+ * Resolve which prompt text the handoff scenario should read its marker
+ * from for this spawn: the CURRENT turn's `prompt` when it carries the
+ * marker itself (the normal case — the first turn of a step, or any
+ * marker-carrying follow-up a test sends directly), else the task's own
+ * stored (turn-1) `prompt` when THAT carries the marker (the pipeline
+ * runner's automatic "no handoff found" reminder, and any other
+ * marker-less follow-up) — via a direct `tasks.get` import, safe because
+ * `db.ts` has no import of `agents.ts` in its own chain (no cycle). Returns
+ * `null` when neither carries the marker at all, i.e. this isn't a handoff
+ * scenario.
+ */
+function resolveFakeHandoffPromptSource(taskId: string, prompt: string): string | null {
+  if (prompt.includes(FAKE_CLAUDE_HANDOFF_PROMPT_MARKER)) return prompt;
+  const stored = tasks.get(taskId)?.prompt;
+  if (stored && stored.includes(FAKE_CLAUDE_HANDOFF_PROMPT_MARKER)) return stored;
+  return null;
+}
+
+/**
+ * Per-task turn counter for the handoff scenario only, bumped once per fake
+ * spawn that actually enters the handoff branch below (see
+ * `resolveFakeHandoffPromptSource`) — this is what lets `missing-then-done`
+ * / `invalid-then-done` (and `missing-then-<token>` / `invalid-then-<token>`)
+ * distinguish a task's first turn from every turn after it. Never cleared on
+ * `kill()` (a cancelled turn still counts as having happened — the counter
+ * isn't a "successful turns" count), and never explicitly cleared on task
+ * delete either (not observable from here); instead capped at
+ * `FAKE_HANDOFF_TURN_MAP_CAP` entries with FIFO eviction of the
+ * oldest-inserted taskId so a long-running test process can't leak memory
+ * across many short-lived fake tasks.
+ */
+const fakeHandoffTurnCounts = new Map<string, number>();
+const FAKE_HANDOFF_TURN_MAP_CAP = 1000;
+function bumpFakeHandoffTurn(taskId: string): number {
+  const isNewKey = !fakeHandoffTurnCounts.has(taskId);
+  const next = (fakeHandoffTurnCounts.get(taskId) ?? 0) + 1;
+  if (isNewKey && fakeHandoffTurnCounts.size >= FAKE_HANDOFF_TURN_MAP_CAP) {
+    const oldestKey = fakeHandoffTurnCounts.keys().next().value;
+    if (oldestKey !== undefined) fakeHandoffTurnCounts.delete(oldestKey);
+  }
+  fakeHandoffTurnCounts.set(taskId, next);
+  return next;
+}
+
+/**
+ * Two-turn suffix regex: `(missing|invalid)-then-<token>` where `<token>` is
+ * itself a valid ordinary suffix (letters/digits/-/_). Matches
+ * `missing-then-done`, `invalid-then-done`, and `missing-then-<StepName>`
+ * alike — `<token>` is used verbatim, same as a plain suffix would be.
+ */
+const FAKE_HANDOFF_TWO_TURN_RE = /^(missing|invalid)-then-(.+)$/;
+/**
+ * Resolve the raw suffix (from `lastFakeHandoffSuffix`) plus the current
+ * turn number into the EFFECTIVE suffix `makeFakeAgent`'s handoff branch
+ * should act on: an ordinary suffix (or no suffix) is turn-invariant and
+ * passes through unchanged; a two-turn suffix resolves to the "then"
+ * behavior — `missing`/`invalid` — on turn 1, and to the token after
+ * `-then-` on every later turn.
+ */
+function resolveFakeHandoffTurnSuffix(rawSuffix: string | null, turn: number): string | null {
+  if (!rawSuffix) return rawSuffix;
+  const match = FAKE_HANDOFF_TWO_TURN_RE.exec(rawSuffix);
+  if (!match) return rawSuffix;
+  const firstTurnBehavior: string = match[1] ?? rawSuffix;
+  const laterToken: string = match[2] ?? rawSuffix;
+  return turn <= 1 ? firstTurnBehavior : laterToken;
+}
+
+/**
  * Prompt-marker trigger for the `SendUserFile` fake-driver scenario (see
  * `makeFakeAgent` below): a substring in the *prompt* rather than an env var,
  * same rationale as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER} above — the e2e
@@ -1235,6 +1394,116 @@ function makeFakeAgent(
       );
     });
     after(resolveDelayMs, () => { resolveDone(0); });
+  } else if (resolveFakeHandoffPromptSource(taskId, prompt) !== null) {
+    // Test hook: simulate a pipeline step's turn ending with a `<handoff>`
+    // block (see docs/plans/pipelines.md D3, `src/shared/pipeline.ts`'s
+    // `parseHandoff`) so `pipeline-runner.test.ts` can drive the runner's
+    // settle/resolve/join logic end to end without a real claude CLI.
+    // Checked after the api-error/session-died/unknown-command branches
+    // above (this fake driver has no reason to special-case pipeline
+    // handoffs ahead of those three — they're mutually exclusive env-var
+    // toggles, this is a prompt-marker), but before every OTHER marker
+    // branch further down, so it wins if a test prompt somehow carries more
+    // than one marker. The marker is read from the CURRENT turn's `prompt`
+    // when it carries one, else from the task's own stored (turn-1) prompt
+    // (`resolveFakeHandoffPromptSource`) — this is what lets a pipeline's
+    // automatic "no handoff found" reminder turn (a plain follow-up
+    // `sendInput` line with no marker of its own) still resolve against the
+    // scenario the step's ORIGINAL prompt selected. `lastFakeHandoffSuffix`
+    // then finds the LAST occurrence of the marker in THAT source prompt (a
+    // step's own instructions can override a default the overall goal text
+    // carries) and extracts its optional `:<token>` suffix — `done` (or no
+    // suffix) emits a valid terminal handoff, `missing` emits prose with no
+    // `<handoff>` tag at all, `invalid` emits a `<handoff>` tag whose body
+    // isn't valid JSON, `missing-then-<token>` / `invalid-then-<token>`
+    // behave like `missing`/`invalid` on this task's first fake-driver turn
+    // and like plain `<token>` (e.g. `done`, or a named outgoing step) on
+    // every turn after that — `bumpFakeHandoffTurn`/
+    // `resolveFakeHandoffTurnSuffix` resolve the two-turn form against a
+    // per-task turn counter — and any other plain token is used verbatim as
+    // the handoff's `next` field (a `"choose"`-transition step picking a
+    // named outgoing step). `AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS` (same env
+    // var the api-error/session-died/unknown-command branches above already
+    // read) widens the window between "assistant text landed" and "turn
+    // resolved" — lets a test (`cancelRun`/`cancelPipelineRun` mid-step)
+    // reliably fire a Stop while the step is still genuinely `running`.
+    // Defaults to 30ms, same as this branch's original fixed delay.
+    const handoffPromptSource = resolveFakeHandoffPromptSource(taskId, prompt) as string;
+    const turn = bumpFakeHandoffTurn(taskId);
+    const suffix = resolveFakeHandoffTurnSuffix(lastFakeHandoffSuffix(handoffPromptSource), turn);
+    // A `FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER` in the same source prompt (turn
+    // 1 only — a real agent spawns its helpers while doing the work, not on
+    // a reminder round-trip) adds a "spawned a subagent" phase ahead of the
+    // handoff: the row runs for `runMs`, then settles, and the handoff +
+    // resolve are pushed out past that settle so the orchestrator's
+    // subagent hold never outlives the turn.
+    const subagentSpec = turn <= 1 ? parseFakeSubagentMarker(handoffPromptSource) : null;
+    const baseResolveDelayMs = Math.max(20, Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 30) || 30);
+    const resolveDelayMs = subagentSpec ? Math.max(baseResolveDelayMs, subagentSpec.runMs + 60) : baseResolveDelayMs;
+    after(5, () => onChunk("status", "fake: working"));
+    if (subagentSpec) {
+      // Keyed on the RUN (same reasoning as the Monitor scenario's id):
+      // `insertIfAbsent` is INSERT OR IGNORE, so a task-keyed id would
+      // collide with a previous run's already-completed row on a re-run.
+      const subagentId = `fake-subagent-${fakeOpts.runId ?? taskId}`;
+      after(8, () => {
+        onChunk(
+          "tool_use",
+          JSON.stringify({
+            id: "fake-subagent-1",
+            name: "Agent",
+            input: { subagent_type: "general-purpose", description: subagentSpec.description, prompt: "do the delegated part" },
+            serverSide: false,
+          }),
+          "fake-subagent-1-tu",
+        );
+        subagentsDb.insertIfAbsent({
+          id: subagentId,
+          taskId,
+          runId: fakeOpts.runId ?? null,
+          parentKind: "subagent",
+          agentType: "general-purpose",
+          description: subagentSpec.description,
+          spawnDepth: 1,
+          sourcePath: "",
+          toolUseId: "fake-subagent-1",
+          status: "running",
+          startedAt: Date.now(),
+          endedAt: null,
+        });
+        record.push(`subagent:spawned:${subagentId}`);
+      });
+      after(8 + subagentSpec.runMs, () => {
+        settleSubagentById(subagentId, "completed", "receipt");
+        onChunk(
+          "tool_result",
+          JSON.stringify({ toolUseId: "fake-subagent-1", content: "delegated part done", isError: false }),
+          "fake-subagent-1-tr",
+        );
+        record.push(`subagent:settled:${subagentId}`);
+      });
+    }
+    after(subagentSpec ? subagentSpec.runMs + 30 : Math.min(20, resolveDelayMs - 10), () => {
+      if (suffix === "missing") {
+        onChunk("assistant", "I finished the work but forgot the handoff.");
+      } else if (suffix === "invalid") {
+        onChunk("assistant", `Done.\n<${HANDOFF_TAG}>\n{not json\n</${HANDOFF_TAG}>`);
+      } else {
+        const next = suffix && suffix !== "done" ? suffix : null;
+        const handoff = {
+          schemaVersion: 1,
+          purpose: "fake purpose",
+          summary: `fake summary for ${suffix ?? "step"}`,
+          reason: "fake reason",
+          next,
+          artifacts: [] as string[],
+          openQuestions: [] as string[],
+          status: "done" as const,
+        };
+        onChunk("assistant", `Done.\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`);
+      }
+    });
+    after(resolveDelayMs, () => { onChunk("status", "turn complete"); resolveDone(0); });
   } else if (
     process.env.AGETOR_FAKE_CLAUDE_TODOS === "1"
     || prompt.includes(FAKE_CLAUDE_TODOS_PROMPT_MARKER)

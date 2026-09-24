@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles } from "./db.ts";
+import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles, pipelines } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
 import { checkHarness, upgradeHintFor } from "./agent-status.ts";
@@ -38,6 +38,15 @@ import {
 } from "../shared/types.ts";
 import { cliVersionSatisfies, formatMinCliVersionError } from "../shared/cli-version.ts";
 import { isFxRecoveryResumable, parseFxAutoResumePrefs, parseFxRecoveryPayload } from "../shared/fx-recovery.ts";
+import { resolveStartStep } from "../shared/pipeline.ts";
+import {
+  cascadePipelineArchive,
+  cascadePipelineDelete,
+  initialPipelineRunState,
+  startPipelineRun,
+  tombstonedPipelineParents,
+  withPipelineLock,
+} from "./pipeline-runner.ts";
 
 /**
  * Resolve a task's harness id to its full row (falling back to a synthetic
@@ -138,6 +147,7 @@ import type {
   ColumnId,
   FxRecoveryPayload,
   GlobalEvent,
+  Pipeline,
   RunEvent,
   RunStatus,
   SentFileEntry,
@@ -375,8 +385,57 @@ export function subscribeGlobal(fn: GlobalListener): () => void {
   return () => globalListeners.delete(fn);
 }
 
+/** `GlobalEvent` kinds that carry a per-task `taskId` and get stamped with
+ *  the task's `pipelineParentId` (when it's a hidden pipeline step row) so
+ *  consumers — the webview's toast/notification gates, the CLI's `--notify`,
+ *  the TUI — can scope a step's own lifecycle noise to its parent without a
+ *  DB round-trip of their own. `pipeline` events already name the parent as
+ *  their `taskId`, and `update` carries no task at all. */
+const PIPELINE_PARENT_STAMPED_KINDS = new Set<GlobalEvent["kind"]>([
+  "run-status",
+  "column",
+  "interaction",
+  "files-sent",
+  "fx-auto-resume",
+]);
+
+/** The pipeline parent id of a hidden step task, or `undefined` for an
+ *  ordinary task (including a pipeline PARENT — `pipelineParentId` is only
+ *  ever set on a step row). A cheap single-row read; the field is written
+ *  exactly once, at insert, so there's nothing to invalidate. */
+function stepParentOf(taskId: string): string | undefined {
+  return tasks.get(taskId)?.pipelineParentId ?? undefined;
+}
+
+/** Stamp `pipelineParentId` onto a per-task event (see
+ *  {@link PIPELINE_PARENT_STAMPED_KINDS}) unless the emitter already set it
+ *  (interactions.ts stamps its own `interaction` events). Built with
+ *  `Object.assign` rather than an object-literal spread so this compiles the
+ *  same whether or not the union member declares the optional field. */
+function stampPipelineParent(e: GlobalEvent): GlobalEvent {
+  if (!PIPELINE_PARENT_STAMPED_KINDS.has(e.kind) || !("taskId" in e)) return e;
+  if ((e as { pipelineParentId?: string }).pipelineParentId !== undefined) return e;
+  const pipelineParentId = stepParentOf(e.taskId);
+  if (pipelineParentId === undefined) return e;
+  return Object.assign({}, e, { pipelineParentId }) as GlobalEvent;
+}
+
+/** Fan an app-wide lifecycle event out to every subscriber. Each listener
+ *  is isolated (L-R8): a throw inside one — the pipeline runner's own
+ *  `handleRunStatus`/`handleColumnChange` dispatch, the SSE bridge, a test
+ *  hook — is logged and must never skip the listeners after it, nor unwind
+ *  into the emitter (the done handler's `noteFxRunSettled` and the four
+ *  `drain*Queue` calls run AFTER its `emitGlobal`, and would be silently
+ *  skipped otherwise). */
 function emitGlobal(e: GlobalEvent) {
-  for (const fn of globalListeners) fn(e);
+  const stamped = stampPipelineParent(e);
+  for (const fn of globalListeners) {
+    try {
+      fn(stamped);
+    } catch (err) {
+      console.error(`[agetor] global event listener threw on ${stamped.kind}:`, err);
+    }
+  }
 }
 
 /**
@@ -410,7 +469,7 @@ function updateColumn(
   taskId: string,
   runId: string | null,
   next: ColumnId,
-  reason?: "api-error" | "approval" | "session-died" | "unknown-command",
+  reason?: "api-error" | "approval" | "session-died" | "unknown-command" | "pipeline",
 ): void {
   const before = tasks.get(taskId);
   const prev: ColumnId | null = before?.column ?? null;
@@ -418,6 +477,33 @@ function updateColumn(
   if (prev !== next) {
     emitGlobal({ kind: "column", taskId, runId, column: next, prev, ts: Date.now(), reason });
   }
+}
+
+/**
+ * Thin export of `updateColumn` (module-private otherwise) for
+ * `pipeline-runner.ts` — every column transition the runner drives (a step
+ * task settling to `done`, the parent mirroring running/blocked/review/
+ * ready) rides the `"pipeline"` reason so the UI/CLI can tell a
+ * runner-driven transition apart from an ordinary one (docs/plans/pipelines.md
+ * D12).
+ */
+export function pipelineUpdateColumn(taskId: string, runId: string | null, next: ColumnId): void {
+  updateColumn(taskId, runId, next, "pipeline");
+}
+
+/**
+ * M7: true when `task` is a pipeline step row (`pipelineParentId` set) whose
+ * parent pipeline task no longer exists — the parent row was itself deleted
+ * (`deleteTask` cascades every step first, but a step can also be left
+ * behind by a bug, a partial cascade failure, or on-disk state predating
+ * this fix) with no legitimate way left to "act on the pipeline task
+ * instead". The ordinary step-task guards on `deleteTask`/`archiveTask` (and
+ * `server.ts`'s matching route checks) exempt exactly this case: routing the
+ * user at a parent that's already gone would leave the orphaned step
+ * permanently undeletable/unarchivable.
+ */
+export function isOrphanedPipelineStep(task: Task): boolean {
+  return task.pipelineParentId != null && tasks.get(task.pipelineParentId) == null;
 }
 
 /**
@@ -438,7 +524,11 @@ function isTaskHeldByBackgroundAgents(task: Task): boolean {
   return subagents.hasRunning(task.id);
 }
 
-function isHeldByBackgroundAgents(taskId: string): boolean {
+/** Exported for `pipeline-runner.ts` (M-R3): a step task whose turn
+ *  succeeded but whose background subagents are still running has NOT
+ *  settled as far as the pipeline is concerned — the runner keeps that
+ *  execution active until `maybeReleaseHeldTask` releases it. */
+export function isHeldByBackgroundAgents(taskId: string): boolean {
   const task = tasks.get(taskId);
   return task ? isTaskHeldByBackgroundAgents(task) : false;
 }
@@ -549,6 +639,9 @@ export function wireInteractionBroadcast(): void {
       state: "pending",
       interactionId: req.id,
       ts: req.createdAt,
+      // Forwarded off the request itself (interactions.ts stamps it at
+      // registration); `emitGlobal`'s own stamp only fills it when absent.
+      ...(req.pipelineParentId ? { pipelineParentId: req.pipelineParentId } : {}),
     });
   });
 
@@ -574,6 +667,7 @@ export function wireInteractionBroadcast(): void {
       state: "resolved",
       interactionId: res.id,
       ts: Date.now(),
+      ...(res.pipelineParentId ? { pipelineParentId: res.pipelineParentId } : {}),
     });
   });
 }
@@ -921,8 +1015,19 @@ async function spawnAgentOrFail(
     const { runId, taskId, onChunk } = args;
     const message = err instanceof Error ? err.message : String(err);
     onChunk("stderr", `failed to start agent: ${message}`);
+    // H1: capture "was this the task's current run" BEFORE the row update
+    // below clears `runId`, so the terminal `run-status` emit can be gated on
+    // exactly the condition the done handler's own `isTerminalRun` uses. No
+    // done handler will ever fire for this run (the agent never registered),
+    // so this is the ONLY terminal signal a subscriber — the pipeline
+    // runner, the UI's toasts — gets for a spawn that never started; without
+    // it a pipeline step whose spawn threw sat `running` forever.
+    const wasCurrentRun = tasks.get(taskId)?.runId === runId;
     runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
     tasks.update(taskId, { column: "ready", runId: null });
+    if (wasCurrentRun) {
+      emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now() });
+    }
     return { agent: null, message };
   }
 }
@@ -1068,6 +1173,11 @@ async function consumePendingCancel(
   if (tasks.get(taskId)?.runId === runId) {
     onChunk("status", "cancelled by user before the agent launched");
     updateColumn(taskId, runId, "ready");
+    // H1: no done handler will ever fire for this run (it never registered),
+    // so emit the terminal transition here — gated exactly like the done
+    // handler's `isTerminalRun` — or a pipeline step stopped mid-spawn would
+    // never reach the runner and its run would sit `running` forever.
+    emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
   }
   return true;
 }
@@ -1101,6 +1211,17 @@ export function effectiveAgentProfile(
   task: Task,
 ): { profile: AgentProfileSnapshot; source: "live" | "snapshot" } | null {
   if (!task.agentProfileId && !task.agentProfile) return null;
+
+  // Pipeline step tasks are frozen at launch (D8, docs/plans/pipelines.md):
+  // the parent's run snapshot already captured the profile as it was when
+  // the run started, and a step task's `agentProfile` is that exact frozen
+  // copy. Step tasks never enter the "live until first run" window below —
+  // even a fresh step task's very first run must launch with the snapshot,
+  // not a possibly-since-edited live profile.
+  if (task.pipelineParentId) {
+    if (!task.agentProfile) return null;
+    return { profile: task.agentProfile, source: "snapshot" };
+  }
 
   if (task.agentProfileId && runs.countForTask(task.id) === 0) {
     const profile: AgentProfile | null = agentProfiles.get(task.agentProfileId);
@@ -1137,6 +1258,51 @@ export function agentProfileSnapshotDrifted(
   const { capturedAt: _priorCapturedAt, ...priorRest } = prior;
   const { capturedAt: _nextCapturedAt, ...nextRest } = next;
   return JSON.stringify(priorRest) !== JSON.stringify(nextRest);
+}
+
+/**
+ * True when `taskId` currently has a live run in flight — mirrors the exact
+ * check `startTask` itself uses to refuse a double-start: either an
+ * `active`-registered handle for the task's current `runId`, or a spawn
+ * claim still held in `startingTaskIds` (the window between `startTask`
+ * minting the claim and the spawn actually registering — including the
+ * bounded-pending continuation described in `startingTaskIds`'s own doc,
+ * where the HTTP response has already returned but the real spawn hasn't
+ * settled yet). Callers that need "is this task actually busy right now" —
+ * as opposed to `task.column === 'running'`, which can lag a beat behind a
+ * just-started or just-settled spawn — should use this instead of
+ * re-deriving the same check inline.
+ */
+export function isTaskRunLive(taskId: string): boolean {
+  if (startingTaskIds.has(taskId)) return true;
+  const task = tasks.get(taskId);
+  if (!task) return false;
+  if (task.runId && active.has(task.runId)) return true;
+  // M-R3: a HELD task (terminal run succeeded, background subagents still
+  // running, card parked in `running` by the done handler) has no `active`
+  // handle, but its work genuinely isn't finished — `cancelRun` still has
+  // something to stop (`stopHeldTask`), and the pipeline runner must not
+  // Retry/Advance past it or advance the graph off its handoff until
+  // `maybeReleaseHeldTask` lets it go. Same DB-derived predicate the done
+  // handler and `cancelRun` already agree on.
+  return isTaskHeldByBackgroundAgents(task);
+}
+
+/**
+ * True when `taskId`'s current run has been stopped (`stopActiveHandle`
+ * flagged its `active` handle `cancelled`) but the handle hasn't been
+ * removed from `active` yet — the async window between `kill()` being
+ * called and the exit handler's `active.delete` actually running (see the
+ * "live-run check keys on `cancelled`, NOT on `active.has`" note near
+ * `enqueueArchiveTeardown`'s worktree-removal guard for the same window
+ * from the other side). A handle that's absent, or present but not
+ * cancelled, is not "cancelling" — it's either idle or a genuinely live run.
+ */
+export function isTaskRunCancelling(taskId: string): boolean {
+  const task = tasks.get(taskId);
+  if (!task?.runId) return false;
+  const handle = active.get(task.runId);
+  return !!handle?.cancelled;
 }
 
 /**
@@ -1185,6 +1351,19 @@ async function startTaskInner(
   // archive filter, which is confusing at best.
   if (task.archivedAt != null) {
     task = tasks.update(taskId, { archivedAt: null }) ?? task;
+  }
+
+  // Pipeline tasks never spawn an agent themselves — Run instead kicks off
+  // the pipeline runner, which materializes the shared worktree once and
+  // launches the graph's start step (or retries whatever's blocked/
+  // cancelled) as a hidden step task (D1/D9, docs/plans/pipelines.md).
+  // Placed after the pendingTeardown wait and auto-unarchive above (a
+  // pipeline task can be archived/unarchived like any other task) but
+  // before every harness/profile pre-flight below, none of which apply to
+  // the parent row itself — the runner does its own pre-flight per step via
+  // the ordinary `startTask` path for each child.
+  if (task.pipelineId) {
+    return startPipelineRun(task);
   }
 
   // Freeze-at-first-run (docs/plans/agent-profiles.md D2): resolve the
@@ -1275,6 +1454,32 @@ async function startTaskInner(
   {
     const floorError = await minCliVersionError(harness, task.model ?? DEFAULT_MODEL[harness.kind], status);
     if (floorError !== null) return { error: floorError };
+  }
+
+  // M6: a worktree-isolated pipeline step task shares its parent's worktree
+  // (D2, docs/plans/pipelines.md) — `launchStep` copies `worktreePath`/
+  // `branch` straight from the parent row at insert time, and the parent's
+  // own `startPipelineRun` is what materializes that worktree, once, up
+  // front. Such a step task must NEVER fall through to `prepareWorkdir`
+  // below on its own: `prepareWorkdir`'s reuse branch only fires when
+  // `worktreePath` is both set AND present on disk — anything else (a step
+  // row inserted with no worktree yet, or one whose directory has since
+  // been removed, e.g. a stray retry racing the parent's own teardown)
+  // falls through to its "materialize a brand-new worktree" path, which
+  // would silently give this ONE step its own private checkout instead of
+  // the shared one every other step (and the parent) is using. Refuse
+  // instead — the pipeline task itself is what re-materializes the shared
+  // worktree on Run/Retry. Gated on `isolation === "worktree"`: an
+  // `isolation: "none"` step legitimately carries a `null` `worktreePath`
+  // forever (copied from an equally `null` parent) and `prepareWorkdir`
+  // never reaches the worktree-creation branch for it at all — that's not
+  // a missing worktree, it's the correct shape for that isolation mode.
+  if (
+    task.pipelineParentId
+    && task.isolation === "worktree"
+    && (!task.worktreePath || !existsSync(task.worktreePath))
+  ) {
+    return { error: "step task's worktree is missing — run the pipeline task instead" };
   }
 
   // Pass the branches other tasks have pinned. If materializing this task's
@@ -1489,6 +1694,15 @@ async function startTaskInner(
           // latest) and say why nothing ran.
           spawnArgs.onChunk("status", "cancelled by user before the agent launched");
           updateColumn(taskId, runId, "ready");
+        }
+        // H1: this run never registers, so no done handler will ever emit
+        // its terminal transition — do it here whenever the run is still the
+        // task's current one (a user Stop, or a force-archive during the
+        // pending window), gated exactly like the done handler's
+        // `isTerminalRun`. A delete/replace (`fresh.runId !== runId`) is not
+        // terminal for the task and stays silent, as before.
+        if (fresh && fresh.runId === runId) {
+          emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
         }
         return { ok: true as const };
       }
@@ -3060,6 +3274,19 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   // existsSync check decides whether a restore is needed.
   await pendingTeardown(row.task_id);
 
+  // M-R5: a worktree-isolated pipeline step task shares its parent's worktree
+  // (D2) — the same refusal `startTaskInner`'s M6 guard makes. Restoring it
+  // from a follow-up send would hand this ONE step a private checkout
+  // (`prepareWorkdir`'s materialize branch) instead of the shared one; only
+  // the pipeline task's own Run/Retry re-materializes it.
+  if (
+    task.pipelineParentId
+    && task.isolation === "worktree"
+    && (!task.worktreePath || !existsSync(task.worktreePath))
+  ) {
+    return { delivered: false, reason: "step task's worktree is missing — run the pipeline task instead" };
+  }
+
   if (task.worktreePath && !existsSync(task.worktreePath)) {
     // Re-fetch so the restore sees the just-cleared archivedAt (prepareWorkdir
     // doesn't care about it, but keeping the object fresh avoids acting on a
@@ -3963,13 +4190,24 @@ function clearFxRecovery(taskId: string): void {
   tasks.setFxRecovery(taskId, null);
 }
 
-/** Append a plain status line to an already-settled run and broadcast it —
- *  the same `runs.appendEvent` + `emit` pair used post-hoc elsewhere (e.g.
- *  `pullBackParkedTask`), for auto-resume breadcrumbs landing on a run that
- *  finished before this code runs. */
-function appendFxStatusLine(taskId: string, runId: string, data: string): void {
+/** Append a plain status line to an already-settled (or otherwise
+ *  not-currently-spawning) run and broadcast it live over the run's SSE
+ *  channel — the same `runs.appendEvent` + `emit` pair used post-hoc
+ *  elsewhere (e.g. `pullBackParkedTask`, fx's auto-resume breadcrumbs) for a
+ *  status line landing on a run with no active `onChunk` handler in scope.
+ *  Exported for `pipeline-runner.ts`'s handoff-reminder status lines, which
+ *  land on a step task's run from outside any spawn — `runs.appendEvent`
+ *  alone would persist the line but never reach a live SSE subscriber. */
+export function appendRunStatusLine(taskId: string, runId: string, data: string): void {
   runs.appendEvent(runId, "status", data);
   emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+}
+
+/** @deprecated thin fx-named alias of {@link appendRunStatusLine} — kept so
+ *  every existing fx call site reads unchanged; new callers should use the
+ *  generic export directly. */
+function appendFxStatusLine(taskId: string, runId: string, data: string): void {
+  appendRunStatusLine(taskId, runId, data);
 }
 
 /**
@@ -5357,6 +5595,11 @@ async function spawnResumedSessionInner(
           onChunk("status", "cancelled by user before the agent launched");
           updateColumn(taskId, newRunId, "ready");
         }
+        // H1: same terminal emit as `startTaskInner`'s continuation — this
+        // run never registers, so nothing else will ever announce it.
+        if (fresh && fresh.runId === newRunId) {
+          emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
+        }
         return;
       }
 
@@ -5434,6 +5677,18 @@ export interface CreateTaskInput extends Partial<Task> {
    * `{ error }` rather than silently falling back to "no agent".
    */
   agentProfileId?: string | null;
+  /**
+   * Bind this task to a {@link Pipeline} at create time (docs/plans/pipelines.md
+   * D1) — mutually exclusive with `agentProfileId` (`{ error }` when both are
+   * set). The created row is a **pipeline task**: `startTask` routes it to
+   * `startPipelineRun` instead of spawning an agent, and its own
+   * agent/model/effort/mode/fast/maxMode fields are cosmetic, mirroring the
+   * graph's start step (A1). Also settable via the inherited `Partial<Task>`
+   * field; listed here too so its doc comment lives next to the validation it
+   * triggers. An unresolvable id, a graph with no resolvable start step, or
+   * any step with no resolvable agent fails the whole create with `{ error }`.
+   */
+  pipelineId?: string | null;
 }
 
 /**
@@ -5470,7 +5725,7 @@ export interface CreateTaskInternal {
  * curated `MODEL_EFFORT_SUPPORT` table when the harness reported a non-empty
  * list for this model — see `supportedEfforts`/`getDiscoveredEfforts`.
  */
-function defaultEffortFor(kind: AgentKind, model: string, harnessId: string): string | null {
+export function defaultEffortFor(kind: AgentKind, model: string, harnessId: string): string | null {
   const support = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, harnessId));
   if (support.length === 0) return null;
   return support.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : support[0]!.id;
@@ -5550,6 +5805,33 @@ export async function createTask(
 
   const id = randomUUID();
 
+  // Pipeline binding (D1, docs/plans/pipelines.md): mutually exclusive with
+  // `agentProfileId` — a pipeline task never launches an agent of its own
+  // (the runner drives hidden step tasks instead), but its own
+  // agent/model/effort/mode/fast/maxMode fields still cosmetically mirror
+  // the graph's start step (A1) so every existing per-task surface that
+  // reads those fields (board filters, badges, CLI `ls`) keeps working
+  // unchanged. Validated up front, before `profile` below, so a bad
+  // pipeline id (or a step with no resolvable agent) fails the create
+  // outright, the same way a bad `agentProfileId` already does.
+  let pipeline: Pipeline | null = null;
+  const requestedPipelineId = input.pipelineId?.trim();
+  if (requestedPipelineId) {
+    if (input.agentProfileId?.trim()) {
+      return { error: "a task can't bind both a pipeline and an agent" };
+    }
+    pipeline = pipelines.get(requestedPipelineId);
+    if (!pipeline) return { error: "unknown pipeline" };
+    const start = resolveStartStep(pipeline.graph);
+    if (!start) return { error: "pipeline has no resolvable start step" };
+    for (const step of pipeline.graph.steps) {
+      if (!step.agentProfileId) return { error: `step "${step.name}" has no agent` };
+      if (!agentProfiles.get(step.agentProfileId)) {
+        return { error: `agent for step "${step.name}" no longer exists` };
+      }
+    }
+  }
+
   // Agent profile override (docs/plans/agent-profiles.md D2/D3): resolved
   // BEFORE the harness/model/effort defaulting below, since a bound profile
   // wins outright over any of those six body-provided fields. An
@@ -5568,19 +5850,31 @@ export async function createTask(
       return { error: `unknown agent profile "${requestedProfileId}"` };
     }
   }
+  // Cosmetic defaults source for agent/model/effort/mode/fast/maxMode: a
+  // bound profile wins as before; otherwise a pipeline task's start-step
+  // profile fills the same role (A1) — but `profile` itself stays null
+  // below, so the task row is never recorded as BOUND to that profile
+  // (`agentProfileId`/`agentProfile` stay null; only `pipelineId` marks
+  // this row as a pipeline task). Every step above already validated that
+  // `pipeline`'s start step has an `agentProfileId` that resolves, so the
+  // `agentProfiles.get` here can't fail.
+  const pipelineStartProfile: AgentProfile | null = pipeline
+    ? agentProfiles.get(resolveStartStep(pipeline.graph)!.agentProfileId!)
+    : null;
+  const defaultsProfile: AgentProfile | null = profile ?? pipelineStartProfile;
 
   // Resolve the harness so we can default model/effort by kind. A bad alias
   // id is rejected up-front rather than persisted and surfacing as a launch
   // failure later. Falls back to the built-in claude-code id when the caller
   // omits `agent` entirely. A bound profile's own harness always wins over
   // `input.agent`.
-  const agentId = profile ? profile.harness : (input.agent ?? "claude-code");
+  const agentId = defaultsProfile ? defaultsProfile.harness : (input.agent ?? "claude-code");
   const harness = resolveHarness(agentId);
   if (!harness) {
     return { error: `unknown harness "${agentId}"` };
   }
   const kind = harness.kind;
-  const model = profile ? profile.model : (input.model ?? DEFAULT_MODEL[kind]);
+  const model = defaultsProfile ? defaultsProfile.model : (input.model ?? DEFAULT_MODEL[kind]);
   // Discovered efforts (e.g. Codex's own app-server catalog) win when the
   // harness reported a non-empty list for this model; the curated
   // MODEL_EFFORT_SUPPORT table is only the fallback (see
@@ -5619,8 +5913,8 @@ export async function createTask(
   // treatment; `agentProfileSnapshot` below is built straight from `profile`
   // and keeps the raw `null`.
   let effort: string | null;
-  if (profile) {
-    effort = profile.effort ?? defaultEffortFor(kind, model, harness.id);
+  if (defaultsProfile) {
+    effort = defaultsProfile.effort ?? defaultEffortFor(kind, model, harness.id);
   } else if (input.effort !== undefined && input.effort !== null) {
     effort = input.effort;
   } else {
@@ -5727,13 +6021,22 @@ export async function createTask(
     // No PR exists for a brand-new task; set server-side by pull-create.
     prUrl: null,
     issueUrl: validatedIssueUrl,
-    mode: profile ? profile.mode : (input.mode ?? null),
+    mode: defaultsProfile ? defaultsProfile.mode : (input.mode ?? null),
     model,
     effort,
-    fast: profile ? profile.fast : input.fast === true,
-    maxMode: profile ? profile.maxMode : input.maxMode === true,
+    fast: defaultsProfile ? defaultsProfile.fast : input.fast === true,
+    maxMode: defaultsProfile ? defaultsProfile.maxMode : input.maxMode === true,
     agentProfileId: profile?.id ?? null,
     agentProfile: agentProfileSnapshot,
+    // Pipeline binding (D1): only the parent row carries `pipelineId` (set
+    // above once, validated) — a brand-new task is never itself a hidden
+    // step (`pipelineParentId`/`pipelineStepId` are only ever set by the
+    // runner's own `launchStep`, never by `createTask`). `pipelineRun`
+    // starts idle (`snapshot: null`) until the first Run.
+    pipelineId: pipeline?.id ?? null,
+    pipelineRun: pipeline ? initialPipelineRunState(pipeline) : null,
+    pipelineParentId: null,
+    pipelineStepId: null,
     references: input.references ?? [],
     // Brand-new tasks start with an empty backlog; drafts are added later from
     // the run panel.
@@ -5871,7 +6174,14 @@ function enqueueArchiveTeardown(
     else if (kind === "cursor") await dropCursorSession(cur.id);
     else if (kind === "gemini") await dropGeminiSession(cur.id);
     else if (kind === "fx") dropFxSession(cur.id); // fx has no tmux session — stays sync
-    result = await detachWorktree(cur, { force: opts?.force });
+    // Pipeline step rows share the parent's worktree (D2, docs/plans/pipelines.md)
+    // — a step's own archive teardown must never detach it out from under
+    // the parent (or any sibling step still using it). The parent's own
+    // teardown (this same function, called for the parent row) removes the
+    // worktree exactly as before; only a step row's call skips the detach.
+    result = cur.pipelineParentId
+      ? { removed: false, reason: "no-worktree" }
+      : await detachWorktree(cur, { force: opts?.force });
   });
   return { promise, result: () => result };
 }
@@ -5915,10 +6225,23 @@ function enqueueArchiveTeardown(
  */
 export async function archiveTask(
   taskId: string,
-  opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean },
+  opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean; fromPipeline?: boolean },
 ): Promise<{ task: Task; teardown?: WorktreeTeardownResult } | { error: string }> {
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
+  // Pipeline step tasks can't be archived individually (D9, docs/plans/pipelines.md)
+  // — their lifecycle belongs to the parent pipeline task. `fromPipeline` is
+  // set only by `cascadePipelineArchive` (pipeline-runner.ts), which is the
+  // one legitimate caller archiving a step row directly, as part of
+  // archiving the whole pipeline. `server.ts`'s route already 409s a direct
+  // step-archive request before ever reaching here; this is defense in
+  // depth against any other internal caller making the same mistake.
+  // M7: exempt an ORPHANED step (its parent row no longer exists) — there is
+  // no pipeline task left to "act on instead", so refusing here would leave
+  // it permanently unarchivable.
+  if (task.pipelineParentId && !opts?.fromPipeline && !isOrphanedPipelineStep(task)) {
+    return { error: `step task belongs to a pipeline — act on the pipeline task ${task.pipelineParentId} instead` };
+  }
   if (task.column !== "done" && !opts?.force) {
     return { error: "only tasks in Done can be archived" };
   }
@@ -5977,6 +6300,17 @@ export async function archiveTask(
   }
   const updated = tasks.update(taskId, { archivedAt: Date.now() });
   if (!updated) return { error: "task not found" };
+  // Pipeline parent (D9, docs/plans/pipelines.md): archive every non-archived
+  // step task first — `cascadePipelineArchive` is best-effort per step (a
+  // step that fails to archive is logged, not thrown), so one stuck step
+  // never blocks the parent's own archive below. No-op for an ordinary task
+  // (`pipelineId` null). M7: run under this parent's `withPipelineLock` so
+  // the cascade can't interleave its per-step archive calls with a live
+  // settle/advance event (pipeline-runner.ts's own `runExclusive`) racing to
+  // read-modify-write the same `pipelineRun` JSON blob.
+  if (updated.pipelineId) {
+    await withPipelineLock(updated.id, () => cascadePipelineArchive(updated.id));
+  }
   // Turn queues are cheap in-memory bookkeeping (no I/O), so they're dropped
   // inline rather than folded into the deferred job.
   codexTurnQueue.delete(taskId);
@@ -6027,7 +6361,11 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
   await pendingTeardown(taskId);
   const updated = tasks.update(taskId, { archivedAt: null });
   if (!updated) return { error: "task not found" };
-  if (updated.worktreePath && updated.branch && !existsSync(updated.worktreePath)) {
+  // A step row's worktree belongs to its pipeline parent (D2) — restoring
+  // it here (were a step row ever unarchived on its own, which the normal
+  // UI never does) would be redundant at best and racy at worst against the
+  // parent's own restore; only the parent's own worktree is materialized.
+  if (updated.worktreePath && updated.branch && !updated.pipelineParentId && !existsSync(updated.worktreePath)) {
     try {
       const restored = await prepareWorkdir(updated);
       if ("error" in restored) {
@@ -6043,10 +6381,44 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
 /**
  * Delete a task and best-effort tear down its worktree. Kills any active run
  * first so we don't leave a stale process around.
+ *
+ * Pass `{ fromPipeline: true }` when the caller is `cascadePipelineDelete`
+ * (pipeline-runner.ts) deleting a step task as part of deleting the whole
+ * pipeline task — the one legitimate way a step row gets deleted directly.
+ * Without it, a step task (`pipelineParentId` set) is refused: delete the
+ * pipeline task instead (D9, docs/plans/pipelines.md). `server.ts`'s route
+ * already 409s a direct step-delete request before ever reaching here; this
+ * is defense in depth against any other internal caller making the same
+ * mistake. A pipeline PARENT task (`pipelineId` set) instead cascades —
+ * every step task is deleted first, best-effort, before the parent's own
+ * teardown below.
  */
-export async function deleteTask(taskId: string): Promise<void> {
+export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean }): Promise<void> {
   const task = tasks.get(taskId);
   if (!task) return;
+  // M7: exempt an ORPHANED step (its parent row no longer exists) — same
+  // rationale as the matching exemption in `archiveTask`.
+  if (task.pipelineParentId && !opts?.fromPipeline && !isOrphanedPipelineStep(task)) {
+    console.warn(`[agetor] refusing to delete pipeline step task ${taskId} directly — delete the pipeline task ${task.pipelineParentId} instead`);
+    return;
+  }
+  // M-R7: `cascadePipelineDelete` tombstones the parent id FIRST (so a
+  // racing launch bails) — but a throw anywhere between that tombstone and
+  // the `tasks.delete` at the bottom (a step delete, a teardown, the issue
+  // snapshot removal) would otherwise leave a still-existing parent row
+  // permanently tombstoned: every later Run/Retry/Advance on it refused with
+  // "pipeline task no longer exists" while the card sat on the board. Undo
+  // the tombstone on any such throw and re-raise, so the parent stays
+  // launchable and the user can simply retry the delete.
+  const isPipelineParent = task.pipelineId != null;
+  try {
+  if (isPipelineParent) {
+    // M7: run under this parent's `withPipelineLock` so the cascade can't
+    // interleave its per-step delete calls with a live settle/advance event
+    // (pipeline-runner.ts's own `runExclusive`) racing to read-modify-write
+    // the same `pipelineRun` JSON blob.
+    await withPipelineLock(taskId, () => cascadePipelineDelete(taskId));
+  }
   if (task.runId && active.has(task.runId)) active.get(task.runId)?.kill();
   // Resolve any pending interactions for this task so hook scripts / MCP
   // children blocked on agetor unblock immediately. Done before dropSession
@@ -6087,7 +6459,10 @@ export async function deleteTask(taskId: string): Promise<void> {
     else if (deleteKind === "cursor") await dropCursorSession(taskId);
     else if (deleteKind === "gemini") await dropGeminiSession(taskId);
     else if (deleteKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
-    await removeWorktree(task);
+    // A step task's worktree is the shared parent's (D2) — never remove it
+    // out from under the parent (or any sibling step) just because one step
+    // row is being deleted as part of the parent's own cascade.
+    if (!task.pipelineParentId) await removeWorktree(task);
   });
   // Refs are otherwise path-only — agetor never copies anything to disk for
   // them — except the per-task issue-thread snapshot directory (written by
@@ -6101,6 +6476,10 @@ export async function deleteTask(taskId: string): Promise<void> {
     console.warn(`[agetor] failed to remove issue thread snapshot dir for task ${taskId}:`, e);
   }
   tasks.delete(taskId);
+  } catch (err) {
+    if (isPipelineParent) tombstonedPipelineParents.delete(taskId);
+    throw err;
+  }
 }
 
 /**
@@ -6130,6 +6509,11 @@ export function sweepArchivedTeardowns(): number {
   let enqueued = 0;
   for (const task of tasks.list()) {
     if (task.archivedAt == null) continue;
+    // A step task's `worktreePath` is a copy of its pipeline parent's — the
+    // parent's own row (also archived, also swept by this same loop) is
+    // what actually owns and tears it down; enqueuing a redundant no-op job
+    // per step just adds queue churn.
+    if (task.pipelineParentId) continue;
     if (!task.worktreePath) continue;
     if (!existsSync(task.worktreePath)) continue;
     // Defensive: an archived task shouldn't have a live run (archiveTask

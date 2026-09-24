@@ -1,0 +1,11 @@
+-- Partial index backing the pipeline-PARENT lookups that migration 058 left
+-- to a table scan: `pipelines.taskCounts()` (GROUP BY pipeline_id across
+-- every task, stamped as `taskCount` on every `/pipelines*` response),
+-- `reconcilePipelineRuns()`'s boot sweep over every non-archived pipeline
+-- parent, and the runner's "is this pipeline still bound to a task" checks.
+-- Partial (`WHERE pipeline_id IS NOT NULL`) because the overwhelming
+-- majority of rows are ordinary tasks with a NULL there — indexing the NULLs
+-- would only inflate the index for lookups that never ask about them.
+-- `IF NOT EXISTS` so a dev DB that picked this up under another id is a
+-- no-op, mirroring the 057/058 alias treatment.
+CREATE INDEX IF NOT EXISTS idx_tasks_pipeline_id ON tasks(pipeline_id) WHERE pipeline_id IS NOT NULL;

@@ -347,8 +347,12 @@ async function openIssueTaskDialog(page: Page): Promise<Locator> {
   const issueTaskDialog = page.getByTestId("issue-task-dialog");
   await expect(issueTaskDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 
+  // The composer only mounts once BOTH the issue thread and the launch
+  // pickers' harness statuses have loaded (`loading = launch.loading ||
+  // threadLoading` in CreateTaskFromIssueDialog); `/harnesses` runs a probe
+  // per harness, which under parallel-run load outlasts the 5s default.
   const promptTextarea = issueTaskDialog.getByTestId("prompt-textarea");
-  await expect(promptTextarea).toBeVisible();
+  await expect(promptTextarea).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   await expect(async () => {
     const value = await promptTextarea.inputValue();
     expect(value).toContain(`Issue #${ISSUE_NUMBER}`);

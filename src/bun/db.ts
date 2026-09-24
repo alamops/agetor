@@ -3,10 +3,11 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import { AGENT_OPTIONS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Harness, type HarnessQuota, type HarnessUsage, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Subagent, type SubagentStatus } from "../shared/types.ts";
+import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Subagent, type SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
+import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -112,6 +113,16 @@ type TaskRow = {
   // must not clobber the snapshot. Both NULL means "no agent".
   agent_profile_id: string | null;
   agent_profile: string | null;
+  // Pipeline binding (migration 058) — see the migration's doc comment for
+  // the full split. `pipeline_id`/`pipeline_run` live on a pipeline PARENT
+  // task, written by `tasks.insert` (create time) and `tasks.setPipelineRun`
+  // (targeted UPDATE); `pipeline_parent_id`/`pipeline_step_id` live on a
+  // hidden STEP task, written only by `tasks.insert`. None of the four are
+  // touched by the generic `insert`/`update` SET clause below.
+  pipeline_id: string | null;
+  pipeline_run: string | null;
+  pipeline_parent_id: string | null;
+  pipeline_step_id: string | null;
   // Unread-indicator watermark pair (migration 045). Not spread into `Task`
   // directly — only the derived `unread` boolean is (see `toTask`). Written
   // exclusively by `tasks.noteAssistantEvent` / `tasks.markSeen`, never by
@@ -423,6 +434,308 @@ const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | n
   };
 };
 
+const isFiniteNumber = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
+const isPlainObject = (x: unknown): x is Record<string, unknown> =>
+  typeof x === "object" && x !== null && !Array.isArray(x);
+
+const PIPELINE_RUN_STATUSES = new Set<string>(["idle", "running", "blocked", "done", "cancelled"]);
+const PIPELINE_BLOCK_KINDS = new Set<string>([
+  "step-failed", "step-blocked", "handoff-missing", "handoff-invalid", "step-cap", "profile-missing", "join-incomplete",
+]);
+
+/** A stored `Handoff` is trusted structurally, not deeply — it was produced
+ *  by `parseHandoff` (`shared/pipeline.ts`) before ever reaching this
+ *  column, so re-validating every field here would just duplicate that
+ *  parser. Anything that isn't a plain object collapses to `null`. */
+const sanitizeStoredHandoff = (raw: unknown): Handoff | null => (isPlainObject(raw) ? (raw as unknown as Handoff) : null);
+
+/** One entry of `PipelineRunState.active` — dropped wholesale (not
+ *  partially trusted) when any of its three required fields is the wrong
+ *  shape, since a malformed active-step entry is unusable for orchestration
+ *  either way. */
+const sanitizeActiveStep = (raw: unknown): PipelineActiveStep | null => {
+  if (!isPlainObject(raw)) return null;
+  const { stepId, taskId, seq } = raw as Record<string, unknown>;
+  if (typeof stepId !== "string" || !stepId) return null;
+  if (typeof taskId !== "string" || !taskId) return null;
+  if (!isFiniteNumber(seq)) return null;
+  return { stepId, taskId, seq };
+};
+
+const sanitizeJoinArrival = (raw: unknown): PipelineJoinArrival | null => {
+  if (!isPlainObject(raw)) return null;
+  const { fromStepId, seq } = raw as Record<string, unknown>;
+  if (typeof fromStepId !== "string" || !fromStepId) return null;
+  if (!isFiniteNumber(seq)) return null;
+  return { fromStepId, seq, handoff: sanitizeStoredHandoff((raw as Record<string, unknown>).handoff) };
+};
+
+const sanitizeJoins = (raw: unknown): PipelineRunState["joins"] => {
+  if (!isPlainObject(raw)) return {};
+  const out: PipelineRunState["joins"] = {};
+  for (const [stepId, value] of Object.entries(raw)) {
+    if (!isPlainObject(value)) continue;
+    const rawArrivals = (value as Record<string, unknown>).arrivals;
+    const arrivals = Array.isArray(rawArrivals)
+      ? rawArrivals.map(sanitizeJoinArrival).filter((a): a is PipelineJoinArrival => a !== null)
+      : [];
+    out[stepId] = { arrivals };
+  }
+  return out;
+};
+
+/** `PipelineBlock.pending` — the run-level launch (a step-cap/profile-missing
+ *  retry, or a join-incomplete launch) Retry would re-attempt. Dropped
+ *  wholesale (never persisted as a half-valid shape) when `stepId` is
+ *  missing/empty; `arrivals` reuses `sanitizeJoinArrival`, same as
+ *  `sanitizeJoins` above, silently dropping any junk entry. */
+const sanitizeBlockPending = (raw: unknown): { stepId: string; arrivals: PipelineJoinArrival[] } | null => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const stepId = rec.stepId;
+  if (typeof stepId !== "string" || !stepId) return null;
+  const arrivals = Array.isArray(rec.arrivals)
+    ? rec.arrivals.map(sanitizeJoinArrival).filter((a): a is PipelineJoinArrival => a !== null)
+    : [];
+  return { stepId, arrivals };
+};
+
+const sanitizeBlock = (raw: unknown): PipelineBlock | null => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const kind = rec.kind;
+  if (typeof kind !== "string" || !PIPELINE_BLOCK_KINDS.has(kind)) return null;
+  const taskId = typeof rec.taskId === "string" ? rec.taskId : null;
+  const stepId = typeof rec.stepId === "string" ? rec.stepId : null;
+  const message = typeof rec.message === "string" ? rec.message : "";
+  const pending = sanitizeBlockPending(rec.pending);
+  return { taskId, stepId, kind: kind as PipelineBlockKind, message, ...(pending ? { pending } : {}) };
+};
+
+const STEP_RECORD_OUTCOMES = new Set<string>(["succeeded", "failed", "cancelled", "advanced-manually"]);
+
+/** {@link PipelineStepRecord.responseKind}'s value set — see {@link
+ *  StepResponseKind} in `src/shared/types.ts`. */
+const STEP_RESPONSE_KINDS = new Set<string>([
+  "handoff", "handoff-blocked", "handoff-missing", "handoff-invalid", "user-ask", "error", "cancelled",
+]);
+
+/** An unrecognized/malformed `responseKind` collapses to `null` (same as a
+ *  record written before this field existed) rather than dropping the whole
+ *  history entry — it's purely a UI label, never consulted for control flow
+ *  by `resolveNextSteps`/`deriveRunStatus`/etc. */
+const sanitizeResponseKind = (raw: unknown): NonNullable<PipelineStepRecord["responseKind"]> | null =>
+  typeof raw === "string" && STEP_RESPONSE_KINDS.has(raw)
+    ? (raw as NonNullable<PipelineStepRecord["responseKind"]>)
+    : null;
+
+const STEP_REMINDER_REASONS = new Set<string>(["handoff-missing", "handoff-invalid", "handoff-next-unknown"]);
+
+/** {@link PipelineStepRecord.reminder} — the one-shot automatic handoff
+ *  reminder the runner records against an execution (`pipeline-runner.ts`'s
+ *  `handleRunStatus`). A malformed value collapses to `null` (treated the
+ *  same as "never reminded") rather than dropping the whole history entry —
+ *  the worst case is one extra reminder attempt, never a control-flow bug.
+ *  `delivered` defaults to `true` for a row written before that field
+ *  existed — every reminder ever persisted so far was in fact delivered (the
+ *  runner only records one once `sendInput` succeeds), so a missing value is
+ *  a pre-field row, not evidence of a failed send. */
+const sanitizeStepReminder = (raw: unknown): NonNullable<PipelineStepRecord["reminder"]> | null => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const at = rec.at;
+  const reason = rec.reason;
+  const detail = rec.detail;
+  const runId = rec.runId;
+  const deliveredRaw = rec.delivered;
+  if (!isFiniteNumber(at)) return null;
+  if (typeof reason !== "string" || !STEP_REMINDER_REASONS.has(reason)) return null;
+  if (typeof detail !== "string") return null;
+  if (runId !== null && typeof runId !== "string") return null;
+  if (deliveredRaw !== undefined && typeof deliveredRaw !== "boolean") return null;
+  const delivered = typeof deliveredRaw === "boolean" ? deliveredRaw : true;
+  return {
+    at,
+    reason: reason as "handoff-missing" | "handoff-invalid" | "handoff-next-unknown",
+    runId: runId ?? null,
+    detail,
+    delivered,
+  };
+};
+
+/** One completed/cancelled execution in `PipelineRunState.history` — dropped
+ *  wholesale when its identity fields (`stepId`/`taskId`/`seq`/`startedAt`)
+ *  are malformed, since a history entry with no usable identity can't be
+ *  attributed to any step anyway; every other field defaults leniently. */
+const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const stepId = rec.stepId;
+  const taskId = rec.taskId;
+  const seq = rec.seq;
+  const startedAt = rec.startedAt;
+  if (typeof stepId !== "string" || !stepId) return null;
+  if (typeof taskId !== "string" || !taskId) return null;
+  if (!isFiniteNumber(seq)) return null;
+  if (!isFiniteNumber(startedAt)) return null;
+
+  const endedAt = isFiniteNumber(rec.endedAt) ? rec.endedAt : null;
+  const outcome = typeof rec.outcome === "string" && STEP_RECORD_OUTCOMES.has(rec.outcome)
+    ? (rec.outcome as PipelineStepRecord["outcome"])
+    : null;
+  const nextStepIds = Array.isArray(rec.nextStepIds)
+    ? rec.nextStepIds.filter((x): x is string => typeof x === "string")
+    : [];
+
+  return {
+    seq, stepId, taskId, startedAt, endedAt, outcome,
+    handoff: sanitizeStoredHandoff(rec.handoff),
+    nextStepIds,
+    responseKind: sanitizeResponseKind(rec.responseKind),
+    reminder: sanitizeStepReminder(rec.reminder),
+  };
+};
+
+/** Sanitize a `PipelineRunState.snapshot`-shaped value: `null`/non-object
+ *  collapses to `null` (no snapshot yet — the run hasn't been started).
+ *  `profiles` is kept lenient — "a record of objects" per the design, not
+ *  re-validated field-by-field against `AgentProfileSnapshot` — since it was
+ *  written by our own `snapshotFromProfile` and deep-validating it here
+ *  would only duplicate that call site.
+ *
+ *  m18: unlike `parsePipelineGraph` (the `pipelines` table's own live `graph`
+ *  column, still deep-validated via `validatePipelineGraph` on every read —
+ *  see that function's doc), a run snapshot's `graph` is validated at run
+ *  start by `startPipelineRun` (which refuses to start the run at all on a
+ *  bad graph) and captured exactly once at that point, and nothing ever
+ *  mutates a `pipeline_run` column's snapshot after it's written —
+ *  re-validating the whole graph on every read (every task poll, every
+ *  pipeline route) only spends cycles re-checking something that can't have
+ *  changed. Only shape-check enough to make it safe to hand to the
+ *  step-resolution helpers (`resolveNextSteps`/`stepNameById`/…), which
+ *  just index into `.steps`/`.edges` arrays: a `graph` that isn't even an
+ *  object with array `steps`/`edges` collapses the whole snapshot to `null`
+ *  (an un-runnable snapshot is as good as none) exactly like before. */
+/** Minimal shape check for one `PipelineGraph.steps` entry — a plain object
+ *  with a string `id` and a `position` that's a plain object with numeric
+ *  `x`/`y`. Anything else (a bare string, `null`, a step missing `position`,
+ *  a `position` with non-numeric coordinates) is unsafe to hand to the
+ *  pipeline editor or the step-resolution helpers (shared by `parsePipelineGraph`
+ *  below and `sanitizeRunSnapshot`), which index into both
+ *  fields unconditionally. */
+const isShapeSafePipelineStep = (x: unknown): boolean => {
+  if (!isPlainObject(x)) return false;
+  if (typeof x.id !== "string") return false;
+  const pos = x.position;
+  if (!isPlainObject(pos)) return false;
+  return isFiniteNumber(pos.x) && isFiniteNumber(pos.y);
+};
+
+/** Minimal shape check for one `PipelineGraph.edges` entry — a plain object
+ *  with string `from`/`to`. */
+const isShapeSafePipelineEdge = (x: unknown): boolean =>
+  isPlainObject(x) && typeof x.from === "string" && typeof x.to === "string";
+
+const sanitizeRunSnapshot = (raw: unknown): PipelineRunSnapshot | null => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  // L-S7: the same per-entry shape checks `parsePipelineGraph` applies to
+  // the live template graph — a `steps` entry without a string `id` or a
+  // numeric `position`, or an `edges` entry without string `from`/`to`,
+  // collapses the whole snapshot to null rather than reaching the
+  // step-resolution helpers that index into those fields unconditionally.
+  if (
+    !isPlainObject(rec.graph) ||
+    !Array.isArray(rec.graph.steps) ||
+    !Array.isArray(rec.graph.edges) ||
+    !rec.graph.steps.every(isShapeSafePipelineStep) ||
+    !rec.graph.edges.every(isShapeSafePipelineEdge)
+  ) {
+    return null;
+  }
+  const graph = rec.graph as unknown as PipelineGraph;
+
+  const profiles: PipelineRunSnapshot["profiles"] = {};
+  if (isPlainObject(rec.profiles)) {
+    for (const [id, value] of Object.entries(rec.profiles)) {
+      if (isPlainObject(value)) profiles[id] = value as unknown as AgentProfileSnapshot;
+    }
+  }
+
+  const maxSteps = isFiniteNumber(rec.maxSteps) ? rec.maxSteps : PIPELINE_LIMITS.maxStepsDefault;
+  const capturedAt = isFiniteNumber(rec.capturedAt) ? rec.capturedAt : 0;
+
+  return { graph, profiles, maxSteps, capturedAt };
+};
+
+/**
+ * Parse a pipeline task's stored `pipeline_run` JSON column into a
+ * {@link PipelineRunState}, tolerating NULL (not a pipeline task, or a
+ * pipeline task that predates a column backfill — neither happens in
+ * practice since `pipeline_run` is always written at insert time for a
+ * pipeline-bound task, but the parser is defensive like every other JSON
+ * column in this file), malformed JSON, and unexpected shapes — all
+ * collapse to `null`. Only `pipelineId` is hard-required (a non-empty
+ * string); every other field defaults leniently so a partially-corrupt run
+ * row degrades gracefully instead of vanishing outright — see the
+ * per-collection sanitizers above for exactly what's dropped vs. defaulted.
+ */
+export const parsePipelineRunState = (raw: string | null): PipelineRunState | null => {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(parsed)) return null;
+  const rec = parsed;
+
+  const pipelineId = rec.pipelineId;
+  if (typeof pipelineId !== "string" || !pipelineId) return null;
+
+  const pipelineName = typeof rec.pipelineName === "string" ? rec.pipelineName : "";
+  const status: PipelineRunStatus = typeof rec.status === "string" && PIPELINE_RUN_STATUSES.has(rec.status)
+    ? (rec.status as PipelineRunStatus)
+    : "idle";
+
+  const active = Array.isArray(rec.active)
+    ? rec.active.map(sanitizeActiveStep).filter((a): a is PipelineActiveStep => a !== null)
+    : [];
+  const blocked = Array.isArray(rec.blocked)
+    ? rec.blocked.map(sanitizeBlock).filter((b): b is PipelineBlock => b !== null)
+    : [];
+  const history = Array.isArray(rec.history)
+    ? rec.history.map(sanitizeStepRecord).filter((h): h is PipelineStepRecord => h !== null)
+    : [];
+
+  // L-S4: both counters are (safe) integers by construction — the runner
+  // only ever increments them by one — so a fractional, negative, or
+  // beyond-2^53 stored value is corruption, not a real run. `capExtensions` is additionally capped at
+  // `PIPELINE_LIMITS.capExtensionsMax` so `effectiveStepCap` can never scale
+  // a run's allowance by an absurd factor off a hand-edited row.
+  const stepCount = Number.isSafeInteger(rec.stepCount) && (rec.stepCount as number) >= 0 ? (rec.stepCount as number) : 0;
+  const startedAt = isFiniteNumber(rec.startedAt) ? rec.startedAt : null;
+  const endedAt = isFiniteNumber(rec.endedAt) ? rec.endedAt : null;
+
+  return {
+    pipelineId,
+    pipelineName,
+    snapshot: sanitizeRunSnapshot(rec.snapshot),
+    status,
+    active,
+    joins: sanitizeJoins(rec.joins),
+    blocked,
+    history,
+    stepCount,
+    startedAt,
+    endedAt,
+    capExtensions: Number.isSafeInteger(rec.capExtensions) && (rec.capExtensions as number) >= 0
+      ? Math.min(rec.capExtensions as number, PIPELINE_LIMITS.capExtensionsMax)
+      : undefined,
+  };
+};
+
 /** Optional pre-computed grouped counts, threaded in by `tasks.list()` so a
  *  multi-row query does one pass over each in-memory registry instead of a
  *  per-row `countPendingForTask`/`countTerminals` scan (289 tasks × 2 linear
@@ -470,6 +783,10 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   fxRecovery: parseTaskFxRecovery(r.fx_recovery),
   agentProfileId: r.agent_profile_id ?? null,
   agentProfile: parseAgentProfileSnapshot(r.agent_profile),
+  pipelineId: r.pipeline_id ?? null,
+  pipelineRun: parsePipelineRunState(r.pipeline_run),
+  pipelineParentId: r.pipeline_parent_id ?? null,
+  pipelineStepId: r.pipeline_step_id ?? null,
   // Derived, never stored: a monotonic-id watermark comparison, race-free by
   // construction (see migration 045's doc comment). NULL
   // `last_assistant_event_id` (no assistant event ever observed) always
@@ -505,7 +822,20 @@ export const tasks = {
          GROUP BY tasks.id
          ORDER BY tasks.created_at DESC`,
     ).all();
-    const counts: TaskCounts = { pending: pendingCountsByTask(), terminals: terminalCountsByTask() };
+    const pending = pendingCountsByTask();
+    // D11: a pipeline parent task never has interactions registered against
+    // its own (hidden, agent-less) id — every interaction happens on the
+    // currently-active hidden step task. Fold each step's pending count into
+    // its parent's here, in the same O(n) pass, so the parent card's
+    // "waiting on you" glow is honest without every consumer (board, CLI,
+    // TUI) having to know about the parent/step split.
+    for (const r of rows) {
+      if (!r.pipeline_parent_id) continue;
+      const stepCount = pending.get(r.id);
+      if (!stepCount) continue;
+      pending.set(r.pipeline_parent_id, (pending.get(r.pipeline_parent_id) ?? 0) + stepCount);
+    }
+    const counts: TaskCounts = { pending, terminals: terminalCountsByTask() };
     return rows.map((r) => toTask(r, counts));
   },
   get(id: string): Task | null {
@@ -514,7 +844,38 @@ export const tasks = {
          WHERE tasks.id = ?
          GROUP BY tasks.id`,
     ).get(id);
-    return row ? toTask(row) : null;
+    if (!row) return null;
+    const task = toTask(row);
+    // M17: a single-task read must show the same honest "waiting on you"
+    // total `list()` already computes in its batched D11 pass above — every
+    // consumer of `GET /tasks/:id` (and anything built on it, like
+    // `withRunningSubagents` or `GET /tasks/:id/pipeline`) would otherwise
+    // disagree with the board's 2s `/tasks` poll about whether a pipeline
+    // parent has anything pending. Gated on `pipeline_id` (only ever set on
+    // a real pipeline parent row, never on a step) so an ordinary task's
+    // `get` pays no extra query.
+    if (!row.pipeline_id) return task;
+    let stepPending = 0;
+    for (const step of this.stepsForParent(id)) stepPending += step.pendingInteractionCount;
+    return stepPending > 0
+      ? { ...task, pendingInteractionCount: task.pendingInteractionCount + stepPending }
+      : task;
+  },
+  /** Every hidden step task of a pipeline parent (`pipeline_parent_id =
+   *  parentId`), oldest first — the order steps were inserted in, which is
+   *  also execution order for a linear run (a fan-out/join run interleaves
+   *  by `created_at` same as any other insert order). Used by the pipeline
+   *  runner and `GET /tasks/:id/pipeline`. Reuses `TASKS_SELECT` (not a bare
+   *  `SELECT *`) so `hasOpenableRun` is computed the same way it is for
+   *  every other task read in this file. */
+  stepsForParent(parentId: string): Task[] {
+    const rows = db.query<TaskRow, [string]>(
+      `${TASKS_SELECT}
+         WHERE tasks.pipeline_parent_id = ?
+         GROUP BY tasks.id
+         ORDER BY tasks.created_at ASC, tasks.id ASC`,
+    ).all(parentId);
+    return rows.map((r) => toTask(r));
   },
   insert(t: Task): Task {
     db.run(
@@ -522,9 +883,10 @@ export const tasks = {
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
           branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans, todo_progress,
           agent_profile_id, agent_profile,
+          pipeline_id, pipeline_run, pipeline_parent_id, pipeline_step_id,
           last_assistant_event_id, last_seen_event_id,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -536,6 +898,10 @@ export const tasks = {
         t.todoProgress ? JSON.stringify(t.todoProgress) : null,
         t.agentProfileId ?? null,
         t.agentProfile ? JSON.stringify(t.agentProfile) : null,
+        t.pipelineId ?? null,
+        t.pipelineRun ? JSON.stringify(t.pipelineRun) : null,
+        t.pipelineParentId ?? null,
+        t.pipelineStepId ?? null,
         // A brand-new task has never had an assistant event or a mark-seen
         // — both start NULL, which `toTask` reads as `unread: false`.
         null, null,
@@ -545,7 +911,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, unread: false, hasAssistantMessages: false, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
@@ -579,6 +945,14 @@ export const tasks = {
     // run must not race a concurrent unrelated edit into silently detaching
     // the profile — and, like the watermarks/`sent_files`/`fx_recovery`,
     // this write never bumps `updated_at` either.
+    // `pipeline_id`/`pipeline_run`/`pipeline_parent_id`/`pipeline_step_id`
+    // (migration 058) join the same skip list: the first two are written
+    // only by `tasks.insert` (create time) and `tasks.setPipelineRun` below
+    // via its own targeted UPDATE, the last two only by `tasks.insert` and
+    // never change again. A generic PATCH must never clobber a live run's
+    // progress or a step task's fixed pipeline identity, and (like every
+    // other server-managed column above) none of these writes bump
+    // `updated_at`.
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
@@ -749,6 +1123,28 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET agent_profile_id = ?, agent_profile = ? WHERE id = ?`,
       [profileId, snapshot ? JSON.stringify(snapshot) : null, taskId],
+    );
+    return this.get(taskId);
+  },
+  /**
+   * Overwrite a pipeline PARENT task's `pipeline_run` state (`PipelineRunState`
+   * JSON, migration 058) in one targeted `UPDATE` — same pattern as
+   * `setAgentProfile`/`setFxRecovery` above: no `updated_at` bump (this is
+   * server-managed run progress, not a task mutation — the runner calls this
+   * on every state transition, and bumping `updated_at` on each one would
+   * re-render every task on every 2s poll) and it bypasses the generic
+   * `update`'s SET clause entirely so a concurrent unrelated PATCH can't
+   * race a live run. `value: null` is the pre-first-run idle state written
+   * once more explicitly by `tasks.insert`; this method's own callers
+   * (`src/bun/pipeline-runner.ts`) never pass `null` in practice once a run
+   * has started. Doesn't check whether the task exists first — an
+   * `UPDATE ... WHERE id = ?` against a missing id simply matches zero rows,
+   * same as every other targeted UPDATE in this file.
+   */
+  setPipelineRun(taskId: string, run: PipelineRunState | null): Task | null {
+    db.run(
+      `UPDATE tasks SET pipeline_run = ? WHERE id = ?`,
+      [run ? JSON.stringify(run) : null, taskId],
     );
     return this.get(taskId);
   },
@@ -1557,6 +1953,247 @@ export const agentProfiles = {
   taskCount(id: string): number {
     const row = db.query<{ n: number }, [string]>(
       `SELECT COUNT(*) AS n FROM tasks WHERE agent_profile_id = ?`,
+    ).get(id);
+    return row?.n ?? 0;
+  },
+};
+
+/** Thrown by `pipelines.insert`/`update` when the (trimmed, case-insensitive)
+ *  name collides with an existing pipeline — the `409` the server maps this
+ *  to, and what makes `agetor pipeline show <name>` unambiguous
+ *  (`matchPipelineRef` in `shared/pipeline.ts`). Mirrors
+ *  {@link AgentProfileNameError}. */
+export class PipelineNameError extends Error {
+  constructor(name: string) {
+    super(`pipeline name "${name}" is already in use`);
+    this.name = "PipelineNameError";
+  }
+}
+
+type PipelineRow = {
+  id: string;
+  name: string;
+  name_key: string;
+  description: string;
+  graph: string;
+  max_steps: number;
+  created_at: number;
+  updated_at: number;
+};
+
+/** Parse a pipeline row's stored `graph` JSON. This is our own write
+ *  (produced by `validatePipelineGraph` at insert/update time), so this only
+ *  ever fires against on-disk corruption or a shape an older/newer validator
+ *  no longer accepts, but every other JSON column in this file is parsed
+ *  defensively and `pipelines` is no exception.
+ *
+ *  m21: unparseable JSON still collapses to the empty graph
+ *  `{steps:[],edges:[],startStepId:null}` (there's nothing else to return),
+ *  logged via `console.warn` so the corruption is visible. A value that
+ *  parses fine yet fails today's `validatePipelineGraph` is returned AS-IS
+ *  (also warned) ONLY when it's still shaped safely enough to hand to the
+ *  pipeline editor and the step-resolution helpers — a plain object with
+ *  array `steps`/`edges` and a `startStepId` that's a string, `null`, or
+ *  `undefined`. That's deliberately lenient (not full `validatePipelineGraph`
+ *  again): the pipeline editor reads this value straight through, and an
+ *  editor session that opens, makes an unrelated change, and saves would
+ *  otherwise silently overwrite the user's real graph with nothing.
+ *  Anything looser than that minimal shape (not an object, non-array
+ *  `steps`/`edges`, a `startStepId` of some other type) collapses to the
+ *  empty graph instead — there's nothing safe to index into otherwise.
+ *  Trusting the stored shape here is the same call `sanitizeRunSnapshot`
+ *  makes for a run's frozen snapshot, for a different reason — this one is
+ *  "don't destroy data", not "don't re-validate a graph that already
+ *  validated once". */
+
+const parsePipelineGraph = (raw: string): PipelineGraph => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.warn(`[agetor] pipeline graph column is not valid JSON — falling back to an empty graph:`, err);
+    return { steps: [], edges: [], startStepId: null };
+  }
+  const validated = validatePipelineGraph(parsed);
+  if (validated.ok) return validated.graph;
+  console.warn(`[agetor] stored pipeline graph failed validation (${validated.error}) — returning it unmodified if shape-safe`);
+  if (isPlainObject(parsed)) {
+    const rec = parsed as Record<string, unknown>;
+    const startStepIdOk = rec.startStepId === undefined || rec.startStepId === null || typeof rec.startStepId === "string";
+    if (
+      Array.isArray(rec.steps) &&
+      Array.isArray(rec.edges) &&
+      startStepIdOk &&
+      rec.steps.every(isShapeSafePipelineStep) &&
+      rec.edges.every(isShapeSafePipelineEdge)
+    ) {
+      return parsed as unknown as PipelineGraph;
+    }
+  }
+  console.warn(`[agetor] stored pipeline graph shape is unsafe to return as-is — falling back to an empty graph`);
+  return { steps: [], edges: [], startStepId: null };
+};
+
+const toPipeline = (r: PipelineRow): Pipeline => ({
+  id: r.id,
+  name: r.name,
+  description: r.description,
+  graph: parsePipelineGraph(r.graph),
+  maxSteps: r.max_steps,
+  createdAt: r.created_at,
+  updatedAt: r.updated_at,
+});
+
+/** Validate + normalize the name/description fields shared by `insert` and
+ *  `update`: trims the name, rejects empty or over `PIPELINE_LIMITS.name`
+ *  with a plain `Error` (a caller/validation error, not a name-clash error
+ *  — mirrors `validateAgentProfileNameAndInstructions`), and rejects a
+ *  description over `PIPELINE_LIMITS.description`. Returns the trimmed name
+ *  and its lower-cased `name_key`. */
+const validatePipelineNameAndDescription = (name: string, description: string): { name: string; nameKey: string } => {
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error("pipeline name is required");
+  if (trimmed.length > PIPELINE_LIMITS.name) {
+    throw new Error(`pipeline name must be ${PIPELINE_LIMITS.name} characters or fewer`);
+  }
+  if (PIPELINE_CONTROL_CHAR_RE.test(trimmed)) {
+    throw new Error("pipeline name must not contain control characters");
+  }
+  if (description.length > PIPELINE_LIMITS.description) {
+    throw new Error(`pipeline description must be ${PIPELINE_LIMITS.description} characters or fewer`);
+  }
+  return { name: trimmed, nameKey: trimmed.toLowerCase() };
+};
+
+/** Resolve a requested `maxSteps`: absent (`undefined`) defaults to
+ *  `PIPELINE_LIMITS.maxStepsDefault`; anything else must be an integer in
+ *  `1..PIPELINE_LIMITS.maxStepsMax` or this throws a plain `Error` (a
+ *  caller/validation error, like `validatePipelineNameAndDescription`'s).
+ *  L-S5: this used to CLAMP out-of-range values silently, which let the db
+ *  layer be handed exactly what the `/pipelines` routes 400 on — the two
+ *  layers now agree, and the route's error text is reused verbatim. */
+const resolveMaxSteps = (raw: number | undefined): number => {
+  if (raw === undefined) return PIPELINE_LIMITS.maxStepsDefault;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > PIPELINE_LIMITS.maxStepsMax) {
+    throw new Error(`maxSteps must be an integer between 1 and ${PIPELINE_LIMITS.maxStepsMax}`);
+  }
+  return raw;
+};
+
+/**
+ * Named, reusable pipeline graphs (`Pipeline`, `shared/types.ts`) — the
+ * templates a pipeline task is launched from. See `docs/plans/pipelines.md`
+ * for the full design. Structurally a near-clone of `agentProfiles` above:
+ * unique case-insensitive names via `name_key`, delete is never blocked
+ * (D8 — an already-started run is frozen onto its own
+ * `tasks.pipeline_run.snapshot` and doesn't need the live row), and
+ * `taskCounts`/`taskCount` mirror `agentProfiles`' the same way. The one
+ * addition is `graph` validation/normalization on every write, via
+ * `validatePipelineGraph` (`shared/pipeline.ts`) — `insert`/`update` never
+ * store an un-normalized graph, and a graph that fails validation throws a
+ * plain `Error` carrying `validatePipelineGraph`'s own message (the server
+ * maps that to a 400).
+ */
+export const pipelines = {
+  list(): Pipeline[] {
+    return db
+      .query<PipelineRow, []>(`SELECT * FROM pipelines ORDER BY name_key ASC, id ASC`)
+      .all()
+      .map(toPipeline);
+  },
+  get(id: string): Pipeline | null {
+    const row = db.query<PipelineRow, [string]>(`SELECT * FROM pipelines WHERE id = ?`).get(id);
+    return row ? toPipeline(row) : null;
+  },
+  /** Case-insensitive, trimmed name lookup — the backing query for the
+   *  unique-name check in `insert`/`update` and for `matchPipelineRef`'s CLI
+   *  `<id|name>` resolution. */
+  findByName(name: string): Pipeline | null {
+    const row = db
+      .query<PipelineRow, [string]>(`SELECT * FROM pipelines WHERE name_key = ?`)
+      .get(name.trim().toLowerCase());
+    return row ? toPipeline(row) : null;
+  },
+  insert(input: PipelineInput): Pipeline {
+    const description = input.description ?? "";
+    const { name, nameKey } = validatePipelineNameAndDescription(input.name, description);
+    if (this.findByName(name)) throw new PipelineNameError(name);
+
+    const validated = validatePipelineGraph(input.graph);
+    if (!validated.ok) throw new Error(validated.error);
+
+    const maxSteps = resolveMaxSteps(input.maxSteps);
+    const id = randomUUID();
+    const now = Date.now();
+    try {
+      db.run(
+        `INSERT INTO pipelines
+           (id, name, name_key, description, graph, max_steps, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [id, name, nameKey, description, JSON.stringify(validated.graph), maxSteps, now, now],
+      );
+    } catch (e) {
+      if (isUniqueConstraintError(e)) throw new PipelineNameError(name);
+      throw e;
+    }
+    return this.get(id) as Pipeline;
+  },
+  update(id: string, patch: Partial<PipelineInput>): Pipeline | null {
+    const current = this.get(id);
+    if (!current) return null;
+
+    const nextNameRaw = patch.name !== undefined ? patch.name : current.name;
+    const nextDescription = patch.description !== undefined ? patch.description : current.description;
+    const { name, nameKey } = validatePipelineNameAndDescription(nextNameRaw, nextDescription);
+    if (patch.name !== undefined) {
+      const clash = this.findByName(name);
+      if (clash && clash.id !== id) throw new PipelineNameError(name);
+    }
+
+    const validated = patch.graph !== undefined ? validatePipelineGraph(patch.graph) : { ok: true as const, graph: current.graph };
+    if (!validated.ok) throw new Error(validated.error);
+
+    const maxSteps = patch.maxSteps !== undefined ? resolveMaxSteps(patch.maxSteps) : current.maxSteps;
+
+    try {
+      db.run(
+        `UPDATE pipelines SET
+           name = ?, name_key = ?, description = ?, graph = ?, max_steps = ?, updated_at = ?
+         WHERE id = ?`,
+        [name, nameKey, nextDescription, JSON.stringify(validated.graph), maxSteps, Date.now(), id],
+      );
+    } catch (e) {
+      if (isUniqueConstraintError(e)) throw new PipelineNameError(name);
+      throw e;
+    }
+    return this.get(id);
+  },
+  /** Deleting a pipeline always succeeds — a task that was launched from it
+   *  keeps its own frozen `pipeline_run.snapshot` (D8 in the plan), so there
+   *  is nothing to guard against here the way `harnesses.delete` must guard
+   *  against in-use tasks/profiles. Mirrors `agentProfiles.delete`. */
+  delete(id: string): boolean {
+    const current = this.get(id);
+    if (!current) return false;
+    db.run(`DELETE FROM pipelines WHERE id = ?`, [id]);
+    return true;
+  },
+  /** pipelineId -> count of tasks currently bound to it (`pipeline_id =
+   *  pipelineId`, every column including archived). One grouped query — the
+   *  batch form the `GET /pipelines` list route uses so listing N pipelines
+   *  never issues N count queries. Mirrors `agentProfiles.taskCounts`. */
+  taskCounts(): Map<string, number> {
+    const rows = db.query<{ pipeline_id: string; n: number }, []>(
+      `SELECT pipeline_id, COUNT(*) AS n FROM tasks WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id`,
+    ).all();
+    return new Map(rows.map((r) => [r.pipeline_id, r.n]));
+  },
+  /** Single-pipeline count of tasks currently bound to it — for a
+   *  single-resource response (GET/POST/PATCH `/pipelines/:id`) where a full
+   *  grouped scan would be wasteful. Mirrors `agentProfiles.taskCount`. */
+  taskCount(id: string): number {
+    const row = db.query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM tasks WHERE pipeline_id = ?`,
     ).get(id);
     return row?.n ?? 0;
   },

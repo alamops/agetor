@@ -221,6 +221,18 @@ export function toastFxAutoResumeExhausted(args: ToastArgs & { max: number }): v
   });
 }
 
+/** Whether a "needs attention" toast registered in `pendingByTask` is still
+ *  live for `taskId` — i.e. `toastPending`/`toastApiError`/
+ *  `notifyWaitingInput` showed one and neither the user nor `dismissPending`
+ *  has cleared it since. App.tsx reads this for a pipeline PARENT: a hidden
+ *  step task's own interaction toast is retargeted at the parent (same
+ *  `taskId`, same slot), so the parent's own `blocked`/`pipeline`
+ *  "Pipeline needs you" toast is suppressed while that retargeted toast is
+ *  still up — otherwise one underlying block would notify twice. */
+export function hasPendingToast(taskId: string): boolean {
+  return pendingByTask.has(taskId);
+}
+
 /** Clear the pending toast for a task (called when the task leaves `blocked`). */
 export function dismissPending(taskId: string): void {
   const id = pendingByTask.get(taskId);

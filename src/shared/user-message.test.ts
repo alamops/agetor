@@ -20,6 +20,7 @@ import {
 } from "./user-message.ts";
 import { appendReferences } from "./refs.ts";
 import { composeLaunchPrompt } from "./agent-profile.ts";
+import { composeHandoffReminder, HANDOFF_REMINDER_MARKER } from "./pipeline.ts";
 import type { TaskReference } from "./types.ts";
 
 /** Build claude's own `<pasted_content>` wrapper shape (the `oKe` function in
@@ -1153,6 +1154,52 @@ describe("agent instructions tag", () => {
     ]);
     expect(userMessageLines(composeLaunchPrompt({ instructions: "  ", skills: [] }, "just a message"))).toEqual([
       { label: "you›", text: "just a message", tone: "user" },
+    ]);
+  });
+});
+
+describe("pipeline handoff reminder marker", () => {
+  test("a composeHandoffReminder message renders as a single agetor› line with the marker stripped", () => {
+    const composed = composeHandoffReminder({
+      stepName: "Implement",
+      reason: "handoff-missing",
+      detail: null,
+      outgoing: [{ name: "Review", label: "" }],
+      transition: "choose",
+    });
+    expect(composed.startsWith(`${HANDOFF_REMINDER_MARKER}\n\n`)).toBe(true);
+    const expectedText = composed.slice(`${HANDOFF_REMINDER_MARKER}\n\n`.length);
+    expect(userMessageLines(composed)).toEqual([
+      { label: "agetor›", text: expectedText, tone: "machine" },
+    ]);
+  });
+
+  test("handoff-invalid reason also renders as agetor›, marker line stripped", () => {
+    const composed = composeHandoffReminder({
+      stepName: "Implement",
+      reason: "handoff-invalid",
+      detail: "unexpected token",
+      outgoing: [],
+      transition: "choose",
+    });
+    const expectedText = composed.slice(`${HANDOFF_REMINDER_MARKER}\n\n`.length);
+    expect(userMessageLines(composed)).toEqual([
+      { label: "agetor›", text: expectedText, tone: "machine" },
+    ]);
+  });
+
+  test("a plain message that merely mentions the marker word mid-text (not as its first line) stays an ordinary you› line", () => {
+    expect(userMessageLines(`see ${HANDOFF_REMINDER_MARKER} for context`)).toEqual([
+      { label: "you›", text: `see ${HANDOFF_REMINDER_MARKER} for context`, tone: "user" },
+    ]);
+  });
+
+  test("a user-typed message whose first line happens to equal the marker exactly is still treated as the automatic reminder (marker is first-line-only, not authorship-aware)", () => {
+    expect(userMessageLines("[agetor handoff reminder]\n\nlegacy body")).toEqual([
+      { label: "agetor›", text: "legacy body", tone: "machine" },
+    ]);
+    expect(userMessageLines(`${HANDOFF_REMINDER_MARKER}\nhello`)).toEqual([
+      { label: "agetor›", text: "hello", tone: "machine" },
     ]);
   });
 });

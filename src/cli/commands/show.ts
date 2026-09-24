@@ -4,6 +4,8 @@ import { c, out, printJson } from "../output.ts";
 import { usageError } from "../usage.ts";
 import { ApiError, type AgetorClient } from "../api-client.ts";
 import { AGENT_OPTIONS, defaultModeFor, type AgentKind, type Run, type Task } from "../../shared/types.ts";
+import { pipelineStepProgress, stepNameById } from "../../shared/pipeline.ts";
+import { colorRunStatus } from "./pipeline.ts";
 
 export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -20,8 +22,12 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   const modeText = await resolveModeText(client, task.agent, task.mode);
 
   out(`${c.bold(task.title)}  ${c.dim(task.id)}`);
+  // A pipeline (parent) task's own agent/model/mode are cosmetic — copied
+  // from the start step's profile at create time; the parent never spawns
+  // an agent, each step launches on its own frozen profile (L-CLI4).
+  const agentNote = task.pipelineId ? c.dim(" (start step's harness — steps own the launch)") : "";
   out(
-    `  ${label("column")} ${colorColumn(task.column)}   ${label("agent")} ${task.agent}` +
+    `  ${label("column")} ${colorColumn(task.column)}   ${label("agent")} ${task.agent}${agentNote}` +
       `   ${label("model")} ${task.model ?? "-"}   ${label("mode")} ${modeText}`,
   );
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
@@ -31,6 +37,20 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
     const deletedSuffix = await agentProfileDeletedSuffix(client, task);
     out(`  ${label("profile")} ${task.agentProfile.name} (${task.agentProfile.id})${deletedSuffix}`);
   }
+  if (task.pipelineId && task.pipelineRun) {
+    const progress = pipelineStepProgress(task.pipelineRun);
+    out(
+      `  ${label("pipeline")} ${task.pipelineRun.pipelineName} (${task.pipelineId})` +
+        `   ${label("status")} ${colorRunStatus(task.pipelineRun.status)}   ${label("steps")} ${progress.label}`,
+    );
+    for (const b of task.pipelineRun.blocked) {
+      out(c.yellow(`    ⚠ ${b.message}`));
+    }
+  }
+  if (task.pipelineParentId) {
+    const stepOf = await pipelineStepOfText(client, task);
+    if (stepOf) out(`  ${label("step of")} ${stepOf}`);
+  }
   out(`  ${label("prompt")} ${c.dim(truncate(task.prompt, 240))}`);
   if (pending.length > 0) {
     out(
@@ -38,6 +58,14 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
         `  ! ${pending.length} pending interaction(s) — answer: agetor answer ${task.id.slice(0, 8)}`,
       ),
     );
+    // `/tasks/:id/interactions/pending` aggregates a pipeline parent's step
+    // interactions — say which step task each card actually belongs to when
+    // it isn't the task the user asked about.
+    for (const req of pending) {
+      if (req.taskId !== task.id) {
+        out(c.yellow(`    ↳ ${req.kind} on step task ${req.taskId.slice(0, 8)}`));
+      }
+    }
   }
   if (runs.length > 0) {
     out(c.dim(`\n  runs (${runs.length}, newest first):`));
@@ -96,6 +124,36 @@ async function agentProfileDeletedSuffix(client: AgetorClient, task: Task): Prom
   } catch (e) {
     if (e instanceof ApiError && e.status === 404) return c.dim(" (deleted)");
     return "";
+  }
+}
+
+/**
+ * `"<parent title> (<parent id>) · step <step name>"` for a hidden pipeline
+ * step task (`task.pipelineParentId` set) — resolved via `GET /tasks/:id/
+ * pipeline` (`getPipelineRun`) on the parent id, which both confirms the
+ * parent is actually a pipeline task and returns its `pipelineRun.snapshot`
+ * graph (frozen at first Run) to resolve the step's display name from
+ * `task.pipelineStepId`. Falls back to the step task's own title when the
+ * snapshot or step id isn't available (e.g. an old run predating the
+ * snapshot). Never fails the whole `show` on a lookup error (L-CLI3): a
+ * clean 404 means the parent row is gone — an ORPHANED step, which the
+ * server lets you delete/archive directly (`isOrphanedPipelineStep`) — so
+ * say so instead of swallowing it; any other error still prints the bare
+ * parent id, so the relationship is never silently dropped.
+ */
+async function pipelineStepOfText(client: AgetorClient, task: Task): Promise<string | null> {
+  if (!task.pipelineParentId) return null;
+  const parentId = task.pipelineParentId;
+  try {
+    const { task: parent } = await client.getPipelineRun(parentId);
+    const graph = parent.pipelineRun?.snapshot?.graph;
+    const stepName = graph && task.pipelineStepId ? stepNameById(graph, task.pipelineStepId) : task.title;
+    return `${parent.title} (${parent.id}) · step ${stepName}`;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) {
+      return `${parentId} ${c.yellow("(pipeline task no longer exists — this step can be deleted/archived directly)")}`;
+    }
+    return parentId;
   }
 }
 

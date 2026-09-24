@@ -22,6 +22,16 @@ export async function cmdStart(args: string[], flags: Flags): Promise<void> {
   // sending a message (the app resumes rather than starting a fresh run).
   const control = runControl(task);
   if (control === "stop") {
+    // A pipeline (parent) task never has a run of its own to answer or
+    // message — its steps do — so point at the pipeline-level controls
+    // instead of the generic cancel/answer/send trio (M-CLI2).
+    if (task.pipelineId) {
+      throw new Error(
+        `pipeline is already ${task.column === "blocked" ? "blocked" : "running"} — stop it with ` +
+          `'agetor cancel ${short}', or retry its blocked/cancelled step(s) with ` +
+          `'agetor pipeline retry ${short}'`,
+      );
+    }
     throw new Error(
       `task is already running — stop it with 'agetor cancel ${short}', ` +
         `answer with 'agetor answer ${short}', or continue with 'agetor send ${short} <message>'`,
@@ -135,6 +145,17 @@ export async function cmdCancel(args: string[], flags: Flags): Promise<void> {
   if (!ref) throw usageError("cancel");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
+  // A pipeline (parent) task never carries its own `runId` — only its hidden
+  // step tasks do, one at a time — so the generic `!task.runId` check below
+  // always fails for one even while its run is genuinely active (`column`
+  // mirrors `pipelineRun.status`). Route it to the pipeline cancel route
+  // instead, which stops every currently-active step execution.
+  if (task.pipelineId) {
+    const res = await client.cancelPipeline(task.id);
+    if (flags.json) return printJson(res);
+    out(`${c.yellow("■")} cancel requested for ${c.dim(task.id.slice(0, 8))}`);
+    return;
+  }
   // Stop is only meaningful while active (running/blocked) — same as the app.
   if (runControl(task) !== "stop" || !task.runId) {
     throw new Error("task is not running");

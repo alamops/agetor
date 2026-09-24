@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "./task-context-menu.ts";
-import type { Task, TaskFxRecovery } from "../../shared/types.ts";
+import type { PipelineRunState, Task, TaskFxRecovery } from "../../shared/types.ts";
 
 /** Minimal hand-built Task fixture, mirroring `task-unread.test.ts`'s
  *  `makeTaskRow` for the required fields. Defaults to a fresh backlog task
@@ -45,6 +45,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
  *  Used to assert every entry lands in the group the plan assigns it. */
 const ACTION_GROUP: Record<TaskMenuAction, TaskMenuGroup> = {
   open: "primary",
+  "open-pipeline": "primary",
   start: "primary",
   stop: "primary",
   "resume-recovery": "primary",
@@ -431,5 +432,136 @@ describe("buildTaskContextMenu", () => {
     const lastEntry = entries[entries.length - 1]!;
     expect(lastEntry.action).toBe("delete");
     expect(lastEntry.danger).toBe(true);
+  });
+
+  describe("pipeline tasks (docs/plans/pipelines.md D9/D11)", () => {
+    test("a pipeline PARENT task gets 'open-pipeline' instead of 'open details'", () => {
+      const task = makeTask({ pipelineId: "pipe-1" });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual(["open-pipeline", "start", "diff", "open-in-finder", "delete"]);
+      expect(entries.find((e) => e.action === "open-pipeline")?.label).toBe("Open pipeline");
+      for (const e of entries) {
+        expect(e.group).toBe(ACTION_GROUP[e.action]);
+      }
+    });
+
+    test("a pipeline PARENT task still gets archive/unarchive/delete like any other task", () => {
+      const running = buildTaskContextMenu(makeTask({ pipelineId: "pipe-1", column: "running" }), { isOpen: false });
+      expect(actions(running)).toContain("archive");
+      expect(actions(running)).toContain("delete");
+      // L-A1: without a `running` pipelineRun there's nothing the cancel
+      // route would honour — no Stop, even though the column says running.
+      expect(actions(running)).not.toContain("stop");
+
+      const archived = buildTaskContextMenu(
+        makeTask({ pipelineId: "pipe-1", archivedAt: Date.now() }),
+        { isOpen: false },
+      );
+      expect(actions(archived)).toContain("unarchive");
+    });
+
+    test("a hidden STEP task hides archive/unarchive/delete — the parent owns its lifecycle", () => {
+      const running = buildTaskContextMenu(
+        makeTask({ pipelineParentId: "pipe-parent-1", column: "running" }),
+        { isOpen: false },
+      );
+      expect(actions(running)).toEqual(["open", "stop", "diff", "open-in-finder"]);
+      expect(actions(running)).not.toContain("archive");
+      expect(actions(running)).not.toContain("delete");
+
+      const done = buildTaskContextMenu(
+        makeTask({ pipelineParentId: "pipe-parent-1", column: "done" }),
+        { isOpen: false },
+      );
+      expect(actions(done)).not.toContain("archive");
+      expect(actions(done)).not.toContain("delete");
+
+      const archived = buildTaskContextMenu(
+        makeTask({ pipelineParentId: "pipe-parent-1", archivedAt: Date.now() }),
+        { isOpen: false },
+      );
+      expect(actions(archived)).not.toContain("unarchive");
+      expect(actions(archived)).not.toContain("delete");
+    });
+
+    test("a hidden STEP task still gets plain 'open' — it's not a pipeline parent", () => {
+      const task = makeTask({ pipelineParentId: "pipe-parent-1" });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+      expect(entries[0]).toEqual({ action: "open", label: "Open details", group: "primary" });
+    });
+
+    // M15 (review): a pipeline parent with run history is "openable" — Run
+    // must not show alongside Open pipeline once there's something to open.
+    function pipelineRun(overrides: Partial<PipelineRunState> = {}): PipelineRunState {
+      return {
+        pipelineId: "pipe-1",
+        pipelineName: "Pipe",
+        snapshot: null,
+        status: "idle",
+        active: [],
+        joins: {},
+        blocked: [],
+        history: [],
+        stepCount: 0,
+        startedAt: null,
+        endedAt: null,
+        ...overrides,
+      };
+    }
+
+    test("M15: a pipeline parent with pipelineRun.history.length > 0 omits 'start' — Retry/Restart live in the run view", () => {
+      const task = makeTask({
+        pipelineId: "pipe-1",
+        column: "ready",
+        pipelineRun: pipelineRun({
+          status: "done",
+          history: [
+            { seq: 1, stepId: "s1", taskId: "step-task-1", startedAt: Date.now(), endedAt: Date.now(), outcome: "succeeded", handoff: null, nextStepIds: [] },
+          ],
+        }),
+      });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual(["open-pipeline", "diff", "open-in-finder", "delete"]);
+      expect(actions(entries)).not.toContain("start");
+    });
+
+    test("M15: an idle pipeline parent (pipelineRun set, empty history) still shows 'start'", () => {
+      const task = makeTask({
+        pipelineId: "pipe-1",
+        pipelineRun: pipelineRun(),
+      });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual(["open-pipeline", "start", "diff", "open-in-finder", "delete"]);
+    });
+
+    test("L-A1: a pipeline parent's Stop gates on pipelineRun.status === 'running', not the column", () => {
+      const running = buildTaskContextMenu(
+        makeTask({ pipelineId: "pipe-1", column: "running", pipelineRun: pipelineRun({ status: "running", active: [{ stepId: "s1", taskId: "step-1", seq: 1 }] }) }),
+        { isOpen: false },
+      );
+      expect(actions(running)).toContain("stop");
+
+      // A `blocked` run with nothing live — the cancel route 409s
+      // ("pipeline is not running"), so the card/menu must not offer Stop.
+      const blocked = buildTaskContextMenu(
+        makeTask({ pipelineId: "pipe-1", column: "blocked", pipelineRun: pipelineRun({ status: "blocked", active: [{ stepId: "s1", taskId: "step-1", seq: 1 }] }) }),
+        { isOpen: false },
+      );
+      expect(actions(blocked)).not.toContain("stop");
+
+      // A plain (non-pipeline) blocked task keeps the column-based rule.
+      const plainBlocked = buildTaskContextMenu(makeTask({ column: "blocked" }), { isOpen: false });
+      expect(actions(plainBlocked)).toContain("stop");
+    });
+
+    test("M15: a pipeline parent with no pipelineRun at all (never run) still shows 'start'", () => {
+      const task = makeTask({ pipelineId: "pipe-1", pipelineRun: null });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual(["open-pipeline", "start", "diff", "open-in-finder", "delete"]);
+    });
   });
 });

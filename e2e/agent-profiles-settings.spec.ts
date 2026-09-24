@@ -199,8 +199,11 @@ test.describe("agent profiles — Settings surface", () => {
     // Only Claude Code is enabled at this point (cursor ships disabled by
     // migration 032, and this is the very first test in the suite) — one
     // harness button, selected by default ("default" variant = bg-primary).
+    // The harness buttons render off TaskLaunchPickers' own `/harnesses`
+    // fetch (one probe per harness), which under parallel-run load outlasts
+    // the 5s default — the form itself is up long before the buttons are.
     const claudeButton = harnessButton(form, "Claude Code");
-    await expect(claudeButton).toBeVisible();
+    await expect(claudeButton).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await expect(claudeButton).toHaveClass(/bg-primary/);
 
     // Switch model first, then mode, then effort — in that order — so each
@@ -266,7 +269,9 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(launchSelect(form, "Effort")).toHaveValue("medium");
     await expect(launchSelect(form, "Mode")).toHaveValue("plan");
     await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(WIDGET_BUILDER_INSTRUCTIONS);
-    await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/);
+    // Harness buttons render only once TaskLaunchPickers' `/harnesses` fetch
+    // lands (one probe per harness) — past the 5s default under load.
+    await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
     await expect(form.locator('[data-testid="skills-picker-chip"]')).toHaveCount(0);
 
     await form.getByTestId("agent-profile-save").click();

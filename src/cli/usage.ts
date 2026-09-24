@@ -20,6 +20,9 @@ export const USAGE: Record<string, string> = {
     --profile <id|name>  launch from a saved agent profile (agetor profile ls) —
                         cannot combine with --agent/--model/--mode/--effort/
                         --fast/--max-mode, the profile defines them
+    --pipeline <id|name> launch a pipeline (agetor pipeline ls) instead of a
+                        single agent — cannot combine with --profile or any
+                        of --agent/--model/--mode/--effort/--fast/--max-mode
     --type <t>         task | subtask | epic | feature | bug | spike
     --ref <path>       attach a file/folder reference (repeatable)
     --issue <url>      seed title/prompt from a GitHub/GitLab issue + its thread
@@ -30,7 +33,8 @@ export const USAGE: Record<string, string> = {
 
   List tasks. Filters combine (substring match for --repo/--search):
     --column <c>   --agent <id>   --type <t>   --repo <s>   --search <s>
-    --archived     archived only        --all   include archived`,
+    --archived     archived only        --all   include archived
+    --steps        also list hidden pipeline step tasks (hidden by default)`,
 
   ps: `usage: agetor ps
 
@@ -90,7 +94,8 @@ export const USAGE: Record<string, string> = {
 
   cancel: `usage: agetor cancel <task-id>
 
-  Stop the active run. The session stays alive for follow-ups (claude-code).`,
+  Stop the active run. The session stays alive for follow-ups (claude-code).
+  On a pipeline task, stops every currently-active step execution instead.`,
 
   attach: `usage: agetor attach <task-id>
 
@@ -196,6 +201,65 @@ export const USAGE: Record<string, string> = {
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced).`,
 
+  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>
+
+  Manage pipelines — named graphs of agent-profile-bound steps launched as
+  one board task (built in the app's Pipelines editor; the CLI moves them
+  around) — and control a pipeline TASK's run.
+    ls / show / rm / export / import   take a pipeline <ref> (id, or its
+                                        unique case-insensitive name)
+    retry / advance / restart / status take a pipeline TASK <ref> (id or
+                                        short-id prefix, like every other
+                                        task-targeting command; a hidden
+                                        step task's id is refused — target
+                                        its pipeline task instead)
+  Launch a pipeline with 'agetor add --pipeline <id|name>'.`,
+
+  "pipeline export": `usage: agetor pipeline export <ref> [--out <file|->] [--force]
+
+  Print (or write to --out; '-' is stdout) the pipeline as PipelineInput
+  JSON (name/description/graph/maxSteps) — re-importable with 'pipeline
+  import'. Refuses to overwrite an existing --out file unless --force.
+  Each step also carries a 'profileName' hint (and 'subagents.profileNames')
+  next to its agent-profile id so an import on another machine can remap
+  the profile by name.`,
+
+  "pipeline import": `usage: agetor pipeline import <file|-> [--name <name>]
+
+  Create a pipeline from an exported JSON file ('-' reads stdin). --name
+  overrides the file's own name. A step agent-profile id (or subagent
+  profile id) that doesn't exist on this machine is remapped to the unique
+  local profile named by the file's 'profileName' hint when there is one
+  (printed), else warned about (--json: folded into 'warnings') — assign a
+  profile in the editor before running such a pipeline.`,
+
+  "pipeline retry": `usage: agetor pipeline retry <task-id> [--from <step-task-id-or-prefix>]
+
+  Retry the pipeline run's currently blocked (or cancelled) step
+  execution(s). 409 unless the run is actually blocked or cancelled. --from
+  narrows the retry to one specific active execution (its step task's id or
+  a unique prefix of it — 'agetor pipeline status' lists them); omitted,
+  every eligible execution plus every pending run-level block is retried.`,
+
+  "pipeline advance": `usage: agetor pipeline advance <task-id> [--next <step-name-or-id> …] [--finish] [--from <step-task-id>]
+
+  Manually resolve what a pipeline run is currently waiting on. --next
+  (repeatable) names the step(s) to run next — matched against the run's
+  snapshot graph by step name, then step id, then an edge label (the same
+  precedence a step's own handoff 'next' gets); --finish ends the run here
+  with no next step. Exactly one of --next / --finish is required. --from targets a
+  specific blocked/awaiting execution when more than one is in play (e.g. a
+  fan-out); omitted, the sole such execution is used.`,
+
+  "pipeline restart": `usage: agetor pipeline restart <task-id>
+
+  Restart the pipeline run from its start step, discarding current progress.`,
+
+  "pipeline status": `usage: agetor pipeline status <task-id>
+
+  Print the pipeline task's run status, blocked entries, active step
+  executions, and full step history.`,
+
   daemon: `usage: agetor daemon <status | start | stop>
 
   Control the background headless core (used when the desktop app isn't open).`,
@@ -220,6 +284,7 @@ const ALIASES: Record<string, string> = {
   delete: "rm",
   harnesses: "harness",
   profiles: "profile",
+  pipelines: "pipeline",
   project: "projects",
   sent: "files",
 };

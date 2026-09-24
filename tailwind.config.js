@@ -88,9 +88,30 @@ export default {
           "0%, 100%": { opacity: "0.45" },
           "50%":      { opacity: "1" },
         },
+        // Pipelines canvas: a soft pulse around the node currently
+        // running/awaiting attention, using the --info token (blue) so it
+        // matches the rest of the app's "in progress" color language rather
+        // than introducing a new hue. Animates `outline` (+ `outline-offset`)
+        // rather than `box-shadow` on purpose: Tailwind's `ring-*` utilities
+        // ARE box-shadow, so a box-shadow keyframe on the same element
+        // clobbered both the node's static `ring-info` and the `ring-primary`
+        // selection ring for as long as the animation ran. The element pairs
+        // this with `outline outline-2` so there's an outline to animate.
+        "pipeline-pulse": {
+          "0%, 100%": { outlineColor: "hsl(var(--info) / 0.55)", outlineOffset: "0px" },
+          "50%":      { outlineColor: "hsl(var(--info) / 0)",    outlineOffset: "6px" },
+        },
+        // Pipelines canvas: animated "marching ants" dash offset for an
+        // in-flight edge (a step currently handing off to the next one).
+        "pipeline-dash": {
+          "0%":   { strokeDashoffset: "24" },
+          "100%": { strokeDashoffset: "0" },
+        },
       },
       animation: {
         "awaiting-pulse": "awaiting-pulse 2.4s ease-in-out infinite",
+        "pipeline-pulse": "pipeline-pulse 1.6s ease-in-out infinite",
+        "pipeline-dash": "pipeline-dash 1s linear infinite",
       },
     },
   },
