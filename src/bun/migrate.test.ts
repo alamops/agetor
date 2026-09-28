@@ -542,11 +542,11 @@ test("056_normalize_cursor_opus_5_5 folds suffixed claude-opus-5-5 variants into
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("056 is the last registered migration, right after 055", () => {
-  const at = migrations.findIndex((m) => m.id === "056_normalize_cursor_opus_5_5");
+test("058 is the last registered migration, right after 057", () => {
+  const at = migrations.findIndex((m) => m.id === "058_jcode_id_collision_selfheal");
   expect(at).toBe(migrations.length - 1);
   const prev = migrations[at - 1];
-  expect(prev?.id).toBe("055_normalize_cursor_grok_4_7");
+  expect(prev?.id).toBe("057_jcode_harness");
   const last = migrations[at];
-  expect(last?.sql).toContain("claude-opus-5-5");
+  expect(last?.sql).toContain("jcode-builtin");
 });
