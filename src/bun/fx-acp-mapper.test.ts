@@ -1771,4 +1771,63 @@ describe("parseFxEffortOption", () => {
     ];
     expect(parseFxEffortOption(duplicated)).toEqual({ current: "low", values: ["low"] });
   });
+
+  // ── configId parameterization (jcode reuse) ───────────────────────────────
+  // jcode reuses this driver but names its reasoning-effort control
+  // `reasoning_effort` (not fx's `effort`) and exposes a selectable `model`
+  // entry that must be applied over ACP (its argv `--model` is ignored). Both
+  // are read by the SAME parseFxEffortOption via its `configId` arg. Verbatim
+  // shape from a live jcode v0.89 `session/new` (trimmed model option list).
+  const JCODE_CONFIG_OPTIONS = [
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: "claude-sonnet-5",
+      options: [
+        { value: "claude-sonnet-5", name: "claude-sonnet-5" },
+        { value: "claude-opus-4-6", name: "claude-opus-4-6" },
+        { value: "gpt-6-astra", name: "gpt-6-astra" },
+      ],
+    },
+    {
+      id: "reasoning_effort",
+      name: "Reasoning effort",
+      category: "thought_level",
+      type: "select",
+      currentValue: "high",
+      options: [
+        { value: "none", name: "none" },
+        { value: "low", name: "low" },
+        { value: "medium", name: "medium" },
+        { value: "high", name: "high" },
+        { value: "xhigh", name: "xhigh" },
+        { value: "max", name: "max" },
+      ],
+    },
+  ];
+
+  test("configId 'reasoning_effort' reads jcode's effort entry (default 'effort' would miss it and return null)", () => {
+    expect(parseFxEffortOption(JCODE_CONFIG_OPTIONS, "reasoning_effort")).toEqual({
+      current: "high",
+      values: ["none", "low", "medium", "high", "xhigh", "max"],
+    });
+    // The fx default id finds no `effort` entry in jcode's shape.
+    expect(parseFxEffortOption(JCODE_CONFIG_OPTIONS)).toBeNull();
+  });
+
+  test("configId 'model' reads the model entry — the generic reader powers jcode's over-ACP model application", () => {
+    expect(parseFxEffortOption(JCODE_CONFIG_OPTIONS, "model")).toEqual({
+      current: "claude-sonnet-5",
+      values: ["claude-sonnet-5", "claude-opus-4-6", "gpt-6-astra"],
+    });
+  });
+
+  test("configId defaults to 'effort' when omitted — fx's shape is unaffected by the new param", () => {
+    // Explicit 'effort' and the omitted default resolve identically for fx.
+    expect(parseFxEffortOption(ZAI_GLM_FLASH_CONFIG_OPTIONS, "effort")).toEqual(
+      parseFxEffortOption(ZAI_GLM_FLASH_CONFIG_OPTIONS),
+    );
+  });
 });

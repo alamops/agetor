@@ -2239,10 +2239,10 @@ export function extractFxProviderValue(result: unknown): string | null {
  *  malformed shape without throwing: a non-string `currentValue` reads as
  *  `null`, a missing/non-array `options` reads as `values: []`, and a
  *  non-string option `value` is skipped rather than included. */
-export function parseFxEffortOption(configOptions: unknown): { current: string | null; values: string[] } | null {
+export function parseFxEffortOption(configOptions: unknown, configId: string = "effort"): { current: string | null; values: string[] } | null {
   if (!Array.isArray(configOptions)) return null;
   const entry = configOptions.find(
-    (o) => o && typeof o === "object" && (o as { id?: unknown }).id === "effort",
+    (o) => o && typeof o === "object" && (o as { id?: unknown }).id === configId,
   ) as { currentValue?: unknown; options?: unknown } | undefined;
   if (!entry) return null;
   const rawOptions = Array.isArray(entry.options) ? entry.options : [];
@@ -2303,13 +2303,19 @@ export function parseFxEffortOption(configOptions: unknown): { current: string |
 async function applyFxEffort(
   state: FxSessionState,
   sessionResult: unknown,
-  opts: { effort?: string | null; model?: string },
+  opts: { effort?: string | null; effortConfigId?: string; model?: string },
 ): Promise<void> {
   const effort = opts.effort ?? null;
   if (effort === null) return;
+  // fx's own control id is `effort`; jcode reuses this driver but names the
+  // identical control `reasoning_effort` (see `FxLaunchOptions.effortConfigId`).
+  // The same id is used BOTH to find the entry in the session result's
+  // `configOptions` AND as the `configId` sent to `session/set_config_option`.
+  const configId = opts.effortConfigId ?? "effort";
   const modelLabel = opts.model ?? "the active model";
   const parsed = parseFxEffortOption(
     (sessionResult as { configOptions?: unknown } | undefined)?.configOptions,
+    configId,
   );
   // A missing `effort` entry and a present-but-empty one (`values: []`,
   // e.g. `auto` is the only thing fx would ever offer to begin with) are
@@ -2343,7 +2349,7 @@ async function applyFxEffort(
     await withTimeout(
       sendRpc(state, "session/set_config_option", {
         sessionId: state.sessionId,
-        configId: "effort",
+        configId,
         value: effort,
       }),
       RPC_HANDSHAKE_TIMEOUT_MS,
@@ -2360,6 +2366,88 @@ async function applyFxEffort(
       `fx: couldn't set effort ${effort} — ${message} — running at fx's default`,
       `fx:${state.runId}:${state.seq++}`,
     );
+  }
+}
+
+/** Best-effort application of the task's model to the active ACP session, for
+ *  kinds whose argv `--model` flag does NOT pin the session model (jcode:
+ *  `jcode acp --model X` is ignored — the session always starts at jcode's own
+ *  default; the model is only honored via `session/set_config_option
+ *  {configId:"model"}` — live-verified v0.89). Returns `true` when the caller
+ *  may proceed to `session/prompt`, `false` when it must NOT (the model could
+ *  not be pinned — this function has already failed the turn loudly via
+ *  `failTurn`, so the run lands failed/blocked rather than silently executing
+ *  on the wrong model/provider).
+ *
+ *  No-op returning `true` unless `opts.modelConfigId` is set (fx pins via argv,
+ *  so it passes nothing here). The model id ALSO selects jcode's auth/billing
+ *  route (bare `claude-*` = subscription, `us.anthropic.*`/`global.*` =
+ *  Bedrock, etc. — live-verified), so this doubles as provider pinning. Per the
+ *  no-silent-cross-provider-fallback rule (wolf, 2026-09-28): a task pinned to a
+ *  model that this session can't select, or a `set_config_option` that fails,
+ *  must FAIL the run — never fall through to the session default on a different
+ *  provider/account.
+ *
+ *  Reuses `parseFxEffortOption` (a generic "read this configOptions entry's
+ *  current value + offered values by id" reader despite its fx-effort name) to
+ *  confirm the id is offered and the requested model is a listed option, and to
+ *  skip the RPC when the session's `currentValue` already equals the target. */
+async function applyAcpModel(
+  state: FxSessionState,
+  sessionResult: unknown,
+  opts: { model?: string; modelConfigId?: string },
+): Promise<boolean> {
+  const configId = opts.modelConfigId;
+  const model = opts.model ?? null;
+  if (!configId || model === null) return true;
+  const parsed = parseFxEffortOption(
+    (sessionResult as { configOptions?: unknown } | undefined)?.configOptions,
+    configId,
+  );
+  // No model entry at all (or an empty option list) — the session can't be
+  // pinned to the requested model, so running it would silently execute on the
+  // session default (a different provider/account). Fail loudly instead.
+  if (parsed === null || parsed.values.length === 0) {
+    failTurn(
+      state,
+      `jcode: this session exposes no selectable model list, so it can't be pinned to ${model} `
+        + `(it would run on ${parsed?.current ?? "the session default"} instead). Not running — `
+        + `re-check the model id or the harness's login.`,
+    );
+    return false;
+  }
+  if (!parsed.values.includes(model)) {
+    failTurn(
+      state,
+      `jcode: model ${model} isn't offered by this session (offers ${parsed.values.length} ids; `
+        + `current ${parsed.current ?? "unknown"}). Not running on a different model — `
+        + `pick a model this account/provider actually exposes.`,
+    );
+    return false;
+  }
+  if (parsed.current === model) return true;
+  try {
+    await withTimeout(
+      sendRpc(state, "session/set_config_option", {
+        sessionId: state.sessionId,
+        configId,
+        value: model,
+      }),
+      RPC_HANDSHAKE_TIMEOUT_MS,
+      "session/set_config_option",
+    );
+    if (state.resolved) return false;
+    // success — silent, nothing to emit; the caller proceeds.
+    return true;
+  } catch (err) {
+    if (state.resolved) return false;
+    const message = err instanceof RpcError ? (err.rawMessage ?? err.message) : String(err);
+    failTurn(
+      state,
+      `jcode: couldn't set model ${model} — ${message}. Not running on the session default `
+        + `(no silent cross-provider fallback).`,
+    );
+    return false;
   }
 }
 
@@ -2400,6 +2488,15 @@ async function runFxTurn(
      *  `session/new`/a successful `session/resume`/`session/load` — see
      *  `FxLaunchOptions.effort`. */
     effort?: string | null;
+    /** ACP `configId` for the reasoning-effort control — see
+     *  `FxLaunchOptions.effortConfigId`. Defaults to `"effort"` in
+     *  `applyFxEffort` when omitted (fx's own id); jcode passes
+     *  `"reasoning_effort"`. */
+    effortConfigId?: string;
+    /** ACP `configId` for the model control, when the model must be applied
+     *  over ACP rather than pinned by argv — see `FxLaunchOptions.modelConfigId`.
+     *  Undefined for fx (argv-pinned); jcode passes `"model"`. */
+    modelConfigId?: string;
     /** The launch model id, used only for `applyFxEffort`'s breadcrumb text
      *  — see `FxLaunchOptions.model`. */
     model?: string;
@@ -2527,9 +2624,15 @@ async function runFxTurn(
     }
     if (state.resolved) return;
     if (resumed) {
-      // Apply the task's stored effort before session/prompt — resumeResult
-      // carries the same configOptions shape session/new does (see
-      // applyFxEffort). Best-effort: never throws, never fails the turn.
+      // Apply the task's model (jcode only — no-op for fx) then its stored
+      // effort before session/prompt — resumeResult carries the same
+      // configOptions shape session/new does. Model first: on a resumed jcode
+      // session the argv `--model` was ignored, and a follow-up run may carry a
+      // NEWER model than the one the session opened with (per-run model
+      // override), so re-assert it here. A model that can't be pinned FAILS
+      // the turn (no silent cross-provider fallback) — stop before prompting.
+      if (!(await applyAcpModel(state, resumeResult, opts))) return;
+      if (state.resolved) return;
       await applyFxEffort(state, resumeResult, opts);
       if (state.resolved) return;
     }
@@ -2550,7 +2653,10 @@ async function runFxTurn(
         maybeEmitProvider(loadResult);
         state.suppressUpdates = false;
         // loadResult carries the same configOptions shape session/new/resume
-        // do — apply the task's stored effort here too, before session/prompt.
+        // do — apply the task's model (jcode only) then stored effort here too,
+        // before session/prompt.
+        if (!(await applyAcpModel(state, loadResult, opts))) return;
+        if (state.resolved) return;
         await applyFxEffort(state, loadResult, opts);
         if (state.resolved) return;
       } catch (err) {
@@ -2596,9 +2702,16 @@ async function runFxTurn(
     state.onSessionId?.(sessionId);
     maybeEmitProvider(sessionResult);
 
-    // Apply the task's stored effort — best-effort, never throws, never
-    // fails the turn (see applyFxEffort). Order relative to the mode nudge
-    // below is irrelevant — they touch independent configOptions entries.
+    // Apply the task's model (jcode only — `jcode acp --model` is ignored, so
+    // the model MUST be set over ACP; no-op for fx, which pins via argv), then
+    // its stored effort. A model that can't be pinned FAILS the turn (no silent
+    // cross-provider fallback — the model id also selects jcode's auth/billing
+    // route), so stop before effort/prompt when it returns false. Model first so
+    // the effort read reflects the chosen model where a kind's effort list is
+    // model-dependent. Order relative to the mode nudge below is irrelevant —
+    // independent configOptions entries.
+    if (!(await applyAcpModel(state, sessionResult, opts))) return;
+    if (state.resolved) return;
     await applyFxEffort(state, sessionResult, opts);
     if (state.resolved) return;
 
@@ -2819,6 +2932,27 @@ export interface FxLaunchOptions {
    *  as of wave 2 (see `docs/plans/fx-0.0.10-compat.md` T4) — optional here
    *  so this file typechecks standalone during wave 1. */
   effort?: string | null;
+  /** The ACP `configId` this driver sends to set reasoning effort, and reads
+   *  as the `id` of the effort entry in a session result's `configOptions`.
+   *  Defaults to `"effort"` — fx's own id. The jcode kind reuses this whole
+   *  driver but exposes its reasoning-effort control under `"reasoning_effort"`
+   *  instead (live-verified against jcode v0.89's `session/new` /
+   *  `session/set_config_option`), so its spawn path passes that id here. Every
+   *  fx-specific caller omits it and keeps fx's byte-identical behaviour. See
+   *  `parseFxEffortOption`/`applyFxEffort`. */
+  effortConfigId?: string;
+  /** When set, the driver applies `opts.model` to the active ACP session via
+   *  `session/set_config_option {configId, value: model}` (after
+   *  `session/new`/`resume`/`load`, before `session/prompt`), reading this
+   *  entry's `id` from the session result's `configOptions` to confirm the id
+   *  is offered and the value is a listed option. Defaults to undefined for fx,
+   *  which pins its model via the argv `--model` flag at spawn time — so fx
+   *  applies nothing over ACP. jcode is the opposite: `jcode acp --model X` is
+   *  IGNORED for the ACP session (live-verified v0.89 — the session always
+   *  starts at jcode's own default `claude-sonnet-5` regardless of argv), and
+   *  the model is only honored via `session/set_config_option {configId:
+   *  "model"}`, so its spawn path passes `"model"` here. See `applyAcpModel`. */
+  modelConfigId?: string;
   /** The launch model id (fx's Gateway model id, e.g. `zai/glm-5.3-flash`)
    *  — used only for `applyFxEffort`'s breadcrumb text, never sent as its
    *  own RPC field (the model itself is already pinned by `argv`'s
@@ -2934,6 +3068,8 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
     resumeSessionId: opts.resumeSessionId,
     continueRecovery: opts.continueRecovery,
     effort: opts.effort,
+    effortConfigId: opts.effortConfigId,
+    modelConfigId: opts.modelConfigId,
     model,
   }).catch((err) => {
     failTurn(state, `fx acp: unexpected driver error: ${errMessage(err)}`);
