@@ -1,0 +1,24 @@
+  signature" and "Hold at the restaurant counter for pickup, I will collect it
+  myself later this evening".
+────────────────────────────────────────────────────────────────────────────────
+←  ☒ Toppings  ☐ Size  ☐ Delivery  ✔ Submit  →
+
+What size pizza do you want?
+
+  1. Small
+     8 inch
+❯ 2. Medium
+     12 inch
+  3. Large
+     16 inch
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+
+
+
+
+
+

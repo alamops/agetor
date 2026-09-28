@@ -5059,9 +5059,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // The native modal is live on the tmux pane; there's no promise. Plan
       // the keystrokes from the user's picks and drive them into the modal
       // (planAskAnswers + driveAskAnswers, which verifies-and-retries the
-      // review-screen confirm rather than trusting send-keys exit codes), or,
-      // for a custom/free-text answer, Esc the modal (sendModalKeys) and post
-      // the answer as a normal follow-up turn. Then drop the card.
+      // review-screen confirm rather than trusting send-keys exit codes). A
+      // typed custom answer is driven too: it is typed into the modal's native
+      // `Type something` row and verified on the pane before Enter. Only what
+      // can't be driven — multiline or over-long custom text, an unknown
+      // option, an arity mismatch — falls back to Esc'ing the modal
+      // (sendModalKeys) and posting the answer as a normal follow-up turn.
+      // Then drop the card.
       "/ask-questions/:id/answer": {
         POST: authed(async (req) => {
           const body = (await req.json().catch(() => ({}))) as Partial<AskQuestionsAnswer>;
@@ -5083,21 +5087,22 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             }));
             const plan = planAskAnswers(specs, sanitised);
             let ok = false;
-            // Only the custom/free-text path routes through `sendInput`
+            // Only the message-mode fallback routes through `sendInput`
             // (which is the only thing capable of reporting a withhold — the
             // "drive" path types keys straight into an already-open modal via
             // tmux send-keys, with no composer paste for a blocking modal to
             // hold up). Left undefined on the drive path; the response only
-            // carries these when the free-text branch actually ran.
+            // carries these when the message-mode branch actually ran.
             let withheld: true | undefined;
             let savedToBacklog: true | undefined;
             let reason: string | undefined;
             if (plan.mode === "drive") {
               ok = await driveAskAnswers(pending.taskId, plan);
             } else {
-              // Custom/free-text (or anything we can't drive): dismiss the
-              // native modal, then deliver the answer as a follow-up turn —
-              // mirrors claude's own "Type something." → REPL behaviour.
+              // Message-mode fallback — only for what can't be driven into
+              // the modal (multiline or over-long custom text, an unknown
+              // option, an arity mismatch): dismiss the native modal, then
+              // deliver the answer as a follow-up turn.
               await sendModalKeys(pending.taskId, ["Escape"]);
               // Give claude a beat to tear the modal down and return to the
               // REPL prompt before the paste lands, so it isn't eaten by the

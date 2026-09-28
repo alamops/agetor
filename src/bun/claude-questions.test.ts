@@ -321,7 +321,7 @@ describe("planAskAnswers — drive sequences", () => {
     const plan = planAskAnswers(specs, answers);
     expect(plan.mode).toBe("drive");
     // Green = index 1 → Down once, Enter. Flat single-select ⇒ NO trailing submit Enter.
-    expect(plan).toEqual({ mode: "drive", keys: ["Down", "Enter"], confirmsReview: false });
+    expect(plan).toEqual({ mode: "drive", steps: ["Down", "Enter"], confirmsReview: false });
   });
 
   test("first option of a flat single-select needs no arrow", () => {
@@ -329,7 +329,7 @@ describe("planAskAnswers — drive sequences", () => {
       [{ question: "q", multiSelect: false, options: ["Red", "Green"] }],
       [{ selected: ["Red"] }],
     );
-    expect(plan).toEqual({ mode: "drive", keys: ["Enter"], confirmsReview: false });
+    expect(plan).toEqual({ mode: "drive", steps: ["Enter"], confirmsReview: false });
   });
 
   test("captured multi example: Toppings[Ham,Mushroom] + Size[Large]", () => {
@@ -347,7 +347,7 @@ describe("planAskAnswers — drive sequences", () => {
     // Size: 0→1 (Large) Down,Enter (auto-advances to Submit). Trailing Enter submits.
     expect(plan).toEqual({
       mode: "drive",
-      keys: ["Down", "Enter", "Down", "Enter", "Right", "Down", "Enter", "Enter"],
+      steps: ["Down", "Enter", "Down", "Enter", "Right", "Down", "Enter", "Enter"],
       confirmsReview: true,
     });
   });
@@ -360,7 +360,7 @@ describe("planAskAnswers — drive sequences", () => {
     // Cheese idx0 (no arrow) Enter ; 0→2 Down,Down,Enter ; Right (to Submit) ; Enter (submit).
     expect(plan).toEqual({
       mode: "drive",
-      keys: ["Enter", "Down", "Down", "Enter", "Right", "Enter"],
+      steps: ["Enter", "Down", "Down", "Enter", "Right", "Enter"],
       confirmsReview: true,
     });
   });
@@ -375,7 +375,7 @@ describe("planAskAnswers — drive sequences", () => {
     // B idx1 Down,Enter ; 1→3 Down,Down,Enter ; Right ; Enter.
     expect(planAsc).toEqual({
       mode: "drive",
-      keys: ["Down", "Enter", "Down", "Down", "Enter", "Right", "Enter"],
+      steps: ["Down", "Enter", "Down", "Down", "Enter", "Right", "Enter"],
       confirmsReview: true,
     });
   });
@@ -389,7 +389,7 @@ describe("planAskAnswers — drive sequences", () => {
     // q1: Down,Enter(auto-advance) ; q2: Down,Down,Enter(auto-advance to Submit) ; Enter(submit).
     expect(plan).toEqual({
       mode: "drive",
-      keys: ["Down", "Enter", "Down", "Down", "Enter", "Enter"],
+      steps: ["Down", "Enter", "Down", "Down", "Enter", "Enter"],
       confirmsReview: true,
     });
   });
@@ -400,20 +400,26 @@ describe("planAskAnswers — message fallbacks", () => {
     { question: "Which color?", multiSelect: false, options: ["Red", "Green", "Blue"] },
   ];
 
-  test("custom/free-text answer falls back to message mode", () => {
-    const plan = planAskAnswers(specs, [{ selected: [], custom: "Magenta" }]);
+  // Plan change (2.1.284): a typed custom answer is DRIVEN through the native
+  // "Type something" row, so these two no longer fall back. What still falls
+  // back for custom text is the untypeable cases (multi-line / over-long).
+  test("multi-line custom answer falls back to message mode", () => {
+    const plan = planAskAnswers(specs, [{ selected: [], custom: "Magenta\nor pink" }]);
     expect(plan.mode).toBe("message");
     if (plan.mode === "message") {
-      expect(plan.reason).toBe("custom-text");
+      expect(plan.reason).toBe("multiline-custom");
       expect(plan.text).toContain("Magenta");
       expect(plan.text).toContain("Which color?");
     }
   });
 
-  test("custom text alongside a pick still falls back (can't mix)", () => {
+  test("custom text alongside a pick: the typed text wins and is driven", () => {
     const plan = planAskAnswers(specs, [{ selected: ["Red"], custom: "or maybe pink" }]);
-    expect(plan.mode).toBe("message");
-    if (plan.mode === "message") expect(plan.reason).toBe("custom-text");
+    expect(plan).toEqual({
+      mode: "drive",
+      steps: ["Down", "Down", "Down", { type: "text", text: "or maybe pink" }, "Enter"],
+      confirmsReview: false,
+    });
   });
 
   test("empty answer → message mode (native requires an answer)", () => {

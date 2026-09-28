@@ -1,0 +1,24 @@
+  signature" and "Hold at the restaurant counter for pickup, I will collect it
+  myself later this evening".
+────────────────────────────────────────────────────────────────────────────────
+←  ☒ Toppings  ☒ Size  ☐ Delivery  ✔ Submit  →
+
+How should we deliver the order?
+
+❯ 1. Deliver to my home address by courier, leaving it at the front door without
+     signature
+  2. Hold at the restaurant counter for pickup, I will collect it myself later
+     this evening
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+
+
+
+
+
+
+
+

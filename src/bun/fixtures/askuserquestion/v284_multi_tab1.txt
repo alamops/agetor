@@ -1,0 +1,24 @@
+  signature" and "Hold at the restaurant counter for pickup, I will collect it
+  myself later this evening".
+────────────────────────────────────────────────────────────────────────────────
+←  ☐ Toppings  ☐ Size  ☐ Delivery  ✔ Submit  →
+
+│ Which toppings do you want on your pizza? Pick as many as you like, keeping in
+│ mind that each additional topping adds a small charge to the final price of
+│ the order.
+
+❯ 1. [ ] Cheese
+         Add cheese
+  2. [ ] Ham
+         Add ham
+  3. [ ] Mushrooms
+         Add mushrooms
+  4. [ ] Olives
+         Add olives
+  5. [ ] Type something
+     Next
+────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+

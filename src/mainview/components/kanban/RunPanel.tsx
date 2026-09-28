@@ -7254,7 +7254,7 @@ function AskQuestionsCard({
           <div className="space-y-2">
             {req.questions.map((q, qi) => (
               <div key={qi} className="rounded-md border border-border/40 bg-muted/20 p-2">
-                <div className="text-[12px] font-medium">{q.question}</div>
+                <div className="whitespace-pre-wrap text-[12px] font-medium">{q.question}</div>
                 <div className="mt-0.5 text-[12px] text-primary">→ {answerSummary(qi)}</div>
               </div>
             ))}
@@ -7273,7 +7273,7 @@ function AskQuestionsCard({
           <div className="space-y-3">
             {req.questions.map((q, qi) => (
               <div key={qi} className="rounded-md border border-border/40 bg-muted/20 p-2">
-                <div className="mb-1.5 text-[13px] font-medium">{q.question}</div>
+                <div className="mb-1.5 whitespace-pre-wrap text-[13px] font-medium">{q.question}</div>
                 <div className="space-y-1">
                   {q.options.map((opt) => {
                     const picked = answers[qi]?.selected.includes(opt.label) ?? false;
@@ -7308,7 +7308,7 @@ function AskQuestionsCard({
                 <Textarea
                   value={answers[qi]?.custom ?? ""}
                   onChange={(e) => setCustom(qi, e.target.value)}
-                  placeholder="Custom answer (optional)"
+                  placeholder={q.multiSelect ? "Custom answer — added to the selection" : "Custom answer — replaces the selection"}
                   rows={2}
                   className="mt-2 text-[12px]"
                 />
