@@ -2125,64 +2125,116 @@ describe("startupConfirmDecision — pure attempt/retry decision", () => {
     expect(startupConfirmDecision({ seenTwice: true, attempts: 0, lastAttemptAt: 0, now: 1000 })).toBe("attempt");
   });
 
-  test("after an attempt: waits until STARTUP_CONFIRM_RETRY_MS, then retries", () => {
+  test("the retry window is at least 1.5 s", () => {
+    expect(STARTUP_CONFIRM_RETRY_MS).toBeGreaterThanOrEqual(1500);
+  });
+
+  test("after an attempt: waits until STARTUP_CONFIRM_RETRY_MS, then retries only when the fingerprint was stable", () => {
     const at = 5000;
     expect(startupConfirmDecision({ seenTwice: true, attempts: 1, lastAttemptAt: at, now: at + 1 })).toBe("wait");
     expect(startupConfirmDecision({ seenTwice: true, attempts: 1, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS - 1 })).toBe("wait");
     expect(startupConfirmDecision({ seenTwice: true, attempts: 1, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS })).toBe("attempt");
-    // A retry does not need the fingerprint to repeat (it moves with the cursor).
-    expect(startupConfirmDecision({ seenTwice: false, attempts: 2, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS })).toBe("attempt");
+    // A retry now DOES need the identical fingerprint on two consecutive polls.
+    expect(startupConfirmDecision({ seenTwice: false, attempts: 2, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS })).toBe("wait");
   });
 
-  test("at the attempt cap: waits out the window, then gives up", () => {
+  test("at the attempt cap: waits out the window, then gives up (once stable)", () => {
     const at = 9000;
     expect(STARTUP_CONFIRM_MAX_ATTEMPTS).toBe(4);
     expect(startupConfirmDecision({ seenTwice: true, attempts: 4, lastAttemptAt: at, now: at + 10 })).toBe("wait");
     expect(startupConfirmDecision({ seenTwice: true, attempts: 4, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS })).toBe("give-up");
+    expect(startupConfirmDecision({ seenTwice: false, attempts: 4, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS })).toBe("wait");
     expect(startupConfirmDecision({ seenTwice: true, attempts: 3, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS })).toBe("attempt");
   });
 });
 
 describe("createStartupConfirmTracker — the boot poller's per-dialog state machine", () => {
   const { createStartupConfirmTracker, STARTUP_CONFIRM_RETRY_MS } = __forTest;
+  const POLL = 350;
   const TRUST = (cursorFirst: boolean): string =>
     ` Quick safety check: Is this a project you created or one you trust?\n\n` +
     (cursorFirst ? ` ❯ No, exit\n   Yes, I trust this folder\n` : `   No, exit\n ❯ Yes, I trust this folder\n`) +
     `\n Enter to confirm · Esc to cancel\n`;
   const match = (cursorFirst: boolean) => matchStartupConsentDialog(TRUST(cursorFirst))!;
 
-  test("confirms only on the 2nd consecutive sighting; auto-confirmed is emitted only after the dialog leaves", () => {
+  test("confirms only on the 2nd consecutive sighting; auto-confirmed is emitted only after the dialog is absent on two polls", () => {
     const t = createStartupConfirmTracker();
     const m = match(true);
     expect(t.observe(m, 0)).toEqual({ attempt: null, statuses: [] });
-    const second = t.observe(m, 350);
+    const second = t.observe(m, POLL);
     expect(second.attempt).toBe(m);
     expect(second.statuses).toEqual([]);
     // Still on the pane 350 ms later: too early to retry, and NOT reported confirmed.
-    expect(t.observe(m, 700)).toEqual({ attempt: null, statuses: [] });
-    // Gone on a later poll → now it is reported.
-    expect(t.observe(null, 1050)).toEqual({
+    expect(t.observe(m, 2 * POLL)).toEqual({ attempt: null, statuses: [] });
+    // One blank frame is not enough...
+    expect(t.observe(null, 3 * POLL)).toEqual({ attempt: null, statuses: [] });
+    // ...the second consecutive one reports it.
+    expect(t.observe(null, 4 * POLL)).toEqual({
       attempt: null,
       statuses: ["claude startup dialog auto-confirmed (trust-folder)"],
     });
     // Reported once.
-    expect(t.observe(null, 1400).statuses).toEqual([]);
+    expect(t.observe(null, 5 * POLL).statuses).toEqual([]);
   });
 
-  test("a dialog that survives the attempt is retried after the window with the CURRENT cursor (Down landed → Enter only)", () => {
+  test("N3: m,m,m,null,m,m,null,null emits exactly one auto-confirmed (at the 2nd consecutive null) and no extra attempt", () => {
+    const t = createStartupConfirmTracker();
+    const m = match(true);
+    const seq: Array<typeof m | null> = [m, m, m, null, m, m, null, null];
+    const attempts: number[] = [];
+    const statuses: Array<{ i: number; s: string }> = [];
+    seq.forEach((obs, i) => {
+      const step = t.observe(obs, i * POLL);
+      if (step.attempt) attempts.push(i);
+      for (const s of step.statuses) statuses.push({ i, s });
+    });
+    expect(attempts).toEqual([1]);
+    expect(statuses).toEqual([{ i: 7, s: "claude startup dialog auto-confirmed (trust-folder)" }]);
+  });
+
+  test("N3: a single null frame keeps the entry and its attempt count (no fresh first attempt afterwards)", () => {
+    const t = createStartupConfirmTracker();
+    const m = match(true);
+    t.observe(m, 0);
+    expect(t.observe(m, POLL).attempt).toBe(m);
+    expect(t.observe(null, 2 * POLL).statuses).toEqual([]);
+    // Back again, within the retry window: waits (attempts is still 1, not reset to 0
+    // — a reset would let the very next stable pair fire another attempt immediately).
+    expect(t.observe(m, 3 * POLL).attempt).toBeNull();
+    expect(t.observe(m, 4 * POLL).attempt).toBeNull();
+  });
+
+  test("N2: a retry needs an identical fingerprint on two consecutive post-window polls", () => {
     const t = createStartupConfirmTracker();
     const before = match(true);
     t.observe(before, 0);
-    expect(t.observe(before, 350).attempt).toBe(before);
-    expect(before.cursorIndex).toBe(0);
-    expect(before.acceptIndex).toBe(1);
-    // Down landed but Enter didn't: the cursor now sits on the accept row.
-    const after = match(false);
+    expect(t.observe(before, POLL).attempt).toBe(before); // attempt #1 at t=350
+    const after = match(false); // Down landed, Enter did not: cursor now on the accept row
     expect(after.fingerprint).not.toBe(before.fingerprint);
-    expect(t.observe(after, 700).attempt).toBeNull(); // < 700ms after the attempt at 350
-    const retry = t.observe(after, 350 + STARTUP_CONFIRM_RETRY_MS);
+    const t0 = POLL;
+    // Inside the window: never.
+    for (let now = t0 + POLL; now < t0 + STARTUP_CONFIRM_RETRY_MS; now += POLL) {
+      expect(t.observe(after, now).attempt).toBeNull();
+    }
+    // First post-window poll: only ONE stable sighting → still waits.
+    const first = t0 + Math.ceil(STARTUP_CONFIRM_RETRY_MS / POLL) * POLL;
+    expect(t.observe(after, first).attempt).toBeNull();
+    // Second consecutive post-window poll with the same fingerprint → retry, Enter alone.
+    const retry = t.observe(after, first + POLL);
     expect(retry.attempt).toBe(after);
-    expect(retry.attempt!.cursorIndex).toBe(retry.attempt!.acceptIndex); // Enter alone
+    expect(retry.attempt!.cursorIndex).toBe(retry.attempt!.acceptIndex);
+  });
+
+  test("N2: a fingerprint that changes between the two post-window polls restarts the stability count", () => {
+    const t = createStartupConfirmTracker();
+    const a = match(true);
+    const b = match(false);
+    t.observe(a, 0);
+    expect(t.observe(a, POLL).attempt).toBe(a);
+    const first = POLL + 5 * POLL; // 1750 ms after the attempt: past the window
+    expect(t.observe(a, first).attempt).toBeNull();
+    expect(t.observe(b, first + POLL).attempt).toBeNull(); // changed mid-repaint
+    expect(t.observe(b, first + 2 * POLL).attempt).toBe(b); // now two identical in a row
   });
 
   test("gives up after 4 attempts with ONE status line, then stops retrying", () => {
@@ -2192,8 +2244,8 @@ describe("createStartupConfirmTracker — the boot poller's per-dialog state mac
     t.observe(m, now);
     let attempts = 0;
     const statuses: string[] = [];
-    for (let i = 0; i < 40; i++) {
-      now += 350;
+    for (let i = 0; i < 80; i++) {
+      now += POLL;
       const step = t.observe(m, now);
       if (step.attempt) attempts++;
       statuses.push(...step.statuses);
@@ -2202,21 +2254,75 @@ describe("createStartupConfirmTracker — the boot poller's per-dialog state mac
     expect(statuses).toEqual([
       "claude startup dialog could not be confirmed after 4 attempts (trust-folder) — answer it in the terminal",
     ]);
-    // Leaving after a give-up never claims an auto-confirm.
-    expect(t.observe(null, now + 350).statuses).toEqual([]);
+    // N4: the poller asks the tracker whether to fall through to the generic card path.
+    expect(t.hasGivenUp("trust-folder")).toBe(true);
+    expect(t.hasGivenUp("bypass-permissions")).toBe(false);
+    // Leaving after a give-up never claims an auto-confirm (even after 2 absent polls).
+    expect(t.observe(null, now + POLL).statuses).toEqual([]);
+    expect(t.observe(null, now + 2 * POLL).statuses).toEqual([]);
+    expect(t.hasGivenUp("trust-folder")).toBe(false);
+  });
+
+  test("N4: before give-up hasGivenUp is false, so the poller keeps auto-confirming instead of carding", () => {
+    const t = createStartupConfirmTracker();
+    const m = match(true);
+    expect(t.hasGivenUp("trust-folder")).toBe(false);
+    t.observe(m, 0);
+    t.observe(m, POLL);
+    expect(t.hasGivenUp("trust-folder")).toBe(false);
+  });
+
+  test("N4: the dialog that survived give-up is still cardable by the generic path (pickScrapeMatch), so the fall-through registers a tmux_prompt", () => {
+    const generic = __forTest.pickScrapeMatch(TRUST(true), { paneWorking: false, watchdogArmed: false });
+    expect(generic).not.toBeNull();
+    expect(generic!.unparsable).toBe(true);
+    expect(generic!.paneText).toContain("Yes, I trust this folder");
+  });
+
+  test("flushAbsent (bootSettled early return) reports only dialogs NOT matched on the last poll", () => {
+    // Still matched on the last poll (boot window timed out with the dialog up): nothing.
+    const stuck = createStartupConfirmTracker();
+    const m = match(true);
+    stuck.observe(m, 0);
+    expect(stuck.observe(m, POLL).attempt).toBe(m);
+    stuck.observe(m, 2 * POLL);
+    expect(stuck.flushAbsent()).toEqual([]);
+    expect(stuck.flushConfirmed()).toEqual([]); // entries were cleared by the flush
+
+    // Absent on the last poll after an attempt (one blank frame is enough here): reported once.
+    const gone = createStartupConfirmTracker();
+    gone.observe(m, 0);
+    gone.observe(m, POLL);
+    gone.observe(null, 2 * POLL); // single null: entry kept, statuses empty
+    expect(gone.flushAbsent()).toEqual(["claude startup dialog auto-confirmed (trust-folder)"]);
+    expect(gone.flushAbsent()).toEqual([]);
+
+    // Matched again after a blank frame: the absence counter reset, so nothing.
+    const flicker = createStartupConfirmTracker();
+    flicker.observe(m, 0);
+    flicker.observe(m, POLL);
+    flicker.observe(null, 2 * POLL);
+    flicker.observe(m, 3 * POLL);
+    expect(flicker.flushAbsent()).toEqual([]);
+
+    // Never attempted (only ever one sighting) and gave-up entries emit nothing either.
+    const fresh = createStartupConfirmTracker();
+    fresh.observe(m, 0);
+    fresh.observe(null, POLL);
+    expect(fresh.flushAbsent()).toEqual([]);
   });
 
   test("a different dialog is tracked under its own name; flushConfirmed reports attempted-but-unreported ones", () => {
     const t = createStartupConfirmTracker();
     const bypass = matchStartupConsentDialog(`Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept`)!;
     t.observe(bypass, 0);
-    expect(t.observe(bypass, 350).attempt).toBe(bypass);
+    expect(t.observe(bypass, POLL).attempt).toBe(bypass);
     const trust = match(true);
-    // Bypass left, trust appears: bypass is reported confirmed, trust waits a poll.
-    const step = t.observe(trust, 700);
+    // Bypass replaced by trust (positive evidence it is gone): reported immediately, trust waits a poll.
+    const step = t.observe(trust, 2 * POLL);
     expect(step.statuses).toEqual(["claude startup dialog auto-confirmed (bypass-permissions)"]);
     expect(step.attempt).toBeNull();
-    expect(t.observe(trust, 1050).attempt).toBe(trust);
+    expect(t.observe(trust, 3 * POLL).attempt).toBe(trust);
     // JSONL appeared while the trust dialog was still "pending": flush reports it.
     expect(t.flushConfirmed()).toEqual(["claude startup dialog auto-confirmed (trust-folder)"]);
     expect(t.flushConfirmed()).toEqual([]);

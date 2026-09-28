@@ -8,7 +8,7 @@ import path from "node:path";
 // claude-tmux-scraper.test.ts.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-askdrive-"));
 
-import { __forTest, driveAskAnswers } from "./claude-tmux.ts";
+import { __forTest, dismissAskModalForMessage, driveAskAnswers } from "./claude-tmux.ts";
 import type { AskModalKind, DriveStep } from "./claude-questions.ts";
 
 const {
@@ -132,6 +132,18 @@ describe("paneShowsTypedAnswer", () => {
     expect(paneShowsTypedAnswer("  4. purple\n", "purple")).toBe(false);
   });
 
+  test("the untouched placeholder row never echoes a prefix of `Type something` (T / Type / Types)", () => {
+    const untouched = "  3. green\n❯ 4. Type something.\n  5. Chat about this\n";
+    for (const text of ["T", "Ty", "Type", "Types", "Type something", "Type something."]) {
+      expect(paneShowsTypedAnswer(untouched, text)).toBe(false);
+    }
+    // Multi-select placeholder, and the unpunctuated spelling.
+    expect(paneShowsTypedAnswer("❯ 5. [ ] Type something\n     Next\n", "Type")).toBe(false);
+    // ...whereas the same text really typed into the row (row now reads `Type`) does echo.
+    expect(paneShowsTypedAnswer("  3. green\n❯ 4. Type\n  5. Chat about this\n", "Type")).toBe(true);
+    expect(paneShowsTypedAnswer("  3. green\n❯ 4. Types\n  5. Chat about this\n", "Types")).toBe(true);
+  });
+
   test("false for an unrelated pane", () => {
     expect(paneShowsTypedAnswer("❯ 4. Type something.\n  5. Chat about this\n", "purple")).toBe(false);
     expect(paneShowsTypedAnswer("", "purple")).toBe(false);
@@ -198,6 +210,17 @@ describe("escapeTypedTrailingSemicolon", () => {
     expect(escapeTypedTrailingSemicolon("a;b")).toBe("a;b");
     expect(escapeTypedTrailingSemicolon("plain")).toBe("plain");
     expect(escapeTypedTrailingSemicolon("")).toBe("");
+  });
+
+  test("a text already ending in backslashes gets exactly ONE more before the `;` (tmux 3.6a eats one)", () => {
+    // Verified on tmux 3.6a via `send-keys -l --` into a `cat` pane: N backslashes
+    // + `;` arrive as max(N - 1, 0) backslashes + `;`; N = 0 truncates.
+    const BS = String.fromCharCode(92);
+    expect(escapeTypedTrailingSemicolon("A" + BS + ";")).toBe("A" + BS + BS + ";");
+    expect(escapeTypedTrailingSemicolon("A" + BS + BS + ";")).toBe("A" + BS + BS + BS + ";");
+    expect(escapeTypedTrailingSemicolon(BS + ";")).toBe(BS + BS + ";");
+    // A trailing backslash WITHOUT a `;` is left alone.
+    expect(escapeTypedTrailingSemicolon("A" + BS)).toBe("A" + BS);
   });
 });
 
@@ -445,5 +468,136 @@ describe("confirmStartupDialog — key gap over a recorded fake tmux", () => {
       expect(await confirmStartupDialog(taskId, sessionName, dialog(1, 1))).toBe(true);
       expect(fake.calls().filter((a) => a[0] === "send-keys")).toEqual([["send-keys", "-t", sessionName, "Enter"]]);
     });
+  });
+});
+
+
+// ────────────────────────────────────────────────────────────────────────────
+// dismissAskModalForMessage (F-D N1) — over a scripted fake tmux whose pane
+// depends on how many `Escape` keys have been sent so far (each element of a
+// `COMPOSER_CLEAR_KEYS` send counts).
+// ────────────────────────────────────────────────────────────────────────────
+
+interface ScriptedTmux {
+  binPath: string;
+  logPath: string;
+  sendKeys(): string[][];
+}
+
+/** `frames`: the pane is the LAST frame whose `minEsc` <= the cumulative number
+ *  of `Escape` arguments sent to `send-keys` so far. */
+function makeScriptedTmux(frames: Array<{ minEsc: number; pane: string }>): ScriptedTmux {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-dismiss-tmux-"));
+  scratchDirs.push(dir);
+  const binPath = path.join(dir, "tmux");
+  const logPath = path.join(dir, "log.jsonl");
+  writeFileSync(
+    binPath,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync, readFileSync, existsSync } from "node:fs";\n` +
+      `const argv = process.argv.slice(2);\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(argv) + "\\n");\n` +
+      `if (argv.includes("capture-pane")) {\n` +
+      `  const frames = ${JSON.stringify(frames)};\n` +
+      `  const lines = readFileSync(${JSON.stringify(logPath)}, "utf8").split("\\n").filter(Boolean).map((l) => JSON.parse(l));\n` +
+      `  const esc = lines.filter((a) => a.includes("send-keys")).flat().filter((k) => k === "Escape").length;\n` +
+      `  let pane = frames[0].pane;\n` +
+      `  for (const f of frames) if (f.minEsc <= esc) pane = f.pane;\n` +
+      `  process.stdout.write(pane);\n` +
+      `}\n`,
+  );
+  chmodSync(binPath, 0o755);
+  return {
+    binPath,
+    logPath,
+    sendKeys: () => {
+      if (!existsSync(logPath)) return [];
+      return readFileSync(logPath, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as string[])
+        .map((a) => (a[0] === "-L" ? a.slice(2) : a))
+        .filter((a) => a.includes("send-keys"))
+        .map((a) => a.slice(a.indexOf("send-keys") + 3)); // drop `send-keys -t <session>`
+    },
+  };
+}
+
+async function withScripted<T>(fake: ScriptedTmux, fn: (taskId: string) => Promise<T>): Promise<T> {
+  const prevBin = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = fake.binPath;
+  const taskId = `dismiss-${Math.random().toString(36).slice(2, 10)}`;
+  __forTest.installSession(taskId, path.join(path.dirname(fake.logPath), "s.jsonl"));
+  try {
+    return await fn(taskId);
+  } finally {
+    __forTest.uninstallSession(taskId);
+    if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevBin;
+  }
+}
+
+const IDLE_STATUS_BAR = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+const RULE = "─".repeat(80);
+const CLEAN_REPL = `\n${RULE}\n❯ \n${RULE}\n${IDLE_STATUS_BAR}\n`;
+const DIRTY_REPL = readFileSync(path.join(import.meta.dir, "fixtures/askuserquestion/v284_typed_single.txt"), "utf8");
+const MODAL_PANE = TYPE_ROW_PANE;
+
+describe("dismissAskModalForMessage — over a scripted fake tmux", () => {
+  test("fixture sanity: the recorded declined-modal pane has draft text in the composer; the clean one does not", () => {
+    expect(__forTest.paneShowsComposerText(DIRTY_REPL)).toBe(true);
+    expect(__forTest.paneShowsComposerText(CLEAN_REPL)).toBe(false);
+    expect(__forTest.paneShowsIdleInputBox(CLEAN_REPL)).toBe(true);
+  });
+
+  test("modal gone after one Escape + clean composer → true, exactly one Escape", async () => {
+    const fake = makeScriptedTmux([{ minEsc: 0, pane: MODAL_PANE }, { minEsc: 1, pane: CLEAN_REPL }]);
+    const res = await withScripted(fake, (taskId) => dismissAskModalForMessage(taskId));
+    expect(res).toBe(true);
+    expect(fake.sendKeys()).toEqual([["Escape"]]);
+  });
+
+  test("modal persisting through the first window → ONE more Escape, then true", async () => {
+    const fake = makeScriptedTmux([{ minEsc: 0, pane: MODAL_PANE }, { minEsc: 2, pane: CLEAN_REPL }]);
+    const res = await withScripted(fake, (taskId) => dismissAskModalForMessage(taskId));
+    expect(res).toBe(true);
+    expect(fake.sendKeys()).toEqual([["Escape"], ["Escape"]]);
+  });
+
+  test("leftover draft text in the composer → COMPOSER_CLEAR_KEYS sent (one send-keys) and re-verified", async () => {
+    // 1 Escape closes the modal but leaves `❯ purple`; the clear pair (esc count 3) empties it.
+    const fake = makeScriptedTmux([
+      { minEsc: 0, pane: MODAL_PANE },
+      { minEsc: 1, pane: DIRTY_REPL },
+      { minEsc: 3, pane: CLEAN_REPL },
+    ]);
+    const res = await withScripted(fake, (taskId) => dismissAskModalForMessage(taskId));
+    expect(res).toBe(true);
+    expect(fake.sendKeys()).toEqual([["Escape"], [...__forTest.COMPOSER_CLEAR_KEYS]]);
+  });
+
+  test("a composer that will not clear → false (after the clear keys were tried once)", async () => {
+    const fake = makeScriptedTmux([{ minEsc: 0, pane: MODAL_PANE }, { minEsc: 1, pane: DIRTY_REPL }]);
+    const res = await withScripted(fake, (taskId) => dismissAskModalForMessage(taskId));
+    expect(res).toBe(false);
+    expect(fake.sendKeys()).toEqual([["Escape"], [...__forTest.COMPOSER_CLEAR_KEYS]]);
+  });
+
+  test("a bare composer never gets the clear keys (a double Escape there opens the rewind picker)", async () => {
+    const fake = makeScriptedTmux([{ minEsc: 0, pane: MODAL_PANE }, { minEsc: 1, pane: CLEAN_REPL }]);
+    await withScripted(fake, (taskId) => dismissAskModalForMessage(taskId));
+    expect(fake.sendKeys().some((k) => k.length === 2)).toBe(false);
+  });
+
+  test("modal never goes away → false after exactly ASK_DISMISS_MAX_ESCAPES Escapes", async () => {
+    const fake = makeScriptedTmux([{ minEsc: 0, pane: MODAL_PANE }]);
+    const res = await withScripted(fake, (taskId) => dismissAskModalForMessage(taskId));
+    expect(res).toBe(false);
+    expect(__forTest.ASK_DISMISS_MAX_ESCAPES).toBe(2);
+    expect(fake.sendKeys()).toEqual([["Escape"], ["Escape"]]);
+  });
+
+  test("an unknown task → false without touching tmux", async () => {
+    expect(await dismissAskModalForMessage("no-such-task-" + Math.random())).toBe(false);
   });
 });

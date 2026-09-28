@@ -2071,6 +2071,21 @@ function renderFakeModal(tabs: FakeTab[], tab: number, cursor: number): string {
   return out.join("\n");
 }
 
+/** The review tab (`✔ Submit`) as tmux captures it — no `Chat about this`, no
+ *  `Esc to cancel` footer; `detectAskModal` reads it as `"review"`. */
+const FAKE_REVIEW_FRAME = [
+  "─".repeat(80),
+  "Review your answers",
+  "",
+  " ● Question for Alpha?",
+  "   → Alpha one",
+  "",
+  "Ready to submit your answers?",
+  "",
+  "❯ 1. Submit answers",
+  "  2. Cancel",
+].join("\n");
+
 /** In-memory PaneIo: clamps Up at option 0 and Down at the last option (no
  *  wrap — matching the real TUI), resets the cursor to 0 on a tab switch, and
  *  logs every key + resize so the test can assert cursor/tab restoration. */
@@ -2091,6 +2106,10 @@ function makeFakePane(
     swallowDownAt?: number[];
     /** Ignore every `Left` press. */
     swallowAllLefts?: boolean;
+    /** 1-based indices of `Left` presses that are swallowed while a LATE `Right`
+     *  (an earlier resend the TUI processed after the fact) lands, leaving the
+     *  modal stranded on the "Ready to submit your answers?" review tab. */
+    driftToReviewOnLeftAt?: number[];
     /** Up from option 0 WRAPS to the Type row (the real TUI's behaviour), and
      *  Down/Up move over the Type/Chat rows too. Default: clamp at the options. */
     wrap?: boolean;
@@ -2100,9 +2119,15 @@ function makeFakePane(
   let rightPresses = 0, leftPresses = 0, upPresses = 0, downPresses = 0;
   const log: string[] = [];
   const io = {
-    capture: async () => renderFakeModal(tabs, tab, cursor),
+    capture: async () => (tab >= tabs.length ? FAKE_REVIEW_FRAME : renderFakeModal(tabs, tab, cursor)),
     send: async (key: NavKey) => {
       log.push(key);
+      if (key === "Left" && opts.driftToReviewOnLeftAt?.includes(leftPresses + 1)) {
+        leftPresses++;
+        tab = tabs.length;
+        cursor = 0;
+        return true;
+      }
       if (key === "Right") {
         rightPresses++;
         if (opts.swallowAllRights || opts.swallowRightAt?.includes(rightPresses)) return true;
@@ -2113,6 +2138,11 @@ function makeFakePane(
       }
       if (key === "Up") { upPresses++; if (opts.swallowUpAt?.includes(upPresses)) return true; }
       if (key === "Down") { downPresses++; if (opts.swallowDownAt?.includes(downPresses)) return true; }
+      if (tab >= tabs.length) {
+        // On the review tab only Left/Right move (Right clamps, Left steps back).
+        if (key === "Left") { tab = tabs.length - 1; cursor = 0; }
+        return true;
+      }
       const cur = tabs[tab]!;
       const rowCount = cur.options.length + (cur.typeRow === false ? 1 : 2);
       if (key === "Down") cursor = opts.wrap ? (cursor + 1) % rowCount : Math.min(cursor + 1, cur.options.length - 1);
@@ -2478,6 +2508,29 @@ test("collectAskQuestionsFromPane: a swallowed Right is resent once and the walk
     expect(log).toContain("restore:120x30");
   } finally {
     __forTest.uninstallSession("ask-swallow-once");
+  }
+});
+
+test("collectAskQuestionsFromPane: a Left swallowed while a late Right lands on the review tab still returns to tab 0 and registers", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { detectAskModal } = await import("./claude-questions.ts");
+  expect(detectAskModal(FAKE_REVIEW_FRAME)).toBe("review");
+  const twoTabs = FOUR_TABS.slice(0, 2);
+  const { io, log, at } = makeFakePane(twoTabs, { driftToReviewOnLeftAt: [1] });
+  const state = __forTest.installSession("ask-left-review-overshoot", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(twoTabs, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res!.map((q) => q.question)).toEqual(twoTabs.map((t) => t.question));
+    expect(state.askGrowAttempts).toBe(0);
+    // Walk: 1 Right. Return trip: 1 Left (stranded on review). Verification: a
+    // Left off the review tab, then one more off the last question tab.
+    expect(log.filter((l) => l === "Right").length).toBe(1);
+    expect(log.filter((l) => l === "Left").length).toBe(3);
+    expect(at().tab).toBe(0);
+    expect(at().cursor).toBe(0);
+  } finally {
+    __forTest.uninstallSession("ask-left-review-overshoot");
   }
 });
 

@@ -55,6 +55,7 @@ import {
   type TmuxSource,
 } from "./tmux-resolution.ts";
 import {
+  dismissAskModalForMessage,
   dismissTmuxPrompt,
   driveAskAnswers,
   healWindowSize,
@@ -5065,8 +5066,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // can't be driven — multiline, over-long or control-character custom
       // text, custom text for a question with no `Type something` row (the
       // preview layout), an unknown option, an arity mismatch — falls back to
-      // Esc'ing the modal (sendModalKeys) and posting the answer as a normal
-      // follow-up turn. The same fallback runs when the drive returns
+      // Esc'ing the modal (dismissAskModalForMessage, which verifies the modal
+      // left the pane and clears any leftover composer draft) and posting the
+      // answer as a normal follow-up turn. The same fallback runs when the drive returns
       // `"typed-abort"`: the typed step couldn't be delivered or verified, so
       // the modal (now holding stray text) is dismissed and the answer goes as
       // a follow-up message instead. Then drop the card.
@@ -5101,16 +5103,27 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             let withheld: true | undefined;
             let savedToBacklog: true | undefined;
             let reason: string | undefined;
+            // Which path actually delivered (or attempted) the answer — lets
+            // the UI word a failure toast accurately.
+            let delivery: "drive" | "message" = "drive";
             // Message-mode fallback — shared by the planner's `mode: "message"`
             // and a drive that aborted its typed step (`"typed-abort"`):
             // dismiss the native modal, then deliver the answer as a follow-up
             // turn.
             const deliverAsMessage = async (): Promise<void> => {
-              await sendModalKeys(pending.taskId, ["Escape"]);
-              // Give claude a beat to tear the modal down and return to the
-              // REPL prompt before the paste lands, so it isn't eaten by the
-              // dismissing modal.
-              await Bun.sleep(150);
+              delivery = "message";
+              // Escape the modal, verify it left the pane and clear any
+              // leftover draft from claude's composer before pasting, so the
+              // paste isn't eaten by a dismissing modal or appended to stray
+              // typed text. When a clean composer can't be reached, do NOT
+              // paste: the card still resolves below and the scraper
+              // re-collects a modal that is still open.
+              const clean = await dismissAskModalForMessage(pending.taskId);
+              if (!clean) {
+                ok = false;
+                reason = "the question modal could not be dismissed cleanly — answer it in the terminal";
+                return;
+              }
               const r = await sendInput(pending.runId, formatAnswersMessage(specs, sanitised));
               ok = r.delivered;
               // A withheld paste (e.g. a DIFFERENT blocking modal came up
@@ -5147,7 +5160,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             // its next tick (without clearing it, the `!askCardId` gate would
             // block re-registration and strand the modal with no card).
             resolveAskCard(req.params.id, pending.taskId);
-            return json({ ok, withheld, savedToBacklog, reason }, { headers: corsHeaders(req) });
+            return json({ ok, withheld, savedToBacklog, reason, delivery }, { headers: corsHeaders(req) });
           }
           // No scraper-sourced card matched this id (and there are no
           // hook-sourced ask cards any more) — nothing to drive.

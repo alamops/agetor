@@ -2124,6 +2124,82 @@ export async function sendModalKeys(taskId: string, keys: NavKey[]): Promise<boo
   return ok;
 }
 
+/** Poll budget for {@link dismissAskModalForMessage}: after each `Escape`, the
+ *  pane is polled this many times, this far apart, for the modal to leave. */
+const ASK_DISMISS_POLLS = 6;
+const ASK_DISMISS_POLL_MS = 100;
+/** Total `Escape`s {@link dismissAskModalForMessage} may send: the first, plus
+ *  ONE more when the modal is still up after a full poll window (a swallowed
+ *  key, or a first Escape that only cleared a half-typed Type row). */
+const ASK_DISMISS_MAX_ESCAPES = 2;
+/** Re-verification polls after {@link COMPOSER_CLEAR_KEYS} (each preceded by a
+ *  {@link ASK_DISMISS_POLL_MS} gap, on top of the {@link COMPOSER_CLEAR_SETTLE_MS} settle). */
+const ASK_DISMISS_COMPOSER_POLLS = 3;
+
+/**
+ * Dismiss a live AskUserQuestion modal so a free-text follow-up MESSAGE can be
+ * pasted safely (the answer route's message-mode fallback and its
+ * `"typed-abort"` recovery). Replaces a blind `Escape` + fixed sleep, which
+ * could paste into a modal that had not closed yet and left a typed draft
+ * sitting in claude's composer (recorded capture `v284_typed_single.txt`: a
+ * declined modal leaves `❯ purple` in the input box).
+ *
+ * Under the task's `queueTmuxOp` chain: send `Escape`, poll the pane until
+ * `detectAskModal` reports no modal; if it is still up after the first window
+ * send ONE more `Escape` and poll again (bounded to
+ * {@link ASK_DISMISS_MAX_ESCAPES}). Once the modal is gone, when the composer
+ * holds text (`paneShowsComposerText`) send {@link COMPOSER_CLEAR_KEYS} exactly
+ * as the paste path does — ONLY when text is visible, because a double Escape
+ * on an empty composer opens claude's rewind picker — and re-verify the
+ * composer is clear (bounded). A working pane never reads as "composer text",
+ * so a still-running turn is left alone (no safe mid-turn clear exists).
+ *
+ * Returns true only when the modal is gone AND the composer is clean; false on
+ * a tmux failure, a superseded session, a modal that never left, or a composer
+ * that would not clear.
+ */
+export async function dismissAskModalForMessage(taskId: string): Promise<boolean> {
+  const state = sessions.get(taskId);
+  if (!state) return false;
+  let ok = false;
+  await queueTmuxOp(taskId, async (stillCurrent) => {
+    // Strict capture: a failed `capture-pane` must read as "unknown", never as
+    // an empty pane in which no modal could be detected.
+    const capture = async (): Promise<string | null> => {
+      const cap = await tmux(["capture-pane", "-p", "-t", state.sessionName]);
+      if (!cap.ok) return null;
+      const lines = cap.stdout.split("\n");
+      return lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n");
+    };
+    let gone = false;
+    for (let esc = 0; esc < ASK_DISMISS_MAX_ESCAPES && !gone; esc++) {
+      bumpKeystroke(state);
+      if (!(await tmux(["send-keys", "-t", state.sessionName, "Escape"])).ok) return;
+      for (let poll = 0; poll < ASK_DISMISS_POLLS && !gone; poll++) {
+        await Bun.sleep(ASK_DISMISS_POLL_MS);
+        if (!stillCurrent()) return;
+        const tail = await capture();
+        gone = tail !== null && detectAskModal(tail) === null;
+      }
+    }
+    if (!gone) return;
+
+    let tail = await capture();
+    if (tail === null) return;
+    if (!paneShowsComposerText(tail)) { ok = true; return; }
+    bumpKeystroke(state);
+    if (!(await tmux(["send-keys", "-t", state.sessionName, ...COMPOSER_CLEAR_KEYS])).ok) return;
+    await Bun.sleep(COMPOSER_CLEAR_SETTLE_MS);
+    for (let poll = 0; poll < ASK_DISMISS_COMPOSER_POLLS; poll++) {
+      if (!stillCurrent()) return;
+      tail = await capture();
+      if (tail !== null && detectAskModal(tail) === null && !paneShowsComposerText(tail)) { ok = true; return; }
+      await Bun.sleep(ASK_DISMISS_POLL_MS);
+    }
+  }, state);
+  return ok;
+}
+
 /**
  * Gap between the review-screen tab transition and the first poll for the
  * "Ready to submit your answers?" screen to render. This is Ink's heaviest
@@ -2259,6 +2335,9 @@ function paneShowsTypedAnswer(pane: string, text: string): boolean {
   const want = prefix.replace(/\s+/g, "");
   const rows = pane.split("\n");
   for (let i = 0; i < rows.length; i++) {
+    // The untouched placeholder row must never count as an echo of `T` / `Type`
+    // / `Types`: its label is literally "Type something".
+    if (EMPTY_TYPE_ROW_RE.test(rows[i]!)) continue;
     const m = rows[i]!.match(/[❯›]\s*\d+\.\s*(?:\[[ ✔xX]\]\s*)?(.*)$/);
     if (!m) continue;
     let joined = m[1]!;
@@ -2269,8 +2348,13 @@ function paneShowsTypedAnswer(pane: string, text: string): boolean {
 }
 
 /** tmux 3.6a treats a bare trailing `;` in an argv element as a command
- *  separator even after `-l --` (the text is silently truncated); `\;` arrives
- *  as a literal `;` (verified). Escapes only the final character. Pure. */
+ *  separator even after `-l --` (the text is silently truncated). Its parser
+ *  also consumes ONE backslash from the run of backslashes directly before that
+ *  final `;` (verified on 3.6a with `send-keys -l --` into a `cat` pane:
+ *  N backslashes + `;` arrive as max(N - 1, 0) backslashes + `;`, and N = 0
+ *  truncates). So the text's own k trailing backslashes need exactly k + 1
+ *  before the `;` — i.e. append a single `\` ahead of it, which is also right
+ *  for k = 0. Escapes only the final `;`. Pure. */
 function escapeTypedTrailingSemicolon(text: string): string {
   return text.endsWith(";") ? text.slice(0, -1) + "\\;" : text;
 }
@@ -3799,9 +3883,13 @@ async function collectAskQuestionsFromPane(
         let finalFirst: ParsedQuestionPane | null = null;
         let extraLefts = 0;
         for (let attempt = 0; attempt < n + 3; attempt++) {
-          const p = parseModalPane(sliceModalRegion(await io.capture()));
+          const cap = await io.capture();
+          const p = parseModalPane(sliceModalRegion(cap));
           if (p && tabBodyKey(p) === firstKey) { finalFirst = p; break; }
-          if (p) {
+          // A `Right` resend that overshot lands on the review tab, which
+          // `parseModalPane` can't read (p is null there) — it still needs a
+          // `Left` to come back, so treat it like any other wrong tab.
+          if (p || detectAskModal(cap) === "review") {
             if (extraLefts >= n) break;
             if (!(await io.send("Left"))) break;
             extraLefts++;
@@ -5600,22 +5688,32 @@ async function confirmStartupDialog(taskId: string, sessionName: string, m: Star
 /** Gap between the arrow key(s) and the Enter of a startup-dialog confirm. */
 const STARTUP_CONFIRM_KEY_GAP_MS = 150;
 /** A startup dialog still matched this long after a confirm attempt means the
- *  attempt did not take — retry (with the CURRENT cursor position). */
-const STARTUP_CONFIRM_RETRY_MS = 700;
+ *  attempt did not take — but a retry ALSO needs the dialog to hold an identical
+ *  fingerprint (cursor included) on two consecutive polls that are both past
+ *  this window, so one repaint frame captured mid-transition can never trigger
+ *  a stray Enter (which on a still-"No, exit" cursor would decline the dialog). */
+const STARTUP_CONFIRM_RETRY_MS = 1500;
 /** Attempts per dialog name before giving up and asking the user to answer it. */
 const STARTUP_CONFIRM_MAX_ATTEMPTS = 4;
+/** Consecutive polls without the dialog before it is declared gone: one blank
+ *  or garbled frame (Ink repaint, tmux capture race) must neither emit
+ *  `auto-confirmed` nor discard the attempt count. */
+const STARTUP_CONFIRM_ABSENT_POLLS = 2;
 
 type StartupConfirmDecision = "wait" | "attempt" | "give-up";
 
 /**
  * Pure: whether the boot poller should send a confirm for a startup dialog it
- * currently sees. `seenTwice` — the dialog's fingerprint was on the pane on two
- * consecutive polls (Ink may still be mounting on the first sighting).
- * `attempts` / `lastAttemptAt` — confirms already sent for this dialog name and
- * when the last one started. Retries only once the dialog has stayed on the
- * pane {@link STARTUP_CONFIRM_RETRY_MS} past the last attempt; after
- * {@link STARTUP_CONFIRM_MAX_ATTEMPTS} attempts a dialog that is still there past
- * that window is `"give-up"` (the caller emits the message once).
+ * currently sees. `attempts` / `lastAttemptAt` — confirms already sent for this
+ * dialog name and when the last one started. `seenTwice` means, for the first
+ * attempt, the fingerprint was on the pane on two consecutive polls (Ink may
+ * still be mounting on the first sighting); for a retry, that the SAME
+ * fingerprint was on the pane on two consecutive polls that both fall past
+ * {@link STARTUP_CONFIRM_RETRY_MS} after the last attempt (the caller computes
+ * that; the window itself is re-checked here). After
+ * {@link STARTUP_CONFIRM_MAX_ATTEMPTS} attempts a dialog that is still there
+ * under the same stability rule is `"give-up"` (the caller emits the message
+ * once and lets the generic prompt path card it).
  */
 function startupConfirmDecision(input: {
   seenTwice: boolean;
@@ -5626,6 +5724,7 @@ function startupConfirmDecision(input: {
   const { seenTwice, attempts, lastAttemptAt, now } = input;
   if (attempts === 0) return seenTwice ? "attempt" : "wait";
   if (now - lastAttemptAt < STARTUP_CONFIRM_RETRY_MS) return "wait";
+  if (!seenTwice) return "wait";
   return attempts >= STARTUP_CONFIRM_MAX_ATTEMPTS ? "give-up" : "attempt";
 }
 
@@ -5633,9 +5732,18 @@ interface StartupConfirmTracker {
   /** Feed one poll's match (null = no known consent dialog on the pane). Returns
    *  the dialog to confirm NOW (attempt already counted) and any status lines. */
   observe(m: StartupDialogMatch | null, now: number): { attempt: StartupDialogMatch | null; statuses: string[] };
+  /** Whether the dialog named `name` exhausted its attempts and is still
+   *  tracked — the poller then lets the generic prompt path card it. */
+  hasGivenUp(name: string): boolean;
   /** Status lines for dialogs attempted but not yet reported as gone — used when
    *  the poller ends because claude got past boot (its JSONL exists). */
   flushConfirmed(): string[];
+  /** Like {@link flushConfirmed}, but only for entries whose dialog was NOT on
+   *  the most recent poll (the tracker saw it absent at least once after its
+   *  attempt) — used when the boot window closed without the poller having seen
+   *  the JSONL itself, where a dialog still matched on the last poll must not
+   *  be reported as confirmed. Entries still matched emit nothing. */
+  flushAbsent(): string[];
 }
 
 /**
@@ -5644,32 +5752,62 @@ interface StartupConfirmTracker {
  * dialog stranded whenever the keys were accepted by tmux but ignored by claude.
  * Attempts are counted per dialog NAME (the unnumbered fingerprint includes the
  * cursor, so it changes when the Down lands), the `auto-confirmed` status is
- * emitted only once the dialog has actually left the pane, and a dialog that
- * survives {@link STARTUP_CONFIRM_MAX_ATTEMPTS} attempts yields one
- * "could not be confirmed" status.
+ * emitted only once the dialog has been absent for
+ * {@link STARTUP_CONFIRM_ABSENT_POLLS} consecutive polls (or replaced by a
+ * different dialog), and a dialog that survives
+ * {@link STARTUP_CONFIRM_MAX_ATTEMPTS} attempts yields one "could not be
+ * confirmed" status.
  */
 function createStartupConfirmTracker(): StartupConfirmTracker {
-  const entries = new Map<string, { attempts: number; lastAttemptAt: number; gaveUp: boolean }>();
+  interface Entry {
+    attempts: number;
+    lastAttemptAt: number;
+    gaveUp: boolean;
+    /** Consecutive polls the dialog has been missing from the pane. */
+    absent: number;
+    /** Fingerprint of the previous post-window poll (retry stability gate). */
+    postWindowFingerprint: string | null;
+  }
+  const entries = new Map<string, Entry>();
   let prevFingerprint: string | null = null;
   const confirmedText = (name: string): string => `claude startup dialog auto-confirmed (${name})`;
   return {
     observe(m, now) {
       const statuses: string[] = [];
       for (const [name, e] of [...entries]) {
-        if (m && m.name === name) continue;
-        // The dialog is gone (or replaced by another one): the confirm took.
+        if (m && m.name === name) { e.absent = 0; continue; }
+        // A DIFFERENT dialog on the pane is positive evidence this one is gone;
+        // a blank frame is not — that needs consecutive absences.
+        if (!m) {
+          e.absent += 1;
+          e.postWindowFingerprint = null;
+          if (e.absent < STARTUP_CONFIRM_ABSENT_POLLS) continue;
+        }
         if (e.attempts > 0 && !e.gaveUp) statuses.push(confirmedText(name));
         entries.delete(name);
       }
       if (!m) { prevFingerprint = null; return { attempt: null, statuses }; }
-      const seenTwice = prevFingerprint === m.fingerprint;
-      prevFingerprint = m.fingerprint;
       let e = entries.get(m.name);
-      if (!e) { e = { attempts: 0, lastAttemptAt: 0, gaveUp: false }; entries.set(m.name, e); }
+      if (!e) {
+        e = { attempts: 0, lastAttemptAt: 0, gaveUp: false, absent: 0, postWindowFingerprint: null };
+        entries.set(m.name, e);
+      }
+      let seenTwice: boolean;
+      if (e.attempts === 0) {
+        seenTwice = prevFingerprint === m.fingerprint;
+      } else if (now - e.lastAttemptAt < STARTUP_CONFIRM_RETRY_MS) {
+        e.postWindowFingerprint = null;
+        seenTwice = false;
+      } else {
+        seenTwice = e.postWindowFingerprint === m.fingerprint;
+        e.postWindowFingerprint = m.fingerprint;
+      }
+      prevFingerprint = m.fingerprint;
       const decision = startupConfirmDecision({ seenTwice, attempts: e.attempts, lastAttemptAt: e.lastAttemptAt, now });
       if (decision === "attempt") {
         e.attempts += 1;
         e.lastAttemptAt = now;
+        e.postWindowFingerprint = null;
         return { attempt: m, statuses };
       }
       if (decision === "give-up" && !e.gaveUp) {
@@ -5680,9 +5818,22 @@ function createStartupConfirmTracker(): StartupConfirmTracker {
       }
       return { attempt: null, statuses };
     },
+    hasGivenUp(name) {
+      return entries.get(name)?.gaveUp === true;
+    },
     flushConfirmed() {
       const out: string[] = [];
       for (const [name, e] of entries) if (e.attempts > 0 && !e.gaveUp) out.push(confirmedText(name));
+      entries.clear();
+      return out;
+    },
+    flushAbsent() {
+      const out: string[] = [];
+      for (const [name, e] of entries) {
+        // `absent` resets to 0 on every matched poll, so >= 1 means the dialog
+        // was missing from the latest poll(s) — not merely present-when-we-stopped.
+        if (e.absent >= 1 && e.attempts > 0 && !e.gaveUp) out.push(confirmedText(name));
+      }
       entries.clear();
       return out;
     },
@@ -7586,7 +7737,14 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           // this short-circuits on the first tick so the poller is a no-op —
           // a re-shown consent dialog on resume is out of scope (bypass
           // acceptance is global + persistent once accepted).
-          if (bootSettled) return;
+          if (bootSettled) {
+            // The window closed under us (JSONL found, or the boot timed out).
+            // Only a dialog the tracker saw ABSENT on the latest poll is
+            // reported as confirmed; one still matched at the deadline emits
+            // nothing (the boot-timeout path surfaces the raw pane instead).
+            for (const line of startupConfirm.flushAbsent()) opts.onChunk("status", line);
+            return;
+          }
           if (existsSync(jsonlPath)) {
             // claude got past boot — any dialog we confirmed is demonstrably gone.
             for (const line of startupConfirm.flushConfirmed()) opts.onChunk("status", line);
@@ -7605,20 +7763,29 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           // and a confirm is VERIFIED against the pane rather than trusted on
           // send-keys success: live on 2.1.284 a Down+Enter was accepted by tmux
           // yet ignored, and the old fingerprint latch then never retried. The
-          // tracker retries a dialog that is still matched >= 700 ms after an
-          // attempt (with the CURRENT cursor, so only a missing Enter is resent),
-          // up to 4 attempts, and reports `auto-confirmed` only after the dialog
-          // has left the pane. A genuinely different follow-up dialog (bypass,
-          // then trust) is tracked under its own name.
+          // tracker retries a dialog only after a >= 1.5 s window AND an identical
+          // fingerprint on two consecutive post-window polls (with the CURRENT
+          // cursor, so only a missing Enter is resent), up to 4 attempts, and
+          // reports `auto-confirmed` only after the dialog has been absent on two
+          // consecutive polls. After the 4th attempt it gives up and the dialog
+          // falls through to the generic card path. A genuinely different
+          // follow-up dialog (bypass, then trust) is tracked under its own name.
           const step = startupConfirm.observe(m, Date.now());
           for (const line of step.statuses) opts.onChunk("status", line);
           if (m) {
-            // A consent dialog is on the pane — never also treat it as a
-            // generic question (its repaint frames must not leak into an
-            // interactive card while we auto-confirm it).
-            lastGenericFingerprint = null;
             if (step.attempt) await confirmStartupDialog(opts.taskId, sessionName, step.attempt);
-            continue;
+            if (!startupConfirm.hasGivenUp(m.name)) {
+              // A consent dialog is on the pane — never also treat it as a
+              // generic question (its repaint frames must not leak into an
+              // interactive card while we auto-confirm it).
+              lastGenericFingerprint = null;
+              continue;
+            }
+            // Auto-confirm gave up (the "answer it in the terminal" status was
+            // just emitted): the user is now the only way through, so keep the
+            // boot window from expiring under them and fall through to the
+            // generic prompt path below, which cards the dialog for a click.
+            sawStartupPromptThisWindow = true;
           }
 
           // Not a known consent dialog. If claude is showing some other
@@ -9278,6 +9445,7 @@ export const __forTest = {
   ASK_VERIFY_POLL_MS,
   ASK_VERIFY_POLL_ATTEMPTS,
   ASK_VERIFY_MAX_RESENDS,
+  ASK_DISMISS_MAX_ESCAPES,
   readPendingAskQuestionsFromJsonl,
   GROW_PANE_COLS,
   tabBodyKey,
@@ -9298,6 +9466,7 @@ export const __forTest = {
   STARTUP_CONFIRM_KEY_GAP_MS,
   STARTUP_CONFIRM_RETRY_MS,
   STARTUP_CONFIRM_MAX_ATTEMPTS,
+  STARTUP_CONFIRM_ABSENT_POLLS,
   resumeJsonlOffset,
   /** Drive the pane-scrape AskUserQuestion collector against a fake `PaneIo`
    *  (no tmux), to assert per-option preview capture + cursor restoration for

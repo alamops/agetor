@@ -690,6 +690,23 @@ describe("parseModalPane — 2.1.284 real captures", () => {
     expect(q.hasTypeRow).toBe(true);
   });
 
+  test("structural Type row: picks the NEAREST `chatNum - 1` row above `Chat about this`, never scrollback above the modal", () => {
+    const modal = synthPane({
+      question: ["Pick one?"],
+      options: ["❯ 1. Alpha", "  2. Beta", "  3. my own words"],
+    }).replace("  9. Chat about this", "  4. Chat about this");
+    const p = parseModalPane(["  3. old item", "some earlier output", modal].join("\n"))!;
+    expect(p).not.toBeNull();
+    // The modal's own Type row (also numbered 3) is excluded ...
+    expect(p.options.map((o) => o.label)).not.toContain("my own words");
+    expect(p.hasTypeRow).toBe(true);
+    // ... and the nearest-above rule never reaches the scrollback row to
+    // exclude it in the Type row's place (the pre-fix `raw.find` did).
+    expect(p.options.map((o) => o.label)).toEqual(expect.arrayContaining(["Alpha", "Beta"]));
+    const withoutScrollback = parseModalPane(modal)!;
+    expect(withoutScrollback.options.map((o) => o.label)).toEqual(["Alpha", "Beta"]);
+  });
+
   test("v284_typed_single (post-decline screen) and v284_review do not parse as a question", () => {
     expect(parseModalPane(fx("v284_typed_single"))).toBeNull();
     expect(parseModalPane(fx("v284_review"))).toBeNull();

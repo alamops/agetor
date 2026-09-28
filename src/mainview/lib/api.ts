@@ -1740,7 +1740,15 @@ export const api = {
    *  present alongside `ok: false`, and only for that free-text path — see
    *  `/ask-questions/:id/answer` in server.ts. */
   answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; custom?: string }> }) =>
-    j<{ ok: boolean; withheld?: boolean; savedToBacklog?: boolean; reason?: string }>(
+    j<{
+      ok: boolean;
+      withheld?: boolean;
+      savedToBacklog?: boolean;
+      reason?: string;
+      /** Which path delivered (or attempted) the answer: `"drive"` typed it into
+       *  the live modal, `"message"` dismissed the modal and sent a follow-up. */
+      delivery?: "drive" | "message";
+    }>(
       `/ask-questions/${id}/answer`,
       {
         method: "POST",

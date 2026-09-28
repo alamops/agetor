@@ -29,7 +29,7 @@ afterAll(() => {
 
 async function seedScrapedAskQuestions(args: {
   taskId: string;
-  questions: { question: string; multiSelect?: boolean; options: { label: string }[] }[];
+  questions: { question: string; multiSelect?: boolean; hasTypeRow?: boolean; options: { label: string }[] }[];
 }): Promise<{ id: string }> {
   const cwd = mkdtempSync(path.join(tmpdir(), `agetor-askq-${args.taskId}-`));
   const { tasks } = await import("./db.ts");
@@ -61,18 +61,19 @@ test("POST /ask-questions — scraper-sourced drive answer resolves the card", a
     body: JSON.stringify({ answers: [{ selected: ["Green"] }] }),
   });
   expect(res.status).toBe(200);
+  expect((await res.json()).delivery).toBe("drive");
   // No live tmux session in the test → the keystrokes can't actually land,
   // but the route must still drop the card (it resolves unconditionally).
   const { listPendingForTask } = await import("./interactions.ts");
   expect(listPendingForTask("t-askq-drive")).toHaveLength(0);
 });
 
-test("POST /ask-questions — scraper-sourced custom-text answer resolves the card (typed drive path)", async () => {
+test("POST /ask-questions — scraper-sourced custom-text answer resolves the card (message path — no Type row)", async () => {
   const { __testing } = await import("./interactions.ts");
   __testing.reset();
   const { id } = await seedScrapedAskQuestions({
     taskId: "t-askq-msg",
-    questions: [{ question: "Pick", multiSelect: false, options: [{ label: "Red" }] }],
+    questions: [{ question: "Pick", multiSelect: false, hasTypeRow: false, options: [{ label: "Red" }] }],
   });
   const res = await fetch(url(`/ask-questions/${id}/answer`), {
     method: "POST",
@@ -80,6 +81,13 @@ test("POST /ask-questions — scraper-sourced custom-text answer resolves the ca
     body: JSON.stringify({ answers: [{ selected: [], custom: "Magenta" }] }),
   });
   expect(res.status).toBe(200);
+  // A session-less task can't reach a clean composer, so nothing is pasted:
+  // ok:false, message-mode delivery, and no withheld/backlog flags.
+  const payload = await res.json();
+  expect(payload.delivery).toBe("message");
+  expect(payload.ok).toBe(false);
+  expect(payload.withheld).toBeUndefined();
+  expect(payload.savedToBacklog).toBeUndefined();
   const { listPendingForTask } = await import("./interactions.ts");
   expect(listPendingForTask("t-askq-msg")).toHaveLength(0);
 });

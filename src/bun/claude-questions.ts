@@ -452,7 +452,17 @@ export function parseModalPane(tail: string): ParsedQuestionPane | null {
   // a label match would mistake it for a real option. Without a numbered Chat
   // row (the preview layout renders it bare) fall back to the label.
   const chatRow = raw.find((r) => r.label === "Chat about this");
-  const typeRow = chatRow ? raw.find((r) => r.num === chatRow.num - 1) : undefined;
+  // Search UPWARD from the Chat row for the nearest `chatNum - 1` row, so a
+  // stale numbered row in scrollback above the modal can never be picked.
+  let typeRow: RawRow | undefined;
+  if (chatRow) {
+    for (let i = raw.indexOf(chatRow) - 1; i >= 0; i--) {
+      if (raw[i]!.num === chatRow.num - 1) {
+        typeRow = raw[i];
+        break;
+      }
+    }
+  }
   const kept = raw.filter((r) => r !== typeRow && !EXCLUDED_OPTION.test(r.label));
   const hasTypeRow = typeRow !== undefined || raw.some((r) => /^Type something\.?$/.test(r.label));
   if (kept.length === 0) return null;
