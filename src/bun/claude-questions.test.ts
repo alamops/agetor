@@ -152,6 +152,28 @@ describe("parseModalPane — reads the visible question off the pane", () => {
     expect(p.complete).toBe(true);
   });
 
+  test("a bare unnumbered `Chat about this` row under the last option is never folded into its description", () => {
+    const pane = [
+      " Which color do you prefer?",
+      "",
+      " ❯ 1. Red",
+      "      A warm color",
+      "   2. Green",
+      "      A cool color",
+      "  Chat about this",
+      "",
+      " Enter to select · ↑/↓ to navigate · Esc to cancel",
+    ].join("\n");
+    const p = parseModalPane(pane)!;
+    expect(p).not.toBeNull();
+    expect(p.questionText).toBe("Which color do you prefer?");
+    expect(p.options.map((o) => o.label)).toEqual(["Red", "Green"]);
+    expect(p.options[0]!.description).toBe("A warm color");
+    expect(p.options[1]!.description).toBe("A cool color");
+    const bare = parseModalPane(pane.replace("      A cool color\n", ""))!;
+    expect(bare.options[1]!.description).toBeUndefined();
+  });
+
   test("wrapped question + wrapped description: gathers every hard-wrapped row, not just the tail", () => {
     const p = parseModalPane(fx("single_wrapped_question"))!;
     // The full question spans two pane rows; the old parser kept only the tail

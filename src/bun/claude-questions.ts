@@ -435,6 +435,9 @@ export function parseModalPane(tail: string): ParsedQuestionPane | null {
   // a separator, "Next"/"Submit", blank, or the footer.
   const isNoise = (l: string | undefined): boolean =>
     l === undefined || l.trim() === "" || /^[─-]{3,}$/.test(l.trim())
+    // The preview layout renders "Chat about this" as a bare, unnumbered row
+    // directly under the last option — never part of that option's description.
+    || l.trim() === "Chat about this"
     || /^(Next|Submit)$/.test(l.trim()) || /Esc to cancel/.test(l) || OPTION_RE.test(l)
     // TUI chrome that the pane sometimes interleaves with options: an option's
     // multi-line `preview`/description collapsed to "✂ N lines hidden" / "── N

@@ -5248,10 +5248,20 @@ const STARTUP_CONSENT_DIALOGS: Array<{ name: string; marker: RegExp; affirmative
   // permissions), so agetor's fresh per-task worktrees reliably trigger it —
   // and it blocks claude from ever writing its JSONL until answered (otherwise
   // the run dies at the 30s boot timeout with the dialog on the pane). Observed
-  // text (claude 2.1.x):
-  //   Quick safety check: Is this a project you created or one you trust? …
-  //   ❯ 1. Yes, I trust this folder
-  //     2. No, exit
+  // text comes in two shapes:
+  //   claude 2.1.x (numbered, cursor defaults to the affirmative):
+  //     Quick safety check: Is this a project you created or one you trust? …
+  //     ❯ 1. Yes, I trust this folder
+  //       2. No, exit
+  //   claude 2.1.284 (UNNUMBERED, cursor defaults to "No, exit"):
+  //     Quick safety check: Is this a project you created or one you trust? …
+  //     ❯ No, exit
+  //       Yes, I trust this folder
+  //     Enter to confirm · Esc to cancel
+  // On 2.1.284 the cursor starts on "No, exit", so a bare Enter would EXIT
+  // claude. `confirmStartupDialog` never sends a digit key: it arrows from
+  // `cursorIndex` to `acceptIndex` and then presses Enter, which is what makes
+  // the unnumbered shape safe to drive.
   // `affirmative` is anchored on "Yes …trust this folder", so it can only ever
   // land on the trust option — never a "No, …trust" variant (the original
   // safety concern). The marker also keeps the older "trust the files in this
@@ -5288,11 +5298,16 @@ export interface StartupDialogMatch {
 export function matchStartupConsentDialog(pane: string): StartupDialogMatch | null {
   const dialog = STARTUP_CONSENT_DIALOGS.find((d) => d.marker.test(pane));
   if (!dialog) return null;
-  // Reuse the numbered-modal parser so the choice list / cursor handling
-  // stays identical to the runtime scraper. It requires a cursor marker,
-  // which every one of these dialogs draws.
-  const modal = matchNumberedModal(pane);
-  if (!modal || modal.cursorIndex === undefined) return null;
+  // Reuse the numbered-modal parser first so the choice list / cursor handling
+  // stays identical to the runtime scraper for older CLIs. It requires a
+  // cursor marker, which every one of these dialogs draws. Claude 2.1.284
+  // dropped the `N.` prefixes, so fall back to the unnumbered parser.
+  const numbered = matchNumberedModal(pane);
+  const modal =
+    numbered && numbered.cursorIndex !== undefined
+      ? { choices: numbered.choices, cursorIndex: numbered.cursorIndex, fingerprint: numbered.fingerprint }
+      : parseUnnumberedConsentChoices(pane);
+  if (!modal) return null;
   const acceptIndex = modal.choices.findIndex((c) => dialog.affirmative.test(c.label));
   if (acceptIndex < 0) return null;
   return {
@@ -5302,6 +5317,54 @@ export function matchStartupConsentDialog(pane: string): StartupDialogMatch | nu
     acceptIndex,
     fingerprint: sha1(`startup:${dialog.name}:${modal.fingerprint}`),
   };
+}
+
+/**
+ * Pure: parse an UNNUMBERED choice list (claude 2.1.284's workspace-trust
+ * dialog) anchored on the dialog's `Enter to confirm` footer. Walks upward
+ * from the footer (skipping blank rows between it and the list), collecting
+ * contiguous choice rows — a `❯`/`›` cursor row or a row indented 2+ spaces —
+ * and stopping at the first row that is neither. Requires at least two choices
+ * and exactly one cursor row. Choices get 1-based keys like the numbered path
+ * so the fingerprint/label plumbing stays identical.
+ */
+function parseUnnumberedConsentChoices(
+  pane: string,
+): { choices: TmuxPromptChoice[]; cursorIndex: number; fingerprint: string } | null {
+  const lines = pane.split("\n");
+  let footerAt = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/Enter to confirm/.test(lines[i]!)) {
+      footerAt = i;
+      break;
+    }
+  }
+  if (footerAt < 0) return null;
+  let i = footerAt - 1;
+  while (i >= 0 && lines[i]!.trim() === "") i--;
+  const rows: Array<{ label: string; cursor: boolean }> = [];
+  for (; i >= 0; i--) {
+    const raw = lines[i]!;
+    const cur = raw.match(/^\s*[❯›]\s+(\S.*?)\s*$/);
+    if (cur) {
+      rows.unshift({ label: cur[1]!, cursor: true });
+      continue;
+    }
+    const plain = raw.match(/^\s{2,}(\S.*?)\s*$/);
+    if (plain) {
+      rows.unshift({ label: plain[1]!, cursor: false });
+      continue;
+    }
+    break;
+  }
+  if (rows.length < 2) return null;
+  if (rows.filter((r) => r.cursor).length !== 1) return null;
+  const cursorIndex = rows.findIndex((r) => r.cursor);
+  const choices: TmuxPromptChoice[] = rows.map((r, idx) => ({ key: String(idx + 1), label: r.label }));
+  const fingerprint = sha1(
+    `unnumbered:${choices.map((c) => `${c.key}|${c.label}`).join("/")}|@${cursorIndex}`,
+  );
+  return { choices, cursorIndex, fingerprint };
 }
 
 /**

@@ -326,6 +326,64 @@ test("matchStartupConsentDialog — workspace-trust dialog (real observed text),
   expect(m!.acceptIndex).toBe(0); // already on "Yes, I trust this folder" → Enter alone
 });
 
+test("matchStartupConsentDialog — 2.1.284 unnumbered workspace-trust dialog, cursor defaults to \"No, exit\"", () => {
+  // Real capture (claude 2.1.284): options carry no `N.` prefix and the cursor
+  // starts on "No, exit". accept must land on the "Yes" row, never the default.
+  const pane = `────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /private/tmp/claude-501/-Users-me--agetor-worktrees-cb38d00e/scratchpad/smoke/pr
+ oj
+
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
+
+`;
+  const m = matchStartupConsentDialog(pane);
+  expect(m).not.toBeNull();
+  expect(m!.name).toBe("trust-folder");
+  expect(m!.cursorIndex).toBe(0);
+  expect(m!.acceptIndex).toBe(1);
+  expect(m!.choices.map((c) => c.label)).toEqual(["No, exit", "Yes, I trust this folder"]);
+  // Fingerprint is stable per rendered dialog and moves with the cursor.
+  expect(matchStartupConsentDialog(pane)!.fingerprint).toBe(m!.fingerprint);
+  const moved = pane.replace(" ❯ No, exit\n   Yes, I trust this folder", "   No, exit\n ❯ Yes, I trust this folder");
+  const m2 = matchStartupConsentDialog(moved);
+  expect(m2!.cursorIndex).toBe(1);
+  expect(m2!.fingerprint).not.toBe(m!.fingerprint);
+});
+
+test("matchStartupConsentDialog — unnumbered dialog with no affirmative choice → null", () => {
+  const pane = ` Quick safety check: Is this a project you created or one you trust?
+
+ ❯ No, exit
+   Cancel
+
+ Enter to confirm · Esc to cancel`;
+  expect(matchStartupConsentDialog(pane)).toBeNull();
+});
+
+test("matchStartupConsentDialog — unrelated unnumbered list without the marker → null", () => {
+  const pane = ` Pick one
+
+ ❯ No, exit
+   Yes, proceed
+
+ Enter to confirm · Esc to cancel`;
+  expect(matchStartupConsentDialog(pane)).toBeNull();
+});
+
 test("matchStartupConsentDialog — a normal per-tool permission modal is NOT auto-confirmed", () => {
   // Runtime permission prompts carry no startup marker → must stay null so
   // they route through the interactive scraper for the user to decide.
