@@ -3523,8 +3523,10 @@ function tabBodyKey(p: ParsedQuestionPane): string {
  *  Otherwise — a tabbed modal, a flat one already showing a preview panel, or a
  *  lossy capture — we grow the detached pane once (`GROW_PANE_COLS` × 100, so
  *  previews aren't collapsed, labels don't wrap, and a truncated top has room
- *  to render in full) and walk it: every tab, and within each tab whose
- *  focused option has a preview, every option. A tabbed modal always grows
+ *  to render in full) and walk it. The tab count and headers are taken from the
+ *  first GROWN capture, never the short tail (whose tab bar may have scrolled
+ *  off, making a 4-question modal look flat). The walk visits every tab, and
+ *  within each tab whose focused option has a preview, every option. A tabbed modal always grows
  *  because any of its questions may carry previews we can only detect by
  *  visiting the tab. The pane is detached (user sees the webview) and always
  *  restored. `io` is injectable so the orchestration is unit-testable without
@@ -3536,8 +3538,12 @@ async function collectAskQuestionsFromPane(
 ): Promise<AskQuestion[] | null> {
   const first = parseModalPane(firstTail);
   if (!first) return null;
-  const headers = first.tabHeaders;
-  const n = first.tabbed ? Math.max(1, headers.length) : 1;
+  // `headers`/`n` start from the short pre-grow tail and are RE-DERIVED from the
+  // grown capture below: on an 80x24 pane a tall modal's tab bar can scroll off
+  // the top, so `first.tabbed` reads false for a 4-question modal. The fast path
+  // only fires for a non-lossy, complete flat tail, where `first` is trustworthy.
+  let headers = first.tabHeaders;
+  let n = first.tabbed ? Math.max(1, headers.length) : 1;
 
   const toAsk = (p: ParsedQuestionPane, header: string | undefined): AskQuestion => ({
     question: p.questionText,
@@ -3624,6 +3630,12 @@ async function collectAskQuestionsFromPane(
           await io.sleep(OPTION_NAV_MS);
           const recheck = parseModalPane(sliceModalRegion(await io.capture()));
           if (!recheck || recheck.options.length !== base.options.length) { collected.push(null); break; }
+        }
+        if (t === 0) {
+          // The tab count comes from the GROWN, rechecked capture (which shows
+          // the whole modal incl. the tab bar), never the short tail.
+          headers = base.tabHeaders;
+          n = base.tabbed ? Math.max(1, headers.length) : 1;
         }
         // Walk options only when THIS tab's focused option actually has a panel
         // (keys on the parsed preview, not a loose pane regex). A tab whose
