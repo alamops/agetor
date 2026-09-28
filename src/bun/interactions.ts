@@ -60,6 +60,11 @@ export interface AskQuestion {
    *  while the card is live), and the live pane scrape, which grows the pane and walks each option to read its panel
    *  (see `collectAskQuestionsFromPane`). */
   options: Array<{ label: string; description?: string; preview?: string }>;
+  /** Live-pane scrapes only: whether the modal has an inline "Type something"
+   *  row for a typed custom answer. `false` for the preview layout (bare
+   *  `Chat about this`), where typed characters would act as hotkeys; absent
+   *  means unknown / the normal layout. */
+  hasTypeRow?: boolean;
 }
 
 export interface AskQuestionsRequest {

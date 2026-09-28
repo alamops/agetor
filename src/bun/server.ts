@@ -66,7 +66,7 @@ import {
   sessionExists,
   sessionNameFor,
 } from "./claude-tmux.ts";
-import { planAskAnswers } from "./claude-questions.ts";
+import { formatAnswersMessage, planAskAnswers } from "./claude-questions.ts";
 import {
   getAheadCount,
   getTaskDiff,
@@ -5062,10 +5062,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // review-screen confirm rather than trusting send-keys exit codes). A
       // typed custom answer is driven too: it is typed into the modal's native
       // `Type something` row and verified on the pane before Enter. Only what
-      // can't be driven — multiline or over-long custom text, an unknown
-      // option, an arity mismatch — falls back to Esc'ing the modal
-      // (sendModalKeys) and posting the answer as a normal follow-up turn.
-      // Then drop the card.
+      // can't be driven — multiline, over-long or control-character custom
+      // text, custom text for a question with no `Type something` row (the
+      // preview layout), an unknown option, an arity mismatch — falls back to
+      // Esc'ing the modal (sendModalKeys) and posting the answer as a normal
+      // follow-up turn. The same fallback runs when the drive returns
+      // `"typed-abort"`: the typed step couldn't be delivered or verified, so
+      // the modal (now holding stray text) is dismissed and the answer goes as
+      // a follow-up message instead. Then drop the card.
       "/ask-questions/:id/answer": {
         POST: authed(async (req) => {
           const body = (await req.json().catch(() => ({}))) as Partial<AskQuestionsAnswer>;
@@ -5084,6 +5088,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               question: q.question,
               multiSelect: !!q.multiSelect,
               options: q.options.map((o) => o.label),
+              hasTypeRow: q.hasTypeRow,
             }));
             const plan = planAskAnswers(specs, sanitised);
             let ok = false;
@@ -5091,51 +5096,56 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             // (which is the only thing capable of reporting a withhold — the
             // "drive" path types keys straight into an already-open modal via
             // tmux send-keys, with no composer paste for a blocking modal to
-            // hold up). Left undefined on the drive path; the response only
-            // carries these when the message-mode branch actually ran.
+            // hold up). Left undefined on a successful/failed drive; the
+            // response only carries these when the fallback actually ran.
             let withheld: true | undefined;
             let savedToBacklog: true | undefined;
             let reason: string | undefined;
-            if (plan.mode === "drive") {
-              ok = await driveAskAnswers(pending.taskId, plan);
-            } else {
-              // Message-mode fallback — only for what can't be driven into
-              // the modal (multiline or over-long custom text, an unknown
-              // option, an arity mismatch): dismiss the native modal, then
-              // deliver the answer as a follow-up turn.
+            // Message-mode fallback — shared by the planner's `mode: "message"`
+            // and a drive that aborted its typed step (`"typed-abort"`):
+            // dismiss the native modal, then deliver the answer as a follow-up
+            // turn.
+            const deliverAsMessage = async (): Promise<void> => {
               await sendModalKeys(pending.taskId, ["Escape"]);
               // Give claude a beat to tear the modal down and return to the
               // REPL prompt before the paste lands, so it isn't eaten by the
               // dismissing modal.
               await Bun.sleep(150);
-              const r = await sendInput(pending.runId, plan.text);
+              const r = await sendInput(pending.runId, formatAnswersMessage(specs, sanitised));
               ok = r.delivered;
-              // This used to report `ok = r.delivered` alone — a withheld
-              // paste (e.g. a DIFFERENT blocking modal came up while the
-              // Escape above was settling) read to the UI as an ordinary
-              // failure with no indication the answer was safely saved to
-              // the backlog tray rather than lost outright. Thread the full
-              // shape through so the UI can toast the informational
-              // "saved to backlog" framing exactly like `sendRunInput`'s
-              // withheld branch, instead of a bare error.
+              // A withheld paste (e.g. a DIFFERENT blocking modal came up
+              // while the Escape above was settling) must not read to the UI
+              // as an ordinary failure with no indication the answer was
+              // safely saved to the backlog tray rather than lost outright.
+              // Thread the full shape through so the UI can toast the
+              // informational "saved to backlog" framing exactly like
+              // `sendRunInput`'s withheld branch, instead of a bare error.
               if (!r.delivered) {
                 withheld = r.withheld;
                 savedToBacklog = r.savedToBacklog;
                 reason = r.reason;
               }
+            };
+            if (plan.mode === "drive") {
+              const driven = await driveAskAnswers(pending.taskId, plan);
+              if (driven === "typed-abort") {
+                await deliverAsMessage();
+              } else {
+                ok = driven;
+              }
+            } else {
+              await deliverAsMessage();
             }
-            // Drop the card either way — including a withheld free-text
-            // answer. The Escape above already dismissed the ORIGINAL
-            // AskUserQuestion modal (that's what `plan.text` is answering);
-            // a withhold here means some OTHER blocking modal came up while
-            // delivering the follow-up turn, which is an unrelated, separate
-            // problem the "saved to backlog" toast covers — keeping this card
-            // up wouldn't let the user retry answering a modal that's already
-            // gone. `resolveAskCard` also clears the session's `askCardId`
-            // tracker, so if a drive FAILED and the modal is still on the
-            // pane the scraper re-collects a fresh card on its next tick
-            // (without clearing it, the `!askCardId` gate would block
-            // re-registration and strand the modal with no card).
+            // Drop the card either way — including a withheld answer. On the
+            // fallback path the Escape above dismissed the ORIGINAL
+            // AskUserQuestion modal; a withhold there means some OTHER
+            // blocking modal came up while delivering the follow-up turn, an
+            // unrelated problem the "saved to backlog" toast covers. On the
+            // drive path no Escape is sent, and a FAILED drive can leave the
+            // modal still open: `resolveAskCard` also clears the session's
+            // `askCardId` tracker, so the scraper re-collects a fresh card on
+            // its next tick (without clearing it, the `!askCardId` gate would
+            // block re-registration and strand the modal with no card).
             resolveAskCard(req.params.id, pending.taskId);
             return json({ ok, withheld, savedToBacklog, reason }, { headers: corsHeaders(req) });
           }

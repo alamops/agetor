@@ -222,8 +222,9 @@ describe("parseModalPane — reads the visible question off the pane", () => {
       "  2. Plugins only",
       "  Enumerate enabled-plugin items only.",
       "Notes: press n to add notes",
+      "  3. Type something.",
       "──────────────────────────────────────",
-      "  3. Chat about this",
+      "  4. Chat about this",
       "",
       "Enter to select · ↑/↓ to navigate · Esc to cancel",
     ].join("\n");
@@ -649,21 +650,44 @@ describe("parseModalPane — 2.1.284 real captures", () => {
     expect(p.complete).toBe(true);
   });
 
-  test("v284_typed_single_modal: the typed `purple` row is option index 3 with the cursor on it", () => {
+  test("v284_typed_single_modal: the typed `purple` row is the Type row, NOT an option (cursor -1)", () => {
     const p = parseModalPane(fx("v284_typed_single_modal"))!;
-    expect(p.options.map((o) => o.label)).toEqual(["Red", "Blue", "Green", "purple"]);
-    expect(p.options[3]!.label).toBe("purple");
-    expect(p.cursorIndex).toBe(3);
+    expect(p.options.map((o) => o.label)).toEqual(["Red", "Blue", "Green"]);
+    expect(p.cursorIndex).toBe(-1);
+    expect(p.hasTypeRow).toBe(true);
     expect(p.complete).toBe(true);
   });
 
-  test("v284_typed_multi: the typed `Peppers` row is checked and holds the cursor", () => {
+  test("v284_typed_multi: the typed, auto-checked `Peppers` row is the Type row, NOT an option", () => {
     const p = parseModalPane(fx("v284_typed_multi"))!;
     expect(p.multiSelect).toBe(true);
-    expect(p.options.map((o) => o.label)).toEqual(["Cheese", "Ham", "Mushrooms", "Olives", "Peppers"]);
-    expect(p.options[4]!.checked).toBe(true);
-    expect(p.cursorIndex).toBe(4);
+    expect(p.options.map((o) => o.label)).toEqual(["Cheese", "Ham", "Mushrooms", "Olives"]);
+    expect(p.cursorIndex).toBe(-1);
+    expect(p.hasTypeRow).toBe(true);
     expect(p.complete).toBe(true);
+  });
+
+  test("hasTypeRow per fixture: true for flat / multi tabs / footer_wrapped, false for the preview layout", () => {
+    expect(parseModalPane(fx("v284_flat"))!.hasTypeRow).toBe(true);
+    expect(parseModalPane(fx("v284_multi_tab1"))!.hasTypeRow).toBe(true);
+    expect(parseModalPane(fx("v284_footer_wrapped"))!.hasTypeRow).toBe(true);
+    expect(parseModalPane(fx("v284_preview"))!.hasTypeRow).toBe(false);
+  });
+
+  test("structural Type row: a numbered row right above the numbered `Chat about this` is excluded whatever its label", () => {
+    const t = synthPane({
+      question: ["Pick one?"],
+      options: ["❯ 1. Alpha", "  2. Beta", "  3. Type something.", "  4. my own words"].slice(0, 3),
+    }).replace("  9. Chat about this", "  4. Chat about this");
+    const typed = t.replace("  3. Type something.", "  3. my own words");
+    const p = parseModalPane(typed)!;
+    expect(p.options.map((o) => o.label)).toEqual(["Alpha", "Beta"]);
+    expect(p.hasTypeRow).toBe(true);
+    // Label fallback (no numbered Chat row): `Type something` alone still counts.
+    const noChat = t.replace("  4. Chat about this", "  Chat about this");
+    const q = parseModalPane(noChat)!;
+    expect(q.options.map((o) => o.label)).toEqual(["Alpha", "Beta"]);
+    expect(q.hasTypeRow).toBe(true);
   });
 
   test("v284_typed_single (post-decline screen) and v284_review do not parse as a question", () => {
@@ -821,6 +845,113 @@ describe("paneWrapRisk", () => {
       "Enter to select · ↑/↓ to navigate · Esc to cancel",
     ].join("\n");
     expect(paneWrapRisk(pane)).toBe(false);
+  });
+});
+
+describe("paneWrapRisk — long-token wrap and scrollback", () => {
+  test("a label well short of the edge whose continuation starts with a long path wraps early (Ink wraps at the word)", () => {
+    // 52-col row + 1 + 49-char path > 80: the path could not fit, so Ink wrapped
+    // it onto the next line even though the row is far from the right edge.
+    const pane = synthPane({
+      question: ["Which file should the helper live in?"],
+      options: [
+        "❯ 1. Edit the shared prompt helper that lives at",
+        "     src/mainview/components/kanban/PromptComposer.tsx",
+        "  2. Create a new file",
+      ],
+    });
+    expect("❯ 1. Edit the shared prompt helper that lives at".length).toBeLessThan(68);
+    expect(paneWrapRisk(pane)).toBe(true);
+    expect(isLossyAskPane(pane)).toBe(true);
+  });
+
+  test("the same continuation is NOT a wrap when the row + word would have fit on one line", () => {
+    const pane = synthPane({
+      question: ["Which file?"],
+      options: ["❯ 1. Edit the helper at", "     src/mainview/components/kanban/PromptComposer.tsx", "  2. Other"],
+    });
+    expect(paneWrapRisk(pane)).toBe(false);
+  });
+
+  test("a short label with a normal short description is not a wrap risk", () => {
+    const pane = synthPane({
+      question: ["Which one?"],
+      options: ["❯ 1. Red", "     Bold and energetic", "  2. Blue", "     Calm"],
+    });
+    expect(paneWrapRisk(pane)).toBe(false);
+  });
+
+  test("v284_flat stays false", () => {
+    expect(paneWrapRisk(fx("v284_flat"))).toBe(false);
+  });
+
+  test("a full-width numbered list in the scrollback above the modal's rule is ignored", () => {
+    const scrollback = [
+      "  1. " + "word ".repeat(16).trim(),
+      "  2. " + "word ".repeat(16).trim(),
+      "",
+    ].join("\n");
+    const pane = scrollback + "\n" + synthPane({
+      question: ["Pick?"],
+      options: ["❯ 1. Red", "  2. Blue"],
+    });
+    expect(scrollback.split("\n")[0]!.length).toBeGreaterThan(68);
+    expect(paneWrapRisk(pane)).toBe(false);
+  });
+});
+
+describe("formatAnswersMessage — single-select custom wins", () => {
+  test("single-select: only the custom text; multi-select keeps picks + custom", () => {
+    const specs: AskQuestionSpec[] = [
+      { question: "Color?", multiSelect: false, options: ["Red", "Blue"] },
+      { question: "Toppings?", multiSelect: true, options: ["Ham", "Olives"] },
+    ];
+    const msg = formatAnswersMessage(specs, [
+      { selected: ["Red"], custom: "purple" },
+      { selected: ["Ham"], custom: "peppers" },
+    ]);
+    expect(msg).toBe('Here are my answers: "Color?"="purple", "Toppings?"="Ham, peppers".');
+  });
+});
+
+describe("planAskAnswers — hasTypeRow and unsafe custom text", () => {
+  const spec = (hasTypeRow?: boolean, multiSelect = false): AskQuestionSpec => ({
+    question: "q", multiSelect, options: ["A", "B"], ...(hasTypeRow !== undefined ? { hasTypeRow } : {}),
+  });
+
+  test("custom answer for a question with no Type row → message mode `no-type-row` (single and multi)", () => {
+    for (const multi of [false, true]) {
+      const plan = planAskAnswers([spec(false, multi)], [{ selected: [], custom: "purple" }]);
+      expect(plan.mode).toBe("message");
+      if (plan.mode === "message") {
+        expect(plan.reason).toBe("no-type-row");
+        expect(plan.text).toContain("purple");
+      }
+    }
+  });
+
+  test("no Type row but a pick only → still driven; hasTypeRow true/undefined → typed", () => {
+    expect(planAskAnswers([spec(false)], [{ selected: ["B"] }])).toEqual({
+      mode: "drive", steps: ["Down", "Enter"], confirmsReview: false,
+    });
+    for (const h of [true, undefined]) {
+      const plan = planAskAnswers([spec(h)], [{ selected: [], custom: "purple" }]);
+      expect(plan.mode).toBe("drive");
+    }
+  });
+
+  test("control characters in custom text → `unsafe-custom` (tab, ESC, DEL, C1)", () => {
+    for (const bad of ["a\tb", "a\u001bb", "a\u007fb", "a\u0085b", "a\u0000b"]) {
+      const plan = planAskAnswers([spec()], [{ selected: [], custom: bad }]);
+      expect(plan.mode).toBe("message");
+      if (plan.mode === "message") expect(plan.reason).toBe("unsafe-custom");
+    }
+  });
+
+  test("a newline still reports multiline-custom (checked before unsafe-custom)", () => {
+    const plan = planAskAnswers([spec()], [{ selected: [], custom: "a\nb\tc" }]);
+    expect(plan.mode).toBe("message");
+    if (plan.mode === "message") expect(plan.reason).toBe("multiline-custom");
   });
 });
 

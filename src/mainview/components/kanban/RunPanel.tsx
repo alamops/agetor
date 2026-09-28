@@ -7210,15 +7210,18 @@ function AskQuestionsCard({
           custom: a.custom.trim() || undefined,
         })),
       });
-      // The server drops the card regardless of outcome (see its own doc):
-      // the Escape it sent before attempting delivery already dismissed
-      // THIS modal, so keeping the card up wouldn't let the user retry
-      // answering it. A withheld-and-saved outcome (some OTHER blocking
-      // modal came up while delivering the follow-up turn) is purely
-      // informational — surface it exactly like the composer's own withheld
-      // branch (toast + backlog refresh) before dropping the card.
+      // The server resolves the card regardless of outcome (see its own
+      // doc), so keeping it up wouldn't let the user retry: on the drive
+      // path no Escape is sent, and a modal that is still open is simply
+      // re-collected by the pane scraper as a fresh card. A withheld-and-saved
+      // outcome (some OTHER blocking modal came up while delivering the
+      // follow-up turn) is purely informational — surface it exactly like the
+      // composer's own withheld branch (toast + backlog refresh); any other
+      // failed delivery gets its own toast so the vanished card isn't silent.
       if (res.withheld && res.savedToBacklog) {
         onWithheld?.(res.reason ?? "claude is waiting on a prompt — your answer was saved to the backlog tray");
+      } else if (!res.ok) {
+        toast.error("Answer didn't reach Claude — a fresh card will appear; answer it there or in the terminal");
       }
       onResolved(req.id);
     } finally {
@@ -7227,11 +7230,14 @@ function AskQuestionsCard({
   };
 
   /** One-line summary of the user's answer to question `qi` (picked labels +
-   *  any custom text), for the review screen. Mirrors the native "→ a, b". */
+   *  any custom text), for the review screen. Mirrors the native "→ a, b".
+   *  A single-select question's custom text REPLACES the pick (the drive and
+   *  the follow-up message both send custom only); multi-select adds it. */
   const answerSummary = (qi: number): string => {
     const a = answers[qi] ?? { selected: [], custom: "" };
-    const pieces = [...a.selected];
-    if (a.custom.trim()) pieces.push(a.custom.trim());
+    const custom = a.custom.trim();
+    const pieces = !req.questions[qi]?.multiSelect && custom ? [] : [...a.selected];
+    if (custom) pieces.push(custom);
     return pieces.length ? pieces.join(", ") : "(no answer)";
   };
 

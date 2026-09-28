@@ -67,7 +67,7 @@ test("POST /ask-questions — scraper-sourced drive answer resolves the card", a
   expect(listPendingForTask("t-askq-drive")).toHaveLength(0);
 });
 
-test("POST /ask-questions — scraper-sourced custom-text answer resolves the card (message path)", async () => {
+test("POST /ask-questions — scraper-sourced custom-text answer resolves the card (typed drive path)", async () => {
   const { __testing } = await import("./interactions.ts");
   __testing.reset();
   const { id } = await seedScrapedAskQuestions({

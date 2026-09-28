@@ -11,7 +11,15 @@ process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-askdrive-"
 import { __forTest, driveAskAnswers } from "./claude-tmux.ts";
 import type { AskModalKind, DriveStep } from "./claude-questions.ts";
 
-const { decideAskDriveStep, ASK_VERIFY_MAX_RESENDS, paneShowsTypedAnswer } = __forTest;
+const {
+  decideAskDriveStep,
+  ASK_VERIFY_MAX_RESENDS,
+  paneShowsTypedAnswer,
+  paneFocusedRowIsEmptyType,
+  escapeTypedTrailingSemicolon,
+  confirmStartupDialog,
+  STARTUP_CONFIRM_KEY_GAP_MS,
+} = __forTest;
 
 // ────────────────────────────────────────────────────────────────────────────
 // decideAskDriveStep — pure per-poll decision table driving both phases of
@@ -133,12 +141,63 @@ describe("paneShowsTypedAnswer", () => {
     expect(paneShowsTypedAnswer("❯ 4. \n", "")).toBe(false);
   });
 
+  test("joins the ❯ row with its indented continuation rows (a wrap inside the first 40 chars)", () => {
+    const text = "the quick brown fox jumps over the lazy dog again and again";
+    // Wrapped mid-phrase at ~20 chars: the first row alone is NOT a 40-char prefix.
+    const pane = `  3. other\n❯ 4. the quick brown fox\n     jumps over the lazy dog again\n     and again\n  5. Chat about this\n`;
+    expect(paneShowsTypedAnswer(pane, text)).toBe(true);
+    // A wrap that swallowed the space at the break still matches (whitespace-insensitive).
+    expect(paneShowsTypedAnswer("❯ 4. the quick brown fox\n     jumps over the lazy dog again and again\n", text)).toBe(true);
+    // CJK: no spaces in the text, the wrap adds none but the join inserts one.
+    const cjk = "今日は天気がいいので散歩に行きましょう。それから買い物もします";
+    expect(paneShowsTypedAnswer(`❯ 4. ${cjk.slice(0, 12)}\n     ${cjk.slice(12)}\n`, cjk)).toBe(true);
+  });
+
+  test("continuation stops at an option row, Next, a rule or a blank line", () => {
+    // The text continues on the NEXT option row's label only by coincidence — must not join.
+    expect(paneShowsTypedAnswer("❯ 4. hello\n  5. world\n", "hello world")).toBe(false);
+    expect(paneShowsTypedAnswer("❯ 4. hello\n     Next\n", "hello Next")).toBe(false);
+    expect(paneShowsTypedAnswer("❯ 4. hello\n─────\n     world\n", "hello world")).toBe(false);
+    expect(paneShowsTypedAnswer("❯ 4. hello\n\n     world\n", "hello world")).toBe(false);
+  });
+
+  test("collapses whitespace runs in the text and the row", () => {
+    expect(paneShowsTypedAnswer("❯ 4. a b   c\n", "a  b c")).toBe(true);
+  });
+
   test("regex metacharacters in the text match literally, not as a pattern", () => {
     const text = "a (b) [c] $d ^e .*";
     expect(paneShowsTypedAnswer(`❯ 4. ${text}\n`, text)).toBe(true);
     // If `.*` were live regex, this pane (different literal text) would match.
     expect(paneShowsTypedAnswer("❯ 4. a (b) [c] $d ^e zzz\n", text)).toBe(false);
     expect(paneShowsTypedAnswer("❯ 4. a b c d e\n", text)).toBe(false);
+  });
+});
+
+describe("paneFocusedRowIsEmptyType", () => {
+  test("true for an empty Type row focused (single-select, multi-select, either cursor glyph)", () => {
+    expect(paneFocusedRowIsEmptyType("  3. green\n❯ 4. Type something.\n  5. Chat about this\n")).toBe(true);
+    expect(paneFocusedRowIsEmptyType("  3. [ ] green\n❯ 4. [ ] Type something\n     Next\n")).toBe(true);
+    expect(paneFocusedRowIsEmptyType(" › 4. Type something.  \n")).toBe(true);
+  });
+
+  test("false for a row already holding text, a checked row, a cursor elsewhere, or no Type row at all", () => {
+    expect(paneFocusedRowIsEmptyType("❯ 4. half typed\n  5. Chat about this\n")).toBe(false);
+    expect(paneFocusedRowIsEmptyType("❯ 4. [✔] Type something and more\n")).toBe(false);
+    expect(paneFocusedRowIsEmptyType("❯ 1. red\n  4. Type something.\n")).toBe(false);
+    // Preview layout: bare Chat row, cursor on an option, no Type row.
+    expect(paneFocusedRowIsEmptyType("❯ 3. Gamma\n  Chat about this\n")).toBe(false);
+    expect(paneFocusedRowIsEmptyType("")).toBe(false);
+  });
+});
+
+describe("escapeTypedTrailingSemicolon", () => {
+  test("escapes only a trailing `;` as `\\;`", () => {
+    expect(escapeTypedTrailingSemicolon("done;")).toBe("done\\;");
+    expect(escapeTypedTrailingSemicolon(";")).toBe("\\;");
+    expect(escapeTypedTrailingSemicolon("a;b")).toBe("a;b");
+    expect(escapeTypedTrailingSemicolon("plain")).toBe("plain");
+    expect(escapeTypedTrailingSemicolon("")).toBe("");
   });
 });
 
@@ -163,9 +222,11 @@ interface FakeTmux {
   setPane(text: string): void;
   /** Argv of every call with the leading `-L <socket>` args stripped. */
   calls(): string[][];
+  /** `{ k: last argv element, t: epoch ms }` per call, in order. */
+  times(): Array<{ k: string; t: number }>;
 }
 
-function makeFakeTmux(opts: { emptyPaneOnEnter: boolean }): FakeTmux {
+function makeFakeTmux(opts: { emptyPaneOnEnter: boolean; paneAfterText?: string }): FakeTmux {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-askdrive-tmux-"));
   scratchDirs.push(dir);
   const binPath = path.join(dir, "tmux");
@@ -180,6 +241,11 @@ function makeFakeTmux(opts: { emptyPaneOnEnter: boolean }): FakeTmux {
       `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(argv) + "\\n");\n` +
       `const i = argv.indexOf("capture-pane");\n` +
       `if (i >= 0) { process.stdout.write(readFileSync(${JSON.stringify(panePath)}, "utf8")); }\n` +
+      // The text step (`send-keys -l`) repaints the pane with the typed echo.
+      (opts.paneAfterText !== undefined
+        ? `if (argv.includes("send-keys") && argv.includes("-l")) writeFileSync(${JSON.stringify(panePath)}, ${JSON.stringify(opts.paneAfterText)});\n`
+        : ``) +
+      `appendFileSync(${JSON.stringify(path.join(dir, "times.jsonl"))}, JSON.stringify({ k: argv[argv.length - 1], t: Date.now() }) + "\\n");\n` +
       (opts.emptyPaneOnEnter
         ? `if (argv.includes("send-keys") && argv[argv.length - 1] === "Enter") writeFileSync(${JSON.stringify(panePath)}, "");\n`
         : ``),
@@ -189,6 +255,11 @@ function makeFakeTmux(opts: { emptyPaneOnEnter: boolean }): FakeTmux {
     logPath,
     panePath,
     setPane: (t) => writeFileSync(panePath, t),
+    times: () => {
+      const f = path.join(dir, "times.jsonl");
+      if (!existsSync(f)) return [];
+      return readFileSync(f, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as { k: string; t: number });
+    },
     calls: () => {
       if (!existsSync(logPath)) return [];
       return readFileSync(logPath, "utf8")
@@ -224,10 +295,15 @@ async function withDrive<T>(
 const TEXT = 'a -leading-dash "quoted" ; text';
 const TYPED_STEPS: DriveStep[] = ["Down", "Down", "Down", { type: "text", text: TEXT }, "Enter"];
 
+const TYPE_ROW_PANE = "Pick a colour\n  1. red\n  2. blue\n  3. green\n❯ 4. Type something.\n  5. Chat about this\n\nEnter to select · Esc to cancel\n";
+
 describe("driveAskAnswers — typed text step over a recorded fake tmux", () => {
   test("sends the text as ONE `send-keys -l -- <text>` argv, in order, and returns true", async () => {
-    const fake = makeFakeTmux({ emptyPaneOnEnter: true });
-    fake.setPane(`Pick a colour\n  1. red\n  2. blue\n  3. green\n❯ 4. ${TEXT}\n  5. Chat about this\n\nEnter to select · Esc to cancel\n`);
+    const fake = makeFakeTmux({
+      emptyPaneOnEnter: true,
+      paneAfterText: `Pick a colour\n  1. red\n  2. blue\n  3. green\n❯ 4. ${TEXT}\n  5. Chat about this\n\nEnter to select · Esc to cancel\n`,
+    });
+    fake.setPane(TYPE_ROW_PANE);
     await withDrive(fake, async ({ taskId, sessionName }) => {
       const ok = await driveAskAnswers(taskId, { steps: TYPED_STEPS, confirmsReview: false });
       expect(ok).toBe(true);
@@ -244,20 +320,40 @@ describe("driveAskAnswers — typed text step over a recorded fake tmux", () => 
         ["send-keys", "-t", sessionName, "Down"],
       ]);
       expect(sends.slice(textIdx + 1)).toEqual([["send-keys", "-t", sessionName, "Enter"]]);
-      // The pane was read between the text and the Enter (echo verification).
+      // The pane was read BEFORE the text (empty-Type-row guard) and between the
+      // text and the Enter (echo verification).
       const all = fake.calls();
       const textAt = all.findIndex((a) => a.includes("-l"));
       const enterAt = all.findIndex((a) => a[0] === "send-keys" && a[a.length - 1] === "Enter");
+      expect(all.slice(0, textAt).some((a) => a[0] === "capture-pane")).toBe(true);
       expect(all.slice(textAt + 1, enterAt).some((a) => a[0] === "capture-pane")).toBe(true);
     });
   });
 
-  test("echo never appears → returns false, sends NO Enter or further key, emits a status chunk", async () => {
+  test("a trailing `;` is sent as `\\;` (tmux 3.6a swallows a bare trailing `;`); the echo check still uses the original text", async () => {
+    const fake = makeFakeTmux({
+      emptyPaneOnEnter: true,
+      paneAfterText: "Pick a colour\n  3. green\n❯ 4. all done;\n  5. Chat about this\n\nEnter to select · Esc to cancel\n",
+    });
+    fake.setPane(TYPE_ROW_PANE);
+    await withDrive(fake, async ({ taskId, sessionName }) => {
+      const ok = await driveAskAnswers(taskId, {
+        steps: ["Down", "Down", "Down", { type: "text", text: "all done;" }, "Enter"],
+        confirmsReview: false,
+      });
+      expect(ok).toBe(true);
+      const text = fake.calls().find((a) => a.includes("-l"));
+      expect(text).toEqual(["send-keys", "-t", sessionName, "-l", "--", "all done\\;"]);
+      expect(text![5]!.length).toBe("all done;".length + 1);
+    });
+  });
+
+  test("echo never appears → 'typed-abort', sends NO Enter or further key, emits a status chunk", async () => {
     const fake = makeFakeTmux({ emptyPaneOnEnter: true });
-    fake.setPane("Pick a colour\n  1. red\n  2. blue\n  3. green\n❯ 4. Type something.\n  5. Chat about this\n\nEnter to select · Esc to cancel\n");
+    fake.setPane(TYPE_ROW_PANE);
     await withDrive(fake, async ({ taskId, chunks }) => {
       const ok = await driveAskAnswers(taskId, { steps: TYPED_STEPS, confirmsReview: false });
-      expect(ok).toBe(false);
+      expect(ok).toBe("typed-abort");
 
       const sends = fake.calls().filter((a) => a[0] === "send-keys");
       const textIdx = sends.findIndex((a) => a.includes("-l"));
@@ -272,6 +368,36 @@ describe("driveAskAnswers — typed text step over a recorded fake tmux", () => 
     });
   });
 
+  const REFUSED: Array<[string, string]> = [
+    [
+      "a preview-layout question with no Type row (bare Chat row, cursor on an option)",
+      "Pick one\n❯ 1. Alpha\n  2. Beta\n  3. Gamma\n  Chat about this\n\nEnter to select · Esc to cancel\n",
+    ],
+    [
+      "a Type row already holding text",
+      "Pick a colour\n  3. green\n❯ 4. half typed answer\n  5. Chat about this\n\nEnter to select · Esc to cancel\n",
+    ],
+    [
+      "the cursor on another row while an empty Type row is visible",
+      "Pick a colour\n❯ 1. red\n  2. blue\n  4. Type something.\n  5. Chat about this\n\nEnter to select · Esc to cancel\n",
+    ],
+  ];
+  for (const [name, pane] of REFUSED) {
+    test(`typed-step guard refuses (${name}) → 'typed-abort' and types NOTHING`, async () => {
+      const fake = makeFakeTmux({ emptyPaneOnEnter: true });
+      fake.setPane(pane);
+      await withDrive(fake, async ({ taskId, chunks }) => {
+        const ok = await driveAskAnswers(taskId, { steps: TYPED_STEPS, confirmsReview: false });
+        expect(ok).toBe("typed-abort");
+        const sends = fake.calls().filter((a) => a[0] === "send-keys");
+        // Only the three navigation Downs went out — no text, no Enter.
+        expect(sends).toHaveLength(3);
+        expect(fake.calls().some((a) => a.includes("-l"))).toBe(false);
+        expect(chunks.some((c) => c.stream === "status" && c.data.includes("not an empty 'Type something' row"))).toBe(true);
+      });
+    });
+  }
+
   test("a plan with no text steps sends keys only and returns true once the modal closes", async () => {
     const fake = makeFakeTmux({ emptyPaneOnEnter: true });
     fake.setPane("Pick a colour\n❯ 1. red\n  2. blue\n\nEnter to select · Esc to cancel\n");
@@ -283,6 +409,41 @@ describe("driveAskAnswers — typed text step over a recorded fake tmux", () => 
         ["send-keys", "-t", sessionName, "Enter"],
       ]);
       expect(fake.calls().some((a) => a.includes("-l"))).toBe(false);
+    });
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// confirmStartupDialog — 150 ms gap between the arrow(s) and Enter (live-smoke
+// finding: a 30 ms Down+Enter pair was accepted by tmux but ignored by claude).
+// ────────────────────────────────────────────────────────────────────────────
+
+describe("confirmStartupDialog — key gap over a recorded fake tmux", () => {
+  const dialog = (cursorIndex: number, acceptIndex: number) => ({
+    name: "trust-folder",
+    choices: [{ key: "1", label: "No, exit" }, { key: "2", label: "Yes, I trust this folder" }],
+    cursorIndex,
+    acceptIndex,
+    fingerprint: `fp-${cursorIndex}`,
+  });
+
+  test("Down then Enter, at least STARTUP_CONFIRM_KEY_GAP_MS apart", async () => {
+    expect(STARTUP_CONFIRM_KEY_GAP_MS).toBe(150);
+    const fake = makeFakeTmux({ emptyPaneOnEnter: false });
+    await withDrive(fake, async ({ taskId, sessionName }) => {
+      expect(await confirmStartupDialog(taskId, sessionName, dialog(0, 1))).toBe(true);
+      const keys = fake.times().filter((c) => c.k === "Down" || c.k === "Enter");
+      expect(keys.map((c) => c.k)).toEqual(["Down", "Enter"]);
+      // Wall-clock gap (process-spawn latency only ever adds to it).
+      expect(keys[1]!.t - keys[0]!.t).toBeGreaterThanOrEqual(STARTUP_CONFIRM_KEY_GAP_MS - 20);
+    });
+  });
+
+  test("cursor already on the accept row → Enter alone (the retry case where only Enter was lost)", async () => {
+    const fake = makeFakeTmux({ emptyPaneOnEnter: false });
+    await withDrive(fake, async ({ taskId, sessionName }) => {
+      expect(await confirmStartupDialog(taskId, sessionName, dialog(1, 1))).toBe(true);
+      expect(fake.calls().filter((a) => a[0] === "send-keys")).toEqual([["send-keys", "-t", sessionName, "Enter"]]);
     });
   });
 });

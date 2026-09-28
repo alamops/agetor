@@ -2012,10 +2012,18 @@ test("readPendingAskQuestionsFromJsonl: null when there's no AskUserQuestion / t
 import type { NavKey } from "./claude-questions.ts";
 
 type FakeOption = { label: string; preview?: string[]; description?: string };
-type FakeTab = { header: string; question: string; multiSelect: boolean; options: FakeOption[] };
+type FakeTab = {
+  header: string; question: string; multiSelect: boolean; options: FakeOption[];
+  /** `false` renders the preview layout's bare, unnumbered `Chat about this` row
+   *  with NO `Type something` row. Default: the normal layout (a numbered Type
+   *  row directly above a numbered Chat row). */
+  typeRow?: boolean;
+};
 
 /** Render one frame of the modal as tmux would capture it: option list on the
- *  left, the FOCUSED option's preview in a box to the right (col 30). */
+ *  left, the FOCUSED option's preview in a box to the right (col 30). `cursor`
+ *  indexes the real options; `options.length` is the Type row (when present) and
+ *  the next index the Chat row. */
 function renderFakeModal(tabs: FakeTab[], tab: number, cursor: number): string {
   const COL = 30, W = 28;
   const cur = tabs[tab]!;
@@ -2045,10 +2053,18 @@ function renderFakeModal(tabs: FakeTab[], tab: number, cursor: number): string {
     const box = boxRows[r] ?? "";
     out.push(box ? left.padEnd(COL) + box : left);
   }
+  const hasType = cur.typeRow !== false;
+  const typeIdx = cur.options.length;
+  const chatIdx = typeIdx + (hasType ? 1 : 0);
+  if (hasType) {
+    out.push(`${cursor === typeIdx ? "❯ " : "  "}${typeIdx + 1}. ${cur.multiSelect ? "[ ] " : ""}Type something.`);
+  }
   if (cur.multiSelect) out.push("  Next");
-  // Numbered like the real modal; an unnumbered row would be folded into the
-  // preceding option's description by the parser.
-  out.push(`  ${cur.options.length + 1}. Chat about this`, "─".repeat(80),
+  // The normal layout numbers the Chat row directly under the Type row; the
+  // preview layout renders it bare and unnumbered.
+  out.push(
+    hasType ? `${cursor === chatIdx ? "❯ " : "  "}${chatIdx + 1}. Chat about this` : "  Chat about this",
+    "─".repeat(80),
     tabs.length > 1
       ? "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"
       : "Enter to select · ↑/↓ to navigate · Esc to cancel");
@@ -2067,10 +2083,21 @@ function makeFakePane(
     swallowAllRights?: boolean;
     /** Initial pane size (default 120x30). */
     size?: { w: number; h: number };
+    /** 1-based indices of `Left` / `Up` / `Down` presses the fake TUI ignores. */
+    swallowLeftAt?: number[];
+    /** Initial cursor index (default 0; `options.length` = the Type row). */
+    startCursor?: number;
+    swallowUpAt?: number[];
+    swallowDownAt?: number[];
+    /** Ignore every `Left` press. */
+    swallowAllLefts?: boolean;
+    /** Up from option 0 WRAPS to the Type row (the real TUI's behaviour), and
+     *  Down/Up move over the Type/Chat rows too. Default: clamp at the options. */
+    wrap?: boolean;
   } = {},
 ) {
-  let tab = 0, cursor = 0, w = opts.size?.w ?? 120, h = opts.size?.h ?? 30;
-  let rightPresses = 0;
+  let tab = 0, cursor = opts.startCursor ?? 0, w = opts.size?.w ?? 120, h = opts.size?.h ?? 30;
+  let rightPresses = 0, leftPresses = 0, upPresses = 0, downPresses = 0;
   const log: string[] = [];
   const io = {
     capture: async () => renderFakeModal(tabs, tab, cursor),
@@ -2080,8 +2107,16 @@ function makeFakePane(
         rightPresses++;
         if (opts.swallowAllRights || opts.swallowRightAt?.includes(rightPresses)) return true;
       }
-      if (key === "Down") cursor = Math.min(cursor + 1, tabs[tab]!.options.length - 1);
-      else if (key === "Up") cursor = Math.max(cursor - 1, 0);
+      if (key === "Left") {
+        leftPresses++;
+        if (opts.swallowAllLefts || opts.swallowLeftAt?.includes(leftPresses)) return true;
+      }
+      if (key === "Up") { upPresses++; if (opts.swallowUpAt?.includes(upPresses)) return true; }
+      if (key === "Down") { downPresses++; if (opts.swallowDownAt?.includes(downPresses)) return true; }
+      const cur = tabs[tab]!;
+      const rowCount = cur.options.length + (cur.typeRow === false ? 1 : 2);
+      if (key === "Down") cursor = opts.wrap ? (cursor + 1) % rowCount : Math.min(cursor + 1, cur.options.length - 1);
+      else if (key === "Up") cursor = opts.wrap ? (cursor - 1 + rowCount) % rowCount : Math.max(cursor - 1, 0);
       else if (key === "Right") { tab = Math.min(tab + 1, tabs.length - 1); cursor = 0; }
       else if (key === "Left") { tab = Math.max(tab - 1, 0); cursor = 0; }
       return true;
@@ -2531,13 +2566,11 @@ test("tabBodyKey: pure identity of question + option labels; descriptions never 
   expect(__forTest.tabBodyKey(parse({ ...base, question: "Which other one?" }))).not.toBe(key);
 });
 
-// The post-collect recheck retry (D8: re-capture after 150 ms before discarding
-// a finished collection) lives in `collectAndRegisterAskCard`, which reads the
-// pane through the module-private `captureTail(state)` -> real `tmux`
-// subprocess, and is not injectable (no PaneIo seam). It is not reachable
-// without faking the tmux binary, which this suite deliberately does not do for
-// the collector. Covered by e2e/manual smoke instead.
-test.skip("collectAndRegisterAskCard: recheck retries once (150 ms) before discarding — not reachable without tmux", () => {});
+// The post-collect recheck (D8, widened to 3 × 150 ms) lives in
+// `collectAndRegisterAskCard`, which reads the pane through the module-private
+// `captureTail(state)` (a real `tmux` subprocess). Its poll loop is factored into
+// `pollAskModalStillUp` and unit-tested below ("pollAskModalStillUp: rechecks
+// up to 3 × 150 ms …"); the wiring itself is covered by e2e/manual smoke.
 
 test("JSONL grace removed: shouldWaitForAskJsonl is gone and a lossy collection grows without sleeping first", async () => {
   const { __forTest } = await import("./claude-tmux.ts");
@@ -2553,6 +2586,209 @@ test("JSONL grace removed: shouldWaitForAskJsonl is gone and a lossy collection 
   } finally {
     __forTest.uninstallSession("ask-no-grace");
   }
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * F-B (review round 1 #2-#5, #8, #10): registering only from a known state,
+ * verified Left / Up returns, a null first parse growing, region-parsed fast
+ * path, `hasTypeRow` carried onto the question.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+const ALL_SWALLOWED = Array.from({ length: 40 }, (_, i) => i + 1);
+
+/** Flat question whose every option carries a preview (so the walk navigates). */
+const PREVIEW_FLAT: FakeTab[] = [{
+  header: "Pick", question: "Which option?", multiSelect: false,
+  options: [
+    { label: "Alpha", preview: ["a-1"] },
+    { label: "Beta", preview: ["b-1"] },
+    { label: "Gamma", preview: ["g-1"] },
+  ],
+}];
+
+test("collectAskQuestionsFromPane: hasTypeRow rides on the question — true for the normal layout (fast path and walk), false for the preview layout", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  // Fast path (flat, no preview, normal layout: numbered Type row above Chat).
+  const flat: FakeTab[] = [{ header: "Pick", question: "Which option?", multiSelect: false, options: [{ label: "Yes" }, { label: "No" }] }];
+  const s1 = __forTest.installSession("ask-htr-fast", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(s1, renderFakeModal(flat, 0, 0), makeFakePane(flat).io);
+    expect(res![0]!.options.map((o) => o.label)).toEqual(["Yes", "No"]);
+    expect(res![0]!.hasTypeRow).toBe(true);
+  } finally { __forTest.uninstallSession("ask-htr-fast"); }
+
+  // Walk (tabbed) — normal layout.
+  const s2 = __forTest.installSession("ask-htr-walk", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(s2, renderFakeModal(FOUR_TABS, 0, 0), makeFakePane(FOUR_TABS).io);
+    expect(res!.every((q) => q.hasTypeRow === true)).toBe(true);
+  } finally { __forTest.uninstallSession("ask-htr-walk"); }
+
+  // Preview layout: a bare, unnumbered `Chat about this` and NO Type row.
+  const preview: FakeTab[] = PREVIEW_FLAT.map((t) => ({ ...t, typeRow: false }));
+  const s3 = __forTest.installSession("ask-htr-preview", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(s3, renderFakeModal(preview, 0, 0), makeFakePane(preview).io);
+    expect(res).not.toBeNull();
+    expect(res![0]!.options.map((o) => o.label)).toEqual(["Alpha", "Beta", "Gamma"]);
+    expect(res![0]!.hasTypeRow).toBe(false);
+  } finally { __forTest.uninstallSession("ask-htr-preview"); }
+});
+
+test("collectAskQuestionsFromPane: a swallowed Left is detected on the return trip and an extra Left puts the modal back on tab 0", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  // 3 Rights are needed; swallowing the FIRST Left strands the modal on tab 1.
+  const { io, log, at } = makeFakePane(FOUR_TABS, { swallowLeftAt: [1] });
+  const state = __forTest.installSession("ask-swallow-left", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(FOUR_TABS, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res!.map((q) => q.question)).toEqual(FOUR_TABS.map((t) => t.question));
+    expect(at().tab).toBe(0);
+    expect(at().cursor).toBe(0);
+    // Exactly one extra Left beyond the 3 walked-back ones.
+    expect(log.filter((l) => l === "Left").length).toBe(4);
+    expect(state.askGrowAttempts).toBe(0);
+  } finally { __forTest.uninstallSession("ask-swallow-left"); }
+});
+
+test("collectAskQuestionsFromPane: the return trip never reaches tab 0 → null, latch counted, extra Lefts bounded", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { io, log } = makeFakePane(FOUR_TABS, { swallowAllLefts: true });
+  const state = __forTest.installSession("ask-swallow-all-lefts", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(FOUR_TABS, 0, 0), io);
+    expect(res).toBeNull();
+    expect(state.askGrowAttempts).toBe(1);
+    // 3 walk-back Lefts + at most n (=4) extra ones.
+    expect(log.filter((l) => l === "Left").length).toBeLessThanOrEqual(3 + 4);
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+    expect(state.paneGrowInFlight).toBe(false);
+  } finally { __forTest.uninstallSession("ask-swallow-all-lefts"); }
+});
+
+test("collectAskQuestionsFromPane: a swallowed Up in the preview restore is corrected with an extra Up until the cursor is back on option 1", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { io, log, at } = makeFakePane(PREVIEW_FLAT, { swallowUpAt: [1] });
+  const state = __forTest.installSession("ask-swallow-up", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(PREVIEW_FLAT, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res![0]!.options.map((o) => o.preview)).toEqual(["a-1", "b-1", "g-1"]);
+    expect(at().cursor).toBe(0);
+    expect(log.filter((l) => l === "Down").length).toBe(2);
+    expect(log.filter((l) => l === "Up").length).toBe(3); // 2 restoring + 1 correcting
+  } finally { __forTest.uninstallSession("ask-swallow-up"); }
+});
+
+test("collectAskQuestionsFromPane: a swallowed Down over-presses the Ups, which WRAP to the Type row — extra Ups walk back to option 1", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { io, at } = makeFakePane(PREVIEW_FLAT, { swallowDownAt: [1], wrap: true });
+  const state = __forTest.installSession("ask-wrap-up", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(PREVIEW_FLAT, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(at().cursor).toBe(0);
+  } finally { __forTest.uninstallSession("ask-wrap-up"); }
+});
+
+test("collectAskQuestionsFromPane: the cursor can never be restored → null and the failure is counted", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { io, log } = makeFakePane(PREVIEW_FLAT, { swallowUpAt: ALL_SWALLOWED });
+  const state = __forTest.installSession("ask-up-stuck", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(PREVIEW_FLAT, 0, 0), io);
+    expect(res).toBeNull();
+    expect(state.askGrowAttempts).toBe(1);
+    // 2 restoring Ups + at most 2 × options extra ones.
+    expect(log.filter((l) => l === "Up").length).toBeLessThanOrEqual(2 + 2 * 3);
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+  } finally { __forTest.uninstallSession("ask-up-stuck"); }
+});
+
+test("collectAskQuestionsFromPane: refuses to register when the cursor is not on option 1 (on the Type row) — fast path and walk both count the latch", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const flat: FakeTab[] = [{ header: "Pick", question: "Which option?", multiSelect: false, options: [{ label: "Yes" }, { label: "No" }] }];
+  const typeRowFrame = renderFakeModal(flat, 0, 2); // cursor on the Type row
+  expect(typeRowFrame).toContain("❯ 3. Type something.");
+  // Fast path.
+  const fast = makeFakePane(flat, { startCursor: 2 });
+  const s1 = __forTest.installSession("ask-cursor-fast", "/tmp/never-read.jsonl");
+  try {
+    expect(await __forTest.collectAskQuestionsFromPane(s1, typeRowFrame, fast.io)).toBeNull();
+    expect(s1.askGrowAttempts).toBe(1);
+    expect(fast.log.length).toBe(0); // never resized or navigated
+  } finally { __forTest.uninstallSession("ask-cursor-fast"); }
+
+  // Walk (lossy tail forces the grow path); the grown frame has the cursor on the Type row.
+  const s2 = __forTest.installSession("ask-cursor-walk", "/tmp/never-read.jsonl");
+  const walk = makeFakePane(FOUR_TABS, { startCursor: 2 });
+  try {
+    expect(await __forTest.collectAskQuestionsFromPane(s2, scrolledOffTabBar(FOUR_TABS), walk.io)).toBeNull();
+    expect(s2.askGrowAttempts).toBe(1);
+    expect(walk.log.some((l) => l.startsWith("restore:"))).toBe(true);
+    expect(walk.log.filter((l) => l === "Right").length).toBe(0); // bailed before walking
+  } finally { __forTest.uninstallSession("ask-cursor-walk"); }
+});
+
+test("collectAskQuestionsFromPane: a first tail with NO option rows is lossy, not fatal — it grows and registers from the grown capture", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { parseModalPane } = await import("./claude-questions.ts");
+  const firstTail = "  ...mid-repaint garbage...\nEnter to select · Esc to cancel";
+  expect(parseModalPane(firstTail)).toBeNull();
+  const { io, log } = makeFakePane(FOUR_TABS);
+  const state = __forTest.installSession("ask-null-first", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, firstTail, io);
+    expect(res).not.toBeNull();
+    expect(res!.map((q) => q.question)).toEqual(FOUR_TABS.map((t) => t.question));
+    expect(log.some((l) => l.startsWith("resize:"))).toBe(true);
+  } finally { __forTest.uninstallSession("ask-null-first"); }
+
+  // ...and when the grown capture is unparsable too, the failure is COUNTED.
+  const stuck = { ...makeFakePane(FOUR_TABS).io, capture: async () => firstTail };
+  const s2 = __forTest.installSession("ask-null-first-stuck", "/tmp/never-read.jsonl");
+  try {
+    expect(await __forTest.collectAskQuestionsFromPane(s2, firstTail, stuck)).toBeNull();
+    expect(s2.askGrowAttempts).toBe(1);
+  } finally { __forTest.uninstallSession("ask-null-first-stuck"); }
+});
+
+test("collectAskQuestionsFromPane: the fast path parses the modal REGION — a numbered list in scrollback can't defeat it", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const tabs: FakeTab[] = [{ header: "Pick", question: "Which option?", multiSelect: false, options: [{ label: "Yes" }, { label: "No" }] }];
+  const scrollback = ["", "  Earlier the agent listed:", "  1. install deps", "  2. run the build", "  3. deploy", ""].join("\n");
+  const tail = scrollback + "\n" + renderFakeModal(tabs, 0, 0);
+  const { io, log } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-fast-region", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, tail, io);
+    expect(res).not.toBeNull();
+    expect(res![0]!.options.map((o) => o.label)).toEqual(["Yes", "No"]);
+    expect(log.length).toBe(0); // still the no-navigation fast path
+  } finally { __forTest.uninstallSession("ask-fast-region"); }
+});
+
+test("pollAskModalStillUp: rechecks up to 3 × 150 ms before concluding the modal left", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { pollAskModalStillUp, ASK_RECHECK_POLLS, ASK_RECHECK_GAP_MS } = __forTest;
+  expect(ASK_RECHECK_POLLS).toBe(3);
+  expect(ASK_RECHECK_GAP_MS).toBe(150);
+  // Never up: 1 immediate check + 3 rechecks, 3 sleeps of 150 ms.
+  let checks = 0;
+  const sleeps: number[] = [];
+  expect(await pollAskModalStillUp(async () => { checks++; return false; }, async (ms) => { sleeps.push(ms); })).toBe(false);
+  expect(checks).toBe(4);
+  expect(sleeps).toEqual([150, 150, 150]);
+  // Reappears on the LAST recheck (a slow repaint after the resize) → still up.
+  let n = 0;
+  expect(await pollAskModalStillUp(async () => ++n === 4, async () => {})).toBe(true);
+  // Up immediately → no sleeps at all.
+  const none: number[] = [];
+  expect(await pollAskModalStillUp(async () => true, async (ms) => { none.push(ms); })).toBe(true);
+  expect(none).toEqual([]);
+  // A card registered meanwhile ends the wait.
+  expect(await pollAskModalStillUp(async () => false, async () => {}, () => true)).toBe(true);
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *

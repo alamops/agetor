@@ -102,7 +102,7 @@ Alternatives rejected: parsing `capture-pane -e` ANSI for the active tab / dim d
 - `__forTest` exports removed: `shouldWaitForAskJsonl`; renamed constant `PREVIEW_PANE_MIN_COLS` → `GROW_PANE_COLS` (grep for both).
 - `parseModalPane.complete` is stricter: a pane with no `☐`/`☒` row now reads incomplete → routes to the grow path instead of registering. Older CLIs (≤ 2.1.183) also render the row, so no regression there; a future CLI that drops it would degrade to "grow, then give up after 3 attempts → generic numbered card", never a wrong card.
 - Grow width 200: `resize-window -x 200` on an attached client shows a momentarily wide window (restored afterwards, same as today's 120).
-- Typed-answer drive: text with tmux-special characters is passed as ONE argv element after `-l` (no shell) — safe; newlines are excluded by the planner. Claude's paste heuristic wraps ~3 KB typed at once; the 500-char cap keeps well under it.
+- Typed-answer drive: text with tmux-special characters is passed as ONE argv element after `-l` (no shell) — safe; newlines are excluded by the planner. Claude's paste heuristic wraps ~3 KB typed at once; the 400-char cap keeps well under it.
 - CLI parity: `agetor answer` posts the same route; TUI `AnswerOverlay` likewise — no change needed (they only send `selected`/`custom`).
 - Rollback: revert the branch; no migrations, no persisted-shape changes.
 
@@ -131,3 +131,26 @@ Alternatives rejected: parsing `capture-pane -e` ANSI for the active tab / dim d
 | ASCII-glyph terminals | out of scope — agetor's session env pins a UTF-8 Ink renderer; no report of this |
 | ANSI-based active-tab detection | out of scope — superseded by D3 (body verification) |
 | e2e test for the parser | out of scope — no seam (fake driver renders no pane); covered by unit fixtures + live smoke |
+
+## 10. Review round 1 (opus, `code-review` rubric) — fix list
+
+Critical `#1` (tab count from the short tail) was fixed in `11ae5ab` before the review landed. The rest, all accepted, are dispositioned into three file-disjoint fix tasks:
+
+| # | Sev | Finding | Fix | Task |
+| --- | --- | --- | --- | --- |
+| 2 | high | Typed answers driven into preview-layout questions (no `Type something` row; typed chars act as hotkeys, `n` opens notes) | `parseModalPane` records `hasTypeRow` (structural: the numbered row right before the `Chat about this` row, else the `Type something` label); carried on `AskQuestion`/`AskQuestionSpec`; planner sends custom text for a `hasTypeRow === false` question to message mode (`no-type-row`); driver additionally refuses to type unless the focused row is an EMPTY Type row | F-A (parser/planner/type), F-B (driver guard), F-C (route passes it) |
+| 3 | high | A failed typed drive leaves a dirty modal; re-collect mis-drives it | `driveAskAnswers` returns `"typed-abort"` distinctly; the route then runs the existing message-mode fallback (Esc + `formatAnswersMessage`); the collector refuses to register unless `cursorIndex === 0` (counts toward the latch); the structural Type-row rule keeps a typed row out of `options` | F-B, F-C |
+| 4 | high | `Left` return trip and preview `Up` restore unverified | after the Lefts, compare `tabBodyKey` with tab 0's key, bounded extra Lefts, else count a failure and don't register; after the Ups require `cursorIndex === 0` (bounded extra Ups) | F-B |
+| 5 | med | Echo check false negatives on word-wrap / CJK | join the `❯` row with its indented continuation rows, collapse whitespace on both sides, compare the prefix | F-B |
+| 6 | med | tmux drops a trailing `;` from `send-keys -l -- <text>` | escape a trailing `;` as `\;` (verified on 3.6a) | F-B |
+| 7 | med | Control characters driven as keystrokes | planner: any `[\u0000-\u001f\u007f-\u009f]` → message mode (`unsafe-custom`) | F-A |
+| 8 | med | `if (!first) return null` skips grow + latch | a null first parse takes the grow path (n starts at 1, re-derived from the grown capture); the walk's null `base` is counted | F-B |
+| 9 | med | `paneWrapRisk` misses long-word wraps | also flag an option/question row followed by an indented continuation row when `row.length + 1 + firstWord(next).length > width` | F-A |
+| 10 | low | Scrollback numbered lists defeat the fast path | `paneWrapRisk` scans from the modal's top rule; the fast path parses `sliceModalRegion(firstTail)` | F-A (scan), F-B (slice) |
+| 11 | low | `sliceModalRegion` literal `Esc to cancel` | share the wrapped-footer rule | F-B |
+| 12 | low | D8 recheck window too short | poll 3 × 150 ms | F-B |
+| 13 | low | Review summary shows pick + custom for single-select while the drive sends custom only | `answerSummary` and `formatAnswersMessage`: custom wins for single-select | F-C (UI), F-A (message) |
+| 14 | low | Failed drive invisible in the card | toast on `!res.ok` | F-C |
+| 15 | low | Stale docs / dead code (`AskAnswer.custom` doc, RunPanel Escape rationale, `approvals-endpoint.test.ts:70` title, OPTION_RE column doc, plan §7 "500" → 400, dead `custom-text` reason) | fix each | F-A / F-C |
+
+Also landed between waves (outside the review's diff): `d4df873` — 2.1.284's unnumbered workspace-trust dialog is now auto-confirmed (found by the live smoke, which stalled on it), and a bare `Chat about this` row can no longer be folded into an option description.

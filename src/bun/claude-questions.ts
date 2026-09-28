@@ -87,9 +87,11 @@
  *      on that row would UN-check it — so the advance goes Down onto the real
  *      `Next`/`Submit` row and Enter there;
  *    - Enter on an EMPTY Type row declines the whole modal — never send it.
- * A custom answer that can't be typed safely (multi-line, over
- * `ASK_TYPED_ANSWER_MAX_CHARS`) still falls back to `mode: "message"`: Esc to
- * dismiss the modal, then send the formatted answer as a normal follow-up.
+ * A custom answer that can't be typed safely (multi-line, containing control
+ * characters, over `ASK_TYPED_ANSWER_MAX_CHARS`, or for a question with no Type
+ * row — the preview layout, where typed characters would be hotkeys) falls back
+ * to `mode: "message"`: Esc to dismiss the modal, then send the formatted answer
+ * as a normal follow-up.
  */
 
 import { createHash } from "node:crypto";
@@ -106,13 +108,22 @@ export interface AskQuestionSpec {
   multiSelect: boolean;
   /** Option labels in the exact order claude rendered them (the JSONL order). */
   options: string[];
+  /** Whether the live modal has an inline "Type something" row (the only place
+   *  a custom answer can be typed). `false` for the preview layout, which
+   *  renders just a bare `Chat about this`; `undefined` (unknown / JSONL-sourced
+   *  spec) is treated as "has one" — the normal layout. */
+  hasTypeRow?: boolean;
 }
 
 /** The user's answer to a single question, from the agetor card. */
 export interface AskAnswer {
   /** Picked option labels (must be a subset of the spec's `options`). */
   selected: string[];
-  /** Free-text "Other" answer. Presence forces message-mode delivery. */
+  /** Free-text "Other" answer. Typed into the modal's native "Type something"
+   *  row and driven like any pick — unless it is multiline, contains control
+   *  characters, is over {@link ASK_TYPED_ANSWER_MAX_CHARS}, or the question has
+   *  no Type row (`spec.hasTypeRow === false`), in which case the whole submit
+   *  falls back to message mode. */
   custom?: string;
 }
 
@@ -136,7 +147,8 @@ export type DriveStep = NavKey | { type: "text"; text: string };
  *     the confirm instead of firing it blind.
  *  - `message`: dismiss the modal (Esc) and post the answer as a normal turn.
  *     Used when the answer can't be driven safely (empty answer, unknown
- *     label, arity mismatch, a multi-line or over-long custom text). `text`
+ *     label, arity mismatch, a multi-line / control-char / over-long custom text,
+ *     or a custom answer for a question with no Type row). `text`
  *     is the message body to paste; `reason` explains the choice (for logs).
  */
 export type SubmitPlan =
@@ -248,8 +260,17 @@ export interface ParsedQuestionPane {
    *  is true when the TUI collapsed it to "✂ N lines hidden" and a taller pane is
    *  needed to read it in full. */
   options: Array<{ label: string; description?: string; checked: boolean; preview?: string; previewTruncated?: boolean }>;
-  /** 0-based cursor position among `options`, or -1 when the cursor is elsewhere. */
+  /** 0-based cursor position among `options`, or -1 when the cursor is elsewhere
+   *  (including on the Type row, which is not an option). */
   cursorIndex: number;
+  /** True when the modal has an inline "Type something" row. Detected
+   *  structurally: the numbered row directly above the numbered `Chat about
+   *  this` row IS the Type row whatever its label (once text is typed it reads
+   *  `❯ 4. purple` / `❯ 5. [✔] Peppers`), and it is excluded from `options`.
+   *  Falls back to the `Type something` label when there is no numbered Chat
+   *  row. False for the preview layout (bare, unnumbered `Chat about this`,
+   *  no Type row), where typed characters would act as hotkeys. */
+  hasTypeRow: boolean;
   /** True when this parse is trustworthy: the first real option's rendered
    *  number is `1`, non-empty question text was gathered, a `[☐☒]` row (the flat
    *  ` ☐ Header` or the tab bar) sits ABOVE the question block inside the parsed
@@ -274,11 +295,12 @@ export interface ParsedQuestionPane {
   flatHeader?: string;
 }
 
-/** A numbered option row: optional `❯`/`›` cursor (group 1) or `↑`/`↓` window-edge
- *  marker (group 2) in the pointer column, number (group 3), optional `[ ]`/`[✔]`
- *  checkbox (group 4), then the label (group 5). The number must start within
- *  the first 4 columns: a description row indented 5+ that merely begins `2. …`
- *  is never an option. */
+/** A numbered option row: up to 3 leading spaces, then an optional `❯`/`›` cursor
+ *  (group 1) or `↑`/`↓` window-edge marker (group 2) in the pointer column and
+ *  one optional space, number (group 3), optional `[ ]`/`[✔]` checkbox
+ *  (group 4), then the label (group 5). Without a pointer the number must start
+ *  within the first 4 columns, so a description row indented 5+ that merely
+ *  begins `2. …` is never an option. */
 const OPTION_RE = /^\s{0,3}(?:([❯›])|([↑↓]))?\s?(\d{1,2})\.\s+(?:\[([ xX✔])\]\s*)?(.+?)\s*$/;
 /** A revisited, already-answered option carries a trailing ` ✔`. */
 const ANSWERED_SUFFIX_RE = /\s+✔$/;
@@ -424,7 +446,15 @@ export function parseModalPane(tail: string): ParsedQuestionPane | null {
     .filter((r): r is RawRow => r !== null);
 
   // Real answer options (drop the built-in "Type something" / "Chat about this").
-  const kept = raw.filter((r) => !EXCLUDED_OPTION.test(r.label));
+  // The Type row is found STRUCTURALLY first: it is the numbered row directly
+  // above the numbered `Chat about this` row, whatever it currently says — once
+  // the user has typed into it, it reads `❯ 4. purple` / `❯ 5. [✔] Peppers` and
+  // a label match would mistake it for a real option. Without a numbered Chat
+  // row (the preview layout renders it bare) fall back to the label.
+  const chatRow = raw.find((r) => r.label === "Chat about this");
+  const typeRow = chatRow ? raw.find((r) => r.num === chatRow.num - 1) : undefined;
+  const kept = raw.filter((r) => r !== typeRow && !EXCLUDED_OPTION.test(r.label));
+  const hasTypeRow = typeRow !== undefined || raw.some((r) => /^Type something\.?$/.test(r.label));
   if (kept.length === 0) return null;
   const multiSelect = kept.some((r) => r.checkbox !== null);
   const cursorIndex = kept.findIndex((r) => r.cursor);
@@ -529,6 +559,7 @@ export function parseModalPane(tail: string): ParsedQuestionPane | null {
     multiSelect,
     options,
     cursorIndex,
+    hasTypeRow,
     complete,
     windowed,
     ...(flatHeader !== undefined ? { flatHeader } : {}),
@@ -558,6 +589,13 @@ function modalRuleWidth(lines: string[]): number {
  * width is the length of the modal's own `─` rule row; false when there is no
  * such row. False positives only cost one grow-and-re-read.
  *
+ * Also true when an option (or ungutted question) row is followed by an
+ * indented continuation row and would not have fit the continuation's first
+ * word on its own line (`row + 1 + word > width`) — Ink's real wrap condition,
+ * which trips well short of the edge when the next token is a long path/URL.
+ * Only rows from the modal's own header / tab bar down are inspected, never the
+ * scrollback above it.
+ *
  * Question rows that carry the `│ ` gutter don't count: claude gutters EVERY
  * row of a wrapped question and `parseModalPane` rejoins them, so a wrapped
  * question is fully recovered and near-edge gutter rows are the normal case.
@@ -571,27 +609,43 @@ export function paneWrapRisk(tail: string): boolean {
   if (width === 0) return false;
   const limit = width - 12;
   const parsed = parseModalPane(tail);
-  const firstOptIdx = lines.findIndex((l) => {
+  // The modal's own top bounds the region we inspect — rows above it are
+  // scrollback (an echoed user prompt, an earlier numbered list…), often
+  // full-width text that says nothing about the modal. The top is the header /
+  // tab-bar row (`[☐☒]`, the last one on the pane); when it has scrolled off
+  // there is nothing to bound by, so the whole capture counts.
+  let scanStart = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/^\s*(?:←\s*)?[☐☒]/.test(lines[i]!)) { scanStart = i; break; }
+  }
+  const firstOptIdx = lines.findIndex((l, i) => {
+    if (i < scanStart) return false;
     const m = l.match(OPTION_RE);
     return m !== null && !EXCLUDED_OPTION.test(m[5]!.trim());
   });
-  // The modal's own top rule bounds the question region — rows above it are
-  // scrollback (e.g. the echoed user prompt), which is often full-width text.
-  let questionStart = 0;
-  for (let i = 0; i < firstOptIdx; i++) {
-    const t = lines[i]!;
-    if (t.length >= 20 && /^─+$/.test(t)) questionStart = i + 1;
-  }
-  for (let i = 0; i < lines.length; i++) {
+  const isNoiseRow = (l: string): boolean => {
+    const t = l.trim();
+    return t === "" || /^[─-]{3,}$/.test(t) || t === "Chat about this" || /^(Next|Submit)$/.test(t)
+      || /Esc to cancel/.test(l) || /✂|\blines hidden\b/.test(l) || /^Notes:|press n to add notes/i.test(t);
+  };
+  for (let i = scanStart; i < lines.length; i++) {
     const l = lines[i]!;
-    if (l.length < limit) continue;
-    if (OPTION_RE.test(l)) return true;
-    // A question-block row: between the modal's top rule and the first option,
+    const isOption = OPTION_RE.test(l);
+    // A question-block row: between the modal's header and the first option,
     // not the tab bar / header, and without the `│` gutter.
-    if (
-      parsed !== null && firstOptIdx >= 0 && i >= questionStart && i < firstOptIdx
+    const isUngutteredQuestion =
+      !isOption && parsed !== null && firstOptIdx >= 0 && i >= scanStart && i < firstOptIdx
       && !/^[─-]{3,}$/.test(l.trim()) && !/^\s*(?:←\s*)?[☐☒]/.test(l) && !/✔\s*Submit/.test(l)
-      && !/^\s*│/.test(l) && l.trim() !== ""
+      && !/^\s*│/.test(l) && l.trim() !== "";
+    if (!isOption && !isUngutteredQuestion) continue;
+    if (l.length >= limit) return true;
+    // Ink wraps a row as soon as its next word would not fit, so a long token
+    // (a path, a URL) wraps well short of the edge: the row is followed by an
+    // indented continuation that `parseModalPane` would read as a description.
+    const next = lines[i + 1];
+    if (
+      next !== undefined && /^ {5,}\S/.test(next) && !OPTION_RE.test(next) && !isNoiseRow(next)
+      && l.length + 1 + (next.trim().split(/\s+/)[0]?.length ?? 0) > width
     ) {
       return true;
     }
@@ -628,8 +682,11 @@ export function isLossyAskPane(tail: string): boolean {
 export function formatAnswersMessage(specs: AskQuestionSpec[], answers: AskAnswer[]): string {
   const parts = specs.map((spec, i) => {
     const a = answers[i] ?? { selected: [] as string[] };
-    const pieces = [...a.selected];
-    if (a.custom && a.custom.trim()) pieces.push(a.custom.trim());
+    const custom = a.custom && a.custom.trim() ? a.custom.trim() : null;
+    // A single-select question has exactly one answer, and the typed drive lets
+    // the custom text win over any pick — the message must say the same.
+    const pieces = custom !== null && !spec.multiSelect ? [] : [...a.selected];
+    if (custom !== null) pieces.push(custom);
     const value = pieces.length ? pieces.join(", ") : "(no answer)";
     const escape = (s: string) => s.replace(/"/g, '\\"');
     return `"${escape(spec.question)}"="${escape(value)}"`;
@@ -643,13 +700,12 @@ export function formatAnswersMessage(specs: AskQuestionSpec[], answers: AskAnswe
  *  Longer text falls back to message mode. */
 export const ASK_TYPED_ANSWER_MAX_CHARS = 400;
 
-/** Reasons a submit falls back to message-mode. Exported for assertions.
- *  (`custom-text` is legacy — custom answers are driven now — and is no longer
- *  produced by {@link planAskAnswers}.) */
+/** Reasons a submit falls back to message-mode. Exported for assertions. */
 export type MessageFallbackReason =
-  | "custom-text"
   | "multiline-custom"
+  | "unsafe-custom"
   | "custom-too-long"
+  | "no-type-row"
   | "empty-answer"
   | "unknown-option"
   | "arity-mismatch";
@@ -705,7 +761,12 @@ export function planAskAnswers(specs: AskQuestionSpec[], answers: AskAnswer[]): 
     const custom = answer.custom != null && answer.custom.trim() !== "" ? answer.custom.trim() : null;
     if (custom !== null) {
       if (/[\r\n]/.test(custom)) return fallback("multiline-custom");
+      // Typed text is sent as literal keystrokes: a tab, ESC or any other C0/C1
+      // control char would act as a key (focus move, dismiss…), not text.
+      if (/[\u0000-\u001f\u007f-\u009f]/.test(custom)) return fallback("unsafe-custom");
       if (custom.length > ASK_TYPED_ANSWER_MAX_CHARS) return fallback("custom-too-long");
+      // No inline Type row (preview layout): typed characters would be hotkeys.
+      if (spec.hasTypeRow === false) return fallback("no-type-row");
       if (!spec.multiSelect) {
         // The Type row is one choice: typed text replaces any highlighted pick.
         perQuestion.push({ idxs: [], custom });
