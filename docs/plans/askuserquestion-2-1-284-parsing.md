@@ -154,3 +154,20 @@ Critical `#1` (tab count from the short tail) was fixed in `11ae5ab` before the 
 | 15 | low | Stale docs / dead code (`AskAnswer.custom` doc, RunPanel Escape rationale, `approvals-endpoint.test.ts:70` title, OPTION_RE column doc, plan §7 "500" → 400, dead `custom-text` reason) | fix each | F-A / F-C |
 
 Also landed between waves (outside the review's diff): `d4df873` — 2.1.284's unnumbered workspace-trust dialog is now auto-confirmed (found by the live smoke, which stalled on it), and a bare `Chat about this` row can no longer be folded into an option description.
+
+## 11. Review round 2 — all round-1 findings verified fixed; 10 new (2 medium, 8 low), all fixed in `41b2126`
+
+| # | Sev | Finding | Fix |
+| --- | --- | --- | --- |
+| N1 | med | typed-abort fallback never verified the Escape closed the modal or cleaned the composer | `dismissAskModalForMessage` (Escape ×≤2, verify `detectAskModal === null`, `COMPOSER_CLEAR_KEYS` only when a draft is visible, re-verify); the route pastes only on a clean composer, else `ok:false` + reason |
+| N2 | med | boot-confirm retry could land a stale Enter on a "No, exit"-default dialog | retry only after two identical post-window sightings, 1.5 s window, Enter-only when the cursor is already on the affirmative |
+| N3 | low | one flicker frame emitted a false `auto-confirmed` and reset the cap | a dialog counts as gone only after two absent polls |
+| N4 | low | give-up left no card | falls through to the generic prompt card |
+| N5 | low | `bootSettled` exit lost the breadcrumb | flush on that path too, but only for dialogs not matched on the last poll (no false breadcrumb on a boot timeout) |
+| N6 | low | echo check matched the placeholder row for `T`/`Type`… | rows matching `EMPTY_TYPE_ROW_RE` never count |
+| N7 | low | Left verification could not leave the review tab | presses Left when the capture is the review screen |
+| N8 | low | backslashes before a trailing `;` | the reviewer's `2k+1` formula was verified WRONG on tmux 3.6a (tmux eats exactly one backslash); the existing `\;` escape is correct and now pinned by tests |
+| N9 | low | failure toast wrong on the message path | route returns `delivery: "drive" \| "message"`; toast worded per path |
+| N10 | low | structural Type-row lookup not scoped to the modal | nearest row above the Chat row |
+
+Verification at `41b2126`: typecheck green; ask-related suites 516 tests green; full suite and a final live smoke (4-question card, typed answers, and a preview-layout question answered by the message path) recorded in the final report.
