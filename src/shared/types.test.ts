@@ -154,6 +154,37 @@ test("MODEL_EFFORT_SUPPORT.fx's keys exactly match AGENT_OPTIONS.fx.models' ids 
   expect(effortKeys.size).toBe(catalogIds.size);
 });
 
+/* ── jcode (reuses the fx ACP driver; own model/effort surface) ──────────── */
+
+test("DEFAULT_MODEL.jcode is claude-sonnet-5 (jcode's own default) and is the first AGENT_OPTIONS.jcode.models row", () => {
+  expect(DEFAULT_MODEL.jcode).toBe("claude-sonnet-5");
+  const ids = AGENT_OPTIONS.jcode.models.map((m) => m.id);
+  expect(ids).toContain(DEFAULT_MODEL.jcode);
+  expect(ids[0]).toBe("claude-sonnet-5");
+});
+
+test("MODEL_EFFORT_SUPPORT.jcode's keys exactly match AGENT_OPTIONS.jcode.models' ids (both directions)", () => {
+  const catalogIds = new Set(AGENT_OPTIONS.jcode.models.map((m) => m.id));
+  const effortKeys = new Set(Object.keys(MODEL_EFFORT_SUPPORT.jcode));
+  for (const id of catalogIds) expect(effortKeys.has(id)).toBe(true);
+  for (const key of effortKeys) expect(catalogIds.has(key)).toBe(true);
+  expect(effortKeys.size).toBe(catalogIds.size);
+});
+
+test("jcode exposes exactly one mode ('auto') and both CODE_PLAN_MODE postures resolve to it — jcode's ACP has no permission surface", () => {
+  expect(AGENT_OPTIONS.jcode.modes.map((m) => m.id)).toEqual(["auto"]);
+  expect(defaultModeFor("jcode")).toBe("auto");
+});
+
+test("jcode effort options never include 'auto' — that tier is fx-only (jcode has no 'model default')", () => {
+  for (const [, efforts] of Object.entries(MODEL_EFFORT_SUPPORT.jcode)) {
+    expect(efforts).not.toContain("auto");
+  }
+  // supportedEfforts for a jcode model surfaces the real none…max ladder.
+  const ids = supportedEfforts("jcode", "claude-sonnet-5").map((e) => e.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low", "none"]);
+});
+
 /* ── fx effort (docs/plans/fx-0.0.10-compat.md §3 shared spec / T1) ──────── */
 
 // The 17 effort-advertising ids, live-probed on fx 0.0.10 (spike

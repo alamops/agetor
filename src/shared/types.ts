@@ -281,7 +281,7 @@ export function isApprovalPrompt(text: string): boolean {
   return APPROVAL_PROMPT_PATTERNS.some((re) => re.test(text));
 }
 
-export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini" | "fx";
+export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini" | "fx" | "jcode";
 
 /**
  * A "harness" is the user-facing name for an agent configuration. Built-in
@@ -1850,6 +1850,13 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // moonshotai/kimi-k3, unauth catalog grown to 247 ids, zai/glm-5.3-flash
   // still present; signed-in 158-id account still unverifiable.
   "fx": "zai/glm-5.3-flash",
+  // jcode's ACP server exposes its own model catalog via `session/new`'s
+  // configOptions (id "model", currentValue "claude-sonnet-5" out of the box —
+  // live-verified against jcode v0.89 `jcode acp`). Sonnet 5 is jcode's own
+  // default and a strong coding/agentic tier, so agetor pins it verbatim
+  // rather than inventing a different default. Ids are jcode model ids, passed
+  // through as `jcode acp --model <id>`.
+  "jcode": "claude-sonnet-5",
 };
 
 /**
@@ -1890,6 +1897,12 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   // other four kinds use, since that would silently change every fx run's
   // cost/latency on the owner's rate-limited free-tier Gateway account.
   "fx": "auto",
+  // jcode exposes a `reasoning_effort` config option over ACP
+  // (none/low/medium/high/xhigh/max — live-verified on jcode v0.89, its own
+  // `currentValue` is "high"). Unlike fx there is no `auto` tier, so the house
+  // `high` convention applies straight: a new jcode task runs at high effort,
+  // matching jcode's own default and every other non-fx kind.
+  "jcode": "high",
 };
 
 /**
@@ -2351,6 +2364,13 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
   // has an explicit stored mode. Plan still resolves to "ask" (only
   // pre-approved rules run; everything else surfaces as an approval card).
   "fx": { code: "yolo", plan: "ask" },
+  // jcode's ACP server exposes no permission-mode surface at all — no `modes`
+  // in `session/new`, no permission-posture flag on `jcode acp` (live-verified
+  // on v0.89: `--help` has no approval/permission flag, and `session/new`
+  // returns only model + reasoning_effort configOptions). It always runs
+  // hands-off. So `AGENT_OPTIONS.jcode.modes` offers only "auto" and both Code
+  // and Plan resolve to it — there is no read-only posture to route Plan to.
+  "jcode": { code: "auto", plan: "auto" },
 };
 
 /**
@@ -2568,6 +2588,27 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "openai/gpt-6-sol": ["high", "medium", "low", "none", "auto"],
     "openai/gpt-6-luna": ["high", "medium", "low", "none", "auto"],
   },
+  // jcode drives reasoning effort over ACP the same way fx does
+  // (`session/set_config_option`), but under its own config id
+  // `reasoning_effort` (not fx's `effort` — see `effortConfigId` in
+  // `fx-acp.ts`). Live-verified on jcode v0.89: `session/new` returns a single
+  // `reasoning_effort` option whose `options` are none/low/medium/high/xhigh/max
+  // for every model in its catalog (the effort list is model-independent in
+  // jcode's ACP surface, unlike fx's per-Gateway-model sets), so each curated
+  // model below carries the identical ladder. No `auto` tier exists (jcode has
+  // no "let the model pick" option), so — unlike fx — none of these lists
+  // include `auto`. The picker's unknown-model fallback resolves to
+  // DEFAULT_MODEL.jcode (claude-sonnet-5), which carries the full ladder, so a
+  // user-pasted jcode model still gets a sensible effort picker.
+  jcode: {
+    "claude-sonnet-5": ["max", "xhigh", "high", "medium", "low", "none"],
+    "claude-opus-4-8": ["max", "xhigh", "high", "medium", "low", "none"],
+    "claude-haiku-4-5-20251001": ["max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-6-astra": ["max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
+    "anthropic.claude-sonnet-4-20250514-v1:0": ["max", "xhigh", "high", "medium", "low", "none"],
+    "anthropic.claude-opus-4-20250514-v1:0": ["max", "xhigh", "high", "medium", "low", "none"],
+  },
 };
 
 /**
@@ -2691,6 +2732,9 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   cursor: {},
   gemini: {},
   fx: {},
+  // jcode exposes only "auto" (no read-only posture — see CODE_PLAN_MODE.jcode),
+  // so there is nothing to deny per-model.
+  jcode: {},
 };
 
 export function supportedModes(agent: AgentKind, model: string | null): AgentOption[] {
@@ -2914,6 +2958,48 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // report an empty set and the picker collapses for those, same as any
     // other kind's no-effort models. Every id-supported model always
     // includes `auto` (fx's own default) last, per EFFORT_OPTIONS.
+    efforts: EFFORT_OPTIONS,
+  },
+  jcode: {
+    // Curated minimal slice of jcode's live ACP catalog (live-verified on
+    // jcode v0.89 via `session/new`'s `configOptions` model list — 61 ids
+    // across Anthropic-subscription / OpenAI-OAuth / AWS-Bedrock / Cursor
+    // providers). The model id ALSO selects jcode's auth/billing route
+    // (provider pinning): bare `claude-*` = Anthropic subscription/OAuth,
+    // `gpt-6-*` = OpenAI OAuth, `anthropic.*`/`amazon.*` = AWS Bedrock
+    // (live-verified: setting a Bedrock id flipped the session's `provider` to
+    // "Bedrock"). Labels make that boundary visible. `jcode acp --model` is
+    // IGNORED for the session (the driver applies the model over ACP via
+    // `session/set_config_option {configId:"model"}` — see agents.ts's jcode
+    // spawn branch and applyAcpModel in fx-acp.ts); a user who wants any other
+    // jcode model can `agetor add --model <id>` and it passes through verbatim.
+    // Sonnet 5 (subscription) is jcode's own default (first here, and
+    // DEFAULT_MODEL.jcode). NO silent cross-provider fallback — a pinned model
+    // that the signed-in account can't select fails the run loudly.
+    models: [
+      { id: "claude-sonnet-5", label: "Claude Sonnet 5 (subscription)", hint: "Default — jcode's own default; Anthropic subscription/OAuth route. Near-Opus quality at Sonnet cost." },
+      { id: "claude-opus-4-8", label: "Claude Opus 4.8 (subscription)", hint: "Most capable Claude tier via the Anthropic subscription/OAuth route." },
+      { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5 (subscription)", hint: "Fast and cheap; Anthropic subscription/OAuth route." },
+      { id: "gpt-6-astra", label: "GPT-6 Astra (OpenAI)", hint: "OpenAI's most capable model via jcode's OpenAI-OAuth route." },
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna (OpenAI)", hint: "Fast, lower-cost OpenAI tier via the OpenAI-OAuth route." },
+      { id: "anthropic.claude-sonnet-4-20250514-v1:0", label: "Claude Sonnet 4 (Bedrock)", hint: "AWS Bedrock route — billed to your AWS account, not the Anthropic subscription. Pins the session to provider=Bedrock." },
+      { id: "anthropic.claude-opus-4-20250514-v1:0", label: "Claude Opus 4 (Bedrock)", hint: "AWS Bedrock route — billed to your AWS account. Pins the session to provider=Bedrock." },
+    ],
+    // jcode's ACP server exposes no permission-mode surface (no `modes` in
+    // `session/new`, no permission flag on `jcode acp` — live-verified v0.89),
+    // so the only posture is hands-off. A single "auto" row keeps the picker
+    // and `defaultModeFor("jcode")` well-defined; the driver sends no
+    // `session/set_mode` for it (jcode advertises no modes to nudge).
+    modes: [
+      { id: "auto", label: "Auto", hint: "Hands-off — jcode runs tool calls without approval prompts (its ACP server exposes no other permission posture)." },
+    ],
+    // Reasoning effort rides over ACP (`session/set_config_option`, config id
+    // `reasoning_effort`) — see MODEL_EFFORT_SUPPORT.jcode. jcode's ACP
+    // `reasoning_effort` entry returns none/low/medium/high/xhigh/max
+    // model-independently (live-verified); where a given model/provider
+    // doesn't honor it, the driver's applyFxEffort reads the live option list
+    // and degrades gracefully. `auto` is off-scale and never offered for jcode
+    // (it has no "model default" tier).
     efforts: EFFORT_OPTIONS,
   },
 };
