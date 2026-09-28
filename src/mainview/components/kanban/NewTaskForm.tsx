@@ -272,6 +272,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     "cursor": { mode: initialMode("cursor"), model: DEFAULT_MODEL["cursor"], effort: DEFAULT_EFFORT["cursor"], fast: false, maxMode: false },
     "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"], fast: false, maxMode: false },
     "fx": { mode: initialMode("fx"), model: DEFAULT_MODEL["fx"], effort: DEFAULT_EFFORT["fx"], fast: false, maxMode: false },
+    "jcode": { mode: initialMode("jcode"), model: DEFAULT_MODEL["jcode"], effort: DEFAULT_EFFORT["jcode"], fast: false, maxMode: false },
   });
 
   // Seed mode + model + effort defaults from the last submitted picks,

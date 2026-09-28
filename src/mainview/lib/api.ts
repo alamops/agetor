@@ -195,6 +195,7 @@ export interface AgentModelMap {
   "cursor": { id: string; label?: string; efforts?: string[] }[];
   "gemini": { id: string; label?: string; efforts?: string[] }[];
   "fx": { id: string; label?: string; efforts?: string[] }[];
+  "jcode": { id: string; label?: string; efforts?: string[] }[];
 }
 
 /** Per-harness model id list from `GET /agent-models/harnesses` — one entry

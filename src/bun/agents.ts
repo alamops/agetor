@@ -303,6 +303,10 @@ export function resolveBin(harness: Harness): string {
       fallback = "fx";
       override = process.env.AGETOR_FX_BIN;
       break;
+    case "jcode":
+      fallback = "jcode";
+      override = process.env.AGETOR_JCODE_BIN;
+      break;
   }
   if (override) return override;
   return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
@@ -349,6 +353,11 @@ export function harnessEnv(harness: Harness): Record<string, string> {
       // branch above. Re-verified 0.0.10 — all 60 FX_* env vars identical
       // across 0.0.8/0.0.9/0.0.10, still no FX_HOME (`profile_paths.zig
       // root_dir_name = ".fx"`, hardcoded).
+      env.HOME = harness.home;
+    } else if (harness.kind === "jcode") {
+      // jcode has no documented dedicated config-dir env var (its state lives
+      // under `~/.jcode`), so isolating an additional account's login/config
+      // means a true HOME override, same approach as fx/cursor above.
       env.HOME = harness.home;
     } else {
       // gemini: GEMINI_CLI_HOME is a dedicated home-override env var (verified
@@ -730,6 +739,41 @@ export function buildCommand(
     // `spawnFxViaAcp` call site below `buildCommand`). So `buildCommand`
     // still emits nothing for `opts.effort` here — a 0.0.8-or-earlier binary
     // silently ignores the ACP call and just keeps its own default.
+
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  }
+
+  if (harness.kind === "jcode") {
+    // jcode — driven over ACP/stdio via the SAME driver as fx (`fx-acp.ts`,
+    // reused). `jcode acp` is a newline-delimited JSON-RPC 2.0 ACP server over
+    // stdio (live-verified against jcode v0.89: `initialize` returns agentInfo
+    // name "jcode"; `session/new` returns a sessionId plus configOptions for
+    // model + reasoning_effort). The prompt is NOT an argv element — it rides
+    // over the `session/prompt` call the driver issues after the handshake, so
+    // there's no argv-size budget to enforce here (same as fx/codex).
+    //
+    // Unlike fx there is NO `--log-file` flag (jcode rejects it — it's fx-only;
+    // verified via `jcode acp --help`), so this argv is just `jcode acp --model
+    // <id>`. Model is required. Extra args ride via AGETOR_JCODE_ARGS.
+    const extra = (process.env.AGETOR_JCODE_ARGS ?? "").split(/\s+/).filter(Boolean);
+
+    if (!opts.model) {
+      throw new Error("model is required for jcode");
+    }
+
+    const args: string[] = [bin, "acp", "--model", opts.model, ...extra];
+
+    // jcode's ACP server exposes no permission-mode surface (no `modes` in
+    // `session/new`, no permission flag on `jcode acp` — live-verified v0.89),
+    // so there is nothing to gate on `opts.mode` here: the sole "auto" mode is
+    // hands-off and needs no argv/env knob. The driver sends no
+    // `session/set_mode` for it either (jcode advertises no modes to nudge).
+    //
+    // Effort is NOT an argv/env knob for jcode — like fx it rides over ACP
+    // (`session/set_config_option`), but under jcode's own config id
+    // `reasoning_effort` (see `FxLaunchOptions.effortConfigId`, threaded at the
+    // `spawnFxViaAcp` call site below). So `buildCommand` emits nothing for
+    // `opts.effort` here.
 
     return { cmd: args, env: Object.keys(env).length ? env : undefined };
   }
@@ -2098,6 +2142,72 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       resumeSessionId: opts.resumeSessionId ?? undefined,
       continueRecovery: opts.continueRecovery === true,
       effort: opts.effort ?? null,
+      model: opts.model ?? undefined,
+      onChunk,
+      onSessionId,
+    });
+  }
+
+  if (harness.kind === "jcode") {
+    // jcode — driven over ACP/stdio by REUSING the fx driver (`spawnFxViaAcp`
+    // in fx-acp.ts). `jcode acp` speaks the same newline-delimited JSON-RPC
+    // 2.0 ACP protocol the driver already implements; the fx-specific bits are
+    // harmless no-ops here:
+    //   - No `--log-file` in the argv (buildCommand omits it for jcode), so
+    //     the driver's `ensureLogDirForArgv` finds no `--log-file` and does
+    //     nothing.
+    //   - `session/new` returns no `modes`, so the driver's best-effort
+    //     `session/set_mode` nudge never fires (its `availableModes.some(...)`
+    //     guard is false).
+    //   - fx recovery / usage / provider sentinels only emit when jcode
+    //     actually sends those `session/update` shapes, which it doesn't — the
+    //     mapper is lenient about missing notifications by construction (fx
+    //     version drift is handled the same way).
+    // The one real parameterization is `effortConfigId: "reasoning_effort"` —
+    // jcode's own id for the reasoning-effort control (fx uses `effort`).
+    if (process.env.AGETOR_JCODE_DRIVER === "fake") {
+      // Build the command anyway so the fake records the prompt going by and
+      // exercises the same validation (missing model) the real path does.
+      buildCommand(harness, prompt, { ...opts, runId });
+      // jcode's ACP session id is DISCOVERED from `session/new`'s response,
+      // not pre-generated — same timing as fx/codex.
+      onSessionId?.(`fake-jcode-session-${taskId}`);
+      return makeFakeAgent(taskId, prompt, onChunk, {
+        runId,
+        mode: opts.mode ?? defaultModeFor(harness.kind),
+        kind: "jcode",
+        cwd,
+        effort: opts.effort ?? null,
+        model: opts.model ?? undefined,
+      });
+    }
+    const built = buildCommand(harness, prompt, { ...opts, runId });
+    return spawnFxViaAcp({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      // jcode exposes only "auto" — no read-only/yolo posture — and its ACP
+      // server advertises no modes to nudge, so the driver's set_mode is a
+      // no-op regardless. Cast keeps the shared FxMode-typed param satisfied.
+      mode: (opts.mode ?? defaultModeFor(harness.kind)) as FxMode,
+      resumeSessionId: opts.resumeSessionId ?? undefined,
+      effort: opts.effort ?? null,
+      // jcode's reasoning-effort control lives under `reasoning_effort`, not
+      // fx's `effort` (live-verified v0.89) — this is the sole driver-level
+      // fx-ism jcode has to override.
+      effortConfigId: "reasoning_effort",
+      // `jcode acp --model X` is IGNORED for the ACP session (live-verified
+      // v0.89 — the session always opens at jcode's own default regardless of
+      // the argv flag); the model is only honored via `session/set_config_option
+      // {configId:"model"}`. So the argv `--model` in buildCommand is a
+      // best-effort hint at most, and the driver applies the real model over
+      // ACP under this config id. This is also what makes a per-run model
+      // override work on a resumed/loaded session (a follow-up run re-asserts
+      // task.model onto the existing session).
+      modelConfigId: "model",
       model: opts.model ?? undefined,
       onChunk,
       onSessionId,

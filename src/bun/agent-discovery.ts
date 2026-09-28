@@ -1008,6 +1008,20 @@ async function runRefreshKind(kind: AgentKind): Promise<void> {
       case "fx":
         models = await discoverFx();
         break;
+      case "jcode":
+        // jcode has no CLI model-list subcommand (`jcode models --json` is an
+        // unrecognized subcommand — live-verified v0.89). Its catalog is only
+        // reachable by spawning `jcode acp`, handshaking, and reading
+        // `session/new`'s `configOptions` model list — a stateful RPC probe
+        // that doesn't fit this module's one-shot `<bin> <sub> --json` +
+        // parse-stdout discovery framework (and this module deliberately never
+        // imports the ACP driver, to stay a leaf with no process-spawn signal
+        // handlers). So kind-level discovery is intentionally skipped: the
+        // curated `AGENT_OPTIONS.jcode.models` list is the source of truth, and
+        // a user-typed jcode model id still passes through verbatim. An empty
+        // list here means the picker shows exactly the curated rows.
+        models = [];
+        break;
     }
   } catch {
     models = [];

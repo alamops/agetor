@@ -1246,6 +1246,119 @@ test("fx buildCommand for mode 'yolo' sets FX_PERMISSION_MODE=yolo verbatim (nev
   expect(env?.FX_PERMISSION_MODE).toBe("yolo");
 });
 
+// ── jcode ────────────────────────────────────────────────────────────────
+// jcode reuses the fx ACP driver (spawnFxViaAcp) but has its own buildCommand
+// branch. Key differences from fx, all live-verified against jcode v0.89:
+//   - NO `--log-file` flag (jcode rejects it — it's fx-only), so the argv is
+//     just `jcode acp --model <id>` and buildCommand doesn't require runId.
+//   - NO permission-mode env var (jcode exposes no permission posture), so
+//     there's no FX_PERMISSION_MODE analogue.
+//   - Effort/model ride over ACP (session/set_config_option) via the driver,
+//     not argv/env — buildCommand emits neither.
+const jcodeDefaults = { mode: "auto", model: "claude-sonnet-5" } as const;
+
+test("jcode with defaults emits `jcode acp --model <id>` and NO --log-file (that flag is fx-only)", () => {
+  const { cmd } = buildCommand(builtin("jcode"), "hi", { ...jcodeDefaults });
+  // cmd[0] is the resolved jcode binary (a bare "jcode" or an absolute path,
+  // depending on whether jcode is installed on the test host's PATH), so
+  // assert on the argv TAIL rather than pinning the binary spelling.
+  expect(cmd[0]).toMatch(/jcode$/);
+  expect(cmd.slice(1)).toEqual(["acp", "--model", "claude-sonnet-5"]);
+  expect(cmd).not.toContain("--log-file");
+});
+
+test("jcode model id passes through verbatim — no translation table", () => {
+  const { cmd } = buildCommand(builtin("jcode"), "hi", { ...jcodeDefaults, model: "gpt-6-astra" });
+  const i = cmd.indexOf("--model");
+  expect(i).toBeGreaterThan(-1);
+  expect(cmd[i + 1]).toBe("gpt-6-astra");
+});
+
+test("jcode buildCommand does NOT require runId (unlike fx — no --log-file path to build)", () => {
+  expect(() =>
+    buildCommand(builtin("jcode"), "hi", { mode: "auto", model: "claude-sonnet-5" }),
+  ).not.toThrow();
+});
+
+test("jcode throws when model is missing", () => {
+  expect(() =>
+    buildCommand(builtin("jcode"), "hi", { mode: "auto" }),
+  ).toThrow(/model is required for jcode/);
+});
+
+test("jcode buildCommand emits no argv/env for effort (rides over ACP as reasoning_effort via the driver) and no FX_PERMISSION_MODE", () => {
+  const { cmd, env } = buildCommand(builtin("jcode"), "hi", { ...jcodeDefaults, effort: "high" });
+  expect(cmd.join(" ")).not.toMatch(/effort/i);
+  expect(env?.CLAUDE_CODE_EFFORT_LEVEL).toBeUndefined();
+  expect(env?.FX_PERMISSION_MODE).toBeUndefined();
+});
+
+test("jcode ignores mode for argv/env — its only posture is auto (no permission surface)", () => {
+  const { cmd, env } = buildCommand(builtin("jcode"), "hi", { ...jcodeDefaults, mode: "auto" });
+  // No mode flag in argv, no FX_PERMISSION_MODE-style env. (cmd[0] is the
+  // resolved binary; assert on the argv tail — see the defaults test above.)
+  expect(cmd.slice(1)).toEqual(["acp", "--model", "claude-sonnet-5"]);
+  expect(env?.FX_PERMISSION_MODE).toBeUndefined();
+});
+
+test("AGETOR_JCODE_BIN override is respected for the built-in jcode harness", () => {
+  process.env.AGETOR_JCODE_BIN = "/env-fallback/jcode";
+  expect(buildCommand(builtin("jcode"), "hi", { ...jcodeDefaults }).cmd[0]).toBe("/env-fallback/jcode");
+  delete process.env.AGETOR_JCODE_BIN;
+});
+
+test("AGETOR_JCODE_ARGS extra args land at the end of argv, after --model", () => {
+  process.env.AGETOR_JCODE_ARGS = "--trace --quiet";
+  const { cmd } = buildCommand(builtin("jcode"), "hi", { ...jcodeDefaults });
+  expect(cmd.slice(-2)).toEqual(["--trace", "--quiet"]);
+  delete process.env.AGETOR_JCODE_ARGS;
+});
+
+test("aliased jcode with a home override emits HOME (no dedicated jcode config-dir env var, mirrors fx/cursor)", () => {
+  const result = buildCommand(
+    alias("jcode", { home: "/tmp/agetor-test/jcode-2" }),
+    "hi",
+    { ...jcodeDefaults },
+  );
+  expect(result.env?.HOME).toBe("/tmp/agetor-test/jcode-2");
+});
+
+test("jcode AGETOR_JCODE_DRIVER=fake yields a fake handle and fires onSessionId with fake-jcode-session-<taskId>", async () => {
+  process.env.AGETOR_JCODE_DRIVER = "fake";
+  let sessionId: string | undefined;
+  const handle = await spawnAgent({
+    taskId: "task-jcode-1",
+    runId: "run-jcode-1",
+    harness: builtin("jcode"),
+    prompt: "hi",
+    cwd: "/tmp",
+    onChunk: () => {},
+    onSessionId: (id) => { sessionId = id; },
+    opts: { ...jcodeDefaults },
+  });
+  expect(sessionId).toBe("fake-jcode-session-task-jcode-1");
+  expect(handle).toBeDefined();
+  expect(typeof handle.kill).toBe("function");
+  handle.kill();
+  delete process.env.AGETOR_JCODE_DRIVER;
+});
+
+test("jcode AGETOR_JCODE_DRIVER=fake still exercises buildCommand's validation (throws on missing model)", async () => {
+  process.env.AGETOR_JCODE_DRIVER = "fake";
+  await expect(
+    spawnAgent({
+      taskId: "task-jcode-2",
+      runId: "run-jcode-2",
+      harness: builtin("jcode"),
+      prompt: "hi",
+      cwd: "/tmp",
+      onChunk: () => {},
+      opts: { mode: "auto" },
+    }),
+  ).rejects.toThrow(/model is required for jcode/);
+  delete process.env.AGETOR_JCODE_DRIVER;
+});
+
 /**
  * docs/plans/fx-0.0.8-compat.md §3 "Fake fx driver per turn" — the fake fx
  * driver (AGETOR_FX_DRIVER=fake) must emit, per completed turn: a `thinking`

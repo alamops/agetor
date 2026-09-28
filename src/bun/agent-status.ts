@@ -20,6 +20,10 @@ export const INSTALL_HINTS: Record<AgentKind, string> = {
   "cursor": "curl https://cursor.com/install -fsS | bash",
   "gemini": "npm i -g @google/gemini-cli",
   "fx": "curl -fsSL https://fx.sh/setup.sh | bash",
+  // jcode ships as a self-contained binary on the user's PATH (e.g.
+  // ~/.local/bin/jcode); there's no public npm/brew package, so the hint just
+  // points at its repo's install instructions.
+  "jcode": "install jcode from https://github.com/1jehuang/jcode",
 };
 
 /**

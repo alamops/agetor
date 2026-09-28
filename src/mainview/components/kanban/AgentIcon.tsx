@@ -1,4 +1,5 @@
 import { ClaudeCode, Codex, Cursor, GeminiCLI, Vercel } from "@lobehub/icons";
+import { SquareTerminal } from "lucide-react";
 import type { ComponentType } from "react";
 import { cn } from "@/lib/utils";
 import type { AgentKind } from "../../../shared/types.ts";
@@ -17,6 +18,9 @@ const ICONS: Record<AgentKind, ComponentType<IconProps>> = {
   // for Vercel (fx's maker), so the plain (Mono) triangle glyph is the
   // closest equivalent.
   "fx": Vercel,
+  // @lobehub/icons has no Jcode brand mark, so use a neutral lucide terminal
+  // glyph as its stand-in (same monochrome treatment as cursor/fx above).
+  "jcode": SquareTerminal,
 };
 
 /**

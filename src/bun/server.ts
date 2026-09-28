@@ -3946,6 +3946,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               "cursor": getDiscoveredModels("cursor"),
               "gemini": getDiscoveredModels("gemini"),
               "fx": getDiscoveredModels("fx"),
+              "jcode": getDiscoveredModels("jcode"),
             },
             { headers: corsHeaders(req) },
           )),
@@ -3980,6 +3981,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               "cursor": getDiscoveredModels("cursor"),
               "gemini": getDiscoveredModels("gemini"),
               "fx": getDiscoveredModels("fx"),
+              "jcode": getDiscoveredModels("jcode"),
             },
             { headers: corsHeaders(req) },
           );

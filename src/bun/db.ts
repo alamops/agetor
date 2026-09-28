@@ -1066,14 +1066,15 @@ export const harnesses = {
     if (direct) return direct;
     if (
       id === "claude-code" || id === "codex" || id === "cursor" ||
-      id === "gemini" || id === "fx"
+      id === "gemini" || id === "fx" || id === "jcode"
     ) {
       const label =
         id === "claude-code" ? "Claude Code"
         : id === "codex" ? "Codex"
         : id === "cursor" ? "Cursor"
         : id === "gemini" ? "Gemini CLI"
-        : "fx.sh";
+        : id === "fx" ? "fx.sh"
+        : "Jcode";
       return {
         id,
         kind: id,
@@ -1096,7 +1097,7 @@ export const harnesses = {
     if (
       input.kind !== "claude-code" && input.kind !== "codex" &&
       input.kind !== "cursor" && input.kind !== "gemini" &&
-      input.kind !== "fx"
+      input.kind !== "fx" && input.kind !== "jcode"
     ) {
       throw new Error(`unknown harness kind: ${input.kind}`);
     }

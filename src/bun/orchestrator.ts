@@ -1365,7 +1365,7 @@ async function startTaskInner(
   // strand the user's only path back to the paused response. From this point
   // on a run row WILL be inserted below, so the old pause is genuinely
   // superseded regardless of whether the spawn itself goes on to succeed.
-  if (harness.kind === "fx") clearFxRecovery(taskId);
+  if (harness.kind === "fx" || harness.kind === "jcode") clearFxRecovery(taskId);
 
   const runId = randomUUID();
   const now = Date.now();
@@ -2363,7 +2363,7 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     else if (beforeKind === "codex") await dropCodexSession(taskId);
     else if (beforeKind === "cursor") await dropCursorSession(taskId);
     else if (beforeKind === "gemini") await dropGeminiSession(taskId);
-    else if (beforeKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
+    else if (beforeKind === "fx" || beforeKind === "jcode") dropFxSession(taskId); // fx/jcode have no tmux session — stays sync
     // Any queued codex/cursor/gemini/fx follow-ups belong to the old agent —
     // drop them so a later drain doesn't spawn them against the new harness.
     codexTurnQueue.delete(taskId);
@@ -3183,7 +3183,7 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
           reason: "another message is already starting a new turn for this task — try again in a moment",
         };
   }
-  if (kind === "fx") {
+  if (kind === "fx" || kind === "jcode") {
     const result = await sendFxTurn(row.task_id, line);
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
@@ -4102,14 +4102,18 @@ async function spawnFxRun(
     }
 
     const kind: AgentKind = harness?.kind ?? "fx";
+    // Label the ACP session in status lines by its actual kind — this same
+    // resume machinery drives both fx and jcode (jcode reuses spawnFxViaAcp),
+    // so a jcode follow-up shouldn't say "fx session".
+    const acpLabel = kind === "jcode" ? "jcode" : "fx";
     const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
     if ("line" in turn) {
       onChunk("user", normalizeUserText(turn.line));
       onChunk(
         "status",
         priorSessionId
-          ? `resuming fx session ${priorSessionId.slice(0, 8)}…`
-          : "no prior fx session — starting fresh",
+          ? `resuming ${acpLabel} session ${priorSessionId.slice(0, 8)}…`
+          : `no prior ${acpLabel} session — starting fresh`,
       );
       // A fresh follow-up turn is spawning — the pause chain (if any) is
       // over: whatever checkpoint fx had, this new prompt supersedes it, and
@@ -5870,7 +5874,7 @@ function enqueueArchiveTeardown(
     else if (kind === "codex") await dropCodexSession(cur.id);
     else if (kind === "cursor") await dropCursorSession(cur.id);
     else if (kind === "gemini") await dropGeminiSession(cur.id);
-    else if (kind === "fx") dropFxSession(cur.id); // fx has no tmux session — stays sync
+    else if (kind === "fx" || kind === "jcode") dropFxSession(cur.id); // fx/jcode have no tmux session — stays sync
     result = await detachWorktree(cur, { force: opts?.force });
   });
   return { promise, result: () => result };
@@ -6086,7 +6090,7 @@ export async function deleteTask(taskId: string): Promise<void> {
     else if (deleteKind === "codex") await dropCodexSession(taskId);
     else if (deleteKind === "cursor") await dropCursorSession(taskId);
     else if (deleteKind === "gemini") await dropGeminiSession(taskId);
-    else if (deleteKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
+    else if (deleteKind === "fx" || deleteKind === "jcode") dropFxSession(taskId); // fx/jcode have no tmux session — stays sync
     await removeWorktree(task);
   });
   // Refs are otherwise path-only — agetor never copies anything to disk for

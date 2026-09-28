@@ -179,6 +179,11 @@ const HARNESS_HOME_COPY: Record<AgentKind, { label: string; slug: string; help: 
     slug: "fx-2",
     help: "HOME override — fx has no dedicated config-dir env var; the harness home becomes $HOME for the spawned agent, so fx's state (~/.fx) lands under this path, giving this harness its own account.",
   },
+  jcode: {
+    label: "HOME override (absolute path; optional)",
+    slug: "jcode-2",
+    help: "HOME override — jcode has no dedicated config-dir env var; the harness home becomes $HOME for the spawned agent, so jcode's state (~/.jcode) lands under this path, giving this harness its own account.",
+  },
 };
 
 function uniqueHarnessId(base: string, existing: Set<string>): string {

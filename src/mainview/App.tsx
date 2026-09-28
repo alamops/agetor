@@ -172,7 +172,7 @@ function AppInner() {
   // tabs/panels never re-triggers a redundant `GET /agent-profiles` — see
   // `useAgentProfiles`'s own doc comment.
   const { profiles, loaded: profilesLoaded, refresh: refreshProfiles } = useAgentProfiles();
-  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
+  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [], jcode: [] });
   // Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`.
   // `discoveryReady` mirrors the daemon's boot discovery sweep: false until
   // the first `GET /agent-models/harnesses` reports `ready: true`, which is
@@ -374,7 +374,7 @@ function AppInner() {
   // to what's already rendered — re-rendering `NewTaskForm` and the whole
   // `RunPanel` for nothing. A plain `JSON.stringify` compare is cheap at
   // this scale (a handful of harnesses/kinds, once per poll).
-  const agentModelsJsonRef = useRef<string>(JSON.stringify({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] }));
+  const agentModelsJsonRef = useRef<string>(JSON.stringify({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [], jcode: [] }));
   const harnessModelsJsonRef = useRef<string>(JSON.stringify({}));
   const refreshAgentModels = useCallback(async () => {
     try {
