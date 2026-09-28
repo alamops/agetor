@@ -2001,66 +2001,6 @@ test("readPendingAskQuestionsFromJsonl: null when there's no AskUserQuestion / t
   expect(__forTest.readPendingAskQuestionsFromJsonl("/no/such/agetor/file.jsonl")).toBeNull();
 });
 
-test("shouldWaitForAskJsonl: stalls only for a lossy pane with no JSONL, inside the grace window", async () => {
-  const { __forTest } = await import("./claude-tmux.ts");
-  const wait = __forTest.shouldWaitForAskJsonl;
-  const lossy = "❯ 1. Plugins + curated\n  ✂ 5 lines hidden\n  2. Plugins only";
-  const simple = "❯ 1. Plugins + curated\n  2. Plugins only";
-  const now = 1_000_000;
-  // Lossy pane, no JSONL yet, modal just appeared → wait for the JSONL.
-  expect(wait(false, lossy, now, now)).toBe(true);
-  // Grace expired (>2s since first seen) → register from the pane instead.
-  expect(wait(false, lossy, now - 2_001, now)).toBe(false);
-  // Simple pane → never wait; the pane already renders it cleanly.
-  expect(wait(false, simple, now, now)).toBe(false);
-  // JSONL already available → use it, don't wait.
-  expect(wait(true, lossy, now, now)).toBe(false);
-  // No firstSeenAt recorded → don't wait.
-  expect(wait(false, lossy, null, now)).toBe(false);
-});
-
-test("shouldWaitForAskJsonl: also stalls for a pane whose top (header/question/option 1) scrolled off-screen, even with no '✂' markers", async () => {
-  const { __forTest } = await import("./claude-tmux.ts");
-  const wait = __forTest.shouldWaitForAskJsonl;
-  // A REAL question modal (has the footer + "Chat about this" signature) but
-  // captured starting mid-option-1's wrapped description — option 1's own
-  // numbered row is gone, so the first REAL option reads "2.", not "1.". No
-  // "✂"/"lines hidden" collapse marker anywhere — the old trigger would have
-  // missed this entirely and registered a corrupted card immediately.
-  const truncatedTop = [
-    "One main model with others as failover/cost backups.",
-    "  2. Task-specialized",
-    "  3. Experimental",
-    "  4. Type something.",
-    "─".repeat(40),
-    "  5. Chat about this",
-    "",
-    "Enter to select · ↑/↓ to navigate · Esc to cancel",
-  ].join("\n");
-  const now = 1_000_000;
-  expect(wait(false, truncatedTop, now, now)).toBe(true);
-  // Grace expired → stop stalling (the caller falls through to the grow path
-  // or, failing that, refuses to register — see collectAskQuestionsFromPane).
-  expect(wait(false, truncatedTop, now - 2_001, now)).toBe(false);
-  // JSONL already available → use it, don't wait on the pane at all.
-  expect(wait(true, truncatedTop, now, now)).toBe(false);
-  // A COMPLETE question modal (option 1 present) never stalls.
-  const complete = [
-    " ☐ Providers",
-    "",
-    "Which provider?",
-    "",
-    "❯ 1. Task-specialized",
-    "  2. Experimental",
-    "  3. Type something.",
-    "─".repeat(40),
-    "  4. Chat about this",
-    "",
-    "Enter to select · ↑/↓ to navigate · Esc to cancel",
-  ].join("\n");
-  expect(wait(false, complete, now, now)).toBe(false);
-});
-
 /* ────────────────────────────────────────────────────────────────────────── *
  * collectAskQuestionsFromPane — per-option preview capture orchestration
  *
