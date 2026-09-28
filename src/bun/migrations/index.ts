@@ -75,6 +75,7 @@ import m054 from "./054_account_usage.sql" with { type: "text" };
 import m055 from "./055_normalize_cursor_grok_4_7.sql" with { type: "text" };
 import m056 from "./056_normalize_cursor_opus_5_5.sql" with { type: "text" };
 import m057 from "./057_jcode_harness.sql" with { type: "text" };
+import m058 from "./058_jcode_id_collision_selfheal.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -140,4 +141,5 @@ export const migrations: Migration[] = [
   { id: "055_normalize_cursor_grok_4_7", sql: m055 },
   { id: "056_normalize_cursor_opus_5_5", sql: m056 },
   { id: "057_jcode_harness", sql: m057 },
+  { id: "058_jcode_id_collision_selfheal", sql: m058 },
 ];

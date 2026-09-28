@@ -331,6 +331,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
       seed("cursor");
       seed("gemini");
       seed("fx");
+      // jcode was missing from this list — `submit` below persists
+      // `lastMode:jcode`/`lastModel:jcode`/`lastEffort:jcode` on every jcode
+      // task the same as every other kind, but without this call nothing
+      // ever read them back: a jcode task's saved model/effort/mode silently
+      // reset to `DEFAULT_MODEL`/`DEFAULT_EFFORT`/`initialMode` on every form
+      // reopen (CodeRabbit's PR #245 review flagged this — "saved Jcode
+      // selections also need to be restored when the form reopens").
+      seed("jcode");
       const active = agentCache.current[kind];
       setMode(active.mode);
       setModel(active.model);
@@ -820,6 +828,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                         ? "Routed to gemini's --approval-mode plan — a real read-only mode, no changes made."
                         : kind === "fx"
                         ? "fx has no native plan mode — routed to 'ask': only pre-approved rules run; anything else surfaces as an approval card in the run panel."
+                        : kind === "jcode"
+                        ? "jcode has no native plan mode and no read-only posture at all — Plan routes to the SAME hands-off 'auto' mode as Code. The agent will still execute tool calls and make changes; nothing here restricts it."
                         : "Plan only — agent describes what it would do without making changes."
                     }
                   >

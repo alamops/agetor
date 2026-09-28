@@ -4212,11 +4212,17 @@ async function drainFxQueue(taskId: string): Promise<void> {
   const q = fxTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
   const task = tasks.get(taskId);
-  // Task vanished, or its agent was switched away from fx while a turn was
-  // in flight — abandon the stale queue. Without this guard, draining after
-  // an fx→claude switch would spawn the follow-up against the new claude
-  // harness with an fx session id, which claude rejects.
-  if (!task || resolveHarness(task.agent)?.kind !== "fx") {
+  // Task vanished, or its agent was switched away from fx/jcode while a turn
+  // was in flight — abandon the stale queue. Without this guard, draining
+  // after an fx→claude switch would spawn the follow-up against the new
+  // claude harness with an fx session id, which claude rejects. jcode shares
+  // this same queue (both route through `sendFxTurn`/`spawnFxRun` — see the
+  // `kind === "fx" || kind === "jcode"` gate in `sendInput`), so it must be
+  // accepted here too — an fx-only check silently dropped every jcode
+  // follow-up sent while a turn was in flight (queued by `sendFxTurn`, never
+  // drained, no error surfaced).
+  const kind = task ? resolveHarness(task.agent)?.kind : undefined;
+  if (!task || (kind !== "fx" && kind !== "jcode")) {
     fxTurnQueue.delete(taskId);
     return;
   }
