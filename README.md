@@ -31,7 +31,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 
 - **Local-first.** Everything runs on your machine. There's no Agetor account, no cloud relay and no telemetry.
 - **Non-invasive.** Agetor installs no hooks and no MCP server, and it doesn't edit your `CLAUDE.md`. It drives the real CLI the way you would.
-- **Restart-safe.** Agent sessions live in `tmux`, so quitting Agetor doesn't kill your agents. The next launch picks the sessions back up.
+- **Restart-safe.** Claude Code, Codex, Cursor and Gemini CLI run inside `tmux`, so quitting Agetor doesn't stop them, and the next launch reconnects to them. fx is the exception: it runs as a child process of Agetor and stops when Agetor quits, so an fx turn in progress doesn't survive a restart.
 
 ---
 
@@ -40,7 +40,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 ### Orchestrate
 
 - **Kanban workflow.** Tasks move through *Backlog → Ready → Running → Blocked → Review → Done* as their runs start, stall, fail or finish. You can drag a card to override the flow at any time.
-- **A git worktree for every task.** Each task runs on its own branch (`agetor/<id>-<slug>`) under `~/.agetor/worktrees/`, so two agents can work on the same repo at once without colliding. The base commit is pinned when the task is created, so re-runs are reproducible.
+- **A git worktree for every task.** Each task runs on its own branch (`agetor/<id>-<slug>`) under `~/.agetor/worktrees/`, so two agents can work on the same repo at once without colliding. The base commit is pinned when the task is created, so the task keeps the same starting point even after the source branch moves on.
 - **Five harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI and fx side by side. To use a second account for any of them, add a harness with its own isolated `$HOME`.
 - **Agents (reusable profiles).** Save a harness, model, effort, mode, instructions and skills as a named **Agent**, then launch tasks from it in one click.
 - **Pipelines.** Chain Agents into a reusable graph on a canvas, such as *Plan → Implement → Review*. Steps hand context to each other, branch, fan out and loop, all from a single board card. See [Pipelines](#pipelines).
