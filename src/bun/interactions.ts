@@ -44,9 +44,15 @@ export type InteractionKind =
  * live source), then surfaces it as a structured card. The answer is driven
  * back as keystrokes (`planAskAnswers` + `driveAskAnswers`) — a typed custom
  * answer goes into the modal's native `Type something` row via `send-keys -l`.
- * Only what can't be driven (multiline or over-long custom text, unknown
- * options) takes the message-mode fallback: `sendModalKeys(["Escape"])` plus a
- * follow-up turn. There is no blocking hook curl.
+ * Only what can't be driven takes the message-mode fallback: custom text that
+ * is multiline, over-long or carries control characters (`unsafe-custom`),
+ * custom text for a question with no `Type something` row (`no-type-row`), an
+ * empty answer, an unknown option or an arity mismatch (all decided by
+ * `planAskAnswers`), and a drive whose typed step could not be delivered or
+ * verified (`driveAskAnswers` returning `"typed-abort"`). That fallback
+ * dismisses the modal (`dismissAskModalForMessage`: Escape, verify it left the
+ * pane, clear a leftover composer draft) and sends a follow-up turn. There is
+ * no blocking hook curl.
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** One question inside an AskUserQuestion tool call (claude code shape). */

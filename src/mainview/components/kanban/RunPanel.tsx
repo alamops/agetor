@@ -7221,10 +7221,14 @@ function AskQuestionsCard({
       if (res.withheld && res.savedToBacklog) {
         onWithheld?.(res.reason ?? "claude is waiting on a prompt — your answer was saved to the backlog tray");
       } else if (!res.ok) {
+        // The server's own `reason` (e.g. the modal couldn't be dismissed
+        // cleanly) is the most specific explanation; the delivery-based copy
+        // is the fallback when it sent none.
         toast.error(
-          res.delivery === "message"
-            ? "Answer didn't reach Claude — answer it in the terminal or resend from the composer"
-            : "Answer didn't reach Claude — a fresh card will appear; answer it there or in the terminal",
+          res.reason?.trim()
+            || (res.delivery === "message"
+              ? "Answer didn't reach Claude — answer it in the terminal or resend from the composer"
+              : "Answer didn't reach Claude — a fresh card will appear; answer it there or in the terminal"),
         );
       }
       onResolved(req.id);
