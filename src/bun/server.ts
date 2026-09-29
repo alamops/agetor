@@ -501,6 +501,16 @@ function planCursorKindGuard(req: Request, task: Task): Response | null {
  *  to read unambiguously in isolation. */
 const approvalsInFlight = new Set<string>();
 
+/** Concurrent-answer guard for `/ask-questions/:id/answer`: a card stays
+ *  pending until `resolveAskCard` runs AFTER the delivery awaits, so a second
+ *  POST for the same card (a double submit, or the CLI racing the webview)
+ *  would otherwise plan and drive the same keystrokes into the live modal a
+ *  second time. Claimed synchronously — no `await` between the pending lookup,
+ *  the `.has` check and the `.add` — and released in a `finally` once delivery
+ *  has finished. The second request is rejected with 409 before it does
+ *  anything. Keyed on the card id. */
+const askAnswersInFlight = new Set<string>();
+
 /**
  * Coerce an untrusted request body into a well-formed BranchNamingConfig,
  * dropping unknown fields and filling every task-type rule (missing ones fall
@@ -5550,81 +5560,96 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           const pending = getAskQuestionsById(req.params.id);
           if (pending && pending.source === "scraper") {
-            const specs = pending.questions.map((q) => ({
-              question: q.question,
-              multiSelect: !!q.multiSelect,
-              options: q.options.map((o) => o.label),
-              hasTypeRow: q.hasTypeRow,
-            }));
-            const plan = planAskAnswers(specs, sanitised);
-            let ok = false;
-            // Only the message-mode fallback routes through `sendInput`
-            // (which is the only thing capable of reporting a withhold — the
-            // "drive" path types keys straight into an already-open modal via
-            // tmux send-keys, with no composer paste for a blocking modal to
-            // hold up). Left undefined on a successful/failed drive; the
-            // response only carries these when the fallback actually ran.
-            let withheld: true | undefined;
-            let savedToBacklog: true | undefined;
-            let reason: string | undefined;
-            // Which path actually delivered (or attempted) the answer — lets
-            // the UI word a failure toast accurately.
-            let delivery: "drive" | "message" = "drive";
-            // Message-mode fallback — shared by the planner's `mode: "message"`
-            // and a drive that aborted its typed step (`"typed-abort"`):
-            // dismiss the native modal, then deliver the answer as a follow-up
-            // turn.
-            const deliverAsMessage = async (): Promise<void> => {
-              delivery = "message";
-              // Escape the modal, verify it left the pane and clear any
-              // leftover draft from claude's composer before pasting, so the
-              // paste isn't eaten by a dismissing modal or appended to stray
-              // typed text. When a clean composer can't be reached, do NOT
-              // paste: the card still resolves below and the scraper
-              // re-collects a modal that is still open.
-              const clean = await dismissAskModalForMessage(pending.taskId);
-              if (!clean) {
-                ok = false;
-                reason = "the question modal could not be dismissed cleanly — answer it in the terminal";
-                return;
-              }
-              const r = await sendInput(pending.runId, formatAnswersMessage(specs, sanitised));
-              ok = r.delivered;
-              // A withheld paste (e.g. a DIFFERENT blocking modal came up
-              // while the Escape above was settling) must not read to the UI
-              // as an ordinary failure with no indication the answer was
-              // safely saved to the backlog tray rather than lost outright.
-              // Thread the full shape through so the UI can toast the
-              // informational "saved to backlog" framing exactly like
-              // `sendRunInput`'s withheld branch, instead of a bare error.
-              if (!r.delivered) {
-                withheld = r.withheld;
-                savedToBacklog = r.savedToBacklog;
-                reason = r.reason;
-              }
-            };
-            if (plan.mode === "drive") {
-              const driven = await driveAskAnswers(pending.taskId, plan);
-              if (driven === "typed-abort") {
-                await deliverAsMessage();
-              } else {
-                ok = driven;
-              }
-            } else {
-              await deliverAsMessage();
+            // Claimed synchronously, before the first answer-delivery await: a
+            // second request for the same card must not send keys or a
+            // message. The loser gets a 409 here, before touching anything
+            // else — same contract as the plan-approve route's claim.
+            if (askAnswersInFlight.has(req.params.id)) {
+              return json(
+                { error: "this question is already being answered" },
+                { status: 409, headers: corsHeaders(req) },
+              );
             }
-            // Drop the card either way — including a withheld answer. On the
-            // fallback path the Escape above dismissed the ORIGINAL
-            // AskUserQuestion modal; a withhold there means some OTHER
-            // blocking modal came up while delivering the follow-up turn, an
-            // unrelated problem the "saved to backlog" toast covers. On the
-            // drive path no Escape is sent, and a FAILED drive can leave the
-            // modal still open: `resolveAskCard` also clears the session's
-            // `askCardId` tracker, so the scraper re-collects a fresh card on
-            // its next tick (without clearing it, the `!askCardId` gate would
-            // block re-registration and strand the modal with no card).
-            resolveAskCard(req.params.id, pending.taskId);
-            return json({ ok, withheld, savedToBacklog, reason, delivery }, { headers: corsHeaders(req) });
+            askAnswersInFlight.add(req.params.id);
+            try {
+              const specs = pending.questions.map((q) => ({
+                question: q.question,
+                multiSelect: !!q.multiSelect,
+                options: q.options.map((o) => o.label),
+                hasTypeRow: q.hasTypeRow,
+              }));
+              const plan = planAskAnswers(specs, sanitised);
+              let ok = false;
+              // Only the message-mode fallback routes through `sendInput`
+              // (which is the only thing capable of reporting a withhold — the
+              // "drive" path types keys straight into an already-open modal via
+              // tmux send-keys, with no composer paste for a blocking modal to
+              // hold up). Left undefined on a successful/failed drive; the
+              // response only carries these when the fallback actually ran.
+              let withheld: true | undefined;
+              let savedToBacklog: true | undefined;
+              let reason: string | undefined;
+              // Which path actually delivered (or attempted) the answer — lets
+              // the UI word a failure toast accurately.
+              let delivery: "drive" | "message" = "drive";
+              // Message-mode fallback — shared by the planner's `mode: "message"`
+              // and a drive that aborted its typed step (`"typed-abort"`):
+              // dismiss the native modal, then deliver the answer as a follow-up
+              // turn.
+              const deliverAsMessage = async (): Promise<void> => {
+                delivery = "message";
+                // Escape the modal, verify it left the pane and clear any
+                // leftover draft from claude's composer before pasting, so the
+                // paste isn't eaten by a dismissing modal or appended to stray
+                // typed text. When a clean composer can't be reached, do NOT
+                // paste: the card still resolves below and the scraper
+                // re-collects a modal that is still open.
+                const clean = await dismissAskModalForMessage(pending.taskId);
+                if (!clean) {
+                  ok = false;
+                  reason = "the question modal could not be dismissed cleanly — answer it in the terminal";
+                  return;
+                }
+                const r = await sendInput(pending.runId, formatAnswersMessage(specs, sanitised));
+                ok = r.delivered;
+                // A withheld paste (e.g. a DIFFERENT blocking modal came up
+                // while the Escape above was settling) must not read to the UI
+                // as an ordinary failure with no indication the answer was
+                // safely saved to the backlog tray rather than lost outright.
+                // Thread the full shape through so the UI can toast the
+                // informational "saved to backlog" framing exactly like
+                // `sendRunInput`'s withheld branch, instead of a bare error.
+                if (!r.delivered) {
+                  withheld = r.withheld;
+                  savedToBacklog = r.savedToBacklog;
+                  reason = r.reason;
+                }
+              };
+              if (plan.mode === "drive") {
+                const driven = await driveAskAnswers(pending.taskId, plan);
+                if (driven === "typed-abort") {
+                  await deliverAsMessage();
+                } else {
+                  ok = driven;
+                }
+              } else {
+                await deliverAsMessage();
+              }
+              // Drop the card either way — including a withheld answer. On the
+              // fallback path the Escape above dismissed the ORIGINAL
+              // AskUserQuestion modal; a withhold there means some OTHER
+              // blocking modal came up while delivering the follow-up turn, an
+              // unrelated problem the "saved to backlog" toast covers. On the
+              // drive path no Escape is sent, and a FAILED drive can leave the
+              // modal still open: `resolveAskCard` also clears the session's
+              // `askCardId` tracker, so the scraper re-collects a fresh card on
+              // its next tick (without clearing it, the `!askCardId` gate would
+              // block re-registration and strand the modal with no card).
+              resolveAskCard(req.params.id, pending.taskId);
+              return json({ ok, withheld, savedToBacklog, reason, delivery }, { headers: corsHeaders(req) });
+            } finally {
+              askAnswersInFlight.delete(req.params.id);
+            }
           }
           // No scraper-sourced card matched this id (and there are no
           // hook-sourced ask cards any more) — nothing to drive.

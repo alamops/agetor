@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -90,6 +90,74 @@ test("POST /ask-questions — scraper-sourced custom-text answer resolves the ca
   expect(payload.savedToBacklog).toBeUndefined();
   const { listPendingForTask } = await import("./interactions.ts");
   expect(listPendingForTask("t-askq-msg")).toHaveLength(0);
+});
+
+test("POST /ask-questions — a second request for a card that is still being answered sends no keys and no message", async () => {
+  const { __testing, listPendingForTask } = await import("./interactions.ts");
+  __testing.reset();
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "t-askq-race";
+  const { id } = await seedScrapedAskQuestions({
+    taskId,
+    questions: [{ question: "Pick", multiSelect: false, hasTypeRow: true, options: [{ label: "Red" }, { label: "Green" }] }],
+  });
+
+  // A fake tmux that records every call and keeps answering `capture-pane`
+  // with the question modal still up, so the first request's drive stays in
+  // its verify polls (~1 s) — the window the second request lands in.
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-askq-race-tmux-"));
+  const logPath = path.join(dir, "calls.log");
+  const panePath = path.join(dir, "pane.txt");
+  const binPath = path.join(dir, "tmux");
+  writeFileSync(logPath, "");
+  writeFileSync(panePath, [
+    " \u2610 Pick", "", "Pick", "",
+    "\u276f 1. Red", "  2. Green", "  3. Type something.",
+    "\u2500".repeat(40), "  4. Chat about this", "",
+    "Enter to select \u00b7 \u2191/\u2193 to navigate \u00b7 Esc to cancel",
+  ].join("\n"));
+  writeFileSync(binPath, `#!/bin/sh\necho "$*" >> "${logPath}"\ncase "$*" in *capture-pane*) cat "${panePath}";; esac\nexit 0\n`);
+  chmodSync(binPath, 0o755);
+
+  const prevBin = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = binPath;
+  __forTest.installSession(taskId, path.join(dir, "s.jsonl"));
+  try {
+    const post = () => fetch(url(`/ask-questions/${id}/answer`), {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ answers: [{ selected: ["Green"] }] }),
+    });
+    const sendKeys = () => readFileSync(logPath, "utf8").split("\n").filter((l) => l.includes("send-keys"));
+
+    const first = post();
+    // Let the first request claim the card and send its keys (Down, Enter).
+    const deadline = Date.now() + 3000;
+    while (sendKeys().length < 2 && Date.now() < deadline) await Bun.sleep(20);
+    expect(sendKeys().length).toBe(2);
+
+    const second = await post();
+    expect(second.status).toBe(409);
+    const secondBody = await second.json();
+    expect(secondBody).toEqual({ error: "this question is already being answered" });
+    // The rejected request typed nothing into the modal.
+    expect(sendKeys().length).toBe(2);
+    // …and it did not resolve the card out from under the request that owns it.
+    expect(listPendingForTask(taskId)).toHaveLength(1);
+
+    const firstBody = await (await first).json();
+    expect(firstBody.delivery).toBe("drive");
+    expect(listPendingForTask(taskId)).toHaveLength(0);
+
+    // The claim is released: a later request finds no card and attempts nothing.
+    const third = await (await post()).json();
+    expect(third).toEqual({ ok: false });
+    expect(sendKeys().length).toBe(2);
+  } finally {
+    __forTest.uninstallSession(taskId);
+    if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevBin;
+  }
 });
 
 test("POST /ask-questions — unknown id returns ok:false (no hook-sourced cards exist)", async () => {

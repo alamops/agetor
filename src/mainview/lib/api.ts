@@ -1801,7 +1801,8 @@ export const api = {
    *  drive-a-numbered-modal path types keys straight into the open modal, no
    *  paste to withhold). `withheld`/`savedToBacklog`/`reason` are only ever
    *  present alongside `ok: false`, and only for that free-text path — see
-   *  `/ask-questions/:id/answer` in server.ts. */
+   *  `/ask-questions/:id/answer` in server.ts. A request for a card that
+   *  another request is still answering is refused 409 (thrown as `ApiError`). */
   answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; custom?: string }> }) =>
     j<{
       ok: boolean;

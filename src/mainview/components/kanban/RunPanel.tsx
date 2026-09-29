@@ -7523,17 +7523,37 @@ function AskQuestionsCard({
       if (res.withheld && res.savedToBacklog) {
         onWithheld?.(res.reason ?? "claude is waiting on a prompt — your answer was saved to the backlog tray");
       } else if (!res.ok) {
-        // The server's own `reason` (e.g. the modal couldn't be dismissed
-        // cleanly) is the most specific explanation; the delivery-based copy
-        // is the fallback when it sent none.
-        toast.error(
-          res.reason?.trim()
-            || (res.delivery === "message"
-              ? "Answer didn't reach Claude — answer it in the terminal or resend from the composer"
-              : "Answer didn't reach Claude — a fresh card will appear; answer it there or in the terminal"),
-        );
+        // The server's own `reason` is the most specific explanation; the
+        // copy below is the fallback when it sent none. `delivery` says what
+        // was attempted: absent means NOTHING was (the card was already
+        // resolved), so that is neutral feedback, not an error — and no
+        // fresh card is coming. The fresh-card copy is reserved for a failed
+        // drive, which can leave the modal open for the scraper to
+        // re-collect.
+        const reason = res.reason?.trim();
+        if (res.delivery === undefined) {
+          toast(reason || "This question was already resolved");
+        } else {
+          toast.error(
+            reason
+              || (res.delivery === "message"
+                ? "Answer didn't reach Claude — answer it in the terminal or resend from the composer"
+                : "Answer didn't reach Claude — a fresh card will appear; answer it there or in the terminal"),
+          );
+        }
       }
       onResolved(req.id);
+    } catch (e) {
+      // 409: another request (a double submit, the CLI, the TUI) holds the
+      // route's in-flight claim and is answering this card right now. Nothing
+      // was sent on our behalf, so this is neutral feedback, and the card
+      // goes away — the request that owns it resolves it on the server.
+      if (e instanceof ApiError && e.status === 409) {
+        toast(e.message || "This question is already being answered");
+        onResolved(req.id);
+        return;
+      }
+      throw e;
     } finally {
       setSubmitting(false);
     }

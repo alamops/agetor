@@ -3,7 +3,7 @@ import { getClient, type Flags } from "../context.ts";
 import { usageError } from "../usage.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, isTTY } from "../output.ts";
-import type { AgetorClient } from "../api-client.ts";
+import { ApiError, type AgetorClient } from "../api-client.ts";
 import type {
   AskQuestionsRequest,
   TmuxPromptRequest,
@@ -74,8 +74,15 @@ async function answerAsk(client: AgetorClient, req: AskQuestionsRequest): Promis
     }
     answers.push(entry);
   }
-  const res = await client.answerAskQuestions(req.id, answers);
-  out(res.ok ? c.green("✓ answered") : c.red("failed to answer"));
+  try {
+    const res = await client.answerAskQuestions(req.id, answers);
+    out(res.ok ? c.green("✓ answered") : c.red("failed to answer"));
+  } catch (e) {
+    // 409: another client (the app, the TUI, a second `agetor answer`) is
+    // answering this same card right now — nothing was sent on our behalf.
+    if (!(e instanceof ApiError) || e.status !== 409) throw e;
+    out(c.dim("already being answered elsewhere"));
+  }
   return true;
 }
 
