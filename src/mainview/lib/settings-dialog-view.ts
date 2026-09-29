@@ -5,6 +5,7 @@ export const SETTINGS_SECTIONS = [
   { id: "general", label: "General" },
   { id: "harnesses", label: "Harnesses" },
   { id: "agents", label: "Agents" },
+  { id: "pipelines", label: "Pipelines" },
   { id: "git", label: "Git Integration" },
   { id: "prompts", label: "Saved Prompts" },
 ] as const;

@@ -1,6 +1,6 @@
 import { test, expect, mock, afterAll, beforeEach, afterEach } from "bun:test";
 import type { AgetorClient } from "./api-client.ts";
-import type { Task, TaskFxRecovery } from "../shared/types.ts";
+import type { PipelineRunState, Task, TaskFxRecovery } from "../shared/types.ts";
 
 /**
  * `cmdLs` (commands/ls.ts) reaches for a client via `getClient(flags)`,
@@ -363,4 +363,125 @@ test("agent/profile columns: a task bound to an agent profile shows the harness 
   const row = dataRowLine();
   expect(row).toContain("claude-code");
   expect(row).toContain("Reviewer");
+});
+
+// ── pipeline step hiding + blocked-run "needs" hint (docs/plans/pipelines.md
+// §3 D11/T7) — GET /tasks also returns hidden step tasks (pipelineParentId
+// set); `ls` hides them by default like the board/TUI, and a parent task's
+// blocked run extends the "needs" cell the same way the fx-pause hint does.
+
+function pipelineRun(overrides: Partial<PipelineRunState> = {}): PipelineRunState {
+  return {
+    pipelineId: "pipe-1",
+    pipelineName: "Bug fix flow",
+    snapshot: {
+      graph: {
+        steps: [
+          { id: "s1", name: "Investigate", instructions: "", agentProfileId: null, position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any" },
+          { id: "s2", name: "Fix", instructions: "", agentProfileId: null, position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any" },
+          { id: "s3", name: "Verify", instructions: "", agentProfileId: null, position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any" },
+        ],
+        edges: [],
+        startStepId: "s1",
+      },
+      maxSteps: 25,
+      profiles: {},
+      capturedAt: 0,
+    },
+    status: "blocked",
+    active: [{ stepId: "s2", taskId: "step-task-1", seq: 2 }],
+    joins: {},
+    blocked: [{ taskId: "step-task-1", stepId: "s2", kind: "handoff-missing", message: "no <handoff> block found" }],
+    history: [
+      { seq: 1, stepId: "s1", taskId: "step-task-0", startedAt: 0, endedAt: 1, outcome: "succeeded", handoff: null, nextStepIds: ["s2"] },
+    ],
+    stepCount: 2,
+    startedAt: 0,
+    endedAt: null,
+    ...overrides,
+  };
+}
+
+test("cmdLs: hides pipeline step tasks (pipelineParentId set) by default", async () => {
+  currentClient = makeClient([
+    task({ id: "parent01", title: "Parent" }),
+    task({ id: "stepaaaa", title: "Step", pipelineParentId: "parent01" }),
+  ]);
+  await cmdLs([], flags);
+
+  expect(outputs).toHaveLength(1);
+  const lines = outputs[0]!.split("\n");
+  expect(lines.length).toBe(2); // header + only the parent row
+  expect(lines[1]).toContain("Parent");
+  expect(lines[1]).not.toContain("Step");
+});
+
+test("cmdLs --steps: also lists pipeline step tasks — `↳ `-prefixed title, parent short id in the needs cell; the parent row gets the `»` glyph", async () => {
+  currentClient = makeClient([
+    task({ id: "parent01", title: "Parent", pipelineId: "pipe-1" }),
+    task({ id: "stepaaaa", title: "Step", pipelineParentId: "parent01" }),
+  ]);
+  await cmdLs(["--steps"], flags);
+
+  expect(outputs).toHaveLength(1);
+  const lines = outputs[0]!.split("\n");
+  expect(lines.length).toBe(3); // header + both rows
+  const parentRow = lines.find((l) => l.includes("parent01"))!;
+  const stepRow = lines.find((l) => l.includes("stepaaaa"))!;
+  expect(parentRow.trimStart().startsWith("»")).toBe(true);
+  expect(parentRow).not.toContain("↳");
+  expect(stepRow).toContain("↳ Step");
+  expect(stepRow).toContain("step of parent01");
+  expect(stepRow.trimStart().startsWith("○")).toBe(true); // a step keeps its own column glyph
+});
+
+test("cmdLs: a plain task keeps its column glyph (no `»`) and no `↳`", async () => {
+  currentClient = makeClient([task({ id: "t1", title: "Plain", column: "running" })]);
+  await cmdLs([], flags);
+  const row = dataRowLine();
+  expect(row.trimStart().startsWith("▸")).toBe(true);
+  expect(row).not.toContain("↳");
+  expect(row).not.toContain("step of");
+});
+
+test("needs column: a pipeline (parent) task whose run is blocked shows 'pipeline blocked · <progress>'", async () => {
+  currentClient = makeClient([
+    task({ pipelineId: "pipe-1", pipelineRun: pipelineRun({ status: "blocked" }) }),
+  ]);
+  await cmdLs([], flags);
+
+  const row = dataRowLine();
+  expect(row).toContain("pipeline blocked · 1/3 · Fix");
+});
+
+test("needs column: a pipeline (parent) task whose run is running (not blocked) shows no pipeline hint", async () => {
+  currentClient = makeClient([
+    task({ pipelineId: "pipe-1", pipelineRun: pipelineRun({ status: "running", blocked: [] }) }),
+  ]);
+  await cmdLs([], flags);
+
+  const row = dataRowLine();
+  expect(row).not.toContain("pipeline");
+});
+
+test("needs column: pendingInteractionCount AND a blocked pipeline run -> space-joined", async () => {
+  currentClient = makeClient([
+    task({
+      pendingInteractionCount: 1,
+      pipelineId: "pipe-1",
+      pipelineRun: pipelineRun({ status: "blocked" }),
+    }),
+  ]);
+  await cmdLs([], flags);
+
+  const row = dataRowLine();
+  expect(row).toContain("! 1 pipeline blocked · 1/3 · Fix");
+});
+
+test("needs column: a plain (non-pipeline) task's null pipelineId never shows a pipeline hint even with pipelineRun set (defensive)", async () => {
+  currentClient = makeClient([task({ pipelineId: null, pipelineRun: pipelineRun({ status: "blocked" }) })]);
+  await cmdLs([], flags);
+
+  const row = dataRowLine();
+  expect(row).not.toContain("pipeline");
 });

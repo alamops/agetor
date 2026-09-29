@@ -12,6 +12,7 @@ import { taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { sentFileBasename } from "../../../shared/sent-files.ts";
 import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
 import { AgentIcon } from "./AgentIcon";
+import { PipelineBadge } from "@/components/pipelines";
 
 interface Props {
   task: Task;
@@ -66,7 +67,20 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   //    something worth re-reading; Run stays reachable from inside the panel.
   //  - Run otherwise (no openable history yet, or only failed/cancelled).
   const active = task.column === "running" || task.column === "blocked";
-  const openable = task.hasOpenableRun;
+  // A pipeline PARENT never gets its own `runId`/`hasOpenableRun` — only its
+  // step tasks do — so `hasOpenableRun` alone would forever gate the button
+  // on "Run" even once the pipeline has actually executed. Once any step
+  // execution has landed in `pipelineRun.history`, there's something worth
+  // opening the run view for; Retry/Restart live there, not on the card
+  // (M15, docs/plans/pipelines.md review). Mirrored in `buildTaskContextMenu`.
+  const hasOpenablePipelineRun = !!task.pipelineRun && task.pipelineRun.history.length > 0;
+  const openable = task.hasOpenableRun || hasOpenablePipelineRun;
+  // Stop is only honoured server-side for a pipeline PARENT while its run
+  // is genuinely `running` (`POST /tasks/:id/pipeline/cancel` 409s
+  // otherwise — e.g. a `blocked` run with nothing live), so the card's Stop
+  // gates on `pipelineRun.status`, not the column (L-A1). Mirrored in
+  // `buildTaskContextMenu`. Every other task keeps the column-based rule.
+  const stoppable = task.pipelineId ? task.pipelineRun?.status === "running" : active;
   // Combine structured interactions with codex's narrative `blocked` signal.
   // The latter has no answerable payload — the user resolves it from the run
   // panel — but it represents the same "waiting on you" state to the user.
@@ -220,12 +234,18 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               </Badge>
             )}
           </div>
-          {/* When the task was launched from a saved agent profile, show its
-           *  name (with the harness id as the tooltip) instead of the raw
-           *  harness id — the snapshot is server-managed and always present
-           *  once `agentProfileId` is set (plan D1/D14), so no live profile
+          {/* A pipeline task's badge is the pipeline name + step progress
+           *  (D5/D9, docs/plans/pipelines.md) — the profile is per-step, not
+           *  per-task, so it replaces the agent-profile badge outright
+           *  rather than sitting alongside it. Otherwise: when the task was
+           *  launched from a saved agent profile, show its name (with the
+           *  harness id as the tooltip) instead of the raw harness id — the
+           *  snapshot is server-managed and always present once
+           *  `agentProfileId` is set (plan D1/D14), so no live profile
            *  lookup is needed here. */}
-          {task.agentProfile ? (
+          {task.pipelineRun ? (
+            <PipelineBadge run={task.pipelineRun} className="shrink-0" />
+          ) : task.agentProfile ? (
             <Badge
               variant="secondary"
               className="gap-1 shrink-0"
@@ -284,7 +304,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               {awaitingLabel}
               <ArrowRight className="size-3" />
             </Button>
-          ) : active ? (
+          ) : stoppable ? (
             <Button size="sm" variant="destructive" onClick={() => onCancel(task)}>
               <Square className="size-3" /> Stop
             </Button>
@@ -297,7 +317,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               <Play className="size-3" /> Run
             </Button>
           )}
-          {!archived && awaiting && active && (
+          {!archived && awaiting && stoppable && (
             <Button size="icon" variant="ghost" onClick={() => onCancel(task)} title="Stop">
               <Square className="size-3" />
             </Button>

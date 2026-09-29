@@ -143,7 +143,21 @@ async function closeTaskPanel(page: Page): Promise<void> {
   await page
     .getByRole("button", { name: "Close task panel" })
     .click({ position: { x: 10, y: 10 } });
-  await expect(runPanel(page)).toHaveClass(/translate-x-full/);
+  // The panel slides out (`translate-x-full`) and then UNMOUNTS once its exit
+  // animation ends (`if (!mountedTask) return null` in RunPanel) — its
+  // backdrop button goes with it, and `runPanel()`'s `aside.last()` then
+  // resolves to the New Task sidebar. A bare class check races that unmount
+  // under load, so "closed" is either state: sliding out, or gone.
+  await expect
+    .poll(
+      async () => {
+        const cls = (await runPanel(page).getAttribute("class")) ?? "";
+        if (cls.includes("translate-x-full")) return true;
+        return (await page.getByRole("button", { name: "Close task panel" }).count()) === 0;
+      },
+      { message: "expected the task panel to slide out or unmount" },
+    )
+    .toBe(true);
 }
 
 /** Same in-page Meta/Control sniff the app itself uses (`isMacPlatform` in

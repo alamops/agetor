@@ -493,6 +493,8 @@ function describeGlobalEvent(event: GlobalEvent): string {
       return `files-sent:${event.count}`;
     case "fx-auto-resume":
       return `fx-auto-resume:${event.state}`;
+    case "pipeline":
+      return `pipeline:${event.status}`;
     default:
       return assertNever(event);
   }

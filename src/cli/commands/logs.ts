@@ -4,7 +4,8 @@ import { streamSse, type SseHandle } from "../sse.ts";
 import { c, out, errln } from "../output.ts";
 import { usageError } from "../usage.ts";
 import { notifyFor, osNotify } from "../notify.ts";
-import type { RunEvent, GlobalEvent } from "../../shared/types.ts";
+import type { AgetorClient } from "../api-client.ts";
+import type { RunEvent, GlobalEvent, Task } from "../../shared/types.ts";
 import { FX_RECOVERY_STATUS_PREFIX, isInternalStatusSentinel } from "../../shared/types.ts";
 import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../../shared/fx-recovery.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
@@ -26,6 +27,24 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   const task = await resolveTask(client, ref);
   const formatEvent = createEventFormatter();
   const renderLine = createLineRenderer(formatEvent, flags.json);
+
+  // A pipeline (parent) task never runs an agent of its own — only its
+  // hidden step tasks do, one at a time — so `/tasks/:id/events` yields
+  // nothing for it and `agetor logs <parent>` used to follow a stream that
+  // stays silent forever. Print the hint pointing at the step tasks (to
+  // stderr under --json, so stdout stays machine-readable) and RETURN —
+  // unless `--notify` was asked for, the one thing that still does
+  // something useful on a parent: the parent's own column transitions
+  // (blocked / done via the `pipeline` reason) ride the global event
+  // stream the --notify branch below subscribes to (L-CLI6).
+  if (task.pipelineId) {
+    const hint = await pipelineLogsHint(client, task);
+    if (flags.json) errln(hint);
+    else out(hint);
+    if (!notify || noFollow) return;
+  }
+
+  const hidden = task.pipelineParentId != null;
 
   // --rebuild: reconstruct the latest run's events from the on-disk claude
   // JSONL (recovery when the live stream truncated) — a one-shot snapshot.
@@ -75,7 +94,7 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
       notifyHandle = streamSse<GlobalEvent>(
         "/events",
         (e) => {
-          const n = notifyFor(e, task.id);
+          const n = notifyFor(e, task.id, { hidden });
           if (n) osNotify(n.title, n.body);
         },
         { dataDir: flags.dataDir },
@@ -240,5 +259,27 @@ function tryJson(s: string): unknown {
     return JSON.parse(s);
   } catch {
     return null;
+  }
+}
+
+/**
+ * One dim hint line for `agetor logs <pipeline-parent-task>` — the parent
+ * never runs an agent of its own, so its `/tasks/:id/events` stream is
+ * always silent; this points the user at whichever hidden step task they
+ * actually want to watch. Lists every step task launched so far (id + its
+ * `"<pipeline> · <step>"` title, per `pipeline-runner.ts`'s `launchStep`) or
+ * "none yet" before the first Run. Degrades to a plain "use a step task id"
+ * line — never throws — if `GET /tasks/:id/pipeline` itself fails, mirroring
+ * `show.ts`'s `pipelineStepOfText` swallow-and-degrade treatment of the same
+ * route.
+ */
+export async function pipelineLogsHint(client: AgetorClient, task: Task): Promise<string> {
+  const base = "pipeline task — use `agetor logs <stepTaskId>` for a step";
+  try {
+    const { steps } = await client.getPipelineRun(task.id);
+    const list = steps.length > 0 ? steps.map((s) => `${s.title} (${s.id.slice(0, 8)})`).join(", ") : "none yet";
+    return c.dim(`${base}; steps: ${list}`);
+  } catch {
+    return c.dim(base);
   }
 }
