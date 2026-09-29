@@ -313,8 +313,10 @@ test("parseFxModels: 0.0.10-shaped envelope (247 ids, private_models_hidden true
   // below. Rather than inline all 247 real ids, generate a list that
   // contains every curated AGENT_OPTIONS.fx.models id (all 28 then-curated
   // ids confirmed present in the real payload; spacexai/grok-4.7 (curated
-  // since 2026-09-21) and anthropic/claude-opus-5.5 (curated since
-  // 2026-09-22) postdate it) padded out with synthetic filler ids to
+  // since 2026-09-21), anthropic/claude-opus-5.5, openai/gpt-6-sol and
+  // openai/gpt-6-luna (curated since 2026-09-22) and
+  // anthropic/claude-sonnet-5.5 (curated since 2026-09-28) postdate it)
+  // padded out with synthetic filler ids to
   // the real count, and assert both the exact count and full curated
   // coverage — the envelope's unknown-fields-are-fine tolerance is already
   // pinned by the 0.0.7/0.0.8 tests above.

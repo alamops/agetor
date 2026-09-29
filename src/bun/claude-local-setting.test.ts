@@ -47,6 +47,10 @@ test("claudeModelIdFromArg resolves the Opus 5.5 CLAUDE_MODEL_FLAG value back to
   expect(claudeModelIdFromArg("claude-opus-5-5")).toBe("opus-5.5");
 });
 
+test("claudeModelIdFromArg resolves the Sonnet 5.5 CLAUDE_MODEL_FLAG value back to its agetor id", () => {
+  expect(claudeModelIdFromArg("claude-sonnet-5-5")).toBe("sonnet-5.5");
+});
+
 test("claudeModelIdFromArg passes an unrecognized raw claude-* id through verbatim", () => {
   expect(claudeModelIdFromArg("claude-opus-6")).toBe("claude-opus-6");
 });
@@ -66,6 +70,9 @@ test("claudeModelIdFromArg returns null for claude's own aliases and the empty s
 // parseClaudeLocalSetting — model (src/bun/claude-local-setting.ts)
 // ---------------------------------------------------------------------------
 
+// 2.1.246-era fixture: on claude 2.1.284 the `sonnet` alias resolves to Sonnet
+// 5.5, but the parser follows the stdout display name, not the alias, so the
+// "Sonnet 5" stdout below still (correctly) reads as sonnet-5.
 test("model: an arg-less stdout display name resolves via AGENT_OPTIONS labels (ANSI bold stripped)", () => {
   const result = parseClaudeLocalSetting({
     setting: "model",
@@ -248,6 +255,43 @@ test("model: 'Kept model as Opus 5.5' parses as the kept/no-change outcome with 
 });
 
 // ---------------------------------------------------------------------------
+// parseClaudeLocalSetting — Sonnet 5.5 (docs/plans/add-claude-sonnet-5-5.md).
+// Mirrors the Opus 5.5 "Set model to"/"Kept model as" cases above: claude
+// 2.1.284 makes claude-sonnet-5-5 the default Sonnet model, so sonnet-5.5 now
+// owns the "Sonnet" row the same way opus-5.5 owns the "Opus" row.
+// ---------------------------------------------------------------------------
+
+test("model: 'Set model to Sonnet 5.5' resolves to sonnet-5.5", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Sonnet 5.5 and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "sonnet-5.5" });
+});
+
+test("model: 'Set model to Sonnet 5.5' with appended qualifiers still resolves to sonnet-5.5", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Sonnet 5.5 (1M context) and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "sonnet-5.5" });
+});
+
+test("model: 'Kept model as Sonnet 5.5' parses as the kept/no-change outcome with id sonnet-5.5", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Kept model as Sonnet 5.5",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "sonnet-5.5", kept: true });
+});
+
+// ---------------------------------------------------------------------------
 // claudeModelIdFromDisplayName — word boundary after the label (finding #4,
 // docs/plans/model-effort-local-command-turns.md §10 re-review): a bare
 // `startsWith` would let a longer real model name that merely shares a
@@ -337,6 +381,32 @@ test("claudeModelIdFromDisplayName: 'Opus 5 and saved …' still resolves to opu
   // because it shares a leading prefix.
   expect(claudeModelIdFromDisplayName("Opus 5")).toBe("opus-5");
   expect(claudeModelIdFromDisplayName("Opus 5 and saved as your default for new sessions")).toBe("opus-5");
+});
+
+// ---------------------------------------------------------------------------
+// claudeModelIdFromDisplayName — Sonnet 5.5 (docs/plans/add-claude-sonnet-5-5.md):
+// the same word-boundary guard has to keep the NEW "Sonnet 5.5" label from
+// conflating with the EXISTING "Sonnet 5" label in both directions.
+// ---------------------------------------------------------------------------
+
+test("claudeModelIdFromDisplayName: 'Sonnet 5.5' resolves to sonnet-5.5", () => {
+  expect(claudeModelIdFromDisplayName("Sonnet 5.5")).toBe("sonnet-5.5");
+});
+
+test("claudeModelIdFromDisplayName: 'Sonnet 5.5 (1M context)' strips the qualifier and resolves to sonnet-5.5", () => {
+  expect(claudeModelIdFromDisplayName("Sonnet 5.5 (1M context)")).toBe("sonnet-5.5");
+});
+
+test("claudeModelIdFromDisplayName: 'Sonnet 5.5 and saved …' matches via the space word boundary and resolves to sonnet-5.5", () => {
+  expect(claudeModelIdFromDisplayName("Sonnet 5.5 and saved as your default for new sessions")).toBe("sonnet-5.5");
+});
+
+test("claudeModelIdFromDisplayName: 'Sonnet 5 and saved …' still resolves to sonnet-5, not sonnet-5.5", () => {
+  // Word-boundary guard, forward direction: "sonnet 5" must match the "Sonnet 5"
+  // label exactly, not get pulled onto the newer "Sonnet 5.5" label just
+  // because it shares a leading prefix.
+  expect(claudeModelIdFromDisplayName("Sonnet 5")).toBe("sonnet-5");
+  expect(claudeModelIdFromDisplayName("Sonnet 5 and saved as your default for new sessions")).toBe("sonnet-5");
 });
 
 test("model: 'Opus 5.1 (1M context) and saved …' resolves to 'unrepresentable' with a qualifier-stripped raw of 'Opus 5.1'", () => {
@@ -644,13 +714,13 @@ test("applyClaudeLocalSetting does not flip an already-equivalent model id repor
 });
 
 test("applyClaudeLocalSetting 'Kept model as' corrects a row that already drifted to a different value", async () => {
-  // Simulates: the dropdown mirror already wrote "sonnet-5" onto the row
+  // Simulates: the dropdown mirror already wrote "sonnet-5.5" onto the row
   // (the PATCH that triggered `reconcileTaskSession`'s /model mirror), but
   // the user answered "No, go back" on claude's "Switch model?" confirm —
   // so the live session actually kept "Opus 4.8". The row must be corrected
   // back to what claude actually kept, not left pointing at what was asked
   // for.
-  const task = await makeClaudeTaskWithRun("sonnet-5", "xhigh");
+  const task = await makeClaudeTaskWithRun("sonnet-5.5", "xhigh");
   const changed = applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "",

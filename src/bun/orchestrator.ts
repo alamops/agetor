@@ -2837,7 +2837,7 @@ function effortFallbackForModelChange(
  * by the task's current model (`supportedEfforts`, discovered-then-curated,
  * the same contract the RunPanel picker filters against). Model equality is
  * checked both by raw id AND via `toClaudeModelArg` so an alias (e.g. claude
- * reporting "sonnet" resolved to agetor id `sonnet-5`) can never flip the
+ * reporting "sonnet" resolved to agetor id `sonnet-5.5`) can never flip the
  * stored id against an already-equivalent one. A `null` `task.model` (the
  * row has never had an explicit model written to it — the task simply runs
  * on claude's/agetor's default) is compared as if it already held
@@ -5892,13 +5892,14 @@ export async function createTask(
   // `supportedEfforts` makes both cases resolve to `null` for gemini — that's
   // what the PATCH null-clear guard and every picker already compute for an
   // unknown id, so this closes a known inconsistency, on purpose. fx is
-  // different: 19 of its 32 curated models advertise real efforts (16
+  // different: 20 of its 33 curated models advertise real efforts (16
   // live-probed 2026-09-14, plus anthropic/claude-opus-5.5, openai/gpt-6-sol
-  // and openai/gpt-6-luna from their Gateway catalog entries on 2026-09-22),
+  // and openai/gpt-6-luna from their Gateway catalog entries on 2026-09-22,
+  // and anthropic/claude-sonnet-5.5 from its Gateway entry on 2026-09-28),
   // so both a listed and an unlisted fx model resolve through
   // `supportedEfforts` to `DEFAULT_EFFORT.fx` (`"auto"`) whenever the model —
   // or the `DEFAULT_MODEL.fx` fallback used for an unlisted id — is one of
-  // those 19; only the remaining 13 no-effort fx models (e.g. `zai/glm-4.7`)
+  // those 20; only the remaining 13 no-effort fx models (e.g. `zai/glm-4.7`)
   // resolve to `null`. That whole computation is `defaultEffortFor` below.
   //
   // A bound profile's `effort` is passthrough instead (D3/A5 in the plan) —
