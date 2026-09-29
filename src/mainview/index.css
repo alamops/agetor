@@ -1,3 +1,31 @@
+/* React Flow's own stylesheet. TRIED first: placing this `@import` right
+   after `@tailwind base` (so Preflight's resets apply before React Flow's
+   own layout/positioning rules, letting `.react-flow__node`/`.react-flow__
+   pane`'s `box-sizing`/absolute-positioning win the cascade) — but built
+   output (`bunx vite build --mode development`, then grepped the emitted
+   CSS for `.react-flow__handle`/`.react-flow__pane`/`.react-flow__minimap`)
+   showed PostCSS silently DROPPED the `@import` and emitted only a
+   "@import statements must precede all other statements" warning: Vite's
+   built-in postcss-import pass enforces real CSS `@import`-ordering rules
+   against the raw source (it runs before Tailwind's own PostCSS plugin
+   consumes the `@tailwind` at-rules, so `@tailwind base` still counts as a
+   preceding statement at that point), so React Flow's canvas would have
+   shipped with NO base styling at all. Falling back to the CSS-spec
+   position — the very top of the file, before `@tailwind base` itself —
+   fixed it: re-running the same build + grep confirmed `.react-flow__node`/
+   `.react-flow__pane`/`.react-flow__handle`/`.react-flow__minimap` are now
+   present in the emitted CSS. This does mean Preflight's resets are applied
+   AFTER React Flow's own rules in cascade order, but that's harmless here:
+   React Flow's rules target its own `.react-flow*` classes with fairly
+   specific selectors, Preflight only resets bare element selectors (not
+   classes), and Tailwind utility classes (from `@tailwind
+   components`/`utilities`, both still after this import) retain their
+   usual higher-specificity/later-in-cascade win over React Flow's own
+   defaults — so a utility class on a custom node still applies correctly.
+   The scoped `.react-flow` variable/override block further down this file
+   (see bottom) is what actually themes the canvas either way. */
+@import "@xyflow/react/dist/style.css";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -195,4 +223,48 @@
 .agetor-md input[type="checkbox"] {
   margin-right: 0.375rem;
   vertical-align: middle;
+}
+
+/* React Flow (pipelines canvas) theming — maps our existing shadcn/ui HSL
+   tokens onto React Flow 12's own `--xy-*` custom properties instead of
+   overriding its class selectors directly, so both `.dark` and `:root`
+   automatically stay in sync the same way every other themed surface in
+   this app does. Every variable below is a real `--xy-*` name emitted by
+   `node_modules/@xyflow/react/dist/style.css` (verified via
+   `grep -o -- '--xy-[a-z-]*' node_modules/@xyflow/react/dist/style.css`) —
+   none invented. Scoped to `.react-flow` (the library's own root class)
+   rather than `:root`/`.dark` so it never leaks CSS variables onto
+   unrelated parts of the app. */
+.react-flow {
+  --xy-background-color: hsl(var(--background));
+  --xy-node-background-color-default: hsl(var(--card));
+  --xy-node-border-default: 1px solid hsl(var(--border));
+  --xy-edge-stroke-default: hsl(var(--muted-foreground));
+  --xy-edge-stroke-selected-default: hsl(var(--info));
+  --xy-handle-background-color-default: hsl(var(--info));
+  --xy-minimap-background-color: hsl(var(--card));
+  --xy-controls-button-background-color: hsl(var(--card));
+  --xy-controls-button-color: hsl(var(--foreground));
+  --xy-controls-button-border-color: hsl(var(--border));
+}
+
+/* Scoped overrides restoring/adjusting React Flow defaults under Tailwind
+   Preflight. `.react-flow svg { display: block }` ships correctly in React
+   Flow's own stylesheet already (no override needed); the two below are
+   the ones Preflight/our own resets actually affect. */
+.react-flow__edges {
+  overflow: visible;
+}
+.react-flow__edge-path {
+  fill: none;
+}
+/* React Flow's MIT license permits removing the on-canvas attribution as
+   long as attribution is retained elsewhere; this is a desktop app, not a
+   public web deployment, so the corner watermark is suppressed here.
+   Attribution is retained via `package.json`'s dependency list
+   (`@xyflow/react`) rather than the README, which doesn't name the
+   library. Attribution: React Flow / @xyflow, MIT License,
+   https://github.com/xyflow/xyflow. */
+.react-flow__attribution {
+  display: none;
 }

@@ -185,6 +185,35 @@ test.describe("theme: Auto follows the system", () => {
   });
 });
 
+test.describe("theme: boot request order", () => {
+  // L-A12: the `/pipelines` list is gated on `prefsLoaded` in App.tsx
+  // (`usePipelines({ enabled: prefsLoaded })`) precisely so it can never go
+  // out ahead of the boot `listPreferences` read — under the browser's
+  // per-host connection cap, with two SSE channels already open, an
+  // ungated `/pipelines` request once delayed the `dark` class past first
+  // paint. Pin the order from the page's own request stream: the FIRST
+  // `GET /pipelines` (if any) must come after the first `GET /preferences`.
+  test("GET /pipelines is never requested before GET /preferences", async ({ page, request, backend }) => {
+    await setThemePreference(request, backend, "dark");
+    const order: string[] = [];
+    page.on("request", (req) => {
+      if (req.method() !== "GET") return;
+      const path = new URL(req.url()).pathname;
+      if (path === "/preferences" || path === "/pipelines") order.push(path);
+    });
+    await gotoApp(page, backend);
+    await expect
+      .poll(() => order.includes("/preferences"), { message: "expected the boot listPreferences fetch", timeout: 5000 })
+      .toBe(true);
+    // Give a wrongly-ungated `/pipelines` fetch every chance to show up
+    // (it would be issued in the very same mount pass as `/preferences`).
+    await expect
+      .poll(() => order.includes("/pipelines"), { message: "expected the (prefs-gated) pipelines fetch", timeout: 5000 })
+      .toBe(true);
+    expect(order.indexOf("/preferences")).toBeLessThan(order.indexOf("/pipelines"));
+  });
+});
+
 test.describe("theme: token layer is live", () => {
   test("a converted status token (--danger) actually differs between themes", async ({
     page,
@@ -198,6 +227,21 @@ test.describe("theme: token layer is live", () => {
 
     await setThemePreference(request, backend, "dark");
     await gotoApp(page, backend);
+    // The Vite/e2e boot path carries no `&theme=` on the URL hash (only the
+    // packaged app's index.ts adds it), so the page first paints from
+    // `matchMedia` and flips to the persisted Dark only once App's
+    // `listPreferences` fetch lands — under parallel-run load that fetch can
+    // take seconds, and reading the token before the flip compares Light
+    // against Light. Wait for the flip; the no-flash guarantee is the
+    // packaged app's, not this path's.
+    // Bounded tightly on purpose (L-A12): the flip is one `listPreferences`
+    // round-trip after mount, so a multi-second delay — the `/pipelines`
+    // fetch (or anything else) racing ahead of it under the per-host
+    // connection cap — must FAIL here rather than be absorbed by the
+    // default 5s poll budget.
+    await expect
+      .poll(() => isDark(page), { message: "expected the persisted Dark preference to apply", timeout: 1500 })
+      .toBe(true);
     const dangerDark = await readDanger();
 
     const dialog = await openSettingsGeneral(page);

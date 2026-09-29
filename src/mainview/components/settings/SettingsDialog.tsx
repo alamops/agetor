@@ -12,6 +12,7 @@ import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { AgentProfilesSection } from "@/components/settings/AgentProfilesSection";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
+import { PipelinesSection } from "@/components/settings/PipelinesSection";
 import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
 import { useFontSize } from "@/components/font-size-provider";
 import { useTheme } from "@/components/theme-provider";
@@ -88,6 +89,10 @@ interface Props {
    *  transition (not just the first) — absent/undefined preserves today's
    *  behavior of always resetting to General. */
   initialSection?: SettingsSectionId;
+  /** Navigate the app-level `view` to the pipelines page/editor — see
+   *  `PipelinesSection`'s `onOpenPipelines` prop. The caller closes this
+   *  dialog in the same callback. */
+  onOpenPipelines: (id: string | null, editing: boolean) => void;
 }
 
 /**
@@ -239,7 +244,7 @@ async function describeHarnessInUse(err: unknown): Promise<string | null> {
   return `In use by ${segments.join(" and ")}`;
 }
 
-export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, fxAutoResume, onFxAutoResumeChange, onChange, homeDir, dataDir, initialSection }: Props) {
+export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, fxAutoResume, onFxAutoResumeChange, onChange, homeDir, dataDir, initialSection, onOpenPipelines }: Props) {
   const [version, setVersion] = useState<string>("");
   const [payload, setPayload] = useState<HarnessesPayload>({ harnesses: [], statuses: [] });
   const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
@@ -559,6 +564,9 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                 case "agents":
                   // Rendered by the always-mounted div below instead.
                   return null;
+                case "pipelines":
+                  // Rendered by the always-mounted div below instead.
+                  return null;
                 case "git":
                   // Rendered by the always-mounted div below instead.
                   return null;
@@ -582,6 +590,14 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
               "space-y-4 pt-3 text-sm". */}
           <div className={cn(!(view.kind === "section" && view.section === "agents") && "hidden")}>
             <AgentProfilesSection harnesses={payload.harnesses} />
+          </div>
+
+          {/* Same treatment as AgentProfilesSection above — kept mounted
+              regardless of the active section. No wrapper spacing classes
+              here since PipelinesSection's own root already applies
+              "space-y-4 pt-3 text-sm". */}
+          <div className={cn(!(view.kind === "section" && view.section === "pipelines") && "hidden")}>
+            <PipelinesSection onOpenPipelines={onOpenPipelines} />
           </div>
 
           {/* Kept mounted regardless of the active section (unlike the

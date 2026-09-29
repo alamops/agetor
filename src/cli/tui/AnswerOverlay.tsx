@@ -197,6 +197,10 @@ export function AnswerOverlay({
         {req.kind === "ask_questions"
           ? `Question ${qIndex + 1}/${req.questions.length}`
           : "Prompt"}
+        {/* A pipeline parent's pending list aggregates its hidden step
+            tasks' cards — name the step task when it isn't the one the
+            user pressed `g` on. */}
+        {req.taskId !== taskId ? <Text dimColor> ↳ on step task {req.taskId.slice(0, 8)}</Text> : null}
       </Text>
       {req.kind === "ask_questions" ? (
         <Text wrap="truncate-end">{req.questions[qIndex]?.question}</Text>

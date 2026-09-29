@@ -56,7 +56,7 @@ const FX_DEFAULT_MODEL_ID = "zai/glm-5.3-flash";
 
 /** Curated ids that must NOT survive the curated ∩ discovered filter against
  *  the 3-id stub catalog: two ordinary curated rows absent from the stub
- *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and six of the fourteen
+ *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and nine of the seventeen
  *  `catalogOnly` premium rows (absent from the stub the same as any other
  *  id would be — catalogOnly gates them even harder, but plain absence
  *  already excludes them under the scoped merge). `Claude Fable 5.1`
@@ -68,7 +68,10 @@ const FX_DEFAULT_MODEL_ID = "zai/glm-5.3-flash";
  *  harness test below instead of a fourth id added to that frozen stub.
  *  `Claude Opus 5.5` (`anthropic/claude-opus-5.5`,
  *  docs/plans/add-claude-opus-5-5.md — catalogOnly for the same
- *  unverified-signed-in-presence reason) joins it likewise. */
+ *  unverified-signed-in-presence reason) joins it likewise. `Claude Sonnet
+ *  5.5` (`anthropic/claude-sonnet-5.5`, docs/plans/add-claude-sonnet-5-5.md —
+ *  catalogOnly for the same unverified-signed-in-presence reason) joins it
+ *  likewise. */
 const EXCLUDED_FX_OPTION_LABELS = [
   "Grok 4.6",
   "Kimi K2.7 Code",
@@ -78,6 +81,7 @@ const EXCLUDED_FX_OPTION_LABELS = [
   "Kimi K3",
   "Claude Fable 5.1",
   "Claude Opus 5.5",
+  "Claude Sonnet 5.5",
   // GPT-6 Sol / Luna (docs/plans/add-gpt-6-sol-and-luna.md, 2026-09-22) —
   // catalogOnly rows, absent from this file's frozen 3-id fx stub catalog
   // the same as every other premium row above.

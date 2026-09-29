@@ -33,11 +33,13 @@ import {
   defaultModeFor,
   type AgentKind,
   type AgentProfile,
+  type Pipeline,
 } from "../../shared/types.ts";
 import { mergeModelOptions, discoveredEffortsFor, type DiscoveredModel } from "../../shared/model-options.ts";
 import { buildFileEntries } from "../../shared/at-file-filter.ts";
 import { unresolvedAtTokens } from "../../shared/at-refs.ts";
 import { agentProfileSummary, asProfileError, matchAgentProfileRef } from "../../shared/agent-profile.ts";
+import { matchPipelineRef } from "../../shared/pipeline.ts";
 
 interface AddOpts {
   title?: string;
@@ -64,6 +66,13 @@ interface AddOpts {
    *  `assertProfileFlagCombo` before either the non-interactive or wizard
    *  path runs. Resolved to an id via `matchAgentProfileRef` in `cmdAdd`. */
   profile?: string;
+  /** `--pipeline <id|name>` — launch a {@link Pipeline} instead of a single
+   *  agent. The created task becomes the pipeline's parent (board) task; the
+   *  pipeline itself defines every step's harness/model/mode/effort, so this
+   *  is mutually exclusive with `--profile` and the six manual-launch flags
+   *  — enforced by `assertPipelineFlagCombo`. Resolved to an id via
+   *  `matchPipelineRef` in `cmdAdd`. */
+  pipeline?: string;
 }
 
 export function parseAdd(args: string[]): AddOpts {
@@ -91,10 +100,27 @@ export function parseAdd(args: string[]): AddOpts {
       case "--start": o.start = true; break;
       case "--issue": o.issue = val(); break;
       case "--profile": o.profile = val(); break;
+      case "--pipeline": o.pipeline = val(); break;
       default: break;
     }
   }
   return o;
+}
+
+/** Whether any of the six manual harness/model/mode/effort/fast/maxMode
+ *  flags were given — the block `--profile`/`--pipeline` each replace
+ *  wholesale. Shared by `assertProfileFlagCombo`/`assertPipelineFlagCombo`
+ *  (flag-vs-flag conflicts) and the wizard's Pipeline-step gating below (m20
+ *  review fix) so the two can't drift. */
+function hasManualLaunchFlags(o: AddOpts): boolean {
+  return (
+    o.agent !== undefined ||
+    o.model !== undefined ||
+    o.mode !== undefined ||
+    o.effort !== undefined ||
+    o.fast !== undefined ||
+    o.maxMode !== undefined
+  );
 }
 
 /** `--profile` replaces the whole harness/model/mode/effort/fast/maxMode
@@ -103,16 +129,23 @@ export function parseAdd(args: string[]): AddOpts {
  *  and wizard paths (checked once, up front, before either runs). */
 function assertProfileFlagCombo(o: AddOpts): void {
   if (!o.profile) return;
-  const conflicting =
-    o.agent !== undefined ||
-    o.model !== undefined ||
-    o.mode !== undefined ||
-    o.effort !== undefined ||
-    o.fast !== undefined ||
-    o.maxMode !== undefined;
-  if (conflicting) {
+  if (hasManualLaunchFlags(o)) {
     throw new Error(
       "--profile cannot be combined with --agent/--model/--mode/--effort/--fast/--max-mode (the agent defines them)",
+    );
+  }
+}
+
+/** `--pipeline` replaces the whole harness/model/mode/effort/fast/maxMode
+ *  block too — a pipeline's steps carry their own agent profiles — AND
+ *  `--profile` (a task is either a pipeline's parent or launched from a
+ *  single agent profile, never both). Checked once, up front, mirroring
+ *  `assertProfileFlagCombo`. */
+function assertPipelineFlagCombo(o: AddOpts): void {
+  if (!o.pipeline) return;
+  if (o.profile !== undefined || hasManualLaunchFlags(o)) {
+    throw new Error(
+      "--pipeline cannot be combined with --profile/--agent/--model/--mode/--effort/--fast/--max-mode (the pipeline defines the launch)",
     );
   }
 }
@@ -120,6 +153,7 @@ function assertProfileFlagCombo(o: AddOpts): void {
 export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   const o = parseAdd(args);
   assertProfileFlagCombo(o);
+  assertPipelineFlagCombo(o);
   let prompt = o.prompt;
   if (o.promptFile) {
     prompt = o.promptFile === "-" ? (await Bun.stdin.text()).trim() : readFileSync(o.promptFile, "utf8");
@@ -198,16 +232,23 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     }
     // An explicit `--mode` is never touched; only fill the gap a scripted
     // add would otherwise leave (see `defaultNonInteractiveMode`'s doc). A
-    // `--profile` add ignores mode entirely (the profile supplies it), so
-    // skip the fill rather than compute a default `baseInput` will discard.
-    if (!o.mode && !o.profile) o.mode = defaultNonInteractiveMode(o.agent);
+    // `--profile`/`--pipeline` add ignores mode entirely (the profile/
+    // pipeline supplies it), so skip the fill rather than compute a default
+    // `baseInput` will discard.
+    if (!o.mode && !o.profile && !o.pipeline) o.mode = defaultNonInteractiveMode(o.agent);
     let profileId: string | undefined;
     if (o.profile) {
       const result = matchAgentProfileRef(await client.listAgentProfiles(), o.profile);
       if ("error" in result) throw new Error(asProfileError(result.error));
       profileId = result.profile.id;
     }
-    input = baseInput(o, o.title, prompt, profileId);
+    let pipelineId: string | undefined;
+    if (o.pipeline) {
+      const result = matchPipelineRef(await client.listPipelines(), o.pipeline);
+      if (!result.ok) throw new Error(result.error);
+      pipelineId = result.pipeline.id;
+    }
+    input = baseInput(o, o.title, prompt, profileId, pipelineId);
   } else {
     input = await wizard(client, o, prompt);
   }
@@ -241,6 +282,12 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   let unresolvedRefsWarning: string[] = [];
 
   let started = false;
+  // A failed start (e.g. a pipeline whose step profile was deleted, a
+  // logged-out harness, a missing binary) used to be swallowed into a bare
+  // `started: false` — the task exists, so the add itself isn't a failure,
+  // but the reason must reach the user (L-CLI9): a plain `! start failed:`
+  // line, or a `warnings` entry under --json.
+  let startError: string | null = null;
   if (o.start) {
     try {
       const startRes = await client.startTask(task.id);
@@ -249,8 +296,9 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
         const extensionNames = await discoveredExtensionNames(client, task);
         unresolvedRefsWarning = filterUnresolvedRefs(startRes.unresolvedRefs, { extensionNames, restrictTo });
       }
-    } catch {
+    } catch (e) {
       started = false;
+      startError = `start failed: ${(e as Error)?.message ?? String(e)}`;
     }
   } else if (restrictTo !== "" && input.prompt.includes("@")) {
     // Task wasn't started, so there's no server-side send-time expansion to
@@ -315,7 +363,7 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   }
 
   if (flags.json) {
-    const warnings = [issueWarning, unresolvedWarningLine(unresolvedRefsWarning)].filter(
+    const warnings = [issueWarning, unresolvedWarningLine(unresolvedRefsWarning), startError].filter(
       (w): w is string => Boolean(w),
     );
     return printJson(warnings.length ? { task, started, warnings } : { task, started });
@@ -324,6 +372,7 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     `${c.green("✓")} created ${c.dim(task.id.slice(0, 8))} — ${task.title}` +
       (started ? c.cyan("  ▸ started") : ""),
   );
+  if (startError) out(c.yellow(`  ! ${startError}`));
   warnUnresolvedRefs(unresolvedRefsWarning);
   if (!started) out(c.dim(`  start it: agetor start ${task.id.slice(0, 8)}`));
 }
@@ -386,11 +435,21 @@ export function defaultNonInteractiveMode(agent: string | undefined): string | u
   return defaultModeFor(kind);
 }
 
-/** `profileId`, when given, replaces the whole agent/model/mode/effort/fast/
- *  maxMode block with `agentProfileId` — the server resolves the profile and
- *  overrides those six fields from it (plan §3 D5/routes table), so sending
- *  them here too would be dead weight at best and misleading at worst. */
-function baseInput(o: AddOpts, title: string, prompt: string, profileId?: string): CreateTaskInput {
+/** `profileId`/`pipelineId`, when given, replace the whole agent/model/mode/
+ *  effort/fast/maxMode block with `agentProfileId`/`pipelineId` — the server
+ *  resolves it and overrides (agent profile) or entirely owns (pipeline)
+ *  those fields (plan §3 D5/routes table, `docs/plans/pipelines.md`'s routes
+ *  table), so sending them here too would be dead weight at best and
+ *  misleading at worst. `pipelineId` wins over `profileId` when somehow both
+ *  are passed (unreachable in practice — `assertPipelineFlagCombo` already
+ *  rejects `--pipeline` + `--profile` together before either resolves). */
+function baseInput(
+  o: AddOpts,
+  title: string,
+  prompt: string,
+  profileId?: string,
+  pipelineId?: string,
+): CreateTaskInput {
   const input: CreateTaskInput = {
     title,
     prompt,
@@ -404,7 +463,9 @@ function baseInput(o: AddOpts, title: string, prompt: string, profileId?: string
     taskType: o.type,
     references: resolveRefs(o.refs),
   };
-  if (profileId) {
+  if (pipelineId) {
+    input.pipelineId = pipelineId;
+  } else if (profileId) {
     input.agentProfileId = profileId;
   } else {
     input.agent = o.agent;
@@ -485,41 +546,81 @@ async function wizard(
     .harnessModels()
     .catch(() => ({ ready: true, byHarness: {} as Record<string, DiscoveredModel[]> }));
 
-  // Agent-profile step: a first "Profile" pick over saved profiles (plus a
-  // "Pick harness manually" escape hatch), shown only when at least one
-  // profile exists and `--profile` wasn't already given on the command line.
-  // Picking a profile skips the harness/model/mode/effort steps below
-  // entirely (and their pref writes) — the profile supplies all of it.
-  let profileId: string | undefined;
-  if (o.profile) {
-    const result = matchAgentProfileRef(
-      await client.listAgentProfiles().catch(() => [] as AgentProfile[]),
-      o.profile,
-    );
-    if ("error" in result) throw new Error(asProfileError(result.error));
-    profileId = result.profile.id;
-  } else {
-    const profiles = await client.listAgentProfiles().catch(() => [] as AgentProfile[]);
-    if (profiles.length > 0) {
-      const MANUAL = "__manual__";
+  // Pipeline step: a first "Pipeline" pick over saved pipelines (plus a
+  // "None — launch a single agent" escape hatch), shown only when at least
+  // one pipeline exists, `--pipeline` wasn't already given on the command
+  // line, AND neither `--profile` nor any manual harness/model/mode/effort/
+  // fast/max-mode flag was given (m20 review fix) — mirroring
+  // `assertPipelineFlagCombo`'s exclusivity: those flags already commit the
+  // task to a single-agent launch, so offering a Pipeline pick here would
+  // let a wizard answer silently override (or conflict with) a flag the
+  // user already set on the command line. Picking a pipeline skips the
+  // Profile step and the harness/model/mode/effort steps below entirely —
+  // the pipeline's steps supply all of it, the created task is just the
+  // pipeline's parent (board) task.
+  let pipelineId: string | undefined;
+  if (o.pipeline) {
+    const result = matchPipelineRef(await client.listPipelines().catch(() => [] as Pipeline[]), o.pipeline);
+    if (!result.ok) throw new Error(result.error);
+    pipelineId = result.pipeline.id;
+  } else if (!o.profile && !hasManualLaunchFlags(o)) {
+    const pipelines = await client.listPipelines().catch(() => [] as Pipeline[]);
+    if (pipelines.length > 0) {
+      const NONE = "__none__";
       const pick = await p.select({
-        message: "Profile",
+        message: "Pipeline",
         options: [
-          ...profiles.map((pr) => ({
-            value: pr.id,
-            label: pr.name,
-            hint: agentProfileSummary({
-              harnessLabel: harnesses.find((h) => h.id === pr.harness)?.label ?? pr.harness,
-              model: pr.model,
-              effort: pr.effort,
-              mode: pr.mode,
-            }),
+          { value: NONE, label: "None — launch a single agent" },
+          ...pipelines.map((pl) => ({
+            value: pl.id,
+            label: pl.name,
+            hint: `${pl.graph.steps.length} step${pl.graph.steps.length === 1 ? "" : "s"}`,
           })),
-          { value: MANUAL, label: "Pick harness manually" },
         ],
       });
       if (p.isCancel(pick)) return cancelled();
-      if (pick !== MANUAL) profileId = pick;
+      if (pick !== NONE) pipelineId = pick;
+    }
+  }
+
+  // Agent-profile step: a first "Profile" pick over saved profiles (plus a
+  // "Pick harness manually" escape hatch), shown only when at least one
+  // profile exists, `--profile` wasn't already given on the command line,
+  // and no pipeline was picked above. Picking a profile skips the harness/
+  // model/mode/effort steps below entirely (and their pref writes) — the
+  // profile supplies all of it.
+  let profileId: string | undefined;
+  if (!pipelineId) {
+    if (o.profile) {
+      const result = matchAgentProfileRef(
+        await client.listAgentProfiles().catch(() => [] as AgentProfile[]),
+        o.profile,
+      );
+      if ("error" in result) throw new Error(asProfileError(result.error));
+      profileId = result.profile.id;
+    } else {
+      const profiles = await client.listAgentProfiles().catch(() => [] as AgentProfile[]);
+      if (profiles.length > 0) {
+        const MANUAL = "__manual__";
+        const pick = await p.select({
+          message: "Profile",
+          options: [
+            ...profiles.map((pr) => ({
+              value: pr.id,
+              label: pr.name,
+              hint: agentProfileSummary({
+                harnessLabel: harnesses.find((h) => h.id === pr.harness)?.label ?? pr.harness,
+                model: pr.model,
+                effort: pr.effort,
+                mode: pr.mode,
+              }),
+            })),
+            { value: MANUAL, label: "Pick harness manually" },
+          ],
+        });
+        if (p.isCancel(pick)) return cancelled();
+        if (pick !== MANUAL) profileId = pick;
+      }
     }
   }
 
@@ -529,7 +630,7 @@ async function wizard(
   let effort = o.effort;
   let kind: AgentKind | undefined;
 
-  if (!profileId) {
+  if (!profileId && !pipelineId) {
     if (!agent) {
       const enabled = harnesses.filter((h) => h.enabled !== false);
       if (enabled.length > 0) {
@@ -630,14 +731,15 @@ async function wizard(
   o.start = start;
 
   // Remember the picks so the next `add` defaults to them — skipped entirely
-  // for a profile-launched task (D12: no "last used profile" preference,
-  // and the profile's own values shouldn't leak into the manual defaults).
-  if (!profileId && kind) {
+  // for a profile- or pipeline-launched task (D12: no "last used profile"
+  // preference, and the profile's/pipeline's own values shouldn't leak into
+  // the manual defaults).
+  if (!profileId && !pipelineId && kind) {
     await persistPrefs(client, kind, { model, mode, effort });
   }
 
   p.outro(c.green("creating…"));
-  return baseInput({ ...o, agent, model, mode, effort, workdir }, title, prompt, profileId);
+  return baseInput({ ...o, agent, model, mode, effort, workdir }, title, prompt, profileId, pipelineId);
 }
 
 /** A select that returns the chosen value (or null on cancel), pre-selecting

@@ -64,11 +64,14 @@ import type {
   GitHubWorkflowRun,
   GitHubWorkflowRunsResult,
   GitHubWorkflowsResult,
+  Handoff,
   Harness,
   HarnessQuota,
   HarnessStatus,
   HarnessUsage,
   Isolation,
+  Pipeline,
+  PipelineInput,
   Project,
   Run,
   RunEvent,
@@ -531,6 +534,62 @@ export const api = {
    *  404 unknown task, 409 archived. */
   detachTaskAgentProfile: (taskId: string) =>
     j<Task>(`/tasks/${encodeURIComponent(taskId)}/agent-profile`, { method: "DELETE" }),
+  listPipelines: () => j<Pipeline[]>("/pipelines"),
+  getPipeline: (id: string) => j<Pipeline>(`/pipelines/${encodeURIComponent(id)}`),
+  createPipeline: (input: PipelineInput) =>
+    // retry: false — a replay would create a duplicate pipeline (409 on
+    // the name clash it collides with, but no reason to risk it).
+    j<Pipeline>("/pipelines", { method: "POST", body: JSON.stringify(input) }, { retry: false }),
+  updatePipeline: (id: string, patch: Partial<PipelineInput>) =>
+    j<Pipeline>(`/pipelines/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deletePipeline: (id: string) =>
+    j<void>(`/pipelines/${encodeURIComponent(id)}`, { method: "DELETE" }, { retry: false }),
+  /** A pipeline TASK's live run: the parent task plus every hidden step
+   *  task belonging to it (`GET /tasks/:id/pipeline`) — what
+   *  `PipelineRunView` needs in one round-trip. 404 unknown task, 400 the
+   *  task isn't a pipeline task. */
+  getPipelineRun: (taskId: string) =>
+    j<{ task: Task; steps: Task[] }>(`/tasks/${encodeURIComponent(taskId)}/pipeline`),
+  /** Manually advance a blocked (or just-settled) pipeline execution: start
+   *  `nextStepIds`, or `null` to finish the run here. `handoff` seeds the
+   *  synthetic handoff recorded for this manual transition (e.g. a
+   *  free-text purpose/summary typed in the Advance form); `fromTaskId`
+   *  disambiguates which blocked execution is being advanced when more than
+   *  one is blocked at once. `retry: false` — a replay would double-start
+   *  the next step(s). */
+  advancePipeline: (
+    taskId: string,
+    body: { nextStepIds: string[] | null; handoff?: Partial<Handoff>; fromTaskId?: string },
+  ) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/pipeline/advance`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { retry: false }),
+  /** Retry the pipeline's current blocked/cancelled execution. `taskId`
+   *  disambiguates which blocked step task to retry when several are
+   *  blocked at once; omit to retry the run's only/most-recent block.
+   *  `retry: false` — a replay would double-spawn the retry. */
+  retryPipeline: (taskId: string, body?: { taskId?: string }) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/pipeline/retry`, {
+      method: "POST",
+      body: JSON.stringify(body ?? {}),
+    }, { retry: false }),
+  /** Stop every active execution of a pipeline run and return the parent
+   *  task to `ready` (state `cancelled`) — mirrors Stop on an ordinary
+   *  task. `retry: false` to match every other cancel-shaped mutation. */
+  cancelPipeline: (taskId: string) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/pipeline/cancel`, { method: "POST" }, { retry: false }),
+  /** Restart a finished pipeline run (`done`/`cancelled`/`blocked`) from its
+   *  start step, discarding the prior run's history — a fresh execution of
+   *  the same parent task. Mirrors `startPipelineRun`'s own return shape
+   *  (same as `/tasks/:id/start`'s bounded-spawn-await shape, item 16) —
+   *  NOT a `Task`: the route hands back the server result verbatim.
+   *  `retry: false` to match every other run-mutating pipeline route. */
+  restartPipeline: (taskId: string) =>
+    j<{ runId: string; pending?: true }>(`/tasks/${encodeURIComponent(taskId)}/pipeline/restart`, { method: "POST" }, { retry: false }),
   listAgentModels: () => j<AgentModelMap>("/agent-models"),
   /** Per-harness model catalog (fx account-scoped, one entry per enabled
    *  harness) — see `HarnessModelMap`. */
@@ -1330,6 +1389,10 @@ export const api = {
      *  profile (body-provided values for those fields are ignored); 400 on an
      *  unknown id. */
     agentProfileId?: string | null;
+    /** Id of a {@link Pipeline} to launch this task as the parent run of —
+     *  mutually exclusive with `agentProfileId` (400 when both are sent).
+     *  See `docs/plans/pipelines.md` D1. */
+    pipelineId?: string;
   }) =>
     // retry: false — a replay would create a duplicate task + branch.
     j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }, { retry: false }),

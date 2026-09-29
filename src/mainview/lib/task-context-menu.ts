@@ -9,6 +9,7 @@ import { isTaskFxPaused } from "../../shared/fx-recovery.ts";
  *  `api.cancelFxAutoResume` — see `docs/plans/fx-recovery-follow-ups.md`. */
 export type TaskMenuAction =
   | "open"
+  | "open-pipeline"
   | "start"
   | "stop"
   | "resume-recovery"
@@ -67,16 +68,42 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   const archived = task.archivedAt != null;
   const active = task.column === "running" || task.column === "blocked";
   const awaiting = task.pendingInteractionCount > 0 || task.column === "blocked";
-  const openable = task.hasOpenableRun;
+  // A pipeline PARENT never gets its own `runId`/`hasOpenableRun` — only its
+  // step tasks do (see `isPipelineParent` below) — so `hasOpenableRun` alone
+  // would forever gate the "Run" entry open even once the pipeline has
+  // actually executed. `hasOpenablePipelineRun` is the parent-shaped
+  // equivalent: once any step execution has landed in history, there's
+  // something worth opening the run view for, and Retry/Restart live there
+  // instead of the card (M15, docs/plans/pipelines.md review).
+  const hasOpenablePipelineRun = !!task.pipelineRun && task.pipelineRun.history.length > 0;
+  const openable = task.hasOpenableRun || hasOpenablePipelineRun;
+  // A pipeline PARENT task (`pipelineId` set) opens the full-page run view
+  // instead of the run panel — "Open pipeline" replaces "Open details" as
+  // the first entry (App.tsx maps it to `openPipelineRun`). A hidden STEP
+  // task (`pipelineParentId` set) can't be deleted/archived/unarchived
+  // individually — the parent owns its lifecycle (409 server-side, D9) — so
+  // those entries never appear for one, even though the board never
+  // renders a menu for a step row today (D11 hides them from the board).
+  const isPipelineParent = task.pipelineId != null;
+  const isStepTask = task.pipelineParentId != null;
+  // Stop is only honoured server-side for a pipeline PARENT while its run
+  // is genuinely `running` (`POST /tasks/:id/pipeline/cancel` 409s
+  // otherwise — e.g. a `blocked` run with nothing live), so the entry gates
+  // on `pipelineRun.status`, not the column (L-A1). Mirrors `TaskCard`.
+  const stoppable = isPipelineParent ? task.pipelineRun?.status === "running" : active;
 
   const entries: TaskMenuEntry[] = [];
 
   // primary
-  entries.push({ action: "open", label: "Open details", group: "primary" });
+  if (isPipelineParent) {
+    entries.push({ action: "open-pipeline", label: "Open pipeline", group: "primary" });
+  } else {
+    entries.push({ action: "open", label: "Open details", group: "primary" });
+  }
   if (!archived && !awaiting && !active && !openable) {
     entries.push({ action: "start", label: "Run", group: "primary" });
   }
-  if (active && !archived) {
+  if (stoppable && !archived) {
     entries.push({ action: "stop", label: "Stop", group: "primary" });
   }
   // A resumable fx pause (see TaskFxRecovery) offers its own quick actions
@@ -93,10 +120,10 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   if (task.column === "review" && !archived) {
     entries.push({ action: "mark-done", label: "Mark done", group: "primary" });
   }
-  if (!archived && (task.column === "done" || active)) {
+  if (!archived && !isStepTask && (task.column === "done" || active)) {
     entries.push({ action: "archive", label: active ? "Stop & archive…" : "Archive", group: "primary" });
   }
-  if (archived) {
+  if (archived && !isStepTask) {
     entries.push({ action: "unarchive", label: "Unarchive", group: "primary" });
   }
 
@@ -128,8 +155,11 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
     entries.push({ action: "copy-worktree-path", label: "Copy worktree path", group: "utility" });
   }
 
-  // danger — always last.
-  entries.push({ action: "delete", label: "Delete…", group: "danger", danger: true });
+  // danger — always last. A step task can't be deleted individually — the
+  // parent pipeline task owns its lifecycle (409 server-side, D9).
+  if (!isStepTask) {
+    entries.push({ action: "delete", label: "Delete…", group: "danger", danger: true });
+  }
 
   return entries;
 }

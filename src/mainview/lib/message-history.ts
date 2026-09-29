@@ -6,6 +6,7 @@
 import { isMachineEmittedMessage, normalizeDeliveredUserText, parseUserMessage, splitReferences } from "../../shared/user-message.ts";
 import { canonicalizeAttachmentText } from "../../shared/attachments.ts";
 import { stripAgentInstructionsPreamble } from "../../shared/agent-profile.ts";
+import { isHandoffReminderMarker } from "../../shared/pipeline.ts";
 
 /**
  * Reduce a raw sent-message payload to display text: normalize CR newlines,
@@ -49,6 +50,15 @@ import { stripAgentInstructionsPreamble } from "../../shared/agent-profile.ts";
 export function cleanMessageText(raw: string): string {
   const withoutAttachmentDiffs = canonicalizeAttachmentText(raw.replace(/\r\n?/g, "\n"));
   const text = stripAgentInstructionsPreamble(normalizeDeliveredUserText(withoutAttachmentDiffs));
+  // Agetor's own automatic handoff-format reminder (`composeHandoffReminder`
+  // in shared/pipeline.ts) is a `user` event the RUNNER sent into a pipeline
+  // step, not the user's own words — its first line is exactly the marker
+  // (any spelling in HANDOFF_REMINDER_MARKERS, so older persisted reminders
+  // are caught too). Never offer it for resend (L-A5); checked AFTER the
+  // delivery-wrapper normalization above, since a claude step receives it by
+  // paste and its JSONL twin is `<pasted_content>`-wrapped.
+  const nl = text.indexOf("\n");
+  if (isHandoffReminderMarker(nl === -1 ? text : text.slice(0, nl))) return "";
   const parsed = parseUserMessage(text);
   let display: string;
   if (parsed?.kind === "command") {

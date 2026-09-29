@@ -1,6 +1,9 @@
 import { test, expect, mock, afterAll } from "bun:test";
 import type { AgetorClient } from "./api-client.ts";
-import type { Harness, Run, Task } from "../shared/types.ts";
+import type { Harness, PipelineRunState, Run, Task } from "../shared/types.ts";
+import { newStep } from "../shared/pipeline.ts";
+import { makeTask } from "./test-fixtures.ts";
+import { ApiError } from "./api-client.ts";
 
 /**
  * `cmdShow` (commands/show.ts) reaches for a client via `getClient(flags)`
@@ -65,24 +68,15 @@ const { cmdShow } = await import("./commands/show.ts");
 
 const TASK_ID = "abcdefgh12345678";
 
+// Typed via the shared `makeTask` (L-CLI13) — a `Task` field rename now
+// fails typecheck here instead of slipping through an `as unknown as Task`.
 function task(overrides: Partial<Task> = {}): Task {
-  return {
+  return makeTask({
     id: TASK_ID,
-    title: "T",
-    column: "ready",
-    runId: null,
-    pendingInteractionCount: 0,
-    archivedAt: null,
-    hasOpenableRun: false,
     agent: "fx",
     model: "zai/glm-5.3-flash",
-    mode: null,
-    workdir: "/repo",
-    branch: null,
-    issueUrl: null,
-    prompt: "do the thing",
     ...overrides,
-  } as unknown as Task;
+  });
 }
 
 function harness(id: string, kind: Harness["kind"]): Harness {
@@ -95,14 +89,17 @@ function makeClient(
     harnesses?: Harness[];
     listHarnesses?: AgetorClient["listHarnesses"];
     runs?: Run[];
+    getPipelineRun?: AgetorClient["getPipelineRun"];
+    pending?: Array<{ id: string; kind: string; taskId: string }>;
   } = {},
 ): AgetorClient {
   return {
     listTasks: async () => [t],
     getRuns: async () => opts.runs ?? [],
-    pendingInteractions: async () => [],
+    pendingInteractions: async () => opts.pending ?? [],
     listHarnesses: opts.listHarnesses
       ?? (async () => ({ harnesses: opts.harnesses ?? [], statuses: [] })),
+    getPipelineRun: opts.getPipelineRun,
   } as unknown as AgetorClient;
 }
 
@@ -244,4 +241,182 @@ test("show: missing task-id argument throws the usage error", async () => {
   outputs.length = 0;
   currentClient = makeClient(task());
   await expect(cmdShow([], flags)).rejects.toThrow(/usage: agetor show/);
+});
+
+// ── pipeline (docs/plans/pipelines.md §3 D11/T7) ─────────────────────────
+
+function pipelineRun(overrides: Partial<PipelineRunState> = {}): PipelineRunState {
+  const s1 = newStep({ id: "s1", name: "Investigate" });
+  const s2 = newStep({ id: "s2", name: "Fix" });
+  return {
+    pipelineId: "pipe-1",
+    pipelineName: "Bug fix flow",
+    snapshot: {
+      graph: { steps: [s1, s2], edges: [{ id: "e1", from: "s1", to: "s2", label: "" }], startStepId: "s1" },
+      maxSteps: 25,
+      profiles: {},
+      capturedAt: 0,
+    },
+    status: "blocked",
+    active: [{ stepId: "s2", taskId: "step-task-1", seq: 2 }],
+    joins: {},
+    blocked: [{ taskId: "step-task-1", stepId: "s2", kind: "handoff-missing", message: "no <handoff> block found" }],
+    history: [
+      { seq: 1, stepId: "s1", taskId: "step-task-0", startedAt: 0, endedAt: 1, outcome: "succeeded", handoff: null, nextStepIds: ["s2"] },
+    ],
+    stepCount: 2,
+    startedAt: 0,
+    endedAt: null,
+    ...overrides,
+  };
+}
+
+test("show: a pipeline (parent) task prints a 'pipeline:' line with name/id/status/steps, and each blocked message", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(
+    task({ pipelineId: "pipe-1", pipelineRun: pipelineRun() }),
+  );
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("pipeline: Bug fix flow (pipe-1)");
+  expect(rendered).toContain("status: blocked");
+  expect(rendered).toContain("steps: 1/2 · Fix");
+  expect(rendered).toContain("no <handoff> block found");
+});
+
+test("show: a pipeline task with no blocked entries prints no '⚠' lines", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(
+    task({ pipelineId: "pipe-1", pipelineRun: pipelineRun({ status: "running", blocked: [] }) }),
+  );
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("pipeline: Bug fix flow (pipe-1)");
+  expect(rendered).not.toContain("⚠");
+});
+
+test("show: a task with no pipelineId prints no 'pipeline:' line even with pipelineRun set (defensive)", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(task({ pipelineId: null, pipelineRun: pipelineRun() }));
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).not.toContain("pipeline:");
+});
+
+test("show: a pipeline step task prints a 'step of:' line resolved from the parent's frozen snapshot", async () => {
+  outputs.length = 0;
+  const parentTask = { id: "parent-1", title: "Fix the login bug", pipelineRun: pipelineRun() } as unknown as Task;
+  currentClient = makeClient(
+    task({ pipelineParentId: "parent-1", pipelineStepId: "s2" }),
+    { getPipelineRun: async () => ({ task: parentTask, steps: [] }) },
+  );
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("step of: Fix the login bug (parent-1) · step Fix");
+});
+
+test("show: a pipeline step task with no resolvable step id falls back to its own title", async () => {
+  outputs.length = 0;
+  const parentTask = { id: "parent-1", title: "Fix the login bug", pipelineRun: pipelineRun() } as unknown as Task;
+  currentClient = makeClient(
+    task({ pipelineParentId: "parent-1", pipelineStepId: null, title: "Fix step task" }),
+    { getPipelineRun: async () => ({ task: parentTask, steps: [] }) },
+  );
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("step of: Fix the login bug (parent-1) · step Fix step task");
+});
+
+test("show: a pipeline step task whose parent lookup 404s (orphaned step) says so and that it can be deleted/archived directly", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(
+    task({ pipelineParentId: "parent-1", pipelineStepId: "s2" }),
+    {
+      getPipelineRun: async () => {
+        throw new ApiError(404, { error: "task not found" }, "task not found");
+      },
+    },
+  );
+
+  await expect(cmdShow([TASK_ID], flags)).resolves.toBeUndefined();
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain(
+    "step of: parent-1 (pipeline task no longer exists — this step can be deleted/archived directly)",
+  );
+});
+
+test("show: a pipeline step task whose parent lookup fails for any other reason still prints the bare parent id (never silently dropped)", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(
+    task({ pipelineParentId: "parent-1", pipelineStepId: "s2" }),
+    {
+      getPipelineRun: async () => {
+        throw new Error("network error");
+      },
+    },
+  );
+
+  await expect(cmdShow([TASK_ID], flags)).resolves.toBeUndefined();
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("step of: parent-1");
+  expect(rendered).not.toContain("no longer exists");
+});
+
+test("show: a pipeline (parent) task annotates its agent line as the start step's harness, and colors the run status via colorRunStatus", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(task({ pipelineId: "pipe-1", pipelineRun: pipelineRun({ status: "done" }) }));
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("agent: fx (start step's harness — steps own the launch)");
+  expect(rendered).toContain("status: done");
+});
+
+test("show: a plain task never carries the start-step annotation", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(task());
+  await cmdShow([TASK_ID], flags);
+  expect(outputs.join("\n")).not.toContain("start step's harness");
+});
+
+test("show: a pending interaction aggregated from a step task names that step task; one on the task itself doesn't", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(task({ pipelineId: "pipe-1", pipelineRun: pipelineRun() }), {
+    pending: [
+      { id: "i1", kind: "ask_questions", taskId: "step-task-1abcdef" },
+      { id: "i2", kind: "tmux_prompt", taskId: TASK_ID },
+    ],
+  });
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain(`! 2 pending interaction(s) — answer: agetor answer ${TASK_ID.slice(0, 8)}`);
+  expect(rendered).toContain("↳ ask_questions on step task step-tas");
+  expect(rendered).not.toContain("↳ tmux_prompt");
+});
+
+test("show: a task with no pipelineParentId never calls getPipelineRun", async () => {
+  outputs.length = 0;
+  let called = false;
+  currentClient = makeClient(task(), {
+    getPipelineRun: async () => {
+      called = true;
+      return { task: task(), steps: [] };
+    },
+  });
+
+  await cmdShow([TASK_ID], flags);
+  expect(called).toBe(false);
 });

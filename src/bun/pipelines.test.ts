@@ -1,0 +1,975 @@
+// DB-level tests for pipelines (docs/plans/pipelines.md §3/T2): the
+// `pipelines` CRUD module, the task-side pipeline columns
+// (`pipeline_id`/`pipeline_run`/`pipeline_parent_id`/`pipeline_step_id`,
+// migration 058) round-tripping through `tasks.insert`/`tasks.update`/
+// `tasks.setPipelineRun`, `tasks.stepsForParent`, `tasks.list()`'s
+// parent/step pending-interaction aggregation (D11), and the defensive
+// `parsePipelineRunState` parser. Mirrors agent-profiles.test.ts's
+// structure: `AGETOR_DATA_DIR` is set at module scope BEFORE `./db.ts` is
+// dynamically imported in `beforeAll` (the db opens — and migrates — on
+// module load), a `beforeEach` clears the `tasks`/`pipelines` tables so
+// every test starts from a clean slate (name-key uniqueness in particular
+// would otherwise leak across tests), and `rmTestDataDir` (never a bare
+// `rmSync`) tears the dir down afterward.
+import { test, expect, beforeAll, beforeEach, afterAll } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import type { Pipeline, PipelineGraph, PipelineRunSnapshot, PipelineRunState, PipelineStep, PipelineStepRecord, Task } from "../shared/types.ts";
+
+type PipelineRunSnapshotProfiles = PipelineRunSnapshot["profiles"];
+import { PIPELINE_LIMITS } from "../shared/types.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
+
+const dataDir = mkdtempSync(path.join(tmpdir(), "agetor-pipelines-"));
+process.env.AGETOR_DATA_DIR = dataDir;
+
+let db: typeof import("./db.ts").db;
+let tasks: typeof import("./db.ts").tasks;
+let pipelines: typeof import("./db.ts").pipelines;
+let PipelineNameError: typeof import("./db.ts").PipelineNameError;
+let parsePipelineRunState: typeof import("./db.ts").parsePipelineRunState;
+let registerTmuxPrompt: typeof import("./interactions.ts").registerTmuxPrompt;
+let interactionsTesting: typeof import("./interactions.ts").__testing;
+
+beforeAll(async () => {
+  ({ db, tasks, pipelines, PipelineNameError, parsePipelineRunState } = await import("./db.ts"));
+  ({ registerTmuxPrompt, __testing: interactionsTesting } = await import("./interactions.ts"));
+});
+
+afterAll(() => {
+  rmTestDataDir(dataDir);
+});
+
+beforeEach(() => {
+  db.run(`DELETE FROM tasks`);
+  db.run(`DELETE FROM pipelines`);
+  interactionsTesting.reset();
+});
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+function makeStep(overrides: Partial<PipelineStep> = {}): PipelineStep {
+  return {
+    id: randomUUID(),
+    name: "Step",
+    instructions: "",
+    agentProfileId: null,
+    position: { x: 0, y: 0 },
+    subagents: { profileIds: [], cap: null },
+    transition: "choose",
+    join: "any",
+    ...overrides,
+  };
+}
+
+/** A minimal valid two-step linear graph. */
+function makeGraph(): PipelineGraph {
+  const s1 = makeStep({ id: "step-1", name: "Step One" });
+  const s2 = makeStep({ id: "step-2", name: "Step Two" });
+  return {
+    steps: [s1, s2],
+    edges: [{ id: "edge-1", from: "step-1", to: "step-2", label: "" }],
+    startStepId: "step-1",
+  };
+}
+
+function makeTaskRow(taskId: string, overrides: Partial<Task> = {}): Task {
+  return {
+    id: taskId,
+    title: "t",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: "/tmp",
+    isolation: "none",
+    taskType: "task",
+    branch: null,
+    branchSource: "created",
+    worktreePath: null,
+    baseRef: null,
+    prUrl: null,
+    mode: null,
+    model: null,
+    effort: null,
+    fast: false,
+    maxMode: false,
+    references: [],
+    backlog: [],
+    plans: [],
+    draft: null,
+    column: "ready",
+    runId: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    hasOpenableRun: false,
+    pendingInteractionCount: 0,
+    openTerminalCount: 0,
+    archivedAt: null,
+    ...overrides,
+  };
+}
+
+function makeRunState(pipeline: Pipeline, overrides: Partial<PipelineRunState> = {}): PipelineRunState {
+  return {
+    pipelineId: pipeline.id,
+    pipelineName: pipeline.name,
+    snapshot: {
+      graph: pipeline.graph,
+      maxSteps: pipeline.maxSteps,
+      profiles: {},
+      capturedAt: Date.now(),
+    },
+    status: "running",
+    active: [{ stepId: "step-1", taskId: randomUUID(), seq: 1 }],
+    joins: { "step-2": { arrivals: [{ fromStepId: "step-1", seq: 1, handoff: null }] } },
+    blocked: [],
+    history: [],
+    stepCount: 1,
+    startedAt: Date.now(),
+    endedAt: null,
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// pipelines CRUD
+// ---------------------------------------------------------------------------
+
+test("insert/list/get/findByName round-trip, case-insensitive name lookup", () => {
+  const p = pipelines.insert({ name: "  My Pipeline  ", description: "desc", graph: makeGraph() });
+  expect(p.name).toBe("My Pipeline"); // trimmed
+  expect(p.description).toBe("desc");
+  expect(p.maxSteps).toBe(PIPELINE_LIMITS.maxStepsDefault);
+  expect(p.graph.steps.length).toBe(2);
+
+  expect(pipelines.get(p.id)).toEqual(p);
+  expect(pipelines.list().map((x) => x.id)).toEqual([p.id]);
+
+  expect(pipelines.findByName("my pipeline")?.id).toBe(p.id);
+  expect(pipelines.findByName("  MY PIPELINE  ")?.id).toBe(p.id);
+  expect(pipelines.findByName("nonexistent")).toBeNull();
+
+  expect(pipelines.get("nonexistent")).toBeNull();
+});
+
+test("insert throws PipelineNameError on a case-insensitive/trimmed name clash", () => {
+  pipelines.insert({ name: "Dup Name", graph: makeGraph() });
+  expect(() => pipelines.insert({ name: "  dup name  ", graph: makeGraph() })).toThrow(PipelineNameError);
+});
+
+test("update throws PipelineNameError when renaming into a clash, but a same-value resend is fine", () => {
+  const a = pipelines.insert({ name: "Pipeline A", graph: makeGraph() });
+  const b = pipelines.insert({ name: "Pipeline B", graph: makeGraph() });
+
+  expect(() => pipelines.update(b.id, { name: "pipeline a" })).toThrow(PipelineNameError);
+  // Renaming a pipeline to its own (differently-cased) current name is not a clash.
+  const same = pipelines.update(a.id, { name: "PIPELINE A" });
+  expect(same?.name).toBe("PIPELINE A");
+});
+
+test("insert/update throw a plain Error on an invalid graph", () => {
+  const badGraph = {
+    steps: [
+      { id: "s1", name: "Dup" },
+      { id: "s2", name: "dup " },
+    ],
+    edges: [],
+    startStepId: null,
+  } as unknown as PipelineGraph;
+
+  expect(() => pipelines.insert({ name: "Bad Graph", graph: badGraph })).toThrow(/duplicate step name/i);
+
+  const ok = pipelines.insert({ name: "Good Graph", graph: makeGraph() });
+  expect(() => pipelines.update(ok.id, { graph: badGraph })).toThrow(/duplicate step name/i);
+  // The bad update must not have partially applied.
+  expect(pipelines.get(ok.id)?.graph.steps.length).toBe(2);
+});
+
+test("pipelines.get(): a stored graph that parses but fails validatePipelineGraph is returned unmodified, not silently emptied (m21)", () => {
+  // insert()/update() still validate and reject a bad graph outright (the
+  // test above) — this covers the OTHER way a bad graph can reach the
+  // column: on-disk corruption, or a shape a newer/older validator no
+  // longer accepts. Written directly via SQL, bypassing pipelines.update's
+  // own validation, to simulate exactly that.
+  const p = pipelines.insert({ name: "Drifted Graph", graph: makeGraph() });
+  // Steps still need a shape-safe `position` (string `id` + numeric x/y) —
+  // that's the minimal-shape bar `parsePipelineGraph` enforces regardless of
+  // whether the graph passes full semantic validation — but the duplicate
+  // step names below still fail `validatePipelineGraph`, which is the case
+  // this test is about: returned unmodified, not collapsed to empty.
+  const dupNameGraph = {
+    steps: [
+      { id: "s1", name: "Dup", position: { x: 0, y: 0 } },
+      { id: "s2", name: "dup", position: { x: 10, y: 20 } },
+    ],
+    edges: [],
+    startStepId: null,
+  } as unknown as PipelineGraph;
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify(dupNameGraph), p.id]);
+
+  // Returned AS-IS rather than collapsed to the empty graph: the editor
+  // reads this value straight through, and an editor session that opens,
+  // makes an unrelated change, and saves would otherwise silently overwrite
+  // the user's real graph with nothing.
+  expect(pipelines.get(p.id)?.graph).toEqual(dupNameGraph);
+});
+
+test("pipelines.get(): unparseable JSON in the graph column collapses to the empty graph (m21)", () => {
+  const p = pipelines.insert({ name: "Broken JSON Graph", graph: makeGraph() });
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, ["{not json", p.id]);
+
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+});
+
+test("pipelines.get(): a stored value that fails validatePipelineGraph AND isn't even shaped like a graph collapses to the empty graph, not returned as-is", () => {
+  // Distinguishes the "return unmodified" case above (shape-safe: a plain
+  // object with array steps/edges and a string|null|undefined startStepId)
+  // from a value too loose to safely hand to the editor or the
+  // step-resolution helpers, which just index into `.steps`/`.edges`.
+  const p = pipelines.insert({ name: "Unsafe Shape Graph", graph: makeGraph() });
+
+  // Not a plain object at all.
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify(["not", "an", "object"]), p.id]);
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // A plain object, but `steps`/`edges` aren't arrays.
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify({ steps: "nope", edges: [], startStepId: null }), p.id]);
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify({ steps: [], edges: "nope", startStepId: null }), p.id]);
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // Arrays present, but `startStepId` is neither a string, null, nor
+  // undefined.
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify({ steps: [], edges: [], startStepId: 42 }), p.id]);
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+});
+
+test("pipelines.get(): a step/edge that isn't shape-safe on its own also collapses the whole graph to empty, not returned as-is", () => {
+  // Arrays present and `startStepId` is fine, but an individual step/edge
+  // entry is missing what the editor and step-resolution helpers index into
+  // unconditionally (`id`/`position.x`/`position.y` for a step, `from`/`to`
+  // for an edge) — this is stricter than "steps/edges are arrays" and is
+  // what keeps a single corrupt entry from reaching the editor.
+  const p = pipelines.insert({ name: "Unsafe Entry Graph", graph: makeGraph() });
+
+  // A null entry in `steps`.
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify({ steps: [null], edges: [], startStepId: null }), p.id]);
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // A step that's a plain object but missing `id`/`position` entirely.
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify({ steps: [{}], edges: [], startStepId: null }), p.id]);
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // A step with a string id but a non-object `position`.
+  db.run(
+    `UPDATE pipelines SET graph = ? WHERE id = ?`,
+    [JSON.stringify({ steps: [{ id: "s1", position: "nope" }], edges: [], startStepId: null }), p.id],
+  );
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // A step with a `position` whose x/y aren't numbers.
+  db.run(
+    `UPDATE pipelines SET graph = ? WHERE id = ?`,
+    [JSON.stringify({ steps: [{ id: "s1", position: { x: "0", y: 0 } }], edges: [], startStepId: null }), p.id],
+  );
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // An edge missing `to`.
+  db.run(
+    `UPDATE pipelines SET graph = ? WHERE id = ?`,
+    [JSON.stringify({ steps: [], edges: [{ id: "e1", from: "s1" }], startStepId: null }), p.id],
+  );
+  expect(pipelines.get(p.id)?.graph).toEqual({ steps: [], edges: [], startStepId: null });
+
+  // A step that IS shape-safe still returns as-is (sanity check that the
+  // stricter guard doesn't over-reject a valid-shaped, semantically-fine
+  // entry — this graph has no duplicate names or other validation issue, so
+  // it round-trips through `validatePipelineGraph` successfully instead of
+  // hitting the as-is fallback at all).
+  const safe = { steps: [{ id: "s1", name: "Solo", position: { x: 5, y: 5 } }], edges: [], startStepId: "s1" } as unknown as PipelineGraph;
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify(safe), p.id]);
+  expect(pipelines.get(p.id)?.graph.steps).toHaveLength(1);
+  expect(pipelines.get(p.id)?.graph.steps[0]?.id).toBe("s1");
+});
+
+test("insert normalizes the graph, filling defaults for omitted step fields", () => {
+  const rawGraph = {
+    steps: [
+      { id: "s1", name: "Step One" },
+      { id: "s2", name: "Step Two" },
+    ],
+    edges: [],
+    startStepId: null,
+  } as unknown as PipelineGraph;
+
+  const p = pipelines.insert({ name: "Defaults", graph: rawGraph });
+  expect(p.graph.steps).toHaveLength(2);
+  for (const step of p.graph.steps) {
+    expect(step.position).toEqual({ x: 0, y: 0 });
+    expect(step.subagents).toEqual({ profileIds: [], cap: null });
+    expect(step.transition).toBe("choose");
+    expect(step.join).toBe("any");
+    expect(step.instructions).toBe("");
+    expect(step.agentProfileId).toBeNull();
+  }
+
+  // Stored (not just returned) normalized — re-fetching sees the same shape.
+  expect(pipelines.get(p.id)?.graph).toEqual(p.graph);
+});
+
+test("maxSteps defaults when omitted and is REJECTED (not clamped) outside 1..maxStepsMax — the db layer agrees with the route's 400 (L-S5)", () => {
+  const noVal = pipelines.insert({ name: "No MaxSteps", graph: makeGraph() });
+  expect(noVal.maxSteps).toBe(PIPELINE_LIMITS.maxStepsDefault);
+
+  const expectedError = `maxSteps must be an integer between 1 and ${PIPELINE_LIMITS.maxStepsMax}`;
+  expect(() => pipelines.insert({ name: "Low MaxSteps", graph: makeGraph(), maxSteps: 0 })).toThrow(expectedError);
+  expect(() => pipelines.insert({ name: "Negative MaxSteps", graph: makeGraph(), maxSteps: -5 })).toThrow(expectedError);
+  expect(() => pipelines.insert({ name: "High MaxSteps", graph: makeGraph(), maxSteps: 999 })).toThrow(expectedError);
+  expect(() => pipelines.insert({ name: "Fractional MaxSteps", graph: makeGraph(), maxSteps: 1.5 })).toThrow(expectedError);
+  expect(() => pipelines.insert({ name: "NaN MaxSteps", graph: makeGraph(), maxSteps: Number.NaN })).toThrow(expectedError);
+  // A rejected insert leaves nothing behind.
+  expect(pipelines.findByName("Low MaxSteps")).toBeNull();
+
+  const exact = pipelines.insert({ name: "Exact MaxSteps", graph: makeGraph(), maxSteps: 50 });
+  expect(exact.maxSteps).toBe(50);
+  const atMax = pipelines.insert({ name: "Max MaxSteps", graph: makeGraph(), maxSteps: PIPELINE_LIMITS.maxStepsMax });
+  expect(atMax.maxSteps).toBe(PIPELINE_LIMITS.maxStepsMax);
+  const atMin = pipelines.insert({ name: "Min MaxSteps", graph: makeGraph(), maxSteps: 1 });
+  expect(atMin.maxSteps).toBe(1);
+
+  expect(() => pipelines.update(exact.id, { maxSteps: 1000 })).toThrow(expectedError);
+  expect(pipelines.get(exact.id)?.maxSteps).toBe(50); // untouched by the rejected update
+  const updated = pipelines.update(exact.id, { maxSteps: 7 });
+  expect(updated?.maxSteps).toBe(7);
+});
+
+test("delete returns true once, then false", () => {
+  const p = pipelines.insert({ name: "To Delete", graph: makeGraph() });
+  expect(pipelines.delete(p.id)).toBe(true);
+  expect(pipelines.get(p.id)).toBeNull();
+  expect(pipelines.delete(p.id)).toBe(false);
+});
+
+test("delete is never blocked by tasks still bound to the pipeline", () => {
+  const p = pipelines.insert({ name: "Referenced", graph: makeGraph() });
+  const taskId = randomUUID();
+  tasks.insert(makeTaskRow(taskId, { pipelineId: p.id, pipelineRun: makeRunState(p) }));
+
+  expect(pipelines.delete(p.id)).toBe(true);
+  // The task keeps its own frozen pipelineId/pipelineRun — untouched by the delete.
+  const task = tasks.get(taskId);
+  expect(task?.pipelineId).toBe(p.id);
+  expect(task?.pipelineRun?.pipelineId).toBe(p.id);
+});
+
+test("taskCounts/taskCount reflect tasks bound via pipeline_id", () => {
+  const a = pipelines.insert({ name: "Pipeline A2", graph: makeGraph() });
+  const b = pipelines.insert({ name: "Pipeline B2", graph: makeGraph() });
+
+  expect(pipelines.taskCount(a.id)).toBe(0);
+  expect(pipelines.taskCounts().get(a.id)).toBeUndefined();
+
+  tasks.insert(makeTaskRow(randomUUID(), { pipelineId: a.id }));
+  tasks.insert(makeTaskRow(randomUUID(), { pipelineId: a.id }));
+  tasks.insert(makeTaskRow(randomUUID(), { pipelineId: b.id }));
+  tasks.insert(makeTaskRow(randomUUID())); // unrelated task, no pipeline
+
+  expect(pipelines.taskCount(a.id)).toBe(2);
+  expect(pipelines.taskCount(b.id)).toBe(1);
+  const counts = pipelines.taskCounts();
+  expect(counts.get(a.id)).toBe(2);
+  expect(counts.get(b.id)).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// tasks: pipeline columns
+// ---------------------------------------------------------------------------
+
+test("tasks.insert writes the four pipeline columns; toTask round-trips them", () => {
+  const p = pipelines.insert({ name: "Insert Cols", graph: makeGraph() });
+  const run = makeRunState(p);
+
+  const parentId = randomUUID();
+  const parent = tasks.insert(makeTaskRow(parentId, { pipelineId: p.id, pipelineRun: run }));
+  expect(parent.pipelineId).toBe(p.id);
+  expect(parent.pipelineRun).toEqual(run);
+  expect(parent.pipelineParentId).toBeNull();
+  expect(parent.pipelineStepId).toBeNull();
+
+  const stepId = randomUUID();
+  const step = tasks.insert(makeTaskRow(stepId, { pipelineParentId: parentId, pipelineStepId: "step-1" }));
+  expect(step.pipelineId).toBeNull();
+  expect(step.pipelineRun).toBeNull();
+  expect(step.pipelineParentId).toBe(parentId);
+  expect(step.pipelineStepId).toBe("step-1");
+
+  // An ordinary task never touched by pipelines reads all four as null.
+  const plain = tasks.insert(makeTaskRow(randomUUID()));
+  expect(plain.pipelineId).toBeNull();
+  expect(plain.pipelineRun).toBeNull();
+  expect(plain.pipelineParentId).toBeNull();
+  expect(plain.pipelineStepId).toBeNull();
+});
+
+test("tasks.setPipelineRun round-trips the run state and never bumps updated_at", () => {
+  const p = pipelines.insert({ name: "Set Run", graph: makeGraph() });
+  const taskId = randomUUID();
+  const created = tasks.insert(makeTaskRow(taskId, { pipelineId: p.id, updatedAt: 1000 }));
+  expect(created.pipelineRun).toBeNull();
+
+  const beforeUpdatedAt = tasks.get(taskId)?.updatedAt;
+  expect(beforeUpdatedAt).toBe(1000);
+
+  const run = makeRunState(p, { status: "blocked", stepCount: 3 });
+  const updated = tasks.setPipelineRun(taskId, run);
+  expect(updated?.pipelineRun).toEqual(run);
+  expect(updated?.updatedAt).toBe(beforeUpdatedAt); // unchanged
+
+  // Re-fetch confirms persistence, not just the returned shape.
+  const refetched = tasks.get(taskId);
+  expect(refetched?.pipelineRun).toEqual(run);
+  expect(refetched?.updatedAt).toBe(beforeUpdatedAt);
+
+  // Clearing back to null.
+  const cleared = tasks.setPipelineRun(taskId, null);
+  expect(cleared?.pipelineRun).toBeNull();
+  expect(cleared?.updatedAt).toBe(beforeUpdatedAt);
+
+  // Nonexistent id is a harmless no-op matching zero rows.
+  expect(tasks.setPipelineRun("nonexistent", run)).toBeNull();
+});
+
+test("the generic tasks.update SET clause leaves all four pipeline columns intact", () => {
+  const p = pipelines.insert({ name: "Update Skip", graph: makeGraph() });
+  const run = makeRunState(p);
+
+  const parentId = randomUUID();
+  tasks.insert(makeTaskRow(parentId, { pipelineId: p.id, pipelineRun: run }));
+  const patchedParent = tasks.update(parentId, { title: "renamed parent" });
+  expect(patchedParent?.title).toBe("renamed parent");
+  expect(patchedParent?.pipelineId).toBe(p.id);
+  expect(patchedParent?.pipelineRun).toEqual(run);
+
+  const stepId = randomUUID();
+  tasks.insert(makeTaskRow(stepId, { pipelineParentId: parentId, pipelineStepId: "step-2" }));
+  const patchedStep = tasks.update(stepId, { column: "review" });
+  expect(patchedStep?.column).toBe("review");
+  expect(patchedStep?.pipelineParentId).toBe(parentId);
+  expect(patchedStep?.pipelineStepId).toBe("step-2");
+
+  // A patch that tries to smuggle pipeline fields through the generic patch
+  // object is still ignored — `update`'s SET clause never references them.
+  const smuggled = tasks.update(parentId, { pipelineId: "smuggled-id" } as Partial<Task>);
+  expect(smuggled?.pipelineId).toBe(p.id);
+});
+
+test("tasks.stepsForParent returns a parent's steps oldest-created first", () => {
+  const parentId = randomUUID();
+  tasks.insert(makeTaskRow(parentId));
+
+  const stepBId = randomUUID();
+  const stepAId = randomUUID();
+  const stepCId = randomUUID();
+  // Inserted out of chronological order; createdAt (not insertion order)
+  // must drive the returned ordering.
+  tasks.insert(makeTaskRow(stepBId, { pipelineParentId: parentId, pipelineStepId: "b", createdAt: 200 }));
+  tasks.insert(makeTaskRow(stepAId, { pipelineParentId: parentId, pipelineStepId: "a", createdAt: 100 }));
+  tasks.insert(makeTaskRow(stepCId, { pipelineParentId: parentId, pipelineStepId: "c", createdAt: 300 }));
+  // An unrelated task must not leak in.
+  tasks.insert(makeTaskRow(randomUUID(), { createdAt: 150 }));
+
+  const steps = tasks.stepsForParent(parentId);
+  expect(steps.map((s) => s.id)).toEqual([stepAId, stepBId, stepCId]);
+
+  expect(tasks.stepsForParent("nonexistent-parent")).toEqual([]);
+});
+
+test("tasks.list() folds each step task's pending-interaction count onto its parent (D11)", () => {
+  const parentId = randomUUID();
+  tasks.insert(makeTaskRow(parentId));
+
+  const step1Id = randomUUID();
+  const step2Id = randomUUID();
+  tasks.insert(makeTaskRow(step1Id, { pipelineParentId: parentId, pipelineStepId: "step-1" }));
+  tasks.insert(makeTaskRow(step2Id, { pipelineParentId: parentId, pipelineStepId: "step-2" }));
+
+  const plainId = randomUUID();
+  tasks.insert(makeTaskRow(plainId));
+
+  // No interactions yet: everyone reads zero.
+  let byId = new Map(tasks.list().map((t) => [t.id, t]));
+  expect(byId.get(parentId)?.pendingInteractionCount).toBe(0);
+  expect(byId.get(step1Id)?.pendingInteractionCount).toBe(0);
+
+  registerTmuxPrompt({
+    taskId: step1Id,
+    runId: "run-1",
+    paneText: "pane",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "fp-1",
+  });
+  registerTmuxPrompt({
+    taskId: step2Id,
+    runId: "run-2",
+    paneText: "pane",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "fp-2",
+  });
+  registerTmuxPrompt({
+    taskId: step2Id,
+    runId: "run-2",
+    paneText: "pane 2",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "fp-3",
+  });
+  registerTmuxPrompt({
+    taskId: plainId,
+    runId: "run-3",
+    paneText: "pane",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "fp-4",
+  });
+
+  byId = new Map(tasks.list().map((t) => [t.id, t]));
+  // Parent aggregates both steps' counts (1 + 2 = 3), even though it has no
+  // interactions registered against its own id.
+  expect(byId.get(parentId)?.pendingInteractionCount).toBe(3);
+  // Each step task still reports its own count unchanged — aggregation is
+  // additive onto the parent, not a transfer off the step.
+  expect(byId.get(step1Id)?.pendingInteractionCount).toBe(1);
+  expect(byId.get(step2Id)?.pendingInteractionCount).toBe(2);
+  // An unrelated task (no pipeline_parent_id) is unaffected.
+  expect(byId.get(plainId)?.pendingInteractionCount).toBe(1);
+});
+
+test("tasks.get() aggregates a pipeline parent's step pending-interaction counts, same as tasks.list() (M17)", () => {
+  const pipeline = pipelines.insert({ name: "M17 Get Aggregation", graph: makeGraph() });
+  const parentId = randomUUID();
+  tasks.insert(makeTaskRow(parentId, { pipelineId: pipeline.id }));
+
+  const step1Id = randomUUID();
+  const step2Id = randomUUID();
+  tasks.insert(makeTaskRow(step1Id, { pipelineParentId: parentId, pipelineStepId: "step-1" }));
+  tasks.insert(makeTaskRow(step2Id, { pipelineParentId: parentId, pipelineStepId: "step-2" }));
+
+  // No interactions yet: a single-task read agrees with the batched one.
+  expect(tasks.get(parentId)?.pendingInteractionCount).toBe(0);
+
+  registerTmuxPrompt({
+    taskId: step1Id,
+    runId: "get-run-1",
+    paneText: "pane",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "get-fp-1",
+  });
+  registerTmuxPrompt({
+    taskId: step2Id,
+    runId: "get-run-2",
+    paneText: "pane",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "get-fp-2",
+  });
+  registerTmuxPrompt({
+    taskId: step2Id,
+    runId: "get-run-2",
+    paneText: "pane 2",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "get-fp-3",
+  });
+
+  // `tasks.get` aggregates the same way `tasks.list()`'s batched pass does
+  // (1 + 2 = 3), even though the parent has no interactions of its own.
+  expect(tasks.get(parentId)?.pendingInteractionCount).toBe(3);
+  // Each step's own single-task read is unaffected — aggregation is additive
+  // onto the parent, not a transfer off the step.
+  expect(tasks.get(step1Id)?.pendingInteractionCount).toBe(1);
+  expect(tasks.get(step2Id)?.pendingInteractionCount).toBe(2);
+  // And the aggregated list() view agrees with the single-task get() view.
+  const listed = new Map(tasks.list().map((t) => [t.id, t]));
+  expect(tasks.get(parentId)?.pendingInteractionCount).toBe(listed.get(parentId)?.pendingInteractionCount);
+});
+
+test("tasks.get() does NOT aggregate step counts onto a row with no pipeline_id set (M17 perf gate)", () => {
+  // A row with children pointing at it via `pipelineParentId` but no
+  // `pipelineId` of its own shouldn't happen for a real pipeline parent in
+  // practice, but `tasks.get`'s aggregation is deliberately gated on
+  // `pipeline_id` (cheap to check, always set on a real parent) rather than
+  // "does anything point at me" (which would cost every ordinary task's
+  // `get` an extra query) — this pins that gate.
+  const parentId = randomUUID();
+  tasks.insert(makeTaskRow(parentId));
+  const stepId = randomUUID();
+  tasks.insert(makeTaskRow(stepId, { pipelineParentId: parentId, pipelineStepId: "step-1" }));
+
+  registerTmuxPrompt({
+    taskId: stepId,
+    runId: "get-run-3",
+    paneText: "pane",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "get-fp-4",
+  });
+
+  expect(tasks.get(parentId)?.pendingInteractionCount).toBe(0);
+  expect(tasks.get(stepId)?.pendingInteractionCount).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// parsePipelineRunState
+// ---------------------------------------------------------------------------
+
+test("parsePipelineRunState: null/malformed JSON/missing pipelineId all collapse to null", () => {
+  expect(parsePipelineRunState(null)).toBeNull();
+  expect(parsePipelineRunState("not json")).toBeNull();
+  expect(parsePipelineRunState("{")).toBeNull();
+  expect(parsePipelineRunState("[]")).toBeNull(); // array, not a plain object
+  expect(parsePipelineRunState("null")).toBeNull();
+  expect(parsePipelineRunState(JSON.stringify({ status: "running" }))).toBeNull(); // no pipelineId
+  expect(parsePipelineRunState(JSON.stringify({ pipelineId: "" }))).toBeNull(); // empty string
+});
+
+test("parsePipelineRunState: minimal valid input fills every default", () => {
+  const parsed = parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1" }));
+  expect(parsed).toEqual({
+    pipelineId: "pipe-1",
+    pipelineName: "",
+    snapshot: null,
+    status: "idle",
+    active: [],
+    joins: {},
+    blocked: [],
+    history: [],
+    stepCount: 0,
+    startedAt: null,
+    endedAt: null,
+  });
+});
+
+test("parsePipelineRunState: an unknown status value falls back to idle", () => {
+  const parsed = parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", status: "not-a-real-status" }));
+  expect(parsed?.status).toBe("idle");
+
+  const statuses: PipelineRunState["status"][] = ["idle", "running", "blocked", "done", "cancelled"];
+  for (const status of statuses) {
+    const p = parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", status }));
+    expect(p?.status).toBe(status);
+  }
+});
+
+test("parsePipelineRunState: junk entries are dropped from active/blocked/history/joins, valid ones kept", () => {
+  const raw = {
+    pipelineId: "pipe-1",
+    active: [
+      { stepId: "s1", taskId: "t1", seq: 1 }, // valid
+      { stepId: "s2", taskId: "t2" }, // missing seq -> dropped
+      { stepId: "s3", seq: 2 }, // missing taskId -> dropped
+      "junk", // not even an object -> dropped
+      null,
+    ],
+    blocked: [
+      { taskId: "t1", stepId: "s1", kind: "step-failed", message: "boom" }, // valid
+      { taskId: "t2", stepId: "s2", kind: "not-a-real-kind", message: "x" }, // invalid kind -> dropped
+      { taskId: null, stepId: null, kind: "handoff-missing", message: "" }, // valid, nullable ids
+    ],
+    history: [
+      {
+        seq: 1, stepId: "s1", taskId: "t1", startedAt: 100, endedAt: 200,
+        outcome: "succeeded", handoff: { schemaVersion: 1, purpose: "p" }, nextStepIds: ["s2", 5, "s3"],
+      }, // valid, junk entry in nextStepIds filtered
+      { seq: 2, stepId: "s2" }, // missing taskId/startedAt -> dropped
+      { seq: 3, stepId: "s3", taskId: "t3", startedAt: 300, outcome: "not-a-real-outcome" }, // invalid outcome -> null, record kept
+    ],
+    joins: {
+      "s2": { arrivals: [{ fromStepId: "s1", seq: 1, handoff: null }, { fromStepId: "s1" }, "junk"] },
+      "s3": "not-an-object", // dropped entirely
+    },
+  };
+
+  const parsed = parsePipelineRunState(JSON.stringify(raw));
+  expect(parsed).not.toBeNull();
+
+  expect(parsed?.active).toEqual([{ stepId: "s1", taskId: "t1", seq: 1 }]);
+
+  expect(parsed?.blocked).toEqual([
+    { taskId: "t1", stepId: "s1", kind: "step-failed", message: "boom" },
+    { taskId: null, stepId: null, kind: "handoff-missing", message: "" },
+  ]);
+
+  expect(parsed?.history).toHaveLength(2);
+  // `handoff` is kept as-is (not deep-validated) — the fixture is
+  // deliberately a partial object, so the expected value needs a type
+  // escape hatch the same way the raw fixture above does at runtime.
+  expect(parsed?.history[0]).toEqual({
+    seq: 1, stepId: "s1", taskId: "t1", startedAt: 100, endedAt: 200,
+    outcome: "succeeded", handoff: { schemaVersion: 1, purpose: "p" }, nextStepIds: ["s2", "s3"],
+    responseKind: null, reminder: null,
+  } as unknown as PipelineStepRecord);
+  expect(parsed?.history[1]).toEqual({
+    seq: 3, stepId: "s3", taskId: "t3", startedAt: 300, endedAt: null,
+    outcome: null, handoff: null, nextStepIds: [],
+    responseKind: null, reminder: null,
+  });
+
+  expect(Object.keys(parsed?.joins ?? {})).toEqual(["s2"]);
+  expect(parsed?.joins.s2?.arrivals).toEqual([{ fromStepId: "s1", seq: 1, handoff: null }]);
+});
+
+test("parsePipelineRunState: a history entry's `responseKind`/`reminder` round-trip; junk values collapse to null", () => {
+  const raw = {
+    pipelineId: "pipe-1",
+    history: [
+      {
+        // valid responseKind + a full, valid reminder object (no `delivered`,
+        // as every reminder persisted before that field existed) -> both
+        // survive, `delivered` defaults to true.
+        seq: 1, stepId: "s1", taskId: "t1", startedAt: 100, endedAt: 200,
+        outcome: "succeeded",
+        responseKind: "handoff-missing",
+        reminder: { at: 150, reason: "handoff-missing", runId: "run-1", detail: "no <handoff> block was found" },
+      },
+      {
+        // unknown responseKind + malformed reminder (bad reason) -> both null.
+        seq: 2, stepId: "s2", taskId: "t2", startedAt: 100,
+        responseKind: "not-a-real-kind",
+        reminder: { at: 150, reason: "not-a-real-reason", runId: null, detail: "x" },
+      },
+      {
+        // reminder missing required fields -> null.
+        seq: 3, stepId: "s3", taskId: "t3", startedAt: 100,
+        reminder: { at: 150, reason: "handoff-invalid" },
+      },
+      {
+        // the new "handoff-next-unknown" reason, with an explicit `delivered`
+        // value -> both survive verbatim.
+        seq: 4, stepId: "s4", taskId: "t4", startedAt: 100,
+        reminder: { at: 150, reason: "handoff-next-unknown", runId: "run-4", detail: "next \"foo\" not found", delivered: false },
+      },
+      {
+        // `delivered` present but the wrong type -> the whole reminder is
+        // malformed, collapses to null (same as any other bad field).
+        seq: 5, stepId: "s5", taskId: "t5", startedAt: 100,
+        reminder: { at: 150, reason: "handoff-invalid", runId: null, detail: "x", delivered: "yes" },
+      },
+    ],
+  };
+
+  const parsed = parsePipelineRunState(JSON.stringify(raw));
+  expect(parsed).not.toBeNull();
+  expect(parsed?.history).toHaveLength(5);
+
+  expect(parsed?.history[0]?.responseKind).toBe("handoff-missing");
+  expect(parsed?.history[0]?.reminder).toEqual({
+    at: 150, reason: "handoff-missing", runId: "run-1", detail: "no <handoff> block was found", delivered: true,
+  });
+
+  expect(parsed?.history[1]?.responseKind).toBeNull();
+  expect(parsed?.history[1]?.reminder).toBeNull();
+
+  expect(parsed?.history[2]?.responseKind).toBeNull();
+  expect(parsed?.history[2]?.reminder).toBeNull();
+
+  expect(parsed?.history[3]?.reminder).toEqual({
+    at: 150, reason: "handoff-next-unknown", runId: "run-4", detail: "next \"foo\" not found", delivered: false,
+  });
+
+  expect(parsed?.history[4]?.reminder).toBeNull();
+});
+
+test("parsePipelineRunState: a blocked entry's `pending` and the run's `capExtensions` round-trip, junk is dropped", () => {
+  const raw = {
+    pipelineId: "pipe-1",
+    capExtensions: 2,
+    blocked: [
+      {
+        // valid `pending` — its `arrivals` reuse the same junk-filtering as
+        // `joins` above (a malformed arrival is dropped, a valid one kept).
+        taskId: null, stepId: "s1", kind: "step-cap", message: "capped",
+        pending: {
+          stepId: "s1",
+          arrivals: [{ fromStepId: "s0", seq: 1, handoff: null }, { fromStepId: "s0" }, "junk"],
+        },
+      },
+      {
+        // `pending` missing its own `stepId` -> the whole `pending` sub-shape
+        // is dropped (never persisted half-valid), the block itself is kept.
+        taskId: null, stepId: "s2", kind: "join-incomplete", message: "waiting",
+        pending: { arrivals: [] },
+      },
+      {
+        // `pending` isn't even an object -> dropped, block kept.
+        taskId: null, stepId: "s3", kind: "join-incomplete", message: "waiting too",
+        pending: "not-an-object",
+      },
+    ],
+  };
+
+  const parsed = parsePipelineRunState(JSON.stringify(raw));
+  expect(parsed?.capExtensions).toBe(2);
+  expect(parsed?.blocked).toEqual([
+    {
+      taskId: null, stepId: "s1", kind: "step-cap", message: "capped",
+      pending: { stepId: "s1", arrivals: [{ fromStepId: "s0", seq: 1, handoff: null }] },
+    },
+    { taskId: null, stepId: "s2", kind: "join-incomplete", message: "waiting" },
+    { taskId: null, stepId: "s3", kind: "join-incomplete", message: "waiting too" },
+  ]);
+
+  // capExtensions omits the key (not just nulls it) when absent or invalid,
+  // so a pre-existing equality check against a run with no `capExtensions`
+  // field never sees a stray new key.
+  expect(parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1" }))?.capExtensions).toBeUndefined();
+  expect(
+    parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", capExtensions: -1 }))?.capExtensions,
+  ).toBeUndefined();
+  expect(
+    parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", capExtensions: "nope" }))?.capExtensions,
+  ).toBeUndefined();
+});
+
+test("parsePipelineRunState: a snapshot.graph that's shape-valid but semantically invalid is trusted as-is (m18 — no deep re-validation on read)", () => {
+  // A run snapshot is captured exactly once, at run-start, by `buildSnapshot`'s
+  // own `validatePipelineGraph` call — nothing ever mutates it afterward, so
+  // `sanitizeRunSnapshot` no longer re-runs full validation on every read.
+  // Duplicate step names would fail `validatePipelineGraph`, but the shape
+  // itself (`steps`/`edges` arrays) is fine, so it's trusted through
+  // unchanged rather than collapsed to `null`.
+  // Each entry still has to pass the per-entry shape check (`id` + numeric
+  // `position` — L-S7), which is what "shape-valid" means here.
+  const dupNameGraph = {
+    steps: [
+      { id: "s1", name: "Dup", position: { x: 0, y: 0 } },
+      { id: "s2", name: "dup", position: { x: 10, y: 10 } },
+    ],
+    edges: [],
+    startStepId: null,
+  } as unknown as PipelineGraph;
+  const raw = {
+    pipelineId: "pipe-1",
+    pipelineName: "My Pipe",
+    status: "running",
+    snapshot: {
+      graph: dupNameGraph,
+      maxSteps: 10,
+      profiles: { "profile-1": { id: "profile-1", name: "Agent" } },
+      capturedAt: 123,
+    },
+  };
+  const parsed = parsePipelineRunState(JSON.stringify(raw));
+  expect(parsed?.pipelineName).toBe("My Pipe");
+  expect(parsed?.status).toBe("running");
+  expect(parsed?.snapshot?.graph).toEqual(dupNameGraph);
+  expect(parsed?.snapshot?.maxSteps).toBe(10);
+  expect(parsed?.snapshot?.capturedAt).toBe(123);
+
+  const validGraph = makeGraph();
+  const validRaw = {
+    pipelineId: "pipe-1",
+    snapshot: { graph: validGraph, maxSteps: 10, profiles: { "profile-1": { id: "profile-1" } }, capturedAt: 123 },
+  };
+  const validParsed = parsePipelineRunState(JSON.stringify(validRaw));
+  expect(validParsed?.snapshot?.graph).toEqual(validGraph);
+  expect(validParsed?.snapshot?.maxSteps).toBe(10);
+  expect(validParsed?.snapshot?.capturedAt).toBe(123);
+  // `profiles` is kept as "a record of objects" (not deep-validated against
+  // `AgentProfileSnapshot`) — same type escape hatch as the handoff fixture.
+  expect(validParsed?.snapshot?.profiles).toEqual(
+    { "profile-1": { id: "profile-1" } } as unknown as PipelineRunSnapshotProfiles,
+  );
+});
+
+test("parsePipelineRunState: a snapshot.graph that isn't even shape-valid (non-array steps/edges, or not an object) nulls the whole snapshot but keeps the rest of the run", () => {
+  const rawNonArraySteps = {
+    pipelineId: "pipe-1",
+    status: "running",
+    snapshot: { graph: { steps: "nope", edges: [], startStepId: null }, maxSteps: 10, profiles: {}, capturedAt: 1 },
+  };
+  const parsedNonArraySteps = parsePipelineRunState(JSON.stringify(rawNonArraySteps));
+  expect(parsedNonArraySteps?.snapshot).toBeNull();
+  expect(parsedNonArraySteps?.pipelineId).toBe("pipe-1");
+  expect(parsedNonArraySteps?.status).toBe("running");
+
+  const rawNonArrayEdges = {
+    pipelineId: "pipe-1",
+    snapshot: { graph: { steps: [], edges: "nope", startStepId: null }, maxSteps: 10, profiles: {}, capturedAt: 1 },
+  };
+  expect(parsePipelineRunState(JSON.stringify(rawNonArrayEdges))?.snapshot).toBeNull();
+
+  const rawNonObjectGraph = {
+    pipelineId: "pipe-1",
+    snapshot: { graph: "not-an-object", maxSteps: 10, profiles: {}, capturedAt: 1 },
+  };
+  expect(parsePipelineRunState(JSON.stringify(rawNonObjectGraph))?.snapshot).toBeNull();
+});
+
+test("parsePipelineRunState: a snapshot.graph entry that fails the per-entry shape check (L-S7 — same rule as parsePipelineGraph) nulls the whole snapshot", () => {
+  const base = { pipelineId: "pipe-1", status: "running" };
+  const snap = (graph: unknown) => ({ ...base, snapshot: { graph, maxSteps: 10, profiles: {}, capturedAt: 1 } });
+
+  // A step missing `position` entirely.
+  expect(
+    parsePipelineRunState(JSON.stringify(snap({ steps: [{ id: "s1", name: "A" }], edges: [], startStepId: null })))?.snapshot,
+  ).toBeNull();
+  // A step whose `position` has non-numeric coordinates.
+  expect(
+    parsePipelineRunState(
+      JSON.stringify(snap({ steps: [{ id: "s1", name: "A", position: { x: "0", y: 0 } }], edges: [], startStepId: null })),
+    )?.snapshot,
+  ).toBeNull();
+  // A bare string in `steps`.
+  expect(
+    parsePipelineRunState(JSON.stringify(snap({ steps: ["s1"], edges: [], startStepId: null })))?.snapshot,
+  ).toBeNull();
+  // A step with a non-string id.
+  expect(
+    parsePipelineRunState(
+      JSON.stringify(snap({ steps: [{ id: 7, name: "A", position: { x: 0, y: 0 } }], edges: [], startStepId: null })),
+    )?.snapshot,
+  ).toBeNull();
+  // An edge missing `to`.
+  const goodStep = { id: "s1", name: "A", position: { x: 0, y: 0 } };
+  expect(
+    parsePipelineRunState(
+      JSON.stringify(snap({ steps: [goodStep], edges: [{ id: "e1", from: "s1" }], startStepId: null })),
+    )?.snapshot,
+  ).toBeNull();
+  // A bare string in `edges`.
+  expect(
+    parsePipelineRunState(JSON.stringify(snap({ steps: [goodStep], edges: ["e1"], startStepId: null })))?.snapshot,
+  ).toBeNull();
+  // The rest of the run survives regardless.
+  const parsed = parsePipelineRunState(JSON.stringify(snap({ steps: ["s1"], edges: [], startStepId: null })));
+  expect(parsed?.pipelineId).toBe("pipe-1");
+  expect(parsed?.status).toBe("running");
+  // And a fully shape-safe graph is still trusted through unchanged.
+  const ok = { steps: [goodStep, { id: "s2", name: "B", position: { x: 1, y: 1 } }], edges: [{ id: "e1", from: "s1", to: "s2", label: "" }], startStepId: "s1" };
+  expect(parsePipelineRunState(JSON.stringify(snap(ok)))?.snapshot?.graph).toEqual(ok as unknown as PipelineGraph);
+});
+
+test("parsePipelineRunState: stepCount/capExtensions must be non-negative integers, and capExtensions is capped at PIPELINE_LIMITS.capExtensionsMax (L-S4)", () => {
+  const parse = (extra: Record<string, unknown>) => parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", ...extra }));
+  expect(parse({ stepCount: 3, capExtensions: 2 })).toMatchObject({ stepCount: 3, capExtensions: 2 });
+  // Fractional / negative / huge-float / non-numeric counters read as unset.
+  expect(parse({ stepCount: 1.5 })?.stepCount).toBe(0);
+  expect(parse({ stepCount: -1 })?.stepCount).toBe(0);
+  expect(parse({ stepCount: "7" })?.stepCount).toBe(0);
+  expect(parse({ stepCount: 1e300 })?.stepCount).toBe(0);
+  expect(parse({ capExtensions: 1.5 })?.capExtensions).toBeUndefined();
+  expect(parse({ capExtensions: -1 })?.capExtensions).toBeUndefined();
+  expect(parse({ capExtensions: "2" })?.capExtensions).toBeUndefined();
+  expect(parse({ capExtensions: 0 })?.capExtensions).toBe(0);
+  // A stored value past the cap is clamped down to it, not dropped.
+  expect(parse({ capExtensions: PIPELINE_LIMITS.capExtensionsMax })?.capExtensions).toBe(PIPELINE_LIMITS.capExtensionsMax);
+  expect(parse({ capExtensions: PIPELINE_LIMITS.capExtensionsMax + 1 })?.capExtensions).toBe(PIPELINE_LIMITS.capExtensionsMax);
+  expect(parse({ capExtensions: 1e12 })?.capExtensions).toBe(PIPELINE_LIMITS.capExtensionsMax);
+});
+
+test("pipelines.insert/update reject a name carrying control characters (L-S1)", () => {
+  for (const bad of ["Tab\tName", "New\nLine", "Bell\u0007", "Del\u007f"]) {
+    expect(() => pipelines.insert({ name: bad, graph: makeGraph() })).toThrow("control characters");
+  }
+  const p = pipelines.insert({ name: "Fine Name", graph: makeGraph() });
+  expect(() => pipelines.update(p.id, { name: "Also\u0000Bad" })).toThrow("control characters");
+  expect(pipelines.get(p.id)?.name).toBe("Fine Name");
+});

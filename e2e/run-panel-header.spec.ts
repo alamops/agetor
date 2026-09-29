@@ -141,7 +141,23 @@ test.describe("task details header", () => {
 
     // --- (4) clicking "Close task details" closes the panel ---------------
     await closeButton.click();
-    await expect(panel).toHaveClass(/translate-x-full/);
+    // The panel first slides out (`translate-x-full`) and then UNMOUNTS once
+    // its exit animation ends (`if (!mountedTask) return null` in RunPanel),
+    // at which point `runPanel()`'s `aside.last()` resolves to the New Task
+    // sidebar instead — so a bare class check races the unmount under load.
+    // "Closed" is either state: sliding out, or gone (no aside still shows
+    // this task's title).
+    await expect
+      .poll(
+        async () => {
+          const aside = runPanel(page);
+          const cls = (await aside.getAttribute("class")) ?? "";
+          if (cls.includes("translate-x-full")) return true;
+          return (await aside.getByText(prompt, { exact: false }).count()) === 0;
+        },
+        { message: "expected the task panel to slide out or unmount" },
+      )
+      .toBe(true);
   });
 
   test("header icon buttons show a hover tooltip and carry no native title", async ({

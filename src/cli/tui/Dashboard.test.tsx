@@ -1,6 +1,7 @@
 import { test, expect, mock, afterAll } from "bun:test";
 import { render } from "ink-testing-library";
-import { Dashboard, buildSentFilesLines, buildFxRecoveryLines } from "./Dashboard.tsx";
+import { Dashboard, buildSentFilesLines, buildFxRecoveryLines, dashboardRows } from "./Dashboard.tsx";
+import type { PipelineRunState } from "../../shared/types.ts";
 import { eventKey } from "./useCoalescedStream.ts";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task, RunEvent } from "../../shared/types.ts";
@@ -1261,4 +1262,288 @@ test("event stream: a user-typed <context> tag renders context› followed by yo
   expect(contextIdx).toBeGreaterThanOrEqual(0);
   expect(youIdx).toBe(contextIdx + 1);
   unmount();
+});
+
+
+// --- pipelines: step rows (`p`), parent-aware `s`/`x` (M-CLI2, L-CLI10) -----
+
+function pipelineRun(overrides: Partial<PipelineRunState> = {}): PipelineRunState {
+  return {
+    pipelineId: "pipe-1",
+    pipelineName: "Bug fix flow",
+    snapshot: {
+      graph: {
+        steps: [
+          { id: "s1", name: "Investigate", instructions: "", agentProfileId: null, position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any" },
+          { id: "s2", name: "Fix", instructions: "", agentProfileId: null, position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any" },
+        ],
+        edges: [{ id: "e1", from: "s1", to: "s2", label: "" }],
+        startStepId: "s1",
+      },
+      maxSteps: 25,
+      profiles: {},
+      capturedAt: 0,
+    },
+    status: "running",
+    active: [{ stepId: "s2", taskId: "stepB", seq: 2 }],
+    joins: {},
+    blocked: [],
+    history: [
+      { seq: 1, stepId: "s1", taskId: "stepA", startedAt: 0, endedAt: 1, outcome: "succeeded", handoff: null, nextStepIds: ["s2"] },
+    ],
+    stepCount: 2,
+    startedAt: 0,
+    endedAt: null,
+    ...overrides,
+  };
+}
+
+const parentTask = (over: Partial<Task> = {}) =>
+  task({ id: "parent", title: "Pipeline P", column: "running", pipelineId: "pipe-1", pipelineRun: pipelineRun(), ...over });
+const stepTask = (id: string, over: Partial<Task> = {}) =>
+  task({ id, title: `step ${id}`, column: "running", runId: `run-${id}`, pipelineParentId: "parent", pipelineStepId: "s1", createdAt: 1, ...over });
+
+test("dashboardRows: hides step rows by default, and lists them under their parent (depth 1, creation order) once expanded", () => {
+  const tasks = [
+    stepTask("stepB", { createdAt: 2 }),
+    task({ id: "plain", column: "ready" }),
+    parentTask(),
+    stepTask("stepA", { createdAt: 1 }),
+    task({ id: "archived", archivedAt: 5 }),
+  ];
+  const collapsed = dashboardRows(tasks, new Set());
+  expect(collapsed.map((r) => `${r.task.id}:${r.depth}`)).toEqual(["parent:0", "plain:0"]);
+
+  const expanded = dashboardRows(tasks, new Set(["parent"]));
+  expect(expanded.map((r) => `${r.task.id}:${r.depth}`)).toEqual(["parent:0", "stepA:1", "stepB:1", "plain:0"]);
+});
+
+test("dashboardRows: an expanded id that isn't a pipeline parent expands nothing; an orphaned step (parent gone) stays hidden", () => {
+  const tasks = [task({ id: "plain" }), stepTask("orphan", { pipelineParentId: "gone" })];
+  expect(dashboardRows(tasks, new Set(["plain", "gone"])).map((r) => r.task.id)).toEqual(["plain"]);
+});
+
+test("'p' on a pipeline parent lists its step rows (↳-indented) and the parent's pane says where the transcripts live; 'p' again hides them", async () => {
+  const client = {
+    listTasks: async () => [parentTask(), stepTask("stepA")],
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  let frame = flatten(lastFrame() ?? "");
+  expect(frame).not.toContain("↳");
+  expect(frame).toContain("press p to list its step tasks");
+  expect(frame).toContain("p steps"); // legend mentions p only while a pipeline row is selected
+  stdin.write("p");
+  await wait(80);
+  frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("↳");
+  expect(frame).toContain("step stepA");
+  expect(frame).toContain("select a ↳ step row below it");
+  stdin.write("p");
+  await wait(80);
+  frame = flatten(lastFrame() ?? "");
+  expect(frame).not.toContain("↳");
+  unmount();
+});
+
+test("selecting an expanded step row opens ITS transcript stream (the parent never opens one)", async () => {
+  const opened: string[] = [];
+  const client = {
+    listTasks: async () => [parentTask(), stepTask("stepA")],
+  } as unknown as AgetorClient;
+  // Track every `/tasks/:id/events` subscription the dashboard opens.
+  mock.module("../sse.ts", () => ({
+    ...realSseSnapshot,
+    streamSse: (pathname: string, onEvent: (e: unknown) => void) => {
+      const m = /^\/tasks\/([^/]+)\/events/.exec(pathname);
+      if (m) {
+        opened.push(m[1]!);
+        onTaskEvents = onEvent as (e: RunEvent) => void;
+      }
+      return { close: () => {} };
+    },
+  }));
+  try {
+    const { stdin, unmount } = render(
+      <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+    );
+    await wait(90);
+    expect(opened).toEqual([]); // parent selected — no stream
+    stdin.write("p");
+    await wait(60);
+    stdin.write("j"); // down onto stepA
+    await wait(80);
+    expect(opened).toEqual(["stepA"]);
+    unmount();
+  } finally {
+    mock.module("../sse.ts", () => ({
+      ...realSseSnapshot,
+      streamSse: (pathname: string, onEvent: (e: unknown) => void) => {
+        if (pathname.startsWith("/tasks/") && pathname.includes("/events")) {
+          onTaskEvents = onEvent as (e: RunEvent) => void;
+        }
+        return { close: () => {} };
+      },
+    }));
+  }
+});
+
+test("'p' on a plain task shows 'not a pipeline task' and no legend hint", async () => {
+  const client = { listTasks: async () => [task({ id: "plain", column: "ready" })] } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(lastFrame() ?? "").not.toContain("p steps");
+  stdin.write("p");
+  await wait(80);
+  expect(flatten(lastFrame() ?? "")).toContain("not a pipeline task");
+  unmount();
+});
+
+test("'x' on a pipeline parent calls cancelPipeline (never cancelRun) and shows '■ stopped pipeline'", async () => {
+  const cancelled: string[] = [];
+  let cancelRunCalled = false;
+  const client = {
+    listTasks: async () => [parentTask()],
+    cancelPipeline: async (id: string) => {
+      cancelled.push(id);
+      return parentTask();
+    },
+    cancelRun: async () => {
+      cancelRunCalled = true;
+      return { ok: true };
+    },
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("x");
+  await wait(80);
+  expect(cancelled).toEqual(["parent"]);
+  expect(cancelRunCalled).toBe(false);
+  expect(flatten(lastFrame() ?? "")).toContain("■ stopped pipeline parent");
+  unmount();
+});
+
+test("'x' on a pipeline parent surfaces the route's 409 text (e.g. not running) as '! <message>'", async () => {
+  const client = {
+    listTasks: async () => [parentTask({ column: "ready", pipelineRun: pipelineRun({ status: "idle", active: [] }) })],
+    cancelPipeline: async () => {
+      throw new Error("pipeline is not running");
+    },
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("x");
+  await wait(80);
+  expect(flatten(lastFrame() ?? "")).toContain("! pipeline is not running");
+  unmount();
+});
+
+test("'s' on a BLOCKED pipeline parent calls retryPipeline (not startTask) and shows '↻ retrying pipeline'", async () => {
+  const retried: string[] = [];
+  let started = false;
+  const client = {
+    listTasks: async () => [parentTask({ column: "blocked", pipelineRun: pipelineRun({ status: "blocked" }) })],
+    retryPipeline: async (id: string) => {
+      retried.push(id);
+      return parentTask();
+    },
+    startTask: async () => {
+      started = true;
+      return { runId: "r" };
+    },
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("s");
+  await wait(80);
+  expect(retried).toEqual(["parent"]);
+  expect(started).toBe(false);
+  expect(flatten(lastFrame() ?? "")).toContain("↻ retrying parent");
+  unmount();
+});
+
+test("'s' on a CANCELLED pipeline parent (column ready) also retries in place", async () => {
+  const retried: string[] = [];
+  const client = {
+    listTasks: async () => [parentTask({ column: "ready", pipelineRun: pipelineRun({ status: "cancelled" }) })],
+    retryPipeline: async (id: string) => {
+      retried.push(id);
+      return parentTask();
+    },
+  } as unknown as AgetorClient;
+  const { stdin, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("s");
+  await wait(80);
+  expect(retried).toEqual(["parent"]);
+  unmount();
+});
+
+test("'s' on a RUNNING pipeline parent points at x instead of calling anything", async () => {
+  let called = false;
+  const client = {
+    listTasks: async () => [parentTask()],
+    retryPipeline: async () => {
+      called = true;
+      return parentTask();
+    },
+    startTask: async () => {
+      called = true;
+      return { runId: "r" };
+    },
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("s");
+  await wait(80);
+  expect(called).toBe(false);
+  expect(flatten(lastFrame() ?? "")).toContain("running — x stops");
+  unmount();
+});
+
+test("'s' on a never-run (idle) pipeline parent starts it via startTask; a finished one surfaces the server's 409 verbatim", async () => {
+  const startedIds: string[] = [];
+  const client = {
+    listTasks: async () => [parentTask({ column: "ready", pipelineRun: pipelineRun({ status: "idle", active: [], history: [] }) })],
+    startTask: async (id: string) => {
+      startedIds.push(id);
+      return { runId: "r" };
+    },
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("s");
+  await wait(80);
+  expect(startedIds).toEqual(["parent"]);
+  expect(flatten(lastFrame() ?? "")).toContain("▸ started pipeline parent");
+  unmount();
+
+  const doneClient = {
+    listTasks: async () => [parentTask({ column: "review", pipelineRun: pipelineRun({ status: "done", active: [] }) })],
+    startTask: async () => {
+      throw new Error("pipeline already finished — restart it explicitly");
+    },
+  } as unknown as AgetorClient;
+  const r2 = render(<Dashboard client={doneClient} core={core} dataDir="/nonexistent-agetor-test" />);
+  await wait(90);
+  r2.stdin.write("s");
+  await wait(80);
+  expect(flatten(r2.lastFrame() ?? "")).toContain("! pipeline already finished");
+  r2.unmount();
 });

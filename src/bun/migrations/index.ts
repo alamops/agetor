@@ -74,6 +74,16 @@ import m053 from "./053_task_agent_profile.sql" with { type: "text" };
 import m054 from "./054_account_usage.sql" with { type: "text" };
 import m055 from "./055_normalize_cursor_grok_4_7.sql" with { type: "text" };
 import m056 from "./056_normalize_cursor_opus_5_5.sql" with { type: "text" };
+// Pipelines landed on a branch as 056/057 while `main` took 056 for the
+// cursor Opus 5.5 normalization — renumbered to 057/058 on merge, original
+// ids kept as aliases (same renumber-with-alias pattern as 054 above).
+import m057 from "./057_pipelines.sql" with { type: "text" };
+import m058 from "./058_task_pipeline.sql" with { type: "text" };
+import m059 from "./059_task_pipeline_id_index.sql" with { type: "text" };
+// Cursor Sonnet 5.5 normalization was written on its branch as 057 while
+// `main` took 057–059 for pipelines — renumbered to 060 on rebase, original
+// id kept as an alias (same renumber-with-alias pattern as 054/057/058).
+import m060 from "./060_normalize_cursor_sonnet_5_5.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -138,4 +148,8 @@ export const migrations: Migration[] = [
   { id: "054_account_usage", sql: m054, aliases: ["040_account_usage"] },
   { id: "055_normalize_cursor_grok_4_7", sql: m055 },
   { id: "056_normalize_cursor_opus_5_5", sql: m056 },
+  { id: "057_pipelines", sql: m057, aliases: ["056_pipelines"] },
+  { id: "058_task_pipeline", sql: m058, aliases: ["057_task_pipeline"] },
+  { id: "059_task_pipeline_id_index", sql: m059 },
+  { id: "060_normalize_cursor_sonnet_5_5", sql: m060, aliases: ["057_normalize_cursor_sonnet_5_5"] },
 ];

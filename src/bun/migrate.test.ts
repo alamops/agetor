@@ -5,6 +5,7 @@ import reseedBuiltins from "./migrations/024_reseed_harness_builtins.sql" with {
 import retireGemini3ProPreview from "./migrations/049_retire_gemini_3_pro_preview.sql" with { type: "text" };
 import normalizeCursorGrok47 from "./migrations/055_normalize_cursor_grok_4_7.sql" with { type: "text" };
 import normalizeCursorOpus55 from "./migrations/056_normalize_cursor_opus_5_5.sql" with { type: "text" };
+import normalizeCursorSonnet55 from "./migrations/060_normalize_cursor_sonnet_5_5.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
 
 // Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
@@ -542,11 +543,179 @@ test("056_normalize_cursor_opus_5_5 folds suffixed claude-opus-5-5 variants into
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("056 is the last registered migration, right after 055", () => {
+test("056 (cursor Opus 5.5) sits right after 055, followed by the renumbered pipelines pair 057/058 with their pre-merge ids as aliases", () => {
   const at = migrations.findIndex((m) => m.id === "056_normalize_cursor_opus_5_5");
+  expect(migrations[at - 1]?.id).toBe("055_normalize_cursor_grok_4_7");
+  expect(migrations[at]?.sql).toContain("claude-opus-5-5");
+  // Pipelines landed on a branch as 056/057 while `main` took 056 above —
+  // renumbered on merge; a dev DB that already applied them under the old
+  // ids must not re-run them, hence the aliases.
+  expect(migrations[at + 1]?.id).toBe("057_pipelines");
+  expect(migrations[at + 1]?.aliases).toEqual(["056_pipelines"]);
+  expect(migrations[at + 2]?.id).toBe("058_task_pipeline");
+  expect(migrations[at + 2]?.aliases).toEqual(["057_task_pipeline"]);
+  // 059 (L-S8): the partial `tasks(pipeline_id)` index the pipeline-parent
+  // lookups were missing — appended after the renumbered pair (060, the
+  // cursor Sonnet 5.5 normalization, follows it — pinned by its own test).
+  expect(migrations[at + 3]?.id).toBe("059_task_pipeline_id_index");
+  expect(migrations[at + 3]?.aliases).toBeUndefined();
+  expect(migrations[at + 3]?.sql).toContain("CREATE INDEX IF NOT EXISTS idx_tasks_pipeline_id ON tasks(pipeline_id) WHERE pipeline_id IS NOT NULL");
+});
+
+test("059 creates the partial tasks(pipeline_id) index, is idempotent, and only indexes non-NULL pipeline_id rows", () => {
+  const db = new Database(":memory:");
+  migrate(db, migrations);
+  const idx = db
+    .query<{ name: string; sql: string }, []>(
+      `SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_tasks_pipeline_id'`,
+    )
+    .get();
+  expect(idx?.sql).toContain("WHERE pipeline_id IS NOT NULL");
+  // Re-running the migration set is a no-op (recorded in `_migrations`), and
+  // the statement itself is `IF NOT EXISTS`, so applying it a second time
+  // by hand doesn't throw either.
+  migrate(db, migrations);
+  db.exec(migrations.find((m) => m.id === "059_task_pipeline_id_index")!.sql);
+  // The query planner actually uses the partial index for the parent lookup
+  // `pipelines.taskCounts()` runs.
+  const plan = db
+    .query<{ detail: string }, []>(
+      `EXPLAIN QUERY PLAN SELECT pipeline_id, COUNT(*) FROM tasks WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id`,
+    )
+    .all();
+  expect(plan.some((row) => row.detail.includes("idx_tasks_pipeline_id"))).toBe(true);
+  db.close();
+});
+
+test("060_normalize_cursor_sonnet_5_5 folds suffixed claude-sonnet-5-5 variants into base id + effort (fast reset to 0) on cursor-kind tasks, agent profiles and the lastModel:cursor pref, idempotently", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL
+    );
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE agent_profiles (
+      id TEXT PRIMARY KEY,
+      harness_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
+  db.exec(`
+    INSERT INTO harnesses (id, kind) VALUES
+      ('cursor', 'cursor'), ('cursor-2', 'cursor'), ('fx', 'fx'), ('codex', 'codex');
+  `);
+
+  db.exec(`
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'cursor', 'claude-sonnet-5-5-high', NULL, 0),
+      ('t02', 'cursor-2', 'claude-sonnet-5-5-xhigh', 'low', 0),
+      ('t03', 'cursor', 'claude-sonnet-5-5-medium', 'medium', 1),
+      ('t04', 'cursor', 'claude-sonnet-5-5-low', NULL, 1),
+      ('t05', 'cursor', 'claude-sonnet-5-5-max', NULL, 0),
+      ('t06', 'cursor', 'claude-sonnet-5-5', 'high', 1),
+      ('t07', 'cursor', 'claude-sonnet-5-max', NULL, 0),
+      ('t08', 'cursor', 'claude-opus-5-5-high', NULL, 0),
+      ('t09', 'fx', 'anthropic/claude-sonnet-5.5', NULL, 0),
+      ('t10', 'codex', 'claude-sonnet-5-5-high', 'high', 0),
+      ('t11', 'cursor', NULL, NULL, 0),
+      ('t12', 'cursor', 'claude-sonnet-5-5-minimal', NULL, 0);
+  `);
+
+  db.exec(`
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'cursor', 'claude-sonnet-5-5-xhigh', NULL, 0),
+      ('p02', 'cursor-2', 'claude-sonnet-5-5-high', 'high', 1),
+      ('p03', 'cursor', 'claude-sonnet-5-5', 'medium', 0),
+      ('p04', 'codex', 'claude-sonnet-5-5-low', NULL, 0);
+  `);
+
+  db.exec(`
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:cursor', 'claude-sonnet-5-5-high', 1),
+      ('lastModel:codex', 'claude-sonnet-5-5-high', 1),
+      ('lastMode:cursor', 'auto', 1);
+  `);
+
+  const readTasks = () =>
+    db
+      .query<{ id: string; model: string | null; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM tasks ORDER BY id`,
+      )
+      .all();
+  const readProfiles = () =>
+    db
+      .query<{ id: string; model: string; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM agent_profiles ORDER BY id`,
+      )
+      .all();
+  const readPrefs = () =>
+    db
+      .query<{ key: string; value: string; updated_at: number }, []>(
+        `SELECT key, value, updated_at FROM preferences ORDER BY key`,
+      )
+      .all();
+
+  db.exec(normalizeCursorSonnet55);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "claude-sonnet-5-5", effort: "high", fast: 0 }, // variant → base + effort
+    { id: "t02", model: "claude-sonnet-5-5", effort: "xhigh", fast: 0 }, // variant wins over a stale effort; additional cursor harness via the kind join
+    { id: "t03", model: "claude-sonnet-5-5", effort: "medium", fast: 0 }, // stale fast=1 cleared — the verbatim id ran the regular tier
+    { id: "t04", model: "claude-sonnet-5-5", effort: "low", fast: 0 }, // stale fast=1 cleared — no -fast forms exist for Sonnet 5.5
+    { id: "t05", model: "claude-sonnet-5-5", effort: "max", fast: 0 }, // variant → base + effort (max IS a real Sonnet 5.5 tier)
+    { id: "t06", model: "claude-sonnet-5-5", effort: "high", fast: 1 }, // untouched — already the base id (not in the variant list)
+    { id: "t07", model: "claude-sonnet-5-max", effort: null, fast: 0 }, // untouched — Sonnet 5 variant, no `-5-5-`
+    { id: "t08", model: "claude-opus-5-5-high", effort: null, fast: 0 }, // untouched — Opus 5.5 variant (056's territory)
+    { id: "t09", model: "anthropic/claude-sonnet-5.5", effort: null, fast: 0 }, // untouched — fx id
+    { id: "t10", model: "claude-sonnet-5-5-high", effort: "high", fast: 0 }, // untouched — not a cursor-kind harness
+    { id: "t11", model: null, effort: null, fast: 0 }, // untouched — still NULL
+    { id: "t12", model: "claude-sonnet-5-5-minimal", effort: null, fast: 0 }, // untouched — not a real variant id
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "claude-sonnet-5-5", effort: "xhigh", fast: 0 },
+    { id: "p02", model: "claude-sonnet-5-5", effort: "high", fast: 0 }, // stale fast=1 cleared
+    { id: "p03", model: "claude-sonnet-5-5", effort: "medium", fast: 0 }, // untouched
+    { id: "p04", model: "claude-sonnet-5-5-low", effort: null, fast: 0 }, // untouched — not a cursor-kind harness
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:cursor", value: "auto", updated_at: 1 }, // untouched — not a lastModel key
+    { key: "lastModel:codex", value: "claude-sonnet-5-5-high", updated_at: 1 }, // untouched — other kind
+    { key: "lastModel:cursor", value: "claude-sonnet-5-5", updated_at: 1 }, // variant → base
+  ]);
+
+  // Idempotent: re-applying against the already-normalized rows is a no-op.
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(normalizeCursorSonnet55);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+});
+
+test("060 (cursor Sonnet 5.5) is the last registered migration, right after 059, with its pre-rebase id as an alias", () => {
+  const at = migrations.findIndex((m) => m.id === "060_normalize_cursor_sonnet_5_5");
   expect(at).toBe(migrations.length - 1);
   const prev = migrations[at - 1];
-  expect(prev?.id).toBe("055_normalize_cursor_grok_4_7");
+  expect(prev?.id).toBe("059_task_pipeline_id_index");
+  // Written on its branch as 057 while `main` took 057–059 for pipelines —
+  // renumbered on rebase; a dev DB that applied it under the old id must not
+  // re-run it, hence the alias (the SQL is idempotent either way).
+  expect(migrations[at]?.aliases).toEqual(["057_normalize_cursor_sonnet_5_5"]);
   const last = migrations[at];
-  expect(last?.sql).toContain("claude-opus-5-5");
+  expect(last?.sql).toContain("claude-sonnet-5-5");
 });

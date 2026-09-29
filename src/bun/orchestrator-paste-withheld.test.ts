@@ -268,7 +268,10 @@ test("reconcileTaskSession: a withheld /model mirror leaves a '\u26a0\ufe0f mode
 
   try {
     const before = tasks.get(taskId)!;
-    const after = { ...before, model: "sonnet-5" };
+    // sonnet-5.5, not sonnet-5: claudeModelPickerFamily("sonnet-5") is now
+    // null (superseded on claude 2.1.284), so only sonnet-5.5 still owns the
+    // Sonnet row and starts the mirror at all.
+    const after = { ...before, model: "sonnet-5.5" };
     await reconcileTaskSession(taskId, before, after);
     // reconcileTaskSession fires sendSlashCommand fire-and-forget for the
     // model mirror — wait its (chained) op out.
@@ -280,7 +283,7 @@ test("reconcileTaskSession: a withheld /model mirror leaves a '\u26a0\ufe0f mode
 
     const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
     expect(statusTexts.some((t) => t.startsWith("\u26a0\ufe0f model change not applied"))).toBe(true);
-    expect(statusTexts.some((t) => t.includes("sonnet-5"))).toBe(true);
+    expect(statusTexts.some((t) => t.includes("sonnet-5.5"))).toBe(true);
   } finally {
     claudeTmux.__forTest.setCapturePastePane(prevPastePane);
     claudeTmux.__forTest.setCaptureConfirmPane(prevConfirmPane);
@@ -678,14 +681,16 @@ test("non-withheld send: delivered:true resolves promptly, driven by the paste's
 
 /** Verbatim-shaped claude 2.1.246 bare `/model` picker (5 rows, `✔` marks the
  *  row currently in effect, a run of ≥2 spaces gaps the name from its
- *  description) — copied from `mirrorModelViaPicker`'s own doc comment.
- *  Cursor starts on the Sonnet row (index 3), matching `before.model:
+ *  description) — copied from `mirrorModelViaPicker`'s own doc comment. The
+ *  row DESCRIPTIONS have since been refreshed to the current releases claude
+ *  2.1.284 names (Opus 5.5, Sonnet 5.5) — only the row NAMES matter to the
+ *  matcher, and the shape is still the 2.1.246 one. Cursor starts on the Sonnet row (index 3), matching `before.model:
  *  "sonnet-5"` below. */
 const MODEL_PICKER_PANE_CURSOR_ON_SONNET = [
   "  1. Default (recommended)  Opus 5.5 with 1M context, best for complex work",
   "  2. Opus (1M context)      Opus 5.5 with 1M context, cheaper for simple tasks",
   "  3. Fable                  Fable 5 — balanced speed and capability",
-  "❯ 4. Sonnet ✔               Sonnet 5 — fast and cost-effective",
+  "❯ 4. Sonnet ✔               Sonnet 5.5 — fast and cost-effective",
   "  5. Haiku                  Haiku 4.5 — fastest, most economical",
   "Enter to set as default · s to use this session only · Esc to cancel",
 ].join("\n");
@@ -892,6 +897,69 @@ test("reconcileTaskSession: a superseded pinned id (opus-5) never drives the pic
   }
 }, 10_000);
 
+test("reconcileTaskSession: a superseded pinned id (sonnet-5) never drives the picker — next-run breadcrumb, no paste", async () => {
+  const { createTask, reconcileTaskSession } = await import("./orchestrator.ts");
+  const { db, tasks, runs } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "reconcile-model-sonnet-5-superseded",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "opus-5.5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+
+  const runId = randomUUID();
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    exitCode: 0,
+    tmuxSession: `agetor-test-${taskId}`,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+    fxSessionId: null,
+  });
+
+  try {
+    await withRecordingTmuxBin(async (logPath) => {
+      const before = tasks.get(taskId)!;
+      // sonnet-5 is now superseded by sonnet-5.5 as the "Sonnet" row's owner
+      // (claude 2.1.284 ships claude-sonnet-5-5 as its default Sonnet model),
+      // so claudeModelPickerFamily("sonnet-5") returns null — the mirror must
+      // skip the picker entirely, same as opus-5 above. The task is created
+      // on opus-5.5 so before.model !== after.model and the mirror actually
+      // has a change to consider.
+      const after = { ...before, model: "sonnet-5" };
+      await reconcileTaskSession(taskId, before, after);
+
+      const log = readTmuxLog(logPath);
+      expect(log.some((e) => e.argv[0] === "load-buffer")).toBe(false);
+      expect(log.filter((e) => e.argv[0] === "send-keys")).toHaveLength(0);
+    });
+
+    const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(statusTexts).toContain(
+      "model sonnet-5 applies on the next run — claude's picker can't select it for this session",
+    );
+  } finally {
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
 /* ────────────────────────────────────────────────────────────────────────── *
  * 10 — Model mirror: the picker never renders (idle pane throughout) → poll
  * timeout → "picker not shown" breadcrumb, with no keystroke ever sent.
@@ -964,13 +1032,14 @@ test("reconcileTaskSession: model mirror poll timeout when the picker never rend
  * (claude renamed/dropped its row) → Escape closes it, "target not offered".
  * ────────────────────────────────────────────────────────────────────────── */
 
-/** Same picker shape as `MODEL_PICKER_PANE_CURSOR_ON_SONNET` but WITHOUT the
- *  Fable row — used to drive `mirrorModelViaPicker`'s "target not offered"
+/** Same picker shape as `MODEL_PICKER_PANE_CURSOR_ON_SONNET` (its row
+ *  descriptions likewise refreshed to current releases; only the row names
+ *  matter to the matcher) but WITHOUT the Fable row — used to drive `mirrorModelViaPicker`'s "target not offered"
  *  branch for `targetFamily: "Fable"`. */
 const MODEL_PICKER_PANE_NO_FABLE = [
   "  1. Default (recommended)  Opus 5 with 1M context, best for complex work",
   "  2. Opus (1M context)      Opus 5 with 1M context, cheaper for simple tasks",
-  "❯ 3. Sonnet ✔               Sonnet 5 — fast and cost-effective",
+  "❯ 3. Sonnet ✔               Sonnet 5.5 — fast and cost-effective",
   "  4. Haiku                  Haiku 4.5 — fastest, most economical",
   "Enter to set as default · s to use this session only · Esc to cancel",
 ].join("\n");

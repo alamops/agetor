@@ -9,6 +9,14 @@ import { gotoApp, getPreferences, openSettingsGeneral } from "./helpers";
 // (see the marker-literal comments below for why THOSE stay copied).
 import { FX_AUTO_RESUME_DELAY_PREF, FX_AUTO_RESUME_MAX, FX_AUTO_RESUME_PREF } from "../src/shared/types.ts";
 
+// Wait budget for a fake-driver turn to surface in the panel (the paused
+// notice, the recovered line, a follow-up echo). The fake storm itself is
+// ~1.5s, but under parallel-run load the spawn (`pending: true` past
+// SPAWN_RESPONSE_BUDGET_MS), the run settle, the 2s runs poll and the
+// panel's own load add up past the 10s this used to allow — same headroom
+// the pipeline specs' CONVERGE_TIMEOUT gives a fake-driver settle.
+const PAUSE_TIMEOUT = 20_000;
+
 /**
  * Prompt-marker trigger for the fake fx model-response-recovery scenario
  * (`makeFakeAgent` in `src/bun/agents.ts`, exported there as
@@ -244,7 +252,21 @@ async function openTask(page: Page, title: string): Promise<Locator> {
  */
 async function closeTaskPanel(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Close task panel" }).click({ position: { x: 10, y: 10 } });
-  await expect(runPanel(page)).toHaveClass(/translate-x-full/);
+  // The panel slides out (`translate-x-full`) and then UNMOUNTS once its exit
+  // animation ends (`if (!mountedTask) return null` in RunPanel) — its
+  // backdrop button goes with it, and `runPanel()`'s `aside.last()` then
+  // resolves to the New Task sidebar. A bare class check races that unmount
+  // under load, so "closed" is either state: sliding out, or gone.
+  await expect
+    .poll(
+      async () => {
+        const cls = (await runPanel(page).getAttribute("class")) ?? "";
+        if (cls.includes("translate-x-full")) return true;
+        return (await page.getByRole("button", { name: "Close task panel" }).count()) === 0;
+      },
+      { message: "expected the task panel to slide out or unmount" },
+    )
+    .toBe(true);
 }
 
 /** Scopes a locator to the board `TaskCard` for the given exact title —
@@ -538,7 +560,7 @@ test.describe("fx recovery", () => {
     // The auto-resume timer was already cancelled at the end of the previous
     // test, so this state is stable — no race against the 2s auto-fire here.
     const paused = panel.getByTestId("fx-recovery-paused");
-    await expect(paused).toBeVisible({ timeout: 10_000 });
+    await expect(paused).toBeVisible({ timeout: PAUSE_TIMEOUT });
     await expect(paused).toContainText("recovery paused after 3/3 attempts");
     await expect(paused).toContainText("resume once the limit clears");
     await expect(panel.getByText("Auto-resume cancelled.", { exact: true })).toBeVisible();
@@ -574,7 +596,7 @@ test.describe("fx recovery", () => {
     await expect(async () => {
       const runs = await getRuns(request, backend, stormTaskId);
       expect(runs[0]?.status).toBe("failed");
-    }).toPass({ timeout: 10_000 });
+    }).toPass({ timeout: PAUSE_TIMEOUT });
 
     const task = await getTask(request, backend, stormTaskId);
     expect(task.column).toBe("ready");
@@ -591,7 +613,7 @@ test.describe("fx recovery", () => {
     await gotoApp(page, backend.bootBase);
     const panel = await openTask(page, stormTaskTitle);
 
-    await expect(panel.getByTestId("fx-recovery-paused")).toBeVisible({ timeout: 10_000 });
+    await expect(panel.getByTestId("fx-recovery-paused")).toBeVisible({ timeout: PAUSE_TIMEOUT });
 
     // `UserMessageBlock` (RunPanel.tsx) always renders a "you" label — either
     // its own dedicated span (ordinary/command messages) or via
@@ -611,10 +633,10 @@ test.describe("fx recovery", () => {
     await resumeButton.click();
 
     // Paused notice disappears once the continue-recovery run starts.
-    await expect(panel.getByTestId("fx-recovery-paused")).toHaveCount(0, { timeout: 10_000 });
+    await expect(panel.getByTestId("fx-recovery-paused")).toHaveCount(0, { timeout: PAUSE_TIMEOUT });
 
     // Transcript gains the recovered summary line + the assistant answer.
-    await expect(panel.getByText(RECOVERED_MESSAGE, { exact: true })).toBeVisible({ timeout: 10_000 });
+    await expect(panel.getByText(RECOVERED_MESSAGE, { exact: true })).toBeVisible({ timeout: PAUSE_TIMEOUT });
     await expect(panel.getByText(RECOVERED_ASSISTANT_TEXT, { exact: true })).toBeVisible();
 
     // No new user bubble was added — resuming sends no new prompt.
@@ -661,13 +683,19 @@ test.describe("fx recovery", () => {
 
   test("auto-resume fires on its own, recovers, and clears the board badge", async ({ page, request, backend }) => {
     const title = `fx-recovery-autofire-e2e ${randomUUID()}`;
-    const task = await createAndStartFakeFxRecoveryTask(request, backend, title);
+    const task = await createFakeFxRecoveryTask(request, backend, title);
 
+    // Open the panel BEFORE starting (same as the cancel-then-menu test
+    // below): the paused notice this test observes first only exists for the
+    // ~2s AGETOR_FX_AUTO_RESUME_DELAY_MS window plus the auto-fired continue
+    // turn — a fresh page load after starting can outlast that under
+    // parallel-run load, arriving to an already-recovered transcript.
     await gotoApp(page, backend.bootBase);
     const panel = await openTask(page, title);
+    await startFakeFxRecoveryTask(request, backend, task.id);
 
     const paused = panel.getByTestId("fx-recovery-paused");
-    await expect(paused).toBeVisible({ timeout: 10_000 });
+    await expect(paused).toBeVisible({ timeout: PAUSE_TIMEOUT });
 
     const runsBefore = await getRuns(request, backend, task.id);
     const pausedRunId = runsBefore[0]?.id;
@@ -684,7 +712,7 @@ test.describe("fx recovery", () => {
 
     // Transcript gains the recovered summary line + the assistant answer,
     // same terminal shape as a manual Resume.
-    await expect(panel.getByText(RECOVERED_MESSAGE, { exact: true })).toBeVisible({ timeout: 10_000 });
+    await expect(panel.getByText(RECOVERED_MESSAGE, { exact: true })).toBeVisible({ timeout: PAUSE_TIMEOUT });
     await expect(panel.getByText(RECOVERED_ASSISTANT_TEXT, { exact: true })).toBeVisible();
 
     // Paused notice is gone, and so is the board badge.
@@ -700,7 +728,7 @@ test.describe("fx recovery", () => {
       const runs = await getRuns(request, backend, task.id);
       expect(runs[0]?.id).not.toBe(pausedRunId);
       expect(runs[0]?.status).toBe("succeeded");
-    }).toPass({ timeout: 10_000 });
+    }).toPass({ timeout: PAUSE_TIMEOUT });
 
     const finalTask = await getTask(request, backend, task.id);
     expect(finalTask.fxRecovery ?? null).toBeNull();
@@ -785,7 +813,7 @@ test.describe("fx recovery", () => {
       const runs = await getRuns(request, backend, task.id);
       expect(runs[0]?.id).not.toBe(pausedRunId);
       expect(runs[0]?.status).toBe("succeeded");
-    }).toPass({ timeout: 10_000 });
+    }).toPass({ timeout: PAUSE_TIMEOUT });
   });
 
   test("context menu: Cancel auto-resume while the countdown is running", async ({ page, request, backend }) => {
