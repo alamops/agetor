@@ -156,8 +156,10 @@ test("MODEL_EFFORT_SUPPORT.fx's keys exactly match AGENT_OPTIONS.fx.models' ids 
 
 /* ── fx effort (docs/plans/fx-0.0.10-compat.md §3 shared spec / T1) ──────── */
 
-// The 17 effort-advertising ids, live-probed on fx 0.0.10 (spike
-// fx-0010-efforts, 2026-09-14) — copied verbatim from the plan's shared-spec
+// The 20 effort-advertising ids — 16 live-probed on fx 0.0.10 (spike
+// fx-0010-efforts, 2026-09-14), the other four (opus-5.5, gpt-6-sol/-luna on
+// 2026-09-22; sonnet-5.5 on 2026-09-28) from their Gateway reasoning_options
+// — copied verbatim from the plan's shared-spec
 // table (§3). Every row ends in "auto" (fx's own default, off-scale). The
 // 17th, anthropic/claude-opus-5.5 (2026-09-22), rests on the Gateway
 // catalog's reasoning_options rather than an ACP probe (no credentials) —
@@ -184,6 +186,9 @@ const FX_EFFORT_MODELS: Record<string, string[]> = {
   // ids (docs/plans/add-gpt-6-sol-and-luna.md).
   "openai/gpt-6-sol": ["high", "medium", "low", "none", "auto"],
   "openai/gpt-6-luna": ["high", "medium", "low", "none", "auto"],
+  // 2026-09-28: from the Gateway catalog's reasoning_options, not ACP-probed
+  // (docs/plans/add-claude-sonnet-5-5.md §8 A2).
+  "anthropic/claude-sonnet-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
 };
 
 // The 13 no-effort ids — their Gateway catalog entry carries no
@@ -206,7 +211,7 @@ const FX_NO_EFFORT_MODELS = [
   "spacexai/grok-4.7",
 ];
 
-test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan §3 shared spec) — 19 effort models each end in auto, 13 named models are empty", () => {
+test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan §3 shared spec) — 20 effort models each end in auto, 13 named models are empty", () => {
   for (const [id, expected] of Object.entries(FX_EFFORT_MODELS)) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual(expected);
     expect(expected[expected.length - 1]).toBe("auto");
@@ -214,10 +219,10 @@ test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan
   for (const id of FX_NO_EFFORT_MODELS) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual([]);
   }
-  // The two lists above are exactly the 32 curated fx ids, no more no less.
-  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(19);
+  // The two lists above are exactly the 33 curated fx ids, no more no less.
+  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(20);
   expect(FX_NO_EFFORT_MODELS.length).toBe(13);
-  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(32);
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(33);
 });
 
 test("DEFAULT_EFFORT.fx is 'auto' (fx's own default — owner decision D1, docs/plans/fx-0.0.10-compat.md §8)", () => {
@@ -283,7 +288,7 @@ test("none of the seven previously-curated fx ids survives as an unconditional r
   expect(Object.keys(MODEL_EFFORT_SUPPORT.fx)).not.toContain("google/gemini-3-pro");
 });
 
-test("exactly the sixteen catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
+test("exactly the seventeen catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
   const expectedCatalogOnly = new Set([
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-5",
@@ -310,12 +315,15 @@ test("exactly the sixteen catalog-gated Gateway ids are catalogOnly in AGENT_OPT
     // day; signed-in presence unverified, same treatment as the rows above.
     "openai/gpt-6-sol",
     "openai/gpt-6-luna",
+    // 2026-09-28 (docs/plans/add-claude-sonnet-5-5.md) — signed-in presence
+    // unverified, same reason as opus-5.5.
+    "anthropic/claude-sonnet-5.5",
   ]);
   const actualCatalogOnly = new Set(
     AGENT_OPTIONS.fx.models.filter((m) => m.catalogOnly).map((m) => m.id),
   );
   expect(actualCatalogOnly).toEqual(expectedCatalogOnly);
-  expect(actualCatalogOnly.size).toBe(16);
+  expect(actualCatalogOnly.size).toBe(17);
 
   for (const kind of KINDS) {
     if (kind === "fx") continue;
@@ -325,7 +333,7 @@ test("exactly the sixteen catalog-gated Gateway ids are catalogOnly in AGENT_OPT
   }
 });
 
-test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (sixteen catalogOnly rows included)", () => {
+test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (seventeen catalogOnly rows included)", () => {
   // Narrower restatement of the bidirectional-keys test above, scoped to
   // just the fx picker's own ids — guards specifically against a
   // catalogOnly row landing in AGENT_OPTIONS.fx.models without a paired

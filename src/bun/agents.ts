@@ -162,6 +162,7 @@ const CLAUDE_MODEL_FLAG: Record<string, string> = {
   "opus-4.8": "claude-opus-4-8",
   "opus-4.7": "claude-opus-4-7",
   "opus-4.6": "claude-opus-4-6",
+  "sonnet-5.5": "claude-sonnet-5-5",
   "sonnet-5": "claude-sonnet-5",
   "sonnet-4.6": "claude-sonnet-4-6",
   "haiku-4.5": "claude-haiku-4-5",
@@ -208,7 +209,7 @@ export function claudeModelIdFromArg(arg: string): string | null {
  * family, always resolving to that family's CURRENT release, not every
  * versioned id agetor tracks. An id whose family row would therefore land on
  * a DIFFERENT specific version than the one just requested — `opus-4.8`,
- * `opus-4.7`, `opus-4.6`, `sonnet-4.6` (all superseded within their family by
+ * `opus-4.7`, `opus-4.6`, `sonnet-4.6`, `sonnet-5` (all superseded within their family by
  * a newer pinned id) — is deliberately mapped to `null` rather than the
  * nearest family, so the live-session mirror is skipped instead of silently
  * switching the session to a different version than the task row now holds.
@@ -222,7 +223,13 @@ export function claudeModelIdFromArg(arg: string): string | null {
  * `claude-opus-5-5` and the picker rows read "Opus 5.5 - best for everyday,
  * complex tasks" / "Opus 5 - previous Opus version"), so `opus-5` joins
  * `opus-4.8`, `opus-4.7`, `opus-4.6`, `sonnet-4.6` and `fable-5` in the null
- * (next-run-only) bucket. `mythos-5` and `mythos-5.1` both have no picker row
+ * (next-run-only) bucket. Sonnet follows the same current-release rule:
+ * `sonnet-5.5` owns the "Sonnet" row because claude 2.1.284 ships
+ * `claude-sonnet-5-5` as its default Sonnet model (CHANGELOG "now the default
+ * Sonnet model on the Anthropic API"; the binary's alias table maps `sonnet` →
+ * `claude-sonnet-5-5` and the picker's previous-version row reads "Sonnet 5 -
+ * previous Sonnet version"), so `sonnet-5` joins the null (next-run-only)
+ * bucket too. `mythos-5` and `mythos-5.1` both have no picker row
  * at all — claude's picker has no Mythos row of any kind. An unknown/future
  * raw id also returns `null` rather than guess. Sole caller:
  * `reconcileTaskSession`'s model mirror (`orchestrator.ts`), which feeds the
@@ -232,7 +239,7 @@ export function claudeModelPickerFamily(id: string): "Opus" | "Sonnet" | "Fable"
   switch (id) {
     case "opus-5.5":
       return "Opus";
-    case "sonnet-5":
+    case "sonnet-5.5":
       return "Sonnet";
     case "fable-5.1":
       return "Fable";

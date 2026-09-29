@@ -16,6 +16,13 @@ import {
 } from "../shared/types.ts";
 import type { ModelOption } from "../shared/model-options.ts";
 
+test("claude sonnet-5.5 exposes exactly max/xhigh/high/medium/low (no none row)", () => {
+  const ids = supportedEfforts("claude-code", "sonnet-5.5").map((o) => o.id);
+  // Exact match is deliberate: there is no `none` row because thinking can't
+  // be disabled on Sonnet 5.5 (plan §2).
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+});
+
 test("claude opus-5.5 supports xhigh + max", () => {
   const ids = supportedEfforts("claude-code", "opus-5.5").map((o) => o.id);
   expect(ids).toContain("max");
@@ -410,6 +417,7 @@ test("cursor model catalog includes the screenshot/default surface", () => {
   expect(ids).toContain("cursor-grok-4.5");
   expect(ids).toContain("composer-2.5");
   expect(ids).toContain("claude-opus-5-5");
+  expect(ids).toContain("claude-sonnet-5-5");
   expect(ids).toContain("claude-opus-5");
   expect(ids).toContain("claude-opus-4-7");
   expect(ids).toContain("gpt-5.6-sol");
@@ -543,6 +551,35 @@ test("cursorModelIdCoveredByCatalog recognizes Opus 5.5 effort variants (base, -
   expect(cursorModelIdCoveredByCatalog("claude-opus-5-5-thinking-high")).toBe(false);
   // The Opus 5 spec still uses -thinking- ids — unaffected by the Opus 5.5 spec.
   expect(cursorModelIdCoveredByCatalog("claude-opus-5-thinking-high")).toBe(true);
+});
+
+test("cursor Sonnet 5.5 exposes the full max/xhigh/high/medium/low ladder", () => {
+  const ids = supportedEfforts("cursor", "claude-sonnet-5-5").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+});
+
+test("cursorModelArg composes Sonnet 5.5 efforts but never -fast or the max-mode bracket", () => {
+  expect(cursorModelArg("claude-sonnet-5-5", "xhigh", false)).toBe("claude-sonnet-5-5-xhigh");
+  // No fastEfforts on the spec — fast never composes.
+  expect(cursorModelArg("claude-sonnet-5-5", "high", true)).toBe("claude-sonnet-5-5-high");
+  expect(cursorModelSupportsFast("claude-sonnet-5-5", "max")).toBe(false);
+  expect(cursorModelSupportsMaxMode("claude-sonnet-5-5")).toBe(false);
+  // Max mode never emits the bracket: cursor-agent 2026.09.26 has no 1M row
+  // for Sonnet 5.5 and rejected the `[context=1m,…]` bracket in a live probe
+  // (docs/plans/add-claude-sonnet-5-5.md §8 A1).
+  expect(cursorModelArg("claude-sonnet-5-5", "xhigh", false, true)).toBe("claude-sonnet-5-5-xhigh");
+});
+
+test("cursorModelIdCoveredByCatalog recognizes Sonnet 5.5 effort variants but not a -thinking- form", () => {
+  expect(cursorModelIdCoveredByCatalog("claude-sonnet-5-5-medium")).toBe(true);
+  expect(cursorModelIdCoveredByCatalog("claude-sonnet-5-5-max")).toBe(true);
+  // Generic `${variant}-fast` coverage rule — no such Cursor id exists today
+  // for Sonnet 5.5, but covering it is harmless.
+  expect(cursorModelIdCoveredByCatalog("claude-sonnet-5-5-medium-fast")).toBe(true);
+  // No such Cursor id — Sonnet 5.5 has no -thinking- variants.
+  expect(cursorModelIdCoveredByCatalog("claude-sonnet-5-5-thinking-high")).toBe(false);
+  // The Sonnet 5 spec is unaffected by the Sonnet 5.5 spec.
+  expect(cursorModelIdCoveredByCatalog("claude-sonnet-5-max")).toBe(true);
 });
 
 // These are the ids migration 055 folds into base id + effort + fast — a
