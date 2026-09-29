@@ -1,273 +1,153 @@
+<div align="center">
+
+<img src="src/assets/agetor-icon.png" alt="Agetor" width="112" height="112" />
+
 # Agetor
 
-**Website:** [agetor.dev](https://agetor.dev)
+**The harness orchestrator.**<br />
+A local-first kanban for running Claude Code, Codex, Cursor, Gemini CLI and fx in parallel, with each task in its own git worktree.
 
-> A local-first kanban board for orchestrating CLI coding agents — Claude Code, OpenAI Codex, and friends — across many tasks and many repos at once.
+[![Latest release](https://img.shields.io/github/v/release/alamops/agetor?style=flat-square&label=release&color=4c1)](https://github.com/alamops/agetor/releases/latest)
+[![Platform](https://img.shields.io/badge/macOS-Apple%20Silicon-111?style=flat-square&logo=apple&logoColor=white)](#install)
+[![License: MIT](https://img.shields.io/github/license/alamops/agetor?style=flat-square&color=blue)](./LICENSE)
+[![Built with Bun](https://img.shields.io/badge/built%20with-Bun-fbf0df?style=flat-square&logo=bun&logoColor=000)](https://bun.sh)
+[![Sponsor](https://img.shields.io/badge/sponsor-%E2%9D%A4-ea4aaa?style=flat-square&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/alamops)
 
-Agetor turns a kanban board into a control plane for AI coding agents. Each card is a prompt plus a working directory plus an agent choice; starting it spawns the agent as a child process inside an isolated git worktree, streams its output back to the UI, and moves the card through columns as the run progresses. Approvals, clarifying questions, and follow-up messages flow through structured cards in the run panel instead of getting buried in a TUI.
+[Website](https://agetor.dev) · [Download](https://github.com/alamops/agetor/releases/latest) · [Quick start](#quick-start) · [Pipelines](#pipelines) · [CLI](#command-line-interface) · [Contributing](#contributing)
 
-It runs entirely on your machine. No cloud relay, no remote sandbox — agents execute with your shell privileges in your repos, the same way they would if you launched them by hand. Agetor just adds the orchestration, isolation, and UI on top.
+<br />
 
-![Agetor app preview](docs/agetor-demo.png)
+<img src="docs/agetor-demo.png" alt="The Agetor board: tasks across Backlog, Running, Blocked and Review columns, with a live agent transcript open in the side panel" width="100%" />
 
----
-
-## Highlights
-
-- **Multi-agent, multi-account.** Built-in support for five agent kinds: `claude-code`, `codex`, `cursor`, `gemini`, and `fx` (Vercel Labs' `fx.sh`, driven over the Agent Client Protocol rather than a tmux-hosted CLI — ships experimental and disabled by default until you enable it in Settings). Define additional *harnesses* to run a second account of any of them in parallel — each one gets a dedicated `$HOME` so logins, history, and config never collide.
-- **Agents.** Save a harness + model + effort + mode + free-text instructions + a skills list as a named, reusable **Agent** in Settings → Agents, then pick it on task launch instead of choosing each field by hand. Its instructions are injected into the launch prompt; a task follows the live agent until its first run, then keeps exactly what it launched with even if the agent changes later. See [Agents](#agents) below.
-- **Pipelines.** Chain several Agents into a named, reusable graph on a full-page canvas — each step hands the next one context via a small JSON handoff it emits at the end of its turn. Running a pipeline creates one board card; agetor drives its steps as hidden tasks sharing one worktree, animating the run live (active step, traversed edges, a token on each handoff) and stopping on `Blocked` whenever a step needs you. Supports branching (a step's agent picks the next step by name), parallel fan-out/fan-in, and cycles. See [Pipelines](#pipelines) below.
-- **Per-task git worktrees.** Every task runs on its own branch (`agetor/<short-id>-<slug>`) in a dedicated worktree under `~/.agetor/worktrees/`. Two agents can hammer the same repo simultaneously without stepping on each other. Base ref is pinned at create time, so re-runs always start from the same commit.
-- **Interactive Claude sessions.** Claude Code is hosted in a per-task `tmux` session that stays alive across multiple turns. Follow up on a task without losing the conversation. Output is streamed by tailing Claude's own JSONL transcript, so assistant text, thinking blocks, tool calls, and tool results all render with their own UI components.
-- **Approvals and questions, lifted out of the TUI.** Agetor watches Claude's tmux pane and JSONL transcript to detect `AskUserQuestion` / `ExitPlanMode` modals and tool-permission prompts, and surfaces them in the run panel as structured cards — radios, checkboxes, free-text. It's fully non-invasive: it registers no MCP server and installs no hook (it only strips stale entries left by older builds). Codex prompts are detected heuristically from stdout and surfaced the same way.
-- **Live event stream.** SSE per task and a global event channel. Status toasts and native notifications fire when a run finishes, succeeds, fails, or blocks waiting on input.
-- **Reproducible re-runs.** Run history persists per task. Cancelling a run keeps the tmux session alive so you can iterate; deleting a task tears down its worktree, branch, and session.
-- **Local SQLite.** All state — tasks, runs, events, projects, harnesses, preferences, approval rules — lives in `~/.agetor/agetor.sqlite` with a versioned migration runner. Nothing leaves your machine.
+</div>
 
 ---
 
-## How it works
+## Why Agetor
 
-Agetor is an [Electrobun](https://github.com/blackboardsh/electrobun) app — a Bun main process that owns the window and a native WebView that renders the UI.
+Coding agents are good enough now that the limiting factor is you: one terminal, one conversation, one branch at a time. Agetor turns a kanban board into a control plane for the agents you **already** use. Each card is a prompt, a repository and a harness. When you press **Run**, Agetor creates an isolated git worktree, launches the agent's own CLI inside it and streams the conversation to the board. The card moves by itself when the agent finishes or needs you.
 
-```
-┌─────────────────────────┐       HTTP + SSE        ┌─────────────────────────┐
-│  React webview          │ ◀──────────────────────▶│  Bun main process        │
-│  (kanban, run panel)    │   127.0.0.1 + token     │  (SQLite, orchestrator) │
-└─────────────────────────┘                         └─────────────┬───────────┘
-                                                                  │ spawn
-                                                  ┌───────────────┴───────────────┐
-                                                  ▼                               ▼
-                                       ┌──────────────────┐            ┌──────────────────┐
-                                       │  tmux: claude    │            │  codex exec      │
-                                       │  (per task)      │            │  (one-shot)      │
-                                       └──────────────────┘            └──────────────────┘
-                                                  │                               │
-                                                  ▼                               ▼
-                                       ┌──────────────────┐            ┌──────────────────┐
-                                       │ git worktree per │            │ git worktree per │
-                                       │ task             │            │ task             │
-                                       └──────────────────┘            └──────────────────┘
-```
+**Agetor doesn't replace your agents, and it doesn't replace your harness.** Claude Code is still Claude Code, with the same login, skills, MCP servers, slash commands and settings. Agetor adds what one terminal can't give you: many agents working in parallel, isolation between them, and one place to review, answer and ship their work.
 
-Some key design decisions:
-
-- **Localhost API, not Electrobun RPC.** The webview talks to the main process over a plain HTTP API bound to `127.0.0.1` on a configurable port. Every route (except `/health`) is gated on a per-launch random bearer token passed to the webview via a `WKUserScript` preload. A site you happen to visit can't drive an agent run even if it guesses the port.
-- **One tmux session per Claude task.** `claude` runs in interactive mode (so you draw from your normal subscription quota, not the Agent SDK credit). Prompts are delivered as keystrokes via `tmux load-buffer + paste-buffer + send-keys`. Output is read from the JSONL Claude writes to `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`.
-- **Codex stays one-shot.** Each Codex run is a fresh `codex exec` invocation; follow-ups create a new run record on the same task.
-- **Boot reconciliation.** On startup, any tmux sessions left over from a previous Agetor process are killed, and any rows still marked `running` are flipped to `orphaned`. The kanban never shows stuck cards.
-
-The full architecture, schema, and lifecycle is documented in [`CLAUDE.md`](./CLAUDE.md).
+- **Local-first.** Everything runs on your machine. There's no Agetor account, no cloud relay and no telemetry.
+- **Non-invasive.** Agetor installs no hooks and no MCP server, and it doesn't edit your `CLAUDE.md`. It drives the real CLI the way you would.
+- **Restart-safe.** Claude Code, Codex, Cursor and Gemini CLI run inside `tmux`, so quitting Agetor doesn't stop them, and the next launch reconnects to them. fx is the exception: it runs as a child process of Agetor and stops when Agetor quits, so an fx turn in progress doesn't survive a restart.
 
 ---
 
-## Requirements
+## Features
 
-- **Bun** ≥ 1.1 ([install](https://bun.sh))
-- **tmux** — hard requirement for the Claude Code driver
-  - macOS: `brew install tmux`
-  - Debian/Ubuntu: `apt install tmux`
-- **At least one agent CLI on `PATH`:**
-  - `claude-code`: `npm i -g @anthropic-ai/claude-code`
-  - `codex`: `npm i -g @openai/codex`
-- **Git** — required for worktree isolation
-- **Platforms:** macOS (primary). Linux and Windows builds are configured in `electrobun.config.ts` but are not currently tested.
+### Orchestrate
 
-Agents are launched with your full shell privileges in whatever directory the task points at. There is no sandbox.
+- **Kanban workflow.** Tasks move through *Backlog → Ready → Running → Blocked → Review → Done* as their runs start, stall, fail or finish. You can drag a card to override the flow at any time.
+- **A git worktree for every task.** Each task runs on its own branch (`agetor/<id>-<slug>`) under `~/.agetor/worktrees/`, so two agents can work on the same repo at once without colliding. The base commit is pinned when the task is created, so the task keeps the same starting point even after the source branch moves on.
+- **Five harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI and fx side by side. To use a second account for any of them, add a harness with its own isolated `$HOME`.
+- **Agents (reusable profiles).** Save a harness, model, effort, mode, instructions and skills as a named **Agent**, then launch tasks from it in one click.
+- **Pipelines.** Chain Agents into a reusable graph on a canvas, such as *Plan → Implement → Review*. Steps hand context to each other, branch, fan out and loop, all from a single board card. See [Pipelines](#pipelines).
+- **Model discovery.** Model and effort pickers start from a curated list. For Codex, Cursor and fx, they also include the models your account actually offers, as reported by the CLI. If a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
 
----
+### Converse
 
-## Getting started
+- **A live, structured transcript.** Assistant text, thinking, tool calls, subagents, plans, TODO progress and files the agent sends you each render as their own UI components, not as raw terminal output.
+- **Questions and approvals as cards.** Claude's `AskUserQuestion`, plan approvals and permission prompts show up as cards you answer in the panel. Agetor then types the keystrokes into the real session. fx permission requests and Cursor plans work the same way.
+- **Follow-ups at any time.** You can message a running agent and the message folds into its current turn. Drafts you're not ready to send go to a per-task **Save for later** tray.
+- **An autocompleting composer.** `/` completes slash commands, skills, MCP servers and plugins. `@` completes files and folders, which Agetor resolves to real paths inside the task's worktree. You can also attach files and images and reuse saved prompts.
+- **Built-in terminals.** Every task has terminal tabs rooted in its worktree. `agetor attach <id>` connects your own terminal to the live agent session.
 
-```bash
-# Clone and install
-git clone https://github.com/alamops/agetor.git
-cd agetor
-bun install
+### Ship
 
-# Build the webview bundle once (required for `bun run dev`)
-bun run build
+- **Diff review.** Review a branch's changes in the app. Select lines and send them back to the agent as a quoted follow-up.
+- **Git host integration.** Works with GitHub, GitLab and Bitbucket Cloud. You can commit and push, open pull requests, check mergeability, create a conflict-resolution task, browse issues, and start a task from an issue's full comment thread.
+- **Clone any repository.** Clone from any of those three hosts with live progress and cancel. Optionally, an agent then writes an `ELI5.md` tour of the codebase.
 
-# Run it
-bun run dev
-```
+### Stay in the loop
 
-For UI iteration, run Vite and Electrobun together:
-
-```bash
-bun run dev:hmr
-```
-
-That starts Vite on port `5173` for hot reload and Electrobun in dev mode in parallel. Main-process changes (anything under `src/bun/`) do *not* hot-reload — restart `bun run dev:hmr` after editing them.
-
-### First task
-
-1. Click **New task** in the left rail.
-2. Pick a workdir (any local folder; if it's a git repo, you'll get worktree isolation for free).
-3. Choose an agent and a model, and write your prompt.
-4. Hit **Run task** to start it immediately, or **To backlog** to queue it.
-
-Drag cards between columns to override flow manually. Open a card to see the live event stream, send follow-up messages, or answer approval prompts.
+- **Notifications.** Native macOS notifications link straight to the task that needs you. Cards show an unread dot when the agent has said something new.
+- **Usage meter.** Plan quota for Claude Code, Codex and Cursor accounts, read with the logins those CLIs already have, plus local token rollups.
+- **Themes and automatic updates.** Auto, dark or light theme. The app is signed, notarized and updates itself in place.
 
 ---
 
-## Command-line interface (`agetor`)
+## Supported harnesses
 
-Agetor also ships as a standalone terminal CLI — drive the same board from your shell, with or without the desktop app open.
+A **harness** is the agent CLI Agetor drives. Agetor launches the real binary on your `PATH` with your existing login, and it doesn't proxy or re-implement the agent.
 
-### Install
+| Harness | Binary | How Agetor drives it | Default model | Install |
+| --- | --- | --- | --- | --- |
+| **Claude Code** | `claude` | Interactive session in a per-task `tmux` session; output is tailed from Claude's own JSONL transcript | Opus 5.5 | `npm i -g @anthropic-ai/claude-code` |
+| **Codex** <sup>experimental</sup> | `codex` | `codex exec --json` for each turn inside `tmux`; the conversation resumes by thread id | GPT-6 Sol | `npm i -g @openai/codex` |
+| **Cursor** <sup>experimental</sup> | `cursor-agent` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Grok 4.7 | `curl https://cursor.com/install -fsS \| bash` |
+| **Gemini CLI** <sup>experimental</sup> | `gemini` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Gemini 3.1 Pro (preview) | `npm i -g @google/gemini-cli` |
+| **fx** (Vercel Labs) <sup>experimental</sup> | `fx` | [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio), through Vercel AI Gateway | GLM 5.3 Flash | `curl -fsSL https://fx.sh/setup.sh \| bash` |
+
+Claude Code is enabled out of the box. The experimental harnesses are opt-in: turn them on in **Settings → Harnesses**. Settings and the onboarding checklist show whether each CLI is installed and logged in, and give an install hint if it isn't.
+
+Each harness offers the permission modes its CLI actually supports. They range from hands-off modes (*Auto*, *Full access*) to *Ask*, *Plan only* and *Read-only*.
+
+---
+
+## Install
+
+### Desktop app (macOS, Apple Silicon)
+
+1. Download **[Agetor-arm64.dmg](https://github.com/alamops/agetor/releases/latest/download/Agetor-arm64.dmg)** from the latest release.
+2. Drag **Agetor** into Applications and open it.
+3. Install at least one [harness](#supported-harnesses) and log in to it the way you normally would (for example, run `claude` once).
+
+The app is signed and notarized by Apple and updates itself. Harnesses hosted in `tmux` need it on your `PATH`; if it's missing, the app offers to use a bundled copy instead.
+
+### CLI
 
 ```bash
 curl -fsSL https://github.com/alamops/agetor/releases/latest/download/install.sh | sh
 ```
 
-The installer is arm64-macOS only (matching the app), verifies a SHA-256 checksum, and drops a single `agetor` binary in `/usr/local/bin` (falling back to `~/.local/bin`). To build it from source instead:
+The installer verifies a SHA-256 checksum and installs a single `agetor` binary into `/usr/local/bin`, or `~/.local/bin` if that isn't writable. The CLI works with or without the desktop app. See [Command-line interface](#command-line-interface) below.
 
-```bash
-bun run build:cli          # → artifacts/agetor-arm64 (+ .sha256, install.sh)
-# …or run straight from source, no build:
-bun src/cli/index.ts --help
-```
-
-### How it connects
-
-The CLI is a thin client over the same localhost API the webview uses. It discovers the running core through a `0600` credentials file (`~/.agetor/agetor-core.json`, written on launch with the per-launch port + token). If the desktop app is open, the CLI talks to it; if not, it **auto-starts a headless background daemon** that shares the same `~/.agetor` state — so a task you add from the CLI shows up in the app and vice-versa. When you later open the app, the daemon hands the port off to it.
-
-It honors the same `AGETOR_DATA_DIR` / `AGETOR_API_PORT` as the app, so e.g. `AGETOR_DATA_DIR=~/.agetor-dev agetor ls` targets the dev tree.
-
-### Commands
-
-```bash
-agetor                       # full-screen live dashboard (board + streaming detail + inline compose/answer)
-
-# create · inspect
-agetor add                   # create a task (guided wizard, or --title/--prompt[/--start])
-agetor add --issue <url>     # seed a task from a GitHub/GitLab issue + its thread (uses --workdir or the cwd)
-agetor add --profile <id|name>  # launch from a saved Agent instead of picking --agent/--model/--mode/--effort by hand
-agetor add --pipeline <id|name>  # launch a saved Pipeline instead — its steps supply every agent/model/mode/effort
-agetor ls [filters]          # list tasks (--column/--agent/--type/--repo/--search/--archived/--all)
-agetor ls --steps            # also list hidden pipeline step tasks (hidden by default; `»` marks a pipeline task, `↳` a step row naming its parent)
-agetor ps                    # list running / blocked tasks only
-agetor show <id>             # details, runs, pending interactions
-
-# run · converse
-agetor start <id>            # run a not-yet-run task
-agetor send <id> <msg…>      # message a task (--ref <path> to attach a file/image; resumes a finished one)
-agetor commit <id>           # ask the agent to commit all changes & push the branch
-agetor answer <id>           # answer a task that needs input (interactive picker)
-agetor commands <id>         # list the agent's slash commands + extensions (composer autocomplete)
-agetor logs <id>             # stream a task's live conversation (--no-follow snapshot · --notify on state change · --rebuild from JSONL)
-                             #   on a pipeline task: prints which step tasks to watch instead (only --notify keeps following)
-agetor files <id>            # files the agent sent you (name · size · when · path; alias: sent)
-agetor cancel <id>           # stop the active run
-agetor attach <id>           # attach your terminal to the live tmux session (claude-code)
-agetor shell <id>            # open a shell in the task's worktree (--print for the path)
-
-# manage
-agetor edit <id> [flags]     # change title/prompt/agent/workdir/model/mode/effort/type/column
-agetor edit <id> --detach-profile  # unbind a task from its Agent, keeping its current values
-agetor move <id> <column>    # move between columns (mark done = move <id> done)
-agetor archive <id>          # archive a done task · unarchive <id> to restore
-agetor diff <id>             # show the task's git diff
-agetor rm <id> --yes         # delete a task (worktree + branch)
-
-# setup
-agetor clone <url>           # clone a GitHub/GitLab/Bitbucket repo as a new project (--provider, --dest, --no-eli5)
-agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
-agetor harness <sub>         # list | add | edit | enable | disable | rm | shell  (aliases / accounts; shell = log in)
-agetor profile <sub>         # ls | show <ref> | add <name> | edit <ref> | rm <ref>  (alias: profiles — saved launch presets, see Agents above)
-agetor pipeline <sub>        # ls | show <ref> | rm <ref> | export <ref> [--out <f|->] [--force] | import <file|-> | retry <ref> [--from <step-task>] | advance <ref> --next <step>|--finish [--from <step-task>] | restart <ref> | status <ref>  (see Pipelines above)
-agetor daemon status|start|stop
-agetor info                  # the connected core's version
-agetor config [k] [v]        # view / set core preferences (defaultHarness, last model/mode/effort)
-```
-
-Vocabulary note: in the CLI, `--agent` / the `agent` column always mean the **harness** (the CLI being driven); an **Agent** (the saved harness+model+effort+mode+instructions+skills preset) is always called a **profile** — `agetor profile …`, `--profile`, `--detach-profile`.
-
-**Dashboard keys:** `↑/↓` (or `j/k`) select · `s` run · `x` stop · `m` message · `c` commit & push · `g` answer · `q` quit. Messages and answers happen inline; run-status toasts flash on success / failure / needs-you.
-
-Every command accepts `--json` for scripting, `--data-dir <dir>` / `--port <n>` to target a specific core, and `--no-daemon` to fail instead of auto-spawning one. Short id prefixes (the 8 chars shown in `agetor ls`) work anywhere an `<id>` is expected. The desktop `.dmg`/`.app` is unchanged — the CLI is an additional surface, not a replacement.
+> [!NOTE]
+> Agetor ships for **macOS on Apple Silicon** only. Linux and Windows targets are configured but not built or tested yet.
 
 ---
 
-## Configuration
+## Quick start
 
-All persistent state lives in `~/.agetor/` (override with `AGETOR_DATA_DIR`):
+1. Click **New task** in the left rail.
+2. Pick a project folder. If it's a git repository, the task gets its own worktree automatically.
+3. Choose an Agent, or pick a harness, model and mode yourself, then write your prompt.
+4. Click **Run task** to start now, or **To backlog** to queue it.
 
-```
-~/.agetor/
-├── agetor.sqlite               # tasks, runs, events, projects, harnesses, preferences
-├── agetor-core.json            # 0600 creds file: the running core's port + token (CLI auth)
-├── daemon.log                  # headless CLI daemon log (when the app isn't running)
-├── worktrees/<task-id>/        # per-task git worktrees
-└── harnesses/<id>/             # optional per-harness HOME (multi-account)
-```
-
-### Environment variables
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `AGETOR_DATA_DIR` | Where the SQLite db, worktrees, and bin scripts live. | `~/.agetor` |
-| `AGETOR_API_PORT` | Localhost port the main process binds. | `4317` |
-| `AGETOR_CLAUDE_BIN` | Override the `claude` binary path. | `claude` on `PATH` |
-| `AGETOR_CLAUDE_ARGS` | Extra args appended to every Claude spawn. | *(none)* |
-| `AGETOR_CODEX_BIN` | Override the `codex` binary path. | `codex` on `PATH` |
-| `AGETOR_CODEX_ARGS` | Extra args appended to every Codex spawn. | *(none)* |
-| `AGETOR_CURSOR_BIN` | Override the `cursor-agent` binary path. | `cursor-agent` on `PATH` |
-| `AGETOR_CURSOR_ARGS` | Extra args appended to every Cursor spawn. | *(none)* |
-| `AGETOR_GEMINI_BIN` | Override the `gemini` binary path. | `gemini` on `PATH` |
-| `AGETOR_GEMINI_ARGS` | Extra args appended to every Gemini spawn. | *(none)* |
-| `AGETOR_FX_BIN` | Override the `fx` binary path. | `fx` on `PATH` |
-| `AGETOR_FX_ARGS` | Extra args appended to every fx spawn. | *(none)* |
-| `AGETOR_TMUX_BIN` | Override the `tmux` binary path. | `tmux` on `PATH` |
-| `AGETOR_CLAUDE_DRIVER` | Set to `fake` to skip tmux + the real CLI (test-only). | unset |
-| `AGETOR_CODEX_DRIVER` | Same, for Codex (test-only). | unset |
-| `AGETOR_CURSOR_DRIVER` | Same, for Cursor (test-only). | unset |
-| `AGETOR_GEMINI_DRIVER` | Same, for Gemini (test-only). | unset |
-| `AGETOR_FX_DRIVER` | Same, for fx — skips spawning the ACP child entirely (test-only). | unset |
-| `AGETOR_GITHUB_API_BASE` | GitHub REST/GraphQL API origin. Dev/e2e only — see `e2e/github-stub.ts`; never point it at a non-loopback host (the GitHub token is sent there). | `https://api.github.com` |
-| `AGETOR_DAEMON_IDLE_MS` | CLI daemon: idle-shutdown after this long with no run and no attached client. `0` disables. | `300000` (5 min) |
-
-Per-harness `bin`, `home`, and `env` overrides are configured through the Settings dialog and stored in SQLite — they take precedence over the corresponding env vars.
+Click a card to open its run panel. From there you can watch the transcript stream, answer questions, send follow-ups, review the diff, open a terminal, or commit and open a PR once you're happy with the result.
 
 ---
 
-## Concepts
+## Pipelines
 
-### Tasks, columns, and runs
+A **pipeline** chains several [Agents](#orchestrate) into a named, reusable graph of steps. For example, a planner hands off to an implementer, and a reviewer either approves the work or sends it back. You build pipelines on a full-page canvas (the **Pipelines** button in the header, or **Settings → Pipelines**), give each step its own Agent and instructions, and launch them like any other task.
 
-A **task** is a prompt + workdir + agent. It lives in one of six columns:
+```mermaid
+flowchart LR
+    Plan --> Implement --> Review
+    Review -- "changes requested" --> Implement
+    Review -- "approved" --> Docs
+```
 
-| Column | Meaning |
-| --- | --- |
-| Backlog | Queued, not started. |
-| Ready | Created via "Run task" but waiting on pre-flight. |
-| Running | Agent is actively producing output. |
-| Blocked | Agent is waiting on an approval, question, or plan review. |
-| Review | Last run exited `0`. The diff is yours to inspect. |
-| Done | You've decided you're satisfied. |
+- **One card, many agents.** Running a pipeline creates a single board card. Each step runs as a hidden task in the card's worktree. Click any step to read its transcript, chat with it or check its diff, just like a normal task.
+- **Structured handoffs.** Each step ends its turn with a small `<handoff>` JSON block: a summary, the files it touched, open questions and which step runs `next`. That block becomes the next step's context.
+- **Branching, fan-out and loops.** A step can pick the next step by name, run all of its outgoing steps in parallel, or loop back to an earlier one. A join can wait for any incoming branch or for all of them. A step cap (25 by default) stops runaway loops.
+- **Live run view.** The canvas animates as the pipeline runs: the active step pulses, and a token travels along each edge when a handoff happens.
+- **Blocks instead of guessing.** If a step needs your input, fails, or can't produce a valid handoff even after one automatic reminder, the card moves to **Blocked** with the reason. From there you can retry the step, choose the next step yourself, stop, or restart.
+- **Frozen at launch.** A pipeline and its Agents are captured the moment you click Run, so editing or deleting them never affects a run already in progress.
+- **Portable.** `agetor pipeline export` and `agetor pipeline import` move pipelines between machines. On import, Agents are matched to local ones by name.
 
-A **run** is a single invocation of the agent on a task. Tasks accumulate run history; the run panel can replay any past run's events.
+> [!WARNING]
+> Parallel steps share **one** worktree, and nothing stops two of them from editing the same files. Use fan-out only for work that is truly independent, such as docs in one branch and tests in another.
 
-### Harnesses
+<details>
+<summary><strong>Handoff format and run control</strong></summary>
 
-A **harness** is a named agent configuration. The two built-ins (`claude-code`, `codex`) wrap each CLI directly. User-defined harnesses are *aliases* that wrap the same underlying kind with extra env, an alternate binary, or — most usefully — a per-account `$HOME` override. That last knob lets you run a second Claude or Codex account in parallel without their logins overwriting each other.
+<br />
 
-Add a harness from **Settings → Harnesses**. Templates pre-fill common patterns.
-
-### Agents
-
-An **Agent** is a named, reusable launch preset — a harness + model + effort + mode (+ Cursor's fast/max-mode toggles) + free-text instructions + a list of skills — bundled up so you stop re-picking the same five fields on every task. Create, edit, and delete them from **Settings → Agents**; each row shows how many tasks are currently bound to it ("Used by N tasks").
-
-Pick an Agent from the picker on any launch surface (New Task form, the Resolve-Conflicts and Create-from-issue dialogs) instead of choosing harness/mode/model/effort by hand — its instructions get injected into the launch prompt, and its skills are suggested to the agent up front. A task follows its *live* agent (so an edit to the agent in Settings is reflected) right up until the task's first run, then freezes: from then on the task keeps exactly what it launched with, even if you later edit or delete the agent.
-
-Task details shows the bound agent as a compact chip in its own **Agent** row (the harness picker next to it is labeled **Harness**, since "agent" here means the profile, not the CLI). Click the chip to open a details dialog with the task's frozen snapshot — name, harness, model, effort, mode, instructions, skills — plus a status line telling you whether it's still following the live agent or frozen since the first run, and a link back to Settings to edit it. **Detach** unbinds the task from the agent (keeping its current values) and unlocks the harness/mode/model/effort pickers again.
-
-### Pipelines
-
-A **pipeline** is a named, reusable graph of **steps**, each bound to an [Agent](#agents). Build one on the full-page canvas editor (the **Pipelines** button in the header, or Settings → Pipelines): drag out step nodes, connect them, and give each step its own instructions and agent. Running a pipeline creates one ordinary board card — agetor drives it by running each step as a hidden task that shares the pipeline card's worktree, one at a time (or several at once, for a branch that fans out).
-
-Each step ends its turn with a small JSON block telling agetor what happened and what should run next:
+A step ends its turn with a block like this. The last block in the turn wins.
 
 ```
 <handoff>
@@ -282,193 +162,213 @@ Each step ends its turn with a small JSON block telling agetor what happened and
 </handoff>
 ```
 
-`next` names the step to run next (by its name, or by an edge's label if you've given the connecting edge one). A step can instead be set to run **all** of its outgoing steps in parallel (fan-out), and a downstream step can wait for **any** one of its incoming steps to arrive (the default — this is also how loops/cycles work) or for **all** of them before it starts (a join, receiving every branch's handoff at once). A step with no outgoing edges ends that path.
+`next` names a step, or the label of an edge leading out of this step. A step with no outgoing edges ends its path.
 
-If a step forgets the handoff format — no `<handoff>` block at all, one agetor can't parse, or one that doesn't clearly say what happens next — agetor doesn't block right away: it sends the agent one automatic follow-up asking it to reply with just the handoff block, and the run keeps going. Only if that second reply still isn't a valid handoff (or the step reports itself blocked, is waiting on you to answer something, or its run fails) does the pipeline card go to **Blocked** with a reason — you can **Retry** the stuck step (also available from the CLI, `agetor pipeline retry <ref>`, or narrowed to one specific stuck execution with `--from <task-id-or-prefix>`), or **manually advance** it (pick which step runs next yourself, optionally with your own summary; `agetor pipeline advance <ref> --next <step>` or `--finish`, also narrowable with `--from`). A run-away cycle is capped (25 steps by default, configurable per pipeline) — hitting the cap is itself just another Blocked reason, and Retry there extends the run's allowance (each Retry adds one more full cap) instead of being a dead end, so a long-running pipeline can keep going for as long as you keep retrying past the cap. Plain Run on a **blocked** or **cancelled** pipeline always picks up where it left off — it never restarts from scratch. **Stop** means two different things depending on where you click it: Stop in the run view's own header stops the **whole pipeline** — every step still running is cancelled at once and the run ends cleanly **Cancelled**, even on a fan-out with several branches in flight — while stopping one step from that step's own task view only ends that **branch**, leaving its still-running siblings alone (a step that was stopped shows as its own Blocked entry so you can retry or advance past it). Run refuses outright on a **finished** pipeline (`"pipeline already finished — restart it explicitly"`). Re-running a pipeline from the top — for a finished, blocked, or cancelled run alike — is a separate, explicit action: **Restart** in the run view, or `agetor pipeline restart <ref>` — it cancels anything still genuinely running, then starts over from the start step, discarding the previous run's history. `agetor pipeline status <ref>` prints the run's overall status, progress, and every blocked entry from the terminal. Every one of these run-control subcommands takes the **pipeline task's** id — a hidden step task's id is refused with a pointer at its parent. `--next` matches a step by name, then by id, then by an edge label (the same precedence a step's own handoff `next` gets), and `--from` takes a step task id or a unique prefix of one (`pipeline status` lists them).
-
-From the terminal, `agetor pipeline show <ref>` resolves each step's agent to its name (marking one that no longer exists as `(missing)`); `agetor pipeline export <ref> [--out <file|->] [--force]` writes the pipeline as re-importable JSON — it refuses to overwrite an existing file unless `--force`, `--out -` is stdout, and each step carries a `profileName` hint next to its agent id — so that `agetor pipeline import <file|->` on another machine can remap an agent that isn't defined there to the unique local agent of the same name (it prints what it remapped; an agent it can't remap is a warning — `--json` folds them into `warnings` — and you assign one in the editor before running). `agetor logs <pipeline-task>` prints which step tasks to watch instead of following a stream that would stay silent (a pipeline task never runs an agent itself); only `--notify` keeps following, since the pipeline task's own Blocked/done transitions still notify. `agetor ls --steps` lists the hidden step rows too: a pipeline task gets a `»` marker, a step row a `↳`-prefixed title and its parent's short id in the `needs` column. In the TUI dashboard, `p` on a pipeline task lists its step rows inline (indented `↳`) so you can select one and stream its transcript — the pipeline row's own pane just explains where the transcripts live — and `s`/`x` on a pipeline task retry (when blocked or cancelled) or stop the whole pipeline. `agetor add --pipeline … --start` reports a failed start (`! start failed: …`, or a `warnings` entry under `--json`) instead of silently creating the task unstarted.
-
-Click a pipeline card to open the full-page run view: the graph animates as it runs (the active step pulses, a token travels each edge on handoff), and clicking any step node opens that step's normal task details on top, exactly like any other task — you can read its full transcript, chat with it, or look at its diff.
-
-A step can also list which other Agents it's *allowed to delegate to* as subagents, with an optional cap — this is injected into the step's prompt as guidance; agetor doesn't enforce the cap itself.
-
-Deleting or archiving a pipeline task cascades to all of its step tasks; a step task can't be deleted or archived on its own — act on the pipeline task instead. Editing or deleting the underlying pipeline (or an agent it uses) never affects a run already in progress — everything is frozen the moment you click Run.
-
-**Caveat:** parallel steps (fan-out) share the *same* worktree — nothing stops two concurrent steps from editing the same files, so use fan-out for genuinely independent pieces of work (e.g. one step writing docs while another writes tests), not for steps racing over the same code.
-
-### Modes, models, and effort
-
-Each task picks:
-
-- a **mode** — how much permission the agent has (`auto`, `ask`, `acceptEdits`, `plan`, `bypass` — exposed per agent),
-- a **model** — Opus / Sonnet / Haiku for Claude, GPT-6 Sol (the default) / Luna / Astra / Astra Aeon (Sol and Luna need codex CLI ≥ 0.155, Astra and Aeon ≥ 0.153 — on an older CLI agetor refuses to start the run with an upgrade hint instead of letting codex answer a misleading 400), the superseded GPT-5.6 Sol / Terra / Luna (plus the access-gated GPT-5.6 Cyber), and earlier GPT-5 options for Codex,
-- an **effort** level — reasoning depth, where the model supports it, up to Codex's `Ultra` delegation tier where offered; Codex's effort menu follows what the signed-in account's Codex CLI actually reports.
-
-The picker filters incompatible combinations (e.g. effort is hidden on Haiku 4.5 because Anthropic's API doesn't accept it there).
-
-### Worktree isolation
-
-When `isolation: "worktree"` (the default), starting a task in a git repo:
-
-1. Resolves the base ref to a sha (pinned on the row — re-runs reproduce).
-2. Creates `~/.agetor/worktrees/<task-id>/` on a fresh branch off that sha.
-3. Spawns the agent with that path as `cwd`.
-
-Worktree teardown happens automatically on task delete: `git worktree remove --force` plus `git branch -D`, with an `rm -rf` fallback for the case where the user moved `workdir` out from under us.
-
-Set isolation to `"none"` to run directly in `workdir` — useful for one-off scripts where a worktree would be overhead.
-
-### Approvals and clarifying questions
-
-When Claude is about to use a tool, the Agetor-installed `PreToolUse` hook posts the tool name and input to `127.0.0.1:<port>/approvals`. The run panel renders a card; the user clicks **Allow**, **Allow always**, or **Deny**. "Allow always" persists a `(task, tool)` rule in SQLite so future fires are auto-allowed without bothering you.
-
-When Claude wants to ask a structured question, it calls the `ask_user` tool on Agetor's MCP server. The webview renders radios / checkboxes / textarea, and the MCP server's response unblocks the agent.
-
-`AskUserQuestion` and `ExitPlanMode` from Claude's built-in tools are intercepted the same way.
-
----
-
-## HTTP API
-
-The main process exposes a small JSON + SSE API on `127.0.0.1:$AGETOR_API_PORT`. All routes except `/health` require `Authorization: Bearer $AGETOR_API_TOKEN` (or `?token=...` for `EventSource`).
-
-| Method | Path | Purpose |
+| Action | What it does | CLI |
 | --- | --- | --- |
-| `GET` | `/health` | Liveness probe. |
-| `GET` | `/info` | App version + boot info. |
-| `GET` | `/defaults` | Home dir and other defaults the UI needs to expand `~`. |
-| `GET` / `POST` | `/tasks` | List or create tasks. |
-| `GET` / `PATCH` / `DELETE` | `/tasks/:id` | Inspect, edit allow-listed fields, or delete a task. |
-| `POST` | `/tasks/:id/start` | Start a run for the task. |
-| `GET` | `/tasks/:id/runs` | Run history for the task (newest first). |
-| `GET` | `/tasks/:id/events` | SSE: unified event stream across all runs for the task. |
-| `POST` | `/runs/:id/cancel` | Send Ctrl-C to the in-progress run; tmux session survives. |
-| `POST` | `/runs/:id/input` | Send a follow-up user message (Claude only). |
-| `GET` | `/runs/:id/events` | SSE: events for a single run (replays history, then streams live). |
-| `GET` / `POST` / `DELETE` | `/harnesses[...]` | Manage harness configs. |
-| `GET` | `/agents` | Per-harness availability + version probes. |
-| `GET` | `/agent-models` | Models discovered by probing each CLI. |
-| `GET` | `/agent-commands` | Slash commands supported by the active agent. |
-| `POST` | `/approvals/:id/answer` | Resolve a pending tool approval. |
-| `POST` | `/questions/:id/answer` | Resolve a pending `ask_user` question. |
-| `POST` | `/ask-questions/:id/answer` | Resolve an intercepted `AskUserQuestion`. |
-| `POST` | `/plan-approvals/:id/answer` | Resolve an intercepted `ExitPlanMode`. |
-| `GET` | `/tasks/:id/interactions/pending` | Anything currently blocking the task. |
-| `GET` / `POST` / `DELETE` | `/projects[...]` | Working-directory shortcuts shown in the New Task form. |
-| `GET` / `PATCH` | `/preferences[...]` | Per-user preferences (key/value). |
-| `POST` | `/open-path` | Open a file or folder with the OS default app. |
-| `POST` | `/reveal-path` | Reveal (select) a file or folder in Finder. |
-| `GET` | `/events` | SSE: global lifecycle stream (toasts, native notifications). |
+| **Run** | Starts the pipeline. On a blocked or cancelled pipeline, it resumes where it stopped and never starts over. | `agetor start <id>` for the first run; `agetor pipeline retry <ref>` to resume |
+| **Retry** | Re-runs the blocked or cancelled step. When the step cap was hit, each Retry adds another full allowance. | `agetor pipeline retry <ref> [--from <step-task>]` |
+| **Advance** | Skips the stuck step: you pick the next step, or finish the run. | `agetor pipeline advance <ref> --next <step> \| --finish` |
+| **Stop** | From the run view header, stops the whole pipeline. From a single step, stops only that branch. | `agetor cancel <id>` |
+| **Restart** | Cancels anything still running and starts over from the first step, discarding the previous run. | `agetor pipeline restart <ref>` |
 
-The full route list is in [`src/bun/server.ts`](./src/bun/server.ts).
+A step can also list other Agents it's allowed to delegate to as subagents, with an optional cap. Agetor passes this to the step as guidance in its prompt; it doesn't enforce the cap. Deleting or archiving a pipeline task also deletes or archives its steps.
+
+</details>
 
 ---
 
-## Commands
+## Command-line interface
+
+The `agetor` CLI drives the same board from your shell. If the desktop app is running, the CLI talks to it. If it isn't, the CLI starts a **headless background daemon** that shares the same `~/.agetor` state. A task you add in the terminal shows up in the app, and the reverse is also true. When you open the app later, the daemon hands over to it.
 
 ```bash
-bun install                                # install deps
-bun run dev                                # Electrobun, loads packaged webview
-bun run dev:hmr                            # Vite + Electrobun in parallel (preferred for UI work)
-bun run build                              # production bundle (vite build → electrobun build)
-bun run build:canary                       # canary channel build
-bun run build:stable                       # stable channel build
-bun run typecheck                          # tsc --noEmit; must be green
-bun test                                   # full test suite (Bun's test runner)
-bun test src/bun/orchestrator.test.ts      # single file
-bun test -t "createTask"                   # by test name
+agetor                       # full-screen live dashboard: board, streaming detail, inline compose/answer
+
+# create · inspect
+agetor add                   # create a task (guided wizard, or --title/--prompt[/--start])
+agetor add --issue <url>     # seed a task from a GitHub/GitLab/Bitbucket issue and its thread
+agetor add --profile <name>  # launch from a saved Agent profile
+agetor add --pipeline <name> # launch a saved Pipeline (its steps supply every agent)
+agetor ls [filters]          # list tasks (--column/--agent/--type/--repo/--search/--archived/--all)
+agetor ls --steps            # include the hidden step tasks of pipelines
+agetor ps                    # running and blocked tasks only
+agetor show <id>             # details, runs, pending interactions
+
+# run · converse
+agetor start <id>            # run a task
+agetor send <id> <msg…>      # message a task (--ref <path> to attach a file; resumes a finished one)
+agetor answer <id>           # answer a task that's waiting on you
+agetor logs <id>             # stream the conversation (--no-follow · --notify · --rebuild)
+agetor commit <id>           # ask the agent to commit everything and push the branch
+agetor cancel <id>           # stop the active run
+agetor resume <id>           # resume an fx response paused by rate limiting
+agetor attach <id>           # attach your terminal to the live tmux session
+agetor shell <id>            # open a shell in the task's worktree
+agetor diff <id>             # the task's git diff
+agetor files <id>            # files the agent sent you
+
+# manage · setup
+agetor edit <id> [flags]     # change title, prompt, harness, model, mode, effort, column…
+agetor move <id> <column>    # e.g. `agetor move <id> done`
+agetor archive <id>          # archive a done task (unarchive to restore)
+agetor rm <id> --yes         # delete a task, its worktree and its branch
+agetor clone <url>           # clone a GitHub/GitLab/Bitbucket repo as a new project
+agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
+agetor harness <sub>         # list | add | edit | enable | disable | rm | shell
+agetor profile <sub>         # ls | show | add | edit | rm (saved Agents)
+agetor pipeline <sub>        # ls | show | rm | export | import | status | retry | advance | restart
+agetor daemon status|start|stop
+agetor config [key] [value]  # view or set preferences
 ```
+
+Every command accepts `--json` for scripting. Short id prefixes (the 8 characters `agetor ls` shows) work anywhere an `<id>` is expected. In the CLI, `--agent` always means the **harness**, and a saved Agent is called a **profile**.
+
+**Dashboard keys:** `↑/↓` or `j/k` select · `s` run · `x` stop · `m` message · `c` commit and push · `g` answer · `r` resume · `p` show a pipeline's steps · `q` quit.
 
 ---
 
-## Project layout
+## How it works
+
+Agetor is an [Electrobun](https://github.com/blackboardsh/electrobun) app: a **Bun** main process that owns the orchestration, and a native macOS WebView that renders a **React** UI.
+
+```mermaid
+flowchart LR
+    UI["Desktop app<br/>(React webview)"] -- "HTTP + SSE" --> Core
+    CLI["agetor CLI / TUI"] -- "HTTP + SSE" --> Core
+    Core["Bun core<br/>orchestrator · SQLite · git"]
+    Core -- "tmux (interactive)" --> Claude["claude"]
+    Core -- "tmux (one-shot per turn)" --> OneShot["codex · cursor-agent · gemini"]
+    Core -- "ACP over stdio" --> FX["fx"]
+    Claude --> WT[("git worktree<br/>per task")]
+    OneShot --> WT
+    FX --> WT
+```
+
+- **One local API.** The desktop UI and the CLI both talk to the core over HTTP and Server-Sent Events. The API listens only on `127.0.0.1`, and every route except `/health` requires a random token generated at each launch.
+- **Drive the real CLI; don't re-implement it.** Claude Code runs as an interactive session inside `tmux` and receives prompts as keystrokes. Its structured output comes from the transcript Claude writes itself. Codex, Cursor and Gemini CLI run once per turn inside `tmux` and resume by session id. fx talks the Agent Client Protocol.
+- **Restart-safe by design.** On boot, Agetor reattaches to any `tmux`-hosted session that is still alive and replays its transcript without duplicates. Runs whose session is gone move back to **Ready**, so no card is left stuck in Running.
+- **Local persistence.** Tasks, runs, events, projects, harnesses and preferences live in a SQLite database with versioned migrations.
+
+The architecture, lifecycle and gotchas are documented in depth in [`CLAUDE.md`](./CLAUDE.md). Design notes for individual features are in [`docs/plans/`](./docs/plans).
+
+---
+
+## Configuration
+
+Most settings live in the app under **Settings**: General, Harnesses, Agents, Pipelines, Git Integration and Saved Prompts. All state is stored under `~/.agetor/`:
 
 ```
-src/
-├── bun/                       # main process: API, orchestration, persistence
-│   ├── index.ts               # entrypoint: menus, reconcile orphans, start server, open window
-│   ├── server.ts              # Bun.serve routes (HTTP + SSE)
-│   ├── orchestrator.ts        # task lifecycle, spawn/cancel/cleanup, event fanout
-│   ├── agents.ts              # buildCommand / spawnAgent — single source of truth per agent
-│   ├── claude-tmux.ts         # tmux session lifecycle + JSONL tailer
-│   ├── agent-status.ts        # availability + version probes per harness
-│   ├── agent-discovery.ts     # async model-list discovery
-│   ├── worktree.ts            # git worktree create/remove
-│   ├── interactions.ts        # approvals + questions registry (in-memory)
-│   ├── hook-installer.ts      # writes PreToolUse hook + MCP launcher per task
-│   ├── hooks/                 # bundled hook script + system prompt
-│   ├── mcp/agetor-mcp.ts      # stdio MCP server exposing `ask_user`
-│   ├── commands.ts            # slash-command catalogue per agent
-│   ├── db.ts                  # bun:sqlite + bindings
-│   ├── migrate.ts             # numbered SQL migration runner
-│   └── migrations/            # 001_init.sql … 013_harnesses.sql
-├── mainview/                  # React webview (kanban, run panel, settings)
-│   ├── App.tsx
-│   ├── components/
-│   │   ├── kanban/            # board, columns, cards, run panel, pickers
-│   │   ├── settings/
-│   │   └── ui/                # shadcn-style primitives (hand-rolled)
-│   └── lib/api.ts             # typed wrapper around the Bun HTTP API
-└── shared/                    # types both processes import (no runtime side effects)
-    └── types.ts               # Task, Run, Harness, AGENT_OPTIONS, etc.
+~/.agetor/
+├── agetor.sqlite            # tasks, runs, events, projects, harnesses, agents, preferences
+├── agetor-core.json         # 0600: the running core's port + token (how the CLI connects)
+├── github-tokens.json       # 0600: git host tokens from Settings → Git Integration
+├── worktrees/<task-id>/     # per-task git worktrees
+├── harnesses/<id>/          # isolated $HOME for additional-account harnesses
+├── attachments/             # files and images attached to prompts
+├── issue-threads/           # issue snapshots for tasks started from an issue
+├── pipeline-runs/           # handoffs recorded by each pipeline run
+├── {codex,cursor,gemini,fx}-logs/   # per-run structured agent output
+└── daemon.log               # headless CLI daemon log
 ```
+
+<details>
+<summary><strong>Environment variables</strong></summary>
+
+<br />
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `AGETOR_DATA_DIR` | Where the database, worktrees and logs live. | `~/.agetor` |
+| `AGETOR_API_PORT` | Port for the local API. | `4317` |
+| `AGETOR_CLAUDE_BIN` / `AGETOR_CLAUDE_ARGS` | Override the `claude` binary / append extra args. | `claude` on `PATH` |
+| `AGETOR_CODEX_BIN` / `AGETOR_CODEX_ARGS` | Same, for Codex. | `codex` on `PATH` |
+| `AGETOR_CURSOR_BIN` / `AGETOR_CURSOR_ARGS` | Same, for Cursor. | `cursor-agent` on `PATH` |
+| `AGETOR_GEMINI_BIN` / `AGETOR_GEMINI_ARGS` | Same, for Gemini CLI. | `gemini` on `PATH` |
+| `AGETOR_FX_BIN` / `AGETOR_FX_ARGS` | Same, for fx. | `fx` on `PATH` |
+| `AGETOR_TMUX_BIN` | Override the `tmux` binary. | `tmux` on `PATH` |
+| `AGETOR_SKIP_CLI_VERSION_FLOOR` | Set to `1` to skip the per-model minimum CLI version check. | unset |
+| `AGETOR_DAEMON_IDLE_MS` | Shut the CLI daemon down after this long with no run and no client (`0` disables). | `300000` |
+
+The bin, home and env overrides you set per harness in Settings take precedence over these variables. The CLI honors `AGETOR_DATA_DIR` and `AGETOR_API_PORT` too, and so do its `--data-dir` and `--port` flags. Test-only switches (fake drivers, API stubs) are documented in [`CLAUDE.md`](./CLAUDE.md).
+
+</details>
 
 ---
 
 ## Security model
 
-- The API binds to `127.0.0.1` only and is gated on a per-launch random token. Even if `Access-Control-Allow-Origin` were misconfigured, a foreign origin can't read the token.
-- The token is delivered to the webview via a `WKUserScript` preload (not a query string or hash, so it never appears in the URL bar or logs).
-- Agents run **with your full shell privileges** in whatever `workdir` the task names. Agetor does not sandbox them. Treat it like running the agent CLI directly — because that's exactly what it's doing.
-- Approval rules are scoped to a single task, never globally. Each new task starts fresh.
+- **Agents run with your privileges.** Each harness runs with your full user privileges in the task's directory, exactly as it would if you launched it yourself. Agetor adds no sandbox beyond what the CLI provides. The default modes are hands-off; pick an *Ask* or *Read-only* mode for tasks where you want approvals.
+- **Only local, authenticated access.** The API binds to `127.0.0.1` and requires a random token generated at each launch. A website you visit can't read the token, so it can't drive an agent run.
+- **Untrusted text is labeled.** Issue and PR text pulled into a prompt is marked as untrusted, and the agent is told not to follow instructions found inside it.
+- **Minimal network use.** The only network calls Agetor itself makes are update checks against GitHub Releases, the git host APIs you configure, and quota lookups against your harnesses' own providers.
 
-If you find a security issue, please disclose it privately to `alamo@alamoweb.com.br` rather than filing a public issue.
+Found a vulnerability? Please report it privately to **alamo@alamoweb.com.br** instead of opening a public issue.
 
 ---
 
 ## Contributing
 
-Issues and pull requests are welcome — including AI-assisted and fully vibecoded ones. If Claude, Codex, Cursor, or any other agent wrote most of the diff, that's fine. Just hold it to the same bar as a hand-written PR: tests green, types clean, and a description that makes the *why* obvious. (Agetor itself is built to make this kind of contribution easier — eat your own dog food.)
+Issues and pull requests are welcome, including AI-assisted and fully vibecoded ones. Agetor itself is built almost entirely by Claude Code running inside Agetor. Hold your PR to the same bar as a hand-written one: tests green, types clean, and a description that makes the *why* obvious.
 
-A few conventions worth knowing before opening a PR:
+### Development setup
 
-- **`bun run typecheck` must be green.** TypeScript is strict (`noUncheckedIndexedAccess` is on).
-- **Tests are required for behavioural changes.** The orchestrator and Claude-tmux modules have particularly thorough coverage; mirror that style. Tests must set `AGETOR_DATA_DIR` at the top of the file (not in `beforeAll`) to avoid the production-db-pollution trap documented in `src/bun/db.ts`.
-- **Never edit an already-applied migration.** Add a new numbered `.sql` file and append it to `src/bun/migrations/index.ts`. The migration runner only tracks ids, so silent edits will diverge from existing user databases.
-- **Shared types are runtime-free.** `src/shared/types.ts` is imported by both processes — no Node, Bun, React, or DOM imports there.
-- **Agent options live in `AGENT_OPTIONS`.** To add a model or mode, extend the curated list and teach `buildCommand` how to translate it. Unknown ids are passed through verbatim so users can paste a fresh release before Agetor knows about it.
+You'll need [Bun](https://bun.sh) ≥ 1.3.5, Git, `tmux`, and at least one harness CLI.
 
-Adding a new agent kind:
+```bash
+git clone https://github.com/alamops/agetor.git
+cd agetor
+bun install
+bun run dev:hmr        # Vite (HMR) + Electrobun, using ~/.agetor-dev on port 4318
+```
 
-1. Extend the `AgentKind` union in `src/shared/types.ts`.
-2. Add an entry to `AGENT_OPTIONS` with models / modes / effort.
-3. Add a branch in `buildCommand` (`src/bun/agents.ts`) and `spawnAgent`.
-4. Surface availability hints in `agent-status.ts`.
-5. The orchestrator and UI pick it up automatically.
+The dev scripts use their own data directory (`~/.agetor-dev`), so work in progress can't touch the state of your installed app. `bun run wipe:dev` resets it. Changes to the webview hot-reload; changes under `src/bun/` require a restart.
 
-The architecture and the gotchas worth knowing are documented in [`CLAUDE.md`](./CLAUDE.md). Reading that file before your first PR is the highest-leverage thing you can do.
+```bash
+bun run typecheck                               # tsc --noEmit — must be green
+bun test                                        # unit and integration tests (Bun test runner)
+bun test src/bun/orchestrator.test.ts           # a single file
+bun node_modules/@playwright/test/cli.js test   # end-to-end tests (Playwright)
+bun run build:cli                               # standalone CLI binary → artifacts/
+```
+
+`bun run build` produces the signed, notarized `.app` and requires a Developer ID identity, so only maintainers need it.
+
+### Conventions
+
+- **Read [`CLAUDE.md`](./CLAUDE.md) first.** It covers the architecture, every subsystem and the known traps. Reading it is the single most useful thing you can do before your first PR.
+- **Tests for behavior changes.** Test files set `AGETOR_DATA_DIR` to a temp directory at the **top** of the file, not in `beforeAll`, so they never touch a real database. Use a temp git repo, or `isolation: "none"`, so tests never create real branches.
+- **Never edit an applied migration.** Add a new numbered file to `src/bun/migrations/` and append it to `index.ts`.
+- **Keep `src/shared/` free of runtime imports.** Both processes import it.
+- **Use semantic theme tokens in the UI.** Write `text-success`, `bg-warning/10` and so on, never literal palette classes. The UI has to work in both light and dark themes.
+
+### Adding a harness
+
+1. Extend the `AgentKind` union and add an entry to `AGENT_OPTIONS` in `src/shared/types.ts`.
+2. Teach `buildCommand` and `spawnAgent` in `src/bun/agents.ts` how to launch it, and add a driver if it needs one (see `codex-tmux.ts` or `fx-acp.ts`).
+3. Add availability and install hints in `src/bun/agent-status.ts`.
+
+The orchestrator, UI and CLI pick up the new kind automatically.
 
 ---
 
 ## Roadmap
 
-This is an early-stage project. Things on the near-term list:
+- Linux and Windows builds. The targets are configured in `electrobun.config.ts` but not yet built or tested.
+- Graduating Codex, Cursor, Gemini CLI and fx from experimental to stable.
+- More harnesses as new agent CLIs mature.
 
-- An uninstall flow that strips the `PreToolUse` hook and MCP-server entries from `.claude/settings.local.json` across every repo Agetor touched.
-- First-class Linux and Windows builds (currently configured but untested).
-- More agent kinds: Aider, Gemini CLI. (Cursor landed — experimental, disabled by default; enable it in Settings.)
-- Optional Slack / native push notifications on terminal state, not just toasts.
-
----
-
-## License
-
-[MIT](./LICENSE) © 2026 Alamo Saravali
+Have an idea? [Open an issue](https://github.com/alamops/agetor/issues).
 
 ---
 
 ## Acknowledgements
 
-- [Electrobun](https://github.com/blackboardsh/electrobun) — the native-webview-on-Bun runtime this app is built on.
-- [Claude Code](https://github.com/anthropics/claude-code) and [OpenAI Codex CLI](https://github.com/openai/codex) — the agents Agetor was built to orchestrate.
-- [dnd-kit](https://dndkit.com/), [shadcn/ui](https://ui.shadcn.com/), [Tailwind CSS](https://tailwindcss.com/), [Lucide](https://lucide.dev/), [Sonner](https://sonner.emilkowal.ski/) — the front-end stack.
+- [Electrobun](https://github.com/blackboardsh/electrobun) and [Bun](https://bun.sh): the runtime Agetor is built on.
+- [Claude Code](https://github.com/anthropics/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor CLI](https://cursor.com/cli), [Gemini CLI](https://github.com/google-gemini/gemini-cli) and [fx](https://fx.sh): the agents Agetor orchestrates.
+- [tmux](https://github.com/tmux/tmux): what keeps agent sessions alive across restarts.
+- [React](https://react.dev), [React Flow](https://reactflow.dev), [dagre](https://github.com/dagrejs/dagre), [Motion](https://motion.dev), [dnd-kit](https://dndkit.com), [shadcn/ui](https://ui.shadcn.com), [Tailwind CSS](https://tailwindcss.com), [Lucide](https://lucide.dev), [Sonner](https://sonner.emilkowal.ski), [xterm.js](https://xtermjs.org), [Ink](https://github.com/vadimdemedes/ink) and [Clack](https://github.com/bombshell-dev/clack): the UI and TUI stack.
+
+## License
+
+[MIT](./LICENSE) © 2026 Alamo Saravali
