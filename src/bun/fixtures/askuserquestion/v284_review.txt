@@ -1,0 +1,24 @@
+  signature" and "Hold at the restaurant counter for pickup, I will collect it
+  myself later this evening".
+
+────────────────────────────────────────────────────────────────────────────────
+←  ☒ Toppings  ☒ Size  ☒ Delivery  ✔ Submit  →
+
+Review your answers
+
+ │ ● Which toppings do you want on your pizza? Pick as many as you like, keeping
+ │   in mind that each additional topping adds a small charge to the final
+ │   price of the order.
+   → Cheese, Mushrooms
+ ● What size pizza do you want?
+   → Medium
+ ● How should we deliver the order?
+   → Deliver to my home address by courier, leaving it at the front door without
+   signature
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel
+
+

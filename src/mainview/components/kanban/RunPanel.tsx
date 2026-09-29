@@ -7512,28 +7512,62 @@ function AskQuestionsCard({
           custom: a.custom.trim() || undefined,
         })),
       });
-      // The server drops the card regardless of outcome (see its own doc):
-      // the Escape it sent before attempting delivery already dismissed
-      // THIS modal, so keeping the card up wouldn't let the user retry
-      // answering it. A withheld-and-saved outcome (some OTHER blocking
-      // modal came up while delivering the follow-up turn) is purely
-      // informational — surface it exactly like the composer's own withheld
-      // branch (toast + backlog refresh) before dropping the card.
+      // The server resolves the card regardless of outcome (see its own
+      // doc), so keeping it up wouldn't let the user retry: on the drive
+      // path no Escape is sent, and a modal that is still open is simply
+      // re-collected by the pane scraper as a fresh card. A withheld-and-saved
+      // outcome (some OTHER blocking modal came up while delivering the
+      // follow-up turn) is purely informational — surface it exactly like the
+      // composer's own withheld branch (toast + backlog refresh); any other
+      // failed delivery gets its own toast so the vanished card isn't silent.
       if (res.withheld && res.savedToBacklog) {
         onWithheld?.(res.reason ?? "claude is waiting on a prompt — your answer was saved to the backlog tray");
+      } else if (!res.ok) {
+        // The server's own `reason` is the most specific explanation; the
+        // copy below is the fallback when it sent none. `delivery` says what
+        // was attempted: absent means NOTHING was (the card was already
+        // resolved), so that is neutral feedback, not an error — and no
+        // fresh card is coming. The fresh-card copy is reserved for a failed
+        // drive, which can leave the modal open for the scraper to
+        // re-collect.
+        const reason = res.reason?.trim();
+        if (res.delivery === undefined) {
+          toast(reason || "This question was already resolved");
+        } else {
+          toast.error(
+            reason
+              || (res.delivery === "message"
+                ? "Answer didn't reach Claude — answer it in the terminal or resend from the composer"
+                : "Answer didn't reach Claude — a fresh card will appear; answer it there or in the terminal"),
+          );
+        }
       }
       onResolved(req.id);
+    } catch (e) {
+      // 409: another request (a double submit, the CLI, the TUI) holds the
+      // route's in-flight claim and is answering this card right now. Nothing
+      // was sent on our behalf, so this is neutral feedback, and the card
+      // goes away — the request that owns it resolves it on the server.
+      if (e instanceof ApiError && e.status === 409) {
+        toast(e.message || "This question is already being answered");
+        onResolved(req.id);
+        return;
+      }
+      throw e;
     } finally {
       setSubmitting(false);
     }
   };
 
   /** One-line summary of the user's answer to question `qi` (picked labels +
-   *  any custom text), for the review screen. Mirrors the native "→ a, b". */
+   *  any custom text), for the review screen. Mirrors the native "→ a, b".
+   *  A single-select question's custom text REPLACES the pick (the drive and
+   *  the follow-up message both send custom only); multi-select adds it. */
   const answerSummary = (qi: number): string => {
     const a = answers[qi] ?? { selected: [], custom: "" };
-    const pieces = [...a.selected];
-    if (a.custom.trim()) pieces.push(a.custom.trim());
+    const custom = a.custom.trim();
+    const pieces = !req.questions[qi]?.multiSelect && custom ? [] : [...a.selected];
+    if (custom) pieces.push(custom);
     return pieces.length ? pieces.join(", ") : "(no answer)";
   };
 
@@ -7556,7 +7590,7 @@ function AskQuestionsCard({
           <div className="space-y-2">
             {req.questions.map((q, qi) => (
               <div key={qi} className="rounded-md border border-border/40 bg-muted/20 p-2">
-                <div className="text-[12px] font-medium">{q.question}</div>
+                <div className="whitespace-pre-wrap text-[12px] font-medium">{q.question}</div>
                 <div className="mt-0.5 text-[12px] text-primary">→ {answerSummary(qi)}</div>
               </div>
             ))}
@@ -7575,7 +7609,7 @@ function AskQuestionsCard({
           <div className="space-y-3">
             {req.questions.map((q, qi) => (
               <div key={qi} className="rounded-md border border-border/40 bg-muted/20 p-2">
-                <div className="mb-1.5 text-[13px] font-medium">{q.question}</div>
+                <div className="mb-1.5 whitespace-pre-wrap text-[13px] font-medium">{q.question}</div>
                 <div className="space-y-1">
                   {q.options.map((opt) => {
                     const picked = answers[qi]?.selected.includes(opt.label) ?? false;
@@ -7610,7 +7644,7 @@ function AskQuestionsCard({
                 <Textarea
                   value={answers[qi]?.custom ?? ""}
                   onChange={(e) => setCustom(qi, e.target.value)}
-                  placeholder="Custom answer (optional)"
+                  placeholder={q.multiSelect ? "Custom answer — added to the selection" : "Custom answer — replaces the selection"}
                   rows={2}
                   className="mt-2 text-[12px]"
                 />

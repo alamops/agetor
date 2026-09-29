@@ -45,10 +45,20 @@ export type InteractionKind =
  * AskUserQuestion's tool body is "block until the human answers in the TUI".
  * Since agetor drives claude detached in tmux, that native Ink modal is
  * invisible to the user. The scraper in `claude-tmux.ts` detects it on the
- * pane, pairs it with the structured `questions` it saw in the JSONL tool_use,
- * and surfaces it as a structured card. The answer is driven back as keystrokes
- * (`planAskAnswers` + `driveAskAnswers`, or `sendModalKeys(["Escape"])` for the
- * message-mode fallback); there is no blocking hook curl.
+ * pane and parses the structured `questions` out of it (claude does not write
+ * the tool_use to the JSONL while the modal is open, so the pane is the only
+ * live source), then surfaces it as a structured card. The answer is driven
+ * back as keystrokes (`planAskAnswers` + `driveAskAnswers`) — a typed custom
+ * answer goes into the modal's native `Type something` row via `send-keys -l`.
+ * Only what can't be driven takes the message-mode fallback: custom text that
+ * is multiline, over-long or carries control characters (`unsafe-custom`),
+ * custom text for a question with no `Type something` row (`no-type-row`), an
+ * empty answer, an unknown option or an arity mismatch (all decided by
+ * `planAskAnswers`), and a drive whose typed step could not be delivered or
+ * verified (`driveAskAnswers` returning `"typed-abort"`). That fallback
+ * dismisses the modal (`dismissAskModalForMessage`: Escape, verify it left the
+ * pane, clear a leftover composer draft) and sends a follow-up turn. There is
+ * no blocking hook curl.
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** One question inside an AskUserQuestion tool call (claude code shape). */
@@ -57,11 +67,16 @@ export interface AskQuestion {
   header?: string;
   multiSelect?: boolean;
   /** `preview` is the multi-line code/text block claude attaches to an option
-   *  (rendered as a side box in the TUI). Two sources populate it: the JSONL
-   *  tool_use (available only after the modal is answered), and the live pane
-   *  scrape, which grows the pane and walks each option to read its panel
+   *  (rendered as a side box in the TUI). Two sources can populate it: the JSONL
+   *  tool_use (available only after the modal is answered, so in practice not
+   *  while the card is live), and the live pane scrape, which grows the pane and walks each option to read its panel
    *  (see `collectAskQuestionsFromPane`). */
   options: Array<{ label: string; description?: string; preview?: string }>;
+  /** Live-pane scrapes only: whether the modal has an inline "Type something"
+   *  row for a typed custom answer. `false` for the preview layout (bare
+   *  `Chat about this`), where typed characters would act as hotkeys; absent
+   *  means unknown / the normal layout. */
+  hasTypeRow?: boolean;
 }
 
 export interface AskQuestionsRequest {
@@ -356,8 +371,9 @@ function pipelineParentFor(taskId: string): { pipelineParentId?: string } {
  * AskUserQuestion — scraper-sourced.
  *
  * Claude renders its native Ink modal in the tmux pane. The scraper detects
- * it, pairs it with the structured `questions` it already saw in the JSONL
- * tool_use, and registers it here. There is no blocking curl to resolve — the
+ * it, parses the structured `questions` from the pane (the JSONL tool_use only
+ * lands once the modal is answered, so it is never available while the card is
+ * live), and registers it here. There is no blocking curl to resolve — the
  * answer route plans a keystroke sequence and drives it back into the pane,
  * then calls `resolveScrapedAskQuestions` to drop the card. The registry
  * entry's `resolve` is therefore a no-op.

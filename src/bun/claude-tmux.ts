@@ -26,7 +26,7 @@ import {
 } from "./interactions.ts";
 import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
-import { detectAskModal, parseModalPane, type AskModalKind, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
+import { detectAskModal, isLossyAskPane, parseModalPane, type AskModalKind, type DriveStep, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
 /**
  * Driver that hosts Claude Code's interactive REPL inside a per-task tmux
@@ -2124,6 +2124,82 @@ export async function sendModalKeys(taskId: string, keys: NavKey[]): Promise<boo
   return ok;
 }
 
+/** Poll budget for {@link dismissAskModalForMessage}: after each `Escape`, the
+ *  pane is polled this many times, this far apart, for the modal to leave. */
+const ASK_DISMISS_POLLS = 6;
+const ASK_DISMISS_POLL_MS = 100;
+/** Total `Escape`s {@link dismissAskModalForMessage} may send: the first, plus
+ *  ONE more when the modal is still up after a full poll window (a swallowed
+ *  key, or a first Escape that only cleared a half-typed Type row). */
+const ASK_DISMISS_MAX_ESCAPES = 2;
+/** Re-verification polls after {@link COMPOSER_CLEAR_KEYS} (each preceded by a
+ *  {@link ASK_DISMISS_POLL_MS} gap, on top of the {@link COMPOSER_CLEAR_SETTLE_MS} settle). */
+const ASK_DISMISS_COMPOSER_POLLS = 3;
+
+/**
+ * Dismiss a live AskUserQuestion modal so a free-text follow-up MESSAGE can be
+ * pasted safely (the answer route's message-mode fallback and its
+ * `"typed-abort"` recovery). Replaces a blind `Escape` + fixed sleep, which
+ * could paste into a modal that had not closed yet and left a typed draft
+ * sitting in claude's composer (recorded capture `v284_typed_single.txt`: a
+ * declined modal leaves `❯ purple` in the input box).
+ *
+ * Under the task's `queueTmuxOp` chain: send `Escape`, poll the pane until
+ * `detectAskModal` reports no modal; if it is still up after the first window
+ * send ONE more `Escape` and poll again (bounded to
+ * {@link ASK_DISMISS_MAX_ESCAPES}). Once the modal is gone, when the composer
+ * holds text (`paneShowsComposerText`) send {@link COMPOSER_CLEAR_KEYS} exactly
+ * as the paste path does — ONLY when text is visible, because a double Escape
+ * on an empty composer opens claude's rewind picker — and re-verify the
+ * composer is clear (bounded). A working pane never reads as "composer text",
+ * so a still-running turn is left alone (no safe mid-turn clear exists).
+ *
+ * Returns true only when the modal is gone AND the composer is clean; false on
+ * a tmux failure, a superseded session, a modal that never left, or a composer
+ * that would not clear.
+ */
+export async function dismissAskModalForMessage(taskId: string): Promise<boolean> {
+  const state = sessions.get(taskId);
+  if (!state) return false;
+  let ok = false;
+  await queueTmuxOp(taskId, async (stillCurrent) => {
+    // Strict capture: a failed `capture-pane` must read as "unknown", never as
+    // an empty pane in which no modal could be detected.
+    const capture = async (): Promise<string | null> => {
+      const cap = await tmux(["capture-pane", "-p", "-t", state.sessionName]);
+      if (!cap.ok) return null;
+      const lines = cap.stdout.split("\n");
+      return lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n");
+    };
+    let gone = false;
+    for (let esc = 0; esc < ASK_DISMISS_MAX_ESCAPES && !gone; esc++) {
+      bumpKeystroke(state);
+      if (!(await tmux(["send-keys", "-t", state.sessionName, "Escape"])).ok) return;
+      for (let poll = 0; poll < ASK_DISMISS_POLLS && !gone; poll++) {
+        await Bun.sleep(ASK_DISMISS_POLL_MS);
+        if (!stillCurrent()) return;
+        const tail = await capture();
+        gone = tail !== null && detectAskModal(tail) === null;
+      }
+    }
+    if (!gone) return;
+
+    let tail = await capture();
+    if (tail === null) return;
+    if (!paneShowsComposerText(tail)) { ok = true; return; }
+    bumpKeystroke(state);
+    if (!(await tmux(["send-keys", "-t", state.sessionName, ...COMPOSER_CLEAR_KEYS])).ok) return;
+    await Bun.sleep(COMPOSER_CLEAR_SETTLE_MS);
+    for (let poll = 0; poll < ASK_DISMISS_COMPOSER_POLLS; poll++) {
+      if (!stillCurrent()) return;
+      tail = await capture();
+      if (tail !== null && detectAskModal(tail) === null && !paneShowsComposerText(tail)) { ok = true; return; }
+      await Bun.sleep(ASK_DISMISS_POLL_MS);
+    }
+  }, state);
+  return ok;
+}
+
 /**
  * Gap between the review-screen tab transition and the first poll for the
  * "Ready to submit your answers?" screen to render. This is Ink's heaviest
@@ -2207,6 +2283,82 @@ function decideAskDriveStep(
   return "wait";
 }
 
+/** Poll budget for the typed-answer echo check in `driveAskAnswers`. */
+const ASK_TYPED_ECHO_POLL_MS = 120;
+const ASK_TYPED_ECHO_POLL_ATTEMPTS = 6;
+/** Poll budget for the typed-step pre-check (the focused row must be an EMPTY
+ *  Type row) — the preceding `Down`s may still be repainting when it first runs. */
+const ASK_TYPED_GUARD_POLL_MS = 80;
+const ASK_TYPED_GUARD_POLL_ATTEMPTS = 5;
+/** How many leading characters of a typed answer the echo check matches — the
+ *  row soft-wraps at a 5-space indent, so only the head is reliably on ONE row. */
+const ASK_TYPED_ECHO_PREFIX_CHARS = 40;
+
+/** The focused row is an EMPTY native `Type something` row: `❯ N. Type something.`
+ *  (single-select) or `❯ N. [ ] Type something.` (multi-select, still unchecked).
+ *  A row already holding text, a cursor on another row, or a preview-layout
+ *  question (no Type row at all) all fail — typing there would act as hotkeys
+ *  (`n` opens notes) or append to a half-typed answer. */
+const EMPTY_TYPE_ROW_RE = /^\s*[❯›]\s*\d+\.\s*(?:\[[ ]\]\s*)?Type something\.?\s*$/m;
+
+/** Pure: whether the pane's focused row is an empty Type row (see {@link EMPTY_TYPE_ROW_RE}). */
+function paneFocusedRowIsEmptyType(pane: string): boolean {
+  return EMPTY_TYPE_ROW_RE.test(pane);
+}
+
+/** A continuation row of a soft-wrapped option: ≥ 5 leading spaces, and not an
+ *  option row, a `Next` / `Submit` row, a rule, or blank. */
+function isTypedRowContinuation(line: string): boolean {
+  if (!/^ {5,}\S/.test(line)) return false;
+  if (/^\s*(?:[❯›↑↓]\s*)?\d+\.\s/.test(line)) return false;
+  const t = line.trim();
+  if (/^(?:Next|Submit)\b/.test(t)) return false;
+  if (/^[─━-]{3,}$/.test(t)) return false;
+  return true;
+}
+
+/**
+ * Whether the pane shows a typed answer echoed on the focused option row:
+ * `❯ N. <text…>` (single-select) or `❯ N. [✔] <text…>` (multi-select, where
+ * typing auto-checks the row). The `❯` row is joined with its indented
+ * continuation rows (a long answer soft-wraps, and a CJK / long-word wrap can
+ * land inside the first 40 chars), whitespace is collapsed on both sides, and
+ * the first {@link ASK_TYPED_ECHO_PREFIX_CHARS} characters of the collapsed
+ * text must be a prefix of the joined row's label. Whitespace is then ignored
+ * entirely in the comparison: a wrap can insert a break where the text has none
+ * (CJK) or swallow the space at the break. Pure.
+ */
+function paneShowsTypedAnswer(pane: string, text: string): boolean {
+  const collapse = (s: string): string => s.replace(/\s+/g, " ").trim();
+  const prefix = collapse(text).slice(0, ASK_TYPED_ECHO_PREFIX_CHARS);
+  if (prefix === "") return false;
+  const want = prefix.replace(/\s+/g, "");
+  const rows = pane.split("\n");
+  for (let i = 0; i < rows.length; i++) {
+    // The untouched placeholder row must never count as an echo of `T` / `Type`
+    // / `Types`: its label is literally "Type something".
+    if (EMPTY_TYPE_ROW_RE.test(rows[i]!)) continue;
+    const m = rows[i]!.match(/[❯›]\s*\d+\.\s*(?:\[[ ✔xX]\]\s*)?(.*)$/);
+    if (!m) continue;
+    let joined = m[1]!;
+    for (let j = i + 1; j < rows.length && isTypedRowContinuation(rows[j]!); j++) joined += " " + rows[j]!.trim();
+    if (collapse(joined).replace(/\s+/g, "").startsWith(want)) return true;
+  }
+  return false;
+}
+
+/** tmux 3.6a treats a bare trailing `;` in an argv element as a command
+ *  separator even after `-l --` (the text is silently truncated). Its parser
+ *  also consumes ONE backslash from the run of backslashes directly before that
+ *  final `;` (verified on 3.6a with `send-keys -l --` into a `cat` pane:
+ *  N backslashes + `;` arrive as max(N - 1, 0) backslashes + `;`, and N = 0
+ *  truncates). So the text's own k trailing backslashes need exactly k + 1
+ *  before the `;` — i.e. append a single `\` ahead of it, which is also right
+ *  for k = 0. Escapes only the final `;`. Pure. */
+function escapeTypedTrailingSemicolon(text: string): string {
+  return text.endsWith(";") ? text.slice(0, -1) + "\\;" : text;
+}
+
 /**
  * Drive a `planAskAnswers` `mode: "drive"` plan into the task's tmux
  * session, verified-and-retried rather than trusting `send-keys` exit codes.
@@ -2217,11 +2369,29 @@ function decideAskDriveStep(
  * repainting the heaviest screen in the whole modal, and was intermittently
  * swallowed. `driveAskAnswers` instead:
  *
- *  1. Sends every key up to (but not including) a review-confirming trailing
+ *  1. Sends every step up to (but not including) a review-confirming trailing
  *     Enter exactly like `sendModalKeys` — same 35ms gap, same per-key
  *     `stillCurrent()` re-gate. (`plan.confirmsReview` is false for the
  *     singleFlat shape, which has no review screen and no confirm to gate —
- *     the full key list is sent here and phase 2 below just verifies.)
+ *     the full step list is sent here and phase 3 below just verifies.) A
+ *     `{type:"text"}` step (a typed custom answer for the native `Type
+ *     something` row) is GUARDED first: the pane is captured
+ *     (`ASK_TYPED_GUARD_POLL_*`) and the FOCUSED row must be an EMPTY Type row
+ *     (`paneFocusedRowIsEmptyType`) — a preview-layout question has no Type
+ *     row (typed characters would act as hotkeys, `n` opens notes), and a row
+ *     already holding text would be appended to. Otherwise nothing is typed.
+ *     The text is then sent as ONE `send-keys -l -- <text>` — a literal argv
+ *     element, no shell, and `--` so text starting with `-` is not read as a
+ *     flag (a trailing `;` is escaped as `\;`, since tmux would otherwise
+ *     swallow it) — and the pane is polled (`ASK_TYPED_ECHO_POLL_*`) until the
+ *     focused row echoes the text's first 40 chars (wrap-tolerant, see
+ *     `paneShowsTypedAnswer`). If the guard or the echo check fails, the drive
+ *     ABORTS without sending anything further, emits a status line and returns
+ *     `"typed-abort"`: an Enter on an empty Type row declines the whole modal,
+ *     and on a half-typed row submits garbage, so no further key is safe. The
+ *     modal may be dirty (typed text sitting in the row), so the CALLER must
+ *     run the message-mode fallback (Escape + follow-up message), not
+ *     re-collect it.
  *  2. When `confirmsReview`, polls the pane (`ASK_REVIEW_POLL_MS` /
  *     `ASK_REVIEW_POLL_ATTEMPTS`) until the review screen is actually
  *     rendered, then sends the confirm Enter. A mis-drive that never reaches
@@ -2237,25 +2407,67 @@ function decideAskDriveStep(
  * the confirm-wait and verify polls can't interleave with a racing user
  * paste either. `sendModalKeys` is unchanged and still used for the
  * `Escape` dismissal paths, which have no review screen to wait for.
+ *
+ * Returns `true` when the modal resolved, `false` for an ordinary failure (a
+ * key failed to send, the session was superseded, the confirm never landed),
+ * and `"typed-abort"` when a `{type:"text"}` step could not be delivered or
+ * verified — nothing was typed, or the typed text may be sitting in the row.
+ * The answer route runs the message-mode fallback for `"typed-abort"`.
  */
 export async function driveAskAnswers(
   taskId: string,
-  plan: { keys: NavKey[]; confirmsReview: boolean },
-): Promise<boolean> {
+  plan: { steps: DriveStep[]; confirmsReview: boolean },
+): Promise<boolean | "typed-abort"> {
   const state = sessions.get(taskId);
   if (!state) return false;
-  const { keys, confirmsReview } = plan;
-  if (keys.length === 0) return true;
-  // The trailing key IS the confirm Enter when confirmsReview — split it off
+  const { steps, confirmsReview } = plan;
+  if (steps.length === 0) return true;
+  let typedAbort = false;
+  const abortTyped = (why: string): void => {
+    typedAbort = true;
+    (state.turnQueue[0]?.onChunk ?? state.lastChunk)?.("status", why);
+  };
+  // The trailing step IS the confirm Enter when confirmsReview — split it off
   // so it can be gated on the review screen actually rendering (step 2)
   // instead of fired blind after the flat inter-key gap (step 1).
-  const body = confirmsReview ? keys.slice(0, -1) : keys;
+  const body = confirmsReview ? steps.slice(0, -1) : steps;
 
   let ok = false;
   await queueTmuxOp(taskId, async (stillCurrent) => {
-    for (const key of body) {
+    for (const step of body) {
       bumpKeystroke(state);
-      if (!(await tmux(["send-keys", "-t", state.sessionName, key])).ok) return;
+      if (typeof step === "string") {
+        if (!(await tmux(["send-keys", "-t", state.sessionName, step])).ok) return;
+      } else {
+        // Guard: the FOCUSED row must be an EMPTY Type row before any character
+        // is typed (see the doc comment). Polled briefly — the preceding Downs
+        // may still be repainting.
+        let onTypeRow = false;
+        for (let attempt = 0; attempt < ASK_TYPED_GUARD_POLL_ATTEMPTS && !onTypeRow; attempt++) {
+          if (attempt > 0) await Bun.sleep(ASK_TYPED_GUARD_POLL_MS);
+          if (!stillCurrent()) return;
+          onTypeRow = paneFocusedRowIsEmptyType(await captureTail(state));
+        }
+        if (!onTypeRow) {
+          abortTyped("typed answer not sent — the focused row is not an empty 'Type something' row");
+          return;
+        }
+        if (!(await tmux(["send-keys", "-t", state.sessionName, "-l", "--", escapeTypedTrailingSemicolon(step.text)])).ok) {
+          abortTyped("typed answer did not land in the modal — answer it in the terminal or retry");
+          return;
+        }
+        let landed = false;
+        for (let attempt = 0; attempt < ASK_TYPED_ECHO_POLL_ATTEMPTS && !landed; attempt++) {
+          await Bun.sleep(ASK_TYPED_ECHO_POLL_MS);
+          if (!stillCurrent()) return;
+          landed = paneShowsTypedAnswer(await captureTail(state), step.text);
+        }
+        if (!landed) {
+          // Send NOTHING further (no Enter): see the doc comment.
+          abortTyped("typed answer did not land in the modal — answer it in the terminal or retry");
+          return;
+        }
+      }
       // Inter-key gap mirrors sendModalKeys: a bursted pair can read as a
       // single Ink event, and the gap lets the dispose re-gate fire.
       await Bun.sleep(35);
@@ -2300,6 +2512,7 @@ export async function driveAskAnswers(
     }
     // Verify budget exhausted without ever seeing the modal close.
   }, state);
+  if (typedAbort) return "typed-abort";
   return ok;
 }
 
@@ -2490,12 +2703,11 @@ interface SessionState {
   /** `Date.now()` of the last pane capture taken while the session was
    *  JSONL-idle (no turn in flight, no recent append). A native modal —
    *  AskUserQuestion or a permission dialog — can appear before any (or any
-   *  RECENT) JSONL write lands: a permission dialog writes nothing to the
-   *  JSONL until answered, and even though claude DOES write the pending
-   *  AskUserQuestion tool_use pre-answer (see `readPendingAskQuestionsFromJsonl`),
-   *  it can flush lazily. So the idle path can't stop scraping entirely or it
-   *  would never see a question raised after the turn already resolved to
-   *  `review`. Instead it throttles to one capture every
+   *  RECENT) JSONL write lands: neither writes anything to the JSONL until it
+   *  is answered (the AskUserQuestion tool_use lands together with its
+   *  tool_result — verified on 2.1.168, 2.1.170 and 2.1.284). So the idle path
+   *  can't stop scraping entirely or it would never see a question raised
+   *  after the turn already resolved to `review`. Instead it throttles to one capture every
    *  `SCRAPE_IDLE_POLL_MS`, stamping the time here. 0 means "no idle capture
    *  taken yet". */
   lastIdleScrapeAt: number;
@@ -2511,29 +2723,25 @@ interface SessionState {
   /**
    * The structured AskUserQuestion card registered for this session's live
    * native modal, or null when none is up. Detection comes from the tmux pane
-   * (`detectAskModal`); CONTENT preferentially comes from the pending
-   * AskUserQuestion tool_use claude already wrote to the JSONL (see
-   * `readPendingAskQuestionsFromJsonl`), falling back to a pane scrape
-   * (`collectAskQuestionsFromPane`) for the window before that flushes. The
-   * card is resolved when the modal leaves the pane.
+   * (`detectAskModal`); CONTENT comes from a pane scrape
+   * (`collectAskQuestionsFromPane`) — claude writes the AskUserQuestion
+   * tool_use to the JSONL only when the modal is answered, so the pane is the
+   * only live source (`readPendingAskQuestionsFromJsonl` is a harmless first
+   * attempt that returns null for the modal's whole open lifetime). The card
+   * is resolved when the modal leaves the pane.
    */
   askCardId: string | null;
   /** True while the tab-walk collector is mid-flight reading a multi-question
    *  modal's tabs, so the scraper doesn't kick off a second collection. */
   askCollecting: boolean;
-  /** Wall-clock ms when the AskUserQuestion modal was first seen on the pane.
-   *  Gives claude a grace window to flush the tool_use (which carries the full
-   *  question incl. previews + long descriptions) before we degrade to the
-   *  lossy pane scrape. Null when no modal is open. */
-  askFirstSeenAt: number | null;
   /** Consecutive "grew the pane but the parse is still incomplete" failures
    *  for the CURRENT modal (see `collectAskQuestionsFromPane`). Once this
    *  hits `MAX_ASK_GROW_ATTEMPTS`, `collectAskQuestionsFromPane` gives up
    *  without resizing the pane again — otherwise a truncated modal that can
    *  never parse complete (some pane geometry / content combo we haven't
    *  seen) would resize the user's live tmux window forever, once per scrape
-   *  tick. Reset to 0 alongside `askFirstSeenAt` — the modal leaving the pane
-   *  (or a new one replacing it) earns a fresh budget. */
+   *  tick. Reset to 0 when the modal leaves the pane (or a new one replaces
+   *  it), which earns a fresh budget. */
   askGrowAttempts: number;
   /**
    * A turn-end (`stop_reason: "end_turn"`) that has been observed but not yet
@@ -2880,7 +3088,6 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     recentlyAnsweredFingerprints: new Map(),
     askCardId: null,
     askCollecting: false,
-    askFirstSeenAt: null,
     askGrowAttempts: 0,
     pendingEndTurn: null,
     holdUntilIdle: false,
@@ -3135,18 +3342,20 @@ async function captureTail(state: SessionState): Promise<string> {
  * Read the live native AskUserQuestion modal off the tmux pane and register a
  * structured card for it.
  *
- * The JSONL tool_use (read via `readPendingAskQuestionsFromJsonl`) is the
- * preferred source — claude DOES write the pending AskUserQuestion tool_use
- * to the session JSONL before the modal is answered, and it carries the full
- * question/options/previews the TUI may wrap or collapse on screen. But
- * claude can flush it lazily, so this pane-scrape path is the fallback for
- * while it's briefly absent from disk. For a single-question modal everything
- * is on screen; for a multi-question (tabbed) modal only the active tab's
- * options are visible, so we briefly walk the tabs (`→` per tab, capture+parse
- * each, then `←` back to the first) and register one card with every question.
- * A tall modal can also push the header/question/first option off the top of
- * the visible pane — `collectAndRegisterAskCard` guards against trusting that
- * kind of partial read (see `ParsedQuestionPane.complete`).
+ * The pane is the ONLY live source: claude writes the AskUserQuestion
+ * tool_use to the session JSONL only when the modal is answered (it lands in
+ * one batch together with the tool_result — verified on 2.1.168, 2.1.170 and
+ * 2.1.284, including after a 125 s idle). `readPendingAskQuestionsFromJsonl`
+ * is still tried first as a cheap, harmless attempt (it would carry the full
+ * previews if a future CLI ever flushed early), but for the modal's whole open
+ * lifetime it returns null and the pane scrape does the work. For a small,
+ * fully-visible single-question modal everything is on screen; for a
+ * multi-question (tabbed) modal only the active tab's options are visible, so
+ * we briefly walk the tabs (`→` per tab, capture+parse each, then `←` back to
+ * the first) and register one card with every question. A tall modal can also
+ * push the tab bar / header / question off the top of the visible pane —
+ * `collectAskQuestionsFromPane` guards against trusting that kind of partial
+ * read (see `ParsedQuestionPane.complete` and `isLossyAskPane`).
  *
  * Fire-and-forget from the scraper, guarded by `askCollecting` (so a 1s tick
  * can't start a second walk) and `askCardId` (so we never double-register). The
@@ -3177,15 +3386,18 @@ function mapJsonlAskInput(input: unknown): AskQuestion[] | null {
 
 /** Read the structured questions for the CURRENTLY-OPEN AskUserQuestion straight
  *  from the session JSONL: the last `AskUserQuestion` tool_use whose
- *  tool_use_id has no matching tool_result yet (still awaiting the user). When
- *  present this beats scraping the pane — it carries full descriptions and the
- *  multi-line `preview` blocks the TUI collapses to "✂ N lines hidden". Returns
- *  null when the tool_use isn't on disk yet (claude can flush it lazily), so the
- *  caller falls back to the pane parser. */
+ *  tool_use_id has no matching tool_result yet (still awaiting the user).
+ *  IMPORTANT: on every claude version verified (2.1.168, 2.1.170, 2.1.284) the
+ *  tool_use is written to the JSONL only when the user ANSWERS, in the same
+ *  batch as its tool_result — so for a live modal this returns null and the
+ *  pane is the only source. It is kept as a cheap first attempt (it would carry
+ *  full descriptions and the multi-line `preview` blocks the TUI collapses to
+ *  "✂ N lines hidden" if a future CLI flushed early). */
 /** Read the trailing `maxBytes` of a file as UTF-8 text, dropping the (partial)
  *  first line when we didn't start at byte 0. Returns null on any error. Lets us
  *  scan just the recent JSONL instead of loading a multi-MB session file into
- *  memory on every grace tick (a sync read that would otherwise block the loop). */
+ *  memory on every collection attempt (a sync read that would otherwise block
+ *  the loop). */
 function readFileTail(filePath: string, maxBytes: number): string | null {
   let fd: number | null = null;
   try {
@@ -3238,12 +3450,18 @@ function readPendingAskQuestionsFromJsonl(jsonlPath: string): AskQuestion[] | nu
  * the RIGHT of the option list — but only for the FOCUSED option, and the TUI
  * collapses anything taller than the available rows to "✂ N lines hidden". So to
  * surface real per-option previews live (the JSONL tool_use only lands on
- * answer), we (a) GROW the detached pane so the panel isn't truncated — verified
+ * answer — see `readPendingAskQuestionsFromJsonl`), we (a) GROW the detached pane so the panel isn't truncated — verified
  * de-truncating against real 2.1.170 captures — then (b) navigate each option,
  * scraping its panel. The user views the webview card, never the pane, so the
  * resize is invisible; it is always restored afterwards.
  * ────────────────────────────────────────────────────────────────────────── */
-const PREVIEW_PANE_MIN_COLS = 120; // wider never adds label wraps; widens the box for wide previews
+/** Width the collector grows the detached pane to (`max(orig.w, GROW_PANE_COLS)`).
+ *  200 (was 120) so option labels up to ~190 chars no longer WRAP: on 2.1.284 a
+ *  wrapped label's continuation lands at the same 5-col indent as a description
+ *  row, so at 80 cols the parser would split a long label into label + fake
+ *  description. Previews still fit — claude sizes the preview box from
+ *  `columns − 34`, so a wider pane only widens it. */
+const GROW_PANE_COLS = 200;
 const PREVIEW_PANE_ROWS = 100;     // covers ~any realistic preview; restored after
 const PREVIEW_REFLOW_MS = 450;     // let claude's Ink TUI redraw after a resize
 const OPTION_NAV_MS = 160;         // settle after each Up/Down before capturing
@@ -3391,13 +3609,17 @@ async function captureFullPane(state: SessionState): Promise<string> {
 
 /** Trim a full pane capture to just the current modal (header→footer), so a
  *  numbered list in the scrollback above can't be mis-read as options. The modal
- *  always sits at the bottom; the footer ("Esc to cancel") marks its end and the
- *  `☐`/`☒` header (or tab bar) marks its top. */
+ *  always sits at the bottom; the footer ("Esc to cancel", possibly wrapped as
+ *  `Esc to` / `cancel` across two rows) marks its end and the `☐`/`☒` header
+ *  (or tab bar) marks its top. */
 function sliceModalRegion(fullText: string): string {
   const lines = fullText.split("\n");
   let footer = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
     if (/Esc to cancel/.test(lines[i]!)) { footer = i; break; }
+    // A footer that wrapped at the pane edge: `… · Esc to` / `cancel`. The
+    // footer ends on the successor row.
+    if (/Esc to\s*$/.test(lines[i]!) && lines[i + 1]?.trim() === "cancel") { footer = i + 1; break; }
   }
   if (footer < 0) return fullText;
   let top = Math.max(0, footer - 80); // bounded fallback if no header is found
@@ -3412,12 +3634,16 @@ function sliceModalRegion(fullText: string): string {
  *  stop, then restoring the cursor to option 0. `base` is the already-parsed
  *  (grown) frame for this tab — its focused option's preview is already set.
  *  Assumes the cursor starts on option 0 (true at modal open and after a tab
- *  switch). The pane must already be grown by the caller. */
+ *  switch). The pane must already be grown by the caller. Returns `null` when
+ *  the cursor could NOT be verified back on option 0 after the restore (a
+ *  swallowed `Down` makes the exact-count `Up`s over-press, and `Up` from option
+ *  1 WRAPS to the Type row) — the caller treats that as a failed collection so
+ *  a modal left with an unknown cursor is never registered. */
 async function captureTabWithPreviews(
   io: PaneIo,
   stillCurrent: () => boolean,
   base: ParsedQuestionPane,
-): Promise<ParsedQuestionPane> {
+): Promise<ParsedQuestionPane | null> {
   const previews: Array<string | undefined> = base.options.map((o) => o.preview);
   let downs = 0;
   for (let j = 1; j < base.options.length; j++) {
@@ -3440,7 +3666,25 @@ async function captureTabWithPreviews(
     if (!stillCurrent()) break;
   }
   base.options.forEach((o, j) => { o.preview = previews[j]; });
-  return base;
+  if (!stillCurrent()) return null;
+  // Verify the restore: capture + parse, and if the cursor is not on option 0
+  // press extra `Up`s — bounded (2 × options: Up from option 1 wraps to the Type
+  // row, and a full lap plus a step always reaches option 0). An unparsable
+  // (mid-repaint) frame only waits; it never presses a key blind.
+  const maxUps = 2 * base.options.length;
+  let extraUps = 0;
+  for (let attempt = 0; attempt < maxUps + 3; attempt++) {
+    const p = parseModalPane(sliceModalRegion(await io.capture()));
+    if (p && p.cursorIndex === 0) return base;
+    if (p) {
+      if (extraUps >= maxUps) break;
+      if (!(await io.send("Up"))) break;
+      extraUps++;
+    }
+    await io.sleep(OPTION_NAV_MS);
+    if (!stillCurrent()) return null;
+  }
+  return null;
 }
 
 /** Cap on consecutive "grew the pane, still couldn't parse it complete"
@@ -3452,39 +3696,78 @@ async function captureTabWithPreviews(
  *  looping on something structurally unparseable. */
 const MAX_ASK_GROW_ATTEMPTS = 3;
 
-/** Pane fallback for when the JSONL tool_use isn't on disk yet: scrape the
- *  visible modal. A flat no-preview COMPLETE question registers immediately
- *  (fast path, no added latency) — `complete` (see `ParsedQuestionPane`) rules
- *  out the tall-modal truncation bug: a header/question/option-1 pushed off
- *  the top of a short pane must never register straight off `firstTail`.
- *  Otherwise — a tabbed modal, a flat one already showing a preview panel, or
- *  an incomplete flat capture — we grow the detached pane once (so previews
- *  aren't collapsed to "✂ N lines hidden" AND a truncated top has room to
- *  render in full) and walk it: every tab, and within each tab whose focused
- *  option has a preview, every option. A tabbed modal always grows because any
- *  of its questions may carry previews we can only detect by visiting the tab.
- *  The pane is detached (user sees the webview) and always restored.
- *  `io` is injectable so the orchestration is unit-testable without tmux. */
+/** Identity of a tab's body for the swallowed-`Right` check: the question text
+ *  plus every option label (NUL / SOH separators can't occur in pane text). */
+function tabBodyKey(p: ParsedQuestionPane): string {
+  return p.questionText + "\u0000" + p.options.map((o) => o.label).join("\u0001");
+}
+
+/** The pane collector — the ONLY live source of an AskUserQuestion's content
+ *  (the JSONL tool_use lands only when the modal is answered): scrape the
+ *  visible modal. A flat no-preview question registers immediately (fast path,
+ *  no added latency) but ONLY when the pane isn't lossy
+ *  (`isLossyAskPane`): `complete` (see `ParsedQuestionPane`, which requires the
+ *  `☐`/`☒` header or tab bar to be visible) rules out the tall-modal truncation
+ *  bug where a 4-question modal's tab bar scrolls off an 80x24 pane while
+ *  option 1 is still visible and it would register as ONE question, and the
+ *  rest of `isLossyAskPane` (collapse markers, windowed lists, labels/questions
+ *  near the right edge that may have wrapped) rules out a lossy read.
+ *  Otherwise — a tabbed modal, a flat one already showing a preview panel, or a
+ *  lossy capture — we grow the detached pane once (`GROW_PANE_COLS` × 100, so
+ *  previews aren't collapsed, labels don't wrap, and a truncated top has room
+ *  to render in full) and walk it. The tab count and headers are taken from the
+ *  first GROWN capture, never the short tail (whose tab bar may have scrolled
+ *  off, making a 4-question modal look flat). The walk visits every tab, and
+ *  within each tab whose focused option has a preview, every option. A tabbed modal always grows
+ *  because any of its questions may carry previews we can only detect by
+ *  visiting the tab. The pane is detached (user sees the webview) and always
+ *  restored. `io` is injectable so the orchestration is unit-testable without
+ *  tmux. */
 async function collectAskQuestionsFromPane(
   state: SessionState,
   firstTail: string,
   io: PaneIo = tmuxPaneIo(state),
 ): Promise<AskQuestion[] | null> {
-  const first = parseModalPane(firstTail);
-  if (!first) return null;
-  const headers = first.tabHeaders;
-  const n = first.tabbed ? Math.max(1, headers.length) : 1;
+  // Parse the MODAL REGION (header→footer), not the raw tail: a numbered list in
+  // scrollback above the modal must not defeat `complete`. A null parse is
+  // LOSSY, not fatal — it takes the grow path below (a grown capture may parse
+  // where the short tail didn't) and the latch counts it if that fails too.
+  const firstRegion = sliceModalRegion(firstTail);
+  const first = parseModalPane(firstRegion);
+  // `headers`/`n` start from the short pre-grow tail and are RE-DERIVED from the
+  // grown capture below: on an 80x24 pane a tall modal's tab bar can scroll off
+  // the top, so `first.tabbed` reads false for a 4-question modal. The fast path
+  // only fires for a non-lossy, complete flat tail, where `first` is trustworthy.
+  let headers = first?.tabHeaders ?? [];
+  let n = first?.tabbed ? Math.max(1, headers.length) : 1;
 
   const toAsk = (p: ParsedQuestionPane, header: string | undefined): AskQuestion => ({
     question: p.questionText,
     header,
     multiSelect: p.multiSelect,
     options: p.options.map((o) => ({ label: o.label, description: o.description, preview: o.preview })),
+    // Whether the live modal has a native `Type something` row — `false` for the
+    // preview layout, which routes a custom answer to message mode.
+    hasTypeRow: p.hasTypeRow,
   });
 
-  // Fast path: a single flat, COMPLETE question with no preview panel —
-  // nothing to walk, nothing missing from the top of the capture.
-  if (n === 1 && !paneHasPreviewPanel(firstTail) && first.complete) return [toAsk(first, headers[0])];
+  // Fast path: a single flat, COMPLETE question with no preview panel and a
+  // non-lossy pane — nothing to walk, nothing missing from the capture, no
+  // label/question that may have wrapped.
+  // The whole fast-path verdict (preview panel, complete, lossy) is read off the
+  // modal REGION: a scrollback numbered list above the modal must not make the
+  // raw tail look incomplete/lossy.
+  if (first && n === 1 && !paneHasPreviewPanel(firstRegion) && first.complete && !isLossyAskPane(firstRegion)) {
+    // Register only from a KNOWN state: option 1 focused. A cursor elsewhere
+    // (-1 = on the Type / Chat row, e.g. a dirty modal left by a failed typed
+    // drive) would make the planner's Down-counts land on the wrong option.
+    // Counts toward the give-up latch so the generic card takes over.
+    if (first.cursorIndex !== 0) {
+      if (state.askGrowAttempts < MAX_ASK_GROW_ATTEMPTS) state.askGrowAttempts += 1;
+      return null;
+    }
+    return [toAsk(first, headers[0] ?? first.flatHeader)];
+  }
 
   // Give-up latch: once we've grown the pane this many times for the CURRENT
   // modal and still can't get a complete parse, stop trying. Without this, a
@@ -3499,6 +3782,8 @@ async function collectAskQuestionsFromPane(
 
   let grew = false;
   let sizeUnavailable = false;
+  // Set once the modal is verified back on tab 0 / option 1 after the walk.
+  let firstTabVerified = false;
   const collected: Array<ParsedQuestionPane | null> = [];
   await queueTmuxOp(state.taskId, async (stillCurrent) => {
     const orig = await io.size();
@@ -3513,25 +3798,61 @@ async function collectAskQuestionsFromPane(
     if (orig) state.paneGrowInFlight = true;
     try {
       if (orig) {
-        await io.resize(Math.max(orig.w, PREVIEW_PANE_MIN_COLS), PREVIEW_PANE_ROWS);
+        await io.resize(Math.max(orig.w, GROW_PANE_COLS), PREVIEW_PANE_ROWS);
         await io.sleep(PREVIEW_REFLOW_MS);
         if (!stillCurrent()) return; // finally below restores + clears
       }
+      // Body keys of the tabs collected so far. The ACTIVE tab is marked only by
+      // ANSI colour, so plain `capture-pane -p` is byte-identical across tabs —
+      // the sole signal that a `Right` landed is that the tab's body changed.
+      // Two questions in one call can't be identical (claude keys answers by
+      // question text), so an unchanged body means the key was swallowed.
+      const seenKeys: string[] = [];
+      firstTabVerified = false;
+      // `Right` presses sent so far (resends included) — how far the return trip
+      // below must walk back, INCLUDING after an aborted walk, so a retry on the
+      // next scrape tick starts from tab 0 again instead of mid-modal.
+      let rights = 0;
       for (let t = 0; t < n; t++) {
-        if (t > 0) {
-          if (!(await io.send("Right"))) return; // entering a tab resets the cursor to option 0
+        let base: ParsedQuestionPane | null;
+        if (t === 0) {
+          base = parseModalPane(sliceModalRegion(await io.capture()));
+        } else {
+          // Entering a tab resets the cursor to option 0.
+          if (!(await io.send("Right"))) return;
+          rights++;
           await io.sleep(180);
           if (!stillCurrent()) return;
+          base = parseModalPane(sliceModalRegion(await io.capture()));
+          if (base && seenKeys.includes(tabBodyKey(base))) {
+            // Swallowed key: resend ONCE, then require a body we haven't seen.
+            if (!(await io.send("Right"))) return;
+            rights++;
+            await io.sleep(180);
+            if (!stillCurrent()) return;
+            base = parseModalPane(sliceModalRegion(await io.capture()));
+            if (base && seenKeys.includes(tabBodyKey(base))) { collected.push(null); break; }
+          }
         }
-        const base = parseModalPane(sliceModalRegion(await io.capture()));
-        if (!base) { collected.push(null); return; }
+        if (!base) { collected.push(null); break; }
+        // The first tab must START on option 1 (the walk and the answer plan both
+        // assume it). A cursor elsewhere — -1 = on the Type row — is a dirty
+        // modal; refuse rather than walk from a wrong position.
+        if (t === 0 && base.cursorIndex !== 0) { collected.push(null); break; }
+        seenKeys.push(tabBodyKey(base));
         if (t === 0 && orig) {
           // Guard the post-resize transient: a mid-reflow capture can drop an
           // option and mis-drive the answer. Require two consecutive captures to
           // agree on the option count before trusting this tab.
           await io.sleep(OPTION_NAV_MS);
           const recheck = parseModalPane(sliceModalRegion(await io.capture()));
-          if (!recheck || recheck.options.length !== base.options.length) { collected.push(null); return; }
+          if (!recheck || recheck.options.length !== base.options.length) { collected.push(null); break; }
+        }
+        if (t === 0) {
+          // The tab count comes from the GROWN, rechecked capture (which shows
+          // the whole modal incl. the tab bar), never the short tail.
+          headers = base.tabHeaders;
+          n = base.tabbed ? Math.max(1, headers.length) : 1;
         }
         // Walk options only when THIS tab's focused option actually has a panel
         // (keys on the parsed preview, not a loose pane regex). A tab whose
@@ -3539,13 +3860,45 @@ async function collectAskQuestionsFromPane(
         // closing it would mean navigating every no-preview question.
         const focused = base.options[base.cursorIndex];
         const tabHasPreview = !!focused && (focused.preview != null || focused.previewTruncated === true);
-        collected.push(tabHasPreview ? await captureTabWithPreviews(io, stillCurrent, base) : base);
+        const filled = tabHasPreview ? await captureTabWithPreviews(io, stillCurrent, base) : base;
+        collected.push(filled);
+        // Cursor could not be restored to option 1 — stop walking and fail.
+        if (!filled) break;
       }
       // Back to the first tab so the answer-driving sequence starts known.
-      for (let t = 1; t < n; t++) {
-        if (!(await io.send("Left"))) break;
+      // Right/Left CLAMP at the ends on 2.1.284 (no wrap), so an over-press
+      // (a `Right` resend that did land, or an extra `Left`) is harmless.
+      let returnAborted = false;
+      for (let k = 0; k < rights; k++) {
+        if (!(await io.send("Left"))) { returnAborted = true; break; }
         await io.sleep(90);
-        if (!stillCurrent()) break;
+        if (!stillCurrent()) { returnAborted = true; break; }
+      }
+      // Verify the return trip (a swallowed `Left` strands the modal on a later
+      // tab): the tab-0 body must be back, else press extra `Left`s — bounded by
+      // the tab count (`Left` clamps at tab 0) — re-checking after each. An
+      // unparsable frame only waits. Never registers from an unverified state.
+      const firstKey = seenKeys[0];
+      if (!returnAborted && firstKey !== undefined) {
+        let finalFirst: ParsedQuestionPane | null = null;
+        let extraLefts = 0;
+        for (let attempt = 0; attempt < n + 3; attempt++) {
+          const cap = await io.capture();
+          const p = parseModalPane(sliceModalRegion(cap));
+          if (p && tabBodyKey(p) === firstKey) { finalFirst = p; break; }
+          // A `Right` resend that overshot lands on the review tab, which
+          // `parseModalPane` can't read (p is null there) — it still needs a
+          // `Left` to come back, so treat it like any other wrong tab.
+          if (p || detectAskModal(cap) === "review") {
+            if (extraLefts >= n) break;
+            if (!(await io.send("Left"))) break;
+            extraLefts++;
+          }
+          await io.sleep(90);
+          if (!stillCurrent()) break;
+        }
+        // Register only from a known state: tab 0 focused on option 1.
+        firstTabVerified = finalFirst !== null && finalFirst.cursorIndex === 0;
       }
     } finally {
       if (orig) {
@@ -3572,7 +3925,7 @@ async function collectAskQuestionsFromPane(
   // produces that fallback: once `askGrowAttempts` crosses
   // `MAX_ASK_GROW_ATTEMPTS`, `scrapeOnce` stops suppressing the generic
   // matcher and an ordinary `tmux_prompt` card takes over.
-  if (collected.length !== n || collected.some((p) => p == null || !p.complete)) {
+  if (collected.length !== n || collected.some((p) => p == null || !p.complete) || !firstTabVerified) {
     // Count the failure when the pane actually got GROWN, and also when the
     // pane size was UNAVAILABLE (`io.size()` returned null) — a no-grow retry
     // at the same size can never improve the capture, so it must burn latch
@@ -3582,45 +3935,32 @@ async function collectAskQuestionsFromPane(
     if (grew || sizeUnavailable) state.askGrowAttempts += 1;
     return null;
   }
-  return collected.map((p, i) => toAsk(p!, headers[i]));
+  return collected.map((p, i) => toAsk(p!, headers[i] ?? p!.flatHeader));
 }
 
-/** Grace window during which we keep waiting for claude to flush its
- *  AskUserQuestion tool_use to the JSONL (full data incl. previews) before
- *  degrading to the lossy pane scrape. Only applied to a *lossy* pane (see
- *  `shouldWaitForAskJsonl`), so simple questions never incur it. */
-const ASK_JSONL_GRACE_MS = 2000;
+/** Post-collect recheck window: re-poll the pane this many times, this far apart,
+ *  before concluding the modal really left the pane. */
+const ASK_RECHECK_POLLS = 3;
+const ASK_RECHECK_GAP_MS = 150;
 
-/** True when the visible pane can't represent the question — it shows claude's
- *  "✂ N lines hidden" collapse markers, meaning an option's preview / long
- *  description is off-screen. */
-function paneCollapsesContent(paneTail: string): boolean {
-  return /✂|\blines hidden\b/.test(paneTail);
-}
-
-/** True when the pane parses but is missing its top (header/question/option 1
- *  scrolled off a short pane — see `ParsedQuestionPane.complete`). A pane that
- *  doesn't even parse as a question modal (e.g. it's mid-repaint, or — as in
- *  some unit tests — a bare snippet with no footer) is deliberately NOT
- *  treated as lossy here: `shouldWaitForAskJsonl` is only ever called once
- *  `detectAskModal` has already confirmed a question modal is on the pane, so
- *  a null parse in production would mean something else is wrong that a JSONL
- *  wait can't fix either — same behavior as before this check existed. */
-function paneTruncatesTop(paneTail: string): boolean {
-  const parsed = parseModalPane(paneTail);
-  return parsed !== null && !parsed.complete;
-}
-
-/** Decide whether to keep waiting for the JSONL tool_use rather than register
- *  from the pane: only when there's no JSONL yet, the pane is lossy (it either
- *  collapses content to "✂ N lines hidden", OR its top — header/question/
- *  option 1 — scrolled off the captured pane), and we're still inside the
- *  grace window. A simple, complete pane registers immediately, so we never
- *  stall a question the pane can already render in full. Pure, so the timing
- *  logic is unit-testable without tmux. */
-function shouldWaitForAskJsonl(hasJsonl: boolean, paneTail: string, firstSeenAt: number | null, now: number): boolean {
-  if (hasJsonl || firstSeenAt === null) return false;
-  return (paneCollapsesContent(paneTail) || paneTruncatesTop(paneTail)) && now - firstSeenAt < ASK_JSONL_GRACE_MS;
+/**
+ * Whether the ask modal is (still) on the pane: an immediate check, then up to
+ * {@link ASK_RECHECK_POLLS} re-checks {@link ASK_RECHECK_GAP_MS} apart, stopping
+ * at the first sighting. `superseded` (a card got registered meanwhile) ends the
+ * wait early. `check` / `sleep` are injected so the window is unit-testable.
+ */
+async function pollAskModalStillUp(
+  check: () => Promise<boolean>,
+  sleep: (ms: number) => Promise<unknown>,
+  superseded: () => boolean = () => false,
+): Promise<boolean> {
+  if (await check()) return true;
+  for (let i = 0; i < ASK_RECHECK_POLLS; i++) {
+    await sleep(ASK_RECHECK_GAP_MS);
+    if (superseded()) return true;
+    if (await check()) return true;
+  }
+  return false;
 }
 
 async function collectAndRegisterAskCard(state: SessionState, firstTail: string): Promise<void> {
@@ -3629,18 +3969,32 @@ async function collectAndRegisterAskCard(state: SessionState, firstTail: string)
   if (!runId) return;
   state.askCollecting = true;
   try {
-    // Prefer the JSONL tool_use — it carries the full question incl. multi-line
-    // previews and the long descriptions the pane collapses to "✂ N lines
-    // hidden". When the pane is lossy and the tool_use isn't on disk yet, stall
-    // within a short grace window (return → next scrape tick retries) rather
-    // than registering a degraded scrape. A simple pane, or the grace expiring,
-    // registers immediately so a never-flushed tool_use can't strand the card.
+    // Cheap first attempt: the JSONL tool_use. Claude writes it only when the
+    // modal is ANSWERED (together with its tool_result — verified on 2.1.168,
+    // 2.1.170 and 2.1.284), so for a live modal this is null and the pane is
+    // the only source; it stays as a harmless attempt in case a future CLI
+    // flushes early (it would carry the full previews). No grace wait: waiting
+    // for a tool_use that never arrives only delayed the card by ~2 s.
     const fromJsonl = readPendingAskQuestionsFromJsonl(state.jsonlPath);
-    if (shouldWaitForAskJsonl(fromJsonl !== null, firstTail, state.askFirstSeenAt, Date.now())) return;
     const questions = fromJsonl ?? await collectAskQuestionsFromPane(state, firstTail);
     if (!questions) return;
-    // The modal may have been answered out from under us mid-collect.
-    if (state.askCardId || detectAskModal(await captureTail(state)) === null) return;
+    // The modal may have been answered out from under us mid-collect. A single
+    // capture can land mid-repaint (no modal signature for one frame — and after
+    // the collector's resize/restore Ink can take a few frames to settle), so
+    // poll up to `ASK_RECHECK_POLLS` × `ASK_RECHECK_GAP_MS` before discarding a
+    // finished collection; a real discard counts toward the give-up latch like
+    // any other failure.
+    if (state.askCardId) return;
+    const stillUp = await pollAskModalStillUp(
+      async () => detectAskModal(await captureTail(state)) !== null,
+      Bun.sleep,
+      () => state.askCardId !== null,
+    );
+    if (state.askCardId) return;
+    if (!stillUp) {
+      state.askGrowAttempts += 1;
+      return;
+    }
     const card = registerScrapedAskQuestions({
       taskId: state.taskId,
       runId,
@@ -3649,8 +4003,9 @@ async function collectAndRegisterAskCard(state: SessionState, firstTail: string)
     });
     state.askCardId = card.id;
     // A generic `tmux_prompt` fallback card may already be live for this same
-    // modal — the give-up latch unsuppresses the generic matcher, and a
-    // late-flushing JSONL tool_use can still land afterwards (this path).
+    // modal — the give-up latch unsuppresses the generic matcher, and a later
+    // collection attempt (a re-collect after a failed drive, say) can still
+    // succeed afterwards (this path).
     // scrapeOnce's per-tick auto-cancel would reap it on the next tick anyway
     // (registering the ask card re-suppresses the matcher, so the prompt's
     // fingerprint stops matching), but resolving it here avoids showing two
@@ -5168,10 +5523,20 @@ const STARTUP_CONSENT_DIALOGS: Array<{ name: string; marker: RegExp; affirmative
   // permissions), so agetor's fresh per-task worktrees reliably trigger it —
   // and it blocks claude from ever writing its JSONL until answered (otherwise
   // the run dies at the 30s boot timeout with the dialog on the pane). Observed
-  // text (claude 2.1.x):
-  //   Quick safety check: Is this a project you created or one you trust? …
-  //   ❯ 1. Yes, I trust this folder
-  //     2. No, exit
+  // text comes in two shapes:
+  //   claude 2.1.x (numbered, cursor defaults to the affirmative):
+  //     Quick safety check: Is this a project you created or one you trust? …
+  //     ❯ 1. Yes, I trust this folder
+  //       2. No, exit
+  //   claude 2.1.284 (UNNUMBERED, cursor defaults to "No, exit"):
+  //     Quick safety check: Is this a project you created or one you trust? …
+  //     ❯ No, exit
+  //       Yes, I trust this folder
+  //     Enter to confirm · Esc to cancel
+  // On 2.1.284 the cursor starts on "No, exit", so a bare Enter would EXIT
+  // claude. `confirmStartupDialog` never sends a digit key: it arrows from
+  // `cursorIndex` to `acceptIndex` and then presses Enter, which is what makes
+  // the unnumbered shape safe to drive.
   // `affirmative` is anchored on "Yes …trust this folder", so it can only ever
   // land on the trust option — never a "No, …trust" variant (the original
   // safety concern). The marker also keeps the older "trust the files in this
@@ -5208,11 +5573,16 @@ export interface StartupDialogMatch {
 export function matchStartupConsentDialog(pane: string): StartupDialogMatch | null {
   const dialog = STARTUP_CONSENT_DIALOGS.find((d) => d.marker.test(pane));
   if (!dialog) return null;
-  // Reuse the numbered-modal parser so the choice list / cursor handling
-  // stays identical to the runtime scraper. It requires a cursor marker,
-  // which every one of these dialogs draws.
-  const modal = matchNumberedModal(pane);
-  if (!modal || modal.cursorIndex === undefined) return null;
+  // Reuse the numbered-modal parser first so the choice list / cursor handling
+  // stays identical to the runtime scraper for older CLIs. It requires a
+  // cursor marker, which every one of these dialogs draws. Claude 2.1.284
+  // dropped the `N.` prefixes, so fall back to the unnumbered parser.
+  const numbered = matchNumberedModal(pane);
+  const modal =
+    numbered && numbered.cursorIndex !== undefined
+      ? { choices: numbered.choices, cursorIndex: numbered.cursorIndex, fingerprint: numbered.fingerprint }
+      : parseUnnumberedConsentChoices(pane);
+  if (!modal) return null;
   const acceptIndex = modal.choices.findIndex((c) => dialog.affirmative.test(c.label));
   if (acceptIndex < 0) return null;
   return {
@@ -5225,6 +5595,54 @@ export function matchStartupConsentDialog(pane: string): StartupDialogMatch | nu
 }
 
 /**
+ * Pure: parse an UNNUMBERED choice list (claude 2.1.284's workspace-trust
+ * dialog) anchored on the dialog's `Enter to confirm` footer. Walks upward
+ * from the footer (skipping blank rows between it and the list), collecting
+ * contiguous choice rows — a `❯`/`›` cursor row or a row indented 2+ spaces —
+ * and stopping at the first row that is neither. Requires at least two choices
+ * and exactly one cursor row. Choices get 1-based keys like the numbered path
+ * so the fingerprint/label plumbing stays identical.
+ */
+function parseUnnumberedConsentChoices(
+  pane: string,
+): { choices: TmuxPromptChoice[]; cursorIndex: number; fingerprint: string } | null {
+  const lines = pane.split("\n");
+  let footerAt = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/Enter to confirm/.test(lines[i]!)) {
+      footerAt = i;
+      break;
+    }
+  }
+  if (footerAt < 0) return null;
+  let i = footerAt - 1;
+  while (i >= 0 && lines[i]!.trim() === "") i--;
+  const rows: Array<{ label: string; cursor: boolean }> = [];
+  for (; i >= 0; i--) {
+    const raw = lines[i]!;
+    const cur = raw.match(/^\s*[❯›]\s+(\S.*?)\s*$/);
+    if (cur) {
+      rows.unshift({ label: cur[1]!, cursor: true });
+      continue;
+    }
+    const plain = raw.match(/^\s{2,}(\S.*?)\s*$/);
+    if (plain) {
+      rows.unshift({ label: plain[1]!, cursor: false });
+      continue;
+    }
+    break;
+  }
+  if (rows.length < 2) return null;
+  if (rows.filter((r) => r.cursor).length !== 1) return null;
+  const cursorIndex = rows.findIndex((r) => r.cursor);
+  const choices: TmuxPromptChoice[] = rows.map((r, idx) => ({ key: String(idx + 1), label: r.label }));
+  const fingerprint = sha1(
+    `unnumbered:${choices.map((c) => `${c.key}|${c.label}`).join("/")}|@${cursorIndex}`,
+  );
+  return { choices, cursorIndex, fingerprint };
+}
+
+/**
  * Send the keystrokes that confirm a startup consent dialog: arrow from the
  * cursor's current position to the affirmative option, then Enter. Talks to
  * tmux directly (not via `queueTmuxOp`) because this runs during the boot
@@ -5234,10 +5652,12 @@ export function matchStartupConsentDialog(pane: string): StartupDialogMatch | nu
  * the wrong line.
  *
  * Returns true only when every keystroke (arrows + the final Enter) was
- * delivered. The caller latches the dialog's fingerprint on a `true` so a
- * transient `send-keys` failure leaves the fingerprint UN-latched and the next
- * poll tick retries — otherwise a half-sent confirm would silently strand the
- * dialog until the boot timeout.
+ * delivered. `true` means "sent", NOT "the dialog left the pane": live on
+ * 2.1.284 a Down+Enter sent 30 ms apart was accepted by tmux (exit 0) yet had
+ * no effect (cursor still on "No, exit"), so the boot poller verifies against
+ * the pane and retries via {@link createStartupConfirmTracker}. The inter-key
+ * gap is {@link STARTUP_CONFIRM_KEY_GAP_MS} (150 ms) for the same reason —
+ * Ink may still be mounting and coalesce a tight pair.
  *
  * `taskId` is used ONLY to bump `lastKeystrokeAt` on this session's
  * `SessionState` (finding #6, wave-5 re-review) — the caller's boot-poller
@@ -5259,10 +5679,165 @@ async function confirmStartupDialog(taskId: string, sessionName: string, m: Star
   for (let i = 0; i < Math.abs(delta); i++) {
     bumpIfLive();
     if (!(await tmux(["send-keys", "-t", sessionName, arrow])).ok) return false;
-    await Bun.sleep(30);
+    await Bun.sleep(STARTUP_CONFIRM_KEY_GAP_MS);
   }
   bumpIfLive();
   return (await tmux(["send-keys", "-t", sessionName, "Enter"])).ok;
+}
+
+/** Gap between the arrow key(s) and the Enter of a startup-dialog confirm. */
+const STARTUP_CONFIRM_KEY_GAP_MS = 150;
+/** A startup dialog still matched this long after a confirm attempt means the
+ *  attempt did not take — but a retry ALSO needs the dialog to hold an identical
+ *  fingerprint (cursor included) on two consecutive polls that are both past
+ *  this window, so one repaint frame captured mid-transition can never trigger
+ *  a stray Enter (which on a still-"No, exit" cursor would decline the dialog). */
+const STARTUP_CONFIRM_RETRY_MS = 1500;
+/** Attempts per dialog name before giving up and asking the user to answer it. */
+const STARTUP_CONFIRM_MAX_ATTEMPTS = 4;
+/** Consecutive polls without the dialog before it is declared gone: one blank
+ *  or garbled frame (Ink repaint, tmux capture race) must neither emit
+ *  `auto-confirmed` nor discard the attempt count. */
+const STARTUP_CONFIRM_ABSENT_POLLS = 2;
+
+type StartupConfirmDecision = "wait" | "attempt" | "give-up";
+
+/**
+ * Pure: whether the boot poller should send a confirm for a startup dialog it
+ * currently sees. `attempts` / `lastAttemptAt` — confirms already sent for this
+ * dialog name and when the last one started. `seenTwice` means, for the first
+ * attempt, the fingerprint was on the pane on two consecutive polls (Ink may
+ * still be mounting on the first sighting); for a retry, that the SAME
+ * fingerprint was on the pane on two consecutive polls that both fall past
+ * {@link STARTUP_CONFIRM_RETRY_MS} after the last attempt (the caller computes
+ * that; the window itself is re-checked here). After
+ * {@link STARTUP_CONFIRM_MAX_ATTEMPTS} attempts a dialog that is still there
+ * under the same stability rule is `"give-up"` (the caller emits the message
+ * once and lets the generic prompt path card it).
+ */
+function startupConfirmDecision(input: {
+  seenTwice: boolean;
+  attempts: number;
+  lastAttemptAt: number;
+  now: number;
+}): StartupConfirmDecision {
+  const { seenTwice, attempts, lastAttemptAt, now } = input;
+  if (attempts === 0) return seenTwice ? "attempt" : "wait";
+  if (now - lastAttemptAt < STARTUP_CONFIRM_RETRY_MS) return "wait";
+  if (!seenTwice) return "wait";
+  return attempts >= STARTUP_CONFIRM_MAX_ATTEMPTS ? "give-up" : "attempt";
+}
+
+interface StartupConfirmTracker {
+  /** Feed one poll's match (null = no known consent dialog on the pane). Returns
+   *  the dialog to confirm NOW (attempt already counted) and any status lines. */
+  observe(m: StartupDialogMatch | null, now: number): { attempt: StartupDialogMatch | null; statuses: string[] };
+  /** Whether the dialog named `name` exhausted its attempts and is still
+   *  tracked — the poller then lets the generic prompt path card it. */
+  hasGivenUp(name: string): boolean;
+  /** Status lines for dialogs attempted but not yet reported as gone — used when
+   *  the poller ends because claude got past boot (its JSONL exists). */
+  flushConfirmed(): string[];
+  /** Like {@link flushConfirmed}, but only for entries whose dialog was NOT on
+   *  the most recent poll (the tracker saw it absent at least once after its
+   *  attempt) — used when the boot window closed without the poller having seen
+   *  the JSONL itself, where a dialog still matched on the last poll must not
+   *  be reported as confirmed. Entries still matched emit nothing. */
+  flushAbsent(): string[];
+}
+
+/**
+ * Per-boot state machine behind the consent-dialog poller: replaces the old
+ * "confirm once, latch the fingerprint on send-keys success" logic, which left a
+ * dialog stranded whenever the keys were accepted by tmux but ignored by claude.
+ * Attempts are counted per dialog NAME (the unnumbered fingerprint includes the
+ * cursor, so it changes when the Down lands), the `auto-confirmed` status is
+ * emitted only once the dialog has been absent for
+ * {@link STARTUP_CONFIRM_ABSENT_POLLS} consecutive polls (or replaced by a
+ * different dialog), and a dialog that survives
+ * {@link STARTUP_CONFIRM_MAX_ATTEMPTS} attempts yields one "could not be
+ * confirmed" status.
+ */
+function createStartupConfirmTracker(): StartupConfirmTracker {
+  interface Entry {
+    attempts: number;
+    lastAttemptAt: number;
+    gaveUp: boolean;
+    /** Consecutive polls the dialog has been missing from the pane. */
+    absent: number;
+    /** Fingerprint of the previous post-window poll (retry stability gate). */
+    postWindowFingerprint: string | null;
+  }
+  const entries = new Map<string, Entry>();
+  let prevFingerprint: string | null = null;
+  const confirmedText = (name: string): string => `claude startup dialog auto-confirmed (${name})`;
+  return {
+    observe(m, now) {
+      const statuses: string[] = [];
+      for (const [name, e] of [...entries]) {
+        if (m && m.name === name) { e.absent = 0; continue; }
+        // A DIFFERENT dialog on the pane is positive evidence this one is gone;
+        // a blank frame is not — that needs consecutive absences.
+        if (!m) {
+          e.absent += 1;
+          e.postWindowFingerprint = null;
+          if (e.absent < STARTUP_CONFIRM_ABSENT_POLLS) continue;
+        }
+        if (e.attempts > 0 && !e.gaveUp) statuses.push(confirmedText(name));
+        entries.delete(name);
+      }
+      if (!m) { prevFingerprint = null; return { attempt: null, statuses }; }
+      let e = entries.get(m.name);
+      if (!e) {
+        e = { attempts: 0, lastAttemptAt: 0, gaveUp: false, absent: 0, postWindowFingerprint: null };
+        entries.set(m.name, e);
+      }
+      let seenTwice: boolean;
+      if (e.attempts === 0) {
+        seenTwice = prevFingerprint === m.fingerprint;
+      } else if (now - e.lastAttemptAt < STARTUP_CONFIRM_RETRY_MS) {
+        e.postWindowFingerprint = null;
+        seenTwice = false;
+      } else {
+        seenTwice = e.postWindowFingerprint === m.fingerprint;
+        e.postWindowFingerprint = m.fingerprint;
+      }
+      prevFingerprint = m.fingerprint;
+      const decision = startupConfirmDecision({ seenTwice, attempts: e.attempts, lastAttemptAt: e.lastAttemptAt, now });
+      if (decision === "attempt") {
+        e.attempts += 1;
+        e.lastAttemptAt = now;
+        e.postWindowFingerprint = null;
+        return { attempt: m, statuses };
+      }
+      if (decision === "give-up" && !e.gaveUp) {
+        e.gaveUp = true;
+        statuses.push(
+          `claude startup dialog could not be confirmed after ${STARTUP_CONFIRM_MAX_ATTEMPTS} attempts (${m.name}) — answer it in the terminal`,
+        );
+      }
+      return { attempt: null, statuses };
+    },
+    hasGivenUp(name) {
+      return entries.get(name)?.gaveUp === true;
+    },
+    flushConfirmed() {
+      const out: string[] = [];
+      for (const [name, e] of entries) if (e.attempts > 0 && !e.gaveUp) out.push(confirmedText(name));
+      entries.clear();
+      return out;
+    },
+    flushAbsent() {
+      const out: string[] = [];
+      for (const [name, e] of entries) {
+        // `absent` resets to 0 on every matched poll, so >= 1 means the dialog
+        // was missing from the latest poll(s) — not merely present-when-we-stopped.
+        if (e.absent >= 1 && e.attempts > 0 && !e.gaveUp) out.push(confirmedText(name));
+      }
+      entries.clear();
+      return out;
+    },
+  };
 }
 
 /** How often the boot-time consent poller re-checks the pane. Fast enough
@@ -5959,8 +6534,8 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   // that nothing is driving: the drive's bounded resends genuinely exhausted
   // (a real failure, not just a slow repaint), or the user attached to tmux
   // directly and navigated to review by hand. `parseModalPane` can't parse
-  // the review screen (no question/footer signature), and the JSONL-preferred
-  // path is never consulted here either — it's gated on `askOnPane` (kind ===
+  // the review screen (no question/footer signature), and the ask-card
+  // collection (JSONL first attempt, then pane scrape) is never consulted here either — it's gated on `askOnPane` (kind ===
   // "question"), which is false for "review" — so with the old blanket
   // suppression a stranded review screen matched nothing on every tick,
   // forever — the bug this whole change fixes. Letting `askOnPane` go false for "review"
@@ -5975,7 +6550,6 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   const askKind = detectAskModal(tail);
   const askOnPane = askKind === "question";
   if (askOnPane) {
-    if (state.askFirstSeenAt === null) state.askFirstSeenAt = now;
     if (!claudeIsWriting && !state.askCardId && !state.askCollecting) {
       void collectAndRegisterAskCard(state, tail);
     }
@@ -5984,7 +6558,6 @@ async function scrapeOnce(state: SessionState): Promise<void> {
       resolveScrapedAskQuestions(state.askCardId);
       state.askCardId = null;
     }
-    state.askFirstSeenAt = null;
     state.askGrowAttempts = 0;
   }
 
@@ -7146,7 +7719,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
     // the run dies with the dialog stranded on the pane. The poller self-stops
     // the moment the JSONL appears, the session dies, or boot settles.
     let bootSettled = false;
-    let lastConfirmedFingerprint: string | null = null;
+    const startupConfirm = createStartupConfirmTracker();
     let lastGenericFingerprint: string | null = null;
     // Set by the poller whenever a startup question is on the pane during the
     // current boot-wait window; read (and reset) by the wait loop so a window
@@ -7164,7 +7737,19 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           // this short-circuits on the first tick so the poller is a no-op —
           // a re-shown consent dialog on resume is out of scope (bypass
           // acceptance is global + persistent once accepted).
-          if (bootSettled || existsSync(jsonlPath)) return;
+          if (bootSettled) {
+            // The window closed under us (JSONL found, or the boot timed out).
+            // Only a dialog the tracker saw ABSENT on the latest poll is
+            // reported as confirmed; one still matched at the deadline emits
+            // nothing (the boot-timeout path surfaces the raw pane instead).
+            for (const line of startupConfirm.flushAbsent()) opts.onChunk("status", line);
+            return;
+          }
+          if (existsSync(jsonlPath)) {
+            // claude got past boot — any dialog we confirmed is demonstrably gone.
+            for (const line of startupConfirm.flushConfirmed()) opts.onChunk("status", line);
+            return;
+          }
           if (!(await tmux(["has-session", "-t", "=" + sessionName])).ok) return;
           const pane = (await tmux(["capture-pane", "-p", "-t", sessionName])).stdout;
           // A startup prompt we already surfaced and is still awaiting the
@@ -7173,27 +7758,34 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
             sawStartupPromptThisWindow = true;
           }
           const m = matchStartupConsentDialog(pane);
-          // Single-tick action is deliberate (unlike the runtime scraper's
-          // two-tick stability gate): this only runs during the bounded boot
-          // window and is gated on a marker string AND a parseable affirmative
-          // choice, so a half-drawn frame can't trigger a stray confirm.
-          // Confirm a given on-screen dialog at most once — the fingerprint is
-          // latched ONLY after `confirmStartupDialog` reports every keystroke
-          // landed, so a transient send-keys failure retries next tick instead
-          // of stranding the dialog. A genuinely different follow-up dialog
-          // (new fingerprint) is still acted on.
+          // A consent dialog is confirmed only once its fingerprint was seen on TWO
+          // consecutive polls (Ink may still be mounting on the first sighting),
+          // and a confirm is VERIFIED against the pane rather than trusted on
+          // send-keys success: live on 2.1.284 a Down+Enter was accepted by tmux
+          // yet ignored, and the old fingerprint latch then never retried. The
+          // tracker retries a dialog only after a >= 1.5 s window AND an identical
+          // fingerprint on two consecutive post-window polls (with the CURRENT
+          // cursor, so only a missing Enter is resent), up to 4 attempts, and
+          // reports `auto-confirmed` only after the dialog has been absent on two
+          // consecutive polls. After the 4th attempt it gives up and the dialog
+          // falls through to the generic card path. A genuinely different
+          // follow-up dialog (bypass, then trust) is tracked under its own name.
+          const step = startupConfirm.observe(m, Date.now());
+          for (const line of step.statuses) opts.onChunk("status", line);
           if (m) {
-            // A consent dialog is on the pane — never also treat it as a
-            // generic question (its repaint frames must not leak into an
-            // interactive card while we auto-confirm it).
-            lastGenericFingerprint = null;
-            if (m.fingerprint !== lastConfirmedFingerprint) {
-              if (await confirmStartupDialog(opts.taskId, sessionName, m)) {
-                lastConfirmedFingerprint = m.fingerprint;
-                opts.onChunk("status", `claude startup dialog auto-confirmed (${m.name})`);
-              }
+            if (step.attempt) await confirmStartupDialog(opts.taskId, sessionName, step.attempt);
+            if (!startupConfirm.hasGivenUp(m.name)) {
+              // A consent dialog is on the pane — never also treat it as a
+              // generic question (its repaint frames must not leak into an
+              // interactive card while we auto-confirm it).
+              lastGenericFingerprint = null;
+              continue;
             }
-            continue;
+            // Auto-confirm gave up (the "answer it in the terminal" status was
+            // just emitted): the user is now the only way through, so keep the
+            // boot window from expiring under them and fall through to the
+            // generic prompt path below, which cards the dialog for a click.
+            sawStartupPromptThisWindow = true;
           }
 
           // Not a known consent dialog. If claude is showing some other
@@ -8853,8 +9445,28 @@ export const __forTest = {
   ASK_VERIFY_POLL_MS,
   ASK_VERIFY_POLL_ATTEMPTS,
   ASK_VERIFY_MAX_RESENDS,
+  ASK_DISMISS_MAX_ESCAPES,
   readPendingAskQuestionsFromJsonl,
-  shouldWaitForAskJsonl,
+  GROW_PANE_COLS,
+  tabBodyKey,
+  paneShowsTypedAnswer,
+  paneFocusedRowIsEmptyType,
+  escapeTypedTrailingSemicolon,
+  sliceModalRegion,
+  pollAskModalStillUp,
+  ASK_RECHECK_POLLS,
+  ASK_RECHECK_GAP_MS,
+  /** Startup consent-dialog confirm: the pure attempt/retry decision, the
+   *  per-boot tracker the poller drives, the key-sending routine and its
+   *  constants — so the verify-and-retry logic and the 150 ms inter-key gap are
+   *  testable without a live boot. */
+  startupConfirmDecision,
+  createStartupConfirmTracker,
+  confirmStartupDialog,
+  STARTUP_CONFIRM_KEY_GAP_MS,
+  STARTUP_CONFIRM_RETRY_MS,
+  STARTUP_CONFIRM_MAX_ATTEMPTS,
+  STARTUP_CONFIRM_ABSENT_POLLS,
   resumeJsonlOffset,
   /** Drive the pane-scrape AskUserQuestion collector against a fake `PaneIo`
    *  (no tmux), to assert per-option preview capture + cursor restoration for

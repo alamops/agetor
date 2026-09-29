@@ -1,0 +1,24 @@
+  follow for the migration?", with exactly 4 options and NO descriptions (omit
+  description or leave it empty). Each option label must be at least 90
+  characters long, for example: "Option A: migrate every service in a single
+  big-bang weekend cutover with full downtime window". Make all 4 labels
+  distinct and each >= 90 chars.
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Plan
+
+Which rollout plan should we follow for the migration?
+
+❯ 1. Option A: perform a complete big-bang cutover during a single weekend
+     window with full system downtime across all environments
+  2. Option B: implement a phased canary rollout starting with ten percent of
+     traffic gradually increasing over two weeks with monitoring
+  3. Option C: execute a rolling deployment across multiple availability zones
+     sequentially ensuring at least one zone remains active
+  4. Option D: deploy using blue-green infrastructure switching with full
+     traffic cutover only after comprehensive testing on green env
+  5. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
