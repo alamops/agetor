@@ -277,6 +277,12 @@ function AgentProfileFormBody({
 
   return (
     <div data-testid="agent-profile-form" className={cn("space-y-3", variant === "card" && CARD_ROOT_CLASS)}>
+      {/* Every draft-changing control is inert while a save is in flight: the
+          form reports clean then (see `dirty` above) and pops on success, so
+          an edit typed after Save captured its values would be dropped
+          without a confirm. `TaskLaunchPickers` has no `disabled` prop — the
+          fieldset reaches its selects/buttons/switches natively. */}
+      <fieldset disabled={saving} className="m-0 min-w-0 space-y-3 border-0 p-0">
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Name</label>
         <Input
@@ -310,8 +316,10 @@ function AgentProfileFormBody({
           value={form.skills}
           onChange={(skills) => setForm({ ...form, skills })}
           harnessId={launch.agent}
+          disabled={saving}
         />
       </div>
+      </fieldset>
 
       {saveError && (
         <div

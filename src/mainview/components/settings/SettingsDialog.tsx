@@ -1546,7 +1546,7 @@ function Editor({
             {...IDENTIFIER_INPUT_PROPS}
             value={id}
             onChange={(e) => setId(e.target.value)}
-            disabled={isEdit}
+            disabled={isEdit || busy}
             placeholder="claude-work"
           />
         </div>
@@ -1555,6 +1555,7 @@ function Editor({
           <Input
             value={label}
             onChange={(e) => setLabel(e.target.value)}
+            disabled={busy}
             placeholder="Claude (work)"
           />
         </div>
@@ -1570,7 +1571,7 @@ function Editor({
                 size="sm"
                 variant={kind === k ? "default" : "outline"}
                 onClick={() => setKind(k)}
-                disabled={isEdit}
+                disabled={isEdit || busy}
                 className="justify-start"
               >
                 <AgentIcon kind={k} className="mr-1.5 size-3.5" />
@@ -1593,6 +1594,7 @@ function Editor({
           {...IDENTIFIER_INPUT_PROPS}
           value={home}
           onChange={(e) => setHome(e.target.value)}
+          disabled={busy}
           placeholder={
             dataDir
               ? abbreviateHome(`${dataDir}/harnesses/${HARNESS_HOME_COPY[kind].slug}`, homeDir)
@@ -1610,6 +1612,7 @@ function Editor({
           {...IDENTIFIER_INPUT_PROPS}
           value={bin}
           onChange={(e) => setBin(e.target.value)}
+          disabled={busy}
           placeholder="/opt/homebrew/bin/claude"
         />
       </div>
@@ -1618,6 +1621,7 @@ function Editor({
         <Textarea
           value={envText}
           onChange={(e) => setEnvText(e.target.value)}
+          disabled={busy}
           rows={3}
           className="font-mono text-xs"
         />
