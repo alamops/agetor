@@ -170,7 +170,7 @@ test("codex 0.152.0 + gpt-6-astra is refused, naming the 0.153.0 floor", async (
   }
 });
 
-test("a null task.model resolves through DEFAULT_MODEL.codex (gpt-6-sol) and is gated the same way", async () => {
+test("a null task.model resolves through DEFAULT_MODEL.codex (gpt-6.1-sol) and is gated the same way", async () => {
   process.env.FAKE_CODEX_VERSION = "codex-cli 0.147.0";
   const { startTask } = await import("./orchestrator.ts");
   const { tasks } = await import("./db.ts");
@@ -179,18 +179,53 @@ test("a null task.model resolves through DEFAULT_MODEL.codex (gpt-6-sol) and is 
   const taskId = await createCodexTask(null);
   // createTask itself substitutes DEFAULT_MODEL[kind] for a null model at
   // create time (unlike task.mode, which stays null until spawn) — the
-  // stored row already carries "gpt-6-sol", not null. Assert that directly
+  // stored row already carries "gpt-6.1-sol", not null. Assert that directly
   // rather than the raw-null shape the T7 spec sketch assumed.
-  expect(DEFAULT_MODEL.codex).toBe("gpt-6-sol");
+  expect(DEFAULT_MODEL.codex).toBe("gpt-6.1-sol");
   const stored = tasks.get(taskId);
-  expect(stored!.model).toBe("gpt-6-sol");
+  expect(stored!.model).toBe("gpt-6.1-sol");
 
   const started = await startTask(taskId);
   expect("error" in started).toBe(true);
   if ("error" in started) {
-    expect(started.error).toContain("GPT-6 Sol");
-    expect(started.error).toContain("0.155.0");
+    expect(started.error).toContain("GPT-6.1 Sol");
+    expect(started.error).toContain("0.159.0");
   }
+});
+
+// docs/plans/add-gpt-6-1-sol.md (2026-09-30): GPT-6.1 Sol's floor is 0.159.0.
+test("codex 0.158.0 + gpt-6.1-sol is refused before any run row is created", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.158.0";
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const taskId = await createCodexTask("gpt-6.1-sol");
+  const beforeColumn = tasks.get(taskId)!.column;
+
+  const started = await startTask(taskId);
+  expect("error" in started).toBe(true);
+  if ("error" in started) {
+    expect(started.error).toContain("0.158.0");
+    expect(started.error).toContain("0.159.0");
+  }
+
+  const after = tasks.get(taskId);
+  expect(after!.column).toBe(beforeColumn);
+  expect(after!.runId).toBeNull();
+  expect(runs.listForTask(taskId).length).toBe(0);
+});
+
+test("codex 0.159.0 + gpt-6.1-sol is allowed to start", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.159.0";
+  const { startTask } = await import("./orchestrator.ts");
+  const { runs } = await import("./db.ts");
+
+  const taskId = await createCodexTask("gpt-6.1-sol");
+  const started = await startTask(taskId);
+  expect("error" in started).toBe(false);
+
+  await settle();
+  expect(runs.listForTask(taskId).length).toBe(1);
 });
 
 test("boundary: codex exactly at the 0.155.0 floor + gpt-6-luna is allowed to start", async () => {

@@ -56,7 +56,7 @@ const FX_DEFAULT_MODEL_ID = "zai/glm-5.3-flash";
 
 /** Curated ids that must NOT survive the curated ∩ discovered filter against
  *  the 3-id stub catalog: two ordinary curated rows absent from the stub
- *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and nine of the seventeen
+ *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and ten of the eighteen
  *  `catalogOnly` premium rows (absent from the stub the same as any other
  *  id would be — catalogOnly gates them even harder, but plain absence
  *  already excludes them under the scoped merge). `Claude Fable 5.1`
@@ -87,6 +87,10 @@ const EXCLUDED_FX_OPTION_LABELS = [
   // the same as every other premium row above.
   "GPT-6 Sol",
   "GPT-6 Luna",
+  // GPT-6.1 Sol (docs/plans/add-gpt-6-1-sol.md, 2026-09-30) — catalogOnly
+  // row, absent from this file's frozen 3-id fx stub catalog like every other
+  // premium row above.
+  "GPT-6.1 Sol",
 ];
 
 /** Mirrors `e2e/fx-interactions.spec.ts`'s identical helper. Duplicated
