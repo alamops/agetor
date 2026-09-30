@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { __clearApiHostCacheForTest } from "./git-provider.ts";
-import { __gitlabInternals, getGitLabIssueThread, listGitLabComments } from "./gitlab.ts";
+import { __gitlabInternals, createGitLabPull, getGitLabIssueThread, listGitLabComments } from "./gitlab.ts";
 import { cleanupSshStubs, gitlabIssue, gitlabNote, mockGitLabFetch, sampleRepo, writeSshStub } from "./gitlab-test-util.ts";
 
 const {
@@ -709,4 +709,77 @@ test("authHint keeps GitLab's own 401/403 body message (it often names the real 
   const generic = authHint(401, "401 Unauthorized", REPO as any, false);
   expect(generic).toContain("requires authentication (401)");
   expect(generic).not.toContain("401 Unauthorized");
+});
+
+// ---------------------------------------------------------------------------
+// createGitLabPull — target_project_id (fork MRs must land in the fork itself)
+// ---------------------------------------------------------------------------
+// GitLab opens a fork's MR against the PARENT project when target_project_id
+// is omitted, so createGitLabPull pins it to the numeric id read from
+// GET /projects/:id. Runs under the same GITLAB_TOKEN/ssh-stub hooks as the
+// issue-thread tests above (createGitLabPull refuses to post without a token).
+
+test("createGitLabPull sends target_project_id equal to the numeric id from GET /projects/:id", async () => {
+  const repo = sampleRepo({ owner: "me", name: "forked-app" });
+  const mock = mockGitLabFetch([
+    {
+      method: "POST",
+      match: "/projects/me%2Fforked-app/merge_requests",
+      json: { iid: 9, title: "Fix it", state: "opened", web_url: "https://gitlab.com/me/forked-app/-/merge_requests/9" },
+    },
+    {
+      method: "GET",
+      match: "/api/v4/projects/me%2Fforked-app",
+      // A fork's project payload carries its parent under forked_from_project —
+      // the MR must still target the fork's own id, never the parent's.
+      json: { id: 4242, default_branch: "main", forked_from_project: { id: 1001 } },
+    },
+  ]);
+  try {
+    const res = await createGitLabPull(repo, { title: "Fix it", base: "main", head: "fix-branch" });
+    expect(res.ok).toBe(true);
+    expect(mock.calls.map((c) => c.method)).toEqual(["GET", "POST"]);
+    const body = JSON.parse(mock.calls[1]!.body!);
+    expect(body.target_project_id).toBe(4242);
+    expect(body).toMatchObject({ source_branch: "fix-branch", target_branch: "main" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("createGitLabPull returns ok:false and does not POST when the project can't be read", async () => {
+  const repo = sampleRepo({ owner: "me", name: "forked-app" });
+  const mock = mockGitLabFetch([
+    { method: "GET", match: "/api/v4/projects/me%2Fforked-app", status: 500, json: { message: "boom" } },
+    // Present only so an unexpected POST is recorded rather than thrown — the
+    // assertion below proves it never happens.
+    { method: "POST", match: "/merge_requests", json: { iid: 1, title: "x", state: "opened", web_url: "https://x/1" } },
+  ]);
+  try {
+    const res = await createGitLabPull(repo, { title: "Fix it", base: "main", head: "fix-branch" });
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("couldn't read GitLab project me/forked-app");
+    expect(res.error).toContain("boom");
+    expect(mock.calls.some((c) => c.method === "POST")).toBe(false);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("createGitLabPull returns ok:false and does not POST when the project response has no numeric id", async () => {
+  const repo = sampleRepo({ owner: "me", name: "forked-app" });
+  const mock = mockGitLabFetch([
+    { method: "GET", match: "/api/v4/projects/me%2Fforked-app", json: { id: "me/forked-app", default_branch: "main" } },
+    { method: "POST", match: "/merge_requests", json: { iid: 1, title: "x", state: "opened", web_url: "https://x/1" } },
+  ]);
+  try {
+    const res = await createGitLabPull(repo, { title: "Fix it", base: "main", head: "fix-branch" });
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("did not return a numeric project id");
+    expect(mock.calls.some((c) => c.method === "POST")).toBe(false);
+  } finally {
+    mock.restore();
+  }
 });
