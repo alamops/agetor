@@ -10,6 +10,7 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
+import { AgentProfileForm } from "@/components/kanban/AgentProfileFormDialog";
 import { AgentProfilesSection } from "@/components/settings/AgentProfilesSection";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
 import { PipelinesSection } from "@/components/settings/PipelinesSection";
@@ -22,11 +23,14 @@ import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
 import { FX_AUTO_RESUME_MAX, parseFxAutoResumeDelayInput } from "@/lib/fx-auto-resume-prefs";
 import { abbreviateHome, cn, formatTokens } from "@/lib/utils";
 import { resolveTemplateInitialHome } from "@/lib/harness-template";
+import { harnessEditorDirty } from "@/lib/harness-editor-dirty";
 import {
   SETTINGS_SECTIONS,
   activeSection,
   backFromSubview,
   initialView,
+  isFormSubpage,
+  openAgentEditor,
   openEditor,
   openSection,
   openTemplates,
@@ -89,6 +93,10 @@ interface Props {
    *  transition (not just the first) — absent/undefined preserves today's
    *  behavior of always resetting to General. */
   initialSection?: SettingsSectionId;
+  /** Agent profile to open straight on its edit subpage when the dialog
+   *  opens (a deep link, e.g. "Edit in Settings" from a task's agent
+   *  details). Wins over `initialSection`; absent/null falls back to it. */
+  initialAgentProfileId?: string | null;
   /** Navigate the app-level `view` to the pipelines page/editor — see
    *  `PipelinesSection`'s `onOpenPipelines` prop. The caller closes this
    *  dialog in the same callback. */
@@ -244,7 +252,18 @@ async function describeHarnessInUse(err: unknown): Promise<string | null> {
   return `In use by ${segments.join(" and ")}`;
 }
 
-export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, fxAutoResume, onFxAutoResumeChange, onChange, homeDir, dataDir, initialSection, onOpenPipelines }: Props) {
+/** The view the modal opens on: a deep-linked agent's edit subpage, else the
+ *  requested section, else General. */
+function entryView(
+  initialSection: SettingsSectionId | undefined,
+  initialAgentProfileId: string | null | undefined,
+): SettingsView {
+  if (initialAgentProfileId) return openAgentEditor(initialAgentProfileId);
+  if (initialSection) return openSection(initialSection);
+  return initialView();
+}
+
+export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, fxAutoResume, onFxAutoResumeChange, onChange, homeDir, dataDir, initialSection, initialAgentProfileId, onOpenPipelines }: Props) {
   const [version, setVersion] = useState<string>("");
   const [payload, setPayload] = useState<HarnessesPayload>({ harnesses: [], statuses: [] });
   const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
@@ -254,13 +273,46 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
   // helper — see src/bun/disclaim.ts. Only the literal stored value "false"
   // turns it off; unset/anything-else reads as on, matching disclaimEnabled().
   const [disclaimSpawnedAgents, setDisclaimSpawnedAgents] = useState(true);
-  const [view, setView] = useState<SettingsView>(initialView());
+  const [view, setView] = useState<SettingsView>(() => entryView(initialSection, initialAgentProfileId));
+  // The view (and a per-open counter) must be correct on the very FIRST commit
+  // after the modal opens: the dialog stays mounted while closed, and an
+  // effect-driven reset would let that commit render the previous subpage —
+  // mounting its autoFocus form (which Dialog's passive effect would then
+  // record as the focus-restore target) before the reset landed. So the reset
+  // is adjusted during render, on the props' change, React's "derive state
+  // from props" pattern. `openCount` rides in the agent editor's `key` so a
+  // reopen onto the SAME profile id still mounts a fresh form.
+  const [entry, setEntry] = useState({ open, initialSection, initialAgentProfileId });
+  const [openCount, setOpenCount] = useState(0);
+  if (
+    entry.open !== open ||
+    entry.initialSection !== initialSection ||
+    entry.initialAgentProfileId !== initialAgentProfileId
+  ) {
+    setEntry({ open, initialSection, initialAgentProfileId });
+    if (open) {
+      setView(entryView(initialSection, initialAgentProfileId));
+      if (!entry.open) setOpenCount((n) => n + 1);
+    }
+  }
   // Mirrors `view` for use inside async callbacks (e.g. the Editor's
   // onSubmit) so they can tell, after an await, whether the user navigated
   // away in the meantime — see Fix 3 in the settings-sidebar review.
   const viewRef = useRef(view);
   viewRef.current = view;
-  const [busy, setBusy] = useState(false);
+  // Whether the form subpage on screen (harness editor or agent editor) holds
+  // unsaved edits — fed by each form's `onDirtyChange`, which reports `false`
+  // again when the form unmounts. Read by `leaveSubpage`.
+  const subpageDirtyRef = useRef(false);
+  const leavingRef = useRef(false);
+  // Bumped every time a harness editor view is opened. A save captures the
+  // value at submit time, so its late resolution can tell whether the editor
+  // that started it is still the one on screen (a reopened editor gets a new
+  // token, even though `viewRef.current.kind` is "editor" again).
+  const editorTokenRef = useRef(0);
+  // Token of the editor whose save is in flight (null = none), so a save that
+  // outlives its editor never marks a newly opened one busy.
+  const [savingToken, setSavingToken] = useState<number | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   // Optimistic toggle map: harness id → the value the user *clicked toward*.
   // Lets the Switch animate the moment the user clicks even though the actual
@@ -317,12 +369,11 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
   useEffect(() => {
     if (!open) return;
     void refresh();
-    // Reset to the General section (or `initialSection`, when the caller
-    // wants a deep link) on every open so a half-filled editor doesn't
-    // greet the user next time.
-    setView(initialSection ? openSection(initialSection) : initialView());
+    // The view itself is reset during render (see `entry` above), so a
+    // half-filled editor never greets the user on the next open.
+    subpageDirtyRef.current = false;
     setFormError(null);
-  }, [open, initialSection]);
+  }, [open, initialSection, initialAgentProfileId]);
 
   const statusByHarness = useMemo(() => {
     const map = new Map(payload.statuses.map((s) => [s.harnessId, s]));
@@ -445,16 +496,73 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
 
   const currentSection = activeSection(view);
 
+  const showEditor = (harnessId: string | null, template: HarnessTemplate) => {
+    editorTokenRef.current += 1;
+    setView(openEditor(harnessId, template));
+  };
+
+  /** Every internal way of closing the modal (and handing off to another
+   *  page) goes through here: drop the subpage back to General so a save
+   *  resolving after the close finds no editor showing, then tell the parent.
+   *  Opening again re-derives the view during render regardless, for closes
+   *  the parent makes on its own. */
+  const resetView = () => {
+    setView(initialView());
+    subpageDirtyRef.current = false;
+  };
+  const closeModal = () => {
+    resetView();
+    onClose();
+  };
+
+  /**
+   * The one guard every way out of the current view goes through — header
+   * Back, Escape/backdrop, a sidebar section click, the header X. On a form
+   * subpage holding unsaved edits it asks "Discard unsaved changes?" and only
+   * runs `proceed` on a yes; otherwise it runs it straight away. The forms'
+   * own Cancel buttons and successful saves deliberately bypass it. `proceed`
+   * must read `viewRef.current`, not the render's `view` — the view can change
+   * while the confirm is open.
+   */
+  const leaveSubpage = async (proceed: () => void) => {
+    const current = viewRef.current;
+    if (isFormSubpage(current) && subpageDirtyRef.current) {
+      if (leavingRef.current) return;
+      leavingRef.current = true;
+      let ok = false;
+      try {
+        ok = await confirm({
+          title: "Discard unsaved changes?",
+          description:
+            current.kind === "agent-editor"
+              ? "Your edits to this agent will be lost."
+              : "Your edits to this harness will be lost.",
+          confirmLabel: "Discard",
+          variant: "destructive",
+        });
+      } finally {
+        leavingRef.current = false;
+      }
+      if (!ok) return;
+    }
+    proceed();
+  };
+
+  /** Pop the current subpage to its section, or close the modal from a
+   *  section view — what Escape and a backdrop click do. */
+  const popOrClose = () => {
+    const current = viewRef.current;
+    if (resolveEscape(current) === "pop") {
+      setView(backFromSubview(current));
+      return;
+    }
+    closeModal();
+  };
+
   return (
     <Dialog
       open={open}
-      onClose={() => {
-        if (resolveEscape(view) === "pop") {
-          setView(backFromSubview());
-          return;
-        }
-        onClose();
-      }}
+      onClose={() => void leaveSubpage(popOrClose)}
       className="flex max-h-[85vh] w-full max-w-4xl flex-col p-0"
       labelledBy="settings-dialog-title"
     >
@@ -464,7 +572,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
             <Button
               variant="ghost"
               size="icon"
-              onClick={() => setView(backFromSubview())}
+              onClick={() => void leaveSubpage(() => setView(backFromSubview(viewRef.current)))}
               aria-label="Back"
             >
               <ChevronLeft className="size-4" />
@@ -474,6 +582,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
             {view.kind === "section" && "Settings"}
             {view.kind === "templates" && "Add harness"}
             {view.kind === "editor" && (view.harnessId ? "Edit harness" : "Add harness")}
+            {view.kind === "agent-editor" && (view.profileId ? "Edit agent" : "Add agent")}
           </h2>
         </div>
         <div className="flex items-center gap-2">
@@ -481,7 +590,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
           <Button
             variant="ghost"
             size="icon"
-            onClick={onClose}
+            onClick={() => void leaveSubpage(closeModal)}
             aria-label="Close"
           >
             <X className="size-4" />
@@ -503,7 +612,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                 variant={active ? "secondary" : "ghost"}
                 className="w-full justify-start"
                 aria-current={active ? "page" : undefined}
-                onClick={() => setView(openSection(s.id))}
+                onClick={() => void leaveSubpage(() => setView(openSection(s.id)))}
               >
                 {s.label}
               </Button>
@@ -530,7 +639,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       onPickTmuxSource={onPickTmuxSource}
                       disclaimSpawnedAgents={disclaimSpawnedAgents}
                       onDisclaimSpawnedAgentsChange={onDisclaimSpawnedAgentsChange}
-                      onClose={onClose}
+                      onClose={closeModal}
                     />
                   );
                 case "harnesses":
@@ -542,18 +651,16 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       canAdd={!!dataDir}
                       onAdd={() => setView(openTemplates())}
                       onEdit={(h) =>
-                        setView(
-                          openEditor(h.id, {
-                            id: "__edit",
-                            label: h.label,
-                            description: "",
-                            kind: h.kind,
-                            suggestedHarnessId: h.id,
-                            home: h.home,
-                            bin: h.bin,
-                            env: h.env,
-                          }),
-                        )
+                        showEditor(h.id, {
+                          id: "__edit",
+                          label: h.label,
+                          description: "",
+                          kind: h.kind,
+                          suggestedHarnessId: h.id,
+                          home: h.home,
+                          bin: h.bin,
+                          env: h.env,
+                        })
                       }
                       onDelete={onDeleteHarness}
                       onToggleEnabled={onToggleEnabled}
@@ -562,8 +669,13 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                     />
                   );
                 case "agents":
-                  // Rendered by the always-mounted div below instead.
-                  return null;
+                  return (
+                    <AgentProfilesSection
+                      harnesses={payload.harnesses}
+                      onAdd={() => setView(openAgentEditor(null))}
+                      onEdit={(p) => setView(openAgentEditor(p.id))}
+                    />
+                  );
                 case "pipelines":
                   // Rendered by the always-mounted div below instead.
                   return null;
@@ -581,23 +693,21 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
               }
             })()}
 
-          {/* Same treatment as GitHubTokensSection/SavedPromptsSection below
-              — kept mounted regardless of the active section so an
-              in-progress agent-profile create/edit form survives switching
-              sections instead of being destroyed on unmount. No wrapper
-              spacing classes here (unlike the GitHubTokensSection div
-              below) since AgentProfilesSection's own root already applies
-              "space-y-4 pt-3 text-sm". */}
-          <div className={cn(!(view.kind === "section" && view.section === "agents") && "hidden")}>
-            <AgentProfilesSection harnesses={payload.harnesses} />
-          </div>
-
-          {/* Same treatment as AgentProfilesSection above — kept mounted
-              regardless of the active section. No wrapper spacing classes
-              here since PipelinesSection's own root already applies
+          {/* Kept mounted regardless of the active section (unlike the
+              switch above) so an in-flight delete's `busyId`/`actionError`
+              survive a section switch (the list itself is module-cached and
+              doesn't need it). No wrapper spacing classes here since
+              PipelinesSection's own root already applies
               "space-y-4 pt-3 text-sm". */}
           <div className={cn(!(view.kind === "section" && view.section === "pipelines") && "hidden")}>
-            <PipelinesSection onOpenPipelines={onOpenPipelines} />
+            <PipelinesSection
+              onOpenPipelines={(id, editing) => {
+                // The parent closes the modal for this hand-off — reset the
+                // view here too, like every other close.
+                resetView();
+                onOpenPipelines(id, editing);
+              }}
+            />
           </div>
 
           {/* Kept mounted regardless of the active section (unlike the
@@ -627,8 +737,32 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
 
           {view.kind === "templates" && (
             <TemplatePicker
-              onPick={(t) => setView(openEditor(null, resolveTemplate(t, dataDir)))}
+              onPick={(t) => showEditor(null, resolveTemplate(t, dataDir))}
             />
+          )}
+
+          {view.kind === "agent-editor" && (
+            <div data-testid="agent-profile-editor" className="pt-3 text-sm">
+              <AgentProfileForm
+                key={`${openCount}:${view.profileId ?? "new"}`}
+                variant="page"
+                autoFocus
+                profileId={view.profileId}
+                onDirtyChange={(dirty) => {
+                  subpageDirtyRef.current = dirty;
+                }}
+                onCancel={() => setView(backFromSubview(viewRef.current))}
+                onSaved={() => {
+                  // The user may have left (rail click, Escape-pop) while the
+                  // save was in flight — only pop if this editor is still the
+                  // one showing.
+                  const current = viewRef.current;
+                  if (current.kind === "agent-editor" && current.profileId === view.profileId) {
+                    setView(backFromSubview(current));
+                  }
+                }}
+              />
+            </div>
           )}
 
           {view.kind === "editor" && (
@@ -638,11 +772,21 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
               homeDir={homeDir}
               dataDir={dataDir}
               existingIds={new Set(payload.harnesses.map((h) => h.id))}
-              busy={busy}
+              busy={savingToken === editorTokenRef.current}
               error={formError}
-              onCancel={() => setView(backFromSubview())}
+              onDirtyChange={(dirty) => {
+                subpageDirtyRef.current = dirty;
+              }}
+              onCancel={() => setView(backFromSubview(viewRef.current))}
               onSubmit={async (input) => {
-                setBusy(true);
+                const token = editorTokenRef.current;
+                // Still the editor instance that started this save — a rail
+                // click / Escape-pop / close may have replaced it while the
+                // round-trip was in flight, and a reopened editor is a
+                // different instance even though its kind is "editor" again.
+                const stillShowing = () =>
+                  viewRef.current.kind === "editor" && editorTokenRef.current === token;
+                setSavingToken(token);
                 setFormError(null);
                 try {
                   if (view.harnessId) {
@@ -657,13 +801,11 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                   }
                   await refresh();
                   onChange?.();
-                  // The user may have navigated away (rail click, Escape-pop)
-                  // while this round-trip was in flight — only pop the view
-                  // if the Editor is still the one showing.
-                  if (viewRef.current.kind === "editor") setView(backFromSubview());
+                  // Only pop the view if the Editor that saved is still showing.
+                  if (stillShowing()) setView(backFromSubview(viewRef.current));
                 } catch (e) {
                   const message = e instanceof Error ? e.message : String(e);
-                  if (viewRef.current.kind === "editor") {
+                  if (stillShowing()) {
                     setFormError(message);
                   } else {
                     // Editor is unmounted — setFormError would target nothing
@@ -675,7 +817,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                     });
                   }
                 } finally {
-                  setBusy(false);
+                  setSavingToken((t) => (t === token ? null : t));
                 }
               }}
             />
@@ -1291,6 +1433,7 @@ function Editor({
   existingIds,
   busy,
   error,
+  onDirtyChange,
   onCancel,
   onSubmit,
 }: {
@@ -1301,6 +1444,9 @@ function Editor({
   existingIds: Set<string>;
   busy: boolean;
   error: string | null;
+  /** Reports whether any field differs from what the form opened with;
+   *  reports `false` again on unmount. */
+  onDirtyChange: (dirty: boolean) => void;
   onCancel: () => void;
   onSubmit: (input: HarnessInput) => void;
 }) {
@@ -1329,6 +1475,27 @@ function Editor({
   const [bin, setBin] = useState(template.bin ?? "");
   const [envText, setEnvText] = useState(stringifyEnv(template.env));
   const [localError, setLocalError] = useState<string | null>(null);
+
+  // Dirty = any field differs from what the state above was seeded with. All
+  // six are seeded synchronously, so a plain value diff is exact.
+  const [initialDraft] = useState(() => ({
+    id: initialState.id,
+    label: template.label,
+    kind: template.kind as string,
+    home: initialState.home,
+    bin: template.bin ?? "",
+    envText: stringifyEnv(template.env),
+  }));
+  // While a save is in flight the edits are being persisted, not discarded —
+  // report clean so leaving mid-save doesn't ask "Discard unsaved changes?".
+  // A failed save flips `busy` back and the form reads dirty again.
+  const dirty = harnessEditorDirty({ id, label, kind, home, bin, envText }, initialDraft) && !busy;
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  onDirtyChangeRef.current = onDirtyChange;
+  useEffect(() => {
+    onDirtyChangeRef.current(dirty);
+  }, [dirty]);
+  useEffect(() => () => onDirtyChangeRef.current(false), []);
 
   // Parse once per render so we can warn about ignored lines below the
   // textarea. Cheap — the env block is tiny.
@@ -1379,7 +1546,7 @@ function Editor({
             {...IDENTIFIER_INPUT_PROPS}
             value={id}
             onChange={(e) => setId(e.target.value)}
-            disabled={isEdit}
+            disabled={isEdit || busy}
             placeholder="claude-work"
           />
         </div>
@@ -1388,6 +1555,7 @@ function Editor({
           <Input
             value={label}
             onChange={(e) => setLabel(e.target.value)}
+            disabled={busy}
             placeholder="Claude (work)"
           />
         </div>
@@ -1403,7 +1571,7 @@ function Editor({
                 size="sm"
                 variant={kind === k ? "default" : "outline"}
                 onClick={() => setKind(k)}
-                disabled={isEdit}
+                disabled={isEdit || busy}
                 className="justify-start"
               >
                 <AgentIcon kind={k} className="mr-1.5 size-3.5" />
@@ -1426,6 +1594,7 @@ function Editor({
           {...IDENTIFIER_INPUT_PROPS}
           value={home}
           onChange={(e) => setHome(e.target.value)}
+          disabled={busy}
           placeholder={
             dataDir
               ? abbreviateHome(`${dataDir}/harnesses/${HARNESS_HOME_COPY[kind].slug}`, homeDir)
@@ -1443,6 +1612,7 @@ function Editor({
           {...IDENTIFIER_INPUT_PROPS}
           value={bin}
           onChange={(e) => setBin(e.target.value)}
+          disabled={busy}
           placeholder="/opt/homebrew/bin/claude"
         />
       </div>
@@ -1451,6 +1621,7 @@ function Editor({
         <Textarea
           value={envText}
           onChange={(e) => setEnvText(e.target.value)}
+          disabled={busy}
           rows={3}
           className="font-mono text-xs"
         />

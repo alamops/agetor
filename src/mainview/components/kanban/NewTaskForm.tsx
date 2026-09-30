@@ -105,7 +105,7 @@ interface Props {
   profiles: AgentProfile[];
   /** "Manage agents…" footer row in the profile picker's popover — opens
    *  Settings on the Agents section. */
-  onOpenSettingsAgents: () => void;
+  onOpenSettingsAgents: (profileId?: string) => void;
   /** Saved pipelines — powers the `PipelinePicker` above the Agent picker
    *  ("one selection" with the agent profile: picking a pipeline hides the
    *  Agent picker and the manual harness/mode/model/effort block). */

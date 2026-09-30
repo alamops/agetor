@@ -47,7 +47,7 @@ export function SubagentDetailsDialog({
   /** Run view only: open the step task's panel on its main stream. */
   onOpenStep?: () => void;
   /** When set, offers "Edit in Settings" for a persona that still exists. */
-  onOpenSettingsAgents?: () => void;
+  onOpenSettingsAgents?: (profileId?: string) => void;
 }) {
   if (!open || !satellite) return null;
 
@@ -197,7 +197,7 @@ export function SubagentDetailsDialog({
               data-testid="subagent-details-edit"
               onClick={() => {
                 onClose();
-                onOpenSettingsAgents();
+                onOpenSettingsAgents(profile.id);
               }}
             >
               <Settings2 className="size-3.5" aria-hidden />

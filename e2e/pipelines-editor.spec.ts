@@ -14,6 +14,13 @@ import { gotoApp } from "./helpers";
  * empty pipeline name), and delete from the list. It also covers Settings →
  * Pipelines linking into the same full-page view.
  *
+ * It also covers the step panel's standalone "New agent…" dialog
+ * (`AgentProfileFormDialog`) dirty-close guard — Escape, backdrop and the
+ * header X ask "Discard unsaved changes?" once the form is edited, its Cancel
+ * and a clean close never do (docs/plans/agents-new-edit-subpage.md) — and
+ * the satellite details' "Edit in Settings" deep link onto that persona's
+ * Settings → Agents edit subpage.
+ *
  * `e2e/pipelines-run.spec.ts` owns everything about actually RUNNING a
  * pipeline (fake-driver handoffs, the run view, RunPanel's pipeline strip) —
  * this file never starts a task.
@@ -133,6 +140,56 @@ async function openConnectAndPick(panel: Locator, targetName: string): Promise<v
   const connect = panel.getByTestId("pipeline-step-connect");
   await connect.getByRole("button", { name: "Connect to another step…" }).click();
   await connect.getByRole("button", { name: targetName, exact: true }).click();
+}
+
+/** The Settings modal, located by its own title id — bare
+ *  `getByRole("dialog")` is ambiguous whenever a second dialog (the discard
+ *  confirm, the details dialog) is stacked on it. */
+function settingsModal(page: Page): Locator {
+  return page.getByRole("dialog").filter({ has: page.locator("#settings-dialog-title") });
+}
+
+/** The step panel's standalone "New agent" dialog — `Dialog` puts
+ *  `role="dialog"` on the full-screen backdrop, so this locator is also the
+ *  thing a backdrop click targets (see `clickBackdrop`). Located by its title
+ *  id so it stays unambiguous while the discard confirm is stacked on top. */
+function newAgentDialog(page: Page): Locator {
+  return page.getByRole("dialog").filter({ has: page.locator("#agent-profile-form-dialog-title") });
+}
+
+/** The shared confirm the dirty-close guard raises (`ui/confirm.tsx`). Not to
+ *  be confused with the editor's own "Discard unsaved pipeline changes?". */
+function discardConfirm(page: Page): Locator {
+  return page.getByRole("dialog", { name: "Discard unsaved changes?", exact: true });
+}
+
+/** Click a `Dialog`'s dimmed backdrop (the role="dialog" overlay's own
+ *  padding, outside the panel) — the panel stops propagation. */
+async function clickBackdrop(dialog: Locator): Promise<void> {
+  await dialog.click({ position: { x: 4, y: 4 } });
+}
+
+/** True when an agent profile with exactly this name exists (REST). */
+async function agentProfileExists(backend: E2EBackend, name: string): Promise<boolean> {
+  const res = await fetch(`${backend.apiBase}/agent-profiles`, { headers: auth(backend) });
+  expect(res.ok, `GET /agent-profiles -> ${res.status}`).toBeTruthy();
+  const list = (await res.json()) as { name: string }[];
+  return list.some((p) => p.name === name);
+}
+
+/** New pipeline → select the default step → open its "New agent…" dialog. */
+async function openNewAgentDialog(page: Page, backend: E2EBackend): Promise<{ editor: Locator; panel: Locator; dialog: Locator }> {
+  await gotoApp(page, backend.bootBase);
+  await pipelinesButton(page).click();
+  await page.getByTestId("pipelines-new").click();
+  const editor = page.getByTestId("pipeline-editor");
+  await expect(editor).toBeVisible();
+  const [id0] = await nodeIds(page);
+  const panel = await openStepPanel(editor, stepNode(page, id0!));
+  await panel.getByTestId("pipeline-step-new-agent").click();
+  const dialog = newAgentDialog(page);
+  await expect(dialog.getByTestId("agent-profile-form-dialog")).toBeVisible();
+  return { editor, panel, dialog };
 }
 
 const createdPipelineIds: string[] = [];
@@ -502,6 +559,29 @@ test.describe("pipelines editor", () => {
     await details.getByTestId("subagent-details-close").click();
     await expect(details).toBeHidden();
 
+    // "Edit in Settings" from the satellite deep-links straight onto THAT
+    // persona's edit subpage in Settings → Agents (not the plain list),
+    // Name pre-filled; Back lands on the agents list. The details dialog
+    // closes on the way, and the pipeline editor underneath is untouched.
+    await satellites2.filter({ hasText: helperOne.name }).click({ force: true });
+    await expect(details).toBeVisible();
+    await expect(details.getByTestId("subagent-details-name")).toHaveText(helperOne.name);
+    await details.getByTestId("subagent-details-edit").click();
+    await expect(details).toBeHidden();
+    const settings = settingsModal(page);
+    await expect(settings.getByRole("heading", { name: "Edit agent" })).toBeVisible();
+    await expect(settings.getByTestId("agent-profile-editor")).toBeVisible();
+    await expect(settings.getByTestId("agent-profiles-section")).toHaveCount(0);
+    await expect(settings.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(settings.getByTestId("agent-profile-name")).toHaveValue(helperOne.name);
+    await settings.getByRole("button", { name: "Back", exact: true }).click();
+    await expect(settings.getByRole("heading", { name: "Settings" })).toBeVisible();
+    await expect(settings.getByTestId("agent-profiles-section")).toBeVisible();
+    await expect(settings.getByTestId("agent-profile-editor")).toHaveCount(0);
+    await settings.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(settings).toBeHidden();
+    await expect(editor2).toBeVisible();
+
     // The popover shows both picked profiles as checked (the check glyph is
     // rendered opaque only on an active row).
     await trigger2.click();
@@ -779,6 +859,117 @@ test.describe("pipelines editor", () => {
 
     const panel2 = await openStepPanel(editor, node2);
     await expect(panel2.getByTestId("pipeline-step-name")).toHaveValue(name2);
+  });
+
+  // The standalone "New agent" dialog (`AgentProfileFormDialog`) guards its
+  // own Escape / backdrop / header X the same way Settings' editor subpage
+  // does; its form's Cancel and a clean close never ask. Drafts are never
+  // saved, so nothing is created.
+  test("New agent dialog, dirty: Escape confirms — decline keeps the typed name, accept closes without creating", async ({
+    page,
+    backend,
+  }) => {
+    const { editor, dialog } = await openNewAgentDialog(page, backend);
+    const typed = `Dirty Escape Agent ${randomUUID()}`;
+    await dialog.getByTestId("agent-profile-name").fill(typed);
+
+    await page.keyboard.press("Escape");
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(dialog.getByTestId("agent-profile-form-dialog")).toBeVisible();
+    await expect(dialog.getByTestId("agent-profile-name")).toHaveValue(typed);
+
+    await page.keyboard.press("Escape");
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(dialog).toBeHidden();
+    await expect(editor).toBeVisible();
+    expect(await agentProfileExists(backend, typed)).toBe(false);
+  });
+
+  test("New agent dialog, dirty: header X confirms — decline keeps the typed name, accept closes without creating", async ({
+    page,
+    backend,
+  }) => {
+    const { editor, dialog } = await openNewAgentDialog(page, backend);
+    const typed = `Dirty Close Agent ${randomUUID()}`;
+    await dialog.getByTestId("agent-profile-name").fill(typed);
+
+    await dialog.getByRole("button", { name: "Close", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(dialog.getByTestId("agent-profile-name")).toHaveValue(typed);
+
+    await dialog.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(dialog).toBeHidden();
+    await expect(editor).toBeVisible();
+    expect(await agentProfileExists(backend, typed)).toBe(false);
+  });
+
+  test("New agent dialog, dirty: backdrop click confirms — decline keeps the typed name, accept closes", async ({
+    page,
+    backend,
+  }) => {
+    const { dialog } = await openNewAgentDialog(page, backend);
+    const typed = `Dirty Backdrop Agent ${randomUUID()}`;
+    await dialog.getByTestId("agent-profile-name").fill(typed);
+
+    await clickBackdrop(dialog);
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(dialog.getByTestId("agent-profile-name")).toHaveValue(typed);
+
+    await clickBackdrop(dialog);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(dialog).toBeHidden();
+    expect(await agentProfileExists(backend, typed)).toBe(false);
+  });
+
+  test("New agent dialog: its own Cancel closes immediately even when dirty; a clean form closes on Escape, X and backdrop without asking", async ({
+    page,
+    backend,
+  }) => {
+    const { panel, dialog } = await openNewAgentDialog(page, backend);
+
+    // Dirty + Cancel → closes at once, no confirm.
+    await dialog.getByTestId("agent-profile-name").fill(`Cancelled Agent ${randomUUID()}`);
+    await dialog.getByTestId("agent-profile-cancel").click();
+    await expect(dialog).toBeHidden();
+    await expect(discardConfirm(page)).toHaveCount(0);
+
+    // Clean form: Escape.
+    await expect(panel).toBeVisible();
+    await panel.getByTestId("pipeline-step-new-agent").click();
+    await expect(dialog.getByTestId("agent-profile-form-dialog")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await expect(discardConfirm(page)).toHaveCount(0);
+
+    // Clean form: header X.
+    await panel.getByTestId("pipeline-step-new-agent").click();
+    await expect(dialog.getByTestId("agent-profile-form-dialog")).toBeVisible();
+    await dialog.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(dialog).toBeHidden();
+    await expect(discardConfirm(page)).toHaveCount(0);
+
+    // Clean form: backdrop.
+    await panel.getByTestId("pipeline-step-new-agent").click();
+    await expect(dialog.getByTestId("agent-profile-form-dialog")).toBeVisible();
+    await clickBackdrop(dialog);
+    await expect(dialog).toBeHidden();
+    await expect(discardConfirm(page)).toHaveCount(0);
   });
 });
 

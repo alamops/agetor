@@ -1,16 +1,19 @@
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
+import { useConfirm } from "@/components/ui/confirm";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { useAgentProfiles } from "@/lib/agent-profiles";
+import { agentProfileTextDirty } from "@/lib/agent-profile-form";
+import { cn } from "@/lib/utils";
 import { AGENT_PROFILE_LIMITS } from "../../../shared/agent-profile.ts";
 import type { AgentProfile } from "../../../shared/types.ts";
 import { SkillsPicker } from "./SkillsPicker";
-import { TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
+import { TaskLaunchPickers, useTaskLaunch, type TaskLaunch } from "./TaskLaunchPickers";
 
 /** Local edit-buffer shape for the create/edit form — the two fields
  *  `TaskLaunchPickers` doesn't own (name, and the composition-only
@@ -37,15 +40,30 @@ export interface AgentProfileFormProps {
    *  dialog-hosted form can opt in via `initialFocusRef` instead (the
    *  dialog's own focus-management already handles that case). */
   autoFocus?: boolean;
+  /** Reports whether the form holds unsaved edits — a text field differing
+   *  from what the form opened with, or any harness/mode/model/effort/fast/
+   *  max-mode pick the user made. Fires when the flag flips and reports
+   *  `false` again when the form unmounts, so a host can keep a plain
+   *  "is dirty" ref without tracking mount state itself. */
+  onDirtyChange?: (dirty: boolean) => void;
+  /** `"card"` (default) draws the form as a bordered card, for embedding
+   *  inside a dialog body; `"page"` drops the card chrome and gives the
+   *  footer a top border, for hosting as a whole subpage (Settings → Agents'
+   *  editor). Test ids, labels and disabled rules are identical in both. */
+  variant?: "card" | "page";
 }
+
+const CARD_ROOT_CLASS = "rounded-md border border-border/60 p-3";
+const PAGE_FOOTER_CLASS = "border-t border-border/60 pt-3";
 
 /**
  * The agent-profile create/edit form — name, harness/mode/model/effort/fast/
  * maxMode (via `<TaskLaunchPickers hideProfilePicker>`), instructions and
- * skills. Extracted out of `AgentProfilesSection` (Settings → Agents) so a
- * second consumer (a pipeline step's inline "create an agent" affordance,
- * via `AgentProfileFormDialog` below) can reuse it verbatim rather than
- * duplicating the save/validation logic. Every test id, label, placeholder
+ * skills. Extracted out of `AgentProfilesSection` (Settings → Agents) so it
+ * can be hosted twice without duplicating the save/validation logic: as the
+ * Settings modal's agent-editor subpage (`variant="page"`) and inside
+ * `AgentProfileFormDialog` below (a pipeline step's inline "create an
+ * agent" affordance). Every test id, label, placeholder
  * and disabled rule from the original inline form is preserved unchanged.
  *
  * This outer component only RESOLVES the profile being edited from the
@@ -60,7 +78,7 @@ export interface AgentProfileFormProps {
  * "Loading…" line (no Save button at all) and a genuinely-missing one an
  * error with only Cancel.
  */
-export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus }: AgentProfileFormProps) {
+export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus, onDirtyChange, variant = "card" }: AgentProfileFormProps) {
   const { profiles, loaded, refresh } = useAgentProfiles();
 
   if (profileId === null) {
@@ -72,6 +90,8 @@ export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus }: Ag
         onSaved={onSaved}
         onCancel={onCancel}
         autoFocus={autoFocus}
+        onDirtyChange={onDirtyChange}
+        variant={variant}
         refreshProfiles={refresh}
       />
     );
@@ -87,13 +107,15 @@ export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus }: Ag
         onSaved={onSaved}
         onCancel={onCancel}
         autoFocus={autoFocus}
+        onDirtyChange={onDirtyChange}
+        variant={variant}
         refreshProfiles={refresh}
       />
     );
   }
 
   return (
-    <div data-testid="agent-profile-form" className="space-y-3 rounded-md border border-border/60 p-3">
+    <div data-testid="agent-profile-form" className={cn("space-y-3", variant === "card" && CARD_ROOT_CLASS)}>
       {loaded ? (
         <div
           data-testid="agent-profile-form-error"
@@ -106,7 +128,7 @@ export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus }: Ag
           Loading…
         </div>
       )}
-      <div className="flex justify-end gap-2">
+      <div className={cn("flex justify-end gap-2", variant === "page" && PAGE_FOOTER_CLASS)}>
         <Button variant="outline" size="sm" data-testid="agent-profile-cancel" onClick={onCancel}>
           Cancel
         </Button>
@@ -124,12 +146,25 @@ interface AgentProfileFormBodyProps extends AgentProfileFormProps {
   refreshProfiles: () => Promise<void>;
 }
 
-function AgentProfileFormBody({ profileId, editingProfile, onSaved, onCancel, autoFocus, refreshProfiles }: AgentProfileFormBodyProps) {
+function AgentProfileFormBody({
+  profileId,
+  editingProfile,
+  onSaved,
+  onCancel,
+  autoFocus,
+  onDirtyChange,
+  variant = "card",
+  refreshProfiles,
+}: AgentProfileFormBodyProps) {
   const [form, setForm] = useState<FormState>(() =>
     editingProfile
       ? { name: editingProfile.name, instructions: editingProfile.instructions, skills: editingProfile.skills }
       : EMPTY_FORM,
   );
+  // What the form opened with — `editingProfile` is fixed for this body's
+  // lifetime (the parent keys the body on its id), so the first render's
+  // values are the baseline for the whole life of the form.
+  const baselineRef = useRef<FormState>(form);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
@@ -152,6 +187,65 @@ function AgentProfileFormBody({ profileId, editingProfile, onSaved, onCancel, au
       : undefined,
   });
 
+  // The picker block is tracked by interaction, not by value: `useTaskLaunch`
+  // seeds mode/model/effort asynchronously (preferences, harness fetch) and
+  // its reset effects call its own internal setters, so a value diff would
+  // read an untouched form as dirty. Only a pick made through the setters
+  // `TaskLaunchPickers` calls marks the form touched.
+  const [launchTouched, setLaunchTouched] = useState(false);
+  const trackedLaunch = useMemo<TaskLaunch>(
+    () => ({
+      ...launch,
+      switchAgent: (id) => {
+        if (id !== launch.agent) setLaunchTouched(true);
+        launch.switchAgent(id);
+      },
+      setMode: (mode) => {
+        if (mode !== launch.mode) setLaunchTouched(true);
+        launch.setMode(mode);
+      },
+      setModel: (model) => {
+        if (model !== launch.model) setLaunchTouched(true);
+        launch.setModel(model);
+      },
+      setEffort: (effort) => {
+        if (effort !== launch.effort) setLaunchTouched(true);
+        launch.setEffort(effort);
+      },
+      setFast: (fast) => {
+        if (fast !== launch.fast) setLaunchTouched(true);
+        launch.setFast(fast);
+      },
+      setMaxMode: (maxMode) => {
+        if (maxMode !== launch.maxMode) setLaunchTouched(true);
+        launch.setMaxMode(maxMode);
+      },
+    }),
+    [launch],
+  );
+
+  // While a save is in flight the edits are being persisted, not discarded —
+  // report clean so leaving mid-save doesn't ask "Discard unsaved changes?".
+  // A failed save flips `saving` back and the form reads dirty again.
+  const dirty = (agentProfileTextDirty(form, baselineRef.current) || launchTouched) && !saving;
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  onDirtyChangeRef.current = onDirtyChange;
+  useEffect(() => {
+    onDirtyChangeRef.current?.(dirty);
+  }, [dirty]);
+  useEffect(() => () => onDirtyChangeRef.current?.(false), []);
+
+  // A save can resolve after the body is gone (the user left mid-save, or the
+  // host reopened onto a fresh form) — a late `onSaved` would then act on
+  // whichever form is showing NOW, so it and the state writes are skipped.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   const disabled = saving || !form.name.trim();
 
   const save = async () => {
@@ -173,16 +267,22 @@ function AgentProfileFormBody({ profileId, editingProfile, onSaved, onCancel, au
       };
       const saved = profileId ? await api.updateAgentProfile(profileId, input) : await api.createAgentProfile(input);
       await refreshProfiles();
-      onSaved(saved);
+      if (mountedRef.current) onSaved(saved);
     } catch (e) {
-      setSaveError(e instanceof Error ? e.message : String(e));
+      if (mountedRef.current) setSaveError(e instanceof Error ? e.message : String(e));
     } finally {
-      setSaving(false);
+      if (mountedRef.current) setSaving(false);
     }
   };
 
   return (
-    <div data-testid="agent-profile-form" className="space-y-3 rounded-md border border-border/60 p-3">
+    <div data-testid="agent-profile-form" className={cn("space-y-3", variant === "card" && CARD_ROOT_CLASS)}>
+      {/* Every draft-changing control is inert while a save is in flight: the
+          form reports clean then (see `dirty` above) and pops on success, so
+          an edit typed after Save captured its values would be dropped
+          without a confirm. `TaskLaunchPickers` has no `disabled` prop — the
+          fieldset reaches its selects/buttons/switches natively. */}
+      <fieldset disabled={saving} className="m-0 min-w-0 space-y-3 border-0 p-0">
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Name</label>
         <Input
@@ -196,7 +296,7 @@ function AgentProfileFormBody({ profileId, editingProfile, onSaved, onCancel, au
         />
       </div>
 
-      <TaskLaunchPickers launch={launch} hideProfilePicker />
+      <TaskLaunchPickers launch={trackedLaunch} hideProfilePicker />
 
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Instructions</label>
@@ -216,8 +316,10 @@ function AgentProfileFormBody({ profileId, editingProfile, onSaved, onCancel, au
           value={form.skills}
           onChange={(skills) => setForm({ ...form, skills })}
           harnessId={launch.agent}
+          disabled={saving}
         />
       </div>
+      </fieldset>
 
       {saveError && (
         <div
@@ -228,7 +330,7 @@ function AgentProfileFormBody({ profileId, editingProfile, onSaved, onCancel, au
         </div>
       )}
 
-      <div className="flex justify-end gap-2">
+      <div className={cn("flex justify-end gap-2", variant === "page" && PAGE_FOOTER_CLASS)}>
         <Button variant="outline" size="sm" data-testid="agent-profile-cancel" onClick={onCancel} disabled={saving}>
           Cancel
         </Button>
@@ -251,15 +353,44 @@ interface AgentProfileFormDialogProps {
  * Modal wrapper around {@link AgentProfileForm} — lets a surface that isn't
  * Settings (e.g. a Pipelines step's "New agent…" affordance) create or edit
  * an {@link AgentProfile} inline without leaving its own flow. Settings →
- * Agents keeps rendering `AgentProfileForm` inline (not through this
- * dialog) — see `AgentProfilesSection`.
+ * Agents does not use it — its Add/Edit open the Settings modal's own
+ * agent-editor subpage, which hosts `AgentProfileForm` directly.
+ *
+ * Escape, a backdrop click and the header X all route through
+ * `requestClose`, which asks "Discard unsaved changes?" when the form
+ * reports dirty; the form's own Cancel and a successful Save close at once.
  */
 export function AgentProfileFormDialog({ open, profileId, onClose, onSaved }: AgentProfileFormDialogProps) {
   const title = profileId ? "Edit agent" : "New agent";
+  const confirm = useConfirm();
+  const dirtyRef = useRef(false);
+  const confirmingRef = useRef(false);
+  const handleDirtyChange = useCallback((dirty: boolean) => {
+    dirtyRef.current = dirty;
+  }, []);
+  const requestClose = useCallback(async () => {
+    if (!dirtyRef.current) {
+      onClose();
+      return;
+    }
+    if (confirmingRef.current) return;
+    confirmingRef.current = true;
+    try {
+      const ok = await confirm({
+        title: "Discard unsaved changes?",
+        description: "Your edits to this agent will be lost.",
+        confirmLabel: "Discard",
+        variant: "destructive",
+      });
+      if (ok) onClose();
+    } finally {
+      confirmingRef.current = false;
+    }
+  }, [confirm, onClose]);
   return (
     <Dialog
       open={open}
-      onClose={onClose}
+      onClose={() => void requestClose()}
       labelledBy="agent-profile-form-dialog-title"
       className="flex max-h-[85vh] w-full max-w-lg flex-col p-0"
     >
@@ -268,7 +399,7 @@ export function AgentProfileFormDialog({ open, profileId, onClose, onSaved }: Ag
           <div id="agent-profile-form-dialog-title" className="text-sm font-semibold">
             {title}
           </div>
-          <Button variant="ghost" size="icon" className="shrink-0" title="Close" aria-label="Close" onClick={onClose}>
+          <Button variant="ghost" size="icon" className="shrink-0" title="Close" aria-label="Close" onClick={() => void requestClose()}>
             <X className="size-4" />
           </Button>
         </header>
@@ -282,6 +413,7 @@ export function AgentProfileFormDialog({ open, profileId, onClose, onSaved }: Ag
             }}
             onCancel={onClose}
             autoFocus
+            onDirtyChange={handleDirtyChange}
           />
         </div>
       </div>

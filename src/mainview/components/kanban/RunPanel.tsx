@@ -219,7 +219,7 @@ interface Props {
   onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
   /** "Manage agents…" — wired to the task-details Detach hint's sibling
    *  affordance and the header chip, mirroring `NewTaskForm`'s own prop. */
-  onOpenSettingsAgents: () => void;
+  onOpenSettingsAgents: (profileId?: string) => void;
   agentModels: AgentModelMap;
   /** Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`
    *  on the api client. Preferred over `agentModels` for the task's own
@@ -614,7 +614,7 @@ function RunPanelBody({
   agents: AgentStatus[];
   harnesses: Harness[];
   profiles: AgentProfile[] | null;
-  onOpenSettingsAgents: () => void;
+  onOpenSettingsAgents: (profileId?: string) => void;
   agentModels: AgentModelMap;
   harnessModels: Record<string, { id: string; label?: string }[]>;
   onRefreshModels: (harnessId?: string) => Promise<void>;
@@ -6771,7 +6771,7 @@ function TaskDetails({
    *  `agentProfileDisplay` when the task was never bound to a profile. */
   agentProfileForCard: AgentProfile | AgentProfileSnapshot | null;
   /** "Manage agents…" — the bound-profile hint's sibling link into Settings. */
-  onOpenSettingsAgents: () => void;
+  onOpenSettingsAgents: (profileId?: string) => void;
   agentModels: AgentModelMap;
   harnessModels: Record<string, { id: string; label?: string }[]>;
   onRefreshModels: (harnessId?: string) => Promise<void>;
@@ -7101,7 +7101,7 @@ function TaskDetails({
                   <button
                     type="button"
                     data-testid="task-agent-profile-manage"
-                    onClick={onOpenSettingsAgents}
+                    onClick={() => onOpenSettingsAgents()}
                     className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
                   >
                     Manage agents…

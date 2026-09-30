@@ -59,7 +59,7 @@ export function AgentProfileDetailsDialog({
   deleted: boolean;
   hasRun: boolean;
   harnesses: Harness[];
-  onOpenSettingsAgents: () => void;
+  onOpenSettingsAgents: (profileId?: string) => void;
 }) {
   const snapshot = task.agentProfile ?? null;
   const name = snapshot?.name ?? display?.name ?? "Agent";
@@ -179,7 +179,7 @@ export function AgentProfileDetailsDialog({
               variant="outline"
               data-testid="agent-profile-details-edit"
               onClick={() => {
-                onOpenSettingsAgents();
+                onOpenSettingsAgents(task.agentProfileId ?? undefined);
                 onClose();
               }}
             >

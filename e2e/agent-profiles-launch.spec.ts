@@ -432,11 +432,15 @@ test.describe("agent profiles: launch surfaces", () => {
 
     // Create a fourth profile ("Echo") through the Settings UI itself.
     await section.getByTestId("agent-profile-add").click();
-    const form3 = section.getByTestId("agent-profile-form");
+    // Add opens the editor SUBPAGE (the list is replaced), so the form is
+    // looked up on the dialog rather than inside the list section.
+    const form3 = dialog.getByTestId("agent-profile-form");
     await expect(form3).toBeVisible();
     await form3.getByTestId("agent-profile-name").fill("Echo");
     await form3.getByTestId("agent-profile-save").click();
+    // Save pops back to the list.
     await expect(form3).toBeHidden();
+    await expect(section).toBeVisible();
     const echoRow = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: "Echo" });
     await expect(echoRow).toBeVisible();
 

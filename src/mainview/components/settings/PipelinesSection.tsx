@@ -18,9 +18,9 @@ interface Props {
  * Settings → Pipelines — a lightweight list (name, step count, "used by N
  * task(s)", Edit, Delete) that hands off to the full-page canvas editor for
  * actual editing (T8, `docs/plans/pipelines.md`). Mirrors
- * `AgentProfilesSection`'s CRUD posture but doesn't render the editor
- * inline — the editor is a full-page React Flow canvas, not a form that
- * fits in the Settings pane.
+ * `AgentProfilesSection`'s list-and-delete posture, but the editor is a
+ * full-page React Flow canvas, so this hands off to that page (closing
+ * Settings) instead of opening a Settings subpage the way Agents does.
  */
 export function PipelinesSection({ onOpenPipelines }: Props) {
   const { pipelines, loading, error: loadError, refresh } = usePipelines();

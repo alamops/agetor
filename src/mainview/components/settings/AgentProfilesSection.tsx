@@ -6,7 +6,6 @@ import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm";
 import type { AgentProfile, Harness } from "../../../shared/types.ts";
 import { AgentProfileCard } from "@/components/kanban/AgentProfileCard";
-import { AgentProfileForm } from "@/components/kanban/AgentProfileFormDialog";
 import { useAgentProfiles } from "@/lib/agent-profiles";
 
 /** Render `p.taskCount` (server-derived, rides on the same `/agent-profiles`
@@ -25,32 +24,25 @@ interface Props {
    *  `AgentProfileCard`'s `resolveHarnessDisplay`). Passed down from
    *  `SettingsDialog`, which already loads them for the Harnesses section. */
   harnesses: Harness[];
+  /** Open the create form — `SettingsDialog` navigates to its agent-editor
+   *  subpage. */
+  onAdd: () => void;
+  /** Open the edit form for `profile` (same subpage, keyed on its id). */
+  onEdit: (profile: AgentProfile) => void;
 }
 
 /**
- * Settings → Agents — CRUD for reusable {@link AgentProfile} launch presets.
- * The create/edit form itself (name, harness/mode/model/effort/fast/
- * maxMode, instructions, skills) is `AgentProfileForm`
- * (`@/components/kanban/AgentProfileFormDialog`) — extracted so a pipeline
- * step's inline "New agent…" affordance can reuse it via
- * `AgentProfileFormDialog` without duplicating the save/validation logic.
- * This section renders it inline (not through the dialog wrapper) exactly
- * where its own hand-rolled form used to live, so its behavior — including
- * the `useTaskLaunch`/`initial`-seeding race fix documented on
- * `AgentProfileForm` — is unchanged.
+ * Settings → Agents — the list of reusable {@link AgentProfile} launch
+ * presets, with delete. List-only: Add and Edit hand off through `onAdd` /
+ * `onEdit` to `SettingsDialog`, which navigates its own agent-editor subpage
+ * to `AgentProfileForm` (`@/components/kanban/AgentProfileFormDialog`, also
+ * reused by a pipeline step's inline "New agent…" affordance via
+ * `AgentProfileFormDialog`).
  */
-export function AgentProfilesSection({ harnesses }: Props) {
+export function AgentProfilesSection({ harnesses, onAdd, onEdit }: Props) {
   const { profiles, loading, error: loadError, refresh } = useAgentProfiles();
-  // `null` when no form is open; `{ id }` for a create (`id: null`) or edit
-  // (`id: <profileId>`) form — `AgentProfileForm` resolves the profile being
-  // edited itself from the shared `useAgentProfiles()` cache.
-  const [form, setForm] = useState<{ id: string | null } | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const confirm = useConfirm();
-
-  const openCreate = () => setForm({ id: null });
-  const openEdit = (p: AgentProfile) => setForm({ id: p.id });
-  const closeForm = () => setForm(null);
 
   const remove = async (p: AgentProfile) => {
     const n = p.taskCount ?? 0;
@@ -82,11 +74,9 @@ export function AgentProfilesSection({ harnesses }: Props) {
     <div data-testid="agent-profiles-section" className="space-y-4 pt-3 text-sm">
       <div className="flex items-center justify-between">
         <label className="text-xs text-muted-foreground">Agents</label>
-        {!form && (
-          <Button variant="outline" size="sm" data-testid="agent-profile-add" onClick={openCreate}>
-            <Plus className="mr-1 size-3.5" /> Add agent
-          </Button>
-        )}
+        <Button variant="outline" size="sm" data-testid="agent-profile-add" onClick={onAdd}>
+          <Plus className="mr-1 size-3.5" /> Add agent
+        </Button>
       </div>
 
       {loadError && (
@@ -111,13 +101,7 @@ export function AgentProfilesSection({ harnesses }: Props) {
                 </p>
               </div>
               <div className="flex shrink-0 items-center gap-1 pt-0.5">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  data-testid="agent-profile-edit"
-                  onClick={() => openEdit(p)}
-                  disabled={form !== null}
-                >
+                <Button size="sm" variant="ghost" data-testid="agent-profile-edit" onClick={() => onEdit(p)}>
                   Edit
                 </Button>
                 <Button
@@ -139,18 +123,6 @@ export function AgentProfilesSection({ harnesses }: Props) {
             </p>
           )}
         </div>
-      )}
-
-      {form && (
-        // Keyed by the profile being edited (or "new" for a create) so
-        // switching Edit from profile A straight to profile B remounts the
-        // form instead of reusing A's stale internal state (nit7).
-        <AgentProfileForm
-          key={form.id ?? "new"}
-          profileId={form.id}
-          onSaved={closeForm}
-          onCancel={closeForm}
-        />
       )}
     </div>
   );

@@ -315,7 +315,9 @@ test.describe("agent profiles", () => {
 
     // ---- Create "Reviewer" ----
     await section.getByTestId("agent-profile-add").click();
-    const form = section.getByTestId("agent-profile-form");
+    // The form lives on the Settings modal's editor subpage, not inside the
+    // list section — look it up on the dialog.
+    const form = dialog.getByTestId("agent-profile-form");
     await expect(form).toBeVisible();
 
     await form.getByTestId("agent-profile-name").fill("Reviewer");
@@ -332,6 +334,7 @@ test.describe("agent profiles", () => {
 
     await form.getByTestId("agent-profile-save").click();
     await expect(form).toBeHidden();
+    await expect(section).toBeVisible();
 
     const row = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: "Reviewer" });
     await expect(row).toBeVisible();
@@ -342,32 +345,35 @@ test.describe("agent profiles", () => {
 
     // ---- Edit: rename to "Reviewer v2" ----
     await row.getByTestId("agent-profile-edit").click();
-    const editForm = section.getByTestId("agent-profile-form");
+    const editForm = dialog.getByTestId("agent-profile-form");
     await expect(editForm).toBeVisible();
     await expect(editForm.getByTestId("agent-profile-name")).toHaveValue("Reviewer");
     await editForm.getByTestId("agent-profile-name").fill(PROFILE_NAME);
     await editForm.getByTestId("agent-profile-save").click();
     await expect(editForm).toBeHidden();
+    await expect(section).toBeVisible();
 
     const renamedRow = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: PROFILE_NAME });
     await expect(renamedRow).toBeVisible();
 
     // ---- Duplicate: a second profile named "reviewer v2" (case-insensitive clash) ----
     await section.getByTestId("agent-profile-add").click();
-    const dupForm = section.getByTestId("agent-profile-form");
+    const dupForm = dialog.getByTestId("agent-profile-form");
     await expect(dupForm).toBeVisible();
     await dupForm.getByTestId("agent-profile-name").fill("reviewer v2");
     await dupForm.getByTestId("agent-profile-save").click();
     await expect(dupForm.getByTestId("agent-profile-form-error")).toContainText("already in use");
-    // No second row was created — scoped to this spec's own name family
-    // ("Reviewer" was renamed to "Reviewer v2" above) rather than the whole
-    // list, which may also hold profiles left behind by another spec file
-    // sharing this worker's backend.
+    // The list isn't rendered while the editor subpage is up — Cancel back
+    // to it, then check that no second row was created. Scoped to this spec's
+    // own name family ("Reviewer" was renamed to "Reviewer v2" above) rather
+    // than the whole list, which may also hold profiles left behind by
+    // another spec file sharing this worker's backend.
+    await dupForm.getByTestId("agent-profile-cancel").click();
+    await expect(dupForm).toBeHidden();
+    await expect(section).toBeVisible();
     await expect(
       section.locator('[data-testid="agent-profile-row"]').filter({ hasText: "Reviewer" }),
     ).toHaveCount(1);
-    await dupForm.getByTestId("agent-profile-cancel").click();
-    await expect(dupForm).toBeHidden();
   });
 
   test("Launch from New Task: picker replaces the manual block; run injects instructions", async ({
@@ -471,13 +477,26 @@ test.describe("agent profiles", () => {
       "Frozen since the task's first run",
     );
 
-    // "Edit in Settings" deep-links into Settings → Agents and closes the
+    // "Edit in Settings" deep-links straight onto THIS profile's edit
+    // subpage in Settings → Agents (not the plain list) and closes the
     // dialog on the way.
     await detailsDialog.getByTestId("agent-profile-details-edit").click();
     await expect(detailsDialog).toBeHidden();
     const settingsDialog = page.getByRole("dialog");
+    await expect(settingsDialog.getByRole("heading", { name: "Edit agent" })).toBeVisible();
+    await expect(settingsDialog.getByTestId("agent-profile-editor")).toBeVisible();
+    await expect(settingsDialog.getByTestId("agent-profiles-section")).toHaveCount(0);
+    await expect(settingsDialog.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    // Pre-filled with the bound profile — the form's Name is the profile's.
+    await expect(settingsDialog.getByTestId("agent-profile-name")).toHaveValue(PROFILE_NAME);
+    // Back (clean form, so no confirm) lands on the agents list.
+    await settingsDialog.getByRole("button", { name: "Back", exact: true }).click();
     await expect(settingsDialog.getByRole("heading", { name: "Settings" })).toBeVisible();
     await expect(settingsDialog.getByTestId("agent-profiles-section")).toBeVisible();
+    await expect(settingsDialog.getByTestId("agent-profile-editor")).toHaveCount(0);
     await settingsDialog.getByRole("button", { name: "Close", exact: true }).click();
     await expect(settingsDialog).toBeHidden();
 

@@ -269,6 +269,11 @@ function AppInner() {
   // onboarding's "Enable in Settings…" deep link, cleared on close so the
   // plain gear-icon open still lands on General.
   const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsSectionId | undefined>(undefined);
+  // Agent profile whose edit subpage the Settings dialog should open on —
+  // set only by the "Edit in Settings" buttons (task-details Agent row,
+  // pipeline subagent satellite), cleared on every close/other open path so a
+  // later "Manage agents…" or gear open lands on the plain list.
+  const [settingsInitialAgentId, setSettingsInitialAgentId] = useState<string | null>(null);
   // --- Onboarding (docs/plans/onboarding-first-run.md) ---------------------
   // Server preference mirror. `undefined` = never fetched OR never set;
   // `resolveOnboardingVisibility` treats those the same (both gate on
@@ -1442,10 +1447,16 @@ function AppInner() {
   }, []);
   const openSettingsHarnesses = useCallback(() => {
     setSettingsInitialSection("harnesses");
+    setSettingsInitialAgentId(null);
     setSettingsOpen(true);
   }, []);
-  const openSettingsAgents = useCallback(() => {
+  // `profileId` deep-links to that profile's edit subpage; no argument opens
+  // the plain Agents list. The `typeof` guard is load-bearing: callers may
+  // hand this straight to an `onClick`, and a click event must never become
+  // a profile id.
+  const openSettingsAgents = useCallback((profileId?: string) => {
     setSettingsInitialSection("agents");
+    setSettingsInitialAgentId(typeof profileId === "string" ? profileId : null);
     setSettingsOpen(true);
   }, []);
   /** Switch the app-level `view` to the full-page pipelines list — the
@@ -1461,6 +1472,8 @@ function AppInner() {
    *  gear icon stays live), so this can also be leaving a dirty editor. */
   const onSettingsOpenPipelines = useCallback((id: string | null, editing: boolean) => {
     setSettingsOpen(false);
+    setSettingsInitialAgentId(null);
+    setSettingsInitialSection(undefined);
     navigate({ kind: "pipelines", pipelineId: id, editing });
   }, [navigate]);
   const onFocusNewTask = useCallback(() => {
@@ -2385,6 +2398,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           // Clear the deep-link so a later plain gear-icon open lands back
           // on General instead of wherever onboarding last sent it.
           setSettingsInitialSection(undefined);
+          setSettingsInitialAgentId(null);
           // Reflects a "Show getting started guide" replay (General section
           // writes the pref server-side, then calls this same onClose) —
           // simplest correct option without threading a dedicated callback
@@ -2400,6 +2414,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         homeDir={homeDir}
         dataDir={dataDir}
         initialSection={settingsInitialSection}
+        initialAgentProfileId={settingsInitialAgentId}
         onOpenPipelines={onSettingsOpenPipelines}
       />
       <TmuxInstallDialog
