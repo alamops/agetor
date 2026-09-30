@@ -70,7 +70,7 @@ interface PipelineEditorProps {
    *  discard-guard the in-editor Back button already applies. */
   onDirtyChange?: (dirty: boolean) => void;
   /** Offered as "Edit in Settings" from a satellite's details dialog. */
-  onOpenSettingsAgents?: () => void;
+  onOpenSettingsAgents?: (profileId?: string) => void;
 }
 
 /** `maxSteps` is the RAW text of the Max-steps input (see `maxStepsInput` in

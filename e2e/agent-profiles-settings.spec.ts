@@ -13,9 +13,16 @@ import { AGENT_PROFILE_LIMITS } from "../src/shared/agent-profile.ts";
  * so this file goes deep on the Settings form/list instead: validation,
  * edit-seeding (the exact race `docs/plans/agent-profiles.md` §10's "Review"
  * notes call out — `useTaskLaunch`'s `initial` option), the `SkillsPicker`'s
- * keyboard/mouse contract, draft survival across Settings section switches,
- * the cursor-only fast/max-mode toggles, the disabled-harness marker, the
- * harness-delete guard, and duplicate-name/task-count edge cases.
+ * keyboard/mouse contract, the cursor-only fast/max-mode toggles, the
+ * disabled-harness marker, the harness-delete guard, duplicate-name/task-count
+ * edge cases — and (docs/plans/agents-new-edit-subpage.md) the Add/Edit
+ * SUBPAGE: "Add agent" / a row's "Edit" replace the list inside the Settings
+ * modal with an editor page (heading "Add agent"/"Edit agent", a header Back
+ * button, sidebar "Agents" still current), Back/Escape/backdrop pop to the
+ * list, and every exit but the form's own Cancel asks "Discard unsaved
+ * changes?" when the draft is dirty. The same guard on the harness editor
+ * lives in `e2e/settings-subpage-guard.spec.ts`; the pipeline step's "New
+ * agent" dialog is covered in `e2e/pipelines-editor.spec.ts`.
  *
  * One serial `describe` sharing the worker backend (`e2e/fixtures.ts`) and
  * building on itself exactly like `e2e/agent-profiles.spec.ts` does: scenario
@@ -108,6 +115,50 @@ function launchSelect(container: Locator, label: string): Locator {
     .locator("xpath=following-sibling::*[1]//select");
 }
 
+/**
+ * The Settings modal itself, located by its own title id — NOT bare
+ * `getByRole("dialog")`, which becomes ambiguous (strict-mode violation on
+ * `toBeHidden()` etc.) the moment the "Discard unsaved changes?" confirm
+ * stacks a second `role="dialog"` on top of it. `Dialog` puts the role on the
+ * fixed full-screen backdrop, so a click near the top-left corner of this
+ * locator lands on the backdrop (outside the panel) — see `clickBackdrop`.
+ */
+function settingsModal(page: Page): Locator {
+  return page.getByRole("dialog").filter({ has: page.locator("#settings-dialog-title") });
+}
+
+/** The shared confirm dialog (`ui/confirm.tsx`) the dirty-leave guard raises. */
+function discardConfirm(page: Page): Locator {
+  return page.getByRole("dialog", { name: "Discard unsaved changes?", exact: true });
+}
+
+/** Click the modal's dimmed backdrop (the `role="dialog"` overlay's own
+ *  padding, outside the panel) — the panel stops propagation, the overlay
+ *  routes the click to `onClose`. */
+async function clickBackdrop(modal: Locator): Promise<void> {
+  await modal.click({ position: { x: 4, y: 4 } });
+}
+
+/** From an already-loaded app: opens Settings → Agents → Add agent and waits
+ *  for the editor subpage. Returns the modal and the (empty) form. */
+async function openAddSubpage(page: Page): Promise<{ modal: Locator; form: Locator }> {
+  await openSettingsAgents(page);
+  const modal = settingsModal(page);
+  await modal.getByTestId("agent-profile-add").click();
+  const form = modal.getByTestId("agent-profile-form");
+  await expect(form).toBeVisible();
+  await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+  return { modal, form };
+}
+
+/** Asserts the modal is back on the plain Agents list (section view). */
+async function expectAgentsList(modal: Locator): Promise<void> {
+  await expect(modal.getByRole("heading", { name: "Settings" })).toBeVisible();
+  await expect(modal.getByTestId("agent-profiles-section")).toBeVisible();
+  await expect(modal.getByTestId("agent-profile-editor")).toHaveCount(0);
+  await expect(modal.getByRole("button", { name: "Back", exact: true })).toHaveCount(0);
+}
+
 /** One of the harness-picker's grid buttons (`AgentIcon` + exact label text;
  *  the icon is `aria-hidden`, so `name` matches the label alone). */
 function harnessButton(container: Locator, label: string): Locator {
@@ -177,7 +228,7 @@ test.describe("agent profiles — Settings surface", () => {
     const section = dialog.getByTestId("agent-profiles-section");
 
     await section.getByTestId("agent-profile-add").click();
-    const form = section.getByTestId("agent-profile-form");
+    const form = dialog.getByTestId("agent-profile-form");
     await expect(form).toBeVisible();
 
     const nameInput = form.getByTestId("agent-profile-name");
@@ -239,7 +290,7 @@ test.describe("agent profiles — Settings surface", () => {
     // Name over 80 chars is capped by the input's `maxLength` — a throwaway
     // second Add form, cancelled afterward.
     await section.getByTestId("agent-profile-add").click();
-    const capForm = section.getByTestId("agent-profile-form");
+    const capForm = dialog.getByTestId("agent-profile-form");
     await expect(capForm).toBeVisible();
     const capName = capForm.getByTestId("agent-profile-name");
     await capName.pressSequentially("x".repeat(AGENT_PROFILE_LIMITS.name + 10));
@@ -261,7 +312,7 @@ test.describe("agent profiles — Settings surface", () => {
 
     const row = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: WIDGET_BUILDER_NAME });
     await row.getByTestId("agent-profile-edit").click();
-    const form = section.getByTestId("agent-profile-form");
+    const form = dialog.getByTestId("agent-profile-form");
     await expect(form).toBeVisible();
 
     await expect(form.getByTestId("agent-profile-name")).toHaveValue(WIDGET_BUILDER_NAME);
@@ -297,7 +348,7 @@ test.describe("agent profiles — Settings surface", () => {
     const section = dialog.getByTestId("agent-profiles-section");
 
     await section.getByTestId("agent-profile-add").click();
-    const form = section.getByTestId("agent-profile-form");
+    const form = dialog.getByTestId("agent-profile-form");
     await expect(form).toBeVisible();
     await form.getByTestId("agent-profile-name").fill(`Skills Scratch ${randomUUID()}`);
 
@@ -363,7 +414,9 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(codeReviewRow).toBeVisible({ timeout: 5_000 });
     await input.press("Escape");
     await expect(codeReviewRow).toBeHidden();
-    await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
+    // Still on the editor subpage: the popover consumed the Escape, so the
+    // modal neither popped back to the list nor closed.
+    await expect(dialog.getByRole("heading", { name: "Add agent" })).toBeVisible();
     await expect(form).toBeVisible();
     await input.fill("");
 
@@ -385,34 +438,346 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(form).toBeHidden();
   });
 
-  test("Draft survives switching Settings sections and back", async ({ page, backend }) => {
+  test("Sidebar click with a dirty draft asks to discard: decline keeps the draft, accept navigates and drops it", async ({
+    page,
+    backend,
+  }) => {
     await gotoApp(page, backend.bootBase);
-    const dialog = await openSettingsAgents(page);
-    const section = dialog.getByTestId("agent-profiles-section");
-
-    await section.getByTestId("agent-profile-add").click();
-    const form = section.getByTestId("agent-profile-form");
-    await expect(form).toBeVisible();
-    const draftName = `Draft Survivor ${randomUUID()}`;
+    const { modal, form } = await openAddSubpage(page);
+    const draftName = `Draft Discard ${randomUUID()}`;
+    const draftInstructions = "Draft instructions that a sidebar click must not silently drop.";
     await form.getByTestId("agent-profile-name").fill(draftName);
-    await form.getByTestId("agent-profile-instructions").fill("Draft instructions that must survive a tab switch.");
+    await form.getByTestId("agent-profile-instructions").fill(draftInstructions);
 
-    // AgentProfilesSection is always-mounted (hidden via className, not
-    // unmounted) exactly like the Git/Saved-Prompts sections — switching
-    // away and back must not lose the in-progress form.
-    await dialog.getByRole("button", { name: "General", exact: true }).click();
-    await expect(section).toBeHidden();
-
-    await dialog.getByRole("button", { name: "Agents", exact: true }).click();
-    await expect(section).toBeVisible();
-    await expect(form).toBeVisible();
+    // The draft no longer survives a section switch silently — the editor is
+    // a subpage, so leaving it is guarded. Decline keeps everything.
+    await modal.getByRole("button", { name: "General", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await expect(confirm).toContainText("Your edits to this agent will be lost.");
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
     await expect(form.getByTestId("agent-profile-name")).toHaveValue(draftName);
-    await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(
-      "Draft instructions that must survive a tab switch.",
-    );
+    await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(draftInstructions);
+    await expect(modal.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+
+    // Accept navigates to General…
+    await modal.getByRole("button", { name: "General", exact: true }).click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal.getByRole("heading", { name: "Settings" })).toBeVisible();
+    await expect(modal.getByRole("button", { name: "General", exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(form).toHaveCount(0);
+
+    // …and coming back to Agents shows the LIST, not the old draft; a fresh
+    // Add form is empty.
+    await modal.getByRole("button", { name: "Agents", exact: true }).click();
+    await expectAgentsList(modal);
+    await modal.getByTestId("agent-profile-add").click();
+    const fresh = modal.getByTestId("agent-profile-form");
+    await expect(fresh).toBeVisible();
+    await expect(fresh.getByTestId("agent-profile-name")).toHaveValue("");
+    await expect(fresh.getByTestId("agent-profile-instructions")).toHaveValue("");
+    await fresh.getByTestId("agent-profile-cancel").click();
+    await expectAgentsList(modal);
+  });
+
+  test("Add opens an editor subpage: heading, Back button, list hidden, sidebar keeps Agents current; clean Back pops with no confirm", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+
+    // The list is REPLACED by the editor (not rendered beside/under it).
+    await expect(modal.getByTestId("agent-profile-editor")).toBeVisible();
+    await expect(form).toBeVisible();
+    await expect(modal.getByTestId("agent-profiles-section")).toHaveCount(0);
+    await expect(modal.getByTestId("agent-profile-add")).toHaveCount(0);
+    await expect(modal.getByRole("button", { name: "Back", exact: true })).toBeVisible();
+    await expect(modal.getByRole("heading", { name: "Settings" })).toHaveCount(0);
+    // The sidebar stays and keeps Agents highlighted.
+    await expect(modal.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+
+    // Untouched form: Back pops straight to the list, no confirm.
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+  });
+
+  test("Edit opens the editor subpage for that row; an untouched (even fully seeded) form pops on Back, Escape and backdrop with no confirm", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    await openSettingsAgents(page);
+    const modal = settingsModal(page);
+    const row = modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: WIDGET_BUILDER_NAME });
+    await row.getByTestId("agent-profile-edit").click();
+
+    const form = modal.getByTestId("agent-profile-form");
+    await expect(modal.getByRole("heading", { name: "Edit agent" })).toBeVisible();
+    await expect(modal.getByTestId("agent-profile-editor")).toBeVisible();
+    await expect(modal.getByTestId("agent-profiles-section")).toHaveCount(0);
+    await expect(modal.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(WIDGET_BUILDER_NAME);
+    // Wait for the async launch seeding (harness fetch, preference reads) to
+    // fully settle — an untouched Edit form must not read dirty afterwards.
+    await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
+    await expect(launchSelect(form, "Model")).toHaveValue("sonnet-5");
+    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
+
+    // Back.
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+
+    // Escape pops (does NOT close the modal), still no confirm.
+    await row.getByTestId("agent-profile-edit").click();
+    await expect(modal.getByRole("heading", { name: "Edit agent" })).toBeVisible();
+    await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
+    await page.keyboard.press("Escape");
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal).toBeVisible();
+
+    // Backdrop click pops too.
+    await row.getByTestId("agent-profile-edit").click();
+    await expect(modal.getByRole("heading", { name: "Edit agent" })).toBeVisible();
+    await clickBackdrop(modal);
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal).toBeVisible();
+
+    // From the list (section view), Escape now closes the modal outright.
+    await page.keyboard.press("Escape");
+    await expect(modal).toBeHidden();
+  });
+
+  test("Clean Add: Escape and backdrop pop to the list with no confirm and keep the Settings modal open", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal } = await openAddSubpage(page);
+
+    await page.keyboard.press("Escape");
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal).toBeVisible();
+
+    await modal.getByTestId("agent-profile-add").click();
+    await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+    await clickBackdrop(modal);
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal).toBeVisible();
+  });
+
+  test("Dirty Back confirms: decline keeps the draft on the form, accept pops to the list and discards it", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    const draftName = `Dirty Back ${randomUUID()}`;
+    await form.getByTestId("agent-profile-name").fill(draftName);
+    await form.getByTestId("agent-profile-instructions").fill("Half-written instructions.");
+
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await expect(confirm.getByRole("button", { name: "Discard", exact: true })).toBeVisible();
+    // Decline → still on the form, draft intact.
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(draftName);
+    await expect(form.getByTestId("agent-profile-instructions")).toHaveValue("Half-written instructions.");
+
+    // Accept → list; the draft is gone (a fresh Add form is empty).
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expectAgentsList(modal);
+    // Nothing was saved.
+    await expect(
+      modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: draftName }),
+    ).toHaveCount(0);
+    await modal.getByTestId("agent-profile-add").click();
+    await expect(modal.getByTestId("agent-profile-form").getByTestId("agent-profile-name")).toHaveValue("");
+    await modal.getByTestId("agent-profile-cancel").click();
+    await expectAgentsList(modal);
+  });
+
+  test("Dirty Escape confirms: Escape on the confirm declines and keeps the draft, accept pops to the list", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    const draftName = `Dirty Escape ${randomUUID()}`;
+    await form.getByTestId("agent-profile-name").fill(draftName);
+
+    await page.keyboard.press("Escape");
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    // Escape while the confirm is on top closes only the confirm (= decline).
+    await page.keyboard.press("Escape");
+    await expect(confirm).toBeHidden();
+    await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(draftName);
+
+    await page.keyboard.press("Escape");
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expectAgentsList(modal);
+    // Popped, not closed.
+    await expect(modal).toBeVisible();
+  });
+
+  test("Dirty backdrop click confirms: decline keeps the draft, accept pops to the list", async ({ page, backend }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    const draftName = `Dirty Backdrop ${randomUUID()}`;
+    await form.getByTestId("agent-profile-name").fill(draftName);
+
+    await clickBackdrop(modal);
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(draftName);
+
+    await clickBackdrop(modal);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expectAgentsList(modal);
+    await expect(modal).toBeVisible();
+  });
+
+  test("Dirty header X confirms: decline keeps the draft, accept closes the whole Settings modal", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    const draftName = `Dirty Close ${randomUUID()}`;
+    await form.getByTestId("agent-profile-name").fill(draftName);
+
+    await modal.getByRole("button", { name: "Close", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(draftName);
+
+    await modal.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal).toBeHidden();
+
+    // Reopening Settings starts fresh on General (no stale draft/subpage).
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(settingsModal(page).getByRole("heading", { name: "Settings" })).toBeVisible();
+    await expect(settingsModal(page).getByTestId("agent-profile-editor")).toHaveCount(0);
+  });
+
+  test("Reopening Settings after closing from the Add subpage starts on General with no editor mounted, and closing again restores focus to the gear", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal } = await openAddSubpage(page);
+
+    // Clean form: the header X closes the whole modal with no confirm.
+    await modal.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal).toBeHidden();
+
+    const gear = page.getByRole("button", { name: "Settings", exact: true });
+    await gear.click();
+    await expect(modal.getByRole("heading", { name: "Settings" })).toBeVisible();
+    await expect(modal.getByRole("button", { name: "General", exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(modal.getByTestId("agent-profile-editor")).toHaveCount(0);
+    await expect(modal.getByTestId("agent-profile-form")).toHaveCount(0);
+
+    // The editor was never mounted on the reopen, so its autoFocus Name input
+    // can't have been recorded as the focus-restore target — closing returns
+    // focus to the element that opened Settings.
+    await page.keyboard.press("Escape");
+    await expect(modal).toBeHidden();
+    await expect(gear).toBeFocused();
+  });
+
+  test("Dirty Edit (rename, never saved): Back confirms, accept leaves the stored profile untouched", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    await openSettingsAgents(page);
+    const modal = settingsModal(page);
+    const row = modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: WIDGET_BUILDER_NAME });
+    await row.getByTestId("agent-profile-edit").click();
+    const form = modal.getByTestId("agent-profile-form");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(WIDGET_BUILDER_NAME);
+    await form.getByTestId("agent-profile-name").fill(`${WIDGET_BUILDER_NAME} renamed`);
+
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expectAgentsList(modal);
+
+    const stored = await getAgentProfile(request, backend, widgetBuilderId);
+    expect(stored.name).toBe(WIDGET_BUILDER_NAME);
+    await expect(row).toBeVisible();
+  });
+
+  test("Cancel on a dirty form pops to the list immediately, with no confirm", async ({ page, backend }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    await form.getByTestId("agent-profile-name").fill(`Dirty Cancel ${randomUUID()}`);
+    await form.getByTestId("agent-profile-instructions").fill("Discarded by Cancel.");
 
     await form.getByTestId("agent-profile-cancel").click();
-    await expect(form).toBeHidden();
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal).toBeVisible();
+  });
+
+  test("A change to ONLY a launch picker (Mode select) counts as dirty", async ({ page, backend }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    // Name and every text field stay untouched. Let the picker block finish
+    // its async seeding first, so the pick below is unambiguously the user's.
+    await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue("");
+    await launchSelect(form, "Mode").selectOption("plan");
+    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
+
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
+
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expectAgentsList(modal);
   });
 
   test("Cursor-only fast/max-mode toggles: appear for a supporting model, hide for claude-code, persist maxMode", async ({
@@ -427,7 +792,7 @@ test.describe("agent profiles — Settings surface", () => {
     const section = dialog.getByTestId("agent-profiles-section");
 
     await section.getByTestId("agent-profile-add").click();
-    const form = section.getByTestId("agent-profile-form");
+    const form = dialog.getByTestId("agent-profile-form");
     await expect(form).toBeVisible();
     const cursorName = `Cursor MaxMode Test ${randomUUID()}`;
     await form.getByTestId("agent-profile-name").fill(cursorName);
@@ -464,7 +829,7 @@ test.describe("agent profiles — Settings surface", () => {
     // Switching the form back to claude-code hides both toggles.
     const row = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: cursorName });
     await row.getByTestId("agent-profile-edit").click();
-    const editForm = section.getByTestId("agent-profile-form");
+    const editForm = dialog.getByTestId("agent-profile-form");
     await expect(editForm).toBeVisible();
     await expect(editForm.getByTestId("launch-max-mode-toggle")).toBeVisible();
     await harnessButton(editForm, "Claude Code").click();
@@ -559,9 +924,8 @@ test.describe("agent profiles — Settings surface", () => {
 
     // The delete was refused server-side (409, a profile still references
     // it) — surfaced as a toast naming the blocking agent by name. Scoped to
-    // the sonner toast region — the always-mounted (hidden-not-unmounted)
-    // Agents section underneath also contains this profile's row text, so an
-    // unscoped page-wide text search hits both and trips strict mode.
+    // the sonner toast region so the text search can't match anything else
+    // on the page.
     const toaster = page.locator("[data-sonner-toaster]");
     await expect(toaster.getByText(`Couldn't delete "${guardLabel}"`)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     const toastDescription = toaster.getByText(/In use by 1 agent/);
@@ -593,7 +957,7 @@ test.describe("agent profiles — Settings surface", () => {
 
     const freshName = `Task Count Fresh ${randomUUID()}`;
     await section.getByTestId("agent-profile-add").click();
-    const createForm = section.getByTestId("agent-profile-form");
+    const createForm = dialog.getByTestId("agent-profile-form");
     await expect(createForm).toBeVisible();
     await createForm.getByTestId("agent-profile-name").fill(freshName);
     await createForm.getByTestId("agent-profile-save").click();
@@ -607,11 +971,18 @@ test.describe("agent profiles — Settings surface", () => {
     // Rename to a name that clashes case-insensitively with "Widget Builder"
     // (created in scenario 1, still present).
     await freshRow.getByTestId("agent-profile-edit").click();
-    const editForm = section.getByTestId("agent-profile-form");
+    const editForm = dialog.getByTestId("agent-profile-form");
     await expect(editForm).toBeVisible();
     await editForm.getByTestId("agent-profile-name").fill(WIDGET_BUILDER_NAME.toLowerCase());
     await editForm.getByTestId("agent-profile-save").click();
     await expect(editForm.getByTestId("agent-profile-form-error")).toContainText("already in use");
+    // The rejected save keeps the user on the editor with the error shown.
+    // The list is not rendered while the editor subpage is up, so Cancel back
+    // to it before checking the rows.
+    await editForm.getByTestId("agent-profile-cancel").click();
+    await expect(editForm).toBeHidden();
+    await expect(section).toBeVisible();
+
     // The row still shows the ORIGINAL name — the rejected save didn't
     // rename it, and no duplicate row was created. `.filter({hasText: string})`
     // matches case-INsensitively, which would make a lowercase needle match
@@ -623,9 +994,6 @@ test.describe("agent profiles — Settings surface", () => {
         .locator('[data-testid="agent-profile-row"]')
         .filter({ hasText: new RegExp(WIDGET_BUILDER_NAME.toLowerCase()) }),
     ).toHaveCount(0);
-
-    await editForm.getByTestId("agent-profile-cancel").click();
-    await expect(editForm).toBeHidden();
   });
 });
 

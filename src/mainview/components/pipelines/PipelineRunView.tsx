@@ -174,7 +174,7 @@ interface PipelineRunViewProps {
   onOpenTask: (task: Task, opts?: { subagentId?: string }) => void;
   onBack: () => void;
   /** Offered as "Edit in Settings" from a satellite's details. */
-  onOpenSettingsAgents?: () => void;
+  onOpenSettingsAgents?: (profileId?: string) => void;
 }
 
 function formatClockTime(ts: number): string {
