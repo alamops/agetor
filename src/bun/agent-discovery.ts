@@ -508,9 +508,10 @@ async function discoverGemini(): Promise<DiscoveredModel[]> {
  * All 28 then-curated `AGENT_OPTIONS.fx.models` ids (16 standard + 12
  * `catalogOnly`; spacexai/grok-4.7 (curated since 2026-09-21),
  * anthropic/claude-opus-5.5, openai/gpt-6-sol and openai/gpt-6-luna (all
- * curated since 2026-09-22) and anthropic/claude-sonnet-5.5 (curated since
- * 2026-09-28) postdate this measurement) are present in the unauth catalog; the signed-in reference
- * account still couldn't be re-measured (no valid local login at
+ * curated since 2026-09-22), anthropic/claude-sonnet-5.5 (curated since
+ * 2026-09-28) and openai/gpt-6.1-sol (curated since 2026-09-30) postdate
+ * this measurement) are present in the unauth catalog; the signed-in
+ * reference account still couldn't be re-measured (no valid local login at
  * measurement time).
  */
 function parseFxModels(stdout: string): DiscoveredModel[] {

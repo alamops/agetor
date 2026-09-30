@@ -75,7 +75,7 @@ A **harness** is the agent CLI Agetor drives. Agetor launches the real binary on
 | Harness | Binary | How Agetor drives it | Default model | Install |
 | --- | --- | --- | --- | --- |
 | **Claude Code** | `claude` | Interactive session in a per-task `tmux` session; output is tailed from Claude's own JSONL transcript | Opus 5.5 | `npm i -g @anthropic-ai/claude-code` |
-| **Codex** <sup>experimental</sup> | `codex` | `codex exec --json` for each turn inside `tmux`; the conversation resumes by thread id | GPT-6 Sol | `npm i -g @openai/codex` |
+| **Codex** <sup>experimental</sup> | `codex` | `codex exec --json` for each turn inside `tmux`; the conversation resumes by thread id | GPT-6.1 Sol | `npm i -g @openai/codex` |
 | **Cursor** <sup>experimental</sup> | `cursor-agent` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Grok 4.7 | `curl https://cursor.com/install -fsS \| bash` |
 | **Gemini CLI** <sup>experimental</sup> | `gemini` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Gemini 3.1 Pro (preview) | `npm i -g @google/gemini-cli` |
 | **fx** (Vercel Labs) <sup>experimental</sup> | `fx` | [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio), through Vercel AI Gateway | GLM 5.3 Flash | `curl -fsSL https://fx.sh/setup.sh \| bash` |
