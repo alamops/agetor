@@ -2190,11 +2190,11 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // most-capable-but-heavier tier. This supersedes the 2026-09-22 decision
   // (docs/plans/add-gpt-6-sol-and-luna.md) that defaulted to GPT-6 Sol, which
   // stays available. Live spike on 2026-09-30 on a ChatGPT-plan account:
-  // codex-cli 0.147.0 through 0.158.0 omit gpt-6.1-sol from `model/list` and
-  // answer the misleading "not supported when using Codex with a ChatGPT
-  // account" 400 (the real gate is the client version — the catalog is
-  // `client_version`-gated, NousResearch/hermes-agent#119412); 0.159.0 and
-  // 0.159.2 run it. Hence the 0.159.0 entry in `MODEL_MIN_CLI_VERSION` below
+  // codex-cli 0.147.0 through 0.158.0 all omit gpt-6.1-sol from `model/list`,
+  // and live turns on 0.147.0/0.155.1/0.158.0 answer the misleading "not
+  // supported when using Codex with a ChatGPT account" 400 (the real gate is
+  // the client version — the catalog is `client_version`-gated,
+  // NousResearch/hermes-agent#119412); 0.159.0 and 0.159.2 run it. Hence the 0.159.0 entry in `MODEL_MIN_CLI_VERSION` below
   // and the `startTask` pre-flight.
   "codex": "gpt-6.1-sol",
   // Grok 4.7 (high effort via DEFAULT_EFFORT) — agetor pins an explicit
@@ -2941,8 +2941,9 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // anthropic/claude-opus-5.5, joined the effort group on 2026-09-22 on its
   // Gateway `reasoning_options` alone (not ACP-probed — see its row); a 31st
   // and 32nd, openai/gpt-6-sol and openai/gpt-6-luna, joined it the same day
-  // on their Gateway `reasoning_options` (none/low/medium/high), likewise not
-  // ACP-probed (see their rows); a 33rd, anthropic/claude-sonnet-5.5, joined
+  // on their Gateway `reasoning_options` (none/low/medium/high as measured
+  // 2026-09-22; re-measured none…max on 2026-09-30 and the rows refreshed),
+  // likewise not ACP-probed (see their rows); a 33rd, anthropic/claude-sonnet-5.5, joined
   // it on 2026-09-28 the same way (see its row); a 34th, openai/gpt-6.1-sol,
   // joined it on 2026-09-30 the same way (see its row). An
   // unknown/discovered-only fx id falls back to `DEFAULT_MODEL.fx`'s set via
@@ -3006,12 +3007,12 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     // thinking can't be disabled) plus fx's always-present auto, the same
     // shape as the anthropic/claude-opus-5.5 row above.
     // docs/plans/add-claude-sonnet-5-5.md §8 A2.
+    "anthropic/claude-sonnet-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
     // 2026-09-30: not ACP-probed — rests on the public Gateway catalog entry's
     // reasoning_options (effort low/medium/high/xhigh/max — no toggle, no
     // none) plus fx's always-present auto, same shape as the
     // anthropic/claude-opus-5.5 row. docs/plans/add-gpt-6-1-sol.md §3 D3.
     "openai/gpt-6.1-sol": ["max", "xhigh", "high", "medium", "low", "auto"],
-    "anthropic/claude-sonnet-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
   },
 };
 

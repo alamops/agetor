@@ -114,6 +114,14 @@ Run recipe: `bun run typecheck`; targeted `bun test src/shared/types.test.ts src
 - **A4** — The fx `openai/gpt-6-sol`/`-luna` xhigh/max refresh rests on the public Gateway catalog, not an ACP probe (no fx credentials that pass), same standing as the rows' original entries.
 - Grill Q&A (owner, 2026-09-30): Q1 default → 6.1 Sol; Q2 order → below Astra/Aeon, above GPT-6 Sol; Q3 → sweep both drifts in.
 
+## 8b. Review outcome (Phase 5, opus, code-review skill — 2026-09-30)
+
+4 findings: 0 must-fix, 1 should-fix, 3 nice-to-have; all four addressed in Phase 8, none deferred.
+1. should-fix — the new fx `openai/gpt-6.1-sol` effort row + comment were inserted between Sonnet 5.5's evidence comment and Sonnet 5.5's row → moved below the Sonnet row so every row sits under its own dated comment.
+2. nice — the fx effort-table header still quoted the 2026-09-22 (none/low/medium/high) values for gpt-6-sol/-luna → re-measure parenthetical added.
+3. nice — "0.147.0 through 0.158.0 … answer the 400" overstated what was measured (live turns ran on 0.147.0/0.155.1/0.158.0 only; the `model/list` omission was probed on every version) → comment + CLAUDE.md reworded.
+4. nice — `-fast` twins' effort-picker fallback not covered by §7/§9 → ledger row added (out of scope, pre-existing for every `-fast` id).
+
 ## 9. Completeness ledger
 
 | Candidate remainder | Disposition |
@@ -132,4 +140,5 @@ Run recipe: `bun run typecheck`; targeted `bun test src/shared/types.test.ts src
 | `openai/gpt-6.1-sol-fast` fx row | **out of scope** — `-fast` twins are discovery-only for every fx model today |
 | Retiring `gpt-5.5` (codex says 2026-10-14) | **out of scope** — future dated event; retiring a curated id is its own three-store change |
 | Historical "28 then-curated" measurement prose in `agent-discovery.test.ts`/`agent-discovery.ts`/`fx-acp.ts` | the enumerations of ids that postdate it are extended (T3); the measurement itself stays historical — **out of scope** to re-measure |
+| `openai/gpt-6.1-sol-fast` (and every other fx `-fast` twin) surfacing as a discovered-only row inherits `DEFAULT_MODEL.fx`'s effort set in the picker (`supportedEfforts` fallback), not its own Gateway `reasoning_options` (review finding 4) | **out of scope** — pre-existing behavior for every `-fast` twin, unchanged by this run; harmless at runtime (an unoffered value degrades to a status breadcrumb); a base-id lookup for `-fast` ids is its own change |
 | Owner-deferred | none |
