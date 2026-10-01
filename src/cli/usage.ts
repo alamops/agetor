@@ -163,12 +163,50 @@ export const USAGE: Record<string, string> = {
   Run 'agetor harness add --help' / 'edit --help' for their flags;
   'agetor harness shell <id>' opens a shell with the harness env for login.`,
 
-  profile: `usage: agetor profile <ls | show <ref> | add <name> … | edit <ref> … | rm <ref>>
+  profile: `usage: agetor profile <ls | show <ref> | add <name> … | edit <ref> … | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […]>
 
   Manage agent profiles — a reusable harness + model + effort + mode +
   instructions + skills preset — pick one at launch with 'agetor add --profile'.
   <ref> is a profile id or its (unique, case-insensitive) name.
-  Run 'agetor profile add --help' / 'edit --help' for their flags.`,
+  Run 'agetor profile add --help' / 'edit --help' for their flags, and
+  'export --help' / 'import --help' for moving profiles between machines.`,
+
+  export: `usage: agetor export [--profile <ref>]… [--pipeline <ref>]… [--all] [--out <file|->] [--force]
+
+  Write Agents (agent profiles) and/or Pipelines to one portable JSON bundle
+  ("agetor-bundle", version 1). A Pipeline brings every Agent its steps use.
+  Each Agent records its harness id and the harness kind it wraps, so an
+  import on a machine without that account falls back to the built-in
+  harness of the same kind.
+    --profile <ref>   an Agent (id or unique name); repeatable ('--agent' is an alias)
+    --pipeline <ref>  a Pipeline (id or unique name); repeatable
+    --all             every Agent and every Pipeline
+    --out <file|->    write to a file instead of stdout ('-' is stdout)
+    --force           overwrite an existing --out file (refused otherwise)
+  Re-import with 'agetor import <file>'.`,
+
+  import: `usage: agetor import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <n>] [--enable-harnesses]
+
+  Import a bundle written by 'agetor export' (or a legacy 'pipeline export'
+  file; '-' reads stdin). Everything is created in one step, or nothing is.
+  New ids are always assigned; a name that's already taken becomes
+  "Name (imported)". An Agent whose harness isn't on this machine binds to
+  the built-in harness of the same kind, with a warning.
+    --dry-run              show what would be created, renamed and bound
+    --harness-map <a>=<b>  bind Agents on file harness <a> to local harness <b>
+                           (repeatable; required for a harness kind this
+                           version doesn't know)
+    --name <n>             name for the file's only Pipeline (or its only
+                           Agent when it has no Pipelines) — must be free
+    --enable-harnesses     enable a disabled harness the Agents land on`,
+
+  "profile export": `usage: agetor profile export <ref> [--out <file|->] [--force]
+
+  Export one Agent as a bundle — same format and flags as 'agetor export --profile <ref>'.`,
+
+  "profile import": `usage: agetor profile import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <n>] [--enable-harnesses]
+
+  Import a bundle — same as 'agetor import' (see 'agetor import --help').`,
 
   // Subcommand-keyed blocks ("<cmd> <sub>") back both `agetor <cmd> <sub> --help`
   // and that subcommand's bad-argument error. Trivial subcommands (harness
@@ -201,7 +239,7 @@ export const USAGE: Record<string, string> = {
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced).`,
 
-  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>
+  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>
 
   Manage pipelines — named graphs of agent-profile-bound steps launched as
   one board task (built in the app's Pipelines editor; the CLI moves them
@@ -217,21 +255,19 @@ export const USAGE: Record<string, string> = {
 
   "pipeline export": `usage: agetor pipeline export <ref> [--out <file|->] [--force]
 
-  Print (or write to --out; '-' is stdout) the pipeline as PipelineInput
-  JSON (name/description/graph/maxSteps) — re-importable with 'pipeline
-  import'. Refuses to overwrite an existing --out file unless --force.
-  Each step also carries a 'profileName' hint (and 'subagents.profileNames')
-  next to its agent-profile id so an import on another machine can remap
-  the profile by name.`,
+  Print (or write to --out; '-' is stdout) the pipeline as an agetor bundle:
+  the pipeline plus every Agent its steps and delegations use, each with its
+  harness id and kind — same format as 'agetor export --pipeline <ref>'.
+  Re-importable with 'pipeline import' or 'agetor import'. Refuses to
+  overwrite an existing --out file unless --force.`,
 
-  "pipeline import": `usage: agetor pipeline import <file|-> [--name <name>]
+  "pipeline import": `usage: agetor pipeline import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <name>] [--enable-harnesses]
 
-  Create a pipeline from an exported JSON file ('-' reads stdin). --name
-  overrides the file's own name. A step agent-profile id (or subagent
-  profile id) that doesn't exist on this machine is remapped to the unique
-  local profile named by the file's 'profileName' hint when there is one
-  (printed), else warned about (--json: folded into 'warnings') — assign a
-  profile in the editor before running such a pipeline.`,
+  Import a bundle ('-' reads stdin) — same as 'agetor import' (see 'agetor
+  import --help'). --name names the file's only pipeline. A legacy pipeline
+  file (from before bundles) still imports: a step Agent id that doesn't
+  exist here is matched by the file's profileName hint when exactly one
+  local Agent has that name, else reported.`,
 
   "pipeline retry": `usage: agetor pipeline retry <task-id> [--from <step-task-id-or-prefix>]
 

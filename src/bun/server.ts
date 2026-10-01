@@ -219,6 +219,23 @@ import { consumePendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
+import { BUNDLE_MAX_BYTES } from "../shared/bundle.ts";
+import type { BundleImportOptions } from "../shared/bundle-import.ts";
+import {
+  BUNDLE_MAX_REQUEST_BYTES,
+  bundleDownloadsDir,
+  commitBundleImport,
+  exportBundleFor,
+  fakePickDir,
+  fakePickedFolder,
+  fakePickedJsonFile,
+  parseBundleImportOptions,
+  parseBundleSelection,
+  previewBundleImport,
+  readPickedBundleFile,
+  writeBundleFile,
+  type BundleImportError,
+} from "./bundle.ts";
 import type { AgentProfilePatch } from "./db.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
@@ -634,6 +651,54 @@ function withPipelineTaskCounts(list: Pipeline[]): Pipeline[] {
 }
 
 /**
+ * Read and validate a `POST /bundle/import[/preview]` body — `{ text,
+ * options? }` (docs/plans/agents-pipelines-import-export.md K4). A body over
+ * `BUNDLE_MAX_REQUEST_BYTES` is refused with 413 by `Content-Length` before
+ * it is read (like `/screenshots`), and again by its actual length. Returns
+ * the error `Response` to send, or the parsed body.
+ */
+async function readBundleImportBody(
+  req: Request,
+): Promise<{ text: string; options: BundleImportOptions } | Response> {
+  const tooLarge = () =>
+    json(
+      { error: `request is too large — the file limit is ${BUNDLE_MAX_BYTES / (1024 * 1024)} MB`, code: "too-large" },
+      { status: 413, headers: corsHeaders(req) },
+    );
+  const claimed = Number(req.headers.get("content-length") ?? "");
+  if (Number.isFinite(claimed) && claimed > BUNDLE_MAX_REQUEST_BYTES) return tooLarge();
+  const raw = await req.text().catch(() => "");
+  if (raw.length > BUNDLE_MAX_REQUEST_BYTES) return tooLarge();
+  let body: unknown;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return json({ error: "invalid body", code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return json({ error: "invalid body", code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  const { text, options } = body as { text?: unknown; options?: unknown };
+  if (typeof text !== "string") {
+    return json({ error: "text (string) required", code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  const parsedOptions = parseBundleImportOptions(options);
+  if ("error" in parsedOptions) {
+    return json({ error: parsedOptions.error, code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  return { text, options: parsedOptions.options };
+}
+
+/** 400 `{ error, code }` for a file that didn't parse; 409 `{ error, plan }`
+ *  for a plan with blocking issues. */
+function bundleImportErrorResponse(req: Request, r: BundleImportError): Response {
+  if (r.status === 400) {
+    return json({ error: r.error, code: r.code }, { status: 400, headers: corsHeaders(req) });
+  }
+  return json({ error: r.error, plan: r.plan }, { status: 409, headers: corsHeaders(req) });
+}
+
+/**
  * Validate the `POST /pipelines` / `PATCH /pipelines/:id` body's `name`:
  * trimmed, required, `PIPELINE_LIMITS.name` cap, and (L-S1) no C0/DEL
  * control characters — the same rule `validatePipelineGraph` applies to
@@ -782,6 +847,9 @@ function validateCloneLaunch(
 export interface ApiNative {
   openFileDialog(opts: {
     startingFolder: string;
+    /** Comma-separated extensions the panel accepts (e.g. `"json"`);
+     *  omitted means any file. */
+    allowedFileTypes?: string;
     canChooseFiles: boolean;
     canChooseDirectory: boolean;
     allowsMultipleSelection: boolean;
@@ -4031,6 +4099,145 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return removed
             ? json({ ok: true }, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // ── Agents + Pipelines bundle export/import ─────────────────────────
+      // docs/plans/agents-pipelines-import-export.md K4. The logic lives in
+      // ./bundle.ts; these routes only validate, call it and map results to
+      // statuses. None of them reads or writes a client-supplied path: save
+      // targets are the Downloads dir or a folder the native panel returned,
+      // and Choose file reads only what the native panel returned.
+      "/bundle/export": {
+        POST: authed(async (req) => {
+          const sel = parseBundleSelection(await req.json().catch(() => null));
+          if ("error" in sel) return json({ error: sel.error }, { status: 400, headers: corsHeaders(req) });
+          const built = exportBundleFor(sel.selection);
+          if (!built.ok) return json({ error: built.error }, { status: 400, headers: corsHeaders(req) });
+          return json(
+            { bundle: built.bundle, text: built.text, filename: built.filename, warnings: built.warnings, counts: built.counts },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Save the export to ~/Downloads (then reveal it in Finder) or into a
+      // folder picked in the native panel — never overwriting (K7).
+      "/bundle/export/save": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+          const sel = parseBundleSelection(body);
+          if ("error" in sel) return json({ error: sel.error }, { status: 400, headers: corsHeaders(req) });
+          const target = body?.target;
+          if (target !== "downloads" && target !== "folder") {
+            return json({ error: 'target must be "downloads" or "folder"' }, { status: 400, headers: corsHeaders(req) });
+          }
+          const built = exportBundleFor(sel.selection);
+          if (!built.ok) return json({ error: built.error }, { status: 400, headers: corsHeaders(req) });
+
+          let dir: string;
+          if (target === "downloads") {
+            dir = bundleDownloadsDir();
+          } else {
+            // Same fake-pick seam `/refs/pick` honors (e2e/fixtures.ts).
+            const fake = fakePickDir();
+            if (fake) {
+              const picked = fakePickedFolder(fake);
+              if (!picked) return json({ cancelled: true }, { headers: corsHeaders(req) });
+              dir = picked;
+            } else {
+              if (!native) return notAvailableHeadless(req);
+              // The request stays open while the panel is up.
+              server.timeout(req, 0);
+              const picks = await native.openFileDialog({
+                startingFolder: homedir(),
+                canChooseFiles: false,
+                canChooseDirectory: true,
+                allowsMultipleSelection: false,
+              });
+              const picked = picks.map((p) => p.trim()).find((p) => p.length > 0 && path.isAbsolute(p));
+              if (!picked) return json({ cancelled: true }, { headers: corsHeaders(req) });
+              dir = picked;
+            }
+          }
+
+          let written: { path: string; filename: string };
+          try {
+            written = writeBundleFile(dir, built.filename, built.text);
+          } catch (e) {
+            return json(
+              { error: `couldn't save the export: ${(e as Error).message}` },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+          const revealed = target === "downloads" && native ? native.revealPath(written.path) : false;
+          return json(
+            { path: written.path, filename: written.filename, revealed, warnings: built.warnings, counts: built.counts },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Choose file: a native Open panel filtered to .json (K8).
+      "/bundle/pick-file": {
+        POST: authed(async (req) => {
+          let file: string | null;
+          const fake = fakePickDir();
+          if (fake) {
+            file = fakePickedJsonFile(fake);
+          } else {
+            if (!native) return notAvailableHeadless(req);
+            server.timeout(req, 0);
+            const picks = await native.openFileDialog({
+              startingFolder: homedir(),
+              allowedFileTypes: "json",
+              canChooseFiles: true,
+              canChooseDirectory: false,
+              allowsMultipleSelection: false,
+            });
+            file = picks.map((p) => p.trim()).find((p) => p.length > 0 && path.isAbsolute(p)) ?? null;
+          }
+          if (!file) return json({ cancelled: true }, { headers: corsHeaders(req) });
+          const read = readPickedBundleFile(file);
+          if ("error" in read) return json({ error: read.error }, { status: 400, headers: corsHeaders(req) });
+          return json(read, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Dry run: what an import would create, rename and bind (K5/K6).
+      "/bundle/import/preview": {
+        POST: authed(async (req) => {
+          const body = await readBundleImportBody(req);
+          if (body instanceof Response) return body;
+          const r = await previewBundleImport(body.text, body.options);
+          if (!r.ok) return bundleImportErrorResponse(req, r);
+          return json(r.plan, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Commit: everything in one transaction, or nothing (K13).
+      "/bundle/import": {
+        POST: authed(async (req) => {
+          const body = await readBundleImportBody(req);
+          if (body instanceof Response) return body;
+          let r: Awaited<ReturnType<typeof commitBundleImport>>;
+          try {
+            r = await commitBundleImport(body.text, body.options);
+          } catch (e) {
+            return json(
+              { error: `import failed — nothing was imported: ${(e as Error).message}` },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+          if (!r.ok) return bundleImportErrorResponse(req, r);
+          return json(
+            {
+              ...r.result,
+              agents: r.result.agents.map((a) => ({ ...a, taskCount: 0 })),
+              pipelines: r.result.pipelines.map((p) => ({ ...p, taskCount: 0 })),
+            },
+            { status: 201, headers: corsHeaders(req) },
+          );
         }),
       },
 

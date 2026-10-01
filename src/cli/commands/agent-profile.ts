@@ -4,6 +4,7 @@ import { c, out, printJson, table } from "../output.ts";
 import { flagValue } from "../args.ts";
 import type { AgetorClient, AgentProfileInput } from "../api-client.ts";
 import { usageError } from "../usage.ts";
+import { cmdExportOne, cmdImportAs } from "./bundle.ts";
 import { asProfileError, matchAgentProfileRef, normalizeSkillName } from "../../shared/agent-profile.ts";
 import type { AgentProfile } from "../../shared/types.ts";
 
@@ -118,8 +119,13 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       out(`${c.red("✗")} removed profile ${c.bold(profile.name)} — existing tasks keep their snapshot`);
       return;
     }
+    case "export":
+      // The agetor bundle (docs/plans/agents-pipelines-import-export.md).
+      return cmdExportOne("profile", args.slice(1), flags, client);
+    case "import":
+      return cmdImportAs("profile", args.slice(1), flags, client);
     default:
-      throw new Error(`unknown profile subcommand: ${sub} (use ls | show | add | edit | rm)`);
+      throw new Error(`unknown profile subcommand: ${sub} (use ls | show | add | edit | rm | export | import)`);
   }
 }
 

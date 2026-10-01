@@ -90,6 +90,13 @@ import type {
   WorktreeTeardownResult,
 } from "../../shared/types.ts";
 import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
+import type {
+  BundleExportResponse,
+  BundlePickResponse,
+  BundleSaveResponse,
+  BundleSelection,
+} from "../../shared/bundle.ts";
+import type { BundleImportOptions, BundleImportPlan, BundleImportResponse } from "../../shared/bundle-import.ts";
 import { fetchWithRecovery } from "./net-retry.ts";
 
 export interface UpdateSnapshot {
@@ -547,6 +554,35 @@ export const api = {
     }),
   deletePipeline: (id: string) =>
     j<void>(`/pipelines/${encodeURIComponent(id)}`, { method: "DELETE" }, { retry: false }),
+  // ── Agents + Pipelines bundle (docs/plans/agents-pipelines-import-export.md K4) ──
+  /** The canonical bundle text for a selection, plus its counts and
+   *  export-time warnings. Read-only, so a replay is harmless. */
+  exportBundle: (selection: BundleSelection) =>
+    j<BundleExportResponse>("/bundle/export", { method: "POST", body: JSON.stringify(selection) }),
+  /** Save the export to ~/Downloads (revealed in Finder) or a folder picked
+   *  in the native panel. `retry: false` — a replay would write a second,
+   *  numbered copy (or open a second panel). */
+  saveBundle: (selection: BundleSelection, target: "downloads" | "folder") =>
+    j<BundleSaveResponse>(
+      "/bundle/export/save",
+      { method: "POST", body: JSON.stringify({ ...selection, target }) },
+      { retry: false },
+    ),
+  /** Choose file: the native Open panel, filtered to .json. `retry: false` —
+   *  a replay would open the panel twice. */
+  pickBundleFile: () =>
+    j<BundlePickResponse>("/bundle/pick-file", { method: "POST", body: "{}" }, { retry: false }),
+  /** Dry run: what importing `text` would create, rename and bind. */
+  previewBundleImport: (text: string, options: BundleImportOptions) =>
+    j<BundleImportPlan>("/bundle/import/preview", { method: "POST", body: JSON.stringify({ text, options }) }),
+  /** Commit an import — all or nothing. 409 `{ error, plan }` when blocked.
+   *  `retry: false` — a replay after a lost response would import twice. */
+  importBundle: (text: string, options: BundleImportOptions) =>
+    j<BundleImportResponse>(
+      "/bundle/import",
+      { method: "POST", body: JSON.stringify({ text, options }) },
+      { retry: false },
+    ),
   /** A pipeline TASK's live run: the parent task plus every hidden step
    *  task belonging to it (`GET /tasks/:id/pipeline`) — what
    *  `PipelineRunView` needs in one round-trip. 404 unknown task, 400 the

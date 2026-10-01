@@ -338,7 +338,11 @@ registerNotifierBundle();
 // self-updater, quit). The headless CLI daemon injects none of these — its
 // routes 501 — but the packaged app wires them up here.
 const native: ApiNative = {
-  openFileDialog: (opts) => Utils.openFileDialog(opts),
+  // Electrobun spreads `opts` over its defaults, so an explicit
+  // `allowedFileTypes: undefined` would wipe its "*" default — only pass the
+  // filter when a caller set one (`/bundle/pick-file` asks for "json").
+  openFileDialog: ({ allowedFileTypes, ...opts }) =>
+    Utils.openFileDialog(allowedFileTypes ? { ...opts, allowedFileTypes } : opts),
   openPath: (p) => Utils.openPath(p),
   // No Electrobun `Utils.revealPath` equivalent — spawn macOS's own
   // Finder-reveal command directly (agetor ships arm64 macOS only, so no

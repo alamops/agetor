@@ -10,7 +10,7 @@ import type { BundleHarnessRef, ParsedBundle } from "./bundle.ts";
 import { AGENT_PROFILE_LIMITS } from "./agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE } from "./pipeline.ts";
 import { DEFAULT_MODEL, PIPELINE_LIMITS } from "./types.ts";
-import type { AgentKind, PipelineGraph } from "./types.ts";
+import type { AgentKind, AgentProfile, Pipeline, PipelineGraph } from "./types.ts";
 
 export interface BundleIssue {
   code: string;
@@ -131,6 +131,16 @@ export interface BundleImportPlan {
   /** Every blocking issue in the plan, flattened. */
   blocking: BundleIssue[];
   canImport: boolean;
+}
+
+/** `POST /bundle/import`'s 201 response. */
+export interface BundleImportResponse {
+  agents: AgentProfile[];
+  pipelines: Pipeline[];
+  /** Harnesses the import enabled. */
+  enabledHarnesses: string[];
+  warnings: BundleIssue[];
+  plan: BundleImportPlan;
 }
 
 const nameKey = (s: string): string => s.trim().toLowerCase();

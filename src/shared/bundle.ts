@@ -100,6 +100,30 @@ export interface BundleSelection {
   all: boolean;
 }
 
+/** `POST /bundle/export`'s response. `text` is the canonical file text. */
+export interface BundleExportResponse {
+  bundle: BundleFile;
+  text: string;
+  filename: string;
+  warnings: string[];
+  counts: { agents: number; pipelines: number };
+}
+
+/** `POST /bundle/export/save`'s response. */
+export type BundleSaveResponse =
+  | {
+      path: string;
+      filename: string;
+      /** False when there is no Finder to reveal it in (headless). */
+      revealed: boolean;
+      warnings: string[];
+      counts: { agents: number; pipelines: number };
+    }
+  | { cancelled: true };
+
+/** `POST /bundle/pick-file`'s response. */
+export type BundlePickResponse = { text: string; filename: string } | { cancelled: true };
+
 const KEY_SLUG_MAX = 64;
 const FILE_SLUG_MAX = 64;
 

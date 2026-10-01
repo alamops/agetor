@@ -23,6 +23,8 @@ import type {
   GitHubIssueThreadResult,
   GitProvider,
 } from "../shared/types.ts";
+import type { BundleExportResponse } from "../shared/bundle.ts";
+import type { BundleImportOptions, BundleImportPlan, BundleImportResponse } from "../shared/bundle-import.ts";
 import type { AnyRequest, AskQuestionsAnswer } from "../bun/interactions.ts";
 import type { AvailableCommand, AvailableExtension } from "../bun/commands.ts";
 
@@ -420,6 +422,24 @@ export class AgetorClient {
   deletePipeline(id: string): Promise<void> {
     return this.req("DELETE", `/pipelines/${encodeURIComponent(id)}`);
   }
+  // ── Agents + Pipelines bundle (docs/plans/agents-pipelines-import-export.md) ──
+  /** `POST /bundle/export` — the canonical bundle text for a selection (ids,
+   *  or `all`). 400 on an empty selection or an unknown id. */
+  exportBundle(selection: { agentIds?: string[]; pipelineIds?: string[]; all?: boolean }): Promise<BundleExportResponse> {
+    return this.req("POST", "/bundle/export", selection);
+  }
+  /** `POST /bundle/import/preview` — dry run: what an import would create,
+   *  rename and bind. 400 `{ error, code }` for a file that doesn't parse.
+   *  Probes harness status, hence the longer budget. */
+  previewBundleImport(text: string, options: BundleImportOptions = {}): Promise<BundleImportPlan> {
+    return this.req("POST", "/bundle/import/preview", { text, options }, START_TIMEOUT_MS);
+  }
+  /** `POST /bundle/import` — all or nothing. 400 as preview; 409 `{ error,
+   *  plan }` (thrown `ApiError` with that body) when the plan is blocked. */
+  importBundle(text: string, options: BundleImportOptions = {}): Promise<BundleImportResponse> {
+    return this.req("POST", "/bundle/import", { text, options }, START_TIMEOUT_MS);
+  }
+
   /** `GET /tasks/:id/pipeline` — `id` is a pipeline (parent) task's id; 404
    *  unknown task, 400 the task isn't a pipeline task. Returns the parent
    *  task (with its live `pipelineRun`) plus every hidden step task
