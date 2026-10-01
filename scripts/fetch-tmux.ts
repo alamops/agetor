@@ -22,7 +22,7 @@ const REPO_ROOT = path.resolve(import.meta.dir, "..");
 // runtime resolver in src/bun/tmux-resolution.ts hardcodes the same arch
 // path, so this assert keeps both ends in lockstep — if we ever revisit
 // the decision, both must move together.
-const ARCH = "arm64";
+const ARCH = process.arch;
 const VENDOR_DIR = path.join(REPO_ROOT, "vendor", "tmux", ARCH);
 
 function fail(msg: string): never {
@@ -128,8 +128,8 @@ async function main() {
     console.log(`[fetch-tmux] skipped on ${process.platform} (macOS-only step)`);
     return;
   }
-  if (process.arch !== "arm64") {
-    fail(`expected an arm64 build host (got ${process.arch}); Agetor only ships arm64`);
+  if (process.arch !== "arm64" && process.arch !== "x64") {
+    fail(`expected an arm64 or x64 build host (got ${process.arch}); Agetor supports arm64 and x64`);
   }
 
   const tmuxBin = await which("tmux");
