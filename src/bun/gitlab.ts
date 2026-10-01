@@ -588,6 +588,33 @@ export async function getGitLabPullDefaults(repo: ProviderRepoInfo): Promise<Git
   return { ok: true, repo: `${repo.owner}/${repo.name}`, head: "", base };
 }
 
+/** Reads the NUMERIC id of `repo`'s own project via `GET /projects/:id`
+ *  (same fetch pattern as `getGitLabPullDefaults`). `createGitLabPull` needs
+ *  it for `target_project_id`, which — unlike the `:id` path segment — does
+ *  not accept a URL-encoded `owner/name` path. A missing or non-integer `id`
+ *  in an otherwise-2xx response is an error rather than a silent omission,
+ *  since omitting `target_project_id` is precisely what retargets a fork's
+ *  MR at its upstream parent. */
+async function fetchGitLabProjectNumericId(
+  repo: ProviderRepoInfo,
+  projectId: string,
+  token: string | null,
+): Promise<{ ok: true; id: number } | GitLabError> {
+  const res = await fetchGitLab(`${gitlabApiBase(repo)}/projects/${projectId}`, token);
+  if (!("status" in res)) {
+    return { ok: false, error: `couldn't read GitLab project ${repo.owner}/${repo.name} to target the merge request: ${res.error}` };
+  }
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    return { ok: false, error: `couldn't read GitLab project ${repo.owner}/${repo.name} to target the merge request: ${errorFrom(res, json, repo, !!token)}` };
+  }
+  const id = json && typeof json === "object" ? (json as Record<string, unknown>).id : undefined;
+  if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) {
+    return { ok: false, error: `GitLab did not return a numeric project id for ${repo.owner}/${repo.name} — merge request not created` };
+  }
+  return { ok: true, id };
+}
+
 export interface CreateGitLabPullInput {
   title: string;
   body?: string;
@@ -602,7 +629,17 @@ export interface CreateGitLabPullInput {
  *  set some other way, e.g. the GitLab UI or a separate call not wired up
  *  here). `draft: true` prefixes the title with `"Draft: "`, GitLab's own
  *  draft convention (the same one its web UI uses; there's no separate
- *  boolean field on create). */
+ *  boolean field on create).
+ *
+ *  `target_project_id` is always sent, set to this same project's own id:
+ *  GitLab documents that when the project is a FORK and `target_project_id`
+ *  is omitted, the merge request is opened against the fork's PARENT
+ *  (upstream) project — so in a fork, "Create PR" would silently propose the
+ *  change to the upstream repo instead of the repo the user is working in.
+ *  The field only accepts the NUMERIC project id (not the `owner%2Fname` path
+ *  every other call here uses), so it is read first via `GET /projects/:id`
+ *  (`fetchGitLabProjectNumericId`); if that can't be read, nothing is posted —
+ *  guessing would risk exactly the wrong-target MR this guards against. */
 export async function createGitLabPull(repo: ProviderRepoInfo, input: CreateGitLabPullInput): Promise<GitLabIssueResponse> {
   const title = input.title.trim();
   const head = input.head.trim();
@@ -614,6 +651,8 @@ export async function createGitLabPull(repo: ProviderRepoInfo, input: CreateGitL
   const token = await gitlabToken(repo.remoteHost);
   if (!token) return { ok: false, error: "GitLab authentication required to create a merge request" };
   const projectId = encodeProjectId(repo.owner, repo.name);
+  const numericId = await fetchGitLabProjectNumericId(repo, projectId, token);
+  if (!numericId.ok) return numericId;
   const finalTitle = input.draft ? `Draft: ${title}` : title;
   const res = await fetchGitLab(`${gitlabApiBase(repo)}/projects/${projectId}/merge_requests`, token, {
     method: "POST",
@@ -622,6 +661,7 @@ export async function createGitLabPull(repo: ProviderRepoInfo, input: CreateGitL
       ...(input.body?.trim() ? { description: input.body.trim() } : {}),
       source_branch: head,
       target_branch: base,
+      target_project_id: numericId.id,
     }),
   });
   if (!("status" in res)) return res;

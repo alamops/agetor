@@ -290,6 +290,7 @@ test("getGitLabPullDefaults reads default_branch from the project GET, head is e
 
 test("createGitLabPull POSTs source_branch/target_branch and prefixes the title on draft", async () => {
   const mock = mockGitLabFetch([
+    { method: "GET", match: "/api/v4/projects/acme%2Fapp", json: { id: 77, default_branch: "main" } },
     {
       method: "POST",
       match: "/merge_requests",
@@ -299,9 +300,9 @@ test("createGitLabPull POSTs source_branch/target_branch and prefixes the title 
   try {
     const res = await createGitLabPull(REPO, { title: "Add x", body: "desc", base: "main", head: "feature", draft: true });
     expect(res.ok).toBe(true);
-    const call = mock.calls[0]!;
+    const call = mock.calls.find((c) => c.method === "POST")!;
     const body = JSON.parse(call.body!);
-    expect(body).toMatchObject({ title: "Draft: Add x", description: "desc", source_branch: "feature", target_branch: "main" });
+    expect(body).toMatchObject({ title: "Draft: Add x", description: "desc", source_branch: "feature", target_branch: "main", target_project_id: 77 });
   } finally {
     mock.restore();
   }
