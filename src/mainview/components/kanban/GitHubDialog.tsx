@@ -122,7 +122,14 @@ import type {
   TaskDiff,
 } from "../../../shared/types.ts";
 import { GIT_HOST_TOKENS_SECTION } from "../../../shared/types.ts";
-import { displayCaps, itemProvider, providerSupports } from "../../lib/provider-caps.ts";
+import {
+  displayCaps,
+  itemProvider,
+  providerForTarget,
+  providerSupports,
+  providerTargetKey,
+  type BoundProvider,
+} from "../../lib/provider-caps.ts";
 
 // Hoisted ReactMarkdown `components` map for GitHub markdown bodies (PR/issue
 // descriptions, comments, list previews). Module scope keeps the prop identity
@@ -578,13 +585,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // same as "mixed" by `caps` below so the dialog never renders a half-known
   // provider's gaps; it only ever narrows once resolution lands. Cached per
   // project path so switching between two already-seen projects is instant and
-  // aggregate mode doesn't refetch on every render.
-  const [provider, setProvider] = useState<GitProvider | "mixed" | null>(null);
+  // aggregate mode doesn't refetch on every render. The result is stored bound
+  // to the target it was resolved for; `provider`/`providerSettled` are derived
+  // from it below (after `aggregatePathsKey`).
+  const [boundProvider, setBoundProvider] = useState<BoundProvider | null>(null);
   const providerCache = useRef<Map<string, GitProvider | null>>(new Map());
-  // Whether the lookup for the current target has landed (success OR failure).
-  // `provider` alone can't say: a failed single-repo lookup leaves it `null`,
-  // the same value it holds while still in flight.
-  const [providerSettled, setProviderSettled] = useState(false);
   const [kind, setKind] = useState<GitHubItemKind>("pulls");
   const [state, setState] = useState<GitHubItemState>("open");
   const [query, setQuery] = useState("");
@@ -960,9 +965,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // Aggregate: resolve every registered project (cached individually so
   // re-entering aggregate mode doesn't refetch already-known repos), then
   // collapse to "github" only if every one of them is GitHub — otherwise
-  // "mixed". `provider` starts `null` each time the target changes, so a
-  // stale provider from the previously-selected project can never leak onto
-  // the next one while the new lookup is in flight.
+  // "mixed". The result is bound to its target key and `provider` is derived
+  // as unresolved whenever that key isn't the current target — the dialog
+  // stays mounted across target changes, and a reset issued from this effect
+  // would only land on the NEXT render, after the request-gating effects had
+  // already run once with the previous project's provider.
+  const providerTarget = providerTargetKey(projectPath, aggregatePathsKey);
+  const { provider, settled: providerSettled } = providerForTarget(boundProvider, providerTarget);
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
@@ -979,29 +988,25 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         return null;
       }
     };
-    setProviderSettled(false);
+    const targetKey = providerTarget;
+    setBoundProvider({ targetKey, provider: null, settled: false });
     if (isAggregate) {
-      setProvider(null);
       void (async () => {
         const resolved = await Promise.all(projects.map((p) => resolveOne(p.path)));
         if (cancelled) return;
-        setProvider(resolved.length > 0 && resolved.every((r) => r === "github") ? "github" : "mixed");
-        setProviderSettled(true);
+        const collapsed = resolved.length > 0 && resolved.every((r) => r === "github") ? "github" : "mixed";
+        setBoundProvider({ targetKey, provider: collapsed, settled: true });
       })();
     } else if (projectPath) {
-      setProvider(null);
       void resolveOne(projectPath).then((resolved) => {
         if (cancelled) return;
-        setProvider(resolved);
-        setProviderSettled(true);
+        setBoundProvider({ targetKey, provider: resolved, settled: true });
       });
-    } else {
-      setProvider(null);
     }
     return () => {
       cancelled = true;
     };
-  }, [open, isAggregate, projectPath, aggregatePathsKey]);
+  }, [open, isAggregate, projectPath, aggregatePathsKey, providerTarget]);
 
   // While unresolved (null) or in aggregate mode with mixed providers, default
   // to GitHub's capability set so terminology/gating never flicker for the

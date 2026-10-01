@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { PROVIDER_CAPS } from "../../shared/types.ts";
-import { displayCaps, itemProvider, providerSupports, type ProviderCapFlag } from "./provider-caps.ts";
+import {
+  displayCaps,
+  itemProvider,
+  providerForTarget,
+  providerSupports,
+  providerTargetKey,
+  type ProviderCapFlag,
+} from "./provider-caps.ts";
 
 /** Flags whose fetches hit GitHub-only backend routes (`/github/repo-permissions`,
  *  `/github/milestones`, `/github/assignees`, `/github/releases`,
@@ -64,5 +71,44 @@ describe("itemProvider", () => {
     expect(itemProvider("mixed", true, "github")).toBe("github");
     expect(itemProvider("mixed", true, undefined)).toBeNull();
     expect(itemProvider("mixed", true, null)).toBeNull();
+  });
+});
+
+describe("providerForTarget", () => {
+  const githubKey = providerTargetKey("/repos/hub", "");
+  const gitlabKey = providerTargetKey("/repos/lab", "");
+
+  test("nothing resolved yet reads as unresolved", () => {
+    expect(providerForTarget(null, githubKey)).toEqual({ provider: null, settled: false });
+  });
+
+  test("a result for the current target applies", () => {
+    expect(providerForTarget({ targetKey: githubKey, provider: "github", settled: true }, githubKey)).toEqual({
+      provider: "github",
+      settled: true,
+    });
+    // A settled failure stays distinguishable from an in-flight lookup.
+    expect(providerForTarget({ targetKey: gitlabKey, provider: null, settled: true }, gitlabKey)).toEqual({
+      provider: null,
+      settled: true,
+    });
+  });
+
+  test("a result bound to another target reads as unresolved", () => {
+    const stale = { targetKey: githubKey, provider: "github" as const, settled: true };
+    expect(providerForTarget(stale, gitlabKey)).toEqual({ provider: null, settled: false });
+    expect(providerSupports(providerForTarget(stale, gitlabKey).provider, "milestones")).toBe(false);
+  });
+
+  test("aggregate mode is keyed on the candidate set", () => {
+    const aggregate = "__agetor_all_repositories__";
+    const twoRepos = providerTargetKey(aggregate, "/repos/hub\n/repos/hub2");
+    const threeRepos = providerTargetKey(aggregate, "/repos/hub\n/repos/hub2\n/repos/lab");
+    const bound = { targetKey: twoRepos, provider: "github" as const, settled: true };
+    expect(providerForTarget(bound, twoRepos)).toEqual({ provider: "github", settled: true });
+    expect(providerForTarget(bound, threeRepos)).toEqual({ provider: null, settled: false });
+    // Aggregate and single-repo targets never collide.
+    expect(providerTargetKey(aggregate, "")).not.toBe(providerTargetKey("", ""));
+    expect(providerForTarget(bound, githubKey)).toEqual({ provider: null, settled: false });
   });
 });

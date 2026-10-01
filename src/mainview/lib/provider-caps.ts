@@ -46,3 +46,38 @@ export function itemProvider(
   if (!isAggregate) return dialogProvider;
   return cached ?? null;
 }
+
+/** A provider-info result bound to the target it was resolved for, so it can
+ *  never be read against a different one. */
+export interface BoundProvider {
+  /** {@link providerTargetKey} of the target this result belongs to. */
+  targetKey: string;
+  provider: DialogProvider;
+  /** Whether the lookup landed (success OR failure) — `provider` alone can't
+   *  say, since a failed lookup leaves it `null` exactly like an in-flight one. */
+  settled: boolean;
+}
+
+/**
+ * Identity of the dialog's provider-lookup target: the selected project path,
+ * plus — in aggregate mode, where `projectPath` is the aggregate sentinel — the
+ * joined candidate paths (`aggregatePathsKey`, `""` in single-repo mode), so a
+ * change to the registered set also invalidates a resolved aggregate provider.
+ */
+export function providerTargetKey(projectPath: string, aggregatePathsKey: string): string {
+  return `${projectPath}\0${aggregatePathsKey}`;
+}
+
+/**
+ * The provider (and settled flag) that applies to `targetKey`. A result bound
+ * to a different target — the dialog stays mounted across target changes, and
+ * the lookup effect's state update lands only on a later render — reads as
+ * unresolved, so request gates never fire against the previous repo's provider.
+ */
+export function providerForTarget(
+  bound: BoundProvider | null,
+  targetKey: string,
+): { provider: DialogProvider; settled: boolean } {
+  if (bound === null || bound.targetKey !== targetKey) return { provider: null, settled: false };
+  return { provider: bound.provider, settled: bound.settled };
+}
