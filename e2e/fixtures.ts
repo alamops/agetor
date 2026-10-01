@@ -50,6 +50,11 @@ export interface E2EBackend {
    *  writing into `fakePickDir` by hand before exercising the
    *  Files/Folder picker buttons. */
   plantPicks: (files: Record<string, string>) => Promise<string[]>;
+  /** Where `POST /bundle/export/save` with `target: "downloads"` writes in
+   *  this backend (`AGETOR_DOWNLOADS_DIR`, docs/plans/agents-pipelines-
+   *  import-export.md). Not created up front — the server creates it on the
+   *  first save, exactly like a missing `~/Downloads`. */
+  downloadsDir: string;
 }
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
@@ -278,6 +283,8 @@ async function provisionBackend(
   // bin above) so a spec can write into it before the backend even boots.
   const fakePickDir = path.join(dataDir, "fake-picks");
   mkdirSync(fakePickDir, { recursive: true });
+  // Save to Downloads target for the bundle export (see `downloadsDir`).
+  const downloadsDir = path.join(dataDir, "fake-downloads");
 
   const logStream: WriteStream = createWriteStream(logFile);
   await new Promise<void>((resolve, reject) => {
@@ -359,6 +366,9 @@ async function provisionBackend(
       // Test seam for `/refs/pick` (src/bun/server.ts) — see fakePickDir
       // above. Never set in production launches.
       AGETOR_FAKE_PICK_REFS_DIR: fakePickDir,
+      // Test seam for the bundle export's Save to Downloads — see
+      // downloadsDir above. Never set in production launches.
+      AGETOR_DOWNLOADS_DIR: downloadsDir,
       // So `githubToken()` resolves this literal token from env and never
       // shells out to `gh auth token` on the dev machine (which could hang,
       // fail, or leak a real token into a test run).
@@ -450,6 +460,7 @@ async function provisionBackend(
     githubStubPort,
     fakePickDir,
     plantPicks,
+    downloadsDir,
   };
 
   await use(backend);
