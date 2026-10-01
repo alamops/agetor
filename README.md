@@ -133,11 +133,11 @@ flowchart LR
 
 - **One card, many agents.** Running a pipeline creates a single board card. Each step runs as a hidden task in the card's worktree. Click any step to read its transcript, chat with it or check its diff, just like a normal task.
 - **Structured handoffs.** Each step ends its turn with a small `<handoff>` JSON block: a summary, the files it touched, open questions and which step runs `next`. That block becomes the next step's context.
-- **Branching, fan-out and loops.** A step can pick the next step by name, run all of its outgoing steps in parallel, or loop back to an earlier one. A join can wait for any incoming branch or for all of them. A step cap (25 by default) stops runaway loops.
+- **Branching, fan-out and loops.** When a step has more than one outgoing edge, it chooses where to go by putting the next step's name (or the edge's label) in its handoff. A step can instead run all of its outgoing steps in parallel, and an edge can loop back to an earlier step. A step with several incoming edges either runs each time one of them hands off, or waits until all of them have. A step cap (25 by default) stops runaway loops.
 - **Live run view.** The canvas animates as the pipeline runs: the active step pulses, and a token travels along each edge when a handoff happens.
 - **Blocks instead of guessing.** If a step needs your input, fails, or can't produce a valid handoff even after one automatic reminder, the card moves to **Blocked** with the reason. From there you can retry the step, choose the next step yourself, stop, or restart.
 - **Frozen at launch.** A pipeline and its Agents are captured the moment you click Run, so editing or deleting them never affects a run already in progress.
-- **Portable.** `agetor pipeline export` and `agetor pipeline import` move pipelines between machines. On import, Agents are matched to local ones by name.
+- **Portable.** `agetor pipeline export` and `agetor pipeline import` move pipelines between machines. The file records each step's Agent by name only, without the Agent's settings. On import, each step uses the local Agent with the same name (ignoring case), with that Agent's own harness, model, permission mode and instructions. Import doesn't flag differences from the original machine, so check them with `agetor profile show <name>` before the first run. If no local Agent has the name, import warns you, and that step needs an Agent before the pipeline can run.
 
 > [!WARNING]
 > Parallel steps share **one** worktree, and nothing stops two of them from editing the same files. Use fan-out only for work that is truly independent, such as docs in one branch and tests in another.
@@ -162,7 +162,7 @@ A step ends its turn with a block like this. The last block in the turn wins.
 </handoff>
 ```
 
-`next` names a step, or the label of an edge leading out of this step. A step with no outgoing edges ends its path.
+`next` names a step, or the label of an edge leading out of this step. It only matters when the step has more than one outgoing edge: a single edge is always followed, and a step set to run all of its next steps ignores `next`. A step with no outgoing edges ends its path.
 
 | Action | What it does | CLI |
 | --- | --- | --- |
@@ -173,6 +173,8 @@ A step ends its turn with a block like this. The last block in the turn wins.
 | **Restart** | Cancels anything still running and starts over from the first step, discarding the previous run. | `agetor pipeline restart <ref>` |
 
 A step can also list other Agents it's allowed to delegate to as subagents, with an optional cap. Agetor passes this to the step as guidance in its prompt; it doesn't enforce the cap. Deleting or archiving a pipeline task also deletes or archives its steps.
+
+On your own machine, a step points at the Agent itself, not at its name, so renaming an Agent doesn't break a pipeline. Two Agents can't share a name. Names only matter when you import a pipeline.
 
 </details>
 
