@@ -497,9 +497,9 @@ import {
  *     effortConfigState`, sourced from the Gateway catalog's per-model
  *     `reasoning_options[{type:"effort", values}]`). Live-probed across all
  *     28 then-curated fx models (spike `fx-0010-efforts`; spacexai/grok-4.7,
- *     anthropic/claude-opus-5.5, openai/gpt-6-sol, openai/gpt-6-luna and
- *     anthropic/claude-sonnet-5.5 postdate it): 16 advertise efforts, 12
- *     advertise none. Example (the owner's default model): `zai/glm-5.3-
+ *     anthropic/claude-opus-5.5, openai/gpt-6-sol, openai/gpt-6-luna,
+ *     anthropic/claude-sonnet-5.5 and openai/gpt-6.1-sol postdate it): 16
+ *     advertise efforts, 12 advertise none. Example (the owner's default model): `zai/glm-5.3-
  *     flash` → `auto, low, high, max`. **`session/set_config_option
  *     {sessionId, configId:"effort", value}` sets it** (`server.zig:2222-
  *     2247`, see `applyFxEffort` below; `ReasoningEffort.parse` in
