@@ -4779,6 +4779,17 @@ export interface ProviderCaps {
   lockConversation: boolean;
   pinIssue: boolean;
   issueTransfer: boolean;
+  /** Push-access lookup (`/github/repo-permissions`) — GitHub-only; elsewhere
+   *  the dialog stays optimistic and lets the provider reject a write. */
+  repoPermissions: boolean;
+  /** Repo assignee list for the assignee picker (`/github/assignees`) —
+   *  GitHub-only; elsewhere the picker falls back to free-text logins. */
+  assigneeList: boolean;
+  /** A pull request's commit list (`/github/pull-commits`) — GitHub-only. */
+  pullCommits: boolean;
+  /** Review-thread resolution state (`/github/pull-review-threads`) —
+   *  GitHub-only; review comments themselves are provider-aware. */
+  reviewThreads: boolean;
   mergeMethods: GitHubPullMergeMethod[];
   providerName: string;
   /** Singular term for a "pull request" in this provider's own terminology. */
@@ -4793,7 +4804,10 @@ export interface ProviderCaps {
  * dialog's original baseline); GitLab and Bitbucket flip off flags for panels
  * and actions their APIs don't support (Projects/Discussions/Actions/
  * Notifications/Releases/Reactions/SubIssues/Suggestions/AutoMerge/
- * UpdateBranch/LinkedIssues/CommentSort/Lock/Pin/Transfer are GitHub-only).
+ * UpdateBranch/LinkedIssues/CommentSort/Lock/Pin/Transfer/RepoPermissions/
+ * AssigneeList/PullCommits/ReviewThreads are GitHub-only). The dialog gates
+ * every fetch to a GitHub-only route on these flags via `providerSupports`
+ * (`src/mainview/lib/provider-caps.ts`), never on a bare `provider ===` check.
  *
  * `mergeMethods` reuses {@link GitHubPullMergeMethod} ("merge"|"squash"|"rebase")
  * as the neutral merge-strategy vocabulary:
@@ -4835,6 +4849,10 @@ export const PROVIDER_CAPS: Record<GitProvider, ProviderCaps> = {
     lockConversation: true,
     pinIssue: true,
     issueTransfer: true,
+    repoPermissions: true,
+    assigneeList: true,
+    pullCommits: true,
+    reviewThreads: true,
     mergeMethods: ["merge", "squash", "rebase"],
     providerName: "GitHub",
     pullNoun: "Pull request",
@@ -4867,6 +4885,10 @@ export const PROVIDER_CAPS: Record<GitProvider, ProviderCaps> = {
     lockConversation: false,
     pinIssue: false,
     issueTransfer: false,
+    repoPermissions: false,
+    assigneeList: false,
+    pullCommits: false,
+    reviewThreads: false,
     mergeMethods: ["merge", "squash"],
     providerName: "GitLab",
     pullNoun: "Merge request",
@@ -4899,6 +4921,10 @@ export const PROVIDER_CAPS: Record<GitProvider, ProviderCaps> = {
     lockConversation: false,
     pinIssue: false,
     issueTransfer: false,
+    repoPermissions: false,
+    assigneeList: false,
+    pullCommits: false,
+    reviewThreads: false,
     // merge_commit/squash/fast_forward → merge/squash/rebase; see the
     // ProviderCaps doc comment above for the fast_forward↔"rebase" mapping.
     mergeMethods: ["merge", "squash", "rebase"],

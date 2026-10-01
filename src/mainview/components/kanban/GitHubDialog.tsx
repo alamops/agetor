@@ -121,7 +121,15 @@ import type {
   ProviderCaps,
   TaskDiff,
 } from "../../../shared/types.ts";
-import { GIT_HOST_TOKENS_SECTION, PROVIDER_CAPS } from "../../../shared/types.ts";
+import { GIT_HOST_TOKENS_SECTION } from "../../../shared/types.ts";
+import {
+  displayCaps,
+  itemProvider,
+  providerForTarget,
+  providerSupports,
+  providerTargetKey,
+  type BoundProvider,
+} from "../../lib/provider-caps.ts";
 
 // Hoisted ReactMarkdown `components` map for GitHub markdown bodies (PR/issue
 // descriptions, comments, list previews). Module scope keeps the prop identity
@@ -577,8 +585,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // same as "mixed" by `caps` below so the dialog never renders a half-known
   // provider's gaps; it only ever narrows once resolution lands. Cached per
   // project path so switching between two already-seen projects is instant and
-  // aggregate mode doesn't refetch on every render.
-  const [provider, setProvider] = useState<GitProvider | "mixed" | null>(null);
+  // aggregate mode doesn't refetch on every render. The result is stored bound
+  // to the target it was resolved for; `provider`/`providerSettled` are derived
+  // from it below (after `aggregatePathsKey`).
+  const [boundProvider, setBoundProvider] = useState<BoundProvider | null>(null);
   const providerCache = useRef<Map<string, GitProvider | null>>(new Map());
   const [kind, setKind] = useState<GitHubItemKind>("pulls");
   const [state, setState] = useState<GitHubItemState>("open");
@@ -955,9 +965,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // Aggregate: resolve every registered project (cached individually so
   // re-entering aggregate mode doesn't refetch already-known repos), then
   // collapse to "github" only if every one of them is GitHub — otherwise
-  // "mixed". `provider` starts `null` each time the target changes, so a
-  // stale provider from the previously-selected project can never leak onto
-  // the next one while the new lookup is in flight.
+  // "mixed". The result is bound to its target key and `provider` is derived
+  // as unresolved whenever that key isn't the current target — the dialog
+  // stays mounted across target changes, and a reset issued from this effect
+  // would only land on the NEXT render, after the request-gating effects had
+  // already run once with the previous project's provider.
+  const providerTarget = providerTargetKey(projectPath, aggregatePathsKey);
+  const { provider, settled: providerSettled } = providerForTarget(boundProvider, providerTarget);
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
@@ -974,30 +988,30 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         return null;
       }
     };
+    const targetKey = providerTarget;
+    setBoundProvider({ targetKey, provider: null, settled: false });
     if (isAggregate) {
-      setProvider(null);
       void (async () => {
         const resolved = await Promise.all(projects.map((p) => resolveOne(p.path)));
         if (cancelled) return;
-        setProvider(resolved.length > 0 && resolved.every((r) => r === "github") ? "github" : "mixed");
+        const collapsed = resolved.length > 0 && resolved.every((r) => r === "github") ? "github" : "mixed";
+        setBoundProvider({ targetKey, provider: collapsed, settled: true });
       })();
     } else if (projectPath) {
-      setProvider(null);
       void resolveOne(projectPath).then((resolved) => {
-        if (!cancelled) setProvider(resolved);
+        if (cancelled) return;
+        setBoundProvider({ targetKey, provider: resolved, settled: true });
       });
-    } else {
-      setProvider(null);
     }
     return () => {
       cancelled = true;
     };
-  }, [open, isAggregate, projectPath, aggregatePathsKey]);
+  }, [open, isAggregate, projectPath, aggregatePathsKey, providerTarget]);
 
   // While unresolved (null) or in aggregate mode with mixed providers, default
   // to GitHub's capability set so terminology/gating never flicker for the
   // (overwhelmingly common) GitHub case during the brief lookup window.
-  const caps: ProviderCaps = provider === "mixed" || provider === null ? PROVIDER_CAPS.github : PROVIDER_CAPS[provider];
+  const caps: ProviderCaps = displayCaps(provider);
   // GitHub-exclusive panels (Labels/Milestones/Releases/Notifications/Actions/
   // Projects/Discussions manager buttons, per plan §8.6) require a *confirmed*
   // GitHub repo, unlike `caps` above which defaults to GitHub's flags while
@@ -1359,6 +1373,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // item carries its own repo's `sourcePath` from the merge in
   // `listGitHubItemsAcrossRepos`.
   const expandedItemPath = expandedItem?.sourcePath ?? projectPath;
+  // Provider owning the expanded item — in aggregate mode each item's own
+  // repo (resolved per path by the provider-info effect), so a GitLab item in
+  // a mixed view is gated like one in a single-repo GitLab view. Recomputed
+  // every render; `provider` flipping once the lookup lands re-runs the
+  // per-item fetch effects that list it.
+  const expandedItemProvider = itemProvider(provider, isAggregate, providerCache.current.get(expandedItemPath));
+  const expandedItemCaps: ProviderCaps = expandedItemProvider === null ? caps : displayCaps(expandedItemProvider);
 
   /** Small "owner/name"-ish badge shown on each row in aggregate mode (G8) —
    *  the local project's display name for `item.sourcePath`, matching what the
@@ -1413,8 +1434,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
       return;
     }
     if (!projectPath || canPushResolvedFor.current === projectPath) return;
-    let cancelled = false;
     setCanPush(true);
+    // Only GitHub has a permissions lookup (caps.repoPermissions); elsewhere
+    // stay optimistic and let the provider reject a write with a real error.
+    // Waits for a *confirmed* provider so the unresolved window can't fire it.
+    if (!providerSupports(provider, "repoPermissions")) return;
+    let cancelled = false;
     api.getGitHubRepoPermissions({ path: projectPath })
       .then((r) => {
         if (cancelled) return;
@@ -1427,7 +1452,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
       // caching a wrongly-optimistic value permanently.
       .catch(() => { /* keep the current (optimistic) canPush */ });
     return () => { cancelled = true; };
-  }, [open, projectPath, isAggregate]);
+  }, [open, projectPath, isAggregate, provider]);
 
   const refreshRepoLabels = async () => {
     if (!projectPath) return;
@@ -1547,22 +1572,22 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   };
 
   useEffect(() => {
-    if (!open || !projectPath || isAggregate) { setRepoMilestones([]); return; }
+    if (!open || !projectPath || isAggregate || !providerSupports(provider, "milestones")) { setRepoMilestones([]); return; }
     let cancelled = false;
     api.listGitHubMilestones({ path: projectPath })
       .then((r) => { if (!cancelled) setRepoMilestones(sortMilestones(r.milestones)); })
       .catch(() => { if (!cancelled) setRepoMilestones([]); });
     return () => { cancelled = true; };
-  }, [open, projectPath, isAggregate]);
+  }, [open, projectPath, isAggregate, provider]);
 
   useEffect(() => {
-    if (!open || !projectPath || isAggregate) { setRepoAssignees([]); return; }
+    if (!open || !projectPath || isAggregate || !providerSupports(provider, "assigneeList")) { setRepoAssignees([]); return; }
     let cancelled = false;
     api.listGitHubAssignees({ path: projectPath })
       .then((r) => { if (!cancelled) setRepoAssignees(r.assignees); })
       .catch(() => { if (!cancelled) setRepoAssignees([]); });
     return () => { cancelled = true; };
-  }, [open, projectPath, isAggregate]);
+  }, [open, projectPath, isAggregate, provider]);
 
   // Newest first (by publishedAt, falling back to createdAt for drafts) — the
   // server already sorts this way, but re-sort after every mutation so the
@@ -1608,13 +1633,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   };
 
   useEffect(() => {
-    if (!open || !projectPath || isAggregate) { setRepoReleases([]); return; }
+    if (!open || !projectPath || isAggregate || !providerSupports(provider, "releases")) { setRepoReleases([]); return; }
     let cancelled = false;
     api.listGitHubReleases({ path: projectPath })
       .then((r) => { if (!cancelled) setRepoReleases(sortReleases(r.releases)); })
       .catch(() => { if (!cancelled) setRepoReleases([]); });
     return () => { cancelled = true; };
-  }, [open, projectPath, isAggregate]);
+  }, [open, projectPath, isAggregate, provider]);
 
   // Tags are manager-only convenience data (the create-release tag datalist),
   // so — like notifications — fetched lazily only while the panel is open
@@ -2320,6 +2345,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     // headSha (only fetched for open PRs). Skip until one of them lands —
     // there's nothing to fetch yet.
     if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
+    // GitHub-only endpoint (caps.commitStatusPanel); GitLab/Bitbucket statuses
+    // are normalized into the CheckRuns payload instead.
+    if (!providerSupports(expandedItemProvider, "commitStatusPanel")) return;
     const key = itemKey(expandedItem);
     const sha = checks[key]?.sha ?? mergeability[key]?.headSha;
     if (!sha) return;
@@ -2341,7 +2369,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         if (requestId !== commitStatusSeq.current) return;
         setCommitStatusLoading((cur) => ({ ...cur, [key]: false }));
       });
-  }, [open, projectPath, expandedItem, checks, mergeability, commitStatus, commitStatusLoading, commitStatusErrors]);
+  }, [open, projectPath, expandedItem, expandedItemProvider, checks, mergeability, commitStatus, commitStatusLoading, commitStatusErrors]);
 
   // Fetches a fresh copy of `item` via the same `getGitHubPullDetail`
   // endpoint the "View PR" prefill effect above uses, and reconciles it into
@@ -2502,6 +2530,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
 
   useEffect(() => {
     if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
+    if (!providerSupports(expandedItemProvider, "pullCommits")) return;
     const number = expandedItem.number;
     const key = itemKey(expandedItem);
     if (commits[key] || commitsLoading[key] || commitsErrors[key]) return;
@@ -2522,10 +2551,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         if (requestId !== commitsSeq.current) return;
         setCommitsLoading((cur) => ({ ...cur, [key]: false }));
       });
-  }, [open, projectPath, expandedItem, commits, commitsLoading, commitsErrors]);
+  }, [open, projectPath, expandedItem, expandedItemProvider, commits, commitsLoading, commitsErrors]);
 
   useEffect(() => {
     if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
+    if (!providerSupports(expandedItemProvider, "linkedIssues")) return;
     const number = expandedItem.number;
     const key = itemKey(expandedItem);
     if (linkedIssues[key] || linkedIssuesLoading[key] || linkedIssuesErrors[key]) return;
@@ -2546,7 +2576,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         if (requestId !== linkedIssuesSeq.current) return;
         setLinkedIssuesLoading((cur) => ({ ...cur, [key]: false }));
       });
-  }, [open, projectPath, expandedItem, linkedIssues, linkedIssuesLoading, linkedIssuesErrors]);
+  }, [open, projectPath, expandedItem, expandedItemProvider, linkedIssues, linkedIssuesLoading, linkedIssuesErrors]);
 
   useEffect(() => {
     if (!open || !projectPath || !expandedItem) return;
@@ -2577,15 +2607,22 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     const number = expandedItem.number;
     const key = itemKey(expandedItem);
     if (reviewComments[key] || reviewCommentsLoading[key] || reviewCommentErrors[key]) return;
+    // Comments and threads land together and are cached as one, so wait for
+    // the provider lookup to settle — otherwise a detail opened before it
+    // lands (a "View PR" deep link) would cache "no threads" for a GitHub PR.
+    if (!providerSettled) return;
 
     const requestId = ++reviewCommentSeq.current;
     setReviewCommentsLoading((cur) => ({ ...cur, [key]: true }));
     setReviewCommentErrors((cur) => ({ ...cur, [key]: undefined }));
+    const noThreads = { threads: [] as GitHubReviewThread[], truncated: false };
     Promise.all([
       api.listGitHubPullReviewComments({ path: expandedItemPath, number }),
-      // Threads are supplementary (resolve controls) — degrade to none on failure.
-      api.getGitHubPullReviewThreads({ path: expandedItemPath, number })
-        .catch(() => ({ threads: [] as GitHubReviewThread[], truncated: false })),
+      // Threads are supplementary (resolve controls) — degrade to none on
+      // failure, and skip the GitHub-only fetch outright (caps.reviewThreads).
+      providerSupports(expandedItemProvider, "reviewThreads")
+        ? api.getGitHubPullReviewThreads({ path: expandedItemPath, number }).catch(() => noThreads)
+        : Promise.resolve(noThreads),
     ])
       .then(([commentsPayload, threadsPayload]) => {
         if (requestId !== reviewCommentSeq.current) return;
@@ -2601,7 +2638,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         if (requestId !== reviewCommentSeq.current) return;
         setReviewCommentsLoading((cur) => ({ ...cur, [key]: false }));
       });
-  }, [open, projectPath, expandedItem, reviewComments, reviewCommentsLoading, reviewCommentErrors]);
+  }, [open, projectPath, expandedItem, expandedItemProvider, providerSettled, reviewComments, reviewCommentsLoading, reviewCommentErrors]);
 
   const submitComment = async (item: GitHubListItem) => {
     const itemPath = item.sourcePath ?? projectPath;
@@ -3789,8 +3826,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         {showDetail && expandedItem ? (
           <GitHubItemDetail
             item={expandedItem}
-            caps={caps}
-            provider={provider}
+            caps={expandedItemCaps}
+            provider={expandedItemProvider ?? provider}
             itemPath={expandedItemPath}
             canPush={canPush}
             viewerLogin={viewerLogin}
@@ -7066,7 +7103,9 @@ function GitHubItemDetail({
           {caps.commitStatusPanel && (
             <CommitStatus status={commitStatus} loading={commitStatusLoading} error={commitStatusError} onRetry={onRetryCommitStatus} onRefresh={onRefreshCommitStatus} />
           )}
-          <PullCommits commits={commits} loading={commitsLoading} error={commitsError} onRetry={onRetryCommits} />
+          {caps.pullCommits && (
+            <PullCommits commits={commits} loading={commitsLoading} error={commitsError} onRetry={onRetryCommits} />
+          )}
           <ReviewComments
             path={itemPath}
             caps={caps}
