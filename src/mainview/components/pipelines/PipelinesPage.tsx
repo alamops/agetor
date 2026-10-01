@@ -1,28 +1,36 @@
 import { useState } from "react";
-import { ArrowLeft, Copy, Pencil, Plus, Trash2, Workflow } from "lucide-react";
+import { ArrowLeft, Copy, Download, Pencil, Plus, Trash2, Workflow } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm";
 import { usePipelines } from "@/lib/pipelines";
 import { api, ApiError } from "@/lib/api";
+import { BundleToolbar, useBundleList } from "@/components/bundle";
+import { cn } from "@/lib/utils";
 import { PIPELINE_LIMITS } from "../../../shared/types.ts";
 import type { Pipeline } from "../../../shared/types.ts";
 
 interface PipelinesPageProps {
   onOpenEditor: (id: string | null) => void;
   onBack: () => void;
+  /** After a bundle import — App reloads its harness list when the import
+   *  enabled a harness. */
+  onImported?: (result: { enabledHarnesses: string[] }) => void;
 }
 
 /**
  * The pipelines list — one board-agnostic full-page view (D5,
  * `docs/plans/pipelines.md`) for creating, editing, duplicating, and
  * deleting {@link Pipeline}s. Editing itself happens in {@link
- * PipelineEditor}, opened via `onOpenEditor`.
+ * PipelineEditor}, opened via `onOpenEditor`. Export/import runs through
+ * `useBundleList` (docs/plans/agents-pipelines-import-export.md C13); the
+ * whole page is a drop zone for a .json bundle.
  */
-export function PipelinesPage({ onOpenEditor, onBack }: PipelinesPageProps) {
+export function PipelinesPage({ onOpenEditor, onBack, onImported }: PipelinesPageProps) {
   const { pipelines, loading, error, refresh } = usePipelines();
   const confirm = useConfirm();
   const [busyId, setBusyId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const bundle = useBundleList({ ids: pipelines.map((p) => p.id), kind: "pipeline", onImported });
 
   const handleDuplicate = async (pipeline: Pipeline) => {
     setBusyId(pipeline.id);
@@ -67,7 +75,12 @@ export function PipelinesPage({ onOpenEditor, onBack }: PipelinesPageProps) {
   };
 
   return (
-    <div className="flex h-full w-full flex-col">
+    <div
+      data-testid="pipelines-page"
+      data-dragging={bundle.dragging ? "" : undefined}
+      className={cn("flex h-full w-full flex-col", bundle.dragging && "ring-2 ring-inset ring-info")}
+      {...bundle.dropProps}
+    >
       <div className="flex items-center gap-2 border-b border-border bg-card px-4 py-2.5">
         <Button type="button" variant="ghost" size="sm" data-testid="pipelines-back" onClick={onBack} className="gap-1.5">
           <ArrowLeft className="size-4" aria-hidden />
@@ -95,6 +108,10 @@ export function PipelinesPage({ onOpenEditor, onBack }: PipelinesPageProps) {
           </p>
         )}
 
+        <div className="mb-3">
+          <BundleToolbar {...bundle.toolbarProps} />
+        </div>
+
         {loading ? (
           <p className="text-sm text-muted-foreground">Loading pipelines…</p>
         ) : pipelines.length === 0 ? (
@@ -115,6 +132,14 @@ export function PipelinesPage({ onOpenEditor, onBack }: PipelinesPageProps) {
                 data-pipeline-id={pipeline.id}
                 className="flex items-start gap-3 rounded-lg border border-border bg-card p-3"
               >
+                <input
+                  type="checkbox"
+                  data-testid="bundle-row-select"
+                  className="mt-1 size-3.5 shrink-0 accent-primary"
+                  checked={bundle.isSelected(pipeline.id)}
+                  onChange={() => bundle.toggle(pipeline.id)}
+                  aria-label={`Select ${pipeline.name}`}
+                />
                 <div className="min-w-0 flex-1">
                   <button
                     type="button"
@@ -133,6 +158,18 @@ export function PipelinesPage({ onOpenEditor, onBack }: PipelinesPageProps) {
                   </p>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    title="Export"
+                    aria-label={`Export ${pipeline.name}`}
+                    data-testid="bundle-row-export"
+                    onClick={() => bundle.exportOne(pipeline.id)}
+                    className="size-8"
+                  >
+                    <Download className="size-3.5" aria-hidden />
+                  </Button>
                   <Button
                     type="button"
                     variant="ghost"
@@ -175,6 +212,7 @@ export function PipelinesPage({ onOpenEditor, onBack }: PipelinesPageProps) {
           </ul>
         )}
       </div>
+      {bundle.dialogs}
     </div>
   );
 }

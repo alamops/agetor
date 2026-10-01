@@ -2229,6 +2229,13 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 <PipelinesPage
                   onOpenEditor={(id) => setView({ kind: "pipelines", pipelineId: id, editing: true })}
                   onBack={() => setView({ kind: "board" })}
+                  onImported={(result) => {
+                    // A bundle import may enable a harness — refresh the
+                    // header/picker harness state now, not on the next poll.
+                    // (The Agents/Pipelines caches are refreshed by the
+                    // import dialog itself.)
+                    if (result.enabledHarnesses.length > 0) void refreshAgents();
+                  }}
                 />
               </motion.div>
             )}
