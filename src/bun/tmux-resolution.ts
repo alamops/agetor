@@ -24,8 +24,10 @@ export function bundledTmuxPath(): string {
     "tmux",
   );
   if (existsSync(packaged)) return packaged;
-  const dev = path.join(process.cwd(), "vendor", "tmux", "arm64", "tmux");
-  if (existsSync(dev)) return dev;
+  const devArch = path.join(process.cwd(), "vendor", "tmux", process.arch, "tmux");
+  if (existsSync(devArch)) return devArch;
+  const devArm64 = path.join(process.cwd(), "vendor", "tmux", "arm64", "tmux");
+  if (existsSync(devArm64)) return devArm64;
   return packaged;
 }
 
