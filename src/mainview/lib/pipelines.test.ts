@@ -14,6 +14,7 @@ import {
   stepAttention,
   stepLayoutFootprint,
   stepReminded,
+  stepNodeTaskFor,
   stepTaskFor,
   stepVisualState,
   subagentEdgeKey,
@@ -1235,5 +1236,105 @@ describe("pipelineAttentionStepTask", () => {
   test("an explicit null preferred id behaves like none (the tiers run)", () => {
     const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
     expect(pipelineAttentionStepTask(parent, [step("a", { pendingInteractionCount: 1 })], null)?.id).toBe("a");
+  });
+
+  test("a preferred step whose blocked column belongs to a settled execution doesn't win", () => {
+    // The toast named `a`; it settled (its row still reads blocked) and a
+    // cycle re-ran the step as `b`, which now asks — tier 3 and
+    // stepAttention ignore a settled row's column, so the preference must too.
+    const parent = parentWith({
+      active: [{ stepId: "s1", taskId: "b", seq: 2 }],
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" }), makeRecord({ seq: 2, stepId: "s1", taskId: "b" })],
+    });
+    const tasks = [step("a", { column: "blocked" }), step("b", { pendingInteractionCount: 1 })];
+    expect(pipelineAttentionStepTask(parent, tasks, "a")?.id).toBe("b");
+    expect(pipelineAttentionStepTask(parent, [step("a", { column: "blocked" }), step("b")], "a")).toBeNull();
+  });
+});
+
+describe("stepNodeTaskFor", () => {
+  const step = (id: string, overrides: Partial<Task> = {}) =>
+    makeTask({ id, pipelineParentId: "parent", column: "running", pendingInteractionCount: 0, ...overrides });
+
+  test("no run → null", () => {
+    expect(stepNodeTaskFor([], null, "s1")).toBeNull();
+  });
+
+  test("nothing needs the user → the latest execution (stepTaskFor)", () => {
+    const run = makeRun({
+      active: [{ stepId: "s1", taskId: "b", seq: 2 }],
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" })],
+    });
+    expect(stepNodeTaskFor([step("a"), step("b")], run, "s1")?.id).toBe("b");
+  });
+
+  test("a cycle: the node glows Answer from a settled execution's leftover question → opens that execution", () => {
+    const run = makeRun({
+      active: [{ stepId: "s1", taskId: "b", seq: 2 }],
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" }), makeRecord({ seq: 2, stepId: "s1", taskId: "b" })],
+    });
+    const steps = [step("a", { column: "review", pendingInteractionCount: 1 }), step("b")];
+    expect(stepAttention(run, "s1", steps)?.kind).toBe("answer");
+    expect(stepNodeTaskFor(steps, run, "s1")?.id).toBe("a");
+  });
+
+  test("a fan-in with two active executions: opens the one asking, not the latest", () => {
+    const run = makeRun({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s1", taskId: "b", seq: 2 },
+      ],
+    });
+    expect(stepNodeTaskFor([step("a", { pendingInteractionCount: 1 }), step("b")], run, "s1")?.id).toBe("a");
+  });
+
+  test("an active question beats a leftover one in history", () => {
+    const run = makeRun({
+      active: [{ stepId: "s1", taskId: "b", seq: 2 }],
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" })],
+    });
+    const steps = [step("a", { pendingInteractionCount: 1 }), step("b", { pendingInteractionCount: 1 })];
+    expect(stepNodeTaskFor(steps, run, "s1")?.id).toBe("b");
+  });
+
+  test("history leftovers resolve newest-first", () => {
+    const run = makeRun({
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" }), makeRecord({ seq: 2, stepId: "s1", taskId: "b" })],
+    });
+    const steps = [step("a", { pendingInteractionCount: 1 }), step("b", { pendingInteractionCount: 1 })];
+    expect(stepNodeTaskFor(steps, run, "s1")?.id).toBe("b");
+  });
+
+  test("a blocked active execution on a fan-in → that execution (block entry, then blocked column)", () => {
+    const run = makeRun({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s1", taskId: "b", seq: 2 },
+      ],
+      blocked: [{ taskId: "a", stepId: "s1", kind: "handoff-missing", message: "x" }],
+    });
+    expect(stepNodeTaskFor([step("a", { column: "review" }), step("b")], run, "s1")?.id).toBe("a");
+    const byColumn = makeRun({ active: run.active });
+    expect(stepNodeTaskFor([step("a", { column: "blocked" }), step("b")], byColumn, "s1")?.id).toBe("a");
+  });
+
+  test("other steps' questions never redirect this node", () => {
+    const run = makeRun({
+      active: [
+        { stepId: "s2", taskId: "x", seq: 1 },
+        { stepId: "s1", taskId: "a", seq: 2 },
+      ],
+    });
+    expect(stepNodeTaskFor([step("x", { pendingInteractionCount: 1 }), step("a")], run, "s1")?.id).toBe("a");
+  });
+
+  test("the asking row isn't polled yet → falls back to the latest polled execution", () => {
+    const run = makeRun({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s1", taskId: "b", seq: 2 },
+      ],
+    });
+    expect(stepNodeTaskFor([step("b")], run, "s1")?.id).toBe("b");
   });
 });

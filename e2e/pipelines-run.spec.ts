@@ -41,6 +41,9 @@ import { gotoApp } from "./helpers";
  */
 
 const FAKE_CLAUDE_HANDOFF_PROMPT_MARKER = "__agetor_fake_claude_handoff__";
+// Mirrors `FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER` in `src/bun/agents.ts`: a
+// fake claude turn that delivers two files via `SendUserFile`.
+const FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER = "__agetor_fake_claude_sent_files__";
 // Mirrors `FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER` in `src/bun/agents.ts` (literal
 // copy — see that constant's doc comment): inside a fake handoff turn, spawn
 // one subagent row for `:<ms>` described as `[<text>]`, then hand off.
@@ -1176,12 +1179,16 @@ test.describe("pipelines run: step attention — a step asking mid-turn", () => 
     await expect(waitingToast(page)).toHaveCount(0);
   });
 
-  test("the card body stays a run-view-only path: no step panel opens", async ({ page, freshBackend }) => {
+  test("the card body stays a run-view-only path: no step panel opens; opening the asking node clears the parent's toast", async ({
+    page,
+    freshBackend,
+  }) => {
     const backend = freshBackend;
     const { asker, task, title } = await createAskingPipelineTask(backend);
-    await gotoApp(page, backend.bootBase);
+    await gotoAppSubscribed(page, backend);
     await startTaskRest(backend, task.id);
     await waitForPendingCount(backend, task.id, 1);
+    await expect(waitingToast(page)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await waitForPolledStep(page, task.id, { pending: true });
     await expect(boardCard(page, title).getByRole("button", { name: "Answer", exact: true })).toBeVisible({
       timeout: CONVERGE_TIMEOUT,
@@ -1191,6 +1198,14 @@ test.describe("pipelines run: step attention — a step asking mid-turn", () => 
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
     await expect(stepNode(page, asker.id)).toHaveAttribute("data-attention", "answer", { timeout: CONVERGE_TIMEOUT });
     await expect(runPanelHandle(page)).toHaveCount(0);
+    // A run-view-only landing leaves the parent-keyed toast up…
+    await expect(waitingToast(page)).toBeVisible();
+
+    // …but opening the asking step's own panel clears it: the toast is
+    // keyed on the parent, not the step.
+    await stepNode(page, asker.id).click();
+    await expect(page.getByTestId("run-panel-pipeline-strip")).toContainText("step Asker");
+    await expect(waitingToast(page)).toHaveCount(0);
   });
 
   test("the 'Waiting on you' toast's Open lands on the step that asked", async ({ page, freshBackend }) => {
@@ -1420,5 +1435,84 @@ test.describe("pipelines run: step attention — blocks", () => {
     await expect(attentionChip(page, B.id)).toHaveText("Review");
     await expect(stepNode(page, A.id)).not.toHaveAttribute("data-attention", /.+/);
     await expect(runPanelHandle(page)).toHaveCount(0);
+  });
+});
+
+test.describe("pipelines run: step attention — step-named and keep-the-panel landings", () => {
+  test.use({ backendEnv: { AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: RESOLVE_DELAY_MS } });
+
+  test("the retargeted files-sent toast's Open lands on the run view plus the step that sent them", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({ id: randomUUID(), name: "Sender", agentProfileId: profileId });
+    const pipelineId = await createPipelineRest(backend, "Sending Pipeline", [A], []);
+    const title = `Sending Run ${randomUUID()}`;
+    // No handoff marker: the fake driver's sent-files scenario runs instead
+    // (the step later blocks on its missing handoff — irrelevant here).
+    const task = await createPipelineTaskRest(backend, title, pipelineId, `Send the files. ${FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER}`);
+    await gotoAppSubscribed(page, backend);
+    await startTaskRest(backend, task.id);
+
+    const toastEl = page.locator("[data-sonner-toaster] [data-sonner-toast]").filter({ hasText: "files sent to you" });
+    await expect(toastEl).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    // Retargeted at the parent: its title, never the hidden step's id.
+    await expect(toastEl).toContainText(title);
+    await waitForPolledStep(page, task.id);
+    // The step's later missing-handoff block raises a "Pipeline needs you"
+    // toast that stacks in front of this one; hovering the toaster expands
+    // the stack (as it would for a user) so this toast's Open is reachable.
+    await page.locator("[data-sonner-toaster] [data-sonner-toast][data-front='true']").hover();
+    await toastEl.getByRole("button", { name: "Open", exact: true }).click();
+
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await expect(page.getByTestId("run-panel-pipeline-strip")).toContainText("step Sender");
+    await expect(page.getByTestId("sent-files-card").first()).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  });
+
+  test("an attention landing that resolves no step keeps a step panel of the same pipeline open", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({ id: randomUUID(), name: "First", agentProfileId: profileId });
+    const B = makeStep({ id: randomUUID(), name: "Capped", agentProfileId: profileId });
+    // maxSteps = 1: launching B hits the cap — a run-level `step-cap` block
+    // with no step task, so the "Pipeline needs you" toast resolves no step.
+    const pipelineId = await createPipelineRest(backend, "Capped Keep Pipeline", [A, B], [{ from: A.id, to: B.id }], 1);
+    const title = `Capped Keep Run ${randomUUID()}`;
+    const task = await createPipelineTaskRest(
+      backend,
+      title,
+      pipelineId,
+      `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+    );
+    await gotoAppSubscribed(page, backend);
+    await startTaskRest(backend, task.id);
+
+    const toastEl = waitingToast(page).filter({ hasText: "Pipeline needs you" });
+    await expect(toastEl).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await waitForPolledStep(page, task.id);
+
+    // Read the pipeline: run view (card body), then the settled step's panel.
+    await boardCard(page, title).getByText(title, { exact: true }).click();
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await stepNode(page, A.id).click();
+    const strip = page.getByTestId("run-panel-pipeline-strip");
+    await expect(strip).toContainText("step First");
+
+    // The toast sits above the panel's backdrop; its landing resolves no
+    // step, so the panel the user is reading must stay open.
+    await expect(toastEl).toBeVisible();
+    await toastEl.getByRole("button", { name: "Open", exact: true }).click();
+    await expect(toastEl).toHaveCount(0);
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    // Past the panel's exit animation, had it been closed.
+    await page.waitForTimeout(1000);
+    await expect(runPanelHandle(page)).toHaveCount(1);
+    await expect(strip).toContainText("step First");
   });
 });

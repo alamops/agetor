@@ -317,7 +317,8 @@ export function sameStepAttention(
  * With `preferredStepTaskId` (the "Waiting on you" toast names the step
  * that asked) that row wins when it's in `tasks`, is one of `parent`'s
  * steps, and still needs the user — a pending interaction, a `blocked`
- * column, or a `run.blocked` entry naming its task. A named step that no
+ * column on a still-active execution, or a `run.blocked` entry naming its
+ * task. A named step that no
  * longer does (answered since — the parent-keyed toast outlives its first
  * asker while another step's question is still open) or isn't polled in
  * yet falls through to the tiers below, so the toast lands on whichever
@@ -348,10 +349,15 @@ export function pipelineAttentionStepTask(
 
   if (preferredStepTaskId != null) {
     const row = byId.get(preferredStepTaskId);
+    // A `blocked` column only counts on a still-active execution — the
+    // same rule as tier 3 and {@link stepAttention}; a settled execution's
+    // row can keep reading `blocked` long after the run moved past it.
+    const activeBlocked =
+      row?.column === "blocked" && (run?.active.some((a) => a.taskId === row.id) ?? false);
     if (
       row &&
       (row.pendingInteractionCount > 0 ||
-        row.column === "blocked" ||
+        activeBlocked ||
         (run?.blocked.some((b) => b.taskId === row.id) ?? false))
     ) {
       return row;
@@ -902,6 +908,50 @@ export function stepTaskFor(steps: Task[], run: PipelineRunState | null | undefi
     if (record.stepId === stepId) latestTaskId = record.taskId;
   }
   return latestTaskId ? (steps.find((t) => t.id === latestTaskId) ?? null) : null;
+}
+
+/**
+ * Which execution of `stepId` clicking its run-view node should open. When
+ * the step needs the user, that's the execution that actually does — the
+ * same tiers {@link pipelineAttentionStepTask} walks, scoped to this step:
+ * the first active execution with a pending question, then the latest
+ * history execution still holding one (a leftover card on a settled run of
+ * the step — {@link stepAttention} counts those, so a glowing `Answer` node
+ * must open the row that asks), then the first `run.blocked` entry naming
+ * one of the step's active executions, then the first active execution
+ * whose column reads `blocked`. Otherwise (or when that row isn't polled)
+ * {@link stepTaskFor}'s latest execution.
+ */
+export function stepNodeTaskFor(
+  steps: Task[],
+  run: PipelineRunState | null | undefined,
+  stepId: string,
+): Task | null {
+  if (!run) return null;
+  const byId = new Map(steps.map((t) => [t.id, t] as const));
+  const active = run.active.filter((a) => a.stepId === stepId);
+  const activeIds = new Set(active.map((a) => a.taskId));
+
+  for (const entry of active) {
+    const row = byId.get(entry.taskId);
+    if (row && row.pendingInteractionCount > 0) return row;
+  }
+  for (let i = run.history.length - 1; i >= 0; i -= 1) {
+    const record = run.history[i]!;
+    if (record.stepId !== stepId) continue;
+    const row = byId.get(record.taskId);
+    if (row && row.pendingInteractionCount > 0) return row;
+  }
+  for (const block of run.blocked) {
+    if (block.taskId == null || !activeIds.has(block.taskId)) continue;
+    const row = byId.get(block.taskId);
+    if (row) return row;
+  }
+  for (const entry of active) {
+    const row = byId.get(entry.taskId);
+    if (row && row.column === "blocked") return row;
+  }
+  return stepTaskFor(steps, run, stepId);
 }
 
 /**

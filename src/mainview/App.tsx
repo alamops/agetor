@@ -891,9 +891,16 @@ function AppInner() {
   // task is noise — they're already looking at the prompt. Clearing it also
   // removes one more high-z-index click target that could otherwise sit on
   // top of the panel header and eat clicks meant for the X button.
+  // A pipeline step that is itself asking also clears its parent's toast:
+  // a step's "Waiting on you" toast is retargeted at (and keyed by) the
+  // pipeline parent, so dismissing by the step id alone would leave it up
+  // over the very panel answering it.
   useEffect(() => {
     if (!selected) return;
     dismissPending(selected.id);
+    if (selected.pipelineParentId && selected.pendingInteractionCount > 0) {
+      dismissPending(selected.pipelineParentId);
+    }
   }, [selected?.id]);
 
   // Mark-seen wiring for the unread-bullet indicator (see TaskCard's corner

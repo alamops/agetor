@@ -20,6 +20,7 @@ import {
   sameStepAttention,
   satellitesSignature,
   stepAttention,
+  stepNodeTaskFor,
   stepReminded,
   stepTaskFor,
   stepVisualState,
@@ -675,7 +676,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         setDetailsNodeId(node.id);
         return;
       }
-      const stepTask = stepTaskFor(steps, run, node.id);
+      const stepTask = stepNodeTaskFor(steps, run, node.id);
       if (stepTask) {
         setNotStartedStepName(null);
         onOpenTask(stepTask);
