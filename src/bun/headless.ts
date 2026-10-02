@@ -1,5 +1,5 @@
 import pkg from "../../package.json" with { type: "json" };
-import { API_TOKEN } from "./api-config.ts";
+import { API_TOKEN, formatHostForUrl, getApiHost, nonLoopbackBindWarning } from "./api-config.ts";
 import { db, dataDir, subagents } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
@@ -237,7 +237,10 @@ export async function runDaemon(): Promise<void> {
     },
     dataDir,
   );
-  daemonLog(`cli-daemon listening on http://127.0.0.1:${server.port}`);
+  const bindHost = getApiHost();
+  daemonLog(`cli-daemon listening on http://${formatHostForUrl(bindHost)}:${server.port}`);
+  const bindWarning = nonLoopbackBindWarning(bindHost, server.port!);
+  if (bindWarning) daemonLog(bindWarning);
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));

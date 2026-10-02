@@ -283,6 +283,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 | --- | --- | --- |
 | `AGETOR_DATA_DIR` | Where the database, worktrees and logs live. | `~/.agetor` |
 | `AGETOR_API_PORT` | Port for the local API. | `4317` |
+| `AGETOR_API_HOST` | Address the local API binds to. Leave it on loopback unless you run Agetor headless in a container (see below). | `127.0.0.1` |
 | `AGETOR_CLAUDE_BIN` / `AGETOR_CLAUDE_ARGS` | Override the `claude` binary / append extra args. | `claude` on `PATH` |
 | `AGETOR_CODEX_BIN` / `AGETOR_CODEX_ARGS` | Same, for Codex. | `codex` on `PATH` |
 | `AGETOR_CURSOR_BIN` / `AGETOR_CURSOR_ARGS` | Same, for Cursor. | `cursor-agent` on `PATH` |
@@ -293,6 +294,24 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 | `AGETOR_DAEMON_IDLE_MS` | Shut the CLI daemon down after this long with no run and no client (`0` disables). | `300000` |
 
 The bin, home and env overrides you set per harness in Settings take precedence over these variables. The CLI honors `AGETOR_DATA_DIR` and `AGETOR_API_PORT` too, and so do its `--data-dir` and `--port` flags. Test-only switches (fake drivers, API stubs) are documented in [`CLAUDE.md`](./CLAUDE.md).
+
+**Running headless in a container.** The API binds to `127.0.0.1` by default, and a Docker port mapping can't reach a loopback-only listener inside the container. Set `AGETOR_API_HOST=0.0.0.0` in the container so the published port works. Use a wildcard rather than the container's own IP, because the CLI and agent hooks inside the container still connect over `127.0.0.1`. A non-loopback bind is protected **only by the bearer token**, and Agetor logs a warning about this at startup. Publish the port to `127.0.0.1` on the host so nothing beyond your machine can reach it:
+
+```bash
+docker run -e AGETOR_API_HOST=0.0.0.0 -p 127.0.0.1:4317:4317 <your-agetor-image>
+```
+
+```yaml
+services:
+  agetor:
+    image: <your-agetor-image>
+    environment:
+      AGETOR_API_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:4317:4317"
+```
+
+The token changes on every launch and is written to `agetor-core.json` in the data directory.
 
 </details>
 

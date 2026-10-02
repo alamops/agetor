@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
+import { formatHostForUrl, getApiHost } from "./api-config.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
@@ -399,7 +400,7 @@ try {
   }
   if (!recovered) {
     const msg = (e as Error)?.message ?? String(e);
-    console.error(`[agetor] failed to bind API on 127.0.0.1:${API_PORT}: ${msg}`);
+    console.error(`[agetor] failed to bind API on ${formatHostForUrl(getApiHost())}:${API_PORT}: ${msg}`);
     console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
     process.exit(1);
   }
