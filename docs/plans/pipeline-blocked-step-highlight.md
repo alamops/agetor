@@ -127,7 +127,7 @@ onOpenAttention: (t: Task) => void;
 ### 3.4 `stepAttention` rules
 
 1. No run → `null`.
-2. Candidate tasks: every `run.active` entry with this `stepId`. If there is none, the task of the latest `run.history` record for this step.
+2. Candidate tasks: every `run.active` entry with this `stepId`, plus the task of every `run.history` record for this step (deduped). *Review fix: originally only the latest history record when nothing was active, which disagreed with resolver tier 4 in a cycle — the card read Answer and opened a step while no node glowed.*
 3. `pending` = sum of `pendingInteractionCount` over the candidate rows found in `steps`.
 4. `block` = first `run.blocked` entry where `b.stepId === stepId`, or `b.taskId` is one of the step's active task ids.
 5. `columnBlocked` = any active candidate row with `column === "blocked"`.
@@ -139,7 +139,7 @@ This covers grill rows 1–5, gives `null` for the `reviewActive`-without-block 
 
 ### 3.5 `pipelineAttentionStepTask` rules (the "which step" resolver)
 
-With `preferredStepTaskId` (the toast names the step, D12): return that row only if it is in `tasks` and its `pipelineParentId` is `parent.id`. Otherwise `null`. No fallback to the tiers.
+With `preferredStepTaskId` (the toast names the step, D12): return that row if it is in `tasks`, its `pipelineParentId` is `parent.id`, and it still needs the user (pending > 0, `column === "blocked"`, or a `run.blocked` entry with its `taskId`). Otherwise fall through to the tiers. *Review fix: originally no fallback, so the parent-keyed toast stayed pinned to its first asker after that step was answered while another step's question was open. D13's "no longer needs you → run view only" still holds when no tier matches.*
 
 Without it, over `parent.pipelineRun` (`null` run → `null`):
 
@@ -302,3 +302,11 @@ Carried from the grill unchanged: `block.stepId` naming a step missing from the 
 | Runner cancelling pending cards when a step settles | Out of scope | Server behavior change; the UI side is handled in T2 |
 | Server / DB / schema | Out of scope | Every needed field is already on the wire |
 | A step that asks the instant it spawns loses its "Waiting on you" toast | Out of scope (found while executing; pre-existing) | The runner `persist`s again right after `launchStep`'s `startTask` returns (`startPipelineRun`, and the settle path), and App's `pipeline`-event handler dismisses the parent's pending toast + tracker entry on any non-`blocked` status. A question registered during the spawn therefore loses its toast (the card and node still glow). Fixing it means changing either the runner's persist ordering (server) or the toast lifecycle rule for every pipeline event — neither is part of this webview-only change; reported in the handoff. |
+
+## Review fixes (code review of `c08e5c7..dfa130e`)
+
+- **Step-named toasts.** The retargeted `files-sent` / `fx-auto-resume` toasts no longer call `openPipelineRun`, which closed the step panel the user was reading. They go through `openPipelineStep(parentId, stepTaskId)`: run view plus the named step's panel, unconditionally, without re-resolving and without dismissing the parent's "Waiting on you" toast.
+- **`landOnPipeline`.** Shared by `openPipelineAttention` and `openPipelineStep`. With no step to open, it closes another task's leftover panel but keeps a step panel of the same pipeline (and its subagent-focus request) open. So an OS-notification click about the pipeline being read (a proactive send notifies the OS even when focused) no longer closes the step. `openPipelineRun` keeps closing every panel, because RunPanel's "Open pipeline" strip button lands there and must reveal the run view.
+- **Resolver preferred id** and **`stepAttention` candidates**: see §3.4/§3.5 notes above.
+- **D16 e2e.** A dirty-editor scenario: "Waiting on you" toast Open → cancel the discard confirm → editor still shown, no run view, no run panel.
+

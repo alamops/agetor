@@ -980,13 +980,56 @@ describe("stepAttention", () => {
       label: "Answer",
       message: null,
     });
-    // Only the LATEST execution counts — an older generation's leftover doesn't.
+    // An older generation's leftover counts too — the same set the attention
+    // resolver scans, so a card reading Answer always has a node glowing.
     expect(
       stepAttention(run, "step-1", [
         makeTask({ id: "task-old", column: "review", pendingInteractionCount: 1 }),
         makeTask({ id: "task-new", column: "review", pendingInteractionCount: 0 }),
       ]),
-    ).toBeNull();
+    ).toEqual({ kind: "answer", label: "Answer", message: null });
+  });
+
+  test("a cycle: an earlier execution's leftover question still glows while the step re-runs", () => {
+    const run = makeRun({
+      active: [{ stepId: "step-1", taskId: "task-2", seq: 3 }],
+      history: [
+        makeRecord({ seq: 1, stepId: "step-1", taskId: "task-1" }),
+        makeRecord({ seq: 2, stepId: "step-2", taskId: "task-other" }),
+        makeRecord({ seq: 3, stepId: "step-1", taskId: "task-2" }),
+      ],
+    });
+    const steps = [
+      makeTask({ id: "task-1", column: "review", pendingInteractionCount: 1 }),
+      makeTask({ id: "task-2", column: "running", pendingInteractionCount: 0 }),
+    ];
+    expect(stepAttention(run, "step-1", steps)).toEqual({ kind: "answer", label: "Answer", message: null });
+    // Agrees with the resolver: the card's Answer lands on that leftover.
+    const parent = makeTask({ id: "parent", pipelineId: "pipeline-1", pipelineRun: run });
+    const rows = steps.map((t) => ({ ...t, pipelineParentId: "parent" }));
+    expect(pipelineAttentionStepTask(parent, rows)?.id).toBe("task-1");
+    // The other step of the cycle needs nothing.
+    expect(stepAttention(run, "step-2", steps)).toBeNull();
+  });
+
+  test("an active execution also present in history is counted once", () => {
+    const run = makeRun({
+      active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }],
+      history: [makeRecord({ seq: 1, stepId: "step-1", taskId: "task-1" })],
+    });
+    expect(stepAttention(run, "step-1", [asking()])?.label).toBe("Answer");
+  });
+
+  test("a settled execution's blocked column doesn't read Review while the step re-runs", () => {
+    const run = makeRun({
+      active: [{ stepId: "step-1", taskId: "task-2", seq: 2 }],
+      history: [
+        makeRecord({ seq: 1, stepId: "step-1", taskId: "task-1", outcome: "failed" }),
+        makeRecord({ seq: 2, stepId: "step-1", taskId: "task-2" }),
+      ],
+    });
+    const steps = [makeTask({ id: "task-1", column: "blocked" }), makeTask({ id: "task-2", column: "running" })];
+    expect(stepAttention(run, "step-1", steps)).toBeNull();
   });
 
   test("a settled step whose own column reads blocked is not an attention (only active ones are)", () => {
@@ -1133,21 +1176,60 @@ describe("pipelineAttentionStepTask", () => {
     expect(pipelineAttentionStepTask(parent, [foreign])).toBeNull();
   });
 
-  test("a preferred step id that's polled and belongs to the parent wins outright", () => {
-    const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
-    const tasks = [step("a", { pendingInteractionCount: 1 }), step("b")];
+  test("a preferred step id that still has a pending question wins over the tiers", () => {
+    const parent = parentWith({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s2", taskId: "b", seq: 2 },
+      ],
+    });
+    const tasks = [step("a", { pendingInteractionCount: 1 }), step("b", { pendingInteractionCount: 1 })];
     expect(pipelineAttentionStepTask(parent, tasks, "b")?.id).toBe("b");
   });
 
-  test("a preferred step id that isn't polled → null, with no fallback to the tiers", () => {
-    const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
-    expect(pipelineAttentionStepTask(parent, [step("a", { pendingInteractionCount: 1 })], "gone")).toBeNull();
+  test("a preferred step whose column reads blocked, or that a run.blocked entry names, still wins", () => {
+    const parent = parentWith({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s2", taskId: "b", seq: 2 },
+        { stepId: "s3", taskId: "c", seq: 3 },
+      ],
+      blocked: [{ taskId: "c", stepId: "s3", kind: "step-blocked", message: "waiting" }],
+    });
+    const tasks = [step("a", { pendingInteractionCount: 1 }), step("b", { column: "blocked" }), step("c", { column: "review" })];
+    expect(pipelineAttentionStepTask(parent, tasks, "b")?.id).toBe("b");
+    expect(pipelineAttentionStepTask(parent, tasks, "c")?.id).toBe("c");
   });
 
-  test("a preferred step id belonging to another parent → null", () => {
+  test("a preferred step answered since falls through to the step that still needs the user", () => {
+    // Two steps asked at once; the parent-keyed toast still names the first
+    // asker after it was answered, while the second's question is open.
+    const parent = parentWith({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s2", taskId: "b", seq: 2 },
+      ],
+    });
+    const tasks = [step("a"), step("b", { pendingInteractionCount: 1 })];
+    expect(pipelineAttentionStepTask(parent, tasks, "a")?.id).toBe("b");
+  });
+
+  test("a preferred step answered since, with nothing else needing the user → null (run view alone)", () => {
+    const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
+    expect(pipelineAttentionStepTask(parent, [step("a"), step("b")], "a")).toBeNull();
+  });
+
+  test("a preferred step id that isn't polled falls through to the tiers", () => {
+    const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
+    expect(pipelineAttentionStepTask(parent, [step("a", { pendingInteractionCount: 1 })], "gone")?.id).toBe("a");
+    expect(pipelineAttentionStepTask(parent, [step("a")], "gone")).toBeNull();
+  });
+
+  test("a preferred step id belonging to another parent is never returned", () => {
     const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
     const foreign = makeTask({ id: "x", pipelineParentId: "other-parent", pendingInteractionCount: 1 });
-    expect(pipelineAttentionStepTask(parent, [step("a", { pendingInteractionCount: 1 }), foreign], "x")).toBeNull();
+    expect(pipelineAttentionStepTask(parent, [step("a"), foreign], "x")).toBeNull();
+    expect(pipelineAttentionStepTask(parent, [step("a", { pendingInteractionCount: 1 }), foreign], "x")?.id).toBe("a");
   });
 
   test("an explicit null preferred id behaves like none (the tiers run)", () => {

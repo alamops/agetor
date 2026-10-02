@@ -1211,6 +1211,38 @@ test.describe("pipelines run: step attention — a step asking mid-turn", () => 
     await expect(stepNode(page, asker.id)).toHaveAttribute("data-attention", "answer", { timeout: CONVERGE_TIMEOUT });
     await expect(waitingToast(page)).toHaveCount(0);
   });
+
+  test("an attention landing over a dirty pipeline editor: cancelling the discard confirm opens nothing (D16)", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const { task } = await createAskingPipelineTask(backend);
+    await gotoAppSubscribed(page, backend);
+
+    // A dirty draft in the pipeline editor.
+    await page.getByTestId("pipelines-button").click();
+    await page.getByTestId("pipelines-new").click();
+    const editor = page.getByTestId("pipeline-editor");
+    await expect(editor).toBeVisible();
+    await editor.getByTestId("pipeline-name").fill(`E2E Dirty Draft ${randomUUID()}`);
+
+    await startTaskRest(backend, task.id);
+    const toastEl = waitingToast(page);
+    await expect(toastEl).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await waitForPolledStep(page, task.id, { pending: true });
+    await toastEl.getByRole("button", { name: "Open", exact: true }).click();
+
+    const discardDialog = page.getByRole("dialog").filter({ hasText: "Discard unsaved pipeline changes?" });
+    await expect(discardDialog).toBeVisible();
+    await discardDialog.getByRole("button", { name: "Keep editing", exact: true }).click();
+    await expect(discardDialog).toBeHidden();
+
+    // Still editing; no run view, and no step panel opened over the editor.
+    await expect(editor).toBeVisible();
+    await expect(page.getByTestId("pipeline-run-view")).toHaveCount(0);
+    await expect(runPanelHandle(page)).toHaveCount(0);
+  });
 });
 
 test.describe("pipelines run: step attention — run-view-only landings", () => {

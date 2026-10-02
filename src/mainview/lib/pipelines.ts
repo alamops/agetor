@@ -242,13 +242,16 @@ export interface StepAttention {
 
 /**
  * Resolve {@link StepAttention} for one step of `run`, or `null` when it
- * needs nothing. Candidates are every `run.active` execution of `stepId`
- * (several on a fan-in that launched it more than once), else — the step
- * isn't running — the task of its latest `run.history` record, so a
- * question left pending after the execution settled still glows (the runner
- * never cancels pending cards when a step settles; only Restart does).
- * Then, in order: any pending interaction on a candidate's row (looked up
- * in `steps`) → `answer` with `Answer`/`Answer (N)`; else a `run.blocked`
+ * needs nothing. Pending questions are counted across EVERY execution of
+ * `stepId` — each `run.active` entry (several on a fan-in that launched it
+ * more than once) plus every `run.history` record's task — so a question
+ * left pending after its execution settled still glows (the runner never
+ * cancels pending cards when a step settles; only Restart does), even once
+ * a cycle has re-run the step since. That's the same set
+ * {@link pipelineAttentionStepTask} scans, so a card reading `Answer`
+ * always has a glowing node to land on. Then, in order: any pending
+ * interaction on one of those rows (looked up in `steps`) → `answer` with
+ * `Answer`/`Answer (N)`; else a `run.blocked`
  * entry naming this step (by `stepId`, which also covers a run-level block
  * like `step-cap` stuck at a step that isn't active, or by one of its
  * active executions' `taskId`), or an active execution whose own board
@@ -264,13 +267,11 @@ export function stepAttention(
   if (!run) return null;
 
   const activeTaskIds = run.active.filter((a) => a.stepId === stepId).map((a) => a.taskId);
-  let candidateIds = activeTaskIds;
-  if (candidateIds.length === 0) {
-    let latestTaskId: string | null = null;
-    for (const record of run.history) {
-      if (record.stepId === stepId) latestTaskId = record.taskId;
-    }
-    candidateIds = latestTaskId ? [latestTaskId] : [];
+  // A Set: an execution that's still active also has its (open) history
+  // record, and must not be counted twice.
+  const candidateIds = new Set(activeTaskIds);
+  for (const record of run.history) {
+    if (record.stepId === stepId) candidateIds.add(record.taskId);
   }
 
   let pending = 0;
@@ -313,10 +314,15 @@ export function sameStepAttention(
  * means "land on the run view only" (nothing to open, or the step row
  * hasn't been polled yet).
  *
- * With `preferredStepTaskId` (a toast that names its step) that row is
- * returned only when it's in `tasks` and is one of `parent`'s steps — no
- * fallback to the tiers below, so a toast never opens a different step
- * than the one it announced. Otherwise, over `parent.pipelineRun`:
+ * With `preferredStepTaskId` (the "Waiting on you" toast names the step
+ * that asked) that row wins when it's in `tasks`, is one of `parent`'s
+ * steps, and still needs the user — a pending interaction, a `blocked`
+ * column, or a `run.blocked` entry naming its task. A named step that no
+ * longer does (answered since — the parent-keyed toast outlives its first
+ * asker while another step's question is still open) or isn't polled in
+ * yet falls through to the tiers below, so the toast lands on whichever
+ * step needs the user now, or on the run view alone when none does.
+ * The tiers, over `parent.pipelineRun`:
  * 1. the first `run.active` execution (array order is launch order) whose
  *    row has a pending interaction — a question beats everything;
  * 2. the first `run.blocked` entry with a `taskId` whose row is present;
@@ -338,9 +344,20 @@ export function pipelineAttentionStepTask(
     if (t.pipelineParentId === parent.id) byId.set(t.id, t);
   }
 
-  if (preferredStepTaskId != null) return byId.get(preferredStepTaskId) ?? null;
-
   const run = parent.pipelineRun;
+
+  if (preferredStepTaskId != null) {
+    const row = byId.get(preferredStepTaskId);
+    if (
+      row &&
+      (row.pendingInteractionCount > 0 ||
+        row.column === "blocked" ||
+        (run?.blocked.some((b) => b.taskId === row.id) ?? false))
+    ) {
+      return row;
+    }
+  }
+
   if (!run) return null;
 
   for (const entry of run.active) {

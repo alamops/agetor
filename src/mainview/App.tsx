@@ -386,6 +386,30 @@ function AppInner() {
     setView(next);
     onNavigated?.();
   }, [confirm]);
+  /** What a step-resolving pipeline landing (`openPipelineAttention`,
+   *  `openPipelineStep`) does to the run panel once its view switch
+   *  commits: with a `step`, open that step (keeping a pending subagent-
+   *  focus request only if it's for that same step); without one (nothing
+   *  needs the user, or the row isn't polled in yet), close a leftover
+   *  panel from ANOTHER task but keep a step panel of this same pipeline
+   *  (`parentId`) — and its subagent-focus request — open, so a toast or
+   *  OS-notification click about the pipeline the user is already reading
+   *  never closes the step under them.
+   *  `tasksRef` is declared further down; it's only read inside the
+   *  callback, by which time it exists. Stable identity. */
+  const landOnPipeline = useCallback((parentId: string, step: Task | null) => {
+    if (step) {
+      setFocusSubagent((f) => (f && f.taskId === step.id ? f : null));
+      setSelected(step);
+      return;
+    }
+    setSelected((cur) => (cur && cur.pipelineParentId === parentId ? cur : null));
+    setFocusSubagent((f) => {
+      if (!f) return f;
+      const row = tasksRef.current.find((t) => t.id === f.taskId);
+      return row?.pipelineParentId === parentId ? f : null;
+    });
+  }, []);
   /** Switch the app-level `view` to a pipeline TASK's live run view — the
    *  card-open / context-menu / RunPanel-strip destination for a pipeline
    *  parent task (D5/D7, `docs/plans/pipelines.md`). Declared this early
@@ -396,7 +420,11 @@ function AppInner() {
    *  closes whatever run panel was left open (another task's, or a step of
    *  this same pipeline), so the run view isn't covered by something the
    *  user didn't ask to see — the attention paths that DO open a step go
-   *  through `openPipelineAttention` instead. */
+   *  through `openPipelineAttention` instead. The same-pipeline case is
+   *  deliberate: RunPanel's own "Open pipeline" strip button lands here,
+   *  and must reveal the run view that step panel is covering. The
+   *  step-named toasts that must NOT close the step being read go through
+   *  `openPipelineStep`. */
   const openPipelineRun = useCallback((taskId: string) => {
     navigate({ kind: "pipeline-run", taskId }, () => {
       setFocusSubagent(null);
@@ -413,7 +441,8 @@ function AppInner() {
    *  `tasksRef` — via `pipelineAttentionStepTask` (`opts.stepTaskId` pins
    *  the step a toast announced). Nothing resolvable (only run-level
    *  blocks, or a step row not polled in yet) lands on the run view alone,
-   *  closing any leftover panel like `openPipelineRun`. Landing on a step
+   *  closing another task's leftover panel but keeping a step panel of
+   *  this same pipeline (`landOnPipeline`). Landing on a step
    *  also dismisses the parent-keyed pending toast — the panel-open
    *  dismissal effect below is keyed on the STEP id, so it would miss it.
    *  `tasksRef` is declared further down; it's only read inside the
@@ -424,13 +453,26 @@ function AppInner() {
         const list = opts?.tasks ?? tasksRef.current;
         const parent = list.find((t) => t.id === parentId);
         const step = parent ? pipelineAttentionStepTask(parent, list, opts?.stepTaskId) : null;
-        setFocusSubagent(null);
-        setSelected(step);
+        landOnPipeline(parentId, step);
         if (step) dismissPending(parentId);
       });
     },
-    [navigate],
+    [navigate, landOnPipeline],
   );
+  /** A step-NAMED, non-attention landing — the retargeted `files-sent` /
+   *  `fx-auto-resume` toasts: the run view plus the panel of the step the
+   *  toast is about (its sent-files card, its paused-recovery notice),
+   *  whether or not that step needs the user. Unlike
+   *  `openPipelineAttention` it never re-resolves to another step and never
+   *  dismisses the parent's "Waiting on you" toast — this toast isn't
+   *  about a question. A step row not polled in yet lands on the run view
+   *  alone (same `landOnPipeline` rules). Stable identity. */
+  const openPipelineStep = useCallback((parentId: string, stepTaskId: string) => {
+    navigate({ kind: "pipeline-run", taskId: parentId }, () => {
+      const row = tasksRef.current.find((t) => t.id === stepTaskId && t.pipelineParentId === parentId);
+      landOnPipeline(parentId, row ?? null);
+    });
+  }, [navigate, landOnPipeline]);
   /** Card click / row-open handler for every task in the board and every
    *  other list that opens a task (Worktrees dialog, etc. still call
    *  `setSelected` directly where a run panel is always the right target,
@@ -1216,7 +1258,7 @@ function AppInner() {
               isSelected: viewingTask(stepParentId),
               isFocused,
               onOpen: () => {
-                openPipelineRun(stepParentId);
+                openPipelineStep(stepParentId, ev.taskId);
                 void api.focusWindow();
               },
             };
@@ -1232,9 +1274,11 @@ function AppInner() {
         if (ev.state === "pending") {
           if (tracker.add(target.taskId, ev.interactionId)) {
             // The retargeted step toast names the exact step that asked, so
-            // its Open lands on the run view AND that step's panel. Only
-            // this kind — `files-sent`/`fx-auto-resume` below reuse `target`
-            // and keep landing on the run view alone.
+            // its Open is an ATTENTION landing (run view + that step's panel,
+            // or another step that still needs the user once this one is
+            // answered, plus dismissing this toast). `files-sent`/
+            // `fx-auto-resume` below reuse `target`, whose Open lands on the
+            // named step unconditionally and leaves this toast alone.
             notifyWaitingInput(
               stepParentId
                 ? {
@@ -1417,13 +1461,13 @@ function AppInner() {
     };
     const cancel = api.subscribeGlobalEvents(handle);
     return cancel;
-    // `openTask`, `openPipelineRun`, `openPipelineAttention` and
+    // `openTask`, `openPipelineStep`, `openPipelineAttention` and
     // `mergeTaskFields` all have stable identities (the first three read
     // `view`/`pipelineEditorDirty` via refs rather than depending on them
     // directly — see `viewRef`'s doc comment above) — listing them doesn't
     // cause a resubscribe, it just keeps this effect honest about what it
     // closes over.
-  }, [openTask, openPipelineRun, openPipelineAttention, mergeTaskFields]);
+  }, [openTask, openPipelineStep, openPipelineAttention, mergeTaskFields]);
 
   // Hidden pipeline STEP tasks never count toward anything user-facing (D11,
   // `docs/plans/pipelines.md`) — the header's "N of M tasks" count and the
