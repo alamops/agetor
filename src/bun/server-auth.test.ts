@@ -48,6 +48,24 @@ test("a request with the correct bearer token succeeds", async () => {
   expect(res.status).toBe(200);
 });
 
+test("a same-length wrong token is rejected, in the header and the query string", async () => {
+  const wrong = token.slice(0, -1) + (token.endsWith("0") ? "1" : "0");
+  expect(wrong).toHaveLength(token.length);
+  const viaHeader = await fetch(url("/tasks"), { headers: { authorization: `Bearer ${wrong}` } });
+  expect(viaHeader.status).toBe(401);
+  const viaQuery = await fetch(url(`/tasks?token=${encodeURIComponent(wrong)}`));
+  expect(viaQuery.status).toBe(401);
+});
+
+test("the token with extra characters, or without the exact Bearer scheme, is rejected", async () => {
+  for (const authorization of [`Bearer ${token}x`, `bearer ${token}`, `Bearer  ${token}`, token]) {
+    const res = await fetch(url("/tasks"), { headers: { authorization } });
+    expect(res.status).toBe(401);
+  }
+  const prefixOnly = await fetch(url(`/tasks?token=${encodeURIComponent(token.slice(0, 8))}`));
+  expect(prefixOnly.status).toBe(401);
+});
+
 test("a request with the token in the query string succeeds (SSE fallback)", async () => {
   const res = await fetch(url(`/tasks?token=${encodeURIComponent(token)}`));
   expect(res.status).toBe(200);
