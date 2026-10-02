@@ -44,7 +44,7 @@ import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortc
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { useAgentProfiles } from "@/lib/agent-profiles";
-import { usePipelines } from "@/lib/pipelines";
+import { pipelineAttentionStepTask, usePipelines } from "@/lib/pipelines";
 import { PipelineEditor, PipelinesPage, PipelineRunView } from "@/components/pipelines";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { FontSizeProvider, useFontSize } from "@/components/font-size-provider";
@@ -362,8 +362,12 @@ function AppInner() {
    *  handle — or don't need — the guard themselves, see
    *  `pipelineEditorDirty` above) must go through this rather than calling
    *  `setView` directly, so a stray click while mid-edit can't silently
-   *  discard the draft. */
-  const navigate = useCallback((next: AppView) => {
+   *  discard the draft. `onNavigated` runs right after the view switch
+   *  commits (synchronously, or once the discard-confirm is accepted) and
+   *  never when that confirm is cancelled — so whatever a landing opens on
+   *  top of the new view (a step's run panel, or closing a leftover one)
+   *  can't land over the editor the user chose to keep editing. */
+  const navigate = useCallback((next: AppView, onNavigated?: () => void) => {
     const current = viewRef.current;
     if (current.kind === "pipelines" && current.editing && pipelineEditorDirtyRef.current) {
       void confirm({
@@ -375,10 +379,12 @@ function AppInner() {
         if (!ok) return;
         setPipelineEditorDirty(false);
         setView(next);
+        onNavigated?.();
       });
       return;
     }
     setView(next);
+    onNavigated?.();
   }, [confirm]);
   /** Switch the app-level `view` to a pipeline TASK's live run view — the
    *  card-open / context-menu / RunPanel-strip destination for a pipeline
@@ -386,10 +392,45 @@ function AppInner() {
    *  (rather than beside its sibling `openPipelinesPage`/`openTask`
    *  further down) because the app-wide global-events subscription effect
    *  below reads it. Routes through `navigate` (m2) so leaving a dirty
-   *  editor for a run view still confirms. */
+   *  editor for a run view still confirms. A run-view-only landing also
+   *  closes whatever run panel was left open (another task's, or a step of
+   *  this same pipeline), so the run view isn't covered by something the
+   *  user didn't ask to see — the attention paths that DO open a step go
+   *  through `openPipelineAttention` instead. */
   const openPipelineRun = useCallback((taskId: string) => {
-    navigate({ kind: "pipeline-run", taskId });
+    navigate({ kind: "pipeline-run", taskId }, () => {
+      setFocusSubagent(null);
+      setSelected(null);
+    });
   }, [navigate]);
+  /** The "attention" landing for a pipeline PARENT — its card's amber
+   *  Answer/Review button, the "Waiting on you" / "Pipeline needs you"
+   *  toasts and the OS-notification click: the run view PLUS the run panel
+   *  of the step that needs the user, in one click. The step is resolved
+   *  only once the navigation commits (`navigate`'s `onNavigated`, so a
+   *  cancelled discard-confirm opens nothing), from already-polled state —
+   *  `opts.tasks` when the caller just fetched a fresher list, else
+   *  `tasksRef` — via `pipelineAttentionStepTask` (`opts.stepTaskId` pins
+   *  the step a toast announced). Nothing resolvable (only run-level
+   *  blocks, or a step row not polled in yet) lands on the run view alone,
+   *  closing any leftover panel like `openPipelineRun`. Landing on a step
+   *  also dismisses the parent-keyed pending toast — the panel-open
+   *  dismissal effect below is keyed on the STEP id, so it would miss it.
+   *  `tasksRef` is declared further down; it's only read inside the
+   *  callback, by which time it exists. Stable identity. */
+  const openPipelineAttention = useCallback(
+    (parentId: string, opts?: { stepTaskId?: string; tasks?: readonly Task[] }) => {
+      navigate({ kind: "pipeline-run", taskId: parentId }, () => {
+        const list = opts?.tasks ?? tasksRef.current;
+        const parent = list.find((t) => t.id === parentId);
+        const step = parent ? pipelineAttentionStepTask(parent, list, opts?.stepTaskId) : null;
+        setFocusSubagent(null);
+        setSelected(step);
+        if (step) dismissPending(parentId);
+      });
+    },
+    [navigate],
+  );
   /** Card click / row-open handler for every task in the board and every
    *  other list that opens a task (Worktrees dialog, etc. still call
    *  `setSelected` directly where a run panel is always the right target,
@@ -412,6 +453,19 @@ function AppInner() {
     setFocusSubagent(null);
     setSelected(t);
   }, [openPipelineRun]);
+  /** The card's amber "waiting on you" button (`TaskCard`'s
+   *  `onOpenAttention`): a pipeline PARENT lands on its run view plus the
+   *  step that needs the user (`openPipelineAttention`), while the card
+   *  body and its plain Open button keep browsing the run view alone
+   *  (`openTask`). Any other task opens exactly like `openTask`. Stable
+   *  identity — passed to the memoized `Column`/`TaskCard`. */
+  const openAttention = useCallback((t: Task) => {
+    if (t.pipelineId) {
+      openPipelineAttention(t.id);
+      return;
+    }
+    openTask(t);
+  }, [openPipelineAttention, openTask]);
 
   // Fade out the boot splash (defined in index.html) once React has mounted,
   // with a minimum dwell so fast machines don't flash a 200ms splash. Not
@@ -981,11 +1035,14 @@ function AppInner() {
       }
       if (ev.type === "open_task") {
         // A native notification deep-link (`agetor://task/<id>`) was
-        // clicked. Open that task via `openTask` (m5) — a pipeline PARENT
-        // routes to its full-page run view instead of the run panel, same
-        // as a board card click — fetching a fresh task list first if it
-        // isn't loaded yet (e.g. the task was just created and hasn't been
-        // picked up by the 2s poll). Mirrors the onOpen idiom in the
+        // clicked. Open that task via `openTask` (m5) — fetching a fresh
+        // task list first if it isn't loaded yet (e.g. the task was just
+        // created and hasn't been picked up by the 2s poll). A pipeline
+        // PARENT goes through `openPipelineAttention` instead: its run view
+        // plus the step that needs the user, if any. The link carries only
+        // the parent id, so it can't tell which notification was clicked —
+        // a "finished" one simply finds nothing waiting and lands on the
+        // run view alone. Mirrors the onOpen idiom in the
         // GlobalEvent handler below, but this handler closes over its own
         // scope, so the fresh list has to be fetched directly rather than
         // relying on `tasksRef` updating synchronously after `setTasks`. No
@@ -994,7 +1051,8 @@ function AppInner() {
         // itself, so a second call would be redundant.
         const fresh = findTaskById(tasksRef.current, ev.taskId);
         if (fresh) {
-          openTask(fresh);
+          if (fresh.pipelineId) openPipelineAttention(fresh.id);
+          else openTask(fresh);
           return;
         }
         void (async () => {
@@ -1003,7 +1061,10 @@ function AppInner() {
             setTasks(list);
             const found = findTaskById(list, ev.taskId);
             if (found) {
-              openTask(found);
+              // `tasksRef` only catches up with `setTasks` after the next
+              // commit, so the resolver reads the list just fetched.
+              if (found.pipelineId) openPipelineAttention(found.id, { tasks: list });
+              else openTask(found);
             }
             // else: silently no-op — the task doesn't exist (deleted?).
           } catch {
@@ -1039,7 +1100,7 @@ function AppInner() {
       });
     });
     return cancel;
-  }, [confirm, refreshAgentModels, refreshHarnessModels, openTask]);
+  }, [confirm, refreshAgentModels, refreshHarnessModels, openTask, openPipelineAttention]);
 
   // App-wide lifecycle subscription. Drives toasts + native notifications.
   //
@@ -1093,8 +1154,9 @@ function AppInner() {
       // before any of the gating below — so the pipeline run view and the
       // RunPanel's pipeline strip get every event without opening a second
       // permanent `EventSource` (WKWebView's ~6-per-host connection cap; see
-      // `lib/pipeline-events.ts`).
-      if (ev.kind === "pipeline" || ev.kind === "column" || ev.kind === "run-status") {
+      // `lib/pipeline-events.ts`). `interaction` lets the run view repaint a
+      // step's amber "waiting on you" highlight the moment it asks.
+      if (ev.kind === "pipeline" || ev.kind === "column" || ev.kind === "run-status" || ev.kind === "interaction") {
         publishPipelineGlobalEvent(ev);
       }
       // Update events are app-scoped, not task-scoped — handle them before
@@ -1169,7 +1231,21 @@ function AppInner() {
         const tracker = pendingInputRef.current;
         if (ev.state === "pending") {
           if (tracker.add(target.taskId, ev.interactionId)) {
-            notifyWaitingInput(target);
+            // The retargeted step toast names the exact step that asked, so
+            // its Open lands on the run view AND that step's panel. Only
+            // this kind — `files-sent`/`fx-auto-resume` below reuse `target`
+            // and keep landing on the run view alone.
+            notifyWaitingInput(
+              stepParentId
+                ? {
+                    ...target,
+                    onOpen: () => {
+                      openPipelineAttention(stepParentId, { stepTaskId: ev.taskId });
+                      void api.focusWindow();
+                    },
+                  }
+                : target,
+            );
           }
         } else if (tracker.remove(target.taskId, ev.interactionId)) {
           dismissPending(target.taskId);
@@ -1313,7 +1389,19 @@ function AppInner() {
           // "Pipeline needs you" for the same block would be noise (and a
           // second OS notification).
           if (!hasPendingToast(ev.taskId)) {
-            toastPending({ taskId: ev.taskId, title, subtitle: "Pipeline needs you", isSelected, isFocused, onOpen });
+            toastPending({
+              taskId: ev.taskId,
+              title,
+              subtitle: "Pipeline needs you",
+              isSelected,
+              isFocused,
+              // Lands on the run view plus the step that needs the user
+              // (resolved at click time), not the run view alone.
+              onOpen: () => {
+                openPipelineAttention(ev.taskId);
+                void api.focusWindow();
+              },
+            });
           }
         } else {
           toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
@@ -1329,12 +1417,13 @@ function AppInner() {
     };
     const cancel = api.subscribeGlobalEvents(handle);
     return cancel;
-    // `openTask`, `openPipelineRun` and `mergeTaskFields` all have stable
-    // identities (the first two read `view`/`pipelineEditorDirty` via refs
-    // rather than depending on them directly — see `viewRef`'s doc comment
-    // above) — listing them doesn't cause a resubscribe, it just keeps this
-    // effect honest about what it closes over.
-  }, [openTask, openPipelineRun, mergeTaskFields]);
+    // `openTask`, `openPipelineRun`, `openPipelineAttention` and
+    // `mergeTaskFields` all have stable identities (the first three read
+    // `view`/`pipelineEditorDirty` via refs rather than depending on them
+    // directly — see `viewRef`'s doc comment above) — listing them doesn't
+    // cause a resubscribe, it just keeps this effect honest about what it
+    // closes over.
+  }, [openTask, openPipelineRun, openPipelineAttention, mergeTaskFields]);
 
   // Hidden pipeline STEP tasks never count toward anything user-facing (D11,
   // `docs/plans/pipelines.md`) — the header's "N of M tasks" count and the
@@ -2178,6 +2267,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                             onCancel={cancel}
                             onDelete={del}
                             onOpen={openTask}
+                            onOpenAttention={openAttention}
                             onDiff={setDiffTask}
                             onMarkDone={markDone}
                             onArchive={archive}
