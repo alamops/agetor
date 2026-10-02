@@ -9,7 +9,10 @@ import { gotoApp } from "./helpers";
  * the full-page run view (node/edge visual states, history, blocked +
  * manual advance, Stop + Retry, fan-out/join, per-step subagent delegation
  * guidance in the composed step prompt), clicking a step node to open
- * its RunPanel with the pipeline strip, and Settings' pipelines link.
+ * its RunPanel with the pipeline strip, Settings' pipelines link, and the
+ * step-attention highlight + "attention" landings
+ * (docs/plans/pipeline-blocked-step-highlight.md, the "step attention"
+ * describes at the end of the file).
  *
  * `e2e/pipelines-editor.spec.ts` owns building/saving/deleting pipelines in
  * the canvas editor — every pipeline here is created directly over the REST
@@ -143,7 +146,9 @@ interface TaskRow {
   id: string;
   title: string;
   column: string;
+  pendingInteractionCount?: number;
   pipelineId: string | null;
+  pipelineParentId?: string | null;
   pipelineRun: {
     status: string;
     startedAt: number | null;
@@ -1029,5 +1034,359 @@ test.describe("pipelines run: stopping one fan-out branch", () => {
     expect(stoppedBlock?.taskId).toBeTruthy();
     expect(stoppedBlock?.stepId).toBe(B.id);
     expect(finalTask.pipelineRun?.status).toBe("blocked");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Step attention (docs/plans/pipeline-blocked-step-highlight.md): a step
+// that needs the user wears the board card's amber look on the run-view
+// canvas (`data-attention` + the `pipeline-step-attention` chip), and the
+// "attention" paths — the card's amber Answer/Review button and the toasts —
+// land on the run view PLUS that step's RunPanel, while the card body stays a
+// run-view-only "browse" path that closes any leftover panel.
+// ---------------------------------------------------------------------------
+
+// Mirrors `FAKE_FX_PERMISSION_PROMPT_MARKER` in `src/bun/agents.ts` (literal
+// copy, same reason as the handoff marker above): a fake turn whose prompt
+// carries it registers a real pending `fx_permission` card on its task and
+// only resolves once that card is answered — so a step whose own
+// instructions carry it sits mid-turn "asking the user", aggregated onto the
+// pipeline parent's `pendingInteractionCount`. Checked AFTER the handoff
+// marker, so the goal text of these scenarios must not carry one.
+const FAKE_FX_PERMISSION_PROMPT_MARKER = "__agetor_fake_fx_permission__";
+// The fake driver registers that card the instant its turn spawns — before
+// the runner's own post-launch `persist`, whose `pipeline` event (status
+// `running`) makes App drop the parent's pending "Waiting on you" toast.
+// Delaying the fake SPAWN past `SPAWN_RESPONSE_BUDGET_MS` (1.5 s) lets the
+// launch return `pending` and persist first, so the question — and its
+// toast — land afterwards, the way a real agent's question does.
+const ASK_SPAWN_DELAY_MS = "3000";
+
+/** Open the board and wait until the app's single global-events
+ *  `EventSource` (`GET /events`) has been requested — toasts are live-only,
+ *  so a task started before the subscription exists never toasts. Waits on
+ *  the REQUEST, not a response: see `e2e/sent-files.spec.ts`'s identical
+ *  wait for why. */
+async function gotoAppSubscribed(page: Page, backend: E2EBackend): Promise<void> {
+  const globalEventsRequested = page.waitForRequest((r) => new URL(r.url()).pathname === "/events");
+  await gotoApp(page, backend.bootBase);
+  await globalEventsRequested;
+}
+
+async function waitForPendingCount(backend: E2EBackend, id: string, expected: number): Promise<void> {
+  await expect(async () => {
+    const row = await getTask(backend, id);
+    expect(row.pendingInteractionCount ?? 0).toBe(expected);
+  }).toPass({ timeout: CONVERGE_TIMEOUT });
+}
+
+/** Wait until the board's own 2 s `/tasks` poll has delivered a step row of
+ *  `parentId` (with a pending question, when `pending` is set). The
+ *  attention landings resolve the step from App's already-polled list and
+ *  never fetch (plan D13) — a click inside the poll window after a step was
+ *  created lands on the run view alone, by design — so a test clicking an
+ *  attention path waits for the poll first. */
+async function waitForPolledStep(page: Page, parentId: string, opts: { pending?: boolean } = {}): Promise<void> {
+  await page.waitForResponse(
+    async (r) => {
+      if (r.request().method() !== "GET" || new URL(r.url()).pathname !== "/tasks") return false;
+      const rows = (await r.json().catch(() => [])) as TaskRow[];
+      return rows.some(
+        (t) => t.pipelineParentId === parentId && (!opts.pending || (t.pendingInteractionCount ?? 0) > 0),
+      );
+    },
+    { timeout: CONVERGE_TIMEOUT },
+  );
+}
+
+function attentionChip(page: Page, stepId: string): Locator {
+  return stepNode(page, stepId).getByTestId("pipeline-step-attention");
+}
+
+function waitingToast(page: Page): Locator {
+  return page.locator("[data-sonner-toaster] [data-sonner-toast]").filter({ hasText: "Waiting on you" });
+}
+
+/** "No run panel at all" — RunPanel returns null once closed (after its
+ *  exit animation), so its resize handle is the reliable probe. */
+function runPanelHandle(page: Page): Locator {
+  return page.getByTestId("run-panel-resize");
+}
+
+/** Pipeline "Asker" -> "Follower" whose first step asks the user mid-turn
+ *  (a pending `fx_permission` card), with the goal text carrying no
+ *  handoff marker. */
+async function createAskingPipelineTask(
+  backend: E2EBackend,
+): Promise<{ asker: ReturnType<typeof makeStep>; follower: ReturnType<typeof makeStep>; task: TaskRow; title: string }> {
+  const profileId = await createProfileRest(backend, "Runner");
+  const asker = makeStep({
+    id: randomUUID(),
+    name: "Asker",
+    agentProfileId: profileId,
+    instructions: `Ask before writing. ${FAKE_FX_PERMISSION_PROMPT_MARKER}`,
+  });
+  const follower = makeStep({ id: randomUUID(), name: "Follower", agentProfileId: profileId });
+  const pipelineId = await createPipelineRest(
+    backend,
+    "Attention Pipeline",
+    [asker, follower],
+    [{ from: asker.id, to: follower.id }],
+  );
+  const title = `Attention Run ${randomUUID()}`;
+  const task = await createPipelineTaskRest(backend, title, pipelineId, "Do the thing.");
+  return { asker, follower, task, title };
+}
+
+test.describe("pipelines run: step attention — a step asking mid-turn", () => {
+  test.use({
+    backendEnv: {
+      AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: RESOLVE_DELAY_MS,
+      AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS: ASK_SPAWN_DELAY_MS,
+    },
+  });
+
+  test("the card's Answer opens the run view plus the asking step's panel; the node reads Answer in amber", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const { asker, follower, task, title } = await createAskingPipelineTask(backend);
+    await gotoAppSubscribed(page, backend);
+    await startTaskRest(backend, task.id);
+    await waitForPendingCount(backend, task.id, 1);
+    // The question raised the parent-keyed "Waiting on you" toast.
+    await expect(waitingToast(page)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await waitForPolledStep(page, task.id, { pending: true });
+
+    const answer = boardCard(page, title).getByRole("button", { name: "Answer", exact: true });
+    await expect(answer).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await answer.click();
+
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await expect(page.getByTestId("run-panel-pipeline-strip")).toContainText("step Asker");
+    // Amber over blue: the asking step is still mid-turn (`data-visual`
+    // stays "active"), but it wears the attention look and says Answer.
+    await expect(stepNode(page, asker.id)).toHaveAttribute("data-attention", "answer", { timeout: CONVERGE_TIMEOUT });
+    await expect(stepNode(page, asker.id)).toHaveAttribute("data-visual", "active");
+    await expect(attentionChip(page, asker.id)).toHaveText("Answer");
+    await expect(attentionChip(page, asker.id)).toHaveAttribute("title", "Waiting for your answer");
+    await expect(stepNode(page, follower.id)).not.toHaveAttribute("data-attention", /.+/);
+    // Landing on the step dismissed the parent-keyed toast too.
+    await expect(waitingToast(page)).toHaveCount(0);
+  });
+
+  test("the card body stays a run-view-only path: no step panel opens", async ({ page, freshBackend }) => {
+    const backend = freshBackend;
+    const { asker, task, title } = await createAskingPipelineTask(backend);
+    await gotoApp(page, backend.bootBase);
+    await startTaskRest(backend, task.id);
+    await waitForPendingCount(backend, task.id, 1);
+    await waitForPolledStep(page, task.id, { pending: true });
+    await expect(boardCard(page, title).getByRole("button", { name: "Answer", exact: true })).toBeVisible({
+      timeout: CONVERGE_TIMEOUT,
+    });
+
+    await boardCard(page, title).getByText(title, { exact: true }).click();
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await expect(stepNode(page, asker.id)).toHaveAttribute("data-attention", "answer", { timeout: CONVERGE_TIMEOUT });
+    await expect(runPanelHandle(page)).toHaveCount(0);
+  });
+
+  test("the 'Waiting on you' toast's Open lands on the step that asked", async ({ page, freshBackend }) => {
+    const backend = freshBackend;
+    const { asker, task, title } = await createAskingPipelineTask(backend);
+    await gotoAppSubscribed(page, backend);
+    await startTaskRest(backend, task.id);
+
+    const toastEl = waitingToast(page);
+    await expect(toastEl).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    // Retargeted at the parent: its title, with the asking step named.
+    await expect(toastEl).toContainText(title);
+    await waitForPolledStep(page, task.id);
+    await toastEl.getByRole("button", { name: "Open", exact: true }).click();
+
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await expect(page.getByTestId("run-panel-pipeline-strip")).toContainText("step Asker");
+    await expect(stepNode(page, asker.id)).toHaveAttribute("data-attention", "answer", { timeout: CONVERGE_TIMEOUT });
+    await expect(waitingToast(page)).toHaveCount(0);
+  });
+});
+
+test.describe("pipelines run: step attention — run-view-only landings", () => {
+  test.use({ backendEnv: { AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: RESOLVE_DELAY_MS } });
+
+  // A panel can only be "left over" under a run-view-only landing through a
+  // path that's clickable while it's open — the panel's backdrop covers the
+  // board and the run view, but not the toasts. Here: another task's panel
+  // is open when the "Pipeline finished" toast (a run-view-only landing)
+  // is clicked.
+  test("a run-view-only landing closes another task's run panel left open", async ({ page, freshBackend }) => {
+    const backend = freshBackend;
+    await gotoAppSubscribed(page, backend);
+
+    const plainTitle = `Plain Task ${randomUUID()}`;
+    const plainRes = await fetch(`${backend.apiBase}/tasks`, {
+      method: "POST",
+      headers: auth(backend),
+      body: JSON.stringify({ title: plainTitle, prompt: "Just finish.", isolation: "none", workdir: tmpdir() }),
+    });
+    if (!plainRes.ok) throw new Error(`POST /tasks -> ${plainRes.status}: ${await plainRes.text()}`);
+    const plain = (await plainRes.json()) as TaskRow;
+    await startTaskRest(backend, plain.id);
+    await waitForColumn(backend, plain.id, "review");
+
+    await boardCard(page, plainTitle).getByText(plainTitle, { exact: true }).click();
+    await expect(runPanelHandle(page)).toHaveCount(1);
+
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({ id: randomUUID(), name: "Only", agentProfileId: profileId });
+    const pipelineId = await createPipelineRest(backend, "Finishing Pipeline", [A], []);
+    const title = `Finishing Run ${randomUUID()}`;
+    const task = await createPipelineTaskRest(
+      backend,
+      title,
+      pipelineId,
+      `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+    );
+    await startTaskRest(backend, task.id);
+
+    const finished = page
+      .locator("[data-sonner-toaster] [data-sonner-toast]")
+      .filter({ hasText: "Pipeline finished" });
+    await expect(finished).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await finished.getByRole("button", { name: "Open", exact: true }).click();
+
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done");
+    await expect(runPanelHandle(page)).toHaveCount(0);
+  });
+});
+
+test.describe("pipelines run: step attention — an errored step", () => {
+  // A nested `test.use` REPLACES the whole `backendEnv` object, so the
+  // resolve delay has to be listed again next to the error seam.
+  test.use({
+    backendEnv: { AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: RESOLVE_DELAY_MS, AGETOR_FAKE_CLAUDE_API_ERROR: "1" },
+  });
+
+  test("the card's Review opens the run view plus the errored step's panel; the node reads Review", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({ id: randomUUID(), name: "Errored", agentProfileId: profileId });
+    const pipelineId = await createPipelineRest(backend, "Error Pipeline", [A], []);
+    const title = `Error Run ${randomUUID()}`;
+    const task = await createPipelineTaskRest(backend, title, pipelineId, "Do the thing.");
+    await startTaskRest(backend, task.id);
+    // The step's own `blocked` column lands first (a column-reasoned
+    // block); the settled run then records the final `step-failed` one —
+    // wait for that, since its message is what the chip's tooltip shows.
+    let blockMessage = "";
+    await expect(async () => {
+      const row = await getTask(backend, task.id);
+      const block = row.pipelineRun?.blocked.find((b) => b.stepId === A.id && b.kind === "step-failed");
+      expect(block).toBeTruthy();
+      expect(row.column).toBe("blocked");
+      blockMessage = block!.message;
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+    await gotoApp(page, backend.bootBase);
+    const review = boardCard(page, title).getByRole("button", { name: "Review", exact: true });
+    await expect(review).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await review.click();
+
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await expect(page.getByTestId("run-panel-pipeline-strip")).toContainText("step Errored");
+    await expect(stepNode(page, A.id)).toHaveAttribute("data-attention", "review", { timeout: CONVERGE_TIMEOUT });
+    await expect(attentionChip(page, A.id)).toHaveText("Review");
+    await expect(attentionChip(page, A.id)).toHaveAttribute("title", blockMessage);
+  });
+});
+
+test.describe("pipelines run: step attention — blocks", () => {
+  test.use({ backendEnv: { AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: RESOLVE_DELAY_MS } });
+
+  test("a missing handoff: the 'Pipeline needs you' toast opens the blocked step; the node reads Review with the block message", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({ id: randomUUID(), name: "Handoff", agentProfileId: profileId });
+    const B = makeStep({ id: randomUUID(), name: "Next", agentProfileId: profileId });
+    const pipelineId = await createPipelineRest(backend, "No Handoff Pipeline", [A, B], [{ from: A.id, to: B.id }]);
+    const title = `No Handoff Run ${randomUUID()}`;
+    const task = await createPipelineTaskRest(
+      backend,
+      title,
+      pipelineId,
+      `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing`,
+    );
+    await gotoAppSubscribed(page, backend);
+    await startTaskRest(backend, task.id);
+
+    // One automatic reminder round-trip first, then the block.
+    let blockMessage = "";
+    await expect(async () => {
+      const row = await getTask(backend, task.id);
+      const block = row.pipelineRun?.blocked.find((b) => b.kind === "handoff-missing");
+      expect(block).toBeTruthy();
+      blockMessage = block!.message;
+    }).toPass({ timeout: REMINDER_TIMEOUT });
+
+    const toastEl = waitingToast(page).filter({ hasText: "Pipeline needs you" });
+    await expect(toastEl).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await waitForPolledStep(page, task.id);
+    await toastEl.getByRole("button", { name: "Open", exact: true }).click();
+
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await expect(page.getByTestId("run-panel-pipeline-strip")).toContainText("step Handoff");
+    await expect(stepNode(page, A.id)).toHaveAttribute("data-attention", "review", { timeout: CONVERGE_TIMEOUT });
+    await expect(attentionChip(page, A.id)).toHaveText("Review");
+    await expect(attentionChip(page, A.id)).toHaveAttribute("title", blockMessage);
+    await expect(waitingToast(page)).toHaveCount(0);
+  });
+
+  test("a run-level block (step cap) highlights the step it's stuck at; the card's Review lands on the run view only", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({ id: randomUUID(), name: "First", agentProfileId: profileId });
+    const B = makeStep({ id: randomUUID(), name: "Capped", agentProfileId: profileId });
+    // maxSteps = 1: A's single outgoing edge is taken unconditionally, and
+    // launching B hits the cap — a run-level `step-cap` block naming B,
+    // with no step task of its own.
+    const pipelineId = await createPipelineRest(backend, "Capped Pipeline", [A, B], [{ from: A.id, to: B.id }], 1);
+    const title = `Capped Run ${randomUUID()}`;
+    const task = await createPipelineTaskRest(
+      backend,
+      title,
+      pipelineId,
+      `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+    );
+    await startTaskRest(backend, task.id);
+    await expect(async () => {
+      const row = await getTask(backend, task.id);
+      const block = row.pipelineRun?.blocked.find((b) => b.kind === "step-cap");
+      expect(block?.stepId).toBe(B.id);
+      expect(block?.taskId ?? null).toBeNull();
+      expect(row.column).toBe("blocked");
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+    await gotoApp(page, backend.bootBase);
+    const review = boardCard(page, title).getByRole("button", { name: "Review", exact: true });
+    await expect(review).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await review.click();
+
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await expect(stepNode(page, B.id)).toHaveAttribute("data-attention", "review", { timeout: CONVERGE_TIMEOUT });
+    await expect(attentionChip(page, B.id)).toHaveText("Review");
+    await expect(stepNode(page, A.id)).not.toHaveAttribute("data-attention", /.+/);
+    await expect(runPanelHandle(page)).toHaveCount(0);
   });
 });
