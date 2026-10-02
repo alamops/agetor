@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { test, expect, type APIRequestContext, type E2EBackend, type Page } from "./fixtures";
+import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp } from "./helpers";
 
 /**
@@ -82,6 +82,14 @@ async function createAndStartFakeTodoTask(
 /** The run panel's slide-over `<aside>` — see quote.spec.ts's identical
  *  helper for why `.last()` is the right pick (NewTaskForm's sidebar is
  *  also an `<aside>`, mounted first in App.tsx's JSX). */
+/** The board `TaskCard` for a given (unique, uuid-suffixed) title — same
+ *  idiom as sent-files.spec.ts's `taskCard`: `TaskCard.tsx` puts
+ *  `cursor-grab` on the Card root unconditionally, the only stable hook
+ *  available since board cards carry no `data-testid`. */
+function taskCard(page: Page, title: string): Locator {
+  return page.locator('[class*="cursor-grab"]').filter({ hasText: title });
+}
+
 function runPanel(page: Page) {
   return page.locator("aside").last();
 }
@@ -136,9 +144,13 @@ test.describe("todo progress tracker", () => {
     // `title` attribute is unique to the board badge (TaskCard.tsx) — the
     // RunPanel's own "0/2" count in the TodoProgressCard header carries no
     // such attribute, so this locator can't accidentally match the panel
-    // instead of the board card. The board list polls every 2s (App.tsx),
-    // so give it real headroom past the default assertion timeout.
-    await expect(page.locator('[title="0 of 2 tasks done"]')).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator('[title="0 of 2 tasks done"]').getByText("0/2", { exact: true })).toBeVisible();
+    // instead of the board card. Scoped to THIS task's card: sibling spec
+    // files sharing this worker's backend (task-context-menu) leave their own
+    // fake-todo tasks on the board, each carrying the same "0 of 2" badge.
+    // The board list polls every 2s (App.tsx), so give it real headroom past
+    // the default assertion timeout.
+    const badge = taskCard(page, title).locator('[title="0 of 2 tasks done"]');
+    await expect(badge).toBeVisible({ timeout: 10_000 });
+    await expect(badge.getByText("0/2", { exact: true })).toBeVisible();
   });
 });
