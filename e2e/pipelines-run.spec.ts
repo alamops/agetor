@@ -1516,3 +1516,108 @@ test.describe("pipelines run: step attention — step-named and keep-the-panel l
     await expect(strip).toContainText("step First");
   });
 });
+
+// The board card and the step node share one "waiting on you" look
+// (`AWAITING_RING_CLASS` + `AwaitingGlow`, `@/lib/awaiting`): amber replaces
+// the node's blue "working" pulse (plan D4), both pulses stop under reduced
+// motion (D3/D7), and the highlight follows the question's own lifecycle —
+// answering it drops Answer, and the step that then ends without a handoff
+// reads Review.
+test.describe("pipelines run: step attention — the shared look and its lifecycle", () => {
+  test.use({
+    backendEnv: {
+      AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: RESOLVE_DELAY_MS,
+      AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS: ASK_SPAWN_DELAY_MS,
+    },
+  });
+
+  const AMBER_RING = /(^|\s)ring-warning\/60(\s|$)/;
+  const BLUE_PULSE = /(^|\s)animate-pipeline-pulse(\s|$)/;
+
+  /** The `AwaitingGlow` overlay inside `host` (its last child). */
+  function glowIn(host: Locator): Locator {
+    return host.locator(":scope > span[aria-hidden].animate-awaiting-pulse");
+  }
+
+  async function animationName(el: Locator): Promise<string> {
+    return el.evaluate((node) => getComputedStyle(node).animationName);
+  }
+
+  test("amber replaces the blue pulse on the asking node, and both glows stop under reduced motion", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const { asker, follower, task, title } = await createAskingPipelineTask(backend);
+    await gotoAppSubscribed(page, backend);
+    await startTaskRest(backend, task.id);
+    await waitForPendingCount(backend, task.id, 1);
+
+    // Board card: the amber ring plus a pulsing glow overlay.
+    const card = boardCard(page, title);
+    await expect(card.getByRole("button", { name: "Answer", exact: true })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(card).toHaveClass(AMBER_RING);
+    await expect(glowIn(card)).toHaveCount(1);
+    expect(await animationName(glowIn(card))).toBe("awaiting-pulse");
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    expect(await animationName(glowIn(card))).toBe("none");
+    await page.emulateMedia({ reducedMotion: "no-preference" });
+
+    // Run view: the asking node is still mid-turn (`data-visual="active"`)
+    // but wears the card's amber look, never the blue working pulse.
+    await card.getByText(title, { exact: true }).click();
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    const node = stepNode(page, asker.id);
+    await expect(node).toHaveAttribute("data-attention", "answer", { timeout: CONVERGE_TIMEOUT });
+    await expect(node).toHaveAttribute("data-visual", "active");
+    await expect(node).toHaveClass(AMBER_RING);
+    await expect(node).not.toHaveClass(BLUE_PULSE);
+    await expect(glowIn(node)).toHaveCount(1);
+    expect(await animationName(glowIn(node))).toBe("awaiting-pulse");
+    // A step that needs nothing carries neither the ring nor the glow.
+    await expect(stepNode(page, follower.id)).not.toHaveClass(AMBER_RING);
+    await expect(glowIn(stepNode(page, follower.id))).toHaveCount(0);
+
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    expect(await animationName(glowIn(node))).toBe("none");
+    // The highlight itself stays — only the motion stops.
+    await expect(node).toHaveClass(AMBER_RING);
+    await expect(attentionChip(page, asker.id)).toHaveText("Answer");
+  });
+
+  test("answering the question in the step's panel drops Answer; the step then ends without a handoff and reads Review", async ({
+    page,
+    freshBackend,
+  }) => {
+    test.setTimeout(REMINDER_TIMEOUT * 3);
+    const backend = freshBackend;
+    const { asker, task, title } = await createAskingPipelineTask(backend);
+    await gotoAppSubscribed(page, backend);
+    await startTaskRest(backend, task.id);
+    await waitForPendingCount(backend, task.id, 1);
+    await waitForPolledStep(page, task.id, { pending: true });
+
+    await boardCard(page, title).getByRole("button", { name: "Answer", exact: true }).click();
+    await expect(page.getByTestId("run-panel-pipeline-strip")).toContainText("step Asker");
+    await expect(stepNode(page, asker.id)).toHaveAttribute("data-attention", "answer", { timeout: CONVERGE_TIMEOUT });
+
+    // Answer it the way a user does: the card in the step's own panel.
+    await page.getByRole("button", { name: "Dismiss (reject)" }).click();
+    await waitForPendingCount(backend, task.id, 0);
+    await expect(attentionChip(page, asker.id)).not.toHaveText("Answer", { timeout: CONVERGE_TIMEOUT });
+
+    // No handoff marker in the goal: after the one automatic reminder the
+    // step blocks on `handoff-missing`, and the node reads Review with the
+    // block's message as its tooltip.
+    let message = "";
+    await expect(async () => {
+      const row = await getTask(backend, task.id);
+      const block = row.pipelineRun?.blocked.find((b) => b.kind === "handoff-missing");
+      expect(block).toBeTruthy();
+      message = block!.message;
+    }).toPass({ timeout: REMINDER_TIMEOUT });
+    await expect(stepNode(page, asker.id)).toHaveAttribute("data-attention", "review", { timeout: CONVERGE_TIMEOUT });
+    await expect(attentionChip(page, asker.id)).toHaveText("Review");
+    await expect(attentionChip(page, asker.id)).toHaveAttribute("title", message);
+  });
+});
