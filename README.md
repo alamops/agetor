@@ -283,7 +283,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 | --- | --- | --- |
 | `AGETOR_DATA_DIR` | Where the database, worktrees and logs live. | `~/.agetor` |
 | `AGETOR_API_PORT` | Port for the local API. | `4317` |
-| `AGETOR_API_HOST` | Address the local API binds to. Leave it on loopback unless you run Agetor headless in a container (see below). | `127.0.0.1` |
+| `AGETOR_API_HOST` | Address the headless core's API binds to: `127.0.0.1`, `0.0.0.0` or `::`. Only for running Agetor headless in a container (see below); the desktop app ignores it. | `127.0.0.1` |
 | `AGETOR_CLAUDE_BIN` / `AGETOR_CLAUDE_ARGS` | Override the `claude` binary / append extra args. | `claude` on `PATH` |
 | `AGETOR_CODEX_BIN` / `AGETOR_CODEX_ARGS` | Same, for Codex. | `codex` on `PATH` |
 | `AGETOR_CURSOR_BIN` / `AGETOR_CURSOR_ARGS` | Same, for Cursor. | `cursor-agent` on `PATH` |
@@ -295,7 +295,9 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 
 The bin, home and env overrides you set per harness in Settings take precedence over these variables. The CLI honors `AGETOR_DATA_DIR` and `AGETOR_API_PORT` too, and so do its `--data-dir` and `--port` flags. Test-only switches (fake drivers, API stubs) are documented in [`CLAUDE.md`](./CLAUDE.md).
 
-**Running headless in a container.** The API binds to `127.0.0.1` by default, and a Docker port mapping can't reach a loopback-only listener inside the container. Set `AGETOR_API_HOST=0.0.0.0` in the container so the published port works. Use a wildcard rather than the container's own IP, because the CLI and agent hooks inside the container still connect over `127.0.0.1`. A non-loopback bind is protected **only by the bearer token**, and Agetor logs a warning about this at startup. Publish the port to `127.0.0.1` on the host so nothing beyond your machine can reach it:
+**Running headless in a container.** The API binds to `127.0.0.1` by default, and a Docker port mapping can't reach a loopback-only listener inside the container. Set `AGETOR_API_HOST=0.0.0.0` (or `::`) in the container so the published port works. The headless core (`agetor daemon`) accepts only `127.0.0.1`, `0.0.0.0` or `::`, and refuses to start on anything else: the CLI and agent hooks inside the container connect over `127.0.0.1`, which a specific address such as the container's own IP, or `localhost`/`::1` (IPv6-only), would break. The desktop app always stays on `127.0.0.1`.
+
+A wildcard bind is protected **only by the bearer token**, and the API speaks plain HTTP, so that token travels in cleartext. Agetor logs a warning about this at startup. Publish the port to `127.0.0.1` on the host so nothing beyond your machine can reach it, and never publish it more widely. For remote access, use an SSH tunnel or a TLS-terminating proxy:
 
 ```bash
 docker run -e AGETOR_API_HOST=0.0.0.0 -p 127.0.0.1:4317:4317 <your-agetor-image>

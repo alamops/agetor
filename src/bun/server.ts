@@ -1,10 +1,10 @@
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { WebSocketHandler } from "bun";
 import pkg from "../../package.json" with { type: "json" };
-import { API_TOKEN, formatHostForUrl, getApiHost, getApiPort, nonLoopbackBindWarning } from "./api-config.ts";
+import { API_TOKEN, DEFAULT_API_HOST, formatHostForUrl, getApiPort, nonLoopbackBindWarning } from "./api-config.ts";
 import { removeCoreCreds } from "./core-creds.ts";
 import {
   tasks,
@@ -362,12 +362,12 @@ function writeAttachmentAtomic(
   }
 }
 
-// We bind to 127.0.0.1 by default (configurable via AGETOR_API_HOST for
-// headless/container use), so CORS is mostly belt-and-suspenders. We still echo
-// the calling origin so the Vite HMR webview (http://localhost:5173) can call
-// us during dev — but never `*`. Foreign origins are also blocked by the token
-// gate, so this is defense-in-depth. Populated inside `startApiServer` once
-// the runtime port is known.
+// We bind to 127.0.0.1 by default (the headless core can widen it via
+// AGETOR_API_HOST for container use), so CORS is mostly belt-and-suspenders.
+// We still echo the calling origin so the Vite HMR webview
+// (http://localhost:5173) can call us during dev — but never `*`. Foreign
+// origins are also blocked by the token gate, so this is defense-in-depth.
+// Populated inside `startApiServer` once the runtime port is known.
 
 function corsHeaders(req: Request): Record<string, string> {
   const origin = req.headers.get("origin") ?? "";
@@ -380,12 +380,23 @@ function corsHeaders(req: Request): Record<string, string> {
   };
 }
 
+const API_TOKEN_BYTES = Buffer.from(API_TOKEN);
+
+// Constant-time compare: the headless core can be bound beyond loopback
+// (AGETOR_API_HOST), so don't let response timing leak how much of a guess
+// matched. The length check only reveals the token's (public, fixed) length.
+function tokenMatches(candidate: string | null | undefined): boolean {
+  if (candidate == null) return false;
+  const bytes = Buffer.from(candidate);
+  return bytes.length === API_TOKEN_BYTES.length && timingSafeEqual(bytes, API_TOKEN_BYTES);
+}
+
 function isAuthorized(req: Request): boolean {
   const header = req.headers.get("authorization");
-  if (header === `Bearer ${API_TOKEN}`) return true;
+  if (header?.startsWith("Bearer ") && tokenMatches(header.slice("Bearer ".length))) return true;
   // Fallback for EventSource, which can't set headers.
   const url = new URL(req.url);
-  return url.searchParams.get("token") === API_TOKEN;
+  return tokenMatches(url.searchParams.get("token"));
 }
 
 function unauthorized(req: Request): Response {
@@ -828,15 +839,16 @@ const notAvailableHeadless = (req: Request) =>
     { status: 501, headers: corsHeaders(req) },
   );
 
-export function startApiServer(deps: { native?: ApiNative } = {}) {
+export function startApiServer(deps: { native?: ApiNative; hostname?: string } = {}) {
   const native = deps.native;
   // Read the port fresh — supports tests that import server.ts after setting
   // AGETOR_API_PORT and rely on the bind to honour their override even when
   // a sibling test file imported the module first.
   const PORT = getApiPort();
-  // Same fresh read for the bind host — loopback unless AGETOR_API_HOST says
-  // otherwise (see api-config.ts).
-  const HOST = getApiHost();
+  // Bind address: loopback unless the caller passes one. Only the headless
+  // core does, from a validated AGETOR_API_HOST (`resolveApiHost` in
+  // api-config.ts); the desktop app always stays on 127.0.0.1.
+  const HOST = deps.hostname ?? DEFAULT_API_HOST;
   ALLOWED_ORIGINS.clear();
   ALLOWED_ORIGINS.add(`http://localhost:${PORT}`);
   ALLOWED_ORIGINS.add("http://localhost:5173");
@@ -4895,9 +4907,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // textual diff" placeholder. Same trust posture as /files/preview:
       // token-gated + loopback bind (the default; see AGETOR_API_HOST) is the
       // real boundary, the extension allowlist (`binaryPreviewKind`) just
-      // keeps this from doubling as a generic blob reader, and `getTaskDiffBlob` rejects any path that
-      // would lexically escape the task's cwd (symlink containment is not
-      // enforced, consistent with /files/preview's trust posture).
+      // keeps this from doubling as a generic blob reader, and
+      // `getTaskDiffBlob` rejects any path that would lexically escape the
+      // task's cwd (symlink containment is not enforced, consistent with
+      // /files/preview's trust posture).
       "/tasks/:id/diff/blob": {
         GET: authed(async (req) => {
           const t = tasks.get(req.params.id);

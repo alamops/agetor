@@ -2,10 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import {
   DEFAULT_API_HOST,
   formatHostForUrl,
-  getApiHost,
   getApiPort,
-  isLoopbackHost,
   nonLoopbackBindWarning,
+  resolveApiHost,
 } from "./api-config.ts";
 
 let savedHost: string | undefined;
@@ -36,68 +35,58 @@ describe("getApiPort", () => {
   });
 });
 
-describe("getApiHost", () => {
-  it("defaults to 127.0.0.1", () => {
+describe("resolveApiHost", () => {
+  it("defaults to 127.0.0.1 when AGETOR_API_HOST is unset", () => {
     delete process.env.AGETOR_API_HOST;
     expect(DEFAULT_API_HOST).toBe("127.0.0.1");
-    expect(getApiHost()).toBe("127.0.0.1");
+    expect(resolveApiHost()).toEqual({ ok: true, host: "127.0.0.1" });
   });
 
-  it("honors an AGETOR_API_HOST override, read fresh on each call", () => {
+  it("reads AGETOR_API_HOST fresh on each call", () => {
     process.env.AGETOR_API_HOST = "0.0.0.0";
-    expect(getApiHost()).toBe("0.0.0.0");
+    expect(resolveApiHost()).toEqual({ ok: true, host: "0.0.0.0" });
     process.env.AGETOR_API_HOST = "::";
-    expect(getApiHost()).toBe("::");
+    expect(resolveApiHost()).toEqual({ ok: true, host: "::" });
   });
 
   it("falls back to the default on an empty or whitespace-only value", () => {
-    process.env.AGETOR_API_HOST = "";
-    expect(getApiHost()).toBe("127.0.0.1");
-    process.env.AGETOR_API_HOST = "   \t\n";
-    expect(getApiHost()).toBe("127.0.0.1");
+    expect(resolveApiHost("")).toEqual({ ok: true, host: "127.0.0.1" });
+    expect(resolveApiHost("   \t\n")).toEqual({ ok: true, host: "127.0.0.1" });
   });
 
-  it("trims surrounding whitespace", () => {
-    process.env.AGETOR_API_HOST = "  0.0.0.0 \n";
-    expect(getApiHost()).toBe("0.0.0.0");
+  it("maps localhost to IPv4 loopback — Bun binds `localhost` as ::1 only on macOS", () => {
+    expect(resolveApiHost("localhost")).toEqual({ ok: true, host: "127.0.0.1" });
+    expect(resolveApiHost("LOCALHOST")).toEqual({ ok: true, host: "127.0.0.1" });
+    expect(resolveApiHost("127.0.0.1")).toEqual({ ok: true, host: "127.0.0.1" });
   });
-});
 
-describe("isLoopbackHost", () => {
-  it("accepts localhost, 127.0.0.0/8 and ::1", () => {
+  it("accepts the wildcards, trimmed, with `[::]` unbracketed", () => {
+    expect(resolveApiHost("  0.0.0.0 \n")).toEqual({ ok: true, host: "0.0.0.0" });
+    expect(resolveApiHost("::")).toEqual({ ok: true, host: "::" });
+    expect(resolveApiHost("[::]")).toEqual({ ok: true, host: "::" });
+  });
+
+  it("refuses any address 127.0.0.1 clients can't reach, naming the variable and the supported values", () => {
     for (const h of [
-      "localhost",
-      "LOCALHOST",
-      "127.0.0.1",
-      "127.1.2.3",
-      "127.255.255.255",
       "::1",
       "[::1]",
-      "0:0:0:0:0:0:0:1",
-      "::ffff:127.0.0.1",
-      " 127.0.0.1 ",
-    ]) {
-      expect(isLoopbackHost(h)).toBe(true);
-    }
-  });
-
-  it("rejects wildcards, other addresses and hostnames", () => {
-    for (const h of [
-      "0.0.0.0",
-      "::",
-      "[::]",
+      "127.0.0.2",
       "192.168.1.10",
-      "10.0.0.1",
-      "128.0.0.1",
-      "127.0.0.256",
-      "127.0.0",
-      "::ffff:10.0.0.1",
+      "172.17.0.2",
+      "::ffff:127.0.0.1",
       "fe80::1",
       "example.com",
-      "localhost.example.com",
-      "",
+      "0.0.0.O",
+      "not a host!",
     ]) {
-      expect(isLoopbackHost(h)).toBe(false);
+      const r = resolveApiHost(h);
+      expect(r.ok).toBe(false);
+      if (r.ok) continue;
+      expect(r.error).toContain(`AGETOR_API_HOST=${JSON.stringify(h)}`);
+      expect(r.error).toContain("127.0.0.1");
+      expect(r.error).toContain("0.0.0.0");
+      expect(r.error).toContain("::");
+      expect(r.error).not.toContain("\n");
     }
   });
 });
@@ -105,26 +94,26 @@ describe("isLoopbackHost", () => {
 describe("formatHostForUrl", () => {
   it("brackets bare IPv6 literals only", () => {
     expect(formatHostForUrl("127.0.0.1")).toBe("127.0.0.1");
-    expect(formatHostForUrl("localhost")).toBe("localhost");
+    expect(formatHostForUrl("0.0.0.0")).toBe("0.0.0.0");
     expect(formatHostForUrl("::")).toBe("[::]");
-    expect(formatHostForUrl("[::1]")).toBe("[::1]");
+    expect(formatHostForUrl("[::]")).toBe("[::]");
   });
 });
 
 describe("nonLoopbackBindWarning", () => {
-  it("is null for a loopback bind", () => {
+  it("is null for the loopback bind", () => {
     expect(nonLoopbackBindWarning("127.0.0.1", 4317)).toBeNull();
-    expect(nonLoopbackBindWarning("::1", 4317)).toBeNull();
   });
 
-  it("is a single line naming the bind and the bearer-token caveat otherwise", () => {
+  it("is a single line naming the bind, plain HTTP and the cleartext token otherwise", () => {
     const w = nonLoopbackBindWarning("0.0.0.0", 4317);
     expect(w).not.toBeNull();
     expect(w!).not.toContain("\n");
     expect(w!).toContain("0.0.0.0:4317");
     expect(w!).toContain("beyond loopback");
-    expect(w!).toContain("bearer token");
-    expect(w!).toContain("container");
+    expect(w!).toContain("plain HTTP");
+    expect(w!).toContain("cleartext");
+    expect(w!).toContain("-p 127.0.0.1:4317:4317");
     expect(nonLoopbackBindWarning("::", 4317)!).toContain("[::]:4317");
   });
 });
