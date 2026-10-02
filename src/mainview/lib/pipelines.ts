@@ -315,14 +315,17 @@ export function sameStepAttention(
  * hasn't been polled yet).
  *
  * With `preferredStepTaskId` (the "Waiting on you" toast names the step
- * that asked) that row wins when it's in `tasks`, is one of `parent`'s
- * steps, and still needs the user — a pending interaction, a `blocked`
- * column on a still-active execution, or a `run.blocked` entry naming its
- * task. A named step that no
- * longer does (answered since — the parent-keyed toast outlives its first
- * asker while another step's question is still open) or isn't polled in
- * yet falls through to the tiers below, so the toast lands on whichever
- * step needs the user now, or on the run view alone when none does.
+ * that asked) that row — when it's in `tasks` and is one of `parent`'s
+ * steps — wins outright while it still has a pending question. If it no
+ * longer asks but is still blocked (a `blocked` column on a still-active
+ * execution, or a `run.blocked` entry naming its task), it wins only
+ * AFTER the question tiers 1–2: another step's open question outranks it,
+ * since the toast is about a question and the card reads Answer. A named
+ * step that needs nothing any more (answered since — the parent-keyed
+ * toast outlives its first asker while another step's question is still
+ * open) or isn't polled in yet falls through to the tiers below, so the
+ * toast lands on whichever step needs the user now, or on the run view
+ * alone when none does.
  * The tiers, over `parent.pipelineRun`:
  * 1. the first `run.active` execution (array order is launch order) whose
  *    row has a pending interaction — a question beats everything;
@@ -349,23 +352,9 @@ export function pipelineAttentionStepTask(
   }
 
   const run = parent.pipelineRun;
+  const preferred = preferredStepTaskId != null ? byId.get(preferredStepTaskId) : undefined;
 
-  if (preferredStepTaskId != null) {
-    const row = byId.get(preferredStepTaskId);
-    // A `blocked` column only counts on a still-active execution — the
-    // same rule as tier 4 and {@link stepAttention}; a settled execution's
-    // row can keep reading `blocked` long after the run moved past it.
-    const activeBlocked =
-      row?.column === "blocked" && (run?.active.some((a) => a.taskId === row.id) ?? false);
-    if (
-      row &&
-      (row.pendingInteractionCount > 0 ||
-        activeBlocked ||
-        (run?.blocked.some((b) => b.taskId === row.id) ?? false))
-    ) {
-      return row;
-    }
-  }
+  if (preferred && preferred.pendingInteractionCount > 0) return preferred;
 
   if (!run) return null;
 
@@ -376,6 +365,17 @@ export function pipelineAttentionStepTask(
   for (let i = run.history.length - 1; i >= 0; i -= 1) {
     const row = byId.get(run.history[i]!.taskId);
     if (row && row.pendingInteractionCount > 0) return row;
+  }
+
+  // No step asks: a named step that is still blocked beats the other
+  // blocks. A `blocked` column only counts on a still-active execution —
+  // the same rule as tier 4 and {@link stepAttention}; a settled
+  // execution's row can keep reading `blocked` long after the run moved
+  // past it.
+  if (preferred) {
+    const activeBlocked =
+      preferred.column === "blocked" && run.active.some((a) => a.taskId === preferred.id);
+    if (activeBlocked || run.blocked.some((b) => b.taskId === preferred.id)) return preferred;
   }
   for (const block of run.blocked) {
     if (block.taskId == null) continue;

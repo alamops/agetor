@@ -139,7 +139,7 @@ This covers grill rows 1–5, gives `null` for the `reviewActive`-without-block 
 
 ### 3.5 `pipelineAttentionStepTask` rules (the "which step" resolver)
 
-With `preferredStepTaskId` (the toast names the step, D12): return that row if it is in `tasks`, its `pipelineParentId` is `parent.id`, and it still needs the user (pending > 0, `column === "blocked"`, or a `run.blocked` entry with its `taskId`). Otherwise fall through to the tiers. *Review fix: originally no fallback, so the parent-keyed toast stayed pinned to its first asker after that step was answered while another step's question was open. D13's "no longer needs you → run view only" still holds when no tier matches.*
+With `preferredStepTaskId` (the toast names the step, D12): return that row if it is in `tasks`, its `pipelineParentId` is `parent.id`, and it still needs the user (pending > 0, `column === "blocked"`, or a `run.blocked` entry with its `taskId`). Otherwise fall through to the tiers. *Review fix: originally no fallback, so the parent-keyed toast stayed pinned to its first asker after that step was answered while another step's question was open. D13's "no longer needs you → run view only" still holds when no tier matches.* *Fourth-review fix: the named row wins outright only while it has a pending question; a named row that is merely blocked is checked after the question tiers (1–2) and before the block tiers (3–4). Otherwise, on a fan-out where A was answered and then blocked while B still asks, the toast opened A (Review) and dismissed the parent's toast while B's question was still open.*
 
 Without it, over `parent.pipelineRun` (`null` run → `null`):
 

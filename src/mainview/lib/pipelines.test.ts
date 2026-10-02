@@ -1231,7 +1231,7 @@ describe("pipelineAttentionStepTask", () => {
     expect(pipelineAttentionStepTask(parent, tasks, "b")?.id).toBe("b");
   });
 
-  test("a preferred step whose column reads blocked, or that a run.blocked entry names, still wins", () => {
+  test("with nothing asking, a preferred step whose column reads blocked, or that a run.blocked entry names, wins", () => {
     const parent = parentWith({
       active: [
         { stepId: "s1", taskId: "a", seq: 1 },
@@ -1240,9 +1240,43 @@ describe("pipelineAttentionStepTask", () => {
       ],
       blocked: [{ taskId: "c", stepId: "s3", kind: "step-blocked", message: "waiting" }],
     });
-    const tasks = [step("a", { pendingInteractionCount: 1 }), step("b", { column: "blocked" }), step("c", { column: "review" })];
+    const tasks = [step("a"), step("b", { column: "blocked" }), step("c", { column: "review" })];
+    expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("c");
     expect(pipelineAttentionStepTask(parent, tasks, "b")?.id).toBe("b");
     expect(pipelineAttentionStepTask(parent, tasks, "c")?.id).toBe("c");
+  });
+
+  test("a preferred step that's only blocked loses to another step's open question", () => {
+    // Fan-out: A and B both asked; A was answered and then blocked on a
+    // missing handoff while B's question is still open. The toast still
+    // names A, but Answer must open B, the row that asks.
+    const parent = parentWith({
+      status: "blocked",
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s2", taskId: "b", seq: 2 },
+      ],
+      blocked: [{ taskId: "a", stepId: "s1", kind: "handoff-missing", message: "x" }],
+    });
+    const tasks = [step("a", { column: "blocked" }), step("b", { pendingInteractionCount: 1 })];
+    expect(pipelineAttentionStepTask(parent, tasks, "a")?.id).toBe("b");
+  });
+
+  test("a preferred step that's only blocked still beats an earlier block when nothing asks", () => {
+    const parent = parentWith({
+      status: "blocked",
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s2", taskId: "b", seq: 2 },
+      ],
+      blocked: [
+        { taskId: "a", stepId: "s1", kind: "step-failed", message: "boom" },
+        { taskId: "b", stepId: "s2", kind: "handoff-missing", message: "x" },
+      ],
+    });
+    const tasks = [step("a", { column: "blocked" }), step("b", { column: "blocked" })];
+    expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("a");
+    expect(pipelineAttentionStepTask(parent, tasks, "b")?.id).toBe("b");
   });
 
   test("a preferred step answered since falls through to the step that still needs the user", () => {
