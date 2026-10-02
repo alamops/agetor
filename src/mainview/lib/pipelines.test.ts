@@ -1166,6 +1166,49 @@ describe("pipelineAttentionStepTask", () => {
     expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("b");
   });
 
+  test("a leftover question on a finished execution beats a blocked re-run of the same step", () => {
+    // A cycle re-ran s1: the first execution still holds an unanswered
+    // question, the re-run is blocked. Answer must open the row that asks —
+    // the same execution the s1 node click opens (stepNodeTaskFor).
+    const parent = parentWith({
+      status: "blocked",
+      history: [
+        makeRecord({ seq: 1, stepId: "s1", taskId: "a" }),
+        makeRecord({ seq: 2, stepId: "s1", taskId: "b" }),
+      ],
+      active: [{ stepId: "s1", taskId: "b", seq: 2 }],
+      blocked: [{ taskId: "b", stepId: "s1", kind: "step-failed", message: "boom" }],
+    });
+    const tasks = [
+      step("a", { column: "review", pendingInteractionCount: 1 }),
+      step("b", { column: "blocked" }),
+    ];
+    expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("a");
+    expect(stepNodeTaskFor(tasks, parent.pipelineRun, "s1")?.id).toBe("a");
+  });
+
+  test("a leftover question on another settled step beats a task-level block and a blocked column", () => {
+    const parent = parentWith({
+      status: "blocked",
+      history: [
+        makeRecord({ seq: 1, stepId: "s1", taskId: "a" }),
+        makeRecord({ seq: 2, stepId: "s2", taskId: "b" }),
+        makeRecord({ seq: 3, stepId: "s3", taskId: "c" }),
+      ],
+      active: [
+        { stepId: "s2", taskId: "b", seq: 2 },
+        { stepId: "s3", taskId: "c", seq: 3 },
+      ],
+      blocked: [{ taskId: "b", stepId: "s2", kind: "handoff-missing", message: "x" }],
+    });
+    const tasks = [
+      step("a", { column: "review", pendingInteractionCount: 1 }),
+      step("b", { column: "review" }),
+      step("c", { column: "blocked" }),
+    ];
+    expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("a");
+  });
+
   test("nothing needs the user → null", () => {
     const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
     expect(pipelineAttentionStepTask(parent, [step("a")])).toBeNull();

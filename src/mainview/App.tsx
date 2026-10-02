@@ -463,10 +463,12 @@ function AppInner() {
    *  `fx-auto-resume` toasts: the run view plus the panel of the step the
    *  toast is about (its sent-files card, its paused-recovery notice),
    *  whether or not that step needs the user. Unlike
-   *  `openPipelineAttention` it never re-resolves to another step and never
-   *  dismisses the parent's "Waiting on you" toast — this toast isn't
-   *  about a question. A step row not polled in yet lands on the run view
-   *  alone (same `landOnPipeline` rules). Stable identity. */
+   *  `openPipelineAttention` it never re-resolves to another step and
+   *  doesn't itself dismiss the parent's "Waiting on you" toast — this
+   *  toast isn't about a question. (The panel-open dismissal effect below
+   *  still clears it when the named step is itself asking, same as opening
+   *  that step any other way.) A step row not polled in yet lands on the
+   *  run view alone (same `landOnPipeline` rules). Stable identity. */
   const openPipelineStep = useCallback((parentId: string, stepTaskId: string) => {
     navigate({ kind: "pipeline-run", taskId: parentId }, () => {
       const row = tasksRef.current.find((t) => t.id === stepTaskId && t.pipelineParentId === parentId);

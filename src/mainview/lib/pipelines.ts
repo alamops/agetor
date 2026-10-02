@@ -326,12 +326,15 @@ export function sameStepAttention(
  * The tiers, over `parent.pipelineRun`:
  * 1. the first `run.active` execution (array order is launch order) whose
  *    row has a pending interaction — a question beats everything;
- * 2. the first `run.blocked` entry with a `taskId` whose row is present;
- * 3. the first `run.active` execution whose row's column is `blocked` (the
+ * 2. the latest `run.history` execution (scanning from the end) whose row
+ *    still has a pending interaction — a leftover card on a settled step.
+ *    Still a question, so it ranks above every block: the card reads
+ *    Answer whenever any step row has one pending, and Answer must open a
+ *    row that asks (the same order {@link stepNodeTaskFor} uses per step);
+ * 3. the first `run.blocked` entry with a `taskId` whose row is present;
+ * 4. the first `run.active` execution whose row's column is `blocked` (the
  *    card already reads Review from the optimistic column patch, but the
  *    refetched `run.blocked` hasn't landed yet);
- * 4. the latest `run.history` execution (scanning from the end) whose row
- *    still has a pending interaction — a leftover card on a settled step;
  * 5. `null` — e.g. only run-level blocks, which have no step task.
  * Every row must belong to `parent` (`pipelineParentId`).
  */
@@ -350,7 +353,7 @@ export function pipelineAttentionStepTask(
   if (preferredStepTaskId != null) {
     const row = byId.get(preferredStepTaskId);
     // A `blocked` column only counts on a still-active execution — the
-    // same rule as tier 3 and {@link stepAttention}; a settled execution's
+    // same rule as tier 4 and {@link stepAttention}; a settled execution's
     // row can keep reading `blocked` long after the run moved past it.
     const activeBlocked =
       row?.column === "blocked" && (run?.active.some((a) => a.taskId === row.id) ?? false);
@@ -370,6 +373,10 @@ export function pipelineAttentionStepTask(
     const row = byId.get(entry.taskId);
     if (row && row.pendingInteractionCount > 0) return row;
   }
+  for (let i = run.history.length - 1; i >= 0; i -= 1) {
+    const row = byId.get(run.history[i]!.taskId);
+    if (row && row.pendingInteractionCount > 0) return row;
+  }
   for (const block of run.blocked) {
     if (block.taskId == null) continue;
     const row = byId.get(block.taskId);
@@ -378,10 +385,6 @@ export function pipelineAttentionStepTask(
   for (const entry of run.active) {
     const row = byId.get(entry.taskId);
     if (row && row.column === "blocked") return row;
-  }
-  for (let i = run.history.length - 1; i >= 0; i -= 1) {
-    const row = byId.get(run.history[i]!.taskId);
-    if (row && row.pendingInteractionCount > 0) return row;
   }
   return null;
 }

@@ -24,7 +24,7 @@
 7. Unit tests, the new Playwright scenarios, `bun run typecheck`, and the existing unit + pipeline e2e suites are green (D20).
 8. `CLAUDE.md` item 19 and `docs/plans/pipelines.md` describe the new behavior (D21).
 
-**Not changing** (D19): the editor canvas, TUI/CLI, node click, the run view's "Open step" button, the context menu, the board card's own look, and anything server-side.
+**Not changing** (D19): the editor canvas, TUI/CLI, node click, the run view's "Open step" button, the context menu, the board card's own look, and anything server-side. *Review fix (re-review of `5a5afad`, landed in `d78159d`): node click did change — a glowing node now opens the execution that needs the user (`stepNodeTaskFor`), not just the latest one, because `stepAttention` counts every execution of the step and a cycle could otherwise open a sibling with nothing to answer. This departs from D19 as grilled; flagged to the owner.*
 
 ## 2. Context & constraints
 
@@ -127,7 +127,7 @@ onOpenAttention: (t: Task) => void;
 ### 3.4 `stepAttention` rules
 
 1. No run → `null`.
-2. Candidate tasks: every `run.active` entry with this `stepId`, plus the task of every `run.history` record for this step (deduped). *Review fix: originally only the latest history record when nothing was active, which disagreed with resolver tier 4 in a cycle — the card read Answer and opened a step while no node glowed.*
+2. Candidate tasks: every `run.active` entry with this `stepId`, plus the task of every `run.history` record for this step (deduped). *Review fix: originally only the latest history record when nothing was active, which disagreed with resolver tier 4 (now tier 2) in a cycle — the card read Answer and opened a step while no node glowed.*
 3. `pending` = sum of `pendingInteractionCount` over the candidate rows found in `steps`.
 4. `block` = first `run.blocked` entry where `b.stepId === stepId`, or `b.taskId` is one of the step's active task ids.
 5. `columnBlocked` = any active candidate row with `column === "blocked"`.
@@ -144,12 +144,12 @@ With `preferredStepTaskId` (the toast names the step, D12): return that row if i
 Without it, over `parent.pipelineRun` (`null` run → `null`):
 
 1. First `run.active` entry, in array order, whose row has `pendingInteractionCount > 0` (D11).
-2. First `run.blocked` entry with a non-null `taskId` whose row is in `tasks` (D11).
-3. First `run.active` entry whose row has `column === "blocked"`.
-4. Latest `run.history` record (scanning from the end) whose row has `pendingInteractionCount > 0`.
+2. Latest `run.history` record (scanning from the end) whose row has `pendingInteractionCount > 0`.
+3. First `run.blocked` entry with a non-null `taskId` whose row is in `tasks` (D11).
+4. First `run.active` entry whose row has `column === "blocked"`.
 5. `null` → run view only (D10 row 5, D13).
 
-Tiers 3 and 4 are planner additions; see §8.
+Tiers 2 and 4 are planner additions; see §8. *Review fix (third review): the leftover-question tier was originally 4th, after the block tiers. Within one step that has a finished execution still asking plus a blocked re-run, the card's Answer then opened the blocked execution (nothing to answer) while the node opened the asking one. A question now outranks every block, matching `stepNodeTaskFor` and §8 item 2's intent that Answer opens the row that asks.*
 
 ### 3.6 Node rendering
 
@@ -192,7 +192,7 @@ Accepted edge: a "files sent" notification clicked while another step is waiting
 Notes for T6:
 - `tasksRef` is declared at `App.tsx:882`, after the early callbacks at `:366-414`. Reading it inside a callback body is fine; don't read it during render above its declaration.
 - Keep the generic `onOpen` (`:1125-1137`) as is. It serves ordinary tasks and the "Pipeline finished" toast, which stays run-view-only.
-- The existing `dismissPending(selected.id)` effect (`:798-801`) stays as is; the parent-keyed dismissal lives in `openPipelineAttention` only (D15 scopes it to attention paths).
+- The existing `dismissPending(selected.id)` effect (`:798-801`) stays as is; the parent-keyed dismissal lives in `openPipelineAttention` only (D15 scopes it to attention paths). *Review fix (`d78159d`): the effect now also dismisses `selected.pipelineParentId`'s toast when the opened step itself has a pending question, so opening an asking step from its node (or a step-named toast) clears the parent-keyed toast that would otherwise sit over the panel answering it.*
 
 ## 5. Work breakdown — test tasks
 
@@ -257,8 +257,8 @@ This is small enough for one agent to run sequentially in wave order; the partit
 
 Nothing is blocked. These are the points where the plan goes past the letter of the grill. The owner approved the plan with them; items 2 and 5 were asked explicitly and confirmed:
 
-1. **Resolver tier 3** (active execution whose own column is `blocked`). Covers the moment where the card already reads Review from the optimistic column patch but the parent's refetched `run.blocked` hasn't landed. Without it that click lands on the run view only.
-2. **Leftover question on a settled step** (resolver tier 4 and `stepAttention` rule 2) — **owner-confirmed**. The runner doesn't cancel pending cards when a step settles, so the card can read Answer while no active step is asking. The plan highlights that step's node and lets Answer open it, which keeps D1's rule ("whenever the card glows, some node glows") true. A finished node can therefore show amber.
+1. **Resolver tier 4** (originally tier 3; active execution whose own column is `blocked`). Covers the moment where the card already reads Review from the optimistic column patch but the parent's refetched `run.blocked` hasn't landed. Without it that click lands on the run view only.
+2. **Leftover question on a settled step** (resolver tier 2 — originally tier 4 — and `stepAttention` rule 2) — **owner-confirmed**. The runner doesn't cancel pending cards when a step settles, so the card can read Answer while no active step is asking. The plan highlights that step's node and lets Answer open it, which keeps D1's rule ("whenever the card glows, some node glows") true. A finished node can therefore show amber.
 3. **Blocked tier skips unpolled rows.** D11 says "the first `run.blocked` entry with a `taskId`"; the plan takes the first one whose row is present.
 4. **D14 also closes a same-pipeline step panel** on a run-view-only landing, not only another task's. This matches what RunPanel's "Open pipeline" strip already does.
 5. **Notification click** uses the resolver for every notification on a pipeline parent (§3.8) — **owner-confirmed**.
