@@ -12,6 +12,7 @@ import { useCallback, useEffect, useState } from "react";
 import dagre from "@dagrejs/dagre";
 import type { Edge, Node } from "@xyflow/react";
 import { api } from "./api";
+import { awaitingLabel } from "./awaiting";
 import type {
   Pipeline,
   PipelineEdge,
@@ -212,6 +213,152 @@ export function latestTransition(
     if (record.nextStepIds.length > 0) {
       return { fromStepId: record.stepId, toStepIds: [...new Set(record.nextStepIds)], seq: record.seq };
     }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Attention — what a step needs from the user
+// ---------------------------------------------------------------------------
+
+/**
+ * What a step needs from the user right now, for the run view's amber
+ * "waiting on you" look (the board card's own ring + glow, see
+ * `@/lib/awaiting`). Deliberately separate from {@link StepVisualState}: a
+ * run-level block highlights a node whose lifecycle state is `idle`/`done`,
+ * and the node also carries a label and a tooltip, which one enum can't —
+ * so `data-visual` keeps meaning "lifecycle" and attention rides alongside
+ * it. `kind: "answer"` when the step's task has a pending question,
+ * `"review"` when it's blocked with nothing answerable (an error, a missing
+ * or invalid handoff, a run-level block). `label` is the card button's own
+ * wording ({@link awaitingLabel}); `message` is the matching block's
+ * message (the node's tooltip), when there is one.
+ */
+export interface StepAttention {
+  kind: "answer" | "review";
+  label: string;
+  message: string | null;
+}
+
+/**
+ * Resolve {@link StepAttention} for one step of `run`, or `null` when it
+ * needs nothing. Candidates are every `run.active` execution of `stepId`
+ * (several on a fan-in that launched it more than once), else — the step
+ * isn't running — the task of its latest `run.history` record, so a
+ * question left pending after the execution settled still glows (the runner
+ * never cancels pending cards when a step settles; only Restart does).
+ * Then, in order: any pending interaction on a candidate's row (looked up
+ * in `steps`) → `answer` with `Answer`/`Answer (N)`; else a `run.blocked`
+ * entry naming this step (by `stepId`, which also covers a run-level block
+ * like `step-cap` stuck at a step that isn't active, or by one of its
+ * active executions' `taskId`), or an active execution whose own board
+ * column reads `blocked` → `review`; else `null`. An active execution
+ * sitting in `review` for a manual Advance with no block reads `null`, the
+ * same as the board card (it doesn't glow for that either).
+ */
+export function stepAttention(
+  run: PipelineRunState | null | undefined,
+  stepId: string,
+  steps: Task[],
+): StepAttention | null {
+  if (!run) return null;
+
+  const activeTaskIds = run.active.filter((a) => a.stepId === stepId).map((a) => a.taskId);
+  let candidateIds = activeTaskIds;
+  if (candidateIds.length === 0) {
+    let latestTaskId: string | null = null;
+    for (const record of run.history) {
+      if (record.stepId === stepId) latestTaskId = record.taskId;
+    }
+    candidateIds = latestTaskId ? [latestTaskId] : [];
+  }
+
+  let pending = 0;
+  let columnBlocked = false;
+  for (const id of candidateIds) {
+    const row = steps.find((t) => t.id === id);
+    if (!row) continue;
+    pending += Math.max(0, row.pendingInteractionCount ?? 0);
+    if (activeTaskIds.includes(id) && row.column === "blocked") columnBlocked = true;
+  }
+
+  const block = run.blocked.find(
+    (b) => b.stepId === stepId || (b.taskId != null && activeTaskIds.includes(b.taskId)),
+  );
+  const message = block?.message ?? null;
+
+  if (pending > 0) return { kind: "answer", label: awaitingLabel(pending), message };
+  if (block || columnBlocked) return { kind: "review", label: awaitingLabel(0), message };
+  return null;
+}
+
+/** Structural equality for {@link StepAttention} (`null` and `undefined`
+ *  both mean "no attention" and compare equal). {@link stepAttention}
+ *  returns a fresh object every call, so the run view's identity-stable
+ *  node merge must compare through this — never by reference — or every
+ *  poll would churn node identities (the React Flow update-depth crash). */
+export function sameStepAttention(
+  a: StepAttention | null | undefined,
+  b: StepAttention | null | undefined,
+): boolean {
+  if (!a || !b) return !a && !b;
+  return a.kind === b.kind && a.label === b.label && a.message === b.message;
+}
+
+/**
+ * Which hidden step task an "attention" landing on a pipeline parent should
+ * open (the card's amber Answer/Review button, the "Waiting on you" /
+ * "Pipeline needs you" toasts, the OS-notification click) — resolved at
+ * click time from App's already-polled `tasks` list, never fetched. `null`
+ * means "land on the run view only" (nothing to open, or the step row
+ * hasn't been polled yet).
+ *
+ * With `preferredStepTaskId` (a toast that names its step) that row is
+ * returned only when it's in `tasks` and is one of `parent`'s steps — no
+ * fallback to the tiers below, so a toast never opens a different step
+ * than the one it announced. Otherwise, over `parent.pipelineRun`:
+ * 1. the first `run.active` execution (array order is launch order) whose
+ *    row has a pending interaction — a question beats everything;
+ * 2. the first `run.blocked` entry with a `taskId` whose row is present;
+ * 3. the first `run.active` execution whose row's column is `blocked` (the
+ *    card already reads Review from the optimistic column patch, but the
+ *    refetched `run.blocked` hasn't landed yet);
+ * 4. the latest `run.history` execution (scanning from the end) whose row
+ *    still has a pending interaction — a leftover card on a settled step;
+ * 5. `null` — e.g. only run-level blocks, which have no step task.
+ * Every row must belong to `parent` (`pipelineParentId`).
+ */
+export function pipelineAttentionStepTask(
+  parent: Task,
+  tasks: readonly Task[],
+  preferredStepTaskId?: string | null,
+): Task | null {
+  const byId = new Map<string, Task>();
+  for (const t of tasks) {
+    if (t.pipelineParentId === parent.id) byId.set(t.id, t);
+  }
+
+  if (preferredStepTaskId != null) return byId.get(preferredStepTaskId) ?? null;
+
+  const run = parent.pipelineRun;
+  if (!run) return null;
+
+  for (const entry of run.active) {
+    const row = byId.get(entry.taskId);
+    if (row && row.pendingInteractionCount > 0) return row;
+  }
+  for (const block of run.blocked) {
+    if (block.taskId == null) continue;
+    const row = byId.get(block.taskId);
+    if (row) return row;
+  }
+  for (const entry of run.active) {
+    const row = byId.get(entry.taskId);
+    if (row && row.column === "blocked") return row;
+  }
+  for (let i = run.history.length - 1; i >= 0; i -= 1) {
+    const row = byId.get(run.history[i]!.taskId);
+    if (row && row.pendingInteractionCount > 0) return row;
   }
   return null;
 }
