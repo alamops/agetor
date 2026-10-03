@@ -299,3 +299,46 @@ test("getByIdOrKind synthesises a built-in gemini row for legacy id without a ma
     }
   }
 });
+
+test("antigravity is a built-in row (carve-out setEnabled toggle works like every other built-in)", () => {
+  const h = harnesses.get("antigravity")!;
+  expect(h.isBuiltin).toBe(true);
+  expect(h.kind).toBe("antigravity");
+  expect(h.label).toBe("Antigravity");
+  expect(harnesses.setEnabled("antigravity", false).enabled).toBe(false);
+  expect(harnesses.get("antigravity")!.enabled).toBe(false);
+  expect(() => harnesses.update("antigravity", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+});
+
+test("insert accepts kind:'antigravity' and round-trips an antigravity alias", () => {
+  const inserted = harnesses.insert({
+    id: "antigravity-work",
+    kind: "antigravity",
+    label: "Antigravity (work)",
+    home: "/tmp/agetor-test-antigravity-home",
+    bin: null,
+    env: {},
+  });
+  expect(inserted.kind).toBe("antigravity");
+  expect(harnesses.get("antigravity-work")!.home).toBe("/tmp/agetor-test-antigravity-home");
+});
+
+test("getByIdOrKind synthesises a built-in antigravity row for legacy id without a matching row", () => {
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("antigravity");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["antigravity"]);
+    const synth = harnesses.getByIdOrKind("antigravity");
+    expect(synth?.kind).toBe("antigravity");
+    expect(synth?.isBuiltin).toBe(true);
+    expect(synth?.label).toBe("Antigravity");
+  } finally {
+    if (saved) {
+      const s = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [s.id, s.kind, s.label, s.is_builtin, s.home, s.bin, s.env_json, s.created_at, s.updated_at, s.enabled] as SQLQueryBindings[],
+      );
+    }
+  }
+});

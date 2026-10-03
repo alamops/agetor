@@ -113,6 +113,10 @@ import {
   dropGeminiSession,
   reattachGeminiSession,
 } from "./gemini-tmux.ts";
+import {
+  dropAntigravitySession,
+  reattachAntigravitySession,
+} from "./antigravity-tmux.ts";
 import {  dropFxSession,
 } from "./fx-acp.ts";
 import {
@@ -718,8 +722,8 @@ export async function reconcileOrphans(): Promise<number> {
   // task; only the latest reflects the user's current intent. Older
   // siblings get flipped to orphaned so we never have two SessionState
   // objects fighting for the same tmux session.
-  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; gemini_session_id: string | null; fx_session_id: string | null; agent: string }, []>(
-    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
+  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; gemini_session_id: string | null; fx_session_id: string | null; antigravity_session_id: string | null; agent: string }, []>(
+    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
   ).all();
 
   const reattachedTaskIds = new Set<string>();
@@ -729,14 +733,15 @@ export async function reconcileOrphans(): Promise<number> {
     const task = tasks.get(row.task_id);
     const prevColumn: ColumnId | null = task?.column ?? null;
     const kind = resolveHarness(row.agent)?.kind ?? null;
-    // claude-code, codex, cursor, and gemini runs can all be reattached when
-    // their detached tmux session is still alive. The reattach key differs
+    // claude-code, codex, cursor, gemini, and antigravity runs can all be reattached
+    // when their detached tmux session is still alive. The reattach key differs
     // by kind: claude needs its JSONL session uuid (`claude_session_id`),
     // codex needs its thread id (`codex_session_id`), cursor needs its
     // `session_id` (`cursor_session_id`), gemini needs its self-issued uuid
-    // (`gemini_session_id`) — the per-run log path is derived from the run
-    // id in every case. Note codex's, cursor's, gemini's, and fx's sessions
-    // only live WHILE their turn is in flight (one process per turn), so a
+    // (`gemini_session_id`), antigravity needs its conversation id
+    // (`antigravity_session_id`) — the per-run log path is derived from the run
+    // id in every case. Note codex's, cursor's, gemini's, antigravity's, and fx's
+    // sessions only live WHILE their turn is in flight (one process per turn), so a
     // reattachable one of those is by definition one that was still running
     // when agetor restarted. Also: if we already reattached a newer sibling
     // for this task, orphan the older one — only one SessionState can drive
@@ -746,6 +751,7 @@ export async function reconcileOrphans(): Promise<number> {
       : kind === "codex" ? row.codex_session_id
       : kind === "cursor" ? row.cursor_session_id
       : kind === "gemini" ? row.gemini_session_id
+      : kind === "antigravity" ? row.antigravity_session_id
       : null;
     // fx is driven over ACP/stdio, not tmux — nothing to reattach to, so a
     // `running` fx row at boot always takes the orphaned→ready path.
@@ -759,7 +765,7 @@ export async function reconcileOrphans(): Promise<number> {
     // `string` for everything below.
     let canTryReattach = false;
     if (
-      (kind === "claude-code" || kind === "codex" || kind === "cursor" || kind === "gemini")
+      (kind === "claude-code" || kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity")
       && task !== null
       && row.tmux_session !== null
       && reattachKey !== null
@@ -798,7 +804,15 @@ export async function reconcileOrphans(): Promise<number> {
             onChunk,
             seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
           })
-        : await reattachGeminiSession({
+        : kind === "gemini"
+        ? await reattachGeminiSession({
+            taskId: row.task_id,
+            runId: row.id,
+            sessionName: row.tmux_session as string,
+            onChunk,
+            seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+          })
+        : await reattachAntigravitySession({
             taskId: row.task_id,
             runId: row.id,
             sessionName: row.tmux_session as string,
@@ -1608,6 +1622,7 @@ async function startTaskInner(
       cursorSessionId: null,
       geminiSessionId: null,
       fxSessionId: null,
+      antigravitySessionId: null,
     });
   });
   persist();
@@ -1649,6 +1664,8 @@ async function startTaskInner(
         ? { cursorSessionId: sessionId }
         : harness.kind === "gemini"
         ? { geminiSessionId: sessionId }
+        : harness.kind === "antigravity"
+        ? { antigravitySessionId: sessionId }
         : { fxSessionId: sessionId });
     },
     opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, fast: task.fast, maxMode: task.maxMode },
@@ -2499,6 +2516,7 @@ function attachDoneHandler(
       await drainCodexQueue(taskId);
       await drainCursorQueue(taskId);
       await drainGeminiQueue(taskId);
+      await drainAntigravityQueue(taskId);
       await drainFxQueue(taskId);
     })
     .catch(async (err) => {
@@ -2537,6 +2555,7 @@ function attachDoneHandler(
       await drainCodexQueue(taskId);
       await drainCursorQueue(taskId);
       await drainGeminiQueue(taskId);
+      await drainAntigravityQueue(taskId);
       await drainFxQueue(taskId);
     });
 }
@@ -2577,12 +2596,14 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     else if (beforeKind === "codex") await dropCodexSession(taskId);
     else if (beforeKind === "cursor") await dropCursorSession(taskId);
     else if (beforeKind === "gemini") await dropGeminiSession(taskId);
+    else if (beforeKind === "antigravity") await dropAntigravitySession(taskId);
     else if (beforeKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
     // Any queued codex/cursor/gemini/fx follow-ups belong to the old agent —
     // drop them so a later drain doesn't spawn them against the new harness.
     codexTurnQueue.delete(taskId);
     cursorTurnQueue.delete(taskId);
     geminiTurnQueue.delete(taskId);
+    antigravityTurnQueue.delete(taskId);
     fxTurnQueue.delete(taskId);
     // Same reasoning for a pending fx auto-resume schedule: it belongs to
     // the old fx session, and the new agent (fx or otherwise) has nothing to
@@ -3410,6 +3431,15 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
           reason: "another message is already starting a new turn for this task — try again in a moment",
         };
   }
+  if (kind === "antigravity") {
+    const result = await sendAntigravityTurn(row.task_id, line);
+    return result
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
+      : {
+          delivered: false,
+          reason: "another message is already starting a new turn for this task — try again in a moment",
+        };
+  }
   if (kind === "fx") {
     const result = await sendFxTurn(row.task_id, line);
     return result
@@ -3614,6 +3644,7 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
       cursorSessionId: null,
       geminiSessionId: null,
       fxSessionId: null,
+      antigravitySessionId: null,
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
@@ -3814,6 +3845,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       cursorSessionId: priorSessionId,
       geminiSessionId: null,
       fxSessionId: null,
+      antigravitySessionId: null,
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
@@ -3992,6 +4024,7 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
       cursorSessionId: null,
       geminiSessionId: priorSessionId,
       fxSessionId: null,
+      antigravitySessionId: null,
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
@@ -4096,6 +4129,160 @@ function findLastGeminiSessionId(taskId: string): string | null {
      LIMIT 1`,
   ).get(taskId);
   return row?.gemini_session_id ?? null;
+}
+
+/**
+ * Per-task queue of follow-up lines received while an antigravity turn is in
+ * flight. Antigravity's CLI is one-shot per turn, so — exactly like
+ * gemini/codex — we hold the message and spawn a fresh `--conversation <id>`
+ * turn for it once the active turn resolves (`drainAntigravityQueue`, called from
+ * `attachDoneHandler`).
+ */
+const antigravityTurnQueue = new Map<string, string[]>();
+
+/**
+ * Send a follow-up to an antigravity task. Each follow-up is its own run row + its
+ * own `agy --conversation <id>` turn (sequential-turn model, same as gemini/codex).
+ * When a turn is already running, the message is queued; otherwise it spawns
+ * immediately. Returns the run id the message was attached to, or null on
+ * lookup failure — or when `spawnAntigravityTurnNow` declined to mint a run
+ * because `startingTaskIds` was already claimed for this task.
+ */
+async function sendAntigravityTurn(taskId: string, line: string): Promise<string | null> {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  if (task.runId && active.has(task.runId)) {
+    const q = antigravityTurnQueue.get(taskId) ?? [];
+    q.push(line);
+    antigravityTurnQueue.set(taskId, q);
+    // Record the user bubble on the active run so the panel reflects it right
+    // away; the queued turn that answers it lands as a later run row.
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    runs.appendEvent(runId, "user", data);
+    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    return runId;
+  }
+  return spawnAntigravityTurnNow(task, taskId, line);
+}
+
+/**
+ * Spawn a fresh antigravity turn that resumes the task's prior conversation via
+ * `agy --conversation <id>`. New run row, new tmux session (the previous
+ * turn's exited), prior conversation id carried forward.
+ */
+async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+  if (startingTaskIds.has(taskId)) return null;
+  startingTaskIds.add(taskId);
+  try {
+    const priorSessionId = findLastAntigravitySessionId(taskId);
+    const cwd = task.worktreePath ?? task.workdir;
+    const harness = resolveHarness(task.agent);
+
+    const newRunId = randomUUID();
+    const now = Date.now();
+    runs.insert({
+      id: newRunId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      tmuxSession: sessionNameFor(taskId),
+      claudeSessionId: null,
+      codexSessionId: null,
+      cursorSessionId: null,
+      geminiSessionId: null,
+      fxSessionId: null,
+      antigravitySessionId: priorSessionId,
+    });
+    const prevColumn: ColumnId = task.column;
+    tasks.update(taskId, { column: "running", runId: newRunId });
+    if (prevColumn !== "running") {
+      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    }
+
+    const kind: AgentKind = harness?.kind ?? "antigravity";
+    const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+    onChunk("user", normalizeUserText(line));
+    onChunk(
+      "status",
+      priorSessionId
+        ? `resuming antigravity conversation ${priorSessionId.slice(0, 8)}…`
+        : "no prior antigravity conversation — starting fresh",
+    );
+
+    if (!harness) {
+      onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      tasks.update(taskId, { column: "ready", runId: null });
+      return newRunId;
+    }
+
+    const { agent } = await spawnAgentOrFail({
+      taskId,
+      runId: newRunId,
+      harness,
+      prompt: line,
+      cwd,
+      onChunk,
+      onSessionId: (sessionId) => {
+        runs.update(newRunId, { antigravitySessionId: sessionId });
+      },
+      opts: {
+        mode: task.mode,
+        model: task.model ?? DEFAULT_MODEL[harness.kind],
+        effort: task.effort,
+        fast: task.fast,
+        maxMode: task.maxMode,
+        resumeSessionId: priorSessionId,
+      },
+    });
+    if (!agent) {
+      antigravityTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      antigravityTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    registerActiveRun(newRunId, taskId, task, agent);
+    attachDoneHandler(newRunId, taskId, agent);
+    return newRunId;
+  } finally {
+    startingTaskIds.delete(taskId);
+  }
+}
+
+/**
+ * After an antigravity turn resolves, spawn the next queued follow-up (if any) as a
+ * fresh resume turn. No-op while a run is still active for the task, or if
+ * the task's agent was switched away from antigravity mid-flight.
+ */
+async function drainAntigravityQueue(taskId: string): Promise<void> {
+  const q = antigravityTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  if (!task || resolveHarness(task.agent)?.kind !== "antigravity") {
+    antigravityTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) antigravityTurnQueue.delete(taskId);
+  if (next !== undefined) await spawnAntigravityTurnNow(task, taskId, next);
+}
+
+/** Most-recent antigravity conversation id across the task's runs (for `--conversation`). */
+function findLastAntigravitySessionId(taskId: string): string | null {
+  const row = db.query<{ antigravity_session_id: string }, [string]>(
+    `SELECT antigravity_session_id FROM runs
+     WHERE task_id = ? AND antigravity_session_id IS NOT NULL
+     ORDER BY started_at DESC
+     LIMIT 1`,
+  ).get(taskId);
+  return row?.antigravity_session_id ?? null;
 }
 
 /** * Per-task queue of follow-up lines received while an fx turn is in flight.
@@ -4332,6 +4519,7 @@ async function spawnFxRun(
       cursorSessionId: null,
       geminiSessionId: null,
       fxSessionId: priorSessionId,
+      antigravitySessionId: null,
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
@@ -5193,6 +5381,7 @@ async function sendTurnInExistingSession(
       cursorSessionId: null,
       geminiSessionId: null,
       fxSessionId: null,
+      antigravitySessionId: null,
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
@@ -5418,6 +5607,7 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
     cursorSessionId: null,
     geminiSessionId: null,
     fxSessionId: null,
+    antigravitySessionId: null,
     origin: "continuation",
   });
   const prevColumn: ColumnId = task.column;
@@ -5518,6 +5708,7 @@ async function spawnResumedSessionInner(
     cursorSessionId: null,
     geminiSessionId: null,
     fxSessionId: null,
+    antigravitySessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -6175,6 +6366,7 @@ function enqueueArchiveTeardown(
     else if (kind === "codex") await dropCodexSession(cur.id);
     else if (kind === "cursor") await dropCursorSession(cur.id);
     else if (kind === "gemini") await dropGeminiSession(cur.id);
+    else if (kind === "antigravity") await dropAntigravitySession(cur.id);
     else if (kind === "fx") dropFxSession(cur.id); // fx has no tmux session — stays sync
     // Pipeline step rows share the parent's worktree (D2, docs/plans/pipelines.md)
     // — a step's own archive teardown must never detach it out from under
@@ -6460,6 +6652,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     else if (deleteKind === "codex") await dropCodexSession(taskId);
     else if (deleteKind === "cursor") await dropCursorSession(taskId);
     else if (deleteKind === "gemini") await dropGeminiSession(taskId);
+    else if (deleteKind === "antigravity") await dropAntigravitySession(taskId);
     else if (deleteKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
     // A step task's worktree is the shared parent's (D2) — never remove it
     // out from under the parent (or any sibling step) just because one step

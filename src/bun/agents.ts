@@ -17,6 +17,7 @@ import { spawnCursorViaTmux } from "./cursor-tmux.ts";
 import { dataDir, subagents as subagentsDb, tasks } from "./db.ts";
 import { spawnFxViaAcp, type FxMode } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
+import { spawnAntigravityViaTmux } from "./antigravity-tmux.ts";
 import { answerFxPermission, registerFxPermission } from "./interactions.ts";
 import { gitWritableRoots } from "./worktree.ts";
 
@@ -312,6 +313,10 @@ export function resolveBin(harness: Harness): string {
       fallback = "fx";
       override = process.env.AGETOR_FX_BIN;
       break;
+    case "antigravity":
+      fallback = "agy";
+      override = process.env.AGETOR_ANTIGRAVITY_BIN;
+      break;
   }
   if (override) return override;
   return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
@@ -358,6 +363,8 @@ export function harnessEnv(harness: Harness): Record<string, string> {
       // branch above. Re-verified 0.0.10 — all 60 FX_* env vars identical
       // across 0.0.8/0.0.9/0.0.10, still no FX_HOME (`profile_paths.zig
       // root_dir_name = ".fx"`, hardcoded).
+      env.HOME = harness.home;
+    } else if (harness.kind === "antigravity") {
       env.HOME = harness.home;
     } else {
       // gemini: GEMINI_CLI_HOME is a dedicated home-override env var (verified
@@ -679,6 +686,40 @@ export function buildCommand(
       );
     }
     args.push("-p", prompt);
+
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  }
+
+  if (harness.kind === "antigravity") {
+    const extra = (process.env.AGETOR_ANTIGRAVITY_ARGS ?? "").split(/\s+/).filter(Boolean);
+    const args: string[] = [bin, "--output-format", "stream-json"];
+
+    if (!opts.model) {
+      throw new Error("model is required for antigravity");
+    }
+    args.push("--model", opts.model);
+
+    if (opts.effort) {
+      args.push("--effort", opts.effort);
+    }
+
+    const mode = opts.mode ?? defaultModeFor(harness.kind);
+    if (mode === "auto") {
+      args.push("--dangerously-skip-permissions");
+    } else if (mode === "plan") {
+      args.push("--mode", "plan");
+    } else if (mode === "ask") {
+      args.push("--mode", "accept-edits");
+    }
+
+    if (opts.resumeSessionId) {
+      args.push("--conversation", opts.resumeSessionId);
+    }
+
+    args.push(...extra);
+
+    // End with -p so the shell wrapper in spawnAntigravityViaTmux delivers the prompt via $(cat <promptfile>)
+    args.push("-p");
 
     return { cmd: args, env: Object.keys(env).length ? env : undefined };
   }
@@ -2334,6 +2375,26 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       env: built.env ?? {},
       cwd,
       onChunk,
+    });
+  }
+
+  if (harness.kind === "antigravity") {
+    if (process.env.AGETOR_ANTIGRAVITY_DRIVER === "fake") {
+      buildCommand(harness, prompt, opts);
+      const sessionId = opts.resumeSessionId ?? `fake-antigravity-session-${taskId}`;
+      onSessionId?.(sessionId);
+      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });
+    }
+    const built = buildCommand(harness, prompt, opts);
+    return await spawnAntigravityViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      onChunk,
+      onSessionId,
     });
   }
 

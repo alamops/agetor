@@ -302,6 +302,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"], fast: false, maxMode: false },
     "cursor": { mode: initialMode("cursor"), model: DEFAULT_MODEL["cursor"], effort: DEFAULT_EFFORT["cursor"], fast: false, maxMode: false },
     "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"], fast: false, maxMode: false },
+    "antigravity": { mode: initialMode("antigravity"), model: DEFAULT_MODEL["antigravity"], effort: DEFAULT_EFFORT["antigravity"], fast: false, maxMode: false },
     "fx": { mode: initialMode("fx"), model: DEFAULT_MODEL["fx"], effort: DEFAULT_EFFORT["fx"], fast: false, maxMode: false },
   });
 
@@ -360,6 +361,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
       seed("codex");
       seed("cursor");
       seed("gemini");
+      seed("antigravity");
       seed("fx");
       const active = agentCache.current[kind];
       setMode(active.mode);
@@ -962,6 +964,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                         ? "Cursor has no native plan mode — routed to propose-only 'ask' so nothing auto-executes."
                         : kind === "gemini"
                         ? "Routed to gemini's --approval-mode plan — a real read-only mode, no changes made."
+                        : kind === "antigravity"
+                        ? "Routed to agy's --mode plan — a real read-only planning mode."
                         : kind === "fx"
                         ? "fx has no native plan mode — routed to 'ask': only pre-approved rules run; anything else surfaces as an approval card in the run panel."
                         : "Plan only — agent describes what it would do without making changes."
