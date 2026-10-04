@@ -6628,6 +6628,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   codexTurnQueue.delete(taskId);
   cursorTurnQueue.delete(taskId);
   geminiTurnQueue.delete(taskId);
+  antigravityTurnQueue.delete(taskId);
   fxTurnQueue.delete(taskId);
   // Same for a pending fx auto-resume schedule, before the task row itself
   // goes (plan §3 T2 item 8).

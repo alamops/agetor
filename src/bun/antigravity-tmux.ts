@@ -449,7 +449,7 @@ export async function spawnAntigravityViaTmux(opts: AntigravityLaunchOptions): P
     ...envArgs,
     "--", "sh", "-c", inner, "sh", ...opts.argv,
   ];
-  await spawnTmuxNewSession(tmux, args);
+  const res = await spawnTmuxNewSession(tmux, args);
 
   const state: AntigravitySessionState = {
     taskId: opts.taskId,
@@ -472,6 +472,15 @@ export async function spawnAntigravityViaTmux(opts: AntigravityLaunchOptions): P
     lastCode: null,
     resolveDone: () => {},
   };
+
+  if (res.status !== 0) {
+    // tmux failed to launch the session — surface stderr and resolve failed
+    // synchronously so the run doesn't hang until the death probe fires.
+    const detail = (res.stderr || "tmux new-session failed").trim();
+    opts.onChunk("stderr", `failed to start antigravity session: ${detail}`, undefined);
+    const done = Promise.resolve(1);
+    return { kill: () => { /* nothing to kill */ }, writeInput: () => false, done };
+  }
 
   const done = startAntigravityTailer(state);
   return {
