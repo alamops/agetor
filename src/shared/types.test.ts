@@ -12,12 +12,14 @@ import {
   FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
+  ISSUE_TASK_TEMPLATE_LIMITS,
   MODEL_EFFORT_SUPPORT,
   PERMISSION_MODE_STATUS_PREFIX,
   defaultModeFor,
   isInternalStatusSentinel,
   retainableEfforts,
   supportedEfforts,
+  validateIssueTaskTemplate,
   supportedModes,
   type AgentKind,
   type GlobalEvent,
@@ -544,4 +546,28 @@ test("GlobalEvent: the \"fx-auto-resume\" kind type-checks in a discriminated sw
     .toBe("run-status:succeeded");
   expect(describeGlobalEvent({ kind: "files-sent", taskId: "t1", runId: "r1", count: 2, caption: null, proactive: false, ts: 0 }))
     .toBe("files-sent:2");
+});
+
+test("validateIssueTaskTemplate: accepts a prompt with or without a profile", () => {
+  expect(validateIssueTaskTemplate({ prompt: "/acme:cards {number}", agentProfileId: null })).toEqual({ ok: true });
+  expect(validateIssueTaskTemplate({ prompt: "/acme:cards {number}", agentProfileId: "p1" })).toEqual({ ok: true });
+});
+
+test("validateIssueTaskTemplate: rejects an empty or whitespace-only prompt", () => {
+  expect(validateIssueTaskTemplate({ prompt: "", agentProfileId: null }).ok).toBe(false);
+  expect(validateIssueTaskTemplate({ prompt: "  \n\t ", agentProfileId: null }).ok).toBe(false);
+});
+
+test("validateIssueTaskTemplate: bounds the prompt length", () => {
+  const max = ISSUE_TASK_TEMPLATE_LIMITS.prompt;
+  expect(validateIssueTaskTemplate({ prompt: "x".repeat(max), agentProfileId: null }).ok).toBe(true);
+  expect(validateIssueTaskTemplate({ prompt: "x".repeat(max + 1), agentProfileId: null }).ok).toBe(false);
+});
+
+test("validateIssueTaskTemplate: rejects a blank, over-long or non-string profile id", () => {
+  expect(validateIssueTaskTemplate({ prompt: "p", agentProfileId: "  " }).ok).toBe(false);
+  expect(
+    validateIssueTaskTemplate({ prompt: "p", agentProfileId: "x".repeat(ISSUE_TASK_TEMPLATE_LIMITS.agentProfileId + 1) }).ok,
+  ).toBe(false);
+  expect(validateIssueTaskTemplate({ prompt: "p", agentProfileId: 7 as unknown as string }).ok).toBe(false);
 });

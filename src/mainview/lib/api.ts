@@ -5,6 +5,7 @@ import type {
   AppEvent,
   BranchInfo,
   BranchNamingConfig,
+  IssueTaskTemplate,
   ColumnId,
   DiscoveredAccount,
   GlobalEvent,
@@ -102,7 +103,7 @@ export interface UpdateSnapshot {
 // Re-exported from shared so existing `import { type BranchInfo } from "@/lib/api"`
 // callers (BranchPicker) keep working while the single definition lives in
 // src/shared/types.ts (server + webview share one wire shape).
-export type { BranchInfo, BranchNamingConfig };
+export type { BranchInfo, BranchNamingConfig, IssueTaskTemplate };
 export type {
   GitHubCheckRun,
   GitHubChecksResult,
@@ -657,6 +658,18 @@ export const api = {
     j<Project>("/projects/settings", {
       method: "PUT",
       body: JSON.stringify({ path: p, config }),
+    }),
+  /** The project's issue task template, or `null` when it has none. Throws
+   *  (404) for an unregistered project — the issue dialog treats any failure
+   *  as "no template" and seeds the stock issue prompt. */
+  getProjectIssueTemplate: (p: string) =>
+    j<{ template: IssueTaskTemplate | null }>(`/projects/issue-template?path=${encodeURIComponent(p)}`)
+      .then((r) => r.template),
+  /** Persist (or clear, with `null`) the project's issue task template. */
+  setProjectIssueTemplate: (p: string, template: IssueTaskTemplate | null) =>
+    j<Project>("/projects/issue-template", {
+      method: "PUT",
+      body: JSON.stringify({ path: p, template }),
     }),
   /** Open a native file/folder picker and return the chosen references.
    *  WKWebView never exposes `File.path`, so this native panel is the only

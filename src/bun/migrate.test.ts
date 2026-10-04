@@ -707,9 +707,9 @@ test("060_normalize_cursor_sonnet_5_5 folds suffixed claude-sonnet-5-5 variants 
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("060 (cursor Sonnet 5.5) is the last registered migration, right after 059, with its pre-rebase id as an alias", () => {
+test("060 (cursor Sonnet 5.5) is registered right after 059, with its pre-rebase id as an alias", () => {
   const at = migrations.findIndex((m) => m.id === "060_normalize_cursor_sonnet_5_5");
-  expect(at).toBe(migrations.length - 1);
+  expect(at).toBeGreaterThan(0);
   const prev = migrations[at - 1];
   expect(prev?.id).toBe("059_task_pipeline_id_index");
   // Written on its branch as 057 while `main` took 057–059 for pipelines —
@@ -718,4 +718,20 @@ test("060 (cursor Sonnet 5.5) is the last registered migration, right after 059,
   expect(migrations[at]?.aliases).toEqual(["057_normalize_cursor_sonnet_5_5"]);
   const last = migrations[at];
   expect(last?.sql).toContain("claude-sonnet-5-5");
+});
+
+test("061 (project issue task template) is the last registered migration, right after 060, and adds a nullable column", () => {
+  const at = migrations.findIndex((m) => m.id === "061_project_issue_task_template");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("060_normalize_cursor_sonnet_5_5");
+
+  const db = new Database(":memory:");
+  migrate(db, migrations);
+  const cols = db.query<{ name: string; notnull: number }, []>("PRAGMA table_info(projects)").all();
+  const col = cols.find((c) => c.name === "issue_task_template");
+  expect(col).toBeDefined();
+  expect(col?.notnull).toBe(0);
+  // Existing rows read back as "no template".
+  db.run("INSERT INTO projects (path, name, added_at) VALUES ('/p', 'p', 1)");
+  expect(db.query<{ t: string | null }, []>("SELECT issue_task_template AS t FROM projects").get()?.t).toBeNull();
 });

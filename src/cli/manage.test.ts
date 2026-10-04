@@ -54,6 +54,37 @@ test("projects add/list/remove round-trip + listBranches returns BranchInfo[]", 
   });
 }, 30_000);
 
+test("issue task template: get/set/clear round-trip through the client", async () => {
+  await withClient(4502, async (client) => {
+    const repo = mkdtempSync(path.join(tmpdir(), "agetor-repo-"));
+    await client.addProject(repo, "Planning");
+    expect(await client.getIssueTaskTemplate(repo)).toBeNull();
+
+    const profile = await client.createAgentProfile({
+      name: "Cards",
+      harness: "claude-code",
+      model: DEFAULT_MODEL["claude-code"],
+      effort: null,
+      mode: null,
+      fast: false,
+      maxMode: false,
+      instructions: "",
+      skills: [],
+    });
+    const saved = await client.setIssueTaskTemplate(repo, { prompt: "/acme:cards {number}", agentProfileId: profile.id });
+    expect(saved.issueTaskTemplate).toEqual({ prompt: "/acme:cards {number}", agentProfileId: profile.id });
+    expect(await client.getIssueTaskTemplate(repo)).toEqual({ prompt: "/acme:cards {number}", agentProfileId: profile.id });
+
+    // An unknown profile id is refused, not stored.
+    await expect(client.setIssueTaskTemplate(repo, { prompt: "x", agentProfileId: "nope" })).rejects.toBeInstanceOf(ApiError);
+
+    expect((await client.setIssueTaskTemplate(repo, null)).issueTaskTemplate).toBeNull();
+    // An unregistered path is a 404, not "no template".
+    await expect(client.getIssueTaskTemplate(path.join(repo, "not-a-project"))).rejects.toBeInstanceOf(ApiError);
+    rmSync(repo, { recursive: true, force: true });
+  });
+}, 30_000);
+
 test("harness create/patch/enable/disable/delete + guard paths + {harnesses,statuses} shape", async () => {
   await withClient(4497, async (client) => {
     const listed = await client.listHarnesses();

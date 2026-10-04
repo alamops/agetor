@@ -58,6 +58,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 
 - **Diff review.** Review a branch's changes in the app. Select lines and send them back to the agent as a quoted follow-up.
 - **Git host integration.** Works with GitHub, GitLab and Bitbucket Cloud. You can commit and push, open pull requests, check mergeability, create a conflict-resolution task, browse issues, and start a task from an issue's full comment thread.
+- **Issue task templates.** By default, "Work on this with Agetor" starts the task with the issue and its comments in the prompt. A project can replace that with its own template and a preselected Agent, for example `/acme:cards {number}` for a planning repo whose issues are user stories. The template can use `{number}`, `{title}`, `{url}` and `{repo}`. Set it with **Configure issue template** in the dialog, or with `agetor projects issue-template <path> --prompt '…' --profile <name>`. The prompt stays editable for each task, and the issue thread is still attached as a snapshot file.
 - **Clone any repository.** Clone from any of those three hosts with live progress and cancel. Optionally, an agent then writes an `ELI5.md` tour of the codebase.
 
 ### Stay in the loop
@@ -216,7 +217,7 @@ agetor move <id> <column>    # e.g. `agetor move <id> done`
 agetor archive <id>          # archive a done task (unarchive to restore)
 agetor rm <id> --yes         # delete a task, its worktree and its branch
 agetor clone <url>           # clone a GitHub/GitLab/Bitbucket repo as a new project
-agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
+agetor projects <sub>        # list | add <path> | rm <path> | branches <path> | issue-template <path>
 agetor harness <sub>         # list | add | edit | enable | disable | rm | shell
 agetor profile <sub>         # ls | show | add | edit | rm (saved Agents)
 agetor pipeline <sub>        # ls | show | rm | export | import | status | retry | advance | restart

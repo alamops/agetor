@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Subagent, type SubagentStatus } from "../shared/types.ts";
+import { AGENT_OPTIONS, PIPELINE_LIMITS, validateIssueTaskTemplate, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type IssueTaskTemplate, type HarnessQuota, type HarnessUsage, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Subagent, type SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
@@ -1264,7 +1264,13 @@ export const drafts = {
   },
 };
 
-type ProjectRow = { path: string; name: string; added_at: number; branch_config: string | null };
+type ProjectRow = {
+  path: string;
+  name: string;
+  added_at: number;
+  branch_config: string | null;
+  issue_task_template: string | null;
+};
 
 /** Parse the stored branch-config JSON, tolerating legacy NULLs and bad data. */
 function parseBranchConfig(raw: string | null): BranchNamingConfig | null {
@@ -1278,11 +1284,36 @@ function parseBranchConfig(raw: string | null): BranchNamingConfig | null {
   return null;
 }
 
+/**
+ * Parse the stored issue-task-template JSON. Defensive like
+ * `parseBranchConfig`: corrupt JSON, a wrong shape, or a value today's
+ * validator rejects all read as "no template", so the issue dialog falls back
+ * to the built-in prompt instead of seeding something broken. Only the two
+ * known fields are kept — an extra key written by a future version never
+ * leaks through.
+ */
+export function parseIssueTaskTemplate(raw: string | null): IssueTaskTemplate | null {
+  if (!raw) return null;
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const rec = v as { prompt?: unknown; agentProfileId?: unknown };
+  if (typeof rec.prompt !== "string") return null;
+  const agentProfileId = typeof rec.agentProfileId === "string" ? rec.agentProfileId : null;
+  const template: IssueTaskTemplate = { prompt: rec.prompt, agentProfileId };
+  return validateIssueTaskTemplate(template).ok ? template : null;
+}
+
 const toProject = (r: ProjectRow): Project => ({
   path: r.path,
   name: r.name,
   addedAt: r.added_at,
   branchConfig: parseBranchConfig(r.branch_config),
+  issueTaskTemplate: parseIssueTaskTemplate(r.issue_task_template),
 });
 
 export const projects = {
@@ -1300,8 +1331,9 @@ export const projects = {
   /**
    * Insert if new, refresh `added_at` if already present. The refresh lets the
    * picker surface "recently used" paths at the top — every task creation
-   * bumps its project to the front. `branch_config` is left untouched on
-   * conflict so re-picking a project doesn't wipe its nomenclature.
+   * bumps its project to the front. `branch_config` and
+   * `issue_task_template` are left untouched on conflict so re-picking a
+   * project doesn't wipe its settings.
    */
   upsert(path: string, name: string): Project {
     const now = Date.now();
@@ -1320,6 +1352,18 @@ export const projects = {
     db.run(
       `UPDATE projects SET branch_config = ? WHERE path = ?`,
       [config ? JSON.stringify(config) : null, path],
+    );
+    return this.get(path);
+  },
+  /**
+   * Persist (or clear, with `null`) a project's issue task template. The
+   * caller validates; this only serializes. Returns the refreshed row, or
+   * null if the project isn't registered.
+   */
+  setIssueTaskTemplate(path: string, template: IssueTaskTemplate | null): Project | null {
+    db.run(
+      `UPDATE projects SET issue_task_template = ? WHERE path = ?`,
+      [template ? JSON.stringify({ prompt: template.prompt, agentProfileId: template.agentProfileId }) : null, path],
     );
     return this.get(path);
   },

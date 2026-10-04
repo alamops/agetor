@@ -60,7 +60,7 @@ Commands:
   pipeline <sub>      list | show | rm | export | import pipelines; retry [--from] |
                       advance | restart | status control a pipeline task's run
   clone <url>         clone a repository as a new project (--provider, --dest, --no-eli5)
-  projects <sub>      list | add | rm | branches (project folders)
+  projects <sub>      list | add | rm | branches | issue-template (project folders)
   config [k] [v]      view / set core preferences (defaultHarness, last model…)
   help                show this help
 

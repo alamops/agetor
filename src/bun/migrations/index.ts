@@ -84,6 +84,7 @@ import m059 from "./059_task_pipeline_id_index.sql" with { type: "text" };
 // `main` took 057–059 for pipelines — renumbered to 060 on rebase, original
 // id kept as an alias (same renumber-with-alias pattern as 054/057/058).
 import m060 from "./060_normalize_cursor_sonnet_5_5.sql" with { type: "text" };
+import m061 from "./061_project_issue_task_template.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -152,4 +153,5 @@ export const migrations: Migration[] = [
   { id: "058_task_pipeline", sql: m058, aliases: ["057_task_pipeline"] },
   { id: "059_task_pipeline_id_index", sql: m059 },
   { id: "060_normalize_cursor_sonnet_5_5", sql: m060, aliases: ["057_normalize_cursor_sonnet_5_5"] },
+  { id: "061_project_issue_task_template", sql: m061 },
 ];
