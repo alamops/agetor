@@ -138,9 +138,10 @@ export const USAGE: Record<string, string> = {
 
   Delete a task, its worktree, and its branch. --yes skips the confirmation.`,
 
-  projects: `usage: agetor projects <ls | add <path> [--name <n>] | rm <path> | branches <path>>
+  projects: `usage: agetor projects <ls | add <path> [--name <n>] | rm <path> | branches <path> | issue-template <path> …>
 
-  Manage the registered project folders shown in the new-task picker.`,
+  Manage the registered project folders shown in the new-task picker.
+  Run 'agetor projects issue-template --help' for its flags.`,
 
   clone: `usage: agetor clone <url> [--provider github|gitlab|bitbucket] [--dest <path>] [--no-eli5]
 
@@ -176,6 +177,20 @@ export const USAGE: Record<string, string> = {
   "projects add": `usage: agetor projects add <path> [--name <name>]
 
   Register a project folder (shown in the new-task workdir picker).`,
+
+  "projects issue-template": `usage: agetor projects issue-template <path> [--prompt <text> | --prompt-file <path|->] [--profile <ref> | --no-profile] [--clear]
+
+  Show or set the project's issue task template — the prompt and agent profile
+  "Work on this with Agetor" starts every issue of this project with, instead
+  of the built-in issue prompt. No flag prints the current template.
+    --prompt <text>        template prompt; {number} {title} {url} {repo}
+                           are filled in per issue, other {…} stay as typed
+    --prompt-file <path|-> read the prompt from a file, or stdin with -
+    --profile <ref>        preselect this agent profile (id or unique name)
+    --no-profile           keep the template but preselect no profile
+    --clear                remove the template (back to the built-in prompt)
+  Unset fields keep their current value, so --profile alone re-points an
+  existing template. Example: --prompt '/acme:cards {number}' --profile Cards`,
 
   "harness add": `usage: agetor harness add <id> --label <label> [--kind claude-code] [--home <abs>] [--bin <abs>] [--env KEY=VAL …]
 

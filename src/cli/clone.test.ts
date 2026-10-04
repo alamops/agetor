@@ -163,6 +163,7 @@ function project(overrides: Partial<Project> = {}): Project {
     name: "repo",
     addedAt: 1_700_000_000_000,
     branchConfig: null,
+    issueTaskTemplate: null,
     ...overrides,
   };
 }

@@ -2,10 +2,13 @@ import { describe, expect, test } from "bun:test";
 import {
   buildIssueTaskPrompt,
   inferTaskTypeFromLabels,
+  issueRepoSlug,
   issueTaskTitle,
   normalizeIssueUrl,
   parseIssueUrl,
+  renderIssueTaskTemplate,
   renderIssueThreadMarkdown,
+  ISSUE_TASK_TEMPLATE_PLACEHOLDERS,
   sameIssueUrl,
   snapshotParagraph,
   agentFacingCommentsError,
@@ -813,5 +816,65 @@ describe("agentFacingCommentsError", () => {
     const t = { repo: "g/p", item, comments: [], truncated: false, refetchCommand: null, snapshotAttached: true, commentsError: "g/p: GitLab requires authentication (401) — add a token for gitlab.com in Settings → Git host tokens" };
     expect(buildIssueTaskPrompt(t).prompt).not.toContain("Settings");
     expect(renderIssueThreadMarkdown(t)).not.toContain("Settings");
+  });
+});
+
+describe("renderIssueTaskTemplate", () => {
+  const issue = {
+    number: 42,
+    title: "As a user I want cards",
+    url: "https://gitlab.com/acme/planning/-/issues/42",
+    repo: "acme/planning",
+  };
+
+  test("substitutes every placeholder", () => {
+    expect(renderIssueTaskTemplate("{repo}#{number}: {title} ({url})", issue)).toBe(
+      "acme/planning#42: As a user I want cards (https://gitlab.com/acme/planning/-/issues/42)",
+    );
+  });
+
+  test("the slash-command use case", () => {
+    expect(renderIssueTaskTemplate("/acme:cards {number}", issue)).toBe("/acme:cards 42");
+  });
+
+  test("substitutes repeated placeholders", () => {
+    expect(renderIssueTaskTemplate("{number} and {number}", issue)).toBe("42 and 42");
+  });
+
+  test("leaves unknown {…} tokens, JSON braces and near-misses untouched", () => {
+    expect(renderIssueTaskTemplate("{foo} {Number} { number } {} {\"a\": 1} {number", issue)).toBe(
+      "{foo} {Number} { number } {} {\"a\": 1} {number",
+    );
+  });
+
+  test("never re-expands placeholders that appear inside substituted values", () => {
+    const tricky = { ...issue, title: "see {url} and {number}" };
+    expect(renderIssueTaskTemplate("{title}", tricky)).toBe("see {url} and {number}");
+  });
+
+  test("inserts values with $-patterns literally (no String.replace specials)", () => {
+    expect(renderIssueTaskTemplate("{title}", { ...issue, title: "cost $& and $1" })).toBe("cost $& and $1");
+  });
+
+  test("a template with no placeholders passes through unchanged", () => {
+    expect(renderIssueTaskTemplate("just text\nwith lines", issue)).toBe("just text\nwith lines");
+  });
+
+  test("the placeholder list names exactly what the renderer substitutes", () => {
+    for (const { name } of ISSUE_TASK_TEMPLATE_PLACEHOLDERS) {
+      expect(renderIssueTaskTemplate(`{${name}}`, issue)).not.toBe(`{${name}}`);
+    }
+  });
+});
+
+describe("issueRepoSlug", () => {
+  test("owner/name for each provider", () => {
+    expect(issueRepoSlug("https://github.com/acme/widgets/issues/7")).toBe("acme/widgets");
+    expect(issueRepoSlug("https://gitlab.com/group/sub/project/-/issues/3")).toBe("group/sub/project");
+    expect(issueRepoSlug("https://bitbucket.org/ws/repo/issues/1")).toBe("ws/repo");
+  });
+
+  test("empty for an unparseable URL", () => {
+    expect(issueRepoSlug("not a url")).toBe("");
   });
 });

@@ -1,13 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
-import { AlertCircle, AlertTriangle, Bot, Loader2, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AlertCircle, AlertTriangle, Bot, FileText, Loader2, SlidersHorizontal, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { api } from "@/lib/api";
+import { api, type IssueTaskTemplate } from "@/lib/api";
+import { useAgentProfiles } from "@/lib/agent-profiles";
 import { DEFAULT_TASK_TYPE, type GitHubIssueThreadResult, type TaskReference, type TaskType } from "../../../shared/types.ts";
 import {
   buildIssueTaskPrompt,
   inferTaskTypeFromLabels,
+  issueRepoSlug,
   issueTaskTitle,
+  renderIssueTaskTemplate,
   renderIssueThreadMarkdown,
   sameIssueUrl,
 } from "../../../shared/issue-task.ts";
@@ -17,6 +20,7 @@ import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaun
 import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
 import { PromptComposer } from "./PromptComposer";
 import { TaskTypePicker } from "./TaskTypePicker";
+import { IssueTaskTemplateDialog } from "@/components/settings/IssueTaskTemplateDialog";
 
 /** The exact sibling of `ResolveConflictsContext` for issues: enough to
  *  refetch the thread and know where to put the resulting task. */
@@ -49,6 +53,13 @@ interface Props {
  * (on a fresh worktree branch by default, same as the panel) with the thread
  * embedded (inline in the prompt, and in full as a referenced snapshot
  * file).
+ *
+ * A project can replace that starting point with its own issue task template
+ * (`Project.issueTaskTemplate`, edited through "Configure issue template"):
+ * the prompt is then seeded from `renderIssueTaskTemplate` instead of
+ * `buildIssueTaskPrompt`, and the template's agent profile is preselected
+ * when it still exists. Only the seed changes — the prompt stays editable,
+ * the snapshot file is still attached, and the same-repo check still runs.
  */
 export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }: Props) {
   const launch = useTaskLaunch(open);
@@ -59,6 +70,22 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
 
   const [prompt, setPrompt] = useState("");
   const [promptDirty, setPromptDirty] = useState(false);
+
+  // The project's issue task template (null = none, or the fetch failed —
+  // both fall back to the stock prompt). Fetched on open alongside the
+  // thread; `templateLoading` holds the dialog in its loading state so the
+  // stock prompt never flashes before the template replaces it.
+  const [template, setTemplate] = useState<IssueTaskTemplate | null>(null);
+  const [templateLoading, setTemplateLoading] = useState(false);
+  const [templateDialogOpen, setTemplateDialogOpen] = useState(false);
+  // Per-open latch: the template's agent is preselected at most once (and
+  // again only when the template itself is re-saved), so a user who then
+  // picks another agent is never overridden. `seededProfileRef` remembers
+  // which profile the template put there, so the next open can undo it —
+  // a template-driven pick must not leak into an issue from another project.
+  const [profileSeeded, setProfileSeeded] = useState(false);
+  const seededProfileRef = useRef<string | null>(null);
+  const { loaded: profilesLoaded } = useAgentProfiles({ enabled: open });
   const [references, setReferences] = useState<TaskReference[]>([]);
 
   // This modal now has a Type picker (`TaskTypePicker`, mirroring the New
@@ -115,9 +142,21 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
     setReferences([]);
     setTaskType(DEFAULT_TASK_TYPE);
     setTypeDirty(false);
+    setTemplate(null);
+    setTemplateLoading(false);
+    setProfileSeeded(false);
+    if (seededProfileRef.current !== null) {
+      if (launch.agentProfileId === seededProfileRef.current) launch.setAgentProfileId(null);
+      seededProfileRef.current = null;
+    }
     if (!open || !context) return;
     setThreadLoading(true);
+    setTemplateLoading(true);
     let cancelled = false;
+    api.getProjectIssueTemplate(context.path)
+      .then((t) => { if (!cancelled) setTemplate(t); })
+      .catch(() => { /* unregistered project / older core — use the stock prompt */ })
+      .finally(() => { if (!cancelled) setTemplateLoading(false); });
     api.getGitHubIssueThread(context.path, context.number)
       .then((result) => {
         if (cancelled) return;
@@ -133,14 +172,37 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, context?.path, context?.number, context?.url]);
 
-  // Seed (and re-seed) the prompt from the fetched thread, but only while
-  // the user hasn't started editing it — matches ResolveConflictsDialog's
-  // "don't clobber what you typed" rule.
+  // Seed (and re-seed) the prompt from the fetched thread — through the
+  // project's issue template when it has one — but only while the user
+  // hasn't started editing it — matches ResolveConflictsDialog's "don't
+  // clobber what you typed" rule.
   useEffect(() => {
     if (!thread || promptDirty) return;
-    setPrompt(buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt);
+    setPrompt(
+      template
+        ? renderIssueTaskTemplate(template.prompt, {
+          number: thread.item.number,
+          title: thread.item.title,
+          url: thread.item.htmlUrl,
+          repo: issueRepoSlug(thread.item.htmlUrl),
+        })
+        : buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt,
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [thread, promptDirty]);
+  }, [thread, promptDirty, template]);
+
+  // Preselect the template's agent profile once the profile list is known.
+  // A profile that no longer exists is skipped silently — the stored id is a
+  // soft reference, and the manual pickers are a fine fallback.
+  useEffect(() => {
+    if (!open || profileSeeded || !template?.agentProfileId || !profilesLoaded) return;
+    setProfileSeeded(true);
+    const id = template.agentProfileId;
+    if (!launch.profiles.some((p) => p.id === id)) return;
+    launch.setAgentProfileId(id);
+    seededProfileRef.current = id;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, profileSeeded, template, profilesLoaded, launch.profiles]);
 
   // Seed (and re-seed) the Type picker from the fetched thread's labels, but
   // only while the user hasn't picked one themselves — same "don't clobber
@@ -151,7 +213,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [thread, typeDirty]);
 
-  const loading = launch.loading || threadLoading;
+  const loading = launch.loading || threadLoading || templateLoading;
   const error = launch.loadError ?? threadError;
 
   const overage = promptByteOverage(launch.effectiveKind, composeLaunchPrompt(launch.selectedProfile, prompt));
@@ -269,7 +331,9 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
                 {wt.isolate
                   ? "Creates a task on a fresh branch in its own worktree."
                   : "Runs the agent directly in the project checkout — it commits onto your current branch, in your working tree."}{" "}
-                {thread.commentsError ? (
+                {template ? (
+                  "The prompt comes from this project's issue template; the issue thread is saved as a referenced snapshot file."
+                ) : thread.commentsError ? (
                   "The issue is embedded in the prompt (comments couldn't be fetched) and saved as a referenced snapshot file."
                 ) : (
                   <>
@@ -307,6 +371,27 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
                 onChange={(t) => { setTaskType(t); setTypeDirty(true); }}
               />
 
+              <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                {template ? (
+                  <span data-testid="issue-template-hint" className="flex min-w-0 items-center gap-1">
+                    <FileText className="size-3 shrink-0" />
+                    <span className="truncate">Prompt from this project&apos;s issue template</span>
+                  </span>
+                ) : (
+                  <span />
+                )}
+                <button
+                  type="button"
+                  data-testid="issue-template-configure"
+                  onClick={() => setTemplateDialogOpen(true)}
+                  title="Set the prompt and agent every issue in this project starts with"
+                  className="flex shrink-0 items-center gap-1 transition-colors hover:text-foreground"
+                >
+                  <SlidersHorizontal className="size-3" />
+                  Configure issue template
+                </button>
+              </div>
+
               <PromptComposer
                 value={prompt}
                 onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
@@ -338,6 +423,28 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
             </div>
           )}
         </div>
+
+        {context && (
+          <IssueTaskTemplateDialog
+            open={templateDialogOpen}
+            onClose={() => setTemplateDialogOpen(false)}
+            projectPath={context.path}
+            harnesses={launch.harnesses}
+            previewIssue={thread ? {
+              number: thread.item.number,
+              title: thread.item.title,
+              url: thread.item.htmlUrl,
+              repo: issueRepoSlug(thread.item.htmlUrl),
+            } : undefined}
+            onSaved={(t) => {
+              // Re-arm the agent preselection for the new template. The
+              // prompt re-seeds through the effect above — unless the user
+              // already edited it, which still wins.
+              setTemplate(t);
+              setProfileSeeded(false);
+            }}
+          />
+        )}
 
         <div className="flex shrink-0 justify-end gap-2 border-t border-border/60 p-3">
           <Button variant="outline" onClick={onClose} disabled={submitting}>

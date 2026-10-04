@@ -191,12 +191,14 @@ import {
   TASK_TYPES,
   supportedEfforts,
   validateBranchConfig,
+  validateIssueTaskTemplate,
 } from "../shared/types.ts";
 import type {
   AgentKind,
   AgentProfile,
   AppEvent,
   BranchNamingConfig,
+  IssueTaskTemplate,
   GitHubItemKind,
   GitHubItemState,
   GitHubPullMergeMethod,
@@ -545,6 +547,29 @@ function coerceBranchConfig(raw: unknown): { config: BranchNamingConfig } | { er
   const v = validateBranchConfig(config);
   if (!v.ok) return { error: v.reason };
   return { config };
+}
+
+/**
+ * Coerce an untrusted request body into an {@link IssueTaskTemplate} for
+ * `PUT /projects/issue-template` — the sibling of `coerceBranchConfig`.
+ * Unknown fields are dropped, the prompt is trimmed at both ends (inner
+ * newlines are kept: a template may be a multi-paragraph prompt), and a
+ * missing/empty `agentProfileId` means "no profile". Returns `{ error }` for
+ * a wrong shape or anything `validateIssueTaskTemplate` rejects. The profile's
+ * existence is checked by the route, not here, since that needs the db.
+ */
+function coerceIssueTaskTemplate(raw: unknown): { template: IssueTaskTemplate } | { error: string } {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { error: "template (object or null) required" };
+  const src = raw as { prompt?: unknown; agentProfileId?: unknown };
+  if (typeof src.prompt !== "string") return { error: "template.prompt (string) required" };
+  if (src.agentProfileId !== undefined && src.agentProfileId !== null && typeof src.agentProfileId !== "string") {
+    return { error: "template.agentProfileId must be a string or null" };
+  }
+  const id = typeof src.agentProfileId === "string" ? src.agentProfileId.trim() : "";
+  const template: IssueTaskTemplate = { prompt: src.prompt.trim(), agentProfileId: id || null };
+  const v = validateIssueTaskTemplate(template);
+  if (!v.ok) return { error: v.reason };
+  return { template };
 }
 
 /**
@@ -1241,6 +1266,59 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: coerced.error }, { status: 400, headers: corsHeaders(req) });
           }
           const updated = projects.setBranchConfig(body.path, coerced.config);
+          if (!updated) {
+            return json({ error: "project not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(updated, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Per-project issue task template ("Work on this with Agetor"). Unlike
+      // /projects/settings there is no built-in default to resolve to — the
+      // default IS "no template", which the issue dialog renders as the stock
+      // issue prompt — so GET answers `{ template: null }` for a registered
+      // project without one and 404s for an unregistered path (the CLI wants
+      // to tell "not a project" apart from "no template"). PUT takes
+      // `{ path, template }`; `template: null` clears it.
+      "/projects/issue-template": {
+        GET: authed((req) => {
+          const url = new URL(req.url);
+          const p = url.searchParams.get("path");
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const project = projects.get(p);
+          if (!project) {
+            return json({ error: "project not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json({ template: project.issueTaskTemplate }, { headers: corsHeaders(req) });
+        }),
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: unknown; template?: unknown };
+          if (typeof body.path !== "string" || !body.path) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!("template" in body)) {
+            return json({ error: "template (object or null) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          let template: IssueTaskTemplate | null = null;
+          if (body.template !== null) {
+            const coerced = coerceIssueTaskTemplate(body.template);
+            if ("error" in coerced) {
+              return json({ error: coerced.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            template = coerced.template;
+          }
+          if (!projects.get(body.path)) {
+            return json({ error: "project not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          // A typo'd id from the raw API would otherwise be stored and then
+          // silently ignored by the dialog's preselection; reject it while
+          // the caller is still there to fix it. (A profile deleted LATER is
+          // fine — the template keeps the dangling id and the dialog falls
+          // back.)
+          if (template?.agentProfileId && !agentProfiles.get(template.agentProfileId)) {
+            return json({ error: `unknown agent profile "${template.agentProfileId}"` }, { status: 400, headers: corsHeaders(req) });
+          }
+          const updated = projects.setIssueTaskTemplate(body.path, template);
           if (!updated) {
             return json({ error: "project not found" }, { status: 404, headers: corsHeaders(req) });
           }

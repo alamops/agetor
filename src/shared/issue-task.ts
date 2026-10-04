@@ -195,6 +195,67 @@ export function issueTaskTitle(item: Pick<GitHubListItem, "number" | "title">): 
   return `Issue #${item.number}: ${item.title}`;
 }
 
+/** The placeholders {@link renderIssueTaskTemplate} substitutes, in display
+ *  order, with the one-line description the template editor shows for each.
+ *  The single list both the renderer and the editor read, so a placeholder
+ *  can't be documented without working (or vice versa). */
+export const ISSUE_TASK_TEMPLATE_PLACEHOLDERS = [
+  { name: "number", description: "issue number, e.g. 42" },
+  { name: "title", description: "issue title" },
+  { name: "url", description: "issue URL" },
+  { name: "repo", description: "repository as owner/name" },
+] as const;
+
+export type IssueTaskTemplatePlaceholder = (typeof ISSUE_TASK_TEMPLATE_PLACEHOLDERS)[number]["name"];
+
+export interface IssueTaskTemplateVars {
+  number: number;
+  title: string;
+  url: string;
+  /** `owner/name` — nested GitLab groups keep their full group path as the
+   *  owner, so this reads e.g. `group/sub/project`. */
+  repo: string;
+}
+
+const ISSUE_TASK_TEMPLATE_RE = new RegExp(
+  `\\{(${ISSUE_TASK_TEMPLATE_PLACEHOLDERS.map((p) => p.name).join("|")})\\}`,
+  "g",
+);
+
+/**
+ * Render a project's issue task template prompt (`IssueTaskTemplate.prompt`)
+ * for one issue, substituting `{number}`, `{title}`, `{url}` and `{repo}`.
+ *
+ * Substitution is a single pass over the TEMPLATE, never over the output: an
+ * issue title that itself contains `{url}` is inserted verbatim, not expanded
+ * again. Any other `{…}` (a JSON snippet, a placeholder from a future version,
+ * a typo) is left untouched, so a template never silently loses text.
+ *
+ * Unlike {@link buildIssueTaskPrompt}, this adds no untrusted-content framing:
+ * the template is the user's own text, and which issue fields it pulls in is
+ * their call. The full thread still reaches the agent through the snapshot
+ * file reference, which carries its own untrusted-content warning.
+ */
+export function renderIssueTaskTemplate(template: string, issue: IssueTaskTemplateVars): string {
+  return template.replace(ISSUE_TASK_TEMPLATE_RE, (_match, name: IssueTaskTemplatePlaceholder) => {
+    switch (name) {
+      case "number": return String(issue.number);
+      case "title": return issue.title;
+      case "url": return issue.url;
+      case "repo": return issue.repo;
+    }
+  });
+}
+
+/** `owner/name` for {@link renderIssueTaskTemplate}'s `{repo}`, derived from
+ *  the issue's own URL via {@link parseIssueUrl}; empty when the URL doesn't
+ *  parse (the dialog only renders for issues that already passed the
+ *  same-repo check, so that's a defensive fallback, not an expected path). */
+export function issueRepoSlug(url: string): string {
+  const parsed = parseIssueUrl(url);
+  return parsed ? `${parsed.owner}/${parsed.repo}` : "";
+}
+
 /** Keyword families {@link inferTaskTypeFromLabels} matches against, each
  *  compared against any token obtained by splitting the lowercased label
  *  name on non-alphanumeric characters — so `type: bug`, `kind/defect`, and

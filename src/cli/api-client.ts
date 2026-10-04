@@ -7,6 +7,7 @@ import type {
   Task,
   Run,
   RunEvent,
+  IssueTaskTemplate,
   Project,
   Harness,
   HarnessStatus,
@@ -254,6 +255,19 @@ export class AgetorClient {
   }
   listBranches(path: string): Promise<BranchInfo[]> {
     return this.req("GET", `/projects/branches?path=${encodeURIComponent(path)}`);
+  }
+  /** The project's issue task template, or `null` when it has none (404s for
+   *  an unregistered project). */
+  async getIssueTaskTemplate(path: string): Promise<IssueTaskTemplate | null> {
+    const r = await this.req<{ template: IssueTaskTemplate | null }>(
+      "GET",
+      `/projects/issue-template?path=${encodeURIComponent(path)}`,
+    );
+    return r.template;
+  }
+  /** Persist (or clear, with `null`) the project's issue task template. */
+  setIssueTaskTemplate(path: string, template: IssueTaskTemplate | null): Promise<Project> {
+    return this.req("PUT", "/projects/issue-template", { path, template });
   }
   /** Clone a GitHub/GitLab/Bitbucket repo as a new project (`POST
    *  /projects/clone`, plan `docs/plans/clone-repository-all-providers.md`

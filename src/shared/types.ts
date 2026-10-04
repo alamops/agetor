@@ -4677,6 +4677,69 @@ export interface Project {
    * consumers fall back to {@link DEFAULT_BRANCH_CONFIG}.
    */
   branchConfig: BranchNamingConfig | null;
+  /**
+   * Per-project starting point for "Work on this with Agetor" (and nothing
+   * else). Null when the user hasn't configured one — the issue dialog then
+   * falls back to the built-in `buildIssueTaskPrompt` and no agent profile.
+   */
+  issueTaskTemplate: IssueTaskTemplate | null;
+}
+
+/**
+ * A project's issue task template: the prompt every task started from one of
+ * its issues is seeded with, plus the agent profile preselected for it. The
+ * prompt is rendered by `renderIssueTaskTemplate` (`src/shared/issue-task.ts`),
+ * which substitutes `{number}`, `{title}`, `{url}` and `{repo}`. Use case: a
+ * planning repo whose issues are user stories, where every story should start
+ * as `/acme:cards {number}` run by one specific agent — instead of the user
+ * retyping the prompt and re-picking the agent for each issue.
+ *
+ * `agentProfileId` is a soft reference (no FK, same as a task's bound
+ * profile): deleting the profile never blocks or rewrites the template, the
+ * dialog simply skips the preselection when the id no longer resolves.
+ */
+export interface IssueTaskTemplate {
+  prompt: string;
+  agentProfileId: string | null;
+}
+
+/** Bounds enforced by {@link validateIssueTaskTemplate}. The prompt cap
+ *  matches the agent-profile instructions cap — both are user-authored
+ *  launch text that ends up in an agent's first prompt. */
+export const ISSUE_TASK_TEMPLATE_LIMITS = {
+  prompt: 20_000,
+  agentProfileId: 128,
+} as const;
+
+/**
+ * Validate an {@link IssueTaskTemplate}: a prompt that is non-empty after
+ * trimming and within {@link ISSUE_TASK_TEMPLATE_LIMITS}, and an
+ * `agentProfileId` that is either null or a non-empty bounded string. Shared
+ * by the editor dialog (client), the persist route (server) and the db parse
+ * path, so a template one side accepts can never be rejected by another.
+ * Whether the profile still EXISTS is not checked here — that is a live
+ * lookup only the server can do, and a stored template must survive its
+ * profile being deleted later.
+ */
+export function validateIssueTaskTemplate(
+  template: IssueTaskTemplate,
+): { ok: true } | { ok: false; reason: string } {
+  if (typeof template.prompt !== "string" || !template.prompt.trim()) {
+    return { ok: false, reason: "Prompt is empty." };
+  }
+  if (template.prompt.length > ISSUE_TASK_TEMPLATE_LIMITS.prompt) {
+    return { ok: false, reason: `Prompt is longer than ${ISSUE_TASK_TEMPLATE_LIMITS.prompt} characters.` };
+  }
+  const id = template.agentProfileId;
+  if (id !== null) {
+    if (typeof id !== "string" || !id.trim()) {
+      return { ok: false, reason: "Agent profile id must be a non-empty string or null." };
+    }
+    if (id.length > ISSUE_TASK_TEMPLATE_LIMITS.agentProfileId) {
+      return { ok: false, reason: "Agent profile id is too long." };
+    }
+  }
+  return { ok: true };
 }
 
 /**
