@@ -41,6 +41,7 @@ const LOGIN_COMMAND: Partial<Record<AgentKind, string>> = {
   "claude-code": "claude /login",
   codex: "codex login",
   cursor: "cursor-agent login",
+  antigravity: "agy login",
   fx: "fx login",
 };
 

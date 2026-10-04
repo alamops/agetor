@@ -20,6 +20,7 @@ export const INSTALL_HINTS: Record<AgentKind, string> = {
   "cursor": "curl https://cursor.com/install -fsS | bash",
   "gemini": "npm i -g @google/gemini-cli",
   "fx": "curl -fsSL https://fx.sh/setup.sh | bash",
+  "antigravity": "brew install --cask antigravity-cli",
 };
 
 /**
@@ -32,6 +33,7 @@ const BREW_PACKAGES: Partial<Record<AgentKind, string>> = {
   "codex": "codex",
   "claude-code": "claude-code",
   "gemini": "gemini-cli",
+  "antigravity": "antigravity-cli",
 };
 
 /**
@@ -80,6 +82,7 @@ export function upgradeHintFor(kind: AgentKind, binPath: string | null): string 
   }
   if (kind === "claude-code") return "claude update";
   if (kind === "cursor") return "cursor-agent update";
+  if (kind === "antigravity") return "agy update";
   return INSTALL_HINTS[kind];
 }
 

@@ -197,6 +197,7 @@ export interface AgentModelMap {
   "codex": { id: string; label?: string; efforts?: string[] }[];
   "cursor": { id: string; label?: string; efforts?: string[] }[];
   "gemini": { id: string; label?: string; efforts?: string[] }[];
+  "antigravity": { id: string; label?: string; efforts?: string[] }[];
   "fx": { id: string; label?: string; efforts?: string[] }[];
 }
 
