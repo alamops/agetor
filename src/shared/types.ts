@@ -281,7 +281,7 @@ export function isApprovalPrompt(text: string): boolean {
   return APPROVAL_PROMPT_PATTERNS.some((re) => re.test(text));
 }
 
-export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini" | "fx";
+export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini" | "fx" | "antigravity";
 
 /**
  * A "harness" is the user-facing name for an agent configuration. Built-in
@@ -2237,6 +2237,7 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // moonshotai/kimi-k3, unauth catalog grown to 247 ids, zai/glm-5.3-flash
   // still present; signed-in 158-id account still unverifiable.
   "fx": "zai/glm-5.3-flash",
+  "antigravity": "gemini-3.8-flash-high",
 };
 
 /**
@@ -2277,6 +2278,7 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   // other four kinds use, since that would silently change every fx run's
   // cost/latency on the owner's rate-limited free-tier Gateway account.
   "fx": "auto",
+  "antigravity": "high",
 };
 
 /**
@@ -2759,6 +2761,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
   // has an explicit stored mode. Plan still resolves to "ask" (only
   // pre-approved rules run; everything else surfaces as an approval card).
   "fx": { code: "yolo", plan: "ask" },
+  "antigravity": { code: "auto", plan: "plan" },
 };
 
 /**
@@ -3014,6 +3017,26 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     // anthropic/claude-opus-5.5 row. docs/plans/add-gpt-6-1-sol.md §3 D3.
     "openai/gpt-6.1-sol": ["max", "xhigh", "high", "medium", "low", "auto"],
   },
+  antigravity: {
+    "gemini-3.8-flash-high": ["max", "xhigh", "high", "medium", "low"],
+    "gemini-3.8-flash-medium": ["max", "xhigh", "high", "medium", "low"],
+    "gemini-3.8-flash-low": ["max", "xhigh", "high", "medium", "low"],
+    "gemini-3.7-flash-high": ["max", "xhigh", "high", "medium", "low"],
+    "gemini-3.7-flash-medium": ["max", "xhigh", "high", "medium", "low"],
+    "gemini-3.7-flash-low": ["max", "xhigh", "high", "medium", "low"],
+    "gemini-3.6-flash-high": ["max", "xhigh", "high", "medium", "low"],
+    "gemini-3.6-flash-medium": ["max", "xhigh", "high", "medium", "low"],
+    "gemini-3.6-flash-low": ["max", "xhigh", "high", "medium", "low"],
+    "gemini-3.1-pro-high": ["max", "xhigh", "high", "medium", "low"],
+    "gemini-3.1-pro-low": ["max", "xhigh", "high", "medium", "low"],
+    "claude-opus-5-5-high": ["max", "xhigh", "high", "medium", "low"],
+    "claude-opus-5-5-medium": ["max", "xhigh", "high", "medium", "low"],
+    "claude-opus-5-5-low": ["max", "xhigh", "high", "medium", "low"],
+    "claude-sonnet-5-5-high": ["max", "xhigh", "high", "medium", "low"],
+    "claude-sonnet-5-5-medium": ["max", "xhigh", "high", "medium", "low"],
+    "claude-sonnet-5-5-low": ["max", "xhigh", "high", "medium", "low"],
+    "gpt-oss-120b-medium": ["max", "xhigh", "high", "medium", "low"],
+  },
 };
 
 /**
@@ -3138,6 +3161,7 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   cursor: {},
   gemini: {},
   fx: {},
+  antigravity: {},
 };
 
 export function supportedModes(agent: AgentKind, model: string | null): AgentOption[] {
@@ -3381,6 +3405,34 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // includes `auto` (fx's own default) last, per EFFORT_OPTIONS.
     efforts: EFFORT_OPTIONS,
   },
+  antigravity: {
+    models: [
+      { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)", hint: "Latest Gemini 3.8 Flash with high reasoning effort." },
+      { id: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash (Medium)", hint: "Gemini 3.8 Flash with medium reasoning effort." },
+      { id: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low)", hint: "Fast Gemini 3.8 Flash with low reasoning effort." },
+      { id: "gemini-3.7-flash-high", label: "Gemini 3.7 Flash (High)", hint: "Gemini 3.7 Flash with high reasoning effort." },
+      { id: "gemini-3.7-flash-medium", label: "Gemini 3.7 Flash (Medium)", hint: "Gemini 3.7 Flash with medium reasoning effort." },
+      { id: "gemini-3.7-flash-low", label: "Gemini 3.7 Flash (Low)", hint: "Gemini 3.7 Flash with low reasoning effort." },
+      { id: "gemini-3.6-flash-high", label: "Gemini 3.6 Flash (High)", hint: "Gemini 3.6 Flash with high reasoning effort." },
+      { id: "gemini-3.6-flash-medium", label: "Gemini 3.6 Flash (Medium)", hint: "Gemini 3.6 Flash with medium reasoning effort." },
+      { id: "gemini-3.6-flash-low", label: "Gemini 3.6 Flash (Low)", hint: "Gemini 3.6 Flash with low reasoning effort." },
+      { id: "gemini-3.1-pro-high", label: "Gemini 3.1 Pro (High)", hint: "Flagship Gemini 3.1 Pro with high reasoning effort." },
+      { id: "gemini-3.1-pro-low", label: "Gemini 3.1 Pro (Low)", hint: "Gemini 3.1 Pro with low reasoning effort." },
+      { id: "claude-opus-5-5-high", label: "Claude Opus 5.5 (High)", hint: "Claude Opus 5.5 with high reasoning effort." },
+      { id: "claude-opus-5-5-medium", label: "Claude Opus 5.5 (Medium)", hint: "Claude Opus 5.5 with medium reasoning effort." },
+      { id: "claude-opus-5-5-low", label: "Claude Opus 5.5 (Low)", hint: "Claude Opus 5.5 with low reasoning effort." },
+      { id: "claude-sonnet-5-5-high", label: "Claude Sonnet 5.5 (High)", hint: "Claude Sonnet 5.5 with high reasoning effort." },
+      { id: "claude-sonnet-5-5-medium", label: "Claude Sonnet 5.5 (Medium)", hint: "Claude Sonnet 5.5 with medium reasoning effort." },
+      { id: "claude-sonnet-5-5-low", label: "Claude Sonnet 5.5 (Low)", hint: "Claude Sonnet 5.5 with low reasoning effort." },
+      { id: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)", hint: "Open weights model with medium reasoning effort." },
+    ],
+    modes: [
+      { id: "auto", label: "Auto", hint: "Hands-off — auto-approves all tool permissions (--dangerously-skip-permissions)." },
+      { id: "plan", label: "Plan only", hint: "Plan without making changes (--mode plan)." },
+      { id: "ask", label: "Accept edits", hint: "Auto-accept file edits, ask before executing commands (--mode accept-edits)." },
+    ],
+    efforts: EFFORT_OPTIONS,
+  },
 };
 
 export type RunStatus =
@@ -3450,6 +3502,12 @@ export interface Run {
    * self-issued-uuid pattern. NULL for every other agent kind and legacy rows.
    */
   fxSessionId: string | null;
+  /**
+   * Antigravity CLI's own conversation id — DISCOVERED from the `init` event's
+   * `conversation_id`. Captured by the antigravity-tmux driver and persisted
+   * for `--conversation` on follow-up turns. NULL for every other agent kind.
+   */
+  antigravitySessionId?: string | null;
   /**
    * How this run came to exist. `null`/undefined = user-initiated (Run
    * button, a follow-up message typed into the panel — every run before

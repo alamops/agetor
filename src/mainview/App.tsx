@@ -216,7 +216,7 @@ function AppInner() {
   // tabs/panels never re-triggers a redundant `GET /agent-profiles` — see
   // `useAgentProfiles`'s own doc comment.
   const { profiles, loaded: profilesLoaded, refresh: refreshProfiles } = useAgentProfiles();
-  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
+  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], antigravity: [], fx: [] });
   // Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`.
   // `discoveryReady` mirrors the daemon's boot discovery sweep: false until
   // the first `GET /agent-models/harnesses` reports `ready: true`, which is
