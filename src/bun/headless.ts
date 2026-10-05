@@ -1,5 +1,5 @@
 import pkg from "../../package.json" with { type: "json" };
-import { API_TOKEN } from "./api-config.ts";
+import { API_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-config.ts";
 import { db, dataDir, subagents } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
@@ -123,6 +123,18 @@ export async function runDaemon(): Promise<void> {
   process.env.AGETOR_HEADLESS = "1";
   daemonLog(`cli-daemon starting — pid ${process.pid}, version ${pkg.version}`);
 
+  // Validate AGETOR_API_HOST before any boot work. An unusable value would
+  // otherwise only surface at bind time, where Bun reports it as "Is port N in
+  // use?" and the catch below would treat it as a port conflict. Logged to
+  // stderr as well as daemon.log so a foreground run (e.g. a container's
+  // entrypoint) shows it too.
+  const apiHost = resolveApiHost();
+  if (!apiHost.ok) {
+    daemonLog(`refusing to start: ${apiHost.error}`);
+    console.error(`[agetor] refusing to start: ${apiHost.error}`);
+    process.exit(1);
+  }
+
   // Same PATH hydration + orphan reconciliation the app does at boot, so the
   // daemon can find claude/codex/tmux and doesn't leave stale "running" cards.
   // Awaited so `startApiServer()` below never starts serving `/tasks`/`/runs`
@@ -210,7 +222,8 @@ export async function runDaemon(): Promise<void> {
 
   let server: ReturnType<typeof startApiServer>;
   try {
-    server = startApiServer(); // no native deps → native routes return 501
+    // No native deps → native routes return 501.
+    server = startApiServer({ hostname: apiHost.host });
   } catch (e) {
     // Port busy. If a live core already owns it (the app launched, or another
     // daemon won a startup race), exit quietly — the CLI re-discovers the
@@ -220,7 +233,9 @@ export async function runDaemon(): Promise<void> {
       daemonLog("port already owned by a live core — exiting quietly");
       process.exit(0);
     }
-    daemonLog(`failed to bind API: ${(e as Error)?.message ?? String(e)}`);
+    daemonLog(
+      `failed to bind API on ${formatHostForUrl(apiHost.host)}:${getApiPort()}: ${(e as Error)?.message ?? String(e)}`,
+    );
     process.exit(1);
   }
 
@@ -237,7 +252,9 @@ export async function runDaemon(): Promise<void> {
     },
     dataDir,
   );
-  daemonLog(`cli-daemon listening on http://127.0.0.1:${server.port}`);
+  // A non-loopback bind's warning is printed once by startApiServer, to
+  // stderr — which `spawnDaemon` points at this same daemon.log.
+  daemonLog(`cli-daemon listening on http://${formatHostForUrl(apiHost.host)}:${server.port}`);
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
