@@ -1,4 +1,5 @@
 import * as React from "react";
+import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 
@@ -32,6 +33,11 @@ const DESC_ID = "agetor-confirm-desc";
  * Escape, or a superseding `confirm()` call. For `variant: "destructive"` we
  * default focus to Cancel so a fat-finger Enter doesn't fire the destructive
  * action.
+ *
+ * The dialog portals to `document.body`: `Dialog` renders nothing while
+ * closed, so an opening confirm is appended after every other body-level
+ * dialog (the bundle import/export dialogs portal there too) and stacks above
+ * the dialog that asked, instead of under it.
  */
 export function ConfirmProvider({ children }: { children: React.ReactNode }) {
   const [pending, setPending] = React.useState<ConfirmOptions | null>(null);
@@ -67,41 +73,44 @@ export function ConfirmProvider({ children }: { children: React.ReactNode }) {
   return (
     <ConfirmContext.Provider value={confirm}>
       {children}
-      <Dialog
-        open={!!pending}
-        onClose={() => settle(false)}
-        className="max-w-sm"
-        labelledBy={TITLE_ID}
-        describedBy={pending?.description !== undefined ? DESC_ID : undefined}
-        initialFocusRef={initialFocusRef}
-      >
-        {pending && (
-          <>
-            <h2 id={TITLE_ID} className="text-sm font-semibold">{pending.title}</h2>
-            {pending.description !== undefined && (
-              <div id={DESC_ID} className="mt-2 text-xs text-muted-foreground">
-                {pending.description}
+      {createPortal(
+        <Dialog
+          open={!!pending}
+          onClose={() => settle(false)}
+          className="max-w-sm"
+          labelledBy={TITLE_ID}
+          describedBy={pending?.description !== undefined ? DESC_ID : undefined}
+          initialFocusRef={initialFocusRef}
+        >
+          {pending && (
+            <>
+              <h2 id={TITLE_ID} className="text-sm font-semibold">{pending.title}</h2>
+              {pending.description !== undefined && (
+                <div id={DESC_ID} className="mt-2 text-xs text-muted-foreground">
+                  {pending.description}
+                </div>
+              )}
+              <div className="mt-4 flex justify-end gap-2">
+                <Button
+                  ref={cancelBtnRef}
+                  variant="outline"
+                  onClick={() => settle(false)}
+                >
+                  {pending.cancelLabel ?? "Cancel"}
+                </Button>
+                <Button
+                  ref={confirmBtnRef}
+                  variant={pending.variant === "destructive" ? "destructive" : "default"}
+                  onClick={() => settle(true)}
+                >
+                  {pending.confirmLabel ?? "Confirm"}
+                </Button>
               </div>
-            )}
-            <div className="mt-4 flex justify-end gap-2">
-              <Button
-                ref={cancelBtnRef}
-                variant="outline"
-                onClick={() => settle(false)}
-              >
-                {pending.cancelLabel ?? "Cancel"}
-              </Button>
-              <Button
-                ref={confirmBtnRef}
-                variant={pending.variant === "destructive" ? "destructive" : "default"}
-                onClick={() => settle(true)}
-              >
-                {pending.confirmLabel ?? "Confirm"}
-              </Button>
-            </div>
-          </>
-        )}
-      </Dialog>
+            </>
+          )}
+        </Dialog>,
+        document.body,
+      )}
     </ConfirmContext.Provider>
   );
 }

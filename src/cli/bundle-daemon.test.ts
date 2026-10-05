@@ -254,7 +254,7 @@ test("an unknown harness kind fails with the --harness-map hint, then imports wi
     }),
   );
   await expect(cmdImport([out], flags())).rejects.toThrow(/nothing was imported — 1 blocking issue/);
-  expect(rendered()).toContain("hint: map a file harness to a local one with --harness-map");
+  expect(rendered()).toContain("hint: map grok-2 to a local harness with --harness-map grok-2=<localHarnessId> — it can use: claude-code (claude-code)");
   expect(await client.listAgentProfiles()).toEqual([]);
 
   outputs.length = 0;
@@ -266,6 +266,67 @@ test("an unknown harness kind fails with the --harness-map hint, then imports wi
     null,
     null,
   ]);
+});
+
+test("a --harness-map key no Agent uses is refused before any request, with the file's harness ids", async () => {
+  await seedSourceMachine();
+  const out = file("map-typo.agetor.json");
+  await cmdExport(["--all", "--out", out, "--force"], flags());
+  wipe();
+  // With no client the command can't reach the core: the refusal must come
+  // from the local check, before any request.
+  currentClient = null;
+  try {
+    await expect(cmdImport([out, "--harness-map", "secondary-claud-code=claude-code"], flags())).rejects.toThrow(
+      '--harness-map names a harness this file doesn\'t use: "secondary-claud-code" — its Agents use: "claude-code", "secondary-claude-code"',
+    );
+    // The `--harness-map --name=x` shape reads `--name` as the key.
+    await expect(cmdImport([out, "--harness-map", "--name=Copy"], flags())).rejects.toThrow(
+      /^--harness-map names a harness this file doesn't use: "--name" — its Agents use: /,
+    );
+    // A dry run is refused the same way.
+    await expect(cmdImport([out, "--dry-run", "--harness-map", "nope=claude-code"], flags())).rejects.toThrow(
+      /"nope"/,
+    );
+  } finally {
+    currentClient = client;
+  }
+  expect(await client.listAgentProfiles()).toEqual([]);
+  expect(await client.listPipelines()).toEqual([]);
+
+  // A used key plus an unknown one still refuses, naming only the unknown one.
+  await expect(
+    cmdImport([out, "--harness-map", "secondary-claude-code=claude-code", "--harness-map", "x=claude-code"], flags()),
+  ).rejects.toThrow('--harness-map names a harness this file doesn\'t use: "x" — ');
+  expect(await client.listAgentProfiles()).toEqual([]);
+
+  // Only keys the file uses: imports, remapped.
+  await cmdImport([out, "--harness-map", "secondary-claude-code=claude-code"], flags());
+  const profiles = await client.listAgentProfiles();
+  expect(profiles.map((p) => [p.name, p.harness]).sort()).toEqual([
+    ["Helper", "claude-code"],
+    ["Planner", "claude-code"],
+  ]);
+});
+
+test("a --harness-map on a file with no Agents says there is nothing to map", async () => {
+  wipe();
+  const out = file("no-agents.agetor.json");
+  writeFileSync(
+    out,
+    JSON.stringify({
+      format: "agetor-bundle",
+      version: 1,
+      agents: [],
+      pipelines: [{ name: "Bare", graph: { steps: [{ id: "s1", name: "Only", agent: null }], edges: [], startStepId: "s1" } }],
+    }),
+  );
+  await expect(cmdImport([out, "--harness-map", "claude-code=claude-code"], flags())).rejects.toThrow(
+    '--harness-map names a harness this file doesn\'t use: "claude-code" — the file has no Agents, so there is nothing to map',
+  );
+  expect(await client.listPipelines()).toEqual([]);
+  await cmdImport([out], flags());
+  expect((await client.listPipelines()).map((p) => p.name)).toEqual(["Bare"]);
 });
 
 test("--enable-harnesses enables a disabled harness the Agents land on", async () => {

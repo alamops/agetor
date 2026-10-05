@@ -43,7 +43,9 @@ export function BundleToolbar({
           checked={totalCount > 0 && allSelected}
           disabled={totalCount === 0}
           onChange={onToggleAll}
-          aria-label="Select all"
+          // The visible text leads the name (WCAG 2.5.3, label in name);
+          // "select all" says what the box does once something is picked.
+          aria-label={selectedCount > 0 ? `${selectedCount} selected, select all` : "Select all"}
         />
         {selectedCount > 0 ? `${selectedCount} selected` : "Select"}
       </label>

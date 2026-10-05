@@ -3,9 +3,14 @@
  * K5/K6/K12/K14): given a parsed bundle and a snapshot of this machine's
  * state, decide which harness each Agent lands on, what every Agent and
  * Pipeline will be named, and what to warn about or block on. The server runs
- * it for the preview and again inside the import transaction, so the preview
- * and the commit can never disagree. Pure and total — it never throws.
+ * it for the preview and again inside the import transaction. The two can
+ * disagree when this machine changes in between (a name gets taken, a
+ * harness is removed): every plan carries a `fingerprint` of what it would
+ * create, and a commit sent with the previewed fingerprint is refused (409,
+ * with the new plan) when the re-plan's differs. Pure and total — it never
+ * throws.
  */
+import { bundleNameKey, findInvisibleChar, LONE_SURROGATE_RE, stripInvisible } from "./bundle.ts";
 import type { BundleHarnessRef, ParsedBundle } from "./bundle.ts";
 import { AGENT_PROFILE_LIMITS } from "./agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE } from "./pipeline.ts";
@@ -71,8 +76,9 @@ export interface PlannedAgent {
   harnessId: string | null;
   harnessKind: AgentKind | null;
   harnessLabel: string | null;
-  /** Local harnesses the Agent may be bound to instead: same kind, or every
-   *  local harness when the file's kind is unknown. */
+  /** Local harnesses the Agent may be bound to instead: same kind, or —
+   *  when the file's kind is unknown — every local harness of a kind this
+   *  build can run. */
   candidateHarnessIds: string[];
   model: string;
   effort: string | null;
@@ -92,8 +98,13 @@ export interface PlannedStep {
   agentKey: string | null;
   agentName: string | null;
   /** Legacy files only: how the step's Agent reference was resolved. */
-  legacy: "kept" | "remapped" | "dangling" | null;
+  legacy: LegacyOutcome | null;
+  /** Legacy files only: how each delegation reference was resolved, in the
+   *  file's order (before duplicates collapse). */
+  delegationLegacy?: LegacyOutcome[];
 }
+
+export type LegacyOutcome = "kept" | "remapped" | "dangling";
 
 export interface PlannedPipeline {
   index: number;
@@ -117,6 +128,11 @@ export interface PlannedHarness {
   enabled: boolean;
   canEnable: boolean;
   willEnable: boolean;
+  /** The options ask to enable it (`enableHarnesses` lists it or is
+   *  `"all"`), whether or not it is disabled right now. Unlike `willEnable`
+   *  it doesn't move when someone toggles the harness elsewhere, which is
+   *  what keeps it in the fingerprint. */
+  enableRequested: boolean;
   warnings: BundleIssue[];
 }
 
@@ -131,6 +147,10 @@ export interface BundleImportPlan {
   /** Every blocking issue in the plan, flattened. */
   blocking: BundleIssue[];
   canImport: boolean;
+  /** `planFingerprint` of this plan: what the import would create. A client
+   *  echoes it on `POST /bundle/import` so the commit is refused if it would
+   *  create anything other than what the user confirmed. */
+  fingerprint: string;
 }
 
 /** `POST /bundle/import`'s 201 response. */
@@ -143,7 +163,9 @@ export interface BundleImportResponse {
   plan: BundleImportPlan;
 }
 
-const nameKey = (s: string): string => s.trim().toLowerCase();
+// The key Agent and Pipeline names clash under (defined beside the export
+// builder, which numbers its fallback names under the same key).
+const nameKey = bundleNameKey;
 
 /** Cut `s` to at most `max` UTF-16 units without splitting a surrogate pair. */
 function truncate(s: string, max: number): string {
@@ -154,17 +176,32 @@ function truncate(s: string, max: number): string {
   return s.slice(0, end);
 }
 
+/** `s` cut to `max` UTF-16 units for display, with an ellipsis when cut. A
+ *  joiner or selector the cut strands (a ZWJ whose emoji was cut off) is
+ *  dropped too, as `importedName` does. */
+function truncateDisplay(s: string, max: number): string {
+  const cut = truncate(s, max);
+  return cut.length < s.length ? `${stripInvisible(cut, false)}…` : s;
+}
+
+/** A legacy name hint quoted for a warning, cut so a long one stays short. */
+const shownHint = (hint: string): string => `"${truncateDisplay(hint, 60)}"`;
+
 /**
  * The first free automatic name for `base` (K6): `Base (imported)`, then
  * `Base (imported 2)`, … — the base is truncated so the whole name fits
- * `limit`. `taken` holds lower-cased, trimmed names; the caller adds the
+ * `limit` (a joiner or selector the cut strands is dropped too). `taken`
+ * holds `nameKey`s; the caller adds the
  * result to it.
  */
 export function importedName(base: string, taken: ReadonlySet<string>, limit: number): string {
   const trimmed = base.trim();
   for (let n = 1; ; n++) {
     const suffix = n === 1 ? " (imported)" : ` (imported ${n})`;
-    const candidate = `${truncate(trimmed, Math.max(0, limit - suffix.length)).trimEnd()}${suffix}`;
+    // A cut can strand a joiner or selector whose context was the character
+    // after it (a ZWJ before the emoji it joined), which import refuses.
+    const cut = stripInvisible(truncate(trimmed, Math.max(0, limit - suffix.length)), false);
+    const candidate = `${cut.trimEnd()}${suffix}`;
     if (!taken.has(nameKey(candidate))) return candidate;
   }
 }
@@ -189,6 +226,9 @@ function harnessText(h: { id: string; kind: string; label: string }): string {
 function explicitNameError(name: string, limit: number, what: string): string | null {
   if (name.length > limit) return `${what} must be ${limit} characters or fewer`;
   if (PIPELINE_CONTROL_CHAR_RE.test(name)) return `${what} must not contain control characters`;
+  if (LONE_SURROGATE_RE.test(name)) return `${what} must not contain a lone surrogate`;
+  const invisible = findInvisibleChar(name);
+  if (invisible) return `${what} must not contain invisible characters (${invisible})`;
   return null;
 }
 
@@ -318,6 +358,15 @@ export function planBundleImport(
             ),
           );
         }
+      } else if (!knownKinds.has(target.kind)) {
+        // A harness row of a retired kind (the harnesses.kind CHECK still
+        // admits some) has no DEFAULT_MODEL to reset to — never bindable.
+        errors.push(
+          issue(
+            "unsupported-local-harness",
+            `${who}: harness ${harnessText(target)} is a "${target.kind}" harness, which this version of agetor can't run — pick another harness`,
+          ),
+        );
       } else {
         resolution = "rebound";
         bound = target;
@@ -361,7 +410,9 @@ export function planBundleImport(
     }
 
     const candidateHarnessIds = (
-      fileKindKnown ? local.harnesses.filter((h) => h.kind === a.harness.kind) : local.harnesses
+      fileKindKnown
+        ? local.harnesses.filter((h) => h.kind === a.harness.kind)
+        : local.harnesses.filter((h) => knownKinds.has(h.kind))
     ).map((h) => h.id);
 
     if (bound && resolution !== "rebound") {
@@ -429,6 +480,21 @@ export function planBundleImport(
   const agentByKey = new Map(agents.map((a) => [a.key, a] as const));
   const localProfileIds = new Set(local.profiles.map((p) => p.id));
   const localProfileName = new Map(local.profiles.map((p) => [p.id, p.name] as const));
+  // Local Agent ids by name key, for legacy name hints: built once per plan
+  // (and only for a legacy file), not per unresolved reference.
+  let localIdsByNameKey: Map<string, string[]> | null = null;
+  const localIdsNamed = (key: string): string[] => {
+    if (!localIdsByNameKey) {
+      localIdsByNameKey = new Map();
+      for (const lp of local.profiles) {
+        const k = nameKey(lp.name);
+        const ids = localIdsByNameKey.get(k);
+        if (ids) ids.push(lp.id);
+        else localIdsByNameKey.set(k, [lp.id]);
+      }
+    }
+    return localIdsByNameKey.get(key) ?? [];
+  };
 
   const pipelines: PlannedPipeline[] = parsed.pipelines.map((p, index) => {
     const warnings: BundleIssue[] = [];
@@ -444,16 +510,16 @@ export function planBundleImport(
         id: string,
         hint: string | null,
         what: string,
-      ): { id: string; outcome: "kept" | "remapped" | "dangling" } => {
+      ): { id: string; outcome: LegacyOutcome } => {
         if (localProfileIds.has(id)) return { id, outcome: "kept" };
         if (hint) {
-          const matches = local.profiles.filter((lp) => nameKey(lp.name) === nameKey(hint));
-          if (matches.length === 1) return { id: matches[0]!.id, outcome: "remapped" };
+          const matches = localIdsNamed(nameKey(hint));
+          if (matches.length === 1) return { id: matches[0]!, outcome: "remapped" };
           if (matches.length > 1) {
             warnings.push(
               issue(
                 "legacy-ambiguous-agent",
-                `${what}: several Agents here are named "${hint}" — assign one in the editor before running this pipeline`,
+                `${what}: several Agents here are named ${shownHint(hint)} — assign one in the editor before running this pipeline`,
               ),
             );
             return { id, outcome: "dangling" };
@@ -462,7 +528,7 @@ export function planBundleImport(
         warnings.push(
           issue(
             "legacy-missing-agent",
-            `${what}: Agent ${hint ? `"${hint}"` : id} isn't defined on this machine — assign one in the editor before running this pipeline`,
+            `${what}: Agent ${hint ? shownHint(hint) : id} isn't defined on this machine — assign one in the editor before running this pipeline`,
           ),
         );
         return { id, outcome: "dangling" };
@@ -471,7 +537,7 @@ export function planBundleImport(
       graph = {
         ...p.graph,
         steps: p.graph.steps.map((step) => {
-          const hints = p.legacyHints?.[step.id] ?? null;
+          const hints = p.legacyHints && Object.hasOwn(p.legacyHints, step.id) ? p.legacyHints[step.id]! : null;
           let agentProfileId: string | null = null;
           let outcome: PlannedStep["legacy"] = null;
           if (step.agentProfileId !== null) {
@@ -479,20 +545,27 @@ export function planBundleImport(
             agentProfileId = r.id;
             outcome = r.outcome;
           }
-          const profileIds = step.subagents.profileIds.map(
-            (id, i) =>
-              resolveLegacy(id, hints?.subagentProfileNames[i] ?? null, `${who}, step "${step.name}" delegation`).id,
+          const delegations = step.subagents.profileIds.map((id, i) =>
+            resolveLegacy(id, hints?.subagentProfileNames[i] ?? null, `${who}, step "${step.name}" delegation`),
           );
+          const profileIds = delegations.map((r) => r.id);
           steps.push({
             id: step.id,
             name: step.name,
             instructions: step.instructions,
             agentKey: null,
+            // A step stored without an Agent imports without one, whatever
+            // its name hint says — never preview "→ Reviewer" for it.
             agentName:
-              agentProfileId !== null && outcome !== "dangling"
-                ? (localProfileName.get(agentProfileId) ?? null)
-                : (hints?.profileName ?? null),
+              agentProfileId === null
+                ? null
+                : outcome !== "dangling"
+                  ? (localProfileName.get(agentProfileId) ?? null)
+                  : hints?.profileName
+                    ? truncateDisplay(hints.profileName, AGENT_PROFILE_LIMITS.name)
+                    : null,
             legacy: outcome,
+            delegationLegacy: delegations.map((r) => r.outcome),
           });
           return { ...step, agentProfileId, subagents: { ...step.subagents, profileIds: [...new Set(profileIds)] } };
         }),
@@ -552,7 +625,8 @@ export function planBundleImport(
     const h = localById.get(id)!;
     const warnings: BundleIssue[] = [];
     const canEnable = !h.enabled;
-    const willEnable = canEnable && (enableAll || enableSet.has(id));
+    const enableRequested = enableAll || enableSet.has(id);
+    const willEnable = canEnable && enableRequested;
     const name = harnessText(h);
     if (!h.enabled && !willEnable) {
       warnings.push(issue("harness-disabled", `Harness ${name} is disabled — enable it to run these Agents`));
@@ -565,7 +639,7 @@ export function planBundleImport(
     if (h.loggedIn === false) {
       warnings.push(issue("harness-logged-out", `Harness ${name} isn't logged in`));
     }
-    return { id: h.id, kind: h.kind, label: h.label, enabled: h.enabled, canEnable, willEnable, warnings };
+    return { id: h.id, kind: h.kind, label: h.label, enabled: h.enabled, canEnable, willEnable, enableRequested, warnings };
   });
 
   const warnings = [
@@ -575,7 +649,7 @@ export function planBundleImport(
   ];
   const blocking = [...planLevelBlocking, ...agents.flatMap((a) => a.errors), ...pipelines.flatMap((p) => p.errors)];
 
-  return {
+  const plan: Omit<BundleImportPlan, "fingerprint"> = {
     legacy: parsed.legacy,
     agents,
     pipelines,
@@ -585,4 +659,43 @@ export function planBundleImport(
     blocking,
     canImport: blocking.length === 0,
   };
+  return { ...plan, fingerprint: planFingerprint(plan) };
+}
+
+/**
+ * A short hash of everything a plan would write: each Agent's final name,
+ * harness and launch settings, each Pipeline's final name and step-to-Agent
+ * bindings, and which of its harnesses the user asked to enable. Two plans
+ * of the same file with the same fingerprint create the same things. Not a security boundary —
+ * just a check that the commit still matches the confirmed preview.
+ */
+export function planFingerprint(plan: Pick<BundleImportPlan, "agents" | "pipelines" | "harnesses">): string {
+  const content = JSON.stringify([
+    plan.agents.map((a) => [a.key, a.name, a.harnessId, a.model, a.effort, a.mode, a.fast, a.maxMode]),
+    plan.pipelines.map((p) => [
+      p.index,
+      p.name,
+      p.graph.steps.map((s) => [s.id, s.agentProfileId, s.subagents.profileIds]),
+      // Legacy files keep an id that exists here and leave one that doesn't
+      // dangling — the same id either way, so the outcome has to be hashed
+      // too: an Agent deleted between preview and Confirm turns a kept
+      // reference into a dangling one.
+      p.steps.map((s) => [s.legacy, s.delegationLegacy ?? []]),
+    ]),
+    // The harnesses the user asked to enable — not their current state: a
+    // harness enabled (or disabled) elsewhere between preview and Confirm
+    // changes nothing the import writes, so it must not read as drift.
+    plan.harnesses.filter((h) => h.enableRequested).map((h) => h.id),
+  ]);
+  // cyrb53: a fast 53-bit string hash; collisions don't matter here.
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < content.length; i++) {
+    const ch = content.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
 }

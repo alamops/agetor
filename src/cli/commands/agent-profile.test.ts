@@ -282,3 +282,48 @@ test("formatAgentProfileListRow: null effort/mode render as '-'", () => {
   expect(row[3]).toBe("-");
   expect(row[4]).toBe("-");
 });
+
+test("formatAgentProfileListRow: names and instructions print with control characters escaped", () => {
+  const row = formatAgentProfileListRow({
+    id: "p1",
+    name: "Rev\u001b[31miewer",
+    harness: "claude-code",
+    model: "opus\u009b",
+    effort: null,
+    mode: null,
+    fast: false,
+    maxMode: false,
+    instructions: "do\u001b]52;c;x\u0007 it",
+    skills: [],
+    createdAt: 1,
+    updatedAt: 1,
+  });
+  expect(row.join(" ")).not.toMatch(/[\u001b\u009b\u0007]/);
+  expect(row[0]).toContain("Rev\\u001b[31miewer");
+});
+
+test("formatAgentProfileListRow: instructions cut never leaves half an emoji, and joiners print as text", () => {
+  const base = {
+    id: "p1",
+    name: "Reviewer",
+    harness: "claude-code",
+    model: "opus",
+    effort: null,
+    mode: null,
+    fast: false,
+    maxMode: false,
+    skills: [],
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  // 58 ASCII chars then an emoji: a UTF-16 slice at 59 would keep only its
+  // high surrogate, which escapes to a literal `\ud83d`.
+  const emoji = formatAgentProfileListRow({ ...base, instructions: `${"a".repeat(58)}😀 and more text` });
+  expect(emoji[7]).not.toContain("\\ud83d");
+  expect(emoji[7]).toContain("…");
+  // Persian ZWNJ and Hindi ZWJ are allowed between letters in multi-line text.
+  const scripts = formatAgentProfileListRow({ ...base, instructions: "می‌خواهم क्‍ष\n  next line" });
+  expect(scripts[7]).not.toContain("\\u200c");
+  expect(scripts[7]).not.toContain("\\u200d");
+  expect(scripts[7]).toContain("next line");
+});

@@ -97,7 +97,7 @@ import type {
   BundleSelection,
 } from "../../shared/bundle.ts";
 import type { BundleImportOptions, BundleImportPlan, BundleImportResponse } from "../../shared/bundle-import.ts";
-import { fetchWithRecovery } from "./net-retry.ts";
+import { ApiTransitError, fetchWithRecovery } from "./net-retry.ts";
 
 export interface UpdateSnapshot {
   status: UpdateStatus;
@@ -391,6 +391,24 @@ async function j<T>(
   return body as T;
 }
 
+/** `j` for the bundle routes, whose callers read fields off the answer:
+ *  a 2xx whose body didn't parse as a JSON object (`j` resolves `null` for
+ *  an unparsable one) is an answer the request lost on the way back, so it
+ *  throws `ApiTransitError` — which the dialogs already word as "the
+ *  connection dropped" and treat as "it may have run" — instead of letting
+ *  a caller dereference `null` after an import that did commit. */
+async function bundleJ<T extends object>(
+  path: string,
+  init?: RequestInit,
+  opts?: { retry?: boolean },
+): Promise<T> {
+  const body = await j<unknown>(path, init, opts);
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    throw new ApiTransitError(`request to ${path} returned an unreadable answer`);
+  }
+  return body as T;
+}
+
 export interface AppDefaults { home: string; cwd: string; dataDir: string }
 
 /** One page of older task events, as returned by `GET /tasks/:id/events/page`
@@ -558,12 +576,12 @@ export const api = {
   /** The canonical bundle text for a selection, plus its counts and
    *  export-time warnings. Read-only, so a replay is harmless. */
   exportBundle: (selection: BundleSelection) =>
-    j<BundleExportResponse>("/bundle/export", { method: "POST", body: JSON.stringify(selection) }),
+    bundleJ<BundleExportResponse>("/bundle/export", { method: "POST", body: JSON.stringify(selection) }),
   /** Save the export to ~/Downloads (revealed in Finder) or a folder picked
    *  in the native panel. `retry: false` — a replay would write a second,
    *  numbered copy (or open a second panel). */
   saveBundle: (selection: BundleSelection, target: "downloads" | "folder") =>
-    j<BundleSaveResponse>(
+    bundleJ<BundleSaveResponse>(
       "/bundle/export/save",
       { method: "POST", body: JSON.stringify({ ...selection, target }) },
       { retry: false },
@@ -571,16 +589,19 @@ export const api = {
   /** Choose file: the native Open panel, filtered to .json. `retry: false` —
    *  a replay would open the panel twice. */
   pickBundleFile: () =>
-    j<BundlePickResponse>("/bundle/pick-file", { method: "POST", body: "{}" }, { retry: false }),
-  /** Dry run: what importing `text` would create, rename and bind. */
-  previewBundleImport: (text: string, options: BundleImportOptions) =>
-    j<BundleImportPlan>("/bundle/import/preview", { method: "POST", body: JSON.stringify({ text, options }) }),
-  /** Commit an import — all or nothing. 409 `{ error, plan }` when blocked.
+    bundleJ<BundlePickResponse>("/bundle/pick-file", { method: "POST", body: "{}" }, { retry: false }),
+  /** Dry run: what importing `text` would create, rename and bind. `signal`
+   *  lets the import dialog drop a preview it no longer wants (the dialog
+   *  closed or got new text) instead of waiting for it to land. */
+  previewBundleImport: (text: string, options: BundleImportOptions, signal?: AbortSignal) =>
+    bundleJ<BundleImportPlan>("/bundle/import/preview", { method: "POST", body: JSON.stringify({ text, options }), signal }),
+  /** Commit an import — all or nothing. 409 `{ error, plan }` when blocked,
+   *  or when the re-plan no longer matches the previewed `planFingerprint`.
    *  `retry: false` — a replay after a lost response would import twice. */
-  importBundle: (text: string, options: BundleImportOptions) =>
-    j<BundleImportResponse>(
+  importBundle: (text: string, options: BundleImportOptions, planFingerprint: string) =>
+    bundleJ<BundleImportResponse>(
       "/bundle/import",
-      { method: "POST", body: JSON.stringify({ text, options }) },
+      { method: "POST", body: JSON.stringify({ text, options, planFingerprint }) },
       { retry: false },
     ),
   /** A pipeline TASK's live run: the parent task plus every hidden step

@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import path from "node:path";
 import { test, expect, type Locator } from "./fixtures";
 import { gotoApp, openSettingsGeneral } from "./helpers";
 
@@ -163,12 +166,24 @@ test.describe("identifier inputs opt out of autocorrect", () => {
     // The Extensions trigger is disabled until the New Task panel has a
     // non-empty workdir (PromptComposer: `disabled={disabled ||
     // !workdir.trim()}`), so a project must be registered and selected
-    // first. The worker's own `dataDir` is already guaranteed to exist and
-    // is unrelated to this repo checkout, so pointing a project at it can't
-    // touch a real git worktree — this test never starts a task.
+    // first. A directory under the worker's own `dataDir` is unrelated to
+    // this repo checkout, so pointing a project at it can't touch a real git
+    // worktree — this test never starts a task. Its own subdirectory, not
+    // `dataDir` itself: `projects.upsert` keeps the FIRST name a path was
+    // registered under, and sibling specs sharing this worker's backend
+    // (fx-interactions, fx-recovery) register paths too.
+    // (Named by a hash, not the project name itself: the picker trigger
+    // labels the auto-selected project by its path's basename, which would
+    // then also match the row locator below.)
+    const projectDir = path.join(
+      backend.dataDir,
+      "e2e-projects",
+      createHash("sha1").update(EXTENSIONS_TEST_PROJECT_NAME).digest("hex").slice(0, 12),
+    );
+    mkdirSync(projectDir, { recursive: true });
     const projectRes = await page.request.post(`${backend.apiBase}/projects`, {
       headers: { authorization: `Bearer ${backend.apiToken}` },
-      data: { path: backend.dataDir, name: EXTENSIONS_TEST_PROJECT_NAME },
+      data: { path: projectDir, name: EXTENSIONS_TEST_PROJECT_NAME },
     });
     expect(projectRes.ok()).toBeTruthy();
 

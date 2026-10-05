@@ -183,12 +183,17 @@ export const USAGE: Record<string, string> = {
     --all             every Agent and every Pipeline
     --out <file|->    write to a file instead of stdout ('-' is stdout)
     --force           overwrite an existing --out file (refused otherwise)
-  Re-import with 'agetor import <file>'.`,
+  Without --out, stdout is the bundle file itself; with --json it is
+  { filename, counts, warnings, bundle } (or { written, counts, warnings }
+  with --out). Re-import with 'agetor import <file>'.`,
 
-  import: `usage: agetor import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <n>] [--enable-harnesses]
+  import: `usage: agetor import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <n>] [--enable-harnesses] [--yes]
 
   Import a bundle written by 'agetor export' (or a legacy 'pipeline export'
-  file; '-' reads stdin). Everything is created in one step, or nothing is.
+  file; '-' reads stdin). In a terminal it first prints what it will create
+  — each Agent's harness, skills and instructions — and asks before
+  importing (No or Esc imports nothing; Ctrl+C exits 130). Everything is
+  created in one step, or nothing is.
   New ids are always assigned; a name that's already taken becomes
   "Name (imported)". An Agent whose harness isn't on this machine binds to
   the built-in harness of the same kind, with a warning.
@@ -198,13 +203,15 @@ export const USAGE: Record<string, string> = {
                            version doesn't know)
     --name <n>             name for the file's only Pipeline (or its only
                            Agent when it has no Pipelines) — must be free
-    --enable-harnesses     enable a disabled harness the Agents land on`,
+    --enable-harnesses     enable a disabled harness the Agents land on
+    --yes, -y              import without asking (scripts, stdin and --json
+                           never ask)`,
 
   "profile export": `usage: agetor profile export <ref> [--out <file|->] [--force]
 
   Export one Agent as a bundle — same format and flags as 'agetor export --profile <ref>'.`,
 
-  "profile import": `usage: agetor profile import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <n>] [--enable-harnesses]
+  "profile import": `usage: agetor profile import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <n>] [--enable-harnesses] [--yes]
 
   Import a bundle — same as 'agetor import' (see 'agetor import --help').`,
 
@@ -261,13 +268,15 @@ export const USAGE: Record<string, string> = {
   Re-importable with 'pipeline import' or 'agetor import'. Refuses to
   overwrite an existing --out file unless --force.`,
 
-  "pipeline import": `usage: agetor pipeline import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <name>] [--enable-harnesses]
+  "pipeline import": `usage: agetor pipeline import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <n>] [--enable-harnesses] [--yes]
 
   Import a bundle ('-' reads stdin) — same as 'agetor import' (see 'agetor
-  import --help'). --name names the file's only pipeline. A legacy pipeline
-  file (from before bundles) still imports: a step Agent id that doesn't
-  exist here is matched by the file's profileName hint when exactly one
-  local Agent has that name, else reported.`,
+  import --help'): in a terminal it prints what it will create and asks
+  first; --yes (-y) skips the question. --name names the file's only
+  pipeline. A legacy pipeline file (from before bundles) still imports: a
+  step Agent id that doesn't exist here is matched by the file's
+  profileName hint when exactly one local Agent has that name, else
+  reported.`,
 
   "pipeline retry": `usage: agetor pipeline retry <task-id> [--from <step-task-id-or-prefix>]
 

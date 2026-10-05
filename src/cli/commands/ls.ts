@@ -5,6 +5,7 @@ import { COLUMNS } from "../../shared/types.ts";
 import { flagValue } from "../args.ts";
 import { fxAutoResumeCountdownText, isTaskFxPaused } from "../../shared/fx-recovery.ts";
 import { pipelineStepProgress } from "../../shared/pipeline.ts";
+import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id);
 
@@ -110,7 +111,9 @@ export async function cmdLs(
  *  `--steps`) is prefixed `↳ ` so it reads as belonging to the parent row
  *  above it, mirroring the TUI's expanded step rows (L-CLI11). */
 function titleCell(t: Task): string {
-  return t.pipelineParentId ? `↳ ${truncate(t.title, 42)}` : truncate(t.title, 44);
+  // Truncate the raw title, then escape: cutting the escaped text could
+  // split a `\uXXXX` escape in half.
+  return t.pipelineParentId ? `↳ ${escapeFreeText(truncateText(t.title, 42))}` : escapeFreeText(truncateText(t.title, 44));
 }
 
 /** Agent column: the raw harness id — always, regardless of whether the task
@@ -124,7 +127,7 @@ function agentCell(t: Task): string {
  *  frozen snapshot — reads the same whether the profile is still live or has
  *  since been deleted), or `-` when the task isn't bound to one. */
 function profileCell(t: Task): string {
-  return t.agentProfile ? c.bold(t.agentProfile.name) : c.dim("-");
+  return t.agentProfile ? c.bold(escapeControlChars(t.agentProfile.name)) : c.dim("-");
 }
 
 /** The "needs" column: pending-interaction count first (unchanged), then an
@@ -141,7 +144,7 @@ function profileCell(t: Task): string {
  *  fixed-width, `wrap="truncate"` row, `cmdLs`'s "needs" column is BOTH (a)
  *  the table's last column, whose padding `table()`'s `fmt()` immediately
  *  `.trimEnd()`s away, and (b) never consulted when budgeting the "title"
- *  column (`truncate(t.title, 44)` above is a fixed, needs-independent
+ *  column (`truncateText(t.title, 44)` above is a fixed, needs-independent
  *  constant). So the same off-by-one has nothing to overflow into here — no
  *  column-width accounting change was needed; `ls.test.ts` pins this
  *  (alignment across rows holds, and a hint-bearing row's `⏸` is never cut
@@ -161,7 +164,7 @@ function needsCell(t: Task): string {
   // attention" cell rather than adding a column of its own, mirroring the
   // fx-pause hint above. `pipelineRun` is only ever set on a parent task.
   if (t.pipelineId && t.pipelineRun?.status === "blocked") {
-    parts.push(c.yellow(`pipeline blocked · ${pipelineStepProgress(t.pipelineRun).label}`));
+    parts.push(c.yellow(`pipeline blocked · ${escapeControlChars(pipelineStepProgress(t.pipelineRun).label)}`));
   }
   // A step task (listed only under `--steps`) names its parent here so the
   // row is actionable — `agetor pipeline status <parent>` / `agetor show`.
@@ -187,6 +190,3 @@ function colorColumn(col: string): string {
   return col;
 }
 
-function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n - 1) + "…" : s;
-}

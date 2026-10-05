@@ -1,5 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
+import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp, getPreferences, openSettingsGeneral } from "./helpers";
 // Pure constants/types only (no bun/node runtime imports — see
@@ -366,17 +368,29 @@ async function selectHarness(page: Page, label: string): Promise<void> {
   await button.click();
 }
 
-/** Registers `backend.dataDir` as a project under a distinctive name, so the
- *  New Task form's ProjectPicker has something to select without touching
- *  the native folder dialog (unavailable in this headless harness) — the
- *  form's `workdir` starts empty and "Run task" stays disabled until one is
- *  chosen, regardless of the isolate toggle. Mirrors
- *  `e2e/fx-interactions.spec.ts`'s identical helper. */
+/** Registers a fresh directory under `backend.dataDir` as a project under a
+ *  distinctive name, so the New Task form's ProjectPicker has something to
+ *  select without touching the native folder dialog (unavailable in this
+ *  headless harness) — the form's `workdir` starts empty and "Run task"
+ *  stays disabled until one is chosen, regardless of the isolate toggle.
+ *  Mirrors `e2e/fx-interactions.spec.ts`'s identical helper.
+ *
+ *  The directory is per-NAME, never `dataDir` itself: `projects.upsert` is
+ *  keyed on path and keeps the FIRST name a path was registered under, and
+ *  sibling spec files sharing this worker's backend (fx-interactions,
+ *  identifier-inputs) register paths too — reusing one path made this
+ *  spec's name silently lose ("No matches.") whenever a sibling ran first. */
 async function registerDataDirProject(backend: E2EBackend, name: string): Promise<void> {
+  // Under `dataDir`, so the `backend` fixture's own teardown removes it.
+  // Named by a hash of the project name, never the name itself: the
+  // ProjectPicker trigger labels the auto-selected project by its path's
+  // basename, which would then also match `selectProject`'s row locator.
+  const dir = path.join(backend.dataDir, "e2e-projects", createHash("sha1").update(name).digest("hex").slice(0, 12));
+  mkdirSync(dir, { recursive: true });
   const res = await fetch(`${backend.apiBase}/projects`, {
     method: "POST",
     headers: { ...authHeaders(backend), "content-type": "application/json" },
-    body: JSON.stringify({ path: backend.dataDir, name }),
+    body: JSON.stringify({ path: dir, name }),
   });
   if (!res.ok) {
     throw new Error(`POST /projects -> ${res.status}: ${await res.text()}`);

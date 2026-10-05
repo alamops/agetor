@@ -30,7 +30,9 @@ export function PipelinesPage({ onOpenEditor, onBack, onImported }: PipelinesPag
   const confirm = useConfirm();
   const [busyId, setBusyId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const bundle = useBundleList({ ids: pipelines.map((p) => p.id), kind: "pipeline", onImported });
+  // The page unmounts on an app-level navigation, so an edited import
+  // asks before one drops it.
+  const bundle = useBundleList({ ids: pipelines.map((p) => p.id), kind: "pipeline", onImported, guardsNavigation: true });
 
   const handleDuplicate = async (pipeline: Pipeline) => {
     setBusyId(pipeline.id);

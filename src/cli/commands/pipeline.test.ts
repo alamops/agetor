@@ -38,6 +38,7 @@ mock.module("../context.ts", () => ({
 
 mock.module("../output.ts", () => ({
   ...realOutputSnapshot,
+  isTTY: false,
   c: {
     dim: (s: string) => s,
     bold: (s: string) => s,
@@ -254,6 +255,24 @@ test("pipelineShowLines: with a live profile list, a step's profile renders as '
   expect(text).toContain("profile: prof-b (missing)");
 });
 
+test("pipelineShowLines: Agent references and profile names print with control characters escaped", () => {
+  // A legacy import keeps a reference nothing matched as it was.
+  const g = twoStepGraph();
+  g.steps[0]!.agentProfileId = "\u001b]0;pwned\u0007";
+  g.steps[1]!.agentProfileId = "prof-a";
+  g.steps[1]!.subagents = { profileIds: ["x\u001b[2J"], cap: null };
+  const profiles = [makeProfile({ id: "prof-a", name: "Inv\u001b[31mestigator" })];
+  for (const list of [profiles, null]) {
+    const text = pipelineShowLines(makePipeline({ graph: g }), list).join("\n");
+    expect(text).toContain("\\u001b]0;pwned\\u0007");
+    expect(text).toContain("x\\u001b[2J");
+    expect(text).not.toContain("\u001b]0;");
+    expect(text).not.toContain("\u001b[2J");
+  }
+  const text = pipelineShowLines(makePipeline({ graph: g }), profiles).join("\n");
+  expect(text).toContain("Inv\\u001b[31mestigator");
+});
+
 test("pipelineShowLines: a null profile list (listing failed) prints bare ids, never a false '(missing)'", () => {
   const text = pipelineShowLines(makePipeline({ graph: twoStepGraph() }), null).join("\n");
   expect(text).toContain("profile: prof-a");
@@ -421,7 +440,6 @@ const BUNDLE_TEXT = '{\n  "format": "agetor-bundle",\n  "version": 1\n}\n';
 
 function exportResponse(over: Partial<BundleExportResponse> = {}): BundleExportResponse {
   return {
-    bundle: { format: "agetor-bundle", version: 1, exportedAt: "x", agetorVersion: "1.0.0", agents: [], pipelines: [] },
     text: BUNDLE_TEXT,
     filename: "flow-a.agetor.json",
     warnings: [],
@@ -440,6 +458,7 @@ function plan(over: Partial<BundleImportPlan> = {}): BundleImportPlan {
     warnings: [],
     blocking: [],
     canImport: true,
+    fingerprint: "fp-1",
     ...over,
   };
 }
@@ -493,6 +512,15 @@ test("cmdPipeline export --out <existing file>: refuses to overwrite without --f
     await cmdPipeline(["export", "p1", "--out", file, "--force"], flags);
     expect(readFileSync(file, "utf8")).toBe(BUNDLE_TEXT);
     expect(outputs.join("\n")).toContain(`wrote 2 Agents, 1 Pipeline to ${file}`);
+  });
+});
+
+test("cmdPipeline export|import: handle the file before connecting to the core", async () => {
+  await withFile("{}", async (file) => {
+    currentClient = null; // reaching getClient would fail with "no fake client"
+    await expect(cmdPipeline(["export", "p1", "--out", file], flags)).rejects.toThrow(/refusing to overwrite/);
+    await expect(cmdPipeline(["import", `${file}.missing`], flags)).rejects.toThrow(/no such file/);
+    await expect(cmdPipeline(["import", file], flags)).rejects.toThrow(/can't import/);
   });
 });
 
@@ -585,8 +613,32 @@ test("cmdPipeline import --json: prints the raw import result", async () => {
 test("cmdPipeline import: a blocked import prints the plan's blocking issues plus a hint and fails", async () => {
   const { ApiError } = await import("../api-client.ts");
   await withFile(VALID_BUNDLE, async (file) => {
+    const unknownKind = { code: "unknown-kind", message: 'Agent "X" uses a "grok" harness' };
     const blocked = plan({
-      blocking: [{ code: "unknown-kind", message: 'Agent "X" uses a "grok" harness' }],
+      agents: [
+        {
+          key: "x",
+          sourceName: "X",
+          name: "X",
+          renamed: false,
+          fileHarness: { id: "grok-2", kind: "grok" as never, label: "Grok" },
+          resolution: "unresolved",
+          harnessId: null,
+          harnessKind: null,
+          harnessLabel: null,
+          candidateHarnessIds: ["claude-code"],
+          model: "grok-5",
+          effort: null,
+          mode: null,
+          fast: false,
+          maxMode: false,
+          instructions: "",
+          skills: [],
+          warnings: [],
+          errors: [unknownKind],
+        },
+      ],
+      blocking: [unknownKind],
       canImport: false,
       localHarnesses: [
         { id: "claude-code", kind: "claude-code", label: "Claude Code", isBuiltin: true, enabled: true, available: true, loggedIn: null, reason: null, installHint: null },
@@ -600,8 +652,9 @@ test("cmdPipeline import: a blocked import prints the plan's blocking issues plu
     await expect(cmdPipeline(["import", file], flags)).rejects.toThrow(/nothing was imported/);
     const rendered = outputs.join("\n");
     expect(rendered).toContain('✗ Agent "X" uses a "grok" harness');
-    expect(rendered).toContain("--harness-map <fileHarnessId>=<localHarnessId>");
-    expect(rendered).toContain("claude-code (claude-code)");
+    expect(rendered).toContain(
+      "hint: map grok-2 to a local harness with --harness-map grok-2=<localHarnessId> — it can use: claude-code (claude-code)",
+    );
   });
 });
 
@@ -825,6 +878,21 @@ test("pipelineStatusLines: status/progress header, blocked, active, and history 
   expect(text).toContain("history");
   expect(text).toContain("Investigate"); // history entry s1's name
   expect(text).toContain("succeeded");
+});
+
+test("pipelineStatusLines: the task title and block messages are free text (escapeFreeText)", () => {
+  const run = pipelineRun();
+  const t = task({
+    title: "رفع\u200cاشکال",
+    pipelineRun: { ...run, blocked: [{ ...run.blocked[0]!, message: "a\nb\u001b[31m" }] },
+  });
+  const text = pipelineStatusLines(t, []).join("\n");
+  // A Persian half-space prints as text, not as \u200c …
+  expect(text).toContain("رفع\u200cاشکال");
+  expect(text).not.toContain("\\u200c");
+  // … and a block message's line break folds to a space, its ESC escaped.
+  expect(text).toContain("a b\\u001b[31m");
+  expect(text).not.toContain("\\u000a");
 });
 
 test("pipelineStatusLines: an active step's own live column is shown when its step task is known", () => {
@@ -1236,4 +1304,57 @@ test("cmdPipeline status --json: prints { task, steps }", async () => {
   });
   await cmdPipeline(["status", "parent-1"], jsonFlags);
   expect(jsonOutputs).toEqual([{ task: t, steps }]);
+});
+
+// ── terminal safety (imported names, ids and descriptions) ───────────────
+
+test("pipelineShowLines: ids, names, labels and descriptions print with control characters escaped", () => {
+  const g: PipelineGraph = {
+    steps: [
+      newStep({ name: "Plan\u001b[2J", id: "s\u009b1" }),
+      newStep({ name: "Ship", id: "s\u202e2" }),
+    ],
+    edges: [{ id: "e1", from: "s\u009b1", to: "s\u202e2", label: "go\u001b]52;c;x\u0007" }],
+    startStepId: "s\u009b1",
+  };
+  const text = pipelineShowLines(makePipeline({ name: "Flow\u001b[31m", graph: g })).join("\n");
+  expect(text).not.toMatch(/[\u001b\u009b\u202e\u0007]/);
+  expect(text).toContain("s\\u009b1");
+  expect(text).toContain("s\\u202e2");
+  expect(text).toContain("Flow\\u001b[31m");
+  expect(text).toContain("Ship (go\\u001b]52;c;x\\u0007)");
+});
+
+test("pipelineShowLines: a bare CR in a description starts a new line instead of overprinting", () => {
+  const lines = pipelineShowLines(makePipeline({ description: "run evil\rbenign text" }));
+  expect(lines.join("\n")).not.toContain("\r");
+  const at = lines.findIndex((l) => l.includes("description"));
+  expect(lines.slice(at, at + 3)).toEqual(["  description:", "    run evil", "    benign text"]);
+});
+
+test("pipelineShowLines: a one-line description stays on the label line", () => {
+  const lines = pipelineShowLines(makePipeline({ description: "Fix\tbugs\n" }));
+  expect(lines).toContain("  description: Fix bugs");
+});
+
+test("pipelineStatusLines: a block message (which can quote an agent's handoff) prints escaped", () => {
+  const t = task({
+    title: "T\u001b[1m",
+    pipelineRun: pipelineRun({
+      blocked: [{ taskId: "step-task-1", stepId: "s2", kind: "handoff-invalid", message: 'next "\u001b]52;c;eA==\u0007" matches no step' }],
+    }),
+  });
+  const text = pipelineStatusLines(t, []).join("\n");
+  expect(text).not.toMatch(/[\u001b\u0007]/);
+  expect(text).toContain("\\u001b]52;c;eA==\\u0007");
+  expect(text).toContain("T\\u001b[1m");
+});
+
+test("pipelineStatusLines: a step id missing from the snapshot prints escaped", () => {
+  const t = task({
+    pipelineRun: pipelineRun({ active: [{ stepId: "gone\u009b", taskId: "step-task-1", seq: 2 }], blocked: [] }),
+  });
+  const text = pipelineStatusLines(t, []).join("\n");
+  expect(text).not.toContain("\u009b");
+  expect(text).toContain("gone\\u009b");
 });

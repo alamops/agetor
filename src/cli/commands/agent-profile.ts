@@ -4,12 +4,19 @@ import { c, out, printJson, table } from "../output.ts";
 import { flagValue } from "../args.ts";
 import type { AgetorClient, AgentProfileInput } from "../api-client.ts";
 import { usageError } from "../usage.ts";
-import { cmdExportOne, cmdImportAs } from "./bundle.ts";
+import { cmdExportOne, cmdImportAs, printableLines } from "./bundle.ts";
 import { asProfileError, matchAgentProfileRef, normalizeSkillName } from "../../shared/agent-profile.ts";
+import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
 import type { AgentProfile } from "../../shared/types.ts";
 
 export async function cmdAgentProfile(args: string[], flags: Flags): Promise<void> {
   const sub = args[0] ?? "ls";
+  // The agetor bundle (docs/plans/agents-pipelines-import-export.md). Handled
+  // before `getClient`, which may start a daemon: an `--out` that would be
+  // overwritten, or an unreadable/invalid import file, fails first — the
+  // same order as top-level `agetor export`/`agetor import`.
+  if (sub === "export") return cmdExportOne("profile", args.slice(1), flags);
+  if (sub === "import") return cmdImportAs("profile", args.slice(1), flags);
   const client = await getClient(flags);
   switch (sub) {
     case "ls":
@@ -29,19 +36,19 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       if (!ref) throw usageError("profile");
       const profile = await resolveProfile(client, ref);
       if (flags.json) return printJson(profile);
-      out(`${c.bold(profile.name)}  ${c.dim(profile.id)}`);
+      out(`${c.bold(safe(profile.name))}  ${c.dim(profile.id)}`);
       out(
-        `  ${label("harness")} ${profile.harness}   ${label("model")} ${profile.model}` +
-          `   ${label("effort")} ${profile.effort ?? "-"}   ${label("mode")} ${profile.mode ?? "-"}`,
+        `  ${label("harness")} ${safe(profile.harness)}   ${label("model")} ${safe(profile.model)}` +
+          `   ${label("effort")} ${safe(profile.effort ?? "-")}   ${label("mode")} ${safe(profile.mode ?? "-")}`,
       );
       out(`  ${label("fast")} ${profile.fast ? "yes" : "no"}   ${label("max mode")} ${profile.maxMode ? "yes" : "no"}`);
       out(
-        `  ${label("skills")} ${profile.skills.length ? profile.skills.map((s) => `/${s}`).join(", ") : c.dim("none")}`,
+        `  ${label("skills")} ${profile.skills.length ? profile.skills.map((s) => `/${safe(s)}`).join(", ") : c.dim("none")}`,
       );
       out(`  ${label("used by")} ${taskCountText(profile.taskCount ?? 0)}`);
       out(`  ${label("instructions")}${profile.instructions ? "" : ` ${c.dim("none")}`}`);
       if (profile.instructions) {
-        for (const line of profile.instructions.split("\n")) out(`    ${line}`);
+        for (const line of printableLines(profile.instructions.replace(/\s+$/, ""))) out(`    ${line}`);
       }
       return;
     }
@@ -64,7 +71,7 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       };
       const created = await client.createAgentProfile(input);
       if (flags.json) return printJson(created);
-      out(`${c.green("✓")} created profile ${c.bold(created.name)} (${c.dim(created.id)})`);
+      out(`${c.green("✓")} created profile ${c.bold(safe(created.name))} (${c.dim(created.id)})`);
       return;
     }
     case "edit": {
@@ -106,7 +113,7 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       }
       const updated = await client.patchAgentProfile(profile.id, patch);
       if (flags.json) return printJson(updated);
-      out(`${c.green("✓")} updated profile ${c.bold(updated.name)} (${c.dim(updated.id)})`);
+      out(`${c.green("✓")} updated profile ${c.bold(safe(updated.name))} (${c.dim(updated.id)})`);
       return;
     }
     case "rm":
@@ -116,14 +123,9 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       const profile = await resolveProfile(client, ref);
       await client.deleteAgentProfile(profile.id);
       if (flags.json) return printJson({ removed: profile.id });
-      out(`${c.red("✗")} removed profile ${c.bold(profile.name)} — existing tasks keep their snapshot`);
+      out(`${c.red("✗")} removed profile ${c.bold(safe(profile.name))} — existing tasks keep their snapshot`);
       return;
     }
-    case "export":
-      // The agetor bundle (docs/plans/agents-pipelines-import-export.md).
-      return cmdExportOne("profile", args.slice(1), flags, client);
-    case "import":
-      return cmdImportAs("profile", args.slice(1), flags, client);
     default:
       throw new Error(`unknown profile subcommand: ${sub} (use ls | show | add | edit | rm | export | import)`);
   }
@@ -160,10 +162,10 @@ function label(s: string): string {
   return c.dim(s + ":");
 }
 
-function oneLine(s: string, n: number): string {
-  const flat = s.replace(/\s+/g, " ").trim();
-  return flat.length > n ? flat.slice(0, n - 1) + "…" : flat;
-}
+/** Profile text escaped for the terminal: an imported or hand-written
+ *  value can hold an ESC, a C1 control or a bidi override, which would
+ *  otherwise drive the terminal or hide what the text says. */
+const safe = (s: string): string => escapeControlChars(s);
 
 /** `"N task"` / `"N tasks"` — the singular/plural form both `profile ls`'s
  *  `tasks` column and `profile show`'s `used by:` line render. `taskCount` is
@@ -180,14 +182,17 @@ export function taskCountText(n: number): string {
  *  is unit-testable without a client/daemon. */
 export function formatAgentProfileListRow(pr: AgentProfile): string[] {
   return [
-    c.bold(pr.name),
-    c.gray(pr.harness),
-    pr.model,
-    pr.effort ?? "-",
-    pr.mode ?? "-",
+    c.bold(safe(pr.name)),
+    c.gray(safe(pr.harness)),
+    safe(pr.model),
+    safe(pr.effort ?? "-"),
+    safe(pr.mode ?? "-"),
     String(pr.skills.length),
     String(pr.taskCount ?? 0),
-    c.dim(oneLine(pr.instructions, 60)),
+    // Free text: whitespace folded to one line, cut without splitting a
+    // surrogate pair, then escaped with the multi-line rule so a Persian or
+    // Hindi ZWNJ/ZWJ prints as text rather than `\u200c`.
+    c.dim(escapeFreeText(truncateText(pr.instructions.replace(/\s+/g, " ").trim(), 60))),
   ];
 }
 

@@ -31,7 +31,6 @@ import {
   buildBundle,
   numberedFileName,
   parseBundleText,
-  serializeBundle,
   type BundleExportResponse,
   type BundleParseErrorCode,
   type BundleSelection,
@@ -50,10 +49,7 @@ import type { AgentKind, AgentProfile, Harness, HarnessStatus, Pipeline, Pipelin
 
 const AGENT_KINDS = Object.keys(AGENT_OPTIONS) as AgentKind[];
 
-/** Largest `/bundle/*` request body read at all: the import text plus JSON
- *  escaping headroom plus the options object. Checked against
- *  `Content-Length` before the body is read, like `/screenshots`. */
-export const BUNDLE_MAX_REQUEST_BYTES = 2 * BUNDLE_MAX_BYTES + 64 * 1024;
+export { BUNDLE_MAX_REQUEST_BYTES } from "../shared/bundle.ts";
 
 /** Most ids one export request may name. */
 const SELECTION_MAX_IDS = 1000;
@@ -115,12 +111,13 @@ function stringRecord(
   if (!isPlainObject(raw)) return { ok: false, error: `${what} must be an object of strings` };
   const entries = Object.entries(raw);
   if (entries.length > OPTION_MAP_MAX_ENTRIES) return { ok: false, error: `${what} has too many entries` };
-  const value: Record<string, string> = {};
-  for (const [k, v] of entries) {
+  for (const [, v] of entries) {
     if (typeof v !== "string") return { ok: false, error: `${what} must be an object of strings` };
-    value[k] = v;
   }
-  return { ok: true, value };
+  // `fromEntries` defines own properties, so a key such as "__proto__" (an
+  // Agent key or harness id a file may carry) survives — an assignment would
+  // hit the prototype setter and silently drop it.
+  return { ok: true, value: Object.fromEntries(entries) as Record<string, string> };
 }
 
 /** Validate the `options` object of a preview/import request. */
@@ -167,8 +164,7 @@ export function exportBundleFor(
   if (!built.ok) return built;
   return {
     ok: true,
-    bundle: built.bundle,
-    text: serializeBundle(built.bundle),
+    text: built.text,
     filename: built.filename,
     warnings: built.warnings,
     counts: { agents: built.bundle.agents.length, pipelines: built.bundle.pipelines.length },
@@ -178,21 +174,32 @@ export function exportBundleFor(
 /** Where Save to Downloads writes: `AGETOR_DOWNLOADS_DIR` (test seam, wins
  *  whenever set) else `~/Downloads`. */
 export function bundleDownloadsDir(): string {
-  const seam = process.env.AGETOR_DOWNLOADS_DIR?.trim();
-  return seam ? seam : path.join(homedir(), "Downloads");
+  // Never trimmed, like every other path here (a folder name may end in a
+  // space); only a blank value reads as unset.
+  const seam = process.env.AGETOR_DOWNLOADS_DIR;
+  return seam && seam.trim() ? seam : path.join(homedir(), "Downloads");
 }
 
 /**
  * Write `text` into `dir` as `filename`, never overwriting: the file is
  * created exclusively and, when the name is taken, numbered
- * `name (2).agetor.json`, `name (3)…` up to 999. Creates `dir` when missing.
- * `filename` must be a bare name this side derived.
+ * `name (2).agetor.json`, `name (3)…` up to 999 (a symlink at the name counts
+ * as taken — exclusive creation never follows it). Creates `dir` when
+ * missing only with `createDir` (Downloads); a picked folder must exist, so a
+ * mangled pick can never create a stray directory. `filename` must be a bare
+ * name this side derived.
  */
-export function writeBundleFile(dir: string, filename: string, text: string): { path: string; filename: string } {
+export function writeBundleFile(
+  dir: string,
+  filename: string,
+  text: string,
+  opts: { createDir?: boolean } = {},
+): { path: string; filename: string } {
   if (path.basename(filename) !== filename || filename === "." || filename === "..") {
     throw new Error("invalid export file name");
   }
-  mkdirSync(dir, { recursive: true });
+  if (opts.createDir) mkdirSync(dir, { recursive: true });
+  else if (!isDirectory(dir)) throw new Error(`${dir} is not a folder`);
   for (let n = 1; n <= MAX_FILE_NUMBER; n++) {
     const name = numberedFileName(filename, n);
     const target = path.join(dir, name);
@@ -205,6 +212,30 @@ export function writeBundleFile(dir: string, filename: string, text: string): { 
     }
   }
   throw new Error(`${dir} already has ${MAX_FILE_NUMBER} files named like ${filename}`);
+}
+
+/**
+ * The message for an export that couldn't be written. A permission error
+ * (EPERM/EACCES) is almost always macOS privacy: Agetor isn't allowed into
+ * Downloads (or the picked folder) — so say where to allow it and what
+ * works without it, instead of a bare errno.
+ */
+export function bundleSaveErrorMessage(err: unknown, target: "downloads" | "folder", dir: string): string {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  if (code === "EPERM" || code === "EACCES") {
+    const where = target === "downloads" ? "your Downloads folder" : dir;
+    const settings =
+      target === "downloads"
+        ? "System Settings → Privacy & Security → Files and Folders"
+        : "System Settings → Privacy & Security";
+    return `couldn't save the export: macOS didn't allow Agetor to write to ${where} — allow it in ${settings}, or use Copy JSON${target === "downloads" ? " or Choose folder" : ""} instead`;
+  }
+  // Creating Downloads (or AGETOR_DOWNLOADS_DIR) when a file, or a dangling
+  // symlink, sits at its path or above it: `writeBundleFile` numbers past a
+  // taken file name itself, so these only come from the folder.
+  if (code === "EEXIST") return `couldn't save the export: ${dir} exists but isn't a folder`;
+  if (code === "ENOTDIR") return `couldn't save the export: part of ${dir} isn't a folder`;
+  return `couldn't save the export: ${err instanceof Error ? err.message : String(err)}`;
 }
 
 /** The test seam directory shared with `/refs/pick` (`e2e/fixtures.ts`). */
@@ -310,13 +341,19 @@ function probeHarness(h: Harness): Promise<HarnessProbe> {
 }
 
 /** Model ids known for a harness (K14): its discovered catalog plus the
- *  curated rows; `catalogOnly` rows count only while discovery is empty. */
-function knownModelsFor(h: Harness): string[] {
+ *  curated rows; `catalogOnly` rows count only while discovery is empty.
+ *  A logged-out harness (`loggedIn === false`) distrusts its catalog, as
+ *  `mergeModelOptions`' rule 7 does for the pickers — an expired login's
+ *  passive discovery reads back a catalog the account can't run — and
+ *  knows exactly what its pickers would offer: the non-gated curated rows. */
+function knownModelsFor(h: Harness, loggedIn: boolean | null): string[] {
+  const curated = AGENT_OPTIONS[h.kind]?.models ?? [];
+  if (loggedIn === false) return curated.filter((m) => !m.catalogOnly).map((m) => m.id);
   // Same per-harness/per-kind split as `model-discovery.ts`'s
   // `modelsForHarness`: only fx and codex catalogs vary per harness.
   const discovered = h.kind === "fx" || h.kind === "codex" ? getHarnessDiscoveredModels(h.id) : getDiscoveredModels(h.kind);
   const known = new Set(discovered.map((m) => m.id));
-  for (const m of AGENT_OPTIONS[h.kind]?.models ?? []) {
+  for (const m of curated) {
     if (!m.catalogOnly || discovered.length === 0) known.add(m.id);
   }
   return [...known];
@@ -361,7 +398,7 @@ function localStateFrom(probes: ProbeMap): BundleLocalState {
   const knownModels: Record<string, string[] | null> = {};
   const knownSkills: Record<string, string[] | null> = {};
   for (const h of rows) {
-    knownModels[h.id] = knownModelsFor(h);
+    knownModels[h.id] = knownModelsFor(h, probes.get(h.id)?.status?.loggedIn ?? null);
     knownSkills[h.id] = probes.get(h.id)?.skills ?? null;
   }
   return {
@@ -403,6 +440,12 @@ class BundleImportBlocked extends Error {
   }
 }
 
+class BundleImportChanged extends Error {
+  constructor(readonly plan: BundleImportPlan) {
+    super("the import changed since the preview — review the new preview and import again");
+  }
+}
+
 /** Swap a bundle graph's Agent keys for the ids the import just created. */
 function graphWithIds(graph: PipelineGraph, idByKey: Map<string, string>): PipelineGraph {
   return {
@@ -426,11 +469,16 @@ function graphWithIds(graph: PipelineGraph, idByKey: Map<string, string>): Pipel
  * rows are re-read, the plan is rebuilt, and — only if nothing is blocking —
  * harnesses are enabled, Agents inserted, graphs rewritten to the new ids and
  * Pipelines inserted. Any throw rolls everything back. A name clash that
- * slipped past the plan surfaces as a 409 with a fresh plan.
+ * slipped past the plan surfaces as a 409 with a fresh plan, and so does a
+ * re-plan whose fingerprint differs from `expectedFingerprint` (the one the
+ * client previewed and the user confirmed) — this machine changed in
+ * between, so the import would create something other than what was shown.
+ * Without `expectedFingerprint` (an older client) the re-plan is trusted.
  */
 export async function commitBundleImport(
   text: string,
   options: BundleImportOptions,
+  expectedFingerprint?: string,
 ): Promise<{ ok: true; result: BundleImportResponse } | BundleImportError> {
   const parsed = parseBundleText(text);
   if (!parsed.ok) return { ok: false, status: 400, error: parsed.error, code: parsed.code };
@@ -439,6 +487,9 @@ export async function commitBundleImport(
   const run = db.transaction((): BundleImportResponse => {
     const plan = planBundleImport(parsed.bundle, localStateFrom(probes), options);
     if (!plan.canImport) throw new BundleImportBlocked(plan);
+    if (expectedFingerprint !== undefined && plan.fingerprint !== expectedFingerprint) {
+      throw new BundleImportChanged(plan);
+    }
 
     const enabledHarnesses: string[] = [];
     for (const h of plan.harnesses) {
@@ -484,7 +535,7 @@ export async function commitBundleImport(
   try {
     result = run();
   } catch (err) {
-    if (err instanceof BundleImportBlocked) {
+    if (err instanceof BundleImportBlocked || err instanceof BundleImportChanged) {
       return { ok: false, status: 409, error: err.message, plan: err.plan };
     }
     if (err instanceof AgentProfileNameError || err instanceof PipelineNameError) {

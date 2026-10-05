@@ -130,11 +130,13 @@ test("export/import: top-level blocks plus profile and pipeline shortcut blocks"
   );
   expect(USAGE["export"]).toContain("'--agent' is an alias");
   expect(USAGE["import"]!.split("\n", 1)[0]).toBe(
-    "usage: agetor import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <n>] [--enable-harnesses]",
+    "usage: agetor import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <n>] [--enable-harnesses] [--yes]",
   );
   expect(helpFor("profile", "export")).toBe(USAGE["profile export"]);
   expect(helpFor("profiles", "import")).toBe(USAGE["profile import"]);
   expect(usageError("profile export").message).toBe("usage: agetor profile export <ref> [--out <file|->] [--force]");
   expect(USAGE["pipeline import"]!.split("\n", 1)[0]).toContain("--harness-map");
+  expect(USAGE["pipeline import"]!.split("\n", 1)[0]).toContain("[--yes]");
+  expect(USAGE["profile import"]!.split("\n", 1)[0]).toContain("[--yes]");
   expect(USAGE["pipeline export"]).toContain("agetor bundle");
 });

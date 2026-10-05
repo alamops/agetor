@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { BundleSelection } from "../../../shared/bundle.ts";
+import { pruneSelection } from "@/lib/bundle";
 import { ExportBundleDialog } from "./ExportBundleDialog";
 import { ImportBundleDialog } from "./ImportBundleDialog";
 import { useBundleFileDrop } from "./useBundleFileDrop";
@@ -17,11 +18,15 @@ export function useBundleList({
   ids,
   kind,
   onImported,
+  guardsNavigation = false,
 }: {
   /** The list's row ids, in display order. */
   ids: string[];
   kind: "agent" | "pipeline";
   onImported?: (result: { enabledHarnesses: string[] }) => void;
+  /** Set when the list unmounts with an app-level navigation (the Pipelines
+   *  page): an edited import then asks before `navigate` drops it. */
+  guardsNavigation?: boolean;
 }) {
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
   const [exportSelection, setExportSelection] = useState<BundleSelection | null>(null);
@@ -30,12 +35,7 @@ export function useBundleList({
   // A selected row that leaves the list (deleted elsewhere) leaves the selection.
   const idsKey = ids.join("\u0000");
   useEffect(() => {
-    setSelected((prev) => {
-      if (prev.size === 0) return prev;
-      const live = new Set(ids);
-      const kept = [...prev].filter((id) => live.has(id));
-      return kept.length === prev.size ? prev : new Set(kept);
-    });
+    setSelected((prev) => pruneSelection(prev, ids));
     // Keyed on `idsKey` (the content of `ids`), not the array's identity.
   }, [idsKey]);
 
@@ -85,6 +85,7 @@ export function useBundleList({
         initialText={importState.text}
         onClose={() => setImportState({ open: false, text: null })}
         onImported={onImported}
+        guardsNavigation={guardsNavigation}
       />
     </>
   );

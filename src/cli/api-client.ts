@@ -426,18 +426,64 @@ export class AgetorClient {
   /** `POST /bundle/export` — the canonical bundle text for a selection (ids,
    *  or `all`). 400 on an empty selection or an unknown id. */
   exportBundle(selection: { agentIds?: string[]; pipelineIds?: string[]; all?: boolean }): Promise<BundleExportResponse> {
-    return this.req("POST", "/bundle/export", selection);
+    return this.bundleReq("/bundle/export", selection, undefined, "the core's answer to the export was lost — try again");
   }
   /** `POST /bundle/import/preview` — dry run: what an import would create,
    *  rename and bind. 400 `{ error, code }` for a file that doesn't parse.
    *  Probes harness status, hence the longer budget. */
   previewBundleImport(text: string, options: BundleImportOptions = {}): Promise<BundleImportPlan> {
-    return this.req("POST", "/bundle/import/preview", { text, options }, START_TIMEOUT_MS);
+    return this.bundleReq(
+      "/bundle/import/preview",
+      { text, options },
+      START_TIMEOUT_MS,
+      "the core's answer to the preview was lost — try again",
+    );
   }
   /** `POST /bundle/import` — all or nothing. 400 as preview; 409 `{ error,
-   *  plan }` (thrown `ApiError` with that body) when the plan is blocked. */
-  importBundle(text: string, options: BundleImportOptions = {}): Promise<BundleImportResponse> {
-    return this.req("POST", "/bundle/import", { text, options }, START_TIMEOUT_MS);
+   *  plan }` (thrown `ApiError` with that body) when the plan is blocked, or
+   *  when `planFingerprint` (a previewed plan's) no longer matches. */
+  importBundle(
+    text: string,
+    options: BundleImportOptions = {},
+    planFingerprint?: string,
+  ): Promise<BundleImportResponse> {
+    const body = planFingerprint === undefined ? { text, options } : { text, options, planFingerprint };
+    return this.bundleReq(
+      "/bundle/import",
+      body,
+      START_TIMEOUT_MS,
+      "the core's answer to the import was lost, so the import may have run — check `agetor profile ls` and `agetor pipeline ls` before importing again",
+      true,
+    );
+  }
+
+  /** A `/bundle/*` POST whose 2xx must be a JSON object. `req` hands back an
+   *  unparsable body as its raw string (and a body cut off mid-read throws a
+   *  bare TypeError), which the printers would trip over — after an import
+   *  that may well have committed. Either case throws `lost` instead.
+   *  `transportLost` (the import) also maps a request that got no answer at
+   *  all — a timeout or a dropped socket, `ApiError(0)` from `req` — to
+   *  `lost`, keeping `req`'s own text as the cause: the request may have
+   *  reached the core, and a rerun would create "(imported)" duplicates. */
+  private async bundleReq<T>(
+    path: string,
+    body: unknown,
+    timeoutMs: number | undefined,
+    lost: string,
+    transportLost = false,
+  ): Promise<T> {
+    let parsed: unknown;
+    try {
+      parsed = await this.req<unknown>("POST", path, body, timeoutMs);
+    } catch (e) {
+      if (e instanceof ApiError) {
+        if (transportLost && e.status === 0) throw new ApiError(0, null, `${lost} (${e.message})`);
+        throw e;
+      }
+      throw new ApiError(0, null, lost);
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new ApiError(0, null, lost);
+    return parsed as T;
   }
 
   /** `GET /tasks/:id/pipeline` — `id` is a pipeline (parent) task's id; 404

@@ -164,13 +164,16 @@ at `agents[].key`, are unique within the file, and are never stored. The exporte
 Agent name (`[a-z0-9-]`, ≤64 chars), falling back to `agent-<n>` and suffixing `-2`, `-3` on a clash. The
 parser maps `agent` → `agentProfileId` and `subagents.agents` → `subagents.profileIds` on the raw object, then
 runs the existing `validatePipelineGraph`, then checks every referenced key exists. Rejected: reusing the
-internal field name `agentProfileId` in the public file (reads as a DB id).
+internal field name `agentProfileId` in the public file (reads as a DB id). A file that carries the internal names anyway (a non-null
+`agentProfileId`, a non-empty `subagents.profileIds`) is refused, not silently dropped. The same holds for what the
+validator would coerce: a non-string step `instructions` or edge `label` (read as `""`) and a second edge between
+the same two steps (collapsed into the first) are refused in bundle and legacy files alike.
 
 ### K4. HTTP contract (all routes `authed`, in `src/bun/server.ts`) [reasoning]
 
 | Route | Body | Success | Errors |
 | --- | --- | --- | --- |
-| `POST /bundle/export` | `{ agentIds?: string[], pipelineIds?: string[], all?: boolean }` | 200 `{ bundle, text, filename, warnings: string[], counts: { agents, pipelines } }` | 400 bad body, empty selection, unknown id (named) |
+| `POST /bundle/export` | `{ agentIds?: string[], pipelineIds?: string[], all?: boolean }` | 200 `{ text, filename, warnings: string[], counts: { agents, pipelines } }` | 400 bad body, empty selection, unknown id (named), or an export import would refuse (K11b) |
 | `POST /bundle/export/save` | selection + `{ target: "downloads" \| "folder" }` | 200 `{ path, filename, revealed: boolean, warnings, counts }` or `{ cancelled: true }` | 400 as above; 501 for `folder` with no native bridge and no seam; 500 `{ error }` on a write failure |
 | `POST /bundle/pick-file` | `{}` | 200 `{ text, filename }` or `{ cancelled: true }` | 400 file over 2 MB or unreadable; 501 headless without the seam |
 | `POST /bundle/import/preview` | `{ text: string, options?: BundleImportOptions }` | 200 `BundleImportPlan` | 400 `{ error, code }` (too large, invalid JSON, unrecognized, unsupported version, invalid) |
@@ -182,8 +185,16 @@ internal field name `agentProfileId` in the public file (reads as a DB id).
   or a folder the native panel returned; Choose file reads only what the native panel returned.
 - `pick-file` and `export/save` with `target: "folder"` hold the request while a native panel is open, so both
   call `server.timeout(req, 0)`.
-- Request bodies over `2 × BUNDLE_MAX_BYTES + 64 KB` are refused by `Content-Length` before reading, mirroring
-  `/screenshots`.
+- Request bodies over `2 × BUNDLE_MAX_BYTES + 64 KB` (`BUNDLE_MAX_REQUEST_BYTES`, in `src/shared/bundle.ts` so
+  the webview checks a request against it too) are refused by `Content-Length` before parsing, mirroring
+  `/screenshots`, and a chunked one as soon as the capped read passes it. Either way the server then reads and
+  throws away the rest of the upload (up to 64 MB) instead of leaving it on the socket: Bun's fetch reuses a
+  keep-alive socket and wedged its next request behind an unread upload, and a `Connection: close` response
+  header did not help (spike-verified on Bun 1.3.10) [round-9 code-review fix]. The 413 says the *request* is
+  too large — text full of control characters grows up to 6x as JSON — not that the file passed 2 MB. The
+  webview measures a text against the request cap less 64 KB (`BUNDLE_OPTIONS_HEADROOM_BYTES`), so a text that
+  only just fits with empty options can't preview and then fail once the user edits names or harnesses
+  [round-13 code-review fix].
 
 ### K5. Harness resolution, per Agent [owner D3, D9, D10, C3, C11]
 
@@ -194,6 +205,7 @@ Evaluated in this order by the pure planner:
 | `options.agentHarness[key]` or `options.harnessMap[file.harness.id]` names a local harness; file kind is known | bind it (`mapped`) if it has the same kind; a different kind is a blocking issue `harness-kind-mismatch` |
 | same, but the file kind is unknown to this build | bind it (`rebound`); `model` → `DEFAULT_MODEL[kind]`, `effort`/`mode` → `null`, `fast`/`maxMode` → `false`; warning says the settings were reset |
 | override names a harness that isn't local | blocking `unknown-local-harness` |
+| file kind unknown and the override names a local harness whose own kind this build doesn't know either (a row of a retired kind the `harnesses.kind` CHECK still admits) | blocking `unsupported-local-harness` — such a harness is never offered as a candidate, since it has no `DEFAULT_MODEL` to reset to |
 | no override; local harness has the file's id **and** kind | bind (`exact`), no warning |
 | no override; kind known; id missing or id present with another kind | bind the built-in of that kind (`fallback`) + warning naming the file harness and the fallback |
 | no override; kind unknown | `unresolved`, blocking `unknown-kind` until mapped |
@@ -204,9 +216,14 @@ or is `"all"` (CLI `--enable-harnesses`). Labels are never used for matching.
 
 ### K6. Names [owner D4, D4a, D8, C9]
 
-- Automatic: a clashing name (case-insensitive, trimmed; against local rows and against earlier items of the
-  same import) becomes `Name (imported)`, then `Name (imported 2)`, …, truncated so the whole name fits the
-  80-char limit. Non-clashing names are untouched.
+- Automatic: a clashing name (case-insensitive, trimmed, NFC-normalized, without default-ignorable
+  characters and with every run of whitespace — Braille blank U+2800 included — folded to one space
+  [round-7 code-review fix]; computed on top of the stored `name_key` — trimmed and lower-cased first, then
+  NFC, then lower-cased again — because lower-casing and NFC don't commute, and a key that normalized
+  first let `J` + U+030C preview as free beside a local `j` + U+030C that the database's `name_key` treats
+  as the same name, so every commit 409ed [round-13 code-review fix]; against local rows and against earlier items of the same import) becomes `Name (imported)`, then `Name (imported 2)`, …, truncated so the whole name fits the
+  80-char limit — a joiner or selector the cut strands (a ZWJ whose emoji was cut off) is dropped too, so the
+  name still imports [round-9 code-review fix]. Non-clashing names are untouched.
 - Explicit: a name the user typed in the preview, or CLI `--name`, must be free. A clash is a blocking
   `name-in-use` issue on that row rather than a silent suffix. **Owner-confirmed (A1, §8).**
 - `options.singleName` (CLI `--name`) renames the file's only Pipeline, or — when the file has no Pipelines —
@@ -218,11 +235,29 @@ or is `"all"` (CLI `--enable-harnesses`). Labels are never used for matching.
   `~/Downloads` (created if missing), then calls `native.revealPath`. Headless: the write still succeeds and the
   response carries `revealed: false`; the app toast then shows the full path instead of "Revealed in Finder".
 - **Choose folder**: native Open panel in folder mode; with `AGETOR_FAKE_PICK_REFS_DIR` set the seam directory
-  is used (same seam `/refs/pick` uses). Headless without the seam → 501.
+  is used (same seam `/refs/pick` uses). Headless without the seam → 501. The picked folder must exist — it
+  is never created — and the pick is re-joined on "," (`singlePickedPath`), because Electrobun's
+  `openFileDialog` splits its answer on commas, so a `Backups, 2026` folder came back as `Backups` and was
+  created [round-8 code-review fix; `/bundle/pick-file` re-joins the same way]. The answer is never trimmed,
+  since a folder name may end in a space, and a relative answer reads as a cancelled pick [round-9
+  code-review fix]. The helper lives in `src/bun/native-pick.ts`; `/projects/pick` uses it too, and
+  `/refs/pick` (multi-selection) uses its sibling `pickedPaths`, which joins a non-absolute piece onto the
+  path before it (and re-joins an absolute piece when only the joined path exists) — `/projects/pick` used to
+  keep only the first piece, and `/refs/pick` dropped a comma path's pieces altogether [round-10 code-review
+  fix: wording, and the sibling-name re-join]; a path through several folders whose names end in `,`
+  (`/d/Backups,/2026,/f.json`) is re-joined whole, its run growing only while the next join's parent folder
+  exists [round-25 code-review fix]; when both halves and the join exist, the pieces stay separate picks
+  only while the second sits inside the first's folder (one listing's multi-selection), so
+  `/d/Backups,/Library` beside a sibling `/d/Backups` stays one path [round-26 code-review fix]. The export is built before the panel opens (so a selection that can't export fails
+  first) and again after the pick, so the file holds what the Agents and Pipelines hold at save time.
+- A failed export build offers Retry; a save whose HTTP answer never arrives (a dropped connection, or the
+  webview giving up on a request held open by the native panel) says the file may still have been written,
+  so a second click doesn't silently duplicate it [round-8 code-review fix].
 - **Copy JSON**: `navigator.clipboard.writeText(text)` in the webview, as `App.tsx:1769` already does.
 - Never overwrite: files are created with the exclusive flag (`wx`); on `EEXIST` the name becomes
   `name (2).agetor.json`, `name (3)…` (up to 999).
-- File name: one selected item → `<slug-of-name>.agetor.json`; several → `agetor-export-YYYY-MM-DD.agetor.json`.
+- File name: one selected item → `<slug-of-name>.agetor.json`; several → `agetor-export-YYYY-MM-DD.agetor.json`,
+  the local date (`localDate`), not the UTC one [round-13 code-review fix].
 
 ### K8. App import sources [owner D7 + evidence]
 
@@ -254,7 +289,108 @@ a `format` other than `agetor-bundle` (unless it is a legacy pipeline file, K12)
 duplicate or missing Agent keys; a step referencing an unknown key; `maxSteps` outside 1..200. Control
 characters: C0 and DEL are rejected in identifier-like fields (names, keys, harness id/kind/label, model,
 effort, mode, skills); multi-line text (Agent instructions, Pipeline description, step instructions) allows
-only `\t`, `\n`, `\r`. Unknown keys are ignored.
+only `\t`, `\n`, `\r`. Invisible characters are rejected too, naming the code point, because no preview
+can show them [code-review fix]: the refused set is every `Default_Ignorable_Code_Point` (zero-width
+characters, word joiners and invisible operators, the deprecated format characters U+206A–206F, bidi
+overrides and isolates, the BOM, Hangul fillers, Mongolian and standard variation selectors, the
+musical-symbol and shorthand format controls, and the whole U+E0000–E0FFF block — tag characters can spell
+out an instruction a model reads but a person never sees) plus C1 controls, U+FFF9–FFFB and, single-line
+only, U+2028/2029 — minus a context-bound allowlist [round-6 and round-7 code-review fixes]. Each allowed
+character must sit right after a visible character (so never two in a row) and only where real text needs
+it, which leaves no free position to hide bits in — a run of selectors after one emoji, one selector
+interleaved after every letter (4 bits a letter), or a ZWJ/ZWNJ binary run all used to carry bytes:
+U+FE0E/FE0F only after an emoji (`\p{Extended_Pictographic}`) or a keycap base 0-9/#/* that U+20E3
+follows; the Mongolian
+U+180B–180D/180F only after a Mongolian letter; ZWJ only between an emoji (or its skin-tone modifier or
+U+FE0F) and the emoji it joins; and, in multi-line text only, ZWJ/ZWNJ between two letters or marks of an
+Arabic-family joining script or an Indic script (the Persian half-space, a half-form) and U+034F between a
+letter or mark and a combining mark. The soft hyphen and the bidi marks LRM/RLM/ALM are refused
+everywhere: a model reads the same text without them, and one after any space or letter was a channel. A
+residual channel stays only inside the scripts that need ZWJ/ZWNJ (about one bit per letter pair there).
+U+FE00–FE0D and the supplement U+E0100–E01EF are refused everywhere [round-8 code-review fix]: they were
+allowed after a CJK ideograph, but 240 supplement selectors there carry a byte per ideograph, and a
+variation selector only picks a glyph variant — a model reads the same text without it. So a name like "Reviewer" + U+200B can't import as a look-alike of a local
+"Reviewer" — and neither can "Reviewer" + ZWJ or + U+FE0F — while emoji, ZWJ sequences and keycaps
+still import. The same rule drives the export stripping (K11b, repeated to
+a fixpoint: removing one character can leave its neighbour out of context) and `escapeControlChars`; emoji
+subdivision flags, which need tag characters, ideographic variation sequences and the standardized variation
+sequences of math symbols are the accepted casualties. Independently of the parser, the planner's clash key (K6) is NFC-normalized,
+drops every `Default_Ignorable_Code_Point` and folds whitespace runs to one space, so a lookalike name reads as a
+clash and gets "(imported)". Unknown keys are ignored.
+
+### K11b. Every export imports [code-review fix]
+
+The local write paths are looser than K11 (Agent instructions and Pipeline descriptions are length-checked
+only, so an ANSI escape pasted from a terminal is stored), and K11 stays strict because a bundle is
+third-party content. So `buildBundle` makes the file fit K11 instead. It first runs each selected Pipeline's
+stored graph through `validatePipelineGraph` and exports the normalized result; a graph today's validator
+refuses (a legacy or hand-edited row, an edge with no label, a control character in a step name or edge
+label) refuses the export, naming the Pipeline and pointing at the pipeline editor, instead of crashing
+or exporting a file import refuses [round-12 code-review fix]. Then it removes terminal escape sequences
+whole (CSI such as SGR colors, OSC, and the short `ESC c` / `ESC ( B` forms — a colored name exports as
+"Rev", never "Rev[31m") and then the control and invisible characters K11 refuses, from Agent names, harness
+id and label, model, effort, mode, skills and instructions and from Pipeline names, descriptions and step
+instructions — and the invisible characters (only: a control character there already refused the export
+above) from step names and edge labels; it
+cuts a single-line value over its K11 cap (a harness label over 200, a model over 200, an effort or mode over
+100) without splitting a surrogate pair, a harness label left empty falling back to the harness id and a
+model left empty (one made only of invisible characters) falling back to the harness kind's `DEFAULT_MODEL`
+with an "empty after export cleanup and was set to the harness default" warning [round-16 code-review fix];
+it keeps
+step names valid — one stripping empties becomes `Step N`, and two that stripping makes equal (`Review` and
+`Review` + U+200B) get a ` 2`, ` 3` suffix within the 60-character cap [round-9 code-review fix] — and a
+step's export warnings name it by that exported name [round-10 code-review fix]; a changed name that meets
+an unchanged label on another edge out of a step leading to it takes the suffix too, rather than the label
+being dropped [round-22 code-review fix], as does one that meets the id of another target of such a step,
+since `resolveNextSteps` matches names before ids; "changed" and "unchanged" compare `stepNameKey`s, so a
+label stored as `Yes ` (the editor stores labels untrimmed) that exports trimmed still counts as unchanged
+[round-23 code-review fix]; it drops an edge label that cleaning changed and made equal to
+another outgoing label of the same step (`Yes` and `Yes` + U+200B) or to a sibling target's cleaned, maybe
+renamed, name — labels cleaning left alone are kept first whatever the edge order, so a `next` that matched
+one still reaches the same step [round-22 code-review fix], the edge still routes, and the warning says the
+labels "were removed" [round-11 code-review fix]; and it
+adds one warning per Agent or Pipeline naming the fields ("control or invisible characters were removed from its …; its …
+was cut to fit"). Every warning names an Agent or Pipeline by its cleaned name, the way the file does. It
+refuses an export of more than 500 Agents or 200 Pipelines, and it round-trips the serialized text through
+`parseBundleText`, refusing an export over 2 MB ("export fewer at a time") or one that fails any other rule,
+naming the Agent by its display name rather than its file key. `/bundle/export` and `/bundle/export/save`
+answer such a refusal 400 and write nothing. The agent-profile routes cap `model` (200), `effort` and `mode`
+(100) to match K11 (`AGENT_PROFILE_LIMITS`), so only rows written before those caps ever need cutting, and
+refuse a `model` carrying a control or invisible character (`PIPELINE_CONTROL_CHAR_RE` + `findInvisibleChar`,
+the parser's own single-line check) [round-16 code-review fix].
+
+Round 18 [code-review fix]: lone UTF-16 surrogates are removed with the other characters (a JSON column or
+route keeps `"\ud800"`, and before this a single one in a skill or a step id refused the whole export).
+Step ids, edge ids and Agent references are cleaned before validation (`cleanStoredGraph`): control
+characters, lone surrogates and the invisible characters `checkGraphText` refuses (C1, bidi overrides,
+zero-width and tag characters, the BOM) removed, ids kept unique with a `-2` suffix, edges and `startStepId`
+remapped — ids can't be edited, so refusing the Pipeline would leave no way out; a graph whose ids already
+repeat is left for the validator to refuse. A lone surrogate in a step name, step instructions or an edge
+label becomes U+FFFD rather than being removed: removal could empty a name, and the validator would then
+refuse the whole Pipeline. Every lone surrogate becomes the same U+FFFD, though, so two names (or two
+outgoing labels, or a label and a sibling target's name) can still meet; `keepReplacedTextDistinct` gives a
+replaced name that clashes a ` 2`/` 3` suffix and removes a replaced label that clashes (round 20). Accepted
+residual (round 24): a cleaned step id isn't checked against edge labels, so a hand-edited id `b\u200b` that
+cleans to `b` beside a sibling edge labelled `b` makes `next: "b"` route by id (ids match before labels)
+instead of by label — the editor's ids are `crypto.randomUUID()`s, so only a hand-edited row can reach it. An Agent or Pipeline whose name cleaning empties is numbered
+`Agent N` / `Pipeline N` past any name the file already holds (`bundleNameKey`, the planner's key), so
+import never renames it silently. Two names cleaning makes equal (`Reviewer` and `Reviewer\u200b`) are kept
+apart the same way: unchanged names first, a later clash takes a ` 2`/` 3` suffix, "renamed to keep them
+distinct" in the warning [round-36 code-review fix]. A skipped Agent's step warnings carry its real skip reason. On the write
+side, `validatePipelineGraph` now refuses a control character or lone surrogate in a step/edge id or an
+Agent reference (and a lone surrogate in step names, instructions and edge labels), `checkGraphText`
+refuses an invisible character in a step id, an edge id or an Agent reference — a legacy file's unmatched reference is stored as it
+was, and `agetor pipeline show` prints it (escaped now as well, along with step ids, names, edge labels and
+descriptions, the last split on a bare CR too; `pipeline status`, `show` and `ls` escape block messages,
+which can quote an agent's handoff) — and the agent-profile and pipeline routes
+refuse a lone surrogate in every text field. Round 20: the agent-profile routes also refuse a C0 control
+character in `name`/`effort`/`mode` (a pipeline name already was); task titles (a step task's is
+`<pipeline> · <step>`), a bound profile's name/model/mode, `agetor add`'s pickers, `agetor logs`' parent
+hint, the TUI's status line and toasts, and the CLI's central error printer are escaped too, since older
+rows can still hold an ESC. The validator tightening is retroactive for runs: `startPipelineRun`
+re-validates the stored graph (and a restart's frozen snapshot), so a pipeline stored earlier with a lone
+surrogate in a step name, instructions or label refuses to start until that text is edited — accepted, since
+the same text would make the run's step prompts and `next` matching unreliable anyway.
 
 ### K12. Legacy pipeline files [owner C8]
 
@@ -268,13 +404,27 @@ used; else the id stays dangling with a warning. The preview and the CLI label i
 `commitBundleImport` gathers async state (harness status, catalogs), then inside one `db.transaction`:
 re-reads names and harness rows, re-runs the planner, throws if anything is blocking, enables the chosen
 harnesses, inserts Agents (collecting key → new id), rewrites each graph's keys to ids, inserts Pipelines.
-Any throw rolls everything back; a name race surfaces as 409. After commit it fires
+Any throw rolls everything back; a name race surfaces as 409. Every plan carries a `fingerprint` of what it
+would create (final names, harness bindings and launch fields, step bindings — for a legacy file with each
+reference's kept/remapped/dangling outcome, since a deleted Agent leaves the stored id unchanged [round-26
+code-review fix] — and which of its harnesses the user asked to enable —
+not their current state, so a harness enabled or disabled elsewhere meanwhile is not drift); a client
+sends the previewed one as `planFingerprint`, and a re-plan with a different fingerprint is refused 409 with
+the new plan ("the import changed since the preview") — so what gets created is always what was confirmed
+[code-review fix]. Without `planFingerprint` (an older client, or a scripted CLI import that never previewed)
+the re-plan is trusted. In the app, a 409 that carries the new plan replaces the preview with it as a
+"Nothing was imported — review the updated plan" notice (not an import error, so the live region announces the
+new plan's state), relabels Confirm "Import updated plan" and holds it disabled for 800 ms; Confirm also ignores
+the second click of a double-click, so the click that drew the 409 can't import the changed plan unseen
+[round-10 code-review fix]. After commit it fires
 `refreshHarnessModels(id)` for each newly enabled harness, as the PATCH route does.
 
 ### K14. Model and skill warnings — warn, never block [owner D14 + reasoning]
 
 - Model: known ids for the target harness = its discovered catalog ∪ the curated `AGENT_OPTIONS[kind].models`
   rows that are not `catalogOnly`; when the discovered catalog is empty the `catalogOnly` rows count too.
+  A logged-out harness (`loggedIn === false`) distrusts its catalog the way `mergeModelOptions` (rule 7)
+  does and knows only its non-gated curated rows — what its pickers offer [round-13 code-review fix].
   A model outside that set gets a warning. Rebound Agents are skipped (their model was reset).
 - Skills: user-level skills from `listAgentCapabilities` with no workdir, only for kinds whose discovery
   implements skills (read `src/bun/commands.ts`; today claude-code and codex). Discovery failure → no warning.
@@ -283,7 +433,7 @@ Any throw rolls everything back; a name race surfaces as 409. After commit it fi
 
 ```
 agetor export [--profile <ref>]… [--pipeline <ref>]… [--all] [--out <file|->] [--force]
-agetor import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <n>] [--enable-harnesses]
+agetor import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <n>] [--enable-harnesses] [--yes]
 agetor profile  export <ref> [--out <file|->] [--force]      agetor profile  import <file|-> [same flags]
 agetor pipeline export <ref> [--out <file|->] [--force]      agetor pipeline import <file|-> [same flags]
 ```
@@ -291,12 +441,33 @@ agetor pipeline export <ref> [--out <file|->] [--force]      agetor pipeline imp
 - `--profile` is the documented selector flag and `--agent` is accepted as an alias.
   **Owner-confirmed (A3, §8)** (D12 wrote `--agent`, but in the CLI `--agent` means the harness).
 - Refs resolve client-side with `matchAgentProfileRef` / `matchPipelineRef`; the server receives ids.
-- `export` without `--out` prints to stdout; an existing `--out` file is refused before any network call
-  unless `--force`. `--all` excludes `--profile`/`--pipeline`; no selector at all is a usage error.
-- `import` sends the text to `POST /bundle/import` (or `/preview` with `--dry-run`). Blocking issues print one
-  line each plus the `--harness-map` hint and exit 1. Warnings print in yellow; `--json` prints the raw plan or
+- `export` without `--out` prints the bundle file to stdout (with `--json`: `{filename, counts, warnings,
+  bundle}` [round-8 code-review fix]); an existing `--out` file is refused before any network call
+  unless `--force`, and the file is then created exclusively (`wx`), so one that appears meanwhile is still
+  never overwritten. An `--out` naming a folder (or inside a missing one) fails with a plain message, not a
+  raw `EISDIR`/`ENOENT` [round-8 code-review fix]. A 409 whose plan lists no blocking issue (a name taken between plan and commit) prints
+  the core's own message. `--all` excludes `--profile`/`--pipeline`; no selector at all is a usage error.
+- `import` sends the text to `POST /bundle/import` (or `/preview` with `--dry-run`). In a terminal (stdin and
+  stdout TTYs, a file rather than `-`, no `--json`, no `--yes`) it previews first, prints the plan and asks
+  (default No), then commits with the previewed `planFingerprint` [code-review fix]; Ctrl+C at that
+  question imports nothing and exits 130, a No exits 0 [round-8 code-review fix]. @clack/prompts reports Esc
+  and Ctrl+C alike as a cancel, so the prompt watches the raw input for the Ctrl+C byte: Esc is a No (exit 0)
+  [round-9 code-review fix, verified in a pty]. `import -` reads stdin with the same 2 MB cap as a file,
+  stopping at the cap; so does a path that isn't a regular file (`/dev/stdin`, `/dev/fd/N`, a FIFO), whose
+  size says nothing about what it delivers. A folder, a missing file and an unreadable one fail with a plain
+  sentence, never a raw `EISDIR`/`EACCES`; an empty or blank value for any value flag (`--out ""`,
+  `--name ""`) is "needs a value", not stdout or an ignored rename [round-13 code-review fix]. Tabs in printed instructions expand to 4-column stops instead of printing as `\u0009`. `profile import` and
+  `pipeline import` share this path, so they ask too. The printed plan starts
+  with the app's third-party note and shows each Agent's skills and instructions and each Pipeline's
+  description and step instructions (40 lines per block). Blocking issues print one
+  line each plus the `--harness-map` hint (per blocked file harness, listing only the Agent's bindable candidates;
+  the file's id shell-quoted, since it is third-party text in a pasteable command) and exit 1. `--harness-map`
+  splits on the last `=` — a local id never contains one, a file id may [round-29 code-review fix]; a key no
+  Agent in the file uses fails before any request, listing the ids the file does use [round-36 code-review fix]. Warnings print in yellow; `--json` prints the raw plan or
   result. Unknown flags throw (these commands write data).
 - A 404 from a `/bundle/*` route prints "the running agetor core is older than this CLI — restart or update it".
+- `profile`/`pipeline` `export|import` are dispatched before the CLI connects to (or starts) the core, so a
+  refused `--out` or an unreadable file fails first, as for the top-level commands [code-review fix].
 - `withProfileHints` and the CLI-side `parsePipelineFile` / `resolveImportProfiles` are removed; the legacy
   read path lives in the shared module.
 
@@ -389,6 +560,8 @@ Test ids (kebab-case): `bundle-import-open`, `bundle-export-all`, `bundle-export
 (`data-agent-key`), `bundle-import-agent-name`, `bundle-import-agent-harness`, `bundle-import-agent-instructions`,
 `bundle-import-harness-row` (`data-harness-id`), `bundle-import-harness-enable`, `bundle-import-pipeline-row`,
 `bundle-import-pipeline-name`, `bundle-import-warning`, `bundle-import-blocking`, `bundle-import-confirm`.
+Added by the review fixes: `bundle-import-back`, `bundle-import-close`, `bundle-import-retry`,
+`bundle-import-status` (live region), `bundle-import-paste-error`; `bundle-export-close`, `bundle-export-status`.
 The Pipelines page root gains `data-testid="pipelines-page"`.
 
 ## 4. Work breakdown — implementation tasks
@@ -483,6 +656,35 @@ matches Agents by NAME only" to describe the bundle behavior and records a workd
   app; skill discovery is wrapped fail-open. If preview latency is noticeable, cache the gathered state for a
   few seconds inside `src/bun/bundle.ts` — no contract change.
 - **WKWebView connection budget.** The import dialog keeps one request in flight and adds no SSE channel.
+  The in-flight preview is aborted (`AbortController`) whenever its epoch ends — the dialog opens or closes,
+  new text loads, or it unmounts — so the next preview runs at once instead of waiting behind an answer that
+  would be dropped [round-13 code-review fix]. A 409 whose plan is unchanged (same fingerprint, still
+  importable) shows the core's own reason as an import error rather than "the plan changed".
+- **A lost import answer.** An import whose answer never arrives may have committed, so the dialog
+  re-previews the same options and judges by that plan (`lostImportLanded`): the confirmed fingerprint AND
+  still importable → it didn't run; a different fingerprint, or a plan that can no longer import → it most
+  likely ran. `planFingerprint` hashes names, not `canImport`, and a typed name is never suffixed (A1), so a
+  landed import of a typed name re-plans to the same fingerprint but blocked `name-in-use` — reading the
+  fingerprint alone called that "safe to import again" [round-29 code-review fix]. Until the verdict lands
+  the preview stays locked and Confirm disabled (an option edit would replace that re-preview); a failed
+  re-preview unlocks it so Retry works, and an edit then leaves a sticky "may have run — check" warning
+  instead of no verdict at all. The lost-answer box uses the warning tone and its live-region text says
+  "Import may have run / most likely ran / didn't run", never "Import failed"; it also re-runs
+  `onImported` with the harnesses the plan would enable [round-29 code-review fix]. A "most likely ran"
+  verdict is sticky across option edits like the unsettled one (renaming past a taken name used to clear it
+  and re-enable Confirm silently); a failed verdict preview is announced ("Preview failed: … Whether the
+  import ran is still unknown") instead of the stale "checking" line; the box shows the same lead-in as the
+  live region and the messages carry only the detail, so it never reads "may have run … may have run";
+  leaving the dialog while the verdict is pending shows the "Import didn't finish" toast; and `shellWord`
+  quotes a leading `=` (zsh's `=cmd` expansion broke a `--harness-map` hint) [round-30 code-review fix].
+- **An import the core refused.** An HTTP error answer from `POST /bundle/import` (a 500, a 400, a 409
+  without a plan) is the core's own refusal — its one transaction wrote nothing — so, unlike a lost answer,
+  the dialog keeps the shown plan current: no re-preview, Confirm stays usable, and the danger-toned box reads
+  "Nothing was imported: <reason>" (`importRefusalText` replaces the route's lowercase `import failed —
+  nothing was imported:` prefix), which the live region announces as-is, followed by "Current plan: …",
+  without adding an "Import failed:" lead-in of its own. The lists are still refreshed, as after every
+  import failure. When `/health` is down too (`ApiUnreachableError`) the plan likewise stays current, with
+  one "most likely didn't run" error [round-34 code-review fix].
 - **Native-panel routes hold a request open.** They opt out of the idle timeout; the app disables the button
   while pending.
 - **Drag in the packaged app.** K8 rests on the existing drop ladder reading dropped file bytes; the e2e drop
