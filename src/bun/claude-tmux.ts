@@ -24,7 +24,7 @@ import {
   type AskQuestion,
   type TmuxPromptChoice,
 } from "./interactions.ts";
-import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer, tmuxClientEnv } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
 import { detectAskModal, isLossyAskPane, parseModalPane, type AskModalKind, type DriveStep, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
@@ -1471,6 +1471,7 @@ async function tmux(args: string[], opts: { stdinText?: string } = {}): Promise<
         : "ignore",
       stdout: "pipe",
       stderr: "pipe",
+      env: tmuxClientEnv(),
     });
     const [stdout, stderr] = await Promise.all([
       new Response(proc.stdout).text(),
