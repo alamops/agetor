@@ -234,3 +234,80 @@ test("agetor show <task>: prints the frozen 'profile:' line with a '(deleted)' s
   // the line is `profile: …`, not the pre-rename `agent profile: …`.
   expect(rendered).not.toContain("agent profile:");
 });
+
+// ---- profile duplicate ----
+let dupSourceId = "";
+const DUP_NAME = "Dup Source";
+
+test("duplicate: by name prints 'duplicated profile' + '(copy)', second prints '(copy 2)'", async () => {
+  reset();
+  await cmdAgentProfile(
+    ["add", DUP_NAME, "--harness", "claude-code", "--model", CURATED_CLAUDE_MODEL],
+    flags({ json: true }),
+  );
+  dupSourceId = (jsonOutputs[0] as AgentProfile).id;
+
+  reset();
+  await cmdAgentProfile(["duplicate", DUP_NAME], flags());
+  expect(outputs.join("\n")).toContain("duplicated profile");
+  expect(outputs.join("\n")).toContain(`${DUP_NAME} (copy)`);
+
+  reset();
+  await cmdAgentProfile(["duplicate", DUP_NAME], flags());
+  expect(outputs.join("\n")).toContain("duplicated profile");
+  expect(outputs.join("\n")).toContain(`${DUP_NAME} (copy 2)`);
+});
+
+test("duplicate: --name of an existing profile fails and creates nothing", async () => {
+  reset();
+  await cmdAgentProfile(["ls"], flags({ json: true }));
+  const before = (jsonOutputs[0] as AgentProfile[]).length;
+  await expect(
+    cmdAgentProfile(["duplicate", DUP_NAME, "--name", DUP_NAME.toUpperCase()], flags()),
+  ).rejects.toThrow();
+  reset();
+  await cmdAgentProfile(["ls"], flags({ json: true }));
+  expect((jsonOutputs[0] as AgentProfile[]).length).toBe(before);
+});
+
+test("duplicate: --json result has profile.name, copiedTasks, taskCopyErrors", async () => {
+  reset();
+  await cmdAgentProfile(["duplicate", dupSourceId, "--name", "Json Copy"], flags({ json: true }));
+  const r = jsonOutputs[0] as { profile: AgentProfile; copiedTasks: unknown[]; taskCopyErrors: unknown[] };
+  expect(r.profile.name).toBe("Json Copy");
+  expect(Array.isArray(r.copiedTasks)).toBe(true);
+  expect(Array.isArray(r.taskCopyErrors)).toBe(true);
+});
+
+test("duplicate --with-tasks: copies ordinary bound task to backlog on new profile, skips pipeline steps", async () => {
+  reset();
+  const addTask = async (title: string): Promise<Task> => {
+    reset();
+    await cmdAdd(
+      ["--title", title, "--prompt", "p", "--profile", DUP_NAME, "--workdir", WORKDIR, "--isolation", "none"],
+      flags({ json: true }),
+    );
+    return (jsonOutputs[0] as { task: Task }).task;
+  };
+  const ordinary = await addTask("ordinary");
+  const step = await addTask("step");
+  const { db } = await import("../bun/db.ts");
+  db.query("UPDATE tasks SET pipeline_parent_id = ? WHERE id = ?").run("some-parent", step.id);
+
+  reset();
+  await cmdAgentProfile(
+    ["duplicate", dupSourceId, "--name", "With Tasks", "--with-tasks"],
+    flags({ json: true }),
+  );
+  const r = jsonOutputs[0] as { profile: AgentProfile; copiedTasks: Task[]; taskCopyErrors: unknown[] };
+  expect(r.copiedTasks.length).toBe(1);
+  expect(r.copiedTasks[0]!.agentProfileId).toBe(r.profile.id);
+  expect(r.copiedTasks[0]!.column).toBe("backlog");
+  expect(r.copiedTasks[0]!.id).not.toBe(ordinary.id);
+});
+
+test("duplicate: field flags like --harness are rejected", async () => {
+  await expect(
+    cmdAgentProfile(["duplicate", dupSourceId, "--harness", "codex"], flags()),
+  ).rejects.toThrow(/does not accept/);
+});

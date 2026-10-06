@@ -1189,6 +1189,145 @@ test.describe("agent profiles — Settings surface", () => {
       await patchHarness(request, backend, "cursor", { enabled: false });
     }
   });
+
+  async function mkSource(request: APIRequestContext, backend: E2EBackend, label: string) {
+    const name = `${label} ${randomUUID()}`;
+    const src = await createAgentProfileRest(request, backend, {
+      name,
+      harness: "claude-code",
+      model: "sonnet-5",
+      effort: "medium",
+      mode: "plan",
+      instructions: "dup-from-edit",
+      skills: [],
+    });
+    createdProfileIds.push(src.id);
+    return { name, id: src.id };
+  }
+
+  async function openEditFor(page: Page, name: string): Promise<{ modal: Locator; form: Locator }> {
+    await openSettingsAgents(page);
+    const modal = settingsModal(page);
+    await modal
+      .locator('[data-testid="agent-profile-row"]')
+      .filter({ hasText: name })
+      .filter({ hasNotText: "(copy)" })
+      .getByTestId("agent-profile-edit")
+      .click();
+    const form = modal.getByTestId("agent-profile-form");
+    await expect(form).toBeVisible();
+    await expect(modal.getByRole("heading", { name: "Edit agent", exact: true })).toBeVisible();
+    return { modal, form };
+  }
+
+  async function taskCountOf(request: APIRequestContext, backend: E2EBackend, id: string): Promise<number> {
+    return (await getAgentProfile(request, backend, id)).taskCount;
+  }
+
+  async function createBoundTask(request: APIRequestContext, backend: E2EBackend, profileId: string, title: string) {
+    const dir = await mkdtemp(path.join(tmpdir(), "agetor-dup-"));
+    const res = await request.post(`${backend.apiBase}/tasks`, {
+      headers: auth(backend),
+      data: { title, prompt: "noop", workdir: dir, isolation: "none", agentProfileId: profileId },
+    });
+    expect(res.ok(), `POST /tasks -> ${res.status()}: ${await res.text()}`).toBeTruthy();
+    return (await res.json()) as { id: string };
+  }
+
+  test("Edit page Duplicate: heading becomes Duplicate agent with '<saved name> (copy)'", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "EditDup");
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${src.name} (copy)`);
+  });
+
+  test("Edit page Duplicate with dirty name: Cancel keeps draft and Edit heading; Discard prefills from SAVED name", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "DirtyDup");
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    const dirty = `${src.name} DIRTY`;
+    await form.getByTestId("agent-profile-name").fill(dirty);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(dirty);
+    await expect(modal.getByRole("heading", { name: "Edit agent", exact: true })).toBeVisible();
+
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await expect(modal.getByTestId("agent-profile-form").getByTestId("agent-profile-name")).toHaveValue(
+      `${src.name} (copy)`,
+    );
+  });
+
+  test("Duplicate without copy-tasks: checkbox unchecked by default, new taskCount 0, source unchanged", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "NoCopyTasks");
+    await createBoundTask(request, backend, src.id, `nocopy-${randomUUID()}`);
+    expect(await taskCountOf(request, backend, src.id)).toBe(1);
+
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    const box = form.getByTestId("agent-profile-copy-tasks");
+    await expect(box).not.toBeChecked();
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+
+    const copyId = await getProfileIdByName(request, backend, `${src.name} (copy)`);
+    createdProfileIds.push(copyId);
+    expect(await taskCountOf(request, backend, copyId)).toBe(0);
+    expect(await taskCountOf(request, backend, src.id)).toBe(1);
+  });
+
+  test("Duplicate with copy-tasks checked: new profile gets 1 backlog task copy, source unchanged", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "CopyTasks");
+    const title = `copyme-${randomUUID()}`;
+    await createBoundTask(request, backend, src.id, title);
+
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await form.getByTestId("agent-profile-copy-tasks").check();
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+
+    const copyId = await getProfileIdByName(request, backend, `${src.name} (copy)`);
+    createdProfileIds.push(copyId);
+    expect(await taskCountOf(request, backend, copyId)).toBe(1);
+    expect(await taskCountOf(request, backend, src.id)).toBe(1);
+
+    const res = await request.get(`${backend.apiBase}/tasks`, { headers: auth(backend) });
+    expect(res.ok()).toBeTruthy();
+    const tasks = (await res.json()) as any[];
+    const copied = tasks.filter((t) => t.agentProfileId === copyId);
+    expect(copied).toHaveLength(1);
+    expect(copied[0].title).toContain(title);
+    expect(copied[0].column).toBe("backlog");
+  });
 });
 
 test.afterAll(async ({ backend }) => {
