@@ -163,12 +163,12 @@ export const USAGE: Record<string, string> = {
   Run 'agetor harness add --help' / 'edit --help' for their flags;
   'agetor harness shell <id>' opens a shell with the harness env for login.`,
 
-  profile: `usage: agetor profile <ls | show <ref> | add <name> … | edit <ref> … | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […]>
+  profile: `usage: agetor profile <ls | show <ref> | add <name> … | edit <ref> … | duplicate <ref> [--name <name>] [--with-tasks] | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […]>
 
   Manage agent profiles — a reusable harness + model + effort + mode +
   instructions + skills preset — pick one at launch with 'agetor add --profile'.
   <ref> is a profile id or its (unique, case-insensitive) name.
-  Run 'agetor profile add --help' / 'edit --help' for their flags, and
+  Run 'agetor profile add --help' / 'edit --help' / 'duplicate --help' for their flags, and
   'export --help' / 'import --help' for moving profiles between machines.`,
 
   export: `usage: agetor export [--profile <ref>]… [--pipeline <ref>]… [--all] [--out <file|->] [--force]
@@ -245,6 +245,14 @@ export const USAGE: Record<string, string> = {
 
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced).`,
+
+  "profile duplicate": `usage: agetor profile duplicate <ref> [--name <name>] [--with-tasks]
+
+  Create a copy of an agent profile immediately. The copy is named
+  "<name> (copy)" unless --name overrides it. --with-tasks also copies the
+  profile's non-archived, non-pipeline tasks as new backlog cards bound to the
+  new agent; runs and worktrees are not copied. The original agent is unchanged.
+  Edit the copy afterwards with 'agetor profile edit'.`,
 
   pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>
 

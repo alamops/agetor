@@ -116,6 +116,35 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       out(`${c.green("✓")} updated profile ${c.bold(safe(updated.name))} (${c.dim(updated.id)})`);
       return;
     }
+    case "duplicate": {
+      const ref = args[1];
+      if (!ref) throw usageError("profile duplicate");
+      let name: string | undefined;
+      let withTasks = false;
+      const rest = args.slice(2);
+      for (let i = 0; i < rest.length; i++) {
+        const a = rest[i]!;
+        if (a === "--name") name = flagValue(rest, ++i, a);
+        else if (a === "--with-tasks") withTasks = true;
+        else if (a.startsWith("-")) {
+          throw new Error(
+            `profile duplicate does not accept '${safe(a)}' — duplicate first, then change the copy with 'agetor profile edit'`,
+          );
+        } else throw usageError("profile duplicate");
+      }
+      const profile = await resolveProfile(client, ref);
+      const result = await client.duplicateAgentProfile(profile.id, {
+        ...(name !== undefined ? { name } : {}),
+        ...(withTasks ? { copyTasks: true } : {}),
+      });
+      if (flags.json) return printJson(result);
+      out(`${c.green("✓")} duplicated profile ${c.bold(safe(result.profile.name))} (${c.dim(result.profile.id)})`);
+      if (withTasks) out(`copied ${taskCountText(result.copiedTasks.length)}`);
+      for (const err of result.taskCopyErrors) {
+        out(c.yellow(`could not copy task ${escapeFreeText(err.sourceTaskId.slice(0, 8))}: ${escapeFreeText(err.error)}`));
+      }
+      return;
+    }
     case "rm":
     case "delete": {
       const ref = args[1];
@@ -127,7 +156,7 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       return;
     }
     default:
-      throw new Error(`unknown profile subcommand: ${sub} (use ls | show | add | edit | rm | export | import)`);
+      throw new Error(`unknown profile subcommand: ${sub} (use ls | show | add | edit | duplicate | rm | export | import)`);
   }
 }
 
