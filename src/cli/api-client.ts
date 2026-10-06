@@ -382,6 +382,11 @@ export class AgetorClient {
   createAgentProfile(input: AgentProfileInput): Promise<AgentProfile> {
     return this.req("POST", "/agent-profiles", input);
   }
+  /** `POST /agent-profiles/:id/duplicate` — 404 unknown source, 409 name clash.
+   *  Task-copy failures come back in `taskCopyErrors`, not as an error. */
+  duplicateAgentProfile(id: string, input: DuplicateAgentProfileInput): Promise<DuplicateAgentProfileResult> {
+    return this.req("POST", `/agent-profiles/${encodeURIComponent(id)}/duplicate`, input);
+  }
   /** `PATCH /agent-profiles/:id` — same validation as create. */
   patchAgentProfile(id: string, patch: Partial<AgentProfileInput>): Promise<AgentProfile> {
     return this.req("PATCH", `/agent-profiles/${encodeURIComponent(id)}`, patch);
@@ -648,6 +653,17 @@ export interface AgentProfileInput {
   maxMode: boolean;
   instructions: string;
   skills: string[];
+}
+
+/** Body for `POST /agent-profiles/:id/duplicate`; omitted fields copy the source. */
+export interface DuplicateAgentProfileInput extends Partial<AgentProfileInput> {
+  copyTasks?: boolean;
+}
+
+export interface DuplicateAgentProfileResult {
+  profile: AgentProfile;
+  copiedTasks: Task[];
+  taskCopyErrors: { sourceTaskId: string; error: string }[];
 }
 
 /** Server-side allow-list for PATCH /tasks/:id. */

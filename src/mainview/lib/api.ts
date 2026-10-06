@@ -476,6 +476,18 @@ export interface AgentProfileInput {
   skills: string[];
 }
 
+/** Body for `POST /agent-profiles/:id/duplicate` — omitted fields are copied
+ *  from the source; `copyTasks` also re-creates its live tasks on the copy. */
+export interface DuplicateAgentProfileInput extends Partial<AgentProfileInput> {
+  copyTasks?: boolean;
+}
+
+export interface DuplicateAgentProfileResult {
+  profile: AgentProfile;
+  copiedTasks: Task[];
+  taskCopyErrors: { sourceTaskId: string; error: string }[];
+}
+
 export const api = {
   defaults: () => j<AppDefaults>("/defaults"),
   info: () => j<{ version: string }>("/info"),
@@ -548,6 +560,13 @@ export const api = {
   getAgentProfile: (id: string) => j<AgentProfile>(`/agent-profiles/${encodeURIComponent(id)}`),
   createAgentProfile: (input: AgentProfileInput) =>
     j<AgentProfile>("/agent-profiles", { method: "POST", body: JSON.stringify(input) }),
+  duplicateAgentProfile: (id: string, input: DuplicateAgentProfileInput) =>
+    // retry: false — a replay would create another copy.
+    j<DuplicateAgentProfileResult>(
+      `/agent-profiles/${encodeURIComponent(id)}/duplicate`,
+      { method: "POST", body: JSON.stringify(input) },
+      { retry: false },
+    ),
   updateAgentProfile: (id: string, patch: Partial<AgentProfileInput>) =>
     j<AgentProfile>(`/agent-profiles/${encodeURIComponent(id)}`, {
       method: "PATCH",
