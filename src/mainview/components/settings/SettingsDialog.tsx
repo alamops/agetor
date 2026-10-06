@@ -770,6 +770,12 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                   subpageDirtyRef.current = dirty;
                 }}
                 onCancel={() => setView(backFromSubview(viewRef.current))}
+                onDuplicate={() => {
+                  const current = viewRef.current;
+                  if (current.kind !== "agent-editor" || !current.profileId) return;
+                  const id = current.profileId;
+                  void leaveSubpage(() => setView(openAgentEditor(null, id)));
+                }}
                 onSaved={() => {
                   // The user may have left (rail click, Escape-pop) while the
                   // save was in flight — only pop if this editor is still the

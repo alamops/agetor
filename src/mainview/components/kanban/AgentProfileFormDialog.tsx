@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { X } from "lucide-react";
+import { toast } from "sonner";
 import { Dialog } from "@/components/ui/dialog";
 import { useConfirm } from "@/components/ui/confirm";
 import { Button } from "@/components/ui/button";
@@ -55,6 +56,8 @@ export interface AgentProfileFormProps {
    *  footer a top border, for hosting as a whole subpage (Settings → Agents'
    *  editor). Test ids, labels and disabled rules are identical in both. */
   variant?: "card" | "page";
+  /** Page variant only: shows a Duplicate button on an edit form. */
+  onDuplicate?: () => void;
 }
 
 const CARD_ROOT_CLASS = "rounded-md border border-border/60 p-3";
@@ -90,6 +93,7 @@ export function AgentProfileForm({
   autoFocus,
   onDirtyChange,
   variant = "card",
+  onDuplicate,
 }: AgentProfileFormProps) {
   const { profiles, loaded, refresh } = useAgentProfiles();
 
@@ -109,6 +113,7 @@ export function AgentProfileForm({
         key={`dup-${duplicateSource.id}`}
         profileId={null}
         editingProfile={seed}
+        duplicateFromId={duplicateSource.id}
         onSaved={onSaved}
         onCancel={onCancel}
         autoFocus={autoFocus}
@@ -142,6 +147,7 @@ export function AgentProfileForm({
         key={editingProfile.id}
         profileId={editingProfile.id}
         editingProfile={editingProfile}
+        onDuplicate={onDuplicate}
         onSaved={onSaved}
         onCancel={onCancel}
         autoFocus={autoFocus}
@@ -194,8 +200,11 @@ function AgentProfileFormBody({
   autoFocus,
   onDirtyChange,
   variant = "card",
+  duplicateFromId = null,
+  onDuplicate,
   refreshProfiles,
 }: AgentProfileFormBodyProps) {
+  const [copyTasks, setCopyTasks] = useState(false);
   const [form, setForm] = useState<FormState>(() =>
     editingProfile
       ? { name: editingProfile.name, instructions: editingProfile.instructions, skills: editingProfile.skills }
@@ -305,9 +314,25 @@ function AgentProfileFormBody({
         instructions: form.instructions,
         skills: form.skills,
       };
-      const saved = profileId ? await api.updateAgentProfile(profileId, input) : await api.createAgentProfile(input);
+      let saved: AgentProfile;
+      let copyErrors: { sourceTaskId: string; error: string }[] = [];
+      if (typeof duplicateFromId === "string" && duplicateFromId !== "") {
+        const result = await api.duplicateAgentProfile(duplicateFromId, { ...input, copyTasks });
+        saved = result.profile;
+        copyErrors = result.taskCopyErrors;
+      } else {
+        saved = profileId ? await api.updateAgentProfile(profileId, input) : await api.createAgentProfile(input);
+      }
       await refreshProfiles();
-      if (mountedRef.current) onSaved(saved);
+      if (mountedRef.current) {
+        if (copyErrors.length > 0) {
+          const first = copyErrors[0]?.error ?? "";
+          toast.error(
+            `${copyErrors.length} task${copyErrors.length === 1 ? "" : "s"} couldn't be copied${first ? `: ${first}` : ""}`,
+          );
+        }
+        onSaved(saved);
+      }
     } catch (e) {
       if (mountedRef.current) setSaveError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -359,6 +384,24 @@ function AgentProfileFormBody({
           disabled={saving}
         />
       </div>
+
+      {typeof duplicateFromId === "string" && duplicateFromId !== "" && (
+        <label className="flex items-start gap-2">
+          <input
+            type="checkbox"
+            data-testid="agent-profile-copy-tasks"
+            className="mt-0.5"
+            checked={copyTasks}
+            onChange={(e) => setCopyTasks(e.target.checked)}
+          />
+          <span className="space-y-0.5">
+            <span className="block text-xs">Also copy tasks that use this agent</span>
+            <span className="block text-xs text-muted-foreground">
+              New backlog cards. Runs and pipeline steps stay on the original.
+            </span>
+          </span>
+        </label>
+      )}
       </fieldset>
 
       {saveError && (
@@ -371,6 +414,17 @@ function AgentProfileFormBody({
       )}
 
       <div className={cn("flex justify-end gap-2", variant === "page" && PAGE_FOOTER_CLASS)}>
+        {variant === "page" && typeof profileId === "string" && profileId !== "" && (
+          <Button
+            variant="outline"
+            size="sm"
+            data-testid="agent-profile-form-duplicate"
+            onClick={() => onDuplicate?.()}
+            disabled={saving}
+          >
+            Duplicate
+          </Button>
+        )}
         <Button variant="outline" size="sm" data-testid="agent-profile-cancel" onClick={onCancel} disabled={saving}>
           Cancel
         </Button>
