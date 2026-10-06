@@ -218,7 +218,26 @@ import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guar
 import { consumePendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
-import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
+import { LONE_SURROGATE_RE, PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
+import { BUNDLE_MAX_BYTES, findInvisibleChar } from "../shared/bundle.ts";
+import type { BundleImportOptions } from "../shared/bundle-import.ts";
+import {
+  BUNDLE_MAX_REQUEST_BYTES,
+  bundleDownloadsDir,
+  bundleSaveErrorMessage,
+  commitBundleImport,
+  exportBundleFor,
+  fakePickDir,
+  fakePickedFolder,
+  fakePickedJsonFile,
+  parseBundleImportOptions,
+  parseBundleSelection,
+  previewBundleImport,
+  readPickedBundleFile,
+  writeBundleFile,
+  type BundleImportError,
+} from "./bundle.ts";
+import { pickedPaths, singlePickedPath } from "./native-pick.ts";
 import type { AgentProfilePatch } from "./db.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
@@ -277,18 +296,15 @@ function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
 
 // Turn raw path strings into references: keep only existing absolute paths,
 // dedupe, and read directory-ness from the filesystem (authoritative — more
-// reliable than the webview's view). The stat filter also discards the bogus
-// fragments produced when Electrobun's native open-panel returns its picks as
-// a comma-joined string and a chosen path itself contains a comma: the split
-// pieces don't exist on disk, so they fall out here rather than reaching the
-// prompt as broken refs. (A comma path still can't be attached via the panel —
-// that's a bridge limitation — but it fails safe instead of corrupting.)
+// reliable than the webview's view). A path is never trimmed: a file name may
+// end in a space. `/refs/pick` re-joins the native panel's comma-split answer
+// first (`pickedPaths`, ./native-pick.ts); any piece that still doesn't exist
+// on disk falls out here rather than reaching the prompt as a broken ref.
 function refsFromPaths(rawPaths: unknown[]): TaskReference[] {
   const refs: TaskReference[] = [];
   const seen = new Set<string>();
-  for (const entry of rawPaths) {
-    if (typeof entry !== "string") continue;
-    const abs = entry.trim();
+  for (const abs of rawPaths) {
+    if (typeof abs !== "string") continue;
     if (!abs || !path.isAbsolute(abs) || seen.has(abs)) continue;
     let st;
     try {
@@ -559,6 +575,74 @@ function coerceBranchConfig(raw: unknown): { config: BranchNamingConfig } | { er
   return { config };
 }
 
+/** "`<what>` must not contain a lone surrogate" when `value` holds one, else
+ *  null. JSON can spell an unpaired surrogate (`"\ud800"`); SQLite stores
+ *  text as UTF-8 and pairs it with the next code unit, so the stored value
+ *  would differ from the one sent, and no bundle could carry it. */
+function loneSurrogateError(value: string, what: string): string | null {
+  return LONE_SURROGATE_RE.test(value) ? `${what} must not contain a lone surrogate` : null;
+}
+
+/** The `name` body check shared by `POST`/`PATCH /agent-profiles`, run on
+ *  the trimmed value: required, within its cap, and free of control
+ *  characters and lone surrogates. Returns the error, or null. */
+function agentProfileNameError(name: string): string | null {
+  if (!name) return "name required";
+  if (name.length > AGENT_PROFILE_LIMITS.name) {
+    return `agent name must be ${AGENT_PROFILE_LIMITS.name} characters or fewer`;
+  }
+  // Same rule as a pipeline name: a terminal escape in a name would reach
+  // every CLI listing that prints it.
+  if (PIPELINE_CONTROL_CHAR_RE.test(name)) return "agent name must not contain control characters";
+  return loneSurrogateError(name, "agent name");
+}
+
+/** The `instructions` body check shared by `POST`/`PATCH /agent-profiles`.
+ *  Returns the error, or null. */
+function agentProfileInstructionsError(instructions: string): string | null {
+  if (instructions.length > AGENT_PROFILE_LIMITS.instructions) {
+    return `agent instructions must be ${AGENT_PROFILE_LIMITS.instructions} characters or fewer`;
+  }
+  return loneSurrogateError(instructions, "agent instructions");
+}
+
+/** The `effort`/`mode` body check shared by `POST`/`PATCH /agent-profiles`:
+ *  a string within its cap, or null. Returns the error, or null when valid. */
+function agentProfileOptionalFieldError(value: unknown, field: "effort" | "mode"): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return `${field} must be a string or null`;
+  const max = AGENT_PROFILE_LIMITS[field];
+  if (value.trim().length > max) return `agent ${field} must be ${max} characters or fewer`;
+  if (PIPELINE_CONTROL_CHAR_RE.test(value.trim())) return `agent ${field} must not contain control characters`;
+  return loneSurrogateError(value, `agent ${field}`);
+}
+
+/** The `model` body check shared by `POST`/`PATCH /agent-profiles`, run on
+ *  the trimmed value: required, within its cap, and free of control and
+ *  invisible characters — a model made only of those would export as an
+ *  empty string, which no bundle could carry. Returns the error, or null. */
+function agentProfileModelError(model: string): string | null {
+  if (!model) return "model required";
+  if (model.length > AGENT_PROFILE_LIMITS.model) {
+    return `agent model must be ${AGENT_PROFILE_LIMITS.model} characters or fewer`;
+  }
+  if (PIPELINE_CONTROL_CHAR_RE.test(model)) return "agent model must not contain control characters";
+  const lone = loneSurrogateError(model, "agent model");
+  if (lone) return lone;
+  const invisible = findInvisibleChar(model);
+  if (invisible) return `agent model must not contain invisible characters (${invisible})`;
+  return null;
+}
+
+/** The stored form of a valid `effort`/`mode` body value: trimmed, and an
+ *  empty one reads as null (the kind default) — the length check above runs
+ *  on the trimmed value, and the bundle parser reads these fields the same
+ *  way, so what is stored is exactly what was checked and what exports. */
+function agentProfileOptionalField(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  return value.trim() || null;
+}
+
 /**
  * Validate + normalize an agent profile's `skills` field for the
  * `POST`/`PATCH /agent-profiles` routes (docs/plans/agent-profiles.md). Unlike
@@ -576,6 +660,9 @@ function coerceBranchConfig(raw: unknown): { config: BranchNamingConfig } | { er
 function parseSkillsBody(raw: unknown): { skills: string[] } | { error: string } {
   if (!Array.isArray(raw) || raw.some((s) => typeof s !== "string")) {
     return { error: "skills must be an array of strings" };
+  }
+  if ((raw as string[]).some((s) => LONE_SURROGATE_RE.test(s))) {
+    return { error: "skills must not contain a lone surrogate" };
   }
   const seen = new Set<string>();
   const skills: string[] = [];
@@ -645,6 +732,165 @@ function withPipelineTaskCounts(list: Pipeline[]): Pipeline[] {
   return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
 }
 
+/** Most bytes of a refused request body read and thrown away before the
+ *  reader gives up and cancels. Also the server's `maxRequestBodySize`: Bun
+ *  refuses a larger Content-Length itself (413, before any handler runs) and
+ *  leaves the keep-alive socket clean, so the cancel below is only ever
+ *  reached by a chunked body — Bun 1.3.10 doesn't apply `maxRequestBodySize`
+ *  to one (spike-verified) — or a stalled one. The largest legitimate body
+ *  (`POST /screenshots`) is 25 MB. */
+export const REFUSED_BODY_DRAIN_MAX_BYTES = 64 * 1024 * 1024;
+/** Longest a refused body is drained before the reader gives up and cancels:
+ *  a client that sends slowly (or stalls) mid-upload must not hold the 413
+ *  back, and the request open, indefinitely. */
+const REFUSED_BODY_DRAIN_MAX_MS = 5_000;
+
+/**
+ * Read and discard the rest of a request body that is being refused, up to
+ * {@link REFUSED_BODY_DRAIN_MAX_BYTES} or {@link REFUSED_BODY_DRAIN_MAX_MS},
+ * then cancel. A client that keeps its connection alive (Bun's fetch does;
+ * verified on 1.3.10) otherwise wedges its next request on that socket
+ * behind the unread upload — a `Connection: close` response header does not
+ * help. Nothing is held: each chunk is dropped as it arrives.
+ *
+ * The give-up paths sacrifice that socket: after `reader.cancel()` the
+ * client's next request on it waits until `idleTimeout` closes it. That only
+ * happens to a chunked body over 64 MB (a Content-Length one that size never
+ * reaches a handler — see `maxRequestBodySize`) or a client that stops
+ * sending for 5 s mid-upload, neither of which the webview or CLI does; the
+ * 413 itself is still answered at once.
+ */
+export async function drainRefusedBody(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  maxMs = REFUSED_BODY_DRAIN_MAX_MS,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), maxMs);
+  });
+  const drain = async (): Promise<"done" | "cap"> => {
+    let drained = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return "done";
+      drained += value.byteLength;
+      if (drained > REFUSED_BODY_DRAIN_MAX_BYTES) return "cap";
+    }
+  };
+  const drained = drain();
+  // Lost the race and cancelled below: a late rejection must not surface as
+  // an unhandled one.
+  drained.catch(() => {});
+  try {
+    const outcome = await Promise.race([drained, deadline]);
+    if (outcome === "done") return;
+  } catch {
+    return;
+  } finally {
+    clearTimeout(timer);
+  }
+  // Past the byte cap or the deadline: cancelling also settles a read still
+  // pending in `drain`, so nothing is left waiting on the stream.
+  await reader.cancel().catch(() => {});
+}
+
+/**
+ * The request body as text, or null once it passes `maxBytes` — from there
+ * the rest is drained and thrown away instead of buffered. A body that can't
+ * be read reads as "" (the JSON parse then 400s).
+ */
+async function readBodyCapped(req: Request, maxBytes: number): Promise<string | null> {
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await drainRefusedBody(reader);
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return "";
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+/**
+ * Read and validate a `POST /bundle/import[/preview]` body — `{ text,
+ * options?, planFingerprint? }` (docs/plans/agents-pipelines-import-export.md
+ * K4; `planFingerprint`, the previewed plan's, only matters to the commit,
+ * which 409s when its own re-plan differs). A body over
+ * `BUNDLE_MAX_REQUEST_BYTES` is refused with 413 by `Content-Length` before
+ * it is parsed (like `/screenshots`), and — when chunked, with no length — as
+ * soon as the read passes it; either way the rest is drained, never held. Returns
+ * the error `Response` to send, or the parsed body.
+ */
+async function readBundleImportBody(
+  req: Request,
+): Promise<{ text: string; options: BundleImportOptions; planFingerprint?: string } | Response> {
+  const tooLarge = () =>
+    json(
+      {
+        error:
+          `request is too large to import — a bundle file holds at most ${BUNDLE_MAX_BYTES / (1024 * 1024)} MB, ` +
+          "and text with many control characters takes more room once sent",
+        code: "too-large",
+      },
+      { status: 413, headers: corsHeaders(req) },
+    );
+  const claimed = Number(req.headers.get("content-length") ?? "");
+  if (Number.isFinite(claimed) && claimed > BUNDLE_MAX_REQUEST_BYTES) {
+    // Refused before parsing, but read off the socket so a keep-alive client
+    // can send its next request on it.
+    if (req.body) await drainRefusedBody(req.body.getReader());
+    return tooLarge();
+  }
+  // A chunked body carries no Content-Length: read it with a byte cap, so an
+  // oversized one is refused without ever being held in memory whole.
+  const raw = await readBodyCapped(req, BUNDLE_MAX_REQUEST_BYTES);
+  if (raw === null) return tooLarge();
+  let body: unknown;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return json({ error: "invalid body", code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return json({ error: "invalid body", code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  const { text, options, planFingerprint } = body as { text?: unknown; options?: unknown; planFingerprint?: unknown };
+  if (typeof text !== "string") {
+    return json({ error: "text (string) required", code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  const parsedOptions = parseBundleImportOptions(options);
+  if ("error" in parsedOptions) {
+    return json({ error: parsedOptions.error, code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  if (planFingerprint !== undefined && planFingerprint !== null && typeof planFingerprint !== "string") {
+    return json({ error: "planFingerprint must be a string", code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  return {
+    text,
+    options: parsedOptions.options,
+    ...(typeof planFingerprint === "string" ? { planFingerprint } : {}),
+  };
+}
+
+/** 400 `{ error, code }` for a file that didn't parse; 409 `{ error, plan }`
+ *  for a plan with blocking issues. */
+function bundleImportErrorResponse(req: Request, r: BundleImportError): Response {
+  if (r.status === 400) {
+    return json({ error: r.error, code: r.code }, { status: 400, headers: corsHeaders(req) });
+  }
+  return json({ error: r.error, plan: r.plan }, { status: 409, headers: corsHeaders(req) });
+}
+
 /**
  * Validate the `POST /pipelines` / `PATCH /pipelines/:id` body's `name`:
  * trimmed, required, `PIPELINE_LIMITS.name` cap, and (L-S1) no C0/DEL
@@ -658,6 +904,8 @@ function parsePipelineName(body: Record<string, unknown>): { value: string } | {
     return { error: `pipeline name must be ${PIPELINE_LIMITS.name} characters or fewer` };
   }
   if (PIPELINE_CONTROL_CHAR_RE.test(name)) return { error: "pipeline name must not contain control characters" };
+  const lone = loneSurrogateError(name, "pipeline name");
+  if (lone) return { error: lone };
   return { value: name };
 }
 
@@ -673,6 +921,8 @@ function parsePipelineDescription(body: Record<string, unknown>): { value: strin
   if (body.description.length > PIPELINE_LIMITS.description) {
     return { error: `pipeline description must be ${PIPELINE_LIMITS.description} characters or fewer` };
   }
+  const lone = loneSurrogateError(body.description, "pipeline description");
+  if (lone) return { error: lone };
   return { value: body.description };
 }
 
@@ -794,6 +1044,9 @@ function validateCloneLaunch(
 export interface ApiNative {
   openFileDialog(opts: {
     startingFolder: string;
+    /** Comma-separated extensions the panel accepts (e.g. `"json"`);
+     *  omitted means any file. */
+    allowedFileTypes?: string;
     canChooseFiles: boolean;
     canChooseDirectory: boolean;
     allowsMultipleSelection: boolean;
@@ -901,6 +1154,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
     // that awaits >10s before writing bytes. 255 is Bun's max; some handlers
     // below opt out entirely via server.timeout(req, 0).
     idleTimeout: 255,
+    // Bun refuses a larger Content-Length body itself (413) and keeps the
+    // keep-alive socket usable; see REFUSED_BODY_DRAIN_MAX_BYTES.
+    maxRequestBodySize: REFUSED_BODY_DRAIN_MAX_BYTES,
     websocket: terminalWebSocket,
     routes: {
       // Unauthenticated probes only — never returns data.
@@ -1207,9 +1463,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             canChooseDirectory: true,
             allowsMultipleSelection: false,
           });
-          // The native bridge returns a comma-joined string of paths; an empty
-          // first element means "user cancelled".
-          const picked = paths.find((p) => p && p.length > 0);
+          // Electrobun splits the panel's answer on ",", so a folder whose
+          // path has a comma arrives in pieces; nothing at all means cancelled.
+          const picked = singlePickedPath(paths);
           if (!picked) {
             return json({ project: null }, { headers: corsHeaders(req) });
           }
@@ -3758,13 +4014,8 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           const body = raw as Record<string, unknown>;
 
           const name = typeof body.name === "string" ? body.name.trim() : "";
-          if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
-          if (name.length > AGENT_PROFILE_LIMITS.name) {
-            return json(
-              { error: `agent name must be ${AGENT_PROFILE_LIMITS.name} characters or fewer` },
-              { status: 400, headers: corsHeaders(req) },
-            );
-          }
+          const nameError = agentProfileNameError(name);
+          if (nameError) return json({ error: nameError }, { status: 400, headers: corsHeaders(req) });
 
           const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
           if (!harnessRef) return json({ error: "harness required" }, { status: 400, headers: corsHeaders(req) });
@@ -3774,22 +4025,16 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           }
 
           const model = typeof body.model === "string" ? body.model.trim() : "";
-          if (!model) return json({ error: "model required" }, { status: 400, headers: corsHeaders(req) });
+          const modelError = agentProfileModelError(model);
+          if (modelError) return json({ error: modelError }, { status: 400, headers: corsHeaders(req) });
 
-          if (body.effort !== undefined && body.effort !== null && typeof body.effort !== "string") {
-            return json({ error: "effort must be a string or null" }, { status: 400, headers: corsHeaders(req) });
-          }
-          if (body.mode !== undefined && body.mode !== null && typeof body.mode !== "string") {
-            return json({ error: "mode must be a string or null" }, { status: 400, headers: corsHeaders(req) });
-          }
+          const optionalError =
+            agentProfileOptionalFieldError(body.effort, "effort") ?? agentProfileOptionalFieldError(body.mode, "mode");
+          if (optionalError) return json({ error: optionalError }, { status: 400, headers: corsHeaders(req) });
 
           const instructions = typeof body.instructions === "string" ? body.instructions : "";
-          if (instructions.length > AGENT_PROFILE_LIMITS.instructions) {
-            return json(
-              { error: `agent instructions must be ${AGENT_PROFILE_LIMITS.instructions} characters or fewer` },
-              { status: 400, headers: corsHeaders(req) },
-            );
-          }
+          const instructionsError = agentProfileInstructionsError(instructions);
+          if (instructionsError) return json({ error: instructionsError }, { status: 400, headers: corsHeaders(req) });
 
           let skills: string[] = [];
           if (body.skills !== undefined) {
@@ -3805,8 +4050,8 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               name,
               harness: harness.id,
               model,
-              effort: (body.effort as string | null | undefined) ?? null,
-              mode: (body.mode as string | null | undefined) ?? null,
+              effort: agentProfileOptionalField(body.effort),
+              mode: agentProfileOptionalField(body.mode),
               fast: body.fast === true,
               maxMode: body.maxMode === true,
               instructions,
@@ -3843,13 +4088,8 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
 
           if ("name" in body) {
             const name = typeof body.name === "string" ? body.name.trim() : "";
-            if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
-            if (name.length > AGENT_PROFILE_LIMITS.name) {
-              return json(
-                { error: `agent name must be ${AGENT_PROFILE_LIMITS.name} characters or fewer` },
-                { status: 400, headers: corsHeaders(req) },
-              );
-            }
+            const nameError = agentProfileNameError(name);
+            if (nameError) return json({ error: nameError }, { status: 400, headers: corsHeaders(req) });
             patch.name = name;
           }
           if ("harness" in body) {
@@ -3863,30 +4103,27 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           }
           if ("model" in body) {
             const model = typeof body.model === "string" ? body.model.trim() : "";
-            if (!model) return json({ error: "model required" }, { status: 400, headers: corsHeaders(req) });
+            const modelError = agentProfileModelError(model);
+            if (modelError) return json({ error: modelError }, { status: 400, headers: corsHeaders(req) });
             patch.model = model;
           }
           if ("effort" in body) {
-            if (body.effort !== null && typeof body.effort !== "string") {
-              return json({ error: "effort must be a string or null" }, { status: 400, headers: corsHeaders(req) });
-            }
-            patch.effort = body.effort;
+            const effortError = agentProfileOptionalFieldError(body.effort, "effort");
+            if (effortError) return json({ error: effortError }, { status: 400, headers: corsHeaders(req) });
+            patch.effort = agentProfileOptionalField(body.effort);
           }
           if ("mode" in body) {
-            if (body.mode !== null && typeof body.mode !== "string") {
-              return json({ error: "mode must be a string or null" }, { status: 400, headers: corsHeaders(req) });
-            }
-            patch.mode = body.mode;
+            const modeError = agentProfileOptionalFieldError(body.mode, "mode");
+            if (modeError) return json({ error: modeError }, { status: 400, headers: corsHeaders(req) });
+            patch.mode = agentProfileOptionalField(body.mode);
           }
           if ("fast" in body) patch.fast = body.fast === true;
           if ("maxMode" in body) patch.maxMode = body.maxMode === true;
           if ("instructions" in body) {
             const instructions = typeof body.instructions === "string" ? body.instructions : "";
-            if (instructions.length > AGENT_PROFILE_LIMITS.instructions) {
-              return json(
-                { error: `agent instructions must be ${AGENT_PROFILE_LIMITS.instructions} characters or fewer` },
-                { status: 400, headers: corsHeaders(req) },
-              );
+            const instructionsError = agentProfileInstructionsError(instructions);
+            if (instructionsError) {
+              return json({ error: instructionsError }, { status: 400, headers: corsHeaders(req) });
             }
             patch.instructions = instructions;
           }
@@ -4048,6 +4285,148 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           return removed
             ? json({ ok: true }, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // ── Agents + Pipelines bundle export/import ─────────────────────────
+      // docs/plans/agents-pipelines-import-export.md K4. The logic lives in
+      // ./bundle.ts; these routes only validate, call it and map results to
+      // statuses. None of them reads or writes a client-supplied path: save
+      // targets are the Downloads dir or a folder the native panel returned,
+      // and Choose file reads only what the native panel returned.
+      "/bundle/export": {
+        POST: authed(async (req) => {
+          const sel = parseBundleSelection(await req.json().catch(() => null));
+          if ("error" in sel) return json({ error: sel.error }, { status: 400, headers: corsHeaders(req) });
+          const built = exportBundleFor(sel.selection);
+          if (!built.ok) return json({ error: built.error }, { status: 400, headers: corsHeaders(req) });
+          return json(
+            { text: built.text, filename: built.filename, warnings: built.warnings, counts: built.counts },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Save the export to ~/Downloads (then reveal it in Finder) or into a
+      // folder picked in the native panel — never overwriting (K7).
+      "/bundle/export/save": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+          const sel = parseBundleSelection(body);
+          if ("error" in sel) return json({ error: sel.error }, { status: 400, headers: corsHeaders(req) });
+          const target = body?.target;
+          if (target !== "downloads" && target !== "folder") {
+            return json({ error: 'target must be "downloads" or "folder"' }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Built up front so a selection that can't export fails before any
+          // panel opens; Choose folder builds again after the pick (below).
+          let built = exportBundleFor(sel.selection);
+          if (!built.ok) return json({ error: built.error }, { status: 400, headers: corsHeaders(req) });
+
+          let dir: string;
+          if (target === "downloads") {
+            dir = bundleDownloadsDir();
+          } else {
+            // Same fake-pick seam `/refs/pick` honors (e2e/fixtures.ts).
+            const fake = fakePickDir();
+            if (fake) {
+              const picked = fakePickedFolder(fake);
+              if (!picked) return json({ cancelled: true }, { headers: corsHeaders(req) });
+              dir = picked;
+            } else {
+              if (!native) return notAvailableHeadless(req);
+              // The request stays open while the panel is up.
+              server.timeout(req, 0);
+              const picks = await native.openFileDialog({
+                startingFolder: homedir(),
+                canChooseFiles: false,
+                canChooseDirectory: true,
+                allowsMultipleSelection: false,
+              });
+              const picked = singlePickedPath(picks);
+              if (!picked) return json({ cancelled: true }, { headers: corsHeaders(req) });
+              dir = picked;
+              // The panel can stay up for minutes: write what the Agents and
+              // Pipelines hold now, not what they held when it opened.
+              built = exportBundleFor(sel.selection);
+              if (!built.ok) return json({ error: built.error }, { status: 400, headers: corsHeaders(req) });
+            }
+          }
+
+          let written: { path: string; filename: string };
+          try {
+            written = writeBundleFile(dir, built.filename, built.text, { createDir: target === "downloads" });
+          } catch (e) {
+            return json({ error: bundleSaveErrorMessage(e, target, dir) }, { status: 500, headers: corsHeaders(req) });
+          }
+          const revealed = target === "downloads" && native ? native.revealPath(written.path) : false;
+          return json(
+            { path: written.path, filename: written.filename, revealed, warnings: built.warnings, counts: built.counts },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Choose file: a native Open panel filtered to .json (K8).
+      "/bundle/pick-file": {
+        POST: authed(async (req) => {
+          let file: string | null;
+          const fake = fakePickDir();
+          if (fake) {
+            file = fakePickedJsonFile(fake);
+          } else {
+            if (!native) return notAvailableHeadless(req);
+            server.timeout(req, 0);
+            const picks = await native.openFileDialog({
+              startingFolder: homedir(),
+              allowedFileTypes: "json",
+              canChooseFiles: true,
+              canChooseDirectory: false,
+              allowsMultipleSelection: false,
+            });
+            file = singlePickedPath(picks);
+          }
+          if (!file) return json({ cancelled: true }, { headers: corsHeaders(req) });
+          const read = readPickedBundleFile(file);
+          if ("error" in read) return json({ error: read.error }, { status: 400, headers: corsHeaders(req) });
+          return json(read, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Dry run: what an import would create, rename and bind (K5/K6).
+      "/bundle/import/preview": {
+        POST: authed(async (req) => {
+          const body = await readBundleImportBody(req);
+          if (body instanceof Response) return body;
+          const r = await previewBundleImport(body.text, body.options);
+          if (!r.ok) return bundleImportErrorResponse(req, r);
+          return json(r.plan, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Commit: everything in one transaction, or nothing (K13).
+      "/bundle/import": {
+        POST: authed(async (req) => {
+          const body = await readBundleImportBody(req);
+          if (body instanceof Response) return body;
+          let r: Awaited<ReturnType<typeof commitBundleImport>>;
+          try {
+            r = await commitBundleImport(body.text, body.options, body.planFingerprint);
+          } catch (e) {
+            return json(
+              { error: `import failed — nothing was imported: ${(e as Error).message}` },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+          if (!r.ok) return bundleImportErrorResponse(req, r);
+          return json(
+            {
+              ...r.result,
+              agents: r.result.agents.map((a) => ({ ...a, taskCount: 0 })),
+              pipelines: r.result.pipelines.map((p) => ({ ...p, taskCount: 0 })),
+            },
+            { status: 201, headers: corsHeaders(req) },
+          );
         }),
       },
 
@@ -5296,9 +5675,10 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             canChooseDirectory: mode === "folder",
             allowsMultipleSelection: true,
           });
-          // The native bridge returns a comma-joined string; an empty first
-          // element means the user cancelled.
-          return json({ refs: refsFromPaths(paths) }, { headers: corsHeaders(req) });
+          // Electrobun splits the panel's answer on ",", so a path with a
+          // comma arrives in pieces — put them back together; nothing at all
+          // means the user cancelled.
+          return json({ refs: refsFromPaths(pickedPaths(paths)) }, { headers: corsHeaders(req) });
         }),
       },
 

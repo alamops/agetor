@@ -385,6 +385,15 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
     return map;
   }, [payload.statuses]);
 
+  // A bundle import (Agents / Pipelines sections) can enable a harness as
+  // part of its transaction — reload the Harnesses list here and the app's
+  // header state, so the change shows without reopening Settings.
+  const onBundleImported = (result: { enabledHarnesses: string[] }) => {
+    if (result.enabledHarnesses.length === 0) return;
+    void refresh();
+    onChange?.();
+  };
+
   const onDisclaimSpawnedAgentsChange = (enabled: boolean) => {
     setDisclaimSpawnedAgents(enabled);
     // keep in sync with DISCLAIM_PREF_KEY in src/bun/disclaim.ts
@@ -679,6 +688,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       harnesses={payload.harnesses}
                       onAdd={() => setView(openAgentEditor(null))}
                       onEdit={(p) => setView(openAgentEditor(p.id))}
+                      onImported={onBundleImported}
                     />
                   );
                 case "pipelines":
@@ -712,6 +722,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                 resetView();
                 onOpenPipelines(id, editing);
               }}
+              onImported={onBundleImported}
             />
           </div>
 

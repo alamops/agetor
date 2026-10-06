@@ -283,6 +283,149 @@ test("POST /agent-profiles with instructions over the limit → 400", async () =
   expect((await res.json()).error).toContain("instructions");
 });
 
+// The free-text launch fields carry the same caps a bundle import applies, so
+// every saved Agent exports as a file that imports.
+for (const field of ["model", "effort", "mode"] as const) {
+  test(`POST /agent-profiles with a ${field} over the limit → 400`, async () => {
+    const res = await call("/agent-profiles", {
+      method: "POST",
+      body: JSON.stringify({
+        name: `Long ${field}`,
+        harness: "claude-code",
+        model: "m",
+        [field]: "a".repeat(AGENT_PROFILE_LIMITS[field] + 1),
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe(`agent ${field} must be ${AGENT_PROFILE_LIMITS[field]} characters or fewer`);
+  });
+
+  test(`PATCH /agent-profiles/:id with a ${field} over the limit → 400, and one at the limit → 200`, async () => {
+    const p = await createProfile();
+    const tooLong = await call(`/agent-profiles/${p.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ [field]: "a".repeat(AGENT_PROFILE_LIMITS[field] + 1) }),
+    });
+    expect(tooLong.status).toBe(400);
+    expect((await tooLong.json()).error).toContain(`${AGENT_PROFILE_LIMITS[field]} characters or fewer`);
+    const atCap = await call(`/agent-profiles/${p.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ [field]: "a".repeat(AGENT_PROFILE_LIMITS[field]) }),
+    });
+    expect(atCap.status).toBe(200);
+    expect(((await atCap.json()) as AgentProfile)[field]).toBe("a".repeat(AGENT_PROFILE_LIMITS[field]));
+  });
+}
+
+// A model made only of control or invisible characters would export as an
+// empty string, which no bundle can carry — refuse it at the door.
+for (const [label, model, error] of [
+  ["a control character", "opus\u001b[31m", "agent model must not contain control characters"],
+  ["an invisible character", "\u200b", "agent model must not contain invisible characters (U+200B)"],
+] as const) {
+  test(`POST and PATCH /agent-profiles with ${label} in the model → 400`, async () => {
+    const created = await call("/agent-profiles", {
+      method: "POST",
+      body: JSON.stringify({ name: `Model with ${label}`, harness: "claude-code", model }),
+    });
+    expect(created.status).toBe(400);
+    expect((await created.json()).error).toBe(error);
+    const p = await createProfile();
+    const patched = await call(`/agent-profiles/${p.id}`, { method: "PATCH", body: JSON.stringify({ model }) });
+    expect(patched.status).toBe(400);
+    expect((await patched.json()).error).toBe(error);
+  });
+}
+
+// JSON can spell an unpaired surrogate; SQLite would store it paired with
+// the next code unit (a different string), and no bundle could carry it.
+test("POST and PATCH /agent-profiles refuse a lone surrogate in every text field", async () => {
+  const p = await createProfile();
+  for (const [field, value, error] of [
+    ["name", "Rev\ud800iewer", "agent name must not contain a lone surrogate"],
+    ["model", "opus\udc00", "agent model must not contain a lone surrogate"],
+    ["effort", "high\ud800", "agent effort must not contain a lone surrogate"],
+    ["mode", "\udc00auto", "agent mode must not contain a lone surrogate"],
+    ["instructions", "Do\ud800 it", "agent instructions must not contain a lone surrogate"],
+    ["skills", ["ok", "sk\ud800ill"], "skills must not contain a lone surrogate"],
+  ] as const) {
+    const created = await call("/agent-profiles", {
+      method: "POST",
+      body: JSON.stringify({ name: `Lone ${field}`, harness: "claude-code", model: "m", [field]: value }),
+    });
+    expect(created.status).toBe(400);
+    expect((await created.json()).error).toBe(error);
+    const patched = await call(`/agent-profiles/${p.id}`, { method: "PATCH", body: JSON.stringify({ [field]: value }) });
+    expect(patched.status).toBe(400);
+    expect((await patched.json()).error).toBe(error);
+  }
+  // A surrogate PAIR is ordinary text.
+  const emoji = await call(`/agent-profiles/${p.id}`, { method: "PATCH", body: JSON.stringify({ instructions: "ship 🚀" }) });
+  expect(emoji.status).toBe(200);
+});
+
+// Same rule as a pipeline name: a stored ESC would reach every CLI listing.
+test("POST and PATCH /agent-profiles refuse a control character in name, effort and mode", async () => {
+  const p = await createProfile();
+  for (const [field, value, error] of [
+    ["name", "Rev\u001b[31miewer", "agent name must not contain control characters"],
+    ["effort", "high\u0007", "agent effort must not contain control characters"],
+    ["mode", "au\u007fto", "agent mode must not contain control characters"],
+  ] as const) {
+    const created = await call("/agent-profiles", {
+      method: "POST",
+      body: JSON.stringify({ name: `Control ${field}`, harness: "claude-code", model: "m", [field]: value }),
+    });
+    expect(created.status).toBe(400);
+    expect((await created.json()).error).toBe(error);
+    const patched = await call(`/agent-profiles/${p.id}`, { method: "PATCH", body: JSON.stringify({ [field]: value }) });
+    expect(patched.status).toBe(400);
+    expect((await patched.json()).error).toBe(error);
+  }
+  // Surrounding whitespace is trimmed before the check, as it is before storing.
+  const padded = await call(`/agent-profiles/${p.id}`, { method: "PATCH", body: JSON.stringify({ effort: "\thigh\n" }) });
+  expect(padded.status).toBe(200);
+  expect((await padded.json()).effort).toBe("high");
+});
+
+test("effort and mode are stored trimmed, and a blank one as null", async () => {
+  const pad = (n: number) => " ".repeat(n);
+  const created = await call("/agent-profiles", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "Padded launch fields",
+      harness: "claude-code",
+      model: "m",
+      // At the cap once trimmed: what is stored must be what was checked.
+      effort: `${pad(3)}${"e".repeat(AGENT_PROFILE_LIMITS.effort)}${pad(3)}`,
+      mode: `  auto  `,
+    }),
+  });
+  expect(created.status).toBe(200);
+  const p = (await created.json()) as AgentProfile;
+  expect(p.effort).toBe("e".repeat(AGENT_PROFILE_LIMITS.effort));
+  expect(p.mode).toBe("auto");
+  const patched = await call(`/agent-profiles/${p.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ effort: "   ", mode: " plan " }),
+  });
+  expect(patched.status).toBe(200);
+  const after = (await patched.json()) as AgentProfile;
+  expect(after.effort).toBeNull();
+  expect(after.mode).toBe("plan");
+});
+
+test("POST /agent-profiles with a non-string effort or mode → 400", async () => {
+  for (const field of ["effort", "mode"]) {
+    const res = await call("/agent-profiles", {
+      method: "POST",
+      body: JSON.stringify({ name: `Bad ${field}`, harness: "claude-code", model: "m", [field]: 3 }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe(`${field} must be a string or null`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 409 duplicate name — POST and PATCH
 // ---------------------------------------------------------------------------

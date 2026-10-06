@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { fetchWithRecovery, type NetRetryDeps } from "./net-retry.ts";
+import { ApiTransitError, ApiUnreachableError, fetchWithRecovery, type NetRetryDeps } from "./net-retry.ts";
 
 type Call = { url: string; init?: RequestInit };
 type Handler = (url: string, init?: RequestInit) => Promise<Response>;
@@ -133,6 +133,7 @@ describe("fetchWithRecovery", () => {
       await fetchWithRecovery(deps(fetchImpl), PATH);
       throw new Error("expected fetchWithRecovery to throw");
     } catch (e) {
+      expect(e).toBeInstanceOf(ApiTransitError);
       const message = (e as Error).message;
       expect(message).toContain("failed twice");
       expect(message).toContain(`${BASE}${PATH}`);
@@ -163,6 +164,7 @@ describe("fetchWithRecovery", () => {
       await fetchWithRecovery(deps(fetchImpl), PATH, undefined, { retry: false });
       throw new Error("expected fetchWithRecovery to throw");
     } catch (e) {
+      expect(e).toBeInstanceOf(ApiTransitError);
       const message = (e as Error).message;
       expect(message).toMatch(/not retried/i);
       expect(message).toContain(PATH);
@@ -205,6 +207,59 @@ describe("fetchWithRecovery", () => {
     ).rejects.toThrow(/aborted/i);
     // no health probe, no retry — just the original call.
     expect(calls).toHaveLength(1);
+  });
+
+  test("abort during the health probe: the probe stops at once and nothing is retried", async () => {
+    const controller = new AbortController();
+    const { fetchImpl, calls } = makeFetch([
+      async () => {
+        // A stale socket fails the request; the caller aborts while the
+        // probe is still waiting.
+        setTimeout(() => controller.abort(), 10);
+        throw new TypeError("Load failed");
+      },
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            const err = new Error("The operation was aborted.");
+            err.name = "AbortError";
+            reject(err);
+          });
+        }),
+    ]);
+
+    const start = Date.now();
+    const err = await fetchWithRecovery(deps(fetchImpl, 5000), PATH, { signal: controller.signal }).catch((e) => e);
+    expect((err as Error).name).toBe("AbortError");
+    expect(err).not.toBeInstanceOf(ApiUnreachableError);
+    // Original + probe only: no retry with the aborted signal.
+    expect(calls).toHaveLength(2);
+    // The caller's abort ended the probe, not its 5 s timeout.
+    expect(Date.now() - start).toBeLessThan(1000);
+  });
+
+  test("abort during the retry: the caller's AbortError is rethrown, not wrapped as a transit failure", async () => {
+    const controller = new AbortController();
+    const { fetchImpl, calls } = makeFetch([
+      async () => {
+        throw new TypeError("Load failed");
+      },
+      async () => ok(), // health probe: the server is alive
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            const err = new Error("The operation was aborted.");
+            err.name = "AbortError";
+            reject(err);
+          });
+          controller.abort();
+        }),
+    ]);
+
+    const err = await fetchWithRecovery(deps(fetchImpl), PATH, { signal: controller.signal }).catch((e) => e);
+    expect((err as Error).name).toBe("AbortError");
+    expect(err).not.toBeInstanceOf(ApiTransitError);
+    expect(calls).toHaveLength(3);
   });
 
   test("non-\"Load failed\" original error + dead server: original message surfaces", async () => {
@@ -252,5 +307,31 @@ describe("fetchWithRecovery", () => {
     expect(calls).toHaveLength(2); // original + health probe; no retry
     // sanity: the timeout actually gated this, not some near-instant path
     expect(elapsed).toBeLessThan(1000);
+  });
+});
+
+describe("ApiUnreachableError", () => {
+  test("a dead server throws ApiUnreachableError; a live one not-retried does not", async () => {
+    const { fetchImpl } = makeFetch([
+      async () => {
+        throw new TypeError("Load failed");
+      },
+      async () => {
+        throw new Error("ECONNREFUSED");
+      },
+    ]);
+    const dead = await fetchWithRecovery(deps(fetchImpl), PATH).catch((e: unknown) => e);
+    expect(dead).toBeInstanceOf(ApiUnreachableError);
+    expect((dead as Error).message).toContain("cannot reach agetor API");
+
+    const { fetchImpl: liveImpl } = makeFetch([
+      async () => {
+        throw new TypeError("Load failed");
+      },
+      async () => new Response("ok"),
+    ]);
+    const live = await fetchWithRecovery(deps(liveImpl), PATH, undefined, { retry: false }).catch((e: unknown) => e);
+    expect(live).toBeInstanceOf(ApiTransitError);
+    expect(live).not.toBeInstanceOf(ApiUnreachableError);
   });
 });

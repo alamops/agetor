@@ -270,6 +270,22 @@ function isPlainObject(x: unknown): x is Record<string, unknown> {
  *  identical rule to the pipeline's own name. */
 export const PIPELINE_CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
 
+/** An unpaired UTF-16 surrogate. JSON can spell one (`"\ud800"`), but it is
+ *  not text: SQLite stores the string as UTF-8, pairing a lone high surrogate
+ *  with the next code unit (`Review\ud800er` lands as `Review𐁥r`), so the
+ *  stored value would differ from the one that was checked. */
+export const LONE_SURROGATE_RE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+
+/** Why `id` can't be a step/edge id or an Agent reference, or null: control
+ *  characters and lone surrogates are refused in every identifier — an id is
+ *  printed by the CLI and quoted into errors, where a raw ESC would be a
+ *  terminal escape sequence. */
+function idCharsError(id: string, what: string): string | null {
+  if (PIPELINE_CONTROL_CHAR_RE.test(id)) return `${what} must not contain control characters`;
+  if (LONE_SURROGATE_RE.test(id)) return `${what} must not contain a lone surrogate`;
+  return null;
+}
+
 /** The key two step names are compared under for uniqueness, and the key
  *  `resolveNextSteps` matches a handoff's `next` against a step name / edge
  *  label with: trimmed, internal whitespace runs collapsed, NFC-normalized
@@ -340,7 +356,8 @@ export function validatePipelineGraph(
     const id = typeof rawStep.id === "string" && rawStep.id.length > 0 ? rawStep.id : null;
     if (id === null) return { ok: false, error: "each step must have a non-empty id" };
     if (id.length > PIPELINE_LIMITS.id) return { ok: false, error: `step id "${id}" exceeds ${PIPELINE_LIMITS.id} chars` };
-    if (PIPELINE_CONTROL_CHAR_RE.test(id)) return { ok: false, error: "step ids must not contain control characters" };
+    const stepIdError = idCharsError(id, "step ids");
+    if (stepIdError) return { ok: false, error: stepIdError };
     if (seenIds.has(id)) return { ok: false, error: `duplicate step id "${id}"` };
     seenIds.add(id);
 
@@ -348,6 +365,7 @@ export function validatePipelineGraph(
     if (PIPELINE_CONTROL_CHAR_RE.test(rawName)) {
       return { ok: false, error: `step "${id}" name must not contain control characters` };
     }
+    if (LONE_SURROGATE_RE.test(rawName)) return { ok: false, error: `step "${id}" name must not contain a lone surrogate` };
     // Trim + collapse internal whitespace runs to one space — stored that
     // way too, so the name the editor shows is the name uniqueness and
     // `next` matching are decided on.
@@ -364,6 +382,9 @@ export function validatePipelineGraph(
     if (instructions.length > PIPELINE_LIMITS.instructions) {
       return { ok: false, error: `step "${name}" instructions exceed ${PIPELINE_LIMITS.instructions} chars` };
     }
+    if (LONE_SURROGATE_RE.test(instructions)) {
+      return { ok: false, error: `step "${name}" instructions must not contain a lone surrogate` };
+    }
 
     const agentProfileId =
       typeof rawStep.agentProfileId === "string" && rawStep.agentProfileId.length > 0
@@ -372,6 +393,8 @@ export function validatePipelineGraph(
     if (agentProfileId !== null && agentProfileId.length > PIPELINE_LIMITS.id) {
       return { ok: false, error: `step "${name}" agentProfileId exceeds ${PIPELINE_LIMITS.id} chars` };
     }
+    const agentRefError = agentProfileId === null ? null : idCharsError(agentProfileId, `step "${name}" agentProfileId`);
+    if (agentRefError) return { ok: false, error: agentRefError };
 
     const rawPos = isPlainObject(rawStep.position) ? rawStep.position : {};
     const position = {
@@ -386,6 +409,10 @@ export function validatePipelineGraph(
     );
     if (profileIds.some((pid) => pid.length > PIPELINE_LIMITS.id)) {
       return { ok: false, error: `step "${name}" subagents.profileIds entry exceeds ${PIPELINE_LIMITS.id} chars` };
+    }
+    for (const pid of profileIds) {
+      const subRefError = idCharsError(pid, `step "${name}" subagents.profileIds entries`);
+      if (subRefError) return { ok: false, error: subRefError };
     }
     if (profileIds.length > PIPELINE_LIMITS.subagentProfiles) {
       return {
@@ -436,7 +463,8 @@ export function validatePipelineGraph(
     const id = typeof rawEdge.id === "string" && rawEdge.id.length > 0 ? rawEdge.id : null;
     if (id === null) return { ok: false, error: "each edge must have a non-empty id" };
     if (id.length > PIPELINE_LIMITS.id) return { ok: false, error: `edge id "${id}" exceeds ${PIPELINE_LIMITS.id} chars` };
-    if (PIPELINE_CONTROL_CHAR_RE.test(id)) return { ok: false, error: "edge ids must not contain control characters" };
+    const edgeIdError = idCharsError(id, "edge ids");
+    if (edgeIdError) return { ok: false, error: edgeIdError };
     if (seenEdgeIds.has(id)) return { ok: false, error: `duplicate edge id "${id}"` };
     seenEdgeIds.add(id);
 
@@ -459,6 +487,7 @@ export function validatePipelineGraph(
     if (PIPELINE_CONTROL_CHAR_RE.test(label)) {
       return { ok: false, error: `edge "${id}" label must not contain control characters` };
     }
+    if (LONE_SURROGATE_RE.test(label)) return { ok: false, error: `edge "${id}" label must not contain a lone surrogate` };
     edges.push({ id, from, to, label });
   }
 
@@ -486,21 +515,31 @@ export function validatePipelineGraph(
     }
     seen.set(key, edge);
   }
+  // Each source's targets by name key, built once — comparing every labeled
+  // edge with every other edge re-derived the same keys E² times. Step names
+  // are unique by key and identical edges collapse, so a key names at most
+  // one target per source.
+  const targetByNameKeyBySource = new Map<string, Map<string, string>>();
+  for (const edge of edges) {
+    let byKey = targetByNameKeyBySource.get(edge.from);
+    if (!byKey) {
+      byKey = new Map();
+      targetByNameKeyBySource.set(edge.from, byKey);
+    }
+    byKey.set(stepNameKey(stepById.get(edge.to)!.name), edge.to);
+  }
   for (const edge of edges) {
     if (edge.label.trim().length === 0) continue;
-    const key = stepNameKey(edge.label);
-    for (const sibling of edges) {
-      if (sibling.from !== edge.from || sibling.to === edge.to) continue;
-      const siblingTarget = stepById.get(sibling.to);
-      if (siblingTarget && stepNameKey(siblingTarget.name) === key) {
-        const fromName = stepById.get(edge.from)?.name ?? edge.from;
-        return {
-          ok: false,
-          error:
-            `edge "${edge.id}" from step "${fromName}" is labeled "${edge.label}", which is also the name of ` +
-            `its sibling target "${siblingTarget.name}" — the agent's "next" answer would be ambiguous`,
-        };
-      }
+    const siblingTo = targetByNameKeyBySource.get(edge.from)!.get(stepNameKey(edge.label));
+    if (siblingTo !== undefined && siblingTo !== edge.to) {
+      const siblingTarget = stepById.get(siblingTo)!;
+      const fromName = stepById.get(edge.from)?.name ?? edge.from;
+      return {
+        ok: false,
+        error:
+          `edge "${edge.id}" from step "${fromName}" is labeled "${edge.label}", which is also the name of ` +
+          `its sibling target "${siblingTarget.name}" — the agent's "next" answer would be ambiguous`,
+      };
     }
   }
 

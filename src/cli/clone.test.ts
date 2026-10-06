@@ -572,7 +572,7 @@ test("a 409 cancelled clone rejection prints 'clone cancelled' and sets exit cod
     expect(outputs.some((l) => l.includes("cloned"))).toBe(false);
     expect(currentExitCode()).toBe(130);
   } finally {
-    process.exitCode = savedExitCode;
+    process.exitCode = savedExitCode ?? 0;
   }
 });
 
@@ -594,7 +594,7 @@ test("--json: a 409 cancelled clone rejection prints the body as JSON and sets e
     expect(outputs).toEqual([]);
     expect(currentExitCode()).toBe(130);
   } finally {
-    process.exitCode = savedExitCode;
+    process.exitCode = savedExitCode ?? 0;
   }
 });
 

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Plus } from "lucide-react";
+import { Download, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -7,6 +7,8 @@ import { useConfirm } from "@/components/ui/confirm";
 import type { AgentProfile, Harness } from "../../../shared/types.ts";
 import { AgentProfileCard } from "@/components/kanban/AgentProfileCard";
 import { useAgentProfiles } from "@/lib/agent-profiles";
+import { BundleToolbar, useBundleList } from "@/components/bundle";
+import { cn } from "@/lib/utils";
 
 /** Render `p.taskCount` (server-derived, rides on the same `/agent-profiles`
  *  payload `useAgentProfiles` already fetches — no extra request) as the
@@ -29,6 +31,9 @@ interface Props {
   onAdd: () => void;
   /** Open the edit form for `profile` (same subpage, keyed on its id). */
   onEdit: (profile: AgentProfile) => void;
+  /** After a bundle import — `SettingsDialog` reloads its harness list when
+   *  the import enabled a harness. */
+  onImported?: (result: { enabledHarnesses: string[] }) => void;
 }
 
 /**
@@ -37,12 +42,15 @@ interface Props {
  * `onEdit` to `SettingsDialog`, which navigates its own agent-editor subpage
  * to `AgentProfileForm` (`@/components/kanban/AgentProfileFormDialog`, also
  * reused by a pipeline step's inline "New agent…" affordance via
- * `AgentProfileFormDialog`).
+ * `AgentProfileFormDialog`). Export/import (per-row Export, multi-select,
+ * Export all, Import, and dropping a .json file onto the list) runs through
+ * `useBundleList` — docs/plans/agents-pipelines-import-export.md C13.
  */
-export function AgentProfilesSection({ harnesses, onAdd, onEdit }: Props) {
+export function AgentProfilesSection({ harnesses, onAdd, onEdit, onImported }: Props) {
   const { profiles, loading, error: loadError, refresh } = useAgentProfiles();
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const confirm = useConfirm();
+  const bundle = useBundleList({ ids: profiles.map((p) => p.id), kind: "agent", onImported });
 
   const remove = async (p: AgentProfile) => {
     const n = p.taskCount ?? 0;
@@ -71,13 +79,20 @@ export function AgentProfilesSection({ harnesses, onAdd, onEdit }: Props) {
   };
 
   return (
-    <div data-testid="agent-profiles-section" className="space-y-4 pt-3 text-sm">
+    <div
+      data-testid="agent-profiles-section"
+      data-dragging={bundle.dragging ? "" : undefined}
+      className={cn("space-y-4 rounded-md pt-3 text-sm", bundle.dragging && "ring-2 ring-info ring-offset-2 ring-offset-card")}
+      {...bundle.dropProps}
+    >
       <div className="flex items-center justify-between">
         <label className="text-xs text-muted-foreground">Agents</label>
         <Button variant="outline" size="sm" data-testid="agent-profile-add" onClick={onAdd}>
           <Plus className="mr-1 size-3.5" /> Add agent
         </Button>
       </div>
+
+      <BundleToolbar {...bundle.toolbarProps} />
 
       {loadError && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive-foreground">
@@ -94,6 +109,14 @@ export function AgentProfilesSection({ harnesses, onAdd, onEdit }: Props) {
               data-profile-id={p.id}
               className="flex items-start gap-2 rounded-md border border-border/60 px-3 py-2"
             >
+              <input
+                type="checkbox"
+                data-testid="bundle-row-select"
+                className="mt-1 size-3.5 shrink-0 accent-primary"
+                checked={bundle.isSelected(p.id)}
+                onChange={() => bundle.toggle(p.id)}
+                aria-label={`Select ${p.name}`}
+              />
               <div className="min-w-0 flex-1">
                 <AgentProfileCard profile={p} harnesses={harnesses} variant="row" />
                 <p data-testid="agent-profile-task-count" className="mt-1 text-xs text-muted-foreground">
@@ -101,6 +124,16 @@ export function AgentProfilesSection({ harnesses, onAdd, onEdit }: Props) {
                 </p>
               </div>
               <div className="flex shrink-0 items-center gap-1 pt-0.5">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  data-testid="bundle-row-export"
+                  title={`Export "${p.name}"`}
+                  aria-label={`Export ${p.name}`}
+                  onClick={() => bundle.exportOne(p.id)}
+                >
+                  <Download className="size-3.5" aria-hidden />
+                </Button>
                 <Button size="sm" variant="ghost" data-testid="agent-profile-edit" onClick={() => onEdit(p)}>
                   Edit
                 </Button>
@@ -124,6 +157,7 @@ export function AgentProfilesSection({ harnesses, onAdd, onEdit }: Props) {
           )}
         </div>
       )}
+      {bundle.dialogs}
     </div>
   );
 }

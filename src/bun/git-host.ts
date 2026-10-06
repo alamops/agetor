@@ -47,6 +47,7 @@ import {
 } from "./github.ts";
 import { providerRepoForDir } from "./git-provider.ts";
 import { isSafeRelPath } from "./worktree.ts";
+import { shellQuote } from "../shared/shell-quote.ts";
 import {
   closeGitLabPull,
   createGitLabComment,
@@ -471,14 +472,6 @@ export async function pullDetail(input: { dir: string; number: number }): Promis
     : await getBitbucketPullDetail(repoInfo, input.number);
   if (!res.ok) return res;
   return { ...res, item: withSourcePath(res.item, input.dir) };
-}
-
-/** Single-quotes a shell argument for interpolation into the commands
- *  `refetchCommandFor` builds, escaping any embedded single quote as the
- *  standard POSIX `'\''` (close quote, escaped literal quote, reopen quote).
- *  Pure — unit-tested directly and via `refetchCommandFor`. */
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 /**

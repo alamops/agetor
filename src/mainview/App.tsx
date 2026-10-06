@@ -40,6 +40,7 @@ import { UsagePopover } from "@/components/usage/UsagePopover";
 import { visibleTopbarAgents } from "@/lib/usage";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { isMacPlatform } from "@/lib/platform";
+import { activeLeaveGuard } from "@/lib/leave-guard";
 import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -195,6 +196,20 @@ type AppView =
   | { kind: "board" }
   | { kind: "pipelines"; pipelineId: string | null; editing: boolean }
   | { kind: "pipeline-run"; taskId: string };
+
+/** The `key` a view's page mounts under in the AnimatePresence below: two
+ *  views with the same key render the same page instance, so switching
+ *  between them unmounts nothing (the pipelines list ignores `pipelineId`). */
+function viewMountKey(view: AppView): string {
+  switch (view.kind) {
+    case "board":
+      return "board";
+    case "pipelines":
+      return view.editing ? `pipelines-editor-${view.pipelineId ?? "new"}` : "pipelines-list";
+    case "pipeline-run":
+      return `pipeline-run-${view.taskId}`;
+  }
+}
 
 /**
  * The actual app tree. Split out from the default-exported `App` so it can
@@ -356,14 +371,10 @@ function AppInner() {
   useEffect(() => { viewRef.current = view; }, [view]);
   const pipelineEditorDirtyRef = useRef(pipelineEditorDirty);
   useEffect(() => { pipelineEditorDirtyRef.current = pipelineEditorDirty; }, [pipelineEditorDirty]);
-  /** Central app-level navigation: switches `view`, confirming first when
-   *  leaving the pipeline editor with unsaved changes. Every `view` change
-   *  that isn't PipelineEditor's own `onBack`/`onSaved` callback (which
-   *  handle — or don't need — the guard themselves, see
-   *  `pipelineEditorDirty` above) must go through this rather than calling
-   *  `setView` directly, so a stray click while mid-edit can't silently
-   *  discard the draft. */
-  const navigate = useCallback((next: AppView) => {
+  /** The view switch behind `navigate`, past the leave guards (below): the
+   *  pipeline editor's own guard, then the switch. Reads refs, so it's
+   *  stable like `navigate`. */
+  const switchView = useCallback((next: AppView) => {
     const current = viewRef.current;
     if (current.kind === "pipelines" && current.editing && pipelineEditorDirtyRef.current) {
       void confirm({
@@ -380,6 +391,36 @@ function AppInner() {
     }
     setView(next);
   }, [confirm]);
+  /** Central app-level navigation: switches `view`, confirming first when
+   *  leaving the pipeline editor with unsaved changes. Every `view` change
+   *  that isn't PipelineEditor's own `onBack`/`onSaved` callback (which
+   *  handle — or don't need — the guard themselves, see
+   *  `pipelineEditorDirty` above) must go through this rather than calling
+   *  `setView` directly, so a stray click while mid-edit can't silently
+   *  discard the draft. */
+  const navigate = useCallback((next: AppView) => {
+    const current = viewRef.current;
+    // Unsaved work elsewhere that this view switch would unmount (an edited
+    // import preview on the Pipelines page — lib/leave-guard.ts) asks first;
+    // a switch that keeps the same page mounted unmounts nothing.
+    const guard = viewMountKey(next) === viewMountKey(current) ? null : activeLeaveGuard();
+    if (guard) {
+      void confirm({
+        title: guard.title,
+        description: guard.description,
+        confirmLabel: "Discard",
+        variant: "destructive",
+      }).then((ok) => {
+        if (!ok) return;
+        // Drop the guarded work first (closes the import dialog now) so it
+        // doesn't linger over the old view's exit animation.
+        guard.discard?.();
+        switchView(next);
+      });
+      return;
+    }
+    switchView(next);
+  }, [confirm, switchView]);
   /** Switch the app-level `view` to a pipeline TASK's live run view — the
    *  card-open / context-menu / RunPanel-strip destination for a pipeline
    *  parent task (D5/D7, `docs/plans/pipelines.md`). Declared this early
@@ -2219,7 +2260,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
 
             {view.kind === "pipelines" && !view.editing && (
               <motion.div
-                key="pipelines-list"
+                key={viewMountKey(view)}
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -8 }}
@@ -2227,15 +2268,24 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 className="flex min-h-0 flex-1 flex-col"
               >
                 <PipelinesPage
-                  onOpenEditor={(id) => setView({ kind: "pipelines", pipelineId: id, editing: true })}
-                  onBack={() => setView({ kind: "board" })}
+                  // Through `navigate`, like every other view switch: an
+                  // edited import preview on this page asks before it goes.
+                  onOpenEditor={(id) => navigate({ kind: "pipelines", pipelineId: id, editing: true })}
+                  onBack={() => navigate({ kind: "board" })}
+                  onImported={(result) => {
+                    // A bundle import may enable a harness — refresh the
+                    // header/picker harness state now, not on the next poll.
+                    // (The Agents/Pipelines caches are refreshed by the
+                    // import dialog itself.)
+                    if (result.enabledHarnesses.length > 0) void refreshAgents();
+                  }}
                 />
               </motion.div>
             )}
 
             {view.kind === "pipelines" && view.editing && (
               <motion.div
-                key={`pipelines-editor-${view.pipelineId ?? "new"}`}
+                key={viewMountKey(view)}
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -8 }}
@@ -2268,7 +2318,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
 
             {view.kind === "pipeline-run" && (
               <motion.div
-                key={`pipeline-run-${view.taskId}`}
+                key={viewMountKey(view)}
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -8 }}

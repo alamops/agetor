@@ -137,7 +137,7 @@ flowchart LR
 - **Live run view.** The canvas animates as the pipeline runs: the active step pulses, and a token travels along each edge when a handoff happens.
 - **Blocks instead of guessing.** If a step needs your input, fails, or can't produce a valid handoff even after one automatic reminder, the card moves to **Blocked** with the reason. From there you can retry the step, choose the next step yourself, stop, or restart.
 - **Frozen at launch.** A pipeline and its Agents are captured the moment you click Run, so editing or deleting them never affects a run already in progress.
-- **Portable.** `agetor pipeline export` and `agetor pipeline import` move pipelines between machines. The file records each step's Agent by name only, without the Agent's settings. On import, each step uses the local Agent with the same name (ignoring case), with that Agent's own harness, model, permission mode and instructions. Import doesn't flag differences from the original machine, so check them with `agetor profile show <name>` before the first run. If no local Agent has the name, import warns you, and that step needs an Agent before the pipeline can run.
+- **Portable.** Export Agents and Pipelines to one JSON file and import them on another machine — from Settings → Agents, Settings → Pipelines or the Pipelines page (per row, a multi-select, or Export all; import by choosing a file, pasting JSON or dropping the file onto the list), or with `agetor export` / `agetor import`. A pipeline brings every Agent it uses, with its full settings. Each Agent records its harness and the built-in harness that harness wraps, so an Agent on an extra account such as `secondary-claude-code` still imports on a machine without that account: it lands on the built-in Claude Code harness, with a warning. Import shows a preview first — what it will create, which harness each Agent lands on, and the instructions it carries — and then creates everything in one step; in a terminal, `agetor import` prints the same preview and asks before importing (`--dry-run` only previews, `--yes` skips the question for scripts). If something changes on this machine between the preview and the import (a name gets taken, say), the import stops and shows the new preview instead of creating something you didn't confirm. Instructions with invisible characters a preview couldn't show are refused. A name that's already taken becomes `Name (imported)`; nothing local is overwritten.
 
 > [!WARNING]
 > Parallel steps share **one** worktree, and nothing stops two of them from editing the same files. Use fan-out only for work that is truly independent, such as docs in one branch and tests in another.
@@ -174,7 +174,7 @@ A step ends its turn with a block like this. The last block in the turn wins.
 
 A step can also list other Agents it's allowed to delegate to as subagents, with an optional cap. Agetor passes this to the step as guidance in its prompt; it doesn't enforce the cap. Deleting or archiving a pipeline task also deletes or archives its steps.
 
-On your own machine, a step points at the Agent itself, not at its name, so renaming an Agent doesn't break a pipeline. Two Agents can't share a name. Names only matter when you import a pipeline.
+On your own machine, a step points at the Agent itself, not at its name, so renaming an Agent doesn't break a pipeline. Two Agents can't share a name. An exported file carries the Agents themselves, so names only matter when you import a pipeline file from an older version of Agetor: those files list each step's Agent by name only, and import uses the local Agent with that name.
 
 </details>
 
@@ -218,8 +218,10 @@ agetor rm <id> --yes         # delete a task, its worktree and its branch
 agetor clone <url>           # clone a GitHub/GitLab/Bitbucket repo as a new project
 agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
 agetor harness <sub>         # list | add | edit | enable | disable | rm | shell
-agetor profile <sub>         # ls | show | add | edit | rm (saved Agents)
+agetor profile <sub>         # ls | show | add | edit | rm | export | import (saved Agents)
 agetor pipeline <sub>        # ls | show | rm | export | import | status | retry | advance | restart
+agetor export --all --out f  # Agents and/or Pipelines to a JSON file (--profile/--pipeline <ref> to pick)
+agetor import <file>         # preview + confirm, then import (--dry-run, --yes, --harness-map <from>=<to>, --enable-harnesses)
 agetor daemon status|start|stop
 agetor config [key] [value]  # view or set preferences
 ```

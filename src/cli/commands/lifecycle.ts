@@ -7,6 +7,7 @@ import { resolveRefs, warnMissingRefs } from "../refs.ts";
 import { appendReferences } from "../../shared/refs.ts";
 import { discoveredExtensionNames, filterUnresolvedRefs, warnUnresolvedRefs } from "../at-warn.ts";
 import { findAtTokens } from "../../shared/at-refs.ts";
+import { escapeFreeText } from "../../shared/terminal-text.ts";
 
 export async function cmdStart(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -175,7 +176,7 @@ export async function cmdRm(args: string[], flags: Flags): Promise<void> {
   if (!yes) {
     out(
       c.yellow(
-        `refusing to delete without --yes. Would delete "${task.title}" (${task.id.slice(0, 8)}) ` +
+        `refusing to delete without --yes. Would delete "${escapeFreeText(task.title)}" (${task.id.slice(0, 8)}) ` +
           "and its worktree + branch.",
       ),
     );

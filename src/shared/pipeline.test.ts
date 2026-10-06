@@ -532,6 +532,30 @@ describe("validatePipelineGraph", () => {
     expect(ok.ok).toBe(true);
   });
 
+  test("rejects control characters and lone surrogates in ids and Agent references", () => {
+    const withStep = (step: Record<string, unknown>) =>
+      validatePipelineGraph({ steps: [makeStep({ id: "a", ...step })], edges: [] });
+    const error = (r: ReturnType<typeof validatePipelineGraph>) => (r.ok ? null : r.error);
+    expect(error(withStep({ id: "a\ud800" }))).toBe("step ids must not contain a lone surrogate");
+    expect(error(withStep({ agentProfileId: "\u001b]0;pwned\u0007" }))).toBe(
+      'step "Step 1" agentProfileId must not contain control characters',
+    );
+    expect(error(withStep({ agentProfileId: "p\udc00" }))).toBe('step "Step 1" agentProfileId must not contain a lone surrogate');
+    expect(error(withStep({ subagents: { profileIds: ["ok", "x\u001b"], cap: null } }))).toBe(
+      'step "Step 1" subagents.profileIds entries must not contain control characters',
+    );
+    expect(error(withStep({ subagents: { profileIds: ["\ud800"], cap: null } }))).toBe(
+      'step "Step 1" subagents.profileIds entries must not contain a lone surrogate',
+    );
+    const loneEdgeId = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" })],
+      edges: [makeEdge({ id: "e\udc00", from: "a", to: "b" })],
+    });
+    expect(error(loneEdgeId)).toBe("edge ids must not contain a lone surrogate");
+    // A surrogate PAIR is ordinary text.
+    expect(withStep({ id: "a😀", agentProfileId: "p😀", subagents: { profileIds: ["q😀"], cap: null } }).ok).toBe(true);
+  });
+
   test("rejects control characters in step names, step/edge ids and edge labels (L-S1)", () => {
     const withStepName = (name: string) => validatePipelineGraph({ steps: [makeStep({ id: "a", name })], edges: [] });
     for (const bad of ["Tab\there", "New\nline", "CR\rhere", "Bell\u0007", "NUL\u0000", "Del\u007f"]) {

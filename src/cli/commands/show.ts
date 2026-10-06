@@ -5,6 +5,7 @@ import { usageError } from "../usage.ts";
 import { ApiError, type AgetorClient } from "../api-client.ts";
 import { AGENT_OPTIONS, defaultModeFor, type AgentKind, type Run, type Task } from "../../shared/types.ts";
 import { pipelineStepProgress, stepNameById } from "../../shared/pipeline.ts";
+import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
 import { colorRunStatus } from "./pipeline.ts";
 
 export async function cmdShow(args: string[], flags: Flags): Promise<void> {
@@ -21,37 +22,42 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
 
   const modeText = await resolveModeText(client, task.agent, task.mode);
 
-  out(`${c.bold(task.title)}  ${c.dim(task.id)}`);
+  // A step task's title is `<pipeline> · <step>`, both locally written names.
+  out(`${c.bold(escapeFreeText(task.title))}  ${c.dim(task.id)}`);
   // A pipeline (parent) task's own agent/model/mode are cosmetic — copied
   // from the start step's profile at create time; the parent never spawns
   // an agent, each step launches on its own frozen profile (L-CLI4).
   const agentNote = task.pipelineId ? c.dim(" (start step's harness — steps own the launch)") : "";
   out(
     `  ${label("column")} ${colorColumn(task.column)}   ${label("agent")} ${task.agent}${agentNote}` +
-      `   ${label("model")} ${task.model ?? "-"}   ${label("mode")} ${modeText}`,
+      `   ${label("model")} ${escapeControlChars(task.model ?? "-")}   ${label("mode")} ${escapeControlChars(modeText)}`,
   );
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
   if (task.branch) out(`  ${label("branch")} ${task.branch}`);
   if (task.issueUrl) out(`  ${label("issue")} ${task.issueUrl}`);
   if (task.agentProfile) {
     const deletedSuffix = await agentProfileDeletedSuffix(client, task);
-    out(`  ${label("profile")} ${task.agentProfile.name} (${task.agentProfile.id})${deletedSuffix}`);
+    out(`  ${label("profile")} ${escapeControlChars(task.agentProfile.name)} (${task.agentProfile.id})${deletedSuffix}`);
   }
   if (task.pipelineId && task.pipelineRun) {
     const progress = pipelineStepProgress(task.pipelineRun);
     out(
-      `  ${label("pipeline")} ${task.pipelineRun.pipelineName} (${task.pipelineId})` +
-        `   ${label("status")} ${colorRunStatus(task.pipelineRun.status)}   ${label("steps")} ${progress.label}`,
+      `  ${label("pipeline")} ${escapeControlChars(task.pipelineRun.pipelineName)} (${task.pipelineId})` +
+        `   ${label("status")} ${colorRunStatus(task.pipelineRun.status)}   ${label("steps")} ${escapeControlChars(progress.label)}`,
     );
+    // A block message can quote an agent's own handoff text verbatim.
     for (const b of task.pipelineRun.blocked) {
-      out(c.yellow(`    ⚠ ${b.message}`));
+      out(c.yellow(`    ⚠ ${escapeFreeText(b.message)}`));
     }
   }
   if (task.pipelineParentId) {
     const stepOf = await pipelineStepOfText(client, task);
     if (stepOf) out(`  ${label("step of")} ${stepOf}`);
   }
-  out(`  ${label("prompt")} ${c.dim(truncate(task.prompt, 240))}`);
+  // The prompt can be third-party text (`agetor add --issue` quotes an issue
+  // body): line breaks fold to spaces for this one-line summary, and control
+  // and invisible characters are escaped so none reaches the terminal.
+  out(`  ${label("prompt")} ${c.dim(promptSummary(task.prompt))}`);
   if (pending.length > 0) {
     out(
       c.yellow(
@@ -148,7 +154,7 @@ async function pipelineStepOfText(client: AgetorClient, task: Task): Promise<str
     const { task: parent } = await client.getPipelineRun(parentId);
     const graph = parent.pipelineRun?.snapshot?.graph;
     const stepName = graph && task.pipelineStepId ? stepNameById(graph, task.pipelineStepId) : task.title;
-    return `${parent.title} (${parent.id}) · step ${stepName}`;
+    return `${escapeFreeText(parent.title)} (${parent.id}) · step ${escapeControlChars(stepName)}`;
   } catch (e) {
     if (e instanceof ApiError && e.status === 404) {
       return `${parentId} ${c.yellow("(pipeline task no longer exists — this step can be deleted/archived directly)")}`;
@@ -160,9 +166,12 @@ async function pipelineStepOfText(client: AgetorClient, task: Task): Promise<str
 function label(s: string): string {
   return c.dim(s + ":");
 }
-function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+/** The `prompt:` line of `agetor show`: one line, at most 240 characters
+ *  of the prompt, escaped for the terminal. */
+export function promptSummary(prompt: string): string {
+  return escapeFreeText(truncateText(prompt.replace(/[\r\n]+/g, " "), 240));
 }
+
 function colorColumn(col: string): string {
   if (col === "running") return c.cyan(col);
   if (col === "blocked") return c.yellow(col);

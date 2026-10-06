@@ -1222,6 +1222,36 @@ test("POST/PATCH /pipelines reject a name with control characters (L-S1)", async
   expect((await badStep.json()).error).toContain("control characters");
 });
 
+test("POST/PATCH /pipelines refuse lone surrogates, and control characters in Agent references", async () => {
+  const post = (body: Record<string, unknown>) =>
+    call("/pipelines", { method: "POST", body: JSON.stringify({ graph: oneStepGraph(), ...body, name: body.name ?? "Lone" }) });
+  const cases: [Record<string, unknown>, string][] = [
+    [{ name: "Fl\ud800ow" }, "pipeline name must not contain a lone surrogate"],
+    [{ description: "d\udc00" }, "pipeline description must not contain a lone surrogate"],
+    [{ graph: oneStepGraph(null, { name: "St\ud800ep" }) }, "name must not contain a lone surrogate"],
+    [{ graph: oneStepGraph(null, { instructions: "x\udc00" }) }, "instructions must not contain a lone surrogate"],
+    [{ graph: oneStepGraph(null, { id: "s\ud800" }) }, "step ids must not contain a lone surrogate"],
+    [{ graph: oneStepGraph("\u001b]0;pwned\u0007") }, "agentProfileId must not contain control characters"],
+    [{ graph: oneStepGraph("p\udc00") }, "agentProfileId must not contain a lone surrogate"],
+    [
+      { graph: oneStepGraph(null, { subagents: { profileIds: ["x\u001b[2J"], cap: null } }) },
+      "subagents.profileIds entries must not contain control characters",
+    ],
+  ];
+  for (const [body, error] of cases) {
+    const res = await post(body);
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toContain(error);
+  }
+  const created = await createPipeline(null, { name: "Surrogate-free" });
+  const patched = await call(`/pipelines/${created.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ description: "\ud800" }),
+  });
+  expect(patched.status).toBe(400);
+  expect((await patched.json()).error).toBe("pipeline description must not contain a lone surrogate");
+});
+
 test("POST/PATCH /pipelines with a non-string description → 400 'description must be a string' (L-S6)", async () => {
   const post = await call("/pipelines", {
     method: "POST",

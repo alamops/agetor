@@ -11,6 +11,7 @@ import {
 } from "../../shared/fx-recovery.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
 import { pipelineStepProgress } from "../../shared/pipeline.ts";
+import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
 import {
   parseSentFilesToolUse,
   parseSentFilesToolResult,
@@ -292,7 +293,7 @@ export function Dashboard({
           const extensionNames = await getExtensionNames(task);
           const filtered = filterUnresolvedRefs(res.unresolvedRefs, { extensionNames });
           const fragment = unresolvedWarningFragment(filtered);
-          setStatus(fragment ? truncate(`${okLabel}${fragment}`, 120) : okLabel);
+          setStatus(fragment ? truncateText(`${okLabel}${fragment}`, 120) : okLabel);
         } else {
           setStatus(okLabel);
         }
@@ -393,7 +394,7 @@ export function Dashboard({
               const filtered = filterUnresolvedRefs(res.unresolvedRefs, { extensionNames });
               const fragment = unresolvedWarningFragment(filtered);
               if (fragment) {
-                setStatus(truncate(`▸ started ${sid}${fragment}`, 120));
+                setStatus(truncateText(`▸ started ${sid}${fragment}`, 120));
                 return;
               }
             }
@@ -611,7 +612,7 @@ const TaskRow = memo(function TaskRow({
   // pipeline task (not just a blocked one — unlike `ls.ts`'s "needs" cell,
   // which only surfaces on `blocked` to keep that shared cell uncluttered)
   // since this is this row's ONLY place pipeline progress renders at all.
-  const pipelineText = task.pipelineId && task.pipelineRun ? `» ${pipelineStepProgress(task.pipelineRun).label}` : null;
+  const pipelineText = task.pipelineId && task.pipelineRun ? `» ${escapeControlChars(pipelineStepProgress(task.pipelineRun).label)}` : null;
   // Budget the title so the row can never need to wrap, even if a glyph renders
   // a cell wider than measured in some terminal. The fixed prefix is the marker
   // (2) + glyph (1) + " <id> " (id length + 2); the badge is " !N"; the pause
@@ -639,7 +640,7 @@ const TaskRow = memo(function TaskRow({
       {indent ? <Text dimColor>{indent}</Text> : null}
       {columnGlyph(task, frame)}
       <Text dimColor> {id} </Text>
-      <Text bold={active}>{truncate(task.title, titleMax)}</Text>
+      <Text bold={active}>{escapeFreeText(truncateText(task.title, titleMax))}</Text>
       {needs > 0 ? <Text color="yellow"> !{needs}</Text> : null}
       {pipelineText ? <Text color="magenta"> · {pipelineText}</Text> : null}
       {pauseText ? <Text color="yellow"> · {pauseText}</Text> : null}
@@ -692,7 +693,7 @@ function Detail({
   return (
     <Box flexDirection="column">
       <Text wrap="truncate">
-        <Text bold>{task.title}</Text> <Text dimColor>{task.id.slice(0, 8)}</Text>{" "}
+        <Text bold>{escapeFreeText(task.title)}</Text> <Text dimColor>{task.id.slice(0, 8)}</Text>{" "}
         <Text color={columnColor(task.column)}>{task.column}</Text>
         {task.pendingInteractionCount > 0 ? (
           <Text color="yellow"> · ! press g to answer</Text>
@@ -716,7 +717,7 @@ function Detail({
           // transcripts live (the TUI mirror of `agetor logs`'s
           // `pipelineLogsHint`, L-CLI10).
           <Text dimColor wrap="wrap">
-            pipeline task — {task.pipelineRun ? `${pipelineStepProgress(task.pipelineRun).label} · ` : ""}
+            pipeline task — {task.pipelineRun ? `${escapeControlChars(pipelineStepProgress(task.pipelineRun).label)} · ` : ""}
             {expanded
               ? "select a ↳ step row below it to watch that step's transcript (p hides them)"
               : "press p to list its step tasks, then select one to watch its transcript"}
@@ -1025,9 +1026,9 @@ function Footer({
     <Box justifyContent="space-between" paddingX={1}>
       <Text dimColor>{hint}</Text>
       {toast ? (
-        <Text color={toast.color}>{toast.text}</Text>
+        <Text color={toast.color}>{escapeFreeText(toast.text)}</Text>
       ) : status ? (
-        <Text color="cyan">{status}</Text>
+        <Text color="cyan">{escapeFreeText(status) /* can quote a server error naming a stored name */}</Text>
       ) : (
         <Text> </Text>
       )}
@@ -1078,10 +1079,6 @@ function columnColor(col: string): string {
   if (col === "blocked") return "yellow";
   if (col === "review" || col === "done") return "green";
   return "white";
-}
-
-function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
 /** `" · ⚠ N @ ref(s) won't resolve: ..."` fragment for a non-empty, already

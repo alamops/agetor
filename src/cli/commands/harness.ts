@@ -4,6 +4,7 @@ import { flagValue } from "../args.ts";
 import { ApiError, type HarnessPatchInput } from "../api-client.ts";
 import type { AgentKind } from "../../shared/types.ts";
 import { usageError } from "../usage.ts";
+import { escapeControlChars } from "../../shared/terminal-text.ts";
 
 export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
   const sub = args[0] ?? "ls";
@@ -20,7 +21,8 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
           h.enabled ? c.green("✓") : c.gray("·"),
           c.bold(h.id),
           c.gray(h.kind),
-          h.label,
+          // The route stores a label as typed, control characters included.
+          escapeControlChars(h.label),
           st?.available ? c.green("ready") : c.red(st?.reason ?? "unavailable"),
           st?.version ?? "",
           h.isBuiltin ? c.dim("built-in") : "",

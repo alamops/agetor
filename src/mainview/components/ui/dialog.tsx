@@ -26,7 +26,18 @@ const FOCUSABLE_SELECTOR = [
   "select:not([disabled])",
   "textarea:not([disabled])",
   '[tabindex]:not([tabindex="-1"])',
+  // A <details> disclosure's toggle is focusable without a tabindex.
+  "details > summary:first-of-type",
 ].join(",");
+
+/** The panel's tabbable elements, in DOM order. A form control disabled by
+ *  an ancestor `<fieldset disabled>` carries no `disabled` attribute of its
+ *  own, so the selector alone would trap focus onto it; `:disabled` is the
+ *  browser's own answer, and it already exempts controls in the fieldset's
+ *  first `<legend>` (links and summaries are never disabled by a fieldset). */
+function tabbables(root: HTMLElement): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter((el) => !el.matches(":disabled"));
+}
 
 // Dialogs can nest (Settings → GitHub setup guide, confirm.tsx overlays over
 // another Dialog): each open Dialog registers its own document-level keydown
@@ -139,7 +150,7 @@ export function Dialog({
       if (e.key !== "Tab") return;
       const root = panelRef.current;
       if (!root) return;
-      const items = root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
+      const items = tabbables(root);
       if (items.length === 0) {
         // No focusable children — keep focus on the panel itself.
         e.preventDefault();

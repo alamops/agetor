@@ -1,9 +1,11 @@
 import { useState } from "react";
-import { ExternalLink, Pencil, Plus, Trash2, Workflow } from "lucide-react";
+import { Download, ExternalLink, Pencil, Plus, Trash2, Workflow } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm";
 import { usePipelines } from "@/lib/pipelines";
 import { api, ApiError } from "@/lib/api";
+import { BundleToolbar, useBundleList } from "@/components/bundle";
+import { cn } from "@/lib/utils";
 import type { Pipeline } from "../../../shared/types.ts";
 
 interface Props {
@@ -12,6 +14,9 @@ interface Props {
    *  `editing: true` for a specific pipeline's editor ("Edit"/"New
    *  pipeline"). The caller (App.tsx) also closes the Settings dialog. */
   onOpenPipelines: (id: string | null, editing: boolean) => void;
+  /** After a bundle import — `SettingsDialog` reloads its harness list when
+   *  the import enabled a harness. */
+  onImported?: (result: { enabledHarnesses: string[] }) => void;
 }
 
 /**
@@ -21,12 +26,15 @@ interface Props {
  * `AgentProfilesSection`'s list-and-delete posture, but the editor is a
  * full-page React Flow canvas, so this hands off to that page (closing
  * Settings) instead of opening a Settings subpage the way Agents does.
+ * Export/import runs through `useBundleList`, like the Agents section
+ * (docs/plans/agents-pipelines-import-export.md C13).
  */
-export function PipelinesSection({ onOpenPipelines }: Props) {
+export function PipelinesSection({ onOpenPipelines, onImported }: Props) {
   const { pipelines, loading, error: loadError, refresh } = usePipelines();
   const confirm = useConfirm();
   const [busyId, setBusyId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const bundle = useBundleList({ ids: pipelines.map((p) => p.id), kind: "pipeline", onImported });
 
   const remove = async (p: Pipeline) => {
     const n = p.taskCount ?? 0;
@@ -53,7 +61,12 @@ export function PipelinesSection({ onOpenPipelines }: Props) {
   };
 
   return (
-    <div data-testid="pipelines-section" className="space-y-4 pt-3 text-sm">
+    <div
+      data-testid="pipelines-section"
+      data-dragging={bundle.dragging ? "" : undefined}
+      className={cn("space-y-4 rounded-md pt-3 text-sm", bundle.dragging && "ring-2 ring-info ring-offset-2 ring-offset-card")}
+      {...bundle.dropProps}
+    >
       <div className="flex items-center justify-between">
         <label className="text-xs text-muted-foreground">Pipelines</label>
         <div className="flex items-center gap-1.5">
@@ -77,6 +90,8 @@ export function PipelinesSection({ onOpenPipelines }: Props) {
         </div>
       </div>
 
+      <BundleToolbar {...bundle.toolbarProps} />
+
       {actionError && <p className="text-xs text-danger">{actionError}</p>}
       {loadError && <p className="text-xs text-danger">{loadError}</p>}
 
@@ -96,6 +111,14 @@ export function PipelinesSection({ onOpenPipelines }: Props) {
               data-pipeline-id={p.id}
               className="flex items-start gap-3 rounded-lg border border-border bg-card p-3"
             >
+              <input
+                type="checkbox"
+                data-testid="bundle-row-select"
+                className="mt-1 size-3.5 shrink-0 accent-primary"
+                checked={bundle.isSelected(p.id)}
+                onChange={() => bundle.toggle(p.id)}
+                aria-label={`Select ${p.name}`}
+              />
               <Workflow className="mt-0.5 size-4 shrink-0 text-info" aria-hidden />
               <div className="min-w-0 flex-1">
                 <button
@@ -112,6 +135,18 @@ export function PipelinesSection({ onOpenPipelines }: Props) {
                 </p>
               </div>
               <div className="flex shrink-0 items-center gap-1">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  title="Export"
+                  aria-label={`Export ${p.name}`}
+                  data-testid="bundle-row-export"
+                  onClick={() => bundle.exportOne(p.id)}
+                  className="size-8"
+                >
+                  <Download className="size-3.5" aria-hidden />
+                </Button>
                 <Button
                   type="button"
                   variant="ghost"
@@ -141,6 +176,7 @@ export function PipelinesSection({ onOpenPipelines }: Props) {
           ))}
         </ul>
       )}
+      {bundle.dialogs}
     </div>
   );
 }

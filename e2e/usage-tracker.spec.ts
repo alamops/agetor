@@ -60,8 +60,22 @@ function claudeCodeQuota(): HarnessQuota {
 
 test("renders the claude-code chip's worst-meter mini-bar and its popover's meter rows, plan, and Refresh; Escape closes it", async ({
   page,
+  request,
   backend,
 }) => {
+  // The "disabled harnesses render no chip" assertion below needs the other
+  // built-ins at their shipped default (disabled), but this worker's backend
+  // is shared with sibling spec files that enable some of them (the fx
+  // specs enable fx.sh, agent-profiles-* enable cursor/gemini) — so pin that
+  // precondition here instead of relying on file order. Every such sibling
+  // enables what it needs itself, so this can't leak the other way.
+  for (const id of ["codex", "cursor", "gemini", "fx"]) {
+    const res = await request.patch(`${backend.apiBase}/harnesses/${id}`, {
+      headers: { authorization: `Bearer ${backend.apiToken}` },
+      data: { enabled: false },
+    });
+    expect(res.ok(), `PATCH /harnesses/${id} -> ${res.status()}`).toBeTruthy();
+  }
   seedHarnessUsage(backend, claudeCodeQuota());
   await gotoApp(page, backend.bootBase);
 

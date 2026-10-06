@@ -27,19 +27,27 @@ export const AGENT_PROFILE_LIMITS = {
   instructions: 20_000,
   skills: 50,
   skillName: 100,
+  /** Free-text launch fields; the same caps a bundle import applies. */
+  model: 200,
+  effort: 100,
+  mode: 100,
 } as const;
 
+/** Leading slashes and whitespace, in any mix, that a skill token drops. */
+export const SKILL_NAME_LEAD_RE = /^[\s/]+/;
+
 /**
- * Normalize a user-typed or autocompleted skill token: trim, strip one
- * leading `/` (the composer's own `/name` insert syntax, and a pasted slash
- * command), trim again, then collapse any run of internal whitespace to a
- * single space. Returns `""` — the caller's signal to drop the token — when
- * the result is empty or longer than {@link AGENT_PROFILE_LIMITS.skillName}.
+ * Normalize a user-typed or autocompleted skill token: strip every leading
+ * `/` and whitespace character (the composer's own `/name` insert syntax, a
+ * pasted slash command, or a doubled `//name`), trim the end, then collapse
+ * any run of internal whitespace to a single space. Idempotent — a stored
+ * name normalizes to itself, so the preview, the route and the db layer
+ * (each of which normalizes) always agree. Returns `""` — the caller's signal
+ * to drop the token — when the result is empty or longer than
+ * {@link AGENT_PROFILE_LIMITS.skillName}.
  */
 export function normalizeSkillName(raw: string): string {
-  let name = raw.trim();
-  if (name.startsWith("/")) name = name.slice(1);
-  name = name.trim().replace(/\s+/g, " ");
+  const name = raw.replace(SKILL_NAME_LEAD_RE, "").trim().replace(/\s+/g, " ");
   if (name.length === 0 || name.length > AGENT_PROFILE_LIMITS.skillName) return "";
   return name;
 }
