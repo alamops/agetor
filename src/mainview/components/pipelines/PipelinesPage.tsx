@@ -6,6 +6,7 @@ import { usePipelines } from "@/lib/pipelines";
 import { api, ApiError } from "@/lib/api";
 import { BundleToolbar, useBundleList } from "@/components/bundle";
 import { cn } from "@/lib/utils";
+import { duplicateAgentName } from "../../../shared/duplicate-name.ts";
 import { PIPELINE_LIMITS } from "../../../shared/types.ts";
 import type { Pipeline } from "../../../shared/types.ts";
 
@@ -219,18 +220,8 @@ export function PipelinesPage({ onOpenEditor, onBack, onImported }: PipelinesPag
   );
 }
 
-/** " (copy)" / " (copy 2)" / … suffix, capped at `PIPELINE_LIMITS.name`, that
- *  avoids colliding with an existing pipeline name (case-insensitive,
- *  trimmed — matching the server's own uniqueness rule). */
+/** " (copy)" / " (copy 2)" / … suffix that avoids colliding with an existing
+ *  pipeline name and keeps the suffix inside `PIPELINE_LIMITS.name`. */
 function duplicateName(base: string, existing: Pipeline[]): string {
-  const used = new Set(existing.map((p) => p.name.trim().toLowerCase()));
-  const truncate = (s: string) => s.slice(0, PIPELINE_LIMITS.name);
-  let candidate = truncate(`${base} (copy)`);
-  if (!used.has(candidate.toLowerCase())) return candidate;
-  let n = 2;
-  do {
-    candidate = truncate(`${base} (copy ${n})`);
-    n += 1;
-  } while (used.has(candidate.toLowerCase()) && n < 1000);
-  return candidate;
+  return duplicateAgentName(base, existing.map((p) => p.name), PIPELINE_LIMITS.name);
 }
