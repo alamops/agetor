@@ -1013,7 +1013,7 @@ test.describe("agent profiles — Settings surface", () => {
       fast: false,
       maxMode: false,
       instructions: sourceInstructions,
-      skills: [],
+      skills: ["code-review"],
     });
     createdProfileIds.push(source.id);
 
@@ -1039,18 +1039,67 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
     await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy)`);
     await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(sourceInstructions);
+    // These are not the blank-create defaults (opus-5.5 / auto), so a missed
+    // launch seed cannot pass the way a Claude Code harness check can.
+    await expect(launchSelect(form, "Model")).toHaveValue("sonnet-5");
+    await expect(launchSelect(form, "Effort")).toHaveValue("medium");
+    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
+    await expect(form.locator('[data-testid="skills-picker-chip"][data-skill="code-review"]')).toBeVisible();
+    await expect(modal.getByTestId("agent-profile-editor")).toBeVisible();
     await form.getByTestId("agent-profile-save").click();
     await expect(form).toBeHidden();
     await expectAgentsList(modal);
     const copyName = `${sourceName} (copy)`;
     await expect(modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: copyName })).toBeVisible();
-    createdProfileIds.push(await getProfileIdByName(request, backend, copyName));
+    const copyId = await getProfileIdByName(request, backend, copyName);
+    createdProfileIds.push(copyId);
+    const copy = await getAgentProfile(request, backend, copyId);
+    expect(copy.harness).toBe("claude-code");
+    expect(copy.model).toBe("sonnet-5");
+    expect(copy.effort).toBe("medium");
+    expect(copy.mode).toBe("plan");
+    expect(copy.instructions).toBe(sourceInstructions);
+    expect(copy.skills).toEqual(["code-review"]);
+    expect(copy.id).not.toBe(source.id);
+
+    const sourceAfter = await getAgentProfile(request, backend, source.id);
+    expect(sourceAfter.name).toBe(sourceName);
+    expect(sourceAfter.instructions).toBe(sourceInstructions);
+    expect(sourceAfter.model).toBe("sonnet-5");
+    expect(sourceAfter.mode).toBe("plan");
+    expect(sourceAfter.effort).toBe("medium");
+    expect(sourceAfter.skills).toEqual(["code-review"]);
+    await expect(sourceRow()).toBeVisible();
+
+    // Open the saved copy: this is an edit of the new agent, and the source text survived.
+    const copyRow = modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: copyName });
+    await copyRow.getByTestId("agent-profile-edit").click();
+    await expect(form).toBeVisible();
+    await expect(heading).toHaveText("Edit agent");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(copyName);
+    await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(sourceInstructions);
+    await expect(launchSelect(form, "Model")).toHaveValue("sonnet-5");
+    await expect(form.locator('[data-testid="skills-picker-chip"][data-skill="code-review"]')).toBeVisible();
+    await form.getByTestId("agent-profile-cancel").click();
+    await expect(form).toBeHidden();
+    await expectAgentsList(modal);
+
+    // Edit of the source still opens the original, not the duplicate draft.
+    await sourceRow().getByTestId("agent-profile-edit").click();
+    await expect(form).toBeVisible();
+    await expect(heading).toHaveText("Edit agent");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(sourceName);
+    await form.getByTestId("agent-profile-cancel").click();
+    await expect(form).toBeHidden();
 
     // Second duplicate of the same source → "(copy 2)". Untouched Back: no confirm.
     await sourceRow().getByTestId("agent-profile-duplicate").click();
     await expect(form).toBeVisible();
     await expect(heading).toHaveText("Duplicate agent");
     await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy 2)`);
+    await expect(launchSelect(form, "Model")).toHaveValue("sonnet-5");
+    await expect(launchSelect(form, "Effort")).toHaveValue("medium");
+    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
     await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
     await modal.getByRole("button", { name: "Back", exact: true }).click();
     await expect(discardConfirm(page)).toHaveCount(0);
@@ -1081,6 +1130,64 @@ test.describe("agent profiles — Settings surface", () => {
     const names = ((await listRes.json()) as { name: string }[]).map((p) => p.name);
     expect(names).not.toContain(renamed);
     expect(names).not.toContain(`${sourceName} (copy 2)`);
+  });
+
+  test("Duplicate copies cursor fast and max mode without changing the source", async ({ page, request, backend }) => {
+    await patchHarness(request, backend, "cursor", { enabled: true });
+    try {
+      const sourceName = `Cursor Duplicate ${randomUUID()}`;
+      const source = await createAgentProfileRest(request, backend, {
+        name: sourceName,
+        harness: "cursor",
+        model: "gpt-5.3-codex",
+        effort: "high",
+        mode: "ask",
+        fast: true,
+        maxMode: true,
+        instructions: "",
+        skills: [],
+      });
+      createdProfileIds.push(source.id);
+
+      await gotoApp(page, backend.bootBase);
+      await openSettingsAgents(page);
+      const modal = settingsModal(page);
+      const sourceRow = modal
+        .locator('[data-testid="agent-profile-row"]')
+        .filter({ hasText: sourceName })
+        .filter({ hasNotText: "(copy)" });
+      await sourceRow.getByTestId("agent-profile-duplicate").click();
+      const form = modal.getByTestId("agent-profile-form");
+      await expect(form).toBeVisible();
+      await expect(modal.locator("#settings-dialog-title")).toHaveText("Duplicate agent");
+      await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy)`);
+      await expect(harnessButton(form, "Cursor")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
+      await expect(launchSelect(form, "Model")).toHaveValue("gpt-5.3-codex");
+      await expect(launchSelect(form, "Mode")).toHaveValue("ask");
+      await expect(form.getByTestId("launch-max-mode-toggle").getByRole("switch")).toHaveAttribute("aria-checked", "true");
+      await expect(form.getByTestId("launch-fast-toggle").getByRole("switch")).toHaveAttribute("aria-checked", "true");
+
+      await form.getByTestId("agent-profile-save").click();
+      await expect(form).toBeHidden();
+
+      const copyName = `${sourceName} (copy)`;
+      const copyId = await getProfileIdByName(request, backend, copyName);
+      createdProfileIds.push(copyId);
+      const copy = await getAgentProfile(request, backend, copyId);
+      expect(copy.harness).toBe("cursor");
+      expect(copy.model).toBe("gpt-5.3-codex");
+      expect(copy.mode).toBe("ask");
+      expect(copy.fast).toBe(true);
+      expect(copy.maxMode).toBe(true);
+
+      const sourceAfter = await getAgentProfile(request, backend, source.id);
+      expect(sourceAfter.name).toBe(sourceName);
+      expect(sourceAfter.fast).toBe(true);
+      expect(sourceAfter.maxMode).toBe(true);
+      expect(sourceAfter.model).toBe("gpt-5.3-codex");
+    } finally {
+      await patchHarness(request, backend, "cursor", { enabled: false });
+    }
   });
 });
 
