@@ -37,19 +37,31 @@ describe("normalizeSkillName", () => {
     expect(normalizeSkillName("  foo  ")).toBe("foo");
   });
 
-  test("strips exactly one leading slash", () => {
+  test("strips a leading slash", () => {
     expect(normalizeSkillName("/foo")).toBe("foo");
   });
 
-  test("strips only ONE leading slash — a second leading slash survives", () => {
-    expect(normalizeSkillName("//foo")).toBe("/foo");
+  test("strips every leading slash, mixed with whitespace", () => {
+    expect(normalizeSkillName("//foo")).toBe("foo");
+    expect(normalizeSkillName(" / /foo")).toBe("foo");
+  });
+
+  test("is idempotent — a normalized name normalizes to itself", () => {
+    for (const raw of ["//foo", " / /foo  bar ", "/a/b", "foo/", "  x  "]) {
+      const once = normalizeSkillName(raw);
+      expect(normalizeSkillName(once)).toBe(once);
+    }
+  });
+
+  test("keeps an internal slash", () => {
+    expect(normalizeSkillName("/plugin:a/b")).toBe("plugin:a/b");
   });
 
   test("collapses internal whitespace runs to a single space", () => {
     expect(normalizeSkillName("foo   bar")).toBe("foo bar");
   });
 
-  test("combination: outer whitespace, one leading slash, internal whitespace runs", () => {
+  test("combination: outer whitespace, a leading slash, internal whitespace runs", () => {
     expect(normalizeSkillName("  /  foo   bar  ")).toBe("foo bar");
   });
 

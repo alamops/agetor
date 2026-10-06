@@ -40,6 +40,7 @@ import { UsagePopover } from "@/components/usage/UsagePopover";
 import { visibleTopbarAgents } from "@/lib/usage";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { isMacPlatform } from "@/lib/platform";
+import { activeLeaveGuard } from "@/lib/leave-guard";
 import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -196,6 +197,20 @@ type AppView =
   | { kind: "pipelines"; pipelineId: string | null; editing: boolean }
   | { kind: "pipeline-run"; taskId: string };
 
+/** The `key` a view's page mounts under in the AnimatePresence below: two
+ *  views with the same key render the same page instance, so switching
+ *  between them unmounts nothing (the pipelines list ignores `pipelineId`). */
+function viewMountKey(view: AppView): string {
+  switch (view.kind) {
+    case "board":
+      return "board";
+    case "pipelines":
+      return view.editing ? `pipelines-editor-${view.pipelineId ?? "new"}` : "pipelines-list";
+    case "pipeline-run":
+      return `pipeline-run-${view.taskId}`;
+  }
+}
+
 /**
  * The actual app tree. Split out from the default-exported `App` so it can
  * live *inside* `<ThemeProvider>` and call `useTheme()` — the provider must
@@ -216,7 +231,7 @@ function AppInner() {
   // tabs/panels never re-triggers a redundant `GET /agent-profiles` — see
   // `useAgentProfiles`'s own doc comment.
   const { profiles, loaded: profilesLoaded, refresh: refreshProfiles } = useAgentProfiles();
-  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
+  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], antigravity: [], fx: [] });
   // Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`.
   // `discoveryReady` mirrors the daemon's boot discovery sweep: false until
   // the first `GET /agent-models/harnesses` reports `ready: true`, which is
@@ -356,18 +371,12 @@ function AppInner() {
   useEffect(() => { viewRef.current = view; }, [view]);
   const pipelineEditorDirtyRef = useRef(pipelineEditorDirty);
   useEffect(() => { pipelineEditorDirtyRef.current = pipelineEditorDirty; }, [pipelineEditorDirty]);
-  /** Central app-level navigation: switches `view`, confirming first when
-   *  leaving the pipeline editor with unsaved changes. Every `view` change
-   *  that isn't PipelineEditor's own `onBack`/`onSaved` callback (which
-   *  handle — or don't need — the guard themselves, see
-   *  `pipelineEditorDirty` above) must go through this rather than calling
-   *  `setView` directly, so a stray click while mid-edit can't silently
-   *  discard the draft. `onNavigated` runs right after the view switch
+  /** The view switch behind `navigate`, past the leave guards (below): the
+   *  pipeline editor's own guard, then the switch. Reads refs, so it's
+   *  stable like `navigate`. `onNavigated` runs right after the switch
    *  commits (synchronously, or once the discard-confirm is accepted) and
-   *  never when that confirm is cancelled — so whatever a landing opens on
-   *  top of the new view (a step's run panel, or closing a leftover one)
-   *  can't land over the editor the user chose to keep editing. */
-  const navigate = useCallback((next: AppView, onNavigated?: () => void) => {
+   *  never when that confirm is cancelled. */
+  const switchView = useCallback((next: AppView, onNavigated?: () => void) => {
     const current = viewRef.current;
     if (current.kind === "pipelines" && current.editing && pipelineEditorDirtyRef.current) {
       void confirm({
@@ -386,6 +395,40 @@ function AppInner() {
     setView(next);
     onNavigated?.();
   }, [confirm]);
+  /** Central app-level navigation: switches `view`, confirming first when
+   *  leaving the pipeline editor with unsaved changes. Every `view` change
+   *  that isn't PipelineEditor's own `onBack`/`onSaved` callback (which
+   *  handle — or don't need — the guard themselves, see
+   *  `pipelineEditorDirty` above) must go through this rather than calling
+   *  `setView` directly, so a stray click while mid-edit can't silently
+   *  discard the draft. `onNavigated` runs right after the view switch
+   *  commits (synchronously, or once a discard-confirm is accepted) and
+   *  never when a confirm is cancelled — so whatever a landing opens on
+   *  top of the new view (a step's run panel, or closing a leftover one)
+   *  can't land over work the user chose to keep. */
+  const navigate = useCallback((next: AppView, onNavigated?: () => void) => {
+    const current = viewRef.current;
+    // Unsaved work elsewhere that this view switch would unmount (an edited
+    // import preview on the Pipelines page — lib/leave-guard.ts) asks first;
+    // a switch that keeps the same page mounted unmounts nothing.
+    const guard = viewMountKey(next) === viewMountKey(current) ? null : activeLeaveGuard();
+    if (guard) {
+      void confirm({
+        title: guard.title,
+        description: guard.description,
+        confirmLabel: "Discard",
+        variant: "destructive",
+      }).then((ok) => {
+        if (!ok) return;
+        // Drop the guarded work first (closes the import dialog now) so it
+        // doesn't linger over the old view's exit animation.
+        guard.discard?.();
+        switchView(next, onNavigated);
+      });
+      return;
+    }
+    switchView(next, onNavigated);
+  }, [confirm, switchView]);
   /** What a step-resolving pipeline landing (`openPipelineAttention`,
    *  `openPipelineStep`) does to the run panel once its view switch
    *  commits: with a `step`, open that step (keeping a pending subagent-
@@ -2362,7 +2405,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
 
             {view.kind === "pipelines" && !view.editing && (
               <motion.div
-                key="pipelines-list"
+                key={viewMountKey(view)}
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -8 }}
@@ -2370,15 +2413,24 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 className="flex min-h-0 flex-1 flex-col"
               >
                 <PipelinesPage
-                  onOpenEditor={(id) => setView({ kind: "pipelines", pipelineId: id, editing: true })}
-                  onBack={() => setView({ kind: "board" })}
+                  // Through `navigate`, like every other view switch: an
+                  // edited import preview on this page asks before it goes.
+                  onOpenEditor={(id) => navigate({ kind: "pipelines", pipelineId: id, editing: true })}
+                  onBack={() => navigate({ kind: "board" })}
+                  onImported={(result) => {
+                    // A bundle import may enable a harness — refresh the
+                    // header/picker harness state now, not on the next poll.
+                    // (The Agents/Pipelines caches are refreshed by the
+                    // import dialog itself.)
+                    if (result.enabledHarnesses.length > 0) void refreshAgents();
+                  }}
                 />
               </motion.div>
             )}
 
             {view.kind === "pipelines" && view.editing && (
               <motion.div
-                key={`pipelines-editor-${view.pipelineId ?? "new"}`}
+                key={viewMountKey(view)}
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -8 }}
@@ -2411,7 +2463,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
 
             {view.kind === "pipeline-run" && (
               <motion.div
-                key={`pipeline-run-${view.taskId}`}
+                key={viewMountKey(view)}
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -8 }}

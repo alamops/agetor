@@ -3,7 +3,9 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgetorClient } from "../api-client.ts";
-import type { AgentProfile, Pipeline, PipelineGraph, PipelineInput, PipelineRunState, Task } from "../../shared/types.ts";
+import type { AgentProfile, Pipeline, PipelineGraph, PipelineRunState, Task } from "../../shared/types.ts";
+import type { BundleExportResponse } from "../../shared/bundle.ts";
+import type { BundleImportPlan, BundleImportResponse } from "../../shared/bundle-import.ts";
 import { newStep } from "../../shared/pipeline.ts";
 import { makeTask } from "../test-fixtures.ts";
 
@@ -36,6 +38,7 @@ mock.module("../context.ts", () => ({
 
 mock.module("../output.ts", () => ({
   ...realOutputSnapshot,
+  isTTY: false,
   c: {
     dim: (s: string) => s,
     bold: (s: string) => s,
@@ -66,15 +69,10 @@ const {
   formatPipelineListRow,
   pipelineShowLines,
   pipelineStatusLines,
-  parsePipelineFile,
-  parseExportFlags,
-  parseImportFlags,
   parseAdvanceFlags,
   parseRetryFlags,
   resolveStepRef,
   resolveActiveStepRef,
-  resolveImportProfiles,
-  withProfileHints,
   colorRunStatus,
 } = await import("./pipeline.ts");
 
@@ -257,6 +255,24 @@ test("pipelineShowLines: with a live profile list, a step's profile renders as '
   expect(text).toContain("profile: prof-b (missing)");
 });
 
+test("pipelineShowLines: Agent references and profile names print with control characters escaped", () => {
+  // A legacy import keeps a reference nothing matched as it was.
+  const g = twoStepGraph();
+  g.steps[0]!.agentProfileId = "\u001b]0;pwned\u0007";
+  g.steps[1]!.agentProfileId = "prof-a";
+  g.steps[1]!.subagents = { profileIds: ["x\u001b[2J"], cap: null };
+  const profiles = [makeProfile({ id: "prof-a", name: "Inv\u001b[31mestigator" })];
+  for (const list of [profiles, null]) {
+    const text = pipelineShowLines(makePipeline({ graph: g }), list).join("\n");
+    expect(text).toContain("\\u001b]0;pwned\\u0007");
+    expect(text).toContain("x\\u001b[2J");
+    expect(text).not.toContain("\u001b]0;");
+    expect(text).not.toContain("\u001b[2J");
+  }
+  const text = pipelineShowLines(makePipeline({ graph: g }), profiles).join("\n");
+  expect(text).toContain("Inv\\u001b[31mestigator");
+});
+
 test("pipelineShowLines: a null profile list (listing failed) prints bare ids, never a false '(missing)'", () => {
   const text = pipelineShowLines(makePipeline({ graph: twoStepGraph() }), null).join("\n");
   expect(text).toContain("profile: prof-a");
@@ -305,85 +321,6 @@ test("pipelineShowLines: a step with no bound profile prints 'none'", () => {
   g.steps[0]!.agentProfileId = null;
   const lines = pipelineShowLines(makePipeline({ graph: g }));
   expect(lines.join("\n")).toContain("profile: none");
-});
-
-// ── parsePipelineFile ────────────────────────────────────────────────────
-
-test("parsePipelineFile: a minimal valid file parses into a PipelineInput", () => {
-  const result = parsePipelineFile(JSON.stringify({ name: "My pipeline", graph: emptyGraph() }));
-  expect(result.ok).toBe(true);
-  if (result.ok) {
-    expect(result.input.name).toBe("My pipeline");
-    expect(result.input.graph).toEqual(emptyGraph());
-    expect(result.input.description).toBeUndefined();
-    expect(result.input.maxSteps).toBeUndefined();
-  }
-});
-
-test("parsePipelineFile: description and maxSteps carry through when present", () => {
-  const result = parsePipelineFile(
-    JSON.stringify({ name: "P", description: "desc", graph: emptyGraph(), maxSteps: 10 }),
-  );
-  expect(result.ok).toBe(true);
-  if (result.ok) {
-    expect(result.input.description).toBe("desc");
-    expect(result.input.maxSteps).toBe(10);
-  }
-});
-
-test("parsePipelineFile: invalid JSON fails with an 'invalid JSON' error", () => {
-  const result = parsePipelineFile("{ not json");
-  expect(result.ok).toBe(false);
-  if (!result.ok) expect(result.error).toContain("invalid JSON");
-});
-
-test("parsePipelineFile: a JSON array (not an object) is rejected", () => {
-  const result = parsePipelineFile("[]");
-  expect(result.ok).toBe(false);
-  if (!result.ok) expect(result.error).toContain("JSON object");
-});
-
-test("parsePipelineFile: a missing/empty name is rejected", () => {
-  expect(parsePipelineFile(JSON.stringify({ graph: emptyGraph() })).ok).toBe(false);
-  expect(parsePipelineFile(JSON.stringify({ name: "   ", graph: emptyGraph() })).ok).toBe(false);
-});
-
-test("parsePipelineFile: an invalid graph surfaces validatePipelineGraph's own error", () => {
-  const result = parsePipelineFile(JSON.stringify({ name: "P", graph: { steps: "nope", edges: [], startStepId: null } }));
-  expect(result.ok).toBe(false);
-  if (!result.ok) expect(result.error).toContain("graph.steps must be an array");
-});
-
-test("parsePipelineFile: a non-integer maxSteps is rejected", () => {
-  const result = parsePipelineFile(JSON.stringify({ name: "P", graph: emptyGraph(), maxSteps: 2.5 }));
-  expect(result.ok).toBe(false);
-  if (!result.ok) expect(result.error).toContain("maxSteps");
-});
-
-// ── parseExportFlags / parseImportFlags ──────────────────────────────────
-
-test("parseExportFlags: --out <file>", () => {
-  expect(parseExportFlags(["--out", "/tmp/x.json"])).toEqual({ out: "/tmp/x.json", force: false });
-});
-
-test("parseExportFlags: no --out leaves it undefined; force defaults false", () => {
-  expect(parseExportFlags([])).toEqual({ force: false });
-});
-
-test("parseExportFlags: --force sets force; --out - is kept verbatim (stdout)", () => {
-  expect(parseExportFlags(["--out", "-", "--force"])).toEqual({ out: "-", force: true });
-});
-
-test("parseExportFlags: --out with nothing after it throws 'needs a value'", () => {
-  expect(() => parseExportFlags(["--out"])).toThrow(/needs a value/);
-});
-
-test("parseImportFlags: --name <n>", () => {
-  expect(parseImportFlags(["--name", "Renamed"])).toEqual({ name: "Renamed" });
-});
-
-test("parseImportFlags: no --name leaves it undefined", () => {
-  expect(parseImportFlags([])).toEqual({});
 });
 
 // ── cmdPipeline: ls ──────────────────────────────────────────────────────
@@ -493,319 +430,271 @@ test("cmdPipeline delete: 'delete' is an alias for 'rm'", async () => {
   expect(jsonOutputs).toEqual([{ removed: "p1" }]);
 });
 
-// ── cmdPipeline: export ──────────────────────────────────────────────────
+// ── cmdPipeline: export / import (the agetor bundle) ─────────────────────
+// docs/plans/agents-pipelines-import-export.md: `pipeline export|import` are
+// shortcuts over the bundle routes (`/bundle/export`, `/bundle/import`); the
+// format itself is covered in src/shared/bundle.test.ts and the CLI flag
+// parsers/printers in ./bundle.test.ts.
 
-test("cmdPipeline export: no --out prints PipelineInput JSON to stdout", async () => {
-  const pipeline = makePipeline({ id: "p1", name: "Flow A", description: "d", graph: twoStepGraph(), maxSteps: 12 });
-  currentClient = makeClient({ listPipelines: async () => [pipeline] });
-  await cmdPipeline(["export", "p1"], flags);
-  expect(outputs).toHaveLength(1);
-  const parsed = JSON.parse(outputs[0]!) as PipelineInput;
-  expect(parsed).toEqual({ name: "Flow A", description: "d", graph: twoStepGraph(), maxSteps: 12 });
-  // Only PipelineInput fields — no server-assigned id/createdAt/taskCount.
-  expect(parsed).not.toHaveProperty("id");
-  expect(parsed).not.toHaveProperty("taskCount");
+const BUNDLE_TEXT = '{\n  "format": "agetor-bundle",\n  "version": 1\n}\n';
+
+function exportResponse(over: Partial<BundleExportResponse> = {}): BundleExportResponse {
+  return {
+    text: BUNDLE_TEXT,
+    filename: "flow-a.agetor.json",
+    warnings: [],
+    counts: { agents: 2, pipelines: 1 },
+    ...over,
+  };
+}
+
+function plan(over: Partial<BundleImportPlan> = {}): BundleImportPlan {
+  return {
+    legacy: false,
+    agents: [],
+    pipelines: [],
+    harnesses: [],
+    localHarnesses: [],
+    warnings: [],
+    blocking: [],
+    canImport: true,
+    fingerprint: "fp-1",
+    ...over,
+  };
+}
+
+const VALID_BUNDLE = JSON.stringify({
+  format: "agetor-bundle",
+  version: 1,
+  agents: [],
+  pipelines: [{ name: "Flow A", graph: { steps: [], edges: [] } }],
 });
 
-test("cmdPipeline export: writes profileName / subagents.profileNames hints when the profile listing is available", async () => {
-  const g = twoStepGraph();
-  g.steps[0]!.subagents = { profileIds: ["prof-b", "prof-gone"], cap: null };
-  const pipeline = makePipeline({ id: "p1", name: "Flow A", graph: g });
+async function withFile(content: string, fn: (file: string) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
+  const file = path.join(dir, "flow-a.agetor.json");
+  try {
+    await Bun.write(file, content);
+    await fn(file);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("cmdPipeline export: resolves the ref and prints the bundle text the core built", async () => {
+  const requests: unknown[] = [];
   currentClient = makeClient({
-    listPipelines: async () => [pipeline],
-    listAgentProfiles: async () => [
-      makeProfile({ id: "prof-a", name: "Investigator" }),
-      makeProfile({ id: "prof-b", name: "Fixer" }),
-    ],
+    listPipelines: async () => [makePipeline({ id: "p1", name: "Flow A" })],
+    exportBundle: async (sel) => {
+      requests.push(sel);
+      return exportResponse();
+    },
   });
-  await cmdPipeline(["export", "p1"], flags);
-  const parsed = JSON.parse(outputs[0]!) as { graph: { steps: Array<Record<string, unknown>> } };
-  expect(parsed.graph.steps[0]!.profileName).toBe("Investigator");
-  expect(parsed.graph.steps[0]!.subagents).toEqual({ profileIds: ["prof-b", "prof-gone"], cap: null, profileNames: ["Fixer", null] });
-  expect(parsed.graph.steps[1]!.profileName).toBe("Fixer");
-  expect(parsed.graph.steps[1]!.subagents).toEqual({ profileIds: [], cap: null }); // no ids → no profileNames key
-});
-
-test("withProfileHints: a step whose profile id matches no live profile gets no profileName key at all", () => {
-  const input: PipelineInput = { name: "P", graph: twoStepGraph() };
-  const hinted = withProfileHints(input, [makeProfile({ id: "prof-a", name: "Investigator" })]);
-  const steps = hinted.graph.steps as unknown as Array<Record<string, unknown>>;
-  expect(steps[0]!.profileName).toBe("Investigator");
-  expect(steps[1]).not.toHaveProperty("profileName");
-  // The original input is not mutated.
-  expect(input.graph.steps[0]).not.toHaveProperty("profileName");
+  await cmdPipeline(["export", "flow a"], flags);
+  expect(requests).toEqual([{ agentIds: [], pipelineIds: ["p1"] }]);
+  expect(outputs).toEqual([BUNDLE_TEXT.replace(/\n$/, "")]);
 });
 
 test("cmdPipeline export --out <existing file>: refuses to overwrite without --force (and never hits the network)", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
-  const file = path.join(dir, "flow-a.json");
-  try {
-    await Bun.write(file, "{}");
+  await withFile("{}", async (file) => {
     let listed = false;
     currentClient = makeClient({
       listPipelines: async () => {
         listed = true;
         return [makePipeline({ id: "p1" })];
       },
+      exportBundle: async () => exportResponse(),
     });
     await expect(cmdPipeline(["export", "p1", "--out", file], flags)).rejects.toThrow(/refusing to overwrite .*--force/);
     expect(listed).toBe(false);
     expect(readFileSync(file, "utf8")).toBe("{}");
 
     await cmdPipeline(["export", "p1", "--out", file, "--force"], flags);
-    expect((JSON.parse(readFileSync(file, "utf8")) as PipelineInput).name).toBe("Bug fix flow");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+    expect(readFileSync(file, "utf8")).toBe(BUNDLE_TEXT);
+    expect(outputs.join("\n")).toContain(`wrote 2 Agents, 1 Pipeline to ${file}`);
+  });
+});
+
+test("cmdPipeline export|import: handle the file before connecting to the core", async () => {
+  await withFile("{}", async (file) => {
+    currentClient = null; // reaching getClient would fail with "no fake client"
+    await expect(cmdPipeline(["export", "p1", "--out", file], flags)).rejects.toThrow(/refusing to overwrite/);
+    await expect(cmdPipeline(["import", `${file}.missing`], flags)).rejects.toThrow(/no such file/);
+    await expect(cmdPipeline(["import", file], flags)).rejects.toThrow(/can't import/);
+  });
 });
 
 test("cmdPipeline export --out -: prints to stdout (symmetry with `import -`)", async () => {
-  currentClient = makeClient({ listPipelines: async () => [makePipeline({ id: "p1", name: "Flow A" })] });
+  currentClient = makeClient({
+    listPipelines: async () => [makePipeline({ id: "p1", name: "Flow A" })],
+    exportBundle: async () => exportResponse(),
+  });
   await cmdPipeline(["export", "p1", "--out", "-"], flags);
   expect(outputs).toHaveLength(1);
-  expect((JSON.parse(outputs[0]!) as PipelineInput).name).toBe("Flow A");
   expect(outputs[0]).not.toContain("wrote");
 });
 
-test("cmdPipeline export: missing ref throws the usage error", async () => {
+test("cmdPipeline export: missing ref, selection flags and unknown flags throw the usage error", async () => {
   currentClient = makeClient();
   await expect(cmdPipeline(["export"], flags)).rejects.toThrow(/usage: agetor pipeline export/);
+  await expect(cmdPipeline(["export", "p1", "--all"], flags)).rejects.toThrow(/usage: agetor pipeline export/);
+  await expect(cmdPipeline(["export", "p1", "--frobnicate"], flags)).rejects.toThrow(/usage: agetor pipeline export/);
 });
 
-test("cmdPipeline export --out <file>: writes the JSON to disk instead of stdout", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
-  const file = path.join(dir, "flow-a.json");
-  try {
-    const pipeline = makePipeline({ id: "p1", name: "Flow A", graph: twoStepGraph() });
-    currentClient = makeClient({ listPipelines: async () => [pipeline] });
-    await cmdPipeline(["export", "p1", "--out", file], flags);
-
-    expect(outputs).toHaveLength(1);
-    expect(outputs[0]).toContain("wrote");
-    expect(outputs[0]).toContain(file);
-
-    const written = JSON.parse(readFileSync(file, "utf8")) as PipelineInput;
-    expect(written.name).toBe("Flow A");
-    expect(written.graph).toEqual(twoStepGraph());
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test("cmdPipeline export: a core without the bundle routes gets an explicit hint", async () => {
+  const { ApiError } = await import("../api-client.ts");
+  currentClient = makeClient({
+    listPipelines: async () => [makePipeline({ id: "p1" })],
+    exportBundle: async () => {
+      throw new ApiError(404, { error: "not found" }, "not found");
+    },
+  });
+  await expect(cmdPipeline(["export", "p1"], flags)).rejects.toThrow(/older than this CLI/);
 });
-
-// ── cmdPipeline: import ──────────────────────────────────────────────────
 
 test("cmdPipeline import: missing file argument throws the usage error", async () => {
   currentClient = makeClient();
   await expect(cmdPipeline(["import"], flags)).rejects.toThrow(/usage: agetor pipeline import/);
 });
 
-test("cmdPipeline import: reads, validates, and POSTs the file's PipelineInput", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
-  const file = path.join(dir, "flow-a.json");
-  try {
-    const input: PipelineInput = { name: "Flow A", description: "d", graph: twoStepGraph(), maxSteps: 12 };
-    await Bun.write(file, JSON.stringify(input));
-    const created: PipelineInput[] = [];
+test("cmdPipeline import: sends the file text with --name as singleName and prints the result", async () => {
+  await withFile(VALID_BUNDLE, async (file) => {
+    const sent: { text: string; options: unknown }[] = [];
     currentClient = makeClient({
-      createPipeline: async (i: PipelineInput) => {
-        created.push(i);
-        return makePipeline({ id: "new-id", ...i });
+      importBundle: async (text: string, options) => {
+        sent.push({ text, options });
+        return {
+          agents: [],
+          pipelines: [makePipeline({ id: "new-id", name: "Renamed flow" })],
+          enabledHarnesses: [],
+          warnings: [],
+          plan: plan(),
+        } satisfies BundleImportResponse;
       },
     });
-
-    await cmdPipeline(["import", file], flags);
-
-    expect(created).toEqual([input]);
-    expect(outputs[0]).toContain("imported pipeline");
-    expect(outputs[0]).toContain("Flow A");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("cmdPipeline import: --name overrides the file's own name", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
-  const file = path.join(dir, "flow-a.json");
-  try {
-    await Bun.write(file, JSON.stringify({ name: "Flow A", graph: emptyGraph() }));
-    const created: PipelineInput[] = [];
-    currentClient = makeClient({
-      createPipeline: async (i: PipelineInput) => {
-        created.push(i);
-        return makePipeline({ id: "new-id", ...i });
-      },
-    });
-
     await cmdPipeline(["import", file, "--name", "Renamed flow"], flags);
-
-    expect(created[0]!.name).toBe("Renamed flow");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("cmdPipeline import: a dangling step profile id with a hint that names exactly one live profile is remapped (and reported)", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
-  const file = path.join(dir, "flow-a.json");
-  try {
-    const g = twoStepGraph(); // prof-a / prof-b — neither exists on "this machine"
-    const steps = g.steps as unknown as Array<Record<string, unknown>>;
-    steps[0]!.profileName = "Investigator";
-    steps[1]!.profileName = "Fixer";
-    await Bun.write(file, JSON.stringify({ name: "Flow A", graph: g }));
-    const created: PipelineInput[] = [];
-    currentClient = makeClient({
-      listAgentProfiles: async () => [makeProfile({ id: "local-1", name: "investigator" })], // case-insensitive
-      createPipeline: async (i: PipelineInput) => {
-        created.push(i);
-        return makePipeline({ id: "new-id", ...i });
-      },
-    });
-
-    await cmdPipeline(["import", file], flags);
-
-    expect(created[0]!.graph.steps[0]!.agentProfileId).toBe("local-1");
-    expect(created[0]!.graph.steps[1]!.agentProfileId).toBe("prof-b"); // no unique "Fixer" here — left dangling
-    // The posted graph is the validator's normalized shape — hints stripped.
-    expect(created[0]!.graph.steps[0]).not.toHaveProperty("profileName");
+    expect(sent).toEqual([{ text: VALID_BUNDLE, options: { singleName: "Renamed flow" } }]);
     const rendered = outputs.join("\n");
-    expect(rendered).toContain("imported pipeline");
-    expect(rendered).toContain('step "Investigate": agent profile prof-a isn\'t defined here — remapped to "investigator" (local-1)');
-    expect(rendered).toContain('! step "Fix": agent profile prof-b ("Fixer") isn\'t defined on this machine');
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+    expect(rendered).toContain("imported 1 Pipeline");
+    expect(rendered).toContain("Renamed flow");
+  });
 });
 
-test("cmdPipeline import --json: remaps and warnings fold into a `warnings` array on the created pipeline", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
-  const file = path.join(dir, "flow-a.json");
-  try {
-    await Bun.write(file, JSON.stringify({ name: "Flow A", graph: twoStepGraph() }));
+test("cmdPipeline import: a legacy pipeline file is still accepted and sent as-is", async () => {
+  const legacy = JSON.stringify({ name: "Old", graph: twoStepGraph() });
+  await withFile(legacy, async (file) => {
+    const texts: string[] = [];
     currentClient = makeClient({
-      listAgentProfiles: async () => [makeProfile({ id: "prof-a" })], // prof-b dangling, no hint
-      createPipeline: async (i: PipelineInput) => makePipeline({ id: "new-id", ...i }),
-    });
-    await cmdPipeline(["import", file], jsonFlags);
-    const printed = jsonOutputs[0] as { id: string; warnings?: string[] };
-    expect(printed.id).toBe("new-id");
-    expect(printed.warnings).toEqual([
-      'step "Fix": agent profile prof-b isn\'t defined on this machine — assign one in the editor before running this pipeline',
-    ]);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("cmdPipeline import: every profile id resolving locally prints no warnings and no `warnings` key under --json", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
-  const file = path.join(dir, "flow-a.json");
-  try {
-    await Bun.write(file, JSON.stringify({ name: "Flow A", graph: twoStepGraph() }));
-    currentClient = makeClient({
-      listAgentProfiles: async () => [makeProfile({ id: "prof-a" }), makeProfile({ id: "prof-b", name: "Fixer" })],
-      createPipeline: async (i: PipelineInput) => makePipeline({ id: "new-id", ...i }),
-    });
-    await cmdPipeline(["import", file], jsonFlags);
-    expect(jsonOutputs[0] as object).not.toHaveProperty("warnings");
-    outputs.length = 0;
-    await cmdPipeline(["import", file], flags);
-    expect(outputs.join("\n")).not.toContain("!");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("cmdPipeline import: a failed profile listing warns that references weren't checked, but still imports", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
-  const file = path.join(dir, "flow-a.json");
-  try {
-    await Bun.write(file, JSON.stringify({ name: "Flow A", graph: twoStepGraph() }));
-    let called = false;
-    currentClient = makeClient({
-      listAgentProfiles: async () => {
-        throw new Error("boom");
-      },
-      createPipeline: async (i: PipelineInput) => {
-        called = true;
-        return makePipeline({ id: "new-id", ...i });
+      importBundle: async (text: string) => {
+        texts.push(text);
+        return { agents: [], pipelines: [makePipeline({ id: "n", name: "Old" })], enabledHarnesses: [], warnings: [], plan: plan({ legacy: true }) };
       },
     });
     await cmdPipeline(["import", file], flags);
-    expect(called).toBe(true);
-    expect(outputs.join("\n")).toContain("! couldn't list this machine's agent profiles");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+    expect(texts).toEqual([legacy]);
+  });
 });
 
-test("resolveImportProfiles: subagents.profileIds entries remap by their positional profileNames hint and warn when dangling", () => {
-  const g = twoStepGraph();
-  g.steps[0]!.subagents = { profileIds: ["gone-1", "gone-2", "prof-a"], cap: 2 };
-  const hints = new Map([["s1", { profileName: null, subagentProfileNames: ["Fixer", null, null] }]]);
-  const profiles = [makeProfile({ id: "prof-a" }), makeProfile({ id: "prof-b", name: "Fixer" })];
-  const r = resolveImportProfiles({ name: "P", graph: g }, hints, profiles);
-  expect(r.input.graph.steps[0]!.subagents.profileIds).toEqual(["prof-b", "gone-2", "prof-a"]);
-  expect(r.remapped).toHaveLength(1);
-  expect(r.remapped[0]).toContain('step "Investigate" subagent: agent profile gone-1 isn\'t defined here — remapped to "Fixer" (prof-b)');
-  // gone-2 has no hint → warned; prof-a resolves → silent; s2's prof-b resolves → silent.
-  expect(r.warnings).toEqual([
-    'step "Investigate" subagent: agent profile gone-2 isn\'t defined on this machine — assign one in the editor before running this pipeline',
-  ]);
-  // Input is not mutated.
-  expect(g.steps[0]!.subagents.profileIds).toEqual(["gone-1", "gone-2", "prof-a"]);
+test("cmdPipeline import --json: prints the raw import result", async () => {
+  await withFile(VALID_BUNDLE, async (file) => {
+    const result: BundleImportResponse = {
+      agents: [],
+      pipelines: [makePipeline({ id: "new-id" })],
+      enabledHarnesses: [],
+      warnings: [{ code: "step-without-agent", message: "w" }],
+      plan: plan(),
+    };
+    currentClient = makeClient({ importBundle: async () => result });
+    await cmdPipeline(["import", file], jsonFlags);
+    expect(jsonOutputs).toEqual([result]);
+  });
 });
 
-test("resolveImportProfiles: an ambiguous hint (two live profiles with that name) is NOT remapped — warned instead", () => {
-  const hints = new Map([["s1", { profileName: "Dup", subagentProfileNames: [] }]]);
-  const profiles = [makeProfile({ id: "x1", name: "Dup" }), makeProfile({ id: "x2", name: "dup " })];
-  const r = resolveImportProfiles({ name: "P", graph: twoStepGraph() }, hints, profiles);
-  expect(r.input.graph.steps[0]!.agentProfileId).toBe("prof-a");
-  expect(r.remapped).toEqual([]);
-  expect(r.warnings.some((w) => w.includes('prof-a ("Dup")'))).toBe(true);
-});
-
-test("parsePipelineFile: profileName / subagents.profileNames hints are extracted per step id and stripped from the graph", () => {
-  const result = parsePipelineFile(
-    JSON.stringify({
-      name: "P",
-      graph: {
-        steps: [
-          { ...newStep({ id: "s1", name: "A", agentProfileId: "p1" }), profileName: "Alpha", subagents: { profileIds: ["q1"], cap: null, profileNames: ["Q"] } },
-          { ...newStep({ id: "s2", name: "B" }), profileName: 42 },
-        ],
-        edges: [],
-        startStepId: "s1",
-      },
-    }),
-  );
-  expect(result.ok).toBe(true);
-  if (result.ok) {
-    expect(result.hints.get("s1")).toEqual({ profileName: "Alpha", subagentProfileNames: ["Q"] });
-    expect(result.hints.get("s2")).toEqual({ profileName: null, subagentProfileNames: [] });
-    expect(result.input.graph.steps[0]).not.toHaveProperty("profileName");
-    expect(result.input.graph.steps[0]!.subagents).toEqual({ profileIds: ["q1"], cap: null });
-  }
-});
-
-test("cmdPipeline import: an invalid file throws without calling createPipeline", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pipeline-"));
-  const file = path.join(dir, "bad.json");
-  try {
-    await Bun.write(file, "not json");
-    let called = false;
+test("cmdPipeline import: a blocked import prints the plan's blocking issues plus a hint and fails", async () => {
+  const { ApiError } = await import("../api-client.ts");
+  await withFile(VALID_BUNDLE, async (file) => {
+    const unknownKind = { code: "unknown-kind", message: 'Agent "X" uses a "grok" harness' };
+    const blocked = plan({
+      agents: [
+        {
+          key: "x",
+          sourceName: "X",
+          name: "X",
+          renamed: false,
+          fileHarness: { id: "grok-2", kind: "grok" as never, label: "Grok" },
+          resolution: "unresolved",
+          harnessId: null,
+          harnessKind: null,
+          harnessLabel: null,
+          candidateHarnessIds: ["claude-code"],
+          model: "grok-5",
+          effort: null,
+          mode: null,
+          fast: false,
+          maxMode: false,
+          instructions: "",
+          skills: [],
+          warnings: [],
+          errors: [unknownKind],
+        },
+      ],
+      blocking: [unknownKind],
+      canImport: false,
+      localHarnesses: [
+        { id: "claude-code", kind: "claude-code", label: "Claude Code", isBuiltin: true, enabled: true, available: true, loggedIn: null, reason: null, installHint: null },
+      ],
+    });
     currentClient = makeClient({
-      createPipeline: async () => {
-        called = true;
-        return makePipeline();
+      importBundle: async () => {
+        throw new ApiError(409, { error: "blocked", plan: blocked }, "blocked");
       },
     });
+    await expect(cmdPipeline(["import", file], flags)).rejects.toThrow(/nothing was imported/);
+    const rendered = outputs.join("\n");
+    expect(rendered).toContain('✗ Agent "X" uses a "grok" harness');
+    expect(rendered).toContain(
+      "hint: map grok-2 to a local harness with --harness-map grok-2=<localHarnessId> — it can use: claude-code (claude-code)",
+    );
+  });
+});
 
-    await expect(cmdPipeline(["import", file], flags)).rejects.toThrow(/invalid pipeline file/);
+test("cmdPipeline import --dry-run: previews without importing", async () => {
+  await withFile(VALID_BUNDLE, async (file) => {
+    let imported = false;
+    currentClient = makeClient({
+      previewBundleImport: async () => plan({ warnings: [{ code: "harness-fallback", message: "falls back" }] }),
+      importBundle: async () => {
+        imported = true;
+        throw new Error("should not import");
+      },
+    });
+    await cmdPipeline(["import", file, "--dry-run"], flags);
+    expect(imported).toBe(false);
+    const rendered = outputs.join("\n");
+    expect(rendered).toContain("dry run — nothing was imported");
+    expect(rendered).toContain("! falls back");
+  });
+});
+
+test("cmdPipeline import: an invalid file throws without calling the core", async () => {
+  await withFile("not json", async (file) => {
+    let called = false;
+    currentClient = makeClient({
+      importBundle: async () => {
+        called = true;
+        throw new Error("unreachable");
+      },
+    });
+    await expect(cmdPipeline(["import", file], flags)).rejects.toThrow(/can't import .*invalid JSON/);
     expect(called).toBe(false);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  });
+});
+
+test("cmdPipeline import: an unknown flag throws the usage error", async () => {
+  await withFile(VALID_BUNDLE, async (file) => {
+    currentClient = makeClient();
+    await expect(cmdPipeline(["import", file, "--nmae", "x"], flags)).rejects.toThrow(/usage: agetor pipeline import/);
+  });
 });
 
 // ── cmdPipeline: unknown subcommand ──────────────────────────────────────
@@ -989,6 +878,21 @@ test("pipelineStatusLines: status/progress header, blocked, active, and history 
   expect(text).toContain("history");
   expect(text).toContain("Investigate"); // history entry s1's name
   expect(text).toContain("succeeded");
+});
+
+test("pipelineStatusLines: the task title and block messages are free text (escapeFreeText)", () => {
+  const run = pipelineRun();
+  const t = task({
+    title: "رفع\u200cاشکال",
+    pipelineRun: { ...run, blocked: [{ ...run.blocked[0]!, message: "a\nb\u001b[31m" }] },
+  });
+  const text = pipelineStatusLines(t, []).join("\n");
+  // A Persian half-space prints as text, not as \u200c …
+  expect(text).toContain("رفع\u200cاشکال");
+  expect(text).not.toContain("\\u200c");
+  // … and a block message's line break folds to a space, its ESC escaped.
+  expect(text).toContain("a b\\u001b[31m");
+  expect(text).not.toContain("\\u000a");
 });
 
 test("pipelineStatusLines: an active step's own live column is shown when its step task is known", () => {
@@ -1400,4 +1304,57 @@ test("cmdPipeline status --json: prints { task, steps }", async () => {
   });
   await cmdPipeline(["status", "parent-1"], jsonFlags);
   expect(jsonOutputs).toEqual([{ task: t, steps }]);
+});
+
+// ── terminal safety (imported names, ids and descriptions) ───────────────
+
+test("pipelineShowLines: ids, names, labels and descriptions print with control characters escaped", () => {
+  const g: PipelineGraph = {
+    steps: [
+      newStep({ name: "Plan\u001b[2J", id: "s\u009b1" }),
+      newStep({ name: "Ship", id: "s\u202e2" }),
+    ],
+    edges: [{ id: "e1", from: "s\u009b1", to: "s\u202e2", label: "go\u001b]52;c;x\u0007" }],
+    startStepId: "s\u009b1",
+  };
+  const text = pipelineShowLines(makePipeline({ name: "Flow\u001b[31m", graph: g })).join("\n");
+  expect(text).not.toMatch(/[\u001b\u009b\u202e\u0007]/);
+  expect(text).toContain("s\\u009b1");
+  expect(text).toContain("s\\u202e2");
+  expect(text).toContain("Flow\\u001b[31m");
+  expect(text).toContain("Ship (go\\u001b]52;c;x\\u0007)");
+});
+
+test("pipelineShowLines: a bare CR in a description starts a new line instead of overprinting", () => {
+  const lines = pipelineShowLines(makePipeline({ description: "run evil\rbenign text" }));
+  expect(lines.join("\n")).not.toContain("\r");
+  const at = lines.findIndex((l) => l.includes("description"));
+  expect(lines.slice(at, at + 3)).toEqual(["  description:", "    run evil", "    benign text"]);
+});
+
+test("pipelineShowLines: a one-line description stays on the label line", () => {
+  const lines = pipelineShowLines(makePipeline({ description: "Fix\tbugs\n" }));
+  expect(lines).toContain("  description: Fix bugs");
+});
+
+test("pipelineStatusLines: a block message (which can quote an agent's handoff) prints escaped", () => {
+  const t = task({
+    title: "T\u001b[1m",
+    pipelineRun: pipelineRun({
+      blocked: [{ taskId: "step-task-1", stepId: "s2", kind: "handoff-invalid", message: 'next "\u001b]52;c;eA==\u0007" matches no step' }],
+    }),
+  });
+  const text = pipelineStatusLines(t, []).join("\n");
+  expect(text).not.toMatch(/[\u001b\u0007]/);
+  expect(text).toContain("\\u001b]52;c;eA==\\u0007");
+  expect(text).toContain("T\\u001b[1m");
+});
+
+test("pipelineStatusLines: a step id missing from the snapshot prints escaped", () => {
+  const t = task({
+    pipelineRun: pipelineRun({ active: [{ stepId: "gone\u009b", taskId: "step-task-1", seq: 2 }], blocked: [] }),
+  });
+  const text = pipelineStatusLines(t, []).join("\n");
+  expect(text).not.toContain("\u009b");
+  expect(text).toContain("gone\\u009b");
 });

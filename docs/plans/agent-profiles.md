@@ -10,6 +10,8 @@
 | Branch | `feature/agents-creating-agents` (already a feature branch) |
 | Base SHA | `fe65199` (release v0.1.8), tree clean |
 
+> **Update 2026-10-01:** Agents can now be exported and imported between machines (`agetor profile export|import`, `agetor export|import`, and Export/Import on Settings → Agents) as part of the versioned agetor bundle; an Agent on an additional-account harness records that harness's base kind so it falls back to the built-in on import. See `docs/plans/agents-pipelines-import-export.md`.
+
 ## 1. Objective & success criteria
 
 Let the user define named **Agents** — a reusable profile bundling *harness* (a harness id, so multi-account aliases work), *model*, *effort*, *mode*, *fast/max-mode* (cursor only), free-text *general instructions*, and a list of *skills* — manage them (create / edit / delete) in Settings and from the CLI, and pick one on task launch instead of picking harness/model/effort by hand.

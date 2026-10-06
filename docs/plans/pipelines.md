@@ -66,6 +66,8 @@ Done means:
 | D13 | **Editor connect fallback**: besides drag-to-connect, the step panel has a "Connect to…" select (adds an edge). | Keyboard/a11y and a deterministic e2e path (Playwright handle-drags are flaky). |
 | D14 | **Pipeline authoring in CLI = JSON files** (`export`/`import`, `add` from a file); `agetor add --pipeline` creates the parent task. | Canvas is the authoring surface; the CLI moves pipelines around. |
 
+> **Update 2026-10-01:** `agetor pipeline export|import` now write and read the versioned **agetor bundle** (a pipeline plus every Agent it uses, each with its harness id and base kind), with import preview, harness fallback and app-side export/import — see `docs/plans/agents-pipelines-import-export.md`. The bare-`PipelineInput` file with `profileName` hints described here is now the *legacy* format: it still imports, but is no longer written.
+
 ### Contracts
 
 `src/shared/types.ts` (additive):

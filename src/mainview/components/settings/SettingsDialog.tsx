@@ -129,7 +129,7 @@ function parseEnv(raw: string): { env: Record<string, string>; ignored: number }
  *  badge everywhere a harness/template kind is shown. Extend this list (not
  *  the individual call sites) as a kind graduates out of experimental. */
 function isExperimentalKind(kind: AgentKind): boolean {
-  return kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "fx";
+  return kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "fx";
 }
 
 function stringifyEnv(env: Record<string, string>): string {
@@ -186,6 +186,11 @@ const HARNESS_HOME_COPY: Record<AgentKind, { label: string; slug: string; help: 
     label: "GEMINI_CLI_HOME override (absolute path; optional)",
     slug: "gemini-2",
     help: "Sets GEMINI_CLI_HOME on spawn — gemini stores its login, sessions, and settings under this path (a dedicated override, not the real HOME), so a separate path gives this harness its own account.",
+  },
+  antigravity: {
+    label: "HOME override (absolute path; optional)",
+    slug: "antigravity-2",
+    help: "HOME override — Antigravity (agy) stores its config, auth, and logs under $HOME/.gemini, so a separate path gives this harness its own account.",
   },
   fx: {
     label: "HOME override (absolute path; optional)",
@@ -379,6 +384,15 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
     const map = new Map(payload.statuses.map((s) => [s.harnessId, s]));
     return map;
   }, [payload.statuses]);
+
+  // A bundle import (Agents / Pipelines sections) can enable a harness as
+  // part of its transaction — reload the Harnesses list here and the app's
+  // header state, so the change shows without reopening Settings.
+  const onBundleImported = (result: { enabledHarnesses: string[] }) => {
+    if (result.enabledHarnesses.length === 0) return;
+    void refresh();
+    onChange?.();
+  };
 
   const onDisclaimSpawnedAgentsChange = (enabled: boolean) => {
     setDisclaimSpawnedAgents(enabled);
@@ -674,6 +688,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       harnesses={payload.harnesses}
                       onAdd={() => setView(openAgentEditor(null))}
                       onEdit={(p) => setView(openAgentEditor(p.id))}
+                      onImported={onBundleImported}
                     />
                   );
                 case "pipelines":
@@ -707,6 +722,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                 resetView();
                 onOpenPipelines(id, editing);
               }}
+              onImported={onBundleImported}
             />
           </div>
 
@@ -1562,8 +1578,8 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Harness type</label>
-        <div className="grid grid-cols-5 gap-1">
-          {(["claude-code", "codex", "cursor", "gemini", "fx"] as AgentKind[]).map((k) => {
+        <div className="grid grid-cols-3 gap-1 sm:grid-cols-6">
+          {(["claude-code", "codex", "cursor", "gemini", "antigravity", "fx"] as AgentKind[]).map((k) => {
             const experimental = isExperimentalKind(k);
             return (
               <Button

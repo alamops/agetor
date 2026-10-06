@@ -5,6 +5,7 @@ import { c, out, errln } from "../output.ts";
 import { usageError } from "../usage.ts";
 import { notifyFor, osNotify } from "../notify.ts";
 import type { AgetorClient } from "../api-client.ts";
+import { escapeFreeText } from "../../shared/terminal-text.ts";
 import type { RunEvent, GlobalEvent, Task } from "../../shared/types.ts";
 import { FX_RECOVERY_STATUS_PREFIX, isInternalStatusSentinel } from "../../shared/types.ts";
 import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../../shared/fx-recovery.ts";
@@ -277,7 +278,7 @@ export async function pipelineLogsHint(client: AgetorClient, task: Task): Promis
   const base = "pipeline task — use `agetor logs <stepTaskId>` for a step";
   try {
     const { steps } = await client.getPipelineRun(task.id);
-    const list = steps.length > 0 ? steps.map((s) => `${s.title} (${s.id.slice(0, 8)})`).join(", ") : "none yet";
+    const list = steps.length > 0 ? steps.map((s) => `${escapeFreeText(s.title)} (${s.id.slice(0, 8)})`).join(", ") : "none yet";
     return c.dim(`${base}; steps: ${list}`);
   } catch {
     return c.dim(base);

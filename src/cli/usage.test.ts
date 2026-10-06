@@ -4,7 +4,7 @@ import { USAGE, canonical, usageError, helpFor } from "./usage.ts";
 const COMMANDS = [
   "add", "ls", "ps", "show", "start", "send", "commit", "answer", "commands", "logs",
   "files", "cancel", "attach", "shell", "edit", "move", "archive", "unarchive", "diff", "rm",
-  "projects", "harness", "profile", "pipeline", "daemon", "info", "config",
+  "projects", "harness", "profile", "pipeline", "export", "import", "daemon", "info", "config",
 ];
 
 test("every dispatched command has a USAGE block whose first line is its usage line", () => {
@@ -41,7 +41,9 @@ test("the retired 'agent'/'agents' profile-subcommand spelling has no USAGE bloc
   expect(USAGE[canonical("agent")]).toBeUndefined();
   expect(USAGE["profile"]).toBeDefined();
   expect(canonical("profiles")).toBe("profile");
-  expect(USAGE["profile"]!.split("\n", 1)[0]).toBe("usage: agetor profile <ls | show <ref> | add <name> … | edit <ref> … | rm <ref>>");
+  expect(USAGE["profile"]!.split("\n", 1)[0]).toBe(
+    "usage: agetor profile <ls | show <ref> | add <name> … | edit <ref> … | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […]>",
+  );
 });
 
 test("usageError throws only the concise first line, resolving aliases", () => {
@@ -69,7 +71,7 @@ test("pipeline: 'pipelines' aliases to 'pipeline', with export/import subcommand
   expect(canonical("pipelines")).toBe("pipeline");
   expect(USAGE["pipeline"]).toBeDefined();
   expect(USAGE["pipeline"]!.split("\n", 1)[0]).toBe(
-    "usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>",
+    "usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>",
   );
   expect(helpFor("pipelines", "export")).toBe(USAGE["pipeline export"]);
   expect(helpFor("pipeline", "import")).toBe(USAGE["pipeline import"]);
@@ -118,4 +120,23 @@ test("pipeline subcommand blocks document --from, label matching, --out -/--forc
 test("ls usage mentions --steps; add usage mentions --pipeline", () => {
   expect(USAGE["ls"]).toContain("--steps");
   expect(USAGE["add"]).toContain("--pipeline");
+});
+
+// docs/plans/agents-pipelines-import-export.md K15: top-level export/import
+// plus the profile/pipeline shortcuts, all over the same bundle.
+test("export/import: top-level blocks plus profile and pipeline shortcut blocks", () => {
+  expect(USAGE["export"]!.split("\n", 1)[0]).toBe(
+    "usage: agetor export [--profile <ref>]… [--pipeline <ref>]… [--all] [--out <file|->] [--force]",
+  );
+  expect(USAGE["export"]).toContain("'--agent' is an alias");
+  expect(USAGE["import"]!.split("\n", 1)[0]).toBe(
+    "usage: agetor import <file|-> [--dry-run] [--harness-map <fileId>=<localId>]… [--name <n>] [--enable-harnesses] [--yes]",
+  );
+  expect(helpFor("profile", "export")).toBe(USAGE["profile export"]);
+  expect(helpFor("profiles", "import")).toBe(USAGE["profile import"]);
+  expect(usageError("profile export").message).toBe("usage: agetor profile export <ref> [--out <file|->] [--force]");
+  expect(USAGE["pipeline import"]!.split("\n", 1)[0]).toContain("--harness-map");
+  expect(USAGE["pipeline import"]!.split("\n", 1)[0]).toContain("[--yes]");
+  expect(USAGE["profile import"]!.split("\n", 1)[0]).toContain("[--yes]");
+  expect(USAGE["pipeline export"]).toContain("agetor bundle");
 });

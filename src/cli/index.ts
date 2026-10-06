@@ -19,6 +19,7 @@ import { cmdAttach } from "./commands/attach.ts";
 import { cmdHarness } from "./commands/harness.ts";
 import { cmdAgentProfile } from "./commands/agent-profile.ts";
 import { cmdPipeline } from "./commands/pipeline.ts";
+import { cmdExport, cmdImport, printableLines } from "./commands/bundle.ts";
 import { cmdProjects } from "./commands/projects.ts";
 import { cmdClone } from "./commands/clone.ts";
 import { cmdCommit } from "./commands/commit.ts";
@@ -56,9 +57,14 @@ Commands:
   info                show the connected core's version
   daemon <sub>        start | stop | status of the background core
   harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
-  profile <sub>       list | show | add | edit | rm reusable agent profiles
+  profile <sub>       list | show | add | edit | rm | export | import reusable agent profiles
   pipeline <sub>      list | show | rm | export | import pipelines; retry [--from] |
                       advance | restart | status control a pipeline task's run
+  export [selectors]  write Agents and/or Pipelines to a portable JSON bundle
+                      (--profile <ref>… --pipeline <ref>… | --all; --out <file>)
+  import <file|->     import a bundle (or a legacy pipeline file) — --dry-run
+                      previews; --harness-map / --name / --enable-harnesses;
+                      asks before importing in a terminal (--yes skips)
   clone <url>         clone a repository as a new project (--provider, --dest, --no-eli5)
   projects <sub>      list | add | rm | branches (project folders)
   config [k] [v]      view / set core preferences (defaultHarness, last model…)
@@ -195,6 +201,10 @@ async function main(): Promise<void> {
     case "pipeline":
     case "pipelines":
       return cmdPipeline(args, flags);
+    case "export":
+      return cmdExport(args, flags);
+    case "import":
+      return cmdImport(args, flags);
     case "projects":
     case "project":
       return cmdProjects(args, flags);
@@ -215,6 +225,8 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  errln(c.red(`error: ${e?.message ?? String(e)}`));
+  // An error can quote a server message, which can quote a stored name —
+  // escape it so a name holding an ESC can't drive the terminal.
+  errln(c.red(`error: ${printableLines(String(e?.message ?? e)).join("\n")}`));
   process.exit(1);
 });

@@ -459,6 +459,38 @@ async function discoverGemini(): Promise<DiscoveredModel[]> {
   return [];
 }
 
+function parseAntigravityModels(stdout: string): DiscoveredModel[] {
+  const out: DiscoveredModel[] = [];
+  const seen = new Set<string>();
+  const clean = stdout.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, "");
+  for (const raw of clean.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.includes("Fetching available models")) continue;
+    const parts = line.split(/\s+/);
+    const id = parts[0]!;
+    if (!/^[a-z0-9][a-z0-9.\-_]*[a-z0-9]$/i.test(id)) continue;
+    if (!id.includes("-")) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const label = parts.slice(1).join(" ").trim();
+    out.push({
+      id,
+      label: label.length > 0 ? label : undefined,
+    });
+  }
+  return out;
+}
+
+async function discoverAntigravity(): Promise<DiscoveredModel[]> {
+  const fallback = process.env.AGETOR_ANTIGRAVITY_BIN ?? "agy";
+  const bin = Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+  const probe = await runProbe([bin, "models"]);
+  if (!probe.ok || !probe.stdout) return [];
+  return parseAntigravityModels(probe.stdout);
+}
+
+
 /**
  * Parse `fx models --json` output. Unlike codex/cursor (whose CLI output
  * format isn't formally specified, hence the loose line-heuristic parsers
@@ -859,8 +891,9 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Prom
       discoverCursor(),
       discoverGemini(),
       discoverFx(),
+      discoverAntigravity(),
     ]);
-    const kinds: AgentKind[] = ["codex", "claude-code", "cursor", "gemini", "fx"];
+    const kinds: AgentKind[] = ["codex", "claude-code", "cursor", "gemini", "fx", "antigravity"];
     results.forEach((result, i) => {
       cache.set(kinds[i]!, result.status === "fulfilled" ? result.value : []);
     });
@@ -1010,6 +1043,9 @@ async function runRefreshKind(kind: AgentKind): Promise<void> {
       case "fx":
         models = await discoverFx();
         break;
+      case "antigravity":
+        models = await discoverAntigravity();
+        break;
     }
   } catch {
     models = [];
@@ -1086,6 +1122,7 @@ export const __testing = {
   parseCodexModelList,
   parseCursorModels,
   parseFxModels,
+  parseAntigravityModels,
   resetForTests,
   setCodexProbeTimeoutMs,
 };

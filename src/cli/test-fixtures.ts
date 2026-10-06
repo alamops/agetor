@@ -1,4 +1,4 @@
-import type { Task } from "../shared/types.ts";
+import type { AgentProfile, Pipeline, Task } from "../shared/types.ts";
 
 /**
  * Typed `Task` fixture for CLI tests. Every required `Task` field is spelled
@@ -52,6 +52,39 @@ export function makeTask(over: Partial<Task> = {}): Task {
     createdAt: 0,
     updatedAt: 0,
     archivedAt: null,
+  };
+  return { ...base, ...over };
+}
+
+/** Typed `AgentProfile` fixture — same rationale as {@link makeTask}. */
+export function makeAgentProfile(over: Partial<AgentProfile> = {}): AgentProfile {
+  const base: AgentProfile = {
+    id: "prof-a",
+    name: "Investigator",
+    harness: "claude-code",
+    model: "opus-5.5",
+    effort: null,
+    mode: null,
+    fast: false,
+    maxMode: false,
+    instructions: "",
+    skills: [],
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  return { ...base, ...over };
+}
+
+/** Typed `Pipeline` fixture — same rationale as {@link makeTask}. */
+export function makePipelineFixture(over: Partial<Pipeline> = {}): Pipeline {
+  const base: Pipeline = {
+    id: "pipe-123456789",
+    name: "Bug fix flow",
+    description: "",
+    graph: { steps: [], edges: [], startStepId: null },
+    maxSteps: 25,
+    createdAt: 1,
+    updatedAt: 1,
   };
   return { ...base, ...over };
 }

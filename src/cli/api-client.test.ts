@@ -252,3 +252,86 @@ test("edit/move/archive/unarchive round-trip returns the bare Task", async () =>
     }
   }
 }, 30_000);
+
+// A `/bundle/*` 2xx that isn't a JSON object (a body cut off or garbled
+// after the core committed) must not reach the printers as a raw string.
+test("bundle calls: an unreadable 2xx rejects with the lost-answer message", async () => {
+  const server = Bun.serve({
+    port: 0,
+    fetch: () => new Response("{\"agents\": [", { status: 201, headers: { "content-type": "application/json" } }),
+  });
+  try {
+    const client = new AgetorClient({ port: server.port!, token: "tok" });
+    const err = await client.importBundle("{}").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).message).toContain("the import may have run");
+    expect((err as ApiError).message).toContain("agetor profile ls");
+    const preview = await client.previewBundleImport("{}").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((preview as ApiError).message).toBe("the core's answer to the preview was lost — try again");
+    const exported = await client.exportBundle({ all: true }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((exported as ApiError).message).toBe("the core's answer to the export was lost — try again");
+  } finally {
+    server.stop(true);
+  }
+});
+
+// An import that got no answer at all (a dropped socket, a timeout) may still
+// have committed, so it reads as lost — never as a plain "cannot reach core"
+// that invites a rerun. Preview/export keep `req`'s own text.
+test("bundle calls: an import with no answer rejects with the lost-answer message", async () => {
+  const listener = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      data(socket) {
+        socket.end();
+      },
+    },
+  });
+  try {
+    const client = new AgetorClient({ port: listener.port, token: "tok" });
+    const err = await client.importBundle("{}").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(0);
+    expect((err as ApiError).message).toContain("the import may have run");
+    expect((err as ApiError).message).toContain("cannot reach core (POST /bundle/import)");
+    const preview = await client.previewBundleImport("{}").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((preview as ApiError).status).toBe(0);
+    expect((preview as ApiError).message).toContain("cannot reach core (POST /bundle/import/preview)");
+  } finally {
+    listener.stop(true);
+  }
+});
+
+test("bundle calls: an HTTP error answer keeps the core's own message", async () => {
+  const server = Bun.serve({
+    port: 0,
+    fetch: () => Response.json({ error: "import failed — nothing was imported: boom" }, { status: 500 }),
+  });
+  try {
+    const client = new AgetorClient({ port: server.port!, token: "tok" });
+    const err = await client.importBundle("{}").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((err as ApiError).status).toBe(500);
+    expect((err as ApiError).message).toBe("import failed — nothing was imported: boom");
+  } finally {
+    server.stop(true);
+  }
+});

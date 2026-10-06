@@ -137,7 +137,7 @@ flowchart LR
 - **Live run view.** The canvas animates as the pipeline runs: the active step pulses, and a token travels along each edge when a handoff happens.
 - **Blocks instead of guessing.** If a step needs your input, fails, or can't produce a valid handoff even after one automatic reminder, the card moves to **Blocked** with the reason. From there you can retry the step, choose the next step yourself, stop, or restart.
 - **Frozen at launch.** A pipeline and its Agents are captured the moment you click Run, so editing or deleting them never affects a run already in progress.
-- **Portable.** `agetor pipeline export` and `agetor pipeline import` move pipelines between machines. The file records each step's Agent by name only, without the Agent's settings. On import, each step uses the local Agent with the same name (ignoring case), with that Agent's own harness, model, permission mode and instructions. Import doesn't flag differences from the original machine, so check them with `agetor profile show <name>` before the first run. If no local Agent has the name, import warns you, and that step needs an Agent before the pipeline can run.
+- **Portable.** Export Agents and Pipelines to one JSON file and import them on another machine — from Settings → Agents, Settings → Pipelines or the Pipelines page (per row, a multi-select, or Export all; import by choosing a file, pasting JSON or dropping the file onto the list), or with `agetor export` / `agetor import`. A pipeline brings every Agent it uses, with its full settings. Each Agent records its harness and the built-in harness that harness wraps, so an Agent on an extra account such as `secondary-claude-code` still imports on a machine without that account: it lands on the built-in Claude Code harness, with a warning. Import shows a preview first — what it will create, which harness each Agent lands on, and the instructions it carries — and then creates everything in one step; in a terminal, `agetor import` prints the same preview and asks before importing (`--dry-run` only previews, `--yes` skips the question for scripts). If something changes on this machine between the preview and the import (a name gets taken, say), the import stops and shows the new preview instead of creating something you didn't confirm. Instructions with invisible characters a preview couldn't show are refused. A name that's already taken becomes `Name (imported)`; nothing local is overwritten.
 
 > [!WARNING]
 > Parallel steps share **one** worktree, and nothing stops two of them from editing the same files. Use fan-out only for work that is truly independent, such as docs in one branch and tests in another.
@@ -174,7 +174,7 @@ A step ends its turn with a block like this. The last block in the turn wins.
 
 A step can also list other Agents it's allowed to delegate to as subagents, with an optional cap. Agetor passes this to the step as guidance in its prompt; it doesn't enforce the cap. Deleting or archiving a pipeline task also deletes or archives its steps.
 
-On your own machine, a step points at the Agent itself, not at its name, so renaming an Agent doesn't break a pipeline. Two Agents can't share a name. Names only matter when you import a pipeline.
+On your own machine, a step points at the Agent itself, not at its name, so renaming an Agent doesn't break a pipeline. Two Agents can't share a name. An exported file carries the Agents themselves, so names only matter when you import a pipeline file from an older version of Agetor: those files list each step's Agent by name only, and import uses the local Agent with that name.
 
 </details>
 
@@ -218,8 +218,10 @@ agetor rm <id> --yes         # delete a task, its worktree and its branch
 agetor clone <url>           # clone a GitHub/GitLab/Bitbucket repo as a new project
 agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
 agetor harness <sub>         # list | add | edit | enable | disable | rm | shell
-agetor profile <sub>         # ls | show | add | edit | rm (saved Agents)
+agetor profile <sub>         # ls | show | add | edit | rm | export | import (saved Agents)
 agetor pipeline <sub>        # ls | show | rm | export | import | status | retry | advance | restart
+agetor export --all --out f  # Agents and/or Pipelines to a JSON file (--profile/--pipeline <ref> to pick)
+agetor import <file>         # preview + confirm, then import (--dry-run, --yes, --harness-map <from>=<to>, --enable-harnesses)
 agetor daemon status|start|stop
 agetor config [key] [value]  # view or set preferences
 ```
@@ -283,6 +285,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 | --- | --- | --- |
 | `AGETOR_DATA_DIR` | Where the database, worktrees and logs live. | `~/.agetor` |
 | `AGETOR_API_PORT` | Port for the local API. | `4317` |
+| `AGETOR_API_HOST` | Address the headless core's API binds to: `127.0.0.1`, `0.0.0.0` or `::`. Only for running Agetor headless in a container (see below); the desktop app ignores it. | `127.0.0.1` |
 | `AGETOR_CLAUDE_BIN` / `AGETOR_CLAUDE_ARGS` | Override the `claude` binary / append extra args. | `claude` on `PATH` |
 | `AGETOR_CODEX_BIN` / `AGETOR_CODEX_ARGS` | Same, for Codex. | `codex` on `PATH` |
 | `AGETOR_CURSOR_BIN` / `AGETOR_CURSOR_ARGS` | Same, for Cursor. | `cursor-agent` on `PATH` |
@@ -293,6 +296,26 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 | `AGETOR_DAEMON_IDLE_MS` | Shut the CLI daemon down after this long with no run and no client (`0` disables). | `300000` |
 
 The bin, home and env overrides you set per harness in Settings take precedence over these variables. The CLI honors `AGETOR_DATA_DIR` and `AGETOR_API_PORT` too, and so do its `--data-dir` and `--port` flags. Test-only switches (fake drivers, API stubs) are documented in [`CLAUDE.md`](./CLAUDE.md).
+
+**Running headless in a container.** The API binds to `127.0.0.1` by default, and a Docker port mapping can't reach a loopback-only listener inside the container. Set `AGETOR_API_HOST=0.0.0.0` (or `::`) in the container so the published port works. The headless core (`agetor daemon`) accepts only `127.0.0.1`, `0.0.0.0` or `::`, and refuses to start on anything else: the CLI and agent hooks inside the container connect over `127.0.0.1`, which a specific address such as the container's own IP, or `localhost`/`::1` (IPv6-only), would break. The desktop app always stays on `127.0.0.1`.
+
+A wildcard bind is protected **only by the bearer token**, and the API speaks plain HTTP, so that token travels in cleartext. Agetor logs a warning about this at startup. Publish the port to `127.0.0.1` on the host so nothing beyond your machine can reach it, and never publish it more widely. For remote access, use an SSH tunnel or a TLS-terminating proxy:
+
+```bash
+docker run -e AGETOR_API_HOST=0.0.0.0 -p 127.0.0.1:4317:4317 <your-agetor-image>
+```
+
+```yaml
+services:
+  agetor:
+    image: <your-agetor-image>
+    environment:
+      AGETOR_API_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:4317:4317"
+```
+
+The token changes on every launch and is written to `agetor-core.json` in the data directory.
 
 </details>
 

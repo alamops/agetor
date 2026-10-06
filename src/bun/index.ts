@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
+import { DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
@@ -338,7 +339,11 @@ registerNotifierBundle();
 // self-updater, quit). The headless CLI daemon injects none of these — its
 // routes 501 — but the packaged app wires them up here.
 const native: ApiNative = {
-  openFileDialog: (opts) => Utils.openFileDialog(opts),
+  // Electrobun spreads `opts` over its defaults, so an explicit
+  // `allowedFileTypes: undefined` would wipe its "*" default — only pass the
+  // filter when a caller set one (`/bundle/pick-file` asks for "json").
+  openFileDialog: ({ allowedFileTypes, ...opts }) =>
+    Utils.openFileDialog(allowedFileTypes ? { ...opts, allowedFileTypes } : opts),
   openPath: (p) => Utils.openPath(p),
   // No Electrobun `Utils.revealPath` equivalent — spawn macOS's own
   // Finder-reveal command directly (agetor ships arm64 macOS only, so no
@@ -366,6 +371,16 @@ const native: ApiNative = {
     apply: () => applyUpdate(),
   },
 };
+
+// AGETOR_API_HOST is a headless-core setting (containers). The desktop app's
+// only clients are its own webview and same-machine CLI/hooks, so it always
+// binds 127.0.0.1 — say so rather than silently ignoring a set override.
+const requestedApiHost = resolveApiHost();
+if (!requestedApiHost.ok || requestedApiHost.host !== DEFAULT_API_HOST) {
+  console.warn(
+    `[agetor] AGETOR_API_HOST is ignored by the desktop app — it applies to the headless core only (agetor daemon). The app's API stays on ${DEFAULT_API_HOST}.`,
+  );
+}
 
 let apiServer: ReturnType<typeof startApiServer>;
 try {
@@ -399,7 +414,7 @@ try {
   }
   if (!recovered) {
     const msg = (e as Error)?.message ?? String(e);
-    console.error(`[agetor] failed to bind API on 127.0.0.1:${API_PORT}: ${msg}`);
+    console.error(`[agetor] failed to bind API on ${DEFAULT_API_HOST}:${API_PORT}: ${msg}`);
     console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
     process.exit(1);
   }

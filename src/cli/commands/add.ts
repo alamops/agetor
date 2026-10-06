@@ -40,6 +40,7 @@ import { buildFileEntries } from "../../shared/at-file-filter.ts";
 import { unresolvedAtTokens } from "../../shared/at-refs.ts";
 import { agentProfileSummary, asProfileError, matchAgentProfileRef } from "../../shared/agent-profile.ts";
 import { matchPipelineRef } from "../../shared/pipeline.ts";
+import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
 
 interface AddOpts {
   title?: string;
@@ -369,10 +370,10 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     return printJson(warnings.length ? { task, started, warnings } : { task, started });
   }
   out(
-    `${c.green("✓")} created ${c.dim(task.id.slice(0, 8))} — ${task.title}` +
+    `${c.green("✓")} created ${c.dim(task.id.slice(0, 8))} — ${escapeFreeText(task.title)}` +
       (started ? c.cyan("  ▸ started") : ""),
   );
-  if (startError) out(c.yellow(`  ! ${startError}`));
+  if (startError) out(c.yellow(`  ! ${escapeFreeText(startError)}`));
   warnUnresolvedRefs(unresolvedRefsWarning);
   if (!started) out(c.dim(`  start it: agetor start ${task.id.slice(0, 8)}`));
 }
@@ -573,7 +574,7 @@ async function wizard(
           { value: NONE, label: "None — launch a single agent" },
           ...pipelines.map((pl) => ({
             value: pl.id,
-            label: pl.name,
+            label: escapeControlChars(pl.name),
             hint: `${pl.graph.steps.length} step${pl.graph.steps.length === 1 ? "" : "s"}`,
           })),
         ],
@@ -607,13 +608,15 @@ async function wizard(
           options: [
             ...profiles.map((pr) => ({
               value: pr.id,
-              label: pr.name,
-              hint: agentProfileSummary({
-                harnessLabel: harnesses.find((h) => h.id === pr.harness)?.label ?? pr.harness,
-                model: pr.model,
-                effort: pr.effort,
-                mode: pr.mode,
-              }),
+              label: escapeControlChars(pr.name),
+              hint: escapeControlChars(
+                agentProfileSummary({
+                  harnessLabel: harnesses.find((h) => h.id === pr.harness)?.label ?? pr.harness,
+                  model: pr.model,
+                  effort: pr.effort,
+                  mode: pr.mode,
+                }),
+              ),
             })),
             { value: MANUAL, label: "Pick harness manually" },
           ],

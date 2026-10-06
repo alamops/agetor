@@ -39,6 +39,27 @@ export interface FetchRecoveryOpts {
   retry?: boolean;
 }
 
+/** Thrown when a request failed in transit and the `/health` probe got no
+ *  answer either: the core is down, so the request most likely never ran
+ *  (a caller can word its error that way). Same message as before. */
+export class ApiUnreachableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApiUnreachableError";
+  }
+}
+
+/** Thrown when a request failed in transit while the core's `/health`
+ *  probe answered — not retried (`retry: false`), or failed again on the
+ *  retry. The request may have run. The message is developer-facing (it
+ *  names the URL); a caller showing it to a user can word it by this type. */
+export class ApiTransitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApiTransitError";
+  }
+}
+
 function unreachableMessage(base: string, path: string): string {
   return `cannot reach agetor API at ${base} (${path}) — is the bun process running? Try restarting \`bun run dev\`.`;
 }
@@ -61,9 +82,13 @@ async function probeHealth(
   fetchImpl: typeof fetch,
   base: string,
   timeoutMs: number,
+  callerSignal?: AbortSignal | null,
 ): Promise<boolean> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // The caller giving up ends the probe too: nothing will use its answer.
+  const onCallerAbort = () => controller.abort();
+  callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
   try {
     const res = await fetchImpl(`${base}/health`, { signal: controller.signal });
     return res.ok;
@@ -71,7 +96,13 @@ async function probeHealth(
     return false;
   } finally {
     clearTimeout(timer);
+    callerSignal?.removeEventListener("abort", onCallerAbort);
   }
+}
+
+/** The error a caller-aborted request rejects with. */
+function abortError(signal: AbortSignal): unknown {
+  return signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError");
 }
 
 /** Performs `fetchImpl(base + path, init)`. On a network-layer rejection
@@ -83,7 +114,8 @@ async function probeHealth(
  *  - otherwise probes `GET {base}/health` with an AbortController timeout
  *    to decide whether the server is actually alive:
  *    - probe fails/times out: the server is genuinely unreachable. Throws
- *      the original error's message verbatim UNLESS it's WebKit's generic
+ *      an `ApiUnreachableError` carrying the original error's message
+ *      verbatim UNLESS it's WebKit's generic
  *      "Load failed", in which case the friendlier "cannot reach agetor
  *      API… is the bun process running?" message is thrown instead.
  *    - probe succeeds (`res.ok`): the server is alive, so the original
@@ -114,21 +146,23 @@ export async function fetchWithRecovery(
       throw e;
     }
     const msg = (e as Error).message ?? String(e);
-    const alive = await probeHealth(fetchImpl, base, healthTimeoutMs);
+    const alive = await probeHealth(fetchImpl, base, healthTimeoutMs, init?.signal);
+    // Aborted while the probe ran: the caller asked for this to stop, so
+    // neither report the server nor retry with an already-aborted signal.
+    if (init?.signal?.aborted) throw abortError(init.signal);
     if (!alive) {
-      if (msg !== "Load failed") {
-        throw e instanceof Error ? e : new Error(msg);
-      }
-      throw new Error(unreachableMessage(base, path));
+      throw new ApiUnreachableError(msg !== "Load failed" ? msg : unreachableMessage(base, path));
     }
     if (!retry) {
-      throw new Error(notRetriedMessage(base, path, msg));
+      throw new ApiTransitError(notRetriedMessage(base, path, msg));
     }
     try {
       return await fetchImpl(`${base}${path}`, init);
     } catch (e2) {
+      // Aborted during the retry: the caller's outcome, not a transit failure.
+      if (init?.signal?.aborted || (e2 as Error)?.name === "AbortError") throw e2;
       const lastErrorMsg = (e2 as Error).message ?? String(e2);
-      throw new Error(failedTwiceMessage(base, path, lastErrorMsg || msg));
+      throw new ApiTransitError(failedTwiceMessage(base, path, lastErrorMsg || msg));
     }
   }
 }
