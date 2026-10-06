@@ -78,11 +78,27 @@ describe("openEditor", () => {
 
 describe("openAgentEditor", () => {
   test("opens the editor for a new agent (null id)", () => {
-    expect(openAgentEditor(null)).toEqual({ kind: "agent-editor", profileId: null });
+    expect(openAgentEditor(null)).toEqual({ kind: "agent-editor", profileId: null, duplicateFromId: null });
+  });
+
+  test("duplicating carries the source id on a new agent", () => {
+    expect(openAgentEditor(null, "prof-1")).toEqual({
+      kind: "agent-editor",
+      profileId: null,
+      duplicateFromId: "prof-1",
+    });
+  });
+
+  test("editing an existing agent forces duplicateFromId to null", () => {
+    expect(openAgentEditor("prof-1", "other")).toEqual({
+      kind: "agent-editor",
+      profileId: "prof-1",
+      duplicateFromId: null,
+    });
   });
 
   test("opens the editor for an existing agent id", () => {
-    expect(openAgentEditor("prof-1")).toEqual({ kind: "agent-editor", profileId: "prof-1" });
+    expect(openAgentEditor("prof-1")).toEqual({ kind: "agent-editor", profileId: "prof-1", duplicateFromId: null });
   });
 });
 
@@ -98,6 +114,7 @@ describe("backFromSubview", () => {
   test("the agent editor view returns the Agents section (create and edit)", () => {
     expect(backFromSubview(openAgentEditor(null))).toEqual({ kind: "section", section: "agents" });
     expect(backFromSubview(openAgentEditor("prof-1"))).toEqual({ kind: "section", section: "agents" });
+    expect(backFromSubview(openAgentEditor(null, "prof-1"))).toEqual({ kind: "section", section: "agents" });
   });
 
   for (const id of SECTION_IDS) {
@@ -154,6 +171,7 @@ describe("isFormSubpage", () => {
     expect(isFormSubpage(openEditor(null, template()))).toBe(true);
     expect(isFormSubpage(openAgentEditor(null))).toBe(true);
     expect(isFormSubpage(openAgentEditor("prof-1"))).toBe(true);
+    expect(isFormSubpage(openAgentEditor(null, "prof-1"))).toBe(true);
   });
 
   test("the templates picker holds no draft", () => {

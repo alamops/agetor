@@ -22,7 +22,8 @@ import { AGENT_PROFILE_LIMITS } from "../src/shared/agent-profile.ts";
  * list, and every exit but the form's own Cancel asks "Discard unsaved
  * changes?" when the draft is dirty. The same guard on the harness editor
  * lives in `e2e/settings-subpage-guard.spec.ts`; the pipeline step's "New
- * agent" dialog is covered in `e2e/pipelines-editor.spec.ts`.
+ * agent" dialog is covered in `e2e/pipelines-editor.spec.ts`. This file also
+ * covers Duplicate → prefilled subpage → save.
  *
  * One serial `describe` sharing the worker backend (`e2e/fixtures.ts`) and
  * building on itself exactly like `e2e/agent-profiles.spec.ts` does: scenario
@@ -994,6 +995,92 @@ test.describe("agent profiles — Settings surface", () => {
         .locator('[data-testid="agent-profile-row"]')
         .filter({ hasText: new RegExp(WIDGET_BUILDER_NAME.toLowerCase()) }),
     ).toHaveCount(0);
+  });
+
+  test("Duplicate: prefilled subpage, save creates the copy, second duplicate is '(copy 2)', untouched Back is clean, dirty Back confirms", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const sourceName = `Duplicate Source ${randomUUID()}`;
+    const sourceInstructions = `Distinctive duplicate instructions ${randomUUID()}`;
+    const source = await createAgentProfileRest(request, backend, {
+      name: sourceName,
+      harness: "claude-code",
+      model: "sonnet-5",
+      effort: "medium",
+      mode: "plan",
+      fast: false,
+      maxMode: false,
+      instructions: sourceInstructions,
+      skills: [],
+    });
+    createdProfileIds.push(source.id);
+
+    await gotoApp(page, backend.bootBase);
+    await openSettingsAgents(page);
+    const modal = settingsModal(page);
+    // The copy's name contains the source name, so a hasText-only filter matches
+    // both rows once the copy exists. "(copy)" is only on the copies.
+    const sourceRow = () =>
+      modal
+        .locator('[data-testid="agent-profile-row"]')
+        .filter({ hasText: sourceName })
+        .filter({ hasNotText: "(copy)" });
+    const heading = modal.locator("#settings-dialog-title");
+
+    // Duplicate → prefilled subpage → Save.
+    const dupButton = sourceRow().getByTestId("agent-profile-duplicate");
+    await expect(dupButton).toHaveText("Duplicate");
+    await dupButton.click();
+    const form = modal.getByTestId("agent-profile-form");
+    await expect(form).toBeVisible();
+    await expect(heading).toHaveText("Duplicate agent");
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy)`);
+    await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(sourceInstructions);
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+    await expectAgentsList(modal);
+    const copyName = `${sourceName} (copy)`;
+    await expect(modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: copyName })).toBeVisible();
+    createdProfileIds.push(await getProfileIdByName(request, backend, copyName));
+
+    // Second duplicate of the same source → "(copy 2)". Untouched Back: no confirm.
+    await sourceRow().getByTestId("agent-profile-duplicate").click();
+    await expect(form).toBeVisible();
+    await expect(heading).toHaveText("Duplicate agent");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy 2)`);
+    await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expectAgentsList(modal);
+    await expect(
+      modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: `${sourceName} (copy 2)` }),
+    ).toHaveCount(0);
+
+    // Dirty Back: rename → confirm; Cancel stays, Discard returns without creating.
+    await sourceRow().getByTestId("agent-profile-duplicate").click();
+    await expect(form).toBeVisible();
+    const renamed = `${sourceName} renamed copy`;
+    await form.getByTestId("agent-profile-name").fill(renamed);
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(heading).toHaveText("Duplicate agent");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(renamed);
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expectAgentsList(modal);
+    await expect(modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: renamed })).toHaveCount(0);
+    const listRes = await request.get(`${backend.apiBase}/agent-profiles`, { headers: auth(backend) });
+    const names = ((await listRes.json()) as { name: string }[]).map((p) => p.name);
+    expect(names).not.toContain(renamed);
+    expect(names).not.toContain(`${sourceName} (copy 2)`);
   });
 });
 
