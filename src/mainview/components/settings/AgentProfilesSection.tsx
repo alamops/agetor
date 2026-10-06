@@ -31,6 +31,8 @@ interface Props {
   onAdd: () => void;
   /** Open the edit form for `profile` (same subpage, keyed on its id). */
   onEdit: (profile: AgentProfile) => void;
+  /** Open the create form prefilled from `profile` (same subpage). */
+  onDuplicate: (profile: AgentProfile) => void;
   /** After a bundle import — `SettingsDialog` reloads its harness list when
    *  the import enabled a harness. */
   onImported?: (result: { enabledHarnesses: string[] }) => void;
@@ -38,15 +40,15 @@ interface Props {
 
 /**
  * Settings → Agents — the list of reusable {@link AgentProfile} launch
- * presets, with delete. List-only: Add and Edit hand off through `onAdd` /
- * `onEdit` to `SettingsDialog`, which navigates its own agent-editor subpage
+ * presets, with delete. List-only: Add, Edit and Duplicate hand off through
+ * `onAdd` / `onEdit` / `onDuplicate` to `SettingsDialog`, which navigates its own agent-editor subpage
  * to `AgentProfileForm` (`@/components/kanban/AgentProfileFormDialog`, also
  * reused by a pipeline step's inline "New agent…" affordance via
  * `AgentProfileFormDialog`). Export/import (per-row Export, multi-select,
  * Export all, Import, and dropping a .json file onto the list) runs through
  * `useBundleList` — docs/plans/agents-pipelines-import-export.md C13.
  */
-export function AgentProfilesSection({ harnesses, onAdd, onEdit, onImported }: Props) {
+export function AgentProfilesSection({ harnesses, onAdd, onEdit, onDuplicate, onImported }: Props) {
   const { profiles, loading, error: loadError, refresh } = useAgentProfiles();
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const confirm = useConfirm();
@@ -136,6 +138,9 @@ export function AgentProfilesSection({ harnesses, onAdd, onEdit, onImported }: P
                 </Button>
                 <Button size="sm" variant="ghost" data-testid="agent-profile-edit" onClick={() => onEdit(p)}>
                   Edit
+                </Button>
+                <Button size="sm" variant="ghost" data-testid="agent-profile-duplicate" onClick={() => onDuplicate(p)}>
+                  Duplicate
                 </Button>
                 <Button
                   size="sm"

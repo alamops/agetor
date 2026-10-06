@@ -19,7 +19,9 @@ export type SettingsSectionId = (typeof SETTINGS_SECTIONS)[number]["id"];
  * Prompts — see `SETTINGS_SECTIONS`), "templates" is the Add-harness
  * template picker, "editor" is the harness create/edit form, and
  * "agent-editor" is the agent-profile create/edit form (`profileId` is null
- * when creating). The sidebar itself stays visible across all four kinds
+ * when creating; a null `profileId` with a `duplicateFromId` means "create
+ * prefilled from that agent", while a set `profileId` is always an edit
+ * with a null `duplicateFromId`). The sidebar itself stays visible across all four kinds
  * (see `activeSection`), unlike the GitHub modal's full-panel subpage
  * replacement.
  */
@@ -27,7 +29,7 @@ export type SettingsView =
   | { kind: "section"; section: SettingsSectionId }
   | { kind: "templates" }
   | { kind: "editor"; harnessId: string | null; template: HarnessTemplate }
-  | { kind: "agent-editor"; profileId: string | null };
+  | { kind: "agent-editor"; profileId: string | null; duplicateFromId: string | null };
 
 /** The view shown every time the dialog opens — always General, no persistence. */
 export function initialView(): SettingsView {
@@ -49,9 +51,21 @@ export function openEditor(harnessId: string | null, template: HarnessTemplate):
   return { kind: "editor", harnessId, template };
 }
 
-/** Navigate to the agent-profile editor — `profileId` is null when creating. */
-export function openAgentEditor(profileId: string | null): SettingsView {
-  return { kind: "agent-editor", profileId };
+/**
+ * Navigate to the agent-profile editor — `profileId` is null when creating.
+ * A null `profileId` with a `duplicateFromId` means "create prefilled from
+ * that agent"; a set `profileId` is always an edit, so `duplicateFromId` is
+ * forced to null in that case.
+ */
+export function openAgentEditor(
+  profileId: string | null,
+  duplicateFromId: string | null = null,
+): SettingsView {
+  return {
+    kind: "agent-editor",
+    profileId,
+    duplicateFromId: profileId === null ? duplicateFromId : null,
+  };
 }
 
 /**

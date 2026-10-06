@@ -8,7 +8,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { useAgentProfiles } from "@/lib/agent-profiles";
-import { agentProfileTextDirty } from "@/lib/agent-profile-form";
+import { agentProfileTextDirty, duplicateAgentName } from "@/lib/agent-profile-form";
 import { cn } from "@/lib/utils";
 import { AGENT_PROFILE_LIMITS } from "../../../shared/agent-profile.ts";
 import type { AgentProfile } from "../../../shared/types.ts";
@@ -34,6 +34,10 @@ export interface AgentProfileFormProps {
    *  (the same module-cached list every other profile consumer reads), so
    *  a caller never has to pass the `AgentProfile` object itself. */
   profileId: string | null;
+  /** When `profileId` is null, opens a create form prefilled from this
+   *  existing agent (name suffixed to stay unique). Save still creates a
+   *  new agent. Ignored when `profileId` is set. */
+  duplicateFromId?: string | null;
   onSaved: (profile: AgentProfile) => void;
   onCancel: () => void;
   /** Focuses the Name field on mount when true. Defaults to `false` so a
@@ -78,10 +82,44 @@ const PAGE_FOOTER_CLASS = "border-t border-border/60 pt-3";
  * "Loading…" line (no Save button at all) and a genuinely-missing one an
  * error with only Cancel.
  */
-export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus, onDirtyChange, variant = "card" }: AgentProfileFormProps) {
+export function AgentProfileForm({
+  profileId,
+  duplicateFromId = null,
+  onSaved,
+  onCancel,
+  autoFocus,
+  onDirtyChange,
+  variant = "card",
+}: AgentProfileFormProps) {
   const { profiles, loaded, refresh } = useAgentProfiles();
 
-  if (profileId === null) {
+  const duplicating = profileId === null && typeof duplicateFromId === "string" && duplicateFromId !== "";
+  const duplicateSource = duplicating ? (profiles.find((p) => p.id === duplicateFromId) ?? null) : null;
+
+  if (duplicateSource) {
+    const seed: AgentProfile = {
+      ...duplicateSource,
+      name: duplicateAgentName(
+        duplicateSource.name,
+        profiles.map((p) => p.name),
+      ),
+    };
+    return (
+      <AgentProfileFormBody
+        key={`dup-${duplicateSource.id}`}
+        profileId={null}
+        editingProfile={seed}
+        onSaved={onSaved}
+        onCancel={onCancel}
+        autoFocus={autoFocus}
+        onDirtyChange={onDirtyChange}
+        variant={variant}
+        refreshProfiles={refresh}
+      />
+    );
+  }
+
+  if (profileId === null && !duplicating) {
     return (
       <AgentProfileFormBody
         key="new"
@@ -97,7 +135,7 @@ export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus, onDi
     );
   }
 
-  const editingProfile = profiles.find((p) => p.id === profileId) ?? null;
+  const editingProfile = profileId === null ? null : (profiles.find((p) => p.id === profileId) ?? null);
   if (editingProfile) {
     return (
       <AgentProfileFormBody
@@ -138,8 +176,10 @@ export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus, onDi
 }
 
 interface AgentProfileFormBodyProps extends AgentProfileFormProps {
-  /** The already-resolved row for an edit form — never `null` when
-   *  `profileId` isn't. The outer `AgentProfileForm` guarantees this by
+  /** The already-resolved row used to seed the form — never `null` when
+   *  `profileId` isn't. It is also non-null with a null `profileId` for a
+   *  duplicate seed (a create form prefilled from another agent);
+   *  `profileId` is non-null only for a real edit. The outer `AgentProfileForm` guarantees this by
    *  only mounting the body once the profile is known (and keys it on the
    *  id), so every `useState` initializer below can seed straight from it. */
   editingProfile: AgentProfile | null;
