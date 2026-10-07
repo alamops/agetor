@@ -6,11 +6,15 @@ import {
   graphFromFlow,
   latestTransition,
   matchSubagentToProfile,
+  pipelineAttentionStepTask,
   reconcileFlowItems,
   responseKindLabel,
+  sameStepAttention,
   satellitesSignature,
+  stepAttention,
   stepLayoutFootprint,
   stepReminded,
+  stepNodeTaskFor,
   stepTaskFor,
   stepVisualState,
   subagentEdgeKey,
@@ -837,4 +841,765 @@ describe("reconcileFlowItems", () => {
     );
     expect(subagentEdgeKey(e1!)).not.toBe(subagentEdgeKey(e2!));
   });
+});
+
+// ---------------------------------------------------------------------------
+// stepAttention / sameStepAttention
+
+describe("stepAttention", () => {
+  const asking = (overrides: Partial<Task> = {}) =>
+    makeTask({ id: "task-1", column: "running", pendingInteractionCount: 1, ...overrides });
+
+  test("no run → null", () => {
+    expect(stepAttention(null, "step-1", [])).toBeNull();
+    expect(stepAttention(undefined, "step-1", [])).toBeNull();
+  });
+
+  test("row 1 — asking mid-turn: answer, while the lifecycle visual still reads active", () => {
+    const run = makeRun({ active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }] });
+    const steps = [asking()];
+    expect(stepAttention(run, "step-1", steps)).toEqual({ kind: "answer", label: "Answer", message: null });
+    expect(stepVisualState(run, "step-1", steps)).toBe("active");
+  });
+
+  test("row 2 — a question still pending after the turn carries the block's message", () => {
+    const run = makeRun({
+      status: "blocked",
+      active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }],
+      blocked: [{ taskId: "task-1", stepId: "step-1", kind: "step-blocked", message: 'step "One" is waiting for you' }],
+    });
+    expect(stepAttention(run, "step-1", [asking({ column: "review" })])).toEqual({
+      kind: "answer",
+      label: "Answer",
+      message: 'step "One" is waiting for you',
+    });
+  });
+
+  test("row 2 — once the pending count dropped, the remaining block reads Review", () => {
+    const run = makeRun({
+      active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }],
+      blocked: [{ taskId: "task-1", stepId: "step-1", kind: "step-blocked", message: "waiting" }],
+    });
+    expect(stepAttention(run, "step-1", [asking({ pendingInteractionCount: 0, column: "review" })])).toEqual({
+      kind: "review",
+      label: "Review",
+      message: "waiting",
+    });
+  });
+
+  test("row 3 — error: a step-failed block on a blocked step task → review with the message", () => {
+    const run = makeRun({
+      status: "blocked",
+      active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }],
+      blocked: [{ taskId: "task-1", stepId: "step-1", kind: "step-failed", message: "API error" }],
+    });
+    expect(stepAttention(run, "step-1", [makeTask({ id: "task-1", column: "blocked" })])).toEqual({
+      kind: "review",
+      label: "Review",
+      message: "API error",
+    });
+  });
+
+  test("row 3 — the step task's own column reads blocked before any block lands → review, no message", () => {
+    const run = makeRun({ active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }] });
+    expect(stepAttention(run, "step-1", [makeTask({ id: "task-1", column: "blocked" })])).toEqual({
+      kind: "review",
+      label: "Review",
+      message: null,
+    });
+  });
+
+  test("row 4 — missing handoff and a step-blocked handoff both read Review", () => {
+    for (const kind of ["handoff-missing", "handoff-invalid", "step-blocked"] as const) {
+      const run = makeRun({
+        active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }],
+        blocked: [{ taskId: "task-1", stepId: "step-1", kind, message: `blocked: ${kind}` }],
+      });
+      expect(stepAttention(run, "step-1", [makeTask({ id: "task-1", column: "review" })])).toEqual({
+        kind: "review",
+        label: "Review",
+        message: `blocked: ${kind}`,
+      });
+    }
+  });
+
+  test("a block naming the active execution by taskId only still matches", () => {
+    const run = makeRun({
+      active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }],
+      blocked: [{ taskId: "task-1", stepId: null, kind: "step-failed", message: "boom" }],
+    });
+    expect(stepAttention(run, "step-1", [makeTask({ id: "task-1", column: "review" })])?.message).toBe("boom");
+  });
+
+  test("row 5 — a run-level block highlights the named step even though it isn't active", () => {
+    const run = makeRun({
+      status: "blocked",
+      history: [makeRecord({ seq: 1, stepId: "step-1", taskId: "task-1", nextStepIds: [] })],
+      blocked: [{ taskId: null, stepId: "step-2", kind: "step-cap", message: "step cap reached" }],
+    });
+    const steps = [makeTask({ id: "task-1", column: "review" })];
+    expect(stepAttention(run, "step-2", steps)).toEqual({ kind: "review", label: "Review", message: "step cap reached" });
+    expect(stepVisualState(run, "step-2", steps)).toBe("idle");
+  });
+
+  test("a block naming another step never leaks onto this one", () => {
+    const run = makeRun({
+      active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }],
+      blocked: [{ taskId: null, stepId: "step-2", kind: "step-cap", message: "cap" }],
+    });
+    expect(stepAttention(run, "step-1", [makeTask({ id: "task-1", column: "running" })])).toBeNull();
+  });
+
+  test("an active execution sitting in review for a manual Advance, with no block → null (D18)", () => {
+    const run = makeRun({ active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }] });
+    expect(stepAttention(run, "step-1", [makeTask({ id: "task-1", column: "review", pendingInteractionCount: 0 })])).toBeNull();
+  });
+
+  test("two pending questions → Answer (2), summed across every active execution of the step", () => {
+    const single = makeRun({ active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }] });
+    expect(stepAttention(single, "step-1", [asking({ pendingInteractionCount: 2 })])?.label).toBe("Answer (2)");
+
+    const fanIn = makeRun({
+      active: [
+        { stepId: "step-1", taskId: "task-1", seq: 1 },
+        { stepId: "step-1", taskId: "task-2", seq: 2 },
+      ],
+    });
+    expect(stepAttention(fanIn, "step-1", [asking(), asking({ id: "task-2" })])?.label).toBe("Answer (2)");
+  });
+
+  test("a leftover pending card on a settled step (latest history execution) → answer", () => {
+    const run = makeRun({
+      status: "done",
+      history: [
+        makeRecord({ seq: 1, stepId: "step-1", taskId: "task-old" }),
+        makeRecord({ seq: 2, stepId: "step-1", taskId: "task-new" }),
+      ],
+    });
+    expect(stepAttention(run, "step-1", [makeTask({ id: "task-new", column: "review", pendingInteractionCount: 1 })])).toEqual({
+      kind: "answer",
+      label: "Answer",
+      message: null,
+    });
+    // An older generation's leftover counts too — the same set the attention
+    // resolver scans, so a card reading Answer always has a node glowing.
+    expect(
+      stepAttention(run, "step-1", [
+        makeTask({ id: "task-old", column: "review", pendingInteractionCount: 1 }),
+        makeTask({ id: "task-new", column: "review", pendingInteractionCount: 0 }),
+      ]),
+    ).toEqual({ kind: "answer", label: "Answer", message: null });
+  });
+
+  test("a cycle: an earlier execution's leftover question still glows while the step re-runs", () => {
+    const run = makeRun({
+      active: [{ stepId: "step-1", taskId: "task-2", seq: 3 }],
+      history: [
+        makeRecord({ seq: 1, stepId: "step-1", taskId: "task-1" }),
+        makeRecord({ seq: 2, stepId: "step-2", taskId: "task-other" }),
+        makeRecord({ seq: 3, stepId: "step-1", taskId: "task-2" }),
+      ],
+    });
+    const steps = [
+      makeTask({ id: "task-1", column: "review", pendingInteractionCount: 1 }),
+      makeTask({ id: "task-2", column: "running", pendingInteractionCount: 0 }),
+    ];
+    expect(stepAttention(run, "step-1", steps)).toEqual({ kind: "answer", label: "Answer", message: null });
+    // Agrees with the resolver: the card's Answer lands on that leftover.
+    const parent = makeTask({ id: "parent", pipelineId: "pipeline-1", pipelineRun: run });
+    const rows = steps.map((t) => ({ ...t, pipelineParentId: "parent" }));
+    expect(pipelineAttentionStepTask(parent, rows)?.id).toBe("task-1");
+    // The other step of the cycle needs nothing.
+    expect(stepAttention(run, "step-2", steps)).toBeNull();
+  });
+
+  test("an active execution also present in history is counted once", () => {
+    const run = makeRun({
+      active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }],
+      history: [makeRecord({ seq: 1, stepId: "step-1", taskId: "task-1" })],
+    });
+    expect(stepAttention(run, "step-1", [asking()])?.label).toBe("Answer");
+  });
+
+  test("a settled execution's blocked column doesn't read Review while the step re-runs", () => {
+    const run = makeRun({
+      active: [{ stepId: "step-1", taskId: "task-2", seq: 2 }],
+      history: [
+        makeRecord({ seq: 1, stepId: "step-1", taskId: "task-1", outcome: "failed" }),
+        makeRecord({ seq: 2, stepId: "step-1", taskId: "task-2" }),
+      ],
+    });
+    const steps = [makeTask({ id: "task-1", column: "blocked" }), makeTask({ id: "task-2", column: "running" })];
+    expect(stepAttention(run, "step-1", steps)).toBeNull();
+  });
+
+  test("a settled step whose own column reads blocked is not an attention (only active ones are)", () => {
+    const run = makeRun({ history: [makeRecord({ seq: 1, stepId: "step-1", taskId: "task-1", outcome: "failed" })] });
+    expect(stepAttention(run, "step-1", [makeTask({ id: "task-1", column: "blocked" })])).toBeNull();
+  });
+
+  test("a step that never ran, or whose row isn't polled yet → null", () => {
+    expect(stepAttention(makeRun(), "step-1", [])).toBeNull();
+    const run = makeRun({ active: [{ stepId: "step-1", taskId: "task-1", seq: 1 }] });
+    expect(stepAttention(run, "step-1", [])).toBeNull();
+  });
+});
+
+describe("sameStepAttention", () => {
+  test("null and undefined both mean no attention and compare equal", () => {
+    expect(sameStepAttention(null, null)).toBe(true);
+    expect(sameStepAttention(undefined, null)).toBe(true);
+    expect(sameStepAttention(null, undefined)).toBe(true);
+  });
+
+  test("no attention vs some attention → not equal", () => {
+    const a = { kind: "answer" as const, label: "Answer", message: null };
+    expect(sameStepAttention(a, null)).toBe(false);
+    expect(sameStepAttention(undefined, a)).toBe(false);
+  });
+
+  test("structurally equal objects compare equal even when they're different references", () => {
+    expect(
+      sameStepAttention(
+        { kind: "review", label: "Review", message: "m" },
+        { kind: "review", label: "Review", message: "m" },
+      ),
+    ).toBe(true);
+  });
+
+  test("a difference in kind, label or message is detected", () => {
+    const base = { kind: "answer" as const, label: "Answer", message: null as string | null };
+    expect(sameStepAttention(base, { ...base, kind: "review" })).toBe(false);
+    expect(sameStepAttention(base, { ...base, label: "Answer (2)" })).toBe(false);
+    expect(sameStepAttention(base, { ...base, message: "now blocked" })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pipelineAttentionStepTask
+
+describe("pipelineAttentionStepTask", () => {
+  const parentWith = (run: Partial<PipelineRunState> | null) =>
+    makeTask({
+      id: "parent",
+      pipelineId: "pipeline-1",
+      column: "running",
+      pipelineRun: run ? makeRun(run) : null,
+    });
+  const step = (id: string, overrides: Partial<Task> = {}) =>
+    makeTask({ id, pipelineParentId: "parent", column: "running", pendingInteractionCount: 0, ...overrides });
+
+  test("a parent without a run → null", () => {
+    expect(pipelineAttentionStepTask(parentWith(null), [step("a", { pendingInteractionCount: 1 })])).toBeNull();
+  });
+
+  test("a pending question beats a task-level block", () => {
+    const parent = parentWith({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s2", taskId: "b", seq: 2 },
+      ],
+      blocked: [{ taskId: "a", stepId: "s1", kind: "step-failed", message: "boom" }],
+    });
+    const tasks = [step("a", { column: "blocked" }), step("b", { pendingInteractionCount: 1 })];
+    expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("b");
+  });
+
+  test("several asking at once → the earliest-launched (run.active array order)", () => {
+    const parent = parentWith({
+      active: [
+        { stepId: "s2", taskId: "b", seq: 2 },
+        { stepId: "s1", taskId: "a", seq: 3 },
+      ],
+    });
+    const tasks = [step("a", { pendingInteractionCount: 1 }), step("b", { pendingInteractionCount: 2 })];
+    expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("b");
+  });
+
+  test("the block tier skips a block whose step row isn't polled yet", () => {
+    const parent = parentWith({
+      active: [
+        { stepId: "s1", taskId: "missing", seq: 1 },
+        { stepId: "s2", taskId: "a", seq: 2 },
+      ],
+      blocked: [
+        { taskId: "missing", stepId: "s1", kind: "handoff-missing", message: "x" },
+        { taskId: "a", stepId: "s2", kind: "handoff-invalid", message: "y" },
+      ],
+    });
+    expect(pipelineAttentionStepTask(parent, [step("a", { column: "review" })])?.id).toBe("a");
+  });
+
+  test("only run-level blocks (no step task) → null, the run view alone", () => {
+    const parent = parentWith({
+      status: "blocked",
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" })],
+      blocked: [{ taskId: null, stepId: "s2", kind: "step-cap", message: "cap" }],
+    });
+    expect(pipelineAttentionStepTask(parent, [step("a", { column: "review" })])).toBeNull();
+  });
+
+  test("an active execution whose own column reads blocked, before run.blocked catches up", () => {
+    const parent = parentWith({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s2", taskId: "b", seq: 2 },
+      ],
+    });
+    expect(pipelineAttentionStepTask(parent, [step("a"), step("b", { column: "blocked" })])?.id).toBe("b");
+  });
+
+  test("a leftover pending card on a settled step → the latest such history execution", () => {
+    const parent = parentWith({
+      status: "done",
+      history: [
+        makeRecord({ seq: 1, stepId: "s1", taskId: "a" }),
+        makeRecord({ seq: 2, stepId: "s2", taskId: "b" }),
+        makeRecord({ seq: 3, stepId: "s3", taskId: "c" }),
+      ],
+    });
+    const tasks = [
+      step("a", { column: "review", pendingInteractionCount: 1 }),
+      step("b", { column: "review", pendingInteractionCount: 1 }),
+      step("c", { column: "review" }),
+    ];
+    expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("b");
+  });
+
+  test("a leftover question on a finished execution beats a blocked re-run of the same step", () => {
+    // A cycle re-ran s1: the first execution still holds an unanswered
+    // question, the re-run is blocked. Answer must open the row that asks —
+    // the same execution the s1 node click opens (stepNodeTaskFor).
+    const parent = parentWith({
+      status: "blocked",
+      history: [
+        makeRecord({ seq: 1, stepId: "s1", taskId: "a" }),
+        makeRecord({ seq: 2, stepId: "s1", taskId: "b" }),
+      ],
+      active: [{ stepId: "s1", taskId: "b", seq: 2 }],
+      blocked: [{ taskId: "b", stepId: "s1", kind: "step-failed", message: "boom" }],
+    });
+    const tasks = [
+      step("a", { column: "review", pendingInteractionCount: 1 }),
+      step("b", { column: "blocked" }),
+    ];
+    expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("a");
+    expect(stepNodeTaskFor(tasks, parent.pipelineRun, "s1")?.id).toBe("a");
+  });
+
+  test("a leftover question on another settled step beats a task-level block and a blocked column", () => {
+    const parent = parentWith({
+      status: "blocked",
+      history: [
+        makeRecord({ seq: 1, stepId: "s1", taskId: "a" }),
+        makeRecord({ seq: 2, stepId: "s2", taskId: "b" }),
+        makeRecord({ seq: 3, stepId: "s3", taskId: "c" }),
+      ],
+      active: [
+        { stepId: "s2", taskId: "b", seq: 2 },
+        { stepId: "s3", taskId: "c", seq: 3 },
+      ],
+      blocked: [{ taskId: "b", stepId: "s2", kind: "handoff-missing", message: "x" }],
+    });
+    const tasks = [
+      step("a", { column: "review", pendingInteractionCount: 1 }),
+      step("b", { column: "review" }),
+      step("c", { column: "blocked" }),
+    ];
+    expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("a");
+  });
+
+  test("nothing needs the user → null", () => {
+    const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
+    expect(pipelineAttentionStepTask(parent, [step("a")])).toBeNull();
+  });
+
+  test("a row belonging to another pipeline parent is never returned", () => {
+    const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
+    const foreign = makeTask({ id: "a", pipelineParentId: "other-parent", pendingInteractionCount: 1 });
+    expect(pipelineAttentionStepTask(parent, [foreign])).toBeNull();
+  });
+
+  test("a preferred step id that still has a pending question wins over the tiers", () => {
+    const parent = parentWith({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s2", taskId: "b", seq: 2 },
+      ],
+    });
+    const tasks = [step("a", { pendingInteractionCount: 1 }), step("b", { pendingInteractionCount: 1 })];
+    expect(pipelineAttentionStepTask(parent, tasks, "b")?.id).toBe("b");
+  });
+
+  test("with nothing asking, a preferred step whose column reads blocked, or that a run.blocked entry names, wins", () => {
+    const parent = parentWith({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s2", taskId: "b", seq: 2 },
+        { stepId: "s3", taskId: "c", seq: 3 },
+      ],
+      blocked: [{ taskId: "c", stepId: "s3", kind: "step-blocked", message: "waiting" }],
+    });
+    const tasks = [step("a"), step("b", { column: "blocked" }), step("c", { column: "review" })];
+    expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("c");
+    expect(pipelineAttentionStepTask(parent, tasks, "b")?.id).toBe("b");
+    expect(pipelineAttentionStepTask(parent, tasks, "c")?.id).toBe("c");
+  });
+
+  test("a preferred step that's only blocked loses to another step's open question", () => {
+    // Fan-out: A and B both asked; A was answered and then blocked on a
+    // missing handoff while B's question is still open. The toast still
+    // names A, but Answer must open B, the row that asks.
+    const parent = parentWith({
+      status: "blocked",
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s2", taskId: "b", seq: 2 },
+      ],
+      blocked: [{ taskId: "a", stepId: "s1", kind: "handoff-missing", message: "x" }],
+    });
+    const tasks = [step("a", { column: "blocked" }), step("b", { pendingInteractionCount: 1 })];
+    expect(pipelineAttentionStepTask(parent, tasks, "a")?.id).toBe("b");
+  });
+
+  test("a preferred step that's only blocked still beats an earlier block when nothing asks", () => {
+    const parent = parentWith({
+      status: "blocked",
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s2", taskId: "b", seq: 2 },
+      ],
+      blocked: [
+        { taskId: "a", stepId: "s1", kind: "step-failed", message: "boom" },
+        { taskId: "b", stepId: "s2", kind: "handoff-missing", message: "x" },
+      ],
+    });
+    const tasks = [step("a", { column: "blocked" }), step("b", { column: "blocked" })];
+    expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("a");
+    expect(pipelineAttentionStepTask(parent, tasks, "b")?.id).toBe("b");
+  });
+
+  test("a preferred step answered since falls through to the step that still needs the user", () => {
+    // Two steps asked at once; the parent-keyed toast still names the first
+    // asker after it was answered, while the second's question is open.
+    const parent = parentWith({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s2", taskId: "b", seq: 2 },
+      ],
+    });
+    const tasks = [step("a"), step("b", { pendingInteractionCount: 1 })];
+    expect(pipelineAttentionStepTask(parent, tasks, "a")?.id).toBe("b");
+  });
+
+  test("a preferred step answered since, with nothing else needing the user → null (run view alone)", () => {
+    const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
+    expect(pipelineAttentionStepTask(parent, [step("a"), step("b")], "a")).toBeNull();
+  });
+
+  test("a preferred step id that isn't polled falls through to the tiers", () => {
+    const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
+    expect(pipelineAttentionStepTask(parent, [step("a", { pendingInteractionCount: 1 })], "gone")?.id).toBe("a");
+    expect(pipelineAttentionStepTask(parent, [step("a")], "gone")).toBeNull();
+  });
+
+  test("a preferred step id belonging to another parent is never returned", () => {
+    const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
+    const foreign = makeTask({ id: "x", pipelineParentId: "other-parent", pendingInteractionCount: 1 });
+    expect(pipelineAttentionStepTask(parent, [step("a"), foreign], "x")).toBeNull();
+    expect(pipelineAttentionStepTask(parent, [step("a", { pendingInteractionCount: 1 }), foreign], "x")?.id).toBe("a");
+  });
+
+  test("an explicit null preferred id behaves like none (the tiers run)", () => {
+    const parent = parentWith({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
+    expect(pipelineAttentionStepTask(parent, [step("a", { pendingInteractionCount: 1 })], null)?.id).toBe("a");
+  });
+
+  test("a preferred step whose blocked column belongs to a settled execution doesn't win", () => {
+    // The toast named `a`; it settled (its row still reads blocked) and a
+    // cycle re-ran the step as `b`, which now asks — tier 3 and
+    // stepAttention ignore a settled row's column, so the preference must too.
+    const parent = parentWith({
+      active: [{ stepId: "s1", taskId: "b", seq: 2 }],
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" }), makeRecord({ seq: 2, stepId: "s1", taskId: "b" })],
+    });
+    const tasks = [step("a", { column: "blocked" }), step("b", { pendingInteractionCount: 1 })];
+    expect(pipelineAttentionStepTask(parent, tasks, "a")?.id).toBe("b");
+    expect(pipelineAttentionStepTask(parent, [step("a", { column: "blocked" }), step("b")], "a")).toBeNull();
+  });
+});
+
+describe("stepNodeTaskFor", () => {
+  const step = (id: string, overrides: Partial<Task> = {}) =>
+    makeTask({ id, pipelineParentId: "parent", column: "running", pendingInteractionCount: 0, ...overrides });
+
+  test("no run → null", () => {
+    expect(stepNodeTaskFor([], null, "s1")).toBeNull();
+  });
+
+  test("nothing needs the user → the latest execution (stepTaskFor)", () => {
+    const run = makeRun({
+      active: [{ stepId: "s1", taskId: "b", seq: 2 }],
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" })],
+    });
+    expect(stepNodeTaskFor([step("a"), step("b")], run, "s1")?.id).toBe("b");
+  });
+
+  test("a cycle: the node glows Answer from a settled execution's leftover question → opens that execution", () => {
+    const run = makeRun({
+      active: [{ stepId: "s1", taskId: "b", seq: 2 }],
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" }), makeRecord({ seq: 2, stepId: "s1", taskId: "b" })],
+    });
+    const steps = [step("a", { column: "review", pendingInteractionCount: 1 }), step("b")];
+    expect(stepAttention(run, "s1", steps)?.kind).toBe("answer");
+    expect(stepNodeTaskFor(steps, run, "s1")?.id).toBe("a");
+  });
+
+  test("a fan-in with two active executions: opens the one asking, not the latest", () => {
+    const run = makeRun({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s1", taskId: "b", seq: 2 },
+      ],
+    });
+    expect(stepNodeTaskFor([step("a", { pendingInteractionCount: 1 }), step("b")], run, "s1")?.id).toBe("a");
+  });
+
+  test("an active question beats a leftover one in history", () => {
+    const run = makeRun({
+      active: [{ stepId: "s1", taskId: "b", seq: 2 }],
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" })],
+    });
+    const steps = [step("a", { pendingInteractionCount: 1 }), step("b", { pendingInteractionCount: 1 })];
+    expect(stepNodeTaskFor(steps, run, "s1")?.id).toBe("b");
+  });
+
+  test("history leftovers resolve newest-first", () => {
+    const run = makeRun({
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" }), makeRecord({ seq: 2, stepId: "s1", taskId: "b" })],
+    });
+    const steps = [step("a", { pendingInteractionCount: 1 }), step("b", { pendingInteractionCount: 1 })];
+    expect(stepNodeTaskFor(steps, run, "s1")?.id).toBe("b");
+  });
+
+  test("a blocked active execution on a fan-in → that execution (block entry, then blocked column)", () => {
+    const run = makeRun({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s1", taskId: "b", seq: 2 },
+      ],
+      blocked: [{ taskId: "a", stepId: "s1", kind: "handoff-missing", message: "x" }],
+    });
+    expect(stepNodeTaskFor([step("a", { column: "review" }), step("b")], run, "s1")?.id).toBe("a");
+    const byColumn = makeRun({ active: run.active });
+    expect(stepNodeTaskFor([step("a", { column: "blocked" }), step("b")], byColumn, "s1")?.id).toBe("a");
+  });
+
+  test("other steps' questions never redirect this node", () => {
+    const run = makeRun({
+      active: [
+        { stepId: "s2", taskId: "x", seq: 1 },
+        { stepId: "s1", taskId: "a", seq: 2 },
+      ],
+    });
+    expect(stepNodeTaskFor([step("x", { pendingInteractionCount: 1 }), step("a")], run, "s1")?.id).toBe("a");
+  });
+
+  test("the asking row isn't polled yet → falls back to the latest polled execution", () => {
+    const run = makeRun({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s1", taskId: "b", seq: 2 },
+      ],
+    });
+    expect(stepNodeTaskFor([step("b")], run, "s1")?.id).toBe("b");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Step attention — edge cases and the cross-function contract
+// (docs/plans/pipeline-blocked-step-highlight.md §3.4–3.5): the card's
+// Answer/Review landing (`pipelineAttentionStepTask`), the node's glow
+// (`stepAttention`) and the node click (`stepNodeTaskFor`) must agree, or a
+// card reads Answer while no node glows, or a glowing node opens a sibling
+// execution with nothing to answer.
+
+describe("step attention — edge cases", () => {
+  const step = (id: string, overrides: Partial<Task> = {}) =>
+    makeTask({ id, pipelineParentId: "parent", column: "running", pendingInteractionCount: 0, ...overrides });
+
+  test("stepAttention: an unset or negative pending count never reads Answer", () => {
+    const run = makeRun({ active: [{ stepId: "s1", taskId: "a", seq: 1 }] });
+    const unset = makeTask({ id: "a", column: "running" });
+    expect((unset as Partial<Task>).pendingInteractionCount).toBeUndefined();
+    expect(stepAttention(run, "s1", [unset])).toBeNull();
+    expect(stepAttention(run, "s1", [step("a", { pendingInteractionCount: -3 })])).toBeNull();
+    // A negative count on one execution can't cancel a real question on another.
+    const fanIn = makeRun({
+      active: [
+        { stepId: "s1", taskId: "a", seq: 1 },
+        { stepId: "s1", taskId: "b", seq: 2 },
+      ],
+    });
+    expect(
+      stepAttention(fanIn, "s1", [step("a", { pendingInteractionCount: -1 }), step("b", { pendingInteractionCount: 1 })]),
+    ).toEqual({ kind: "answer", label: "Answer", message: null });
+  });
+
+  test("stepAttention: a block with no step id naming a SETTLED execution doesn't match the step", () => {
+    const run = makeRun({
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" })],
+      blocked: [{ taskId: "a", stepId: null, kind: "step-failed", message: "stale" }],
+    });
+    expect(stepAttention(run, "s1", [step("a", { column: "review" })])).toBeNull();
+  });
+
+  test("stepAttention: the first matching block's message wins", () => {
+    const run = makeRun({
+      active: [{ stepId: "s1", taskId: "a", seq: 1 }],
+      blocked: [
+        { taskId: null, stepId: "s1", kind: "step-cap", message: "first" },
+        { taskId: "a", stepId: "s1", kind: "step-failed", message: "second" },
+      ],
+    });
+    expect(stepAttention(run, "s1", [step("a")])?.message).toBe("first");
+  });
+
+  test("pipelineAttentionStepTask: a block naming another pipeline's task is skipped for the next tier", () => {
+    const parent = makeTask({
+      id: "parent",
+      pipelineId: "pipeline-1",
+      pipelineRun: makeRun({
+        active: [{ stepId: "s2", taskId: "b", seq: 2 }],
+        blocked: [{ taskId: "foreign", stepId: "s1", kind: "step-failed", message: "x" }],
+      }),
+    });
+    const tasks = [makeTask({ id: "foreign", pipelineParentId: "other-parent", column: "blocked" }), step("b", { column: "blocked" })];
+    expect(pipelineAttentionStepTask(parent, tasks)?.id).toBe("b");
+  });
+
+  test("pipelineAttentionStepTask: an asking execution that isn't polled yet yields to the next asking one", () => {
+    const parent = makeTask({
+      id: "parent",
+      pipelineId: "pipeline-1",
+      pipelineRun: makeRun({
+        active: [
+          { stepId: "s1", taskId: "not-polled", seq: 1 },
+          { stepId: "s2", taskId: "b", seq: 2 },
+        ],
+      }),
+    });
+    expect(pipelineAttentionStepTask(parent, [step("b", { pendingInteractionCount: 1 })])?.id).toBe("b");
+  });
+
+  test("pipelineAttentionStepTask: a step row whose question isn't in the run any more (Restart archived it) never wins a tier", () => {
+    // Restart replaces `run.active`/`history` wholesale; a polled row of the
+    // replaced run that still reports a pending count must not be landed on
+    // unless a preferred id names it (the toast that named it).
+    const parent = makeTask({
+      id: "parent",
+      pipelineId: "pipeline-1",
+      pipelineRun: makeRun({ active: [{ stepId: "s1", taskId: "fresh", seq: 1 }] }),
+    });
+    const tasks = [step("old", { pendingInteractionCount: 1 }), step("fresh")];
+    expect(pipelineAttentionStepTask(parent, tasks)).toBeNull();
+  });
+
+  test("stepNodeTaskFor: a block naming a SETTLED execution of the step doesn't redirect the click", () => {
+    const run = makeRun({
+      active: [{ stepId: "s1", taskId: "b", seq: 2 }],
+      history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" })],
+      blocked: [{ taskId: "a", stepId: "s1", kind: "step-failed", message: "old" }],
+    });
+    expect(stepNodeTaskFor([step("a", { column: "blocked" }), step("b")], run, "s1")?.id).toBe("b");
+  });
+});
+
+describe("step attention — card, node glow and node click agree", () => {
+  const step = (id: string, overrides: Partial<Task> = {}) =>
+    makeTask({ id, pipelineParentId: "parent", column: "running", pendingInteractionCount: 0, ...overrides });
+
+  /** Which step id an execution belongs to, by the run's own records. */
+  function stepIdOf(run: PipelineRunState, taskId: string): string | null {
+    return (
+      run.active.find((a) => a.taskId === taskId)?.stepId
+      ?? run.history.find((r) => r.taskId === taskId)?.stepId
+      ?? run.blocked.find((b) => b.taskId === taskId)?.stepId
+      ?? null
+    );
+  }
+
+  const scenarios: Array<{ name: string; run: Partial<PipelineRunState>; tasks: Task[] }> = [
+    {
+      name: "one step asking mid-turn",
+      run: { active: [{ stepId: "s1", taskId: "a", seq: 1 }] },
+      tasks: [step("a", { pendingInteractionCount: 1 })],
+    },
+    {
+      name: "a cycle: leftover question on an earlier execution, re-run blocked",
+      run: {
+        active: [{ stepId: "s1", taskId: "b", seq: 2 }],
+        history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a" }), makeRecord({ seq: 2, stepId: "s1", taskId: "b" })],
+        blocked: [{ taskId: "b", stepId: "s1", kind: "handoff-missing", message: "missing" }],
+      },
+      tasks: [step("a", { column: "review", pendingInteractionCount: 1 }), step("b", { column: "review" })],
+    },
+    {
+      name: "a fan-out: one branch blocked, the other asking",
+      run: {
+        active: [
+          { stepId: "s2", taskId: "b", seq: 2 },
+          { stepId: "s3", taskId: "c", seq: 3 },
+        ],
+        history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a", nextStepIds: ["s2", "s3"] })],
+        blocked: [{ taskId: "b", stepId: "s2", kind: "step-failed", message: "boom" }],
+      },
+      tasks: [step("a", { column: "review" }), step("b", { column: "blocked" }), step("c", { pendingInteractionCount: 2 })],
+    },
+    {
+      name: "a fan-in: two executions of one step, the later one asking",
+      run: {
+        active: [
+          { stepId: "s1", taskId: "a", seq: 1 },
+          { stepId: "s1", taskId: "b", seq: 2 },
+        ],
+      },
+      tasks: [step("a"), step("b", { pendingInteractionCount: 1 })],
+    },
+    {
+      name: "only a blocked column, before run.blocked catches up",
+      run: { active: [{ stepId: "s1", taskId: "a", seq: 1 }] },
+      tasks: [step("a", { column: "blocked" })],
+    },
+    {
+      name: "a settled step's leftover question while another step runs quietly",
+      run: {
+        active: [{ stepId: "s2", taskId: "b", seq: 2 }],
+        history: [makeRecord({ seq: 1, stepId: "s1", taskId: "a", nextStepIds: ["s2"] })],
+      },
+      tasks: [step("a", { column: "review", pendingInteractionCount: 1 }), step("b")],
+    },
+  ];
+
+  for (const { name, run: runOverrides, tasks } of scenarios) {
+    test(name, () => {
+      const run = makeRun(runOverrides);
+      const parent = makeTask({ id: "parent", pipelineId: "pipeline-1", pipelineRun: run });
+      const landed = pipelineAttentionStepTask(parent, tasks);
+      const anyAsking = tasks.some((t) => t.pendingInteractionCount > 0);
+
+      // Something needs the user in every scenario, so the card lands on a step.
+      expect(landed).not.toBeNull();
+      // A question anywhere means the card reads Answer — and must land on a row that asks.
+      if (anyAsking) expect(landed!.pendingInteractionCount).toBeGreaterThan(0);
+
+      const landedStep = stepIdOf(run, landed!.id);
+      expect(landedStep).not.toBeNull();
+      const glow = stepAttention(run, landedStep!, tasks);
+      // The landed step's node glows, with the same kind the card button implies.
+      expect(glow?.kind).toBe(landed!.pendingInteractionCount > 0 ? "answer" : "review");
+      // Clicking that node opens the same row the card landed on.
+      expect(stepNodeTaskFor(tasks, run, landedStep!)?.id).toBe(landed!.id);
+    });
+  }
 });

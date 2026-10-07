@@ -12,6 +12,7 @@ import { useCallback, useEffect, useState } from "react";
 import dagre from "@dagrejs/dagre";
 import type { Edge, Node } from "@xyflow/react";
 import { api } from "./api";
+import { awaitingLabel } from "./awaiting";
 import type {
   Pipeline,
   PipelineEdge,
@@ -212,6 +213,178 @@ export function latestTransition(
     if (record.nextStepIds.length > 0) {
       return { fromStepId: record.stepId, toStepIds: [...new Set(record.nextStepIds)], seq: record.seq };
     }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Attention — what a step needs from the user
+// ---------------------------------------------------------------------------
+
+/**
+ * What a step needs from the user right now, for the run view's amber
+ * "waiting on you" look (the board card's own ring + glow, see
+ * `@/lib/awaiting`). Deliberately separate from {@link StepVisualState}: a
+ * run-level block highlights a node whose lifecycle state is `idle`/`done`,
+ * and the node also carries a label and a tooltip, which one enum can't —
+ * so `data-visual` keeps meaning "lifecycle" and attention rides alongside
+ * it. `kind: "answer"` when the step's task has a pending question,
+ * `"review"` when it's blocked with nothing answerable (an error, a missing
+ * or invalid handoff, a run-level block). `label` is the card button's own
+ * wording ({@link awaitingLabel}); `message` is the matching block's
+ * message (the node's tooltip), when there is one.
+ */
+export interface StepAttention {
+  kind: "answer" | "review";
+  label: string;
+  message: string | null;
+}
+
+/**
+ * Resolve {@link StepAttention} for one step of `run`, or `null` when it
+ * needs nothing. Pending questions are counted across EVERY execution of
+ * `stepId` — each `run.active` entry (several on a fan-in that launched it
+ * more than once) plus every `run.history` record's task — so a question
+ * left pending after its execution settled still glows (the runner never
+ * cancels pending cards when a step settles; only Restart does), even once
+ * a cycle has re-run the step since. That's the same set
+ * {@link pipelineAttentionStepTask} scans, so a card reading `Answer`
+ * always has a glowing node to land on. Then, in order: any pending
+ * interaction on one of those rows (looked up in `steps`) → `answer` with
+ * `Answer`/`Answer (N)`; else a `run.blocked`
+ * entry naming this step (by `stepId`, which also covers a run-level block
+ * like `step-cap` stuck at a step that isn't active, or by one of its
+ * active executions' `taskId`), or an active execution whose own board
+ * column reads `blocked` → `review`; else `null`. An active execution
+ * sitting in `review` for a manual Advance with no block reads `null`, the
+ * same as the board card (it doesn't glow for that either).
+ */
+export function stepAttention(
+  run: PipelineRunState | null | undefined,
+  stepId: string,
+  steps: Task[],
+): StepAttention | null {
+  if (!run) return null;
+
+  const activeTaskIds = run.active.filter((a) => a.stepId === stepId).map((a) => a.taskId);
+  // A Set: an execution that's still active also has its (open) history
+  // record, and must not be counted twice.
+  const candidateIds = new Set(activeTaskIds);
+  for (const record of run.history) {
+    if (record.stepId === stepId) candidateIds.add(record.taskId);
+  }
+
+  let pending = 0;
+  let columnBlocked = false;
+  for (const id of candidateIds) {
+    const row = steps.find((t) => t.id === id);
+    if (!row) continue;
+    pending += Math.max(0, row.pendingInteractionCount ?? 0);
+    if (activeTaskIds.includes(id) && row.column === "blocked") columnBlocked = true;
+  }
+
+  const block = run.blocked.find(
+    (b) => b.stepId === stepId || (b.taskId != null && activeTaskIds.includes(b.taskId)),
+  );
+  const message = block?.message ?? null;
+
+  if (pending > 0) return { kind: "answer", label: awaitingLabel(pending), message };
+  if (block || columnBlocked) return { kind: "review", label: awaitingLabel(0), message };
+  return null;
+}
+
+/** Structural equality for {@link StepAttention} (`null` and `undefined`
+ *  both mean "no attention" and compare equal). {@link stepAttention}
+ *  returns a fresh object every call, so the run view's identity-stable
+ *  node merge must compare through this — never by reference — or every
+ *  poll would churn node identities (the React Flow update-depth crash). */
+export function sameStepAttention(
+  a: StepAttention | null | undefined,
+  b: StepAttention | null | undefined,
+): boolean {
+  if (!a || !b) return !a && !b;
+  return a.kind === b.kind && a.label === b.label && a.message === b.message;
+}
+
+/**
+ * Which hidden step task an "attention" landing on a pipeline parent should
+ * open (the card's amber Answer/Review button, the "Waiting on you" /
+ * "Pipeline needs you" toasts, the OS-notification click) — resolved at
+ * click time from App's already-polled `tasks` list, never fetched. `null`
+ * means "land on the run view only" (nothing to open, or the step row
+ * hasn't been polled yet).
+ *
+ * With `preferredStepTaskId` (the "Waiting on you" toast names the step
+ * that asked) that row — when it's in `tasks` and is one of `parent`'s
+ * steps — wins outright while it still has a pending question. If it no
+ * longer asks but is still blocked (a `blocked` column on a still-active
+ * execution, or a `run.blocked` entry naming its task), it wins only
+ * AFTER the question tiers 1–2: another step's open question outranks it,
+ * since the toast is about a question and the card reads Answer. A named
+ * step that needs nothing any more (answered since — the parent-keyed
+ * toast outlives its first asker while another step's question is still
+ * open) or isn't polled in yet falls through to the tiers below, so the
+ * toast lands on whichever step needs the user now, or on the run view
+ * alone when none does.
+ * The tiers, over `parent.pipelineRun`:
+ * 1. the first `run.active` execution (array order is launch order) whose
+ *    row has a pending interaction — a question beats everything;
+ * 2. the latest `run.history` execution (scanning from the end) whose row
+ *    still has a pending interaction — a leftover card on a settled step.
+ *    Still a question, so it ranks above every block: the card reads
+ *    Answer whenever any step row has one pending, and Answer must open a
+ *    row that asks (the same order {@link stepNodeTaskFor} uses per step);
+ * 3. the first `run.blocked` entry with a `taskId` whose row is present;
+ * 4. the first `run.active` execution whose row's column is `blocked` (the
+ *    card already reads Review from the optimistic column patch, but the
+ *    refetched `run.blocked` hasn't landed yet);
+ * 5. `null` — e.g. only run-level blocks, which have no step task.
+ * Every row must belong to `parent` (`pipelineParentId`).
+ */
+export function pipelineAttentionStepTask(
+  parent: Task,
+  tasks: readonly Task[],
+  preferredStepTaskId?: string | null,
+): Task | null {
+  const byId = new Map<string, Task>();
+  for (const t of tasks) {
+    if (t.pipelineParentId === parent.id) byId.set(t.id, t);
+  }
+
+  const run = parent.pipelineRun;
+  const preferred = preferredStepTaskId != null ? byId.get(preferredStepTaskId) : undefined;
+
+  if (preferred && preferred.pendingInteractionCount > 0) return preferred;
+
+  if (!run) return null;
+
+  for (const entry of run.active) {
+    const row = byId.get(entry.taskId);
+    if (row && row.pendingInteractionCount > 0) return row;
+  }
+  for (let i = run.history.length - 1; i >= 0; i -= 1) {
+    const row = byId.get(run.history[i]!.taskId);
+    if (row && row.pendingInteractionCount > 0) return row;
+  }
+
+  // No step asks: a named step that is still blocked beats the other
+  // blocks. A `blocked` column only counts on a still-active execution —
+  // the same rule as tier 4 and {@link stepAttention}; a settled
+  // execution's row can keep reading `blocked` long after the run moved
+  // past it.
+  if (preferred) {
+    const activeBlocked =
+      preferred.column === "blocked" && run.active.some((a) => a.taskId === preferred.id);
+    if (activeBlocked || run.blocked.some((b) => b.taskId === preferred.id)) return preferred;
+  }
+  for (const block of run.blocked) {
+    if (block.taskId == null) continue;
+    const row = byId.get(block.taskId);
+    if (row) return row;
+  }
+  for (const entry of run.active) {
+    const row = byId.get(entry.taskId);
+    if (row && row.column === "blocked") return row;
   }
   return null;
 }
@@ -738,6 +911,50 @@ export function stepTaskFor(steps: Task[], run: PipelineRunState | null | undefi
     if (record.stepId === stepId) latestTaskId = record.taskId;
   }
   return latestTaskId ? (steps.find((t) => t.id === latestTaskId) ?? null) : null;
+}
+
+/**
+ * Which execution of `stepId` clicking its run-view node should open. When
+ * the step needs the user, that's the execution that actually does — the
+ * same tiers {@link pipelineAttentionStepTask} walks, scoped to this step:
+ * the first active execution with a pending question, then the latest
+ * history execution still holding one (a leftover card on a settled run of
+ * the step — {@link stepAttention} counts those, so a glowing `Answer` node
+ * must open the row that asks), then the first `run.blocked` entry naming
+ * one of the step's active executions, then the first active execution
+ * whose column reads `blocked`. Otherwise (or when that row isn't polled)
+ * {@link stepTaskFor}'s latest execution.
+ */
+export function stepNodeTaskFor(
+  steps: Task[],
+  run: PipelineRunState | null | undefined,
+  stepId: string,
+): Task | null {
+  if (!run) return null;
+  const byId = new Map(steps.map((t) => [t.id, t] as const));
+  const active = run.active.filter((a) => a.stepId === stepId);
+  const activeIds = new Set(active.map((a) => a.taskId));
+
+  for (const entry of active) {
+    const row = byId.get(entry.taskId);
+    if (row && row.pendingInteractionCount > 0) return row;
+  }
+  for (let i = run.history.length - 1; i >= 0; i -= 1) {
+    const record = run.history[i]!;
+    if (record.stepId !== stepId) continue;
+    const row = byId.get(record.taskId);
+    if (row && row.pendingInteractionCount > 0) return row;
+  }
+  for (const block of run.blocked) {
+    if (block.taskId == null || !activeIds.has(block.taskId)) continue;
+    const row = byId.get(block.taskId);
+    if (row) return row;
+  }
+  for (const entry of active) {
+    const row = byId.get(entry.taskId);
+    if (row && row.column === "blocked") return row;
+  }
+  return stepTaskFor(steps, run, stepId);
 }
 
 /**
