@@ -818,7 +818,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   const candidates = (effectiveGraph?.steps ?? []).map((s) => ({ value: s.id, label: s.name }));
   const showStop = hasLiveExecution(steps, run);
   const showRestart = RESTARTABLE_STATUSES.includes(run.status);
-  const showMarkDone = run.status === "done" && task.column !== "done";
+  const showMarkDone = run.status === "done" && task.column !== "done" && task.archivedAt == null;
   // An active execution whose step task already finished (board column
   // `review`) but the pipeline hasn't advanced past it — e.g. `transition:
   // "choose"` with no agent-emitted handoff yet resolved. Distinct from
