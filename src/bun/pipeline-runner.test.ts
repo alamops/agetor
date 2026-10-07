@@ -903,6 +903,61 @@ test("M2: a finished pipeline refuses a plain Run (\"restart it explicitly\"); s
   await waitUntilIdle(parentId);
 });
 
+test("a pipeline parked in Done survives a same-status persist, and Restart pulls the card back", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { startPipelineRun, __forTest } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("park-done");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const graph = { steps: [A], edges: [], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("park-done-pipeline"), graph, maxSteps: 25 });
+
+  const created = await createTask({ title: "park done", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  const finished = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" ? t : undefined;
+  });
+  expect(finished.column).toBe("review");
+
+  // The Done button's park. The HTTP guard is covered in
+  // pipelines-endpoint.test.ts; here the column is written the same way
+  // the route's `tasks.update` does, then a same-status persist must leave
+  // it alone.
+  tasks.update(parentId, { column: "done" });
+  __forTest.persist(parentId, tasks.get(parentId)!.pipelineRun!);
+  expect(tasks.get(parentId)!.column).toBe("done");
+  expect(tasks.get(parentId)!.pipelineRun!.status).toBe("done");
+
+  // Hold the restarted step in flight long enough to observe the column
+  // follow the status change to Running before the new run finishes in Review.
+  process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = "700";
+  try {
+    const restarted = await startPipelineRun(tasks.get(parentId)!, { restart: true });
+    if ("error" in restarted) throw new Error(restarted.error);
+    const running = tasks.get(parentId)!;
+    expect(running.pipelineRun!.status).toBe("running");
+    expect(running.column).toBe("running");
+
+    const finishedAgain = await waitFor(() => {
+      const t = tasks.get(parentId);
+      return t?.pipelineRun?.status === "done" && t.pipelineRun.startedAt !== finished.pipelineRun!.startedAt ? t : undefined;
+    }, 10000);
+    expect(finishedAgain.column).toBe("review");
+    await waitUntilIdle(parentId);
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
+  }
+});
+
 test("M4: advancePipeline refuses (409) while the target step is still genuinely live", async () => {
   process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = "700";
   try {

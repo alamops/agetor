@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ReactFlow, ReactFlowProvider, Background, BackgroundVariant, Controls, useNodesState, useEdgesState } from "@xyflow/react";
 import { AnimatePresence, motion } from "motion/react";
-import { ArrowLeft, ChevronDown, RotateCcw, Square, Workflow } from "lucide-react";
+import { ArrowLeft, CheckCircle2, ChevronDown, RotateCcw, Square, Workflow } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -175,6 +175,10 @@ interface PipelineRunViewProps {
   onBack: () => void;
   /** Offered as "Edit in Settings" from a satellite's details. */
   onOpenSettingsAgents?: (profileId?: string) => void;
+  /** Park a finished pipeline in the Done column. App passes the same
+   *  `markDone` the board card uses, so the board updates immediately.
+   *  Falls back to `api.moveTask` when omitted. */
+  onMarkDone?: (task: Task) => Promise<void> | void;
 }
 
 function formatClockTime(ts: number): string {
@@ -250,7 +254,7 @@ function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } |
  * re-render (and therefore `<StoreUpdater>`'s own `setEdges`/`setNodes`
  * sync) entirely when a poll turns up nothing new to paint.
  */
-export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents }: PipelineRunViewProps) {
+export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents, onMarkDone }: PipelineRunViewProps) {
   const { resolved } = useTheme();
   const { profiles: liveProfiles, loaded: liveProfilesLoaded } = useAgentProfiles();
   const confirm = useConfirm();
@@ -721,6 +725,21 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     [taskId, load],
   );
 
+  const handleMarkDone = useCallback(async () => {
+    if (!task) return;
+    setActionBusy(true);
+    setActionError(null);
+    try {
+      if (onMarkDone) await onMarkDone(task);
+      else await api.moveTask(taskId, "done");
+      await load();
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : "Failed to mark the pipeline done.");
+    } finally {
+      setActionBusy(false);
+    }
+  }, [task, taskId, load, onMarkDone]);
+
   const handleRestart = useCallback(async () => {
     const ok = await confirm({
       title: "Restart this pipeline?",
@@ -763,6 +782,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   const candidates = (effectiveGraph?.steps ?? []).map((s) => ({ value: s.id, label: s.name }));
   const showStop = hasLiveExecution(steps, run);
   const showRestart = RESTARTABLE_STATUSES.includes(run.status);
+  const showMarkDone = run.status === "done" && task.column !== "done";
   // An active execution whose step task already finished (board column
   // `review`) but the pipeline hasn't advanced past it — e.g. `transition:
   // "choose"` with no agent-emitted handoff yet resolved. Distinct from
@@ -800,6 +820,20 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         {progress && <span className="text-xs text-muted-foreground">{progress.label}</span>}
         <div className="ml-auto flex items-center gap-2">
           {actionError && <span className="text-xs text-danger">{actionError}</span>}
+          {showMarkDone && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-testid="pipeline-run-done"
+              disabled={actionBusy}
+              onClick={() => void handleMarkDone()}
+              className="gap-1.5"
+            >
+              <CheckCircle2 className="size-3.5" aria-hidden />
+              Done
+            </Button>
+          )}
           {showStop && (
             <Button
               type="button"
