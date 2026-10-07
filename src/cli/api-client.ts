@@ -53,6 +53,13 @@ const ISSUE_THREAD_TIMEOUT_MS = 60_000;
  *  explainer task's own create+start work, without the CLI's default
  *  one-shot timeout aborting a legitimate long clone out from under it. */
 const CLONE_TIMEOUT_MS = 15 * 60_000;
+/** `POST /agent-profiles/:id/duplicate` with `copyTasks` re-creates every
+ *  eligible task through `createTask`. A worktree task resolves a git ref,
+ *  and the route opts out of Bun's idle timeout, so a large copy can run
+ *  for minutes. 10 minutes lets the CLI hear that one response. The default
+ *  15s budget would abort while the core was still inserting, and a retry
+ *  would create a second profile. */
+const DUPLICATE_WITH_TASKS_TIMEOUT_MS = 10 * 60_000;
 
 export class ApiError extends Error {
   constructor(
@@ -382,6 +389,29 @@ export class AgetorClient {
   createAgentProfile(input: AgentProfileInput): Promise<AgentProfile> {
     return this.req("POST", "/agent-profiles", input);
   }
+  /** `POST /agent-profiles/:id/duplicate` — 404 unknown source, 409 name clash.
+   *  Task-copy failures come back in `taskCopyErrors`, not as an error. */
+  async duplicateAgentProfile(id: string, input: DuplicateAgentProfileInput): Promise<DuplicateAgentProfileResult> {
+    try {
+      return await this.req(
+        "POST",
+        `/agent-profiles/${encodeURIComponent(id)}/duplicate`,
+        input,
+        input.copyTasks ? DUPLICATE_WITH_TASKS_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
+      );
+    } catch (e) {
+      // The server may already have inserted the profile (and any task copies)
+      // before the socket dropped. A blind retry would create another one.
+      if (e instanceof ApiError && e.status === 0) {
+        throw new ApiError(
+          0,
+          e.body,
+          `${e.message} — the copy may have been created; check the profile list before retrying`,
+        );
+      }
+      throw e;
+    }
+  }
   /** `PATCH /agent-profiles/:id` — same validation as create. */
   patchAgentProfile(id: string, patch: Partial<AgentProfileInput>): Promise<AgentProfile> {
     return this.req("PATCH", `/agent-profiles/${encodeURIComponent(id)}`, patch);
@@ -648,6 +678,17 @@ export interface AgentProfileInput {
   maxMode: boolean;
   instructions: string;
   skills: string[];
+}
+
+/** Body for `POST /agent-profiles/:id/duplicate`; omitted fields copy the source. */
+export interface DuplicateAgentProfileInput extends Partial<AgentProfileInput> {
+  copyTasks?: boolean;
+}
+
+export interface DuplicateAgentProfileResult {
+  profile: AgentProfile;
+  copiedTasks: Task[];
+  taskCopyErrors: { sourceTaskId: string; error: string }[];
 }
 
 /** Server-side allow-list for PATCH /tasks/:id. */

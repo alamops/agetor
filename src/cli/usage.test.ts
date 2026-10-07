@@ -42,7 +42,7 @@ test("the retired 'agent'/'agents' profile-subcommand spelling has no USAGE bloc
   expect(USAGE["profile"]).toBeDefined();
   expect(canonical("profiles")).toBe("profile");
   expect(USAGE["profile"]!.split("\n", 1)[0]).toBe(
-    "usage: agetor profile <ls | show <ref> | add <name> … | edit <ref> … | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […]>",
+    "usage: agetor profile <ls | show <ref> | add <name> … | edit <ref> … | duplicate <ref> [--name <name>] [--with-tasks] | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […]>",
   );
 });
 

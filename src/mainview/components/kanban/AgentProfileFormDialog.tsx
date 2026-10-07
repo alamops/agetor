@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { X } from "lucide-react";
+import { toast } from "sonner";
 import { Dialog } from "@/components/ui/dialog";
 import { useConfirm } from "@/components/ui/confirm";
 import { Button } from "@/components/ui/button";
@@ -8,7 +9,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { useAgentProfiles } from "@/lib/agent-profiles";
-import { agentProfileTextDirty } from "@/lib/agent-profile-form";
+import { agentProfileTextDirty, duplicateAgentName } from "@/lib/agent-profile-form";
 import { cn } from "@/lib/utils";
 import { AGENT_PROFILE_LIMITS } from "../../../shared/agent-profile.ts";
 import type { AgentProfile } from "../../../shared/types.ts";
@@ -34,6 +35,10 @@ export interface AgentProfileFormProps {
    *  (the same module-cached list every other profile consumer reads), so
    *  a caller never has to pass the `AgentProfile` object itself. */
   profileId: string | null;
+  /** When `profileId` is null, opens a create form prefilled from this
+   *  existing agent (name suffixed to stay unique). Save still creates a
+   *  new agent. Ignored when `profileId` is set. */
+  duplicateFromId?: string | null;
   onSaved: (profile: AgentProfile) => void;
   onCancel: () => void;
   /** Focuses the Name field on mount when true. Defaults to `false` so a
@@ -51,6 +56,8 @@ export interface AgentProfileFormProps {
    *  footer a top border, for hosting as a whole subpage (Settings → Agents'
    *  editor). Test ids, labels and disabled rules are identical in both. */
   variant?: "card" | "page";
+  /** Page variant only: shows a Duplicate button on an edit form. */
+  onDuplicate?: () => void;
 }
 
 const CARD_ROOT_CLASS = "rounded-md border border-border/60 p-3";
@@ -78,10 +85,46 @@ const PAGE_FOOTER_CLASS = "border-t border-border/60 pt-3";
  * "Loading…" line (no Save button at all) and a genuinely-missing one an
  * error with only Cancel.
  */
-export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus, onDirtyChange, variant = "card" }: AgentProfileFormProps) {
+export function AgentProfileForm({
+  profileId,
+  duplicateFromId = null,
+  onSaved,
+  onCancel,
+  autoFocus,
+  onDirtyChange,
+  variant = "card",
+  onDuplicate,
+}: AgentProfileFormProps) {
   const { profiles, loaded, refresh } = useAgentProfiles();
 
-  if (profileId === null) {
+  const duplicating = profileId === null && typeof duplicateFromId === "string" && duplicateFromId !== "";
+  const duplicateSource = duplicating ? (profiles.find((p) => p.id === duplicateFromId) ?? null) : null;
+
+  if (duplicateSource) {
+    const seed: AgentProfile = {
+      ...duplicateSource,
+      name: duplicateAgentName(
+        duplicateSource.name,
+        profiles.map((p) => p.name),
+      ),
+    };
+    return (
+      <AgentProfileFormBody
+        key={`dup-${duplicateSource.id}`}
+        profileId={null}
+        editingProfile={seed}
+        duplicateFromId={duplicateSource.id}
+        onSaved={onSaved}
+        onCancel={onCancel}
+        autoFocus={autoFocus}
+        onDirtyChange={onDirtyChange}
+        variant={variant}
+        refreshProfiles={refresh}
+      />
+    );
+  }
+
+  if (profileId === null && !duplicating) {
     return (
       <AgentProfileFormBody
         key="new"
@@ -97,13 +140,14 @@ export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus, onDi
     );
   }
 
-  const editingProfile = profiles.find((p) => p.id === profileId) ?? null;
+  const editingProfile = profileId === null ? null : (profiles.find((p) => p.id === profileId) ?? null);
   if (editingProfile) {
     return (
       <AgentProfileFormBody
         key={editingProfile.id}
         profileId={editingProfile.id}
         editingProfile={editingProfile}
+        onDuplicate={onDuplicate}
         onSaved={onSaved}
         onCancel={onCancel}
         autoFocus={autoFocus}
@@ -138,8 +182,10 @@ export function AgentProfileForm({ profileId, onSaved, onCancel, autoFocus, onDi
 }
 
 interface AgentProfileFormBodyProps extends AgentProfileFormProps {
-  /** The already-resolved row for an edit form — never `null` when
-   *  `profileId` isn't. The outer `AgentProfileForm` guarantees this by
+  /** The already-resolved row used to seed the form — never `null` when
+   *  `profileId` isn't. It is also non-null with a null `profileId` for a
+   *  duplicate seed (a create form prefilled from another agent);
+   *  `profileId` is non-null only for a real edit. The outer `AgentProfileForm` guarantees this by
    *  only mounting the body once the profile is known (and keys it on the
    *  id), so every `useState` initializer below can seed straight from it. */
   editingProfile: AgentProfile | null;
@@ -154,8 +200,11 @@ function AgentProfileFormBody({
   autoFocus,
   onDirtyChange,
   variant = "card",
+  duplicateFromId = null,
+  onDuplicate,
   refreshProfiles,
 }: AgentProfileFormBodyProps) {
+  const [copyTasks, setCopyTasks] = useState(false);
   const [form, setForm] = useState<FormState>(() =>
     editingProfile
       ? { name: editingProfile.name, instructions: editingProfile.instructions, skills: editingProfile.skills }
@@ -265,8 +314,22 @@ function AgentProfileFormBody({
         instructions: form.instructions,
         skills: form.skills,
       };
-      const saved = profileId ? await api.updateAgentProfile(profileId, input) : await api.createAgentProfile(input);
+      let saved: AgentProfile;
+      let copyErrors: { sourceTaskId: string; error: string }[] = [];
+      if (typeof duplicateFromId === "string" && duplicateFromId !== "") {
+        const result = await api.duplicateAgentProfile(duplicateFromId, { ...input, copyTasks });
+        saved = result.profile;
+        copyErrors = result.taskCopyErrors;
+      } else {
+        saved = profileId ? await api.updateAgentProfile(profileId, input) : await api.createAgentProfile(input);
+      }
       await refreshProfiles();
+      if (copyErrors.length > 0) {
+        const first = copyErrors[0]?.error ?? "";
+        toast.error(
+          `${copyErrors.length} task${copyErrors.length === 1 ? "" : "s"} couldn't be copied${first ? `: ${first}` : ""}`,
+        );
+      }
       if (mountedRef.current) onSaved(saved);
     } catch (e) {
       if (mountedRef.current) setSaveError(e instanceof Error ? e.message : String(e));
@@ -319,6 +382,24 @@ function AgentProfileFormBody({
           disabled={saving}
         />
       </div>
+
+      {typeof duplicateFromId === "string" && duplicateFromId !== "" && (
+        <label className="flex items-start gap-2">
+          <input
+            type="checkbox"
+            data-testid="agent-profile-copy-tasks"
+            className="mt-0.5"
+            checked={copyTasks}
+            onChange={(e) => setCopyTasks(e.target.checked)}
+          />
+          <span className="space-y-0.5">
+            <span className="block text-xs">Also copy tasks that use this agent</span>
+            <span className="block text-xs text-muted-foreground">
+              New backlog cards. Runs, pipeline steps, and tasks on an existing branch stay on the original.
+            </span>
+          </span>
+        </label>
+      )}
       </fieldset>
 
       {saveError && (
@@ -331,6 +412,17 @@ function AgentProfileFormBody({
       )}
 
       <div className={cn("flex justify-end gap-2", variant === "page" && PAGE_FOOTER_CLASS)}>
+        {variant === "page" && typeof profileId === "string" && profileId !== "" && (
+          <Button
+            variant="outline"
+            size="sm"
+            data-testid="agent-profile-form-duplicate"
+            onClick={() => onDuplicate?.()}
+            disabled={saving}
+          >
+            Duplicate
+          </Button>
+        )}
         <Button variant="outline" size="sm" data-testid="agent-profile-cancel" onClick={onCancel} disabled={saving}>
           Cancel
         </Button>

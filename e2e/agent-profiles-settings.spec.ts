@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
@@ -22,7 +23,8 @@ import { AGENT_PROFILE_LIMITS } from "../src/shared/agent-profile.ts";
  * list, and every exit but the form's own Cancel asks "Discard unsaved
  * changes?" when the draft is dirty. The same guard on the harness editor
  * lives in `e2e/settings-subpage-guard.spec.ts`; the pipeline step's "New
- * agent" dialog is covered in `e2e/pipelines-editor.spec.ts`.
+ * agent" dialog is covered in `e2e/pipelines-editor.spec.ts`. This file also
+ * covers Duplicate → prefilled subpage → save.
  *
  * One serial `describe` sharing the worker backend (`e2e/fixtures.ts`) and
  * building on itself exactly like `e2e/agent-profiles.spec.ts` does: scenario
@@ -1002,7 +1004,430 @@ test.describe("agent profiles — Settings surface", () => {
         .filter({ hasText: new RegExp(WIDGET_BUILDER_NAME.toLowerCase()) }),
     ).toHaveCount(0);
   });
+
+  test("Duplicate: prefilled subpage, save creates the copy, second duplicate is '(copy 2)', untouched Back is clean, dirty Back confirms", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const sourceName = `Duplicate Source ${randomUUID()}`;
+    const sourceInstructions = `Distinctive duplicate instructions ${randomUUID()}`;
+    const source = await createAgentProfileRest(request, backend, {
+      name: sourceName,
+      harness: "claude-code",
+      model: "sonnet-5",
+      effort: "medium",
+      mode: "plan",
+      fast: false,
+      maxMode: false,
+      instructions: sourceInstructions,
+      skills: ["code-review"],
+    });
+    createdProfileIds.push(source.id);
+
+    await gotoApp(page, backend.bootBase);
+    await openSettingsAgents(page);
+    const modal = settingsModal(page);
+    // The copy's name contains the source name, so a hasText-only filter matches
+    // both rows once the copy exists. "(copy)" is only on the copies.
+    const sourceRow = () =>
+      modal
+        .locator('[data-testid="agent-profile-row"]')
+        .filter({ hasText: sourceName })
+        .filter({ hasNotText: "(copy)" });
+    const heading = modal.locator("#settings-dialog-title");
+
+    // Duplicate → prefilled subpage → Save.
+    const dupButton = sourceRow().getByTestId("agent-profile-duplicate");
+    await expect(dupButton).toHaveText("Duplicate");
+    await dupButton.click();
+    const form = modal.getByTestId("agent-profile-form");
+    await expect(form).toBeVisible();
+    await expect(heading).toHaveText("Duplicate agent");
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy)`);
+    await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(sourceInstructions);
+    // These are not the blank-create defaults (opus-5.5 / auto), so a missed
+    // launch seed cannot pass the way a Claude Code harness check can.
+    await expect(launchSelect(form, "Model")).toHaveValue("sonnet-5");
+    await expect(launchSelect(form, "Effort")).toHaveValue("medium");
+    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
+    await expect(form.locator('[data-testid="skills-picker-chip"][data-skill="code-review"]')).toBeVisible();
+    await expect(modal.getByTestId("agent-profile-editor")).toBeVisible();
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+    await expectAgentsList(modal);
+    const copyName = `${sourceName} (copy)`;
+    await expect(modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: copyName })).toBeVisible();
+    const copyId = await getProfileIdByName(request, backend, copyName);
+    createdProfileIds.push(copyId);
+    const copy = await getAgentProfile(request, backend, copyId);
+    expect(copy.harness).toBe("claude-code");
+    expect(copy.model).toBe("sonnet-5");
+    expect(copy.effort).toBe("medium");
+    expect(copy.mode).toBe("plan");
+    expect(copy.instructions).toBe(sourceInstructions);
+    expect(copy.skills).toEqual(["code-review"]);
+    expect(copy.id).not.toBe(source.id);
+
+    const sourceAfter = await getAgentProfile(request, backend, source.id);
+    expect(sourceAfter.name).toBe(sourceName);
+    expect(sourceAfter.instructions).toBe(sourceInstructions);
+    expect(sourceAfter.model).toBe("sonnet-5");
+    expect(sourceAfter.mode).toBe("plan");
+    expect(sourceAfter.effort).toBe("medium");
+    expect(sourceAfter.skills).toEqual(["code-review"]);
+    await expect(sourceRow()).toBeVisible();
+
+    // Open the saved copy: this is an edit of the new agent, and the source text survived.
+    const copyRow = modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: copyName });
+    await copyRow.getByTestId("agent-profile-edit").click();
+    await expect(form).toBeVisible();
+    await expect(heading).toHaveText("Edit agent");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(copyName);
+    await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(sourceInstructions);
+    await expect(launchSelect(form, "Model")).toHaveValue("sonnet-5");
+    await expect(form.locator('[data-testid="skills-picker-chip"][data-skill="code-review"]')).toBeVisible();
+    await form.getByTestId("agent-profile-cancel").click();
+    await expect(form).toBeHidden();
+    await expectAgentsList(modal);
+
+    // Edit of the source still opens the original, not the duplicate draft.
+    await sourceRow().getByTestId("agent-profile-edit").click();
+    await expect(form).toBeVisible();
+    await expect(heading).toHaveText("Edit agent");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(sourceName);
+    await form.getByTestId("agent-profile-cancel").click();
+    await expect(form).toBeHidden();
+
+    // Second duplicate of the same source → "(copy 2)". Untouched Back: no confirm.
+    await sourceRow().getByTestId("agent-profile-duplicate").click();
+    await expect(form).toBeVisible();
+    await expect(heading).toHaveText("Duplicate agent");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy 2)`);
+    await expect(launchSelect(form, "Model")).toHaveValue("sonnet-5");
+    await expect(launchSelect(form, "Effort")).toHaveValue("medium");
+    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
+    await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expectAgentsList(modal);
+    await expect(
+      modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: `${sourceName} (copy 2)` }),
+    ).toHaveCount(0);
+
+    // Dirty Back: rename → confirm; Cancel stays, Discard returns without creating.
+    await sourceRow().getByTestId("agent-profile-duplicate").click();
+    await expect(form).toBeVisible();
+    const renamed = `${sourceName} renamed copy`;
+    await form.getByTestId("agent-profile-name").fill(renamed);
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(heading).toHaveText("Duplicate agent");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(renamed);
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expectAgentsList(modal);
+    await expect(modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: renamed })).toHaveCount(0);
+    const listRes = await request.get(`${backend.apiBase}/agent-profiles`, { headers: auth(backend) });
+    const names = ((await listRes.json()) as { name: string }[]).map((p) => p.name);
+    expect(names).not.toContain(renamed);
+    expect(names).not.toContain(`${sourceName} (copy 2)`);
+  });
+
+  test("Duplicate copies cursor fast and max mode without changing the source", async ({ page, request, backend }) => {
+    await patchHarness(request, backend, "cursor", { enabled: true });
+    try {
+      const sourceName = `Cursor Duplicate ${randomUUID()}`;
+      const source = await createAgentProfileRest(request, backend, {
+        name: sourceName,
+        harness: "cursor",
+        model: "gpt-5.3-codex",
+        effort: "high",
+        mode: "ask",
+        fast: true,
+        maxMode: true,
+        instructions: "",
+        skills: [],
+      });
+      createdProfileIds.push(source.id);
+
+      await gotoApp(page, backend.bootBase);
+      await openSettingsAgents(page);
+      const modal = settingsModal(page);
+      const sourceRow = modal
+        .locator('[data-testid="agent-profile-row"]')
+        .filter({ hasText: sourceName })
+        .filter({ hasNotText: "(copy)" });
+      await sourceRow.getByTestId("agent-profile-duplicate").click();
+      const form = modal.getByTestId("agent-profile-form");
+      await expect(form).toBeVisible();
+      await expect(modal.locator("#settings-dialog-title")).toHaveText("Duplicate agent");
+      await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy)`);
+      await expect(harnessButton(form, "Cursor")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
+      await expect(launchSelect(form, "Model")).toHaveValue("gpt-5.3-codex");
+      await expect(launchSelect(form, "Mode")).toHaveValue("ask");
+      await expect(form.getByTestId("launch-max-mode-toggle").getByRole("switch")).toHaveAttribute("aria-checked", "true");
+      await expect(form.getByTestId("launch-fast-toggle").getByRole("switch")).toHaveAttribute("aria-checked", "true");
+
+      await form.getByTestId("agent-profile-save").click();
+      await expect(form).toBeHidden();
+
+      const copyName = `${sourceName} (copy)`;
+      const copyId = await getProfileIdByName(request, backend, copyName);
+      createdProfileIds.push(copyId);
+      const copy = await getAgentProfile(request, backend, copyId);
+      expect(copy.harness).toBe("cursor");
+      expect(copy.model).toBe("gpt-5.3-codex");
+      expect(copy.mode).toBe("ask");
+      expect(copy.fast).toBe(true);
+      expect(copy.maxMode).toBe(true);
+
+      const sourceAfter = await getAgentProfile(request, backend, source.id);
+      expect(sourceAfter.name).toBe(sourceName);
+      expect(sourceAfter.fast).toBe(true);
+      expect(sourceAfter.maxMode).toBe(true);
+      expect(sourceAfter.model).toBe("gpt-5.3-codex");
+    } finally {
+      await patchHarness(request, backend, "cursor", { enabled: false });
+    }
+  });
+
+  async function mkSource(request: APIRequestContext, backend: E2EBackend, label: string) {
+    const name = `${label} ${randomUUID()}`;
+    const src = await createAgentProfileRest(request, backend, {
+      name,
+      harness: "claude-code",
+      model: "sonnet-5",
+      effort: "medium",
+      mode: "plan",
+      instructions: "dup-from-edit",
+      skills: [],
+    });
+    createdProfileIds.push(src.id);
+    return { name, id: src.id };
+  }
+
+  async function openEditFor(page: Page, name: string): Promise<{ modal: Locator; form: Locator }> {
+    await openSettingsAgents(page);
+    const modal = settingsModal(page);
+    await modal
+      .locator('[data-testid="agent-profile-row"]')
+      .filter({ hasText: name })
+      .filter({ hasNotText: "(copy)" })
+      .getByTestId("agent-profile-edit")
+      .click();
+    const form = modal.getByTestId("agent-profile-form");
+    await expect(form).toBeVisible();
+    await expect(modal.getByRole("heading", { name: "Edit agent", exact: true })).toBeVisible();
+    return { modal, form };
+  }
+
+  async function taskCountOf(request: APIRequestContext, backend: E2EBackend, id: string): Promise<number> {
+    return (await getAgentProfile(request, backend, id)).taskCount;
+  }
+
+  async function createBoundTask(request: APIRequestContext, backend: E2EBackend, profileId: string, title: string) {
+    const dir = await mkdtemp(path.join(tmpdir(), "agetor-dup-"));
+    const res = await request.post(`${backend.apiBase}/tasks`, {
+      headers: auth(backend),
+      data: { title, prompt: "noop", workdir: dir, isolation: "none", agentProfileId: profileId },
+    });
+    expect(res.ok(), `POST /tasks -> ${res.status()}: ${await res.text()}`).toBeTruthy();
+    return (await res.json()) as { id: string };
+  }
+
+  test("Edit page Duplicate: heading becomes Duplicate agent with '<saved name> (copy)'", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "EditDup");
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${src.name} (copy)`);
+  });
+
+  test("Edit page Duplicate with dirty name: Cancel keeps draft and Edit heading; Discard prefills from SAVED name", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "DirtyDup");
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    const dirty = `${src.name} DIRTY`;
+    await form.getByTestId("agent-profile-name").fill(dirty);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(dirty);
+    await expect(modal.getByRole("heading", { name: "Edit agent", exact: true })).toBeVisible();
+
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await expect(modal.getByTestId("agent-profile-form").getByTestId("agent-profile-name")).toHaveValue(
+      `${src.name} (copy)`,
+    );
+  });
+
+  test("Duplicate without copy-tasks: checkbox unchecked by default, new taskCount 0, source unchanged", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "NoCopyTasks");
+    await createBoundTask(request, backend, src.id, `nocopy-${randomUUID()}`);
+    expect(await taskCountOf(request, backend, src.id)).toBe(1);
+
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    const box = form.getByTestId("agent-profile-copy-tasks");
+    await expect(box).not.toBeChecked();
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+
+    const copyId = await getProfileIdByName(request, backend, `${src.name} (copy)`);
+    createdProfileIds.push(copyId);
+    expect(await taskCountOf(request, backend, copyId)).toBe(0);
+    expect(await taskCountOf(request, backend, src.id)).toBe(1);
+  });
+
+  test("Duplicate with copy-tasks checked: new profile gets 1 backlog task copy, source unchanged", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "CopyTasks");
+    const title = `copyme-${randomUUID()}`;
+    await createBoundTask(request, backend, src.id, title);
+
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await form.getByTestId("agent-profile-copy-tasks").check();
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+
+    const copyId = await getProfileIdByName(request, backend, `${src.name} (copy)`);
+    createdProfileIds.push(copyId);
+    expect(await taskCountOf(request, backend, copyId)).toBe(1);
+    expect(await taskCountOf(request, backend, src.id)).toBe(1);
+
+    const res = await request.get(`${backend.apiBase}/tasks`, { headers: auth(backend) });
+    expect(res.ok()).toBeTruthy();
+    const tasks = (await res.json()) as any[];
+    const copied = tasks.filter((t) => t.agentProfileId === copyId);
+    expect(copied).toHaveLength(1);
+    expect(copied[0].title).toContain(title);
+    expect(copied[0].column).toBe("backlog");
+  });
+
+  test("Copy tasks leaves an existing-branch task on the original and copies the ordinary one", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "ExistingBranch");
+    const ordinaryTitle = `ordinary-${randomUUID()}`;
+    const branchTitle = `on-branch-${randomUUID()}`;
+    await createBoundTask(request, backend, src.id, ordinaryTitle);
+    const branchTask = await createExistingBranchTask(request, backend, src.id, branchTitle);
+    expect(await taskCountOf(request, backend, src.id)).toBe(2);
+
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await expect(form.getByText("tasks on an existing branch stay on the original")).toBeVisible();
+    await form.getByTestId("agent-profile-copy-tasks").check();
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+
+    const toaster = page.locator("[data-sonner-toaster]");
+    await expect(
+      toaster.getByText("1 task couldn't be copied: task works on an existing branch — not copied"),
+    ).toBeVisible();
+
+    const copyId = await getProfileIdByName(request, backend, `${src.name} (copy)`);
+    createdProfileIds.push(copyId);
+    expect(await taskCountOf(request, backend, copyId)).toBe(1);
+    expect(await taskCountOf(request, backend, src.id)).toBe(2);
+
+    const res = await request.get(`${backend.apiBase}/tasks`, { headers: auth(backend) });
+    expect(res.ok()).toBeTruthy();
+    const tasks = (await res.json()) as {
+      id: string;
+      title: string;
+      column: string;
+      agentProfileId: string | null;
+      branchSource: string;
+    }[];
+    const copied = tasks.filter((t) => t.agentProfileId === copyId);
+    expect(copied).toHaveLength(1);
+    expect(copied[0]!.title).toBe(ordinaryTitle);
+    expect(copied[0]!.column).toBe("backlog");
+    const kept = tasks.find((t) => t.id === branchTask.id);
+    expect(kept?.agentProfileId).toBe(src.id);
+    expect(kept?.branchSource).toBe("existing");
+    expect(kept?.title).toBe(branchTitle);
+  });
 });
+
+function git(cwd: string, args: string[]): void {
+  execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+}
+
+/** A local branch with no remote. `createTask`'s existingBranch path fetch is
+ *  best-effort, then it resolves `refs/heads/<branch>`. */
+async function initRepoWithBranch(backend: E2EBackend, branch: string): Promise<string> {
+  const dir = path.join(backend.dataDir, `dup-repo-${randomUUID()}`);
+  await mkdir(dir, { recursive: true });
+  git(dir, ["init", "-q", "-b", "main"]);
+  git(dir, ["config", "user.email", "e2e@example.com"]);
+  git(dir, ["config", "user.name", "e2e"]);
+  git(dir, ["config", "commit.gpgsign", "false"]);
+  git(dir, ["commit", "-q", "--allow-empty", "-m", "init"]);
+  git(dir, ["branch", branch]);
+  return dir;
+}
+
+async function createExistingBranchTask(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  profileId: string,
+  title: string,
+) {
+  const branch = "pr-head";
+  const workdir = await initRepoWithBranch(backend, branch);
+  const res = await request.post(`${backend.apiBase}/tasks`, {
+    headers: auth(backend),
+    data: {
+      title,
+      prompt: "noop",
+      workdir,
+      isolation: "worktree",
+      existingBranch: branch,
+      agentProfileId: profileId,
+    },
+  });
+  expect(res.ok(), `POST /tasks existingBranch -> ${res.status()}: ${await res.text()}`).toBeTruthy();
+  return (await res.json()) as { id: string; branchSource: string };
+}
 
 test.afterAll(async ({ backend }) => {
   // Best-effort cleanup for anything a failed scenario left dangling — uses

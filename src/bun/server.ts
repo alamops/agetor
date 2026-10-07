@@ -239,6 +239,8 @@ import {
 } from "./bundle.ts";
 import { pickedPaths, singlePickedPath } from "./native-pick.ts";
 import type { AgentProfilePatch } from "./db.ts";
+import { duplicateAgentName } from "../shared/duplicate-name.ts";
+import { duplicateAgentProfile } from "./duplicate-agent-profile.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
 // `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
@@ -4063,6 +4065,103 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
             }
             return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+      },
+
+      // Copy a profile (and, with `copyTasks`, its live tasks). Omitted fields
+      // come from the source; the merged result goes through the same
+      // validators as POST. docs/plans/duplicate-agent-leftovers.md
+      "/agent-profiles/:id/duplicate": {
+        POST: authed(async (req) => {
+          const bad = (error: string, status = 400) =>
+            json({ error }, { status, headers: corsHeaders(req) });
+          const source = agentProfiles.get(req.params.id);
+          if (!source) return bad("not found", 404);
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) return bad("invalid body");
+          const body = raw as Record<string, unknown>;
+
+          for (const key of ["copyTasks", "fast", "maxMode"]) {
+            if (key in body && typeof body[key] !== "boolean") return bad(`${key} must be a boolean`);
+          }
+
+          const name =
+            "name" in body
+              ? typeof body.name === "string"
+                ? body.name.trim()
+                : ""
+              : duplicateAgentName(source.name, agentProfiles.list().map((p) => p.name));
+          const nameError = agentProfileNameError(name);
+          if (nameError) return bad(nameError);
+
+          let harnessId = source.harness;
+          if ("harness" in body) {
+            const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
+            if (!harnessRef) return bad("harness required");
+            const harness = harnesses.getByIdOrKind(harnessRef);
+            if (!harness) return bad(`unknown harness "${harnessRef}"`);
+            harnessId = harness.id;
+          }
+
+          const model = "model" in body ? (typeof body.model === "string" ? body.model.trim() : "") : source.model;
+          const modelError = agentProfileModelError(model);
+          if (modelError) return bad(modelError);
+
+          const optionalError =
+            ("effort" in body ? agentProfileOptionalFieldError(body.effort, "effort") : null) ??
+            ("mode" in body ? agentProfileOptionalFieldError(body.mode, "mode") : null);
+          if (optionalError) return bad(optionalError);
+
+          if ("instructions" in body && typeof body.instructions !== "string") {
+            return bad("instructions must be a string");
+          }
+          const instructions = "instructions" in body ? (body.instructions as string) : source.instructions;
+          const instructionsError = agentProfileInstructionsError(instructions);
+          if (instructionsError) return bad(instructionsError);
+
+          let skills = source.skills;
+          if ("skills" in body) {
+            const parsedSkills = parseSkillsBody(body.skills);
+            if ("error" in parsedSkills) return bad(parsedSkills.error);
+            skills = parsedSkills.skills;
+          }
+
+          // Each copied worktree task resolves a git ref inside createTask.
+          // A profile with many of those can outlast Bun's 255s idle ceiling,
+          // which would kill the handler after the profile row already exists.
+          // Opt out for the copy itself. The CLI waits on a matching long
+          // timeout so it hears this response instead of retrying into a
+          // second profile.
+          if (body.copyTasks === true) server.timeout(req, 0);
+          try {
+            const result = await duplicateAgentProfile(
+              source.id,
+              {
+                name,
+                harness: harnessId,
+                model,
+                effort: "effort" in body ? agentProfileOptionalField(body.effort) : source.effort,
+                mode: "mode" in body ? agentProfileOptionalField(body.mode) : source.mode,
+                fast: "fast" in body ? body.fast === true : source.fast,
+                maxMode: "maxMode" in body ? body.maxMode === true : source.maxMode,
+                instructions,
+                skills,
+              },
+              body.copyTasks === true,
+            );
+            if ("notFound" in result) return bad("not found", 404);
+            return json(
+              {
+                profile: withTaskCount(result.profile),
+                copiedTasks: result.copiedTasks,
+                taskCopyErrors: result.taskCopyErrors,
+              },
+              { status: 201, headers: corsHeaders(req) },
+            );
+          } catch (e) {
+            if (e instanceof AgentProfileNameError) return bad(e.message, 409);
+            return bad((e as Error).message);
           }
         }),
       },

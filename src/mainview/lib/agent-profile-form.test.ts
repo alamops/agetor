@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { agentProfileTextDirty, type AgentProfileTextDraft } from "./agent-profile-form.ts";
+import { agentProfileTextDirty, duplicateAgentName, type AgentProfileTextDraft } from "./agent-profile-form.ts";
 
 function draft(overrides: Partial<AgentProfileTextDraft> = {}): AgentProfileTextDraft {
   return { name: "Bug fixer", instructions: "Be terse.", skills: ["review", "test"], ...overrides };
@@ -45,5 +45,42 @@ describe("agentProfileTextDirty", () => {
 
   test("a fresh but equal skills array is clean", () => {
     expect(agentProfileTextDirty(draft({ skills: ["review", "test"] }), draft())).toBe(false);
+  });
+});
+
+describe("duplicateAgentName", () => {
+  test("appends (copy) when nothing collides", () => {
+    expect(duplicateAgentName("Bug fixer", [])).toBe("Bug fixer (copy)");
+  });
+
+  test("numbers the copy when (copy) is taken", () => {
+    expect(duplicateAgentName("Bug fixer", ["Bug fixer (copy)"])).toBe("Bug fixer (copy 2)");
+  });
+
+  test("collision check ignores case and surrounding whitespace", () => {
+    expect(duplicateAgentName("Bug fixer", ["  bug fixer (copy)  ", "Bug fixer (copy 2)"])).toBe(
+      "Bug fixer (copy 3)",
+    );
+  });
+
+  test("an 80-char base is truncated to fit with the suffix", () => {
+    const out = duplicateAgentName("A".repeat(80), []);
+    expect(out.length).toBeLessThanOrEqual(80);
+    expect(out.endsWith(" (copy)")).toBe(true);
+  });
+
+  test("never splits a surrogate pair when truncating", () => {
+    const out = duplicateAgentName("😀".repeat(10), [], 10);
+    expect(out.length).toBeLessThanOrEqual(10);
+    expect(out.endsWith(" (copy)")).toBe(true);
+    const last = out.charCodeAt(out.length - 1);
+    expect(last >= 0xd800 && last <= 0xdbff).toBe(false);
+  });
+
+  test("does not throw with many collisions", () => {
+    const taken = ["Bug fixer (copy)"];
+    for (let n = 2; n <= 1000; n++) taken.push(`Bug fixer (copy ${n})`);
+    const result = duplicateAgentName("Bug fixer", taken);
+    expect(taken.map((n) => n.trim().toLowerCase())).not.toContain(result.trim().toLowerCase());
   });
 });

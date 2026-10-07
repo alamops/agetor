@@ -57,7 +57,7 @@ Commands:
   info                show the connected core's version
   daemon <sub>        start | stop | status of the background core
   harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
-  profile <sub>       list | show | add | edit | rm | export | import reusable agent profiles
+  profile <sub>       list | show | add | edit | duplicate | rm | export | import reusable agent profiles
   pipeline <sub>      list | show | rm | export | import pipelines; retry [--from] |
                       advance | restart | status control a pipeline task's run
   export [selectors]  write Agents and/or Pipelines to a portable JSON bundle
