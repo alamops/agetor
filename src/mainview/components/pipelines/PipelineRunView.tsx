@@ -17,7 +17,10 @@ import {
   latestTransition,
   reconcileFlowItems,
   responseKindLabel,
+  sameStepAttention,
   satellitesSignature,
+  stepAttention,
+  stepNodeTaskFor,
   stepReminded,
   stepTaskFor,
   stepVisualState,
@@ -31,6 +34,7 @@ import {
   type EdgeVisualState,
   type ResponseKindTone,
   type StepFlowEdge,
+  type StepAttention,
   type StepFlowNode,
   type StepVisualState,
   type SubagentFlowEdge,
@@ -210,7 +214,10 @@ function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } |
  * Full-page, live-animated view of one pipeline TASK's run: the active step
  * pulses, traversed edges paint, and a token travels the edge on each
  * handoff — via `stepVisualState`/`edgeVisualState`/`latestTransition`
- * (`src/mainview/lib/pipelines.ts`). Self-sufficient: fetches its own data
+ * (`src/mainview/lib/pipelines.ts`) — and a step that needs the user (a
+ * pending question, an error, a missing handoff, a run-level block stuck at
+ * it) wears the board card's amber attention look via `stepAttention`.
+ * Self-sufficient: fetches its own data
  * (`GET /tasks/:id/pipeline`), refetches on relevant global events (D12)
  * with a 2s poll as the fallback, and lets the caller handle navigation
  * (`onOpenTask` for a step click, `onBack` for the header button). See
@@ -382,14 +389,23 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   // documented fallback (skipping a tick while a request is already in
   // flight, per the app's existing poll convention). The events arrive
   // through `subscribePipelineGlobalEvents` — `App.tsx`'s ONE `/events`
-  // EventSource forwards every `pipeline`/`column`/`run-status` event into
-  // that module bus — rather than this view opening a second permanent
-  // EventSource of its own: WKWebView's ~6-connections-per-host budget
-  // already carries two SSE channels, and a third starved the rest.
+  // EventSource forwards every `pipeline`/`column`/`run-status`/
+  // `interaction` event into that module bus — rather than this view opening
+  // a second permanent EventSource of its own: WKWebView's
+  // ~6-connections-per-host budget already carries two SSE channels, and a
+  // third starved the rest. `interaction` (a step asking, or its question
+  // resolving) is what repaints a node's attention highlight right away —
+  // without it a new question would only show up on the next 2s poll. It
+  // also matches on the event's own `pipelineParentId` stamp, so a step
+  // created moments ago (not in `stepIdsRef` yet) still triggers a reload.
   useEffect(() => {
     const unsubscribe = subscribePipelineGlobalEvents((e) => {
       if (e.kind === "pipeline") {
         if (e.taskId === taskId) void load();
+        return;
+      }
+      if (e.kind === "interaction") {
+        if (e.pipelineParentId === taskId || stepIdsRef.current.has(e.taskId)) void load();
         return;
       }
       if (
@@ -492,9 +508,18 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   const nodeVisualSignature = useMemo(() => {
     if (!run) return "";
     const active = run.active.map((a) => `${a.stepId}:${a.taskId}`).join(",");
-    const blocked = run.blocked.map((b) => `${b.stepId ?? ""}:${b.taskId ?? ""}`).join(",");
-    const history = run.history.map((h) => `${h.stepId}:${h.outcome ?? ""}:${h.reminder ? h.reminder.at : ""}`).join(",");
-    const columns = steps.map((t) => `${t.id}:${t.column}`).join(",");
+    // `kind` + `message` per block and each step row's pending count feed
+    // `stepAttention` (the node's amber look, label and tooltip) — leave
+    // either out and a new question or a changed block message never
+    // repaints. JSON-quoted so a message containing a separator can't
+    // collide with a different block list.
+    const blocked = run.blocked
+      .map((b) => `${b.stepId ?? ""}:${b.taskId ?? ""}:${b.kind}:${JSON.stringify(b.message)}`)
+      .join(",");
+    const history = run.history
+      .map((h) => `${h.stepId}:${h.taskId}:${h.outcome ?? ""}:${h.reminder ? h.reminder.at : ""}`)
+      .join(",");
+    const columns = steps.map((t) => `${t.id}:${t.column}:${t.pendingInteractionCount}`).join(",");
     return `${active}|${blocked}|${history}|${columns}`;
   }, [run, steps]);
 
@@ -510,12 +535,16 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   transitionRef.current = transition;
   const transitionKey = transition ? `${transition.fromStepId}>${transition.toStepIds.join("+")}#${transition.seq}` : "";
 
-  // ---- Per-poll merge: replace a node's `data.visual` only when it
-  // actually changed, so most nodes keep their exact object identity —
-  // and, whenever NO node's visual changed, hand `setNodes` back the exact
-  // same array reference so React's `Object.is` bail-out skips the
-  // re-render entirely instead of feeding React Flow a perpetually-new
-  // (but content-identical) `nodes` array. ----
+  // ---- Per-poll merge: replace a node's `data.visual`/`reminded`/
+  // `attention` only when one actually changed, so most nodes keep their
+  // exact object identity — and, whenever NO node changed, hand `setNodes`
+  // back the exact same array reference so React's `Object.is` bail-out
+  // skips the re-render entirely instead of feeding React Flow a
+  // perpetually-new (but content-identical) `nodes` array. `stepAttention`
+  // returns a fresh object on every call, so it MUST be compared through
+  // `sameStepAttention`, never by reference — a reference check would
+  // "change" every node on every poll and reintroduce the update loop the
+  // class doc comment describes. ----
   useEffect(() => {
     const r = runRef.current;
     const s = stepsRef.current;
@@ -524,9 +553,16 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
       const next = ns.map((n) => {
         const visual: StepVisualState = stepVisualState(r, n.id, s);
         const reminded = stepReminded(r, n.id);
-        if (n.data.visual === visual && n.data.reminded === reminded) return n;
+        const attention = stepAttention(r, n.id, s);
+        if (
+          n.data.visual === visual
+          && n.data.reminded === reminded
+          && sameStepAttention(n.data.attention as StepAttention | null | undefined, attention)
+        ) {
+          return n;
+        }
         changed = true;
-        return { ...n, data: { ...n.data, visual, reminded } };
+        return { ...n, data: { ...n.data, visual, reminded, attention } };
       });
       return changed ? next : ns;
     });
@@ -640,7 +676,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         setDetailsNodeId(node.id);
         return;
       }
-      const stepTask = stepTaskFor(steps, run, node.id);
+      const stepTask = stepNodeTaskFor(steps, run, node.id);
       if (stepTask) {
         setNotStartedStepName(null);
         onOpenTask(stepTask);

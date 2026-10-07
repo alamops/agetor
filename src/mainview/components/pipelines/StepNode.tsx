@@ -1,8 +1,10 @@
 import { memo } from "react";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
-import { Merge, Play, Plus, RefreshCw, Split } from "lucide-react";
+import { Merge, MessageCircleQuestion, Play, Plus, RefreshCw, Split } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { StepVisualState } from "@/lib/pipelines";
+import { AWAITING_RING_CLASS } from "@/lib/awaiting";
+import type { StepAttention, StepVisualState } from "@/lib/pipelines";
+import { AwaitingGlow } from "@/components/ui/awaiting-glow";
 import type { PipelineStep } from "../../../shared/types.ts";
 import { AgentProfileCard } from "../kanban/AgentProfileCard";
 import { usePipelineCanvasContext } from "./pipeline-canvas-context";
@@ -25,6 +27,14 @@ export type StepNodeData = Record<string, unknown> & {
    *  and hasn't settled since — see `stepReminded` in `@/lib/pipelines`.
    *  Renders a small glyph while `visual === "active"`. */
   reminded?: boolean;
+  /** Run view only: what this step needs from the user right now (a
+   *  pending question, an error, a missing handoff, a run-level block
+   *  stuck at this step) — see `stepAttention` in `@/lib/pipelines`. While
+   *  set, the node wears the board card's own amber look (ring + pulsing
+   *  glow, replacing the blue "working" pulse) plus a label chip, and
+   *  carries `data-attention`; `visual`/`data-visual` keep describing the
+   *  lifecycle state underneath. The editor never sets it. */
+  attention?: StepAttention | null;
   /** Appends a new step connected to this one's output — omit (or pair
    *  with `readOnly: true`) to hide the "+" button entirely. */
   onAppend?: (stepId: string) => void;
@@ -38,7 +48,7 @@ const VISUAL_CLASSES: Record<StepVisualState, string> = {
   // tailwind.config.js), so it coexists with the `ring-primary` selection
   // ring below — both used to be box-shadows, and the keyframe clobbered
   // the ring. No static `ring-info` here: the animated outline IS the halo.
-  active: "border-info outline outline-2 outline-info animate-pipeline-pulse",
+  active: "border-info outline outline-2 outline-info animate-pipeline-pulse motion-reduce:animate-none",
   done: "border-success",
   blocked: "border-warning",
   failed: "border-danger",
@@ -46,7 +56,7 @@ const VISUAL_CLASSES: Record<StepVisualState, string> = {
 };
 
 function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
-  const { step, visual = "idle", readOnly, reminded, onAppend } = data;
+  const { step, visual = "idle", readOnly, reminded, attention, onAppend } = data;
   const { startStepId, resolveProfile } = usePipelineCanvasContext();
   const { profile, profileDeleted } = resolveProfile(step.agentProfileId ?? null);
   const isStart = startStepId === step.id;
@@ -57,9 +67,12 @@ function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
       data-testid="pipeline-step-node"
       data-step-id={step.id}
       data-visual={visual}
+      data-attention={attention?.kind}
       className={cn(
         "relative w-[240px] rounded-lg border bg-card p-3 text-card-foreground shadow-sm transition-colors",
-        VISUAL_CLASSES[visual],
+        // Attention wins over the lifecycle look — a step asking mid-turn
+        // is still `active`, but reads amber like the board card, not blue.
+        attention ? cn("border-warning", AWAITING_RING_CLASS) : VISUAL_CLASSES[visual],
         selected && "ring-2 ring-primary",
       )}
     >
@@ -97,6 +110,19 @@ function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
             className="inline-flex shrink-0 items-center text-warning"
           >
             <RefreshCw className="size-3.5" aria-hidden />
+          </span>
+        )}
+        {attention && (
+          // Says what the step needs in the card button's own words, so
+          // colour isn't the only signal. Not a button — the whole node
+          // already opens the step on click.
+          <span
+            data-testid="pipeline-step-attention"
+            title={attention.message ?? (attention.kind === "answer" ? "Waiting for your answer" : "Needs your review")}
+            className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium text-warning"
+          >
+            <MessageCircleQuestion className="size-2.5" aria-hidden />
+            {attention.label}
           </span>
         )}
       </div>
@@ -152,6 +178,7 @@ function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
           <Plus className="size-3.5" aria-hidden />
         </button>
       )}
+      {attention && <AwaitingGlow />}
     </div>
   );
 }

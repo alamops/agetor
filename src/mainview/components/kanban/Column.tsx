@@ -14,6 +14,10 @@ interface Props {
   onCancel: (t: Task) => void;
   onDelete: (t: Task) => void;
   onOpen: (t: Task) => void;
+  /** Forwarded to each `TaskCard` as its amber "waiting on you" button's
+   *  callback — see `TaskCard`'s own doc for why it's separate from
+   *  `onOpen`. Must be `useCallback`-stable (compared below). */
+  onOpenAttention: (t: Task) => void;
   onDiff: (t: Task) => void;
   onMarkDone: (t: Task) => void;
   onArchive: (t: Task) => void;
@@ -46,7 +50,7 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
-function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu }: Props) {
+function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onOpenAttention, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   return (
     <div
@@ -75,6 +79,7 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
             onCancel={onCancel}
             onDelete={onDelete}
             onOpen={onOpen}
+            onOpenAttention={onOpenAttention}
             onDiff={onDiff}
             onMarkDone={onMarkDone}
             onArchive={onArchive}
@@ -110,6 +115,7 @@ export const Column = memo(ColumnImpl, (prev, next) => (
   prev.onCancel === next.onCancel &&
   prev.onDelete === next.onDelete &&
   prev.onOpen === next.onOpen &&
+  prev.onOpenAttention === next.onOpenAttention &&
   prev.onDiff === next.onDiff &&
   prev.onMarkDone === next.onMarkDone &&
   prev.onArchive === next.onArchive &&

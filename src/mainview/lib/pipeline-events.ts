@@ -1,7 +1,11 @@
 /**
  * In-memory fan-out for the pipeline-relevant `GlobalEvent`s — the
- * `pipeline`, `column` and `run-status` kinds (see `GlobalEvent` in
- * `src/shared/types.ts`, and `docs/plans/pipelines.md` D12).
+ * `pipeline`, `column`, `run-status` and `interaction` kinds (see
+ * `GlobalEvent` in `src/shared/types.ts`, and `docs/plans/pipelines.md`
+ * D12). `interaction` is what lets the run view repaint a step's amber
+ * "waiting on you" highlight the moment it asks (or its question resolves),
+ * instead of on the next 2s poll —
+ * `docs/plans/pipeline-blocked-step-highlight.md` D8.
  *
  * Same spirit as `lib/clone-progress.ts`: WKWebView caps HTTP/1.1
  * connections per host at ~6, and two are already spent on permanent SSE
@@ -9,7 +13,7 @@
  * `/tasks/:id/events`) — so neither the pipeline run view nor the RunPanel's
  * pipeline strip may open their own `EventSource` on `/events`. Instead
  * `App.tsx`'s single `subscribeGlobalEvents` handler forwards every
- * `pipeline`/`column`/`run-status` event here via
+ * `pipeline`/`column`/`run-status`/`interaction` event here via
  * `publishPipelineGlobalEvent` — FIRST thing, before any of its own toast /
  * board gating — and consumers subscribe through
  * `subscribePipelineGlobalEvents`.
