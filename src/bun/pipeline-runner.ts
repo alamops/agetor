@@ -356,6 +356,31 @@ function persistReconcileFailure(parentId: string, taskId: string, err: unknown)
   }
 }
 
+/** The step's current run when it is a different run from `settledRunId`.
+ *  Null when this settle is still the current run. The row may already be
+ *  terminal: a continuation can finish in the gap after a reminder was
+ *  queued, and that is still the run whose text has to be classified. */
+function differentCurrentRunId(taskId: string, settledRunId: string): string | null {
+  const currentId = tasks.get(taskId)?.runId;
+  if (!currentId || currentId === settledRunId) return null;
+  return currentId;
+}
+
+/** True when {@link differentCurrentRunId} names a run that is still
+ *  `running`. The task transcript merges every run, and a background-task
+ *  continuation (or a follow-up that already started) often carries the
+ *  `<handoff>` the settled run does not have yet. Reminding off the settled
+ *  run warns "handoff missing" about a turn that is still writing.
+ *  {@link attemptHandoffReminderOrBlock} only skips in this case. A
+ *  successor that has already left `running` is not skipped there — its
+ *  own settle classifies it, and {@link deliverHandoffReminder} re-enters
+ *  that settle when the reminder was already queued. */
+function runningSuccessorSupersedes(taskId: string, settledRunId: string): boolean {
+  const currentId = differentCurrentRunId(taskId, settledRunId);
+  if (!currentId) return false;
+  return runs.get(currentId)?.status === "running";
+}
+
 /** A run's MAIN-stream rows (`subagentId == null`) in id order, loaded ONCE
  *  per settle (L-R6) — both derivations below read from this one array
  *  instead of each re-fetching the whole `run_events` table for the run.
@@ -1586,13 +1611,21 @@ interface PendingReminder {
   reminderText: string;
 }
 
-/** Step task ids whose one automatic reminder is mid-send outside the lock.
- *  A second settle for the same execution arriving in that window — the
- *  `review` column event and the `run-status` event for ONE turn both reach
- *  the settle body, see `handleColumnChange` — must not classify and send
- *  again: the in-flight reminder owns this execution's next state. Cleared
- *  by `deliverHandoffReminder` once it re-acquires the lock. */
-const remindersInFlight = new Set<string>();
+/** Step task id → the run id whose reminder is mid-send outside the lock.
+ *  A second settle of THAT run arriving in the window — the `review`
+ *  column event and the `run-status` event for one turn both reach the
+ *  settle body, see `handleColumnChange` — must not classify and send
+ *  again. A settle of a *different* run is the continuation and is
+ *  classified; it must not queue a second reminder while this one is
+ *  still in flight (`attemptHandoffReminderOrBlock`). Cleared by
+ *  `deliverHandoffReminder` once it re-acquires the lock, or sooner when
+ *  the send is abandoned for a successor. */
+const remindersInFlight = new Map<string, string>();
+
+/** Test seam. Invoked once at the start of {@link deliverHandoffReminder}
+ *  (then cleared) so a test can settle a successor while the reminder is
+ *  queued. Production never sets it. */
+let beforeReminderSend: (() => Promise<void> | void) | null = null;
 
 /**
  * Decide whether the single automatic handoff-format reminder for `taskId`'s
@@ -1619,6 +1652,13 @@ const remindersInFlight = new Set<string>();
  *    handoff while the whole run is being torn down (`cancelPipelineRun`,
  *    or every other live sibling already mid-cancellation) must not have
  *    the reminder revive the run back into `running`.
+ *  - A newer run of this step is still `running` (`task.runId` moved, and
+ *    that run has not settled). The transcript merges every run; the
+ *    `<handoff>` usually lands on the continuation, so this settle must
+ *    not remind, block, or stamp `handoff-missing`. That run's own settle
+ *    classifies the reply. A successor that is already terminal does not
+ *    take this branch: its settle already ran, or `deliverHandoffReminder`
+ *    re-enters it instead of sending this reminder.
  *  - Otherwise: hand the send back to the caller. Medium 3 — the reminder
  *    is recorded onto `historyEntry.reminder` ONLY when `sendInput` reports
  *    `delivered: true` (see `deliverHandoffReminder`); a failed/withheld
@@ -1688,6 +1728,29 @@ function attemptHandoffReminderOrBlock(input: {
     return null;
   }
 
+  // The step's current run is a newer one that is still in flight. The
+  // handoff (if any) lands on that run; this settle only saw the text that
+  // existed before the continuation started. Leave the execution active and
+  // unblocked, and don't stamp `handoff-missing` — that run's own settle
+  // classifies the reply, or sends the one reminder if it also lacks a
+  // handoff. No `remindersInFlight` entry on this path.
+  if (runningSuccessorSupersedes(taskId, runId)) {
+    if (historyEntry) historyEntry.responseKind = null;
+    persist(parentId, run);
+    return null;
+  }
+
+  // A reminder for the previous run of this same execution is already
+  // mid-send. This settle is the continuation. One reminder per execution:
+  // don't queue another and don't block. A real handoff never reaches
+  // here — the caller advances on it. `deliverHandoffReminder` stamps the
+  // in-flight send only when this run also has no handoff.
+  const inFlightRunId = remindersInFlight.get(taskId);
+  if (inFlightRunId && inFlightRunId !== runId) {
+    persist(parentId, run);
+    return null;
+  }
+
   const stepObj = graph.steps.find((s) => s.id === activeEntry.stepId);
   const outgoing = outgoingSteps(graph, activeEntry.stepId).map((o) => ({ name: o.step.name, label: o.edge.label }));
   const transition = stepObj?.transition ?? "choose";
@@ -1695,7 +1758,7 @@ function attemptHandoffReminderOrBlock(input: {
 
   // No block recorded — the execution stays `active`; the send itself
   // happens once the caller has released the lock (L-R7).
-  remindersInFlight.add(taskId);
+  remindersInFlight.set(taskId, runId);
   checkJoinIncomplete(run);
   persist(parentId, run);
   return {
@@ -1711,6 +1774,72 @@ function attemptHandoffReminderOrBlock(input: {
   };
 }
 
+/** The continuation (or follow-up) became the current run after
+ *  {@link attemptHandoffReminderOrBlock} already queued a reminder. Drop
+ *  the send, clear the in-flight flag so that run's settle isn't swallowed,
+ *  and leave `reminder` unset so a later reply that still lacks a handoff
+ *  can still be reminded once. */
+async function abandonReminderForSuccessor(p: PendingReminder): Promise<void> {
+  await runExclusive(p.parentId, async () => {
+    if (remindersInFlight.get(p.taskId) === p.runId) remindersInFlight.delete(p.taskId);
+    const parent = tasks.get(p.parentId);
+    const run = parent?.pipelineRun;
+    if (!run) return;
+    const historyEntry = run.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
+    // A successor settle that already recorded an outcome owns `responseKind`.
+    // Clearing it here would wipe a handoff that was classified while this
+    // reminder was queued.
+    if (historyEntry && !historyEntry.reminder && historyEntry.outcome == null) historyEntry.responseKind = null;
+    persist(p.parentId, run);
+  });
+}
+
+function terminalRunStatus(status: string): "succeeded" | "failed" | "cancelled" | "orphaned" | null {
+  if (status === "succeeded" || status === "failed" || status === "cancelled" || status === "orphaned") return status;
+  return null;
+}
+
+/** Stop this reminder when a newer run should own the step's outcome.
+ *  Returns true when the caller must not send or stamp.
+ *
+ *  `sentRunId` is the run `sendInput` just delivered this reminder on.
+ *  That run is the reminder turn itself. It is not a continuation, and
+ *  treating it as one never stamps `reminder`, so every later settle of
+ *  the same execution queues another send.
+ *
+ *  A still-`running` successor (other than that reminder turn) is left
+ *  for its own settle. A terminal successor that already has a handoff
+ *  is classified now (`handleRunStatus`) — that recovers a settle which
+ *  ran while `remindersInFlight` pointed at the previous run, or which
+ *  never ran. A terminal successor with no handoff does not take this
+ *  branch: the one reminder still goes out on the run that was queued,
+ *  which is the live session. Re-settling that successor would
+ *  `sendInput` a finished run that is not a session. */
+async function deferReminderToSuccessor(p: PendingReminder, sentRunId?: string): Promise<boolean> {
+  const successorId = differentCurrentRunId(p.taskId, p.runId);
+  if (!successorId || successorId === sentRunId) return false;
+  const successor = runs.get(successorId);
+  if (!successor) return false;
+
+  if (successor.status === "running") {
+    await abandonReminderForSuccessor(p);
+    return true;
+  }
+
+  const status = terminalRunStatus(successor.status);
+  if (!status) return false;
+  const classified = classifyStepResponse({
+    runStatus: status,
+    assistantText: assistantTextFrom(mainStreamEventsForRun(successorId)),
+    pendingInteractions: pendingInteractionsForRun(p.taskId, successorId),
+  });
+  if (classified.kind !== "handoff" && classified.kind !== "handoff-blocked") return false;
+
+  await abandonReminderForSuccessor(p);
+  await handleRunStatus(p.taskId, successorId, status);
+  return true;
+}
+
 /**
  * Second half of the reminder (L-R7): send `p.reminderText` as an ordinary
  * follow-up turn on the step's own run with NO lock held, then re-acquire
@@ -1720,18 +1849,41 @@ function attemptHandoffReminderOrBlock(input: {
  * the execution to its next classification once the reminder turn
  * finishes. Nothing here revives an execution that was retried/advanced
  * while the send was in flight: a delivered reminder is still stamped on
- * its history entry (it's a fact), but a failed send only records its block
- * if the execution is still the active one.
+ * its history entry (it's a fact) unless a newer run now owns the step, in
+ * which case that run is classified and the stamp is skipped. A failed
+ * send only records its block if the execution is still the active one.
+ *
+ * Before sending, and again after `sendInput` returns, defers to a newer
+ * current run ({@link deferReminderToSuccessor}). A continuation that
+ * starts or finishes in the gap after the settle released the lock must
+ * not get this reminder pasted onto the old run, and a handoff it already
+ * wrote must be classified instead of waiting for the next boot reconcile.
  */
 async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
+  if (beforeReminderSend) {
+    const hook = beforeReminderSend;
+    beforeReminderSend = null;
+    await hook();
+  }
+  // Re-check outside the lock, before `sendInput`. The continuation often
+  // starts in the gap after the settle released the lock. A successor that
+  // is already terminal had its settle dropped, or never ran; classify it
+  // now. Sending anyway is the false "handoff missing" warning.
+  if (await deferReminderToSuccessor(p)) return;
   let sent: Awaited<ReturnType<typeof sendInput>>;
   try {
     sent = await sendInput(p.runId, p.reminderText);
   } catch (err) {
     sent = { delivered: false, reason: err instanceof Error ? err.message : String(err) };
   }
+  // The continuation can start and finish during `sendInput`. A handoff
+  // on that run is classified and this reminder is not stamped over it.
+  // No handoff leaves the stamp in place: the paste above is the one
+  // reminder, on the run that was queued. The run `sendInput` just
+  // started is that reminder, not a continuation.
+  if (await deferReminderToSuccessor(p, sent.delivered ? sent.runId : undefined)) return;
   await runExclusive(p.parentId, async () => {
-    remindersInFlight.delete(p.taskId);
+    if (remindersInFlight.get(p.taskId) === p.runId) remindersInFlight.delete(p.taskId);
     try {
       const parent = tasks.get(p.parentId);
       if (!parent || !parent.pipelineRun) return;
@@ -1854,10 +2006,12 @@ async function settleStepRun(
     const stepName = stepNameById(graph, activeEntry.stepId);
     const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
 
-    // An automatic reminder for this very execution is mid-send outside the
-    // lock — its outcome (stamp, or block) is what decides this execution's
-    // next state, not a second classification of the same turn.
-    if (remindersInFlight.has(taskId)) return null;
+    // An automatic reminder for this very run is mid-send outside the lock.
+    // Its outcome (stamp, or block) decides that run, not a second
+    // classification of the same turn. A different runId is the
+    // continuation and must be classified — dropping it here left the
+    // handoff unread until the next boot reconcile.
+    if (remindersInFlight.get(taskId) === runId) return null;
 
     if (status === "succeeded") {
       // One-shot handoff reminder (owner request, `docs/plans/pipelines.md`):
@@ -2327,11 +2481,14 @@ async function handleColumnChange(
         // ground truth; the settle body itself is idempotent against the
         // same outcome arriving twice.
         if (isTaskRunLive(taskId)) return;
-        if (remindersInFlight.has(taskId)) return;
         const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
         if (historyEntry && historyEntry.outcome !== null) return;
         const latest = runs.listForTask(taskId)[0];
         if (!latest || latest.status === "running") return;
+        // The in-flight reminder owns the settle of its own run. A newer
+        // run (the continuation) is `latest` once it exists and still has
+        // to be classified.
+        if (remindersInFlight.get(taskId) === latest.id) return;
         if (column === "review" ? latest.status !== "succeeded" : latest.status === "succeeded") return;
         pending = await settleStepRun(parentId, taskId, latest.id, latest.status);
       }
@@ -2465,4 +2622,7 @@ export const __forTest = {
   },
   handleRunStatus,
   handleColumnChange,
+  setBeforeReminderSend(hook: (() => Promise<void> | void) | null): void {
+    beforeReminderSend = hook;
+  },
 };

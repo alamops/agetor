@@ -707,15 +707,21 @@ test("060_normalize_cursor_sonnet_5_5 folds suffixed claude-sonnet-5-5 variants 
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("060 (cursor Sonnet 5.5) is the last registered migration, right after 059, with its pre-rebase id as an alias", () => {
+test("060 (cursor Sonnet 5.5) sits right after 059, with its pre-rebase id as an alias", () => {
   const at = migrations.findIndex((m) => m.id === "060_normalize_cursor_sonnet_5_5");
-  expect(at).toBe(migrations.length - 1);
-  const prev = migrations[at - 1];
-  expect(prev?.id).toBe("059_task_pipeline_id_index");
+  expect(at).toBeGreaterThanOrEqual(0);
+  expect(migrations[at - 1]?.id).toBe("059_task_pipeline_id_index");
+  expect(migrations[at + 1]?.id).toBe("061_antigravity_harness");
   // Written on its branch as 057 while `main` took 057–059 for pipelines —
   // renumbered on rebase; a dev DB that applied it under the old id must not
   // re-run it, hence the alias (the SQL is idempotent either way).
   expect(migrations[at]?.aliases).toEqual(["057_normalize_cursor_sonnet_5_5"]);
-  const last = migrations[at];
-  expect(last?.sql).toContain("claude-sonnet-5-5");
+  expect(migrations[at]?.sql).toContain("claude-sonnet-5-5");
+});
+
+test("061 (antigravity harness) is the last registered migration, right after 060", () => {
+  const at = migrations.findIndex((m) => m.id === "061_antigravity_harness");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("060_normalize_cursor_sonnet_5_5");
+  expect(migrations[at]?.sql).toContain("antigravity");
 });

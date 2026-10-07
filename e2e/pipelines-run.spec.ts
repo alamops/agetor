@@ -700,6 +700,63 @@ test.describe("pipelines run: executing a run", () => {
     await waitForColumn(backend, task.id, "review");
   });
 
+  // A background-task continuation replaces the step's current run before
+  // the first reply — which has no `<handoff>` — is classified. The
+  // continuation writes the handoff. The run must finish with no reminder
+  // chip and no blocked banner. `:continue-then-done` opens that second
+  // run through the same factory a stray JSONL line uses.
+  test("continuation writes the handoff: no reminder, then the next step finishes the run", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({
+      id: randomUUID(),
+      name: "A",
+      agentProfileId: profileId,
+      instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:continue-then-done`,
+    });
+    const B = makeStep({
+      id: randomUUID(),
+      name: "B",
+      agentProfileId: profileId,
+      instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+    });
+    const pipelineId = await createPipelineRest(
+      backend,
+      "Continuation Handoff Pipeline",
+      [A, B],
+      [{ from: A.id, to: B.id }],
+    );
+    const title = `Continuation Handoff ${randomUUID()}`;
+    const task = await createPipelineTaskRest(backend, title, pipelineId, "Do the thing.");
+    await openPipelineRunFromBoard(page, backend, title);
+    await startTaskRest(backend, task.id);
+
+    await expect(stepNode(page, A.id)).toHaveAttribute("data-visual", "active", { timeout: CONVERGE_TIMEOUT });
+
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done", { timeout: CONVERGE_TIMEOUT });
+    await expect(page.getByTestId("pipeline-run-blocked")).toHaveCount(0);
+    await expect(page.getByTestId("pipeline-run-reminder")).toHaveCount(0);
+    await expect(page.locator('[data-testid="pipeline-run-history-row"]')).toHaveCount(2);
+
+    const rowA = historyRowFor(page, "A");
+    await expect(rowA).toHaveCount(1);
+    await expect(rowA.locator('[data-testid="pipeline-run-response-kind"][data-kind="handoff"]')).toBeVisible();
+    await expect(rowA.getByTestId("pipeline-run-reminder")).toHaveCount(0);
+
+    await stepNode(page, A.id).click();
+    const panel = page.locator("aside").last();
+    await expect(panel.getByTestId("run-panel-pipeline-strip")).toBeVisible();
+    await expect(panel.getByTestId("handoff-reminder-badge")).toHaveCount(0);
+    await expect(panel.getByTestId("transcript-log")).toContainText("auto-continued after background task", {
+      timeout: CONVERGE_TIMEOUT,
+    });
+
+    await waitForColumn(backend, task.id, "review");
+  });
+
   // 65f8a75: `:invalid-then-done` is `:invalid`'s two-turn sibling — an
   // unparsable `<handoff>` JSON on the first turn, a valid one on the
   // second. Single-step pipeline (no B) so the final history record is

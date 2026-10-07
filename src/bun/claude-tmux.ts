@@ -157,6 +157,17 @@ export function setContinuationRunFactory(
 }
 
 /**
+ * Open a continuation run through the factory the orchestrator installed.
+ * The fake claude driver uses this for the `continue-then-done` handoff
+ * marker so an e2e pipeline can reproduce a background-task continuation
+ * without a live JSONL tail. Returns null when nothing is installed or the
+ * factory declines the task (unknown, archived, not claude-code).
+ */
+export function openContinuationRun(taskId: string): ContinuationHooks | null {
+  return continuationRunFactory?.(taskId) ?? null;
+}
+
+/**
  * Predicate the orchestrator installs to answer "is this task being held
  * open for background agents right now?" (the #92 hold: the main run
  * already resolved but the kanban card stays in `running` while subagents
