@@ -157,6 +157,25 @@ test("archived and pipeline step tasks are not copied", async () => {
   expect(body.copiedTasks.map((t) => t.title)).toEqual(["Ordinary"]);
 });
 
+test("a task on an existing branch is not copied", async () => {
+  const src = await createProfile();
+  const ordinary = await createTask(src.id, "Ordinary");
+  const existing = await createTask(src.id, "On a PR branch");
+  db.run(`UPDATE tasks SET branch_source = 'existing', branch = ? WHERE id = ?`, ["pr-head", existing.id]);
+  const res = await dup(src.id, { copyTasks: true });
+  expect(res.status).toBe(201);
+  const body = (await res.json()) as {
+    copiedTasks: Task[];
+    taskCopyErrors: { sourceTaskId: string; error: string }[];
+  };
+  expect(body.copiedTasks.map((t) => t.title)).toEqual(["Ordinary"]);
+  expect(body.taskCopyErrors).toEqual([
+    { sourceTaskId: existing.id, error: "task works on an existing branch — not copied" },
+  ]);
+  expect((await getTask(existing.id)).agentProfileId).toBe(src.id);
+  expect((await getTask(ordinary.id)).agentProfileId).toBe(src.id);
+});
+
 test("copyTasks omitted copies zero tasks", async () => {
   const src = await createProfile();
   await createTask(src.id);

@@ -32,6 +32,18 @@ export async function duplicateAgentProfile(
     .sort((a, b) => a.createdAt - b.createdAt);
 
   for (const t of eligible) {
+    // A task checked out on a branch that already exists (a PR head, for
+    // example) does not start from `baseRef`. Copying it without that branch
+    // would cut a fresh `agetor/…` branch from the pinned sha instead.
+    // `createTask` also refuses a second checkout of the same branch, so
+    // leave the original in place and say so.
+    if (t.branchSource === "existing") {
+      taskCopyErrors.push({
+        sourceTaskId: t.id,
+        error: "task works on an existing branch — not copied",
+      });
+      continue;
+    }
     try {
       const res = await createTask({
         title: t.title,

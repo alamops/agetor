@@ -4129,6 +4129,13 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             skills = parsedSkills.skills;
           }
 
+          // Each copied worktree task resolves a git ref inside createTask.
+          // A profile with many of those can outlast Bun's 255s idle ceiling,
+          // which would kill the handler after the profile row already exists.
+          // Opt out for the copy itself. The CLI waits on a matching long
+          // timeout so it hears this response instead of retrying into a
+          // second profile.
+          if (body.copyTasks === true) server.timeout(req, 0);
           try {
             const result = await duplicateAgentProfile(
               source.id,

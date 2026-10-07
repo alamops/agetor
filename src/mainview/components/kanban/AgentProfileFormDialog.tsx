@@ -397,7 +397,7 @@ function AgentProfileFormBody({
           <span className="space-y-0.5">
             <span className="block text-xs">Also copy tasks that use this agent</span>
             <span className="block text-xs text-muted-foreground">
-              New backlog cards. Runs and pipeline steps stay on the original.
+              New backlog cards. Runs, pipeline steps, and tasks on an existing branch stay on the original.
             </span>
           </span>
         </label>

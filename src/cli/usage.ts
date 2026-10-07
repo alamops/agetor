@@ -251,7 +251,9 @@ export const USAGE: Record<string, string> = {
   Create a copy of an agent profile immediately. The copy is named
   "<name> (copy)" unless --name overrides it. --with-tasks also copies the
   profile's non-archived, non-pipeline tasks as new backlog cards bound to the
-  new agent; runs and worktrees are not copied. The original agent is unchanged.
+  new agent. Runs and worktrees are not copied. A task checked out on an
+  existing branch is left on the original and reported in the output. The
+  original agent is unchanged.
   Edit the copy afterwards with 'agetor profile edit'.`,
 
   pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>

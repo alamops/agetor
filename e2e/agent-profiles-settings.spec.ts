@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
@@ -1328,7 +1329,98 @@ test.describe("agent profiles — Settings surface", () => {
     expect(copied[0].title).toContain(title);
     expect(copied[0].column).toBe("backlog");
   });
+
+  test("Copy tasks leaves an existing-branch task on the original and copies the ordinary one", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "ExistingBranch");
+    const ordinaryTitle = `ordinary-${randomUUID()}`;
+    const branchTitle = `on-branch-${randomUUID()}`;
+    await createBoundTask(request, backend, src.id, ordinaryTitle);
+    const branchTask = await createExistingBranchTask(request, backend, src.id, branchTitle);
+    expect(await taskCountOf(request, backend, src.id)).toBe(2);
+
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await expect(form.getByText("tasks on an existing branch stay on the original")).toBeVisible();
+    await form.getByTestId("agent-profile-copy-tasks").check();
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+
+    const toaster = page.locator("[data-sonner-toaster]");
+    await expect(
+      toaster.getByText("1 task couldn't be copied: task works on an existing branch — not copied"),
+    ).toBeVisible();
+
+    const copyId = await getProfileIdByName(request, backend, `${src.name} (copy)`);
+    createdProfileIds.push(copyId);
+    expect(await taskCountOf(request, backend, copyId)).toBe(1);
+    expect(await taskCountOf(request, backend, src.id)).toBe(2);
+
+    const res = await request.get(`${backend.apiBase}/tasks`, { headers: auth(backend) });
+    expect(res.ok()).toBeTruthy();
+    const tasks = (await res.json()) as {
+      id: string;
+      title: string;
+      column: string;
+      agentProfileId: string | null;
+      branchSource: string;
+    }[];
+    const copied = tasks.filter((t) => t.agentProfileId === copyId);
+    expect(copied).toHaveLength(1);
+    expect(copied[0]!.title).toBe(ordinaryTitle);
+    expect(copied[0]!.column).toBe("backlog");
+    const kept = tasks.find((t) => t.id === branchTask.id);
+    expect(kept?.agentProfileId).toBe(src.id);
+    expect(kept?.branchSource).toBe("existing");
+    expect(kept?.title).toBe(branchTitle);
+  });
 });
+
+function git(cwd: string, args: string[]): void {
+  execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+}
+
+/** A local branch with no remote. `createTask`'s existingBranch path fetch is
+ *  best-effort, then it resolves `refs/heads/<branch>`. */
+async function initRepoWithBranch(backend: E2EBackend, branch: string): Promise<string> {
+  const dir = path.join(backend.dataDir, `dup-repo-${randomUUID()}`);
+  await mkdir(dir, { recursive: true });
+  git(dir, ["init", "-q", "-b", "main"]);
+  git(dir, ["config", "user.email", "e2e@example.com"]);
+  git(dir, ["config", "user.name", "e2e"]);
+  git(dir, ["config", "commit.gpgsign", "false"]);
+  git(dir, ["commit", "-q", "--allow-empty", "-m", "init"]);
+  git(dir, ["branch", branch]);
+  return dir;
+}
+
+async function createExistingBranchTask(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  profileId: string,
+  title: string,
+) {
+  const branch = "pr-head";
+  const workdir = await initRepoWithBranch(backend, branch);
+  const res = await request.post(`${backend.apiBase}/tasks`, {
+    headers: auth(backend),
+    data: {
+      title,
+      prompt: "noop",
+      workdir,
+      isolation: "worktree",
+      existingBranch: branch,
+      agentProfileId: profileId,
+    },
+  });
+  expect(res.ok(), `POST /tasks existingBranch -> ${res.status()}: ${await res.text()}`).toBeTruthy();
+  return (await res.json()) as { id: string; branchSource: string };
+}
 
 test.afterAll(async ({ backend }) => {
   // Best-effort cleanup for anything a failed scenario left dangling — uses
