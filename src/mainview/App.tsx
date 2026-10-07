@@ -45,7 +45,7 @@ import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortc
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { useAgentProfiles } from "@/lib/agent-profiles";
-import { usePipelines } from "@/lib/pipelines";
+import { pipelineAttentionStepTask, usePipelines } from "@/lib/pipelines";
 import { PipelineEditor, PipelinesPage, PipelineRunView } from "@/components/pipelines";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { FontSizeProvider, useFontSize } from "@/components/font-size-provider";
@@ -373,8 +373,10 @@ function AppInner() {
   useEffect(() => { pipelineEditorDirtyRef.current = pipelineEditorDirty; }, [pipelineEditorDirty]);
   /** The view switch behind `navigate`, past the leave guards (below): the
    *  pipeline editor's own guard, then the switch. Reads refs, so it's
-   *  stable like `navigate`. */
-  const switchView = useCallback((next: AppView) => {
+   *  stable like `navigate`. `onNavigated` runs right after the switch
+   *  commits (synchronously, or once the discard-confirm is accepted) and
+   *  never when that confirm is cancelled. */
+  const switchView = useCallback((next: AppView, onNavigated?: () => void) => {
     const current = viewRef.current;
     if (current.kind === "pipelines" && current.editing && pipelineEditorDirtyRef.current) {
       void confirm({
@@ -386,10 +388,12 @@ function AppInner() {
         if (!ok) return;
         setPipelineEditorDirty(false);
         setView(next);
+        onNavigated?.();
       });
       return;
     }
     setView(next);
+    onNavigated?.();
   }, [confirm]);
   /** Central app-level navigation: switches `view`, confirming first when
    *  leaving the pipeline editor with unsaved changes. Every `view` change
@@ -397,8 +401,12 @@ function AppInner() {
    *  handle — or don't need — the guard themselves, see
    *  `pipelineEditorDirty` above) must go through this rather than calling
    *  `setView` directly, so a stray click while mid-edit can't silently
-   *  discard the draft. */
-  const navigate = useCallback((next: AppView) => {
+   *  discard the draft. `onNavigated` runs right after the view switch
+   *  commits (synchronously, or once a discard-confirm is accepted) and
+   *  never when a confirm is cancelled — so whatever a landing opens on
+   *  top of the new view (a step's run panel, or closing a leftover one)
+   *  can't land over work the user chose to keep. */
+  const navigate = useCallback((next: AppView, onNavigated?: () => void) => {
     const current = viewRef.current;
     // Unsaved work elsewhere that this view switch would unmount (an edited
     // import preview on the Pipelines page — lib/leave-guard.ts) asks first;
@@ -415,22 +423,101 @@ function AppInner() {
         // Drop the guarded work first (closes the import dialog now) so it
         // doesn't linger over the old view's exit animation.
         guard.discard?.();
-        switchView(next);
+        switchView(next, onNavigated);
       });
       return;
     }
-    switchView(next);
+    switchView(next, onNavigated);
   }, [confirm, switchView]);
+  /** What a step-resolving pipeline landing (`openPipelineAttention`,
+   *  `openPipelineStep`) does to the run panel once its view switch
+   *  commits: with a `step`, open that step (keeping a pending subagent-
+   *  focus request only if it's for that same step); without one (nothing
+   *  needs the user, or the row isn't polled in yet), close a leftover
+   *  panel from ANOTHER task but keep a step panel of this same pipeline
+   *  (`parentId`) — and its subagent-focus request — open, so a toast or
+   *  OS-notification click about the pipeline the user is already reading
+   *  never closes the step under them.
+   *  `tasksRef` is declared further down; it's only read inside the
+   *  callback, by which time it exists. Stable identity. */
+  const landOnPipeline = useCallback((parentId: string, step: Task | null) => {
+    if (step) {
+      setFocusSubagent((f) => (f && f.taskId === step.id ? f : null));
+      setSelected(step);
+      return;
+    }
+    setSelected((cur) => (cur && cur.pipelineParentId === parentId ? cur : null));
+    setFocusSubagent((f) => {
+      if (!f) return f;
+      const row = tasksRef.current.find((t) => t.id === f.taskId);
+      return row?.pipelineParentId === parentId ? f : null;
+    });
+  }, []);
   /** Switch the app-level `view` to a pipeline TASK's live run view — the
    *  card-open / context-menu / RunPanel-strip destination for a pipeline
    *  parent task (D5/D7, `docs/plans/pipelines.md`). Declared this early
    *  (rather than beside its sibling `openPipelinesPage`/`openTask`
    *  further down) because the app-wide global-events subscription effect
    *  below reads it. Routes through `navigate` (m2) so leaving a dirty
-   *  editor for a run view still confirms. */
+   *  editor for a run view still confirms. A run-view-only landing also
+   *  closes whatever run panel was left open (another task's, or a step of
+   *  this same pipeline), so the run view isn't covered by something the
+   *  user didn't ask to see — the attention paths that DO open a step go
+   *  through `openPipelineAttention` instead. The same-pipeline case is
+   *  deliberate: RunPanel's own "Open pipeline" strip button lands here,
+   *  and must reveal the run view that step panel is covering. The
+   *  step-named toasts that must NOT close the step being read go through
+   *  `openPipelineStep`. */
   const openPipelineRun = useCallback((taskId: string) => {
-    navigate({ kind: "pipeline-run", taskId });
+    navigate({ kind: "pipeline-run", taskId }, () => {
+      setFocusSubagent(null);
+      setSelected(null);
+    });
   }, [navigate]);
+  /** The "attention" landing for a pipeline PARENT — its card's amber
+   *  Answer/Review button, the "Waiting on you" / "Pipeline needs you"
+   *  toasts and the OS-notification click: the run view PLUS the run panel
+   *  of the step that needs the user, in one click. The step is resolved
+   *  only once the navigation commits (`navigate`'s `onNavigated`, so a
+   *  cancelled discard-confirm opens nothing), from already-polled state —
+   *  `opts.tasks` when the caller just fetched a fresher list, else
+   *  `tasksRef` — via `pipelineAttentionStepTask` (`opts.stepTaskId` pins
+   *  the step a toast announced). Nothing resolvable (only run-level
+   *  blocks, or a step row not polled in yet) lands on the run view alone,
+   *  closing another task's leftover panel but keeping a step panel of
+   *  this same pipeline (`landOnPipeline`). Landing on a step
+   *  also dismisses the parent-keyed pending toast — the panel-open
+   *  dismissal effect below is keyed on the STEP id, so it would miss it.
+   *  `tasksRef` is declared further down; it's only read inside the
+   *  callback, by which time it exists. Stable identity. */
+  const openPipelineAttention = useCallback(
+    (parentId: string, opts?: { stepTaskId?: string; tasks?: readonly Task[] }) => {
+      navigate({ kind: "pipeline-run", taskId: parentId }, () => {
+        const list = opts?.tasks ?? tasksRef.current;
+        const parent = list.find((t) => t.id === parentId);
+        const step = parent ? pipelineAttentionStepTask(parent, list, opts?.stepTaskId) : null;
+        landOnPipeline(parentId, step);
+        if (step) dismissPending(parentId);
+      });
+    },
+    [navigate, landOnPipeline],
+  );
+  /** A step-NAMED, non-attention landing — the retargeted `files-sent` /
+   *  `fx-auto-resume` toasts: the run view plus the panel of the step the
+   *  toast is about (its sent-files card, its paused-recovery notice),
+   *  whether or not that step needs the user. Unlike
+   *  `openPipelineAttention` it never re-resolves to another step and
+   *  doesn't itself dismiss the parent's "Waiting on you" toast — this
+   *  toast isn't about a question. (The panel-open dismissal effect below
+   *  still clears it when the named step is itself asking, same as opening
+   *  that step any other way.) A step row not polled in yet lands on the
+   *  run view alone (same `landOnPipeline` rules). Stable identity. */
+  const openPipelineStep = useCallback((parentId: string, stepTaskId: string) => {
+    navigate({ kind: "pipeline-run", taskId: parentId }, () => {
+      const row = tasksRef.current.find((t) => t.id === stepTaskId && t.pipelineParentId === parentId);
+      landOnPipeline(parentId, row ?? null);
+    });
+  }, [navigate, landOnPipeline]);
   /** Card click / row-open handler for every task in the board and every
    *  other list that opens a task (Worktrees dialog, etc. still call
    *  `setSelected` directly where a run panel is always the right target,
@@ -453,6 +540,19 @@ function AppInner() {
     setFocusSubagent(null);
     setSelected(t);
   }, [openPipelineRun]);
+  /** The card's amber "waiting on you" button (`TaskCard`'s
+   *  `onOpenAttention`): a pipeline PARENT lands on its run view plus the
+   *  step that needs the user (`openPipelineAttention`), while the card
+   *  body and its plain Open button keep browsing the run view alone
+   *  (`openTask`). Any other task opens exactly like `openTask`. Stable
+   *  identity — passed to the memoized `Column`/`TaskCard`. */
+  const openAttention = useCallback((t: Task) => {
+    if (t.pipelineId) {
+      openPipelineAttention(t.id);
+      return;
+    }
+    openTask(t);
+  }, [openPipelineAttention, openTask]);
 
   // Fade out the boot splash (defined in index.html) once React has mounted,
   // with a minimum dwell so fast machines don't flash a 200ms splash. Not
@@ -836,9 +936,16 @@ function AppInner() {
   // task is noise — they're already looking at the prompt. Clearing it also
   // removes one more high-z-index click target that could otherwise sit on
   // top of the panel header and eat clicks meant for the X button.
+  // A pipeline step that is itself asking also clears its parent's toast:
+  // a step's "Waiting on you" toast is retargeted at (and keyed by) the
+  // pipeline parent, so dismissing by the step id alone would leave it up
+  // over the very panel answering it.
   useEffect(() => {
     if (!selected) return;
     dismissPending(selected.id);
+    if (selected.pipelineParentId && selected.pendingInteractionCount > 0) {
+      dismissPending(selected.pipelineParentId);
+    }
   }, [selected?.id]);
 
   // Mark-seen wiring for the unread-bullet indicator (see TaskCard's corner
@@ -1022,11 +1129,14 @@ function AppInner() {
       }
       if (ev.type === "open_task") {
         // A native notification deep-link (`agetor://task/<id>`) was
-        // clicked. Open that task via `openTask` (m5) — a pipeline PARENT
-        // routes to its full-page run view instead of the run panel, same
-        // as a board card click — fetching a fresh task list first if it
-        // isn't loaded yet (e.g. the task was just created and hasn't been
-        // picked up by the 2s poll). Mirrors the onOpen idiom in the
+        // clicked. Open that task via `openTask` (m5) — fetching a fresh
+        // task list first if it isn't loaded yet (e.g. the task was just
+        // created and hasn't been picked up by the 2s poll). A pipeline
+        // PARENT goes through `openPipelineAttention` instead: its run view
+        // plus the step that needs the user, if any. The link carries only
+        // the parent id, so it can't tell which notification was clicked —
+        // a "finished" one simply finds nothing waiting and lands on the
+        // run view alone. Mirrors the onOpen idiom in the
         // GlobalEvent handler below, but this handler closes over its own
         // scope, so the fresh list has to be fetched directly rather than
         // relying on `tasksRef` updating synchronously after `setTasks`. No
@@ -1035,7 +1145,8 @@ function AppInner() {
         // itself, so a second call would be redundant.
         const fresh = findTaskById(tasksRef.current, ev.taskId);
         if (fresh) {
-          openTask(fresh);
+          if (fresh.pipelineId) openPipelineAttention(fresh.id);
+          else openTask(fresh);
           return;
         }
         void (async () => {
@@ -1044,7 +1155,10 @@ function AppInner() {
             setTasks(list);
             const found = findTaskById(list, ev.taskId);
             if (found) {
-              openTask(found);
+              // `tasksRef` only catches up with `setTasks` after the next
+              // commit, so the resolver reads the list just fetched.
+              if (found.pipelineId) openPipelineAttention(found.id, { tasks: list });
+              else openTask(found);
             }
             // else: silently no-op — the task doesn't exist (deleted?).
           } catch {
@@ -1080,7 +1194,7 @@ function AppInner() {
       });
     });
     return cancel;
-  }, [confirm, refreshAgentModels, refreshHarnessModels, openTask]);
+  }, [confirm, refreshAgentModels, refreshHarnessModels, openTask, openPipelineAttention]);
 
   // App-wide lifecycle subscription. Drives toasts + native notifications.
   //
@@ -1134,8 +1248,9 @@ function AppInner() {
       // before any of the gating below — so the pipeline run view and the
       // RunPanel's pipeline strip get every event without opening a second
       // permanent `EventSource` (WKWebView's ~6-per-host connection cap; see
-      // `lib/pipeline-events.ts`).
-      if (ev.kind === "pipeline" || ev.kind === "column" || ev.kind === "run-status") {
+      // `lib/pipeline-events.ts`). `interaction` lets the run view repaint a
+      // step's amber "waiting on you" highlight the moment it asks.
+      if (ev.kind === "pipeline" || ev.kind === "column" || ev.kind === "run-status" || ev.kind === "interaction") {
         publishPipelineGlobalEvent(ev);
       }
       // Update events are app-scoped, not task-scoped — handle them before
@@ -1195,7 +1310,7 @@ function AppInner() {
               isSelected: viewingTask(stepParentId),
               isFocused,
               onOpen: () => {
-                openPipelineRun(stepParentId);
+                openPipelineStep(stepParentId, ev.taskId);
                 void api.focusWindow();
               },
             };
@@ -1210,7 +1325,23 @@ function AppInner() {
         const tracker = pendingInputRef.current;
         if (ev.state === "pending") {
           if (tracker.add(target.taskId, ev.interactionId)) {
-            notifyWaitingInput(target);
+            // The retargeted step toast names the exact step that asked, so
+            // its Open is an ATTENTION landing (run view + that step's panel,
+            // or another step that still needs the user once this one is
+            // answered, plus dismissing this toast). `files-sent`/
+            // `fx-auto-resume` below reuse `target`, whose Open lands on the
+            // named step unconditionally and leaves this toast alone.
+            notifyWaitingInput(
+              stepParentId
+                ? {
+                    ...target,
+                    onOpen: () => {
+                      openPipelineAttention(stepParentId, { stepTaskId: ev.taskId });
+                      void api.focusWindow();
+                    },
+                  }
+                : target,
+            );
           }
         } else if (tracker.remove(target.taskId, ev.interactionId)) {
           dismissPending(target.taskId);
@@ -1354,7 +1485,19 @@ function AppInner() {
           // "Pipeline needs you" for the same block would be noise (and a
           // second OS notification).
           if (!hasPendingToast(ev.taskId)) {
-            toastPending({ taskId: ev.taskId, title, subtitle: "Pipeline needs you", isSelected, isFocused, onOpen });
+            toastPending({
+              taskId: ev.taskId,
+              title,
+              subtitle: "Pipeline needs you",
+              isSelected,
+              isFocused,
+              // Lands on the run view plus the step that needs the user
+              // (resolved at click time), not the run view alone.
+              onOpen: () => {
+                openPipelineAttention(ev.taskId);
+                void api.focusWindow();
+              },
+            });
           }
         } else {
           toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
@@ -1370,12 +1513,13 @@ function AppInner() {
     };
     const cancel = api.subscribeGlobalEvents(handle);
     return cancel;
-    // `openTask`, `openPipelineRun` and `mergeTaskFields` all have stable
-    // identities (the first two read `view`/`pipelineEditorDirty` via refs
-    // rather than depending on them directly — see `viewRef`'s doc comment
-    // above) — listing them doesn't cause a resubscribe, it just keeps this
-    // effect honest about what it closes over.
-  }, [openTask, openPipelineRun, mergeTaskFields]);
+    // `openTask`, `openPipelineStep`, `openPipelineAttention` and
+    // `mergeTaskFields` all have stable identities (the first three read
+    // `view`/`pipelineEditorDirty` via refs rather than depending on them
+    // directly — see `viewRef`'s doc comment above) — listing them doesn't
+    // cause a resubscribe, it just keeps this effect honest about what it
+    // closes over.
+  }, [openTask, openPipelineStep, openPipelineAttention, mergeTaskFields]);
 
   // Hidden pipeline STEP tasks never count toward anything user-facing (D11,
   // `docs/plans/pipelines.md`) — the header's "N of M tasks" count and the
@@ -1548,10 +1692,12 @@ function AppInner() {
     if (!col) return;
     const t = tasksRef.current.find((x) => x.id === id);
     if (!t || t.column === col) return;
-    // A pipeline PARENT's column is runner-owned (mirrors `pipelineRun.status`;
-    // the server 409s a `column` patch on it) — refuse the drop and say why,
-    // instead of an optimistic flip that snaps back with a raw 409 (L-A4).
-    if (t.pipelineId) {
+    // A pipeline PARENT's column mirrors its run while that run is in
+    // progress (the server 409s any other column patch). Once the run
+    // status is `done`, dropping the card on Done is the same park the
+    // Done buttons perform. Every other drop stays refused — an optimistic
+    // flip would 409 and snap back (L-A4).
+    if (t.pipelineId && !(col === "done" && t.pipelineRun?.status === "done")) {
       toast("This pipeline task's column is managed by its run.");
       return;
     }
@@ -2219,6 +2365,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                             onCancel={cancel}
                             onDelete={del}
                             onOpen={openTask}
+                            onOpenAttention={openAttention}
                             onDiff={setDiffTask}
                             onMarkDone={markDone}
                             onArchive={archive}
@@ -2327,6 +2474,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               >
                 <PipelineRunView
                   taskId={view.taskId}
+                  onMarkDone={markDone}
                   onOpenTask={(t, opts) => {
                     setFocusSubagent(opts?.subagentId ? { taskId: t.id, id: opts.subagentId, nonce: Date.now(), consumed: false } : null);
                     setSelected(t);

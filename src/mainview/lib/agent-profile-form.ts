@@ -17,3 +17,5 @@ export function agentProfileTextDirty(draft: AgentProfileTextDraft, baseline: Ag
   if (draft.skills.length !== baseline.skills.length) return true;
   return draft.skills.some((skill, i) => skill !== baseline.skills[i]);
 }
+
+export { duplicateAgentName } from "../../shared/duplicate-name.ts";

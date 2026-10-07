@@ -596,7 +596,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
             {view.kind === "section" && "Settings"}
             {view.kind === "templates" && "Add harness"}
             {view.kind === "editor" && (view.harnessId ? "Edit harness" : "Add harness")}
-            {view.kind === "agent-editor" && (view.profileId ? "Edit agent" : "Add agent")}
+            {view.kind === "agent-editor" && (view.profileId ? "Edit agent" : view.duplicateFromId ? "Duplicate agent" : "Add agent")}
           </h2>
         </div>
         <div className="flex items-center gap-2">
@@ -688,6 +688,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       harnesses={payload.harnesses}
                       onAdd={() => setView(openAgentEditor(null))}
                       onEdit={(p) => setView(openAgentEditor(p.id))}
+                      onDuplicate={(p) => setView(openAgentEditor(null, p.id))}
                       onImported={onBundleImported}
                     />
                   );
@@ -760,20 +761,31 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
           {view.kind === "agent-editor" && (
             <div data-testid="agent-profile-editor" className="pt-3 text-sm">
               <AgentProfileForm
-                key={`${openCount}:${view.profileId ?? "new"}`}
+                key={`${openCount}:${view.profileId ?? view.duplicateFromId ?? "new"}`}
                 variant="page"
                 autoFocus
                 profileId={view.profileId}
+                duplicateFromId={view.duplicateFromId}
                 onDirtyChange={(dirty) => {
                   subpageDirtyRef.current = dirty;
                 }}
                 onCancel={() => setView(backFromSubview(viewRef.current))}
+                onDuplicate={() => {
+                  const current = viewRef.current;
+                  if (current.kind !== "agent-editor" || !current.profileId) return;
+                  const id = current.profileId;
+                  void leaveSubpage(() => setView(openAgentEditor(null, id)));
+                }}
                 onSaved={() => {
                   // The user may have left (rail click, Escape-pop) while the
                   // save was in flight — only pop if this editor is still the
                   // one showing.
                   const current = viewRef.current;
-                  if (current.kind === "agent-editor" && current.profileId === view.profileId) {
+                  if (
+                    current.kind === "agent-editor" &&
+                    current.profileId === view.profileId &&
+                    current.duplicateFromId === view.duplicateFromId
+                  ) {
                     setView(backFromSubview(current));
                   }
                 }}

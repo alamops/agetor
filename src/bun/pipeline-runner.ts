@@ -252,11 +252,11 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
   }
   // L-R4: the status this parent's row held BEFORE this write — the column
   // below is mirrored only on an actual status TRANSITION, never on every
-  // persist. A user who parked a `done`/`cancelled` pipeline card somewhere
-  // else on the board (Done, say) must not have an unrelated persist (a
-  // join bookkeeping write, a reminder stamp, a reconcile pass) snap the
-  // card back to `review`/`ready`. `server.ts` separately 409s a column
-  // PATCH on a parent whose run is live; both guards stay.
+  // persist. A user who parked a finished (`status === "done"`) pipeline
+  // card in the Done column must not have an unrelated persist (a join
+  // bookkeeping write, a reminder stamp, a reconcile pass) snap the card
+  // back to `review`. `server.ts` allows that one park (`column: "done"`
+  // while status is already `done`) and 409s every other column change.
   const previousStatus = tasks.get(parentId)?.pipelineRun?.status ?? null;
   tasks.setPipelineRun(parentId, run);
   const parent = tasks.get(parentId);
@@ -2614,8 +2614,11 @@ export function initPipelineRunner(): void {
 
 /** Test-only seam (`pipeline-runner.test.ts`) — see `listenerEnabled`'s doc
  *  above and `handleRunStatus`'s own doc for why a test needs to call it
- *  directly to simulate a missed settle. Never imported outside this
- *  module's own test file. */
+ *  directly to simulate a missed settle. `persist` is here so a test can
+ *  replay a same-status bookkeeping write and check a parked Done card is
+ *  not snapped back to Review. `setBeforeReminderSend` lets a test inject a
+ *  successor between the reminder being queued and `sendInput`. Never
+ *  imported outside this module's own test file. */
 export const __forTest = {
   setListenerEnabled(enabled: boolean): void {
     listenerEnabled = enabled;
@@ -2625,4 +2628,5 @@ export const __forTest = {
   setBeforeReminderSend(hook: (() => Promise<void> | void) | null): void {
     beforeReminderSend = hook;
   },
+  persist,
 };

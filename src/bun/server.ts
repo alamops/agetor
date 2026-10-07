@@ -239,6 +239,8 @@ import {
 } from "./bundle.ts";
 import { pickedPaths, singlePickedPath } from "./native-pick.ts";
 import type { AgentProfilePatch } from "./db.ts";
+import { duplicateAgentName } from "../shared/duplicate-name.ts";
+import { duplicateAgentProfile } from "./duplicate-agent-profile.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
 // `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
@@ -4067,6 +4069,103 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
         }),
       },
 
+      // Copy a profile (and, with `copyTasks`, its live tasks). Omitted fields
+      // come from the source; the merged result goes through the same
+      // validators as POST. docs/plans/duplicate-agent-leftovers.md
+      "/agent-profiles/:id/duplicate": {
+        POST: authed(async (req) => {
+          const bad = (error: string, status = 400) =>
+            json({ error }, { status, headers: corsHeaders(req) });
+          const source = agentProfiles.get(req.params.id);
+          if (!source) return bad("not found", 404);
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) return bad("invalid body");
+          const body = raw as Record<string, unknown>;
+
+          for (const key of ["copyTasks", "fast", "maxMode"]) {
+            if (key in body && typeof body[key] !== "boolean") return bad(`${key} must be a boolean`);
+          }
+
+          const name =
+            "name" in body
+              ? typeof body.name === "string"
+                ? body.name.trim()
+                : ""
+              : duplicateAgentName(source.name, agentProfiles.list().map((p) => p.name));
+          const nameError = agentProfileNameError(name);
+          if (nameError) return bad(nameError);
+
+          let harnessId = source.harness;
+          if ("harness" in body) {
+            const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
+            if (!harnessRef) return bad("harness required");
+            const harness = harnesses.getByIdOrKind(harnessRef);
+            if (!harness) return bad(`unknown harness "${harnessRef}"`);
+            harnessId = harness.id;
+          }
+
+          const model = "model" in body ? (typeof body.model === "string" ? body.model.trim() : "") : source.model;
+          const modelError = agentProfileModelError(model);
+          if (modelError) return bad(modelError);
+
+          const optionalError =
+            ("effort" in body ? agentProfileOptionalFieldError(body.effort, "effort") : null) ??
+            ("mode" in body ? agentProfileOptionalFieldError(body.mode, "mode") : null);
+          if (optionalError) return bad(optionalError);
+
+          if ("instructions" in body && typeof body.instructions !== "string") {
+            return bad("instructions must be a string");
+          }
+          const instructions = "instructions" in body ? (body.instructions as string) : source.instructions;
+          const instructionsError = agentProfileInstructionsError(instructions);
+          if (instructionsError) return bad(instructionsError);
+
+          let skills = source.skills;
+          if ("skills" in body) {
+            const parsedSkills = parseSkillsBody(body.skills);
+            if ("error" in parsedSkills) return bad(parsedSkills.error);
+            skills = parsedSkills.skills;
+          }
+
+          // Each copied worktree task resolves a git ref inside createTask.
+          // A profile with many of those can outlast Bun's 255s idle ceiling,
+          // which would kill the handler after the profile row already exists.
+          // Opt out for the copy itself. The CLI waits on a matching long
+          // timeout so it hears this response instead of retrying into a
+          // second profile.
+          if (body.copyTasks === true) server.timeout(req, 0);
+          try {
+            const result = await duplicateAgentProfile(
+              source.id,
+              {
+                name,
+                harness: harnessId,
+                model,
+                effort: "effort" in body ? agentProfileOptionalField(body.effort) : source.effort,
+                mode: "mode" in body ? agentProfileOptionalField(body.mode) : source.mode,
+                fast: "fast" in body ? body.fast === true : source.fast,
+                maxMode: "maxMode" in body ? body.maxMode === true : source.maxMode,
+                instructions,
+                skills,
+              },
+              body.copyTasks === true,
+            );
+            if ("notFound" in result) return bad("not found", 404);
+            return json(
+              {
+                profile: withTaskCount(result.profile),
+                copiedTasks: result.copiedTasks,
+                taskCopyErrors: result.taskCopyErrors,
+              },
+              { status: 201, headers: corsHeaders(req) },
+            );
+          } catch (e) {
+            if (e instanceof AgentProfileNameError) return bad(e.message, 409);
+            return bad((e as Error).message);
+          }
+        }),
+      },
+
       "/agent-profiles/:id": {
         GET: authed((req) => {
           const p = agentProfiles.get(req.params.id);
@@ -4805,6 +4904,13 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
         PATCH: authed(async (req) => {
+          // Parse first, then load the row. Every guard below — the archived
+          // freeze and the pipeline Done park especially — has to see the
+          // task as it is after this await. A Restart (or any status-changing
+          // persist) can land during the parse and move the column; a
+          // snapshot taken beforehand would still treat the run as `done`
+          // and write `column: "done"` onto a run that is no longer finished.
+          const patch = filterPatch(await req.json());
           const before = tasks.get(req.params.id);
           if (!before) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -4820,7 +4926,6 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const patch = filterPatch(await req.json());
           // A pipeline step task's `column` is managed entirely by the
           // pipeline runner (D9, docs/plans/pipelines.md) — it flips as the
           // step's own run settles, and letting a direct PATCH drag it to a
@@ -4836,14 +4941,24 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           }
           // M-S4: a pipeline PARENT's column mirrors its run status
           // (`persist()` in pipeline-runner.ts — running/blocked/review/
-          // ready) — a manual drag would desync the card from the run and
-          // trip `handleColumnChange`. A same-value resend is a no-op and
-          // passes, like the profile-bound-field guard below.
+          // ready). A manual move of a live run would desync the card from
+          // the run. Once the run has finished (`status === "done"`), the
+          // user may park the card in the Done column — the card's Done
+          // button, the run view's Done button, a drag onto Done, and
+          // `agetor move`. `persist()` only mirrors the column on a status
+          // transition, so that park survives later bookkeeping writes and
+          // a Restart (a real status change) still pulls the card back.
+          // A same-value resend is a no-op and passes, like the
+          // profile-bound-field guard below. Every other column change
+          // stays refused.
           if (before.pipelineId != null && "column" in patch && patch.column !== before.column) {
-            return json(
-              { error: "pipeline task's column is managed by its run" },
-              { status: 409, headers: corsHeaders(req) },
-            );
+            const parkingFinished = before.pipelineRun?.status === "done" && patch.column === "done";
+            if (!parkingFinished) {
+              return json(
+                { error: "pipeline task's column is managed by its run" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
           }
           // A task bound to an agent profile (docs/plans/agent-profiles.md
           // D5) has its agent/mode/model/effort/fast/maxMode locked — the

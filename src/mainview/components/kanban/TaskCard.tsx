@@ -6,6 +6,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { abbreviateHome, cn } from "@/lib/utils";
+import { AWAITING_RING_CLASS, awaitingLabel as awaitingLabelFor } from "@/lib/awaiting";
+import { AwaitingGlow } from "@/components/ui/awaiting-glow";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { useCountdown, fxPausedBadgeText, fxPausedBadgeTitle } from "@/lib/fx-auto-resume";
 import { taskTypeMeta, type Task } from "../../../shared/types.ts";
@@ -21,6 +23,13 @@ interface Props {
   onCancel: (t: Task) => void;
   onDelete: (t: Task) => void;
   onOpen: (t: Task) => void;
+  /** The amber "waiting on you" button (Answer / Answer (N) / Review). Kept
+   *  separate from `onOpen` because the two land differently for a
+   *  pipeline parent: the card body and the plain Open button browse the
+   *  run view, while this one also opens the step that needs the user
+   *  (App.tsx's `openAttention`). For any other task App routes both to the
+   *  same `openTask`. */
+  onOpenAttention: (t: Task) => void;
   onDiff: (t: Task) => void;
   onMarkDone: (t: Task) => void;
   onArchive: (t: Task) => void;
@@ -36,7 +45,7 @@ interface Props {
   onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
 }
 
-function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu }: Props) {
+function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOpenAttention, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu }: Props) {
   const archived = task.archivedAt != null;
   // `fx-paused-badge`'s live countdown (see the badge below) — called
   // unconditionally, before any conditional return, so hook order stays
@@ -86,14 +95,13 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   // panel — but it represents the same "waiting on you" state to the user.
   // When the only signal is `blocked` (no structured questions), we label the
   // call-to-action "Review" instead of "Answer" to avoid promising a Q&A flow
-  // the panel can't deliver.
+  // the panel can't deliver. The wording, ring and glow are shared with
+  // the pipeline run view's step nodes (`@/lib/awaiting`, `AwaitingGlow`)
+  // so a step that needs the user reads exactly like this card.
   const pendingCount = task.pendingInteractionCount;
   const blocked = task.column === "blocked";
   const awaiting = pendingCount > 0 || blocked;
-  const awaitingLabel =
-    pendingCount > 1 ? `Answer (${pendingCount})`
-    : pendingCount === 1 ? "Answer"
-    : "Review";
+  const awaitingLabel = awaitingLabelFor(pendingCount);
 
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);
@@ -107,7 +115,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         "relative cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
         type.borderClass,
         isDragging && "opacity-50",
-        awaiting && "ring-2 ring-warning/60 ring-offset-2 ring-offset-background",
+        awaiting && AWAITING_RING_CLASS,
         archived && "cursor-default opacity-60",
       )}
       // `onClick` (open) stays untouched by the addition below — a
@@ -297,7 +305,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
             <Button
               size="sm"
               className="gap-1 bg-amber-500 text-amber-950 hover:bg-amber-500/90 focus-visible:ring-amber-500"
-              onClick={() => onOpen(task)}
+              onClick={() => onOpenAttention(task)}
               title={pendingCount > 0 ? "Open run panel to answer" : "Agent is waiting on you — open the run panel"}
             >
               <MessageCircleQuestion className="size-3" />
@@ -350,21 +358,9 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
           </Button>
         </div>
       </CardContent>
-      {/* The "waiting on you" glow. A separate overlay whose OPACITY pulses,
-          rather than animating `filter: drop-shadow` on the card itself:
-          filter animations re-rasterize the whole card on the CPU every
-          frame (60–120 Hz, for as long as the card is awaiting), whereas an
-          opacity animation is compositor-only. The shadow is static and
-          paints outside the overlay's box, so the overlay is invisible over
-          the card's own content and `pointer-events-none` keeps clicks and
-          drags untouched. */}
-      {awaiting && (
-        <span
-          aria-hidden
-          className="pointer-events-none absolute inset-0 rounded-[inherit] animate-awaiting-pulse motion-reduce:animate-none"
-          style={{ boxShadow: "0 0 14px hsl(var(--warning) / 0.85)" }}
-        />
-      )}
+      {/* The "waiting on you" glow — an opacity-pulsed overlay (see
+          `AwaitingGlow` for why it isn't a filter/box-shadow animation). */}
+      {awaiting && <AwaitingGlow />}
     </Card>
   );
 }

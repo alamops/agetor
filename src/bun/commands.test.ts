@@ -909,3 +909,245 @@ describe("branch-scoped capability discovery (ref mode)", () => {
     expect(dup!.source).toBe("project");
   });
 });
+
+// ---------------------------------------------------------------------------
+// cursor / fx skill discovery
+// ---------------------------------------------------------------------------
+
+function writeSkill(root: string, rel: string, name: string, description: string) {
+  writeCmd(path.join(root, rel, name), "SKILL.md", `---\ndescription: ${description}\n---\nbody`);
+}
+
+describe("cursor / fx skill discovery", () => {
+  const find = (all: Awaited<ReturnType<typeof listAvailableCommands>>, n: string) =>
+    all.filter((c) => c.name === n);
+
+  test("cursor sees a skill in each user root and in skills-cursor", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "cur-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "cur-proj-"));
+    const roots = [".cursor/skills", ".claude/skills", ".codex/skills", ".grok/skills", ".agents/skills"];
+    roots.forEach((r, i) => writeSkill(home, r, `cur-root-${i}-zq`, `root ${i}`));
+    writeSkill(home, ".cursor/skills-cursor", "cur-builtin-zq", "builtin one");
+
+    const all = await listAvailableCommands({ agent: "cursor", workdir: project, harnessHome: home });
+    roots.forEach((_, i) => {
+      const hit = find(all, `/cur-root-${i}-zq`);
+      expect(hit).toHaveLength(1);
+      expect(hit[0]!.source).toBe("user");
+    });
+    const b = find(all, "/cur-builtin-zq");
+    expect(b).toHaveLength(1);
+    expect(b[0]!.source).toBe("builtin");
+  });
+
+  test("cursor: user skill beats same-named builtin", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "cur-bi-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "cur-bi-proj-"));
+    writeSkill(home, ".cursor/skills-cursor", "cur-shared-zq", "from builtin");
+    writeSkill(home, ".claude/skills", "cur-shared-zq", "from user");
+
+    const all = await listAvailableCommands({ agent: "cursor", workdir: project, harnessHome: home });
+    const hit = find(all, "/cur-shared-zq");
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.source).toBe("user");
+    expect(hit[0]!.description).toBe("from user");
+  });
+
+  test("cursor: duplicate user copies collapse, earlier dir wins", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "cur-dup-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "cur-dup-proj-"));
+    writeSkill(home, ".agents/skills", "cur-dup-zq", "from agents");
+    writeSkill(home, ".cursor/skills", "cur-dup-zq", "from cursor");
+
+    const all = await listAvailableCommands({ agent: "cursor", workdir: project, harnessHome: home });
+    const hit = find(all, "/cur-dup-zq");
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.description).toBe("from cursor");
+  });
+
+  test("cursor: project skill replaces user skill of the same name", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "cur-pr-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "cur-pr-proj-"));
+    writeSkill(home, ".cursor/skills", "cur-proj-zq", "from user");
+    writeSkill(project, ".cursor/skills", "cur-proj-zq", "from project");
+
+    const all = await listAvailableCommands({ agent: "cursor", workdir: project, harnessHome: home });
+    const hit = find(all, "/cur-proj-zq");
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.source).toBe("project");
+    expect(hit[0]!.description).toBe("from project");
+  });
+
+  test("fx sees user opencode dir and project .fx, bare skills, .opencode, .claw", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "fx-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "fx-proj-"));
+    writeSkill(home, ".config/opencode/skills", "fx-user-oc-zq", "u");
+    writeSkill(home, ".claw/skills", "fx-user-claw-zq", "u");
+    writeSkill(project, ".fx/skills", "fx-proj-fx-zq", "p");
+    writeSkill(project, "skills", "fx-proj-bare-zq", "p");
+    writeSkill(project, ".opencode/skills", "fx-proj-oc-zq", "p");
+    writeSkill(project, ".claw/skills", "fx-proj-claw-zq", "p");
+
+    const all = await listAvailableCommands({ agent: "fx", workdir: project, harnessHome: home });
+    for (const n of ["fx-user-oc-zq", "fx-user-claw-zq"]) {
+      expect(find(all, `/${n}`)[0]?.source).toBe("user");
+    }
+    for (const n of ["fx-proj-fx-zq", "fx-proj-bare-zq", "fx-proj-oc-zq", "fx-proj-claw-zq"]) {
+      expect(find(all, `/${n}`)[0]?.source).toBe("project");
+    }
+  });
+
+  test("fx: project skill replaces user skill of the same name", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "fx-pr-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "fx-pr-proj-"));
+    writeSkill(home, ".fx/skills", "fx-shared-zq", "from user");
+    writeSkill(project, "skills", "fx-shared-zq", "from project");
+
+    const all = await listAvailableCommands({ agent: "fx", workdir: project, harnessHome: home });
+    const hit = find(all, "/fx-shared-zq");
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.source).toBe("project");
+    expect(hit[0]!.description).toBe("from project");
+  });
+
+  test("cursor mcp.json: user and project rows, project wins, secrets stay out of the description", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "cur-mcp-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "cur-mcp-proj-"));
+    writeCmd(
+      path.join(home, ".cursor"),
+      "mcp.json",
+      JSON.stringify({
+        mcpServers: {
+          "user-stdio-zq": { command: "true", env: { TOKEN: "secret-env" } },
+          "shared-mcp-zq": { command: "from-user" },
+        },
+      }),
+    );
+    writeCmd(
+      path.join(project, ".cursor"),
+      "mcp.json",
+      JSON.stringify({
+        mcpServers: {
+          "proj-http-zq": { url: "https://example.test/mcp", headers: { Authorization: "secret-token" } },
+          "shared-mcp-zq": { command: "from-project" },
+        },
+      }),
+    );
+
+    const exts = await listExtensions({ agent: "cursor", workdir: project, harnessHome: home });
+    const mcp = (name: string) => exts.filter((e) => e.kind === "mcp" && e.name === name);
+
+    const user = mcp("user-stdio-zq");
+    expect(user).toHaveLength(1);
+    expect(user[0]!.source).toBe("user");
+    expect(user[0]!.insert).toBe("@user-stdio-zq");
+    expect(user[0]!.description).toBe("stdio · true");
+    expect(user[0]!.description).not.toContain("secret-env");
+
+    const proj = mcp("proj-http-zq");
+    expect(proj).toHaveLength(1);
+    expect(proj[0]!.source).toBe("project");
+    expect(proj[0]!.insert).toBe("@proj-http-zq");
+    expect(proj[0]!.description).toBe("http · example.test");
+    expect(proj[0]!.description).not.toContain("secret-token");
+
+    const shared = mcp("shared-mcp-zq");
+    expect(shared).toHaveLength(1);
+    expect(shared[0]!.source).toBe("project");
+    expect(shared[0]!.description).toBe("stdio · from-project");
+  });
+
+  test("harnessEnv.HOME overrides harnessHome for mcp.json", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "cur-mcp-env-a-"));
+    const envHome = mkdtempSync(path.join(tmpRoot, "cur-mcp-env-b-"));
+    const project = mkdtempSync(path.join(tmpRoot, "cur-mcp-env-proj-"));
+    writeCmd(path.join(home, ".cursor"), "mcp.json", JSON.stringify({ mcpServers: { "from-harness-zq": { command: "h" } } }));
+    writeCmd(path.join(envHome, ".cursor"), "mcp.json", JSON.stringify({ mcpServers: { "from-env-zq": { command: "e" } } }));
+
+    const exts = await listExtensions({
+      agent: "cursor",
+      workdir: project,
+      harnessHome: home,
+      harnessEnv: { HOME: envHome },
+    });
+    const names = exts.filter((e) => e.kind === "mcp").map((e) => e.name);
+    expect(names).toContain("from-env-zq");
+    expect(names).not.toContain("from-harness-zq");
+  });
+
+  test("harnessEnv.HOME overrides harnessHome", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "env-home-a-"));
+    const envHome = mkdtempSync(path.join(tmpRoot, "env-home-b-"));
+    const project = mkdtempSync(path.join(tmpRoot, "env-proj-"));
+    writeSkill(home, ".cursor/skills", "env-from-harness-zq", "h");
+    writeSkill(envHome, ".cursor/skills", "env-from-env-zq", "e");
+
+    const all = await listAvailableCommands({
+      agent: "cursor",
+      workdir: project,
+      harnessHome: home,
+      harnessEnv: { HOME: envHome },
+    });
+    expect(find(all, "/env-from-env-zq")).toHaveLength(1);
+    expect(find(all, "/env-from-harness-zq")).toHaveLength(0);
+  });
+
+  describe("branch ref", () => {
+    let repo: string;
+    beforeAll(async () => {
+      repo = mkdtempSync(path.join(tmpRoot, "cur-branch-repo-"));
+      await branchGitOk(["init", "-q", "-b", "main"], repo);
+      await branchGitOk(["config", "user.email", "test@example.com"], repo);
+      await branchGitOk(["config", "user.name", "test"], repo);
+      await branchGitOk(["config", "commit.gpgsign", "false"], repo);
+      writeCmd(repo, "README.md", "hello\n");
+      await branchGitOk(["add", "."], repo);
+      await branchGitOk(["commit", "-q", "-m", "init"], repo);
+      await branchGitOk(["checkout", "-q", "-b", "feature/cur"], repo);
+      writeSkill(repo, ".cursor/skills", "on-ref", "committed on ref");
+      writeCmd(
+        path.join(repo, ".cursor"),
+        "mcp.json",
+        JSON.stringify({ mcpServers: { "mcp-on-ref": { command: "committed" } } }),
+      );
+      await branchGitOk(["add", "."], repo);
+      await branchGitOk(["commit", "-q", "-m", "skill"], repo);
+      await branchGitOk(["checkout", "-q", "main"], repo);
+      writeSkill(repo, ".cursor/skills", "uncommitted-zq", "disk only");
+      writeCmd(
+        path.join(repo, ".cursor"),
+        "mcp.json",
+        JSON.stringify({ mcpServers: { "mcp-dirty-zq": { command: "dirty" } } }),
+      );
+    });
+
+    test("offers committed cursor skill, hides uncommitted one", async () => {
+      const home = mkdtempSync(path.join(tmpRoot, "cur-branch-home-"));
+      const all = await listAvailableCommands({
+        agent: "cursor",
+        workdir: repo,
+        branch: "feature/cur",
+        harnessHome: home,
+      });
+      const hit = find(all, "/on-ref");
+      expect(hit).toHaveLength(1);
+      expect(hit[0]!.source).toBe("project");
+      expect(find(all, "/uncommitted-zq")).toHaveLength(0);
+    });
+
+    test("offers committed .cursor/mcp.json and hides an uncommitted one", async () => {
+      const home = mkdtempSync(path.join(tmpRoot, "cur-mcp-branch-home-"));
+      const exts = await listExtensions({
+        agent: "cursor",
+        workdir: repo,
+        branch: "feature/cur",
+        harnessHome: home,
+      });
+      const hit = exts.filter((e) => e.kind === "mcp" && e.name === "mcp-on-ref");
+      expect(hit).toHaveLength(1);
+      expect(hit[0]!.source).toBe("project");
+      expect(hit[0]!.insert).toBe("@mcp-on-ref");
+      expect(exts.filter((e) => e.kind === "mcp" && e.name === "mcp-dirty-zq")).toHaveLength(0);
+    });
+  });
+});
