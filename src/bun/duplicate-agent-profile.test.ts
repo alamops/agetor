@@ -185,6 +185,16 @@ test("copyTasks omitted copies zero tasks", async () => {
   expect((await getProfile(body.profile.id)).taskCount).toBe(0);
 });
 
+test("non-string instructions is 400 and writes nothing", async () => {
+  const src = await createProfile();
+  const n = await listCount();
+  const res = await dup(src.id, { instructions: 1 });
+  expect(res.status).toBe(400);
+  expect(await listCount()).toBe(n);
+  const kept = await getProfile(src.id);
+  expect(kept.instructions).toBe(src.instructions);
+});
+
 test("explicit name and model override win", async () => {
   const src = await createProfile();
   const res = await dup(src.id, { name: "Renamed", model: "sonnet-5" });

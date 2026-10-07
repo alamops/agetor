@@ -37,6 +37,7 @@ describe("duplicateAgentName", () => {
   test("1000 colliding names does not throw", () => {
     const names = ["X (copy)"];
     for (let n = 2; n <= 1000; n++) names.push(`X (copy ${n})`);
-    expect(() => duplicateAgentName("X", names)).not.toThrow();
+    const result = duplicateAgentName("X", names);
+    expect(names.map((n) => n.trim().toLowerCase())).not.toContain(result.trim().toLowerCase());
   });
 });

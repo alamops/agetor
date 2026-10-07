@@ -324,15 +324,13 @@ function AgentProfileFormBody({
         saved = profileId ? await api.updateAgentProfile(profileId, input) : await api.createAgentProfile(input);
       }
       await refreshProfiles();
-      if (mountedRef.current) {
-        if (copyErrors.length > 0) {
-          const first = copyErrors[0]?.error ?? "";
-          toast.error(
-            `${copyErrors.length} task${copyErrors.length === 1 ? "" : "s"} couldn't be copied${first ? `: ${first}` : ""}`,
-          );
-        }
-        onSaved(saved);
+      if (copyErrors.length > 0) {
+        const first = copyErrors[0]?.error ?? "";
+        toast.error(
+          `${copyErrors.length} task${copyErrors.length === 1 ? "" : "s"} couldn't be copied${first ? `: ${first}` : ""}`,
+        );
       }
+      if (mountedRef.current) onSaved(saved);
     } catch (e) {
       if (mountedRef.current) setSaveError(e instanceof Error ? e.message : String(e));
     } finally {

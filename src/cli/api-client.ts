@@ -391,13 +391,26 @@ export class AgetorClient {
   }
   /** `POST /agent-profiles/:id/duplicate` — 404 unknown source, 409 name clash.
    *  Task-copy failures come back in `taskCopyErrors`, not as an error. */
-  duplicateAgentProfile(id: string, input: DuplicateAgentProfileInput): Promise<DuplicateAgentProfileResult> {
-    return this.req(
-      "POST",
-      `/agent-profiles/${encodeURIComponent(id)}/duplicate`,
-      input,
-      input.copyTasks ? DUPLICATE_WITH_TASKS_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
-    );
+  async duplicateAgentProfile(id: string, input: DuplicateAgentProfileInput): Promise<DuplicateAgentProfileResult> {
+    try {
+      return await this.req(
+        "POST",
+        `/agent-profiles/${encodeURIComponent(id)}/duplicate`,
+        input,
+        input.copyTasks ? DUPLICATE_WITH_TASKS_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
+      );
+    } catch (e) {
+      // The server may already have inserted the profile (and any task copies)
+      // before the socket dropped. A blind retry would create another one.
+      if (e instanceof ApiError && e.status === 0) {
+        throw new ApiError(
+          0,
+          e.body,
+          `${e.message} — the copy may have been created; check the profile list before retrying`,
+        );
+      }
+      throw e;
+    }
   }
   /** `PATCH /agent-profiles/:id` — same validation as create. */
   patchAgentProfile(id: string, patch: Partial<AgentProfileInput>): Promise<AgentProfile> {

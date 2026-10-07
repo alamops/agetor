@@ -1,5 +1,7 @@
 # Plan — Duplicate an agent into a prefilled create form
 
+> **Superseded** by `docs/plans/duplicate-agent-leftovers.md`. Saving a duplicate calls `api.duplicateAgentProfile` (`POST /agent-profiles/:id/duplicate`). That follow-up also shipped the CLI, the edit-page Duplicate button, and optional task copying. Sections 1, 3, and 9 below are the first slice only.
+
 | Field | Value |
 | --- | --- |
 | Date | 2026-10-06 |
@@ -174,6 +176,8 @@ The grill was presented and skipped. Proceeding on these. Each one is reversible
 No one-way decision was scoped out. No data migration, no public API change, no auth change.
 
 ## 9. Completeness ledger
+
+The rows marked out of scope here (CLI, edit-page Duplicate, task copying, and a duplicate route) shipped in `docs/plans/duplicate-agent-leftovers.md`. This ledger is not the current contract.
 
 | Candidate | Disposition |
 | --- | --- |

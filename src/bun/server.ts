@@ -4113,12 +4113,10 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             ("mode" in body ? agentProfileOptionalFieldError(body.mode, "mode") : null);
           if (optionalError) return bad(optionalError);
 
-          const instructions =
-            "instructions" in body
-              ? typeof body.instructions === "string"
-                ? body.instructions
-                : ""
-              : source.instructions;
+          if ("instructions" in body && typeof body.instructions !== "string") {
+            return bad("instructions must be a string");
+          }
+          const instructions = "instructions" in body ? (body.instructions as string) : source.instructions;
           const instructionsError = agentProfileInstructionsError(instructions);
           if (instructionsError) return bad(instructionsError);
 

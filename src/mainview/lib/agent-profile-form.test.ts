@@ -80,6 +80,7 @@ describe("duplicateAgentName", () => {
   test("does not throw with many collisions", () => {
     const taken = ["Bug fixer (copy)"];
     for (let n = 2; n <= 1000; n++) taken.push(`Bug fixer (copy ${n})`);
-    expect(typeof duplicateAgentName("Bug fixer", taken)).toBe("string");
+    const result = duplicateAgentName("Bug fixer", taken);
+    expect(taken.map((n) => n.trim().toLowerCase())).not.toContain(result.trim().toLowerCase());
   });
 });
