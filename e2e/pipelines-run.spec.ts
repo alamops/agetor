@@ -947,6 +947,47 @@ test.describe("pipelines run: executing a run", () => {
     // Restart is offered again once the new run has itself finished.
     await expect(page.getByTestId("pipeline-run-restart")).toBeVisible();
   });
+
+  test("Done column: the run view and the board card park a finished pipeline in Done", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({ id: randomUUID(), name: "A", agentProfileId: profileId });
+    const pipelineId = await createPipelineRest(backend, "Done Pipeline", [A], []);
+    const prompt = `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`;
+    const viewTitle = `Done View ${randomUUID()}`;
+    const cardTitle = `Done Card ${randomUUID()}`;
+    const viewTask = await createPipelineTaskRest(backend, viewTitle, pipelineId, prompt);
+    const cardTask = await createPipelineTaskRest(backend, cardTitle, pipelineId, prompt);
+    await startTaskRest(backend, viewTask.id);
+    await startTaskRest(backend, cardTask.id);
+    await waitForPipelineStatus(backend, viewTask.id, "done");
+    await waitForPipelineStatus(backend, cardTask.id, "done");
+    await waitForColumn(backend, viewTask.id, "review");
+    await waitForColumn(backend, cardTask.id, "review");
+
+    await openPipelineRunFromBoard(page, backend, viewTitle);
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done");
+    await expect(page.getByTestId("pipeline-run-done")).toBeVisible();
+    await page.getByTestId("pipeline-run-done").click();
+    await waitForColumn(backend, viewTask.id, "done");
+    await expect(page.getByTestId("pipeline-run-done")).toHaveCount(0);
+
+    await page.getByTestId("pipeline-run-back").click();
+    const column = (label: string) =>
+      page.locator("div.w-72.shrink-0").filter({
+        has: page.getByRole("heading", { name: label, exact: true }),
+      });
+    const cardIn = (label: string, title: string) =>
+      column(label).locator(".cursor-grab").filter({ has: page.getByText(title, { exact: true }) });
+    await expect(cardIn("Done", viewTitle)).toBeVisible();
+
+    await cardIn("Review", cardTitle).getByRole("button", { name: "Done" }).click();
+    await waitForColumn(backend, cardTask.id, "done");
+    await expect(cardIn("Done", cardTitle)).toBeVisible();
+  });
 });
 
 // ---------------------------------------------------------------------------

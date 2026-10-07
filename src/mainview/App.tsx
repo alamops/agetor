@@ -1692,10 +1692,12 @@ function AppInner() {
     if (!col) return;
     const t = tasksRef.current.find((x) => x.id === id);
     if (!t || t.column === col) return;
-    // A pipeline PARENT's column is runner-owned (mirrors `pipelineRun.status`;
-    // the server 409s a `column` patch on it) — refuse the drop and say why,
-    // instead of an optimistic flip that snaps back with a raw 409 (L-A4).
-    if (t.pipelineId) {
+    // A pipeline PARENT's column mirrors its run while that run is in
+    // progress (the server 409s any other column patch). Once the run
+    // status is `done`, dropping the card on Done is the same park the
+    // Done buttons perform. Every other drop stays refused — an optimistic
+    // flip would 409 and snap back (L-A4).
+    if (t.pipelineId && !(col === "done" && t.pipelineRun?.status === "done")) {
       toast("This pipeline task's column is managed by its run.");
       return;
     }
@@ -2472,6 +2474,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               >
                 <PipelineRunView
                   taskId={view.taskId}
+                  onMarkDone={markDone}
                   onOpenTask={(t, opts) => {
                     setFocusSubagent(opts?.subagentId ? { taskId: t.id, id: opts.subagentId, nonce: Date.now(), consumed: false } : null);
                     setSelected(t);

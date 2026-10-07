@@ -4805,6 +4805,13 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
         PATCH: authed(async (req) => {
+          // Parse first, then load the row. Every guard below — the archived
+          // freeze and the pipeline Done park especially — has to see the
+          // task as it is after this await. A Restart (or any status-changing
+          // persist) can land during the parse and move the column; a
+          // snapshot taken beforehand would still treat the run as `done`
+          // and write `column: "done"` onto a run that is no longer finished.
+          const patch = filterPatch(await req.json());
           const before = tasks.get(req.params.id);
           if (!before) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -4820,7 +4827,6 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const patch = filterPatch(await req.json());
           // A pipeline step task's `column` is managed entirely by the
           // pipeline runner (D9, docs/plans/pipelines.md) — it flips as the
           // step's own run settles, and letting a direct PATCH drag it to a
@@ -4836,14 +4842,24 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           }
           // M-S4: a pipeline PARENT's column mirrors its run status
           // (`persist()` in pipeline-runner.ts — running/blocked/review/
-          // ready) — a manual drag would desync the card from the run and
-          // trip `handleColumnChange`. A same-value resend is a no-op and
-          // passes, like the profile-bound-field guard below.
+          // ready). A manual move of a live run would desync the card from
+          // the run. Once the run has finished (`status === "done"`), the
+          // user may park the card in the Done column — the card's Done
+          // button, the run view's Done button, a drag onto Done, and
+          // `agetor move`. `persist()` only mirrors the column on a status
+          // transition, so that park survives later bookkeeping writes and
+          // a Restart (a real status change) still pulls the card back.
+          // A same-value resend is a no-op and passes, like the
+          // profile-bound-field guard below. Every other column change
+          // stays refused.
           if (before.pipelineId != null && "column" in patch && patch.column !== before.column) {
-            return json(
-              { error: "pipeline task's column is managed by its run" },
-              { status: 409, headers: corsHeaders(req) },
-            );
+            const parkingFinished = before.pipelineRun?.status === "done" && patch.column === "done";
+            if (!parkingFinished) {
+              return json(
+                { error: "pipeline task's column is managed by its run" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
           }
           // A task bound to an agent profile (docs/plans/agent-profiles.md
           // D5) has its agent/mode/model/effort/fast/maxMode locked — the

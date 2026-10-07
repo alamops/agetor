@@ -1176,6 +1176,55 @@ test("PATCH /tasks/:id column on a pipeline PARENT → 409 when it differs; a sa
   expect(((await plainMoved.json()) as Task).column).toBe("ready");
 });
 
+test("PATCH /tasks/:id column on a finished pipeline parent accepts Done and refuses every other column", async () => {
+  const { tasks } = await import("./db.ts");
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const parent = await createTask({ pipelineId: pipeline.id });
+  const stepId = pipeline.graph.steps[0]!.id;
+
+  const finished = {
+    pipelineId: pipeline.id,
+    pipelineName: pipeline.name,
+    snapshot: {
+      graph: pipeline.graph,
+      maxSteps: 25,
+      profiles: {},
+      capturedAt: 1,
+    },
+    active: [],
+    joins: {},
+    blocked: [],
+    history: [
+      { seq: 1, stepId, taskId: "step-task-1", startedAt: 1, endedAt: 2, outcome: "succeeded" as const, handoff: null, nextStepIds: [] },
+    ],
+    stepCount: 1,
+    startedAt: 1,
+    endedAt: 2,
+  };
+  tasks.update(parent.id, { column: "review" });
+  tasks.setPipelineRun(parent.id, { ...finished, status: "done" });
+
+  const elsewhere = await call(`/tasks/${parent.id}`, { method: "PATCH", body: JSON.stringify({ column: "ready" }) });
+  expect(elsewhere.status).toBe(409);
+  expect((await elsewhere.json()).error).toBe("pipeline task's column is managed by its run");
+  expect(((await (await call(`/tasks/${parent.id}`)).json()) as Task).column).toBe("review");
+
+  const parked = await call(`/tasks/${parent.id}`, { method: "PATCH", body: JSON.stringify({ column: "done" }) });
+  expect(parked.status).toBe(200);
+  const parkedBody = (await parked.json()) as Task;
+  expect(parkedBody.column).toBe("done");
+  expect(parkedBody.pipelineRun?.status).toBe("done");
+
+  // A cancelled run sits in Ready and is not parkable in Done.
+  const cancelled = await createTask({ pipelineId: pipeline.id });
+  tasks.update(cancelled.id, { column: "ready" });
+  tasks.setPipelineRun(cancelled.id, { ...finished, status: "cancelled" });
+  const cancelledMove = await call(`/tasks/${cancelled.id}`, { method: "PATCH", body: JSON.stringify({ column: "done" }) });
+  expect(cancelledMove.status).toBe(409);
+  expect(((await (await call(`/tasks/${cancelled.id}`)).json()) as Task).column).toBe("ready");
+});
+
 test("POST /tasks/:id/start on a (non-orphaned) pipeline step task → 409 (M-R5)", async () => {
   const profile = await createProfile();
   const pipeline = await createPipeline(profile.id);
