@@ -405,6 +405,13 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(chips).toHaveCount(1);
     await expect(input).not.toBeFocused();
 
+    // A leading slash is ignored when filtering suggestions.
+    await input.click();
+    await input.fill("/code");
+    await expect(
+      skillsPicker.locator('[data-testid="skills-picker-row"][data-skill="code-review"]'),
+    ).toBeVisible({ timeout: 5_000 });
+
     // Escape closes only the suggestion popover, not the Settings dialog.
     // "code" reliably matches the hardcoded CLAUDE_BUILTINS "/code-review"
     // suggestion regardless of the machine's own ~/.claude contents.

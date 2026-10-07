@@ -307,10 +307,10 @@ function probeKey(h: Harness): string {
   return JSON.stringify([h.id, h.kind, h.home, h.bin, h.env]);
 }
 
-/** User-level skills for kinds whose discovery implements them (claude-code
- *  and codex today, `commands.ts`); null when it can't tell. */
+/** User-level skills for kinds whose discovery implements them (claude-code,
+ *  codex, cursor, and fx — `commands.ts`); null when it can't tell. */
 async function userLevelSkills(h: Harness): Promise<string[] | null> {
-  if (h.kind !== "claude-code" && h.kind !== "codex") return null;
+  if (h.kind !== "claude-code" && h.kind !== "codex" && h.kind !== "cursor" && h.kind !== "fx") return null;
   try {
     const caps = await listAgentCapabilities({
       agent: h.kind,

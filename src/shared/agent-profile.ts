@@ -52,6 +52,15 @@ export function normalizeSkillName(raw: string): string {
   return name;
 }
 
+/**
+ * Filter query for skill suggestions: drops leading whitespace/slashes (the UI
+ * shows `/name`, stored names have no slash), trims the end and lowercases.
+ * Internal whitespace is kept and no length cap applies. `""` for a lone `/`.
+ */
+export function skillQueryText(raw: string): string {
+  return raw.replace(SKILL_NAME_LEAD_RE, "").trim().toLowerCase();
+}
+
 const AGENT_INSTRUCTIONS_OPEN_TAG = `<${AGENT_INSTRUCTIONS_TAG}>`;
 const AGENT_INSTRUCTIONS_CLOSE_MARKER = `</${AGENT_INSTRUCTIONS_TAG}>\n\nYour task:\n`;
 

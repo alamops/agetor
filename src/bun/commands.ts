@@ -203,7 +203,9 @@ function codexSystemSkills(home: string): AvailableCommand[] {
  * `.codex` file `loadRefProjectTree`'s default pathspecs would list) so a
  * ref checkout never pulls in unrelated project files — mirrors exactly
  * what `listAvailableCommands`/`readEnabledPlugins`/
- * `discoverMcpAndPluginExtensions` read from disk today.
+ * `discoverMcpAndPluginExtensions` read from disk today. The list is the
+ * union across kinds, so a claude or codex ref read may also fetch a
+ * cursor/fx `SKILL.md` it will not surface.
  */
 const CAPABILITY_READ_PATTERNS: RegExp[] = [
   /^\.claude\/commands\/.+\.md$/,
@@ -214,7 +216,28 @@ const CAPABILITY_READ_PATTERNS: RegExp[] = [
   /^\.codex\/prompts\/.+\.md$/,
   /^\.codex\/skills\/[^/]+\/SKILL\.md$/,
   /^\.codex\/config\.toml$/,
+  // cursor / fx project skills: one-level SKILL.md only. Cursor MCP is the
+  // one extra file under `.cursor/` — same `mcpServers` object as `.mcp.json`.
+  /^\.cursor\/mcp\.json$/,
+  /^\.cursor\/skills\/[^/]+\/SKILL\.md$/,
+  /^\.agents\/skills\/[^/]+\/SKILL\.md$/,
+  /^\.grok\/skills\/[^/]+\/SKILL\.md$/,
+  /^\.fx\/skills\/[^/]+\/SKILL\.md$/,
+  /^\.opencode\/skills\/[^/]+\/SKILL\.md$/,
+  /^\.claw\/skills\/[^/]+\/SKILL\.md$/,
+  /^skills\/[^/]+\/SKILL\.md$/,
 ];
+
+const CURSOR_USER_SKILL_DIRS = [".cursor/skills", ".claude/skills", ".codex/skills", ".grok/skills", ".agents/skills"];
+const FX_USER_SKILL_DIRS = [".fx/skills", ".config/opencode/skills", ".codex/skills", ".claude/skills", ".agents/skills", ".claw/skills"];
+const FX_PROJECT_SKILL_DIRS = [".fx/skills", "skills", ".opencode/skills", ".codex/skills", ".claude/skills", ".agents/skills", ".claw/skills"];
+
+/** HOME for cursor/fx. An explicit harness-env HOME wins, matching spawn
+ *  (`harnessEnv` writes HOME from `harness.home` and then lets the env map
+ *  overwrite it). Else the harness home, else the process home. */
+function homeForHomeKinds(opts: { harnessHome?: string | null; harnessEnv?: Record<string, string> | null }): string {
+  return opts.harnessEnv?.HOME || opts.harnessHome || homedir();
+}
 
 function isDiscoveredCapabilityPath(relPath: string): boolean {
   return CAPABILITY_READ_PATTERNS.some((re) => re.test(relPath));
@@ -248,19 +271,28 @@ export async function resolveProjectTree(
 /**
  * Return the slash commands + skills that an agent will see when started with
  * the given workdir. User-level entries are always included; project-level
- * entries are read from the workdir's `.claude/` (or `.codex/`) tree when the
- * workdir exists. Project entries override user entries by name.
+ * entries are read from the workdir's `.claude/` or `.codex/` tree, and for
+ * cursor and fx from their skill directories, when the workdir exists.
+ * Project entries override user entries by name.
  *
  * `harnessHome` is the harness-level config-dir override (from `Harness.home`):
  *  - claude-code: CLAUDE_CONFIG_DIR=<harnessHome>, so user commands/skills live
  *    directly under it (no `.claude/` segment, matching what spawned claude sees).
  *  - codex: HOME=<harnessHome>, so user prompts live at <harnessHome>/.codex/prompts.
  *    CODEX_HOME in harness env wins when present, matching the spawned process.
+ *  - cursor / fx: an explicit HOME in the harness env wins (it wins at spawn
+ *    too — `harnessEnv` applies the env map after the home-derived HOME),
+ *    else HOME=<harnessHome>, else the process home; user skills live under
+ *    that HOME (`.cursor/skills`, `.fx/skills`, …),
+ *    project skills under the same relative dirs (fx also a bare `skills/`),
+ *    and cursor's `~/.cursor/skills-cursor` built-ins are read from disk last.
  *  - NULL: fall back to the agetor process homedir + the default `.claude/`
  *    or `.codex/` layout.
  *
  * `branch` is a git ref. When set, project-level entries (everything under
- * `.claude/` or `.codex/` in the repo root, plus `.mcp.json`) are read from
+ * `.claude/` or `.codex/` in the repo root, plus `.mcp.json`, plus
+ * `.cursor/mcp.json`, plus the cursor/fx skill dirs in `DEFAULT_PATHSPECS`)
+ * are read from
  * that ref's COMMITTED tree via `ref-tree.ts`'s `loadRefProjectTree`, not
  * from whatever happens to be checked out on disk — so the autocomplete
  * shows exactly what a worktree cut from that ref will contain; an
@@ -321,9 +353,31 @@ export async function listAvailableCommands(
     all.push(...builtinCommands(opts.agent));
     all.push(...codexSystemSkills(userCmdRoot));
   } else if (opts.agent === "cursor") {
-    // No `.cursor/` command/rules discovery in v1 (plan assumption 7) — just
-    // the (currently empty) curated built-ins, no filesystem scanning at all.
+    // Skills only in this walk (commands and rules stay unread). MCP config
+    // is parsed in `discoverMcpAndPluginExtensions`. User skills come from
+    // the HOME dirs below, project skills from the same relative dirs on the
+    // project tree; `~/.cursor/skills-cursor` (disk only, never the git ref)
+    // are built-ins and go last so same-named skills win.
+    const home = homeForHomeKinds(opts);
+    const userTree = diskProjectTree(home);
+    for (const dir of CURSOR_USER_SKILL_DIRS) all.push(...discoverSkills(userTree, dir, "user"));
+    const root = opts.workdir ? (await repoRoot(opts.workdir)) ?? opts.workdir : null;
+    const projectTree = ctx?.projectTree !== undefined ? ctx.projectTree : await resolveProjectTree(opts.branch, root);
+    if (projectTree) {
+      for (const dir of CURSOR_USER_SKILL_DIRS) all.push(...discoverSkills(projectTree, dir, "project"));
+    }
     all.push(...builtinCommands(opts.agent));
+    all.push(...discoverSkills(userTree, ".cursor/skills-cursor", "builtin"));
+  } else if (opts.agent === "fx") {
+    // fx skills: HOME-relative user dirs, repo-relative project dirs (incl. a
+    // bare top-level `skills/`). No builtin list.
+    const userTree = diskProjectTree(homeForHomeKinds(opts));
+    for (const dir of FX_USER_SKILL_DIRS) all.push(...discoverSkills(userTree, dir, "user"));
+    const root = opts.workdir ? (await repoRoot(opts.workdir)) ?? opts.workdir : null;
+    const projectTree = ctx?.projectTree !== undefined ? ctx.projectTree : await resolveProjectTree(opts.branch, root);
+    if (projectTree) {
+      for (const dir of FX_PROJECT_SKILL_DIRS) all.push(...discoverSkills(projectTree, dir, "project"));
+    }
   }
   // Gemini intentionally falls through with no discovery yet: it stores
   // custom commands as `.toml` files under `<geminiDir>/commands/` (verified
@@ -642,9 +696,9 @@ interface DiscoveryOpts {
  *
  * `projectTree` is `resolveProjectTree`'s result — live disk or a git ref's
  * committed tree — and backs only the tracked project files (`.mcp.json`,
- * `.codex/config.toml`); `~/.claude.json`'s per-project MCP block stays
- * disk-only regardless (it's machine-local, keyed by the cwd claude ran in,
- * not a file the ref would carry).
+ * `.cursor/mcp.json`, `.codex/config.toml`); `~/.claude.json`'s per-project
+ * MCP block stays disk-only regardless (it's machine-local, keyed by the cwd
+ * claude ran in, not a file the ref would carry).
  */
 function discoverMcpAndPluginExtensions(
   opts: DiscoveryOpts,
@@ -684,9 +738,23 @@ function discoverMcpAndPluginExtensions(
       all.push(...codexTomlMcpServersFromText(projectTree?.read(".codex/config.toml") ?? null, "project"));
     }
   } else if (opts.agent === "cursor") {
-    // No MCP-config parsing for cursor in v1 (plan §8 assumption) — no
-    // `.cursor/` config format is scanned here; falls through to an empty
-    // extension list rather than throwing or silently mislabeling.
+    // Same `{ mcpServers }` object Claude's `.mcp.json` uses. User file is
+    // `<home>/.cursor/mcp.json` (env HOME, else harness.home, else the
+    // process home). Project file is `.cursor/mcp.json` on the project tree,
+    // so a ref reads the committed copy. Plugin-contributed and dashboard
+    // servers are not in these files.
+    const home = homeForHomeKinds(opts);
+    all.push(
+      ...mcpServersToExtensions(safeReadJson(path.join(home, ".cursor", "mcp.json"))?.mcpServers, "user"),
+    );
+    if (root) {
+      all.push(
+        ...mcpServersToExtensions(
+          safeParseJson(projectTree?.read(".cursor/mcp.json") ?? null)?.mcpServers,
+          "project",
+        ),
+      );
+    }
   }
   // Gemini has its own `gemini mcp add/list/remove` surface, so it almost
   // certainly stores MCP config somewhere under GEMINI_CLI_HOME/`.gemini/` —
