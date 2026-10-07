@@ -3,7 +3,7 @@ import { X } from "lucide-react";
 import { api, type AvailableExtension } from "@/lib/api";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { cn } from "@/lib/utils";
-import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../../../shared/agent-profile.ts";
+import { AGENT_PROFILE_LIMITS, normalizeSkillName, skillQueryText } from "../../../shared/agent-profile.ts";
 
 // Per-harness-id suggestion cache, module-level so switching tabs or
 // remounting the profile form doesn't re-walk the harness's skill/plugin
@@ -105,7 +105,7 @@ export function SkillsPicker({ value, onChange, harnessId, disabled, className }
 
   const valueSet = useMemo(() => new Set(value), [value]);
   const filtered = useMemo(() => {
-    const q = inputValue.trim().toLowerCase();
+    const q = skillQueryText(inputValue);
     return suggestions
       .filter((s) => !valueSet.has(s.name))
       .filter((s) => !q || s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q));

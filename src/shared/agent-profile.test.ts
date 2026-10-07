@@ -6,6 +6,7 @@ import {
   composeLaunchPrompt,
   matchAgentProfileRef,
   normalizeSkillName,
+  skillQueryText,
   snapshotFromProfile,
   stripAgentInstructionsPreamble,
 } from "./agent-profile.ts";
@@ -81,6 +82,19 @@ describe("normalizeSkillName", () => {
   test("over the length cap: → \"\"", () => {
     const overCap = "a".repeat(AGENT_PROFILE_LIMITS.skillName + 1);
     expect(normalizeSkillName(overCap)).toBe("");
+  });
+});
+
+describe("skillQueryText", () => {
+  test.each([
+    ["/implement", "implement"],
+    ["//implement", "implement"],
+    [" /implement", "implement"],
+    ["/", ""],
+    ["code review", "code review"],
+    ["IMPLEMENT", "implement"],
+  ])("%j => %j", (raw, expected) => {
+    expect(skillQueryText(raw)).toBe(expected);
   });
 });
 
