@@ -3,7 +3,12 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Harness } from "../../shared/types.ts";
-import { discoverCursorCookie, fetchCursorQuota, parseCursorUsage } from "./cursor-usage.ts";
+import {
+  CURSOR_LOGIN_EXPIRED_REASON,
+  discoverCursorCookie,
+  fetchCursorQuota,
+  parseCursorUsage,
+} from "./cursor-usage.ts";
 
 function fakeHarness(overrides: Partial<Harness> = {}): Harness {
   return {
@@ -316,5 +321,119 @@ describe("allowIdeRead gating (macOS TCC cross-app-read guard)", () => {
     const withDefault = await discoverCursorCookie(harness);
     const withExplicitTrue = await discoverCursorCookie(harness, { allowIdeRead: true });
     expect(withDefault).toBe(withExplicitTrue);
+  });
+});
+
+// 401 recovery: expired/rejected access tokens trigger at most one in-memory
+// OAuth refresh. Synthetic unsigned JWTs and a fully stubbed fetch only.
+describe("fetchCursorQuota — 401 recovery", () => {
+  const OAUTH_URL = "https://api2.cursor.sh/oauth/token";
+  const SUMMARY_URL = "https://cursor.com/api/usage-summary";
+  const ME_URL = "https://cursor.com/api/auth/me";
+  const REFRESH_FIXTURE = "refresh-fixture-secret";
+  const USAGE_BODY = {
+    membershipType: "pro_plus",
+    billingCycleEnd: "2026-09-08T20:58:45.000Z",
+    individualUsage: {
+      plan: { totalPercentUsed: 43.67, autoPercentUsed: 40.84, apiPercentUsed: 64.27, enabled: true },
+      onDemand: { enabled: true, used: 0, limit: 5000, remaining: 5000 },
+    },
+  };
+
+  function b64(obj: unknown): string {
+    return Buffer.from(JSON.stringify(obj)).toString("base64url");
+  }
+  function mintJwt(expSeconds: number, tag: string): string {
+    return `${b64({ alg: "none", typ: "JWT" })}.${b64({ sub: "google-oauth2|user_test", exp: expSeconds, tag })}.sig`;
+  }
+  const nowSec = () => Math.floor(Date.now() / 1000);
+
+  type Call = { url: string; cookie: string | null };
+  function makeFetch(handlers: {
+    oauth?: () => Response;
+    summary?: () => Response;
+  }) {
+    const calls: Call[] = [];
+    const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const cookie = headers.cookie ?? headers.Cookie ?? null;
+      calls.push({ url, cookie });
+      if (url === OAUTH_URL && handlers.oauth) return handlers.oauth();
+      if (url === SUMMARY_URL && handlers.summary) return handlers.summary();
+      if (url === ME_URL) return Response.json({});
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as unknown as typeof fetch;
+    const count = (u: string) => calls.filter((c) => c.url === u).length;
+    return { fetchImpl, calls, count };
+  }
+
+  test("expired access token is refreshed and the new token's cookie is used", async () => {
+    const expired = mintJwt(nowSec() - 3600, "expired");
+    const fresh = mintJwt(nowSec() + 3600, "fresh");
+    const f = makeFetch({
+      oauth: () => Response.json({ access_token: fresh, id_token: "", shouldLogout: false }),
+      summary: () => Response.json(USAGE_BODY),
+    });
+    const quota = await fetchCursorQuota(fakeHarness(), {
+      session: { accessToken: expired, refreshToken: REFRESH_FIXTURE },
+      fetchImpl: f.fetchImpl,
+    });
+    expect(quota.status).toBe("ok");
+    expect(quota.meters.some((m) => m.id === "plan")).toBe(true);
+    expect(f.count(OAUTH_URL)).toBe(1);
+    const summaryCalls = f.calls.filter((c) => c.url === SUMMARY_URL);
+    expect(summaryCalls.length).toBe(1);
+    expect(summaryCalls[0]!.cookie).toBe(`WorkosCursorSessionToken=user_test%3A%3A${fresh}`);
+  });
+
+  test("refresh answering shouldLogout resolves the login-expired error without an empty-token request", async () => {
+    const expired = mintJwt(nowSec() - 3600, "expired");
+    const f = makeFetch({
+      oauth: () => Response.json({ access_token: "", id_token: "", shouldLogout: true }),
+      summary: () => new Response("unauthorized", { status: 401 }),
+    });
+    const quota = await fetchCursorQuota(fakeHarness(), {
+      session: { accessToken: expired, refreshToken: REFRESH_FIXTURE },
+      fetchImpl: f.fetchImpl,
+    });
+    expect(quota.status).toBe("error");
+    expect(quota.meters).toEqual([]);
+    expect(quota.planType).toBeNull();
+    expect(quota.reason).toBe(CURSOR_LOGIN_EXPIRED_REASON);
+    expect(quota.reason).not.toContain(REFRESH_FIXTURE);
+    expect(f.count(OAUTH_URL)).toBe(1);
+    for (const c of f.calls.filter((x) => x.url === SUMMARY_URL)) {
+      expect(c.cookie).not.toBe("WorkosCursorSessionToken=");
+      expect(c.cookie).not.toMatch(/%3A%3A$/);
+    }
+  });
+
+  test("a 401 with no refresh token resolves login-expired after exactly one usage request", async () => {
+    const live = mintJwt(nowSec() + 3600, "live");
+    const f = makeFetch({ summary: () => new Response("unauthorized", { status: 401 }) });
+    const quota = await fetchCursorQuota(fakeHarness(), {
+      session: { accessToken: live, refreshToken: null },
+      fetchImpl: f.fetchImpl,
+    });
+    expect(quota.status).toBe("error");
+    expect(quota.meters).toEqual([]);
+    expect(quota.planType).toBeNull();
+    expect(quota.reason).toBe(CURSOR_LOGIN_EXPIRED_REASON);
+    expect(f.count(SUMMARY_URL)).toBe(1);
+    expect(f.count(OAUTH_URL)).toBe(0);
+  });
+
+  test("a non-401 failure keeps its own reason and never attempts a refresh", async () => {
+    const live = mintJwt(nowSec() + 3600, "live");
+    const f = makeFetch({ summary: () => new Response("boom", { status: 500 }) });
+    const quota = await fetchCursorQuota(fakeHarness(), {
+      session: { accessToken: live, refreshToken: REFRESH_FIXTURE },
+      fetchImpl: f.fetchImpl,
+    });
+    expect(quota.status).toBe("error");
+    expect(quota.reason).toContain("returned 500");
+    expect(quota.reason).not.toBe(CURSOR_LOGIN_EXPIRED_REASON);
+    expect(f.count(OAUTH_URL)).toBe(0);
   });
 });

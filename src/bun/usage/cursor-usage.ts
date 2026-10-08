@@ -30,6 +30,15 @@ const FETCH_TIMEOUT_MS = 5000;
 
 const COOKIE_NAME = "WorkosCursorSessionToken";
 
+const OAUTH_TOKEN_URL = "https://api2.cursor.sh/oauth/token";
+/** Cursor's public OAuth client id (the same one the IDE/CLI refresh with). */
+const OAUTH_CLIENT_ID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB";
+
+/** Shown when the saved login can't be used (expired and unrefreshable, or
+ *  rejected by `usage-summary`). Deliberately carries no URL. */
+export const CURSOR_LOGIN_EXPIRED_REASON =
+  "Cursor's saved login expired or was rejected. Open the Cursor app and sign in again, then click Refresh \u2014 Agetor reads Cursor's local login to fetch plan usage.";
+
 /**
  * Path to the Cursor IDE's VS Code-style global storage SQLite DB, where the
  * desktop app persists its own signed-in session. `harness.home` re-homes
@@ -201,6 +210,109 @@ function readCursorIdeCookie(): string | null {
     } catch {
       // ignore
     }
+  }
+}
+
+/**
+ * Read the IDE's OAuth `cursorAuth/accessToken` and `cursorAuth/refreshToken`
+ * from `state.vscdb`. Same read-only open and key-equality-only discipline as
+ * `readCursorIdeCookie` (multi-GB DB: never a value-LIKE). Never throws;
+ * missing file/rows yield nulls. Callers must have already decided the
+ * cross-app read is allowed (TCC rule — see `fetchCursorQuota`).
+ */
+function readCursorIdeAuth(): {
+  accessToken: string | null;
+  refreshToken: string | null;
+} {
+  const out = { accessToken: null as string | null, refreshToken: null as string | null };
+  const dbPath = cursorStateDbPath();
+  if (!existsSync(dbPath)) return out;
+  let db: Database | null = null;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const read = (key: string): string | null => {
+      const row = db!
+        .query<{ value: unknown }, [string]>(
+          "SELECT value FROM ItemTable WHERE key = ?",
+        )
+        .get(key);
+      if (!row || typeof row.value !== "string") return null;
+      const v = row.value.trim().replace(/^"|"$/g, "");
+      return v || null;
+    };
+    out.accessToken = read("cursorAuth/accessToken");
+    out.refreshToken = read("cursorAuth/refreshToken");
+  } catch {
+    // fail soft — whatever was read so far is returned
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore
+    }
+  }
+  return out;
+}
+
+/** JWT `exp` claim in epoch seconds, or `null` if absent/undecodable. */
+function jwtExpSeconds(jwt: string): number | null {
+  try {
+    const parts = jwt.split(".");
+    if (parts.length !== 3 || !parts[1]) return null;
+    const payload = JSON.parse(
+      Buffer.from(parts[1], "base64url").toString("utf8"),
+    ) as Record<string, unknown>;
+    return typeof payload.exp === "number" && Number.isFinite(payload.exp)
+      ? payload.exp
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Thrown by `fetchJson` for a non-OK response so callers can branch on 401. */
+class HttpStatusError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * Exchange a refresh token for a fresh access token and derive the web
+ * session cookie from it. Returns `null` on any failure, `shouldLogout`, or a
+ * non-JWT/empty token — the caller must never retry with an empty cookie. The
+ * new token is only ever held in memory.
+ */
+async function refreshCursorCookie(
+  refreshToken: string,
+  fetchImpl: typeof fetch,
+): Promise<string | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetchImpl(OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        client_id: OAUTH_CLIENT_ID,
+        refresh_token: refreshToken,
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as Record<string, unknown> | null;
+    if (!body || body.shouldLogout === true) return null;
+    const token = body.access_token;
+    if (typeof token !== "string" || !JWT_RE.test(token)) return null;
+    return deriveSessionCookieFromJwt(token);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -512,11 +624,12 @@ export function parseCursorUsage(
 async function fetchJson(
   url: string,
   cookie: string,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<unknown> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(url, {
+    const res = await fetchImpl(url, {
       headers: {
         cookie: `${COOKIE_NAME}=${cookie}`,
         accept: "application/json",
@@ -524,7 +637,7 @@ async function fetchJson(
       signal: controller.signal,
     });
     if (!res.ok) {
-      throw new Error(`${url} returned ${res.status}`);
+      throw new HttpStatusError(res.status, `${url} returned ${res.status}`);
     }
     return await res.json();
   } finally {
@@ -537,15 +650,23 @@ async function fetchJson(
  * single entry point the poller (`src/bun/usage/poller.ts`) calls, and the
  * plan is explicit (section 3, section 7) that a Cursor fetch must never
  * throw, prompt, or block. Resolution order:
- *  1. `discoverCursorCookie(harness, { allowIdeRead })` — if it yields
- *     nothing, resolve `status:"unavailable"` immediately with a reason
- *     explaining what's needed, no network call attempted.
+ *  1. Read the IDE OAuth access and refresh tokens (or `opts.session` in
+ *     tests — that path never opens the database). Derive the web cookie
+ *     from the access token. If that yields nothing and no session was
+ *     injected, fall through to `discoverCursorCookie`. An expired access
+ *     token, a missing cookie when a refresh token exists, or a later 401
+ *     triggers at most one in-memory OAuth refresh. Still no cookie resolves
+ *     `status:"unavailable"`, or `status:"error"` with
+ *     `CURSOR_LOGIN_EXPIRED_REASON` when a refresh was attempted and failed.
  *  2. With a cookie, fetch `usage-summary` and `auth/me` in parallel (each
  *     under a ~5s timeout) and parse via `parseCursorUsage`. Empty meters
  *     still resolves `status:"unavailable"` (we got a response but
  *     recognized nothing in it); non-empty meters resolve `status:"ok"`.
- *  3. Any thrown error (network, timeout, non-2xx, JSON parse) is caught
- *     and resolves `status:"error"` with a short reason — never propagated.
+ *     A 401 resolves `status:"error"` with `CURSOR_LOGIN_EXPIRED_REASON`
+ *     (after that one refresh, if a refresh token was available).
+ *  3. Any other thrown error (network, timeout, non-401 HTTP, JSON parse)
+ *     is caught and resolves `status:"error"` with a short reason — never
+ *     propagated. `opts.fetchImpl` replaces `fetch`.
  *
  * `opts.allowIdeRead` (default `true` when `opts` is omitted, preserving
  * today's behavior for any direct caller and the explicit-refresh path)
@@ -556,9 +677,14 @@ async function fetchJson(
  */
 export async function fetchCursorQuota(
   harness: Harness,
-  opts?: { allowIdeRead?: boolean },
+  opts?: {
+    allowIdeRead?: boolean;
+    session?: { accessToken: string | null; refreshToken: string | null };
+    fetchImpl?: typeof fetch;
+  },
 ): Promise<HarnessQuota> {
   const allowIdeRead = opts?.allowIdeRead ?? true;
+  const fetchImpl = opts?.fetchImpl ?? fetch;
   const fetchedAtMs = Date.now();
   const base: Omit<HarnessQuota, "status" | "meters" | "reason" | "planType"> = {
     harnessId: harness.id,
@@ -567,14 +693,56 @@ export async function fetchCursorQuota(
     fetchedAtMs,
   };
 
+  let accessToken: string | null = null;
+  let refreshToken: string | null = null;
   let cookie: string | null = null;
   try {
-    cookie = await discoverCursorCookie(harness, { allowIdeRead });
+    if (opts?.session) {
+      accessToken = opts.session.accessToken;
+      refreshToken = opts.session.refreshToken;
+    } else if (allowIdeRead) {
+      ({ accessToken, refreshToken } = readCursorIdeAuth());
+    }
+    if (accessToken && JWT_RE.test(accessToken)) {
+      cookie = deriveSessionCookieFromJwt(accessToken);
+    }
+    // Legacy storage shapes / browser stub — only when no session was injected.
+    if (!cookie && !opts?.session) {
+      cookie = await discoverCursorCookie(harness, { allowIdeRead });
+    }
   } catch {
     cookie = null;
   }
 
+  let refreshed = false;
+  const tryRefresh = async (): Promise<string | null> => {
+    if (refreshed || !refreshToken) return null;
+    refreshed = true;
+    return refreshCursorCookie(refreshToken, fetchImpl);
+  };
+
+  const expired =
+    accessToken != null &&
+    (() => {
+      const exp = jwtExpSeconds(accessToken);
+      return exp != null && exp <= Date.now() / 1000;
+    })();
+
+  if (refreshToken && (expired || !cookie)) {
+    const fresh = await tryRefresh();
+    if (fresh) cookie = fresh;
+  }
+
   if (!cookie) {
+    if (refreshed) {
+      return {
+        ...base,
+        planType: null,
+        status: "error",
+        meters: [],
+        reason: CURSOR_LOGIN_EXPIRED_REASON,
+      };
+    }
     return {
       ...base,
       planType: null,
@@ -585,19 +753,40 @@ export async function fetchCursorQuota(
       // stating that it can't. When the IDE read itself was skipped (no
       // prior consent/snapshot yet), say so explicitly rather than implying
       // a login problem — the fix here is clicking Refresh, not signing in.
-      reason: allowIdeRead
-        ? "No Cursor session found. Open the Cursor desktop app and sign in, " +
-          "then Refresh here — Agetor reads Cursor's local login to fetch plan usage."
-        : "Cursor usage isn't read in the background. Click Refresh to read " +
-          "Cursor's local login and show plan usage.",
+      reason:
+        allowIdeRead || opts?.session
+          ? "No Cursor session found. Open the Cursor desktop app and sign in, " +
+            "then Refresh here \u2014 Agetor reads Cursor's local login to fetch plan usage."
+          : "Cursor usage isn't read in the background. Click Refresh to read " +
+            "Cursor's local login and show plan usage.",
     };
   }
 
-  try {
-    const [summaryJson, meJson] = await Promise.all([
-      fetchJson(USAGE_SUMMARY_URL, cookie),
-      fetchJson(AUTH_ME_URL, cookie).catch(() => null),
+  const fetchBoth = (c: string) =>
+    Promise.all([
+      fetchJson(USAGE_SUMMARY_URL, c, fetchImpl),
+      fetchJson(AUTH_ME_URL, c, fetchImpl).catch(() => null),
     ]);
+
+  try {
+    let summaryJson: unknown;
+    let meJson: unknown;
+    try {
+      [summaryJson, meJson] = await fetchBoth(cookie);
+    } catch (err) {
+      if (!(err instanceof HttpStatusError) || err.status !== 401) throw err;
+      const fresh = await tryRefresh();
+      if (!fresh) {
+        return {
+          ...base,
+          planType: null,
+          status: "error",
+          meters: [],
+          reason: CURSOR_LOGIN_EXPIRED_REASON,
+        };
+      }
+      [summaryJson, meJson] = await fetchBoth(fresh);
+    }
 
     const { meters, planType } = parseCursorUsage(
       summaryJson,
@@ -623,6 +812,15 @@ export async function fetchCursorQuota(
       reason: null,
     };
   } catch (err) {
+    if (err instanceof HttpStatusError && err.status === 401) {
+      return {
+        ...base,
+        planType: null,
+        status: "error",
+        meters: [],
+        reason: CURSOR_LOGIN_EXPIRED_REASON,
+      };
+    }
     const reason =
       err instanceof Error ? err.message.slice(0, 200) : "Cursor usage fetch failed";
     return {
