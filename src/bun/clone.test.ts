@@ -1961,8 +1961,14 @@ describe("cloneRepo", () => {
           host: "127.0.0.1",
         });
 
-        // Give attempt 1 time to fail and opts.auth() to actually start.
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        // Attempt 1 has to fail and enter opts.auth() before the cancel.
+        // A fixed 100ms sleep loses that race when git is slow, and then
+        // authCalls stays 0 even though the cancel itself was honored.
+        const authStarted = Date.now() + 5_000;
+        while (authCalls === 0 && Date.now() < authStarted) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        expect(authCalls).toBe(1);
         expect(cancelClone(cloneId)).toBe(true);
 
         const result = await clonePromise;
