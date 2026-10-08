@@ -708,10 +708,12 @@ test("060_normalize_cursor_sonnet_5_5 folds suffixed claude-sonnet-5-5 variants 
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("060 (cursor Sonnet 5.5) sits right after 059 with its pre-rebase id as an alias", () => {
+test("060 (cursor Sonnet 5.5) sits right after 059, with its pre-rebase id as an alias", () => {
   const at = migrations.findIndex((m) => m.id === "060_normalize_cursor_sonnet_5_5");
   expect(at).toBeGreaterThan(0);
   expect(migrations[at - 1]?.id).toBe("059_task_pipeline_id_index");
+  // 061 still follows 060. 062 (Haiku 5.5) is what moved "last" off 061.
+  expect(migrations[at + 1]?.id).toBe("061_antigravity_harness");
   // Written on its branch as 057 while `main` took 057–059 for pipelines —
   // renumbered on rebase; a dev DB that applied it under the old id must not
   // re-run it, hence the alias (the SQL is idempotent either way).

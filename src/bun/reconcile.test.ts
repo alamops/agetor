@@ -314,37 +314,60 @@ test("startTask honors cancel — exit handler records status 'cancelled'", asyn
   const fakeBin = path.join(binDir, "fake-codex");
   writeFileSync(fakeBin, "#!/bin/sh\nexec sleep 30\n");
   chmodSync(fakeBin, 0o755);
+  // Sibling files in this shared `bun test` process set
+  // AGETOR_CODEX_DRIVER=fake and AGETOR_TMUX_BIN=/bin/echo at module scope.
+  // Either one makes this turn exit before there is a session to cancel.
+  const savedDriver = process.env.AGETOR_CODEX_DRIVER;
+  const savedTmuxBin = process.env.AGETOR_TMUX_BIN;
+  const savedCodexBin = process.env.AGETOR_CODEX_BIN;
+  const savedCodexArgs = process.env.AGETOR_CODEX_ARGS;
+  delete process.env.AGETOR_CODEX_DRIVER;
+  delete process.env.AGETOR_TMUX_BIN;
   process.env.AGETOR_CODEX_BIN = fakeBin;
   process.env.AGETOR_CODEX_ARGS = "";
+  const restoreEnv = () => {
+    if (savedDriver === undefined) delete process.env.AGETOR_CODEX_DRIVER;
+    else process.env.AGETOR_CODEX_DRIVER = savedDriver;
+    if (savedTmuxBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = savedTmuxBin;
+    if (savedCodexBin === undefined) delete process.env.AGETOR_CODEX_BIN;
+    else process.env.AGETOR_CODEX_BIN = savedCodexBin;
+    if (savedCodexArgs === undefined) delete process.env.AGETOR_CODEX_ARGS;
+    else process.env.AGETOR_CODEX_ARGS = savedCodexArgs;
+  };
 
-  const { createTask, startTask, cancelRun } = await import("./orchestrator.ts");
-  const { runs, harnesses } = await import("./db.ts");
-  // Codex is shipped disabled-by-default (see migration 016); re-enable the
-  // built-in for the test database so startTask doesn't reject it.
-  harnesses.setEnabled("codex", true);
+  try {
+    const { createTask, startTask, cancelRun } = await import("./orchestrator.ts");
+    const { runs, harnesses } = await import("./db.ts");
+    // Codex is shipped disabled-by-default (see migration 016); re-enable the
+    // built-in for the test database so startTask doesn't reject it.
+    harnesses.setEnabled("codex", true);
 
-  const created = await createTask({
-    title: "long-running",
-    prompt: "30", // sleep 30 → session blocks until killed
-    agent: "codex",
-    workdir: process.cwd(),
-    isolation: "none",
-    taskType: "task",
-  });
-  if ("error" in created) throw new Error(created.error);
+    const created = await createTask({
+      title: "long-running",
+      prompt: "30", // sleep 30 → session blocks until killed
+      agent: "codex",
+      workdir: process.cwd(),
+      isolation: "none",
+      taskType: "task",
+    });
+    if ("error" in created) throw new Error(created.error);
 
-  const started = await startTask(created.task.id);
-  if ("error" in started) throw new Error(started.error);
+    const started = await startTask(created.task.id);
+    if ("error" in started) throw new Error(started.error);
 
-  // Give the tmux session a moment to come up, then cancel.
-  await new Promise((r) => setTimeout(r, 250));
-  expect(await cancelRun(started.runId)).toBe(true);
+    // Give the tmux session a moment to come up, then cancel.
+    await new Promise((r) => setTimeout(r, 250));
+    expect(await cancelRun(started.runId)).toBe(true);
 
-  // Wait past the driver's kill grace + the exit handler's status flip.
-  await new Promise((r) => setTimeout(r, 700));
+    // Wait past the driver's kill grace + the exit handler's status flip.
+    await new Promise((r) => setTimeout(r, 700));
 
-  const list = runs.listForTask(created.task.id);
-  expect(list[0]?.status).toBe("cancelled");
+    const list = runs.listForTask(created.task.id);
+    expect(list[0]?.status).toBe("cancelled");
+  } finally {
+    restoreEnv();
+  }
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *
