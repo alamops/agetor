@@ -2294,6 +2294,110 @@ test("a successor settle is classified while the handoff reminder is still queue
   await waitUntilIdle(parentId);
 });
 
+test("a running successor that appears before the reminder is stamped is not recorded", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines, runs } = await import("./db.ts");
+  const { newStep, HANDOFF_TAG } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { __forTest } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("pre-stamp");
+  const A = newStep({
+    name: "A",
+    agentProfileId: profile.id,
+    instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing`,
+  });
+  const graph = { steps: [A], edges: [], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("pre-stamp-pipe"), graph, maxSteps: 25 });
+
+  const created = await createTask({
+    title: "stamp-window successor",
+    prompt: "goal",
+    workdir: freshWorkdir(),
+    isolation: "none",
+    pipelineId: pipeline.id,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  let stepA: ReturnType<typeof tasks.get> = null;
+  const continuationId = randomUUID();
+  __forTest.setListenerEnabled(false);
+  try {
+    const started = await startTask(parentId);
+    if ("error" in started) throw new Error(started.error);
+
+    stepA = await waitFor(() => tasks.stepsForParent(parentId)[0]);
+    const settled = await waitFor(() => {
+      const r = runs.listForTask(stepA!.id)[0];
+      return r && r.status !== "running" ? r : undefined;
+    });
+
+    __forTest.setBeforeReminderStamp(() => {
+      // After `sendInput` returns and before the stamp lock records the
+      // reminder. The post-send defer already ran and saw no successor.
+      runs.insert({
+        ...settled,
+        id: continuationId,
+        status: "running",
+        startedAt: Date.now(),
+        endedAt: null,
+        exitCode: null,
+        origin: "continuation",
+      });
+      tasks.update(stepA!.id, { runId: continuationId });
+    });
+
+    await __forTest.handleRunStatus(stepA.id, settled.id, "succeeded");
+
+    const deferred = tasks.get(parentId)!.pipelineRun!;
+    expect(deferred.status).not.toBe("done");
+    expect(deferred.blocked.filter((b) => b.taskId === stepA!.id)).toEqual([]);
+    expect(deferred.active.some((a) => a.taskId === stepA!.id)).toBe(true);
+    const deferredRecord = deferred.history.find((h) => h.taskId === stepA!.id);
+    expect(deferredRecord?.reminder ?? null).toBeNull();
+    expect(deferredRecord?.responseKind ?? null).toBeNull();
+
+    const doneHandoff = {
+      schemaVersion: 1,
+      purpose: "p",
+      summary: "s",
+      reason: "finished after the stamp window",
+      next: null,
+      artifacts: [] as string[],
+      openQuestions: [] as string[],
+      status: "done" as const,
+    };
+    runs.appendEvent(
+      continuationId,
+      "assistant",
+      `Skill scan.\n<${HANDOFF_TAG}>\n${JSON.stringify(doneHandoff)}\n</${HANDOFF_TAG}>`,
+    );
+    await __forTest.handleRunStatus(stepA.id, continuationId, "succeeded");
+    // `sendInput` returns before the fake driver's resolve timer writes its
+    // chunks. Drain that turn while the listener is still off and the run
+    // row still exists, so the timer cannot append after `deleteTask`.
+    await waitFor(() => {
+      const pending = runs.listForTask(stepA!.id).some((r) => r.id !== continuationId && r.status === "running");
+      return pending ? undefined : true;
+    });
+  } finally {
+    __forTest.setBeforeReminderStamp(null);
+    __forTest.setListenerEnabled(true);
+  }
+
+  const after = tasks.get(parentId)!;
+  expect(after.pipelineRun?.status).toBe("done");
+  expect(after.column).toBe("review");
+  const record = after.pipelineRun!.history.find((h) => h.taskId === stepA!.id);
+  expect(record?.outcome).toBe("succeeded");
+  expect(record?.responseKind).toBe("handoff");
+  expect(record?.reminder ?? null).toBeNull();
+
+  await waitUntilIdle(parentId);
+});
+
 test("a failed run records step-failed with no reminder and responseKind \"error\"", async () => {
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { tasks, pipelines, runs } = await import("./db.ts");

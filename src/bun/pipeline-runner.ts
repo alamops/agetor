@@ -374,10 +374,13 @@ function differentCurrentRunId(taskId: string, settledRunId: string): string | n
  *  {@link attemptHandoffReminderOrBlock} only skips in this case. A
  *  successor that has already left `running` is not skipped there — its
  *  own settle classifies it, and {@link deliverHandoffReminder} re-enters
- *  that settle when the reminder was already queued. */
-function runningSuccessorSupersedes(taskId: string, settledRunId: string): boolean {
+ *  that settle when the reminder was already queued.
+ *  `ignoreRunId` is the reminder turn `sendInput` just started. That run
+ *  is not a continuation; treating it as one skips the stamp and every
+ *  later settle of the same execution queues another send. */
+function runningSuccessorSupersedes(taskId: string, settledRunId: string, ignoreRunId?: string): boolean {
   const currentId = differentCurrentRunId(taskId, settledRunId);
-  if (!currentId) return false;
+  if (!currentId || currentId === ignoreRunId) return false;
   return runs.get(currentId)?.status === "running";
 }
 
@@ -1627,6 +1630,13 @@ const remindersInFlight = new Map<string, string>();
  *  queued. Production never sets it. */
 let beforeReminderSend: (() => Promise<void> | void) | null = null;
 
+/** Test seam. Invoked once inside the stamp lock, before the ownership
+ *  check (then cleared), so a test can make a successor the current run
+ *  after `sendInput` has returned and before the reminder is recorded.
+ *  Must not take the per-parent lock — the caller already holds it.
+ *  Production never sets it. */
+let beforeReminderStamp: (() => Promise<void> | void) | null = null;
+
 /**
  * Decide whether the single automatic handoff-format reminder for `taskId`'s
  * just-succeeded (but not yet resolvable) execution should go out, falling
@@ -1779,18 +1789,24 @@ function attemptHandoffReminderOrBlock(input: {
  *  the send, clear the in-flight flag so that run's settle isn't swallowed,
  *  and leave `reminder` unset so a later reply that still lacks a handoff
  *  can still be reminded once. */
+/** Drop this queued reminder under the caller's lock. No-op when a newer
+ *  send already owns `remindersInFlight`. A successor settle that already
+ *  recorded an outcome owns `responseKind`; clearing it here would wipe a
+ *  handoff that was classified while this reminder was queued. */
+function releaseReminderOwnership(p: PendingReminder): void {
+  if (remindersInFlight.get(p.taskId) !== p.runId) return;
+  remindersInFlight.delete(p.taskId);
+  const parent = tasks.get(p.parentId);
+  const run = parent?.pipelineRun;
+  if (!run) return;
+  const historyEntry = run.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
+  if (historyEntry && !historyEntry.reminder && historyEntry.outcome == null) historyEntry.responseKind = null;
+  persist(p.parentId, run);
+}
+
 async function abandonReminderForSuccessor(p: PendingReminder): Promise<void> {
   await runExclusive(p.parentId, async () => {
-    if (remindersInFlight.get(p.taskId) === p.runId) remindersInFlight.delete(p.taskId);
-    const parent = tasks.get(p.parentId);
-    const run = parent?.pipelineRun;
-    if (!run) return;
-    const historyEntry = run.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
-    // A successor settle that already recorded an outcome owns `responseKind`.
-    // Clearing it here would wipe a handoff that was classified while this
-    // reminder was queued.
-    if (historyEntry && !historyEntry.reminder && historyEntry.outcome == null) historyEntry.responseKind = null;
-    persist(p.parentId, run);
+    releaseReminderOwnership(p);
   });
 }
 
@@ -1858,6 +1874,10 @@ async function deferReminderToSuccessor(p: PendingReminder, sentRunId?: string):
  * starts or finishes in the gap after the settle released the lock must
  * not get this reminder pasted onto the old run, and a handoff it already
  * wrote must be classified instead of waiting for the next boot reconcile.
+ * The stamp re-checks under the lock: if this send no longer owns
+ * `remindersInFlight`, or a different run is now `running`, the reminder
+ * is not recorded. The run `sendInput` just started is excluded from that
+ * running check — it is the reminder turn, not a continuation.
  */
 async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
   if (beforeReminderSend) {
@@ -1883,7 +1903,21 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
   // started is that reminder, not a continuation.
   if (await deferReminderToSuccessor(p, sent.delivered ? sent.runId : undefined)) return;
   await runExclusive(p.parentId, async () => {
-    if (remindersInFlight.get(p.taskId) === p.runId) remindersInFlight.delete(p.taskId);
+    if (beforeReminderStamp) {
+      const hook = beforeReminderStamp;
+      beforeReminderStamp = null;
+      await hook();
+    }
+    // `sendInput` released the lock. A successor settle may have abandoned
+    // this send, or a continuation may have become the current run, before
+    // this callback acquired it. Recording either way would stamp a reminder
+    // onto an execution a newer run now owns.
+    if (remindersInFlight.get(p.taskId) !== p.runId) return;
+    if (runningSuccessorSupersedes(p.taskId, p.runId, sent.delivered ? sent.runId : undefined)) {
+      releaseReminderOwnership(p);
+      return;
+    }
+    remindersInFlight.delete(p.taskId);
     try {
       const parent = tasks.get(p.parentId);
       if (!parent || !parent.pipelineRun) return;
@@ -2617,8 +2651,10 @@ export function initPipelineRunner(): void {
  *  directly to simulate a missed settle. `persist` is here so a test can
  *  replay a same-status bookkeeping write and check a parked Done card is
  *  not snapped back to Review. `setBeforeReminderSend` lets a test inject a
- *  successor between the reminder being queued and `sendInput`. Never
- *  imported outside this module's own test file. */
+ *  successor between the reminder being queued and `sendInput`.
+ *  `setBeforeReminderStamp` lets a test inject one after `sendInput`
+ *  returns and before the reminder is recorded. Never imported outside
+ *  this module's own test file. */
 export const __forTest = {
   setListenerEnabled(enabled: boolean): void {
     listenerEnabled = enabled;
@@ -2627,6 +2663,9 @@ export const __forTest = {
   handleColumnChange,
   setBeforeReminderSend(hook: (() => Promise<void> | void) | null): void {
     beforeReminderSend = hook;
+  },
+  setBeforeReminderStamp(hook: (() => Promise<void> | void) | null): void {
+    beforeReminderStamp = hook;
   },
   persist,
 };
