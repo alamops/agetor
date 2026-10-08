@@ -312,6 +312,18 @@ test("claude-code 'sonnet-5.5' maps to --model claude-sonnet-5-5", () => {
   ]);
 });
 
+test("claude-code 'haiku-5.5' maps to --model claude-haiku-5-5 and sets effort env", () => {
+  const { cmd, env } = buildCommand(builtin("claude-code"), "do thing", {
+    ...claudeDefaults,
+    model: "haiku-5.5",
+    mode: "auto",
+    effort: "high",
+  });
+  expect(cmd).toContain("--model");
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("claude-haiku-5-5");
+  expect(env?.CLAUDE_CODE_EFFORT_LEVEL).toBe("high");
+});
+
 // ---------------------------------------------------------------------------
 // claudeModelPickerFamily (src/bun/agents.ts) — maps an agetor claude-code
 // model id to the model-FAMILY label claude 2.1.246's bare `/model` picker
@@ -324,7 +336,7 @@ test("claudeModelPickerFamily maps each current-release id to its picker row fam
   expect(claudeModelPickerFamily("opus-5.5")).toBe("Opus");
   expect(claudeModelPickerFamily("sonnet-5.5")).toBe("Sonnet");
   expect(claudeModelPickerFamily("fable-5.1")).toBe("Fable");
-  expect(claudeModelPickerFamily("haiku-4.5")).toBe("Haiku");
+  expect(claudeModelPickerFamily("haiku-5.5")).toBe("Haiku");
 });
 
 test("claudeModelPickerFamily returns null for ids the picker's single per-family row would misrepresent, has no row for, or doesn't recognize", () => {
@@ -345,6 +357,9 @@ test("claudeModelPickerFamily returns null for ids the picker's single per-famil
   // claude-sonnet-5-5 the default Sonnet model, so the picker's Sonnet row
   // would land on the wrong version.
   expect(claudeModelPickerFamily("sonnet-5")).toBeNull();
+  // haiku-4.5 is superseded by haiku-5.5 on CLI 2.1.293 (alias haiku →
+  // claude-haiku-5-5), so the picker's Haiku row would land on the wrong version.
+  expect(claudeModelPickerFamily("haiku-4.5")).toBeNull();
   // No picker row at all for either Mythos id.
   expect(claudeModelPickerFamily("mythos-5")).toBeNull();
   expect(claudeModelPickerFamily("mythos-5.1")).toBeNull();

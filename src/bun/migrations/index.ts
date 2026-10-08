@@ -85,6 +85,7 @@ import m059 from "./059_task_pipeline_id_index.sql" with { type: "text" };
 // id kept as an alias (same renumber-with-alias pattern as 054/057/058).
 import m060 from "./060_normalize_cursor_sonnet_5_5.sql" with { type: "text" };
 import m061 from "./061_antigravity_harness.sql" with { type: "text" };
+import m062 from "./062_normalize_cursor_haiku_5_5.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -155,4 +156,5 @@ export const migrations: Migration[] = [
   { id: "059_task_pipeline_id_index", sql: m059 },
   { id: "060_normalize_cursor_sonnet_5_5", sql: m060, aliases: ["057_normalize_cursor_sonnet_5_5"] },
   { id: "061_antigravity_harness", sql: m061 },
+  { id: "062_normalize_cursor_haiku_5_5", sql: m062 },
 ];
