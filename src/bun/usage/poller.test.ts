@@ -233,7 +233,7 @@ test("refreshOne passes allowIdeRead:true when force:true, even with no prior sn
   expect(capturedOpts?.allowIdeRead).toBe(true);
 });
 
-test("refreshOne passes allowIdeRead:true when the prior snapshot is an error (a cookie was found once)", async () => {
+test("refreshOne passes allowIdeRead:true when the prior snapshot is an error (a previous allowed read)", async () => {
   harnesses.setEnabled("cursor", true);
   harnessUsage.upsert(
     fakeQuota({

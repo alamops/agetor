@@ -136,6 +136,9 @@ export async function getPreferences(
 export function seedHarnessUsage(backend: E2EBackend, quota: HarnessQuota): void {
   const db = new Database(path.join(backend.dataDir, "agetor.sqlite"));
   try {
+    // The headless backend holds this file too. A write that arrives during
+    // its transaction used to throw SQLITE_BUSY immediately; wait it out.
+    db.exec("PRAGMA busy_timeout = 5000");
     db.run(
       `INSERT INTO harness_usage (harness_id, snapshot_json, updated_at)
        VALUES (?, ?, ?)

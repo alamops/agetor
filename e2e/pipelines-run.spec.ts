@@ -405,6 +405,9 @@ test.describe("pipelines run: executing a run", () => {
     page,
     freshBackend,
   }) => {
+    // Several 20s converge waits plus a subagent turn. Under a full-suite
+    // worker the default 30s expires while the step strip is still loading.
+    test.setTimeout(60_000);
     const backend = freshBackend;
     const profileId = await createProfileRest(backend, "Runner");
     const helperOneId = await createProfileRest(backend, "Helper One", {
@@ -476,7 +479,9 @@ test.describe("pipelines run: executing a run", () => {
     // The step task's panel opens ON that helper's tab (kept visible even
     // though everything has finished), not on the Main stream.
     let helperPanel = page.locator("aside").last();
-    await expect(helperPanel.getByTestId("run-panel-pipeline-strip")).toContainText("A");
+    await expect(helperPanel.getByTestId("run-panel-pipeline-strip")).toContainText("A", {
+      timeout: CONVERGE_TIMEOUT,
+    });
     const helperTab = helperPanel.locator(`[data-testid="subagent-tab"][data-subagent-id="${helperSubagentId}"]`);
     await expect(helperTab).toHaveAttribute("aria-selected", "true", { timeout: CONVERGE_TIMEOUT });
     await helperPanel.getByTestId("run-panel-open-pipeline").click();
@@ -494,7 +499,9 @@ test.describe("pipelines run: executing a run", () => {
     // of A's helper names leak into B's prompt.
     await stepNode(page, B.id).click();
     let panel = page.locator("aside").last();
-    await expect(panel.getByTestId("run-panel-pipeline-strip")).toContainText("B");
+    await expect(panel.getByTestId("run-panel-pipeline-strip")).toContainText("B", {
+      timeout: CONVERGE_TIMEOUT,
+    });
     let log = panel.getByTestId("transcript-log");
     await expect(log).toContainText("Do not spawn subagents for this step.", { timeout: CONVERGE_TIMEOUT });
     await expect(log).not.toContainText("Helper One");
@@ -505,7 +512,9 @@ test.describe("pipelines run: executing a run", () => {
     // instructions and skill rendered so the step can brief its subagents.
     await stepNode(page, A.id).click();
     panel = page.locator("aside").last();
-    await expect(panel.getByTestId("run-panel-pipeline-strip")).toContainText("A");
+    await expect(panel.getByTestId("run-panel-pipeline-strip")).toContainText("A", {
+      timeout: CONVERGE_TIMEOUT,
+    });
     log = panel.getByTestId("transcript-log");
     await expect(log).toContainText("Delegation", { timeout: CONVERGE_TIMEOUT });
     await expect(log).toContainText("You may delegate to subagents. Limit: 2 subagent(s).");

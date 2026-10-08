@@ -109,12 +109,17 @@ export async function refreshOne(
 
   // Cross-app-read gate (currently Cursor-only — see cursor-usage.ts): allow
   // it on an explicit user refresh, or when a prior `ok` or `error` snapshot
-  // exists for this harness — either proves the cross-app read already
-  // happened once (so the macOS TCC grant was given and now persists):
-  // `fetchCursorQuota` returns `error` only after a cookie was found, while
-  // the skip path writes `unavailable`. The catch below does the same when
-  // this call was not allowed to read: a throw during a skipped sweep must
-  // not be stored as `error`, or the next sweep would treat it as consent.
+  // exists for this harness — either proves this process was already allowed
+  // to open Cursor's database once (so the macOS TCC grant was given and now
+  // persists). `fetchCursorQuota` returns `error` only after that read was
+  // allowed: a cookie was derived, or a refresh token was read and the
+  // refresh was rejected or the token endpoint failed. The no-cookie
+  // refresh-failure path is still `error` on purpose — folding it back to
+  // `unavailable` would close this gate and hide a later sign-in. The skip
+  // path (read not allowed) writes `unavailable`. The catch below does the
+  // same when this call was not allowed to read: a throw during a skipped
+  // sweep must not be stored as `error`, or the next sweep would treat it
+  // as consent.
   // A merely-existing snapshot is NOT
   // enough: `refreshOne` upserts every result, INCLUDING that `unavailable`
   // one, so gating on `!= null` (or letting `unavailable` count) would let the

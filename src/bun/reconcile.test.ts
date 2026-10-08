@@ -336,9 +336,17 @@ test("startTask honors cancel — exit handler records status 'cancelled'", asyn
   const started = await startTask(created.task.id);
   if ("error" in started) throw new Error(started.error);
 
-  // Give the tmux session a moment to come up, then cancel.
-  await new Promise((r) => setTimeout(r, 250));
-  expect(await cancelRun(started.runId)).toBe(true);
+  // The tmux session is registered after spawn. Under a loaded full-suite
+  // run, 250ms is not always enough, and cancelRun returns false until the
+  // handle exists. Poll until it does, instead of one fixed sleep.
+  const deadline = Date.now() + 5_000;
+  let cancelled = false;
+  while (Date.now() < deadline) {
+    cancelled = await cancelRun(started.runId);
+    if (cancelled) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  expect(cancelled).toBe(true);
 
   // Wait past the driver's kill grace + the exit handler's status flip.
   await new Promise((r) => setTimeout(r, 700));

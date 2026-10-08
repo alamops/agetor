@@ -280,16 +280,33 @@ class HttpStatusError extends Error {
   }
 }
 
+/** A refresh Cursor refused (`shouldLogout`, empty token, non-JWT) versus one
+ *  that never answered (timeout, network, non-OK HTTP). Callers must not
+ *  treat those the same: a refusal is the sign-in sentence, a transport
+ *  failure keeps a short error that does not claim the login was rejected.
+ *  The new access token is only ever held in memory, and never returned. */
+type CursorRefreshResult =
+  | { outcome: "cookie"; cookie: string }
+  | { outcome: "rejected" }
+  | { outcome: "failed"; reason: string };
+
+const REFRESH_FAILED_REASON = "Cursor login refresh failed";
+
+/** Drop the refresh token if a thrown message quoted the request, then cap. */
+function scrubRefreshReason(raw: string, refreshToken: string): string {
+  const scrubbed = raw.split(refreshToken).join("").replace(/\s+/g, " ").trim();
+  return (scrubbed || REFRESH_FAILED_REASON).slice(0, 200);
+}
+
 /**
  * Exchange a refresh token for a fresh access token and derive the web
- * session cookie from it. Returns `null` on any failure, `shouldLogout`, or a
- * non-JWT/empty token — the caller must never retry with an empty cookie. The
- * new token is only ever held in memory.
+ * session cookie from it. `rejected` and `failed` both mean "do not retry
+ * with an empty cookie". The new token is only ever held in memory.
  */
 async function refreshCursorCookie(
   refreshToken: string,
   fetchImpl: typeof fetch,
-): Promise<string | null> {
+): Promise<CursorRefreshResult> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
@@ -303,14 +320,22 @@ async function refreshCursorCookie(
       }),
       signal: controller.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      return {
+        outcome: "failed",
+        reason: `${REFRESH_FAILED_REASON} (HTTP ${res.status})`,
+      };
+    }
     const body = (await res.json()) as Record<string, unknown> | null;
-    if (!body || body.shouldLogout === true) return null;
+    if (!body || body.shouldLogout === true) return { outcome: "rejected" };
     const token = body.access_token;
-    if (typeof token !== "string" || !JWT_RE.test(token)) return null;
-    return deriveSessionCookieFromJwt(token);
-  } catch {
-    return null;
+    if (typeof token !== "string" || !JWT_RE.test(token)) return { outcome: "rejected" };
+    const cookie = deriveSessionCookieFromJwt(token);
+    if (!cookie) return { outcome: "rejected" };
+    return { outcome: "cookie", cookie };
+  } catch (err) {
+    const raw = err instanceof Error ? err.message : REFRESH_FAILED_REASON;
+    return { outcome: "failed", reason: scrubRefreshReason(raw, refreshToken) };
   } finally {
     clearTimeout(timeout);
   }
@@ -657,7 +682,13 @@ async function fetchJson(
  *     token, a missing cookie when a refresh token exists, or a later 401
  *     triggers at most one in-memory OAuth refresh. Still no cookie resolves
  *     `status:"unavailable"`, or `status:"error"` with
- *     `CURSOR_LOGIN_EXPIRED_REASON` when a refresh was attempted and failed.
+ *     `CURSOR_LOGIN_EXPIRED_REASON` when Cursor rejected the refresh
+ *     (`shouldLogout`, empty token, non-JWT). A refresh that fails on the
+ *     network or with a non-OK status, and still yields no cookie, resolves
+ *     `status:"error"` with that failure's short text — not the sign-in
+ *     sentence. That `error` still means the database read was already
+ *     allowed (the refresh token came from it); do not fold it back to
+ *     `unavailable` or the poller will treat a later sign-in as unconsented.
  *  2. With a cookie, fetch `usage-summary` and `auth/me` in parallel (each
  *     under a ~5s timeout) and parse via `parseCursorUsage`. Empty meters
  *     still resolves `status:"unavailable"` (we got a response but
@@ -715,7 +746,7 @@ export async function fetchCursorQuota(
   }
 
   let refreshed = false;
-  const tryRefresh = async (): Promise<string | null> => {
+  const tryRefresh = async (): Promise<CursorRefreshResult | null> => {
     if (refreshed || !refreshToken) return null;
     refreshed = true;
     return refreshCursorCookie(refreshToken, fetchImpl);
@@ -730,7 +761,17 @@ export async function fetchCursorQuota(
 
   if (refreshToken && (expired || !cookie)) {
     const fresh = await tryRefresh();
-    if (fresh) cookie = fresh;
+    if (fresh?.outcome === "cookie") cookie = fresh.cookie;
+    else if (fresh?.outcome === "failed" && !cookie) {
+      // No session to fall back on. A timeout or 5xx is not a rejected login.
+      return {
+        ...base,
+        planType: null,
+        status: "error",
+        meters: [],
+        reason: fresh.reason,
+      };
+    }
   }
 
   if (!cookie) {
@@ -776,7 +817,9 @@ export async function fetchCursorQuota(
     } catch (err) {
       if (!(err instanceof HttpStatusError) || err.status !== 401) throw err;
       const fresh = await tryRefresh();
-      if (!fresh) {
+      if (fresh?.outcome !== "cookie") {
+        // The usage call already 401'd, so a refresh that was rejected or
+        // that never answered still means this saved login cannot be used.
         return {
           ...base,
           planType: null,
@@ -785,7 +828,7 @@ export async function fetchCursorQuota(
           reason: CURSOR_LOGIN_EXPIRED_REASON,
         };
       }
-      [summaryJson, meJson] = await fetchBoth(fresh);
+      [summaryJson, meJson] = await fetchBoth(fresh.cookie);
     }
 
     const { meters, planType } = parseCursorUsage(

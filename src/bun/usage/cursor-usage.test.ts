@@ -436,4 +436,58 @@ describe("fetchCursorQuota — 401 recovery", () => {
     expect(quota.reason).not.toBe(CURSOR_LOGIN_EXPIRED_REASON);
     expect(f.count(OAUTH_URL)).toBe(0);
   });
+
+  test("a rejected refresh with no access token is the sign-in sentence and does not call usage-summary", async () => {
+    const f = makeFetch({
+      oauth: () => Response.json({ access_token: "", id_token: "", shouldLogout: true }),
+      summary: () => Response.json(USAGE_BODY),
+    });
+    const quota = await fetchCursorQuota(fakeHarness(), {
+      session: { accessToken: null, refreshToken: REFRESH_FIXTURE },
+      fetchImpl: f.fetchImpl,
+    });
+    expect(quota.status).toBe("error");
+    expect(quota.meters).toEqual([]);
+    expect(quota.reason).toBe(CURSOR_LOGIN_EXPIRED_REASON);
+    expect(quota.reason).not.toContain(REFRESH_FIXTURE);
+    expect(f.count(OAUTH_URL)).toBe(1);
+    expect(f.count(SUMMARY_URL)).toBe(0);
+  });
+
+  test("a refresh HTTP failure with no access token keeps the failure text, not the sign-in sentence", async () => {
+    const f = makeFetch({
+      oauth: () => new Response("unavailable", { status: 500 }),
+      summary: () => Response.json(USAGE_BODY),
+    });
+    const quota = await fetchCursorQuota(fakeHarness(), {
+      session: { accessToken: null, refreshToken: REFRESH_FIXTURE },
+      fetchImpl: f.fetchImpl,
+    });
+    expect(quota.status).toBe("error");
+    expect(quota.meters).toEqual([]);
+    expect(quota.reason).toBe("Cursor login refresh failed (HTTP 500)");
+    expect(quota.reason).not.toBe(CURSOR_LOGIN_EXPIRED_REASON);
+    expect(quota.reason).not.toContain(REFRESH_FIXTURE);
+    expect(f.count(OAUTH_URL)).toBe(1);
+    expect(f.count(SUMMARY_URL)).toBe(0);
+  });
+
+  test("a refresh that throws with no access token keeps the thrown text and strips the refresh token", async () => {
+    const f = makeFetch({
+      oauth: () => {
+        throw new Error(`network down ${REFRESH_FIXTURE}`);
+      },
+    });
+    const quota = await fetchCursorQuota(fakeHarness(), {
+      session: { accessToken: null, refreshToken: REFRESH_FIXTURE },
+      fetchImpl: f.fetchImpl,
+    });
+    expect(quota.status).toBe("error");
+    expect(quota.meters).toEqual([]);
+    expect(quota.reason).toBe("network down");
+    expect(quota.reason).not.toBe(CURSOR_LOGIN_EXPIRED_REASON);
+    expect(quota.reason).not.toContain(REFRESH_FIXTURE);
+    expect(f.count(OAUTH_URL)).toBe(1);
+    expect(f.count(SUMMARY_URL)).toBe(0);
+  });
 });
