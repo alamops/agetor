@@ -409,6 +409,43 @@ describe("fetchCursorQuota — 401 recovery", () => {
     }
   });
 
+  test("a 401 whose refresh fails with HTTP 500 keeps the failure text, not the sign-in sentence", async () => {
+    const live = mintJwt(nowSec() + 3600, "live");
+    const f = makeFetch({
+      oauth: () => new Response("unavailable", { status: 500 }),
+      summary: () => new Response("unauthorized", { status: 401 }),
+    });
+    const quota = await fetchCursorQuota(fakeHarness(), {
+      session: { accessToken: live, refreshToken: REFRESH_FIXTURE },
+      fetchImpl: f.fetchImpl,
+    });
+    expect(quota.status).toBe("error");
+    expect(quota.meters).toEqual([]);
+    expect(quota.reason).toBe("Cursor login refresh failed (HTTP 500)");
+    expect(quota.reason).not.toBe(CURSOR_LOGIN_EXPIRED_REASON);
+    expect(quota.reason).not.toContain(REFRESH_FIXTURE);
+    expect(f.count(OAUTH_URL)).toBe(1);
+    expect(f.count(SUMMARY_URL)).toBe(1);
+  });
+
+  test("a 401 whose refresh is rejected is the sign-in sentence", async () => {
+    const live = mintJwt(nowSec() + 3600, "live");
+    const f = makeFetch({
+      oauth: () => Response.json({ access_token: "", id_token: "", shouldLogout: true }),
+      summary: () => new Response("unauthorized", { status: 401 }),
+    });
+    const quota = await fetchCursorQuota(fakeHarness(), {
+      session: { accessToken: live, refreshToken: REFRESH_FIXTURE },
+      fetchImpl: f.fetchImpl,
+    });
+    expect(quota.status).toBe("error");
+    expect(quota.meters).toEqual([]);
+    expect(quota.reason).toBe(CURSOR_LOGIN_EXPIRED_REASON);
+    expect(quota.reason).not.toContain(REFRESH_FIXTURE);
+    expect(f.count(OAUTH_URL)).toBe(1);
+    expect(f.count(SUMMARY_URL)).toBe(1);
+  });
+
   test("a 401 with no refresh token resolves login-expired after exactly one usage request", async () => {
     const live = mintJwt(nowSec() + 3600, "live");
     const f = makeFetch({ summary: () => new Response("unauthorized", { status: 401 }) });

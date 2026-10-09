@@ -694,8 +694,10 @@ async function fetchJson(
  *     under a ~5s timeout) and parse via `parseCursorUsage`. Empty meters
  *     still resolves `status:"unavailable"` (we got a response but
  *     recognized nothing in it); non-empty meters resolve `status:"ok"`.
- *     A 401 resolves `status:"error"` with `CURSOR_LOGIN_EXPIRED_REASON`
- *     (after that one refresh, if a refresh token was available).
+ *     A 401 after a refresh Cursor rejected, or with no refresh token,
+ *     resolves `status:"error"` with `CURSOR_LOGIN_EXPIRED_REASON`. A
+ *     refresh that fails on the network or with a non-OK status keeps that
+ *     failure's short text, same as the pre-request path.
  *  3. Any other thrown error (network, timeout, non-401 HTTP, JSON parse)
  *     is caught and resolves `status:"error"` with a short reason — never
  *     propagated. `opts.fetchImpl` replaces `fetch`.
@@ -820,9 +822,18 @@ export async function fetchCursorQuota(
     } catch (err) {
       if (!(err instanceof HttpStatusError) || err.status !== 401) throw err;
       const fresh = await tryRefresh();
+      if (fresh?.outcome === "failed") {
+        // A timeout or 5xx is not a rejected login, same as the pre-request path.
+        return {
+          ...base,
+          planType: null,
+          status: "error",
+          meters: [],
+          reason: fresh.reason,
+        };
+      }
       if (fresh?.outcome !== "cookie") {
-        // The usage call already 401'd, so a refresh that was rejected or
-        // that never answered still means this saved login cannot be used.
+        // Rejected refresh, or no refresh token. The usage call already 401'd.
         return {
           ...base,
           planType: null,
