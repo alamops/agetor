@@ -232,3 +232,52 @@ test("refreshOne passes allowIdeRead:true when force:true, even with no prior sn
 
   expect(capturedOpts?.allowIdeRead).toBe(true);
 });
+
+test("refreshOne passes allowIdeRead:true when the prior snapshot is an error (a previous allowed read)", async () => {
+  harnesses.setEnabled("cursor", true);
+  harnessUsage.upsert(
+    fakeQuota({
+      harnessId: "cursor",
+      kind: "cursor",
+      status: "error",
+      meters: [],
+      reason: "login expired",
+      fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000,
+    }),
+  );
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+
+  await refreshOne("cursor");
+
+  expect(capturedOpts?.allowIdeRead).toBe(true);
+});
+
+test("a provider throw on a non-allowed sweep is stored unavailable, and does not open the read next sweep", async () => {
+  harnesses.setEnabled("cursor", true);
+  __setUsageProviderForTest("cursor", async () => {
+    throw new Error("provider regressed");
+  });
+
+  await refreshOne("cursor");
+
+  expect(harnessUsage.get("cursor")?.status).toBe("unavailable");
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor", status: "unavailable", meters: [] });
+  });
+  // Backdate the stored row past the freshness floor so the provider runs.
+  const stored = harnessUsage.get("cursor")!;
+  harnessUsage.upsert({ ...stored, fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000 });
+
+  await refreshOne("cursor");
+
+  expect(capturedOpts).toBeDefined();
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+});

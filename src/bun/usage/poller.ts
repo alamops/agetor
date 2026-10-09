@@ -108,31 +108,43 @@ export async function refreshOne(
   }
 
   // Cross-app-read gate (currently Cursor-only — see cursor-usage.ts): allow
-  // it on an explicit user refresh, or when a prior *successful* (`ok`)
-  // snapshot exists for this harness — that's the only proof the cross-app
-  // read actually happened once (so the macOS TCC grant was given and now
-  // persists). A merely-existing snapshot is NOT enough: `refreshOne` upserts
-  // every result, INCLUDING the `unavailable` one the skip path itself writes
-  // (and the browser-cookie fallback is stubbed, so `ok` is only reachable via
-  // a real IDE read). Gating on `!= null` would let the very snapshot produced
-  // by skipping re-open the read on the next sweep, re-tripping the prompt for
-  // an un-consented user. A first-ever background sweep has no `ok` snapshot,
-  // so it stays false and the provider skips the cross-app read.
+  // it on an explicit user refresh, or when a prior `ok` or `error` snapshot
+  // exists for this harness — either proves this process was already allowed
+  // to open Cursor's database once (so the macOS TCC grant was given and now
+  // persists). `fetchCursorQuota` returns `error` only after that read was
+  // allowed: a cookie was derived, or a refresh token was read and the
+  // refresh was rejected or the token endpoint failed. The no-cookie
+  // refresh-failure path is still `error` on purpose — folding it back to
+  // `unavailable` would close this gate and hide a later sign-in. The skip
+  // path (read not allowed) writes `unavailable`. The catch below does the
+  // same when this call was not allowed to read: a throw during a skipped
+  // sweep must not be stored as `error`, or the next sweep would treat it
+  // as consent.
+  // A merely-existing snapshot is NOT
+  // enough: `refreshOne` upserts every result, INCLUDING that `unavailable`
+  // one, so gating on `!= null` (or letting `unavailable` count) would let the
+  // very snapshot produced by skipping re-open the read on the next sweep,
+  // re-tripping the prompt for an un-consented user. A first-ever background
+  // sweep has no such snapshot, so it stays false and the provider skips the
+  // cross-app read.
+  const priorStatus = harnessUsage.get(harness.id)?.status;
   const allowIdeRead =
-    Boolean(opts?.force) || harnessUsage.get(harness.id)?.status === "ok";
+    Boolean(opts?.force) || priorStatus === "ok" || priorStatus === "error";
 
   let quota: HarnessQuota;
   try {
     quota = await provider(harness, { allowIdeRead });
   } catch (err) {
     // Belt-and-braces: providers are documented to always resolve, never
-    // throw. If one regresses, synthesize an error snapshot rather than
-    // letting the throw escape into the sweep/route caller.
+    // throw. If one regresses, synthesize a snapshot rather than letting
+    // the throw escape into the sweep/route caller. A throw on a call that
+    // was not allowed to touch the IDE database is stored as `unavailable`,
+    // not `error` — an `error` row would open the cross-app read next sweep.
     quota = {
       harnessId: harness.id,
       kind: harness.kind,
       planType: null,
-      status: "error",
+      status: allowIdeRead ? "error" : "unavailable",
       source: "api",
       fetchedAtMs: Date.now(),
       meters: [],

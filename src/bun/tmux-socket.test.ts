@@ -11,6 +11,12 @@ process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-tmux-socke
 const { tmuxSocketName, tmuxSocketArgs, deriveTmuxSocketName } = await import("./tmux-resolution.ts");
 const { dataDir } = await import("./db.ts");
 
+/** Production (and an unset NODE_ENV) uses a socket named from the open data
+ *  dir, not tmux's shared default. `AGETOR_TMUX_SOCKET=default` is what forces
+ *  null. Use the db singleton's path: in a full `bun test` run another file
+ *  may have opened the database first, so `AGETOR_DATA_DIR` at this point is
+ *  not necessarily the directory `tmuxSocketName()` reads. */
+
 // Snapshot + restore the env vars the resolver reads around EVERY test, so a
 // case that mutates AGETOR_TMUX_SOCKET / NODE_ENV can't leak into sibling
 // tests in the same bun process (same idiom as withFakeTmuxBin in

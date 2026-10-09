@@ -8,7 +8,7 @@
 // module scope BEFORE `./db.ts` is dynamically imported in `beforeAll` (the
 // db opens — and migrates — on module load), and `rmTestDataDir` (never a
 // bare `rmSync`) tears the dir down afterward.
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll, beforeEach, afterAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -30,6 +30,14 @@ let HarnessInUseError: typeof import("./db.ts").HarnessInUseError;
 
 beforeAll(async () => {
   ({ db, tasks, runs, harnesses, agentProfiles, AgentProfileNameError, HarnessInUseError } = await import("./db.ts"));
+});
+
+// bun test loads every file in one process and one SQLite database. An
+// earlier file (the agent-profiles HTTP tests) can leave a "Research Bot"
+// row behind. Wipe before each case so this file's inserts don't collide.
+beforeEach(() => {
+  db.run(`DELETE FROM tasks`);
+  db.run(`DELETE FROM agent_profiles`);
 });
 
 afterAll(() => {
