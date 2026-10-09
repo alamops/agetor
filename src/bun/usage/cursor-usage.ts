@@ -684,11 +684,12 @@ async function fetchJson(
  *     `status:"unavailable"`, or `status:"error"` with
  *     `CURSOR_LOGIN_EXPIRED_REASON` when Cursor rejected the refresh
  *     (`shouldLogout`, empty token, non-JWT). A refresh that fails on the
- *     network or with a non-OK status, and still yields no cookie, resolves
- *     `status:"error"` with that failure's short text — not the sign-in
- *     sentence. That `error` still means the database read was already
- *     allowed (the refresh token came from it); do not fold it back to
- *     `unavailable` or the poller will treat a later sign-in as unconsented.
+ *     network or with a non-OK status resolves `status:"error"` with that
+ *     failure's short text — not the sign-in sentence — even when a stale
+ *     access-token cookie was already derived. That cookie is not sent.
+ *     That `error` still means the database read was already allowed (the
+ *     refresh token came from it); do not fold it back to `unavailable` or
+ *     the poller will treat a later sign-in as unconsented.
  *  2. With a cookie, fetch `usage-summary` and `auth/me` in parallel (each
  *     under a ~5s timeout) and parse via `parseCursorUsage`. Empty meters
  *     still resolves `status:"unavailable"` (we got a response but
@@ -762,8 +763,10 @@ export async function fetchCursorQuota(
   if (refreshToken && (expired || !cookie)) {
     const fresh = await tryRefresh();
     if (fresh?.outcome === "cookie") cookie = fresh.cookie;
-    else if (fresh?.outcome === "failed" && !cookie) {
-      // No session to fall back on. A timeout or 5xx is not a rejected login.
+    else if (fresh?.outcome === "failed") {
+      // A timeout or 5xx is not a rejected login, and the cookie still in
+      // hand is the expired one this refresh was meant to replace. Return
+      // before fetchBoth sends it.
       return {
         ...base,
         planType: null,

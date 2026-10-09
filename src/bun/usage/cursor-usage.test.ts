@@ -454,6 +454,25 @@ describe("fetchCursorQuota — 401 recovery", () => {
     expect(f.count(SUMMARY_URL)).toBe(0);
   });
 
+  test("a refresh HTTP failure with an expired access token returns the failure text and does not call usage-summary", async () => {
+    const expired = mintJwt(nowSec() - 3600, "expired");
+    const f = makeFetch({
+      oauth: () => new Response("unavailable", { status: 500 }),
+      summary: () => Response.json(USAGE_BODY),
+    });
+    const quota = await fetchCursorQuota(fakeHarness(), {
+      session: { accessToken: expired, refreshToken: REFRESH_FIXTURE },
+      fetchImpl: f.fetchImpl,
+    });
+    expect(quota.status).toBe("error");
+    expect(quota.meters).toEqual([]);
+    expect(quota.reason).toBe("Cursor login refresh failed (HTTP 500)");
+    expect(quota.reason).not.toBe(CURSOR_LOGIN_EXPIRED_REASON);
+    expect(quota.reason).not.toContain(REFRESH_FIXTURE);
+    expect(f.count(OAUTH_URL)).toBe(1);
+    expect(f.count(SUMMARY_URL)).toBe(0);
+  });
+
   test("a refresh HTTP failure with no access token keeps the failure text, not the sign-in sentence", async () => {
     const f = makeFetch({
       oauth: () => new Response("unavailable", { status: 500 }),
