@@ -2223,7 +2223,7 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // (`~/.fx/settings.json` on the reference account). Ids are Vercel AI
   // Gateway ids, passed verbatim. fx is exempt from the "always default to
   // the best available model" rule above: the Gateway bills per token to the
-  // user's own account, and flagship tiers (the eighteen `catalogOnly` rows in
+  // user's own account, and flagship tiers (the nineteen `catalogOnly` rows in
   // `AGENT_OPTIONS.fx.models`) stay one click away
   // in the picker as catalog-gated rows — offered only when the signed-in
   // account's catalog actually contains them (see `AgentOption.catalogOnly`).
@@ -2472,6 +2472,23 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
       high: "claude-fable-5-high",
       medium: "claude-fable-5-medium",
       low: "claude-fable-5-low",
+    },
+  },
+  // Measured 2026-10-07 on cursor-agent 2026.10.01: ten rows, no -fast, zero
+  // labels contain "1M". Thinking ids are
+  // claude-haiku-5-5-thinking-{low,medium,high,xhigh,max}. The No Thinking
+  // siblings claude-haiku-5-5-{effort} are intentionally uncovered so they
+  // stay pickable as discovered rows and a stored No Thinking id keeps
+  // launching No Thinking — never put the plain ids in effortIds.
+  "claude-haiku-5-5": {
+    label: "Haiku 5.5",
+    hint: "Anthropic Haiku 5.5 via Cursor.",
+    effortIds: {
+      max: "claude-haiku-5-5-thinking-max",
+      xhigh: "claude-haiku-5-5-thinking-xhigh",
+      high: "claude-haiku-5-5-thinking-high",
+      medium: "claude-haiku-5-5-thinking-medium",
+      low: "claude-haiku-5-5-thinking-low",
     },
   },
   // Ids verified against `cursor-agent models` (CLI 2026.09.26-dd393fe, 250
@@ -2789,7 +2806,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "ultra", label: "Ultra", hint: "Codex's top tier — maximum reasoning plus automatic delegation to internal sub-agents. Several times Max's usage; Codex-only today." },
   { id: "max", label: "Max thinking", hint: "Absolute maximum reasoning effort. Separate from Cursor Max Mode context." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5.1 / 5 / Mythos 5.1 / 5 / Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / Sonnet 5.5 / 5 / codex." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5.1 / 5 / Mythos 5.1 / 5 / Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / Sonnet 5.5 / 5 / Haiku 5.5 / codex." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default on most models (Opus 5.5 defaults to medium)." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
@@ -2804,6 +2821,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  *       https://platform.claude.com/docs/en/build-with-claude/effort
  *     Opus 4.7 → low/medium/high/xhigh/max
  *     Sonnet 5.5 / 5 → low/medium/high/xhigh/max
+ *     Haiku 5.5 → low/medium/high/xhigh/max
  *     Sonnet 4.6 → low/medium/high/max
  *     Haiku 4.5 → effort parameter NOT supported
  *   - Codex `model_reasoning_effort`:
@@ -2820,8 +2838,8 @@ export const EFFORT_OPTIONS: AgentOption[] = [
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
   // effort parameter is API-supported on Fable 5.1 / 5 / Mythos 5.1 / 5 /
-  // Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / Sonnet 5.5 / 5 / Sonnet 4.6 / Opus 4.5 (xhigh is
-  // Fable-, Mythos-, Opus-, and Sonnet-5.5/5-only; Sonnet 4.6 has no xhigh;
+  // Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / Sonnet 5.5 / 5 / Haiku 5.5 / Sonnet 4.6 / Opus 4.5 (xhigh is
+  // Fable-, Mythos-, Opus-, Sonnet-5.5/5- and Haiku-5.5-only; Sonnet 4.6 has no xhigh;
   // Haiku 4.5 doesn't support effort at all). The `/effort` CLI command
   // accepts more levels but the underlying API request would fail for
   // unsupported pairs, so we filter at the picker rather than letting the
@@ -2859,6 +2877,11 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "sonnet-4.6": ["max", "high", "medium", "low"],
     // Haiku 4.5 doesn't support the effort parameter — `supportedEfforts`
     // returns `[]` and the picker disables itself.
+    // Haiku 5.5 is the first Haiku with effort (low→max incl. xhigh). The
+    // Gateway also lists `none` and a thinking toggle for it; both are
+    // deliberately NOT offered on claude-code because CLAUDE_EFFORT_VALUES
+    // would drop `none`.
+    "haiku-5.5": ["max", "xhigh", "high", "medium", "low"],
     "haiku-4.5": [],
   },
   codex: {
@@ -2948,7 +2971,9 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // 2026-09-22; re-measured none…max on 2026-09-30 and the rows refreshed),
   // likewise not ACP-probed (see their rows); a 33rd, anthropic/claude-sonnet-5.5, joined
   // it on 2026-09-28 the same way (see its row); a 34th, openai/gpt-6.1-sol,
-  // joined it on 2026-09-30 the same way (see its row). An
+  // joined it on 2026-09-30 the same way (see its row); a 35th,
+  // anthropic/claude-haiku-5.5, joined it on 2026-10-07 the same way (see
+  // its row). An
   // unknown/discovered-only fx id falls back to `DEFAULT_MODEL.fx`'s set via
   // `supportedEfforts`, and the driver validates at runtime against whatever
   // `effort` option fx actually returns for that session — so drift between
@@ -3016,6 +3041,10 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     // none) plus fx's always-present auto, same shape as the
     // anthropic/claude-opus-5.5 row. docs/plans/add-gpt-6-1-sol.md §3 D3.
     "openai/gpt-6.1-sol": ["max", "xhigh", "high", "medium", "low", "auto"],
+    // 2026-10-07: not ACP-probed — rests on the public Gateway catalog entry's
+    // reasoning_options (effort low/medium/high/xhigh/max plus none, and a
+    // thinking toggle) plus fx's always-present auto.
+    "anthropic/claude-haiku-5.5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
   },
   antigravity: {
     "gemini-3.8-flash-high": ["max", "xhigh", "high", "medium", "low"],
@@ -3153,6 +3182,7 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
     "sonnet-5.5": [],
     "sonnet-5": [],
     "sonnet-4.6": [],
+    "haiku-5.5": [],
     "haiku-4.5": [],
   },
   codex: {},
@@ -3213,7 +3243,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "sonnet-5.5", label: "Sonnet 5.5", hint: "Faster, lower-cost complement to Opus 5.5 ($2/$10 per MTok) — 30%+ faster than Sonnet 5 on coding/agentic work. Claude Code's own default effort for it is medium." },
       { id: "sonnet-5", label: "Sonnet 5", hint: "Prior Sonnet release ($2/$10 per MTok)." },
       { id: "sonnet-4.6", label: "Sonnet 4.6", hint: "Prior Sonnet generation." },
-      { id: "haiku-4.5", label: "Haiku 4.5", hint: "Fast and cheap." },
+      { id: "haiku-5.5", label: "Haiku 5.5", hint: "Cheapest, fastest Claude ($0.10/$0.50 per MTok up to 100k tokens, $0.50/$2.50 above). 1M context. API default effort is medium." },
+      { id: "haiku-4.5", label: "Haiku 4.5", hint: "Prior Haiku release ($1/$5 per MTok). No effort control." },
     ],
     modes: [
       { id: "auto", label: "Auto", hint: "Hands-off — claude's auto-mode AI classifier decides per call. Clarifying questions and plan-approval modals route to agetor's UI." },
@@ -3353,6 +3384,11 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // hence catalogOnly — eighteen catalogOnly rows, 34 curated ids total.
     // Every prior curated id is still present except mistral/devstral-2,
     // still gone.
+    // 2026-10-07: anthropic/claude-haiku-5.5 added from fx 0.0.10's
+    // unauthenticated catalog (`fx models --json`, 259 ids; no -fast twin);
+    // signed-in presence unverified, hence catalogOnly — nineteen catalogOnly
+    // rows, 35 curated ids total. Every prior curated id is still present
+    // except mistral/devstral-2, still gone.
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
@@ -3388,18 +3424,19 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "openai/gpt-6-luna", label: "GPT-6 Luna", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "anthropic/claude-sonnet-5.5", label: "Claude Sonnet 5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "openai/gpt-6.1-sol", label: "GPT-6.1 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-haiku-5.5", label: "Claude Haiku 5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [
       { id: "yolo", label: "Full access", hint: "Hands-off default — disables fx's permission checks entirely, so no tool call is ever held. What fx 0.0.8 calls --full-access / /permissions full-access (still true on 0.0.10); yolo is fx's surviving alias and stays agetor's stored id." },
       { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
-    // 21 of the 34 curated models accept the effort flag (see
+    // 22 of the 35 curated models accept the effort flag (see
     // MODEL_EFFORT_SUPPORT.fx — 16 live-probed on fx 0.0.10, plus
     // anthropic/claude-opus-5.5, openai/gpt-6-sol and openai/gpt-6-luna from
     // their Gateway reasoning_options, all 2026-09-22, and
     // anthropic/claude-sonnet-5.5 on 2026-09-28 and openai/gpt-6.1-sol on
-    // 2026-09-30); the other 13
+    // 2026-09-30, and anthropic/claude-haiku-5.5 on 2026-10-07); the other 13
     // report an empty set and the picker collapses for those, same as any
     // other kind's no-effort models. Every id-supported model always
     // includes `auto` (fx's own default) last, per EFFORT_OPTIONS.

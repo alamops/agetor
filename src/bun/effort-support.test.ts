@@ -16,6 +16,12 @@ import {
 } from "../shared/types.ts";
 import type { ModelOption } from "../shared/model-options.ts";
 
+test("claude haiku-5.5 exposes exactly max/xhigh/high/medium/low (no none row)", () => {
+  const ids = supportedEfforts("claude-code", "haiku-5.5").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+  expect(ids).not.toContain("none");
+});
+
 test("claude sonnet-5.5 exposes exactly max/xhigh/high/medium/low (no none row)", () => {
   const ids = supportedEfforts("claude-code", "sonnet-5.5").map((o) => o.id);
   // Exact match is deliberate: there is no `none` row because thinking can't
@@ -429,6 +435,7 @@ test("cursor model catalog includes the screenshot/default surface", () => {
   expect(ids).toContain("composer-2.5");
   expect(ids).toContain("claude-opus-5-5");
   expect(ids).toContain("claude-sonnet-5-5");
+  expect(ids).toContain("claude-haiku-5-5");
   expect(ids).toContain("claude-opus-5");
   expect(ids).toContain("claude-opus-4-7");
   expect(ids).toContain("gpt-5.6-sol");
@@ -579,6 +586,24 @@ test("cursorModelArg composes Sonnet 5.5 efforts but never -fast or the max-mode
   // for Sonnet 5.5 and rejected the `[context=1m,…]` bracket in a live probe
   // (docs/plans/add-claude-sonnet-5-5.md §8 A1).
   expect(cursorModelArg("claude-sonnet-5-5", "xhigh", false, true)).toBe("claude-sonnet-5-5-xhigh");
+});
+
+test("cursorModelArg composes Haiku 5.5 THINKING variants but never -fast or the max-mode bracket", () => {
+  expect(cursorModelArg("claude-haiku-5-5", "low", false)).toBe("claude-haiku-5-5-thinking-low");
+  // fast never appends -fast.
+  expect(cursorModelArg("claude-haiku-5-5", "high", true)).toBe("claude-haiku-5-5-thinking-high");
+  expect(cursorModelSupportsFast("claude-haiku-5-5", "max")).toBe(false);
+  expect(cursorModelSupportsMaxMode("claude-haiku-5-5")).toBe(false);
+  // No [context=1m,…] bracket.
+  expect(cursorModelArg("claude-haiku-5-5", "xhigh", false, true)).toBe("claude-haiku-5-5-thinking-xhigh");
+  expect(supportedEfforts("cursor", "claude-haiku-5-5").map((o) => o.id)).toEqual([
+    "max", "xhigh", "high", "medium", "low",
+  ]);
+  expect(cursorModelIdCoveredByCatalog("claude-haiku-5-5-thinking-medium")).toBe(true);
+  // The No Thinking form is deliberately uncovered.
+  expect(cursorModelIdCoveredByCatalog("claude-haiku-5-5-medium")).toBe(false);
+  // Generic `${variant}-fast` coverage rule.
+  expect(cursorModelIdCoveredByCatalog("claude-haiku-5-5-thinking-medium-fast")).toBe(true);
 });
 
 test("cursorModelIdCoveredByCatalog recognizes Sonnet 5.5 effort variants but not a -thinking- form", () => {

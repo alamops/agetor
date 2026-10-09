@@ -16,9 +16,6 @@ const { dataDir } = await import("./db.ts");
  *  null. Use the db singleton's path: in a full `bun test` run another file
  *  may have opened the database first, so `AGETOR_DATA_DIR` at this point is
  *  not necessarily the directory `tmuxSocketName()` reads. */
-function dataDirSocket(): string {
-  return deriveTmuxSocketName(dataDir);
-}
 
 // Snapshot + restore the env vars the resolver reads around EVERY test, so a
 // case that mutates AGETOR_TMUX_SOCKET / NODE_ENV can't leak into sibling
@@ -65,13 +62,14 @@ test('AGETOR_TMUX_SOCKET="default" forces tmux\'s own default socket (null / no 
 
 test("outside test env with no override, socket is derived from the data dir", () => {
   delete process.env.AGETOR_TMUX_SOCKET;
+  const derived = deriveTmuxSocketName(dataDir);
   process.env.NODE_ENV = "production";
-  expect(tmuxSocketName()).toBe(dataDirSocket());
-  expect(tmuxSocketArgs()).toEqual(["-L", dataDirSocket()]);
+  expect(tmuxSocketName()).toBe(derived);
+  expect(tmuxSocketArgs()).toEqual(["-L", derived]);
 
   delete process.env.NODE_ENV;
-  expect(tmuxSocketName()).toBe(dataDirSocket());
-  expect(tmuxSocketArgs()).toEqual(["-L", dataDirSocket()]);
+  expect(tmuxSocketName()).toBe(derived);
+  expect(tmuxSocketArgs()).toEqual(["-L", derived]);
 });
 
 test("env is read at CALL time — flipping vars between calls changes the result (no caching)", () => {
@@ -93,7 +91,7 @@ test("env is read at CALL time — flipping vars between calls changes the resul
   expect(tmuxSocketName()).toBe("agetor-test");
 
   process.env.NODE_ENV = "production";
-  expect(tmuxSocketName()).toBe(dataDirSocket());
+  expect(tmuxSocketName()).toBe(deriveTmuxSocketName(dataDir));
 
   process.env.NODE_ENV = "test";
   expect(tmuxSocketArgs()).toEqual(["-L", "agetor-test"]);

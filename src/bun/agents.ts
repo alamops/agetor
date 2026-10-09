@@ -7,6 +7,7 @@ import { settleSubagentById } from "./claude-subagents.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
   CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
+  openContinuationRun,
   spawnClaudeViaTmux,
   toClaudeModeString,
   type ChunkHandler,
@@ -166,6 +167,7 @@ const CLAUDE_MODEL_FLAG: Record<string, string> = {
   "sonnet-5.5": "claude-sonnet-5-5",
   "sonnet-5": "claude-sonnet-5",
   "sonnet-4.6": "claude-sonnet-4-6",
+  "haiku-5.5": "claude-haiku-5-5",
   "haiku-4.5": "claude-haiku-4-5",
 };
 
@@ -230,7 +232,10 @@ export function claudeModelIdFromArg(arg: string): string | null {
  * Sonnet model on the Anthropic API"; the binary's alias table maps `sonnet` →
  * `claude-sonnet-5-5` and the picker's previous-version row reads "Sonnet 5 -
  * previous Sonnet version"), so `sonnet-5` joins the null (next-run-only)
- * bucket too. `mythos-5` and `mythos-5.1` both have no picker row
+ * bucket too. Haiku follows the same current-release rule: Claude CLI 2.1.293
+ * maps the alias `haiku` to `claude-haiku-5-5` (constant HAIKU_ID), so
+ * `haiku-5.5` owns the "Haiku" row and the superseded `haiku-4.5` joins the
+ * null bucket alongside `opus-5`, `sonnet-5` and `fable-5`. `mythos-5` and `mythos-5.1` both have no picker row
  * at all — claude's picker has no Mythos row of any kind. An unknown/future
  * raw id also returns `null` rather than guess. Sole caller:
  * `reconcileTaskSession`'s model mirror (`orchestrator.ts`), which feeds the
@@ -244,7 +249,7 @@ export function claudeModelPickerFamily(id: string): "Opus" | "Sonnet" | "Fable"
       return "Sonnet";
     case "fable-5.1":
       return "Fable";
-    case "haiku-4.5":
+    case "haiku-5.5":
       return "Haiku";
     default:
       return null;
@@ -933,7 +938,13 @@ export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
  * `done`) on turn 2+. These exist because the pipeline runner sends ONE
  * automatic reminder — an ordinary follow-up `sendInput` turn on the step
  * task — when a step's reply lacked a valid `<handoff>`; that reminder text
- * never carries this marker itself. A per-task turn counter
+ * never carries this marker itself. `continue-then-done` is turn 1 only: the
+ * reply has no `<handoff>`, then a real continuation run (the same factory
+ * a stray JSONL line uses) is opened and that run writes a terminal
+ * handoff. The continuation is scheduled as a microtask after this turn's
+ * `done` resolves, so the first run's settle still runs and sees the newer
+ * run already `running`. Later turns ignore the suffix's continuation
+ * behavior and emit an ordinary terminal handoff. A per-task turn counter
  * (`fakeHandoffTurnCounts` below) tracks which turn a given taskId is on,
  * and when the CURRENT turn's `prompt` carries no marker at all (true for
  * that reminder, and for any other marker-less follow-up), the driver falls
@@ -1062,6 +1073,55 @@ function resolveFakeHandoffTurnSuffix(rawSuffix: string | null, turn: number): s
   const firstTurnBehavior: string = match[1] ?? rawSuffix;
   const laterToken: string = match[2] ?? rawSuffix;
   return turn <= 1 ? firstTurnBehavior : laterToken;
+}
+
+/** Terminal handoff the `continue-then-done` continuation writes. `next`
+ *  is null so a step with one outgoing edge still takes it, and a step
+ *  with none is finished. */
+function fakeTerminalHandoffText(summary: string): string {
+  const handoff = {
+    schemaVersion: 1,
+    purpose: "fake purpose",
+    summary,
+    reason: "fake reason",
+    next: null as string | null,
+    artifacts: [] as string[],
+    openQuestions: [] as string[],
+    status: "done" as const,
+  };
+  return `Done.\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`;
+}
+
+/**
+ * Adopt a continuation run and write a terminal handoff onto it. Called
+ * from a microtask queued AFTER the current turn's `done` promise is
+ * resolved, so that turn's settle is already queued and still sees this
+ * newer run as `running` when it classifies. The continuation's own
+ * `done` is resolved from a further microtask so it cannot settle before
+ * that classification. A null factory (no orchestrator wired) is a no-op:
+ * the turn that just finished simply has no handoff.
+ */
+function adoptFakeHandoffContinuation(taskId: string): void {
+  const hooks = openContinuationRun(taskId);
+  if (!hooks) return;
+  let resolveCont!: (code: number) => void;
+  const contDone = new Promise<number>((res) => { resolveCont = res; });
+  let settled = false;
+  const finish = (code: number) => {
+    if (settled) return;
+    settled = true;
+    resolveCont(code);
+  };
+  hooks.onAdopted({
+    kill: () => finish(0),
+    writeInput: () => true,
+    done: contDone,
+  });
+  hooks.onChunk("assistant", fakeTerminalHandoffText("continued after background task"));
+  queueMicrotask(() => {
+    hooks.onChunk("status", "turn complete");
+    finish(0);
+  });
 }
 
 /**
@@ -1532,10 +1592,12 @@ function makeFakeAgent(
       });
     }
     after(subagentSpec ? subagentSpec.runMs + 30 : Math.min(20, resolveDelayMs - 10), () => {
-      if (suffix === "missing") {
+      if (suffix === "missing" || (suffix === "continue-then-done" && turn <= 1)) {
         onChunk("assistant", "I finished the work but forgot the handoff.");
       } else if (suffix === "invalid") {
         onChunk("assistant", `Done.\n<${HANDOFF_TAG}>\n{not json\n</${HANDOFF_TAG}>`);
+      } else if (suffix === "continue-then-done") {
+        onChunk("assistant", fakeTerminalHandoffText("fake summary for continue-then-done"));
       } else {
         const next = suffix && suffix !== "done" ? suffix : null;
         const handoff = {
@@ -1551,7 +1613,16 @@ function makeFakeAgent(
         onChunk("assistant", `Done.\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`);
       }
     });
-    after(resolveDelayMs, () => { onChunk("status", "turn complete"); resolveDone(0); });
+    after(resolveDelayMs, () => {
+      onChunk("status", "turn complete");
+      resolveDone(0);
+      // After `done` is resolved, its settle is queued. This microtask
+      // runs before that settle, so the continuation is already the
+      // current run when the missing handoff is classified.
+      if (suffix === "continue-then-done" && turn <= 1) {
+        queueMicrotask(() => adoptFakeHandoffContinuation(taskId));
+      }
+    });
   } else if (
     process.env.AGETOR_FAKE_CLAUDE_TODOS === "1"
     || prompt.includes(FAKE_CLAUDE_TODOS_PROMPT_MARKER)

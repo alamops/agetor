@@ -6,6 +6,7 @@ import retireGemini3ProPreview from "./migrations/049_retire_gemini_3_pro_previe
 import normalizeCursorGrok47 from "./migrations/055_normalize_cursor_grok_4_7.sql" with { type: "text" };
 import normalizeCursorOpus55 from "./migrations/056_normalize_cursor_opus_5_5.sql" with { type: "text" };
 import normalizeCursorSonnet55 from "./migrations/060_normalize_cursor_sonnet_5_5.sql" with { type: "text" };
+import normalizeCursorHaiku55 from "./migrations/062_normalize_cursor_haiku_5_5.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
 
 // Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
@@ -707,14 +708,122 @@ test("060_normalize_cursor_sonnet_5_5 folds suffixed claude-sonnet-5-5 variants 
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("060 (cursor Sonnet 5.5) sits right after 059, with its pre-rebase id as an alias, and 061 is last", () => {
+test("060 (cursor Sonnet 5.5) sits right after 059, with its pre-rebase id as an alias", () => {
   const at = migrations.findIndex((m) => m.id === "060_normalize_cursor_sonnet_5_5");
+  expect(at).toBeGreaterThan(0);
   expect(migrations[at - 1]?.id).toBe("059_task_pipeline_id_index");
+  // 061 still follows 060. 062 (Haiku 5.5) is what moved "last" off 061.
+  expect(migrations[at + 1]?.id).toBe("061_antigravity_harness");
   // Written on its branch as 057 while `main` took 057–059 for pipelines —
   // renumbered on rebase; a dev DB that applied it under the old id must not
   // re-run it, hence the alias (the SQL is idempotent either way).
   expect(migrations[at]?.aliases).toEqual(["057_normalize_cursor_sonnet_5_5"]);
   expect(migrations[at]?.sql).toContain("claude-sonnet-5-5");
-  expect(migrations[at + 1]?.id).toBe("061_antigravity_harness");
-  expect(migrations.at(-1)?.id).toBe("061_antigravity_harness");
+});
+
+test("062_normalize_cursor_haiku_5_5 folds claude-haiku-5-5-thinking-* ids into base id + effort (fast reset to 0) on cursor-kind tasks, agent profiles and the lastModel:cursor pref, idempotently", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE agent_profiles (
+      id TEXT PRIMARY KEY,
+      harness_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO harnesses (id, kind) VALUES
+      ('cursor', 'cursor'), ('cursor-2', 'cursor'), ('fx', 'fx'), ('codex', 'codex');
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'cursor', 'claude-haiku-5-5-thinking-max', NULL, 0),
+      ('t02', 'cursor-2', 'claude-haiku-5-5-thinking-xhigh', 'low', 0),
+      ('t03', 'cursor', 'claude-haiku-5-5-thinking-high', NULL, 1),
+      ('t04', 'cursor', 'claude-haiku-5-5-thinking-medium', 'high', 0),
+      ('t05', 'cursor', 'claude-haiku-5-5-thinking-low', NULL, 0),
+      ('t06', 'cursor', 'claude-haiku-5-5-low', NULL, 0),
+      ('t07', 'cursor', 'claude-haiku-5-5-thinking-minimal', NULL, 0),
+      ('t08', 'cursor', 'claude-sonnet-5-5-high', NULL, 0),
+      ('t09', 'fx', 'anthropic/claude-haiku-5.5', NULL, 0),
+      ('t10', 'cursor', NULL, NULL, 0),
+      ('t11', 'codex', 'claude-haiku-5-5-thinking-high', 'high', 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'cursor', 'claude-haiku-5-5-thinking-xhigh', NULL, 0),
+      ('p02', 'cursor-2', 'claude-haiku-5-5-thinking-high', 'low', 1),
+      ('p03', 'codex', 'claude-haiku-5-5-thinking-low', NULL, 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:cursor', 'claude-haiku-5-5-thinking-medium', 1),
+      ('lastModel:codex', 'claude-haiku-5-5-thinking-medium', 1),
+      ('lastMode:cursor', 'auto', 1);
+  `);
+
+  const readTasks = () =>
+    db
+      .query<{ id: string; model: string | null; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM tasks ORDER BY id`,
+      )
+      .all();
+  const readProfiles = () =>
+    db
+      .query<{ id: string; model: string; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM agent_profiles ORDER BY id`,
+      )
+      .all();
+  const readPrefs = () =>
+    db
+      .query<{ key: string; value: string; updated_at: number }, []>(
+        `SELECT key, value, updated_at FROM preferences ORDER BY key`,
+      )
+      .all();
+
+  db.exec(normalizeCursorHaiku55);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "claude-haiku-5-5", effort: "max", fast: 0 },
+    { id: "t02", model: "claude-haiku-5-5", effort: "xhigh", fast: 0 }, // variant wins over stale effort; extra cursor harness via kind join
+    { id: "t03", model: "claude-haiku-5-5", effort: "high", fast: 0 }, // stale fast=1 cleared
+    { id: "t04", model: "claude-haiku-5-5", effort: "medium", fast: 0 },
+    { id: "t05", model: "claude-haiku-5-5", effort: "low", fast: 0 },
+    { id: "t06", model: "claude-haiku-5-5-low", effort: null, fast: 0 }, // untouched — No Thinking row
+    { id: "t07", model: "claude-haiku-5-5-thinking-minimal", effort: null, fast: 0 }, // untouched — not a real tier
+    { id: "t08", model: "claude-sonnet-5-5-high", effort: null, fast: 0 }, // untouched — Sonnet
+    { id: "t09", model: "anthropic/claude-haiku-5.5", effort: null, fast: 0 }, // untouched — fx id
+    { id: "t10", model: null, effort: null, fast: 0 }, // untouched — NULL
+    { id: "t11", model: "claude-haiku-5-5-thinking-high", effort: "high", fast: 0 }, // untouched — not cursor-kind
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "claude-haiku-5-5", effort: "xhigh", fast: 0 },
+    { id: "p02", model: "claude-haiku-5-5", effort: "high", fast: 0 },
+    { id: "p03", model: "claude-haiku-5-5-thinking-low", effort: null, fast: 0 }, // untouched — not cursor-kind
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:cursor", value: "auto", updated_at: 1 },
+    { key: "lastModel:codex", value: "claude-haiku-5-5-thinking-medium", updated_at: 1 },
+    { key: "lastModel:cursor", value: "claude-haiku-5-5", updated_at: 1 },
+  ]);
+
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(normalizeCursorHaiku55);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+});
+
+test("062 (cursor Haiku 5.5) is the last registered migration, right after 061_antigravity_harness", () => {
+  const at = migrations.findIndex((m) => m.id === "062_normalize_cursor_haiku_5_5");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("061_antigravity_harness");
+  expect(migrations[at]?.sql).toContain("claude-haiku-5-5");
 });

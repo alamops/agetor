@@ -314,45 +314,73 @@ test("startTask honors cancel — exit handler records status 'cancelled'", asyn
   const fakeBin = path.join(binDir, "fake-codex");
   writeFileSync(fakeBin, "#!/bin/sh\nexec sleep 30\n");
   chmodSync(fakeBin, 0o755);
+  // Sibling files in this shared `bun test` process set
+  // AGETOR_CODEX_DRIVER=fake and AGETOR_TMUX_BIN=/bin/echo at module scope.
+  // Either one makes this turn exit before there is a session to cancel.
+  const savedDriver = process.env.AGETOR_CODEX_DRIVER;
+  const savedTmuxBin = process.env.AGETOR_TMUX_BIN;
+  const savedCodexBin = process.env.AGETOR_CODEX_BIN;
+  const savedCodexArgs = process.env.AGETOR_CODEX_ARGS;
+  delete process.env.AGETOR_CODEX_DRIVER;
+  delete process.env.AGETOR_TMUX_BIN;
   process.env.AGETOR_CODEX_BIN = fakeBin;
   process.env.AGETOR_CODEX_ARGS = "";
+  const restoreEnv = () => {
+    if (savedDriver === undefined) delete process.env.AGETOR_CODEX_DRIVER;
+    else process.env.AGETOR_CODEX_DRIVER = savedDriver;
+    if (savedTmuxBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = savedTmuxBin;
+    if (savedCodexBin === undefined) delete process.env.AGETOR_CODEX_BIN;
+    else process.env.AGETOR_CODEX_BIN = savedCodexBin;
+    if (savedCodexArgs === undefined) delete process.env.AGETOR_CODEX_ARGS;
+    else process.env.AGETOR_CODEX_ARGS = savedCodexArgs;
+  };
 
-  const { createTask, startTask, cancelRun } = await import("./orchestrator.ts");
-  const { runs, harnesses } = await import("./db.ts");
-  // Codex is shipped disabled-by-default (see migration 016); re-enable the
-  // built-in for the test database so startTask doesn't reject it.
-  harnesses.setEnabled("codex", true);
+  try {
+    const { createTask, startTask, cancelRun } = await import("./orchestrator.ts");
+    const { runs, harnesses } = await import("./db.ts");
+    // Codex is shipped disabled-by-default (see migration 016); re-enable the
+    // built-in for the test database so startTask doesn't reject it.
+    harnesses.setEnabled("codex", true);
 
-  const created = await createTask({
-    title: "long-running",
-    prompt: "30", // sleep 30 → session blocks until killed
-    agent: "codex",
-    workdir: process.cwd(),
-    isolation: "none",
-    taskType: "task",
-  });
-  if ("error" in created) throw new Error(created.error);
+    const created = await createTask({
+      title: "long-running",
+      prompt: "30", // sleep 30 → session blocks until killed
+      agent: "codex",
+      workdir: process.cwd(),
+      isolation: "none",
+      taskType: "task",
+    });
+    if ("error" in created) throw new Error(created.error);
 
-  const started = await startTask(created.task.id);
-  if ("error" in started) throw new Error(started.error);
+    const started = await startTask(created.task.id);
+    if ("error" in started) throw new Error(started.error);
 
-  // The tmux session is registered after spawn. Under a loaded full-suite
-  // run, 250ms is not always enough, and cancelRun returns false until the
-  // handle exists. Poll until it does, instead of one fixed sleep.
-  const deadline = Date.now() + 5_000;
-  let cancelled = false;
-  while (Date.now() < deadline) {
-    cancelled = await cancelRun(started.runId);
-    if (cancelled) break;
-    await new Promise((r) => setTimeout(r, 50));
+    // startTask can return before the tmux session exists, and a fixed 250ms
+    // is not always enough under a loaded full-suite run. cancelRun in that
+    // window records a pending cancel and never reaches the live handle.
+    // Wait until the session exists, then cancel once.
+    const { sessionExists } = await import("./claude-tmux.ts");
+    const deadline = Date.now() + 5_000;
+    let sessionUp = false;
+    while (Date.now() < deadline) {
+      if (await sessionExists(created.task.id)) {
+        sessionUp = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(sessionUp).toBe(true);
+    expect(await cancelRun(started.runId)).toBe(true);
+
+    // Wait past the driver's kill grace + the exit handler's status flip.
+    await new Promise((r) => setTimeout(r, 700));
+
+    const list = runs.listForTask(created.task.id);
+    expect(list[0]?.status).toBe("cancelled");
+  } finally {
+    restoreEnv();
   }
-  expect(cancelled).toBe(true);
-
-  // Wait past the driver's kill grace + the exit handler's status flip.
-  await new Promise((r) => setTimeout(r, 700));
-
-  const list = runs.listForTask(created.task.id);
-  expect(list[0]?.status).toBe("cancelled");
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *

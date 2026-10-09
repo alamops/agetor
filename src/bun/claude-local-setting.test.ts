@@ -36,6 +36,7 @@ test("claudeModelIdFromArg resolves CLAUDE_MODEL_FLAG values back to their ageto
   expect(claudeModelIdFromArg("claude-opus-5")).toBe("opus-5");
   expect(claudeModelIdFromArg("claude-sonnet-4-6")).toBe("sonnet-4.6");
   expect(claudeModelIdFromArg("claude-haiku-4-5")).toBe("haiku-4.5");
+  expect(claudeModelIdFromArg("claude-haiku-5-5")).toBe("haiku-5.5");
 });
 
 test("claudeModelIdFromArg resolves the Fable 5.1 / Mythos 5.1 CLAUDE_MODEL_FLAG values back to their agetor ids", () => {
@@ -291,6 +292,26 @@ test("model: 'Kept model as Sonnet 5.5' parses as the kept/no-change outcome wit
   expect(result).toEqual({ kind: "model", id: "sonnet-5.5", kept: true });
 });
 
+test("model: 'Set model to Haiku 5.5' resolves to haiku-5.5", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Haiku 5.5 and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "haiku-5.5" });
+});
+
+test("model: 'Kept model as Haiku 5.5' parses as the kept/no-change outcome with id haiku-5.5", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Kept model as Haiku 5.5",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "haiku-5.5", kept: true });
+});
+
 // ---------------------------------------------------------------------------
 // claudeModelIdFromDisplayName — word boundary after the label (finding #4,
 // docs/plans/model-effort-local-command-turns.md §10 re-review): a bare
@@ -399,6 +420,18 @@ test("claudeModelIdFromDisplayName: 'Sonnet 5.5 (1M context)' strips the qualifi
 
 test("claudeModelIdFromDisplayName: 'Sonnet 5.5 and saved …' matches via the space word boundary and resolves to sonnet-5.5", () => {
   expect(claudeModelIdFromDisplayName("Sonnet 5.5 and saved as your default for new sessions")).toBe("sonnet-5.5");
+});
+
+test("claudeModelIdFromDisplayName: 'Haiku 5.5' resolves to haiku-5.5", () => {
+  expect(claudeModelIdFromDisplayName("Haiku 5.5")).toBe("haiku-5.5");
+});
+
+test("claudeModelIdFromDisplayName: 'Haiku 5.5 (1M context)' strips the qualifier and resolves to haiku-5.5", () => {
+  expect(claudeModelIdFromDisplayName("Haiku 5.5 (1M context)")).toBe("haiku-5.5");
+});
+
+test("claudeModelIdFromDisplayName: 'Haiku 5.5 and saved …' matches via the space word boundary and resolves to haiku-5.5", () => {
+  expect(claudeModelIdFromDisplayName("Haiku 5.5 and saved as your default for new sessions")).toBe("haiku-5.5");
 });
 
 test("claudeModelIdFromDisplayName: 'Sonnet 5 and saved …' still resolves to sonnet-5, not sonnet-5.5", () => {

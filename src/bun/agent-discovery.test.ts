@@ -315,7 +315,8 @@ test("parseFxModels: 0.0.10-shaped envelope (247 ids, private_models_hidden true
   // ids confirmed present in the real payload; spacexai/grok-4.7 (curated
   // since 2026-09-21), anthropic/claude-opus-5.5, openai/gpt-6-sol and
   // openai/gpt-6-luna (curated since 2026-09-22) and
-  // anthropic/claude-sonnet-5.5 (curated since 2026-09-28) postdate it)
+  // anthropic/claude-sonnet-5.5 (curated since 2026-09-28) and
+  // anthropic/claude-haiku-5.5 (curated since 2026-10-07) postdate it)
   // padded out with synthetic filler ids to
   // the real count, and assert both the exact count and full curated
   // coverage — the envelope's unknown-fields-are-fine tolerance is already

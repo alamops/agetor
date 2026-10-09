@@ -56,7 +56,7 @@ const FX_DEFAULT_MODEL_ID = "zai/glm-5.3-flash";
 
 /** Curated ids that must NOT survive the curated ∩ discovered filter against
  *  the 3-id stub catalog: two ordinary curated rows absent from the stub
- *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and ten of the eighteen
+ *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and eleven of the nineteen
  *  `catalogOnly` premium rows (absent from the stub the same as any other
  *  id would be — catalogOnly gates them even harder, but plain absence
  *  already excludes them under the scoped merge). `Claude Fable 5.1`
@@ -91,6 +91,9 @@ const EXCLUDED_FX_OPTION_LABELS = [
   // row, absent from this file's frozen 3-id fx stub catalog like every other
   // premium row above.
   "GPT-6.1 Sol",
+  // Claude Haiku 5.5 (docs/plans/add-haiku-5-5.md) — catalogOnly, unverified
+  // signed-in presence.
+  "Claude Haiku 5.5",
 ];
 
 /** Mirrors `e2e/fx-interactions.spec.ts`'s identical helper. Duplicated
