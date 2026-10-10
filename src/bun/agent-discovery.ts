@@ -30,7 +30,8 @@ export interface DiscoveredModel {
  * probes where blocking the API boot is unacceptable — if the CLI hangs (e.g.
  * waiting for an auth flow) we give up rather than freezing app startup.
  *
- * `env`, when given, is merged over `process.env` for this one spawn — it
+ * The child always gets the live `process.env` (never Bun's startup env
+ * snapshot); `env`, when given, is merged over it for this one spawn — it
  * exists solely so `discoverFx` can probe an additional-account fx harness
  * (one with a `HOME` override) under *that* harness's own env instead of
  * agetor's process env, since fx's catalog is account-scoped (see
@@ -57,7 +58,11 @@ async function runProbe(
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
-      ...(env ? { env: { ...process.env, ...env } } : {}),
+      // Always pass the LIVE env: without `env`, Bun.spawn hands the child
+      // Bun's startup env snapshot, whose PATH on a packaged .app is
+      // launchd's minimal set — so a `#!/usr/bin/env node` CLI can't find
+      // its interpreter even though rehydratePath() fixed process.env.PATH.
+      env: { ...process.env, ...env },
     });
     const timer = setTimeout(() => { try { proc.kill(); } catch { /* already exited */ } }, 3_000);
     const stdout = await new Response(proc.stdout).text();
@@ -211,7 +216,8 @@ let codexProbeTimeoutMs = DEFAULT_CODEX_PROBE_TIMEOUT_MS;
  * `resolveBin`'s harness.bin-first resolution in `agents.ts`. Both are
  * optional and additive: every pre-existing no-args caller keeps probing the
  * built-in harness under agetor's own process env, exactly as before these
- * parameters existed.
+ * parameters existed. As in `runProbe`, the child always gets the live
+ * `process.env` (never Bun's startup env snapshot), with `env` layered on top.
  *
  * Contract, matching every other discoverer in this module: never throws,
  * never hangs. Resolves `[]` when: the child exits before the `model/list`
@@ -283,7 +289,8 @@ async function discoverCodex(env?: Record<string, string>, bin?: string): Promis
       stdin: "pipe",
       stdout: "pipe",
       stderr: "ignore",
-      ...(env ? { env: { ...process.env, ...env } } : {}),
+      // Live env, never Bun's startup snapshot — see runProbe above.
+      env: { ...process.env, ...env },
     });
   } catch {
     return [];
