@@ -57,7 +57,11 @@ async function runProbe(
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
-      ...(env ? { env: { ...process.env, ...env } } : {}),
+      // Always pass the LIVE env: without `env`, Bun.spawn hands the child
+      // Bun's startup env snapshot, whose PATH on a packaged .app is
+      // launchd's minimal set — so a `#!/usr/bin/env node` CLI can't find
+      // its interpreter even though rehydratePath() fixed process.env.PATH.
+      env: { ...process.env, ...env },
     });
     const timer = setTimeout(() => { try { proc.kill(); } catch { /* already exited */ } }, 3_000);
     const stdout = await new Response(proc.stdout).text();
@@ -283,7 +287,8 @@ async function discoverCodex(env?: Record<string, string>, bin?: string): Promis
       stdin: "pipe",
       stdout: "pipe",
       stderr: "ignore",
-      ...(env ? { env: { ...process.env, ...env } } : {}),
+      // Live env, never Bun's startup snapshot — see runProbe above.
+      env: { ...process.env, ...env },
     });
   } catch {
     return [];
