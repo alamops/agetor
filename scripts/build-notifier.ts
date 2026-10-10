@@ -58,8 +58,8 @@ async function main() {
     console.log(`[build-notifier] skipped on ${process.platform} (macOS-only step)`);
     return;
   }
-  if (process.arch !== "arm64") {
-    fail(`expected an arm64 build host (got ${process.arch}); Agetor only ships arm64`);
+  if (process.arch !== "arm64" && process.arch !== "x64") {
+    fail(`expected an arm64 or x64 build host (got ${process.arch}); Agetor supports arm64 and x64`);
   }
   if (!existsSync(SRC) || !existsSync(PLIST)) {
     fail(`missing helper sources at ${path.relative(REPO_ROOT, path.dirname(SRC))}/`);
@@ -89,11 +89,12 @@ async function main() {
   await mkdir(path.join(CONTENTS, "MacOS"), { recursive: true });
   await mkdir(path.join(CONTENTS, "Resources"), { recursive: true });
 
-  // 1. Compile arm64 against AppKit + UserNotifications.
-  console.log(`[build-notifier] compiling ${path.relative(REPO_ROOT, SRC)} → arm64`);
+  // 1. Compile against AppKit + UserNotifications.
+  const target = process.arch === "x64" ? "x86_64-apple-macos13" : "arm64-apple-macos13";
+  console.log(`[build-notifier] compiling ${path.relative(REPO_ROOT, SRC)} → ${process.arch}`);
   await run([
     "xcrun", "swiftc", "-O",
-    "-target", "arm64-apple-macos13",
+    "-target", target,
     "-framework", "AppKit",
     "-framework", "UserNotifications",
     SRC, "-o", EXE,
@@ -133,8 +134,9 @@ async function main() {
 
   // 5. Verify arch.
   const arch = await run(["lipo", "-archs", EXE]);
-  if (arch.trim() !== "arm64") {
-    fail(`built binary is '${arch}', expected arm64 (no Rosetta / x86_64 allowed)`);
+  const expectedArch = process.arch === "x64" ? "x86_64" : "arm64";
+  if (!arch.includes(expectedArch)) {
+    fail(`built binary is '${arch}', expected ${expectedArch}`);
   }
   console.log(`[build-notifier] ✓ ${path.relative(REPO_ROOT, APP)} (${arch})`);
 }
