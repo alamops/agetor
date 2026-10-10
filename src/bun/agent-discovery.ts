@@ -216,7 +216,8 @@ let codexProbeTimeoutMs = DEFAULT_CODEX_PROBE_TIMEOUT_MS;
  * `resolveBin`'s harness.bin-first resolution in `agents.ts`. Both are
  * optional and additive: every pre-existing no-args caller keeps probing the
  * built-in harness under agetor's own process env, exactly as before these
- * parameters existed.
+ * parameters existed. As in `runProbe`, the child always gets the live
+ * `process.env` (never Bun's startup env snapshot), with `env` layered on top.
  *
  * Contract, matching every other discoverer in this module: never throws,
  * never hangs. Resolves `[]` when: the child exits before the `model/list`
