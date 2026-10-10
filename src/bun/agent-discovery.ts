@@ -30,7 +30,8 @@ export interface DiscoveredModel {
  * probes where blocking the API boot is unacceptable — if the CLI hangs (e.g.
  * waiting for an auth flow) we give up rather than freezing app startup.
  *
- * `env`, when given, is merged over `process.env` for this one spawn — it
+ * The child always gets the live `process.env` (never Bun's startup env
+ * snapshot); `env`, when given, is merged over it for this one spawn — it
  * exists solely so `discoverFx` can probe an additional-account fx harness
  * (one with a `HOME` override) under *that* harness's own env instead of
  * agetor's process env, since fx's catalog is account-scoped (see

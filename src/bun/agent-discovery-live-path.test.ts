@@ -13,16 +13,28 @@
  * runtime (so it is absent from Bun's startup snapshot), and asserts that
  * discovery still returns the stub's models.
  */
-import { test, expect } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { afterEach, test, expect } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { __testing, getDiscoveredModels, refreshKindModels } from "./agent-discovery.ts";
 import { plantFakeCodexAppServer } from "./test-codex-app-server.ts";
 
+const tempDirs: string[] = [];
+function tempDir(prefix: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  __testing.resetForTests();
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 /** Plant `<interp>` (forwards to /bin/sh) in a fresh dir; return [dir, name]. */
 function plantLivePathInterpreter(): [string, string] {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-live-path-interp-"));
+  const dir = tempDir("agetor-live-path-interp-");
   const name = `agetor-fake-node-${path.basename(dir).slice(-6)}`;
   writeFileSync(path.join(dir, name), `#!/bin/sh\nexec /bin/sh "$@"\n`, { mode: 0o755 });
   return [dir, name];
@@ -31,7 +43,7 @@ function plantLivePathInterpreter(): [string, string] {
 /** Rewrite a `#!/bin/sh` stub so it is launched via `#!/usr/bin/env <interp>`. */
 function viaEnvShebang(stub: string, interp: string): string {
   const body = readFileSync(stub, "utf8").replace(/^#!.*\n/, "");
-  const out = path.join(mkdtempSync(path.join(tmpdir(), "agetor-live-path-bin-")), path.basename(stub));
+  const out = path.join(tempDir("agetor-live-path-bin-"), path.basename(stub));
   writeFileSync(out, `#!/usr/bin/env ${interp}\n${body}`, { mode: 0o755 });
   return out;
 }
@@ -57,7 +69,8 @@ async function withLivePath(dir: string, vars: Record<string, string>, run: () =
 test("discoverCodex: an env-shebang codex resolves its interpreter from the live PATH", async () => {
   __testing.resetForTests();
   const [interpDir, interp] = plantLivePathInterpreter();
-  const bin = viaEnvShebang(plantFakeCodexAppServer({ pages: [[{ id: "live-path-model" }]] }), interp);
+  const stub = plantFakeCodexAppServer({ pages: [[{ id: "live-path-model" }]], dir: tempDir("agetor-live-path-stub-") });
+  const bin = viaEnvShebang(stub, interp);
   await withLivePath(interpDir, { AGETOR_CODEX_BIN: bin }, async () => {
     await refreshKindModels("codex");
   });
@@ -67,7 +80,7 @@ test("discoverCodex: an env-shebang codex resolves its interpreter from the live
 test("discoverCursor (runProbe): an env-shebang cursor-agent resolves its interpreter from the live PATH", async () => {
   __testing.resetForTests();
   const [interpDir, interp] = plantLivePathInterpreter();
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-live-path-cursor-"));
+  const dir = tempDir("agetor-live-path-cursor-");
   const bin = path.join(dir, "cursor-agent");
   writeFileSync(bin, `#!/usr/bin/env ${interp}\necho 'live-path-cursor'\nexit 0\n`, { mode: 0o755 });
   await withLivePath(interpDir, { AGETOR_CURSOR_BIN: bin }, async () => {
