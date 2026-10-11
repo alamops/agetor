@@ -142,6 +142,20 @@ export function tmuxSocketArgs(): string[] {
 }
 
 /**
+ * Environment for every tmux client we spawn. `Bun.spawn` WITHOUT an `env`
+ * option hands the child the env snapshot Bun captured at process start, not
+ * the live `process.env` — so the PATH `rehydratePath()` builds at boot never
+ * reached tmux when agetor was launched from Finder/`open -a` (launchd's
+ * minimal `/usr/bin:/bin`). tmux then sets the pane's PATH from the CLIENT's
+ * PATH, overriding `new-session -e PATH=…`, so `#!/usr/bin/env node` CLIs
+ * (codex) died with "env: node: No such file or directory". Every tmux spawn
+ * site must pass this as `env`.
+ */
+export function tmuxClientEnv(): Record<string, string | undefined> {
+  return { ...process.env };
+}
+
+/**
  * Build the argv for a disclaimed `tmux start-server` on agetor's own
  * socket — pure so it's unit-testable without spawning anything. `tmuxBin`
  * is the caller-resolved tmux binary (`resolveTmuxBin()`); wrapping happens
@@ -172,7 +186,12 @@ export async function ensureDisclaimedServer(): Promise<void> {
     // Ignore stdio rather than pipe: `start-server` emits nothing and this is
     // best-effort, so there's no output to capture and a drain-free pipe is
     // pointless. `disclaim`'s exec-replace preserves these fd choices.
-    const proc = Bun.spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    const proc = Bun.spawn(argv, {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+      env: tmuxClientEnv(),
+    });
     await proc.exited;
   } catch {
     // Best-effort — swallow. See doc comment above.
@@ -207,6 +226,7 @@ export async function spawnTmuxNewSession(
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
+      env: tmuxClientEnv(),
     });
     const [, stderr] = await Promise.all([
       new Response(proc.stdout).text(),
