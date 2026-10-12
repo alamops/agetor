@@ -1026,7 +1026,14 @@ export async function prepareWorkdir(
     if (onRecorded.ok) {
       restoredOn = recorded;
       created = onRecorded;
-      if (!branchExists) warnings.push(`task branch ${branch} no longer exists — restored on ${recorded}`);
+      // A PR-head task's branch may live only as `origin/<branch>` (fetchBranch
+      // refreshes the remote-tracking ref, never a local one), so a missing
+      // local ref alone doesn't mean the task branch is gone.
+      if (!branchExists) {
+        const onOrigin = task.branchSource === "existing"
+          && (await git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`], root, 5_000)).ok;
+        if (!onOrigin) warnings.push(`task branch ${branch} no longer exists — restored on ${recorded}`);
+      }
     } else {
       const why = (onRecorded.stderr || onRecorded.stdout).split("\n")[0] ?? "";
       warnings.push(`could not restore recorded checkout ${recorded}${why ? ` (${why})` : ""} — restored on ${branch}`);

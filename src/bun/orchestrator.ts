@@ -6618,13 +6618,16 @@ export async function archiveTask(
  * way; a later send/start/terminal-open retries the restore lazily.
  */
 /**
- * After a worktree restore (unarchive, or `sendInput`'s missing-worktree
- * branch) record the branch it came back on, and surface `prepareWorkdir`'s
- * `warning` — the recorded checkout couldn't be restored, so the worktree is
- * on `task.branch` instead — as a status line on the task's latest run
- * (console only when the task has never run).
+ * After a `prepareWorkdir` outside a run start (unarchive, `sendInput`'s
+ * missing-worktree branch, a terminal open) record the branch the worktree is
+ * on, and surface `prepareWorkdir`'s `warning` — a re-attach couldn't bring
+ * the worktree back exactly as recorded (recorded checkout missing or
+ * unattachable, task branch recreated from base) — as a status line on the
+ * task's latest run (console only when the task has never run). Only a
+ * re-attach sets `warning`, and later prepares take the reuse path, so this
+ * is the one chance to say it.
  */
-function noteRestoredCheckout(taskId: string, prepared: PreparedWorkdir): void {
+export function noteRestoredCheckout(taskId: string, prepared: PreparedWorkdir): void {
   const checkout = recordableCheckout(prepared);
   if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
   if (!prepared.warning) return;

@@ -1773,6 +1773,49 @@ describe("drift tolerated", () => {
     expect(await runCapture(["branch", "--list", taskBranch], repo)).toBe("");
   });
 
+  test("re-attach of a PR-head task whose branch lives only on origin restores the recorded checkout without a gone-branch warning", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { repo } = await makeRepoWithOrigin();
+    await pushPrHeadOnly(repo);
+    const fresh = fakeTask({ workdir: repo, branch: "pr-head", branchSource: "existing" });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const wt = first.worktreePath!;
+    await git(["checkout", "-b", "implement/x"], wt);
+    writeFileSync(path.join(wt, "README"), "drifted\n");
+    await git(["commit", "-am", "drift"], wt);
+    const task = { ...fresh, worktreePath: wt, checkoutBranch: "implement/x" };
+    await detachWorktree(task, { force: true });
+    // Only the LOCAL ref goes; `origin/pr-head` survives, as it does for any
+    // PR head nobody kept a local branch for.
+    await git(["branch", "-D", "pr-head"], repo);
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe("implement/x");
+    expect(r.warning).toBeUndefined();
+    expect(await runCapture(["symbolic-ref", "--short", "HEAD"], wt)).toBe("implement/x");
+  });
+
+  test("re-attach of a PR-head task whose branch is gone from origin too still warns", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { repo } = await makeRepoWithOrigin();
+    await pushPrHeadOnly(repo);
+    const fresh = fakeTask({ workdir: repo, branch: "pr-head", branchSource: "existing" });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const wt = first.worktreePath!;
+    await git(["checkout", "-b", "implement/x"], wt);
+    const task = { ...fresh, worktreePath: wt, checkoutBranch: "implement/x" };
+    await detachWorktree(task, { force: true });
+    await git(["branch", "-D", "pr-head"], repo);
+    await git(["push", "origin", "--delete", "pr-head"], repo);
+    await git(["update-ref", "-d", "refs/remotes/origin/pr-head"], repo);
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe("implement/x");
+    expect(r.warning).toBe("task branch pr-head no longer exists — restored on implement/x");
+  });
+
   test("re-attach that has to recreate a deleted task branch from base says so", async () => {
     const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
     const repo = await makeRepo();

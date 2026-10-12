@@ -17,6 +17,7 @@
 // that way, exactly like the db.ts ↔ interactions.ts cycle.
 
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
 import type { TerminalTab } from "../shared/types.ts";
 import { tasks } from "./db.ts";
@@ -141,8 +142,21 @@ export async function createTerminal(
   // doesn't move until the spawn lands).
   inFlight.set(taskId, pending + 1);
   try {
-    // Dynamic import — see the top-of-file note on the db.ts ↔ worktree.ts cycle.
-    const { prepareWorkdir, recordableCheckout, resolveRef } = await import("./worktree.ts");
+    // A worktree-isolated pipeline step shares its parent's worktree (D2):
+    // re-materializing a missing one here would give this ONE step a private
+    // checkout at its own path. Same refusal as startTask / sendInput — only
+    // the pipeline task's own Run/Retry restores the shared worktree.
+    if (
+      task.pipelineParentId
+      && task.isolation === "worktree"
+      && (!task.worktreePath || !existsSync(task.worktreePath))
+    ) {
+      return { error: "step task's worktree is missing — run the pipeline task instead" };
+    }
+    // Dynamic imports — see the top-of-file note on the db.ts ↔ worktree.ts
+    // cycle; orchestrator.ts imports this module statically.
+    const { prepareWorkdir, resolveRef } = await import("./worktree.ts");
+    const { noteRestoredCheckout } = await import("./orchestrator.ts");
     const prepared = await prepareWorkdir(task);
     if ("error" in prepared) return { error: prepared.error };
 
@@ -158,10 +172,11 @@ export async function createTerminal(
     ) {
       tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
     }
-    // An unknown read (reuse whose `git symbolic-ref` failed) records nothing,
-    // so a transient git failure can't erase the recorded drifted branch.
-    const checkout = recordableCheckout(prepared);
-    if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
+    // Record the live checkout (an unknown read records nothing, so a
+    // transient git failure can't erase the recorded drifted branch) and
+    // surface a re-attach `warning` — a terminal open may be the first thing
+    // to restore a missing worktree, and later prepares take the reuse path.
+    noteRestoredCheckout(taskId, prepared);
 
     const id = randomUUID();
     const shell = process.env.SHELL || "/bin/zsh";

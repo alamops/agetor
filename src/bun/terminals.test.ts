@@ -7,7 +7,7 @@ import path from "node:path";
 // imports `tasks` from db.ts, which opens + migrates the database on load).
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-terminals-"));
 
-const { tasks } = await import("./db.ts");
+const { tasks, runs } = await import("./db.ts");
 const {
   createTerminal,
   listTerminals,
@@ -278,6 +278,53 @@ test("createTerminal keeps the recorded checkout when the live branch read fails
     await killTerminalsForTask(task.id);
     writeFileSync(pointer, saved);
   }
+});
+
+test("createTerminal that re-attaches a missing worktree surfaces prepareWorkdir's warning on the latest run", async () => {
+  const repo = await makeRepo();
+  const task = makeTask(repo, { isolation: "worktree", agent: "codex" });
+  const first = await createTerminal(task.id);
+  if ("error" in first) throw new Error(first.error);
+  await killTerminalsForTask(task.id);
+  const pinned = tasks.get(task.id)!;
+  const runId = `term-run-${task.id}`;
+  runs.insert({
+    id: runId, taskId: task.id, agent: "codex", status: "succeeded",
+    startedAt: Date.now(), endedAt: Date.now(), exitCode: 0, tmuxSession: null,
+    claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+  });
+
+  // The worktree dir AND the task branch are gone (e.g. cleaned up by hand):
+  // the terminal open is the first thing to re-attach, recreating the branch
+  // from base — the run log must say so, since later opens take the reuse path.
+  const { detachWorktree } = await import("./worktree.ts");
+  await detachWorktree(pinned, { force: true });
+  await git(["branch", "-D", pinned.branch!], repo);
+  expect(existsSync(pinned.worktreePath!)).toBe(false);
+
+  const second = await createTerminal(task.id);
+  if ("error" in second) throw new Error(`terminal open failed: ${second.error}`);
+  expect(second.cwd).toBe(pinned.worktreePath!);
+  const statuses = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+  expect(statuses.some((d) => d.startsWith(`task branch ${pinned.branch} no longer exists — recreated it from `))).toBe(true);
+  expect(tasks.get(task.id)!.checkoutBranch).toBe(pinned.branch);
+});
+
+test("createTerminal refuses a pipeline step whose shared worktree is missing", async () => {
+  const repo = await makeRepo();
+  const missing = path.join(repo, "no-such-worktree");
+  const step = makeTask(repo, {
+    isolation: "worktree",
+    branch: "agetor/shared",
+    worktreePath: missing,
+    pipelineParentId: "term-parent",
+    pipelineStepId: "s1",
+  });
+  const r = await createTerminal(step.id);
+  expect(r).toEqual({ error: "step task's worktree is missing — run the pipeline task instead" });
+  // Nothing was materialized at the step's own path.
+  expect(existsSync(missing)).toBe(false);
+  expect(countTerminals(step.id)).toBe(0);
 });
 
 test("a shell that exits is auto-removed from the manager", async () => {
