@@ -821,9 +821,16 @@ test("062_normalize_cursor_haiku_5_5 folds claude-haiku-5-5-thinking-* ids into 
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("062 (cursor Haiku 5.5) is the last registered migration, right after 061_antigravity_harness", () => {
+test("062 (cursor Haiku 5.5) is registered right after 061_antigravity_harness", () => {
   const at = migrations.findIndex((m) => m.id === "062_normalize_cursor_haiku_5_5");
-  expect(at).toBe(migrations.length - 1);
+  expect(at).toBeGreaterThan(0);
   expect(migrations[at - 1]?.id).toBe("061_antigravity_harness");
   expect(migrations[at]?.sql).toContain("claude-haiku-5-5");
+});
+
+test("063 (task checkout branch) is the last registered migration, right after 062", () => {
+  const at = migrations.findIndex((m) => m.id === "063_task_checkout_branch");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("062_normalize_cursor_haiku_5_5");
+  expect(migrations[at]?.sql).toContain("ADD COLUMN checkout_branch TEXT");
 });

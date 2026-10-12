@@ -142,6 +142,7 @@ import {
   hasUncommittedChanges,
   getAheadCount,
   isMergedIntoDefaultBranch,
+  headBranchState,
 } from "./worktree.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
@@ -7101,15 +7102,16 @@ export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus |
 
   const dirty0 = await hasUncommittedChanges(dir);
   if (dirty0 === null) {
-    return { dirty: false, ahead: 0, merged: null, ignored: true };
+    return { dirty: false, ahead: 0, merged: null, ignored: true, branch: null };
   }
 
-  const [aheadResult, merged] = await Promise.all([
+  const [aheadResult, merged, head] = await Promise.all([
     getAheadCount(dir, baseRef),
     isMergedIntoDefaultBranch(dir),
+    headBranchState(dir),
   ]);
 
-  return { dirty: dirty0, ahead: aheadResult ?? 0, merged, ignored: false };
+  return { dirty: dirty0, ahead: aheadResult ?? 0, merged, ignored: false, branch: head.branch };
 }
 
 /**
