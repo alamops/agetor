@@ -1711,11 +1711,81 @@ describe("drift tolerated", () => {
   });
 
   test("isolation none reports checkoutBranch null", async () => {
-    const { prepareWorkdir } = await import("./worktree.ts");
+    const { prepareWorkdir, recordableCheckout } = await import("./worktree.ts");
     const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-plain-"));
     const r = await prepareWorkdir(fakeTask({ workdir: dir, isolation: "none" }));
     if ("error" in r) throw new Error(r.error);
     expect(r.checkoutBranch).toBeNull();
+    expect(r.checkoutKnown).toBe(false);
+    expect(recordableCheckout(r)).toBeUndefined();
+  });
+
+  test("a readable reuse is known — a drifted branch and a detached HEAD are both recordable", async () => {
+    const { prepareWorkdir, recordableCheckout } = await import("./worktree.ts");
+    const { task, wt } = await materializeAndDrift();
+    const onBranch = await prepareWorkdir(task);
+    if ("error" in onBranch) throw new Error(onBranch.error);
+    expect(onBranch.checkoutKnown).toBe(true);
+    expect(recordableCheckout(onBranch)).toBe("implement/x");
+    await git(["checkout", "--detach"], wt);
+    const detached = await prepareWorkdir(task);
+    if ("error" in detached) throw new Error(detached.error);
+    expect(detached.checkoutKnown).toBe(true);
+    // A detached HEAD is a real reading: record null.
+    expect(recordableCheckout(detached)).toBeNull();
+  });
+
+  test("a reuse whose branch read fails is unknown, not detached, and records nothing", async () => {
+    const { prepareWorkdir, recordableCheckout } = await import("./worktree.ts");
+    const { task, wt, taskBranch } = await materializeAndDrift();
+    // Break the worktree's `.git` pointer so `git symbolic-ref` exits 128.
+    const pointer = path.join(wt, ".git");
+    const saved = await Bun.file(pointer).text();
+    writeFileSync(pointer, "gitdir: /nonexistent/agetor-broken\n");
+    try {
+      const r = await prepareWorkdir(task);
+      if ("error" in r) throw new Error(`unexpected error: ${r.error}`);
+      expect(r.cwd).toBe(wt);
+      expect(r.checkoutBranch).toBeNull();
+      expect(r.checkoutKnown).toBe(false);
+      expect(recordableCheckout(r)).toBeUndefined();
+      expect(r.note).toBe(`reusing worktree at ${wt} on ${taskBranch}`);
+    } finally {
+      writeFileSync(pointer, saved);
+    }
+  });
+
+  test("re-attach restores the recorded checkout even when the task branch was deleted", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { repo, wt, task, taskBranch } = await materializeAndDrift();
+    await detachWorktree(task, { force: true });
+    await git(["branch", "-D", taskBranch], repo);
+    const r = await prepareWorkdir({ ...task, checkoutBranch: "implement/x" });
+    if ("error" in r) throw new Error(r.error);
+    expect(r.branch).toBe(taskBranch);
+    expect(r.checkoutBranch).toBe("implement/x");
+    expect(r.checkoutKnown).toBe(true);
+    expect(r.warning).toBe(`task branch ${taskBranch} no longer exists — restored on implement/x`);
+    expect(await runCapture(["symbolic-ref", "--short", "HEAD"], wt)).toBe("implement/x");
+    // The drifted work came back with it.
+    expect(await runCapture(["log", "-1", "--format=%s"], wt)).toBe("drift");
+    // task.branch is not recreated behind the user's back.
+    expect(await runCapture(["branch", "--list", taskBranch], repo)).toBe("");
+  });
+
+  test("re-attach that has to recreate a deleted task branch from base says so", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const task = { ...fresh, branch: first.branch, worktreePath: first.worktreePath, checkoutBranch: first.branch };
+    await detachWorktree(task, { force: true });
+    await git(["branch", "-D", first.branch!], repo);
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe(first.branch);
+    expect(r.warning).toBe(`task branch ${first.branch} no longer exists — recreated it from HEAD`);
   });
 });
 

@@ -1832,10 +1832,13 @@ function AppInner() {
     // Ask the core which branches the delete would remove — `t.branch`, plus
     // the branch a drifted worktree is actually on — so the confirm names
     // every one. Best-effort: on failure (or an older core) fall back to the
-    // generic copy.
+    // task row — `t.branch`, plus the last-seen drifted checkout as a branch
+    // the delete may also remove (the core's exclusions — default branch, a
+    // branch another task holds — can't be applied client-side).
     const preview = t.worktreePath
       ? await api.getTaskTeardownPreview(t.id).catch(() => null)
       : null;
+    const maybeDrifted = t.checkoutBranch && t.checkoutBranch !== t.branch ? t.checkoutBranch : null;
     const ok = await confirm({
       title: `Delete "${t.title}"?`,
       description: (
@@ -1862,7 +1865,14 @@ function AppInner() {
             <>
               {" "}Its git worktree (
               <span className="font-mono text-foreground/80">{t.branch}</span>
-              ) will also be torn down.
+              ) will also be torn down
+              {maybeDrifted ? (
+                <>
+                  , and possibly the branch it was last on (
+                  <span data-testid="delete-confirm-maybe-branch" className="font-mono text-foreground/80">{maybeDrifted}</span>
+                  ).
+                </>
+              ) : "."}
             </>
           )}
         </>

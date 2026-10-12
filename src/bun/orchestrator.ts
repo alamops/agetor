@@ -142,8 +142,8 @@ import {
   hasUncommittedChanges,
   getAheadCount,
   isMergedIntoDefaultBranch,
-  headBranchState,
   readCheckoutBranch,
+  recordableCheckout,
   planTeardownBranches,
   resolveDefaultBranchName,
   type PreparedWorkdir,
@@ -1628,9 +1628,11 @@ async function startTaskInner(
       runId,
     });
     // Run start is one of the four last-seen-checkout refresh points (start,
-    // settle, terminal open, archive). Isolation "none" reports null; keep
-    // whatever was recorded rather than erasing it for a non-worktree run.
-    if (prepared.worktreePath) tasks.setCheckoutBranch(taskId, prepared.checkoutBranch);
+    // settle, terminal open, archive). Isolation "none", or a reuse whose
+    // branch read failed, has nothing to record — keep whatever was recorded
+    // rather than erasing it (`recordableCheckout`).
+    const checkout = recordableCheckout(prepared);
+    if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
     runs.insert({
       id: runId,
       taskId,
@@ -6623,7 +6625,8 @@ export async function archiveTask(
  * (console only when the task has never run).
  */
 function noteRestoredCheckout(taskId: string, prepared: PreparedWorkdir): void {
-  if (prepared.worktreePath) tasks.setCheckoutBranch(taskId, prepared.checkoutBranch);
+  const checkout = recordableCheckout(prepared);
+  if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
   if (!prepared.warning) return;
   const latest = runs.listForTask(taskId)[0];
   if (latest) appendRunStatusLine(taskId, latest.id, prepared.warning);
@@ -7245,13 +7248,17 @@ export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus |
     return { dirty: false, ahead: 0, merged: null, ignored: true, branch: null };
   }
 
-  const [aheadResult, merged, head] = await Promise.all([
+  // Only the live branch name is needed here, so `readCheckoutBranch` (one
+  // `git symbolic-ref`) rather than `headBranchState`, whose repo check and
+  // default-branch lookup would cost a few more spawns per Worktrees row.
+  // Detached or unreadable both show as no branch.
+  const [aheadResult, merged, live] = await Promise.all([
     getAheadCount(dir, baseRef),
     isMergedIntoDefaultBranch(dir),
-    headBranchState(dir),
+    readCheckoutBranch(dir),
   ]);
 
-  return { dirty: dirty0, ahead: aheadResult ?? 0, merged, ignored: false, branch: head.branch };
+  return { dirty: dirty0, ahead: aheadResult ?? 0, merged, ignored: false, branch: live.ok ? live.branch : null };
 }
 
 /**

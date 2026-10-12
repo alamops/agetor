@@ -53,7 +53,7 @@ afterAll(() => {
   mock.module("../output.ts", () => realOutputSnapshot);
 });
 
-const { cmdRm } = await import("./lifecycle.ts");
+const { cmdRm, teardownPhrase } = await import("./lifecycle.ts");
 
 const flags = { json: false, plain: true, noDaemon: true } as unknown as Parameters<typeof cmdRm>[1];
 const jsonFlags = { ...flags, json: true } as unknown as Parameters<typeof cmdRm>[1];
@@ -112,14 +112,32 @@ test("a single branch reads singular", async () => {
   process.exitCode = 0;
 });
 
-test("an older core without the preview route degrades to the generic wording", async () => {
+test("an older core without the preview route degrades to the task row's branch", async () => {
   currentClient = fakeClient(null);
   await cmdRm(["abcdefgh"], flags);
-  expect(outputs[0]).toContain("and its worktree + branch.");
+  expect(outputs[0]).toContain("and its worktree + branch agetor/abc-fix.");
   process.exitCode = 0;
   outputs.length = 0;
   await cmdRm(["abcdefgh", "--yes"], flags);
   expect(outputs).toEqual(["✗ deleted abcdefgh"]);
+});
+
+test("with no preview, a drifted row's last-seen checkout is named as a possible removal", async () => {
+  const drifted = { ...task, checkoutBranch: "implement/x" };
+  currentClient = { ...fakeClient(null), listTasks: async () => [drifted] } as unknown as AgetorClient;
+  await cmdRm(["abcdefgh"], flags);
+  expect(outputs[0]).toContain(
+    "and its worktree + branch agetor/abc-fix (and possibly implement/x, the branch it was last on).",
+  );
+  process.exitCode = 0;
+});
+
+test("teardownPhrase escapes branch names in the no-preview fallback", () => {
+  expect(teardownPhrase(null, { branch: "a\u001b[31m", checkoutBranch: "b\u0007" })).toBe(
+    "its worktree + branch a\\u001b[31m (and possibly b\\u0007, the branch it was last on)",
+  );
+  expect(teardownPhrase(null, { branch: null, checkoutBranch: null })).toBe("its worktree + branch");
+  expect(teardownPhrase(null, { branch: "x", checkoutBranch: "x" })).toBe("its worktree + branch x");
 });
 
 test("--json carries the deleted branches", async () => {

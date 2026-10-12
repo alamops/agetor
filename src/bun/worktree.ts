@@ -881,11 +881,34 @@ export interface PreparedWorkdir {
    */
   checkoutBranch: string | null;
   /**
+   * Whether `checkoutBranch` is an actual reading of the worktree: `true` for
+   * a successful read (a detached HEAD included) and for a worktree that was
+   * just created or re-attached; `false` when the reuse-path read failed or no
+   * worktree is involved. Callers must only record `checkoutBranch` when this
+   * is `true` — an unknown read stored as `null` would erase the recorded
+   * drifted branch (the badge, delete-time teardown and unarchive restore all
+   * read it), matching `readCheckoutBranch`'s own keep-on-failure contract.
+   * See `recordableCheckout`.
+   */
+  checkoutKnown: boolean;
+  /**
    * A non-fatal problem worth surfacing in the run log — currently only: the
    * recorded checkout branch could not be restored on re-attach, so the
    * worktree came back on `task.branch` instead.
    */
   warning?: string;
+}
+
+/**
+ * The value a caller should record as the task's last-seen checkout after a
+ * `prepareWorkdir`, or `undefined` when there is nothing to record — no
+ * worktree (`isolation: "none"`), or the reuse-path read failed. Keeping the
+ * stored value on `undefined` is what stops a transient git failure from
+ * erasing a recorded drifted branch.
+ */
+export function recordableCheckout(prepared: PreparedWorkdir): string | null | undefined {
+  if (!prepared.worktreePath || !prepared.checkoutKnown) return undefined;
+  return prepared.checkoutBranch;
 }
 
 /** Returned instead of PreparedWorkdir when the worktree cannot be set up. */
@@ -917,7 +940,7 @@ export async function prepareWorkdir(
   },
 ): Promise<PrepareResult> {
   if (task.isolation !== "worktree") {
-    return { cwd: task.workdir, branch: null, worktreePath: null, note: "isolation: none", checkoutBranch: null };
+    return { cwd: task.workdir, branch: null, worktreePath: null, note: "isolation: none", checkoutBranch: null, checkoutKnown: false };
   }
 
   const root = await repoRoot(task.workdir);
@@ -936,7 +959,8 @@ export async function prepareWorkdir(
     // when it succeeds it silently switches the branch under a live agent or
     // an open terminal. `task.branch` stays "the branch agetor created"; the
     // live name travels back as `checkoutBranch` for callers to record. A
-    // failed read is treated as unknown (null) — it must not fail the prepare.
+    // failed read is unknown (`checkoutKnown: false`) — it must not fail the
+    // prepare, and callers must not record it over the stored value.
     const live = await readCheckoutBranch(task.worktreePath);
     const checkoutBranch = live.ok ? live.branch : null;
     let where: string;
@@ -950,6 +974,7 @@ export async function prepareWorkdir(
       worktreePath: task.worktreePath,
       note: `reusing worktree at ${task.worktreePath} ${where}`,
       checkoutBranch,
+      checkoutKnown: live.ok,
     };
   }
 
@@ -983,38 +1008,44 @@ export async function prepareWorkdir(
   await git(["worktree", "prune"], root, 10_000);
   // Re-attach prefers the checkout agetor last recorded for this task (e.g. an
   // archived task whose worktree had drifted onto another branch), so unarchive
-  // / restore brings the worktree back where the user left it. Only when that
-  // branch still exists and differs from the task branch; otherwise (or when
-  // the attach itself fails — say it is checked out elsewhere) fall back to the
-  // task branch and say so via `warning`.
+  // / restore brings the worktree back where the user left it — whenever that
+  // branch still exists and differs from the task branch, even if the task
+  // branch itself is gone (the work lives on the recorded branch, so recreating
+  // `task.branch` from base would bring the worktree back without it). When the
+  // recorded branch is missing or the attach fails (say it is checked out
+  // elsewhere), fall back to the task branch and say so via `warning`.
   const recorded = task.checkoutBranch ?? null;
+  const wantsRecorded = recorded !== null && recorded !== branch;
+  const recordedExists = wantsRecorded
+    && (await git(["rev-parse", "--verify", "--quiet", `refs/heads/${recorded}`], root, 5_000)).ok;
   let restoredOn: string | null = null;
-  let warning: string | undefined;
-  let created: GitResult;
-  if (branchExists) {
-    if (recorded && recorded !== branch) {
-      const recordedExists = (await git(["rev-parse", "--verify", "--quiet", `refs/heads/${recorded}`], root, 5_000)).ok;
-      if (recordedExists) {
-        const onRecorded = await git(["worktree", "add", wt, recorded], root);
-        if (onRecorded.ok) {
-          restoredOn = recorded;
-          created = onRecorded;
-        } else {
-          const why = (onRecorded.stderr || onRecorded.stdout).split("\n")[0] ?? "";
-          warning = `could not restore recorded checkout ${recorded}${why ? ` (${why})` : ""} — restored on ${branch}`;
-          created = await git(["worktree", "add", wt, branch], root);
-        }
-      } else {
-        warning = `recorded checkout ${recorded} no longer exists — restored on ${branch}`;
-        created = await git(["worktree", "add", wt, branch], root);
-      }
+  const warnings: string[] = [];
+  let created: GitResult | null = null;
+  if (recordedExists) {
+    const onRecorded = await git(["worktree", "add", wt, recorded], root);
+    if (onRecorded.ok) {
+      restoredOn = recorded;
+      created = onRecorded;
+      if (!branchExists) warnings.push(`task branch ${branch} no longer exists — restored on ${recorded}`);
     } else {
-      created = await git(["worktree", "add", wt, branch], root);
+      const why = (onRecorded.stderr || onRecorded.stdout).split("\n")[0] ?? "";
+      warnings.push(`could not restore recorded checkout ${recorded}${why ? ` (${why})` : ""} — restored on ${branch}`);
     }
-  } else if (task.branchSource === "existing") {
-    created = await git(["worktree", "add", "--track", "-b", branch, wt, `origin/${branch}`], root);
-  } else {
-    created = await git(["worktree", "add", "-b", branch, wt, base], root);
+  } else if (wantsRecorded) {
+    warnings.push(`recorded checkout ${recorded} no longer exists — restored on ${branch}`);
+  }
+  if (!created) {
+    if (branchExists) {
+      created = await git(["worktree", "add", wt, branch], root);
+    } else if (task.branchSource === "existing") {
+      created = await git(["worktree", "add", "--track", "-b", branch, wt, `origin/${branch}`], root);
+    } else {
+      // A re-attach (the task materialized before) whose branch was deleted by
+      // hand: the branch comes back fresh from base, without the previous
+      // run's commits — say so rather than let it pass silently.
+      if (task.worktreePath) warnings.push(`task branch ${branch} no longer exists — recreated it from ${base === "HEAD" ? "HEAD" : base.slice(0, 7)}`);
+      created = await git(["worktree", "add", "-b", branch, wt, base], root);
+    }
   }
 
   // Collision recovery — ONLY on a first materialization (`!task.worktreePath`).
@@ -1078,6 +1109,7 @@ export async function prepareWorkdir(
     };
   }
 
+  const warning = warnings.length > 0 ? warnings.join("; ") : undefined;
   if (restoredOn) {
     return {
       cwd: wt,
@@ -1085,6 +1117,8 @@ export async function prepareWorkdir(
       worktreePath: wt,
       note: `restored worktree at ${wt} on ${restoredOn} (task branch ${branch})`,
       checkoutBranch: restoredOn,
+      checkoutKnown: true,
+      ...(warning ? { warning } : {}),
     };
   }
 
@@ -1095,6 +1129,7 @@ export async function prepareWorkdir(
     worktreePath: wt,
     note: `created worktree at ${wt} on ${branch} (${baseLabel})`,
     checkoutBranch: branch,
+    checkoutKnown: true,
     ...(warning ? { warning } : {}),
   };
 }

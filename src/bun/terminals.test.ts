@@ -251,6 +251,35 @@ test("createTerminal on a drifted worktree opens in place, never checks out, and
   expect(after.checkoutBranch).toBe("implement/x");
 });
 
+test("createTerminal keeps the recorded checkout when the live branch read fails", async () => {
+  const repo = await makeRepo();
+  const task = makeTask(repo, { isolation: "worktree", agent: "codex" });
+  const first = await createTerminal(task.id);
+  if ("error" in first) throw new Error(first.error);
+  await killTerminalsForTask(task.id);
+  const wt = tasks.get(task.id)!.worktreePath!;
+  await git(["checkout", "-b", "implement/x"], wt);
+  const second = await createTerminal(task.id);
+  if ("error" in second) throw new Error(second.error);
+  await killTerminalsForTask(task.id);
+  expect(tasks.get(task.id)!.checkoutBranch).toBe("implement/x");
+
+  // A transient git failure (here a broken `.git` pointer) is "unknown", not
+  // "detached": the open still succeeds and the recorded drift survives.
+  const pointer = path.join(wt, ".git");
+  const saved = await Bun.file(pointer).text();
+  writeFileSync(pointer, "gitdir: /nonexistent/agetor-broken\n");
+  try {
+    const third = await createTerminal(task.id);
+    if ("error" in third) throw new Error(`terminal open failed: ${third.error}`);
+    expect(third.cwd).toBe(wt);
+    expect(tasks.get(task.id)!.checkoutBranch).toBe("implement/x");
+  } finally {
+    await killTerminalsForTask(task.id);
+    writeFileSync(pointer, saved);
+  }
+});
+
 test("a shell that exits is auto-removed from the manager", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-term-exit-"));
   const task = makeTask(dir);

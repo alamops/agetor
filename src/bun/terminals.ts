@@ -142,7 +142,7 @@ export async function createTerminal(
   inFlight.set(taskId, pending + 1);
   try {
     // Dynamic import — see the top-of-file note on the db.ts ↔ worktree.ts cycle.
-    const { prepareWorkdir, resolveRef } = await import("./worktree.ts");
+    const { prepareWorkdir, recordableCheckout, resolveRef } = await import("./worktree.ts");
     const prepared = await prepareWorkdir(task);
     if ("error" in prepared) return { error: prepared.error };
 
@@ -158,7 +158,10 @@ export async function createTerminal(
     ) {
       tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
     }
-    if (prepared.worktreePath) tasks.setCheckoutBranch(taskId, prepared.checkoutBranch);
+    // An unknown read (reuse whose `git symbolic-ref` failed) records nothing,
+    // so a transient git failure can't erase the recorded drifted branch.
+    const checkout = recordableCheckout(prepared);
+    if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
 
     const id = randomUUID();
     const shell = process.env.SHELL || "/bin/zsh";

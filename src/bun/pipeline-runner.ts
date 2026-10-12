@@ -47,7 +47,7 @@ import {
   subscribeGlobal,
 } from "./orchestrator.ts";
 import { cancelPendingForTask, listPendingForTask } from "./interactions.ts";
-import { prepareWorkdir } from "./worktree.ts";
+import { prepareWorkdir, recordableCheckout } from "./worktree.ts";
 import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
 import {
   classifyStepResponse,
@@ -515,8 +515,10 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
   if ("error" in prepared) return { error: prepared.error };
   // The parent carries the pipeline's last-seen checkout (D14); steps mirror
   // it. `setCheckoutBranch` is compare-then-write, so an unchanged value
-  // touches nothing.
-  if (prepared.worktreePath) tasks.setCheckoutBranch(parent.id, prepared.checkoutBranch);
+  // touches nothing; an unknown read (`recordableCheckout` → undefined) keeps
+  // the stored value instead of erasing it.
+  const checkout = recordableCheckout(prepared);
+  if (checkout !== undefined) tasks.setCheckoutBranch(parent.id, checkout);
   if (prepared.warning) noteParentWorktreeWarning(parent.id, prepared.warning);
   // Only write the row when something actually changed — an unconditional
   // `tasks.update` bumps `updated_at` on every refresh, which re-renders the
