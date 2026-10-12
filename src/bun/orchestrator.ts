@@ -300,6 +300,30 @@ export function pendingTeardown(taskId: string): Promise<void> {
   return teardowns.get(taskId) ?? Promise.resolve();
 }
 
+/** Tasks whose `deleteTask` is in progress. A pipeline parent's delete awaits
+ *  its step cascade before it ever enqueues a teardown, so `teardowns` alone
+ *  can't tell that the task is on its way out during that window. */
+const deletingTaskIds = new Set<string>();
+
+/**
+ * Synchronous "is this task being torn down right now" — an archive/delete
+ * teardown is queued or running, or a delete has started. For a caller that
+ * has already awaited `pendingTeardown` and then did async work of its own
+ * (terminal open's `prepareWorkdir`): a teardown that landed meanwhile has
+ * killed, or is about to kill, what the caller is about to start, so the
+ * caller must re-check this in the same synchronous run as its spawn.
+ */
+export function isTaskTearingDown(taskId: string): boolean {
+  return teardowns.has(taskId) || deletingTaskIds.has(taskId);
+}
+
+/** Test hook: queue `job` on the teardown FIFO for `key` under `taskId`, so a
+ *  test can hold that queue open (and make `pendingTeardown(taskId)` wait)
+ *  until it releases a gate. Not part of the public surface. */
+export function __enqueueTeardownForTest(taskId: string, key: string, job: () => Promise<void>): Promise<void> {
+  return enqueueTeardown(taskId, key, job);
+}
+
 export function subscribe(fn: Listener): () => void {
   listeners.add(fn);
   return () => listeners.delete(fn);
@@ -6747,6 +6771,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   // the tombstone on any such throw and re-raise, so the parent stays
   // launchable and the user can simply retry the delete.
   const isPipelineParent = task.pipelineId != null;
+  deletingTaskIds.add(taskId);
   try {
   if (isPipelineParent) {
     // M7: run under this parent's `withPipelineLock` so the cascade can't
@@ -6804,9 +6829,14 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     // gone (nothing can switch the checkout any more) and before the
     // directory is removed (the last moment the live branch is readable) —
     // with the same function the delete-confirm preview used.
+    // Re-read the row: a terminal open that was mid-`prepareWorkdir` when
+    // the delete started may have materialized the worktree and persisted
+    // its path since `task` was captured — the stale snapshot would leave
+    // that directory and its branch behind.
     if (!task.pipelineParentId) {
-      const plan = await teardownBranchesForTask(tasks.get(taskId) ?? task);
-      await removeWorktree(task, { branches: plan.branches });
+      const cur = tasks.get(taskId) ?? task;
+      const plan = await teardownBranchesForTask(cur);
+      await removeWorktree(cur, { branches: plan.branches });
     }
   });
   // Refs are otherwise path-only — agetor never copies anything to disk for
@@ -6824,7 +6854,43 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   } catch (err) {
     if (isPipelineParent) tombstonedPipelineParents.delete(taskId);
     throw err;
+  } finally {
+    deletingTaskIds.delete(taskId);
   }
+}
+
+/**
+ * Clean up a worktree that a refused terminal open materialized (created or
+ * re-attached) while the task was being archived or deleted. The open had
+ * persisted the path before it noticed, but the archive/delete teardown may
+ * already have run on a snapshot without it, so nothing else would remove
+ * the directory — and for a deleted task there is no row left for the boot
+ * sweep to find either.
+ *
+ * Queued on the task's teardown FIFO, so it runs after the archive/delete
+ * teardown already queued for the same workdir and `pendingTeardown(task.id)`
+ * covers it. At run time: a row that is live again (unarchived, or a delete
+ * that failed) owns the worktree through its persisted path, so nothing is
+ * done; an archived row gets the archive's branch-preserving detach; a deleted
+ * task gets the delete's removal, branches planned exactly as delete plans
+ * them. Best-effort, never throws.
+ */
+export function discardRefusedWorktree(
+  task: Task,
+  prepared: { worktreePath: string; branch: string | null },
+): Promise<void> {
+  return enqueueTeardown(task.id, task.workdir, async () => {
+    const cur = tasks.get(task.id);
+    if (cur && cur.archivedAt == null) return;
+    if (!existsSync(prepared.worktreePath)) return;
+    const target: Task = { ...(cur ?? task), worktreePath: prepared.worktreePath, branch: prepared.branch };
+    if (cur) {
+      await detachWorktree(target);
+      return;
+    }
+    const plan = await teardownBranchesForTask(target);
+    await removeWorktree(target, { branches: plan.branches });
+  });
 }
 
 /**

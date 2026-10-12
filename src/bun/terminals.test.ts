@@ -1,4 +1,4 @@
-import { test, expect, afterEach, beforeAll, afterAll } from "bun:test";
+import { test, expect, afterEach, beforeAll, afterAll, spyOn } from "bun:test";
 import { mkdtempSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -17,6 +17,7 @@ const {
   killTerminalsForTask,
   attachSocket,
   ARCHIVED_TERMINAL_ERROR,
+  TEARDOWN_TERMINAL_ERROR,
 } = await import("./terminals.ts");
 
 import type { Task } from "../shared/types.ts";
@@ -352,22 +353,117 @@ test("createTerminal waits out a queued teardown before reusing the worktree", a
   const task = makeTask(repo, { isolation: "worktree", agent: "codex", column: "done" });
   const first = await createTerminal(task.id);
   if ("error" in first) throw new Error(first.error);
+  await killTerminalsForTask(task.id);
   const wt = tasks.get(task.id)!.worktreePath!;
 
-  const { archiveTask, pendingTeardown } = await import("./orchestrator.ts");
-  const res = await archiveTask(task.id);
-  expect("task" in res).toBe(true);
-  // Clear the archive stamp directly (unarchiveTask would itself wait), so
-  // the teardown is still queued when the terminal opens. Without the wait
-  // the open reuses `wt` (still on disk) and the teardown then deletes it
-  // from under the shell.
-  tasks.update(task.id, { archivedAt: null });
-  const r = await createTerminal(task.id);
-  if ("error" in r) throw new Error(`terminal open failed: ${r.error}`);
+  const { archiveTask, pendingTeardown, __enqueueTeardownForTest } = await import("./orchestrator.ts");
+  // Hold the repo's teardown queue open with a gate, so the archive teardown
+  // below stays queued for exactly as long as the test wants.
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  void __enqueueTeardownForTest(`${task.id}-gate`, repo, () => gate);
+  try {
+    const res = await archiveTask(task.id);
+    expect("task" in res).toBe(true);
+    // Clear the archive stamp directly (unarchiveTask would itself wait), so
+    // the teardown is still queued when the terminal opens.
+    tasks.update(task.id, { archivedAt: null });
+    let settled = false;
+    const opening = createTerminal(task.id).finally(() => { settled = true; });
+    // While the teardown is queued the open must wait, not spawn a shell.
+    await Bun.sleep(300);
+    expect(settled).toBe(false);
+    expect(countTerminals(task.id)).toBe(0);
+    release();
+    const r = await opening;
+    if ("error" in r) throw new Error(`terminal open failed: ${r.error}`);
+    await pendingTeardown(task.id);
+    expect(r.cwd).toBe(wt);
+    expect(existsSync(wt)).toBe(true);
+    expect(countTerminals(task.id)).toBe(1);
+  } finally {
+    release();
+  }
+});
+
+/** Open a terminal on `taskId`, running `during` right after the real
+ *  `prepareWorkdir` returns — the window between terminal open's teardown
+ *  wait and its spawn, where a delete or archive can land. */
+async function openWithPrepareHook<T>(taskId: string, during: () => T | Promise<T>) {
+  const worktree = await import("./worktree.ts");
+  const real = worktree.prepareWorkdir;
+  let produced: T | undefined;
+  const spy = spyOn(worktree, "prepareWorkdir").mockImplementation(async (t, opts) => {
+    const res = await real(t, opts);
+    produced = await during();
+    return res;
+  });
+  try {
+    const result = await createTerminal(taskId);
+    return { result, produced: produced as T };
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+function branchExists(repo: string, branch: string): boolean {
+  return Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repo }).exitCode === 0;
+}
+
+test("createTerminal refuses when a delete starts during prepareWorkdir, leaving no shell and no worktree", async () => {
+  const { deleteTask, pendingTeardown } = await import("./orchestrator.ts");
+  const repo = await makeRepo();
+  // No worktree yet: the open materializes it, then the delete lands.
+  const task = makeTask(repo, { isolation: "worktree", agent: "codex", branch: "agetor/del-during-open" });
+
+  const { result, produced } = await openWithPrepareHook(task.id, () => ({ deleting: deleteTask(task.id) }));
+  expect("error" in result).toBe(true);
+  if (!("error" in result)) return;
+  expect([TEARDOWN_TERMINAL_ERROR, "task not found"]).toContain(result.error);
+  await produced.deleting;
   await pendingTeardown(task.id);
-  expect(r.cwd).toBe(wt);
-  expect(existsSync(wt)).toBe(true);
-  expect(countTerminals(task.id)).toBe(1);
+
+  expect(tasks.get(task.id)).toBeNull();
+  expect(countTerminals(task.id)).toBe(0);
+  // Neither the materialized worktree nor its branch outlived the delete.
+  const wt = path.join(process.env.AGETOR_DATA_DIR!, "worktrees", task.id);
+  expect(existsSync(wt)).toBe(false);
+  expect(branchExists(repo, "agetor/del-during-open")).toBe(false);
+});
+
+test("createTerminal refuses when a delete starts while it reuses an existing worktree", async () => {
+  const { deleteTask, pendingTeardown } = await import("./orchestrator.ts");
+  const repo = await makeRepo();
+  const task = makeTask(repo, { isolation: "worktree", agent: "codex" });
+  const first = await createTerminal(task.id);
+  if ("error" in first) throw new Error(first.error);
+  await killTerminalsForTask(task.id);
+  const wt = tasks.get(task.id)!.worktreePath!;
+
+  const { result, produced } = await openWithPrepareHook(task.id, () => ({ deleting: deleteTask(task.id) }));
+  expect("error" in result).toBe(true);
+  await produced.deleting;
+  await pendingTeardown(task.id);
+  expect(tasks.get(task.id)).toBeNull();
+  expect(countTerminals(task.id)).toBe(0);
+  expect(existsSync(wt)).toBe(false);
+});
+
+test("createTerminal refused by an archive during prepareWorkdir detaches the worktree it materialized", async () => {
+  const { archiveTask, pendingTeardown } = await import("./orchestrator.ts");
+  const repo = await makeRepo();
+  const task = makeTask(repo, { isolation: "worktree", agent: "codex", column: "done", branch: "agetor/archive-during-open" });
+
+  const { result } = await openWithPrepareHook(task.id, () => archiveTask(task.id));
+  expect(result).toEqual({ error: ARCHIVED_TERMINAL_ERROR });
+  await pendingTeardown(task.id);
+
+  expect(countTerminals(task.id)).toBe(0);
+  const row = tasks.get(task.id)!;
+  expect(row.archivedAt).not.toBeNull();
+  // Archive semantics: the checkout is gone, the branch survives for unarchive.
+  expect(existsSync(path.join(process.env.AGETOR_DATA_DIR!, "worktrees", task.id))).toBe(false);
+  expect(branchExists(repo, "agetor/archive-during-open")).toBe(true);
 });
 
 test("a shell that exits is auto-removed from the manager", async () => {

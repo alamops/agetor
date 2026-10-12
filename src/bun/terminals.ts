@@ -19,7 +19,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
-import type { TerminalTab } from "../shared/types.ts";
+import type { Task, TerminalTab } from "../shared/types.ts";
 import { tasks } from "./db.ts";
 // NOTE: worktree.ts is imported *dynamically* inside createTerminal, not at
 // the top level. worktree.ts reads db.ts's `dataDir` at module init; importing
@@ -34,6 +34,10 @@ const MAX_TERMINALS_PER_TASK = 8;
 /** `createTerminal`'s refusal for an archived task (archive closes a task's
  *  terminals and tears its worktree down). Exported for the tests. */
 export const ARCHIVED_TERMINAL_ERROR = "task is archived — unarchive it to open a terminal";
+
+/** `createTerminal`'s refusal while a delete (or another teardown) of the task
+ *  is in flight. Exported for the tests. */
+export const TEARDOWN_TERMINAL_ERROR = "task is being deleted";
 
 /** Recent-output ring buffer size. Replayed to a (re)connecting socket so
  *  reopening the sidebar or switching back to a tab restores scrollback
@@ -137,7 +141,10 @@ function notifyExit(e: TerminalEntry): void {
  * still queued for the task, then refuses an archived task outright — the
  * archived freeze: archive tears the worktree down and closes its terminals,
  * so opening one would either reuse a directory that is about to vanish or
- * re-create the worktree of an archived task. Unarchive it first.
+ * re-create the worktree of an archived task. Unarchive it first. The same
+ * check runs again right before the spawn, since an archive or delete can
+ * start while `prepareWorkdir` runs; a worktree this open materialized in
+ * that window is handed to `discardRefusedWorktree` instead of being leaked.
  */
 export async function createTerminal(
   taskId: string,
@@ -156,13 +163,26 @@ export async function createTerminal(
     // Dynamic imports — see the top-of-file note on the db.ts ↔ worktree.ts
     // cycle; orchestrator.ts imports this module statically.
     const { prepareWorkdir, resolveRef } = await import("./worktree.ts");
-    const { noteRestoredCheckout, pendingTeardown } = await import("./orchestrator.ts");
+    const {
+      discardRefusedWorktree,
+      isTaskTearingDown,
+      noteRestoredCheckout,
+      pendingTeardown,
+    } = await import("./orchestrator.ts");
+    /** The task as it stands right now, or why a terminal can't open on it. */
+    const current = (): { task: Task } | { error: string; notFound?: boolean } => {
+      const t = tasks.get(taskId);
+      if (!t) return { error: "task not found", notFound: true };
+      if (t.archivedAt != null) return { error: ARCHIVED_TERMINAL_ERROR };
+      if (isTaskTearingDown(taskId)) return { error: TEARDOWN_TERMINAL_ERROR };
+      return { task: t };
+    };
     // Serialize against a deferred archive/delete teardown before touching
     // the worktree, then judge the task as it stands once that settled.
     await pendingTeardown(taskId);
-    const task = tasks.get(taskId);
-    if (!task) return { error: "task not found", notFound: true };
-    if (task.archivedAt != null) return { error: ARCHIVED_TERMINAL_ERROR };
+    const before = current();
+    if ("error" in before) return before;
+    const { task } = before;
 
     // A worktree-isolated pipeline step shares its parent's worktree (D2):
     // re-materializing a missing one here would give this ONE step a private
@@ -175,6 +195,9 @@ export async function createTerminal(
     ) {
       return { error: "step task's worktree is missing — run the pipeline task instead" };
     }
+    // Same reuse condition as prepareWorkdir's: anything else materializes
+    // (creates or re-attaches) the worktree in this call.
+    const hadWorktree = !!task.worktreePath && !!task.branch && existsSync(task.worktreePath);
     const prepared = await prepareWorkdir(task);
     if ("error" in prepared) return { error: prepared.error };
 
@@ -190,15 +213,25 @@ export async function createTerminal(
     ) {
       tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
     }
-    // An archive or delete can land while `prepareWorkdir` runs. Its teardown
-    // has already closed this task's terminals (or is about to remove the
-    // worktree), so a shell spawned now would outlive it in a dying
-    // directory. The fields above are still persisted on purpose: if the
-    // prepare just materialized a worktree, that pointer is what lets the
-    // boot sweep (`sweepArchivedTeardowns`) find and remove it.
-    const current = tasks.get(taskId);
-    if (!current) return { error: "task not found", notFound: true };
-    if (current.archivedAt != null) return { error: ARCHIVED_TERMINAL_ERROR };
+    // An archive or delete can land while `prepareWorkdir` runs (both start
+    // synchronously — a delete's teardown is queued, or marked in progress,
+    // before its first await). Its teardown has already closed this task's
+    // terminals, or will before removing the worktree, so a shell spawned
+    // now would outlive it in a dying directory. Everything from this check
+    // to `terminals.set` below is synchronous, so a teardown that starts
+    // after it finds the new tab and kills it.
+    //
+    // The fields above are still persisted on purpose: the archive/delete
+    // teardown re-reads the row and removes whatever path it finds. If the
+    // prepare materialized the worktree, it may also have done so after that
+    // teardown already ran, so queue a cleanup behind it as well.
+    const after = current();
+    if ("error" in after) {
+      if (!hadWorktree && prepared.worktreePath) {
+        void discardRefusedWorktree(task, { worktreePath: prepared.worktreePath, branch: prepared.branch });
+      }
+      return after;
+    }
     // Record the live checkout (an unknown read records nothing, so a
     // transient git failure can't erase the recorded drifted branch) and
     // surface a re-attach `warning` — a terminal open may be the first thing
