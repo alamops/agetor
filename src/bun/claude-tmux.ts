@@ -46,7 +46,7 @@ import { detectAskModal, isLossyAskPane, parseModalPane, type AskModalKind, type
  * ready for the next prompt.
  */
 
-import type { RunEventStream } from "../shared/types.ts";
+import type { ContinuationTrigger, RunEventStream } from "../shared/types.ts";
 import {
   PERMISSION_MODE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
@@ -55,6 +55,7 @@ import {
 } from "../shared/types.ts";
 import { imageSourceMetaPath } from "../shared/attachments.ts";
 import { sanitizeToolResultAttachments } from "../shared/sent-files.ts";
+import { compactionStatusLine, isCompactionNotice } from "../shared/compaction.ts";
 
 /**
  * Stream chunk callback. `lineUuid` is the JSONL line's `uuid` field (claude
@@ -146,11 +147,19 @@ export type ContinuationHooks = {
  * Save/restore this like `claude-subagents.ts`'s `setSubagentEmitter`: a
  * test that installs a fake here and doesn't put the real one back strands
  * every later test file that dispatches a JSONL line while idle.
+ *
+ * The optional `trigger` says what started the turn — a task-notification,
+ * a `user` line agetor didn't paste (typed in the attached terminal), or an
+ * `assistant` line with no turn open — so the orchestrator's opening status
+ * line (`CONTINUATION_STATUS_TEXT`) names what actually happened. Optional
+ * so one-arg factories (tests, older callers) still fit; omitted means
+ * `"notification"`.
  */
-let continuationRunFactory: ((taskId: string) => ContinuationHooks | null) | null = null;
+export type ContinuationRunFactory = (taskId: string, trigger?: ContinuationTrigger) => ContinuationHooks | null;
+let continuationRunFactory: ContinuationRunFactory | null = null;
 export function setContinuationRunFactory(
-  fn: ((taskId: string) => ContinuationHooks | null) | null,
-): ((taskId: string) => ContinuationHooks | null) | null {
+  fn: ContinuationRunFactory | null,
+): ContinuationRunFactory | null {
   const prev = continuationRunFactory;
   continuationRunFactory = fn;
   return prev;
@@ -162,9 +171,14 @@ export function setContinuationRunFactory(
  * marker so an e2e pipeline can reproduce a background-task continuation
  * without a live JSONL tail. Returns null when nothing is installed or the
  * factory declines the task (unknown, archived, not claude-code).
+ * `trigger` defaults to `"notification"` — the background-task wording the
+ * fake driver's handoff scenario reproduces.
  */
-export function openContinuationRun(taskId: string): ContinuationHooks | null {
-  return continuationRunFactory?.(taskId) ?? null;
+export function openContinuationRun(
+  taskId: string,
+  trigger: ContinuationTrigger = "notification",
+): ContinuationHooks | null {
+  return continuationRunFactory?.(taskId, trigger) ?? null;
 }
 
 /**
@@ -620,7 +634,10 @@ interface ParsedJsonlEvent {
   /** Claude 2.1.x system events carry a `subtype` discriminator — observed
    *  values: `turn_duration` (durationMs + messageCount, emitted right after
    *  an assistant end_turn) and `away_summary` (recap text claude generated
-   *  for resumption). Older events leave this null. */
+   *  for resumption), plus `compact_boundary` (carries `compactMetadata`)
+   *  and `informational` (a `level`-tagged on-screen notice in `content`,
+   *  e.g. "Compacted while idle, before the prompt cache expired") from
+   *  context compaction. Older events leave this null. */
   subtype?: string;
   uuid?: string;
   message?: AssistantMessage & UserMessage;
@@ -645,6 +662,25 @@ interface ParsedJsonlEvent {
    *  "not a real turn" marker. We demote any isMeta entry to a status
    *  breadcrumb. `origin.kind` (above) is a narrower, nicer-summarized subset. */
   isMeta?: boolean;
+  /** Claude 2.1.x context compaction (idle, mid-turn auto, manual `/compact`)
+   *  writes its summary of the dropped history as a `user` line carrying
+   *  `isCompactSummary: true` (and, observed on 2.1.296, also
+   *  `isVisibleInTranscriptOnly: true`), with `isMeta` unset — so the
+   *  `isMeta` filter never catches it. Mapped to the `compaction_summary`
+   *  stream instead of a `user` chunk, and never continuation content (see
+   *  `isContinuationContentEvent`). */
+  isCompactSummary?: boolean;
+  /** Claude's "render in the transcript, but not a turn" marker on a `user`
+   *  line. Seen paired with `isCompactSummary`; on its own the shape is
+   *  unknown, so such a line keeps rendering as a `user` chunk but never
+   *  adopts a continuation run. */
+  isVisibleInTranscriptOnly?: boolean;
+  /** `system{subtype:"compact_boundary"}` metadata — `trigger` (`"auto"` /
+   *  `"manual"`), `preTokens`, `postTokens`, `durationMs`, … — read only for
+   *  the `context compacted · 450k → 8.6k tokens` status line
+   *  (`compactionStatusLine`, `src/shared/compaction.ts`). Typed loosely:
+   *  it is Claude's own shape and every field is validated at use. */
+  compactMetadata?: { trigger?: unknown; preTokens?: unknown; postTokens?: unknown };
   /** Claude 2.1.x `queue-operation` events carry `operation` (`enqueue` /
    *  `remove`) and, on enqueue, a string `content` payload. This is where
    *  background task-notifications now arrive — older versions delivered
@@ -990,6 +1026,20 @@ function syntheticNotificationUuid(content: string): string {
  * command / command-output bubbles `src/shared/user-message.ts` already knows
  * how to draw. The `isMeta` `<local-command-caveat>` breadcrumb is already
  * excluded by the `isMeta` check just above.
+ *
+ * **Compaction-summary lines are never continuation content either** (prod
+ * evidence, claude 2.1.296): ~54 min after the last turn, claude compacts an
+ * idle session and writes its summary of the dropped history as a `user`
+ * line carrying `isCompactSummary: true` + `isVisibleInTranscriptOnly: true`
+ * with `isMeta` unset. Under the old rule that line opened a phantom
+ * `origin: "continuation"` run on an idle session — nothing ever settled it
+ * (claude was idle; no `end_turn` was coming) and the task sat `running`
+ * for hours. It is claude rewriting its own context, not claude continuing
+ * work, so a `user` line with EITHER flag is excluded here (a line with only
+ * `isVisibleInTranscriptOnly` is of unknown shape — excluded from adoption,
+ * otherwise rendered as before). The summary routes to `state.lastChunk`
+ * (or the in-flight turn, for a mid-turn auto-compaction) and renders on
+ * the `compaction_summary` stream — see `mapParsedEventToChunks`.
  */
 function isContinuationContentEvent(evt: ParsedJsonlEvent): boolean {
   if (evt.type === "assistant") return true;
@@ -999,6 +1049,9 @@ function isContinuationContentEvent(evt: ParsedJsonlEvent): boolean {
     // content on their own.
     if (evt.origin?.kind === "task-notification") return false;
     if (evt.isMeta === true) return false;
+    // Compaction summary (and its transcript-only marker) — see this
+    // function's doc.
+    if (evt.isCompactSummary === true || evt.isVisibleInTranscriptOnly === true) return false;
     // The two local-command twins — see this function's doc.
     if (parseLocalCommandLine(evt) !== null) return false;
     if (isLocalCommandStdoutEvent(evt)) return false;
@@ -1223,6 +1276,26 @@ function mapParsedEventToChunks(
         if (data) onChunk("status", data, uuid);
         return { endOfTurn: false, lineUuid: uuid };
       }
+      // Context-compaction summary (`isCompactSummary: true`, isMeta unset):
+      // claude's own ~16 KB markdown summary of the history it just dropped.
+      // Not a human turn — emit it verbatim (CR-normalised like the human
+      // turn below) on the dedicated `compaction_summary` stream, never as a
+      // `user` chunk, so it never renders as a YOU bubble and is excluded by
+      // construction from the first-load anchor and the resend picker (both
+      // filter `stream = 'user'`). One chunk per line: the text blocks of an
+      // array-shaped content are joined, since a second chunk under the same
+      // line uuid would collide on the run_events dedup index. A line that
+      // only carries `isVisibleInTranscriptOnly` keeps today's rendering.
+      if (evt.isCompactSummary === true) {
+        const text =
+          typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content.filter((b) => b?.type === "text" && b.text).map((b) => b.text!).join("\n\n")
+              : "";
+        if (text) onChunk("compaction_summary", text.replace(/\r\n?/g, "\n"), uuid);
+        return { endOfTurn: false, lineUuid: uuid };
+      }
       // The human's interactive turn. We DO emit a "user" stream event
       // here — both for the run-panel rendering (so the bubble appears
       // alongside assistant text) and so a rebuild-from-JSONL contains
@@ -1405,6 +1478,23 @@ function mapParsedEventToChunks(
         // stays silent — it's claude's own resumption context, not
         // user-relevant.
         onChunk("status", `turn duration: ${formatTurnDuration(evt.durationMs)}`, uuid);
+      }
+      // Context compaction (idle, mid-turn auto, manual `/compact`): the
+      // `compact_boundary` line becomes `context compacted · 450k → 8.6k
+      // tokens` (`(manual)` for a user-run `/compact`; bare `context
+      // compacted` without token counts) built from claude's own
+      // `compactMetadata`. Independent `if`s, same convention as
+      // `turn_duration` above. These ride the ordinary dispatch path: no
+      // turn slot, no column change, no watchdog.
+      if (evt.subtype === "compact_boundary") {
+        onChunk("status", compactionStatusLine(evt.compactMetadata ?? {}), uuid);
+      }
+      // The compaction `informational` notice ("Compacted while idle, before
+      // the prompt cache expired") becomes its own status line, verbatim.
+      // Every other `informational` notice stays silent, as before.
+      if (evt.subtype === "informational" && typeof evt.content === "string"
+        && isCompactionNotice(evt.content)) {
+        onChunk("status", evt.content.trim(), uuid);
       }
       return { endOfTurn: false, lineUuid: uuid };
 
@@ -2198,14 +2288,18 @@ export async function dismissAskModalForMessage(taskId: string): Promise<boolean
 
     let tail = await capture();
     if (tail === null) return;
-    if (!paneShowsComposerText(tail)) { ok = true; return; }
+    // A dim composer placeholder (prompt suggestion, `Try "…"` sample) is an
+    // empty composer, not a draft — the styled read (taken only when the row
+    // is non-bare) keeps the double Escape from ever being sent into it.
+    if (!paneShowsComposerText(tail, await styledTailIfNonBare(state, tail))) { ok = true; return; }
     bumpKeystroke(state);
     if (!(await tmux(["send-keys", "-t", state.sessionName, ...COMPOSER_CLEAR_KEYS])).ok) return;
     await Bun.sleep(COMPOSER_CLEAR_SETTLE_MS);
     for (let poll = 0; poll < ASK_DISMISS_COMPOSER_POLLS; poll++) {
       if (!stillCurrent()) return;
       tail = await capture();
-      if (tail !== null && detectAskModal(tail) === null && !paneShowsComposerText(tail)) { ok = true; return; }
+      if (tail !== null && detectAskModal(tail) === null
+        && !paneShowsComposerText(tail, await styledTailIfNonBare(state, tail))) { ok = true; return; }
       await Bun.sleep(ASK_DISMISS_POLL_MS);
     }
   }, state);
@@ -4184,7 +4278,12 @@ function maybeAdoptContinuation(
   const isNotification = notifContent !== null;
   if (!isContinuationContentEvent(evt) && !isNotification) return;
 
-  const hooks = continuationRunFactory(state.taskId);
+  // What started this turn, for the run's opening status line: a
+  // notification, else whichever kind of content line claude wrote.
+  const trigger: ContinuationTrigger = isNotification
+    ? "notification"
+    : evt.type === "assistant" ? "assistant" : "user";
+  const hooks = continuationRunFactory(state.taskId, trigger);
   // A null factory result (unknown/archived task) intentionally falls
   // through to the pre-existing `lastChunk` routing in `dispatchLine` —
   // unchanged.
@@ -6314,6 +6413,12 @@ const IDLE_PROMPT_SEARCH_LINES = 8;
  * likely a modal replacing it, or a stale status-bar-shaped line sitting in
  * scrollback above one.
  *
+ * Returns the row's RAW line index into `tail.split("\n")` (blank rows
+ * included), not its position among the non-blank rows — so the same row
+ * can be located in a second, styled (`capture-pane -e`) capture of the same
+ * pane by index (`placeholderRowShowing`). `livePromptRow` is this function
+ * plus the lookup, so the two can never disagree about which row is live.
+ *
  * Bottom-most, not "any row" (docs/plans/model-effort-local-command-
  * turns.md §10 re-review finding #1): claude ECHOES the user's last
  * submitted line in the transcript with the SAME `❯` glyph — e.g.
@@ -6329,27 +6434,169 @@ const IDLE_PROMPT_SEARCH_LINES = 8;
  * LAST matching row — closest to the bar — picks the real composer over any
  * stale echo further up.
  */
-function livePromptRow(tail: string): string | null {
-  const nonBlank = tail.split("\n").filter((l) => l.trim().length > 0);
+function livePromptRowIndex(tail: string): number | null {
+  const lines = tail.split("\n");
+  const nonBlank: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]!.trim().length > 0) nonBlank.push(i);
+  }
   if (nonBlank.length === 0) return null;
   const lastTwo = nonBlank.slice(-2);
-  const barRelIndex = lastTwo.findIndex((l) => STATUS_BAR_RE.test(l));
+  const barRelIndex = lastTwo.findIndex((i) => STATUS_BAR_RE.test(lines[i]!));
   if (barRelIndex === -1) return null;
-  if (ESC_TO_INTERRUPT_RE.test(lastTwo[barRelIndex]!)) return null;
+  if (ESC_TO_INTERRUPT_RE.test(lines[lastTwo[barRelIndex]!]!)) return null;
   const barAbsIndex = nonBlank.length - lastTwo.length + barRelIndex;
   const above = nonBlank.slice(Math.max(0, barAbsIndex - IDLE_PROMPT_SEARCH_LINES), barAbsIndex);
-  for (let i = above.length - 1; i >= 0; i--) {
-    if (/^\s*❯/.test(above[i]!)) return above[i]!;
+  for (let k = above.length - 1; k >= 0; k--) {
+    if (/^\s*❯/.test(lines[above[k]!]!)) return above[k]!;
   }
   return null;
 }
 
+/** The live prompt row's text (see `livePromptRowIndex`), or `null`. */
+function livePromptRow(tail: string): string | null {
+  const index = livePromptRowIndex(tail);
+  return index === null ? null : tail.split("\n")[index]!;
+}
+
+/** A live prompt row exists and carries something after the `❯` — typed
+ *  text, a paste/image chip, or a dim placeholder; plain text can't tell
+ *  which. Callers take the (costlier) styled capture only in this case, since
+ *  a bare row already reads as idle and no row at all can't be a placeholder. */
+function livePromptRowNonBare(tail: string): boolean {
+  const row = livePromptRow(tail);
+  return row !== null && !/^\s*❯\s*$/.test(row);
+}
+
+/** Matches one terminal escape sequence at the start of the remaining input
+ *  (sticky): a CSI (`ESC [ params intermediates final` — SGR among them), an
+ *  OSC terminated by BEL or ST (tmux ≥ 3.4 emits OSC 8 hyperlinks under
+ *  `capture-pane -e`), a charset designation (`ESC ( B`), or any other
+ *  two-byte `ESC <char>` escape. */
+const ESCAPE_SEQUENCE_RE =
+  /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()*+][\x20-\x7e]|[\x20-\x7e])/y;
+const ESCAPE_SEQUENCE_GLOBAL_RE = new RegExp(ESCAPE_SEQUENCE_RE.source, "g");
+
+/** Strip terminal escape sequences (`ESC[…m` SGR and every other CSI, OSC,
+ *  charset and two-byte escapes) from a `capture-pane -e` line, leaving the
+ *  same text plain `capture-pane -p` returns for that row. A stray lone ESC
+ *  that starts no recognised sequence is dropped too. */
+function stripSgr(s: string): string {
+  return s.replace(ESCAPE_SEQUENCE_GLOBAL_RE, "").replace(/\x1b/g, "");
+}
+
+/**
+ * True when a STYLED (`capture-pane -e`) live prompt row holds only Claude's
+ * dim composer placeholder — a prompt suggestion (`❯ make a vertical version
+ * too`), the startup `Try "…"` sample, or `Message @<agent>…` — rather than
+ * text in the box. Claude renders every placeholder through one renderer:
+ * `dim(text)`, with the first character inverted instead (`invert(text[0]) +
+ * dim(rest)`) when a focused client shows the cursor block on it; typed text
+ * is never dim (spike, claude 2.1.296 / tmux 3.6a: `\x1b[39m❯\xa0\x1b[2mmake
+ * a vertical version too\x1b[0m` for a suggestion, per-word
+ * `\x1b[2mTry\x1b[0m \x1b[2m"create\x1b[0m …` spans for the startup sample,
+ * `\x1b[39m❯\xa0hello` for typed text). Note the `❯` is followed by a NBSP
+ * (U+00A0), not an ASCII space — JS `\s` matches both.
+ *
+ * Rule: the plain projection must read `❯` + whitespace + text and must not
+ * be a `[Pasted text …]` / `[Image #N]` chip (both render plain-coloured —
+ * the SGR rule alone already rejects them; this is belt-and-braces). Then an
+ * SGR state machine walks the row: params split on `;`; empty/`0` resets dim
+ * and invert; `2` sets dim, `22` clears it; `7` sets invert, `27` clears it;
+ * everything else (colours) is ignored — with the extended-colour forms
+ * `38/48/58;5;n` and `38/48/58;2;r;g;b` consumed whole, so a colour index of
+ * 2 or 7 can't read as dim/invert — and a non-`m` CSI is skipped. Characters
+ * up to and including `❯` are skipped, as is whitespace; every other
+ * character must be dim, except that the FIRST one may be inverted instead.
+ * At least one visible character is required, so a mixed row (`dim` then
+ * plain text) or an all-plain row is never a placeholder.
+ */
+function isPlaceholderRow(styledRow: string): boolean {
+  const plain = stripSgr(styledRow);
+  if (!/^\s*❯\s+\S/.test(plain)) return false;
+  if (/\[Pasted text/.test(plain) || /\[Image #\d+\]/.test(plain)) return false;
+  let dim = false;
+  let inverse = false;
+  let seenPrompt = false;
+  let visible = 0;
+  let i = 0;
+  while (i < styledRow.length) {
+    if (styledRow[i] === "\x1b") {
+      ESCAPE_SEQUENCE_RE.lastIndex = i;
+      const m = ESCAPE_SEQUENCE_RE.exec(styledRow);
+      if (!m) { i++; continue; }
+      const seq = m[0];
+      if (seq.startsWith("\x1b[") && seq.endsWith("m")) {
+        const params = seq.slice(2, -1).split(";");
+        for (let p = 0; p < params.length; p++) {
+          const param = params[p]!;
+          if (param === "" || param === "0") { dim = false; inverse = false; }
+          else if (param === "2") dim = true;
+          else if (param === "22") dim = false;
+          else if (param === "7") inverse = true;
+          else if (param === "27") inverse = false;
+          else if (param === "38" || param === "48" || param === "58") {
+            // Extended colour: its arguments are not attributes.
+            const mode = params[p + 1];
+            if (mode === "5") p += 2;
+            else if (mode === "2") p += 4;
+          }
+        }
+      }
+      i += seq.length;
+      continue;
+    }
+    const cp = styledRow.codePointAt(i)!;
+    const ch = String.fromCodePoint(cp);
+    i += ch.length;
+    if (!seenPrompt) {
+      if (ch === "❯") seenPrompt = true;
+      continue;
+    }
+    if (/\s/.test(ch)) continue;
+    visible++;
+    if (dim) continue;
+    if (visible === 1 && inverse) continue;
+    return false;
+  }
+  return seenPrompt && visible > 0;
+}
+
+/**
+ * True when the live prompt row of the PLAIN `tail` is, in the STYLED capture
+ * of the same pane (`styledTail`, from `captureStyledTail`), a dim
+ * placeholder (`isPlaceholderRow`). The styled row is located by the plain
+ * row's raw line index (`livePromptRowIndex`) and trusted only when its
+ * plain projection equals the plain row (right-trimmed): the two captures
+ * are separate tmux reads, so a mismatch means the pane moved between them
+ * and reads as "not a placeholder" — today's reading — never as idle.
+ */
+function placeholderRowShowing(plainTail: string, styledTail: string | null | undefined): boolean {
+  if (!styledTail) return false;
+  const index = livePromptRowIndex(plainTail);
+  if (index === null) return false;
+  const plainLine = plainTail.split("\n")[index]!;
+  const styledLine = styledTail.split("\n")[index];
+  if (styledLine === undefined) return false;
+  if (stripSgr(styledLine).trimEnd() !== plainLine.trimEnd()) return false;
+  return isPlaceholderRow(styledLine);
+}
+
 /** True when the pane shows claude idle at its input box: `livePromptRow`
  *  finds a live prompt row and that row is BARE — `❯` and nothing else typed
- *  (`/^\s*❯\s*$/`). `paneShowsComposerText` immediately below is this
- *  predicate's complement on the SAME row (finding #1, §10 re-review):
- *  exactly one of the two is true whenever `livePromptRow` finds a row at
- *  all, bare vs. non-bare.
+ *  (`/^\s*❯\s*$/`; the glyph is followed by a NBSP on 2.1.296, which `\s`
+ *  matches) — OR, when the caller passes the styled capture of the same pane
+ *  (`styledTail`), holds only Claude's dim composer placeholder (a prompt
+ *  suggestion, the startup `Try "…"` sample, `Message @<agent>…` — see
+ *  `isPlaceholderRow`). A placeholder IS an empty composer: Enter on it
+ *  submits nothing, and `Escape Escape` "clears" it straight back to the same
+ *  placeholder (spike, 2.1.296). Without `styledTail` (or with a `null` one —
+ *  the styled read failed or the caller never took it) only the bare row
+ *  counts, exactly as before placeholders were understood.
+ *  `paneShowsComposerText` immediately below is this predicate's complement
+ *  on the SAME row (finding #1, §10 re-review): given the same arguments,
+ *  exactly one of the two is true whenever `livePromptRow` finds a row on a
+ *  non-working pane.
  *
  *  NOTE: unlike `paneShowsComposerText`, this does not separately check
  *  `!paneShowsClaudeWorking(tail)` — the status bar's own `esc to interrupt`
@@ -6363,10 +6610,14 @@ function livePromptRow(tail: string): string | null {
  *  Gates the stuck-turn watchdog (`stuckTurnFallbackArmed`'s `paneIdle`
  *  param) — claude idle at the input box is proof a turn ended without ever
  *  writing an `end_turn` line, not a stuck/unparsable modal; see
- *  `signalIdleSettle` for how that gets settled instead of carded. */
-function paneShowsIdleInputBox(tail: string): boolean {
+ *  `signalIdleSettle` for how that gets settled instead of carded. A
+ *  placeholder-bearing composer must read idle here, or the watchdog arms on
+ *  it and an idle task gets an "unknown prompt" card instead of a settle. */
+function paneShowsIdleInputBox(tail: string, styledTail?: string | null): boolean {
   const row = livePromptRow(tail);
-  return row !== null && /^\s*❯\s*$/.test(row);
+  if (row === null) return false;
+  if (/^\s*❯\s*$/.test(row)) return true;
+  return placeholderRowShowing(tail, styledTail);
 }
 
 /**
@@ -6375,7 +6626,13 @@ function paneShowsIdleInputBox(tail: string): boolean {
  * in the box — the live row is non-bare (`/^\s*❯\s+\S/`, at least one
  * non-whitespace character after the `❯`) rather than the bare `❯` that
  * function requires. The multi-line paste placeholder (`❯ [Pasted text #1
- * +12 lines]`) is non-bare too — correctly treated as composer text.
+ * +12 lines]`) and an `[Image #N]` chip are non-bare too — correctly treated
+ * as composer text (both render plain-coloured, never dim). Claude's own
+ * DIM composer placeholder (prompt suggestion, startup `Try "…"` sample) is
+ * NOT composer text when the caller passes the styled capture
+ * (`styledTail`, see `isPlaceholderRow`): the box is empty, and sending
+ * `COMPOSER_CLEAR_KEYS` into it would only open claude's rewind picker. With
+ * no styled tail every non-bare row counts as text, as before.
  *
  * Also requires `!paneShowsClaudeWorking(tail)` explicitly (rather than
  * relying only on the status-bar's own `esc to interrupt` rejection, as
@@ -6388,10 +6645,55 @@ function paneShowsIdleInputBox(tail: string): boolean {
  * sitting in the composer before pasting a NEW message — pasting on top of
  * it would concatenate rather than replace.
  */
-function paneShowsComposerText(tail: string): boolean {
+function paneShowsComposerText(tail: string, styledTail?: string | null): boolean {
   if (paneShowsClaudeWorking(tail)) return false;
   const row = livePromptRow(tail);
-  return row !== null && /^\s*❯\s+\S/.test(row);
+  if (row === null || !/^\s*❯\s+\S/.test(row)) return false;
+  return !placeholderRowShowing(tail, styledTail);
+}
+
+/**
+ * Default `captureStyledTail`: `tmux capture-pane -p -e` — the same rows as
+ * the plain `capture-pane -p` every scraper site reads, with SGR escapes
+ * embedded — sliced to the same trailing `SCRAPE_TAIL_LINES` window, so a row
+ * index from `livePromptRowIndex(plainTail)` names the same pane row here.
+ * `tmux()` `.trim()`s stdout, which drops whole blank lines at both ends of
+ * the PLAIN capture; on the styled capture a visually blank edge line can
+ * still carry an escape sequence and survive that trim, so blank-by-
+ * projection edge lines are dropped here too before slicing — otherwise the
+ * two tails would be offset by a row. `null` on a failed capture (session
+ * gone, server down), which every caller reads as "no styled evidence",
+ * i.e. the plain-only reading.
+ */
+async function captureStyledTailFromTmux(state: SessionState): Promise<string | null> {
+  const cap = await tmux(["capture-pane", "-p", "-e", "-t", state.sessionName]);
+  if (!cap.ok) return null;
+  const lines = cap.stdout.split("\n");
+  let start = 0;
+  let end = lines.length;
+  while (start < end && stripSgr(lines[start]!).trim() === "") start++;
+  while (end > start && stripSgr(lines[end - 1]!).trim() === "") end--;
+  const kept = lines.slice(start, end);
+  return kept.slice(Math.max(0, kept.length - SCRAPE_TAIL_LINES)).join("\n");
+}
+
+/**
+ * Test seam: how the placeholder-aware callers (`scrapeOnce`, `queuePaste`'s
+ * composer-clear check, `dismissAskModalForMessage`, `autoConfirmSlashModal`)
+ * read the STYLED pane. Production is `captureStyledTailFromTmux`; the unit
+ * suite swaps in a synthetic styled pane via `__forTest.setCaptureStyledTail`.
+ * A SEPARATE seam from `capturePastePane`/`captureConfirmPane`: a test that
+ * injects only a plain pane gets whatever this returns — against a missing
+ * tmux session that is `null`, i.e. today's plain reading.
+ */
+let captureStyledTail: (state: SessionState) => Promise<string | null> = captureStyledTailFromTmux;
+
+/** Take the styled capture only when the plain `tail`'s live prompt row is
+ *  non-bare (`livePromptRowNonBare`) — the one case where it can change a
+ *  predicate's answer — so a bare or row-less pane costs no extra tmux call.
+ *  Returns `null` otherwise, or when the styled read fails. */
+async function styledTailIfNonBare(state: SessionState, tail: string): Promise<string | null> {
+  return livePromptRowNonBare(tail) ? captureStyledTail(state) : null;
 }
 
 /**
@@ -6491,6 +6793,15 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   const lines = cap.stdout.split("\n");
   const tailLines = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES));
   const tail = tailLines.join("\n");
+  // Second, STYLED read of the same pane — only when the live prompt row is
+  // non-bare, the one case where it can change `paneIdle` (a dim composer
+  // placeholder is idle; typed text is not — see `isPlaceholderRow`). Taken
+  // right after the plain capture, before anything below reads or mutates
+  // state, so the rest of the tick stays synchronous exactly as before. Used
+  // for `paneIdle` ONLY: fingerprints, the modal matchers and the
+  // `__external__` sweep keep reading the plain `tail` (no escape bytes, so
+  // #191's de-flicker is untouched).
+  const styledTail = await styledTailIfNonBare(state, tail);
 
   // The pane changing is a life signal independent of the JSONL — a native
   // AskUserQuestion modal, or the user driving the session directly via
@@ -6593,7 +6904,7 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   // turn is over even when no `end_turn` JSONL line ever confirmed it — used
   // below to keep the watchdog arm from carding an idle pane, and to drive
   // the idle-settle net that closes such a turn out instead.
-  const paneIdle = paneShowsIdleInputBox(tail);
+  const paneIdle = paneShowsIdleInputBox(tail, styledTail);
   const match = (claudeIsWriting || (askOnPane && !askUnrecoverable))
     ? null
     : pickScrapeMatch(tail, {
@@ -8509,7 +8820,11 @@ async function autoConfirmSlashModal(
     // already settled with no confirm modal — give up now rather than
     // spending the rest of SLASH_CONFIRM_WINDOW_MS polling nothing (see
     // this function's doc for why that matters for the tmux op chain).
-    idleStreak = paneShowsIdleInputBox(tail) ? idleStreak + 1 : 0;
+    // A dim composer placeholder (a prompt suggestion) is an idle box too —
+    // the styled read is taken only when the live row is non-bare.
+    const styledTail = await styledTailIfNonBare(state, tail);
+    if (!stillCurrent()) return false;
+    idleStreak = paneShowsIdleInputBox(tail, styledTail) ? idleStreak + 1 : 0;
     if (idleStreak >= SLASH_CONFIRM_IDLE_BREAK_TICKS) return false;
     if (i < attempts - 1) await Bun.sleep(SLASH_CONFIRM_POLL_MS);
   }
@@ -9621,9 +9936,37 @@ export const __forTest = {
    *  a thin wrapper over this). Exposed so the args half of the identity
    *  gate — and `LocalSettingInfo.args` — is unit-testable directly. */
   parseLocalCommandLine,
+  /** Adoption filter behind `maybeAdoptContinuation` — exposed so the
+   *  never-content families (task-notifications, `isMeta`, local-command
+   *  twins, compaction summaries) are unit-testable without a session. */
+  isContinuationContentEvent,
+  /** The parsed-line mapper `dispatchLine` and `rebuildEventsFromJsonl`
+   *  share — exposed so a test can map a parsed fixture object directly. */
+  mapParsedEventToChunks,
   paneShowsIdleInputBox,
   STATUS_BAR_RE,
   IDLE_PROMPT_SEARCH_LINES,
+  /** Placeholder-aware composer reading (`isPlaceholderRow`'s doc): the
+   *  escape stripper, the styled-row rule, the plain↔styled row match, and
+   *  the live-row locators it is built on — pure, so the truth table is
+   *  testable against synthetic `capture-pane -e` rows. */
+  stripSgr,
+  isPlaceholderRow,
+  placeholderRowShowing,
+  livePromptRow,
+  livePromptRowIndex,
+  /** Override how the placeholder-aware callers read the STYLED pane
+   *  (`captureStyledTail`; production runs `tmux capture-pane -p -e`).
+   *  Tests inject a synthetic styled pane — or `async () => null` for "no
+   *  styled evidence". Returns the previous reader so the test can restore
+   *  it in `afterEach` (mirrors `setCapturePastePane`). */
+  setCaptureStyledTail(
+    fn: (state: SessionState) => Promise<string | null>,
+  ): (state: SessionState) => Promise<string | null> {
+    const prev = captureStyledTail;
+    captureStyledTail = fn;
+    return prev;
+  },
   /** The flickering right-hand `● <effort> · /effort` status-bar hint regex,
    *  plus the pure helper that strips it off a matched `STATUS_BAR_RE` row —
    *  exposed so the "narrower than the whole line" truth table (finding #8,
@@ -10358,7 +10701,15 @@ function queuePaste(
         report(outcome);
         return;
       }
-      if (paneShowsComposerText(tail)) {
+      // Styled read of the same pane, only when the live row is non-bare: a
+      // dim composer placeholder (prompt suggestion, startup `Try "…"`
+      // sample) means the box is EMPTY — the stranded text is gone — so it
+      // takes the already-bare branch below and NEVER gets `Escape Escape`
+      // (which would just redraw the same placeholder and fail the positive
+      // verify). `null` (no styled evidence) keeps the plain reading.
+      const styledTail = await styledTailIfNonBare(expectedState, tail);
+      if (!stillCurrent()) return;
+      if (paneShowsComposerText(tail, styledTail)) {
         // (finding #8, §10 re-review) `send-keys` can itself fail (dead
         // server, socket gone, session vanished mid-op) exactly like any
         // other tmux call — check `.ok` rather than assuming the clear
@@ -10393,7 +10744,12 @@ function queuePaste(
         // "no blocking prompt" AND a confirmed bare row before trusting it.
         const after = await capturePastePane(expectedState);
         if (!stillCurrent()) return;
-        if (paneShowsBlockingPrompt(after) || !paneShowsIdleInputBox(after)) {
+        // A cleared composer can immediately redraw claude's dim placeholder
+        // (spike, 2.1.296: `Escape Escape` → `❯ Try "fix lint errors"`), so
+        // the positive verify accepts a placeholder row as bare too.
+        const afterStyled = await styledTailIfNonBare(expectedState, after);
+        if (!stillCurrent()) return;
+        if (paneShowsBlockingPrompt(after) || !paneShowsIdleInputBox(after, afterStyled)) {
           const outcome: Extract<PasteOutcome, { ok: false }> =
             { ok: false, op: "modal-guard", phase: "composer-dirty", stderr: "composer clear did not take" };
           const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
@@ -10405,8 +10761,8 @@ function queuePaste(
           return;
         }
         expectedState.composerHoldsText = false;
-      } else if (paneShowsIdleInputBox(tail)) {
-        // Prompt line already bare — the user submitted or cleared it some
+      } else if (paneShowsIdleInputBox(tail, styledTail)) {
+        // Prompt line already bare (or showing only claude's dim placeholder) — the user submitted or cleared it some
         // other way (typed Enter themselves, a modal that consumed it, …).
         // Nothing left to clear. Requires the POSITIVE `paneShowsIdleInputBox`
         // read (finding #2, §10 re-review), not merely `!paneShowsComposerText`

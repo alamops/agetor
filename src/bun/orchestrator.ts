@@ -149,6 +149,7 @@ import type {
   AgentProfile,
   AgentProfileSnapshot,
   ColumnId,
+  ContinuationTrigger,
   FxRecoveryPayload,
   GlobalEvent,
   Pipeline,
@@ -162,7 +163,7 @@ import type {
   WorktreeStaleReason,
   WorktreeTeardownResult,
 } from "../shared/types.ts";
-import { WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
+import { CONTINUATION_STATUS_TEXT, WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
 import {
   SENT_FILES_DELIVERED_RE,
   parseSentFilesToolResult,
@@ -5583,8 +5584,24 @@ export function __handlePasteWithheldForTest(
  *     equivalent notion of "kept talking after end_turn", so there's nothing
  *     to adopt a run for. Only claude-tmux's `dispatchLine` calls this
  *     factory today, so this is defense in depth rather than a live path.
+ *
+ * `trigger` names what started the turn, so the run's opening status line
+ * says what actually happened (`CONTINUATION_STATUS_TEXT`):
+ *   - `"notification"` (default) — a `<task-notification>` line, a
+ *     background task finishing → `auto-continued after background task`.
+ *     Also the fake driver's / pipeline-handoff adoption path
+ *     (`openContinuationRun`).
+ *   - `"user"` — a `user` line agetor didn't paste, i.e. typed in the
+ *     attached terminal → `turn started from the terminal`.
+ *   - `"assistant"` — an `assistant` line with no turn open → `Claude
+ *     continued on its own`.
+ * Claude's compaction-summary `user` lines never reach here: claude-tmux's
+ * `isContinuationContentEvent` excludes them.
  */
-function startContinuationRun(taskId: string): ContinuationHooks | null {
+function startContinuationRun(
+  taskId: string,
+  trigger: ContinuationTrigger = "notification",
+): ContinuationHooks | null {
   if (taskId === "__rebuild__") return null;
   const task = tasks.get(taskId);
   if (!task || task.archivedAt != null) return null;
@@ -5623,7 +5640,7 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
   const harness = resolveHarness(task.agent);
   const kind: AgentKind = harness?.kind ?? "claude-code";
   const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
-  onChunk("status", "auto-continued after background task");
+  onChunk("status", CONTINUATION_STATUS_TEXT[trigger] ?? CONTINUATION_STATUS_TEXT.notification);
 
   return {
     onChunk,

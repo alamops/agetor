@@ -548,13 +548,15 @@ test("claude-code without resumeSessionId or sessionId omits both flags", () => 
 
 test("claude-code with haiku-4.5 model + null effort emits no CLAUDE_CODE_EFFORT_LEVEL", () => {
   // Haiku 4.5 is the carve-out: the model doesn't accept the effort flag,
-  // so the UI sends null and buildCommand emits no env var.
+  // so the UI sends null and buildCommand emits no effort env var (the
+  // prompt-suggestion default still rides along).
   const result = buildCommand(builtin("claude-code"), "p", {
     mode: "auto",
     model: "haiku-4.5",
     effort: null,
   });
-  expect(result.env).toBeUndefined();
+  expect(result.env).toEqual({ CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "false" });
+  expect(result.env?.CLAUDE_CODE_EFFORT_LEVEL).toBeUndefined();
   expect(result.cmd).toContain("--model");
 });
 
@@ -1911,14 +1913,14 @@ test("fx: a null mode yields the exact same argv/env as passing defaultModeFor(\
 
 test("claude-code 'max' effort sets CLAUDE_CODE_EFFORT_LEVEL=max env", () => {
   const result = buildCommand(builtin("claude-code"), "do the thing", { ...claudeDefaults, effort: "max", mode: "auto" });
-  expect(result.env).toEqual({ CLAUDE_CODE_EFFORT_LEVEL: "max" });
+  expect(result.env).toEqual({ CLAUDE_CODE_EFFORT_LEVEL: "max", CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "false" });
 });
 
 test.each(["low", "medium", "high", "xhigh"])(
   "claude-code '%s' effort sets CLAUDE_CODE_EFFORT_LEVEL accordingly",
   (level) => {
     const result = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults, effort: level, mode: "auto" });
-    expect(result.env).toEqual({ CLAUDE_CODE_EFFORT_LEVEL: level });
+    expect(result.env).toEqual({ CLAUDE_CODE_EFFORT_LEVEL: level, CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "false" });
   },
 );
 
@@ -1926,7 +1928,64 @@ test("claude-code unknown effort id is dropped (no env)", () => {
   // Unknown values still satisfy the "effort was provided" check but are
   // filtered out of CLAUDE_EFFORT_VALUES so they don't reach the CLI.
   const result = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults, effort: "yolo", mode: "auto" });
-  expect(result.env).toBeUndefined();
+  expect(result.env).toEqual({ CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "false" });
+});
+
+// Claude Code's prompt suggestions and the startup `Try "…"` sample render as
+// dim text on the `❯` row; agetor turns them off on every claude-code launch
+// (docs/plans/claude-code-placeholder.md, P6).
+test("claude-code (built-in) with effort carries CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false", () => {
+  const { env } = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults });
+  expect(env?.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION).toBe("false");
+  expect(env?.CLAUDE_CODE_EFFORT_LEVEL).toBe("high");
+});
+
+test("claude-code (built-in) without effort carries CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false", () => {
+  const { env } = buildCommand(builtin("claude-code"), "p", { mode: "auto", model: "haiku-4.5", effort: null });
+  expect(env?.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION).toBe("false");
+});
+
+test("an extra-account claude-code harness carries CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false beside its own env", () => {
+  const secondary: Harness = {
+    ...alias("claude-code", { home: "/tmp/agetor-test/claude-2", env: { FOO: "bar" } }),
+    id: "secondary-claude-code",
+    label: "secondary-claude-code",
+  };
+  const { env } = buildCommand(secondary, "p", { ...claudeDefaults });
+  expect(env?.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION).toBe("false");
+  expect(env?.CLAUDE_CONFIG_DIR).toBe("/tmp/agetor-test/claude-2");
+  expect(env?.FOO).toBe("bar");
+});
+
+test("claude-code resumeSessionId launch carries CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false", () => {
+  const { cmd, env } = buildCommand(builtin("claude-code"), "p", {
+    ...claudeDefaults,
+    resumeSessionId: "abc-123-uuid",
+  });
+  expect(cmd).toContain("--resume");
+  expect(env?.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION).toBe("false");
+});
+
+test("a claude-code harness whose own env sets CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION keeps its value", () => {
+  const { env } = buildCommand(
+    alias("claude-code", { env: { CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "true" } }),
+    "p",
+    { ...claudeDefaults },
+  );
+  expect(env?.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION).toBe("true");
+});
+
+test("non-claude kinds never get CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", () => {
+  const launches: { env?: Record<string, string> }[] = [
+    buildCommand(builtin("codex"), "p", { ...codexDefaults }),
+    buildCommand(builtin("gemini"), "p", { ...geminiDefaults }),
+    buildCommand(builtin("cursor"), "p", { ...cursorDefaults }),
+    buildCommand(builtin("fx"), "p", { ...fxDefaults }),
+    buildCommand(alias("codex", { home: "/tmp/agetor-test/codex-2" }), "p", { ...codexDefaults }),
+  ];
+  for (const { env } of launches) {
+    expect(env?.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION).toBeUndefined();
+  }
 });
 
 test("AGETOR_CLAUDE_ARGS extra args land before the prompt (and before the `--` terminator)", () => {

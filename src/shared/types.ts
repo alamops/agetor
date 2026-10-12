@@ -4209,6 +4209,16 @@ export interface GitHubNotificationsResult {
  *                  this stream just keeps the open panel's tab strip in sync.
  *                  The subagent's actual transcript content rides the normal
  *                  user/assistant/tool_* streams, tagged via `subagentId`.
+ *   compaction_summary — Claude Code's own context-compaction summary (the
+ *                  JSONL `user` line carrying `isCompactSummary: true`),
+ *                  persisted verbatim with no agetor-authored wrapper. Kept
+ *                  off the `user` stream on purpose: the first-load anchor
+ *                  (`runs.lastUserEventId`) and the resend picker
+ *                  (`runs.userMessageHistory`) both filter `stream = 'user'`,
+ *                  so the summary is excluded from them by construction.
+ *                  Set at ingest only — rows stored before this stream
+ *                  existed keep rendering as before (see
+ *                  `src/shared/compaction.ts`).
  */
 export type RunEventStream =
   | "stdout"
@@ -4221,7 +4231,29 @@ export type RunEventStream =
   | "thinking"
   | "tool_use"
   | "tool_result"
-  | "subagent";
+  | "subagent"
+  | "compaction_summary";
+
+/**
+ * What made a claude-code session start a turn agetor didn't send — the
+ * trigger of an `origin: "continuation"` run (`startContinuationRun` in
+ * `src/bun/orchestrator.ts`, adopted by `maybeAdoptContinuation` in
+ * `src/bun/claude-tmux.ts`):
+ *   notification — a `<task-notification>` (background task finished);
+ *   user         — a `user` line agetor didn't paste (typed in the attached
+ *                  terminal);
+ *   assistant    — an `assistant` line with no turn open (Claude continued
+ *                  on its own).
+ */
+export type ContinuationTrigger = "notification" | "user" | "assistant";
+
+/** The status line a continuation run opens with, per trigger — says what
+ *  actually happened instead of blaming a background task for every case. */
+export const CONTINUATION_STATUS_TEXT: Readonly<Record<ContinuationTrigger, string>> = {
+  notification: "auto-continued after background task",
+  user: "turn started from the terminal",
+  assistant: "Claude continued on its own",
+};
 
 /** Max number of persisted events `GET /tasks/:id/events` replays on SSE
  *  (re)connect — the most recent window; older history is fetched on demand

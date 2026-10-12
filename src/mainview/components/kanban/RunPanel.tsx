@@ -121,6 +121,7 @@ import { TodoProgressCard } from "./TodoProgressCard";
 import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
 import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink, MD_URL_TRANSFORM, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./md-components";
 import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent, HandoffReminderBadge } from "./MessageSegments";
+import { CompactionSummaryBlock } from "./CompactionSummaryBlock";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -5337,6 +5338,8 @@ function RunEventList({
           return [wrap(key, evid, <AssistantBlock text={e.data} />)];
         case "thinking":
           return [wrap(key, evid, <ThinkingBlock text={e.data} />)];
+        case "compaction_summary":
+          return [wrap(key, evid, <CompactionSummaryBlock text={e.data} />)];
         case "tool_use": {
           const parsed = safeParse<ParsedToolUse>(e.data);
           if (!parsed) return [wrap(key, evid, <RawText text={e.data} muted />)];

@@ -10,6 +10,7 @@ import {
   parseFxRecoveryPayload,
 } from "../../shared/fx-recovery.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
+import { COMPACTION_SUMMARY_LABEL, compactionSummaryLine } from "../../shared/compaction.ts";
 import { pipelineStepProgress } from "../../shared/pipeline.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
 import {
@@ -896,6 +897,18 @@ const EventLine = memo(function EventLine({
             <UserPlainLine key={i} line={line} />
           ))}
         </Box>
+      );
+    // Claude's context-compaction summary — one digest line (first line +
+    // size), same as `agetor logs`, never the ~16 KB body.
+    case "compaction_summary":
+      return (
+        <UserPlainLine
+          line={{
+            label: COMPACTION_SUMMARY_LABEL,
+            text: escapeFreeText(compactionSummaryLine(e.data)),
+            tone: "machine",
+          }}
+        />
       );
     case "assistant":
       return <Text wrap="truncate-end">{e.data}</Text>;
