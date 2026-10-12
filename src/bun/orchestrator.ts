@@ -1770,8 +1770,10 @@ async function startTaskInner(
         data: `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
         ts: now,
       });
+      // Persisted (unlike the broadcast-only `started —` breadcrumb) so the
+      // drift notice stays in the run log, `agetor logs` and history.
       for (const line of worktreeDriftStatusLines(task, prepared)) {
-        emit({ runId, taskId, stream: "status", data: line, ts: now });
+        appendRunStatusLine(taskId, runId, line);
       }
       attachDoneHandler(runId, taskId, agent);
       return { ok: true as const };

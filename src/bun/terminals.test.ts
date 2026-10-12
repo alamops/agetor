@@ -222,6 +222,35 @@ test("createTerminal materializes the worktree for an isolation task and pins it
   expect(created.cwd).toBe(after.worktreePath!);
 });
 
+test("createTerminal on a drifted worktree opens in place, never checks out, and records the live branch", async () => {
+  const repo = await makeRepo();
+  const task = makeTask(repo, { isolation: "worktree", agent: "codex" });
+  const first = await createTerminal(task.id);
+  if ("error" in first) throw new Error(first.error);
+  const pinned = tasks.get(task.id)!;
+  const wt = pinned.worktreePath!;
+  // The first open recorded the branch it materialized on.
+  expect(pinned.checkoutBranch).toBe(pinned.branch);
+  await killTerminalsForTask(task.id);
+
+  // Drift: an agent cut its own branch, committed, then left a conflicting
+  // uncommitted edit — exactly the state that made the old reuse-path
+  // `git checkout <task.branch>` fail with "could not be switched".
+  await git(["checkout", "-b", "implement/x"], wt);
+  writeFileSync(path.join(wt, "README"), "drifted\n");
+  await git(["commit", "-am", "drift"], wt);
+  writeFileSync(path.join(wt, "README"), "uncommitted conflicting edit\n");
+
+  const second = await createTerminal(task.id);
+  if ("error" in second) throw new Error(`terminal open failed: ${second.error}`);
+  expect(second.cwd).toBe(wt);
+  const head = Bun.spawnSync(["git", "symbolic-ref", "--short", "HEAD"], { cwd: wt }).stdout.toString().trim();
+  expect(head).toBe("implement/x");
+  const after = tasks.get(task.id)!;
+  expect(after.branch).toBe(pinned.branch); // task.branch is never adopted
+  expect(after.checkoutBranch).toBe("implement/x");
+});
+
 test("a shell that exits is auto-removed from the manager", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-term-exit-"));
   const task = makeTask(dir);

@@ -2683,8 +2683,10 @@ export function initPipelineRunner(): void {
  *  not snapped back to Review. `setBeforeReminderSend` lets a test inject a
  *  successor between the reminder being queued and `sendInput`.
  *  `setBeforeReminderStamp` lets a test inject one after `sendInput`
- *  returns and before the reminder is recorded. Never imported outside
- *  this module's own test file. */
+ *  returns and before the reminder is recorded. `refreshParentWorktree` /
+ *  `propagateWorktreeToActiveSteps` let a test drive the shared-worktree
+ *  upkeep (and its last-seen-checkout mirroring) directly. Never imported
+ *  outside this module's own test files. */
 export const __forTest = {
   setListenerEnabled(enabled: boolean): void {
     listenerEnabled = enabled;
@@ -2698,4 +2700,6 @@ export const __forTest = {
     beforeReminderStamp = hook;
   },
   persist,
+  refreshParentWorktree,
+  propagateWorktreeToActiveSteps,
 };

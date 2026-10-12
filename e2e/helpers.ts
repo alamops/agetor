@@ -149,3 +149,17 @@ export function seedHarnessUsage(backend: E2EBackend, quota: HarnessQuota): void
     db.close();
   }
 }
+
+/**
+ * Waits for a task's terminal pane to be live: `TerminalView`'s pane carries
+ * `data-ready="true"` once the PTY has delivered its first output frame over
+ * the WebSocket (xterm's canvas renders before anything arrives, so its mere
+ * visibility proves nothing). `scope` is the run panel (or any container
+ * holding the Terminal section). The default 20 s ceiling matches
+ * `terminals.test.ts`'s `SHELL_READY_MS` — a cold login shell on a loaded box.
+ */
+export async function waitForTerminalReady(scope: Locator, timeoutMs = 20_000): Promise<Locator> {
+  const pane = scope.locator('[data-testid="terminal-pane"][data-ready="true"]').first();
+  await expect(pane).toBeAttached({ timeout: timeoutMs });
+  return pane;
+}
