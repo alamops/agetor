@@ -6713,10 +6713,18 @@ export async function teardownBranchesForTask(task: Task): Promise<TaskTeardownP
   if (task.isolation !== "worktree" || !task.worktreePath || task.pipelineParentId) {
     return { branches: [], liveBranch: null, taskBranch, source: "none", excluded: [] };
   }
+  // A successful read of a detached HEAD (`{ok: true, branch: null}`) is a
+  // KNOWN state — the worktree is on no named branch — so the recorded
+  // last-seen checkout must not stand in for it (D5: the recorded value is
+  // used only when the live branch can't be read).
   let liveBranch: string | null = null;
+  let liveKnown = false;
   if (existsSync(task.worktreePath)) {
     const live = await readCheckoutBranch(task.worktreePath);
-    if (live.ok) liveBranch = live.branch;
+    if (live.ok) {
+      liveBranch = live.branch;
+      liveKnown = true;
+    }
   }
   const root = await repoRoot(task.workdir);
   const defaultBranch = root ? await resolveDefaultBranchName(root) : null;
@@ -6731,7 +6739,7 @@ export async function teardownBranchesForTask(task: Task): Promise<TaskTeardownP
     taskBranch,
     branchSource: task.branchSource,
     liveBranch,
-    lastSeen: task.checkoutBranch ?? null,
+    lastSeen: liveKnown ? null : task.checkoutBranch ?? null,
     defaultBranch,
     heldByOthers,
   });

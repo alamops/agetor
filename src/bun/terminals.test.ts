@@ -466,6 +466,40 @@ test("createTerminal refused by an archive during prepareWorkdir detaches the wo
   expect(branchExists(repo, "agetor/archive-during-open")).toBe(true);
 });
 
+test("createTerminal refuses a pipeline task while its delete awaits the step cascade", async () => {
+  const { deleteTask, isTaskTearingDown } = await import("./orchestrator.ts");
+  const { withPipelineLock } = await import("./pipeline-runner.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-term-pipeline-del-"));
+  // A pipeline PARENT: its delete awaits the step cascade (under the
+  // per-parent pipeline lock) before it ever queues a teardown, so during
+  // that window `pendingTeardown` has nothing to wait on — only the
+  // delete-in-progress mark can tell the open the task is on its way out.
+  const parent = makeTask(dir, { pipelineId: "term-pipeline" });
+
+  // Hold the parent's pipeline lock so the delete's cascade stays parked.
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const held = withPipelineLock(parent.id, () => gate);
+  let deleting: Promise<void> | undefined;
+  try {
+    deleting = deleteTask(parent.id);
+    expect(isTaskTearingDown(parent.id)).toBe(true);
+    // The row is still there — the open must be refused, not served.
+    expect(tasks.get(parent.id)).not.toBeNull();
+
+    const r = await createTerminal(parent.id);
+    expect(r).toEqual({ error: TEARDOWN_TERMINAL_ERROR });
+    expect(countTerminals(parent.id)).toBe(0);
+  } finally {
+    release();
+    await held;
+    await deleting;
+  }
+  expect(tasks.get(parent.id)).toBeNull();
+  expect(isTaskTearingDown(parent.id)).toBe(false);
+  expect(countTerminals(parent.id)).toBe(0);
+});
+
 test("a shell that exits is auto-removed from the manager", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-term-exit-"));
   const task = makeTask(dir);

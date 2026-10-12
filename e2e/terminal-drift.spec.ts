@@ -26,8 +26,10 @@ import { startGitHubStub, type GitHubStub } from "./github-stub";
  * Act/assert: the terminal opens (PTY live, no toast) and HEAD is untouched;
  * the run panel's drift chip and details rows show the live branch; the
  * terminal open recorded it, so the board card shows it on the next poll;
- * "Create PR" prefills the drifted branch as head; and Delete's confirm names
- * both branches it would remove (cancelled).
+ * "Create PR" prefills the drifted branch as head; Delete's confirm names
+ * both branches it would remove (cancelled); and when the teardown preview
+ * fails, the confirm falls back to the task row and names the drifted branch
+ * as one the delete may also remove (cancelled).
  *
  * `SHELL=/bin/sh` (via `backendEnv`, which only `freshBackend` reads) for the
  * same reason `terminals.test.ts` pins it: the assertion is about the
@@ -166,6 +168,38 @@ test("a drifted worktree opens a terminal in place and every surface shows the l
     await expect(dialog).toBeHidden();
     // Cancelled: nothing was torn down.
     expect(git(repo, ["branch", "--list", DRIFT_BRANCH])).toContain(DRIFT_BRANCH);
+
+    // ── Preview unavailable: the confirm falls back to the task row ─────
+    // An older core (or a failed preview request) can't plan the teardown,
+    // so the confirm names `task.branch` and, as a "possibly", the drifted
+    // branch the worktree was last seen on.
+    // The app calls the API cross-origin: without the ACAO header the browser
+    // would block the response and the app would see a network error instead.
+    let previewRequests = 0;
+    await page.route((url) => url.pathname === `/tasks/${taskId}/teardown-preview`, (route) => {
+      previewRequests++;
+      return route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify({ error: "teardown preview unavailable" }),
+      });
+    });
+    try {
+      await page.getByText(title, { exact: true }).first().click({ button: "right" });
+      await page.locator('[data-testid="task-context-menu-delete"]').click();
+      const fallback = page.getByRole("dialog");
+      await expect(fallback.getByTestId("delete-confirm-maybe-branch")).toHaveText(DRIFT_BRANCH);
+      expect(previewRequests).toBeGreaterThan(0);
+      await expect(fallback).toContainText(`Its git worktree (${taskBranch}) will also be torn down`);
+      await expect(fallback.getByTestId("delete-confirm-branches")).toHaveCount(0);
+      await fallback.getByRole("button", { name: "Cancel" }).click();
+      await expect(fallback).toBeHidden();
+    } finally {
+      await page.unrouteAll({ behavior: "wait" });
+    }
+    expect(git(repo, ["branch", "--list", DRIFT_BRANCH])).toContain(DRIFT_BRANCH);
+    expect(git(repo, ["branch", "--list", taskBranch])).toContain(taskBranch);
   } finally {
     await stub.close();
   }

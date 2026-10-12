@@ -207,6 +207,28 @@ test("teardownBranchesForTask: live, last-seen (archived) and no drift", async (
   tasks.delete(taskId);
 });
 
+test("teardownBranchesForTask and deleteTask keep the last-seen branch when the live HEAD is detached", async () => {
+  const { teardownBranchesForTask, deleteTask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const { repo, taskId, wt, taskBranch } = await startedWorktreeTask({ title: "detached at delete" });
+  // The worktree drifted onto implement/x and that was recorded; the user then
+  // detached HEAD in a terminal with no run settling in between, so the
+  // recorded checkout is stale but the live read is a known detached state.
+  await drift(wt);
+  tasks.setCheckoutBranch(taskId, "implement/x");
+  await git(["checkout", "--detach"], wt);
+  expect(tasks.get(taskId)?.checkoutBranch).toBe("implement/x");
+
+  expect(await teardownBranchesForTask(tasks.get(taskId)!)).toEqual({
+    branches: [taskBranch], liveBranch: null, taskBranch, source: "task-branch", excluded: [],
+  });
+
+  await deleteTask(taskId);
+  expect(tasks.get(taskId)).toBeNull();
+  expect(await branchExists(repo, taskBranch)).toBe(false);
+  expect(await branchExists(repo, "implement/x")).toBe(true);
+});
+
 test("teardownBranchesForTask never names the default branch and is empty for isolation none", async () => {
   const { teardownBranchesForTask, createTask } = await import("./orchestrator.ts");
   const { tasks } = await import("./db.ts");
