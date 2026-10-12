@@ -97,6 +97,10 @@ function TerminalPane({
   // below can send a resize frame after a live refit without needing its own
   // WebSocket plumbing.
   const wsRef = useRef<WebSocket | null>(null);
+  // Flips once the PTY has sent its first output frame — exposed as
+  // `data-ready` on the pane so e2e can wait for a live shell rather than for
+  // xterm's canvas, which renders before the socket has delivered anything.
+  const [ready, setReady] = useState(false);
   const { resolved } = useTheme();
   const { percent: fontSizePercent } = useFontSize();
   // Read via a ref inside the mount effect below so the effect's own
@@ -170,6 +174,7 @@ function TerminalPane({
           return;
         }
         term.write(new Uint8Array(ev.data));
+        setReady(true);
       };
       sock.onclose = () => {
         if (disposed) return;
@@ -285,6 +290,9 @@ function TerminalPane({
   return (
     <div
       ref={hostRef}
+      data-testid="terminal-pane"
+      data-terminal-id={terminalId}
+      data-ready={ready ? "true" : "false"}
       className={cn(
         "absolute inset-0 p-1",
         visible ? "z-10 opacity-100" : "-z-10 opacity-0 pointer-events-none",
@@ -353,6 +361,7 @@ export function TerminalView({ taskId }: { taskId: string }) {
           {tabs.map((t) => (
             <div
               key={t.id}
+              data-testid="terminal-tab"
               className={cn(
                 "group flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[11px]",
                 t.id === activeId
@@ -379,6 +388,7 @@ export function TerminalView({ taskId }: { taskId: string }) {
           type="button"
           className="shrink-0 rounded-md p-1 text-muted-foreground hover:bg-accent/40 disabled:opacity-50"
           title="New terminal"
+          data-testid="terminal-open"
           disabled={busy}
           onClick={() => void openTerminal()}
         >
@@ -391,6 +401,7 @@ export function TerminalView({ taskId }: { taskId: string }) {
           <button
             type="button"
             className="flex h-full w-full flex-col items-center justify-center gap-2 text-xs text-muted-foreground hover:text-foreground"
+            data-testid="terminal-open"
             disabled={busy}
             onClick={() => void openTerminal()}
           >

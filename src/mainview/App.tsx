@@ -1829,12 +1829,36 @@ function AppInner() {
     }
   }, [refresh, surfaceError]);
   const del = useCallback(async (t: Task) => {
+    // Ask the core which branches the delete would remove — `t.branch`, plus
+    // the branch a drifted worktree is actually on — so the confirm names
+    // every one. Best-effort: on failure (or an older core) fall back to the
+    // generic copy.
+    const preview = t.worktreePath
+      ? await api.getTaskTeardownPreview(t.id).catch(() => null)
+      : null;
     const ok = await confirm({
       title: `Delete "${t.title}"?`,
       description: (
         <>
           The task and its run history will be removed.
-          {t.worktreePath && (
+          {t.worktreePath && preview && preview.branches.length > 0 && (
+            <>
+              {" "}Its git worktree and {preview.branches.length === 1 ? "branch" : "branches"}{" "}
+              <span data-testid="delete-confirm-branches">
+                {preview.branches.map((b, i) => (
+                  <span key={b}>
+                    {i > 0 && ", "}
+                    <span className="font-mono text-foreground/80">{b}</span>
+                  </span>
+                ))}
+              </span>{" "}
+              will be torn down.
+            </>
+          )}
+          {t.worktreePath && preview && preview.branches.length === 0 && (
+            <> Its git worktree will be torn down; no branches will be deleted.</>
+          )}
+          {t.worktreePath && !preview && (
             <>
               {" "}Its git worktree (
               <span className="font-mono text-foreground/80">{t.branch}</span>

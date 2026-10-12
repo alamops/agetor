@@ -10,6 +10,7 @@ import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingIntera
 import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
+import { driftOf, driftTitle } from "@/lib/branch-drift";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
 import { EXPAND_EVENT, isExpandTargetFor } from "@/lib/expand-on-jump";
@@ -3301,7 +3302,10 @@ function RunPanelBody({
   // Head branch a "Create PR" would open from — agetor's worktree branch, or
   // the workdir's live non-default branch for an isolation:"none" task. `null`
   // means "nothing sensible to PR from", which is also the chip's gate.
-  const prHead = prHeadBranch(task.branch ?? null, gitStatus);
+  const prHead = prHeadBranch(task.branch ?? null, gitStatus, task.branchSource);
+  // Live checkout vs the branch agetor created (5 s git-status poll). Drift is
+  // tolerated, never corrected — the header and details say where it is.
+  const branchDrift = driftOf(task.branch ?? null, gitStatus?.branch);
   const resolveConflictsSentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => {
     if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
@@ -3637,7 +3641,23 @@ function RunPanelBody({
         <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
           <span className="truncate">
             {task.agent} · {task.column}
-            {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
+            {task.branch && !branchDrift.drifted && <> · <span className="font-mono">{task.branch}</span></>}
+            {branchDrift.drifted && (
+              <>
+                {" · "}
+                <span className="font-mono" title={driftTitle(task.branch ?? null)}>{branchDrift.live}</span>{" "}
+                <span
+                  data-testid="run-panel-branch-drift"
+                  title={driftTitle(task.branch ?? null)}
+                  className={cn(
+                    "rounded px-1 py-px text-[10px] font-medium",
+                    task.branchSource === "existing" ? "bg-warning/15 text-warning" : "bg-info/15 text-info",
+                  )}
+                >
+                  {task.branchSource === "existing" ? "not on PR head" : "drifted"}
+                </span>
+              </>
+            )}
             {task.baseRef && (
               <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
             )}
@@ -3806,6 +3826,7 @@ function RunPanelBody({
         onRefreshModels={onRefreshModels}
         homeDir={homeDir}
         onTaskFieldsChanged={onTaskFieldsChanged}
+        liveBranch={gitStatus?.branch ?? null}
         tmuxSession={latestRun?.tmuxSession ?? null}
         // "Has this task ever run" for the Agent-details dialog's status
         // line — the union of every signal in scope, since each is
@@ -6753,6 +6774,7 @@ function TaskDetails({
   onRefreshModels,
   homeDir,
   onTaskFieldsChanged,
+  liveBranch,
   tmuxSession,
   hasRun,
 }: {
@@ -6780,6 +6802,10 @@ function TaskDetails({
    *  state — used by Detach below so the unlock is visible immediately
    *  instead of waiting for the next 2s poll. */
   onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
+  /** Branch the worktree has checked out right now (the panel's 5 s
+   *  git-status poll), `null` when unknown/detached. When it differs from
+   *  `task.branch` the Branch row splits into "Checked out" + "Task branch". */
+  liveBranch: string | null;
   /** Tmux session name from the latest run (claude-code only). `null` when
    *  no run has spawned a session yet — the Tmux row hides itself in that
    *  case rather than presenting an Attach button that's guaranteed to 404. */
@@ -7243,12 +7269,34 @@ function TaskDetails({
             <dt className="text-muted-foreground">Isolation</dt>
             <dd className="min-w-0">{task.isolation}</dd>
 
-            {task.branch && (
-              <>
-                <dt className="text-muted-foreground">Branch</dt>
-                <dd className="min-w-0 truncate font-mono">{task.branch}</dd>
-              </>
-            )}
+            {task.branch && (() => {
+              const drift = driftOf(task.branch, liveBranch);
+              if (!drift.drifted) {
+                return (
+                  <>
+                    <dt className="text-muted-foreground">Branch</dt>
+                    <dd className="min-w-0 truncate font-mono">{task.branch}</dd>
+                  </>
+                );
+              }
+              return (
+                <>
+                  <dt className="text-muted-foreground">Checked out</dt>
+                  <dd
+                    data-testid="task-details-checkout-branch"
+                    className={cn(
+                      "min-w-0 truncate font-mono",
+                      task.branchSource === "existing" ? "text-warning" : undefined,
+                    )}
+                    title={task.branchSource === "existing" ? "Commits here won't land on the pull request" : undefined}
+                  >
+                    {drift.live}
+                  </dd>
+                  <dt className="text-muted-foreground">Task branch</dt>
+                  <dd data-testid="task-details-task-branch" className="min-w-0 truncate font-mono">{task.branch}</dd>
+                </>
+              );
+            })()}
             {task.baseRef && (
               <>
                 <dt className="text-muted-foreground">Base</dt>
