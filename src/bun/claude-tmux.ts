@@ -2311,7 +2311,9 @@ export async function dismissAskModalForMessage(taskId: string): Promise<boolean
     // A dim composer placeholder (prompt suggestion, `Try "…"` sample) is an
     // empty composer, not a draft — the styled read (taken only when the row
     // is non-bare) keeps the double Escape from ever being sent into it.
-    if (!paneShowsComposerText(tail, await styledTailIfNonBare(state, tail))) { ok = true; return; }
+    const styled = await styledTailIfNonBare(state, tail);
+    if (!stillCurrent()) return;
+    if (!paneShowsComposerText(tail, styled)) { ok = true; return; }
     bumpKeystroke(state);
     if (!(await tmux(["send-keys", "-t", state.sessionName, ...COMPOSER_CLEAR_KEYS])).ok) return;
     await Bun.sleep(COMPOSER_CLEAR_SETTLE_MS);
@@ -6829,8 +6831,16 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   // state, so the rest of the tick stays synchronous exactly as before. Used
   // for `paneIdle` ONLY: fingerprints, the modal matchers and the
   // `__external__` sweep keep reading the plain `tail` (no escape bytes, so
-  // #191's de-flicker is untouched).
-  const styledTail = await styledTailIfNonBare(state, tail);
+  // #191's de-flicker is untouched). `paneIdle` itself only matters once a
+  // turn is in flight AND the JSONL has been quiet past
+  // `STUCK_TURN_FALLBACK_MS` — both of its consumers (the watchdog arm and
+  // the idle-settle net, via `stuckTurnFallbackArmed`) require exactly that —
+  // so an idle session with a non-bare row (a draft typed via `tmux attach`,
+  // a `Message @agent…` placeholder) doesn't pay this fork every idle tick.
+  const paneIdleMatters = turnInFlight(state)
+    && state.lastJsonlAppendAt !== 0
+    && now - state.lastJsonlAppendAt > STUCK_TURN_FALLBACK_MS;
+  const styledTail = paneIdleMatters ? await styledTailIfNonBare(state, tail) : null;
 
   // The pane changing is a life signal independent of the JSONL — a native
   // AskUserQuestion modal, or the user driving the session directly via

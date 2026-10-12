@@ -203,3 +203,16 @@ Assumptions carried (from the grill, confirmed or refined here):
 | Non-compaction `informational` notices as status lines | out of scope | different ticket; one-line widening of `isCompactionNotice` if ever wanted |
 | Subagent transcripts (`claude-subagents.ts`) and compaction | out of scope | separate tailer; a subagent compaction has never been observed |
 | `Message @<agent>…` placeholder live capture | out of scope (covered by the shared rule) | same renderer per the binary; the owner's smoke can't reach a fork transcript view headlessly |
+
+## 10. Test Loop (pipeline step 7)
+
+A final code review found nothing must-fix. Its 2 should-fix items and 3 nits were all fixed in this step:
+
+- **Search into a collapsed summary.** `CompactionSummaryBlock` now listens for the search-jump `EXPAND_EVENT`. The `useExpandOnJump` hook moved out of `RunPanel.tsx` into `src/mainview/lib/use-expand-on-jump.ts` so both files share it. A new e2e case in `e2e/compaction-summary.spec.ts` searches, presses Enter and expects `data-state="expanded"`.
+  - That e2e exposed an older `RunPanel` bug, present before this branch: Enter on the only match never re-ran the highlight effect, because `activeMatchId` didn't change. A single match therefore never expanded any collapsed block, and the unconsumed `jumpIntentRef` leaked into the next keystroke. Fixed with a `jumpSeq` counter that `stepSearch` bumps and the effect depends on.
+- **Continuation badge wording.** The run-history "auto" badge tooltip is now neutral (`CONTINUATION_BADGE_TITLE`). The trigger isn't stored on the run row; the run's first status line names it.
+- **Extra pane capture.** `scrapeOnce` takes the styled `capture-pane -e` only while `paneIdle` can matter: a turn is in flight and the JSONL has been quiet past `STUCK_TURN_FALLBACK_MS`. An idle session with a non-bare row no longer pays one fork per idle tick.
+- **Missing staleness check.** `dismissAskModalForMessage` now re-checks `stillCurrent()` after the styled read and before the composer clear.
+- **New tests.** Covered:
+  - `queuePaste` accepting a placeholder redrawn after `Escape Escape` (`claude-tmux-local-command.test.ts`, (b4)).
+  - `dismissAskModalForMessage` sending no clear keys over a placeholder but clearing a real draft (`claude-tmux-askdrive.test.ts`).

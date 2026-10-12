@@ -2469,6 +2469,73 @@ describe("queuePaste composer-clear check", () => {
     });
   });
 
+  test("(b4) a REAL stranded draft is cleared with Escape,Escape and the pane then redraws claude's dim `Try \"…\"` placeholder — the post-clear verify accepts it as bare, paste proceeds, no composer-dirty withhold", async () => {
+    // Spike (2.1.296): `Escape Escape` on a stranded draft empties the box and
+    // claude immediately redraws its startup sample (`❯ Try "fix lint errors"`)
+    // SGR-dim on the live row. Plain capture can't tell that from typed text, so
+    // without the styled read the positive verify (`paneShowsIdleInputBox`)
+    // fails and the paste is withheld as "composer clear did not take".
+    const placeholderPlain = [
+      "\u2500".repeat(80),
+      '\u276F\u00A0Try "fix lint errors"',
+      "\u2500".repeat(80),
+      "\u23F5\u23F5 bypass permissions on (shift+tab to cycle) \u00B7 \u2190 1 agent",
+    ].join("\n");
+    const placeholderStyled = [
+      "\u2500".repeat(80),
+      '\x1b[39m\u276F\u00A0\x1b[2mTry "fix lint errors"\x1b[0m',
+      "\u2500".repeat(80),
+      "\u23F5\u23F5 bypass permissions on (shift+tab to cycle) \u00B7 \u2190 1 agent",
+    ].join("\n");
+    await withRecordingTmuxBin(async (logPath) => {
+      const prevGap = __forTest.setBracketedEnterGapMs(0);
+      const { taskId, state } = freshSession();
+      state.composerHoldsText = true;
+      let calls = 0;
+      const prevCapture = __forTest.setCapturePastePane(async () => {
+        calls++;
+        if (calls === 1) return idlePane; // pre-paste guard: clear
+        if (calls === 2) return COMPOSER_DIRTY_PANE; // composer check: genuine typed text
+        return placeholderPlain; // post-clear verify onward: dim placeholder
+      });
+      let styledReads = 0;
+      const prevStyled = __forTest.setCaptureStyledTail(async () => {
+        styledReads++;
+        // First styled read belongs to the dirty pane: typed text carries no dim,
+        // so it must still read as text and trigger the clear. Later reads see
+        // the redrawn placeholder.
+        return styledReads === 1 ? COMPOSER_DIRTY_PANE : placeholderStyled;
+      });
+      const failures: PasteFailureOutcome[] = [];
+      try {
+        await __forTest.queuePaste(taskId, state.sessionName, "hello", 0, state, {
+          bracketed: true,
+          onPasteFailure: (outcome) => failures.push(outcome),
+        });
+
+        expect(failures).toEqual([]);
+        // The post-clear verify actually took a styled read of the placeholder pane.
+        expect(styledReads).toBeGreaterThanOrEqual(2);
+        const entries = readTmuxLog(logPath);
+        const escapeCalls = entries.filter(
+          (e) => e.argv[0] === "send-keys" && e.argv.slice(-2).join(",") === COMPOSER_CLEAR_KEYS.join(","),
+        );
+        expect(escapeCalls.length).toBe(1);
+        const escapeIndex = entries.indexOf(escapeCalls[0]!);
+        const loadBufferIndex = entries.findIndex((e) => e.argv[0] === "load-buffer");
+        expect(loadBufferIndex).toBeGreaterThan(escapeIndex);
+        const enterCalls = entries.filter((e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "Enter");
+        expect(enterCalls.length).toBe(1);
+        expect(state.composerHoldsText).toBe(false);
+      } finally {
+        __forTest.setCaptureStyledTail(prevStyled);
+        __forTest.setCapturePastePane(prevCapture);
+        __forTest.setBracketedEnterGapMs(prevGap);
+        __forTest.uninstallSession(taskId);
+      }
+    });
+  });
+
   test("(c) claude working with a stranded non-bare composer withholds immediately (phase 'composer-dirty') — no Escape attempted (would interrupt the live turn), flag stays true", async () => {
     await withRecordingTmuxBin(async (logPath) => {
       const { taskId, state } = freshSession();

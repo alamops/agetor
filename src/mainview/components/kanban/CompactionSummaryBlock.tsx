@@ -10,11 +10,12 @@
 //
 // Styled like `AgentInstructionsBlock` (`MessageSegments.tsx`) with semantic
 // tokens only, per the repo's dark/light theming convention.
-import { memo, useState } from "react";
+import { memo, useCallback, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useExpandOnJump } from "@/lib/use-expand-on-jump";
 import { compactionSummaryBytes } from "../../../shared/compaction.ts";
 import { formatByteSize } from "../../../shared/sent-files.ts";
 import { ASSISTANT_MD_COMPONENTS, MD_URL_TRANSFORM } from "./md-components";
@@ -25,9 +26,15 @@ export const CompactionSummaryBlock = memo(function CompactionSummaryBlock({
   text: string;
 }) {
   const [open, setOpen] = useState(false);
+  // The summary is searchable (`searchableEventText`), so a search jump onto it
+  // must reveal the body — otherwise it lands on a collapsed header.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const expand = useCallback(() => setOpen(true), []);
+  useExpandOnJump(rootRef, expand);
   const trimmed = text.trim();
   return (
     <div
+      ref={rootRef}
       data-testid="compaction-summary-block"
       data-state={open ? "expanded" : "collapsed"}
       className="rounded-md border border-border bg-muted/30"

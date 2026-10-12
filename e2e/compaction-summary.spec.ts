@@ -20,6 +20,8 @@ import { gotoApp } from "./helpers";
  *  (kept as a literal so this spec doesn't import bun-side code). */
 const FAKE_CLAUDE_COMPACTION_PROMPT_MARKER = "__agetor_fake_claude_compaction__";
 const SUMMARY_FIRST_LINE = "This session is being continued from a previous conversation that ran out of context.";
+/** A phrase from the middle of the fake summary body (not its first line). */
+const SUMMARY_SEARCH_PHRASE = "fixed-width columns were rejected";
 
 test.describe.configure({ mode: "serial" });
 
@@ -136,5 +138,40 @@ test.describe("compaction summary", () => {
     await expect(
       popover.locator('[data-testid="message-history-item"]').filter({ hasText: SUMMARY_FIRST_LINE }),
     ).toHaveCount(0);
+  });
+
+  test("a message search for text only in the summary expands the collapsed block", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const marker = randomUUID();
+    const title = `compaction search ${marker}`;
+    const task = await createAndStartTask(
+      request,
+      backend,
+      title,
+      `compaction search scenario ${marker} ${FAKE_CLAUDE_COMPACTION_PROMPT_MARKER}`,
+    );
+    await expect.poll(() => taskColumn(request, backend, task.id), { timeout: 15_000 }).toBe("review");
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    const block = panel.getByTestId("compaction-summary-block");
+    await expect(block).toHaveAttribute("data-state", "collapsed");
+
+    // `SUMMARY_SEARCH_PHRASE` appears only inside the (unmounted) summary
+    // body, so the match can only be the summary event itself.
+    await panel.getByRole("button", { name: "Search messages" }).click();
+    const input = panel.getByRole("textbox", { name: "Search messages" });
+    await expect(input).toBeFocused();
+    await input.fill(SUMMARY_SEARCH_PHRASE);
+    await expect(panel.getByText("1/1", { exact: true })).toBeVisible();
+    // A keystroke re-resolving the match highlights it but doesn't expand;
+    // an explicit jump (Enter) does.
+    await expect(block).toHaveAttribute("data-state", "collapsed");
+    await input.press("Enter");
+    await expect(block).toHaveAttribute("data-state", "expanded");
+    await expect(panel.getByTestId("compaction-summary-body")).toContainText(SUMMARY_SEARCH_PHRASE);
   });
 });
