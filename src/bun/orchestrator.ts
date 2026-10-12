@@ -292,7 +292,7 @@ function enqueueTeardown(taskId: string, key: string, job: () => Promise<void>):
 /**
  * Await any deferred teardown currently in flight (or queued) for `taskId`.
  * Resolves immediately when nothing is pending. Exported so `unarchiveTask`,
- * `startTask`, and the boot-time sweep can serialize against a still-running
+ * `startTask`, terminal open (`createTerminal`), and the boot-time sweep can serialize against a still-running
  * archive/delete teardown before touching the same worktree, and so tests can
  * drain the queue deterministically.
  */
@@ -6598,7 +6598,7 @@ export async function archiveTask(
   // `prune` — those still run (serialized per
   // workdir, see `enqueueTeardown`), just off the request's critical path;
   // tasks in a different workdir proceed independently. Callers that must
-  // not race a deferred teardown (unarchive, start, delete, the boot sweep)
+  // not race a deferred teardown (unarchive, start, delete, terminal open, the boot sweep)
   // await `pendingTeardown(taskId)` first. `awaitTeardown` is the one opt-in
   // exception: the Worktrees page explicitly wants to block on this specific
   // teardown to get a truthful result back.
@@ -6611,12 +6611,6 @@ export async function archiveTask(
   return { task: updated };
 }
 
-/**
- * Reverse of `archiveTask`: clear the timestamp and, best-effort, restore the
- * worktree if `archiveTask` detached it (or it's otherwise missing on disk).
- * Restore failure doesn't block the unarchive — the card comes back either
- * way; a later send/start/terminal-open retries the restore lazily.
- */
 /**
  * After a `prepareWorkdir` outside a run start (unarchive, `sendInput`'s
  * missing-worktree branch, a terminal open) record the branch the worktree is
@@ -6636,6 +6630,12 @@ export function noteRestoredCheckout(taskId: string, prepared: PreparedWorkdir):
   else console.warn(`[agetor] task ${taskId}: ${prepared.warning}`);
 }
 
+/**
+ * Reverse of `archiveTask`: clear the timestamp and, best-effort, restore the
+ * worktree if `archiveTask` detached it (or it's otherwise missing on disk).
+ * Restore failure doesn't block the unarchive — the card comes back either
+ * way; a later send/start/terminal-open retries the restore lazily.
+ */
 export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { error: string }> {
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };

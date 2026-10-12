@@ -5070,7 +5070,7 @@ function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: (forTa
         </span>
       </summary>
       <div className="h-80 border-t border-border/60">
-        {ready && <TerminalView taskId={task.id} />}
+        {ready && <TerminalView taskId={task.id} archived={task.archivedAt != null} />}
       </div>
     </details>
   );

@@ -30,6 +30,11 @@ import { tasks } from "./db.ts";
 
 /** Cap per task so a runaway loop of "+" clicks can't fork-bomb the box. */
 const MAX_TERMINALS_PER_TASK = 8;
+
+/** `createTerminal`'s refusal for an archived task (archive closes a task's
+ *  terminals and tears its worktree down). Exported for the tests. */
+export const ARCHIVED_TERMINAL_ERROR = "task is archived — unarchive it to open a terminal";
+
 /** Recent-output ring buffer size. Replayed to a (re)connecting socket so
  *  reopening the sidebar or switching back to a tab restores scrollback
  *  without persisting anything. ~256 KB is plenty for a screen of history. */
@@ -126,12 +131,18 @@ function notifyExit(e: TerminalEntry): void {
  * agent. Opening one is a last-seen-checkout refresh point instead: the live
  * branch is recorded as `task.checkoutBranch` so the board and CLI can show
  * where the worktree really is.
+ *
+ * Like every other restore point (`unarchiveTask`, `sendInput`'s restore,
+ * `startTask`, the boot sweep) it first waits out any archive/delete teardown
+ * still queued for the task, then refuses an archived task outright — the
+ * archived freeze: archive tears the worktree down and closes its terminals,
+ * so opening one would either reuse a directory that is about to vanish or
+ * re-create the worktree of an archived task. Unarchive it first.
  */
 export async function createTerminal(
   taskId: string,
 ): Promise<TerminalTab | { error: string; notFound?: boolean }> {
-  const task = tasks.get(taskId);
-  if (!task) return { error: "task not found", notFound: true };
+  if (!tasks.get(taskId)) return { error: "task not found", notFound: true };
 
   const pending = inFlight.get(taskId) ?? 0;
   if (countTerminals(taskId) + pending >= MAX_TERMINALS_PER_TASK) {
@@ -142,6 +153,17 @@ export async function createTerminal(
   // doesn't move until the spawn lands).
   inFlight.set(taskId, pending + 1);
   try {
+    // Dynamic imports — see the top-of-file note on the db.ts ↔ worktree.ts
+    // cycle; orchestrator.ts imports this module statically.
+    const { prepareWorkdir, resolveRef } = await import("./worktree.ts");
+    const { noteRestoredCheckout, pendingTeardown } = await import("./orchestrator.ts");
+    // Serialize against a deferred archive/delete teardown before touching
+    // the worktree, then judge the task as it stands once that settled.
+    await pendingTeardown(taskId);
+    const task = tasks.get(taskId);
+    if (!task) return { error: "task not found", notFound: true };
+    if (task.archivedAt != null) return { error: ARCHIVED_TERMINAL_ERROR };
+
     // A worktree-isolated pipeline step shares its parent's worktree (D2):
     // re-materializing a missing one here would give this ONE step a private
     // checkout at its own path. Same refusal as startTask / sendInput — only
@@ -153,10 +175,6 @@ export async function createTerminal(
     ) {
       return { error: "step task's worktree is missing — run the pipeline task instead" };
     }
-    // Dynamic imports — see the top-of-file note on the db.ts ↔ worktree.ts
-    // cycle; orchestrator.ts imports this module statically.
-    const { prepareWorkdir, resolveRef } = await import("./worktree.ts");
-    const { noteRestoredCheckout } = await import("./orchestrator.ts");
     const prepared = await prepareWorkdir(task);
     if ("error" in prepared) return { error: prepared.error };
 
@@ -172,6 +190,15 @@ export async function createTerminal(
     ) {
       tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
     }
+    // An archive or delete can land while `prepareWorkdir` runs. Its teardown
+    // has already closed this task's terminals (or is about to remove the
+    // worktree), so a shell spawned now would outlive it in a dying
+    // directory. The fields above are still persisted on purpose: if the
+    // prepare just materialized a worktree, that pointer is what lets the
+    // boot sweep (`sweepArchivedTeardowns`) find and remove it.
+    const current = tasks.get(taskId);
+    if (!current) return { error: "task not found", notFound: true };
+    if (current.archivedAt != null) return { error: ARCHIVED_TERMINAL_ERROR };
     // Record the live checkout (an unknown read records nothing, so a
     // transient git failure can't erase the recorded drifted branch) and
     // surface a re-attach `warning` — a terminal open may be the first thing

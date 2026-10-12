@@ -301,11 +301,16 @@ function TerminalPane({
   );
 }
 
+const ARCHIVED_HINT = "Unarchive this task to open a terminal";
+
 /**
  * Terminal tab strip + the active terminal, for the task details sidebar.
  * Tabs are backed by per-task PTYs on the bun side (`src/bun/terminals.ts`).
+ * An archived task can't open one (archive closes its terminals and tears
+ * its worktree down; `createTerminal` refuses it), so `archived` disables
+ * the open affordances instead of letting them fail with a toast.
  */
-export function TerminalView({ taskId }: { taskId: string }) {
+export function TerminalView({ taskId, archived = false }: { taskId: string; archived?: boolean }) {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -387,9 +392,9 @@ export function TerminalView({ taskId }: { taskId: string }) {
         <button
           type="button"
           className="shrink-0 rounded-md p-1 text-muted-foreground hover:bg-accent/40 disabled:opacity-50"
-          title="New terminal"
+          title={archived ? ARCHIVED_HINT : "New terminal"}
           data-testid="terminal-open"
-          disabled={busy}
+          disabled={busy || archived}
           onClick={() => void openTerminal()}
         >
           <Plus className="size-4" />
@@ -400,13 +405,13 @@ export function TerminalView({ taskId }: { taskId: string }) {
         {tabs.length === 0 ? (
           <button
             type="button"
-            className="flex h-full w-full flex-col items-center justify-center gap-2 text-xs text-muted-foreground hover:text-foreground"
+            className="flex h-full w-full flex-col items-center justify-center gap-2 text-xs text-muted-foreground hover:text-foreground disabled:cursor-default disabled:hover:text-muted-foreground"
             data-testid="terminal-open"
-            disabled={busy}
+            disabled={busy || archived}
             onClick={() => void openTerminal()}
           >
             <TerminalSquare className="size-6" />
-            <span>Open a terminal in this task's worktree</span>
+            <span>{archived ? ARCHIVED_HINT : "Open a terminal in this task's worktree"}</span>
           </button>
         ) : (
           tabs.map((t) => (

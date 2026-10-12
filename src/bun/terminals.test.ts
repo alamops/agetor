@@ -16,6 +16,7 @@ const {
   closeTerminal,
   killTerminalsForTask,
   attachSocket,
+  ARCHIVED_TERMINAL_ERROR,
 } = await import("./terminals.ts");
 
 import type { Task } from "../shared/types.ts";
@@ -325,6 +326,48 @@ test("createTerminal refuses a pipeline step whose shared worktree is missing", 
   // Nothing was materialized at the step's own path.
   expect(existsSync(missing)).toBe(false);
   expect(countTerminals(step.id)).toBe(0);
+});
+
+test("createTerminal refuses an archived task without re-creating its torn-down worktree", async () => {
+  const repo = await makeRepo();
+  const task = makeTask(repo, { isolation: "worktree", agent: "codex", column: "done" });
+  const first = await createTerminal(task.id);
+  if ("error" in first) throw new Error(first.error);
+  const wt = tasks.get(task.id)!.worktreePath!;
+
+  const { archiveTask, pendingTeardown } = await import("./orchestrator.ts");
+  const res = await archiveTask(task.id);
+  expect("task" in res).toBe(true);
+  // Open right after archive, while its deferred teardown is still queued.
+  const r = await createTerminal(task.id);
+  expect(r).toEqual({ error: ARCHIVED_TERMINAL_ERROR });
+  await pendingTeardown(task.id);
+  // The teardown removed the worktree and nothing brought it back.
+  expect(existsSync(wt)).toBe(false);
+  expect(countTerminals(task.id)).toBe(0);
+});
+
+test("createTerminal waits out a queued teardown before reusing the worktree", async () => {
+  const repo = await makeRepo();
+  const task = makeTask(repo, { isolation: "worktree", agent: "codex", column: "done" });
+  const first = await createTerminal(task.id);
+  if ("error" in first) throw new Error(first.error);
+  const wt = tasks.get(task.id)!.worktreePath!;
+
+  const { archiveTask, pendingTeardown } = await import("./orchestrator.ts");
+  const res = await archiveTask(task.id);
+  expect("task" in res).toBe(true);
+  // Clear the archive stamp directly (unarchiveTask would itself wait), so
+  // the teardown is still queued when the terminal opens. Without the wait
+  // the open reuses `wt` (still on disk) and the teardown then deletes it
+  // from under the shell.
+  tasks.update(task.id, { archivedAt: null });
+  const r = await createTerminal(task.id);
+  if ("error" in r) throw new Error(`terminal open failed: ${r.error}`);
+  await pendingTeardown(task.id);
+  expect(r.cwd).toBe(wt);
+  expect(existsSync(wt)).toBe(true);
+  expect(countTerminals(task.id)).toBe(1);
 });
 
 test("a shell that exits is auto-removed from the manager", async () => {
