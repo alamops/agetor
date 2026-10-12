@@ -1060,6 +1060,26 @@ function isContinuationContentEvent(evt: ParsedJsonlEvent): boolean {
   return false;
 }
 
+/** True when a `user` line carries content a person typed — a non-empty
+ *  string, or a `text` block / `image` block — rather than only claude's own
+ *  plumbing (`tool_result` blocks, or the `[Request interrupted by user]`
+ *  marker text claude writes after Esc/Ctrl+C). Decides the continuation
+ *  trigger wording (`maybeAdoptContinuation`): only human content reads as
+ *  "turn started from the terminal". */
+function userLineHasHumanContent(evt: ParsedJsonlEvent): boolean {
+  const content = evt.message?.content as unknown;
+  const isHumanText = (t: unknown): boolean =>
+    typeof t === "string" && t.trim() !== "" && !USER_INTERRUPT_RE.test(t);
+  if (typeof content === "string") return isHumanText(content);
+  if (!Array.isArray(content)) return false;
+  return content.some((b) => {
+    if (!b || typeof b !== "object") return false;
+    const block = b as { type?: unknown; text?: unknown };
+    if (block.type === "image") return true;
+    return block.type === "text" && isHumanText(block.text);
+  });
+}
+
 /** A user message whose tool_result is claude's interrupt/cancel marker (Esc on
  *  a modal, Ctrl+C). `dispatchLine` force-resolves the run on these — see the
  *  force-end at the bottom of `dispatchLine`. */
@@ -4279,10 +4299,13 @@ function maybeAdoptContinuation(
   if (!isContinuationContentEvent(evt) && !isNotification) return;
 
   // What started this turn, for the run's opening status line: a
-  // notification, else whichever kind of content line claude wrote.
+  // notification; a `user` line only when it carries something a person
+  // typed (`userLineHasHumanContent` — a tool_result or interrupt marker is
+  // claude's own plumbing, not a turn started from the terminal); else
+  // claude continued on its own.
   const trigger: ContinuationTrigger = isNotification
     ? "notification"
-    : evt.type === "assistant" ? "assistant" : "user";
+    : evt.type === "user" && userLineHasHumanContent(evt) ? "user" : "assistant";
   const hooks = continuationRunFactory(state.taskId, trigger);
   // A null factory result (unknown/archived task) intentionally falls
   // through to the pre-existing `lastChunk` routing in `dispatchLine` —
@@ -6508,8 +6531,10 @@ function stripSgr(s: string): string {
  * 2 or 7 can't read as dim/invert — and a non-`m` CSI is skipped. Characters
  * up to and including `❯` are skipped, as is whitespace; every other
  * character must be dim, except that the FIRST one may be inverted instead.
- * At least one visible character is required, so a mixed row (`dim` then
- * plain text) or an all-plain row is never a placeholder.
+ * At least one visible character is required, and at least one of them must
+ * be dim, so a mixed row (`dim` then plain text), an all-plain row, or a
+ * one-character draft under the cursor block (`❯ ` + invert(`h`)) is never a
+ * placeholder.
  */
 function isPlaceholderRow(styledRow: string): boolean {
   const plain = stripSgr(styledRow);
@@ -6519,6 +6544,7 @@ function isPlaceholderRow(styledRow: string): boolean {
   let inverse = false;
   let seenPrompt = false;
   let visible = 0;
+  let dimSeen = false;
   let i = 0;
   while (i < styledRow.length) {
     if (styledRow[i] === "\x1b") {
@@ -6555,11 +6581,14 @@ function isPlaceholderRow(styledRow: string): boolean {
     }
     if (/\s/.test(ch)) continue;
     visible++;
-    if (dim) continue;
+    if (dim) { dimSeen = true; continue; }
     if (visible === 1 && inverse) continue;
     return false;
   }
-  return seenPrompt && visible > 0;
+  // At least one dim character: Claude's cursor block alone (an inverted
+  // first character with nothing dim after it) is a one-character typed
+  // draft, never a placeholder — every placeholder renders its text dim.
+  return seenPrompt && visible > 0 && dimSeen;
 }
 
 /**

@@ -2432,6 +2432,8 @@ const placeholderCases: Array<[string, string]> = [
     "\x1b[7mm\x1b[0m\x1b[2make a vertical version too\x1b[0m",
   ],
   ["a 'Message @<agent>…' dim hint", "\x1b[2mMessage @reviewer…\x1b[0m"],
+  ["a two-char placeholder: inverted first char + one dim char", "\x1b[7mo\x1b[27m\x1b[2mk\x1b[0m"],
+  ["dim set alongside an extended colour in one sequence ('2;38;5;7')", "\x1b[2;38;5;7mmake a vertical version too\x1b[0m"],
   ["dim set through a compound param ('0;2')", "\x1b[0;2mmake a vertical version too\x1b[0m"],
   ["dim set after an empty-param reset ('ESC[m')", "\x1b[m\x1b[2mmake a vertical version too\x1b[0m"],
   [
@@ -2457,6 +2459,13 @@ const nonPlaceholderCases: Array<[string, string]> = [
   ["a dim paste chip (explicit exclusion)", "\x1b[2m[Pasted text #1 +3 lines]\x1b[0m"],
   ["a dim image chip (explicit exclusion)", "\x1b[2m[Image #2]\x1b[0m"],
   ["an inverted run longer than the first char", "\x1b[7mhello\x1b[0m"],
+  // Claude's cursor block sits on the LAST typed character, so a one-letter
+  // draft renders as one inverted char with nothing dim — typed text, not a
+  // placeholder (code review, low finding 1).
+  ["a one-char typed draft under the cursor block (7…27)", "\x1b[7mh\x1b[27m"],
+  ["a one-char typed draft under the cursor block (7…0)", "\x1b[7mh\x1b[0m"],
+  ["a one-char typed draft under an unclosed cursor block", "\x1b[7mh"],
+  ["a one-char inverted draft followed by trailing spaces", "\x1b[7mh\x1b[0m   "],
   ["a row with no visible text after the glyph", ""],
 ];
 
@@ -2515,6 +2524,30 @@ describe("isPlaceholderRow — the SGR dim rule", () => {
   test("an ASCII space after the glyph reads the same as the NBSP", () => {
     expect(isPlaceholderRow("\x1b[39m❯ \x1b[2mmake a vertical version too\x1b[0m")).toBe(true);
     expect(isPlaceholderRow("\x1b[39m❯ hello from agetor")).toBe(false);
+  });
+});
+
+describe("placeholderRowShowing — escape-only rows in the styled capture", () => {
+  test("blank rows that carry only escapes in the styled capture keep the index alignment (still a placeholder)", () => {
+    const { plain, styled } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    // `capture-pane -e` can emit a bare reset on a row that is blank in the
+    // plain capture; the line count is unchanged, so the live row's index
+    // still lines up.
+    const styledLines = styled.split("\n");
+    expect(styledLines[2]).toBe("");
+    styledLines[2] = "\x1b[0m";
+    const withEscapeRow = ["\x1b[0m\x1b[39m", ...styledLines].join("\n");
+    const plainWithBlank = ["", ...plain.split("\n")].join("\n");
+    expect(placeholderRowShowing(plainWithBlank, withEscapeRow)).toBe(true);
+    expect(paneShowsIdleInputBox(plainWithBlank, withEscapeRow)).toBe(true);
+    expect(paneShowsComposerText(plainWithBlank, withEscapeRow)).toBe(false);
+  });
+
+  test("an extra escape-only row at the TOP of the styled capture only (counts differ) shifts the index and is not trusted", () => {
+    const { plain, styled } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    const shifted = ["\x1b[0m", ...styled.split("\n")].join("\n");
+    expect(placeholderRowShowing(plain, shifted)).toBe(false);
+    expect(paneShowsIdleInputBox(plain, shifted)).toBe(false);
   });
 });
 

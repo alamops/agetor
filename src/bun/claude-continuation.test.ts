@@ -1103,6 +1103,84 @@ test("a plain terminal-typed user line adopts a continuation with trigger \"user
   }
 });
 
+/** Adopt off one `user` line with the given `message.content`, returning the
+ *  recorded factory calls (code review low finding 2: only human content
+ *  reads as "turn started from the terminal"). */
+async function triggerForUserContent(content: unknown, uuid: string) {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    await resolveFirstTurn(state, jsonlPath);
+    const cont = recorder();
+    const { calls, factory } = countingFactory(cont);
+    await withContinuationFactory(factory, () => {
+      appendFileSync(jsonlPath, JSON.stringify({ type: "user", uuid, message: { role: "user", content } }) + "\n");
+      __forTest.flushSync(state);
+    });
+    return { taskId, calls };
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+}
+
+test("a tool_result-only user line adopts with trigger \"assistant\", never \"user\" (claude's own plumbing, not a turn typed in the terminal)", async () => {
+  const { taskId, calls } = await triggerForUserContent(
+    [{ type: "tool_result", tool_use_id: "toolu_synthetic", content: "exit code 0\nsynthetic output" }],
+    "uuid-tool-result",
+  );
+  expect(calls).toEqual([{ taskId, trigger: "assistant" }]);
+});
+
+test("a tool_result whose content is an array of text blocks still adopts with trigger \"assistant\"", async () => {
+  const { taskId, calls } = await triggerForUserContent(
+    [{ type: "tool_result", tool_use_id: "toolu_synthetic", content: [{ type: "text", text: "synthetic result text" }] }],
+    "uuid-tool-result-array",
+  );
+  expect(calls).toEqual([{ taskId, trigger: "assistant" }]);
+});
+
+test("an interrupt-marker user line ('[Request interrupted by user]') adopts with trigger \"assistant\", in both string and text-block shapes", async () => {
+  const asString = await triggerForUserContent("[Request interrupted by user]", "uuid-interrupt-string");
+  expect(asString.calls).toEqual([{ taskId: asString.taskId, trigger: "assistant" }]);
+  const asBlock = await triggerForUserContent(
+    [{ type: "text", text: "[Request interrupted by user for tool use]" }],
+    "uuid-interrupt-block",
+  );
+  expect(asBlock.calls).toEqual([{ taskId: asBlock.taskId, trigger: "assistant" }]);
+});
+
+test("a whitespace-only string user line adopts with trigger \"assistant\"", async () => {
+  const { taskId, calls } = await triggerForUserContent("   \n  ", "uuid-blank");
+  expect(calls).toEqual([{ taskId, trigger: "assistant" }]);
+});
+
+test("a user line with a human text block (array content) adopts with trigger \"user\"", async () => {
+  const { taskId, calls } = await triggerForUserContent(
+    [{ type: "text", text: "typed in the terminal as a text block" }],
+    "uuid-text-block",
+  );
+  expect(calls).toEqual([{ taskId, trigger: "user" }]);
+});
+
+test("a user line mixing a tool_result with a human text block adopts with trigger \"user\"", async () => {
+  const { taskId, calls } = await triggerForUserContent(
+    [
+      { type: "tool_result", tool_use_id: "toolu_synthetic", content: "synthetic output" },
+      { type: "text", text: "and a note typed alongside it" },
+    ],
+    "uuid-mixed",
+  );
+  expect(calls).toEqual([{ taskId, trigger: "user" }]);
+});
+
+test("a user line carrying only a pasted image block adopts with trigger \"user\"", async () => {
+  const { taskId, calls } = await triggerForUserContent(
+    [{ type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } }],
+    "uuid-image",
+  );
+  expect(calls).toEqual([{ taskId, trigger: "user" }]);
+});
+
 test("an assistant line adopts a continuation with trigger \"assistant\"", async () => {
   const { taskId, jsonlPath } = freshSession();
   const state = __forTest.installSession(taskId, jsonlPath);
