@@ -20,6 +20,7 @@ import type {
   TaskReference,
   TaskDiff,
   TaskGitStatus,
+  TaskTeardownPreview,
   GitHubIssueThreadResult,
   GitProvider,
 } from "../shared/types.ts";
@@ -155,6 +156,18 @@ export class AgetorClient {
   }
   deleteTask(id: string): Promise<void> {
     return this.req("DELETE", `/tasks/${id}`);
+  }
+  /** Which branches `deleteTask` would remove (`task.branch`, plus the branch a
+   *  drifted worktree is actually on, after the default-branch / PR-head /
+   *  held-by-another-task exclusions). `null` when the running core predates
+   *  the route (404) — callers fall back to their generic wording. */
+  async getTeardownPreview(id: string): Promise<TaskTeardownPreview | null> {
+    try {
+      return await this.req<TaskTeardownPreview>("GET", `/tasks/${encodeURIComponent(id)}/teardown-preview`);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return null;
+      throw err;
+    }
   }
   /** `unresolvedRefs` (omitted when empty) lists the raw `@`-tokens (verbatim,
    *  `@` included) in the task's prompt that didn't resolve to a real file

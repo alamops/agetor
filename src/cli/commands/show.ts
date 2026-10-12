@@ -33,7 +33,16 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
       `   ${label("model")} ${escapeControlChars(task.model ?? "-")}   ${label("mode")} ${escapeControlChars(modeText)}`,
   );
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
-  if (task.branch) out(`  ${label("branch")} ${task.branch}`);
+  if (task.branch) out(`  ${label("branch")} ${escapeControlChars(task.branch)}`);
+  // Last-seen worktree checkout (recorded at run start/settle, terminal open,
+  // archive). Drift off the task branch is tolerated, so say where it is.
+  if (task.checkoutBranch) {
+    const drifted = task.branch != null && task.checkoutBranch !== task.branch;
+    out(
+      `  ${label("checkout")} ${escapeControlChars(task.checkoutBranch)}` +
+        (drifted ? c.yellow(" (drifted from task branch)") : ""),
+    );
+  }
   if (task.issueUrl) out(`  ${label("issue")} ${task.issueUrl}`);
   if (task.agentProfile) {
     const deletedSuffix = await agentProfileDeletedSuffix(client, task);

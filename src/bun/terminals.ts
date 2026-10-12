@@ -117,6 +117,14 @@ function notifyExit(e: TerminalEntry): void {
  * task that hasn't one yet — and persists the resulting branch/worktreePath
  * back onto the task so a later agent run reuses the same isolated dir
  * (mirrors `orchestrator.startTask`).
+ *
+ * A terminal never changes the worktree's checkout (D1): an existing worktree
+ * opens exactly as it is, even when it has drifted off `task.branch` — a
+ * `git checkout` here could fail on the user's uncommitted edits (the old
+ * "could not be switched" error) or silently switch the branch under a live
+ * agent. Opening one is a last-seen-checkout refresh point instead: the live
+ * branch is recorded as `task.checkoutBranch` so the board and CLI can show
+ * where the worktree really is.
  */
 export async function createTerminal(
   taskId: string,
@@ -150,6 +158,7 @@ export async function createTerminal(
     ) {
       tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
     }
+    if (prepared.worktreePath) tasks.setCheckoutBranch(taskId, prepared.checkoutBranch);
 
     const id = randomUUID();
     const shell = process.env.SHELL || "/bin/zsh";

@@ -494,11 +494,12 @@ function buildSnapshot(
 async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promise<{ parent: Task } | { error: string }> {
   // M-R6: while ANY execution of this run is genuinely live (a fan-out
   // sibling mid-turn, a spawn still settling, a held step), `prepareWorkdir`
-  // must not run against the shared worktree — its reuse branch runs `git
-  // symbolic-ref`/`git checkout` in the directory an agent is actively
-  // writing to, and its materialize branch would `git worktree add` on top
-  // of it. Only VERIFY the worktree is still on disk in that case; the
-  // full (re-)materialization is reserved for a run with nothing live.
+  // must not run against the shared worktree. Its reuse branch no longer
+  // checks anything out (drift is tolerated and only reported), but its
+  // materialize branch would `git worktree add` on top of a directory an
+  // agent is actively writing to. Only VERIFY the worktree is still on disk
+  // in that case; the full (re-)materialization is reserved for a run with
+  // nothing live.
   const anyLive = run.active.some((a) => isTaskRunLive(a.taskId));
   if (anyLive) {
     if (parent.isolation === "worktree" && (!parent.worktreePath || !existsSync(parent.worktreePath))) {
@@ -512,18 +513,40 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
     ),
   });
   if ("error" in prepared) return { error: prepared.error };
+  // The parent carries the pipeline's last-seen checkout (D14); steps mirror
+  // it. `setCheckoutBranch` is compare-then-write, so an unchanged value
+  // touches nothing.
+  if (prepared.worktreePath) tasks.setCheckoutBranch(parent.id, prepared.checkoutBranch);
+  if (prepared.warning) noteParentWorktreeWarning(parent.id, prepared.warning);
   // Only write the row when something actually changed — an unconditional
   // `tasks.update` bumps `updated_at` on every refresh, which re-renders the
   // board card for a no-op and defeats `reconcileById`'s identity
   // preservation in the webview (same rationale as the watermark columns).
   if (parent.branch === prepared.branch && parent.worktreePath === prepared.worktreePath) {
-    return { parent };
+    return { parent: tasks.get(parent.id) ?? parent };
   }
   const updated = tasks.update(parent.id, { branch: prepared.branch, worktreePath: prepared.worktreePath }) ?? parent;
   return { parent: updated };
 }
 
-/** Copy the parent's current `branch`/`worktreePath` onto every step row
+/** Surface a re-attach warning from `prepareWorkdir` (the recorded checkout
+ *  couldn't be restored, so the shared worktree came back on the task
+ *  branch). A pipeline parent never runs an agent of its own, so the line
+ *  goes on the most recent run of any of its step tasks; console only when
+ *  no step has run yet. */
+function noteParentWorktreeWarning(parentId: string, warning: string): void {
+  let latest: { taskId: string; runId: string; startedAt: number } | null = null;
+  for (const step of tasks.stepsForParent(parentId)) {
+    const run = runs.listForTask(step.id)[0];
+    if (run && (!latest || run.startedAt > latest.startedAt)) {
+      latest = { taskId: step.id, runId: run.id, startedAt: run.startedAt };
+    }
+  }
+  if (latest) appendRunStatusLine(latest.taskId, latest.runId, warning);
+  else console.warn(`[agetor] pipeline task ${parentId}: ${warning}`);
+}
+
+/** Copy the parent's current `branch`/`worktreePath`/`checkoutBranch` onto every step row
  *  still `active` in `run`, so each step's own `startTask` → `prepareWorkdir`
  *  reuse-check sees the up-to-date path instead of whatever it was inserted
  *  with (M6). No-op for a row already in sync. */
@@ -532,6 +555,12 @@ function propagateWorktreeToActiveSteps(parent: Task, run: PipelineRunState): vo
     const step = tasks.get(a.taskId);
     if (step && (step.worktreePath !== parent.worktreePath || step.branch !== parent.branch)) {
       tasks.update(a.taskId, { worktreePath: parent.worktreePath, branch: parent.branch });
+    }
+    // Mirror the parent's last-seen checkout too (compare-then-write; the
+    // step→parent mirror inside `setCheckoutBranch` writes the same value
+    // back, a no-op).
+    if (step && (step.checkoutBranch ?? null) !== (parent.checkoutBranch ?? null)) {
+      tasks.setCheckoutBranch(a.taskId, parent.checkoutBranch ?? null);
     }
   }
 }
@@ -773,6 +802,7 @@ async function launchStep(
     branch: parent.branch,
     branchSource: parent.branchSource,
     worktreePath: parent.worktreePath,
+    checkoutBranch: parent.checkoutBranch ?? null,
     baseRef: parent.baseRef,
     prUrl: null,
     issueUrl: null,

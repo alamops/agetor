@@ -7,7 +7,8 @@ import { resolveRefs, warnMissingRefs } from "../refs.ts";
 import { appendReferences } from "../../shared/refs.ts";
 import { discoveredExtensionNames, filterUnresolvedRefs, warnUnresolvedRefs } from "../at-warn.ts";
 import { findAtTokens } from "../../shared/at-refs.ts";
-import { escapeFreeText } from "../../shared/terminal-text.ts";
+import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
+import type { TaskTeardownPreview } from "../../shared/types.ts";
 
 export async function cmdStart(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -173,17 +174,33 @@ export async function cmdRm(args: string[], flags: Flags): Promise<void> {
   if (!ref) throw usageError("rm");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
+  // Read BEFORE deleting: the preview names every branch the delete removes
+  // (`task.branch` plus a drifted worktree's live branch). `null` = an older
+  // core without the route — fall back to the generic wording.
+  const preview = await client.getTeardownPreview(task.id);
   if (!yes) {
     out(
       c.yellow(
         `refusing to delete without --yes. Would delete "${escapeFreeText(task.title)}" (${task.id.slice(0, 8)}) ` +
-          "and its worktree + branch.",
+          `and ${teardownPhrase(preview)}.`,
       ),
     );
     process.exitCode = 1;
     return;
   }
   await client.deleteTask(task.id);
-  if (flags.json) return printJson({ deleted: task.id });
-  out(`${c.red("✗")} deleted ${c.dim(task.id.slice(0, 8))}`);
+  if (flags.json) {
+    return printJson(preview ? { deleted: task.id, branches: preview.branches } : { deleted: task.id });
+  }
+  const removed = preview && preview.branches.length > 0 ? ` and ${teardownPhrase(preview)}` : "";
+  out(`${c.red("✗")} deleted ${c.dim(task.id.slice(0, 8))}${removed}`);
+}
+
+/** "its worktree + branch" (no preview), else the exact branches the delete
+ *  removes — escaped, since branch names are user/agent-controlled text. */
+function teardownPhrase(preview: TaskTeardownPreview | null): string {
+  if (!preview) return "its worktree + branch";
+  const names = preview.branches.map((b) => escapeControlChars(b));
+  if (names.length === 0) return preview.source === "none" ? "no worktree or branches" : "its worktree (no branches)";
+  return `its worktree + ${names.length === 1 ? "branch" : "branches"} ${names.join(", ")}`;
 }
