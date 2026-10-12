@@ -126,7 +126,13 @@ test("a drifted worktree opens a terminal in place and every surface shows the l
     // ── Terminal opens in place ──────────────────────────────────────────
     await panel.locator('[data-testid="terminals-section"] > summary').click();
     await panel.locator('[data-testid="terminal-open"]').first().click();
-    await waitForTerminalReady(panel);
+    const pane = await waitForTerminalReady(panel);
+    // xterm's DOM renderer pads `.xterm-rows` with letter-spacing = cell width
+    // minus the glyph width it measures; a font family the canvas measure
+    // can't parse (a CSS `var()`) left ~2px of it, visibly letter-spacing the
+    // terminal. A correct family leaves (close to) none.
+    const rowSpacing = await pane.locator(".xterm-rows").evaluate((el) => parseFloat(getComputedStyle(el).letterSpacing) || 0);
+    expect(Math.abs(rowSpacing)).toBeLessThan(0.5);
     await expect(page.getByText(/could not be switched/)).toHaveCount(0);
     await expect(page.getByText(/Could not open/i)).toHaveCount(0);
     expect(git(wt, ["symbolic-ref", "--short", "HEAD"])).toBe(DRIFT_BRANCH);

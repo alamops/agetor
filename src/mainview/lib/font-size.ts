@@ -42,6 +42,16 @@ export function terminalFontSize(pct: number): number {
   return Math.round((TERMINAL_FONT_SIZE_BASE_PX * pct) / 100);
 }
 
+/** xterm's `fontFamily`: a concrete stack, never a CSS `var()`. xterm sizes its
+ *  cells by measuring "W" on a canvas (`ctx.font = `${size}px ${family}``), and
+ *  a canvas font string can't resolve `var()` — the assignment is ignored, the
+ *  cells come out as wide as a 10px sans-serif "W", and the DOM rows draw the
+ *  real monospace glyphs inside them, visibly letter-spaced. Same stack as
+ *  Tailwind's default `font-mono`, so the terminal matches the app's other
+ *  monospace text. */
+export const TERMINAL_FONT_FAMILY =
+  'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+
 /**
  * Read the boot-seeded font size: `window.__AGETOR.fontSize` first (the
  * WKUserScript `preload` payload for the bundled `views://` path), the

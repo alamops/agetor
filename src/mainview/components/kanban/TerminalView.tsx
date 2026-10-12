@@ -8,7 +8,7 @@ import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useFontSize } from "../font-size-provider.tsx";
 import { useTheme } from "../theme-provider.tsx";
-import { terminalFontSize } from "@/lib/font-size";
+import { TERMINAL_FONT_FAMILY, terminalFontSize } from "@/lib/font-size";
 import { macEditSequence } from "./terminal-keys.ts";
 import type { TerminalTab } from "../../../shared/types.ts";
 import type { ITheme } from "@xterm/xterm";
@@ -121,7 +121,7 @@ function TerminalPane({
     if (!host) return;
 
     const term = new Terminal({
-      fontFamily: "var(--font-mono, ui-monospace, monospace)",
+      fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: terminalFontSize(fontSizePercentRef.current),
       cursorBlink: true,
       theme: resolvedRef.current === "light" ? XTERM_THEME_LIGHT : XTERM_THEME_DARK,
