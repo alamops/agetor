@@ -196,3 +196,18 @@ smoke: run a claude task in `~/.agetor-dev` (never prod `~/.agetor`) and observe
   tuned.
 - Boot-window watchdog arm is deliberately excluded (no turn in flight; boot has its own
   timeout semantics).
+
+## Addendum (2026-10-12) — placeholder rows are idle, not unparsable
+
+Claude Code 2.1.296 shows dim placeholder text on the live `❯` row of an idle composer: a
+prompt suggestion after a turn, the startup `Try "…"` sample, or `Message @<agent>…`. Plain
+`capture-pane -p` drops the styling, so the row read as typed text, `paneShowsIdleInputBox`
+was false, and on a turn that never wrote `end_turn` the stuck-turn watchdog carded an
+"unparsable" prompt over a perfectly idle pane. `paneShowsIdleInputBox(tail, styledTail?)` now
+treats a row whose visible text is entirely SGR-dim (first character optionally inverted, the
+cursor) as idle; the styled row comes from ONE extra `capture-pane -p -e` taken only when the
+plain row is non-bare, located by raw line index and trusted only when its SGR-stripped text
+equals the plain row. Typed text and the `[Pasted text …]` / `[Image #N]` chips never qualify.
+Agetor also launches every claude session with `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`,
+which removes suggestions and the startup sample on fresh launches. See
+`docs/plans/claude-code-placeholder.md`.

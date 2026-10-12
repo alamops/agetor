@@ -11,6 +11,7 @@ process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-continuati
 const { __forTest, setContinuationRunFactory, setBackgroundTaskSettledHandler, setContinuationWatchdogMs } =
   await import("./claude-tmux.ts");
 import type { ContinuationHooks, SpawnedAgent, ChunkHandler } from "./claude-tmux.ts";
+import type { ContinuationTrigger } from "../shared/types.ts";
 
 // Safety net for the whole file: several tests below arm a REAL
 // notification-triggered watchdog (a real `setTimeout`, per
@@ -107,7 +108,7 @@ async function resolveFirstTurn(
  *  every later test file in the shared bun test process (the file's own doc
  *  comment on `setContinuationRunFactory` calls this out explicitly). */
 async function withContinuationFactory<T>(
-  factory: (taskId: string) => ContinuationHooks | null,
+  factory: (taskId: string, trigger?: ContinuationTrigger) => ContinuationHooks | null,
   body: () => Promise<T> | T,
 ): Promise<T> {
   const prev = setContinuationRunFactory(factory);
@@ -933,6 +934,213 @@ test("with no factory installed at all, behavior is identical to pre-change: no 
 
     expect(state.turnQueue.length).toBe(0);
     expect(firstOut.some((r) => r.data === "plain trailing content, no adoption seam active")).toBe(true);
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+// ─── compaction lines + per-trigger wording (docs/plans/claude-code-placeholder.md P7/P8/P9) ──
+//
+// Claude compacts an idle session ~54 min after its last turn and writes a
+// `user` summary line (`isCompactSummary` + `isVisibleInTranscriptOnly`), a
+// `compact_boundary` system line and an `informational` notice. None of them
+// is claude continuing work, so none may adopt a phantom continuation run.
+
+/** ~2 KB synthetic markdown body, standing in for claude's compaction summary. */
+function syntheticSummaryBody(): string {
+  const para =
+    "## Section\n- Synthetic bullet describing earlier work in this session.\n- Another synthetic bullet.\n\n";
+  let out = "This session is being continued from a previous conversation.\n\n";
+  while (out.length < 2048) out += para;
+  return out;
+}
+
+/** Install a counting factory that records `(taskId, trigger)` per call. */
+function countingFactory(cont: ReturnType<typeof recorder>) {
+  const calls: Array<{ taskId: string; trigger: ContinuationTrigger | undefined }> = [];
+  const factory = (taskId: string, trigger?: ContinuationTrigger): ContinuationHooks => {
+    calls.push({ taskId, trigger });
+    return { onChunk: cont.onChunk, onAdopted: () => {} };
+  };
+  return { calls, factory };
+}
+
+test("a compaction-summary user line (isCompactSummary + isVisibleInTranscriptOnly, ~2 KB) does NOT adopt, and reaches lastChunk as compaction_summary, never user", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    const firstOut = await resolveFirstTurn(state, jsonlPath);
+    const cont = recorder();
+    const { calls, factory } = countingFactory(cont);
+    const body = syntheticSummaryBody();
+    expect(body.length).toBeGreaterThanOrEqual(2048);
+
+    await withContinuationFactory(factory, () => {
+      appendFileSync(
+        jsonlPath,
+        JSON.stringify({
+          type: "user",
+          uuid: "uuid-summary",
+          isCompactSummary: true,
+          isVisibleInTranscriptOnly: true,
+          message: { role: "user", content: body },
+        }) + "\n",
+      );
+      __forTest.flushSync(state);
+    });
+
+    expect(calls).toEqual([]);
+    expect(state.turnQueue.length).toBe(0);
+    expect(__forTest.turnInFlight(state)).toBe(false);
+    expect(cont.out).toEqual([]);
+
+    const summaries = firstOut.filter((r) => r.stream === "compaction_summary");
+    expect(summaries.length).toBe(1);
+    expect(summaries[0]!.data).toBe(body);
+    expect(summaries[0]!.uuid).toBe("uuid-summary");
+    expect(firstOut.some((r) => r.stream === "user" && r.data.includes("This session is being continued"))).toBe(false);
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("a user line with only isVisibleInTranscriptOnly does NOT adopt but still reaches lastChunk as a user chunk", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    const firstOut = await resolveFirstTurn(state, jsonlPath);
+    const cont = recorder();
+    const { calls, factory } = countingFactory(cont);
+
+    await withContinuationFactory(factory, () => {
+      appendFileSync(
+        jsonlPath,
+        JSON.stringify({
+          type: "user",
+          uuid: "uuid-vis-only",
+          isVisibleInTranscriptOnly: true,
+          message: { role: "user", content: "transcript-only synthetic note" },
+        }) + "\n",
+      );
+      __forTest.flushSync(state);
+    });
+
+    expect(calls).toEqual([]);
+    expect(state.turnQueue.length).toBe(0);
+    expect(firstOut.some((r) => r.stream === "user" && r.data === "transcript-only synthetic note")).toBe(true);
+    expect(firstOut.some((r) => r.stream === "compaction_summary")).toBe(false);
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("compact_boundary and the informational compaction notice with no turn open do NOT adopt; both reach lastChunk as status lines", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    const firstOut = await resolveFirstTurn(state, jsonlPath);
+    const cont = recorder();
+    const { calls, factory } = countingFactory(cont);
+
+    await withContinuationFactory(factory, () => {
+      appendFileSync(
+        jsonlPath,
+        JSON.stringify({
+          type: "system",
+          subtype: "compact_boundary",
+          uuid: "uuid-boundary",
+          compactMetadata: { trigger: "auto", preTokens: 450162, postTokens: 8613 },
+        }) + "\n",
+      );
+      appendFileSync(
+        jsonlPath,
+        JSON.stringify({
+          type: "system",
+          subtype: "informational",
+          level: "notice",
+          uuid: "uuid-notice",
+          content: "Compacted while idle, before the prompt cache expired",
+        }) + "\n",
+      );
+      __forTest.flushSync(state);
+    });
+
+    expect(calls).toEqual([]);
+    expect(state.turnQueue.length).toBe(0);
+    expect(__forTest.turnInFlight(state)).toBe(false);
+    expect(firstOut.some((r) => r.stream === "status" && r.data === "context compacted · 450k → 8.6k tokens")).toBe(true);
+    expect(firstOut.some((r) => r.stream === "status" && r.data === "Compacted while idle, before the prompt cache expired")).toBe(true);
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("a plain terminal-typed user line adopts a continuation with trigger \"user\"", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    await resolveFirstTurn(state, jsonlPath);
+    const cont = recorder();
+    const { calls, factory } = countingFactory(cont);
+
+    await withContinuationFactory(factory, () => {
+      appendFileSync(
+        jsonlPath,
+        JSON.stringify({
+          type: "user",
+          uuid: "uuid-typed",
+          message: { role: "user", content: "typed straight into the terminal" },
+        }) + "\n",
+      );
+      __forTest.flushSync(state);
+    });
+
+    expect(calls).toEqual([{ taskId, trigger: "user" }]);
+    expect(state.turnQueue.length).toBe(1);
+    expect(cont.out.some((r) => r.stream === "user" && r.data === "typed straight into the terminal")).toBe(true);
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("an assistant line adopts a continuation with trigger \"assistant\"", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    await resolveFirstTurn(state, jsonlPath);
+    const cont = recorder();
+    const { calls, factory } = countingFactory(cont);
+
+    await withContinuationFactory(factory, () => {
+      appendFileSync(jsonlPath, assistantLineId("claude kept going on its own", "msg-2", "uuid-2"));
+      __forTest.flushSync(state);
+    });
+
+    expect(calls).toEqual([{ taskId, trigger: "assistant" }]);
+    expect(state.turnQueue.length).toBe(1);
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("a task-notification line adopts a continuation with trigger \"notification\"", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    await resolveFirstTurn(state, jsonlPath);
+    const cont = recorder();
+    const { calls, factory } = countingFactory(cont);
+
+    try {
+      await withContinuationFactory(factory, () => {
+        appendFileSync(jsonlPath, taskNotificationLine("agent-trigger", "uuid-notif-trigger"));
+        __forTest.flushSync(state);
+      });
+      expect(calls).toEqual([{ taskId, trigger: "notification" }]);
+      expect(state.turnQueue.length).toBe(1);
+    } finally {
+      clearArmedWatchdog(state);
+    }
   } finally {
     __forTest.uninstallSession(taskId);
   }

@@ -1547,3 +1547,24 @@ test("'s' on a never-run (idle) pipeline parent starts it via startTask; a finis
   expect(flatten(r2.lastFrame() ?? "")).toContain("! pipeline already finished");
   r2.unmount();
 });
+
+test("event stream: a compaction_summary event renders one summary› digest line, never the body", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const body = "Summary first line\n\nHidden second paragraph\n" + "y".repeat(1500);
+  onTaskEvents!({ runId: "runA", taskId: "taskA", stream: "compaction_summary", data: body, ts: 1 });
+  await wait(80);
+
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("summary› Summary first line (1.5 KB)");
+  expect(frame).not.toContain("Hidden second paragraph");
+  unmount();
+});
