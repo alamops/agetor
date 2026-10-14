@@ -164,3 +164,48 @@ test("reconcileOrphans emits run-status → orphaned + column → ready", async 
 
   tasks.delete(taskId);
 });
+
+test("a step task's event is stamped with its pipeline parent's id and title", async () => {
+  const { createTask, publishGlobalEvent, subscribeGlobal } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const { randomUUID } = await import("node:crypto");
+
+  const parent = await createTask({
+    title: "global-events: pipeline parent",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+  });
+  if ("error" in parent) throw new Error(parent.error);
+  const stepId = randomUUID();
+  tasks.insert({ ...parent.task, id: stepId, title: "pipeline · step", pipelineParentId: parent.task.id, pipelineStepId: "s1" });
+
+  const events: GlobalEvent[] = [];
+  const unsub = subscribeGlobal((e) => {
+    if (e.kind === "files-sent" && e.taskId === stepId) events.push(e);
+  });
+  publishGlobalEvent({ kind: "files-sent", taskId: stepId, runId: "r1", count: 1, caption: null, proactive: false, ts: Date.now() });
+  // An emitter that stamped the id itself (interactions.ts does) still gets the title.
+  publishGlobalEvent({
+    kind: "files-sent",
+    taskId: stepId,
+    runId: "r2",
+    count: 1,
+    caption: null,
+    proactive: false,
+    ts: Date.now(),
+    pipelineParentId: parent.task.id,
+  });
+  unsub();
+
+  expect(events.length).toBe(2);
+  for (const e of events) {
+    if (e.kind !== "files-sent") throw new Error("unexpected kind");
+    expect(e.pipelineParentId).toBe(parent.task.id);
+    expect(e.pipelineParentTitle).toBe("global-events: pipeline parent");
+  }
+
+  tasks.delete(stepId);
+  tasks.delete(parent.task.id);
+});

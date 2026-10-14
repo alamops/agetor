@@ -12,7 +12,8 @@ import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sort
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
-import { EXPAND_EVENT, isExpandTargetFor } from "@/lib/expand-on-jump";
+import { EXPAND_EVENT } from "@/lib/expand-on-jump";
+import { useExpandOnJump } from "@/lib/use-expand-on-jump";
 import { latestPrProposal } from "@/lib/pr-proposal";
 import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
@@ -121,6 +122,7 @@ import { TodoProgressCard } from "./TodoProgressCard";
 import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
 import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink, MD_URL_TRANSFORM, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./md-components";
 import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent, HandoffReminderBadge } from "./MessageSegments";
+import { CompactionSummaryBlock } from "./CompactionSummaryBlock";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -482,6 +484,15 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles
   // both the panel and the popovers attach to `document`, so DOM markers
   // are the order-independent way to coordinate the handoff.
   //
+  // An Escape that a layer already handled arrives `defaultPrevented`, and
+  // that alone is enough to bail: a popover listening on the textarea (the
+  // `@` autocomplete, `/` autocomplete) dismisses itself in the same event,
+  // and its marker can already be gone by the time this bubble-phase
+  // listener runs — React may flush the dismiss between the two listeners.
+  // Under load that closed the whole panel on the first Escape (reproduced
+  // 2/8 in e2e/at-file-autocomplete.spec.ts with every core busy).
+  // dialog.tsx bails the same way.
+  //
   // onClose is captured into a ref because the parent passes an inline arrow
   // function — depending on it directly would tear down + re-add the listener
   // on every kanban poll (every 2s).
@@ -491,6 +502,7 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      if (e.defaultPrevented) return;
       if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open], [data-search-open]')) return;
       e.preventDefault();
       onCloseRef.current();
@@ -738,6 +750,12 @@ function RunPanelBody({
   // query narrows — gating the dispatch on "the user actually asked to jump"
   // keeps auto-expand tied to intentional navigation only.
   const jumpIntentRef = useRef(false);
+  // Bumped by every explicit jump (`stepSearch`) and listed in the highlight
+  // effect's deps, so a jump that resolves to the SAME match — the only match,
+  // or a wrap back onto the current one — still re-runs that effect (re-centre
+  // + `EXPAND_EVENT`). Without it a 1/1 match never expanded its collapsed
+  // block, and the unconsumed `jumpIntentRef` leaked into the next keystroke.
+  const [jumpSeq, setJumpSeq] = useState(0);
   // Tracks whether the log was scrolled near the bottom at the last user
   // interaction. Auto-scroll-to-bottom on new events only fires when this is
   // true, so a user who scrolls up to read history isn't yanked back down on
@@ -1951,7 +1969,7 @@ function RunPanelBody({
       // committed and the browser has laid out the taller card.
       requestAnimationFrame(() => el.scrollIntoView({ block: "center" }));
     }
-  }, [activeMatchId]);
+  }, [activeMatchId, jumpSeq]);
 
   const closeSearch = useCallback(() => {
     setSearchOpen(false);
@@ -1961,6 +1979,7 @@ function RunPanelBody({
 
   const stepSearch = useCallback((dir: 1 | -1) => {
     jumpIntentRef.current = true;
+    setJumpSeq((n) => n + 1);
     setActiveMatchId((cur) => {
       const idx = matches.indexOf(cur ?? -1);
       const next = stepMatchIndex(matches.length, idx, dir);
@@ -2023,6 +2042,8 @@ function RunPanelBody({
     if (!searchOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      // Already handled by a layer above (see the panel-close listener).
+      if (e.defaultPrevented) return;
       if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open]')) return;
       e.preventDefault();
       closeSearch();
@@ -4920,7 +4941,7 @@ function RunsList({
             <Badge
               variant="secondary"
               className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
-              title="auto-continued after a background task"
+              title={CONTINUATION_BADGE_TITLE}
             >
               auto
             </Badge>
@@ -4962,7 +4983,7 @@ function RunsList({
                   <Badge
                     variant="secondary"
                     className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
-                    title="auto-continued after a background task"
+                    title={CONTINUATION_BADGE_TITLE}
                   >
                     auto
                   </Badge>
@@ -5337,6 +5358,8 @@ function RunEventList({
           return [wrap(key, evid, <AssistantBlock text={e.data} />)];
         case "thinking":
           return [wrap(key, evid, <ThinkingBlock text={e.data} />)];
+        case "compaction_summary":
+          return [wrap(key, evid, <CompactionSummaryBlock text={e.data} />)];
         case "tool_use": {
           const parsed = safeParse<ParsedToolUse>(e.data);
           if (!parsed) return [wrap(key, evid, <RawText text={e.data} muted />)];
@@ -6104,21 +6127,11 @@ const StatusDivider = memo(function StatusDivider({ text }: { text: string }) {
   );
 });
 
-/** Listens for the search-jump `EXPAND_EVENT` bubbling up from the matched
- *  `[data-evid]` element (see the highlight effect above) and calls
- *  `onExpand` when `root` is (or contains) the element that dispatched it —
- *  the imperative counterpart to that effect, so a jump onto a match inside
- *  a collapsed tool-call card / result fold / thinking block reveals it
- *  without threading new props through the `blocks` memo. */
-function useExpandOnJump(rootRef: React.RefObject<HTMLDivElement | null>, onExpand: () => void) {
-  useEffect(() => {
-    const handler = (evt: Event) => {
-      if (isExpandTargetFor(evt.target, rootRef.current)) onExpand();
-    };
-    document.addEventListener(EXPAND_EVENT, handler);
-    return () => document.removeEventListener(EXPAND_EVENT, handler);
-  }, [rootRef, onExpand]);
-}
+/** Tooltip for a continuation run's "auto" badge. The trigger (background
+ *  task, a turn typed in the attached terminal, Claude continuing on its own)
+ *  isn't stored on the run row — it's named by the run's opening status line
+ *  (`CONTINUATION_STATUS_TEXT`) — so the badge stays neutral. */
+const CONTINUATION_BADGE_TITLE = "a turn Agetor didn't send — its first status line says what started it";
 
 const ThinkingBlock = memo(function ThinkingBlock({ text }: { text: string }) {
   const [open, setOpen] = useState(false);

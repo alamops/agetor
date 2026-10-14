@@ -10,6 +10,7 @@ import type { RunEvent, GlobalEvent, Task } from "../../shared/types.ts";
 import { FX_RECOVERY_STATUS_PREFIX, isInternalStatusSentinel } from "../../shared/types.ts";
 import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../../shared/fx-recovery.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
+import { COMPACTION_SUMMARY_LABEL, compactionSummaryLine } from "../../shared/compaction.ts";
 import {
   parseSentFilesToolUse,
   parseSentFilesToolResult,
@@ -187,6 +188,18 @@ function createEventFormatter(): (e: RunEvent) => string {
       // this formatter.
       case "user":
         return userMessageLines(e.data).map((line) => `${colorLabel(line)} ${line.text}`).join("\n");
+      // Claude's context-compaction summary (~16 KB of its own markdown) —
+      // one digest line (first line + size), never the whole body. The
+      // digest is model-written text on one terminal line, so it goes
+      // through `escapeFreeText` like any other free text printed here.
+      case "compaction_summary": {
+        const line: PlainLine = {
+          label: COMPACTION_SUMMARY_LABEL,
+          text: escapeFreeText(compactionSummaryLine(e.data)),
+          tone: "machine",
+        };
+        return `${colorLabel(line)} ${line.text}`;
+      }
       case "assistant":
         return e.data;
       case "thinking":

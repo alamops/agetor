@@ -74,3 +74,21 @@ Test tasks are file-disjoint from each other and from Wave 1 (which is already c
 - Assumption: a `<task-notification>` line reliably precedes any auto-continuation (it is the wake signal itself). If claude versions change the JSONL shape, `taskNotificationContent` already centralizes detection.
 - Assumption: 10min watchdog constant needs no env override for now (module const, test-injectable).
 - Codex remains inert by construction throughout (writes no subagents rows; factory rejects non-claude-code).
+
+## Addendum (2026-10-12) — compaction summaries never adopt; per-trigger wording
+
+- **Third never-content family.** Claude Code's idle compaction (and every other compaction)
+  writes a `user` JSONL line carrying `isCompactSummary: true` / `isVisibleInTranscriptOnly:
+  true` with no turn open. `isContinuationContentEvent` used to treat it as content, so
+  `maybeAdoptContinuation` opened an `origin: "continuation"` run that no `end_turn` ever
+  settled — the card sat `running` for hours. A `user` line with either flag is now excluded,
+  alongside task-notifications and local-command twins. The summary itself is mapped to the new
+  `compaction_summary` stream (rendered as a collapsed block), the `compact_boundary` and the
+  `Compacted while idle, …` notice to status lines.
+- **Honest wording.** The factory now receives a `ContinuationTrigger`
+  (`notification` | `user` | `assistant`), and `startContinuationRun` opens the run with
+  `CONTINUATION_STATUS_TEXT[trigger]`: `auto-continued after background task`,
+  `turn started from the terminal`, or `Claude continued on its own`. The default stays
+  `notification` (fake driver, pipeline handoff adoption).
+
+See `docs/plans/claude-code-placeholder.md`.
