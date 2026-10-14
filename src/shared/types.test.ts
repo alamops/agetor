@@ -461,9 +461,14 @@ test("gemini picker is tier-ordered: Gemini 4 first, then Pro rows, then Flash r
   ]);
 });
 
-test("the gemini-4-argon row's hint names the Ultra / paid-key requirement and the medium default thinking, and gemini has no CLI version floor (owner D2)", () => {
+test("the gemini-4-argon row's hint names the paid-API-key requirement (Gemini CLI no longer serves AI Pro/Ultra) and the medium default thinking, and gemini has no CLI version floor (owner D2)", () => {
   const row = AGENT_OPTIONS.gemini.models.find((m) => m.id === "gemini-4-argon");
-  expect(row?.hint).toContain("AI Ultra");
+  expect(row?.hint).toContain("paid Gemini API");
+  expect(row?.hint).toContain("not the API free tier");
+  expect(row?.hint).toContain("Antigravity harness");
+  // Gemini CLI stopped serving Google AI Pro/Ultra on 2026-06-18, so the hint
+  // must never present an Ultra plan as a way to run this row.
+  expect(row?.hint).not.toMatch(/Needs Google AI Ultra/);
   expect(row?.hint).toContain("medium");
   expect(MODEL_MIN_CLI_VERSION.gemini).toBeUndefined();
 });

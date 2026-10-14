@@ -3331,14 +3331,18 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       // GA 2026-10-13 (ai.google.dev model page / changelog). The only
       // published code — no -preview suffix, no sibling ids. thinking_level
       // low/medium/high, default medium; 1,048,576-token shared context. Not
-      // on the API free tier or the AI Pro plan (Antigravity: Ultra/Enterprise
-      // only). Gemini CLI 0.64.0 forwards the id verbatim and gives it the
-      // `chat-base` alias config (no thinkingLevel) until upstream PR #29737
+      // on the API free tier. Gemini CLI itself stopped serving Google AI
+      // Pro/Ultra (and free Code Assist for individuals) on 2026-06-18 — only
+      // paid Gemini / Agent Platform API keys and Code Assist Standard/
+      // Enterprise still work (developers.googleblog.com, "transitioning Gemini
+      // CLI to Antigravity CLI") — so the plan-tier gate (Ultra/Enterprise)
+      // lives on the antigravity rows, not here. Gemini CLI 0.64.0 forwards
+      // the id verbatim and gives it the `chat-base` alias config (no thinkingLevel) until upstream PR #29737
       // lands, so there is deliberately no MODEL_MIN_CLI_VERSION.gemini floor
       // (owner D2, docs/plans/add-gemini-4-argon-grill.md). Vertex AI / Agent
       // Platform serve it from the `global` location only — us-central1 404s
       // — and agetor sets no location.
-      { id: "gemini-4-argon", label: "Gemini 4 Argon", hint: "Newest flagship (GA 2026-10-13) — Google's most capable model for complex coding, agentic, math and science work. Needs Google AI Ultra or a paid Gemini API key (not the API free tier or the AI Pro plan). Runs at Google's default (medium) thinking until Gemini CLI registers the id." },
+      { id: "gemini-4-argon", label: "Gemini 4 Argon", hint: "Newest flagship (GA 2026-10-13) — Google's most capable model for complex coding, agentic, math and science work. Needs a paid Gemini API or Agent Platform key (not the API free tier) — Gemini CLI no longer serves Google AI Pro/Ultra logins, so use the Antigravity harness for those. Runs at Google's default (medium) thinking until Gemini CLI registers the id." },
       { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", hint: "Recommended default — current flagship; Google's successor to the retired 3 Pro preview." },
       { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", hint: "Prior stable flagship." },
       { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Latest and most capable Flash — built for long-horizon coding and agentic work at Flash cost." },

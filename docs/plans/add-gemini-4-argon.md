@@ -94,7 +94,7 @@ Owner decisions (D1–D10, C1–C9) are taken as given; see the grill record. Th
 6. **`DEFAULT_EFFORT.antigravity` stays `"high"`** and gains a one-line "unused — effort rides in the model id; every `MODEL_EFFORT_SUPPORT.antigravity` set is empty" comment, mirroring gemini's. *Reasoning:* C7; keeps `Record<AgentKind,string>` total.
 7. **Gemini picker order: Argon first, then the existing tiers.** New order `gemini-4-argon, gemini-3.1-pro-preview, gemini-2.5-pro, gemini-3.8-flash, gemini-3.8-flash-cyber, gemini-2.5-flash`; the tier comment becomes "Frontier row first (Gemini 4), then Pro tier, then Flash tier; newest first within each tier". *Evidence:* C1.
 8. **Hint wording** (pinned so T1 and T5 agree; T5 asserts substrings, not whole strings):
-   - gemini `gemini-4-argon`: `"Newest flagship (GA 2026-10-13) — Google's most capable model for complex coding, agentic, math and science work. Needs Google AI Ultra or a paid Gemini API key (not the API free tier or the AI Pro plan). Runs at Google's default (medium) thinking until Gemini CLI registers the id."` — T5 asserts `AI Ultra` and `medium`.
+   - gemini `gemini-4-argon`: `"Newest flagship (GA 2026-10-13) — Google's most capable model for complex coding, agentic, math and science work. Needs a paid Gemini API or Agent Platform key (not the API free tier) — Gemini CLI no longer serves Google AI Pro/Ultra logins, so use the Antigravity harness for those. Runs at Google's default (medium) thinking until Gemini CLI registers the id."` — T5 asserts the paid-key wording, the Antigravity pointer and `medium`. (Code-review fix: the first draft said "Needs Google AI Ultra or a paid Gemini API key", but Gemini CLI stopped serving Google AI Pro/Ultra and free Code Assist for individuals on 2026-06-18 — only paid Gemini / Agent Platform API keys and Code Assist Standard/Enterprise still work — so the Ultra gate belongs on the antigravity rows only.)
    - antigravity `gemini-4-argon-<e>`: `"Gemini 4 Argon with <high|medium|low> reasoning effort. Needs Google AI Ultra or an eligible Gemini Enterprise subscription in Antigravity. The id follows Antigravity's naming convention and is unconfirmed — if `agy models` lists it differently, pick that discovered row instead."` — T5 asserts `unconfirmed` and `agy models`.
    - cursor: label `"Gemini 4 Argon"`, hint `"Google Gemini 4 Argon via Cursor."`.
    - fx: label `"Gemini 4 Argon"`, hint `"Premium Gateway tier — offered only when this account's catalog includes it."`.
@@ -201,7 +201,7 @@ Planner calls the owner should confirm first (all three are reversible one-liner
 | # | Call | Chosen | Why | Confidence |
 | --- | --- | --- | --- | --- |
 | P1 | Migration grouping (A5) | three files: 063 cursor, 064 antigravity effort clear (+ `lastEffort:antigravity` delete), 065 prune | owner prefers one purpose per migration; commuting, independently testable | high |
-| P2 | Hint wording | §3.8 strings | names the gates the owner asked for (AI Ultra / paid API, medium thinking; Ultra/Enterprise + unconfirmed id) | medium — wording only |
+| P2 | Hint wording | §3.8 strings | names the gates the owner asked for (paid API key — not AI Ultra, which Gemini CLI no longer serves — medium thinking; Ultra/Enterprise + unconfirmed id) | medium — wording only |
 | P3 | Vertex `global`-only (A7) | types.ts row comment only | cheapest place; agetor sets no location; hint already long | medium |
 
 Assumptions carried from the grill (unchanged, with the plan's mitigation):
@@ -217,7 +217,7 @@ Assumptions carried from the grill (unchanged, with the plan's mitigation):
 
 | Item | Disposition | Task ID / reason / who deferred |
 | --- | --- | --- |
-| gemini `gemini-4-argon` row + `[]` effort key, first in the picker, hint names AI Ultra/paid API + medium thinking | in this run | T1, T5 |
+| gemini `gemini-4-argon` row + `[]` effort key, first in the picker, hint names the paid API key + medium thinking | in this run | T1, T5 |
 | gemini default / "Recommended default" hint stays on 3.1 Pro preview; README gemini cell unchanged | in this run (no-op pinned by test) | T5 (:406-409 retarget), owner D1 |
 | `MODEL_MIN_CLI_VERSION.gemini` floor for Argon | out of scope | owner D2 — a floor would block runs that work; `MODEL_MIN_CLI_VERSION.gemini === undefined` pinned by T5 |
 | antigravity `gemini-4-argon-{high,medium,low}` rows + keys on top, Ultra/Enterprise + unconfirmed-id hint | in this run | T1, T5 |
