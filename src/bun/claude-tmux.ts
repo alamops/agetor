@@ -6232,6 +6232,13 @@ const SPINNER_ELAPSED_WORKING_LINE = `^(?!.*${TURN_DONE_SUMMARY_RE.source})\\s*$
  *  match. */
 const TOKEN_COUNTER_LINE = "·\\s*(?:↓|↑)\\s*[0-9.]+k?\\s*tokens";
 
+/** Earlier entries of a comma-joined status-bar item, so the shell and
+ *  monitor arms of `WORKING_LINE_RE` also match their count when it is not
+ *  the item's first entry. Live capture (2.1.296, 2026-10-13): one item
+ *  `· 1 shell, 1 monitor ·` (`⏵⏵ auto mode on · ← 1 agent · 1 shell, 1
+ *  monitor · esc to interrupt · ↓ to …`) instead of two `·`-separated ones. */
+const STATUS_ITEM_LIST_PREFIX = "(?:\\d+\\s+\\w+,\\s*)*";
+
 /** Lines that prove claude is actively working on the pane in Claude Code
  *  2.1.239. Evidence (captured live): the present-participle spinner
  *  (`SPINNER_ACTIVE_LINE`) and its elapsed summary (`SPINNER_ELAPSED_LINE`);
@@ -6271,9 +6278,9 @@ const WORKING_LINE_RE = new RegExp(
     TOKEN_COUNTER_LINE,
     `^\\s*${SPINNER_GLYPH}\\s+Waiting for \\d+ background agent`,
     "\\d+\\s+shells?\\s+still\\s+running",
-    "·\\s*\\d+\\s+shells?\\s*(?:·|$)",
+    `·\\s*${STATUS_ITEM_LIST_PREFIX}\\d+\\s+shells?\\s*(?:[·,]|$)`,
     `^\\s*${SPINNER_GLYPH}[^\\n]*·\\s*\\d+\\s+monitors?\\s+still\\s+running`,
-    "·\\s*\\d+\\s+monitors?\\s*(?:·|$)",
+    `·\\s*${STATUS_ITEM_LIST_PREFIX}\\d+\\s+monitors?\\s*(?:[·,]|$)`,
   ].join("|"),
   "i",
 );
@@ -6424,6 +6431,39 @@ function paneShowsClaudeWorking(tail: string): boolean {
  *  be mistaken for the live prompt. */
 const IDLE_PROMPT_SEARCH_LINES = 8;
 
+/** One row of the background-agent roster that Claude Code 2.1.296 draws
+ *  BELOW the status bar (older builds drew it between the input box and the
+ *  bar — `IDLE_PROMPT_SEARCH_LINES` covers that layout). Live capture
+ *  (2.1.296 / tmux 3.6a, 2026-10-13), plain text after the bar:
+ *    `  ⏺ main`
+ *    `  ◯ general-purpose  sleeper                           1m 40s · ↓ 37.4k tokens`
+ *  `⏺` marks the transcript the composer is talking to and `◯` the others,
+ *  so either glyph can sit on either row. A row is either the `main` entry
+ *  or an agent entry ending in its `· ↓ <n> tokens` counter — the counter
+ *  stays (frozen) after the agent finishes, and the selector-focused form
+ *  (`❯ ⏺ main`) never matches, since that state replaces the bar anyway. */
+const AGENT_ROSTER_ROW_RE = /^\s*[⏺◯]\s+(?:main\s*$|\S.*·\s*[↓↑]\s*[0-9.]+k?\s*tokens\s*$)/;
+
+/** Most roster rows skipped below the status bar — `main` plus one row per
+ *  agent. Generous on purpose: a longer run of matching rows than this is
+ *  not a roster this code has seen, and is left to read as "no bar". */
+const AGENT_ROSTER_MAX_ROWS = 12;
+
+/** `nonBlank` (raw line indices of a pane's non-blank rows) minus the run of
+ *  trailing background-agent roster rows (`AGENT_ROSTER_ROW_RE`) Claude
+ *  2.1.296 draws below the status bar, so bar-anchored readers find the bar
+ *  where they expect it — at the bottom. Returns `nonBlank` unchanged when
+ *  the bottom row isn't a roster row or the run is longer than
+ *  `AGENT_ROSTER_MAX_ROWS`. */
+function withoutTrailingAgentRoster(lines: string[], nonBlank: number[]): number[] {
+  let end = nonBlank.length;
+  while (end > 0 && nonBlank.length - end < AGENT_ROSTER_MAX_ROWS && AGENT_ROSTER_ROW_RE.test(lines[nonBlank[end - 1]!]!)) {
+    end--;
+  }
+  if (end > 0 && end < nonBlank.length && AGENT_ROSTER_ROW_RE.test(lines[nonBlank[end - 1]!]!)) return nonBlank;
+  return end === nonBlank.length ? nonBlank : nonBlank.slice(0, end);
+}
+
 /**
  * The single LIVE prompt row within the idle chrome window — the
  * BOTTOM-MOST line matching a leading `❯` among the up-to-
@@ -6458,13 +6498,20 @@ const IDLE_PROMPT_SEARCH_LINES = 8;
  * border/hint chrome between them, never ordinary transcript), so taking the
  * LAST matching row — closest to the bar — picks the real composer over any
  * stale echo further up.
+ *
+ * "Last two non-blank lines" is counted after dropping the background-agent
+ * roster Claude 2.1.296 draws BELOW the bar (`withoutTrailingAgentRoster`) —
+ * without that, every session that had used a background subagent (and the
+ * `Message @<agent>…` view of one) had no live prompt row at all, so neither
+ * a bare `❯` nor a placeholder could ever read idle there.
  */
 function livePromptRowIndex(tail: string): number | null {
   const lines = tail.split("\n");
-  const nonBlank: number[] = [];
+  const allNonBlank: number[] = [];
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i]!.trim().length > 0) nonBlank.push(i);
+    if (lines[i]!.trim().length > 0) allNonBlank.push(i);
   }
+  const nonBlank = withoutTrailingAgentRoster(lines, allNonBlank);
   if (nonBlank.length === 0) return null;
   const lastTwo = nonBlank.slice(-2);
   const barRelIndex = lastTwo.findIndex((i) => STATUS_BAR_RE.test(lines[i]!));
@@ -6522,6 +6569,21 @@ function stripSgr(s: string): string {
  * `\x1b[2mTry\x1b[0m \x1b[2m"create\x1b[0m …` spans for the startup sample,
  * `\x1b[39m❯\xa0hello` for typed text). Note the `❯` is followed by a NBSP
  * (U+00A0), not an ASCII space — JS `\s` matches both.
+ *
+ * All three families and both cursor styles were captured live on 2.1.296 /
+ * tmux 3.6a (2026-10-13; fixtures in claude-tmux-scraper.test.ts): a
+ * post-turn suggestion `\x1b[39m❯\xa0\x1b[2mcommit this\x1b[0m` (Claude
+ * withholds one while the prompt cache is cold, so a session's first turn
+ * never shows one), `\x1b[39m❯\xa0\x1b[2mMessage @general-purpose…\x1b[0m`
+ * while viewing a background subagent, and the inverted first character
+ * `\x1b[7mT\x1b[0;2mry\x1b[0m …`. The inverted form appears only when Claude
+ * draws its own cursor cell: with the `tengu_native_cursor` flag on (the
+ * owner's account) or `CLAUDE_CODE_NATIVE_CURSOR` set, Claude parks the
+ * terminal's real cursor on the row instead and the row stays all-dim — the
+ * block cursor seen on an attached terminal is the terminal's, not an SGR
+ * invert. Not handled, deliberately: while voice input is recording, Claude
+ * swaps the first character for a coloured level-meter glyph (`▁…█`); that
+ * row reads as text, which is right — the user is dictating.
  *
  * Rule: the plain projection must read `❯` + whitespace + text and must not
  * be a `[Pasted text …]` / `[Image #N]` chip (both render plain-coloured —
@@ -9311,9 +9373,16 @@ const MODE_BAR_SCAN_LINES = 4;
 async function readPaneMode(state: SessionState): Promise<string | null> {
   const lines = (await captureModePane(state)).split("\n");
   let scanned = 0;
+  let rosterSkipped = 0;
   for (let i = lines.length - 1; i >= 0 && scanned < MODE_BAR_SCAN_LINES; i--) {
     const bar = lines[i]!;
     if (bar.trim() === "") continue;
+    // 2.1.296 draws the background-agent roster below the bar; its rows
+    // don't count against the scan window (`AGENT_ROSTER_ROW_RE`).
+    if (rosterSkipped < AGENT_ROSTER_MAX_ROWS && scanned === 0 && AGENT_ROSTER_ROW_RE.test(bar)) {
+      rosterSkipped++;
+      continue;
+    }
     scanned++;
     if (/shift\+tab to cycle/i.test(bar)) {
       if (/accept edits on/i.test(bar)) return CLAUDE_MODE_ACCEPT_EDITS;

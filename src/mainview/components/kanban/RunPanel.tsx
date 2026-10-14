@@ -484,6 +484,15 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles
   // both the panel and the popovers attach to `document`, so DOM markers
   // are the order-independent way to coordinate the handoff.
   //
+  // An Escape that a layer already handled arrives `defaultPrevented`, and
+  // that alone is enough to bail: a popover listening on the textarea (the
+  // `@` autocomplete, `/` autocomplete) dismisses itself in the same event,
+  // and its marker can already be gone by the time this bubble-phase
+  // listener runs — React may flush the dismiss between the two listeners.
+  // Under load that closed the whole panel on the first Escape (reproduced
+  // 2/8 in e2e/at-file-autocomplete.spec.ts with every core busy).
+  // dialog.tsx bails the same way.
+  //
   // onClose is captured into a ref because the parent passes an inline arrow
   // function — depending on it directly would tear down + re-add the listener
   // on every kanban poll (every 2s).
@@ -493,6 +502,7 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      if (e.defaultPrevented) return;
       if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open], [data-search-open]')) return;
       e.preventDefault();
       onCloseRef.current();
@@ -2032,6 +2042,8 @@ function RunPanelBody({
     if (!searchOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      // Already handled by a layer above (see the panel-close listener).
+      if (e.defaultPrevented) return;
       if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open]')) return;
       e.preventDefault();
       closeSearch();

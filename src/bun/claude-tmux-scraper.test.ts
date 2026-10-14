@@ -2732,3 +2732,171 @@ describe("placeholder keeps the unknown-prompt watchdog chain quiet", () => {
     }
   });
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// Live captures (claude 2.1.296 / tmux 3.6a, 2026-10-13): the rows below are
+// verbatim `capture-pane -p -e` bytes from a real session, not hand-built.
+// They pin the three placeholder families seen live, both cursor styles, the
+// background-agent roster that 2.1.296 draws BELOW the status bar, and the
+// comma-joined `1 shell, 1 monitor` status item.
+// ────────────────────────────────────────────────────────────────────────────
+
+const LIVE_BORDER = `\x1b[38;5;244m${"─".repeat(80)}`;
+const LIVE_IDLE_BAR = "\x1b[39m  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m (shift+tab to cycle) · ← 1 agent\x1b[39m";
+const LIVE_ROSTER_BAR =
+  "\x1b[39m  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m (shift+tab to cycle) · ← 1 agent · ↓ to manage\x1b[39m";
+/** Roster as drawn in the MAIN view (`⏺` on main) — the agent had finished;
+ *  its row keeps the frozen elapsed time and token counter. */
+const LIVE_ROSTER_MAIN = [
+  "\x1b[1m  ⏺ main\x1b[0m",
+  "\x1b[38;5;246m  \x1b[38;5;211m◯ \x1b[38;5;246mgeneral-purpose\x1b[39m  \x1b[38;5;246msleeper\x1b[39m                           \x1b[38;5;246m1m 40s · ↓ 37.4k tokens\x1b[39m",
+];
+/** Same roster while viewing the subagent's transcript (`⏺` on the agent). */
+const LIVE_ROSTER_AGENT_VIEW = [
+  "\x1b[38;5;246m  ◯ main\x1b[39m",
+  "\x1b[1m  \x1b[38;5;211m⏺ \x1b[39mgeneral-purpose\x1b[0m  \x1b[1msleeper\x1b[0m                           \x1b[1m1m 40s · ↓ 37.4k tokens\x1b[0m",
+];
+
+/** A live pane tail pair: transcript, border, the live row, border, bar,
+ *  then any rows below the bar (one blank row before them, as captured). */
+function livePanes(liveRow: string, belowBar: string[] = [], bar = LIVE_IDLE_BAR): { plain: string; styled: string } {
+  const styledLines = [
+    "\x1b[38;5;231m⏺\x1b[39m I added a docstring to add() in util.py.",
+    "",
+    "\x1b[38;5;246m✻ Brewed for 4s · done 6:39 PM\x1b[39m",
+    LIVE_BORDER,
+    liveRow,
+    LIVE_BORDER,
+    bar,
+    ...(belowBar.length > 0 ? ["", ...belowBar] : []),
+  ];
+  return { plain: styledLines.map(stripSgr).join("\n"), styled: styledLines.join("\n") };
+}
+
+const LIVE_PLACEHOLDER_ROWS: Array<[string, string]> = [
+  ["a post-turn prompt suggestion", "\x1b[39m❯\xa0\x1b[2mcommit this\x1b[0m"],
+  ["the startup sample, one dim span (after the box was cleared)", '\x1b[39m❯\xa0\x1b[2mTry "fix typecheck errors"\x1b[0m'],
+  [
+    "the startup sample, dim per word (fresh session)",
+    '\x1b[39m❯\xa0\x1b[2mTry\x1b[0m \x1b[2m"create\x1b[0m \x1b[2ma\x1b[0m \x1b[2mutil\x1b[0m \x1b[2mlogging.py\x1b[0m \x1b[2mthat..."',
+  ],
+  [
+    "the startup sample with Claude's own cursor cell inverting the first char (native cursor off)",
+    '\x1b[39m❯\xa0\x1b[7mT\x1b[0;2mry\x1b[0m \x1b[2m"edit\x1b[0m \x1b[2m<filepath>\x1b[0m \x1b[2mto..."\x1b[0m',
+  ],
+  [
+    "the cleared startup sample with the inverted first char, one dim span",
+    '\x1b[39m❯\xa0\x1b[7mT\x1b[0;2mry "edit <filepath> to..."\x1b[0m',
+  ],
+  ["the 'Message @<agent>…' hint while viewing a background subagent", "\x1b[39m❯\xa0\x1b[2mMessage @general-purpose…\x1b[0m"],
+];
+
+/** Typed drafts with Claude's own cursor cell (native cursor off): the
+ *  inverted cell is AFTER or INSIDE the text, never a placeholder. */
+const LIVE_TYPED_ROWS: Array<[string, string]> = [
+  ["one typed char, cursor cell after it", "\x1b[39m❯\xa0h\x1b[7m \x1b[0m"],
+  ["a typed word, cursor cell after it", "\x1b[39m❯\xa0hello\x1b[7m \x1b[0m"],
+  ["a typed word, cursor cell inside it", "\x1b[39m❯\xa0hel\x1b[7ml\x1b[0mo"],
+];
+
+describe("live 2.1.296 captures — placeholder rows read idle, typed rows don't", () => {
+  for (const [label, row] of LIVE_PLACEHOLDER_ROWS) {
+    test(`${label}: a placeholder, idle with the styled tail, text without it`, () => {
+      expect(isPlaceholderRow(row)).toBe(true);
+      const { plain, styled } = livePanes(row);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+      expect(paneShowsComposerText(plain, styled)).toBe(false);
+      // Plain `capture-pane -p` alone can't tell: today's reading.
+      expect(paneShowsIdleInputBox(plain)).toBe(false);
+    });
+  }
+  for (const [label, row] of LIVE_TYPED_ROWS) {
+    test(`${label}: composer text even with the styled tail`, () => {
+      expect(isPlaceholderRow(row)).toBe(false);
+      const { plain, styled } = livePanes(row);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(false);
+      expect(paneShowsComposerText(plain, styled)).toBe(true);
+    });
+  }
+  test("the empty composer with Claude's own cursor cell (an inverted space) is a bare ❯", () => {
+    const { plain } = livePanes("\x1b[39m❯\xa0\x1b[7m \x1b[0m");
+    expect(paneShowsIdleInputBox(plain)).toBe(true);
+  });
+});
+
+describe("live 2.1.296 captures — the background-agent roster below the status bar", () => {
+  test("main view: the suggestion row above the bar is still the live prompt row", () => {
+    const row = "\x1b[39m❯\xa0\x1b[2mcheck on the sleeper agent\x1b[0m";
+    const { plain, styled } = livePanes(row, LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(livePromptRow(plain)).toBe("❯\xa0check on the sleeper agent");
+    expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+  });
+
+  test("subagent view: the 'Message @<agent>…' row reads idle", () => {
+    const row = "\x1b[39m❯\xa0\x1b[2mMessage @general-purpose…\x1b[0m";
+    const { plain, styled } = livePanes(row, LIVE_ROSTER_AGENT_VIEW, LIVE_ROSTER_BAR);
+    expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+    expect(paneShowsComposerText(plain, styled)).toBe(false);
+  });
+
+  test("a bare ❯ above a roster reads idle; typed text above one reads as composer text", () => {
+    const bare = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(paneShowsIdleInputBox(bare.plain)).toBe(true);
+    const typed = livePanes("\x1b[39m❯\xa0hello", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(livePromptRow(typed.plain)).toBe("❯\xa0hello");
+    expect(paneShowsIdleInputBox(typed.plain, typed.styled)).toBe(false);
+  });
+
+  test("the roster's frozen token counter still reads as working chrome (unchanged: one frame can't tell a finished agent from a running one)", () => {
+    const { plain } = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(paneShowsClaudeWorking(plain)).toBe(true);
+  });
+
+  test("the selector-focused roster (the bar replaced by '↑/↓ to select') has no live prompt row", () => {
+    const tail = [
+      "❯\xa0Message @general-purpose…",
+      "─".repeat(80),
+      "  ↑/↓ to select · Enter to view",
+      "❯ ◯ main",
+      "  ⏺ general-purpose  sleeper                               7s · ↓ 37.4k tokens",
+    ].join("\n");
+    expect(livePromptRowIndex(tail)).toBeNull();
+  });
+
+  test("transcript-shaped ⏺ rows at the bottom are not a roster (no bar above them → no live row)", () => {
+    const tail = ["❯\xa0", "─".repeat(80), "⏺ The sleep 120 is running in the background.", "⏺ I'll wait for it."].join("\n");
+    expect(livePromptRowIndex(tail)).toBeNull();
+  });
+
+  test("a roster longer than the skip cap is left alone (reads as no bar)", () => {
+    const rows = Array.from({ length: 13 }, (_, i) => `  ◯ general-purpose  agent${i}   2s · ↓ 1.0k tokens`);
+    const { plain } = livePanes("\x1b[39m❯\xa0", ["  ⏺ main", ...rows], LIVE_ROSTER_BAR);
+    expect(livePromptRowIndex(plain)).toBeNull();
+  });
+
+  test("readPaneMode finds the bar above a roster of four agents", async () => {
+    const rows = Array.from({ length: 4 }, (_, i) => `  ◯ general-purpose  agent${i}   2s · ↓ 1.0k tokens`);
+    const { plain } = livePanes("\x1b[39m❯\xa0", ["  ⏺ main", ...rows], LIVE_ROSTER_BAR);
+    const prev = __forTest.setCaptureModePane(async () => plain);
+    try {
+      expect(await __forTest.readPaneMode({} as never)).toBe("auto");
+    } finally {
+      __forTest.setCaptureModePane(prev);
+    }
+  });
+});
+
+describe("live 2.1.296 captures — comma-joined status-bar items", () => {
+  for (const bar of [
+    "  ⏵⏵ auto mode on · ← 1 agent · 1 shell, 1 monitor · ↓ to manage",
+    "  ⏵⏵ auto mode on · ← 1 agent · 1 shell, 1 monitor · esc to interrupt · ↓ to …",
+    "  ⏵⏵ auto mode on · 2 monitors, 1 shell · ← 1 agent",
+  ]) {
+    test(`working: ${JSON.stringify(bar)}`, () => {
+      expect(paneShowsClaudeWorking(`❯\xa0\n${"─".repeat(80)}\n${bar}`)).toBe(true);
+    });
+  }
+  test("prose that merely mentions shells after a list is not working chrome", () => {
+    expect(paneShowsClaudeWorking("· 3 shell scripts were updated, 2 tests added")).toBe(false);
+  });
+});
