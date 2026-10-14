@@ -704,9 +704,13 @@ export function buildCommand(
     }
     args.push("--model", opts.model);
 
-    if (opts.effort) {
-      args.push("--effort", opts.effort);
-    }
+    // Effort is encoded in the model id suffix (`gemini-3.8-flash-high`,
+    // `gemini-4-argon-low`, …) and every `MODEL_EFFORT_SUPPORT.antigravity`
+    // set is empty, so `opts.effort` is deliberately ignored here — like the
+    // gemini branch, NOT routed through `modelDeclinesEffort`, so a
+    // user-typed or discovered id still launches. Owner decision D6/D7
+    // (docs/plans/add-gemini-4-argon-grill.md); migration 064 cleared the
+    // efforts older rows had saved.
 
     const mode = opts.mode ?? defaultModeFor(harness.kind);
     if (mode === "auto") {

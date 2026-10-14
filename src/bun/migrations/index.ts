@@ -86,6 +86,9 @@ import m059 from "./059_task_pipeline_id_index.sql" with { type: "text" };
 import m060 from "./060_normalize_cursor_sonnet_5_5.sql" with { type: "text" };
 import m061 from "./061_antigravity_harness.sql" with { type: "text" };
 import m062 from "./062_normalize_cursor_haiku_5_5.sql" with { type: "text" };
+import m063 from "./063_normalize_cursor_gemini_4_argon.sql" with { type: "text" };
+import m064 from "./064_antigravity_effort_in_model_id.sql" with { type: "text" };
+import m065 from "./065_retire_gemini_3_7_and_3_5_flash.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -157,4 +160,7 @@ export const migrations: Migration[] = [
   { id: "060_normalize_cursor_sonnet_5_5", sql: m060, aliases: ["057_normalize_cursor_sonnet_5_5"] },
   { id: "061_antigravity_harness", sql: m061 },
   { id: "062_normalize_cursor_haiku_5_5", sql: m062 },
+  { id: "063_normalize_cursor_gemini_4_argon", sql: m063 },
+  { id: "064_antigravity_effort_in_model_id", sql: m064 },
+  { id: "065_retire_gemini_3_7_and_3_5_flash", sql: m065 },
 ];

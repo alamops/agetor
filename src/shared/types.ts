@@ -2223,7 +2223,7 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // (`~/.fx/settings.json` on the reference account). Ids are Vercel AI
   // Gateway ids, passed verbatim. fx is exempt from the "always default to
   // the best available model" rule above: the Gateway bills per token to the
-  // user's own account, and flagship tiers (the nineteen `catalogOnly` rows in
+  // user's own account, and flagship tiers (the twenty `catalogOnly` rows in
   // `AGENT_OPTIONS.fx.models`) stay one click away
   // in the picker as catalog-gated rows — offered only when the signed-in
   // account's catalog actually contains them (see `AgentOption.catalogOnly`).
@@ -2278,6 +2278,8 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   // other four kinds use, since that would silently change every fx run's
   // cost/latency on the owner's rate-limited free-tier Gateway account.
   "fx": "auto",
+  // Unused, kept for symmetry: effort rides in the antigravity model id and
+  // every MODEL_EFFORT_SUPPORT.antigravity set is empty.
   "antigravity": "high",
 };
 
@@ -2608,6 +2610,21 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   // (unlike 3.6), no bare id, no -fast variants, no Max Mode. We map the
   // unsuffixed label to the high tier — agetor's convention, mirroring 3.6;
   // Cursor's own listing calls it "Gemini 3.8 Flash High" (cosmetic).
+  // Verified live via `cursor-agent models` on cursor-agent 2026.10.01
+  // (2026-10-14): gemini-4-argon-{low,medium,high} only — no bare id, no
+  // -fast, no minimal tier, no Max Mode (same shape as 3.8 Flash). The
+  // unsuffixed label maps to the high tier (house convention; Cursor's own
+  // listing says "Gemini 4 Argon High"). Migration 063 normalizes stored
+  // variant ids.
+  "gemini-4-argon": {
+    label: "Gemini 4 Argon",
+    hint: "Google Gemini 4 Argon via Cursor.",
+    effortIds: {
+      high: "gemini-4-argon-high",
+      medium: "gemini-4-argon-medium",
+      low: "gemini-4-argon-low",
+    },
+  },
   "gemini-3.8-flash": {
     label: "Gemini 3.8 Flash",
     hint: "Google Gemini 3.8 Flash via Cursor.",
@@ -2942,12 +2959,11 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // [] for any model key here, which collapses the effort picker in the UI —
   // the same treatment claude-code's haiku-4.5 gets.
   gemini: {
+    "gemini-4-argon": [],
     "gemini-3.1-pro-preview": [],
     "gemini-2.5-pro": [],
     "gemini-3.8-flash": [],
     "gemini-3.8-flash-cyber": [],
-    "gemini-3.7-flash": [],
-    "gemini-3.5-flash": [],
     "gemini-2.5-flash": [],
   },
   // fx ≥0.0.9 exposes reasoning effort per ACP session: `session/new`,
@@ -3045,26 +3061,36 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     // reasoning_options (effort low/medium/high/xhigh/max plus none, and a
     // thinking toggle) plus fx's always-present auto.
     "anthropic/claude-haiku-5.5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    // 2026-10-14: not ACP-probed — rests on the public Gateway catalog entry
+    // (reasoning_options effort low/medium/high, context_window 1,000,000,
+    // released 2026-10-13, providers google + vertex) plus fx's always-present
+    // auto.
+    "google/gemini-4-argon": ["high", "medium", "low", "auto"],
   },
+  // Effort is encoded in the model-id suffix (<model>-<effort>), and `agy
+  // --effort` accepts only low/medium/high anyway, so the builder never emits
+  // `--effort` (owner D6/D7, docs/plans/add-gemini-4-argon.md). Every set is
+  // empty, so the picker collapses and supportedEfforts() returns [] even for
+  // a discovered-only id (an unknown key falls back to the default model's []).
   antigravity: {
-    "gemini-3.8-flash-high": ["max", "xhigh", "high", "medium", "low"],
-    "gemini-3.8-flash-medium": ["max", "xhigh", "high", "medium", "low"],
-    "gemini-3.8-flash-low": ["max", "xhigh", "high", "medium", "low"],
-    "gemini-3.7-flash-high": ["max", "xhigh", "high", "medium", "low"],
-    "gemini-3.7-flash-medium": ["max", "xhigh", "high", "medium", "low"],
-    "gemini-3.7-flash-low": ["max", "xhigh", "high", "medium", "low"],
-    "gemini-3.6-flash-high": ["max", "xhigh", "high", "medium", "low"],
-    "gemini-3.6-flash-medium": ["max", "xhigh", "high", "medium", "low"],
-    "gemini-3.6-flash-low": ["max", "xhigh", "high", "medium", "low"],
-    "gemini-3.1-pro-high": ["max", "xhigh", "high", "medium", "low"],
-    "gemini-3.1-pro-low": ["max", "xhigh", "high", "medium", "low"],
-    "claude-opus-5-5-high": ["max", "xhigh", "high", "medium", "low"],
-    "claude-opus-5-5-medium": ["max", "xhigh", "high", "medium", "low"],
-    "claude-opus-5-5-low": ["max", "xhigh", "high", "medium", "low"],
-    "claude-sonnet-5-5-high": ["max", "xhigh", "high", "medium", "low"],
-    "claude-sonnet-5-5-medium": ["max", "xhigh", "high", "medium", "low"],
-    "claude-sonnet-5-5-low": ["max", "xhigh", "high", "medium", "low"],
-    "gpt-oss-120b-medium": ["max", "xhigh", "high", "medium", "low"],
+    "gemini-4-argon-high": [],
+    "gemini-4-argon-medium": [],
+    "gemini-4-argon-low": [],
+    "gemini-3.8-flash-high": [],
+    "gemini-3.8-flash-medium": [],
+    "gemini-3.8-flash-low": [],
+    "gemini-3.6-flash-high": [],
+    "gemini-3.6-flash-medium": [],
+    "gemini-3.6-flash-low": [],
+    "gemini-3.1-pro-high": [],
+    "gemini-3.1-pro-low": [],
+    "claude-opus-5-5-high": [],
+    "claude-opus-5-5-medium": [],
+    "claude-opus-5-5-low": [],
+    "claude-sonnet-5-5-high": [],
+    "claude-sonnet-5-5-medium": [],
+    "claude-sonnet-5-5-low": [],
+    "gpt-oss-120b-medium": [],
   },
 };
 
@@ -3293,11 +3319,26 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     efforts: EFFORT_OPTIONS,
   },
   gemini: {
-    // Pro tier first, then Flash tier; newest first within each tier.
+    // Frontier row first (Gemini 4), then Pro tier, then Flash tier; newest
+    // first within each tier.
     // gemini-3-pro-preview (the default until 2026-09) was shut down by
     // Google on 2026-03-09 and is retired here; migration 049 rewrites
-    // tasks still pinned to it to its successor, 3.1 Pro preview.
+    // tasks still pinned to it to its successor, 3.1 Pro preview. Google
+    // deprecated 3.7 Flash on 2026-10-08 (auto-routed to 3.8) and 3.5 Flash
+    // (to 3.6); those rows are retired here too, and migration 065 rewrites
+    // tasks still pinned to 3.7/3.5 Flash to 3.8 Flash.
     models: [
+      // GA 2026-10-13 (ai.google.dev model page / changelog). The only
+      // published code — no -preview suffix, no sibling ids. thinking_level
+      // low/medium/high, default medium; 1,048,576-token shared context. Not
+      // on the API free tier or the AI Pro plan (Antigravity: Ultra/Enterprise
+      // only). Gemini CLI 0.64.0 forwards the id verbatim and gives it the
+      // `chat-base` alias config (no thinkingLevel) until upstream PR #29737
+      // lands, so there is deliberately no MODEL_MIN_CLI_VERSION.gemini floor
+      // (owner D2, docs/plans/add-gemini-4-argon-grill.md). Vertex AI / Agent
+      // Platform serve it from the `global` location only — us-central1 404s
+      // — and agetor sets no location.
+      { id: "gemini-4-argon", label: "Gemini 4 Argon", hint: "Newest flagship (GA 2026-10-13) — Google's most capable model for complex coding, agentic, math and science work. Needs Google AI Ultra or a paid Gemini API key (not the API free tier or the AI Pro plan). Runs at Google's default (medium) thinking until Gemini CLI registers the id." },
       { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", hint: "Recommended default — current flagship; Google's successor to the retired 3 Pro preview." },
       { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", hint: "Prior stable flagship." },
       { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Latest and most capable Flash — built for long-horizon coding and agentic work at Flash cost." },
@@ -3310,8 +3351,6 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       // pending a published code; agetor passes it through verbatim, so a
       // grant that names it differently needs only this literal changed.
       { id: "gemini-3.8-flash-cyber", label: "Gemini 3.8 Flash Cyber", hint: "Cybersecurity-tuned 3.8 Flash for vulnerability discovery and patching. Requires Fairwind Program access (invite-only). No public model code yet — this id follows Google's naming convention; if your grant names it differently, create the task with `agetor add --model <code>`." },
-      { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", hint: "Prior Flash generation — strong on coding and agentic work." },
-      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost — earlier Flash generation." },
       { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, earliest Flash generation offered." },
     ],
     modes: [
@@ -3389,6 +3428,12 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // signed-in presence unverified, hence catalogOnly — nineteen catalogOnly
     // rows, 35 curated ids total. Every prior curated id is still present
     // except mistral/devstral-2, still gone.
+    // 2026-10-14: google/gemini-4-argon added from fx 0.0.10's unauthenticated
+    // catalog (`fx models --json`, 254 ids; no -fast twin); signed-in presence
+    // unverified, hence catalogOnly — twenty catalogOnly rows, 36 curated ids
+    // total. This pass also found alibaba/qwen3-coder-plus and
+    // anthropic/claude-3-haiku absent from the unauth view (mistral/devstral-2
+    // still gone) — left as-is, see docs/plans/add-gemini-4-argon.md §9.
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
@@ -3425,18 +3470,20 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "anthropic/claude-sonnet-5.5", label: "Claude Sonnet 5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "openai/gpt-6.1-sol", label: "GPT-6.1 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "anthropic/claude-haiku-5.5", label: "Claude Haiku 5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "google/gemini-4-argon", label: "Gemini 4 Argon", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [
       { id: "yolo", label: "Full access", hint: "Hands-off default — disables fx's permission checks entirely, so no tool call is ever held. What fx 0.0.8 calls --full-access / /permissions full-access (still true on 0.0.10); yolo is fx's surviving alias and stays agetor's stored id." },
       { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
-    // 22 of the 35 curated models accept the effort flag (see
+    // 23 of the 36 curated models accept the effort flag (see
     // MODEL_EFFORT_SUPPORT.fx — 16 live-probed on fx 0.0.10, plus
     // anthropic/claude-opus-5.5, openai/gpt-6-sol and openai/gpt-6-luna from
     // their Gateway reasoning_options, all 2026-09-22, and
     // anthropic/claude-sonnet-5.5 on 2026-09-28 and openai/gpt-6.1-sol on
-    // 2026-09-30, and anthropic/claude-haiku-5.5 on 2026-10-07); the other 13
+    // 2026-09-30, anthropic/claude-haiku-5.5 on 2026-10-07, and
+    // google/gemini-4-argon on 2026-10-14); the other 13
     // report an empty set and the picker collapses for those, same as any
     // other kind's no-effort models. Every id-supported model always
     // includes `auto` (fx's own default) last, per EFFORT_OPTIONS.
@@ -3444,12 +3491,18 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   antigravity: {
     models: [
+      // Gemini 4 Argon (GA 2026-10-13). Ids follow Antigravity's own
+      // <model>-<effort> convention (every known agy id and the cortexkit
+      // registry agree) but are unconfirmed against a live `agy models` on an
+      // Ultra account (owner D3/D4). Ultra / eligible-Enterprise only in
+      // Antigravity; discovery still appends whatever `agy models` really
+      // lists.
+      { id: "gemini-4-argon-high", label: "Gemini 4 Argon (High)", hint: "Gemini 4 Argon with high reasoning effort. Needs Google AI Ultra or an eligible Gemini Enterprise subscription in Antigravity. The id follows Antigravity's naming convention and is unconfirmed — if `agy models` lists it differently, pick that discovered row instead." },
+      { id: "gemini-4-argon-medium", label: "Gemini 4 Argon (Medium)", hint: "Gemini 4 Argon with medium reasoning effort. Needs Google AI Ultra or an eligible Gemini Enterprise subscription in Antigravity. The id follows Antigravity's naming convention and is unconfirmed — if `agy models` lists it differently, pick that discovered row instead." },
+      { id: "gemini-4-argon-low", label: "Gemini 4 Argon (Low)", hint: "Gemini 4 Argon with low reasoning effort. Needs Google AI Ultra or an eligible Gemini Enterprise subscription in Antigravity. The id follows Antigravity's naming convention and is unconfirmed — if `agy models` lists it differently, pick that discovered row instead." },
       { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)", hint: "Latest Gemini 3.8 Flash with high reasoning effort." },
       { id: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash (Medium)", hint: "Gemini 3.8 Flash with medium reasoning effort." },
       { id: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low)", hint: "Fast Gemini 3.8 Flash with low reasoning effort." },
-      { id: "gemini-3.7-flash-high", label: "Gemini 3.7 Flash (High)", hint: "Gemini 3.7 Flash with high reasoning effort." },
-      { id: "gemini-3.7-flash-medium", label: "Gemini 3.7 Flash (Medium)", hint: "Gemini 3.7 Flash with medium reasoning effort." },
-      { id: "gemini-3.7-flash-low", label: "Gemini 3.7 Flash (Low)", hint: "Gemini 3.7 Flash with low reasoning effort." },
       { id: "gemini-3.6-flash-high", label: "Gemini 3.6 Flash (High)", hint: "Gemini 3.6 Flash with high reasoning effort." },
       { id: "gemini-3.6-flash-medium", label: "Gemini 3.6 Flash (Medium)", hint: "Gemini 3.6 Flash with medium reasoning effort." },
       { id: "gemini-3.6-flash-low", label: "Gemini 3.6 Flash (Low)", hint: "Gemini 3.6 Flash with low reasoning effort." },
