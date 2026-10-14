@@ -227,6 +227,11 @@ test.describe("pipelines editor", () => {
     page,
     backend,
   }) => {
+    // The longest flow in this file: ~15 s on an idle machine, 30–32 s with
+    // every core busy (measured 2026-10-13), which overran the default 30 s
+    // budget at whichever step happened to be running — never one stuck
+    // assertion (all 6 runs pass under the same load with a larger budget).
+    test.setTimeout(90_000);
     const alpha = await createProfileRest(backend, `Editor Alpha ${randomUUID()}`);
     createdProfileIds.push(alpha.id);
 

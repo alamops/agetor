@@ -5,6 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ColumnId } from "../shared/types.ts";
 import type { ContinuationHooks, SpawnedAgent } from "./claude-tmux.ts";
+import { CONTINUATION_STATUS_TEXT, type ContinuationTrigger } from "../shared/types.ts";
 
 /*
  * Covers `startContinuationRun` (src/bun/orchestrator.ts, ~line 1365) — the
@@ -46,7 +47,7 @@ const ENV_OVERRIDES: Record<string, string> = {
 };
 const savedEnv: Record<string, string | undefined> = {};
 
-let realFactory: ((taskId: string) => ContinuationHooks | null) | null = null;
+let realFactory: ((taskId: string, trigger?: ContinuationTrigger) => ContinuationHooks | null) | null = null;
 
 beforeAll(async () => {
   for (const [k, v] of Object.entries(ENV_OVERRIDES)) {
@@ -212,6 +213,34 @@ test("happy path: new run row (origin continuation, inherited session, running) 
   expect(
     events.some((e) => e.stream === "status" && e.data === "auto-continued after background task"),
   ).toBe(true);
+});
+
+test("trigger wording: each trigger opens the run with a status line saying what actually happened", async () => {
+  const cases: Array<[ContinuationTrigger, string]> = [
+    ["notification", "auto-continued after background task"],
+    ["user", "turn started from the terminal"],
+    ["assistant", "Claude continued on its own"],
+  ];
+  const { tasks, runs } = await import("./db.ts");
+  for (const [trigger, text] of cases) {
+    expect(CONTINUATION_STATUS_TEXT[trigger]).toBe(text);
+    const taskId = await createTaskWithAgent(`continuation-trigger-${trigger}`, "claude-code");
+    await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}`, column: "review" });
+
+    expect(realFactory!(taskId, trigger)).not.toBeNull();
+
+    const task = tasks.get(taskId);
+    expect(task?.column).toBe("running");
+    const newRun = runs.get(task!.runId!);
+    expect(newRun?.origin).toBe("continuation");
+    const statuses = runs.events(task!.runId!).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(statuses).toContain(text);
+    // Exactly one opening line — never the notification wording on a
+    // terminal- or assistant-triggered turn.
+    for (const [other, otherText] of cases) {
+      if (other !== trigger) expect(statuses).not.toContain(otherText);
+    }
+  }
 });
 
 test("happy path: pulls back from an arbitrary non-running column too (continuations always land in running)", async () => {

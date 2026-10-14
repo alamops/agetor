@@ -99,6 +99,10 @@ export function searchableEventText(stream: RunEventStream, data: string): strin
       // a bubble containing neither. Same CR→LF-then-normalize order the
       // bubble uses; same string back when there is nothing to strip.
       return normalizeDeliveredUserText(data.replace(/\r\n?/g, "\n"));
+    // Claude's compaction summary renders (when expanded) as its own block —
+    // the stored text is Claude's verbatim, so match it as-is.
+    case "compaction_summary":
+      return data;
     case "assistant":
     case "thinking":
     case "stderr":

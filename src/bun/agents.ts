@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";import { cursorModelArg, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness } from "../shared/types.ts";
+import { compactionStatusLine } from "../shared/compaction.ts";
 import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
 import { HANDOFF_TAG } from "../shared/pipeline.ts";
 import { GEMINI_PROMPT_ARGV_MAX_BYTES } from "../shared/prompt-limits.ts";
@@ -481,6 +482,15 @@ export function buildCommand(
   const env: Record<string, string> = harnessEnv(harness);
 
   if (harness.kind === "claude-code") {
+    // Turn off Claude Code's prompt suggestions. Spike (claude 2.1.296): the
+    // var suppresses both the post-turn suggestion AND the startup
+    // `Try "…"` sample, which otherwise render as dim text on the `❯` row of
+    // the tmux pane (the scraper then has to tell that placeholder apart
+    // from a real draft). The env var wins over the user's own
+    // `promptSuggestionEnabled` setting. `??=` keeps a harness whose own env
+    // map sets the var (e.g. to "true") in charge of its own launches.
+    // Both the fresh and the `resumeSessionId` launches pass through here.
+    env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION ??= "false";
     const extra = (process.env.AGETOR_CLAUDE_ARGS ?? "").split(/\s+/).filter(Boolean);
 
     // Interactive launch — no --print. Model, permission-mode, session-id,
@@ -1273,10 +1283,22 @@ function emitFakeFxUsageAndTitle(onChunk: ChunkHandler): void {
 }
 
 /**
+ * When the fake fx storm ({@link emitFakeFxRecoveryStorm}) pauses: 1500 ms,
+ * or `AGETOR_FAKE_FX_RECOVERY_PAUSE_MS` (≥ 900, so all three attempts land
+ * first). The e2e fixture widens it — the live notice exists only between the
+ * first attempt and the pause, and a loaded machine can spend 1.5 s just
+ * delivering the first attempt to an open panel.
+ */
+function fakeFxRecoveryPauseMs(): number {
+  const raw = Number(process.env.AGETOR_FAKE_FX_RECOVERY_PAUSE_MS);
+  return Number.isFinite(raw) && raw >= 900 ? raw : 1500;
+}
+
+/**
  * Emits the fake fx driver's 3-attempt rate-limit storm → terminal `paused`
  * sequence: three `FX_RECOVERY_STATUS_PREFIX` sentinel `status` chunks
  * (attempt 1/3, 2/3 with `delaySeconds: 1`, 3/3, at +5/+400/+800ms), then at
- * +1500ms a terminal `paused` sentinel, its persisted `fxRecoverySummaryLine`
+ * +1500ms (`fakeFxRecoveryPauseMs`) a terminal `paused` sentinel, its persisted `fxRecoverySummaryLine`
  * status line, the plain `fx turn ended: refused (…)` status line, and
  * `resolveDone(1)`. Factored out so a fresh (non-continue) storm launch and a
  * `continueRecovery` launch under {@link FAKE_FX_REPAUSE_PROMPT_MARKER}
@@ -1335,7 +1357,7 @@ function emitFakeFxRecoveryStorm(
     };
     onChunk("status", `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(attempt3)}`);
   });
-  after(1500, () => {
+  after(fakeFxRecoveryPauseMs(), () => {
     const paused: FxRecoveryPayload = {
       state: "paused",
       kind: "terminal_provider_error",
@@ -1369,6 +1391,67 @@ function emitFakeFxRecoveryStorm(
  * `docs/plans/markdown-image-rendering.md` (D10, T3).
  */
 export const FAKE_CLAUDE_MD_IMAGE_PROMPT_MARKER = "__agetor_fake_claude_md_image__";
+
+/**
+ * Test hook for the Claude Code context-compaction rendering work
+ * (`docs/plans/claude-code-placeholder.md`): makes the fake claude driver emit
+ * the sequence the real JSONL mapper produces for a compaction — a `status`
+ * line from the `compact_boundary` event, the `compaction_summary` stream
+ * carrying the (synthetic) summary markdown, the "Compacted while idle…"
+ * notice as a second `status` line, then one short assistant reply and the
+ * usual turn-complete. Same prompt-marker trick as
+ * {@link FAKE_CLAUDE_MD_IMAGE_PROMPT_MARKER} above, for the same reason: the
+ * e2e suite's worker-shared backend fixture can't set a per-test env var, but
+ * a spec can put anything it wants in `task.prompt`. Exported so unit tests
+ * can reference the exact string; `e2e/compaction-summary.spec.ts` can't
+ * `import` from `src/bun/*` and keeps a **literal copy** of it.
+ */
+export const FAKE_CLAUDE_COMPACTION_PROMPT_MARKER = "__agetor_fake_claude_compaction__";
+
+/** First line of the synthetic compaction summary — mirrors the opening line
+ *  of Claude Code's real summary. Exported for tests. */
+export const FAKE_CLAUDE_COMPACTION_SUMMARY_FIRST_LINE =
+  "This session is being continued from a previous conversation that ran out of context.";
+
+/** Notice Claude Code writes ~280 ms after a compaction that happened while
+ *  the session was idle. Exported for tests. */
+export const FAKE_CLAUDE_COMPACTION_NOTICE = "Compacted while idle, before the prompt cache expired";
+
+/** Synthetic multi-paragraph markdown summary (~2 KB) — invented text only. */
+const FAKE_CLAUDE_COMPACTION_SUMMARY = [
+  FAKE_CLAUDE_COMPACTION_SUMMARY_FIRST_LINE,
+  "The summary below covers the earlier part of the conversation.",
+  "",
+  "## Analysis",
+  "",
+  "The user asked for a small command-line tool that renders a table of widgets from a JSON file. The first half of the session was spent agreeing on the file format (an array of objects with `name`, `count` and `tags` keys), the column order, and how long cell values should be truncated. Several approaches to column-width calculation were compared; fixed-width columns were rejected in favour of measuring the longest cell per column, capped at 40 characters.",
+  "",
+  "The renderer was written as a pure function that takes parsed rows and returns an array of lines, so it can be tested without touching the terminal. Edge cases covered so far: an empty array, a row with a missing key, a cell containing a newline, and a value wider than the cap.",
+  "",
+  "## Files and code sections",
+  "",
+  "- `src/render.ts` - the pure `renderTable(rows, opts)` function and its helper `padCell`.",
+  "- `src/cli.ts` - argument parsing (`--file`, `--max-width`, `--no-header`) and the entry point.",
+  "- `src/render.test.ts` - eight unit tests covering the cases listed above.",
+  "",
+  "## Errors and fixes",
+  "",
+  "- Truncation initially counted UTF-16 code units, which split emoji in the middle; it now iterates by code point.",
+  "- The `--max-width` flag was parsed as a string and compared lexically; it is now converted with `Number` and validated.",
+  "",
+  "## Pending tasks",
+  "",
+  "- Add a `--sort <column>` option.",
+  "- Document the JSON format in the README.",
+  "",
+  "## Current work",
+  "",
+  "Immediately before this summary the assistant was wiring the `--sort` option into the argument parser and had just written a failing test for sorting by the `count` column in descending order.",
+  "",
+  "## Next step",
+  "",
+  "Make the failing sort test pass, then run the whole suite and report the result.",
+].join("\n");
 
 /**
  * Test hook for the "anchored first-load window" work
@@ -1987,6 +2070,26 @@ function makeFakeAgent(
         "assistant",
         `Here are the screenshots.\n\n![Absolute shot](${mdImageDir}/shot.png)\n\n![Relative shot](agetor-md-images/shot.png)\n\n![Missing shot](${mdImageDir}/missing.png)\n\n![The report](${mdImageDir}/report.pdf)`,
       );
+    });
+    after(10, () => {
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+  } else if (prompt.includes(FAKE_CLAUDE_COMPACTION_PROMPT_MARKER)) {
+    // Test hook: simulate a context compaction (see
+    // FAKE_CLAUDE_COMPACTION_PROMPT_MARKER's doc comment) so the
+    // `compaction_summary` stream, its two companion status lines and their
+    // ordering can be exercised end to end without a real claude CLI. The
+    // order mirrors the real session JSONL: boundary status, summary, notice
+    // status, then the turn's own assistant reply.
+    //
+    // Only turn 1 (a fresh spawn) runs this scenario — same convention as
+    // every other canned scenario in this driver.
+    after(5, () => {
+      onChunk("status", compactionStatusLine({ preTokens: 450162, postTokens: 8613, trigger: "auto" }));
+      onChunk("compaction_summary", FAKE_CLAUDE_COMPACTION_SUMMARY);
+      onChunk("status", FAKE_CLAUDE_COMPACTION_NOTICE);
+      onChunk("assistant", "Picking up where we left off.");
     });
     after(10, () => {
       onChunk("status", "turn complete");

@@ -589,6 +589,52 @@ describe("dismissAskModalForMessage — over a scripted fake tmux", () => {
     expect(fake.sendKeys().some((k) => k.length === 2)).toBe(false);
   });
 
+  // The fake tmux answers `capture-pane -e` with the plain pane, so the styled
+  // path is driven through the `setCaptureStyledTail` seam instead. The plain and
+  // styled twins share their row text so `isPlaceholderRow` sees the same row it
+  // would in production (the SGR-stripped styled row must equal the plain row).
+  // `tmux()` trims its stdout, so the plain tail has no surrounding blank lines;
+  // the styled twin is trimmed the same way to keep raw row indices aligned.
+  const composerPane = (row: string) => `\n${RULE}\n${row}\n${RULE}\n${IDLE_STATUS_BAR}\n`;
+  const PLACEHOLDER_PLAIN = composerPane('\u276F\u00A0Try "fix lint errors"');
+  const PLACEHOLDER_STYLED = composerPane('\x1b[39m\u276F\u00A0\x1b[2mTry "fix lint errors"\x1b[0m').trim();
+
+  test("a dim placeholder row after the modal closes reads as an EMPTY composer → no clear keys, true", async () => {
+    // Plain capture alone reads `❯ Try "…"` as a typed draft and would send the
+    // double Escape (which on an empty box opens claude's rewind picker).
+    const fake = makeScriptedTmux([{ minEsc: 0, pane: MODAL_PANE }, { minEsc: 1, pane: PLACEHOLDER_PLAIN }]);
+    expect(__forTest.paneShowsComposerText(PLACEHOLDER_PLAIN)).toBe(true); // plain-only reading: looks like text
+    let styledReads = 0;
+    const prevStyled = __forTest.setCaptureStyledTail(async () => {
+      styledReads++;
+      return PLACEHOLDER_STYLED;
+    });
+    try {
+      const res = await withScripted(fake, (taskId) => dismissAskModalForMessage(taskId));
+      expect(res).toBe(true);
+      expect(styledReads).toBeGreaterThan(0);
+      expect(fake.sendKeys()).toEqual([["Escape"]]);
+    } finally {
+      __forTest.setCaptureStyledTail(prevStyled);
+    }
+  });
+
+  test("a real typed draft (styled twin carries no dim) still gets COMPOSER_CLEAR_KEYS", async () => {
+    const fake = makeScriptedTmux([
+      { minEsc: 0, pane: MODAL_PANE },
+      { minEsc: 1, pane: composerPane("\u276F\u00A0purple") },
+      { minEsc: 3, pane: CLEAN_REPL },
+    ]);
+    const prevStyled = __forTest.setCaptureStyledTail(async () => composerPane("\x1b[39m\u276F\u00A0purple\x1b[0m").trim());
+    try {
+      const res = await withScripted(fake, (taskId) => dismissAskModalForMessage(taskId));
+      expect(res).toBe(true);
+      expect(fake.sendKeys()).toEqual([["Escape"], [...__forTest.COMPOSER_CLEAR_KEYS]]);
+    } finally {
+      __forTest.setCaptureStyledTail(prevStyled);
+    }
+  });
+
   test("modal never goes away → false after exactly ASK_DISMISS_MAX_ESCAPES Escapes", async () => {
     const fake = makeScriptedTmux([{ minEsc: 0, pane: MODAL_PANE }]);
     const res = await withScripted(fake, (taskId) => dismissAskModalForMessage(taskId));

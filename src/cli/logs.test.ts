@@ -583,3 +583,28 @@ test("logs --rebuild: an ordinary (non-SendUserFile) tool_use/tool_result pair i
   expect(outputs[0]).toBe("▸ Bash");
   expect(outputs[1]).toBe("  ↳ result");
 });
+
+// --- compaction (docs/plans/claude-code-placeholder.md, T7/TT5) -------------
+
+test("logs --rebuild: a compaction_summary event prints ONE summary› digest line (first line + size), never the body; its status lines print as • …", async () => {
+  outputs.length = 0;
+  const body = [
+    "This session is being continued from a previous conversation that ran out of context.",
+    "",
+    "## Secret middle line that must not print",
+    "x".repeat(2000),
+  ].join("\n");
+  const events: RunEvent[] = [
+    { runId: "run1", taskId: "t1", stream: "status", data: "context compacted · 450k → 8.6k tokens", ts: 1 },
+    { runId: "run1", taskId: "t1", stream: "compaction_summary", data: body, ts: 2 },
+    { runId: "run1", taskId: "t1", stream: "status", data: "Compacted while idle, before the prompt cache expired", ts: 3 },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toEqual([
+    "• context compacted · 450k → 8.6k tokens",
+    "summary› This session is being continued from a previous conversation that ran out of context. (2.1 KB)",
+    "• Compacted while idle, before the prompt cache expired",
+  ]);
+  expect(outputs.join("\n")).not.toContain("Secret middle line");
+});

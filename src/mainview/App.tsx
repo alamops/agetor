@@ -88,6 +88,13 @@ function stepParentIdOf(ev: GlobalEvent): string | null {
   return ev.pipelineParentId ? ev.pipelineParentId : null;
 }
 
+/** The parent title the core stamped next to `pipelineParentId` — what a
+ *  retargeted toast falls back to before the polled list has the parent. */
+function stepParentTitleOf(ev: GlobalEvent): string | null {
+  if (!("pipelineParentTitle" in ev)) return null;
+  return ev.pipelineParentTitle ? ev.pipelineParentTitle : null;
+}
+
 /** Subtitle for a step task's toast once it's retargeted at its pipeline
  *  parent (M-A3): the step's own name. A step row's title is
  *  `<pipeline name> · <step name>` (`pipeline-runner.ts`), so the
@@ -1305,7 +1312,7 @@ function AppInner() {
             const parent = tasksRef.current.find((t) => t.id === stepParentId);
             return {
               taskId: stepParentId,
-              title: parent?.title || `Pipeline ${stepParentId.slice(0, 7)}`,
+              title: parent?.title || stepParentTitleOf(ev) || `Pipeline ${stepParentId.slice(0, 7)}`,
               subtitle: stepSubtitle(task, parent),
               isSelected: viewingTask(stepParentId),
               isFocused,
