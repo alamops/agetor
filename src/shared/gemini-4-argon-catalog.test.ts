@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { mergeModelOptions, type DiscoveredModel } from "./model-options.ts";
-import { AGENT_OPTIONS, CATALOG_SCOPED_KINDS, DEFAULT_MODEL } from "./types.ts";
+import { AGENT_OPTIONS, CATALOG_SCOPED_KINDS, DEFAULT_MODEL, cursorModelIdCoveredByCatalog } from "./types.ts";
 
 /**
  * Gemini 4 Argon (docs/plans/add-gemini-4-argon.md) through the real picker
@@ -32,6 +32,9 @@ test("fx picker shows Gemini 4 Argon when the account's discovered catalog lists
   expect(argon?.unlisted).toBeUndefined();
 });
 
+// This case pins the scoped intersection (any curated id the catalog lacks is
+// dropped), not catalogOnly; the empty-discovery and logged-out cases below
+// are the ones that depend on catalogOnly.
 test("fx picker hides Gemini 4 Argon when the account's catalog lacks it", () => {
   const rows = mergeModelOptions({
     curated: AGENT_OPTIONS.fx.models,
@@ -141,7 +144,18 @@ test("gemini: a task still pinned to retired gemini-3.5-flash shows it as an unl
 // --- cursor: one Argon row, variants are not picker rows ----------------------
 
 test("cursor picker offers one bare Gemini 4 Argon row and no suffixed variant rows", () => {
-  const rows = mergeModelOptions({ curated: AGENT_OPTIONS.cursor.models, discovered: [], scoped: false, selected: null });
+  // `cursor-agent models` lists the suffixed variants; every cursor picker
+  // (NewTaskForm, TaskLaunchPickers, RunPanel, `agetor add`) drops the ids the
+  // curated specs already cover from the discovered list before merging.
+  const discovered: DiscoveredModel[] = [
+    { id: "gemini-4-argon" },
+    { id: "gemini-4-argon-high" },
+    { id: "gemini-4-argon-medium" },
+    { id: "gemini-4-argon-low" },
+    { id: "gemini-4-argon-low-fast" },
+  ].filter((m) => !cursorModelIdCoveredByCatalog(m.id));
+  expect(discovered).toEqual([]);
+  const rows = mergeModelOptions({ curated: AGENT_OPTIONS.cursor.models, discovered, scoped: false, selected: null });
   const argonRows = ids(rows).filter((id) => id.startsWith("gemini-4-argon"));
   expect(argonRows).toEqual(["gemini-4-argon"]);
 });

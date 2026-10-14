@@ -1353,7 +1353,12 @@ test("fx unknown mode id passes through verbatim to FX_PERMISSION_MODE", () => {
 
 test("fx buildCommand still emits no argv/env for effort (fx ≥0.0.9: effort rides over ACP via fx-acp.ts's applyFxEffort/session-set_config_option, not argv/env — see agents.ts's buildCommand fx branch comment)", () => {
   const { cmd, env } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, effort: "max" });
-  expect(cmd.join(" ")).not.toMatch(/effort/i);
+  // The --log-file value is a path under the process-wide data dir, whose
+  // mkdtemp name may itself contain "effort" (orchestrator-discovered-efforts
+  // .test.ts), so it is left out of the match.
+  const argv = cmd.filter((_, i) => cmd[i - 1] !== "--log-file");
+  expect(argv).toContain("--log-file");
+  expect(argv.join(" ")).not.toMatch(/effort/i);
   expect(env?.CLAUDE_CODE_EFFORT_LEVEL).toBeUndefined();
   expect(Object.keys(env ?? {})).not.toContain("FX_EFFORT");
 });

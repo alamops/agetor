@@ -20,9 +20,6 @@ import { rmTestDataDir } from "./test-data-dir.ts";
  * `harness.enabled`, so the built-in rows need no setup.
  */
 
-// Keep "effort" out of this prefix: agents.test.ts asserts the fx argv (which
-// carries `--log-file <dataDir>/fx-logs/…`) never mentions effort, and the
-// data dir is process-wide when files share one `bun test` run.
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-argon-defaults-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
 
