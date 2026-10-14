@@ -5,7 +5,7 @@
 # Agetor
 
 **The harness orchestrator.**<br />
-A local-first kanban for running Claude Code, Codex, Cursor, Gemini CLI and fx in parallel, with each task in its own git worktree.
+A local-first kanban for running Claude Code, Codex, Cursor, Gemini CLI, fx and Antigravity in parallel, with each task in its own git worktree.
 
 [![Latest release](https://img.shields.io/github/v/release/alamops/agetor?style=flat-square&label=release&color=4c1)](https://github.com/alamops/agetor/releases/latest)
 [![Platform](https://img.shields.io/badge/macOS-Apple%20Silicon-111?style=flat-square&logo=apple&logoColor=white)](#install)
@@ -31,7 +31,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 
 - **Local-first.** Everything runs on your machine. There's no Agetor account, no cloud relay and no telemetry.
 - **Non-invasive.** Agetor installs no hooks and no MCP server, and it doesn't edit your `CLAUDE.md`. It drives the real CLI the way you would.
-- **Restart-safe.** Claude Code, Codex, Cursor and Gemini CLI run inside `tmux`, so quitting Agetor doesn't stop them, and the next launch reconnects to them. fx is the exception: it runs as a child process of Agetor and stops when Agetor quits, so an fx turn in progress doesn't survive a restart.
+- **Restart-safe.** Claude Code, Codex, Cursor, Gemini CLI and Antigravity run inside `tmux`, so quitting Agetor doesn't stop them, and the next launch reconnects to them. fx is the exception: it runs as a child process of Agetor and stops when Agetor quits, so an fx turn in progress doesn't survive a restart.
 
 ---
 
@@ -41,10 +41,10 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 
 - **Kanban workflow.** Tasks move through *Backlog → Ready → Running → Blocked → Review → Done* as their runs start, stall, fail or finish. You can drag a card to override the flow at any time.
 - **A git worktree for every task.** Each task runs on its own branch (`agetor/<id>-<slug>`) under `~/.agetor/worktrees/`, so two agents can work on the same repo at once without colliding. The base commit is pinned when the task is created, so the task keeps the same starting point even after the source branch moves on.
-- **Five harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI and fx side by side. To use a second account for any of them, add a harness with its own isolated `$HOME`.
+- **Six harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI, fx and Antigravity side by side. To use a second account for any of them, add a harness with its own isolated `$HOME`.
 - **Agents (reusable profiles).** Save a harness, model, effort, mode, instructions and skills as a named **Agent**, then launch tasks from it in one click.
 - **Pipelines.** Chain Agents into a reusable graph on a canvas, such as *Plan → Implement → Review*. Steps hand context to each other, branch, fan out and loop, all from a single board card. See [Pipelines](#pipelines).
-- **Model discovery.** Model and effort pickers start from a curated list. For Codex, Cursor and fx, they also include the models your account actually offers, as reported by the CLI. If a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
+- **Model discovery.** Model and effort pickers start from a curated list. For Codex, Cursor, fx and Antigravity, they also include the models your account actually offers, as reported by the CLI. If a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
 
 ### Converse
 
@@ -79,8 +79,9 @@ A **harness** is the agent CLI Agetor drives. Agetor launches the real binary on
 | **Cursor** <sup>experimental</sup> | `cursor-agent` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Grok 4.7 | `curl https://cursor.com/install -fsS \| bash` |
 | **Gemini CLI** <sup>experimental</sup> | `gemini` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Gemini 3.1 Pro (preview) | `npm i -g @google/gemini-cli` |
 | **fx** (Vercel Labs) <sup>experimental</sup> | `fx` | [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio), through Vercel AI Gateway | GLM 5.3 Flash | `curl -fsSL https://fx.sh/setup.sh \| bash` |
+| **Antigravity** <sup>experimental</sup> | `agy` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by conversation id | Gemini 3.8 Flash (High) | `brew install --cask antigravity-cli` |
 
-Claude Code is enabled out of the box. The experimental harnesses are opt-in: turn them on in **Settings → Harnesses**. Settings and the onboarding checklist show whether each CLI is installed and logged in, and give an install hint if it isn't.
+Claude Code and Antigravity are enabled out of the box. The other experimental harnesses are opt-in: turn them on in **Settings → Harnesses**. Settings and the onboarding checklist show whether each CLI is installed and logged in, and give an install hint if it isn't.
 
 Each harness offers the permission modes its CLI actually supports. They range from hands-off modes (*Auto*, *Full access*) to *Ask*, *Plan only* and *Read-only*.
 
@@ -242,7 +243,7 @@ flowchart LR
     CLI["agetor CLI / TUI"] -- "HTTP + SSE" --> Core
     Core["Bun core<br/>orchestrator · SQLite · git"]
     Core -- "tmux (interactive)" --> Claude["claude"]
-    Core -- "tmux (one-shot per turn)" --> OneShot["codex · cursor-agent · gemini"]
+    Core -- "tmux (one-shot per turn)" --> OneShot["codex · cursor-agent · gemini · agy"]
     Core -- "ACP over stdio" --> FX["fx"]
     Claude --> WT[("git worktree<br/>per task")]
     OneShot --> WT
@@ -272,7 +273,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 ├── attachments/             # files and images attached to prompts
 ├── issue-threads/           # issue snapshots for tasks started from an issue
 ├── pipeline-runs/           # handoffs recorded by each pipeline run
-├── {codex,cursor,gemini,fx}-logs/   # per-run structured agent output
+├── {codex,cursor,gemini,fx,antigravity}-logs/   # per-run structured agent output
 └── daemon.log               # headless CLI daemon log
 ```
 
@@ -291,6 +292,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 | `AGETOR_CURSOR_BIN` / `AGETOR_CURSOR_ARGS` | Same, for Cursor. | `cursor-agent` on `PATH` |
 | `AGETOR_GEMINI_BIN` / `AGETOR_GEMINI_ARGS` | Same, for Gemini CLI. | `gemini` on `PATH` |
 | `AGETOR_FX_BIN` / `AGETOR_FX_ARGS` | Same, for fx. | `fx` on `PATH` |
+| `AGETOR_ANTIGRAVITY_BIN` / `AGETOR_ANTIGRAVITY_ARGS` | Same, for Antigravity. | `agy` on `PATH` |
 | `AGETOR_TMUX_BIN` | Override the `tmux` binary. | `tmux` on `PATH` |
 | `AGETOR_SKIP_CLI_VERSION_FLOOR` | Set to `1` to skip the per-model minimum CLI version check. | unset |
 | `AGETOR_DAEMON_IDLE_MS` | Shut the CLI daemon down after this long with no run and no client (`0` disables). | `300000` |
@@ -380,7 +382,7 @@ The orchestrator, UI and CLI pick up the new kind automatically.
 ## Roadmap
 
 - Linux and Windows builds. The targets are configured in `electrobun.config.ts` but not yet built or tested.
-- Graduating Codex, Cursor, Gemini CLI and fx from experimental to stable.
+- Graduating Codex, Cursor, Gemini CLI, fx and Antigravity from experimental to stable.
 - More harnesses as new agent CLIs mature.
 
 Have an idea? [Open an issue](https://github.com/alamops/agetor/issues).
@@ -390,7 +392,7 @@ Have an idea? [Open an issue](https://github.com/alamops/agetor/issues).
 ## Acknowledgements
 
 - [Electrobun](https://github.com/blackboardsh/electrobun) and [Bun](https://bun.sh): the runtime Agetor is built on.
-- [Claude Code](https://github.com/anthropics/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor CLI](https://cursor.com/cli), [Gemini CLI](https://github.com/google-gemini/gemini-cli) and [fx](https://fx.sh): the agents Agetor orchestrates.
+- [Claude Code](https://github.com/anthropics/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor CLI](https://cursor.com/cli), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [fx](https://fx.sh) and [Antigravity CLI](https://antigravity.google): the agents Agetor orchestrates.
 - [tmux](https://github.com/tmux/tmux): what keeps agent sessions alive across restarts.
 - [React](https://react.dev), [React Flow](https://reactflow.dev), [dagre](https://github.com/dagrejs/dagre), [Motion](https://motion.dev), [dnd-kit](https://dndkit.com), [shadcn/ui](https://ui.shadcn.com), [Tailwind CSS](https://tailwindcss.com), [Lucide](https://lucide.dev), [Sonner](https://sonner.emilkowal.ski), [xterm.js](https://xtermjs.org), [Ink](https://github.com/vadimdemedes/ink) and [Clack](https://github.com/bombshell-dev/clack): the UI and TUI stack.
 

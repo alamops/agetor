@@ -51,11 +51,13 @@ beforeEach(() => {
   process.env.AGETOR_CURSOR_BIN = "cursor-agent";
   process.env.AGETOR_GEMINI_BIN = "gemini";
   process.env.AGETOR_FX_BIN = "fx";
+  process.env.AGETOR_ANTIGRAVITY_BIN = "agy";
   delete process.env.AGETOR_CLAUDE_ARGS;
   delete process.env.AGETOR_CODEX_ARGS;
   delete process.env.AGETOR_CURSOR_ARGS;
   delete process.env.AGETOR_GEMINI_ARGS;
   delete process.env.AGETOR_FX_ARGS;
+  delete process.env.AGETOR_ANTIGRAVITY_ARGS;
   delete process.env.AGETOR_FX_DRIVER;
 });
 
@@ -914,6 +916,40 @@ test("cursor Gemini 3.7 Flash + low effort composes gemini-3.7-flash-low", () =>
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.7-flash-low");
 });
 
+test("cursor Gemini 4 Argon + medium effort composes gemini-4-argon-medium", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gemini-4-argon",
+    effort: "medium",
+  });
+  expect(cmd).toEqual([
+    "cursor-agent",
+    "-p", "--output-format", "stream-json",
+    "--model", "gemini-4-argon-medium",
+    "--force", "--sandbox", "disabled",
+  ]);
+});
+
+test("cursor Gemini 4 Argon with null effort falls back to the high variant", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gemini-4-argon",
+    effort: null,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-4-argon-high");
+});
+
+test("cursor Gemini 4 Argon ignores fast and maxMode (no fast variant, no Max Mode)", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gemini-4-argon",
+    effort: "high",
+    fast: true,
+    maxMode: true,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-4-argon-high");
+});
+
 test("cursor Gemini 3.8 Flash ignores fast and maxMode (no fast variant, no Max Mode)", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
@@ -1035,11 +1071,11 @@ test("gemini with defaults emits -m + stream-json + --yolo + --skip-trust, promp
   ]);
 });
 
-test("gemini-3.7-flash model id is emitted verbatim via -m", () => {
-  const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, model: "gemini-3.7-flash" });
+test("gemini-4-argon model id is emitted verbatim via -m", () => {
+  const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, model: "gemini-4-argon" });
   expect(cmd).toEqual([
     "gemini",
-    "-m", "gemini-3.7-flash",
+    "-m", "gemini-4-argon",
     "--output-format", "stream-json",
     "--yolo",
     "--skip-trust",
@@ -1069,6 +1105,105 @@ test("gemini-3.8-flash-cyber (Fairwind-gated) model id is emitted verbatim via -
     "--skip-trust",
     "-p", "hi",
   ]);
+});
+
+// Antigravity (`agy`): effort lives in the model id suffix, so the builder must
+// never emit `--effort` whatever `opts.effort` carries (owner decision D6/D7,
+// docs/plans/add-gemini-4-argon.md). The prompt rides as the shell wrapper's
+// `$(cat <promptfile>)` after a trailing `-p`.
+const antigravityDefaults = { mode: "auto", model: "gemini-4-argon-high", effort: "high" } as const;
+const ANTIGRAVITY_AUTO_ARGV = [
+  "agy",
+  "--output-format", "stream-json",
+  "--model", "gemini-4-argon-high",
+  "--dangerously-skip-permissions",
+  "-p",
+];
+
+test("antigravity auto mode emits exact argv and never --effort (effort high)", () => {
+  const { cmd } = buildCommand(builtin("antigravity"), "hi", { ...antigravityDefaults });
+  expect(cmd).toEqual(ANTIGRAVITY_AUTO_ARGV);
+  expect(cmd).not.toContain("--effort");
+});
+
+test("antigravity ignores effort max: same argv, no --effort", () => {
+  const { cmd } = buildCommand(builtin("antigravity"), "hi", { ...antigravityDefaults, effort: "max" });
+  expect(cmd).toEqual(ANTIGRAVITY_AUTO_ARGV);
+  expect(cmd).not.toContain("--effort");
+});
+
+test("antigravity ignores null effort: same argv, no --effort", () => {
+  const { cmd } = buildCommand(builtin("antigravity"), "hi", { ...antigravityDefaults, effort: null });
+  expect(cmd).toEqual(ANTIGRAVITY_AUTO_ARGV);
+  expect(cmd).not.toContain("--effort");
+});
+
+test("antigravity plan mode uses --mode plan instead of the skip-permissions flag", () => {
+  const { cmd } = buildCommand(builtin("antigravity"), "hi", { ...antigravityDefaults, mode: "plan" });
+  expect(cmd).not.toContain("--dangerously-skip-permissions");
+  expect(cmd).toEqual([
+    "agy",
+    "--output-format", "stream-json",
+    "--model", "gemini-4-argon-high",
+    "--mode", "plan",
+    "-p",
+  ]);
+});
+
+test("antigravity ask mode maps to --mode accept-edits", () => {
+  const { cmd } = buildCommand(builtin("antigravity"), "hi", { ...antigravityDefaults, mode: "ask" });
+  expect(cmd).not.toContain("--dangerously-skip-permissions");
+  expect(cmd).toEqual([
+    "agy",
+    "--output-format", "stream-json",
+    "--model", "gemini-4-argon-high",
+    "--mode", "accept-edits",
+    "-p",
+  ]);
+});
+
+test("antigravity resumeSessionId adds --conversation before -p", () => {
+  const { cmd } = buildCommand(builtin("antigravity"), "hi", {
+    ...antigravityDefaults,
+    resumeSessionId: "conv-1",
+  });
+  expect(cmd).toEqual([
+    "agy",
+    "--output-format", "stream-json",
+    "--model", "gemini-4-argon-high",
+    "--dangerously-skip-permissions",
+    "--conversation", "conv-1",
+    "-p",
+  ]);
+  expect(cmd.indexOf("--conversation")).toBeLessThan(cmd.indexOf("-p"));
+});
+
+test("AGETOR_ANTIGRAVITY_ARGS is spliced before the trailing -p", () => {
+  process.env.AGETOR_ANTIGRAVITY_ARGS = "--foo bar";
+  const { cmd } = buildCommand(builtin("antigravity"), "hi", { ...antigravityDefaults });
+  expect(cmd).toEqual([
+    "agy",
+    "--output-format", "stream-json",
+    "--model", "gemini-4-argon-high",
+    "--dangerously-skip-permissions",
+    "--foo", "bar",
+    "-p",
+  ]);
+});
+
+test("antigravity without a model throws", () => {
+  expect(() =>
+    buildCommand(builtin("antigravity"), "hi", { mode: "auto", model: null, effort: null }),
+  ).toThrow("model is required for antigravity");
+});
+
+test("antigravity gemini-3.8-flash-high model id is emitted verbatim via --model (control)", () => {
+  const { cmd } = buildCommand(builtin("antigravity"), "hi", {
+    ...antigravityDefaults,
+    model: "gemini-3.8-flash-high",
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.8-flash-high");
+  expect(cmd).not.toContain("--effort");
 });
 
 test("gemini 'ask' mode uses --approval-mode plan instead of --yolo", () => {
@@ -1220,7 +1355,12 @@ test("fx unknown mode id passes through verbatim to FX_PERMISSION_MODE", () => {
 
 test("fx buildCommand still emits no argv/env for effort (fx ≥0.0.9: effort rides over ACP via fx-acp.ts's applyFxEffort/session-set_config_option, not argv/env — see agents.ts's buildCommand fx branch comment)", () => {
   const { cmd, env } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, effort: "max" });
-  expect(cmd.join(" ")).not.toMatch(/effort/i);
+  // The --log-file value is a path under the process-wide data dir, whose
+  // mkdtemp name may itself contain "effort" (orchestrator-discovered-efforts
+  // .test.ts), so it is left out of the match.
+  const argv = cmd.filter((_, i) => cmd[i - 1] !== "--log-file");
+  expect(argv).toContain("--log-file");
+  expect(argv.join(" ")).not.toMatch(/effort/i);
   expect(env?.CLAUDE_CODE_EFFORT_LEVEL).toBeUndefined();
   expect(Object.keys(env ?? {})).not.toContain("FX_EFFORT");
 });

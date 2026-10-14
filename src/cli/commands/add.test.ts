@@ -602,7 +602,15 @@ test("chooseAddPath: --json always goes non-interactive, even in a TTY", () => {
 // pre-selected default via mergeModelOptions' unlisted-row rule.
 
 test("resolveInitialModel: keeps a stored id that is still a curated row", () => {
-  expect(resolveInitialModel("gemini", "gemini-3.7-flash", [])).toBe("gemini-3.7-flash");
+  expect(resolveInitialModel("gemini", "gemini-4-argon", [])).toBe("gemini-4-argon");
+  expect(resolveInitialModel("gemini", "gemini-3.8-flash", [])).toBe("gemini-3.8-flash");
+});
+
+test("resolveInitialModel: a pruned gemini Flash id falls back to the default", () => {
+  // gemini-3.7-flash / gemini-3.5-flash were pruned from the Gemini picker
+  // (migration 066 rewrites the pref on disk too), so a stale one falls through.
+  expect(resolveInitialModel("gemini", "gemini-3.7-flash", [])).toBe(DEFAULT_MODEL.gemini);
+  expect(resolveInitialModel("gemini", "gemini-3.5-flash", [])).toBe(DEFAULT_MODEL.gemini);
 });
 
 test("resolveInitialModel: falls back to DEFAULT_MODEL when the stored id was retired from the catalog", () => {
@@ -628,6 +636,9 @@ test("resolveInitialModel: a suffixed cursor variant id is not a curated row, so
 
 test("resolveInitialModel: but the base cursor id is kept", () => {
   expect(resolveInitialModel("cursor", "gemini-3.8-flash", [])).toBe("gemini-3.8-flash");
+  // A covered variant of Argon is not a picker row; the bare id is.
+  expect(resolveInitialModel("cursor", "gemini-4-argon-high", [])).toBe(DEFAULT_MODEL.cursor);
+  expect(resolveInitialModel("cursor", "gemini-4-argon", [])).toBe("gemini-4-argon");
 });
 
 test("resolveInitialModel: a logged-out harness's discovered catalog is not consulted (mirrors mergeModelOptions rule 7) — discovered-only pref falls back, curated pref survives", () => {

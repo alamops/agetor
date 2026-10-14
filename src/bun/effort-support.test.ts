@@ -394,8 +394,8 @@ describe("retainableEfforts", () => {
 
 // --- gemini: no per-invocation effort flag -------------------------------------
 
-test("gemini gemini-3.7-flash exposes no effort options (no effort flag on the CLI)", () => {
-  const ids = supportedEfforts("gemini", "gemini-3.7-flash").map((o) => o.id);
+test("gemini gemini-4-argon exposes no effort options (no effort flag on the CLI)", () => {
+  const ids = supportedEfforts("gemini", "gemini-4-argon").map((o) => o.id);
   expect(ids).toEqual([]);
 });
 
@@ -489,6 +489,39 @@ test("cursor Gemini 3.8 Flash and 3.7 Flash expose exactly High/Medium/Low — n
   const ids = AGENT_OPTIONS.cursor.models.map((m) => m.id);
   expect(ids.indexOf("gemini-3.8-flash")).toBeLessThan(ids.indexOf("gemini-3.7-flash"));
   expect(ids.indexOf("gemini-3.7-flash")).toBeLessThan(ids.indexOf("gemini-3.6-flash"));
+});
+
+test("cursor Gemini 4 Argon exposes exactly High/Medium/Low and composes <base>-<effort> (no fast, no Max Mode), listed above 3.8 Flash", () => {
+  expect(supportedEfforts("cursor", "gemini-4-argon").map((o) => o.id)).toEqual(["high", "medium", "low"]);
+  expect(cursorModelSupportsMaxMode("gemini-4-argon")).toBe(false);
+  expect(cursorModelSupportsFast("gemini-4-argon", "high")).toBe(false);
+  expect(cursorModelArg("gemini-4-argon", "medium", false)).toBe("gemini-4-argon-medium");
+  // No effort, fast and Max Mode requested: both are ignored, default tier.
+  expect(cursorModelArg("gemini-4-argon", null, true, true)).toBe("gemini-4-argon-high");
+  expect(cursorModelIdCoveredByCatalog("gemini-4-argon-low")).toBe(true);
+  expect(cursorModelIdCoveredByCatalog("gemini-4-argon-low-fast")).toBe(true);
+  const ids = AGENT_OPTIONS.cursor.models.map((m) => m.id);
+  expect(ids.indexOf("gemini-4-argon")).toBeGreaterThanOrEqual(0);
+  expect(ids.indexOf("gemini-4-argon")).toBeLessThan(ids.indexOf("gemini-3.8-flash"));
+  expect(ids.indexOf("gemini-3.8-flash")).toBeLessThan(ids.indexOf("gemini-3.7-flash"));
+  expect(ids.indexOf("gemini-3.7-flash")).toBeLessThan(ids.indexOf("gemini-3.6-flash"));
+});
+
+// --- antigravity: effort rides in the model id, no --effort flag ----------------
+
+test("antigravity exposes no effort options for any curated model (effort is the id suffix)", () => {
+  for (const m of AGENT_OPTIONS.antigravity.models) {
+    expect(supportedEfforts("antigravity", m.id)).toEqual([]);
+  }
+});
+
+test("antigravity discovered-only / unknown ids and null fall back to the default model's empty set", () => {
+  expect(supportedEfforts("antigravity", "some-discovered-id")).toEqual([]);
+  expect(supportedEfforts("antigravity", null)).toEqual([]);
+});
+
+test("DEFAULT_EFFORT.antigravity stays a valid EFFORT_OPTIONS id (symmetry pin; unused at runtime)", () => {
+  expect(EFFORT_OPTIONS.map((o) => o.id)).toContain(DEFAULT_EFFORT.antigravity);
 });
 
 test("cursor unknown model id reports zero efforts (effort rides in the id, so a pick would be inert)", () => {

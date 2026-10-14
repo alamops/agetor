@@ -87,6 +87,13 @@ import m060 from "./060_normalize_cursor_sonnet_5_5.sql" with { type: "text" };
 import m061 from "./061_antigravity_harness.sql" with { type: "text" };
 import m062 from "./062_normalize_cursor_haiku_5_5.sql" with { type: "text" };
 import m063 from "./063_task_checkout_branch.sql" with { type: "text" };
+// The Gemini 4 Argon migrations were written on their branch as 063–065 while
+// `main` took 063 for the task checkout branch — renumbered to 064–066 on
+// merge, original ids kept as aliases (same renumber-with-alias pattern as
+// 054/057/058/060).
+import m064 from "./064_normalize_cursor_gemini_4_argon.sql" with { type: "text" };
+import m065 from "./065_antigravity_effort_in_model_id.sql" with { type: "text" };
+import m066 from "./066_retire_gemini_3_7_and_3_5_flash.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -159,4 +166,7 @@ export const migrations: Migration[] = [
   { id: "061_antigravity_harness", sql: m061 },
   { id: "062_normalize_cursor_haiku_5_5", sql: m062 },
   { id: "063_task_checkout_branch", sql: m063 },
+  { id: "064_normalize_cursor_gemini_4_argon", sql: m064, aliases: ["063_normalize_cursor_gemini_4_argon"] },
+  { id: "065_antigravity_effort_in_model_id", sql: m065, aliases: ["064_antigravity_effort_in_model_id"] },
+  { id: "066_retire_gemini_3_7_and_3_5_flash", sql: m066, aliases: ["065_retire_gemini_3_7_and_3_5_flash"] },
 ];
