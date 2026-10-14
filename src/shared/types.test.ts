@@ -13,6 +13,7 @@ import {
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   MODEL_EFFORT_SUPPORT,
+  MODEL_MIN_CLI_VERSION,
   PERMISSION_MODE_STATUS_PREFIX,
   defaultModeFor,
   isInternalStatusSentinel,
@@ -201,6 +202,10 @@ const FX_EFFORT_MODELS: Record<string, string[]> = {
   // reasoning_options, not ACP-probed (docs/plans/add-haiku-5-5.md). Unlike
   // sonnet-5.5 this list INCLUDES none.
   "anthropic/claude-haiku-5.5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+  // 2026-10-14: google/gemini-4-argon (GA 2026-10-13) from the Gateway
+  // catalog's reasoning_options (low/medium/high) plus fx's always-present
+  // auto, not ACP-probed (docs/plans/add-gemini-4-argon.md).
+  "google/gemini-4-argon": ["high", "medium", "low", "auto"],
 };
 
 // The 13 no-effort ids — their Gateway catalog entry carries no
@@ -223,7 +228,7 @@ const FX_NO_EFFORT_MODELS = [
   "spacexai/grok-4.7",
 ];
 
-test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan §3 shared spec) — 22 effort models each end in auto, 13 named models are empty", () => {
+test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan §3 shared spec) — 23 effort models each end in auto, 13 named models are empty", () => {
   for (const [id, expected] of Object.entries(FX_EFFORT_MODELS)) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual(expected);
     expect(expected[expected.length - 1]).toBe("auto");
@@ -231,10 +236,10 @@ test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan
   for (const id of FX_NO_EFFORT_MODELS) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual([]);
   }
-  // The two lists above are exactly the 35 curated fx ids, no more no less.
-  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(22);
+  // The two lists above are exactly the 36 curated fx ids, no more no less.
+  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(23);
   expect(FX_NO_EFFORT_MODELS.length).toBe(13);
-  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(35);
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(36);
 });
 
 test("DEFAULT_EFFORT.fx is 'auto' (fx's own default — owner decision D1, docs/plans/fx-0.0.10-compat.md §8)", () => {
@@ -300,7 +305,7 @@ test("none of the seven previously-curated fx ids survives as an unconditional r
   expect(Object.keys(MODEL_EFFORT_SUPPORT.fx)).not.toContain("google/gemini-3-pro");
 });
 
-test("exactly the nineteen catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
+test("exactly the twenty catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
   const expectedCatalogOnly = new Set([
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-5",
@@ -336,12 +341,15 @@ test("exactly the nineteen catalog-gated Gateway ids are catalogOnly in AGENT_OP
     // 2026-10-07 (docs/plans/add-haiku-5-5.md) — signed-in presence
     // unverified, same treatment as the rows above.
     "anthropic/claude-haiku-5.5",
+    // 2026-10-14 (docs/plans/add-gemini-4-argon.md) — released 2026-10-13;
+    // signed-in presence unverified, same treatment as the rows above.
+    "google/gemini-4-argon",
   ]);
   const actualCatalogOnly = new Set(
     AGENT_OPTIONS.fx.models.filter((m) => m.catalogOnly).map((m) => m.id),
   );
   expect(actualCatalogOnly).toEqual(expectedCatalogOnly);
-  expect(actualCatalogOnly.size).toBe(19);
+  expect(actualCatalogOnly.size).toBe(20);
 
   for (const kind of KINDS) {
     if (kind === "fx") continue;
@@ -351,7 +359,7 @@ test("exactly the nineteen catalog-gated Gateway ids are catalogOnly in AGENT_OP
   }
 });
 
-test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (nineteen catalogOnly rows included)", () => {
+test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (twenty catalogOnly rows included)", () => {
   // Narrower restatement of the bidirectional-keys test above, scoped to
   // just the fx picker's own ids — guards specifically against a
   // catalogOnly row landing in AGENT_OPTIONS.fx.models without a paired
@@ -403,9 +411,12 @@ test("CATALOG_SCOPED_KINDS contains exactly fx", () => {
 
 /* ── gemini 3.8 Flash + retired gemini-3-pro-preview default (docs/plans/add-gemini-3-8-flash.md §5 TEST-2) ── */
 
-test("DEFAULT_MODEL.gemini is gemini-3.1-pro-preview (Google's successor to the shut-down 3 Pro preview) and heads the gemini picker", () => {
+test("DEFAULT_MODEL.gemini stays gemini-3.1-pro-preview (owner D1) while gemini-4-argon heads the picker above it", () => {
   expect(DEFAULT_MODEL.gemini).toBe("gemini-3.1-pro-preview");
-  expect(AGENT_OPTIONS.gemini.models[0]?.id).toBe("gemini-3.1-pro-preview");
+  expect(AGENT_OPTIONS.gemini.models[0]?.id).toBe("gemini-4-argon");
+  const defaultRow = AGENT_OPTIONS.gemini.models.find((m) => m.id === DEFAULT_MODEL.gemini);
+  expect(defaultRow).toBeDefined();
+  expect(defaultRow?.hint?.startsWith("Recommended default")).toBe(true);
 });
 
 test("the gemini picker offers gemini-3.8-flash and no longer offers the shut-down gemini-3-pro-preview", () => {
@@ -413,6 +424,17 @@ test("the gemini picker offers gemini-3.8-flash and no longer offers the shut-do
   expect(ids).toContain("gemini-3.8-flash");
   expect(ids).not.toContain("gemini-3-pro-preview");
   expect(Object.keys(MODEL_EFFORT_SUPPORT.gemini)).not.toContain("gemini-3-pro-preview");
+});
+
+test("the gemini picker offers gemini-4-argon and no longer offers the deprecated 3.7 / 3.5 Flash (migration 065)", () => {
+  const ids = AGENT_OPTIONS.gemini.models.map((m) => m.id);
+  expect(ids).toContain("gemini-4-argon");
+  expect(ids).not.toContain("gemini-3.7-flash");
+  expect(ids).not.toContain("gemini-3.5-flash");
+  const effortKeys = Object.keys(MODEL_EFFORT_SUPPORT.gemini);
+  expect(effortKeys).toContain("gemini-4-argon");
+  expect(effortKeys).not.toContain("gemini-3.7-flash");
+  expect(effortKeys).not.toContain("gemini-3.5-flash");
 });
 
 test("MODEL_EFFORT_SUPPORT.gemini's keys exactly match AGENT_OPTIONS.gemini.models' ids (both directions) and every value is empty", () => {
@@ -427,17 +449,23 @@ test("MODEL_EFFORT_SUPPORT.gemini's keys exactly match AGENT_OPTIONS.gemini.mode
   }
 });
 
-test("gemini picker is tier-ordered: Pro rows first, then Flash rows newest-first", () => {
+test("gemini picker is tier-ordered: Gemini 4 first, then Pro rows, then Flash rows newest-first", () => {
   const ids = AGENT_OPTIONS.gemini.models.map((m) => m.id);
   expect(ids).toEqual([
+    "gemini-4-argon",
     "gemini-3.1-pro-preview",
     "gemini-2.5-pro",
     "gemini-3.8-flash",
     "gemini-3.8-flash-cyber",
-    "gemini-3.7-flash",
-    "gemini-3.5-flash",
     "gemini-2.5-flash",
   ]);
+});
+
+test("the gemini-4-argon row's hint names the Ultra / paid-key requirement and the medium default thinking, and gemini has no CLI version floor (owner D2)", () => {
+  const row = AGENT_OPTIONS.gemini.models.find((m) => m.id === "gemini-4-argon");
+  expect(row?.hint).toContain("AI Ultra");
+  expect(row?.hint).toContain("medium");
+  expect(MODEL_MIN_CLI_VERSION.gemini).toBeUndefined();
 });
 
 test("gemini-3.8-flash-cyber sits directly under 3.8 Flash and its hint names the Fairwind gate (no public model code — id is convention-based)", () => {
@@ -459,14 +487,64 @@ test("cursor picker lists Gemini Flash newest-first: 3.8 before 3.7 before 3.6",
   expect(i36).toBeGreaterThanOrEqual(0);
   expect(i38).toBeLessThan(i37);
   expect(i37).toBeLessThan(i36);
+  // Gemini 4 Argon sits above the whole Flash run (spec insertion order is
+  // picker order).
+  const iArgon = ids.indexOf("gemini-4-argon");
+  expect(iArgon).toBeGreaterThanOrEqual(0);
+  expect(iArgon).toBeLessThan(i38);
 
-  for (const id of ["gemini-3.8-flash", "gemini-3.7-flash"]) {
+  for (const id of ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.7-flash"]) {
     const spec = CURSOR_MODEL_SPECS[id];
     expect(spec).toBeDefined();
     expect(Object.keys(spec?.effortIds ?? {}).sort()).toEqual(["high", "low", "medium"]);
     expect(spec?.fastEfforts).toBeUndefined();
     expect(spec?.fastId).toBeUndefined();
     expect(spec?.supportsMaxMode).toBeUndefined();
+  }
+});
+
+/* ── antigravity: Gemini 4 Argon rows + effort-in-id (docs/plans/add-gemini-4-argon.md) ── */
+
+test("antigravity picker leads with the three Gemini 4 Argon effort rows, and the default stays 3.8 Flash (High) right behind them", () => {
+  const ids = AGENT_OPTIONS.antigravity.models.map((m) => m.id);
+  expect(ids.slice(0, 3)).toEqual([
+    "gemini-4-argon-high",
+    "gemini-4-argon-medium",
+    "gemini-4-argon-low",
+  ]);
+  expect(DEFAULT_MODEL.antigravity).toBe("gemini-3.8-flash-high");
+  expect(ids.indexOf(DEFAULT_MODEL.antigravity)).toBe(3);
+  expect(AGENT_OPTIONS.antigravity.models.slice(0, 3).map((m) => m.label)).toEqual([
+    "Gemini 4 Argon (High)",
+    "Gemini 4 Argon (Medium)",
+    "Gemini 4 Argon (Low)",
+  ]);
+});
+
+test("antigravity no longer offers the deprecated 3.7 Flash rows (migration 065), still 18 curated rows", () => {
+  const ids = AGENT_OPTIONS.antigravity.models.map((m) => m.id);
+  for (const id of ids) expect(id.startsWith("gemini-3.7-flash")).toBe(false);
+  expect(ids.length).toBe(18);
+});
+
+test("MODEL_EFFORT_SUPPORT.antigravity keys exactly match the antigravity picker ids (both directions) and every value is empty — effort rides in the id", () => {
+  const catalogIds = new Set(AGENT_OPTIONS.antigravity.models.map((m) => m.id));
+  const effortKeys = new Set(Object.keys(MODEL_EFFORT_SUPPORT.antigravity));
+  for (const id of catalogIds) expect(effortKeys.has(id)).toBe(true);
+  for (const key of effortKeys) expect(catalogIds.has(key)).toBe(true);
+  expect(effortKeys.size).toBe(catalogIds.size);
+  for (const supported of Object.values(MODEL_EFFORT_SUPPORT.antigravity)) {
+    expect(supported).toEqual([]);
+  }
+});
+
+test("every antigravity Gemini 4 Argon hint flags the id as unconfirmed and points at `agy models`", () => {
+  const argon = AGENT_OPTIONS.antigravity.models.filter((m) => m.id.startsWith("gemini-4-argon-"));
+  expect(argon.length).toBe(3);
+  for (const row of argon) {
+    expect(row.hint).toContain("unconfirmed");
+    expect(row.hint).toContain("agy models");
+    expect(row.hint).toContain("AI Ultra");
   }
 });
 

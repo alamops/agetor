@@ -7,6 +7,9 @@ import normalizeCursorGrok47 from "./migrations/055_normalize_cursor_grok_4_7.sq
 import normalizeCursorOpus55 from "./migrations/056_normalize_cursor_opus_5_5.sql" with { type: "text" };
 import normalizeCursorSonnet55 from "./migrations/060_normalize_cursor_sonnet_5_5.sql" with { type: "text" };
 import normalizeCursorHaiku55 from "./migrations/062_normalize_cursor_haiku_5_5.sql" with { type: "text" };
+import normalizeCursorGemini4Argon from "./migrations/063_normalize_cursor_gemini_4_argon.sql" with { type: "text" };
+import antigravityEffortInModelId from "./migrations/064_antigravity_effort_in_model_id.sql" with { type: "text" };
+import retireGemini37And35Flash from "./migrations/065_retire_gemini_3_7_and_3_5_flash.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
 
 // Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
@@ -821,9 +824,290 @@ test("062_normalize_cursor_haiku_5_5 folds claude-haiku-5-5-thinking-* ids into 
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("062 (cursor Haiku 5.5) is the last registered migration, right after 061_antigravity_harness", () => {
+test("062 (cursor Haiku 5.5) sits right after 061_antigravity_harness", () => {
   const at = migrations.findIndex((m) => m.id === "062_normalize_cursor_haiku_5_5");
-  expect(at).toBe(migrations.length - 1);
+  expect(at).toBeGreaterThan(0);
   expect(migrations[at - 1]?.id).toBe("061_antigravity_harness");
   expect(migrations[at]?.sql).toContain("claude-haiku-5-5");
+});
+
+// Shared in-memory schema + readers for the 063-065 tests (same table shapes
+// as the 062 test above).
+function makeModelMigrationDb(harnessRows: Array<[string, string]>, seedSql: string) {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE agent_profiles (
+      id TEXT PRIMARY KEY,
+      harness_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+  const ins = db.prepare(`INSERT INTO harnesses (id, kind) VALUES (?, ?)`);
+  for (const [id, kind] of harnessRows) ins.run(id, kind);
+  db.exec(seedSql);
+  return {
+    db,
+    readTasks: () =>
+      db
+        .query<{ id: string; model: string | null; effort: string | null; fast: number }, []>(
+          `SELECT id, model, effort, fast FROM tasks ORDER BY id`,
+        )
+        .all(),
+    readProfiles: () =>
+      db
+        .query<{ id: string; model: string; effort: string | null; fast: number }, []>(
+          `SELECT id, model, effort, fast FROM agent_profiles ORDER BY id`,
+        )
+        .all(),
+    readPrefs: () =>
+      db
+        .query<{ key: string; value: string; updated_at: number }, []>(
+          `SELECT key, value, updated_at FROM preferences ORDER BY key`,
+        )
+        .all(),
+  };
+}
+
+test("063_normalize_cursor_gemini_4_argon folds gemini-4-argon-* ids into base id + effort (fast reset to 0) on cursor-kind rows only, leaving antigravity's identical curated ids verbatim, idempotently", () => {
+  const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
+    [
+      ["cursor", "cursor"],
+      ["cursor-2", "cursor"],
+      ["antigravity", "antigravity"],
+      ["fx", "fx"],
+      ["codex", "codex"],
+    ],
+    `
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'cursor', 'gemini-4-argon-high', NULL, 0),
+      ('t02', 'cursor-2', 'gemini-4-argon-medium', 'low', 0),
+      ('t03', 'cursor', 'gemini-4-argon-low', NULL, 1),
+      ('t04', 'antigravity', 'gemini-4-argon-high', NULL, 0),
+      ('t05', 'cursor', 'gemini-4-argon', 'high', 0),
+      ('t06', 'cursor', 'gemini-3.8-flash-high', NULL, 0),
+      ('t07', 'fx', 'google/gemini-4-argon', NULL, 0),
+      ('t08', 'cursor', NULL, NULL, 0),
+      ('t09', 'codex', 'gemini-4-argon-high', 'high', 0),
+      ('t10', 'antigravity', 'gemini-4-argon-low', 'low', 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'cursor', 'gemini-4-argon-high', NULL, 0),
+      ('p02', 'cursor-2', 'gemini-4-argon-low', 'high', 1),
+      ('p03', 'antigravity', 'gemini-4-argon-medium', NULL, 0),
+      ('p04', 'codex', 'gemini-4-argon-low', NULL, 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:cursor', 'gemini-4-argon-medium', 1),
+      ('lastModel:antigravity', 'gemini-4-argon-high', 1),
+      ('lastModel:codex', 'gemini-4-argon-medium', 1),
+      ('lastMode:cursor', 'auto', 1);
+    `,
+  );
+
+  db.exec(normalizeCursorGemini4Argon);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "gemini-4-argon", effort: "high", fast: 0 },
+    { id: "t02", model: "gemini-4-argon", effort: "medium", fast: 0 }, // variant wins over stale effort; extra cursor harness via kind join
+    { id: "t03", model: "gemini-4-argon", effort: "low", fast: 0 }, // stale fast=1 cleared
+    { id: "t04", model: "gemini-4-argon-high", effort: null, fast: 0 }, // untouched — antigravity's curated id (the kind-join control)
+    { id: "t05", model: "gemini-4-argon", effort: "high", fast: 0 }, // untouched — already a bare base id
+    { id: "t06", model: "gemini-3.8-flash-high", effort: null, fast: 0 }, // untouched — other model
+    { id: "t07", model: "google/gemini-4-argon", effort: null, fast: 0 }, // untouched — fx id
+    { id: "t08", model: null, effort: null, fast: 0 }, // untouched — NULL
+    { id: "t09", model: "gemini-4-argon-high", effort: "high", fast: 0 }, // untouched — not cursor-kind
+    { id: "t10", model: "gemini-4-argon-low", effort: "low", fast: 0 }, // untouched — antigravity
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "gemini-4-argon", effort: "high", fast: 0 },
+    { id: "p02", model: "gemini-4-argon", effort: "low", fast: 0 },
+    { id: "p03", model: "gemini-4-argon-medium", effort: null, fast: 0 }, // untouched — antigravity
+    { id: "p04", model: "gemini-4-argon-low", effort: null, fast: 0 }, // untouched — not cursor-kind
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:cursor", value: "auto", updated_at: 1 },
+    { key: "lastModel:antigravity", value: "gemini-4-argon-high", updated_at: 1 }, // untouched
+    { key: "lastModel:codex", value: "gemini-4-argon-medium", updated_at: 1 }, // untouched
+    { key: "lastModel:cursor", value: "gemini-4-argon", updated_at: 1 },
+  ]);
+
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(normalizeCursorGemini4Argon);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+});
+
+test("064_antigravity_effort_in_model_id clears effort on antigravity-kind tasks and agent profiles (model untouched) and deletes lastEffort:antigravity, idempotently", () => {
+  const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
+    [
+      ["antigravity", "antigravity"],
+      ["antigravity-2", "antigravity"],
+      ["gemini", "gemini"],
+      ["cursor", "cursor"],
+      ["codex", "codex"],
+      ["fx", "fx"],
+    ],
+    `
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'antigravity', 'gemini-4-argon-high', 'high', 0),
+      ('t02', 'antigravity-2', 'gemini-3.8-flash-low', 'max', 0),
+      ('t03', 'antigravity', 'gemini-4-argon-medium', 'xhigh', 0),
+      ('t04', 'antigravity', 'gemini-4-argon-low', NULL, 0),
+      ('t05', 'gemini', 'gemini-3.8-flash', 'high', 0),
+      ('t06', 'cursor', 'gemini-4-argon', 'high', 0),
+      ('t07', 'codex', 'gpt-6-sol', 'xhigh', 0),
+      ('t08', 'fx', 'google/gemini-4-argon', 'max', 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'antigravity', 'gemini-4-argon-high', 'high', 0),
+      ('p02', 'antigravity-2', 'gemini-3.8-flash-medium', 'max', 0),
+      ('p03', 'antigravity', 'gemini-4-argon-low', NULL, 0),
+      ('p04', 'cursor', 'gemini-4-argon', 'high', 0),
+      ('p05', 'gemini', 'gemini-3.8-flash', 'xhigh', 0),
+      ('p06', 'codex', 'gpt-6-sol', 'max', 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastEffort:antigravity', 'high', 1),
+      ('lastEffort:cursor', 'high', 1),
+      ('lastModel:antigravity', 'gemini-4-argon-high', 1);
+    `,
+  );
+
+  db.exec(antigravityEffortInModelId);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "gemini-4-argon-high", effort: null, fast: 0 },
+    { id: "t02", model: "gemini-3.8-flash-low", effort: null, fast: 0 }, // extra antigravity harness via kind join
+    { id: "t03", model: "gemini-4-argon-medium", effort: null, fast: 0 },
+    { id: "t04", model: "gemini-4-argon-low", effort: null, fast: 0 }, // already NULL
+    { id: "t05", model: "gemini-3.8-flash", effort: "high", fast: 0 }, // untouched — gemini
+    { id: "t06", model: "gemini-4-argon", effort: "high", fast: 0 }, // untouched — cursor keeps base id + effort
+    { id: "t07", model: "gpt-6-sol", effort: "xhigh", fast: 0 }, // untouched — codex
+    { id: "t08", model: "google/gemini-4-argon", effort: "max", fast: 0 }, // untouched — fx
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "gemini-4-argon-high", effort: null, fast: 0 },
+    { id: "p02", model: "gemini-3.8-flash-medium", effort: null, fast: 0 },
+    { id: "p03", model: "gemini-4-argon-low", effort: null, fast: 0 },
+    { id: "p04", model: "gemini-4-argon", effort: "high", fast: 0 }, // untouched — cursor
+    { id: "p05", model: "gemini-3.8-flash", effort: "xhigh", fast: 0 }, // untouched — gemini
+    { id: "p06", model: "gpt-6-sol", effort: "max", fast: 0 }, // untouched — codex
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastEffort:cursor", value: "high", updated_at: 1 }, // untouched
+    { key: "lastModel:antigravity", value: "gemini-4-argon-high", updated_at: 1 }, // untouched
+  ]);
+
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(antigravityEffortInModelId);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+});
+
+test("065_retire_gemini_3_7_and_3_5_flash moves gemini-kind 3.7/3.5 Flash rows to gemini-3.8-flash and antigravity-kind gemini-3.7-flash-<effort> rows to gemini-3.8-flash-<effort>, leaving cursor and fx rows alone, idempotently", () => {
+  const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
+    [
+      ["gemini", "gemini"],
+      ["gemini-2", "gemini"],
+      ["antigravity", "antigravity"],
+      ["antigravity-2", "antigravity"],
+      ["cursor", "cursor"],
+      ["fx", "fx"],
+    ],
+    `
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'gemini', 'gemini-3.7-flash', NULL, 0),
+      ('t02', 'gemini-2', 'gemini-3.5-flash', NULL, 0),
+      ('t03', 'antigravity', 'gemini-3.7-flash-high', NULL, 0),
+      ('t04', 'antigravity-2', 'gemini-3.7-flash-medium', NULL, 0),
+      ('t05', 'antigravity', 'gemini-3.7-flash-low', NULL, 0),
+      ('t06', 'cursor', 'gemini-3.7-flash', 'low', 0),
+      ('t07', 'cursor', 'gemini-3.7-flash-high', NULL, 0),
+      ('t08', 'gemini', 'gemini-3.8-flash', NULL, 0),
+      ('t09', 'gemini', 'gemini-2.5-flash', NULL, 0),
+      ('t10', 'gemini', NULL, NULL, 0),
+      ('t11', 'fx', 'google/gemini-3.7-flash', NULL, 0),
+      ('t12', 'cursor', 'gemini-3.5-flash', NULL, 0),
+      ('t13', 'antigravity', 'gemini-3.7-flash', NULL, 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'gemini', 'gemini-3.7-flash', NULL, 0),
+      ('p02', 'gemini-2', 'gemini-3.5-flash', NULL, 0),
+      ('p03', 'antigravity', 'gemini-3.7-flash-high', NULL, 0),
+      ('p04', 'antigravity-2', 'gemini-3.7-flash-low', NULL, 0),
+      ('p05', 'cursor', 'gemini-3.7-flash', 'low', 0),
+      ('p06', 'cursor', 'gemini-3.7-flash-medium', NULL, 0),
+      ('p07', 'gemini', 'gemini-3.8-flash', NULL, 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:gemini', 'gemini-3.5-flash', 1),
+      ('lastModel:antigravity', 'gemini-3.7-flash-low', 1),
+      ('lastModel:cursor', 'gemini-3.7-flash', 1),
+      ('lastMode:gemini', 'auto', 1);
+    `,
+  );
+
+  db.exec(retireGemini37And35Flash);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "gemini-3.8-flash", effort: null, fast: 0 },
+    { id: "t02", model: "gemini-3.8-flash", effort: null, fast: 0 }, // extra gemini harness via kind join
+    { id: "t03", model: "gemini-3.8-flash-high", effort: null, fast: 0 },
+    { id: "t04", model: "gemini-3.8-flash-medium", effort: null, fast: 0 },
+    { id: "t05", model: "gemini-3.8-flash-low", effort: null, fast: 0 },
+    { id: "t06", model: "gemini-3.7-flash", effort: "low", fast: 0 }, // untouched — Cursor keeps 3.7 Flash (the kind-join control)
+    { id: "t07", model: "gemini-3.7-flash-high", effort: null, fast: 0 }, // untouched — cursor
+    { id: "t08", model: "gemini-3.8-flash", effort: null, fast: 0 }, // untouched — already the successor
+    { id: "t09", model: "gemini-2.5-flash", effort: null, fast: 0 }, // untouched — other model
+    { id: "t10", model: null, effort: null, fast: 0 }, // untouched — NULL
+    { id: "t11", model: "google/gemini-3.7-flash", effort: null, fast: 0 }, // untouched — fx id
+    { id: "t12", model: "gemini-3.5-flash", effort: null, fast: 0 }, // untouched — cursor
+    { id: "t13", model: "gemini-3.7-flash", effort: null, fast: 0 }, // untouched — bare id is not an antigravity row
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "gemini-3.8-flash", effort: null, fast: 0 },
+    { id: "p02", model: "gemini-3.8-flash", effort: null, fast: 0 },
+    { id: "p03", model: "gemini-3.8-flash-high", effort: null, fast: 0 },
+    { id: "p04", model: "gemini-3.8-flash-low", effort: null, fast: 0 },
+    { id: "p05", model: "gemini-3.7-flash", effort: "low", fast: 0 }, // untouched — cursor
+    { id: "p06", model: "gemini-3.7-flash-medium", effort: null, fast: 0 }, // untouched — cursor
+    { id: "p07", model: "gemini-3.8-flash", effort: null, fast: 0 },
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:gemini", value: "auto", updated_at: 1 },
+    { key: "lastModel:antigravity", value: "gemini-3.8-flash-low", updated_at: 1 },
+    { key: "lastModel:cursor", value: "gemini-3.7-flash", updated_at: 1 }, // untouched — Cursor keeps it
+    { key: "lastModel:gemini", value: "gemini-3.8-flash", updated_at: 1 },
+  ]);
+
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(retireGemini37And35Flash);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+});
+
+test("065 (retire gemini 3.7/3.5 Flash) is the last registered migration, after 064, after 063, after 062", () => {
+  const at = migrations.findIndex((m) => m.id === "065_retire_gemini_3_7_and_3_5_flash");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("064_antigravity_effort_in_model_id");
+  expect(migrations[at - 2]?.id).toBe("063_normalize_cursor_gemini_4_argon");
+  expect(migrations[at - 3]?.id).toBe("062_normalize_cursor_haiku_5_5");
+  expect(migrations[at]?.sql).toContain("gemini-3.8-flash");
+  expect(migrations[at - 1]?.sql).toContain("lastEffort:antigravity");
+  expect(migrations[at - 2]?.sql).toContain("gemini-4-argon");
 });
