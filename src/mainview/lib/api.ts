@@ -81,6 +81,7 @@ import type {
   TaskDiff,
   TaskEventsReplayMeta,
   TaskGitStatus,
+  TaskTeardownPreview,
   TaskReference,
   TaskType,
   TerminalTab,
@@ -1580,6 +1581,12 @@ export const api = {
   getTaskDiff: (taskId: string) => j<TaskDiff>(`/tasks/${taskId}/diff`),
   getTaskGitStatus: (taskId: string) =>
     j<TaskGitStatus>(`/tasks/${taskId}/git-status`),
+  /** Which branches deleting the task would remove (`task.branch`, plus the
+   *  branch a drifted worktree is actually on), after the default-branch /
+   *  PR-head / held-by-another-task exclusions — read before the delete
+   *  confirm so the dialog can name them. Read-only. */
+  getTaskTeardownPreview: (taskId: string) =>
+    j<TaskTeardownPreview>(`/tasks/${encodeURIComponent(taskId)}/teardown-preview`),
   cancelRun: (runId: string) =>
     j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
   // Mirrors the orchestrator's `SendInputResult` (src/bun/orchestrator.ts) —

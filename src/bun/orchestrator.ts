@@ -142,6 +142,11 @@ import {
   hasUncommittedChanges,
   getAheadCount,
   isMergedIntoDefaultBranch,
+  readCheckoutBranch,
+  recordableCheckout,
+  planTeardownBranches,
+  resolveDefaultBranchName,
+  type PreparedWorkdir,
 } from "./worktree.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
@@ -149,6 +154,7 @@ import type {
   AgentProfile,
   AgentProfileSnapshot,
   ColumnId,
+  ContinuationTrigger,
   FxRecoveryPayload,
   GlobalEvent,
   Pipeline,
@@ -158,11 +164,12 @@ import type {
   Task,
   TaskFxRecovery,
   WorktreeGitStatus,
+  TaskTeardownPreview,
   WorktreeInfo,
   WorktreeStaleReason,
   WorktreeTeardownResult,
 } from "../shared/types.ts";
-import { WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
+import { CONTINUATION_STATUS_TEXT, WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
 import {
   SENT_FILES_DELIVERED_RE,
   parseSentFilesToolResult,
@@ -286,12 +293,36 @@ function enqueueTeardown(taskId: string, key: string, job: () => Promise<void>):
 /**
  * Await any deferred teardown currently in flight (or queued) for `taskId`.
  * Resolves immediately when nothing is pending. Exported so `unarchiveTask`,
- * `startTask`, and the boot-time sweep can serialize against a still-running
+ * `startTask`, terminal open (`createTerminal`), and the boot-time sweep can serialize against a still-running
  * archive/delete teardown before touching the same worktree, and so tests can
  * drain the queue deterministically.
  */
 export function pendingTeardown(taskId: string): Promise<void> {
   return teardowns.get(taskId) ?? Promise.resolve();
+}
+
+/** Tasks whose `deleteTask` is in progress. A pipeline parent's delete awaits
+ *  its step cascade before it ever enqueues a teardown, so `teardowns` alone
+ *  can't tell that the task is on its way out during that window. */
+const deletingTaskIds = new Set<string>();
+
+/**
+ * Synchronous "is this task being torn down right now" — an archive/delete
+ * teardown is queued or running, or a delete has started. For a caller that
+ * has already awaited `pendingTeardown` and then did async work of its own
+ * (terminal open's `prepareWorkdir`): a teardown that landed meanwhile has
+ * killed, or is about to kill, what the caller is about to start, so the
+ * caller must re-check this in the same synchronous run as its spawn.
+ */
+export function isTaskTearingDown(taskId: string): boolean {
+  return teardowns.has(taskId) || deletingTaskIds.has(taskId);
+}
+
+/** Test hook: queue `job` on the teardown FIFO for `key` under `taskId`, so a
+ *  test can hold that queue open (and make `pendingTeardown(taskId)` wait)
+ *  until it releases a gate. Not part of the public surface. */
+export function __enqueueTeardownForTest(taskId: string, key: string, job: () => Promise<void>): Promise<void> {
+  return enqueueTeardown(taskId, key, job);
 }
 
 export function subscribe(fn: Listener): () => void {
@@ -413,15 +444,25 @@ function stepParentOf(taskId: string): string | undefined {
 
 /** Stamp `pipelineParentId` onto a per-task event (see
  *  {@link PIPELINE_PARENT_STAMPED_KINDS}) unless the emitter already set it
- *  (interactions.ts stamps its own `interaction` events). Built with
+ *  (interactions.ts stamps its own `interaction` events), plus the parent's
+ *  title as `pipelineParentTitle` — a toast for a run started right after the
+ *  page loaded can arrive before the client's task poll has the parent row,
+ *  and would otherwise name the pipeline by a short id. Built with
  *  `Object.assign` rather than an object-literal spread so this compiles the
- *  same whether or not the union member declares the optional field. */
+ *  same whether or not the union member declares the optional fields. */
 function stampPipelineParent(e: GlobalEvent): GlobalEvent {
   if (!PIPELINE_PARENT_STAMPED_KINDS.has(e.kind) || !("taskId" in e)) return e;
-  if ((e as { pipelineParentId?: string }).pipelineParentId !== undefined) return e;
-  const pipelineParentId = stepParentOf(e.taskId);
+  const stamped = e as { pipelineParentId?: string; pipelineParentTitle?: string };
+  if (stamped.pipelineParentTitle !== undefined) return e;
+  const pipelineParentId = stamped.pipelineParentId ?? stepParentOf(e.taskId);
   if (pipelineParentId === undefined) return e;
-  return Object.assign({}, e, { pipelineParentId }) as GlobalEvent;
+  const pipelineParentTitle = tasks.get(pipelineParentId)?.title;
+  return Object.assign(
+    {},
+    e,
+    { pipelineParentId },
+    pipelineParentTitle ? { pipelineParentTitle } : {},
+  ) as GlobalEvent;
 }
 
 /** Fan an app-wide lifecycle event out to every subscriber. Each listener
@@ -1343,6 +1384,28 @@ export async function startTask(
   return startTaskInner(taskId, task);
 }
 
+/**
+ * Status lines a run start writes about the worktree's checkout. Drift is
+ * tolerated, never corrected (`prepareWorkdir` no longer checks out on reuse),
+ * so when the worktree is on a different named branch than `task.branch` the
+ * run log says so — and, for a PR-head task (`branchSource: "existing"`),
+ * warns that commits there won't reach the pull request. A re-attach that
+ * couldn't restore the recorded checkout adds its own `warning` line.
+ */
+function worktreeDriftStatusLines(task: Task, prepared: PreparedWorkdir): string[] {
+  const lines: string[] = [];
+  const live = prepared.checkoutBranch;
+  if (prepared.worktreePath && prepared.branch && live && live !== prepared.branch) {
+    lines.push(
+      task.branchSource === "existing"
+        ? `⚠ worktree is on ${live}, not the PR head branch ${prepared.branch} — commits here will not land on the pull request`
+        : `worktree is on ${live} (task branch ${prepared.branch}) — running there`,
+    );
+  }
+  if (prepared.warning) lines.push(prepared.warning);
+  return lines;
+}
+
 async function startTaskInner(
   taskId: string,
   task: Task,
@@ -1599,6 +1662,12 @@ async function startTaskInner(
       worktreePath: prepared.worktreePath,
       runId,
     });
+    // Run start is one of the four last-seen-checkout refresh points (start,
+    // settle, terminal open, archive). Isolation "none", or a reuse whose
+    // branch read failed, has nothing to record — keep whatever was recorded
+    // rather than erasing it (`recordableCheckout`).
+    const checkout = recordableCheckout(prepared);
+    if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
     runs.insert({
       id: runId,
       taskId,
@@ -1738,6 +1807,11 @@ async function startTaskInner(
         data: `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
         ts: now,
       });
+      // Persisted (unlike the broadcast-only `started —` breadcrumb) so the
+      // drift notice stays in the run log, `agetor logs` and history.
+      for (const line of worktreeDriftStatusLines(task, prepared)) {
+        appendRunStatusLine(taskId, runId, line);
+      }
       attachDoneHandler(runId, taskId, agent);
       return { ok: true as const };
     } catch (err) {
@@ -2383,6 +2457,25 @@ function detectCursorPlan(task: Task, runId: string): void {
  * Pulled out so `startTask` and `sendInput` (which also creates run rows for
  * claude-code) can share the lifecycle handling.
  */
+/**
+ * Refresh a worktree task's last-seen checkout after one of its runs settled
+ * (`tasks.setCheckoutBranch`, compare-then-write). Only a readable checkout is
+ * recorded — `null` on a detached HEAD — while an unreadable one (dir gone,
+ * git failed) leaves the stored value alone. Never throws: it runs
+ * fire-and-forget off `attachDoneHandler`.
+ */
+async function noteRunSettledCheckout(taskId: string): Promise<void> {
+  try {
+    const task = tasks.get(taskId);
+    if (!task || task.isolation !== "worktree" || !task.worktreePath) return;
+    if (!existsSync(task.worktreePath)) return;
+    const live = await readCheckoutBranch(task.worktreePath);
+    if (live.ok) tasks.setCheckoutBranch(taskId, live.branch);
+  } catch (err) {
+    console.warn(`[agetor] could not record checkout branch for task ${taskId}:`, err);
+  }
+}
+
 function attachDoneHandler(
   runId: string,
   taskId: string,
@@ -2421,6 +2514,10 @@ function attachDoneHandler(
         : (wasApiError || wasSessionDied || wasUnknownCommand) ? "failed"
         : code === 0 ? "succeeded" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: code });
+      // Run settle is a last-seen-checkout refresh point for every harness
+      // kind (the agent may have switched branches during the turn).
+      // Fire-and-forget: one `git symbolic-ref`, never on the settle path.
+      void noteRunSettledCheckout(taskId);
       // Only flip the task's column when the run that just resolved is
       // still the latest one. If the user pipelined a follow-up while
       // this run was in flight, `task.runId` already points at the
@@ -2528,6 +2625,7 @@ function attachDoneHandler(
       pendingSentFilesByRun.delete(runId);
       const newStatus: RunStatus = wasCancelled ? "cancelled" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: -1 });
+      void noteRunSettledCheckout(taskId);
       const task = tasks.get(taskId);
       const isTerminalRun = !!task && task.runId === runId;
       if (isTerminalRun) {
@@ -3318,6 +3416,7 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
       if ("error" in restored) {
         return { delivered: false, reason: `worktree restore failed: ${restored.error}` };
       }
+      noteRestoredCheckout(fresh.id, restored);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return { delivered: false, reason: `worktree restore failed: ${msg}` };
@@ -5583,8 +5682,24 @@ export function __handlePasteWithheldForTest(
  *     equivalent notion of "kept talking after end_turn", so there's nothing
  *     to adopt a run for. Only claude-tmux's `dispatchLine` calls this
  *     factory today, so this is defense in depth rather than a live path.
+ *
+ * `trigger` names what started the turn, so the run's opening status line
+ * says what actually happened (`CONTINUATION_STATUS_TEXT`):
+ *   - `"notification"` (default) — a `<task-notification>` line, a
+ *     background task finishing → `auto-continued after background task`.
+ *     Also the fake driver's / pipeline-handoff adoption path
+ *     (`openContinuationRun`).
+ *   - `"user"` — a `user` line agetor didn't paste, i.e. typed in the
+ *     attached terminal → `turn started from the terminal`.
+ *   - `"assistant"` — an `assistant` line with no turn open → `Claude
+ *     continued on its own`.
+ * Claude's compaction-summary `user` lines never reach here: claude-tmux's
+ * `isContinuationContentEvent` excludes them.
  */
-function startContinuationRun(taskId: string): ContinuationHooks | null {
+function startContinuationRun(
+  taskId: string,
+  trigger: ContinuationTrigger = "notification",
+): ContinuationHooks | null {
   if (taskId === "__rebuild__") return null;
   const task = tasks.get(taskId);
   if (!task || task.archivedAt != null) return null;
@@ -5623,7 +5738,7 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
   const harness = resolveHarness(task.agent);
   const kind: AgentKind = harness?.kind ?? "claude-code";
   const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
-  onChunk("status", "auto-continued after background task");
+  onChunk("status", CONTINUATION_STATUS_TEXT[trigger] ?? CONTINUATION_STATUS_TEXT.notification);
 
   return {
     onChunk,
@@ -6377,6 +6492,15 @@ function enqueueArchiveTeardown(
     // the parent (or any sibling step still using it). The parent's own
     // teardown (this same function, called for the parent row) removes the
     // worktree exactly as before; only a step row's call skips the detach.
+    // Archive is the last moment the live checkout can be read — once the
+    // directory is detached git can't tell which branch it was on. Record it
+    // (D6) so unarchive re-attaches onto the same branch and a later delete
+    // of the archived task can still name it. An unreadable checkout leaves
+    // the previously recorded value in place.
+    if (!cur.pipelineParentId && cur.isolation === "worktree" && cur.worktreePath && existsSync(cur.worktreePath)) {
+      const live = await readCheckoutBranch(cur.worktreePath);
+      if (live.ok) tasks.setCheckoutBranch(cur.id, live.branch);
+    }
     result = cur.pipelineParentId
       ? { removed: false, reason: "no-worktree" }
       : await detachWorktree(cur, { force: opts?.force });
@@ -6527,7 +6651,7 @@ export async function archiveTask(
   // `prune` — those still run (serialized per
   // workdir, see `enqueueTeardown`), just off the request's critical path;
   // tasks in a different workdir proceed independently. Callers that must
-  // not race a deferred teardown (unarchive, start, delete, the boot sweep)
+  // not race a deferred teardown (unarchive, start, delete, terminal open, the boot sweep)
   // await `pendingTeardown(taskId)` first. `awaitTeardown` is the one opt-in
   // exception: the Worktrees page explicitly wants to block on this specific
   // teardown to get a truthful result back.
@@ -6538,6 +6662,25 @@ export async function archiveTask(
   }
   void promise;
   return { task: updated };
+}
+
+/**
+ * After a `prepareWorkdir` outside a run start (unarchive, `sendInput`'s
+ * missing-worktree branch, a terminal open) record the branch the worktree is
+ * on, and surface `prepareWorkdir`'s `warning` — a re-attach couldn't bring
+ * the worktree back exactly as recorded (recorded checkout missing or
+ * unattachable, task branch recreated from base) — as a status line on the
+ * task's latest run (console only when the task has never run). Only a
+ * re-attach sets `warning`, and later prepares take the reuse path, so this
+ * is the one chance to say it.
+ */
+export function noteRestoredCheckout(taskId: string, prepared: PreparedWorkdir): void {
+  const checkout = recordableCheckout(prepared);
+  if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
+  if (!prepared.warning) return;
+  const latest = runs.listForTask(taskId)[0];
+  if (latest) appendRunStatusLine(taskId, latest.id, prepared.warning);
+  else console.warn(`[agetor] task ${taskId}: ${prepared.warning}`);
 }
 
 /**
@@ -6568,12 +6711,68 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
       const restored = await prepareWorkdir(updated);
       if ("error" in restored) {
         console.warn(`[agetor] unarchiveTask: worktree restore failed for ${taskId}: ${restored.error}`);
+      } else {
+        noteRestoredCheckout(taskId, restored);
       }
     } catch (err) {
       console.warn(`[agetor] unarchiveTask: worktree restore failed for ${taskId}:`, err);
     }
   }
   return { task: updated };
+}
+
+/**
+ * Which branches deleting `task` would remove — the read behind
+ * `GET /tasks/:id/teardown-preview` (the delete confirm and `agetor rm`) and
+ * the plan `deleteTask` itself executes, so the two always agree.
+ *
+ * Drift is tolerated (D3/D5): besides `task.branch`, delete also removes the
+ * branch the worktree is actually on when that is a different named branch —
+ * read live from the worktree while it still exists, else the recorded
+ * `checkoutBranch` (an archived task's detached worktree). `planTeardownBranches`
+ * drops the repo's default branch, a PR-head task's own branch, and any branch
+ * another task in the same repo holds as its `branch` or last-seen checkout
+ * (archived rows included; pipeline step rows excluded — they mirror their
+ * parent's names and would otherwise shadow the parent's own delete). A task
+ * with no worktree to remove (never materialized, isolation "none", or a
+ * pipeline step whose worktree is the parent's) deletes nothing. Read-only.
+ */
+export async function teardownBranchesForTask(task: Task): Promise<TaskTeardownPreview> {
+  const taskBranch = task.branch ?? null;
+  if (task.isolation !== "worktree" || !task.worktreePath || task.pipelineParentId) {
+    return { branches: [], liveBranch: null, taskBranch, source: "none", excluded: [] };
+  }
+  // A successful read of a detached HEAD (`{ok: true, branch: null}`) is a
+  // KNOWN state — the worktree is on no named branch — so the recorded
+  // last-seen checkout must not stand in for it (D5: the recorded value is
+  // used only when the live branch can't be read).
+  let liveBranch: string | null = null;
+  let liveKnown = false;
+  if (existsSync(task.worktreePath)) {
+    const live = await readCheckoutBranch(task.worktreePath);
+    if (live.ok) {
+      liveBranch = live.branch;
+      liveKnown = true;
+    }
+  }
+  const root = await repoRoot(task.workdir);
+  const defaultBranch = root ? await resolveDefaultBranchName(root) : null;
+  const heldByOthers = new Set<string>();
+  for (const other of tasks.list()) {
+    if (other.id === task.id || other.pipelineParentId) continue;
+    if (other.workdir !== task.workdir && (!root || (await repoRoot(other.workdir)) !== root)) continue;
+    if (other.branch) heldByOthers.add(other.branch);
+    if (other.checkoutBranch) heldByOthers.add(other.checkoutBranch);
+  }
+  const plan = planTeardownBranches({
+    taskBranch,
+    branchSource: task.branchSource,
+    liveBranch,
+    lastSeen: liveKnown ? null : task.checkoutBranch ?? null,
+    defaultBranch,
+    heldByOthers,
+  });
+  return { ...plan, liveBranch, taskBranch };
 }
 
 /**
@@ -6609,6 +6808,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   // the tombstone on any such throw and re-raise, so the parent stays
   // launchable and the user can simply retry the delete.
   const isPipelineParent = task.pipelineId != null;
+  deletingTaskIds.add(taskId);
   try {
   if (isPipelineParent) {
     // M7: run under this parent's `withPipelineLock` so the cascade can't
@@ -6662,7 +6862,19 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     // A step task's worktree is the shared parent's (D2) — never remove it
     // out from under the parent (or any sibling step) just because one step
     // row is being deleted as part of the parent's own cascade.
-    if (!task.pipelineParentId) await removeWorktree(task);
+    // The branch plan is computed here — after the agent and every shell are
+    // gone (nothing can switch the checkout any more) and before the
+    // directory is removed (the last moment the live branch is readable) —
+    // with the same function the delete-confirm preview used.
+    // Re-read the row: a terminal open that was mid-`prepareWorkdir` when
+    // the delete started may have materialized the worktree and persisted
+    // its path since `task` was captured — the stale snapshot would leave
+    // that directory and its branch behind.
+    if (!task.pipelineParentId) {
+      const cur = tasks.get(taskId) ?? task;
+      const plan = await teardownBranchesForTask(cur);
+      await removeWorktree(cur, { branches: plan.branches });
+    }
   });
   // Refs are otherwise path-only — agetor never copies anything to disk for
   // them — except the per-task issue-thread snapshot directory (written by
@@ -6679,7 +6891,43 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   } catch (err) {
     if (isPipelineParent) tombstonedPipelineParents.delete(taskId);
     throw err;
+  } finally {
+    deletingTaskIds.delete(taskId);
   }
+}
+
+/**
+ * Clean up a worktree that a refused terminal open materialized (created or
+ * re-attached) while the task was being archived or deleted. The open had
+ * persisted the path before it noticed, but the archive/delete teardown may
+ * already have run on a snapshot without it, so nothing else would remove
+ * the directory — and for a deleted task there is no row left for the boot
+ * sweep to find either.
+ *
+ * Queued on the task's teardown FIFO, so it runs after the archive/delete
+ * teardown already queued for the same workdir and `pendingTeardown(task.id)`
+ * covers it. At run time: a row that is live again (unarchived, or a delete
+ * that failed) owns the worktree through its persisted path, so nothing is
+ * done; an archived row gets the archive's branch-preserving detach; a deleted
+ * task gets the delete's removal, branches planned exactly as delete plans
+ * them. Best-effort, never throws.
+ */
+export function discardRefusedWorktree(
+  task: Task,
+  prepared: { worktreePath: string; branch: string | null },
+): Promise<void> {
+  return enqueueTeardown(task.id, task.workdir, async () => {
+    const cur = tasks.get(task.id);
+    if (cur && cur.archivedAt == null) return;
+    if (!existsSync(prepared.worktreePath)) return;
+    const target: Task = { ...(cur ?? task), worktreePath: prepared.worktreePath, branch: prepared.branch };
+    if (cur) {
+      await detachWorktree(target);
+      return;
+    }
+    const plan = await teardownBranchesForTask(target);
+    await removeWorktree(target, { branches: plan.branches });
+  });
 }
 
 /**
@@ -7103,15 +7351,20 @@ export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus |
 
   const dirty0 = await hasUncommittedChanges(dir);
   if (dirty0 === null) {
-    return { dirty: false, ahead: 0, merged: null, ignored: true };
+    return { dirty: false, ahead: 0, merged: null, ignored: true, branch: null };
   }
 
-  const [aheadResult, merged] = await Promise.all([
+  // Only the live branch name is needed here, so `readCheckoutBranch` (one
+  // `git symbolic-ref`) rather than `headBranchState`, whose repo check and
+  // default-branch lookup would cost a few more spawns per Worktrees row.
+  // Detached or unreadable both show as no branch.
+  const [aheadResult, merged, live] = await Promise.all([
     getAheadCount(dir, baseRef),
     isMergedIntoDefaultBranch(dir),
+    readCheckoutBranch(dir),
   ]);
 
-  return { dirty: dirty0, ahead: aheadResult ?? 0, merged, ignored: false };
+  return { dirty: dirty0, ahead: aheadResult ?? 0, merged, ignored: false, branch: live.ok ? live.branch : null };
 }
 
 /**

@@ -123,6 +123,12 @@ type TaskRow = {
   pipeline_run: string | null;
   pipeline_parent_id: string | null;
   pipeline_step_id: string | null;
+  // The branch agetor last observed checked out in the task's worktree
+  // (migration 063; NULL = never observed, or detached HEAD at the last
+  // observation). Written exclusively by `tasks.insert` (create time) and
+  // `tasks.setCheckoutBranch`'s targeted UPDATE, never by the generic
+  // `update` SET clause below — same rationale as `sent_files`/`fx_recovery`.
+  checkout_branch: string | null;
   // Unread-indicator watermark pair (migration 045). Not spread into `Task`
   // directly — only the derived `unread` boolean is (see `toTask`). Written
   // exclusively by `tasks.noteAssistantEvent` / `tasks.markSeen`, never by
@@ -787,6 +793,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   pipelineRun: parsePipelineRunState(r.pipeline_run),
   pipelineParentId: r.pipeline_parent_id ?? null,
   pipelineStepId: r.pipeline_step_id ?? null,
+  checkoutBranch: r.checkout_branch ?? null,
   // Derived, never stored: a monotonic-id watermark comparison, race-free by
   // construction (see migration 045's doc comment). NULL
   // `last_assistant_event_id` (no assistant event ever observed) always
@@ -884,9 +891,10 @@ export const tasks = {
           branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans, todo_progress,
           agent_profile_id, agent_profile,
           pipeline_id, pipeline_run, pipeline_parent_id, pipeline_step_id,
+          checkout_branch,
           last_assistant_event_id, last_seen_event_id,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -902,6 +910,7 @@ export const tasks = {
         t.pipelineRun ? JSON.stringify(t.pipelineRun) : null,
         t.pipelineParentId ?? null,
         t.pipelineStepId ?? null,
+        t.checkoutBranch ?? null,
         // A brand-new task has never had an assistant event or a mark-seen
         // — both start NULL, which `toTask` reads as `unread: false`.
         null, null,
@@ -911,7 +920,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, unread: false, hasAssistantMessages: false, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, checkoutBranch: t.checkoutBranch ?? null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
@@ -953,6 +962,12 @@ export const tasks = {
     // progress or a step task's fixed pipeline identity, and (like every
     // other server-managed column above) none of these writes bump
     // `updated_at`.
+    // `checkout_branch` (migration 063) joins the same skip list: it's
+    // written only by `tasks.insert` (create time) and
+    // `tasks.setCheckoutBranch` below via its own targeted UPDATE. A generic
+    // PATCH must never overwrite the last-observed checkout with whatever
+    // stale copy the caller read earlier, and (like every other
+    // server-managed column above) the write never bumps `updated_at`.
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
@@ -1106,6 +1121,40 @@ export const tasks = {
       `UPDATE tasks SET fx_recovery = ? WHERE id = ?`,
       [value ? JSON.stringify(value) : null, taskId],
     );
+  },
+  /**
+   * Record the branch agetor last observed checked out in a task's worktree
+   * (`checkout_branch`, migration 063; `null` = detached HEAD / unknown) in
+   * one targeted `UPDATE` — same pattern as `setFxRecovery` above: no
+   * `updated_at` bump and it bypasses the generic `update`'s SET clause so a
+   * concurrent unrelated PATCH can't race it. Compare-then-write
+   * (`checkout_branch IS NOT ?`): an unchanged value matches zero rows, so a
+   * repeated observation doesn't churn the row the webview's
+   * `reconcileById` identity preservation depends on. A pipeline STEP row
+   * (non-null `pipeline_parent_id`) also writes its parent in the same
+   * transaction — step tasks share the parent's worktree and run through the
+   * ordinary orchestrator start/settle paths, so mirroring here keeps the
+   * parent card current with no runner change. Silently no-ops on an unknown
+   * task id (zero rows match, same as every other targeted UPDATE here).
+   */
+  setCheckoutBranch(taskId: string, value: string | null): void {
+    db.transaction(() => {
+      db.run(
+        `UPDATE tasks SET checkout_branch = ? WHERE id = ? AND checkout_branch IS NOT ?`,
+        [value, taskId, value],
+      );
+      const row = db
+        .query<{ pipeline_parent_id: string | null }, [string]>(
+          `SELECT pipeline_parent_id FROM tasks WHERE id = ?`,
+        )
+        .get(taskId);
+      if (row?.pipeline_parent_id) {
+        db.run(
+          `UPDATE tasks SET checkout_branch = ? WHERE id = ? AND checkout_branch IS NOT ?`,
+          [value, row.pipeline_parent_id, value],
+        );
+      }
+    })();
   },
   /**
    * Bind (or detach, when both arguments are `null`) a task's agent profile

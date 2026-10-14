@@ -1,0 +1,17 @@
+-- The branch name agetor last OBSERVED checked out in the task's worktree
+-- (`Task.checkoutBranch`, src/shared/types.ts). `tasks.branch` stays the
+-- task's identity branch (what `prepareWorkdir` created and what delete tears
+-- down); a worktree can legitimately drift off it (an agent or a terminal ran
+-- `git checkout -b other`), and this column remembers where it was last seen
+-- so the UI can show the live name, delete can clean up both branches, and
+-- unarchive can re-attach onto the same one. Drift is derived, never stored:
+-- `checkout_branch IS NOT NULL AND checkout_branch != branch`. NULL means
+-- "never observed", or a detached HEAD at the last observation. Written ONLY
+-- by `tasks.insert` (create time, normally NULL) and `tasks.setCheckoutBranch`
+-- (its own targeted UPDATE, compare-then-write) — never by the generic
+-- `tasks.update` SET clause, same treatment as `sent_files` (050) /
+-- `fx_recovery` (051) / `agent_profile*` (053): an unrelated PATCH must not
+-- clobber it, and the write never bumps `updated_at`. No backfill — existing
+-- rows fill in on their next run start, run settle, terminal open or archive,
+-- and readers fall back to `branch` until then.
+ALTER TABLE tasks ADD COLUMN checkout_branch TEXT;

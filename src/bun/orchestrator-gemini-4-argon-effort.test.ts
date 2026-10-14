@@ -11,7 +11,7 @@ import { rmTestDataDir } from "./test-data-dir.ts";
  * model offered efforts, so an antigravity task stored `high`; now effort is
  * the model id's suffix, every `MODEL_EFFORT_SUPPORT.antigravity` set is
  * empty, and a new antigravity task stores `null` — matching the rows
- * migration 064 cleared. The other three Argon rows each follow their own
+ * migration 065 cleared. The other three Argon rows each follow their own
  * kind's rule: gemini none, cursor high, fx auto.
  *
  * Same harness as orchestrator-discovered-efforts.test.ts: a mkdtemp

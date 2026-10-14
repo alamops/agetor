@@ -1662,6 +1662,24 @@ export interface Task {
    */
   fxRecovery?: TaskFxRecovery | null;
   /**
+   * The branch name agetor last observed checked out in the task's worktree.
+   * `null` = never observed, or a detached HEAD at the last observation.
+   * `task.branch` stays the task's identity branch; this is where the
+   * worktree actually was, so drift is derived as
+   * `checkoutBranch != null && checkoutBranch !== branch`. Refreshed at run
+   * start, run settle, terminal open and archive (and mirrored onto a
+   * pipeline parent from its step rows) via `tasks.setCheckoutBranch` — a
+   * targeted `UPDATE`, no `updated_at` bump. Server-managed: not in
+   * `ALLOWED_PATCH_FIELDS` and excluded from the generic `tasks.update` SET
+   * clause, same as `fxRecovery`.
+   *
+   * Optional (rather than required) for the same fixture-compatibility
+   * reason as `fxRecovery`: the many hand-built `Task` fixtures predate this
+   * field — `db.ts` always populates it on read, so runtime code can treat a
+   * missing key the same as `null`.
+   */
+  checkoutBranch?: string | null;
+  /**
    * Whether this task has assistant messages the user hasn't seen yet —
    * `last_assistant_event_id > last_seen_event_id` (both watermarks live on
    * the `tasks` row, migration 045), computed in `db.ts`'s `toTask` and
@@ -1839,6 +1857,31 @@ export interface WorktreeGitStatus {
   /** The dir isn't inspectable (missing, not a git repo, git failed). When true,
    *  the other fields are not meaningful. */
   ignored: boolean;
+  /** Live short branch name (`rev-parse --abbrev-ref HEAD`) the worktree has
+   *  checked out right now. null on a detached HEAD or when unknown (including
+   *  `ignored`). Can differ from the task's own branch when the worktree has
+   *  drifted. */
+  branch: string | null;
+}
+
+/**
+ * What `GET /tasks/:id/teardown-preview` returns: the branches deleting the
+ * task would remove, so the delete confirm and `agetor rm` can name them
+ * before anything happens.
+ */
+export interface TaskTeardownPreview {
+  /** Branches delete would remove, after exclusions (the task branch first). */
+  branches: string[];
+  /** The branch currently checked out in the worktree, when readable. */
+  liveBranch: string | null;
+  /** The task's own branch (`task.branch`), null for a non-worktree task. */
+  taskBranch: string | null;
+  /** Where the non-task branch name came from: the live worktree, the last
+   *  observed `checkoutBranch`, only `task.branch`, or nothing to delete. */
+  source: "live" | "last-seen" | "task-branch" | "none";
+  /** Candidates deliberately left alone, with why: the repo's default branch,
+   *  a pull request's head branch, or a branch another task still holds. */
+  excluded: { branch: string; reason: "default-branch" | "pr-head" | "held-by-task" }[];
 }
 
 /**
@@ -2614,7 +2657,7 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   // (2026-10-14): gemini-4-argon-{low,medium,high} only — no bare id, no
   // -fast, no minimal tier, no Max Mode (same shape as 3.8 Flash). The
   // unsuffixed label maps to the high tier (house convention; Cursor's own
-  // listing says "Gemini 4 Argon High"). Migration 063 normalizes stored
+  // listing says "Gemini 4 Argon High"). Migration 064 normalizes stored
   // variant ids.
   "gemini-4-argon": {
     label: "Gemini 4 Argon",
@@ -3325,7 +3368,7 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // Google on 2026-03-09 and is retired here; migration 049 rewrites
     // tasks still pinned to it to its successor, 3.1 Pro preview. Google
     // deprecated 3.7 Flash on 2026-10-08 (auto-routed to 3.8) and 3.5 Flash
-    // (to 3.6); those rows are retired here too, and migration 065 rewrites
+    // (to 3.6); those rows are retired here too, and migration 066 rewrites
     // tasks still pinned to 3.7/3.5 Flash to 3.8 Flash.
     models: [
       // GA 2026-10-13 (ai.google.dev model page / changelog). The only
@@ -4266,6 +4309,16 @@ export interface GitHubNotificationsResult {
  *                  this stream just keeps the open panel's tab strip in sync.
  *                  The subagent's actual transcript content rides the normal
  *                  user/assistant/tool_* streams, tagged via `subagentId`.
+ *   compaction_summary — Claude Code's own context-compaction summary (the
+ *                  JSONL `user` line carrying `isCompactSummary: true`),
+ *                  persisted verbatim with no agetor-authored wrapper. Kept
+ *                  off the `user` stream on purpose: the first-load anchor
+ *                  (`runs.lastUserEventId`) and the resend picker
+ *                  (`runs.userMessageHistory`) both filter `stream = 'user'`,
+ *                  so the summary is excluded from them by construction.
+ *                  Set at ingest only — rows stored before this stream
+ *                  existed keep rendering as before (see
+ *                  `src/shared/compaction.ts`).
  */
 export type RunEventStream =
   | "stdout"
@@ -4278,7 +4331,29 @@ export type RunEventStream =
   | "thinking"
   | "tool_use"
   | "tool_result"
-  | "subagent";
+  | "subagent"
+  | "compaction_summary";
+
+/**
+ * What made a claude-code session start a turn agetor didn't send — the
+ * trigger of an `origin: "continuation"` run (`startContinuationRun` in
+ * `src/bun/orchestrator.ts`, adopted by `maybeAdoptContinuation` in
+ * `src/bun/claude-tmux.ts`):
+ *   notification — a `<task-notification>` (background task finished);
+ *   user         — a `user` line agetor didn't paste (typed in the attached
+ *                  terminal);
+ *   assistant    — an `assistant` line with no turn open (Claude continued
+ *                  on its own).
+ */
+export type ContinuationTrigger = "notification" | "user" | "assistant";
+
+/** The status line a continuation run opens with, per trigger — says what
+ *  actually happened instead of blaming a background task for every case. */
+export const CONTINUATION_STATUS_TEXT: Readonly<Record<ContinuationTrigger, string>> = {
+  notification: "auto-continued after background task",
+  user: "turn started from the terminal",
+  assistant: "Claude continued on its own",
+};
 
 /** Max number of persisted events `GET /tasks/:id/events` replays on SSE
  *  (re)connect — the most recent window; older history is fetched on demand
@@ -4494,6 +4569,10 @@ export type GlobalEvent =
        *  resolve the step row themselves; absent for an ordinary task (and
        *  on events from an older core, so always read it with a fallback). */
       pipelineParentId?: string;
+      /** The pipeline parent's title, stamped alongside `pipelineParentId`
+       *  so a toast can name the pipeline before the client's own task poll
+       *  has the parent row (a run started right after the page loaded). */
+      pipelineParentTitle?: string;
     }
   | {
       kind: "column";
@@ -4512,6 +4591,8 @@ export type GlobalEvent =
       /** Pipeline parent id when `taskId` is a hidden step task — see the
        *  `run-status` member. Optional/additive. */
       pipelineParentId?: string;
+      /** See the `run-status` member. */
+      pipelineParentTitle?: string;
     }
   | {
       kind: "update";
@@ -4545,6 +4626,9 @@ export type GlobalEvent =
        *  (`src/bun/interactions.ts`) stamps it on the request/resolved
        *  payloads it hands the orchestrator's bridge. */
       pipelineParentId?: string;
+      /** See the `run-status` member. Stamped by the orchestrator's
+       *  `emitGlobal`, not by the registry. */
+      pipelineParentTitle?: string;
     }
   | {
       /**
@@ -4564,6 +4648,8 @@ export type GlobalEvent =
       /** Pipeline parent id when `taskId` is a hidden step task — see the
        *  `run-status` member. Optional/additive. */
       pipelineParentId?: string;
+      /** See the `run-status` member. */
+      pipelineParentTitle?: string;
     }
   | {
       /**
@@ -4613,6 +4699,8 @@ export type GlobalEvent =
       /** Pipeline parent id when `taskId` is a hidden step task — see the
        *  `run-status` member. Optional/additive. */
       pipelineParentId?: string;
+      /** See the `run-status` member. */
+      pipelineParentTitle?: string;
     }
   | {
       /**

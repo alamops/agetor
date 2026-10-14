@@ -1910,6 +1910,11 @@ const IDLE_STATUS_BAR_VARIANTS: Array<[string, string]> = [
   ["accept edits", "⏵⏵ accept edits on (shift+tab to cycle) · ← 1 agent"],
   ["plan mode", "⏸ plan mode on (shift+tab to cycle) · ← 1 agent"],
   ["bypass permissions, no '· ← N agent' suffix", "⏵⏵ bypass permissions on (shift+tab to cycle)"],
+  ["auto mode with a '⧉ index' segment (2.1.29x)", "⏵⏵ auto mode on (shift+tab to cycle) · ⧉ index · ← 1 agent"],
+  [
+    "auto mode with the right-hand '◉ xhigh · /effort' hint (2.1.296)",
+    "⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                               ◉ xhigh · /effort",
+  ],
 ];
 
 for (const [label, bar] of IDLE_STATUS_BAR_VARIANTS) {
@@ -2355,5 +2360,670 @@ describe("sliceModalRegion", () => {
 
   test("no footer at all → the full text, unchanged", () => {
     expect(sliceModalRegion("a\nb\nc")).toBe("a\nb\nc");
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Composer placeholder (docs/plans/claude-code-placeholder.md, TT1): a dim
+// prompt suggestion / startup `Try "…"` sample / `Message @<agent>…` hint on
+// the live `❯` row is an EMPTY composer, not text in the box. Plain
+// `capture-pane -p` cannot tell it from typed text; the styled
+// (`capture-pane -p -e`) tail can — the placeholder is SGR-dim.
+// ────────────────────────────────────────────────────────────────────────────
+
+const {
+  stripSgr,
+  isPlaceholderRow,
+  placeholderRowShowing,
+  livePromptRow,
+  livePromptRowIndex,
+} = __forTest;
+
+const PLACEHOLDER_STATUS_BAR = "⏵⏵ auto mode on (shift+tab to cycle) · ⧉ index · ← 1 agent";
+
+/** The live `❯` row as claude 2.1.296 renders it: a default-colour SGR lead,
+ *  the glyph, then a NBSP (U+00A0, not an ASCII space) before any text. */
+const livePrefix = "\x1b[39m❯\xa0";
+
+/** SGR-only projection (the fixtures below use nothing but `ESC[…m`). */
+const sgrPlain = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+
+/**
+ * A full synthetic `{ plain, styled }` tail pair for one live row. Both
+ * captures have the SAME line count and the live row at the same raw index
+ * (a transcript echo, a blank row, a separator, the live `❯` row, a
+ * separator, then the status bar); the styled one just carries SGR escapes
+ * on its chrome rows too, like the real `capture-pane -e` does. Pass the
+ * styled live row WITHOUT the `\x1b[39m❯\xa0` lead (it is prepended) — or a
+ * full `liveRow` override to build a deliberately mismatched styled tail.
+ */
+function placeholderPanes(
+  rowSuffix: string,
+  opts: { statusBar?: string; liveRow?: string } = {},
+): { plain: string; styled: string; rowIndex: number } {
+  const statusBar = opts.statusBar ?? PLACEHOLDER_STATUS_BAR;
+  const styledLive = opts.liveRow ?? `${livePrefix}${rowSuffix}`;
+  const styledLines = [
+    "\x1b[39m❯\xa0/model sonnet\x1b[0m",
+    "  ⎿  Set model to Sonnet 5 and saved as your default for new sessions",
+    "",
+    `\x1b[2m${IDLE_BORDER}\x1b[0m`,
+    styledLive,
+    `\x1b[2m${IDLE_BORDER}\x1b[0m`,
+    `  \x1b[2m${statusBar}\x1b[0m`,
+  ];
+  const plainLines = styledLines.map(sgrPlain);
+  return { plain: plainLines.join("\n"), styled: styledLines.join("\n"), rowIndex: 4 };
+}
+
+/** Live-row suffixes (after the `\x1b[39m❯\xa0` lead) that ARE placeholders. */
+const placeholderCases: Array<[string, string]> = [
+  ["a contiguous dim suggestion", "\x1b[2mmake a vertical version too\x1b[0m"],
+  [
+    "the per-word dim startup sample (resets at every space)",
+    '\x1b[2mTry\x1b[0m \x1b[2m"create\x1b[0m \x1b[2ma\x1b[0m \x1b[2mfile\x1b[0m \x1b[2mcalled\x1b[0m \x1b[2mhello.txt"\x1b[0m',
+  ],
+  [
+    "an inverted first char closed with SGR 27 (7…27…2)",
+    "\x1b[7mm\x1b[27m\x1b[2make a vertical version too\x1b[0m",
+  ],
+  [
+    "an inverted first char closed with a full reset (7…0…2)",
+    "\x1b[7mm\x1b[0m\x1b[2make a vertical version too\x1b[0m",
+  ],
+  ["a 'Message @<agent>…' dim hint", "\x1b[2mMessage @reviewer…\x1b[0m"],
+  ["a two-char placeholder: inverted first char + one dim char", "\x1b[7mo\x1b[27m\x1b[2mk\x1b[0m"],
+  ["dim set alongside an extended colour in one sequence ('2;38;5;7')", "\x1b[2;38;5;7mmake a vertical version too\x1b[0m"],
+  ["dim set through a compound param ('0;2')", "\x1b[0;2mmake a vertical version too\x1b[0m"],
+  ["dim set after an empty-param reset ('ESC[m')", "\x1b[m\x1b[2mmake a vertical version too\x1b[0m"],
+  [
+    "dim survives an unrelated colour change mid-row",
+    "\x1b[2mmake a \x1b[38;5;244mvertical\x1b[39m version too\x1b[0m",
+  ],
+];
+
+/** Live-row suffixes that are NOT placeholders (text, chips, mixed or coloured rows). */
+const nonPlaceholderCases: Array<[string, string]> = [
+  ["typed text (plain)", "hello from agetor"],
+  ["a plain paste chip", "[Pasted text #1 +25 lines]"],
+  ["a plain image chip", "[Image #2]"],
+  ["an image chip followed by typed text", "[Image #2] hello"],
+  ["a dim run followed by plain text", "\x1b[2mmake a\x1b[0m vertical version too"],
+  ["plain text followed by a dim run", "make a \x1b[2mvertical version too\x1b[0m"],
+  ["dim cleared mid-row by SGR 22", "\x1b[2mmake a \x1b[22mvertical version too\x1b[0m"],
+  ["text coloured with the 256-colour index 2 (green, NOT dim)", "\x1b[38;5;2mhello from agetor\x1b[0m"],
+  ["a single char in the 256-colour index 7 (NOT inverse)", "\x1b[38;5;7mx\x1b[0m"],
+  ["text coloured with truecolour 2;2;2 (NOT dim)", "\x1b[38;2;2;2;2mhello from agetor\x1b[0m"],
+  ["a single char in truecolour 7;7;7 (NOT inverse)", "\x1b[38;2;7;7;7mx\x1b[0m"],
+  ["a 256-colour background index 2 (NOT dim)", "\x1b[48;5;2mhello from agetor\x1b[0m"],
+  ["a dim paste chip (explicit exclusion)", "\x1b[2m[Pasted text #1 +3 lines]\x1b[0m"],
+  ["a dim image chip (explicit exclusion)", "\x1b[2m[Image #2]\x1b[0m"],
+  ["an inverted run longer than the first char", "\x1b[7mhello\x1b[0m"],
+  // Claude's cursor block sits on the LAST typed character, so a one-letter
+  // draft renders as one inverted char with nothing dim — typed text, not a
+  // placeholder (code review, low finding 1).
+  ["a one-char typed draft under the cursor block (7…27)", "\x1b[7mh\x1b[27m"],
+  ["a one-char typed draft under the cursor block (7…0)", "\x1b[7mh\x1b[0m"],
+  ["a one-char typed draft under an unclosed cursor block", "\x1b[7mh"],
+  ["a one-char inverted draft followed by trailing spaces", "\x1b[7mh\x1b[0m   "],
+  ["a row with no visible text after the glyph", ""],
+];
+
+describe("stripSgr", () => {
+  test("removes SGR sequences, leaving the plain text", () => {
+    expect(stripSgr("\x1b[39m❯\xa0\x1b[2mmake a\x1b[0m version")).toBe("❯\xa0make a version");
+    expect(stripSgr("\x1b[1;38;5;12mbold\x1b[m")).toBe("bold");
+  });
+
+  test("removes non-'m' CSI sequences too (erase / cursor movement)", () => {
+    expect(stripSgr("a\x1b[Kb\x1b[2Kc\x1b[3;4Hd")).toBe("abcd");
+  });
+
+  test("removes an OSC 8 hyperlink terminated by BEL, keeping the link text", () => {
+    expect(stripSgr("\x1b]8;;https://example.invalid/x\x07link\x1b]8;;\x07 after")).toBe("link after");
+  });
+
+  test("removes an OSC 8 hyperlink terminated by ST (ESC \\), keeping the link text", () => {
+    expect(stripSgr("\x1b]8;;https://example.invalid/x\x1b\\link\x1b]8;;\x1b\\ after")).toBe("link after");
+  });
+
+  test("removes a charset designation", () => {
+    expect(stripSgr("\x1b(Bplain")).toBe("plain");
+  });
+
+  test("drops a stray lone ESC that starts no recognised sequence", () => {
+    expect(stripSgr("abc\x1b")).toBe("abc");
+    expect(stripSgr("a\x1b\x01b")).toBe("a\x01b");
+  });
+
+  test("is the identity on text without escapes", () => {
+    expect(stripSgr("❯\xa0hello — plain")).toBe("❯\xa0hello — plain");
+  });
+});
+
+describe("isPlaceholderRow — the SGR dim rule", () => {
+  for (const [label, suffix] of placeholderCases) {
+    test(`true for ${label}`, () => {
+      const row = `${livePrefix}${suffix}`;
+      expect(isPlaceholderRow(row)).toBe(true);
+    });
+  }
+
+  for (const [label, suffix] of nonPlaceholderCases) {
+    test(`false for ${label}`, () => {
+      const row = `${livePrefix}${suffix}`;
+      expect(isPlaceholderRow(row)).toBe(false);
+    });
+  }
+
+  test("false for a bare row (no text after the glyph) and for a row with no glyph at all", () => {
+    expect(isPlaceholderRow(livePrefix)).toBe(false);
+    expect(isPlaceholderRow("\x1b[2mjust dim text, no prompt glyph\x1b[0m")).toBe(false);
+  });
+
+  test("an ASCII space after the glyph reads the same as the NBSP", () => {
+    expect(isPlaceholderRow("\x1b[39m❯ \x1b[2mmake a vertical version too\x1b[0m")).toBe(true);
+    expect(isPlaceholderRow("\x1b[39m❯ hello from agetor")).toBe(false);
+  });
+});
+
+describe("placeholderRowShowing — escape-only rows in the styled capture", () => {
+  test("blank rows that carry only escapes in the styled capture keep the index alignment (still a placeholder)", () => {
+    const { plain, styled } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    // `capture-pane -e` can emit a bare reset on a row that is blank in the
+    // plain capture; the line count is unchanged, so the live row's index
+    // still lines up.
+    const styledLines = styled.split("\n");
+    expect(styledLines[2]).toBe("");
+    styledLines[2] = "\x1b[0m";
+    const withEscapeRow = ["\x1b[0m\x1b[39m", ...styledLines].join("\n");
+    const plainWithBlank = ["", ...plain.split("\n")].join("\n");
+    expect(placeholderRowShowing(plainWithBlank, withEscapeRow)).toBe(true);
+    expect(paneShowsIdleInputBox(plainWithBlank, withEscapeRow)).toBe(true);
+    expect(paneShowsComposerText(plainWithBlank, withEscapeRow)).toBe(false);
+  });
+
+  test("an extra escape-only row at the TOP of the styled capture only (counts differ) shifts the index and is not trusted", () => {
+    const { plain, styled } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    const shifted = ["\x1b[0m", ...styled.split("\n")].join("\n");
+    expect(placeholderRowShowing(plain, shifted)).toBe(false);
+    expect(paneShowsIdleInputBox(plain, shifted)).toBe(false);
+  });
+});
+
+describe("livePromptRow / livePromptRowIndex — raw line index", () => {
+  test("livePromptRowIndex is the index into tail.split('\\n') and livePromptRow is that very line", () => {
+    const { plain, rowIndex } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    expect(livePromptRowIndex(plain)).toBe(rowIndex);
+    expect(livePromptRow(plain)).toBe(plain.split("\n")[rowIndex]!);
+    expect(livePromptRow(plain)).toBe("❯\xa0make a vertical version too");
+  });
+
+  test("blank rows (leading, between chrome rows) count toward the raw index; a trailing artifact row after the bar is tolerated", () => {
+    const lines = [
+      "",
+      "",
+      "  ⎿  an earlier transcript row",
+      "",
+      "❯ /model sonnet",
+      "",
+      IDLE_BORDER,
+      "",
+      "❯\xa0make a vertical version too",
+      IDLE_BORDER,
+      `  ${PLACEHOLDER_STATUS_BAR}`,
+      "  a stray artifact row",
+    ];
+    const tail = lines.join("\n");
+    // The bottom-most `❯` row wins over the transcript echo further up, and
+    // the index counts every blank row.
+    expect(livePromptRowIndex(tail)).toBe(8);
+    expect(livePromptRow(tail)).toBe(lines[8]!);
+  });
+
+  test("null when no status bar is anchored in the last two non-blank rows", () => {
+    expect(livePromptRowIndex("❯\xa0hello\nsome transcript\nmore transcript")).toBeNull();
+    expect(livePromptRow("❯\xa0hello\nsome transcript\nmore transcript")).toBeNull();
+  });
+});
+
+describe("placeholderRowShowing / paneShowsIdleInputBox / paneShowsComposerText with a styled tail", () => {
+  for (const [label, suffix] of placeholderCases) {
+    test(`placeholder (${label}) reads idle, not composer text`, () => {
+      const { plain, styled } = placeholderPanes(suffix);
+      expect(placeholderRowShowing(plain, styled)).toBe(true);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+      expect(paneShowsComposerText(plain, styled)).toBe(false);
+    });
+  }
+
+  for (const [label, suffix] of nonPlaceholderCases) {
+    if (suffix === "") continue; // covered by the bare-row tests below
+    test(`non-placeholder (${label}) reads as composer text, not idle`, () => {
+      const { plain, styled } = placeholderPanes(suffix);
+      expect(placeholderRowShowing(plain, styled)).toBe(false);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(false);
+      expect(paneShowsComposerText(plain, styled)).toBe(true);
+    });
+  }
+
+  test("a bare row is idle with or without a styled tail, and is never composer text", () => {
+    const { plain, styled } = placeholderPanes("");
+    expect(plain.split("\n")[4]).toBe("❯\xa0");
+    expect(paneShowsIdleInputBox(plain)).toBe(true);
+    expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+    expect(paneShowsComposerText(plain)).toBe(false);
+    expect(paneShowsComposerText(plain, styled)).toBe(false);
+  });
+
+  test("without a styled tail (omitted, undefined or null) a placeholder-text row reads exactly as today: composer text, not idle", () => {
+    const { plain } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    for (const styled of [undefined, null] as const) {
+      expect(placeholderRowShowing(plain, styled)).toBe(false);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(false);
+      expect(paneShowsComposerText(plain, styled)).toBe(true);
+    }
+    expect(paneShowsIdleInputBox(plain)).toBe(false);
+    expect(paneShowsComposerText(plain)).toBe(true);
+  });
+
+  test("a styled row whose plain projection differs from the plain capture (the pane moved between the two reads) is NOT trusted as a placeholder", () => {
+    const { plain } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    // The styled read caught a later frame: a different dim suggestion.
+    const moved = placeholderPanes("", {
+      liveRow: `${livePrefix}\x1b[2msomething else entirely\x1b[0m`,
+    }).styled;
+    expect(placeholderRowShowing(plain, moved)).toBe(false);
+    expect(paneShowsIdleInputBox(plain, moved)).toBe(false);
+    expect(paneShowsComposerText(plain, moved)).toBe(true);
+  });
+
+  test("a styled tail that is offset by a row (its index names a different line) is NOT trusted either", () => {
+    const { plain, styled } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    const shifted = `\n${styled}`;
+    expect(placeholderRowShowing(plain, shifted)).toBe(false);
+    // And one too short to hold the live row's index at all.
+    expect(placeholderRowShowing(plain, "\x1b[2mmake a vertical version too\x1b[0m")).toBe(false);
+  });
+
+  test("trailing whitespace differences between the two captures are tolerated (right-trimmed compare)", () => {
+    const { plain, styled } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m   ");
+    expect(placeholderRowShowing(plain.replace(/ +$/gm, ""), styled)).toBe(true);
+  });
+
+  test("a working pane (spinner + 'esc to interrupt' bar) never reads idle or composer text, placeholder or not", () => {
+    const styledLines = [
+      "✽ Frosting… (2m 52s · ↓ 12.1k tokens)",
+      "",
+      `${livePrefix}\x1b[2mmake a vertical version too\x1b[0m`,
+      "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent",
+    ];
+    const styled = styledLines.join("\n");
+    const plain = sgrPlain(styled);
+    expect(paneShowsIdleInputBox(plain, styled)).toBe(false);
+    expect(paneShowsComposerText(plain, styled)).toBe(false);
+  });
+});
+
+describe("idle status-bar variants read as idle with a bare NBSP row, styled or not", () => {
+  for (const [label, bar] of IDLE_STATUS_BAR_VARIANTS) {
+    test(`"${label}"`, () => {
+      const { plain, styled } = placeholderPanes("", { statusBar: bar });
+      expect(STATUS_BAR_RE.test(bar)).toBe(true);
+      expect(paneShowsIdleInputBox(plain)).toBe(true);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+      expect(paneShowsComposerText(plain, styled)).toBe(false);
+    });
+  }
+
+  for (const [label, bar] of IDLE_STATUS_BAR_VARIANTS) {
+    test(`"${label}" — a dim placeholder above it reads idle only given the styled tail`, () => {
+      const { plain, styled } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m", { statusBar: bar });
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+      expect(paneShowsIdleInputBox(plain)).toBe(false);
+    });
+  }
+});
+
+describe("placeholder keeps the unknown-prompt watchdog chain quiet", () => {
+  const SUGGESTION = "\x1b[2mmake a vertical version too\x1b[0m";
+
+  test("paneIdle computed from a placeholder (styled) disarms stuckTurnFallbackArmed and pickScrapeMatch / matchUnparsableModal yield nothing", () => {
+    const { plain, styled } = placeholderPanes(SUGGESTION);
+    const paneWorking = paneShowsClaudeWorking(plain);
+    const paneIdle = paneShowsIdleInputBox(plain, styled);
+    expect(paneWorking).toBe(false);
+    expect(paneIdle).toBe(true);
+
+    const watchdogArmed = stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking, paneIdle });
+    expect(watchdogArmed).toBe(false);
+    expect(matchUnparsableModal(plain, watchdogArmed)).toBeNull();
+    expect(pickScrapeMatch(plain, { paneWorking, watchdogArmed })).toBeNull();
+    expect(paneShowsBlockingPrompt(plain)).toBe(false);
+  });
+
+  test("contrast: with NO styled evidence the same quiet turn arms the watchdog and the placeholder row registers as an unparsable card (the prod bug this guards against)", () => {
+    const { plain } = placeholderPanes(SUGGESTION);
+    const paneWorking = paneShowsClaudeWorking(plain);
+    const paneIdle = paneShowsIdleInputBox(plain);
+    expect(paneIdle).toBe(false);
+
+    const watchdogArmed = stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking, paneIdle });
+    expect(watchdogArmed).toBe(true);
+    expect(pickScrapeMatch(plain, { paneWorking, watchdogArmed })).not.toBeNull();
+  });
+
+  test("typed text in the composer is NOT idle even with a styled tail, so the watchdog still arms (genuinely stranded text keeps today's behaviour)", () => {
+    const { plain, styled } = placeholderPanes("hello from agetor");
+    const paneIdle = paneShowsIdleInputBox(plain, styled);
+    expect(paneIdle).toBe(false);
+    expect(stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking: false, paneIdle })).toBe(true);
+  });
+
+  test("the injectable styled reader round-trips through setCaptureStyledTail (restores the previous reader)", async () => {
+    const { styled } = placeholderPanes(SUGGESTION);
+    const prev = __forTest.setCaptureStyledTail(async () => styled);
+    try {
+      const swapped = __forTest.setCaptureStyledTail(async () => null);
+      expect(await swapped({} as never)).toBe(styled);
+      __forTest.setCaptureStyledTail(swapped);
+    } finally {
+      __forTest.setCaptureStyledTail(prev);
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Live captures (claude 2.1.296 / tmux 3.6a, 2026-10-13): the rows below are
+// verbatim `capture-pane -p -e` bytes from a real session, not hand-built.
+// They pin the three placeholder families seen live, both cursor styles, the
+// background-agent roster that 2.1.296 draws BELOW the status bar, and the
+// comma-joined `1 shell, 1 monitor` status item.
+// ────────────────────────────────────────────────────────────────────────────
+
+const LIVE_BORDER = `\x1b[38;5;244m${"─".repeat(80)}`;
+const LIVE_IDLE_BAR = "\x1b[39m  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m (shift+tab to cycle) · ← 1 agent\x1b[39m";
+const LIVE_ROSTER_BAR =
+  "\x1b[39m  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m (shift+tab to cycle) · ← 1 agent · ↓ to manage\x1b[39m";
+/** Roster as drawn in the MAIN view (`⏺` on main) — the agent had finished;
+ *  its row keeps the frozen elapsed time and token counter. */
+const LIVE_ROSTER_MAIN = [
+  "\x1b[1m  ⏺ main\x1b[0m",
+  "\x1b[38;5;246m  \x1b[38;5;211m◯ \x1b[38;5;246mgeneral-purpose\x1b[39m  \x1b[38;5;246msleeper\x1b[39m                           \x1b[38;5;246m1m 40s · ↓ 37.4k tokens\x1b[39m",
+];
+/** Same roster while viewing the subagent's transcript (`⏺` on the agent). */
+const LIVE_ROSTER_AGENT_VIEW = [
+  "\x1b[38;5;246m  ◯ main\x1b[39m",
+  "\x1b[1m  \x1b[38;5;211m⏺ \x1b[39mgeneral-purpose\x1b[0m  \x1b[1msleeper\x1b[0m                           \x1b[1m1m 40s · ↓ 37.4k tokens\x1b[0m",
+];
+
+/** A live pane tail pair: transcript, border, the live row, border, bar,
+ *  then any rows below the bar (one blank row before them, as captured). */
+function livePanes(liveRow: string, belowBar: string[] = [], bar = LIVE_IDLE_BAR): { plain: string; styled: string } {
+  const styledLines = [
+    "\x1b[38;5;231m⏺\x1b[39m I added a docstring to add() in util.py.",
+    "",
+    "\x1b[38;5;246m✻ Brewed for 4s · done 6:39 PM\x1b[39m",
+    LIVE_BORDER,
+    liveRow,
+    LIVE_BORDER,
+    bar,
+    ...(belowBar.length > 0 ? ["", ...belowBar] : []),
+  ];
+  return { plain: styledLines.map(stripSgr).join("\n"), styled: styledLines.join("\n") };
+}
+
+const LIVE_PLACEHOLDER_ROWS: Array<[string, string]> = [
+  ["a post-turn prompt suggestion", "\x1b[39m❯\xa0\x1b[2mcommit this\x1b[0m"],
+  ["the startup sample, one dim span (after the box was cleared)", '\x1b[39m❯\xa0\x1b[2mTry "fix typecheck errors"\x1b[0m'],
+  [
+    "the startup sample, dim per word (fresh session)",
+    '\x1b[39m❯\xa0\x1b[2mTry\x1b[0m \x1b[2m"create\x1b[0m \x1b[2ma\x1b[0m \x1b[2mutil\x1b[0m \x1b[2mlogging.py\x1b[0m \x1b[2mthat..."',
+  ],
+  [
+    "the startup sample with Claude's own cursor cell inverting the first char (native cursor off)",
+    '\x1b[39m❯\xa0\x1b[7mT\x1b[0;2mry\x1b[0m \x1b[2m"edit\x1b[0m \x1b[2m<filepath>\x1b[0m \x1b[2mto..."\x1b[0m',
+  ],
+  [
+    "the cleared startup sample with the inverted first char, one dim span",
+    '\x1b[39m❯\xa0\x1b[7mT\x1b[0;2mry "edit <filepath> to..."\x1b[0m',
+  ],
+  ["the 'Message @<agent>…' hint while viewing a background subagent", "\x1b[39m❯\xa0\x1b[2mMessage @general-purpose…\x1b[0m"],
+];
+
+/** Typed drafts with Claude's own cursor cell (native cursor off): the
+ *  inverted cell is AFTER or INSIDE the text, never a placeholder. */
+const LIVE_TYPED_ROWS: Array<[string, string]> = [
+  ["one typed char, cursor cell after it", "\x1b[39m❯\xa0h\x1b[7m \x1b[0m"],
+  ["a typed word, cursor cell after it", "\x1b[39m❯\xa0hello\x1b[7m \x1b[0m"],
+  ["a typed word, cursor cell inside it", "\x1b[39m❯\xa0hel\x1b[7ml\x1b[0mo"],
+];
+
+describe("live 2.1.296 captures — placeholder rows read idle, typed rows don't", () => {
+  for (const [label, row] of LIVE_PLACEHOLDER_ROWS) {
+    test(`${label}: a placeholder, idle with the styled tail, text without it`, () => {
+      expect(isPlaceholderRow(row)).toBe(true);
+      const { plain, styled } = livePanes(row);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+      expect(paneShowsComposerText(plain, styled)).toBe(false);
+      // Plain `capture-pane -p` alone can't tell: today's reading.
+      expect(paneShowsIdleInputBox(plain)).toBe(false);
+    });
+  }
+  for (const [label, row] of LIVE_TYPED_ROWS) {
+    test(`${label}: composer text even with the styled tail`, () => {
+      expect(isPlaceholderRow(row)).toBe(false);
+      const { plain, styled } = livePanes(row);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(false);
+      expect(paneShowsComposerText(plain, styled)).toBe(true);
+    });
+  }
+  test("the empty composer with Claude's own cursor cell (an inverted space) is a bare ❯", () => {
+    const { plain } = livePanes("\x1b[39m❯\xa0\x1b[7m \x1b[0m");
+    expect(paneShowsIdleInputBox(plain)).toBe(true);
+  });
+});
+
+describe("live 2.1.296 captures — the background-agent roster below the status bar", () => {
+  test("main view: the suggestion row above the bar is still the live prompt row", () => {
+    const row = "\x1b[39m❯\xa0\x1b[2mcheck on the sleeper agent\x1b[0m";
+    const { plain, styled } = livePanes(row, LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(livePromptRow(plain)).toBe("❯\xa0check on the sleeper agent");
+    expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+  });
+
+  test("subagent view: the 'Message @<agent>…' row reads idle", () => {
+    const row = "\x1b[39m❯\xa0\x1b[2mMessage @general-purpose…\x1b[0m";
+    const { plain, styled } = livePanes(row, LIVE_ROSTER_AGENT_VIEW, LIVE_ROSTER_BAR);
+    expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+    expect(paneShowsComposerText(plain, styled)).toBe(false);
+  });
+
+  test("a bare ❯ above a roster reads idle; typed text above one reads as composer text", () => {
+    const bare = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(paneShowsIdleInputBox(bare.plain)).toBe(true);
+    const typed = livePanes("\x1b[39m❯\xa0hello", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(livePromptRow(typed.plain)).toBe("❯\xa0hello");
+    expect(paneShowsIdleInputBox(typed.plain, typed.styled)).toBe(false);
+  });
+
+  test("without a session, the roster's token counter still reads as working chrome (one frame can't tell a finished agent from a running one)", () => {
+    const { plain } = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(paneShowsClaudeWorking(plain)).toBe(true);
+    expect(paneShowsClaudeWorking(plain, { rosterLive: true })).toBe(true);
+  });
+
+  test("a frozen roster (rosterLive: false) is not working chrome; other working chrome still is", () => {
+    const { plain } = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(paneShowsClaudeWorking(plain, { rosterLive: false })).toBe(false);
+    const busy = livePanes(
+      "\x1b[39m❯\xa0",
+      LIVE_ROSTER_MAIN,
+      "  ⏵⏵ auto mode on · ← 1 agent · esc to interrupt · ↓ to manage",
+    );
+    expect(paneShowsClaudeWorking(busy.plain, { rosterLive: false })).toBe(true);
+  });
+});
+
+describe("background-agent roster liveness (noteAgentRoster)", () => {
+  const ROSTER_ROW = "  ◯ general-purpose  sleeper                           1m 40s · ↓ 37.4k tokens";
+  const pane = (row: string | null): string =>
+    [
+      "❯\xa0",
+      "─".repeat(80),
+      "  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent · ↓ to manage",
+      "",
+      "  ⏺ main",
+      ...(row === null ? [] : [row]),
+    ].join("\n");
+  const freshState = () => ({ agentRosterSignature: null, agentRosterChangedAt: 0 }) as never;
+
+  test("the signature holds only the agent rows, not the main row", () => {
+    expect(__forTest.agentRosterSignature(pane(ROSTER_ROW))).toBe(ROSTER_ROW.trim());
+    expect(__forTest.agentRosterSignature(pane(null))).toBeNull();
+  });
+
+  test("a roster is live when first seen, frozen once it hasn't changed for AGENT_ROSTER_LIVE_MS, live again when it ticks", () => {
+    const state = freshState();
+    const t0 = 1_000_000;
+    expect(__forTest.noteAgentRoster(state, pane(ROSTER_ROW), t0)).toBe(true);
+    expect(__forTest.noteAgentRoster(state, pane(ROSTER_ROW), t0 + __forTest.AGENT_ROSTER_LIVE_MS - 1)).toBe(true);
+    expect(__forTest.noteAgentRoster(state, pane(ROSTER_ROW), t0 + __forTest.AGENT_ROSTER_LIVE_MS)).toBe(false);
+    const ticked = ROSTER_ROW.replace("1m 40s", "1m 41s");
+    expect(__forTest.noteAgentRoster(state, pane(ticked), t0 + __forTest.AGENT_ROSTER_LIVE_MS + 1)).toBe(true);
+  });
+
+  test("no roster on the pane is not live and clears the remembered rows", () => {
+    const state = freshState() as unknown as { agentRosterSignature: string | null };
+    __forTest.noteAgentRoster(state as never, pane(ROSTER_ROW), 5);
+    expect(__forTest.noteAgentRoster(state as never, pane(null), 6)).toBe(false);
+    expect(state.agentRosterSignature).toBeNull();
+  });
+
+  test("a frozen roster no longer blocks the idle-settle net: idle at the box, not working", () => {
+    const state = freshState();
+    const { plain } = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    const t0 = 2_000_000;
+    __forTest.noteAgentRoster(state, plain, t0);
+    const rosterLive = __forTest.noteAgentRoster(state, plain, t0 + __forTest.AGENT_ROSTER_LIVE_MS);
+    const paneWorking = paneShowsClaudeWorking(plain, { rosterLive });
+    expect(paneWorking).toBe(false);
+    expect(paneShowsIdleInputBox(plain)).toBe(true);
+    expect(stuckTurnFallbackArmed({
+      turnInFlight: true,
+      lastJsonlAppendAt: 1,
+      now: 1 + __forTest.STUCK_TURN_FALLBACK_MS + 1,
+      paneWorking,
+      askCardLive: false,
+      paneIdle: false,
+    })).toBe(true);
+  });
+
+  test("a frozen roster no longer hides typed composer text", () => {
+    const typed = livePanes("\x1b[39m❯\xa0hello", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(paneShowsComposerText(typed.plain, typed.styled)).toBe(false);
+    expect(paneShowsComposerText(typed.plain, typed.styled, { rosterLive: false })).toBe(true);
+  });
+
+  test("the selector-focused roster (the bar replaced by '↑/↓ to select') has no live prompt row", () => {
+    const tail = [
+      "❯\xa0Message @general-purpose…",
+      "─".repeat(80),
+      "  ↑/↓ to select · Enter to view",
+      "❯ ◯ main",
+      "  ⏺ general-purpose  sleeper                               7s · ↓ 37.4k tokens",
+    ].join("\n");
+    expect(livePromptRowIndex(tail)).toBeNull();
+  });
+
+  test("transcript-shaped ⏺ rows at the bottom are not a roster (no bar above them → no live row)", () => {
+    const tail = ["❯\xa0", "─".repeat(80), "⏺ The sleep 120 is running in the background.", "⏺ I'll wait for it."].join("\n");
+    expect(livePromptRowIndex(tail)).toBeNull();
+  });
+
+  test("a roster longer than the skip cap is left alone (reads as no bar)", () => {
+    const rows = Array.from({ length: 13 }, (_, i) => `  ◯ general-purpose  agent${i}   2s · ↓ 1.0k tokens`);
+    const { plain } = livePanes("\x1b[39m❯\xa0", ["  ⏺ main", ...rows], LIVE_ROSTER_BAR);
+    expect(livePromptRowIndex(plain)).toBeNull();
+  });
+
+  test("readPaneMode finds the bar above a roster of four agents", async () => {
+    const rows = Array.from({ length: 4 }, (_, i) => `  ◯ general-purpose  agent${i}   2s · ↓ 1.0k tokens`);
+    const { plain } = livePanes("\x1b[39m❯\xa0", ["  ⏺ main", ...rows], LIVE_ROSTER_BAR);
+    const prev = __forTest.setCaptureModePane(async () => plain);
+    try {
+      expect(await __forTest.readPaneMode({} as never)).toBe("auto");
+    } finally {
+      __forTest.setCaptureModePane(prev);
+    }
+  });
+});
+
+describe("live 2.1.296 captures — comma-joined status-bar items", () => {
+  for (const bar of [
+    "  ⏵⏵ auto mode on · ← 1 agent · 1 shell, 1 monitor · ↓ to manage",
+    "  ⏵⏵ auto mode on · ← 1 agent · 1 shell, 1 monitor · esc to interrupt · ↓ to …",
+    "  ⏵⏵ auto mode on · 2 monitors, 1 shell · ← 1 agent",
+  ]) {
+    test(`working: ${JSON.stringify(bar)}`, () => {
+      expect(paneShowsClaudeWorking(`❯\xa0\n${"─".repeat(80)}\n${bar}`)).toBe(true);
+    });
+  }
+  test("prose that merely mentions shells after a list is not working chrome", () => {
+    expect(paneShowsClaudeWorking("· 3 shell scripts were updated, 2 tests added")).toBe(false);
+  });
+});
+
+/** Claude's background-sessions view as captured live (2.1.299, 80x24,
+ *  2026-10-13; directory and session names replaced). */
+const BACKGROUND_VIEW_PANE = [
+  "",
+  " ▐▛███▛█   Claude Code v2.1.299",
+  "▝▜██████▀  New sessions: Opus 5.5 · high effort",
+  " ▝▝   ▝▝   ~/projects/example-repo",
+  "           2 awaiting input · 0 working · 1 completed",
+  "",
+  "Your conversation moved to the background — enter opens it · esc returns to it ·",
+  "ctrl+c twice quits",
+  "",
+  "~/projects/example-repo",
+  "∙ Example task one              Failed · waiting on helper subagent's sle…   5m",
+  "✻ current session               Needs input · repo                            0s",
+  "",
+  "────────────────────────────────────────────────────────────────────────────────",
+  "❯ describe a task for a new session",
+  "────────────────────────────────────────────────────────────────────────────────",
+  "  ⏵⏵ auto mode · enter to return · space to reply · ctrl+x to delete · ? for sh…",
+  "",
+  "",
+].join("\n");
+
+describe("Claude's background-sessions view", () => {
+  test("the live view is detected", () => {
+    expect(__forTest.paneShowsBackgroundSessionsView(BACKGROUND_VIEW_PANE)).toBe(true);
+  });
+
+  test("the view is neither an idle input box nor composer text, and no matcher cards it", () => {
+    expect(paneShowsIdleInputBox(BACKGROUND_VIEW_PANE)).toBe(false);
+    expect(paneShowsComposerText(BACKGROUND_VIEW_PANE)).toBe(false);
+    expect(__forTest.paneShowsBlockingPrompt(BACKGROUND_VIEW_PANE)).toBe(false);
+  });
+
+  test("an ordinary idle pane, and the redraw frame after Escape, are not the view", () => {
+    const { plain } = livePanes("\x1b[39m❯\xa0");
+    expect(__forTest.paneShowsBackgroundSessionsView(plain)).toBe(false);
+    expect(__forTest.paneShowsBackgroundSessionsView("\n  Waiting for session to redraw… Ctrl+Z to detach\n")).toBe(false);
+  });
+
+  test("the bar's wording in the transcript, above a real input box, is not the view", () => {
+    const tail = [
+      "⏺ The bar reads `· enter to return · space to reply · ctrl+x to delete`.",
+      "Your conversation moved to the background — enter opens it · esc returns to it ·",
+      "─".repeat(80),
+      "❯\xa0",
+      "─".repeat(80),
+      "  ⏵⏵ auto mode on (shift+tab to cycle)",
+    ].join("\n");
+    expect(__forTest.paneShowsBackgroundSessionsView(tail)).toBe(false);
   });
 });

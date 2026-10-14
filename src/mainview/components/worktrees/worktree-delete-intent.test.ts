@@ -27,6 +27,7 @@ function gitStatus(overrides: Partial<WorktreeGitStatus> = {}): WorktreeGitStatu
     ahead: 0,
     merged: null,
     ignored: false,
+    branch: null,
     ...overrides,
   };
 }

@@ -302,6 +302,124 @@ export async function headBranchState(dir: string): Promise<HeadBranchState> {
   return { branch, isDefaultBranch: branch === defaultName };
 }
 
+/**
+ * The branch `dir` currently has checked out, read straight from git
+ * (`symbolic-ref`), distinguishing the three outcomes callers care about:
+ *   • `{ ok: true, branch: "<name>" }` — on a named branch;
+ *   • `{ ok: true, branch: null }`     — detached HEAD (nothing to record);
+ *   • `{ ok: false, error }`           — the dir is missing, isn't a repo, or
+ *                                         git failed/timed out (unknown).
+ *
+ * Unlike `headBranchState` this does no default-branch lookup and does not
+ * collapse "detached" and "couldn't tell" into one value, so a refresh point
+ * can decide to write `null` (detached) versus leave the stored value alone
+ * (unknown). Never throws; 5 s timeout.
+ */
+export async function readCheckoutBranch(
+  dir: string,
+): Promise<{ ok: true; branch: string | null } | { ok: false; error: string }> {
+  if (!existsSync(dir)) return { ok: false, error: `directory does not exist: ${dir}` };
+  try {
+    const head = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], dir, 5_000);
+    if (head.ok) {
+      return head.stdout ? { ok: true, branch: head.stdout } : { ok: true, branch: null };
+    }
+    // `--quiet` makes a detached HEAD exit 1 with no output; any other failure
+    // (128 = not a repo / corrupt, a killed timeout, ...) is "unknown".
+    if (head.exitCode === 1 && !head.stdout && !head.stderr) return { ok: true, branch: null };
+    return { ok: false, error: head.stderr || head.stdout || `git exited ${head.exitCode}` };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * The repo's default branch as a bare local name (`main`), or null when it
+ * can't be resolved. Wraps `resolveDefaultBranchRef` (which can return the
+ * remote-qualified `origin/main`) and strips the remote/refs prefix so the
+ * result is comparable against a local branch name. `root` should be the repo
+ * root (or any dir inside the repo). Never throws.
+ */
+export async function resolveDefaultBranchName(root: string): Promise<string | null> {
+  try {
+    if (!existsSync(root)) return null;
+    const ref = await resolveDefaultBranchRef(root);
+    if (!ref) return null;
+    const name = ref
+      .replace(/^refs\/remotes\/origin\//, "")
+      .replace(/^refs\/heads\//, "")
+      .replace(/^origin\//, "");
+    return name.length > 0 ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Why `planTeardownBranches` refused to delete a candidate branch. */
+export interface TeardownBranchExclusion {
+  branch: string;
+  reason: "default-branch" | "pr-head" | "held-by-task";
+}
+
+/** Which input the second (non-task) branch name came from. */
+export type TeardownBranchSource = "live" | "last-seen" | "task-branch" | "none";
+
+/**
+ * Pure planner for which git branches deleting a task should remove.
+ *
+ * Candidates are `taskBranch` (the branch agetor created — never for a PR-head
+ * task, `branchSource: "existing"`, whose branch is the user's own) and, when
+ * it is a different name, the branch the worktree is actually on: `liveBranch`
+ * when readable, else the `lastSeen` value recorded on the task row. Any
+ * candidate equal to the repo default (`defaultBranch`, or the literal
+ * `main`/`master` when the default couldn't be resolved) or held by another
+ * task (`heldByOthers`) is dropped and reported in `excluded` instead.
+ *
+ * Takes every other row's names as input rather than looking them up: this
+ * module must not import `tasks` from db.ts (init cycle, see terminals.ts).
+ */
+export function planTeardownBranches(input: {
+  taskBranch: string | null;
+  branchSource: "created" | "existing" | null | undefined;
+  liveBranch: string | null;
+  lastSeen: string | null;
+  defaultBranch: string | null;
+  heldByOthers: Set<string>;
+}): { branches: string[]; source: TeardownBranchSource; excluded: TeardownBranchExclusion[] } {
+  const { taskBranch, branchSource, liveBranch, lastSeen, defaultBranch, heldByOthers } = input;
+  const excluded: TeardownBranchExclusion[] = [];
+  const candidates: string[] = [];
+  const exclude = (branch: string, reason: TeardownBranchExclusion["reason"]): void => {
+    if (!excluded.some((e) => e.branch === branch && e.reason === reason)) {
+      excluded.push({ branch, reason });
+    }
+  };
+  const consider = (branch: string): void => {
+    const isDefault = defaultBranch !== null
+      ? branch === defaultBranch
+      : branch === "main" || branch === "master";
+    if (isDefault) exclude(branch, "default-branch");
+    else if (heldByOthers.has(branch)) exclude(branch, "held-by-task");
+    else if (!candidates.includes(branch)) candidates.push(branch);
+  };
+
+  if (taskBranch) {
+    if (branchSource === "existing") exclude(taskBranch, "pr-head");
+    else consider(taskBranch);
+  }
+
+  // The "other" name: live wins over last-seen, and only counts when it is a
+  // different branch from the task's own.
+  let source: TeardownBranchSource = taskBranch ? "task-branch" : "none";
+  const other = liveBranch ?? lastSeen;
+  if (other && other !== taskBranch) {
+    source = liveBranch ? "live" : "last-seen";
+    consider(other);
+  }
+
+  return { branches: candidates, source, excluded };
+}
+
 // A directory's git top-level is stable for the lifetime of the process, so
 // resolved roots are memoized — discovery (/agent-discovery) resolves the same
 // workdir on every refresh and would otherwise spawn a `git rev-parse` for
@@ -752,6 +870,45 @@ export interface PreparedWorkdir {
   worktreePath: string | null;
   /** Human-readable note for the run log. */
   note: string;
+  /**
+   * The branch actually checked out in `cwd` at the moment of the call: the
+   * live name when an existing worktree was reused (which may differ from
+   * `branch` if the user or an agent switched it — drift is tolerated, never
+   * corrected), the branch the worktree was just created/re-attached on
+   * otherwise. `null` for a detached HEAD, an unreadable checkout, or when no
+   * worktree is involved (`isolation: "none"`). Callers record it as the
+   * task's last-seen checkout; `branch` stays "the branch agetor created".
+   */
+  checkoutBranch: string | null;
+  /**
+   * Whether `checkoutBranch` is an actual reading of the worktree: `true` for
+   * a successful read (a detached HEAD included) and for a worktree that was
+   * just created or re-attached; `false` when the reuse-path read failed or no
+   * worktree is involved. Callers must only record `checkoutBranch` when this
+   * is `true` — an unknown read stored as `null` would erase the recorded
+   * drifted branch (the badge, delete-time teardown and unarchive restore all
+   * read it), matching `readCheckoutBranch`'s own keep-on-failure contract.
+   * See `recordableCheckout`.
+   */
+  checkoutKnown: boolean;
+  /**
+   * A non-fatal problem worth surfacing in the run log — currently only: the
+   * recorded checkout branch could not be restored on re-attach, so the
+   * worktree came back on `task.branch` instead.
+   */
+  warning?: string;
+}
+
+/**
+ * The value a caller should record as the task's last-seen checkout after a
+ * `prepareWorkdir`, or `undefined` when there is nothing to record — no
+ * worktree (`isolation: "none"`), or the reuse-path read failed. Keeping the
+ * stored value on `undefined` is what stops a transient git failure from
+ * erasing a recorded drifted branch.
+ */
+export function recordableCheckout(prepared: PreparedWorkdir): string | null | undefined {
+  if (!prepared.worktreePath || !prepared.checkoutKnown) return undefined;
+  return prepared.checkoutBranch;
 }
 
 /** Returned instead of PreparedWorkdir when the worktree cannot be set up. */
@@ -783,7 +940,7 @@ export async function prepareWorkdir(
   },
 ): Promise<PrepareResult> {
   if (task.isolation !== "worktree") {
-    return { cwd: task.workdir, branch: null, worktreePath: null, note: "isolation: none" };
+    return { cwd: task.workdir, branch: null, worktreePath: null, note: "isolation: none", checkoutBranch: null, checkoutKnown: false };
   }
 
   const root = await repoRoot(task.workdir);
@@ -795,22 +952,29 @@ export async function prepareWorkdir(
 
   // Reuse if previously created and still on disk.
   if (task.worktreePath && task.branch && existsSync(task.worktreePath)) {
-    // Verify the worktree is on the expected branch. A user cd-ing in and
-    // switching branches shouldn't silently redirect the agent.
-    const head = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], task.worktreePath, 5_000);
-    if (head.ok && head.stdout !== task.branch) {
-      const checkout = await git(["checkout", task.branch], task.worktreePath, 10_000);
-      if (!checkout.ok) {
-        return {
-          error: `worktree is on "${head.stdout}" not "${task.branch}" and could not be switched: ${checkout.stderr || checkout.stdout}`,
-        };
-      }
-    }
+    // Branch drift is tolerated, never corrected. A user (or the agent itself)
+    // may have switched this worktree onto another branch; we read the live
+    // name purely to report it. We deliberately do NOT `git checkout
+    // task.branch`: a checkout can fail on conflicting uncommitted edits, and
+    // when it succeeds it silently switches the branch under a live agent or
+    // an open terminal. `task.branch` stays "the branch agetor created"; the
+    // live name travels back as `checkoutBranch` for callers to record. A
+    // failed read is unknown (`checkoutKnown: false`) — it must not fail the
+    // prepare, and callers must not record it over the stored value.
+    const live = await readCheckoutBranch(task.worktreePath);
+    const checkoutBranch = live.ok ? live.branch : null;
+    let where: string;
+    if (!live.ok) where = `on ${task.branch}`;
+    else if (checkoutBranch === null) where = `(detached HEAD; task branch ${task.branch})`;
+    else if (checkoutBranch !== task.branch) where = `on ${checkoutBranch} (task branch ${task.branch})`;
+    else where = `on ${task.branch}`;
     return {
       cwd: task.worktreePath,
       branch: task.branch,
       worktreePath: task.worktreePath,
-      note: `reusing worktree at ${task.worktreePath} on ${task.branch}`,
+      note: `reusing worktree at ${task.worktreePath} ${where}`,
+      checkoutBranch,
+      checkoutKnown: live.ok,
     };
   }
 
@@ -842,11 +1006,54 @@ export async function prepareWorkdir(
   // a path it still tracks as a missing-but-registered worktree without a
   // prune step first.
   await git(["worktree", "prune"], root, 10_000);
-  let created = branchExists
-    ? await git(["worktree", "add", wt, branch], root)
-    : task.branchSource === "existing"
-      ? await git(["worktree", "add", "--track", "-b", branch, wt, `origin/${branch}`], root)
-      : await git(["worktree", "add", "-b", branch, wt, base], root);
+  // Re-attach prefers the checkout agetor last recorded for this task (e.g. an
+  // archived task whose worktree had drifted onto another branch), so unarchive
+  // / restore brings the worktree back where the user left it — whenever that
+  // branch still exists and differs from the task branch, even if the task
+  // branch itself is gone (the work lives on the recorded branch, so recreating
+  // `task.branch` from base would bring the worktree back without it). When the
+  // recorded branch is missing or the attach fails (say it is checked out
+  // elsewhere), fall back to the task branch and say so via `warning`.
+  const recorded = task.checkoutBranch ?? null;
+  const wantsRecorded = recorded !== null && recorded !== branch;
+  const recordedExists = wantsRecorded
+    && (await git(["rev-parse", "--verify", "--quiet", `refs/heads/${recorded}`], root, 5_000)).ok;
+  let restoredOn: string | null = null;
+  const warnings: string[] = [];
+  let created: GitResult | null = null;
+  if (recordedExists) {
+    const onRecorded = await git(["worktree", "add", wt, recorded], root);
+    if (onRecorded.ok) {
+      restoredOn = recorded;
+      created = onRecorded;
+      // A PR-head task's branch may live only as `origin/<branch>` (fetchBranch
+      // refreshes the remote-tracking ref, never a local one), so a missing
+      // local ref alone doesn't mean the task branch is gone.
+      if (!branchExists) {
+        const onOrigin = task.branchSource === "existing"
+          && (await git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`], root, 5_000)).ok;
+        if (!onOrigin) warnings.push(`task branch ${branch} no longer exists — restored on ${recorded}`);
+      }
+    } else {
+      const why = (onRecorded.stderr || onRecorded.stdout).split("\n")[0] ?? "";
+      warnings.push(`could not restore recorded checkout ${recorded}${why ? ` (${why})` : ""} — restored on ${branch}`);
+    }
+  } else if (wantsRecorded) {
+    warnings.push(`recorded checkout ${recorded} no longer exists — restored on ${branch}`);
+  }
+  if (!created) {
+    if (branchExists) {
+      created = await git(["worktree", "add", wt, branch], root);
+    } else if (task.branchSource === "existing") {
+      created = await git(["worktree", "add", "--track", "-b", branch, wt, `origin/${branch}`], root);
+    } else {
+      // A re-attach (the task materialized before) whose branch was deleted by
+      // hand: the branch comes back fresh from base, without the previous
+      // run's commits — say so rather than let it pass silently.
+      if (task.worktreePath) warnings.push(`task branch ${branch} no longer exists — recreated it from ${base === "HEAD" ? "HEAD" : base.slice(0, 7)}`);
+      created = await git(["worktree", "add", "-b", branch, wt, base], root);
+    }
+  }
 
   // Collision recovery — ONLY on a first materialization (`!task.worktreePath`).
   //
@@ -909,12 +1116,28 @@ export async function prepareWorkdir(
     };
   }
 
+  const warning = warnings.length > 0 ? warnings.join("; ") : undefined;
+  if (restoredOn) {
+    return {
+      cwd: wt,
+      branch,
+      worktreePath: wt,
+      note: `restored worktree at ${wt} on ${restoredOn} (task branch ${branch})`,
+      checkoutBranch: restoredOn,
+      checkoutKnown: true,
+      ...(warning ? { warning } : {}),
+    };
+  }
+
   const baseLabel = task.baseRef ? `base: ${task.baseRef.slice(0, 7)}` : `base: ${root} HEAD`;
   return {
     cwd: wt,
     branch,
     worktreePath: wt,
     note: `created worktree at ${wt} on ${branch} (${baseLabel})`,
+    checkoutBranch: branch,
+    checkoutKnown: true,
+    ...(warning ? { warning } : {}),
   };
 }
 
@@ -1200,6 +1423,12 @@ export async function getTaskDiffBlob(
  * Best-effort cleanup. Called on task delete; never throws.
  * Removes the worktree directory and deletes the branch.
  *
+ * By default only `task.branch` is deleted (never a `branchSource: "existing"`
+ * one). Pass `opts.branches` to delete exactly that list instead — each with
+ * `git branch -D`, independently and best-effort — which is how delete also
+ * removes a branch the worktree had drifted onto (see `planTeardownBranches`,
+ * which is responsible for excluding branches that must survive).
+ *
  * Two-stage cleanup so we never leak a directory under our owned data dir:
  *   1. Ask git to remove the registered worktree + branch (works in the
  *      common case where `task.workdir` still points at the original repo).
@@ -1208,14 +1437,23 @@ export async function getTaskDiffBlob(
  *      where the user edited `task.workdir` after the worktree was created,
  *      so git in the new workdir doesn't know about this worktree.
  */
-export async function removeWorktree(task: Task): Promise<void> {
+export async function removeWorktree(task: Task, opts?: { branches?: string[] }): Promise<void> {
   if (!task.worktreePath) return;
   const root = await repoRoot(task.workdir);
   if (root) {
     await git(["worktree", "remove", "--force", task.worktreePath], root);
-    // A `branchSource: "existing"` branch is the user's own (e.g. a PR's head
-    // branch) — deleting it here would destroy a branch agetor doesn't own.
-    if (task.branch && task.branchSource !== "existing") {
+    if (opts?.branches) {
+      // Caller-planned list: each branch is deleted on its own so one failure
+      // (e.g. "checked out at <main repo>") never blocks the rest. A leading
+      // "-" would be read as an option, so such a name is skipped.
+      for (const b of opts.branches) {
+        if (!b || b.startsWith("-")) continue;
+        try { await git(["branch", "-D", b], root); }
+        catch { /* best-effort */ }
+      }
+    } else if (task.branch && task.branchSource !== "existing") {
+      // A `branchSource: "existing"` branch is the user's own (e.g. a PR's head
+      // branch) — deleting it here would destroy a branch agetor doesn't own.
       await git(["branch", "-D", task.branch], root);
     }
     // Clean up any stale .git/worktrees/<id>/ registrations left by previous

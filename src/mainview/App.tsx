@@ -88,6 +88,13 @@ function stepParentIdOf(ev: GlobalEvent): string | null {
   return ev.pipelineParentId ? ev.pipelineParentId : null;
 }
 
+/** The parent title the core stamped next to `pipelineParentId` — what a
+ *  retargeted toast falls back to before the polled list has the parent. */
+function stepParentTitleOf(ev: GlobalEvent): string | null {
+  if (!("pipelineParentTitle" in ev)) return null;
+  return ev.pipelineParentTitle ? ev.pipelineParentTitle : null;
+}
+
 /** Subtitle for a step task's toast once it's retargeted at its pipeline
  *  parent (M-A3): the step's own name. A step row's title is
  *  `<pipeline name> · <step name>` (`pipeline-runner.ts`), so the
@@ -1305,7 +1312,7 @@ function AppInner() {
             const parent = tasksRef.current.find((t) => t.id === stepParentId);
             return {
               taskId: stepParentId,
-              title: parent?.title || `Pipeline ${stepParentId.slice(0, 7)}`,
+              title: parent?.title || stepParentTitleOf(ev) || `Pipeline ${stepParentId.slice(0, 7)}`,
               subtitle: stepSubtitle(task, parent),
               isSelected: viewingTask(stepParentId),
               isFocused,
@@ -1829,16 +1836,50 @@ function AppInner() {
     }
   }, [refresh, surfaceError]);
   const del = useCallback(async (t: Task) => {
+    // Ask the core which branches the delete would remove — `t.branch`, plus
+    // the branch a drifted worktree is actually on — so the confirm names
+    // every one. Best-effort: on failure (or an older core) fall back to the
+    // task row — `t.branch`, plus the last-seen drifted checkout as a branch
+    // the delete may also remove (the core's exclusions — default branch, a
+    // branch another task holds — can't be applied client-side).
+    const preview = t.worktreePath
+      ? await api.getTaskTeardownPreview(t.id).catch(() => null)
+      : null;
+    const maybeDrifted = t.checkoutBranch && t.checkoutBranch !== t.branch ? t.checkoutBranch : null;
     const ok = await confirm({
       title: `Delete "${t.title}"?`,
       description: (
         <>
           The task and its run history will be removed.
-          {t.worktreePath && (
+          {t.worktreePath && preview && preview.branches.length > 0 && (
+            <>
+              {" "}Its git worktree and {preview.branches.length === 1 ? "branch" : "branches"}{" "}
+              <span data-testid="delete-confirm-branches">
+                {preview.branches.map((b, i) => (
+                  <span key={b}>
+                    {i > 0 && ", "}
+                    <span className="font-mono text-foreground/80">{b}</span>
+                  </span>
+                ))}
+              </span>{" "}
+              will be torn down.
+            </>
+          )}
+          {t.worktreePath && preview && preview.branches.length === 0 && (
+            <> Its git worktree will be torn down; no branches will be deleted.</>
+          )}
+          {t.worktreePath && !preview && (
             <>
               {" "}Its git worktree (
               <span className="font-mono text-foreground/80">{t.branch}</span>
-              ) will also be torn down.
+              ) will also be torn down
+              {maybeDrifted ? (
+                <>
+                  , and possibly the branch it was last on (
+                  <span data-testid="delete-confirm-maybe-branch" className="font-mono text-foreground/80">{maybeDrifted}</span>
+                  ).
+                </>
+              ) : "."}
             </>
           )}
         </>

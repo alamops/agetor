@@ -70,6 +70,12 @@ const BASE_API_PORT = 4600;
 const HEALTH_TIMEOUT_MS = Number(process.env.E2E_HEALTH_TIMEOUT_MS ?? 60_000);
 const HEALTH_POLL_INTERVAL_MS = 200;
 const TEARDOWN_GRACE_MS = 4_000;
+/** The fake fx storm's pause and the fx auto-resume delay this fixture sets
+ *  on every backend (`AGETOR_FAKE_FX_RECOVERY_PAUSE_MS`,
+ *  `AGETOR_FX_AUTO_RESUME_DELAY_MS` below). Exported so
+ *  `e2e/fx-recovery.spec.ts` sizes its waits from the same numbers. */
+export const E2E_FX_STORM_PAUSE_MS = 6_000;
+export const E2E_FX_AUTO_RESUME_DELAY_MS = 6_000;
 const FINAL_KILL_WAIT_MS = 2_000;
 const PREFLIGHT_TIMEOUT_MS = 2_000;
 
@@ -345,7 +351,15 @@ async function provisionBackend(
       // production default. Read once per schedule/re-arm, so it applies to
       // every fx task this worker's backend ever runs, not just one spec's
       // tasks — no other spec file in this fixture starts an fx run.
-      AGETOR_FX_AUTO_RESUME_DELAY_MS: "2000",
+      // 6s rather than the 2s it once was: the spec has to see the countdown
+      // and click Cancel inside this window, and a loaded machine (load ~40)
+      // spent most of 2s on the panel's poll round-trips alone.
+      AGETOR_FX_AUTO_RESUME_DELAY_MS: String(E2E_FX_AUTO_RESUME_DELAY_MS),
+      // Test seam for the fake fx storm (`src/bun/agents.ts`,
+      // `fakeFxRecoveryPauseMs`): pause at 6s instead of 1.5s, so the live
+      // "retrying" notice `e2e/fx-recovery.spec.ts` asserts stays up long
+      // enough to be seen under load. Only that spec runs the storm.
+      AGETOR_FAKE_FX_RECOVERY_PAUSE_MS: String(E2E_FX_STORM_PAUSE_MS),
       // Test seam for the fake fx driver's recovery scenario (`src/bun/
       // agents.ts`'s `FAKE_FX_RECOVERY_URL_PROMPT_MARKER` doc comment) —
       // process-wide equivalent of the per-task prompt marker, so every

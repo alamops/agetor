@@ -7,9 +7,9 @@ import normalizeCursorGrok47 from "./migrations/055_normalize_cursor_grok_4_7.sq
 import normalizeCursorOpus55 from "./migrations/056_normalize_cursor_opus_5_5.sql" with { type: "text" };
 import normalizeCursorSonnet55 from "./migrations/060_normalize_cursor_sonnet_5_5.sql" with { type: "text" };
 import normalizeCursorHaiku55 from "./migrations/062_normalize_cursor_haiku_5_5.sql" with { type: "text" };
-import normalizeCursorGemini4Argon from "./migrations/063_normalize_cursor_gemini_4_argon.sql" with { type: "text" };
-import antigravityEffortInModelId from "./migrations/064_antigravity_effort_in_model_id.sql" with { type: "text" };
-import retireGemini37And35Flash from "./migrations/065_retire_gemini_3_7_and_3_5_flash.sql" with { type: "text" };
+import normalizeCursorGemini4Argon from "./migrations/064_normalize_cursor_gemini_4_argon.sql" with { type: "text" };
+import antigravityEffortInModelId from "./migrations/065_antigravity_effort_in_model_id.sql" with { type: "text" };
+import retireGemini37And35Flash from "./migrations/066_retire_gemini_3_7_and_3_5_flash.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
 
 // Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
@@ -824,14 +824,21 @@ test("062_normalize_cursor_haiku_5_5 folds claude-haiku-5-5-thinking-* ids into 
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("062 (cursor Haiku 5.5) sits right after 061_antigravity_harness", () => {
+test("062 (cursor Haiku 5.5) is registered right after 061_antigravity_harness", () => {
   const at = migrations.findIndex((m) => m.id === "062_normalize_cursor_haiku_5_5");
   expect(at).toBeGreaterThan(0);
   expect(migrations[at - 1]?.id).toBe("061_antigravity_harness");
   expect(migrations[at]?.sql).toContain("claude-haiku-5-5");
 });
 
-// Shared in-memory schema + readers for the 063-065 tests (same table shapes
+test("063 (task checkout branch) is registered right after 062 and adds the column", () => {
+  const at = migrations.findIndex((m) => m.id === "063_task_checkout_branch");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("062_normalize_cursor_haiku_5_5");
+  expect(migrations[at]?.sql).toContain("ADD COLUMN checkout_branch TEXT");
+});
+
+// Shared in-memory schema + readers for the 064-066 tests (same table shapes
 // as the 062 test above).
 function makeModelMigrationDb(harnessRows: Array<[string, string]>, seedSql: string) {
   const db = new Database(":memory:");
@@ -883,7 +890,7 @@ function makeModelMigrationDb(harnessRows: Array<[string, string]>, seedSql: str
   };
 }
 
-test("063_normalize_cursor_gemini_4_argon folds gemini-4-argon-* ids into base id + effort (fast reset to 0) on cursor-kind rows only, leaving antigravity's identical curated ids verbatim, idempotently", () => {
+test("064_normalize_cursor_gemini_4_argon folds gemini-4-argon-* ids into base id + effort (fast reset to 0) on cursor-kind rows only, leaving antigravity's identical curated ids verbatim, idempotently", () => {
   const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
     [
       ["cursor", "cursor"],
@@ -952,7 +959,7 @@ test("063_normalize_cursor_gemini_4_argon folds gemini-4-argon-* ids into base i
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("064_antigravity_effort_in_model_id clears effort on antigravity-kind tasks and agent profiles (model untouched) and deletes lastEffort:antigravity, idempotently", () => {
+test("065_antigravity_effort_in_model_id clears effort on antigravity-kind tasks and agent profiles (model untouched) and deletes lastEffort:antigravity, idempotently", () => {
   const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
     [
       ["antigravity", "antigravity"],
@@ -1019,7 +1026,7 @@ test("064_antigravity_effort_in_model_id clears effort on antigravity-kind tasks
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("065_retire_gemini_3_7_and_3_5_flash moves gemini-kind 3.7/3.5 Flash rows to gemini-3.8-flash and antigravity-kind gemini-3.7-flash-<effort> rows to gemini-3.8-flash-<effort>, leaving cursor and fx rows alone, idempotently", () => {
+test("066_retire_gemini_3_7_and_3_5_flash moves gemini-kind 3.7/3.5 Flash rows to gemini-3.8-flash and antigravity-kind gemini-3.7-flash-<effort> rows to gemini-3.8-flash-<effort>, leaving cursor and fx rows alone, idempotently", () => {
   const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
     [
       ["gemini", "gemini"],
@@ -1101,13 +1108,51 @@ test("065_retire_gemini_3_7_and_3_5_flash moves gemini-kind 3.7/3.5 Flash rows t
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("065 (retire gemini 3.7/3.5 Flash) is the last registered migration, after 064, after 063, after 062", () => {
-  const at = migrations.findIndex((m) => m.id === "065_retire_gemini_3_7_and_3_5_flash");
+test("066 (retire gemini 3.7/3.5 Flash) is the last registered migration, after 065, after 064, after 063 (task checkout branch)", () => {
+  const at = migrations.findIndex((m) => m.id === "066_retire_gemini_3_7_and_3_5_flash");
   expect(at).toBe(migrations.length - 1);
-  expect(migrations[at - 1]?.id).toBe("064_antigravity_effort_in_model_id");
-  expect(migrations[at - 2]?.id).toBe("063_normalize_cursor_gemini_4_argon");
-  expect(migrations[at - 3]?.id).toBe("062_normalize_cursor_haiku_5_5");
+  expect(migrations[at - 1]?.id).toBe("065_antigravity_effort_in_model_id");
+  expect(migrations[at - 2]?.id).toBe("064_normalize_cursor_gemini_4_argon");
+  expect(migrations[at - 3]?.id).toBe("063_task_checkout_branch");
   expect(migrations[at]?.sql).toContain("gemini-3.8-flash");
   expect(migrations[at - 1]?.sql).toContain("lastEffort:antigravity");
   expect(migrations[at - 2]?.sql).toContain("gemini-4-argon");
+});
+
+test("the Gemini 4 Argon migrations were renumbered 063-065 -> 064-066 when main took 063; their pre-merge ids stay as aliases so a DB that already applied them does not re-run them", () => {
+  const renumbered = [
+    ["064_normalize_cursor_gemini_4_argon", "063_normalize_cursor_gemini_4_argon"],
+    ["065_antigravity_effort_in_model_id", "064_antigravity_effort_in_model_id"],
+    ["066_retire_gemini_3_7_and_3_5_flash", "065_retire_gemini_3_7_and_3_5_flash"],
+  ] as const;
+  for (const [id, alias] of renumbered) {
+    expect(migrations.find((m) => m.id === id)?.aliases).toEqual([alias]);
+  }
+  // Every id/alias is unique across the registry (an alias that equalled another
+  // migration's id would silently mark that migration applied).
+  const seen = new Set<string>();
+  for (const m of migrations) {
+    for (const key of [m.id, ...(m.aliases ?? [])]) {
+      expect(seen.has(key)).toBe(false);
+      seen.add(key);
+    }
+  }
+
+  // A DB that applied the pre-merge ids (the branch's own dev data dir) gets
+  // the renumbered rows recorded, not re-applied; main's 063 still runs.
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE _migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
+  `);
+  const insert = db.prepare(`INSERT INTO _migrations (id, applied_at) VALUES (?, 1)`);
+  for (const m of migrations) {
+    if (m.id.startsWith("063_task_") || renumbered.some(([id]) => id === m.id)) continue;
+    insert.run(m.id);
+  }
+  for (const [, alias] of renumbered) insert.run(alias);
+  db.exec(`CREATE TABLE tasks (id TEXT PRIMARY KEY, branch TEXT)`);
+  const ran = migrate(db, migrations);
+  expect(ran).toEqual(["063_task_checkout_branch"]);
+  const ids = db.query<{ id: string }, []>(`SELECT id FROM _migrations`).all().map((r) => r.id);
+  for (const [id] of renumbered) expect(ids).toContain(id);
 });

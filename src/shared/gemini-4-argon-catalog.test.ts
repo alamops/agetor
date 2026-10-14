@@ -111,7 +111,7 @@ test("antigravity: a differently named Argon id from `agy models` is appended af
   expect(ids(rows).filter((id) => id === "gemini-4-argon-high").length).toBe(1);
 });
 
-test("antigravity: a task still pinned to a retired 3.7 Flash id shows it as an unlisted row (migration 065 normally rewrites it first)", () => {
+test("antigravity: a task still pinned to a retired 3.7 Flash id shows it as an unlisted row (migration 066 normally rewrites it first)", () => {
   const rows = mergeModelOptions({
     curated: AGENT_OPTIONS.antigravity.models,
     discovered: [],

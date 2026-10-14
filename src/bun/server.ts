@@ -28,7 +28,7 @@ import {
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
@@ -212,6 +212,7 @@ import type {
   Task,
   TaskEventsReplayMeta,
   TaskGitStatus,
+  TaskTeardownPreview,
   TaskReference,
 } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
@@ -443,6 +444,11 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
  * `PATCH /tasks/:id` for the other half of that lock: even a listed field
  * here (`agent`/`mode`/`model`/`effort`/`fast`/`maxMode`) is refused once a
  * task is bound to a profile, until it's detached.
+ *
+ * `checkoutBranch` (the last-seen worktree checkout, migration 063) is
+ * server-managed the same way: only `tasks.setCheckoutBranch` writes it, at
+ * run start/settle, terminal open and archive — a PATCH carrying it is
+ * silently ignored like every other unlisted field.
  */
 const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
   "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "fast", "maxMode", "taskType",
@@ -5620,6 +5626,22 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             } satisfies TaskGitStatus,
             { headers: corsHeaders(req) },
           );
+        }),
+      },
+      // Which branches `DELETE /tasks/:id` would remove — `task.branch` plus,
+      // when the worktree drifted onto another named branch, that one too,
+      // after the default-branch / PR-head / held-by-another-task exclusions
+      // (`teardownBranchesForTask`, the same plan the delete itself runs).
+      // Read-only; fetched by the delete confirm and `agetor rm` so both can
+      // name every branch before anything is torn down. `DELETE` itself keeps
+      // answering 204 with no body, so older clients are unaffected.
+      "/tasks/:id/teardown-preview": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(await teardownBranchesForTask(t) satisfies TaskTeardownPreview, { headers: corsHeaders(req) });
         }),
       },
 

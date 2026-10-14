@@ -608,7 +608,7 @@ test("resolveInitialModel: keeps a stored id that is still a curated row", () =>
 
 test("resolveInitialModel: a pruned gemini Flash id falls back to the default", () => {
   // gemini-3.7-flash / gemini-3.5-flash were pruned from the Gemini picker
-  // (migration 065 rewrites the pref on disk too), so a stale one falls through.
+  // (migration 066 rewrites the pref on disk too), so a stale one falls through.
   expect(resolveInitialModel("gemini", "gemini-3.7-flash", [])).toBe(DEFAULT_MODEL.gemini);
   expect(resolveInitialModel("gemini", "gemini-3.5-flash", [])).toBe(DEFAULT_MODEL.gemini);
 });

@@ -511,3 +511,16 @@ turn read as busy (also the second contributor to smoke 1's stuck run). Wave 6:
 `SPINNER_ELAPSED_WORKING_LINE` excludes `TURN_DONE_SUMMARY_RE` (the row stays volatile), and
 `Kept model as …` drift-corrects the row only when agetor's own mirror produced it
 (`viaMirror`) — a user's Esc on the picker no longer clobbers a next-run selection.
+
+## 12. Addendum (2026-10-12) — the idle-settle gate reads placeholders as idle
+
+`signalIdleSettle`'s eligibility and the composer clear from §10 both key on
+`paneShowsIdleInputBox` / `paneShowsComposerText`. On Claude Code 2.1.296 an idle composer can
+show dim placeholder text on the `❯` row (prompt suggestion, startup `Try "…"`,
+`Message @<agent>…`), which plain `capture-pane -p` reads as typed text — so the idle-settle net
+never fired and a stalled turn fell through to an unparsable card. Both predicates now take an
+optional styled tail (one extra `capture-pane -p -e`, only when the plain row is non-bare): an
+all-dim row is idle, and `paneShowsComposerText` is false on it, so `COMPOSER_CLEAR_KEYS`
+(`Escape Escape`, which opens the rewind picker on an empty box) is never sent into a
+placeholder. Agetor also launches claude with `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`. See
+`docs/plans/claude-code-placeholder.md`.

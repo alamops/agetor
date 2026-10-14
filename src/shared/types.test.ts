@@ -426,7 +426,7 @@ test("the gemini picker offers gemini-3.8-flash and no longer offers the shut-do
   expect(Object.keys(MODEL_EFFORT_SUPPORT.gemini)).not.toContain("gemini-3-pro-preview");
 });
 
-test("the gemini picker offers gemini-4-argon and no longer offers the deprecated 3.7 / 3.5 Flash (migration 065)", () => {
+test("the gemini picker offers gemini-4-argon and no longer offers the deprecated 3.7 / 3.5 Flash (migration 066)", () => {
   const ids = AGENT_OPTIONS.gemini.models.map((m) => m.id);
   expect(ids).toContain("gemini-4-argon");
   expect(ids).not.toContain("gemini-3.7-flash");
@@ -526,7 +526,7 @@ test("antigravity picker leads with the three Gemini 4 Argon effort rows, and th
   ]);
 });
 
-test("antigravity no longer offers the deprecated 3.7 Flash rows (migration 065), still 18 curated rows", () => {
+test("antigravity no longer offers the deprecated 3.7 Flash rows (migration 066), still 18 curated rows", () => {
   const ids = AGENT_OPTIONS.antigravity.models.map((m) => m.id);
   for (const id of ids) expect(id.startsWith("gemini-3.7-flash")).toBe(false);
   expect(ids.length).toBe(18);

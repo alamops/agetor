@@ -387,3 +387,10 @@ test("findMatchingEventIds: only the USER stream is normalized — an assistant 
   const events = [ev("assistant", "claude wraps pastes in <pasted_content id=\"0a7d\"> tags")];
   expect(findMatchingEventIds(events, "pasted_content")).toEqual([0]);
 });
+
+test("searchableEventText: a compaction_summary event is searchable by its body text", () => {
+  const body = "This session is being continued from a previous conversation.\n\n## Pending work\n- wire the frobnicator";
+  expect(searchableEventText("compaction_summary", body)).toBe(body);
+  const events = [ev("user", "hi"), ev("compaction_summary", body), ev("assistant", "ok")];
+  expect(findMatchingEventIds(events, "frobnicator")).toEqual([1]);
+});

@@ -2,7 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
+import {
+  test,
+  expect,
+  E2E_FX_AUTO_RESUME_DELAY_MS,
+  E2E_FX_STORM_PAUSE_MS,
+  type APIRequestContext,
+  type E2EBackend,
+  type Locator,
+  type Page,
+} from "./fixtures";
 import { gotoApp, getPreferences, openSettingsGeneral } from "./helpers";
 // Pure constants/types only (no bun/node runtime imports — see
 // `src/shared/types.ts`'s own "Keep it free of runtime imports" rule), same
@@ -13,11 +22,22 @@ import { FX_AUTO_RESUME_DELAY_PREF, FX_AUTO_RESUME_MAX, FX_AUTO_RESUME_PREF } fr
 
 // Wait budget for a fake-driver turn to surface in the panel (the paused
 // notice, the recovered line, a follow-up echo). The fake storm itself is
-// ~1.5s, but under parallel-run load the spawn (`pending: true` past
+// ~6s here (AGETOR_FAKE_FX_RECOVERY_PAUSE_MS, e2e/fixtures.ts), but under parallel-run load the spawn (`pending: true` past
 // SPAWN_RESPONSE_BUDGET_MS), the run settle, the 2s runs poll and the
 // panel's own load add up past the 10s this used to allow — same headroom
 // the pipeline specs' CONVERGE_TIMEOUT gives a fake-driver settle.
 const PAUSE_TIMEOUT = 20_000;
+
+// The two fixed real-time windows this spec runs inside, both set in
+// e2e/fixtures.ts: the fake storm pauses STORM_PAUSE_MS after the start
+// (`AGETOR_FAKE_FX_RECOVERY_PAUSE_MS`), and the auto-resume fires
+// AUTO_RESUME_DELAY_MS after that (`AGETOR_FX_AUTO_RESUME_DELAY_MS`). The
+// countdown is on screen only between the two, so a loop that starts at the
+// run's start and waits for the countdown gets until just before the
+// auto-resume fires — waiting any longer can't succeed.
+const STORM_PAUSE_MS = E2E_FX_STORM_PAUSE_MS;
+const AUTO_RESUME_DELAY_MS = E2E_FX_AUTO_RESUME_DELAY_MS;
+const COUNTDOWN_SEEN_BY = STORM_PAUSE_MS + AUTO_RESUME_DELAY_MS - 1_000;
 
 /**
  * Prompt-marker trigger for the fake fx model-response-recovery scenario
@@ -32,7 +52,8 @@ const PAUSE_TIMEOUT = 20_000;
  * Triggering this marker on turn 1 selects the "storm" variant documented in
  * `docs/plans/fix-fx-harness-rate-limit.md` §3: three retry-attempt
  * sentinels (at ~5/400/800ms) followed by a terminal `paused` sentinel (at
- * ~1500ms) once the fake's 3-attempt budget is exhausted. A *later* turn on
+ * ~1500ms; 6000ms in e2e via `AGETOR_FAKE_FX_RECOVERY_PAUSE_MS`) once the
+ * fake's 3-attempt budget is exhausted. A *later* turn on
  * the same task started via `POST /tasks/:id/fx-resume` ignores this marker
  * entirely — `AgentRunOptions.continueRecovery: true` always wins and
  * selects the "continue" variant instead (a `recovered` sentinel + an
@@ -161,7 +182,7 @@ async function enableFxHarness(backend: E2EBackend): Promise<void> {
  *  driver never touches the filesystem), explicit `mode: "yolo"`. Deliberately
  *  split from starting (unlike `e2e/fx-interactions.spec.ts`'s
  *  `createAndStartFakeFxTask`, which does both): the fake "storm" scenario's
- *  active-retry window is only ~1.5s wall-clock (see the marker's doc
+ *  active-retry window is only ~6s wall-clock (see the marker's doc
  *  comment above), and a `gotoApp` + click-to-open after the run has already
  *  started reliably burns past that window on its own (page navigation +
  *  React mount + initial `/tasks` fetch). Opening the panel FIRST, with the
@@ -196,7 +217,7 @@ async function startFakeFxRecoveryTask(request: APIRequestContext, backend: E2EB
 
 /** Create AND start a storm task in one call — for the auto-resume tests
  *  below, which only care about the state the run settles into (paused,
- *  then auto-resumed), never the ~1.5s live-retry window the split
+ *  then auto-resumed), never the ~6s live-retry window the split
  *  create/start helpers above exist to catch (see
  *  `createFakeFxRecoveryTask`'s doc comment). Mirrors
  *  `e2e/fx-interactions.spec.ts`'s `createAndStartFakeFxTask`. */
@@ -343,7 +364,7 @@ function menuItem(page: Page, action: string): Locator {
  *  event (`onVisible`/`onFocus` respectively), so one synthetic dispatch
  *  nudges both. Same trick the live-recovery-notice test above already uses
  *  to force RunPanel's own poll early; here it's what makes `task.fxRecovery`
- *  (board badge, context-menu gating) observable well inside the 2s
+ *  (board badge, context-menu gating) observable well inside the 6s
  *  `AGETOR_FX_AUTO_RESUME_DELAY_MS` auto-resume window instead of racing the
  *  natural poll cadence against the auto-resume timer. */
 async function kickPolls(page: Page): Promise<void> {
@@ -445,7 +466,7 @@ test.describe("fx recovery", () => {
 
     // Open the panel BEFORE starting — see `createFakeFxRecoveryTask`'s doc
     // comment for why this ordering (rather than start-then-navigate) is
-    // what gives the ~1.5s active window a real chance: by the time the
+    // what gives the ~6s active window a real chance: by the time the
     // panel is open and its SSE subscription is live, starting the task
     // delivers the fake driver's attempt sentinels over that already-open
     // stream instead of racing a full page load against them.
@@ -454,13 +475,13 @@ test.describe("fx recovery", () => {
     await startFakeFxRecoveryTask(request, backend, task.id);
 
     // The fake emits three retry-attempt sentinels at ~5/400/800ms, then
-    // pauses at ~1500ms. The events themselves arrive live over SSE well
+    // pauses at ~6000ms (the e2e pause seam). The events themselves arrive live over SSE well
     // within that window, but RunPanel only force-refreshes its `runs`
     // snapshot (which `latestRun`/`liveRecoveryNotice` are derived from) on
     // an SSE-driven "life sign" kick debounced behind a ~1s post-connect
     // settle window (`CONNECT_SETTLE_MS`, RunPanel.tsx) or on window focus
     // (`onFocus` → `kick()`, unconditional) — the settle window alone can
-    // eat the whole ~1.5s active window before the first forced refresh
+    // eat a ~1.5s active window before the first forced refresh
     // fires. Dispatching a synthetic `focus` event on every retry nudges the
     // SAME refresh path a real user's browser regaining focus would trigger,
     // so this is polling for a real (if debounced) state, not sleeping past
@@ -472,16 +493,16 @@ test.describe("fx recovery", () => {
       await page.evaluate(() => window.dispatchEvent(new Event("focus")));
       await expect(notice).toContainText("attempt");
       await expect(notice).toContainText("Rate limited");
-    }).toPass({ timeout: 5_000, intervals: [50, 100, 200] });
+    }).toPass({ timeout: STORM_PAUSE_MS, intervals: [50, 100, 200] });
 
     // --- Paused notice + auto-resume countdown + board badge -----------------
     // Deliberately continues within THIS SAME test rather than a fresh
-    // `gotoApp` in the next one: the run settles paused at a fixed ~1500ms
-    // mark and `AGETOR_FX_AUTO_RESUME_DELAY_MS=2000` (e2e/fixtures.ts) arms
+    // `gotoApp` in the next one: the run settles paused at a fixed ~6000ms
+    // mark and `AGETOR_FX_AUTO_RESUME_DELAY_MS=6000` (e2e/fixtures.ts) arms
     // the auto-resume timer the INSTANT it does — both on the backend's own
     // clock, independent of anything this test does. A fresh page load in a
     // follow-on test (navigation + React mount + initial `/tasks` fetch)
-    // reliably burns past however much of that fixed 2000ms window is left
+    // reliably burns past however much of that fixed 6000ms window is left
     // by the time settlement happens, so the only reliable place to observe
     // the countdown before it fires is right here, still inside the window
     // the live-notice assertion above already proved is open. `kickPolls`
@@ -490,7 +511,7 @@ test.describe("fx recovery", () => {
     // natural 2s cadence — see its doc comment.
     // Single combined poll loop (rather than sequential bounded waits) for
     // "paused notice up" AND "countdown + badge both showing the schedule" —
-    // every extra `toPass` round-trip here eats into the fixed ~2000ms
+    // every extra `toPass` round-trip here eats into the fixed ~6000ms
     // budget before the auto-resume timer fires, so this checks the whole
     // target state in one loop instead of waiting out one condition before
     // starting to poll for the next.
@@ -501,7 +522,7 @@ test.describe("fx recovery", () => {
     // timeout (200ms) — without one, a web-first assertion that's still
     // false (e.g. the badge hasn't refreshed yet) retries internally for
     // Playwright's default 5000ms before this outer `toPass` iteration even
-    // gets to retry, which single-handedly blows the ~2000ms real budget on
+    // gets to retry, which single-handedly blows the ~6000ms real budget on
     // ONE failing iteration. A short inner timeout is what makes the OUTER
     // loop's own `intervals` (and repeated `kickPolls`) actually the thing
     // doing the polling, the way the rest of this test relies on.
@@ -513,7 +534,7 @@ test.describe("fx recovery", () => {
         { timeout: 200 },
       );
       await expect(badge).toHaveText(/auto-resume \d:\d\d/, { timeout: 200 });
-    }).toPass({ timeout: 3_000, intervals: [30, 60, 100, 150] });
+    }).toPass({ timeout: COUNTDOWN_SEEN_BY, intervals: [30, 60, 100, 150] });
     await expect(paused).toContainText("recovery paused after 3/3 attempts");
     await expect(paused).toContainText("resume once the limit clears");
     // The live (active-state) notice is mutually exclusive with the paused one.
@@ -525,7 +546,7 @@ test.describe("fx recovery", () => {
     // countdown assertions above resolve quickly (often within one
     // `kickPolls` round-trip, since RunPanel's own live SSE state already
     // knows the run is paused well before any poll fires), but the fixed
-    // ~2000ms `AGETOR_FX_AUTO_RESUME_DELAY_MS` window can already be more
+    // ~6000ms `AGETOR_FX_AUTO_RESUME_DELAY_MS` window can already be more
     // than half spent by the time this test reaches this point (opening the
     // panel, waiting for a live "attempt" sentinel, then this block) — an
     // earlier version of this test that clicked the Gateway link BEFORE
@@ -572,7 +593,7 @@ test.describe("fx recovery", () => {
 
     // --- Paused notice + Resume affordance ----------------------------------
     // The auto-resume timer was already cancelled at the end of the previous
-    // test, so this state is stable — no race against the 2s auto-fire here.
+    // test, so this state is stable — no race against the 6s auto-fire here.
     const paused = panel.getByTestId("fx-recovery-paused");
     await expect(paused).toBeVisible({ timeout: PAUSE_TIMEOUT });
     await expect(paused).toContainText("recovery paused after 3/3 attempts");
@@ -701,7 +722,7 @@ test.describe("fx recovery", () => {
 
     // Open the panel BEFORE starting (same as the cancel-then-menu test
     // below): the paused notice this test observes first only exists for the
-    // ~2s AGETOR_FX_AUTO_RESUME_DELAY_MS window plus the auto-fired continue
+    // ~6s AGETOR_FX_AUTO_RESUME_DELAY_MS window plus the auto-fired continue
     // turn — a fresh page load after starting can outlast that under
     // parallel-run load, arriving to an already-recovered transcript.
     await gotoApp(page, backend.bootBase);
@@ -715,14 +736,14 @@ test.describe("fx recovery", () => {
     const pausedRunId = runsBefore[0]?.id;
     expect(pausedRunId).toBeTruthy();
 
-    // Nothing is clicked here — `AGETOR_FX_AUTO_RESUME_DELAY_MS=2000`
+    // Nothing is clicked here — `AGETOR_FX_AUTO_RESUME_DELAY_MS=6000`
     // (e2e/fixtures.ts) means the orchestrator's own timer fires the resume.
     // The opening status line on an auto-fired continue-recovery run is
     // distinct from a manual one's (`turn.origin === "auto"` in
     // `spawnFxRun`, orchestrator.ts).
     await expect(
       panel.getByText(`auto-resuming paused fx response (1/${FX_AUTO_RESUME_MAX})`, { exact: false }),
-    ).toBeVisible({ timeout: 8_000 });
+    ).toBeVisible({ timeout: AUTO_RESUME_DELAY_MS + 9_000 });
 
     // Transcript gains the recovered summary line + the assistant answer,
     // same terminal shape as a manual Resume.
@@ -753,7 +774,7 @@ test.describe("fx recovery", () => {
     const task = await createFakeFxRecoveryTask(request, backend, title);
 
     // Open the panel BEFORE starting — same reasoning as the live-notice
-    // test above: a fresh page load after starting would burn into the 2s
+    // test above: a fresh page load after starting would burn into the 6s
     // AGETOR_FX_AUTO_RESUME_DELAY_MS window this test needs to click Cancel
     // inside of.
     await gotoApp(page, backend.bootBase);
@@ -762,7 +783,7 @@ test.describe("fx recovery", () => {
 
     // Combined loop (paused notice up AND countdown showing) for the same
     // reason the live-notice test above does this: every extra `toPass`
-    // round-trip eats into the fixed ~2000ms budget before the auto-resume
+    // round-trip eats into the fixed ~6000ms budget before the auto-resume
     // timer would fire on its own.
     const paused = panel.getByTestId("fx-recovery-paused");
     const countdown = panel.getByTestId("fx-recovery-countdown");
@@ -770,12 +791,12 @@ test.describe("fx recovery", () => {
     // the live-notice test's identical comment: without one, a still-false
     // assertion retries internally for Playwright's default 5000ms before
     // this outer loop even gets another `kickPolls`, which alone can blow
-    // the ~2000ms real budget.
+    // the ~6000ms real budget.
     await expect(async () => {
       await kickPolls(page);
       await expect(paused).toBeVisible({ timeout: 200 });
       await expect(countdown).toBeVisible({ timeout: 200 });
-    }).toPass({ timeout: 3_500, intervals: [30, 60, 100, 150] });
+    }).toPass({ timeout: COUNTDOWN_SEEN_BY, intervals: [30, 60, 100, 150] });
 
     await panel.getByTestId("fx-recovery-cancel-auto").click();
     // `handleCancelFxAutoResume` only kicks the RUNS poll on success, not the
@@ -851,7 +872,7 @@ test.describe("fx recovery", () => {
     await expect(async () => {
       await kickPolls(page);
       await expect(badge).toHaveText(/auto-resume \d:\d\d/, { timeout: 200 });
-    }).toPass({ timeout: 3_500, intervals: [30, 60, 100, 150] });
+    }).toPass({ timeout: COUNTDOWN_SEEN_BY, intervals: [30, 60, 100, 150] });
 
     await rightClickCard(page, title);
     await expect(contextMenu(page)).toBeVisible();

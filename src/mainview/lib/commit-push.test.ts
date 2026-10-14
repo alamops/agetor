@@ -96,3 +96,35 @@ test("shouldOfferOpenPr: hasChanges/ahead never affect the result either way", (
     shouldOfferOpenPr(status({ remoteSynced: true, hasChanges: false, ahead: 0 })),
   ).toBe(true);
 });
+
+// ── prHeadBranch under worktree drift ────────────────────────────────────
+// The worktree can drift off `task.branch` (an agent ran `git checkout -b …`);
+// agetor tolerates that, so the commits live on the branch actually checked
+// out — that's the PR head (docs/plans/codex-terminal-worktree-error.md D7).
+
+test("prHeadBranch: a drifted live branch wins over the task branch", () => {
+  expect(prHeadBranch("agetor/abc123-thing", status({ branch: "implement/x", isDefaultBranch: false })))
+    .toBe("implement/x");
+  expect(prHeadBranch("agetor/abc123-thing", status({ branch: "implement/x" }), "created"))
+    .toBe("implement/x");
+});
+
+test("prHeadBranch: live branch equal to the task branch → the task branch", () => {
+  expect(prHeadBranch("agetor/abc123-thing", status({ branch: "agetor/abc123-thing" })))
+    .toBe("agetor/abc123-thing");
+});
+
+test("prHeadBranch: a worktree drifted onto the default branch keeps the task branch", () => {
+  expect(prHeadBranch("agetor/abc123-thing", status({ branch: "main", isDefaultBranch: true })))
+    .toBe("agetor/abc123-thing");
+});
+
+test("prHeadBranch: an ignored status never contributes a live branch", () => {
+  expect(prHeadBranch("agetor/abc123-thing", status({ ignored: true, branch: "implement/x" })))
+    .toBe("agetor/abc123-thing");
+});
+
+test("prHeadBranch: a PR-head task always keeps its own branch", () => {
+  expect(prHeadBranch("pr-head", status({ branch: "implement/x" }), "existing")).toBe("pr-head");
+  expect(prHeadBranch("pr-head", null, "existing")).toBe("pr-head");
+});

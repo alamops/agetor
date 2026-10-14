@@ -8,7 +8,7 @@ import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useFontSize } from "../font-size-provider.tsx";
 import { useTheme } from "../theme-provider.tsx";
-import { terminalFontSize } from "@/lib/font-size";
+import { TERMINAL_FONT_FAMILY, terminalFontSize } from "@/lib/font-size";
 import { macEditSequence } from "./terminal-keys.ts";
 import type { TerminalTab } from "../../../shared/types.ts";
 import type { ITheme } from "@xterm/xterm";
@@ -97,6 +97,10 @@ function TerminalPane({
   // below can send a resize frame after a live refit without needing its own
   // WebSocket plumbing.
   const wsRef = useRef<WebSocket | null>(null);
+  // Flips once the PTY has sent its first output frame — exposed as
+  // `data-ready` on the pane so e2e can wait for a live shell rather than for
+  // xterm's canvas, which renders before the socket has delivered anything.
+  const [ready, setReady] = useState(false);
   const { resolved } = useTheme();
   const { percent: fontSizePercent } = useFontSize();
   // Read via a ref inside the mount effect below so the effect's own
@@ -117,7 +121,7 @@ function TerminalPane({
     if (!host) return;
 
     const term = new Terminal({
-      fontFamily: "var(--font-mono, ui-monospace, monospace)",
+      fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: terminalFontSize(fontSizePercentRef.current),
       cursorBlink: true,
       theme: resolvedRef.current === "light" ? XTERM_THEME_LIGHT : XTERM_THEME_DARK,
@@ -170,6 +174,7 @@ function TerminalPane({
           return;
         }
         term.write(new Uint8Array(ev.data));
+        setReady(true);
       };
       sock.onclose = () => {
         if (disposed) return;
@@ -285,6 +290,9 @@ function TerminalPane({
   return (
     <div
       ref={hostRef}
+      data-testid="terminal-pane"
+      data-terminal-id={terminalId}
+      data-ready={ready ? "true" : "false"}
       className={cn(
         "absolute inset-0 p-1",
         visible ? "z-10 opacity-100" : "-z-10 opacity-0 pointer-events-none",
@@ -293,11 +301,16 @@ function TerminalPane({
   );
 }
 
+const ARCHIVED_HINT = "Unarchive this task to open a terminal";
+
 /**
  * Terminal tab strip + the active terminal, for the task details sidebar.
  * Tabs are backed by per-task PTYs on the bun side (`src/bun/terminals.ts`).
+ * An archived task can't open one (archive closes its terminals and tears
+ * its worktree down; `createTerminal` refuses it), so `archived` disables
+ * the open affordances instead of letting them fail with a toast.
  */
-export function TerminalView({ taskId }: { taskId: string }) {
+export function TerminalView({ taskId, archived = false }: { taskId: string; archived?: boolean }) {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -353,6 +366,7 @@ export function TerminalView({ taskId }: { taskId: string }) {
           {tabs.map((t) => (
             <div
               key={t.id}
+              data-testid="terminal-tab"
               className={cn(
                 "group flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[11px]",
                 t.id === activeId
@@ -378,8 +392,9 @@ export function TerminalView({ taskId }: { taskId: string }) {
         <button
           type="button"
           className="shrink-0 rounded-md p-1 text-muted-foreground hover:bg-accent/40 disabled:opacity-50"
-          title="New terminal"
-          disabled={busy}
+          title={archived ? ARCHIVED_HINT : "New terminal"}
+          data-testid="terminal-open"
+          disabled={busy || archived}
           onClick={() => void openTerminal()}
         >
           <Plus className="size-4" />
@@ -390,12 +405,13 @@ export function TerminalView({ taskId }: { taskId: string }) {
         {tabs.length === 0 ? (
           <button
             type="button"
-            className="flex h-full w-full flex-col items-center justify-center gap-2 text-xs text-muted-foreground hover:text-foreground"
-            disabled={busy}
+            className="flex h-full w-full flex-col items-center justify-center gap-2 text-xs text-muted-foreground hover:text-foreground disabled:cursor-default disabled:hover:text-muted-foreground"
+            data-testid="terminal-open"
+            disabled={busy || archived}
             onClick={() => void openTerminal()}
           >
             <TerminalSquare className="size-6" />
-            <span>Open a terminal in this task's worktree</span>
+            <span>{archived ? ARCHIVED_HINT : "Open a terminal in this task's worktree"}</span>
           </button>
         ) : (
           tabs.map((t) => (
