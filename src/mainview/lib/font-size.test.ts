@@ -4,6 +4,7 @@ import {
   readFontSizeFromBoot,
   rootFontSizeStyle,
   stepFontSize,
+  TERMINAL_FONT_FAMILY,
   terminalFontSize,
   type FontSizeAction,
 } from "./font-size.ts";
@@ -276,5 +277,14 @@ describe("fontSizeShortcutAction", () => {
     test("Alt+Ctrl+= does not fire — altKey disqualifies", () => {
       expect(fontSizeShortcutAction({ ...base, key: "=", ctrlKey: true, altKey: true }, false)).toBeNull();
     });
+  });
+});
+
+describe("TERMINAL_FONT_FAMILY", () => {
+  test("is a concrete stack a canvas font string can parse — no CSS var()", () => {
+    // xterm measures cells with `ctx.font = `${size}px ${family}``; a var()
+    // makes the canvas ignore the assignment and the terminal letter-spaced.
+    expect(TERMINAL_FONT_FAMILY).not.toContain("var(");
+    expect(TERMINAL_FONT_FAMILY.split(",").map((f) => f.trim()).at(-1)).toBe("monospace");
   });
 });

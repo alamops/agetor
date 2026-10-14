@@ -87,7 +87,7 @@ export async function cmdLs(
   if (f.search) {
     const q = f.search.toLowerCase();
     tasks = tasks.filter((t) =>
-      `${t.title} ${t.prompt} ${t.workdir} ${t.branch ?? ""}`.toLowerCase().includes(q),
+      `${t.title} ${t.prompt} ${t.workdir} ${t.branch ?? ""} ${t.checkoutBranch ?? ""}`.toLowerCase().includes(q),
     );
   }
   if (flags.json) return printJson(tasks);
@@ -169,6 +169,12 @@ function needsCell(t: Task): string {
   // A step task (listed only under `--steps`) names its parent here so the
   // row is actionable — `agetor pipeline status <parent>` / `agetor show`.
   if (t.pipelineParentId) parts.push(c.dim(`step of ${t.pipelineParentId.slice(0, 8)}`));
+  // Worktree drifted off the task branch (last-seen checkout, recorded by the
+  // core at run start/settle, terminal open and archive) — a hint here rather
+  // than a branch column, which the table doesn't have.
+  if (t.branch && t.checkoutBranch && t.checkoutBranch !== t.branch) {
+    parts.push(c.yellow(`⇢ on ${escapeControlChars(t.checkoutBranch)}`));
+  }
   return parts.join(" ");
 }
 

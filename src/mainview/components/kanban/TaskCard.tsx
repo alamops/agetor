@@ -9,6 +9,7 @@ import { abbreviateHome, cn } from "@/lib/utils";
 import { AWAITING_RING_CLASS, awaitingLabel as awaitingLabelFor } from "@/lib/awaiting";
 import { AwaitingGlow } from "@/components/ui/awaiting-glow";
 import { taskTypeIcon } from "@/lib/task-type-icon";
+import { driftOf, driftTitle } from "@/lib/branch-drift";
 import { useCountdown, fxPausedBadgeText, fxPausedBadgeTitle } from "@/lib/fx-auto-resume";
 import { taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { sentFileBasename } from "../../../shared/sent-files.ts";
@@ -47,6 +48,9 @@ interface Props {
 
 function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOpenAttention, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu }: Props) {
   const archived = task.archivedAt != null;
+  // Last-seen worktree checkout (server-recorded; no git spawn on the 2 s
+  // poll) vs the branch agetor created. Drift is tolerated — just shown.
+  const branchDrift = driftOf(task.branch ?? null, task.checkoutBranch);
   // `fx-paused-badge`'s live countdown (see the badge below) — called
   // unconditionally, before any conditional return, so hook order stays
   // stable whether or not this task is actually paused right now; ticks
@@ -288,12 +292,24 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
         {(task.branch || task.baseRef) && (
           <div className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground">
             <GitBranch className="size-3 shrink-0" />
-            <span className="truncate">
-              {task.branch ?? "(not yet created)"}
+            <span className="truncate" title={branchDrift.drifted ? driftTitle(task.branch) : undefined}>
+              {task.checkoutBranch ?? task.branch ?? "(not yet created)"}
               {task.baseRef && (
                 <span className="ml-1 opacity-70">· {task.baseRef.slice(0, 7)}</span>
               )}
             </span>
+            {branchDrift.drifted && (
+              <span
+                data-testid="task-card-branch-drift"
+                title={driftTitle(task.branch)}
+                className={cn(
+                  "shrink-0 rounded px-1 font-sans font-medium",
+                  task.branchSource === "existing" ? "bg-warning/15 text-warning" : "bg-info/15 text-info",
+                )}
+              >
+                {task.branchSource === "existing" ? "not on PR head" : "drifted"}
+              </span>
+            )}
           </div>
         )}
         <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>

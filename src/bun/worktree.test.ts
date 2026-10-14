@@ -1584,3 +1584,374 @@ describe("detachWorktree", () => {
     expect(alreadyAbsent).toEqual({ removed: false, reason: "already-absent" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Branch drift is tolerated, never corrected (docs/plans/codex-terminal-worktree-error.md)
+// ---------------------------------------------------------------------------
+
+describe("drift tolerated", () => {
+  /** Materialize a worktree for a fresh task, then drift it onto `implement/x`
+   *  with one commit there. Returns the persisted-shape task (branch +
+   *  worktreePath set, as startTask would store them). */
+  async function materializeAndDrift(): Promise<{ repo: string; task: Task; wt: string; taskBranch: string }> {
+    const { prepareWorkdir } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    expect(first.checkoutBranch).toBe(first.branch);
+    const wt = first.worktreePath!;
+    const taskBranch = first.branch!;
+    await git(["checkout", "-b", "implement/x"], wt);
+    writeFileSync(path.join(wt, "README"), "drifted\n");
+    await git(["commit", "-am", "drift"], wt);
+    return { repo, task: { ...fresh, branch: taskBranch, worktreePath: wt }, wt, taskBranch };
+  }
+
+  async function expectReusedInPlace(task: Task, wt: string, expectedCheckout: string | null) {
+    const { prepareWorkdir } = await import("./worktree.ts");
+    const headBefore = await runCapture(["rev-parse", "HEAD"], wt);
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(`unexpected error: ${r.error}`);
+    expect(r.cwd).toBe(wt);
+    expect(r.branch).toBe(task.branch);
+    expect(r.worktreePath).toBe(wt);
+    expect(r.checkoutBranch).toBe(expectedCheckout);
+    expect(r.warning).toBeUndefined();
+    // No checkout happened: HEAD (and the symbolic branch) are untouched.
+    expect(await runCapture(["rev-parse", "HEAD"], wt)).toBe(headBefore);
+    const sym = await runCapture(["symbolic-ref", "--quiet", "--short", "HEAD"], wt);
+    expect(sym).toBe(expectedCheckout ?? "");
+    return r;
+  }
+
+  test("clean drifted tree reuses in place and reports the live branch", async () => {
+    const { task, wt, taskBranch } = await materializeAndDrift();
+    const r = await expectReusedInPlace(task, wt, "implement/x");
+    expect(r.note).toContain("on implement/x");
+    expect(r.note).toContain(`(task branch ${taskBranch})`);
+  });
+
+  test("a conflicting uncommitted edit no longer fails the prepare", async () => {
+    const { task, wt } = await materializeAndDrift();
+    // Before the fix this made `git checkout <task.branch>` refuse ("Your
+    // local changes … would be overwritten") — the terminal-open toast.
+    writeFileSync(path.join(wt, "README"), "uncommitted conflicting edit\n");
+    await expectReusedInPlace(task, wt, "implement/x");
+    expect(await runCapture(["status", "--porcelain"], wt)).toContain("README");
+  });
+
+  test("an untracked-only tree is not silently switched", async () => {
+    const { task, wt } = await materializeAndDrift();
+    writeFileSync(path.join(wt, "scratch.txt"), "untracked\n");
+    await expectReusedInPlace(task, wt, "implement/x");
+  });
+
+  test("a detached HEAD reuses in place with checkoutBranch null", async () => {
+    const { task, wt, taskBranch } = await materializeAndDrift();
+    await git(["checkout", "--detach"], wt);
+    const r = await expectReusedInPlace(task, wt, null);
+    expect(r.note).toContain("detached HEAD");
+    expect(r.note).toContain(taskBranch);
+  });
+
+  test("a worktree still on the task branch reports it", async () => {
+    const { prepareWorkdir } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const r = await prepareWorkdir({ ...fresh, branch: first.branch, worktreePath: first.worktreePath });
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe(first.branch);
+    expect(r.note).toBe(`reusing worktree at ${first.worktreePath} on ${first.branch}`);
+  });
+
+  test("re-attach prefers the recorded checkout when it still exists", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { wt, task, taskBranch } = await materializeAndDrift();
+    await detachWorktree(task, { force: true });
+    expect(existsSync(wt)).toBe(false);
+    const r = await prepareWorkdir({ ...task, checkoutBranch: "implement/x" });
+    if ("error" in r) throw new Error(r.error);
+    expect(r.branch).toBe(taskBranch);
+    expect(r.checkoutBranch).toBe("implement/x");
+    expect(r.warning).toBeUndefined();
+    expect(r.note).toContain("restored worktree");
+    expect(await runCapture(["symbolic-ref", "--short", "HEAD"], wt)).toBe("implement/x");
+    expect(await runCapture(["log", "-1", "--format=%s"], wt)).toBe("drift");
+  });
+
+  test("re-attach falls back to the task branch with a warning when the recorded branch is gone", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { repo, wt, task, taskBranch } = await materializeAndDrift();
+    await detachWorktree(task, { force: true });
+    await git(["branch", "-D", "implement/x"], repo);
+    const r = await prepareWorkdir({ ...task, checkoutBranch: "implement/x" });
+    if ("error" in r) throw new Error(r.error);
+    expect(r.branch).toBe(taskBranch);
+    expect(r.checkoutBranch).toBe(taskBranch);
+    expect(r.warning).toBe(`recorded checkout implement/x no longer exists — restored on ${taskBranch}`);
+    expect(await runCapture(["symbolic-ref", "--short", "HEAD"], wt)).toBe(taskBranch);
+  });
+
+  test("re-attach with the recorded checkout equal to the task branch takes the plain path", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const task = { ...fresh, branch: first.branch, worktreePath: first.worktreePath, checkoutBranch: first.branch };
+    await detachWorktree(task, { force: true });
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe(first.branch);
+    expect(r.warning).toBeUndefined();
+    expect(r.note).toContain("created worktree");
+  });
+
+  test("isolation none reports checkoutBranch null", async () => {
+    const { prepareWorkdir, recordableCheckout } = await import("./worktree.ts");
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-plain-"));
+    const r = await prepareWorkdir(fakeTask({ workdir: dir, isolation: "none" }));
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBeNull();
+    expect(r.checkoutKnown).toBe(false);
+    expect(recordableCheckout(r)).toBeUndefined();
+  });
+
+  test("a readable reuse is known — a drifted branch and a detached HEAD are both recordable", async () => {
+    const { prepareWorkdir, recordableCheckout } = await import("./worktree.ts");
+    const { task, wt } = await materializeAndDrift();
+    const onBranch = await prepareWorkdir(task);
+    if ("error" in onBranch) throw new Error(onBranch.error);
+    expect(onBranch.checkoutKnown).toBe(true);
+    expect(recordableCheckout(onBranch)).toBe("implement/x");
+    await git(["checkout", "--detach"], wt);
+    const detached = await prepareWorkdir(task);
+    if ("error" in detached) throw new Error(detached.error);
+    expect(detached.checkoutKnown).toBe(true);
+    // A detached HEAD is a real reading: record null.
+    expect(recordableCheckout(detached)).toBeNull();
+  });
+
+  test("a reuse whose branch read fails is unknown, not detached, and records nothing", async () => {
+    const { prepareWorkdir, recordableCheckout } = await import("./worktree.ts");
+    const { task, wt, taskBranch } = await materializeAndDrift();
+    // Break the worktree's `.git` pointer so `git symbolic-ref` exits 128.
+    const pointer = path.join(wt, ".git");
+    const saved = await Bun.file(pointer).text();
+    writeFileSync(pointer, "gitdir: /nonexistent/agetor-broken\n");
+    try {
+      const r = await prepareWorkdir(task);
+      if ("error" in r) throw new Error(`unexpected error: ${r.error}`);
+      expect(r.cwd).toBe(wt);
+      expect(r.checkoutBranch).toBeNull();
+      expect(r.checkoutKnown).toBe(false);
+      expect(recordableCheckout(r)).toBeUndefined();
+      expect(r.note).toBe(`reusing worktree at ${wt} on ${taskBranch}`);
+    } finally {
+      writeFileSync(pointer, saved);
+    }
+  });
+
+  test("re-attach restores the recorded checkout even when the task branch was deleted", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { repo, wt, task, taskBranch } = await materializeAndDrift();
+    await detachWorktree(task, { force: true });
+    await git(["branch", "-D", taskBranch], repo);
+    const r = await prepareWorkdir({ ...task, checkoutBranch: "implement/x" });
+    if ("error" in r) throw new Error(r.error);
+    expect(r.branch).toBe(taskBranch);
+    expect(r.checkoutBranch).toBe("implement/x");
+    expect(r.checkoutKnown).toBe(true);
+    expect(r.warning).toBe(`task branch ${taskBranch} no longer exists — restored on implement/x`);
+    expect(await runCapture(["symbolic-ref", "--short", "HEAD"], wt)).toBe("implement/x");
+    // The drifted work came back with it.
+    expect(await runCapture(["log", "-1", "--format=%s"], wt)).toBe("drift");
+    // task.branch is not recreated behind the user's back.
+    expect(await runCapture(["branch", "--list", taskBranch], repo)).toBe("");
+  });
+
+  test("re-attach of a PR-head task whose branch lives only on origin restores the recorded checkout without a gone-branch warning", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { repo } = await makeRepoWithOrigin();
+    await pushPrHeadOnly(repo);
+    const fresh = fakeTask({ workdir: repo, branch: "pr-head", branchSource: "existing" });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const wt = first.worktreePath!;
+    await git(["checkout", "-b", "implement/x"], wt);
+    writeFileSync(path.join(wt, "README"), "drifted\n");
+    await git(["commit", "-am", "drift"], wt);
+    const task = { ...fresh, worktreePath: wt, checkoutBranch: "implement/x" };
+    await detachWorktree(task, { force: true });
+    // Only the LOCAL ref goes; `origin/pr-head` survives, as it does for any
+    // PR head nobody kept a local branch for.
+    await git(["branch", "-D", "pr-head"], repo);
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe("implement/x");
+    expect(r.warning).toBeUndefined();
+    expect(await runCapture(["symbolic-ref", "--short", "HEAD"], wt)).toBe("implement/x");
+  });
+
+  test("re-attach of a PR-head task whose branch is gone from origin too still warns", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { repo } = await makeRepoWithOrigin();
+    await pushPrHeadOnly(repo);
+    const fresh = fakeTask({ workdir: repo, branch: "pr-head", branchSource: "existing" });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const wt = first.worktreePath!;
+    await git(["checkout", "-b", "implement/x"], wt);
+    const task = { ...fresh, worktreePath: wt, checkoutBranch: "implement/x" };
+    await detachWorktree(task, { force: true });
+    await git(["branch", "-D", "pr-head"], repo);
+    await git(["push", "origin", "--delete", "pr-head"], repo);
+    await git(["update-ref", "-d", "refs/remotes/origin/pr-head"], repo);
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe("implement/x");
+    expect(r.warning).toBe("task branch pr-head no longer exists — restored on implement/x");
+  });
+
+  test("re-attach that has to recreate a deleted task branch from base says so", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const task = { ...fresh, branch: first.branch, worktreePath: first.worktreePath, checkoutBranch: first.branch };
+    await detachWorktree(task, { force: true });
+    await git(["branch", "-D", first.branch!], repo);
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe(first.branch);
+    expect(r.warning).toBe(`task branch ${first.branch} no longer exists — recreated it from HEAD`);
+  });
+});
+
+describe("readCheckoutBranch", () => {
+  test("named branch, detached HEAD, and unreadable dir", async () => {
+    const { readCheckoutBranch } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await readCheckoutBranch(repo)).toEqual({ ok: true, branch: "main" });
+    await git(["checkout", "--detach"], repo);
+    expect(await readCheckoutBranch(repo)).toEqual({ ok: true, branch: null });
+    const missing = await readCheckoutBranch(path.join(repo, "does-not-exist"));
+    expect(missing.ok).toBe(false);
+    const notRepo = await readCheckoutBranch(mkdtempSync(path.join(tmpdir(), "agetor-wt-norepo-")));
+    expect(notRepo.ok).toBe(false);
+  });
+});
+
+describe("resolveDefaultBranchName", () => {
+  test("strips the remote prefix and returns null outside a repo", async () => {
+    const { resolveDefaultBranchName } = await import("./worktree.ts");
+    const { repo } = await makeRepoWithOrigin();
+    expect(await resolveDefaultBranchName(repo)).toBe("main");
+    expect(await resolveDefaultBranchName(path.join(repo, "nope"))).toBeNull();
+  });
+});
+
+describe("planTeardownBranches", () => {
+  const base = {
+    taskBranch: "agetor/abc-fix" as string | null,
+    branchSource: "created" as "created" | "existing",
+    liveBranch: null as string | null,
+    lastSeen: null as string | null,
+    defaultBranch: "main" as string | null,
+    heldByOthers: new Set<string>(),
+  };
+
+  test("no drift → only the task branch", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, liveBranch: "agetor/abc-fix" })).toEqual({
+      branches: ["agetor/abc-fix"], source: "task-branch", excluded: [],
+    });
+  });
+
+  test("live drift → both branches, source live", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, liveBranch: "implement/x", lastSeen: "other" })).toEqual({
+      branches: ["agetor/abc-fix", "implement/x"], source: "live", excluded: [],
+    });
+  });
+
+  test("no live read → falls back to the last-seen checkout", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, lastSeen: "implement/x" })).toEqual({
+      branches: ["agetor/abc-fix", "implement/x"], source: "last-seen", excluded: [],
+    });
+  });
+
+  test("PR-head task keeps its own branch but still removes a drifted one", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, branchSource: "existing", taskBranch: "pr-head", liveBranch: "implement/x" })).toEqual({
+      branches: ["implement/x"], source: "live", excluded: [{ branch: "pr-head", reason: "pr-head" }],
+    });
+  });
+
+  test("the default branch is never deleted", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, liveBranch: "main" })).toEqual({
+      branches: ["agetor/abc-fix"], source: "live", excluded: [{ branch: "main", reason: "default-branch" }],
+    });
+    // Unresolvable default → literal main/master are protected.
+    expect(planTeardownBranches({ ...base, defaultBranch: null, liveBranch: "master" }).excluded).toEqual([
+      { branch: "master", reason: "default-branch" },
+    ]);
+    // A resolved non-main default protects that name instead.
+    expect(planTeardownBranches({ ...base, defaultBranch: "trunk", liveBranch: "trunk" }).branches).toEqual(["agetor/abc-fix"]);
+  });
+
+  test("a branch another task holds is excluded", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, liveBranch: "shared", heldByOthers: new Set(["shared"]) })).toEqual({
+      branches: ["agetor/abc-fix"], source: "live", excluded: [{ branch: "shared", reason: "held-by-task" }],
+    });
+    expect(planTeardownBranches({ ...base, heldByOthers: new Set(["agetor/abc-fix"]) })).toEqual({
+      branches: [], source: "task-branch", excluded: [{ branch: "agetor/abc-fix", reason: "held-by-task" }],
+    });
+  });
+
+  test("nothing to delete → source none", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, taskBranch: null })).toEqual({ branches: [], source: "none", excluded: [] });
+  });
+});
+
+describe("removeWorktree branches option", () => {
+  async function branchExists(repo: string, name: string): Promise<boolean> {
+    return (await runCapture(["branch", "--list", name], repo)).length > 0;
+  }
+
+  test("deletes every listed branch after removing the worktree", async () => {
+    const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const wt = first.worktreePath!;
+    await git(["checkout", "-b", "implement/x"], wt);
+    const task = { ...fresh, branch: first.branch, worktreePath: wt };
+    await removeWorktree(task, { branches: [first.branch!, "implement/x"] });
+    expect(existsSync(wt)).toBe(false);
+    expect(await branchExists(repo, first.branch!)).toBe(false);
+    expect(await branchExists(repo, "implement/x")).toBe(false);
+  });
+
+  test("omitting the option keeps today's behaviour: only task.branch goes", async () => {
+    const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const wt = first.worktreePath!;
+    await git(["checkout", "-b", "implement/x"], wt);
+    await removeWorktree({ ...fresh, branch: first.branch, worktreePath: wt });
+    expect(await branchExists(repo, first.branch!)).toBe(false);
+    expect(await branchExists(repo, "implement/x")).toBe(true);
+  });
+});

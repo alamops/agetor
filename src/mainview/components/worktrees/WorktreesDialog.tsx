@@ -21,6 +21,7 @@ import {
   type WorktreeStaleReason,
 } from "../../../shared/types.ts";
 import { buildDeleteConfirmCopy, triageDeleteOutcome } from "./worktree-delete-intent.ts";
+import { driftOf, driftTitle } from "@/lib/branch-drift";
 
 interface Props {
   open: boolean;
@@ -537,7 +538,25 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                       )}
                     </div>
                     <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                      <span className="font-mono">{w.branch ?? "—"}</span>
+                      {(() => {
+                        // The listing reports the task's own branch (fs + DB
+                        // only); the per-row git status reads the live HEAD.
+                        // A worktree that drifted onto another branch shows
+                        // where it really is, with the task branch on hover.
+                        const drift = driftOf(w.branch, status && status !== "loading" ? status.branch : null);
+                        if (!drift.drifted) return <span className="font-mono">{w.branch ?? "—"}</span>;
+                        return (
+                          <span className="flex items-center gap-1" title={driftTitle(w.branch)}>
+                            <span className="font-mono">{drift.live}</span>
+                            <span
+                              data-testid="worktree-row-branch-drift"
+                              className="rounded bg-info/15 px-1 text-[10px] font-medium text-info"
+                            >
+                              drifted
+                            </span>
+                          </span>
+                        );
+                      })()}
                       <span>{projectLabel(w)}</span>
                       <span className="min-w-0 truncate" title={w.path}>{abbreviateHome(w.path, homeDir)}</span>
                       <span>updated {formatAge(w.taskUpdatedAt)}</span>

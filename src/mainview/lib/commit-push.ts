@@ -37,22 +37,36 @@ export function shouldOfferOpenPr(status: TaskGitStatus | null): boolean {
  * there isn't a sensible one — which doubles as the gate for showing the chip
  * at all.
  *
- * `taskBranch` (`task.branch`) is agetor's *worktree-managed* branch and is
- * only ever written for `isolation: "worktree"` tasks. Keying the gate on it
- * alone hid the chip for every `isolation: "none"` task, including one whose
- * workdir sits on the user's own pushed, synced feature branch — the branch
- * field is NULL there by construction, not because there's nothing to PR.
+ * `taskBranch` (`task.branch`) is agetor's *worktree-managed* branch — the one
+ * it created — and is only ever written for `isolation: "worktree"` tasks.
+ * Keying the gate on it alone hid the chip for every `isolation: "none"`
+ * task, including one whose workdir sits on the user's own pushed, synced
+ * feature branch — the branch field is NULL there by construction, not
+ * because there's nothing to PR.
  *
- * So: prefer the managed branch verbatim (unchanged worktree behaviour — an
- * `agetor/<id>-<slug>` branch is never the repo default, so no extra check is
- * warranted), and otherwise fall back to the live checked-out branch reported
- * by `GET /tasks/:id/git-status`. The fallback is the ONLY path that consults
- * `isDefaultBranch`, guarding the original concern this gate was written for:
- * an isolation-none task sitting on `main` would open a base == head PR.
+ * A worktree can drift off `task.branch` (an agent or a terminal ran `git
+ * checkout -b …`); agetor tolerates that rather than switching it back, so
+ * the commits the agent pushed live on the branch it is actually on. Rules:
+ *   1. A PR-head task (`branchSource: "existing"`) always uses `taskBranch` —
+ *      its PR already exists on that head, and a drifted branch would open a
+ *      second PR.
+ *   2. Otherwise the live checked-out branch from `GET /tasks/:id/git-status`
+ *      wins when it is set, isn't the repo default, and differs from
+ *      `taskBranch`.
+ *   3. Otherwise `taskBranch` verbatim (an `agetor/<id>-<slug>` branch is never
+ *      the repo default, so no extra check is warranted).
+ *   4. With no `taskBranch` at all, fall back to the live branch — the only
+ *      path besides rule 2 that consults `isDefaultBranch`, guarding the
+ *      original concern: an isolation-none task sitting on `main` would open
+ *      a base == head PR.
  */
-export function prHeadBranch(taskBranch: string | null, status: TaskGitStatus | null): string | null {
-  if (taskBranch) return taskBranch;
-  if (!status || status.ignored) return null;
-  if (!status.branch || status.isDefaultBranch) return null;
-  return status.branch;
+export function prHeadBranch(
+  taskBranch: string | null,
+  status: TaskGitStatus | null,
+  branchSource?: "created" | "existing",
+): string | null {
+  if (taskBranch && branchSource === "existing") return taskBranch;
+  const live = status && !status.ignored && status.branch && !status.isDefaultBranch ? status.branch : null;
+  if (taskBranch) return live && live !== taskBranch ? live : taskBranch;
+  return live;
 }
