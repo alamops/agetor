@@ -7,7 +7,7 @@
 | Agents | 0 sub-agents (pipeline step forbids delegation) — all research briefs run inline; 2 scratchpad spikes + 4 binary string scans |
 | Flags | none |
 | Branch | `fix/claude-code-placeholder` (cut from `main` @ `a46aa6c`) |
-| Owner evidence | `~/Desktop/Screenshot 2026-10-12 at 1.33.12 AM.png` (RunPanel card), `… 1.34.21 AM.png` (attached tmux pane, claude 2.1.296, task "Import files as Knowledge", tmux session `agetor-d70417fd-0a8`) |
+| Owner evidence | owner screenshot 1 (RunPanel card), owner screenshot 2 (attached tmux pane, claude 2.1.296, task "Example task", tmux session `agetor-00000000-000`) |
 
 ## 0. One-paragraph summary
 
@@ -32,21 +32,21 @@ Two defects compound. **(A) Trigger:** Claude Code ≥ 2.1.286 compacts an idle 
 - Precedent: the identical class of bug — a non-human `user` line adopted as a continuation that nothing can settle — was fixed for the `/model`/`/effort` local-command twins in #194 (`373a685`), documented inline at `:975-993` ("The observed run sat `running` for 6 minutes with claude parked at a bare `❯`"). The compaction summary is the third member of that family (task-notification → #97, local-command twins → #194, compaction summary → this).
 - History of the adoption filter: `1e28eb6` (#95, introduced), `55ef208` (#97, notification adoption + watchdog), `373a685` (#194, local-command exclusion). Tests: `src/bun/claude-continuation.test.ts` (23 tests; the local-command exclusion is pinned at `:250`, so the convention for pinning a new exclusion exists).
 
-### 1.3 Prod evidence (read-only, `~/.agetor/agetor.sqlite`, task `d70417fd-0a89-4a26-8710-ab64ad1dfa88`, claude session `5fb78bf9-…`, JSONL `~/.claude/projects/-Users-alamosaravali--agetor-worktrees-d70417fd-…/5fb78bf9-….jsonl`)
+### 1.3 Prod evidence (read-only, `~/.agetor/agetor.sqlite`, task `00000000-0000-4000-8000-00000000a1a1`, claude session `11111111-…`, JSONL `~/.claude/projects/-Users-<user>--agetor-worktrees-00000000-…/11111111-….jsonl`)
 
 | UTC | Source | Event |
 | --- | --- | --- |
-| 02:45:47 → 02:50:50 | `runs` | `2d0654d0` (agetor-sent turn) succeeded. Session idle from here; a prompt suggestion ("Open the PR and merge it") is generated after this turn. |
+| 02:45:47 → 02:50:50 | `runs` | `aaaa0001` (agetor-sent turn) succeeded. Session idle from here; a prompt suggestion ("Open the PR and merge it") is generated after this turn. |
 | 03:46:37.382 | JSONL line 958 | `user`, `isCompactSummary: true`, `isMeta` absent, content "This session is being continued from a previous conversation that ran out of context…" |
 | 03:46:37.385 | JSONL line 957 | `system` / `compact_boundary`, `compactMetadata.trigger: "auto"`, `preTokens: 450162 → postTokens: 8613` |
 | 03:46:37.664 | JSONL line 971 | `system` / `informational` "Compacted while idle, before the prompt cache expired" (pane also shows 3× `SessionStart:compact hook error … /bin/sh: node: command not found`) |
-| 03:46:37.956 | `runs` | **`9df59166` inserted, `origin: continuation`, status `running`**; `run_events` 865528 `status: auto-continued after background task`, 865529 `user:` the compaction summary (line_uuid `cb96bdc5…`) |
+| 03:46:37.956 | `runs` | **`aaaa0002` inserted, `origin: continuation`, status `running`**; `run_events` 865528 `status: auto-continued after background task`, 865529 `user:` the compaction summary (line_uuid `cccc0001…`) |
 | ~03:47:38 → ~03:47:44 | scraper (in-memory) | watchdog arm true (quiet > 60 s, composer row non-bare because of the suggestion) → unparsable card registered after 3 ticks |
 | 03:56:42 | `run_events` 865530 | `status: turn stalled: no transcript activity for 10m while a turn is in flight — an interactive dialog may be open …` |
 | 05:33 (01:33 local) | screenshot | card visible; pane shows `❯ Open the PR and merge it` (dim, cursor on `O`), status bar `⏵⏵ auto mode on (shift+tab to cycle) · ⧉ index · ← 1 agent` |
-| 05:35:52 | JSONL 979 / `run_events` 865561 | owner types "what should I set in the CRON_SECRET" in the attached terminal → recorded **into the phantom run**; 865562 `turn resumed` |
-| 05:36:54 | `runs` | `9df59166` ends `succeeded` on that turn's `end_turn`; card → `review` |
-| 05:38:15 → 05:38:40 | `runs` | `0cd3d955` (`continuation`) — a legitimate terminal-typed turn adopted off its `user` line and settled normally |
+| 05:35:52 | JSONL 979 / `run_events` 865561 | owner types "what should the retry limit be" in the attached terminal → recorded **into the phantom run**; 865562 `turn resumed` |
+| 05:36:54 | `runs` | `aaaa0002` ends `succeeded` on that turn's `end_turn`; card → `review` |
+| 05:38:15 → 05:38:40 | `runs` | `aaaa0003` (`continuation`) — a legitimate terminal-typed turn adopted off its `user` line and settled normally |
 | 05:40:16 | JSONL 1063-1065 | owner runs `/model` in the terminal; the twins are correctly **not** adopted (#194 behaviour) |
 
 - The earlier continuation runs on this task (`0def644f`, `13b723f6`, `71f0b2d9`, 2026-10-10) also carry `auto-continued after background task` as their first event — some are terminal-typed turns, so that wording is already misleading for content-triggered adoption, independent of this bug.
@@ -64,14 +64,14 @@ Two defects compound. **(A) Trigger:** Claude Code ≥ 2.1.286 compacts an idle 
 | Question | Verdict | Evidence (command → output) | Versions | Artifact |
 | --- | --- | --- | --- | --- |
 | How does a composer placeholder render in a tmux pane, and where is the cursor? | **Dim SGR spans, cursor at column 2.** | `tmux -L agetor-spike-ph new-session -d -x 100 -y 30 -c <scratch git repo> -- env -u CLAUDECODE -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_ENTRYPOINT claude --model haiku`; answered the unnumbered trust dialog (Down, Enter after seeing it twice); `capture-pane -p -e` row 7 → `ESC[39m❯ ESC[2mTryESC[0m ESC[2m"refactorESC[0m ESC[2m<filepath>"ESC[0m`; `display-message -p '#{cursor_x},#{cursor_y}'` → `2,6`. Plain `-p` shows `❯ Try "refactor <filepath>"`. | claude 2.1.296, tmux 3.6a, macOS Darwin 25.6.0, user settings `tui: fullscreen` | `<scratchpad>/spikes/placeholder-sgr/{plain.txt,escaped.txt}` |
-| Does a **real prompt suggestion** render the same way inside an agetor-owned session? | **Yes — live-confirmed on the owner's prod session.** | Read-only `tmux -L agetor capture-pane -p -e -t agetor-d70417fd-0a8` at ~05:55Z, task idle in `review`: row 25 → `ESC[39m❯ ESC[2mmake a vertical version tooESC[0m`, cursor `2,24`; plain `-p` → `❯ make a vertical version too`. (One contiguous dim span; the startup sample dims per word with resets at spaces — a detector must accept both.) | claude 2.1.296 in Agetor 1.0.0's prod socket | captured inline in this brief (no file; the prod pane was never written to) |
+| Does a **real prompt suggestion** render the same way inside an agetor-owned session? | **Yes — live-confirmed on the owner's prod session.** | Read-only `tmux -L agetor capture-pane -p -e -t agetor-00000000-000` at ~05:55Z, task idle in `review`: row 25 → `ESC[39m❯ ESC[2mmake a vertical version tooESC[0m`, cursor `2,24`; plain `-p` → `❯ make a vertical version too`. (One contiguous dim span; the startup sample dims per word with resets at spaces — a detector must accept both.) | claude 2.1.296 in Agetor 1.0.0's prod socket | captured inline in this brief (no file; the prod pane was never written to) |
 | Is typed text distinguishable? | **Yes: never dim; cursor at end of text.** | `send-keys -l -- 'hello from spike'` → `-e` row: `ESC[39m❯ hello from spike` (no SGR 2), cursor `18,6`. | same | `spikes/placeholder-sgr/` |
 | Can cursor column alone identify a placeholder? | **No — false positive on Home/C-a.** | `send-keys C-a` with typed text → cursor `2,6` while text is still present. SGR is the reliable signal; the cursor column is at best corroboration. | same | same |
 | What does `Escape Escape` do with text present, and what is on the row afterwards? | **Clears the text; the placeholder immediately re-renders dim.** So agetor's positive post-clear check `paneShowsIdleInputBox` (`:10396`) can never pass while a placeholder is showing → `composer-dirty` withhold. | `send-keys Escape Escape` → row `ESC[39m❯ ESC[2mTry "fix lint errors"ESC[0m`, cursor `2,6`. | same | `spikes/placeholder-sgr/escaped-after-clear.txt` |
-| Does the idle-compaction summary line satisfy `isContinuationContentEvent`? | **Yes (by code reading + prod DB).** The line is `type: "user"`, `isMeta` absent, no `origin`, not a local-command twin; the phantom run `9df59166` was inserted 574 ms after that line's timestamp with the summary as its first `user` event. | DB query over `runs`/`run_events` (above) | Agetor 1.0.0 vs. source at `a46aa6c` — the filter at `:994` is unchanged since #194 | — |
+| Does the idle-compaction summary line satisfy `isContinuationContentEvent`? | **Yes (by code reading + prod DB).** The line is `type: "user"`, `isMeta` absent, no `origin`, not a local-command twin; the phantom run `aaaa0002` was inserted 574 ms after that line's timestamp with the summary as its first `user` event. | DB query over `runs`/`run_events` (above) | Agetor 1.0.0 vs. source at `a46aa6c` — the filter at `:994` is unchanged since #194 | — |
 | Binary string facts (setting/env names, renderer, compaction notice) | proven | `python3 -I scan*.py <binary>` (mmap + regex; BSD grep on the 200 MB Mach-O is too slow) | 2.1.296 | `<scratchpad>/spikes/claude-binary-strings/scan.py … scan4.py` |
 
-`<scratchpad>` = `/private/tmp/claude-501/-Users-alamosaravali--agetor-worktrees-59481802-833f-4352-93ca-c5d06eb5a55a/4ec72edc-7a7a-4998-9e93-69a352707640/scratchpad`. The downloaded changelog used for the version mapping is at `<scratchpad>/downloads/changelog/CHANGELOG.md` (treated as untrusted data; only grepped).
+`<scratchpad>` = `<session scratchpad directory>`. The downloaded changelog used for the version mapping is at `<scratchpad>/downloads/changelog/CHANGELOG.md` (treated as untrusted data; only grepped).
 
 **Would the tests notice?** No. Every scraper fixture in `src/bun/claude-tmux-scraper.test.ts` is plain text (`idlePane`, `idlePaneWithDoneRow`, `idlePaneWithComposerText`), so a fix keyed on SGR passes the existing suite untouched while remaining unpinned, and a naive fix ("a non-bare row is idle once the turn has been quiet") would wrongly flip the `hello from agetor` composer-text test at `:2062`. Any plan must add SGR-bearing fixtures (both dim shapes) and a compaction-summary adoption test.
 
@@ -113,7 +113,7 @@ Two defects compound. **(A) Trigger:** Claude Code ≥ 2.1.286 compacts an idle 
 
 - `scrapeOnce` runs ~1 Hz on every live claude task; switching its capture to `-e` touches the fingerprinting of all four matchers and the `__external__` sweep — strip SGR before hashing or the fallback card re-registers every tick (the exact flicker #191 fixed).
 - Treating a placeholder row as idle makes the idle-settle net close turns it previously carded. That is the intended fix, but it also means a genuinely wedged turn whose pane happens to show a suggestion will be *settled* (run `succeeded`, card → `review`) rather than carded — the same trade the net already makes for bare rows.
-- Excluding `isCompactSummary` lines from adoption must not exclude terminal-typed human turns (`0cd3d955` above is the legitimate case) — key on the flag, not on "any non-agetor user line".
+- Excluding `isCompactSummary` lines from adoption must not exclude terminal-typed human turns (`aaaa0003` above is the legitimate case) — key on the flag, not on "any non-agetor user line".
 - The composer-clear path (`Escape Escape`) stays unchanged in keystrokes; only its predicates change. A double-Escape on an empty composer opens the rewind picker — the fix must make `paneShowsComposerText` false on a placeholder row so that path is never entered for one.
 - The installed app is 1.0.0; the fix lands in the next release alongside #258/#266.
 

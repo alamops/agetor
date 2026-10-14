@@ -247,6 +247,9 @@ test.describe("task details stay responsive while another task's session restore
     // await that network round-trip here — the whole point of this test is
     // that switching tasks doesn't have to wait for it.
     await textareaA.press("Enter");
+    // A's follow-up spawn starts with this send; every B check below shares
+    // one deadline measured from here.
+    const followUpSentAt = Date.now();
 
     // Immediately (no wait) open task B's details — via the task context
     // menu's "Open details" (see `openTaskWhilePanelOpen`'s doc comment for
@@ -262,10 +265,14 @@ test.describe("task details stay responsive while another task's session restore
     // has missed a fixed 2s window without anything being wrong. The pre-fix
     // bug held B blank until A's spawn settled, which the run check below
     // catches whatever the machine's speed.
-    const bRendersBy = FAKE_SPAWN_DELAY_MS - 2_000;
-    await expect(panel.getByTestId("transcript-loading")).toHaveCount(0, { timeout: bRendersBy });
+    // One shared deadline, 2s short of A's spawn settling: time spent waiting
+    // for the skeleton to clear comes out of the transcript check's budget,
+    // so the two together can never wait past A's spawn.
+    const bRenderDeadline = followUpSentAt + FAKE_SPAWN_DELAY_MS - 2_000;
+    const remaining = () => Math.max(1, bRenderDeadline - Date.now());
+    await expect(panel.getByTestId("transcript-loading")).toHaveCount(0, { timeout: remaining() });
     await expect(panel.getByText(`fake response to: ${titleB}`, { exact: true })).toBeVisible({
-      timeout: bRendersBy,
+      timeout: remaining(),
     });
     const runsAWhileBShows = await getRuns(request, freshBackend, taskA.id);
     expect(runsAWhileBShows.length, "A's follow-up run row exists").toBeGreaterThanOrEqual(2);

@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Date | 2026-10-12 |
-| Source | pipeline task "Agetor is not properly recognizing the Claude Code placeholder, and throwing an unknown error for that"; `docs/plans/claude-code-placeholder-investigation.md` (step 1); `docs/plans/claude-code-placeholder-grill.md` (step 2, every decision answered by the owner); owner screenshots `~/Desktop/Screenshot 2026-10-12 at 1.33.12 AM.png` / `… 1.34.21 AM.png`; code at `a46aa6c` (`main`) |
+| Source | pipeline task "Agetor is not properly recognizing the Claude Code placeholder, and throwing an unknown error for that"; `docs/plans/claude-code-placeholder-investigation.md` (step 1); `docs/plans/claude-code-placeholder-grill.md` (step 2, every decision answered by the owner); owner screenshots 1 and 2; code at `a46aa6c` (`main`) |
 | Flags | none |
 | Gates | grilled + every decision approved by the owner (two passes, see the grill record). The plan itself is handed to the pipeline's Implementing step without a separate approval round; the planner's own calls (§3 P1–P10) are listed in §8 for veto. |
 | Branch | `fix/claude-code-placeholder` (already cut from `main` @ `a46aa6c`) |
