@@ -2313,7 +2313,7 @@ export async function dismissAskModalForMessage(taskId: string): Promise<boolean
     // is non-bare) keeps the double Escape from ever being sent into it.
     const styled = await styledTailIfNonBare(state, tail);
     if (!stillCurrent()) return;
-    if (!paneShowsComposerText(tail, styled)) { ok = true; return; }
+    if (!paneShowsComposerText(tail, styled, { rosterLive: noteAgentRoster(state, tail) })) { ok = true; return; }
     bumpKeystroke(state);
     if (!(await tmux(["send-keys", "-t", state.sessionName, ...COMPOSER_CLEAR_KEYS])).ok) return;
     await Bun.sleep(COMPOSER_CLEAR_SETTLE_MS);
@@ -2321,7 +2321,10 @@ export async function dismissAskModalForMessage(taskId: string): Promise<boolean
       if (!stillCurrent()) return;
       tail = await capture();
       if (tail !== null && detectAskModal(tail) === null
-        && !paneShowsComposerText(tail, await styledTailIfNonBare(state, tail))) { ok = true; return; }
+        && !paneShowsComposerText(tail, await styledTailIfNonBare(state, tail), { rosterLive: noteAgentRoster(state, tail) })) {
+        ok = true;
+        return;
+      }
       await Bun.sleep(ASK_DISMISS_POLL_MS);
     }
   }, state);
@@ -2809,6 +2812,19 @@ interface SessionState {
    *  or a torn-down session both mean whatever streak was accruing no
    *  longer applies. */
   scrapeIdleSettleStreak: number;
+  /** The background-agent roster rows (`agentRosterSignature`) as last seen
+   *  on this pane, and when they last changed. A running agent's row ticks
+   *  (its elapsed time, its token count); a finished one keeps its last
+   *  values forever, so "changed recently" is what tells the two apart —
+   *  see `noteAgentRoster`. `null` while no roster is on the pane. */
+  agentRosterSignature: string | null;
+  agentRosterChangedAt: number;
+  /** Consecutive scrape ticks Claude's background-sessions view
+   *  (`paneShowsBackgroundSessionsView`) has sat on the pane while a turn
+   *  was in flight and quiet past `STUCK_TURN_FALLBACK_MS` — held to
+   *  `UNPARSABLE_STABILITY_TICKS` before the scraper presses Escape to
+   *  return to the conversation (`returnFromBackgroundSessionsView`). */
+  scrapeBackgroundViewStreak: number;
   /** `Date.now()` stamp of the most recent successful JSONL append the
    *  flusher dispatched. The scraper consults it to (a) suppress
    *  matches that happened while claude was actively writing (the
@@ -3209,6 +3225,9 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     scrapeLastFingerprint: null,
     scrapeUnparsableStreak: 0,
     scrapeIdleSettleStreak: 0,
+    agentRosterSignature: null,
+    agentRosterChangedAt: 0,
+    scrapeBackgroundViewStreak: 0,
     lastJsonlAppendAt: 0,
     stallFloorAt: Date.now(),
     stallFired: false,
@@ -6338,6 +6357,38 @@ const MODAL_NOTICE_RE = /continuing automatically|continuing shortly/i;
 const STATUS_BAR_RE = /^\s*(?:⏵⏵|⏸)\s.*(?:\(shift\+tab to cycle\)|\? for shortcuts)/;
 
 /**
+ * Claude Code's background-sessions view — what Left on an EMPTY composer
+ * opens (2.1.296+). Live capture (2.1.299, 80x24 pane, 2026-10-13):
+ *
+ *   `Your conversation moved to the background — enter opens it · esc returns to it ·`
+ *   `ctrl+c twice quits`
+ *   … one row per session, grouped by directory …
+ *   `❯ describe a task for a new session`          (grey `38;5;246`, not dim)
+ *   `  ⏵⏵ auto mode · enter to return · space to reply · ctrl+x to delete · ? for sh…`
+ *
+ * Text pasted or typed there starts a NEW background session with it as the
+ * task — it never reaches this task's conversation — so `queuePaste` must
+ * leave the view before it pastes (`returnFromBackgroundSessionsView`).
+ * Escape returns to the conversation as the header says, through one
+ * transient `Waiting for session to redraw… Ctrl+Z to detach` frame
+ * (`SESSION_REDRAW_WAIT_RE`). The bar is the anchor: its `enter to return ·
+ * space to reply` pair is specific to this view, and at 80 columns its tail
+ * is cut, so `STATUS_BAR_RE` (which wants `? for shortcuts`) doesn't match it.
+ */
+const BACKGROUND_VIEW_BAR_RE = /·\s*enter to return\s*·\s*space to reply\b/;
+/** The one frame between Escape and the conversation's redraw. */
+const SESSION_REDRAW_WAIT_RE = /Waiting for session to redraw…/;
+
+/** True when the pane shows the background-sessions view: its bar
+ *  (`BACKGROUND_VIEW_BAR_RE`) among the last three non-blank rows. Only the
+ *  bottom counts — the header's wording can sit in a transcript (an agent
+ *  discussing this very view), the bar's position can't. Pure. */
+function paneShowsBackgroundSessionsView(tail: string): boolean {
+  const nonBlank = tail.split("\n").filter((l) => l.trim().length > 0);
+  return nonBlank.slice(-3).some((l) => BACKGROUND_VIEW_BAR_RE.test(l));
+}
+
+/**
  * Pane chrome that repaints on a fixed cadence independent of anything
  * meaningful — the animated spinner line and its token counter (shared with
  * `WORKING_LINE_RE`) and the rotating `Tip:` banner. Matched AFTER trailing
@@ -6411,10 +6462,64 @@ const EFFORT_HINT_SUFFIX_RE = /\s+[●◉]\s+\S+\s+·\s+\/effort\s*$/;
  *  safety claim honest: the transcript can legitimately contain chrome-shaped
  *  text (a tool result echoing a pane, prose resembling a spinner line) above
  *  a real modal. Pure/exported so the truth table is unit-testable without a
- *  live tmux pane. */
-function paneShowsClaudeWorking(tail: string): boolean {
+ *  live tmux pane.
+ *
+ *  `rosterLive` decides whether a background-agent roster row
+ *  (`AGENT_ROSTER_ROW_RE`) counts. Its `· ↓ 37.4k tokens` counter matches
+ *  `TOKEN_COUNTER_LINE`, and Claude 2.1.296 keeps a finished agent's row on
+ *  the pane with that counter frozen — so a roster row alone can't say
+ *  whether anything is still running. Callers with a session pass
+ *  `noteAgentRoster`'s answer (did the roster change recently?); without
+ *  one the row counts, as it always did. */
+function paneShowsClaudeWorking(tail: string, opts?: { rosterLive?: boolean }): boolean {
+  const rosterLive = opts?.rosterLive ?? true;
   const nonBlank = tail.split("\n").filter((l) => l.trim().length > 0);
-  return nonBlank.slice(-WORKING_CHROME_WINDOW_LINES).some((l) => WORKING_LINE_RE.test(l));
+  return nonBlank.slice(-WORKING_CHROME_WINDOW_LINES)
+    .some((l) => WORKING_LINE_RE.test(l) && (rosterLive || !AGENT_ROSTER_ROW_RE.test(l)));
+}
+
+/** The agent rows of the background-agent roster in the bottom widget area
+ *  (the same `WORKING_CHROME_WINDOW_LINES` window `paneShowsClaudeWorking`
+ *  reads), joined — or `null` when there are none. Only rows carrying the
+ *  token counter: the bare `main` row never changes. */
+function agentRosterSignature(tail: string): string | null {
+  const rows = tail.split("\n")
+    .filter((l) => l.trim().length > 0)
+    .slice(-WORKING_CHROME_WINDOW_LINES)
+    .filter((l) => AGENT_ROSTER_ROW_RE.test(l) && new RegExp(TOKEN_COUNTER_LINE).test(l))
+    .map((l) => l.trim());
+  return rows.length > 0 ? rows.join("\n") : null;
+}
+
+/** How long after the roster last changed it still counts as a running
+ *  agent. A running row's elapsed time ticks every second (`7s` … `1m 40s`,
+ *  live capture 2.1.296), but a long-running agent may only show minutes,
+ *  so the window has to outlast a minute-granularity tick. Past it the rows
+ *  are frozen — every agent on them has finished. */
+const AGENT_ROSTER_LIVE_MS = 75_000;
+
+/** Record this pane's roster on the session and answer whether it is still
+ *  live (changed within `AGENT_ROSTER_LIVE_MS`) — the `rosterLive` input to
+ *  `paneShowsClaudeWorking`. A roster seen for the first time counts as a
+ *  change, so a just-attached session gives its agents the full window
+ *  before calling them finished. */
+function noteAgentRoster(state: SessionState, tail: string, now = Date.now()): boolean {
+  const signature = agentRosterSignature(tail);
+  if (signature === null) {
+    state.agentRosterSignature = null;
+    return false;
+  }
+  if (signature !== state.agentRosterSignature) {
+    state.agentRosterSignature = signature;
+    state.agentRosterChangedAt = now;
+  }
+  return now - state.agentRosterChangedAt < AGENT_ROSTER_LIVE_MS;
+}
+
+/** `paneShowsClaudeWorking` for a pane of this session, with the roster
+ *  judged by `noteAgentRoster`. */
+function sessionPaneWorking(state: SessionState, tail: string): boolean {
+  return paneShowsClaudeWorking(tail, { rosterLive: noteAgentRoster(state, tail) });
 }
 
 /** How many trailing NON-BLANK pane lines ABOVE the status bar
@@ -6738,8 +6843,12 @@ function paneShowsIdleInputBox(tail: string, styledTail?: string | null): boolea
  * sitting in the composer before pasting a NEW message — pasting on top of
  * it would concatenate rather than replace.
  */
-function paneShowsComposerText(tail: string, styledTail?: string | null): boolean {
-  if (paneShowsClaudeWorking(tail)) return false;
+function paneShowsComposerText(
+  tail: string,
+  styledTail?: string | null,
+  opts?: { rosterLive?: boolean },
+): boolean {
+  if (paneShowsClaudeWorking(tail, opts)) return false;
   const row = livePromptRow(tail);
   if (row === null || !/^\s*❯\s+\S/.test(row)) return false;
   return !placeholderRowShowing(tail, styledTail);
@@ -7000,13 +7109,16 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   // unparsable matcher entirely (see below) — `stuckTurnFallbackArmed`'s
   // signature stays honest about what it was actually gated on, rather than
   // silently hardcoding `false` at the call site.
-  const paneWorking = paneShowsClaudeWorking(tail);
+  const paneWorking = sessionPaneWorking(state, tail);
   // Claude idle at its own input box (see `paneShowsIdleInputBox`) is proof a
   // turn is over even when no `end_turn` JSONL line ever confirmed it — used
   // below to keep the watchdog arm from carding an idle pane, and to drive
   // the idle-settle net that closes such a turn out instead.
   const paneIdle = paneShowsIdleInputBox(tail, styledTail);
-  const match = (claudeIsWriting || (askOnPane && !askUnrecoverable))
+  // Claude's background-sessions view (Left on an empty composer) is
+  // navigation, not a prompt — never a card. See the return net below.
+  const backgroundView = paneShowsBackgroundSessionsView(tail);
+  const match = (claudeIsWriting || (askOnPane && !askUnrecoverable) || backgroundView)
     ? null
     : pickScrapeMatch(tail, {
         paneWorking,
@@ -7052,6 +7164,36 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   const idleTick = idleSettleTick({ eligible: idleSettleEligible, streak: state.scrapeIdleSettleStreak });
   state.scrapeIdleSettleStreak = idleTick.streak;
   if (idleTick.fire) signalIdleSettle(state);
+
+  // Background-sessions-view return net: the view hides the conversation,
+  // so a turn that went quiet behind it could neither idle-settle nor be
+  // carded. Under the same conditions that arm the watchdog (in flight,
+  // JSONL quiet past `STUCK_TURN_FALLBACK_MS` — a conversation still working
+  // in the background keeps writing), held for `UNPARSABLE_STABILITY_TICKS`,
+  // press Escape to bring the conversation back; the next ticks then read
+  // the real pane. With no turn in flight the view is left alone — the next
+  // paste leaves it itself (`queuePaste`).
+  const backgroundViewEligible = backgroundView
+    && pendingPrompts.length === 0
+    && stuckTurnFallbackArmed({
+      turnInFlight: turnInFlight(state),
+      lastJsonlAppendAt: state.lastJsonlAppendAt,
+      now,
+      paneWorking: false,
+      askCardLive: state.askCardId !== null,
+      paneIdle: false,
+    });
+  state.scrapeBackgroundViewStreak = backgroundViewEligible ? state.scrapeBackgroundViewStreak + 1 : 0;
+  if (state.scrapeBackgroundViewStreak >= UNPARSABLE_STABILITY_TICKS) {
+    state.scrapeBackgroundViewStreak = 0;
+    void queueTmuxOp(state.taskId, async (stillCurrent) => {
+      if (!paneShowsBackgroundSessionsView(await capturePastePane(state))) return;
+      if (!stillCurrent()) return;
+      if (await returnFromBackgroundSessionsView(state, stillCurrent)) {
+        (state.turnQueue[0]?.onChunk ?? state.lastChunk)?.("status", BACKGROUND_VIEW_RETURN_STATUS_TEXT);
+      }
+    }, state);
+  }
 
   // Auto-cancel: any registered prompt for this task whose fingerprint
   // is NOT what we see now has been dismissed (either externally via
@@ -8755,6 +8897,45 @@ async function stillBlocking(state: SessionState): Promise<boolean> {
   return paneShowsBlockingPrompt(await capturePastePane(state));
 }
 
+/** How long `returnFromBackgroundSessionsView` waits for the conversation to
+ *  come back after its Escape. The live redraw took about two seconds. `let`
+ *  for `__forTest.setBackgroundViewReturnTimeoutMs`. */
+let BACKGROUND_VIEW_RETURN_TIMEOUT_MS = 6_000;
+/** Poll interval while waiting for that redraw. `let` for
+ *  `__forTest.setBackgroundViewPollMs`. */
+let BACKGROUND_VIEW_POLL_MS = 250;
+
+/** Status line posted when agetor pressed Escape to leave Claude's
+ *  background-sessions view. */
+const BACKGROUND_VIEW_RETURN_STATUS_TEXT =
+  "returned from Claude's background-sessions view to the conversation";
+
+/**
+ * Press Escape to leave Claude's background-sessions view
+ * (`paneShowsBackgroundSessionsView`) and wait, up to
+ * `BACKGROUND_VIEW_RETURN_TIMEOUT_MS`, for a frame that is neither the view
+ * nor the `Waiting for session to redraw…` frame between them. Resolves
+ * `true` once the conversation is back; `false` when the key failed, the
+ * session was replaced (`stillCurrent`), or the view stayed. Must run inside
+ * the task's `queueTmuxOp` chain.
+ */
+async function returnFromBackgroundSessionsView(
+  state: SessionState,
+  stillCurrent: () => boolean,
+): Promise<boolean> {
+  bumpKeystroke(state);
+  if (!(await tmux(["send-keys", "-t", state.sessionName, "Escape"])).ok) return false;
+  const deadline = Date.now() + BACKGROUND_VIEW_RETURN_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await Bun.sleep(BACKGROUND_VIEW_POLL_MS);
+    if (!stillCurrent()) return false;
+    const tail = await capturePastePane(state);
+    if (!stillCurrent()) return false;
+    if (!paneShowsBackgroundSessionsView(tail) && !SESSION_REDRAW_WAIT_RE.test(tail)) return true;
+  }
+  return false;
+}
+
 /**
  * @internal — no production caller since wave 5 (the dropdown mirror for
  * `/model` uses `mirrorModelViaPicker`, which drives the bare picker and
@@ -9122,7 +9303,7 @@ export async function mirrorModelViaPicker(
   // Never open the picker on a busy session (finding #2, wave-5 re-review) —
   // see this function's doc. Checked again as the first thing the driving op
   // does below.
-  if (turnInFlight(state) || paneShowsClaudeWorking(await capturePastePane(state))) {
+  if (turnInFlight(state) || sessionPaneWorking(state, await capturePastePane(state))) {
     return { ok: false, reason: "turn in flight" };
   }
 
@@ -9160,7 +9341,7 @@ export async function mirrorModelViaPicker(
     // busy — including one where the bare `/model` we just pasted got
     // swallowed into claude's queued-input buffer instead of opening the
     // picker immediately.
-    if (turnInFlight(state) || paneShowsClaudeWorking(await capturePastePane(state))) {
+    if (turnInFlight(state) || sessionPaneWorking(state, await capturePastePane(state))) {
       result = { ok: false, reason: "turn in flight" };
       return;
     }
@@ -10063,6 +10244,33 @@ export const __forTest = {
   placeholderRowShowing,
   livePromptRow,
   livePromptRowIndex,
+  /** Background-agent roster liveness (`noteAgentRoster`): a finished
+   *  agent's row stays with its counter frozen, so only a roster that
+   *  changed within `AGENT_ROSTER_LIVE_MS` reads as working. */
+  agentRosterSignature,
+  noteAgentRoster,
+  sessionPaneWorking,
+  AGENT_ROSTER_LIVE_MS,
+  /** Claude's background-sessions view (Left on an empty composer): the
+   *  pure detector, the Escape-and-wait return, its status text, and the
+   *  scrape tick that drives the return net. */
+  paneShowsBackgroundSessionsView,
+  returnFromBackgroundSessionsView,
+  BACKGROUND_VIEW_RETURN_STATUS_TEXT,
+  scrapeOnce,
+  /** Override `returnFromBackgroundSessionsView`'s wait / poll (defaults
+   *  `BACKGROUND_VIEW_RETURN_TIMEOUT_MS` / `BACKGROUND_VIEW_POLL_MS`).
+   *  Returns the previous value. */
+  setBackgroundViewReturnTimeoutMs(ms: number): number {
+    const prev = BACKGROUND_VIEW_RETURN_TIMEOUT_MS;
+    BACKGROUND_VIEW_RETURN_TIMEOUT_MS = ms;
+    return prev;
+  },
+  setBackgroundViewPollMs(ms: number): number {
+    const prev = BACKGROUND_VIEW_POLL_MS;
+    BACKGROUND_VIEW_POLL_MS = ms;
+    return prev;
+  },
   /** Override how the placeholder-aware callers read the STYLED pane
    *  (`captureStyledTail`; production runs `tmux capture-pane -p -e`).
    *  Tests inject a synthetic styled pane — or `async () => null` for "no
@@ -10752,7 +10960,34 @@ function queuePaste(
     if (expectedState && !opts.skipModalGuard) {
       const graceMs = opts.modalGuardGraceMs ?? PASTE_MODAL_GRACE_MS;
       const guardDeadline = Date.now() + graceMs;
-      while (paneShowsBlockingPrompt(await capturePastePane(expectedState))) {
+      let returnedFromBackgroundView = false;
+      for (;;) {
+        const guardTail = await capturePastePane(expectedState);
+        // Claude's background-sessions view: a paste there would start a NEW
+        // background session instead of reaching this conversation (see
+        // `paneShowsBackgroundSessionsView`). Leave it once with Escape; a
+        // view that stays — or comes back — withholds like a modal.
+        if (paneShowsBackgroundSessionsView(guardTail)) {
+          if (!stillCurrent()) return;
+          const back = !returnedFromBackgroundView
+            && await returnFromBackgroundSessionsView(expectedState, stillCurrent);
+          if (!stillCurrent()) return;
+          const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
+          if (!back) {
+            const outcome: Extract<PasteOutcome, { ok: false }> =
+              { ok: false, op: "modal-guard", phase: "pre-paste", stderr: "claude background-sessions view on pane" };
+            const message =
+              "paste withheld: claude is showing its background-sessions view and didn't return to the conversation — press Esc in the terminal and resend";
+            onChunk?.("status", message);
+            console.error(`[claude-tmux] ${message} (task ${taskId})`);
+            report(outcome);
+            return;
+          }
+          returnedFromBackgroundView = true;
+          onChunk?.("status", BACKGROUND_VIEW_RETURN_STATUS_TEXT);
+          continue;
+        }
+        if (!paneShowsBlockingPrompt(guardTail)) break;
         if (!stillCurrent()) return;
         if (Date.now() >= guardDeadline) {
           // Double-sample before withholding (finding #3, docs/plans/model-
@@ -10796,7 +11031,7 @@ function queuePaste(
     if (expectedState && !opts.skipModalGuard && expectedState.composerHoldsText) {
       const tail = await capturePastePane(expectedState);
       if (!stillCurrent()) return;
-      if (paneShowsClaudeWorking(tail)) {
+      if (sessionPaneWorking(expectedState, tail)) {
         // No safe mid-turn clear — Escape/Ctrl-C would interrupt the live
         // turn (see COMPOSER_CLEAR_KEYS's doc) — so withhold until idle.
         const outcome: Extract<PasteOutcome, { ok: false }> =
@@ -10817,7 +11052,7 @@ function queuePaste(
       // verify). `null` (no styled evidence) keeps the plain reading.
       const styledTail = await styledTailIfNonBare(expectedState, tail);
       if (!stillCurrent()) return;
-      if (paneShowsComposerText(tail, styledTail)) {
+      if (paneShowsComposerText(tail, styledTail, { rosterLive: noteAgentRoster(expectedState, tail) })) {
         // (finding #8, §10 re-review) `send-keys` can itself fail (dead
         // server, socket gone, session vanished mid-op) exactly like any
         // other tmux call — check `.ok` rather than assuming the clear

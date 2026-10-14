@@ -18,7 +18,7 @@ import { gotoApp } from "./helpers";
  * the in-process fake claude-code driver's `spawnAgent` call itself take
  * that long to resolve, reproducing a slow `spawnClaudeViaTmux` without
  * touching tmux. `SPAWN_RESPONSE_BUDGET_MS` (src/shared/types.ts) is 1500ms,
- * so with a 6000ms delay `POST /runs/:id/input` and `POST /tasks/:id/start`
+ * so with a 10000ms delay `POST /runs/:id/input` and `POST /tasks/:id/start`
  * both return well before the underlying spawn settles, carrying
  * `pending: true` — the run row, the `running` column flip, and the initial
  * `user` event are already persisted by then, which is what lets the panel
@@ -29,7 +29,7 @@ import { gotoApp } from "./helpers";
  * distinguish), and env vars are fixed for the lifetime of a spawned
  * backend process, so there's no way to enable the delay only for the
  * follow-up send while leaving the two tasks' initial starts fast. Both
- * tests that need it below (T1, T2) therefore pay the 6s delay on every
+ * tests that need it below (T1, T2) therefore pay the 10s delay on every
  * spawn they trigger, including the initial starts, and poll with generous
  * timeouts — this is the documented fallback in the work order, not a
  * workaround for a fixtures.ts limitation.
@@ -41,7 +41,11 @@ import { gotoApp } from "./helpers";
  * worker-scoped `backend` fixture.
  */
 
-test.use({ backendEnv: { AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS: "6000" } });
+// 10s, not the 6s it once was: T1's claim is "B renders while A's spawn is
+// still pending", and the wider spawn keeps that claim meaningful on a
+// loaded machine where B's panel alone can take a few seconds.
+const FAKE_SPAWN_DELAY_MS = 10_000;
+test.use({ backendEnv: { AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS: String(FAKE_SPAWN_DELAY_MS) } });
 
 interface TaskRow {
   id: string;
@@ -217,7 +221,7 @@ test.describe("task details stay responsive while another task's session restore
     const titleA = `switch-restore-a-${suffix}`;
     const titleB = `switch-restore-b-${suffix}`;
 
-    // Both initial starts pay the 6s fake-spawn delay too (see the file
+    // Both initial starts pay the 10s fake-spawn delay too (see the file
     // doc comment) — `createAndStartFakeClaudeTask`'s own POST returns
     // quickly (bounded by SPAWN_RESPONSE_BUDGET_MS), but the task doesn't
     // reach `review` until the detached spawn actually settles and the
@@ -225,8 +229,8 @@ test.describe("task details stay responsive while another task's session restore
     const taskA = await createAndStartFakeClaudeTask(request, freshBackend, titleA);
     const taskB = await createAndStartFakeClaudeTask(request, freshBackend, titleB);
 
-    await waitForColumn(request, freshBackend, taskA.id, "review", 20_000);
-    await waitForColumn(request, freshBackend, taskB.id, "review", 20_000);
+    await waitForColumn(request, freshBackend, taskA.id, "review", 40_000);
+    await waitForColumn(request, freshBackend, taskB.id, "review", 40_000);
 
     await gotoApp(page, freshBackend.bootBase);
 
@@ -239,7 +243,7 @@ test.describe("task details stay responsive while another task's session restore
     // Enter (no Shift) sends — mirrors the composer's own keydown handler.
     // This POSTs /runs/<A's run>/input, which the backend bounds at
     // SPAWN_RESPONSE_BUDGET_MS (1.5s) and returns `pending: true` well
-    // before the 6s fake spawn actually settles. We deliberately do NOT
+    // before the 10s fake spawn actually settles. We deliberately do NOT
     // await that network round-trip here — the whole point of this test is
     // that switching tasks doesn't have to wait for it.
     await textareaA.press("Enter");
@@ -250,20 +254,29 @@ test.describe("task details stay responsive while another task's session restore
     // A's panel is still showing).
     await openTaskWhilePanelOpen(page, titleB);
 
-    // Within ~2s, B's own panel content is up — not stuck on A's stream,
-    // not showing A's loading skeleton forever, and not carrying A's
-    // in-flight `sending` state.
-    await expect(panel.getByTestId("transcript-loading")).toHaveCount(0, { timeout: 2_000 });
+    // B's own panel content comes up while A's follow-up spawn is still
+    // pending — not stuck on A's stream, not showing A's loading skeleton
+    // until A's spawn settles, and not carrying A's in-flight `sending`
+    // state. The claim is relative to A's spawn, not a fixed clock: on an
+    // idle machine B renders in well under 2s, and a loaded one (load ~40)
+    // has missed a fixed 2s window without anything being wrong. The pre-fix
+    // bug held B blank until A's spawn settled, which the run check below
+    // catches whatever the machine's speed.
+    const bRendersBy = FAKE_SPAWN_DELAY_MS - 2_000;
+    await expect(panel.getByTestId("transcript-loading")).toHaveCount(0, { timeout: bRendersBy });
     await expect(panel.getByText(`fake response to: ${titleB}`, { exact: true })).toBeVisible({
-      timeout: 2_000,
+      timeout: bRendersBy,
     });
+    const runsAWhileBShows = await getRuns(request, freshBackend, taskA.id);
+    expect(runsAWhileBShows.length, "A's follow-up run row exists").toBeGreaterThanOrEqual(2);
+    expect(runsAWhileBShows[0]?.status, "A's follow-up spawn is still pending when B's transcript shows").toBe("running");
     // A's follow-up text must not have bled into B's transcript.
     await expect(panel.getByText(followUpText, { exact: true })).toHaveCount(0);
     // B's composer is live, not stuck disabled by A's `sending` flag (the
     // per-task reset effect — RunPanel.tsx's `[task.id]` effect — is what
     // this pins).
     const textareaB = panel.getByTestId("send-textarea");
-    await expect(textareaB).toBeEnabled({ timeout: 2_000 });
+    await expect(textareaB).toBeEnabled({ timeout: 5_000 });
 
     // Server-side ground truth: B has exactly its own single run (the
     // follow-up went to A, never touched B).
@@ -271,8 +284,8 @@ test.describe("task details stay responsive while another task's session restore
     expect(runsB.length).toBe(1);
 
     // A's follow-up still lands: a second run appears and settles
-    // `succeeded` once the detached 6s spawn finishes.
-    const runsA = await waitForRunSettled(request, freshBackend, taskA.id, 2, "succeeded", 20_000);
+    // `succeeded` once the detached 10s spawn finishes.
+    const runsA = await waitForRunSettled(request, freshBackend, taskA.id, 2, "succeeded", 40_000);
     expect(runsA.length).toBeGreaterThanOrEqual(2);
   });
 
@@ -280,12 +293,12 @@ test.describe("task details stay responsive while another task's session restore
     request,
     freshBackend,
   }) => {
-    test.setTimeout(60_000);
+    test.setTimeout(90_000);
 
     const suffix = randomUUID();
     const title = `bounded-response-${suffix}`;
     const task = await createAndStartFakeClaudeTask(request, freshBackend, title);
-    await waitForColumn(request, freshBackend, task.id, "review", 20_000);
+    await waitForColumn(request, freshBackend, task.id, "review", 40_000);
 
     const detail = await getTask(request, freshBackend, task.id);
     expect(detail.runId, "task should carry its last run id in review").toBeTruthy();
@@ -300,9 +313,9 @@ test.describe("task details stay responsive while another task's session restore
     const elapsedMs = Date.now() - startedAt;
 
     expect(res.ok(), `POST /runs/${firstRunId}/input -> ${res.status()}: ${await res.text()}`).toBeTruthy();
-    // Bounded well under the full 6s spawn delay — SPAWN_RESPONSE_BUDGET_MS
+    // Bounded well under the full 10s spawn delay — SPAWN_RESPONSE_BUDGET_MS
     // is 1.5s, budget of 3s leaves headroom for CI/load without weakening
-    // the assertion (a regression here would take ~6s, not ~1.5-3s).
+    // the assertion (a regression here would take ~10s, not ~1.5-3s).
     expect(elapsedMs, `POST /runs/${firstRunId}/input took ${elapsedMs}ms`).toBeLessThan(3_000);
 
     const body = (await res.json()) as SendInputPendingResult;
@@ -312,7 +325,7 @@ test.describe("task details stay responsive while another task's session restore
     expect(body.runId).not.toBe(firstRunId);
 
     // The detached spawn keeps running and the new run settles.
-    await waitForRunSettled(request, freshBackend, task.id, 2, "succeeded", 20_000);
+    await waitForRunSettled(request, freshBackend, task.id, 2, "succeeded", 40_000);
   });
 });
 

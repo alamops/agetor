@@ -1283,10 +1283,22 @@ function emitFakeFxUsageAndTitle(onChunk: ChunkHandler): void {
 }
 
 /**
+ * When the fake fx storm ({@link emitFakeFxRecoveryStorm}) pauses: 1500 ms,
+ * or `AGETOR_FAKE_FX_RECOVERY_PAUSE_MS` (≥ 900, so all three attempts land
+ * first). The e2e fixture widens it — the live notice exists only between the
+ * first attempt and the pause, and a loaded machine can spend 1.5 s just
+ * delivering the first attempt to an open panel.
+ */
+function fakeFxRecoveryPauseMs(): number {
+  const raw = Number(process.env.AGETOR_FAKE_FX_RECOVERY_PAUSE_MS);
+  return Number.isFinite(raw) && raw >= 900 ? raw : 1500;
+}
+
+/**
  * Emits the fake fx driver's 3-attempt rate-limit storm → terminal `paused`
  * sequence: three `FX_RECOVERY_STATUS_PREFIX` sentinel `status` chunks
  * (attempt 1/3, 2/3 with `delaySeconds: 1`, 3/3, at +5/+400/+800ms), then at
- * +1500ms a terminal `paused` sentinel, its persisted `fxRecoverySummaryLine`
+ * +1500ms (`fakeFxRecoveryPauseMs`) a terminal `paused` sentinel, its persisted `fxRecoverySummaryLine`
  * status line, the plain `fx turn ended: refused (…)` status line, and
  * `resolveDone(1)`. Factored out so a fresh (non-continue) storm launch and a
  * `continueRecovery` launch under {@link FAKE_FX_REPAUSE_PROMPT_MARKER}
@@ -1345,7 +1357,7 @@ function emitFakeFxRecoveryStorm(
     };
     onChunk("status", `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(attempt3)}`);
   });
-  after(1500, () => {
+  after(fakeFxRecoveryPauseMs(), () => {
     const paused: FxRecoveryPayload = {
       state: "paused",
       kind: "terminal_provider_error",

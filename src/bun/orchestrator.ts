@@ -414,15 +414,25 @@ function stepParentOf(taskId: string): string | undefined {
 
 /** Stamp `pipelineParentId` onto a per-task event (see
  *  {@link PIPELINE_PARENT_STAMPED_KINDS}) unless the emitter already set it
- *  (interactions.ts stamps its own `interaction` events). Built with
+ *  (interactions.ts stamps its own `interaction` events), plus the parent's
+ *  title as `pipelineParentTitle` — a toast for a run started right after the
+ *  page loaded can arrive before the client's task poll has the parent row,
+ *  and would otherwise name the pipeline by a short id. Built with
  *  `Object.assign` rather than an object-literal spread so this compiles the
- *  same whether or not the union member declares the optional field. */
+ *  same whether or not the union member declares the optional fields. */
 function stampPipelineParent(e: GlobalEvent): GlobalEvent {
   if (!PIPELINE_PARENT_STAMPED_KINDS.has(e.kind) || !("taskId" in e)) return e;
-  if ((e as { pipelineParentId?: string }).pipelineParentId !== undefined) return e;
-  const pipelineParentId = stepParentOf(e.taskId);
+  const stamped = e as { pipelineParentId?: string; pipelineParentTitle?: string };
+  if (stamped.pipelineParentTitle !== undefined) return e;
+  const pipelineParentId = stamped.pipelineParentId ?? stepParentOf(e.taskId);
   if (pipelineParentId === undefined) return e;
-  return Object.assign({}, e, { pipelineParentId }) as GlobalEvent;
+  const pipelineParentTitle = tasks.get(pipelineParentId)?.title;
+  return Object.assign(
+    {},
+    e,
+    { pipelineParentId },
+    pipelineParentTitle ? { pipelineParentTitle } : {},
+  ) as GlobalEvent;
 }
 
 /** Fan an app-wide lifecycle event out to every subscriber. Each listener

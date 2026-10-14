@@ -4469,6 +4469,10 @@ export type GlobalEvent =
        *  resolve the step row themselves; absent for an ordinary task (and
        *  on events from an older core, so always read it with a fallback). */
       pipelineParentId?: string;
+      /** The pipeline parent's title, stamped alongside `pipelineParentId`
+       *  so a toast can name the pipeline before the client's own task poll
+       *  has the parent row (a run started right after the page loaded). */
+      pipelineParentTitle?: string;
     }
   | {
       kind: "column";
@@ -4487,6 +4491,8 @@ export type GlobalEvent =
       /** Pipeline parent id when `taskId` is a hidden step task — see the
        *  `run-status` member. Optional/additive. */
       pipelineParentId?: string;
+      /** See the `run-status` member. */
+      pipelineParentTitle?: string;
     }
   | {
       kind: "update";
@@ -4520,6 +4526,9 @@ export type GlobalEvent =
        *  (`src/bun/interactions.ts`) stamps it on the request/resolved
        *  payloads it hands the orchestrator's bridge. */
       pipelineParentId?: string;
+      /** See the `run-status` member. Stamped by the orchestrator's
+       *  `emitGlobal`, not by the registry. */
+      pipelineParentTitle?: string;
     }
   | {
       /**
@@ -4539,6 +4548,8 @@ export type GlobalEvent =
       /** Pipeline parent id when `taskId` is a hidden step task — see the
        *  `run-status` member. Optional/additive. */
       pipelineParentId?: string;
+      /** See the `run-status` member. */
+      pipelineParentTitle?: string;
     }
   | {
       /**
@@ -4588,6 +4599,8 @@ export type GlobalEvent =
       /** Pipeline parent id when `taskId` is a hidden step task — see the
        *  `run-status` member. Optional/additive. */
       pipelineParentId?: string;
+      /** See the `run-status` member. */
+      pipelineParentTitle?: string;
     }
   | {
       /**

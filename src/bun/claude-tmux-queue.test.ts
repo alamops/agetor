@@ -1597,3 +1597,166 @@ test("sendTurn(...).pasteOutcome resolves a PASTE_DROPPED_OUTCOME-shaped failure
     expect(outcome.stderr).toContain("paste dropped");
   }
 });
+
+// ─── Claude's background-sessions view (Left on an empty composer): a paste
+// there would start a NEW background session instead of reaching this
+// conversation, so queuePaste presses Escape and waits for the conversation
+// before pasting; the scraper does the same for a turn gone quiet behind it. ───
+
+const BACKGROUND_VIEW_TAIL = [
+  "Your conversation moved to the background — enter opens it · esc returns to it ·",
+  "✻ current session               Needs input · repo                            0s",
+  "─".repeat(80),
+  "❯ describe a task for a new session",
+  "─".repeat(80),
+  "  ⏵⏵ auto mode · enter to return · space to reply · ctrl+x to delete · ? for sh…",
+].join("\n");
+const REDRAW_WAIT_TAIL = "  Waiting for session to redraw… Ctrl+Z to detach";
+const IDLE_COMPOSER_TAIL = ["─".repeat(80), "❯\xa0", "─".repeat(80), "  ⏵⏵ auto mode on (shift+tab to cycle)"].join("\n");
+
+function withBackgroundViewTiming<T>(fn: () => Promise<T>): Promise<T> {
+  const prevTimeout = __forTest.setBackgroundViewReturnTimeoutMs(200);
+  const prevPoll = __forTest.setBackgroundViewPollMs(5);
+  const prevGrace = __forTest.setPasteModalGraceMs(20);
+  const prevModalPoll = __forTest.setPasteModalPollMs(5);
+  const prevGap = __forTest.setBracketedEnterGapMs(0);
+  return fn().finally(() => {
+    __forTest.setBackgroundViewReturnTimeoutMs(prevTimeout);
+    __forTest.setBackgroundViewPollMs(prevPoll);
+    __forTest.setPasteModalGraceMs(prevGrace);
+    __forTest.setPasteModalPollMs(prevModalPoll);
+    __forTest.setBracketedEnterGapMs(prevGap);
+  });
+}
+
+test("queuePaste: the background-sessions view is left with one Escape before the paste, through the redraw frame", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    await withBackgroundViewTiming(async () => {
+      const { taskId, jsonlPath } = freshSession();
+      const state = __forTest.installSession(taskId, jsonlPath);
+      const rec = recorder();
+      state.lastChunk = rec.onChunk;
+      const frames = [BACKGROUND_VIEW_TAIL, REDRAW_WAIT_TAIL];
+      const prevCapture = __forTest.setCapturePastePane(async () => frames.shift() ?? IDLE_COMPOSER_TAIL);
+      try {
+        const result = await pasteFollowUp(taskId, "a follow-up message");
+        if (result === false) throw new Error("expected delivered");
+        const outcome = await result.pasteOutcome;
+        expect(outcome.ok).toBe(true);
+
+        const calls = readTmuxLog(logPath).map((c) => c.argv);
+        const escapeAt = calls.findIndex((a) => a[0] === "send-keys" && a.includes("Escape"));
+        const loadAt = calls.findIndex((a) => a[0] === "load-buffer");
+        expect(escapeAt).toBeGreaterThanOrEqual(0);
+        expect(loadAt).toBeGreaterThan(escapeAt);
+        expect(calls.filter((a) => a[0] === "send-keys" && a.includes("Escape")).length).toBe(1);
+        expect(rec.out).toContainEqual({ stream: "status", data: __forTest.BACKGROUND_VIEW_RETURN_STATUS_TEXT });
+      } finally {
+        __forTest.setCapturePastePane(prevCapture);
+        __forTest.uninstallSession(taskId);
+      }
+    });
+  });
+});
+
+test("queuePaste: a background-sessions view that stays is withheld (pre-paste) after one Escape — nothing is pasted into it", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    await withBackgroundViewTiming(async () => {
+      const { taskId, jsonlPath } = freshSession();
+      const state = __forTest.installSession(taskId, jsonlPath);
+      const rec = recorder();
+      state.lastChunk = rec.onChunk;
+      const prevCapture = __forTest.setCapturePastePane(async () => BACKGROUND_VIEW_TAIL);
+      try {
+        const result = await pasteFollowUp(taskId, "a follow-up message");
+        if (result === false) throw new Error("expected delivered");
+        const outcome = await result.pasteOutcome;
+        expect(outcome.ok).toBe(false);
+        assertModalGuard(outcome as PasteFailureOutcome);
+        expect((outcome as ModalGuardFailure).phase).toBe("pre-paste");
+
+        const calls = readTmuxLog(logPath).map((c) => c.argv);
+        expect(calls.filter((a) => a[0] === "send-keys" && a.includes("Escape")).length).toBe(1);
+        expect(calls.some((a) => a[0] === "load-buffer" || a[0] === "paste-buffer")).toBe(false);
+        expect(rec.out.some((r) => r.stream === "status" && r.data.includes("background-sessions view"))).toBe(true);
+      } finally {
+        __forTest.setCapturePastePane(prevCapture);
+        __forTest.uninstallSession(taskId);
+      }
+    });
+  });
+});
+
+/** A tmux bin that logs every call (like `withRecordingTmuxBin`) and answers
+ *  `capture-pane` with the current contents of a pane file the test rewrites. */
+function withPaneFileTmuxBin<T>(fn: (logPath: string, panePath: string) => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-pane-"));
+  const binPath = path.join(dir, "tmux");
+  const logPath = path.join(dir, "log.jsonl");
+  const panePath = path.join(dir, "pane.txt");
+  writeFileSync(panePath, "");
+  writeFileSync(
+    binPath,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync, readFileSync } from "node:fs";\n` +
+      `const argv = process.argv.slice(2);\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ ms: Date.now(), argv }) + "\\n");\n` +
+      `if (argv.includes("capture-pane")) process.stdout.write(readFileSync(${JSON.stringify(panePath)}, "utf8"));\n`,
+  );
+  chmodSync(binPath, 0o755);
+  const prevBin = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = binPath;
+  return fn(logPath, panePath).finally(() => {
+    if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevBin;
+  });
+}
+
+test("scrapeOnce: a turn gone quiet behind the background-sessions view gets one Escape back to the conversation", async () => {
+  await withPaneFileTmuxBin(async (logPath, panePath) => {
+    await withBackgroundViewTiming(async () => {
+      const { taskId, jsonlPath } = freshSession();
+      const state = __forTest.installSession(taskId, jsonlPath);
+      const rec = recorder();
+      __forTest.pushTurnSlot(state, rec.onChunk).catch(() => {});
+      state.lastJsonlAppendAt = Date.now() - __forTest.STUCK_TURN_FALLBACK_MS - 1_000;
+      writeFileSync(panePath, BACKGROUND_VIEW_TAIL);
+      const frames = [BACKGROUND_VIEW_TAIL, REDRAW_WAIT_TAIL];
+      const prevCapture = __forTest.setCapturePastePane(async () => frames.shift() ?? IDLE_COMPOSER_TAIL);
+      const prevStyled = __forTest.setCaptureStyledTail(async () => null);
+      try {
+        for (let i = 0; i < __forTest.UNPARSABLE_STABILITY_TICKS; i++) await __forTest.scrapeOnce(state);
+        await __forTest.pasteChains.get(taskId);
+
+        const escapes = readTmuxLog(logPath).filter((c) => c.argv[0] === "send-keys" && c.argv.includes("Escape"));
+        expect(escapes.length).toBe(1);
+        expect(rec.out).toContainEqual({ stream: "status", data: __forTest.BACKGROUND_VIEW_RETURN_STATUS_TEXT });
+      } finally {
+        __forTest.setCapturePastePane(prevCapture);
+        __forTest.setCaptureStyledTail(prevStyled);
+        __forTest.uninstallSession(taskId);
+      }
+    });
+  });
+});
+
+test("scrapeOnce: the background-sessions view is left alone while the conversation is still writing", async () => {
+  await withPaneFileTmuxBin(async (logPath, panePath) => {
+    await withBackgroundViewTiming(async () => {
+      const { taskId, jsonlPath } = freshSession();
+      const state = __forTest.installSession(taskId, jsonlPath);
+      __forTest.pushTurnSlot(state, () => {}).catch(() => {});
+      state.lastJsonlAppendAt = Date.now() - 1_000;
+      writeFileSync(panePath, BACKGROUND_VIEW_TAIL);
+      const prevStyled = __forTest.setCaptureStyledTail(async () => null);
+      try {
+        for (let i = 0; i < __forTest.UNPARSABLE_STABILITY_TICKS + 1; i++) await __forTest.scrapeOnce(state);
+        await __forTest.pasteChains.get(taskId);
+        expect(readTmuxLog(logPath).some((c) => c.argv[0] === "send-keys")).toBe(false);
+      } finally {
+        __forTest.setCaptureStyledTail(prevStyled);
+        __forTest.uninstallSession(taskId);
+      }
+    });
+  });
+});

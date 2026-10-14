@@ -2847,9 +2847,82 @@ describe("live 2.1.296 captures — the background-agent roster below the status
     expect(paneShowsIdleInputBox(typed.plain, typed.styled)).toBe(false);
   });
 
-  test("the roster's frozen token counter still reads as working chrome (unchanged: one frame can't tell a finished agent from a running one)", () => {
+  test("without a session, the roster's token counter still reads as working chrome (one frame can't tell a finished agent from a running one)", () => {
     const { plain } = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
     expect(paneShowsClaudeWorking(plain)).toBe(true);
+    expect(paneShowsClaudeWorking(plain, { rosterLive: true })).toBe(true);
+  });
+
+  test("a frozen roster (rosterLive: false) is not working chrome; other working chrome still is", () => {
+    const { plain } = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(paneShowsClaudeWorking(plain, { rosterLive: false })).toBe(false);
+    const busy = livePanes(
+      "\x1b[39m❯\xa0",
+      LIVE_ROSTER_MAIN,
+      "  ⏵⏵ auto mode on · ← 1 agent · esc to interrupt · ↓ to manage",
+    );
+    expect(paneShowsClaudeWorking(busy.plain, { rosterLive: false })).toBe(true);
+  });
+});
+
+describe("background-agent roster liveness (noteAgentRoster)", () => {
+  const ROSTER_ROW = "  ◯ general-purpose  sleeper                           1m 40s · ↓ 37.4k tokens";
+  const pane = (row: string | null): string =>
+    [
+      "❯\xa0",
+      "─".repeat(80),
+      "  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent · ↓ to manage",
+      "",
+      "  ⏺ main",
+      ...(row === null ? [] : [row]),
+    ].join("\n");
+  const freshState = () => ({ agentRosterSignature: null, agentRosterChangedAt: 0 }) as never;
+
+  test("the signature holds only the agent rows, not the main row", () => {
+    expect(__forTest.agentRosterSignature(pane(ROSTER_ROW))).toBe(ROSTER_ROW.trim());
+    expect(__forTest.agentRosterSignature(pane(null))).toBeNull();
+  });
+
+  test("a roster is live when first seen, frozen once it hasn't changed for AGENT_ROSTER_LIVE_MS, live again when it ticks", () => {
+    const state = freshState();
+    const t0 = 1_000_000;
+    expect(__forTest.noteAgentRoster(state, pane(ROSTER_ROW), t0)).toBe(true);
+    expect(__forTest.noteAgentRoster(state, pane(ROSTER_ROW), t0 + __forTest.AGENT_ROSTER_LIVE_MS - 1)).toBe(true);
+    expect(__forTest.noteAgentRoster(state, pane(ROSTER_ROW), t0 + __forTest.AGENT_ROSTER_LIVE_MS)).toBe(false);
+    const ticked = ROSTER_ROW.replace("1m 40s", "1m 41s");
+    expect(__forTest.noteAgentRoster(state, pane(ticked), t0 + __forTest.AGENT_ROSTER_LIVE_MS + 1)).toBe(true);
+  });
+
+  test("no roster on the pane is not live and clears the remembered rows", () => {
+    const state = freshState() as unknown as { agentRosterSignature: string | null };
+    __forTest.noteAgentRoster(state as never, pane(ROSTER_ROW), 5);
+    expect(__forTest.noteAgentRoster(state as never, pane(null), 6)).toBe(false);
+    expect(state.agentRosterSignature).toBeNull();
+  });
+
+  test("a frozen roster no longer blocks the idle-settle net: idle at the box, not working", () => {
+    const state = freshState();
+    const { plain } = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    const t0 = 2_000_000;
+    __forTest.noteAgentRoster(state, plain, t0);
+    const rosterLive = __forTest.noteAgentRoster(state, plain, t0 + __forTest.AGENT_ROSTER_LIVE_MS);
+    const paneWorking = paneShowsClaudeWorking(plain, { rosterLive });
+    expect(paneWorking).toBe(false);
+    expect(paneShowsIdleInputBox(plain)).toBe(true);
+    expect(stuckTurnFallbackArmed({
+      turnInFlight: true,
+      lastJsonlAppendAt: 1,
+      now: 1 + __forTest.STUCK_TURN_FALLBACK_MS + 1,
+      paneWorking,
+      askCardLive: false,
+      paneIdle: false,
+    })).toBe(true);
+  });
+
+  test("a frozen roster no longer hides typed composer text", () => {
+    const typed = livePanes("\x1b[39m❯\xa0hello", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(paneShowsComposerText(typed.plain, typed.styled)).toBe(false);
+    expect(paneShowsComposerText(typed.plain, typed.styled, { rosterLive: false })).toBe(true);
   });
 
   test("the selector-focused roster (the bar replaced by '↑/↓ to select') has no live prompt row", () => {
@@ -2898,5 +2971,59 @@ describe("live 2.1.296 captures — comma-joined status-bar items", () => {
   }
   test("prose that merely mentions shells after a list is not working chrome", () => {
     expect(paneShowsClaudeWorking("· 3 shell scripts were updated, 2 tests added")).toBe(false);
+  });
+});
+
+/** Claude's background-sessions view as captured live (2.1.299, 80x24,
+ *  2026-10-13; directory and session names replaced). */
+const BACKGROUND_VIEW_PANE = [
+  "",
+  " ▐▛███▛█   Claude Code v2.1.299",
+  "▝▜██████▀  New sessions: Opus 5.5 · high effort",
+  " ▝▝   ▝▝   ~/projects/example-repo",
+  "           2 awaiting input · 0 working · 1 completed",
+  "",
+  "Your conversation moved to the background — enter opens it · esc returns to it ·",
+  "ctrl+c twice quits",
+  "",
+  "~/projects/example-repo",
+  "∙ Example task one              Failed · waiting on helper subagent's sle…   5m",
+  "✻ current session               Needs input · repo                            0s",
+  "",
+  "────────────────────────────────────────────────────────────────────────────────",
+  "❯ describe a task for a new session",
+  "────────────────────────────────────────────────────────────────────────────────",
+  "  ⏵⏵ auto mode · enter to return · space to reply · ctrl+x to delete · ? for sh…",
+  "",
+  "",
+].join("\n");
+
+describe("Claude's background-sessions view", () => {
+  test("the live view is detected", () => {
+    expect(__forTest.paneShowsBackgroundSessionsView(BACKGROUND_VIEW_PANE)).toBe(true);
+  });
+
+  test("the view is neither an idle input box nor composer text, and no matcher cards it", () => {
+    expect(paneShowsIdleInputBox(BACKGROUND_VIEW_PANE)).toBe(false);
+    expect(paneShowsComposerText(BACKGROUND_VIEW_PANE)).toBe(false);
+    expect(__forTest.paneShowsBlockingPrompt(BACKGROUND_VIEW_PANE)).toBe(false);
+  });
+
+  test("an ordinary idle pane, and the redraw frame after Escape, are not the view", () => {
+    const { plain } = livePanes("\x1b[39m❯\xa0");
+    expect(__forTest.paneShowsBackgroundSessionsView(plain)).toBe(false);
+    expect(__forTest.paneShowsBackgroundSessionsView("\n  Waiting for session to redraw… Ctrl+Z to detach\n")).toBe(false);
+  });
+
+  test("the bar's wording in the transcript, above a real input box, is not the view", () => {
+    const tail = [
+      "⏺ The bar reads `· enter to return · space to reply · ctrl+x to delete`.",
+      "Your conversation moved to the background — enter opens it · esc returns to it ·",
+      "─".repeat(80),
+      "❯\xa0",
+      "─".repeat(80),
+      "  ⏵⏵ auto mode on (shift+tab to cycle)",
+    ].join("\n");
+    expect(__forTest.paneShowsBackgroundSessionsView(tail)).toBe(false);
   });
 });
