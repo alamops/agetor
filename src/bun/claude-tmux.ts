@@ -8516,6 +8516,11 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
       const detail = stillAlive
         ? `claude is up but hasn't written its JSONL yet after ${(BOOT_TIMEOUT_MS / 1000) | 0}s — pane content below`
         : "claude exited before writing its JSONL — check `tmux` / `claude` are installed and you can run `claude` interactively in this cwd";
+      // `attachTailer` never ran, so the deferred breadcrumb would otherwise be
+      // dropped: a launch whose pre-launch stages were slow and then timed out
+      // is exactly the one worth naming. Three-stage form — there is no
+      // watcher stage to add.
+      reportSlowLaunch();
       opts.onChunk("stderr", `claude session JSONL never appeared: ${detail}`);
       opts.onChunk("stderr", `expected at: ${jsonlPath}`);
       opts.onChunk("stderr", `--- tmux pane ---\n${pane}\n--- end pane ---`);

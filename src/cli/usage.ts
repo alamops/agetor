@@ -57,10 +57,11 @@ export const USAGE: Record<string, string> = {
   the turn. --ref with no message sends just the attachment(s).
 
   "accepted … still getting ready" (a session that is still restoring or
-  launching) is a promise, not a delivery: if the delivery later fails the message is re-stashed into the
-  task's saved-messages backlog and the app shows it — the CLI cannot report
-  that failure after it has exited. Check 'agetor show <id>' or the app if a
-  reply never arrives.`,
+  launching) is a promise, not a delivery: if the delivery later fails the app
+  reports it and tries to restore the message to the task's saved-messages
+  backlog (it says when that fails too) — the CLI cannot report that failure
+  after it has exited. Check 'agetor show <id>' or the app if a reply never
+  arrives.`,
 
   commit: `usage: agetor commit <task-id>
 
