@@ -6,8 +6,11 @@ import type {
   BranchInfo,
   BranchNamingConfig,
   ColumnId,
+  DbCompactResult,
+  DbStats,
   DiscoveredAccount,
   GlobalEvent,
+  RetentionPassResult,
   GitHubIssueThreadResult,
   GitHubItemKind,
   GitHubItemState,
@@ -99,6 +102,7 @@ import type {
 } from "../../shared/bundle.ts";
 import type { BundleImportOptions, BundleImportPlan, BundleImportResponse } from "../../shared/bundle-import.ts";
 import { ApiTransitError, fetchWithRecovery } from "./net-retry.ts";
+import { configureCoreBusy, suspendCoreBusy, trackRequest } from "./core-busy.ts";
 
 export interface UpdateSnapshot {
   status: UpdateStatus;
@@ -347,6 +351,11 @@ const API_PORT = injected?.port ?? params.get("api") ?? "4317";
 const API_TOKEN = injected?.token ?? params.get("token") ?? "";
 const BASE = `http://127.0.0.1:${API_PORT}`;
 
+// Point the busy-banner watchdog at this core before the first request. It
+// only ever probes the unauthenticated `/health` route and never aborts or
+// retries a tracked request (docs/plans/non-blocking-session-restore.md).
+configureCoreBusy({ base: BASE });
+
 /** Error thrown for any non-2xx API response. Carries the parsed JSON body
  *  so callers can read structured fields (e.g. the `taskIds` list returned
  *  by `DELETE /harnesses/:id` when the harness is still in use) instead of
@@ -362,7 +371,18 @@ export class ApiError extends Error {
   }
 }
 
-async function j<T>(
+function j<T>(
+  path: string,
+  init?: RequestInit,
+  opts?: { retry?: boolean },
+): Promise<T> {
+  // The whole request — fetch AND body parse — is registered with the
+  // core-busy watchdog, so a response that was accepted but never finishes
+  // (a blocked Bun main thread) counts as pending and can raise the banner.
+  return trackRequest(jRequest<T>(path, init, opts));
+}
+
+async function jRequest<T>(
   path: string,
   init?: RequestInit,
   opts?: { retry?: boolean },
@@ -1384,6 +1404,29 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ value }),
     }),
+  /** `GET /db/stats` — file/WAL size, reclaimable bytes, the Compact estimate
+   *  and the archived-history retention bookkeeping (Settings → General). */
+  getDbStats: () => j<DbStats>("/db/stats"),
+  /** `POST /db/compact` — `VACUUM` + WAL truncate. Blocks the core for the
+   *  whole duration (the request itself is the freeze), so it suspends the
+   *  busy banner for its lifetime; the Settings modal owns the user-facing
+   *  "Agetor won't respond" copy. Refused with a 409 `ApiError` (message =
+   *  the server's "N task(s) running — …" text, body carries
+   *  `activeRunCount`) while any run is active. `retry: false` — never
+   *  replayed. */
+  compactDb: async (): Promise<DbCompactResult> => {
+    const release = suspendCoreBusy();
+    try {
+      return await j<DbCompactResult>("/db/compact", { method: "POST" }, { retry: false });
+    } finally {
+      release();
+    }
+  },
+  /** `POST /db/retention/run` — runs one archived-history retention pass now.
+   *  400 when the preference is `off`, 409 while a pass is already running
+   *  (both thrown as `ApiError`). `retry: false`. */
+  runRetentionPass: () =>
+    j<RetentionPassResult>("/db/retention/run", { method: "POST" }, { retry: false }),
   listAgentCapabilities: (opts: { agent: string; workdir?: string | null; branch?: string }) => {
     // Slash commands/skills + MCP/skill/plugin extensions in one fetch. `agent`
     // is a harness id (built-ins use id-equals-kind, so "claude-code" / "codex"

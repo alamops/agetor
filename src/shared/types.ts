@@ -2300,6 +2300,32 @@ export interface DbStats {
   };
 }
 
+/**
+ * Outcome of one archived-history retention pass (`POST /db/retention/run`,
+ * the scheduler's log line, `scripts/measure-restore.ts`). `freedBytes` is
+ * payload bytes removed from `run_events.data`, not file size — the file
+ * only shrinks after a Compact.
+ */
+export interface RetentionPassResult {
+  scannedTasks: number;
+  scannedRuns: number;
+  trimmedRows: number;
+  freedBytes: number;
+  durationMs: number;
+  /** The pass stopped early (shutdown / stop requested); a later pass resumes
+   *  where it left off, since trimmed rows are skipped by the marker prefilter. */
+  aborted: boolean;
+}
+
+/** `POST /db/compact` success body (a refusal is a 409 `{ error, activeRunCount }`). */
+export interface DbCompactResult {
+  ok: true;
+  /** `agetor.sqlite` + `-wal` bytes before / after `VACUUM` + `wal_checkpoint(TRUNCATE)`. */
+  beforeBytes: number;
+  afterBytes: number;
+  durationMs: number;
+}
+
 export interface AgentOption {
   /** Stored on the task and passed to `buildCommand`. */
   id: string;

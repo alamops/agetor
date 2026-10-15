@@ -51,6 +51,7 @@ import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { FontSizeProvider, useFontSize } from "@/components/font-size-provider";
 import { ThemeProvider, useTheme } from "@/components/theme-provider";
 import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
+import { CoreBusyBanner } from "@/components/CoreBusyBanner";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
 import { UpdateBanner } from "@/components/updater/UpdateBanner";
 import { WorktreesDialog } from "@/components/worktrees/WorktreesDialog";
@@ -60,7 +61,7 @@ import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
+import { dismissPending, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
 import { publishCloneProgress } from "@/lib/clone-progress";
@@ -1408,6 +1409,34 @@ function AppInner() {
         // `cancelled` is intentionally silent — the user issued the cancel.
         return;
       }
+      if (ev.kind === "send-failed") {
+        // A message accepted with `pending: true` failed late (the bounded
+        // pre-dispatch of `sendInput` — session/worktree restore — finished
+        // after the response had returned). Live-only, so a replayed history
+        // never re-toasts; NOT gated on the open panel (see
+        // `toastSendFailed`). `target` already retargets a hidden pipeline
+        // step at its parent (title = parent, subtitle = step, Open lands on
+        // the step), exactly like `files-sent` below.
+        toastSendFailed({
+          taskId: target.taskId,
+          title: target.title,
+          subtitle: target.subtitle,
+          reason: ev.reason,
+          savedToBacklog: ev.savedToBacklog,
+          onOpen: target.onOpen,
+        });
+        if (ev.savedToBacklog) {
+          // The server re-stashed the text into THIS task's backlog (a step's
+          // own tray for a pipeline step). Pull just the backlog so an open
+          // RunPanel's tray shows it now instead of at the next 2s poll —
+          // never the whole snapshot (would revert concurrent optimistic
+          // patches, same rule as `refetchPipelineParent`).
+          api.getTask(ev.taskId)
+            .then((fresh) => mergeTaskFields(ev.taskId, { backlog: fresh.backlog }))
+            .catch(() => { /* the 2s poll catches up */ });
+        }
+        return;
+      }
       if (ev.kind === "files-sent") {
         // Live-only signal (a replayed historical send must not notify) — no
         // optimistic board patch here, unlike `column`/`interaction` above:
@@ -2338,6 +2367,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             show={isTmuxMissing(agents)}
             onResolve={() => setTmuxDialogOpen(true)}
           />
+          <CoreBusyBanner />
           <ErrorToast error={error} onDismiss={() => setError(null)} />
           <Toaster panelOpen={panelMounted} />
           <AnimatePresence mode="wait">
