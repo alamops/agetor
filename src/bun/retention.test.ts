@@ -327,6 +327,104 @@ describe("runArchivedHistoryRetentionPass", () => {
     expect(afterFirst.get(old.ids.bigMain[0]!)!.bytes).toBeGreaterThan(4096);
   });
 
+  test("a completed sweep is recorded: an unchanged task (even one holding untrimmable big rows) is skipped next time", async () => {
+    const log = silenceLog();
+    const now = Date.now();
+    const old = seedTask(now - 40 * DAY, { bigMain: 2, bigGarbage: 2 });
+    const first = await ret.runArchivedHistoryRetentionPass({ now, days: 30 });
+    expect(first.scannedTasks).toBe(1);
+    expect(first.trimmedRows).toBe(2);
+    expect(dbm.retentionSweeps.all().has(old.taskId)).toBe(true);
+    // The record lives in its own table, never in the preferences store that
+    // GET /preferences and `agetor config ls` return.
+    expect(Object.keys(dbm.preferences.list()).filter((k) => k.toLowerCase().includes("swept"))).toEqual([]);
+
+    // The two garbage rows still match the candidate query (big, unmarked)…
+    const leftovers = old.runIds.flatMap((r) => dbm.runs.toolResultRowsForTrim(r, 4096, 0, 1000));
+    expect(leftovers.map((r) => r.id).sort()).toEqual([...old.ids.bigGarbage].sort());
+    // …but the next pass no longer re-reads them.
+    const second = await ret.runArchivedHistoryRetentionPass({ now: now + 1000, days: 30 });
+    log.mockRestore();
+    expect(second.scannedTasks).toBe(0);
+    expect(second.scannedRuns).toBe(0);
+    expect(second.trimmedRows).toBe(0);
+  });
+
+  test("a swept task is swept again when it gains events, is re-archived, or the threshold changes", async () => {
+    const log = silenceLog();
+    const now = Date.now();
+    const old = seedTask(now - 40 * DAY, { bigMain: 1 });
+    expect((await ret.runArchivedHistoryRetentionPass({ now, days: 30 })).trimmedRows).toBe(1);
+
+    // New rows (a JSONL rebuild of the archived task) → swept and trimmed.
+    const late = dbm.runs.appendEvent(old.runIds[0]!, "tool_result", bigToolResult("late", BIG), `ln-${randomUUID()}`, null);
+    expect(late).not.toBeNull();
+    const afterRebuild = await ret.runArchivedHistoryRetentionPass({ now, days: 30 });
+    expect(afterRebuild.scannedTasks).toBe(1);
+    expect(afterRebuild.trimmedRows).toBe(1);
+    expect((await ret.runArchivedHistoryRetentionPass({ now, days: 30 })).scannedTasks).toBe(0);
+
+    // A different threshold is a different sweep.
+    expect((await ret.runArchivedHistoryRetentionPass({ now, days: 30, maxBytes: 8192 })).scannedTasks).toBe(1);
+
+    // Re-archived (still past the cutoff) → archived_at moved → swept again.
+    dbm.db.run(`UPDATE tasks SET archived_at = ? WHERE id = ?`, [now - 35 * DAY, old.taskId]);
+    expect((await ret.runArchivedHistoryRetentionPass({ now, days: 30 })).scannedTasks).toBe(1);
+
+    // Unarchived → dropped from the record.
+    dbm.db.run(`UPDATE tasks SET archived_at = NULL WHERE id = ?`, [old.taskId]);
+    await ret.runArchivedHistoryRetentionPass({ now, days: 30 });
+    log.mockRestore();
+    expect(dbm.retentionSweeps.all().has(old.taskId)).toBe(false);
+  });
+
+  test("a deleted task's sweep record goes with it", async () => {
+    const log = silenceLog();
+    const now = Date.now();
+    const old = seedTask(now - 40 * DAY, { bigMain: 1 });
+    await ret.runArchivedHistoryRetentionPass({ now, days: 30 });
+    log.mockRestore();
+    expect(dbm.retentionSweeps.all().has(old.taskId)).toBe(true);
+    for (const runId of old.runIds) {
+      dbm.db.run(`DELETE FROM run_events WHERE run_id = ?`, [runId]);
+      dbm.db.run(`DELETE FROM runs WHERE id = ?`, [runId]);
+    }
+    dbm.db.run(`DELETE FROM tasks WHERE id = ?`, [old.taskId]);
+    expect(dbm.retentionSweeps.all().has(old.taskId)).toBe(false);
+    // Recording a sweep for a task that no longer exists is a silent no-op.
+    dbm.retentionSweeps.set(old.taskId, "0:0:0");
+    expect(dbm.retentionSweeps.all().has(old.taskId)).toBe(false);
+  });
+
+  test("a steady-state pass that skips every already-swept task still yields between tasks", async () => {
+    const log = silenceLog();
+    const now = Date.now();
+    const count = 25;
+    const seeded = Array.from({ length: count }, () => seedTask(now - 40 * DAY, { bigMain: 1 }));
+    expect((await ret.runArchivedHistoryRetentionPass({ now, days: 30 })).scannedTasks).toBeGreaterThanOrEqual(count);
+    const sweeps = dbm.retentionSweeps.all();
+    for (const s of seeded) expect(sweeps.has(s.taskId)).toBe(true);
+
+    // sliceMs: 0 → any slice is spent, so every loop iteration must yield.
+    let settled = false;
+    const pass = ret.runArchivedHistoryRetentionPass({ now: now + 1000, days: 30, sliceMs: 0 }).then((r) => {
+      settled = true;
+      return r;
+    });
+    let ticksWhileRunning = 0;
+    while (!settled) {
+      await tick();
+      if (!settled && ret.isRetentionRunning()) ticksWhileRunning++;
+    }
+    const second = await pass;
+    log.mockRestore();
+    expect(second.scannedTasks).toBe(0);
+    expect(second.aborted).toBe(false);
+    // One yield per skipped task (before the fix: zero — the whole skip loop
+    // ran without ever returning to the event loop).
+    expect(ticksWhileRunning).toBeGreaterThanOrEqual(count - 1);
+  });
+
   test("days: null is a no-op that writes no bookkeeping", async () => {
     const log = silenceLog();
     const now = Date.now();
@@ -394,6 +492,8 @@ describe("runArchivedHistoryRetentionPass", () => {
     expect(done).toBe(result.trimmedRows);
     expect(done).toBeGreaterThan(0);
     expect(done).toBeLessThan(total);
+    // An aborted sweep is never recorded as complete.
+    expect(dbm.retentionSweeps.all().has(old.taskId)).toBe(false);
 
     // The next pass resumes via the marker prefilter and finishes the job.
     const resumed = await ret.runArchivedHistoryRetentionPass({ now, days: 30 });
@@ -479,6 +579,163 @@ describe("runArchivedHistoryRetentionPass", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The swept-task record vs. writes that race a pass
+// ---------------------------------------------------------------------------
+
+describe("retention_swept_tasks record under concurrent task changes", () => {
+  test("runs.maxEventIdForRun is 0 for a run with no events and the newest id otherwise", () => {
+    const empty = seedTask(null, {});
+    expect(dbm.runs.maxEventIdForRun(empty.runIds[0]!)).toBe(0);
+    expect(dbm.runs.maxEventIdForRun(`missing-${randomUUID()}`)).toBe(0);
+    const two = seedTask(null, { runs: 2, small: 4 });
+    for (const runId of two.runIds) {
+      const ids = dbm.db
+        .query<{ id: number }, [string]>(`SELECT id FROM run_events WHERE run_id = ?`)
+        .all(runId)
+        .map((r) => r.id);
+      expect(dbm.runs.maxEventIdForRun(runId)).toBe(Math.max(...ids));
+    }
+  });
+
+  test("a task unarchived mid-sweep is not recorded (other tasks are); re-archived, it is swept to completion", async () => {
+    const log = silenceLog();
+    const now = Date.now();
+    const total = 300;
+    // `control` archived earlier → swept first (candidates are archived_at ASC).
+    const control = seedTask(now - 45 * DAY, { bigMain: 3 });
+    const old = seedTask(now - 40 * DAY, { bigMain: total });
+
+    const pass = ret.runArchivedHistoryRetentionPass({ now, days: 30, sliceMs: 0 });
+    await until(() => trimmedCount(old.runIds) > 0, "the first chunk of the big task to commit");
+    dbm.db.run(`UPDATE tasks SET archived_at = NULL WHERE id = ?`, [old.taskId]);
+    const result = await pass;
+    expect(result.aborted).toBe(false);
+
+    const sweeps = dbm.retentionSweeps.all();
+    expect(sweeps.has(control.taskId)).toBe(true);
+    expect(sweeps.has(old.taskId)).toBe(false);
+    const partial = trimmedCount(old.runIds);
+    expect(partial).toBeLessThan(total);
+
+    // Re-archived past the cutoff: the missing record means the next pass
+    // sweeps it (rather than skipping it as done) and finishes the job.
+    dbm.db.run(`UPDATE tasks SET archived_at = ? WHERE id = ?`, [now - 40 * DAY, old.taskId]);
+    const again = await ret.runArchivedHistoryRetentionPass({ now, days: 30 });
+    log.mockRestore();
+    expect(again.scannedTasks).toBe(1); // control is skipped as already swept
+    expect(again.trimmedRows).toBe(total - partial);
+    expect(trimmedCount(old.runIds)).toBe(total);
+    expect(dbm.retentionSweeps.all().has(old.taskId)).toBe(true);
+  });
+
+  test("a task deleted mid-sweep ends its sweep quietly: no error, no record, the pass carries on", async () => {
+    const log = silenceLog();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    const now = Date.now();
+    const total = 300;
+    const old = seedTask(now - 45 * DAY, { bigMain: total });
+    const later = seedTask(now - 40 * DAY, { bigMain: 4 });
+
+    const pass = ret.runArchivedHistoryRetentionPass({ now, days: 30, sliceMs: 0 });
+    await until(() => trimmedCount(old.runIds) > 0, "the first chunk of the doomed task to commit");
+    // What deleteTask does at the db layer: events, runs, then the task row.
+    dbm.db.transaction(() => {
+      for (const runId of old.runIds) {
+        dbm.db.run(`DELETE FROM run_events WHERE run_id = ?`, [runId]);
+        dbm.db.run(`DELETE FROM runs WHERE id = ?`, [runId]);
+      }
+      dbm.db.run(`DELETE FROM tasks WHERE id = ?`, [old.taskId]);
+    })();
+    let result: Awaited<ReturnType<typeof ret.runArchivedHistoryRetentionPass>>;
+    let warned: unknown[][] = [];
+    try {
+      result = await pass;
+    } finally {
+      warned = [...warn.mock.calls];
+      log.mockRestore();
+      warn.mockRestore();
+    }
+    expect(result.aborted).toBe(false);
+    expect(warned.filter((c) => String(c[0]).includes("retention"))).toEqual([]);
+    expect(dbm.retentionSweeps.all().has(old.taskId)).toBe(false);
+    expect(dbm.retentionSweeps.all().has(later.taskId)).toBe(true);
+    expect(trimmedCount(later.runIds)).toBe(4);
+  });
+
+  test("rows appended to an already-scanned run during a sweep are picked up by the next pass", async () => {
+    const log = silenceLog();
+    const now = Date.now();
+    // Two runs, rows round-robin: run 0 (started first) is fully scanned
+    // before run 1's first row is trimmed.
+    const old = seedTask(now - 40 * DAY, { runs: 2, bigMain: 300 });
+    const pass = ret.runArchivedHistoryRetentionPass({ now, days: 30, sliceMs: 0 });
+    await until(() => trimmedCount([old.runIds[1]!]) > 0, "the sweep to reach the second run");
+    // A JSONL rebuild landing behind the sweep's keyset cursor.
+    const late = dbm.runs.appendEvent(old.runIds[0]!, "tool_result", bigToolResult("late"), `ln-${randomUUID()}`, null);
+    expect(late).not.toBeNull();
+    const first = await pass;
+    expect(first.aborted).toBe(false);
+    expect(first.trimmedRows).toBe(300);
+    expect(isTrimmed(snapshot([late!]).get(late!)!)).toBe(false);
+
+    // The record holds the key computed BEFORE the append, so it no longer
+    // matches: the task is swept again and the late row trimmed.
+    const second = await ret.runArchivedHistoryRetentionPass({ now, days: 30 });
+    log.mockRestore();
+    expect(second.scannedTasks).toBe(1);
+    expect(second.trimmedRows).toBe(1);
+    expect(isTrimmed(snapshot([late!]).get(late!)!)).toBe(true);
+  });
+
+  test("a task that falls out of the age window (retention days raised) loses its record", async () => {
+    const log = silenceLog();
+    const now = Date.now();
+    const old = seedTask(now - 40 * DAY, { bigMain: 1 });
+    const older = seedTask(now - 90 * DAY, { bigMain: 1 });
+    await ret.runArchivedHistoryRetentionPass({ now, days: 30 });
+    expect(dbm.retentionSweeps.all().has(old.taskId)).toBe(true);
+    expect(dbm.retentionSweeps.all().has(older.taskId)).toBe(true);
+    const wider = await ret.runArchivedHistoryRetentionPass({ now, days: 60 });
+    log.mockRestore();
+    // `older` is still a candidate with an unchanged key → skipped, kept.
+    expect(wider.scannedTasks).toBe(0);
+    const sweeps = dbm.retentionSweeps.all();
+    expect(sweeps.has(old.taskId)).toBe(false);
+    expect(sweeps.has(older.taskId)).toBe(true);
+  });
+
+  test("a failed record write only warns: the pass completes and the task is swept again next time", async () => {
+    const log = silenceLog();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    const set = spyOn(dbm.retentionSweeps, "set").mockImplementation(() => {
+      throw new Error("disk I/O error");
+    });
+    const now = Date.now();
+    const old = seedTask(now - 40 * DAY, { bigMain: 2 });
+    let first: Awaited<ReturnType<typeof ret.runArchivedHistoryRetentionPass>>;
+    let warned: unknown[][] = [];
+    try {
+      first = await ret.runArchivedHistoryRetentionPass({ now, days: 30 });
+    } finally {
+      warned = [...warn.mock.calls];
+      set.mockRestore();
+      warn.mockRestore();
+    }
+    expect(first.aborted).toBe(false);
+    expect(first.trimmedRows).toBe(2);
+    expect(dbm.preferences.get("retention:lastRunAt")).not.toBeNull();
+    expect(warned.some((c) => String(c[0]).includes("could not record swept task"))).toBe(true);
+    expect(dbm.retentionSweeps.all().has(old.taskId)).toBe(false);
+
+    const second = await ret.runArchivedHistoryRetentionPass({ now, days: 30 });
+    log.mockRestore();
+    expect(second.scannedTasks).toBe(1);
+    expect(second.trimmedRows).toBe(0);
+    expect(dbm.retentionSweeps.all().has(old.taskId)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Scheduling
 // ---------------------------------------------------------------------------
 
@@ -492,7 +749,9 @@ describe("requestRetentionPass / configuredRetentionDays", () => {
     dbm.preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "45");
     expect(ret.configuredRetentionDays()).toBe(45);
     dbm.preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "garbage");
-    expect(ret.configuredRetentionDays()).toBe(30); // unparsable → default
+    expect(ret.configuredRetentionDays()).toBeNull(); // unparsable → off (fail closed)
+    dbm.preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "0");
+    expect(ret.configuredRetentionDays()).toBeNull(); // an off-word, never the default
     dbm.preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "45");
     process.env.AGETOR_ARCHIVED_HISTORY_RETENTION = "0";
     expect(ret.configuredRetentionDays()).toBeNull(); // env wins over the pref

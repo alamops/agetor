@@ -31,8 +31,15 @@
  * leaves every committed chunk trimmed and every other row untouched, and the
  * next pass simply finds the remainder. A row the prefilter cannot exclude
  * but `trimToolResultData` declines (not JSON, content already within budget
- * though the envelope is large) is re-read by every pass — accepted; the loop
- * still advances through the keyset (`id > afterId`) so it always terminates.
+ * though the envelope is large) would be re-read by every daily pass forever,
+ * so a task whose sweep COMPLETED is recorded in the `retention_swept_tasks`
+ * table (`retentionSweeps` in db.ts) under a key of everything that could make a re-sweep find new
+ * work — its `archived_at` (a re-archive moves it), the size threshold, and
+ * its newest event id (a JSONL rebuild of an archived task appends rows) — and
+ * skipped while that key still matches. A task cut short by an abort or an
+ * unarchive is never recorded; rows for tasks that are no longer
+ * candidates are dropped on every pass (and a deleted task's row cascades),
+ * so the table stays bounded by the archived-task count.
  *
  * The trim is ONE-WAY: the dropped bytes exist nowhere else (Claude's session
  * JSONL may still hold them, which is what "Rebuild from session JSONL"
@@ -94,7 +101,7 @@ import {
   type RetentionPassResult,
 } from "../shared/types";
 import { trimToolResultData, utf8Length } from "../shared/tool-result-trim";
-import { TOOL_RESULT_TRIM_SQL, dataDir, db, preferences, runs, tasks } from "./db";
+import { TOOL_RESULT_TRIM_SQL, dataDir, db, preferences, retentionSweeps, runs, tasks } from "./db";
 import { beginLagLabel } from "./event-loop-lag";
 
 /** Every SQL text this module itself runs against `run_events` (see the
@@ -130,6 +137,12 @@ const BYTES_PER_GB = 1e9;
 const PREF_LAST_RUN_AT = "retention:lastRunAt";
 const PREF_LAST_FREED_BYTES = "retention:lastFreedBytes";
 const PREF_LAST_TRIMMED_ROWS = "retention:lastTrimmedRows";
+/** What a completed sweep of `taskId` saw; unchanged → nothing new to trim. */
+function sweepKey(taskId: string, archivedAt: number, maxBytes: number, runIds: string[]): string {
+  let maxEventId = 0;
+  for (const runId of runIds) maxEventId = Math.max(maxEventId, runs.maxEventIdForRun(runId));
+  return `${archivedAt}:${maxBytes}:${maxEventId}`;
+}
 
 let running = false;
 let abortRequested = false;
@@ -216,14 +229,27 @@ export async function runArchivedHistoryRetentionPass(opts: {
   try {
     const cutoff = now - days * DAY_MS;
     const candidates = tasks.archivedBefore(cutoff);
+    // A task that was unarchived (or fell out of the age window) since drops
+    // out of the record here; a deleted one already went with its row.
+    retentionSweeps.pruneNotArchivedBefore(cutoff);
+    const sweptTasks = retentionSweeps.all();
     let pageLimit = INITIAL_PAGE_ROWS;
     taskLoop: for (const candidate of candidates) {
+      // Every iteration — including the swept-task skip below, which is the
+      // steady state of a daily pass — must reach the slice check, or a pass
+      // over a thousand already-swept tasks is one synchronous loop.
+      await yieldIfSliceSpent();
       if (abortRequested) {
         result.aborted = true;
         break;
       }
+      const taskRunIds = runs.runIdsForTask(candidate.id);
+      const key = sweepKey(candidate.id, candidate.archivedAt, maxBytes, taskRunIds);
+      if (sweptTasks.get(candidate.id) === key) continue;
+      // The stored key (if any) stays stale until this sweep runs to
+      // completion, so an abort or unarchive mid-sweep is re-swept next time.
       result.scannedTasks++;
-      for (const runId of runs.runIdsForTask(candidate.id)) {
+      for (const runId of taskRunIds) {
         result.scannedRuns++;
         let afterId = 0;
         for (;;) {
@@ -287,6 +313,18 @@ export async function runArchivedHistoryRetentionPass(opts: {
           pageLimit = Math.max(1, Math.min(CHUNK_ROWS, Math.floor(TARGET_PAGE_CHARS / Math.max(1, avgChars))));
           if (rows.length < limit) break;
         }
+      }
+      // An abort that landed inside the last run's rows broke only the row
+      // loop: this sweep did not complete, so it must not be recorded.
+      if (abortRequested) {
+        result.aborted = true;
+        break;
+      }
+      try {
+        retentionSweeps.set(candidate.id, key);
+      } catch (err) {
+        // Worst case one extra sweep of this task next pass, never a skipped one.
+        console.warn("[agetor] retention: could not record swept task:", err);
       }
     }
     if (abortRequested) result.aborted = true;

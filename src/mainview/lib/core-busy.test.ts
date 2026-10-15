@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   createCoreBusyMonitor,
+  FAILED_PROBES_TO_SHOW,
   PENDING_THRESHOLD_MS,
   PROBE_TIMEOUT_MS,
   REPROBE_INTERVAL_MS,
@@ -112,7 +113,8 @@ describe("core-busy monitor", () => {
     expect(clock.pendingTimers()).toBe(0);
   });
 
-  test("a failed probe flips busy, a later success clears it", async () => {
+  test("two failed probes in a row flip busy, a later success clears it", async () => {
+    expect(FAILED_PROBES_TO_SHOW).toBe(2);
     const { clock, health, monitor } = setup("fail");
     let notified = 0;
     monitor.subscribe(() => notified++);
@@ -120,14 +122,38 @@ describe("core-busy monitor", () => {
     void monitor.trackRequest(req.promise);
     await clock.advance(PENDING_THRESHOLD_MS);
     expect(health.calls).toEqual(["http://core/health"]);
+    expect(monitor.getBusy()).toBe(false);
+    expect(notified).toBe(0);
+
+    await clock.advance(REPROBE_INTERVAL_MS);
+    expect(health.calls.length).toBe(2);
     expect(monitor.getBusy()).toBe(true);
     expect(notified).toBe(1);
 
     health.set("ok");
     await clock.advance(REPROBE_INTERVAL_MS);
-    expect(health.calls.length).toBe(2);
+    expect(health.calls.length).toBe(3);
     expect(monitor.getBusy()).toBe(false);
     expect(notified).toBe(2);
+    req.resolve("done");
+    await flush();
+  });
+
+  test("a single missed probe followed by an answer never shows the banner", async () => {
+    const { clock, health, monitor } = setup("fail");
+    let notified = 0;
+    monitor.subscribe(() => notified++);
+    const req = deferred();
+    void monitor.trackRequest(req.promise);
+    await clock.advance(PENDING_THRESHOLD_MS);
+    health.set("ok");
+    await clock.advance(REPROBE_INTERVAL_MS);
+    // A miss after an answer starts the count over.
+    health.set("fail");
+    await clock.advance(REPROBE_INTERVAL_MS);
+    expect(health.calls.length).toBe(3);
+    expect(monitor.getBusy()).toBe(false);
+    expect(notified).toBe(0);
     req.resolve("done");
     await flush();
   });
@@ -136,7 +162,9 @@ describe("core-busy monitor", () => {
     const { clock, monitor } = setup("hang");
     const req = deferred();
     void monitor.trackRequest(req.promise);
-    await clock.advance(PENDING_THRESHOLD_MS);
+    await clock.advance(PENDING_THRESHOLD_MS + PROBE_TIMEOUT_MS);
+    expect(monitor.getBusy()).toBe(false);
+    await clock.advance(REPROBE_INTERVAL_MS);
     expect(monitor.getBusy()).toBe(false);
     await clock.advance(PROBE_TIMEOUT_MS);
     expect(monitor.getBusy()).toBe(true);
@@ -148,7 +176,7 @@ describe("core-busy monitor", () => {
     const { clock, health, monitor } = setup("fail");
     const req = deferred();
     void monitor.trackRequest(req.promise);
-    await clock.advance(PENDING_THRESHOLD_MS);
+    await clock.advance(PENDING_THRESHOLD_MS + REPROBE_INTERVAL_MS);
     expect(monitor.getBusy()).toBe(true);
     req.resolve("done");
     await flush();
@@ -172,6 +200,9 @@ describe("core-busy monitor", () => {
     // The request is already past the threshold, so resuming probes now.
     await flush();
     expect(health.calls.length).toBe(1);
+    expect(monitor.getBusy()).toBe(false);
+    await clock.advance(REPROBE_INTERVAL_MS);
+    expect(health.calls.length).toBe(2);
     expect(monitor.getBusy()).toBe(true);
     req.resolve("done");
     await flush();
@@ -181,12 +212,15 @@ describe("core-busy monitor", () => {
     const { clock, monitor } = setup("fail");
     const req = deferred();
     void monitor.trackRequest(req.promise);
-    await clock.advance(PENDING_THRESHOLD_MS);
+    await clock.advance(PENDING_THRESHOLD_MS + REPROBE_INTERVAL_MS);
     expect(monitor.getBusy()).toBe(true);
     const release = monitor.suspend();
     expect(monitor.getBusy()).toBe(false);
     release();
     await flush();
+    // Resuming starts from a clean slate: it takes two fresh misses again.
+    expect(monitor.getBusy()).toBe(false);
+    await clock.advance(REPROBE_INTERVAL_MS);
     expect(monitor.getBusy()).toBe(true);
     req.resolve("done");
     await flush();

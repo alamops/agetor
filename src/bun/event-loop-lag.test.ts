@@ -78,6 +78,29 @@ describe("event-loop-lag monitor", () => {
     expect(reports[0]!.ctx).toEqual({ taskId: "t", runId: "r" });
   });
 
+  test("interleaved async labels: the most recently begun wins, not the deepest", async () => {
+    // Three labels that span awaits (watchers restoring several tasks at
+    // once): A, B, C begin; A and B end while C is still live. A synchronous
+    // call bracketed now (a native file dialog) begins at stack depth 1, below
+    // C's depth 2 — it must still be the one blamed, and its context-free
+    // label must not be swapped for C's task (whose run would get a status
+    // line from the orchestrator's sink).
+    startLagMonitor({ sampleMs: 20, stallMs: 150, force: true });
+    const endA = beginLagLabel("attach subagent watcher · task a", { taskId: "a", runId: "ra" });
+    const endB = beginLagLabel("attach subagent watcher · task b", { taskId: "b", runId: "rb" });
+    const endC = beginLagLabel("attach subagent watcher · task c", { taskId: "c", runId: "rc" });
+    endA();
+    endB();
+    const endDialog = beginLagLabel("native file dialog");
+    Bun.sleepSync(400);
+    endDialog();
+    await waitForReports(1);
+    endC();
+    expect(reports).toHaveLength(1);
+    expect(reports[0]!.label).toBe("native file dialog");
+    expect(reports[0]!.ctx).toBeNull();
+  });
+
   test("a stall with no label reports as idle", async () => {
     startLagMonitor({ sampleMs: 20, stallMs: 150, force: true });
     Bun.sleepSync(400);

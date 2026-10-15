@@ -145,7 +145,7 @@ async function makeCodexTask(title: string) {
 test("sync refusal: an unknown run answers immediately with no pending key", async () => {
   const { sendInput } = await import("./orchestrator.ts");
   const before = Date.now();
-  const res = await sendInput("run-does-not-exist-send-budget", "hi");
+  const res = await sendInput("run-does-not-exist-send-budget", "hi", { bounded: true });
   expect(Date.now() - before).toBeLessThan(50);
   expect(res).toEqual({ delivered: false, reason: "run not found" });
   expect("pending" in res).toBe(false);
@@ -164,7 +164,7 @@ test("fast path: a quick delivered send has no pending key at all", async () => 
 
   const { events, unsubscribe } = await collectSendFailed(taskId);
   try {
-    const res = await sendInput(started.runId, "quick follow-up");
+    const res = await sendInput(started.runId, "quick follow-up", { bounded: true });
     expect(res.delivered).toBe(true);
     expect("pending" in res).toBe(false);
     await waitFor(() => tasks.get(taskId)?.column === "review");
@@ -192,7 +192,7 @@ test("slow pre-dispatch (held teardown): answers pending with the addressed run;
   const { events, unsubscribe } = await collectSendFailed(taskId);
   try {
     const before = Date.now();
-    const res = await sendInput(addressedRunId, "message that waits on a teardown");
+    const res = await sendInput(addressedRunId, "message that waits on a teardown", { bounded: true });
     const elapsed = Date.now() - before;
 
     expect(elapsed).toBeLessThan(SPAWN_RESPONSE_BUDGET_MS + BUDGET_SLACK_MS);
@@ -258,7 +258,7 @@ test("slow pre-dispatch then restore failure: raw text re-stashed into the backl
   const body = "please look at @docs/some-file.md again";
   try {
     const before = Date.now();
-    const res = await sendInput(addressedRunId, body);
+    const res = await sendInput(addressedRunId, body, { bounded: true });
     expect(Date.now() - before).toBeLessThan(SPAWN_RESPONSE_BUDGET_MS + BUDGET_SLACK_MS);
     expect(res).toEqual({ delivered: true, runId: addressedRunId, pending: true });
     // Still blocked on the teardown: nothing stashed or emitted yet.
@@ -295,7 +295,7 @@ test("slow codex floor refusal: raw text re-stashed and exactly one send-failed 
     const body = "hello @nothing.md";
     try {
       const before = Date.now();
-      const res = await sendInput(addressedRunId, body);
+      const res = await sendInput(addressedRunId, body, { bounded: true });
       expect(Date.now() - before).toBeLessThan(SPAWN_RESPONSE_BUDGET_MS + BUDGET_SLACK_MS);
       expect(res).toEqual({ delivered: true, runId: addressedRunId, pending: true });
 
@@ -328,7 +328,7 @@ test("late floor refusal on an archived task does not un-archive it (floor check
 
     const { events, unsubscribe } = await collectSendFailed(taskId);
     try {
-      const res = await sendInput(addressedRunId, "message to an archived task");
+      const res = await sendInput(addressedRunId, "message to an archived task", { bounded: true });
       expect(res).toEqual({ delivered: true, runId: addressedRunId, pending: true });
 
       await waitFor(() => events.length > 0, 8000);
@@ -368,7 +368,7 @@ test("slow claude mint: pending answer carries the newly minted run's id, not th
   process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS = String(SLOW_SPAWN_DELAY_MS);
   try {
     const before = Date.now();
-    const res = await sendInput(firstRunId, "resume with a slow mint");
+    const res = await sendInput(firstRunId, "resume with a slow mint", { bounded: true });
     expect(Date.now() - before).toBeLessThan(SPAWN_RESPONSE_BUDGET_MS + BUDGET_SLACK_MS);
     expect(res.delivered).toBe(true);
     if (!res.delivered) return;

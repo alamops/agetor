@@ -19,7 +19,10 @@
  *     attribution can't just peek at the live stack. Every label records its
  *     `[begin, end]` interval, and a stall is attributed to the label whose
  *     interval overlaps the late period (expected fire time → actual fire
- *     time) the most, preferring the innermost of the near-ties. A
+ *     time) the most, preferring the most recently begun of the near-ties
+ *     (the innermost, for properly nested labels; for labels that interleave
+ *     across `await`s — several tasks' watchers restoring at once — the one
+ *     begun last is the work that actually reached the blocking call). A
  *     `beginLagLabel → Bun.sleepSync(1200) → dispose` sequence therefore still
  *     reports that label.
  *   - A stall logs exactly one `console.warn` line and calls the installed
@@ -55,9 +58,7 @@ export interface LagStall {
 interface LabelEntry {
   label: string;
   ctx: LagContext | null;
-  /** Stack depth at begin time (0 = outermost) — "innermost wins" tie-break. */
-  depth: number;
-  /** Monotonic begin order, the final tie-break. */
+  /** Monotonic begin order — "most recently begun wins" among near-ties. */
   seq: number;
   startedAt: number;
   /** Set when the disposer runs; null while the label is still live. */
@@ -72,9 +73,15 @@ const DEFAULT_STALL_MS = 1000;
  *  the stall suspect. */
 const MAX_ENDED_PER_TICK = 256;
 /** A label counts as "the" culprit when it overlaps the late period at least
- *  this fraction as much as the best-overlapping label; among those, the
- *  innermost wins (so an outer `boot reattach` label doesn't mask the inner
- *  `attach subagent watcher` label that actually held the thread). */
+ *  this fraction as much as the best-overlapping label; among those, the most
+ *  recently begun wins (so an outer `boot reattach` label doesn't mask the inner
+ *  `attach subagent watcher` label that actually held the thread, and a
+ *  long-lived async label doesn't swallow a synchronous call — a native file
+ *  dialog — begun inside it). Begin order rather than stack depth: labels that
+ *  span `await`s interleave, so a label begun later can sit at a SHALLOWER
+ *  depth than an earlier one still live (A, B, C begun; A and B end; a label
+ *  begun now gets depth 1 while C keeps depth 2). For properly nested labels
+ *  the two orders agree. */
 const NEAR_BEST_FRACTION = 0.5;
 
 /** Live labels, outermost first. */
@@ -156,7 +163,6 @@ export function beginLagLabel(label: string, ctx?: LagContext): () => void {
   const entry: LabelEntry = {
     label,
     ctx: ctx ?? null,
-    depth: stack.length,
     seq: seqCounter++,
     startedAt: nowFn(),
     endedAt: null,
@@ -203,7 +209,7 @@ function schedule(): void {
  * `[lastTickAt + sampleMs, now]`: the tick WOULD have fired at its start, and
  * only fired at its end because something held the thread. Both live and
  * just-ended labels are candidates; the best overlap wins, near-ties go to the
- * deepest (innermost) then most recently begun.
+ * most recently begun (see {@link NEAR_BEST_FRACTION}).
  */
 function attribute(now: number): LabelEntry | null {
   const lateStart = lastTickAt + sampleMs;
@@ -222,13 +228,7 @@ function attribute(now: number): LabelEntry | null {
   let pick: LabelEntry | null = null;
   for (const [entry, overlap] of overlaps) {
     if (overlap < best * NEAR_BEST_FRACTION) continue;
-    if (
-      pick === null ||
-      entry.depth > pick.depth ||
-      (entry.depth === pick.depth && entry.seq > pick.seq)
-    ) {
-      pick = entry;
-    }
+    if (pick === null || entry.seq > pick.seq) pick = entry;
   }
   return pick;
 }

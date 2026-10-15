@@ -10,7 +10,8 @@
 // exercised in both states — the gate is read at `startApiServer()` call time:
 //   • 4620 — AGETOR_TEST_BLOCK_ROUTE unset  → `/test/block-event-loop` is a 404
 //   • 4621 — AGETOR_TEST_BLOCK_ROUTE=1      → the route holds the main thread
-// (4620/4621 are unique across src/ — grep before reusing.)
+//   • 4622 — a stub native host, for the native-file-dialog lag label
+// (4620/4621/4622 are unique across src/ — grep before reusing.)
 import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,6 +32,11 @@ process.env.AGETOR_TMUX_BIN = "/bin/echo";
 
 const PLAIN = "http://127.0.0.1:4620";
 const BLOCKING = "http://127.0.0.1:4621";
+const NATIVE = "http://127.0.0.1:4622";
+
+/** The lag label live while the stub native host's Open panel "is up", one
+ *  entry per `openFileDialog` call (see the native-dialog describe below). */
+const dialogLabels: (string | null)[] = [];
 
 const DAY_MS = 86_400_000;
 
@@ -60,7 +66,19 @@ beforeAll(async () => {
   const blocking = startApiServer() as unknown as { stop: () => void };
   delete process.env.AGETOR_TEST_BLOCK_ROUTE;
 
-  servers = [plain, blocking];
+  process.env.AGETOR_API_PORT = "4622";
+  const { makeTestNative } = await import("./test-native.ts");
+  const { currentLagLabel } = await import("./event-loop-lag.ts");
+  const withNative = startApiServer({
+    native: makeTestNative({
+      openFileDialog: async () => {
+        dialogLabels.push(currentLagLabel()?.label ?? null);
+        return [];
+      },
+    }),
+  }) as unknown as { stop: () => void };
+
+  servers = [plain, blocking, withNative];
   harnesses.setEnabled("codex", true);
 });
 
@@ -334,6 +352,48 @@ describe("PUT /preferences/archivedHistoryRetentionDays", () => {
     expect(preferences.get("retention:lastRunAt")).toBeNull();
   });
 
+  test("an off-word like \"0\" is stored as off and schedules nothing", async () => {
+    await idleRetention();
+    clearRetentionBookkeeping();
+    preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "30");
+    await seedArchivedTask(2, 16);
+    for (const word of ["0", " FALSE ", "none"]) {
+      const res = await put(`/preferences/${ARCHIVED_HISTORY_RETENTION_PREF}`, word);
+      expect(res.status).toBe(204);
+      expect(preferences.get(ARCHIVED_HISTORY_RETENTION_PREF)).toBe("off");
+    }
+    // Well past the 50 ms debounce: the 40-day-old archived task stays untrimmed.
+    await new Promise((r) => setTimeout(r, 400));
+    expect(retention.isRetentionRunning()).toBe(false);
+    expect(preferences.get("retention:lastRunAt")).toBeNull();
+  });
+
+  test("a value that is neither off nor 1..3650 days is a 400 that stores and schedules nothing", async () => {
+    await idleRetention();
+    clearRetentionBookkeeping();
+    preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "off");
+    for (const bad of ["garbage", "-3", "3651", "1.5", "1e2", "", "  "]) {
+      const res = await put(`/preferences/${ARCHIVED_HISTORY_RETENTION_PREF}`, bad);
+      expect(res.status).toBe(400);
+      const { error } = (await res.json()) as { error: string };
+      expect(error).toContain("\"off\"");
+      expect(error).toContain("1 to 3650");
+      expect(preferences.get(ARCHIVED_HISTORY_RETENTION_PREF)).toBe("off");
+    }
+    await new Promise((r) => setTimeout(r, 400));
+    expect(retention.isRetentionRunning()).toBe(false);
+    expect(preferences.get("retention:lastRunAt")).toBeNull();
+  });
+
+  test("a padded day count is stored normalized", async () => {
+    await idleRetention();
+    const res = await put(`/preferences/${ARCHIVED_HISTORY_RETENTION_PREF}`, " 090 ");
+    expect(res.status).toBe(204);
+    expect(preferences.get(ARCHIVED_HISTORY_RETENTION_PREF)).toBe("90");
+    await waitFor(() => preferences.get("retention:lastRunAt") !== null, 3000);
+    await idleRetention();
+  });
+
   test("an unrelated preference never schedules a pass", async () => {
     await idleRetention();
     clearRetentionBookkeeping();
@@ -341,6 +401,28 @@ describe("PUT /preferences/archivedHistoryRetentionDays", () => {
     expect((await put("/preferences/someOtherKey", "45")).status).toBe(204);
     await new Promise((r) => setTimeout(r, 300));
     expect(preferences.get("retention:lastRunAt")).toBeNull();
+  });
+});
+
+describe("native file dialogs carry a context-free lag label", () => {
+  test("every route that opens the Open panel brackets it with \"native file dialog\"", async () => {
+    delete process.env.AGETOR_FAKE_PICK_REFS_DIR;
+    dialogLabels.length = 0;
+    const { currentLagLabel } = await import("./event-loop-lag.ts");
+    // A profile so the folder save has something to export.
+    const created = await post("/agent-profiles", { name: "dialog-label agent", harness: "codex", model: "gpt-6.1-sol" }, NATIVE);
+    expect(created.ok).toBe(true);
+
+    expect((await post("/projects/pick", {}, NATIVE)).status).toBe(200);
+    expect((await post("/refs/pick", { mode: "files" }, NATIVE)).status).toBe(200);
+    expect((await post("/bundle/pick-file", {}, NATIVE)).status).toBe(200);
+    const save = await post("/bundle/export/save", { all: true, target: "folder" }, NATIVE);
+    expect(save.status).toBe(200);
+    expect(((await save.json()) as { cancelled?: boolean }).cancelled).toBe(true);
+
+    expect(dialogLabels).toEqual(Array(4).fill("native file dialog"));
+    // Disposed once each panel closes — nothing leaks onto the label stack.
+    expect(currentLagLabel()).toBeNull();
   });
 });
 
@@ -352,7 +434,7 @@ describe("POST /test/block-event-loop", () => {
 
   test("enabled server: validates ms, requires the token", async () => {
     expect((await fetch(`${BLOCKING}/test/block-event-loop`, { method: "POST" })).status).toBe(401);
-    for (const ms of [0, -5, 10_001, 1.5, "100", null]) {
+    for (const ms of [0, -5, 20_001, 1.5, "100", null]) {
       expect((await post("/test/block-event-loop", { ms }, BLOCKING)).status).toBe(400);
     }
     expect((await post("/test/block-event-loop", {}, BLOCKING)).status).toBe(400);

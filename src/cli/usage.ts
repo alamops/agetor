@@ -337,7 +337,8 @@ export const USAGE: Record<string, string> = {
   fxAutoResume (on|off — default on), fxAutoResumeDelaySec (10..3600, default 120),
   archivedHistoryRetentionDays (off, or 1..3650 days — default 30): archived
   tasks older than that have their large tool_result payloads trimmed to 4 KB
-  by a background pass ('agetor compact' then returns the freed space to disk).`,
+  by a background pass ('agetor compact' then returns the freed space to disk).
+  0, false, no, none and disabled also mean off; any other value is refused.`,
 
   compact: `usage: agetor compact [--yes|-y] [--json]
 

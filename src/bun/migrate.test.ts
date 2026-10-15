@@ -10,6 +10,7 @@ import normalizeCursorHaiku55 from "./migrations/062_normalize_cursor_haiku_5_5.
 import normalizeCursorGemini4Argon from "./migrations/064_normalize_cursor_gemini_4_argon.sql" with { type: "text" };
 import antigravityEffortInModelId from "./migrations/065_antigravity_effort_in_model_id.sql" with { type: "text" };
 import retireGemini37And35Flash from "./migrations/066_retire_gemini_3_7_and_3_5_flash.sql" with { type: "text" };
+import retentionSweptTasks from "./migrations/067_retention_swept_tasks.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
 
 // Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
@@ -1108,15 +1109,47 @@ test("066_retire_gemini_3_7_and_3_5_flash moves gemini-kind 3.7/3.5 Flash rows t
   expect(readPrefs()).toEqual(prefsBefore);
 });
 
-test("066 (retire gemini 3.7/3.5 Flash) is the last registered migration, after 065, after 064, after 063 (task checkout branch)", () => {
+test("066 (retire gemini 3.7/3.5 Flash) is registered after 065, after 064, after 063 (task checkout branch)", () => {
   const at = migrations.findIndex((m) => m.id === "066_retire_gemini_3_7_and_3_5_flash");
-  expect(at).toBe(migrations.length - 1);
+  expect(at).toBeGreaterThan(0);
   expect(migrations[at - 1]?.id).toBe("065_antigravity_effort_in_model_id");
   expect(migrations[at - 2]?.id).toBe("064_normalize_cursor_gemini_4_argon");
   expect(migrations[at - 3]?.id).toBe("063_task_checkout_branch");
   expect(migrations[at]?.sql).toContain("gemini-3.8-flash");
   expect(migrations[at - 1]?.sql).toContain("lastEffort:antigravity");
   expect(migrations[at - 2]?.sql).toContain("gemini-4-argon");
+});
+
+test("067 (retention swept tasks) is the last registered migration, right after 066", () => {
+  const at = migrations.findIndex((m) => m.id === "067_retention_swept_tasks");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("066_retire_gemini_3_7_and_3_5_flash");
+  expect(migrations[at]?.sql).toBe(retentionSweptTasks);
+});
+
+test("067 creates retention_swept_tasks (cascading on task delete) and drops the old retention:sweptTasks preference only", () => {
+  const db = new Database(":memory:");
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec(`
+    CREATE TABLE tasks (id TEXT PRIMARY KEY);
+    CREATE TABLE preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+    INSERT INTO tasks (id) VALUES ('t1'), ('t2');
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('retention:sweptTasks', '{"t1":"1:4096:9"}', 1),
+      ('retention:lastRunAt', '5', 1),
+      ('theme', 'dark', 1);
+  `);
+  db.exec(retentionSweptTasks);
+  expect(
+    db.query<{ key: string }, []>(`SELECT key FROM preferences ORDER BY key`).all().map((r) => r.key),
+  ).toEqual(["retention:lastRunAt", "theme"]);
+
+  db.exec(`INSERT INTO retention_swept_tasks (task_id, sweep_key) VALUES ('t1', 'a'), ('t2', 'b')`);
+  expect(() => db.exec(`INSERT INTO retention_swept_tasks (task_id, sweep_key) VALUES ('ghost', 'c')`)).toThrow();
+  db.exec(`DELETE FROM tasks WHERE id = 't1'`);
+  expect(
+    db.query<{ task_id: string }, []>(`SELECT task_id FROM retention_swept_tasks`).all().map((r) => r.task_id),
+  ).toEqual(["t2"]);
 });
 
 test("the Gemini 4 Argon migrations were renumbered 063-065 -> 064-066 when main took 063; their pre-merge ids stay as aliases so a DB that already applied them does not re-run them", () => {

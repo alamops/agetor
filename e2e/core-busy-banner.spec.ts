@@ -10,8 +10,8 @@ import { gotoApp } from "./helpers";
  *
  * What this pins: when the core stops answering altogether (its single Bun
  * thread held — a session restore, a VACUUM), a webview request that has been
- * pending past 3 s triggers a `/health` probe, the probe gets no answer within
- * its 1.5 s abort, and the strip shows; once the core answers again the strip
+ * pending past 3 s triggers a `/health` probe, two consecutive probes get no
+ * answer within their 1.5 s abort, and the strip shows; once the core answers again the strip
  * clears by itself; and NOTHING was aborted or re-issued on the way — the
  * request that was pending across the stall completes and the panel renders
  * its transcript from it. The probe/threshold arithmetic itself is covered by
@@ -26,13 +26,14 @@ import { gotoApp } from "./helpers";
 
 test.use({ backendEnv: { AGETOR_TEST_BLOCK_ROUTE: "1" } });
 
-/** How long the core is held. Banner timeline (from the first request that
- *  goes pending right after the block starts): +3 s threshold, +1.5 s probe
- *  abort => visible at ~4.5 s, so a 7 s block leaves ~2.5 s of margin for a
- *  loaded machine (the plan's 6 s leaves 1.5 s). */
-const BLOCK_MS = 7_000;
+/** How long the core is held. Banner timeline (from the block being fired):
+ *  +0.5 s before the panel's requests go pending, +3 s threshold, +1.5 s
+ *  first probe abort, +2 s re-probe interval, +1.5 s second probe abort
+ *  (`FAILED_PROBES_TO_SHOW` = 2) => visible at ~8.5 s, so a 12 s block leaves
+ *  ~3.5 s of margin for a loaded machine. */
+const BLOCK_MS = 12_000;
 /** The banner must appear within this long of the block being fired. */
-const BANNER_APPEAR_MS = 6_500;
+const BANNER_APPEAR_MS = 11_000;
 /** …and be gone this long after the block ended. */
 const BANNER_CLEAR_MS = 4_000;
 

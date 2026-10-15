@@ -9,10 +9,19 @@ import {
   retentionOptionLabel,
   retentionSelectOptions,
 } from "./retention-prefs.ts";
-import type { DbStats } from "../../shared/types.ts";
+import {
+  ARCHIVED_HISTORY_RETENTION_INVALID_ERROR,
+  ARCHIVED_HISTORY_RETENTION_OFF,
+  normalizeArchivedHistoryRetentionValue,
+  type DbStats,
+} from "../../shared/types.ts";
 
 // Docs: docs/plans/non-blocking-session-restore.md row TT6 (retention prefs
 // parser / formatter round-trips used by Settings → General).
+
+// Values a user cannot mean as a day count. Fail closed: each reads as off
+// (never the 30-day default), and the write route refuses each one.
+const UNPARSABLE = ["garbage", "-3", "3651", "1.5", "1e2", "0x10", "30 days", "+5", "07.0", "∞"];
 
 describe("parseArchivedHistoryRetentionDays", () => {
   test("off, in any case or padding, disables trimming", () => {
@@ -21,10 +30,22 @@ describe("parseArchivedHistoryRetentionDays", () => {
     expect(parseArchivedHistoryRetentionDays("Off")).toBeNull();
   });
 
-  test("absent and unparsable values fall back to the default", () => {
+  test("every off-word a user may type means off, never the default", () => {
+    for (const v of ["0", " 0 ", "false", "FALSE", "no", "No", "none", "disabled", " Disabled "]) {
+      expect(parseArchivedHistoryRetentionDays(v)).toBeNull();
+    }
+  });
+
+  test("only absent or blank values fall back to the default", () => {
     expect(ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS).toBe(30);
-    for (const v of [undefined, null, "", "  ", "garbage", "0", "-3", "3651", "1.5", "1e2", "0x10", "30 days"]) {
+    for (const v of [undefined, null, "", "  "]) {
       expect(parseArchivedHistoryRetentionDays(v)).toBe(30);
+    }
+  });
+
+  test("any other unparsable value fails closed (off)", () => {
+    for (const v of UNPARSABLE) {
+      expect(parseArchivedHistoryRetentionDays(v)).toBeNull();
     }
   });
 
@@ -33,6 +54,41 @@ describe("parseArchivedHistoryRetentionDays", () => {
     expect(parseArchivedHistoryRetentionDays(" 7 ")).toBe(7);
     expect(parseArchivedHistoryRetentionDays("1")).toBe(1);
     expect(parseArchivedHistoryRetentionDays("3650")).toBe(3650);
+    expect(parseArchivedHistoryRetentionDays("007")).toBe(7);
+  });
+});
+
+describe("normalizeArchivedHistoryRetentionValue", () => {
+  test("off-words normalize to the canonical \"off\"", () => {
+    for (const v of ["off", " OFF ", "0", "false", "No", "none", "DISABLED"]) {
+      expect(normalizeArchivedHistoryRetentionValue(v)).toBe(ARCHIVED_HISTORY_RETENTION_OFF);
+    }
+  });
+
+  test("a day count normalizes to its plain integer string", () => {
+    expect(normalizeArchivedHistoryRetentionValue("45")).toBe("45");
+    expect(normalizeArchivedHistoryRetentionValue(" 7 ")).toBe("7");
+    expect(normalizeArchivedHistoryRetentionValue("007")).toBe("7");
+    expect(normalizeArchivedHistoryRetentionValue("1")).toBe("1");
+    expect(normalizeArchivedHistoryRetentionValue("3650")).toBe("3650");
+  });
+
+  test("blank and unparsable values are refused", () => {
+    for (const v of ["", "   ", ...UNPARSABLE]) {
+      expect(normalizeArchivedHistoryRetentionValue(v)).toBeNull();
+    }
+  });
+
+  test("every value the Settings picker writes is accepted unchanged", () => {
+    expect(normalizeArchivedHistoryRetentionValue(formatRetentionValue(null))).toBe("off");
+    for (const days of [...RETENTION_DAY_OPTIONS, 45]) {
+      expect(normalizeArchivedHistoryRetentionValue(formatRetentionValue(days))).toBe(String(days));
+    }
+  });
+
+  test("the refusal message names the accepted values", () => {
+    expect(ARCHIVED_HISTORY_RETENTION_INVALID_ERROR).toContain("\"off\"");
+    expect(ARCHIVED_HISTORY_RETENTION_INVALID_ERROR).toContain("1 to 3650");
   });
 });
 

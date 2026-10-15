@@ -313,6 +313,7 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
         run: () => runs.toolResultRowsForTrim(s.runId, 4096, 0, 200),
       },
     ],
+    "runs.maxEventIdForRun": [{ label: "maxEventIdForRun(runId)", run: () => runs.maxEventIdForRun(s.runId) }],
     "runs.replaceEventData": [
       {
         // Rewrites one of the seeded rows we own through the real statement.
@@ -438,6 +439,7 @@ describe("run_events query-plan guard", () => {
       "runs.lastUserEventId",
       "runs.userMessageHistory",
       "runs.toolResultRowsForTrim",
+      "runs.maxEventIdForRun",
       "runs.replaceEventData",
     ]) {
       expect(discovered, `${known} was not discovered`).toContain(known);

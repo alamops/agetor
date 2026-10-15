@@ -2173,45 +2173,84 @@ export const FX_AUTO_RESUME_MAX = 3;
  * `tool_result` payloads trimmed in place (see
  * {@link RETENTION_TRIM_BYTES} and `src/shared/tool-result-trim.ts`).
  * The stored value is `"off"` ({@link ARCHIVED_HISTORY_RETENTION_OFF}) or an
- * integer string in `[1, ARCHIVED_HISTORY_RETENTION_MAX_DAYS]`; missing or
- * unparsable means {@link ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS}. Read via
- * {@link parseArchivedHistoryRetentionDays}; edited in Settings → General and
- * via `agetor config`.
+ * integer string in `[1, ARCHIVED_HISTORY_RETENTION_MAX_DAYS]`; missing means
+ * {@link ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS}, while any other value reads
+ * as off (fail closed — the trim is destructive). Read via
+ * {@link parseArchivedHistoryRetentionDays}; written (validated and normalized
+ * through {@link normalizeArchivedHistoryRetentionValue} by
+ * `PUT /preferences/:key`) from Settings → General and `agetor config`.
  */
 export const ARCHIVED_HISTORY_RETENTION_PREF = "archivedHistoryRetentionDays";
 
 /** Default retention age, in days, when {@link ARCHIVED_HISTORY_RETENTION_PREF}
- *  is unset or unparsable. */
+ *  is unset (absent, or blank after trimming). */
 export const ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS = 30;
 
-/** The {@link ARCHIVED_HISTORY_RETENTION_PREF} value that disables trimming. */
+/** The {@link ARCHIVED_HISTORY_RETENTION_PREF} value that disables trimming —
+ *  the canonical spelling every off-word is normalized to on write. */
 export const ARCHIVED_HISTORY_RETENTION_OFF = "off";
 
+/** Spellings (case-insensitive, trimmed) that a user means as "off":
+ *  `agetor config archivedHistoryRetentionDays 0` must never start a trim. */
+export const ARCHIVED_HISTORY_RETENTION_OFF_WORDS: readonly string[] = [
+  ARCHIVED_HISTORY_RETENTION_OFF,
+  "0",
+  "false",
+  "no",
+  "none",
+  "disabled",
+];
+
 /** Upper bound (inclusive) on {@link ARCHIVED_HISTORY_RETENTION_PREF}, ten
- *  years — anything larger is indistinguishable from "never" and is treated as
- *  unparsable (so it falls back to the default rather than silently trimming
- *  nothing). */
+ *  years. Anything larger is refused on write and reads as off. */
 export const ARCHIVED_HISTORY_RETENTION_MAX_DAYS = 3650;
 
 /**
- * Parse the raw {@link ARCHIVED_HISTORY_RETENTION_PREF} value into a day count,
- * or `null` when trimming is turned off. `"off"` (case-insensitive, trimmed)
- * → `null`; a plain integer string in `[1, ARCHIVED_HISTORY_RETENTION_MAX_DAYS]`
- * → that number; everything else — missing, empty, `"0"`, negative, fractional,
- * exponent notation, out of range, garbage — → the default
- * ({@link ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS}). Strict on purpose: a typo
- * in `agetor config` must not turn the destructive trim into something other
- * than what the owner can read back.
+ * Validate and canonicalize a value about to be written to
+ * {@link ARCHIVED_HISTORY_RETENTION_PREF}: an off-word
+ * ({@link ARCHIVED_HISTORY_RETENTION_OFF_WORDS}, case-insensitive, trimmed) →
+ * `"off"`; a plain integer string in `[1, ARCHIVED_HISTORY_RETENTION_MAX_DAYS]`
+ * (trimmed) → that integer's string; anything else — blank, negative,
+ * fractional, exponent or hex notation, out of range, garbage — → `null`
+ * (refuse the write). `PUT /preferences/archivedHistoryRetentionDays` answers
+ * 400 with {@link ARCHIVED_HISTORY_RETENTION_INVALID_ERROR} on `null`.
  */
-export function parseArchivedHistoryRetentionDays(value: string | null | undefined): number | null {
-  if (value == null) return ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS;
+export function normalizeArchivedHistoryRetentionValue(value: string): string | null {
   const trimmed = value.trim();
-  if (trimmed.toLowerCase() === ARCHIVED_HISTORY_RETENTION_OFF) return null;
+  if (ARCHIVED_HISTORY_RETENTION_OFF_WORDS.includes(trimmed.toLowerCase())) {
+    return ARCHIVED_HISTORY_RETENTION_OFF;
+  }
   if (/^\d+$/.test(trimmed)) {
     const n = Number(trimmed);
-    if (n >= 1 && n <= ARCHIVED_HISTORY_RETENTION_MAX_DAYS) return n;
+    if (n >= 1 && n <= ARCHIVED_HISTORY_RETENTION_MAX_DAYS) return String(n);
   }
-  return ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS;
+  return null;
+}
+
+/** The 400 message for a refused {@link ARCHIVED_HISTORY_RETENTION_PREF} write,
+ *  naming every accepted value. */
+export const ARCHIVED_HISTORY_RETENTION_INVALID_ERROR =
+  `${ARCHIVED_HISTORY_RETENTION_PREF} must be "off" (or 0, false, no, none, disabled) ` +
+  `or a whole number of days from 1 to ${ARCHIVED_HISTORY_RETENTION_MAX_DAYS}`;
+
+/**
+ * Parse the raw {@link ARCHIVED_HISTORY_RETENTION_PREF} value into a day count,
+ * or `null` when trimming is turned off. Missing (`null`/`undefined`) or blank
+ * after trimming → the default ({@link ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS});
+ * an off-word ({@link ARCHIVED_HISTORY_RETENTION_OFF_WORDS}, case-insensitive,
+ * trimmed) → `null`; a plain integer string in
+ * `[1, ARCHIVED_HISTORY_RETENTION_MAX_DAYS]` → that number; ANY other value —
+ * negative, fractional, exponent notation, out of range, garbage — → `null`
+ * too. Fails closed on purpose: the trim is one-way, so a value nobody can
+ * read back as a day count must never start one (the write route refuses such
+ * values, so this only matters for rows written before it validated, or by
+ * hand).
+ */
+export function parseArchivedHistoryRetentionDays(value: string | null | undefined): number | null {
+  if (value == null || value.trim() === "") return ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS;
+  const normalized = normalizeArchivedHistoryRetentionValue(value);
+  if (normalized === null || normalized === ARCHIVED_HISTORY_RETENTION_OFF) return null;
+  return Number(normalized);
 }
 
 /** A `tool_result` payload larger than this many UTF-8 bytes is a retention
@@ -2307,6 +2346,9 @@ export interface DbStats {
  * only shrinks after a Compact.
  */
 export interface RetentionPassResult {
+  /** Archived tasks this pass swept — a task whose previous sweep completed
+   *  and that has not changed since (see the `retention_swept_tasks` table) is skipped
+   *  and not counted. */
   scannedTasks: number;
   scannedRuns: number;
   trimmedRows: number;

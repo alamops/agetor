@@ -1424,6 +1424,42 @@ export const preferences = {
   },
 };
 
+/**
+ * Archived-history retention's record of completed sweeps (migration 067):
+ * `taskId → sweepKey`, where an unchanged key means the task holds nothing new
+ * to trim. Written only by `retention.ts`. Kept out of `preferences` so it
+ * never rides along on `GET /preferences` / `agetor config ls`.
+ */
+export const retentionSweeps = {
+  /** Every recorded key — one row per swept archived task. */
+  all(): Map<string, string> {
+    const rows = db.query<{ task_id: string; sweep_key: string }, []>(
+      `SELECT task_id, sweep_key FROM retention_swept_tasks`,
+    ).all();
+    return new Map(rows.map((r) => [r.task_id, r.sweep_key]));
+  },
+  /** Records `taskId`'s completed sweep. A task deleted meanwhile is skipped
+   *  (no row, and no foreign-key error). */
+  set(taskId: string, sweepKey: string): void {
+    db.run(
+      `INSERT INTO retention_swept_tasks (task_id, sweep_key)
+       SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ?1)
+       ON CONFLICT(task_id) DO UPDATE SET sweep_key = excluded.sweep_key`,
+      [taskId, sweepKey],
+    );
+  },
+  /** Drops the record of every task that is no longer archived at or before
+   *  `cutoff` (unarchived, or the retention age grew), so the table stays
+   *  bounded by the candidate set. */
+  pruneNotArchivedBefore(cutoff: number): void {
+    db.run(
+      `DELETE FROM retention_swept_tasks WHERE task_id NOT IN
+         (SELECT id FROM tasks WHERE archived_at IS NOT NULL AND archived_at <= ?)`,
+      [cutoff],
+    );
+  },
+};
+
 type HarnessRow = {
   id: string;
   kind: string;
@@ -3044,6 +3080,17 @@ export const runs = {
    *  resume never re-imports what was trimmed. */
   replaceEventData(id: number, data: string): void {
     db.query(`UPDATE run_events SET data = ? WHERE id = ?`).run(data, id);
+  },
+  /** Newest `run_events.id` of one run, or 0 for a run with no events. The
+   *  retention pass folds it into a task's sweep key so a task that gained
+   *  events after it was swept (a JSONL rebuild of an archived task) is swept
+   *  again. `MAX(id)` over the `(run_id, id)` prefix is a single index seek;
+   *  pinned with `INDEXED BY` like the other run-scoped probes. */
+  maxEventIdForRun(runId: string): number {
+    const row = db.query<{ m: number | null }, [string]>(
+      `SELECT MAX(id) AS m FROM run_events INDEXED BY idx_run_events_run WHERE run_id = ?`,
+    ).get(runId);
+    return row?.m ?? 0;
   },
   /** Ids of every run belonging to a task (any status), oldest first.
    *  Retention walks a task's `run_events` per run (the `idx_run_events_run`

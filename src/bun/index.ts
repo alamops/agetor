@@ -136,6 +136,17 @@ rehydratePath();
 // fails boot loudly, matching that old synchronous-throw behavior — no
 // swallow.
 //
+// Event-loop lag monitor (docs/plans/non-blocking-session-restore.md, decision
+// C): one `.unref()`'d sampler that names whatever held the single main thread
+// for >= 1 s (a labelled `beginLagLabel` span, else a bare "no label" warning).
+// `sampleMs: 100`, not the 500 ms default: lag is measured as actual - expected
+// fire time, so a block that starts mid-interval is under-measured by up to
+// `sampleMs`; at 100 ms a 1.1 s block reliably crosses the 1 s stall bar.
+// Started BEFORE the boot restore below (not after the API is up) so the
+// `boot reattach` / `reattach session` / watcher-seed labels it exists to
+// attribute are actually sampled. Unref'd, so an early boot failure can never
+// be held open by it; every shutdown path calls `stopLagMonitor()`.
+startLagMonitor({ sampleMs: 100 });
 // Must run before reconcileOrphans(): reconciliation issues `has-session`
 // probes against agetor's tmux socket, and the first tmux command to touch
 // a socket auto-starts its server — un-disclaimed, if this didn't run
@@ -438,13 +449,6 @@ writeCoreCreds(
   dataDir,
 );
 
-// Event-loop lag monitor (docs/plans/non-blocking-session-restore.md, decision
-// C): one `.unref()`'d sampler that names whatever held the single main thread
-// for >= 1 s (a labelled `beginLagLabel` span, else a bare "no label" warning).
-// `sampleMs: 100`, not the 500 ms default: lag is measured as actual - expected
-// fire time, so a block that starts mid-interval is under-measured by up to
-// `sampleMs`; at 100 ms a 1.1 s block reliably crosses the 1 s stall bar.
-startLagMonitor({ sampleMs: 100 });
 // Archived-history retention: first pass ~90 s after boot (after the API is
 // up and restore/seed work has settled), then every 24 h; each fire reads the
 // preference fresh. Also re-armed on demand by `PUT /preferences/...`.

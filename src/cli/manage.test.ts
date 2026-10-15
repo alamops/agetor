@@ -113,6 +113,19 @@ test("cmdConfig sets a preference via the command (set path)", async () => {
   });
 }, 30_000);
 
+test("cmdConfig on archivedHistoryRetentionDays: an off-word is stored as off, garbage fails with the core's message", async () => {
+  await withClient(4539, async (client, dir) => {
+    const flags = { json: true, plain: true, noDaemon: false, dataDir: dir };
+    await cmdConfig(["archivedHistoryRetentionDays", "0"], flags);
+    expect((await client.getPreferences()).archivedHistoryRetentionDays).toBe("off");
+    const err = await cmdConfig(["archivedHistoryRetentionDays", "thirty"], flags).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("1 to 3650");
+    // Nothing stored by the refused write.
+    expect((await client.getPreferences()).archivedHistoryRetentionDays).toBe("off");
+  });
+}, 30_000);
+
 test("agentDiscovery returns { commands, extensions } arrays", async () => {
   await withClient(4533, async (client) => {
     const repo = mkdtempSync(path.join(tmpdir(), "agetor-disc-"));

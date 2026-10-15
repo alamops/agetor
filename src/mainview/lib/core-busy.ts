@@ -7,10 +7,12 @@
 // VACUUM) — simply hangs, and the UI shows a skeleton forever with no hint
 // why. This module watches the requests `j()` registers: once any of them
 // has been pending longer than `PENDING_THRESHOLD_MS`, it probes the
-// unauthenticated `GET /health` route with a short abort. A probe that gets
-// no answer means the core itself is stuck (not just one slow route), so
-// the banner shows; the next successful probe — or every tracked request
-// settling — clears it.
+// unauthenticated `GET /health` route with a short abort. Two consecutive
+// probes with no answer mean the core itself is stuck (not just one slow
+// route), so the banner shows; the next successful probe — or every tracked
+// request settling — clears it. One miss alone never shows it: the probe
+// shares the webview's ~6-connections-per-host pool with the requests it
+// watches, so a single probe can queue behind them on a healthy core.
 //
 // It is purely observational: nothing is aborted, retried or re-issued
 // because of it (mutations stay `retry: false` in api.ts), and the copy the
@@ -27,6 +29,8 @@ export const PENDING_THRESHOLD_MS = 3000;
 export const PROBE_TIMEOUT_MS = 1500;
 /** Interval between probes while a request stays over the threshold. */
 export const REPROBE_INTERVAL_MS = 2000;
+/** Consecutive unanswered probes before the banner shows. */
+export const FAILED_PROBES_TO_SHOW = 2;
 
 type TimerHandle = ReturnType<typeof setTimeout>;
 
@@ -52,7 +56,8 @@ export interface CoreBusyMonitor {
    *  runs. Nested suspensions stack; the disposer is idempotent. */
   suspend(): () => void;
   subscribe(fn: () => void): () => void;
-  /** True while the latest probe got no answer and nothing suspends it. */
+  /** True once `FAILED_PROBES_TO_SHOW` consecutive probes got no answer and
+   *  nothing suspends it. */
   getBusy(): boolean;
   /** Test/HMR helper: forgets every tracked request, timer and listener. */
   reset(): void;
@@ -65,6 +70,8 @@ export function createCoreBusyMonitor(deps: CoreBusyDeps): CoreBusyMonitor {
   const listeners = new Set<() => void>();
   let nextId = 1;
   let busy = false;
+  /** Consecutive unanswered probes since the last answer / clean slate. */
+  let failedProbes = 0;
   let suspendCount = 0;
   let timer: TimerHandle | null = null;
   let probing = false;
@@ -113,6 +120,7 @@ export function createCoreBusyMonitor(deps: CoreBusyDeps): CoreBusyMonitor {
     const oldest = oldestStart();
     if (oldest === null) {
       // Every tracked request settled, so the core demonstrably answered.
+      failedProbes = 0;
       setBusy(false);
       return;
     }
@@ -145,13 +153,15 @@ export function createCoreBusyMonitor(deps: CoreBusyDeps): CoreBusyMonitor {
     clearTimer();
     if (pending.size === 0) {
       // Everything settled while the probe ran: the core answered.
+      failedProbes = 0;
       setBusy(false);
       return;
     }
     // A suspension that began mid-probe wins: the expected block it covers
-    // must not flip the banner on.
+    // must not flip the banner on (nor count toward it).
     if (suspendCount > 0) return;
-    setBusy(!alive);
+    failedProbes = alive ? 0 : failedProbes + 1;
+    setBusy(failedProbes >= FAILED_PROBES_TO_SHOW);
     // Something is still over the threshold (or will be): keep watching at
     // the re-probe cadence so the banner both appears for a newly stuck
     // core and clears as soon as it answers again.
@@ -186,6 +196,7 @@ export function createCoreBusyMonitor(deps: CoreBusyDeps): CoreBusyMonitor {
           // about to be; start from a clean slate rather than re-showing a
           // stale verdict from before the suspension.
           busy = false;
+          failedProbes = 0;
           schedule();
         }
       };
@@ -202,6 +213,7 @@ export function createCoreBusyMonitor(deps: CoreBusyDeps): CoreBusyMonitor {
       pending.clear();
       listeners.clear();
       busy = false;
+      failedProbes = 0;
       suspendCount = 0;
       probing = false;
     },

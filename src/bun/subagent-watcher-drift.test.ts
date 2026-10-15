@@ -30,7 +30,9 @@ import { rmTestDataDir } from "./test-data-dir.ts";
  * i.e. exactly the old inline code) blocked the loop for ~2.3 s in the first
  * `pump()` alone (plus the synchronous seed inside attach) — well above the
  * 500 ms "unfixed would block" bar the test relies on; the cooperative path
- * measures ~50-80 ms worst case (one 20 ms slice + one 3 MB file).
+ * measured ~50-80 ms worst case when each file was still read in one block
+ * (one 20 ms slice + one 3 MB file) and ~40-55 ms since transcripts are read
+ * in `TAIL_READ_CHUNK_BYTES` (256 KB) chunks (one slice + one chunk).
  * ────────────────────────────────────────────────────────────────────────── */
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-drift-data-"));
@@ -67,23 +69,48 @@ const subIds = Array.from({ length: SUB_COUNT }, (_, i) => `drift${String(i).pad
 const saved: Record<string, string | undefined> = {};
 const createdTaskIds: string[] = [TASK_ID];
 
-/** Longest gap between two consecutive ticks of a `SAMPLE_MS` interval. A free
- *  loop reads ~`SAMPLE_MS`; a blocked one reads the length of the block. */
+/** Longest stretch between two consecutive ticks of a `SAMPLE_MS` interval
+ *  that the process actually spent computing. A free loop reads ~`SAMPLE_MS`;
+ *  a blocked one reads the length of the block.
+ *
+ *  Each gap counts as `min(wall, process CPU time)`, not wall time alone: on
+ *  an overloaded machine (the full suite next to other agents' runs, load
+ *  average 30) the OS can deschedule the whole process for 100-200 ms, which
+ *  shows up as a wall gap no code of ours caused, and is not what this
+ *  measures. A loop held by synchronous work keeps the main thread on-CPU for
+ *  the whole gap (the transcripts were just written, so their reads are page
+ *  cache hits, not disk waits), so its CPU time ≈ its wall time and the min
+ *  still reports the full block — the assertion bar is unchanged.
+ *  `process.cpuUsage` is process-wide, so a GC helper thread can push CPU
+ *  above wall; the min caps that. `stop()` returns that on-CPU max; `wallMax`
+ *  is kept for the log line. */
 function startGapSampler() {
   let last = performance.now();
+  let lastCpu = process.cpuUsage();
   let max = 0;
+  let wallMax = 0;
+  const onCpuGap = (now: number): number => {
+    const wall = now - last;
+    const cpu = process.cpuUsage(lastCpu);
+    if (wall > wallMax) wallMax = wall;
+    return Math.min(wall, (cpu.user + cpu.system) / 1000);
+  };
   const timer = setInterval(() => {
     const now = performance.now();
-    const gap = now - last;
+    const gap = onCpuGap(now);
     if (gap > max) max = gap;
     last = now;
+    lastCpu = process.cpuUsage();
   }, SAMPLE_MS);
   return {
+    get wallMax(): number {
+      return wallMax;
+    },
     stop(): number {
       clearInterval(timer);
       // A final partial interval counts too (the loop may have been blocked
       // right up to the moment the sampler is stopped).
-      return Math.max(max, performance.now() - last);
+      return Math.max(max, onCpuGap(performance.now()));
     },
   };
 }
@@ -249,7 +276,7 @@ test(
     const maxGap = sampler.stop();
     console.log(
       `[drift] ready ${readyMs.toFixed(0)} ms, settled ${settledMs.toFixed(0)} ms, ` +
-        `max loop gap ${maxGap.toFixed(1)} ms (budget ${MAX_GAP_MS} ms)`,
+        `max loop gap ${maxGap.toFixed(1)} ms on-CPU / ${sampler.wallMax.toFixed(1)} ms wall (budget ${MAX_GAP_MS} ms)`,
     );
     handle.detach();
 
@@ -296,7 +323,7 @@ test(
       detachWatcherFor(TASK_ID); // before the first cycle (600 ms later) starts replaying 180 MB
       console.log(
         `[drift] reconcileOrphans (re-arm) took ${(performance.now() - t0).toFixed(0)} ms, ` +
-          `max loop gap ${maxGap.toFixed(1)} ms (budget ${MAX_GAP_MS} ms)`,
+          `max loop gap ${maxGap.toFixed(1)} ms on-CPU / ${sampler.wallMax.toFixed(1)} ms wall (budget ${MAX_GAP_MS} ms)`,
       );
       expect(maxGap).toBeLessThan(MAX_GAP_MS);
     }

@@ -743,6 +743,78 @@ function readAppendedSync(
   return { text: buf.toString("utf8"), next: offset + len };
 }
 
+/** Read `[start, end)` of an open file. Returns fewer bytes than asked when the
+ *  file shrank since it was stat'd (a short read means EOF moved). */
+function readRangeSync(fd: number, start: number, end: number): Buffer {
+  const buf = Buffer.allocUnsafe(end - start);
+  let got = 0;
+  while (got < buf.length) {
+    const n = readSync(fd, buf, got, buf.length - got, start + got);
+    if (n === 0) break;
+    got += n;
+  }
+  return got < buf.length ? buf.subarray(0, got) : buf;
+}
+
+/** The line-oriented sibling of `readAppendedSync` that the JSONL tails use:
+ *  reads at most ~`chunkBytes` of what was appended since `offset` and returns
+ *  only its COMPLETE lines.
+ *
+ *  • `next` is the offset just past the last `\n` read — a trailing partial
+ *    line (claude mid-write, or a chunk boundary cutting a line) is left for
+ *    the next call, exactly like the old "pop the tail, rewind by its length"
+ *    idiom. The cut is made on the BYTE buffer (`0x0a` never occurs inside a
+ *    multi-byte UTF-8 sequence) and only complete lines are decoded, so a
+ *    chunk boundary that splits a character can never skew the cursor.
+ *  • A single line longer than `chunkBytes` still makes progress: when a
+ *    clamped read holds no newline the read keeps growing, chunk by chunk,
+ *    until one turns up or EOF is reached (where the line is a genuine partial
+ *    and nothing is returned, as today).
+ *  • `more` is true when bytes past what this call read were already on disk
+ *    at the stat — the caller should call again for them (immediately, or in a
+ *    later cooperative slice).
+ *
+ *  Never throws: a file that is missing, not a regular file, unreadable, or
+ *  truncated mid-read reads as "nothing (more) appended". */
+function readAppendedLinesSync(
+  filePath: string,
+  offset: number,
+  chunkBytes: number,
+): { lines: string[]; next: number; more: boolean } {
+  const none = { lines: [] as string[], next: offset, more: false };
+  let st;
+  try { st = statSync(filePath); } catch { return none; }
+  // Same non-file guard as `readAppendedSync` (a directory `sourcePath`).
+  if (!st.isFile() || st.size <= offset) return none;
+  let fd;
+  try { fd = openSync(filePath, "r"); } catch { return none; }
+  try {
+    let size = st.size;
+    let end = offset;
+    let lastNewline = -1; // absolute file position of the last `\n` read
+    const parts: Buffer[] = [];
+    while (end < size) {
+      const want = Math.min(size, end + chunkBytes);
+      const part = readRangeSync(fd, end, want);
+      if (part.length < want - end) size = end + part.length; // shrank under us
+      const nl = part.lastIndexOf(0x0a);
+      if (nl !== -1) lastNewline = end + nl;
+      parts.push(part);
+      end += part.length;
+      if (lastNewline !== -1) break;
+    }
+    if (lastNewline === -1) return none;
+    const buf = parts.length === 1 ? parts[0]! : Buffer.concat(parts, end - offset);
+    // Excludes the final `\n`, so `split` yields no trailing empty element.
+    const lines = buf.subarray(0, lastNewline - offset).toString("utf8").split("\n");
+    return { lines, next: lastNewline + 1, more: end < size };
+  } catch {
+    return none;
+  } finally {
+    closeSync(fd);
+  }
+}
+
 interface FileState {
   subagentId: string;
   /** Which flavour of row this file backs — `"subagent"` for a classic
@@ -845,7 +917,7 @@ interface FileState {
 
 /** A resumable unit of watcher work (the seed, the first cycle). `step` runs
  *  until `performance.now()` reaches `deadlineMs` — checked only AFTER each
- *  indivisible piece (a row, a file, a batch of lines) so every call makes
+ *  indivisible piece (a row, a read chunk, a batch of lines) so every call makes
  *  progress — and returns `true` once the job is complete. `Infinity` drains it
  *  in one synchronous call (the `manual`-mode path). */
 interface CoopJob {
@@ -854,11 +926,47 @@ interface CoopJob {
 
 /** Work budget of one cooperative slice before the job yields to the event
  *  loop. Well under the 100 ms main-thread-block bar the restore work is held
- *  to; the real bound is "one row / one file past the deadline". */
+ *  to; the real bound is "one row / one read chunk past the deadline". */
 const JOB_SLICE_MS = 20;
 
 /** Lines of the main-JSONL scan processed between deadline checks. */
 const MAIN_SCAN_LINES_PER_CHECK = 32;
+
+/** Most bytes one read of a subagent transcript (`tailFile`) or of the main
+ *  session JSONL (the main-signal scan) pulls in before its lines are
+ *  dispatched — the granularity at which the first-cycle job can yield
+ *  MID-file. Before this bound, one transcript was read, split, parsed and
+ *  dispatched as a single block (≈2.5 ms/MB on a dedupe-only replay, an
+ *  order of magnitude more when the lines are new and every one is an
+ *  INSERT + emit), so a 50 MB transcript alone held the loop well past the
+ *  100 ms bar. Sized on `subagent-watcher-drift.test.ts` (3 MB transcripts
+ *  whose last ~360 KB is new): the max loop gap read 75–101 ms with 1 MB
+ *  chunks, 39–53 ms with 256 KB and 37–46 ms with 128 KB — below 256 KB the
+ *  gap is set by the rest of the slice, not the chunk, so 256 KB takes that
+ *  floor at half the reads of 128 KB (400 reads for a 100 MB file — nothing
+ *  measurable). Only the cooperative first cycle checks a deadline between
+ *  chunks; every other caller drains all chunks in one call, so steady-state
+ *  outcomes are unchanged. A single line longer than this is still read
+ *  whole (see `readAppendedLinesSync`). */
+const TAIL_READ_CHUNK_BYTES = 256 * 1024;
+
+/** Live values of the two knobs above that tests may shrink (`__forTest`). */
+let readChunkBytes = TAIL_READ_CHUNK_BYTES;
+let jobSliceMs = JOB_SLICE_MS;
+
+/** Test-only seams. `setReadChunkBytes` shrinks the transcript / main-JSONL
+ *  read chunk so a small fixture spans many chunks; `setJobSliceMs(0)` makes
+ *  every cooperative slice stop after one indivisible piece of work, so a test
+ *  can observe the job between pieces deterministically. `null` restores the
+ *  production value. Read at use time — affects watchers already attached. */
+export const __forTest = {
+  setReadChunkBytes(bytes: number | null): void {
+    readChunkBytes = bytes === null ? TAIL_READ_CHUNK_BYTES : Math.max(1, Math.floor(bytes));
+  },
+  setJobSliceMs(ms: number | null): void {
+    jobSliceMs = ms === null ? JOB_SLICE_MS : Math.max(0, ms);
+  },
+};
 
 /** Let timers, I/O and every other task's requests run before the next slice.
  *  `setImmediate` (check phase) rather than a microtask or `setTimeout(0)`: a
@@ -899,11 +1007,18 @@ export interface SubagentWatcherHandle {
    *  pending first-cycle job synchronously (the seed already ran inside
    *  attach), so it produces exactly what the old first cycle did. In
    *  production a `pump()` is a NO-OP while the seed / first cycle is still
-   *  pending — the only production caller, `pumpWatcherForHoldCheck`, fires
-   *  ~`END_TURN_IDLE_FIRE_MS` after an end_turn and the first cycle starts
-   *  `FAST_POLL_MS` after the seed, so a pump can only land in that window if
-   *  a turn ended within ~0.5 s of an attach, which a resume cannot do; the
-   *  next scheduled tick performs the check anyway. */
+   *  pending (until `settled`): those jobs own the watcher's state and a
+   *  synchronous cycle would race them. The only production caller,
+   *  `pumpWatcherForHoldCheck`, fires ~`END_TURN_IDLE_FIRE_MS` after an
+   *  end_turn. On a small task the first cycle is done well before that, but
+   *  on a large one it is not short — a 208-subagent task measured 2.4–2.5 s
+   *  from attach to `settled` — so a turn that ends inside that window gets a
+   *  no-op pump: the hold check then reads only the rows already in the DB,
+   *  and a background agent launched in the turn's closing moments that the
+   *  first cycle has not discovered yet can let the card flip to `review`,
+   *  to be pulled back by the orchestrator's `pullBackParkedTask` once the
+   *  first cycle (or a later tick) registers the row — the same visible
+   *  bounce the pump exists to avoid, confined to that start-up window. */
   pump(now?: number): void;
   /** Reflect an externally-driven settle (see `settleSubagentById`) into this
    *  watcher's in-memory `FileState`, if it's tracking `id` — a no-op
@@ -942,7 +1057,11 @@ export interface SubagentWatcherHandle {
    *  monitors for this task, since an id it fired a background-task
    *  notification for can only be a monitor row if some monitor exists for
    *  this task in the first place. Cheaper and coarser than `hasMonitor(id)`
-   *  — a `true` here does NOT imply `hasMonitor(id)` is also true. */
+   *  — a `true` here does NOT imply `hasMonitor(id)` is also true. Also
+   *  `true` while the cooperative seed is still running: the `monitors` map
+   *  is incomplete until then, so "none" can't be claimed and the caller
+   *  must pay the DB probe (otherwise a mid-seed activity notification for a
+   *  not-yet-seeded monitor would take the receipt shortcut and close it). */
   hasAnyMonitor(): boolean;
 }
 
@@ -1764,12 +1883,6 @@ export function attachSubagentWatcher(opts: {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let dirWatcher: FSWatcher | null = null;
   let detached = false;
-  // The first cycle tails EVERY known file (including ones the DB says are
-  // already `completed`) so a reattach picks up any bytes appended while agetor
-  // was down — e.g. a background agent resumed during the gap. Steady-state
-  // polling then only re-reads `running` files; resumes of a finished agent
-  // after that are caught by the dir watcher's append notification.
-  let firstCycle = true;
   // Byte cursor into the MAIN session JSONL for `scanMainSignals` below —
   // independent of any per-subagent `FileState.offset`. Starts at 0 so a fresh
   // watcher (boot reattach, held-task repair) sees the full history on its
@@ -1803,7 +1916,9 @@ export function attachSubagentWatcher(opts: {
   //
   //  • Production (`!opts.manual`): `runProduction()` steps a job in
   //    `JOB_SLICE_MS` slices with `await yieldToLoop()` between them, so no
-  //    slice blocks the loop for more than ~one row / one file. Order: seed →
+  //    slice blocks the loop for more than ~one row / one read chunk
+  //    (`TAIL_READ_CHUNK_BYTES` of one transcript or of the main JSONL — a
+  //    large file is drained across several slices). Order: seed →
   //    resolve `handle.ready` → `FAST_POLL_MS` pause (the spawn path's "beat to
   //    settle", exactly as the first tick always had) → first cycle → resolve
   //    `handle.settled` → arm the steady-state `tick`. `cycle()`, `discover()`
@@ -1816,8 +1931,9 @@ export function attachSubagentWatcher(opts: {
   //    phases in the very same order as the old first `cycle()`.
   //
   // Every job body is the old code moved, not rewritten; only the loop
-  // boundaries gained deadline checks (after each row / file / batch of lines,
-  // never before the first, so a slice always makes progress). A `detach()`
+  // boundaries gained deadline checks (after each row / file / read chunk /
+  // batch of lines, never before the first, so a slice always makes
+  // progress). A `detach()`
   // mid-job makes the next `step` bail without touching anything.
   //
   // Rehydration never lets a bad row (or a DB hiccup) crash the caller: the
@@ -2086,9 +2202,14 @@ export function attachSubagentWatcher(opts: {
         try {
           if (rows === null) rows = subagentsDb.listForTask(taskId);
           while (idx < rows.length) {
-            const row = rows[idx++]!;
-            if (!files.has(row.id) && !workflows.has(row.id) && !bgShells.has(row.id) && !monitors.has(row.id)) {
-              seedRow(row);
+            const listed = rows[idx++]!;
+            if (!files.has(listed.id) && !workflows.has(listed.id) && !bgShells.has(listed.id) && !monitors.has(listed.id)) {
+              // The snapshot can be several slices old: a row settled (or
+              // deleted) while the seed yielded must be seeded as it is NOW,
+              // or a receipt-closed monitor / settled subagent would come
+              // back as running. One primary-key read per row.
+              const row = subagentsDb.get(listed.id);
+              if (row && row.taskId === taskId) seedRow(row);
             }
             if (idx < rows.length && performance.now() >= deadlineMs) return false;
           }
@@ -2530,36 +2651,59 @@ export function attachSubagentWatcher(opts: {
   }
 
   /** Tail one subagent file: dispatch newly-appended lines through the shared
-   *  mapper, persisting + emitting each chunk tagged with the subagent id. */
-  function tailFile(fs: FileState): void {
-    // Captured BEFORE the read advances `fs.offset` — this is the replay-floor
-    // check's input (W1). A batch that STARTS below `fs.replayFloor` is, in
-    // full or in part, replayed history (every attach re-tails from offset 0),
-    // so the flip-back block below must not treat it as evidence of a genuine
-    // resume. A batch that straddles the floor (starts below, ends at/beyond
-    // it) is conservatively treated as replay for THIS batch — the very next
-    // batch (if the agent is actually still writing) starts at/beyond the
-    // floor and flips then, at most one poll interval later. That's a
-    // deliberate trade: a false "still replay" for one extra tick is cheap: a
-    // false "genuine resume" would resurrect a settled row and retire its
-    // `toolUseId`, so no floor check is what we're guarding against.
-    const batchStart = fs.offset;
-    const { text, next } = readAppendedSync(fs.sourcePath, fs.offset);
-    if (!text) return;
-    const lines = text.split("\n");
-    const tail = lines.pop() ?? ""; // partial trailing line — re-read next tick
-    fs.offset = next - Buffer.byteLength(tail, "utf8");
+   *  mapper, persisting + emitting each chunk tagged with the subagent id.
+   *
+   *  The delta is read in `readChunkBytes` chunks (see `TAIL_READ_CHUNK_BYTES`)
+   *  and each chunk's complete lines are dispatched before the next is read.
+   *  With the default `deadlineMs` (`Infinity`) every chunk is drained in this
+   *  one call — the steady-state cycle, the dir watcher and manual `pump()`
+   *  see exactly the outcome of the old single read. The cooperative first
+   *  cycle passes its slice deadline: once a chunk is done and the deadline
+   *  has passed, this returns `false` with `fs.offset` resting on a line
+   *  boundary, and the job resumes the same file in its next slice (passing
+   *  the SAME `batchStart`). Returns `true` once nothing complete is left.
+   *
+   *  `batchStart` is the replay-floor check's input (W1), captured BEFORE the
+   *  first read advances `fs.offset`. A batch that STARTS below
+   *  `fs.replayFloor` is, in full or in part, replayed history (every attach
+   *  re-tails from offset 0), so the flip-back block must not treat it as
+   *  evidence of a genuine resume. A batch that straddles the floor (starts
+   *  below, ends at/beyond it) is conservatively treated as replay for THIS
+   *  batch — the very next batch (if the agent is actually still writing)
+   *  starts at/beyond the floor and flips then, at most one poll interval
+   *  later. That's a deliberate trade: a false "still replay" for one extra
+   *  tick is cheap: a false "genuine resume" would resurrect a settled row
+   *  and retire its `toolUseId`, so no floor check is what we're guarding
+   *  against. A "batch" is the whole drain, not one chunk: every chunk of it
+   *  is judged against the drain's starting offset, so chunking (and a
+   *  drain spread over several slices) never changes which bytes count as
+   *  replay. */
+  function tailFile(fs: FileState, deadlineMs = Infinity, batchStart = fs.offset): boolean {
+    for (;;) {
+      const { lines, next, more } = readAppendedLinesSync(fs.sourcePath, fs.offset, readChunkBytes);
+      if (next === fs.offset) return true; // nothing complete appended
+      fs.offset = next;
+      dispatchTailedLines(fs, lines, batchStart);
+      if (!more) return true;
+      if (performance.now() >= deadlineMs) return false;
+    }
+  }
+
+  /** The per-chunk half of `tailFile`: dispatch one chunk's complete lines. */
+  function dispatchTailedLines(fs: FileState, lines: string[], batchStart: number): void {
     // Fix 1 (general guard) — a workflow agent whose CONTAINER is settled must
     // never flip back to `running`, independent of `replayFloor`. The floor
     // covers the discovery-time case (a row born under an already-settled
     // container, fix 1's other half in `discoverWorkflowAgents`); this covers
     // every OTHER tick — e.g. the container settles WHILE this row's own file
     // is still trickling a trailing flush, or settles between two batches of
-    // an otherwise-legitimate-looking resume. Computed once per call (not per
-    // line): `fs.parentKind`/`fs.sourcePath` never change across this batch,
-    // and the container's status cannot change mid-batch either (nothing in
-    // this function settles a container). Cheap — a plain map lookup, falling
-    // back to one DB scan only when this watcher never saw the launch line.
+    // an otherwise-legitimate-looking resume. Computed once per chunk (not per
+    // line): `fs.parentKind`/`fs.sourcePath` never change across this chunk,
+    // and the container's status cannot change mid-chunk either (nothing in
+    // this function settles a container). Re-reading it per chunk rather than
+    // per drain only makes it more current when a drain spans several
+    // cooperative slices. Cheap — a plain map lookup, falling back to one DB
+    // scan only when this watcher never saw the launch line.
     const containerSettled =
       fs.parentKind === "workflow_agent" &&
       (() => {
@@ -3736,7 +3880,8 @@ export function attachSubagentWatcher(opts: {
    * which now settles workflow containers, ordinary rows, AND bg shells, and
    * applies the terminal-vs-activity rule for monitors.
    *
-   * One shared `mainOffset` cursor, one read, one split. The early return is
+   * One shared `mainOffset` cursor, one pass (read in bounded chunks — see
+   * `MainScan`). The early return is
    * deliberately narrow: bailing on `pending.length === 0` (as this did when
    * tool_results were its only signal) would starve workflow/bg-shell/
    * notification detection on exactly the common case — a task with no
@@ -3768,44 +3913,65 @@ export function attachSubagentWatcher(opts: {
    * survives only with both `AGETOR_TRACK_WORKFLOWS=0` and
    * `AGETOR_TRACK_BG_SHELLS=0`.
    */
-  /** Cursor over one main-JSONL batch, so the line loop can be sliced. */
+  /** Cursor over one main-JSONL batch, so the scan can be sliced. A batch is
+   *  everything appended since `mainOffset` when it began, read in
+   *  `readChunkBytes` chunks: `lines` holds the current chunk, `more` says
+   *  another chunk was already on disk past it. */
   interface MainScan {
     lines: string[];
     idx: number;
-    /** Built once per batch and shared across its lines (see
-     *  `scanLineForToolResult`'s fix-6 note). */
+    more: boolean;
+    /** Built once per batch and shared across its lines AND chunks (see
+     *  `scanLineForToolResult`'s fix-6 note) — exactly as when the batch was
+     *  one read. */
     pending: FileState[];
   }
 
+  /** Load the next chunk of the main JSONL into `scan`, advancing `mainOffset`
+   *  past its complete lines (a partial trailing line is re-read next time).
+   *  `false` = nothing complete left to read. */
+  function readMainChunk(scan: MainScan): boolean {
+    const { lines, next, more } = readAppendedLinesSync(opts.jsonlPath, mainOffset, readChunkBytes);
+    scan.more = more;
+    if (next === mainOffset) return false;
+    mainOffset = next;
+    scan.lines = lines;
+    scan.idx = 0;
+    return true;
+  }
+
   /** The read half of `scanMainSignals`: bail when there is nothing of any
-   *  tracked kind to look for, else read the bytes appended since `mainOffset`
-   *  (one `readSync`; a 29 MB transcript measured 78 ms), advance the cursor
-   *  and split into lines. `null` = nothing to scan. */
+   *  tracked kind to look for, else read the FIRST chunk of the bytes appended
+   *  since `mainOffset` (later chunks are read by `stepMainScan` as each one is
+   *  exhausted, so a 29 MB transcript — a measured 78 ms as one `readSync` —
+   *  is never pulled in at once). `null` = nothing to scan. */
   function beginMainScan(): MainScan | null {
     const pending = [...files.values()].filter((fs) => fs.status === "running" && fs.toolUseId);
     if (pending.length === 0 && !WORKFLOWS_ENABLED && !BG_SHELLS_ENABLED && !MONITORS_ENABLED) return null;
 
-    const { text, next } = readAppendedSync(opts.jsonlPath, mainOffset);
-    if (!text) return null;
-    const lines = text.split("\n");
-    const tail = lines.pop() ?? ""; // partial trailing line — re-read next tick
-    mainOffset = next - Buffer.byteLength(tail, "utf8");
-    return { lines, idx: 0, pending };
+    const scan: MainScan = { lines: [], idx: 0, more: false, pending };
+    return readMainChunk(scan) ? scan : null;
   }
 
   /** The line-loop half of `scanMainSignals`, resumable: processes lines in
    *  order until the deadline (checked every `MAIN_SCAN_LINES_PER_CHECK`
-   *  lines) and returns `true` when the batch is exhausted. */
+   *  lines, and between chunks) and returns `true` when the batch — every
+   *  chunk of it — is exhausted. Each call makes progress before it can
+   *  return `false`: a call that finds the current chunk spent reads the next
+   *  one and starts on its lines before the first deadline check. */
   function stepMainScan(scan: MainScan, deadlineMs: number): boolean {
-    const { lines, pending } = scan;
-    while (scan.idx < lines.length) {
-      const line = lines[scan.idx++]!;
-      if (line) scanMainLine(line, pending);
-      if (scan.idx % MAIN_SCAN_LINES_PER_CHECK === 0 && scan.idx < lines.length && performance.now() >= deadlineMs) {
-        return false;
+    for (;;) {
+      if (scan.idx >= scan.lines.length && (!scan.more || !readMainChunk(scan))) return true;
+      const { lines, pending } = scan;
+      while (scan.idx < lines.length) {
+        const line = lines[scan.idx++]!;
+        if (line) scanMainLine(line, pending);
+        if (scan.idx % MAIN_SCAN_LINES_PER_CHECK === 0 && scan.idx < lines.length && performance.now() >= deadlineMs) {
+          return false;
+        }
       }
+      if (scan.more && performance.now() >= deadlineMs) return false;
     }
-    return true;
   }
 
   function scanMainLine(line: string, pending: FileState[]): void {
@@ -3870,10 +4036,12 @@ export function attachSubagentWatcher(opts: {
   /** One discover → tail → done-check cycle as a resumable job. Phases, in
    *  the exact order of the old synchronous `cycle()`:
    *   0. head — `armDirWatcher`, `discover`, `discoverWorkflowAgents`
-   *   1. files — tail each known file (per-file granularity: the worst file of
-   *      the largest measured task took 32 ms)
+   *   1. files — tail each known file, in `readChunkBytes` chunks with a
+   *      deadline check between them, so even one huge transcript is spread
+   *      over several slices (`curTail` keeps the file being drained, and its
+   *      drain's `batchStart`, across them)
    *   2. journals + bg shells
-   *   3. main-JSONL signal scan (sliced by line)
+   *   3. main-JSONL signal scan (sliced by line, read chunk by chunk)
    *   4. `checkDone` / `checkStale` / ceilings, stamped with `nowFn()`
    *  `tailAll` marks the FIRST cycle, which tails every file (even completed
    *  ones) to drain a reattach backlog. A throw anywhere abandons the rest of
@@ -3884,6 +4052,10 @@ export function attachSubagentWatcher(opts: {
   function createCycleJob(tailAll: boolean, nowFn: () => number): CoopJob {
     let phase = 0;
     let fileIter: IterableIterator<FileState> | null = null;
+    // The file phase 1 is draining, when a deadline cut its drain short:
+    // resumed first thing in the next slice. `guarded` carries the fix-3
+    // backstop's per-file error swallowing across that boundary.
+    let curTail: { fs: FileState; batchStart: number; guarded: boolean } | null = null;
     let mainScan: MainScan | null = null;
     let mainScanBegun = false;
     return {
@@ -3908,6 +4080,20 @@ export function attachSubagentWatcher(opts: {
             // workflow agent whose workflow is still live (`tailPastSettle`), which
             // the non-recursive dir watcher cannot cover.
             for (;;) {
+              if (curTail) {
+                // Resume the file a previous slice's deadline cut short, with
+                // its drain's original `batchStart` (see `tailFile`).
+                const t = curTail;
+                let drained = true;
+                if (t.guarded) {
+                  try { drained = tailFile(t.fs, deadlineMs, t.batchStart); } catch { /* see fix 3 below */ }
+                } else {
+                  drained = tailFile(t.fs, deadlineMs, t.batchStart);
+                }
+                if (!drained) return false;
+                curTail = null;
+                if (performance.now() >= deadlineMs) return false;
+              }
               const nx = fileIter!.next();
               if (nx.done) { phase = 2; break; }
               const fs = nx.value;
@@ -3918,7 +4104,11 @@ export function attachSubagentWatcher(opts: {
               // all (steady-state only re-tails `running` rows) and its transcript
               // tab would render permanently empty.
               if (tailAll || fs.status === "running" || tailPastSettle(fs) || fs.offset === 0) {
-                tailFile(fs);
+                const batchStart = fs.offset;
+                if (!tailFile(fs, deadlineMs, batchStart)) {
+                  curTail = { fs, batchStart, guarded: false };
+                  return false;
+                }
               } else {
                 // Fix 3 — poll backstop for post-settle resume detection. Before
                 // this, a settled regular row's later growth was only ever seen via
@@ -3935,7 +4125,11 @@ export function attachSubagentWatcher(opts: {
                 // unreadable) is skipped, not treated as an error — the dir watcher
                 // or a later tick picks it up if it reappears.
                 try {
-                  if (statSync(fs.sourcePath).size > fs.offset) tailFile(fs);
+                  const batchStart = fs.offset;
+                  if (statSync(fs.sourcePath).size > batchStart && !tailFile(fs, deadlineMs, batchStart)) {
+                    curTail = { fs, batchStart, guarded: true };
+                    return false;
+                  }
                 } catch { /* file gone/unreadable this tick — try again next cycle */ }
               }
               if (performance.now() >= deadlineMs) return false;
@@ -4044,7 +4238,7 @@ export function attachSubagentWatcher(opts: {
   async function runJob(job: CoopJob): Promise<void> {
     const endLag = beginLagLabel(`attach subagent watcher · task ${taskId}`, lagContext());
     try {
-      while (!detached && !job.step(performance.now() + JOB_SLICE_MS)) await yieldToLoop();
+      while (!detached && !job.step(performance.now() + jobSliceMs)) await yieldToLoop();
     } finally {
       endLag();
     }
@@ -4192,7 +4386,7 @@ export function attachSubagentWatcher(opts: {
       return applyMonitorNotification(id, body, lineTimestampMs);
     },
     hasAnyMonitor(): boolean {
-      return monitors.size > 0;
+      return !seedDone || monitors.size > 0;
     },
   };
   watchers.set(taskId, handle);

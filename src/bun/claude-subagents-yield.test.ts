@@ -222,6 +222,82 @@ test("syncSettled for an id that is not rehydrated yet is a no-op, and the row l
   w.detach();
 });
 
+test("a monitor activity notification that lands mid-seed takes the DB path and never receipt-closes the monitor", async () => {
+  const { attachSubagentWatcher, handleBackgroundTaskNotification } = await import("./claude-subagents.ts");
+  const { subagents } = await import("./db.ts");
+  const { taskId, runId, jsonlPath, now } = await seed();
+
+  // Same shape as the syncSettled test: a heavy first row keeps the monitor
+  // behind it un-rehydrated when attach returns.
+  const heavyId = "h3dddddddddd";
+  const monitorId = "mon_yield_midseed";
+  subagents.insertIfAbsent({
+    id: heavyId, taskId, runId, parentKind: "subagent", agentType: "general-purpose",
+    description: "heavy", spawnDepth: 1, sourcePath: path.join(FIXTURE_DIR, "missing-heavy-3.jsonl"),
+    toolUseId: "toolu_heavy3", status: "completed", startedAt: now - 10_000, endedAt: now - 5_000,
+  });
+  subagents.insertIfAbsent({
+    id: monitorId, taskId, runId, parentKind: "monitor", agentType: "monitor",
+    description: "monitor", spawnDepth: 1, sourcePath: "", toolUseId: "toolu_mon3",
+    status: "running", startedAt: now - 9_000, endedAt: null,
+  });
+  await insertSeededEvents(runId, heavyId, 150_000);
+
+  const w = attachSubagentWatcher({ taskId, jsonlPath });
+  // Synchronous up to `await w.ready` (see the syncSettled test).
+  expect(w.hasMonitor(monitorId)).toBe(false);
+  // The map is incomplete mid-seed, so "no monitors" can't be claimed.
+  expect(w.hasAnyMonitor()).toBe(true);
+  const activity = `<task-notification>\n<task-id>${monitorId}</task-id>\n<event>tick 1</event>\n</task-notification>`;
+  handleBackgroundTaskNotification(taskId, monitorId, activity);
+  // Used to take the `!hasAnyMonitor()` receipt shortcut and settle the row.
+  expect(subagents.get(monitorId)!.status).toBe("running");
+
+  await w.ready;
+  expect(w.hasMonitor(monitorId)).toBe(true);
+  expect(subagents.get(monitorId)!.status).toBe("running");
+  w.detach();
+});
+
+test("a row whose status changes while the seed is mid-flight is rehydrated with its CURRENT status, not the snapshot's", async () => {
+  const { attachSubagentWatcher, handleBackgroundTaskNotification } = await import("./claude-subagents.ts");
+  const { subagents } = await import("./db.ts");
+  const { taskId, runId, jsonlPath, now } = await seed();
+
+  const heavyId = "h4dddddddddd";
+  const monitorId = "mon_yield_resnap";
+  subagents.insertIfAbsent({
+    id: heavyId, taskId, runId, parentKind: "subagent", agentType: "general-purpose",
+    description: "heavy", spawnDepth: 1, sourcePath: path.join(FIXTURE_DIR, "missing-heavy-4.jsonl"),
+    toolUseId: "toolu_heavy4", status: "completed", startedAt: now - 10_000, endedAt: now - 5_000,
+  });
+  // Settled by the ceiling's guess only (no terminal receipt on record), so a
+  // later activity event may reopen it.
+  subagents.insertIfAbsent({
+    id: monitorId, taskId, runId, parentKind: "monitor", agentType: "monitor",
+    description: "monitor", spawnDepth: 1, sourcePath: "", toolUseId: "toolu_mon4",
+    status: "completed", startedAt: now - 9_000, endedAt: now - 8_000,
+  });
+  await insertSeededEvents(runId, heavyId, 150_000);
+
+  const w = attachSubagentWatcher({ taskId, jsonlPath });
+  expect(w.hasMonitor(monitorId)).toBe(false);
+  // Mid-seed activity reopens the row through the DB path.
+  const activity = `<task-notification>\n<task-id>${monitorId}</task-id>\n<event>tick 2</event>\n</task-notification>`;
+  handleBackgroundTaskNotification(taskId, monitorId, activity);
+  expect(subagents.get(monitorId)!.status).toBe("running");
+
+  await w.ready;
+  expect(w.hasMonitor(monitorId)).toBe(true);
+  // Seeded from the stale snapshot the monitor read `completed` in memory, so
+  // its terminal receipt below was latched without settling the row — which
+  // then stayed `running` (holding the task) forever.
+  const terminal = `<task-notification>\n<task-id>${monitorId}</task-id>\n<status>completed</status>\n</task-notification>`;
+  w.applyMonitorNotification(monitorId, terminal);
+  expect(subagents.get(monitorId)!.status).toBe("completed");
+  w.detach();
+});
+
 test("detach() mid-seed stops the job — no events are persisted afterwards — and still resolves ready and settled", async () => {
   const { attachSubagentWatcher } = await import("./claude-subagents.ts");
   const { subagents } = await import("./db.ts");

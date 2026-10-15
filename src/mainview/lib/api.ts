@@ -431,6 +431,23 @@ async function bundleJ<T extends object>(
   return body as T;
 }
 
+/**
+ * Run a request that is EXPECTED to block the core's main thread with the busy
+ * banner suspended for its lifetime, so "Agetor is busy" never shows as a false
+ * alarm: `compactDb` (VACUUM) and every request that opens a native Open panel
+ * — Electrobun's `openFileDialog` is a synchronous FFI call, so the core is
+ * blocked for as long as the user keeps the panel up (the server brackets
+ * those calls with a `native file dialog` lag label for the same reason).
+ */
+export async function withCoreBusySuspended<T>(request: () => Promise<T>): Promise<T> {
+  const release = suspendCoreBusy();
+  try {
+    return await request();
+  } finally {
+    release();
+  }
+}
+
 export interface AppDefaults { home: string; cwd: string; dataDir: string }
 
 /** One page of older task events, as returned by `GET /tasks/:id/events/page`
@@ -620,17 +637,23 @@ export const api = {
     bundleJ<BundleExportResponse>("/bundle/export", { method: "POST", body: JSON.stringify(selection) }),
   /** Save the export to ~/Downloads (revealed in Finder) or a folder picked
    *  in the native panel. `retry: false` — a replay would write a second,
-   *  numbered copy (or open a second panel). */
-  saveBundle: (selection: BundleSelection, target: "downloads" | "folder") =>
-    bundleJ<BundleSaveResponse>(
-      "/bundle/export/save",
-      { method: "POST", body: JSON.stringify({ ...selection, target }) },
-      { retry: false },
-    ),
+   *  numbered copy (or open a second panel). Only the folder target opens a
+   *  panel, so only it suspends the busy banner. */
+  saveBundle: (selection: BundleSelection, target: "downloads" | "folder") => {
+    const request = () =>
+      bundleJ<BundleSaveResponse>(
+        "/bundle/export/save",
+        { method: "POST", body: JSON.stringify({ ...selection, target }) },
+        { retry: false },
+      );
+    return target === "folder" ? withCoreBusySuspended(request) : request();
+  },
   /** Choose file: the native Open panel, filtered to .json. `retry: false` —
    *  a replay would open the panel twice. */
   pickBundleFile: () =>
-    bundleJ<BundlePickResponse>("/bundle/pick-file", { method: "POST", body: "{}" }, { retry: false }),
+    withCoreBusySuspended(() =>
+      bundleJ<BundlePickResponse>("/bundle/pick-file", { method: "POST", body: "{}" }, { retry: false }),
+    ),
   /** Dry run: what importing `text` would create, rename and bind. `signal`
    *  lets the import dialog drop a preview it no longer wants (the dialog
    *  closed or got new text) instead of waiting for it to land. */
@@ -702,11 +725,14 @@ export const api = {
       { method: "POST" },
     ),
   listProjects: () => j<Project[]>("/projects"),
+  /** The native folder panel; registers the pick as a project. */
   pickProject: (startingFolder?: string) =>
-    j<{ project: Project | null }>("/projects/pick", {
-      method: "POST",
-      body: JSON.stringify({ startingFolder }),
-    }),
+    withCoreBusySuspended(() =>
+      j<{ project: Project | null }>("/projects/pick", {
+        method: "POST",
+        body: JSON.stringify({ startingFolder }),
+      }),
+    ),
   deleteProject: (p: string) =>
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
   cloneProject: (input: {
@@ -761,10 +787,12 @@ export const api = {
    *  reliable way to turn a user pick into an absolute path. Returns `[]` on
    *  cancel. `isDirectory` follows `mode`. */
   pickRefs: (mode: "files" | "folder", startingFolder?: string) =>
-    j<{ refs: TaskReference[] }>("/refs/pick", {
-      method: "POST",
-      body: JSON.stringify({ mode, startingFolder }),
-    }).then((r) => r.refs),
+    withCoreBusySuspended(() =>
+      j<{ refs: TaskReference[] }>("/refs/pick", {
+        method: "POST",
+        body: JSON.stringify({ mode, startingFolder }),
+      }),
+    ).then((r) => r.refs),
   /** Resolve absolute paths (pulled from a drag/drop's file:// URLs) into
    *  references — the server stats each for directory-ness and drops any
    *  that no longer exist. */
@@ -1414,14 +1442,8 @@ export const api = {
    *  the server's "N task(s) running — …" text, body carries
    *  `activeRunCount`) while any run is active. `retry: false` — never
    *  replayed. */
-  compactDb: async (): Promise<DbCompactResult> => {
-    const release = suspendCoreBusy();
-    try {
-      return await j<DbCompactResult>("/db/compact", { method: "POST" }, { retry: false });
-    } finally {
-      release();
-    }
-  },
+  compactDb: (): Promise<DbCompactResult> =>
+    withCoreBusySuspended(() => j<DbCompactResult>("/db/compact", { method: "POST" }, { retry: false })),
   /** `POST /db/retention/run` — runs one archived-history retention pass now.
    *  400 when the preference is `off`, 409 while a pass is already running
    *  (both thrown as `ApiError`). `retry: false`. */

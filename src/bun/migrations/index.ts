@@ -94,6 +94,7 @@ import m063 from "./063_task_checkout_branch.sql" with { type: "text" };
 import m064 from "./064_normalize_cursor_gemini_4_argon.sql" with { type: "text" };
 import m065 from "./065_antigravity_effort_in_model_id.sql" with { type: "text" };
 import m066 from "./066_retire_gemini_3_7_and_3_5_flash.sql" with { type: "text" };
+import m067 from "./067_retention_swept_tasks.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -169,4 +170,5 @@ export const migrations: Migration[] = [
   { id: "064_normalize_cursor_gemini_4_argon", sql: m064, aliases: ["063_normalize_cursor_gemini_4_argon"] },
   { id: "065_antigravity_effort_in_model_id", sql: m065, aliases: ["064_antigravity_effort_in_model_id"] },
   { id: "066_retire_gemini_3_7_and_3_5_flash", sql: m066, aliases: ["065_retire_gemini_3_7_and_3_5_flash"] },
+  { id: "067_retention_swept_tasks", sql: m067 },
 ];

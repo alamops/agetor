@@ -28,6 +28,7 @@ import {
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
+import { beginLagLabel } from "./event-loop-lag.ts";
 import { activeRunCount, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import {
   compactDatabase,
@@ -186,6 +187,7 @@ import {
   type AskQuestionsAnswer,
 } from "./interactions.ts";
 import {
+  ARCHIVED_HISTORY_RETENTION_INVALID_ERROR,
   ARCHIVED_HISTORY_RETENTION_PREF,
   DEFAULT_BRANCH_CONFIG,
   DEFAULT_MODEL,
@@ -198,6 +200,7 @@ import {
   PIPELINE_LIMITS,
   TASK_EVENTS_REPLAY_META_EVENT,
   TASK_TYPES,
+  normalizeArchivedHistoryRetentionValue,
   parseArchivedHistoryRetentionDays,
   supportedEfforts,
   validateBranchConfig,
@@ -1050,6 +1053,32 @@ function validateCloneLaunch(
   return out;
 }
 
+/** The lag-monitor label every native Open panel is bracketed with. */
+export const NATIVE_FILE_DIALOG_LAG_LABEL = "native file dialog";
+
+/**
+ * `native.openFileDialog`, bracketed with a context-free lag label.
+ * Electrobun's `Utils.openFileDialog` is a synchronous FFI call, so the Bun
+ * main thread is blocked for as long as the panel is up — an expected block
+ * the user is driving. The label makes the event-loop-lag monitor name it
+ * ("core was unresponsive for 12.3 s during native file dialog") instead of
+ * blaming whatever unrelated labelled work (a watcher restoring another task)
+ * happened to be in flight; having no task context, it never writes a status
+ * line into a transcript. The webview suspends its busy banner for the same
+ * requests (`api.ts`).
+ */
+async function openFileDialogLabelled(
+  native: ApiNative,
+  opts: Parameters<ApiNative["openFileDialog"]>[0],
+): Promise<string[]> {
+  const end = beginLagLabel(NATIVE_FILE_DIALOG_LAG_LABEL);
+  try {
+    return await native.openFileDialog(opts);
+  } finally {
+    end();
+  }
+}
+
 /**
  * Native-host capabilities the API needs but that only exist inside the
  * Electrobun app: file/folder dialogs, OS notifications, open-in-Finder /
@@ -1116,8 +1145,10 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
   const blockEventLoopRoute = authed(async (req: Request) => {
     const body = (await req.json().catch(() => ({}))) as { ms?: unknown };
     const ms = body.ms;
-    if (typeof ms !== "number" || !Number.isInteger(ms) || ms < 1 || ms > 10_000) {
-      return json({ error: "ms (integer 1..10000) required" }, { status: 400, headers: corsHeaders(req) });
+    // 20 s ceiling: long enough for the busy-banner e2e (two unanswered
+    // probes ≈ 8.5 s after the block starts, plus margin).
+    if (typeof ms !== "number" || !Number.isInteger(ms) || ms < 1 || ms > 20_000) {
+      return json({ error: "ms (integer 1..20000) required" }, { status: 400, headers: corsHeaders(req) });
     }
     Bun.sleepSync(ms);
     return json({ ok: true, ms }, { headers: corsHeaders(req) });
@@ -1485,7 +1516,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             }
           } catch { /* no body is fine */ }
           if (!native) return notAvailableHeadless(req);
-          const paths = await native.openFileDialog({
+          const paths = await openFileDialogLabelled(native, {
             startingFolder,
             canChooseFiles: false,
             canChooseDirectory: true,
@@ -3574,18 +3605,26 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if (typeof body.value !== "string") {
             return json({ error: "value (string) required" }, { status: 400, headers: corsHeaders(req) });
           }
-          preferences.set(req.params.key, body.value);
-          // Turning archived-history retention on (or changing its age) asks
-          // for a pass soon — debounced inside `requestRetentionPass`, so a
-          // user stepping through the Settings select doesn't start one per
-          // click. "off" schedules nothing (an already-running pass is not
-          // interrupted; it finishes, and the next fire reads the pref fresh).
-          if (
-            req.params.key === ARCHIVED_HISTORY_RETENTION_PREF
-            && parseArchivedHistoryRetentionDays(body.value) !== null
-          ) {
-            requestRetentionPass();
+          if (req.params.key === ARCHIVED_HISTORY_RETENTION_PREF) {
+            // The retention age drives a destructive, one-way trim, so it is
+            // validated rather than stored opaquely: an off-word ("0",
+            // "false", …) is stored as "off", a day count as its integer
+            // string, and anything else is refused with nothing stored and
+            // nothing scheduled — a typo must never start a trim.
+            const normalized = normalizeArchivedHistoryRetentionValue(body.value);
+            if (normalized === null) {
+              return json({ error: ARCHIVED_HISTORY_RETENTION_INVALID_ERROR }, { status: 400, headers: corsHeaders(req) });
+            }
+            preferences.set(req.params.key, normalized);
+            // Turning retention on (or changing its age) asks for a pass soon
+            // — debounced inside `requestRetentionPass`, so a user stepping
+            // through the Settings select doesn't start one per click. "off"
+            // schedules nothing (an already-running pass is not interrupted;
+            // it finishes, and the next fire reads the pref fresh).
+            if (parseArchivedHistoryRetentionDays(normalized) !== null) requestRetentionPass();
+            return new Response(null, { status: 204, headers: corsHeaders(req) });
           }
+          preferences.set(req.params.key, body.value);
           return new Response(null, { status: 204, headers: corsHeaders(req) });
         }),
       },
@@ -4555,7 +4594,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               if (!native) return notAvailableHeadless(req);
               // The request stays open while the panel is up.
               server.timeout(req, 0);
-              const picks = await native.openFileDialog({
+              const picks = await openFileDialogLabelled(native, {
                 startingFolder: homedir(),
                 canChooseFiles: false,
                 canChooseDirectory: true,
@@ -4595,7 +4634,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           } else {
             if (!native) return notAvailableHeadless(req);
             server.timeout(req, 0);
-            const picks = await native.openFileDialog({
+            const picks = await openFileDialogLabelled(native, {
               startingFolder: homedir(),
               allowedFileTypes: "json",
               canChooseFiles: true,
@@ -5919,7 +5958,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             }
           }
           if (!native) return notAvailableHeadless(req);
-          const paths = await native.openFileDialog({
+          const paths = await openFileDialogLabelled(native, {
             startingFolder,
             canChooseFiles: mode === "files",
             canChooseDirectory: mode === "folder",
@@ -6239,7 +6278,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               // hold up). Left undefined on a successful/failed drive; the
               // response only carries these when the fallback actually ran.
               let withheld: true | undefined;
-              let savedToBacklog: true | undefined;
+              let savedToBacklog: boolean | undefined;
               let reason: string | undefined;
               // Which path actually delivered (or attempted) the answer — lets
               // the UI word a failure toast accurately.
@@ -6891,7 +6930,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             );
           }
           return json(
-            await sendInput(req.params.id, line),
+            await sendInput(req.params.id, line, { bounded: true }),
             { headers: corsHeaders(req) },
           );
         }),
