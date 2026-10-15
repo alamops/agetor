@@ -358,6 +358,7 @@ import {
 import path from "node:path";
 import { runs, subagents as subagentsDb, tasks } from "./db.ts";
 import { formatApiErrorDetail, mapJsonlEventToChunks } from "./claude-tmux.ts";
+import { beginLagLabel } from "./event-loop-lag.ts";
 import type { RunEvent, Subagent, SubagentEvent, SubagentStatus } from "../shared/types.ts";
 
 /** Off only when explicitly disabled. The watcher is cheap when idle, but the
@@ -842,12 +843,67 @@ interface FileState {
   lastPermissionMode: string | null;
 }
 
+/** A resumable unit of watcher work (the seed, the first cycle). `step` runs
+ *  until `performance.now()` reaches `deadlineMs` — checked only AFTER each
+ *  indivisible piece (a row, a file, a batch of lines) so every call makes
+ *  progress — and returns `true` once the job is complete. `Infinity` drains it
+ *  in one synchronous call (the `manual`-mode path). */
+interface CoopJob {
+  step(deadlineMs: number): boolean;
+}
+
+/** Work budget of one cooperative slice before the job yields to the event
+ *  loop. Well under the 100 ms main-thread-block bar the restore work is held
+ *  to; the real bound is "one row / one file past the deadline". */
+const JOB_SLICE_MS = 20;
+
+/** Lines of the main-JSONL scan processed between deadline checks. */
+const MAIN_SCAN_LINES_PER_CHECK = 32;
+
+/** Let timers, I/O and every other task's requests run before the next slice.
+ *  `setImmediate` (check phase) rather than a microtask or `setTimeout(0)`: a
+ *  microtask would not yield at all, and a timer adds a >=1 ms floor per slice. */
+function yieldToLoop(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 export interface SubagentWatcherHandle {
+  /** Resolves once the watcher has finished SEEDING (rehydrating every
+   *  subagent row the task already had into its in-memory maps, plus the
+   *  replay-window clamp that follows) — the point after which `hasMonitor` /
+   *  `syncSettled` / `applyMonitorNotification` see the task's full state and
+   *  the first poll cycle may begin. `attachSubagentWatcher` returns the
+   *  handle SYNCHRONOUSLY and seeds cooperatively in the background (see the
+   *  job model comment inside it); callers that used to rely on "files are
+   *  populated when attach returns" (the claude spawn's `ready` status,
+   *  `reattachSession`, the boot held-task re-arm) await this instead.
+   *  Never rejects — a seeding error is logged and still resolves; `detach()`
+   *  mid-seed resolves it too. Already-resolved in `manual` mode (the seed
+   *  runs synchronously inside attach there) and for the disabled stub. */
+  readonly ready: Promise<void>;
+  /** Resolves once the seed AND the whole first poll cycle (the offset-0
+   *  replay of every known transcript, the journals, the main-JSONL scan and
+   *  the done/stale/ceiling checks) have finished and the steady-state `tick`
+   *  has been armed. Strictly later than `ready` (the first cycle starts
+   *  `FAST_POLL_MS` after the seed, as the first tick always did). Never
+   *  rejects; `detach()` resolves it too. In `manual` mode it resolves when
+   *  the first `pump()` has run. */
+  readonly settled: Promise<void>;
   detach(): void;
   /** Run a single discover → tail → done-check cycle synchronously, without
    *  touching the poll schedule. Production never calls this (the timer drives
    *  it); tests use it with an injected `now` to exercise the watcher
-   *  deterministically instead of waiting on real timers. */
+   *  deterministically instead of waiting on real timers.
+   *
+   *  Job-model contract: in `manual` mode the first `pump()` also drains the
+   *  pending first-cycle job synchronously (the seed already ran inside
+   *  attach), so it produces exactly what the old first cycle did. In
+   *  production a `pump()` is a NO-OP while the seed / first cycle is still
+   *  pending — the only production caller, `pumpWatcherForHoldCheck`, fires
+   *  ~`END_TURN_IDLE_FIRE_MS` after an end_turn and the first cycle starts
+   *  `FAST_POLL_MS` after the seed, so a pump can only land in that window if
+   *  a turn ended within ~0.5 s of an attach, which a resume cannot do; the
+   *  next scheduled tick performs the check anyway. */
   pump(now?: number): void;
   /** Reflect an externally-driven settle (see `settleSubagentById`) into this
    *  watcher's in-memory `FileState`, if it's tracking `id` — a no-op
@@ -1418,7 +1474,7 @@ function applyMonitorNotificationForRow(row: Subagent, body: string, lineTimesta
   // branch's "don't presume resurrectable" posture for those statuses.
   const isNew = persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText, isTerminal, lineTimestampMs);
   if (row.status !== "completed" || !isNew) return; // not a ceiling settle, or a replayed line
-  if (runs.hasLineUuidPrefixForSubagent(row.id, `monitor:${row.id}:terminal:`)) return; // receipt-closed — never resurrect
+  if (runs.hasLineUuidPrefixForSubagent(row.taskId, row.id, `monitor:${row.id}:terminal:`)) return; // receipt-closed — never resurrect
 
   subagentsDb.setStatus(row.id, "running", null);
   emitLifecycleForRow({ ...row, status: "running", endedAt: null }, "started");
@@ -1629,8 +1685,15 @@ export function attachSubagentWatcher(opts: {
   taskId: string;
   jsonlPath: string;
   /** Test-only: suppress the self-scheduling poll timer so a test drives the
-   *  watcher via `pump()` instead of real timers. */
+   *  watcher via `pump()` instead of real timers. In this mode the seed runs
+   *  synchronously inside attach and the first `pump()` drains the first
+   *  cycle, preserving the pre-job-model ordering the unit tests rely on. */
   manual?: boolean;
+  /** The run the attach belongs to — only used to attribute an event-loop
+   *  stall during the cooperative seed / first pass to a run's status line
+   *  (`beginLagLabel` context). Optional: falls back to the task's current
+   *  `runId` at attach time. */
+  runId?: string;
   /** Fired the moment a subagent's own transcript emits an API-error line
    *  (`isApiErrorMessage: true`), right after this module has already
    *  settled that subagent's row `failed`. This module has no visibility
@@ -1652,6 +1715,8 @@ export function attachSubagentWatcher(opts: {
 
   if (!ENABLED) {
     return {
+      ready: Promise.resolve(),
+      settled: Promise.resolve(),
       detach() { /* disabled */ },
       pump() { /* disabled */ },
       syncSettled() { /* disabled */ },
@@ -1721,222 +1786,255 @@ export function attachSubagentWatcher(opts: {
   // "zero subagents ever discovered for the task" gate the plan calls for.
   let lastChangeAt = Date.now();
 
+  // ── Cooperative jobs (seed + first cycle) ────────────────────────────────
+  //
+  // `attachSubagentWatcher` returns its handle SYNCHRONOUSLY but no longer does
+  // the heavy start-up work inline. A task that has run for weeks can own
+  // hundreds of subagent rows and hundreds of MB of transcripts; rehydrating
+  // them (one DB query + stat per row) and replaying them from offset 0 on the
+  // first cycle used to run as a single synchronous block inside the spawn /
+  // reattach path and froze the whole Bun main thread (every HTTP route, SSE
+  // stream, tmux op and pipeline runner) for seconds to minutes. The work is
+  // now split into two `CoopJob`s — the SEED (this block: the rehydrate loop
+  // plus the replay-window clamp) and the FIRST CYCLE (`createCycleJob(true)`,
+  // defined next to `cycle`) — each a resumable state machine whose
+  // `step(deadlineMs)` does work until `performance.now()` passes the deadline
+  // and returns whether it finished.
+  //
+  //  • Production (`!opts.manual`): `runProduction()` steps a job in
+  //    `JOB_SLICE_MS` slices with `await yieldToLoop()` between them, so no
+  //    slice blocks the loop for more than ~one row / one file. Order: seed →
+  //    resolve `handle.ready` → `FAST_POLL_MS` pause (the spawn path's "beat to
+  //    settle", exactly as the first tick always had) → first cycle → resolve
+  //    `handle.settled` → arm the steady-state `tick`. `cycle()`, `discover()`
+  //    and the dir watcher never run while either job is pending, and a
+  //    production `pump()` is a no-op meanwhile (see the handle's doc).
+  //  • `manual` (tests): the seed runs synchronously inside attach
+  //    (`step(Infinity)`), exactly where the old inline loop ran, so anything a
+  //    test observes right after attach is unchanged; the first `pump()` drains
+  //    the first-cycle job with `step(Infinity)`, which executes the very same
+  //    phases in the very same order as the old first `cycle()`.
+  //
+  // Every job body is the old code moved, not rewritten; only the loop
+  // boundaries gained deadline checks (after each row / file / batch of lines,
+  // never before the first, so a slice always makes progress). A `detach()`
+  // mid-job makes the next `step` bail without touching anything.
+  //
+  // Rehydration never lets a bad row (or a DB hiccup) crash the caller: the
+  // production job runs outside any tick's try/catch, so the seed job guards
+  // itself rather than relying on `cycle()`'s wrapper (a throwing row aborts
+  // the rest of the seed and is logged, as the old loop did).
+  //
   // Reattach: rehydrate subagents this task already had so we resume their
   // tails from offset 0 (the DB-seeded `seen` set suppresses re-emission of
   // already-persisted lines). A row left `running` whose transcript is actually
   // finished gets reconciled by the normal done-check on the next tick.
-  // Never let a bad row (or a DB hiccup) crash the caller — this loop runs
-  // synchronously inside `reattachSession`/the spawn IIFE, outside any tick's
-  // try/catch, so it's the one place in this file that must guard itself
-  // rather than rely on `cycle()`'s wrapper.
   // Captured once, not per row: this is the staleness clock's start time
   // (W4) — every rehydrated row is "last heard from" as of THIS attach, not
   // the epoch (`lastAppendAt: 0` would otherwise make every reattached row
   // instantly eligible for `checkStale` on the very next pass).
   const attachedAt = Date.now();
-  try {
-    for (const row of subagentsDb.listForTask(taskId)) {
-      if (row.parentKind === "workflow") {
-        // Container rows are directory-backed: they must never enter `files`
-        // (nothing to tail) and must never be resurrected here — a row the DB
-        // says is `completed`/`orphaned` is rehydrated with THAT status, so
-        // neither a replayed launch line nor the cadence check can flip it
-        // back to running, and no "started" lifecycle is re-emitted for it.
-        if (WORKFLOWS_ENABLED) {
-          workflows.set(row.id, {
-            id: row.id,
-            dir: row.sourcePath,
-            description: row.description,
-            runId: row.runId ?? resolveRunId(taskId) ?? row.id,
-            status: row.status,
-            startedAt: row.startedAt,
-            endedAt: row.endedAt,
-            toolUseId: row.toolUseId ?? null,
-          });
-          // Journal cursor starts at 0 like every other reattach cursor — the
-          // receipts it replays all funnel through `settleSubagentById`, which
-          // no-ops on already-settled rows.
-          if (row.sourcePath && !wfJournals.has(row.sourcePath)) wfJournals.set(row.sourcePath, 0);
-        }
-        continue;
+
+  /** Rehydrate ONE persisted subagent row into the in-memory maps. The body of
+   *  the old synchronous `for (const row of listForTask(taskId))` loop, moved
+   *  verbatim — each `return` below is the old `continue`. */
+  function seedRow(row: Subagent): void {
+    if (row.parentKind === "workflow") {
+      // Container rows are directory-backed: they must never enter `files`
+      // (nothing to tail) and must never be resurrected here — a row the DB
+      // says is `completed`/`orphaned` is rehydrated with THAT status, so
+      // neither a replayed launch line nor the cadence check can flip it
+      // back to running, and no "started" lifecycle is re-emitted for it.
+      if (WORKFLOWS_ENABLED) {
+        workflows.set(row.id, {
+          id: row.id,
+          dir: row.sourcePath,
+          description: row.description,
+          runId: row.runId ?? resolveRunId(taskId) ?? row.id,
+          status: row.status,
+          startedAt: row.startedAt,
+          endedAt: row.endedAt,
+          toolUseId: row.toolUseId ?? null,
+        });
+        // Journal cursor starts at 0 like every other reattach cursor — the
+        // receipts it replays all funnel through `settleSubagentById`, which
+        // no-ops on already-settled rows.
+        if (row.sourcePath && !wfJournals.has(row.sourcePath)) wfJournals.set(row.sourcePath, 0);
       }
-      if (row.parentKind === "bg_session") {
-        // Route to `bgShells`, never `files` — a bg shell's output file is
-        // raw text, not a JSONL transcript, so it must never be handed to
-        // `tailFile`'s mapper-driven machinery (see `BgShellState`).
-        if (BG_SHELLS_ENABLED) {
-          // Offset starts at the file's CURRENT size (not 0, unlike every
-          // `FileState` rehydration above): persisted `run_events` already
-          // cover this row's history via the normal SSE-replay path, and a
-          // raw-text tail has no per-line dedup key the way a JSONL tail
-          // does — re-tailing from 0 would re-persist (and re-emit, since
-          // `runs.appendEvent`'s dedup only applies to a provided
-          // `line_uuid`, and a replayed batch would get a DIFFERENT
-          // `bgshell:<id>:<offset>` key than its first pass) the entire
-          // output as a duplicate stream. `0` on a stat failure (file
-          // genuinely gone, or a transient FS error) degrades to "nothing
-          // more to tail" rather than crashing rehydration.
-          let offset = 0;
-          if (row.sourcePath) {
-            try { offset = statSync(row.sourcePath).size; } catch { /* offset stays 0 */ }
-          }
-          bgShells.set(row.id, {
-            id: row.id,
-            runId: row.runId ?? resolveRunId(taskId) ?? row.id,
-            toolUseId: row.toolUseId ?? null,
-            description: row.description,
-            // Not persisted — a restart loses the specific Bash `timeout`;
-            // `checkBgShellCeiling` falls back to `BG_SHELL_DEFAULT_TIMEOUT_MS`.
-            timeoutMs: null,
-            outputPath: row.sourcePath || null,
-            offset,
-            status: row.status,
-            startedAt: row.startedAt,
-            endedAt: row.endedAt,
-            lastAppendAt: attachedAt,
-            // Never rehydrated (not persisted), mirroring `receiptSettled`
-            // below — a restart re-derives whichever matters the next time
-            // this row's settle-relevant signal replays.
-            settleFloor: null,
-            receiptSettled: false,
-          });
-        }
-        continue;
-      }
-      if (row.parentKind === "monitor") {
-        // Route to `monitors`, never `files` — a monitor has no transcript
-        // of its own (see `MonitorState`, and the module header's
-        // "Monitors" section).
-        if (MONITORS_ENABLED) {
-          // Finding #3(b) (code review) — superseded the old "any non-running
-          // row is receiptSettled" seed, which made flip-back permanently
-          // DEAD across a restart: `ceilingSettled` was always seeded
-          // `false` here (never persisted), and `applyMonitorNotification`'s
-          // flip-back gate is `m.ceilingSettled && !m.receiptSettled` — so a
-          // row that was only EVER settled by the ceiling's guess (never an
-          // authoritative receipt) rehydrated with its flip-back gate
-          // structurally impossible to open.
-          //
-          // Now the gate is derived from what's actually on record in
-          // `run_events`, which — unlike the in-memory `MonitorState` flags —
-          // survives a restart: `persistMonitorEvent` (finding #3(a)) marks a
-          // TERMINAL event's line_uuid with a `monitor:<id>:terminal:`
-          // prefix that no ordinary (activity) event ever carries, so its
-          // presence for this row IS the authoritative-receipt signal.
-          //   - A receipt on record ⇒ `receiptSettled: true` (closed,
-          //     mirrors the old behavior for a harness-terminated monitor).
-          //   - No receipt on record AND the DB says `completed` ⇒ this row
-          //     was settled only by `checkMonitorCeiling`'s GUESS ⇒
-          //     `ceilingSettled: true` so a later live event can flip it back
-          //     — restoring the guarantee the in-memory-only flags used to
-          //     lose on every restart.
-          //   - `running` (no receipt possible while running, by
-          //     construction) ⇒ both `false`, unchanged from before.
-          //   - Any OTHER terminal-ish status (e.g. `orphaned`, settled by a
-          //     wholly different path than either receipt or ceiling) ⇒ both
-          //     `false` — conservative: neither gate opens, so it can't be
-          //     resurrected by a stray later event, matching this module's
-          //     "don't presume resurrectable" default for a status this
-          //     rule doesn't otherwise recognise.
-          const receiptSettled = runs.hasLineUuidPrefixForSubagent(row.id, `monitor:${row.id}:terminal:`);
-          monitors.set(row.id, {
-            id: row.id,
-            runId: row.runId ?? resolveRunId(taskId) ?? row.id,
-            toolUseId: row.toolUseId ?? null,
-            description: row.description,
-            // Neither is persisted — a restart loses the specific
-            // `timeout_ms`/`persistent` from the launch line;
-            // `checkMonitorCeiling` falls back to the activity-anchored
-            // `MONITOR_DEFAULT_STALE_MS`.
-            timeoutMs: null,
-            persistent: null,
-            status: row.status,
-            startedAt: row.startedAt,
-            endedAt: row.endedAt,
-            lastActivityAt: attachedAt,
-            ceilingSettled: row.status === "completed" && !receiptSettled,
-            receiptSettled,
-          });
-        }
-        continue;
-      }
-      // Pre-fix rows (and any row whose sidecar wasn't parsed for toolUseId
-      // yet) have this NULL in the DB even though the sidecar itself carries
-      // it — re-read it here so the tool_result scan below can find these
-      // rows too. This is what repairs already-stuck prod rows on restart.
-      let toolUseId = row.toolUseId ?? null;
-      if (!toolUseId) {
-        const meta = readMeta(subagentsDir, row.id);
-        if (meta.toolUseId) {
-          toolUseId = meta.toolUseId;
-          subagentsDb.setToolUseId(row.id, meta.toolUseId);
-        }
-      }
-      // Replay floor (W1): the source file's size RIGHT NOW, before this
-      // watcher ever reads a byte of it. Every attach re-tails from offset 0
-      // (see `offset: 0` below), so without a floor the very first batch —
-      // pure replay of history the row already settled from — would look
-      // like "new bytes" to the flip-back block and resurrect a completed
-      // row on every restart.
-      //
-      // Fix 7 — the floor's error fallback must distinguish "no file" from
-      // "file exists but couldn't be stat'd": a file that's genuinely gone
-      // (deleted transcript, race with cleanup) has no history to distrust,
-      // so floor 0 (== "treat as freshly-discovered") is the safe default.
-      // But a file that EXISTS and merely failed to `statSync` (permissions,
-      // a transient FS error, an exotic mount) is the opposite case — there
-      // IS history on disk, we just can't measure it right now — and 0 would
-      // wrongly tell the flip-back block "everything in this file is new",
-      // resurrecting a settled row (or worse, mis-treating its full replayed
-      // content as a genuine resume) the moment it becomes readable again.
-      // `Number.MAX_SAFE_INTEGER` makes every batch from this row read as
-      // replay until a later `statSync` succeeds and the real size is used.
-      let replayFloor = 0;
-      if (existsSync(row.sourcePath)) {
-        try {
-          replayFloor = statSync(row.sourcePath).size;
-        } catch {
-          replayFloor = Number.MAX_SAFE_INTEGER;
-        }
-      }
-      files.set(row.id, {
-        subagentId: row.id,
-        parentKind: row.parentKind,
-        runId: row.runId ?? resolveRunId(taskId) ?? row.id,
-        offset: 0,
-        replayFloor,
-        seen: runs.seenLineUuidsForSubagent(row.id),
-        sawEndOfTurn: false,
-        lastAppendAt: attachedAt,
-        status: row.status,
-        sourcePath: row.sourcePath,
-        agentType: row.agentType,
-        description: row.description,
-        spawnDepth: row.spawnDepth,
-        startedAt: row.startedAt,
-        endedAt: row.endedAt,
-        toolUseId,
-        // `"failed"` has exactly one writer in this codebase — the api-error
-        // settle block below — so a rehydrated row already in that status
-        // was necessarily api-errored pre-restart. Reconstructing the latch
-        // here (not just at the live settle site) is what keeps the finding
-        // #5 fix correct across a restart: an agetor restart right after an
-        // api-error, followed by the same background agent resuming, must
-        // still preserve `toolUseId` in the flip-back block below.
-        apiErrored: row.status === "failed",
-        // `staleSettled`/`receiptSettled` are never rehydrated (see their
-        // doc on `FileState`) — a restart re-derives whichever of them
-        // matters the next time this row's settle-relevant signal replays.
-        staleSettled: false,
-        receiptSettled: false,
-        isAsync: false,
-        lastPermissionMode: null,
-      });
+      return;
     }
-  } catch (e) {
-    // degrade gracefully — a bad rehydration row must not crash reattach —
-    // but still log so a silently-empty subagent list is diagnosable.
-    console.error(`[claude-subagents] rehydration failed for task ${taskId}:`, e);
+    if (row.parentKind === "bg_session") {
+      // Route to `bgShells`, never `files` — a bg shell's output file is
+      // raw text, not a JSONL transcript, so it must never be handed to
+      // `tailFile`'s mapper-driven machinery (see `BgShellState`).
+      if (BG_SHELLS_ENABLED) {
+        // Offset starts at the file's CURRENT size (not 0, unlike every
+        // `FileState` rehydration above): persisted `run_events` already
+        // cover this row's history via the normal SSE-replay path, and a
+        // raw-text tail has no per-line dedup key the way a JSONL tail
+        // does — re-tailing from 0 would re-persist (and re-emit, since
+        // `runs.appendEvent`'s dedup only applies to a provided
+        // `line_uuid`, and a replayed batch would get a DIFFERENT
+        // `bgshell:<id>:<offset>` key than its first pass) the entire
+        // output as a duplicate stream. `0` on a stat failure (file
+        // genuinely gone, or a transient FS error) degrades to "nothing
+        // more to tail" rather than crashing rehydration.
+        let offset = 0;
+        if (row.sourcePath) {
+          try { offset = statSync(row.sourcePath).size; } catch { /* offset stays 0 */ }
+        }
+        bgShells.set(row.id, {
+          id: row.id,
+          runId: row.runId ?? resolveRunId(taskId) ?? row.id,
+          toolUseId: row.toolUseId ?? null,
+          description: row.description,
+          // Not persisted — a restart loses the specific Bash `timeout`;
+          // `checkBgShellCeiling` falls back to `BG_SHELL_DEFAULT_TIMEOUT_MS`.
+          timeoutMs: null,
+          outputPath: row.sourcePath || null,
+          offset,
+          status: row.status,
+          startedAt: row.startedAt,
+          endedAt: row.endedAt,
+          lastAppendAt: attachedAt,
+          // Never rehydrated (not persisted), mirroring `receiptSettled`
+          // below — a restart re-derives whichever matters the next time
+          // this row's settle-relevant signal replays.
+          settleFloor: null,
+          receiptSettled: false,
+        });
+      }
+      return;
+    }
+    if (row.parentKind === "monitor") {
+      // Route to `monitors`, never `files` — a monitor has no transcript
+      // of its own (see `MonitorState`, and the module header's
+      // "Monitors" section).
+      if (MONITORS_ENABLED) {
+        // Finding #3(b) (code review) — superseded the old "any non-running
+        // row is receiptSettled" seed, which made flip-back permanently
+        // DEAD across a restart: `ceilingSettled` was always seeded
+        // `false` here (never persisted), and `applyMonitorNotification`'s
+        // flip-back gate is `m.ceilingSettled && !m.receiptSettled` — so a
+        // row that was only EVER settled by the ceiling's guess (never an
+        // authoritative receipt) rehydrated with its flip-back gate
+        // structurally impossible to open.
+        //
+        // Now the gate is derived from what's actually on record in
+        // `run_events`, which — unlike the in-memory `MonitorState` flags —
+        // survives a restart: `persistMonitorEvent` (finding #3(a)) marks a
+        // TERMINAL event's line_uuid with a `monitor:<id>:terminal:`
+        // prefix that no ordinary (activity) event ever carries, so its
+        // presence for this row IS the authoritative-receipt signal.
+        //   - A receipt on record ⇒ `receiptSettled: true` (closed,
+        //     mirrors the old behavior for a harness-terminated monitor).
+        //   - No receipt on record AND the DB says `completed` ⇒ this row
+        //     was settled only by `checkMonitorCeiling`'s GUESS ⇒
+        //     `ceilingSettled: true` so a later live event can flip it back
+        //     — restoring the guarantee the in-memory-only flags used to
+        //     lose on every restart.
+        //   - `running` (no receipt possible while running, by
+        //     construction) ⇒ both `false`, unchanged from before.
+        //   - Any OTHER terminal-ish status (e.g. `orphaned`, settled by a
+        //     wholly different path than either receipt or ceiling) ⇒ both
+        //     `false` — conservative: neither gate opens, so it can't be
+        //     resurrected by a stray later event, matching this module's
+        //     "don't presume resurrectable" default for a status this
+        //     rule doesn't otherwise recognise.
+        const receiptSettled = runs.hasLineUuidPrefixForSubagent(taskId, row.id, `monitor:${row.id}:terminal:`);
+        monitors.set(row.id, {
+          id: row.id,
+          runId: row.runId ?? resolveRunId(taskId) ?? row.id,
+          toolUseId: row.toolUseId ?? null,
+          description: row.description,
+          // Neither is persisted — a restart loses the specific
+          // `timeout_ms`/`persistent` from the launch line;
+          // `checkMonitorCeiling` falls back to the activity-anchored
+          // `MONITOR_DEFAULT_STALE_MS`.
+          timeoutMs: null,
+          persistent: null,
+          status: row.status,
+          startedAt: row.startedAt,
+          endedAt: row.endedAt,
+          lastActivityAt: attachedAt,
+          ceilingSettled: row.status === "completed" && !receiptSettled,
+          receiptSettled,
+        });
+      }
+      return;
+    }
+    // Pre-fix rows (and any row whose sidecar wasn't parsed for toolUseId
+    // yet) have this NULL in the DB even though the sidecar itself carries
+    // it — re-read it here so the tool_result scan below can find these
+    // rows too. This is what repairs already-stuck prod rows on restart.
+    let toolUseId = row.toolUseId ?? null;
+    if (!toolUseId) {
+      const meta = readMeta(subagentsDir, row.id);
+      if (meta.toolUseId) {
+        toolUseId = meta.toolUseId;
+        subagentsDb.setToolUseId(row.id, meta.toolUseId);
+      }
+    }
+    // Replay floor (W1): the source file's size RIGHT NOW, before this
+    // watcher ever reads a byte of it. Every attach re-tails from offset 0
+    // (see `offset: 0` below), so without a floor the very first batch —
+    // pure replay of history the row already settled from — would look
+    // like "new bytes" to the flip-back block and resurrect a completed
+    // row on every restart.
+    //
+    // Fix 7 — the floor's error fallback must distinguish "no file" from
+    // "file exists but couldn't be stat'd": a file that's genuinely gone
+    // (deleted transcript, race with cleanup) has no history to distrust,
+    // so floor 0 (== "treat as freshly-discovered") is the safe default.
+    // But a file that EXISTS and merely failed to `statSync` (permissions,
+    // a transient FS error, an exotic mount) is the opposite case — there
+    // IS history on disk, we just can't measure it right now — and 0 would
+    // wrongly tell the flip-back block "everything in this file is new",
+    // resurrecting a settled row (or worse, mis-treating its full replayed
+    // content as a genuine resume) the moment it becomes readable again.
+    // `Number.MAX_SAFE_INTEGER` makes every batch from this row read as
+    // replay until a later `statSync` succeeds and the real size is used.
+    let replayFloor = 0;
+    if (existsSync(row.sourcePath)) {
+      try {
+        replayFloor = statSync(row.sourcePath).size;
+      } catch {
+        replayFloor = Number.MAX_SAFE_INTEGER;
+      }
+    }
+    files.set(row.id, {
+      subagentId: row.id,
+      parentKind: row.parentKind,
+      runId: row.runId ?? resolveRunId(taskId) ?? row.id,
+      offset: 0,
+      replayFloor,
+      seen: runs.seenLineUuidsForSubagent(taskId, row.id),
+      sawEndOfTurn: false,
+      lastAppendAt: attachedAt,
+      status: row.status,
+      sourcePath: row.sourcePath,
+      agentType: row.agentType,
+      description: row.description,
+      spawnDepth: row.spawnDepth,
+      startedAt: row.startedAt,
+      endedAt: row.endedAt,
+      toolUseId,
+      // `"failed"` has exactly one writer in this codebase — the api-error
+      // settle block below — so a rehydrated row already in that status
+      // was necessarily api-errored pre-restart. Reconstructing the latch
+      // here (not just at the live settle site) is what keeps the finding
+      // #5 fix correct across a restart: an agetor restart right after an
+      // api-error, followed by the same background agent resuming, must
+      // still preserve `toolUseId` in the flip-back block below.
+      apiErrored: row.status === "failed",
+      // `staleSettled`/`receiptSettled` are never rehydrated (see their
+      // doc on `FileState`) — a restart re-derives whichever of them
+      // matters the next time this row's settle-relevant signal replays.
+      staleSettled: false,
+      receiptSettled: false,
+      isAsync: false,
+      lastPermissionMode: null,
+    });
   }
 
   // Replay-window clamp. Before workflows, the main scan only ran at all when
@@ -1960,14 +2058,50 @@ export function attachSubagentWatcher(opts: {
   // cursor), and a workflow that was never seen at all belongs to a session
   // whose runs boot reconciliation orphans anyway. The window only needs to
   // cover "launched shortly before agetor went down", not all history.
-  if (WORKFLOWS_ENABLED) {
-    const needsFullReplay = [...files.values()].some((fs) => fs.status === "running" && fs.toolUseId);
-    if (!needsFullReplay) {
-      try {
-        const size = statSync(opts.jsonlPath).size;
-        if (size > REPLAY_WINDOW_BYTES) mainOffset = size - REPLAY_WINDOW_BYTES;
-      } catch { /* no main JSONL yet — offset 0 is already right */ }
+  function applyReplayWindowClamp(): void {
+    if (WORKFLOWS_ENABLED) {
+      const needsFullReplay = [...files.values()].some((fs) => fs.status === "running" && fs.toolUseId);
+      if (!needsFullReplay) {
+        try {
+          const size = statSync(opts.jsonlPath).size;
+          if (size > REPLAY_WINDOW_BYTES) mainOffset = size - REPLAY_WINDOW_BYTES;
+        } catch { /* no main JSONL yet — offset 0 is already right */ }
+      }
     }
+  }
+
+  /** The seed as a cooperative job over a `listForTask` snapshot taken on the
+   *  first step. Idempotent: a row already present in any map is skipped, so a
+   *  re-run (or a row something else rehydrated first) never double-registers.
+   *  Runs the replay-window clamp when the last row is done (also after a
+   *  logged failure, as the old inline sequence did). */
+  function createSeedJob(): CoopJob {
+    let rows: Subagent[] | null = null;
+    let idx = 0;
+    let finished = false;
+    return {
+      step(deadlineMs: number): boolean {
+        if (finished) return true;
+        if (detached) { finished = true; return true; }
+        try {
+          if (rows === null) rows = subagentsDb.listForTask(taskId);
+          while (idx < rows.length) {
+            const row = rows[idx++]!;
+            if (!files.has(row.id) && !workflows.has(row.id) && !bgShells.has(row.id) && !monitors.has(row.id)) {
+              seedRow(row);
+            }
+            if (idx < rows.length && performance.now() >= deadlineMs) return false;
+          }
+        } catch (e) {
+          // degrade gracefully — a bad rehydration row must not crash reattach —
+          // but still log so a silently-empty subagent list is diagnosable.
+          console.error(`[claude-subagents] rehydration failed for task ${taskId}:`, e);
+        }
+        finished = true;
+        applyReplayWindowClamp();
+        return true;
+      },
+    };
   }
 
   function emitLifecycle(fs: FileState, phase: "started" | "finished"): void {
@@ -3634,44 +3768,79 @@ export function attachSubagentWatcher(opts: {
    * survives only with both `AGETOR_TRACK_WORKFLOWS=0` and
    * `AGETOR_TRACK_BG_SHELLS=0`.
    */
-  function scanMainSignals(): void {
+  /** Cursor over one main-JSONL batch, so the line loop can be sliced. */
+  interface MainScan {
+    lines: string[];
+    idx: number;
+    /** Built once per batch and shared across its lines (see
+     *  `scanLineForToolResult`'s fix-6 note). */
+    pending: FileState[];
+  }
+
+  /** The read half of `scanMainSignals`: bail when there is nothing of any
+   *  tracked kind to look for, else read the bytes appended since `mainOffset`
+   *  (one `readSync`; a 29 MB transcript measured 78 ms), advance the cursor
+   *  and split into lines. `null` = nothing to scan. */
+  function beginMainScan(): MainScan | null {
     const pending = [...files.values()].filter((fs) => fs.status === "running" && fs.toolUseId);
-    if (pending.length === 0 && !WORKFLOWS_ENABLED && !BG_SHELLS_ENABLED && !MONITORS_ENABLED) return;
+    if (pending.length === 0 && !WORKFLOWS_ENABLED && !BG_SHELLS_ENABLED && !MONITORS_ENABLED) return null;
 
     const { text, next } = readAppendedSync(opts.jsonlPath, mainOffset);
-    if (!text) return;
+    if (!text) return null;
     const lines = text.split("\n");
     const tail = lines.pop() ?? ""; // partial trailing line — re-read next tick
     mainOffset = next - Buffer.byteLength(tail, "utf8");
+    return { lines, idx: 0, pending };
+  }
 
-    for (const line of lines) {
-      if (!line) continue;
-      if (pending.length > 0) scanLineForToolResult(line, pending);
-      if (WORKFLOWS_ENABLED) {
-        // Launch before completion: on a replay-from-0 both lines are in this
-        // same batch, and in file order the launch always precedes its
-        // notification — so a workflow that started and finished while agetor
-        // was down is registered and then settled within one pass, never left
-        // holding the card. Same ordering argument applies to the bg-shell
-        // and monitor pairs below.
-        scanLineForWorkflowLaunch(line);
-      }
-      if (BG_SHELLS_ENABLED) {
-        scanLineForBgShellLaunch(line);
-        scanLineForBgShellStub(line);
-      }
-      if (MONITORS_ENABLED) {
-        scanLineForMonitorLaunch(line);
-        scanLineForMonitorStub(line);
-      }
-      if (
-        WORKFLOWS_ENABLED ||
-        (BG_SHELLS_ENABLED && bgShells.size > 0) ||
-        (MONITORS_ENABLED && monitors.size > 0)
-      ) {
-        scanLineForTaskNotification(line);
+  /** The line-loop half of `scanMainSignals`, resumable: processes lines in
+   *  order until the deadline (checked every `MAIN_SCAN_LINES_PER_CHECK`
+   *  lines) and returns `true` when the batch is exhausted. */
+  function stepMainScan(scan: MainScan, deadlineMs: number): boolean {
+    const { lines, pending } = scan;
+    while (scan.idx < lines.length) {
+      const line = lines[scan.idx++]!;
+      if (line) scanMainLine(line, pending);
+      if (scan.idx % MAIN_SCAN_LINES_PER_CHECK === 0 && scan.idx < lines.length && performance.now() >= deadlineMs) {
+        return false;
       }
     }
+    return true;
+  }
+
+  function scanMainLine(line: string, pending: FileState[]): void {
+    if (pending.length > 0) scanLineForToolResult(line, pending);
+    if (WORKFLOWS_ENABLED) {
+      // Launch before completion: on a replay-from-0 both lines are in this
+      // same batch, and in file order the launch always precedes its
+      // notification — so a workflow that started and finished while agetor
+      // was down is registered and then settled within one pass, never left
+      // holding the card. Same ordering argument applies to the bg-shell
+      // and monitor pairs below.
+      scanLineForWorkflowLaunch(line);
+    }
+    if (BG_SHELLS_ENABLED) {
+      scanLineForBgShellLaunch(line);
+      scanLineForBgShellStub(line);
+    }
+    if (MONITORS_ENABLED) {
+      scanLineForMonitorLaunch(line);
+      scanLineForMonitorStub(line);
+    }
+    if (
+      WORKFLOWS_ENABLED ||
+      (BG_SHELLS_ENABLED && bgShells.size > 0) ||
+      (MONITORS_ENABLED && monitors.size > 0)
+    ) {
+      scanLineForTaskNotification(line);
+    }
+  }
+
+  /** Synchronous whole-batch scan (steady-state cycles). The first cycle uses
+   *  `beginMainScan` + `stepMainScan` directly so it can yield mid-batch. */
+  function scanMainSignals(): void {
+    const scan = beginMainScan();
+    if (scan) stepMainScan(scan, Infinity);
   }
 
   function armDirWatcher(): void {
@@ -3682,6 +3851,13 @@ export function attachSubagentWatcher(opts: {
         // Any dir-watcher event is a life signal for the deep-idle tier,
         // independent of whether it turns out to be a new subagent file.
         lastChangeAt = Date.now();
+        // The watcher is armed by the first cycle's head, which is still
+        // replaying every transcript cooperatively. Tailing all files here
+        // would be one big synchronous block (and race the job's per-file
+        // pass); skip — the first cycle drains every file, and later cycles'
+        // `discover()` + never-read/settled-growth backstops pick up anything
+        // this notification announced.
+        if (!firstCycleDone) return;
         try {
           discover();
           discoverWorkflowAgents();
@@ -3691,66 +3867,127 @@ export function attachSubagentWatcher(opts: {
     } catch { /* fs.watch unsupported on this FS — the poll backstop covers it */ }
   }
 
-  /** One discover → tail → done-check pass, with no scheduling side effects. */
-  function cycle(now: number): void {
-    if (detached) return;
-    try {
-      armDirWatcher();
-      discover();
-      discoverWorkflowAgents();
-      // Steady-state: only re-stat/re-read `running` files (plus a couple of
-      // narrow exceptions below). Completed ones keep no per-tick cost beyond
-      // fix 3's cheap `statSync` backstop; a resume also re-opens them via the
-      // dir watcher's append notification (see `armDirWatcher`, which tails
-      // ALL files) where available. The first cycle is the exception — it
-      // tails everything to drain a reattach backlog — as is a settled
-      // workflow agent whose workflow is still live (`tailPastSettle`), which
-      // the non-recursive dir watcher cannot cover.
-      const tailAll = firstCycle;
-      firstCycle = false;
-      for (const fs of files.values()) {
-        // Fix 2 — `fs.offset === 0` drains a row that has NEVER been read,
-        // even though it isn't `running` — the born-settled (W7) case: its
-        // content sits below `replayFloor` (fix 1), so draining it here can
-        // never flip it back, but without this it would never be tailed at
-        // all (steady-state only re-tails `running` rows) and its transcript
-        // tab would render permanently empty.
-        if (tailAll || fs.status === "running" || tailPastSettle(fs) || fs.offset === 0) {
-          tailFile(fs);
-          continue;
-        }
-        // Fix 3 — poll backstop for post-settle resume detection. Before
-        // this, a settled regular row's later growth was only ever seen via
-        // the `fs.watch` dir watcher (steady-state polling above only
-        // re-tails `running`/never-read/`tailPastSettle` rows), which makes
-        // resume detection watcher-only: non-deterministic under manual
-        // `pump()`-driven tests, and silently unavailable on filesystems
-        // where `fs.watch` isn't supported (the dir watcher's own `armDirWatcher`
-        // already tolerates that — "the poll backstop covers it" — but until
-        // now there wasn't one for this specific case). A `statSync` per
-        // non-running row is microsecond-cheap, so doing it every cycle for
-        // every settled row is not a meaningful cost even on a task with many
-        // subagents. Guarded: a file that vanished (or is momentarily
-        // unreadable) is skipped, not treated as an error — the dir watcher
-        // or a later tick picks it up if it reappears.
+  /** One discover → tail → done-check cycle as a resumable job. Phases, in
+   *  the exact order of the old synchronous `cycle()`:
+   *   0. head — `armDirWatcher`, `discover`, `discoverWorkflowAgents`
+   *   1. files — tail each known file (per-file granularity: the worst file of
+   *      the largest measured task took 32 ms)
+   *   2. journals + bg shells
+   *   3. main-JSONL signal scan (sliced by line)
+   *   4. `checkDone` / `checkStale` / ceilings, stamped with `nowFn()`
+   *  `tailAll` marks the FIRST cycle, which tails every file (even completed
+   *  ones) to drain a reattach backlog. A throw anywhere abandons the rest of
+   *  the cycle — the old `cycle()`'s "swallow — never crash the timer" — and a
+   *  `detach()` between slices abandons it too. The files phase walks the live
+   *  `files.values()` iterator (like the old `for...of`), so a row added during
+   *  the walk is visited and a deleted one skipped. */
+  function createCycleJob(tailAll: boolean, nowFn: () => number): CoopJob {
+    let phase = 0;
+    let fileIter: IterableIterator<FileState> | null = null;
+    let mainScan: MainScan | null = null;
+    let mainScanBegun = false;
+    return {
+      step(deadlineMs: number): boolean {
+        if (phase >= 5) return true;
+        if (detached) { phase = 5; return true; }
         try {
-          if (statSync(fs.sourcePath).size > fs.offset) tailFile(fs);
-        } catch { /* file gone/unreadable this tick — try again next cycle */ }
-      }
-      tailJournals();
-      if (BG_SHELLS_ENABLED) tailBgShells();
-      scanMainSignals();
-      checkDone(now);
-      checkStale(now);
-      if (BG_SHELLS_ENABLED) checkBgShellCeiling(now);
-      if (MONITORS_ENABLED) checkMonitorCeiling(now);
-    } catch { /* swallow — never crash the timer */ }
+          if (phase === 0) {
+            armDirWatcher();
+            discover();
+            discoverWorkflowAgents();
+            fileIter = files.values();
+            phase = 1;
+          }
+          if (phase === 1) {
+            // Steady-state: only re-stat/re-read `running` files (plus a couple of
+            // narrow exceptions below). Completed ones keep no per-tick cost beyond
+            // fix 3's cheap `statSync` backstop; a resume also re-opens them via the
+            // dir watcher's append notification (see `armDirWatcher`, which tails
+            // ALL files) where available. The first cycle is the exception — it
+            // tails everything to drain a reattach backlog — as is a settled
+            // workflow agent whose workflow is still live (`tailPastSettle`), which
+            // the non-recursive dir watcher cannot cover.
+            for (;;) {
+              const nx = fileIter!.next();
+              if (nx.done) { phase = 2; break; }
+              const fs = nx.value;
+              // Fix 2 — `fs.offset === 0` drains a row that has NEVER been read,
+              // even though it isn't `running` — the born-settled (W7) case: its
+              // content sits below `replayFloor` (fix 1), so draining it here can
+              // never flip it back, but without this it would never be tailed at
+              // all (steady-state only re-tails `running` rows) and its transcript
+              // tab would render permanently empty.
+              if (tailAll || fs.status === "running" || tailPastSettle(fs) || fs.offset === 0) {
+                tailFile(fs);
+              } else {
+                // Fix 3 — poll backstop for post-settle resume detection. Before
+                // this, a settled regular row's later growth was only ever seen via
+                // the `fs.watch` dir watcher (steady-state polling above only
+                // re-tails `running`/never-read/`tailPastSettle` rows), which makes
+                // resume detection watcher-only: non-deterministic under manual
+                // `pump()`-driven tests, and silently unavailable on filesystems
+                // where `fs.watch` isn't supported (the dir watcher's own `armDirWatcher`
+                // already tolerates that — "the poll backstop covers it" — but until
+                // now there wasn't one for this specific case). A `statSync` per
+                // non-running row is microsecond-cheap, so doing it every cycle for
+                // every settled row is not a meaningful cost even on a task with many
+                // subagents. Guarded: a file that vanished (or is momentarily
+                // unreadable) is skipped, not treated as an error — the dir watcher
+                // or a later tick picks it up if it reappears.
+                try {
+                  if (statSync(fs.sourcePath).size > fs.offset) tailFile(fs);
+                } catch { /* file gone/unreadable this tick — try again next cycle */ }
+              }
+              if (performance.now() >= deadlineMs) return false;
+            }
+          }
+          if (phase === 2) {
+            tailJournals();
+            if (BG_SHELLS_ENABLED) tailBgShells();
+            phase = 3;
+            if (performance.now() >= deadlineMs) return false;
+          }
+          if (phase === 3) {
+            if (!mainScanBegun) {
+              mainScanBegun = true;
+              mainScan = beginMainScan();
+            }
+            if (mainScan && !stepMainScan(mainScan, deadlineMs)) return false;
+            phase = 4;
+            if (performance.now() >= deadlineMs) return false;
+          }
+          if (phase === 4) {
+            const now = nowFn();
+            checkDone(now);
+            checkStale(now);
+            if (BG_SHELLS_ENABLED) checkBgShellCeiling(now);
+            if (MONITORS_ENABLED) checkMonitorCeiling(now);
+            phase = 5;
+          }
+        } catch { phase = 5; /* swallow — never crash the timer */ }
+        return phase >= 5;
+      },
+    };
+  }
+
+  /** One discover → tail → done-check pass, with no scheduling side effects.
+   *  A no-op while the seed / first cycle is still pending: those own the
+   *  watcher's state until they finish (see the cooperative-jobs comment). */
+  function cycle(now: number): void {
+    if (detached || !seedDone || !firstCycleDone) return;
+    createCycleJob(false, () => now).step(Infinity);
   }
 
   function tick(): void {
     if (detached) return;
     const now = Date.now();
     cycle(now);
+    scheduleNext(now);
+  }
+
+  /** Arm the next steady-state tick: fast while anything is running, deep-idle
+   *  once nothing was ever discovered, else slow. */
+  function scheduleNext(now: number): void {
     // A live workflow CONTAINER counts as "running" for cadence purposes even
     // when no agent file is open right now: between waves it is the only thing
     // holding the card, and the next wave's files should be picked up on the
@@ -3777,17 +4014,94 @@ export function attachSubagentWatcher(opts: {
     timer = setTimeout(tick, delay);
   }
 
-  // Kick off on the next tick (give the spawn path a beat to settle). Tests
-  // pass `manual` and drive `pump()` themselves.
-  if (!opts.manual) timer = setTimeout(tick, FAST_POLL_MS);
+  // ── Job state + driver ───────────────────────────────────────────────────
+  let seedDone = false;
+  let firstCycleDone = false;
+  let delayResolve: (() => void) | null = null;
+  let resolveReady!: () => void;
+  let resolveSettled!: () => void;
+  const ready = new Promise<void>((resolve) => { resolveReady = resolve; });
+  const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+
+  /** The run a stall during the cooperative seed / first pass is attributed to
+   *  (`beginLagLabel` context): the caller's, else the task's current run. */
+  function lagContext(): { taskId: string; runId?: string } {
+    let runId = opts.runId;
+    if (!runId) {
+      try { runId = tasks.get(taskId)?.runId ?? undefined; } catch { /* attribution is best-effort */ }
+    }
+    return runId ? { taskId, runId } : { taskId };
+  }
+
+  /** Step `job` in `JOB_SLICE_MS` slices, yielding to the loop between them,
+   *  until it finishes or the watcher is detached. The lag label is held for the
+   *  whole job (including the yields) on purpose: the monitor's sampler fires on
+   *  a later loop turn than the slice that stalled it, so a label disposed
+   *  before each yield would already be gone when the stall is reported and it
+   *  would read "idle". The price — a stall from unrelated code landing inside
+   *  a yield is also attributed here — is mild next to an unattributable one,
+   *  and the label names an operation that genuinely is in flight. */
+  async function runJob(job: CoopJob): Promise<void> {
+    const endLag = beginLagLabel(`attach subagent watcher · task ${taskId}`, lagContext());
+    try {
+      while (!detached && !job.step(performance.now() + JOB_SLICE_MS)) await yieldToLoop();
+    } finally {
+      endLag();
+    }
+  }
+
+  /** Production driver: seed → `ready` → `FAST_POLL_MS` beat → first cycle →
+   *  `settled` → steady-state ticks. The first slice of the seed runs
+   *  synchronously inside attach (the call is made after the handle is
+   *  registered), so a small task is fully seeded before attach returns. Never
+   *  rejects; always resolves both promises on the way out. */
+  async function runProduction(): Promise<void> {
+    try {
+      await runJob(createSeedJob());
+      if (detached) return;
+      seedDone = true;
+      resolveReady();
+      // Give the spawn path a beat to settle before the first (heavy) cycle —
+      // the same pause the first tick always had. Cleared by `detach()`.
+      await new Promise<void>((resolve) => {
+        delayResolve = resolve;
+        timer = setTimeout(() => { timer = null; delayResolve = null; resolve(); }, FAST_POLL_MS);
+      });
+      if (detached) return;
+      await runJob(createCycleJob(true, Date.now));
+      if (detached) return;
+      firstCycleDone = true;
+      resolveSettled();
+      scheduleNext(Date.now());
+    } catch (e) {
+      console.error(`[claude-subagents] cooperative start-up failed for task ${taskId}:`, e);
+      // Never leave the watcher un-armed: fall through to steady-state polling.
+      if (!detached && !firstCycleDone) {
+        seedDone = true;
+        firstCycleDone = true;
+        scheduleNext(Date.now());
+      }
+    } finally {
+      resolveReady();
+      resolveSettled();
+    }
+  }
 
   const handle: SubagentWatcherHandle = {
+    ready,
+    settled,
     detach(): void {
       detached = true;
       if (timer) clearTimeout(timer);
       timer = null;
       dirWatcher?.close();
       dirWatcher = null;
+      // Abort a job paused between slices / the pre-first-cycle beat, and
+      // release anyone awaiting `ready` / `settled`.
+      delayResolve?.();
+      delayResolve = null;
+      resolveReady();
+      resolveSettled();
       // Only remove ourselves if we're still the registered handle — a newer
       // attach for this taskId may already have replaced (and detached) us,
       // and deleting unconditionally would drop that newer entry instead.
@@ -3797,7 +4111,21 @@ export function attachSubagentWatcher(opts: {
       // the tmux server.
     },
     pump(now?: number): void {
-      cycle(now ?? Date.now());
+      if (detached) return;
+      const t = now ?? Date.now();
+      if (opts.manual) {
+        // Tests: the seed already ran inside attach; the first pump IS the old
+        // first cycle (drained in one synchronous step, same phases, same order).
+        if (!firstCycleDone) {
+          createCycleJob(true, () => t).step(Infinity);
+          firstCycleDone = true;
+          resolveSettled();
+          return;
+        }
+      }
+      // Production: `cycle` itself is a no-op while the seed / first cycle is
+      // pending (see the handle's `pump` doc).
+      cycle(t);
     },
     syncSettled(id: string, status: SubagentStatus, endedAt: number, source?: "receipt" | "inferred"): void {
       const fs = files.get(id);
@@ -3868,6 +4196,14 @@ export function attachSubagentWatcher(opts: {
     },
   };
   watchers.set(taskId, handle);
+  if (opts.manual) {
+    // Tests: seed synchronously, exactly where the old inline loop ran.
+    createSeedJob().step(Infinity);
+    seedDone = true;
+    resolveReady();
+  } else {
+    void runProduction();
+  }
   return handle;
 }
 

@@ -1219,6 +1219,22 @@ export const tasks = {
     }
     return out;
   },
+  /**
+   * Tasks archived at or before `cutoffMs` (ms epoch, the unit of
+   * `archived_at`), oldest archive first — the archived-history retention
+   * pass's candidate list (docs/plans/non-blocking-session-restore.md, T8).
+   * Un-archived tasks (`archived_at IS NULL`) never match. Ids and archive
+   * times only: the pass walks each task's runs itself and must not
+   * materialize full `Task` rows (with their JSON columns) for a table that
+   * can hold thousands of archived tasks.
+   */
+  archivedBefore(cutoffMs: number): Array<{ id: string; archivedAt: number }> {
+    return db.query<{ id: string; archived_at: number }, [number]>(
+      `SELECT id, archived_at FROM tasks
+       WHERE archived_at IS NOT NULL AND archived_at <= ?
+       ORDER BY archived_at ASC`,
+    ).all(cutoffMs).map((r) => ({ id: r.id, archivedAt: r.archived_at }));
+  },
 };
 
 /**
@@ -2357,6 +2373,16 @@ const toRun = (r: RunRow): Run => ({
   origin: (r.origin as Run["origin"]) ?? null,
 });
 
+/**
+ * The retention trim's candidate query (see `runs.toolResultRowsForTrim`).
+ * Exported so the `EXPLAIN QUERY PLAN` guard test can assert it SEARCHes
+ * `idx_run_events_run` with no temp b-tree sort.
+ */
+export const TOOL_RESULT_TRIM_SQL = `SELECT id, data FROM run_events
+  WHERE run_id = ? AND stream = 'tool_result' AND LENGTH(CAST(data AS BLOB)) > ?
+    AND substr(data, 1, 13) != '{"retention":' AND id > ?
+  ORDER BY id LIMIT ?`;
+
 export const runs = {
   listForTask(taskId: string): Run[] {
     return db.query<RunRow, [string]>(
@@ -2444,10 +2470,19 @@ export const runs = {
    *  `createPlanToolCall`?" check. That used to be a full `runs.events(runId)`
    *  scan keeping only the last `tool_use` row — correct, but O(run length)
    *  on every settlement of every cursor run, even long ones with no plan at
-   *  all. This is the same lookup expressed as a targeted, indexed query. */
+   *  all. This is the same lookup expressed as a targeted, indexed query.
+   *
+   *  `INDEXED BY idx_run_events_run` is load-bearing: without it the planner
+   *  prefers the partial `idx_run_events_user_history (stream, id DESC)` (it
+   *  satisfies `stream = 'tool_use'`, `subagent_id IS NULL` AND the
+   *  `ORDER BY id DESC`) and walks EVERY run's `tool_use` rows newest-first
+   *  until one belongs to `run_id` — a near-full scan of the table's biggest
+   *  stream for an old run. Forcing the `(run_id, id)` index bounds the walk
+   *  to this run's rows. */
   lastToolUseData(runId: string): string | null {
     const row = db.query<{ data: string }, [string]>(
-      `SELECT data FROM run_events WHERE run_id = ? AND stream = 'tool_use' AND subagent_id IS NULL ORDER BY id DESC LIMIT 1`,
+      `SELECT data FROM run_events INDEXED BY idx_run_events_run
+       WHERE run_id = ? AND stream = 'tool_use' AND subagent_id IS NULL ORDER BY id DESC LIMIT 1`,
     ).get(runId);
     return row ? row.data : null;
   },
@@ -2884,13 +2919,33 @@ export const runs = {
   /** Line uuids already persisted for a single subagent's stream. Seeds the
    *  subagent tailer's in-memory dedup set on reattach so re-reading
    *  `agent-<id>.jsonl` from offset 0 doesn't double-insert/emit events the
-   *  previous process already streamed. Scoped by subagent_id (independent of
-   *  run_id), mirroring `seenLineUuidsForTask` for the main stream. */
-  seenLineUuidsForSubagent(subagentId: string): Set<string> {
-    const rows = db.query<{ line_uuid: string }, [string]>(
-      `SELECT line_uuid FROM run_events
-       WHERE subagent_id = ? AND line_uuid IS NOT NULL`,
-    ).all(subagentId);
+   *  previous process already streamed.
+   *
+   *  TASK-SCOPED, and spelled to hit one specific index: the only index that
+   *  mentions `subagent_id` is the partial unique
+   *  `run_events_run_sub_line_uuid (run_id, IFNULL(subagent_id, ''), line_uuid)
+   *  WHERE line_uuid IS NOT NULL` (migrations/022_subagents.sql). A bare
+   *  `WHERE subagent_id = ?` cannot use it (the leading column is `run_id`),
+   *  so the old query was `SCAN run_events USING INDEX …` — a full pass over
+   *  a multi-GB table per subagent (~1.1 s each on a 4.5 GB DB, ~105 s for a
+   *  96-subagent task, all on the Bun main thread). Joining through `runs` by
+   *  `task_id` supplies the leading `run_id` equality, and
+   *  `IFNULL(e.subagent_id, '') = ?` matches the index EXPRESSION exactly (the
+   *  spelling is load-bearing: `e.subagent_id = ?` would not match the
+   *  expression and falls back to a scan). SQLite then does a covering SEARCH
+   *  per run of the task — `line_uuid` is in the index, so no table lookup.
+   *
+   *  Task scoping is a strict superset of run scoping: every subagent's events
+   *  are written under its own task's runs (and `subagents.id` is a global
+   *  primary key), so no event for `subagentId` can live under another task's
+   *  runs. Pinned by the `EXPLAIN QUERY PLAN` guard test over every
+   *  `run_events` query. */
+  seenLineUuidsForSubagent(taskId: string, subagentId: string): Set<string> {
+    const rows = db.query<{ line_uuid: string }, [string, string]>(
+      `SELECT e.line_uuid
+       FROM runs r JOIN run_events e ON e.run_id = r.id
+       WHERE r.task_id = ? AND IFNULL(e.subagent_id, '') = ? AND e.line_uuid IS NOT NULL`,
+    ).all(taskId, subagentId);
     return new Set(rows.map((r) => r.line_uuid));
   },
   /** Whether ANY persisted event for `subagentId` carries a `line_uuid`
@@ -2899,14 +2954,88 @@ export const runs = {
    *  receipt on record), cheaper than materialising every uuid via
    *  `seenLineUuidsForSubagent` just to scan a chatty stream for one prefix.
    *  Compared with `substr` rather than `LIKE` so a `%`/`_` in the prefix
-   *  can't widen the match. */
-  hasLineUuidPrefixForSubagent(subagentId: string, prefix: string): boolean {
-    const row = db.query<{ one: number }, [string, string, string]>(
-      `SELECT 1 as one FROM run_events
-       WHERE subagent_id = ? AND line_uuid IS NOT NULL AND substr(line_uuid, 1, length(?)) = ?
+   *  can't widen the match.
+   *
+   *  Same task-scoped, `IFNULL(e.subagent_id, '')` shape as
+   *  `seenLineUuidsForSubagent` (see there for why both are load-bearing): a
+   *  covering SEARCH of `run_events_run_sub_line_uuid` per run of the task,
+   *  stopping at the first match. */
+  hasLineUuidPrefixForSubagent(taskId: string, subagentId: string, prefix: string): boolean {
+    const row = db.query<{ one: number }, [string, string, string, string]>(
+      `SELECT 1 as one
+       FROM runs r JOIN run_events e ON e.run_id = r.id
+       WHERE r.task_id = ? AND IFNULL(e.subagent_id, '') = ? AND e.line_uuid IS NOT NULL
+         AND substr(e.line_uuid, 1, length(?)) = ?
        LIMIT 1`,
-    ).get(subagentId, prefix, prefix);
+    ).get(taskId, subagentId, prefix, prefix);
     return row !== null;
+  },
+  /** Whether a run already has a persisted MAIN-stream api-error status line
+   *  (`status` event whose data starts with `prefix`, i.e.
+   *  `CLAUDE_API_ERROR_STATUS_PREFIX`). Lifted verbatim from the boot
+   *  reattach path in the orchestrator, which pre-seeds `handle.apiError` from
+   *  it: the reattach replay can't re-emit the status (its assistant-line uuid
+   *  is already in the seen set), so without the seed `attachDoneHandler`
+   *  would bounce a `blocked` column back to `review`.
+   *
+   *  `subagent_id IS NULL`: a subagent tailer's own transient api-error status
+   *  row (since #81) must not seed the main run's flag. Run-scoped, so it
+   *  walks `idx_run_events_run (run_id, id)`; `EXISTS` short-circuits on the
+   *  first match. `prefix` is matched with `LIKE prefix%` exactly as before
+   *  (the callers pass a fixed constant with no wildcard characters).
+   *
+   *  `INDEXED BY idx_run_events_run` for the same reason as `lastToolUseData`:
+   *  with no `sqlite_stat1` the planner otherwise picks the partial
+   *  `idx_run_events_user_history (stream=?)` and walks every `status` event
+   *  in the database (with a table lookup each, `run_id` not being in that
+   *  index) whenever the run has no api-error line — the common case. */
+  hasPriorApiErrorStatus(runId: string, prefix: string): boolean {
+    const row = db.query<{ found: 0 | 1 }, [string, string]>(
+      `SELECT EXISTS(
+         SELECT 1 FROM run_events INDEXED BY idx_run_events_run
+         WHERE run_id = ? AND stream = 'status' AND data LIKE ? AND subagent_id IS NULL
+       ) AS found`,
+    ).get(runId, `${prefix}%`);
+    return (row?.found ?? 0) === 1;
+  },
+  /** One keyset page of a run's `tool_result` rows that archived-history
+   *  retention may trim: payload over `minBytes` (UTF-8 bytes — `LENGTH` of a
+   *  BLOB cast, since `LENGTH(text)` counts characters), not already carrying
+   *  the retention marker, `id > afterId`, ascending, at most `limit` rows.
+   *
+   *  The marker prefilter is a SQL `substr` on the first 13 bytes
+   *  (`{"retention":`) rather than a JSON parse: a trimmed row re-serializes
+   *  with the `retention` key FIRST (see `trimToolResultData`), so already
+   *  trimmed rows are skipped without being read, which makes the pass
+   *  idempotent and crash-resumable. The query walks `idx_run_events_run
+   *  (run_id, id)` in id order — `id > ?` is a range on the index's second
+   *  column and `ORDER BY id` is satisfied by it, so there is no temp b-tree
+   *  sort (pinned by `TOOL_RESULT_TRIM_SQL`'s plan-guard test). */
+  toolResultRowsForTrim(
+    runId: string,
+    minBytes: number,
+    afterId: number,
+    limit: number,
+  ): Array<{ id: number; data: string }> {
+    return db.query<{ id: number; data: string }, [string, number, number, number]>(
+      TOOL_RESULT_TRIM_SQL,
+    ).all(runId, minBytes, afterId, limit);
+  },
+  /** Replace ONE event's `data` payload in place — the retention trim's write.
+   *  A targeted UPDATE of `data` only: `id`, `stream`, `ts`, `line_uuid` and
+   *  `subagent_id` stay untouched, so the `(run_id, IFNULL(subagent_id,''),
+   *  line_uuid)` dedup index still recognises the row and an unarchive +
+   *  resume never re-imports what was trimmed. */
+  replaceEventData(id: number, data: string): void {
+    db.query(`UPDATE run_events SET data = ? WHERE id = ?`).run(data, id);
+  },
+  /** Ids of every run belonging to a task (any status), oldest first.
+   *  Retention walks a task's `run_events` per run (the `idx_run_events_run`
+   *  prefix) rather than by task so each keyset page stays index-ordered. */
+  runIdsForTask(taskId: string): string[] {
+    return db.query<{ id: string }, [string]>(
+      `SELECT id FROM runs WHERE task_id = ? ORDER BY started_at ASC, id ASC`,
+    ).all(taskId).map((r) => r.id);
   },
 };
 

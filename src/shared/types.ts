@@ -2166,6 +2166,140 @@ export const FX_AUTO_RESUME_MAX_DELAY_SEC = 3600;
  *  resume manually. */
 export const FX_AUTO_RESUME_MAX = 3;
 
+/**
+ * Preference key for archived-history retention
+ * (`docs/plans/non-blocking-session-restore.md`, decision F/G): the age, in
+ * whole days, after which a task archived that long ago has its bulky
+ * `tool_result` payloads trimmed in place (see
+ * {@link RETENTION_TRIM_BYTES} and `src/shared/tool-result-trim.ts`).
+ * The stored value is `"off"` ({@link ARCHIVED_HISTORY_RETENTION_OFF}) or an
+ * integer string in `[1, ARCHIVED_HISTORY_RETENTION_MAX_DAYS]`; missing or
+ * unparsable means {@link ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS}. Read via
+ * {@link parseArchivedHistoryRetentionDays}; edited in Settings → General and
+ * via `agetor config`.
+ */
+export const ARCHIVED_HISTORY_RETENTION_PREF = "archivedHistoryRetentionDays";
+
+/** Default retention age, in days, when {@link ARCHIVED_HISTORY_RETENTION_PREF}
+ *  is unset or unparsable. */
+export const ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS = 30;
+
+/** The {@link ARCHIVED_HISTORY_RETENTION_PREF} value that disables trimming. */
+export const ARCHIVED_HISTORY_RETENTION_OFF = "off";
+
+/** Upper bound (inclusive) on {@link ARCHIVED_HISTORY_RETENTION_PREF}, ten
+ *  years — anything larger is indistinguishable from "never" and is treated as
+ *  unparsable (so it falls back to the default rather than silently trimming
+ *  nothing). */
+export const ARCHIVED_HISTORY_RETENTION_MAX_DAYS = 3650;
+
+/**
+ * Parse the raw {@link ARCHIVED_HISTORY_RETENTION_PREF} value into a day count,
+ * or `null` when trimming is turned off. `"off"` (case-insensitive, trimmed)
+ * → `null`; a plain integer string in `[1, ARCHIVED_HISTORY_RETENTION_MAX_DAYS]`
+ * → that number; everything else — missing, empty, `"0"`, negative, fractional,
+ * exponent notation, out of range, garbage — → the default
+ * ({@link ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS}). Strict on purpose: a typo
+ * in `agetor config` must not turn the destructive trim into something other
+ * than what the owner can read back.
+ */
+export function parseArchivedHistoryRetentionDays(value: string | null | undefined): number | null {
+  if (value == null) return ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS;
+  const trimmed = value.trim();
+  if (trimmed.toLowerCase() === ARCHIVED_HISTORY_RETENTION_OFF) return null;
+  if (/^\d+$/.test(trimmed)) {
+    const n = Number(trimmed);
+    if (n >= 1 && n <= ARCHIVED_HISTORY_RETENTION_MAX_DAYS) return n;
+  }
+  return ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS;
+}
+
+/** A `tool_result` payload larger than this many UTF-8 bytes is a retention
+ *  trim candidate, and a trimmed payload's `content` is cut to this budget. */
+export const RETENTION_TRIM_BYTES = 4096;
+
+/**
+ * Seconds of main-thread block per GB of live data (`(page_count −
+ * freelist_count) × page_size`) that `VACUUM` is expected to cost — the
+ * constant behind the "Compact database" estimate. Measured on a 4.2 GB
+ * database (`VACUUM INTO` ≈ 7.3 s/GB, `docs/plans/non-blocking-session-restore.md`
+ * §2.6); re-calibrated against the production copy in that plan's §10.
+ */
+export const DB_COMPACT_SEC_PER_GB = 7.5;
+
+/**
+ * Marker `trimToolResultData` writes as the FIRST key of a trimmed
+ * `tool_result` payload (`{"retention":{...},"toolUseId":…,"content":…}`). Its
+ * being first is what lets the retention SQL skip already-trimmed rows with a
+ * `substr(data, 1, 13) != '{"retention":'` prefilter instead of parsing them,
+ * and lets the renderers show {@link retentionTrimNote} without guessing.
+ */
+export interface ToolResultRetention {
+  trimmed: true;
+  /** UTF-8 byte length of the payload before it was trimmed. */
+  originalBytes: number;
+  /** Unix ms timestamp of the trim. */
+  trimmedAt: number;
+}
+
+/** Local byte formatter for {@link retentionTrimNote}: `B` below 1 KB, then one
+ *  decimal for KB/MB/GB (binary multiples, matching how the DB sizes are shown). */
+function formatRetentionBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ["KB", "MB", "GB"] as const;
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
+
+/** The muted one-liner every surface (RunPanel, `agetor logs`, the TUI) shows
+ *  for a retention-trimmed `tool_result`, e.g.
+ *  `trimmed by retention (original 1.2 MB)`. */
+export function retentionTrimNote(r: ToolResultRetention): string {
+  return `trimmed by retention (original ${formatRetentionBytes(r.originalBytes)})`;
+}
+
+/**
+ * `GET /db/stats` response (Settings → General "Archived task history" and
+ * `agetor compact`). Sizes are bytes unless the name says otherwise.
+ */
+export interface DbStats {
+  /** Size of `agetor.sqlite` on disk. */
+  fileBytes: number;
+  /** Size of the `-wal` sidecar (0 when absent). */
+  walBytes: number;
+  /** `PRAGMA page_size`. */
+  pageSize: number;
+  /** `PRAGMA page_count`. */
+  pageCount: number;
+  /** `PRAGMA freelist_count` — pages `VACUUM` could give back. */
+  freelistCount: number;
+  /** `freelistCount × pageSize` — what a Compact would reclaim right now. */
+  reclaimableBytes: number;
+  /** Estimated seconds a Compact blocks the core: live bytes ×
+   *  {@link DB_COMPACT_SEC_PER_GB}. */
+  compactEstimateSec: number;
+  /** Runs in flight (`active` + starting) — Compact is refused while > 0. */
+  activeRunCount: number;
+  retention: {
+    /** Effective retention age in days, `null` when the preference is `off`. */
+    days: number | null;
+    /** Ms epoch the last pass finished, `null` if none has run. */
+    lastRunAt: number | null;
+    /** Bytes the last pass freed (payload bytes, not file size), `null` if none. */
+    lastFreedBytes: number | null;
+    /** Rows the last pass trimmed, `null` if none has run. */
+    lastTrimmedRows: number | null;
+    /** A pass is running right now. */
+    running: boolean;
+  };
+}
+
 export interface AgentOption {
   /** Stored on the task and passed to `buildCommand`. */
   id: string;
@@ -4455,6 +4589,16 @@ export const TASK_EVENTS_REPLAY_META_EVENT = "replay_meta";
  * learns the outcome from the task/run's normal SSE stream instead of from
  * the HTTP response. When the spawn settles inside the budget, the response
  * is byte-identical to today's (no `pending` key at all).
+ *
+ * `POST /runs/:id/input` applies the budget to ALL of `sendInput`'s
+ * pre-dispatch work, not just the spawn (teardown wait, worktree restore,
+ * codex CLI-version floor, `@`-expansion, liveness probe —
+ * `docs/plans/non-blocking-session-restore.md` decision D). Past the budget
+ * the answer is `{ delivered: true, runId, pending: true }`, where `runId` is
+ * the new turn's run when one was already minted, else the run the message
+ * was addressed to (display only — no client dereferences it further). If the
+ * late work then fails, the message is re-stashed in the task's backlog and a
+ * live-only `send-failed` {@link GlobalEvent} tells the webview to toast.
  */
 export const SPAWN_RESPONSE_BUDGET_MS = 1500;
 
@@ -4555,6 +4699,8 @@ export interface SubagentEvent {
  *   run-status — fires once when a run reaches a terminal state.
  *   column     — fires every time a task's column changes; `prev` is the
  *                column the row held immediately before the update.
+ *   send-failed — a message already answered `pending: true` was not
+ *                delivered after all (see `SPAWN_RESPONSE_BUDGET_MS`).
  */
 export type GlobalEvent =
   | {
@@ -4718,6 +4864,31 @@ export type GlobalEvent =
       activeStepIds: string[];
       stepCount: number;
       ts: number;
+    }
+  | {
+      /**
+       * A message `sendInput` had already answered `pending: true` for (it
+       * outlived `SPAWN_RESPONSE_BUDGET_MS`) turned out not to be delivered —
+       * the late worktree restore / teardown wait / spawn failed, or a claude
+       * modal-guard withheld the paste. `savedToBacklog` says the text is
+       * safe in the task's message tray (it always is when the orchestrator
+       * emits this: the late path re-stashes before announcing). Live-only,
+       * like `files-sent`: the HTTP response that carried `pending` is long
+       * gone, so this is the only way the sender learns the outcome, and the
+       * UI turns it into a warning toast. Not gated on the task being the open
+       * panel — no run status line exists for it.
+       */
+      kind: "send-failed";
+      taskId: string;
+      /** Human-readable cause, already phrased for a toast. */
+      reason: string;
+      savedToBacklog: boolean;
+      ts: number;
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive. */
+      pipelineParentId?: string;
+      /** See the `run-status` member. */
+      pipelineParentTitle?: string;
     };
 
 /**
