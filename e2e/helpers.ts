@@ -150,6 +150,81 @@ export function seedHarnessUsage(backend: E2EBackend, quota: HarnessQuota): void
   }
 }
 
+/** Opens a short-lived handle on the backend's SQLite file for an
+ *  arrange-only write — same reasoning (and busy_timeout) as
+ *  `seedHarnessUsage` above. */
+function withBackendDb<T>(backend: E2EBackend, fn: (db: Database) => T): T {
+  const db = new Database(path.join(backend.dataDir, "agetor.sqlite"));
+  try {
+    db.exec("PRAGMA busy_timeout = 5000");
+    return fn(db);
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Arrange-only helper for the archived-history retention e2e
+ * (docs/plans/non-blocking-session-restore.md, TT8): appends a `tool_use` row
+ * and its paired `tool_result` row — `bytes` of text in the result's
+ * `content`, so the persisted payload is a little over `bytes` — to `runId`'s
+ * event stream, straight through `bun:sqlite`. No HTTP route can plant a
+ * bulky `tool_result` (the fake drivers emit tiny ones), and the retention
+ * pass only trims rows above `RETENTION_TRIM_BYTES` (4 KB), so the test needs
+ * a deterministic oversized row. The two rows share `toolUseId`, so RunPanel
+ * pairs them into one collapsed tool card exactly as it does for a real
+ * transcript. Returns the ids so a spec can read the row back.
+ */
+export function seedArchivedToolResult(
+  backend: E2EBackend,
+  opts: { taskId: string; runId: string; bytes: number },
+): { toolUseId: string; toolResultEventId: number } {
+  const toolUseId = `toolu_retention_${opts.taskId.slice(0, 8)}`;
+  const content = "retention-payload-".repeat(Math.ceil(opts.bytes / 18)).slice(0, opts.bytes);
+  const toolUse = JSON.stringify({
+    id: toolUseId,
+    name: "Bash",
+    input: { command: "cat big-output.txt", description: "print a large file" },
+  });
+  const toolResult = JSON.stringify({ toolUseId, content, isError: false });
+  return withBackendDb(backend, (db) => {
+    const now = Date.now();
+    db.run("INSERT INTO run_events (run_id, stream, data, ts) VALUES (?, 'tool_use', ?, ?)", [
+      opts.runId,
+      toolUse,
+      now,
+    ]);
+    const res = db.run("INSERT INTO run_events (run_id, stream, data, ts) VALUES (?, 'tool_result', ?, ?)", [
+      opts.runId,
+      toolResult,
+      now + 1,
+    ]);
+    return { toolUseId, toolResultEventId: Number(res.lastInsertRowid) };
+  });
+}
+
+/** Arrange-only helper: rewrites a task's `archived_at` to `msAgo`
+ *  milliseconds in the past, so the retention pass sees it as archived for
+ *  that long without the spec waiting out a real 30 days. */
+export function backdateArchivedAt(backend: E2EBackend, taskId: string, msAgo: number): void {
+  withBackendDb(backend, (db) => {
+    const res = db.run("UPDATE tasks SET archived_at = ? WHERE id = ? AND archived_at IS NOT NULL", [
+      Date.now() - msAgo,
+      taskId,
+    ]);
+    if (res.changes !== 1) throw new Error(`backdateArchivedAt: task ${taskId} is not archived (changes=${res.changes})`);
+  });
+}
+
+/** Arrange/assert helper: reads a single scalar via the backend's SQLite
+ *  file (read-only use — counts for the restore spec). */
+export function queryBackendScalar(backend: E2EBackend, sql: string, params: (string | number)[] = []): number {
+  return withBackendDb(backend, (db) => {
+    const row = db.query<{ n: number }, (string | number)[]>(sql).get(...params);
+    return row?.n ?? 0;
+  });
+}
+
 /**
  * Waits for a task's terminal pane to be live: `TerminalView`'s pane carries
  * `data-ready="true"` once the PTY has delivered its first output frame over

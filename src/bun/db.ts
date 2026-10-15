@@ -2998,6 +2998,22 @@ export const runs = {
     ).get(runId, `${prefix}%`);
     return (row?.found ?? 0) === 1;
   },
+  /** `data` of the newest main-or-subagent `status` event on `runId` whose
+   *  text starts with `prefix` (e.g. fx's `FX_RECOVERY_STATUS_PREFIX`
+   *  sentinel), or null. Lifted from `orchestrator.ts`'s
+   *  `latestResumableFxPause` so the run_events plan guard covers it; pinned
+   *  to `idx_run_events_run` for the same reason as `hasPriorApiErrorStatus`
+   *  — without `sqlite_stat1` the `stream = ?` term can steer SQLite onto
+   *  `idx_run_events_user_history` and a walk of every status row in the
+   *  database. `LIKE` is used only with a caller-supplied literal prefix. */
+  lastStatusDataWithPrefix(runId: string, prefix: string): string | null {
+    const row = db.query<{ data: string }, [string, string]>(
+      `SELECT data FROM run_events INDEXED BY idx_run_events_run
+       WHERE run_id = ? AND stream = 'status' AND data LIKE ?
+       ORDER BY id DESC LIMIT 1`,
+    ).get(runId, `${prefix}%`);
+    return row?.data ?? null;
+  },
   /** One keyset page of a run's `tool_result` rows that archived-history
    *  retention may trim: payload over `minBytes` (UTF-8 bytes — `LENGTH` of a
    *  BLOB cast, since `LENGTH(text)` counts characters), not already carrying

@@ -3,6 +3,8 @@ import { API_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-c
 import { db, dataDir, subagents } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
+import { startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
+import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -111,6 +113,10 @@ function shutdown(reason: string, code = 0): void {
   // not touch any persisted `fxRecovery` row — `rearmFxAutoResumes()` re-arms
   // them from the DB on the next boot.
   stopFxAutoResumeTimers();
+  // Retention: abort a running pass between chunks and clear its timers; stop
+  // the lag sampler. Trimmed rows stay trimmed, the next boot resumes.
+  stopRetentionTimers();
+  stopLagMonitor();
   try {
     removeCoreCreds(dataDir);
   } catch {
@@ -238,6 +244,18 @@ export async function runDaemon(): Promise<void> {
     );
     process.exit(1);
   }
+
+  // Event-loop lag monitor (docs/plans/non-blocking-session-restore.md, decision
+  // C): one `.unref()`'d sampler that names whatever held the single main thread
+  // for >= 1 s (a labelled `beginLagLabel` span, else a bare "no label" warning).
+  // `sampleMs: 100`, not the 500 ms default: lag is measured as actual - expected
+  // fire time, so a block that starts mid-interval is under-measured by up to
+  // `sampleMs`; at 100 ms a 1.1 s block reliably crosses the 1 s stall bar.
+  startLagMonitor({ sampleMs: 100 });
+  // Archived-history retention: first pass ~90 s after boot (after the API is
+  // up and restore/seed work has settled), then every 24 h; each fire reads the
+  // preference fresh. Also re-armed on demand by `PUT /preferences/...`.
+  scheduleRetention();
 
   writeCoreCreds(
     {

@@ -102,14 +102,22 @@ import { beginLagLabel } from "./event-loop-lag";
 export const RETENTION_SQL: readonly string[] = [TOOL_RESULT_TRIM_SQL];
 
 const DAY_MS = 86_400_000;
-/** Rows fetched per keyset page (upper bound; shrinks for huge rows). */
+/** Rows fetched per keyset page — the upper bound. */
 const CHUNK_ROWS = 200;
+/** Rows in the pass's FIRST page fetch, before any row size is known. */
+const INITIAL_PAGE_ROWS = 8;
 /** A write transaction is flushed once this much input data has been
  *  accumulated (~2 MB of characters). */
 const CHUNK_INPUT_BYTES = 2 * 1024 * 1024;
-/** A fetched page larger than this multiple of {@link CHUNK_INPUT_BYTES}
- *  halves the next page's row limit. */
-const OVERSIZE_PAGE_FACTOR = 4;
+/** Characters a single page fetch aims to materialize. `.all()` reads every
+ *  row of a page in one synchronous call, so the page — not the per-row
+ *  parse — is the biggest indivisible unit of work: measured on the owner's
+ *  4.5 GB copy, a fixed 200-row page of multi-hundred-KB tool results held
+ *  the thread for 130 ms. The next page's row count is sized from the
+ *  average row of the previous one (carried across runs and tasks, since
+ *  archived tool output tends to stay the same size), clamped to
+ *  1..{@link CHUNK_ROWS}. */
+const TARGET_PAGE_CHARS = 2 * 1024 * 1024;
 
 const DEFAULT_BOOT_DELAY_MS = 90_000;
 const DEFAULT_INTERVAL_MS = DAY_MS;
@@ -208,6 +216,7 @@ export async function runArchivedHistoryRetentionPass(opts: {
   try {
     const cutoff = now - days * DAY_MS;
     const candidates = tasks.archivedBefore(cutoff);
+    let pageLimit = INITIAL_PAGE_ROWS;
     taskLoop: for (const candidate of candidates) {
       if (abortRequested) {
         result.aborted = true;
@@ -217,8 +226,8 @@ export async function runArchivedHistoryRetentionPass(opts: {
       for (const runId of runs.runIdsForTask(candidate.id)) {
         result.scannedRuns++;
         let afterId = 0;
-        let limit = CHUNK_ROWS;
         for (;;) {
+          const limit = pageLimit;
           if (abortRequested) {
             result.aborted = true;
             break taskLoop;
@@ -272,14 +281,11 @@ export async function runArchivedHistoryRetentionPass(opts: {
           if (!flush()) continue taskLoop;
           await yieldIfSliceSpent();
 
+          // Size the next fetch from this page's average row (see
+          // TARGET_PAGE_CHARS).
+          const avgChars = pageChars / rows.length;
+          pageLimit = Math.max(1, Math.min(CHUNK_ROWS, Math.floor(TARGET_PAGE_CHARS / Math.max(1, avgChars))));
           if (rows.length < limit) break;
-          // Adapt the page size to the data: huge rows → smaller pages,
-          // small rows → back toward the default.
-          if (pageChars > CHUNK_INPUT_BYTES * OVERSIZE_PAGE_FACTOR) {
-            limit = Math.max(1, Math.floor(rows.length / 2));
-          } else if (limit < CHUNK_ROWS && pageChars < CHUNK_INPUT_BYTES) {
-            limit = Math.min(CHUNK_ROWS, limit * 2);
-          }
         }
       }
     }

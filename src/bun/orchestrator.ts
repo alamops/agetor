@@ -4926,10 +4926,8 @@ function latestResumableFxPause(taskId: string): { runId: string; payload: FxRec
   ).get(taskId);
   if (!latestRun || latestRun.status !== "failed") return null;
 
-  const sentinelRow = db.query<{ data: string }, [string, string]>(
-    `SELECT data FROM run_events WHERE run_id = ? AND stream = 'status' AND data LIKE ? ORDER BY id DESC LIMIT 1`,
-  ).get(latestRun.id, `${FX_RECOVERY_STATUS_PREFIX}%`);
-  const payload = sentinelRow ? parseFxRecoveryPayload(sentinelRow.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) : null;
+  const sentinel = runs.lastStatusDataWithPrefix(latestRun.id, FX_RECOVERY_STATUS_PREFIX);
+  const payload = sentinel ? parseFxRecoveryPayload(sentinel.slice(FX_RECOVERY_STATUS_PREFIX.length)) : null;
   if (!payload || !isFxRecoveryResumable(payload)) return null;
 
   return { runId: latestRun.id, payload };

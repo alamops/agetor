@@ -199,12 +199,14 @@ Assumptions the grill left to the planner, now resolved from code (A1–A3), plu
 
 ## 10. Measurements (filled by T14 on the production-DB copy)
 
+Measured 2026-10-14 with `scripts/measure-restore.ts` on a `sqlite3 .backup` copy of `~/.agetor/agetor.sqlite` (4.59 GB, 1,120,364 pages × 4 KB) placed in `~/.agetor-dev` (dev DB moved aside and restored afterwards; nothing under `~/.agetor` written; claude never launched). Machine load average 3–5 during the runs. The task the grill called "96-subagent" has 109 rows today and is archived, so the second-largest live task (142 rows) was measured instead.
+
 | Measure | Target | Result |
 | --- | --- | --- |
-| Seed (208-subagent task): total ms / worst row | ≤ 300 ms / ≤ 20 ms | _pending_ |
-| `ready` latency after attach (208-subagent task) | ≤ 2 s | _pending_ |
-| First-pass replay (596 MB task): total ms / max block | — / ≤ 100 ms | _pending_ |
-| Max main-thread block during attach (5 ms sampler) | ≤ 100 ms | _pending_ |
-| Seed + `ready` for the 96-subagent task | ≤ 2 s | _pending_ |
-| First retention pass (30 d): rows / MB freed / duration / max block / `MAX(LENGTH(data))` | ~1.66 GB / — / ≤ 100 ms block | _pending_ |
-| `page_count`, `freelist_count`, estimate vs measured `VACUUM` on the copy | estimate within 25 % | _pending_ |
+| Seed (208-subagent task): total ms / worst row | ≤ 300 ms / ≤ 20 ms | **71–134 ms / 1.4 ms warm, 36.5 ms cold** (direct task-scoped queries over 208 rows; was ~230 s) |
+| `ready` latency after attach (208-subagent task) | ≤ 2 s | **70–96 ms** |
+| First-pass replay (625 MB, 192 transcripts + 42 MB main JSONL): total ms / max block | — / ≤ 100 ms | **1.70–1.81 s / 43 ms** (settled 2.4–2.5 s raw, incl. the 600 ms beat) |
+| Max main-thread block during attach (5 ms sampler) | ≤ 100 ms | **43–45 ms**, no gap > 50 ms |
+| Seed + `ready` for the 142-subagent task (122 transcripts, 313 MB) | ≤ 2 s | **seed 56.6 ms (worst row 19.6 ms) / `ready` 18 ms / first pass 0.82 s / max block 42.9 ms** |
+| First retention pass (30 d): rows / MB freed / duration / max block / `MAX(LENGTH(data))` | ~1.66 GB / — / ≤ 100 ms block | **36,264 rows (of 39,342 candidates over 639 archived tasks, 7,204 runs) / 1,660 MB payload freed / 10.8 s / 38.8 ms / 2.68 MB**. The first measurement, with a fixed 200-row page, peaked at 129.7 ms (one 100–250 ms gap) — the page `.all()` of multi-hundred-KB rows, not a single-row parse; T8 now sizes each page from the previous page's average row (≈ 2 MB of data per fetch, first fetch 8 rows), which removed it. |
+| `page_count`, `freelist_count`, estimate vs measured `VACUUM` on the copy | estimate within 25 % | after the pass: `page_count` 1,120,365, `freelist_count` 412,797 (live 2.90 GB); estimate **22 s**, measured **24.5 s = 8.44 s/GB** (+12.6 % vs 7.5) → within 25 %, `DB_COMPACT_SEC_PER_GB` kept; file 4,592 MB → 2,796 MB |
