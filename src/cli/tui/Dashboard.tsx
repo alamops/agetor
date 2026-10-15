@@ -33,6 +33,7 @@ import { fileScopeForTask } from "./at-complete.ts";
 import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
 // `../at-warn.ts` is owned by a sibling — import its pure exports only, never edit the file.
 import { discoveredExtensionNames, filterUnresolvedRefs } from "../at-warn.ts";
+import { trimmedResultNote } from "../commands/logs.ts";
 
 type Mode = "nav" | "compose" | "answer";
 
@@ -973,7 +974,10 @@ const EventLine = memo(function EventLine({
       // above (once it arrives) — `sentLine === null` marks that pairing;
       // nothing to render here for it.
       if (sentLine === null) return null;
-      return <Text dimColor>  ↳ result</Text>;
+      // A retention-trimmed payload (`{"retention":{…},…}`, written by the
+      // archived-history retention pass) says so, with its original size.
+      const trimmed = trimmedResultNote(e.data);
+      return <Text dimColor>  ↳ result{trimmed ? ` · ${trimmed}` : ""}</Text>;
     }
     case "interaction":
       return (

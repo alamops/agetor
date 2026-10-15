@@ -119,6 +119,7 @@ import {
 } from "./antigravity-tmux.ts";
 import {  dropFxSession,
 } from "./fx-acp.ts";
+import { beginLagLabel, setLagStallSink } from "./event-loop-lag.ts";
 import {
   attachSubagentWatcher,
   handleBackgroundTaskNotification,
@@ -360,6 +361,26 @@ setParkedDiscoveryHandler(pullBackParkedTask);
 // `startContinuationRun` below.
 setContinuationRunFactory(startContinuationRun);
 
+// Event-loop stall attribution (non-blocking session restore, plan §2.2): the
+// lag monitor (started by index.ts / headless.ts) already `console.warn`s every
+// stall, so this sink only adds the user-visible half — a status line on the
+// run the stalled work was labelled with, so a transcript explains why the app
+// froze. A stall with no run in its label context (or whose run/task has since
+// vanished) is logged by the monitor alone.
+setLagStallSink((stall) => {
+  const ctx = stall.ctx;
+  if (!ctx?.runId) return;
+  try {
+    appendRunStatusLine(
+      ctx.taskId,
+      ctx.runId,
+      `core was unresponsive for ${(stall.lagMs / 1000).toFixed(1)} s during ${stall.label ?? "unlabelled work"}`,
+    );
+  } catch {
+    // The run or task is gone (deleted mid-stall) — nothing to annotate.
+  }
+});
+
 // Death-watch during a #92 hold: keep polling `tmux has-session` even though
 // no turn is in flight, so a session dying mid-hold is caught instead of
 // silently stranding the card in `running` until the next boot. Reuses the
@@ -432,6 +453,7 @@ const PIPELINE_PARENT_STAMPED_KINDS = new Set<GlobalEvent["kind"]>([
   "interaction",
   "files-sent",
   "fx-auto-resume",
+  "send-failed",
 ]);
 
 /** The pipeline parent id of a hidden step task, or `undefined` for an
@@ -816,83 +838,87 @@ export async function reconcileOrphans(): Promise<number> {
     }
 
     if (canTryReattach && task) {
-      const cwd = task.worktreePath ?? task.workdir;
-      const harness = resolveHarness(task.agent);
-      const onChunk = makeChunkHandler(row.id, row.task_id, kind as AgentKind, task.mode);
-      const spawned = kind === "claude-code"
-        ? await reattachSession({
-            taskId: row.task_id,
-            cwd,
-            sessionId: row.claude_session_id as string,
-            configDir: harness?.home ?? null,
-            onChunk,
-            seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
-            mode: task.mode,
-          })
-        : kind === "codex"
-        ? await reattachCodexSession({
-            taskId: row.task_id,
-            runId: row.id,
-            sessionName: row.tmux_session as string,
-            onChunk,
-            seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
-          })
-        : kind === "cursor"
-        ? await reattachCursorSession({
-            taskId: row.task_id,
-            runId: row.id,
-            sessionName: row.tmux_session as string,
-            onChunk,
-            seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
-          })
-        : kind === "gemini"
-        ? await reattachGeminiSession({
-            taskId: row.task_id,
-            runId: row.id,
-            sessionName: row.tmux_session as string,
-            onChunk,
-            seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
-          })
-        : await reattachAntigravitySession({
-            taskId: row.task_id,
-            runId: row.id,
-            sessionName: row.tmux_session as string,
-            onChunk,
-            seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
-          });
-      if (spawned) {
-        registerActiveRun(row.id, row.task_id, task, spawned);
-        // Pre-seed `handle.apiError` when the prior process had already
-        // emitted the api-error status to run_events for this run. The
-        // reattach replay can't re-emit it — the assistant-line uuid is in
-        // seenLineUuids, so `dispatchLine` short-circuits before the
-        // mapper runs — so without this seed `attachDoneHandler` would
-        // resolve with `wasApiError=false` and bounce the column from the
-        // (correctly-persisted) `blocked` back to `review` on the first
-        // pending-end-turn fire. `EXISTS` short-circuits on first match
-        // and reads more clearly than `COUNT(*) > 0`.
-        // subagent_id IS NULL: a subagent tailer's own transient api-error
-        // status row (since #81) must not seed the main run's apiError.
-        const priorApiError = db.query<{ found: 0 | 1 }, [string, string]>(
-          `SELECT EXISTS(
-             SELECT 1 FROM run_events
-             WHERE run_id = ? AND stream = 'status' AND data LIKE ? AND subagent_id IS NULL
-           ) AS found`,
-        ).get(row.id, `${CLAUDE_API_ERROR_STATUS_PREFIX}%`)?.found ?? 0;
-        if (priorApiError === 1) {
-          const handle = active.get(row.id);
-          if (handle) handle.apiError = true;
+      // Attribute any event-loop stall during this reattach (JSONL re-tail,
+      // tmux probes, DB seeding) to the task, so the lag monitor names it in
+      // the log and on the run instead of reporting an anonymous stall.
+      const endLag = beginLagLabel(`boot reattach · task ${row.task_id}`, { taskId: row.task_id, runId: row.id });
+      try {
+        const cwd = task.worktreePath ?? task.workdir;
+        const harness = resolveHarness(task.agent);
+        const onChunk = makeChunkHandler(row.id, row.task_id, kind as AgentKind, task.mode);
+        const spawned = kind === "claude-code"
+          ? await reattachSession({
+              taskId: row.task_id,
+              cwd,
+              sessionId: row.claude_session_id as string,
+              configDir: harness?.home ?? null,
+              onChunk,
+              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+              mode: task.mode,
+            })
+          : kind === "codex"
+          ? await reattachCodexSession({
+              taskId: row.task_id,
+              runId: row.id,
+              sessionName: row.tmux_session as string,
+              onChunk,
+              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            })
+          : kind === "cursor"
+          ? await reattachCursorSession({
+              taskId: row.task_id,
+              runId: row.id,
+              sessionName: row.tmux_session as string,
+              onChunk,
+              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            })
+          : kind === "gemini"
+          ? await reattachGeminiSession({
+              taskId: row.task_id,
+              runId: row.id,
+              sessionName: row.tmux_session as string,
+              onChunk,
+              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            })
+          : await reattachAntigravitySession({
+              taskId: row.task_id,
+              runId: row.id,
+              sessionName: row.tmux_session as string,
+              onChunk,
+              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            });
+        if (spawned) {
+          registerActiveRun(row.id, row.task_id, task, spawned);
+          // Pre-seed `handle.apiError` when the prior process had already
+          // emitted the api-error status to run_events for this run. The
+          // reattach replay can't re-emit it — the assistant-line uuid is in
+          // seenLineUuids, so `dispatchLine` short-circuits before the
+          // mapper runs — so without this seed `attachDoneHandler` would
+          // resolve with `wasApiError=false` and bounce the column from the
+          // (correctly-persisted) `blocked` back to `review` on the first
+          // pending-end-turn fire. `hasPriorApiErrorStatus` pins the
+          // `(run_id)` index (a bare EXISTS let the planner walk the whole
+          // `status` stream) and ignores subagent tailers' own transient
+          // api-error rows (`subagent_id IS NULL`, since #81), which must not
+          // seed the main run's apiError.
+          const priorApiError = runs.hasPriorApiErrorStatus(row.id, CLAUDE_API_ERROR_STATUS_PREFIX);
+          if (priorApiError) {
+            const handle = active.get(row.id);
+            if (handle) handle.apiError = true;
+          }
+          attachDoneHandler(row.id, row.task_id, spawned);
+          reattachedTaskIds.add(row.task_id);
+          // Visible seam in the run panel so the user can tell where the
+          // process boundary is. Non-JSONL chunk → no dedup key needed.
+          onChunk("status", "reconnected to live session after agetor restart");
+          continue;
         }
-        attachDoneHandler(row.id, row.task_id, spawned);
-        reattachedTaskIds.add(row.task_id);
-        // Visible seam in the run panel so the user can tell where the
-        // process boundary is. Non-JSONL chunk → no dedup key needed.
-        onChunk("status", "reconnected to live session after agetor restart");
-        continue;
+        // JSONL missing despite live tmux — can't safely resume; kill the
+        // session and fall through to orphan marking.
+        await killSessionByName(row.tmux_session as string);
+      } finally {
+        endLag();
       }
-      // JSONL missing despite live tmux — can't safely resume; kill the
-      // session and fall through to orphan marking.
-      await killSessionByName(row.tmux_session as string);
     }
     orphaned.push({ id: row.id, task_id: row.task_id, prevColumn });
   }
@@ -984,10 +1010,14 @@ export async function reconcileOrphans(): Promise<number> {
         }
         const cwd = task.worktreePath ?? task.workdir;
         const harness = resolveHarness(task.agent);
-        attachSubagentWatcher({
+        // `.ready` = the seed finished: the boot path waits for each watcher's
+        // seed (so the held-task decision below sees a consistent view) but
+        // the seed itself is cooperative and yields to the event loop.
+        await attachSubagentWatcher({
           taskId: heldId,
+          runId: run.id,
           jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null),
-        });
+        }).ready;
         reArmed++;
       } else {
         // Session gone: no watcher could ever observe these agents finishing, so
@@ -1017,10 +1047,11 @@ export async function reconcileOrphans(): Promise<number> {
       }
       const cwd = task.worktreePath ?? task.workdir;
       const harness = resolveHarness(task.agent);
-      attachSubagentWatcher({
+      await attachSubagentWatcher({
         taskId: heldId,
+        runId: run.id,
         jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null),
-      });
+      }).ready;
       reArmed++;
     } else {
       // Session gone: orphan the rows. Unlike the held-in-running case, the
@@ -1183,6 +1214,21 @@ async function raceSpawnBudget<T>(
  * bounded.
  */
 const startingTaskIds = new Set<string>();
+
+/**
+ * How many agent runs this process is driving right now: registered runs
+ * (`active`) plus spawns that have claimed a task but not yet registered
+ * (`startingTaskIds` — a claim is held through the whole bounded-spawn
+ * pending window, so a launch the HTTP response already answered `pending`
+ * for still counts). The database Compact gate (plan §8 A4) refuses to
+ * `VACUUM` while this is non-zero: a VACUUM holds the single writer for
+ * seconds-to-minutes, which would stall every streaming `run_events` append.
+ * A claude run held open only by background subagents is still in `active`
+ * until it settles, so it counts too.
+ */
+export function activeRunCount(): number {
+  return active.size + startingTaskIds.size;
+}
 /**
  * Runs the user asked to Stop while their spawn was still in flight (the
  * bounded-spawn pending window, CLAUDE.md item 16): the run row exists and
@@ -3278,12 +3324,13 @@ export async function cancelRun(runId: string): Promise<boolean> {
  * type: the message WAS recorded (the optimistic "user" bubble is already in
  * the transcript, and — for an idle send — a new run row exists and the task
  * moved to `running`) but the actual paste never reached claude because a
- * blocking modal was still on the pane. That case sets `withheld: true` and
- * `savedToBacklog: true` — `handlePasteWithheld` has already re-stashed the
- * text into the task's backlog tray and left its own status breadcrumb on
- * the run by the time this resolves, so the caller doesn't need to do
- * anything further with the text itself, just tell the user their message
- * didn't reach the agent. A genuine tmux subprocess failure (not a modal
+ * blocking modal was still on the pane. That case sets `withheld: true`, and
+ * `handlePasteWithheld` has already tried to re-stash the text into the
+ * task's backlog tray and left its own status breadcrumb on the run by the
+ * time this resolves, so the caller doesn't need to do anything further with
+ * the text itself, just tell the user their message didn't reach the agent.
+ * `savedToBacklog` reports that re-stash truthfully: `false` when it was
+ * skipped because the task was deleted or archived underneath the send. A genuine tmux subprocess failure (not a modal
  * withhold) keeps this plain `{ delivered: false, reason }` shape with no
  * `withheld`/`savedToBacklog` flags.
  *
@@ -3294,19 +3341,29 @@ export async function cancelRun(runId: string): Promise<boolean> {
  * extension mention (`@github`) are all indistinguishable here; the server
  * reports the fact, callers decide what's noise.
  *
- * `pending` (delivered variant only, omitted whenever falsy): set when
- * claude's dead/no-session mint path (`sendClaudeTurn` → `spawnResumedSession`)
- * responded before its underlying `claude --resume` spawn actually settled —
- * see `SPAWN_RESPONSE_BUDGET_MS`'s doc. The run row, the `running` column
- * flip and the `user` event are already persisted at that point (this is
- * still `delivered: true`, not a new outcome kind); the spawn keeps running
- * detached and the caller learns its real outcome from the task's normal
- * event stream. Every other dispatch path (fold-while-busy, codex/cursor/
- * gemini/fx's queue-and-resume) is unaffected and never sets this.
+ * `pending` (delivered variant only, omitted whenever falsy): set when the
+ * send hadn't finished within `SPAWN_RESPONSE_BUDGET_MS` — see that
+ * constant's doc. Two producers:
+ *   - claude's dead/no-session mint path (`sendClaudeTurn` →
+ *     `spawnResumedSession`) responded before its underlying `claude
+ *     --resume` spawn settled: the run row, the `running` column flip and
+ *     the `user` event are already persisted, `runId` names the new run, and
+ *     the spawn keeps running detached;
+ *   - `sendInput` itself, for ANY slow pre-dispatch work (the codex CLI
+ *     floor probe, waiting out a deferred archive teardown, restoring a
+ *     detached worktree, `@`-expansion, the dispatch). Here nothing is
+ *     promised to be persisted yet and `runId` is the run the message was
+ *     ADDRESSED to, not necessarily a new turn's run.
+ * Either way this is still `delivered: true`, not a new outcome kind. A
+ * pending answer cannot carry a later failure, so if the detached work ends
+ * in a refusal the raw (pre-expansion) message is re-stashed into the task's
+ * backlog tray and a live-only `send-failed` event is emitted — the CLI's
+ * `send` cannot observe that. A send that settles inside the budget never
+ * sets `pending` unless the claude mint path did.
  */
 export type SendInputResult =
   | { delivered: true; runId: string; unresolvedRefs?: string[]; pending?: true }
-  | { delivered: false; reason: string; withheld?: true; savedToBacklog?: true };
+  | { delivered: false; reason: string; withheld?: true; savedToBacklog?: boolean };
 
 /**
  * Forward a line of user-supplied input to the agent. Behavior depends on
@@ -3349,18 +3406,40 @@ export type SendInputResult =
  * `delivered: false` result rather than silently falling back to an
  * unisolated cwd.
  *
- * Bounded wait: claude's dead/no-session mint path (idle send with no live
- * tmux session — `sendClaudeTurn` → `spawnResumedSession`) never holds this
- * promise open past `SPAWN_RESPONSE_BUDGET_MS` waiting for the underlying
- * `claude --resume` spawn, which has taken 5-30s in practice (see that
- * constant's doc). When the spawn hasn't settled by then, this resolves
- * `{ delivered: true, runId, pending: true }` — the run row, column flip and
- * `user` event are already persisted, which is what the caller needs to
- * render — and the spawn keeps running detached. Every other path (folding
- * into an active run, and codex/cursor/gemini/fx's queue-and-resume) is
- * unaffected and never sets `pending`.
+ * Bounded wait (opt-in, `opts.bounded`): only the HTTP route
+ * (`POST /runs/:id/input`) passes it, because only there is a held promise a
+ * held connection out of the webview's ~6-per-host budget. Internal callers
+ * (the pipeline handoff reminder, cursor plan approval, the ask-card
+ * fallback message) await the REAL outcome: they act on `delivered`, and a
+ * budget-expired `{ delivered: true, pending: true }` would read as success
+ * for a send that is about to be withheld (`PASTE_MODAL_GRACE_MS` equals the
+ * budget, so every withheld claude paste would) or refused. When bounded,
+ * this promise never stays open past `SPAWN_RESPONSE_BUDGET_MS`
+ * (measured from the call). Only the cheap `run not found` / `task not found`
+ * refusals are answered synchronously; everything after them — the codex CLI
+ * floor check, `pendingTeardown`, the pipeline-step guard, the worktree
+ * restore, `@`-expansion, the argv-overage re-check and the per-kind dispatch
+ * (including claude's `claude --resume` mint, which has taken 5-30s in
+ * practice) — runs as `sendInputInner`, raced against the budget. Settled in
+ * time → its result is returned unchanged. Otherwise this resolves
+ * `{ delivered: true, runId, pending: true }` and the work continues
+ * detached. `runId` is the run this message minted when the dispatch got as
+ * far as minting one (claude's idle mint persists the run row and points
+ * `task.runId` at it before the spawn), else the run the message was
+ * addressed to — see `pendingRunIdFor`. A late refusal is
+ * handled by `settleLateSend` (raw message re-stashed into the backlog +
+ * `send-failed` event).
+ *
+ * Ordering guarantee kept from before the split: the codex floor check runs
+ * BEFORE the archived-task auto-unarchive (both inside `sendInputInner`, in
+ * that order), so a send the CLI floor refuses — even a late-refused one —
+ * never un-archives the task or re-creates its worktree.
  */
-export async function sendInput(runId: string, line: string): Promise<SendInputResult> {
+export async function sendInput(
+  runId: string,
+  line: string,
+  opts: { bounded?: boolean } = {},
+): Promise<SendInputResult> {
   const row = db.query<{ task_id: string; agent: string }, [string]>(
     `SELECT task_id, agent FROM runs WHERE id = ?`,
   ).get(runId);
@@ -3369,6 +3448,93 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   const task = tasks.get(row.task_id);
   if (!task) return { delivered: false, reason: "task not found" };
 
+  // Everything past the two cheap lookups above — the codex floor probe, the
+  // teardown wait, the worktree restore, `@`-expansion and the per-kind
+  // dispatch — can take seconds on a cold or contended machine, and the HTTP
+  // request that carries this call must not be held open for any of it (the
+  // webview's connection budget is ~6 per host; see
+  // `SPAWN_RESPONSE_BUDGET_MS`). So the whole tail runs as `sendInputInner`,
+  // raced against that budget measured from here. Settled in time → its
+  // result is returned byte-for-byte (including an inner `pending: true` the
+  // claude mint path produced on its own). Not settled → the caller is told
+  // `{ delivered: true, runId, pending: true }` NOW and the inner keeps
+  // running detached; `settleLateSend` then turns a late failure into a
+  // backlog re-stash plus a `send-failed` event so the message is never lost
+  // silently. `rawLine` is the pre-expansion text — the same text a draft or
+  // tray item was saved with, which is what the re-stash dedupes against.
+  const rawLine = line;
+  const sendStartedAt = Date.now();
+  const inner = sendInputInner(row, task, line).catch(
+    (err): SendInputResult => ({
+      delivered: false,
+      reason: err instanceof Error ? err.message : String(err),
+    }),
+  );
+  if (!opts.bounded) return inner;
+  const raced = await raceSpawnBudget(inner, SPAWN_RESPONSE_BUDGET_MS);
+  if (raced.settled) return raced.value;
+  void inner.then((result) => settleLateSend(row.task_id, rawLine, result)).catch((err) => {
+    console.error(`[agetor] late send settle failed for task ${row.task_id}:`, err);
+  });
+  return { delivered: true, runId: pendingRunIdFor(row.task_id, runId, sendStartedAt), pending: true };
+}
+
+/**
+ * The `runId` a budget-expired `sendInput` reports. Claude's idle mint
+ * (`spawnResumedSession`) persists the new run row and points `task.runId`
+ * at it BEFORE its own (inner) budget race starts — and that inner race only
+ * begins after the pre-dispatch awaits, so the outer race usually fires
+ * first even though a new run already exists. Reporting the addressed run in
+ * that case would hide the turn the caller's message just started, so: when
+ * the task's current run is a different run created during this send, that
+ * run is the answer; otherwise (nothing minted yet — still waiting on a
+ * teardown, a restore, a floor probe — or a fold/queue path that never mints
+ * synchronously) it is the run the message was addressed to.
+ */
+function pendingRunIdFor(taskId: string, addressedRunId: string, sendStartedAt: number): string {
+  try {
+    const current = tasks.get(taskId)?.runId;
+    if (current && current !== addressedRunId) {
+      const run = runs.get(current);
+      if (run && run.startedAt >= sendStartedAt) return current;
+    }
+  } catch (err) {
+    console.warn(`[agetor] pending runId lookup failed for task ${taskId}:`, err);
+  }
+  return addressedRunId;
+}
+
+/**
+ * Outcome handling for a `sendInput` that already answered `pending: true`
+ * (see there): the HTTP response that could have carried a failure is gone,
+ * so a refusal is converted into the two durable signals the sender can still
+ * see — the message back in the task's backlog tray (unless the dispatch
+ * itself already re-stashed it) and a live-only `send-failed` event the
+ * webview toasts. A delivered result needs nothing; a withheld one already
+ * went through `handlePasteWithheld`'s re-stash, whose outcome it carries as
+ * `savedToBacklog`. That flag is reported truthfully either way:
+ * `restashPasteWithheldText` skips a task that is gone or archived, in which
+ * case the toast says the text was NOT saved.
+ */
+function settleLateSend(taskId: string, rawLine: string, result: SendInputResult): void {
+  if (result.delivered) return;
+  const savedToBacklog = result.withheld === true
+    ? result.savedToBacklog === true
+    : restashPasteWithheldText(taskId, rawLine);
+  emitGlobal({ kind: "send-failed", taskId, reason: result.reason, savedToBacklog, ts: Date.now() });
+}
+
+/**
+ * The budgeted tail of {@link sendInput}: everything after the cheap
+ * `run not found` / `task not found` refusals. `row` and `task` are the
+ * caller's lookups (the task snapshot is only used for the pre-flight checks;
+ * later steps re-read it where a stale view would matter).
+ */
+async function sendInputInner(
+  row: { task_id: string; agent: string },
+  task: Task,
+  line: string,
+): Promise<SendInputResult> {
   // Pre-flight 1b for a one-shot kind (today codex) BEFORE any side effect
   // below — the archivedAt clear and the worktree restore both mutate state,
   // and a follow-up the CLI floor is going to refuse must not un-archive the
@@ -3478,8 +3644,10 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
         return {
           delivered: false,
           withheld: true,
-          savedToBacklog: true,
-          reason: "claude is waiting on a prompt — your message was saved to the backlog tray",
+          savedToBacklog: result.savedToBacklog,
+          reason: result.savedToBacklog
+            ? "claude is waiting on a prompt — your message was saved to the backlog tray"
+            : "claude is waiting on a prompt — your message was not delivered, and the task was archived or deleted before it could be saved to the backlog tray",
         };
       }
       return { delivered: false, reason: result.reason };
@@ -4777,10 +4945,8 @@ function latestResumableFxPause(taskId: string): { runId: string; payload: FxRec
   ).get(taskId);
   if (!latestRun || latestRun.status !== "failed") return null;
 
-  const sentinelRow = db.query<{ data: string }, [string, string]>(
-    `SELECT data FROM run_events WHERE run_id = ? AND stream = 'status' AND data LIKE ? ORDER BY id DESC LIMIT 1`,
-  ).get(latestRun.id, `${FX_RECOVERY_STATUS_PREFIX}%`);
-  const payload = sentinelRow ? parseFxRecoveryPayload(sentinelRow.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) : null;
+  const sentinel = runs.lastStatusDataWithPrefix(latestRun.id, FX_RECOVERY_STATUS_PREFIX);
+  const payload = sentinel ? parseFxRecoveryPayload(sentinel.slice(FX_RECOVERY_STATUS_PREFIX.length)) : null;
   if (!payload || !isFxRecoveryResumable(payload)) return null;
 
   return { runId: latestRun.id, payload };
@@ -5212,11 +5378,12 @@ export async function resumeFxRecovery(
  *   • `delivered: false; withheld: true` — the underlying `PasteOutcome` was
  *     specifically the modal-guard withhold (a blocking claude modal was
  *     still on the pane when the paste's grace window elapsed). This is the
- *     ONLY case `sendInput` reports as `{ withheld: true, savedToBacklog:
- *     true, ... }` rather than a plain failure — `handlePasteWithheld` (wired
- *     as `onPasteFailure` below) has already re-stashed the text into the
- *     task's backlog tray and left its own status breadcrumb on the run by
- *     the time this resolves.
+ *     ONLY case `sendInput` reports as `{ withheld: true, savedToBacklog,
+ *     ... }` rather than a plain failure — `handlePasteWithheld` (wired as
+ *     `onPasteFailure` below) has already tried the backlog re-stash and left
+ *     its own status breadcrumb on the run by the time this resolves;
+ *     `savedToBacklog` is what that re-stash returned (`false` when the task
+ *     was gone or archived).
  *   • `delivered: false; reason` — a genuine tmux subprocess failure
  *     (`load-buffer`/`paste-buffer`/`send-keys` exiting non-zero), not a
  *     modal withhold. `handlePasteWithheld` still re-stashes and leaves its
@@ -5225,7 +5392,7 @@ export async function resumeFxRecovery(
  */
 type ClaudeTurnResult =
   | { runId: string; delivered: true; pending?: true }
-  | { runId: string; delivered: false; withheld: true }
+  | { runId: string; delivered: false; withheld: true; savedToBacklog: boolean }
   | { runId: string; delivered: false; withheld: false; reason: string };
 
 /**
@@ -5276,11 +5443,16 @@ const PASTE_OUTCOME_TIMEOUT_MS = 15_000;
  * as `onPasteFailure` at both `sendTurnInExistingSession` call sites) has
  * ALREADY done the backlog re-stash + run status breadcrumb by the time this
  * resolves — this helper only shapes the HTTP-facing result; it never
- * stashes anything itself, so there's no double-stash.
+ * stashes anything itself, so there's no double-stash. `stashed` reads what
+ * that re-stash returned: claude-tmux fires `onPasteOutcome` (which settles
+ * `pasteOutcome`) and then `onPasteFailure` in the same synchronous call, so
+ * the hook has run by the time this `await` resumes; `null` (it never ran)
+ * reads as not saved.
  */
 async function resolveClaudeTurnOutcome(
   runId: string,
   pasteOutcome: Promise<{ ok: boolean; op?: string; stderr?: string }> | undefined,
+  stashed: () => boolean | null = () => null,
 ): Promise<ClaudeTurnResult> {
   if (!pasteOutcome) return { runId, delivered: true };
   // `clearTimeout` once the race settles — whichever side wins, the loser's
@@ -5295,7 +5467,9 @@ async function resolveClaudeTurnOutcome(
   const outcome = await Promise.race([pasteOutcome, timeout]);
   clearTimeout(timer!);
   if (!outcome || outcome.ok) return { runId, delivered: true };
-  if (outcome.op === "modal-guard") return { runId, delivered: false, withheld: true };
+  if (outcome.op === "modal-guard") {
+    return { runId, delivered: false, withheld: true, savedToBacklog: stashed() === true };
+  }
   // Prefer the driver's own descriptive `stderr` (finding #5, §10 re-review)
   // — e.g. "paste dropped: the session was torn down or replaced before the
   // keystrokes went out" for a dropped queued op, which reads correctly
@@ -5412,6 +5586,8 @@ async function sendTurnInExistingSession(
   // a more reliable "in flight" signal than the polled `task.column`.
   if (task.runId && active.has(task.runId)) {
     const activeRunId = task.runId;
+    // What `handlePasteWithheld` reported, for `savedToBacklog`.
+    let stashed: boolean | null = null;
     // `onPasteFailure` covers T7's paste guard (docs/plans/model-effort-
     // local-command-turns.md §10): a blocking claude modal was still on the
     // pane when the queued paste's grace window elapsed, so this follow-up
@@ -5420,7 +5596,9 @@ async function sendTurnInExistingSession(
     // the run, since the "user" bubble below is appended optimistically
     // before the paste's real outcome is known.
     const pasted = await pasteFollowUp(taskId, line, {
-      onPasteFailure: (outcome) => handlePasteWithheld(taskId, activeRunId, rawLine ?? line, outcome),
+      onPasteFailure: (outcome) => {
+        stashed = handlePasteWithheld(taskId, activeRunId, rawLine ?? line, outcome);
+      },
     });
     // `pasteFollowUp` returns `false` only when no live session exists (falls
     // through to the idle/respawn path below); otherwise `{ delivered: true;
@@ -5437,7 +5615,7 @@ async function sendTurnInExistingSession(
       // that the user did send the message.
       runs.appendEvent(activeRunId, "user", data);
       emit({ runId: activeRunId, taskId, stream: "user", data, ts: Date.now() });
-      return resolveClaudeTurnOutcome(activeRunId, pasted.pasteOutcome);
+      return resolveClaudeTurnOutcome(activeRunId, pasted.pasteOutcome, () => stashed);
     }
   }
 
@@ -5493,8 +5671,12 @@ async function sendTurnInExistingSession(
     const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
     onChunk("user", normalizeUserText(line));
 
+    // What `handlePasteWithheld` reported, for `savedToBacklog`.
+    let stashed: boolean | null = null;
     const agent = await sendTurn(taskId, line, onChunk, {
-      onPasteFailure: (outcome) => handlePasteWithheld(taskId, newRunId, rawLine ?? line, outcome),
+      onPasteFailure: (outcome) => {
+        stashed = handlePasteWithheld(taskId, newRunId, rawLine ?? line, outcome);
+      },
     });
     // Stop landed while the paste was in flight (see `pendingCancelRunIds`):
     // interrupt the turn (Ctrl+C, the session stays alive — same as a normal
@@ -5505,7 +5687,7 @@ async function sendTurnInExistingSession(
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
-    return resolveClaudeTurnOutcome(newRunId, agent.pasteOutcome);
+    return resolveClaudeTurnOutcome(newRunId, agent.pasteOutcome, () => stashed);
   } finally {
     startingTaskIds.delete(taskId);
   }
@@ -5585,14 +5767,20 @@ async function sendTurnInExistingSession(
  * dedupe (`restashPasteWithheldText`'s `item.text === text` scan) would never
  * match an expanded absolute-path re-stash against it, producing a duplicate
  * entry every time the same withheld message is retried.
+ *
+ * Returns whether the text is now in the backlog tray (`false` when the
+ * re-stash was skipped for a gone/archived task) — threaded into
+ * `SendInputResult.savedToBacklog` so no surface claims a save that didn't
+ * happen.
  */
 function handlePasteWithheld(
   taskId: string,
   runId: string,
   text: string,
   outcome: { ok: false; op: string; phase?: "pre-paste" | "pre-enter" | "composer-dirty"; stderr: string },
-): void {
+): boolean {
   let data: string;
+  let saved: boolean;
   if (outcome.op !== "modal-guard") {
     // A genuine tmux subprocess failure, not a modal withhold (finding #5,
     // §10 re-review) — see this function's doc for why this must be checked
@@ -5602,36 +5790,43 @@ function handlePasteWithheld(
     // over a generic "the paste … failed" line that would otherwise misread
     // a dropped op (session disposed/respawned mid-flight) as an ordinary
     // tmux subprocess failure.
-    restashPasteWithheldText(taskId, text);
+    saved = restashPasteWithheldText(taskId, text);
     data = `message saved to your backlog — ${outcome.stderr || "the paste to claude's session failed"}; resend from the tray`;
   } else if (outcome.phase === "pre-enter") {
     // Re-stashed (finding #3, §10 re-review) — see this function's doc.
-    restashPasteWithheldText(taskId, text);
+    saved = restashPasteWithheldText(taskId, text);
     data =
       "paste withheld: claude opened a prompt before your message was sent — it's saved to your backlog (claude's input box will be cleared before your next send); resend from the tray";
   } else if (outcome.phase === "composer-dirty") {
-    restashPasteWithheldText(taskId, text);
+    saved = restashPasteWithheldText(taskId, text);
     data = "paste withheld: claude's input box still holds an earlier message — saved this one to your backlog; resend from the tray once claude is idle";
   } else {
     // "pre-paste", or a missing phase (an older/synthesized outcome) —
     // nothing reached the pane at all.
-    restashPasteWithheldText(taskId, text);
+    saved = restashPasteWithheldText(taskId, text);
     data = "message saved to your backlog — claude is waiting on a prompt; answer it and send the message from the tray";
   }
+  // The re-stash is skipped for a task archived (or deleted) underneath the
+  // send — never claim a save that didn't happen.
+  if (!saved) data = "message not delivered — the task was archived before it could be saved to your backlog";
   runs.appendEvent(runId, "status", data);
   emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+  return saved;
 }
 
 /** Re-stash a withheld paste's text into the task's backlog tray, deduping
  *  against the most-recently-added item so retries of the same failed paste
  *  don't pile up duplicate drafts. Skips (and logs) rather than adding when
  *  the task is gone or archived — see `handlePasteWithheld`'s doc for why
- *  that race is possible despite `sendInput` auto-unarchiving up front. */
-function restashPasteWithheldText(taskId: string, text: string): void {
+ *  that race is possible despite `sendInput` auto-unarchiving up front.
+ *  Returns whether the text is now in the tray (freshly added, or already
+ *  there); `false` when it was skipped — `settleLateSend` reports that
+ *  truthfully in `send-failed.savedToBacklog`. */
+function restashPasteWithheldText(taskId: string, text: string): boolean {
   const task = tasks.get(taskId);
   if (!task || task.archivedAt != null) {
     console.warn(`[agetor] handlePasteWithheld: task ${taskId} not found or archived — skipping backlog re-stash`);
-    return;
+    return false;
   }
   // Scan the WHOLE backlog, not just `task.backlog[0]` (finding #3, §10
   // re-review) — a repeated withhold of the same message is the common case
@@ -5640,6 +5835,7 @@ function restashPasteWithheldText(taskId: string, text: string): void {
   // the front would silently let a duplicate through in exactly that case.
   const alreadyStashed = task.backlog.some((item) => item.text === text);
   if (!alreadyStashed) backlog.add(taskId, { text });
+  return true;
 }
 
 /** Test hook: exercise `handlePasteWithheld` directly against a real task
@@ -5650,8 +5846,8 @@ export function __handlePasteWithheldForTest(
   runId: string,
   text: string,
   outcome: { ok: false; op: string; phase?: "pre-paste" | "pre-enter" | "composer-dirty"; stderr: string },
-): void {
-  handlePasteWithheld(taskId, runId, text, outcome);
+): boolean {
+  return handlePasteWithheld(taskId, runId, text, outcome);
 }
 
 /**

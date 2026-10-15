@@ -1772,6 +1772,81 @@ test(":missing (never fixed) — exactly one reminder, then blocks with the afte
   await waitUntilIdle(parentId);
 });
 
+test("a reminder send that fails AFTER the send budget is not recorded as delivered — the step blocks with the real reason", async () => {
+  // Regression for the bounded `sendInput`: the reminder used to await the
+  // HTTP-only 1.5 s budget, so a send that was refused (or withheld — the
+  // claude modal grace is the same 1.5 s) after it came back
+  // `{ delivered: true, pending: true }` and was stamped as a sent reminder.
+  // Here the refusal is made slow by holding the step's teardown FIFO past
+  // the budget, then lands on the step-worktree guard.
+  const { createTask, startTask, __enqueueTeardownForTest } = await import("./orchestrator.ts");
+  const { tasks, pipelines, runs } = await import("./db.ts");
+  const { newStep, HANDOFF_REMINDER_MARKER } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { SPAWN_RESPONSE_BUDGET_MS } = await import("../shared/types.ts");
+  const { __forTest } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("reminder-slow-refusal");
+  const A = newStep({
+    name: "A",
+    agentProfileId: profile.id,
+    instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing`,
+  });
+  const graph = { steps: [A], edges: [], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("reminder-slow-refusal-pipe"), graph, maxSteps: 25 });
+
+  const created = await createTask({
+    title: "reminder slow refusal run",
+    prompt: "goal",
+    workdir: freshWorkdir(),
+    isolation: "none",
+    pipelineId: pipeline.id,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  let sendHookAt = 0;
+  __forTest.setBeforeReminderSend(async () => {
+    sendHookAt = Date.now();
+    const step = tasks.stepsForParent(parentId)[0]!;
+    void __enqueueTeardownForTest(
+      step.id,
+      `hold-${step.id}`,
+      () => new Promise<void>((r) => setTimeout(r, SPAWN_RESPONSE_BUDGET_MS + 500)),
+    );
+    tasks.update(step.id, { isolation: "worktree", worktreePath: path.join(DATA_DIR, "no-such-step-worktree") });
+  });
+  try {
+    const started = await startTask(parentId);
+    if ("error" in started) throw new Error(started.error);
+    const stepA = await waitFor(() => tasks.stepsForParent(parentId)[0]);
+
+    const blocked = await waitFor(() => {
+      const t = tasks.get(parentId);
+      return t?.pipelineRun?.status === "blocked" ? t : undefined;
+    }, 8000);
+    expect(sendHookAt).toBeGreaterThan(0);
+    expect(Date.now() - sendHookAt).toBeGreaterThanOrEqual(SPAWN_RESPONSE_BUDGET_MS);
+
+    const run = blocked.pipelineRun!;
+    const block = run.blocked.find((b) => b.taskId === stepA.id);
+    expect(block?.kind).toBe("handoff-missing");
+    expect(block?.message).toContain("automatic reminder could not be sent");
+    expect(block?.message).toContain("worktree is missing");
+
+    const record = run.history.find((h) => h.stepId === A.id);
+    expect(record?.reminder ?? null).toBeNull();
+    const reminderEvents = runs.listForTask(stepA.id)
+      .flatMap((r) => runs.events(r.id))
+      .filter((e) => e.stream === "user" && e.data.includes(HANDOFF_REMINDER_MARKER));
+    expect(reminderEvents).toEqual([]);
+  } finally {
+    __forTest.setBeforeReminderSend(null);
+  }
+  await waitUntilIdle(parentId);
+});
+
 test(":invalid-then-done — one automatic reminder, then advances to done", async () => {
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { tasks, pipelines, runs } = await import("./db.ts");

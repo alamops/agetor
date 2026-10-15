@@ -54,7 +54,14 @@ export const USAGE: Record<string, string> = {
   Message a task. Resumes a finished task's session, or folds into the live turn
   if one is running. Blocked while the task is waiting on an answer. --ref
   attaches a file/folder (repeatable, made absolute); image refs are attached to
-  the turn. --ref with no message sends just the attachment(s).`,
+  the turn. --ref with no message sends just the attachment(s).
+
+  "accepted … still getting ready" (a session that is still restoring or
+  launching) is a promise, not a delivery: if the delivery later fails the app
+  reports it and tries to restore the message to the task's saved-messages
+  backlog (it says when that fails too) — the CLI cannot report that failure
+  after it has exited. Check 'agetor show <id>' or the app if a reply never
+  arrives.`,
 
   commit: `usage: agetor commit <task-id>
 
@@ -328,7 +335,24 @@ export const USAGE: Record<string, string> = {
   View or set cross-session preferences stored in the core (the same store the
   app's settings use). No args lists all; one arg gets; key + value sets.
   Common keys: defaultHarness, lastModel:<kind>, lastMode:<kind>, lastEffort:<kind>,
-  fxAutoResume (on|off — default on), fxAutoResumeDelaySec (10..3600, default 120).`,
+  fxAutoResume (on|off — default on), fxAutoResumeDelaySec (10..3600, default 120),
+  archivedHistoryRetentionDays (off, or 1..3650 days — default 30): archived
+  tasks older than that have their large tool_result payloads trimmed to 4 KB
+  by a background pass ('agetor compact' then returns the freed space to disk).
+  0, false, no, none and disabled also mean off; any other value is refused.`,
+
+  compact: `usage: agetor compact [--yes|-y] [--json]
+
+  Compact the core's SQLite database (VACUUM) to give freed pages back to the
+  disk — the CLI view of Settings → General → "Compact database". It rewrites
+  the whole file on the core's main thread, so Agetor does not respond while it
+  runs (roughly 7.5 s per GB). Prints the size on disk, what is reclaimable,
+  the estimate and the running-task count first; refused (exit 1) while any
+  task has a run in flight.
+    --yes, -y  compact without asking (required when not in a terminal)
+    --json     machine-readable; never prompts. Without --yes it only reports
+               { stats } and compacts nothing; with --yes it prints
+               { stats, result }, or the refusal body on a 409`,
 };
 
 const ALIASES: Record<string, string> = {

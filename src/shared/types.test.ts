@@ -604,6 +604,8 @@ function describeGlobalEvent(event: GlobalEvent): string {
       return `fx-auto-resume:${event.state}`;
     case "pipeline":
       return `pipeline:${event.status}`;
+    case "send-failed":
+      return `send-failed:${event.savedToBacklog}`;
     default:
       return assertNever(event);
   }

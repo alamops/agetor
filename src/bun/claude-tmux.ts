@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { tasks } from "./db.ts";
+import { beginLagLabel } from "./event-loop-lag.ts";
 import { attachSubagentWatcher, detachWatcherFor, orphanRunningSubagents, subagentActivityWithin, type SubagentWatcherHandle } from "./claude-subagents.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
@@ -2975,10 +2976,12 @@ interface SessionState {
   lastLocalCommandArgs: string | null;
   /** Watches `<sessionId>/subagents/` for background/sub agents this session
    *  spawns, tailing each into the task's event stream (tagged by subagent id)
-   *  for the run panel's read-only tabs. Armed in `attachTailer`, released in
-   *  `disposeSessionState`. Read-only — never touches tmux. Null until armed
-   *  (and when AGETOR_TRACK_SUBAGENTS=0, `attachSubagentWatcher` returns a
-   *  no-op handle). */
+   *  for the run panel's read-only tabs. Armed in `attachTailer` (the handle
+   *  is installed synchronously, but its seed completes cooperatively in the
+   *  background — `attachTailer` awaits `handle.ready` before resolving),
+   *  released in `disposeSessionState`. Read-only — never touches tmux. Null
+   *  until armed (and when AGETOR_TRACK_SUBAGENTS=0, `attachSubagentWatcher`
+   *  returns a no-op handle whose `ready` is already resolved). */
   subagentWatcher: SubagentWatcherHandle | null;
   /**
    * Armed by `maybeAdoptContinuation` ONLY when a continuation run was
@@ -7807,7 +7810,26 @@ function rearmPollTimerFast(state: SessionState): void {
   armPollTimer(state, POLL_FAST_MS);
 }
 
-function attachTailer(state: SessionState): void {
+/**
+ * Arm every per-session observer (main tailer, fs.watch, poll backstop,
+ * scraper, death watch, subagent watcher) and resolve once the subagent
+ * watcher has finished SEEDING.
+ *
+ * Everything but the watcher is armed synchronously, in the same order as
+ * before. `attachSubagentWatcher` returns its handle synchronously too, but
+ * seeds cooperatively in the background (yielding to the event loop between
+ * slices instead of blocking it for the whole rehydration — the fix for the
+ * restore-time stall); awaiting `handle.ready` here keeps the old contract
+ * that callers' `ready` status / reattach continue only after the task's
+ * subagent rows are loaded. `watcherMs` is how long that wait took, for the
+ * slow-launch breadcrumb.
+ *
+ * If the session is disposed while we wait (`disposeSessionState` detaches
+ * the watcher and nulls `state.subagentWatcher`, which also resolves `ready`)
+ * we return without touching the state again. `ready` never rejects, so
+ * nothing past the synchronous arming can reject here either.
+ */
+async function attachTailer(state: SessionState): Promise<{ watcherMs: number }> {
   // Drain whatever's already in the file (claude may have written events
   // before our watcher attached).
   void flush(state);
@@ -7828,11 +7850,28 @@ function attachTailer(state: SessionState): void {
   // dispose a prior handle first so a re-attach (reconcileOrphans defensive
   // overwrite) can't leave two watchers polling the same dir.
   state.subagentWatcher?.detach();
-  state.subagentWatcher = attachSubagentWatcher({
+  const watcher = attachSubagentWatcher({
     taskId: state.taskId,
     jsonlPath: state.jsonlPath,
+    // For stall attribution only (the watcher's lag labels name the run);
+    // `task.runId` is set before any spawn/reattach reaches here, and an
+    // unknown run just means an unattributed label.
+    runId: tasks.get(state.taskId)?.runId ?? undefined,
     onApiError: (info) => signalSubagentApiError(state, info),
   });
+  state.subagentWatcher = watcher;
+  const watcherStart = performance.now();
+  try {
+    await watcher.ready;
+  } catch {
+    // `ready` is documented never to reject; if that ever regresses, a failed
+    // seed must not take the launch/reattach down with it.
+  }
+  // Nothing is touched after the await: if the session was disposed (or
+  // re-attached) while seeding, `disposeSessionState` already detached and
+  // nulled the handle, and callers detect that themselves by checking that
+  // `sessions.get(taskId) === state` before announcing anything.
+  return { watcherMs: Math.round(performance.now() - watcherStart) };
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -7904,9 +7943,16 @@ export function formatSlowLaunchStatus(stages: {
   killMs: number;
   settingsMs: number;
   newSessionMs: number;
+  /** Time spent awaiting the subagent watcher's seed (`attachTailer`). Known
+   *  only once the boot IIFE has attached the tailer, so it is absent from
+   *  the breadcrumb of a launch that failed before then — and when absent the
+   *  string is byte-identical to the three-stage form. */
+  watcherMs?: number;
 }): string {
-  const totalMs = stages.killMs + stages.settingsMs + stages.newSessionMs;
-  return `session launch took ${(totalMs / 1000).toFixed(1)}s (kill ${stages.killMs}ms · settings ${stages.settingsMs}ms · tmux new-session ${stages.newSessionMs}ms)`;
+  const totalMs =
+    stages.killMs + stages.settingsMs + stages.newSessionMs + (stages.watcherMs ?? 0);
+  const watcher = stages.watcherMs === undefined ? "" : ` · watcher ${stages.watcherMs}ms`;
+  return `session launch took ${(totalMs / 1000).toFixed(1)}s (kill ${stages.killMs}ms · settings ${stages.settingsMs}ms · tmux new-session ${stages.newSessionMs}ms${watcher})`;
 }
 
 /**
@@ -7976,28 +8022,40 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   const launch = await tmux(tmuxArgs);
   const afterNewSessionAt = performance.now();
 
-  // Name the slow stage(s), if any, now that all three pre-launch awaits have
-  // settled — computed and (if over threshold) emitted BEFORE the
-  // `!launch.ok` early return below, so a `tmux new-session` that hangs and
-  // then fails still produces this breadcrumb instead of nothing. Previously
-  // this block sat after the early return and was skipped entirely on a
-  // launch failure. Otherwise unchanged: still placed here — before the boot
-  // IIFE further down emits its own `status` chunks (e.g. "ready (jsonl:
-  // …)") — so this breadcrumb, when it fires, is always the first status
-  // line on the run rather than being sandwiched after "ready"; it fires
-  // synchronously right after `launch` resolves, well before that IIFE's
-  // first await.
+  // Name the slow stage(s), if any. The three pre-launch awaits have settled,
+  // but the subagent watcher's seed (a fourth stage, timed inside
+  // `attachTailer`) has not run yet on a successful launch — so the breadcrumb
+  // is split by outcome:
+  //   - `tmux new-session` FAILED: emit the three-stage line right here,
+  //     before the `!launch.ok` early return, so a launch that hangs and then
+  //     fails still produces a breadcrumb instead of nothing (the boot IIFE
+  //     below never runs on that path).
+  //   - it succeeded: DEFER emission into the boot IIFE, right before the
+  //     `ready` status, so the total includes the watcher stage. Ordering
+  //     consequence: the breadcrumb now follows anything the IIFE reports
+  //     while waiting for the JSONL (e.g. a startup-question status line)
+  //     instead of being the first status on the run; it is still emitted
+  //     before `ready`.
   const killMs = Math.round(afterKillAt - spawnStageStart);
   const settingsMs = Math.round(afterSettingsAt - afterKillAt);
   const newSessionMs = Math.round(afterNewSessionAt - afterSettingsAt);
-  if (killMs + settingsMs + newSessionMs > slowLaunchWarnMs) {
+  /** Warn + emit the breadcrumb when the (3- or 4-stage) total is over the
+   *  threshold. `watcherMs` is omitted for the failed-launch case. */
+  const reportSlowLaunch = (watcherMs?: number): void => {
+    const totalMs = killMs + settingsMs + newSessionMs + (watcherMs ?? 0);
+    if (totalMs <= slowLaunchWarnMs) return;
+    const watcherPart = watcherMs === undefined ? "" : ` · watcher ${watcherMs}ms`;
     console.warn(
-      `[claude-tmux] slow launch for ${sessionName}: kill ${killMs}ms · settings ${settingsMs}ms · tmux new-session ${newSessionMs}ms`,
+      `[claude-tmux] slow launch for ${sessionName}: kill ${killMs}ms · settings ${settingsMs}ms · tmux new-session ${newSessionMs}ms${watcherPart}`,
     );
-    opts.onChunk("status", formatSlowLaunchStatus({ killMs, settingsMs, newSessionMs }));
-  }
+    opts.onChunk(
+      "status",
+      formatSlowLaunchStatus({ killMs, settingsMs, newSessionMs, watcherMs }),
+    );
+  };
 
   if (!launch.ok) {
+    reportSlowLaunch();
     const err = new Error(`tmux new-session failed: ${launch.stderr || launch.stdout}`);
     opts.onChunk("stderr", err.message);
     return rejectedAgent(opts.taskId, err);
@@ -8458,6 +8516,11 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
       const detail = stillAlive
         ? `claude is up but hasn't written its JSONL yet after ${(BOOT_TIMEOUT_MS / 1000) | 0}s — pane content below`
         : "claude exited before writing its JSONL — check `tmux` / `claude` are installed and you can run `claude` interactively in this cwd";
+      // `attachTailer` never ran, so the deferred breadcrumb would otherwise be
+      // dropped: a launch whose pre-launch stages were slow and then timed out
+      // is exactly the one worth naming. Three-stage form — there is no
+      // watcher stage to add.
+      reportSlowLaunch();
       opts.onChunk("stderr", `claude session JSONL never appeared: ${detail}`);
       opts.onChunk("stderr", `expected at: ${jsonlPath}`);
       opts.onChunk("stderr", `--- tmux pane ---\n${pane}\n--- end pane ---`);
@@ -8472,7 +8535,11 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
       for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
       return;
     }
-    attachTailer(state);
+    const { watcherMs } = await attachTailer(state);
+    // Disposed (Stop/delete/respawn) while the watcher seeded: the session is
+    // gone, so announce nothing about it.
+    if (sessions.get(opts.taskId) !== state) return;
+    reportSlowLaunch(watcherMs);
     opts.onChunk("status", `claude session ${sessionName} ready (jsonl: ${jsonlPath})`);
   })();
 
@@ -8519,6 +8586,22 @@ export interface ReattachOptions {
  * structured visibility into the session anyway).
  */
 export async function reattachSession(opts: ReattachOptions): Promise<SpawnedAgent | null> {
+  // Label the whole reattach (state rebuild, tailer attach, subagent-watcher
+  // seed, window-size heal) so an event-loop stall during a boot-time restore
+  // is attributed to the task instead of showing up unlabelled. The disposer
+  // runs in `finally`, so a throw or the `null` early return can't leak it.
+  const endLagLabel = beginLagLabel(`reattach session · task ${opts.taskId}`, {
+    taskId: opts.taskId,
+    runId: tasks.get(opts.taskId)?.runId ?? undefined,
+  });
+  try {
+    return await reattachSessionBody(opts);
+  } finally {
+    endLagLabel();
+  }
+}
+
+async function reattachSessionBody(opts: ReattachOptions): Promise<SpawnedAgent | null> {
   const sessionName = sessionNameFor(opts.taskId);
   const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.configDir);
   if (!existsSync(jsonlPath)) return null;
@@ -8572,7 +8655,10 @@ export async function reattachSession(opts: ReattachOptions): Promise<SpawnedAge
   // per state's onChunk), spraying duplicate events into the wrong run.
   disposeSessionState(sessions.get(opts.taskId));
   sessions.set(opts.taskId, state);
-  attachTailer(state);
+  // Awaited: the subagent watcher seeds cooperatively (see `attachTailer`), and
+  // the orchestrator's reattach must not proceed against a half-loaded
+  // subagent state. The lag label names this stretch if the loop still stalls.
+  await attachTailer(state);
   // A crashed previous process is exactly when a stuck `window-size manual`
   // pin (see `healWindowSize`) would have been left behind — heal it now so
   // a subsequent attach isn't confined to whatever size the pin left.

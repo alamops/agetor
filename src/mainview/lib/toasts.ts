@@ -188,6 +188,37 @@ export function notifyFilesSent(
 }
 
 /**
+ * Alert the user that a message they sent never reached the agent — the
+ * `send-failed` `GlobalEvent`, emitted when `sendInput`'s bounded pre-dispatch
+ * (session restore, worktree restore, …) finished AFTER the HTTP response had
+ * already returned `pending: true`, so the late failure has no request left to
+ * carry it. When `savedToBacklog` the server re-stashed the text into the
+ * task's backlog tray, so nothing typed is lost.
+ *
+ * Deliberately NOT gated on `isSelected`/`isFocused`, unlike its siblings: the
+ * composer already cleared on the `pending` acceptance, and no run status line
+ * exists for this failure (there may be no run at all), so a toast is the only
+ * place the user can learn the message didn't go. Self-dismissing after 10 s
+ * (long enough to read a sentence-length reason) and, like `notifyFilesSent`,
+ * deliberately doesn't touch `pendingByTask` — it isn't a "waiting on you"
+ * state with a blocked-column counterpart to auto-clear it.
+ */
+export function toastSendFailed(
+  args: Pick<ToastArgs, "taskId" | "title" | "subtitle" | "onOpen"> & {
+    reason: string;
+    savedToBacklog: boolean;
+  },
+): void {
+  const base = args.subtitle ? `${args.title} · ${args.subtitle}` : args.title;
+  const tail = args.savedToBacklog ? " — saved to the task's backlog" : "";
+  toast.warning("Message not sent", {
+    description: `${base} — ${args.reason}${tail}`,
+    duration: 10_000,
+    action: { label: "Open", onClick: args.onOpen },
+  });
+}
+
+/**
  * Alert the user that the orchestrator's own `fx-auto-resume` engine fired a
  * resume for a paused fx task (see `TaskFxRecovery` / the `fx-auto-resume`
  * `GlobalEvent` in `src/shared/types.ts`). Live-only, like

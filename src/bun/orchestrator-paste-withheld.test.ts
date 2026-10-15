@@ -151,6 +151,155 @@ test("withheld folded follow-up: re-stashed to backlog with a status breadcrumb,
 }, 10_000);
 
 /* ────────────────────────────────────────────────────────────────────────── *
+ * 1b — The REAL modal grace (1.5 s) vs the send budget (1.5 s)
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("withheld fold with the default PASTE_MODAL_GRACE_MS", () => {
+  /** Start a claude task with a live (installed) session and a pane that
+   *  keeps a blocking modal up for the whole grace window. Returns the busy
+   *  run id; the caller must call `sendInput` with NO await in between so
+   *  the send folds into that run. */
+  async function startBusyTaskWithModal(title: string) {
+    const { createTask, startTask } = await import("./orchestrator.ts");
+    const claudeTmux = await import("./claude-tmux.ts");
+    const created = await createTask({
+      title,
+      prompt: "first message",
+      agent: "claude-code",
+      workdir: process.cwd(),
+      isolation: "none",
+      model: "sonnet-5",
+      effort: "high",
+    });
+    if ("error" in created) throw new Error(created.error);
+    const taskId = created.task.id;
+    const res = await startTask(taskId);
+    if (!("runId" in res)) throw new Error("startTask failed");
+    claudeTmux.__forTest.installSession(taskId, freshJsonl());
+    return { taskId, runId: res.runId };
+  }
+
+  test("unbounded sendInput (internal callers) reports withheld:true, not a pending delivered:true", async () => {
+    const { sendInput } = await import("./orchestrator.ts");
+    const { db, tasks } = await import("./db.ts");
+    const claudeTmux = await import("./claude-tmux.ts");
+    // Deliberately NOT shortening the grace: the bug only exists because the
+    // default grace equals SPAWN_RESPONSE_BUDGET_MS.
+    expect(claudeTmux.__forTest.PASTE_MODAL_GRACE_MS).toBeGreaterThanOrEqual(1_500);
+    const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(50);
+    const prevCapture = claudeTmux.__forTest.setCapturePastePane(async () => BLOCKING_PANE);
+    const { taskId, runId } = await startBusyTaskWithModal("withheld-real-grace-unbounded");
+    try {
+      const sent = await sendInput(runId, "internal follow-up");
+      expect(sent.delivered).toBe(false);
+      if (sent.delivered) return;
+      expect(sent.withheld).toBe(true);
+      expect(sent.savedToBacklog).toBe(true);
+      await claudeTmux.__forTest.pasteChains.get(taskId);
+      await waitFor(() => (tasks.get(taskId)?.backlog.length ?? 0) >= 1);
+      expect(tasks.get(taskId)?.backlog.map((b) => b.text)).toEqual(["internal follow-up"]);
+    } finally {
+      claudeTmux.__forTest.setCapturePastePane(prevCapture);
+      claudeTmux.__forTest.setPasteModalPollMs(prevPoll);
+      claudeTmux.__forTest.uninstallSession(taskId);
+      await waitFor(() => tasks.get(taskId)?.column !== "running").catch(() => {});
+      db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    }
+  }, 10_000);
+
+  test("bounded sendInput (HTTP route) answers pending, then one send-failed with savedToBacklog and no duplicate stash", async () => {
+    const { sendInput, subscribeGlobal } = await import("./orchestrator.ts");
+    const { db, tasks } = await import("./db.ts");
+    const claudeTmux = await import("./claude-tmux.ts");
+    const { SPAWN_RESPONSE_BUDGET_MS } = await import("../shared/types.ts");
+    const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(50);
+    const prevCapture = claudeTmux.__forTest.setCapturePastePane(async () => BLOCKING_PANE);
+    const failed: { savedToBacklog: boolean }[] = [];
+    let taskId = "";
+    const unsubscribe = subscribeGlobal((e) => {
+      if (e.kind === "send-failed" && e.taskId === taskId) failed.push(e);
+    });
+    const started = await startBusyTaskWithModal("withheld-real-grace-bounded");
+    taskId = started.taskId;
+    try {
+      const before = Date.now();
+      const sent = await sendInput(started.runId, "http follow-up", { bounded: true });
+      expect(Date.now() - before).toBeLessThan(SPAWN_RESPONSE_BUDGET_MS + 500);
+      expect(sent).toEqual({ delivered: true, runId: started.runId, pending: true });
+      await waitFor(() => failed.length > 0, 6000);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(failed).toHaveLength(1);
+      expect(failed[0]!.savedToBacklog).toBe(true);
+      expect(tasks.get(taskId)?.backlog.map((b) => b.text)).toEqual(["http follow-up"]);
+    } finally {
+      unsubscribe();
+      claudeTmux.__forTest.setCapturePastePane(prevCapture);
+      claudeTmux.__forTest.setPasteModalPollMs(prevPoll);
+      claudeTmux.__forTest.uninstallSession(taskId);
+      await waitFor(() => tasks.get(taskId)?.column !== "running").catch(() => {});
+      db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    }
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 1c — savedToBacklog is truthful when the re-stash is skipped
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("withheld send on a task archived mid-paste reports savedToBacklog:false, stashes nothing, and its status line doesn't claim a save", async () => {
+  const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
+  const { db, runs, tasks } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "withheld-archived-mid-paste",
+    prompt: "first message",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  const res = await startTask(taskId);
+  if (!("runId" in res)) throw new Error("expected the fake driver to start a run");
+  const r1 = res.runId;
+  await waitFor(() => tasks.get(taskId)?.column !== "running");
+
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+  const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
+  const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(10);
+  // `sendInput` un-archives before dispatching; the archive lands while the
+  // paste guard is reading the pane — the concurrent-archive race
+  // `restashPasteWithheldText` guards against.
+  const prevCapture = claudeTmux.__forTest.setCapturePastePane(async () => {
+    if (tasks.get(taskId)?.archivedAt == null) tasks.update(taskId, { archivedAt: Date.now() });
+    return BLOCKING_PANE;
+  });
+  try {
+    const sent = await sendInput(r1, "lost to the archive");
+    if (sent.delivered) throw new Error(`expected a withheld send, got ${JSON.stringify(sent)}`);
+    expect(sent.withheld).toBe(true);
+    expect(sent.savedToBacklog).toBe(false);
+    expect(sent.reason).toContain("not delivered");
+    expect(sent.reason).not.toContain("was saved");
+    await claudeTmux.__forTest.pasteChains.get(taskId);
+    expect(tasks.get(taskId)?.backlog ?? []).toHaveLength(0);
+    const statuses = runs.eventsForTask(taskId).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(statuses).toContain("message not delivered — the task was archived before it could be saved to your backlog");
+    expect(statuses.some((t) => t.includes("saved to your backlog") && !t.startsWith("message not delivered"))).toBe(false);
+  } finally {
+    claudeTmux.__forTest.setCapturePastePane(prevCapture);
+    claudeTmux.__forTest.setPasteModalGraceMs(prevGrace);
+    claudeTmux.__forTest.setPasteModalPollMs(prevPoll);
+    claudeTmux.__forTest.uninstallSession(taskId);
+    await waitFor(() => tasks.get(taskId)?.column !== "running").catch(() => {});
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
+/* ────────────────────────────────────────────────────────────────────────── *
  * 2 — Withheld idle send (no active run)
  * ────────────────────────────────────────────────────────────────────────── */
 

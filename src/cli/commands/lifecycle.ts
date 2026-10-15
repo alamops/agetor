@@ -135,7 +135,7 @@ export async function cmdSend(args: string[], flags: Flags): Promise<void> {
   if (res.pending) {
     out(
       `${c.yellow("→")} accepted by ${c.dim(short)}${refNote} ` +
-        c.dim("(session is still launching; the message will be delivered once it's up)"),
+        c.dim("(the session is still getting ready; the app reports the delivery outcome, including when a failed message could not be restored to the task's backlog)"),
     );
   } else {
     out(`${c.green("→")} sent to ${c.dim(short)}${refNote}`);

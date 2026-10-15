@@ -72,5 +72,16 @@ export function toastFor(e: GlobalEvent, hiddenTaskIds?: ReadonlySet<string>): T
     const why = e.reason === "api-error" ? " (API error)" : "";
     return { text: `! ${short(e.taskId)} needs you${why}`, color: "yellow" };
   }
+  // A send the app answered `pending: true` (session still launching) failed
+  // after the fact — the message was re-stashed into the task's backlog when
+  // `savedToBacklog` says so. Live-only; the dashboard has no persistent
+  // surface for it, so a one-line toast is all it gets.
+  if (e.kind === "send-failed") {
+    if (hidden(e.taskId)) return null;
+    return {
+      text: `! ${short(e.taskId)} message not delivered${e.savedToBacklog ? " — saved to its backlog" : ""}`,
+      color: "yellow",
+    };
+  }
   return null;
 }

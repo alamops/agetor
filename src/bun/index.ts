@@ -7,6 +7,8 @@ import { DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
+import { startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
+import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
@@ -134,6 +136,17 @@ rehydratePath();
 // fails boot loudly, matching that old synchronous-throw behavior — no
 // swallow.
 //
+// Event-loop lag monitor (docs/plans/non-blocking-session-restore.md, decision
+// C): one `.unref()`'d sampler that names whatever held the single main thread
+// for >= 1 s (a labelled `beginLagLabel` span, else a bare "no label" warning).
+// `sampleMs: 100`, not the 500 ms default: lag is measured as actual - expected
+// fire time, so a block that starts mid-interval is under-measured by up to
+// `sampleMs`; at 100 ms a 1.1 s block reliably crosses the 1 s stall bar.
+// Started BEFORE the boot restore below (not after the API is up) so the
+// `boot reattach` / `reattach session` / watcher-seed labels it exists to
+// attribute are actually sampled. Unref'd, so an early boot failure can never
+// be held open by it; every shutdown path calls `stopLagMonitor()`.
+startLagMonitor({ sampleMs: 100 });
 // Must run before reconcileOrphans(): reconciliation issues `has-session`
 // probes against agetor's tmux socket, and the first tmux command to touch
 // a socket auto-starts its server — un-disclaimed, if this didn't run
@@ -436,6 +449,11 @@ writeCoreCreds(
   dataDir,
 );
 
+// Archived-history retention: first pass ~90 s after boot (after the API is
+// up and restore/seed work has settled), then every 24 h; each fire reads the
+// preference fresh. Also re-armed on demand by `PUT /preferences/...`.
+scheduleRetention();
+
 // Warn the user before quitting when runs are still active. Electrobun's
 // `before-quit` event fires synchronously from Utils.quit() and reads
 // `responseWasSet && response.allow === false` to veto — we can't await an
@@ -499,6 +517,13 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
 // about letting the process exit at all; it touches no persisted
 // `fxRecovery` row — `rearmFxAutoResumes()` re-arms from the DB on next boot.
 process.on("exit", stopFxAutoResumeTimers);
+// Same for the retention timers (a running pass is told to stop between
+// chunks; trimmed rows stay trimmed and the next boot resumes) and the lag
+// sampler.
+process.on("exit", () => {
+  stopRetentionTimers();
+  stopLagMonitor();
+});
 
 // Background self-update check on launch + every 6h. Emits global events
 // that the UI subscribes to via SSE to render the "update ready" banner.

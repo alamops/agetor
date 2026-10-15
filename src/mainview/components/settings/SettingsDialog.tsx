@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { BarChart3, ChevronLeft, Minus, Monitor, Moon, Plus, Sun, Terminal, Trash2, X } from "lucide-react";
+import { createPortal } from "react-dom";
+import { BarChart3, ChevronLeft, Loader2, Minus, Monitor, Moon, Plus, Sun, Terminal, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError, api, type AccountUsageDay, type HarnessesPayload, type HarnessInput } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -21,6 +22,15 @@ import { isMacPlatform } from "@/lib/platform";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
 import { FX_AUTO_RESUME_MAX, parseFxAutoResumeDelayInput } from "@/lib/fx-auto-resume-prefs";
+import {
+  ARCHIVED_HISTORY_RETENTION_PREF,
+  formatBytes,
+  formatDbStatsLine,
+  formatRetentionValue,
+  parseArchivedHistoryRetentionDays,
+  retentionOptionLabel,
+  retentionSelectOptions,
+} from "@/lib/retention-prefs";
 import { abbreviateHome, cn, formatTokens } from "@/lib/utils";
 import { resolveTemplateInitialHome } from "@/lib/harness-template";
 import { harnessEditorDirty } from "@/lib/harness-editor-dirty";
@@ -47,6 +57,8 @@ import {
   HARNESS_TEMPLATES,
   THEME_PREFERENCES,
   type AgentKind,
+  type DbCompactResult,
+  type DbStats,
   type DiscoveredAccount,
   type Harness,
   type HarnessTemplate,
@@ -856,6 +868,195 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
   );
 }
 
+/** `ApiError` for a refused Compact is a 409 whose message already is the
+ *  server's `error` ("N task(s) running — stop or wait for them first"). */
+function compactRefusal(e: unknown): string | null {
+  if (!(e instanceof ApiError) || e.status !== 409) return null;
+  const body = e.body;
+  if (body && typeof body === "object" && "error" in body && typeof body.error === "string") return body.error;
+  return e.message;
+}
+
+/**
+ * Settings → General "Archived task history": the retention age picker, the
+ * database size line and the manual Compact button
+ * (docs/plans/non-blocking-session-restore.md, decision F, task T11).
+ *
+ * Self-contained on purpose — it owns its own preference + stats fetches
+ * (on mount, which is every time the General section opens), so nothing
+ * threads through `SettingsDialog`'s `refresh()`. Compact is the one request
+ * that deliberately freezes the core (`VACUUM`), so it runs behind a confirm
+ * that states the estimate and then a blocking modal that can't be dismissed
+ * until the request settles; `api.compactDb` suspends the app-level busy
+ * banner for the duration, since this modal already explains the pause.
+ */
+function ArchivedHistorySection() {
+  const confirm = useConfirm();
+  const [days, setDays] = useState<number | null>(() => parseArchivedHistoryRetentionDays(undefined));
+  const [loaded, setLoaded] = useState(false);
+  const [prefError, setPrefError] = useState<string | null>(null);
+  const [stats, setStats] = useState<DbStats | null>(null);
+  const [compacting, setCompacting] = useState<{ estimateSec: number } | null>(null);
+  const [compactResult, setCompactResult] = useState<DbCompactResult | null>(null);
+  const [compactRefused, setCompactRefused] = useState<string | null>(null);
+  const [compactError, setCompactError] = useState<string | null>(null);
+  const mountedRef = useRef(true);
+  // Sequence guard: a slow stats answer must never overwrite a newer one (the
+  // post-compact refetch races the on-mount one when the section is reopened).
+  const statsSeqRef = useRef(0);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  const loadStats = async (): Promise<DbStats | null> => {
+    const seq = ++statsSeqRef.current;
+    try {
+      const fresh = await api.getDbStats();
+      if (mountedRef.current && seq === statsSeqRef.current) setStats(fresh);
+      return fresh;
+    } catch {
+      // Best-effort display line — an older core without `/db/stats` (or a
+      // busy one) just leaves the previous line / none.
+      return null;
+    }
+  };
+
+  useEffect(() => {
+    void api.listPreferences()
+      .then((prefs) => {
+        if (!mountedRef.current) return;
+        setDays(parseArchivedHistoryRetentionDays(prefs[ARCHIVED_HISTORY_RETENTION_PREF]));
+        setLoaded(true);
+      })
+      .catch(() => { if (mountedRef.current) setLoaded(true); });
+    void loadStats();
+  }, []);
+
+  const onPickDays = (next: number | null) => {
+    const previous = days;
+    setDays(next);
+    setPrefError(null);
+    api.setPreference(ARCHIVED_HISTORY_RETENTION_PREF, formatRetentionValue(next))
+      .then(() => { void loadStats(); })
+      .catch((e: unknown) => {
+        if (!mountedRef.current) return;
+        // Revert only if this failed write is still the latest selection.
+        setDays((current) => (current === next ? previous : current));
+        setPrefError(`Couldn't save: ${e instanceof Error ? e.message : String(e)}`);
+      });
+  };
+
+  const onCompact = async () => {
+    setCompactResult(null);
+    setCompactRefused(null);
+    setCompactError(null);
+    // Fresh stats first: the estimate and the active-run count both go stale.
+    const fresh = (await loadStats()) ?? stats;
+    if (!mountedRef.current) return;
+    const estimateSec = Math.max(1, Math.round(fresh?.compactEstimateSec ?? 0));
+    const ok = await confirm({
+      title: "Compact the database?",
+      description: (
+        <>
+          Rewrites the database file to give back unused space
+          {fresh ? ` (about ${formatBytes(fresh.reclaimableBytes)} reclaimable)` : ""}. This takes about {estimateSec} s,
+          and Agetor won't respond while it runs. Compacting is refused while any task is running.
+        </>
+      ),
+      confirmLabel: "Compact",
+    });
+    if (!ok || !mountedRef.current) return;
+    setCompacting({ estimateSec });
+    try {
+      const result = await api.compactDb();
+      if (!mountedRef.current) return;
+      setCompactResult(result);
+      void loadStats();
+    } catch (e) {
+      if (!mountedRef.current) return;
+      const refusal = compactRefusal(e);
+      if (refusal !== null) setCompactRefused(refusal);
+      else setCompactError(`Couldn't compact: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      if (mountedRef.current) setCompacting(null);
+    }
+  };
+
+  return (
+    <section className="space-y-1" data-testid="settings-archived-history">
+      <label htmlFor="archived-history-retention" className="text-xs text-muted-foreground">
+        Archived task history
+      </label>
+      <Select
+        id="archived-history-retention"
+        data-testid="settings-archived-history-retention"
+        value={days === null ? "off" : String(days)}
+        disabled={!loaded}
+        onChange={(e) => onPickDays(e.target.value === "off" ? null : Number(e.target.value))}
+      >
+        {retentionSelectOptions(days).map((d) => (
+          <option key={d === null ? "off" : d} value={d === null ? "off" : String(d)}>
+            {d === null ? "Off — keep everything" : `Trim after ${retentionOptionLabel(d)}`}
+          </option>
+        ))}
+      </Select>
+      <p className="text-[11px] text-muted-foreground">
+        Large tool outputs (over 4 KB) in tasks archived longer than this are trimmed to their first 4 KB. This is
+        one-way: "Rebuild from session JSONL" can only restore them while Claude's own transcript still exists.
+        Runs automatically after launch and daily.
+      </p>
+      {prefError && <p className="text-[11px] text-danger" data-testid="settings-archived-history-error">{prefError}</p>}
+      {stats && (
+        <p className="text-[11px] text-muted-foreground" data-testid="settings-db-stats">
+          {formatDbStatsLine(stats)}
+        </p>
+      )}
+      <div className="flex items-center gap-2 pt-1">
+        <Button
+          size="sm"
+          variant="outline"
+          data-testid="settings-db-compact"
+          disabled={compacting !== null}
+          onClick={() => { void onCompact(); }}
+        >
+          Compact database
+        </Button>
+        <span className="text-[11px] text-muted-foreground">Reclaims unused space; pauses Agetor briefly.</span>
+      </div>
+      {compactResult && (
+        <p className="text-[11px] text-success" data-testid="settings-db-compact-result">
+          Compacted: {formatBytes(compactResult.beforeBytes)} → {formatBytes(compactResult.afterBytes)}
+        </p>
+      )}
+      {compactRefused && (
+        <p className="text-[11px] text-warning" data-testid="settings-db-compact-refused">{compactRefused}</p>
+      )}
+      {compactError && <p className="text-[11px] text-danger" data-testid="settings-db-compact-error">{compactError}</p>}
+      {/* Portaled to <body>: the blocking modal must sit above the Settings
+          dialog regardless of that panel's stacking/overflow, like the
+          confirm and bundle dialogs. `onClose` is a no-op — the core is
+          frozen for the duration and there is nothing to dismiss to. */}
+      {createPortal(
+        <Dialog open={compacting !== null} onClose={() => {}} labelledBy="db-compacting-title" className="max-w-sm">
+          <div className="flex items-start gap-3" data-testid="settings-db-compacting" role="status">
+            <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin text-muted-foreground motion-reduce:animate-none" aria-hidden />
+            <div className="space-y-1">
+              <h2 id="db-compacting-title" className="text-sm font-medium">
+                Compacting… ~{compacting?.estimateSec ?? 0} s
+              </h2>
+              <p className="text-xs text-muted-foreground">
+                Agetor won't respond until this finishes. Please don't quit.
+              </p>
+            </div>
+          </div>
+        </Dialog>,
+        document.body,
+      )}
+    </section>
+  );
+}
+
 function GeneralSection({
   payload,
   defaultHarness,
@@ -1097,6 +1298,8 @@ function GeneralSection({
           />
         </div>
       </section>
+
+      <ArchivedHistorySection />
 
       <section className="space-y-1">
         <label className="text-xs text-muted-foreground">Getting started</label>

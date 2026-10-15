@@ -28,7 +28,16 @@ import {
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { beginLagLabel } from "./event-loop-lag.ts";
+import { activeRunCount, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import {
+  compactDatabase,
+  configuredRetentionDays,
+  dbStats,
+  isRetentionRunning,
+  requestRetentionPass,
+  runArchivedHistoryRetentionPass,
+} from "./retention.ts";
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
@@ -178,6 +187,8 @@ import {
   type AskQuestionsAnswer,
 } from "./interactions.ts";
 import {
+  ARCHIVED_HISTORY_RETENTION_INVALID_ERROR,
+  ARCHIVED_HISTORY_RETENTION_PREF,
   DEFAULT_BRANCH_CONFIG,
   DEFAULT_MODEL,
   EVENTS_PAGE_MAX_BYTES,
@@ -189,6 +200,8 @@ import {
   PIPELINE_LIMITS,
   TASK_EVENTS_REPLAY_META_EVENT,
   TASK_TYPES,
+  normalizeArchivedHistoryRetentionValue,
+  parseArchivedHistoryRetentionDays,
   supportedEfforts,
   validateBranchConfig,
 } from "../shared/types.ts";
@@ -1040,6 +1053,32 @@ function validateCloneLaunch(
   return out;
 }
 
+/** The lag-monitor label every native Open panel is bracketed with. */
+export const NATIVE_FILE_DIALOG_LAG_LABEL = "native file dialog";
+
+/**
+ * `native.openFileDialog`, bracketed with a context-free lag label.
+ * Electrobun's `Utils.openFileDialog` is a synchronous FFI call, so the Bun
+ * main thread is blocked for as long as the panel is up — an expected block
+ * the user is driving. The label makes the event-loop-lag monitor name it
+ * ("core was unresponsive for 12.3 s during native file dialog") instead of
+ * blaming whatever unrelated labelled work (a watcher restoring another task)
+ * happened to be in flight; having no task context, it never writes a status
+ * line into a transcript. The webview suspends its busy banner for the same
+ * requests (`api.ts`).
+ */
+async function openFileDialogLabelled(
+  native: ApiNative,
+  opts: Parameters<ApiNative["openFileDialog"]>[0],
+): Promise<string[]> {
+  const end = beginLagLabel(NATIVE_FILE_DIALOG_LAG_LABEL);
+  try {
+    return await native.openFileDialog(opts);
+  } finally {
+    end();
+  }
+}
+
 /**
  * Native-host capabilities the API needs but that only exist inside the
  * Electrobun app: file/folder dialogs, OS notifications, open-in-Finder /
@@ -1102,6 +1141,18 @@ const notAvailableHeadless = (req: Request) =>
 
 export function startApiServer(deps: { native?: ApiNative; hostname?: string } = {}) {
   const native = deps.native;
+  const blockRouteEnabled = process.env.AGETOR_TEST_BLOCK_ROUTE === "1";
+  const blockEventLoopRoute = authed(async (req: Request) => {
+    const body = (await req.json().catch(() => ({}))) as { ms?: unknown };
+    const ms = body.ms;
+    // 20 s ceiling: long enough for the busy-banner e2e (two unanswered
+    // probes ≈ 8.5 s after the block starts, plus margin).
+    if (typeof ms !== "number" || !Number.isInteger(ms) || ms < 1 || ms > 20_000) {
+      return json({ error: "ms (integer 1..20000) required" }, { status: 400, headers: corsHeaders(req) });
+    }
+    Bun.sleepSync(ms);
+    return json({ ok: true, ms }, { headers: corsHeaders(req) });
+  });
   // Read the port fresh — supports tests that import server.ts after setting
   // AGETOR_API_PORT and rely on the bind to honour their override even when
   // a sibling test file imported the module first.
@@ -1465,7 +1516,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             }
           } catch { /* no body is fine */ }
           if (!native) return notAvailableHeadless(req);
-          const paths = await native.openFileDialog({
+          const paths = await openFileDialogLabelled(native, {
             startingFolder,
             canChooseFiles: false,
             canChooseDirectory: true,
@@ -3554,9 +3605,110 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if (typeof body.value !== "string") {
             return json({ error: "value (string) required" }, { status: 400, headers: corsHeaders(req) });
           }
+          if (req.params.key === ARCHIVED_HISTORY_RETENTION_PREF) {
+            // The retention age drives a destructive, one-way trim, so it is
+            // validated rather than stored opaquely: an off-word ("0",
+            // "false", …) is stored as "off", a day count as its integer
+            // string, and anything else is refused with nothing stored and
+            // nothing scheduled — a typo must never start a trim.
+            const normalized = normalizeArchivedHistoryRetentionValue(body.value);
+            if (normalized === null) {
+              return json({ error: ARCHIVED_HISTORY_RETENTION_INVALID_ERROR }, { status: 400, headers: corsHeaders(req) });
+            }
+            preferences.set(req.params.key, normalized);
+            // Turning retention on (or changing its age) asks for a pass soon
+            // — debounced inside `requestRetentionPass`, so a user stepping
+            // through the Settings select doesn't start one per click. "off"
+            // schedules nothing (an already-running pass is not interrupted;
+            // it finishes, and the next fire reads the pref fresh).
+            if (parseArchivedHistoryRetentionDays(normalized) !== null) requestRetentionPass();
+            return new Response(null, { status: 204, headers: corsHeaders(req) });
+          }
           preferences.set(req.params.key, body.value);
           return new Response(null, { status: 204, headers: corsHeaders(req) });
         }),
+      },
+
+      // Database size / maintenance (docs/plans/non-blocking-session-restore.md
+      // §2.4): Settings → General "Archived task history", `agetor compact`.
+      "/db/stats": {
+        GET: authed((req) => json(dbStats(activeRunCount()), { headers: corsHeaders(req) })),
+      },
+      // `VACUUM` rewrites the whole file synchronously on the single main
+      // thread, so every other request stalls for its duration (the stats'
+      // `compactEstimateSec`). It is refused while any run is live — a stalled
+      // loop would freeze the streaming transcripts and miss tmux/JSONL
+      // events — and while a retention pass is mid-yield (its writes would
+      // interleave with the rebuild). Opts out of the idle timeout: a large
+      // database can take minutes.
+      "/db/compact": {
+        POST: authed((req) => {
+          // A retention pass is checked first: it is the database's own
+          // maintenance (and ends on its own), so it names the more specific
+          // reason when both hold.
+          if (isRetentionRunning()) {
+            return json(
+              { error: "archived-history retention is running — try again when it finishes" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          const n = activeRunCount();
+          if (n > 0) {
+            return json(
+              { error: `${n} task${n === 1 ? "" : "s"} running — stop or wait for them first`, activeRunCount: n },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          server.timeout(req, 0);
+          try {
+            return json({ ok: true, ...compactDatabase() }, { headers: corsHeaders(req) });
+          } catch (err) {
+            return json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+        }),
+      },
+      // Manual "trim archived history now" — the same pass the scheduler
+      // runs. Held open until it finishes (it yields to the event loop
+      // between slices, so other requests keep flowing).
+      "/db/retention/run": {
+        POST: authed(async (req) => {
+          if (isRetentionRunning()) {
+            return json(
+              { error: "archived-history retention is already running" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          const days = configuredRetentionDays();
+          if (days === null) {
+            return json(
+              { error: "archived-history retention is off" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          server.timeout(req, 0);
+          return json(await runArchivedHistoryRetentionPass({ days }), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Test-only (e2e/unit): hold the main thread for `ms` so the core-busy
+      // banner and the event-loop lag monitor can be exercised end to end.
+      // Live ONLY when AGETOR_TEST_BLOCK_ROUTE=1 was set when this server
+      // started (`blockRouteEnabled`, read once per `startApiServer` call so a
+      // test can run an enabled and a disabled instance side by side) — never
+      // in a production process. Disabled, the handler answers exactly what the
+      // 404 fallback does, before the auth check, so the path is
+      // indistinguishable from an unregistered one. (A conditional object
+      // spread would be the literal "not registered" form, but it types the key
+      // as possibly-undefined, which Bun.serve's route typing rejects.)
+      // Enabled, it is token-gated like every other route.
+      "/test/block-event-loop": {
+        POST: (req: Request) => {
+          if (!blockRouteEnabled) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          return blockEventLoopRoute(req);
+        },
       },
 
       // App info — currently just the version. Read at module-load time
@@ -4442,7 +4594,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               if (!native) return notAvailableHeadless(req);
               // The request stays open while the panel is up.
               server.timeout(req, 0);
-              const picks = await native.openFileDialog({
+              const picks = await openFileDialogLabelled(native, {
                 startingFolder: homedir(),
                 canChooseFiles: false,
                 canChooseDirectory: true,
@@ -4482,7 +4634,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           } else {
             if (!native) return notAvailableHeadless(req);
             server.timeout(req, 0);
-            const picks = await native.openFileDialog({
+            const picks = await openFileDialogLabelled(native, {
               startingFolder: homedir(),
               allowedFileTypes: "json",
               canChooseFiles: true,
@@ -5806,7 +5958,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             }
           }
           if (!native) return notAvailableHeadless(req);
-          const paths = await native.openFileDialog({
+          const paths = await openFileDialogLabelled(native, {
             startingFolder,
             canChooseFiles: mode === "files",
             canChooseDirectory: mode === "folder",
@@ -6126,7 +6278,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               // hold up). Left undefined on a successful/failed drive; the
               // response only carries these when the fallback actually ran.
               let withheld: true | undefined;
-              let savedToBacklog: true | undefined;
+              let savedToBacklog: boolean | undefined;
               let reason: string | undefined;
               // Which path actually delivered (or attempted) the answer — lets
               // the UI word a failure toast accurately.
@@ -6778,7 +6930,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             );
           }
           return json(
-            await sendInput(req.params.id, line),
+            await sendInput(req.params.id, line, { bounded: true }),
             { headers: corsHeaders(req) },
           );
         }),

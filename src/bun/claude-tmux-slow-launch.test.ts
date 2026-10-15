@@ -16,6 +16,8 @@ import { rmTestDataDir } from "./test-data-dir.ts";
  * `spawnClaudeViaTmux`). This file covers:
  *   (a) the pure formatter (`formatSlowLaunchStatus`) — exact string/rounding
  *   (b) the test seam's save/restore contract (`setSlowLaunchWarnMs`)
+ *       (including the optional fourth `watcher` stage that the boot IIFE adds
+ *       once the subagent watcher has seeded — see `attachTailer`)
  *   (c) an integration test driving `spawnClaudeViaTmux` itself through a
  *       stub tmux binary whose `new-session` sleeps, proving the breadcrumb
  *       actually fires (and, in the negative case, doesn't) through the real
@@ -67,6 +69,28 @@ test("formatSlowLaunchStatus handles a sub-second total", () => {
   expect(
     formatSlowLaunchStatus({ killMs: 1, settingsMs: 2, newSessionMs: 3 }),
   ).toBe("session launch took 0.0s (kill 1ms · settings 2ms · tmux new-session 3ms)");
+});
+
+test("formatSlowLaunchStatus appends the watcher stage and folds it into the total when provided", () => {
+  // 4000 + 1200 + 300 + 700 = 6200ms = 6.2s.
+  expect(
+    formatSlowLaunchStatus({ killMs: 4000, settingsMs: 1200, newSessionMs: 300, watcherMs: 700 }),
+  ).toBe(
+    "session launch took 6.2s (kill 4000ms · settings 1200ms · tmux new-session 300ms · watcher 700ms)",
+  );
+  // A zero watcher stage is still "provided": the stage is printed.
+  expect(
+    formatSlowLaunchStatus({ killMs: 1, settingsMs: 2, newSessionMs: 3, watcherMs: 0 }),
+  ).toBe("session launch took 0.0s (kill 1ms · settings 2ms · tmux new-session 3ms · watcher 0ms)");
+});
+
+test("formatSlowLaunchStatus without watcherMs is byte-identical to the three-stage string", () => {
+  const stages = { killMs: 4000, settingsMs: 1200, newSessionMs: 300 };
+  const three = "session launch took 5.5s (kill 4000ms · settings 1200ms · tmux new-session 300ms)";
+  expect(formatSlowLaunchStatus(stages)).toBe(three);
+  // An explicit `undefined` (what the failed-launch call site passes) must not
+  // change the output either.
+  expect(formatSlowLaunchStatus({ ...stages, watcherMs: undefined })).toBe(three);
 });
 
 test("formatSlowLaunchStatus sums all three stages into the total, not just the largest", () => {
@@ -199,13 +223,14 @@ test("spawnClaudeViaTmux emits the slow-launch breadcrumb before the ready statu
   );
 
   expect(breadcrumbIdx).toBeGreaterThanOrEqual(0);
+  // A successful launch defers the breadcrumb into the boot IIFE so it can
+  // include the subagent-watcher stage.
   expect(chunks[breadcrumbIdx]!.data).toMatch(
-    /^session launch took \d+\.\ds \(kill \d+ms · settings \d+ms · tmux new-session \d+ms\)$/,
+    /^session launch took \d+\.\ds \(kill \d+ms · settings \d+ms · tmux new-session \d+ms · watcher \d+ms\)$/,
   );
-  // The breadcrumb is emitted synchronously right after `tmux new-session`
-  // resolves, before the boot-wait IIFE's own "ready" status — it must never
-  // be sandwiched after it (see spawnClaudeViaTmux's doc comment above the
-  // breadcrumb block).
+  // Emitted by the boot IIFE immediately before its own "ready" status — it
+  // must never be sandwiched after it (see spawnClaudeViaTmux's doc comment
+  // above `reportSlowLaunch`).
   expect(readyIdx).toBeGreaterThan(breadcrumbIdx);
 });
 

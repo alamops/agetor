@@ -6,8 +6,11 @@ import type {
   BranchInfo,
   BranchNamingConfig,
   ColumnId,
+  DbCompactResult,
+  DbStats,
   DiscoveredAccount,
   GlobalEvent,
+  RetentionPassResult,
   GitHubIssueThreadResult,
   GitHubItemKind,
   GitHubItemState,
@@ -99,6 +102,7 @@ import type {
 } from "../../shared/bundle.ts";
 import type { BundleImportOptions, BundleImportPlan, BundleImportResponse } from "../../shared/bundle-import.ts";
 import { ApiTransitError, fetchWithRecovery } from "./net-retry.ts";
+import { configureCoreBusy, suspendCoreBusy, trackRequest } from "./core-busy.ts";
 
 export interface UpdateSnapshot {
   status: UpdateStatus;
@@ -347,6 +351,11 @@ const API_PORT = injected?.port ?? params.get("api") ?? "4317";
 const API_TOKEN = injected?.token ?? params.get("token") ?? "";
 const BASE = `http://127.0.0.1:${API_PORT}`;
 
+// Point the busy-banner watchdog at this core before the first request. It
+// only ever probes the unauthenticated `/health` route and never aborts or
+// retries a tracked request (docs/plans/non-blocking-session-restore.md).
+configureCoreBusy({ base: BASE });
+
 /** Error thrown for any non-2xx API response. Carries the parsed JSON body
  *  so callers can read structured fields (e.g. the `taskIds` list returned
  *  by `DELETE /harnesses/:id` when the harness is still in use) instead of
@@ -362,7 +371,18 @@ export class ApiError extends Error {
   }
 }
 
-async function j<T>(
+function j<T>(
+  path: string,
+  init?: RequestInit,
+  opts?: { retry?: boolean },
+): Promise<T> {
+  // The whole request — fetch AND body parse — is registered with the
+  // core-busy watchdog, so a response that was accepted but never finishes
+  // (a blocked Bun main thread) counts as pending and can raise the banner.
+  return trackRequest(jRequest<T>(path, init, opts));
+}
+
+async function jRequest<T>(
   path: string,
   init?: RequestInit,
   opts?: { retry?: boolean },
@@ -409,6 +429,23 @@ async function bundleJ<T extends object>(
     throw new ApiTransitError(`request to ${path} returned an unreadable answer`);
   }
   return body as T;
+}
+
+/**
+ * Run a request that is EXPECTED to block the core's main thread with the busy
+ * banner suspended for its lifetime, so "Agetor is busy" never shows as a false
+ * alarm: `compactDb` (VACUUM) and every request that opens a native Open panel
+ * — Electrobun's `openFileDialog` is a synchronous FFI call, so the core is
+ * blocked for as long as the user keeps the panel up (the server brackets
+ * those calls with a `native file dialog` lag label for the same reason).
+ */
+export async function withCoreBusySuspended<T>(request: () => Promise<T>): Promise<T> {
+  const release = suspendCoreBusy();
+  try {
+    return await request();
+  } finally {
+    release();
+  }
 }
 
 export interface AppDefaults { home: string; cwd: string; dataDir: string }
@@ -600,17 +637,23 @@ export const api = {
     bundleJ<BundleExportResponse>("/bundle/export", { method: "POST", body: JSON.stringify(selection) }),
   /** Save the export to ~/Downloads (revealed in Finder) or a folder picked
    *  in the native panel. `retry: false` — a replay would write a second,
-   *  numbered copy (or open a second panel). */
-  saveBundle: (selection: BundleSelection, target: "downloads" | "folder") =>
-    bundleJ<BundleSaveResponse>(
-      "/bundle/export/save",
-      { method: "POST", body: JSON.stringify({ ...selection, target }) },
-      { retry: false },
-    ),
+   *  numbered copy (or open a second panel). Only the folder target opens a
+   *  panel, so only it suspends the busy banner. */
+  saveBundle: (selection: BundleSelection, target: "downloads" | "folder") => {
+    const request = () =>
+      bundleJ<BundleSaveResponse>(
+        "/bundle/export/save",
+        { method: "POST", body: JSON.stringify({ ...selection, target }) },
+        { retry: false },
+      );
+    return target === "folder" ? withCoreBusySuspended(request) : request();
+  },
   /** Choose file: the native Open panel, filtered to .json. `retry: false` —
    *  a replay would open the panel twice. */
   pickBundleFile: () =>
-    bundleJ<BundlePickResponse>("/bundle/pick-file", { method: "POST", body: "{}" }, { retry: false }),
+    withCoreBusySuspended(() =>
+      bundleJ<BundlePickResponse>("/bundle/pick-file", { method: "POST", body: "{}" }, { retry: false }),
+    ),
   /** Dry run: what importing `text` would create, rename and bind. `signal`
    *  lets the import dialog drop a preview it no longer wants (the dialog
    *  closed or got new text) instead of waiting for it to land. */
@@ -682,11 +725,14 @@ export const api = {
       { method: "POST" },
     ),
   listProjects: () => j<Project[]>("/projects"),
+  /** The native folder panel; registers the pick as a project. */
   pickProject: (startingFolder?: string) =>
-    j<{ project: Project | null }>("/projects/pick", {
-      method: "POST",
-      body: JSON.stringify({ startingFolder }),
-    }),
+    withCoreBusySuspended(() =>
+      j<{ project: Project | null }>("/projects/pick", {
+        method: "POST",
+        body: JSON.stringify({ startingFolder }),
+      }),
+    ),
   deleteProject: (p: string) =>
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
   cloneProject: (input: {
@@ -741,10 +787,12 @@ export const api = {
    *  reliable way to turn a user pick into an absolute path. Returns `[]` on
    *  cancel. `isDirectory` follows `mode`. */
   pickRefs: (mode: "files" | "folder", startingFolder?: string) =>
-    j<{ refs: TaskReference[] }>("/refs/pick", {
-      method: "POST",
-      body: JSON.stringify({ mode, startingFolder }),
-    }).then((r) => r.refs),
+    withCoreBusySuspended(() =>
+      j<{ refs: TaskReference[] }>("/refs/pick", {
+        method: "POST",
+        body: JSON.stringify({ mode, startingFolder }),
+      }),
+    ).then((r) => r.refs),
   /** Resolve absolute paths (pulled from a drag/drop's file:// URLs) into
    *  references — the server stats each for directory-ness and drops any
    *  that no longer exist. */
@@ -1384,6 +1432,23 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ value }),
     }),
+  /** `GET /db/stats` — file/WAL size, reclaimable bytes, the Compact estimate
+   *  and the archived-history retention bookkeeping (Settings → General). */
+  getDbStats: () => j<DbStats>("/db/stats"),
+  /** `POST /db/compact` — `VACUUM` + WAL truncate. Blocks the core for the
+   *  whole duration (the request itself is the freeze), so it suspends the
+   *  busy banner for its lifetime; the Settings modal owns the user-facing
+   *  "Agetor won't respond" copy. Refused with a 409 `ApiError` (message =
+   *  the server's "N task(s) running — …" text, body carries
+   *  `activeRunCount`) while any run is active. `retry: false` — never
+   *  replayed. */
+  compactDb: (): Promise<DbCompactResult> =>
+    withCoreBusySuspended(() => j<DbCompactResult>("/db/compact", { method: "POST" }, { retry: false })),
+  /** `POST /db/retention/run` — runs one archived-history retention pass now.
+   *  400 when the preference is `off`, 409 while a pass is already running
+   *  (both thrown as `ApiError`). `retry: false`. */
+  runRetentionPass: () =>
+    j<RetentionPassResult>("/db/retention/run", { method: "POST" }, { retry: false }),
   listAgentCapabilities: (opts: { agent: string; workdir?: string | null; branch?: string }) => {
     // Slash commands/skills + MCP/skill/plugin extensions in one fetch. `agent`
     // is a harness id (built-ins use id-equals-kind, so "claude-code" / "codex"

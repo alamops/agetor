@@ -7,7 +7,7 @@ import { notifyFor, osNotify } from "../notify.ts";
 import type { AgetorClient } from "../api-client.ts";
 import { escapeFreeText } from "../../shared/terminal-text.ts";
 import type { RunEvent, GlobalEvent, Task } from "../../shared/types.ts";
-import { FX_RECOVERY_STATUS_PREFIX, isInternalStatusSentinel } from "../../shared/types.ts";
+import { FX_RECOVERY_STATUS_PREFIX, isInternalStatusSentinel, retentionTrimNote } from "../../shared/types.ts";
 import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../../shared/fx-recovery.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
 import { COMPACTION_SUMMARY_LABEL, compactionSummaryLine } from "../../shared/compaction.ts";
@@ -18,6 +18,31 @@ import {
   sentFilesSummaryLine,
   type SentFilesRequest,
 } from "../../shared/sent-files.ts";
+
+/** The `trimmed by retention (original …)` note for a `tool_result` payload's
+ *  `retention` marker (`trimToolResultData` writes it as the payload's first
+ *  key, `docs/plans/non-blocking-session-restore.md` §2.2), or `null` when the
+ *  value isn't a well-formed marker. Shared with the TUI dashboard so both
+ *  terminal surfaces word a trimmed result identically. */
+export function retentionNoteFor(retention: unknown): string | null {
+  if (!retention || typeof retention !== "object") return null;
+  const r = retention as { trimmed?: unknown; originalBytes?: unknown; trimmedAt?: unknown };
+  if (r.trimmed !== true || typeof r.originalBytes !== "number" || !Number.isFinite(r.originalBytes)) return null;
+  return retentionTrimNote({
+    trimmed: true,
+    originalBytes: r.originalBytes,
+    trimmedAt: typeof r.trimmedAt === "number" ? r.trimmedAt : 0,
+  });
+}
+
+/** Cheap prefilter + parse for a raw `tool_result` event body: a trimmed
+ *  payload always BEGINS with `{"retention":` (that's what the retention SQL's
+ *  prefilter keys on too), so an ordinary — usually large — result never pays
+ *  a `JSON.parse` just to look for the marker. */
+export function trimmedResultNote(data: string): string | null {
+  if (!data.startsWith('{"retention":')) return null;
+  return retentionNoteFor((tryJson(data) as { retention?: unknown } | null)?.retention);
+}
 
 export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   const ref = args.find((a) => !a.startsWith("-"));
@@ -223,7 +248,7 @@ function createEventFormatter(): (e: RunEvent) => string {
       }
       case "tool_result": {
         const t = tryJson(e.data) as
-          | { toolUseId?: string; content?: unknown; isError?: boolean; attachments?: unknown }
+          | { toolUseId?: string; content?: unknown; isError?: boolean; attachments?: unknown; retention?: unknown }
           | null;
         const req = t?.toolUseId ? pendingSentFiles.get(t.toolUseId) : undefined;
         if (req && t) {
@@ -235,7 +260,8 @@ function createEventFormatter(): (e: RunEvent) => string {
           );
           return c.magenta(`📎 ${sentFilesSummaryLine(req, result)}`);
         }
-        return c.dim(`  ↳ ${t?.isError ? "error" : "result"}`);
+        const trimmed = retentionNoteFor(t?.retention);
+        return c.dim(`  ↳ ${t?.isError ? "error" : "result"}${trimmed ? ` · ${trimmed}` : ""}`);
       }
       case "interaction": {
         const r = tryJson(e.data) as { kind?: string } | null;

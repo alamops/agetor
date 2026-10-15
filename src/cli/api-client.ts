@@ -23,6 +23,9 @@ import type {
   TaskTeardownPreview,
   GitHubIssueThreadResult,
   GitProvider,
+  DbStats,
+  DbCompactResult,
+  RetentionPassResult,
 } from "../shared/types.ts";
 import type { BundleExportResponse } from "../shared/bundle.ts";
 import type { BundleImportOptions, BundleImportPlan, BundleImportResponse } from "../shared/bundle-import.ts";
@@ -61,6 +64,21 @@ const CLONE_TIMEOUT_MS = 15 * 60_000;
  *  15s budget would abort while the core was still inserting, and a retry
  *  would create a second profile. */
 const DUPLICATE_WITH_TASKS_TIMEOUT_MS = 10 * 60_000;
+/** `POST /db/compact` runs `VACUUM` + `wal_checkpoint(TRUNCATE)` on the core's
+ *  single main thread — it rewrites the whole database file, so on a
+ *  multi-GB DB (~7.5 s/GB, `DB_COMPACT_SEC_PER_GB`) the core is unresponsive
+ *  for tens of seconds or more, and longer on a slow disk. The default 15s
+ *  budget would abort the CLI while the VACUUM was still running (leaving the
+ *  user guessing whether it finished); 15 minutes comfortably covers even a
+ *  very large, cold database. */
+const COMPACT_TIMEOUT_MS = 15 * 60_000;
+/** `POST /db/retention/run` awaits a whole archived-history retention pass.
+ *  The pass is time-sliced so the core stays responsive, but a FIRST pass over
+ *  a multi-GB database trims many thousands of rows and can take minutes —
+ *  same 15-minute ceiling as {@link COMPACT_TIMEOUT_MS} so a legitimate long
+ *  pass is never aborted client-side (a re-run just resumes, trimmed rows are
+ *  skipped, but there's no reason to make the user do that). */
+const RETENTION_RUN_TIMEOUT_MS = 15 * 60_000;
 
 export class ApiError extends Error {
   constructor(
@@ -262,6 +280,27 @@ export class AgetorClient {
    *  propagate as a thrown `ApiError` like every other call here. */
   cancelFxAutoResume(taskId: string): Promise<{ ok: true }> {
     return this.req("DELETE", `/tasks/${encodeURIComponent(taskId)}/fx-auto-resume`);
+  }
+
+  // ── database maintenance (docs/plans/non-blocking-session-restore.md §2.4) ─
+  /** `GET /db/stats` — size on disk, reclaimable bytes, the Compact time
+   *  estimate, in-flight run count and the retention status. A 404 means the
+   *  running core predates the route (`ApiError`, callers say so). */
+  dbStats(): Promise<DbStats> {
+    return this.req("GET", "/db/stats");
+  }
+  /** `POST /db/compact` — `VACUUM` the database. Blocks the core for the
+   *  duration (see {@link COMPACT_TIMEOUT_MS}). A refusal while runs are in
+   *  flight is a 409 `ApiError` whose `body` is `{ error, activeRunCount }`
+   *  and whose `message` is the server's `error` text. */
+  compactDb(): Promise<DbCompactResult> {
+    return this.req("POST", "/db/compact", undefined, COMPACT_TIMEOUT_MS);
+  }
+  /** `POST /db/retention/run` — run one archived-history retention pass now.
+   *  400 `ApiError` when the `archivedHistoryRetentionDays` preference is
+   *  `off`; 409 while a pass is already running. */
+  runRetentionPass(): Promise<RetentionPassResult> {
+    return this.req("POST", "/db/retention/run", undefined, RETENTION_RUN_TIMEOUT_MS);
   }
 
   // ── projects ───────────────────────────────────────────────────────────────

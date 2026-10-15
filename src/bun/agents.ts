@@ -1,10 +1,10 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";import { cursorModelArg, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness } from "../shared/types.ts";
 import { compactionStatusLine } from "../shared/compaction.ts";
 import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
 import { HANDOFF_TAG } from "../shared/pipeline.ts";
 import { GEMINI_PROMPT_ARGV_MAX_BYTES } from "../shared/prompt-limits.ts";
-import { settleSubagentById } from "./claude-subagents.ts";
+import { attachSubagentWatcher, settleSubagentById, type SubagentWatcherHandle } from "./claude-subagents.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
   CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
@@ -1005,6 +1005,168 @@ function parseFakeSubagentMarker(prompt: string): { runMs: number; description: 
   const description = m?.[2]?.trim() || "Fake subagent";
   return { runMs, description };
 }
+/**
+ * Test hook: a fake claude turn that attaches the REAL subagent watcher
+ * (`attachSubagentWatcher`, timer mode) over real on-disk subagent
+ * transcripts, instead of faking subagent rows/events by hand the way
+ * {@link FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER} does. Exists for the structural
+ * non-blocking-restore e2e (TT8) and the watcher-drift integration test
+ * (TT2) of `docs/plans/non-blocking-session-restore.md`: a `--resume`-style
+ * follow-up turn re-attaches a watcher over a task with dozens of large
+ * transcripts, and the spec asserts (a) the rest of the app (other task
+ * panels, the pipeline run view, `/health`) stays responsive while that
+ * cooperative seed + first pass runs, and (b) the re-attach dedupes against
+ * the persisted `run_events` (zero new subagent events/rows). The TIMING
+ * claim (max event-loop gap) lives in the drift integration test, not here.
+ *
+ * Optional suffix `:<files>x<kb>` (default 20 files x 64 KB; files clamped
+ * 1..500, kb 1..8192): `__agetor_fake_claude_real_watcher__:60x512`. The LAST
+ * occurrence in the prompt wins. A follow-up turn carries no marker of its
+ * own, so the marker is also honoured from the task's stored (turn-1)
+ * prompt (see `resolveFakeRealWatcherSpec`).
+ *
+ * On-disk layout (under the task's cwd, i.e. a test's temp workdir; the
+ * session id is `fake-<taskId>`, stable across turns):
+ *
+ *   <cwd>/agetor-fake-claude/<taskId>/<sessionId>.jsonl            (main; empty)
+ *   <cwd>/agetor-fake-claude/<taskId>/<sessionId>/subagents/agent-<id>.jsonl
+ *   <cwd>/agetor-fake-claude/<taskId>/<sessionId>/subagents/agent-<id>.meta.json
+ *
+ * which is exactly the layout `attachSubagentWatcher` derives from the main
+ * JSONL path. Turn 1 (main JSONL not on disk yet) writes the files and
+ * inserts one `completed` `subagents` row per file, then attaches the real
+ * watcher and awaits `handle.settled` (seed + first full pass) BEFORE the
+ * turn resolves, so the first pass's events are persisted deterministically
+ * when the run settles. Every later turn only re-attaches (a genuine
+ * rehydrate + offset-0 replay that must dedupe to zero new events). After
+ * each turn resolves — and on `kill()` — the watcher is detached so the next
+ * turn's attach is a real rehydrate rather than a no-op on a live watcher.
+ */
+export const FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER = "__agetor_fake_claude_real_watcher__";
+export const FAKE_CLAUDE_REAL_WATCHER_DEFAULT_FILES = 20;
+export const FAKE_CLAUDE_REAL_WATCHER_DEFAULT_KB = 64;
+const FAKE_CLAUDE_REAL_WATCHER_MAX_FILES = 500;
+const FAKE_CLAUDE_REAL_WATCHER_MAX_KB = 8192;
+const FAKE_CLAUDE_REAL_WATCHER_RE = new RegExp(
+  `${FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER}(?::(\\d+)x(\\d+))?`,
+);
+interface FakeRealWatcherSpec { files: number; kb: number }
+function parseFakeRealWatcherMarker(prompt: string): FakeRealWatcherSpec | null {
+  const idx = prompt.lastIndexOf(FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER);
+  if (idx === -1) return null;
+  const m = FAKE_CLAUDE_REAL_WATCHER_RE.exec(prompt.slice(idx));
+  const files = m?.[1] ? Number(m[1]) : NaN;
+  const kb = m?.[2] ? Number(m[2]) : NaN;
+  return {
+    files: Number.isFinite(files)
+      ? Math.min(FAKE_CLAUDE_REAL_WATCHER_MAX_FILES, Math.max(1, files))
+      : FAKE_CLAUDE_REAL_WATCHER_DEFAULT_FILES,
+    kb: Number.isFinite(kb)
+      ? Math.min(FAKE_CLAUDE_REAL_WATCHER_MAX_KB, Math.max(1, kb))
+      : FAKE_CLAUDE_REAL_WATCHER_DEFAULT_KB,
+  };
+}
+/** The CURRENT turn's prompt when it carries the marker, else the task's own
+ *  stored (turn-1) prompt when THAT does — the same fallback
+ *  `resolveFakeHandoffPromptSource` uses, for the marker-less follow-up turn. */
+function resolveFakeRealWatcherSpec(taskId: string, prompt: string): FakeRealWatcherSpec | null {
+  if (prompt.includes(FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER)) return parseFakeRealWatcherMarker(prompt);
+  const stored = tasks.get(taskId)?.prompt;
+  return stored && stored.includes(FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER) ? parseFakeRealWatcherMarker(stored) : null;
+}
+/** Filesystem-safe form of a task id (a uuid in practice) — the paths below
+ *  are `path.join`ed from it, so nothing but `[A-Za-z0-9_-]` may reach them. */
+function fakeRealWatcherSafeId(taskId: string): string {
+  return taskId.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+/** Paths of the fake session for `taskId` under `cwd` (see the marker doc). */
+function fakeRealWatcherPaths(cwd: string, taskId: string) {
+  const safe = fakeRealWatcherSafeId(taskId);
+  const sessionId = `fake-${safe}`;
+  const baseDir = path.join(cwd, "agetor-fake-claude", safe);
+  return {
+    safe,
+    sessionId,
+    jsonlPath: path.join(baseDir, `${sessionId}.jsonl`),
+    subagentsDir: path.join(baseDir, sessionId, "subagents"),
+  };
+}
+/** Write `files` claude-shaped sidechain transcripts of ~`kb` KB each and
+ *  insert one `completed` `subagents` row per file (`parentKind: "subagent"`,
+ *  `sourcePath` = the transcript, `runId` = the turn's run) — everything the
+ *  watcher's rehydrate seed needs to pick the rows up. Line shape mirrors
+ *  claude's sidechain lines: `isSidechain: true`, `agentId`, an `assistant`
+ *  message with one text block, a unique `uuid` per line (the dedup key), a
+ *  timestamp; the final line carries `stop_reason: "end_turn"`. */
+async function writeFakeRealWatcherFixture(
+  taskId: string,
+  runId: string | null,
+  spec: FakeRealWatcherSpec,
+  paths: ReturnType<typeof fakeRealWatcherPaths>,
+): Promise<void> {
+  mkdirSync(paths.subagentsDir, { recursive: true });
+  writeFileSync(paths.jsonlPath, "");
+  // ~1 KB of text per line so `kb` KB is `kb` lines-ish and each file has
+  // many distinct dedup keys.
+  const filler = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(17).slice(0, 900);
+  const targetBytes = spec.kb * 1024;
+  const now = Date.now();
+  for (let i = 0; i < spec.files; i++) {
+    const agentId = `fakerw-${paths.safe.slice(0, 12)}-${i}`;
+    const sourcePath = path.join(paths.subagentsDir, `agent-${agentId}.jsonl`);
+    const toolUseId = `toolu_${agentId}`;
+    const out: string[] = [];
+    let bytes = 0;
+    let n = 0;
+    let parentUuid: string | null = null;
+    while (bytes < targetBytes) {
+      const uuid = crypto.randomUUID();
+      const last = bytes + 1100 >= targetBytes;
+      const line = JSON.stringify({
+        parentUuid,
+        isSidechain: true,
+        userType: "external",
+        sessionId: paths.sessionId,
+        agentId,
+        type: "assistant",
+        message: {
+          id: `msg_${agentId}_${n}`,
+          type: "message",
+          role: "assistant",
+          model: "claude-fake",
+          content: [{ type: "text", text: `[${agentId} #${n}] ${filler}` }],
+          stop_reason: last ? "end_turn" : null,
+        },
+        uuid,
+        timestamp: new Date(now - (spec.files - i) * 1000 + n).toISOString(),
+      });
+      out.push(line);
+      bytes += line.length + 1;
+      parentUuid = uuid;
+      n++;
+    }
+    await Bun.write(sourcePath, out.join("\n") + "\n");
+    await Bun.write(
+      path.join(paths.subagentsDir, `agent-${agentId}.meta.json`),
+      JSON.stringify({ agentType: "general-purpose", description: `Fake real-watcher subagent ${i}`, toolUseId, spawnDepth: 1 }),
+    );
+    subagentsDb.insertIfAbsent({
+      id: agentId,
+      taskId,
+      runId,
+      parentKind: "subagent",
+      agentType: "general-purpose",
+      description: `Fake real-watcher subagent ${i}`,
+      spawnDepth: 1,
+      sourcePath,
+      toolUseId,
+      status: "completed",
+      startedAt: now - 1000,
+      endedAt: now,
+    });
+  }
+}
+
 /** Find the LAST occurrence of {@link FAKE_CLAUDE_HANDOFF_PROMPT_MARKER} in
  *  `prompt` and return its optional `:<token>` suffix (letters/digits/-/_ ;
  *  stops at whitespace/`:`), or `null` when the marker carries no suffix
@@ -1537,6 +1699,9 @@ function makeFakeAgent(
   // `kill()` returns, since `answerFxPermission` there just settles the
   // registry entry — it doesn't synchronously flush this driver's `.then`).
   let killed = false;
+  // Set only by the FAKE_CLAUDE_REAL_WATCHER scenario: the real watcher this
+  // turn attached, so `kill()` (Stop/delete) can detach it.
+  let realWatcherHandle: SubagentWatcherHandle | undefined;
   // Test hook: simulate a claude code API error mid-turn so orchestrator
   // tests can exercise the api-error → `blocked` column flip without having
   // to plumb a real synthetic-message JSONL through the driver. Mirrors what
@@ -1589,6 +1754,51 @@ function makeFakeAgent(
       );
     });
     after(resolveDelayMs, () => { resolveDone(0); });
+  } else if (resolveFakeRealWatcherSpec(taskId, prompt) !== null) {
+    // Test hook: attach the REAL subagent watcher over real on-disk
+    // transcripts — see FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER's doc comment
+    // for the layout, the turn-1-vs-later split and why it exists. Checked
+    // ahead of the handoff scenario (and every marker below) so it wins when
+    // a prompt carries more than one marker.
+    const realWatcherSpec = resolveFakeRealWatcherSpec(taskId, prompt) as FakeRealWatcherSpec;
+    const rwPaths = fakeRealWatcherPaths(fakeOpts.cwd ?? process.cwd(), taskId);
+    after(5, () => {
+      void (async () => {
+        try {
+          onChunk("status", "fake: attaching real subagent watcher");
+          // Turn 1 == the fake session's main JSONL doesn't exist yet. Stateless
+          // (survives a process restart) and needs no per-task counter.
+          if (!existsSync(rwPaths.jsonlPath)) {
+            const rowRunId = fakeOpts.runId ?? tasks.get(taskId)?.runId ?? null;
+            await writeFakeRealWatcherFixture(taskId, rowRunId, realWatcherSpec, rwPaths);
+          }
+          if (killed) return;
+          realWatcherHandle = attachSubagentWatcher({
+            taskId,
+            jsonlPath: rwPaths.jsonlPath,
+            runId: fakeOpts.runId,
+          });
+          // `settled` (seed + first full pass), not just `ready`: the first
+          // pass is what persists turn 1's subagent events, so awaiting it
+          // makes "the run settled" imply "the events are in run_events".
+          await realWatcherHandle.settled;
+          if (killed) return;
+          onChunk("assistant", `Real subagent watcher attached over ${realWatcherSpec.files} transcript(s).`);
+          onChunk("status", "turn complete");
+          resolveDone(0);
+          // Detach AFTER the turn resolved so the next turn's attach is a
+          // genuine rehydrate + first-pass replay, not a live watcher.
+          realWatcherHandle.detach();
+          realWatcherHandle = undefined;
+        } catch (e) {
+          realWatcherHandle?.detach();
+          realWatcherHandle = undefined;
+          if (killed) return;
+          onChunk("status", `fake real-watcher turn failed: ${(e as Error).message}`);
+          resolveDone(1);
+        }
+      })();
+    });
   } else if (resolveFakeHandoffPromptSource(taskId, prompt) !== null) {
     // Test hook: simulate a pipeline step's turn ending with a `<handoff>`
     // block (see docs/plans/pipelines.md D3, `src/shared/pipeline.ts`'s
@@ -2310,6 +2520,8 @@ function makeFakeAgent(
       // (clearTimeout on an elapsed timer, resolveDone on an already-settled
       // promise).
       for (const t of timers) clearTimeout(t);
+      realWatcherHandle?.detach();
+      realWatcherHandle = undefined;
       // Mirror the real fx driver's settlement discipline: a still-open
       // fx_permission card must be resolved on teardown, not left dangling
       // in the registry. `answerFxPermission` is idempotent (returns false

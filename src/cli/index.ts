@@ -24,6 +24,7 @@ import { cmdProjects } from "./commands/projects.ts";
 import { cmdClone } from "./commands/clone.ts";
 import { cmdCommit } from "./commands/commit.ts";
 import { cmdConfig } from "./commands/config.ts";
+import { cmdCompact } from "./commands/compact.ts";
 import { cmdShell } from "./commands/shell.ts";
 import { cmdCommands } from "./commands/discovery.ts";
 import { helpFor } from "./usage.ts";
@@ -68,6 +69,7 @@ Commands:
   clone <url>         clone a repository as a new project (--provider, --dest, --no-eli5)
   projects <sub>      list | add | rm | branches (project folders)
   config [k] [v]      view / set core preferences (defaultHarness, last model…)
+  compact [--yes]     VACUUM the database to reclaim disk (blocks the core while it runs)
   help                show this help
 
 Global options:
@@ -212,6 +214,8 @@ async function main(): Promise<void> {
       return cmdClone(args, flags);
     case "config":
       return cmdConfig(args, flags);
+    case "compact":
+      return cmdCompact(args, flags);
     case "info": {
       const client = await getClient(flags);
       const meta = await client.info();

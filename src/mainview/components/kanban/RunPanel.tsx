@@ -91,6 +91,8 @@ import {
   type TaskPlan,
   type TaskReference,
   type ToolResultAttachment,
+  type ToolResultRetention,
+  retentionTrimNote,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
 import { parseSentFilesToolUse } from "../../../shared/sent-files.ts";
@@ -3866,7 +3868,7 @@ function RunPanelBody({
         hasRun={runs.length > 0 || task.hasOpenableRun || task.runId != null}
       />
 
-      <RunsList runs={runs} usageByRun={usageByRunId} providerByRun={providerByRunId} titleByRun={titleByRunId} />
+      <RunsList runs={runs} runsLoaded={runsLoaded} usageByRun={usageByRunId} providerByRun={providerByRunId} titleByRun={titleByRunId} />
 
       {/* Keyed on task id: RunPanelBody itself isn't remounted on a task
           switch (see the `[task.id]` reset effect above), so without this key
@@ -4917,11 +4919,17 @@ function SessionTitleChip({ title }: { title: string }) {
 
 function RunsList({
   runs,
+  runsLoaded,
   usageByRun,
   providerByRun,
   titleByRun,
 }: {
   runs: Run[];
+  /** False until the first `listRuns` for this task has answered. Until then
+   *  an empty `runs` means "not fetched yet", not "no runs" — the list renders
+   *  nothing rather than flashing "No runs yet for this task." over a task
+   *  whose runs are simply still loading. */
+  runsLoaded: boolean;
   usageByRun?: Map<string, FxUsagePayload>;
   providerByRun?: Map<string, string>;
   titleByRun?: Map<string, string>;
@@ -4929,6 +4937,7 @@ function RunsList({
   const [open, setOpen] = useState(false);
 
   if (runs.length === 0) {
+    if (!runsLoaded) return null;
     return (
       <div className="border-b border-border/60 px-3 py-2 text-xs text-muted-foreground">
         No runs yet for this task.
@@ -5825,7 +5834,17 @@ function repairTruncatedJson(input: string): unknown | null {
 // kind's `tool_use` JSON simply lacks the key, and `ToolUseBlock` only
 // renders it when present.
 interface ParsedToolUse { id: string; name: string; input: unknown; serverSide?: boolean; title?: string }
-interface ParsedToolResult { toolUseId: string; content: unknown; isError?: boolean; attachments?: ToolResultAttachment[] }
+interface ParsedToolResult {
+  toolUseId: string;
+  content: unknown;
+  isError?: boolean;
+  attachments?: ToolResultAttachment[];
+  /** Present only on a row the archived-history retention pass trimmed — the
+   *  FIRST key of the persisted payload (`src/shared/tool-result-trim.ts`).
+   *  `content` is then the first 4 KB of the original; the muted
+   *  `tool-result-trimmed` line under the fold header says so. */
+  retention?: ToolResultRetention;
+}
 
 function safeParse<T>(s: string): T | null {
   try { return JSON.parse(s) as T; } catch { return null; }
@@ -6651,6 +6670,11 @@ function ToolResultBody({ result, openSignal = 0 }: { result: ParsedToolResult; 
         <span>{open ? "▼" : "▶"}</span>
         <span>{result.isError ? "error result" : "result"}</span>
       </button>
+      {result.retention?.trimmed === true && (
+        <div className="px-2 pb-1 text-[10px] text-muted-foreground" data-testid="tool-result-trimmed">
+          {retentionTrimNote(result.retention)}
+        </div>
+      )}
       <pre className="max-h-96 overflow-auto whitespace-pre-wrap px-2 pb-1.5 font-mono text-[11px]">
         {open || !isLong ? text : preview}
       </pre>

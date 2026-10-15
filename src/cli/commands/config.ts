@@ -9,8 +9,11 @@ import { c, out, printJson, table } from "../output.ts";
  * fx-recovery-follow-ups.md` — `fxAutoResume` (`"on"` | `"off"`, default on)
  * and `fxAutoResumeDelaySec` (integer seconds, clamped 10..3600, default
  * 120; see `FX_AUTO_RESUME_PREF`/`FX_AUTO_RESUME_DELAY_PREF` in
- * `src/shared/types.ts`). This command is generic over the k/v store, so no
- * logic here is specific to those two keys — they round-trip like any other.
+ * `src/shared/types.ts`), and `archivedHistoryRetentionDays` (`"off"` or
+ * whole days 1..3650, default 30 — the core refuses anything else and stores
+ * an off-word like `0` as `"off"`). This command is generic over the k/v
+ * store, so no logic here is specific to any key — it prints the value the
+ * core stored, and a refused write fails with the core's own message.
  */
 export async function cmdConfig(args: string[], flags: Flags): Promise<void> {
   const client = await getClient(flags);
@@ -33,9 +36,14 @@ export async function cmdConfig(args: string[], flags: Flags): Promise<void> {
   // set: config <key> <value…>
   if (rest.length > 0) {
     const value = rest.join(" ");
+    // A refused value (e.g. an out-of-range `archivedHistoryRetentionDays`)
+    // throws the core's own 400 message, printed by the CLI's error handler.
     await client.setPreference(key, value);
-    if (flags.json) return printJson({ [key]: value });
-    out(`${c.green("✓")} ${c.bold(key)} = ${value}`);
+    // Echo what the core actually stored: a validated key may be normalized
+    // on write (`archivedHistoryRetentionDays 0` is stored as "off").
+    const stored = (await client.getPreferences())[key] ?? value;
+    if (flags.json) return printJson({ [key]: stored });
+    out(`${c.green("✓")} ${c.bold(key)} = ${stored}`);
     return;
   }
 
