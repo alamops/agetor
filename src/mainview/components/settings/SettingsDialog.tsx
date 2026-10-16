@@ -63,6 +63,7 @@ import {
   type Harness,
   type HarnessTemplate,
   type ThemePreference,
+  CLAUDE_SESSIONS_LAUNCH_SCAN_PREF,
 } from "../../../shared/types.ts";
 
 // Computed once at module load, same convention as `isMacPlatform()` in
@@ -1092,6 +1093,20 @@ function GeneralSection({
   // soft-deleted harness can't silently become the default for new tasks.
   const enabledHarnesses = payload.harnesses.filter((h) => h.enabled);
   const { preference: themePreference, setPreference: setThemePreference } = useTheme();
+  const [launchScan, setLaunchScan] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    void api.listPreferences().then((prefs) => {
+      if (!cancelled) setLaunchScan(prefs[CLAUDE_SESSIONS_LAUNCH_SCAN_PREF] !== "0");
+    }).catch(() => { /* default stays on */ });
+    return () => { cancelled = true; };
+  }, []);
+  const setLaunchScanPref = (on: boolean) => {
+    setLaunchScan(on);
+    void api.setPreference(CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, on ? "1" : "0").catch(() => {
+      setLaunchScan(!on);
+    });
+  };
   const { percent: fontSizePercent, increase: increaseFontSize, decrease: decreaseFontSize, reset: resetFontSize } = useFontSize();
   const canDecreaseFontSize = fontSizePercent > FONT_SIZE_MIN;
   const canIncreaseFontSize = fontSizePercent < FONT_SIZE_MAX;
@@ -1218,6 +1233,24 @@ function GeneralSection({
           </Button>
         </div>
         <p className="text-[11px] text-muted-foreground">{FONT_SIZE_HINT}</p>
+      </section>
+
+      <section className="space-y-1">
+        <div className="flex items-center justify-between gap-4">
+          <label htmlFor="claude-sessions-launch-scan" className="text-xs text-muted-foreground">
+            Look for Claude Code sessions on launch
+          </label>
+          <Switch
+            id="claude-sessions-launch-scan"
+            data-testid="claude-sessions-launch-scan"
+            checked={launchScan}
+            onCheckedChange={setLaunchScanPref}
+            aria-label="Look for Claude Code sessions on launch"
+          />
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          On startup, notice Claude Code sessions that were started outside Agetor so you can import them.
+        </p>
       </section>
 
       <section className="space-y-1">

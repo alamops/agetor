@@ -2202,7 +2202,7 @@ function RunPanelBody({
   // current response. The message folds into the active run (recorded in the
   // conversation stream, no new run row), so the task stays a single in-flight
   // run rather than stacking queued rows that could strand "running".
-  const canSend = !!resumableRunId;
+  const canSend = !!resumableRunId && (!task.importedClaude || task.importedClaude.status === "ready");
   // While a native modal (question / plan / permission prompt) is pending,
   // the agent is blocked on it — a typed message would go astray instead of
   // reaching the agent (and the run would hang "working"). This gate is
@@ -3661,6 +3661,30 @@ function RunPanelBody({
           </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
+        {task.importedClaude && (
+          <div className="mt-1 space-y-1 text-xs" data-testid="imported-claude-status">
+            {task.importedClaude.gitBranch && (
+              <p className="text-warning" data-testid="imported-claude-branch">
+                This session was on branch {task.importedClaude.gitBranch}. Switch to it before sending if you want to continue there.
+              </p>
+            )}
+            {task.importedClaude.status === "importing" && (
+              <p className="text-muted-foreground">Importing history…</p>
+            )}
+            {task.importedClaude.status === "failed" && (
+              <p className="text-destructive">
+                {task.importedClaude.error ?? "Import failed"}
+                <button
+                  type="button"
+                  className="ml-2 underline"
+                  onClick={() => { void api.retryClaudeSessionImport(task.id); }}
+                >
+                  Retry
+                </button>
+              </p>
+            )}
+          </div>
+        )}
         <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
           <span className="truncate">
             {task.agent} · {task.column}
@@ -4976,6 +5000,15 @@ function RunsList({
               auto
             </Badge>
           )}
+          {latest.origin === "imported" && (
+            <Badge
+              variant="secondary"
+              data-testid="run-origin-imported"
+              className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+            >
+              Imported
+            </Badge>
+          )}
           <span className="truncate">
             Run #{ordinalFor(latest.id)} · {formatTime(latest.startedAt)}
           </span>
@@ -5016,6 +5049,14 @@ function RunsList({
                     title={CONTINUATION_BADGE_TITLE}
                   >
                     auto
+                  </Badge>
+                )}
+                {r.origin === "imported" && (
+                  <Badge
+                    variant="secondary"
+                    className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+                  >
+                    Imported
                   </Badge>
                 )}
                 <span className="truncate text-muted-foreground">
