@@ -91,6 +91,17 @@ export class ApiError extends Error {
   }
 }
 
+export interface ClaudeSessionSummary {
+  sessionId: string;
+  cwd: string;
+  title: string;
+  gitBranch: string | null;
+  importable: boolean;
+  blockedReason: "long-path" | "live" | "no-harness" | null;
+  liveHint: string | null;
+  liveness: "live" | "idle" | "unknown";
+}
+
 /**
  * Discover the running core via the creds file and verify it's alive + ours.
  * Returns null when nothing is running (or the creds are stale). `dataDir`
@@ -196,6 +207,15 @@ export class AgetorClient {
     id: string,
   ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true }> {
     return this.req("POST", `/tasks/${id}/start`, undefined, START_TIMEOUT_MS);
+  }
+  listClaudeSessions(): Promise<{ sessions: ClaudeSessionSummary[] }> {
+    return this.req("GET", "/claude-sessions");
+  }
+  recheckClaudeSessions(): Promise<{ sessions: ClaudeSessionSummary[] }> {
+    return this.req("POST", "/claude-sessions/recheck");
+  }
+  importClaudeSessions(ids: string[]): Promise<{ results: { id: string; taskId?: string; error?: string }[] }> {
+    return this.req("POST", "/claude-sessions/import", { ids });
   }
   archiveTask(id: string): Promise<Task> {
     return this.req("POST", `/tasks/${id}/archive`);

@@ -48,6 +48,13 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
     const deletedSuffix = await agentProfileDeletedSuffix(client, task);
     out(`  ${label("profile")} ${escapeControlChars(task.agentProfile.name)} (${task.agentProfile.id})${deletedSuffix}`);
   }
+  if (task.importedClaude) {
+    const branch = task.importedClaude.gitBranch ?? "no branch";
+    out(
+      `  ${label("imported")} ${escapeControlChars(task.importedClaude.sessionId)} ` +
+        `(on ${escapeControlChars(branch)}, ${task.importedClaude.status})`,
+    );
+  }
   if (task.pipelineId && task.pipelineRun) {
     const progress = pipelineStepProgress(task.pipelineRun);
     out(

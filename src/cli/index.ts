@@ -22,6 +22,7 @@ import { cmdPipeline } from "./commands/pipeline.ts";
 import { cmdExport, cmdImport, printableLines } from "./commands/bundle.ts";
 import { cmdProjects } from "./commands/projects.ts";
 import { cmdClone } from "./commands/clone.ts";
+import { cmdSessions } from "./commands/sessions.ts";
 import { cmdCommit } from "./commands/commit.ts";
 import { cmdConfig } from "./commands/config.ts";
 import { cmdCompact } from "./commands/compact.ts";
@@ -67,6 +68,7 @@ Commands:
                       previews; --harness-map / --name / --enable-harnesses;
                       asks before importing in a terminal (--yes skips)
   clone <url>         clone a repository as a new project (--provider, --dest, --no-eli5)
+  sessions [ls|import]  list or import Claude Code sessions started outside Agetor
   projects <sub>      list | add | rm | branches (project folders)
   config [k] [v]      view / set core preferences (defaultHarness, last model…)
   compact [--yes]     VACUUM the database to reclaim disk (blocks the core while it runs)
@@ -212,6 +214,8 @@ async function main(): Promise<void> {
       return cmdProjects(args, flags);
     case "clone":
       return cmdClone(args, flags);
+    case "sessions":
+      return cmdSessions(args, flags);
     case "config":
       return cmdConfig(args, flags);
     case "compact":
