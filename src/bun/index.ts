@@ -6,6 +6,7 @@ import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts
 import { DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import { startClaudeSessionLaunchScan } from "./claude-session-launch.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
 import { startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
 import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
@@ -204,6 +205,14 @@ setTimeout(() => {
     console.error("[agetor] idle-session reap (post-boot) failed:", err);
   });
 }, 30_000);
+// Claude sessions started outside Agetor (docs/plans/import-claude-code-sessions.md).
+// Same post-boot deferral as the reaper: never blocks startup, and a thrown
+// scan is logged inside startClaudeSessionLaunchScan.
+setTimeout(() => {
+  startClaudeSessionLaunchScan().catch((err) => {
+    console.error("[agetor] claude session launch scan failed:", err);
+  });
+}, 0);
 setInterval(() => {
   reapIdleSessions().catch((err) => {
     console.error("[agetor] idle-session reap (interval) failed:", err);
