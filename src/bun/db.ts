@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Subagent, type SubagentStatus } from "../shared/types.ts";
+import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type ImportedClaudeSession, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Subagent, type SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
@@ -129,6 +129,11 @@ type TaskRow = {
   // `tasks.setCheckoutBranch`'s targeted UPDATE, never by the generic
   // `update` SET clause below — same rationale as `sent_files`/`fx_recovery`.
   checkout_branch: string | null;
+  // Provenance for a Claude Code session imported from outside Agetor
+  // (migration 068). Written exclusively by `tasks.setImportedClaude`, never
+  // by `tasks.insert` (new rows stay NULL) or the generic `update` SET
+  // clause — same rationale as `fx_recovery`/`checkout_branch`.
+  imported_claude: string | null;
   // Unread-indicator watermark pair (migration 045). Not spread into `Task`
   // directly — only the derived `unread` boolean is (see `toTask`). Written
   // exclusively by `tasks.noteAssistantEvent` / `tasks.markSeen`, never by
@@ -753,6 +758,40 @@ interface TaskCounts {
   terminals?: Map<string, number>;
 }
 
+const IMPORTED_CLAUDE_STATUSES = new Set(["importing", "ready", "failed"]);
+
+/** Tolerant read of `tasks.imported_claude`. Bad JSON, or a shape missing a
+ *  required field, reads as null — never throws. */
+function parseImportedClaude(raw: string | null | undefined): ImportedClaudeSession | null {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const o = parsed as Record<string, unknown>;
+  if (typeof o.sessionId !== "string" || o.sessionId.length === 0) return null;
+  if (typeof o.configDir !== "string" || o.configDir.length === 0) return null;
+  if (typeof o.status !== "string" || !IMPORTED_CLAUDE_STATUSES.has(o.status)) return null;
+  if (typeof o.importedAt !== "number" || !Number.isFinite(o.importedAt)) return null;
+  if (typeof o.backfillOffset !== "number" || !Number.isFinite(o.backfillOffset) || o.backfillOffset < 0) return null;
+  const gitBranch = o.gitBranch === null ? null : typeof o.gitBranch === "string" ? o.gitBranch : undefined;
+  if (gitBranch === undefined) return null;
+  const error = o.error === null ? null : typeof o.error === "string" ? o.error : undefined;
+  if (error === undefined) return null;
+  return {
+    sessionId: o.sessionId,
+    gitBranch,
+    importedAt: o.importedAt,
+    configDir: o.configDir,
+    status: o.status as ImportedClaudeSession["status"],
+    backfillOffset: o.backfillOffset,
+    error,
+  };
+}
+
 const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   id: r.id,
   title: r.title,
@@ -794,6 +833,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   pipelineParentId: r.pipeline_parent_id ?? null,
   pipelineStepId: r.pipeline_step_id ?? null,
   checkoutBranch: r.checkout_branch ?? null,
+  importedClaude: parseImportedClaude(r.imported_claude),
   // Derived, never stored: a monotonic-id watermark comparison, race-free by
   // construction (see migration 045's doc comment). NULL
   // `last_assistant_event_id` (no assistant event ever observed) always
@@ -920,7 +960,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, checkoutBranch: t.checkoutBranch ?? null, unread: false, hasAssistantMessages: false, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, checkoutBranch: t.checkoutBranch ?? null, importedClaude: null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
@@ -968,6 +1008,10 @@ export const tasks = {
     // PATCH must never overwrite the last-observed checkout with whatever
     // stale copy the caller read earlier, and (like every other
     // server-managed column above) the write never bumps `updated_at`.
+    // `imported_claude` (migration 068) joins the same skip list: it is
+    // written only by `tasks.setImportedClaude` below. A generic PATCH must
+    // never clobber an in-flight history backfill, and that write never
+    // bumps `updated_at`. `tasks.insert` leaves the column NULL.
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
@@ -1137,6 +1181,19 @@ export const tasks = {
    * parent card current with no runner change. Silently no-ops on an unknown
    * task id (zero rows match, same as every other targeted UPDATE here).
    */
+  /**
+   * Write (or clear) a task's imported-Claude provenance in one targeted
+   * UPDATE. No `updated_at` bump — same pattern as `setFxRecovery`. The
+   * generic `update` SET clause skips this column, so this is the only
+   * writer. A missing task id matches zero rows.
+   */
+  setImportedClaude(taskId: string, value: ImportedClaudeSession | null): Task | null {
+    db.run(
+      `UPDATE tasks SET imported_claude = ? WHERE id = ?`,
+      [value ? JSON.stringify(value) : null, taskId],
+    );
+    return this.get(taskId);
+  },
   setCheckoutBranch(taskId: string, value: string | null): void {
     db.transaction(() => {
       db.run(
@@ -2943,6 +3000,27 @@ export const runs = {
    *  is a no-op in practice (uuid namespaces don't collide) but is the wrong
    *  scope conceptually, and matches the same filter applied elsewhere for
    *  subagent-tagged rows. */
+  /** Line uuids persisted on one run. Seeds `currentRunLineUuids` on
+   *  reattach so a historical `end_turn` that lives on a different run
+   *  (an imported seed run) dedups without staging. Uses the partial unique
+   *  index `run_events_run_line_uuid (run_id, line_uuid) WHERE line_uuid IS
+   *  NOT NULL`. Includes subagent-tagged rows: the running run's own
+   *  `end_turn` uuids are what the gate cares about, and a subagent uuid
+   *  in the set is harmless. */
+  seenLineUuidsForRun(runId: string): Set<string> {
+    const rows = db.query<{ line_uuid: string }, [string]>(
+      `SELECT line_uuid FROM run_events WHERE run_id = ? AND line_uuid IS NOT NULL`,
+    ).all(runId);
+    return new Set(rows.map((r) => r.line_uuid));
+  },
+  /** Every non-null `runs.claude_session_id`. One query, served by
+   *  `runs_claude_session_id_idx`. The session scanner hides these ids. */
+  claudeSessionIds(): Set<string> {
+    const rows = db.query<{ claude_session_id: string }, []>(
+      `SELECT claude_session_id FROM runs WHERE claude_session_id IS NOT NULL`,
+    ).all();
+    return new Set(rows.map((r) => r.claude_session_id));
+  },
   seenLineUuidsForTask(taskId: string): Set<string> {
     const rows = db.query<{ line_uuid: string }, [string]>(
       `SELECT e.line_uuid

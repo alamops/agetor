@@ -1680,6 +1680,18 @@ export interface Task {
    */
   checkoutBranch?: string | null;
   /**
+   * Provenance for a Claude Code session imported from outside Agetor.
+   * Server-managed: written only by `tasks.setImportedClaude` (a targeted
+   * UPDATE, no `updated_at` bump), skipped by the generic `tasks.update`
+   * SET clause, and absent from `ALLOWED_PATCH_FIELDS`. `null` for every
+   * task that was not imported. See {@link ImportedClaudeSession}.
+   *
+   * Optional for the same fixture-compatibility reason as `checkoutBranch`:
+   * hand-built `Task` fixtures predate this field — `db.ts` always populates
+   * it on read, so runtime code can treat a missing key the same as `null`.
+   */
+  importedClaude?: ImportedClaudeSession | null;
+  /**
    * Whether this task has assistant messages the user hasn't seen yet —
    * `last_assistant_event_id > last_seen_event_id` (both watermarks live on
    * the `tasks` row, migration 045), computed in `db.ts`'s `toTask` and
@@ -2074,6 +2086,35 @@ export interface SentFileEntry {
   /** Run whose tool_result confirmed delivery. */
   runId: string;
 }
+
+/**
+ * Persisted shape of `task.importedClaude` (`tasks.imported_claude` JSON
+ * column, migration 068). One imported Claude Code session bound to an
+ * in-place task. Written only by `tasks.setImportedClaude`.
+ */
+export interface ImportedClaudeSession {
+  sessionId: string;
+  gitBranch: string | null;
+  importedAt: number;
+  configDir: string;
+  status: "importing" | "ready" | "failed";
+  /** Bytes of the main JSONL already persisted. A restart resumes from here. */
+  backfillOffset: number;
+  error: string | null;
+}
+
+/**
+ * Preference key for the post-boot Claude session scan
+ * (`docs/plans/import-claude-code-sessions.md` D5). Missing or `"1"` scans;
+ * `"0"` turns the scan off.
+ */
+export const CLAUDE_SESSIONS_LAUNCH_SCAN_PREF = "claudeSessions.launchScan";
+
+/**
+ * Preference key for the session ids the launch scan has already toasted.
+ * Value is a JSON array of session ids, capped at the newest 2 000.
+ */
+export const CLAUDE_SESSIONS_SEEN_IDS_PREF = "claudeSessions.seenIds";
 
 /**
  * Persisted shape of `task.fxRecovery` (`tasks.fx_recovery` JSON column,
@@ -3856,8 +3897,11 @@ export interface Run {
    * that task finished). Optional so callers that don't pass it (most of
    * them — only the continuation-run factory sets it) keep compiling
    * unchanged; DB rows predating migration 023 read back as null.
+   * `"imported"` = the seed run written when a Claude Code session started
+   * outside Agetor was imported (migration 068 does not change the column;
+   * the value is a new application of the existing `origin` text).
    */
-  origin?: "continuation" | null;
+  origin?: "continuation" | "imported" | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */
@@ -5048,6 +5092,17 @@ export type AppEvent =
       phase: CloneProgressPhase;
       percent: number | null;
       line: string;
+      ts: number;
+    }
+  | {
+      type: "claude_sessions_found";
+      count: number;
+      ts: number;
+    }
+  | {
+      type: "claude_session_import";
+      taskId: string;
+      status: "ready" | "failed";
       ts: number;
     };
 

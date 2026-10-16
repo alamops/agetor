@@ -283,6 +283,9 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
     "runs.seenLineUuidsForTask": [
       { label: "seenLineUuidsForTask(taskId)", run: () => runs.seenLineUuidsForTask(s.taskId) },
     ],
+    "runs.seenLineUuidsForRun": [
+      { label: "seenLineUuidsForRun(runId)", run: () => runs.seenLineUuidsForRun(s.runId) },
+    ],
     "runs.seenLineUuidsForSubagent": [
       {
         label: "seenLineUuidsForSubagent(taskId, subagentId)",
