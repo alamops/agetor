@@ -11,7 +11,8 @@ import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { tasks } from "./db.ts";
+import { runs, tasks } from "./db.ts";
+import { effectiveClaudeConfigDir } from "./harness-discovery.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
 import { attachSubagentWatcher, detachWatcherFor, orphanRunningSubagents, subagentActivityWithin, type SubagentWatcherHandle } from "./claude-subagents.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
@@ -504,6 +505,12 @@ export function cycleDistance(cycle: string[], current: string, target: string):
  *   /                          → -
  */
 export function encodeProjectPath(cwd: string): string {
+  // Names of 200 characters or fewer stay this substitution. Claude cuts a
+  // longer encoded name at 200 and appends `-` plus a 6-character hash. The
+  // hash input was never captured (a 207-character directory ending in
+  // `-epaaob` was observed without its cwd), so this function does not guess
+  // one. `claudeProjectDirUnresolved` keeps those sessions from being imported
+  // until a real vector makes this return the on-disk directory name.
   return cwd.replace(/[^a-zA-Z0-9]/g, "-");
 }
 
@@ -2729,6 +2736,14 @@ interface SessionState {
    *  on reattach so a re-read from offset 0 doesn't double-emit events that
    *  already landed in the DB during the previous agetor process. */
   seenLineUuids: Set<string>;
+  /**
+   * Line uuids persisted on the run being reattached. Undefined means "not
+   * provided" — a dedup-hit `end_turn` still stages, which is today's
+   * crash-before-status-update behavior. An empty set means "this run has
+   * no persisted uuids", so a historical `end_turn` that lives only on
+   * another run (an imported seed run) dedups and does not stage.
+   */
+  currentRunLineUuids?: Set<string>;
   /** Fires when a JSONL line ends a turn and the turnQueue is empty (no
    *  awaiter to pop). Reattached runs install this so the orchestrator can
    *  flip the run row to `succeeded` even though no in-process promise is
@@ -3182,6 +3197,7 @@ interface MakeSessionStateOpts {
   turnQueue?: TurnSlot[];
   lastChunk?: ChunkHandler | null;
   seenLineUuids?: Set<string>;
+  currentRunLineUuids?: Set<string>;
   onEndOfTurn?: (() => void) | null;
   permissionMode?: string | null;
   /** Defaults to `permissionMode` (or its own default of `null`) when
@@ -3206,6 +3222,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     turnQueue: o.turnQueue ?? [],
     lastChunk: o.lastChunk ?? null,
     seenLineUuids: o.seenLineUuids ?? new Set(),
+    currentRunLineUuids: o.currentRunLineUuids,
     onEndOfTurn: o.onEndOfTurn ?? null,
     permissionMode: o.permissionMode ?? null,
     lastAnnouncedPermissionMode: o.lastAnnouncedPermissionMode ?? o.permissionMode ?? null,
@@ -3325,14 +3342,16 @@ function bumpKeystroke(state: SessionState): void {
 export function jsonlPathFor(cwd: string, sessionId: string, configDir: string | null): string {
   const encoded = encodeProjectPath(cwd);
   const fileName = `${sessionId}.jsonl`;
+  // A null config dir is the built-in harness: same rule as
+  // `effectiveClaudeConfigDir(null)` — `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+  const root = configDir ?? effectiveClaudeConfigDir(null);
+  const fresh = path.join(root, "projects", encoded, fileName);
   if (configDir) {
-    const fresh = path.join(configDir, "projects", encoded, fileName);
     if (existsSync(fresh)) return fresh;
-    const legacy = path.join(configDir, ".claude", "projects", encoded, fileName);
+    const legacy = path.join(root, ".claude", "projects", encoded, fileName);
     if (existsSync(legacy)) return legacy;
-    return fresh;
   }
-  return path.join(homedir(), ".claude", "projects", encoded, fileName);
+  return fresh;
 }
 
 /**
@@ -4499,12 +4518,17 @@ function dispatchLine(state: SessionState, line: string): void {
     }
   }
 
-  // Already-seen lines (reattach replay-from-offset-0) skip chunk emission
-  // but still stage an end_turn so the run-row status transition can fire
-  // when the next line confirms it. The banner is suppressed (emitBanner:
-  // false) because the prior process already broadcast it.
+  // Already-seen lines (reattach replay-from-offset-0) skip chunk emission.
+  // A dedup-hit end_turn still stages — so a crash between persisting the
+  // line and updating the run row can finish that run — only when
+  // `currentRunLineUuids` is omitted (every caller that predates the set)
+  // or the uuid was persisted on the run being reattached. Uuids that live
+  // only on another run, such as an imported seed run, dedup and do not
+  // stage, so they cannot settle the live turn. The banner is suppressed
+  // (emitBanner: false) because the prior process already broadcast it.
   if (uuid && state.seenLineUuids.has(uuid)) {
-    if (isEndOfTurnEvent(evt)) {
+    const current = state.currentRunLineUuids;
+    if (isEndOfTurnEvent(evt) && (current === undefined || current.has(uuid))) {
       state.pendingEndTurn = {
         messageId: evt.message?.id ?? null,
         uuid,
@@ -4694,6 +4718,38 @@ export function rebuildEventsFromJsonl(text: string, onChunk: ChunkHandler): voi
   }
   // EOF — no continuation can ever arrive. Fire any staged pending so the
   // last turn's "turn complete" banner makes it into the output.
+  if (state.pendingEndTurn) firePendingEndTurn(state);
+}
+
+/**
+ * Same staging as {@link rebuildEventsFromJsonl}, including the single EOF
+ * fire, but yields to the event loop at least every `sliceMs` (default 20)
+ * so a large transcript does not hold the Bun main thread. One call covers
+ * the whole text — splitting a file across calls would fire a staged
+ * `end_turn` at each slice's EOF.
+ */
+export async function rebuildEventsFromJsonlCooperative(
+  text: string,
+  onChunk: ChunkHandler,
+  opts?: { sliceMs?: number },
+): Promise<void> {
+  const sliceMs = opts?.sliceMs ?? 20;
+  const state = makeSessionState({
+    taskId: "__rebuild__",
+    sessionName: "__rebuild__",
+    cwd: "/",
+    jsonlPath: "/__rebuild__",
+    turnQueue: [{ onChunk, resolve: null, reject: null, slashCommand: null }],
+    lastChunk: onChunk,
+  });
+  let sliceStart = Date.now();
+  for (const line of text.split("\n")) {
+    if (line.trim()) dispatchLine(state, line);
+    if (Date.now() - sliceStart >= sliceMs) {
+      await new Promise((r) => setImmediate(r));
+      sliceStart = Date.now();
+    }
+  }
   if (state.pendingEndTurn) firePendingEndTurn(state);
 }
 
@@ -8558,10 +8614,13 @@ export interface ReattachOptions {
   onChunk: ChunkHandler;
   /** Dedup set seeded from `runs.seenLineUuidsForTask(taskId)` — every uuid
    *  the previous process persisted across *every* run of this task. The
-   *  dispatcher skips any line whose uuid is already in this set, so the
-   *  replay from offset 0 doesn't double-emit events and doesn't fire
-   *  `onEndOfTurn` on end_turn lines belonging to long-completed prior
-   *  turns. */
+   *  dispatcher skips chunk emission for any line whose uuid is already in
+   *  this set. A dedup-hit `end_turn` stages (and can fire `onEndOfTurn`)
+   *  only when `currentRunLineUuids` is omitted or contains that uuid.
+   *  `reattachSession` always sets the set from the running run, so an
+   *  `end_turn` that lives only on another run — an imported seed run —
+   *  does not settle the live turn. An `end_turn` persisted on the running
+   *  run itself still stages. */
   seenLineUuids: Set<string>;
   /** The task's agetor mode at reattach time (`task.mode`), used to seed
    *  `SessionState.lastAnnouncedPermissionMode` so the offset-0 JSONL replay
@@ -8635,6 +8694,13 @@ async function reattachSessionBody(opts: ReattachOptions): Promise<SpawnedAgent 
     // by seeding lastChunk, same pattern as spawnClaudeViaTmux.
     lastChunk: opts.onChunk,
     seenLineUuids: opts.seenLineUuids,
+    // Empty when this task has no run row yet — not `undefined`, which would
+    // stage every historical end_turn. Imported uuids live on the seed run,
+    // so they are absent from this set.
+    currentRunLineUuids: (() => {
+      const runId = tasks.get(opts.taskId)?.runId ?? null;
+      return runId ? runs.seenLineUuidsForRun(runId) : new Set<string>();
+    })(),
     onEndOfTurn: () => resolveDone?.(0),
     // Seed the chip-suppression baseline from the task's mode so the
     // offset-0 JSONL replay doesn't re-announce a mode the prior process

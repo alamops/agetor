@@ -1421,7 +1421,7 @@ export function isTaskRunCancelling(taskId: string): boolean {
  */
 export async function startTask(
   taskId: string,
-): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string }> {
+): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string; code?: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
@@ -1455,7 +1455,7 @@ function worktreeDriftStatusLines(task: Task, prepared: PreparedWorkdir): string
 async function startTaskInner(
   taskId: string,
   task: Task,
-): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string }> {
+): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string; code?: string }> {
   // Whether ownership of releasing the `startingTaskIds` claim (added by
   // `startTask` above) has been handed off to the detached spawn
   // continuation created further down (see its own `finally`). Every return
@@ -1463,6 +1463,14 @@ async function startTaskInner(
   // still owns the release itself, via the `finally` below.
   let claimTransferred = false;
   try {
+  // An imported Claude session already has its transcript. Run would mint a
+  // fresh session and re-execute the prompt in the user's checkout.
+  if (task.importedClaude) {
+    return {
+      error: "imported Claude session — send a message to continue",
+      code: "imported-session",
+    };
+  }
   // startTask auto-unarchives and materializes the worktree below — it must
   // not race a teardown archiveTask (or deleteTask) deferred for this task,
   // or a `detachWorktree`/`removeWorktree` still in flight could yank the
@@ -3535,6 +3543,13 @@ async function sendInputInner(
   task: Task,
   line: string,
 ): Promise<SendInputResult> {
+  if (task.importedClaude?.status === "importing") {
+    return { delivered: false, reason: "still importing this session's history" };
+  }
+  if (task.importedClaude?.status === "failed") {
+    return { delivered: false, reason: task.importedClaude.error ?? "import failed" };
+  }
+
   // Pre-flight 1b for a one-shot kind (today codex) BEFORE any side effect
   // below — the archivedAt clear and the worktree restore both mutate state,
   // and a follow-up the CLI floor is going to refuse must not un-archive the
