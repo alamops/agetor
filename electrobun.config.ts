@@ -49,7 +49,7 @@ export default {
       // Bundled tmux for users without one on PATH — see scripts/fetch-tmux.ts.
       // Lands at Contents/Resources/app/bin/ inside the .app, which is what
       // src/bun/tmux-resolution.ts:bundledTmuxPath() points to at runtime.
-      "vendor/tmux/arm64": "bin",
+      [`vendor/tmux/${process.arch}`]: "bin",
       // Our own native arm64 notifier helper (AgetorNotifier.app) — posts
       // deep-linkable notifications via UNUserNotificationCenter and opens
       // agetor://task/<id> on click (built by scripts/build-notifier.ts from
