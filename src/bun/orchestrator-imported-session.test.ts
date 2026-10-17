@@ -11,7 +11,7 @@ process.env.AGETOR_CLAUDE_DRIVER ??= "fake";
 process.env.AGETOR_CLAUDE_BIN ??= "/bin/echo";
 process.env.AGETOR_TMUX_BIN ??= "/bin/echo";
 
-const { db, runs, tasks } = await import("./db.ts");
+const { db, runs, tasks, IMPORTED_CLAUDE_HELD_ELSEWHERE } = await import("./db.ts");
 const { sendInput, startTask } = await import("./orchestrator.ts");
 
 function makeTask(taskId: string, workdir: string): Task {
@@ -127,5 +127,51 @@ test("sendInput refuses importing and failed sessions and resumes a ready one", 
     db.run(`DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE task_id = ?)`, [taskId]);
     db.run(`DELETE FROM runs WHERE task_id = ?`, [taskId]);
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+test("sendInput refuses a duplicate whose session claim belongs to another task", async () => {
+  const winnerId = randomUUID();
+  const loserId = randomUUID();
+  const runId = randomUUID();
+  const sessionId = `dup-${winnerId.slice(0, 8)}`;
+  const workdir = mkdtempSync(path.join(tmpdir(), "cc-imported-dup-"));
+  const now = Date.now();
+  const held = provenance("ready");
+  held.sessionId = sessionId;
+  tasks.insert(makeTask(winnerId, workdir));
+  tasks.insert({ ...makeTask(loserId, workdir), runId, column: "review" });
+  tasks.setImportedClaude(winnerId, held);
+  db.run(
+    `UPDATE tasks SET imported_claude = ?, imported_claude_session_id = NULL WHERE id = ?`,
+    [JSON.stringify({ ...held, status: "ready" }), loserId],
+  );
+  runs.insert({
+    id: runId,
+    taskId: loserId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: now,
+    endedAt: now,
+    exitCode: 0,
+    tmuxSession: null,
+    claudeSessionId: sessionId,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+    fxSessionId: null,
+    origin: "imported",
+  });
+  try {
+    expect(tasks.get(loserId)?.importedClaude?.sessionId).toBe(sessionId);
+    expect(tasks.importedSessionHeldElsewhere(loserId, sessionId)).toBe(true);
+    const sent = await sendInput(runId, "please continue");
+    expect(sent).toEqual({ delivered: false, reason: IMPORTED_CLAUDE_HELD_ELSEWHERE });
+    expect(runs.listForTask(loserId)).toHaveLength(1);
+    expect(tasks.get(loserId)?.column).toBe("review");
+    expect(tasks.findByImportedSessionId(sessionId)?.id).toBe(winnerId);
+  } finally {
+    db.run(`DELETE FROM runs WHERE task_id IN (?, ?)`, [winnerId, loserId]);
+    db.run(`DELETE FROM tasks WHERE id IN (?, ?)`, [winnerId, loserId]);
   }
 });

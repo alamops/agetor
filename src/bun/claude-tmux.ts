@@ -4721,17 +4721,24 @@ export function rebuildEventsFromJsonl(text: string, onChunk: ChunkHandler): voi
   if (state.pendingEndTurn) firePendingEndTurn(state);
 }
 
+export interface JsonlReplayLine {
+  line: string;
+  /** UTF-8 bytes this line occupies in the transcript, including its newline when one was present. */
+  bytes: number;
+}
+
 /**
  * Same staging as {@link rebuildEventsFromJsonl}, including the single EOF
  * fire, but yields to the event loop at least every `sliceMs` (default 20)
  * so a large transcript does not hold the Bun main thread. One call covers
- * the whole text — splitting a file across calls would fire a staged
- * `end_turn` at each slice's EOF.
+ * the whole stream — splitting a file across calls would fire a staged
+ * `end_turn` at each slice's EOF. `pull` may return the next line
+ * synchronously; a promise means the next chunk is still being read.
  */
-export async function rebuildEventsFromJsonlCooperative(
-  text: string,
+export async function replayJsonlLines(
+  pull: () => JsonlReplayLine | null | Promise<JsonlReplayLine | null>,
   onChunk: ChunkHandler,
-  opts?: { sliceMs?: number },
+  opts?: { sliceMs?: number; onProgress?: (bytesConsumed: number) => void },
 ): Promise<void> {
   const sliceMs = opts?.sliceMs ?? 20;
   const state = makeSessionState({
@@ -4743,14 +4750,59 @@ export async function rebuildEventsFromJsonlCooperative(
     lastChunk: onChunk,
   });
   let sliceStart = Date.now();
-  for (const line of text.split("\n")) {
-    if (line.trim()) dispatchLine(state, line);
+  let consumed = 0;
+  for (;;) {
+    const pulled = pull();
+    const piece = isReplayPromise(pulled) ? await pulled : pulled;
+    if (piece == null) break;
+    if (piece.line.trim()) dispatchLine(state, piece.line);
+    consumed += piece.bytes;
     if (Date.now() - sliceStart >= sliceMs) {
+      opts?.onProgress?.(consumed);
       await new Promise((r) => setImmediate(r));
       sliceStart = Date.now();
     }
   }
   if (state.pendingEndTurn) firePendingEndTurn(state);
+  opts?.onProgress?.(consumed);
+}
+
+function isReplayPromise(
+  value: JsonlReplayLine | null | Promise<JsonlReplayLine | null>,
+): value is Promise<JsonlReplayLine | null> {
+  return value != null && typeof (value as Promise<JsonlReplayLine | null>).then === "function";
+}
+
+/** Walk `text` one line at a time. Does not split the whole string up front. */
+function pullJsonlText(text: string): () => JsonlReplayLine | null {
+  let start = 0;
+  return () => {
+    if (start >= text.length) return null;
+    const nl = text.indexOf("\n", start);
+    if (nl < 0) {
+      const line = text.slice(start);
+      start = text.length;
+      return { line, bytes: Buffer.byteLength(line) };
+    }
+    const line = text.slice(start, nl);
+    start = nl + 1;
+    return { line, bytes: Buffer.byteLength(line) + 1 };
+  };
+}
+
+/**
+ * Same staging as {@link rebuildEventsFromJsonl}, including the single EOF
+ * fire, but yields to the event loop at least every `sliceMs` (default 20)
+ * so a large transcript does not hold the Bun main thread. One call covers
+ * the whole text — splitting a file across calls would fire a staged
+ * `end_turn` at each slice's EOF.
+ */
+export async function rebuildEventsFromJsonlCooperative(
+  text: string,
+  onChunk: ChunkHandler,
+  opts?: { sliceMs?: number; onProgress?: (bytesConsumed: number) => void },
+): Promise<void> {
+  await replayJsonlLines(pullJsonlText(text), onChunk, opts);
 }
 
 /**

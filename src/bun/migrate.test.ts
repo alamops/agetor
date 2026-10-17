@@ -1120,11 +1120,21 @@ test("066 (retire gemini 3.7/3.5 Flash) is registered after 065, after 064, afte
   expect(migrations[at - 2]?.sql).toContain("gemini-4-argon");
 });
 
-test("067 (retention swept tasks) is the last registered migration, right after 066", () => {
+test("067 (retention swept tasks) is registered right after 066", () => {
   const at = migrations.findIndex((m) => m.id === "067_retention_swept_tasks");
-  expect(at).toBe(migrations.length - 1);
+  expect(at).toBeGreaterThan(0);
   expect(migrations[at - 1]?.id).toBe("066_retire_gemini_3_7_and_3_5_flash");
   expect(migrations[at]?.sql).toBe(retentionSweptTasks);
+});
+
+test("070 (imported claude session backfill) is the last registered migration, right after 069", () => {
+  const at = migrations.findIndex((m) => m.id === "070_imported_claude_session_backfill");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("069_imported_claude_session_unique");
+  expect(migrations[at - 2]?.id).toBe("068_imported_claude_session");
+  expect(migrations[at - 3]?.id).toBe("067_retention_swept_tasks");
+  expect(migrations[at - 1]?.sql).toContain("tasks_imported_claude_session_uidx");
+  expect(migrations[at]?.sql).toContain("imported_claude_session_id");
 });
 
 test("067 creates retention_swept_tasks (cascading on task delete) and drops the old retention:sweptTasks preference only", () => {

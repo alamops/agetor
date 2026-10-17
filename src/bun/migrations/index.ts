@@ -96,6 +96,8 @@ import m065 from "./065_antigravity_effort_in_model_id.sql" with { type: "text" 
 import m066 from "./066_retire_gemini_3_7_and_3_5_flash.sql" with { type: "text" };
 import m067 from "./067_retention_swept_tasks.sql" with { type: "text" };
 import m068 from "./068_imported_claude_session.sql" with { type: "text" };
+import m069 from "./069_imported_claude_session_unique.sql" with { type: "text" };
+import m070 from "./070_imported_claude_session_backfill.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -173,4 +175,6 @@ export const migrations: Migration[] = [
   { id: "066_retire_gemini_3_7_and_3_5_flash", sql: m066, aliases: ["065_retire_gemini_3_7_and_3_5_flash"] },
   { id: "067_retention_swept_tasks", sql: m067 },
   { id: "068_imported_claude_session", sql: m068 },
+  { id: "069_imported_claude_session_unique", sql: m069 },
+  { id: "070_imported_claude_session_backfill", sql: m070 },
 ];

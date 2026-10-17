@@ -79,6 +79,11 @@ export interface ScanClaudeSessionsOptions {
   pidAlive?: (pid: number) => boolean;
   /** Injectable UTC `ps -o lstart=` comparison. Default shells out. */
   procStartMatches?: (pid: number, procStart: string) => boolean | Promise<boolean>;
+  /** When set, only JSONL files whose session id is in the set are parsed.
+   *  A batch import looks each id up once instead of re-reading every transcript. */
+  onlySessionIds?: ReadonlySet<string>;
+  /** Test seam: fired once per transcript that is actually parsed. */
+  onJsonlRead?: (jsonlPath: string) => void;
 }
 
 const SLICE_MS = 20;
@@ -296,8 +301,9 @@ async function spawnClaudeAgents(configDir: string, env: Record<string, string |
 }
 
 /** Default lister. Honors `AGETOR_CLAUDE_AGENTS_JSON` (a file path) so e2e
- *  never spawns `claude`. A spawn failure returns null — the cache is left
- *  unknown. Not called by `scanClaudeSessions`. */
+ *  never spawns `claude`. A spawn failure returns null. `refreshClaudeSessionLiveness`
+ *  drops that dir's cache entry so the next list stays `unknown` instead of
+ *  a stale idle snapshot. Not called by `scanClaudeSessions`. */
 export async function defaultListLive(configDir: string, env?: Record<string, string | undefined>): Promise<ListedClaudeAgent[] | null> {
   const source = env ?? process.env;
   const stub = source.AGETOR_CLAUDE_AGENTS_JSON;
@@ -344,12 +350,16 @@ export async function refreshClaudeSessionLiveness(
 ): Promise<void> {
   for (const dir of configDirs) {
     const listed = await defaultListLive(dir, env);
-    if (listed === null) continue;
+    const key = safeRealpath(dir);
+    if (listed === null) {
+      livenessCache.delete(key);
+      continue;
+    }
     const byId = new Map<string, LiveInfo>();
     for (const agent of listed) {
       byId.set(agent.sessionId, { kind: agent.kind, background: isBackgroundKind(agent.kind) });
     }
-    livenessCache.set(safeRealpath(dir), { byId });
+    livenessCache.set(key, { byId });
   }
 }
 
@@ -358,10 +368,28 @@ export function clearClaudeSessionLivenessCache(): void {
   livenessCache.clear();
 }
 
-async function metaFromFile(file: string): Promise<ClaudeSessionMeta> {
+/**
+ * Stream a transcript into the shared meta reader, yielding at least every
+ * {@link SLICE_MS} so one large JSONL does not hold the main thread. Same
+ * fields as `readClaudeSessionMeta`, including the last `gitBranch`.
+ */
+export async function readClaudeSessionMetaFile(file: string): Promise<ClaudeSessionMeta> {
   const reader = createClaudeSessionMetaReader();
-  const rl = createInterface({ input: createReadStream(file), crlfDelay: Infinity });
-  for await (const line of rl) reader.push(line);
+  const input = createReadStream(file);
+  const rl = createInterface({ input, crlfDelay: Infinity });
+  let sliceStart = Date.now();
+  try {
+    for await (const line of rl) {
+      reader.push(line);
+      if (Date.now() - sliceStart >= SLICE_MS) {
+        await new Promise((resolve) => setImmediate(resolve));
+        sliceStart = Date.now();
+      }
+    }
+  } finally {
+    rl.close();
+    input.destroy();
+  }
   return reader.finish();
 }
 
@@ -426,9 +454,77 @@ function applyLiveness(
     record.importable = false;
     return;
   }
+  // A second stamp (the commit re-check, after the transcript read) must drop
+  // a "live" reason from the probe that ran before that read.
+  if (record.blockedReason === "live") record.blockedReason = null;
   if (record.liveness === "live") record.blockedReason = "live";
   else if (!record.harnessId && record.blockedReason === null) record.blockedReason = "no-harness";
   record.importable = record.blockedReason === null && record.liveness === "idle";
+}
+
+function stampLiveness(
+  record: ClaudeSessionRecord,
+  known: boolean,
+  agentInfo: LiveInfo | undefined,
+  regInfo: LiveInfo | undefined,
+  registryKind: string | null | undefined,
+): void {
+  const background = isBackgroundKind(registryKind) || (agentInfo?.background ?? false);
+  if (agentInfo && background && !agentInfo.background) agentInfo.background = true;
+  applyLiveness(record, known, agentInfo, regInfo);
+  if (background && record.liveness === "live") {
+    record.liveHint = `claude stop ${record.sessionId}`;
+  }
+}
+
+async function readAgentMap(
+  configDir: string,
+  opts: ScanClaudeSessionsOptions,
+): Promise<{ known: boolean; agentMap: Map<string, LiveInfo> | null }> {
+  if (opts.listLive) {
+    const agentMap = new Map<string, LiveInfo>();
+    try {
+      for (const agent of await opts.listLive(configDir)) {
+        agentMap.set(agent.sessionId, { kind: agent.kind, background: isBackgroundKind(agent.kind) });
+      }
+      return { known: true, agentMap };
+    } catch {
+      return { known: false, agentMap: null };
+    }
+  }
+  const cached = livenessCache.get(safeRealpath(configDir));
+  if (!cached) return { known: false, agentMap: null };
+  return { known: true, agentMap: cached.byId };
+}
+
+/** Re-read liveness for records whose transcripts were already parsed.
+ *  The list and the first pass of a commit snapshot agents and the registry
+ *  before `readClaudeSessionMetaFile`. A session that starts during that
+ *  read must be refused. Does not parse JSONL again. */
+export async function recheckClaudeSessionLiveness(
+  records: Iterable<ClaudeSessionRecord>,
+  opts: ScanClaudeSessionsOptions,
+): Promise<void> {
+  const byDir = new Map<string, ClaudeSessionRecord[]>();
+  for (const record of records) {
+    const group = byDir.get(record.configDir);
+    if (group) group.push(record);
+    else byDir.set(record.configDir, [record]);
+  }
+  if (byDir.size === 0) return;
+  if (!opts.listLive) {
+    await refreshClaudeSessionLiveness([...byDir.keys()], opts.env);
+  }
+  for (const [configDir, group] of byDir) {
+    const { known, agentMap } = await readAgentMap(configDir, opts);
+    const registry = await (opts.readRegistry ?? readClaudeRegistry)(configDir);
+    const regLive = await registryLive(registry, opts);
+    const registryById = new Map(registry.map((r) => [r.sessionId, r]));
+    for (const record of group) {
+      const reg = registryById.get(record.sessionId);
+      stampLiveness(record, known, agentMap?.get(record.sessionId), regLive.get(record.sessionId), reg?.kind);
+    }
+  }
 }
 
 async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
@@ -451,26 +547,7 @@ async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
     const ownedTmux = new Set(registry.filter((r) => isAgetorOwnedTmux(r.tmux)).map((r) => r.sessionId));
     const registryById = new Map(registry.map((r) => [r.sessionId, r]));
 
-    let agentMap: Map<string, LiveInfo> | null = null;
-    let known = false;
-    if (opts.listLive) {
-      known = true;
-      agentMap = new Map();
-      try {
-        for (const agent of await opts.listLive(configDir)) {
-          agentMap.set(agent.sessionId, { kind: agent.kind, background: isBackgroundKind(agent.kind) });
-        }
-      } catch {
-        known = false;
-        agentMap = null;
-      }
-    } else {
-      const cached = livenessCache.get(safeRealpath(configDir));
-      if (cached) {
-        known = true;
-        agentMap = cached.byId;
-      }
-    }
+    const { known, agentMap } = await readAgentMap(configDir, opts);
     const regLive = await registryLive(registry, opts);
 
     for (const dirName of projectDirs) {
@@ -488,10 +565,12 @@ async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
         }
         const jsonlPath = path.join(dirPath, file);
         const sessionId = file.slice(0, -".jsonl".length);
+        if (opts.onlySessionIds && !opts.onlySessionIds.has(sessionId)) continue;
+        opts.onJsonlRead?.(jsonlPath);
         let meta: ClaudeSessionMeta;
         let mtime = 0;
         try {
-          meta = await metaFromFile(jsonlPath);
+          meta = await readClaudeSessionMetaFile(jsonlPath);
           mtime = statSync(jsonlPath).mtimeMs;
         } catch {
           continue;
@@ -504,7 +583,6 @@ async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
         const gitBranch = meta.gitBranch;
         const branchMismatch = gitBranch !== null && liveBranch !== null && gitBranch !== liveBranch;
         const reg = registryById.get(sessionId);
-        const background = isBackgroundKind(reg?.kind) || (agentMap?.get(sessionId)?.background ?? false);
         const record: ClaudeSessionRecord = {
           sessionId,
           configDir,
@@ -526,15 +604,7 @@ async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
           firstHumanPrompt: meta.firstHumanPrompt,
           continuedIn: meta.continuedIn,
         };
-        const agentInfo = agentMap?.get(sessionId);
-        const regInfo = regLive.get(sessionId);
-        if (agentInfo && background && !agentInfo.background) {
-          agentInfo.background = true;
-        }
-        applyLiveness(record, known, agentInfo, regInfo);
-        if (background && record.liveness === "live") {
-          record.liveHint = `claude stop ${sessionId}`;
-        }
+        stampLiveness(record, known, agentMap?.get(sessionId), regLive.get(sessionId), reg?.kind);
         out.push({
           record,
           ownedTmux: ownedTmux.has(sessionId),
@@ -586,14 +656,28 @@ function toCandidate(record: ClaudeSessionRecord): ClaudeSessionCandidate {
   };
 }
 
+/** Sessions by id, including rows the list hides (owned, live, long-path).
+ *  One directory walk, and only the named JSONL files are parsed. */
+export async function findClaudeSessions(
+  sessionIds: ReadonlySet<string>,
+  opts: ScanClaudeSessionsOptions,
+): Promise<Map<string, ClaudeSessionRecord>> {
+  const out = new Map<string, ClaudeSessionRecord>();
+  if (sessionIds.size === 0) return out;
+  const items = await collect({ ...opts, onlySessionIds: sessionIds });
+  for (const item of items) {
+    const prev = out.get(item.record.sessionId);
+    if (!prev || item.record.lastActivity >= prev.lastActivity) out.set(item.record.sessionId, item.record);
+  }
+  return out;
+}
+
 /** One session by id, including rows the list hides (owned, live, long-path).
  *  Returns null when the id is not on disk. */
 export async function findClaudeSession(
   sessionId: string,
   opts: ScanClaudeSessionsOptions,
 ): Promise<ClaudeSessionRecord | null> {
-  const items = await collect(opts);
-  const matches = items.filter((item) => item.record.sessionId === sessionId);
-  matches.sort((a, b) => b.record.lastActivity - a.record.lastActivity);
-  return matches[0]?.record ?? null;
+  const found = await findClaudeSessions(new Set([sessionId]), opts);
+  return found.get(sessionId) ?? null;
 }

@@ -2106,7 +2106,8 @@ export interface ImportedClaudeSession {
 /**
  * Preference key for the post-boot Claude session scan
  * (`docs/plans/import-claude-code-sessions.md` D5). Missing or `"1"` scans;
- * `"0"` turns the scan off.
+ * `"0"` turns the scan off. It does not skip resume of an import left
+ * in `importing` — that runs on every boot, including headless.
  */
 export const CLAUDE_SESSIONS_LAUNCH_SCAN_PREF = "claudeSessions.launchScan";
 

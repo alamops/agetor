@@ -848,6 +848,24 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   archivedAt: r.archived_at,
 });
 
+/** Send and Retry use this when another task holds the session claim.
+ *  A duplicate import's losing row still has `importedClaude` after the
+ *  backfill (migration 070); that JSON is not permission to resume. */
+export const IMPORTED_CLAUDE_HELD_ELSEWHERE =
+  "another task already holds this Claude session";
+
+/** Another task already holds this Claude session id.
+ *  Follow-up runs reuse `runs.claude_session_id`, so that column is not the
+ *  claim — `tasks.imported_claude_session_id` (migration 069) is. */
+export class ImportedClaudeSessionTaken extends Error {
+  readonly sessionId: string;
+  constructor(sessionId: string) {
+    super("session is already imported");
+    this.name = "ImportedClaudeSessionTaken";
+    this.sessionId = sessionId;
+  }
+}
+
 // LEFT JOIN + aggregation, so the runs scan happens once instead of once
 // per task row. `MAX(...)` over a boolean gives us 1 if any matching run
 // exists for the task, 0 otherwise (NULL coalesces to 0 via COALESCE).
@@ -884,6 +902,29 @@ export const tasks = {
     }
     const counts: TaskCounts = { pending, terminals: terminalCountsByTask() };
     return rows.map((r) => toTask(r, counts));
+  },
+  /** Primary-key existence. Import backfill uses this instead of `get`,
+   *  which joins runs and parses the whole row, once per transcript line. */
+  exists(id: string): boolean {
+    if (!id) return false;
+    const row = db.query<{ one: number }, [string]>(
+      `SELECT 1 AS one FROM tasks WHERE id = ? LIMIT 1`,
+    ).get(id);
+    return row != null;
+  },
+  /** Tasks whose import is still `importing`. Reads only the provenance
+   *  column and parses it in process, so a malformed blob cannot abort boot
+   *  the way `json_extract` would, and resume does not pay for `list()`'s
+   *  runs join or badge scans. */
+  importingClaudeIds(): string[] {
+    const rows = db.query<{ id: string; imported_claude: string }, []>(
+      `SELECT id, imported_claude FROM tasks WHERE imported_claude IS NOT NULL`,
+    ).all();
+    const ids: string[] = [];
+    for (const row of rows) {
+      if (parseImportedClaude(row.imported_claude)?.status === "importing") ids.push(row.id);
+    }
+    return ids;
   },
   get(id: string): Task | null {
     const row = db.query<TaskRow, [string]>(
@@ -1008,10 +1049,12 @@ export const tasks = {
     // PATCH must never overwrite the last-observed checkout with whatever
     // stale copy the caller read earlier, and (like every other
     // server-managed column above) the write never bumps `updated_at`.
-    // `imported_claude` (migration 068) joins the same skip list: it is
-    // written only by `tasks.setImportedClaude` below. A generic PATCH must
-    // never clobber an in-flight history backfill, and that write never
-    // bumps `updated_at`. `tasks.insert` leaves the column NULL.
+    // `imported_claude` (migration 068) and `imported_claude_session_id`
+    // (migration 069) join the same skip list: both are written only by
+    // `tasks.setImportedClaude` below, in one UPDATE. A generic PATCH must
+    // never clobber an in-flight history backfill or drop the session claim,
+    // and that write never bumps `updated_at`. `tasks.insert` leaves both
+    // columns NULL.
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
@@ -1186,13 +1229,72 @@ export const tasks = {
    * UPDATE. No `updated_at` bump — same pattern as `setFxRecovery`. The
    * generic `update` SET clause skips this column, so this is the only
    * writer. A missing task id matches zero rows.
+   *
+   * Binding a `sessionId` that another task already holds throws
+   * {@link ImportedClaudeSessionTaken}. The unique index on
+   * `imported_claude_session_id` (migration 069) makes that write the atomic
+   * claim: two commits cannot both succeed. The column is a copy of
+   * `value.sessionId`, written in this same UPDATE — `tasks.insert` and
+   * `tasks.update` leave it alone. Rewriting the same task's own session id
+   * (backfill offset, status) does not conflict.
+   *
+   * `opts.claim === false` writes the JSON only and leaves
+   * `imported_claude_session_id` untouched. A duplicate that lost the claim
+   * can be marked failed without taking the session id.
    */
-  setImportedClaude(taskId: string, value: ImportedClaudeSession | null): Task | null {
-    db.run(
-      `UPDATE tasks SET imported_claude = ? WHERE id = ?`,
-      [value ? JSON.stringify(value) : null, taskId],
-    );
+  setImportedClaude(
+    taskId: string,
+    value: ImportedClaudeSession | null,
+    opts?: { claim?: boolean },
+  ): Task | null {
+    const claim = opts?.claim !== false;
+    try {
+      if (value && !claim) {
+        db.run(
+          `UPDATE tasks SET imported_claude = ? WHERE id = ?`,
+          [JSON.stringify(value), taskId],
+        );
+      } else {
+        db.run(
+          `UPDATE tasks SET imported_claude = ?, imported_claude_session_id = ? WHERE id = ?`,
+          [value ? JSON.stringify(value) : null, value ? value.sessionId : null, taskId],
+        );
+      }
+    } catch (err) {
+      if (value && claim && isUniqueConstraintError(err)) throw new ImportedClaudeSessionTaken(value.sessionId);
+      throw err;
+    }
     return this.get(taskId);
+  },
+  /** The task whose imported-Claude claim holds `sessionId`, if any.
+   *  Served by `tasks_imported_claude_session_uidx`. A session that is owned
+   *  only as a normal run (no provenance yet) is not returned — callers that
+   *  mean "any run" also check `runs.hasClaudeSessionId`. */
+  findByImportedSessionId(sessionId: string): Task | null {
+    if (!sessionId) return null;
+    const row = db.query<{ id: string }, [string]>(
+      `SELECT id FROM tasks WHERE imported_claude_session_id = ? LIMIT 1`,
+    ).get(sessionId);
+    return row ? this.get(row.id) : null;
+  },
+  /** True when `sessionId` is claimed by a task other than `taskId`.
+   *  Callers that resume an imported session (Send, Retry) must refuse:
+   *  the losing row of a duplicate still carries the session id inside
+   *  `imported_claude` after migration 070 left its claim column NULL. */
+  importedSessionHeldElsewhere(taskId: string, sessionId: string): boolean {
+    if (!sessionId) return false;
+    const holder = this.findByImportedSessionId(sessionId);
+    return holder != null && holder.id !== taskId;
+  },
+  /** Every non-null `tasks.imported_claude_session_id`. Served by
+   *  `tasks_imported_claude_session_uidx`. The claim is written before the
+   *  seed run, so a crash between those writes still owns the session id.
+   *  Pair with `runs.claudeSessionIds` via {@link hiddenClaudeSessionIds}. */
+  importedClaudeSessionIds(): Set<string> {
+    const rows = db.query<{ imported_claude_session_id: string }, []>(
+      `SELECT imported_claude_session_id FROM tasks WHERE imported_claude_session_id IS NOT NULL`,
+    ).all();
+    return new Set(rows.map((r) => r.imported_claude_session_id));
   },
   setCheckoutBranch(taskId: string, value: string | null): void {
     db.transaction(() => {
@@ -3014,12 +3116,22 @@ export const runs = {
     return new Set(rows.map((r) => r.line_uuid));
   },
   /** Every non-null `runs.claude_session_id`. One query, served by
-   *  `runs_claude_session_id_idx`. The session scanner hides these ids. */
+   *  `runs_claude_session_id_idx`. The scanner hides the union of this set
+   *  and the import claim column — see {@link hiddenClaudeSessionIds}. */
   claudeSessionIds(): Set<string> {
     const rows = db.query<{ claude_session_id: string }, []>(
       `SELECT claude_session_id FROM runs WHERE claude_session_id IS NOT NULL`,
     ).all();
     return new Set(rows.map((r) => r.claude_session_id));
+  },
+  /** True when any run already records this Claude session id. Not a
+   *  uniqueness check — several runs on one task share an id. */
+  hasClaudeSessionId(sessionId: string): boolean {
+    if (!sessionId) return false;
+    const row = db.query<{ one: number }, [string]>(
+      `SELECT 1 AS one FROM runs WHERE claude_session_id = ? LIMIT 1`,
+    ).get(sessionId);
+    return row != null;
   },
   seenLineUuidsForTask(taskId: string): Set<string> {
     const rows = db.query<{ line_uuid: string }, [string]>(
@@ -3179,6 +3291,14 @@ export const runs = {
     ).all(taskId).map((r) => r.id);
   },
 };
+
+/** Session ids the Claude import list must not offer. A run already records
+ *  the id, or a task's claim column holds it before the seed run exists. */
+export function hiddenClaudeSessionIds(): Set<string> {
+  const ids = runs.claudeSessionIds();
+  for (const id of tasks.importedClaudeSessionIds()) ids.add(id);
+  return ids;
+}
 
 interface SubagentRow {
   id: string;

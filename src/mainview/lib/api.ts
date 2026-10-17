@@ -1463,8 +1463,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ sessionId }),
     }),
+  /** Re-run a failed history backfill. `retry: false` — a replay after the
+   *  server already flipped the row to `importing` comes back as "import is
+   *  not failed" and would show that as the failure. */
   retryClaudeSessionImport: (taskId: string) =>
-    j<{ ok: true }>(`/tasks/${encodeURIComponent(taskId)}/claude-session/retry`, { method: "POST" }),
+    j<{ ok: true }>(`/tasks/${encodeURIComponent(taskId)}/claude-session/retry`, { method: "POST" }, { retry: false }),
   /** `GET /db/stats` — file/WAL size, reclaimable bytes, the Compact estimate
    *  and the archived-history retention bookkeeping (Settings → General). */
   getDbStats: () => j<DbStats>("/db/stats"),

@@ -2,14 +2,16 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, CLAUDE_SESSIONS_SEEN_IDS_PREF } from "../shared/types.ts";
+import { randomUUID } from "node:crypto";
+import { CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, CLAUDE_SESSIONS_SEEN_IDS_PREF, type Task } from "../shared/types.ts";
 import { plainEncodedProjectPath } from "../shared/claude-session-meta.ts";
 
 const dataDir = mkdtempSync(path.join(tmpdir(), "agetor-launch-db-"));
 process.env.AGETOR_DATA_DIR ??= dataDir;
 
-const { preferences } = await import("./db.ts");
+const { db, preferences, runs, tasks } = await import("./db.ts");
 const { startClaudeSessionLaunchScan } = await import("./claude-session-launch.ts");
+const { pendingImportBackfill } = await import("./claude-session-import.ts");
 const { clearClaudeSessionLivenessCache } = await import("./claude-session-scan.ts");
 const { subscribeAppEvents } = await import("./quit-guard.ts");
 
@@ -65,6 +67,45 @@ async function withHome<T>(home: string, stub: string, fn: () => Promise<T>): Pr
   return run;
 }
 
+test("a disabled launch scan still resumes an import left in progress", async () => {
+  const sessionId = "scan-off-resume";
+  const { home, stub } = plant(sessionId);
+  const cwd = path.join(home, "repo");
+  const taskId = randomUUID();
+  tasks.insert({ ...makeTask(taskId), workdir: cwd, column: "review" });
+  tasks.setImportedClaude(taskId, {
+    sessionId,
+    gitBranch: null,
+    importedAt: Date.now(),
+    configDir: path.join(home, ".claude"),
+    status: "importing",
+    backfillOffset: 0,
+    error: null,
+  });
+  preferences.set(CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, "0");
+  preferences.set(CLAUDE_SESSIONS_SEEN_IDS_PREF, "[]");
+  const events: { type: string }[] = [];
+  const unsub = subscribeAppEvents((e) => {
+    if (e.type === "claude_sessions_found") events.push(e);
+  });
+  try {
+    await withHome(home, stub, async () => {
+      await startClaudeSessionLaunchScan();
+      await pendingImportBackfill(taskId);
+    });
+    expect(events).toEqual([]);
+    expect(preferences.get(CLAUDE_SESSIONS_SEEN_IDS_PREF)).toBe("[]");
+    const task = tasks.get(taskId);
+    expect(task?.importedClaude?.status).toBe("ready");
+    expect(task?.runId).toBeTruthy();
+    expect(runs.get(task!.runId!)?.origin).toBe("imported");
+    expect(runs.get(task!.runId!)?.claudeSessionId).toBe(sessionId);
+  } finally {
+    unsub();
+    preferences.set(CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, "1");
+  }
+});
+
 test("a disabled launch scan does nothing", async () => {
   const { home, stub } = plant("off-one");
   preferences.set(CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, "0");
@@ -100,6 +141,132 @@ test("launch scan toasts only new importable ids and caps the seen set at 2000",
     events.length = 0;
     await withHome(home, stub, () => startClaudeSessionLaunchScan());
     expect(events).toEqual([]);
+  } finally {
+    unsub();
+  }
+});
+
+function makeTask(taskId: string): Task {
+  return {
+    id: taskId,
+    title: "t",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: "/tmp",
+    isolation: "none",
+    taskType: "task",
+    branch: null,
+    branchSource: "created",
+    worktreePath: null,
+    baseRef: null,
+    prUrl: null,
+    mode: null,
+    model: null,
+    effort: null,
+    fast: false,
+    maxMode: false,
+    references: [],
+    backlog: [],
+    plans: [],
+    draft: null,
+    column: "ready",
+    runId: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    hasOpenableRun: false,
+    pendingInteractionCount: 0,
+    openTerminalCount: 0,
+    archivedAt: null,
+  };
+}
+
+test("launch scan hides a session whose seed run resume inserts before ownership is read", async () => {
+  const sessionId = "crash-window-seed";
+  const sibling = "crash-window-new";
+  const { home, stub } = plant(sessionId);
+  const cwd = path.join(home, "repo");
+  const dir = path.join(home, ".claude", "projects", plainEncodedProjectPath(cwd));
+  writeFileSync(path.join(dir, `${sibling}.jsonl`), JSON.stringify({
+    type: "user",
+    uuid: `${sibling}-u`,
+    cwd,
+    timestamp: "2026-10-02T00:00:00.000Z",
+    message: { role: "user", content: "a different session" },
+  }) + "\n");
+  const taskId = randomUUID();
+  await withHome(home, stub, async () => {
+    // Claim column stays empty. The only hide signal is the seed run
+    // resume inserts before this function reads ownership for the toast.
+    tasks.insert({ ...makeTask(taskId), workdir: cwd, column: "review" });
+    tasks.setImportedClaude(taskId, {
+      sessionId,
+      gitBranch: null,
+      importedAt: Date.now(),
+      configDir: path.join(home, ".claude"),
+      status: "importing",
+      backfillOffset: 0,
+      error: null,
+    }, { claim: false });
+    const claim = db.query<{ imported_claude_session_id: string | null }, [string]>(
+      `SELECT imported_claude_session_id FROM tasks WHERE id = ?`,
+    ).get(taskId);
+    expect(claim?.imported_claude_session_id).toBeNull();
+    expect(runs.hasClaudeSessionId(sessionId)).toBe(false);
+
+    preferences.set(CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, "1");
+    preferences.set(CLAUDE_SESSIONS_SEEN_IDS_PREF, "[]");
+    const events: { type: string; count?: number }[] = [];
+    const unsub = subscribeAppEvents((e) => {
+      if (e.type === "claude_sessions_found") events.push(e);
+    });
+    try {
+      await startClaudeSessionLaunchScan();
+      expect(events).toEqual([expect.objectContaining({ type: "claude_sessions_found", count: 1 })]);
+      const seen = JSON.parse(preferences.get(CLAUDE_SESSIONS_SEEN_IDS_PREF)!) as string[];
+      expect(seen).toEqual([sibling]);
+      const task = tasks.get(taskId);
+      expect(task?.runId).toBeTruthy();
+      expect(runs.get(task!.runId!)?.claudeSessionId).toBe(sessionId);
+      expect(runs.get(task!.runId!)?.origin).toBe("imported");
+      await pendingImportBackfill(taskId);
+      expect(tasks.get(taskId)?.importedClaude?.status).toBe("ready");
+    } finally {
+      unsub();
+    }
+  });
+});
+
+test("launch scan does not offer a session already stored on a run", async () => {
+  const { home, stub } = plant("owned-scan");
+  const taskId = randomUUID();
+  const runId = randomUUID();
+  tasks.insert(makeTask(taskId));
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    exitCode: 0,
+    tmuxSession: null,
+    claudeSessionId: "owned-scan",
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+    fxSessionId: null,
+    origin: "imported",
+  });
+  preferences.set(CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, "1");
+  preferences.set(CLAUDE_SESSIONS_SEEN_IDS_PREF, "[]");
+  const events: { type: string }[] = [];
+  const unsub = subscribeAppEvents((e) => {
+    if (e.type === "claude_sessions_found") events.push(e);
+  });
+  try {
+    await withHome(home, stub, () => startClaudeSessionLaunchScan());
+    expect(events).toEqual([]);
+    expect(preferences.get(CLAUDE_SESSIONS_SEEN_IDS_PREF)).toBe("[]");
   } finally {
     unsub();
   }

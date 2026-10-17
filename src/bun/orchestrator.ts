@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles, pipelines } from "./db.ts";
+import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles, pipelines, IMPORTED_CLAUDE_HELD_ELSEWHERE } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
 import { checkHarness, upgradeHintFor } from "./agent-status.ts";
@@ -333,6 +333,13 @@ export function subscribe(fn: Listener): () => void {
 
 function emit(e: RunEvent) {
   for (const fn of listeners) fn(e);
+}
+
+/** Fan a persisted event out to `/tasks/:id/events` subscribers. History
+ *  backfill writes through `runs.appendEvent` outside `makeChunkHandler`, so
+ *  it has to emit itself or a panel opened mid-import never sees the rest. */
+export function emitRunEvent(e: RunEvent): void {
+  emit(e);
 }
 
 // The subagent watcher (armed inside the claude-tmux tailer) persists its
@@ -3543,6 +3550,15 @@ async function sendInputInner(
   task: Task,
   line: string,
 ): Promise<SendInputResult> {
+  // The claim column, not the JSON blob. Migration 070 leaves a duplicate's
+  // losing row with `importedClaude` set and `imported_claude_session_id`
+  // NULL; Send would otherwise `--resume` the winner's session.
+  if (
+    task.importedClaude
+    && tasks.importedSessionHeldElsewhere(row.task_id, task.importedClaude.sessionId)
+  ) {
+    return { delivered: false, reason: IMPORTED_CLAUDE_HELD_ELSEWHERE };
+  }
   if (task.importedClaude?.status === "importing") {
     return { delivered: false, reason: "still importing this session's history" };
   }

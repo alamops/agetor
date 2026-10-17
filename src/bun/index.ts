@@ -206,8 +206,9 @@ setTimeout(() => {
   });
 }, 30_000);
 // Claude sessions started outside Agetor (docs/plans/import-claude-code-sessions.md).
-// Same post-boot deferral as the reaper: never blocks startup, and a thrown
-// scan is logged inside startClaudeSessionLaunchScan.
+// Same post-boot deferral as the reaper: never blocks startup. The scan toasts
+// when its preference is on; an import left in `importing` resumes either way.
+// A thrown scan is logged inside startClaudeSessionLaunchScan.
 setTimeout(() => {
   startClaudeSessionLaunchScan().catch((err) => {
     console.error("[agetor] claude session launch scan failed:", err);

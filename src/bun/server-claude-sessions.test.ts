@@ -121,6 +121,12 @@ test("list, recheck, import, and the imported-session start refusal", async () =
     expect(started.status).toBe(409);
     const startBody = await started.json() as { code?: string };
     expect(startBody.code).toBe("imported-session");
+
+    const again = await get("/claude-sessions");
+    expect(again.status).toBe(200);
+    const listedAgain = (await again.json() as { sessions: { sessionId: string }[] }).sessions;
+    expect(listedAgain.some((s) => s.sessionId === "http-idle")).toBe(false);
+    expect(listedAgain.some((s) => s.sessionId === "http-live")).toBe(true);
   });
 });
 

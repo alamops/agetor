@@ -7,7 +7,7 @@ import { plainEncodedProjectPath } from "../shared/claude-session-meta.ts";
 // harness-discovery → worktree → db.ts opens sqlite on import.
 process.env.AGETOR_DATA_DIR ??= mkdtempSync(path.join(tmpdir(), "agetor-scan-db-"));
 
-const { scanClaudeSessions } = await import("./claude-session-scan.ts");
+const { clearClaudeSessionLivenessCache, refreshClaudeSessionLiveness, scanClaudeSessions } = await import("./claude-session-scan.ts");
 
 const homes: string[] = [];
 
@@ -206,4 +206,41 @@ test("a long plain encoding is long-path until encode returns the directory name
   expect(open[0]?.blockedReason).toBeNull();
   expect(open[0]?.importable).toBe(true);
   expect(open[0]?.liveness).toBe("idle");
+});
+
+test("a failed liveness probe drops a stale idle cache", async () => {
+  const root = home();
+  const cwd = path.join(root, "repo");
+  mkdirSync(cwd, { recursive: true });
+  const config = plant({
+    home: root,
+    dirName: plainEncodedProjectPath(cwd),
+    sessionId: "idle-one",
+    cwd,
+    lines: [userLine(cwd, "hello")],
+  });
+  const stub = path.join(root, "agents.json");
+  writeFileSync(stub, "[]");
+  clearClaudeSessionLivenessCache();
+  try {
+    await refreshClaudeSessionLiveness([config], { AGETOR_CLAUDE_AGENTS_JSON: stub });
+    const idle = await scanClaudeSessions({
+      homeDir: root,
+      harnesses: harnessFor(config),
+      encodePath: plainEncodedProjectPath,
+    });
+    expect(idle[0]?.liveness).toBe("idle");
+    expect(idle[0]?.importable).toBe(true);
+
+    await refreshClaudeSessionLiveness([config], { AGETOR_CLAUDE_BIN: "/bin/false" });
+    const unknown = await scanClaudeSessions({
+      homeDir: root,
+      harnesses: harnessFor(config),
+      encodePath: plainEncodedProjectPath,
+    });
+    expect(unknown[0]?.liveness).toBe("unknown");
+    expect(unknown[0]?.importable).toBe(false);
+  } finally {
+    clearClaudeSessionLivenessCache();
+  }
 });

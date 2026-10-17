@@ -5292,6 +5292,10 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
 
       "/tasks/:id/claude-session/retry": {
         POST: authed(async (req) => {
+          // The handler waits until the backfill settles so a failure is the
+          // response, not a later status the click never observes. A large
+          // transcript can outlast the idle timeout.
+          server.timeout(req, 0);
           const result = await retryImport(req.params.id, claudeSessionScanOptions());
           return "error" in result
             ? json(result, { status: tasks.get(req.params.id) ? 400 : 404, headers: corsHeaders(req) })
@@ -5317,6 +5321,8 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
 
       "/claude-sessions/import": {
         POST: authed(async (req) => {
+          // Finding and replaying transcripts can outlast the idle timeout.
+          server.timeout(req, 0);
           const body = await req.json().catch(() => null) as { ids?: unknown } | null;
           if (!body || !Array.isArray(body.ids) || body.ids.some((id) => typeof id !== "string")) {
             return json({ error: "ids must be a string array" }, { status: 400, headers: corsHeaders(req) });
@@ -5328,6 +5334,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
 
       "/claude-sessions/checkout": {
         POST: authed(async (req) => {
+          server.timeout(req, 0);
           const body = await req.json().catch(() => null) as { sessionId?: unknown } | null;
           if (!body || typeof body.sessionId !== "string" || !body.sessionId) {
             return json({ error: "sessionId is required" }, { status: 400, headers: corsHeaders(req) });
