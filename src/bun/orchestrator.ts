@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles, pipelines } from "./db.ts";
+import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles, pipelines, IMPORTED_CLAUDE_HELD_ELSEWHERE } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
 import { checkHarness, upgradeHintFor } from "./agent-status.ts";
@@ -333,6 +333,13 @@ export function subscribe(fn: Listener): () => void {
 
 function emit(e: RunEvent) {
   for (const fn of listeners) fn(e);
+}
+
+/** Fan a persisted event out to `/tasks/:id/events` subscribers. History
+ *  backfill writes through `runs.appendEvent` outside `makeChunkHandler`, so
+ *  it has to emit itself or a panel opened mid-import never sees the rest. */
+export function emitRunEvent(e: RunEvent): void {
+  emit(e);
 }
 
 // The subagent watcher (armed inside the claude-tmux tailer) persists its
@@ -1421,7 +1428,7 @@ export function isTaskRunCancelling(taskId: string): boolean {
  */
 export async function startTask(
   taskId: string,
-): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string }> {
+): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string; code?: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
@@ -1455,7 +1462,7 @@ function worktreeDriftStatusLines(task: Task, prepared: PreparedWorkdir): string
 async function startTaskInner(
   taskId: string,
   task: Task,
-): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string }> {
+): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string; code?: string }> {
   // Whether ownership of releasing the `startingTaskIds` claim (added by
   // `startTask` above) has been handed off to the detached spawn
   // continuation created further down (see its own `finally`). Every return
@@ -1463,6 +1470,14 @@ async function startTaskInner(
   // still owns the release itself, via the `finally` below.
   let claimTransferred = false;
   try {
+  // An imported Claude session already has its transcript. Run would mint a
+  // fresh session and re-execute the prompt in the user's checkout.
+  if (task.importedClaude) {
+    return {
+      error: "imported Claude session — send a message to continue",
+      code: "imported-session",
+    };
+  }
   // startTask auto-unarchives and materializes the worktree below — it must
   // not race a teardown archiveTask (or deleteTask) deferred for this task,
   // or a `detachWorktree`/`removeWorktree` still in flight could yank the
@@ -3535,6 +3550,22 @@ async function sendInputInner(
   task: Task,
   line: string,
 ): Promise<SendInputResult> {
+  // The claim column, not the JSON blob. Migration 070 leaves a duplicate's
+  // losing row with `importedClaude` set and `imported_claude_session_id`
+  // NULL; Send would otherwise `--resume` the winner's session.
+  if (
+    task.importedClaude
+    && tasks.importedSessionHeldElsewhere(row.task_id, task.importedClaude.sessionId)
+  ) {
+    return { delivered: false, reason: IMPORTED_CLAUDE_HELD_ELSEWHERE };
+  }
+  if (task.importedClaude?.status === "importing") {
+    return { delivered: false, reason: "still importing this session's history" };
+  }
+  if (task.importedClaude?.status === "failed") {
+    return { delivered: false, reason: task.importedClaude.error ?? "import failed" };
+  }
+
   // Pre-flight 1b for a one-shot kind (today codex) BEFORE any side effect
   // below — the archivedAt clear and the worktree restore both mutate state,
   // and a follow-up the CLI floor is going to refuse must not un-archive the

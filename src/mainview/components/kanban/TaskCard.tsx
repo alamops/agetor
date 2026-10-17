@@ -332,7 +332,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
             <Button size="sm" variant="destructive" onClick={() => onCancel(task)}>
               <Square className="size-3" /> Stop
             </Button>
-          ) : openable ? (
+          ) : openable || task.importedClaude ? (
             <Button size="sm" variant="secondary" onClick={() => onOpen(task)}>
               <FolderOpen className="size-3" /> Open
             </Button>

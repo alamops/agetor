@@ -30,6 +30,9 @@ import {
 import { refreshOne } from "./usage/poller.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
 import { activeRunCount, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
+import { claudeConfigDirsToScan, refreshClaudeSessionLiveness, scanClaudeSessions } from "./claude-session-scan.ts";
+import { claudeSessionScanOptions } from "./claude-session-launch.ts";
 import {
   compactDatabase,
   configuredRetentionDays,
@@ -5280,6 +5283,63 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           }
           server.timeout(req, 0);
           const result = await startTask(req.params.id);
+          const status = "error" in result && result.code === "imported-session" ? 409 : 400;
+          return "error" in result
+            ? json(result, { status, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/claude-session/retry": {
+        POST: authed(async (req) => {
+          // The handler waits until the backfill settles so a failure is the
+          // response, not a later status the click never observes. A large
+          // transcript can outlast the idle timeout.
+          server.timeout(req, 0);
+          const result = await retryImport(req.params.id, claudeSessionScanOptions());
+          return "error" in result
+            ? json(result, { status: tasks.get(req.params.id) ? 400 : 404, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/claude-sessions": {
+        GET: authed(async (req) => {
+          const sessions = await scanClaudeSessions(claudeSessionScanOptions());
+          return json({ sessions }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/claude-sessions/recheck": {
+        POST: authed(async (req) => {
+          const opts = claudeSessionScanOptions();
+          await refreshClaudeSessionLiveness(claudeConfigDirsToScan(opts), process.env);
+          const sessions = await scanClaudeSessions(opts);
+          return json({ sessions }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/claude-sessions/import": {
+        POST: authed(async (req) => {
+          // Finding and replaying transcripts can outlast the idle timeout.
+          server.timeout(req, 0);
+          const body = await req.json().catch(() => null) as { ids?: unknown } | null;
+          if (!body || !Array.isArray(body.ids) || body.ids.some((id) => typeof id !== "string")) {
+            return json({ error: "ids must be a string array" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await importClaudeSessions(body.ids, claudeSessionScanOptions());
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/claude-sessions/checkout": {
+        POST: authed(async (req) => {
+          server.timeout(req, 0);
+          const body = await req.json().catch(() => null) as { sessionId?: unknown } | null;
+          if (!body || typeof body.sessionId !== "string" || !body.sessionId) {
+            return json({ error: "sessionId is required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await checkoutSessionBranch(body.sessionId, claudeSessionScanOptions());
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(result, { headers: corsHeaders(req) });

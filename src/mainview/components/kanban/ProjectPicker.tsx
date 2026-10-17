@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { Folder, GitBranch, Plus } from "lucide-react";
+import { Folder, GitBranch, Import, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { SearchSelect } from "@/components/ui/search-select";
 import { CloneProjectDialog } from "@/components/kanban/CloneProjectDialog";
+import { ImportClaudeSessionsDialog } from "@/components/kanban/ImportClaudeSessionsDialog";
 import type { Project } from "../../../shared/types.ts";
 
 interface Props {
@@ -48,6 +49,7 @@ export function ProjectPicker({
   const [projects, setProjects] = useState<Project[]>([]);
   const [picking, setPicking] = useState(false);
   const [cloneOpen, setCloneOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
 
   const refresh = async () => {
     try { setProjects(await api.listProjects()); }
@@ -133,6 +135,15 @@ export function ProjectPicker({
               <GitBranch className="size-3.5" aria-hidden />
               Clone repository…
             </button>
+            <button
+              type="button"
+              data-testid="project-import-sessions-open"
+              onClick={() => setImportOpen(true)}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-accent/60"
+            >
+              <Import className="size-3.5" aria-hidden />
+              Import Claude Code sessions…
+            </button>
           </>
         }
       />
@@ -143,6 +154,10 @@ export function ProjectPicker({
         open={cloneOpen}
         onClose={() => setCloneOpen(false)}
         onCloned={() => { void refresh(); }}
+      />
+      <ImportClaudeSessionsDialog
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
       />
     </>
   );

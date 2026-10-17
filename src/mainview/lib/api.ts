@@ -526,6 +526,24 @@ export interface DuplicateAgentProfileResult {
   taskCopyErrors: { sourceTaskId: string; error: string }[];
 }
 
+export interface ClaudeSessionListItem {
+  sessionId: string;
+  configDir: string;
+  cwd: string;
+  title: string;
+  gitBranch: string | null;
+  liveBranch: string | null;
+  branchMismatch: boolean;
+  model: string | null;
+  lastActivity: number;
+  messageCount: number;
+  liveness: "live" | "idle" | "unknown";
+  liveHint: string | null;
+  importable: boolean;
+  blockedReason: "long-path" | "live" | "no-harness" | null;
+  harnessId: string | null;
+}
+
 export const api = {
   defaults: () => j<AppDefaults>("/defaults"),
   info: () => j<{ version: string }>("/info"),
@@ -1432,6 +1450,24 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ value }),
     }),
+  listClaudeSessions: () => j<{ sessions: ClaudeSessionListItem[] }>("/claude-sessions"),
+  recheckClaudeSessions: () =>
+    j<{ sessions: ClaudeSessionListItem[] }>("/claude-sessions/recheck", { method: "POST" }),
+  importClaudeSessions: (ids: string[]) =>
+    j<{ results: { id: string; taskId?: string; error?: string }[] }>("/claude-sessions/import", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    }),
+  checkoutClaudeSession: (sessionId: string) =>
+    j<{ ok: true; branch: string } | { error: string }>("/claude-sessions/checkout", {
+      method: "POST",
+      body: JSON.stringify({ sessionId }),
+    }),
+  /** Re-run a failed history backfill. `retry: false` — a replay after the
+   *  server already flipped the row to `importing` comes back as "import is
+   *  not failed" and would show that as the failure. */
+  retryClaudeSessionImport: (taskId: string) =>
+    j<{ ok: true }>(`/tasks/${encodeURIComponent(taskId)}/claude-session/retry`, { method: "POST" }, { retry: false }),
   /** `GET /db/stats` — file/WAL size, reclaimable bytes, the Compact estimate
    *  and the archived-history retention bookkeeping (Settings → General). */
   getDbStats: () => j<DbStats>("/db/stats"),
