@@ -215,7 +215,9 @@ export class AgetorClient {
     return this.req("POST", "/claude-sessions/recheck");
   }
   importClaudeSessions(ids: string[]): Promise<{ results: { id: string; taskId?: string; error?: string }[] }> {
-    return this.req("POST", "/claude-sessions/import", { ids });
+    // The route opts out of the server idle timeout. The default 15s budget
+    // aborts a transcript import that is still running.
+    return this.req("POST", "/claude-sessions/import", { ids }, CLONE_TIMEOUT_MS);
   }
   archiveTask(id: string): Promise<Task> {
     return this.req("POST", `/tasks/${id}/archive`);

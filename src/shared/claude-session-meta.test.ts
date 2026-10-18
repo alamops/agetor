@@ -53,6 +53,14 @@ test("readClaudeSessionMeta falls back to the first human prompt", () => {
   expect(meta.lastTimestamp).toBe(Date.parse("2026-10-01T00:00:02.000Z"));
 });
 
+test("readClaudeSessionMeta keeps the first cwd when a later line changes directory", () => {
+  const meta = readClaudeSessionMeta([
+    JSON.stringify({ type: "user", cwd: "/launch", message: { content: "hi" } }),
+    JSON.stringify({ type: "assistant", cwd: "/later", message: { content: "ok" } }),
+  ].join("\n"));
+  expect(meta.cwd).toBe("/launch");
+});
+
 test("readClaudeSessionMeta prefers the last aiTitle and the last permission mode", () => {
   const meta = readClaudeSessionMeta([
     JSON.stringify({ type: "user", message: { content: "first prompt" }, timestamp: "2026-10-01T00:00:00.000Z", permissionMode: "default" }),

@@ -1453,11 +1453,13 @@ export const api = {
   listClaudeSessions: () => j<{ sessions: ClaudeSessionListItem[] }>("/claude-sessions"),
   recheckClaudeSessions: () =>
     j<{ sessions: ClaudeSessionListItem[] }>("/claude-sessions/recheck", { method: "POST" }),
+  /** `retry: false` — a replay after a lost response would import the same
+   *  sessions again. */
   importClaudeSessions: (ids: string[]) =>
     j<{ results: { id: string; taskId?: string; error?: string }[] }>("/claude-sessions/import", {
       method: "POST",
       body: JSON.stringify({ ids }),
-    }),
+    }, { retry: false }),
   checkoutClaudeSession: (sessionId: string) =>
     j<{ ok: true; branch: string } | { error: string }>("/claude-sessions/checkout", {
       method: "POST",

@@ -61,7 +61,8 @@ export interface ClaudeSessionMeta {
   lastTimestamp: number | null;
   /** Successor session id when a continuation key is present. */
   continuedIn: string | null;
-  /** Last non-empty `cwd` on the transcript. */
+  /** First non-empty `cwd` — the directory the session launched in. A later
+   *  directory change does not replace it. */
   cwd: string | null;
 }
 
@@ -162,7 +163,7 @@ function noteLine(acc: MetaAcc, raw: string): void {
   }
 
   const cwd = nonEmptyString(line.cwd);
-  if (cwd) acc.cwd = cwd;
+  if (cwd && acc.cwd === null) acc.cwd = cwd;
 
   for (const key of ["continuedIn", "continued-in", "continuedSessionId"] as const) {
     const next = nonEmptyString(line[key]);

@@ -46,8 +46,10 @@ export async function cmdSessions(args: string[], flags: Flags): Promise<void> {
   const chosen = ids.length === 0 ? sessions.filter((s) => s.importable) : sessions.filter((s) => ids.includes(s.sessionId));
   const missing = ids.filter((id) => !sessions.some((s) => s.sessionId === id));
   if (flags.json && dryRun) return printJson({ sessions: chosen, missing, dryRun: true });
-  for (const session of chosen) printSession(session);
-  for (const id of missing) out(c.yellow(`${id}: session not found`));
+  if (!flags.json) {
+    for (const session of chosen) printSession(session);
+    for (const id of missing) out(c.yellow(`${id}: session not found`));
+  }
   if (dryRun) return;
   const blocked = chosen.filter((s) => !s.importable);
   if (ids.length === 1 && blocked.length === 1 && reasonFor(blocked[0]!) === LONG_PATH_IMPORT_ERROR) {
@@ -56,7 +58,8 @@ export async function cmdSessions(args: string[], flags: Flags): Promise<void> {
   const importable = chosen.filter((s) => s.importable);
   if (importable.length === 0) {
     if (ids.length === 1 && (blocked[0] || missing.length)) {
-      throw new Error(reasonFor(blocked[0]!) ?? "session not found");
+      const blockedSession = blocked[0];
+      throw new Error(blockedSession ? (reasonFor(blockedSession) ?? "session not found") : "session not found");
     }
     return;
   }

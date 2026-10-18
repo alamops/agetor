@@ -221,18 +221,6 @@ export async function runDaemon(): Promise<void> {
   }, SESSION_REAP_SWEEP_MS);
   reapIntervalTimer.unref();
 
-  // The desktop process resumes a crashed Claude import from its launch scan.
-  // This process never runs that scan, so resume here too — otherwise a task
-  // left `importing` stays unable to Send. Deferred like the reaper so it
-  // does not block the API coming up; unref'd so a quiet daemon can still
-  // idle-shut. The next boot continues from the stored offset.
-  const importResumeTimer = setTimeout(() => {
-    resumeIncompleteImports().catch((err) => {
-      daemonLog(`claude session import resume failed: ${(err as Error)?.message ?? String(err)}`);
-    });
-  }, 0);
-  importResumeTimer.unref();
-
   // Per-harness usage poller (docs/plans/harness-usage-tracker.md §7): mirrors
   // index.ts's wiring so the headless daemon also keeps quota snapshots fresh.
   // Both timers are `.unref()`'d — usage polling stops the moment the daemon
@@ -268,6 +256,20 @@ export async function runDaemon(): Promise<void> {
     );
     process.exit(1);
   }
+
+  // The desktop process resumes a crashed Claude import from its launch scan.
+  // This process never runs that scan, so resume here too — otherwise a task
+  // left `importing` stays unable to Send. Scheduled only after the API binds:
+  // a process that fails to bind and exits after probing the live core must
+  // not start backfill. Deferred so it does not block the listener coming up;
+  // unref'd so a quiet daemon can still idle-shut. The next boot continues
+  // from the stored offset.
+  const importResumeTimer = setTimeout(() => {
+    resumeIncompleteImports().catch((err) => {
+      daemonLog(`claude session import resume failed: ${(err as Error)?.message ?? String(err)}`);
+    });
+  }, 0);
+  importResumeTimer.unref();
 
   // Archived-history retention: first pass ~90 s after boot (after the API is
   // up and restore/seed work has settled), then every 24 h; each fire reads the

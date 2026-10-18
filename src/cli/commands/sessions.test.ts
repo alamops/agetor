@@ -11,6 +11,7 @@ const realContextSnapshot = { ...realContext };
 const realOutputSnapshot = { ...realOutput };
 let currentClient: AgetorClient | null = null;
 const outputs: string[] = [];
+const jsonOutputs: unknown[] = [];
 
 mock.module("../context.ts", () => ({
   ...realContextSnapshot,
@@ -35,7 +36,7 @@ mock.module("../output.ts", () => ({
   },
   out: (msg = "") => { outputs.push(msg); },
   errln: () => {},
-  printJson: () => {},
+  printJson: (data: unknown) => { jsonOutputs.push(data); },
 }));
 
 afterAll(() => {
@@ -47,7 +48,7 @@ const { cmdSessions } = await import("./sessions.ts");
 const { cmdStart } = await import("./lifecycle.ts");
 const flags = { json: false, plain: true, noDaemon: true } as unknown as Parameters<typeof cmdSessions>[1];
 
-beforeEach(() => { outputs.length = 0; });
+beforeEach(() => { outputs.length = 0; jsonOutputs.length = 0; });
 
 function session(over: Partial<ClaudeSessionSummary> = {}): ClaudeSessionSummary {
   return {
@@ -97,6 +98,29 @@ test("import --yes of a long-path id exits with that sentence and imports nothin
   await expect(cmdSessions(["import", "sess-1", "--yes"], flags)).rejects.toThrow(LONG_PATH_IMPORT_ERROR);
   expect(imported).toBe(0);
   expect(outputs).toContain(`  ${LONG_PATH_IMPORT_ERROR}`);
+});
+
+test("import --json --yes prints only the import result", async () => {
+  const imported = { results: [{ id: "sess-1", taskId: "task-1" }] };
+  currentClient = {
+    recheckClaudeSessions: async () => ({
+      sessions: [session(), session({ sessionId: "other" })],
+    }),
+    importClaudeSessions: async () => imported,
+  } as unknown as AgetorClient;
+  await cmdSessions(["import", "sess-1", "missing", "--yes"], { ...flags, json: true });
+  expect(outputs).toEqual([]);
+  expect(jsonOutputs).toEqual([imported]);
+});
+
+test("import of an unknown id says session not found", async () => {
+  let imported = 0;
+  currentClient = {
+    recheckClaudeSessions: async () => ({ sessions: [session()] }),
+    importClaudeSessions: async () => { imported += 1; return { results: [] }; },
+  } as unknown as AgetorClient;
+  await expect(cmdSessions(["import", "nope", "--yes"], flags)).rejects.toThrow("session not found");
+  expect(imported).toBe(0);
 });
 
 test("agetor start refuses an imported session", async () => {

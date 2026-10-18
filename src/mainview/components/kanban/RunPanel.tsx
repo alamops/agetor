@@ -948,6 +948,8 @@ function RunPanelBody({
     setImportRetryBusy(false);
     setImportRetryError(null);
     setImportRetryOk(false);
+    setImportedBranchBusy(false);
+    setImportedBranchError(null);
     // `editingId` (the backlog tray's inline-editor state) lives inside the
     // `BacklogTray` child component, not here — it's reset by keying that
     // component on `task.id` at its call site below instead (a fresh mount
@@ -3356,19 +3358,24 @@ function RunPanelBody({
   const switchImportedBranch = async () => {
     const sessionId = task.importedClaude?.sessionId;
     if (!sessionId || importedBranchBusy) return;
+    const taskId = task.id;
     setImportedBranchBusy(true);
     setImportedBranchError(null);
     try {
       const res = await api.checkoutClaudeSession(sessionId);
+      if (currentTaskIdRef.current !== taskId) return;
       if ("error" in res) {
         setImportedBranchError(res.error);
         return;
       }
-      setGitStatus(await api.getTaskGitStatus(task.id));
+      const status = await api.getTaskGitStatus(taskId);
+      if (currentTaskIdRef.current !== taskId) return;
+      setGitStatus(status);
     } catch (err) {
+      if (currentTaskIdRef.current !== taskId) return;
       setImportedBranchError(err instanceof ApiError ? err.message : "Couldn't switch branch");
     } finally {
-      setImportedBranchBusy(false);
+      if (currentTaskIdRef.current === taskId) setImportedBranchBusy(false);
     }
   };
   const retryImportedHistory = async () => {

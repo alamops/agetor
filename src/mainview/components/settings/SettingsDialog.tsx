@@ -1094,17 +1094,32 @@ function GeneralSection({
   const enabledHarnesses = payload.harnesses.filter((h) => h.enabled);
   const { preference: themePreference, setPreference: setThemePreference } = useTheme();
   const [launchScan, setLaunchScan] = useState(true);
+  const launchScanTouchedRef = useRef(false);
+  const launchScanDesiredRef = useRef<boolean | null>(null);
+  const launchScanWriteRef = useRef(Promise.resolve());
   useEffect(() => {
     let cancelled = false;
     void api.listPreferences().then((prefs) => {
-      if (!cancelled) setLaunchScan(prefs[CLAUDE_SESSIONS_LAUNCH_SCAN_PREF] !== "0");
+      if (cancelled || launchScanTouchedRef.current) return;
+      setLaunchScan(prefs[CLAUDE_SESSIONS_LAUNCH_SCAN_PREF] !== "0");
     }).catch(() => { /* default stays on */ });
     return () => { cancelled = true; };
   }, []);
   const setLaunchScanPref = (on: boolean) => {
+    launchScanTouchedRef.current = true;
+    launchScanDesiredRef.current = on;
     setLaunchScan(on);
-    void api.setPreference(CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, on ? "1" : "0").catch(() => {
-      setLaunchScan(!on);
+    // Writes run one at a time. A toggle that lands while an older request
+    // is queued skips that request, so the stored value is the last switch.
+    launchScanWriteRef.current = launchScanWriteRef.current.then(async () => {
+      if (launchScanDesiredRef.current !== on) return;
+      try {
+        await api.setPreference(CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, on ? "1" : "0");
+      } catch {
+        if (launchScanDesiredRef.current !== on) return;
+        launchScanDesiredRef.current = !on;
+        setLaunchScan(!on);
+      }
     });
   };
   const { percent: fontSizePercent, increase: increaseFontSize, decrease: decreaseFontSize, reset: resetFontSize } = useFontSize();
