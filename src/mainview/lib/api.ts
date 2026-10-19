@@ -540,8 +540,15 @@ export interface ClaudeSessionListItem {
   liveness: "live" | "idle" | "unknown";
   liveHint: string | null;
   importable: boolean;
-  blockedReason: "long-path" | "live" | "no-harness" | null;
+  blockedReason: "long-path" | "missing-folder" | "live" | "no-harness" | null;
   harnessId: string | null;
+}
+
+export interface ClaudeSessionList {
+  sessions: ClaudeSessionListItem[];
+  /** Oldest cached liveness probe behind the list; null when a config dir
+   *  has none. See `CLAUDE_SESSIONS_LIVENESS_STALE_MS`. */
+  livenessCheckedAt: number | null;
 }
 
 export const api = {
@@ -1450,9 +1457,9 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ value }),
     }),
-  listClaudeSessions: () => j<{ sessions: ClaudeSessionListItem[] }>("/claude-sessions"),
+  listClaudeSessions: () => j<ClaudeSessionList>("/claude-sessions"),
   recheckClaudeSessions: () =>
-    j<{ sessions: ClaudeSessionListItem[] }>("/claude-sessions/recheck", { method: "POST" }),
+    j<ClaudeSessionList>("/claude-sessions/recheck", { method: "POST" }),
   /** `retry: false` — a replay after a lost response would import the same
    *  sessions again. */
   importClaudeSessions: (ids: string[]) =>
@@ -1460,10 +1467,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ ids }),
     }, { retry: false }),
-  checkoutClaudeSession: (sessionId: string) =>
+  /** `branch` is the one the caller showed; omitted, the server uses the
+   *  transcript's latest branch. */
+  checkoutClaudeSession: (sessionId: string, branch?: string) =>
     j<{ ok: true; branch: string } | { error: string }>("/claude-sessions/checkout", {
       method: "POST",
-      body: JSON.stringify({ sessionId }),
+      body: JSON.stringify(branch ? { sessionId, branch } : { sessionId }),
     }),
   /** Re-run a failed history backfill. `retry: false` — a replay after the
    *  server already flipped the row to `importing` comes back as "import is

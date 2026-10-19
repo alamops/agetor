@@ -34,8 +34,9 @@ const {
   jsonlPathFor,
   mapJsonlEventToChunks,
   parseSessionActivityLine,
+  pinClaudeConfigDir,
   rebuildEventsFromJsonl,
-  rebuildEventsFromJsonlCooperative,
+  replayJsonlLines,
   sessionNameFor,
   toClaudeModeString,
 } = await import("./claude-tmux.ts");
@@ -64,6 +65,30 @@ test("jsonlPathFor with home=null honors CLAUDE_CONFIG_DIR", () => {
     if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = prev;
   }
+});
+
+test("pinClaudeConfigDir gives a home-less session this process's config dir, or unsets the tmux server's", () => {
+  const argv = ["claude", "--model", "claude-opus-5-5"];
+  // This process has one: pass it explicitly so the tmux server's copy can't win.
+  expect(pinClaudeConfigDir(argv, { A: "1" }, null, { CLAUDE_CONFIG_DIR: "/cfg/work" })).toEqual({
+    argv,
+    env: { A: "1", CLAUDE_CONFIG_DIR: "/cfg/work" },
+  });
+  // It has none: drop whatever the server captured, so claude uses ~/.claude
+  // like jsonlPathFor(null) does. Never set it to ~/.claude explicitly.
+  expect(pinClaudeConfigDir(argv, { A: "1" }, null, {})).toEqual({
+    argv: ["/usr/bin/env", "-u", "CLAUDE_CONFIG_DIR", ...argv],
+    env: { A: "1" },
+  });
+  // A harness home (already in env via harnessEnv) and a harness env map are left alone.
+  expect(pinClaudeConfigDir(argv, { CLAUDE_CONFIG_DIR: "/h" }, "/h", {})).toEqual({
+    argv,
+    env: { CLAUDE_CONFIG_DIR: "/h" },
+  });
+  expect(pinClaudeConfigDir(argv, { CLAUDE_CONFIG_DIR: "/custom" }, null, { CLAUDE_CONFIG_DIR: "/cfg" })).toEqual({
+    argv,
+    env: { CLAUDE_CONFIG_DIR: "/custom" },
+  });
 });
 
 test("jsonlPathFor honors a per-harness CLAUDE_CONFIG_DIR override", () => {
@@ -1132,7 +1157,7 @@ test("dispatchLine: end_turn uuid in currentRunLineUuids still fires onEndOfTurn
   __forTest.uninstallSession(taskId);
 });
 
-test("rebuildEventsFromJsonlCooperative yields and matches the sync rebuild", async () => {
+test("replayJsonlLines yields and matches the sync rebuild", async () => {
   const lines = [
     JSON.stringify({ type: "assistant", uuid: "u1",
       message: { id: "msg-A", role: "assistant", content: [{ type: "text", text: "hello" }], stop_reason: "end_turn" } }),
@@ -1141,7 +1166,8 @@ test("rebuildEventsFromJsonlCooperative yields and matches the sync rebuild", as
   const sync: { stream: string; data: string }[] = [];
   rebuildEventsFromJsonl(lines, (stream, data) => sync.push({ stream, data }));
   const coop: { stream: string; data: string }[] = [];
-  const pending = rebuildEventsFromJsonlCooperative(lines, (stream, data) => coop.push({ stream, data }), { sliceMs: 0 });
+  const queue = lines.split("\n").map((line) => ({ line, bytes: Buffer.byteLength(line) + 1 }));
+  const pending = replayJsonlLines(() => queue.shift() ?? null, (stream, data) => coop.push({ stream, data }), { sliceMs: 0 });
   // sliceMs 0 awaits setImmediate after the first line. A microtask runs
   // before that macrotask, so the replay is still in progress here.
   let midCount = 0;

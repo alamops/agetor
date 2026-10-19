@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, expect, mock, test } from "bun:test";
 import type { AgetorClient } from "../api-client.ts";
 import { makeTask } from "../test-fixtures.ts";
-import { LONG_PATH_IMPORT_ERROR } from "../../shared/claude-session-meta.ts";
+import { LONG_PATH_IMPORT_ERROR, MISSING_FOLDER_IMPORT_ERROR } from "../../shared/claude-session-meta.ts";
 import type { ClaudeSessionSummary } from "../api-client.ts";
 
 import * as realContext from "../context.ts";
@@ -73,6 +73,49 @@ test("sessions with no subcommand lists, and a long path is not importable", asy
   await cmdSessions([], flags);
   expect(outputs.some((l) => l.includes("sess-1") && l.includes("Fix login"))).toBe(true);
   expect(outputs).toContain(`  ${LONG_PATH_IMPORT_ERROR}`);
+});
+
+test("ls re-checks when liveness is missing or stale, and trusts a fresh list", async () => {
+  let rechecks = 0;
+  const recheck = async () => {
+    rechecks += 1;
+    return { sessions: [session({ title: "Rechecked" })], livenessCheckedAt: Date.now() };
+  };
+  currentClient = {
+    listClaudeSessions: async () => ({ sessions: [session({ title: "Cached" })], livenessCheckedAt: null }),
+    recheckClaudeSessions: recheck,
+  } as unknown as AgetorClient;
+  await cmdSessions(["ls"], flags);
+  expect(rechecks).toBe(1);
+  expect(outputs.some((l) => l.includes("Rechecked"))).toBe(true);
+
+  outputs.length = 0;
+  currentClient = {
+    listClaudeSessions: async () => ({ sessions: [session({ title: "Old" })], livenessCheckedAt: Date.now() - 5 * 60_000 }),
+    recheckClaudeSessions: recheck,
+  } as unknown as AgetorClient;
+  await cmdSessions(["ls"], flags);
+  expect(rechecks).toBe(2);
+
+  outputs.length = 0;
+  currentClient = {
+    listClaudeSessions: async () => ({ sessions: [session({ title: "Fresh" })], livenessCheckedAt: Date.now() }),
+    recheckClaudeSessions: recheck,
+  } as unknown as AgetorClient;
+  await cmdSessions(["ls"], flags);
+  expect(rechecks).toBe(2);
+  expect(outputs.some((l) => l.includes("Fresh"))).toBe(true);
+});
+
+test("ls names a session whose folder is gone", async () => {
+  currentClient = {
+    listClaudeSessions: async () => ({
+      sessions: [session({ importable: false, blockedReason: "missing-folder" })],
+      livenessCheckedAt: Date.now(),
+    }),
+  } as unknown as AgetorClient;
+  await cmdSessions(["ls"], flags);
+  expect(outputs).toContain(`  ${MISSING_FOLDER_IMPORT_ERROR}`);
 });
 
 test("import --dry-run does not call import, and a non-TTY import without --yes is refused", async () => {

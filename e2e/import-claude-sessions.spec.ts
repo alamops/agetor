@@ -33,6 +33,8 @@ function plant(sessionId: string, dirCwd: string, body: string): void {
 }
 
 plant("e2e-idle", cwd, "please fix the login");
+// Its folder is never created: the row must say so and refuse Import.
+plant("e2e-vanished", path.join(home, "vanished"), "work in a deleted folder");
 
 const liveDir = path.join(home, ".claude", "projects", plainEncodedProjectPath(liveCwd));
 mkdirSync(liveDir, { recursive: true });
@@ -102,4 +104,23 @@ test("Settings → General turns the launch scan off", async ({ page, freshBacke
     const prefs = await getPreferences(request, freshBackend);
     return prefs["claudeSessions.launchScan"];
   }).toBe("0");
+});
+
+test("opening the dialog re-checks on its own when nothing has probed yet", async ({ page, freshBackend }) => {
+  await gotoApp(page, freshBackend.bootBase);
+  await page.getByRole("button", { name: "Import Claude Code sessions" }).click();
+  const dialog = page.getByTestId("import-claude-sessions-dialog");
+  // No Re-check click: a fresh core has no cached probe, so the dialog runs one.
+  const row = dialog.locator("li", { hasText: "please fix the login" });
+  await expect(row.getByRole("button", { name: "Import", exact: true })).toBeEnabled();
+});
+
+test("a session whose folder is gone is listed with the reason and cannot be imported", async ({ page, freshBackend }) => {
+  await gotoApp(page, freshBackend.bootBase);
+  await page.getByRole("button", { name: "Import Claude Code sessions" }).click();
+  const dialog = page.getByTestId("import-claude-sessions-dialog");
+  await dialog.getByRole("button", { name: "Re-check" }).click();
+  const row = dialog.locator("li", { hasText: "work in a deleted folder" });
+  await expect(row.getByTestId("import-claude-session-reason")).toHaveText("Session folder no longer exists");
+  await expect(row.getByRole("button", { name: "Import", exact: true })).toBeDisabled();
 });

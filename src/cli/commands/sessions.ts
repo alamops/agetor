@@ -2,15 +2,28 @@ import { confirm as clackConfirm, isCancel } from "@clack/prompts";
 import { getClient, type Flags } from "../context.ts";
 import { c, isTTY, out, printJson } from "../output.ts";
 import { usageError } from "../usage.ts";
-import { LONG_PATH_IMPORT_ERROR } from "../../shared/claude-session-meta.ts";
-import type { ClaudeSessionSummary } from "../api-client.ts";
+import { LONG_PATH_IMPORT_ERROR, MISSING_FOLDER_IMPORT_ERROR } from "../../shared/claude-session-meta.ts";
+import { CLAUDE_SESSIONS_LIVENESS_STALE_MS } from "../../shared/types.ts";
+import type { AgetorClient, ClaudeSessionSummary } from "../api-client.ts";
 
 function reasonFor(session: ClaudeSessionSummary): string | null {
   if (session.importable) return null;
   if (session.blockedReason === "long-path") return LONG_PATH_IMPORT_ERROR;
+  if (session.blockedReason === "missing-folder") return MISSING_FOLDER_IMPORT_ERROR;
   if (session.blockedReason === "live") return session.liveHint ?? "Close it in your terminal first";
   if (session.blockedReason === "no-harness") return "Account isn't set up in Agetor — Add it to import";
   return "Couldn't tell if this session is still open";
+}
+
+/** The cached list, re-checked when its liveness is missing or stale — the
+ *  same rule the app's import dialog uses. An older core sends no
+ *  `livenessCheckedAt`; its list is used as-is. */
+async function listSessions(client: AgetorClient): Promise<ClaudeSessionSummary[]> {
+  const listed = await client.listClaudeSessions();
+  if (listed.livenessCheckedAt === undefined) return listed.sessions;
+  const checkedAt = listed.livenessCheckedAt;
+  if (checkedAt !== null && Date.now() - checkedAt <= CLAUDE_SESSIONS_LIVENESS_STALE_MS) return listed.sessions;
+  return (await client.recheckClaudeSessions()).sessions;
 }
 
 function parseFlags(args: string[]): { dryRun: boolean; yes: boolean; rest: string[] } {
@@ -31,7 +44,7 @@ export async function cmdSessions(args: string[], flags: Flags): Promise<void> {
   if (sub === "--help" || sub === "-h") throw usageError("sessions");
   const client = await getClient(flags);
   if (sub === "ls") {
-    const { sessions } = await client.listClaudeSessions();
+    const sessions = await listSessions(client);
     if (flags.json) return printJson({ sessions });
     if (sessions.length === 0) {
       out("No Claude Code sessions to import.");

@@ -2,9 +2,16 @@ import { expect, test } from "bun:test";
 import {
   agetorModeForClaudePermission,
   claudeProjectDirUnresolved,
+  createClaudeSessionMetaReader,
   plainEncodedProjectPath,
-  readClaudeSessionMeta,
+  type ClaudeSessionMeta,
 } from "./claude-session-meta.ts";
+
+function readClaudeSessionMeta(text: string): ClaudeSessionMeta {
+  const reader = createClaudeSessionMetaReader();
+  for (const line of text.split("\n")) reader.push(line);
+  return reader.finish();
+}
 
 test("agetorModeForClaudePermission maps known modes and falls back to ask", () => {
   expect(agetorModeForClaudePermission("auto")).toBe("auto");
@@ -94,4 +101,55 @@ test("readClaudeSessionMeta reads continued-in and does not throw on missing key
   expect(missing.model).toBeNull();
   expect(missing.hasUser).toBe(false);
   expect(() => readClaudeSessionMeta("{{{")).not.toThrow();
+});
+
+test("readClaudeSessionMeta skips Claude's <synthetic> model placeholder", () => {
+  const meta = readClaudeSessionMeta([
+    JSON.stringify({ type: "user", message: { content: "go" } }),
+    JSON.stringify({ type: "assistant", message: { model: "claude-sonnet-4-5", content: [{ type: "text", text: "on it" }] } }),
+    JSON.stringify({ type: "assistant", message: { model: "<synthetic>", content: [{ type: "text", text: "API Error" }] } }),
+  ].join("\n"));
+  expect(meta.model).toBe("claude-sonnet-4-5");
+
+  const onlySynthetic = readClaudeSessionMeta(
+    JSON.stringify({ type: "assistant", message: { model: "<synthetic>", content: "No response requested." } }),
+  );
+  expect(onlySynthetic.model).toBeNull();
+});
+
+test("messageCount counts prompts and assistant text, not tool traffic or meta lines", () => {
+  const meta = readClaudeSessionMeta([
+    JSON.stringify({ type: "user", message: { content: "Fix the build" } }),
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "thinking", thinking: "hmm" }] } }),
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] } }),
+    JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] } }),
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Fixed." }] } }),
+    JSON.stringify({ type: "user", isMeta: true, message: { content: "<local-command-caveat>note</local-command-caveat>" } }),
+    JSON.stringify({ type: "user", isCompactSummary: true, message: { content: "This session is being continued…" } }),
+    JSON.stringify({ type: "user", message: { content: "<local-command-stdout>Set model to Opus</local-command-stdout>" } }),
+  ].join("\n"));
+  expect(meta.messageCount).toBe(2);
+  expect(meta.hasUser).toBe(true);
+});
+
+test("a slash command reads as /name args, and command output is never the first prompt", () => {
+  const meta = readClaudeSessionMeta([
+    JSON.stringify({ type: "user", message: { content: "<local-command-stdout>Kept model as Opus</local-command-stdout>" } }),
+    JSON.stringify({
+      type: "user",
+      message: {
+        content: "<command-message>implement</command-message>\n<command-name>/implement</command-name>\n<command-args>add dark mode</command-args>",
+      },
+    }),
+  ].join("\n"));
+  expect(meta.firstHumanPrompt).toBe("/implement add dark mode");
+  expect(meta.title).toBe("/implement add dark mode");
+  expect(meta.messageCount).toBe(1);
+});
+
+test("the first prompt is capped without splitting a surrogate pair", () => {
+  const big = "a".repeat(100 * 1024 - 1) + "😀" + "tail";
+  const meta = readClaudeSessionMeta(JSON.stringify({ type: "user", message: { content: big } }));
+  expect(meta.firstHumanPrompt).toHaveLength(100 * 1024 - 1);
+  expect(meta.firstHumanPrompt!.endsWith("a")).toBe(true);
 });

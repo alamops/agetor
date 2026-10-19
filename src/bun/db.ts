@@ -1210,21 +1210,6 @@ export const tasks = {
     );
   },
   /**
-   * Record the branch agetor last observed checked out in a task's worktree
-   * (`checkout_branch`, migration 063; `null` = detached HEAD / unknown) in
-   * one targeted `UPDATE` — same pattern as `setFxRecovery` above: no
-   * `updated_at` bump and it bypasses the generic `update`'s SET clause so a
-   * concurrent unrelated PATCH can't race it. Compare-then-write
-   * (`checkout_branch IS NOT ?`): an unchanged value matches zero rows, so a
-   * repeated observation doesn't churn the row the webview's
-   * `reconcileById` identity preservation depends on. A pipeline STEP row
-   * (non-null `pipeline_parent_id`) also writes its parent in the same
-   * transaction — step tasks share the parent's worktree and run through the
-   * ordinary orchestrator start/settle paths, so mirroring here keeps the
-   * parent card current with no runner change. Silently no-ops on an unknown
-   * task id (zero rows match, same as every other targeted UPDATE here).
-   */
-  /**
    * Write (or clear) a task's imported-Claude provenance in one targeted
    * UPDATE. No `updated_at` bump — same pattern as `setFxRecovery`. The
    * generic `update` SET clause skips this column, so this is the only
@@ -1296,6 +1281,21 @@ export const tasks = {
     ).all();
     return new Set(rows.map((r) => r.imported_claude_session_id));
   },
+  /**
+   * Record the branch agetor last observed checked out in a task's worktree
+   * (`checkout_branch`, migration 063; `null` = detached HEAD / unknown) in
+   * one targeted `UPDATE` — same pattern as `setFxRecovery` above: no
+   * `updated_at` bump and it bypasses the generic `update`'s SET clause so a
+   * concurrent unrelated PATCH can't race it. Compare-then-write
+   * (`checkout_branch IS NOT ?`): an unchanged value matches zero rows, so a
+   * repeated observation doesn't churn the row the webview's
+   * `reconcileById` identity preservation depends on. A pipeline STEP row
+   * (non-null `pipeline_parent_id`) also writes its parent in the same
+   * transaction — step tasks share the parent's worktree and run through the
+   * ordinary orchestrator start/settle paths, so mirroring here keeps the
+   * parent card current with no runner change. Silently no-ops on an unknown
+   * task id (zero rows match, same as every other targeted UPDATE here).
+   */
   setCheckoutBranch(taskId: string, value: string | null): void {
     db.transaction(() => {
       db.run(
@@ -1616,6 +1616,40 @@ export const retentionSweeps = {
          (SELECT id FROM tasks WHERE archived_at IS NOT NULL AND archived_at <= ?)`,
       [cutoff],
     );
+  },
+};
+
+/**
+ * Claude Code session ids the launch scan has already toasted (migration
+ * 071). Offered, not imported: an id here is still listed and importable.
+ */
+export const claudeSessionSeen = {
+  ids(): Set<string> {
+    const rows = db.query<{ session_id: string }, []>(
+      `SELECT session_id FROM claude_session_seen`,
+    ).all();
+    return new Set(rows.map((r) => r.session_id));
+  },
+  /** Record `ids` as seen, in order, then keep only the newest `cap` rows.
+   *  Re-adding a known id moves it to the newest end. */
+  add(ids: readonly string[], cap: number, now: number = Date.now()): void {
+    if (ids.length === 0) return;
+    db.transaction(() => {
+      ids.forEach((id, i) => {
+        db.run(
+          `INSERT INTO claude_session_seen (session_id, seen_at) VALUES (?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET seen_at = excluded.seen_at`,
+          [id, now + i],
+        );
+      });
+      db.run(
+        `DELETE FROM claude_session_seen WHERE session_id NOT IN (
+           SELECT session_id FROM claude_session_seen
+           ORDER BY seen_at DESC, session_id DESC LIMIT ?
+         )`,
+        [cap],
+      );
+    })();
   },
 };
 
@@ -3081,27 +3115,6 @@ export const runs = {
     );
     return Number(result.lastInsertRowid);
   },
-  /** Return every JSONL line uuid already persisted across *every* run of
-   *  this task. Used by `reattachSession` to seed the in-memory dedup set so
-   *  re-tailing the per-session JSONL from offset 0 (after an agetor
-   *  restart) skips events we already streamed in the previous process.
-   *
-   *  Scoped to the task (not just the reattached run) on purpose: one tmux
-   *  session = one JSONL file = all of a task's turns. The replay from
-   *  offset 0 will encounter end_turn lines from prior, already-`succeeded`
-   *  run rows; without those uuids in the dedup set the dispatcher would
-   *  re-emit them onto the reattached (still-`running`) run's chunk
-   *  handler — corrupting its event history and, worse, firing
-   *  `onEndOfTurn` on the wrong turn and prematurely resolving the
-   *  current run.
-   *
-   *  `subagent_id IS NULL`: this seeds the MAIN session tailer's dedup set
-   *  only — subagent transcripts live in separate sidechain files and are
-   *  deduped independently via `seenLineUuidsForSubagent`, keyed by
-   *  `(run_id, subagent_id, line_uuid)`. Mixing subagent uuids into this set
-   *  is a no-op in practice (uuid namespaces don't collide) but is the wrong
-   *  scope conceptually, and matches the same filter applied elsewhere for
-   *  subagent-tagged rows. */
   /** Line uuids persisted on one run. Seeds `currentRunLineUuids` on
    *  reattach so a historical `end_turn` that lives on a different run
    *  (an imported seed run) dedups without staging. Uses the partial unique
@@ -3133,6 +3146,27 @@ export const runs = {
     ).get(sessionId);
     return row != null;
   },
+  /** Return every JSONL line uuid already persisted across *every* run of
+   *  this task. Used by `reattachSession` to seed the in-memory dedup set so
+   *  re-tailing the per-session JSONL from offset 0 (after an agetor
+   *  restart) skips events we already streamed in the previous process.
+   *
+   *  Scoped to the task (not just the reattached run) on purpose: one tmux
+   *  session = one JSONL file = all of a task's turns. The replay from
+   *  offset 0 will encounter end_turn lines from prior, already-`succeeded`
+   *  run rows; without those uuids in the dedup set the dispatcher would
+   *  re-emit them onto the reattached (still-`running`) run's chunk
+   *  handler — corrupting its event history and, worse, firing
+   *  `onEndOfTurn` on the wrong turn and prematurely resolving the
+   *  current run.
+   *
+   *  `subagent_id IS NULL`: this seeds the MAIN session tailer's dedup set
+   *  only — subagent transcripts live in separate sidechain files and are
+   *  deduped independently via `seenLineUuidsForSubagent`, keyed by
+   *  `(run_id, subagent_id, line_uuid)`. Mixing subagent uuids into this set
+   *  is a no-op in practice (uuid namespaces don't collide) but is the wrong
+   *  scope conceptually, and matches the same filter applied elsewhere for
+   *  subagent-tagged rows. */
   seenLineUuidsForTask(taskId: string): Set<string> {
     const rows = db.query<{ line_uuid: string }, [string]>(
       `SELECT e.line_uuid

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { plainEncodedProjectPath, LONG_PATH_IMPORT_ERROR } from "../shared/claude-session-meta.ts";
+import { plainEncodedProjectPath, LONG_PATH_IMPORT_ERROR, MISSING_FOLDER_IMPORT_ERROR } from "../shared/claude-session-meta.ts";
 import type { ImportedClaudeSession, Task } from "../shared/types.ts";
 
 const dataDir = mkdtempSync(path.join(tmpdir(), "agetor-import-db-"));
@@ -266,7 +266,9 @@ test("a live session and a long path write no task", async () => {
   expect(live.results[0]?.error).toBe("Close it in your terminal first");
   expect(runs.claudeSessionIds().has("live-one")).toBe(false);
 
-  const longCwd = `/${"p".repeat(210)}`;
+  const longCwd = path.join(home, "p".repeat(210));
+  mkdirSync(longCwd, { recursive: true });
+  expect(plainEncodedProjectPath(longCwd).length).toBeGreaterThan(200);
   const longConfig = plant({ home, sessionId: "long-one", cwd: longCwd, dirName: "short" });
   const blocked = await importClaudeSessions(["long-one"], {
     ...baseOpts(home, longConfig),
@@ -316,6 +318,72 @@ test("dirty checkout is refused and a clean repo switches to the recorded branch
   const clean = await checkoutSessionBranch("git-one", baseOpts(home, config));
   expect(clean).toEqual({ ok: true, branch: "feature" });
   expect(await git(repo, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("feature");
+});
+
+test("checkout switches to the branch the caller showed, not the transcript's latest", async () => {
+  const home = scratchDir("cc-import-git-asked-");
+  const repo = path.join(home, "repo");
+  mkdirSync(repo, { recursive: true });
+  await git(repo, ["init", "-b", "main"]);
+  await git(repo, ["config", "user.email", "t@example.com"]);
+  await git(repo, ["config", "user.name", "Test"]);
+  writeFileSync(path.join(repo, "a.txt"), "a\n");
+  await git(repo, ["add", "a.txt"]);
+  await git(repo, ["commit", "-m", "init"]);
+  await git(repo, ["checkout", "-b", "later"]);
+  // The session started on `main` and later moved to `later` — the task
+  // panel's banner names the import-time branch.
+  const config = plant({
+    home,
+    sessionId: "git-moved",
+    cwd: repo,
+    lines: [
+      { type: "user", uuid: "m-1", cwd: repo, gitBranch: "main", message: { role: "user", content: "start" } },
+      { type: "user", uuid: "m-2", cwd: repo, gitBranch: "later", message: { role: "user", content: "continue" } },
+    ],
+  });
+  const asked = await checkoutSessionBranch("git-moved", baseOpts(home, config), "main");
+  expect(asked).toEqual({ ok: true, branch: "main" });
+  expect(await git(repo, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("main");
+
+  const bad = await checkoutSessionBranch("git-moved", baseOpts(home, config), "bad..name");
+  expect(bad).toEqual({ error: "invalid branch name: bad..name" });
+  expect(await git(repo, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("main");
+});
+
+test("a session whose folder is gone imports nothing", async () => {
+  const home = scratchDir("cc-import-gone-");
+  const cwd = path.join(home, "repo");
+  mkdirSync(cwd, { recursive: true });
+  const config = plant({ home, sessionId: "gone-before", cwd });
+  rmSync(cwd, { recursive: true, force: true });
+  const before = tasks.list().length;
+  const result = await importClaudeSessions(["gone-before"], baseOpts(home, config));
+  expect(result.results).toEqual([{ id: "gone-before", error: MISSING_FOLDER_IMPORT_ERROR }]);
+  expect(tasks.list()).toHaveLength(before);
+  expect(projects.list().some((p) => p.path === cwd)).toBe(false);
+});
+
+test("a folder removed during the commit's transcript read imports nothing", async () => {
+  const home = scratchDir("cc-import-gone-late-");
+  const cwd = path.join(home, "repo");
+  mkdirSync(cwd, { recursive: true });
+  const config = plant({ home, sessionId: "gone-during", cwd });
+  const before = tasks.list().length;
+  let probes = 0;
+  const result = await importClaudeSessions(["gone-during"], {
+    ...baseOpts(home, config),
+    // The second probe is the commit's re-check, after the scan stamped the
+    // folder as present and before the commit lock.
+    listLive: () => {
+      probes += 1;
+      if (probes === 2) rmSync(cwd, { recursive: true, force: true });
+      return [];
+    },
+  });
+  expect(probes).toBe(2);
+  expect(result.results).toEqual([{ id: "gone-during", error: MISSING_FOLDER_IMPORT_ERROR }]);
+  expect(tasks.list()).toHaveLength(before);
 });
 
 test("retry reports a backfill failure instead of succeeding quietly", async () => {

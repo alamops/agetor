@@ -64,6 +64,11 @@ const CLONE_TIMEOUT_MS = 15 * 60_000;
  *  15s budget would abort while the core was still inserting, and a retry
  *  would create a second profile. */
 const DUPLICATE_WITH_TASKS_TIMEOUT_MS = 10 * 60_000;
+/** `GET /claude-sessions` parses every transcript Agetor does not own the
+ *  first time it sees it, and `POST /claude-sessions/recheck` first runs
+ *  `claude agents --json` once per Claude config dir (up to 8 s each). Both
+ *  routes opt out of the server's idle timeout. */
+const CLAUDE_SESSIONS_TIMEOUT_MS = 5 * 60_000;
 /** `POST /db/compact` runs `VACUUM` + `wal_checkpoint(TRUNCATE)` on the core's
  *  single main thread — it rewrites the whole database file, so on a
  *  multi-GB DB (~7.5 s/GB, `DB_COMPACT_SEC_PER_GB`) the core is unresponsive
@@ -97,9 +102,16 @@ export interface ClaudeSessionSummary {
   title: string;
   gitBranch: string | null;
   importable: boolean;
-  blockedReason: "long-path" | "live" | "no-harness" | null;
+  blockedReason: "long-path" | "missing-folder" | "live" | "no-harness" | null;
   liveHint: string | null;
   liveness: "live" | "idle" | "unknown";
+}
+
+export interface ClaudeSessionSummaryList {
+  sessions: ClaudeSessionSummary[];
+  /** Oldest cached liveness probe behind the list; null when a config dir
+   *  has none. Optional: an older core does not send it. */
+  livenessCheckedAt?: number | null;
 }
 
 /**
@@ -208,11 +220,11 @@ export class AgetorClient {
   ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true }> {
     return this.req("POST", `/tasks/${id}/start`, undefined, START_TIMEOUT_MS);
   }
-  listClaudeSessions(): Promise<{ sessions: ClaudeSessionSummary[] }> {
-    return this.req("GET", "/claude-sessions");
+  listClaudeSessions(): Promise<ClaudeSessionSummaryList> {
+    return this.req("GET", "/claude-sessions", undefined, CLAUDE_SESSIONS_TIMEOUT_MS);
   }
-  recheckClaudeSessions(): Promise<{ sessions: ClaudeSessionSummary[] }> {
-    return this.req("POST", "/claude-sessions/recheck");
+  recheckClaudeSessions(): Promise<ClaudeSessionSummaryList> {
+    return this.req("POST", "/claude-sessions/recheck", undefined, CLAUDE_SESSIONS_TIMEOUT_MS);
   }
   importClaudeSessions(ids: string[]): Promise<{ results: { id: string; taskId?: string; error?: string }[] }> {
     // The route opts out of the server idle timeout. The default 15s budget

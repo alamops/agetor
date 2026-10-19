@@ -4,7 +4,7 @@
  * backfill reaches `ready`.
  */
 import { open, type FileHandle } from "node:fs/promises";
-import { readdirSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -33,6 +33,7 @@ import {
 } from "./claude-session-scan.ts";
 import {
   LONG_PATH_IMPORT_ERROR,
+  MISSING_FOLDER_IMPORT_ERROR,
   agetorModeForClaudePermission,
 } from "../shared/claude-session-meta.ts";
 import type { ImportedClaudeSession, Run, Task } from "../shared/types.ts";
@@ -122,7 +123,7 @@ function scanOptions(opts: ImportClaudeSessionsOptions | undefined): ScanClaudeS
   const homeDir = opts?.homeDir ?? (process.env.HOME || homedir());
   const listed = opts?.harnesses ?? harnesses.list()
     .filter((h) => h.kind === "claude-code")
-    .map((h) => ({ id: h.id, kind: h.kind, home: h.home }));
+    .map((h) => ({ id: h.id, kind: h.kind, home: h.home, bin: h.bin }));
   return {
     homeDir,
     env: opts?.env ?? process.env,
@@ -584,6 +585,7 @@ async function commitOne(
   if (!record) return { id, error: "session not found" };
   if (!record.firstHumanPrompt && record.messageCount === 0) return { id, error: "session has no messages" };
   if (record.blockedReason === "long-path") return { id, error: LONG_PATH_IMPORT_ERROR };
+  if (record.blockedReason === "missing-folder") return { id, error: MISSING_FOLDER_IMPORT_ERROR };
   if (record.liveness === "live" || record.blockedReason === "live") {
     return { id, error: record.liveHint ?? "Close it in your terminal first" };
   }
@@ -596,6 +598,8 @@ async function commitOne(
 
   return withCommitLock(id, async () => {
     if (sessionAlreadyBound(id)) return { id, error: ALREADY_IMPORTED };
+    // The folder can go away between the scan and this commit.
+    if (!isDirectory(found.cwd)) return { id, error: MISSING_FOLDER_IMPORT_ERROR };
     return bindImportedSession(id, found, opts);
   });
 }
@@ -666,9 +670,25 @@ async function bindImportedSession(
   return { id, taskId };
 }
 
+function isDirectory(dir: string): boolean {
+  try {
+    return statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check out a session's branch in its folder, refusing a live session and a
+ * dirty tree. `requested` is the branch the caller showed the user — the
+ * task panel names the branch frozen at import, while the transcript's last
+ * `gitBranch` moves on once the session continues in Agetor. Without it the
+ * transcript's last branch is used (the import dialog shows that one).
+ */
 export async function checkoutSessionBranch(
   sessionId: string,
   opts?: ImportClaudeSessionsOptions,
+  requested?: string,
 ): Promise<{ ok: true; branch: string } | { error: string }> {
   const scan = scanOptions(opts);
   const record = await findClaudeSession(sessionId, scan);
@@ -681,8 +701,9 @@ export async function checkoutSessionBranch(
   }
   // `findClaudeSession` just parsed this transcript. A second full read
   // only to copy `gitBranch` holds the main thread on a large JSONL.
-  const branch = record.gitBranch;
+  const branch = requested ?? record.gitBranch;
   if (!branch) return { error: "this session has no branch to switch to" };
+  if (!isDirectory(record.cwd)) return { error: MISSING_FOLDER_IMPORT_ERROR };
   const inside = await git(record.cwd, ["rev-parse", "--is-inside-work-tree"]);
   if (inside.code !== 0 || inside.stdout.trim() !== "true") {
     return { error: "folder is not a git repository" };

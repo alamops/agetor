@@ -4,9 +4,14 @@
  * both call these so the permission-mode map and the long-path predicate
  * cannot drift. See docs/plans/import-claude-code-sessions.md §3.
  */
+import { isMachineEmittedMessage, normalizeDeliveredUserText, parseUserMessage } from "./user-message.ts";
 
 /** Copy shown when a cwd's encoded project directory cannot be reproduced. */
 export const LONG_PATH_IMPORT_ERROR = "Folder path is too long to import yet";
+
+/** Copy shown when the session's folder is gone. An in-place task there
+ *  would fail at `tmux new-session -c <cwd>` on the first message. */
+export const MISSING_FOLDER_IMPORT_ERROR = "Session folder no longer exists";
 
 /** Claude's own project-dir substitution: every non-alphanumeric becomes `-`. */
 export function plainEncodedProjectPath(cwd: string): string {
@@ -48,11 +53,14 @@ export interface ClaudeSessionMeta {
   title: string | null;
   firstHumanPrompt: string | null;
   gitBranch: string | null;
-  /** Last assistant `message.model`, raw. Null when absent. */
+  /** Last assistant `message.model`, raw. Null when absent. Claude's
+   *  `<synthetic>` placeholder (API errors, interrupts) is skipped. */
   model: string | null;
   /** Last `permissionMode` string. Null when the transcript has none. */
   permissionMode: string | null;
-  /** Count of `type:"user"` plus `type:"assistant"` lines. */
+  /** Human prompts plus assistant lines that carry text. Tool results,
+   *  meta lines, command output, and tool-only assistant lines are not
+   *  messages. */
   messageCount: number;
   /** True when at least one `type:"user"` line exists. */
   hasUser: boolean;
@@ -67,6 +75,12 @@ export interface ClaudeSessionMeta {
 }
 
 const TITLE_MAX = 200;
+/** The scanner keeps every visible session's meta in memory. The import
+ *  path caps the stored prompt at 100 KB of UTF-8 later, so 100 K
+ *  characters never cuts what it keeps. */
+const FIRST_PROMPT_MAX = 100 * 1024;
+/** Claude Code's model id on lines it writes itself. Not a real model. */
+const SYNTHETIC_MODEL = "<synthetic>";
 const INTERRUPT_RE =
   /doesn't want to proceed with this tool use|Request interrupted by user|tool use was rejected/i;
 
@@ -98,9 +112,16 @@ function emptyAcc(): MetaAcc {
   };
 }
 
+/** Cut to `max` UTF-16 units without leaving half a surrogate pair. */
+function capChars(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const code = text.charCodeAt(max - 1);
+  return text.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
+}
+
 function capTitle(text: string): string {
   const trimmed = text.trim();
-  return trimmed.length <= TITLE_MAX ? trimmed : trimmed.slice(0, TITLE_MAX);
+  return capChars(trimmed, TITLE_MAX);
 }
 
 function asRecord(v: unknown): Record<string, unknown> | null {
@@ -121,6 +142,33 @@ function parseTimestamp(v: unknown): number | null {
   if (typeof v !== "string" || !v.trim()) return null;
   const ms = Date.parse(v);
   return Number.isNaN(ms) ? null : ms;
+}
+
+/** Text a person typed, as a prompt: a slash command reads `/name args`,
+ *  command output and other machine-written tags are not prompts. */
+function humanPrompt(content: unknown): string | null {
+  const text = humanText(content);
+  if (text === null) return null;
+  const parsed = parseUserMessage(text);
+  if (!parsed) {
+    const plain = normalizeDeliveredUserText(text.replace(/\r\n?/g, "\n")).trim();
+    return plain || null;
+  }
+  if (parsed.kind === "command") {
+    return `${parsed.command.name} ${parsed.command.args}`.trim() || null;
+  }
+  if (parsed.kind === "command-output") return null;
+  if (isMachineEmittedMessage(parsed.segments)) return null;
+  return text;
+}
+
+function hasAssistantText(content: unknown): boolean {
+  if (typeof content === "string") return content.trim().length > 0;
+  if (!Array.isArray(content)) return false;
+  return content.some((block) => {
+    const rec = asRecord(block);
+    return rec?.type === "text" && nonEmptyString(rec.text) !== null;
+  });
 }
 
 function humanText(content: unknown): string | null {
@@ -171,19 +219,26 @@ function noteLine(acc: MetaAcc, raw: string): void {
   }
 
   const type = typeof line.type === "string" ? line.type : "";
-  if (type === "user" || type === "assistant") acc.messageCount += 1;
   if (type === "user") acc.hasUser = true;
 
   if (type === "assistant") {
     const message = asRecord(line.message);
     const model = nonEmptyString(message?.model);
-    if (model) acc.model = model;
+    if (model && model !== SYNTHETIC_MODEL) acc.model = model;
+    if (hasAssistantText(message?.content ?? line.content)) acc.messageCount += 1;
   }
 
-  if (type === "user" && line.isMeta !== true && acc.firstHumanPrompt === null) {
+  // Compaction summaries are Claude's own text on a `user` line.
+  const machineUser = line.isMeta === true
+    || line.isCompactSummary === true
+    || line.isVisibleInTranscriptOnly === true;
+  if (type === "user" && !machineUser) {
     const message = asRecord(line.message);
-    const text = humanText(message?.content ?? line.content);
-    if (text) acc.firstHumanPrompt = text;
+    const prompt = humanPrompt(message?.content ?? line.content);
+    if (prompt) {
+      acc.messageCount += 1;
+      if (acc.firstHumanPrompt === null) acc.firstHumanPrompt = capChars(prompt, FIRST_PROMPT_MAX);
+    }
   }
 
   const ts = parseTimestamp(line.timestamp);
@@ -206,14 +261,8 @@ function finish(acc: MetaAcc): ClaudeSessionMeta {
   };
 }
 
-/** Parse a transcript. Missing fields are null. Never throws. */
-export function readClaudeSessionMeta(jsonlText: string): ClaudeSessionMeta {
-  const acc = emptyAcc();
-  for (const line of jsonlText.split("\n")) noteLine(acc, line);
-  return finish(acc);
-}
-
-/** Streaming twin of {@link readClaudeSessionMeta}. One instance per file. */
+/** Parse a transcript one line at a time. Missing fields are null. Never
+ *  throws. One instance per file. */
 export function createClaudeSessionMetaReader(): {
   push(line: string): void;
   finish(): ClaudeSessionMeta;

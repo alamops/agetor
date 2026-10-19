@@ -158,6 +158,7 @@ export function ProjectPicker({
       <ImportClaudeSessionsDialog
         open={importOpen}
         onClose={() => setImportOpen(false)}
+        onImported={() => { void refresh(); }}
       />
     </>
   );

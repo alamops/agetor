@@ -205,15 +205,6 @@ setTimeout(() => {
     console.error("[agetor] idle-session reap (post-boot) failed:", err);
   });
 }, 30_000);
-// Claude sessions started outside Agetor (docs/plans/import-claude-code-sessions.md).
-// Same post-boot deferral as the reaper: never blocks startup. The scan toasts
-// when its preference is on; an import left in `importing` resumes either way.
-// A thrown scan is logged inside startClaudeSessionLaunchScan.
-setTimeout(() => {
-  startClaudeSessionLaunchScan().catch((err) => {
-    console.error("[agetor] claude session launch scan failed:", err);
-  });
-}, 0);
 setInterval(() => {
   reapIdleSessions().catch((err) => {
     console.error("[agetor] idle-session reap (interval) failed:", err);
@@ -463,6 +454,20 @@ writeCoreCreds(
 // up and restore/seed work has settled), then every 24 h; each fire reads the
 // preference fresh. Also re-armed on demand by `PUT /preferences/...`.
 scheduleRetention();
+
+// Claude sessions started outside Agetor (docs/plans/import-claude-code-sessions.md).
+// Scheduled only now that this process owns the API port: during a handoff
+// from a CLI daemon, `await probeLiveCore` above yields while the daemon may
+// still be backfilling the same import, and a process that fails to bind
+// exits. Deferred a tick so it never blocks the window coming up. The scan
+// toasts when its preference is on (holding the notice until the webview
+// connects); an import left in `importing` resumes either way. A thrown scan
+// is logged inside startClaudeSessionLaunchScan.
+setTimeout(() => {
+  startClaudeSessionLaunchScan().catch((err) => {
+    console.error("[agetor] claude session launch scan failed:", err);
+  });
+}, 0);
 
 // Warn the user before quitting when runs are still active. Electrobun's
 // `before-quit` event fires synchronously from Utils.quit() and reads

@@ -559,6 +559,31 @@ export function buildClaudeSessionEnv(callerEnv: Record<string, string>): Record
   };
 }
 
+/**
+ * Make a session's config dir the one `jsonlPathFor` will tail. A harness
+ * with a home already passes `CLAUDE_CONFIG_DIR` (`harnessEnv`, agents.ts).
+ * Without one, claude would inherit whatever the long-lived tmux server
+ * captured when it started — possibly another process's env (the desktop
+ * app and a CLI daemon share the socket) — while the tailer reads this
+ * process's `CLAUDE_CONFIG_DIR` (`effectiveClaudeConfigDir(null)`). So pin
+ * this process's value, or unset it so claude falls back to `~/.claude`.
+ * Setting it to `~/.claude` explicitly is not equivalent: claude then reads
+ * `.claude.json` inside that dir instead of `~/.claude.json`. A caller env
+ * that already names a config dir (a harness `env` map) is left alone.
+ */
+export function pinClaudeConfigDir(
+  argv: readonly string[],
+  env: Record<string, string>,
+  configDir: string | null,
+  processEnv: Record<string, string | undefined> = process.env,
+): { argv: string[]; env: Record<string, string> } {
+  if (configDir || env.CLAUDE_CONFIG_DIR) return { argv: [...argv], env };
+  const own = processEnv.CLAUDE_CONFIG_DIR;
+  if (own) return { argv: [...argv], env: { ...env, CLAUDE_CONFIG_DIR: own } };
+  // `env` execs claude in place, so the pane's pid is still claude's.
+  return { argv: ["/usr/bin/env", "-u", "CLAUDE_CONFIG_DIR", ...argv], env };
+}
+
 interface ContentBlock {
   type: string;
   text?: string;
@@ -4773,38 +4798,6 @@ function isReplayPromise(
   return value != null && typeof (value as Promise<JsonlReplayLine | null>).then === "function";
 }
 
-/** Walk `text` one line at a time. Does not split the whole string up front. */
-function pullJsonlText(text: string): () => JsonlReplayLine | null {
-  let start = 0;
-  return () => {
-    if (start >= text.length) return null;
-    const nl = text.indexOf("\n", start);
-    if (nl < 0) {
-      const line = text.slice(start);
-      start = text.length;
-      return { line, bytes: Buffer.byteLength(line) };
-    }
-    const line = text.slice(start, nl);
-    start = nl + 1;
-    return { line, bytes: Buffer.byteLength(line) + 1 };
-  };
-}
-
-/**
- * Same staging as {@link rebuildEventsFromJsonl}, including the single EOF
- * fire, but yields to the event loop at least every `sliceMs` (default 20)
- * so a large transcript does not hold the Bun main thread. One call covers
- * the whole text — splitting a file across calls would fire a staged
- * `end_turn` at each slice's EOF.
- */
-export async function rebuildEventsFromJsonlCooperative(
-  text: string,
-  onChunk: ChunkHandler,
-  opts?: { sliceMs?: number; onProgress?: (bytesConsumed: number) => void },
-): Promise<void> {
-  await replayJsonlLines(pullJsonlText(text), onChunk, opts);
-}
-
 /**
  * Synchronous read+dispatch of any JSONL content past the cursor. Mirrors
  * `flush` but uses sync fs calls so it can run inside a sync code path
@@ -8117,10 +8110,11 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // and the ask_user MCP both gone, nothing in the spawned claude reads them,
   // and AGETOR_API_TOKEN gates every orchestration route — no reason to expose
   // it to the agent's environment.
-  const fullEnv = buildClaudeSessionEnv(opts.env);
+  const launchCommand = pinClaudeConfigDir(opts.argv, buildClaudeSessionEnv(opts.env), opts.configDir);
+  const fullEnv = launchCommand.env;
   const tmuxArgs: string[] = ["new-session", "-d", "-s", sessionName, "-c", opts.cwd];
   for (const [k, v] of Object.entries(fullEnv)) tmuxArgs.push("-e", `${k}=${v}`);
-  tmuxArgs.push("--", ...opts.argv);
+  tmuxArgs.push("--", ...launchCommand.argv);
 
   // Must run before the `new-session` below (the first tmux command that
   // can auto-start the server on this socket) — a server that boots

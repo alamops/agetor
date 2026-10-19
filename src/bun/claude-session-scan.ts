@@ -3,8 +3,14 @@
  * Disk scan plus liveness. The list path never spawns `claude`; a fresh
  * probe is `refreshClaudeSessionLiveness` (Re-check and import commit).
  * Tests inject `listLive` / `readRegistry` and never hit the default lister.
+ *
+ * A list reads as little as it can. A session Agetor already owns is skipped
+ * by file name. A project folder whose name looks like an Agetor worktree or
+ * temp dir is peeked for its cwd before any full parse. Parsed metadata is
+ * cached per file until its size or mtime changes. `git` runs only for rows
+ * that stay visible.
  */
-import { createReadStream, existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { closeSync, createReadStream, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -12,6 +18,7 @@ import { effectiveClaudeConfigDir } from "./harness-discovery.ts";
 import {
   createClaudeSessionMetaReader,
   claudeProjectDirUnresolved,
+  plainEncodedProjectPath,
   type ClaudeSessionMeta,
 } from "../shared/claude-session-meta.ts";
 
@@ -29,7 +36,9 @@ export interface ClaudeSessionCandidate {
   liveness: "live" | "idle" | "unknown";
   liveHint: string | null;
   importable: boolean;
-  blockedReason: "long-path" | "live" | "no-harness" | null;
+  /** Precedence when several apply: `long-path`, `missing-folder`, `live`,
+   *  `no-harness`. The first two do not change on a liveness re-check. */
+  blockedReason: "long-path" | "missing-folder" | "live" | "no-harness" | null;
   harnessId: string | null;
 }
 
@@ -58,6 +67,9 @@ export interface ClaudeHarnessRef {
   id: string;
   kind: string;
   home: string | null;
+  /** The harness's own binary. The `claude agents --json` probe of its
+   *  config dir runs this, same precedence as `resolveBin` in agents.ts. */
+  bin?: string | null;
 }
 
 export interface ScanClaudeSessionsOptions {
@@ -82,11 +94,16 @@ export interface ScanClaudeSessionsOptions {
   /** When set, only JSONL files whose session id is in the set are parsed.
    *  A batch import looks each id up once instead of re-reading every transcript. */
   onlySessionIds?: ReadonlySet<string>;
-  /** Test seam: fired once per transcript that is actually parsed. */
+  /** Test seam: fired once per transcript that is actually parsed. A cache
+   *  hit, a skipped owned file, and a head peek are not parses. */
   onJsonlRead?: (jsonlPath: string) => void;
 }
 
 const SLICE_MS = 20;
+/** Bytes read to find a hidden-looking transcript's launch cwd. */
+const PEEK_BYTES = 64 * 1024;
+const GIT_BRANCH_TIMEOUT_MS = 5_000;
+const GIT_BRANCH_CONCURRENCY = 8;
 
 interface LiveInfo {
   kind: string | null;
@@ -95,9 +112,26 @@ interface LiveInfo {
 
 interface CacheEntry {
   byId: Map<string, LiveInfo>;
+  /** When this probe finished, ms epoch. */
+  at: number;
 }
 
 const livenessCache = new Map<string, CacheEntry>();
+
+interface MetaCacheEntry {
+  size: number;
+  mtimeMs: number;
+  /** Full parse, or null while only the head has been read. */
+  meta: ClaudeSessionMeta | null;
+  /** Launch cwd from a head peek. Undefined until peeked; null when the
+   *  head held no complete line with a cwd. */
+  headCwd?: string | null;
+}
+
+/** Parsed transcripts by absolute path. An entry is reused only while the
+ *  file's size and mtime are unchanged. A full list drops paths it no
+ *  longer saw. */
+const metaCache = new Map<string, MetaCacheEntry>();
 
 function envOf(opts: { env?: Record<string, string | undefined> }): Record<string, string | undefined> {
   return opts.env ?? process.env;
@@ -281,8 +315,15 @@ function agentsFromStubFile(file: string, configDir: string): ListedClaudeAgent[
   return parseAgentList(parsed);
 }
 
-async function spawnClaudeAgents(configDir: string, env: Record<string, string | undefined>): Promise<ListedClaudeAgent[] | null> {
-  const bin = env.AGETOR_CLAUDE_BIN || "claude";
+async function spawnClaudeAgents(
+  configDir: string,
+  env: Record<string, string | undefined>,
+  harnessBin?: string | null,
+): Promise<ListedClaudeAgent[] | null> {
+  const bin = harnessBin
+    || env.AGETOR_CLAUDE_BIN
+    || Bun.which("claude", { PATH: env.PATH ?? process.env.PATH ?? "" })
+    || "claude";
   try {
     const proc = Bun.spawn([bin, "agents", "--json"], {
       env: { ...process.env, ...env, CLAUDE_CONFIG_DIR: configDir },
@@ -303,12 +344,32 @@ async function spawnClaudeAgents(configDir: string, env: Record<string, string |
 /** Default lister. Honors `AGETOR_CLAUDE_AGENTS_JSON` (a file path) so e2e
  *  never spawns `claude`. A spawn failure returns null. `refreshClaudeSessionLiveness`
  *  drops that dir's cache entry so the next list stays `unknown` instead of
- *  a stale idle snapshot. Not called by `scanClaudeSessions`. */
-export async function defaultListLive(configDir: string, env?: Record<string, string | undefined>): Promise<ListedClaudeAgent[] | null> {
+ *  a stale idle snapshot. Not called by `scanClaudeSessions`. `bin` is the
+ *  owning harness's binary, when it has one. */
+export async function defaultListLive(
+  configDir: string,
+  env?: Record<string, string | undefined>,
+  bin?: string | null,
+): Promise<ListedClaudeAgent[] | null> {
   const source = env ?? process.env;
   const stub = source.AGETOR_CLAUDE_AGENTS_JSON;
   if (stub) return agentsFromStubFile(stub, configDir);
-  return spawnClaudeAgents(configDir, source);
+  return spawnClaudeAgents(configDir, source, bin);
+}
+
+/** The `bin` of the claude-code harness whose config dir is `configDir`. */
+function harnessBinFor(
+  configDir: string,
+  harnesses: readonly ClaudeHarnessRef[],
+  discovery: { homeDir?: string; env?: Record<string, string | undefined> },
+): string | null {
+  const real = safeRealpath(configDir);
+  for (const harness of harnesses) {
+    if (harness.kind !== "claude-code" || !harness.bin) continue;
+    const effective = effectiveClaudeConfigDir(harness.home, { homeDir: discovery.homeDir, env: discovery.env ?? process.env });
+    if (safeRealpath(effective) === real) return harness.bin;
+  }
+  return null;
 }
 
 export function readClaudeRegistry(configDir: string): ClaudeRegistryRecord[] {
@@ -344,12 +405,17 @@ export function readClaudeRegistry(configDir: string): ClaudeRegistryRecord[] {
   return out;
 }
 
+/** Probe each config dir with `claude agents --json`, using the matching
+ *  harness's `bin` when it has one, and cache the answer. */
 export async function refreshClaudeSessionLiveness(
   configDirs: readonly string[],
   env?: Record<string, string | undefined>,
+  harnesses: readonly ClaudeHarnessRef[] = [],
+  homeDir?: string,
 ): Promise<void> {
   for (const dir of configDirs) {
-    const listed = await defaultListLive(dir, env);
+    const bin = harnessBinFor(dir, harnesses, { homeDir, env });
+    const listed = await defaultListLive(dir, env, bin);
     const key = safeRealpath(dir);
     if (listed === null) {
       livenessCache.delete(key);
@@ -359,13 +425,31 @@ export async function refreshClaudeSessionLiveness(
     for (const agent of listed) {
       byId.set(agent.sessionId, { kind: agent.kind, background: isBackgroundKind(agent.kind) });
     }
-    livenessCache.set(key, { byId });
+    livenessCache.set(key, { byId, at: Date.now() });
   }
+}
+
+/** When the oldest cached probe among `configDirs` ran, or null when any of
+ *  them has none. A list serves this cache, so a caller can re-check when
+ *  the answer is missing or old. */
+export function claudeSessionLivenessCheckedAt(configDirs: readonly string[]): number | null {
+  let oldest: number | null = null;
+  for (const dir of configDirs) {
+    const entry = livenessCache.get(safeRealpath(dir));
+    if (!entry) return null;
+    oldest = oldest === null ? entry.at : Math.min(oldest, entry.at);
+  }
+  return oldest;
 }
 
 /** Test seam. Production never needs to drop the cache. */
 export function clearClaudeSessionLivenessCache(): void {
   livenessCache.clear();
+}
+
+/** Test seam: forget every parsed transcript. */
+export function clearClaudeSessionMetaCache(): void {
+  metaCache.clear();
 }
 
 /**
@@ -393,19 +477,77 @@ export async function readClaudeSessionMetaFile(file: string): Promise<ClaudeSes
   return reader.finish();
 }
 
+/** Launch cwd from the first complete lines of a transcript, or null when
+ *  the head holds none. Synchronous: one bounded read. */
+function peekFirstCwd(file: string): string | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(file, "r");
+    const buf = Buffer.alloc(PEEK_BYTES);
+    const n = readSync(fd, buf, 0, PEEK_BYTES, 0);
+    const lines = buf.subarray(0, n).toString("utf8").split("\n");
+    // A full buffer can end mid-line. That piece is not parsed.
+    if (n === PEEK_BYTES) lines.pop();
+    const reader = createClaudeSessionMetaReader();
+    for (const line of lines) {
+      reader.push(line);
+      const cwd = reader.finish().cwd;
+      if (cwd) return cwd;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* already closed */ }
+    }
+  }
+}
+
 async function gitHeadBranch(cwd: string): Promise<string | null> {
   try {
     const proc = Bun.spawn(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], {
       stdout: "pipe",
       stderr: "ignore",
     });
-    const text = (await new Response(proc.stdout).text()).trim();
-    const code = await proc.exited;
-    if (code !== 0 || !text || text === "HEAD") return null;
-    return text;
+    // A folder on a slow or unmounted volume must not hold the list.
+    const timer = setTimeout(() => { try { proc.kill(); } catch { /* already gone */ } }, GIT_BRANCH_TIMEOUT_MS);
+    try {
+      const text = (await new Response(proc.stdout).text()).trim();
+      const code = await proc.exited;
+      if (code !== 0 || !text || text === "HEAD") return null;
+      return text;
+    } finally {
+      clearTimeout(timer);
+    }
   } catch {
     return null;
   }
+}
+
+/** Fill `liveBranch` / `branchMismatch`. One `git` per distinct cwd, a few
+ *  at a time. A missing folder has no branch to read. */
+async function fillLiveBranches(records: readonly ClaudeSessionRecord[]): Promise<void> {
+  const byCwd = new Map<string, ClaudeSessionRecord[]>();
+  for (const record of records) {
+    if (record.blockedReason === "missing-folder") continue;
+    const group = byCwd.get(record.cwd);
+    if (group) group.push(record);
+    else byCwd.set(record.cwd, [record]);
+  }
+  const cwds = [...byCwd.keys()];
+  let next = 0;
+  const worker = async () => {
+    while (next < cwds.length) {
+      const cwd = cwds[next++]!;
+      const liveBranch = await gitHeadBranch(cwd);
+      for (const record of byCwd.get(cwd)!) {
+        record.liveBranch = liveBranch;
+        record.branchMismatch = record.gitBranch !== null && liveBranch !== null && record.gitBranch !== liveBranch;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(GIT_BRANCH_CONCURRENCY, cwds.length) }, worker));
 }
 
 interface Collected {
@@ -450,7 +592,8 @@ function applyLiveness(
     record.liveness = "unknown";
     record.liveHint = null;
   }
-  if (record.blockedReason === "long-path") {
+  // Facts about the folder, not the process. A re-check does not clear them.
+  if (record.blockedReason === "long-path" || record.blockedReason === "missing-folder") {
     record.importable = false;
     return;
   }
@@ -513,7 +656,7 @@ export async function recheckClaudeSessionLiveness(
   }
   if (byDir.size === 0) return;
   if (!opts.listLive) {
-    await refreshClaudeSessionLiveness([...byDir.keys()], opts.env);
+    await refreshClaudeSessionLiveness([...byDir.keys()], opts.env, opts.harnesses, opts.homeDir);
   }
   for (const [configDir, group] of byDir) {
     const { known, agentMap } = await readAgentMap(configDir, opts);
@@ -527,10 +670,75 @@ export async function recheckClaudeSessionLiveness(
   }
 }
 
+/** Absolute cwd under an Agetor worktree root, or an Agetor temp dir. */
+function cwdHidden(cwd: string, opts: ScanClaudeSessionsOptions): boolean {
+  if ((opts.worktreeRoots ?? []).some((root) => underRoot(cwd, root))) return true;
+  return isTempAgetorCwd(cwd);
+}
+
+/** Encoded project-dir prefixes of the hidden roots. Claude names a project
+ *  dir by its cwd's plain encoding, so a dir under a hidden root starts with
+ *  one of these. The encoding is lossy (`worktrees-x` shares the prefix), so
+ *  a match only earns a head peek, never a skip on its own. */
+function hiddenDirPrefixes(opts: ScanClaudeSessionsOptions): string[] {
+  const roots = [...(opts.worktreeRoots ?? []), tmpdir()];
+  const prefixes = new Set<string>();
+  for (const root of roots) {
+    for (const form of [path.resolve(root), safeRealpath(root)]) {
+      prefixes.add(`${plainEncodedProjectPath(form)}-`);
+    }
+  }
+  return [...prefixes];
+}
+
+/** Cached or freshly parsed meta for one transcript. `"hidden"` when a head
+ *  peek already shows a hidden cwd (list mode only). Null when unreadable. */
+async function loadMeta(
+  jsonlPath: string,
+  dirName: string,
+  hidePrefixes: readonly string[],
+  opts: ScanClaudeSessionsOptions,
+): Promise<{ meta: ClaudeSessionMeta; mtime: number } | "hidden" | null> {
+  let st: ReturnType<typeof statSync>;
+  try { st = statSync(jsonlPath); } catch { return null; }
+  let entry = metaCache.get(jsonlPath);
+  if (!entry || entry.size !== st.size || entry.mtimeMs !== st.mtimeMs) {
+    entry = { size: st.size, mtimeMs: st.mtimeMs, meta: null };
+    metaCache.set(jsonlPath, entry);
+  }
+  if (!entry.meta && hidePrefixes.some((prefix) => dirName.startsWith(prefix))) {
+    if (entry.headCwd === undefined) entry.headCwd = peekFirstCwd(jsonlPath);
+    if (entry.headCwd && cwdHidden(entry.headCwd, opts)) return "hidden";
+  }
+  if (!entry.meta) {
+    opts.onJsonlRead?.(jsonlPath);
+    try {
+      entry.meta = await readClaudeSessionMetaFile(jsonlPath);
+    } catch {
+      metaCache.delete(jsonlPath);
+      return null;
+    }
+  }
+  return { meta: entry.meta, mtime: st.mtimeMs };
+}
+
+function folderExists(cwd: string): boolean {
+  try {
+    return statSync(cwd).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
   const encode = opts.encodePath ?? (await import("./claude-tmux.ts")).encodeProjectPath;
   const harnesses = opts.harnesses ?? [];
-  const branchCache = new Map<string, Promise<string | null>>();
+  // A full list may skip what it will hide anyway. A lookup by id must still
+  // find owned and hidden sessions (the commit path refuses them by name).
+  const listMode = !opts.onlySessionIds;
+  const hidePrefixes = listMode ? hiddenDirPrefixes(opts) : [];
+  const folders = new Map<string, boolean>();
+  const visited = new Set<string>();
   const out: Collected[] = [];
   let sliceStart = Date.now();
 
@@ -566,38 +774,34 @@ async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
         const jsonlPath = path.join(dirPath, file);
         const sessionId = file.slice(0, -".jsonl".length);
         if (opts.onlySessionIds && !opts.onlySessionIds.has(sessionId)) continue;
-        opts.onJsonlRead?.(jsonlPath);
-        let meta: ClaudeSessionMeta;
-        let mtime = 0;
-        try {
-          meta = await readClaudeSessionMetaFile(jsonlPath);
-          mtime = statSync(jsonlPath).mtimeMs;
-        } catch {
-          continue;
-        }
+        if (listMode && opts.ownedSessionIds?.has(sessionId)) continue;
+        visited.add(jsonlPath);
+        const loaded = await loadMeta(jsonlPath, dirName, hidePrefixes, opts);
+        if (loaded === null || loaded === "hidden") continue;
+        const { meta, mtime } = loaded;
         if (!meta.cwd) continue;
         const unresolved = claudeProjectDirUnresolved(meta.cwd, dirName, encode);
-        let liveBranch: string | null = null;
-        if (!branchCache.has(meta.cwd)) branchCache.set(meta.cwd, gitHeadBranch(meta.cwd));
-        liveBranch = await branchCache.get(meta.cwd)!;
-        const gitBranch = meta.gitBranch;
-        const branchMismatch = gitBranch !== null && liveBranch !== null && gitBranch !== liveBranch;
+        let folderOk = folders.get(meta.cwd);
+        if (folderOk === undefined) {
+          folderOk = folderExists(meta.cwd);
+          folders.set(meta.cwd, folderOk);
+        }
         const reg = registryById.get(sessionId);
         const record: ClaudeSessionRecord = {
           sessionId,
           configDir,
           cwd: meta.cwd,
           title: meta.title ?? "Untitled session",
-          gitBranch,
-          liveBranch,
-          branchMismatch,
+          gitBranch: meta.gitBranch,
+          liveBranch: null,
+          branchMismatch: false,
           model: meta.model,
           lastActivity: meta.lastTimestamp ?? mtime,
           messageCount: meta.messageCount,
           liveness: "unknown",
           liveHint: null,
           importable: false,
-          blockedReason: unresolved ? "long-path" : null,
+          blockedReason: unresolved ? "long-path" : folderOk ? null : "missing-folder",
           harnessId,
           jsonlPath,
           permissionMode: meta.permissionMode,
@@ -614,6 +818,11 @@ async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
       }
     }
   }
+  if (listMode) {
+    for (const cached of metaCache.keys()) {
+      if (!visited.has(cached)) metaCache.delete(cached);
+    }
+  }
   return out;
 }
 
@@ -621,10 +830,9 @@ function shouldHide(item: Collected, opts: ScanClaudeSessionsOptions): boolean {
   const { record } = item;
   if (item.noUser) return true;
   if (opts.ownedSessionIds?.has(record.sessionId)) return true;
-  if ((opts.worktreeRoots ?? []).some((root) => underRoot(record.cwd, root))) return true;
+  if (cwdHidden(record.cwd, opts)) return true;
   if (item.ownedTmux) return true;
   if (item.continued) return true;
-  if (isTempAgetorCwd(record.cwd)) return true;
   return false;
 }
 
@@ -632,6 +840,7 @@ function shouldHide(item: Collected, opts: ScanClaudeSessionsOptions): boolean {
 export async function scanClaudeSessions(opts: ScanClaudeSessionsOptions): Promise<ClaudeSessionCandidate[]> {
   const items = await collect(opts);
   const visible = items.filter((item) => !shouldHide(item, opts));
+  await fillLiveBranches(visible.map((item) => item.record));
   visible.sort((a, b) => b.record.lastActivity - a.record.lastActivity || a.record.sessionId.localeCompare(b.record.sessionId));
   return visible.map((item) => toCandidate(item.record));
 }
@@ -669,6 +878,7 @@ export async function findClaudeSessions(
     const prev = out.get(item.record.sessionId);
     if (!prev || item.record.lastActivity >= prev.lastActivity) out.set(item.record.sessionId, item.record);
   }
+  await fillLiveBranches([...out.values()]);
   return out;
 }
 

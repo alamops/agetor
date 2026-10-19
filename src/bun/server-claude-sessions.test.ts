@@ -87,16 +87,26 @@ test("list, recheck, import, and the imported-session start refusal", async () =
   await withHome(async () => {
     const listed = await get("/claude-sessions");
     expect(listed.status).toBe(200);
-    const first = await listed.json() as { sessions: { sessionId: string; jsonlPath?: string }[] };
+    const first = await listed.json() as {
+      sessions: { sessionId: string; jsonlPath?: string }[];
+      livenessCheckedAt: number | null;
+    };
     expect(first.sessions.some((s) => s.sessionId === "http-idle")).toBe(true);
     expect(first.sessions.every((s) => s.jsonlPath === undefined)).toBe(true);
+    // No probe of this config dir yet: the client is told to re-check.
+    expect(first.livenessCheckedAt).toBeNull();
 
     writeFileSync(stub, "[]");
+    const before = Date.now();
     const rechecked = await post("/claude-sessions/recheck", {});
     expect(rechecked.status).toBe(200);
-    const idle = ((await rechecked.json()) as { sessions: { sessionId: string; importable: boolean }[] })
-      .sessions.find((s) => s.sessionId === "http-idle");
+    const recheckedBody = (await rechecked.json()) as {
+      sessions: { sessionId: string; importable: boolean }[];
+      livenessCheckedAt: number | null;
+    };
+    const idle = recheckedBody.sessions.find((s) => s.sessionId === "http-idle");
     expect(idle?.importable).toBe(true);
+    expect(recheckedBody.livenessCheckedAt).toBeGreaterThanOrEqual(before);
 
     const bad = await post("/claude-sessions/import", { ids: "nope" });
     expect(bad.status).toBe(400);
@@ -133,4 +143,10 @@ test("list, recheck, import, and the imported-session start refusal", async () =
 test("retry on a missing task is 404", async () => {
   const res = await post(`/tasks/${randomUUID()}/claude-session/retry`, {});
   expect(res.status).toBe(404);
+});
+
+test("checkout rejects a branch that is not a non-empty string", async () => {
+  const res = await post("/claude-sessions/checkout", { sessionId: "anything", branch: 5 });
+  expect(res.status).toBe(400);
+  expect(await res.json()).toEqual({ error: "branch must be a non-empty string" });
 });

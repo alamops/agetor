@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
-import { api, ApiError, type ClaudeSessionListItem } from "@/lib/api";
+import { api, ApiError, type ClaudeSessionList, type ClaudeSessionListItem } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
-import { LONG_PATH_IMPORT_ERROR } from "../../../shared/claude-session-meta.ts";
-import type { DiscoveredAccount } from "../../../shared/types.ts";
+import { LONG_PATH_IMPORT_ERROR, MISSING_FOLDER_IMPORT_ERROR } from "../../../shared/claude-session-meta.ts";
+import { CLAUDE_SESSIONS_LIVENESS_STALE_MS, type DiscoveredAccount } from "../../../shared/types.ts";
 
 interface Props {
   open: boolean;
@@ -16,6 +16,7 @@ interface Props {
 function blockedCopy(session: ClaudeSessionListItem): string | null {
   if (session.importable) return null;
   if (session.blockedReason === "long-path") return LONG_PATH_IMPORT_ERROR;
+  if (session.blockedReason === "missing-folder") return MISSING_FOLDER_IMPORT_ERROR;
   if (session.blockedReason === "live") return session.liveHint ?? "Close it in your terminal first";
   if (session.blockedReason === "no-harness") return "Account isn't set up in Agetor — Add it to import";
   if (session.liveness === "unknown") return "Couldn't tell if this session is still open — Re-check";
@@ -53,20 +54,28 @@ export function ImportClaudeSessionsDialog({ open, onClose, onImported }: Props)
   const [rowError, setRowError] = useState<Record<string, string>>({});
   const [accounts, setAccounts] = useState<DiscoveredAccount[]>([]);
   const [harnessIds, setHarnessIds] = useState<Set<string>>(new Set());
+  /** When each id was imported here. A list that started before that time
+   *  was computed without the new task and would bring the row back. */
+  const importedAtRef = useRef(new Map<string, number>());
 
-  const load = useCallback(async (recheck: boolean) => {
+  const load = useCallback(async (recheck: boolean): Promise<ClaudeSessionList | null> => {
+    const startedAt = Date.now();
     setLoading(true);
     setError(null);
     try {
       const res = recheck ? await api.recheckClaudeSessions() : await api.listClaudeSessions();
-      setSessions(res.sessions);
+      const imported = importedAtRef.current;
+      const rows = res.sessions.filter((s) => (imported.get(s.sessionId) ?? -Infinity) < startedAt);
+      setSessions(rows);
       // A fresh probe replaces row errors. Keeping them would hide the new
       // blocked reason (or a now-importable row) behind the previous failure.
       if (recheck) setRowError({});
-      const importable = new Set(res.sessions.filter((s) => s.importable).map((s) => s.sessionId));
+      const importable = new Set(rows.filter((s) => s.importable).map((s) => s.sessionId));
       setSelected((prev) => new Set([...prev].filter((id) => importable.has(id))));
+      return res;
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Couldn't list Claude Code sessions");
+      return null;
     } finally {
       setLoading(false);
     }
@@ -74,8 +83,18 @@ export function ImportClaudeSessionsDialog({ open, onClose, onImported }: Props)
 
   useEffect(() => {
     if (!open) return;
-    void load(false);
     let cancelled = false;
+    void (async () => {
+      // Show the cached list at once, then probe again when that liveness is
+      // missing (launch scan off, or a failed probe) or older than a minute:
+      // a session opened or closed since would otherwise show the wrong state.
+      const res = await load(false);
+      if (cancelled || !res) return;
+      const checkedAt = res.livenessCheckedAt;
+      if (checkedAt === null || Date.now() - checkedAt > CLAUDE_SESSIONS_LIVENESS_STALE_MS) {
+        await load(true);
+      }
+    })();
     void Promise.all([api.discoverAccounts(), api.listHarnesses()])
       .then(([discovered, listed]) => {
         if (cancelled) return;
@@ -92,9 +111,13 @@ export function ImportClaudeSessionsDialog({ open, onClose, onImported }: Props)
   const applyImportResults = (results: { id: string; taskId?: string; error?: string }[]) => {
     const failed: Record<string, string> = {};
     const ok = new Set<string>();
+    const now = Date.now();
     for (const row of results) {
       if (row.error || !row.taskId) failed[row.id] = row.error ?? "Import failed";
-      else ok.add(row.id);
+      else {
+        ok.add(row.id);
+        importedAtRef.current.set(row.id, now);
+      }
     }
     if (Object.keys(failed).length > 0) {
       setRowError((prev) => ({ ...prev, ...failed }));
@@ -191,7 +214,7 @@ export function ImportClaudeSessionsDialog({ open, onClose, onImported }: Props)
   const checkout = async (session: ClaudeSessionListItem) => {
     setBusyId(session.sessionId);
     try {
-      const res = await api.checkoutClaudeSession(session.sessionId);
+      const res = await api.checkoutClaudeSession(session.sessionId, session.gitBranch ?? undefined);
       if ("error" in res) {
         setRowError((prev) => ({ ...prev, [session.sessionId]: res.error }));
         return;

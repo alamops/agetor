@@ -2112,10 +2112,12 @@ export interface ImportedClaudeSession {
 export const CLAUDE_SESSIONS_LAUNCH_SCAN_PREF = "claudeSessions.launchScan";
 
 /**
- * Preference key for the session ids the launch scan has already toasted.
- * Value is a JSON array of session ids, capped at the newest 2 000.
+ * How old the liveness behind a Claude session list may be before a client
+ * re-checks. `GET /claude-sessions` serves cached `claude agents --json`
+ * probes and returns `livenessCheckedAt` — the oldest probe's time, or null
+ * when a config dir has none.
  */
-export const CLAUDE_SESSIONS_SEEN_IDS_PREF = "claudeSessions.seenIds";
+export const CLAUDE_SESSIONS_LIVENESS_STALE_MS = 60_000;
 
 /**
  * Persisted shape of `task.fxRecovery` (`tasks.fx_recovery` JSON column,

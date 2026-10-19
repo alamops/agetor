@@ -3350,19 +3350,29 @@ function RunPanelBody({
   const branchDrift = driftOf(task.branch ?? null, gitStatus?.branch);
   const importedGitBranch = task.importedClaude?.gitBranch ?? null;
   const folderBranch = gitStatus && !gitStatus.ignored ? gitStatus.branch : null;
-  const importedBranchMismatch = !!importedGitBranch && !!folderBranch && importedGitBranch !== folderBranch;
+  // The import-time branch is only a hint until the session continues here.
+  // After an Agetor turn the folder's branch is whatever that turn left, so
+  // the banner would keep naming a branch the session has moved past.
+  const continuedInAgetor = runs.some((r) => r.origin !== "imported");
+  const importedBranchMismatch = runsLoaded
+    && !continuedInAgetor
+    && !!importedGitBranch
+    && !!folderBranch
+    && importedGitBranch !== folderBranch;
   const resolveConflictsSentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => {
     if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
   }, []);
   const switchImportedBranch = async () => {
     const sessionId = task.importedClaude?.sessionId;
-    if (!sessionId || importedBranchBusy) return;
+    // Check out the branch this banner names, not the transcript's latest.
+    const branch = importedGitBranch;
+    if (!sessionId || !branch || importedBranchBusy) return;
     const taskId = task.id;
     setImportedBranchBusy(true);
     setImportedBranchError(null);
     try {
-      const res = await api.checkoutClaudeSession(sessionId);
+      const res = await api.checkoutClaudeSession(sessionId, branch);
       if (currentTaskIdRef.current !== taskId) return;
       if ("error" in res) {
         setImportedBranchError(res.error);
