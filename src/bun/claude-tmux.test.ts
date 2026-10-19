@@ -85,6 +85,16 @@ test("pinClaudeConfigDir gives a home-less session this process's config dir, or
     argv,
     env: { CLAUDE_CONFIG_DIR: "/h" },
   });
+  // A home always wins over a harness env map naming another dir, and is
+  // passed even when the env omits it — the tailer reads `<home>/projects`.
+  expect(pinClaudeConfigDir(argv, { CLAUDE_CONFIG_DIR: "/other" }, "/h", { CLAUDE_CONFIG_DIR: "/cfg" })).toEqual({
+    argv,
+    env: { CLAUDE_CONFIG_DIR: "/h" },
+  });
+  expect(pinClaudeConfigDir(argv, { A: "1" }, "/h", {})).toEqual({
+    argv,
+    env: { A: "1", CLAUDE_CONFIG_DIR: "/h" },
+  });
   expect(pinClaudeConfigDir(argv, { CLAUDE_CONFIG_DIR: "/custom" }, null, { CLAUDE_CONFIG_DIR: "/cfg" })).toEqual({
     argv,
     env: { CLAUDE_CONFIG_DIR: "/custom" },

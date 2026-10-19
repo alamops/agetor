@@ -3277,7 +3277,7 @@ function RunPanelBody({
   // made. Reuses the same `sendRunInput` plumbing as a typed message so the
   // resulting turn shows up as a normal run row with streamed events.
   const sendCommitPush = async () => {
-    if (!resumableRunId || sending) return;
+    if (!canSend || !resumableRunId || sending) return;
     // Nomenclature-aware: the commit subject is prefixed with the task's branch
     // prefix and the push hint names the real branch. Shared with the CLI's
     // `agetor commit` / dashboard `c` so every surface sends the same text.
@@ -4295,8 +4295,10 @@ function RunPanelBody({
                 )}
                 {/* Commit & push keys on live git state (uncommitted changes or
                     unpushed commits), not run status — see `shouldOfferCommitPush`.
-                    Can surface even mid-run (a background agent dirtied the tree). */}
-                {shouldOfferCommitPush(gitStatus) && !sending && (
+                    Can surface even mid-run (a background agent dirtied the tree).
+                    Hidden while `!canSend` — e.g. an imported session still
+                    importing, or whose import failed — since the send would be refused. */}
+                {canSend && shouldOfferCommitPush(gitStatus) && !sending && (
                   <Button
                     size="sm"
                     variant="secondary"

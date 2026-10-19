@@ -568,8 +568,11 @@ export function buildClaudeSessionEnv(callerEnv: Record<string, string>): Record
  * process's `CLAUDE_CONFIG_DIR` (`effectiveClaudeConfigDir(null)`). So pin
  * this process's value, or unset it so claude falls back to `~/.claude`.
  * Setting it to `~/.claude` explicitly is not equivalent: claude then reads
- * `.claude.json` inside that dir instead of `~/.claude.json`. A caller env
- * that already names a config dir (a harness `env` map) is left alone.
+ * `.claude.json` inside that dir instead of `~/.claude.json`. With a home,
+ * `configDir` always wins: a harness `env` map that names a different
+ * `CLAUDE_CONFIG_DIR` would send claude to a folder the tailer, the
+ * session scan and the liveness probe never read. Without a home, a caller
+ * env that already names a config dir (a harness `env` map) is left alone.
  */
 export function pinClaudeConfigDir(
   argv: readonly string[],
@@ -577,7 +580,8 @@ export function pinClaudeConfigDir(
   configDir: string | null,
   processEnv: Record<string, string | undefined> = process.env,
 ): { argv: string[]; env: Record<string, string> } {
-  if (configDir || env.CLAUDE_CONFIG_DIR) return { argv: [...argv], env };
+  if (configDir) return { argv: [...argv], env: { ...env, CLAUDE_CONFIG_DIR: configDir } };
+  if (env.CLAUDE_CONFIG_DIR) return { argv: [...argv], env };
   const own = processEnv.CLAUDE_CONFIG_DIR;
   if (own) return { argv: [...argv], env: { ...env, CLAUDE_CONFIG_DIR: own } };
   // `env` execs claude in place, so the pane's pid is still claude's.

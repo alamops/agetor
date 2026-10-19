@@ -161,6 +161,33 @@ test("import --json --yes prints only the import result", async () => {
   }]);
 });
 
+test("import --json --yes reports a blocked id beside the results, and when nothing is importable", async () => {
+  const listed = [
+    session(),
+    session({ sessionId: "live", importable: false, blockedReason: "live", liveHint: "Close it first" }),
+    session({ sessionId: "long", importable: false, blockedReason: "long-path" }),
+  ];
+  let imported = 0;
+  currentClient = {
+    recheckClaudeSessions: async () => ({ sessions: listed }),
+    importClaudeSessions: async () => { imported += 1; return { results: [{ id: "sess-1", taskId: "task-1" }] }; },
+  } as unknown as AgetorClient;
+  await cmdSessions(["import", "sess-1", "live", "missing", "--yes"], { ...flags, json: true });
+  expect(jsonOutputs).toEqual([{
+    results: [
+      { id: "sess-1", taskId: "task-1" },
+      { id: "live", error: "Close it first" },
+      { id: "missing", error: "session not found" },
+    ],
+  }]);
+
+  jsonOutputs.length = 0;
+  await cmdSessions(["import", "long", "--yes"], { ...flags, json: true });
+  expect(jsonOutputs).toEqual([{ results: [{ id: "long", error: LONG_PATH_IMPORT_ERROR }] }]);
+  expect(imported).toBe(1);
+  expect(outputs).toEqual([]);
+});
+
 test("import of an unknown id says session not found", async () => {
   let imported = 0;
   currentClient = {

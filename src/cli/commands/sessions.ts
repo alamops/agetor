@@ -65,11 +65,17 @@ export async function cmdSessions(args: string[], flags: Flags): Promise<void> {
   }
   if (dryRun) return;
   const blocked = chosen.filter((s) => !s.importable);
-  if (ids.length === 1 && blocked.length === 1 && reasonFor(blocked[0]!) === LONG_PATH_IMPORT_ERROR) {
+  // Requested ids that won't be imported, reported beside the import results.
+  const skipped = [
+    ...blocked.map((s) => ({ id: s.sessionId, error: reasonFor(s) ?? "session not importable" })),
+    ...missing.map((id) => ({ id, error: "session not found" })),
+  ];
+  if (!flags.json && ids.length === 1 && blocked.length === 1 && reasonFor(blocked[0]!) === LONG_PATH_IMPORT_ERROR) {
     throw new Error(LONG_PATH_IMPORT_ERROR);
   }
   const importable = chosen.filter((s) => s.importable);
   if (importable.length === 0) {
+    if (flags.json) return printJson({ results: skipped });
     if (ids.length === 1 && (blocked[0] || missing.length)) {
       const blockedSession = blocked[0];
       throw new Error(blockedSession ? (reasonFor(blockedSession) ?? "session not found") : "session not found");
@@ -82,14 +88,7 @@ export async function cmdSessions(args: string[], flags: Flags): Promise<void> {
     if (isCancel(answer) || answer !== true) return;
   }
   const imported = await client.importClaudeSessions(importable.map((s) => s.sessionId));
-  if (flags.json) {
-    return printJson({
-      results: [
-        ...imported.results,
-        ...missing.map((id) => ({ id, error: "session not found" })),
-      ],
-    });
-  }
+  if (flags.json) return printJson({ results: [...imported.results, ...skipped] });
   for (const result of imported.results) {
     if (result.error) out(c.yellow(`${result.id}: ${result.error}`));
     else out(`imported ${result.id} → ${result.taskId}`);
