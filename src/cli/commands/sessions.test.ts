@@ -110,7 +110,12 @@ test("import --json --yes prints only the import result", async () => {
   } as unknown as AgetorClient;
   await cmdSessions(["import", "sess-1", "missing", "--yes"], { ...flags, json: true });
   expect(outputs).toEqual([]);
-  expect(jsonOutputs).toEqual([imported]);
+  expect(jsonOutputs).toEqual([{
+    results: [
+      { id: "sess-1", taskId: "task-1" },
+      { id: "missing", error: "session not found" },
+    ],
+  }]);
 });
 
 test("import of an unknown id says session not found", async () => {

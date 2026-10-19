@@ -69,7 +69,14 @@ export async function cmdSessions(args: string[], flags: Flags): Promise<void> {
     if (isCancel(answer) || answer !== true) return;
   }
   const imported = await client.importClaudeSessions(importable.map((s) => s.sessionId));
-  if (flags.json) return printJson(imported);
+  if (flags.json) {
+    return printJson({
+      results: [
+        ...imported.results,
+        ...missing.map((id) => ({ id, error: "session not found" })),
+      ],
+    });
+  }
   for (const result of imported.results) {
     if (result.error) out(c.yellow(`${result.id}: ${result.error}`));
     else out(`imported ${result.id} → ${result.taskId}`);
