@@ -115,6 +115,9 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
     <Card
       ref={setNodeRef}
       style={style}
+      // Lets the board find this card when it reveals the card the user
+      // left from (`lib/board-scroll.ts`).
+      data-task-id={task.id}
       className={cn(
         "relative cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
         type.borderClass,

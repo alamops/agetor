@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ReactFlow, ReactFlowProvider, Background, BackgroundVariant, Controls, useNodesState, useEdgesState } from "@xyflow/react";
 import { AnimatePresence, motion } from "motion/react";
 import { ArrowLeft, CheckCircle2, ChevronDown, RotateCcw, Square, Workflow } from "lucide-react";
@@ -12,6 +12,17 @@ import { useTheme } from "@/components/theme-provider";
 import { useAgentProfiles } from "@/lib/agent-profiles";
 import { api, ApiError } from "@/lib/api";
 import { subscribePipelineGlobalEvents } from "@/lib/pipeline-events";
+import {
+  historyExpansionKey,
+  isHistoryRowExpanded,
+  notePipelineRunPanelSignature,
+  pipelineRunGoalOpen,
+  pipelineRunPanelSignature,
+  resolvePipelineRunPanelScroll,
+  savePipelineRunPanelScroll,
+  setHistoryRowExpanded,
+  setPipelineRunGoalOpen,
+} from "@/lib/pipeline-scroll-memory";
 import {
   edgeVisualState,
   latestTransition,
@@ -272,7 +283,8 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [showGoal, setShowGoal] = useState(false);
+  // Remembered per pipeline task across visits (`lib/pipeline-scroll-memory.ts`, D14).
+  const [showGoal, setShowGoal] = useState(() => pipelineRunGoalOpen(taskId));
   const [notStartedStepName, setNotStartedStepName] = useState<string | null>(null);
   // The satellite whose details dialog is open (by node id — re-resolved
   // against the freshly-derived satellites every render, so the dialog
@@ -796,6 +808,30 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     }
   }, [taskId, load, confirm]);
 
+  // The side panel's scroll position across visits (D12/D13): this view
+  // remounts on every visit, and the panel itself first mounts on the first
+  // data commit (the "Loading pipeline run…" branch below renders without
+  // it). On that commit the panel decides ONCE whether to restore — the
+  // saved offset only when the run's signature is the one the user last
+  // saw, else the top. Every later signature change just records the new
+  // signature, so it always means "what the user last saw". Declared above
+  // the early returns, like every hook here.
+  const panelSignature = run ? pipelineRunPanelSignature(run, steps) : null;
+  const sidePanelRef = useRef<HTMLDivElement | null>(null);
+  const panelRestoredRef = useRef(false);
+  useLayoutEffect(() => {
+    if (panelSignature == null) return;
+    const el = sidePanelRef.current;
+    if (!el) return;
+    if (!panelRestoredRef.current) {
+      panelRestoredRef.current = true;
+      const top = resolvePipelineRunPanelScroll(taskId, panelSignature);
+      if (top != null) el.scrollTop = top;
+      return;
+    }
+    notePipelineRunPanelSignature(taskId, panelSignature);
+  }, [taskId, panelSignature]);
+
   if (loadError && !task) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center gap-3 text-sm text-danger">
@@ -978,12 +1014,21 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
           )}
         </div>
 
-        <div className="w-96 shrink-0 overflow-y-auto border-l border-border bg-card p-3">
+        <div
+          ref={sidePanelRef}
+          data-testid="pipeline-run-side-panel"
+          className="w-96 shrink-0 overflow-y-auto border-l border-border bg-card p-3"
+          onScroll={(e) => savePipelineRunPanelScroll(taskId, e.currentTarget.scrollTop)}
+        >
           <div className="mb-3">
             <button
               type="button"
               data-testid="pipeline-run-goal-toggle"
-              onClick={() => setShowGoal((v) => !v)}
+              onClick={() => {
+                const next = !showGoal;
+                setShowGoal(next);
+                setPipelineRunGoalOpen(taskId, next);
+              }}
               className="flex w-full items-center justify-between gap-2 rounded-md border border-border px-2.5 py-1.5 text-left text-xs font-medium text-muted-foreground hover:bg-accent/40"
             >
               Goal
@@ -1105,9 +1150,21 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
               <p className="text-xs text-muted-foreground">No steps have run yet.</p>
             ) : (
               <ul data-testid="pipeline-run-history" className="flex flex-col gap-1.5">
-                {[...run.history].reverse().map((record) => (
-                  <HistoryRow key={record.seq} record={record} graph={effectiveGraph} />
-                ))}
+                {[...run.history].reverse().map((record) => {
+                  // Also the React key, so remembered and on-screen expansion
+                  // agree: a Restart (new `startedAt`) remounts every row
+                  // collapsed instead of reusing a same-`seq` row's state.
+                  const expansionKey = historyExpansionKey(run.startedAt, record.seq);
+                  return (
+                    <HistoryRow
+                      key={expansionKey}
+                      taskId={taskId}
+                      expansionKey={expansionKey}
+                      record={record}
+                      graph={effectiveGraph}
+                    />
+                  );
+                })}
               </ul>
             )}
           </div>
@@ -1178,8 +1235,20 @@ function AdvanceForm({
   );
 }
 
-function HistoryRow({ record, graph }: { record: PipelineStepRecord; graph: PipelineGraph | null }) {
-  const [open, setOpen] = useState(false);
+function HistoryRow({
+  taskId,
+  expansionKey,
+  record,
+  graph,
+}: {
+  taskId: string;
+  /** `historyExpansionKey(run.startedAt, record.seq)` — remembers this row's
+   *  expansion across visits (`lib/pipeline-scroll-memory.ts`, D14). */
+  expansionKey: string;
+  record: PipelineStepRecord;
+  graph: PipelineGraph | null;
+}) {
+  const [open, setOpen] = useState(() => isHistoryRowExpanded(taskId, expansionKey));
   const stepName = graph ? stepNameById(graph, record.stepId) : record.stepId;
   const duration = record.endedAt != null ? formatDuration(record.endedAt - record.startedAt) : "—";
   const kindInfo = responseKindLabel(record.responseKind);
@@ -1188,7 +1257,11 @@ function HistoryRow({ record, graph }: { record: PipelineStepRecord; graph: Pipe
     <li data-testid="pipeline-run-history-row" className="rounded-md border border-border p-2">
       <button
         type="button"
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          const next = !open;
+          setOpen(next);
+          setHistoryRowExpanded(taskId, expansionKey, next);
+        }}
         className="flex w-full items-center justify-between gap-2 text-left text-xs"
       >
         <span className="min-w-0 truncate">

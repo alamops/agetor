@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { ArrowLeft, Copy, Download, Pencil, Plus, Trash2, Workflow } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm";
 import { usePipelines } from "@/lib/pipelines";
+import { pipelinesListScrollTop, savePipelinesListScrollTop } from "@/lib/pipeline-scroll-memory";
 import { api, ApiError } from "@/lib/api";
 import { BundleToolbar, useBundleList } from "@/components/bundle";
 import { cn } from "@/lib/utils";
@@ -34,6 +35,18 @@ export function PipelinesPage({ onOpenEditor, onBack, onImported }: PipelinesPag
   // The page unmounts on an app-level navigation, so an edited import
   // asks before one drops it.
   const bundle = useBundleList({ ids: pipelines.map((p) => p.id), kind: "pipeline", onImported, guardsNavigation: true });
+  // The page remounts on every visit, so the list's scroll offset lives in
+  // `lib/pipeline-scroll-memory.ts` (D11): saved on scroll, written back
+  // once per mount on the first commit that renders the loaded list — at
+  // mount on a warm cache, or once the first load lands on a cold one.
+  const listScrollRef = useRef<HTMLDivElement | null>(null);
+  const listRestoredRef = useRef(false);
+  useLayoutEffect(() => {
+    if (listRestoredRef.current || loading) return;
+    listRestoredRef.current = true;
+    const el = listScrollRef.current;
+    if (el) el.scrollTop = pipelinesListScrollTop();
+  }, [loading]);
 
   const handleDuplicate = async (pipeline: Pipeline) => {
     setBusyId(pipeline.id);
@@ -99,7 +112,12 @@ export function PipelinesPage({ onOpenEditor, onBack, onImported }: PipelinesPag
         </Button>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-4">
+      <div
+        ref={listScrollRef}
+        data-testid="pipelines-list-scroll"
+        className="min-h-0 flex-1 overflow-y-auto p-4"
+        onScroll={(e) => savePipelinesListScrollTop(e.currentTarget.scrollTop)}
+      >
         {actionError && (
           <p data-testid="pipelines-error" className="mb-3 text-xs text-danger">
             {actionError}
