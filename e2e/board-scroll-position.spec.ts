@@ -484,4 +484,103 @@ test.describe("board scroll position", () => {
     expect((await cardVisibility(page, F.id)).state, "the card stays where it was: no reveal").toBe("none");
     await page.setViewportSize(DEFAULT_VIEWPORT);
   });
+
+  // -------------------------------------------------------------------------
+  // B7 — a return inside the board's exit animation forgets the departure
+  // -------------------------------------------------------------------------
+
+  /**
+   * App.tsx's fast-return guard. A card leave records the card as the
+   * departure as soon as the navigation commits. Escape inside the board's
+   * 0.18 s exit brings the "board" key back while it is still exiting, so
+   * `<AnimatePresence mode="wait">` reuses the same element. Its callback ref
+   * never re-runs, so the record is never consumed. Without the guard, the
+   * stale record would reveal the card on some LATER, unrelated return —
+   * here Pipelines → Back.
+   *
+   * The leave and the Escape happen in one `page.evaluate`: a click on the
+   * card root, then Escape on the next task. React flushes a discrete
+   * click's render, and its effects, before that task runs, so the run
+   * view's Escape listener is attached by then. The in-page snapshot and the
+   * element-identity check prove the fast path itself ran. A remount would
+   * go through the ordinary restore instead, which B3 already covers.
+   *
+   * This relies on `motion/react`'s AnimatePresence re-entering a still-
+   * exiting child when its key returns, instead of remounting it. If a
+   * `motion` upgrade changes that, B7 reads "remounted" and goes red even
+   * though the product is still correct (the ordinary restore then consumes
+   * the record). Re-check this behavior before treating that as a product
+   * bug.
+   */
+  test("B7: Escape inside the board's exit animation forgets the card departure", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const { profileId } = await seedBase(backend);
+    const F = await createFinishedTask(backend, profileId, "Fast F");
+
+    await gotoApp(page, backend.bootBase);
+    await expectBoardOverflow(page);
+    await expect(boardCardById(page, F.id)).toBeVisible();
+    const before = await scrollCardToRightEdge(page, F.id);
+
+    // Leave from the card root (TaskCard's own onClick → openTaskFromBoard,
+    // fromBoardCard), then Escape on the next task, while the board exits.
+    const atEscape = await page.evaluate(
+      (id) =>
+        new Promise<{ boardMounted: boolean; runViewMounted: boolean }>((resolve) => {
+          const board = document.querySelector(".kanban-scroll");
+          (window as unknown as { __e2eBoardBefore?: Element | null }).__e2eBoardBefore = board;
+          const card = document.querySelector<HTMLElement>(`[data-task-id="${id}"]`);
+          if (!board || !card) throw new Error("board scroller or card not found");
+          card.click();
+          window.setTimeout(() => {
+            const snapshot = {
+              boardMounted: board.isConnected,
+              runViewMounted: document.querySelector('[data-testid="pipeline-run-view"]') !== null,
+            };
+            document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+            resolve(snapshot);
+          }, 0);
+        }),
+      F.id,
+    );
+    expect(atEscape, "Escape must land while the leaving board is still mounted").toEqual({
+      boardMounted: true,
+      runViewMounted: false,
+    });
+
+    // The board comes back as the SAME element and finishes its re-entry.
+    // If the Escape had been missed, the board would finish exiting and the
+    // run view would mount instead ("gone"). A remount would read "remounted".
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => {
+            const prev = (window as unknown as { __e2eBoardBefore?: Element | null }).__e2eBoardBefore;
+            const now = document.querySelector(".kanban-scroll");
+            if (!now) return "gone";
+            if (now !== prev) return "remounted";
+            for (let el: Element | null = now; el; el = el.parentElement) {
+              if (getComputedStyle(el).opacity !== "1") return "animating";
+            }
+            return "reused";
+          }),
+        { message: "the board element is reused, not remounted" },
+      )
+      .toBe("reused");
+    await expect(page.getByTestId("pipeline-run-view")).toHaveCount(0);
+    await expectBoardAt(page, before);
+
+    // A later, unrelated return must not act on the stale departure. The
+    // narrower viewport puts the card entirely out of view, so a leftover
+    // record would scroll to it.
+    await openPipelinesPage(page);
+    await page.setViewportSize(NARROW_VIEWPORT);
+    await page.getByTestId("pipelines-back").click();
+    await expectBoardAt(page, before);
+    expect((await cardVisibility(page, F.id)).state, "the departure was forgotten: no reveal").toBe("none");
+    await page.setViewportSize(DEFAULT_VIEWPORT);
+  });
 });

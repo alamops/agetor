@@ -59,7 +59,7 @@ All of these go through `navigate` → `switchView` → `setView` (`:417-438`, `
 | Does a remount (new element, what today's `AnimatePresence` key swap does) lose the offset? | **Yes**, this is the bug mechanism | `"remountNoRestore":[0,0]` | as above | spike below |
 | Does writing `scrollLeft`/`scrollTop` synchronously right after the new element is inserted restore it, including under motion's initial `opacity:0; translateY(8px)`? | **Yes** | `"remountSyncRestore":[300,650]`, `"remountRestoreAfterFrame":[300,650]`, `"restoreUnderMotionInitial":[333,777]` | as above | spike below |
 
-Spike artifact: `/private/tmp/claude-501/-Users-alamosaravali--agetor-worktrees-3e24270e-e095-4fd4-9e90-62032884666d/83e4b814-0888-4eb4-959b-28c88860530d/scratchpad/spikes/display-none-scroll/spike.mjs`. Re-run it with `node spike.mjs /Users/alamosaravali/Projects/alamops/agetor/node_modules`. It uses that checkout's `playwright-core` and the installed `webkit-2336` / `chromium-1234` builds.
+Spike artifact: a throwaway `spike.mjs` in the investigating session's scratchpad, not committed. It was run as `node spike.mjs <main-checkout>/node_modules`. It drove that checkout's `playwright-core` against the installed `webkit-2336` / `chromium-1234` builds. On a plain page it scrolled a `.kanban-scroll`-shaped scroller, then hid it, remounted it and restored it. The outputs quoted above are its results.
 
 ## 3. What we're assuming
 

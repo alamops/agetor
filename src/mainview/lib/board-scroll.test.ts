@@ -1,9 +1,10 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
   boardScrollOffsets,
   discardBoardDeparture,
   recordBoardDeparture,
   resetBoardScrollMemoryForTest,
+  restoreBoardScroll,
   revealScrollDelta,
   saveBoardScroll,
   takeBoardDeparture,
@@ -160,5 +161,180 @@ describe("board scroll memory", () => {
     resetBoardScrollMemoryForTest();
     expect(boardScrollOffsets()).toEqual({ left: 0, top: 0 });
     expect(takeBoardDeparture()).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// restoreBoardScroll — the DOM glue the board's callback ref calls on mount.
+// There is no DOM under `bun test`, so it runs against a duck-typed scroller:
+// scroll offsets clamp like a browser's, and each card's client rect follows
+// the current scroll position.
+// ---------------------------------------------------------------------------
+
+interface FakeScrollerOptions {
+  clientWidth: number;
+  clientHeight: number;
+  scrollWidth: number;
+  scrollHeight: number;
+  /** Border width on every side (`clientLeft`/`clientTop`). */
+  border?: number;
+  /** Cards by task id, as rects in scroll-content coordinates. */
+  cards?: Record<string, ViewportRect>;
+}
+
+/** The scroller's border box sits at (100, 50) in client coordinates. */
+const BOX = { left: 100, top: 50 };
+
+function fakeScroller(o: FakeScrollerOptions) {
+  const border = o.border ?? 0;
+  const maxLeft = o.scrollWidth - o.clientWidth;
+  const maxTop = o.scrollHeight - o.clientHeight;
+  let left = 0;
+  let top = 0;
+  const originX = BOX.left + border;
+  const originY = BOX.top + border;
+  const el = {
+    get scrollLeft() { return left; },
+    set scrollLeft(v: number) { left = Math.min(Math.max(v, 0), maxLeft); },
+    get scrollTop() { return top; },
+    set scrollTop(v: number) { top = Math.min(Math.max(v, 0), maxTop); },
+    clientLeft: border,
+    clientTop: border,
+    clientWidth: o.clientWidth,
+    clientHeight: o.clientHeight,
+    getBoundingClientRect: () => ({
+      left: BOX.left,
+      top: BOX.top,
+      right: BOX.left + 2 * border + o.clientWidth,
+      bottom: BOX.top + 2 * border + o.clientHeight,
+    }),
+    querySelector(selector: string) {
+      // Like a real CSS parser: an unescaped `"` ends the value, so the
+      // selector is invalid (the browser throws a SyntaxError too).
+      const m = /^\[data-task-id="((?:[^"\\]|\\.)*)"\]$/.exec(selector);
+      if (!m) throw new Error(`invalid selector ${selector}`);
+      const rect = o.cards?.[m[1]!.replace(/\\(.)/g, "$1")];
+      if (!rect) return null;
+      return {
+        getBoundingClientRect: () => ({
+          left: originX + rect.left - left,
+          top: originY + rect.top - top,
+          right: originX + rect.right - left,
+          bottom: originY + rect.bottom - top,
+        }),
+      };
+    },
+  };
+  return {
+    el,
+    restore: () => restoreBoardScroll(el as unknown as HTMLElement),
+    offsets: () => ({ left: el.scrollLeft, top: el.scrollTop }),
+    /** The card's rect in client coordinates, as the scroller shows it now. */
+    cardRect: (id: string) => el.querySelector(`[data-task-id="${id}"]`)!.getBoundingClientRect(),
+    /** The scroller's client box (the view a reveal measures against). */
+    view: (): ViewportRect => ({
+      left: originX,
+      top: originY,
+      right: originX + o.clientWidth,
+      bottom: originY + o.clientHeight,
+    }),
+  };
+}
+
+/** A 1000 × 600 view onto a 3000 × 2000 board. */
+const BOARD = { clientWidth: 1000, clientHeight: 600, scrollWidth: 3000, scrollHeight: 2000 };
+
+describe("restoreBoardScroll", () => {
+  const g = globalThis as { CSS?: { escape(s: string): string } };
+  const originalCss = g.CSS;
+  beforeAll(() => {
+    // `bun test` has no CSS global; this covers what task ids can contain.
+    g.CSS ??= { escape: (s: string) => s.replace(/["\\]/g, "\\$&") };
+  });
+  afterAll(() => {
+    // Remove the shim outright when there was no global before, so later
+    // files in the same bun process don't see an own `CSS: undefined`.
+    if (originalCss === undefined) delete g.CSS;
+    else g.CSS = originalCss;
+  });
+
+  test("writes the saved offsets onto a fresh scroller and keeps them", () => {
+    saveBoardScroll(300, 200);
+    const s = fakeScroller(BOARD);
+    s.restore();
+    expect(s.offsets()).toEqual({ left: 300, top: 200 });
+    expect(boardScrollOffsets()).toEqual({ left: 300, top: 200 });
+  });
+
+  test("saves the offsets the browser clamped them to", () => {
+    saveBoardScroll(5000, 5000);
+    const s = fakeScroller(BOARD);
+    s.restore();
+    expect(s.offsets()).toEqual({ left: 2000, top: 1400 });
+    expect(boardScrollOffsets()).toEqual({ left: 2000, top: 1400 });
+  });
+
+  test("reveals an entirely hidden departure card by the minimum distance, then forgets it", () => {
+    recordBoardDeparture("p");
+    const s = fakeScroller({ ...BOARD, cards: { p: card(1500, 100) } });
+    s.restore();
+    expect(s.offsets()).toEqual({ left: 780, top: 0 });
+    expect(s.cardRect("p").right).toBe(s.view().right);
+    expect(boardScrollOffsets()).toEqual({ left: 780, top: 0 });
+    expect(takeBoardDeparture()).toBeNull();
+  });
+
+  test("leaves a partly visible departure card alone, and still forgets it", () => {
+    saveBoardScroll(0, 40);
+    recordBoardDeparture("p");
+    const s = fakeScroller({ ...BOARD, cards: { p: card(900, 100) } });
+    s.restore();
+    expect(s.offsets()).toEqual({ left: 0, top: 40 });
+    expect(takeBoardDeparture()).toBeNull();
+  });
+
+  test("a departure whose card isn't rendered is still forgotten, so a later return can't act on it", () => {
+    recordBoardDeparture("p");
+    fakeScroller(BOARD).restore();
+    expect(boardScrollOffsets()).toEqual({ left: 0, top: 0 });
+
+    const later = fakeScroller({ ...BOARD, cards: { p: card(1500, 100) } });
+    later.restore();
+    expect(later.offsets()).toEqual({ left: 0, top: 0 });
+  });
+
+  test("restores without moving when there is no departure, even if a card is off-screen", () => {
+    saveBoardScroll(10, 20);
+    const s = fakeScroller({ ...BOARD, cards: { p: card(1500, 900) } });
+    s.restore();
+    expect(s.offsets()).toEqual({ left: 10, top: 20 });
+  });
+
+  test("a second call on the same element keeps the revealed offsets (StrictMode's double ref call)", () => {
+    recordBoardDeparture("p");
+    const s = fakeScroller({ ...BOARD, cards: { p: card(1500, 100) } });
+    s.restore();
+    s.restore();
+    expect(s.offsets()).toEqual({ left: 780, top: 0 });
+    expect(boardScrollOffsets()).toEqual({ left: 780, top: 0 });
+  });
+
+  test("measures the view from the client box, inside the scroller's border", () => {
+    saveBoardScroll(1000, 0);
+    recordBoardDeparture("p");
+    // Entirely left of and below the view at (1000, 0).
+    const s = fakeScroller({ ...BOARD, border: 10, cards: { p: card(100, 700) } });
+    s.restore();
+    expect(s.offsets()).toEqual({ left: 100, top: 220 });
+    const rect = s.cardRect("p");
+    expect(rect.left).toBe(s.view().left);
+    expect(rect.bottom).toBe(s.view().bottom);
+  });
+
+  test("finds a card whose id needs escaping in the selector", () => {
+    recordBoardDeparture('odd"id');
+    const s = fakeScroller({ ...BOARD, cards: { 'odd"id': card(1500, 100) } });
+    s.restore();
+    expect(s.offsets()).toEqual({ left: 780, top: 0 });
   });
 });
