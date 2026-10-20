@@ -27,6 +27,7 @@ import type {
   DbCompactResult,
   RetentionPassResult,
 } from "../shared/types.ts";
+import type { NotificationKind } from "../shared/os-notification.ts";
 import type { BundleExportResponse } from "../shared/bundle.ts";
 import type { BundleImportOptions, BundleImportPlan, BundleImportResponse } from "../shared/bundle-import.ts";
 import type { AnyRequest, AskQuestionsAnswer } from "../bun/interactions.ts";
@@ -64,6 +65,10 @@ const CLONE_TIMEOUT_MS = 15 * 60_000;
  *  15s budget would abort while the core was still inserting, and a retry
  *  would create a second profile. */
 const DUPLICATE_WITH_TASKS_TIMEOUT_MS = 10 * 60_000;
+/** `POST /notifications` only hands the post to the OS; a core that does not
+ *  answer quickly is as good as absent, and the caller falls back to posting
+ *  the notification itself. */
+const NOTIFY_TIMEOUT_MS = 5_000;
 /** `POST /db/compact` runs `VACUUM` + `wal_checkpoint(TRUNCATE)` on the core's
  *  single main thread — it rewrites the whole database file, so on a
  *  multi-GB DB (~7.5 s/GB, `DB_COMPACT_SEC_PER_GB`) the core is unresponsive
@@ -301,6 +306,21 @@ export class AgetorClient {
    *  `off`; 409 while a pass is already running. */
   runRetentionPass(): Promise<RetentionPassResult> {
     return this.req("POST", "/db/retention/run", undefined, RETENTION_RUN_TIMEOUT_MS);
+  }
+
+  // ── notifications ──────────────────────────────────────────────────────────
+  /** `POST /notifications` — post a desktop notification through the core's
+   *  native bridge (the app). Rejects with an `ApiError` on any non-2xx,
+   *  including the headless core's 501, so the caller can fall back. */
+  notifyOS(input: {
+    title: string;
+    body?: string;
+    subtitle?: string;
+    silent?: boolean;
+    taskId?: string;
+    kind?: NotificationKind;
+  }): Promise<{ ok: boolean }> {
+    return this.req("POST", "/notifications", input, NOTIFY_TIMEOUT_MS);
   }
 
   // ── projects ───────────────────────────────────────────────────────────────

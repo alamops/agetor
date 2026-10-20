@@ -1,6 +1,6 @@
 import { test, expect, mock, afterAll } from "bun:test";
 import type { AgetorClient } from "./api-client.ts";
-import type { RunEvent, Task } from "../shared/types.ts";
+import type { GlobalEvent, RunEvent, Task } from "../shared/types.ts";
 import { FX_RECOVERY_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, PERMISSION_MODE_STATUS_PREFIX } from "../shared/types.ts";
 import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../shared/fx-recovery.ts";
 
@@ -25,14 +25,18 @@ import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../shared/fx-recov
 import * as realContext from "./context.ts";
 import * as realOutput from "./output.ts";
 import * as realSse from "./sse.ts";
+import * as realNotify from "./notify.ts";
 
 const realContextSnapshot = { ...realContext };
 const realOutputSnapshot = { ...realOutput };
 const realSseSnapshot = { ...realSse };
+const realNotifySnapshot = { ...realNotify };
 
 let currentClient: AgetorClient | null = null;
 const outputs: string[] = [];
 let onTaskEvents: ((e: RunEvent) => void) | null = null;
+let onGlobalEvents: ((e: GlobalEvent) => void) | null = null;
+const osNotifyCalls: Array<{ n: Parameters<typeof realNotify.osNotify>[0]; deps: Parameters<typeof realNotify.osNotify>[1] }> = [];
 
 mock.module("./context.ts", () => ({
   ...realContextSnapshot,
@@ -67,7 +71,17 @@ mock.module("./sse.ts", () => ({
     if (pathname.startsWith("/tasks/") && pathname.includes("/events")) {
       onTaskEvents = onEvent as (e: RunEvent) => void;
     }
+    if (pathname === "/events") onGlobalEvents = onEvent as (e: GlobalEvent) => void;
     return { close: () => {} };
+  },
+}));
+
+// `osNotify` is captured, never run: a real one would ring the bell and could
+// spawn a helper or osascript.
+mock.module("./notify.ts", () => ({
+  ...realNotifySnapshot,
+  osNotify: async (n: Parameters<typeof realNotify.osNotify>[0], deps: Parameters<typeof realNotify.osNotify>[1]) => {
+    osNotifyCalls.push({ n, deps });
   },
 }));
 
@@ -75,6 +89,7 @@ afterAll(() => {
   mock.module("./context.ts", () => realContextSnapshot);
   mock.module("./output.ts", () => realOutputSnapshot);
   mock.module("./sse.ts", () => realSseSnapshot);
+  mock.module("./notify.ts", () => realNotifySnapshot);
 });
 
 const { cmdLogs, pipelineLogsHint } = await import("./commands/logs.ts");
@@ -191,6 +206,37 @@ test("logs --notify: a pipeline (parent) task prints the hint AND keeps followin
   await new Promise((r) => setTimeout(r, 20));
   expect(outputs[0]).toContain("pipeline task");
   expect(onTaskEvents).not.toBeNull();
+  void p;
+});
+
+test("logs --notify: a notifying event posts the task id + kind and wires the core's /notifications route", async () => {
+  osNotifyCalls.length = 0;
+  onGlobalEvents = null;
+  const notified: unknown[] = [];
+  currentClient = {
+    listTasks: async () => [{ id: "task-abc-12345", title: "T" }],
+    getRuns: async () => [],
+    notifyOS: async (input: unknown) => {
+      notified.push(input);
+      return { ok: true };
+    },
+  } as unknown as AgetorClient;
+  const p = cmdLogs(["task-abc-12345", "--notify"], flags);
+  await new Promise((r) => setTimeout(r, 20));
+  expect(onGlobalEvents).not.toBeNull();
+  onGlobalEvents!({ kind: "column", taskId: "task-abc-12345", runId: "r", column: "blocked", prev: "running", ts: 1, reason: "session-died" });
+  // an event for another task is not posted
+  onGlobalEvents!({ kind: "run-status", taskId: "other", runId: "r", status: "succeeded", ts: 1 });
+  expect(osNotifyCalls).toHaveLength(1);
+  const { n, deps } = osNotifyCalls[0]!;
+  expect(n).toEqual({
+    title: "Agetor — needs you",
+    body: "task-abc is waiting on you",
+    taskId: "task-abc-12345",
+    kind: "session-ended",
+  });
+  await deps!.notifyCore!(n);
+  expect(notified).toEqual([n]);
   void p;
 });
 

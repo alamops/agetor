@@ -1,6 +1,8 @@
 import { toast } from "sonner";
+import type { NotificationKind } from "../../shared/os-notification.ts";
 import { api } from "./api";
-import { filesSentCopy, shouldNotifyOsFilesSent, shouldToastFilesSent } from "./files-sent-notify";
+import { filesSentCopy, shouldToastFilesSent } from "./files-sent-notify";
+import { TaskToastSlots, type TaskToastKind } from "./toast-slots";
 
 /**
  * Args common to every toast helper. `isSelected` / `isFocused` are evaluated
@@ -22,15 +24,52 @@ export interface ToastArgs {
   onOpen: () => void;
 }
 
-// Track active pending toasts so a column-leaves-blocked transition can
-// dismiss the matching toast without the caller carrying the id around.
-// Single-slot per task, SHARED by every "needs attention" helper here
-// (`toastPending`, `toastApiError`, `notifyWaitingInput`) and cleared by
-// `dismissPending`. Only one such toast shows per task at a time — a second
-// writer dismisses the first. That's fine while these states don't realistically
-// co-occur (an api-error means the turn died, so there's no live modal); if a
-// future caller can overlap them, key this by `(taskId, kind)` instead.
-const pendingByTask = new Map<string, string | number>();
+// One in-app toast slot per task (D12/D13). Every task-event toast below goes
+// through `showTaskToast`: a newer event for a task dismisses that task's
+// previous toast and takes the front, so two event toasts for one task never
+// coexist. The slot is released when the toast goes away on its own — swipe or
+// close (`onDismiss`), timeout (`onAutoClose`) or its "Open" action click.
+// sonner fires `onDismiss` for a programmatic `toast.dismiss(id)` too, but the
+// release is id-guarded, so the displaced toast can't free its successor's slot.
+// "Reason" toasts (waiting / blocked / api-error / session-ended /
+// unknown-command) are the ones `dismissPending` clears when the task leaves
+// `blocked`; `hasPendingToast` reports them. Action-feedback toasts in App.tsx
+// ("Copied", …) are not task events and stay outside the slot.
+const slots = new TaskToastSlots();
+
+/** What `showTaskToast`'s `show` callback wires into the sonner call. */
+interface SlotLifecycle {
+  /** Pass as `onDismiss` and `onAutoClose`. */
+  release: () => void;
+  /** The "Open" action; releases the slot (sonner's action click fires
+   *  neither `onDismiss` nor `onAutoClose`) after running `onOpen`. */
+  openAction: { label: string; onClick: (event: { defaultPrevented: boolean }) => void };
+}
+
+function showTaskToast(
+  taskId: string | undefined,
+  kind: TaskToastKind,
+  onOpen: () => void,
+  show: (lifecycle: SlotLifecycle) => string | number,
+): void {
+  const prior = taskId ? slots.get(taskId) : undefined;
+  if (prior) toast.dismiss(prior.id);
+  let id: string | number | undefined;
+  const release = () => {
+    if (taskId && id !== undefined) slots.release(taskId, id);
+  };
+  id = show({
+    release,
+    openAction: {
+      label: "Open",
+      onClick: (event) => {
+        onOpen();
+        if (!event.defaultPrevented) release();
+      },
+    },
+  });
+  if (taskId) slots.set(taskId, id, kind);
+}
 
 function describe(args: ToastArgs): string {
   return args.subtitle ? `${args.title} · ${args.subtitle}` : args.title;
@@ -38,85 +77,104 @@ function describe(args: ToastArgs): string {
 
 function maybeNotifyOS(
   args: ToastArgs,
+  kind: NotificationKind,
   heading: string,
   detail?: string,
   opts?: { force?: boolean },
 ): void {
-  if (args.isFocused && !opts?.force) return;
+  if (args.isFocused && !opts?.force) {
+    // D7: the in-app toast carries the news while the window is focused, so the
+    // task's older Notification Center entry (if any) is removed, not replaced.
+    api.clearTaskNotification(args.taskId).catch(() => { /* ignore */ });
+    return;
+  }
   // Fire-and-forget — failure (e.g. user denied macOS permission) is silent.
-  api.notifyOS({ title: heading, body: detail, taskId: args.taskId }).catch(() => { /* ignore */ });
+  api.notifyOS({ title: heading, body: detail, taskId: args.taskId, kind }).catch(() => { /* ignore */ });
 }
 
-export function toastSuccess(args: ToastArgs): void {
+export function toastSuccess(args: ToastArgs & { kind?: "succeeded" | "pipeline-finished" }): void {
   if (args.isSelected) return;
+  const kind = args.kind ?? "succeeded";
   const detail = describe(args);
-  toast.success("Task succeeded", {
-    description: detail,
-    duration: 6000,
-    action: { label: "Open", onClick: args.onOpen },
-  });
-  maybeNotifyOS(args, "Task succeeded", detail);
+  showTaskToast(args.taskId, kind, args.onOpen, ({ release, openAction }) =>
+    toast.success("Task succeeded", {
+      description: detail,
+      duration: 6000,
+      action: openAction,
+      onDismiss: release,
+      onAutoClose: release,
+    }),
+  );
+  maybeNotifyOS(args, kind, "Task succeeded", detail);
 }
 
 export function toastError(args: ToastArgs & { reason?: string }): void {
   if (args.isSelected) return;
   const base = describe(args);
   const detail = args.reason ? `${base} — ${args.reason}` : base;
-  toast.error("Task failed", {
-    description: detail,
-    duration: Infinity,
-    action: { label: "Open", onClick: args.onOpen },
-  });
-  maybeNotifyOS(args, "Task failed", detail);
+  showTaskToast(args.taskId, "failed", args.onOpen, ({ release, openAction }) =>
+    toast.error("Task failed", {
+      description: detail,
+      duration: Infinity,
+      action: openAction,
+      onDismiss: release,
+      onAutoClose: release,
+    }),
+  );
+  maybeNotifyOS(args, "failed", "Task failed", detail);
 }
 
-/** Shared lifecycle for the two `blocked`-column toasts (`toastPending` for
- *  permission prompts, `toastApiError` for API failures). Both:
+/** Shared lifecycle for the `blocked`-column toasts (`toastPending` for
+ *  permission prompts, plus the api-error / session-ended / unknown-command
+ *  variants). All of them:
  *    • bail when the affected task is the currently mounted panel,
- *    • dismiss any prior pending toast for this task so we don't stack
- *      duplicates if the column re-enters `blocked`,
- *    • register the toast id in `pendingByTask` so a `column-leaves-blocked`
- *      transition can clear it via `dismissPending`,
+ *    • take the task's one toast slot (`showTaskToast` dismisses any prior
+ *      toast, so we don't stack duplicates if the column re-enters `blocked`),
+ *      which is what lets a `column-leaves-blocked` transition clear it via
+ *      `dismissPending`,
  *    • use `duration: Infinity` (only user/programmatic dismissal cleans up),
  *    • mirror the heading to the OS notification when the app is unfocused.
- *  Only the sonner severity (warning vs error) and the heading differ — keep
- *  those at the call site so adding a third variant is a two-line change. */
+ *  Only the sonner severity (warning vs error), the heading and the kind differ
+ *  — keep those at the call site so adding another variant is a two-line
+ *  change. */
 function showBlockingToast(
-  variant: { method: typeof toast.warning | typeof toast.error; heading: string },
+  variant: {
+    method: typeof toast.warning | typeof toast.error;
+    heading: string;
+    kind: NotificationKind;
+  },
   args: ToastArgs,
 ): void {
   if (args.isSelected) return;
-  const prior = pendingByTask.get(args.taskId);
-  if (prior !== undefined) toast.dismiss(prior);
   const detail = describe(args);
-  const id = variant.method(variant.heading, {
-    description: detail,
-    duration: Infinity,
-    action: { label: "Open", onClick: args.onOpen },
-    onDismiss: () => {
-      if (pendingByTask.get(args.taskId) === id) pendingByTask.delete(args.taskId);
-    },
-  });
-  pendingByTask.set(args.taskId, id);
-  maybeNotifyOS(args, variant.heading, detail);
+  showTaskToast(args.taskId, variant.kind, args.onOpen, ({ release, openAction }) =>
+    variant.method(variant.heading, {
+      description: detail,
+      duration: Infinity,
+      action: openAction,
+      onDismiss: release,
+      onAutoClose: release,
+    }),
+  );
+  maybeNotifyOS(args, variant.kind, variant.heading, detail);
 }
 
 export function toastPending(args: ToastArgs): void {
-  showBlockingToast({ method: toast.warning, heading: "Waiting on you" }, args);
+  showBlockingToast({ method: toast.warning, heading: "Waiting on you", kind: "blocked" }, args);
 }
 
 /** Variant of `toastPending` for the `blocked → api-error` transition.
  *  The heading/copy reads as a transient failure to retry rather than
  *  "the agent is waiting on your answer." */
 export function toastApiError(args: ToastArgs): void {
-  showBlockingToast({ method: toast.error, heading: "API error — retry" }, args);
+  showBlockingToast({ method: toast.error, heading: "API error — retry", kind: "api-error" }, args);
 }
 
 /** Variant of `toastPending` for the `blocked → session-died` transition —
  *  the task's tmux session ended unexpectedly mid-run. Reads as an unexpected
  *  interruption to re-run, not "the agent is waiting on you." */
 export function toastSessionEnded(args: ToastArgs): void {
-  showBlockingToast({ method: toast.error, heading: "Session ended" }, args);
+  showBlockingToast({ method: toast.error, heading: "Session ended", kind: "session-ended" }, args);
 }
 
 /** Variant of `toastPending` for the `blocked → unknown-command` transition —
@@ -125,7 +183,7 @@ export function toastSessionEnded(args: ToastArgs): void {
  *  "the agent is waiting on you." */
 export function toastUnknownCommand(args: ToastArgs): void {
   showBlockingToast(
-    { method: toast.error, heading: "Message not delivered" },
+    { method: toast.error, heading: "Message not delivered", kind: "unknown-command" },
     args,
   );
 }
@@ -142,48 +200,54 @@ export function toastUnknownCommand(args: ToastArgs): void {
  * instant the window repaints on focus).
  */
 export function notifyWaitingInput(args: ToastArgs): void {
-  maybeNotifyOS(args, "Waiting on you", describe(args));
+  maybeNotifyOS(args, "waiting", "Waiting on you", describe(args));
   if (args.isSelected) return;
-  const prior = pendingByTask.get(args.taskId);
-  if (prior !== undefined) toast.dismiss(prior);
   const detail = describe(args);
-  const id = toast.warning("Waiting on you", {
-    description: detail,
-    duration: Infinity,
-    action: { label: "Open", onClick: args.onOpen },
-    onDismiss: () => {
-      if (pendingByTask.get(args.taskId) === id) pendingByTask.delete(args.taskId);
-    },
-  });
-  pendingByTask.set(args.taskId, id);
+  showTaskToast(args.taskId, "waiting", args.onOpen, ({ release, openAction }) =>
+    toast.warning("Waiting on you", {
+      description: detail,
+      duration: Infinity,
+      action: openAction,
+      onDismiss: release,
+      onAutoClose: release,
+    }),
+  );
 }
 
 /**
  * Alert the user that Claude delivered files via `SendUserFile` (the
  * `files-sent` `GlobalEvent` — see `src/shared/types.ts` and
  * `src/mainview/lib/files-sent-notify.ts` for the pure decision logic this
- * composes). Deliberately does **not** use `pendingByTask` — a delivered-
+ * composes). Deliberately not a "reason" toast — a delivered-
  * files toast isn't "waiting on you" and has no blocked-column counterpart
  * to auto-dismiss it, so it's a plain, self-dismissing `toast.info` like
  * `toastSuccess`/`toastError`, not one of the `showBlockingToast` variants.
+ * It still takes the task's one toast slot (as a non-reason kind), so
+ * `dismissPending` leaves it alone.
  * The native notification bypasses the usual focused-window gate
  * (`maybeNotifyOS`'s `force` option) for a `proactive` send — Claude
  * volunteered the files unprompted, so there's no other signal something
- * just landed, focused window or not.
+ * just landed, focused window or not. A focused, not-proactive send goes
+ * through `maybeNotifyOS` too, which then removes the task's older entry (D7).
  */
 export function notifyFilesSent(
   args: ToastArgs & { count: number; caption: string | null; proactive: boolean },
 ): void {
   const { title, body } = filesSentCopy({ count: args.count, caption: args.caption });
   const description = body ? `${describe(args)} — ${body}` : describe(args);
-  if (shouldNotifyOsFilesSent({ isFocused: args.isFocused, proactive: args.proactive })) {
-    maybeNotifyOS(args, title, description, { force: args.proactive });
-  }
+  // Posts when unfocused or proactive (`force`: Claude volunteered the files,
+  // so there's no other signal); a focused, not-proactive send removes the
+  // task's older entry instead.
+  maybeNotifyOS(args, "files-sent", title, description, { force: args.proactive });
   if (shouldToastFilesSent({ isSelected: args.isSelected, isFocused: args.isFocused })) {
-    toast.info(title, {
-      description,
-      action: { label: "Open", onClick: args.onOpen },
-    });
+    showTaskToast(args.taskId, "files-sent", args.onOpen, ({ release, openAction }) =>
+      toast.info(title, {
+        description,
+        action: openAction,
+        onDismiss: release,
+        onAutoClose: release,
+      }),
+    );
   }
 }
 
@@ -199,8 +263,8 @@ export function notifyFilesSent(
  * composer already cleared on the `pending` acceptance, and no run status line
  * exists for this failure (there may be no run at all), so a toast is the only
  * place the user can learn the message didn't go. Self-dismissing after 10 s
- * (long enough to read a sentence-length reason) and, like `notifyFilesSent`,
- * deliberately doesn't touch `pendingByTask` — it isn't a "waiting on you"
+ * (long enough to read a sentence-length reason). Like `notifyFilesSent` it
+ * takes the task's slot as a non-reason kind — it isn't a "waiting on you"
  * state with a blocked-column counterpart to auto-clear it.
  */
 export function toastSendFailed(
@@ -211,11 +275,15 @@ export function toastSendFailed(
 ): void {
   const base = args.subtitle ? `${args.title} · ${args.subtitle}` : args.title;
   const tail = args.savedToBacklog ? " — saved to the task's backlog" : "";
-  toast.warning("Message not sent", {
-    description: `${base} — ${args.reason}${tail}`,
-    duration: 10_000,
-    action: { label: "Open", onClick: args.onOpen },
-  });
+  showTaskToast(args.taskId, "send-failed", args.onOpen, ({ release, openAction }) =>
+    toast.warning("Message not sent", {
+      description: `${base} — ${args.reason}${tail}`,
+      duration: 10_000,
+      action: openAction,
+      onDismiss: release,
+      onAutoClose: release,
+    }),
+  );
 }
 
 /**
@@ -229,11 +297,15 @@ export function toastSendFailed(
  */
 export function toastFxAutoResumeFired(args: ToastArgs & { attempt: number; max: number }): void {
   if (args.isSelected) return;
-  toast.info(`Auto-resuming paused fx response (${args.attempt}/${args.max})…`, {
-    description: describe(args),
-    duration: 6000,
-    action: { label: "Open", onClick: args.onOpen },
-  });
+  showTaskToast(args.taskId, "fx-auto-resume-fired", args.onOpen, ({ release, openAction }) =>
+    toast.info(`Auto-resuming paused fx response (${args.attempt}/${args.max})…`, {
+      description: describe(args),
+      duration: 6000,
+      action: openAction,
+      onDismiss: release,
+      onAutoClose: release,
+    }),
+  );
 }
 
 /**
@@ -245,29 +317,46 @@ export function toastFxAutoResumeFired(args: ToastArgs & { attempt: number; max:
  */
 export function toastFxAutoResumeExhausted(args: ToastArgs & { max: number }): void {
   if (args.isSelected) return;
-  toast.error(`Auto-resume gave up after ${args.max} attempts — resume manually once the limit clears`, {
-    description: describe(args),
-    duration: Infinity,
-    action: { label: "Open", onClick: args.onOpen },
-  });
+  showTaskToast(args.taskId, "fx-auto-resume-exhausted", args.onOpen, ({ release, openAction }) =>
+    toast.error(`Auto-resume gave up after ${args.max} attempts — resume manually once the limit clears`, {
+      description: describe(args),
+      duration: Infinity,
+      action: openAction,
+      onDismiss: release,
+      onAutoClose: release,
+    }),
+  );
 }
 
-/** Whether a "needs attention" toast registered in `pendingByTask` is still
- *  live for `taskId` — i.e. `toastPending`/`toastApiError`/
- *  `notifyWaitingInput` showed one and neither the user nor `dismissPending`
- *  has cleared it since. App.tsx reads this for a pipeline PARENT: a hidden
- *  step task's own interaction toast is retargeted at the parent (same
- *  `taskId`, same slot), so the parent's own `blocked`/`pipeline`
- *  "Pipeline needs you" toast is suppressed while that retargeted toast is
- *  still up — otherwise one underlying block would notify twice. */
+/** Whether a "needs attention" (reason-family) toast is still live in
+ *  `taskId`'s slot — i.e. `toastPending`/`toastApiError`/`toastSessionEnded`/
+ *  `toastUnknownCommand`/`notifyWaitingInput` showed one and neither the user,
+ *  a newer event toast, nor `dismissPending` has cleared it since. App.tsx
+ *  reads this for a pipeline PARENT: a hidden step task's own interaction
+ *  toast is retargeted at the parent (same `taskId`, same slot), so the
+ *  parent's own `blocked`/`pipeline` "Pipeline needs you" toast is suppressed
+ *  while that retargeted toast is still up — otherwise one underlying block
+ *  would notify twice. */
 export function hasPendingToast(taskId: string): boolean {
-  return pendingByTask.has(taskId);
+  return slots.isReason(taskId);
 }
 
-/** Clear the pending toast for a task (called when the task leaves `blocked`). */
+/** Clear the reason-family toast for a task (called when the task leaves
+ *  `blocked`). Any other toast in the slot (success, failed, files sent, …)
+ *  is left alone. */
 export function dismissPending(taskId: string): void {
-  const id = pendingByTask.get(taskId);
-  if (id === undefined) return;
-  toast.dismiss(id);
-  pendingByTask.delete(taskId);
+  const entry = slots.take(taskId, { onlyReason: true });
+  if (entry) toast.dismiss(entry.id);
+}
+
+/** Dismiss whatever event toast holds `taskId`'s slot, whatever its kind
+ *  (called when the task's panel is opened). */
+export function dismissTaskToast(taskId: string): void {
+  const entry = slots.take(taskId);
+  if (entry) toast.dismiss(entry.id);
+}
+
+/** `dismissTaskToast` for several tasks (a pipeline parent plus its steps). */
+export function dismissTaskToastsFor(taskIds: Iterable<string>): void {
+  for (const taskId of taskIds) dismissTaskToast(taskId);
 }

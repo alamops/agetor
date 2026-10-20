@@ -94,6 +94,7 @@ import type {
   WorktreeTeardownResult,
 } from "../../shared/types.ts";
 import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
+import type { NotificationKind } from "../../shared/os-notification.ts";
 import type {
   BundleExportResponse,
   BundlePickResponse,
@@ -2015,10 +2016,21 @@ export const api = {
     subtitle?: string;
     silent?: boolean;
     taskId?: string;
+    /** The event kind; the core uses it for the entry's urgency (sound) and
+     *  for the reason-scoped removals. */
+    kind?: NotificationKind;
   }) =>
     j<{ ok: boolean }>("/notifications", {
       method: "POST",
       body: JSON.stringify(input),
+    }),
+
+  /** Remove a task's Notification Center entry (the focused-window update
+   *  path: the in-app toast carries the news, so the older entry goes).
+   *  Fire-and-forget like `notifyOS`; callers `.catch(() => {})`. */
+  clearTaskNotification: (taskId: string) =>
+    j<{ ok: boolean }>(`/notifications/${encodeURIComponent(taskId)}`, {
+      method: "DELETE",
     }),
 
   /** App-wide lifecycle event stream. Live-only (no replay) — subscribers
