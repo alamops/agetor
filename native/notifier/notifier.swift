@@ -11,8 +11,26 @@
 // to the already-running agetor instance (its registered agetor:// handler),
 // firing agetor's existing open-url -> open_task -> RunPanel flow.
 //
-// CLI contract (invoked by src/bun/notifier.ts buildNotifierArgs):
-//   notifier --title <t> [--subtitle <s>] --message <m> [--url <agetor://...>] [--silent]
+// CLI contract (invoked by src/bun/notifier.ts; see docs/plans/duplicated-macos-notifications.md):
+//   notifier --title <t> --message <m> [--subtitle <s>] [--url <agetor://task/...>] [--silent]
+//            [--id <identifier>] [--kind <kind>] [--urgency needs-you|quiet] [--sound-over <urgency>]...
+//   notifier --remove --id <identifier> [--url <agetor://task/...>] [--if-kind <kind>]...
+//   notifier --list
+//   notifier                      # no args: click relaunch, waits for didReceive
+// Mode order: --list, --remove, post (a --title was given), else click relaunch.
+// Exit codes: 0 ok · 1 remove/list safety timeout · 2 post permission denied or
+// timed out · 64 usage (--remove without --id).
+//
+// One entry per task: a post carrying --id uses it as the request identifier,
+// so a repeat post REPLACES the previous banner instead of stacking a new one.
+// Sound rule: the replacement plays a sound only when --silent is absent AND
+// either nothing for this task is in Notification Center yet, or the entry
+// being replaced carries an urgency listed in --sound-over ("unknown" stands
+// for an entry with no stored urgency, e.g. one posted by an older build). The
+// decision is read from the delivered list, so it survives a helper restart.
+// Entries posted by older builds (random identifiers, matched by --url) are
+// removed when the same task posts again. --remove and --list never request
+// authorization, so they can never pop the permission prompt.
 //
 // arm64-only, no third-party dependency, no Rosetta. Build: swiftc against
 // AppKit + UserNotifications (see scripts/build-notifier.ts).
@@ -27,6 +45,13 @@ struct Options {
   var message: String = ""
   var url: String?
   var silent: Bool = false
+  var id: String?
+  var kind: String?
+  var urgency: String?
+  var soundOver: [String] = []
+  var ifKinds: [String] = []
+  var remove: Bool = false
+  var list: Bool = false
 
   /// Post mode iff a title was supplied. A click-relaunch carries no args, so
   /// hasContent is false and we simply wait for the delegate callback.
@@ -45,16 +70,51 @@ func parseArgs(_ argv: [String]) -> Options {
     case "--message": o.message = value ?? ""; i += 2
     case "--url": o.url = value; i += 2
     case "--silent": o.silent = true; i += 1
+    case "--id": o.id = value; i += 2
+    case "--kind": o.kind = value; i += 2
+    case "--urgency": o.urgency = value; i += 2
+    case "--sound-over": if let value { o.soundOver.append(value) }; i += 2
+    case "--if-kind": if let value { o.ifKinds.append(value) }; i += 2
+    case "--remove": o.remove = true; i += 1
+    case "--list": o.list = true; i += 1
     default: i += 1
     }
   }
   return o
 }
 
+/// The post path decides `playSound` on a Notification Center callback queue,
+/// while `willPresent` may be delivered on another thread; this tiny lock keeps
+/// the hand-off race-free without making the whole delegate Sendable.
+final class SoundGate: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: Bool
+
+  init(_ initial: Bool) { value = initial }
+
+  func set(_ newValue: Bool) {
+    lock.lock()
+    value = newValue
+    lock.unlock()
+  }
+
+  func get() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
+  }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
   private let opts: Options
+  private let soundGate: SoundGate
 
-  init(_ opts: Options) { self.opts = opts }
+  init(_ opts: Options) {
+    self.opts = opts
+    // Until a post decides otherwise, foreground presentation honors --silent
+    // exactly as before.
+    self.soundGate = SoundGate(!opts.silent)
+  }
 
   func applicationDidFinishLaunching(_ note: Notification) {
     let center = UNUserNotificationCenter.current()
@@ -62,7 +122,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // its response to didReceive (Apple's documented requirement).
     center.delegate = self
 
-    if opts.hasContent {
+    if opts.list {
+      listAgetorURLs(center)
+    } else if opts.remove {
+      removeNotifications(center)
+    } else if opts.hasContent {
       postNotification(center)
     } else {
       // Relaunched only to deliver a click response; keep the run loop alive
@@ -75,25 +139,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // Local notifications need no entitlement, but they do need a one-time
     // user grant. On denial we exit quietly (agetor falls back to a plain
     // Utils.showNotification on its side).
-    center.requestAuthorization(options: [.alert, .sound]) { [opts] granted, _ in
+    center.requestAuthorization(options: [.alert, .sound]) { [opts, soundGate] granted, _ in
       // Exit non-zero on denial so agetor's spawn-side fallback fires a plain
       // Utils.showNotification (best-effort) rather than the user getting no
       // notification at all. requestAuthorization also returns granted=false
       // for a previously-denied state, so this degrades consistently.
       guard granted else { exit(2) }
 
-      let content = UNMutableNotificationContent()
-      content.title = opts.title ?? ""
-      if let subtitle = opts.subtitle { content.subtitle = subtitle }
-      content.body = opts.message
-      if !opts.silent { content.sound = .default }
-      if let url = opts.url { content.userInfo = ["url": url] }
+      // Without --id there is nothing to replace: today's behavior, a random
+      // identifier and no query of Notification Center.
+      guard let id = opts.id else {
+        soundGate.set(!opts.silent)
+        Self.add(center, opts: opts, identifier: UUID().uuidString, playSound: !opts.silent)
+        return
+      }
 
-      let request = UNNotificationRequest(
-        identifier: UUID().uuidString, content: content, trigger: nil)
-      center.add(request) { _ in
-        // Delivered to the system; the helper no longer needs to run.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exit(0) }
+      center.getDeliveredNotifications { delivered in
+        var existingUrgency: String?
+        var oldStyleIds: [String] = []
+        for n in delivered {
+          let ident = n.request.identifier
+          let info = n.request.content.userInfo
+          if ident == id {
+            existingUrgency = (info["urgency"] as? String) ?? "unknown"
+          } else if let url = opts.url, info["url"] as? String == url {
+            // Posted by an older build under a random identifier.
+            oldStyleIds.append(ident)
+            if existingUrgency == nil { existingUrgency = "unknown" }
+          }
+        }
+
+        // A repeat post is quiet unless the entry it replaces was a lower
+        // urgency the caller listed in --sound-over (an escalation).
+        let playSound =
+          !opts.silent && (existingUrgency.map { opts.soundOver.contains($0) } ?? true)
+
+        if !oldStyleIds.isEmpty {
+          center.removeDeliveredNotifications(withIdentifiers: oldStyleIds)
+        }
+        // Publish before `add` so a willPresent triggered by it sees the final
+        // decision.
+        soundGate.set(playSound)
+        Self.add(center, opts: opts, identifier: id, playSound: playSound)
       }
     }
     // Safety net if neither the auth callback nor `add` ever completes. Uses a
@@ -103,6 +190,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // failed post. 120s so an AFK first-run doesn't drop the notification
     // prematurely.
     scheduleExit(after: 120, code: 2)
+  }
+
+  private static func add(
+    _ center: UNUserNotificationCenter, opts: Options, identifier: String, playSound: Bool
+  ) {
+    let content = UNMutableNotificationContent()
+    content.title = opts.title ?? ""
+    if let subtitle = opts.subtitle { content.subtitle = subtitle }
+    content.body = opts.message
+    content.sound = playSound ? .default : nil
+    var info: [String: String] = [:]
+    if let url = opts.url { info["url"] = url }
+    if let kind = opts.kind { info["kind"] = kind }
+    if let urgency = opts.urgency { info["urgency"] = urgency }
+    if !info.isEmpty { content.userInfo = info }
+
+    let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+    center.add(request) { _ in
+      // Delivered to the system; the helper no longer needs to run.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exit(0) }
+    }
+  }
+
+  // Removal: no authorization request (a removal must never pop the permission
+  // prompt). Targets are the entry with the task's identifier plus any
+  // old-style entry carrying the task's url; --if-kind narrows them to the
+  // listed kinds, and old-style entries have no kind so they never match then.
+  private func removeNotifications(_ center: UNUserNotificationCenter) {
+    guard let id = opts.id else {
+      FileHandle.standardError.write(
+        Data("usage: notifier --remove --id <identifier> [--url <url>] [--if-kind <kind>]...\n".utf8))
+      exit(64)
+    }
+    center.getDeliveredNotifications { [opts] delivered in
+      var targets: [String] = []
+      for n in delivered {
+        let ident = n.request.identifier
+        let info = n.request.content.userInfo
+        let matches = ident == id || (opts.url != nil && info["url"] as? String == opts.url)
+        guard matches else { continue }
+        if !opts.ifKinds.isEmpty {
+          guard let kind = info["kind"] as? String, opts.ifKinds.contains(kind) else { continue }
+        }
+        targets.append(ident)
+      }
+      if !targets.isEmpty {
+        center.removeDeliveredNotifications(withIdentifiers: targets)
+      }
+      FileHandle.standardOutput.write(Data("removed \(targets.count)\n".utf8))
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exit(0) }
+    }
+    scheduleExit(after: 10, code: 1)
+  }
+
+  // List: the agetor:// url of every delivered entry, distinct and sorted, so
+  // agetor can reconcile its own bookkeeping with Notification Center.
+  private func listAgetorURLs(_ center: UNUserNotificationCenter) {
+    center.getDeliveredNotifications { delivered in
+      var urls = Set<String>()
+      for n in delivered {
+        if let url = n.request.content.userInfo["url"] as? String, url.hasPrefix("agetor://") {
+          urls.insert(url)
+        }
+      }
+      let out = urls.sorted().map { $0 + "\n" }.joined()
+      FileHandle.standardOutput.write(Data(out.utf8))
+      exit(0)
+    }
+    scheduleExit(after: 10, code: 1)
   }
 
   // Click handling: fires in this process, whether it stayed alive or was
@@ -191,9 +347,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     willPresent notification: UNNotification,
     withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
   ) {
-    // Respect --silent even on the foreground-present path (the helper is
+    // Respect --silent, and the post's sound decision (a quiet replacement of
+    // an existing entry), even on the foreground-present path (the helper is
     // briefly frontmost right after posting).
-    completionHandler(opts.silent ? [.banner] : [.banner, .sound])
+    completionHandler(soundGate.get() ? [.banner, .sound] : [.banner])
   }
 
   private func scheduleExit(after seconds: Double, code: Int32 = 0) {

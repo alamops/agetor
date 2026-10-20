@@ -2,17 +2,31 @@
  * Resolves and builds argv for AgetorNotifier.app — our own native arm64
  * helper (native/notifier/, built by scripts/build-notifier.ts) that posts a
  * notification whose click opens `agetor://task/<id>` (see deep-link.ts).
- * Electrobun's own `Utils.showNotification` cannot carry a click URL, and
- * terminal-notifier's only prebuilt release is x86_64-only — so we ship our
- * own signed arm64 UNUserNotificationCenter helper. No third-party binary, no
- * Rosetta.
+ * Electrobun's own `Utils.showNotification` cannot carry a click URL and has
+ * no identifier control, so we ship our own signed arm64
+ * UNUserNotificationCenter helper. No third-party binary, no Rosetta.
  *
- * Pure and side-effect-free at import time so both functions are trivially
+ * Task notifications post under one fixed id per task
+ * (`taskNotificationId`), so a newer event replaces the task's entry and
+ * shows on top; the helper decides the sound from what is still delivered
+ * (see src/shared/os-notification.ts and the helper's header comment for the
+ * CLI contract, including the `--remove` and `--list` modes).
+ *
+ * Pure and side-effect-free at import time so every function is trivially
  * unit-testable without spawning anything.
  */
 
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { buildTaskDeepLink } from "./deep-link.ts";
+import {
+  notificationUrgency,
+  soundOverUrgencies,
+  taskNotificationId,
+  type DeliveredUrgency,
+  type NotificationKind,
+  type NotificationUrgency,
+} from "../shared/os-notification.ts";
 
 /**
  * The helper's executable path inside the packaged .app, mirroring
@@ -47,7 +61,7 @@ function devNotifierExe(): string {
  * Returns `null` if nothing resolves. The deep-link notification is an
  * enhancement, so callers treat `null` (and a non-zero exit — e.g. the user
  * denied notification permission) as "post a plain Utils.showNotification
- * instead" (see showTaskNotification in index.ts).
+ * instead" (see task-notifier.ts).
  */
 export function resolveNotifier(): string | null {
   const override = process.env.AGETOR_NOTIFIER_BIN;
@@ -87,14 +101,27 @@ export interface NotifierOptions {
   silent?: boolean;
   /** Deep-link URL to open on click, e.g. buildTaskDeepLink(taskId). */
   url?: string;
+  /**
+   * Fixed Notification Center request id (`taskNotificationId(taskId)`).
+   * Without one the helper posts under a random id (the pre-dedupe
+   * behavior) and never reads the delivered list.
+   */
+  id?: string;
+  /** Event kind, stored on the entry so a conditional removal can match it. */
+  kind?: NotificationKind;
+  /** Stored on the entry so a later post can decide whether it escalates. */
+  urgency?: NotificationUrgency;
+  /** Delivered urgencies this post plays its sound over (`soundOverUrgencies`). */
+  soundOver?: readonly DeliveredUrgency[];
 }
 
 /**
  * Builds the argv to pass to the notifier helper AFTER its path. Flag order is
- * fixed (title, message, subtitle, url, silent) so output is deterministic and
- * easy to assert on in tests. The helper requires `--message` (empty allowed).
- * Identity/icon come from the helper's own signed bundle ("Agetor"), so there
- * is no `--sender`.
+ * fixed (title, message, subtitle, url, silent, id, kind, urgency, then one
+ * `--sound-over` per entry) so output is deterministic and easy to assert on
+ * in tests; the newer flags come last so the original order is unchanged. The
+ * helper requires `--message` (empty allowed). Identity/icon come from the
+ * helper's own signed bundle ("Agetor"), so there is no `--sender`.
  */
 export function buildNotifierArgs(o: NotifierOptions): string[] {
   const args: string[] = ["--title", o.title, "--message", o.body ?? ""];
@@ -102,6 +129,74 @@ export function buildNotifierArgs(o: NotifierOptions): string[] {
   if (o.subtitle) args.push("--subtitle", o.subtitle);
   if (o.url) args.push("--url", o.url);
   if (o.silent === true) args.push("--silent");
+  if (o.id) args.push("--id", o.id);
+  if (o.kind) args.push("--kind", o.kind);
+  if (o.urgency) args.push("--urgency", o.urgency);
+  for (const u of o.soundOver ?? []) args.push("--sound-over", u);
 
   return args;
+}
+
+/**
+ * The full post argv for a task notification: the task's deep link, its
+ * fixed id, the kind (when known), the kind's urgency and the escalation
+ * table the helper applies against the delivered entry.
+ */
+export function buildTaskNotifierPostArgs(n: {
+  title: string;
+  body?: string;
+  subtitle?: string;
+  silent?: boolean;
+  taskId: string;
+  kind?: NotificationKind;
+}): string[] {
+  const urgency = notificationUrgency(n.kind);
+  return buildNotifierArgs({
+    title: n.title,
+    body: n.body,
+    subtitle: n.subtitle,
+    silent: n.silent,
+    url: buildTaskDeepLink(n.taskId),
+    id: taskNotificationId(n.taskId),
+    kind: n.kind,
+    urgency,
+    soundOver: soundOverUrgencies(urgency),
+  });
+}
+
+/**
+ * Argv for the helper's remove mode: drops the entry with `id` plus any
+ * old-style entry carrying `url`; with `ifKinds`, only entries whose stored
+ * kind is listed. Never asks for notification permission.
+ */
+export function buildNotifierRemoveArgs(o: {
+  id: string;
+  url: string;
+  ifKinds?: readonly NotificationKind[];
+}): string[] {
+  const args = ["--remove", "--id", o.id, "--url", o.url];
+  for (const k of o.ifKinds ?? []) args.push("--if-kind", k);
+  return args;
+}
+
+/** Argv for the helper's list mode: prints each delivered `agetor://` url, one per line. */
+export function buildNotifierListArgs(): string[] {
+  return ["--list"];
+}
+
+/** The helper inside the installed app, for processes that aren't the app (the CLI). */
+const INSTALLED_APP_NOTIFIER =
+  "/Applications/Agetor.app/Contents/Resources/app/bin/AgetorNotifier.app/Contents/MacOS/notifier";
+
+/**
+ * The installed Agetor.app's helper, for the CLI posting without a desktop
+ * core: `AGETOR_NOTIFIER_BIN` wins (returned as-is), else the installed
+ * app's helper when it exists, else null. Posting through the same signed
+ * helper keeps CLI posts in the app's Notification Center scope, so they
+ * share the per-task id with the app's own posts.
+ */
+export function resolveInstalledAppNotifier(): string | null {
+  const override = process.env.AGETOR_NOTIFIER_BIN;
+  if (override) return override;
+  return existsSync(INSTALLED_APP_NOTIFIER) ? INSTALLED_APP_NOTIFIER : null;
 }
