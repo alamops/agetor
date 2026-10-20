@@ -8170,7 +8170,11 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // The JSONL path is deterministic from cwd + session uuid (we passed
   // `--session-id <uuid>` for new sessions, and `--resume <id>` reopens an
   // existing file at the same path). No mtime poll, no freshest-file pick.
-  const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.configDir);
+  // Tail the dir claude was actually launched with: a home-less harness
+  // whose `env` map names a `CLAUDE_CONFIG_DIR` writes there, not to this
+  // process's dir.
+  const sessionConfigDir = opts.configDir ?? fullEnv.CLAUDE_CONFIG_DIR ?? null;
+  const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, sessionConfigDir);
 
   // When the JSONL already exists at spawn time, we're resuming a prior
   // claude session (`--resume <id>` reopens the same file). The file holds

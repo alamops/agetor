@@ -3378,9 +3378,14 @@ function RunPanelBody({
         setImportedBranchError(res.error);
         return;
       }
-      const status = await api.getTaskGitStatus(taskId);
-      if (currentTaskIdRef.current !== taskId) return;
-      setGitStatus(status);
+      // The checkout succeeded; a failed status refresh is left to the 5s
+      // git-status poll rather than reported as a failed switch.
+      try {
+        const status = await api.getTaskGitStatus(taskId);
+        if (currentTaskIdRef.current === taskId) setGitStatus(status);
+      } catch {
+        // The poll reconciles.
+      }
     } catch (err) {
       if (currentTaskIdRef.current !== taskId) return;
       setImportedBranchError(err instanceof ApiError ? err.message : "Couldn't switch branch");
