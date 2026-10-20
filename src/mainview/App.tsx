@@ -61,7 +61,7 @@ import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
+import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
 import { publishCloneProgress } from "@/lib/clone-progress";
@@ -637,6 +637,10 @@ function AppInner() {
   const refreshPollInFlightRef = useRef(false);
   const refreshAgentsPollInFlightRef = useRef(false);
   const refreshProjectsPollInFlightRef = useRef(false);
+  // Ids the last SUCCESSFUL `/tasks` poll listed — the "previous list" for
+  // the in-app toast sweep in `refresh()` below. A task that simply hasn't
+  // been polled yet (just created, not in this set) is never swept.
+  const polledTaskIdsRef = useRef<Set<string> | null>(null);
 
   /** Re-list tasks. Returns the fetched list so callers that need to inspect a
    *  task right after a mutation don't have to issue a second GET. `null` on
@@ -652,6 +656,20 @@ function AppInner() {
       // `loaded` input) — set unconditionally on every success, cheap no-op
       // once already true.
       setTasksLoaded(true);
+      // Toast-slot sweep (after a SUCCESSFUL poll only): a task whose toast
+      // can no longer be acted on — archived, or listed by the previous poll
+      // and gone from this one — must not keep an in-app toast up. O(n);
+      // `dismissTaskToast` is a Map lookup and a no-op on an empty slot.
+      const prevIds = polledTaskIdsRef.current;
+      const nextIds = new Set<string>();
+      for (const t of list) {
+        nextIds.add(t.id);
+        if (t.archivedAt != null) dismissTaskToast(t.id);
+      }
+      if (prevIds) {
+        for (const id of prevIds) if (!nextIds.has(id)) dismissTaskToast(id);
+      }
+      polledTaskIdsRef.current = nextIds;
       return list;
     } catch { return null; /* keep last good snapshot; retry next tick */ }
   }, []);
@@ -944,17 +962,31 @@ function AppInner() {
   // task is noise — they're already looking at the prompt. Clearing it also
   // removes one more high-z-index click target that could otherwise sit on
   // top of the panel header and eat clicks meant for the X button.
-  // A pipeline step that is itself asking also clears its parent's toast:
-  // a step's "Waiting on you" toast is retargeted at (and keyed by) the
-  // pipeline parent, so dismissing by the step id alone would leave it up
-  // over the very panel answering it.
+  // Every event toast shares the task's ONE in-app slot (D12), so opening
+  // the panel drops whatever holds it, whatever its kind. Opening a pipeline
+  // step's panel also drops the parent's slot (D16): a step's toasts are
+  // retargeted at (and keyed by) the pipeline parent, so dismissing by the
+  // step id alone would leave one up over the very panel it is about.
+  // Keyed on the open task's id only: the toast helpers already skip the
+  // in-app toast for the selected task (`isSelected`), so firing on open or
+  // switch is enough — nothing new can land in the slot while it stays open.
   useEffect(() => {
     if (!selected) return;
-    dismissPending(selected.id);
-    if (selected.pipelineParentId && selected.pendingInteractionCount > 0) {
-      dismissPending(selected.pipelineParentId);
-    }
+    dismissTaskToast(selected.id);
+    if (selected.pipelineParentId) dismissTaskToast(selected.pipelineParentId);
   }, [selected?.id]);
+
+  // Opening the full-page pipeline run view counts as opening the parent
+  // task (D6a/D16, plan §8 Q1): its OS Notification Center entry goes (the
+  // `/seen` route only covers the run panel and "Mark as read") and so does
+  // its in-app toast slot. Keyed on the viewed run's task id so a poll
+  // re-render of the same view doesn't re-fire.
+  const runViewTaskId = view.kind === "pipeline-run" ? view.taskId : null;
+  useEffect(() => {
+    if (!runViewTaskId) return;
+    api.clearTaskNotification(runViewTaskId).catch(() => {});
+    dismissTaskToast(runViewTaskId);
+  }, [runViewTaskId]);
 
   // Mark-seen wiring for the unread-bullet indicator (see TaskCard's corner
   // dot). Fires whenever the open task changes — open, switch, or close —
@@ -1045,6 +1077,23 @@ function AppInner() {
   const boardSearchRef = useRef<HTMLInputElement>(null);
   useEffect(() => { tasksRef.current = tasks; }, [tasks]);
   useEffect(() => { selectedIdRef.current = selected?.id ?? null; }, [selected]);
+
+  // Window focus (D6d): the window the user is looking at may already show
+  // the open task (panel or pipeline run view) while a newer Notification
+  // Center entry for it arrived in the background — returning focus clears
+  // it. Deliberately does NOT mark the task seen and leaves in-app toasts
+  // alone. Reads refs so the listener binds once; the server maps a step id
+  // to its pipeline parent.
+  useEffect(() => {
+    const onFocus = () => {
+      const openId = selectedIdRef.current;
+      if (openId) api.clearTaskNotification(openId).catch(() => {});
+      const v = viewRef.current;
+      if (v.kind === "pipeline-run") api.clearTaskNotification(v.taskId).catch(() => {});
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
 
   // Cmd/Ctrl+F while no task details panel is open focuses the board's
   // free-text search box and selects its contents so typing replaces the
@@ -1489,7 +1538,7 @@ function AppInner() {
         // `review` column event stays silent, as every plain success →
         // review transition does.
         if (ev.status === "done" && prevStatus !== "done") {
-          toastSuccess({ taskId: ev.taskId, title, subtitle: "Pipeline finished", isSelected, isFocused, onOpen });
+          toastSuccess({ taskId: ev.taskId, title, subtitle: "Pipeline finished", isSelected, isFocused, onOpen, kind: "pipeline-finished" });
         }
         refetchPipelineParent(ev.taskId);
         return;
@@ -1846,6 +1895,7 @@ function AppInner() {
     try {
       setError(null);
       await api.archiveTask(t.id, active ? { force: true, stopRun: true } : undefined);
+      dismissTaskToast(t.id);
       clearSelectedStepOf(t.id);
       await refresh();
     } catch (e) {
@@ -1920,6 +1970,7 @@ function AppInner() {
     try {
       setError(null);
       await api.deleteTask(t.id);
+      dismissTaskToast(t.id);
       if (selectedIdRef.current === t.id) setSelected(null);
       // m6: a step task's own panel can't outlive its deleted parent either.
       clearSelectedStepOf(t.id);
@@ -1996,6 +2047,10 @@ function AppInner() {
     try {
       setError(null);
       const updated = await api.markTaskSeen(t.id);
+      // "Mark as read" counts as reading the news: drop the in-app toast too
+      // (the OS entry is removed server-side by `/seen`). Before the stale
+      // guard: the toast is stale whichever response order wins.
+      dismissTaskToast(t.id);
       // Stale response guard — see `readStateGen`'s doc comment above.
       if (readStateGen.current.get(t.id) !== gen) return;
       setTasks((cur) => cur.map((x) => (x.id === updated.id ? { ...x, unread: updated.unread } : x)));

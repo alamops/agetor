@@ -21,8 +21,10 @@ import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
 import { repairFrame } from "./screen-frame.ts";
 import { writeCoreCreds, removeCoreCreds, readCoreCreds, probeLiveCore, waitForPortFree } from "./core-creds.ts";
-import { resolveNotifier, resolveNotifierApp, buildNotifierArgs } from "./notifier.ts";
-import { buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
+import { resolveNotifierApp } from "./notifier.ts";
+import { parseTaskDeepLink } from "./deep-link.ts";
+import { createTaskNotifier } from "./task-notifier.ts";
+import { installNotificationRemovalHooks } from "./notification-hooks.ts";
 import { setPendingOpenTask } from "./pending-open.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -245,84 +247,17 @@ void refreshAllModels();
 startPeriodicDiscovery();
 
 /**
- * Posts a task notification, deep-linking it to the task when possible.
- *
- * Electrobun's own `Utils.showNotification` has no click callback — a click
- * just dismisses the banner — so it can't carry the user back to the task that
- * fired it. Our bundled native helper (AgetorNotifier.app, see notifier.ts)
- * can: it posts via UNUserNotificationCenter with the deep link in userInfo,
- * and on click opens `agetor://task/<id>`, which triggers Electrobun's
- * "open-url" event (handled below) on the already-running app. So when a
- * `taskId` is supplied and the helper resolves, we spawn it instead.
- *
- * Fallback discipline (a notifier problem must never mean NO notification):
- *   - No taskId or no helper resolved → plain Utils.showNotification.
- *   - A *synchronous* spawn throw → caught here → plain notification.
- *   - The helper launches but exits non-zero (e.g. the user denied
- *     notification permission — the helper exits 2 then) → we watch `.exited`
- *     and fall back on failure. This async check is essential: a
- *     launch/permission failure surfaces on the *child*, not as a synchronous
- *     throw. The helper exits 0 once it has posted, so the happy path never
- *     double-notifies.
+ * Posts and removes task notifications. Each task owns at most one
+ * Notification Center entry, posted through our bundled native helper
+ * (AgetorNotifier.app, see notifier.ts) under a fixed per-task id, so a newer
+ * event replaces the older one on top. Electrobun's own
+ * `Utils.showNotification` has no click callback and no identifier control,
+ * so it is only the fallback (see task-notifier.ts for when it is used).
  */
-function showTaskNotification(n: {
-  title: string;
-  body?: string;
-  subtitle?: string;
-  silent?: boolean;
-  taskId?: string;
-}): void {
-  const plain = () =>
-    Utils.showNotification({ title: n.title, body: n.body, subtitle: n.subtitle, silent: n.silent });
-
-  if (n.taskId) {
-    const bin = resolveNotifier();
-    if (bin) {
-      try {
-        const child = Bun.spawn(
-          [
-            bin,
-            ...buildNotifierArgs({
-              title: n.title,
-              body: n.body,
-              subtitle: n.subtitle,
-              silent: n.silent,
-              url: buildTaskDeepLink(n.taskId),
-            }),
-          ],
-          { stdout: "ignore", stderr: "ignore" },
-        );
-        // Fall back if the helper failed to actually show anything.
-        child.exited
-          .then((code) => {
-            // 0 = posted. 2 = the user denied notification permission (or never
-            // answered the one-time prompt). On denial we deliberately do NOT
-            // fall back to Utils.showNotification: that posts under agetor's
-            // MAIN bundle id — a second "Agetor" identity — which would
-            // re-prompt for a permission the user just declined. Respect the
-            // choice (no notification). Any OTHER non-zero code is an
-            // unexpected helper failure, so fall back to a plain notification.
-            if (code === 0) return;
-            if (code === 2) {
-              console.error("[agetor] notifier helper: notification permission not granted; skipping fallback");
-              return;
-            }
-            console.error(`[agetor] notifier helper exited ${code}, falling back to plain notification`);
-            plain();
-          })
-          .catch((err) => {
-            console.error("[agetor] notifier helper failed, falling back:", err);
-            plain();
-          });
-        return;
-      } catch (err) {
-        console.error("[agetor] notifier helper spawn failed, falling back:", err);
-        // fall through to the plain notification below
-      }
-    }
-  }
-  plain();
-}
+const taskNotifier = createTaskNotifier({
+  plain: (n) =>
+    Utils.showNotification({ title: n.title, body: n.body, subtitle: n.subtitle, silent: n.silent }),
+});
 
 // Best-effort: register the notifier helper bundle with LaunchServices at
 // startup. We spawn the helper's inner Mach-O directly (not via `open`), which
@@ -346,6 +281,12 @@ function registerNotifierBundle(): void {
   }
 }
 registerNotifierBundle();
+// Learn which tasks still have an entry from a previous run, so opening one
+// removes it without spawning the helper for every other task.
+void taskNotifier.seed();
+// Remove a task's entry once its reason goes away (answered from any client,
+// or the task left `blocked`).
+installNotificationRemovalHooks((r) => taskNotifier.remove(r));
 
 // Native-host capabilities the API server needs but that only exist inside
 // Electrobun (file dialogs, OS notifications, open-in-Finder/browser, the
@@ -375,7 +316,8 @@ const native: ApiNative = {
     }
   },
   openExternal: (url) => Utils.openExternal(url),
-  showNotification: (n) => showTaskNotification(n),
+  showNotification: (n) => taskNotifier.post(n),
+  removeTaskNotification: (r) => taskNotifier.remove(r),
   focusWindow: () => focusMainWindow(),
   quit: () => Utils.quit(),
   updates: {
@@ -705,8 +647,8 @@ Electrobun.events.on("reopen", () => {
 });
 
 // Deep-link entry point: macOS routes a click on our custom `agetor://`
-// scheme (e.g. from a terminal-notifier notification — see
-// showTaskNotification above) to `open <url>`, which Electrobun surfaces as
+// scheme (e.g. a click on an AgetorNotifier notification — see
+// the task notifier above) to `open <url>`, which Electrobun surfaces as
 // this "open-url" event. There's no notification-click callback in
 // Electrobun, so this is the only way a notification click gets back into
 // the app — see the design note at src/mainview/lib/api.ts:424.
