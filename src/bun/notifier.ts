@@ -184,6 +184,30 @@ export function buildNotifierListArgs(): string[] {
   return ["--list"];
 }
 
+// Acks. A helper built before the per-task id existed (a stale
+// vendor/notifier under `bun run dev`) ignores `--id`, `--remove` and
+// `--list`: posts still go out under random ids, and `--remove`/`--list` read
+// as a click relaunch that waits ten seconds and exits 0 with no output. The
+// helper prints these lines so agetor can tell it apart from a real success.
+
+/** The first stdout line of the helper's `--list` mode. */
+export const NOTIFIER_LIST_HEADER = "agetor-notifier list";
+
+/** Whether `--list` stdout starts with {@link NOTIFIER_LIST_HEADER}. */
+export function notifierListAcked(stdout: string): boolean {
+  return stdout.split("\n", 1)[0]?.trim() === NOTIFIER_LIST_HEADER;
+}
+
+/** Whether `--remove` stdout carries the helper's `removed <n>` line. */
+export function notifierRemoveAcked(stdout: string): boolean {
+  return /^removed \d+$/m.test(stdout);
+}
+
+/** Whether a post's stdout confirms it was delivered under `id`. */
+export function notifierPostAcked(stdout: string, id: string): boolean {
+  return stdout.split("\n").some((line) => line.trim() === `posted ${id}`);
+}
+
 /** The helper inside the installed app, for processes that aren't the app (the CLI). */
 const INSTALLED_APP_NOTIFIER =
   "/Applications/Agetor.app/Contents/Resources/app/bin/AgetorNotifier.app/Contents/MacOS/notifier";

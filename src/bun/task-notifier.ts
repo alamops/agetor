@@ -26,6 +26,15 @@
  *     second "Agetor" identity, and would re-prompt for a permission the
  *     user just declined;
  *   - any other non-zero exit → `plain`.
+ * - **Stale helper detection.** Every mode prints an ack line (notifier.ts).
+ *   An exit 0 without it can mean a helper built before per-task ids (a
+ *   stale vendor/notifier under `bun run dev`): it ignored `--id`, or took
+ *   `--remove`/`--list` for a click relaunch. An unacked `--list` proves it;
+ *   an unacked post or `--remove` only triggers a `--list` probe, since a
+ *   current helper can also exit 0 early (a notification click delivered to
+ *   it ends the process). Once proven, it is logged once, removals are
+ *   skipped from then on (they would each wait ten seconds for nothing) and
+ *   the seed counts as failed; posts keep going, as plain random-id ones.
  *
  * No Electrobun import, so the module runs under `bun test` with an injected
  * spawn.
@@ -36,6 +45,9 @@ import {
   buildNotifierListArgs,
   buildNotifierRemoveArgs,
   buildTaskNotifierPostArgs,
+  notifierListAcked,
+  notifierPostAcked,
+  notifierRemoveAcked,
   resolveNotifier,
 } from "./notifier.ts";
 import {
@@ -56,7 +68,7 @@ export interface TaskNotification {
 
 type SpawnFn = (
   argv: string[],
-  opts: { stdout: "pipe" | "ignore" },
+  opts: { stdout: "pipe" },
 ) => { exited: Promise<number>; stdout?: ReadableStream<Uint8Array> | null };
 
 export interface TaskNotifierDeps {
@@ -107,7 +119,50 @@ export function createTaskNotifier(deps: TaskNotifierDeps): TaskNotifier {
   const postGenerations = new Map<string, number>();
   let seeded = false;
   let seedPromise: Promise<void> | null = null;
+  /** Set once an unacked `--list` proved the helper stale (see header). */
+  let helperOutdated = false;
+  /** The `--list` probe an unacked post or remove started; one at a time. */
+  let outdatedProbe: Promise<void> | null = null;
   let idleWaiters: Array<() => void> = [];
+
+  const markOutdated = (mode: string) => {
+    if (helperOutdated) return;
+    helperOutdated = true;
+    log(
+      `notifier helper did not acknowledge ${mode}: it predates one-notification-per-task. ` +
+        "Notifications may stack and are not removed until it is rebuilt " +
+        "(bun run vendor:notifier) and Agetor restarted.",
+    );
+  };
+
+  /** Spawns the helper and reads its stdout to the end alongside the exit. */
+  const runHelper = async (argv: string[]): Promise<{ code: number; stdout: string }> => {
+    const child = spawn(argv, { stdout: "pipe" });
+    const [code, stdout] = await Promise.all([
+      child.exited,
+      child.stdout ? new Response(child.stdout).text() : Promise.resolve(""),
+    ]);
+    return { code, stdout };
+  };
+
+  /**
+   * An exit 0 without its ack from a post or `--remove`: probe with `--list`
+   * and latch only if that is unacked too. A probe that fails proves nothing.
+   */
+  const probeOutdated = (bin: string, mode: string): Promise<void> => {
+    if (helperOutdated) return Promise.resolve();
+    outdatedProbe ??= (async () => {
+      try {
+        const { code, stdout } = await runHelper([bin, ...buildNotifierListArgs()]);
+        if (code === 0 && !notifierListAcked(stdout)) markOutdated(mode);
+      } catch (err) {
+        log("notifier helper --list probe failed:", err);
+      } finally {
+        outdatedProbe = null;
+      }
+    })();
+    return outdatedProbe;
+  };
 
   const plain = (n: TaskNotification) => {
     try {
@@ -142,15 +197,20 @@ export function createTaskNotifier(deps: TaskNotifierDeps): TaskNotifier {
 
   const run = async (taskId: string, op: Op): Promise<void> => {
     if (op.type === "post") {
-      let code: number;
+      let result: { code: number; stdout: string };
       try {
-        code = await spawn([op.bin, ...buildTaskNotifierPostArgs(op.n)], { stdout: "ignore" }).exited;
+        result = await runHelper([op.bin, ...buildTaskNotifierPostArgs(op.n)]);
       } catch (err) {
         log("notifier helper failed, falling back to plain notification:", err);
         plain(op.n);
         return;
       }
-      if (code === 0) return;
+      const { code } = result;
+      if (code === 0) {
+        // Posted either way; without the ack it went out under a random id.
+        if (!notifierPostAcked(result.stdout, taskNotificationId(taskId))) await probeOutdated(op.bin, "--id");
+        return;
+      }
       if (code === 2) {
         log("notifier helper: notification permission not granted; skipping fallback");
         return;
@@ -160,6 +220,9 @@ export function createTaskNotifier(deps: TaskNotifierDeps): TaskNotifier {
       return;
     }
 
+    // Queued before an unacked op proved the helper stale: a stale helper
+    // reads `--remove` as a click relaunch and waits 10 s for nothing.
+    if (helperOutdated) return;
     const argv = [
       op.bin,
       ...buildNotifierRemoveArgs({
@@ -168,15 +231,20 @@ export function createTaskNotifier(deps: TaskNotifierDeps): TaskNotifier {
         ifKinds: op.r.ifKinds,
       }),
     ];
-    let code: number;
+    let result: { code: number; stdout: string };
     try {
-      code = await spawn(argv, { stdout: "ignore" }).exited;
+      result = await runHelper(argv);
     } catch (err) {
       log("notifier helper remove failed:", err);
       return;
     }
-    if (code !== 0) {
-      log(`notifier helper remove exited ${code}`);
+    if (result.code !== 0) {
+      log(`notifier helper remove exited ${result.code}`);
+      return;
+    }
+    if (!notifierRemoveAcked(result.stdout)) {
+      // Nothing proven removed; the task stays in `maybeDelivered`.
+      await probeOutdated(op.bin, "--remove");
       return;
     }
     // Only an unconditional remove proves the task has nothing delivered: a
@@ -204,7 +272,7 @@ export function createTaskNotifier(deps: TaskNotifierDeps): TaskNotifier {
 
   const remove = (r: TaskNotificationRemoval) => {
     const bin = resolveBin();
-    if (!bin) return;
+    if (!bin || helperOutdated) return;
     if (seeded && !maybeDelivered.has(r.taskId)) return;
     if (r.ifKinds === undefined) {
       // Opening (or archiving/deleting) the task makes any post still waiting
@@ -221,13 +289,13 @@ export function createTaskNotifier(deps: TaskNotifierDeps): TaskNotifier {
     // No helper means remove() is a no-op anyway; nothing to seed.
     if (!bin) return;
     try {
-      const child = spawn([bin, ...buildNotifierListArgs()], { stdout: "pipe" });
-      const [code, text] = await Promise.all([
-        child.exited,
-        child.stdout ? new Response(child.stdout).text() : Promise.resolve(""),
-      ]);
+      const { code, stdout: text } = await runHelper([bin, ...buildNotifierListArgs()]);
       if (code !== 0) {
         log(`notifier helper --list exited ${code}; removals won't be skipped`);
+        return;
+      }
+      if (!notifierListAcked(text)) {
+        markOutdated("--list");
         return;
       }
       for (const line of text.split("\n")) {

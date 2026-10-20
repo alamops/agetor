@@ -20,6 +20,10 @@
 // Mode order: --list, --remove, post (a --title was given), else click relaunch.
 // Exit codes: 0 ok · 1 remove/list safety timeout · 2 post permission denied or
 // timed out · 64 usage (--remove without --id).
+// Stdout acks (src/bun/notifier.ts): a post prints `posted <identifier>`,
+// --remove prints `removed <n>`, --list starts with `agetor-notifier list`. A
+// helper that predates these modes prints none of them, which is how agetor
+// tells a stale build from a successful call.
 //
 // One entry per task: a post carrying --id uses it as the request identifier,
 // so a repeat post REPLACES the previous banner instead of stacking a new one.
@@ -208,6 +212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
     center.add(request) { _ in
+      FileHandle.standardOutput.write(Data("posted \(identifier)\n".utf8))
       // Delivered to the system; the helper no longer needs to run.
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exit(0) }
     }
@@ -244,8 +249,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     scheduleExit(after: 10, code: 1)
   }
 
-  // List: the agetor:// url of every delivered entry, distinct and sorted, so
-  // agetor can reconcile its own bookkeeping with Notification Center.
+  // List: a header line, then the agetor:// url of every delivered entry,
+  // distinct and sorted, so agetor can reconcile its own bookkeeping with
+  // Notification Center.
   private func listAgetorURLs(_ center: UNUserNotificationCenter) {
     center.getDeliveredNotifications { delivered in
       var urls = Set<String>()
@@ -254,7 +260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
           urls.insert(url)
         }
       }
-      let out = urls.sorted().map { $0 + "\n" }.joined()
+      let out = (["agetor-notifier list"] + urls.sorted()).map { $0 + "\n" }.joined()
       FileHandle.standardOutput.write(Data(out.utf8))
       exit(0)
     }

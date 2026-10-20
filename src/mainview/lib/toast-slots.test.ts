@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { UNBLOCKED_REMOVAL_KINDS } from "../../shared/os-notification.ts";
-import { TaskToastSlots, type TaskToastKind } from "./toast-slots";
+import { FocusedForcedPosts, TaskToastSlots, type TaskToastKind } from "./toast-slots";
 
 const ALL_KINDS: TaskToastKind[] = [
   "waiting",
@@ -78,5 +78,46 @@ describe("TaskToastSlots", () => {
       slots.set("t1", "a", kind);
       expect(slots.isReason("t1")).toBe(UNBLOCKED_REMOVAL_KINDS.includes(kind as never));
     }
+  });
+});
+
+describe("FocusedForcedPosts", () => {
+  test("a focused, not-forced event clears the entry (D7)", () => {
+    const g = new FocusedForcedPosts();
+    expect(g.decide("t1", { isFocused: true, force: false })).toBe("clear");
+  });
+
+  test("an unfocused event posts", () => {
+    const g = new FocusedForcedPosts();
+    expect(g.decide("t1", { isFocused: false, force: false })).toBe("post");
+  });
+
+  test("a forced post while focused survives the task's next focused events", () => {
+    const g = new FocusedForcedPosts();
+    expect(g.decide("t1", { isFocused: true, force: true })).toBe("post");
+    expect(g.decide("t1", { isFocused: true, force: false })).toBe("keep");
+    expect(g.decide("t1", { isFocused: true, force: false })).toBe("keep");
+    // Other tasks keep the plain D7 rule.
+    expect(g.decide("t2", { isFocused: true, force: false })).toBe("clear");
+  });
+
+  test("forget (task opened, archived or deleted) restores D7", () => {
+    const g = new FocusedForcedPosts();
+    g.decide("t1", { isFocused: true, force: true });
+    g.forget("t1");
+    expect(g.decide("t1", { isFocused: true, force: false })).toBe("clear");
+  });
+
+  test("a later unfocused post replaces the entry and ends the protection", () => {
+    const g = new FocusedForcedPosts();
+    g.decide("t1", { isFocused: true, force: true });
+    expect(g.decide("t1", { isFocused: false, force: false })).toBe("post");
+    expect(g.decide("t1", { isFocused: true, force: false })).toBe("clear");
+  });
+
+  test("a forced post while unfocused gets no protection", () => {
+    const g = new FocusedForcedPosts();
+    expect(g.decide("t1", { isFocused: false, force: true })).toBe("post");
+    expect(g.decide("t1", { isFocused: true, force: false })).toBe("clear");
   });
 });

@@ -29,7 +29,7 @@ import {
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
-import { isNotificationKind, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
+import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
 import { activeRunCount, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import {
@@ -5237,6 +5237,16 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           const updated = tasks.update(req.params.id, patch);
           if (!updated) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          // A manual move (drag, `agetor move`) emits no global `column` event,
+          // so the notification hooks never see a card leave `blocked` this
+          // way. Its reason-family OS entry goes with the block.
+          if (native && before.column === "blocked" && updated.column !== "blocked") {
+            try {
+              native.removeTaskNotification({ taskId: req.params.id, ifKinds: UNBLOCKED_REMOVAL_KINDS });
+            } catch (err) {
+              console.error("[agetor] removeTaskNotification failed:", err);
+            }
           }
           // Mirror behavioural changes onto a live claude session via slash
           // commands so the conversation context survives a model/mode/effort

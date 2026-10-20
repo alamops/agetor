@@ -98,6 +98,12 @@ Agetor window **unfocused** while events arrive unless an item says otherwise.
       run view) already open.
 - [ ] An event arriving while the window is **focused** removes that task's
       older entry instead of posting (a proactive "files sent" still posts).
+- [ ] With the window **focused** and the task not open, a proactive "files
+      sent" entry **stays** when that task's run then succeeds; opening the
+      task removes it.
+- [ ] Pipeline with two steps blocked at once, one of them asking a question:
+      answering the question leaves a **"Pipeline needs you"** toast (and, with
+      the window unfocused, its notification) for the other step's block.
 
 **Upgrades, restarts and the CLI**
 - [ ] **Old-style cleanup:** with an entry posted by an older Agetor build for a
@@ -114,6 +120,9 @@ Agetor window **unfocused** while events arrive unless an item says otherwise.
       previous release posted. Check on the next signed release.
 - [ ] Remove/list modes never pop the permission prompt: on a machine that has
       not granted permission yet, opening a task posts nothing and asks nothing.
+- [ ] **Stale helper:** run `bun run dev` with a `vendor/notifier` built before
+      this change. The console logs once that the helper "did not acknowledge"
+      a mode and to rebuild it; nothing else breaks (posts still show).
 
 > **LaunchServices caveat for dev copies.** A helper built in a worktree
 > registers itself under the production bundle id and can catch production

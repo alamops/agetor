@@ -2,7 +2,7 @@ import { toast } from "sonner";
 import type { NotificationKind } from "../../shared/os-notification.ts";
 import { api } from "./api";
 import { filesSentCopy, shouldToastFilesSent } from "./files-sent-notify";
-import { TaskToastSlots, type TaskToastKind } from "./toast-slots";
+import { FocusedForcedPosts, TaskToastSlots, type TaskToastKind } from "./toast-slots";
 
 /**
  * Args common to every toast helper. `isSelected` / `isFocused` are evaluated
@@ -36,6 +36,9 @@ export interface ToastArgs {
 // `blocked`; `hasPendingToast` reports them. Action-feedback toasts in App.tsx
 // ("Copied", …) are not task events and stay outside the slot.
 const slots = new TaskToastSlots();
+// Tasks whose OS entry was posted while focused because the event forced it;
+// D7 leaves that entry alone until the task is opened (see FocusedForcedPosts).
+const focusedForcedPosts = new FocusedForcedPosts();
 
 /** What `showTaskToast`'s `show` callback wires into the sonner call. */
 interface SlotLifecycle {
@@ -82,7 +85,12 @@ function maybeNotifyOS(
   detail?: string,
   opts?: { force?: boolean },
 ): void {
-  if (args.isFocused && !opts?.force) {
+  const action = focusedForcedPosts.decide(args.taskId, {
+    isFocused: args.isFocused,
+    force: opts?.force === true,
+  });
+  if (action === "keep") return;
+  if (action === "clear") {
     // D7: the in-app toast carries the news while the window is focused, so the
     // task's older Notification Center entry (if any) is removed, not replaced.
     api.clearTaskNotification(args.taskId).catch(() => { /* ignore */ });
@@ -229,6 +237,8 @@ export function notifyWaitingInput(args: ToastArgs): void {
  * volunteered the files unprompted, so there's no other signal something
  * just landed, focused window or not. A focused, not-proactive send goes
  * through `maybeNotifyOS` too, which then removes the task's older entry (D7).
+ * A forced post made while focused is kept by D7 until the task is opened
+ * (`FocusedForcedPosts`), so the turn's own next event doesn't remove it.
  */
 export function notifyFilesSent(
   args: ToastArgs & { count: number; caption: string | null; proactive: boolean },
@@ -350,8 +360,11 @@ export function dismissPending(taskId: string): void {
 }
 
 /** Dismiss whatever event toast holds `taskId`'s slot, whatever its kind
- *  (called when the task's panel is opened). */
+ *  (called when the task's panel or run view is opened, and on archive or
+ *  delete). The task's OS entry is removed on those same paths, so a forced
+ *  focused post stops being protected from D7 too. */
 export function dismissTaskToast(taskId: string): void {
+  focusedForcedPosts.forget(taskId);
   const entry = slots.take(taskId);
   if (entry) toast.dismiss(entry.id);
 }

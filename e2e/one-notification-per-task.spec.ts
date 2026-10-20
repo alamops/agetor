@@ -195,6 +195,39 @@ async function createOnBoardThenStart(
   return task;
 }
 
+/** Records the page's global-events `EventSource` (`GET /events`) so a test can
+ *  deliver synthetic `GlobalEvent` frames through the same `onmessage` path a
+ *  real SSE frame takes. Needed for facts the fake driver can't produce — its
+ *  sent-files scenario always reports `status: "normal"`, never a proactive
+ *  send. Must run BEFORE `gotoApp`. */
+async function installGlobalEventSink(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __globalEventSources: EventSource[] };
+    w.__globalEventSources = [];
+    const Native = window.EventSource;
+    class Recording extends Native {
+      constructor(url: string | URL, init?: EventSourceInit) {
+        super(url, init);
+        if (new URL(String(url), location.href).pathname === "/events") w.__globalEventSources.push(this);
+      }
+    }
+    window.EventSource = Recording as unknown as typeof EventSource;
+  });
+}
+
+async function deliverGlobalEvent(page: Page, event: Record<string, unknown>): Promise<void> {
+  await page.evaluate((ev) => {
+    // Only sources still open: React's dev double-mount leaves a closed one
+    // whose handler would otherwise get the frame a second time.
+    const sources = (window as unknown as { __globalEventSources: EventSource[] }).__globalEventSources.filter(
+      (es) => es.readyState !== EventSource.CLOSED,
+    );
+    if (sources.length === 0) throw new Error("no open /events EventSource recorded");
+    const data = JSON.stringify(ev);
+    for (const es of sources) es.dispatchEvent(new MessageEvent("message", { data }));
+  }, event);
+}
+
 async function waitForColumn(request: APIRequestContext, backend: E2EBackend, id: string, column: string) {
   await expect
     .poll(
@@ -324,6 +357,64 @@ test.describe("one notification per task: OS notification requests", () => {
     await page.evaluate(() => window.dispatchEvent(new Event("focus")));
     await expect.poll(() => capture.deletes(task.id).length, { timeout: CONVERGE_TIMEOUT }).toBeGreaterThan(0);
   });
+
+  test("(g) a focused proactive files-sent keeps its OS entry through the turn's succeeded event until the task is opened", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = uniqueTitle("proactive");
+    await fakeWindowFocus(page, true);
+    await installGlobalEventSink(page);
+    const capture = await captureNotifications(page);
+    await gotoAppSubscribed(page, backend);
+    // Created, not started: the board shows the card but no run emits real
+    // events, so every request below comes from the two synthetic ones.
+    const task = await createSentFilesTask(request, backend, title, { start: false });
+    await expect(taskCard(page, title)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    const runId = randomUUID();
+    await deliverGlobalEvent(page, {
+      kind: "files-sent",
+      taskId: task.id,
+      runId,
+      count: 2,
+      caption: "chart and report",
+      proactive: true,
+      ts: Date.now(),
+    });
+    // The forced post goes out even though the window is focused.
+    await expect.poll(() => capture.postKinds(task.id), { timeout: CONVERGE_TIMEOUT }).toEqual(["files-sent"]);
+
+    // The same turn then settles `succeeded` (focused, not forced): D7 must
+    // leave the proactive entry alone — no DELETE, no second POST.
+    await deliverGlobalEvent(page, { kind: "run-status", taskId: task.id, runId, status: "succeeded", ts: Date.now() });
+    await expect(liveToasts(page, title)).toHaveCount(1);
+    await expect(liveToasts(page, title)).toContainText("Task succeeded");
+    // Allow any (wrongly) fired request to land before asserting its absence.
+    await page.waitForTimeout(750);
+    expect(capture.deletes(task.id)).toHaveLength(0);
+    expect(capture.postKinds(task.id)).toEqual(["files-sent"]);
+
+    // Opening the task is what removes the entry: the panel open marks the
+    // task seen (`POST /tasks/:id/seen`; the core removes the OS entry there —
+    // the headless backend can't observe that part) and drops the in-app toast.
+    const seen = page.waitForRequest(
+      (r) => r.method() === "POST" && new URL(r.url()).pathname === `/tasks/${task.id}/seen`,
+    );
+    await openTaskCard(page, title);
+    await seen;
+    await expect(liveToasts(page, title)).toHaveCount(0);
+    expect(capture.deletes(task.id)).toHaveLength(0);
+
+    // The protection ended with the open: with the panel closed again, the next
+    // focused event clears the task's entry as plain D7 says.
+    await page.getByRole("button", { name: "Close task details" }).click();
+    await expect(page.getByTestId("run-panel-resize")).toHaveCount(0, { timeout: CONVERGE_TIMEOUT });
+    await deliverGlobalEvent(page, { kind: "run-status", taskId: task.id, runId, status: "succeeded", ts: Date.now() });
+    await expect.poll(() => capture.deletes(task.id).length, { timeout: CONVERGE_TIMEOUT }).toBeGreaterThan(0);
+    expect(capture.postKinds(task.id)).toEqual(["files-sent"]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -391,5 +482,232 @@ test.describe("one notification per task: pipeline run view", () => {
     await taskCard(page, title).getByText(title, { exact: true }).click();
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
     await expect.poll(() => capture.deletes(parent.id).length, { timeout: CONVERGE_TIMEOUT }).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (h)/(i) an owed "Pipeline needs you" alert. A step's question takes the
+// pipeline parent's one toast slot (and its one OS entry) while the run is
+// already blocked on something else, so the block alert is displaced. Once
+// the question is answered, from any client, App.tsx raises the alert again
+// because the run is still blocked (OwedPipelineAlerts).
+//
+// The pipeline: Start fans out (`transition: "all"`) to Asker and Capped,
+// with `maxSteps: 2`. Start counts 1 and Asker 2, so launching Capped hits
+// the cap: a run-level `step-cap` block (no step task) keeps the run blocked
+// while Asker asks the user (a pending `fx_permission` card). The widened
+// spawn delay makes Asker's question land after the run is blocked, the way a
+// real agent's question would (see pipelines-run.spec.ts's ASK_SPAWN_DELAY_MS).
+// ---------------------------------------------------------------------------
+
+/** Mirrors `FAKE_CLAUDE_HANDOFF_PROMPT_MARKER` in `src/bun/agents.ts`. */
+const FAKE_CLAUDE_HANDOFF_PROMPT_MARKER = "__agetor_fake_claude_handoff__";
+/** Mirrors `FAKE_FX_PERMISSION_PROMPT_MARKER` in `src/bun/agents.ts`: the fake
+ *  turn registers a pending `fx_permission` card and resolves only once it is
+ *  answered. */
+const FAKE_FX_PERMISSION_PROMPT_MARKER = "__agetor_fake_fx_permission__";
+
+interface PipelineParentRow extends TaskRow {
+  pendingInteractionCount?: number;
+  pipelineRun: {
+    status: string;
+    active: { stepId: string; taskId: string }[];
+    blocked: { taskId: string | null; stepId: string | null; kind: string }[];
+  } | null;
+}
+
+interface PendingInteraction {
+  id: string;
+  kind: string;
+  taskId: string;
+}
+
+function jsonHeaders(backend: E2EBackend): { authorization: string; "content-type": string } {
+  return { ...authHeaders(backend), "content-type": "application/json" };
+}
+
+async function postJson<T>(backend: E2EBackend, pathname: string, body: unknown): Promise<T> {
+  const res = await fetch(`${backend.apiBase}${pathname}`, {
+    method: "POST",
+    headers: jsonHeaders(backend),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`POST ${pathname} -> ${res.status}: ${await res.text()}`);
+  return (await res.json()) as T;
+}
+
+async function getParent(backend: E2EBackend, id: string): Promise<PipelineParentRow> {
+  const res = await fetch(`${backend.apiBase}/tasks/${id}`, { headers: authHeaders(backend) });
+  if (!res.ok) throw new Error(`GET /tasks/${id} -> ${res.status}: ${await res.text()}`);
+  return (await res.json()) as PipelineParentRow;
+}
+
+function pipelineStep(id: string, name: string, agentProfileId: string, x: number, extra: Record<string, unknown> = {}) {
+  return {
+    id,
+    name,
+    instructions: "",
+    agentProfileId,
+    position: { x, y: 0 },
+    subagents: { profileIds: [], cap: null },
+    transition: "choose",
+    join: "any",
+    ...extra,
+  };
+}
+
+/** Creates the Start → {Asker, Capped} pipeline and its (not started) parent task. */
+async function createOwedAlertPipelineTask(
+  backend: E2EBackend,
+): Promise<{ parent: PipelineParentRow; title: string; askerStepId: string; cappedStepId: string }> {
+  const { id: profileId } = await postJson<{ id: string }>(backend, "/agent-profiles", {
+    name: "Runner",
+    harness: "claude-code",
+    model: "opus-5",
+    instructions: "",
+    skills: [],
+  });
+  const startId = randomUUID();
+  const askerStepId = randomUUID();
+  const cappedStepId = randomUUID();
+  const { id: pipelineId } = await postJson<{ id: string }>(backend, "/pipelines", {
+    name: "Owed Alert Pipeline",
+    description: "",
+    graph: {
+      steps: [
+        pipelineStep(startId, "Start", profileId, 0, {
+          transition: "all",
+          instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+        }),
+        pipelineStep(askerStepId, "Asker", profileId, 300, {
+          instructions: `Ask before writing. ${FAKE_FX_PERMISSION_PROMPT_MARKER}`,
+        }),
+        pipelineStep(cappedStepId, "Capped", profileId, 600),
+      ],
+      // Edge order is launch order: Asker takes the second slot, Capped hits the cap.
+      edges: [
+        { id: randomUUID(), from: startId, to: askerStepId, label: "" },
+        { id: randomUUID(), from: startId, to: cappedStepId, label: "" },
+      ],
+      startStepId: startId,
+    },
+    maxSteps: 2,
+  });
+  const title = uniqueTitle("owed-alert");
+  // The goal text carries no fake marker: Asker's own instructions pick its turn.
+  const parent = await postJson<PipelineParentRow>(backend, "/tasks", {
+    title,
+    prompt: "Do the thing.",
+    isolation: "none",
+    workdir: tmpdir(),
+    pipelineId,
+  });
+  return { parent, title, askerStepId, cappedStepId };
+}
+
+/** Starts the run and waits until it is blocked on the step cap (naming
+ *  Capped) while Asker, the one active execution, has its question pending. */
+async function startUntilAskingWhileBlocked(
+  backend: E2EBackend,
+  run: { parent: PipelineParentRow; askerStepId: string; cappedStepId: string },
+): Promise<void> {
+  await postJson(backend, `/tasks/${run.parent.id}/start`, {});
+  await expect(async () => {
+    const row = await getParent(backend, run.parent.id);
+    expect(row.column).toBe("blocked");
+    expect(row.pipelineRun?.status).toBe("blocked");
+    const cap = row.pipelineRun?.blocked.find((b) => b.kind === "step-cap");
+    expect(cap?.stepId).toBe(run.cappedStepId);
+    expect(cap?.taskId ?? null).toBeNull();
+    expect(row.pipelineRun?.active.map((a) => a.stepId)).toEqual([run.askerStepId]);
+    expect(row.pendingInteractionCount ?? 0).toBe(1);
+  }).toPass({ timeout: 30_000 });
+}
+
+/** Answers the step's question over REST, the way `agetor answer` would: the
+ *  parent's pending list unions its steps' cards. */
+async function answerStepQuestion(backend: E2EBackend, parentId: string): Promise<void> {
+  const res = await fetch(`${backend.apiBase}/tasks/${parentId}/interactions/pending`, {
+    headers: authHeaders(backend),
+  });
+  expect(res.ok, `GET /tasks/${parentId}/interactions/pending -> ${res.status}`).toBeTruthy();
+  const pending = (await res.json()) as PendingInteraction[];
+  const card = pending.find((p) => p.kind === "fx_permission");
+  expect(card, `pending interactions: ${JSON.stringify(pending)}`).toBeTruthy();
+  const answer = await postJson<{ ok: boolean }>(backend, `/fx-permissions/${card!.id}/answer`, {
+    optionId: "reject-once",
+  });
+  expect(answer.ok).toBe(true);
+}
+
+test.describe("one notification per task: an owed 'Pipeline needs you' alert", () => {
+  test.use({
+    backendEnv: {
+      AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: "3000",
+      AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS: "3000",
+    },
+  });
+
+  test("(h) unfocused: answering the step's question re-raises the block alert, toast and OS post", async ({
+    page,
+    freshBackend,
+  }) => {
+    test.setTimeout(90_000);
+    const backend = freshBackend;
+    await fakeWindowFocus(page, false);
+    const capture = await captureNotifications(page);
+    const run = await createOwedAlertPipelineTask(backend);
+    await gotoAppSubscribed(page, backend);
+    // The toast copy reads the parent's title from the polled list.
+    await expect(taskCard(page, run.title)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    await startUntilAskingWhileBlocked(backend, run);
+    // The step's question holds the parent's one slot: exactly one live toast
+    // names the pipeline, and it is the question, not the block alert.
+    await expect(liveToasts(page, run.title)).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+    await expect(liveToasts(page, run.title)).toContainText("Waiting on you");
+    await expect(liveToasts(page, run.title)).not.toContainText("Pipeline needs you");
+    // The question took the parent's OS entry too (one `waiting` post).
+    await expect.poll(() => capture.postKinds(run.parent.id), { timeout: CONVERGE_TIMEOUT }).toContain("waiting");
+    expect(capture.postKinds(run.parent.id).at(-1)).toBe("waiting");
+
+    capture.clear();
+    await answerStepQuestion(backend, run.parent.id);
+
+    // The run is still blocked on the step cap, so the owed alert comes back:
+    // one live toast, now the block alert.
+    await expect(liveToasts(page, run.title)).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+    await expect(liveToasts(page, run.title)).toContainText("Pipeline needs you", { timeout: CONVERGE_TIMEOUT });
+    // …and, unfocused, it replaces the parent's OS entry with a `blocked` post.
+    await expect.poll(() => capture.postKinds(run.parent.id)[0], { timeout: CONVERGE_TIMEOUT }).toBe("blocked");
+    expect(capture.deletes(run.parent.id)).toHaveLength(0);
+    // Server side the run really is still blocked, with nothing left to answer.
+    const after = await getParent(backend, run.parent.id);
+    expect(after.pipelineRun?.status).toBe("blocked");
+    expect(after.pendingInteractionCount ?? 0).toBe(0);
+  });
+
+  test("(i) focused: the re-raised block alert is a toast only, and clears the parent's OS entry (D7)", async ({
+    page,
+    freshBackend,
+  }) => {
+    test.setTimeout(90_000);
+    const backend = freshBackend;
+    await fakeWindowFocus(page, true);
+    const capture = await captureNotifications(page);
+    const run = await createOwedAlertPipelineTask(backend);
+    await gotoAppSubscribed(page, backend);
+    await expect(taskCard(page, run.title)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    await startUntilAskingWhileBlocked(backend, run);
+    await expect(liveToasts(page, run.title)).toContainText("Waiting on you", { timeout: CONVERGE_TIMEOUT });
+
+    capture.clear();
+    await answerStepQuestion(backend, run.parent.id);
+
+    await expect(liveToasts(page, run.title)).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+    await expect(liveToasts(page, run.title)).toContainText("Pipeline needs you", { timeout: CONVERGE_TIMEOUT });
+    await expect.poll(() => capture.deletes(run.parent.id).length, { timeout: CONVERGE_TIMEOUT }).toBeGreaterThan(0);
+    expect(capture.posts(run.parent.id)).toHaveLength(0);
   });
 });

@@ -6,6 +6,10 @@ import {
   buildNotifierRemoveArgs,
   buildNotifierListArgs,
   resolveInstalledAppNotifier,
+  NOTIFIER_LIST_HEADER,
+  notifierListAcked,
+  notifierPostAcked,
+  notifierRemoveAcked,
 } from "./notifier.ts";
 
 describe("buildNotifierArgs", () => {
@@ -231,5 +235,39 @@ describe("resolveNotifier", () => {
     expect(
       r === null || r.endsWith("AgetorNotifier.app/Contents/MacOS/notifier"),
     ).toBe(true);
+  });
+});
+
+describe("helper acks", () => {
+  test("list: the header must be the first line", () => {
+    expect(notifierListAcked(`${NOTIFIER_LIST_HEADER}\n`)).toBe(true);
+    expect(notifierListAcked(`${NOTIFIER_LIST_HEADER}\nagetor://task/a\n`)).toBe(true);
+    expect(notifierListAcked("")).toBe(false);
+    expect(notifierListAcked(`agetor://task/a\n${NOTIFIER_LIST_HEADER}\n`)).toBe(false);
+  });
+
+  test("remove: a `removed <n>` line", () => {
+    expect(notifierRemoveAcked("removed 0\n")).toBe(true);
+    expect(notifierRemoveAcked("removed 3\n")).toBe(true);
+    expect(notifierRemoveAcked("")).toBe(false);
+    expect(notifierRemoveAcked("removed\n")).toBe(false);
+  });
+
+  test("post: `posted <id>` for exactly the requested id", () => {
+    expect(notifierPostAcked("posted agetor.task.t1\n", "agetor.task.t1")).toBe(true);
+    expect(notifierPostAcked("posted 3F2504E0-4F89\n", "agetor.task.t1")).toBe(false);
+    expect(notifierPostAcked("", "agetor.task.t1")).toBe(false);
+  });
+
+  test("post: the ack may sit among other lines, but another task's id never counts", () => {
+    expect(notifierPostAcked("some log line\nposted agetor.task.t1\n", "agetor.task.t1")).toBe(true);
+    expect(notifierPostAcked("posted agetor.task.t10\n", "agetor.task.t1")).toBe(false);
+    expect(notifierPostAcked("posted agetor.task.t1-extra\n", "agetor.task.t1")).toBe(false);
+  });
+
+  test("remove: the ack line may follow other output, but a count must be a whole line", () => {
+    expect(notifierRemoveAcked("note\nremoved 2\n")).toBe(true);
+    expect(notifierRemoveAcked("removed 2 entries\n")).toBe(false);
+    expect(notifierRemoveAcked("not removed 2\n")).toBe(false);
   });
 });

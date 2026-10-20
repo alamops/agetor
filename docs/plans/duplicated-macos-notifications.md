@@ -582,6 +582,12 @@ bun run vendor:notifier                       # helper compiles + ad-hoc signs (
 - The pipeline run view clears through `DELETE /notifications/:id`, not `/seen`.
 - The in-app poll sweep is restricted to tasks seen in the previous poll or now archived, so a task that hasn't been polled yet can't lose its toast.
 
+**Code-review round 1 fixes** (after wave 4):
+
+- A forced focused post survives D7. `FocusedForcedPosts` (`toast-slots.ts`) remembers a task whose forced post (a proactive "Files sent") went out while focused; that task's later focused events skip the D7 clear (and so no longer drop the queued post) until the task is opened, marked read, archived or deleted, or an unfocused post replaces the entry. D6d still clears it, since the task is then open on screen.
+- An owed "Pipeline needs you" is re-raised. When a step's retargeted "Waiting on you" suppressed or displaced the parent's block alert, `OwedPipelineAlerts` records it; once the question is answered and no reason toast holds the slot, App.tsx raises the alert (toast plus OS post when unfocused) if the run is still blocked on something other than the answered step's own `step-blocked` block or a block naming a step that is `running` again (the runner clears such a block asynchronously, under the parent's pipeline lock, so the parent's row can lag behind the step's own `running` column event). The debt is dropped when the run leaves `blocked`.
+- Stale helpers are detected. The helper acks every mode on stdout (`posted <id>`, `removed <n>`, an `agetor-notifier list` header). An exit 0 without the ack can mean a helper from before this plan. An unacked `--list` proves it; an unacked post or `--remove` only starts a `--list` probe (one at a time), since a current helper can also exit 0 early when a notification click reaches it, and a failed probe proves nothing. Once proven, Bun logs once, skips later removals (each would wait 10 s for nothing), leaves the seed failed and keeps posting.
+
 ## 9. Completeness ledger
 
 | Item | Disposition | Task ID / reason / who deferred |

@@ -1645,6 +1645,82 @@ test.describe("pipelines run: step attention — reading the pipeline", () => {
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
     await expect(runPanelHandle(page)).toHaveCount(1);
   });
+
+  // The OS-notification click path (`open_task` AppEvent -> App.tsx's
+  // `openPipelineAttention`) with a landing that resolves no step: only a
+  // run-level `step-cap` block, so there is nothing to open — `landOnPipeline`
+  // must keep the step panel of the SAME pipeline the user is reading. The
+  // headless core has no native bridge to emit `open_task`, so the page's
+  // `/app/events` EventSource is recorded by an init script and the frame is
+  // delivered by dispatching a MessageEvent on it (the same `onmessage` path a
+  // real SSE frame takes).
+  test("an open_task landing that resolves no step keeps a step panel of the same pipeline open", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    await page.addInitScript(() => {
+      const w = window as unknown as { __appEventSources: EventSource[] };
+      w.__appEventSources = [];
+      const Native = window.EventSource;
+      class Recording extends Native {
+        constructor(url: string | URL, init?: EventSourceInit) {
+          super(url, init);
+          if (String(url).includes("/app/events")) w.__appEventSources.push(this);
+        }
+      }
+      window.EventSource = Recording as unknown as typeof EventSource;
+    });
+    const deliverOpenTask = (taskId: string) =>
+      page.evaluate((id) => {
+        // Only sources still open (a dev double-mount leaves a closed one).
+        const sources = (window as unknown as { __appEventSources: EventSource[] }).__appEventSources.filter(
+          (es) => es.readyState !== EventSource.CLOSED,
+        );
+        if (sources.length === 0) throw new Error("no open /app/events EventSource recorded");
+        const data = JSON.stringify({ type: "open_task", taskId: id, ts: Date.now() });
+        for (const es of sources) es.dispatchEvent(new MessageEvent("message", { data }));
+      }, taskId);
+
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({ id: randomUUID(), name: "First", agentProfileId: profileId });
+    const B = makeStep({ id: randomUUID(), name: "Capped", agentProfileId: profileId });
+    // maxSteps = 1: launching B hits the cap — a run-level `step-cap` block
+    // with no step task, so the landing resolves no step.
+    const pipelineId = await createPipelineRest(backend, "Capped Open Pipeline", [A, B], [{ from: A.id, to: B.id }], 1);
+    const title = `Capped Open Run ${randomUUID()}`;
+    const task = await createPipelineTaskRest(
+      backend,
+      title,
+      pipelineId,
+      `Do the thing. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+    );
+    await gotoAppSubscribed(page, backend);
+    await startTaskRest(backend, task.id);
+    await expect(async () => {
+      const row = await getTask(backend, task.id);
+      expect(row.pipelineRun?.blocked.some((b) => b.kind === "step-cap")).toBe(true);
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+    await waitForPolledStep(page, task.id);
+
+    // Proves the delivery path: from the bare board the event opens the run
+    // view (and, with no step to open, no panel).
+    await expect(page.getByTestId("pipeline-run-view")).toHaveCount(0);
+    await deliverOpenTask(task.id);
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(runPanelHandle(page)).toHaveCount(0);
+
+    // Read the settled step's panel, then click the notification again.
+    await stepNode(page, A.id).click();
+    const strip = page.getByTestId("run-panel-pipeline-strip");
+    await expect(strip).toContainText("step First");
+    await deliverOpenTask(task.id);
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    // Past the panel's exit animation, had it been closed.
+    await page.waitForTimeout(1000);
+    await expect(runPanelHandle(page)).toHaveCount(1);
+    await expect(strip).toContainText("step First");
+  });
 });
 
 // The board card and the step node share one "waiting on you" look

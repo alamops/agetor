@@ -63,6 +63,7 @@ import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
+import { OwedPipelineAlerts } from "@/lib/owed-pipeline-alerts";
 import { findTaskById } from "@/lib/notification-open";
 import { publishCloneProgress } from "@/lib/clone-progress";
 import { publishPipelineGlobalEvent } from "@/lib/pipeline-events";
@@ -1078,6 +1079,52 @@ function AppInner() {
   useEffect(() => { tasksRef.current = tasks; }, [tasks]);
   useEffect(() => { selectedIdRef.current = selected?.id ?? null; }, [selected]);
 
+  /** The "Pipeline needs you" toast (and, unfocused, OS notification) for a
+   *  blocked pipeline parent. Lands on the run view plus the step that needs
+   *  the user (resolved at click time), not the run view alone. */
+  const raisePipelineNeedsYou = useCallback((parentId: string) => {
+    const parent = tasksRef.current.find((t) => t.id === parentId);
+    toastPending({
+      taskId: parentId,
+      title: parent?.title || `Pipeline ${parentId.slice(0, 7)}`,
+      subtitle: "Pipeline needs you",
+      isSelected:
+        parentId === selectedIdRef.current
+        || (viewRef.current.kind === "pipeline-run" && viewRef.current.taskId === parentId),
+      isFocused: document.hasFocus(),
+      onOpen: () => {
+        openPipelineAttention(parentId);
+        void api.focusWindow();
+      },
+    });
+  }, [openPipelineAttention]);
+
+  // "Pipeline needs you" alerts a step's retargeted "Waiting on you" toast
+  // suppressed or displaced (see OwedPipelineAlerts). Once no question is left
+  // and no reason toast holds the parent's slot, the alert is raised if the
+  // run is still blocked on something else, or dropped if it no longer is.
+  const owedPipelineAlertsRef = useRef(new OwedPipelineAlerts());
+  const settleOwedPipelineAlert = useCallback((parentId: string) => {
+    const owed = owedPipelineAlertsRef.current;
+    if (!owed.isOwed(parentId)) return;
+    if (pendingInputRef.current.hasPending(parentId) || hasPendingToast(parentId)) return;
+    const rows = tasksRef.current;
+    const decision = owed.decide(
+      parentId,
+      rows.find((t) => t.id === parentId),
+      (stepId) => rows.find((t) => t.id === stepId)?.column === "running",
+    );
+    if (decision === "wait") return;
+    owed.forget(parentId);
+    if (decision === "raise") raisePipelineNeedsYou(parentId);
+  }, [raisePipelineNeedsYou]);
+  // Re-checked on every tasks change (poll, refetch merge), after `tasksRef`
+  // has caught up: the block that keeps the run blocked may only show up in a
+  // later snapshot. A Map lookup per owed parent; usually none.
+  useEffect(() => {
+    for (const id of owedPipelineAlertsRef.current.parentIds()) settleOwedPipelineAlert(id);
+  }, [tasks, settleOwedPipelineAlert]);
+
   // Window focus (D6d): the window the user is looking at may already show
   // the open task (panel or pipeline run view) while a newer Notification
   // Center entry for it arrived in the background — returning focus clears
@@ -1382,6 +1429,17 @@ function AppInner() {
         const tracker = pendingInputRef.current;
         if (ev.state === "pending") {
           if (tracker.add(target.taskId, ev.interactionId)) {
+            // A step's question takes the parent's one toast slot. If the run
+            // is already blocked and its "Pipeline needs you" toast is still
+            // up, the question displaces it, so the alert is owed once the
+            // question is answered. One the user already dismissed (or saw
+            // in the run view, where it was suppressed) is not owed again.
+            if (stepParentId && hasPendingToast(stepParentId)) {
+              const parent = tasksRef.current.find((t) => t.id === stepParentId);
+              if (parent?.column === "blocked" || parent?.pipelineRun?.status === "blocked") {
+                owedPipelineAlertsRef.current.owe(stepParentId);
+              }
+            }
             // The retargeted step toast names the exact step that asked, so
             // its Open is an ATTENTION landing (run view + that step's panel,
             // or another step that still needs the user once this one is
@@ -1400,8 +1458,16 @@ function AppInner() {
                 : target,
             );
           }
-        } else if (tracker.remove(target.taskId, ev.interactionId)) {
-          dismissPending(target.taskId);
+        } else {
+          // Every answered step counts, not just the pipeline's last answer:
+          // with two steps asking, the first one answered still carries its
+          // `step-blocked` block when the second is answered. Settling waits
+          // while anything is still pending, so marking early is safe.
+          if (stepParentId) owedPipelineAlertsRef.current.noteAnswered(stepParentId, ev.taskId);
+          if (tracker.remove(target.taskId, ev.interactionId)) {
+            dismissPending(target.taskId);
+            if (stepParentId) settleOwedPipelineAlert(stepParentId);
+          }
         }
         // Optimistically reflect the change in the card's pending count so the
         // "needs input" amber-pulse flag (TaskCard, gated on
@@ -1531,6 +1597,7 @@ function AppInner() {
           // of this pipeline should alert afresh.
           dismissPending(ev.taskId);
           pendingInputRef.current.clearTask(ev.taskId);
+          owedPipelineAlertsRef.current.forget(ev.taskId);
         }
         // ONE "finished" toast + OS notification per run, on the transition
         // into `done` (M-A3) — the outcome someone waiting on a long
@@ -1552,6 +1619,11 @@ function AppInner() {
       setTasks((cur) =>
         cur.map((t) => (t.id === ev.taskId ? { ...t, column: ev.column } : t)),
       );
+      // A step running again ends the "answered question" exemption for its
+      // blocks (see OwedPipelineAlerts).
+      if (stepParentId && ev.column === "running") {
+        owedPipelineAlertsRef.current.noteStepRunning(stepParentId, ev.taskId);
+      }
       // A hidden pipeline STEP task's own `blocked` transition never toasts
       // on its own — the pipeline PARENT's `blocked` column event (reason
       // "pipeline") is the one the user should see, and toasting both would
@@ -1568,21 +1640,12 @@ function AppInner() {
           // already live for this parent (M-A3) — that toast already names
           // the exact step and opens the same run view, so a second
           // "Pipeline needs you" for the same block would be noise (and a
-          // second OS notification).
+          // second OS notification). The suppressed alert is owed: once that
+          // question is answered, it is raised if the run is still blocked.
           if (!hasPendingToast(ev.taskId)) {
-            toastPending({
-              taskId: ev.taskId,
-              title,
-              subtitle: "Pipeline needs you",
-              isSelected,
-              isFocused,
-              // Lands on the run view plus the step that needs the user
-              // (resolved at click time), not the run view alone.
-              onOpen: () => {
-                openPipelineAttention(ev.taskId);
-                void api.focusWindow();
-              },
-            });
+            raisePipelineNeedsYou(ev.taskId);
+          } else {
+            owedPipelineAlertsRef.current.owe(ev.taskId);
           }
         } else {
           toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
@@ -1593,18 +1656,22 @@ function AppInner() {
         // drops its (retargeted, parent-keyed) tracker entries here, so the
         // next step's prompt alerts afresh.
         dismissPending(ev.taskId);
-        if (task?.pipelineId) pendingInputRef.current.clearTask(ev.taskId);
+        if (task?.pipelineId) {
+          pendingInputRef.current.clearTask(ev.taskId);
+          owedPipelineAlertsRef.current.forget(ev.taskId);
+        }
       }
     };
     const cancel = api.subscribeGlobalEvents(handle);
     return cancel;
-    // `openTask`, `openPipelineStep`, `openPipelineAttention` and
-    // `mergeTaskFields` all have stable identities (the first three read
+    // `openTask`, `openPipelineStep`, `openPipelineAttention`,
+    // `mergeTaskFields`, `raisePipelineNeedsYou` and `settleOwedPipelineAlert`
+    // all have stable identities (the first three read
     // `view`/`pipelineEditorDirty` via refs rather than depending on them
     // directly — see `viewRef`'s doc comment above) — listing them doesn't
     // cause a resubscribe, it just keeps this effect honest about what it
     // closes over.
-  }, [openTask, openPipelineStep, openPipelineAttention, mergeTaskFields]);
+  }, [openTask, openPipelineStep, openPipelineAttention, mergeTaskFields, raisePipelineNeedsYou, settleOwedPipelineAlert]);
 
   // Hidden pipeline STEP tasks never count toward anything user-facing (D11,
   // `docs/plans/pipelines.md`) — the header's "N of M tasks" count and the

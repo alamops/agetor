@@ -47,3 +47,12 @@ test("clearTask is scoped to one task", () => {
   expect(t.add("task-1", "c")).toBe(true);   // cleared → re-signals
   expect(t.add("task-2", "d")).toBe(false);  // untouched → still tracked
 });
+
+test("hasPending reflects live prompts", () => {
+  const t = new PendingInputTracker();
+  expect(t.hasPending("task-1")).toBe(false);
+  t.add("task-1", "a");
+  expect(t.hasPending("task-1")).toBe(true);
+  t.remove("task-1", "a");
+  expect(t.hasPending("task-1")).toBe(false);
+});

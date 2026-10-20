@@ -277,6 +277,44 @@ test("DELETE /tasks/:id removes the task's own entry", async () => {
   expect(removals).toEqual([{ taskId: task.id }]);
 });
 
+test("PATCH /tasks/:id moving a card out of blocked removes its reason-family entry", async () => {
+  const { tasks } = await import("./db.ts");
+  const { UNBLOCKED_REMOVAL_KINDS } = await import("../shared/os-notification.ts");
+  const task = await makeTask("notifications: manual unblock");
+  try {
+    tasks.update(task.id, { column: "blocked" });
+    removals.length = 0;
+    // A non-column edit of a blocked card leaves the entry alone.
+    const retitle = await fetch(url(`/tasks/${task.id}`), {
+      method: "PATCH",
+      headers: auth(),
+      body: JSON.stringify({ title: "still blocked" }),
+    });
+    expect(retitle.status).toBe(200);
+    expect(removals).toEqual([]);
+
+    const moved = await fetch(url(`/tasks/${task.id}`), {
+      method: "PATCH",
+      headers: auth(),
+      body: JSON.stringify({ column: "review" }),
+    });
+    expect(moved.status).toBe(200);
+    expect(removals).toEqual([{ taskId: task.id, ifKinds: UNBLOCKED_REMOVAL_KINDS }]);
+
+    // A move between two unblocked columns removes nothing.
+    removals.length = 0;
+    const again = await fetch(url(`/tasks/${task.id}`), {
+      method: "PATCH",
+      headers: auth(),
+      body: JSON.stringify({ column: "done" }),
+    });
+    expect(again.status).toBe(200);
+    expect(removals).toEqual([]);
+  } finally {
+    tasks.delete(task.id);
+  }
+});
+
 test("GET /events route is auth-gated", async () => {
   const res = await fetch(url("/events"));
   expect(res.status).toBe(401);
