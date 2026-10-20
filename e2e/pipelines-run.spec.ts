@@ -1286,7 +1286,7 @@ test.describe("pipelines run: step attention — a step asking mid-turn", () => 
     await expect(waitingToast(page)).toHaveCount(0);
   });
 
-  test("the card body stays a run-view-only path: no step panel opens; opening the asking node clears the parent's toast", async ({
+  test("the card body stays a run-view-only path: no step panel opens, and entering the run view clears the parent's toast", async ({
     page,
     freshBackend,
   }) => {
@@ -1305,11 +1305,14 @@ test.describe("pipelines run: step attention — a step asking mid-turn", () => 
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
     await expect(stepNode(page, asker.id)).toHaveAttribute("data-attention", "answer", { timeout: CONVERGE_TIMEOUT });
     await expect(runPanelHandle(page)).toHaveCount(0);
-    // A run-view-only landing leaves the parent-keyed toast up…
-    await expect(waitingToast(page)).toBeVisible();
+    // Entering the run view counts as opening the task (D6a/D12/D16, plan
+    // §8 Q1): the parent-keyed toast is gone even though no step panel opened,
+    // while the asking node still reads Answer.
+    await expect(waitingToast(page)).toHaveCount(0);
+    await expect(stepNode(page, asker.id)).toHaveAttribute("data-attention", "answer");
+    await expect(attentionChip(page, asker.id)).toHaveText("Answer");
 
-    // …but opening the asking step's own panel clears it: the toast is
-    // keyed on the parent, not the step.
+    // Opening the asking step's own panel afterwards keeps the toast gone.
     await stepNode(page, asker.id).click();
     await expect(page.getByTestId("run-panel-pipeline-strip")).toContainText("step Asker");
     await expect(waitingToast(page)).toHaveCount(0);
@@ -1545,8 +1548,20 @@ test.describe("pipelines run: step attention — blocks", () => {
   });
 });
 
-test.describe("pipelines run: step attention — step-named and keep-the-panel landings", () => {
-  test.use({ backendEnv: { AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: RESOLVE_DELAY_MS } });
+// The retargeted files-sent toast shares the parent's ONE toast slot with the
+// "Pipeline needs you" toast the step's later missing-handoff block raises, so
+// that block REPLACES it (no stacking, no hover-the-front workaround). The test
+// therefore clicks the files-sent toast's Open before the block lands: the
+// widened spawn delay lets the board's 2 s poll deliver the step row first, and
+// the block needs the sent-files turn plus a whole reminder round-trip after
+// the toast appears.
+test.describe("pipelines run: step attention — step-named landings", () => {
+  test.use({
+    backendEnv: {
+      AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: RESOLVE_DELAY_MS,
+      AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS: ASK_SPAWN_DELAY_MS,
+    },
+  });
 
   test("the retargeted files-sent toast's Open lands on the run view plus the step that sent them", async ({
     page,
@@ -1561,25 +1576,35 @@ test.describe("pipelines run: step attention — step-named and keep-the-panel l
     // (the step later blocks on its missing handoff — irrelevant here).
     const task = await createPipelineTaskRest(backend, title, pipelineId, `Send the files. ${FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER}`);
     await gotoAppSubscribed(page, backend);
+    // Armed BEFORE the start: the step row exists as soon as the run starts,
+    // and the spawn delay holds the files-sent turn back until a poll has
+    // delivered it (the landing resolves the step from App's polled list).
+    const stepPolled = waitForPolledStep(page, task.id);
     await startTaskRest(backend, task.id);
+    await stepPolled;
 
     const toastEl = page.locator("[data-sonner-toaster] [data-sonner-toast]").filter({ hasText: "files sent to you" });
     await expect(toastEl).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     // Retargeted at the parent: its title, never the hidden step's id.
     await expect(toastEl).toContainText(title);
-    await waitForPolledStep(page, task.id);
-    // The step's later missing-handoff block raises a "Pipeline needs you"
-    // toast that stacks in front of this one; hovering the toaster expands
-    // the stack (as it would for a user) so this toast's Open is reachable.
-    await page.locator("[data-sonner-toaster] [data-sonner-toast][data-front='true']").hover();
     await toastEl.getByRole("button", { name: "Open", exact: true }).click();
 
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
     await expect(page.getByTestId("run-panel-pipeline-strip")).toContainText("step Sender");
     await expect(page.getByTestId("sent-files-card").first()).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   });
+});
 
-  test("an attention landing that resolves no step keeps a step panel of the same pipeline open", async ({
+// Reading the pipeline (run view, then a step's panel) is "opening" the task:
+// the parent's one toast slot is dismissed on entering the run view (D6a/D12/
+// D16, plan §8 Q1), and a block that lands while the user is viewing the run
+// raises no toast at all (`isSelected`). So an attention TOAST can no longer
+// coexist with an open step panel of its own pipeline, and the panel the user
+// is reading is never at risk from one.
+test.describe("pipelines run: step attention — reading the pipeline", () => {
+  test.use({ backendEnv: { AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: RESOLVE_DELAY_MS } });
+
+  test("opening the run view clears the 'Pipeline needs you' toast, and the step panel the user reads stays open", async ({
     page,
     freshBackend,
   }) => {
@@ -1604,23 +1629,21 @@ test.describe("pipelines run: step attention — step-named and keep-the-panel l
     await expect(toastEl).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await waitForPolledStep(page, task.id);
 
-    // Read the pipeline: run view (card body), then the settled step's panel.
+    // Read the pipeline: the run view (card body) takes the toast with it…
     await boardCard(page, title).getByText(title, { exact: true }).click();
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await expect(toastEl).toHaveCount(0);
+    // …the block still shows on the canvas…
+    await expect(stepNode(page, B.id)).toHaveAttribute("data-attention", "review", { timeout: CONVERGE_TIMEOUT });
+
+    // …and the settled step's panel opens and stays open (nothing raises a
+    // toast whose landing could close it).
     await stepNode(page, A.id).click();
     const strip = page.getByTestId("run-panel-pipeline-strip");
     await expect(strip).toContainText("step First");
-
-    // The toast sits above the panel's backdrop; its landing resolves no
-    // step, so the panel the user is reading must stay open.
-    await expect(toastEl).toBeVisible();
-    await toastEl.getByRole("button", { name: "Open", exact: true }).click();
     await expect(toastEl).toHaveCount(0);
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
-    // Past the panel's exit animation, had it been closed.
-    await page.waitForTimeout(1000);
     await expect(runPanelHandle(page)).toHaveCount(1);
-    await expect(strip).toContainText("step First");
   });
 });
 
