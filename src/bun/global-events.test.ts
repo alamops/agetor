@@ -72,13 +72,11 @@ test("registering and resolving an interaction emits global interaction events",
   // Importing the orchestrator installs the interactions broadcaster bridges
   // (setBroadcaster / setResolvedBroadcaster) that also fan interactions onto
   // the app-level global bus — the channel the notification hook listens on.
-  const { subscribeGlobal, wireInteractionBroadcast } = await import("./orchestrator.ts");
+  // Deliberately NOT re-wired here: this asserts the wiring module load left
+  // installed (interactions.test.ts restores any override it makes), and
+  // interaction-broadcast-wiring.test.ts pins the same from a fresh process.
+  const { subscribeGlobal } = await import("./orchestrator.ts");
   const { registerTmuxPrompt, cancelPendingForTask } = await import("./interactions.ts");
-
-  // The interactions broadcaster is a single process-wide callback; a sibling
-  // test (interactions.test.ts) may have overridden it to capture raw
-  // broadcasts. Re-establish the real wiring so this test is order-independent.
-  wireInteractionBroadcast();
 
   const taskId = "int-evt-task";
   const runId = "int-evt-run";

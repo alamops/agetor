@@ -5,9 +5,10 @@ export default {
     name: "Agetor",
     identifier: "sh.alamops.agetor",
     version: "1.0.2",
-    // Registers agetor:// so a clicked terminal-notifier notification's
-    // `-open agetor://task/<id>` (see src/bun/notifier.ts) routes back into
-    // this app as an "open-url" event, which src/bun/deep-link.ts parses
+    // Registers agetor:// so a clicked AgetorNotifier notification (our
+    // bundled helper, native/notifier/ + src/bun/notifier.ts), which opens
+    // `agetor://task/<id>`, routes back into this app as an "open-url"
+    // event, which src/bun/deep-link.ts parses
     // back into a task id. Hardcoded rather than imported from
     // src/bun/deep-link.ts (APP_URL_SCHEME) to keep this build-config file
     // free of app-source imports — keep the two in sync by hand.

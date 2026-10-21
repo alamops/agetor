@@ -2,7 +2,7 @@
  * Pure decision logic for the `files-sent` `GlobalEvent` (see
  * `src/shared/types.ts`) — no DOM, no React, no sonner. `App.tsx` calls
  * `notifyFilesSent` (`src/mainview/lib/toasts.ts`), which composes these
- * three functions with the actual toast/native-notification calls. Kept
+ * with the actual toast/native-notification calls. Kept
  * separate so the "when does this fire" rules are unit-testable without a
  * jsdom-shaped harness (this repo has none — see CLAUDE.md's test-seam
  * notes).
@@ -43,15 +43,4 @@ export function filesSentCopy(
  */
 export function shouldToastFilesSent(s: { isSelected: boolean; isFocused: boolean }): boolean {
   return !(s.isSelected && s.isFocused);
-}
-
-/**
- * Whether to fire the native OS notification. Normally gated on the window
- * being unfocused (matches every other `maybeNotifyOS` caller in
- * `toasts.ts`), but a `proactive` send — Claude volunteered the files
- * without being asked in the current turn — always notifies, focused window
- * or not: the user has no other signal that something just landed.
- */
-export function shouldNotifyOsFilesSent(s: { isFocused: boolean; proactive: boolean }): boolean {
-  return !s.isFocused || s.proactive;
 }

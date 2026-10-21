@@ -1,4 +1,4 @@
-import { test, expect, beforeEach } from "bun:test";
+import { test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -8,9 +8,34 @@ import path from "node:path";
 // process, falling back to ~/.agetor and polluting the user's real db.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-int-"));
 
+// The broadcasters are single process-wide callbacks that orchestrator.ts
+// installs once at load. Tests below override them to capture raw broadcasts,
+// so snapshot whatever is installed before each test and put it back after —
+// a leaked override would silently detach the global `interaction` events for
+// every later test file in the same process (it once hid exactly that bug).
+type Broadcasters = {
+  broadcast: Parameters<typeof import("./interactions.ts").setBroadcaster>[0];
+  resolved: Parameters<typeof import("./interactions.ts").setResolvedBroadcaster>[0];
+};
+let installedBroadcasters: Broadcasters | null = null;
+
 beforeEach(async () => {
-  const { __testing } = await import("./interactions.ts");
+  const { __testing, setBroadcaster, setResolvedBroadcaster } = await import("./interactions.ts");
   __testing.reset();
+  // A setter returns the fn it replaced; re-install it straight away.
+  const broadcast = setBroadcaster(() => {});
+  setBroadcaster(broadcast);
+  const resolved = setResolvedBroadcaster(() => {});
+  setResolvedBroadcaster(resolved);
+  installedBroadcasters = { broadcast, resolved };
+});
+
+afterEach(async () => {
+  if (!installedBroadcasters) return;
+  const { setBroadcaster, setResolvedBroadcaster } = await import("./interactions.ts");
+  setBroadcaster(installedBroadcasters.broadcast);
+  setResolvedBroadcaster(installedBroadcasters.resolved);
+  installedBroadcasters = null;
 });
 
 /** Insert a Task row pointing at a fresh temp directory so the
@@ -591,11 +616,6 @@ test("registerFxPermission rolls back when the broadcaster throws: the entry nev
   // fan-out learns to drop it.
   expect(resolved).toHaveLength(1);
   expect(resolved[0]).toEqual({ id: resolved[0]!.id, taskId: "tFxThrow", kind: "fx_permission" });
-
-  // Restore so a subsequent test in this file (or a later call within this
-  // one) doesn't inherit the throwing broadcaster.
-  setBroadcaster(() => { /* restored */ });
-  setResolvedBroadcaster(() => { /* restored */ });
 });
 
 test("registerTmuxPrompt rolls back the same way when the broadcaster throws (sibling kind)", async () => {
@@ -624,9 +644,6 @@ test("registerTmuxPrompt rolls back the same way when the broadcaster throws (si
 
   expect(resolved).toHaveLength(1);
   expect(resolved[0]).toEqual({ id: resolved[0]!.id, taskId: "tTmuxThrow", kind: "tmux_prompt" });
-
-  setBroadcaster(() => { /* restored */ });
-  setResolvedBroadcaster(() => { /* restored */ });
 });
 
 /* ── nav passthrough (claude 2.1.245 /effort slider) ──────────────────── */

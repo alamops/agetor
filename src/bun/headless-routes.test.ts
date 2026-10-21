@@ -37,6 +37,7 @@ test("non-native routes work headless (/info, /tasks)", async () => {
 test("every native-host route returns 501 when running headless", async () => {
   const cases: Array<[string, RequestInit]> = [
     ["/notifications", { method: "POST", headers: auth(), body: JSON.stringify({ title: "x" }) }],
+    ["/notifications/x", { method: "DELETE", headers: auth() }],
     ["/open-external", { method: "POST", headers: auth(), body: JSON.stringify({ url: "https://example.com" }) }],
     ["/open-path", { method: "POST", headers: auth(), body: JSON.stringify({ path: "/tmp" }) }],
     ["/projects/pick", { method: "POST", headers: auth(), body: "{}" }],

@@ -94,6 +94,34 @@ async function createAndStartFakeSentFilesTask(
   };
 }
 
+/** Installs an in-page `MutationObserver` that records the text of every
+ *  sonner toast the moment it mounts (`window.__toastLog`). A task has one
+ *  in-app toast slot, so a quick succession of events (files-sent, then the
+ *  turn settling) replaces each toast within milliseconds — a point-in-time
+ *  `toBeVisible()` can't catch the first one reliably; the log can. Must run
+ *  BEFORE `gotoApp` (init scripts apply from the next navigation). */
+async function installToastLog(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __toastLog: { text: string }[] };
+    w.__toastLog = [];
+    const seen = new WeakSet<Element>();
+    const scan = () => {
+      for (const el of document.querySelectorAll("[data-sonner-toast]")) {
+        if (seen.has(el)) continue;
+        const text = el.textContent ?? "";
+        if (!text) continue;
+        seen.add(el);
+        w.__toastLog.push({ text });
+      }
+    };
+    new MutationObserver(scan).observe(document, { childList: true, subtree: true, characterData: true });
+  });
+}
+
+async function toastLog(page: Page): Promise<{ text: string }[]> {
+  return page.evaluate(() => (window as unknown as { __toastLog: { text: string }[] }).__toastLog);
+}
+
 /** The run panel's slide-over `<aside>` — see quote.spec.ts's identical
  *  helper for why `.last()` is the right pick (NewTaskForm's sidebar is
  *  also an `<aside>`, mounted first in App.tsx's JSX). */
@@ -316,6 +344,7 @@ test.describe("sent files to user", () => {
     // event avoids riding that latency while still proving the effect that
     // opens the EventSource has fired — see the product-bug note in this
     // spec's header comment for the underlying latency issue itself.
+    await installToastLog(page);
     const globalEventsRequested = page.waitForRequest(
       (r) => new URL(r.url()).pathname === "/events",
     );
@@ -323,9 +352,32 @@ test.describe("sent files to user", () => {
     await globalEventsRequested;
 
     const title = `sent-files-e2e-toast ${randomUUID()}`;
-    await createAndStartFakeSentFilesTask(request, backend, title);
+    const { task } = await createAndStartFakeSentFilesTask(request, backend, title);
+    // The toast copy names the task by its polled title, or "Task <id7>" when
+    // the board hasn't polled the (instantly finished) row yet.
+    const names = (text: string) => text.includes(title) || text.includes(`Task ${task.id.slice(0, 7)}`);
 
-    await expect(page.getByText("2 files sent to you")).toBeVisible();
+    // One in-app toast slot per task (docs/plans/duplicated-macos-
+    // notifications.md D12/D13): the fake turn settles ~10ms after the
+    // files-sent event, so the task's "Task succeeded" toast REPLACES the
+    // files-sent one almost immediately — too fast for a point-in-time
+    // `toBeVisible()`, and the scenario ignores the fake driver's resolve-delay
+    // seam (its timings are hard-wired). The in-page observer instead logs
+    // every toast the moment it is mounted, so the files-sent toast is
+    // asserted as having appeared (with the task's title) and then as gone.
+    await expect
+      .poll(async () => (await toastLog(page)).some((e) => e.text.includes("2 files sent to you") && names(e.text)), {
+        timeout: 15_000,
+      })
+      .toBe(true);
+    // …and the success toast took over the task's slot: exactly one live
+    // toast names the task, and it is the success one.
+    const live = page
+      .locator("[data-sonner-toaster] [data-sonner-toast]:not([data-removed='true'])")
+      .filter({ hasText: new RegExp(`${title}|Task ${task.id.slice(0, 7)}`) });
+    await expect(live).toHaveCount(1, { timeout: 2500 });
+    await expect(live).toContainText("Task succeeded");
+    await expect(page.getByText("2 files sent to you")).toHaveCount(0);
 
     // Best-effort product-bug detector (Phase 8 concern, not this test's to
     // fail on): api.notifyOS is fire-and-forget with its own .catch, so this

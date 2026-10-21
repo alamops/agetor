@@ -324,9 +324,12 @@ let broadcastResolved: ResolveBroadcastFn = () => { /* installed by the orchestr
  * interactions on the same SSE stream the UI is already subscribed to.
  * Kept as a setter (rather than a constructor dep) because this module is
  * imported by the server before the orchestrator's listener is registered.
+ * Returns the previously installed fn so a test overriding it can restore it.
  */
-export function setBroadcaster(fn: BroadcastFn): void {
+export function setBroadcaster(fn: BroadcastFn): BroadcastFn {
+  const prev = broadcast;
   broadcast = fn;
+  return prev;
 }
 
 /**
@@ -334,10 +337,13 @@ export function setBroadcaster(fn: BroadcastFn): void {
  * call and `cancelPendingForTask` path emits one of these so the UI can
  * drop the resolved card without waiting for a polling refresh. Without
  * this, scraper auto-cancel and run-cancellation leave stale cards in
- * the run panel until the user closes and reopens it.
+ * the run panel until the user closes and reopens it. Returns the
+ * previously installed fn, like `setBroadcaster`.
  */
-export function setResolvedBroadcaster(fn: ResolveBroadcastFn): void {
+export function setResolvedBroadcaster(fn: ResolveBroadcastFn): ResolveBroadcastFn {
+  const prev = broadcastResolved;
   broadcastResolved = fn;
+  return prev;
 }
 
 /** Internal helper — every answer* / cancel* path that deletes from one
@@ -716,11 +722,14 @@ export const __testing = {
   askQuestionsSize: () => askQuestions.size,
   tmuxPromptsSize: () => tmuxPrompts.size,
   fxPermissionsSize: () => fxPermissions.size,
+  /** Clears the registry. The broadcasters stay as installed: they are the
+   *  process-wide bridges orchestrator.ts installs once at load, and resetting
+   *  them here silently detached the global `interaction` events for every
+   *  later test file in the same `bun test` process. A test that overrides a
+   *  broadcaster restores it through the setter's returned previous fn. */
   reset() {
     askQuestions.clear();
     tmuxPrompts.clear();
     fxPermissions.clear();
-    broadcast = () => { /* reset */ };
-    broadcastResolved = () => { /* reset */ };
   },
 };

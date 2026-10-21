@@ -27,6 +27,7 @@ import type {
   DbCompactResult,
   RetentionPassResult,
 } from "../shared/types.ts";
+import type { NotificationKind } from "../shared/os-notification.ts";
 import type { BundleExportResponse } from "../shared/bundle.ts";
 import type { BundleImportOptions, BundleImportPlan, BundleImportResponse } from "../shared/bundle-import.ts";
 import type { AnyRequest, AskQuestionsAnswer } from "../bun/interactions.ts";
@@ -64,6 +65,11 @@ const CLONE_TIMEOUT_MS = 15 * 60_000;
  *  15s budget would abort while the core was still inserting, and a retry
  *  would create a second profile. */
 const DUPLICATE_WITH_TASKS_TIMEOUT_MS = 10 * 60_000;
+/** `POST /notifications` only hands the post to the OS; a core that does not
+ *  answer quickly is as good as absent, and the caller falls back to posting
+ *  the notification itself. */
+const NOTIFY_TIMEOUT_MS = 5_000;
+
 /** `GET /claude-sessions` parses every transcript Agetor does not own the
  *  first time it sees it, and `POST /claude-sessions/recheck` first runs
  *  `claude agents --json` once per Claude config dir (up to 8 s each). Both
@@ -335,6 +341,21 @@ export class AgetorClient {
    *  `off`; 409 while a pass is already running. */
   runRetentionPass(): Promise<RetentionPassResult> {
     return this.req("POST", "/db/retention/run", undefined, RETENTION_RUN_TIMEOUT_MS);
+  }
+
+  // ── notifications ──────────────────────────────────────────────────────────
+  /** `POST /notifications` — post a desktop notification through the core's
+   *  native bridge (the app). Rejects with an `ApiError` on any non-2xx,
+   *  including the headless core's 501, so the caller can fall back. */
+  notifyOS(input: {
+    title: string;
+    body?: string;
+    subtitle?: string;
+    silent?: boolean;
+    taskId?: string;
+    kind?: NotificationKind;
+  }): Promise<{ ok: boolean }> {
+    return this.req("POST", "/notifications", input, NOTIFY_TIMEOUT_MS);
   }
 
   // ── projects ───────────────────────────────────────────────────────────────

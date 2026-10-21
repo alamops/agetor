@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { filesSentCopy, shouldNotifyOsFilesSent, shouldToastFilesSent } from "./files-sent-notify.ts";
+import { filesSentCopy, shouldToastFilesSent } from "./files-sent-notify.ts";
 
 describe("filesSentCopy", () => {
   test("singular title at count === 1", () => {
@@ -60,20 +60,5 @@ describe("shouldToastFilesSent", () => {
 
   test("shown when neither selected nor focused", () => {
     expect(shouldToastFilesSent({ isSelected: false, isFocused: false })).toBe(true);
-  });
-});
-
-describe("shouldNotifyOsFilesSent", () => {
-  test("notifies when the window is unfocused, regardless of proactive", () => {
-    expect(shouldNotifyOsFilesSent({ isFocused: false, proactive: false })).toBe(true);
-    expect(shouldNotifyOsFilesSent({ isFocused: false, proactive: true })).toBe(true);
-  });
-
-  test("a proactive send notifies even while the window is focused", () => {
-    expect(shouldNotifyOsFilesSent({ isFocused: true, proactive: true })).toBe(true);
-  });
-
-  test("a normal (non-proactive) send does not notify while focused", () => {
-    expect(shouldNotifyOsFilesSent({ isFocused: true, proactive: false })).toBe(false);
   });
 });

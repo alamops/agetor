@@ -688,10 +688,15 @@ export function __dispatchChunkForTest(
  * from regular log events via `stream === "interaction"`) AND the app-level
  * global bus so the notification hook can alert the user.
  *
- * Exported and idempotent because `setBroadcaster`/`setResolvedBroadcaster`
- * install a single process-wide callback: any code that overrides it (e.g. a
- * test capturing raw broadcasts) would otherwise permanently detach the global
- * emit. Tests that need the real wiring can re-call this to restore it.
+ * Both bridges are installed exactly once, at module load (below). The
+ * resolved bridge emits the per-task `interaction_resolved` SSE event AND the
+ * global `interaction`/`resolved` event, which the webview tracker and the
+ * native-notification removal hooks rely on.
+ *
+ * `setBroadcaster`/`setResolvedBroadcaster` install a single process-wide
+ * callback and return the one they replaced, so a test that overrides them to
+ * capture raw broadcasts must restore the returned fn when done. Exported and
+ * idempotent so a test can also re-install the real wiring outright.
  */
 export function wireInteractionBroadcast(): void {
   setBroadcaster((req: AnyRequest) => {
@@ -746,23 +751,11 @@ export function wireInteractionBroadcast(): void {
   });
 }
 
+// The single install of both bridges. Nothing else in production may call
+// setBroadcaster/setResolvedBroadcaster: a second install REPLACES the first,
+// which is how the global `interaction`/`resolved` event once went missing
+// (a per-task-only resolved bridge used to be installed right after this).
 wireInteractionBroadcast();
-
-// Companion bridge for the *removal* side. Every answer*/cancel* path
-// in interactions.ts calls into this, so the run panel can drop the
-// card immediately instead of waiting for a refresh poll. Without
-// this, scraper auto-cancel and run-cancellation leave stale cards in
-// the panel (the existing additions-only SSE plumbing has no way to
-// signal "this is gone").
-setResolvedBroadcaster((res: InteractionResolved) => {
-  emit({
-    runId: res.runId,
-    taskId: res.taskId,
-    stream: "interaction_resolved",
-    data: JSON.stringify({ id: res.id, kind: res.kind }),
-    ts: Date.now(),
-  });
-});
 
 /**
  * Decide what to do with runs left in `status='running'` from a previous

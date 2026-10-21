@@ -122,7 +122,12 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
         "/events",
         (e) => {
           const n = notifyFor(e, task.id, { hidden });
-          if (n) osNotify(n.title, n.body);
+          if (n) {
+            void osNotify(
+              { title: n.title, body: n.body, taskId: task.id, kind: n.kind },
+              { notifyCore: (input) => client.notifyOS(input) },
+            );
+          }
         },
         { dataDir: flags.dataDir },
       );

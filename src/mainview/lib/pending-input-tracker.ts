@@ -41,6 +41,11 @@ export class PendingInputTracker {
     return false;
   }
 
+  /** Whether the task still has at least one live prompt. */
+  hasPending(taskId: string): boolean {
+    return (this.byTask.get(taskId)?.size ?? 0) > 0;
+  }
+
   /**
    * Forget all tracking for a task — used when its run reaches a terminal state
    * without every prompt emitting a resolved event (e.g. the agent process

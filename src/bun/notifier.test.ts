@@ -1,5 +1,16 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { resolveNotifier, buildNotifierArgs } from "./notifier.ts";
+import {
+  resolveNotifier,
+  buildNotifierArgs,
+  buildTaskNotifierPostArgs,
+  buildNotifierRemoveArgs,
+  buildNotifierListArgs,
+  resolveInstalledAppNotifier,
+  NOTIFIER_LIST_HEADER,
+  notifierListAcked,
+  notifierPostAcked,
+  notifierRemoveAcked,
+} from "./notifier.ts";
 
 describe("buildNotifierArgs", () => {
   test("title only → --title + always-present empty --message", () => {
@@ -59,6 +70,136 @@ describe("buildNotifierArgs", () => {
       "--silent",
     ]);
   });
+
+  test("full combo with the dedupe flags appends them after the original order", () => {
+    expect(
+      buildNotifierArgs({
+        title: "T",
+        body: "B",
+        subtitle: "S",
+        url: "agetor://task/abc",
+        silent: true,
+        id: "agetor.task.abc",
+        kind: "waiting",
+        urgency: "needs-you",
+        soundOver: ["quiet", "unknown"],
+      }),
+    ).toEqual([
+      "--title", "T",
+      "--message", "B",
+      "--subtitle", "S",
+      "--url", "agetor://task/abc",
+      "--silent",
+      "--id", "agetor.task.abc",
+      "--kind", "waiting",
+      "--urgency", "needs-you",
+      "--sound-over", "quiet",
+      "--sound-over", "unknown",
+    ]);
+  });
+
+  test("an empty soundOver adds no --sound-over", () => {
+    expect(buildNotifierArgs({ title: "T", id: "x", soundOver: [] })).toEqual([
+      "--title", "T", "--message", "", "--id", "x",
+    ]);
+  });
+});
+
+describe("buildTaskNotifierPostArgs", () => {
+  test("a needs-you kind sounds over quiet and unknown entries", () => {
+    expect(
+      buildTaskNotifierPostArgs({ title: "T", body: "B", taskId: "t1", kind: "blocked" }),
+    ).toEqual([
+      "--title", "T",
+      "--message", "B",
+      "--url", "agetor://task/t1",
+      "--id", "agetor.task.t1",
+      "--kind", "blocked",
+      "--urgency", "needs-you",
+      "--sound-over", "quiet",
+      "--sound-over", "unknown",
+    ]);
+  });
+
+  test("a quiet kind never sounds over a delivered entry", () => {
+    expect(
+      buildTaskNotifierPostArgs({ title: "T", subtitle: "S", silent: true, taskId: "t2", kind: "succeeded" }),
+    ).toEqual([
+      "--title", "T",
+      "--message", "",
+      "--subtitle", "S",
+      "--url", "agetor://task/t2",
+      "--silent",
+      "--id", "agetor.task.t2",
+      "--kind", "succeeded",
+      "--urgency", "quiet",
+    ]);
+  });
+
+  test("no kind stores no kind and posts as quiet", () => {
+    expect(buildTaskNotifierPostArgs({ title: "T", taskId: "t3" })).toEqual([
+      "--title", "T",
+      "--message", "",
+      "--url", "agetor://task/t3",
+      "--id", "agetor.task.t3",
+      "--urgency", "quiet",
+    ]);
+  });
+
+  test("the task id is percent-encoded in the url but verbatim in the id", () => {
+    const args = buildTaskNotifierPostArgs({ title: "T", taskId: "a/b" });
+    expect(args).toContain("agetor://task/a%2Fb");
+    expect(args).toContain("agetor.task.a/b");
+  });
+});
+
+describe("buildNotifierRemoveArgs / buildNotifierListArgs", () => {
+  test("unconditional remove targets the id and the old-style url", () => {
+    expect(buildNotifierRemoveArgs({ id: "agetor.task.t1", url: "agetor://task/t1" })).toEqual([
+      "--remove", "--id", "agetor.task.t1", "--url", "agetor://task/t1",
+    ]);
+  });
+
+  test("conditional remove adds one --if-kind per kind", () => {
+    expect(
+      buildNotifierRemoveArgs({ id: "agetor.task.t1", url: "agetor://task/t1", ifKinds: ["waiting", "blocked"] }),
+    ).toEqual([
+      "--remove", "--id", "agetor.task.t1", "--url", "agetor://task/t1",
+      "--if-kind", "waiting",
+      "--if-kind", "blocked",
+    ]);
+  });
+
+  test("list mode is a single flag", () => {
+    expect(buildNotifierListArgs()).toEqual(["--list"]);
+  });
+});
+
+describe("resolveInstalledAppNotifier", () => {
+  const ENV_VAR = "AGETOR_NOTIFIER_BIN";
+  let original: string | undefined;
+
+  beforeEach(() => {
+    original = process.env[ENV_VAR];
+  });
+  afterEach(() => {
+    if (original === undefined) delete process.env[ENV_VAR];
+    else process.env[ENV_VAR] = original;
+  });
+
+  test("the env override wins and is returned verbatim", () => {
+    process.env[ENV_VAR] = "/custom/notifier";
+    expect(resolveInstalledAppNotifier()).toBe("/custom/notifier");
+  });
+
+  test("without an override, resolves to the installed app's helper or null", () => {
+    delete process.env[ENV_VAR];
+    const r = resolveInstalledAppNotifier();
+    expect(
+      r === null ||
+        r === "/Applications/Agetor.app/Contents/Resources/app/bin/AgetorNotifier.app/Contents/MacOS/notifier",
+    ).toBe(true);
+  });
 });
 
 describe("resolveNotifier", () => {
@@ -94,5 +235,39 @@ describe("resolveNotifier", () => {
     expect(
       r === null || r.endsWith("AgetorNotifier.app/Contents/MacOS/notifier"),
     ).toBe(true);
+  });
+});
+
+describe("helper acks", () => {
+  test("list: the header must be the first line", () => {
+    expect(notifierListAcked(`${NOTIFIER_LIST_HEADER}\n`)).toBe(true);
+    expect(notifierListAcked(`${NOTIFIER_LIST_HEADER}\nagetor://task/a\n`)).toBe(true);
+    expect(notifierListAcked("")).toBe(false);
+    expect(notifierListAcked(`agetor://task/a\n${NOTIFIER_LIST_HEADER}\n`)).toBe(false);
+  });
+
+  test("remove: a `removed <n>` line", () => {
+    expect(notifierRemoveAcked("removed 0\n")).toBe(true);
+    expect(notifierRemoveAcked("removed 3\n")).toBe(true);
+    expect(notifierRemoveAcked("")).toBe(false);
+    expect(notifierRemoveAcked("removed\n")).toBe(false);
+  });
+
+  test("post: `posted <id>` for exactly the requested id", () => {
+    expect(notifierPostAcked("posted agetor.task.t1\n", "agetor.task.t1")).toBe(true);
+    expect(notifierPostAcked("posted 3F2504E0-4F89\n", "agetor.task.t1")).toBe(false);
+    expect(notifierPostAcked("", "agetor.task.t1")).toBe(false);
+  });
+
+  test("post: the ack may sit among other lines, but another task's id never counts", () => {
+    expect(notifierPostAcked("some log line\nposted agetor.task.t1\n", "agetor.task.t1")).toBe(true);
+    expect(notifierPostAcked("posted agetor.task.t10\n", "agetor.task.t1")).toBe(false);
+    expect(notifierPostAcked("posted agetor.task.t1-extra\n", "agetor.task.t1")).toBe(false);
+  });
+
+  test("remove: the ack line may follow other output, but a count must be a whole line", () => {
+    expect(notifierRemoveAcked("note\nremoved 2\n")).toBe(true);
+    expect(notifierRemoveAcked("removed 2 entries\n")).toBe(false);
+    expect(notifierRemoveAcked("not removed 2\n")).toBe(false);
   });
 });

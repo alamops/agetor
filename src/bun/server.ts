@@ -29,6 +29,8 @@ import {
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
+import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
+import { notificationTargetTaskId } from "./notification-hooks.ts";
 import { activeRunCount, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
 import { claudeConfigDirsToScan, claudeSessionLivenessCheckedAt, refreshClaudeSessionLiveness, scanClaudeSessions } from "./claude-session-scan.ts";
@@ -1111,14 +1113,21 @@ export interface ApiNative {
    *  as `openPath`/`openExternal`. */
   revealPath(p: string): boolean;
   openExternal(url: string): boolean;
+  /** Post an OS notification. With a `taskId` it is the task's one
+   *  Notification Center entry (posted through the AgetorNotifier helper under
+   *  a fixed per-task id, deep-linking to the task on click): a newer post
+   *  replaces it. `kind` sets its urgency, which drives the sound rule. */
   showNotification(n: {
     title: string;
     body?: string;
     subtitle?: string;
     silent?: boolean;
-    /** Task to deep-link to on click, e.g. via terminal-notifier's -open. */
     taskId?: string;
+    kind?: NotificationKind;
   }): void;
+  /** Remove a task's Notification Center entry — with `ifKinds`, only when its
+   *  stored kind is listed. Fire-and-forget; never asks for permission. */
+  removeTaskNotification(r: TaskNotificationRemoval): void;
   /** Raise + focus the app window. Returns `false` when there is no window to
    *  act on — never to report a failed native call, so callers can map `false`
    *  to "no window" without conflating it with a platform hiccup. Lives behind
@@ -1144,6 +1153,15 @@ const notAvailableHeadless = (req: Request) =>
 
 export function startApiServer(deps: { native?: ApiNative; hostname?: string } = {}) {
   const native = deps.native;
+  /** Best-effort removal of a task's OS notification; never affects a response. */
+  const removeTaskNotification = (taskId: string) => {
+    if (!native) return;
+    try {
+      native.removeTaskNotification({ taskId });
+    } catch (err) {
+      console.error("[agetor] removeTaskNotification failed:", err);
+    }
+  };
   const blockRouteEnabled = process.env.AGETOR_TEST_BLOCK_ROUTE === "1";
   const blockEventLoopRoute = authed(async (req: Request) => {
     const body = (await req.json().catch(() => ({}))) as { ms?: unknown };
@@ -5223,6 +5241,16 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if (!updated) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
+          // A manual move (drag, `agetor move`) emits no global `column` event,
+          // so the notification hooks never see a card leave `blocked` this
+          // way. Its reason-family OS entry goes with the block.
+          if (native && before.column === "blocked" && updated.column !== "blocked") {
+            try {
+              native.removeTaskNotification({ taskId: req.params.id, ifKinds: UNBLOCKED_REMOVAL_KINDS });
+            } catch (err) {
+              console.error("[agetor] removeTaskNotification failed:", err);
+            }
+          }
           // Mirror behavioural changes onto a live claude session via slash
           // commands so the conversation context survives a model/mode/effort
           // change. Agent changes wipe the session — different harness entirely.
@@ -5261,6 +5289,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           // large repos — opt this request out of idle timeout entirely.
           server.timeout(req, 0);
           await deleteTask(req.params.id);
+          // The task is gone, so is its notification (D6c). Its own id only:
+          // a step's entry is its parent's, and the parent outlives the step.
+          removeTaskNotification(req.params.id);
           return new Response(null, { status: 204, headers: corsHeaders(req) });
         }),
       },
@@ -5402,6 +5433,10 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if ("error" in result) {
             return json(result, { status: 400, headers: corsHeaders(req) });
           }
+          // Archived from any client → its notification goes (D6c). Own id
+          // only: a pipeline Restart's internal step archives never reach this
+          // route, and a step never owns an entry anyway.
+          removeTaskNotification(req.params.id);
           // Nest `teardown` as a sibling key rather than spreading its fields
           // onto the task, so it can never collide with an actual Task
           // column — the client only reads it when it explicitly asked for
@@ -6688,6 +6723,10 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       "/tasks/:id/seen": {
         POST: authed((req) => {
           const updated = tasks.markSeen(req.params.id);
+          // Opening the task (panel open/switch, "Mark as read") removes its
+          // OS notification (D6a). A step's entry belongs to its pipeline
+          // parent (D16).
+          if (updated) removeTaskNotification(notificationTargetTaskId(req.params.id));
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -7310,6 +7349,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             subtitle?: unknown;
             silent?: unknown;
             taskId?: unknown;
+            kind?: unknown;
           };
           const MAX_LEN = 256;
           const trunc = (v: unknown): string | undefined =>
@@ -7338,7 +7378,25 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             subtitle: trunc(body.subtitle),
             silent: Boolean(body.silent),
             taskId,
+            // An unknown kind is dropped (posts as quiet, stores no kind).
+            kind: isNotificationKind(body.kind) ? body.kind : undefined,
           });
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Removes a task's OS notification for the webview-only triggers: the
+      // pipeline run view opened, the window coming to the front with the
+      // task open (D6d), and an event arriving while the window is focused
+      // (D7). A step id maps to its pipeline parent, which owns the entry.
+      "/notifications/:taskId": {
+        DELETE: authed((req) => {
+          if (!native) return notAvailableHeadless(req);
+          const taskId = req.params.taskId;
+          if (!taskId || taskId.length > 512) {
+            return json({ error: "invalid task id" }, { status: 400, headers: corsHeaders(req) });
+          }
+          removeTaskNotification(notificationTargetTaskId(taskId));
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
