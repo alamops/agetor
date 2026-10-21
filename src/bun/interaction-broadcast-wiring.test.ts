@@ -1,8 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { rmTestDataDir } from "./test-data-dir.ts";
 
 // Pins the PRODUCTION interaction-broadcast wiring from a fresh process, with
 // nothing re-wired: importing orchestrator.ts must leave a resolved bridge
@@ -14,8 +13,11 @@ import { rmTestDataDir } from "./test-data-dir.ts";
 const repoRoot = path.resolve(import.meta.dir, "..", "..");
 const dataDir = mkdtempSync(path.join(tmpdir(), "agetor-broadcast-wiring-"));
 
+// Only the child process ever opens agetor.sqlite in this dir (it has exited by
+// the time afterAll runs), so a plain rm is safe — rmTestDataDir would refuse
+// because the child's sqlite file is there, and leak the dir.
 afterAll(() => {
-  rmTestDataDir(dataDir);
+  rmSync(dataDir, { recursive: true, force: true });
 });
 
 const SCRIPT = `
