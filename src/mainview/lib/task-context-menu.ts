@@ -100,7 +100,7 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   } else {
     entries.push({ action: "open", label: "Open details", group: "primary" });
   }
-  if (!archived && !awaiting && !active && !openable) {
+  if (!archived && !awaiting && !active && !openable && !task.importedClaude) {
     entries.push({ action: "start", label: "Run", group: "primary" });
   }
   if (stoppable && !archived) {

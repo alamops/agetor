@@ -32,6 +32,9 @@ import { beginLagLabel } from "./event-loop-lag.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
 import { activeRunCount, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
+import { claudeConfigDirsToScan, claudeSessionLivenessCheckedAt, refreshClaudeSessionLiveness, scanClaudeSessions } from "./claude-session-scan.ts";
+import { claudeSessionScanOptions, flushPendingClaudeSessionsNotice } from "./claude-session-launch.ts";
 import {
   compactDatabase,
   configuredRetentionDays,
@@ -5311,6 +5314,79 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           }
           server.timeout(req, 0);
           const result = await startTask(req.params.id);
+          const status = "error" in result && result.code === "imported-session" ? 409 : 400;
+          return "error" in result
+            ? json(result, { status, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/claude-session/retry": {
+        POST: authed(async (req) => {
+          // The handler waits until the backfill settles so a failure is the
+          // response, not a later status the click never observes. A large
+          // transcript can outlast the idle timeout.
+          server.timeout(req, 0);
+          const result = await retryImport(req.params.id, claudeSessionScanOptions());
+          return "error" in result
+            ? json(result, { status: tasks.get(req.params.id) ? 400 : 404, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/claude-sessions": {
+        GET: authed(async (req) => {
+          // A first scan reads every transcript Agetor does not own; it can
+          // outlast the idle timeout on a large ~/.claude.
+          server.timeout(req, 0);
+          const opts = claudeSessionScanOptions();
+          const sessions = await scanClaudeSessions(opts);
+          const livenessCheckedAt = claudeSessionLivenessCheckedAt(claudeConfigDirsToScan(opts));
+          return json({ sessions, livenessCheckedAt }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/claude-sessions/recheck": {
+        POST: authed(async (req) => {
+          // `claude agents --json` per config dir (up to 8 s each), then a scan.
+          server.timeout(req, 0);
+          const opts = claudeSessionScanOptions();
+          const configDirs = claudeConfigDirsToScan(opts);
+          await refreshClaudeSessionLiveness(configDirs, process.env, opts.harnesses, opts.homeDir);
+          const sessions = await scanClaudeSessions(opts);
+          const livenessCheckedAt = claudeSessionLivenessCheckedAt(configDirs);
+          return json({ sessions, livenessCheckedAt }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/claude-sessions/import": {
+        POST: authed(async (req) => {
+          // Finding and replaying transcripts can outlast the idle timeout.
+          server.timeout(req, 0);
+          const body = await req.json().catch(() => null) as { ids?: unknown } | null;
+          if (!body || !Array.isArray(body.ids) || body.ids.some((id) => typeof id !== "string")) {
+            return json({ error: "ids must be a string array" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await importClaudeSessions(body.ids, claudeSessionScanOptions());
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/claude-sessions/checkout": {
+        POST: authed(async (req) => {
+          server.timeout(req, 0);
+          const body = await req.json().catch(() => null) as { sessionId?: unknown; branch?: unknown } | null;
+          if (!body || typeof body.sessionId !== "string" || !body.sessionId) {
+            return json({ error: "sessionId is required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.branch !== undefined && (typeof body.branch !== "string" || !body.branch)) {
+            return json({ error: "branch must be a non-empty string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await checkoutSessionBranch(
+            body.sessionId,
+            claudeSessionScanOptions(),
+            typeof body.branch === "string" ? body.branch : undefined,
+          );
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(result, { headers: corsHeaders(req) });
@@ -7365,6 +7441,14 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             const pendingTaskId = consumePendingOpenTask();
             if (pendingTaskId) {
               send({ type: "open_task", taskId: pendingTaskId, ts: Date.now() });
+            }
+            // Same for the boot-time "Claude Code sessions found" notice: the
+            // launch scan usually finishes before the webview connects.
+            try {
+              flushPendingClaudeSessionsNotice(send);
+            } catch {
+              // Never let a db hiccup stop `start` before the abort handler below
+              // is registered — see `send` above for why that leaks.
             }
             req.signal.addEventListener("abort", () => {
               clearInterval(ping);

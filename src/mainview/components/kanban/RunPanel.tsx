@@ -945,6 +945,11 @@ function RunPanelBody({
     setResumeBusy(false);
     setCancelAutoBusy(false);
     setGitStatus(null);
+    setImportRetryBusy(false);
+    setImportRetryError(null);
+    setImportRetryOk(false);
+    setImportedBranchBusy(false);
+    setImportedBranchError(null);
     // `editingId` (the backlog tray's inline-editor state) lives inside the
     // `BacklogTray` child component, not here — it's reset by keying that
     // component on `task.id` at its call site below instead (a fresh mount
@@ -2202,7 +2207,7 @@ function RunPanelBody({
   // current response. The message folds into the active run (recorded in the
   // conversation stream, no new run row), so the task stays a single in-flight
   // run rather than stacking queued rows that could strand "running".
-  const canSend = !!resumableRunId;
+  const canSend = !!resumableRunId && (!task.importedClaude || task.importedClaude.status === "ready");
   // While a native modal (question / plan / permission prompt) is pending,
   // the agent is blocked on it — a typed message would go astray instead of
   // reaching the agent (and the run would hang "working"). This gate is
@@ -2657,6 +2662,20 @@ function RunPanelBody({
   // polling effect keeps this in sync with the actual git state for as
   // long as the panel is mounted.
   const [gitStatus, setGitStatus] = useState<TaskGitStatus | null>(null);
+  const [importedBranchBusy, setImportedBranchBusy] = useState(false);
+  const [importedBranchError, setImportedBranchError] = useState<string | null>(null);
+  const [importRetryBusy, setImportRetryBusy] = useState(false);
+  const [importRetryError, setImportRetryError] = useState<string | null>(null);
+  /** True after a retry response of ok, until the task prop leaves `failed`.
+   *  The prop still carries the old error until the board refresh lands. */
+  const [importRetryOk, setImportRetryOk] = useState(false);
+  useEffect(() => {
+    setImportRetryOk(false);
+    // A transport abort can land after the server has already left `failed`.
+    // The next status is the source of truth, so the stale error does not
+    // stay on a transcript that finished.
+    setImportRetryError(null);
+  }, [task.importedClaude?.status]);
   const [sendDragging, setSendDragging] = useState(false);
   // `/`-command, skill autocomplete, and saved-prompts loading for the send
   // field render through `PromptComposer`'s own `useAgentCapabilities`/
@@ -3258,7 +3277,7 @@ function RunPanelBody({
   // made. Reuses the same `sendRunInput` plumbing as a typed message so the
   // resulting turn shows up as a normal run row with streamed events.
   const sendCommitPush = async () => {
-    if (!resumableRunId || sending) return;
+    if (!canSend || !resumableRunId || sending) return;
     // Nomenclature-aware: the commit subject is prefixed with the task's branch
     // prefix and the push hint names the real branch. Shared with the CLI's
     // `agetor commit` / dashboard `c` so every surface sends the same text.
@@ -3329,10 +3348,66 @@ function RunPanelBody({
   // Live checkout vs the branch agetor created (5 s git-status poll). Drift is
   // tolerated, never corrected — the header and details say where it is.
   const branchDrift = driftOf(task.branch ?? null, gitStatus?.branch);
+  const importedGitBranch = task.importedClaude?.gitBranch ?? null;
+  const folderBranch = gitStatus && !gitStatus.ignored ? gitStatus.branch : null;
+  // The import-time branch is only a hint until the session continues here.
+  // After an Agetor turn the folder's branch is whatever that turn left, so
+  // the banner would keep naming a branch the session has moved past.
+  const continuedInAgetor = runs.some((r) => r.origin !== "imported");
+  const importedBranchMismatch = runsLoaded
+    && !continuedInAgetor
+    && !!importedGitBranch
+    && !!folderBranch
+    && importedGitBranch !== folderBranch;
   const resolveConflictsSentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => {
     if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
   }, []);
+  const switchImportedBranch = async () => {
+    const sessionId = task.importedClaude?.sessionId;
+    // Check out the branch this banner names, not the transcript's latest.
+    const branch = importedGitBranch;
+    if (!sessionId || !branch || importedBranchBusy) return;
+    const taskId = task.id;
+    setImportedBranchBusy(true);
+    setImportedBranchError(null);
+    try {
+      const res = await api.checkoutClaudeSession(sessionId, branch);
+      if (currentTaskIdRef.current !== taskId) return;
+      if ("error" in res) {
+        setImportedBranchError(res.error);
+        return;
+      }
+      // The checkout succeeded; a failed status refresh is left to the 5s
+      // git-status poll rather than reported as a failed switch.
+      try {
+        const status = await api.getTaskGitStatus(taskId);
+        if (currentTaskIdRef.current === taskId) setGitStatus(status);
+      } catch {
+        // The poll reconciles.
+      }
+    } catch (err) {
+      if (currentTaskIdRef.current !== taskId) return;
+      setImportedBranchError(err instanceof ApiError ? err.message : "Couldn't switch branch");
+    } finally {
+      if (currentTaskIdRef.current === taskId) setImportedBranchBusy(false);
+    }
+  };
+  const retryImportedHistory = async () => {
+    if (importRetryBusy) return;
+    const taskId = task.id;
+    setImportRetryBusy(true);
+    setImportRetryError(null);
+    try {
+      await api.retryClaudeSessionImport(taskId);
+      if (currentTaskIdRef.current === taskId) setImportRetryOk(true);
+    } catch (err) {
+      if (currentTaskIdRef.current !== taskId) return;
+      setImportRetryError(err instanceof ApiError ? err.message : "Couldn't retry the import");
+    } finally {
+      if (currentTaskIdRef.current === taskId) setImportRetryBusy(false);
+    }
+  };
   const sendResolveConflicts = async () => {
     // `resolveConflictsSent` in the guard turns the 5s "Sent to agent"
     // confirmation window into a lockout, not just a label — otherwise the
@@ -3661,6 +3736,50 @@ function RunPanelBody({
           </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
+        {task.importedClaude && (
+          <div className="mt-1 space-y-1 text-xs" data-testid="imported-claude-status">
+            {importedBranchMismatch && (
+              <p className="text-warning" data-testid="imported-claude-branch">
+                This session was on <span className="font-mono">{importedGitBranch}</span>, folder is on{" "}
+                <span className="font-mono">{folderBranch}</span>.
+                <button
+                  type="button"
+                  className="ml-2 underline disabled:opacity-50"
+                  data-testid="imported-claude-switch"
+                  disabled={importedBranchBusy}
+                  onClick={() => { void switchImportedBranch(); }}
+                >
+                  Switch to {importedGitBranch}
+                </button>
+              </p>
+            )}
+            {importedBranchError && (
+              <p className="text-destructive" data-testid="imported-claude-switch-error">{importedBranchError}</p>
+            )}
+            {task.importedClaude.status === "importing" && (
+              <p className="text-muted-foreground">Importing history…</p>
+            )}
+            {task.importedClaude.status === "failed" && !importRetryOk && (
+              <p className="text-destructive">
+                {importRetryBusy
+                  ? "Retrying…"
+                  : (importRetryError ?? task.importedClaude.error ?? "Import failed")}
+                <button
+                  type="button"
+                  className="ml-2 underline disabled:opacity-50"
+                  data-testid="imported-claude-retry"
+                  disabled={importRetryBusy}
+                  onClick={() => { void retryImportedHistory(); }}
+                >
+                  Retry
+                </button>
+              </p>
+            )}
+            {importRetryError && task.importedClaude.status !== "failed" && (
+              <p className="text-destructive" data-testid="imported-claude-retry-error">{importRetryError}</p>
+            )}
+          </div>
+        )}
         <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
           <span className="truncate">
             {task.agent} · {task.column}
@@ -4181,8 +4300,10 @@ function RunPanelBody({
                 )}
                 {/* Commit & push keys on live git state (uncommitted changes or
                     unpushed commits), not run status — see `shouldOfferCommitPush`.
-                    Can surface even mid-run (a background agent dirtied the tree). */}
-                {shouldOfferCommitPush(gitStatus) && !sending && (
+                    Can surface even mid-run (a background agent dirtied the tree).
+                    Hidden while `!canSend` — e.g. an imported session still
+                    importing, or whose import failed — since the send would be refused. */}
+                {canSend && shouldOfferCommitPush(gitStatus) && !sending && (
                   <Button
                     size="sm"
                     variant="secondary"
@@ -4976,6 +5097,15 @@ function RunsList({
               auto
             </Badge>
           )}
+          {latest.origin === "imported" && (
+            <Badge
+              variant="secondary"
+              data-testid="run-origin-imported"
+              className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+            >
+              Imported
+            </Badge>
+          )}
           <span className="truncate">
             Run #{ordinalFor(latest.id)} · {formatTime(latest.startedAt)}
           </span>
@@ -5016,6 +5146,14 @@ function RunsList({
                     title={CONTINUATION_BADGE_TITLE}
                   >
                     auto
+                  </Badge>
+                )}
+                {r.origin === "imported" && (
+                  <Badge
+                    variant="secondary"
+                    className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+                  >
+                    Imported
                   </Badge>
                 )}
                 <span className="truncate text-muted-foreground">
