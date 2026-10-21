@@ -971,9 +971,11 @@ function AppInner() {
   // step's panel also drops the parent's slot (D16): a step's toasts are
   // retargeted at (and keyed by) the pipeline parent, so dismissing by the
   // step id alone would leave one up over the very panel it is about.
-  // Keyed on the open task's id only: the toast helpers already skip the
-  // in-app toast for the selected task (`isSelected`), so firing on open or
-  // switch is enough — nothing new can land in the slot while it stays open.
+  // Keyed on the open task's id only: most toast helpers skip the in-app toast
+  // for the selected task (`isSelected`), so firing on open or switch is enough
+  // for them. Two kinds can still land while the panel stays open — `files-sent`
+  // with the window unfocused, and `send-failed`, which is ungated because its
+  // toast is the only place that failure shows — and both are left up on purpose.
   useEffect(() => {
     if (!selected) return;
     dismissTaskToast(selected.id);
