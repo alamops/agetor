@@ -34,16 +34,71 @@ const {
   jsonlPathFor,
   mapJsonlEventToChunks,
   parseSessionActivityLine,
+  pinClaudeConfigDir,
   rebuildEventsFromJsonl,
+  replayJsonlLines,
   sessionNameFor,
   toClaudeModeString,
 } = await import("./claude-tmux.ts");
 
 test("jsonlPathFor with home=null falls back to the system homedir", () => {
-  const p = jsonlPathFor("/a/b", "session-uuid", null);
-  expect(p.startsWith(homedir())).toBe(true);
-  expect(p.endsWith("/session-uuid.jsonl")).toBe(true);
-  expect(p).toContain(encodeProjectPath("/a/b"));
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.CLAUDE_CONFIG_DIR;
+  try {
+    const p = jsonlPathFor("/a/b", "session-uuid", null);
+    expect(p.startsWith(homedir())).toBe(true);
+    expect(p).toBe(`${homedir()}/.claude/projects/${encodeProjectPath("/a/b")}/session-uuid.jsonl`);
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+});
+
+test("jsonlPathFor with home=null honors CLAUDE_CONFIG_DIR", () => {
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  const dir = mkdtempSync(path.join(tmpdir(), "claude-config-"));
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  try {
+    const p = jsonlPathFor("/a/b", "session-uuid", null);
+    expect(p).toBe(`${dir}/projects/${encodeProjectPath("/a/b")}/session-uuid.jsonl`);
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+});
+
+test("pinClaudeConfigDir gives a home-less session this process's config dir, or unsets the tmux server's", () => {
+  const argv = ["claude", "--model", "claude-opus-5-5"];
+  // This process has one: pass it explicitly so the tmux server's copy can't win.
+  expect(pinClaudeConfigDir(argv, { A: "1" }, null, { CLAUDE_CONFIG_DIR: "/cfg/work" })).toEqual({
+    argv,
+    env: { A: "1", CLAUDE_CONFIG_DIR: "/cfg/work" },
+  });
+  // It has none: drop whatever the server captured, so claude uses ~/.claude
+  // like jsonlPathFor(null) does. Never set it to ~/.claude explicitly.
+  expect(pinClaudeConfigDir(argv, { A: "1" }, null, {})).toEqual({
+    argv: ["/usr/bin/env", "-u", "CLAUDE_CONFIG_DIR", ...argv],
+    env: { A: "1" },
+  });
+  // A harness home (already in env via harnessEnv) and a harness env map are left alone.
+  expect(pinClaudeConfigDir(argv, { CLAUDE_CONFIG_DIR: "/h" }, "/h", {})).toEqual({
+    argv,
+    env: { CLAUDE_CONFIG_DIR: "/h" },
+  });
+  // A home always wins over a harness env map naming another dir, and is
+  // passed even when the env omits it — the tailer reads `<home>/projects`.
+  expect(pinClaudeConfigDir(argv, { CLAUDE_CONFIG_DIR: "/other" }, "/h", { CLAUDE_CONFIG_DIR: "/cfg" })).toEqual({
+    argv,
+    env: { CLAUDE_CONFIG_DIR: "/h" },
+  });
+  expect(pinClaudeConfigDir(argv, { A: "1" }, "/h", {})).toEqual({
+    argv,
+    env: { A: "1", CLAUDE_CONFIG_DIR: "/h" },
+  });
+  expect(pinClaudeConfigDir(argv, { CLAUDE_CONFIG_DIR: "/custom" }, null, { CLAUDE_CONFIG_DIR: "/cfg" })).toEqual({
+    argv,
+    env: { CLAUDE_CONFIG_DIR: "/custom" },
+  });
 });
 
 test("jsonlPathFor honors a per-harness CLAUDE_CONFIG_DIR override", () => {
@@ -1072,6 +1127,66 @@ test("dispatchLine: already-seen end_turn still fires onEndOfTurn (reattach + cr
   // Prior process already emitted "turn complete" — no duplicate.
   expect(emitted.some((e) => e.data === "turn complete")).toBe(false);
   __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: historical end_turn outside currentRunLineUuids does not fire onEndOfTurn", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-end-turn-other-run";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  let endOfTurnFired = false;
+  state.onEndOfTurn = () => { endOfTurnFired = true; };
+  state.seenLineUuids.add("hist-end");
+  state.currentRunLineUuids = new Set(["live-uuid"]);
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant",
+    uuid: "hist-end",
+    message: { id: "msg-H", role: "assistant", content: [{ type: "text", text: "old" }], stop_reason: "end_turn" },
+  }));
+  __forTest.dispatchLine(state, JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 10 }));
+  expect(endOfTurnFired).toBe(false);
+  expect(state.pendingEndTurn).toBeNull();
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: end_turn uuid in currentRunLineUuids still fires onEndOfTurn", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-end-turn-this-run";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  let endOfTurnFired = false;
+  state.onEndOfTurn = () => { endOfTurnFired = true; };
+  state.seenLineUuids.add("live-end");
+  state.currentRunLineUuids = new Set(["live-end"]);
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant",
+    uuid: "live-end",
+    message: { id: "msg-L", role: "assistant", content: [{ type: "text", text: "now" }], stop_reason: "end_turn" },
+  }));
+  expect(endOfTurnFired).toBe(false);
+  __forTest.dispatchLine(state, JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 10 }));
+  expect(endOfTurnFired).toBe(true);
+  __forTest.uninstallSession(taskId);
+});
+
+test("replayJsonlLines yields and matches the sync rebuild", async () => {
+  const lines = [
+    JSON.stringify({ type: "assistant", uuid: "u1",
+      message: { id: "msg-A", role: "assistant", content: [{ type: "text", text: "hello" }], stop_reason: "end_turn" } }),
+    JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1000 }),
+  ].join("\n");
+  const sync: { stream: string; data: string }[] = [];
+  rebuildEventsFromJsonl(lines, (stream, data) => sync.push({ stream, data }));
+  const coop: { stream: string; data: string }[] = [];
+  const queue = lines.split("\n").map((line) => ({ line, bytes: Buffer.byteLength(line) + 1 }));
+  const pending = replayJsonlLines(() => queue.shift() ?? null, (stream, data) => coop.push({ stream, data }), { sliceMs: 0 });
+  // sliceMs 0 awaits setImmediate after the first line. A microtask runs
+  // before that macrotask, so the replay is still in progress here.
+  let midCount = 0;
+  await new Promise<void>((r) => queueMicrotask(() => { midCount = coop.length; r(); }));
+  await pending;
+  expect(midCount).toBeGreaterThan(0);
+  expect(midCount).toBeLessThan(sync.length);
+  expect(coop).toEqual(sync);
+  expect(coop.filter((r) => r.data === "turn complete")).toHaveLength(1);
 });
 
 test("dispatchLine: end_turn staging — tool_use line stages but tool_result cancels, slot never popped", async () => {

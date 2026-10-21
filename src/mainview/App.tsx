@@ -14,6 +14,7 @@ import {
   GitBranch,
   GitCompare,
   GitPullRequest,
+  Import,
   Mail,
   MailOpen,
   Play,
@@ -55,6 +56,7 @@ import { CoreBusyBanner } from "@/components/CoreBusyBanner";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
 import { UpdateBanner } from "@/components/updater/UpdateBanner";
 import { WorktreesDialog } from "@/components/worktrees/WorktreesDialog";
+import { ImportClaudeSessionsDialog } from "@/components/kanban/ImportClaudeSessionsDialog";
 import { WelcomeDialog } from "@/components/onboarding/WelcomeDialog";
 import { OnboardingChecklist } from "@/components/onboarding/OnboardingChecklist";
 import type { UpdateSnapshot } from "@/lib/api";
@@ -345,6 +347,7 @@ function AppInner() {
   // see `GitHubItemDetailPrefill`'s doc comment in GitHubDialog.tsx.
   const [githubItemDetailPrefill, setGithubItemDetailPrefill] = useState<GitHubItemDetailPrefill | null>(null);
   const [worktreesOpen, setWorktreesOpen] = useState(false);
+  const [importSessionsOpen, setImportSessionsOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
   const [homeDir, setHomeDir] = useState<string>("");
@@ -1119,6 +1122,17 @@ function AppInner() {
     const cancel = api.subscribeAppEvents((ev) => {
       if (ev.type === "harness_usage") {
         setUsage((prev) => ({ ...prev, [ev.quota.harnessId]: ev.quota }));
+        return;
+      }
+      if (ev.type === "claude_sessions_found") {
+        const n = ev.count;
+        toast(`${n} Claude Code session${n === 1 ? "" : "s"} found outside Agetor — Review`, {
+          action: { label: "Review", onClick: () => setImportSessionsOpen(true) },
+        });
+        return;
+      }
+      if (ev.type === "claude_session_import") {
+        void refresh();
         return;
       }
       if (ev.type === "clone_progress") {
@@ -2280,6 +2294,16 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           <Button
             variant="ghost"
             size="icon"
+            onClick={() => setImportSessionsOpen(true)}
+            aria-label="Import Claude Code sessions"
+            title="Import Claude Code sessions"
+            data-testid="import-claude-sessions-open"
+          >
+            <Import className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
             onClick={() => setWorktreesOpen(true)}
             aria-label="Worktrees"
             title="Worktrees"
@@ -2615,6 +2639,11 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           closeGithubDialog();
           setSettingsOpen(true);
         }}
+      />
+      <ImportClaudeSessionsDialog
+        open={importSessionsOpen}
+        onClose={() => setImportSessionsOpen(false)}
+        onImported={() => { void refresh(); }}
       />
       <WorktreesDialog
         open={worktreesOpen}

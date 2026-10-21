@@ -19,6 +19,9 @@ export async function cmdStart(args: string[], flags: Flags): Promise<void> {
   if (task.archivedAt != null) {
     throw new Error("task is archived — unarchive it in the app before running");
   }
+  if (task.importedClaude) {
+    throw new Error("imported Claude session — send a message to continue");
+  }
   // Match the dashboard Run button: only a not-yet-run (or failed/cancelled)
   // task is runnable. Active tasks are Stop; finished tasks are continued by
   // sending a message (the app resumes rather than starting a fresh run).

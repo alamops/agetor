@@ -160,6 +160,9 @@ function makeSlowNewSessionTmuxBin(sleepMs: number): { bin: string; dir: string 
 async function runSpawnWithStubTmux(opts: {
   newSessionSleepMs: number;
   warnThresholdMs: number;
+  /** Caller env (a harness `env` map); its `CLAUDE_CONFIG_DIR`, if any, is
+   *  where the JSONL is pre-created. */
+  env?: Record<string, string>;
 }): Promise<Chunk[]> {
   const savedTmuxBin = process.env.AGETOR_TMUX_BIN;
   const prevThreshold = setSlowLaunchWarnMs(opts.warnThresholdMs);
@@ -169,7 +172,7 @@ async function runSpawnWithStubTmux(opts: {
   const taskId = `task-slow-launch-${randomUUID()}`;
   const sessionId = randomUUID();
   const cwd = mkdtempSync(path.join(tmpdir(), "agetor-slow-launch-cwd-"));
-  const jsonlPath = jsonlPathFor(cwd, sessionId, null);
+  const jsonlPath = jsonlPathFor(cwd, sessionId, opts.env?.CLAUDE_CONFIG_DIR ?? null);
   mkdirSync(path.dirname(jsonlPath), { recursive: true });
   writeFileSync(jsonlPath, "");
 
@@ -178,7 +181,7 @@ async function runSpawnWithStubTmux(opts: {
     const agent = await spawnClaudeViaTmux({
       taskId,
       argv: ["claude", "--session-id", sessionId, "hello"],
-      env: {},
+      env: opts.env ?? {},
       cwd,
       onChunk: (stream, data) => {
         chunks.push({ stream, data });
@@ -251,4 +254,19 @@ test("spawnClaudeViaTmux does not emit a slow-launch breadcrumb when the launch 
   // Sanity: the spawn itself still completed normally (ready chunk present)
   // — the negative assertion above isn't just "nothing happened at all".
   expect(readyIdx).toBeGreaterThanOrEqual(0);
+});
+
+test("spawnClaudeViaTmux tails the CLAUDE_CONFIG_DIR a home-less harness's env map names", async () => {
+  const configDir = mkdtempSync(path.join(tmpdir(), "agetor-slow-launch-cfg-"));
+  try {
+    const chunks = await runSpawnWithStubTmux({
+      newSessionSleepMs: 0,
+      warnThresholdMs: 5_000_000,
+      env: { CLAUDE_CONFIG_DIR: configDir },
+    });
+    const ready = chunks.find((c) => c.stream === "status" && c.data.includes("ready (jsonl:"));
+    expect(ready?.data).toContain(path.join(configDir, "projects"));
+  } finally {
+    rmSync(configDir, { recursive: true, force: true });
+  }
 });

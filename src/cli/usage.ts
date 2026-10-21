@@ -341,6 +341,14 @@ export const USAGE: Record<string, string> = {
   by a background pass ('agetor compact' then returns the freed space to disk).
   0, false, no, none and disabled also mean off; any other value is refused.`,
 
+  sessions: `usage: agetor sessions [ls | import [id…]] [--dry-run] [--yes]
+
+  List Claude Code sessions started outside Agetor, or import them as tasks.
+  With no subcommand, lists. import asks in a terminal; --yes skips the
+  question and is required when not in a terminal. --dry-run prints the
+  rows and imports nothing. A folder whose path is too long to import
+  prints "${"Folder path is too long to import yet"}" and is not imported.`,
+
   compact: `usage: agetor compact [--yes|-y] [--json]
 
   Compact the core's SQLite database (VACUUM) to give freed pages back to the

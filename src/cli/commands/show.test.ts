@@ -105,3 +105,19 @@ test("show escapes control characters in branch names", async () => {
   await cmdShow(["abcdefgh"], flags);
   expect(outputs.some((l) => l.includes("checkout: x\\u001b[31m"))).toBe(true);
 });
+
+test("show prints an imported Claude session", async () => {
+  currentClient = fakeClient(makeTask({
+    importedClaude: {
+      sessionId: "sess-1",
+      gitBranch: "main",
+      importedAt: 1,
+      configDir: "/tmp/claude",
+      status: "ready",
+      backfillOffset: 0,
+      error: null,
+    },
+  }));
+  await cmdShow(["abcdefgh"], flags);
+  expect(outputs).toContain("  imported: sess-1 (on main, ready)");
+});

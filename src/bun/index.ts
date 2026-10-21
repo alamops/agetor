@@ -6,6 +6,7 @@ import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts
 import { DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import { startClaudeSessionLaunchScan } from "./claude-session-launch.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
 import { startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
 import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
@@ -453,6 +454,20 @@ writeCoreCreds(
 // up and restore/seed work has settled), then every 24 h; each fire reads the
 // preference fresh. Also re-armed on demand by `PUT /preferences/...`.
 scheduleRetention();
+
+// Claude sessions started outside Agetor (docs/plans/import-claude-code-sessions.md).
+// Scheduled only now that this process owns the API port: during a handoff
+// from a CLI daemon, `await probeLiveCore` above yields while the daemon may
+// still be backfilling the same import, and a process that fails to bind
+// exits. Deferred a tick so it never blocks the window coming up. The scan
+// toasts when its preference is on (holding the notice until the webview
+// connects); an import left in `importing` resumes either way. A thrown scan
+// is logged inside startClaudeSessionLaunchScan.
+setTimeout(() => {
+  startClaudeSessionLaunchScan().catch((err) => {
+    console.error("[agetor] claude session launch scan failed:", err);
+  });
+}, 0);
 
 // Warn the user before quitting when runs are still active. Electrobun's
 // `before-quit` event fires synchronously from Utils.quit() and reads

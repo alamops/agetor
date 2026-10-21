@@ -19,6 +19,7 @@ import {
 import { daemonLog } from "./daemon-log.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
+import { resumeIncompleteImports } from "./claude-session-import.ts";
 
 /**
  * Headless Agetor core — the same Bun server + orchestrator the desktop app
@@ -255,6 +256,20 @@ export async function runDaemon(): Promise<void> {
     );
     process.exit(1);
   }
+
+  // The desktop process resumes a crashed Claude import from its launch scan.
+  // This process never runs that scan, so resume here too — otherwise a task
+  // left `importing` stays unable to Send. Scheduled only after the API binds:
+  // a process that fails to bind and exits after probing the live core must
+  // not start backfill. Deferred so it does not block the listener coming up;
+  // unref'd so a quiet daemon can still idle-shut. The next boot continues
+  // from the stored offset.
+  const importResumeTimer = setTimeout(() => {
+    resumeIncompleteImports().catch((err) => {
+      daemonLog(`claude session import resume failed: ${(err as Error)?.message ?? String(err)}`);
+    });
+  }, 0);
+  importResumeTimer.unref();
 
   // Archived-history retention: first pass ~90 s after boot (after the API is
   // up and restore/seed work has settled), then every 24 h; each fire reads the

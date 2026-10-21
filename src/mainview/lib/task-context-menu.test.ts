@@ -565,3 +565,19 @@ describe("buildTaskContextMenu", () => {
     });
   });
 });
+
+test("an imported Claude session does not offer Run", () => {
+  const entries = buildTaskContextMenu(makeTask({
+    importedClaude: {
+      sessionId: "sess",
+      gitBranch: "main",
+      importedAt: 1,
+      configDir: "/tmp/claude",
+      status: "ready",
+      backfillOffset: 0,
+      error: null,
+    },
+  }), { isOpen: false });
+  expect(actions(entries)).not.toContain("start");
+  expect(actions(entries)).toContain("open");
+});

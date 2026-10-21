@@ -27,6 +27,13 @@ export function subscribeAppEvents(fn: Listener): () => void {
   return () => listeners.delete(fn);
 }
 
+/** True while at least one `/app/events` client is connected. A boot-time
+ *  notice sent with no listener reaches nobody — `/app/events` replays
+ *  nothing — so callers that must not lose one check this first. */
+export function hasAppEventListeners(): boolean {
+  return listeners.size > 0;
+}
+
 export function broadcastAppEvent(e: AppEvent): void {
   for (const fn of listeners) fn(e);
 }
