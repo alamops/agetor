@@ -18,8 +18,9 @@
 //   notifier --list
 //   notifier                      # no args: click relaunch, waits for didReceive
 // Mode order: --list, --remove, post (a --title was given), else click relaunch.
-// Exit codes: 0 ok · 1 remove/list safety timeout · 2 post permission denied or
-// timed out · 64 usage (--remove without --id).
+// Exit codes: 0 ok · 1 remove/list safety timeout, or a post the system refused
+// to add · 2 post permission denied or timed out · 64 usage (--remove without
+// --id).
 // Stdout acks (src/bun/notifier.ts): a post prints `posted <identifier>`,
 // --remove prints `removed <n>`, --list starts with `agetor-notifier list`. A
 // helper that predates these modes prints none of them, which is how agetor
@@ -211,7 +212,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     if !info.isEmpty { content.userInfo = info }
 
     let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
-    center.add(request) { _ in
+    center.add(request) { error in
+      if let error {
+        // Nothing reached Notification Center: no `posted` ack, and exit 1 (not
+        // 2, which means permission denied) so agetor falls back to a plain
+        // notification instead of assuming this one was shown.
+        let msg = "AgetorNotifier: failed to post notification: \(error)\n"
+        FileHandle.standardError.write(Data(msg.utf8))
+        exit(1)
+      }
       FileHandle.standardOutput.write(Data("posted \(identifier)\n".utf8))
       // Delivered to the system; the helper no longer needs to run.
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exit(0) }
