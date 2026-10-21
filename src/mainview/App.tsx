@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import {
@@ -47,6 +47,7 @@ import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { useAgentProfiles } from "@/lib/agent-profiles";
 import { pipelineAttentionStepTask, usePipelines } from "@/lib/pipelines";
+import { discardBoardDeparture, recordBoardDeparture, restoreBoardScroll, saveBoardScroll } from "@/lib/board-scroll";
 import { PipelineEditor, PipelinesPage, PipelineRunView } from "@/components/pipelines";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { FontSizeProvider, useFontSize } from "@/components/font-size-provider";
@@ -479,9 +480,15 @@ function AppInner() {
    *  deliberate: RunPanel's own "Open pipeline" strip button lands here,
    *  and must reveal the run view that step panel is covering. The
    *  step-named toasts that must NOT close the step being read go through
-   *  `openPipelineStep`. */
-  const openPipelineRun = useCallback((taskId: string) => {
+   *  `openPipelineStep`. `opts.fromBoardCard` is passed only by the board
+   *  card paths (`openTaskFromBoard`, the context menu's Open pipeline): it
+   *  records the card as the board's departure once the navigation commits,
+   *  so the first return to the board can reveal it (`lib/board-scroll.ts`).
+   *  Every other caller stays flag-less, which is what lets a non-card hop
+   *  while away keep the original card's record (D8). */
+  const openPipelineRun = useCallback((taskId: string, opts?: { fromBoardCard?: boolean }) => {
     navigate({ kind: "pipeline-run", taskId }, () => {
+      if (opts?.fromBoardCard) recordBoardDeparture(taskId);
       setFocusSubagent(null);
       setSelected(null);
     });
@@ -501,10 +508,13 @@ function AppInner() {
    *  also dismisses the parent-keyed pending toast — the panel-open
    *  dismissal effect below is keyed on the STEP id, so it would miss it.
    *  `tasksRef` is declared further down; it's only read inside the
-   *  callback, by which time it exists. Stable identity. */
+   *  callback, by which time it exists. `opts.fromBoardCard` is passed only
+   *  by the card's own Answer/Review button (`openAttention`) and records
+   *  the board departure, like `openPipelineRun`'s. Stable identity. */
   const openPipelineAttention = useCallback(
-    (parentId: string, opts?: { stepTaskId?: string; tasks?: readonly Task[] }) => {
+    (parentId: string, opts?: { stepTaskId?: string; tasks?: readonly Task[]; fromBoardCard?: boolean }) => {
       navigate({ kind: "pipeline-run", taskId: parentId }, () => {
+        if (opts?.fromBoardCard) recordBoardDeparture(parentId);
         const list = opts?.tasks ?? tasksRef.current;
         const parent = list.find((t) => t.id === parentId);
         const step = parent ? pipelineAttentionStepTask(parent, list, opts?.stepTaskId) : null;
@@ -552,19 +562,58 @@ function AppInner() {
     setFocusSubagent(null);
     setSelected(t);
   }, [openPipelineRun]);
-  /** The card's amber "waiting on you" button (`TaskCard`'s
-   *  `onOpenAttention`): a pipeline PARENT lands on its run view plus the
-   *  step that needs the user (`openPipelineAttention`), while the card
-   *  body and its plain Open button keep browsing the run view alone
-   *  (`openTask`). Any other task opens exactly like `openTask`. Stable
+  /** A board card's body and its Open buttons (`TaskCard`'s `onOpen`):
+   *  exactly `openTask`, except a pipeline PARENT also records the card as
+   *  the board's departure (`fromBoardCard`), so the first return to the
+   *  board can reveal it. Board cards only — every other `openTask` caller
+   *  (toasts, OS notification, Worktrees) stays flag-less, which is why the
+   *  card origin can't be inferred inside `openTask` itself. Stable
    *  identity — passed to the memoized `Column`/`TaskCard`. */
+  const openTaskFromBoard = useCallback((t: Task) => {
+    if (t.pipelineId) {
+      openPipelineRun(t.id, { fromBoardCard: true });
+      return;
+    }
+    openTask(t);
+  }, [openPipelineRun, openTask]);
+  /** The card's amber "waiting on you" button (`TaskCard`'s
+   *  `onOpenAttention` — its only caller): a pipeline PARENT lands on its
+   *  run view plus the step that needs the user (`openPipelineAttention`,
+   *  recording the card as the board's departure), while the card body and
+   *  its plain Open button keep browsing the run view alone
+   *  (`openTaskFromBoard`). Any other task opens exactly like `openTask`.
+   *  Stable identity — passed to the memoized `Column`/`TaskCard`. */
   const openAttention = useCallback((t: Task) => {
     if (t.pipelineId) {
-      openPipelineAttention(t.id);
+      openPipelineAttention(t.id, { fromBoardCard: true });
       return;
     }
     openTask(t);
   }, [openPipelineAttention, openTask]);
+  /** The board's `.kanban-scroll` element while it is mounted (`null` while
+   *  another page is shown), for the fast-return guard below. */
+  const boardScrollerElRef = useRef<HTMLDivElement | null>(null);
+  /** Callback ref for `.kanban-scroll`: restores the board's saved scroll
+   *  position (and reveals the departure card) every time the board mounts
+   *  again — `<AnimatePresence mode="wait">` mounts it only after the
+   *  leaving page's exit, so `navigate` can't do it. Its identity must be
+   *  stable: a new ref on every render would re-run the restore on each 2 s
+   *  task poll and yank the board back mid-scroll. `restoreBoardScroll` is
+   *  idempotent, so StrictMode's double ref call is harmless. */
+  const boardScrollerRef = useCallback((el: HTMLDivElement | null) => {
+    boardScrollerElRef.current = el;
+    if (el) restoreBoardScroll(el);
+  }, []);
+  // Fast-return guard: when `view` flips back to the board while the leaving
+  // board is still mounted (Escape inside the 0.18 s exit), motion may keep
+  // or re-enter that element without a remount, so the departure would never
+  // be consumed and would fire on some later return. On a normal return the
+  // board isn't mounted yet at this commit (the ref is `null`), and on a
+  // normal remount the ref already consumed the record in this same commit
+  // (children's refs attach before this layout effect), so both are no-ops.
+  useLayoutEffect(() => {
+    if (view.kind === "board" && boardScrollerElRef.current?.isConnected) discardBoardDeparture();
+  }, [view.kind]);
 
   // Fade out the boot splash (defined in index.html) once React has mounted,
   // with a minimum dwell so fast machines don't flash a 200ms splash. Not
@@ -2206,7 +2255,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         setSelected(t);
         break;
       case "open-pipeline":
-        openPipelineRun(t.id);
+        openPipelineRun(t.id, { fromBoardCard: true });
         break;
       case "start":
         void start(t);
@@ -2570,7 +2619,11 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                     abs-positioned descendant of a scrolling containing block
                     scrolls along with it — the previous bug). */}
                 <div className="relative flex-1">
-                  <div className="kanban-scroll absolute inset-0 overflow-x-scroll">
+                  <div
+                    ref={boardScrollerRef}
+                    className="kanban-scroll absolute inset-0 overflow-x-scroll"
+                    onScroll={(e) => saveBoardScroll(e.currentTarget.scrollLeft, e.currentTarget.scrollTop)}
+                  >
                     <DndContext sensors={sensors} onDragEnd={onDragEnd}>
                       <div className="flex gap-3 p-4">
                         {visibleColumns.map((c) => (
@@ -2583,7 +2636,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                             onStart={start}
                             onCancel={cancel}
                             onDelete={del}
-                            onOpen={openTask}
+                            onOpen={openTaskFromBoard}
                             onOpenAttention={openAttention}
                             onDiff={setDiffTask}
                             onMarkDone={markDone}
