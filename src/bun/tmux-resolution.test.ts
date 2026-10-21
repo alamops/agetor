@@ -18,6 +18,7 @@ let tmuxSocketName: () => string | null;
 let tmuxSocketArgs: () => string[];
 let buildEnsureServerArgv: (tmuxBin: string) => string[];
 let ensureDisclaimedServer: () => Promise<void>;
+let bundledTmuxPath: () => string;
 let DISCLAIM_PREF_KEY: string;
 let preferences: typeof import("./db.ts").preferences;
 let dataDir: string;
@@ -29,6 +30,7 @@ beforeAll(async () => {
     tmuxSocketArgs,
     buildEnsureServerArgv,
     ensureDisclaimedServer,
+    bundledTmuxPath,
   } = await import("./tmux-resolution.ts"));
   ({ DISCLAIM_PREF_KEY } = await import("./disclaim.ts"));
   ({ preferences, dataDir } = await import("./db.ts"));
@@ -157,3 +159,9 @@ test("tmuxSocketArgs: mirrors tmuxSocketName() as -L flags, or [] for the defaul
   process.env.AGETOR_TMUX_SOCKET = "default";
   expect(tmuxSocketArgs()).toEqual([]);
 });
+
+test("bundledTmuxPath: resolves current architecture dev tmux binary when present", () => {
+  const p = bundledTmuxPath();
+  expect(p).toContain(path.join("vendor", "tmux", process.arch, "tmux"));
+});
+

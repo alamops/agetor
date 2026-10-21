@@ -68,8 +68,8 @@ async function main() {
     console.log(`[build-disclaim] skipped on ${process.platform} (macOS-only step)`);
     return;
   }
-  if (process.arch !== "arm64") {
-    fail(`expected an arm64 build host (got ${process.arch}); Agetor only ships arm64`);
+  if (process.arch !== "arm64" && process.arch !== "x64") {
+    fail(`expected an arm64 or x64 build host (got ${process.arch}); Agetor supports arm64 and x64`);
   }
   if (!existsSync(SRC)) {
     fail(`missing helper source at ${path.relative(REPO_ROOT, SRC)}`);
@@ -93,8 +93,9 @@ async function main() {
     }
   }
 
-  console.log(`[build-disclaim] compiling ${path.relative(REPO_ROOT, SRC)} → arm64`);
-  await run(["clang", "-arch", "arm64", "-O2", "-Wall", "-o", EXE, SRC]);
+  const clangArch = process.arch === "x64" ? "x86_64" : "arm64";
+  console.log(`[build-disclaim] compiling ${path.relative(REPO_ROOT, SRC)} → ${process.arch}`);
+  await run(["clang", "-arch", clangArch, "-O2", "-Wall", "-o", EXE, SRC]);
 
   // Sign inside-out: hardened runtime + secure timestamp under the release
   // Developer ID (required by notarytool — see the header note), ad-hoc for
@@ -114,8 +115,9 @@ async function main() {
   await writeFile(STAMP, `${desiredIdentity}\n`);
 
   const arch = await run(["lipo", "-archs", EXE]);
-  if (arch.trim() !== "arm64") {
-    fail(`built binary is '${arch}', expected arm64 (no Rosetta / x86_64 allowed)`);
+  const expectedArch = process.arch === "x64" ? "x86_64" : "arm64";
+  if (!arch.includes(expectedArch)) {
+    fail(`built binary is '${arch}', expected ${expectedArch}`);
   }
   console.log(`[build-disclaim] ✓ ${path.relative(REPO_ROOT, EXE)} (${arch})`);
 }
