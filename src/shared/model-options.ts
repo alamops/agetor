@@ -106,6 +106,12 @@ export interface DiscoveredModel {
    *  (codex only today, via `codex app-server model/list`). Absent when the
    *  CLI reported none. See rule 8. */
   efforts?: readonly string[];
+  /** fx only (`models --json` ≥0.0.14 `models[].fast`): the model offers the
+   *  ACP `fast` session option. Copied by rule 8 like `efforts`. */
+  fast?: boolean;
+  /** fx only (`models[].ultrafast`): the model offers the ACP `ultrafast`
+   *  session option. Copied by rule 8 like `efforts`. */
+  ultrafast?: boolean;
 }
 
 /** One row in the merged, render-ready model list. */
@@ -120,6 +126,11 @@ export interface ModelOption {
    *  this as the third argument of `supportedEfforts` (`./types.ts`) so the
    *  discovered set wins over the curated `MODEL_EFFORT_SUPPORT` table. */
   efforts?: readonly string[];
+  /** Copied from the discovered entry by rule 8, when `true`. Fed to
+   *  `supportedSpeeds` (`./speed.ts`) as the speed option flags. */
+  fast?: boolean;
+  /** Copied from the discovered entry by rule 8, when `true`. */
+  ultrafast?: boolean;
 }
 
 export interface MergeModelOptionsInput {
@@ -159,11 +170,20 @@ function effortsFor(entry: DiscoveredModel | undefined): readonly string[] | und
   return undefined;
 }
 
+/** Rule 8, speed flags: copy `fast`/`ultrafast` onto `opt` when the
+ *  discovered entry reports them `true` (never attaches a `false` key). */
+function copySpeedFlags(opt: ModelOption, entry: DiscoveredModel | undefined): void {
+  if (entry?.fast === true) opt.fast = true;
+  if (entry?.ultrafast === true) opt.ultrafast = true;
+}
+
 function toCuratedOption(m: CuratedModel, discoveredById: Map<string, DiscoveredModel>): ModelOption {
   const opt: ModelOption = { id: m.id, label: m.label };
   if (m.hint !== undefined) opt.hint = m.hint;
-  const efforts = effortsFor(discoveredById.get(m.id));
+  const entry = discoveredById.get(m.id);
+  const efforts = effortsFor(entry);
   if (efforts !== undefined) opt.efforts = efforts;
+  copySpeedFlags(opt, entry);
   return opt;
 }
 
@@ -171,6 +191,7 @@ function toDiscoveredOnlyOption(m: DiscoveredModel): ModelOption {
   const opt: ModelOption = { id: m.id, label: m.label ?? m.id };
   const efforts = effortsFor(m);
   if (efforts !== undefined) opt.efforts = efforts;
+  copySpeedFlags(opt, m);
   return opt;
 }
 
@@ -255,6 +276,7 @@ export function mergeModelOptions(input: MergeModelOptionsInput): ModelOption[] 
       };
       const efforts = effortsFor(discoveredById.get(selected));
       if (efforts !== undefined) unlistedOpt.efforts = efforts;
+      copySpeedFlags(unlistedOpt, discoveredById.get(selected));
       result.push(unlistedOpt);
     }
   }

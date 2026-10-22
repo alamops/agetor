@@ -154,7 +154,7 @@ export const FX_RECOVERY_STATUS_PREFIX = "fx-recovery: ";
  *  {@link FxRecoveryPayload}. `"cleared"` is agetor's own label for a wire
  *  `modelResponseRecovery: null` (fx has dropped the checkpoint), not a
  *  state fx itself names. */
-export type FxRecoveryState = "active" | "paused" | "recovered" | "cleared";
+export type FxRecoveryState = "active" | "paused" | "recovered" | "failed" | "cleared";
 
 /**
  * JSON body carried after `FX_RECOVERY_STATUS_PREFIX`. Mirrors fx's own
@@ -340,6 +340,12 @@ export interface Harness {
    *  toggleable too — this is the one carve-out from the built-in
    *  immutability rule. */
   enabled: boolean;
+  /** fx only (`harnesses.profile_mcp_servers`, migration 073): when on, the
+   *  fx driver asks fx 0.0.14+ to load the user's own fx profile MCP servers
+   *  into each ACP session (`_meta.fx.profileMcpServers: true` on
+   *  `session/new`/`resume`/`load`). Absent ⇒ on; meaningless for other
+   *  kinds. */
+  profileMcpServers?: boolean;
 }
 
 /** A user-global reusable prompt snippet — not tied to any task or project. */
@@ -351,8 +357,14 @@ export interface SavedPrompt {
   updatedAt: number;
 }
 
+/** Speed tier a task or agent profile runs at. `fast` replaced the old
+ *  cursor-only boolean; `ultrafast` is fx's faster Gateway lane. See
+ *  `./speed.ts` for the pure helpers (`supportedSpeeds`, `resolveSpeedInput`). */
+export type Speed = "off" | "fast" | "ultrafast";
+export const SPEEDS = ["off", "fast", "ultrafast"] as const satisfies readonly Speed[];
+
 /**
- * A reusable, named bundle of harness + model + effort + mode + fast/maxMode
+ * A reusable, named bundle of harness + model + effort + mode + speed/maxMode
  * + free-text instructions + skills, picked on task launch instead of
  * choosing each field by hand. Persisted in the `agent_profiles` table
  * (`src/bun/db.ts`'s `agentProfiles` module); names are unique
@@ -368,7 +380,12 @@ export interface AgentProfile {
   model: string;
   effort: string | null;
   mode: string | null; // null ⇒ defaultModeFor(kind) at spawn
-  fast: boolean; // cursor only
+  /** Speed tier (`supportedSpeeds` in `./speed.ts` says which tiers a
+   *  kind/model offers). Stored in `agent_profiles.speed` (migration 072). */
+  speed: Speed;
+  /** Derived `speed !== "off"`, emitted for older clients (D13) — never read
+   *  by agetor code. */
+  fast?: boolean;
   maxMode: boolean; // cursor only
   instructions: string; // may be ""
   skills: string[]; // bare skill names, no leading "/", deduped, max 50, each ≤ 100 chars
@@ -403,7 +420,11 @@ export interface AgentProfileSnapshot {
   model: string;
   effort: string | null;
   mode: string | null;
-  fast: boolean;
+  speed: Speed;
+  /** Derived `speed !== "off"`, kept for older readers of the frozen
+   *  snapshot JSON — never read by agetor code (legacy `{fast}` snapshots are
+   *  read through `speedFromFast` in `src/bun/db.ts`). */
+  fast?: boolean;
   maxMode: boolean;
   instructions: string;
   skills: string[];
@@ -853,6 +874,12 @@ export interface HarnessStatus {
    *  probe supplies one, else one of agetor's two synthesized fallback hints
    *  (missing credentials vs. an expired login); otherwise null. */
   authHelp: string | null;
+  /** fx ≥0.0.14 only: the permission mode fx's own saved profile starts in
+   *  (`fx status --json` `permission_mode`, probed WITHOUT
+   *  `FX_PERMISSION_MODE` so the env override can't mask it). `"ask"` drives
+   *  the Settings / `agetor harness ls` hint. `null` (or absent) when the
+   *  kind isn't fx, the field is missing (fx ≤0.0.13), or the probe failed. */
+  fxProfilePermissionMode?: string | null;
 }
 
 /**
@@ -1520,11 +1547,15 @@ export interface Task {
    */
   effort: string | null;
   /**
-   * Fast model variant toggle. Currently only consumed by Cursor, whose CLI
-   * exposes Fast as part of the selected model id rather than as a standalone
-   * flag. Non-Cursor harnesses ignore it.
+   * Speed tier — `off | fast | ultrafast` (`tasks.speed`, migration 072).
+   * Cursor folds Fast into the model id (`cursorModelArg`); fx sets its ACP
+   * `fast`/`ultrafast` session options. Other kinds only offer `off`
+   * (`supportedSpeeds` in `./speed.ts`).
    */
-  fast: boolean;
+  speed: Speed;
+  /** Derived `speed !== "off"`, emitted for older clients (D13) — never read
+   *  by agetor code. */
+  fast?: boolean;
   /**
    * Cursor Max Mode / large-context toggle. This is intentionally separate
    * from effort="max", which means maximum reasoning/thinking effort.
