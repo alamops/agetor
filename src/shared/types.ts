@@ -353,8 +353,8 @@ export interface Harness {
    *  immutability rule. */
   enabled: boolean;
   /** fx only (`harnesses.profile_mcp_servers`, migration 073): when on, the
-   *  fx driver asks fx 0.0.14+ to load the user's own fx profile MCP servers
-   *  into each ACP session (`_meta.fx.profileMcpServers: true` on
+   *  fx driver asks fx (0.0.13 or later) to load the user's own fx profile
+   *  MCP servers into each ACP session (`_meta.fx.profileMcpServers: true` on
    *  `session/new`/`resume`/`load`). Absent ⇒ on; meaningless for other
    *  kinds. */
   profileMcpServers?: boolean;

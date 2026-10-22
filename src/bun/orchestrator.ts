@@ -204,9 +204,10 @@ interface ActiveRun {
    */
   writeInput: (line: string) => boolean;
   /**
-   * fx-only (0.0.14+ steering): fold a follow-up into the turn that is
-   * running right now instead of queueing it for the next one. Returns true
-   * only when the steer was actually sent; `sendFxTurn` queues on false.
+   * fx-only (steering, fx 0.0.13 or later): fold a follow-up into the turn
+   * that is running right now instead of queueing it for the next one.
+   * Returns true only when the steer was actually sent; `sendFxTurn` queues
+   * on false.
    * Absent for every other kind and for an fx turn that can't steer.
    */
   steer?: (line: string) => boolean;
@@ -3420,9 +3421,9 @@ export type SendInputResult =
  *   • fx: same queue-and-resume shape as codex/cursor/gemini (`sendFxTurn`/
  *     `drainFxQueue`), resuming via fx's ACP session id for each queued
  *     follow-up — fx has no persistent REPL either (see fx-acp.ts). On fx
- *     0.0.14+ a message sent while a turn runs steers that turn instead
- *     (`ActiveRun.steer`, no new run row) when nothing is queued ahead of
- *     it; a steer fx drops is re-queued in send order
+ *     0.0.13 or later a message sent while a turn runs steers that turn
+ *     instead (`ActiveRun.steer`, no new run row) when nothing is queued
+ *     ahead of it; a steer fx drops is re-queued in send order
  *     (`fxSteerDroppedHandler`).
  *
  * Archived / detached-worktree restore: a message to an archived task
@@ -4597,17 +4598,19 @@ function findLastAntigravitySessionId(taskId: string): string | null {
   return row?.antigravity_session_id ?? null;
 }
 
-/** * Per-task queue of follow-up lines received while an fx turn is in flight.
+/**
+ * Per-task queue of follow-up lines received while an fx turn is in flight.
  * fx is driven over ACP/stdio (`fx-acp.ts`), one turn per spawn — no
  * persistent REPL, no tmux session — so exactly like codex/cursor/gemini we
  * hold the message and spawn a fresh resumed turn once the active turn
- * resolves (`drainFxQueue`, called from `attachDoneHandler`). On fx 0.0.14+
- * a follow-up usually steers the running turn instead (`ActiveRun.steer`)
- * and only lands here when steering isn't possible (older fx, still in the
- * handshake, over 64 KiB), when an earlier follow-up is already waiting here
- * (a later message never steers past it) — or when fx didn't take the steer
- * before the turn ended (`fxSteerDroppedHandler`, re-queued in send order
- * unless the task was torn down or moved to another fx harness).
+ * resolves (`drainFxQueue`, called from `attachDoneHandler`). On fx 0.0.13 or
+ * later a follow-up usually steers the running turn instead
+ * (`ActiveRun.steer`) and only lands here when steering isn't possible (older
+ * fx, still in the handshake, over 64 KiB), when an earlier follow-up is
+ * already waiting here (a later message never steers past it) — or when fx
+ * didn't take the steer before the turn ended (`fxSteerDroppedHandler`,
+ * re-queued in send order unless the task was torn down or moved to another
+ * fx harness).
  */
 const fxTurnQueue = new Map<string, QueuedFxLine[]>();
 
@@ -4783,8 +4786,9 @@ function appendFxStatusLine(taskId: string, runId: string, data: string): void {
 /**
  * Send a follow-up to an fx task. Each follow-up is its own run row + its own
  * resumed ACP turn (sequential-turn model, same as codex/cursor/gemini). When
- * a turn is already running, the message steers it (fx 0.0.14+, no new run
- * row) or, when it can't, is queued; otherwise it spawns immediately. Returns the run id the message was attached to, or null on
+ * a turn is already running, the message steers it (fx 0.0.13 or later, no
+ * new run row) or, when it can't, is queued; otherwise it spawns
+ * immediately. Returns the run id the message was attached to, or null on
  * lookup failure — or when `spawnFxRun` declined to mint a run because
  * `startingTaskIds` was already claimed for this task (see that set's doc,
  * near `startTask`).
@@ -4802,14 +4806,14 @@ async function sendFxTurn(taskId: string, line: string): Promise<string | null> 
   cancelFxAutoResumeTimer(taskId);
   const activeHandle = task.runId ? active.get(task.runId) : undefined;
   if (task.runId && activeHandle) {
-    // fx 0.0.14+: steer the running turn first — the message joins this turn
-    // and gets no run row of its own. `steer` is absent (older fx, other
-    // fakes) or returns false (no capability, still in the handshake, over
-    // 64 KiB) when that isn't possible; then queue exactly as before. A steer
-    // fx later drops comes back through `fxSteerDroppedHandler`. Never steer
-    // past a non-empty queue: an earlier message that had to queue (sent
-    // during the handshake, over 64 KiB, or still waiting behind a turn the
-    // queue started) must reach the model before this one does.
+    // fx 0.0.13 or later: steer the running turn first — the message joins
+    // this turn and gets no run row of its own. `steer` is absent (older fx,
+    // other fakes) or returns false (no capability, still in the handshake,
+    // over 64 KiB) when that isn't possible; then queue exactly as before. A
+    // steer fx later drops comes back through `fxSteerDroppedHandler`. Never
+    // steer past a non-empty queue: an earlier message that had to queue
+    // (sent during the handshake, over 64 KiB, or still waiting behind a turn
+    // the queue started) must reach the model before this one does.
     const seq = ++fxSendSeq;
     const queueEmpty = (fxTurnQueue.get(taskId)?.length ?? 0) === 0;
     if (queueEmpty && activeHandle.steer?.(line) === true) {

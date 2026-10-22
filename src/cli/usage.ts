@@ -243,7 +243,8 @@ export const USAGE: Record<string, string> = {
 
   Create an agent harness — an alias, or a parallel account via a per-harness $HOME.
   --profile-mcp / --no-profile-mcp (fx only; default on): load the MCP servers
-  from your own fx profile into each task's session (fx 0.0.14+). Last flag wins.`,
+  from your own fx profile into each task's session (fx 0.0.13 or later).
+  Last flag wins.`,
 
   "harness edit": `usage: agetor harness edit <id> [--label …] [--home <abs>|none] [--bin <abs>|none] [--env KEY=VAL …] [--profile-mcp | --no-profile-mcp]
 

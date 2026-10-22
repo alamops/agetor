@@ -1579,7 +1579,7 @@ function HarnessesSection({
                     <div className="text-xs">Load profile MCP servers</div>
                     <div className="text-[11px] text-muted-foreground">
                       Loads the MCP servers from your own fx profile into each
-                      task's session (fx 0.0.14+).
+                      task's session (fx 0.0.13 or later).
                     </div>
                   </div>
                   <Switch
