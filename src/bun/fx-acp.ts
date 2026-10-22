@@ -935,7 +935,7 @@ interface FxSessionState {
    *  every dropped steer reach `onSteerDropped` exactly once. */
   pendingSteers: Map<number, PendingSteer>;
   /** See `FxLaunchOptions.onSteerDropped`. */
-  onSteerDropped?: (text: string) => void;
+  onSteerDropped?: (text: string) => boolean;
   /** `STEER_SETTLE_GRACE_MS` unless a test overrides it. */
   steerSettleGraceMs: number;
 
@@ -2451,19 +2451,22 @@ async function settlePendingSteers(state: FxSessionState, graceMs: number): Prom
 
 /** Report every pending steer exactly once (the entry is deleted as it is
  *  reported): an absorbed one is done; anything else — dropped, errored, or
- *  still unanswered — is handed back via `onSteerDropped` and gets one
- *  `FX_STEER_DROPPED_STATUS` line. Synchronous, so `settleFx` can call it
- *  right before `resolveDone`. */
+ *  still unanswered — is handed back via `onSteerDropped`, and gets one
+ *  `FX_STEER_DROPPED_STATUS` line only when the caller reports it queued the
+ *  text (a teardown discards it, and the line would promise a turn that never
+ *  comes). Synchronous, so `settleFx` can call it right before
+ *  `resolveDone`. */
 function reportSteerOutcomes(state: FxSessionState): void {
   for (const [id, entry] of Array.from(state.pendingSteers)) {
     state.pendingSteers.delete(id);
     if (entry.settled === "absorbed") continue;
+    let queued = false;
     try {
-      state.onSteerDropped?.(entry.text);
+      queued = state.onSteerDropped?.(entry.text) === true;
     } catch {
       /* the caller's queue failing must not stop settlement */
     }
-    emit(state, "status", FX_STEER_DROPPED_STATUS);
+    if (queued) emit(state, "status", FX_STEER_DROPPED_STATUS);
   }
 }
 
@@ -3341,8 +3344,9 @@ export interface FxLaunchOptions {
   /** Called once per steer (`SpawnedAgent.steer`) fx did not deliver to the
    *  model before the turn ended — dropped, refused, or unanswered — with
    *  its text, always BEFORE `done` resolves, so the caller can queue it as
-   *  the next turn. Never called for an absorbed steer. */
-  onSteerDropped?: (text: string) => void;
+   *  the next turn. Returns whether it did: `FX_STEER_DROPPED_STATUS` is
+   *  written only on `true`. Never called for an absorbed steer. */
+  onSteerDropped?: (text: string) => boolean;
   /** Test-only override of `STEER_SETTLE_GRACE_MS`. */
   steerSettleGraceMs?: number;
 }

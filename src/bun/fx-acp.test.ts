@@ -866,6 +866,9 @@ function spawnFake(
     profileMcpServers?: boolean;
     /** `FxLaunchOptions.steerSettleGraceMs` (test-only override). */
     steerSettleGraceMs?: number;
+    /** What `onSteerDropped` reports back (whether the caller queued the
+     *  text). Defaults to true, the orchestrator's answer outside a teardown. */
+    steerQueued?: boolean;
   } = {},
 ) {
   const chunks: Chunk[] = [];
@@ -898,6 +901,7 @@ function spawnFake(
     onSteerDropped: (text) => {
       droppedSteers.push(text);
       order.push("steer-dropped");
+      return opts.steerQueued ?? true;
     },
     steerSettleGraceMs: opts.steerSettleGraceMs,
   });
@@ -3049,6 +3053,15 @@ describe("steering (fx ≥0.0.13 _meta.fx.steer)", () => {
     expect(order).toEqual(["steer-dropped", "done"]);
     expect(droppedLines(chunks)).toHaveLength(1);
     expect(chunks.some((c) => c.data.includes("Steering prompt was not delivered"))).toBe(false);
+  }, 10_000);
+
+  test("dropped but not queued by the caller (a teardown): handed back, but no 'sending it as the next turn' line", async () => {
+    const { agent, chunks, captureFile, droppedSteers } = spawnFake("steer-dropped", { steerQueued: false });
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("discarded message")).toBe(true);
+    expect(await agent.done).toBe(0);
+    expect(droppedSteers).toEqual(["discarded message"]);
+    expect(droppedLines(chunks)).toHaveLength(0);
   }, 10_000);
 
   test("two steers on one turn: each dropped one is handed back once, with one status line each", async () => {

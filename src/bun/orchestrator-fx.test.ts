@@ -570,6 +570,63 @@ test("fx steer dropped after a later follow-up queued: the dropped steer still r
   }
 });
 
+test("fx: a follow-up sent while an earlier one is queued queues behind it instead of steering past it", async () => {
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "200";
+  try {
+    const { sendInput } = await import("./orchestrator.ts");
+    const { runs } = await import("./db.ts");
+    const { __getFakeDriver } = await import("./agents.ts");
+    // `:absorbed` — had the second message steered, the running turn would
+    // have taken it and the model would see it before the queued first one.
+    const { taskId, firstRunId } = await startSteerTask("fx queue then steer", "turn one __agetor_fake_fx_steer__:absorbed");
+    await settle(30);
+
+    // Over fx's 64 KiB steer cap, so it can only queue…
+    const big = `queued first ${"x".repeat(70 * 1024)}`;
+    expect((await sendInput(firstRunId, big)).delivered).toBe(true);
+    // …and this one must queue behind it, not steer the running turn.
+    expect((await sendInput(firstRunId, "sent second")).delivered).toBe(true);
+    const record = __getFakeDriver(taskId)?._record ?? [];
+    expect(record.some((r) => r.startsWith("steer:"))).toBe(false);
+    expect(runs.listForTask(taskId).length).toBe(1);
+
+    await waitFor(() => runs.listForTask(taskId).length === 3, 8000);
+    await waitFor(() => runs.listForTask(taskId).every((r) => r.status !== "running"), 8000);
+
+    const ordered = [...runs.listForTask(taskId)].sort((a, b) => a.startedAt - b.startedAt);
+    const events = runs.eventsForTask(taskId);
+    expect(events.some((e) => e.runId === ordered[1]!.id && e.stream === "user" && e.data.startsWith("queued first"))).toBe(true);
+    expect(events.some((e) => e.runId === ordered[2]!.id && e.stream === "user" && e.data === "sent second")).toBe(true);
+  } finally {
+    delete process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  }
+});
+
+test("fx steer dropped after the task moved to another fx harness: not re-queued, and no 'sending it as the next turn' line", async () => {
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "250";
+  try {
+    const { sendInput } = await import("./orchestrator.ts");
+    const { tasks, runs, harnesses } = await import("./db.ts");
+    const { FX_STEER_DROPPED_STATUS } = await import("./fx-acp.ts");
+    if (!harnesses.get("fx-steer-alt")) harnesses.insert({ id: "fx-steer-alt", kind: "fx", label: "fx steer alt" });
+    harnesses.setEnabled("fx-steer-alt", true);
+    const { taskId, firstRunId } = await startSteerTask("fx steer harness switch", "turn one __agetor_fake_fx_steer__:dropped");
+    await settle(30);
+    expect((await sendInput(firstRunId, "steer then switch")).delivered).toBe(true);
+
+    // The row now names another fx harness (another account): the dropped
+    // steer would resume the old harness's session id under it.
+    tasks.update(taskId, { agent: "fx-steer-alt" });
+
+    await waitForRunSettled(firstRunId, 5000);
+    await settle(150);
+    expect(runs.listForTask(taskId).length).toBe(1);
+    expect(runs.eventsForTask(taskId).some((e) => e.stream === "status" && e.data === FX_STEER_DROPPED_STATUS)).toBe(false);
+  } finally {
+    delete process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  }
+});
+
 test("fx steer pending when the task is deleted: the dropped steer is not re-queued, so no turn spawns for the dying task", async () => {
   process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "5000";
   try {

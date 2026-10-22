@@ -1800,7 +1800,7 @@ async function startTaskInner(
         : { fxSessionId: sessionId });
     },
     // fx: a mid-turn steer fx didn't take comes back here as the next turn.
-    ...(harness.kind === "fx" ? { onSteerDropped: fxSteerDroppedHandler(taskId, runId) } : {}),
+    ...(harness.kind === "fx" ? { onSteerDropped: fxSteerDroppedHandler(taskId, runId, harness.id) } : {}),
     opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, speed: task.speed, maxMode: task.maxMode },
   };
 
@@ -3419,7 +3419,11 @@ export type SendInputResult =
  *
  *   • fx: same queue-and-resume shape as codex/cursor/gemini (`sendFxTurn`/
  *     `drainFxQueue`), resuming via fx's ACP session id for each queued
- *     follow-up — fx has no persistent REPL either (see fx-acp.ts).
+ *     follow-up — fx has no persistent REPL either (see fx-acp.ts). On fx
+ *     0.0.14+ a message sent while a turn runs steers that turn instead
+ *     (`ActiveRun.steer`, no new run row) when nothing is queued ahead of
+ *     it; a steer fx drops is re-queued in send order
+ *     (`fxSteerDroppedHandler`).
  *
  * Archived / detached-worktree restore: a message to an archived task
  * auto-unarchives it (sending is an unambiguous signal of continued
@@ -4637,13 +4641,18 @@ function insertBySendOrder(q: QueuedFxLine[], item: QueuedFxLine): void {
  * bubble — see {@link QueuedFxLine}). The driver calls it BEFORE the run's
  * `done` resolves, so the `drainFxQueue` that `attachDoneHandler` runs after
  * every settle (cancelled included) picks it up. Dropped instead when the
- * task is gone, archived, being deleted, or no longer an fx task — the same
- * teardowns that clear `fxTurnQueue` outright (archive/delete/agent switch
- * kill the run and `dropFxSession` after clearing the queue, and both report
- * a still-pending steer dropped). A Stop is not a teardown: its dropped
- * steers re-queue and drain like any other queued follow-up.
+ * task is gone, archived, being deleted, or no longer on the fx harness the
+ * run was spawned with (`harnessId`) — the same teardowns that clear
+ * `fxTurnQueue` outright (archive/delete/agent switch kill the run and
+ * `dropFxSession` after clearing the queue, and both report a still-pending
+ * steer dropped). A switch to ANOTHER fx harness counts as a teardown too:
+ * the queued turn would resume the old harness's session id under the new
+ * harness's account. A Stop is not a teardown: its dropped steers re-queue
+ * and drain like any other queued follow-up. Returns whether the text was
+ * queued — the driver only tells the user "sending it as the next turn"
+ * when it was.
  */
-function fxSteerDroppedHandler(taskId: string, runId: string): (text: string) => void {
+function fxSteerDroppedHandler(taskId: string, runId: string, harnessId: string): (text: string) => boolean {
   return (text) => {
     // Recover the send order this steer was given when fx accepted it.
     const pending = fxPendingSteers.get(runId);
@@ -4652,12 +4661,15 @@ function fxSteerDroppedHandler(taskId: string, runId: string): (text: string) =>
     // `isTaskTearingDown` covers the window where a delete has started (its
     // queue clear already ran) but the row still exists — `deleteTask` kills
     // the run and `dropFxSession`s before `tasks.delete`.
-    if (isTaskTearingDown(taskId)) return;
+    if (isTaskTearingDown(taskId)) return false;
     const task = tasks.get(taskId);
-    if (!task || task.archivedAt != null || resolveHarness(task.agent)?.kind !== "fx") return;
+    if (!task || task.archivedAt != null) return false;
+    const current = resolveHarness(task.agent);
+    if (current?.kind !== "fx" || current.id !== harnessId) return false;
     const q = fxTurnQueue.get(taskId) ?? [];
     insertBySendOrder(q, { line: text, seq, echoed: true });
     fxTurnQueue.set(taskId, q);
+    return true;
   };
 }
 
@@ -4791,9 +4803,13 @@ async function sendFxTurn(taskId: string, line: string): Promise<string | null> 
     // and gets no run row of its own. `steer` is absent (older fx, other
     // fakes) or returns false (no capability, still in the handshake, over
     // 64 KiB) when that isn't possible; then queue exactly as before. A steer
-    // fx later drops comes back through `fxSteerDroppedHandler`.
+    // fx later drops comes back through `fxSteerDroppedHandler`. Never steer
+    // past a non-empty queue: an earlier message that had to queue (sent
+    // during the handshake, over 64 KiB, or still waiting behind a turn the
+    // queue started) must reach the model before this one does.
     const seq = ++fxSendSeq;
-    if (activeHandle.steer?.(line) === true) {
+    const queueEmpty = (fxTurnQueue.get(taskId)?.length ?? 0) === 0;
+    if (queueEmpty && activeHandle.steer?.(line) === true) {
       const pending = fxPendingSteers.get(task.runId) ?? [];
       pending.push({ text: line, seq });
       fxPendingSteers.set(task.runId, pending);
@@ -4971,7 +4987,7 @@ async function spawnFxRun(
       onSessionId: (sessionId) => {
         runs.update(newRunId, { fxSessionId: sessionId });
       },
-      onSteerDropped: fxSteerDroppedHandler(taskId, newRunId),
+      onSteerDropped: fxSteerDroppedHandler(taskId, newRunId, harness.id),
       opts: {
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],

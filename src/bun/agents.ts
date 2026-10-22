@@ -1453,7 +1453,8 @@ export const FAKE_FX_TOOL_META_PROMPT_MARKER = "__agetor_fake_fx_tool_meta__";
  * {@link FAKE_FX_STEER_DEFAULT_HOLD_MS}) and the agent exposes `steer()`,
  * which accepts every line while the turn is in flight. At settle, `absorbed`
  * acknowledges each steered line with an assistant line; `dropped` hands each
- * one to `onSteerDropped` and emits `FX_STEER_DROPPED_STATUS`, both before
+ * one to `onSteerDropped` and emits `FX_STEER_DROPPED_STATUS` when it was
+ * re-queued, both before
  * `done` resolves — the order the real driver guarantees; a kill of a
  * `:dropped` turn reports its pending steers dropped too (no status line). Read from the
  * current turn's prompt, else the task's stored prompt (a steered or
@@ -1899,7 +1900,7 @@ function makeFakeAgent(
     effort?: string | null;
     model?: string;
     speed?: Speed | null;
-    onSteerDropped?: (text: string) => void;
+    onSteerDropped?: (text: string) => boolean;
   } = {},
 ): SpawnedAgent {  const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
@@ -2385,8 +2386,7 @@ function makeFakeAgent(
         if (steerMode === "absorbed") {
           onChunk("assistant", `fake fx took your steer: ${text}`);
         } else {
-          fakeOpts.onSteerDropped?.(text);
-          onChunk("status", FX_STEER_DROPPED_STATUS);
+          if (fakeOpts.onSteerDropped?.(text) === true) onChunk("status", FX_STEER_DROPPED_STATUS);
         }
       }
       emitFakeFxUsageAndTitle(onChunk);
@@ -3065,10 +3065,11 @@ export interface SpawnAgentArgs {
   /**
    * fx-only: called with the text of a mid-turn steer (`SpawnedAgent.steer`)
    * fx didn't take before the turn ended, so the caller can send it as the
-   * next turn instead. Fires BEFORE the agent's `done` resolves. Forwarded
-   * to `FxLaunchOptions.onSteerDropped`; every other kind ignores it.
+   * next turn instead. Fires BEFORE the agent's `done` resolves; returns
+   * whether the text was queued. Forwarded to
+   * `FxLaunchOptions.onSteerDropped`; every other kind ignores it.
    */
-  onSteerDropped?: (text: string) => void;
+  onSteerDropped?: (text: string) => boolean;
   opts?: AgentRunOptions;
 }
 

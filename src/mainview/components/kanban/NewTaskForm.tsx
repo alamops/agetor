@@ -47,7 +47,7 @@ import { AgentProfileCard } from "./AgentProfileCard";
 import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
 import { PipelinePicker } from "@/components/pipelines";
-import { SpeedPicker } from "./SpeedPicker";
+import { showsSpeedPicker, SpeedPicker } from "./SpeedPicker";
 import { ProjectPicker } from "./ProjectPicker";
 import { TaskTypePicker } from "./TaskTypePicker";
 import { captureDroppedOrPastedItems } from "./ReferencesPicker";
@@ -1092,13 +1092,16 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                 </div>
               )}
 
-              {(kind === "cursor" || kind === "fx") && (
-                <SpeedPicker
-                  testId="new-task-speed"
-                  options={speedOptions}
-                  value={speed}
-                  onChange={setSpeed}
-                />
+              {(kind === "cursor" || kind === "fx") && showsSpeedPicker(speedOptions, speed) && (
+                <div className="space-y-1">
+                  <label className="text-muted-foreground">Speed</label>
+                  <SpeedPicker
+                    testId="new-task-speed"
+                    options={speedOptions}
+                    value={speed}
+                    onChange={setSpeed}
+                  />
+                </div>
               )}
 
               {/* Fable models (5, 5.1, …) sit above Opus in the picker but bill at

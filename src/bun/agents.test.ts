@@ -1728,7 +1728,7 @@ test("fx launch options: profileMcpServers is on unless the harness explicitly t
 
 test("fx launch options forward onSteerDropped from the spawn args (absent when the caller passed none)", () => {
   const dropped: string[] = [];
-  const onSteerDropped = (text: string) => { dropped.push(text); };
+  const onSteerDropped = (text: string) => { dropped.push(text); return true; };
   const launch = buildFxLaunchOptions(
     { taskId: "task-fx-launch", runId: "run-fx-launch", harness: builtin("fx"), prompt: "hi", cwd: "/tmp", onChunk: () => {}, onSteerDropped, opts: { ...fxDefaults } },
     { cmd: ["fx", "acp"], env: {} },
@@ -1881,7 +1881,7 @@ test("fx plain turn without any new marker is byte-identical to before: no tool,
 /** Spawn a fake fx steer turn, steer `steers` into it while it holds, and
  *  collect its chunks plus every `onSteerDropped` call — each tagged with
  *  whether `done` had already resolved when it fired. */
-async function runFakeFxSteer(taskId: string, prompt: string, steers: string[]) {
+async function runFakeFxSteer(taskId: string, prompt: string, steers: string[], queued = true) {
   process.env.AGETOR_FX_DRIVER = "fake";
   process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "80";
   const chunks: { stream: RunEventStream; data: string }[] = [];
@@ -1894,7 +1894,7 @@ async function runFakeFxSteer(taskId: string, prompt: string, steers: string[]) 
     prompt,
     cwd: "/tmp",
     onChunk: (stream, data) => { chunks.push({ stream, data }); },
-    onSteerDropped: (text) => { dropped.push({ text, afterDone: doneResolved }); },
+    onSteerDropped: (text) => { dropped.push({ text, afterDone: doneResolved }); return queued; },
     opts: { ...fxDefaults, runId: `run-${taskId}` },
   });
   const accepted = steers.map((line) => handle.steer?.(line));
@@ -1948,6 +1948,19 @@ test("fx steer marker :dropped — onSteerDropped(text) fires before done resolv
   expect(chunks.some((c) => c.stream === "assistant" && c.data.includes("first"))).toBe(false);
 });
 
+test("fx steer marker :dropped — a steer the caller didn't queue is still handed back, but gets no 'sending it as the next turn' line", async () => {
+  const { chunks, dropped, accepted, code } = await runFakeFxSteer(
+    "task-fx-steer-drop-unqueued",
+    `go ${FAKE_FX_STEER_PROMPT_MARKER}:dropped`,
+    ["discarded"],
+    false,
+  );
+  expect(code).toBe(0);
+  expect(accepted).toEqual([true]);
+  expect(dropped).toEqual([{ text: "discarded", afterDone: false }]);
+  expect(chunks.some((c) => c.data === FX_STEER_DROPPED_STATUS)).toBe(false);
+});
+
 test("fx steer marker is read from the task's stored prompt when the turn's own prompt lacks it (a steered/re-queued follow-up)", async () => {
   const taskId = "task-fx-steer-stored";
   tasks.insert({ ...makeHandoffTaskRow(taskId, `go ${FAKE_FX_STEER_PROMPT_MARKER}:dropped`), agent: "fx" });
@@ -1969,7 +1982,7 @@ test("fx steer marker: a killed :dropped turn reports its pending steers dropped
       prompt: `go ${FAKE_FX_STEER_PROMPT_MARKER}:${mode}`,
       cwd: "/tmp",
       onChunk: () => {},
-      onSteerDropped: (text) => { dropped.push(`${text}:${doneResolved}`); },
+      onSteerDropped: (text) => { dropped.push(`${text}:${doneResolved}`); return true; },
       opts: { ...fxDefaults, runId: `run-fx-steer-kill-${mode}` },
     });
     void handle.done.then(() => { doneResolved = true; });
