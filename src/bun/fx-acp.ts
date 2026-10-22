@@ -714,8 +714,10 @@ export const STEER_SETTLE_GRACE_MS = 2_000;
 /** fx's per-message steering limit — a larger steer would only be refused
  *  with `-32602`, so `steerFx` declines it up front and the caller queues. */
 const STEER_MAX_BYTES = 64 * 1024;
-/** Status line emitted once per steer fx didn't deliver before its turn
- *  ended; the text itself is handed back via `onSteerDropped`. */
+/** Status line emitted for a steer fx didn't deliver before its turn ended,
+ *  but only when `onSteerDropped` (which receives the text) reports it
+ *  re-queued it — a steer dropped on a torn-down task, or one moved to
+ *  another fx harness, gets no line. */
 export const FX_STEER_DROPPED_STATUS = "fx didn't take your message before the turn ended — sending it as the next turn";
 /** How many trailing stderr lines to keep for death diagnostics. */
 const STDERR_RING_SIZE = 20;

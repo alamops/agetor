@@ -4603,8 +4603,11 @@ function findLastAntigravitySessionId(taskId: string): string | null {
  * hold the message and spawn a fresh resumed turn once the active turn
  * resolves (`drainFxQueue`, called from `attachDoneHandler`). On fx 0.0.14+
  * a follow-up usually steers the running turn instead (`ActiveRun.steer`)
- * and only lands here when steering isn't possible — or when fx didn't take
- * the steer before the turn ended (`fxSteerDroppedHandler`).
+ * and only lands here when steering isn't possible (older fx, still in the
+ * handshake, over 64 KiB), when an earlier follow-up is already waiting here
+ * (a later message never steers past it) — or when fx didn't take the steer
+ * before the turn ended (`fxSteerDroppedHandler`, re-queued in send order
+ * unless the task was torn down or moved to another fx harness).
  */
 const fxTurnQueue = new Map<string, QueuedFxLine[]>();
 
