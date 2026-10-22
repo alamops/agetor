@@ -62,6 +62,29 @@ const COUNTDOWN_SEEN_BY = STORM_PAUSE_MS + AUTO_RESUME_DELAY_MS - 1_000;
 const FAKE_FX_RECOVERY_PROMPT_MARKER = "__agetor_fake_fx_recovery__";
 
 /**
+ * fx 0.0.14 seams (docs/plans/fx-0.0.14-and-cursor-updates.md §5), literal
+ * copies of `src/bun/agents.ts`'s exports for the same reason as above.
+ *
+ * `FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER`: two `active` retry updates, then
+ * a terminal `failed` one — fx stopped retrying and kept no checkpoint — and
+ * the run fails. Its messages never carry the Gateway URL suffix.
+ *
+ * `FAKE_FX_STEER_PROMPT_MARKER` + `:absorbed` / `:dropped`: the turn holds
+ * for `AGETOR_FAKE_FX_STEER_HOLD_MS` (default 4 s) and the fake agent
+ * exposes `steer()`, so a follow-up sent while it runs is folded into the
+ * running turn (no run row of its own). At settle `absorbed` answers each
+ * steered line with an assistant line; `dropped` reports it back as not
+ * taken (`FX_STEER_DROPPED_STATUS`), and the orchestrator re-queues it as the
+ * next turn.
+ */
+const FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER = "__agetor_fake_fx_recovery_failed__";
+const FAKE_FX_STEER_PROMPT_MARKER = "__agetor_fake_fx_steer__";
+const FAILED_SUMMARY_LINE =
+  "⚠ Provider unavailable · HTTP 503 · fake gateway outage · request failed after 3/3 attempts — fx stopped retrying this response.";
+const FX_STEER_DROPPED_STATUS = "fx didn't take your message before the turn ended — sending it as the next turn";
+const STEER_TURN_TEXT = "fake fx steer turn: working…";
+
+/**
  * Fake Gateway URL the fake fx driver splices onto every `active`/`paused`
  * recovery message in this worker's backend — armed process-wide via
  * `AGETOR_FAKE_FX_RECOVERY_URL=1` in `e2e/fixtures.ts` (mirrors
@@ -93,7 +116,7 @@ const GATEWAY_URL_SUFFIX = ` · upgrade at ${GATEWAY_URL}`;
  */
 const PAUSED_MESSAGE =
   `⚠ Rate limited · HTTP 429 · fake gateway limit · recovery paused after 3/3 attempts${GATEWAY_URL_SUFFIX}`;
-const PAUSED_SUMMARY_LINE = `${PAUSED_MESSAGE} — resume once the limit clears, or send a new message.`;
+const PAUSED_SUMMARY_LINE = `${PAUSED_MESSAGE} — fx paused this response; resume it, or send a new message.`;
 const REFUSED_STATUS_LINE = "fx turn ended: refused (response paused after 3/3 attempts — resumable)";
 const RECOVERED_MESSAGE = "✓ recovered · succeeded on attempt 1/3";
 const RECOVERED_ASSISTANT_TEXT = "recovered answer";
@@ -536,7 +559,7 @@ test.describe("fx recovery", () => {
       await expect(badge).toHaveText(/auto-resume \d:\d\d/, { timeout: 200 });
     }).toPass({ timeout: COUNTDOWN_SEEN_BY, intervals: [30, 60, 100, 150] });
     await expect(paused).toContainText("recovery paused after 3/3 attempts");
-    await expect(paused).toContainText("resume once the limit clears");
+    await expect(paused).toContainText("fx paused this response; resume it");
     // The live (active-state) notice is mutually exclusive with the paused one.
     await expect(notice).toHaveCount(0);
     await expect(badge).toHaveAttribute("title", /recovery paused after 3\/3 attempts/);
@@ -597,7 +620,7 @@ test.describe("fx recovery", () => {
     const paused = panel.getByTestId("fx-recovery-paused");
     await expect(paused).toBeVisible({ timeout: PAUSE_TIMEOUT });
     await expect(paused).toContainText("recovery paused after 3/3 attempts");
-    await expect(paused).toContainText("resume once the limit clears");
+    await expect(paused).toContainText("fx paused this response; resume it");
     await expect(panel.getByText("Auto-resume cancelled.", { exact: true })).toBeVisible();
 
     const resumeButton = panel.getByTestId("fx-recovery-resume");
@@ -1026,4 +1049,170 @@ test.describe("fx recovery", () => {
     // (fx 0.0.8's own "Full access" naming; see AGENT_OPTIONS.fx.modes).
     expect(task!.mode).toBe("yolo");
   });
+
+  test("failed recovery: the transcript keeps the summary line, nothing offers a Resume, and the run fails", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = `fx-recovery-failed-e2e ${randomUUID()}`;
+    const task = await createFxTask(request, backend, title, `${FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER} ${title}`);
+    await startFakeFxRecoveryTask(request, backend, task.id);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+
+    await expect(panel.getByText(FAILED_SUMMARY_LINE, { exact: true })).toBeVisible({ timeout: PAUSE_TIMEOUT });
+    await expect(async () => {
+      const runs = await getRuns(request, backend, task.id);
+      expect(runs[0]?.status).toBe("failed");
+    }).toPass({ timeout: PAUSE_TIMEOUT });
+
+    // `failed` is terminal: no live notice once settled, no Resume, no
+    // paused badge, and no server-side recovery state.
+    await kickPolls(page);
+    await expect(panel.getByTestId("fx-recovery-notice")).toHaveCount(0);
+    await expect(panel.getByTestId("fx-recovery-paused")).toHaveCount(0);
+    await expect(panel.getByTestId("fx-recovery-resume")).toHaveCount(0);
+    await expect(taskCard(page, title).getByTestId("fx-paused-badge")).toHaveCount(0);
+    await expect(panel.getByText("fx-recovery:", { exact: false })).toHaveCount(0);
+    const detail = await getTask(request, backend, task.id);
+    expect(detail.fxRecovery ?? null).toBeNull();
+  });
+
+  test("steering: a follow-up sent mid-turn joins the running turn (:absorbed) — one run, the bubble shown", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = `fx-steer-absorbed-e2e ${randomUUID()}`;
+    const task = await createFxTask(request, backend, title, `${FAKE_FX_STEER_PROMPT_MARKER}:absorbed ${title}`);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await startFakeFxRecoveryTask(request, backend, task.id);
+    await expect(panel.getByText(STEER_TURN_TEXT, { exact: true })).toBeVisible({ timeout: PAUSE_TIMEOUT });
+
+    const steerText = `fx-steer-absorbed-followup ${randomUUID()}`;
+    await sendFromComposer(panel, steerText);
+    await expect(panel.getByText(steerText, { exact: true })).toBeVisible();
+    // Still mid-turn when the steer went in — the turn hasn't settled yet.
+    expect((await getRuns(request, backend, task.id)).map((r) => r.status)).toEqual(["running"]);
+
+    await expect(panel.getByText(`fake fx took your steer: ${steerText}`, { exact: true })).toBeVisible({
+      timeout: PAUSE_TIMEOUT,
+    });
+    await expect(async () => {
+      const runs = await getRuns(request, backend, task.id);
+      expect(runs.map((r) => r.status)).toEqual(["succeeded"]);
+    }).toPass({ timeout: PAUSE_TIMEOUT });
+    // No second run ever starts for the steered message, and its bubble is
+    // shown exactly once.
+    await expectRunCountStays(request, backend, task.id, 1);
+    await expect(panel.getByText(steerText, { exact: true })).toHaveCount(1);
+    await expect(panel.getByText(FX_STEER_DROPPED_STATUS, { exact: true })).toHaveCount(0);
+  });
+
+  test("steering: a steer fx didn't take (:dropped) says so and is answered by a second run", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = `fx-steer-dropped-e2e ${randomUUID()}`;
+    const task = await createFxTask(request, backend, title, `${FAKE_FX_STEER_PROMPT_MARKER}:dropped ${title}`);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await startFakeFxRecoveryTask(request, backend, task.id);
+    await expect(panel.getByText(STEER_TURN_TEXT, { exact: true })).toBeVisible({ timeout: PAUSE_TIMEOUT });
+
+    const steerText = `fx-steer-dropped-followup ${randomUUID()}`;
+    await sendFromComposer(panel, steerText);
+    await expect(panel.getByText(steerText, { exact: true })).toBeVisible();
+
+    await expect(panel.getByText(FX_STEER_DROPPED_STATUS, { exact: true })).toBeVisible({ timeout: PAUSE_TIMEOUT });
+    // The dropped message becomes the next turn: a second run, which the
+    // fake answers like any turn of this task (its stored prompt carries the
+    // steer marker, so the follow-up turn is a steer turn too).
+    await expect(async () => {
+      const runs = await getRuns(request, backend, task.id);
+      expect(runs.map((r) => r.status)).toEqual(["succeeded", "succeeded"]);
+    }).toPass({ timeout: 30_000 });
+    await expect(panel.getByText(STEER_TURN_TEXT, { exact: true })).toHaveCount(2, { timeout: PAUSE_TIMEOUT });
+    // The bubble was written once, on the run it steered — the re-sent turn
+    // doesn't echo it again.
+    await expect(panel.getByText(steerText, { exact: true })).toHaveCount(1);
+  });
+
+  test("no steer marker: a follow-up sent mid-turn still queues as a second run", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    // The storm scenario holds its turn (~6 s) and its fake agent has no
+    // `steer()`, so a follow-up takes today's queue path.
+    const title = `fx-steer-none-e2e ${randomUUID()}`;
+    const task = await createFxTask(request, backend, title, `${FAKE_FX_RECOVERY_PROMPT_MARKER} ${title}`);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await startFakeFxRecoveryTask(request, backend, task.id);
+    await expect(panel.getByTestId("fx-recovery-notice")).toBeVisible({ timeout: PAUSE_TIMEOUT });
+
+    const followUp = `fx-steer-none-followup ${randomUUID()}`;
+    await sendFromComposer(panel, followUp);
+    await expect(panel.getByText(followUp, { exact: true })).toBeVisible();
+    expect((await getRuns(request, backend, task.id)).length).toBe(1);
+
+    await expect(panel.getByText(`fake response to: ${followUp}`, { exact: true })).toBeVisible({ timeout: 30_000 });
+    await expect(async () => {
+      const runs = await getRuns(request, backend, task.id);
+      expect(runs.map((r) => r.status)).toEqual(["succeeded", "failed"]);
+    }).toPass({ timeout: PAUSE_TIMEOUT });
+    await expect(panel.getByText(FX_STEER_DROPPED_STATUS, { exact: true })).toHaveCount(0);
+  });
 });
+
+/** Create (not start) an fx task with an explicit prompt — the E1 tests'
+ *  counterpart of `createFakeFxRecoveryTask`, for the non-storm markers. */
+async function createFxTask(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  title: string,
+  prompt: string,
+): Promise<TaskRow> {
+  const createRes = await request.post(`${backend.apiBase}/tasks`, {
+    headers: authHeaders(backend),
+    data: { title, prompt, agent: "fx", mode: "yolo", isolation: "none", workdir: tmpdir() },
+  });
+  expect(createRes.ok(), `POST /tasks -> ${createRes.status()}: ${await createRes.text()}`).toBeTruthy();
+  const task = (await createRes.json()) as TaskRow;
+  createdTaskIds.push(task.id);
+  return task;
+}
+
+/** Types into the run panel's composer and presses Send. */
+async function sendFromComposer(panel: Locator, text: string): Promise<void> {
+  const textarea = panel.getByTestId("send-textarea");
+  await expect(textarea).toBeVisible();
+  await textarea.fill(text);
+  const send = panel.getByRole("button", { name: "Send" });
+  await expect(send).toBeEnabled();
+  await send.click();
+  await expect(textarea).toHaveValue("");
+}
+
+/** Asserts a task's run count holds at `n` for a couple of seconds — long
+ *  enough for a (wrongly) queued follow-up to have started its own run. */
+async function expectRunCountStays(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  taskId: string,
+  n: number,
+): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    expect((await getRuns(request, backend, taskId)).length).toBe(n);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}

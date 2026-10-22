@@ -606,7 +606,7 @@ test.describe("fx interactions", () => {
     await expect(panel.getByText(`fake response to: ${title}`, { exact: true })).toBeVisible({ timeout: 15_000 });
   });
 
-  test("fx 0.0.10 effort picker: New Task form offers Model default / Max thinking / High / Low for zai/glm-5.3-flash and defaults to Model default", async ({
+  test("fx effort picker: New Task form offers High / Medium / Low / No thinking / Model default for deepseek/deepseek-v4-flash and defaults to Model default", async ({
     page,
     request,
     backend,
@@ -616,13 +616,14 @@ test.describe("fx interactions", () => {
     await selectHarness(page, "fx.sh");
 
     // --- Default model + default effort --------------------------------------
-    // DEFAULT_MODEL.fx (src/shared/types.ts) is "zai/glm-5.3-flash"; picking
+    // DEFAULT_MODEL.fx (src/shared/types.ts) is "deepseek/deepseek-v4-flash"
+    // since fx 0.0.14 (docs/plans/fx-0.0.14-and-cursor-updates.md §3.4); picking
     // fx as the harness doesn't require a project to be selected first (the
     // Model/Effort row isn't gated on Project — see NewTaskForm.tsx's JSX
     // order), so no `selectProject` call is needed for this test, which
     // never submits the form.
     const modelSelect = newTaskModelSelect(page);
-    await expect(modelSelect).toHaveValue("zai/glm-5.3-flash");
+    await expect(modelSelect).toHaveValue("deepseek/deepseek-v4-flash");
 
     // DEFAULT_EFFORT.fx = "auto" ("Model default") — fx's own default, per
     // docs/plans/fx-0.0.10-compat.md D1 — so a freshly-selected fx harness
@@ -631,19 +632,20 @@ test.describe("fx interactions", () => {
     await expect(effortSelect).toHaveValue("auto");
     await expect(effortSelect.locator("option:checked")).toHaveText("Model default");
 
-    // --- Offered rows: MODEL_EFFORT_SUPPORT.fx["zai/glm-5.3-flash"] is
-    // exactly ["max", "high", "low", "auto"], rendered through EFFORT_OPTIONS
-    // in that canonical (highest → lowest, "auto" last) order — "Medium" is
-    // never one of them for this model (it's an id other kinds' tables use,
-    // and other fx models like GPT-5.2 do list it, but not this one).
+    // --- Offered rows: MODEL_EFFORT_SUPPORT.fx["deepseek/deepseek-v4-flash"]
+    // is exactly ["high", "medium", "low", "none", "auto"] (the stub's
+    // id-only catalog carries no efforts, so the curated table is the
+    // source), rendered through EFFORT_OPTIONS in that canonical (highest →
+    // lowest, "auto" last) order — "Max thinking" is never one of them for
+    // this model (other fx models, like GLM 5.3 Flash, do list it).
     const optionTexts = await effortSelect.locator("option").allTextContents();
-    expect(optionTexts).toEqual(["Max thinking", "High", "Low", "Model default"]);
+    expect(optionTexts).toEqual(["High", "Medium", "Low", "No thinking", "Model default"]);
     // `getByText(..., { exact: true })` scoped to the whole form, not just
     // the select — same exact-match rationale as the mode picker test above
     // ("Full access" vs "Yolo"): a substring match could false-positive on
     // an unrelated hint elsewhere in the form, though here it mainly just
     // double-checks the `optionTexts` assertion via a second code path.
-    await expect(newTaskFormPanel(page).getByText("Medium", { exact: true })).toHaveCount(0);
+    await expect(newTaskFormPanel(page).getByText("Max thinking", { exact: true })).toHaveCount(0);
 
     // --- Picking a row updates the trigger --------------------------------
     await effortSelect.selectOption({ label: "High" });
@@ -651,21 +653,23 @@ test.describe("fx interactions", () => {
     await expect(effortSelect.locator("option:checked")).toHaveText("High");
 
     // --- A no-effort model collapses/disables the picker --------------------
-    // MODEL_EFFORT_SUPPORT.fx["zai/glm-4.7"] is `[]` (one of the twelve
-    // curated fx models with no reasoning-effort setting at all) — the same
+    // MODEL_EFFORT_SUPPORT.fx["minimax/minimax-m3"] is `[]` (one of the two
+    // curated fx models with no reasoning-effort setting at all, per fx
+    // 0.0.14's `models[].efforts`) — the same
     // "efforts.length === 0" branch NewTaskForm.tsx/RunPanel.tsx render for
     // e.g. claude's Haiku 4.5 collapses the Effort `<select>` to a single
     // disabled "n/a" option. This deliberately does NOT drive the New Task
-    // form's own Model `<select>` to "zai/glm-4.7": fx is the one
+    // form's own Model `<select>` to "minimax/minimax-m3": fx is the one
     // `CATALOG_SCOPED_KINDS` member, and e2e/fixtures.ts's worker-wide fx
-    // stub (`writeFxStubBin`, frozen for this task — out of scope to edit)
-    // answers `fx models --json` with a fixed 3-id catalog
-    // (`zai/glm-5.3-flash`, `openai/gpt-5.2`, `e2e/discovered-only`) that
-    // does not include `zai/glm-4.7` — under the scoped curated ∩ discovered
+    // stub (`writeFxStubBin`)
+    // answers `fx models --json` with a fixed 4-id catalog
+    // (`deepseek/deepseek-v4-flash`, `zai/glm-5.3-flash`, `openai/gpt-5.2`,
+    // `e2e/discovered-only`) that does not include `minimax/minimax-m3` —
+    // under the scoped curated ∩ discovered
     // merge (`mergeModelOptions`, src/shared/model-options.ts) that model
     // never appears as a selectable `<option>` in this e2e environment, so
     // driving the picker there would time out (confirmed live: `selectOption
-    // ({label:"GLM 4.7"})` on the New Task form's Model select times out
+    // ({label:"MiniMax M3"})` on the New Task form's Model select times out
     // with "did not find some options"). Instead, this creates a second task
     // directly on that model (bypassing the picker's option list entirely,
     // exactly like `createAndStartFakeFxTask`'s `opts.model` override two
@@ -685,7 +689,7 @@ test.describe("fx interactions", () => {
         agent: "fx",
         isolation: "none",
         workdir: tmpdir(),
-        model: "zai/glm-4.7",
+        model: "minimax/minimax-m3",
       },
     });
     expect(createRes.ok(), `POST /tasks -> ${createRes.status()}: ${await createRes.text()}`).toBeTruthy();

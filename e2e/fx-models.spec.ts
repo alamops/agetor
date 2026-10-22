@@ -16,13 +16,14 @@ import { AGENT_OPTIONS } from "../src/shared/types.ts";
  * (`agetor add`, T8) is out of scope here — no Playwright coverage of the CLI.
  *
  * The account catalog is stood in by `e2e/fixtures.ts`'s fx stub binary,
- * which now answers `fx models --json` with a small fixed 3-id catalog:
- * `zai/glm-5.3-flash` and `openai/gpt-5.2` (both curated rows, proving the
+ * which now answers `fx models --json` with a small fixed 4-id catalog:
+ * `deepseek/deepseek-v4-flash` (the curated default since fx 0.0.14),
+ * `zai/glm-5.3-flash` and `openai/gpt-5.2` (all curated rows, proving the
  * curated ∩ discovered intersection) plus `e2e/discovered-only` (no curated
  * row, proving the discovered-only-id append). Every other curated fx id —
  * including non-catalogOnly rows like `spacexai/grok-4.6` /
  * `moonshotai/kimi-k2.7-code` and every `catalogOnly` premium row — is
- * absent from that 3-id catalog, so `mergeModelOptions`'s scoped branch
+ * absent from that 4-id catalog, so `mergeModelOptions`'s scoped branch
  * (`src/shared/model-options.ts`) filters them all out. This is the exact
  * merged list every test below polls for.
  *
@@ -44,18 +45,20 @@ interface TaskRow {
 
 /** The merged option *text* content every fx picker in this file should
  *  converge to — see the module doc comment above for why exactly these
- *  three. Order matters: curated rows first (curated-list order, filtered to
+ *  four. Order matters: curated rows first (curated-list order, filtered to
  *  those present in the discovered catalog), then discovered-only ids
  *  (discovered-list order) — `mergeModelOptions` rules 3/5. */
-const EXPECTED_FX_OPTION_LABELS = ["GLM 5.3 Flash", "GPT-5.2", "e2e/discovered-only"];
+const EXPECTED_FX_OPTION_LABELS = ["DeepSeek V4 Flash", "GLM 5.3 Flash", "GPT-5.2", "e2e/discovered-only"];
 
 /** `DEFAULT_MODEL.fx` (src/shared/types.ts) — the owner-chosen default
- *  (2026-08-27), also the first curated row, so it's always present in the
+ *  (fx 0.0.14, docs/plans/fx-0.0.14-and-cursor-updates.md §3.4 — the owner's
+ *  signed-in catalog lacks the earlier `zai/glm-5.3-flash` default), also
+ *  the first curated row, so it's always present in the
  *  converged list above and should be the picker's initial selected value. */
-const FX_DEFAULT_MODEL_ID = "zai/glm-5.3-flash";
+const FX_DEFAULT_MODEL_ID = "deepseek/deepseek-v4-flash";
 
 /** Curated ids that must NOT survive the curated ∩ discovered filter against
- *  the 3-id stub catalog: two ordinary curated rows absent from the stub
+ *  the 4-id stub catalog: two ordinary curated rows absent from the stub
  *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and twelve of the twenty
  *  `catalogOnly` premium rows (absent from the stub the same as any other
  *  id would be — catalogOnly gates them even harder, but plain absence
@@ -63,7 +66,7 @@ const FX_DEFAULT_MODEL_ID = "zai/glm-5.3-flash";
  *  (`anthropic/claude-fable-5.1`, docs/plans/fx-0.0.8-compat.md §3.7's S2
  *  catalog refresh) joins this list for the same reason — this file's
  *  worker-wide stub (`e2e/fixtures.ts writeFxStubBin`, frozen for this task)
- *  only ever answers the fixed 3-id catalog above; the positive case (a
+ *  only ever answers the fixed 4-id catalog above; the positive case (a
  *  catalog that DOES contain it) is covered by the dedicated additional-
  *  harness test below instead of a fourth id added to that frozen stub.
  *  `Claude Opus 5.5` (`anthropic/claude-opus-5.5`,
@@ -83,12 +86,12 @@ const EXCLUDED_FX_OPTION_LABELS = [
   "Claude Opus 5.5",
   "Claude Sonnet 5.5",
   // GPT-6 Sol / Luna (docs/plans/add-gpt-6-sol-and-luna.md, 2026-09-22) —
-  // catalogOnly rows, absent from this file's frozen 3-id fx stub catalog
+  // catalogOnly rows, absent from this file's frozen 4-id fx stub catalog
   // the same as every other premium row above.
   "GPT-6 Sol",
   "GPT-6 Luna",
   // GPT-6.1 Sol (docs/plans/add-gpt-6-1-sol.md, 2026-09-30) — catalogOnly
-  // row, absent from this file's frozen 3-id fx stub catalog like every other
+  // row, absent from this file's frozen 4-id fx stub catalog like every other
   // premium row above.
   "GPT-6.1 Sol",
   // Claude Haiku 5.5 (docs/plans/add-haiku-5-5.md) — catalogOnly, unverified
@@ -239,10 +242,12 @@ async function expectConvergedFxOptions(
 /**
  * Writes a throwaway fx stub binary — independent of e2e/fixtures.ts's
  * worker-wide `AGETOR_FX_BIN` stub (frozen for this task, and fixed to the
- * 3-id catalog `EXPECTED_FX_OPTION_LABELS` converges to) — whose
+ * 4-id catalog `EXPECTED_FX_OPTION_LABELS` converges to) — whose
  * `models --json` catalog includes `anthropic/claude-fable-5.1` (the S2
  * catalogOnly row added by docs/plans/fx-0.0.8-compat.md §3.7) alongside the
- * curated default `zai/glm-5.3-flash`. Handed to a brand-new *additional* fx
+ * curated default `deepseek/deepseek-v4-flash` (the picker's initial value —
+ * a catalog without it would add it back as an unlisted selected row).
+ * Handed to a brand-new *additional* fx
  * harness (`POST /harnesses`, its own `bin` field) below: `discoverFx`
  * (agent-discovery.ts) prefers a harness's own `bin` outright over
  * `AGETOR_FX_BIN`, so this harness's picker converges against this catalog
@@ -268,7 +273,7 @@ function writeFableCatalogStubBin(dir: string): string {
       "  exit 0",
       "fi",
       'if [ "$1" = "models" ] && [ "$2" = "--json" ]; then',
-      '  echo \'{"kind":"models","count":2,"shown_count":2,"more_count":0,"private_models_hidden":false,"ids":["zai/glm-5.3-flash","anthropic/claude-fable-5.1"]}\'',
+      '  echo \'{"kind":"models","count":2,"shown_count":2,"more_count":0,"private_models_hidden":false,"ids":["deepseek/deepseek-v4-flash","anthropic/claude-fable-5.1"]}\'',
       "  exit 0",
       "fi",
       "exit 0",
@@ -362,7 +367,7 @@ test.describe("fx model catalog picker", () => {
     // model-list command exists — see agent-discovery.ts's discoverClaude),
     // so its picker takes `mergeModelOptions`'s discovery-empty fallback
     // (curated list, as-is) regardless of `scoped` — the full curated set,
-    // unfiltered. A leak of fx's 3-id discovered catalog into claude-code's
+    // unfiltered. A leak of fx's 4-id discovered catalog into claude-code's
     // `discoveredForAgent` (e.g. a harness-id/kind key mixup) would instead
     // intersect claude's ids against fx's Gateway ids and produce an empty
     // (or unrecognizable) list, failing this exact-equality check.
@@ -445,13 +450,13 @@ test.describe("fx model catalog picker", () => {
       await selectHarness(page, harnessLabel);
 
       const modelSelect = newTaskModelSelect(page);
-      // This harness's own catalog (["zai/glm-5.3-flash",
+      // This harness's own catalog (["deepseek/deepseek-v4-flash",
       // "anthropic/claude-fable-5.1"]) converges to exactly these two
       // curated rows — one ordinary, one catalogOnly — in curated-list order
       // (`AGENT_OPTIONS.fx.models`), same `mergeModelOptions` rules
       // `expectConvergedFxOptions`'s default expectation exercises above,
       // just against a different account's catalog.
-      await expectConvergedFxOptions(modelSelect, ["GLM 5.3 Flash", "Claude Fable 5.1"]);
+      await expectConvergedFxOptions(modelSelect, ["DeepSeek V4 Flash", "Claude Fable 5.1"]);
     } finally {
       await fetch(`${backend.apiBase}/harnesses/${harnessId}`, { method: "DELETE", headers: auth }).catch(() => {});
       rmSync(stubDir, { recursive: true, force: true });

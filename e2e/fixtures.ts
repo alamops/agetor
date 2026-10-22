@@ -110,17 +110,27 @@ const PREFLIGHT_TIMEOUT_MS = 2_000;
  * never a throw — see `parseFxModels`), which would make every fx-model-
  * picker e2e assertion trivially true against an empty list instead of
  * proving the account-scoped merge (`mergeModelOptions`,
- * curated ∩ discovered + discovered-only) actually happened. The three ids
+ * curated ∩ discovered + discovered-only) actually happened. The four ids
  * below are deliberately a small, fixed catalog independent of the real
- * fx.sh Gateway catalog: two overlap curated `AGENT_OPTIONS.fx.models` rows
- * (`zai/glm-5.3-flash` — the curated default — and `openai/gpt-5.2`) to
- * exercise the "curated ∩ discovered" intersection, and one
- * (`e2e/discovered-only`) has no curated row at all, to exercise the
- * discovered-only-id append path. Deliberately still NOT implementing
- * `status --json` — that keeps the pre-flight auth check failing OPEN
- * (`loggedIn: null`) against this stub, exactly as documented above and in
- * CLAUDE.md's fx bullet, so no e2e spec (this file's callers included) is
- * ever blocked by the auth pre-flight.
+ * fx.sh Gateway catalog: three overlap curated `AGENT_OPTIONS.fx.models` rows
+ * (`deepseek/deepseek-v4-flash`, the curated default since fx 0.0.14,
+ * `zai/glm-5.3-flash` and `openai/gpt-5.2`) to exercise the "curated ∩
+ * discovered" intersection, and one (`e2e/discovered-only`) has no curated
+ * row at all, to exercise the discovered-only-id append path. By default it
+ * still does NOT answer `status --json` (empty output, exit 0) — that keeps
+ * the pre-flight auth check failing OPEN (`loggedIn: null`) against this
+ * stub, exactly as documented above and in CLAUDE.md's fx bullet, so no e2e
+ * spec is ever blocked by the auth pre-flight.
+ *
+ * Two opt-in env seams let a spec give one harness its own answers without a
+ * second stub binary: `AGETOR_E2E_FX_STATUS_JSON` (`status --json` prints
+ * that file — e.g. a `permission_mode` for the Settings Ask hint) and
+ * `AGETOR_E2E_FX_MODELS_JSON` (`models --json` prints that file instead of
+ * the fixed catalog — e.g. an fx ≥0.0.14 `models[]` array with speed
+ * flags). They are never set on the backend itself; a spec puts them in an
+ * additional fx harness's `env` map, which `harnessEnv` merges into both the
+ * status probe (`agent-status.ts`) and model discovery (`discoverFx`). Unset,
+ * the stub behaves exactly as described above.
  */
 function writeFxStubBin(dataDir: string): string {
   const binDir = path.join(dataDir, "fx-stub-bin");
@@ -138,8 +148,16 @@ function writeFxStubBin(dataDir: string): string {
       '  echo "0.0.4-fake"',
       "  exit 0",
       "fi",
+      'if [ "$1" = "status" ] && [ "$2" = "--json" ] && [ -n "$AGETOR_E2E_FX_STATUS_JSON" ]; then',
+      '  cat "$AGETOR_E2E_FX_STATUS_JSON"',
+      "  exit 0",
+      "fi",
       'if [ "$1" = "models" ] && [ "$2" = "--json" ]; then',
-      '  echo \'{"kind":"models","count":3,"shown_count":3,"more_count":0,"private_models_hidden":false,"ids":["zai/glm-5.3-flash","openai/gpt-5.2","e2e/discovered-only"]}\'',
+      '  if [ -n "$AGETOR_E2E_FX_MODELS_JSON" ]; then',
+      '    cat "$AGETOR_E2E_FX_MODELS_JSON"',
+      "    exit 0",
+      "  fi",
+      '  echo \'{"kind":"models","count":4,"shown_count":4,"more_count":0,"private_models_hidden":false,"ids":["deepseek/deepseek-v4-flash","zai/glm-5.3-flash","openai/gpt-5.2","e2e/discovered-only"]}\'',
       "  exit 0",
       "fi",
       "exit 0",
@@ -339,10 +357,21 @@ async function provisionBackend(
       // so `AGETOR_FX_BIN` points at the stub script written into this
       // backend's own `dataDir` above (mirrors
       // `src/bun/orchestrator-fx.test.ts`'s) instead of `/bin/echo`. Note:
-      // codex/cursor/gemini have no equivalent fake-driver wiring in this
-      // fixture — no spec here starts a run on any of them.
+      // codex/gemini have no equivalent fake-driver wiring in this fixture —
+      // no spec here starts a run on either of them.
       AGETOR_FX_DRIVER: "fake",
       AGETOR_FX_BIN: fxStubBinPath,
+      // cursor routes through its in-process fake driver too
+      // (e2e/cursor-stream.spec.ts starts cursor runs). Its start-task
+      // pre-flight only needs a binary that answers `--version`, so
+      // `/bin/echo` works like claude's above — and it also makes model
+      // discovery (`cursor-agent --list-models`) deterministic: echo prints
+      // the flag back, which `parseCursorModels` rejects, so the picker shows
+      // the curated list whether or not a real cursor-agent is installed on
+      // the machine running the suite.
+      AGETOR_CURSOR_DRIVER: "fake",
+      AGETOR_CURSOR_BIN: "/bin/echo",
+      AGETOR_CURSOR_ARGS: "",
       // Test seam for the fx auto-resume engine (`docs/plans/fx-recovery-
       // follow-ups.md` §3, `orchestrator.ts`'s `fxAutoResumePrefs`) — shrinks
       // the auto-resume delay from the 120s default down to 2s so
