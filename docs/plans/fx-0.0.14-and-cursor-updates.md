@@ -346,8 +346,10 @@ The Playwright fixtures start the headless backend per worker with the fake driv
 **Execution record** (filled in during the run): branch/base SHA, per-wave commit SHAs, L1/L2 results, and D1's draft PR release note.
 
 - **Branch / base:** `feature/fx-and-cursor-updates`, cut from `fbd68603afef778a618a94ca88e0c00997956afd`.
-- **Commits so far:** `1daf1834` docs (plan, investigation, grill) · `0ed6a082` wave 1 prep (the speed contract) · `b07caf56` wave 1 (speed enum, fx catalog, storage) · `f0e97539` wave 2 (fx 0.0.14 + cursor features). Wave 3 (fx steering) and wave 4 (e2e + docs): TBD.
-- **L1 / L2 results:** TBD.
+- **Commits so far:** `1daf1834` docs (plan, investigation, grill) · `0ed6a082` wave 1 prep (the speed contract) · `b07caf56` wave 1 (speed enum, fx catalog, storage) · `f0e97539` wave 2 (fx 0.0.14 + cursor features). · `36b6f03` wave 3 (fx steering + docs) · `125a478` docs (steer send order) · `784ea8a` wave 4 (e2e).
+- **Verification at hand-off:** `bun run typecheck` clean; full `bun test` green at wave 2 (8512 pass / 0 fail) and at wave 3 apart from 9 TUI/endpoint timing failures under load 40–90 that pass file-by-file; the 8 targeted Playwright specs green together (101 tests); full Playwright 337 pass / 2 load flakes (`font-size.spec.ts:294`, `theme.spec.ts:138`, both green on rerun).
+- **Deviations recorded during execution:** a built-in harness accepts a `profileMcpServers`-only patch; a non-boolean `fast` (and `speed`/`fast: null`) now 400s instead of coercing; RunPanel's usage chip was fx-gated and now also scans cursor; fx's paused summary reads " — fx paused this response; resume it, or send a new message."; a failed fx lane-off reads "fx: couldn't turn off <Tier> — <msg>"; the plan-approve mode switch happens after the plan file is written and is reverted when the send isn't delivered; the bound-task warning is also a PlanDialog toast; the held-tool line points at an added fx harness's env for `FX_REVIEW_MODEL` (built-in env is fixed); dropped steers re-queue in send order (`fxSendSeq`); the e2e worker backends now run the fake cursor driver.
+- **L1 / L2 results:** not run — L1 upgrades the owner's `~/.local/bin/fx` to 0.0.14 and needs the owner's go-ahead; both run against `~/.agetor-dev` only.
 - **Draft PR release note (D31, for the PR description):**
 
   > **fx 0.0.14 and cursor-agent 2026.10 support**
