@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import path from "node:path";import { cursorModelArg, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness } from "../shared/types.ts";
+import path from "node:path";import { cursorModelArg, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness, type Speed } from "../shared/types.ts";
 import { compactionStatusLine } from "../shared/compaction.ts";
 import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
 import { HANDOFF_TAG } from "../shared/pipeline.ts";
@@ -88,8 +88,11 @@ export interface AgentRunOptions {
   model?: string | null;
   /** Friendly reasoning-effort id (codex: minimal|low|medium|high). */
   effort?: string | null;
-  /** Fast model variant toggle. Currently consumed by cursor only. */
-  fast?: boolean | null;
+  /**
+   * Speed tier (`off | fast | ultrafast`). Cursor folds `fast` into the
+   * model id; fx applies it as an ACP session option. Other kinds ignore it.
+   */
+  speed?: Speed | null;
   /** Cursor Max Mode / large-context toggle. Currently consumed by cursor only. */
   maxMode?: boolean | null;
   /**
@@ -607,7 +610,7 @@ export function buildCommand(
     }
     // Cursor exposes thinking level and Fast as model variants. Curated base
     // model ids are composed here; unknown/discovered ids pass through.
-    args.push("--model", cursorModelArg(opts.model, opts.effort ?? null, opts.fast === true, opts.maxMode === true));
+    args.push("--model", cursorModelArg(opts.model, opts.effort ?? null, opts.speed === "fast", opts.maxMode === true));
 
     // Mode → auto-execute posture. `auto` (also the null default, per house
     // convention) runs with --force --sandbox disabled so cursor executes
@@ -904,7 +907,12 @@ export async function buildCodexCommand(
  * rather than touching tmux. Keeps orchestrator integration tests fast and
  * isolated from a real CLI.
  */
-type FakeDriverInstance = SpawnedAgent & { _record: string[] };
+type FakeDriverInstance = SpawnedAgent & {
+  _record: string[];
+  /** The speed tier the spawn's run options carried (recorded by the fake
+   *  fx branch, so orchestrator tests can see `task.speed` reach the spawn). */
+  _speed?: Speed | null;
+};
 const fakeDrivers = new Map<string, FakeDriverInstance>();
 export function __getFakeDriver(taskId: string): FakeDriverInstance | undefined {
   return fakeDrivers.get(taskId);
@@ -1675,6 +1683,7 @@ function makeFakeAgent(
     continueRecovery?: boolean;
     effort?: string | null;
     model?: string;
+    speed?: Speed | null;
   } = {},
 ): SpawnedAgent {  const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
@@ -2507,6 +2516,7 @@ function makeFakeAgent(
   }
   const inst: FakeDriverInstance = {
     _record: record,
+    _speed: fakeOpts.speed,
     kill: () => {
       record.push("kill");
       // Set before anything else so the fx-permission scenario's still-
@@ -2811,6 +2821,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
         continueRecovery: opts.continueRecovery === true,
         effort: opts.effort ?? null,
         model: opts.model ?? undefined,
+        speed: opts.speed ?? null,
       });
     }
     const built = buildCommand(harness, prompt, { ...opts, runId });

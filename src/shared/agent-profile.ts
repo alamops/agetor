@@ -1,6 +1,6 @@
 /**
  * Pure grammar for {@link AgentProfile} — reusable, named launch presets
- * (harness + model + effort + mode + fast/maxMode + free-text instructions +
+ * (harness + model + effort + mode + speed/maxMode + free-text instructions +
  * skills) picked on task launch instead of choosing each field by hand. This
  * module is shared by three surfaces that must never drift apart on "what
  * counts as a valid skill name" or "what the injected preamble looks like":

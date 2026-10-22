@@ -45,6 +45,7 @@ function agent(key: string, overrides: Record<string, unknown> = {}): Record<str
     model: "opus-5.5",
     effort: "high",
     mode: "auto",
+    speed: "off",
     fast: false,
     maxMode: false,
     instructions: "",
@@ -183,15 +184,26 @@ describe("planBundleImport — harness resolution (K5)", () => {
     expect(p.canImport).toBe(false);
   });
 
+  test("the plan carries each Agent's speed; a fast-only Agent reads as fast", () => {
+    const legacyFast = agent("legacy", { fast: true });
+    delete legacyFast.speed;
+    const p = plan(bundle([agent("ultra", { speed: "ultrafast", fast: true }), legacyFast, agent("plain")]));
+    expect(p.agents.map((x) => [x.key, x.speed])).toEqual([
+      ["ultra", "ultrafast"],
+      ["legacy", "fast"],
+      ["plain", "off"],
+    ]);
+  });
+
   test("rebound: an unknown kind mapped to any local harness resets its settings", () => {
     const parsed = bundle([
-      agent("future", { harness: { id: "grok", kind: "grok", label: "Grok" }, model: "grok-9", fast: true, maxMode: true }),
+      agent("future", { harness: { id: "grok", kind: "grok", label: "Grok" }, model: "grok-9", speed: "ultrafast", fast: true, maxMode: true }),
     ]);
     const p = plan(parsed, localState(), { harnessMap: { grok: "codex" } });
     const a = p.agents[0]!;
     expect(a.resolution).toBe("rebound");
     expect(a.harnessId).toBe("codex");
-    expect([a.model, a.effort, a.mode, a.fast, a.maxMode]).toEqual([DEFAULT_MODEL.codex, null, null, false, false]);
+    expect([a.model, a.effort, a.mode, a.speed, a.maxMode]).toEqual([DEFAULT_MODEL.codex, null, null, "off", false]);
     expect(a.warnings.map((w) => w.code)).toEqual(["settings-reset"]);
     expect(p.canImport).toBe(true);
   });
@@ -562,6 +574,13 @@ describe("planBundleImport — fingerprint", () => {
       harnesses: [...localState().harnesses, harness("secondary-claude-code", "claude-code")],
     });
     expect(plan(parsed, exact).fingerprint).not.toBe(base.fingerprint);
+  });
+
+  test("changes when an Agent's speed changes", () => {
+    const at = (speed: string) => plan(bundle([agent("a", { speed })])).fingerprint;
+    expect(at("off")).not.toBe(at("fast"));
+    expect(at("fast")).not.toBe(at("ultrafast"));
+    expect(at("ultrafast")).toBe(at("ultrafast"));
   });
 
   test("covers the harnesses an import enables", () => {

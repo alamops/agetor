@@ -18,7 +18,7 @@ import { TaskLaunchPickers, useTaskLaunch, type TaskLaunch } from "./TaskLaunchP
 
 /** Local edit-buffer shape for the create/edit form — the two fields
  *  `TaskLaunchPickers` doesn't own (name, and the composition-only
- *  instructions/skills pair; harness/mode/model/effort/fast/maxMode live on
+ *  instructions/skills pair; harness/mode/model/effort/speed/maxMode live on
  *  the `useTaskLaunch` hook instead of being duplicated here). Mirrors
  *  `AgentProfilesSection`'s original inline `FormState`. */
 interface FormState {
@@ -46,7 +46,7 @@ export interface AgentProfileFormProps {
    *  dialog's own focus-management already handles that case). */
   autoFocus?: boolean;
   /** Reports whether the form holds unsaved edits — a text field differing
-   *  from what the form opened with, or any harness/mode/model/effort/fast/
+   *  from what the form opened with, or any harness/mode/model/effort/speed/
    *  max-mode pick the user made. Fires when the flag flips and reports
    *  `false` again when the form unmounts, so a host can keep a plain
    *  "is dirty" ref without tracking mount state itself. */
@@ -64,7 +64,7 @@ const CARD_ROOT_CLASS = "rounded-md border border-border/60 p-3";
 const PAGE_FOOTER_CLASS = "border-t border-border/60 pt-3";
 
 /**
- * The agent-profile create/edit form — name, harness/mode/model/effort/fast/
+ * The agent-profile create/edit form — name, harness/mode/model/effort/speed/
  * maxMode (via `<TaskLaunchPickers hideProfilePicker>`), instructions and
  * skills. Extracted out of `AgentProfilesSection` (Settings → Agents) so it
  * can be hosted twice without duplicating the save/validation logic: as the
@@ -230,7 +230,7 @@ function AgentProfileFormBody({
           mode: editingProfile.mode,
           model: editingProfile.model,
           effort: editingProfile.effort,
-          fast: editingProfile.fast,
+          speed: editingProfile.speed,
           maxMode: editingProfile.maxMode,
         }
       : undefined,
@@ -261,9 +261,9 @@ function AgentProfileFormBody({
         if (effort !== launch.effort) setLaunchTouched(true);
         launch.setEffort(effort);
       },
-      setFast: (fast) => {
-        if (fast !== launch.fast) setLaunchTouched(true);
-        launch.setFast(fast);
+      setSpeed: (speed) => {
+        if (speed !== launch.speed) setLaunchTouched(true);
+        launch.setSpeed(speed);
       },
       setMaxMode: (maxMode) => {
         if (maxMode !== launch.maxMode) setLaunchTouched(true);
@@ -309,7 +309,7 @@ function AgentProfileFormBody({
         model: launch.model,
         effort: launch.effort,
         mode: launch.mode,
-        fast: launch.fast,
+        speed: launch.speed,
         maxMode: launch.maxMode,
         instructions: form.instructions,
         skills: form.skills,

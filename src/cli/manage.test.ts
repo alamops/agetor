@@ -295,7 +295,7 @@ test("cmdEdit: the server's 'bound to agent' 409 is reworded to 'profile' at the
       model: DEFAULT_MODEL["claude-code"],
       effort: null,
       mode: null,
-      fast: false,
+      speed: "off",
       maxMode: false,
       instructions: "",
       skills: [],
@@ -332,6 +332,55 @@ test("cmdEdit: the server's 'bound to agent' 409 is reworded to 'profile' at the
     expect(after.title).toBe("Bound (detached)");
 
     await client.deleteAgentProfile(profile.id);
+    await client.deleteTask(t.id);
+    rmSync(workdir, { recursive: true, force: true });
+  });
+}, 30_000);
+
+// docs/plans/fx-0.0.14-and-cursor-updates.md §3.1 "CLI alias": `--speed`
+// and its `--fast`/`--no-fast` aliases, the later flag winning.
+
+test("cmdEdit: an invalid --speed is a usage error before any client is created", async () => {
+  // A throwaway dataDir, an unused port and --no-daemon: reaching getClient
+  // could only fail with "no core", never touch a real one — so a rejection
+  // naming the tiers proves the parse failed first.
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-mg-speed-bad-"));
+  const f = { dataDir: dir, port: 4542, json: false, plain: true, noDaemon: true };
+  try {
+    await expect(cmdEdit(["abcd1234", "--speed", "warp"], f)).rejects.toThrow(
+      "'--speed' must be one of off, fast, ultrafast (got 'warp')",
+    );
+    await expect(cmdEdit(["abcd1234", "--speed"], f)).rejects.toThrow("'--speed' needs a value");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cmdEdit: --speed / --fast / --no-fast patch the task's speed, the later flag winning", async () => {
+  await withClient(4541, async (client, dir) => {
+    const workdir = mkdtempSync(path.join(tmpdir(), "agetor-mg-speed-"));
+    const t = await client.createTask({ title: "Speedy", prompt: "p", isolation: "none", workdir, agent: "fx" });
+    expect(t.speed).toBe("off");
+    const f = { dataDir: dir, json: false, plain: true, noDaemon: false };
+
+    await cmdEdit([t.id, "--speed", "ultrafast"], f);
+    expect((await client.getTask(t.id)).speed).toBe("ultrafast");
+
+    await cmdEdit([t.id, "--no-fast"], f);
+    expect((await client.getTask(t.id)).speed).toBe("off");
+
+    await cmdEdit([t.id, "--fast"], f);
+    const fast = await client.getTask(t.id);
+    expect(fast.speed).toBe("fast");
+    // Responses still carry the derived legacy field for older clients.
+    expect(fast.fast).toBe(true);
+
+    await cmdEdit([t.id, "--fast", "--speed", "ultrafast"], f);
+    expect((await client.getTask(t.id)).speed).toBe("ultrafast");
+
+    await cmdEdit([t.id, "--speed", "ultrafast", "--no-fast"], f);
+    expect((await client.getTask(t.id)).speed).toBe("off");
+
     await client.deleteTask(t.id);
     rmSync(workdir, { recursive: true, force: true });
   });

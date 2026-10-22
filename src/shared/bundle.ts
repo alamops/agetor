@@ -30,7 +30,8 @@ import {
   stripControls,
   stripInvisible,
 } from "./terminal-text.ts";
-import type { AgentProfile, Harness, Pipeline, PipelineEdge, PipelineGraph } from "./types.ts";
+import { isSpeed, speedFromFast } from "./speed.ts";
+import type { AgentProfile, Harness, Pipeline, PipelineEdge, PipelineGraph, Speed } from "./types.ts";
 
 export const BUNDLE_FORMAT = "agetor-bundle";
 export const BUNDLE_VERSION = 1;
@@ -74,6 +75,11 @@ export interface BundleAgent {
   model: string;
   effort: string | null;
   mode: string | null;
+  /** The speed tier (D15). Bundle version 1 files written before tiers
+   *  existed carry only `fast`; the parser reads that as `fast`/`off`. */
+  speed: Speed;
+  /** Derived (`speed !== "off"`), written so an older agetor still imports
+   *  the Agent — Ultrafast as Fast. The parser prefers `speed`. */
   fast: boolean;
   maxMode: boolean;
   instructions: string;
@@ -778,7 +784,8 @@ export function buildBundle(input: {
       model,
       effort: optional(p.effort, "effort", BUNDLE_LIMITS.effort),
       mode: optional(p.mode, "mode", BUNDLE_LIMITS.mode),
-      fast: p.fast,
+      speed: p.speed,
+      fast: p.speed !== "off",
       maxMode: p.maxMode,
       instructions: exportText(p.instructions, { multiline: true }, "instructions", changes),
       // Cleaning can make two skills equal (`A\u200b` and `A`); keep one.
@@ -1143,6 +1150,18 @@ function boolField(value: unknown, what: string): boolean {
   return value;
 }
 
+/** An Agent's `speed` (strict tier) and/or legacy `fast` (boolean). `speed`
+ *  wins over a conflicting `fast`; neither reads as `off`. `fast` is
+ *  rewritten from the tier, so a parsed Agent never carries a mismatch. */
+function speedFields(speed: unknown, fast: unknown, label: string): { speed: Speed; fast: boolean } {
+  const legacy = boolField(fast, `${label} fast`);
+  let tier: Speed;
+  if (speed === undefined || speed === null) tier = speedFromFast(legacy);
+  else if (isSpeed(speed)) tier = speed;
+  else return invalid(`${label} speed must be one of off, fast, ultrafast`);
+  return { speed: tier, fast: tier !== "off" };
+}
+
 function skillsField(value: unknown, what: string): string[] {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) return invalid(`${what} must be an array of strings`);
@@ -1205,7 +1224,7 @@ function parseAgent(raw: unknown, index: number, keys: Set<string>): BundleAgent
     model: lineField(raw.model, `${label} model`, BUNDLE_LIMITS.model),
     effort: optionalLineField(raw.effort, `${label} effort`, BUNDLE_LIMITS.effort),
     mode: optionalLineField(raw.mode, `${label} mode`, BUNDLE_LIMITS.mode),
-    fast: boolField(raw.fast, `${label} fast`),
+    ...speedFields(raw.speed, raw.fast, label),
     maxMode: boolField(raw.maxMode, `${label} maxMode`),
     instructions: textField(raw.instructions, `${label} instructions`, AGENT_PROFILE_LIMITS.instructions),
     skills: skillsField(raw.skills, `${label} skills`),

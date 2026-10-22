@@ -1,5 +1,11 @@
 import { test, expect } from "bun:test";
-import { canonicalInstructions, formatAgentProfileListRow, parseAgentProfileFlags, taskCountText } from "./agent-profile.ts";
+import {
+  canonicalInstructions,
+  formatAgentProfileListRow,
+  formatAgentProfileShow,
+  parseAgentProfileFlags,
+  taskCountText,
+} from "./agent-profile.ts";
 import type { AgentProfile } from "../../shared/types.ts";
 
 /**
@@ -38,24 +44,46 @@ test("parseAgentProfileFlags: --mode", () => {
   expect(f.mode).toBe("ask");
 });
 
-test("parseAgentProfileFlags: --fast sets fast true", () => {
-  const f = parseAgentProfileFlags(["--fast"]);
-  expect(f.fast).toBe(true);
+test("parseAgentProfileFlags: --speed takes each tier", () => {
+  expect(parseAgentProfileFlags(["--speed", "off"]).speed).toBe("off");
+  expect(parseAgentProfileFlags(["--speed", "fast"]).speed).toBe("fast");
+  expect(parseAgentProfileFlags(["--speed", "ultrafast"]).speed).toBe("ultrafast");
 });
 
-test("parseAgentProfileFlags: --no-fast sets fast false", () => {
+test("parseAgentProfileFlags: an unknown --speed tier is a usage error naming the tiers", () => {
+  expect(() => parseAgentProfileFlags(["--speed", "warp"])).toThrow(
+    "'--speed' must be one of off, fast, ultrafast (got 'warp')",
+  );
+});
+
+test("parseAgentProfileFlags: --speed with no value is refused", () => {
+  expect(() => parseAgentProfileFlags(["--speed"])).toThrow("'--speed' needs a value");
+});
+
+test("parseAgentProfileFlags: --fast is --speed fast", () => {
+  const f = parseAgentProfileFlags(["--fast"]);
+  expect(f.speed).toBe("fast");
+});
+
+test("parseAgentProfileFlags: --no-fast is --speed off", () => {
   const f = parseAgentProfileFlags(["--no-fast"]);
-  expect(f.fast).toBe(false);
+  expect(f.speed).toBe("off");
 });
 
 test("parseAgentProfileFlags: --fast then --no-fast — last one wins", () => {
   const f = parseAgentProfileFlags(["--fast", "--no-fast"]);
-  expect(f.fast).toBe(false);
+  expect(f.speed).toBe("off");
 });
 
 test("parseAgentProfileFlags: --no-fast then --fast — last one wins", () => {
   const f = parseAgentProfileFlags(["--no-fast", "--fast"]);
-  expect(f.fast).toBe(true);
+  expect(f.speed).toBe("fast");
+});
+
+test("parseAgentProfileFlags: --speed and --fast/--no-fast mixed — the later flag wins", () => {
+  expect(parseAgentProfileFlags(["--speed", "ultrafast", "--fast"]).speed).toBe("fast");
+  expect(parseAgentProfileFlags(["--fast", "--speed", "ultrafast"]).speed).toBe("ultrafast");
+  expect(parseAgentProfileFlags(["--speed", "ultrafast", "--no-fast"]).speed).toBe("off");
 });
 
 test("parseAgentProfileFlags: --max-mode sets maxMode true", () => {
@@ -68,9 +96,9 @@ test("parseAgentProfileFlags: --no-max-mode sets maxMode false", () => {
   expect(f.maxMode).toBe(false);
 });
 
-test("parseAgentProfileFlags: neither --fast/--no-fast nor --max-mode/--no-max-mode leaves them undefined", () => {
+test("parseAgentProfileFlags: no speed flag nor --max-mode/--no-max-mode leaves them undefined", () => {
   const f = parseAgentProfileFlags([]);
-  expect(f.fast).toBeUndefined();
+  expect(f.speed).toBeUndefined();
   expect(f.maxMode).toBeUndefined();
 });
 
@@ -180,7 +208,7 @@ test("parseAgentProfileFlags: every flag combined parses into one flags object",
     model: "gpt-6-astra",
     effort: "high",
     mode: "auto",
-    fast: true,
+    speed: "fast",
     maxMode: true,
     instructions: "Be thorough.",
     skills: ["code-review", "security-review"],
@@ -245,7 +273,7 @@ function fakeProfile(overrides: Partial<AgentProfile> = {}): AgentProfile {
     model: "gpt-6-astra",
     effort: "high",
     mode: "auto",
-    fast: false,
+    speed: "off",
     maxMode: false,
     instructions: "Be thorough and check for regressions carefully across the whole diff.",
     skills: ["code-review", "security-review"],
@@ -291,7 +319,7 @@ test("formatAgentProfileListRow: names and instructions print with control chara
     model: "opus\u009b",
     effort: null,
     mode: null,
-    fast: false,
+    speed: "off",
     maxMode: false,
     instructions: "do\u001b]52;c;x\u0007 it",
     skills: [],
@@ -310,7 +338,7 @@ test("formatAgentProfileListRow: instructions cut never leaves half an emoji, an
     model: "opus",
     effort: null,
     mode: null,
-    fast: false,
+    speed: "off" as const,
     maxMode: false,
     skills: [],
     createdAt: 1,
@@ -326,4 +354,29 @@ test("formatAgentProfileListRow: instructions cut never leaves half an emoji, an
   expect(scripts[7]).not.toContain("\\u200c");
   expect(scripts[7]).not.toContain("\\u200d");
   expect(scripts[7]).toContain("next line");
+});
+
+// ── formatAgentProfileShow (`agetor profile show`) ───────────────────────
+
+test("formatAgentProfileShow: prints the speed tier, not a fast yes/no", () => {
+  const lines = formatAgentProfileShow(fakeProfile({ speed: "fast", taskCount: 1 }));
+  const speedLine = lines.find((l) => l.includes("speed:"));
+  expect(speedLine).toBe("  speed: fast   max mode: no");
+  expect(lines.join("\n")).not.toContain("fast: ");
+});
+
+test("formatAgentProfileShow: off and ultrafast print as their tier", () => {
+  expect(formatAgentProfileShow(fakeProfile({ speed: "off" })).join("\n")).toContain("speed: off");
+  expect(formatAgentProfileShow(fakeProfile({ speed: "ultrafast", maxMode: true })).join("\n")).toContain(
+    "speed: ultrafast   max mode: yes",
+  );
+});
+
+test("formatAgentProfileShow: header, fields, used-by and instructions lines", () => {
+  const lines = formatAgentProfileShow(fakeProfile({ taskCount: 2, instructions: "Line one.\nLine two.\n" }));
+  expect(lines[0]).toBe("Reviewer  p1");
+  expect(lines[1]).toBe("  harness: codex   model: gpt-6-astra   effort: high   mode: auto");
+  expect(lines).toContain("  skills: /code-review, /security-review");
+  expect(lines).toContain("  used by: 2 tasks");
+  expect(lines.slice(-3)).toEqual(["  instructions:", "    Line one.", "    Line two."]);
 });

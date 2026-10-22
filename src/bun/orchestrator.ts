@@ -183,6 +183,7 @@ import { appendReferences } from "../shared/refs.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
 import { expandAtReferencesDetailed } from "./project-files.ts";
 import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
+import { isSpeed } from "../shared/speed.ts";
 
 type Listener = (e: RunEvent) => void;
 const listeners = new Set<Listener>();
@@ -1520,7 +1521,7 @@ async function startTaskInner(
       task.model !== profile.model ||
       task.effort !== resolvedEffort ||
       task.mode !== profile.mode ||
-      task.fast !== profile.fast ||
+      task.speed !== profile.speed ||
       task.maxMode !== profile.maxMode ||
       agentProfileSnapshotDrifted(task.agentProfile ?? null, profile);
     if (driftedFromRow) {
@@ -1529,7 +1530,7 @@ async function startTaskInner(
         model: profile.model,
         effort: resolvedEffort,
         mode: profile.mode,
-        fast: profile.fast,
+        speed: profile.speed,
         maxMode: profile.maxMode,
       }) ?? task;
       task = tasks.setAgentProfile(taskId, profile.id, profile) ?? task;
@@ -1791,7 +1792,7 @@ async function startTaskInner(
         ? { antigravitySessionId: sessionId }
         : { fxSessionId: sessionId });
     },
-    opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, fast: task.fast, maxMode: task.maxMode },
+    opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, speed: task.speed, maxMode: task.maxMode },
   };
 
   // Everything from here on — the actual spawn and everything that depends
@@ -2769,7 +2770,7 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     // alias swaps keep the picks — those ids stay valid.
     if (afterKind && beforeKind !== afterKind) {
       const nextMode = defaultModeFor(afterKind);
-      tasks.update(taskId, { mode: nextMode, model: null, effort: null, fast: false, maxMode: false });
+      tasks.update(taskId, { mode: nextMode, model: null, effort: null, speed: "off", maxMode: false });
     }
     return;
   }
@@ -3974,7 +3975,7 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
         effort: task.effort,
-        fast: task.fast,
+        speed: task.speed,
         maxMode: task.maxMode,
         resumeSessionId: priorThreadId,
       },
@@ -4175,7 +4176,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
         effort: task.effort,
-        fast: task.fast,
+        speed: task.speed,
         maxMode: task.maxMode,
         // Same generic resume-session field claude-code and codex already
         // thread through `spawnAgent` → `buildCommand` — cursor's `session_id`
@@ -4359,7 +4360,7 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
         effort: task.effort,
-        fast: task.fast,
+        speed: task.speed,
         maxMode: task.maxMode,
         resumeSessionId: priorSessionId,
       },
@@ -4525,7 +4526,7 @@ async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string)
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
         effort: task.effort,
-        fast: task.fast,
+        speed: task.speed,
         maxMode: task.maxMode,
         resumeSessionId: priorSessionId,
       },
@@ -4883,7 +4884,7 @@ async function spawnFxRun(
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
         effort: task.effort,
-        fast: task.fast,
+        speed: task.speed,
         maxMode: task.maxMode,
         resumeSessionId: priorSessionId,
         ...("continueRecovery" in turn ? { continueRecovery: true } : {}),
@@ -6090,7 +6091,7 @@ async function spawnResumedSessionInner(
           mode: task.mode,
           model: task.model ?? DEFAULT_MODEL[harness.kind],
           effort: task.effort,
-          fast: task.fast,
+          speed: task.speed,
           maxMode: task.maxMode,
           resumeSessionId: priorSessionId,
         },
@@ -6195,7 +6196,7 @@ export interface CreateTaskInput extends Partial<Task> {
    * Bind this task to a reusable {@link AgentProfile} at create time
    * (docs/plans/agent-profiles.md). When set to a resolvable profile id,
    * `createTask` overrides the effective `agent`/`model`/`effort`/`mode`/
-   * `fast`/`maxMode` from the profile — any of those six fields also present
+   * `speed`/`maxMode` from the profile — any of those six fields also present
    * in the body are ignored — and stores both the id and a point-in-time
    * `AgentProfileSnapshot` on the new row. Also settable via the inherited
    * `Partial<Task>` field; listed here too so its doc comment lives next to
@@ -6208,7 +6209,7 @@ export interface CreateTaskInput extends Partial<Task> {
    * D1) — mutually exclusive with `agentProfileId` (`{ error }` when both are
    * set). The created row is a **pipeline task**: `startTask` routes it to
    * `startPipelineRun` instead of spawning an agent, and its own
-   * agent/model/effort/mode/fast/maxMode fields are cosmetic, mirroring the
+   * agent/model/effort/mode/speed/maxMode fields are cosmetic, mirroring the
    * graph's start step (A1). Also settable via the inherited `Partial<Task>`
    * field; listed here too so its doc comment lives next to the validation it
    * triggers. An unresolvable id, a graph with no resolvable start step, or
@@ -6334,7 +6335,7 @@ export async function createTask(
   // Pipeline binding (D1, docs/plans/pipelines.md): mutually exclusive with
   // `agentProfileId` — a pipeline task never launches an agent of its own
   // (the runner drives hidden step tasks instead), but its own
-  // agent/model/effort/mode/fast/maxMode fields still cosmetically mirror
+  // agent/model/effort/mode/speed/maxMode fields still cosmetically mirror
   // the graph's start step (A1) so every existing per-task surface that
   // reads those fields (board filters, badges, CLI `ls`) keeps working
   // unchanged. Validated up front, before `profile` below, so a bad
@@ -6376,7 +6377,7 @@ export async function createTask(
       return { error: `unknown agent profile "${requestedProfileId}"` };
     }
   }
-  // Cosmetic defaults source for agent/model/effort/mode/fast/maxMode: a
+  // Cosmetic defaults source for agent/model/effort/mode/speed/maxMode: a
   // bound profile wins as before; otherwise a pipeline task's start-step
   // profile fills the same role (A1) — but `profile` itself stays null
   // below, so the task row is never recorded as BOUND to that profile
@@ -6556,7 +6557,7 @@ export async function createTask(
     mode: defaultsProfile ? defaultsProfile.mode : (input.mode ?? null),
     model,
     effort,
-    fast: defaultsProfile ? defaultsProfile.fast : input.fast === true,
+    speed: defaultsProfile ? defaultsProfile.speed : isSpeed(input.speed) ? input.speed : "off",
     maxMode: defaultsProfile ? defaultsProfile.maxMode : input.maxMode === true,
     agentProfileId: profile?.id ?? null,
     agentProfile: agentProfileSnapshot,

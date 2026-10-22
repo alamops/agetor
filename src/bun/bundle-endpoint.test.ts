@@ -679,12 +679,12 @@ describe("POST /bundle/import", () => {
     const ok = await call("/bundle/import", { text, options: { harnessMap: { "grok-2": "claude-code" } } });
     expect(ok.status).toBe(201);
     const [agent] = ((await ok.json()) as { agents: AgentProfile[] }).agents;
-    expect([agent!.harness, agent!.model, agent!.effort, agent!.mode, agent!.fast]).toEqual([
+    expect([agent!.harness, agent!.model, agent!.effort, agent!.mode, agent!.speed]).toEqual([
       "claude-code",
       "opus-5.5",
       null,
       null,
-      false,
+      "off",
     ]);
   });
 
@@ -949,5 +949,48 @@ describe("POST /bundle/import", () => {
     expect(selfBody.error).not.toContain("repeats the connection");
     expect(await get<AgentProfile[]>("/agent-profiles")).toEqual([]);
     expect(await get<Pipeline[]>("/pipelines")).toEqual([]);
+  });
+});
+
+describe("speed (D15)", () => {
+  test("an Ultrafast Agent exports speed plus fast and imports back as Ultrafast", async () => {
+    const ultra = await createProfile({ name: "Ultra", speed: "ultrafast" });
+    expect(ultra.speed).toBe("ultrafast");
+    const res = await call("/bundle/export", { agentIds: [ultra.id] });
+    expect(res.status).toBe(200);
+    const { text } = (await res.json()) as { text: string };
+    const file = JSON.parse(text) as { agents: { speed: string; fast: boolean }[] };
+    expect(file.agents[0]).toMatchObject({ speed: "ultrafast", fast: true });
+    db.run(`DELETE FROM agent_profiles`);
+
+    const imported = await call("/bundle/import", { text });
+    expect(imported.status).toBe(201);
+    const [agent] = ((await imported.json()) as { agents: AgentProfile[] }).agents;
+    expect(agent!.speed).toBe("ultrafast");
+    const stored = await get<AgentProfile[]>("/agent-profiles");
+    expect(stored.map((p) => [p.name, p.speed])).toEqual([["Ultra", "ultrafast"]]);
+  });
+
+  test("a fast-only file imports as Fast; speed wins over a conflicting fast; a bad speed is 400", async () => {
+    const file = (agent: Record<string, unknown>) =>
+      JSON.stringify({
+        format: "agetor-bundle",
+        version: 1,
+        agents: [{ key: "w", name: "Worker", harness: { id: "claude-code", kind: "claude-code", label: "Claude Code" }, model: "opus-5.5", ...agent }],
+      });
+    const legacy = await call("/bundle/import", { text: file({ fast: true }) });
+    expect(legacy.status).toBe(201);
+    expect(((await legacy.json()) as { agents: AgentProfile[] }).agents[0]!.speed).toBe("fast");
+
+    db.run(`DELETE FROM agent_profiles`);
+    const both = await call("/bundle/import", { text: file({ speed: "off", fast: true }) });
+    expect(both.status).toBe(201);
+    expect(((await both.json()) as { agents: AgentProfile[] }).agents[0]!.speed).toBe("off");
+
+    const bad = await call("/bundle/import/preview", { text: file({ speed: "warp" }) });
+    expect(bad.status).toBe(400);
+    const body = (await bad.json()) as { error: string; code: string };
+    expect(body.code).toBe("invalid");
+    expect(body.error).toContain("speed must be one of off, fast, ultrafast");
   });
 });

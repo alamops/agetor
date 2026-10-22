@@ -70,7 +70,7 @@ function makeProfileSnapshot(overrides: Partial<AgentProfileSnapshot> = {}): Age
     model: "sonnet-5",
     effort: null,
     mode: null,
-    fast: false,
+    speed: "off",
     maxMode: false,
     instructions: "Be thorough.",
     skills: [],

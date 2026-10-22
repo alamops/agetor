@@ -113,7 +113,7 @@ function plannedAgent(over: Partial<PlannedAgent> = {}): PlannedAgent {
     model: "opus-5.5",
     effort: null,
     mode: null,
-    fast: false,
+    speed: "off",
     maxMode: false,
     instructions: "",
     skills: [],

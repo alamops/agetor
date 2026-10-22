@@ -49,7 +49,7 @@ async function createProfile(overrides: Record<string, unknown> = {}): Promise<A
       model: "claude-opus-4-7",
       effort: "high",
       mode: "auto",
-      fast: false,
+      speed: "off",
       maxMode: false,
       instructions: "Be terse.",
       skills: ["skill-a", "skill-b"],
@@ -98,7 +98,7 @@ test("duplicate with {} copies fields and names it (copy)", async () => {
   const p = body.profile;
   expect(p.name).toBe("Research Bot (copy)");
   expect(p.id).not.toBe(src.id);
-  for (const k of ["harness", "model", "effort", "mode", "fast", "maxMode", "instructions", "skills"] as const) {
+  for (const k of ["harness", "model", "effort", "mode", "speed", "fast", "maxMode", "instructions", "skills"] as const) {
     expect(p[k]).toEqual(src[k]);
   }
   expect(body.copiedTasks).toEqual([]);
@@ -202,4 +202,54 @@ test("explicit name and model override win", async () => {
   const p = ((await res.json()) as { profile: AgentProfile }).profile;
   expect(p.name).toBe("Renamed");
   expect(p.model).toBe("sonnet-5");
+});
+
+// Speed alias (D13): `speed` and the legacy boolean `fast` both override the
+// source's tier; neither present keeps it; a bad value of either 400s and
+// writes nothing.
+test("omitted speed/fast keeps the source's tier", async () => {
+  const src = await createProfile({ harness: "cursor", model: "composer-2", speed: "fast" });
+  const res = await dup(src.id);
+  expect(res.status).toBe(201);
+  const p = ((await res.json()) as { profile: AgentProfile }).profile;
+  expect(p.speed).toBe("fast");
+  expect(p.fast).toBe(true);
+});
+
+test("explicit speed overrides the source's tier", async () => {
+  const src = await createProfile({ speed: "fast" });
+  const res = await dup(src.id, { speed: "ultrafast" });
+  expect(res.status).toBe(201);
+  const p = ((await res.json()) as { profile: AgentProfile }).profile;
+  expect(p.speed).toBe("ultrafast");
+  expect(p.fast).toBe(true);
+});
+
+test("legacy fast: false maps to speed off", async () => {
+  const src = await createProfile({ speed: "fast" });
+  const res = await dup(src.id, { fast: false });
+  expect(res.status).toBe(201);
+  const p = ((await res.json()) as { profile: AgentProfile }).profile;
+  expect(p.speed).toBe("off");
+  expect(p.fast).toBe(false);
+});
+
+test("legacy fast: true maps to speed fast, and speed wins over fast", async () => {
+  const src = await createProfile();
+  const viaFast = ((await (await dup(src.id, { fast: true })).json()) as { profile: AgentProfile }).profile;
+  expect(viaFast.speed).toBe("fast");
+  const both = ((await (await dup(src.id, { speed: "off", fast: true })).json()) as { profile: AgentProfile }).profile;
+  expect(both.speed).toBe("off");
+});
+
+test.each([
+  [{ speed: "turbo" }, "speed must be one of off, fast, ultrafast"],
+  [{ fast: "yes" }, "fast must be a boolean"],
+])("bad speed input %j is 400 and writes nothing", async (body, message) => {
+  const src = await createProfile();
+  const n = await listCount();
+  const res = await dup(src.id, body);
+  expect(res.status).toBe(400);
+  expect(((await res.json()) as { error: string }).error).toBe(message);
+  expect(await listCount()).toBe(n);
 });

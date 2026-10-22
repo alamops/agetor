@@ -15,7 +15,7 @@ import type { BundleHarnessRef, ParsedBundle } from "./bundle.ts";
 import { AGENT_PROFILE_LIMITS } from "./agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE } from "./pipeline.ts";
 import { DEFAULT_MODEL, PIPELINE_LIMITS } from "./types.ts";
-import type { AgentKind, AgentProfile, Pipeline, PipelineGraph } from "./types.ts";
+import type { AgentKind, AgentProfile, Pipeline, PipelineGraph, Speed } from "./types.ts";
 
 export interface BundleIssue {
   code: string;
@@ -83,7 +83,7 @@ export interface PlannedAgent {
   model: string;
   effort: string | null;
   mode: string | null;
-  fast: boolean;
+  speed: Speed;
   maxMode: boolean;
   instructions: string;
   skills: string[];
@@ -338,7 +338,7 @@ export function planBundleImport(
     let model = a.model;
     let effort = a.effort;
     let mode = a.mode;
-    let fast = a.fast;
+    let speed = a.speed;
     let maxMode = a.maxMode;
 
     const override = agentHarness.get(a.key) ?? harnessMap.get(a.harness.id);
@@ -373,12 +373,12 @@ export function planBundleImport(
         model = DEFAULT_MODEL[target.kind];
         effort = null;
         mode = null;
-        fast = false;
+        speed = "off";
         maxMode = false;
         warnings.push(
           issue(
             "settings-reset",
-            `${who} moves from an unknown "${a.harness.kind}" harness to ${harnessText(target)} — its model, effort and mode were reset to that harness's defaults`,
+            `${who} moves from an unknown "${a.harness.kind}" harness to ${harnessText(target)} — its model, effort, mode and speed were reset to that harness's defaults`,
           ),
         );
       }
@@ -456,7 +456,7 @@ export function planBundleImport(
       model,
       effort,
       mode,
-      fast,
+      speed,
       maxMode,
       instructions: a.instructions,
       skills: [...a.skills],
@@ -671,7 +671,7 @@ export function planBundleImport(
  */
 export function planFingerprint(plan: Pick<BundleImportPlan, "agents" | "pipelines" | "harnesses">): string {
   const content = JSON.stringify([
-    plan.agents.map((a) => [a.key, a.name, a.harnessId, a.model, a.effort, a.mode, a.fast, a.maxMode]),
+    plan.agents.map((a) => [a.key, a.name, a.harnessId, a.model, a.effort, a.mode, a.speed, a.maxMode]),
     plan.pipelines.map((p) => [
       p.index,
       p.name,

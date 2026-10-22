@@ -1,4 +1,6 @@
-import { COLUMNS } from "../shared/types.ts";
+import { COLUMNS, SPEEDS, type Speed } from "../shared/types.ts";
+import { isSpeed } from "../shared/speed.ts";
+import { escapeControlChars } from "../shared/terminal-text.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id).join(", ");
 
@@ -17,12 +19,17 @@ export const USAGE: Record<string, string> = {
     --agent <id>       harness id          --workdir <path>   git repo to run in
     --isolation <m>    worktree | none     --base-ref <ref>   branch base (default HEAD)
     --model <id>   --mode <id>   --effort <id>
+    --speed <s>        off | fast | ultrafast (what the model offers: cursor
+                        Fast variants, fx Gateway lanes); --fast = --speed
+                        fast, --no-fast = --speed off — the later flag wins
+    --max-mode | --no-max-mode   cursor Max Mode
     --profile <id|name>  launch from a saved agent profile (agetor profile ls) —
                         cannot combine with --agent/--model/--mode/--effort/
-                        --fast/--max-mode, the profile defines them
+                        --speed/--fast/--max-mode, the profile defines them
     --pipeline <id|name> launch a pipeline (agetor pipeline ls) instead of a
                         single agent — cannot combine with --profile or any
-                        of --agent/--model/--mode/--effort/--fast/--max-mode
+                        of --agent/--model/--mode/--effort/--speed/--fast/
+                        --max-mode
     --type <t>         task | subtask | epic | feature | bug | spike
     --ref <path>       attach a file/folder reference (repeatable)
     --issue <url>      seed title/prompt from a GitHub/GitLab issue + its thread
@@ -119,10 +126,13 @@ export const USAGE: Record<string, string> = {
   edit: `usage: agetor edit <task-id> [flags]   (at least one flag)
 
   Patch a task. Changing model / mode / effort applies to a live session mid-run.
-  A task bound to an agent profile refuses agent/mode/model/effort/fast/max-mode
+  A task bound to an agent profile refuses agent/mode/model/effort/speed/max-mode
   edits (409) — pass --detach-profile first (or alongside) to unlock them.
     --title <s>   --prompt <s> | --prompt-file <p>   --agent <id>   --workdir <p>
     --model <id>   --mode <id>   --effort <id>   --type <t>   --column <c>
+    --speed <s>   off | fast | ultrafast; --fast = --speed fast, --no-fast =
+                  --speed off — the later flag wins
+    --max-mode | --no-max-mode   cursor Max Mode
     --detach-profile   unbind from the task's agent profile (keeps its values)`,
 
   move: `usage: agetor move <task-id> <column>   (columns: ${COLUMN_IDS})
@@ -243,15 +253,18 @@ export const USAGE: Record<string, string> = {
   env, bin on PATH). Run 'claude /login' (or 'codex login') here to authenticate a
   parallel account against its own config. Ctrl-D to exit.`,
 
-  "profile add": `usage: agetor profile add <name> --harness <id> --model <id> [--effort <id>] [--mode <id>] [--fast|--no-fast] [--max-mode|--no-max-mode] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …]
+  "profile add": `usage: agetor profile add <name> --harness <id> --model <id> [--effort <id>] [--mode <id>] [--speed off|fast|ultrafast] [--max-mode|--no-max-mode] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …]
 
   Create a reusable agent profile. --harness and --model are required.
-  --instructions-file - reads instructions from stdin. --skill is repeatable.`,
+  --instructions-file - reads instructions from stdin. --skill is repeatable.
+  --fast is the same as --speed fast and --no-fast as --speed off; when
+  several speed flags are given, the later one wins.`,
 
-  "profile edit": `usage: agetor profile edit <ref> [--name <new>] [--harness <id>] [--model <id>] [--effort <id>] [--mode <id>] [--fast|--no-fast] [--max-mode|--no-max-mode] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …] [--clear-skills]   (at least one flag)
+  "profile edit": `usage: agetor profile edit <ref> [--name <new>] [--harness <id>] [--model <id>] [--effort <id>] [--mode <id>] [--speed off|fast|ultrafast] [--max-mode|--no-max-mode] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …] [--clear-skills]   (at least one flag)
 
   Update a profile. --skill appends to the existing skill list unless
-  --clear-skills is also given (then the list is replaced).`,
+  --clear-skills is also given (then the list is replaced). --fast is the
+  same as --speed fast and --no-fast as --speed off; the later one wins.`,
 
   "profile duplicate": `usage: agetor profile duplicate <ref> [--name <name>] [--with-tasks]
 
@@ -386,6 +399,15 @@ export function canonical(cmd: string): string {
 export function usageError(cmd: string): Error {
   const block = USAGE[canonical(cmd)];
   return new Error(block ? block.split("\n", 1)[0]! : `unknown command: ${cmd}`);
+}
+
+/** Parse a `--speed` value (`off | fast | ultrafast`). Anything else is a
+ *  usage error naming the tiers. `--fast` / `--no-fast` are the aliases
+ *  `fast` / `off`; every parser assigns in flag order, so the later of
+ *  several speed flags wins. */
+export function parseSpeedFlag(value: string): Speed {
+  if (isSpeed(value)) return value;
+  throw new Error(`'--speed' must be one of ${SPEEDS.join(", ")} (got '${escapeControlChars(value)}')`);
 }
 
 /** Resolve the help block for `agetor <cmd> [sub] --help` / `agetor help <cmd>

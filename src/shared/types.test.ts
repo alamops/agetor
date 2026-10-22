@@ -129,12 +129,28 @@ test("every AGENT_OPTIONS model entry (all kinds) carries a non-empty hint", () 
 
 /* ── fx model catalog invariants (docs/plans/fx-model-catalog-refresh.md §3) ─ */
 
-test("DEFAULT_MODEL.fx is zai/glm-5.3-flash (owner-chosen, 2026-08-27) and is present in AGENT_OPTIONS.fx.models as a non-catalogOnly row", () => {
-  expect(DEFAULT_MODEL.fx).toBe("zai/glm-5.3-flash");
-  const ids = AGENT_OPTIONS.fx.models.map((m) => m.id);
-  expect(ids).toContain(DEFAULT_MODEL.fx);
+test("DEFAULT_MODEL.fx is deepseek/deepseek-v4-flash (owner D21, 2026-10-22) and is the first AGENT_OPTIONS.fx.models row, non-catalogOnly", () => {
+  expect(DEFAULT_MODEL.fx).toBe("deepseek/deepseek-v4-flash");
+  expect(AGENT_OPTIONS.fx.models[0]?.id).toBe(DEFAULT_MODEL.fx);
   const defaultRow = AGENT_OPTIONS.fx.models.find((m) => m.id === DEFAULT_MODEL.fx);
   expect(defaultRow?.catalogOnly).toBeFalsy();
+});
+
+test("the previous fx default zai/glm-5.3-flash stays a standard (non-catalogOnly) row, and spacexai/grok-4.7 stays catalogOnly", () => {
+  const byId = new Map(AGENT_OPTIONS.fx.models.map((m) => [m.id, m]));
+  expect(byId.get("zai/glm-5.3-flash")).toBeDefined();
+  expect(byId.get("zai/glm-5.3-flash")?.catalogOnly).toBeFalsy();
+  expect(byId.get("spacexai/grok-4.7")?.catalogOnly).toBe(true);
+});
+
+const RETIRED_FX_IDS = ["alibaba/qwen3-coder-plus", "mistral/devstral-2", "anthropic/claude-3-haiku"];
+
+test("the three retired fx ids (D10) are absent from both AGENT_OPTIONS.fx.models and MODEL_EFFORT_SUPPORT.fx", () => {
+  const ids = AGENT_OPTIONS.fx.models.map((m) => m.id);
+  for (const id of RETIRED_FX_IDS) {
+    expect(ids).not.toContain(id);
+    expect(Object.keys(MODEL_EFFORT_SUPPORT.fx)).not.toContain(id);
+  }
 });
 
 test("for every AgentKind, DEFAULT_MODEL[kind] is present in AGENT_OPTIONS[kind].models", () => {
@@ -155,91 +171,71 @@ test("MODEL_EFFORT_SUPPORT.fx's keys exactly match AGENT_OPTIONS.fx.models' ids 
   expect(effortKeys.size).toBe(catalogIds.size);
 });
 
-/* ── fx effort (docs/plans/fx-0.0.10-compat.md §3 shared spec / T1) ──────── */
+/* ── fx effort (docs/plans/fx-0.0.14-and-cursor-updates.md §3.4 / T1) ────── */
 
-// The 22 effort-advertising ids — 16 live-probed on fx 0.0.10 (spike
-// fx-0010-efforts, 2026-09-14), the other six (opus-5.5, gpt-6-sol/-luna on
-// 2026-09-22; sonnet-5.5 on 2026-09-28; gpt-6.1-sol on 2026-09-30; haiku-5.5
-// on 2026-10-07) from their
-// Gateway reasoning_options
-// — copied verbatim from the plan's shared-spec
-// table (§3). Every row ends in "auto" (fx's own default, off-scale). The
-// 17th, anthropic/claude-opus-5.5 (2026-09-22), rests on the Gateway
-// catalog's reasoning_options rather than an ACP probe (no credentials) —
-// docs/plans/add-claude-opus-5-5.md §8 A1.
+// The 31 effort-advertising ids. Twenty were refreshed on 2026-10-22 against
+// fx 0.0.14's `models --json` `models[].efforts` (plus fx's always-present
+// `auto`) — the plan §3.4 table, copied verbatim; the other eleven are
+// unchanged from their earlier live-probe (fx 0.0.10, 2026-09-14) or Gateway
+// `reasoning_options` measurement. Every row ends in "auto" (fx's own
+// default, off-scale) and lists ids in agetor order (max, xhigh, high,
+// medium, low, minimal, none, auto).
 const FX_EFFORT_MODELS: Record<string, string[]> = {
+  // Refreshed 2026-10-22 (plan §3.4).
+  "zai/glm-5v-turbo": ["high", "medium", "low", "none", "auto"],
+  "zai/glm-4.7": ["high", "medium", "low", "none", "auto"],
+  "openai/gpt-5.2": ["xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+  "openai/gpt-5.1-codex-max": ["high", "medium", "low", "none", "auto"],
+  "openai/gpt-5.4-mini": ["xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+  "spacexai/grok-4.6": ["xhigh", "high", "medium", "low", "auto"],
+  "spacexai/grok-build-0.1": ["high", "medium", "low", "none", "auto"],
+  "moonshotai/kimi-k2.7-code": ["high", "medium", "low", "none", "auto"],
+  "deepseek/deepseek-v4-flash": ["high", "medium", "low", "none", "auto"],
+  "alibaba/qwen3.8-flash": ["xhigh", "medium", "low", "auto"],
+  "google/gemini-2.5-flash": ["high", "medium", "low", "none", "auto"],
+  "anthropic/claude-opus-5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+  "anthropic/claude-sonnet-5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+  "openai/gpt-5.5": ["xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+  "google/gemini-3.1-pro-preview": ["high", "low", "auto"],
+  "google/gemini-3.8-flash": ["high", "low", "auto"],
+  "anthropic/claude-fable-5.1": ["max", "xhigh", "high", "medium", "low", "auto"],
+  "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+  "deepseek/deepseek-v4-pro": ["max", "high", "low", "none", "auto"],
+  "spacexai/grok-4.7": ["xhigh", "high", "medium", "low", "auto"],
+  // Unchanged by the 0.0.14 refresh.
   "zai/glm-5.3-flash": ["max", "high", "low", "auto"],
-  "openai/gpt-5.2": ["xhigh", "high", "medium", "low", "none", "auto"],
-  "openai/gpt-5.1-codex-max": ["xhigh", "high", "medium", "low", "auto"],
-  "openai/gpt-5.4-mini": ["xhigh", "high", "medium", "low", "none", "auto"],
-  "deepseek/deepseek-v4-flash": ["xhigh", "high", "auto"],
-  "anthropic/claude-opus-5": ["max", "xhigh", "high", "medium", "low", "auto"],
-  "anthropic/claude-sonnet-5": ["xhigh", "high", "medium", "low", "auto"],
-  "openai/gpt-5.5": ["xhigh", "high", "medium", "low", "none", "auto"],
-  "google/gemini-3.1-pro-preview": ["high", "medium", "low", "auto"],
-  "google/gemini-3.8-flash": ["high", "medium", "low", "auto"],
   "moonshotai/kimi-k3": ["max", "high", "low", "auto"],
-  "anthropic/claude-fable-5.1": ["xhigh", "high", "medium", "low", "auto"],
   "openai/gpt-6-astra": ["max", "xhigh", "high", "medium", "low", "auto"],
-  "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
   "zai/glm-5.3": ["max", "high", "low", "auto"],
-  "deepseek/deepseek-v4-pro": ["xhigh", "high", "auto"],
   "anthropic/claude-opus-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
-  // 2026-09-22: from the public Gateway catalog's reasoning_options for both
-  // ids (docs/plans/add-gpt-6-sol-and-luna.md).
-  // 2026-09-30: Gateway re-measured none→max (docs/plans/add-gpt-6-1-sol.md
-  // §2); the 09-22 none…high measurement is stale.
   "openai/gpt-6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
   "openai/gpt-6-luna": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
-  // 2026-09-28: from the Gateway catalog's reasoning_options, not ACP-probed
-  // (docs/plans/add-claude-sonnet-5-5.md §8 A2).
   "anthropic/claude-sonnet-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
-  // 2026-09-30: openai/gpt-6.1-sol (released 2026-09-29) from the Gateway
-  // catalog's reasoning_options, not ACP-probed (docs/plans/add-gpt-6-1-sol.md
-  // §3 D3).
   "openai/gpt-6.1-sol": ["max", "xhigh", "high", "medium", "low", "auto"],
-  // 2026-10-07: anthropic/claude-haiku-5.5 from the Gateway catalog's
-  // reasoning_options, not ACP-probed (docs/plans/add-haiku-5-5.md). Unlike
-  // sonnet-5.5 this list INCLUDES none.
   "anthropic/claude-haiku-5.5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
-  // 2026-10-14: google/gemini-4-argon (GA 2026-10-13) from the Gateway
-  // catalog's reasoning_options (low/medium/high) plus fx's always-present
-  // auto, not ACP-probed (docs/plans/add-gemini-4-argon.md).
   "google/gemini-4-argon": ["high", "medium", "low", "auto"],
 };
 
-// The 13 no-effort ids — their Gateway catalog entry carries no
-// reasoning_options at all, same treatment as every gemini model. The first
-// twelve were live-probed on fx 0.0.10; spacexai/grok-4.7 (2026-09-21) rests
-// on the Gateway catalog entry alone (docs/plans/add-grok-4-7.md §8 A1).
-const FX_NO_EFFORT_MODELS = [
-  "zai/glm-5v-turbo",
-  "zai/glm-4.7",
-  "spacexai/grok-4.6",
-  "spacexai/grok-build-0.1",
-  "moonshotai/kimi-k2.7-code",
-  "minimax/minimax-m3",
-  "alibaba/qwen3.8-flash",
-  "alibaba/qwen3-coder-plus",
-  "mistral/devstral-2",
-  "google/gemini-2.5-flash",
-  "anthropic/claude-3-haiku",
-  "anthropic/claude-haiku-4.5",
-  "spacexai/grok-4.7",
-];
+// The 2 no-effort ids left — the picker collapses for them, same treatment
+// as every gemini model.
+const FX_NO_EFFORT_MODELS = ["minimax/minimax-m3", "anthropic/claude-haiku-4.5"];
 
-test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan §3 shared spec) — 23 effort models each end in auto, 13 named models are empty", () => {
+const AGETOR_EFFORT_ORDER = ["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"];
+
+test("MODEL_EFFORT_SUPPORT.fx exactly matches the 0.0.14-refreshed table — 31 effort models in agetor order each end in auto, 2 named models are empty", () => {
   for (const [id, expected] of Object.entries(FX_EFFORT_MODELS)) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual(expected);
     expect(expected[expected.length - 1]).toBe("auto");
+    expect(expected).toEqual(AGETOR_EFFORT_ORDER.filter((e) => expected.includes(e)));
   }
   for (const id of FX_NO_EFFORT_MODELS) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual([]);
   }
-  // The two lists above are exactly the 36 curated fx ids, no more no less.
-  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(23);
-  expect(FX_NO_EFFORT_MODELS.length).toBe(13);
-  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(36);
+  // The two lists above are exactly the 33 curated fx ids, no more no less.
+  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(31);
+  expect(FX_NO_EFFORT_MODELS.length).toBe(2);
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(33);
+  expect(AGENT_OPTIONS.fx.models.length).toBe(33);
 });
 
 test("DEFAULT_EFFORT.fx is 'auto' (fx's own default — owner decision D1, docs/plans/fx-0.0.10-compat.md §8)", () => {
@@ -262,24 +258,39 @@ test("no non-fx kind's MODEL_EFFORT_SUPPORT table lists 'auto' — it is fx-only
   }
 });
 
+test("supportedEfforts('fx', 'deepseek/deepseek-v4-flash') — the default — returns exactly [high, medium, low, none, auto]", () => {
+  const ids = supportedEfforts("fx", "deepseek/deepseek-v4-flash").map((o) => o.id);
+  expect(ids).toEqual(["high", "medium", "low", "none", "auto"]);
+});
+
 test("supportedEfforts('fx', 'zai/glm-5.3-flash') returns exactly [max, high, low, auto] in canonical order", () => {
   const ids = supportedEfforts("fx", "zai/glm-5.3-flash").map((o) => o.id);
   expect(ids).toEqual(["max", "high", "low", "auto"]);
 });
 
-test("supportedEfforts('fx', 'zai/glm-4.7') is empty (no-effort model)", () => {
-  expect(supportedEfforts("fx", "zai/glm-4.7")).toEqual([]);
+test("supportedEfforts('fx', 'openai/gpt-5.2') surfaces minimal between low and none", () => {
+  const ids = supportedEfforts("fx", "openai/gpt-5.2").map((o) => o.id);
+  expect(ids).toEqual(["xhigh", "high", "medium", "low", "minimal", "none", "auto"]);
 });
 
-test("supportedEfforts('fx', <unknown id>) falls back to DEFAULT_MODEL.fx's set (zai/glm-5.3-flash's)", () => {
+test("supportedEfforts('fx', 'minimax/minimax-m3') is empty (no-effort model)", () => {
+  expect(supportedEfforts("fx", "minimax/minimax-m3")).toEqual([]);
+});
+
+test("supportedEfforts('fx', <unknown id>) falls back to DEFAULT_MODEL.fx's set (deepseek/deepseek-v4-flash's)", () => {
   const fallback = supportedEfforts("fx", "vendor/unknown-model").map((o) => o.id);
   const curated = supportedEfforts("fx", DEFAULT_MODEL.fx).map((o) => o.id);
   expect(fallback).toEqual(curated);
-  expect(fallback).toEqual(["max", "high", "low", "auto"]);
+  expect(fallback).toEqual(["high", "medium", "low", "none", "auto"]);
 });
 
-test("retainableEfforts('fx', 'zai/glm-5.3-flash') contains 'auto'", () => {
-  const retained = retainableEfforts("fx", "zai/glm-5.3-flash");
+test("supportedEfforts('fx', …) lets a discovered models[].efforts set (plus auto) win over the curated table", () => {
+  const ids = supportedEfforts("fx", "deepseek/deepseek-v4-flash", ["xhigh", "high", "auto"]).map((o) => o.id);
+  expect(ids).toEqual(["xhigh", "high", "auto"]);
+});
+
+test("retainableEfforts('fx', 'deepseek/deepseek-v4-flash') contains 'auto'", () => {
+  const retained = retainableEfforts("fx", "deepseek/deepseek-v4-flash");
   expect(retained.has("auto")).toBe(true);
 });
 
@@ -388,6 +399,19 @@ test("AGENT_OPTIONS.fx.modes' yolo row is labelled 'Full access' with id 'yolo',
 test("AGENT_OPTIONS.fx.modes is ordered yolo, auto, ask — yolo ('Full access') first is fx's actual hands-off default (docs/plans/fix-fx-harness-rate-limit.md §3.7)", () => {
   expect(AGENT_OPTIONS.fx.modes.map((m) => m.id)).toEqual(["yolo", "auto", "ask"]);
   expect(AGENT_OPTIONS.fx.modes[0]?.label).toBe("Full access");
+});
+
+test("cursor offers auto / plan / ask (D23) and CODE_PLAN_MODE.cursor maps Plan to its native plan mode", () => {
+  expect(AGENT_OPTIONS.cursor.modes.map((m) => m.id)).toEqual(["auto", "plan", "ask"]);
+  expect(supportedModes("cursor", null).map((m) => m.id)).toEqual(["auto", "plan", "ask"]);
+  const byId = new Map(AGENT_OPTIONS.cursor.modes.map((m) => [m.id, m]));
+  expect(byId.get("auto")?.label).toBe("Auto (force)");
+  expect(byId.get("plan")?.label).toBe("Plan");
+  expect(byId.get("plan")?.hint).toBe("Read-only planning — cursor-agent --mode plan. Approve the plan to implement.");
+  expect(byId.get("ask")?.label).toBe("Read-only");
+  expect(byId.get("ask")?.hint).toBe("Read-only Q&A — cursor-agent --mode ask. Answers questions, makes no edits.");
+  expect(CODE_PLAN_MODE.cursor).toEqual({ code: "auto", plan: "plan" });
+  expect(defaultModeFor("cursor")).toBe("auto");
 });
 
 test("CODE_PLAN_MODE.fx pins Code to yolo (Full access) and Plan to ask, matching the reordered modes[0]", () => {

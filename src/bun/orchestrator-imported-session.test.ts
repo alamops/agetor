@@ -32,7 +32,7 @@ function makeTask(taskId: string, workdir: string): Task {
     mode: "ask",
     model: "claude-opus-4-7",
     effort: "medium",
-    fast: false,
+    speed: "off",
     maxMode: false,
     references: [],
     backlog: [],

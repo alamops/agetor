@@ -20,7 +20,7 @@ function makeProfile(overrides: Partial<AgentProfile> = {}): AgentProfile {
     model: "model-1",
     effort: null,
     mode: null,
-    fast: false,
+    speed: "off",
     maxMode: false,
     instructions: "",
     skills: [],
@@ -326,7 +326,7 @@ describe("snapshotFromProfile", () => {
       model: "opus",
       effort: "high",
       mode: "auto",
-      fast: true,
+      speed: "fast",
       maxMode: true,
       instructions: "Be nice",
       skills: ["a", "b"],
@@ -341,12 +341,33 @@ describe("snapshotFromProfile", () => {
       model: "opus",
       effort: "high",
       mode: "auto",
+      speed: "fast",
       fast: true,
       maxMode: true,
       instructions: "Be nice",
       skills: ["a", "b"],
       capturedAt: 12345,
     });
+  });
+
+  test("writes speed verbatim plus the derived fast boolean (speed !== off)", () => {
+    const harness = { kind: "fx" as const, label: "fx" };
+    const off = snapshotFromProfile(makeProfile({ speed: "off" }), harness, 1);
+    expect(off.speed).toBe("off");
+    expect(off.fast).toBe(false);
+    const ultra = snapshotFromProfile(makeProfile({ speed: "ultrafast" }), harness, 1);
+    expect(ultra.speed).toBe("ultrafast");
+    expect(ultra.fast).toBe(true);
+  });
+
+  test("a legacy fast field on the profile is never read — speed alone decides", () => {
+    const snapshot = snapshotFromProfile(
+      makeProfile({ speed: "off", fast: true }),
+      { kind: "cursor", label: "Cursor" },
+      1,
+    );
+    expect(snapshot.speed).toBe("off");
+    expect(snapshot.fast).toBe(false);
   });
 
   test("skills is copied into a fresh array — later mutation of the source doesn't leak into the snapshot", () => {

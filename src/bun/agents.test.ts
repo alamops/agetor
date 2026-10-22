@@ -109,7 +109,7 @@ function alias(kind: AgentKind, opts: { home?: string; bin?: string; env?: Recor
 const claudeDefaults = { mode: "auto", model: "opus-4.7", effort: "high" } as const;
 const codexDefaults = { mode: "auto", model: "gpt-6-astra", effort: "high" } as const;
 // Cursor's effort rides inside the --model id (`cursorModelArg` composes
-// model + effort + fast into one string), not a separate flag.
+// model + effort + the Fast speed tier into one string), not a separate flag.
 const cursorDefaults = { mode: "auto", model: "grok-4.7", effort: "high" } as const;
 // Gemini has no effort flag at all (see MODEL_EFFORT_SUPPORT.gemini in
 // shared/types.ts) — buildCommand's gemini branch never reads opts.effort.
@@ -939,36 +939,48 @@ test("cursor Gemini 4 Argon with null effort falls back to the high variant", ()
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-4-argon-high");
 });
 
-test("cursor Gemini 4 Argon ignores fast and maxMode (no fast variant, no Max Mode)", () => {
+test("cursor Gemini 4 Argon ignores speed fast and maxMode (no fast variant, no Max Mode)", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gemini-4-argon",
     effort: "high",
-    fast: true,
+    speed: "fast",
     maxMode: true,
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-4-argon-high");
 });
 
-test("cursor Gemini 3.8 Flash ignores fast and maxMode (no fast variant, no Max Mode)", () => {
+test("cursor Gemini 3.8 Flash ignores speed fast and maxMode (no fast variant, no Max Mode)", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gemini-3.8-flash",
     effort: "high",
-    fast: true,
+    speed: "fast",
     maxMode: true,
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.8-flash-high");
 });
 
-test("cursor fast toggle selects the Fast model variant when that effort supports it", () => {
+test("cursor speed fast selects the Fast model variant when that effort supports it", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gpt-5.6-sol",
     effort: "max",
-    fast: true,
+    speed: "fast",
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-5.6-sol-max-fast");
+});
+
+test("cursor speed off and ultrafast both launch the standard model variant (cursor has no Ultrafast tier)", () => {
+  for (const speed of ["off", "ultrafast", null, undefined] as const) {
+    const { cmd } = buildCommand(builtin("cursor"), "hi", {
+      ...cursorDefaults,
+      model: "gpt-5.6-sol",
+      effort: "max",
+      speed,
+    });
+    expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-5.6-sol-max");
+  }
 });
 
 test("cursor maxMode selects large context without changing reasoning effort", () => {
@@ -976,7 +988,7 @@ test("cursor maxMode selects large context without changing reasoning effort", (
     ...cursorDefaults,
     model: "gpt-5.6-sol",
     effort: "high",
-    fast: true,
+    speed: "fast",
     maxMode: true,
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-5.6-sol[context=1m,effort=high,fast=true]");
@@ -986,18 +998,18 @@ test("cursor maxMode is ignored for models without a large-context override", ()
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "composer-2.5",
-    fast: true,
+    speed: "fast",
     maxMode: true,
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("composer-2.5-fast");
 });
 
-test("cursor fast toggle is ignored for model/effort pairs without a fast variant", () => {
+test("cursor speed fast is ignored for model/effort pairs without a fast variant", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "claude-sonnet-5",
     effort: "max",
-    fast: true,
+    speed: "fast",
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("claude-sonnet-5-max");
 });
@@ -1006,7 +1018,7 @@ test("cursor model with no effort levels can still expose a fast variant", () =>
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "composer-2.5",
-    fast: true,
+    speed: "fast",
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("composer-2.5-fast");
 });
@@ -1016,7 +1028,7 @@ test("cursor unknown model id passes through verbatim (house convention: unknown
     ...cursorDefaults,
     model: "cursor-mystery-9000",
     effort: "max",
-    fast: true,
+    speed: "fast",
   });
   const i = cmd.indexOf("--model");
   expect(i).toBeGreaterThan(-1);
@@ -2255,7 +2267,7 @@ function makeHandoffTaskRow(taskId: string, prompt: string): Task {
     mode: null,
     model: null,
     effort: null,
-    fast: false,
+    speed: "off",
     maxMode: false,
     references: [],
     backlog: [],

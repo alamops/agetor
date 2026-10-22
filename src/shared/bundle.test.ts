@@ -36,7 +36,7 @@ function profile(id: string, name: string, overrides: Partial<AgentProfile> = {}
     model: "opus-5.5",
     effort: "high",
     mode: null,
-    fast: false,
+    speed: "off",
     maxMode: false,
     instructions: "",
     skills: [],
@@ -115,6 +115,7 @@ describe("buildBundle", () => {
         model: "opus-5.5",
         effort: "high",
         mode: null,
+        speed: "off",
         fast: false,
         maxMode: false,
         instructions: "Be careful.",
@@ -1121,6 +1122,7 @@ function agentJson(overrides: Record<string, unknown> = {}): Record<string, unkn
     model: "opus-5.5",
     effort: "high",
     mode: null,
+    speed: "off",
     fast: false,
     maxMode: false,
     instructions: "",
@@ -1228,6 +1230,7 @@ describe("parseBundleText", () => {
       model: "opus-5.5",
       effort: null,
       mode: null,
+      speed: "off",
       fast: false,
       maxMode: false,
       instructions: "",
@@ -1603,6 +1606,8 @@ describe("parseBundleText", () => {
     expectError(only({ skills: ["ok", 3] }), "invalid", "skills");
     expectError(only({ skills: "plan" }), "invalid", "skills");
     expectError(only({ fast: "yes" }), "invalid", "fast");
+    expectError(only({ speed: "turbo" }), "invalid", "speed must be one of off, fast, ultrafast");
+    expectError(only({ speed: true }), "invalid", "speed must be one of off, fast, ultrafast");
     expectError(only({ harness: "claude-code" }), "invalid", "harness");
     expectError(only({ model: "" }), "invalid", "model is required");
     expectError(only({ effort: 3 }), "invalid", "effort");
@@ -1875,5 +1880,66 @@ describe("parseBundleText", () => {
     expect(r.bundle.pipelines[0]!.maxSteps).toBeUndefined();
     expectError({ name: "Old", graph: { steps: "x", edges: [] } }, "invalid", "graph.steps must be an array");
     expectError({ name: "  ", graph: { steps: [], edges: [] } }, "invalid", "name is required");
+  });
+});
+
+describe("speed (D15)", () => {
+  const onlyAgent = (a: Record<string, unknown>) => bundleJson({ agents: [agentJson(a)], pipelines: [] });
+  function parsedAgent(a: Record<string, unknown>) {
+    const r = parseObj(onlyAgent(a));
+    if (!r.ok) throw new Error(r.error);
+    return r.bundle.agents[0]!;
+  }
+
+  test("an export writes speed plus the derived fast", () => {
+    const r = mustBuild({ all: true }, [
+      profile("p1", "Off", { speed: "off" }),
+      profile("p2", "Fast", { speed: "fast" }),
+      profile("p3", "Ultra", { speed: "ultrafast" }),
+    ]);
+    const byName = new Map(r.bundle.agents.map((a) => [a.name, a]));
+    expect(byName.get("Off")).toMatchObject({ speed: "off", fast: false });
+    expect(byName.get("Fast")).toMatchObject({ speed: "fast", fast: true });
+    expect(byName.get("Ultra")).toMatchObject({ speed: "ultrafast", fast: true });
+    expect(r.text).toContain('"speed": "ultrafast"');
+  });
+
+  test("an Ultrafast Agent round-trips", () => {
+    const built = mustBuild({ agentIds: ["p1"] }, [profile("p1", "Ultra", { speed: "ultrafast" })]);
+    const parsed = parseBundleText(built.text);
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.bundle.agents[0]).toMatchObject({ speed: "ultrafast", fast: true });
+  });
+
+  test("a fast-only legacy Agent reads as fast or off", () => {
+    const fastOnly = agentJson({ fast: true });
+    delete fastOnly.speed;
+    const offOnly = agentJson({ fast: false });
+    delete offOnly.speed;
+    const neither = agentJson();
+    delete neither.speed;
+    delete neither.fast;
+    for (const [raw, speed] of [
+      [fastOnly, "fast"],
+      [offOnly, "off"],
+      [neither, "off"],
+    ] as const) {
+      const r = parseObj(bundleJson({ agents: [raw], pipelines: [] }));
+      if (!r.ok) throw new Error(r.error);
+      expect(r.bundle.agents[0]).toMatchObject({ speed, fast: speed !== "off" });
+    }
+  });
+
+  test("speed wins over a conflicting fast", () => {
+    expect(parsedAgent({ speed: "off", fast: true })).toMatchObject({ speed: "off", fast: false });
+    expect(parsedAgent({ speed: "ultrafast", fast: false })).toMatchObject({ speed: "ultrafast", fast: true });
+    expect(parsedAgent({ speed: null, fast: true })).toMatchObject({ speed: "fast", fast: true });
+  });
+
+  test("an invalid speed is refused with a field error", () => {
+    expectError(onlyAgent({ speed: "Fast" }), "invalid", 'Agent "worker" speed must be one of off, fast, ultrafast');
+    expectError(onlyAgent({ speed: 1 }), "invalid", "speed must be one of off, fast, ultrafast");
+    // A conflicting fast is still type-checked: the file is malformed.
+    expectError(onlyAgent({ speed: "fast", fast: "yes" }), "invalid", "fast must be true or false");
   });
 });

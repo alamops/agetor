@@ -4,6 +4,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { AgentIcon } from "./AgentIcon";
+import { speedLabel } from "../../../shared/speed.ts";
 import type { TaskProfileDisplay } from "@/lib/agent-profiles";
 import type { AgentKind, Harness, Task } from "../../../shared/types.ts";
 
@@ -13,7 +14,7 @@ const TITLE_ID = "agent-profile-details-title";
  * Task-details "Agent" row modal — plan D2 (`docs/plans/task-details-agent-row.md`).
  * Shows the task's own frozen record of the agent profile it launched (or
  * will launch) with, never a live-refetched profile: name, harness, model,
- * effort, mode, cursor fast/max-mode, skills, and the full instructions.
+ * effort, mode, speed, cursor max-mode, skills, and the full instructions.
  *
  * Data source, in order: `task.agentProfile` (the {@link AgentProfileSnapshot}
  * every current write path stamps onto the task alongside `agentProfileId` —
@@ -71,7 +72,7 @@ export function AgentProfileDetailsDialog({
   const model = snapshot?.model ?? null;
   const effort = snapshot?.effort ?? null;
   const mode = snapshot?.mode ?? null;
-  const fast = snapshot?.fast ?? false;
+  const speed = snapshot?.speed ?? "off";
   const maxMode = snapshot?.maxMode ?? false;
   const instructions = (snapshot?.instructions ?? "").trim();
   const skills = snapshot?.skills ?? [];
@@ -134,11 +135,17 @@ export function AgentProfileDetailsDialog({
             <dt className="text-muted-foreground">Mode</dt>
             <dd className="min-w-0">{mode ?? "default"}</dd>
 
+            {/* Speed shows for the kinds that offer tiers, and for any
+             *  other kind whose snapshot somehow carries one. */}
+            {(harnessKind === "cursor" || harnessKind === "fx" || speed !== "off") && (
+              <>
+                <dt className="text-muted-foreground">Speed</dt>
+                <dd className="min-w-0" data-testid="agent-profile-details-speed">{speedLabel(speed)}</dd>
+              </>
+            )}
+
             {harnessKind === "cursor" && (
               <>
-                <dt className="text-muted-foreground">Fast</dt>
-                <dd className="min-w-0">{fast ? "on" : "off"}</dd>
-
                 <dt className="text-muted-foreground">Max mode</dt>
                 <dd className="min-w-0">{maxMode ? "on" : "off"}</dd>
               </>

@@ -113,7 +113,7 @@ test("a relative path resolves against the task's worktreePath/workdir", async (
     mode: null,
     model: null,
     effort: null,
-    fast: false,
+    speed: "off",
     maxMode: false,
     references: [],
     backlog: [],

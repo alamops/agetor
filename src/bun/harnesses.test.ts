@@ -16,6 +16,7 @@ beforeEach(() => {
   // a prior test may have toggled off, so the baseline truly is "default".
   db.run(`DELETE FROM harnesses WHERE is_builtin = 0`);
   db.run(`UPDATE harnesses SET enabled = 1 WHERE is_builtin = 1`);
+  db.run(`UPDATE harnesses SET profile_mcp_servers = 1 WHERE is_builtin = 1`);
 });
 
 test("seed leaves the two built-in harnesses in place", () => {
@@ -341,4 +342,51 @@ test("getByIdOrKind synthesises a built-in antigravity row for legacy id without
       );
     }
   }
+});
+
+test("profileMcpServers defaults to true on seeded built-ins, a fresh alias and a synthesized row", () => {
+  expect(harnesses.get("fx")!.profileMcpServers).toBe(true);
+  expect(harnesses.get("claude-code")!.profileMcpServers).toBe(true);
+  const alias = harnesses.insert({ id: "fx-alt", kind: "fx", label: "fx (alt)" });
+  expect(alias.profileMcpServers).toBe(true);
+  expect(harnesses.get("fx-alt")!.profileMcpServers).toBe(true);
+  // Same capture/restore rationale as the getByIdOrKind tests above.
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("fx");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["fx"]);
+    expect(harnesses.getByIdOrKind("fx")!.profileMcpServers).toBe(true);
+  } finally {
+    if (saved) {
+      const r = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [r.id, r.kind, r.label, r.is_builtin, r.home, r.bin, r.env_json, r.created_at, r.updated_at, r.enabled, r.profile_mcp_servers] as SQLQueryBindings[],
+      );
+    }
+  }
+});
+
+test("profileMcpServers round-trips through insert and update", () => {
+  const off = harnesses.insert({ id: "fx-off", kind: "fx", label: "fx off", profileMcpServers: false });
+  expect(off.profileMcpServers).toBe(false);
+  expect(harnesses.list().find((h) => h.id === "fx-off")!.profileMcpServers).toBe(false);
+
+  expect(harnesses.update("fx-off", { profileMcpServers: true }).profileMcpServers).toBe(true);
+  expect(harnesses.update("fx-off", { profileMcpServers: false }).profileMcpServers).toBe(false);
+  // A patch that doesn't name the toggle leaves it alone.
+  const relabeled = harnesses.update("fx-off", { label: "fx renamed" });
+  expect(relabeled.label).toBe("fx renamed");
+  expect(relabeled.profileMcpServers).toBe(false);
+});
+
+test("update accepts a profileMcpServers-only patch on a built-in but still refuses config edits", () => {
+  const before = harnesses.get("fx")!;
+  const after = harnesses.update("fx", { profileMcpServers: false });
+  expect(after.profileMcpServers).toBe(false);
+  expect(after.label).toBe(before.label);
+  expect(harnesses.get("fx")!.profileMcpServers).toBe(false);
+
+  expect(() => harnesses.update("fx", { profileMcpServers: true, label: "Renamed" })).toThrow(HarnessBuiltinError);
+  expect(harnesses.get("fx")!.profileMcpServers).toBe(false);
 });

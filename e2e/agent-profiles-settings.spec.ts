@@ -14,7 +14,7 @@ import { AGENT_PROFILE_LIMITS } from "../src/shared/agent-profile.ts";
  * so this file goes deep on the Settings form/list instead: validation,
  * edit-seeding (the exact race `docs/plans/agent-profiles.md` §10's "Review"
  * notes call out — `useTaskLaunch`'s `initial` option), the `SkillsPicker`'s
- * keyboard/mouse contract, the cursor-only fast/max-mode toggles, the
+ * keyboard/mouse contract, the cursor speed picker and max-mode toggle, the
  * disabled-harness marker, the harness-delete guard, duplicate-name/task-count
  * edge cases — and (docs/plans/agents-new-edit-subpage.md) the Add/Edit
  * SUBPAGE: "Add agent" / a row's "Edit" replace the list inside the Settings
@@ -335,7 +335,7 @@ test.describe("agent profiles — Settings surface", () => {
     expect(after.model).toBe(before.model);
     expect(after.effort).toBe(before.effort);
     expect(after.mode).toBe(before.mode);
-    expect(after.fast).toBe(before.fast);
+    expect(after.speed).toBe(before.speed);
     expect(after.maxMode).toBe(before.maxMode);
     expect(after.instructions).toBe(before.instructions);
     expect(after.skills).toEqual(before.skills);
@@ -789,7 +789,7 @@ test.describe("agent profiles — Settings surface", () => {
     await expectAgentsList(modal);
   });
 
-  test("Cursor-only fast/max-mode toggles: appear for a supporting model, hide for claude-code, persist maxMode", async ({
+  test("Cursor speed picker and max-mode toggle: appear for a supporting model, hide for claude-code, persist maxMode", async ({
     page,
     request,
     backend,
@@ -817,9 +817,14 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(launchSelect(form, "Effort")).toHaveValue("high");
 
     const maxModeToggle = form.getByTestId("launch-max-mode-toggle");
-    const fastToggle = form.getByTestId("launch-fast-toggle");
+    const speedPicker = form.getByTestId("launch-speed");
     await expect(maxModeToggle).toBeVisible();
-    await expect(fastToggle).toBeVisible();
+    await expect(speedPicker).toBeVisible();
+    await expect(speedPicker).toHaveAttribute("data-value", "off");
+    await expect(speedPicker.getByTestId("launch-speed-off")).toHaveAttribute("aria-pressed", "true");
+    await expect(speedPicker.getByTestId("launch-speed-fast")).toHaveAttribute("aria-pressed", "false");
+    // Cursor offers no Ultrafast tier.
+    await expect(speedPicker.getByTestId("launch-speed-ultrafast")).toHaveCount(0);
 
     await maxModeToggle.getByRole("switch").click();
     await expect(maxModeToggle.getByRole("switch")).toHaveAttribute("aria-checked", "true");
@@ -833,7 +838,7 @@ test.describe("agent profiles — Settings surface", () => {
     expect(stored.harness).toBe("cursor");
     expect(stored.model).toBe("gpt-5.3-codex");
     expect(stored.maxMode).toBe(true);
-    expect(stored.fast).toBe(false);
+    expect(stored.speed).toBe("off");
 
     // Switching the form back to claude-code hides both toggles.
     const row = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: cursorName });
@@ -843,7 +848,7 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(editForm.getByTestId("launch-max-mode-toggle")).toBeVisible();
     await harnessButton(editForm, "Claude Code").click();
     await expect(editForm.getByTestId("launch-max-mode-toggle")).toHaveCount(0);
-    await expect(editForm.getByTestId("launch-fast-toggle")).toHaveCount(0);
+    await expect(editForm.getByTestId("launch-speed")).toHaveCount(0);
     await editForm.getByTestId("agent-profile-cancel").click();
     await expect(editForm).toBeHidden();
 
@@ -862,7 +867,7 @@ test.describe("agent profiles — Settings surface", () => {
       model: "cursor-grok-4.6",
       effort: "high",
       mode: "auto",
-      fast: false,
+      speed: "off",
       maxMode: false,
       instructions: "",
       skills: [],
@@ -913,7 +918,7 @@ test.describe("agent profiles — Settings surface", () => {
       model: "opus-5",
       effort: "high",
       mode: "auto",
-      fast: false,
+      speed: "off",
       maxMode: false,
       instructions: "",
       skills: [],
@@ -1018,7 +1023,7 @@ test.describe("agent profiles — Settings surface", () => {
       model: "sonnet-5",
       effort: "medium",
       mode: "plan",
-      fast: false,
+      speed: "off",
       maxMode: false,
       instructions: sourceInstructions,
       skills: ["code-review"],
@@ -1140,7 +1145,7 @@ test.describe("agent profiles — Settings surface", () => {
     expect(names).not.toContain(`${sourceName} (copy 2)`);
   });
 
-  test("Duplicate copies cursor fast and max mode without changing the source", async ({ page, request, backend }) => {
+  test("Duplicate copies cursor speed and max mode without changing the source", async ({ page, request, backend }) => {
     await patchHarness(request, backend, "cursor", { enabled: true });
     try {
       const sourceName = `Cursor Duplicate ${randomUUID()}`;
@@ -1150,7 +1155,7 @@ test.describe("agent profiles — Settings surface", () => {
         model: "gpt-5.3-codex",
         effort: "high",
         mode: "ask",
-        fast: true,
+        speed: "fast",
         maxMode: true,
         instructions: "",
         skills: [],
@@ -1173,7 +1178,8 @@ test.describe("agent profiles — Settings surface", () => {
       await expect(launchSelect(form, "Model")).toHaveValue("gpt-5.3-codex");
       await expect(launchSelect(form, "Mode")).toHaveValue("ask");
       await expect(form.getByTestId("launch-max-mode-toggle").getByRole("switch")).toHaveAttribute("aria-checked", "true");
-      await expect(form.getByTestId("launch-fast-toggle").getByRole("switch")).toHaveAttribute("aria-checked", "true");
+      await expect(form.getByTestId("launch-speed")).toHaveAttribute("data-value", "fast");
+      await expect(form.getByTestId("launch-speed-fast")).toHaveAttribute("aria-pressed", "true");
 
       await form.getByTestId("agent-profile-save").click();
       await expect(form).toBeHidden();
@@ -1185,12 +1191,12 @@ test.describe("agent profiles — Settings surface", () => {
       expect(copy.harness).toBe("cursor");
       expect(copy.model).toBe("gpt-5.3-codex");
       expect(copy.mode).toBe("ask");
-      expect(copy.fast).toBe(true);
+      expect(copy.speed).toBe("fast");
       expect(copy.maxMode).toBe(true);
 
       const sourceAfter = await getAgentProfile(request, backend, source.id);
       expect(sourceAfter.name).toBe(sourceName);
-      expect(sourceAfter.fast).toBe(true);
+      expect(sourceAfter.speed).toBe("fast");
       expect(sourceAfter.maxMode).toBe(true);
       expect(sourceAfter.model).toBe("gpt-5.3-codex");
     } finally {

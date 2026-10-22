@@ -662,7 +662,8 @@ test("cursorModelIdCoveredByCatalog recognizes every Grok 4.7 variant, fast form
   expect(cursorModelIdCoveredByCatalog("grok-4.7-max")).toBe(false);
 });
 
-test("cursor supportedModes returns the auto/ask pair (no per-model mode carve-outs)", () => {
+test("cursor supportedModes returns auto/plan/ask (no per-model mode carve-outs)", () => {
   const ids = supportedModes("cursor", null).map((o) => o.id);
-  expect(ids).toEqual(["auto", "ask"]);
+  expect(ids).toEqual(["auto", "plan", "ask"]);
+  expect(supportedModes("cursor", "grok-4.7").map((o) => o.id)).toEqual(["auto", "plan", "ask"]);
 });

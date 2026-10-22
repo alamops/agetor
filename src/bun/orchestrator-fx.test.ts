@@ -128,7 +128,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000, intervalMs = 
   }
 }
 
-test("createTask (fx) defaults model to zai/glm-5.3-flash, effort 'auto' (fx's own default), and lands in backlog", async () => {
+test("createTask (fx) defaults model to deepseek/deepseek-v4-flash, effort 'auto' (fx's own default), and lands in backlog", async () => {
   const { createTask } = await import("./orchestrator.ts");
 
   const created = await createTask({
@@ -142,30 +142,30 @@ test("createTask (fx) defaults model to zai/glm-5.3-flash, effort 'auto' (fx's o
   if ("error" in created) throw new Error(created.error);
 
   expect(created.task.agent).toBe("fx");
-  expect(created.task.model).toBe("zai/glm-5.3-flash");
-  // zai/glm-5.3-flash advertises [max, high, low, auto] (docs/plans/
-  // fx-0.0.10-compat.md §3 shared spec) — DEFAULT_EFFORT.fx ("auto") is
+  expect(created.task.model).toBe("deepseek/deepseek-v4-flash");
+  // deepseek/deepseek-v4-flash advertises [high, medium, low, none, auto]
+  // (docs/plans/fx-0.0.14-and-cursor-updates.md §3.4) — DEFAULT_EFFORT.fx ("auto") is
   // among the offered ids, so createTask picks it, mirroring the picker's
   // own "kind default if offered, else first row" rule.
   expect(created.task.effort).toBe("auto");
   expect(created.task.column).toBe("backlog");
 });
 
-test("createTask (fx) on a no-effort model (zai/glm-4.7) stores effort null — its offered-effort set is empty", async () => {
+test("createTask (fx) on a no-effort model (minimax/minimax-m3) stores effort null — its offered-effort set is empty", async () => {
   const { createTask } = await import("./orchestrator.ts");
 
   const created = await createTask({
     title: "fx no-effort model",
     prompt: "do a thing",
     agent: "fx",
-    model: "zai/glm-4.7",
+    model: "minimax/minimax-m3",
     workdir: process.cwd(),
     isolation: "none",
     taskType: "task",
   });
   if ("error" in created) throw new Error(created.error);
 
-  expect(created.task.model).toBe("zai/glm-4.7");
+  expect(created.task.model).toBe("minimax/minimax-m3");
   expect(created.task.effort).toBeNull();
 });
 
@@ -183,7 +183,7 @@ test("createTask (fx) with an explicit effort keeps it verbatim, not overridden 
   });
   if ("error" in created) throw new Error(created.error);
 
-  expect(created.task.model).toBe("zai/glm-5.3-flash");
+  expect(created.task.model).toBe("deepseek/deepseek-v4-flash");
   expect(created.task.effort).toBe("high");
 });
 
@@ -373,6 +373,41 @@ test("sendInput (fx, idle) spawns a NEW run row that resumes the same session", 
   expect(newRun?.fxSessionId).toBe(`fake-fx-session-${taskId}`);
 });
 
+// Speed tier (plan §3.1 / T5): every fx spawn site passes `task.speed` into
+// the run options. The fx driver itself ignores it until wave 2; the fake
+// fx branch records what reached it (`_speed`) so this plumbing is pinned.
+test("fx: the task's speed reaches the spawn's run options on the first turn and on a follow-up, re-read from the row each turn", async () => {
+  const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
+  const { tasks, harnesses } = await import("./db.ts");
+  const { __getFakeDriver } = await import("./agents.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx speed",
+    prompt: "turn one",
+    agent: "fx",
+    speed: "fast",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  expect(created.task.speed).toBe("fast");
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  expect(__getFakeDriver(taskId)?._speed).toBe("fast");
+  await settle();
+
+  tasks.update(taskId, { speed: "ultrafast" });
+  const firstRunId = "runId" in started ? started.runId : "";
+  const res = await sendInput(firstRunId, "turn two");
+  expect(res.delivered).toBe(true);
+  expect(__getFakeDriver(taskId)?._speed).toBe("ultrafast");
+  await settle();
+});
+
 test("sendInput (fx, busy) queues the follow-up; drainFxQueue spawns it after the active turn resolves", async () => {
   // Exploit the fake's ~20ms resolve window: a follow-up sent in the same
   // tick as start lands while the first turn is still active, so it must
@@ -523,7 +558,7 @@ function baseTask(overrides: Partial<Task> = {}): Task {
     mode: "auto",
     model: null,
     effort: null,
-    fast: false, maxMode: false,
+    speed: "off", maxMode: false,
     references: [], backlog: [], plans: [], draft: null,
     runId: null,
     hasOpenableRun: false,
@@ -644,7 +679,7 @@ test("reconcileOrphans has no reattach path for fx: a mid-boot running fx run al
     mode: null,
     model: null,
     effort: null,
-    fast: false, maxMode: false,
+    speed: "off", maxMode: false,
     references: [], backlog: [], plans: [], draft: null,
     runId,
     hasOpenableRun: false,

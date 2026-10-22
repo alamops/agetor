@@ -31,7 +31,7 @@ function baseTask(overrides: Partial<Task> = {}): Task {
     mode: "auto",
     model: null,
     effort: null,
-    fast: false, maxMode: false,
+    speed: "off", maxMode: false,
     references: [],    backlog: [], plans: [], draft: null,
     runId: null,
     hasOpenableRun: false,

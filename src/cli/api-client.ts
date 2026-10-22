@@ -26,6 +26,7 @@ import type {
   DbStats,
   DbCompactResult,
   RetentionPassResult,
+  Speed,
 } from "../shared/types.ts";
 import type { NotificationKind } from "../shared/os-notification.ts";
 import type { BundleExportResponse } from "../shared/bundle.ts";
@@ -529,7 +530,7 @@ export class AgetorClient {
     return this.req("DELETE", `/agent-profiles/${encodeURIComponent(id)}`);
   }
   /** `DELETE /tasks/:id/agent-profile` — detach a bound task from its
-   *  profile (keeps the copied agent/model/effort/mode/fast/maxMode values,
+   *  profile (keeps the copied agent/model/effort/mode/speed/maxMode values,
    *  unlocks them for PATCH). Returns the full updated `Task`; 404 unknown
    *  task, 409 archived. */
   detachTaskAgentProfile(taskId: string): Promise<Task> {
@@ -704,8 +705,9 @@ export class AgetorClient {
    *  wrong, just never exercised since callers only ever read `.id`.
    *  `efforts` (bare effort ids the CLI reported; codex only today) is
    *  present only when the daemon's discovery probe reported a non-empty
-   *  list for that model — feed it to `discoveredEffortsFor`. */
-  agentModels(): Promise<Record<string, { id: string; label?: string; efforts?: string[] }[]>> {
+   *  list for that model — feed it to `discoveredEffortsFor`. `fast`/
+   *  `ultrafast` (fx ≥0.0.14 speed options) are present only when `true`. */
+  agentModels(): Promise<Record<string, DiscoveredModelRow[]>> {
     return this.req("GET", "/agent-models");
   }
   /** Per-harness discovered model catalog — a key per *enabled* harness
@@ -716,7 +718,7 @@ export class AgetorClient {
    *  landed this route yet. */
   harnessModels(): Promise<{
     ready: boolean;
-    byHarness: Record<string, { id: string; label?: string; efforts?: string[] }[]>;
+    byHarness: Record<string, DiscoveredModelRow[]>;
   }> {
     return this.req("GET", "/agent-models/harnesses");
   }
@@ -727,10 +729,20 @@ export class AgetorClient {
    *  harness (e.g. `fx-2`) is NOT reflected in this response (the kind map
    *  only ever carries the built-in fx harness's list). Callers that need
    *  the per-harness view must call `harnessModels()` afterwards. */
-  refreshAgentModels(harnessId?: string): Promise<Record<string, { id: string; label?: string; efforts?: string[] }[]>> {
+  refreshAgentModels(harnessId?: string): Promise<Record<string, DiscoveredModelRow[]>> {
     const qs = harnessId ? `?harness=${encodeURIComponent(harnessId)}` : "";
     return this.req("POST", `/agent-models${qs}`);
   }
+}
+
+/** One row of a discovered model catalog (`GET /agent-models`, `GET
+ *  /agent-models/harnesses`) — the server's `DiscoveredModel` shape. */
+export interface DiscoveredModelRow {
+  id: string;
+  label?: string;
+  efforts?: string[];
+  fast?: boolean;
+  ultrafast?: boolean;
 }
 
 /** Body for POST /tasks (mirrors the server's accepted fields). */
@@ -743,7 +755,9 @@ export interface CreateTaskInput {
   mode?: string | null;
   model?: string | null;
   effort?: string | null;
-  fast?: boolean;
+  /** Speed tier. The CLI always sends `speed`, never the legacy `fast`
+   *  alias (`resolveSpeedInput` on the server still accepts it). */
+  speed?: Speed;
   maxMode?: boolean;
   taskType?: string;
   /** Match the app's "Run task", which creates the task in "ready" before
@@ -756,7 +770,7 @@ export interface CreateTaskInput {
   /** Rendered issue + comment-thread snapshot; requires `issueUrl`. */
   issueSnapshot?: string;
   /** Id of an {@link AgentProfile} to launch from (create-only) — the server
-   *  resolves it and overrides `agent`/`model`/`effort`/`mode`/`fast`/
+   *  resolves it and overrides `agent`/`model`/`effort`/`mode`/`speed`/
    *  `maxMode` from the profile; 400 on an unknown id. Mutually exclusive
    *  with setting those six fields yourself — the CLI (`agetor add
    *  --profile`) enforces that client-side before this ever reaches the
@@ -781,7 +795,7 @@ export interface AgentProfileInput {
   model: string;
   effort: string | null;
   mode: string | null;
-  fast: boolean;
+  speed: Speed;
   maxMode: boolean;
   instructions: string;
   skills: string[];
@@ -808,7 +822,7 @@ export interface PatchTaskInput {
   mode?: string | null;
   model?: string | null;
   effort?: string | null;
-  fast?: boolean;
+  speed?: Speed;
   maxMode?: boolean;
   taskType?: string;
 }
@@ -821,6 +835,9 @@ export interface CreateHarnessInput {
   home?: string | null;
   bin?: string | null;
   env?: Record<string, string>;
+  /** fx only: load fx's own profile MCP servers (`_meta.fx.profileMcpServers`)
+   *  into each session. Omitted ⇒ the server default (on). */
+  profileMcpServers?: boolean;
 }
 
 /** Resolved harness environment for `agetor harness shell` (GET /harnesses/:id/shell-env). */
@@ -839,6 +856,8 @@ export interface HarnessPatchInput {
   bin?: string | null;
   env?: Record<string, string>;
   enabled?: boolean;
+  /** fx only: the "Load profile MCP servers" toggle. */
+  profileMcpServers?: boolean;
 }
 
 function safeJson(text: string): unknown {

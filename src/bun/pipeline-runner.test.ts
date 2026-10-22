@@ -143,7 +143,7 @@ async function makeProfile(label: string) {
     model: "fake-model",
     effort: null,
     mode: null,
-    fast: false,
+    speed: "off",
     maxMode: false,
     instructions: "",
     skills: [],
@@ -208,6 +208,52 @@ test("linear A→B→C reaches review with 3 succeeded history records, handoff 
   const dir = pipelineRunsDir(parentId);
   expect(existsSync(dir)).toBe(true);
   expect(readdirSync(dir).length).toBeGreaterThan(0);
+  await waitUntilIdle(parentId);
+});
+
+test("a step row copies its profile's speed tier from the frozen snapshot, and the parent mirrors the start step's speed", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines, agentProfiles } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+
+  const profile = agentProfiles.insert({
+    name: uniqueName("speed"),
+    harness: "claude-code",
+    model: "fake-model",
+    effort: null,
+    mode: null,
+    speed: "fast",
+    maxMode: false,
+    instructions: "",
+    skills: [],
+  });
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `Do A. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const pipeline = pipelines.insert({
+    name: uniqueName("speed-pipeline"),
+    graph: { steps: [A], edges: [], startStepId: A.id },
+    maxSteps: 25,
+  });
+
+  const created = await createTask({
+    title: "speed run",
+    prompt: "goal",
+    workdir: freshWorkdir(),
+    isolation: "none",
+    pipelineId: pipeline.id,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  expect(created.task.speed).toBe("fast");
+
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+  const step = await waitFor(() => tasks.stepsForParent(parentId)[0]);
+  expect(step.speed).toBe("fast");
+  expect(step.agentProfile?.speed).toBe("fast");
+
+  await waitFor(() => tasks.get(parentId)?.pipelineRun?.status === "done");
   await waitUntilIdle(parentId);
 });
 

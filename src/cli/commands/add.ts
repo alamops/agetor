@@ -5,6 +5,7 @@ import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, isTTY } from "../output.ts";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import { flagValue } from "../args.ts";
+import { parseSpeedFlag } from "../usage.ts";
 import { resolveRefs, warnMissingRefs } from "../refs.ts";
 import {
   discoveredExtensionNames,
@@ -32,10 +33,18 @@ import {
   cursorModelIdCoveredByCatalog,
   defaultModeFor,
   type AgentKind,
+  type AgentOption,
   type AgentProfile,
   type Pipeline,
+  type Speed,
 } from "../../shared/types.ts";
-import { mergeModelOptions, discoveredEffortsFor, type DiscoveredModel } from "../../shared/model-options.ts";
+import { isSpeed, supportedSpeeds, SPEED_OPTIONS } from "../../shared/speed.ts";
+import {
+  mergeModelOptions,
+  discoveredEffortsFor,
+  type DiscoveredModel,
+  type ModelOption,
+} from "../../shared/model-options.ts";
 import { buildFileEntries } from "../../shared/at-file-filter.ts";
 import { unresolvedAtTokens } from "../../shared/at-refs.ts";
 import { agentProfileSummary, asProfileError, matchAgentProfileRef } from "../../shared/agent-profile.ts";
@@ -50,7 +59,9 @@ interface AddOpts {
   model?: string;
   mode?: string;
   effort?: string;
-  fast?: boolean;
+  /** `--speed <tier>`, or its `--fast` (`fast`) / `--no-fast` (`off`)
+   *  aliases — whichever came last on the command line. */
+  speed?: Speed;
   maxMode?: boolean;
   workdir?: string;
   isolation?: "worktree" | "none";
@@ -63,7 +74,7 @@ interface AddOpts {
   issue?: string;
   /** `--profile <id|name>` — launch from a saved {@link AgentProfile} instead
    *  of picking harness/model/mode/effort by hand. Mutually exclusive with
-   *  those four flags (plus --fast/--max-mode) — enforced by
+   *  those four flags (plus --speed/--fast/--max-mode) — enforced by
    *  `assertProfileFlagCombo` before either the non-interactive or wizard
    *  path runs. Resolved to an id via `matchAgentProfileRef` in `cmdAdd`. */
   profile?: string;
@@ -89,8 +100,9 @@ export function parseAdd(args: string[]): AddOpts {
       case "--model": o.model = val(); break;
       case "--mode": o.mode = val(); break;
       case "--effort": o.effort = val(); break;
-      case "--fast": o.fast = true; break;
-      case "--no-fast": o.fast = false; break;
+      case "--speed": o.speed = parseSpeedFlag(val()); break;
+      case "--fast": o.speed = "fast"; break;
+      case "--no-fast": o.speed = "off"; break;
       case "--max-mode": o.maxMode = true; break;
       case "--no-max-mode": o.maxMode = false; break;
       case "--workdir": o.workdir = val(); break;
@@ -108,7 +120,7 @@ export function parseAdd(args: string[]): AddOpts {
   return o;
 }
 
-/** Whether any of the six manual harness/model/mode/effort/fast/maxMode
+/** Whether any of the six manual harness/model/mode/effort/speed/maxMode
  *  flags were given — the block `--profile`/`--pipeline` each replace
  *  wholesale. Shared by `assertProfileFlagCombo`/`assertPipelineFlagCombo`
  *  (flag-vs-flag conflicts) and the wizard's Pipeline-step gating below (m20
@@ -119,12 +131,12 @@ function hasManualLaunchFlags(o: AddOpts): boolean {
     o.model !== undefined ||
     o.mode !== undefined ||
     o.effort !== undefined ||
-    o.fast !== undefined ||
+    o.speed !== undefined ||
     o.maxMode !== undefined
   );
 }
 
-/** `--profile` replaces the whole harness/model/mode/effort/fast/maxMode
+/** `--profile` replaces the whole harness/model/mode/effort/speed/maxMode
  *  block — the profile defines those — so combining it with any of the six
  *  flags that set them by hand is a usage error, in both the non-interactive
  *  and wizard paths (checked once, up front, before either runs). */
@@ -132,12 +144,12 @@ function assertProfileFlagCombo(o: AddOpts): void {
   if (!o.profile) return;
   if (hasManualLaunchFlags(o)) {
     throw new Error(
-      "--profile cannot be combined with --agent/--model/--mode/--effort/--fast/--max-mode (the agent defines them)",
+      "--profile cannot be combined with --agent/--model/--mode/--effort/--speed/--fast/--max-mode (the agent defines them)",
     );
   }
 }
 
-/** `--pipeline` replaces the whole harness/model/mode/effort/fast/maxMode
+/** `--pipeline` replaces the whole harness/model/mode/effort/speed/maxMode
  *  block too — a pipeline's steps carry their own agent profiles — AND
  *  `--profile` (a task is either a pipeline's parent or launched from a
  *  single agent profile, never both). Checked once, up front, mirroring
@@ -146,7 +158,7 @@ function assertPipelineFlagCombo(o: AddOpts): void {
   if (!o.pipeline) return;
   if (o.profile !== undefined || hasManualLaunchFlags(o)) {
     throw new Error(
-      "--pipeline cannot be combined with --profile/--agent/--model/--mode/--effort/--fast/--max-mode (the pipeline defines the launch)",
+      "--pipeline cannot be combined with --profile/--agent/--model/--mode/--effort/--speed/--fast/--max-mode (the pipeline defines the launch)",
     );
   }
 }
@@ -437,7 +449,7 @@ export function defaultNonInteractiveMode(agent: string | undefined): string | u
 }
 
 /** `profileId`/`pipelineId`, when given, replace the whole agent/model/mode/
- *  effort/fast/maxMode block with `agentProfileId`/`pipelineId` — the server
+ *  effort/speed/maxMode block with `agentProfileId`/`pipelineId` — the server
  *  resolves it and overrides (agent profile) or entirely owns (pipeline)
  *  those fields (plan §3 D5/routes table, `docs/plans/pipelines.md`'s routes
  *  table), so sending them here too would be dead weight at best and
@@ -473,7 +485,7 @@ function baseInput(
     input.model = o.model;
     input.mode = o.mode;
     input.effort = o.effort;
-    input.fast = o.fast;
+    input.speed = o.speed;
     input.maxMode = o.maxMode;
   }
   return input;
@@ -551,7 +563,7 @@ async function wizard(
   // "None — launch a single agent" escape hatch), shown only when at least
   // one pipeline exists, `--pipeline` wasn't already given on the command
   // line, AND neither `--profile` nor any manual harness/model/mode/effort/
-  // fast/max-mode flag was given (m20 review fix) — mirroring
+  // speed/max-mode flag was given (m20 review fix) — mirroring
   // `assertPipelineFlagCombo`'s exclusivity: those flags already commit the
   // task to a single-agent launch, so offering a Pipeline pick here would
   // let a wizard answer silently override (or conflict with) a flag the
@@ -631,6 +643,10 @@ async function wizard(
   let model = o.model;
   let mode = o.mode;
   let effort = o.effort;
+  let speed = o.speed;
+  // Only a speed the user actually picked is remembered — a kind/model with
+  // nothing beyond "off" must not overwrite `lastSpeed:<kind>`.
+  let speedPicked = false;
   let kind: AgentKind | undefined;
 
   if (!profileId && !pipelineId) {
@@ -704,6 +720,26 @@ async function wizard(
         effort = picked;
       }
     }
+    if (speed === undefined) {
+      // Only offered when the model has a tier beyond "off": cursor's Fast
+      // variants, or the fx speed options discovery reported for this model
+      // (the merged row carries rule 8's `fast`/`ultrafast` flags). Anything
+      // else launches at "off" without a prompt.
+      const choices = wizardSpeedChoices(kind, model ?? null, effort ?? null, modelOptions);
+      if (choices.length > 0) {
+        const stored = prefs[`lastSpeed:${kind}`];
+        const picked = await pickOption(
+          "Speed",
+          choices,
+          isSpeed(stored) && choices.some((opt) => opt.id === stored) ? stored : "off",
+        );
+        if (picked === null) return cancelled();
+        speed = picked as Speed;
+        speedPicked = true;
+      } else {
+        speed = "off";
+      }
+    }
   }
 
   let workdir = o.workdir;
@@ -738,11 +774,27 @@ async function wizard(
   // preference, and the profile's/pipeline's own values shouldn't leak into
   // the manual defaults).
   if (!profileId && !pipelineId && kind) {
-    await persistPrefs(client, kind, { model, mode, effort });
+    await persistPrefs(client, kind, { model, mode, effort, speed: speedPicked ? speed : undefined });
   }
 
   p.outro(c.green("creating…"));
-  return baseInput({ ...o, agent, model, mode, effort, workdir }, title, prompt, profileId, pipelineId);
+  return baseInput({ ...o, agent, model, mode, effort, speed, workdir }, title, prompt, profileId, pipelineId);
+}
+
+/** The Speed step's rows for the wizard: the tiers `supportedSpeeds` offers
+ *  for this kind/model/effort — fed the selected merged model row's
+ *  `fast`/`ultrafast` flags (rule 8 copies them from discovery; fx only
+ *  knows its speed options that way) — or `[]` when only `off` is on offer,
+ *  in which case the wizard skips the step and launches at `off`. */
+export function wizardSpeedChoices(
+  kind: AgentKind,
+  model: string | null,
+  effort: string | null,
+  modelOptions: readonly ModelOption[],
+): AgentOption[] {
+  const speeds = supportedSpeeds(kind, model, effort, modelOptions.find((m) => m.id === model));
+  if (speeds.length <= 1) return [];
+  return SPEED_OPTIONS.filter((opt) => speeds.includes(opt.id as Speed));
 }
 
 /** A select that returns the chosen value (or null on cancel), pre-selecting
@@ -764,16 +816,18 @@ async function pickOption(
   return p.isCancel(pick) ? null : (pick as string);
 }
 
-/** Persist the chosen model/mode/effort as the per-kind last-used defaults. */
+/** Persist the chosen model/mode/effort/speed as the per-kind last-used
+ *  defaults (`lastSpeed:<kind>` is the key the New Task form reads too). */
 export async function persistPrefs(
   client: AgetorClient,
   kind: AgentKind,
-  picks: { model?: string; mode?: string; effort?: string },
+  picks: { model?: string; mode?: string; effort?: string; speed?: Speed },
 ): Promise<void> {
   const writes: Array<Promise<unknown>> = [];
   if (picks.model) writes.push(client.setPreference(`lastModel:${kind}`, picks.model));
   if (picks.mode) writes.push(client.setPreference(`lastMode:${kind}`, picks.mode));
   if (picks.effort) writes.push(client.setPreference(`lastEffort:${kind}`, picks.effort));
+  if (picks.speed) writes.push(client.setPreference(`lastSpeed:${kind}`, picks.speed));
   await Promise.allSettled(writes);
 }
 

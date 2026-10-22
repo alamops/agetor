@@ -64,7 +64,6 @@ import {
   FX_USAGE_STATUS_PREFIX,
   isInternalStatusSentinel,
   cursorModelIdCoveredByCatalog,
-  cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
   EFFORT_OPTIONS,
   retainableEfforts,
@@ -98,6 +97,7 @@ import { appendReferences } from "../../../shared/refs.ts";
 import { parseSentFilesToolUse } from "../../../shared/sent-files.ts";
 import { stepNameById } from "../../../shared/pipeline.ts";
 import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
+import { supportedSpeeds } from "../../../shared/speed.ts";
 import { parseIssueUrl } from "../../../shared/issue-task.ts";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
@@ -126,6 +126,7 @@ import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
 import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink, MD_URL_TRANSFORM, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./md-components";
 import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent, HandoffReminderBadge } from "./MessageSegments";
 import { CompactionSummaryBlock } from "./CompactionSummaryBlock";
+import { SpeedPicker } from "./SpeedPicker";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -6994,7 +6995,7 @@ function TaskDetails({
   // in flight for this task's harness — mirrors NewTaskForm's affordance.
   const [refreshingModels, setRefreshingModels] = useState(false);
   // A task bound to an agent profile (plan D5) locks the four dropdowns
-  // (+ cursor fast/max) regardless of run state — only Detach unlocks them.
+  // (+ speed, cursor max) regardless of run state — only Detach unlocks them.
   // `runningLock` alone (the pre-existing rule) still gates the Detach
   // button itself, so a bound task can't be detached mid-run.
   const runningLock = task.column === "running" || task.column === "blocked";
@@ -7132,7 +7133,13 @@ function TaskDetails({
     return options;
   }, [allowedEfforts, retainable, task.effort, harnesses, task.agent, kind]);
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
-  const fastAvailable = kind === "cursor" && cursorModelSupportsFast(task.model, task.effort);
+  // Speed tiers for the task's model: cursor's come from the curated
+  // fast-variant table, fx's only from discovery (the merged row's
+  // `fast`/`ultrafast` flags, rule 8), every other kind offers `off` only.
+  const speedOptions = useMemo(() => {
+    const option = modelOptions.find((o) => o.id === (task.model ?? DEFAULT_MODEL[kind]));
+    return supportedSpeeds(kind, task.model, task.effort, option);
+  }, [kind, task.model, task.effort, modelOptions]);
   useEffect(() => {
     // A profile-bound task's effort is owned by the profile, not this
     // cascade — mutating it here would PATCH a field the profile lock is
@@ -7151,12 +7158,18 @@ function TaskDetails({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel, task.agentProfileId]);
   useEffect(() => {
-    // Same profile-lock guard as the effort cascade above — `fast`/`maxMode`
+    // Same profile-lock guard as the effort cascade above — `speed`/`maxMode`
     // are also profile-owned fields once bound.
     if (task.agentProfileId != null) return;
-    if (task.fast && !fastAvailable) void save({ fast: false });
+    // fx is never cleared here: its tiers come from discovery alone, which
+    // may not be ready yet (or omit flags a moment), so a stored tier the
+    // model doesn't list stays and renders as the picker's "(not offered)"
+    // segment — the driver posts a breadcrumb and runs without it. Only a
+    // user model change resets it (`onModelChange`).
+    if (kind === "fx") return;
+    if (task.speed !== "off" && !speedOptions.includes(task.speed)) void save({ speed: "off" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fastAvailable, task.fast, task.agentProfileId]);
+  }, [kind, speedOptions, task.speed, task.agentProfileId]);
   useEffect(() => {
     if (task.agentProfileId != null) return;
     if (task.maxMode && !maxModeAvailable) void save({ maxMode: false });
@@ -7188,7 +7201,24 @@ function TaskDetails({
       : nextEfforts.some((e) => e.id === DEFAULT_EFFORT[nextKind])
         ? DEFAULT_EFFORT[nextKind]
         : nextEfforts[0]!.id;
-    void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, fast: false, maxMode: false });
+    void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, speed: "off", maxMode: false });
+  };
+
+  const onModelChange = (model: string) => {
+    // fx speed reset rule (plan §3.1): drop a stored tier to `off` only on a
+    // user model change, and only when the new model's tiers are actually
+    // known — the model is in this harness's discovered catalog and that
+    // catalog is trusted (rule 7: not a logged-out harness) — and exclude
+    // it. Cursor's own clear runs in the effect above.
+    if (kind === "fx" && task.speed !== "off" && selectedStatus?.loggedIn !== false) {
+      const discovered = harnessModels[task.agent] ?? agentModels[kind] ?? [];
+      const option = modelOptions.find((o) => o.id === model);
+      if (discovered.some((m) => m.id === model) && !supportedSpeeds(kind, model, task.effort, option).includes(task.speed)) {
+        void save({ model, speed: "off" });
+        return;
+      }
+    }
+    void save({ model });
   };
 
   const modeOptions = supportedModes(kind, task.model);
@@ -7378,7 +7408,7 @@ function TaskDetails({
                 <CompactSelect
                   value={task.model ?? DEFAULT_MODEL[kind]}
                   options={modelOptions}
-                  onChange={(model) => void save({ model })}
+                  onChange={onModelChange}
                 />
               ) : (
                 <span>{task.model ?? "—"}</span>
@@ -7418,20 +7448,17 @@ function TaskDetails({
               </>
             )}
 
-            {kind === "cursor" && (fastAvailable || task.fast) && (
+            {(speedOptions.length > 1 || task.speed !== "off") && (
               <>
-                <dt className="text-muted-foreground">Fast</dt>
+                <dt className="text-muted-foreground">Speed</dt>
                 <dd className="min-w-0">
-                  {editable ? (
-                    <Switch
-                      checked={task.fast}
-                      onCheckedChange={(fast) => void save({ fast })}
-                      disabled={!fastAvailable}
-                      aria-label="Use Cursor fast variant"
-                    />
-                  ) : (
-                    <span>{task.fast ? "on" : "off"}</span>
-                  )}
+                  <SpeedPicker
+                    testId="task-speed"
+                    options={speedOptions}
+                    value={task.speed}
+                    onChange={(speed) => void save({ speed })}
+                    disabled={!editable}
+                  />
                 </dd>
               </>
             )}

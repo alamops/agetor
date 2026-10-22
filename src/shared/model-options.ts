@@ -82,6 +82,10 @@
  *    per-model efforts. The looked-up result is handed to `supportedEfforts`
  *    (`./types.ts`) as its third argument, so a CLI-discovered per-model
  *    effort set wins over the curated `MODEL_EFFORT_SUPPORT` table.
+ *    The same lookup copies the speed flags (`fast` / `ultrafast`, fx
+ *    `models --json` ≥0.0.14) onto every row kind above, but only when the
+ *    entry reports them `true` — a `false` or absent flag attaches no key.
+ *    Pickers pass a row's flags to `supportedSpeeds` (`./speed.ts`).
  *
  * Inputs are never mutated; a new array is always returned.
  */

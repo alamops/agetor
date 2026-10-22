@@ -227,6 +227,7 @@ import type {
   PipelineInput,
   PipelineRunState,
   RunEvent,
+  Speed,
   Task,
   TaskEventsReplayMeta,
   TaskGitStatus,
@@ -259,6 +260,7 @@ import {
 import { pickedPaths, singlePickedPath } from "./native-pick.ts";
 import type { AgentProfilePatch } from "./db.ts";
 import { duplicateAgentName } from "../shared/duplicate-name.ts";
+import { resolveSpeedInput } from "../shared/speed.ts";
 import { duplicateAgentProfile } from "./duplicate-agent-profile.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
@@ -460,8 +462,12 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
  * from `startTask`'s live-profile refresh and the detach route below),
  * never through this generic PATCH. See the bound-agent 409 guard in
  * `PATCH /tasks/:id` for the other half of that lock: even a listed field
- * here (`agent`/`mode`/`model`/`effort`/`fast`/`maxMode`) is refused once a
+ * here (`agent`/`mode`/`model`/`effort`/`speed`/`maxMode`) is refused once a
  * task is bound to a profile, until it's detached.
+ *
+ * `fast` is the legacy boolean alias of `speed` (D13): `filterPatch` maps it
+ * through `resolveSpeedInput` (`true` → `"fast"`, `false` → `"off"`; an
+ * explicit `speed` wins) and never forwards `fast` itself to the db layer.
  *
  * `checkoutBranch` (the last-seen worktree checkout, migration 063) is
  * server-managed the same way: only `tasks.setCheckoutBranch` writes it, at
@@ -469,7 +475,7 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
  * silently ignored like every other unlisted field.
  */
 const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
-  "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "fast", "maxMode", "taskType",
+  "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "speed", "fast", "maxMode", "taskType",
 ]);
 
 /** The 8 reaction contents GitHub's API accepts — validated here before the
@@ -477,21 +483,23 @@ const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
  *  same defense-in-depth as the other GitHub POST routes). */
 const REACTION_CONTENTS = new Set<string>(["+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"]);
 
-function filterPatch(raw: unknown): Partial<Task> {
-  if (!raw || typeof raw !== "object") return {};
+function filterPatch(raw: unknown): { patch: Partial<Task> } | { error: string } {
+  if (!raw || typeof raw !== "object") return { patch: {} };
+  const body = raw as Record<string, unknown>;
   const patch: Partial<Task> = {};
-  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-    if (k === "fast") {
-      patch.fast = v === true;
-      continue;
-    }
+  for (const [k, v] of Object.entries(body)) {
+    // `speed`/`fast` are resolved together below — `fast` never reaches the db.
+    if (k === "speed" || k === "fast") continue;
     if (k === "maxMode") {
       patch.maxMode = v === true;
       continue;
     }
     if (ALLOWED_PATCH_FIELDS.has(k as keyof Task)) (patch as Record<string, unknown>)[k] = v;
   }
-  return patch;
+  const speed = resolveSpeedInput(body);
+  if ("error" in speed) return { error: speed.error };
+  if (speed.speed !== undefined) patch.speed = speed.speed;
+  return { patch };
 }
 
 /** Shared precondition for the backlog-mutation routes: the task must exist
@@ -1002,7 +1010,7 @@ function parsePipelineMaxSteps(body: Record<string, unknown>): { value: number |
  */
 function validateCloneLaunch(
   body: Record<string, unknown>,
-): { agentProfileId?: string; agent?: string; mode?: string; model?: string; effort?: string | null; fast?: boolean; maxMode?: boolean } | { error: string } {
+): { agentProfileId?: string; agent?: string; mode?: string; model?: string; effort?: string | null; speed?: Speed; maxMode?: boolean } | { error: string } {
   let agentProfileId: string | undefined;
   if (body.agentProfileId !== undefined && body.agentProfileId !== null) {
     if (typeof body.agentProfileId !== "string") {
@@ -1035,9 +1043,9 @@ function validateCloneLaunch(
   if (body.effort !== undefined && body.effort !== null && typeof body.effort !== "string") {
     return { error: "effort must be a string or null" };
   }
-  if (body.fast !== undefined && typeof body.fast !== "boolean") {
-    return { error: "fast must be a boolean" };
-  }
+  // `speed`, or its legacy boolean alias `fast` (D13) — `speed` wins.
+  const speedInput = resolveSpeedInput(body);
+  if ("error" in speedInput) return { error: speedInput.error };
   if (body.maxMode !== undefined && typeof body.maxMode !== "boolean") {
     return { error: "maxMode must be a boolean" };
   }
@@ -1048,12 +1056,12 @@ function validateCloneLaunch(
     return { error: `unknown harness "${body.agent}"` };
   }
 
-  const out: { agent?: string; mode?: string; model?: string; effort?: string | null; fast?: boolean; maxMode?: boolean } = {};
+  const out: { agent?: string; mode?: string; model?: string; effort?: string | null; speed?: Speed; maxMode?: boolean } = {};
   if (typeof body.agent === "string") out.agent = body.agent;
   if (typeof body.mode === "string") out.mode = body.mode;
   if (typeof body.model === "string") out.model = body.model;
   if (body.effort !== undefined) out.effort = body.effort as string | null;
-  if (typeof body.fast === "boolean") out.fast = body.fast;
+  if (speedInput.speed !== undefined) out.speed = speedInput.speed;
   if (typeof body.maxMode === "boolean") out.maxMode = body.maxMode;
   return out;
 }
@@ -1322,6 +1330,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             mode?: unknown;
             model?: unknown;
             effort?: unknown;
+            speed?: unknown;
             fast?: unknown;
             maxMode?: unknown;
             agentProfileId?: unknown;
@@ -3913,6 +3922,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             home?: unknown;
             bin?: unknown;
             env?: unknown;
+            profileMcpServers?: unknown;
           };
           if (typeof body.id !== "string" || !body.id.trim()) {
             return json({ error: "id required" }, { status: 400, headers: corsHeaders(req) });
@@ -3964,6 +3974,12 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               env[k] = v;
             }
           }
+          // Whether fx sessions load the user's fx profile MCP servers
+          // (`_meta.fx.profileMcpServers`, D3/D4). Absent ⇒ on; only fx-kind
+          // rows act on it, every kind stores it.
+          if (body.profileMcpServers !== undefined && typeof body.profileMcpServers !== "boolean") {
+            return json({ error: "profileMcpServers must be a boolean" }, { status: 400, headers: corsHeaders(req) });
+          }
           if (harnesses.get(body.id)) {
             return json({ error: `harness "${body.id}" already exists` }, { status: 409, headers: corsHeaders(req) });
           }
@@ -3975,6 +3991,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               home,
               bin,
               env,
+              ...(typeof body.profileMcpServers === "boolean" ? { profileMcpServers: body.profileMcpServers } : {}),
             });
             // A brand-new harness (fx or otherwise) has no discovered
             // catalog yet — probe it now instead of waiting for the next
@@ -4033,6 +4050,15 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               { status: 400, headers: corsHeaders(req) },
             );
           }
+          // `profileMcpServers` (D3/D4) is a behaviour toggle like `enabled`,
+          // not config — allowed on built-ins too (the built-in fx row is the
+          // one most users run). Validated before anything is applied.
+          if ("profileMcpServers" in body && typeof body.profileMcpServers !== "boolean") {
+            return json(
+              { error: "profileMcpServers must be a boolean" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
           if (typeof body.enabled === "boolean") {
             harnesses.setEnabled(req.params.id, body.enabled);
             // Re-enabling a harness that was previously excluded from every
@@ -4045,9 +4071,13 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             if (body.enabled) void refreshHarnessModels(req.params.id);
           }
           if (!hasConfigPatch) {
+            if (typeof body.profileMcpServers === "boolean") {
+              harnesses.update(req.params.id, { profileMcpServers: body.profileMcpServers });
+            }
             return json(harnesses.get(req.params.id), { headers: corsHeaders(req) });
           }
           const patch: Parameters<typeof harnesses.update>[1] = {};
+          if (typeof body.profileMcpServers === "boolean") patch.profileMcpServers = body.profileMcpServers;
           if (typeof body.label === "string") patch.label = body.label.trim();
           if ("home" in body) {
             if (body.home == null || body.home === "") patch.home = null;
@@ -4226,6 +4256,12 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             skills = parsedSkills.skills;
           }
 
+          // `speed`, or its legacy boolean alias `fast` (D13) — `speed` wins.
+          const speedInput = resolveSpeedInput(body);
+          if ("error" in speedInput) {
+            return json({ error: speedInput.error }, { status: 400, headers: corsHeaders(req) });
+          }
+
           try {
             const created = agentProfiles.insert({
               name,
@@ -4233,7 +4269,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               model,
               effort: agentProfileOptionalField(body.effort),
               mode: agentProfileOptionalField(body.mode),
-              fast: body.fast === true,
+              speed: speedInput.speed ?? "off",
               maxMode: body.maxMode === true,
               instructions,
               skills,
@@ -4261,9 +4297,13 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if (!raw || typeof raw !== "object" || Array.isArray(raw)) return bad("invalid body");
           const body = raw as Record<string, unknown>;
 
-          for (const key of ["copyTasks", "fast", "maxMode"]) {
+          for (const key of ["copyTasks", "maxMode"]) {
             if (key in body && typeof body[key] !== "boolean") return bad(`${key} must be a boolean`);
           }
+          // `speed`, or its legacy boolean alias `fast` (D13) — `speed` wins;
+          // neither present keeps the source's tier.
+          const speedInput = resolveSpeedInput(body);
+          if ("error" in speedInput) return bad(speedInput.error);
 
           const name =
             "name" in body
@@ -4322,7 +4362,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
                 model,
                 effort: "effort" in body ? agentProfileOptionalField(body.effort) : source.effort,
                 mode: "mode" in body ? agentProfileOptionalField(body.mode) : source.mode,
-                fast: "fast" in body ? body.fast === true : source.fast,
+                speed: speedInput.speed ?? source.speed,
                 maxMode: "maxMode" in body ? body.maxMode === true : source.maxMode,
                 instructions,
                 skills,
@@ -4395,7 +4435,12 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             if (modeError) return json({ error: modeError }, { status: 400, headers: corsHeaders(req) });
             patch.mode = agentProfileOptionalField(body.mode);
           }
-          if ("fast" in body) patch.fast = body.fast === true;
+          // `speed`, or its legacy boolean alias `fast` (D13) — `speed` wins.
+          const speedInput = resolveSpeedInput(body);
+          if ("error" in speedInput) {
+            return json({ error: speedInput.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (speedInput.speed !== undefined) patch.speed = speedInput.speed;
           if ("maxMode" in body) patch.maxMode = body.maxMode === true;
           if ("instructions" in body) {
             const instructions = typeof body.instructions === "string" ? body.instructions : "";
@@ -5008,9 +5053,16 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if (body.issueUrl !== undefined && typeof body.issueUrl !== "string") {
             return json({ error: "issueUrl must be a string" }, { status: 400, headers: corsHeaders(req) });
           }
+          // `speed` (or its legacy boolean alias `fast`, D13) — resolved
+          // here so a bad value 400s and `fast` itself never reaches
+          // `createTask`.
+          const speedInput = resolveSpeedInput(body as { speed?: unknown; fast?: unknown });
+          if ("error" in speedInput) {
+            return json({ error: speedInput.error }, { status: 400, headers: corsHeaders(req) });
+          }
           // Additive agent-profile binding (docs/plans/agent-profiles.md):
           // `createTask` resolves it and overrides agent/model/effort/mode/
-          // fast/maxMode from the profile — this route only checks the
+          // speed/maxMode from the profile — this route only checks the
           // wire shape, same division of labor as every other field here.
           // `null` is accepted as "no profile", matching createTask's own
           // `input.agentProfileId?.trim()` handling.
@@ -5062,8 +5114,10 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
                   return [{ path: p, isDirectory: Boolean(r.isDirectory) }];
                 })
             : [];
+          const { fast: _legacyFast, speed: _rawSpeed, ...rest } = body;
           const result = await createTask({
-            ...body,
+            ...rest,
+            ...(speedInput.speed !== undefined ? { speed: speedInput.speed } : {}),
             title: body.title,
             prompt: body.prompt,
             references,
@@ -5089,7 +5143,11 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           // persist) can land during the parse and move the column; a
           // snapshot taken beforehand would still treat the run as `done`
           // and write `column: "done"` onto a run that is no longer finished.
-          const patch = filterPatch(await req.json());
+          const filtered = filterPatch(await req.json());
+          if ("error" in filtered) {
+            return json({ error: filtered.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const { patch } = filtered;
           const before = tasks.get(req.params.id);
           if (!before) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -5140,7 +5198,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             }
           }
           // A task bound to an agent profile (docs/plans/agent-profiles.md
-          // D5) has its agent/mode/model/effort/fast/maxMode locked — the
+          // D5) has its agent/mode/model/effort/speed/maxMode locked — the
           // profile owns those six fields, and the only sanctioned way to
           // change them is to detach first (`DELETE /tasks/:id/agent-profile`)
           // or edit the profile itself. Refuse the whole PATCH with 409 if it
@@ -5149,7 +5207,10 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           // form re-submitting unchanged fields) is allowed through rather
           // than punishing a no-op.
           if (before.agentProfileId) {
-            const boundFields = ["agent", "mode", "model", "effort", "fast", "maxMode"] as const;
+            // `speed` is already resolved from a `speed` or legacy `fast`
+            // body field by `filterPatch`, so a tier change through either
+            // spelling is compared against the row here.
+            const boundFields = ["agent", "mode", "model", "effort", "speed", "maxMode"] as const;
             const touchesBoundField = boundFields.some(
               (field) => field in patch && patch[field] !== before[field],
             );
@@ -6692,7 +6753,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // Detach a task from its bound agent profile (docs/plans/
       // agent-profiles.md D5): clears both `agentProfileId` and the frozen
       // `agentProfile` snapshot via `tasks.setAgentProfile`, which unlocks
-      // the agent/mode/model/effort/fast/maxMode dropdowns (the values
+      // the agent/mode/model/effort/speed/maxMode dropdowns (the values
       // themselves are left exactly as they were — "detach" keeps state,
       // it doesn't revert it) and lifts the PATCH route's bound-agent 409
       // guard above. Archived-gated (409, not 400 — unlike `backlogGuard`'s
