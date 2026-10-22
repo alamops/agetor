@@ -40,11 +40,12 @@ const {
   FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER,
   FAKE_FX_SPEED_UNOFFERED_PROMPT_MARKER,
   FAKE_FX_TOOL_META_PROMPT_MARKER,
+  FAKE_FX_STEER_PROMPT_MARKER,
   FAKE_CURSOR_STREAM_PROMPT_MARKER,
   FAKE_CLAUDE_HANDOFF_PROMPT_MARKER,
   buildFxLaunchOptions,
 } = await import("./agents.ts");
-const { fxSpeedNotOfferedLine } = await import("./fx-acp.ts");
+const { FX_STEER_DROPPED_STATUS, fxSpeedNotOfferedLine } = await import("./fx-acp.ts");
 const { dataDir, tasks } = await import("./db.ts");
 
 beforeEach(() => {
@@ -80,6 +81,7 @@ afterEach(() => {
   delete process.env.AGETOR_FAKE_FX_RECOVERY;
   delete process.env.AGETOR_FAKE_FX_EFFORT_UNOFFERED;
   delete process.env.AGETOR_FAKE_FX_RECOVERY_FAILED;
+  delete process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
   delete process.env.AGETOR_FAKE_CURSOR_STREAM;
   delete process.env.AGETOR_FAKE_CURSOR_PLAN;
   delete process.env.AGETOR_CURSOR_DRIVER;
@@ -1724,6 +1726,17 @@ test("fx launch options: profileMcpServers is on unless the harness explicitly t
   expect(fxLaunch({ ...builtin("fx"), profileMcpServers: false }, { ...fxDefaults }).profileMcpServers).toBe(false);
 });
 
+test("fx launch options forward onSteerDropped from the spawn args (absent when the caller passed none)", () => {
+  const dropped: string[] = [];
+  const onSteerDropped = (text: string) => { dropped.push(text); };
+  const launch = buildFxLaunchOptions(
+    { taskId: "task-fx-launch", runId: "run-fx-launch", harness: builtin("fx"), prompt: "hi", cwd: "/tmp", onChunk: () => {}, onSteerDropped, opts: { ...fxDefaults } },
+    { cmd: ["fx", "acp"], env: {} },
+  );
+  expect(launch.onSteerDropped).toBe(onSteerDropped);
+  expect(fxLaunch(builtin("fx"), { ...fxDefaults }).onSteerDropped).toBeUndefined();
+});
+
 test("fx launch options keep the rest of the spawn shape (argv/env/mode/effort/model/resume)", () => {
   const launch = fxLaunch(builtin("fx"), { ...fxDefaults, mode: "ask", effort: "high", resumeSessionId: "sess-fx-1", continueRecovery: true });
   expect(launch).toMatchObject({
@@ -1861,6 +1874,111 @@ test("fx plain turn without any new marker is byte-identical to before: no tool,
     `${FX_SESSION_TITLE_STATUS_PREFIX}Fake fx session`,
     "turn complete",
   ]);
+});
+
+// ── fx steer seam (plan §5: `__agetor_fake_fx_steer__:<absorbed|dropped>`) ──
+
+/** Spawn a fake fx steer turn, steer `steers` into it while it holds, and
+ *  collect its chunks plus every `onSteerDropped` call — each tagged with
+ *  whether `done` had already resolved when it fired. */
+async function runFakeFxSteer(taskId: string, prompt: string, steers: string[]) {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "80";
+  const chunks: { stream: RunEventStream; data: string }[] = [];
+  const dropped: { text: string; afterDone: boolean }[] = [];
+  let doneResolved = false;
+  const handle = await spawnAgent({
+    taskId,
+    runId: `run-${taskId}`,
+    harness: builtin("fx"),
+    prompt,
+    cwd: "/tmp",
+    onChunk: (stream, data) => { chunks.push({ stream, data }); },
+    onSteerDropped: (text) => { dropped.push({ text, afterDone: doneResolved }); },
+    opts: { ...fxDefaults, runId: `run-${taskId}` },
+  });
+  const accepted = steers.map((line) => handle.steer?.(line));
+  const code = await handle.done.then((c) => { doneResolved = true; return c; });
+  return { handle, chunks, dropped, accepted, code };
+}
+
+test("fx fake agent without the steer marker carries no steer at all", async () => {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  const handle = await spawnAgent({
+    taskId: "task-fx-steer-none",
+    runId: "run-fx-steer-none",
+    harness: builtin("fx"),
+    prompt: "go",
+    cwd: "/tmp",
+    onChunk: () => {},
+    opts: { ...fxDefaults, runId: "run-fx-steer-none" },
+  });
+  expect("steer" in handle).toBe(false);
+  await handle.done;
+});
+
+test("fx steer marker :absorbed — steer() takes the line mid-turn, the turn acknowledges it before finishing, nothing is dropped", async () => {
+  const { handle, chunks, dropped, accepted, code } = await runFakeFxSteer(
+    "task-fx-steer-abs",
+    `go ${FAKE_FX_STEER_PROMPT_MARKER}:absorbed`,
+    ["also check the tests"],
+  );
+  expect(code).toBe(0);
+  expect(accepted).toEqual([true]);
+  expect(dropped).toEqual([]);
+  const ackIdx = chunks.findIndex((c) => c.stream === "assistant" && c.data.includes("also check the tests"));
+  const doneIdx = chunks.findIndex((c) => c.stream === "status" && c.data === "turn complete");
+  expect(ackIdx).toBeGreaterThan(-1);
+  expect(doneIdx).toBeGreaterThan(ackIdx);
+  expect(chunks.some((c) => c.data === FX_STEER_DROPPED_STATUS)).toBe(false);
+  // Once the turn settled, steering is over.
+  expect(handle.steer?.("too late")).toBe(false);
+});
+
+test("fx steer marker :dropped — onSteerDropped(text) fires before done resolves, with the dropped status line", async () => {
+  const { chunks, dropped, accepted, code } = await runFakeFxSteer(
+    "task-fx-steer-drop",
+    `go ${FAKE_FX_STEER_PROMPT_MARKER}:dropped`,
+    ["first", "second"],
+  );
+  expect(code).toBe(0);
+  expect(accepted).toEqual([true, true]);
+  expect(dropped).toEqual([{ text: "first", afterDone: false }, { text: "second", afterDone: false }]);
+  expect(chunks.filter((c) => c.stream === "status" && c.data === FX_STEER_DROPPED_STATUS)).toHaveLength(2);
+  expect(chunks.some((c) => c.stream === "assistant" && c.data.includes("first"))).toBe(false);
+});
+
+test("fx steer marker is read from the task's stored prompt when the turn's own prompt lacks it (a steered/re-queued follow-up)", async () => {
+  const taskId = "task-fx-steer-stored";
+  tasks.insert({ ...makeHandoffTaskRow(taskId, `go ${FAKE_FX_STEER_PROMPT_MARKER}:dropped`), agent: "fx" });
+  const { dropped, accepted } = await runFakeFxSteer(taskId, "a follow-up", ["late thought"]);
+  expect(accepted).toEqual([true]);
+  expect(dropped.map((d) => d.text)).toEqual(["late thought"]);
+});
+
+test("fx steer marker: a killed :dropped turn reports its pending steers dropped before done resolves, then refuses steers", async () => {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "5000";
+  for (const mode of ["dropped", "absorbed"] as const) {
+    const dropped: string[] = [];
+    let doneResolved = false;
+    const handle = await spawnAgent({
+      taskId: `task-fx-steer-kill-${mode}`,
+      runId: `run-fx-steer-kill-${mode}`,
+      harness: builtin("fx"),
+      prompt: `go ${FAKE_FX_STEER_PROMPT_MARKER}:${mode}`,
+      cwd: "/tmp",
+      onChunk: () => {},
+      onSteerDropped: (text) => { dropped.push(`${text}:${doneResolved}`); },
+      opts: { ...fxDefaults, runId: `run-fx-steer-kill-${mode}` },
+    });
+    void handle.done.then(() => { doneResolved = true; });
+    expect(handle.steer?.("one")).toBe(true);
+    handle.kill();
+    await handle.done;
+    expect(handle.steer?.("two")).toBe(false);
+    expect(dropped).toEqual(mode === "dropped" ? ["one:false"] : []);
+  }
 });
 
 test("fx AGETOR_FAKE_FX_PERMISSION=1 with mode 'yolo' auto-allows and still emits the same relative sentinel order, plus the provider sentinel", async () => {

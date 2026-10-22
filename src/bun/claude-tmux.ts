@@ -102,6 +102,15 @@ export interface SpawnedAgent {
    * never paste at all.
    */
   pasteOutcome?: Promise<PasteOutcome>;
+  /**
+   * Fold a follow-up into the turn that is still running, instead of
+   * queueing it as a new turn. Returns true only when the message was
+   * actually sent to the agent; false (no side effects) when this agent
+   * can't take it right now, in which case the caller queues as usual.
+   * Only the fx driver sets it (fx ≥0.0.13 ACP steering, see fx-acp.ts);
+   * every other agent leaves it undefined.
+   */
+  steer?: (line: string) => boolean;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *

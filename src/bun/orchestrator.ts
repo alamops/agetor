@@ -203,6 +203,13 @@ interface ActiveRun {
    * same run row.
    */
   writeInput: (line: string) => boolean;
+  /**
+   * fx-only (0.0.14+ steering): fold a follow-up into the turn that is
+   * running right now instead of queueing it for the next one. Returns true
+   * only when the steer was actually sent; `sendFxTurn` queues on false.
+   * Absent for every other kind and for an fx turn that can't steer.
+   */
+  steer?: (line: string) => boolean;
   /** Set when claude code emitted an `isApiErrorMessage` line during this
    *  run (e.g. 529 Overloaded). The chunk handler flips the column to
    *  `blocked` immediately; the done handler reads this on resolution to
@@ -1792,6 +1799,8 @@ async function startTaskInner(
         ? { antigravitySessionId: sessionId }
         : { fxSessionId: sessionId });
     },
+    // fx: a mid-turn steer fx didn't take comes back here as the next turn.
+    ...(harness.kind === "fx" ? { onSteerDropped: fxSteerDroppedHandler(taskId, runId) } : {}),
     opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, speed: task.speed, maxMode: task.maxMode },
   };
 
@@ -2443,6 +2452,7 @@ function registerActiveRun(
     sessionDied: false,
     unknownCommand: false,
     writeInput: (line) => agent.writeInput(line),
+    ...(agent.steer ? { steer: (line: string) => agent.steer?.(line) === true } : {}),
   });
 }
 
@@ -2669,6 +2679,9 @@ function attachDoneHandler(
       await drainCursorQueue(taskId);
       await drainGeminiQueue(taskId);
       await drainAntigravityQueue(taskId);
+      // Every steer this run accepted has now been reported (dropped ones
+      // before `done` resolved) or absorbed — forget the bookkeeping.
+      fxPendingSteers.delete(runId);
       await drainFxQueue(taskId);
     })
     .catch(async (err) => {
@@ -2709,6 +2722,9 @@ function attachDoneHandler(
       await drainCursorQueue(taskId);
       await drainGeminiQueue(taskId);
       await drainAntigravityQueue(taskId);
+      // Every steer this run accepted has now been reported (dropped ones
+      // before `done` resolved) or absorbed — forget the bookkeeping.
+      fxPendingSteers.delete(runId);
       await drainFxQueue(taskId);
     });
 }
@@ -4581,9 +4597,69 @@ function findLastAntigravitySessionId(taskId: string): string | null {
  * fx is driven over ACP/stdio (`fx-acp.ts`), one turn per spawn — no
  * persistent REPL, no tmux session — so exactly like codex/cursor/gemini we
  * hold the message and spawn a fresh resumed turn once the active turn
- * resolves (`drainFxQueue`, called from `attachDoneHandler`).
+ * resolves (`drainFxQueue`, called from `attachDoneHandler`). On fx 0.0.14+
+ * a follow-up usually steers the running turn instead (`ActiveRun.steer`)
+ * and only lands here when steering isn't possible — or when fx didn't take
+ * the steer before the turn ended (`fxSteerDroppedHandler`).
  */
-const fxTurnQueue = new Map<string, string[]>();
+const fxTurnQueue = new Map<string, QueuedFxLine[]>();
+
+/** One queued fx follow-up. `echoed` marks a steer fx dropped: its `user`
+ *  bubble was already written on the run it steered, so the turn that sends
+ *  it must not write a second one. `seq` is the order the user sent it in
+ *  (`fxSendSeq`) — a dropped steer re-enters the queue at the position it
+ *  was sent, not behind follow-ups that were queued after it. */
+interface QueuedFxLine {
+  line: string;
+  seq: number;
+  echoed?: boolean;
+}
+
+/** Monotonic send order across every fx follow-up (queued or steered). */
+let fxSendSeq = 0;
+
+/** Steers fx accepted on a still-running run, keyed by that run's id, with
+ *  the send order each was given — so `fxSteerDroppedHandler` can re-queue a
+ *  dropped one in place. Absorbed steers are never reported back; the run's
+ *  entry is forgotten once it settles (`attachDoneHandler`). */
+const fxPendingSteers = new Map<string, { text: string; seq: number }[]>();
+
+/** Inserts `item` into `q` keeping it ordered by `seq`. */
+function insertBySendOrder(q: QueuedFxLine[], item: QueuedFxLine): void {
+  const at = q.findIndex((existing) => existing.seq > item.seq);
+  if (at === -1) q.push(item);
+  else q.splice(at, 0, item);
+}
+
+/**
+ * The `onSteerDropped` callback an fx spawn carries: a steer fx didn't take
+ * before its turn ended is queued as the task's next turn (no second `user`
+ * bubble — see {@link QueuedFxLine}). The driver calls it BEFORE the run's
+ * `done` resolves, so the `drainFxQueue` that `attachDoneHandler` runs after
+ * every settle (cancelled included) picks it up. Dropped instead when the
+ * task is gone, archived, being deleted, or no longer an fx task — the same
+ * teardowns that clear `fxTurnQueue` outright (archive/delete/agent switch
+ * kill the run and `dropFxSession` after clearing the queue, and both report
+ * a still-pending steer dropped). A Stop is not a teardown: its dropped
+ * steers re-queue and drain like any other queued follow-up.
+ */
+function fxSteerDroppedHandler(taskId: string, runId: string): (text: string) => void {
+  return (text) => {
+    // Recover the send order this steer was given when fx accepted it.
+    const pending = fxPendingSteers.get(runId);
+    const idx = pending?.findIndex((p) => p.text === text) ?? -1;
+    const seq = idx >= 0 ? pending!.splice(idx, 1)[0]!.seq : ++fxSendSeq;
+    // `isTaskTearingDown` covers the window where a delete has started (its
+    // queue clear already ran) but the row still exists — `deleteTask` kills
+    // the run and `dropFxSession`s before `tasks.delete`.
+    if (isTaskTearingDown(taskId)) return;
+    const task = tasks.get(taskId);
+    if (!task || task.archivedAt != null || resolveHarness(task.agent)?.kind !== "fx") return;
+    const q = fxTurnQueue.get(taskId) ?? [];
+    insertBySendOrder(q, { line: text, seq, echoed: true });
+    fxTurnQueue.set(taskId, q);
+  };
+}
 
 /**
  * Pending auto-resume timer for a paused fx task, one per task id (plan
@@ -4692,8 +4768,8 @@ function appendFxStatusLine(taskId: string, runId: string, data: string): void {
 /**
  * Send a follow-up to an fx task. Each follow-up is its own run row + its own
  * resumed ACP turn (sequential-turn model, same as codex/cursor/gemini). When
- * a turn is already running, the message is queued; otherwise it spawns
- * immediately. Returns the run id the message was attached to, or null on
+ * a turn is already running, the message steers it (fx 0.0.14+, no new run
+ * row) or, when it can't, is queued; otherwise it spawns immediately. Returns the run id the message was attached to, or null on
  * lookup failure — or when `spawnFxRun` declined to mint a run because
  * `startingTaskIds` was already claimed for this task (see that set's doc,
  * near `startTask`).
@@ -4709,12 +4785,25 @@ async function sendFxTurn(taskId: string, line: string): Promise<string | null> 
   // here it's just the timer, so a still-in-flight schedule can't fire while
   // this follow-up is in transit.
   cancelFxAutoResumeTimer(taskId);
-  if (task.runId && active.has(task.runId)) {
-    const q = fxTurnQueue.get(taskId) ?? [];
-    q.push(line);
-    fxTurnQueue.set(taskId, q);
+  const activeHandle = task.runId ? active.get(task.runId) : undefined;
+  if (task.runId && activeHandle) {
+    // fx 0.0.14+: steer the running turn first — the message joins this turn
+    // and gets no run row of its own. `steer` is absent (older fx, other
+    // fakes) or returns false (no capability, still in the handshake, over
+    // 64 KiB) when that isn't possible; then queue exactly as before. A steer
+    // fx later drops comes back through `fxSteerDroppedHandler`.
+    const seq = ++fxSendSeq;
+    if (activeHandle.steer?.(line) === true) {
+      const pending = fxPendingSteers.get(task.runId) ?? [];
+      pending.push({ text: line, seq });
+      fxPendingSteers.set(task.runId, pending);
+    } else {
+      const q = fxTurnQueue.get(taskId) ?? [];
+      q.push({ line, seq });
+      fxTurnQueue.set(taskId, q);
+    }
     // Record the user bubble on the active run so the panel reflects it right
-    // away; the queued turn that answers it lands as a later run row.
+    // away; a queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
     runs.appendEvent(runId, "user", data);
@@ -4744,7 +4833,7 @@ async function sendFxTurn(taskId: string, line: string): Promise<string | null> 
  * tell an automatic resume apart from a manual click.
  */
 type FxTurn =
-  | { line: string }
+  | { line: string; echoed?: boolean }
   | { continueRecovery: true; origin?: "manual" | "auto"; attempt?: number; max?: number };
 
 /**
@@ -4759,7 +4848,8 @@ type FxTurn =
  * claim, the run-row insert, the column flip/emit, `spawnAgentOrFail` /
  * `registerActiveRun` / `attachDoneHandler`, and the queue-drop-on-spawn-
  * failure) is identical between them. They differ only in: whether a `user`
- * bubble is echoed (never for `continueRecovery` — nothing was typed), the
+ * bubble is echoed (never for `continueRecovery` — nothing was typed — nor
+ * for a dropped steer, `echoed: true`, whose bubble already exists), the
  * status line, the prompt text handed to the driver (`""` for
  * `continueRecovery`; fx-acp.ts sends an empty `prompt` content array
  * downstream when `continueRecovery` is set, per ACP's continue-recovery
@@ -4822,7 +4912,8 @@ async function spawnFxRun(
     const kind: AgentKind = harness?.kind ?? "fx";
     const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
     if ("line" in turn) {
-      onChunk("user", normalizeUserText(turn.line));
+      // A dropped steer's bubble already sits on the run it steered.
+      if (turn.echoed !== true) onChunk("user", normalizeUserText(turn.line));
       onChunk(
         "status",
         priorSessionId
@@ -4880,6 +4971,7 @@ async function spawnFxRun(
       onSessionId: (sessionId) => {
         runs.update(newRunId, { fxSessionId: sessionId });
       },
+      onSteerDropped: fxSteerDroppedHandler(taskId, newRunId),
       opts: {
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
@@ -4937,7 +5029,9 @@ async function drainFxQueue(taskId: string): Promise<void> {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) fxTurnQueue.delete(taskId);
-  if (next !== undefined) await spawnFxRun(task, taskId, { line: next });
+  if (next !== undefined) {
+    await spawnFxRun(task, taskId, next.echoed ? { line: next.line, echoed: true } : { line: next.line });
+  }
 }
 
 /** Most-recent fx session id across the task's runs (for resume). */

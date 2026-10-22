@@ -345,6 +345,24 @@ The Playwright fixtures start the headless backend per worker with the fake driv
 
 **Execution record** (filled in during the run): branch/base SHA, per-wave commit SHAs, L1/L2 results, and D1's draft PR release note.
 
+- **Branch / base:** `feature/fx-and-cursor-updates`, cut from `fbd68603afef778a618a94ca88e0c00997956afd`.
+- **Commits so far:** `1daf1834` docs (plan, investigation, grill) · `0ed6a082` wave 1 prep (the speed contract) · `b07caf56` wave 1 (speed enum, fx catalog, storage) · `f0e97539` wave 2 (fx 0.0.14 + cursor features). Wave 3 (fx steering) and wave 4 (e2e + docs): TBD.
+- **L1 / L2 results:** TBD.
+- **Draft PR release note (D31, for the PR description):**
+
+  > **fx 0.0.14 and cursor-agent 2026.10 support**
+  >
+  > - **fx 0.0.14.** Agetor now supports fx up to 0.0.14 and still works with older versions back to 0.0.4. The fx 0.0.14 release binaries need macOS 15 or later.
+  > - **Agetor no longer changes your own fx profile.** Earlier Agetor versions sent fx a mode switch at the start of each Auto or Ask turn, and fx 0.0.14 saves that switch into `~/.fx/settings.json`, so your interactive fx may now start in Ask. Agetor no longer sends it. To reset your profile, run `/permissions` inside fx. Settings → Harnesses and `agetor harness ls` show a hint while your fx profile starts in Ask.
+  > - **Profile MCP servers.** fx 0.0.13 and later load your own fx profile's MCP servers only when asked to, and Agetor now asks by default. Turn it off per harness with **Load profile MCP servers** in Settings → Harnesses, or `agetor harness edit <id> --no-profile-mcp`.
+  > - **Speed tiers.** The cursor-only Fast switch is now a **Speed** control (*Off*, *Fast*, *Ultrafast*) for every harness, shown when the model offers more than Off: Cursor's Fast variants, and fx's AI Gateway fast lanes as your account's catalog reports them. Ultrafast costs more per token than Fast. The CLI takes `--speed off|fast|ultrafast`, and `--fast`/`--no-fast` still work.
+  > - **Messages during an fx turn.** With fx 0.0.13 or later, a message sent while fx is working joins the running turn. If fx doesn't take it before the turn ends, Agetor sends it as the next turn.
+  > - **Clearer fx transcripts.** fx's own internal tool calls are hidden, MCP tool calls are labelled *server · tool*, fx notices show as status lines, and a response fx stops retrying is shown as failed rather than as an endless retry. The "fx held this tool call" line now also points at `FX_REVIEW_MODEL` for choosing a reviewer model your account can reach.
+  > - **Cursor Plan and Read-only modes.** Cursor gains a real *Plan* mode (`--mode plan`), used by the Code/Plan toggle; approving its plan switches the task to *Auto (force)* to implement it, unless the task runs from an Agent. *Read-only* now runs `--mode ask`. Both pass `--trust`, so `cursor-agent` accepts each task's fresh worktree. Cursor thinking renders as one block per thought, and the run row shows Cursor's token usage.
+  > - **New default fx model.** New fx tasks default to DeepSeek V4 Flash, since GLM 5.3 Flash isn't in every account's catalog.
+  > - **Retired fx models migrated.** Tasks and Agents on Qwen3 Coder Plus, Devstral 2 or Claude 3 Haiku move to DeepSeek V4 Flash.
+  > - **Downgrade note.** This release replaces the `fast` columns with `speed` (migration 072). If you go back to an older Agetor build afterwards, it reads every task and Agent as not fast.
+
 ## 9. Completeness ledger
 
 | Item | Disposition | Task ID / reason / who deferred |

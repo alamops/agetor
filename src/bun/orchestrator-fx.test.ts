@@ -452,6 +452,222 @@ test("sendInput (fx, busy) queues the follow-up; drainFxQueue spawns it after th
   expect(list.every((r) => r.status !== "running")).toBe(true);
 });
 
+/* ─── fx steering (docs/plans/fx-0.0.14-and-cursor-updates.md §3.2 D17/D18) ───
+ * Driven by the fake steer seam (`__agetor_fake_fx_steer__:<absorbed|dropped>`
+ * in agents.ts): the first turn holds for AGETOR_FAKE_FX_STEER_HOLD_MS and
+ * exposes `steer()`, so a follow-up sent while it holds steers instead of
+ * queueing. */
+
+async function startSteerTask(title: string, prompt: string) {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { harnesses } = await import("./db.ts");
+  harnesses.setEnabled("fx", true);
+  const created = await createTask({ title, prompt, agent: "fx", workdir: process.cwd(), isolation: "none", taskType: "task" });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  return { taskId, firstRunId: "runId" in started ? started.runId : "" };
+}
+
+function userEvents(taskId: string, runs: { eventsForTask: (id: string) => { runId: string; stream: string; data: string }[] }, text: string) {
+  return runs.eventsForTask(taskId).filter((e) => e.stream === "user" && e.data.includes(text));
+}
+
+test("fx steer accepted: a mid-turn follow-up joins the running turn — one run row, its bubble on that run, nothing queued", async () => {
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "250";
+  try {
+    const { sendInput } = await import("./orchestrator.ts");
+    const { runs } = await import("./db.ts");
+    const { __getFakeDriver } = await import("./agents.ts");
+    const { taskId, firstRunId } = await startSteerTask("fx steer absorbed", "turn one __agetor_fake_fx_steer__:absorbed");
+    await settle(30);
+
+    const res = await sendInput(firstRunId, "steer this turn");
+    expect(res.delivered).toBe(true);
+    if (res.delivered) expect(res.runId).toBe(firstRunId);
+    expect(__getFakeDriver(taskId)?._record).toContain("steer:steer this turn");
+
+    await waitForRunSettled(firstRunId, 5000);
+    await settle(150);
+    // No queued turn ever spawned: still exactly one run row.
+    const list = runs.listForTask(taskId);
+    expect(list.length).toBe(1);
+    expect(list[0]!.status).toBe("succeeded");
+    const bubbles = userEvents(taskId, runs, "steer this turn");
+    expect(bubbles.length).toBe(1);
+    expect(bubbles[0]!.runId).toBe(firstRunId);
+    // The fake absorbed it into the turn's own reply.
+    expect(
+      runs.eventsForTask(taskId).some((e) => e.runId === firstRunId && e.stream === "assistant" && e.data.includes("steer this turn")),
+    ).toBe(true);
+  } finally {
+    delete process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  }
+});
+
+test("fx steer dropped: the text comes back as the next turn after settle, without a second user bubble", async () => {
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "200";
+  try {
+    const { sendInput } = await import("./orchestrator.ts");
+    const { runs } = await import("./db.ts");
+    const { FX_STEER_DROPPED_STATUS } = await import("./fx-acp.ts");
+    const { taskId, firstRunId } = await startSteerTask("fx steer dropped", "turn one __agetor_fake_fx_steer__:dropped");
+    await settle(30);
+
+    const res = await sendInput(firstRunId, "late follow-up");
+    expect(res.delivered).toBe(true);
+    if (res.delivered) expect(res.runId).toBe(firstRunId);
+    // Steered, not queued: no second row while the first turn holds.
+    expect(runs.listForTask(taskId).length).toBe(1);
+
+    // The dropped steer re-queues before the first run's done resolves, so
+    // drainFxQueue spawns it as a second run (which itself holds, then settles).
+    await waitFor(() => runs.listForTask(taskId).length === 2, 5000);
+    await waitFor(() => runs.listForTask(taskId).every((r) => r.status !== "running"), 5000);
+
+    const list = runs.listForTask(taskId);
+    const secondRun = list.find((r) => r.id !== firstRunId)!;
+    const events = runs.eventsForTask(taskId);
+    expect(events.some((e) => e.runId === firstRunId && e.stream === "status" && e.data === FX_STEER_DROPPED_STATUS)).toBe(true);
+    // Exactly one bubble for the text — on the run it steered; the turn that
+    // finally sent it echoes none.
+    const bubbles = userEvents(taskId, runs, "late follow-up");
+    expect(bubbles.length).toBe(1);
+    expect(bubbles[0]!.runId).toBe(firstRunId);
+    expect(events.some((e) => e.runId === secondRun.id && e.stream === "user")).toBe(false);
+  } finally {
+    delete process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  }
+});
+
+test("fx steer dropped after a later follow-up queued: the dropped steer still runs first, in send order", async () => {
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "200";
+  try {
+    const { sendInput } = await import("./orchestrator.ts");
+    const { runs } = await import("./db.ts");
+    const { taskId, firstRunId } = await startSteerTask("fx steer order", "turn one __agetor_fake_fx_steer__:dropped");
+    await settle(30);
+
+    // Accepted as a steer…
+    expect((await sendInput(firstRunId, "steered first")).delivered).toBe(true);
+    // …then a follow-up over fx's 64 KiB steer cap, which can only queue.
+    const big = `queued second ${"x".repeat(70 * 1024)}`;
+    expect((await sendInput(firstRunId, big)).delivered).toBe(true);
+    expect(runs.listForTask(taskId).length).toBe(1);
+
+    await waitFor(() => runs.listForTask(taskId).length === 3, 8000);
+    await waitFor(() => runs.listForTask(taskId).every((r) => r.status !== "running"), 8000);
+
+    const ordered = [...runs.listForTask(taskId)].sort((a, b) => a.startedAt - b.startedAt);
+    const events = runs.eventsForTask(taskId);
+    // Run 2 sends the dropped steer (its bubble already sits on run 1, so it
+    // echoes none); run 3 sends the queued follow-up, which echoes as before.
+    expect(events.some((e) => e.runId === ordered[1]!.id && e.stream === "user")).toBe(false);
+    expect(events.some((e) => e.runId === ordered[2]!.id && e.stream === "user" && e.data.startsWith("queued second"))).toBe(true);
+  } finally {
+    delete process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  }
+});
+
+test("fx steer pending when the task is deleted: the dropped steer is not re-queued, so no turn spawns for the dying task", async () => {
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "5000";
+  try {
+    const { sendInput, deleteTask, __enqueueTeardownForTest } = await import("./orchestrator.ts");
+    const { tasks, runs } = await import("./db.ts");
+    const { __getFakeDriver } = await import("./agents.ts");
+    const { taskId, firstRunId } = await startSteerTask("fx steer delete", "turn one __agetor_fake_fx_steer__:dropped");
+    await settle(30);
+    const res = await sendInput(firstRunId, "steer then delete");
+    expect(res.delivered).toBe(true);
+    const driver = __getFakeDriver(taskId);
+    expect(driver?._record).toContain("steer:steer then delete");
+
+    // Hold the workdir's teardown queue so the delete sits mid-teardown with
+    // its row still present — the window where the real driver's
+    // `dropFxSession` reports a pending steer dropped. deleteTask kills the
+    // run; the fake reports the steer dropped a tick later, inside that window.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    void __enqueueTeardownForTest("fx-steer-delete-gate", process.cwd(), () => gate);
+    const deleting = deleteTask(taskId);
+    await settle(150);
+    expect(tasks.get(taskId)).not.toBeNull();
+    expect(__getFakeDriver(taskId)).toBe(driver);
+    release();
+    await deleting;
+    await settle(100);
+    expect(tasks.get(taskId)).toBeNull();
+    expect(runs.listForTask(taskId).length).toBe(0);
+    // No later spawn replaced the fake driver for this task id.
+    expect(__getFakeDriver(taskId)).toBe(driver);
+  } finally {
+    delete process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  }
+});
+
+test("fx steer pending when the task is archived (stopRun): the dropped steer is not re-queued", async () => {
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "5000";
+  try {
+    const { sendInput, archiveTask } = await import("./orchestrator.ts");
+    const { tasks, runs } = await import("./db.ts");
+    const { __getFakeDriver } = await import("./agents.ts");
+    const { taskId, firstRunId } = await startSteerTask("fx steer archive", "turn one __agetor_fake_fx_steer__:dropped");
+    await settle(30);
+    expect((await sendInput(firstRunId, "steer then archive")).delivered).toBe(true);
+    const driver = __getFakeDriver(taskId);
+
+    const archived = await archiveTask(taskId, { force: true, stopRun: true });
+    if ("error" in archived) throw new Error(archived.error);
+    await settle(200);
+    expect(tasks.get(taskId)?.archivedAt).not.toBeNull();
+    expect(runs.listForTask(taskId).length).toBe(1);
+    expect(__getFakeDriver(taskId)).toBe(driver);
+  } finally {
+    delete process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  }
+});
+
+test("fx steer pending when the user presses Stop: the dropped steer re-queues and runs as the next turn, still one bubble", async () => {
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "300";
+  try {
+    const { sendInput, cancelRun } = await import("./orchestrator.ts");
+    const { runs } = await import("./db.ts");
+    const { taskId, firstRunId } = await startSteerTask("fx steer stop", "turn one __agetor_fake_fx_steer__:dropped");
+    await settle(30);
+    expect((await sendInput(firstRunId, "steer then stop")).delivered).toBe(true);
+
+    expect(await cancelRun(firstRunId)).toBe(true);
+    await waitFor(() => runs.listForTask(taskId).length === 2, 5000);
+    await waitFor(() => runs.listForTask(taskId).every((r) => r.status !== "running"), 5000);
+    const first = runs.listForTask(taskId).find((r) => r.id === firstRunId)!;
+    expect(first.status).toBe("cancelled");
+    const bubbles = userEvents(taskId, runs, "steer then stop");
+    expect(bubbles.length).toBe(1);
+    expect(bubbles[0]!.runId).toBe(firstRunId);
+  } finally {
+    delete process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  }
+});
+
+test("fx without a steer-capable agent: a busy follow-up still queues into a second run, with its bubble on both runs as before", async () => {
+  const { sendInput } = await import("./orchestrator.ts");
+  const { runs } = await import("./db.ts");
+  const { __getFakeDriver } = await import("./agents.ts");
+  const { taskId, firstRunId } = await startSteerTask("fx no steer", "turn one");
+  expect(__getFakeDriver(taskId)?.steer).toBeUndefined();
+
+  const res = await sendInput(firstRunId, "queued plain");
+  expect(res.delivered).toBe(true);
+  if (res.delivered) expect(res.runId).toBe(firstRunId);
+  expect(runs.listForTask(taskId).length).toBe(1);
+
+  await waitFor(() => runs.listForTask(taskId).length === 2 && runs.listForTask(taskId).every((r) => r.status !== "running"), 5000);
+  const secondRun = runs.listForTask(taskId).find((r) => r.id !== firstRunId)!;
+  const bubbles = userEvents(taskId, runs, "queued plain");
+  expect(bubbles.map((b) => b.runId).sort()).toEqual([firstRunId, secondRun.id].sort());
+});
+
 test("cancelRun (fx) mid-turn records the run cancelled and returns the task to ready", async () => {
   const { createTask, startTask, cancelRun } = await import("./orchestrator.ts");
   const { tasks, runs, harnesses } = await import("./db.ts");

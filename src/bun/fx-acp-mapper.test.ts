@@ -328,7 +328,7 @@ describe("tool_call_update → held-tool review guidance (review_unavailable)", 
     expect(first[1]!.data.startsWith("⚠ fx held this tool call")).toBe(true);
     expect(first[1]!.data).toContain("Switch this task's mode to Full access (or Ask)");
     expect(first[1]!.data).toContain(
-      "or set FX_REVIEW_MODEL in this harness's environment (Settings → Harnesses) to a reviewer model your account can reach.",
+      "or set FX_REVIEW_MODEL to a reviewer model your account can reach (in the environment of an fx harness you add under Settings → Harnesses).",
     );
     expect(ctx.reviewHeldWarned).toBe(true);
 

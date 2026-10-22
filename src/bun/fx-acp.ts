@@ -659,12 +659,28 @@ import {
  *     tool}}`. `internal: true` marks fx's own discovery steps
  *     (`capability_search`, `mcp_select_tool`); the mapper stamps both the
  *     `tool_use` and its later `tool_result` so renderers can hide them.
- *   - **Steering exists (0.0.13):** `initialize.result.agentCapabilities
- *     ._meta.fx.steering === true`; a `session/prompt` sent mid-turn with
- *     `_meta.fx.steer: true` is folded into the running turn, and the
- *     delivered text is replayed as `user_message_chunk` carrying
- *     `_meta.fx.steering` (silent in the mapper — agetor writes its own user
- *     event at send time).
+ *   - **Steering (0.0.13/0.0.14, source-verified `server.zig
+ *     handleSteeringPrompt`/`publishSteeringOutcomes`).** The capability is
+ *     `initialize.result.agentCapabilities._meta.fx.steering === true` (no
+ *     `_meta` at all on 0.0.10). A steer is a second `session/prompt` sent
+ *     while the main one runs; it MUST carry `_meta.fx.steer: true` (without
+ *     it fx answers "Prompt already in progress"). fx joins it to the running
+ *     turn at the next safe boundary and DEFERS its reply until the turn
+ *     ends, writing it right AFTER the main prompt's response:
+ *     `{stopReason, _meta:{fx:{steering:"absorbed"}}}` when the model saw
+ *     it; on a non-cancelled turn one still queued at the end is a JSON-RPC
+ *     error `-32600` "Steering prompt was not delivered because the turn
+ *     ended first; send it as a new prompt"; on a cancelled turn it is
+ *     `{stopReason:"cancelled", _meta:{fx:{steering:"dropped"}}}`; when the
+ *     main turn itself ended in an RPC error, every steer (absorbed ones
+ *     too) gets that same error. A steer arriving after the turn stopped
+ *     taking input is started by fx as the NEXT turn in the same process.
+ *     Limits: 64 KiB per message (`-32602` "Steering prompt text exceeds the
+ *     64 KiB limit"), 1 MiB queued (`-32600` "Steering queue is full"); text
+ *     content blocks only. Delivered text is replayed as
+ *     `user_message_chunk` carrying `_meta.fx.steering` (silent in the
+ *     mapper — agetor writes its own user event at send time). See
+ *     `steerFx`/`settlePendingSteers` for how agetor maps outcomes.
  *   - **`stopReason: "yielded"` (0.0.14)** is sent only when the host gave
  *     the turn a deadline; agetor never does, so it stays in the switch's
  *     generic default. `usage_update` drops `cost` (0.0.14).
@@ -690,6 +706,17 @@ const RPC_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CANCEL_WAIT_MS = 3_000;
 /** Grace between SIGTERM and SIGKILL when force-killing. */
 const KILL_GRACE_MS = 2_000;
+/** How long, once the main `session/prompt` has resolved, to wait for the
+ *  deferred replies to any steers sent during the turn (fx writes them right
+ *  after the main response, so this is normally instant) before treating an
+ *  unanswered one as dropped. Only paid when a steer is pending. */
+export const STEER_SETTLE_GRACE_MS = 2_000;
+/** fx's per-message steering limit — a larger steer would only be refused
+ *  with `-32602`, so `steerFx` declines it up front and the caller queues. */
+const STEER_MAX_BYTES = 64 * 1024;
+/** Status line emitted once per steer fx didn't deliver before its turn
+ *  ended; the text itself is handed back via `onSteerDropped`. */
+export const FX_STEER_DROPPED_STATUS = "fx didn't take your message before the turn ended — sending it as the next turn";
 /** How many trailing stderr lines to keep for death diagnostics. */
 const STDERR_RING_SIZE = 20;
 /** Guard against a pathological unterminated line growing stdout's line
@@ -752,6 +779,18 @@ interface AcpEnvelope {
 interface PendingRpc {
   resolve: (result: unknown) => void;
   reject: (err: Error) => void;
+}
+
+/** One steer sent during the running turn, awaiting fx's deferred reply. */
+interface PendingSteer {
+  text: string;
+  /** Never rejects: an RPC error, a transport failure or settlement all
+   *  resolve `"dropped"`. */
+  outcome: Promise<"absorbed" | "dropped">;
+  /** Set once `outcome` has resolved, so the synchronous teardown path
+   *  (`reportSteerOutcomes` from `settleFx`) can tell an already-absorbed
+   *  steer apart from one still in flight. */
+  settled?: "absorbed" | "dropped";
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -883,6 +922,22 @@ interface FxSessionState {
    *  matching `tool_result` too. Shared by reference with every
    *  `FxUpdateCtx` `dispatchSessionUpdate` builds. */
   internalToolIds: Set<string>;
+
+  /** `initialize.result.agentCapabilities._meta.fx.steering === true` (fx
+   *  ≥0.0.13). Gate for `steerFx`. */
+  steeringSupported: boolean;
+  /** True from the moment the main `session/prompt` is written until it
+   *  resolves (result or error). A steer is only possible inside that
+   *  window — fx answers a steer outside it by starting a new turn. */
+  promptInFlight: boolean;
+  /** Steers sent this turn, keyed by their JSON-RPC id. An entry is deleted
+   *  the moment it is reported (`reportSteerOutcomes`), which is what makes
+   *  every dropped steer reach `onSteerDropped` exactly once. */
+  pendingSteers: Map<number, PendingSteer>;
+  /** See `FxLaunchOptions.onSteerDropped`. */
+  onSteerDropped?: (text: string) => void;
+  /** `STEER_SETTLE_GRACE_MS` unless a test overrides it. */
+  steerSettleGraceMs: number;
 
   resolved: boolean;
   killRequested: boolean;
@@ -1893,7 +1948,7 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
           chunks.push({
             stream: "status",
             data:
-              "⚠ fx held this tool call — its safety reviewer (auto mode) is unavailable on this account, so tools can't run. Switch this task's mode to Full access (or Ask) to let tools run, or set FX_REVIEW_MODEL in this harness's environment (Settings → Harnesses) to a reviewer model your account can reach.",
+              "⚠ fx held this tool call — its safety reviewer (auto mode) is unavailable on this account, so tools can't run. Switch this task's mode to Full access (or Ask) to let tools run, or set FX_REVIEW_MODEL to a reviewer model your account can reach (in the environment of an fx harness you add under Settings → Harnesses).",
             lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`,
           });
         }
@@ -2269,6 +2324,17 @@ function settleFx(state: FxSessionState, code: number): void {
   } catch {
     /* settlement proceeds regardless */
   }
+  // Teardown paths (death, a cancel that timed out, dropFxSession) reach
+  // here without `runFxTurn`'s post-prompt `settlePendingSteers`: every
+  // steer still unreported counts as dropped and is handed back now, before
+  // `resolveDone`, so the caller has it queued by the time `done` resolves.
+  // A no-op on the normal path, which already reported them all.
+  state.promptInFlight = false;
+  try {
+    reportSteerOutcomes(state);
+  } catch {
+    /* settlement proceeds regardless */
+  }
   state.resolved = true;
   // Identity-checked: a cross-kind agent switch or a fresh turn on the same
   // task can already have replaced this taskId's map entry with a newer
@@ -2308,6 +2374,97 @@ function killProc(state: FxSessionState): void {
     try { state.proc.kill("SIGKILL"); } catch { /* already gone */ }
   }, KILL_GRACE_MS);
   state.proc.exited.then(() => clearTimeout(timer)).catch(() => clearTimeout(timer));
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Steering (fx ≥0.0.13) — see the file header's steering facts.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** `initialize.result.agentCapabilities._meta.fx.steering === true`. */
+function fxSteeringCapable(initResult: unknown): boolean {
+  const caps = (initResult as { agentCapabilities?: { _meta?: { fx?: { steering?: unknown } } } } | null | undefined)
+    ?.agentCapabilities;
+  return caps?._meta?.fx?.steering === true;
+}
+
+/**
+ * Fold `line` into the turn that is still running. Returns true only when
+ * the steer RPC was actually sent; false — with no side effects — when the
+ * turn is settling or stopping, fx didn't advertise steering, the main
+ * `session/prompt` isn't in flight yet (still in the handshake) or any
+ * more, there is no session id, or the text is empty or over fx's 64 KiB
+ * limit. A false answer means the caller queues the line as a new turn.
+ *
+ * The steer RPC has no timeout: fx defers its reply until the turn ends.
+ * Its outcome is collected by `settlePendingSteers` once the main prompt
+ * resolves; a steer fx didn't deliver goes back through `onSteerDropped`.
+ *
+ * Accepted risk: a steer that lands after fx's turn stopped taking input is
+ * started by fx itself as the next turn in the same process. Its reply is a
+ * plain `{stopReason}` that won't arrive within the settle grace, so agetor
+ * reports it dropped, re-queues its text, and kills the child — tearing
+ * down that in-process turn. The model may see a few seconds of duplicate
+ * work; the message is never lost.
+ */
+function steerFx(state: FxSessionState, line: string): boolean {
+  if (state.resolved || state.killRequested || state.cancelRequested) return false;
+  if (!state.steeringSupported || !state.promptInFlight || !state.sessionId) return false;
+  if (line.length === 0 || Buffer.byteLength(line, "utf8") > STEER_MAX_BYTES) return false;
+  // `sendRpc` assigns `state.nextRpcId` synchronously, so reading it first
+  // is exactly the id this steer goes out with.
+  const id = state.nextRpcId;
+  const entry: PendingSteer = { text: line, outcome: Promise.resolve("dropped") };
+  entry.outcome = sendRpc(state, "session/prompt", {
+    sessionId: state.sessionId,
+    prompt: [{ type: "text", text: line }],
+    _meta: { fx: { steer: true } },
+  }).then(
+    (result): "absorbed" | "dropped" =>
+      (result as { _meta?: { fx?: { steering?: unknown } } } | null | undefined)?._meta?.fx?.steering === "absorbed"
+        ? "absorbed"
+        : "dropped",
+    // Any RpcError (-32600 "not delivered because the turn ended first",
+    // -32602 size limit, the main turn's own error echoed to every steer),
+    // or settlement rejecting the pending entry. Swallowed here on purpose:
+    // a steer's failure is never the turn's failure.
+    (): "dropped" => "dropped",
+  ).then((outcome) => {
+    entry.settled = outcome;
+    return outcome;
+  });
+  state.pendingSteers.set(id, entry);
+  return true;
+}
+
+/** Once the main `session/prompt` has resolved, wait (at most `graceMs`) for
+ *  every pending steer's deferred reply, then report them. */
+async function settlePendingSteers(state: FxSessionState, graceMs: number): Promise<void> {
+  if (state.pendingSteers.size === 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const grace = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, graceMs);
+  });
+  await Promise.race([Promise.all(Array.from(state.pendingSteers.values(), (e) => e.outcome)), grace]);
+  clearTimeout(timer);
+  reportSteerOutcomes(state);
+}
+
+/** Report every pending steer exactly once (the entry is deleted as it is
+ *  reported): an absorbed one is done; anything else — dropped, errored, or
+ *  still unanswered — is handed back via `onSteerDropped` and gets one
+ *  `FX_STEER_DROPPED_STATUS` line. Synchronous, so `settleFx` can call it
+ *  right before `resolveDone`. */
+function reportSteerOutcomes(state: FxSessionState): void {
+  for (const [id, entry] of Array.from(state.pendingSteers)) {
+    state.pendingSteers.delete(id);
+    if (entry.settled === "absorbed") continue;
+    try {
+      state.onSteerDropped?.(entry.text);
+    } catch {
+      /* the caller's queue failing must not stop settlement */
+    }
+    emit(state, "status", FX_STEER_DROPPED_STATUS);
+  }
 }
 
 /** Wait for the turn to settle, or `timeoutMs` to elapse — whichever comes
@@ -2728,8 +2885,9 @@ async function runFxTurn(
   }
 
   // 1. initialize
+  let initResult: unknown;
   try {
-    await withTimeout(
+    initResult = await withTimeout(
       sendRpc(state, "initialize", {
         // Send the NUMBER 1 — ACP's schema defines protocolVersion as a
         // number and this driver has always sent one, so nothing here
@@ -2762,6 +2920,7 @@ async function runFxTurn(
     return;
   }
   if (state.resolved) return;
+  state.steeringSupported = fxSteeringCapable(initResult);
 
   // 2. session/new | session/resume (+ session/load fallback)
   if (opts.resumeSessionId) {
@@ -2934,9 +3093,19 @@ async function runFxTurn(
 
   let promptResult: { stopReason?: string; usage?: unknown } | undefined;
   try {
-    promptResult = (await sendRpc(state, "session/prompt", promptParams)) as typeof promptResult;
+    // `sendRpc` writes synchronously, so the steering window opens exactly
+    // when the prompt hits fx's stdin.
+    const prompt = sendRpc(state, "session/prompt", promptParams);
+    state.promptInFlight = true;
+    promptResult = (await prompt) as typeof promptResult;
   } catch (err) {
+    state.promptInFlight = false;
     if (state.resolved) return; // already settled via cancel/death
+    // Steers sent during this turn are answered with the same RPC error
+    // (fx echoes the turn's error to every steer, absorbed or not), right
+    // after it — collect and hand them back before the failure settles.
+    await settlePendingSteers(state, state.steerSettleGraceMs);
+    if (state.resolved) return;
     if (err instanceof RpcError && err.code === -32600) {
       // Credential re-check failed mid-prompt (0.0.5+, confirmed through
       // 0.0.10 — see the file header) — fx's text is user-actionable on its
@@ -2958,7 +3127,16 @@ async function runFxTurn(
     }
     return;
   }
+  state.promptInFlight = false;
   if (state.resolved) return; // cancel/death already settled us
+
+  // fx writes each steer's deferred reply right after the main prompt's
+  // response (a cancelled turn included — its steers come back
+  // `steering:"dropped"`). Collect them BEFORE the stopReason switch so a
+  // dropped steer's text is handed to `onSteerDropped` — and queued by the
+  // caller — before `settleFx` resolves `done`.
+  await settlePendingSteers(state, state.steerSettleGraceMs);
+  if (state.resolved) return;
 
   // A NORMAL (non-continue) prompt just RAN on a session whose replay
   // carried a `paused` recovery checkpoint — fx consumes that checkpoint the
@@ -3160,6 +3338,13 @@ export interface FxLaunchOptions {
    *  resolves on the first turn (persisted as `runs.fx_session_id`). Not
    *  called again on a resumed turn — the session id is already known. */
   onSessionId?: (id: string) => void;
+  /** Called once per steer (`SpawnedAgent.steer`) fx did not deliver to the
+   *  model before the turn ended — dropped, refused, or unanswered — with
+   *  its text, always BEFORE `done` resolves, so the caller can queue it as
+   *  the next turn. Never called for an absorbed steer. */
+  onSteerDropped?: (text: string) => void;
+  /** Test-only override of `STEER_SETTLE_GRACE_MS`. */
+  steerSettleGraceMs?: number;
 }
 
 /**
@@ -3230,6 +3415,11 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
     seenLineUuids: new Set(),
     coalescer: new FxTextCoalescer(),
     internalToolIds: new Set(),
+    steeringSupported: false,
+    promptInFlight: false,
+    pendingSteers: new Map(),
+    onSteerDropped: opts.onSteerDropped,
+    steerSettleGraceMs: opts.steerSettleGraceMs ?? STEER_SETTLE_GRACE_MS,
     resolved: false,
     killRequested: false,
     cancelRequested: false,
@@ -3273,10 +3463,12 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
   return {
     kill: () => { void cancelFxTurn(state); },
     // fx's ACP session has no mid-turn keystroke channel — a follow-up sent
-    // while a turn is in flight folds into the orchestrator's queue and is
+    // while a turn is in flight is offered to `steer` first (fx ≥0.0.13);
+    // when that declines it folds into the orchestrator's queue and is
     // delivered as a fresh turn (new process, `--resume`-equivalent via
     // `session/resume`/`session/load`), same as cursor/gemini.
     writeInput: () => false,
+    steer: (line: string) => steerFx(state, line),
     done,
   };
 }

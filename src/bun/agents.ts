@@ -17,7 +17,7 @@ import {
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
 import { createCursorMapCtx, flushCursorThinking, mapCursorEvent, spawnCursorViaTmux } from "./cursor-tmux.ts";
 import { dataDir, subagents as subagentsDb, tasks } from "./db.ts";
-import { fxRefusedStatusLine, fxSpeedNotOfferedLine, mapFxUpdate, spawnFxViaAcp, type FxLaunchOptions, type FxMode, type FxUpdateCtx } from "./fx-acp.ts";
+import { FX_STEER_DROPPED_STATUS, fxRefusedStatusLine, fxSpeedNotOfferedLine, mapFxUpdate, spawnFxViaAcp, type FxLaunchOptions, type FxMode, type FxUpdateCtx } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
 import { spawnAntigravityViaTmux } from "./antigravity-tmux.ts";
 import { answerFxPermission, registerFxPermission } from "./interactions.ts";
@@ -1447,6 +1447,43 @@ export const FAKE_FX_SPEED_UNOFFERED_PROMPT_MARKER = "__agetor_fake_fx_speed_uno
  */
 export const FAKE_FX_TOOL_META_PROMPT_MARKER = "__agetor_fake_fx_tool_meta__";
 /**
+ * Prompt-marker trigger for fx 0.0.14 mid-turn steering (plan §3.2 "D17/D18,
+ * steering", §5): `__agetor_fake_fx_steer__:absorbed` or `:dropped`. The fake
+ * turn holds for `AGETOR_FAKE_FX_STEER_HOLD_MS` (default
+ * {@link FAKE_FX_STEER_DEFAULT_HOLD_MS}) and the agent exposes `steer()`,
+ * which accepts every line while the turn is in flight. At settle, `absorbed`
+ * acknowledges each steered line with an assistant line; `dropped` hands each
+ * one to `onSteerDropped` and emits `FX_STEER_DROPPED_STATUS`, both before
+ * `done` resolves — the order the real driver guarantees; a kill of a
+ * `:dropped` turn reports its pending steers dropped too (no status line). Read from the
+ * current turn's prompt, else the task's stored prompt (a steered or
+ * re-queued follow-up never carries the marker itself). Without the marker
+ * the fake agent has no `steer` at all. Marker only (no env twin); e2e specs
+ * keep a literal copy.
+ */
+export const FAKE_FX_STEER_PROMPT_MARKER = "__agetor_fake_fx_steer__";
+const FAKE_FX_STEER_SUFFIX_RE = new RegExp(`${FAKE_FX_STEER_PROMPT_MARKER}:(absorbed|dropped)`);
+const FAKE_FX_STEER_DEFAULT_HOLD_MS = 4000;
+
+/** The steer scenario this spawn runs, from the current prompt or (for a
+ *  marker-less follow-up) the task's stored prompt; `null` when neither
+ *  carries a well-formed `:absorbed`/`:dropped` marker. */
+function resolveFakeFxSteerMode(taskId: string, prompt: string): "absorbed" | "dropped" | null {
+  const own = FAKE_FX_STEER_SUFFIX_RE.exec(prompt);
+  if (own) return own[1] as "absorbed" | "dropped";
+  const stored = tasks.get(taskId)?.prompt;
+  const fromStored = stored ? FAKE_FX_STEER_SUFFIX_RE.exec(stored) : null;
+  return fromStored ? (fromStored[1] as "absorbed" | "dropped") : null;
+}
+
+/** How long the steer scenario's turn holds: `AGETOR_FAKE_FX_STEER_HOLD_MS`
+ *  when it is a finite number ≥ 0, else 4000 ms. */
+function fakeFxSteerHoldMs(): number {
+  const raw = process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  const parsed = raw === undefined || raw === "" ? Number.NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : FAKE_FX_STEER_DEFAULT_HOLD_MS;
+}
+/**
  * Same prompt-marker trick as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER}, for the
  * "Claude Code Monitor" scenario (see
  * `docs/plans/claude-code-monitors-hold-running.md`): drives the real "held
@@ -1862,6 +1899,7 @@ function makeFakeAgent(
     effort?: string | null;
     model?: string;
     speed?: Speed | null;
+    onSteerDropped?: (text: string) => void;
   } = {},
 ): SpawnedAgent {  const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
@@ -1889,6 +1927,13 @@ function makeFakeAgent(
   // Set only by the FAKE_CLAUDE_REAL_WATCHER scenario: the real watcher this
   // turn attached, so `kill()` (Stop/delete) can detach it.
   let realWatcherHandle: SubagentWatcherHandle | undefined;
+  // Set only by the FAKE_FX_STEER scenario: the agent's `steer()`. Left
+  // undefined otherwise, so the returned agent carries no `steer` key at all.
+  let steer: ((line: string) => boolean) | undefined;
+  // Set alongside `steer`: what `kill()` does with steers the turn hadn't
+  // settled yet (the `:dropped` variant reports them dropped). Returns true
+  // when it took over resolving `done`.
+  let settleSteersOnKill: (() => boolean) | undefined;
   // Test hook: simulate a claude code API error mid-turn so orchestrator
   // tests can exercise the api-error → `blocked` column flip without having
   // to plumb a real synthetic-message JSONL through the driver. Mirrors what
@@ -2295,6 +2340,59 @@ function makeFakeAgent(
     // see FAKE_FX_TOOL_META_PROMPT_MARKER's doc comment.
     onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
     emitFakeFxToolMetaTurn(onChunk, after, resolveDone, fakeFxUpdateCtx(fakeOpts.runId ?? `fake-${taskId}`));
+  } else if (
+    fakeOpts.kind === "fx"
+    && fakeOpts.continueRecovery !== true
+    && resolveFakeFxSteerMode(taskId, prompt) !== null
+  ) {
+    // Test hook: fx 0.0.14 mid-turn steering — see FAKE_FX_STEER_PROMPT_MARKER's
+    // doc comment. The turn holds so a follow-up can arrive while it runs;
+    // `steer()` takes every line until the turn settles (or is killed). A
+    // kill (Stop, delete, archive, agent switch) of a `:dropped` turn hands
+    // every pending steer to `onSteerDropped` before `done` resolves, like the
+    // real driver's cancel and `dropFxSession` paths — a tick later, since
+    // the real drop arrives asynchronously after the kill too — but emits no
+    // status chunk, since a kill can land after a deleted run's row is gone.
+    const steerMode = resolveFakeFxSteerMode(taskId, prompt) as "absorbed" | "dropped";
+    const steered: string[] = [];
+    let steerSettled = false;
+    steer = (line) => {
+      if (steerSettled || killed) return false;
+      // Same per-message cap the real driver enforces (fx refuses > 64 KiB).
+      if (Buffer.byteLength(line, "utf8") > 64 * 1024) return false;
+      record.push(`steer:${line}`);
+      steered.push(line);
+      return true;
+    };
+    settleSteersOnKill = () => {
+      if (steerSettled) return false;
+      steerSettled = true;
+      if (steerMode !== "dropped" || steered.length === 0) return false;
+      setTimeout(() => {
+        for (const text of steered) fakeOpts.onSteerDropped?.(text);
+        resolveDone(0);
+      }, 0);
+      return true;
+    };
+    onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+    after(5, () => {
+      onChunk("thinking", "fake fx reasoning");
+      onChunk("assistant", "fake fx steer turn: working…");
+    });
+    after(Math.max(fakeFxSteerHoldMs(), 6), () => {
+      steerSettled = true;
+      for (const text of steered) {
+        if (steerMode === "absorbed") {
+          onChunk("assistant", `fake fx took your steer: ${text}`);
+        } else {
+          fakeOpts.onSteerDropped?.(text);
+          onChunk("status", FX_STEER_DROPPED_STATUS);
+        }
+      }
+      emitFakeFxUsageAndTitle(onChunk);
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
   } else if (
     fakeOpts.kind === "fx"
     && (
@@ -2747,9 +2845,10 @@ function makeFakeAgent(
       if (fxPermissionCardId !== undefined) {
         answerFxPermission(fxPermissionCardId, { cancelled: true });
       }
-      resolveDone(0);
+      if (settleSteersOnKill?.() !== true) resolveDone(0);
     },
     writeInput: (line) => { record.push(`write:${line}`); return true; },
+    ...(steer ? { steer } : {}),
     done,
   };
   fakeDrivers.set(taskId, inst);
@@ -2963,6 +3062,13 @@ export interface SpawnAgentArgs {
    * kind now has one.
    */
   onSessionId?: (sessionId: string) => void;
+  /**
+   * fx-only: called with the text of a mid-turn steer (`SpawnedAgent.steer`)
+   * fx didn't take before the turn ended, so the caller can send it as the
+   * next turn instead. Fires BEFORE the agent's `done` resolves. Forwarded
+   * to `FxLaunchOptions.onSteerDropped`; every other kind ignores it.
+   */
+  onSteerDropped?: (text: string) => void;
   opts?: AgentRunOptions;
 }
 
@@ -2975,7 +3081,7 @@ export interface SpawnAgentArgs {
  * explicitly turned it off (an absent field reads as on).
  */
 export function buildFxLaunchOptions(args: SpawnAgentArgs, built: AgentCommand): FxLaunchOptions {
-  const { taskId, runId, harness, prompt, cwd, onChunk, onSessionId, opts = {} } = args;
+  const { taskId, runId, harness, prompt, cwd, onChunk, onSessionId, onSteerDropped, opts = {} } = args;
   return {
     taskId,
     runId,
@@ -2992,6 +3098,7 @@ export function buildFxLaunchOptions(args: SpawnAgentArgs, built: AgentCommand):
     model: opts.model ?? undefined,
     onChunk,
     onSessionId,
+    onSteerDropped,
   };
 }
 
@@ -3170,6 +3277,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
         effort: opts.effort ?? null,
         model: opts.model ?? undefined,
         speed: opts.speed ?? null,
+        onSteerDropped: args.onSteerDropped,
       });
     }
     const built = buildCommand(harness, prompt, { ...opts, runId });

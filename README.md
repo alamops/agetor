@@ -42,7 +42,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 - **Kanban workflow.** Tasks move through *Backlog → Ready → Running → Blocked → Review → Done* as their runs start, stall, fail or finish. You can drag a card to override the flow at any time.
 - **A git worktree for every task.** Each task runs on its own branch (`agetor/<id>-<slug>`) under `~/.agetor/worktrees/`, so two agents can work on the same repo at once without colliding. The base commit is pinned when the task is created, so the task keeps the same starting point even after the source branch moves on.
 - **Six harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI, fx and Antigravity side by side. To use a second account for any of them, add a harness with its own isolated `$HOME`.
-- **Agents (reusable profiles).** Save a harness, model, effort, mode, instructions and skills as a named **Agent**, then launch tasks from it in one click.
+- **Agents (reusable profiles).** Save a harness, model, effort, mode, speed, instructions and skills as a named **Agent**, then launch tasks from it in one click.
 - **Pipelines.** Chain Agents into a reusable graph on a canvas, such as *Plan → Implement → Review*. Steps hand context to each other, branch, fan out and loop, all from a single board card. See [Pipelines](#pipelines).
 - **Model discovery.** Model and effort pickers start from a curated list. For Codex, Cursor, fx and Antigravity, they also include the models your account actually offers, as reported by the CLI. If a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
 
@@ -78,12 +78,30 @@ A **harness** is the agent CLI Agetor drives. Agetor launches the real binary on
 | **Codex** <sup>experimental</sup> | `codex` | `codex exec --json` for each turn inside `tmux`; the conversation resumes by thread id | GPT-6.1 Sol | `npm i -g @openai/codex` |
 | **Cursor** <sup>experimental</sup> | `cursor-agent` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Grok 4.7 | `curl https://cursor.com/install -fsS \| bash` |
 | **Gemini CLI** <sup>experimental</sup> | `gemini` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Gemini 3.1 Pro (preview) | `npm i -g @google/gemini-cli` |
-| **fx** (Vercel Labs) <sup>experimental</sup> | `fx` | [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio), through Vercel AI Gateway | GLM 5.3 Flash | `curl -fsSL https://fx.sh/setup.sh \| bash` |
+| **fx** (Vercel Labs) <sup>experimental</sup> | `fx` | [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio), through Vercel AI Gateway | DeepSeek V4 Flash | `curl -fsSL https://fx.sh/setup.sh \| bash` |
 | **Antigravity** <sup>experimental</sup> | `agy` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by conversation id | Gemini 3.8 Flash (High) | `brew install --cask antigravity-cli` |
 
 Claude Code and Antigravity are enabled out of the box. The other experimental harnesses are opt-in: turn them on in **Settings → Harnesses**. Settings and the onboarding checklist show whether each CLI is installed and logged in, and give an install hint if it isn't.
 
 Each harness offers the permission modes its CLI actually supports. They range from hands-off modes (*Auto*, *Full access*) to *Ask*, *Plan only* and *Read-only*.
+
+Where the model offers one, pickers also show a **Speed** control: *Off*, *Fast* or *Ultrafast*. Cursor's Fast comes from its fast model variants, and fx's Fast and Ultrafast come from the AI Gateway lanes your account's catalog lists for that model. Ultrafast costs more per token than Fast. On the CLI, use `--speed off|fast|ultrafast` (`--fast` and `--no-fast` still work).
+
+### Cursor notes
+
+- **Three modes.** *Auto (force)* runs hands-off. *Plan* runs `cursor-agent --mode plan`, which plans without editing; the New Task form's Code/Plan toggle picks it for Plan. *Read-only* runs `--mode ask` for questions and answers, with no edits.
+- **Approving a plan.** When you approve a Plan task's plan card, Agetor switches the task to *Auto (force)* so Cursor can implement it. A task launched from an Agent keeps Plan, because the Agent defines its mode; detach the Agent or change the mode to implement.
+- **Workspace trust.** Plan and Read-only runs pass `--trust`, so `cursor-agent` accepts the task's fresh worktree and applies its `.cursor` rules, hooks and MCP config, as Auto already does.
+
+### fx notes
+
+- **Versions.** Agetor is tested with fx 0.0.4 through 0.0.14. The fx 0.0.14 release binaries need **macOS 15 or later**.
+- **Default model.** New fx tasks default to **DeepSeek V4 Flash**. The AI Gateway catalog depends on your account, and pickers show the models yours offers. Tasks and Agents on three retired Gateway models (Qwen3 Coder Plus, Devstral 2 and Claude 3 Haiku) move to DeepSeek V4 Flash when you upgrade.
+- **If your own fx now starts in Ask mode.** Earlier Agetor versions sent fx a mode switch at the start of each Auto or Ask turn, and fx 0.0.14 saves that switch into your own fx profile (`~/.fx/settings.json`). Agetor no longer sends it. To reset your profile, run `/permissions` inside fx. Settings → Harnesses and `agetor harness ls` show a hint while your fx profile starts in Ask.
+- **Profile MCP servers.** fx 0.0.13 and later load the MCP servers from your own fx profile only when asked to, and Agetor asks by default. To run fx with only the project's servers, turn off **Load profile MCP servers** for that harness in Settings → Harnesses, or run `agetor harness edit <id> --no-profile-mcp`.
+- **Auto mode's reviewer.** In *Auto*, an fx reviewer model checks each tool call. If your account can't reach fx's default reviewer, fx holds every tool call. Switch the task to *Full access* or *Ask*, or set `FX_REVIEW_MODEL` to a model your account can use, in the environment of an fx harness you add in Settings → Harnesses.
+- **Messages during a turn.** With fx 0.0.13 or later, a message you send while fx is working joins the running turn. If fx doesn't take it before the turn ends, Agetor sends it as the next turn.
+- **Background processes.** Agetor runs one fx process per turn, and since fx 0.0.13 the processes fx's shell tool started stop when that process exits. A dev server an agent starts in one turn isn't running in the next one.
 
 ---
 
@@ -205,7 +223,7 @@ agetor answer <id>           # answer a task that's waiting on you
 agetor logs <id>             # stream the conversation (--no-follow · --notify · --rebuild)
 agetor commit <id>           # ask the agent to commit everything and push the branch
 agetor cancel <id>           # stop the active run
-agetor resume <id>           # resume an fx response paused by rate limiting
+agetor resume <id>           # resume a paused fx response
 agetor attach <id>           # attach your terminal to the live tmux session
 agetor shell <id>            # open a shell in the task's worktree
 agetor diff <id>             # the task's git diff

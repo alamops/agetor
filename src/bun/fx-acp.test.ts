@@ -13,6 +13,7 @@ import path from "node:path";
 // erased at compile time and never pulls db.ts in at runtime).
 import {
   dropFxSession,
+  FX_STEER_DROPPED_STATUS,
   fxSessionActive,
   fxSpeedNotOfferedLine,
   parseFxEffortOption,
@@ -193,7 +194,56 @@ const FAKE_ACP_SERVER_SRC = [
   '    fail(id, -32000, "timed out waiting for gateway upstream");',
   "    return;",
   "  }",
+  "  // fx >=0.0.13 advertises steering here; every steer-* scenario but",
+  "  // steer-unsupported (the 0.0.10 shape: no _meta at all) gets it.",
+  '  if (scenario.indexOf("steer-") === 0 && scenario !== "steer-unsupported") {',
+  "    ok(id, { agentCapabilities: { _meta: { fx: { steering: true } } } });",
+  "    return;",
+  "  }",
   "  ok(id, {});",
+  "}",
+  "",
+  "// Steering (fx 0.0.14 server.zig handleSteeringPrompt /",
+  "// publishSteeringOutcomes): a session/prompt carrying _meta.fx.steer while",
+  "// the main prompt runs joins the turn and its reply is DEFERRED until the",
+  "// turn ends, written right after the main prompt's response. In the steer-*",
+  "// scenarios the main prompt holds until a steer arrives (then ends 30ms",
+  "// later) or, if none does, for STEER_IDLE_MS; steer-cancel holds until",
+  "// session/cancel.",
+  "const STEER_IDLE_MS = 600;",
+  "let steerIds = [];",
+  "let steerTurnEnded = false;",
+  "function steerScenarioPrompt(id) {",
+  '  if (scenario === "steer-cancel") return;',
+  "  setTimeout(function () { finishSteerTurn(id); }, STEER_IDLE_MS);",
+  "}",
+  "function finishSteerTurn(mainId) {",
+  "  if (steerTurnEnded) return;",
+  "  steerTurnEnded = true;",
+  '  const cancelled = scenario === "steer-cancel";',
+  '  ok(mainId, { stopReason: cancelled ? "cancelled" : "end_turn" });',
+  "  steerIds.forEach(function (sid) {",
+  '    if (scenario === "steer-absorbed") {',
+  "      // Late (but inside the driver's grace) so the test proves the driver",
+  "      // waits for the deferred reply instead of reading it as unanswered.",
+  "      setTimeout(function () {",
+  '        ok(sid, { stopReason: "end_turn", _meta: { fx: { steering: "absorbed" } } });',
+  "      }, 100);",
+  '    } else if (scenario === "steer-dropped") {',
+  '      fail(sid, -32600, "Steering prompt was not delivered because the turn ended first; send it as a new prompt");',
+  '    } else if (scenario === "steer-cancel") {',
+  '      ok(sid, { stopReason: "cancelled", _meta: { fx: { steering: "dropped" } } });',
+  "    }",
+  "    // steer-silent: never answered.",
+  "  });",
+  "}",
+  "function handleSteer(id, params) {",
+  '  capture("steer", params);',
+  "  steerIds.push(id);",
+  '  if (scenario === "steer-die") { process.exit(1); return; }',
+  '  if (scenario === "steer-cancel") return;',
+  "  const mainId = promptId;",
+  "  setTimeout(function () { finishSteerTurn(mainId); }, 30);",
   "}",
   "",
   "function handleSessionNew(id, params) {",
@@ -330,8 +380,16 @@ const FAKE_ACP_SERVER_SRC = [
   "}",
   "",
   "function handlePrompt(id, params) {",
+  "  if (params && params._meta && params._meta.fx && params._meta.fx.steer === true) {",
+  "    handleSteer(id, params);",
+  "    return;",
+  "  }",
   "  promptId = id;",
   '  capture("session/prompt", params);',
+  '  if (scenario.indexOf("steer-") === 0) {',
+  "    steerScenarioPrompt(id);",
+  "    return;",
+  "  }",
   '  if (scenario === "happy" || scenario === "resume" || scenario === "resume-fallback" || scenario === "resume-replays-paused") {',
   "    streamHappyUpdates();",
   '    endTurn(id, 20, "end_turn");',
@@ -648,6 +706,10 @@ const FAKE_ACP_SERVER_SRC = [
   "",
   "function handleCancel(params) {",
   '  capture("session/cancel", params);',
+  '  if (scenario === "steer-cancel" && promptId !== null) {',
+  "    const respondId = promptId;",
+  "    setTimeout(function () { finishSteerTurn(respondId); }, 10);",
+  "  }",
   '  if (scenario === "kill-cancel" && promptId !== null && !cancelPromptResponded) {',
   "    cancelPromptResponded = true;",
   "    const respondId = promptId;",
@@ -696,6 +758,12 @@ const FAKE_ACP_SERVER_SRC = [
   "  const method = msg.method;",
   "  const params = msg.params;",
   '  if (method === "initialize") { handleInitialize(id, params); return; }',
+  "  // steer-handshake: a slow session/new, so a steer offered right after",
+  "  // spawn lands before the main prompt is in flight.",
+  '  if (method === "session/new" && scenario === "steer-handshake") {',
+  "    setTimeout(function () { handleSessionNew(id, params); }, 300);",
+  "    return;",
+  "  }",
   '  if (method === "session/new") { handleSessionNew(id, params); return; }',
   '  if (method === "session/resume") { handleSessionResume(id, params); return; }',
   '  if (method === "session/load") { handleSessionLoad(id, params); return; }',
@@ -796,11 +864,17 @@ function spawnFake(
     speed?: FxLaunchOptions["speed"];
     /** `FxLaunchOptions.profileMcpServers`. */
     profileMcpServers?: boolean;
+    /** `FxLaunchOptions.steerSettleGraceMs` (test-only override). */
+    steerSettleGraceMs?: number;
   } = {},
 ) {
   const chunks: Chunk[] = [];
   const onChunk: FxLaunchOptions["onChunk"] = (stream, data, lineUuid) => chunks.push({ stream, data, lineUuid });
   const sessionIds: string[] = [];
+  /** Texts handed back via `onSteerDropped`, plus a shared event log so a
+   *  test can assert they arrived before `done` resolved. */
+  const droppedSteers: string[] = [];
+  const order: string[] = [];
   const taskId = `task-${randomUUID()}`;
   const runId = `run-${randomUUID()}`;
   const captureFile = path.join(scratchDir, `capture-${runId}.jsonl`);
@@ -821,9 +895,15 @@ function spawnFake(
     profileMcpServers: opts.profileMcpServers,
     onChunk,
     onSessionId: (id) => sessionIds.push(id),
+    onSteerDropped: (text) => {
+      droppedSteers.push(text);
+      order.push("steer-dropped");
+    },
+    steerSettleGraceMs: opts.steerSettleGraceMs,
   });
+  void agent.done.then(() => order.push("done"));
 
-  return { agent, chunks, sessionIds, taskId, runId, captureFile };
+  return { agent, chunks, sessionIds, taskId, runId, captureFile, droppedSteers, order };
 }
 
 /** Poll the shared interactions registry until an `fx_permission` card shows
@@ -2928,5 +3008,130 @@ describe("applyFxSpeed — fast/ultrafast configOptions reconciliation (fx ≥0.
     const setIndex = entries.findIndex((e) => e.label === "session/set_config_option");
     expect(setIndex).toBeGreaterThan(loadIndex);
     expect(entries.findIndex((e) => e.label === "session/prompt")).toBeGreaterThan(setIndex);
+  }, 10_000);
+});
+
+describe("steering (fx ≥0.0.13 _meta.fx.steer)", () => {
+  const steerReqs = (captureFile: string) => readCaptured(captureFile).filter((e) => e.label === "steer");
+  const droppedLines = (chunks: Chunk[]) =>
+    chunks.filter((c) => c.stream === "status" && c.data === FX_STEER_DROPPED_STATUS);
+  const promptSent = (captureFile: string) => readCaptured(captureFile).some((e) => e.label === "session/prompt");
+
+  test("absorbed: the steer carries _meta.fx.steer, the driver waits for its late reply, nothing is handed back", async () => {
+    const { agent, chunks, captureFile, droppedSteers } = spawnFake("steer-absorbed");
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("also add tests")).toBe(true);
+    expect(await agent.done).toBe(0);
+
+    const reqs = steerReqs(captureFile);
+    expect(reqs).toHaveLength(1);
+    expect(reqs[0]!.msg).toEqual({
+      sessionId: "sess-steer-absorbed-1",
+      prompt: [{ type: "text", text: "also add tests" }],
+      _meta: { fx: { steer: true } },
+    });
+    // The absorbed reply lands 100ms after the main one — had the driver
+    // not waited for it, it would have read the steer as unanswered.
+    expect(droppedSteers).toEqual([]);
+    expect(droppedLines(chunks)).toHaveLength(0);
+    // A steer RPC never counts as a turn error.
+    expect(chunks.some((c) => c.stream === "status" && c.data.includes("session/prompt failed"))).toBe(false);
+  }, 10_000);
+
+  test("dropped via -32600: onSteerDropped(text) fires before done, plus one status line; the turn still succeeds", async () => {
+    const { agent, chunks, captureFile, droppedSteers, order } = spawnFake("steer-dropped");
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("late message")).toBe(true);
+    expect(await agent.done).toBe(0);
+    await waitFor(() => order.includes("done"));
+
+    expect(droppedSteers).toEqual(["late message"]);
+    expect(order).toEqual(["steer-dropped", "done"]);
+    expect(droppedLines(chunks)).toHaveLength(1);
+    expect(chunks.some((c) => c.data.includes("Steering prompt was not delivered"))).toBe(false);
+  }, 10_000);
+
+  test("two steers on one turn: each dropped one is handed back once, with one status line each", async () => {
+    const { agent, chunks, captureFile, droppedSteers } = spawnFake("steer-dropped");
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("first")).toBe(true);
+    expect(agent.steer!("second")).toBe(true);
+    expect(await agent.done).toBe(0);
+    expect(droppedSteers).toEqual(["first", "second"]);
+    expect(droppedLines(chunks)).toHaveLength(2);
+  }, 10_000);
+
+  test("cancelled turn: the steer comes back steering:dropped and is handed back before done", async () => {
+    const { agent, chunks, captureFile, droppedSteers, order } = spawnFake("steer-cancel");
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("stop and do this")).toBe(true);
+    await waitFor(() => steerReqs(captureFile).length === 1);
+    agent.kill();
+    expect(await agent.done).toBe(1);
+    await waitFor(() => order.includes("done"));
+
+    expect(droppedSteers).toEqual(["stop and do this"]);
+    expect(order).toEqual(["steer-dropped", "done"]);
+    expect(droppedLines(chunks)).toHaveLength(1);
+    // Once Stop is requested, a further steer is declined (the caller queues).
+    expect(agent.steer!("after stop")).toBe(false);
+  }, 10_000);
+
+  test("never answered within the grace: dropped once the grace elapses", async () => {
+    const { agent, chunks, captureFile, droppedSteers, order } = spawnFake("steer-silent", { steerSettleGraceMs: 250 });
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("anyone there?")).toBe(true);
+    const started = Date.now();
+    expect(await agent.done).toBe(0);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(200);
+    await waitFor(() => order.includes("done"));
+
+    expect(droppedSteers).toEqual(["anyone there?"]);
+    expect(order).toEqual(["steer-dropped", "done"]);
+    expect(droppedLines(chunks)).toHaveLength(1);
+  }, 10_000);
+
+  test("the process dies with a steer pending: handed back exactly once, before done", async () => {
+    const { agent, captureFile, droppedSteers, order } = spawnFake("steer-die");
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("lost in a crash?")).toBe(true);
+    expect(await agent.done).toBe(1);
+    await waitFor(() => order.includes("done"));
+    // Give any late outcome callback a chance to (wrongly) report again.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(droppedSteers).toEqual(["lost in a crash?"]);
+    expect(order).toEqual(["steer-dropped", "done"]);
+  }, 10_000);
+
+  test("unsupported (no capability advertised): steer() returns false and sends nothing", async () => {
+    const { agent, captureFile, droppedSteers } = spawnFake("steer-unsupported");
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("hello?")).toBe(false);
+    expect(await agent.done).toBe(0);
+    expect(steerReqs(captureFile)).toHaveLength(0);
+    expect(droppedSteers).toEqual([]);
+  }, 10_000);
+
+  test("over 64 KiB of UTF-8: steer() returns false; exactly 64 KiB is sent", async () => {
+    const { agent, captureFile } = spawnFake("steer-absorbed");
+    await waitFor(() => promptSent(captureFile));
+    // 3 bytes per char: 21846 chars = 65538 bytes > 65536.
+    expect(agent.steer!("€".repeat(21_846))).toBe(false);
+    expect(agent.steer!("")).toBe(false);
+    expect(steerReqs(captureFile)).toHaveLength(0);
+    expect(agent.steer!("a".repeat(64 * 1024))).toBe(true);
+    expect(await agent.done).toBe(0);
+    expect(steerReqs(captureFile)).toHaveLength(1);
+  }, 10_000);
+
+  test("during the handshake (main prompt not yet sent): steer() returns false", async () => {
+    const { agent, captureFile } = spawnFake("steer-handshake");
+    await waitFor(() => readCaptured(captureFile).some((e) => e.label === "initialize"));
+    expect(promptSent(captureFile)).toBe(false);
+    expect(agent.steer!("too early")).toBe(false);
+    expect(await agent.done).toBe(0);
+    // After settlement it is declined too.
+    expect(agent.steer!("too late")).toBe(false);
+    expect(steerReqs(captureFile)).toHaveLength(0);
   }, 10_000);
 });
