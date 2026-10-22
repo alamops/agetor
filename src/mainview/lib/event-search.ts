@@ -13,6 +13,7 @@
 import { isInternalStatusSentinel, type RunEventStream } from "../../shared/types.ts";
 import { isImageSourceMetaBreadcrumb } from "../../shared/attachments.ts";
 import { normalizeDeliveredUserText } from "../../shared/user-message.ts";
+import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
 
 /** Best-effort JSON.parse that never throws — malformed/partial JSON (e.g. a
  *  tool input truncated by an older agetor mapper) falls back to `null`
@@ -58,8 +59,13 @@ function textOf(value: unknown): string {
  * (legacy truncated payloads, corrupt persisted rows) falls back to the raw
  * string rather than throwing, same as every other best-effort JSON.parse
  * over transcript data in this codebase.
+ *
+ * A `tool_use`/`tool_result` the driver stamped `internal: true`
+ * (`isHiddenToolEvent`, shared/tool-visibility.ts — fx's own plumbing
+ * calls) is never rendered either, so it returns `null` too.
  */
 export function searchableEventText(stream: RunEventStream, data: string): string | null {
+  if (isHiddenToolEvent(stream, data)) return null;
   switch (stream) {
     case "interaction":
     case "interaction_resolved":
@@ -136,6 +142,11 @@ export const NO_MATCHES: readonly number[] = Object.freeze([]);
  * searchable text instead. An orphan `tool_result` (no owner, or the
  * "owner" only appears later / never arrives) stays independently matchable
  * at its own index, same as every other stream.
+ *
+ * A hidden (`internal: true`) tool event never matches (see
+ * `searchableEventText`), and neither does a `tool_result` answering a hidden
+ * `tool_use` even when the result itself carries no stamp — RunPanel drops
+ * that pair together, so the result never renders as an orphan card either.
  */
 export function findMatchingEventIds(
   events: ReadonlyArray<{ stream: RunEventStream; data: string }>,
@@ -151,13 +162,17 @@ export function findMatchingEventIds(
   // registered as an owner — an orphan id can't own anything).
   const ownText: (string | null)[] = new Array(events.length);
   const toolUseIndexById = new Map<string, number>();
+  const hiddenToolUseIds = new Set<string>();
   for (let i = 0; i < events.length; i++) {
     const e = events[i]!;
     ownText[i] = searchableEventText(e.stream, e.data);
     if (e.stream === "tool_use") {
       const parsed = tryParseJson(e.data) as { id?: unknown } | null;
       const id = parsed && typeof parsed === "object" ? parsed.id : undefined;
-      if (typeof id === "string" && id) toolUseIndexById.set(id, i);
+      if (typeof id === "string" && id) {
+        if (isHiddenToolEvent(e.stream, e.data)) hiddenToolUseIds.add(id);
+        else toolUseIndexById.set(id, i);
+      }
     }
   }
 
@@ -172,6 +187,11 @@ export function findMatchingEventIds(
     const parsed = tryParseJson(e.data) as { toolUseId?: unknown } | null;
     const toolUseId = parsed && typeof parsed === "object" ? parsed.toolUseId : undefined;
     if (typeof toolUseId !== "string" || !toolUseId) continue;
+    // The answer to a hidden call is dropped along with it — never an orphan.
+    if (hiddenToolUseIds.has(toolUseId)) {
+      owned[i] = true;
+      continue;
+    }
     const ownerIdx = toolUseIndexById.get(toolUseId);
     // Only an EARLIER tool_use counts as an owner — RunEventList only ever
     // folds a result into a call it has already rendered, never one that

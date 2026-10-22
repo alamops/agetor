@@ -344,6 +344,120 @@ test("parseFxModels: 0.0.10-shaped envelope (247 ids, private_models_hidden true
   }
 });
 
+/* ── fx 0.0.14: parseFxModels reading `models[]` ───────────────────────────
+ * 0.0.14 adds `models: [{id, name, efforts, fast, ultrafast}]` beside `ids`
+ * (same ids, same order). The entries below mirror real 0.0.14 rows from
+ * the 2026-10-22 unauthenticated capture (264 ids). */
+
+const FX_0014_MODELS = [
+  { id: "openai/gpt-6.1-sol", name: "GPT-6.1 Sol", efforts: ["low", "medium", "high", "xhigh", "max"], fast: true, ultrafast: true },
+  { id: "openai/gpt-5.2", name: "GPT 5.2", efforts: ["none", "minimal", "low", "medium", "high", "xhigh"], fast: true, ultrafast: false },
+  { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash", efforts: ["none", "low", "medium", "high"], fast: false, ultrafast: false },
+  { id: "vendor/no-reasoning", name: "No Reasoning", efforts: [], fast: false, ultrafast: false },
+];
+
+function fx0014Envelope(models: unknown[], ids?: unknown[]): string {
+  return JSON.stringify({
+    kind: "models",
+    count: models.length,
+    shown_count: models.length,
+    more_count: 0,
+    private_models_hidden: true,
+    ids: ids ?? models.map((m) => (m as { id: unknown }).id),
+    models,
+  });
+}
+
+test("parseFxModels (0.0.14): models[] maps to efforts + auto, the name as label, and true-only fast/ultrafast", () => {
+  expect(__testing.parseFxModels(fx0014Envelope(FX_0014_MODELS))).toEqual([
+    {
+      id: "openai/gpt-6.1-sol",
+      label: "GPT-6.1 Sol",
+      efforts: ["low", "medium", "high", "xhigh", "max", "auto"],
+      fast: true,
+      ultrafast: true,
+    },
+    {
+      id: "openai/gpt-5.2",
+      label: "GPT 5.2",
+      efforts: ["none", "minimal", "low", "medium", "high", "xhigh", "auto"],
+      fast: true,
+    },
+    { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash", efforts: ["none", "low", "medium", "high", "auto"] },
+    // No efforts reported → no `efforts` key at all (not even `["auto"]`),
+    // so the curated table stays the source for that id.
+    { id: "vendor/no-reasoning", label: "No Reasoning" },
+  ]);
+});
+
+test("parseFxModels (0.0.14): never attaches false/empty keys", () => {
+  const [entry] = __testing.parseFxModels(
+    fx0014Envelope([{ id: "a/b", name: "", efforts: [], fast: false, ultrafast: false }]),
+  );
+  expect(entry).toEqual({ id: "a/b" });
+  expect(Object.keys(entry!)).toEqual(["id"]);
+});
+
+test("parseFxModels (0.0.14): a reported `auto` isn't doubled, and repeated efforts are deduped", () => {
+  const [entry] = __testing.parseFxModels(
+    fx0014Envelope([{ id: "a/b", efforts: ["low", "auto", "low", "high"] }]),
+  );
+  expect(entry!.efforts).toEqual(["low", "auto", "high"]);
+});
+
+test("parseFxModels (0.0.14): malformed entries are skipped and malformed fields ignored", () => {
+  const parsed = __testing.parseFxModels(
+    fx0014Envelope(
+      [
+        null,
+        "openai/gpt-5.2",
+        42,
+        [],
+        { name: "No id" },
+        { id: "" },
+        { id: 7 },
+        // Field-level junk: a non-string name, non-string efforts entries,
+        // and truthy-but-not-`true` speed flags all read as absent.
+        { id: "x/one", name: 3, efforts: ["high", 1, null, "", "low"], fast: "true", ultrafast: 1 },
+        { id: "x/two", efforts: "high" },
+        { id: "x/one", name: "Duplicate", efforts: ["max"] },
+      ],
+      ["x/one", "x/two"],
+    ),
+  );
+  expect(parsed).toEqual([
+    { id: "x/one", efforts: ["high", "low", "auto"] },
+    { id: "x/two" },
+  ]);
+});
+
+test("parseFxModels (0.0.14): an id missing from models[] still comes through from ids, after the models[] rows", () => {
+  const parsed = __testing.parseFxModels(
+    fx0014Envelope([FX_0014_MODELS[2]], ["openai/gpt-5.2", "deepseek/deepseek-v4-flash"]),
+  );
+  expect(parsed).toEqual([
+    { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash", efforts: ["none", "low", "medium", "high", "auto"] },
+    { id: "openai/gpt-5.2" },
+  ]);
+});
+
+test("parseFxModels (0.0.14): models[] alone (no ids) is enough", () => {
+  const parsed = __testing.parseFxModels(JSON.stringify({ models: [FX_0014_MODELS[2]] }));
+  expect(parsed.map((m) => m.id)).toEqual(["deepseek/deepseek-v4-flash"]);
+});
+
+test("parseFxModels (≤0.0.13): an ids-only envelope behaves exactly as before — {id} rows, no efforts/labels/flags", () => {
+  const parsed = __testing.parseFxModels(
+    JSON.stringify({ kind: "models", count: 2, ids: ["openai/gpt-5.2", "deepseek/deepseek-v4-flash"] }),
+  );
+  expect(parsed).toEqual([{ id: "openai/gpt-5.2" }, { id: "deepseek/deepseek-v4-flash" }]);
+});
+
+test("parseFxModels (0.0.14): a non-array models field falls back to ids", () => {
+  const parsed = __testing.parseFxModels(JSON.stringify({ ids: ["a/b"], models: "nope" }));
+  expect(parsed).toEqual([{ id: "a/b" }]);
+});
+
 /* ── fx: discoverFx (exercised indirectly via refreshDiscoveredModels +
  * getDiscoveredModels, since discoverFx itself isn't exported — same
  * pattern the codex CLI-missing test above uses) ───────────────────────── */
@@ -699,6 +813,20 @@ test("getDiscoveredEfforts: returns the discovered efforts for a codex model aft
     await refreshKindModels("codex");
   });
   expect(getDiscoveredEfforts("codex", "gpt-6-astra")).toEqual(["ultra", "max", "high"]);
+});
+
+test("getDiscoveredEfforts: an fx 0.0.14 `models --json` catalog serves its efforts (with auto) after refresh", async () => {
+  __testing.resetForTests();
+  const body = fx0014Envelope(FX_0014_MODELS);
+  await withFxBin(
+    plantFakeFxModelsBin(`if [ "$1" = "models" ] && [ "$2" = "--json" ]; then echo '${body}'; exit 0; fi\nexit 1`),
+    async () => {
+      await refreshKindModels("fx");
+    },
+  );
+  expect(getDiscoveredEfforts("fx", "deepseek/deepseek-v4-flash")).toEqual(["none", "low", "medium", "high", "auto"]);
+  expect(getDiscoveredEfforts("fx", "vendor/no-reasoning")).toBeNull();
+  expect(getDiscoveredModels("fx").find((m) => m.id === "openai/gpt-6.1-sol")).toMatchObject({ fast: true, ultrafast: true });
 });
 
 test("getDiscoveredEfforts: null for an unknown model id", async () => {

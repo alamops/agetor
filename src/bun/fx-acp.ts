@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import type { Subprocess } from "bun";
-import type { FxRecoveryPayload, FxUsagePayload, RunEventStream } from "../shared/types.ts";
+import type { FxRecoveryPayload, FxUsagePayload, RunEventStream, Speed } from "../shared/types.ts";
 import {
   FX_PROVIDER_STATUS_PREFIX,
   FX_RECOVERY_STATUS_PREFIX,
@@ -83,22 +83,26 @@ import {
  * writes the sole reply instead.
  *
  * ── Protocol index (verified against fx v0.0.4, v0.0.6, v0.0.7, v0.0.8,
- *    v0.0.9 and v0.0.10 — 0.0.9/0.0.10 facts dated 2026-09-14: binary probes
- *    of the v0.0.9 (`build_revision e26e97ec4040`) and v0.0.10
- *    (`1210c2756ea8`) releases, a full source-tarball diff v0.0.8…v0.0.10,
- *    and the same ACP probe re-run against the installed 0.0.8 binary to
- *    separate real 0.0.9/0.0.10 deltas from pre-existing 0.0.8 behavior;
- *    0.0.8 facts dated 2026-09-08 per the same three-way method run then —
- *    + ACP's canonical schema.json) ──
+ *    v0.0.9, v0.0.10 and v0.0.14 — 0.0.14 facts dated 2026-10-22: release
+ *    notes, a source diff v0.0.10…v0.0.14 of `src/acp/*`, and ACP probes of
+ *    the 0.0.14 release binary in an isolated HOME (see the 0.0.11–0.0.14
+ *    facts block at the end of this header); 0.0.9/0.0.10 facts dated
+ *    2026-09-14: binary probes of the v0.0.9 (`build_revision e26e97ec4040`)
+ *    and v0.0.10 (`1210c2756ea8`) releases, a full source-tarball diff
+ *    v0.0.8…v0.0.10, and the same ACP probe re-run against the installed
+ *    0.0.8 binary to separate real 0.0.9/0.0.10 deltas from pre-existing
+ *    0.0.8 behavior; 0.0.8 facts dated 2026-09-08 per the same three-way
+ *    method run then — + ACP's canonical schema.json) ──
  *
- *   - `initialize`                  SPIKE-VERIFIED             handshake; unauth fails here (see describeHandshakeFailure)
- *   - `session/new`                 SPIKE-VERIFIED             → {sessionId, modes?, configOptions?}; mode nudge is best-effort (see runFxTurn); configOptions gains an `effort` entry (0.0.9+, model-dependent — see applyFxEffort)
- *   - `session/resume`/`load`       SCHEMA-DERIVED             resume falls back to load on -32601/-32602/-32600 alike (see runFxTurn); both replay a paused checkpoint's history structurally as of 0.0.9 — see the 0.0.9/0.0.10 facts block below
+ *   - `initialize`                  SPIKE-VERIFIED             handshake; unauth fails here (see describeHandshakeFailure); advertises `clientCapabilities.session.notices` (0.0.14 — see mapFxUpdate's `notice` case)
+ *   - `session/new`                 SPIKE-VERIFIED             → {sessionId, modes?, configOptions?}; carries `_meta.fx.profileMcpServers` when the harness toggle is on (0.0.13+); configOptions gains `effort` (0.0.9+) and `fast`/`ultrafast` (0.0.13/0.0.14) entries, all model-dependent — see applyFxEffort/applyFxSpeed
+ *   - `session/resume`/`load`       SCHEMA-DERIVED             resume falls back to load on -32601/-32602/-32600 alike (see runFxTurn); both replay a paused checkpoint's history structurally as of 0.0.9 — see the 0.0.9/0.0.10 facts block below; same `_meta` as session/new
  *   - `session/prompt`              SPIKE-VERIFIED shape       sole completion signal, no timeout (see runFxTurn); result gains a `usage` object as of 0.0.8
  *   - `session/update`              SPIKE-VERIFIED envelope    variant → chunk mapping (see mapFxUpdate); text deltas folded per message and (0.0.8+) per messageId (see FxTextCoalescer); dropped wholesale while `state.replaying` except `session_info_update` (0.0.9+ — see handleServerNotification)
  *   - `session/request_permission`  LIVE-VERIFIED 0.0.8 (ask mode)  card flow  (see respondPermissionRequest)
  *   - `session/cancel`              SCHEMA-DERIVED             notification, no reply expected (see cancelFxTurn); 0.0.8 spike confirms it now actually interrupts in-flight work
- *   - `session/set_config_option`   SPIKE-VERIFIED (0.0.10)    `{configId:"effort", value}` — sets the active session's reasoning effort (see applyFxEffort); silent no-op on 0.0.8
+ *   - `session/set_config_option`   SPIKE-VERIFIED (0.0.10)    `{configId:"effort"|"fast"|"ultrafast", value}` — sets the active session's reasoning effort / speed lane (see applyFxEffort, applyFxSpeed); silent no-op on 0.0.8
+ *   - `session/set_mode`            NEVER SENT                 on 0.0.14 it writes the user's `~/.fx/settings.json` profile — see the 0.0.11–0.0.14 facts block
  *   - death                         —                          unexpected exit before settlement (see the `exited` watcher)
  *
  * ── Facts verified against fx 0.0.5 through 0.0.10 (spike + release notes +
@@ -111,7 +115,7 @@ import {
  *
  *   - **No sandbox since 0.0.5** — fx retired its command sandbox; approved
  *     tool calls run as ordinary host subprocesses. Agetor's permission mode
- *     (`session/set_mode` + this driver's `session/request_permission`
+ *     (`FX_PERMISSION_MODE` + this driver's `session/request_permission`
  *     policy, see `respondPermissionRequest`) is the ONLY gate fx has left —
  *     there is no `sandbox_denied` outcome to parse and never was one here.
  *     Still true at 0.0.8, and again at 0.0.10 (0.0.7 even added an fx-side
@@ -174,17 +178,13 @@ import {
  *     dossier claimed the mode/model entries were TUI-only strings a
  *     `strings` scan happened to pick up; that was wrong — that probe never
  *     got past an unauthenticated `initialize` far enough to see a real
- *     `session/new` result. `session/new` also returns a `modes` block whose
- *     `currentModeId` (and the `mode` configOptions entry's `currentValue`)
- *     reads `ask` regardless of `FX_PERMISSION_MODE` — that's just a display
- *     default. The session's EFFECTIVE permission mode is copied from
- *     startup config (`sessions.zig` `.permission_mode =
- *     state.permission_mode`), and `session/set_mode` overwrites it via
- *     `applySessionMode` (`code`→`auto`, `ask`→`ask`) — which is why
- *     `acpModeIdFor` below maps `auto`→`code`, `ask`→`ask`, and deliberately
- *     sends NO `session/set_mode` at all for `yolo` (see its own doc
- *     comment): a `code` nudge would DOWNGRADE yolo to `auto` rather than
- *     leaving it alone. Never add one.
+ *     `session/new` result. `session/new` also returns a `modes` block; on
+ *     0.0.5–0.0.10 its `currentModeId` (and the `mode` configOptions
+ *     entry's `currentValue`) read `ask` regardless of `FX_PERMISSION_MODE`
+ *     — a display default only, the EFFECTIVE mode being copied from
+ *     startup config (`FX_PERMISSION_MODE`). Since 0.0.14 it reports the
+ *     real mode (see the 0.0.11–0.0.14 facts block, which also explains
+ *     why this driver no longer sends `session/set_mode` at all).
  *   - **Eight `session/update` kinds are emitted as of 0.0.8** — up from six
  *     at 0.0.4/0.0.6/0.0.7 (`agent_message_chunk`, `user_message_chunk`,
  *     `tool_call`, `tool_call_update`, `available_commands_update`,
@@ -206,7 +206,9 @@ import {
  *     the stopReason switch) and — keeping only the finite-number fields —
  *     emits it as the `turn` half of the existing `FX_USAGE_STATUS_PREFIX`
  *     sentinel (`FxUsagePayload`, `src/shared/types.ts`); the `used`/`size`/
- *     `cost?` half still comes from the `usage_update` notification above.
+ *     `cost?` half still comes from the `usage_update` notification above
+ *     (`cost` is gone from the wire on 0.0.14 — `writeUsageUpdate(used,
+ *     size)` — but stays optional here for older binaries).
  *     RunPanel shallow-merges every `fx-usage: ` sentinel it sees per run
  *     (see `src/mainview/lib/fx-usage.ts`), so the two halves can arrive as
  *     separate chunks in either order.
@@ -263,7 +265,10 @@ import {
  *     "active", kind, cause, action, attempt, attemptLimit, delaySeconds?,
  *     durable, message}}}}`; a terminal `state:"paused"` once fx exhausts
  *     its retry budget (`requiredAction:"continue_later"` is the only
- *     variant Resume acts on); `state:"recovered"` when a retry succeeds;
+ *     variant Resume acts on — and since 0.0.11 transient failures no
+ *     longer pause at all, see the 0.0.11–0.0.14 facts block); a terminal
+ *     `state:"failed"` (0.0.14) for any other terminal provider error;
+ *     `state:"recovered"` when a retry succeeds;
  *     and `modelResponseRecovery:null` when fx drops the checkpoint. This
  *     driver maps it via `src/shared/fx-recovery.ts`'s `parseFxRecoveryMeta`
  *     to the `FX_RECOVERY_STATUS_PREFIX` sentinel (`src/shared/types.ts`),
@@ -271,7 +276,8 @@ import {
  *     key never includes the `replayed` marker described below, so a live
  *     payload byte-identical to a replayed one still dedupes/resets the same
  *     way), plus a persisted, terminal-transition-only plain status line for
- *     `paused`/`recovered` (`fxRecoverySummaryLine`) — RunPanel derives a
+ *     `paused`/`failed`/`recovered` (whenever `fxRecoverySummaryLine`
+ *     returns one) — RunPanel derives a
  *     live progress notice and a Resume affordance from the sentinel stream,
  *     and the plain lines are what `agetor logs`/the TUI/the transcript show
  *     after the fact. **While replaying** (see the `session/resume` bullet
@@ -427,7 +433,8 @@ import {
  *     strings and the ACP-canonical names, the latter kept for forward
  *     compatibility.
  *   - **`FX_PERMISSION_MODE` still accepts exactly `yolo`/`auto`/`ask`
- *     (0.0.8, unchanged through 0.0.10)** — `--full-access`/`/permissions
+ *     (0.0.8, unchanged through 0.0.14 — where `yolo` reports as the
+ *     `full-access` mode id)** — `--full-access`/`/permissions
  *     full-access` is 0.0.8's UI/CLI wording for the same `.yolo` enum value
  *     (`config_runtime.zig parsePermissionMode`; fx's own README: "saved
  *     settings and JSON output retain `yolo`"); this driver keeps sending
@@ -450,8 +457,10 @@ import {
  *     fx's own approval flow / `allow_acp_mcp`). This driver still passes
  *     `mcpServers: []` on every `session/new`/`session/load` call below, but
  *     a task `workdir` that itself carries a `.mcp.json` can still introduce
- *     MCP tools into the session via that merge — their `tool_call`s render
- *     generically like any other tool call; no driver change needed.
+ *     MCP tools into the session via that merge. The user's PROFILE MCP
+ *     servers are a separate, opt-in source since 0.0.13 (see the
+ *     0.0.11–0.0.14 facts block). MCP `tool_call`s are labelled
+ *     `server · tool` from 0.0.14's `_meta.fx.toolCall.mcp`.
  *   - **`agent_message_chunk` is a token-level delta stream** — fx is the
  *     only agetor driver that streams sub-message deltas (claude's JSONL,
  *     codex's `item.completed`, gemini's `message` and cursor's `assistant`
@@ -477,7 +486,10 @@ import {
  *     prose. The override is a *global* `fx [--context-limit …] <command>`
  *     flag — `fx acp --context-limit …` is rejected by the subcommand's own
  *     usage check — so `AGETOR_FX_ARGS`, which lands after `acp`, cannot
- *     carry it today.
+ *     carry it today. On 0.0.14 a client that advertises
+ *     `session.notices` gets these as structured `notice` updates instead
+ *     (see the 0.0.11–0.0.14 facts block); the `[context]` heuristic stays
+ *     as the fallback for ≤0.0.13.
  *
  * ── Facts new in fx 0.0.9, retained unchanged in 0.0.10 (binary probes of
  *    v0.0.9 `build_revision e26e97ec4040` and v0.0.10 `1210c2756ea8`, a full
@@ -595,9 +607,73 @@ import {
  *     `moonshotai/kimi-k3`; 12-char base64url session ids; the `~/.fx/`
  *     on-disk layout; the `.mcp.json` project-config merge
  *     (`mcp_servers.zig` 0-diff); and the `session/set_mode` registry
- *     (`code`→`auto`, `ask`→`ask`, still no `yolo` mode id — the "never
- *     nudge yolo" rule in `acpModeIdFor` stands unchanged). Build revisions
- *     for the record: v0.0.9 = `e26e97ec4040`, v0.0.10 = `1210c2756ea8`.
+ *     (`code`→`auto`, `ask`→`ask`, no `yolo` mode id — superseded in 0.0.14,
+ *     see below). Build revisions for the record: v0.0.9 = `e26e97ec4040`,
+ *     v0.0.10 = `1210c2756ea8`.
+ *
+ * ── Facts new in fx 0.0.11–0.0.14 (release notes + a source diff
+ *    v0.0.10…v0.0.14 of `src/acp/*` + ACP probes of the 0.0.14 release
+ *    binary in an isolated HOME, dated 2026-10-22;
+ *    docs/plans/fx-0.0.14-and-cursor-updates-investigation.md §1a) ──
+ *
+ *   - **Modes are `auto`/`ask`/`full-access` (0.0.14); `code` is gone.**
+ *     `session/set_mode` now rejects an unknown id (`-32602 "Unknown
+ *     mode"`) and, for a known one, SAVES it as `permission_mode` in the
+ *     user's own `$HOME/.fx/settings.json` — the profile their interactive
+ *     fx reads. That is why this driver sends NO `session/set_mode` in any
+ *     mode (the old best-effort nudge flipped users' own fx profile to
+ *     `ask`): `FX_PERMISSION_MODE` is the only mode channel, and 0.0.14
+ *     makes the starting mode follow it (the env var overrides the saved
+ *     profile value). `modes.currentModeId` now reports that real mode
+ *     (`yolo` → `full-access`); it read `ask` unconditionally through 0.0.10.
+ *   - **Profile MCP servers are opt-in over ACP (0.0.13).** A session loads
+ *     the client's `mcpServers` plus approved project servers only; the
+ *     user's profile servers load when `session/new`/`resume`/`load` carry
+ *     `_meta.fx.profileMcpServers: true`. This driver sends it unless the
+ *     harness turned it off (`FxLaunchOptions.profileMcpServers === false`);
+ *     0.0.10 accepts the field and ignores it, so there is no version gate.
+ *   - **Transient failures no longer pause the turn (0.0.11).** fx keeps
+ *     retrying (slowing billable retries to one a minute after 15 minutes;
+ *     connection loss waits on liveness probes), so the `paused` → `refused`
+ *     → Resume path is now rare. 0.0.14 adds the terminal recovery state
+ *     `failed` (`kind: terminal_provider_error`, `action` not `paused` —
+ *     e.g. `request_limit_reached`, a stalled stream), not resumable; the
+ *     summary-line path in `mapFxUpdate` emits its line like any other
+ *     terminal transition. New vocabulary: causes `connectivity_lost`/
+ *     `compaction_prepared`, action `checking_liveness`, `requiredAction`
+ *     `surface_stall`. `continueRecovery` still exists.
+ *   - **Speed lanes ride `configOptions` (0.0.13/0.0.14)** — `{id:"fast"}`
+ *     on models with a fast lane and `{id:"ultrafast"}` on Gateway models
+ *     with that capability, each `type:"select"` with `currentValue`
+ *     `"true"`/`"false"`, set via `session/set_config_option`. Setting one
+ *     clears the other, and ultrafast wins if both were on. See
+ *     `applyFxSpeed`. The `effort` option equals the model's `models
+ *     --json` `efforts` plus `auto`.
+ *   - **Structured notices (0.0.14).** A client advertising
+ *     `clientCapabilities.session.notices` (any non-null value) receives
+ *     `{sessionUpdate:"notice", severity, title}` — shown to the user,
+ *     never part of the session history — instead of `[context] …` agent
+ *     text. Mapped to one status line (see `mapFxUpdate`).
+ *   - **Tool-call identity (0.0.14).** `tool_call` (never
+ *     `tool_call_update`) carries `_meta.fx.toolCall {internal, mcp?{server,
+ *     tool}}`. `internal: true` marks fx's own discovery steps
+ *     (`capability_search`, `mcp_select_tool`); the mapper stamps both the
+ *     `tool_use` and its later `tool_result` so renderers can hide them.
+ *   - **Steering exists (0.0.13):** `initialize.result.agentCapabilities
+ *     ._meta.fx.steering === true`; a `session/prompt` sent mid-turn with
+ *     `_meta.fx.steer: true` is folded into the running turn, and the
+ *     delivered text is replayed as `user_message_chunk` carrying
+ *     `_meta.fx.steering` (silent in the mapper — agetor writes its own user
+ *     event at send time).
+ *   - **`stopReason: "yielded"` (0.0.14)** is sent only when the host gave
+ *     the turn a deadline; agetor never does, so it stays in the switch's
+ *     generic default. `usage_update` drops `cost` (0.0.14).
+ *   - **Environment and lifecycle:** commands fx launches get `AI_AGENT=fx`
+ *     (0.0.14). Since 0.0.13 processes the shell tool started stop when fx
+ *     exits — with one `fx acp` child per turn, a dev server an agent starts
+ *     in one turn dies when that turn ends. 0.0.14 release binaries need
+ *     macOS 15 or later. `fx --help` still contains "coding agent", so the
+ *     `FX_HELP_MARKER` probe is unchanged.
  */
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -801,6 +877,12 @@ interface FxSessionState {
    *  it at one per run even if fx holds several tool calls in a row for the
    *  same reason. */
   reviewHeldWarned?: boolean;
+  /** `toolCallId`s whose `tool_call` carried `_meta.fx.toolCall.internal:
+   *  true` (fx ≥0.0.14) — the flag rides only the `tool_call`, never the
+   *  `tool_call_update`, so `mapFxUpdate` remembers the id here to stamp the
+   *  matching `tool_result` too. Shared by reference with every
+   *  `FxUpdateCtx` `dispatchSessionUpdate` builds. */
+  internalToolIds: Set<string>;
 
   resolved: boolean;
   killRequested: boolean;
@@ -1609,7 +1691,11 @@ export class FxTextCoalescer {
  *  `lastRecovery`/`reviewHeldWarned` — see those fields' doc comments on
  *  `FxSessionState` for what each one means; `dispatchSessionUpdate` reads
  *  all five off `state` into a fresh `ctx` before every `mapFxUpdate` call
- *  and writes all five back afterwards, exactly like `lastTitle`. */
+ *  and writes all five back afterwards, exactly like `lastTitle`.
+ *  `internalToolIds` is the set of `toolCallId`s whose `tool_call` was
+ *  marked internal (fx ≥0.0.14, see `FxSessionState.internalToolIds`); the
+ *  mapper creates it lazily when absent, and `dispatchSessionUpdate` passes
+ *  the session's own set so it persists across calls by reference. */
 export interface FxUpdateCtx {
   runId: string;
   nextSeq: () => number;
@@ -1619,6 +1705,34 @@ export interface FxUpdateCtx {
   replayedPaused?: boolean;
   lastRecovery?: FxRecoveryPayload;
   reviewHeldWarned?: boolean;
+  internalToolIds?: Set<string>;
+}
+
+/** fx ≥0.0.14's host-facing tool identity, read from a `tool_call`'s
+ *  `_meta.fx.toolCall` (`types.zig ToolCallMeta`: `{internal, mcp?{server,
+ *  tool}}`; never sent on `tool_call_update`). `internal` is true only for
+ *  a literal `true`; `mcp` only when both names are non-empty strings.
+ *  Absent/malformed meta (fx ≤0.0.13) reads as `{internal: false}`. */
+function fxToolCallMeta(update: Record<string, unknown>): {
+  internal: boolean;
+  mcp?: { server: string; tool: string };
+} {
+  const meta = update._meta;
+  if (!meta || typeof meta !== "object") return { internal: false };
+  const fx = (meta as Record<string, unknown>).fx;
+  if (!fx || typeof fx !== "object") return { internal: false };
+  const toolCall = (fx as Record<string, unknown>).toolCall;
+  if (!toolCall || typeof toolCall !== "object") return { internal: false };
+  const tc = toolCall as Record<string, unknown>;
+  const internal = tc.internal === true;
+  const mcpRaw = tc.mcp;
+  if (mcpRaw && typeof mcpRaw === "object") {
+    const { server, tool } = mcpRaw as Record<string, unknown>;
+    if (typeof server === "string" && server.length > 0 && typeof tool === "string" && tool.length > 0) {
+      return { internal, mcp: { server, tool } };
+    }
+  }
+  return { internal };
 }
 
 /**
@@ -1676,7 +1790,7 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
             // own), it just can never pair with a result (see the
             // tool_call_update branch).
             `seq${ctx.nextSeq()}`;
-      const name = toolCallName(update);
+      const fxName = toolCallName(update);
       // fx's human-facing `title`, carried alongside `name` only when it
       // actually adds information: fx ≥0.0.8 puts the real tool id in
       // `name` (see toolCallName), so the title is a separate fact worth
@@ -1685,11 +1799,42 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
       // again would just render it twice.
       const hasRealName = typeof update.name === "string" && update.name.length > 0;
       const rawTitle = typeof update.title === "string" && update.title.length > 0 ? update.title : undefined;
-      const title = hasRealName && rawTitle && rawTitle !== name ? rawTitle : undefined;
+      // fx ≥0.0.14 identity meta (see fxToolCallMeta). An MCP call is
+      // labelled `server · tool` instead of fx's own flattened id
+      // (`mcp_<server>_<tool>`). fx's human title still wins the `title`
+      // slot — it is the more readable of the two and fx always sends one —
+      // so fx's own name only moves into `title` when there is no title to
+      // keep. `mcp` rides in the payload so renderers can tell the call is
+      // an MCP one without parsing the label.
+      const meta = fxToolCallMeta(update);
+      const name = meta.mcp ? `${meta.mcp.server} · ${meta.mcp.tool}` : fxName;
+      let title: string | undefined;
+      if (meta.mcp) {
+        const candidate = rawTitle ?? (hasRealName ? fxName : undefined);
+        title = candidate && candidate !== name ? candidate : undefined;
+      } else {
+        title = hasRealName && rawTitle && rawTitle !== name ? rawTitle : undefined;
+      }
+      // `internal` is stamped only when true, so a pre-0.0.14 (or
+      // non-internal) payload stays byte-identical to before. The id is
+      // remembered so the matching `tool_call_update` — which never carries
+      // the meta itself — can be stamped too.
+      if (meta.internal) {
+        ctx.internalToolIds ??= new Set();
+        ctx.internalToolIds.add(id);
+      }
       return [
         {
           stream: "tool_use",
-          data: JSON.stringify({ id, name, input: toolCallInput(update), serverSide: false, title }),
+          data: JSON.stringify({
+            id,
+            name,
+            input: toolCallInput(update),
+            serverSide: false,
+            title,
+            ...(meta.internal ? { internal: true } : {}),
+            ...(meta.mcp ? { mcp: meta.mcp } : {}),
+          }),
           lineUuid: `fx:tool:${id}:use`,
         },
       ];
@@ -1705,10 +1850,16 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
       if (typeof update.toolCallId !== "string") return [];
       const id = update.toolCallId;
       const resultContent = toolResultContent(update);
+      const internal = ctx.internalToolIds?.has(id) === true;
       const chunks: FxChunk[] = [
         {
           stream: "tool_result",
-          data: JSON.stringify({ toolUseId: id, content: resultContent, isError: status === "failed" }),
+          data: JSON.stringify({
+            toolUseId: id,
+            content: resultContent,
+            isError: status === "failed",
+            ...(internal ? { internal: true } : {}),
+          }),
           lineUuid: `fx:tool:${id}:result`,
         },
       ];
@@ -1727,7 +1878,10 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
       // rather than watch every tool call silently fail. Any other error
       // shape/reason (a real permission denial, an unrelated tool failure)
       // emits nothing here — this is guidance for one specific, otherwise
-      // silent failure mode, not a generic error reporter.
+      // silent failure mode, not a generic error reporter. fx ≥0.0.11 also
+      // lets the reviewer model be chosen (`FX_REVIEW_MODEL`, or the
+      // `review_model` setting), which the user can set through the
+      // harness's env map — hence the second remedy in the line.
       if (!ctx.reviewHeldWarned) {
         const reviewError = fxToolReviewError(resultContent);
         if (
@@ -1739,7 +1893,7 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
           chunks.push({
             stream: "status",
             data:
-              "⚠ fx held this tool call — its safety reviewer (auto mode) is unavailable on this account, so tools can't run. Switch this task's mode to Full access (or Ask) to let tools run.",
+              "⚠ fx held this tool call — its safety reviewer (auto mode) is unavailable on this account, so tools can't run. Switch this task's mode to Full access (or Ask) to let tools run, or set FX_REVIEW_MODEL in this harness's environment (Settings → Harnesses) to a reviewer model your account can reach.",
             lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`,
           });
         }
@@ -1839,6 +1993,8 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
       // Missing/non-numeric used|size is malformed — ignore silently rather
       // than emit a chip with holes in it.
       if (typeof used !== "number" || typeof size !== "number") return [];
+      // `cost` is gone from the wire on fx 0.0.14 (`writeUsageUpdate(used,
+      // size)`); still read when present for 0.0.8–0.0.13 binaries.
       const rawCost = (update as { cost?: unknown }).cost;
       let cost: { amount: number; currency: string } | undefined;
       if (rawCost != null && typeof rawCost === "object") {
@@ -1916,9 +2072,12 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
             // A live (non-replayed) update — record it for the `refused`/
             // `refusal` stopReason branch to enrich its status line when
             // THIS run is the one that paused, and emit the persisted,
-            // terminal-transition-only summary line (paused/recovered only
+            // terminal-transition-only summary line (paused/failed/recovered
             // — `fxRecoverySummaryLine` returns `null` for `active`/
-            // `cleared`, nothing final to say yet).
+            // `cleared`, nothing final to say yet). fx 0.0.14's terminal
+            // `failed` state rides this same path: it is not resumable, so
+            // the line is all the transcript gets, and the dedupe above keeps
+            // it to exactly one per transition.
             ctx.lastRecovery = recovery;
             const summary = fxRecoverySummaryLine(recovery);
             if (summary !== null) {
@@ -1960,8 +2119,31 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
       return chunks;
     }
 
+    case "notice": {
+      // fx ≥0.0.14 ACP v1 Session Notice (`types.zig writeNotice`:
+      // `{severity, title}`), sent only because `initialize` advertises
+      // `clientCapabilities.session.notices`. Shown to the user, never part
+      // of the session history — one status line, flagged `⚠` for
+      // warning/error severities. Older fx sends the same facts as
+      // `[context] …` agent text instead (see `agent_message_chunk` above).
+      const rawTitle = (update as { title?: unknown }).title;
+      if (typeof rawTitle !== "string") return [];
+      const title = rawTitle.trim();
+      if (!title) return [];
+      const severity = (update as { severity?: unknown }).severity;
+      const prefix = severity === "warning" || severity === "error" ? "⚠ " : "";
+      return [{ stream: "status", data: `${prefix}fx: ${title}`, lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}` }];
+    }
+
+    case "user_message_chunk":
+      // Silent on purpose: fx echoes user text here when it replays history
+      // and (0.0.13+) when it delivers a steered message (`_meta.fx
+      // .steering`). Agetor already wrote its own `user` event at send time,
+      // so forwarding these would duplicate every user bubble.
+      return [];
+
     default:
-      // current_mode_update, available_commands_update, user_message_chunk,
+      // current_mode_update, available_commands_update,
       // config_option_update, and any future variant — silent forward-compat
       // (v1 scope).
       return [];
@@ -1985,6 +2167,7 @@ function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unk
     replayedPaused: state.replayedPaused,
     lastRecovery: state.lastRecovery,
     reviewHeldWarned: state.reviewHeldWarned,
+    internalToolIds: state.internalToolIds,
   };
   for (const c of mapFxUpdate(update, ctx)) {
     emit(state, c.stream, c.data, c.lineUuid, c.messageId);
@@ -1995,6 +2178,7 @@ function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unk
   state.replayedPaused = ctx.replayedPaused;
   state.lastRecovery = ctx.lastRecovery;
   state.reviewHeldWarned = ctx.reviewHeldWarned;
+  if (ctx.internalToolIds) state.internalToolIds = ctx.internalToolIds;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -2177,23 +2361,6 @@ async function cancelFxTurn(state: FxSessionState): Promise<void> {
  * The ACP conversation itself: handshake → (new | resume | load) → prompt.
  * ────────────────────────────────────────────────────────────────────────── */
 
-/** Maps agetor's permission mode to the mode id for the best-effort
- *  post-`session/new` `session/set_mode` nudge (see `runFxTurn`): `auto` →
- *  `code`, `ask` → `ask`. Returns `null` for `yolo` ON PURPOSE and this must
- *  never change: fx's `session/set_mode` OVERWRITES the session's effective
- *  permission mode (`applySessionMode`: `code`→`auto`, `ask`→`ask`) — there
- *  is no mode id that means yolo, so a `code` nudge sent while in yolo would
- *  DOWNGRADE it to `auto` rather than leaving it alone. Sending nothing at
- *  all is what lets yolo's startup-config permission mode
- *  (`FX_PERMISSION_MODE=yolo` → `sessions.zig .permission_mode`) survive
- *  untouched. See the file header's configOptions fact for the full
- *  source-level rationale — never add a yolo branch here. */
-function acpModeIdFor(mode: FxMode): string | null {
-  if (mode === "auto") return "code";
-  if (mode === "ask") return "ask";
-  return null; // yolo — no session/set_mode call
-}
-
 /** Pull the active provider id out of a `session/new`/`session/resume`/
  *  `session/load` result's `configOptions` array (0.0.5+, additive — see
  *  the file header's "Facts verified against fx 0.0.5 through 0.0.10"
@@ -2366,6 +2533,122 @@ async function applyFxEffort(
   }
 }
 
+/** The "speed tier isn't offered" breadcrumb `applyFxSpeed` emits when the
+ *  task asks for a lane the active model's `configOptions` don't carry.
+ *  Exported so the fake-driver seam in `agents.ts` and the tests produce the
+ *  exact same text. */
+export function fxSpeedNotOfferedLine(tier: "fast" | "ultrafast", model: string): string {
+  return `fx: ${fxSpeedTierLabel(tier)} isn't offered for ${model} — running without it`;
+}
+
+function fxSpeedTierLabel(tier: "fast" | "ultrafast"): string {
+  return tier === "fast" ? "Fast" : "Ultrafast";
+}
+
+/** Pull the `{id: tier}` speed entry (fx ≥0.0.13 `fast`, ≥0.0.14
+ *  `ultrafast` — `sessions.zig writeFastConfigOption`/
+ *  `writeUltrafastConfigOption`, `type:"select"`, `currentValue` `"true"`/
+ *  `"false"`) out of a `configOptions` array. `null` when the array or the
+ *  entry is absent — fx only lists an entry for a model that has that
+ *  lane. A present entry with a non-string `currentValue` reads as
+ *  `current: null` (unknown), which `applyFxSpeed` always re-sets. */
+export function parseFxSpeedOption(
+  configOptions: unknown,
+  tier: "fast" | "ultrafast",
+): { current: string | null } | null {
+  if (!Array.isArray(configOptions)) return null;
+  const entry = configOptions.find(
+    (o) => o && typeof o === "object" && (o as { id?: unknown }).id === tier,
+  ) as { currentValue?: unknown } | undefined;
+  if (!entry) return null;
+  return { current: typeof entry.currentValue === "string" ? entry.currentValue : null };
+}
+
+/** Best-effort application of the task's stored speed tier to the active fx
+ *  session — the same posture as `applyFxEffort`: never throws, never fails
+ *  the turn, every failure degrades to a visible status breadcrumb. Called
+ *  right after `applyFxEffort` at each of the three handshake points
+ *  (`session/new`, a successful `session/resume`, the `session/load`
+ *  fallback — only one of which runs per turn, so each breadcrumb is
+ *  emitted at most once per turn).
+ *
+ *  `opts.speed` `null`/`undefined` → silent, no RPC (the caller has no
+ *  speed to reconcile). Otherwise the two lanes are driven to
+ *  `ultrafast := speed === "ultrafast"` FIRST, then `fast := speed ===
+ *  "fast"`: fx makes the lanes exclusive (setting one clears the other,
+ *  `server.zig applyActiveSessionFast`/`…Ultrafast`), and every
+ *  `set_config_option` reply carries the full refreshed `configOptions`, so
+ *  after each set the current values are re-read from that reply — e.g.
+ *  turning ultrafast on already turned fast off, and no second RPC follows.
+ *
+ *  Per lane:
+ *    - entry absent, lane wanted   → `fxSpeedNotOfferedLine` breadcrumb.
+ *    - entry absent, lane unwanted → silent (nothing to turn off).
+ *    - entry present, `currentValue` already the wanted `"true"`/`"false"`
+ *                                  → silent, no RPC.
+ *    - entry present, differs      → `session/set_config_option {configId,
+ *                                    value: "true"|"false"}`; success is
+ *                                    silent; an error turning a lane ON
+ *                                    reads `fx: couldn't set <Tier> — <fx
+ *                                    message> — running without it`, and an
+ *                                    error turning one OFF (the session
+ *                                    keeps the lane, so "running without
+ *                                    it" would be false) reads `fx: couldn't
+ *                                    turn off <Tier> — <fx message>`. */
+async function applyFxSpeed(
+  state: FxSessionState,
+  sessionResult: unknown,
+  opts: { speed?: Speed | null; model?: string },
+): Promise<void> {
+  const speed = opts.speed ?? null;
+  if (speed === null) return;
+  const modelLabel = opts.model ?? "the active model";
+  let configOptions: unknown = (sessionResult as { configOptions?: unknown } | undefined)?.configOptions;
+  for (const tier of ["ultrafast", "fast"] as const) {
+    const wanted = speed === tier;
+    const entry = parseFxSpeedOption(configOptions, tier);
+    if (entry === null) {
+      if (wanted) {
+        emit(state, "status", fxSpeedNotOfferedLine(tier, modelLabel), `fx:${state.runId}:${state.seq++}`);
+      }
+      continue;
+    }
+    const value = wanted ? "true" : "false";
+    if (entry.current === value) continue;
+    try {
+      const reply = await withTimeout(
+        sendRpc(state, "session/set_config_option", { sessionId: state.sessionId, configId: tier, value }),
+        RPC_HANDSHAKE_TIMEOUT_MS,
+        "session/set_config_option",
+      );
+      if (state.resolved) return;
+      // Success is silent. Prefer fx's own refreshed view (it reflects the
+      // lanes' mutual exclusion); fall back to patching the one entry we
+      // just set when a reply carries no `configOptions`.
+      const refreshed = (reply as { configOptions?: unknown } | undefined)?.configOptions;
+      configOptions = Array.isArray(refreshed)
+        ? refreshed
+        : (configOptions as unknown[]).map((o) =>
+            o && typeof o === "object" && (o as { id?: unknown }).id === tier
+              ? { ...(o as Record<string, unknown>), currentValue: value }
+              : o,
+          );
+    } catch (err) {
+      if (state.resolved) return;
+      const message = err instanceof RpcError ? (err.rawMessage ?? err.message) : String(err);
+      const label = fxSpeedTierLabel(tier);
+      emit(
+        state,
+        "status",
+        wanted
+          ? `fx: couldn't set ${label} — ${message} — running without it`
+          : `fx: couldn't turn off ${label} — ${message}`,
+        `fx:${state.runId}:${state.seq++}`,
+      );
+    }
+  }
+}
+
 /** Reads `session/prompt`'s (fx ≥0.0.8) `usage` object and, if at least one
  *  of `FX_TURN_KEYS`' known keys is a finite number, emits it as the `turn`
  *  half of the existing `FX_USAGE_STATUS_PREFIX` sentinel (see the file
@@ -2403,9 +2686,14 @@ async function runFxTurn(
      *  `session/new`/a successful `session/resume`/`session/load` — see
      *  `FxLaunchOptions.effort`. */
     effort?: string | null;
-    /** The launch model id, used only for `applyFxEffort`'s breadcrumb text
-     *  — see `FxLaunchOptions.model`. */
+    /** The launch model id, used only for `applyFxEffort`'s and
+     *  `applyFxSpeed`'s breadcrumb text — see `FxLaunchOptions.model`. */
     model?: string;
+    /** Agetor's stored speed tier, applied via `applyFxSpeed` — see
+     *  `FxLaunchOptions.speed`. */
+    speed?: Speed | null;
+    /** See `FxLaunchOptions.profileMcpServers`. */
+    profileMcpServers?: boolean;
   },
 ): Promise<void> {
   // A continue-recovery turn only makes sense against a prior session — fx
@@ -2417,6 +2705,13 @@ async function runFxTurn(
     failTurn(state, "fx acp: continueRecovery requires a prior session id");
     return;
   }
+
+  // fx ≥0.0.13 loads the user's profile MCP servers into an ACP session
+  // only when session/new|resume|load carry this flag (see the file
+  // header's 0.0.11–0.0.14 facts). On unless the harness turned it off;
+  // when off the `_meta` key is omitted entirely rather than sent `false`.
+  const profileMcpMeta: { _meta?: { fx: { profileMcpServers: true } } } =
+    opts.profileMcpServers === false ? {} : { _meta: { fx: { profileMcpServers: true } } };
 
   // Emits the `FX_PROVIDER_STATUS_PREFIX` status chunk at most once per
   // turn, from whichever of session/new|resume|load's results carries a
@@ -2448,7 +2743,15 @@ async function runFxTurn(
         // is accepted leniently rather than rejected. Neither fact changes
         // what this driver sends.
         protocolVersion: 1,
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+        // `session.notices` (any non-null value — `server.zig` checks
+        // `notices != .null`) opts into fx ≥0.0.14's structured `notice`
+        // updates instead of `[context] …` agent text; older fx ignores the
+        // unknown key.
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+          session: { notices: {} },
+        },
         clientInfo: { name: "agetor", version: "0" },
       }),
       RPC_HANDSHAKE_TIMEOUT_MS,
@@ -2488,7 +2791,7 @@ async function runFxTurn(
     let resumeResult: unknown;
     try {
       resumeResult = await withTimeout(
-        sendRpc(state, "session/resume", { sessionId: opts.resumeSessionId }),
+        sendRpc(state, "session/resume", { sessionId: opts.resumeSessionId, ...profileMcpMeta }),
         RPC_HANDSHAKE_TIMEOUT_MS,
         "session/resume",
       );
@@ -2530,10 +2833,13 @@ async function runFxTurn(
     }
     if (state.resolved) return;
     if (resumed) {
-      // Apply the task's stored effort before session/prompt — resumeResult
-      // carries the same configOptions shape session/new does (see
-      // applyFxEffort). Best-effort: never throws, never fails the turn.
+      // Apply the task's stored effort and speed before session/prompt —
+      // resumeResult carries the same configOptions shape session/new does
+      // (see applyFxEffort/applyFxSpeed). Best-effort: never throw, never
+      // fail the turn.
       await applyFxEffort(state, resumeResult, opts);
+      if (state.resolved) return;
+      await applyFxSpeed(state, resumeResult, opts);
       if (state.resolved) return;
     }
     if (!resumed) {
@@ -2546,15 +2852,23 @@ async function runFxTurn(
       state.suppressUpdates = true;
       try {
         const loadResult = await withTimeout(
-          sendRpc(state, "session/load", { sessionId: opts.resumeSessionId, cwd: opts.cwd, mcpServers: [] }),
+          sendRpc(state, "session/load", {
+            sessionId: opts.resumeSessionId,
+            cwd: opts.cwd,
+            mcpServers: [],
+            ...profileMcpMeta,
+          }),
           RPC_HANDSHAKE_TIMEOUT_MS,
           "session/load",
         );
         maybeEmitProvider(loadResult);
         state.suppressUpdates = false;
         // loadResult carries the same configOptions shape session/new/resume
-        // do — apply the task's stored effort here too, before session/prompt.
+        // do — apply the task's stored effort and speed here too, before
+        // session/prompt.
         await applyFxEffort(state, loadResult, opts);
+        if (state.resolved) return;
+        await applyFxSpeed(state, loadResult, opts);
         if (state.resolved) return;
       } catch (err) {
         state.suppressUpdates = false;
@@ -2575,12 +2889,10 @@ async function runFxTurn(
     }
     if (state.resolved) return;
   } else {
-    let sessionResult:
-      | { sessionId?: string; modes?: { availableModes?: Array<{ id?: string }> }; configOptions?: unknown }
-      | undefined;
+    let sessionResult: { sessionId?: string; configOptions?: unknown } | undefined;
     try {
       sessionResult = (await withTimeout(
-        sendRpc(state, "session/new", { cwd: opts.cwd, mcpServers: [] }),
+        sendRpc(state, "session/new", { cwd: opts.cwd, mcpServers: [], ...profileMcpMeta }),
         RPC_HANDSHAKE_TIMEOUT_MS,
         "session/new",
       )) as typeof sessionResult;
@@ -2599,18 +2911,15 @@ async function runFxTurn(
     state.onSessionId?.(sessionId);
     maybeEmitProvider(sessionResult);
 
-    // Apply the task's stored effort — best-effort, never throws, never
-    // fails the turn (see applyFxEffort). Order relative to the mode nudge
-    // below is irrelevant — they touch independent configOptions entries.
+    // Apply the task's stored effort, then its speed lane — best-effort,
+    // never throw, never fail the turn (see applyFxEffort/applyFxSpeed).
+    // No `session/set_mode` follows: on fx 0.0.14 it would write the user's
+    // own `~/.fx/settings.json` profile, so `FX_PERMISSION_MODE` is the only
+    // mode channel (see the file header's 0.0.11–0.0.14 facts).
     await applyFxEffort(state, sessionResult, opts);
     if (state.resolved) return;
-
-    // Best-effort mode nudge — never blocks or fails the turn.
-    const desiredModeId = acpModeIdFor(state.mode);
-    const availableModes = sessionResult?.modes?.availableModes ?? [];
-    if (desiredModeId && availableModes.some((m) => m?.id === desiredModeId)) {
-      sendRpc(state, "session/set_mode", { sessionId, modeId: desiredModeId }).catch(() => { /* best-effort */ });
-    }
+    await applyFxSpeed(state, sessionResult, opts);
+    if (state.resolved) return;
   }
 
   // 3. session/prompt — the ONLY turn-completion signal; no timeout. A
@@ -2731,6 +3040,9 @@ async function runFxTurn(
       return;
     }
     default:
+      // Includes fx 0.0.14's `yielded`, which fx sends only when the host
+      // gave the turn a deadline — agetor never sets one, so it can't occur
+      // here and needs no case of its own.
       emit(state, "status", `fx turn ended with unexpected stopReason: ${stopReason}`);
       settleFx(state, 1);
   }
@@ -2800,8 +3112,11 @@ export interface FxLaunchOptions {
   cwd: string;
   /** The prompt text, delivered via `session/prompt`'s `prompt` array. */
   promptText: string;
-  /** Agetor's permission mode — drives both the `session/set_mode` nudge and
-   *  this driver's `session/request_permission` auto-answer policy. */
+  /** Agetor's permission mode — drives this driver's
+   *  `session/request_permission` auto-answer policy. fx itself learns the
+   *  mode only from `FX_PERMISSION_MODE` in `env`: this driver never sends
+   *  `session/set_mode`, which on fx 0.0.14 saves the mode into the user's
+   *  own `~/.fx/settings.json` profile (see the file header). */
   mode: FxMode;
   /** Set on a follow-up turn to resume (or, on failure, load) a prior ACP
    *  session instead of opening a new one via `session/new`. */
@@ -2830,6 +3145,16 @@ export interface FxLaunchOptions {
    *  doesn't pass it explicitly still gets a real model name in any
    *  breadcrumb rather than the generic "the active model" fallback. */
   model?: string;
+  /** Agetor's stored speed tier, reconciled against the session's fx
+   *  ≥0.0.13 `fast`/`ultrafast` configOptions — see `applyFxSpeed`.
+   *  `null`/`undefined` skips speed reconciliation entirely. */
+  speed?: Speed | null;
+  /** Whether to ask fx (≥0.0.13) to load the user's profile MCP servers
+   *  into the session via `_meta.fx.profileMcpServers: true` on
+   *  `session/new`/`resume`/`load`. `undefined` means on (agents.ts passes
+   *  the harness toggle, `harness.profileMcpServers !== false`); `false`
+   *  omits the `_meta` key entirely. */
+  profileMcpServers?: boolean;
   onChunk: ChunkHandler;
   /** Fires once with fx's `sessionId`, immediately after `session/new`
    *  resolves on the first turn (persisted as `runs.fx_session_id`). Not
@@ -2904,6 +3229,7 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
     seq: 0,
     seenLineUuids: new Set(),
     coalescer: new FxTextCoalescer(),
+    internalToolIds: new Set(),
     resolved: false,
     killRequested: false,
     cancelRequested: false,
@@ -2938,6 +3264,8 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
     continueRecovery: opts.continueRecovery,
     effort: opts.effort,
     model,
+    speed: opts.speed,
+    profileMcpServers: opts.profileMcpServers,
   }).catch((err) => {
     failTurn(state, `fx acp: unexpected driver error: ${errMessage(err)}`);
   });

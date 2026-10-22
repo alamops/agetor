@@ -14,6 +14,7 @@ import path from "node:path";
 import {
   dropFxSession,
   fxSessionActive,
+  fxSpeedNotOfferedLine,
   parseFxEffortOption,
   reapLiveFxProcs,
   spawnFxViaAcp,
@@ -38,6 +39,7 @@ import {
 // AGETOR_DATA_DIR dance either.
 import { answerFxPermission, listPendingForTask, type FxPermissionRequest } from "./interactions.ts";
 import { deriveTodoProgress } from "../shared/todo-progress.ts";
+import { FX_PAUSED_SUMMARY_SUFFIX } from "../shared/fx-recovery.ts";
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * Fake `fx acp` server: a real child process that speaks newline-delimited
@@ -124,6 +126,35 @@ const FAKE_ACP_SERVER_SRC = [
   "  };",
   "}",
   "",
+  "// fx >=0.0.13/0.0.14 speed lanes (`configOptions[{id:\"fast\"}]` /",
+  "// `[{id:\"ultrafast\"}]`, currentValue \"true\"/\"false\"). FX_FAKE_SPEED_OPTS",
+  "// is a JSON object naming which lanes the model offers and their starting",
+  "// values, e.g. {\"fast\":\"false\",\"ultrafast\":\"true\"}; unset = no lanes",
+  "// (the 0.0.10 / no-fast-lane-model shape). FX_FAKE_SPEED_ERROR names a",
+  "// configId whose set call fails with fx's own -32602 text.",
+  "const speedState = process.env.FX_FAKE_SPEED_OPTS ? JSON.parse(process.env.FX_FAKE_SPEED_OPTS) : null;",
+  "function speedEntries() {",
+  "  if (!speedState) return [];",
+  "  const out = [];",
+  '  ["fast", "ultrafast"].forEach(function (lane) {',
+  "    if (Object.prototype.hasOwnProperty.call(speedState, lane)) {",
+  '      out.push({ id: lane, name: lane, category: "model", type: "select", currentValue: speedState[lane], options: [{ value: "false", name: "off" }, { value: "true", name: "on" }] });',
+  "    }",
+  "  });",
+  "  return out;",
+  "}",
+  "function withSpeed(result) {",
+  "  const extra = speedEntries();",
+  "  if (extra.length === 0) return result;",
+  "  result.configOptions = (result.configOptions || []).concat(extra);",
+  "  return result;",
+  "}",
+  "",
+  "// fx 0.0.14's mode block: auto/ask/full-access, currentModeId real.",
+  "function modesBlock() {",
+  '  return { currentModeId: "auto", availableModes: [{ id: "auto", name: "Auto" }, { id: "ask", name: "Ask" }, { id: "full-access", name: "Full access" }] };',
+  "}",
+  "",
   'process.on("SIGTERM", function () {',
   '  capture("sigterm", {});',
   "  process.exit(0);",
@@ -143,6 +174,7 @@ const FAKE_ACP_SERVER_SRC = [
   "}",
   "",
   "function handleInitialize(id, params) {",
+  '  capture("initialize", params);',
   '  if (scenario === "unauth") {',
   '    fail(id, -32600, "Fx needs access to Vercel AI Gateway. Run fx login to authenticate.");',
   "    return;",
@@ -165,9 +197,10 @@ const FAKE_ACP_SERVER_SRC = [
   "}",
   "",
   "function handleSessionNew(id, params) {",
+  '  capture("session/new", params);',
   "  sessionCounter = sessionCounter + 1;",
   '  const sessionId = "sess-" + scenario + "-" + sessionCounter;',
-  '  const result = { sessionId: sessionId, modes: { availableModes: [{ id: "code" }, { id: "ask" }] } };',
+  "  const result = { sessionId: sessionId, modes: modesBlock() };",
   '  if (scenario === "provider") {',
   '    result.configOptions = [{ id: "provider", currentValue: "gateway", options: ["gateway", "codex", "grok"] }];',
   "  }",
@@ -192,7 +225,7 @@ const FAKE_ACP_SERVER_SRC = [
   "      options: []",
   "    }];",
   "  }",
-  "  ok(id, result);",
+  "  ok(id, withSpeed(result));",
   "}",
   "",
   "function handleSessionResume(id, params) {",
@@ -266,14 +299,14 @@ const FAKE_ACP_SERVER_SRC = [
   "    ok(id, {});",
   "    return;",
   "  }",
-  "  ok(id, {});",
+  "  ok(id, withSpeed({ modes: modesBlock() }));",
   "}",
   "",
   "function handleSessionLoad(id, params) {",
   '  capture("session/load", params);',
   '  if (scenario === "resume-fallback") {',
   '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "REPLAYED must be discarded" } } });',
-  "    setTimeout(function () { ok(id, {}); }, 15);",
+  "    setTimeout(function () { ok(id, withSpeed({})); }, 15);",
   "    return;",
   "  }",
   '  if (scenario === "resume-auth-error") {',
@@ -467,6 +500,19 @@ const FAKE_ACP_SERVER_SRC = [
   '    endTurn(id, 15, "end_turn");',
   "    return;",
   "  }",
+  '  if (scenario === "tool-meta") {',
+  "    // fx >=0.0.14: a structured notice, an internal discovery call, an",
+  "    // MCP call (identity meta rides the tool_call only), and a steered",
+  "    // user echo, which the mapper must keep silent.",
+  '    notify("session/update", { update: { sessionUpdate: "notice", severity: "warning", title: "e2e notice" } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "tc-internal", name: "capability_search", title: "Search capabilities", kind: "search", status: "pending", rawInput: { query: "x" }, _meta: { fx: { toolCall: { internal: true } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call_update", toolCallId: "tc-internal", status: "completed", content: [{ type: "content", content: { type: "text", text: "found" } }] } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "tc-mcp", name: "mcp_e2e-mcp_lookup", title: "Lookup", kind: "other", status: "pending", rawInput: { q: "y" }, _meta: { fx: { toolCall: { internal: false, mcp: { server: "e2e-mcp", tool: "lookup" } } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call_update", toolCallId: "tc-mcp", status: "completed", content: [{ type: "content", content: { type: "text", text: "ok" } }] } });',
+  '    notify("session/update", { update: { sessionUpdate: "user_message_chunk", messageId: "steer-1", content: { type: "text", text: "steered echo" }, _meta: { fx: { steering: "absorbed" } } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
   '  if (scenario === "kill-cancel") {',
   '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "working..." } } });',
   "    return;",
@@ -581,6 +627,18 @@ const FAKE_ACP_SERVER_SRC = [
   "",
   "function handleSetConfigOption(id, params) {",
   '  capture("session/set_config_option", params);',
+  '  if (params.configId === "fast" || params.configId === "ultrafast") {',
+  "    if (process.env.FX_FAKE_SPEED_ERROR === params.configId) {",
+  '      fail(id, -32602, (params.configId === "fast" ? "Fast" : "Ultrafast") + " mode is not available for model \\"fake/model\\"");',
+  "      return;",
+  "    }",
+  "    // fx makes the lanes exclusive: turning one on turns the other off.",
+  "    speedState[params.configId] = params.value;",
+  '    const other = params.configId === "fast" ? "ultrafast" : "fast";',
+  '    if (params.value === "true" && Object.prototype.hasOwnProperty.call(speedState, other)) speedState[other] = "false";',
+  "    ok(id, { configOptions: speedEntries() });",
+  "    return;",
+  "  }",
   '  if (scenario === "effort-set-error") {',
   '    fail(id, -32602, "Reasoning effort is not available for the active model");',
   "    return;",
@@ -641,7 +699,15 @@ const FAKE_ACP_SERVER_SRC = [
   '  if (method === "session/new") { handleSessionNew(id, params); return; }',
   '  if (method === "session/resume") { handleSessionResume(id, params); return; }',
   '  if (method === "session/load") { handleSessionLoad(id, params); return; }',
-  '  if (method === "session/set_mode") { ok(id, {}); return; }',
+  "  // fx 0.0.14: an unknown mode id is rejected; a known one would be saved",
+  "  // into the user's ~/.fx/settings.json. Captured so tests can assert the",
+  "  // driver never sends it.",
+  '  if (method === "session/set_mode") {',
+  '    capture("session/set_mode", params);',
+  '    if (["auto", "ask", "full-access"].indexOf(params && params.modeId) === -1) { fail(id, -32602, "Unknown mode"); return; }',
+  "    ok(id, {});",
+  "    return;",
+  "  }",
   '  if (method === "session/set_config_option") { handleSetConfigOption(id, params); return; }',
   '  if (method === "session/prompt") { handlePrompt(id, params); return; }',
   '  if (method === "session/cancel") { handleCancel(params); return; }',
@@ -726,6 +792,10 @@ function spawnFake(
      *  on `applyFxEffort`'s breadcrumb text must pass this explicitly or
      *  the breadcrumb falls back to the generic "the active model" phrase. */
     model?: string;
+    /** `FxLaunchOptions.speed`. */
+    speed?: FxLaunchOptions["speed"];
+    /** `FxLaunchOptions.profileMcpServers`. */
+    profileMcpServers?: boolean;
   } = {},
 ) {
   const chunks: Chunk[] = [];
@@ -747,6 +817,8 @@ function spawnFake(
     continueRecovery: opts.continueRecovery,
     effort: opts.effort,
     model: opts.model,
+    speed: opts.speed,
+    profileMcpServers: opts.profileMcpServers,
     onChunk,
     onSessionId: (id) => sessionIds.push(id),
   });
@@ -1928,11 +2000,11 @@ describe("recovery storm → paused → refused (scenario 1)", () => {
       expect(new Set(recoveryChunks.map((c) => c.data)).size).toBe(recoveryChunks.length);
 
       const statusChunks = chunks.filter((c) => c.stream === "status");
-      const summaryLines = statusChunks.filter((c) => c.data.includes("resume once the limit clears"));
+      const summaryLines = statusChunks.filter((c) => c.data.endsWith(FX_PAUSED_SUMMARY_SUFFIX));
       expect(summaryLines).toHaveLength(1);
       expect(summaryLines[0]!.data).toBe(
         "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts"
-          + " — resume once the limit clears, or send a new message.",
+          + FX_PAUSED_SUMMARY_SUFFIX,
       );
 
       expect(
@@ -2068,7 +2140,7 @@ describe("session/resume replays a paused checkpoint onto a NEW run (scenario 5)
       // The paused terminal-summary PLAIN line must NOT reappear — it
       // already reached the transcript on the run where the pause genuinely
       // happened; a resume replay must not re-fire it.
-      expect(statusChunks.some((c) => c.data.includes("resume once the limit clears"))).toBe(false);
+      expect(statusChunks.some((c) => c.data.endsWith(FX_PAUSED_SUMMARY_SUFFIX))).toBe(false);
 
       // The turn proceeded normally afterwards (the fake's shared "happy"
       // response stream).
@@ -2172,9 +2244,9 @@ describe("replay-seeded dedupe reset (finding #2): a live re-pause right after t
       expect(payloads[1]!.replayed).toBeUndefined(); // the LIVE re-pause
 
       const statusChunks = chunks.filter((c) => c.stream === "status");
-      // Exactly one persisted "resume once the limit clears" summary line —
+      // Exactly one persisted paused summary line (FX_PAUSED_SUMMARY_SUFFIX) —
       // from the LIVE update only (replay summary lines stay suppressed).
-      const summaryLines = statusChunks.filter((c) => c.data.includes("resume once the limit clears"));
+      const summaryLines = statusChunks.filter((c) => c.data.endsWith(FX_PAUSED_SUMMARY_SUFFIX));
       expect(summaryLines).toHaveLength(1);
 
       // The enriched refused status line — proves ctx.lastRecovery got set
@@ -2585,4 +2657,276 @@ describe("session/resume replay window closes on the reply LINE, not on the awai
     },
     10_000,
   );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * fx 0.0.14 (docs/plans/fx-0.0.14-and-cursor-updates.md §3.2, U-F1): no
+ * `session/set_mode` ever, the profile-MCP `_meta` on every handshake, the
+ * `session.notices` client capability, notices + tool identity meta through
+ * the live driver, and `applyFxSpeed`'s lane reconciliation.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("session/set_mode is never sent (fx 0.0.14 would save it into the user's ~/.fx/settings.json)", () => {
+  for (const mode of ["yolo", "auto", "ask"] as const) {
+    test(`mode ${mode}: neither session/new nor session/resume is followed by a set_mode call`, async () => {
+      const fresh = spawnFake("happy", { mode });
+      expect(await fresh.agent.done).toBe(0);
+      const freshEntries = readCaptured(fresh.captureFile);
+      expect(freshEntries.some((e) => e.label === "session/new")).toBe(true);
+      expect(freshEntries.some((e) => e.label === "session/set_mode")).toBe(false);
+
+      const resumed = spawnFake("resume", { mode, resumeSessionId: `resume-no-set-mode-${mode}` });
+      expect(await resumed.agent.done).toBe(0);
+      const resumedEntries = readCaptured(resumed.captureFile);
+      expect(resumedEntries.some((e) => e.label === "session/resume")).toBe(true);
+      expect(resumedEntries.some((e) => e.label === "session/set_mode")).toBe(false);
+    }, 10_000);
+  }
+});
+
+describe("profile MCP servers `_meta.fx.profileMcpServers` (fx ≥0.0.13)", () => {
+  const META = { fx: { profileMcpServers: true } };
+
+  test("undefined (default) and true: session/new carries the _meta", async () => {
+    for (const profileMcpServers of [undefined, true]) {
+      const { agent, captureFile } = spawnFake("happy", { profileMcpServers });
+      expect(await agent.done).toBe(0);
+      const newReq = readCaptured(captureFile).find((e) => e.label === "session/new");
+      expect((newReq!.msg as { _meta?: unknown })._meta).toEqual(META);
+      expect((newReq!.msg as { mcpServers?: unknown }).mcpServers).toEqual([]);
+    }
+  }, 10_000);
+
+  test("on: session/resume carries the _meta", async () => {
+    const { agent, captureFile } = spawnFake("resume", { resumeSessionId: "resume-meta-on" });
+    expect(await agent.done).toBe(0);
+    const req = readCaptured(captureFile).find((e) => e.label === "session/resume");
+    expect(req!.msg).toEqual({ sessionId: "resume-meta-on", _meta: META });
+  }, 10_000);
+
+  test("on: the session/load fallback carries the _meta too", async () => {
+    const { agent, captureFile } = spawnFake("resume-fallback", { resumeSessionId: "resume-meta-load" });
+    expect(await agent.done).toBe(0);
+    const entries = readCaptured(captureFile);
+    expect((entries.find((e) => e.label === "session/resume")!.msg as { _meta?: unknown })._meta).toEqual(META);
+    expect((entries.find((e) => e.label === "session/load")!.msg as { _meta?: unknown })._meta).toEqual(META);
+  }, 10_000);
+
+  test("false: the _meta key is omitted entirely on session/new, session/resume and session/load", async () => {
+    const fresh = spawnFake("happy", { profileMcpServers: false });
+    expect(await fresh.agent.done).toBe(0);
+    const newReq = readCaptured(fresh.captureFile).find((e) => e.label === "session/new");
+    expect("_meta" in (newReq!.msg as object)).toBe(false);
+
+    const fallback = spawnFake("resume-fallback", { resumeSessionId: "resume-meta-off", profileMcpServers: false });
+    expect(await fallback.agent.done).toBe(0);
+    const entries = readCaptured(fallback.captureFile);
+    expect("_meta" in (entries.find((e) => e.label === "session/resume")!.msg as object)).toBe(false);
+    expect("_meta" in (entries.find((e) => e.label === "session/load")!.msg as object)).toBe(false);
+  }, 10_000);
+});
+
+describe("initialize advertises clientCapabilities.session.notices (fx ≥0.0.14)", () => {
+  test("keeps the existing fs/terminal fields and adds session.notices", async () => {
+    const { agent, captureFile } = spawnFake("happy");
+    expect(await agent.done).toBe(0);
+    const init = readCaptured(captureFile).find((e) => e.label === "initialize");
+    expect((init!.msg as { clientCapabilities?: unknown }).clientCapabilities).toEqual({
+      fs: { readTextFile: false, writeTextFile: false },
+      terminal: false,
+      session: { notices: {} },
+    });
+    expect((init!.msg as { protocolVersion?: unknown }).protocolVersion).toBe(1);
+  }, 10_000);
+});
+
+describe("notice + tool identity meta through the live driver (fx ≥0.0.14)", () => {
+  test("a notice becomes a status line; an internal call's use/result are stamped; an MCP call is labelled server · tool", async () => {
+    const { agent, chunks } = spawnFake("tool-meta");
+    expect(await agent.done).toBe(0);
+
+    expect(chunks.filter((c) => c.stream === "status").map((c) => c.data)).toContain("⚠ fx: e2e notice");
+
+    const internalUse = chunks.find((c) => c.lineUuid === "fx:tool:tc-internal:use");
+    const internalResult = chunks.find((c) => c.lineUuid === "fx:tool:tc-internal:result");
+    expect(JSON.parse(internalUse!.data).internal).toBe(true);
+    expect(JSON.parse(internalResult!.data).internal).toBe(true);
+
+    const mcpUse = JSON.parse(chunks.find((c) => c.lineUuid === "fx:tool:tc-mcp:use")!.data);
+    expect(mcpUse.name).toBe("e2e-mcp · lookup");
+    expect(mcpUse.mcp).toEqual({ server: "e2e-mcp", tool: "lookup" });
+    expect("internal" in mcpUse).toBe(false);
+    const mcpResult = JSON.parse(chunks.find((c) => c.lineUuid === "fx:tool:tc-mcp:result")!.data);
+    expect("internal" in mcpResult).toBe(false);
+
+    // The steered user echo fx sends after delivering a steer emits nothing.
+    expect(chunks.some((c) => c.data.includes("steered echo"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxSpeed — fast/ultrafast configOptions reconciliation (fx ≥0.0.13)", () => {
+  const speedCalls = (captureFile: string) =>
+    readCaptured(captureFile)
+      .filter((e) => e.label === "session/set_config_option")
+      .map((e) => e.msg as { configId: string; value: string })
+      .filter((m) => m.configId === "fast" || m.configId === "ultrafast")
+      .map((m) => `${m.configId}=${m.value}`);
+  const statusLines = (chunks: Chunk[]) => chunks.filter((c) => c.stream === "status").map((c) => c.data);
+  const MODEL = "openai/gpt-6.1-sol";
+
+  test("speed null / undefined → no speed RPC and no breadcrumb, even with lanes on", async () => {
+    for (const speed of [null, undefined]) {
+      const { agent, chunks, captureFile } = spawnFake("happy", {
+        speed,
+        model: MODEL,
+        env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "true", ultrafast: "false" }) },
+      });
+      expect(await agent.done).toBe(0);
+      expect(speedCalls(captureFile)).toEqual([]);
+      expect(statusLines(chunks).some((d) => d.includes("Fast") || d.includes("Ultrafast"))).toBe(false);
+    }
+  }, 10_000);
+
+  test("fast, both lanes present and off → one fast=true call, before session/prompt, silent", async () => {
+    const { agent, chunks, captureFile } = spawnFake("happy", {
+      speed: "fast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "false", ultrafast: "false" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["fast=true"]);
+    const entries = readCaptured(captureFile);
+    const setIndex = entries.findIndex((e) => e.label === "session/set_config_option");
+    expect(entries.findIndex((e) => e.label === "session/prompt")).toBeGreaterThan(setIndex);
+    expect(statusLines(chunks).some((d) => d.includes("Fast"))).toBe(false);
+  }, 10_000);
+
+  test("ultrafast with fast currently on → ultrafast=true only (fx's reply already shows fast off); order ultrafast before fast", async () => {
+    const { agent, chunks, captureFile } = spawnFake("happy", {
+      speed: "ultrafast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "true", ultrafast: "false" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["ultrafast=true"]);
+    expect(statusLines(chunks).some((d) => d.includes("Fast") || d.includes("Ultrafast"))).toBe(false);
+  }, 10_000);
+
+  test("fast with ultrafast currently on → ultrafast=false first, then fast=true", async () => {
+    const { agent, captureFile } = spawnFake("happy", {
+      speed: "fast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "false", ultrafast: "true" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["ultrafast=false", "fast=true"]);
+  }, 10_000);
+
+  test("off with a lane on → that lane is turned off; off with lanes already off → no RPC", async () => {
+    const on = spawnFake("happy", {
+      speed: "off",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "true", ultrafast: "false" }) },
+    });
+    expect(await on.agent.done).toBe(0);
+    expect(speedCalls(on.captureFile)).toEqual(["fast=false"]);
+
+    const off = spawnFake("happy", {
+      speed: "off",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "false", ultrafast: "false" }) },
+    });
+    expect(await off.agent.done).toBe(0);
+    expect(speedCalls(off.captureFile)).toEqual([]);
+  }, 10_000);
+
+  test("fast already on → silent, no RPC", async () => {
+    const { agent, chunks, captureFile } = spawnFake("happy", {
+      speed: "fast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "true" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual([]);
+    expect(statusLines(chunks).some((d) => d.includes("Fast"))).toBe(false);
+  }, 10_000);
+
+  test("no lanes offered: fast/ultrafast → exactly one 'isn't offered' breadcrumb, no RPC; off → silent", async () => {
+    for (const [speed, expected] of [
+      ["fast", fxSpeedNotOfferedLine("fast", "deepseek/deepseek-v4-flash")],
+      ["ultrafast", fxSpeedNotOfferedLine("ultrafast", "deepseek/deepseek-v4-flash")],
+    ] as const) {
+      const { agent, chunks, captureFile } = spawnFake("happy", { speed, model: "deepseek/deepseek-v4-flash" });
+      expect(await agent.done).toBe(0);
+      expect(speedCalls(captureFile)).toEqual([]);
+      expect(statusLines(chunks).filter((d) => d === expected)).toHaveLength(1);
+    }
+    const off = spawnFake("happy", { speed: "off", model: "deepseek/deepseek-v4-flash" });
+    expect(await off.agent.done).toBe(0);
+    expect(statusLines(off.chunks).some((d) => d.includes("isn't offered"))).toBe(false);
+  }, 10_000);
+
+  test("ultrafast wanted but only a fast lane exists → fast is turned off and the Ultrafast breadcrumb fires", async () => {
+    const { agent, chunks, captureFile } = spawnFake("happy", {
+      speed: "ultrafast",
+      model: "openai/gpt-5.2",
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "true" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["fast=false"]);
+    expect(statusLines(chunks)).toContain(fxSpeedNotOfferedLine("ultrafast", "openai/gpt-5.2"));
+  }, 10_000);
+
+  test("a set_config_option error degrades to a breadcrumb carrying fx's message; the turn still succeeds", async () => {
+    const { agent, chunks, captureFile } = spawnFake("happy", {
+      speed: "fast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "false" }), FX_FAKE_SPEED_ERROR: "fast" },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["fast=true"]);
+    expect(readCaptured(captureFile).some((e) => e.label === "session/prompt")).toBe(true);
+    expect(statusLines(chunks)).toContain(
+      'fx: couldn\'t set Fast — Fast mode is not available for model "fake/model" — running without it',
+    );
+  }, 10_000);
+
+  test("an error turning a lane OFF says so without claiming the run is without it", async () => {
+    const { agent, chunks } = spawnFake("happy", {
+      speed: "off",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ ultrafast: "true" }), FX_FAKE_SPEED_ERROR: "ultrafast" },
+    });
+    expect(await agent.done).toBe(0);
+    expect(statusLines(chunks)).toContain(
+      'fx: couldn\'t turn off Ultrafast — Ultrafast mode is not available for model "fake/model"',
+    );
+  }, 10_000);
+
+  test("session/resume: lanes are reconciled from the resume result", async () => {
+    const { agent, captureFile } = spawnFake("resume", {
+      resumeSessionId: "resume-speed-1",
+      speed: "ultrafast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "false", ultrafast: "false" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["ultrafast=true"]);
+  }, 10_000);
+
+  test("session/load fallback: lanes are reconciled from the load result, after load and before prompt", async () => {
+    const { agent, captureFile } = spawnFake("resume-fallback", {
+      resumeSessionId: "resume-speed-load",
+      speed: "fast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "false" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["fast=true"]);
+    const entries = readCaptured(captureFile);
+    const loadIndex = entries.findIndex((e) => e.label === "session/load");
+    const setIndex = entries.findIndex((e) => e.label === "session/set_config_option");
+    expect(setIndex).toBeGreaterThan(loadIndex);
+    expect(entries.findIndex((e) => e.label === "session/prompt")).toBeGreaterThan(setIndex);
+  }, 10_000);
 });

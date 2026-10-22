@@ -338,6 +338,10 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
   // on confirm-success (refresh overwrites with the server's truth), on
   // cancel (revert), and on error (revert + surface the message).
   const [pendingToggle, setPendingToggle] = useState<Record<string, boolean>>({});
+  // Same optimistic shape for the fx-only "Load profile MCP servers" switch:
+  // harness id → the value clicked toward, cleared once the PATCH settles
+  // (success: refresh has the truth; error: the switch reverts).
+  const [pendingProfileMcp, setPendingProfileMcp] = useState<Record<string, boolean>>({});
   const confirm = useConfirm();
 
   const refresh = async () => {
@@ -521,6 +525,29 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
     }
   };
 
+  const onToggleProfileMcp = async (h: Harness, next: boolean) => {
+    setPendingProfileMcp((m) => ({ ...m, [h.id]: next }));
+    const clear = () =>
+      setPendingProfileMcp((m) => {
+        if (!(h.id in m)) return m;
+        const { [h.id]: _, ...rest } = m;
+        return rest;
+      });
+    try {
+      await api.updateHarness(h.id, { profileMcpServers: next });
+      await refresh();
+      clear();
+      onChange?.();
+    } catch (e) {
+      clear();
+      const message = e instanceof Error ? e.message : String(e);
+      toast.error(`Couldn't ${next ? "enable" : "disable"} profile MCP servers for "${h.label}"`, {
+        description: message,
+        duration: Infinity,
+      });
+    }
+  };
+
   const currentSection = activeSection(view);
 
   const showEditor = (harnessId: string | null, template: HarnessTemplate) => {
@@ -693,6 +720,8 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       onToggleEnabled={onToggleEnabled}
                       onOpenTerminal={onOpenTerminal}
                       pendingToggle={pendingToggle}
+                      onToggleProfileMcp={onToggleProfileMcp}
+                      pendingProfileMcp={pendingProfileMcp}
                     />
                   );
                 case "agents":
@@ -1395,6 +1424,8 @@ function HarnessesSection({
   onToggleEnabled,
   onOpenTerminal,
   pendingToggle,
+  onToggleProfileMcp,
+  pendingProfileMcp,
 }: {
   payload: HarnessesPayload;
   statusByHarness: Map<string, HarnessesPayload["statuses"][number]>;
@@ -1414,6 +1445,11 @@ function HarnessesSection({
    *  clicked toward. Lets the Switch animate before the confirm/round-trip
    *  resolves. Missing keys mean "use the server's `h.enabled`". */
   pendingToggle: Record<string, boolean>;
+  /** fx only: flip `profileMcpServers` (PATCH, optimistic). */
+  onToggleProfileMcp: (h: Harness, next: boolean) => void;
+  /** Optimistic `profileMcpServers` values, keyed by harness id. Missing keys
+   *  mean "use the server's value" (absent ⇒ on). */
+  pendingProfileMcp: Record<string, boolean>;
 }) {
   // Which harness's account-usage panel is expanded (at most one at a time).
   // Local to this section: the table fetches on expand, and the scan behind
@@ -1537,6 +1573,33 @@ function HarnessesSection({
                   </>
                 )}
               </div>
+              {h.kind === "fx" && (
+                <div className="flex items-start gap-2 pl-6">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs">Load profile MCP servers</div>
+                    <div className="text-[11px] text-muted-foreground">
+                      Loads the MCP servers from your own fx profile into each
+                      task's session (fx 0.0.14+).
+                    </div>
+                  </div>
+                  <Switch
+                    data-testid="harness-profile-mcp-toggle"
+                    checked={pendingProfileMcp[h.id] ?? h.profileMcpServers !== false}
+                    onCheckedChange={(next) => onToggleProfileMcp(h, next)}
+                    aria-label={`Load profile MCP servers for ${h.label}`}
+                  />
+                </div>
+              )}
+              {h.kind === "fx" && status?.fxProfilePermissionMode === "ask" && (
+                <div
+                  data-testid="harness-fx-ask-hint"
+                  className="pl-6 text-[11px] text-muted-foreground"
+                >
+                  fx's own profile starts in Ask mode. Agetor sets each task's
+                  mode itself; to change fx's default, run{" "}
+                  <code className="rounded bg-muted px-1">/permissions</code> inside fx.
+                </div>
+              )}
               {usageOpenFor === h.id && <AccountUsageTable harnessId={h.id} />}
               </div>
             );

@@ -107,7 +107,8 @@ export interface DiscoveredModel {
   id: string;
   label?: string;
   /** Bare reasoning-effort ids the harness's CLI reported for this model
-   *  (codex only today, via `codex app-server model/list`). Absent when the
+   *  (codex via `codex app-server model/list`; fx ≥0.0.14 via
+   *  `models --json` `models[].efforts`, plus `auto`). Absent when the
    *  CLI reported none. See rule 8. */
   efforts?: readonly string[];
   /** fx only (`models --json` ≥0.0.14 `models[].fast`): the model offers the

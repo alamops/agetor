@@ -172,9 +172,11 @@ export type FxRecoveryState = "active" | "paused" | "recovered" | "failed" | "cl
  */
 export interface FxRecoveryPayload {
   /** `"active"` while fx is mid-retry, `"paused"` once fx gives up and the
-   *  checkpoint is resumable, `"recovered"` once a retry succeeds, or
-   *  `"cleared"` for the wire's `modelResponseRecovery: null` (checkpoint
-   *  dropped — e.g. consumed by a normal follow-up prompt). */
+   *  checkpoint is resumable, `"recovered"` once a retry succeeds, `"failed"`
+   *  (fx ≥0.0.14: `kind == terminal_provider_error` without a pause — fx
+   *  stopped retrying and there is nothing to resume), or `"cleared"` for the
+   *  wire's `modelResponseRecovery: null` (checkpoint dropped — e.g. consumed
+   *  by a normal follow-up prompt). */
   state: FxRecoveryState;
   /** Verbatim fx enum tags (forward-compat: unknown values pass through and
    *  render as-is). `kind` distinguishes e.g. `auto_retry` from
@@ -182,15 +184,17 @@ export interface FxRecoveryPayload {
   kind?: string;
   /** Why this attempt is happening, e.g. `rate_limited`, `network_interrupted`,
    *  `response_interrupted`, `provider_stream_timeout`, `provider_unavailable`,
-   *  `system_resumed`, `authentication`, `request_limit_reached`. */
+   *  `system_resumed`, `authentication`, `request_limit_reached`, and (fx
+   *  0.0.14) `connectivity_lost`, `compaction_prepared`. */
   cause?: string;
   /** What fx is doing about it, e.g. `retrying_request`, `continuing_response`,
    *  `regenerating_tool`, `continuing_after_tool`, `reconciling_tool`,
-   *  `waiting_for_connectivity`, `paused`. */
+   *  `waiting_for_connectivity`, `paused`, and (fx 0.0.14) `checking_liveness`,
+   *  `delivering_response`. */
   action?: string;
   /** Set only on a `paused` update: what the caller needs to do next, e.g.
    *  `continue_later` (Resume applies), `inspect_uncertain_tool`,
-   *  `change_request`. */
+   *  `change_request`, `surface_stall` (fx 0.0.14; not resumable). */
   requiredAction?: string;
   /** 1-based retry attempt number and the configured cap for this recovery
    *  episode (fx's `10/10` in "recovery paused after 10/10 attempts"). */
@@ -882,11 +886,11 @@ export interface HarnessStatus {
    *  probe supplies one, else one of agetor's two synthesized fallback hints
    *  (missing credentials vs. an expired login); otherwise null. */
   authHelp: string | null;
-  /** fx ≥0.0.14 only: the permission mode fx's own saved profile starts in
-   *  (`fx status --json` `permission_mode`, probed WITHOUT
-   *  `FX_PERMISSION_MODE` so the env override can't mask it). `"ask"` drives
-   *  the Settings / `agetor harness ls` hint. `null` (or absent) when the
-   *  kind isn't fx, the field is missing (fx ≤0.0.13), or the probe failed. */
+  /** fx only: the permission mode fx's own saved profile starts in
+   *  (`fx status --json` `permission_mode`, reported since fx 0.0.8; probed
+   *  WITHOUT `FX_PERMISSION_MODE` so the env override can't mask it). `"ask"`
+   *  drives the Settings / `agetor harness ls` hint. `null` (or absent) when
+   *  the kind isn't fx, the field is absent, or the probe failed. */
   fxProfilePermissionMode?: string | null;
 }
 

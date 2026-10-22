@@ -161,13 +161,24 @@ async function probeHelp(bin: string, env: Record<string, string>): Promise<stri
  * shape/timeout budget as `probeVersion`/`probeHelp`. Generic (not
  * fx-specific) so a future JSON sub-command probe on another kind can reuse
  * it; today only `probeStatus` calls it.
+ *
+ * `omitEnv` names variables removed from the merged env (`process.env` plus
+ * `env`) before the spawn — `probeStatus` strips `FX_PERMISSION_MODE`, which
+ * would otherwise mask the profile value `status --json` reports.
  */
-async function probeJson(bin: string, args: string[], env: Record<string, string>): Promise<string | null> {
+async function probeJson(
+  bin: string,
+  args: string[],
+  env: Record<string, string>,
+  omitEnv: readonly string[] = [],
+): Promise<string | null> {
+  const merged: Record<string, string | undefined> = { ...process.env, ...env };
+  for (const key of omitEnv) delete merged[key];
   const proc = Bun.spawn([bin, ...args], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, ...env },
+    env: merged,
   });
 
   const timer = setTimeout(() => {
@@ -267,7 +278,8 @@ async function probeJson(bin: string, args: string[], env: Record<string, string
  * `update_channel`, `build_channel`, `permission_mode`, `workspace`,
  * `history_turns`, `session_permission_grants`, `agent_step_limit`, and the
  * `mcp{connection_check,servers,configuration_issues,inspection_error}`
- * object — are, as before, ignored here by construction.
+ * object — are, as before, ignored here by construction (`permission_mode`
+ * only until 0.0.14 made it worth reading — see below).
  *
  * Re-verified through fx 0.0.10 (binary probes of the 0.0.9 and 0.0.10
  * release builds + a full v0.0.8→v0.0.10 source diff, 2026-09-14): the
@@ -281,28 +293,55 @@ async function probeJson(bin: string, args: string[], env: Record<string, string
  * `full-access` still reads back as `yolo`, and an invalid
  * `FX_PERMISSION_MODE` still falls back silently to `auto` (no error) —
  * identical on 0.0.8, 0.0.9, and 0.0.10.
+ *
+ * Re-verified against fx 0.0.14 (binary probe of the release build
+ * 1a070af32cdf, isolated HOMEs, 2026-10-22): `--help` still reads "Fast,
+ * native coding agent for the terminal." (so `FX_HELP_MARKER` matches), and
+ * the auth fields (`auth`, `auth_help`, `auth_refreshable`) and their
+ * vocabulary are unchanged, so the login gate above holds as written.
+ * 0.0.14 adds `mode`, `modes`, `effort` and `ultrafast_requested` (ignored
+ * here) beside `permission_mode`, which is now load-bearing: 0.0.14's
+ * `session/set_mode` writes the chosen mode into the user's own
+ * `~/.fx/settings.json`, and `permission_mode` reports, in order, the
+ * `FX_PERMISSION_MODE` env override, else that saved profile value (`"ask"`
+ * with `{"permission_mode":"ask"}` saved), else `"auto"`. This probe
+ * therefore runs with `FX_PERMISSION_MODE` REMOVED from its env — whether it
+ * came from agetor's process env or from the harness's own env map — so the
+ * value reflects the profile the user's interactive fx starts in, not an
+ * override. It is returned as `permissionMode` (any non-empty string; `null`
+ * when the field is absent, not a string, or the probe failed) and surfaced
+ * as `HarnessStatus.fxProfilePermissionMode`, which drives the "fx starts in
+ * Ask" hint in Settings and `agetor harness ls`. It is read independently of
+ * the auth fields: a payload whose `auth` can't be parsed still reports it.
+ * `status --json` still writes nothing under an empty `HOME`.
  */
-async function probeStatus(bin: string, env: Record<string, string>): Promise<{ loggedIn: boolean | null; authHelp: string | null }> {
-  const out = await probeJson(bin, ["status", "--json"], env);
-  if (!out) return { loggedIn: null, authHelp: null };
+async function probeStatus(bin: string, env: Record<string, string>): Promise<StatusProbeResult> {
+  const failed: StatusProbeResult = { loggedIn: null, authHelp: null, permissionMode: null };
+  const out = await probeJson(bin, ["status", "--json"], env, ["FX_PERMISSION_MODE"]);
+  if (!out) return failed;
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(out);
   } catch {
-    return { loggedIn: null, authHelp: null };
+    return failed;
   }
 
-  if (typeof parsed !== "object" || parsed === null) return { loggedIn: null, authHelp: null };
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return failed;
   const record = parsed as Record<string, unknown>;
+  const permissionMode =
+    typeof record.permission_mode === "string" && record.permission_mode.length > 0
+      ? record.permission_mode
+      : null;
   const auth = record.auth;
-  if (typeof auth !== "string") return { loggedIn: null, authHelp: null };
+  if (typeof auth !== "string") return { loggedIn: null, authHelp: null, permissionMode };
 
   if (auth === "missing") {
     const authHelp = record.auth_help;
     return {
       loggedIn: false,
       authHelp: typeof authHelp === "string" ? authHelp : "Run fx login to sign in.",
+      permissionMode,
     };
   }
 
@@ -325,13 +364,19 @@ async function probeStatus(bin: string, env: Record<string, string>): Promise<{ 
       loggedIn: false,
       authHelp:
         typeof authHelp === "string" ? authHelp : "fx login has expired — run fx login to sign in again.",
+      permissionMode,
     };
   }
 
-  return { loggedIn: true, authHelp: null };
+  return { loggedIn: true, authHelp: null, permissionMode };
 }
 
-type StatusProbeResult = { loggedIn: boolean | null; authHelp: string | null };
+type StatusProbeResult = {
+  loggedIn: boolean | null;
+  authHelp: string | null;
+  /** `status --json` `permission_mode`, probed without `FX_PERMISSION_MODE`. */
+  permissionMode: string | null;
+};
 
 const STATUS_CACHE_TTL_MS = 60_000;
 const statusCache = new Map<string, { value: StatusProbeResult; expiresAt: number }>();
@@ -443,6 +488,7 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
       installHint: INSTALL_HINTS[harness.kind],
       loggedIn: null,
       authHelp: null,
+      fxProfilePermissionMode: null,
       ...accountFields,
     };
   }
@@ -461,6 +507,7 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
         installHint: TMUX_INSTALL_HINT,
         loggedIn: null,
         authHelp: null,
+        fxProfilePermissionMode: null,
         ...accountFields,
       };
     }
@@ -480,6 +527,7 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
   // this probe reports as unavailable.
   let loggedIn: boolean | null = null;
   let authHelp: string | null = null;
+  let fxProfilePermissionMode: string | null = null;
 
   if (harness.kind === "fx" && version !== null) {
     const env = harnessEnv(harness);
@@ -509,11 +557,13 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
         installHint: FX_WRONG_BINARY_HINT,
         loggedIn: null,
         authHelp: null,
+        fxProfilePermissionMode: null,
         ...accountFields,
       };
     }
 
     ({ loggedIn, authHelp } = status);
+    fxProfilePermissionMode = status.permissionMode;
   }
 
   return {
@@ -527,6 +577,7 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
     installHint: null,
     loggedIn,
     authHelp,
+    fxProfilePermissionMode,
     ...accountFields,
   };
 }

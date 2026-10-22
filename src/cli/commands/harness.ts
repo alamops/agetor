@@ -6,6 +6,13 @@ import type { AgentKind } from "../../shared/types.ts";
 import { usageError } from "../usage.ts";
 import { escapeControlChars } from "../../shared/terminal-text.ts";
 
+/** Printed under an fx harness whose own saved profile starts in Ask mode
+ *  (`fx status --json` `permission_mode`, fx ≥0.0.14). Neutral on purpose:
+ *  agetor can't tell whether it or the user set that value. Same copy as the
+ *  Settings → Harnesses hint. */
+export const FX_ASK_PROFILE_HINT =
+  "fx's own profile starts in Ask mode. Agetor sets each task's mode itself; to change fx's default, run `/permissions` inside fx.";
+
 export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
   const sub = args[0] ?? "ls";
   const client = await getClient(flags);
@@ -25,10 +32,12 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
           escapeControlChars(h.label),
           st?.available ? c.green("ready") : c.red(st?.reason ?? "unavailable"),
           st?.version ?? "",
+          // fx only (absent ⇒ on); meaningless for every other kind.
+          h.kind === "fx" ? (h.profileMcpServers !== false ? "on" : c.gray("off")) : c.dim("-"),
           h.isBuiltin ? c.dim("built-in") : "",
         ];
       });
-      out(table(["", "id", "kind", "label", "status", "version", ""], rows));
+      out(table(["", "id", "kind", "label", "status", "version", "profile-mcp", ""], rows));
       // Logged-out state rides alongside availability rather than inside the
       // table cell (a login probe result, not an install/PATH problem) — one
       // extra line per affected harness, same red-text treatment as the
@@ -37,6 +46,9 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
         const st = byId.get(h.id);
         if (st?.loggedIn === false) {
           out(`  ${c.red("!")} ${c.bold(h.id)} not logged in — ${st.authHelp ?? "run its login command"}`);
+        }
+        if (h.kind === "fx" && st?.fxProfilePermissionMode === "ask") {
+          out(`  ${c.dim("i")} ${c.bold(h.id)} ${FX_ASK_PROFILE_HINT}`);
         }
       }
       return;
@@ -54,6 +66,7 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
         home: f.home,
         bin: f.bin,
         env: f.env,
+        ...(f.profileMcpServers !== undefined ? { profileMcpServers: f.profileMcpServers } : {}),
       });
       if (flags.json) return printJson(created);
       out(`${c.green("✓")} created harness ${c.bold(created.id)} (${created.kind})`);
@@ -70,8 +83,9 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
       if (f.homeSet) patch.home = f.home ?? null;
       if (f.binSet) patch.bin = f.bin ?? null;
       if (f.env) patch.env = f.env;
+      if (f.profileMcpServers !== undefined) patch.profileMcpServers = f.profileMcpServers;
       if (Object.keys(patch).length === 0) {
-        throw new Error("nothing to edit — pass --label / --home / --bin / --env");
+        throw new Error("nothing to edit — pass --label / --home / --bin / --env / --profile-mcp / --no-profile-mcp");
       }
       const updated = await client.patchHarness(id, patch);
       if (flags.json) return printJson(updated);
@@ -157,6 +171,8 @@ interface HarnessFlags {
   bin?: string | null;
   binSet?: boolean;
   env?: Record<string, string>;
+  /** fx only: `--profile-mcp` / `--no-profile-mcp` (last one wins). */
+  profileMcpServers?: boolean;
 }
 
 export function parseHarnessFlags(args: string[]): HarnessFlags {
@@ -169,6 +185,8 @@ export function parseHarnessFlags(args: string[]): HarnessFlags {
       case "--label": f.label = val(); break;
       case "--home": { const v = val(); f.home = v === "none" ? null : v; f.homeSet = true; break; }
       case "--bin": { const v = val(); f.bin = v === "none" ? null : v; f.binSet = true; break; }
+      case "--profile-mcp": f.profileMcpServers = true; break;
+      case "--no-profile-mcp": f.profileMcpServers = false; break;
       case "--env": {
         const v = val();
         const eq = v.indexOf("=");

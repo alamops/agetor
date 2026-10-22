@@ -374,3 +374,126 @@ test("plan routes 400 on a non-cursor (claude-code) task, before any runId/plan 
 
   db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
 });
+
+// --- 10. Plan mode: approve switches the task to Auto (plan §3.3, Q1 = a) ----
+
+const FLIP_STATUS = "plan approved — switched this task to Auto (force) so cursor can implement it";
+const BOUND_WARNING =
+  "plan approved, but this task's agent runs cursor in Plan mode — detach the agent or switch the mode to implement";
+
+test("approve on an unbound plan-mode task flips mode to auto BEFORE the approval message is sent", async () => {
+  const { id } = await newCursorTask({ mode: "plan" });
+  const { task } = await startAndDetect(id);
+  expect(task.mode).toBe("plan");
+  const plan = task.plans[0]!;
+  const planRunId = task.runId!;
+
+  // The approval's `user` event is emitted synchronously from the follow-up
+  // turn's spawn — read the persisted mode at that exact moment.
+  const { subscribe } = await import("./orchestrator.ts");
+  let modeWhenSent: string | null | undefined;
+  const unsubscribe = subscribe((e) => {
+    if (e.taskId === id && e.stream === "user" && e.data.includes("The plan is approved")) {
+      modeWhenSent = tasks.get(id)?.mode;
+    }
+  });
+  let res: Response;
+  try {
+    res = await call(`/tasks/${id}/plans/${plan.id}/approve`, { method: "POST" });
+  } finally {
+    unsubscribe();
+  }
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as Task & { warning?: string };
+  expect(body.mode).toBe("auto");
+  expect(body.warning).toBeUndefined();
+  expect(body.plans.find((p) => p.id === plan.id)!.status).toBe("approved");
+  expect(modeWhenSent).toBe("auto");
+  expect(tasks.get(id)!.mode).toBe("auto");
+
+  const events = runs.eventsForTask(id);
+  const flipLine = events.find((e) => e.stream === "status" && e.data === FLIP_STATUS);
+  expect(flipLine).toBeDefined();
+  // Lands on the run that produced the plan.
+  expect(flipLine!.runId).toBe(planRunId);
+  expect(events.some((e) => e.data === BOUND_WARNING)).toBe(false);
+  // Auto can read the plan file — the plan is not embedded.
+  const approvalEvent = events.find(
+    (e) => e.stream === "user" && e.data.includes("The plan is approved"),
+  )!;
+  expect(approvalEvent.data).not.toContain("--- Approved plan ---");
+
+  await settle();
+  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+});
+
+test("approve on a profile-bound plan-mode task keeps plan, warns, and embeds the plan", async () => {
+  const { id } = await newCursorTask({ mode: "plan" });
+  const { task } = await startAndDetect(id);
+  const plan = task.plans[0]!;
+  const planRunId = task.runId!;
+  // Bound after the first run — the binding alone is what keeps Plan.
+  tasks.setAgentProfile(id, "synthetic-profile-1", null);
+
+  const res = await call(`/tasks/${id}/plans/${plan.id}/approve`, { method: "POST" });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as Task & { warning?: string };
+  expect(body.mode).toBe("plan");
+  expect(body.warning).toBe(BOUND_WARNING);
+  expect(body.plans.find((p) => p.id === plan.id)!.status).toBe("approved");
+  expect(tasks.get(id)!.mode).toBe("plan");
+
+  const events = runs.eventsForTask(id);
+  const warningLine = events.find((e) => e.stream === "status" && e.data === BOUND_WARNING);
+  expect(warningLine).toBeDefined();
+  expect(warningLine!.runId).toBe(planRunId);
+  expect(events.some((e) => e.data === FLIP_STATUS)).toBe(false);
+  const approvalEvent = events.find(
+    (e) => e.stream === "user" && e.data.includes("The plan is approved"),
+  );
+  expect(approvalEvent).toBeDefined();
+  expect(approvalEvent!.data).toContain("--- Approved plan ---");
+  expect(approvalEvent!.data).toContain(FAKE_PLAN_MARKDOWN);
+
+  await settle();
+  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+});
+
+test("approve on an ask-mode task keeps ask with no warning or mode status line", async () => {
+  const { id } = await newCursorTask({ mode: "ask" });
+  const { task } = await startAndDetect(id);
+  const plan = task.plans[0]!;
+
+  const res = await call(`/tasks/${id}/plans/${plan.id}/approve`, { method: "POST" });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as Task & { warning?: string };
+  expect(body.mode).toBe("ask");
+  expect(body.warning).toBeUndefined();
+
+  const events = runs.eventsForTask(id);
+  expect(events.some((e) => e.data === FLIP_STATUS || e.data === BOUND_WARNING)).toBe(false);
+
+  await settle();
+  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+});
+
+test("a plan-mode approve whose message is not delivered reverts the mode and adds no status line", async () => {
+  const { id } = await newCursorTask({ mode: "plan" });
+  const { task } = await startAndDetect(id);
+  const plan = task.plans[0]!;
+  // A run row naming a harness that doesn't resolve makes `sendInput` refuse
+  // (`unknown agent kind`) after the route already flipped the mode.
+  db.run(`UPDATE runs SET agent = 'synthetic-missing-harness' WHERE id = ?`, [task.runId!]);
+
+  const res = await call(`/tasks/${id}/plans/${plan.id}/approve`, { method: "POST" });
+  expect(res.status).toBe(409);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("approval message not delivered");
+
+  const after = tasks.get(id)!;
+  expect(after.mode).toBe("plan");
+  expect(after.plans.find((p) => p.id === plan.id)!.status).toBe("pending");
+  expect(runs.eventsForTask(id).some((e) => e.data === FLIP_STATUS)).toBe(false);
+
+  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+});

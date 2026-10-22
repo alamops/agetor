@@ -239,13 +239,17 @@ export const USAGE: Record<string, string> = {
 
   Register a project folder (shown in the new-task workdir picker).`,
 
-  "harness add": `usage: agetor harness add <id> --label <label> [--kind claude-code] [--home <abs>] [--bin <abs>] [--env KEY=VAL …]
+  "harness add": `usage: agetor harness add <id> --label <label> [--kind claude-code] [--home <abs>] [--bin <abs>] [--env KEY=VAL …] [--profile-mcp | --no-profile-mcp]
 
-  Create an agent harness — an alias, or a parallel account via a per-harness $HOME.`,
+  Create an agent harness — an alias, or a parallel account via a per-harness $HOME.
+  --profile-mcp / --no-profile-mcp (fx only; default on): load the MCP servers
+  from your own fx profile into each task's session (fx 0.0.14+). Last flag wins.`,
 
-  "harness edit": `usage: agetor harness edit <id> [--label …] [--home <abs>|none] [--bin <abs>|none] [--env KEY=VAL …]
+  "harness edit": `usage: agetor harness edit <id> [--label …] [--home <abs>|none] [--bin <abs>|none] [--env KEY=VAL …] [--profile-mcp | --no-profile-mcp]
 
-  Update a harness; pass 'none' to clear --home / --bin.`,
+  Update a harness; pass 'none' to clear --home / --bin. --profile-mcp /
+  --no-profile-mcp (fx only) toggles loading your fx profile's MCP servers —
+  also accepted on a built-in harness.`,
 
   "harness shell": `usage: agetor harness shell <id>
 

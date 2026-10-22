@@ -654,3 +654,58 @@ test("logs --rebuild: a compaction_summary event prints ONE summary› digest li
   ]);
   expect(outputs.join("\n")).not.toContain("Secret middle line");
 });
+
+// --- fx 0.0.14 tool metadata + failed recovery (docs/plans/fx-0.0.14-and-cursor-updates.md §3.6) ---
+
+test("logs --rebuild: an fx internal tool_use/tool_result pair prints nothing; the visible tool around it still prints", async () => {
+  outputs.length = 0;
+  const events: RunEvent[] = [
+    { runId: "run1", taskId: "t1", stream: "tool_use", data: JSON.stringify({ id: "call_a", name: "capability_search", input: {}, internal: true }), ts: 1 },
+    { runId: "run1", taskId: "t1", stream: "tool_result", data: JSON.stringify({ toolUseId: "call_a", content: "ok", isError: false, internal: true }), ts: 2 },
+    { runId: "run1", taskId: "t1", stream: "tool_use", data: JSON.stringify({ id: "call_b", name: "shell", input: { cmd: "ls" } }), ts: 3 },
+    { runId: "run1", taskId: "t1", stream: "tool_result", data: JSON.stringify({ toolUseId: "call_b", content: "a", isError: false }), ts: 4 },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toEqual(["▸ shell", "  ↳ result"]);
+  expect(outputs.join("\n")).not.toContain("capability_search");
+});
+
+test("logs --rebuild --json: fx internal tool events are still emitted raw", async () => {
+  outputs.length = 0;
+  const internalUse: RunEvent = {
+    runId: "run1", taskId: "t1", stream: "tool_use",
+    data: JSON.stringify({ id: "call_a", name: "capability_search", input: {}, internal: true }), ts: 1,
+  };
+  currentClient = makeClient([internalUse]);
+  await cmdLogs(["t1", "--rebuild"], jsonFlags);
+  expect(outputs).toEqual([JSON.stringify(internalUse)]);
+});
+
+test("logs --rebuild: an MCP tool_use prints its 'server · tool' label as-is", async () => {
+  outputs.length = 0;
+  const events: RunEvent[] = [
+    {
+      runId: "run1", taskId: "t1", stream: "tool_use",
+      data: JSON.stringify({ id: "call_m", name: "docs-server · search_pages", title: "mcp_call", mcp: { server: "docs-server", tool: "search_pages" }, input: {} }),
+      ts: 1,
+    },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toEqual(["▸ docs-server · search_pages"]);
+});
+
+test("logs --rebuild: a 'failed' fx-recovery sentinel prints no yellow progress line; the driver's plain summary status line prints", async () => {
+  outputs.length = 0;
+  const message = "⚠ Connection lost · retrying request in 4s · attempt 3/3";
+  const summary = `${message} — fx stopped retrying this response.`;
+  const events: RunEvent[] = [
+    fxRecoveryEvent({ state: "failed", kind: "auto_retry", cause: "connectivity_lost", attempt: 3, attemptLimit: 3, message }, 1),
+    { runId: "run1", taskId: "t1", stream: "status", data: summary, ts: 2 },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toEqual([`• ${summary}`]);
+  expect(outputs.join("\n")).not.toContain(FX_RECOVERY_STATUS_PREFIX);
+});

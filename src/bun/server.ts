@@ -31,7 +31,7 @@ import { refreshOne } from "./usage/poller.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
-import { activeRunCount, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { activeRunCount, appendRunStatusLine, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
 import { claudeConfigDirsToScan, claudeSessionLivenessCheckedAt, refreshClaudeSessionLiveness, scanClaudeSessions } from "./claude-session-scan.ts";
 import { claudeSessionScanOptions, flushPendingClaudeSessionsNotice } from "./claude-session-launch.ts";
@@ -6859,8 +6859,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
 
       // Approve-route ordering: claim (`approvalsInFlight`) → checks (task /
       // kind / plan-pending / runId / worktree-presence, all read from ONE
-      // fresh `task` snapshot) → write (plan file to disk) → send (the
-      // approval message into the live session) → persist (`approvePlan` +
+      // fresh `task` snapshot) → write (plan file to disk) → flip (an unbound
+      // plan-mode task to auto; reverted if the send below doesn't deliver)
+      // → send (the approval message into the live session) → persist (`approvePlan` +
       // `tasks.update`, still against that same snapshot) → release the claim
       // in `finally`. See the finding-by-finding notes below for why each
       // step is where it is.
@@ -6956,22 +6957,67 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             let message = edited
               ? `The plan is approved with edits by the user — the approved version is saved at ${relPath}. Read it and follow that version; it supersedes your original plan. Good to go.`
               : `The plan is approved — proceed with the implementation. It is also saved at ${relPath} for reference.`;
-            // ask-mode is propose-only and may not be able to read the file
-            // back off disk headlessly — embed the full effective content
-            // inline so the agent has it regardless. `null` mode means auto
-            // (buildCommand's convention).
-            if (task.mode === "ask") {
+            // Plan mode (`cursor-agent --mode plan`) is read-only, so an
+            // approved plan could never be implemented in it: an unbound task
+            // is switched to Auto (force) right before the approval message
+            // goes out — the follow-up turn re-reads `task.mode` at spawn, so
+            // it runs with `--force` and can read the plan file. Flipped
+            // here, AFTER the plan file was written (a failed write must not
+            // leave a flipped mode behind) and through a direct
+            // `tasks.update`, never the PATCH route. A profile-bound task
+            // keeps Plan — its mode belongs to the agent profile (PATCH 409s
+            // it) — and gets a warning instead. Plan §3.3 (Q1 = a).
+            const flipToAuto = task.mode === "plan" && task.agentProfileId === null;
+            const boundPlanWarning =
+              task.mode === "plan" && !flipToAuto
+                ? "plan approved, but this task's agent runs cursor in Plan mode — detach the agent or switch the mode to implement"
+                : null;
+            // ask-mode — and plan-mode when it stays plan — is propose-only
+            // and may not be able to read the file back off disk headlessly —
+            // embed the full effective content inline so the agent has it
+            // regardless. `null` mode means auto (buildCommand's convention).
+            if (task.mode === "ask" || boundPlanWarning !== null) {
               message += `\n\n--- Approved plan ---\n\n${content}`;
             }
 
-            const sendResult = await sendInput(task.runId, message);
+            // Undo the flip when the approval never reached the agent: the
+            // plan stays pending, so the task must stay in the mode it was
+            // in. Only reverted while the mode is still the `auto` this
+            // request wrote — a concurrent edit wins.
+            const revertFlip = () => {
+              if (flipToAuto && tasks.get(task.id)?.mode === "auto") {
+                tasks.update(task.id, { mode: task.mode });
+              }
+            };
+            if (flipToAuto) tasks.update(task.id, { mode: "auto" });
+            let sendResult: Awaited<ReturnType<typeof sendInput>>;
+            try {
+              sendResult = await sendInput(task.runId, message);
+            } catch (err) {
+              revertFlip();
+              throw err;
+            }
             if (!sendResult.delivered) {
+              revertFlip();
               // The file is already written but nothing was sent — leave the
               // plan pending so the user can retry the approve action.
               return json(
                 { error: `approval message not delivered: ${sendResult.reason}` },
                 { status: 409, headers: corsHeaders(req) },
               );
+            }
+            // Breadcrumbs on the run that produced the plan (settled, so no
+            // live chunk handler) — only once the approval was delivered, so
+            // a failed send never leaves a line claiming the plan was
+            // approved.
+            if (flipToAuto) {
+              appendRunStatusLine(
+                task.id,
+                task.runId,
+                "plan approved — switched this task to Auto (force) so cursor can implement it",
+              );
+            } else if (boundPlanWarning !== null) {
+              appendRunStatusLine(task.id, task.runId, boundPlanWarning);
             }
 
             // The message is now delivered and cannot be un-sent — every
@@ -7008,7 +7054,13 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
                 { status: 404, headers: corsHeaders(req) },
               );
             }
-            return json(updated, { headers: corsHeaders(req) });
+            // `warning` is additive on the Task payload (a bound plan-mode
+            // task that keeps Plan); every other approve answers the plain
+            // Task as before.
+            return json(
+              boundPlanWarning !== null ? { ...updated, warning: boundPlanWarning } : updated,
+              { headers: corsHeaders(req) },
+            );
           } finally {
             approvalsInFlight.delete(key);
           }

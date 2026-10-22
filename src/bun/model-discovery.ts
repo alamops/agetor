@@ -74,14 +74,22 @@ function discoveryTargets(): HarnessTarget[] {
  */
 let previousSnapshot: Map<string, string> | null = null;
 
-// Hashes `id` *and* `efforts` (joined, in reported order) per model, not
-// just `id` — a catalog whose ids are unchanged but whose per-model
-// discovered effort sets changed (e.g. codex's `model/list` starts/stops
-// reporting `ultra` for an id already in the cache) must still be treated
+// Hashes `id`, `label`, `efforts` (in reported order) and the fx speed
+// flags (`fast`, `ultrafast`) per model, not just `id` — a catalog whose ids
+// are unchanged but whose per-model data changed (codex's `model/list`
+// starts/stops reporting `ultra` for an id already in the cache; fx 0.0.14's
+// `models[]` flips an id's `fast` flag or renames it) must still be treated
 // as a change and publish `agent_models_changed`, since that's the only
-// signal that drives a picker refetch.
+// signal that drives a picker refetch. Each model is an array tuple, so a
+// label containing a separator can't collide with another model's fields.
 function snapshotKey(models: DiscoveredModel[]): string {
-  return JSON.stringify(models.map((m) => `${m.id}:${(m.efforts ?? []).join(",")}`));
+  return JSON.stringify(models.map((m) => [
+    m.id,
+    m.label ?? null,
+    m.efforts ?? [],
+    m.fast === true,
+    m.ultrafast === true,
+  ]));
 }
 
 function modelsForHarness(harnessId: string, kind: AgentKind): DiscoveredModel[] {

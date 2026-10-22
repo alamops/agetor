@@ -530,7 +530,8 @@ test("fx status --json auth:missing with fx 0.0.8's real auth_help sentence -> l
 // no `auth_expired` on a non-expired probe), so these are non-regression
 // fixtures pinning the exact 0.0.10 field set (`build_revision` bumped to
 // "1210c2756ea8") against production code that reads only
-// `auth`/`auth_help`/`auth_expired`/`auth_refreshable`.
+// `auth`/`auth_help`/`auth_expired`/`auth_refreshable` (plus
+// `permission_mode`, read since the 0.0.14 work — see below).
 
 function fx010StatusPayload(auth: string, extra: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -589,13 +590,171 @@ test("fx status --json 0.0.10 auth:missing with fx 0.0.10's real auth_help sente
   );
 });
 
-test("fx status --json 0.0.10 payload with permission_mode:\"yolo\" (the live full-access probe's on-wire value, full-access -> yolo) -> probeStatus ignores permission_mode, loggedIn unaffected", async () => {
+test("fx status --json 0.0.10 payload with permission_mode:\"yolo\" (the live full-access probe's on-wire value, full-access -> yolo) -> surfaced as fxProfilePermissionMode, loggedIn unaffected", async () => {
   const payload = fx010StatusPayload("AI_GATEWAY_API_KEY", { permission_mode: "yolo" });
   process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.10", `echo '${payload}'\n  exit 0`);
   const status = await checkAgent("fx");
   expect(status.available).toBe(true);
   expect(status.loggedIn).toBe(true);
   expect(status.authHelp).toBeNull();
+  expect(status.fxProfilePermissionMode).toBe("yolo");
+});
+
+// --- fx status --json 0.0.14: permission_mode -> fxProfilePermissionMode ----
+// 0.0.14's `status --json` reports `permission_mode` as the
+// FX_PERMISSION_MODE env override, else the saved `~/.fx/settings.json`
+// profile value, else "auto" (plan P5). The probe strips FX_PERMISSION_MODE
+// so the field reflects the profile, and the value drives the "fx starts in
+// Ask" hint. The payload below is the 0.0.10 field set plus the four fields
+// 0.0.14 adds (mode, modes, effort, ultrafast_requested); their values are
+// illustrative — production code never reads them.
+
+function fx014StatusPayload(extra: Record<string, unknown> = {}): string {
+  const payload: Record<string, unknown> = {
+    kind: "status",
+    model: "spacexai/grok-4.7",
+    update_channel: "stable",
+    build_channel: "stable",
+    build_revision: "1a070af32cdf",
+    auth: "AI_GATEWAY_API_KEY",
+    auth_refreshable: false,
+    permission_mode: "auto",
+    mode: "auto",
+    modes: ["ask", "auto", "full-access"],
+    effort: "auto",
+    ultrafast_requested: false,
+    workspace: "/Users/dev/project",
+    history_turns: 0,
+    session_permission_grants: 0,
+    agent_step_limit: 0,
+    mcp: { connection_check: "not_checked", servers: [], configuration_issues: [], inspection_error: null },
+    ...extra,
+  };
+  for (const [k, v] of Object.entries(payload)) if (v === undefined) delete payload[k];
+  return JSON.stringify(payload);
+}
+
+test('fx 0.0.14 status --json permission_mode:"ask" -> fxProfilePermissionMode "ask", login state unaffected', async () => {
+  const payload = fx014StatusPayload({ permission_mode: "ask", mode: "ask" });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.version).toBe("0.0.14");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+  expect(status.fxProfilePermissionMode).toBe("ask");
+});
+
+test('fx 0.0.14 status --json permission_mode:"auto" -> fxProfilePermissionMode "auto"', async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", `echo '${fx014StatusPayload()}'\n  exit 0`);
+  expect((await checkAgent("fx")).fxProfilePermissionMode).toBe("auto");
+});
+
+test("fx status --json without permission_mode (absent field) -> fxProfilePermissionMode null", async () => {
+  const payload = fx014StatusPayload({ permission_mode: undefined });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.fxProfilePermissionMode).toBeNull();
+});
+
+test("fx status --json permission_mode that isn't a non-empty string -> fxProfilePermissionMode null", async () => {
+  for (const value of ["", 42, null, ["ask"]]) {
+    __testing.clearStatusCache();
+    const payload = fx014StatusPayload({ permission_mode: value });
+    process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", `echo '${payload}'\n  exit 0`);
+    expect((await checkAgent("fx")).fxProfilePermissionMode).toBeNull();
+  }
+});
+
+test("fx status --json failed probes (empty, non-JSON, non-zero exit) -> fxProfilePermissionMode null, loggedIn still fail-open null", async () => {
+  const askPayload = fx014StatusPayload({ permission_mode: "ask" });
+  for (const body of [`exit 0`, `echo 'not json'\n  exit 0`, `echo '${askPayload}'\n  exit 1`]) {
+    __testing.clearStatusCache();
+    process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", body);
+    const status = await checkAgent("fx");
+    expect(status.available).toBe(true);
+    expect(status.loggedIn).toBeNull();
+    expect(status.authHelp).toBeNull();
+    expect(status.fxProfilePermissionMode).toBeNull();
+  }
+});
+
+test("fx status --json with an unparseable auth still reports permission_mode, and login stays fail-open (null)", async () => {
+  const payload = fx014StatusPayload({ auth: undefined, permission_mode: "ask" });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBeNull();
+  expect(status.fxProfilePermissionMode).toBe("ask");
+});
+
+test("fx status --json auth:missing still carries permission_mode beside the logged-out state", async () => {
+  const payload = fx014StatusPayload({ auth: "missing", auth_help: "Run fx login", permission_mode: "ask" });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(false);
+  expect(status.authHelp).toBe("Run fx login");
+  expect(status.fxProfilePermissionMode).toBe("ask");
+});
+
+test("fx status probe runs WITHOUT FX_PERMISSION_MODE, even when both agetor's env and the harness env map set it", async () => {
+  // The stub records its env, then answers like real 0.0.14 would: the env
+  // override when FX_PERMISSION_MODE is set, else the saved profile ("ask").
+  const envDir = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-env-"));
+  const envFile = path.join(envDir, "status-env");
+  const prevProcessMode = process.env.FX_PERMISSION_MODE;
+  process.env.FX_PERMISSION_MODE = "yolo";
+  try {
+    process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned(
+      "0.0.14",
+      `env > "${envFile}"\n`
+        + `  mode="\${FX_PERMISSION_MODE:-ask}"\n`
+        + `  printf '{"auth":"AI_GATEWAY_API_KEY","permission_mode":"%s"}\\n' "$mode"\n`
+        + `  exit 0`,
+    );
+    const harness: Harness = {
+      ...builtin("fx"),
+      id: "fx-env-strip",
+      env: { FX_PERMISSION_MODE: "yolo", AGETOR_TEST_MARKER: "kept" },
+    };
+    const status = await checkHarness(harness);
+    expect(status.loggedIn).toBe(true);
+    expect(status.fxProfilePermissionMode).toBe("ask");
+    const recorded = readFileSync(envFile, "utf8").split("\n");
+    expect(recorded.some((line) => line.startsWith("FX_PERMISSION_MODE="))).toBe(false);
+    // Only that one variable is stripped — the rest of the harness env still
+    // reaches the probe.
+    expect(recorded).toContain("AGETOR_TEST_MARKER=kept");
+  } finally {
+    if (prevProcessMode === undefined) delete process.env.FX_PERMISSION_MODE;
+    else process.env.FX_PERMISSION_MODE = prevProcessMode;
+    rmSync(envDir, { recursive: true, force: true });
+  }
+});
+
+test("a non-fx kind reports fxProfilePermissionMode null", async () => {
+  process.env.AGETOR_CODEX_BIN = "/bin/echo";
+  const status = await checkAgent("codex");
+  expect(status.available).toBe(true);
+  expect(status.fxProfilePermissionMode).toBeNull();
+});
+
+test("a wrong 'fx' binary (fails the --help marker) reports fxProfilePermissionMode null even when status --json answers", async () => {
+  sandbox = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-wrong-"));
+  const bin = path.join(sandbox, "fx");
+  writeFileSync(
+    bin,
+    `#!/bin/sh\n`
+      + `if [ "$1" = "--version" ]; then echo "1.0.0"; exit 0; fi\n`
+      + `if [ "$1" = "--help" ]; then echo "a JSON viewer"; exit 0; fi\n`
+      + `if [ "$1" = "status" ]; then echo '{"auth":"ok","permission_mode":"ask"}'; exit 0; fi\n`
+      + `exit 1\n`,
+    { mode: 0o755 },
+  );
+  process.env.AGETOR_FX_BIN = bin;
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(false);
+  expect(status.fxProfilePermissionMode).toBeNull();
 });
 
 // --- fx status cache (getCachedStatus / statusCache in agent-status.ts) ----
@@ -607,7 +766,7 @@ test("fx status --json 0.0.10 payload with permission_mode:\"yolo\" (the live fu
 
 /**
  * Plant a fake `fx` binary that satisfies the --version/--help dual probe and
- * answers `status <anything>` with a fixed `{"auth":"ok"}", appending one line
+ * answers `status <anything>` with a fixed `{"auth":"ok","permission_mode":"ask"}`, appending one line
  * to `counterFile` per invocation so tests can assert spawn counts.
  */
 function plantFakeFxStatusCountingBin(counterFile: string): string {
@@ -618,7 +777,7 @@ function plantFakeFxStatusCountingBin(counterFile: string): string {
     `#!/bin/sh\n`
       + `if [ "$1" = "--version" ]; then echo "0.0.6"; exit 0; fi\n`
       + `if [ "$1" = "--help" ]; then echo "Fast, native coding agent for the terminal"; exit 0; fi\n`
-      + `if [ "$1" = "status" ]; then\n  echo x >> "${counterFile}"\n  echo '{"auth":"ok"}'\n  exit 0\nfi\n`
+      + `if [ "$1" = "status" ]; then\n  echo x >> "${counterFile}"\n  echo '{"auth":"ok","permission_mode":"ask"}'\n  exit 0\nfi\n`
       + `exit 1\n`,
     { mode: 0o755 },
   );
@@ -642,8 +801,11 @@ test("checkHarness memoizes fx status --json: a second call within the TTL doesn
 
     const first = await checkHarness(harness);
     expect(first.loggedIn).toBe(true);
+    expect(first.fxProfilePermissionMode).toBe("ask");
     const second = await checkHarness(harness);
     expect(second.loggedIn).toBe(true);
+    // The cached value carries the permission mode too.
+    expect(second.fxProfilePermissionMode).toBe("ask");
 
     expect(countInvocations(counterFile)).toBe(1);
   } finally {

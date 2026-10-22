@@ -16,7 +16,7 @@ import path from "node:path";
 import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
-import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
+import { FX_USAGE_STATUS_PREFIX, SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import {
   DEATH_JSONL_QUIET_MS,
   DEATH_MISS_THRESHOLD,
@@ -51,6 +51,16 @@ import {
  * the prompt is delivered as a positional argv element, never piped via
  * stdin and never string-interpolated into the `sh -c` command. See
  * `spawnCursorViaTmux` for the exact quoting-safe hosting pattern.
+ *
+ * Verified on cursor-agent 2026.10.22-27dcf5f: headless `-p --trust --mode
+ * plan` and `--mode ask` run in an untrusted dir with no MCP-approval stall;
+ * the stream carries `thinking` events (`subtype: "delta"` with a `text`
+ * fragment, then `subtype: "completed"`, no id of their own — several blocks
+ * per turn), a `result.usage` object (`inputTokens`/`outputTokens`/
+ * `cacheReadTokens`/`cacheWriteTokens`), and a `tool_call` payload whose
+ * inner keys are the tool (`globToolCall`, `readToolCall`, …) plus
+ * bookkeeping siblings (`hookAdditionalContexts`, `toolCallId`,
+ * `startedAtMs`, `completedAtMs`) in no guaranteed order.
  */
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -113,7 +123,45 @@ interface CursorEvent {
   message?: { content?: CursorMessageBlock[]; [k: string]: unknown };
   is_error?: boolean;
   result?: string;
+  /** `thinking/delta` fragment. */
+  text?: unknown;
+  /** `result` token counts (cursor-agent 2026.10.x). */
+  usage?: unknown;
   [k: string]: unknown;
+}
+
+/** Per-run mapper state threaded into `mapCursorEvent`. Holds the open
+ *  `thinking` block: cursor streams reasoning as many `thinking/delta`
+ *  fragments, which are coalesced into ONE `thinking` chunk per block rather
+ *  than one transcript row per fragment. `firstLineIndex` (the block's first
+ *  delta line) keys the flushed chunk, so a reattach replay from offset 0 —
+ *  which rebuilds the ctx and re-walks the same lines — derives the same
+ *  `line_uuid`. */
+export interface CursorMapCtx {
+  thinking: { firstLineIndex: number; text: string } | null;
+}
+
+export function createCursorMapCtx(): CursorMapCtx {
+  return { thinking: null };
+}
+
+/** Emit the open thinking block (if any) and close it. Called when the block
+ *  completes, when any other event type arrives mid-block (before that
+ *  event's own chunks, so wire order holds), and when the turn settles with a
+ *  block still open. A whitespace-only block emits nothing. */
+export function flushCursorThinking(ctx: CursorMapCtx, onChunk: ChunkHandler): void {
+  const block = ctx.thinking;
+  if (!block) return;
+  ctx.thinking = null;
+  if (block.text.trim()) onChunk("thinking", block.text, `cursor:thinking:${block.firstLineIndex}`);
+}
+
+/** The `result.usage` fields cursor-agent reports, mirrored onto the shared
+ *  usage sentinel's `turn` body. */
+const CURSOR_USAGE_FIELDS = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"] as const;
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
 /** Result of mapping one event line. `done` is set when the event terminates
@@ -131,22 +179,35 @@ export interface CursorMapResult {
   assistantTextEmitted?: true;
 }
 
+/** Sibling keys cursor-agent puts next to the tool key inside the inner
+ *  `tool_call` payload — never the tool's name. */
+const CURSOR_TOOL_CALL_BOOKKEEPING_KEYS = new Set([
+  "hookAdditionalContexts",
+  "toolCallId",
+  "startedAtMs",
+  "completedAtMs",
+]);
+
 /** Best-effort tool name for generic rendering — the `tool_call` envelope's
- *  inner `tool_call` payload shape is explicitly unstable (plan §2). We
- *  first look for a known string-valued name field (`name` / `tool` /
- *  `tool_name`, the shapes cursor-agent is documented to use), and only
- *  fall back to "first key of the object" when none is present — otherwise
- *  a payload shaped `{name: "shellToolCall", args: {...}}` would render the
- *  literal string "name" rather than the tool's actual name. */
+ *  inner `tool_call` payload shape is explicitly unstable (plan §2). In
+ *  order: the first key ending in `ToolCall` (cursor-agent's live shape,
+ *  `{globToolCall: {...}, hookAdditionalContexts, toolCallId, startedAtMs}`,
+ *  whatever the key order), then a string-valued `name` / `tool` /
+ *  `tool_name` field (so `{name: "shellToolCall", args}` doesn't render the
+ *  literal "name"), then the first key that isn't a bookkeeping sibling,
+ *  then `"tool_call"`. The orchestrator's `detectCursorPlan` relies on this
+ *  resolving `createPlanToolCall`. */
 function bestEffortToolName(toolCall: unknown): string {
-  if (toolCall && typeof toolCall === "object" && !Array.isArray(toolCall)) {
-    const obj = toolCall as Record<string, unknown>;
+  if (isPlainObject(toolCall)) {
+    const keys = Object.keys(toolCall);
+    const toolKey = keys.find((k) => k.endsWith("ToolCall"));
+    if (toolKey) return toolKey;
     for (const field of ["name", "tool", "tool_name"]) {
-      const value = obj[field];
+      const value = toolCall[field];
       if (typeof value === "string" && value.length > 0) return value;
     }
-    const keys = Object.keys(obj);
-    if (keys.length > 0) return keys[0]!;
+    const firstKey = keys.find((k) => !CURSOR_TOOL_CALL_BOOKKEEPING_KEYS.has(k));
+    if (firstKey) return firstKey;
   }
   return "tool_call";
 }
@@ -180,10 +241,20 @@ function assistantText(message: CursorEvent["message"]): string {
  * pure-tool-call turns whose narration shows up nowhere else. Defaults to
  * `false` so callers that don't care (most tests) don't have to pass it.
  *
+ * `ctx` carries the per-run thinking accumulator (see `CursorMapCtx`). With
+ * it, `thinking/delta` fragments coalesce into one `thinking` chunk per
+ * block, flushed on `thinking/completed` or by the next non-thinking event
+ * (before that event's own chunks). Without it every delta is emitted as its
+ * own one-fragment block and `thinking/completed` emits nothing — callers
+ * that map isolated lines keep working.
+ *
  * line_uuid scheme:
  *   - `tool_call:<call_id>:<subtype>` for `tool_call` events — the subtype
  *     suffix keeps `started` and `completed` (same call_id) from colliding
  *     under the `(run_id, line_uuid)` unique index.
+ *   - `cursor:thinking:<firstLineIndex>` for a thinking block (the line of
+ *     its first delta).
+ *   - `cursor:usage:<lineIndex>` for the `result.usage` sentinel.
  *   - `cursor:<lineIndex>` for everything else.
  */
 export function mapCursorEvent(
@@ -191,9 +262,31 @@ export function mapCursorEvent(
   onChunk: ChunkHandler,
   lineIndex: number,
   priorAssistantText: boolean = false,
+  ctx?: CursorMapCtx,
 ): CursorMapResult {
   const type = evt.type ?? "";
   const sessionId = typeof evt.session_id === "string" ? evt.session_id : undefined;
+
+  if (type === "thinking") {
+    const subtype = evt.subtype ?? "";
+    if (subtype === "delta") {
+      const text = typeof evt.text === "string" ? evt.text : "";
+      if (!ctx) {
+        if (text.trim()) onChunk("thinking", text, `cursor:thinking:${lineIndex}`);
+      } else if (ctx.thinking) {
+        ctx.thinking.text += text;
+      } else {
+        ctx.thinking = { firstLineIndex: lineIndex, text };
+      }
+    } else if (subtype === "completed" && ctx) {
+      flushCursorThinking(ctx, onChunk);
+    }
+    // Any other thinking subtype: silent forward-compat, block left as is.
+    return { sessionId };
+  }
+  // Any other event closes an open block first, so the reasoning lands
+  // ahead of whatever this event renders.
+  if (ctx) flushCursorThinking(ctx, onChunk);
 
   switch (type) {
     case "system": {
@@ -259,6 +352,20 @@ export function mapCursorEvent(
       if (!priorAssistantText && typeof evt.result === "string" && evt.result.length > 0) {
         onChunk("assistant", evt.result, `cursor:${lineIndex}`);
       }
+      // Token counts ride the shared usage sentinel (`{turn: {...}}`, the
+      // same body fx's prompt result uses), emitted here — before the caller
+      // acts on `done` — so it's persisted on this run and feeds the run-row
+      // usage chip. Finite numbers only; nothing when none survive.
+      if (isPlainObject(evt.usage)) {
+        const turn: Record<string, number> = {};
+        for (const field of CURSOR_USAGE_FIELDS) {
+          const value = evt.usage[field];
+          if (typeof value === "number" && Number.isFinite(value)) turn[field] = value;
+        }
+        if (Object.keys(turn).length > 0) {
+          onChunk("status", FX_USAGE_STATUS_PREFIX + JSON.stringify({ turn }), `cursor:usage:${lineIndex}`);
+        }
+      }
       return { sessionId, done: isError ? 1 : 0 };
     }
 
@@ -294,6 +401,10 @@ interface CursorSessionState {
    *  there's no mid-run reset to worry about — even a reattach replay from
    *  offset 0 recomputes this correctly as it re-walks the log in order. */
   assistantTextEmitted: boolean;
+  /** Mapper state (the open thinking block) for this run's log. Created
+   *  fresh with the state, so a reattach replay from offset 0 rebuilds it
+   *  line by line and derives the same `cursor:thinking:<n>` keys. */
+  mapCtx: CursorMapCtx;
   watcher: FSWatcher | null;
   pollTimer: ReturnType<typeof setInterval> | null;
   deathTimer: ReturnType<typeof setInterval> | null;
@@ -361,7 +472,8 @@ function flushCursorLog(state: CursorSessionState): void {
       // Not JSON — cursor-agent shouldn't emit this under
       // `--output-format stream-json`, but surface it rather than drop it
       // (could be a launch error from the shell wrapper, e.g. "command not
-      // found").
+      // found"). An open thinking block is flushed first so order holds.
+      flushCursorThinking(state.mapCtx, dedupedOnChunk(state));
       state.onChunk("stderr", trimmed, undefined);
       state.nextLineIndex++;
       continue;
@@ -371,16 +483,26 @@ function flushCursorLog(state: CursorSessionState): void {
   }
 }
 
-function dispatchCursorEvent(state: CursorSessionState, evt: CursorEvent): void {
-  // Wrap onChunk to apply the seenLineUuids dedup (idempotent reattach replay).
-  const onChunk: ChunkHandler = (stream, data, lineUuid) => {
+/** `state.onChunk` behind the seenLineUuids dedup (idempotent reattach
+ *  replay). */
+function dedupedOnChunk(state: CursorSessionState): ChunkHandler {
+  return (stream, data, lineUuid) => {
     if (lineUuid) {
       if (state.seenLineUuids.has(lineUuid)) return;
       state.seenLineUuids.add(lineUuid);
     }
     state.onChunk(stream, data, lineUuid);
   };
-  const result = mapCursorEvent(evt, onChunk, state.nextLineIndex, state.assistantTextEmitted);
+}
+
+function dispatchCursorEvent(state: CursorSessionState, evt: CursorEvent): void {
+  const result = mapCursorEvent(
+    evt,
+    dedupedOnChunk(state),
+    state.nextLineIndex,
+    state.assistantTextEmitted,
+    state.mapCtx,
+  );
   if (result.assistantTextEmitted) state.assistantTextEmitted = true;
   if (result.sessionId && !state.sessionIdSent) {
     state.sessionIdSent = true;
@@ -394,6 +516,9 @@ function dispatchCursorEvent(state: CursorSessionState, evt: CursorEvent): void 
 
 function resolveCursorDone(state: CursorSessionState, code: number): void {
   if (state.resolved) return;
+  // A stream that ended mid-block (crash, kill, no `result`) still keeps its
+  // reasoning. A no-op when the block was already flushed.
+  flushCursorThinking(state.mapCtx, dedupedOnChunk(state));
   state.resolved = true;
   disposeCursorState(state);
   cursorSessions.delete(state.taskId);
@@ -473,6 +598,9 @@ function startCursorTailer(state: CursorSessionState): Promise<number> {
         // decide clean-exit vs death before resolving.
         setTimeout(() => {
           flushCursorLog(state);
+          // Flush a still-open thinking block ahead of the exit/death lines
+          // below so the transcript keeps wire order.
+          if (!state.resolved) flushCursorThinking(state.mapCtx, dedupedOnChunk(state));
           // If the final flush surfaced a terminal event (`result`),
           // resolveCursorDone already fired — this was an orderly finish, not a
           // death, so don't emit the "session ended" sentinel.
@@ -637,6 +765,7 @@ export async function spawnCursorViaTmux(opts: CursorLaunchOptions): Promise<Spa
     partial: "",
     nextLineIndex: 0,
     assistantTextEmitted: false,
+    mapCtx: createCursorMapCtx(),
     watcher: null,
     pollTimer: null,
     deathTimer: null,
@@ -725,6 +854,7 @@ export async function reattachCursorSession(opts: CursorReattachOptions): Promis
     partial: "",
     nextLineIndex: 0,
     assistantTextEmitted: false, // recomputed correctly as the replay from offset 0 re-walks the log in order
+    mapCtx: createCursorMapCtx(),
     watcher: null,
     pollTimer: null,
     deathTimer: null,

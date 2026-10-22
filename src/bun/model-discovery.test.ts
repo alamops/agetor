@@ -407,6 +407,63 @@ test("refreshHarnessModels: an efforts-only catalog change (same ids, different 
   }
 });
 
+/* ── snapshot key hashes fx 0.0.14 labels and speed flags too ────────────── */
+
+/** An fx 0.0.14 `models --json` envelope with a single `models[]` entry. */
+function fx0014ModelsBin(entry: Record<string, unknown>): string {
+  const body = JSON.stringify({ kind: "models", count: 1, ids: [entry.id], models: [entry] });
+  return plantFakeFxModelsBin(`if [ "$1" = "models" ] && [ "$2" = "--json" ]; then echo '${body}'; exit 0; fi\nexit 1`);
+}
+
+test("refreshHarnessModels: an fx flag-only change (same id, label and efforts; fast/ultrafast flipped) publishes agent_models_changed, and a label-only change does too", async () => {
+  resetAll();
+  const events: AppEvent[] = [];
+  const unsubscribe = subscribeAppEvents((e) => events.push(e));
+  const ourChange = () =>
+    events.some((e) => e.type === "agent_models_changed" && e.harnessIds.includes(created.id));
+  const created = insertFxHarness({ id: "fx-flag-only-change" });
+  const base = { id: "vendor/flagged", name: "Flagged", efforts: ["low", "high"], fast: false, ultrafast: false };
+  try {
+    // First publish: the non-empty catalog counts as changed.
+    await withFxBin(fx0014ModelsBin(base), async () => {
+      await scheduler.refreshHarnessModels(created.id);
+    });
+    expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([
+      { id: "vendor/flagged", label: "Flagged", efforts: ["low", "high", "auto"] },
+    ]);
+    expect(ourChange()).toBe(true);
+    events.length = 0;
+
+    // Only `fast` flips -> publishes.
+    await withFxBin(fx0014ModelsBin({ ...base, fast: true }), async () => {
+      await scheduler.refreshHarnessModels(created.id);
+    });
+    expect(ourChange()).toBe(true);
+    events.length = 0;
+
+    // Only `ultrafast` flips -> publishes.
+    await withFxBin(fx0014ModelsBin({ ...base, fast: true, ultrafast: true }), async () => {
+      await scheduler.refreshHarnessModels(created.id);
+    });
+    expect(ourChange()).toBe(true);
+    events.length = 0;
+
+    // Identical output -> not published again.
+    await withFxBin(fx0014ModelsBin({ ...base, fast: true, ultrafast: true }), async () => {
+      await scheduler.refreshHarnessModels(created.id);
+    });
+    expect(ourChange()).toBe(false);
+
+    // Only the display name changes -> publishes.
+    await withFxBin(fx0014ModelsBin({ ...base, name: "Flagged (renamed)", fast: true, ultrafast: true }), async () => {
+      await scheduler.refreshHarnessModels(created.id);
+    });
+    expect(ourChange()).toBe(true);
+  } finally {
+    unsubscribe();
+  }
+});
+
 /* ── getHarnessModelMap ───────────────────────────────────────────────────── */
 
 test("getHarnessModelMap: ready mirrors isDiscoveryReady() — false before any refresh, true after", async () => {

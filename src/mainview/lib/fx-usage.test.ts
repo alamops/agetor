@@ -147,6 +147,21 @@ test("fxUsageTitle: used/size renders the exact, comma-grouped numbers", () => {
   expect(fxUsageTitle({ used: 1234, size: 128000 })).toContain("1,234/128,000 tokens");
 });
 
+test("fxUsageTitle: wording is harness-neutral (cursor feeds the same sentinel)", () => {
+  expect(fxUsageTitle({ used: 1234, size: 128000 })).toBe("usage: 1,234/128,000 tokens");
+  expect(fxUsageTitle({ used: 1234, size: 128000 })).not.toContain("fx");
+});
+
+test("fxUsageTitle: a cursor-shaped turn-only payload (no cost, no reasoning) titles cleanly", () => {
+  const usage = { turn: { inputTokens: 1200, outputTokens: 34, cacheReadTokens: 5000, cacheWriteTokens: 0 } };
+  expect(fxUsageTitle(usage)).toBe("turn: in 1200 · out 34 · cache read 5000 · cache write 0");
+  expect(fxUsageChipText(usage)).toBe("↑1.2k ↓34");
+});
+
+test("fxUsageTitle: no cost (fx 0.0.14's usage_update) leaves the segment bare", () => {
+  expect(fxUsageTitle({ used: 10, size: 100 })).toBe("usage: 10/100 tokens");
+});
+
 test("fxUsageTitle: merged used/size + turn appends the turn segment", () => {
   const title = fxUsageTitle({
     used: 1234,

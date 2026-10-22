@@ -1784,8 +1784,11 @@ export const api = {
    *  auto-sends an approval message that resumes the agent.
    *  `retry: false` — like `sendRunInput`, a replay would re-send a
    *  duplicate approval message to a live agent session. */
+  /** Resolves to the updated Task. A profile-bound cursor task in Plan mode
+   *  (which the route can't switch to Auto) additionally carries `warning`,
+   *  the same line the route writes to the transcript. */
   approvePlan: (taskId: string, planId: string) =>
-    j<Task>(`/tasks/${encodeURIComponent(taskId)}/plans/${encodeURIComponent(planId)}/approve`, {
+    j<Task & { warning?: string }>(`/tasks/${encodeURIComponent(taskId)}/plans/${encodeURIComponent(planId)}/approve`, {
       method: "POST",
     }, { retry: false }),
 

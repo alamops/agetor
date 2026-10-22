@@ -3,6 +3,7 @@ import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { GlobalEvent, Task } from "../shared/types.ts";
+import { FX_PAUSED_SUMMARY_SUFFIX } from "../shared/fx-recovery.ts";
 
 // db.ts captures AGETOR_DATA_DIR at first import.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-fx-orch-"));
@@ -1027,7 +1028,7 @@ test("resumeFxRecovery: storm → paused → resume happy path — the resumed r
         e.stream === "status"
         && !e.data.startsWith(FX_RECOVERY_STATUS_PREFIX)
         && e.data.includes("recovery paused after 3/3 attempts")
-        && e.data.includes("resume once the limit clears, or send a new message."),
+        && e.data.endsWith(FX_PAUSED_SUMMARY_SUFFIX),
     ),
   ).toBe(true);
   expect(

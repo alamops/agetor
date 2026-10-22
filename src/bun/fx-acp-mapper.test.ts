@@ -5,8 +5,10 @@ import {
   extractFxProviderValue,
   fxRefusedStatusLine,
   isFxContextDiagnostic,
+  fxSpeedNotOfferedLine,
   mapFxUpdate,
   parseFxEffortOption,
+  parseFxSpeedOption,
 } from "./fx-acp.ts";
 import type { FxUpdateCtx } from "./fx-acp.ts";
 import {
@@ -15,7 +17,7 @@ import {
   FX_RECOVERY_STATUS_PREFIX,
 } from "../shared/types.ts";
 import type { FxRecoveryPayload } from "../shared/types.ts";
-import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
+import { FX_FAILED_SUMMARY_SUFFIX, FX_PAUSED_SUMMARY_SUFFIX, fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
 import { deriveTodoProgress } from "../shared/todo-progress.ts";
 import { SENT_FILES_TOOL_NAME, parseSentFilesToolUse } from "../shared/sent-files.ts";
 
@@ -325,6 +327,9 @@ describe("tool_call_update → held-tool review guidance (review_unavailable)", 
     expect(first[1]!.lineUuid).toBe("fx:run-H1:0");
     expect(first[1]!.data.startsWith("⚠ fx held this tool call")).toBe(true);
     expect(first[1]!.data).toContain("Switch this task's mode to Full access (or Ask)");
+    expect(first[1]!.data).toContain(
+      "or set FX_REVIEW_MODEL in this harness's environment (Settings → Harnesses) to a reviewer model your account can reach.",
+    );
     expect(ctx.reviewHeldWarned).toBe(true);
 
     const second = mapFxUpdate(
@@ -990,7 +995,7 @@ describe("session_info_update → FX_RECOVERY_STATUS_PREFIX sentinel (model resp
 
     const summary = fxRecoverySummaryLine(pausedPayload);
     expect(summary).not.toBeNull();
-    expect(summary).toContain(" — resume once the limit clears, or send a new message.");
+    expect(summary!.endsWith(FX_PAUSED_SUMMARY_SUFFIX)).toBe(true);
     expect(chunks[1]!.stream).toBe("status");
     expect(chunks[1]!.lineUuid).toBe("fx:run-R2:1");
     expect(chunks[1]!.data).toBe(summary as string);
@@ -1409,7 +1414,6 @@ describe("unknown / forward-compat sessionUpdate variants", () => {
     const variants = [
       "current_mode_update",
       "available_commands_update",
-      "user_message_chunk",
       "config_option_update",
       "some_future_variant_2026",
     ];
@@ -1770,5 +1774,249 @@ describe("parseFxEffortOption", () => {
       { id: "effort", currentValue: "max", options: [{ value: "max", name: "max" }] },
     ];
     expect(parseFxEffortOption(duplicated)).toEqual({ current: "low", values: ["low"] });
+  });
+});
+
+describe("notice (fx ≥0.0.14 ACP v1 Session Notice) → status line", () => {
+  test("info severity → plain `fx: <title>` status line with a fx:<runId>:<seq> lineUuid", () => {
+    const ctx = makeCtx("run-N1");
+    expect(mapFxUpdate({ sessionUpdate: "notice", severity: "info", title: "Loaded 3 skills" }, ctx)).toEqual([
+      { stream: "status", data: "fx: Loaded 3 skills", lineUuid: "fx:run-N1:0" },
+    ]);
+  });
+
+  test("warning and error severities are prefixed with ⚠", () => {
+    const ctx = makeCtx("run-N2");
+    const warning = mapFxUpdate(
+      { sessionUpdate: "notice", severity: "warning", title: "skill description \"x\" truncated" },
+      ctx,
+    );
+    expect(warning.map((c) => c.data)).toEqual(['⚠ fx: skill description "x" truncated']);
+    const error = mapFxUpdate({ sessionUpdate: "notice", severity: "error", title: "MCP server mini failed" }, ctx);
+    expect(error.map((c) => c.data)).toEqual(["⚠ fx: MCP server mini failed"]);
+  });
+
+  test("a missing severity reads as plain; the title is trimmed", () => {
+    const ctx = makeCtx("run-N3");
+    expect(mapFxUpdate({ sessionUpdate: "notice", title: "  hello  " }, ctx).map((c) => c.data)).toEqual([
+      "fx: hello",
+    ]);
+  });
+
+  test("a missing, non-string or blank title emits nothing and does not bump the seq counter", () => {
+    const ctx = makeCtx("run-N4");
+    expect(mapFxUpdate({ sessionUpdate: "notice", severity: "warning" }, ctx)).toEqual([]);
+    expect(mapFxUpdate({ sessionUpdate: "notice", severity: "warning", title: 7 }, ctx)).toEqual([]);
+    expect(mapFxUpdate({ sessionUpdate: "notice", severity: "warning", title: "   " }, ctx)).toEqual([]);
+    expect(ctx.current).toBe(0);
+  });
+});
+
+describe("tool_call `_meta.fx.toolCall` identity (fx ≥0.0.14)", () => {
+  test("an internal call stamps `internal: true` on the tool_use AND on its later tool_result (the meta only rides the tool_call)", () => {
+    const ctx = makeCtx("run-I1");
+    const use = mapFxUpdate(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc-int",
+        name: "capability_search",
+        title: "Search capabilities",
+        kind: "search",
+        status: "pending",
+        rawInput: { query: "browser" },
+        _meta: { fx: { toolCall: { internal: true } } },
+      },
+      ctx,
+    );
+    expect(use).toHaveLength(1);
+    expect(JSON.parse(use[0]!.data)).toEqual({
+      id: "tc-int",
+      name: "capability_search",
+      input: { query: "browser" },
+      serverSide: false,
+      title: "Search capabilities",
+      internal: true,
+    });
+    expect(ctx.internalToolIds?.has("tc-int")).toBe(true);
+
+    const result = mapFxUpdate(
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc-int",
+        status: "completed",
+        content: [{ type: "content", content: { type: "text", text: "found 2" } }],
+      },
+      ctx,
+    );
+    expect(result).toHaveLength(1);
+    expect(JSON.parse(result[0]!.data)).toEqual({
+      toolUseId: "tc-int",
+      content: [{ type: "content", content: { type: "text", text: "found 2" } }],
+      isError: false,
+      internal: true,
+    });
+  });
+
+  test("`internal: false` (fx's explicit default) and absent meta leave both payloads without an `internal` key", () => {
+    const ctx = makeCtx("run-I2");
+    const use = mapFxUpdate(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc-pub",
+        name: "shell",
+        title: "Run ls",
+        kind: "execute",
+        rawInput: { command: "ls" },
+        _meta: { fx: { toolCall: { internal: false } } },
+      },
+      ctx,
+    );
+    expect("internal" in JSON.parse(use[0]!.data)).toBe(false);
+    expect(ctx.internalToolIds?.has("tc-pub") ?? false).toBe(false);
+    const result = mapFxUpdate(
+      { sessionUpdate: "tool_call_update", toolCallId: "tc-pub", status: "completed", content: [] },
+      ctx,
+    );
+    expect("internal" in JSON.parse(result[0]!.data)).toBe(false);
+  });
+
+  test("a ctx with no internalToolIds set gets one created lazily on the first internal call", () => {
+    const ctx = makeCtx("run-I3");
+    expect(ctx.internalToolIds).toBeUndefined();
+    mapFxUpdate(
+      { sessionUpdate: "tool_call", toolCallId: "tc-lazy", name: "mcp_select_tool", _meta: { fx: { toolCall: { internal: true } } } },
+      ctx,
+    );
+    expect(ctx.internalToolIds).toBeInstanceOf(Set);
+    expect([...ctx.internalToolIds!]).toEqual(["tc-lazy"]);
+  });
+
+  test("an MCP call is labelled `server · tool`, keeps fx's human title as `title`, and carries `mcp` in the payload", () => {
+    const ctx = makeCtx("run-M1");
+    const use = mapFxUpdate(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc-mcp",
+        name: "mcp_mini_browser_eval",
+        title: "Evaluate JavaScript",
+        kind: "other",
+        status: "pending",
+        rawInput: { script: "1+1" },
+        _meta: { fx: { toolCall: { internal: false, mcp: { server: "mini", tool: "browser_eval" } } } },
+      },
+      ctx,
+    );
+    expect(JSON.parse(use[0]!.data)).toEqual({
+      id: "tc-mcp",
+      name: "mini · browser_eval",
+      input: { script: "1+1" },
+      serverSide: false,
+      title: "Evaluate JavaScript",
+      mcp: { server: "mini", tool: "browser_eval" },
+    });
+  });
+
+  test("an MCP call with no title moves fx's own name into `title`", () => {
+    const ctx = makeCtx("run-M2");
+    const use = mapFxUpdate(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc-mcp2",
+        name: "mcp_mini_browser_eval",
+        _meta: { fx: { toolCall: { internal: false, mcp: { server: "mini", tool: "browser_eval" } } } },
+      },
+      ctx,
+    );
+    const payload = JSON.parse(use[0]!.data);
+    expect(payload.name).toBe("mini · browser_eval");
+    expect(payload.title).toBe("mcp_mini_browser_eval");
+  });
+
+  test("a malformed `mcp` (missing or empty names) is ignored — the call keeps fx's own name", () => {
+    const ctx = makeCtx("run-M3");
+    for (const mcp of [{ server: "mini" }, { server: "", tool: "x" }, "mini/x", null]) {
+      const use = mapFxUpdate(
+        { sessionUpdate: "tool_call", toolCallId: "tc-bad", name: "shell", _meta: { fx: { toolCall: { mcp } } } },
+        ctx,
+      );
+      const payload = JSON.parse(use[0]!.data);
+      expect(payload.name).toBe("shell");
+      expect("mcp" in payload).toBe(false);
+    }
+  });
+});
+
+describe("user_message_chunk is always silent", () => {
+  test("plain, replayed and steered (`_meta.fx.steering`) user chunks emit nothing and leave the seq counter alone", () => {
+    const ctx = makeCtx("run-U1");
+    expect(
+      mapFxUpdate(
+        { sessionUpdate: "user_message_chunk", messageId: "u1", content: { type: "text", text: "do the thing" } },
+        ctx,
+      ),
+    ).toEqual([]);
+    expect(
+      mapFxUpdate(
+        {
+          sessionUpdate: "user_message_chunk",
+          messageId: "u2",
+          content: { type: "text", text: "also check the tests" },
+          _meta: { fx: { steering: "absorbed" } },
+        },
+        ctx,
+      ),
+    ).toEqual([]);
+    expect(ctx.current).toBe(0);
+  });
+});
+
+describe("terminal `failed` recovery state (fx 0.0.14) → one summary line", () => {
+  test("a live `failed` update emits its sentinel plus exactly one summary line; an identical repeat emits nothing", () => {
+    const ctx = makeCtx("run-F1");
+    const failedPayload: FxRecoveryPayload = {
+      state: "failed",
+      kind: "terminal_provider_error",
+      cause: "rate_limited",
+      action: "stopped",
+      attempt: 3,
+      attemptLimit: 10,
+      durable: true,
+      message: "⚠ Request limit reached · HTTP 429 · stopped after 3 attempts",
+    };
+    const update = { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: failedPayload } } };
+    const chunks = mapFxUpdate(update, ctx);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]!.data.startsWith(FX_RECOVERY_STATUS_PREFIX)).toBe(true);
+    expect(JSON.parse(chunks[0]!.data.slice(FX_RECOVERY_STATUS_PREFIX.length)).state).toBe("failed");
+    const summary = fxRecoverySummaryLine(failedPayload);
+    expect(summary).not.toBeNull();
+    expect(summary!.endsWith(FX_FAILED_SUMMARY_SUFFIX)).toBe(true);
+    expect(chunks[1]).toEqual({ stream: "status", data: summary!, lineUuid: "fx:run-F1:1" });
+
+    expect(mapFxUpdate(update, ctx)).toEqual([]);
+  });
+});
+
+describe("speed helpers (fx ≥0.0.13 fast / ≥0.0.14 ultrafast)", () => {
+  test("fxSpeedNotOfferedLine wording", () => {
+    expect(fxSpeedNotOfferedLine("fast", "deepseek/deepseek-v4-flash")).toBe(
+      "fx: Fast isn't offered for deepseek/deepseek-v4-flash — running without it",
+    );
+    expect(fxSpeedNotOfferedLine("ultrafast", "openai/gpt-5.2")).toBe(
+      "fx: Ultrafast isn't offered for openai/gpt-5.2 — running without it",
+    );
+  });
+
+  test("parseFxSpeedOption reads the `{id: tier}` entry's currentValue; absent → null; non-string → current null", () => {
+    const options = [
+      { id: "effort", currentValue: "auto" },
+      { id: "fast", currentValue: "true" },
+      { id: "ultrafast", currentValue: 1 },
+    ];
+    expect(parseFxSpeedOption(options, "fast")).toEqual({ current: "true" });
+    expect(parseFxSpeedOption(options, "ultrafast")).toEqual({ current: null });
+    expect(parseFxSpeedOption([{ id: "effort" }], "fast")).toBeNull();
+    expect(parseFxSpeedOption(undefined, "fast")).toBeNull();
+    expect(parseFxSpeedOption("nope", "ultrafast")).toBeNull();
   });
 });
