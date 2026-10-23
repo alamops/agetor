@@ -225,6 +225,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // claude-code (back-compat) when the harness list hasn't loaded yet or
   // the selected id was deleted out-of-band.
   const kind: AgentKind = selectedHarness?.kind ?? "claude-code";
+  // Latest kind for the mount-once preference seed below: the user can switch
+  // harness before `listPreferences()` resolves, and the seed must then fill
+  // the form from the kind now selected, not the kind at mount.
+  const kindRef = useRef(kind);
+  kindRef.current = kind;
   // workdir starts empty — the OS cwd / home is NOT auto-added as a project.
   // After the user picks (or adds) one and submits a task, we retain the value
   // so the next task pre-fills with the same project ("previous task's project
@@ -365,7 +370,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
       seed("gemini");
       seed("antigravity");
       seed("fx");
-      const active = agentCache.current[kind];
+      const active = agentCache.current[kindRef.current];
       setMode(active.mode);
       setModel(active.model);
       setEffort(active.effort);

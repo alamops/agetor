@@ -857,6 +857,8 @@ test("reconcileTaskSession drops the fx session and resets mode to the new kind'
     mode: "yolo", // valid for fx, invalid for gemini
     model: "zai/glm-4.7",
     effort: null,
+    // A tier gemini doesn't have (it only offers off) — reset with the rest.
+    speed: "ultrafast",
   });
   tasks.insert(before);
 
@@ -870,6 +872,8 @@ test("reconcileTaskSession drops the fx session and resets mode to the new kind'
   expect(updated.mode).toBe(AGENT_OPTIONS.gemini.modes[0]?.id ?? "auto");
   expect(updated.model).toBeNull();
   expect(updated.effort).toBeNull();
+  expect(updated.speed).toBe("off");
+  expect(updated.fast).toBe(false);
 });
 
 test("reconcileTaskSession resets mode to fx's own modes[0] when switching INTO fx from another kind", async () => {
@@ -915,6 +919,7 @@ test("reconcileTaskSession preserves mode/model/effort on a same-kind fx alias s
     mode: "yolo",
     model: "openai/gpt-5.2",
     effort: null,
+    speed: "fast",
   });
   tasks.insert(before);
 
@@ -925,6 +930,8 @@ test("reconcileTaskSession preserves mode/model/effort on a same-kind fx alias s
   // Same kind -> ids stay valid -> keep the picks.
   expect(updated.mode).toBe("yolo");
   expect(updated.model).toBe("openai/gpt-5.2");
+  // The speed tier is one of those picks: same kind, same lanes.
+  expect(updated.speed).toBe("fast");
 });
 
 test("reconcileOrphans has no reattach path for fx: a mid-boot running fx run always flips to orphaned, task back to ready", async () => {

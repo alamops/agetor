@@ -20,7 +20,9 @@ import { gotoApp } from "./helpers";
  *   never one row each — and the run row's usage chip.
  * - With `AGETOR_FAKE_CURSOR_PLAN=1` (its own fresh backend), approving the
  *   plan on an unbound plan-mode task flips the task to `auto` and posts the
- *   status line saying so.
+ *   status line saying so; on a profile-bound one the task keeps `plan`, the
+ *   approve response's warning shows as a toast and a status line, and the
+ *   plan is embedded in the approval message.
  */
 
 /** Literal copy of `FAKE_CURSOR_STREAM_PROMPT_MARKER` (src/bun/agents.ts) —
@@ -28,6 +30,8 @@ import { gotoApp } from "./helpers";
 const FAKE_CURSOR_STREAM_PROMPT_MARKER = "__agetor_fake_cursor_stream__";
 
 const PLAN_APPROVED_STATUS = "plan approved — switched this task to Auto (force) so cursor can implement it";
+const BOUND_PLAN_WARNING =
+  "plan approved, but this task's agent runs cursor in Plan mode — detach the agent or switch the mode to implement";
 
 function auth(backend: E2EBackend): { authorization: string } {
   return { authorization: `Bearer ${backend.apiToken}` };
@@ -250,6 +254,86 @@ test.describe("cursor plan approval (AGETOR_FAKE_CURSOR_PLAN=1)", () => {
     await expect.poll(async () => (await getTask(request, freshBackend, task.id)).mode, { timeout: 15_000 }).toBe("auto");
     await expect(panel.getByText(PLAN_APPROVED_STATUS, { exact: true })).toBeVisible({ timeout: 15_000 });
 
+    // The approval went out WITHOUT the plan embedded: Auto (force) can read
+    // the saved plan file, so only read-only modes get it inline.
+    let approval: string | undefined;
+    await expect
+      .poll(async () => {
+        approval = (await taskEvents(request, freshBackend, task.id)).find(
+          (e) => e.stream === "user" && e.data.includes("The plan is approved"),
+        )?.data;
+        return approval !== undefined;
+      })
+      .toBe(true);
+    expect(approval).not.toContain("--- Approved plan ---");
+
     await request.delete(`${freshBackend.apiBase}/tasks/${task.id}`, { headers: auth(freshBackend) });
+  });
+
+  // Q1 = a, bound branch: the mode belongs to the agent profile, so the task
+  // stays in Plan; the approve response's `warning` becomes a PlanDialog
+  // toast, the same text lands on the plan's run as a status line, and the
+  // plan is embedded in the approval message (plan mode can't be relied on
+  // to read the file back).
+  test("approving the plan on a profile-bound plan-mode task keeps plan and warns (toast + status line)", async ({
+    page,
+    request,
+    freshBackend,
+  }) => {
+    await setCursorEnabled(freshBackend, true);
+    const profileRes = await request.post(`${freshBackend.apiBase}/agent-profiles`, {
+      headers: auth(freshBackend),
+      data: { name: `Cursor Planner ${randomUUID().slice(0, 8)}`, harness: "cursor", model: "auto", mode: "plan" },
+    });
+    expect(profileRes.ok(), `POST /agent-profiles -> ${profileRes.status()}: ${await profileRes.text()}`).toBeTruthy();
+    const profile = (await profileRes.json()) as { id: string };
+
+    const title = `cursor-plan-approve-bound-e2e ${randomUUID()}`;
+    const createRes = await request.post(`${freshBackend.apiBase}/tasks`, {
+      headers: auth(freshBackend),
+      data: { title, prompt: title, agentProfileId: profile.id, isolation: "none", workdir: tmpdir() },
+    });
+    expect(createRes.ok(), `POST /tasks -> ${createRes.status()}: ${await createRes.text()}`).toBeTruthy();
+    const task = (await createRes.json()) as { id: string; mode: string; agent: string };
+    expect(task.agent).toBe("cursor");
+    expect(task.mode).toBe("plan");
+    const startRes = await request.post(`${freshBackend.apiBase}/tasks/${task.id}/start`, {
+      headers: auth(freshBackend),
+    });
+    expect(startRes.ok(), `POST /tasks/${task.id}/start -> ${startRes.status()}`).toBeTruthy();
+
+    await gotoApp(page, freshBackend.bootBase);
+    const panel = await openTask(page, title);
+    const planCard = panel.getByRole("button", { name: /Fake Plan.*View plan/ });
+    await expect(planCard).toBeVisible({ timeout: 15_000 });
+    await expect.poll(async () => (await getTask(request, freshBackend, task.id)).column, { timeout: 15_000 }).toBe(
+      "review",
+    );
+    await planCard.click();
+    const approve = page.getByRole("button", { name: "Approve Plan", exact: true });
+    await expect(approve).toBeVisible();
+    await approve.click();
+    await expect(approve).toBeHidden();
+
+    const toast = page.locator("[data-sonner-toast]").filter({ hasText: BOUND_PLAN_WARNING });
+    await expect(toast).toBeVisible({ timeout: 15_000 });
+    await expect(panel.getByText(BOUND_PLAN_WARNING, { exact: true })).toBeVisible({ timeout: 15_000 });
+    await expect(panel.getByText(PLAN_APPROVED_STATUS, { exact: true })).toHaveCount(0);
+
+    // The approval still went out — with the plan embedded — and the mode
+    // never moved off plan.
+    await expect
+      .poll(async () =>
+        (await taskEvents(request, freshBackend, task.id)).some(
+          (e) => e.stream === "user" && e.data.includes("--- Approved plan ---"),
+        ),
+      )
+      .toBe(true);
+    const after = await getTask(request, freshBackend, task.id);
+    expect(after.mode).toBe("plan");
+    expect(after.agentProfileId).toBe(profile.id);
+
+    await request.delete(`${freshBackend.apiBase}/tasks/${task.id}`, { headers: auth(freshBackend) });
+    await request.delete(`${freshBackend.apiBase}/agent-profiles/${profile.id}`, { headers: auth(freshBackend) });
   });
 });

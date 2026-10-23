@@ -19,10 +19,15 @@ import { gotoApp } from "./helpers";
  * curated variant table instead (`cursorModelSupportsFast`).
  *
  * Covered: the New Task form's picker per model and the Ultrafast cost hint;
- * the created task's stored `speed`; editing it in task details; cursor's
- * Off/Fast; an Ultrafast agent profile through Settings → Agents, the
- * task-bound profile details dialog, and a bundle export → import; and the
- * fake driver's "isn't offered" breadcrumb.
+ * the created task's stored `speed`; editing it in task details; the
+ * `lastSpeed:<kind>` pref seeding the next form; the §3.1 reset rules (fx
+ * drops a tier only on a user model change whose model lacks it, in the form
+ * and in task details; cursor clears Fast whenever the model/effort loses
+ * its variant); a stored fx tier the model doesn't offer kept as a disabled
+ * "(not offered)" segment; the profile lock; cursor's Off/Fast; an Ultrafast
+ * agent profile through Settings → Agents, the task-bound profile details
+ * dialog, and a bundle export → import; and the fake driver's "isn't
+ * offered" breadcrumb.
  */
 
 /** Literal copy of `FAKE_FX_SPEED_UNOFFERED_PROMPT_MARKER` (src/bun/agents.ts)
@@ -167,11 +172,38 @@ async function selectProject(form: Locator, projectName: string): Promise<void> 
   await row.click();
 }
 
-/** Asserts a `SpeedPicker` offers exactly `tiers` (in order) and none other. */
+/** The task-details Model `<select>` — see e2e/fx-models.spec.ts's identical
+ *  helper: the `<dd>` right after the `<dt>` holding the ↻ button. */
+function detailsModelSelect(panel: Locator): Locator {
+  return panel
+    .getByTestId("refresh-models-details")
+    .locator("xpath=ancestor::dt[1]/following-sibling::dd[1]")
+    .locator("select");
+}
+
+/** `[model, speed]` of a stored task, for polling a PATCH the UI fired. */
+async function modelAndSpeed(request: APIRequestContext, backend: E2EBackend, id: string): Promise<[string, string]> {
+  const task = await getTask(request, backend, id);
+  return [task.model as string, task.speed as string];
+}
+
+async function getPreferences(request: APIRequestContext, backend: E2EBackend): Promise<Record<string, string>> {
+  const res = await request.get(`${backend.apiBase}/preferences`, { headers: auth(backend) });
+  expect(res.ok(), `GET /preferences -> ${res.status()}`).toBeTruthy();
+  return (await res.json()) as Record<string, string>;
+}
+
+/** fx tiers come from this file's harness discovery, which can still be in
+ *  flight when a test runs alone (`--grep`) or on a loaded machine. */
+const DISCOVERY_TIMEOUT = 20_000;
+
+/** Asserts a `SpeedPicker` offers exactly `tiers` (in order) and none other.
+ *  Waits up to DISCOVERY_TIMEOUT for the count, so it doubles as the
+ *  discovery gate: before discovery an fx model's tiers are unknown. */
 async function expectTiers(picker: Locator, testId: string, tiers: string[]): Promise<void> {
-  await expect(picker).toBeVisible();
+  await expect(picker).toBeVisible({ timeout: DISCOVERY_TIMEOUT });
   const segments = picker.locator(`[data-testid^="${testId}-"]`);
-  await expect(segments).toHaveCount(tiers.length);
+  await expect(segments).toHaveCount(tiers.length, { timeout: DISCOVERY_TIMEOUT });
   for (const tier of tiers) await expect(picker.getByTestId(`${testId}-${tier}`)).toBeVisible();
 }
 
@@ -193,8 +225,35 @@ function launchSelect(container: Locator, label: string): Locator {
     .locator("xpath=following-sibling::*[1]//select");
 }
 
+/** The `last*:fx` prefs the New Task form test's submit writes. They live on
+ *  the worker-scoped backend, so a later spec file on the same worker would
+ *  inherit them; afterAll puts back what was there before. */
+const FX_FORM_PREF_KEYS = ["lastMode:fx", "lastModel:fx", "lastEffort:fx", "lastSpeed:fx", "lastMaxMode:fx"];
+/** Value to write back for a key that wasn't set before this file ran (there
+ *  is no preference DELETE): fx's own defaults. */
+const FX_FORM_PREF_DEFAULTS: Record<string, string> = {
+  "lastMode:fx": "yolo",
+  "lastModel:fx": DEEPSEEK,
+  "lastEffort:fx": "auto",
+  "lastSpeed:fx": "off",
+  "lastMaxMode:fx": "false",
+};
+let fxPrefsBefore: Record<string, string> = {};
+
+async function fetchPreferences(backend: E2EBackend): Promise<Record<string, string>> {
+  const res = await fetch(`${backend.apiBase}/preferences`, { headers: auth(backend) });
+  if (!res.ok) throw new Error(`GET /preferences -> ${res.status}: ${await res.text()}`);
+  return (await res.json()) as Record<string, string>;
+}
+
 test.describe("speed picker", () => {
   test.beforeAll(async ({ backend }) => {
+    const prefs = await fetchPreferences(backend);
+    fxPrefsBefore = {};
+    for (const key of FX_FORM_PREF_KEYS) {
+      const value = prefs[key];
+      if (value !== undefined) fxPrefsBefore[key] = value;
+    }
     await patchHarness(backend, "fx", { enabled: true });
     const dir = path.join(backend.dataDir, "speed-picker-e2e");
     mkdirSync(dir, { recursive: true });
@@ -226,6 +285,13 @@ test.describe("speed picker", () => {
       () => {},
     );
     await patchHarness(backend, "cursor", { enabled: false }).catch(() => {});
+    for (const key of FX_FORM_PREF_KEYS) {
+      await fetch(`${backend.apiBase}/preferences/${key}`, {
+        method: "PUT",
+        headers: { ...auth(backend), "content-type": "application/json" },
+        body: JSON.stringify({ value: fxPrefsBefore[key] ?? FX_FORM_PREF_DEFAULTS[key] }),
+      }).catch(() => {});
+    }
   });
 
   test("New Task form: tiers follow the discovered model — Off/Fast/Ultrafast, Off/Fast, none — and the task stores the pick", async ({
@@ -308,6 +374,238 @@ test.describe("speed picker", () => {
     await picker.getByTestId("task-speed-off").click();
     await expect(picker).toHaveAttribute("data-value", "off");
     await expect.poll(async () => (await getTask(request, backend, formTaskId)).speed).toBe("off");
+  });
+
+  // NewTaskForm writes `lastSpeed:<kind>` on submit (it replaced
+  // `lastFast:<kind>`) and seeds the next form from it. The first test's
+  // submit picked Ultrafast on GPT-6.1 Sol.
+  test("New Task form: the last fx pick is remembered (lastSpeed:fx) and seeds the next form", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    expect(formTaskId, "the New Task form test must run first").not.toBe("");
+    await expect
+      .poll(async () => {
+        const prefs = await getPreferences(request, backend);
+        return [prefs["lastSpeed:fx"], prefs["lastModel:fx"]];
+      })
+      .toEqual(["ultrafast", SOL]);
+    expect(Object.keys(await getPreferences(request, backend)).filter((k) => k.startsWith("lastFast:"))).toEqual([]);
+
+    await gotoApp(page, backend.bootBase);
+    const form = newTaskFormPanel(page);
+    await selectHarness(page, SPEED_HARNESS.label);
+    await expect(newTaskModelSelect(page)).toHaveValue(SOL);
+    const picker = form.getByTestId("new-task-speed");
+    await expectTiers(picker, "new-task-speed", ["off", "fast", "ultrafast"]);
+    await expect(picker).toHaveAttribute("data-value", "ultrafast");
+  });
+
+  // Plan §3.1: fx resets a tier only on a USER model change, and only when
+  // the new model's tiers are known and exclude it.
+  test("New Task form: an fx model change drops a tier the new model lacks and keeps one it has", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const form = newTaskFormPanel(page);
+    await selectHarness(page, SPEED_HARNESS.label);
+    const modelSelect = newTaskModelSelect(page);
+    // Discovery is in once the catalogOnly Sol row is listed.
+    await expect
+      .poll(async () => modelSelect.locator("option").allTextContents(), { timeout: 20_000 })
+      .toEqual(["DeepSeek V4 Flash", "GPT-5.2", "GPT-6.1 Sol"]);
+    const picker = form.getByTestId("new-task-speed");
+
+    await modelSelect.selectOption(SOL);
+    await picker.getByTestId("new-task-speed-ultrafast").click();
+    await expect(picker).toHaveAttribute("data-value", "ultrafast");
+
+    // GPT-5.2 has no Ultrafast lane → back to Off.
+    await modelSelect.selectOption(GPT52);
+    await expectTiers(picker, "new-task-speed", ["off", "fast"]);
+    await expect(picker).toHaveAttribute("data-value", "off");
+
+    // Fast survives a move to a model that also has it.
+    await picker.getByTestId("new-task-speed-fast").click();
+    await expect(picker).toHaveAttribute("data-value", "fast");
+    await modelSelect.selectOption(SOL);
+    await expectTiers(picker, "new-task-speed", ["off", "fast", "ultrafast"]);
+    await expect(picker).toHaveAttribute("data-value", "fast");
+
+    // DeepSeek offers no tier: reset to Off, so the picker is gone entirely
+    // (not a stale "Fast (not offered)" segment).
+    await modelSelect.selectOption(DEEPSEEK);
+    await expect(picker).toHaveCount(0);
+    await modelSelect.selectOption(SOL);
+    await expect(picker).toHaveAttribute("data-value", "off");
+  });
+
+  test("Task details (fx): a model change drops a tier the new model lacks and keeps one it has", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = `speed-details-model-change-e2e ${randomUUID()}`;
+    const task = await createTaskRest(
+      request,
+      backend,
+      { title, prompt: title, agent: SPEED_HARNESS.id, model: SOL, speed: "ultrafast" },
+      false,
+    );
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await panel.getByText("Task details", { exact: true }).click();
+    const picker = panel.getByTestId("task-speed");
+    // All three tiers listed ⇒ discovery for this harness is in.
+    await expectTiers(picker, "task-speed", ["off", "fast", "ultrafast"]);
+    await expect(picker).toHaveAttribute("data-value", "ultrafast");
+    const modelSelect = detailsModelSelect(panel);
+
+    await modelSelect.selectOption(GPT52);
+    await expect.poll(() => modelAndSpeed(request, backend, task.id)).toEqual([GPT52, "off"]);
+    await expectTiers(picker, "task-speed", ["off", "fast"]);
+    await expect(picker).toHaveAttribute("data-value", "off");
+
+    await picker.getByTestId("task-speed-fast").click();
+    await expect.poll(() => modelAndSpeed(request, backend, task.id)).toEqual([GPT52, "fast"]);
+    await modelSelect.selectOption(SOL);
+    await expect.poll(() => modelAndSpeed(request, backend, task.id)).toEqual([SOL, "fast"]);
+    await expect(picker).toHaveAttribute("data-value", "fast");
+
+    await modelSelect.selectOption(DEEPSEEK);
+    await expect.poll(() => modelAndSpeed(request, backend, task.id)).toEqual([DEEPSEEK, "off"]);
+    await expect(picker).toHaveCount(0);
+  });
+
+  // fx is never auto-cleared on load (its tiers come from discovery alone):
+  // a stored tier the model doesn't offer stays visible, disabled, until the
+  // user picks another one.
+  test("Task details (fx): a stored tier the model doesn't offer shows as a disabled '(not offered)' segment and is kept", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = `speed-details-not-offered-e2e ${randomUUID()}`;
+    const task = await createTaskRest(
+      request,
+      backend,
+      { title, prompt: title, agent: SPEED_HARNESS.id, model: DEEPSEEK, speed: "fast" },
+      false,
+    );
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await panel.getByText("Task details", { exact: true }).click();
+    // Wait for discovery (the catalogOnly Sol row only shows once it's in),
+    // so the "not offered" verdict below is against the real tier list.
+    await expect
+      .poll(async () => detailsModelSelect(panel).locator("option").allTextContents(), { timeout: 20_000 })
+      .toContain("GPT-6.1 Sol");
+
+    const picker = panel.getByTestId("task-speed");
+    await expect(picker).toHaveAttribute("data-value", "fast");
+    await expect(picker.locator('[data-testid^="task-speed-"]')).toHaveCount(2);
+    const stale = picker.getByTestId("task-speed-fast");
+    await expect(stale).toHaveText("Fast (not offered)");
+    await expect(stale).toBeDisabled();
+    await expect(stale).toHaveAttribute("aria-pressed", "true");
+    await expect(stale).toHaveAttribute("title", /isn't offered for this model/);
+    await expect(picker.getByTestId("task-speed-off")).toBeEnabled();
+    expect((await getTask(request, backend, task.id)).speed).toBe("fast");
+
+    await picker.getByTestId("task-speed-off").click();
+    await expect.poll(async () => (await getTask(request, backend, task.id)).speed).toBe("off");
+    // Off is the only tier left, so the row disappears.
+    await expect(picker).toHaveCount(0);
+  });
+
+  test("Task details: a profile-bound task's speed picker is locked like the other launch fields", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const profileRes = await request.post(`${backend.apiBase}/agent-profiles`, {
+      headers: auth(backend),
+      data: { name: `Locked Sol ${suffix}`, harness: SPEED_HARNESS.id, model: SOL, speed: "ultrafast" },
+    });
+    expect(profileRes.ok(), `POST /agent-profiles -> ${profileRes.status()}: ${await profileRes.text()}`).toBeTruthy();
+    const profile = (await profileRes.json()) as { id: string };
+    createdProfileIds.push(profile.id);
+    const title = `speed-details-locked-e2e ${randomUUID()}`;
+    const task = await createTaskRest(request, backend, { title, prompt: title, agentProfileId: profile.id }, false);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await panel.getByText("Task details", { exact: true }).click();
+    await expect(panel.getByTestId("task-agent-profile-open")).toBeVisible();
+    const picker = panel.getByTestId("task-speed");
+    await expectTiers(picker, "task-speed", ["off", "fast", "ultrafast"]);
+    await expect(picker).toHaveAttribute("data-value", "ultrafast");
+    for (const tier of ["off", "fast", "ultrafast"]) {
+      await expect(picker.getByTestId(`task-speed-${tier}`)).toBeDisabled();
+    }
+    // RunPanel also locks launch fields while a task is running/blocked; this
+    // task never started, so the profile is what disables the segments.
+    const stored = await getTask(request, backend, task.id);
+    expect(stored.column).toBe("backlog");
+    expect(stored.agentProfileId).toBe(profile.id);
+    expect(stored.speed).toBe("ultrafast");
+  });
+
+  test("New Task form (cursor): Fast is cleared when the model loses its Fast variant", async ({ page, backend }) => {
+    await patchHarness(backend, "cursor", { enabled: true });
+    try {
+      await gotoApp(page, backend.bootBase);
+      const form = newTaskFormPanel(page);
+      await selectHarness(page, "Cursor");
+      const modelSelect = newTaskModelSelect(page);
+      const picker = form.getByTestId("new-task-speed");
+
+      await modelSelect.selectOption("gpt-5.3-codex");
+      await picker.getByTestId("new-task-speed-fast").click();
+      await expect(picker).toHaveAttribute("data-value", "fast");
+
+      // Cursor's "Auto" model has no -fast variant.
+      await modelSelect.selectOption("auto");
+      await expect(picker).toHaveCount(0);
+
+      // Coming back does not restore Fast — it was cleared, not hidden.
+      await modelSelect.selectOption("gpt-5.3-codex");
+      await expectTiers(picker, "new-task-speed", ["off", "fast"]);
+      await expect(picker).toHaveAttribute("data-value", "off");
+    } finally {
+      await patchHarness(backend, "cursor", { enabled: false });
+    }
+  });
+
+  test("Task details (cursor): a model change that loses the Fast variant clears speed to off", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    await patchHarness(backend, "cursor", { enabled: true });
+    try {
+      const title = `speed-details-cursor-clear-e2e ${randomUUID()}`;
+      const task = await createTaskRest(
+        request,
+        backend,
+        { title, prompt: title, agent: "cursor", model: "gpt-5.3-codex", effort: "high", speed: "fast" },
+        false,
+      );
+      await gotoApp(page, backend.bootBase);
+      const panel = await openTask(page, title);
+      await panel.getByText("Task details", { exact: true }).click();
+      const picker = panel.getByTestId("task-speed");
+      await expectTiers(picker, "task-speed", ["off", "fast"]);
+      await expect(picker).toHaveAttribute("data-value", "fast");
+
+      await detailsModelSelect(panel).selectOption("auto");
+      await expect.poll(() => modelAndSpeed(request, backend, task.id)).toEqual(["auto", "off"]);
+      await expect(picker).toHaveCount(0);
+    } finally {
+      await patchHarness(backend, "cursor", { enabled: false });
+    }
   });
 
   test("cursor: a Fast-capable model offers Off/Fast, never Ultrafast", async ({ page, backend }) => {
