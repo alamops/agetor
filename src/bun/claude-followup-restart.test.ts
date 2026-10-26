@@ -114,7 +114,7 @@ test.skipIf(!HAVE_TMUX)("follow-up to a task whose session outlived the process 
       // inert here since AGETOR_CLAUDE_BIN=/bin/echo makes the launch a no-op.
       model: "claude-opus-4-7",
       effort: "medium",
-      fast: false,
+      speed: "off",
       maxMode: false,
       references: [],
       backlog: [], plans: [], draft: null,

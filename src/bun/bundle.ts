@@ -507,7 +507,7 @@ export async function commitBundleImport(
         model: a.model,
         effort: a.effort,
         mode: a.mode,
-        fast: a.fast,
+        speed: a.speed,
         maxMode: a.maxMode,
         instructions: a.instructions,
         skills: a.skills,

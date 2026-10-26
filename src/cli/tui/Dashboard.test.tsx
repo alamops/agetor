@@ -1568,3 +1568,36 @@ test("event stream: a compaction_summary event renders one summary› digest lin
   expect(frame).not.toContain("Hidden second paragraph");
   unmount();
 });
+
+// --- fx 0.0.14 internal tool calls (docs/plans/fx-0.0.14-and-cursor-updates.md §3.6) ---
+
+test("event stream: fx internal tool_use/tool_result rows are skipped; visible and MCP-labelled tools still render", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const push = onTaskEvents!;
+  push({ runId: "runA", taskId: "taskA", stream: "tool_use", data: JSON.stringify({ id: "call_i", name: "capability_search", input: {}, internal: true }), ts: 1 });
+  push({ runId: "runA", taskId: "taskA", stream: "tool_result", data: JSON.stringify({ toolUseId: "call_i", content: "secret-internal-output", internal: true }), ts: 2 });
+  push({ runId: "runA", taskId: "taskA", stream: "tool_use", data: JSON.stringify({ id: "call_v", name: "read_file", input: {} }), ts: 3 });
+  push({
+    runId: "runA", taskId: "taskA", stream: "tool_use",
+    data: JSON.stringify({ id: "call_m", name: "docs-server · search_pages", mcp: { server: "docs-server", tool: "search_pages" }, input: {} }),
+    ts: 4,
+  });
+  await wait(80);
+
+  const frame = lastFrame() ?? "";
+  expect(frame).not.toContain("capability_search");
+  expect(frame).toContain("▸ read_file");
+  expect(frame).toContain("▸ docs-server · search_pages");
+  // Only the visible tool_uses render a line — the internal result's "↳ result" row is gone too.
+  expect(frame).not.toContain("↳ result");
+  unmount();
+});

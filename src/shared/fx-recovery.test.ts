@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+  FX_FAILED_SUMMARY_SUFFIX,
+  FX_PAUSED_SUMMARY_SUFFIX,
+  FX_RECOVERY_STATES,
   fxAutoResumeCountdownText,
   fxRecoveryNoticeText,
   fxRecoverySummaryLine,
@@ -207,9 +210,51 @@ test("parseFxRecoveryMeta: an unknown state string falls back to \"active\"", ()
   expect(parseFxRecoveryMeta(update)).toEqual({ state: "active" });
 });
 
-test("parseFxRecoveryMeta: state \"cleared\" as an object-string (not the null shorthand) also falls back to \"active\" — only WIRE_OBJECT_STATES (active/paused/recovered) are accepted from the object form", () => {
+test("parseFxRecoveryMeta: state \"cleared\" as an object-string (not the null shorthand) also falls back to \"active\" — only WIRE_OBJECT_STATES (active/paused/recovered/failed) are accepted from the object form", () => {
   const update = { _meta: { fx: { modelResponseRecovery: { state: "cleared" } } } };
   expect(parseFxRecoveryMeta(update)).toEqual({ state: "active" });
+});
+
+// fx 0.0.11+: a `terminal_provider_error` whose action isn't `paused` goes
+// out as `state:"failed"` (fx-src `src/acp/types.zig` writeModelRecoveryInfoUpdate).
+test("parseFxRecoveryMeta: a 'failed' payload keeps state \"failed\" with every field preserved", () => {
+  const update = {
+    _meta: {
+      fx: {
+        modelResponseRecovery: {
+          state: "failed",
+          kind: "terminal_provider_error",
+          cause: "provider_unavailable",
+          action: "retrying_request",
+          requiredAction: "surface_stall",
+          attempt: 4,
+          attemptLimit: 10,
+          durable: false,
+          message: "⚠ Provider unavailable · kept failing at the same point · stopped",
+        },
+      },
+    },
+  };
+  expect(parseFxRecoveryMeta(update)).toEqual({
+    state: "failed",
+    kind: "terminal_provider_error",
+    cause: "provider_unavailable",
+    action: "retrying_request",
+    requiredAction: "surface_stall",
+    attempt: 4,
+    attemptLimit: 10,
+    durable: false,
+    message: "⚠ Provider unavailable · kept failing at the same point · stopped",
+  });
+});
+
+test("parseFxRecoveryMeta: a bare { state: \"failed\" } stays failed (never read as an in-progress retry)", () => {
+  expect(parseFxRecoveryMeta({ _meta: { fx: { modelResponseRecovery: { state: "failed" } } } }))
+    .toEqual({ state: "failed" });
+});
+
+test("FX_RECOVERY_STATES lists failed alongside the other four states", () => {
+  expect([...FX_RECOVERY_STATES]).toEqual(["active", "paused", "recovered", "failed", "cleared"]);
 });
 
 test("parseFxRecoveryMeta: a non-object, non-null modelResponseRecovery value yields undefined", () => {
@@ -263,6 +308,11 @@ test("parseFxRecoveryPayload: an invalid state string yields null", () => {
   expect(parseFxRecoveryPayload('{"state":"bogus"}')).toBeNull();
 });
 
+test('parseFxRecoveryPayload: a persisted {"state":"failed"} sentinel round-trips', () => {
+  const payload: FxRecoveryPayload = { state: "failed", kind: "terminal_provider_error", cause: "rate_limited" };
+  expect(parseFxRecoveryPayload(JSON.stringify(payload))).toEqual(payload);
+});
+
 test('parseFxRecoveryPayload: {"state":"cleared"} parses to the cleared payload', () => {
   expect(parseFxRecoveryPayload('{"state":"cleared"}')).toEqual({ state: "cleared" });
 });
@@ -307,6 +357,26 @@ test("fxRecoveryNoticeText: nothing known at all falls back to the generic notic
   expect(fxRecoveryNoticeText({ state: "active" })).toBe("⚠ Recovering model response");
 });
 
+test("fxRecoveryNoticeText: fx 0.0.11+ causes and actions get their labels", () => {
+  expect(fxRecoveryNoticeText({ state: "active", cause: "connectivity_lost", action: "waiting_for_connectivity" }))
+    .toBe("⚠ Connection lost · waiting for connection");
+  expect(fxRecoveryNoticeText({ state: "active", cause: "network_interrupted", action: "checking_liveness" }))
+    .toBe("⚠ Network interrupted · checking the connection");
+  expect(fxRecoveryNoticeText({ state: "active", cause: "compaction_prepared", action: "continuing_response" }))
+    .toBe("⚠ Context compacted · restarting response");
+  expect(fxRecoveryNoticeText({ state: "active", cause: "response_interrupted", action: "delivering_response" }))
+    .toBe("⚠ Response ended early · delivering saved response");
+});
+
+test("fxRecoveryNoticeText: failed composes from cause/action like any other non-recovered state", () => {
+  expect(fxRecoveryNoticeText({ state: "failed", cause: "provider_unavailable", attempt: 4, attemptLimit: 10 }))
+    .toBe("⚠ Provider unavailable · attempt 4/10");
+});
+
+test("fxRecoveryNoticeText: failed with nothing known says the response failed, not that it is recovering", () => {
+  expect(fxRecoveryNoticeText({ state: "failed" })).toBe("⚠ Model response failed");
+});
+
 test("fxRecoveryNoticeText: recovered without message composes \"succeeded on attempt N/M\"", () => {
   expect(fxRecoveryNoticeText({ state: "recovered", attempt: 3, attemptLimit: 10 }))
     .toBe("✓ recovered · succeeded on attempt 3/10");
@@ -329,15 +399,32 @@ test("fxRecoverySummaryLine: paused appends the fixed resume-or-message call to 
     message: "⚠ Rate limited · HTTP 429 · … · recovery paused after 10/10 attempts",
   };
   expect(fxRecoverySummaryLine(p)).toBe(
-    "⚠ Rate limited · HTTP 429 · … · recovery paused after 10/10 attempts — resume once the limit clears, or send a new message.",
+    "⚠ Rate limited · HTTP 429 · … · recovery paused after 10/10 attempts — fx paused this response; resume it, or send a new message.",
   );
 });
 
 test("fxRecoverySummaryLine: paused with a composed (message-less) notice still appends the call to action", () => {
   const p: FxRecoveryPayload = { state: "paused", cause: "rate_limited", action: "paused", attempt: 10, attemptLimit: 10 };
   expect(fxRecoverySummaryLine(p)).toBe(
-    "⚠ Rate limited · recovery paused · attempt 10/10 — resume once the limit clears, or send a new message.",
+    "⚠ Rate limited · recovery paused · attempt 10/10 — fx paused this response; resume it, or send a new message.",
   );
+});
+
+test("fxRecoverySummaryLine: the paused call to action no longer assumes a rate limit to wait out", () => {
+  expect(FX_PAUSED_SUMMARY_SUFFIX).not.toContain("limit");
+  expect(fxRecoverySummaryLine({ state: "paused" })).toBe(`⚠ Recovering model response${FX_PAUSED_SUMMARY_SUFFIX}`);
+});
+
+test("fxRecoverySummaryLine: failed appends that fx stopped retrying", () => {
+  const p: FxRecoveryPayload = {
+    state: "failed",
+    message: "⚠ Provider unavailable · kept failing at the same point · stopped",
+  };
+  expect(fxRecoverySummaryLine(p)).toBe(
+    "⚠ Provider unavailable · kept failing at the same point · stopped — fx stopped retrying this response.",
+  );
+  expect(fxRecoverySummaryLine({ state: "failed" })).toBe(`⚠ Model response failed${FX_FAILED_SUMMARY_SUFFIX}`);
+  expect(FX_FAILED_SUMMARY_SUFFIX).toBe(" — fx stopped retrying this response.");
 });
 
 test("fxRecoverySummaryLine: recovered is the notice text verbatim, no suffix", () => {
@@ -366,6 +453,16 @@ test("isFxRecoveryResumable: paused with requiredAction \"inspect_uncertain_tool
 
 test("isFxRecoveryResumable: paused with requiredAction \"change_request\" is not resumable", () => {
   expect(isFxRecoveryResumable({ state: "paused", requiredAction: "change_request" })).toBe(false);
+});
+
+test("isFxRecoveryResumable: paused with requiredAction \"surface_stall\" is not resumable", () => {
+  expect(isFxRecoveryResumable({ state: "paused", requiredAction: "surface_stall" })).toBe(false);
+});
+
+test("isFxRecoveryResumable: failed is never resumable, whatever its requiredAction", () => {
+  expect(isFxRecoveryResumable({ state: "failed" })).toBe(false);
+  expect(isFxRecoveryResumable({ state: "failed", requiredAction: "continue_later" })).toBe(false);
+  expect(isFxRecoveryResumable({ state: "failed", requiredAction: "surface_stall" })).toBe(false);
 });
 
 test("isFxRecoveryResumable: active/recovered/cleared are never resumable regardless of requiredAction", () => {
@@ -423,6 +520,32 @@ test("latestFxRecoveryByRun: an unparsable sentinel row is skipped without clear
   ];
   const result = latestFxRecoveryByRun(events);
   expect(result.get("r1")).toEqual({ state: "active", attempt: 1, attemptLimit: 3 });
+});
+
+test("latestFxRecoveryByRun: a trailing failed sentinel replaces an earlier pause and is never resumable", () => {
+  const events = [
+    sentinelRow("r1", { state: "active", attempt: 1, attemptLimit: 3 }),
+    sentinelRow("r1", { state: "paused", requiredAction: "continue_later", attempt: 3, attemptLimit: 3 }),
+    sentinelRow("r1", { state: "failed", kind: "terminal_provider_error", cause: "rate_limited" }),
+  ];
+  const latest = latestFxRecoveryByRun(events).get("r1");
+  expect(latest).toEqual({ state: "failed", kind: "terminal_provider_error", cause: "rate_limited" });
+  expect(isFxRecoveryResumable(latest)).toBe(false);
+});
+
+// The orchestrator's auto-resume gate (`latestResumableFxPause`) is exactly
+// `parseFxRecoveryPayload(<last sentinel body>)` then `isFxRecoveryResumable` —
+// this pins that composition for every terminal state a run can end on.
+test("auto-resume gate: only a continue_later pause schedules; failed and a stalled pause never do", () => {
+  const gate = (payload: FxRecoveryPayload): boolean => {
+    const row = sentinelRow("r1", payload);
+    return isFxRecoveryResumable(parseFxRecoveryPayload(row.data.slice(FX_RECOVERY_STATUS_PREFIX.length)));
+  };
+  expect(gate({ state: "paused", requiredAction: "continue_later" })).toBe(true);
+  expect(gate({ state: "failed" })).toBe(false);
+  expect(gate({ state: "failed", requiredAction: "continue_later", kind: "terminal_provider_error" })).toBe(false);
+  expect(gate({ state: "paused", requiredAction: "surface_stall" })).toBe(false);
+  expect(gate({ state: "recovered" })).toBe(false);
 });
 
 test("latestFxRecoveryByRun: empty input yields an empty map", () => {

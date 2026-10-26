@@ -811,7 +811,7 @@ async function launchStep(
     mode: profile.mode,
     model: profile.model,
     effort: profile.effort ?? defaultEffortFor(profile.harnessKind, profile.model, profile.harness),
-    fast: profile.fast,
+    speed: profile.speed,
     maxMode: profile.maxMode,
     agentProfileId: profile.id,
     agentProfile: profile,

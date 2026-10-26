@@ -67,7 +67,7 @@ function makeTaskRow(taskId: string, overrides: Partial<Task> = {}): Task {
     mode: null,
     model: null,
     effort: null,
-    fast: false,
+    speed: "off",
     maxMode: false,
     references: [],
     backlog: [],
@@ -107,6 +107,9 @@ function makeRun(taskId: string, overrides: Partial<Parameters<typeof runs.inser
 }
 
 function makeSnapshot(overrides: Partial<AgentProfileSnapshot> = {}): AgentProfileSnapshot {
+  // Mirrors `snapshotFromProfile`: `speed` plus its derived `fast`, which the
+  // db read path (`parseAgentProfileSnapshot`) always re-emits.
+  const speed = overrides.speed ?? "off";
   return {
     id: randomUUID(),
     name: "My Agent",
@@ -116,7 +119,8 @@ function makeSnapshot(overrides: Partial<AgentProfileSnapshot> = {}): AgentProfi
     model: "claude-opus-4-7",
     effort: "high",
     mode: "auto",
-    fast: false,
+    speed,
+    fast: speed !== "off",
     maxMode: false,
     instructions: "Be terse.",
     skills: ["foo", "bar"],
@@ -148,6 +152,7 @@ test("insert returns the full object with a UUID id and equal created/updated ti
   expect(created.model).toBe("claude-opus-4-7");
   expect(created.effort).toBeNull();
   expect(created.mode).toBeNull();
+  expect(created.speed).toBe("off");
   expect(created.fast).toBe(false);
   expect(created.maxMode).toBe(false);
   expect(created.instructions).toBe("");

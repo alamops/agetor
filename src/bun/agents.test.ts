@@ -14,6 +14,7 @@ import {
   type RunEventStream,
   type Task,
 } from "../shared/types.ts";
+import { FX_FAILED_SUMMARY_SUFFIX, FX_PAUSED_SUMMARY_SUFFIX } from "../shared/fx-recovery.ts";
 
 // agents.ts imports codex-tmux.ts/gemini-tmux.ts, both of which import
 // dataDir from db.ts — db.ts opens its sqlite connection at module-load
@@ -36,8 +37,15 @@ const {
   FAKE_FX_REPAUSE_PROMPT_MARKER,
   FAKE_FX_RECOVERY_URL_PROMPT_MARKER,
   FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER,
+  FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER,
+  FAKE_FX_SPEED_UNOFFERED_PROMPT_MARKER,
+  FAKE_FX_TOOL_META_PROMPT_MARKER,
+  FAKE_FX_STEER_PROMPT_MARKER,
+  FAKE_CURSOR_STREAM_PROMPT_MARKER,
   FAKE_CLAUDE_HANDOFF_PROMPT_MARKER,
+  buildFxLaunchOptions,
 } = await import("./agents.ts");
+const { FX_STEER_DROPPED_STATUS, fxSpeedNotOfferedLine } = await import("./fx-acp.ts");
 const { dataDir, tasks } = await import("./db.ts");
 
 beforeEach(() => {
@@ -72,6 +80,11 @@ afterEach(() => {
   delete process.env.AGETOR_FAKE_FX_RECOVERY_URL;
   delete process.env.AGETOR_FAKE_FX_RECOVERY;
   delete process.env.AGETOR_FAKE_FX_EFFORT_UNOFFERED;
+  delete process.env.AGETOR_FAKE_FX_RECOVERY_FAILED;
+  delete process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  delete process.env.AGETOR_FAKE_CURSOR_STREAM;
+  delete process.env.AGETOR_FAKE_CURSOR_PLAN;
+  delete process.env.AGETOR_CURSOR_DRIVER;
   delete process.env.AGETOR_CLAUDE_DRIVER;
 });
 
@@ -109,7 +122,7 @@ function alias(kind: AgentKind, opts: { home?: string; bin?: string; env?: Recor
 const claudeDefaults = { mode: "auto", model: "opus-4.7", effort: "high" } as const;
 const codexDefaults = { mode: "auto", model: "gpt-6-astra", effort: "high" } as const;
 // Cursor's effort rides inside the --model id (`cursorModelArg` composes
-// model + effort + fast into one string), not a separate flag.
+// model + effort + the Fast speed tier into one string), not a separate flag.
 const cursorDefaults = { mode: "auto", model: "grok-4.7", effort: "high" } as const;
 // Gemini has no effort flag at all (see MODEL_EFFORT_SUPPORT.gemini in
 // shared/types.ts) — buildCommand's gemini branch never reads opts.effort.
@@ -852,15 +865,57 @@ test("cursor with defaults emits -p --output-format stream-json --model grok-4.7
   ]);
 });
 
-test("cursor 'ask' mode emits no --force / --sandbox flags (propose-only — cursor can't execute headlessly)", () => {
+test("cursor 'ask' mode emits --mode ask --trust and no --force / --sandbox (read-only Q&A — cursor can't execute headlessly)", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "ask" });
   expect(cmd).toEqual([
     "cursor-agent",
     "-p", "--output-format", "stream-json",
     "--model", "grok-4.7-high",
+    "--mode", "ask",
+    "--trust",
   ]);
   expect(cmd).not.toContain("--force");
   expect(cmd).not.toContain("--sandbox");
+});
+
+test("cursor 'plan' mode emits --mode plan --trust after --model, and no --force / --sandbox", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "plan" });
+  expect(cmd).toEqual([
+    "cursor-agent",
+    "-p", "--output-format", "stream-json",
+    "--model", "grok-4.7-high",
+    "--mode", "plan",
+    "--trust",
+  ]);
+});
+
+test("cursor 'auto' mode keeps --force --sandbox disabled and never adds --trust or --mode", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "auto" });
+  expect(cmd).not.toContain("--trust");
+  expect(cmd).not.toContain("--mode");
+});
+
+test("cursor unknown mode id gets no mode flag, but --trust since nothing passes --force (house passthrough)", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "mystery-mode" });
+  expect(cmd).toEqual([
+    "cursor-agent",
+    "-p", "--output-format", "stream-json",
+    "--model", "grok-4.7-high",
+    "--trust",
+  ]);
+});
+
+test("cursor --trust lands before AGETOR_CURSOR_ARGS extras and before --resume", () => {
+  process.env.AGETOR_CURSOR_ARGS = "--verbose";
+  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "plan", resumeSessionId: "sess-2" });
+  expect(cmd.slice(-6)).toEqual(["--mode", "plan", "--trust", "--verbose", "--resume", "sess-2"]);
+});
+
+test("cursor non-auto mode with an AGETOR_CURSOR_ARGS --force gets no --trust (the argv already contains --force)", () => {
+  process.env.AGETOR_CURSOR_ARGS = "--force";
+  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "ask" });
+  expect(cmd).not.toContain("--trust");
+  expect(cmd.filter((a) => a === "--force")).toEqual(["--force"]);
 });
 
 test("cursor null mode defaults to auto (--force --sandbox disabled), house convention", () => {
@@ -939,36 +994,48 @@ test("cursor Gemini 4 Argon with null effort falls back to the high variant", ()
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-4-argon-high");
 });
 
-test("cursor Gemini 4 Argon ignores fast and maxMode (no fast variant, no Max Mode)", () => {
+test("cursor Gemini 4 Argon ignores speed fast and maxMode (no fast variant, no Max Mode)", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gemini-4-argon",
     effort: "high",
-    fast: true,
+    speed: "fast",
     maxMode: true,
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-4-argon-high");
 });
 
-test("cursor Gemini 3.8 Flash ignores fast and maxMode (no fast variant, no Max Mode)", () => {
+test("cursor Gemini 3.8 Flash ignores speed fast and maxMode (no fast variant, no Max Mode)", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gemini-3.8-flash",
     effort: "high",
-    fast: true,
+    speed: "fast",
     maxMode: true,
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.8-flash-high");
 });
 
-test("cursor fast toggle selects the Fast model variant when that effort supports it", () => {
+test("cursor speed fast selects the Fast model variant when that effort supports it", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gpt-5.6-sol",
     effort: "max",
-    fast: true,
+    speed: "fast",
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-5.6-sol-max-fast");
+});
+
+test("cursor speed off and ultrafast both launch the standard model variant (cursor has no Ultrafast tier)", () => {
+  for (const speed of ["off", "ultrafast", null, undefined] as const) {
+    const { cmd } = buildCommand(builtin("cursor"), "hi", {
+      ...cursorDefaults,
+      model: "gpt-5.6-sol",
+      effort: "max",
+      speed,
+    });
+    expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-5.6-sol-max");
+  }
 });
 
 test("cursor maxMode selects large context without changing reasoning effort", () => {
@@ -976,7 +1043,7 @@ test("cursor maxMode selects large context without changing reasoning effort", (
     ...cursorDefaults,
     model: "gpt-5.6-sol",
     effort: "high",
-    fast: true,
+    speed: "fast",
     maxMode: true,
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-5.6-sol[context=1m,effort=high,fast=true]");
@@ -986,18 +1053,18 @@ test("cursor maxMode is ignored for models without a large-context override", ()
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "composer-2.5",
-    fast: true,
+    speed: "fast",
     maxMode: true,
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("composer-2.5-fast");
 });
 
-test("cursor fast toggle is ignored for model/effort pairs without a fast variant", () => {
+test("cursor speed fast is ignored for model/effort pairs without a fast variant", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "claude-sonnet-5",
     effort: "max",
-    fast: true,
+    speed: "fast",
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("claude-sonnet-5-max");
 });
@@ -1006,7 +1073,7 @@ test("cursor model with no effort levels can still expose a fast variant", () =>
   const { cmd } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "composer-2.5",
-    fast: true,
+    speed: "fast",
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("composer-2.5-fast");
 });
@@ -1016,7 +1083,7 @@ test("cursor unknown model id passes through verbatim (house convention: unknown
     ...cursorDefaults,
     model: "cursor-mystery-9000",
     effort: "max",
-    fast: true,
+    speed: "fast",
   });
   const i = cmd.indexOf("--model");
   expect(i).toBeGreaterThan(-1);
@@ -1055,6 +1122,76 @@ test("AGETOR_CURSOR_ARGS extra args land after the mode flags and before --resum
     "--verbose", "--foo",
     "--resume", "sess-1",
   ]);
+});
+
+// ── fake cursor driver (plan §5 "Fake-driver seams") ──
+
+async function runFakeCursor(taskId: string, prompt: string, opts: Record<string, unknown> = {}) {
+  process.env.AGETOR_CURSOR_DRIVER = "fake";
+  const chunks: { stream: RunEventStream; data: string; lineUuid?: string }[] = [];
+  let sessionId: string | undefined;
+  const handle = await spawnAgent({
+    taskId,
+    runId: `run-${taskId}`,
+    harness: builtin("cursor"),
+    prompt,
+    cwd: "/tmp",
+    onChunk: (stream, data, lineUuid) => { chunks.push({ stream, data, lineUuid }); },
+    onSessionId: (id) => { sessionId = id; },
+    opts: { ...cursorDefaults, ...opts },
+  });
+  const code = await handle.done;
+  return { chunks, code, sessionId };
+}
+
+test("cursor stream marker: one thinking chunk per block (stable cursor:thinking:<line> keys), tool use/result named globToolCall, one assistant reply, one usage sentinel", async () => {
+  const { chunks, code, sessionId } = await runFakeCursor("task-cursor-stream-1", `go ${FAKE_CURSOR_STREAM_PROMPT_MARKER}`);
+  expect(code).toBe(0);
+  expect(sessionId).toBe("fake-cursor-session-task-cursor-stream-1");
+
+  expect(chunks.map((c) => [c.stream, c.lineUuid])).toEqual([
+    ["thinking", "cursor:thinking:2"],
+    ["tool_use", "tool_call:call-fake-stream-1\nfc_fake_stream_1:started"],
+    ["tool_result", "tool_call:call-fake-stream-1\nfc_fake_stream_1:completed"],
+    ["thinking", "cursor:thinking:8"],
+    ["assistant", "cursor:11"],
+    ["status", "cursor:usage:12"],
+  ]);
+  expect(chunks[0]!.data).toBe("Looking for the notes file first.");
+  expect(chunks[3]!.data).toBe("Found it. Answering now.");
+  expect(JSON.parse(chunks[1]!.data).name).toBe("globToolCall");
+  expect(chunks[4]!.data).toBe("The notes file is ./notes.txt.");
+  expect(chunks[5]!.data).toBe(
+    `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ turn: { inputTokens: 1200, outputTokens: 80, cacheReadTokens: 3400, cacheWriteTokens: 0 } })}`,
+  );
+});
+
+test("cursor stream env twin (AGETOR_FAKE_CURSOR_STREAM=1) drives the same turn without the marker", async () => {
+  process.env.AGETOR_FAKE_CURSOR_STREAM = "1";
+  const { chunks } = await runFakeCursor("task-cursor-stream-2", "go");
+  expect(chunks.filter((c) => c.stream === "thinking")).toHaveLength(2);
+  expect(chunks.filter((c) => c.lineUuid?.startsWith("cursor:usage:"))).toHaveLength(1);
+});
+
+test("cursor stream marker wins over AGETOR_FAKE_CURSOR_PLAN=1; the plan env still wins over the stream env twin", async () => {
+  process.env.AGETOR_FAKE_CURSOR_PLAN = "1";
+  const marked = await runFakeCursor("task-cursor-stream-3", `go ${FAKE_CURSOR_STREAM_PROMPT_MARKER}`);
+  expect(marked.chunks.some((c) => c.stream === "thinking")).toBe(true);
+  process.env.AGETOR_FAKE_CURSOR_STREAM = "1";
+  const unmarked = await runFakeCursor("task-cursor-stream-4", "go");
+  expect(unmarked.chunks.some((c) => c.stream === "thinking")).toBe(false);
+  expect(JSON.parse(unmarked.chunks.find((c) => c.stream === "tool_use")!.data).name).toBe("createPlanToolCall");
+});
+
+test("fake cursor without the stream marker/env is unchanged: no thinking, no usage sentinel", async () => {
+  const { chunks, code } = await runFakeCursor("task-cursor-plain-1", "go");
+  expect(code).toBe(0);
+  expect(chunks.map((c) => c.data)).toEqual(["fake response to: go", "turn complete"]);
+});
+
+test("fake cursor accepts plan mode (the run's opening mode= breadcrumb reads the task's own mode)", async () => {
+  const { code } = await runFakeCursor("task-cursor-plan-mode-1", "go", { mode: "plan" });
+  expect(code).toBe(0);
 });
 
 // Prompt rides in argv (`-p <prompt>`) — see GEMINI_PROMPT_ARGV_MAX_BYTES's
@@ -1561,6 +1698,302 @@ test("fx AGETOR_FX_DRIVER=fake plain turn with no marker and no env twin: no 'ru
   expect(chunks.some((c) => c.stream === "status" && c.data.includes("running at fx's default"))).toBe(false);
 });
 
+// ── fx launch options (docs/plans/fx-0.0.14-and-cursor-updates.md §3.2) ──
+// `spawnAgent` builds the real fx spawn's FxLaunchOptions through
+// `buildFxLaunchOptions`, so these pin what reaches `spawnFxViaAcp` without
+// spawning an fx child.
+function fxLaunch(harness: Harness, opts: Record<string, unknown>) {
+  return buildFxLaunchOptions(
+    { taskId: "task-fx-launch", runId: "run-fx-launch", harness, prompt: "hi", cwd: "/tmp", onChunk: () => {}, opts },
+    { cmd: ["fx", "acp"], env: { FX_PERMISSION_MODE: "yolo" } },
+  );
+}
+
+test("fx launch options carry the task's speed tier verbatim (fast / ultrafast / off)", () => {
+  for (const speed of ["fast", "ultrafast", "off"] as const) {
+    expect(fxLaunch(builtin("fx"), { ...fxDefaults, speed }).speed).toBe(speed);
+  }
+});
+
+test("fx launch options pass speed null when the run carries none (the driver then skips speed reconciliation)", () => {
+  expect(fxLaunch(builtin("fx"), { ...fxDefaults }).speed).toBeNull();
+  expect(fxLaunch(builtin("fx"), { ...fxDefaults, speed: null }).speed).toBeNull();
+});
+
+test("fx launch options: profileMcpServers is on unless the harness explicitly turns it off", () => {
+  expect(fxLaunch(builtin("fx"), { ...fxDefaults }).profileMcpServers).toBe(true);
+  expect(fxLaunch({ ...builtin("fx"), profileMcpServers: true }, { ...fxDefaults }).profileMcpServers).toBe(true);
+  expect(fxLaunch({ ...builtin("fx"), profileMcpServers: false }, { ...fxDefaults }).profileMcpServers).toBe(false);
+});
+
+test("fx launch options forward onSteerDropped from the spawn args (absent when the caller passed none)", () => {
+  const dropped: string[] = [];
+  const onSteerDropped = (text: string) => { dropped.push(text); return true; };
+  const launch = buildFxLaunchOptions(
+    { taskId: "task-fx-launch", runId: "run-fx-launch", harness: builtin("fx"), prompt: "hi", cwd: "/tmp", onChunk: () => {}, onSteerDropped, opts: { ...fxDefaults } },
+    { cmd: ["fx", "acp"], env: {} },
+  );
+  expect(launch.onSteerDropped).toBe(onSteerDropped);
+  expect(fxLaunch(builtin("fx"), { ...fxDefaults }).onSteerDropped).toBeUndefined();
+});
+
+test("fx launch options keep the rest of the spawn shape (argv/env/mode/effort/model/resume)", () => {
+  const launch = fxLaunch(builtin("fx"), { ...fxDefaults, mode: "ask", effort: "high", resumeSessionId: "sess-fx-1", continueRecovery: true });
+  expect(launch).toMatchObject({
+    taskId: "task-fx-launch",
+    runId: "run-fx-launch",
+    argv: ["fx", "acp"],
+    env: { FX_PERMISSION_MODE: "yolo" },
+    cwd: "/tmp",
+    promptText: "hi",
+    mode: "ask",
+    effort: "high",
+    model: "fx-default",
+    resumeSessionId: "sess-fx-1",
+    continueRecovery: true,
+  });
+});
+
+// ── fx fake-driver seams (plan §5 "Fake-driver seams") ──
+
+async function runFakeFx(taskId: string, prompt: string, opts: Record<string, unknown> = {}) {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  const chunks: { stream: RunEventStream; data: string; lineUuid?: string }[] = [];
+  const handle = await spawnAgent({
+    taskId,
+    runId: `run-${taskId}`,
+    harness: builtin("fx"),
+    prompt,
+    cwd: "/tmp",
+    onChunk: (stream, data, lineUuid) => { chunks.push({ stream, data, lineUuid }); },
+    opts: { ...fxDefaults, runId: `run-${taskId}`, ...opts },
+  });
+  const code = await handle.done;
+  return { chunks, code };
+}
+
+function recoveryStates(chunks: { stream: RunEventStream; data: string }[]): string[] {
+  return chunks
+    .filter((c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX))
+    .map((c) => (JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string }).state);
+}
+
+test("fx failed-recovery marker: two active sentinels, then failed + its summary line, then 'fx turn ended: refused' and exit 1", async () => {
+  const { chunks, code } = await runFakeFx("task-fx-failed-1", `go ${FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER}`);
+  expect(code).toBe(1);
+  expect(recoveryStates(chunks)).toEqual(["active", "active", "failed"]);
+  const status = chunks.filter((c) => c.stream === "status").map((c) => c.data);
+  const summary = status.filter((d) => d.endsWith(FX_FAILED_SUMMARY_SUFFIX));
+  expect(summary).toEqual(["⚠ Provider unavailable · HTTP 503 · fake gateway outage · request failed after 3/3 attempts" + FX_FAILED_SUMMARY_SUFFIX]);
+  // Not resumable: the refused line carries no "(… — resumable)" tail.
+  expect(status[status.length - 1]).toBe("fx turn ended: refused");
+  expect(status.some((d) => d.endsWith(FX_PAUSED_SUMMARY_SUFFIX))).toBe(false);
+  // Mapped through the real mapFxUpdate: every sentinel carries its fx:<runId>:<seq> line uuid.
+  const sentinelUuids = chunks.filter((c) => c.data.startsWith(FX_RECOVERY_STATUS_PREFIX)).map((c) => c.lineUuid);
+  expect(sentinelUuids.every((u) => typeof u === "string" && u.startsWith("fx:run-task-fx-failed-1:"))).toBe(true);
+  expect(new Set(sentinelUuids).size).toBe(3);
+}, 5_000);
+
+test("fx failed-recovery env twin (AGETOR_FAKE_FX_RECOVERY_FAILED=1) drives the same failed turn", async () => {
+  process.env.AGETOR_FAKE_FX_RECOVERY_FAILED = "1";
+  const { chunks, code } = await runFakeFx("task-fx-failed-2", "go");
+  expect(code).toBe(1);
+  expect(recoveryStates(chunks)).toEqual(["active", "active", "failed"]);
+}, 5_000);
+
+test("fx failed-recovery env twin does not apply to a continueRecovery launch (that still recovers)", async () => {
+  process.env.AGETOR_FAKE_FX_RECOVERY_FAILED = "1";
+  const { chunks, code } = await runFakeFx("task-fx-failed-3", "", { continueRecovery: true });
+  expect(code).toBe(0);
+  expect(recoveryStates(chunks)).toEqual(["recovered"]);
+}, 5_000);
+
+test("fx speed-unoffered marker: one breadcrumb for fast and for ultrafast, naming the task's model, before the thinking chunk", async () => {
+  for (const speed of ["fast", "ultrafast"] as const) {
+    const { chunks } = await runFakeFx(`task-fx-speed-${speed}`, `go ${FAKE_FX_SPEED_UNOFFERED_PROMPT_MARKER}`, {
+      speed,
+      model: "vendor/model-x",
+    });
+    const expected = fxSpeedNotOfferedLine(speed, "vendor/model-x");
+    expect(chunks.filter((c) => c.stream === "status" && c.data === expected)).toHaveLength(1);
+    const crumbIdx = chunks.findIndex((c) => c.data === expected);
+    const thinkingIdx = chunks.findIndex((c) => c.stream === "thinking");
+    expect(thinkingIdx).toBeGreaterThan(crumbIdx);
+  }
+});
+
+test("fx speed-unoffered marker is silent for speed off (and for no speed at all)", async () => {
+  for (const speed of ["off", null] as const) {
+    const { chunks } = await runFakeFx(`task-fx-speed-silent-${speed}`, `go ${FAKE_FX_SPEED_UNOFFERED_PROMPT_MARKER}`, { speed });
+    expect(chunks.some((c) => c.data.includes("isn't offered for"))).toBe(false);
+  }
+});
+
+test("fx without the speed marker: no speed breadcrumb even on a fast task", async () => {
+  const { chunks } = await runFakeFx("task-fx-speed-none", "go", { speed: "fast" });
+  expect(chunks.some((c) => c.data.includes("Fast isn't offered"))).toBe(false);
+});
+
+test("fx tool-meta marker: internal call stamped on use + result, MCP call labelled 'server · tool', notice status line, then a reply and success", async () => {
+  const { chunks, code } = await runFakeFx("task-fx-toolmeta-1", `go ${FAKE_FX_TOOL_META_PROMPT_MARKER}`);
+  expect(code).toBe(0);
+
+  const uses = chunks.filter((c) => c.stream === "tool_use").map((c) => ({ ...JSON.parse(c.data), lineUuid: c.lineUuid }));
+  const results = chunks.filter((c) => c.stream === "tool_result").map((c) => JSON.parse(c.data));
+  expect(uses).toHaveLength(2);
+  expect(results).toHaveLength(2);
+
+  const internalUse = uses.find((u) => u.id === "fake-fx-internal-1");
+  expect(internalUse).toMatchObject({ name: "capability_search", internal: true, lineUuid: "fx:tool:fake-fx-internal-1:use" });
+  expect(results.find((r) => r.toolUseId === "fake-fx-internal-1")).toMatchObject({ internal: true, isError: false });
+
+  const mcpUse = uses.find((u) => u.id === "fake-fx-mcp-1");
+  expect(mcpUse).toMatchObject({ name: "e2e-mcp · lookup", mcp: { server: "e2e-mcp", tool: "lookup" } });
+  expect(mcpUse.internal).toBeUndefined();
+  expect(results.find((r) => r.toolUseId === "fake-fx-mcp-1")?.internal).toBeUndefined();
+
+  expect(chunks.some((c) => c.stream === "status" && c.data === "⚠ fx: e2e notice")).toBe(true);
+  const replyIdx = chunks.findIndex((c) => c.stream === "assistant" && c.data === "Looked it up: alpha is 42.");
+  const noticeIdx = chunks.findIndex((c) => c.data === "⚠ fx: e2e notice");
+  expect(replyIdx).toBeGreaterThan(noticeIdx);
+  expect(chunks[chunks.length - 1]).toMatchObject({ stream: "status", data: "turn complete" });
+});
+
+test("fx plain turn without any new marker is byte-identical to before: no tool, notice, recovery or speed chunks", async () => {
+  const { chunks, code } = await runFakeFx("task-fx-plain-seams", "go", { speed: "ultrafast" });
+  expect(code).toBe(0);
+  expect(chunks.map((c) => c.stream)).not.toContain("tool_use");
+  expect(recoveryStates(chunks)).toEqual([]);
+  expect(chunks.some((c) => c.data.includes("e2e notice") || c.data.includes("isn't offered"))).toBe(false);
+  expect(chunks.map((c) => c.data)).toEqual([
+    `${FX_PROVIDER_STATUS_PREFIX}gateway`,
+    "fake fx reasoning",
+    "fake response to: go",
+    `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ used: 1234, size: 128000 })}`,
+    `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ turn: { inputTokens: 42, outputTokens: 7 } })}`,
+    `${FX_SESSION_TITLE_STATUS_PREFIX}Fake fx session`,
+    "turn complete",
+  ]);
+});
+
+// ── fx steer seam (plan §5: `__agetor_fake_fx_steer__:<absorbed|dropped>`) ──
+
+/** Spawn a fake fx steer turn, steer `steers` into it while it holds, and
+ *  collect its chunks plus every `onSteerDropped` call — each tagged with
+ *  whether `done` had already resolved when it fired. */
+async function runFakeFxSteer(taskId: string, prompt: string, steers: string[], queued = true) {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "80";
+  const chunks: { stream: RunEventStream; data: string }[] = [];
+  const dropped: { text: string; afterDone: boolean }[] = [];
+  let doneResolved = false;
+  const handle = await spawnAgent({
+    taskId,
+    runId: `run-${taskId}`,
+    harness: builtin("fx"),
+    prompt,
+    cwd: "/tmp",
+    onChunk: (stream, data) => { chunks.push({ stream, data }); },
+    onSteerDropped: (text) => { dropped.push({ text, afterDone: doneResolved }); return queued; },
+    opts: { ...fxDefaults, runId: `run-${taskId}` },
+  });
+  const accepted = steers.map((line) => handle.steer?.(line));
+  const code = await handle.done.then((c) => { doneResolved = true; return c; });
+  return { handle, chunks, dropped, accepted, code };
+}
+
+test("fx fake agent without the steer marker carries no steer at all", async () => {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  const handle = await spawnAgent({
+    taskId: "task-fx-steer-none",
+    runId: "run-fx-steer-none",
+    harness: builtin("fx"),
+    prompt: "go",
+    cwd: "/tmp",
+    onChunk: () => {},
+    opts: { ...fxDefaults, runId: "run-fx-steer-none" },
+  });
+  expect("steer" in handle).toBe(false);
+  await handle.done;
+});
+
+test("fx steer marker :absorbed — steer() takes the line mid-turn, the turn acknowledges it before finishing, nothing is dropped", async () => {
+  const { handle, chunks, dropped, accepted, code } = await runFakeFxSteer(
+    "task-fx-steer-abs",
+    `go ${FAKE_FX_STEER_PROMPT_MARKER}:absorbed`,
+    ["also check the tests"],
+  );
+  expect(code).toBe(0);
+  expect(accepted).toEqual([true]);
+  expect(dropped).toEqual([]);
+  const ackIdx = chunks.findIndex((c) => c.stream === "assistant" && c.data.includes("also check the tests"));
+  const doneIdx = chunks.findIndex((c) => c.stream === "status" && c.data === "turn complete");
+  expect(ackIdx).toBeGreaterThan(-1);
+  expect(doneIdx).toBeGreaterThan(ackIdx);
+  expect(chunks.some((c) => c.data === FX_STEER_DROPPED_STATUS)).toBe(false);
+  // Once the turn settled, steering is over.
+  expect(handle.steer?.("too late")).toBe(false);
+});
+
+test("fx steer marker :dropped — onSteerDropped(text) fires before done resolves, with the dropped status line", async () => {
+  const { chunks, dropped, accepted, code } = await runFakeFxSteer(
+    "task-fx-steer-drop",
+    `go ${FAKE_FX_STEER_PROMPT_MARKER}:dropped`,
+    ["first", "second"],
+  );
+  expect(code).toBe(0);
+  expect(accepted).toEqual([true, true]);
+  expect(dropped).toEqual([{ text: "first", afterDone: false }, { text: "second", afterDone: false }]);
+  expect(chunks.filter((c) => c.stream === "status" && c.data === FX_STEER_DROPPED_STATUS)).toHaveLength(2);
+  expect(chunks.some((c) => c.stream === "assistant" && c.data.includes("first"))).toBe(false);
+});
+
+test("fx steer marker :dropped — a steer the caller didn't queue is still handed back, but gets no 'sending it as the next turn' line", async () => {
+  const { chunks, dropped, accepted, code } = await runFakeFxSteer(
+    "task-fx-steer-drop-unqueued",
+    `go ${FAKE_FX_STEER_PROMPT_MARKER}:dropped`,
+    ["discarded"],
+    false,
+  );
+  expect(code).toBe(0);
+  expect(accepted).toEqual([true]);
+  expect(dropped).toEqual([{ text: "discarded", afterDone: false }]);
+  expect(chunks.some((c) => c.data === FX_STEER_DROPPED_STATUS)).toBe(false);
+});
+
+test("fx steer marker is read from the task's stored prompt when the turn's own prompt lacks it (a steered/re-queued follow-up)", async () => {
+  const taskId = "task-fx-steer-stored";
+  tasks.insert({ ...makeHandoffTaskRow(taskId, `go ${FAKE_FX_STEER_PROMPT_MARKER}:dropped`), agent: "fx" });
+  const { dropped, accepted } = await runFakeFxSteer(taskId, "a follow-up", ["late thought"]);
+  expect(accepted).toEqual([true]);
+  expect(dropped.map((d) => d.text)).toEqual(["late thought"]);
+});
+
+test("fx steer marker: a killed :dropped turn reports its pending steers dropped before done resolves, then refuses steers", async () => {
+  process.env.AGETOR_FX_DRIVER = "fake";
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "5000";
+  for (const mode of ["dropped", "absorbed"] as const) {
+    const dropped: string[] = [];
+    let doneResolved = false;
+    const handle = await spawnAgent({
+      taskId: `task-fx-steer-kill-${mode}`,
+      runId: `run-fx-steer-kill-${mode}`,
+      harness: builtin("fx"),
+      prompt: `go ${FAKE_FX_STEER_PROMPT_MARKER}:${mode}`,
+      cwd: "/tmp",
+      onChunk: () => {},
+      onSteerDropped: (text) => { dropped.push(`${text}:${doneResolved}`); return true; },
+      opts: { ...fxDefaults, runId: `run-fx-steer-kill-${mode}` },
+    });
+    void handle.done.then(() => { doneResolved = true; });
+    expect(handle.steer?.("one")).toBe(true);
+    handle.kill();
+    await handle.done;
+    expect(handle.steer?.("two")).toBe(false);
+    expect(dropped).toEqual(mode === "dropped" ? ["one:false"] : []);
+  }
+});
+
 test("fx AGETOR_FAKE_FX_PERMISSION=1 with mode 'yolo' auto-allows and still emits the same relative sentinel order, plus the provider sentinel", async () => {
   process.env.AGETOR_FX_DRIVER = "fake";
   process.env.AGETOR_FAKE_FX_PERMISSION = "1";
@@ -1654,7 +2087,7 @@ test(
     expect(chunks.indexOf(recoveryChunks[0]!)).toBeGreaterThan(providerIdx);
 
     const statusChunks = chunks.filter((c) => c.stream === "status");
-    const summaryLines = statusChunks.filter((c) => c.data.includes("resume once the limit clears"));
+    const summaryLines = statusChunks.filter((c) => c.data.endsWith(FX_PAUSED_SUMMARY_SUFFIX));
     expect(summaryLines).toHaveLength(1);
 
     expect(
@@ -1775,7 +2208,7 @@ test(
       .filter((c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX))
       .map((c) => (JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string }).state);
     expect(recoveryStates).not.toContain("paused");
-    expect(chunks.some((c) => c.data.includes("resume once the limit clears"))).toBe(false);
+    expect(chunks.some((c) => c.data.endsWith(FX_PAUSED_SUMMARY_SUFFIX))).toBe(false);
     expect(chunks.some((c) => c.data.startsWith("fx turn ended: refused"))).toBe(false);
   },
   8_000,
@@ -1854,7 +2287,7 @@ test(
     expect(payloads[3]).toMatchObject({ attemptLimit: 3, requiredAction: "continue_later" });
 
     const stormStatusChunks = stormChunks.filter((c) => c.stream === "status");
-    const summaryLines = stormStatusChunks.filter((c) => c.data.includes("resume once the limit clears"));
+    const summaryLines = stormStatusChunks.filter((c) => c.data.endsWith(FX_PAUSED_SUMMARY_SUFFIX));
     expect(summaryLines).toHaveLength(1);
     expect(
       stormStatusChunks.some(
@@ -2255,7 +2688,7 @@ function makeHandoffTaskRow(taskId: string, prompt: string): Task {
     mode: null,
     model: null,
     effort: null,
-    fast: false,
+    speed: "off",
     maxMode: false,
     references: [],
     backlog: [],

@@ -64,7 +64,6 @@ import {
   FX_USAGE_STATUS_PREFIX,
   isInternalStatusSentinel,
   cursorModelIdCoveredByCatalog,
-  cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
   EFFORT_OPTIONS,
   retainableEfforts,
@@ -98,10 +97,12 @@ import { appendReferences } from "../../../shared/refs.ts";
 import { parseSentFilesToolUse } from "../../../shared/sent-files.ts";
 import { stepNameById } from "../../../shared/pipeline.ts";
 import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
+import { supportedSpeeds } from "../../../shared/speed.ts";
 import { parseIssueUrl } from "../../../shared/issue-task.ts";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
 import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
+import { isHiddenToolEvent } from "../../../shared/tool-visibility.ts";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
@@ -126,6 +127,7 @@ import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
 import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink, MD_URL_TRANSFORM, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./md-components";
 import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent, HandoffReminderBadge } from "./MessageSegments";
 import { CompactionSummaryBlock } from "./CompactionSummaryBlock";
+import { SpeedPicker } from "./SpeedPicker";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -1766,7 +1768,7 @@ function RunPanelBody({
    *  so it splices against these. */
   const mainEvents = useMemo(() => events.filter((e) => !e.subagentId), [events]);
 
-  /** Merged fx usage / provider / title / recovery per run, each keyed by
+  /** Merged usage / fx provider / title / recovery per run, each keyed by
    *  `runId` — feed the run-row chips in `RunsList` (usage/provider/title)
    *  and the bottom-of-transcript recovery notices below (`recoveryByRunId`
    *  — see `liveRecoveryNotice`/`pausedRecovery`). Sourced from the raw
@@ -1783,12 +1785,15 @@ function RunPanelBody({
    *  `fx-provider:`/`fx-title:`/`fx-recovery:` — is already a complete
    *  value; for recovery specifically, the newest sentinel for a run is
    *  exactly the state that matters, since fx emits one per retry attempt
-   *  plus a final terminal one). All four are gated on `kind === "fx"` —
-   *  every other agent kind never emits these sentinels, so scanning the
-   *  full (possibly windowed) event list on every render for them is pure
-   *  waste — and combined into a single pass over `events` so a streamed fx
-   *  task doesn't pay for four independent full scans of the same (up to
-   *  `EVENTS_WINDOW_MAX`-sized) array on every chunk. Note the same
+   *  plus a final terminal one). The usage sentinel is fed by fx and by
+   *  cursor (whose `result.usage` the cursor mapper forwards on the same
+   *  `{turn}` shape), the other three by fx alone — so the scan is skipped
+   *  outright for every other agent kind, which never emits any of them
+   *  (scanning the full, possibly windowed, event list on every render for
+   *  them would be pure waste) — and combined into a single pass over
+   *  `events` so a streamed fx task doesn't pay for four independent full
+   *  scans of the same (up to `EVENTS_WINDOW_MAX`-sized) array on every
+   *  chunk. Note the same
    *  windowing applies here as everywhere else `events` is read: once an
    *  older run's events slide out of the kept window
    *  (`eventWindowKeepCount`/`EVENTS_WINDOW_MAX`), its chips (and any
@@ -1799,7 +1804,7 @@ function RunPanelBody({
     const provider = new Map<string, string>();
     const title = new Map<string, string>();
     const recovery = new Map<string, FxRecoveryPayload>();
-    if (kind !== "fx") {
+    if (kind !== "fx" && kind !== "cursor") {
       return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title, recoveryByRunId: recovery };
     }
     for (const e of events) {
@@ -1807,6 +1812,8 @@ function RunPanelBody({
       if (e.data.startsWith(FX_USAGE_STATUS_PREFIX)) {
         const parsed = parseFxUsage(e.data.slice(FX_USAGE_STATUS_PREFIX.length));
         if (parsed) usage.set(e.runId, mergeFxUsage(usage.get(e.runId), parsed));
+      } else if (kind !== "fx") {
+        continue;
       } else if (e.data.startsWith(FX_PROVIDER_STATUS_PREFIX)) {
         const value = e.data.slice(FX_PROVIDER_STATUS_PREFIX.length).trim();
         if (value) provider.set(e.runId, value);
@@ -1856,12 +1863,17 @@ function RunPanelBody({
   // scrolling/highlighting the wrong block whenever history has duplicate
   // permission-mode chips (review-caught bug). Doing it here keeps search,
   // todo-progress, and rendering all reading from one shared index space.
+  // `dropHiddenToolEvents` runs here for the same reason: an internal tool
+  // call (and its answer) must vanish from the index space search matches
+  // against, not just from the rendered blocks.
   const displayedEvents = useMemo(() => {
     if (activeStream !== "main")
-      return collapseRepeatedStatusChips(subagentEventsById.get(activeStream) ?? []);
-    if (!rebuilt || !rebuiltRunIds) return collapseRepeatedStatusChips(mainEvents);
+      return collapseRepeatedStatusChips(dropHiddenToolEvents(subagentEventsById.get(activeStream) ?? []));
+    if (!rebuilt || !rebuiltRunIds) return collapseRepeatedStatusChips(dropHiddenToolEvents(mainEvents));
     const others = mainEvents.filter((e) => !rebuiltRunIds.has(e.runId) || e.stream === "status");
-    return collapseRepeatedStatusChips([...others, ...rebuilt.events].sort((a, b) => a.ts - b.ts));
+    return collapseRepeatedStatusChips(
+      dropHiddenToolEvents([...others, ...rebuilt.events].sort((a, b) => a.ts - b.ts)),
+    );
   }, [activeStream, subagentEventsById, mainEvents, rebuilt, rebuiltRunIds]);
 
   /** The current to-do list for whichever stream is selected. Claude re-emits
@@ -2532,8 +2544,8 @@ function RunPanelBody({
    *  `holdSummary` above. `null` whenever there's nothing live: wrong kind, a
    *  subagent tab, no run currently `running`, or the latest run's newest
    *  recovery sentinel isn't `state: "active"` — `paused` gets the notice
-   *  below instead, and `recovered`/`cleared` have nothing left to show here
-   *  (the persisted summary line for those transitions lives in the
+   *  below instead, and `recovered`/`cleared`/`failed` have nothing left to
+   *  show here (the persisted summary line for those transitions lives in the
    *  transcript itself, written once by the driver, not derived on every
    *  render by this memo). Ignores a `replayed: true` payload — on
    *  `session/resume` fx replays the PRIOR turn's recovery updates onto the
@@ -2554,8 +2566,8 @@ function RunPanelBody({
   /** Paused fx recovery notice + Resume affordance, same bottom slot as
    *  `liveRecoveryNotice` (mutually exclusive with it — a run is either
    *  `running` with an active retry or `failed` with a paused one, never
-   *  both). fx gave up after exhausting its retry budget: the run already
-   *  settled `failed` and the card is back off `running`, but the model's
+   *  both). When fx pauses a response it keeps the turn's checkpoint: the
+   *  run already settled `failed` and the card is back off `running`, but the model's
    *  mid-turn checkpoint is still resumable via `POST /tasks/:id/fx-resume`
    *  as long as fx's own `requiredAction` says so (`isFxRecoveryResumable`).
    *  `latestRun.status === "failed"` alone is enough to know no newer run is
@@ -2565,9 +2577,12 @@ function RunPanelBody({
    *  every other archived-gated action in this panel), or once the latest
    *  sentinel for that run no longer reads as resumable (e.g. a later
    *  `cleared` sentinel from a normal follow-up prompt consuming the
-   *  checkpoint). The text itself (`fxRecoverySummaryLine`) is the same
-   *  "…resume once the limit clears, or send a new message." line the driver
-   *  already persisted into the transcript at the pause transition — this is
+   *  checkpoint, or a terminal `failed` state / `surface_stall` action,
+   *  neither of which `isFxRecoveryResumable` accepts — a failed recovery
+   *  shows only the driver's persisted summary line, never a notice, Resume
+   *  or the board's paused badge). The text itself (`fxRecoverySummaryLine`)
+   *  is the same paused summary line the driver already persisted into the
+   *  transcript at the pause transition — this is
    *  purely a live, disappearing-once-acted-on affordance layered on top,
    *  not a second source of truth for what happened.
    *
@@ -4989,9 +5004,9 @@ function SubagentTabs({
  * for the latest run (status, ordinal, time, duration). Expanded: every
  * prior run in reverse-chronological order.
  */
-/** Compact `used/size` (+ `· $cost`/`· cost CUR`) chip for an fx run's
- *  merged usage payload, rendered beside the duration/exit chips on a
- *  run-summary row. Falls back to a compact `↑in ↓out` per-turn form when
+/** Compact `used/size` (+ `· $cost`/`· cost CUR`) chip for a run's merged
+ *  usage payload (fx, or cursor's per-turn `result.usage`), rendered beside
+ *  the duration/exit chips on a run-summary row. Falls back to a compact `↑in ↓out` per-turn form when
  *  only `turn` is known, and renders nothing at all when neither half is
  *  known (see `fxUsageChipText`). `title` carries the exact numbers —
  *  including any per-turn breakdown — on hover; the visible text is the
@@ -5307,13 +5322,13 @@ function RunEventList({
    *  lives in the transcript itself, written once by the driver — this prop
    *  is a separate, purely-derived, disappearing-on-its-own affordance. */
   recoveryNotice?: string | null;
-  /** fx paused (exhausted its retry budget) and the checkpoint is still
-   *  resumable — rendered as a `PausedRecoveryNotice` + Resume button in the
+  /** fx paused a response and the checkpoint is still resumable — rendered
+   *  as a `PausedRecoveryNotice` + Resume button in the
    *  same bottom slot, mutually exclusive with `recoveryNotice` (see the
    *  caller's `pausedRecovery` doc comment for the full gate, including why
    *  it's archived- and subagent-tab-gated). `text` is the driver's own
-   *  persisted "…resume once the limit clears…" line reused for the live
-   *  affordance's label; `busy` disables the button while a resume request is
+   *  persisted paused summary line (`fxRecoverySummaryLine`) reused for the
+   *  live affordance's label; `busy` disables the button while a resume request is
    *  in flight; `onResume` is the click handler. `null` when there's nothing
    *  to resume. */
   pausedRecovery?: { text: string; busy: boolean; onResume: () => void } | null;
@@ -5770,8 +5785,9 @@ function RecoveryNotice({ text }: { text: string }) {
 }
 
 /**
- * Pinned-at-bottom notice for a PAUSED fx recovery checkpoint (fx exhausted
- * its retry budget) plus the Resume affordance — same bottom slot as
+ * Pinned-at-bottom notice for a PAUSED fx recovery checkpoint (when fx
+ * pauses a response it keeps the turn resumable until something continues
+ * it) plus the Resume affordance — same bottom slot as
  * `RecoveryNotice`, mutually exclusive with it (`pausedRecovery` in
  * `RunPanelBody` only ever computes non-null once the run has settled
  * `failed`, at which point no run is `running` any more so `recoveryNotice`
@@ -5779,8 +5795,8 @@ function RecoveryNotice({ text }: { text: string }) {
  * ephemeral progress — it stays up until the user either resumes or sends a
  * new message (which the driver's own `cleared` sentinel will reflect,
  * collapsing this notice on the next render) — but it's still layered on top
- * of, not a replacement for, the driver's own persisted "…resume once the
- * limit clears…" transcript line reused here as `text` — rendered through
+ * of, not a replacement for, the driver's own persisted paused summary
+ * line (`fxRecoverySummaryLine`) reused here as `text` — rendered through
  * `renderLinkified` so an embedded Gateway URL is clickable, same as
  * `RecoveryNotice`. Clicking Resume calls `RunPanelBody`'s
  * `handleResumeFxRecovery`, which posts to `POST /tasks/:id/fx-resume` and
@@ -5982,6 +5998,35 @@ interface ParsedToolResult {
    *  `content` is then the first 4 KB of the original; the muted
    *  `tool-result-trimmed` line under the fold header says so. */
   retention?: ToolResultRetention;
+}
+
+/**
+ * Drop the tool events the transcript never shows (D19): every
+ * `tool_use`/`tool_result` stamped `internal: true` (`isHiddenToolEvent`),
+ * plus any `tool_result` answering a hidden `tool_use` even when the result
+ * itself carries no stamp — otherwise it would render as an orphan result
+ * card for a call the user never sees. Persisted rows are untouched; this is
+ * display-only. Returns `events` itself when nothing is hidden, so the
+ * common case allocates nothing.
+ */
+function dropHiddenToolEvents(events: RunEvent[]): RunEvent[] {
+  let hiddenIds: Set<string> | null = null;
+  let anyHidden = false;
+  for (const e of events) {
+    if (!isHiddenToolEvent(e.stream, e.data)) continue;
+    anyHidden = true;
+    if (e.stream === "tool_use") {
+      const id = safeParse<{ id?: unknown }>(e.data)?.id;
+      if (typeof id === "string" && id) (hiddenIds ??= new Set()).add(id);
+    }
+  }
+  if (!anyHidden) return events;
+  return events.filter((e) => {
+    if (isHiddenToolEvent(e.stream, e.data)) return false;
+    if (e.stream !== "tool_result" || !hiddenIds) return true;
+    const toolUseId = safeParse<{ toolUseId?: unknown }>(e.data)?.toolUseId;
+    return !(typeof toolUseId === "string" && hiddenIds.has(toolUseId));
+  });
 }
 
 function safeParse<T>(s: string): T | null {
@@ -6994,7 +7039,7 @@ function TaskDetails({
   // in flight for this task's harness — mirrors NewTaskForm's affordance.
   const [refreshingModels, setRefreshingModels] = useState(false);
   // A task bound to an agent profile (plan D5) locks the four dropdowns
-  // (+ cursor fast/max) regardless of run state — only Detach unlocks them.
+  // (+ speed, cursor max) regardless of run state — only Detach unlocks them.
   // `runningLock` alone (the pre-existing rule) still gates the Detach
   // button itself, so a bound task can't be detached mid-run.
   const runningLock = task.column === "running" || task.column === "blocked";
@@ -7132,7 +7177,13 @@ function TaskDetails({
     return options;
   }, [allowedEfforts, retainable, task.effort, harnesses, task.agent, kind]);
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
-  const fastAvailable = kind === "cursor" && cursorModelSupportsFast(task.model, task.effort);
+  // Speed tiers for the task's model: cursor's come from the curated
+  // fast-variant table, fx's only from discovery (the merged row's
+  // `fast`/`ultrafast` flags, rule 8), every other kind offers `off` only.
+  const speedOptions = useMemo(() => {
+    const option = modelOptions.find((o) => o.id === (task.model ?? DEFAULT_MODEL[kind]));
+    return supportedSpeeds(kind, task.model, task.effort, option);
+  }, [kind, task.model, task.effort, modelOptions]);
   useEffect(() => {
     // A profile-bound task's effort is owned by the profile, not this
     // cascade — mutating it here would PATCH a field the profile lock is
@@ -7151,12 +7202,18 @@ function TaskDetails({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel, task.agentProfileId]);
   useEffect(() => {
-    // Same profile-lock guard as the effort cascade above — `fast`/`maxMode`
+    // Same profile-lock guard as the effort cascade above — `speed`/`maxMode`
     // are also profile-owned fields once bound.
     if (task.agentProfileId != null) return;
-    if (task.fast && !fastAvailable) void save({ fast: false });
+    // fx is never cleared here: its tiers come from discovery alone, which
+    // may not be ready yet (or omit flags a moment), so a stored tier the
+    // model doesn't list stays and renders as the picker's "(not offered)"
+    // segment — the driver posts a breadcrumb and runs without it. Only a
+    // user model change resets it (`onModelChange`).
+    if (kind === "fx") return;
+    if (task.speed !== "off" && !speedOptions.includes(task.speed)) void save({ speed: "off" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fastAvailable, task.fast, task.agentProfileId]);
+  }, [kind, speedOptions, task.speed, task.agentProfileId]);
   useEffect(() => {
     if (task.agentProfileId != null) return;
     if (task.maxMode && !maxModeAvailable) void save({ maxMode: false });
@@ -7188,7 +7245,24 @@ function TaskDetails({
       : nextEfforts.some((e) => e.id === DEFAULT_EFFORT[nextKind])
         ? DEFAULT_EFFORT[nextKind]
         : nextEfforts[0]!.id;
-    void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, fast: false, maxMode: false });
+    void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, speed: "off", maxMode: false });
+  };
+
+  const onModelChange = (model: string) => {
+    // fx speed reset rule (plan §3.1): drop a stored tier to `off` only on a
+    // user model change, and only when the new model's tiers are actually
+    // known — the model is in this harness's discovered catalog and that
+    // catalog is trusted (rule 7: not a logged-out harness) — and exclude
+    // it. Cursor's own clear runs in the effect above.
+    if (kind === "fx" && task.speed !== "off" && selectedStatus?.loggedIn !== false) {
+      const discovered = harnessModels[task.agent] ?? agentModels[kind] ?? [];
+      const option = modelOptions.find((o) => o.id === model);
+      if (discovered.some((m) => m.id === model) && !supportedSpeeds(kind, model, task.effort, option).includes(task.speed)) {
+        void save({ model, speed: "off" });
+        return;
+      }
+    }
+    void save({ model });
   };
 
   const modeOptions = supportedModes(kind, task.model);
@@ -7378,7 +7452,7 @@ function TaskDetails({
                 <CompactSelect
                   value={task.model ?? DEFAULT_MODEL[kind]}
                   options={modelOptions}
-                  onChange={(model) => void save({ model })}
+                  onChange={onModelChange}
                 />
               ) : (
                 <span>{task.model ?? "—"}</span>
@@ -7418,20 +7492,17 @@ function TaskDetails({
               </>
             )}
 
-            {kind === "cursor" && (fastAvailable || task.fast) && (
+            {(speedOptions.length > 1 || task.speed !== "off") && (
               <>
-                <dt className="text-muted-foreground">Fast</dt>
+                <dt className="text-muted-foreground">Speed</dt>
                 <dd className="min-w-0">
-                  {editable ? (
-                    <Switch
-                      checked={task.fast}
-                      onCheckedChange={(fast) => void save({ fast })}
-                      disabled={!fastAvailable}
-                      aria-label="Use Cursor fast variant"
-                    />
-                  ) : (
-                    <span>{task.fast ? "on" : "off"}</span>
-                  )}
+                  <SpeedPicker
+                    testId="task-speed"
+                    options={speedOptions}
+                    value={task.speed}
+                    onChange={(speed) => void save({ speed })}
+                    disabled={!editable}
+                  />
                 </dd>
               </>
             )}

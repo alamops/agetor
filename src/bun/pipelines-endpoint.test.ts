@@ -83,7 +83,7 @@ async function createProfile(overrides: Record<string, unknown> = {}): Promise<A
       model: "claude-opus-4-7",
       effort: "high",
       mode: "auto",
-      fast: false,
+      speed: "off",
       maxMode: false,
       instructions: "Be terse.",
       skills: [],
@@ -1097,7 +1097,9 @@ test("GET /tasks ships a trimmed pipelineRun (no handoffs, no profile snapshots)
   };
   // Shape-only fixture — `sanitizeRunSnapshot` keeps `profiles` as "a record
   // of objects" without deep-validating against `AgentProfileSnapshot`.
-  const snapshotProfiles = { [profile.id]: { id: profile.id, name: profile.name } } as unknown as Record<
+  // `speed` + derived `fast` included: the snapshot parse normalizes each
+  // profile entry's speed tier on read, so the round trip must already carry it.
+  const snapshotProfiles = { [profile.id]: { id: profile.id, name: profile.name, speed: "off", fast: false } } as unknown as Record<
     string,
     import("../shared/types.ts").AgentProfileSnapshot
   >;

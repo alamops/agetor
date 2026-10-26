@@ -36,7 +36,7 @@ async function seedDataDir(dir: string): Promise<{ taskId: string; bigEventId: n
     tasks.insert({
       id: taskId, title: "boot retention", prompt: "p", agent: "claude-code", workdir: "/tmp",
       isolation: "none", taskType: "task", branch: null, branchSource: "created", worktreePath: null,
-      baseRef: null, prUrl: null, mode: null, model: null, effort: null, fast: false, maxMode: false,
+      baseRef: null, prUrl: null, mode: null, model: null, effort: null, speed: "off", maxMode: false,
       references: [], backlog: [], plans: [], draft: null, column: "ready", runId: null,
       createdAt: now, updatedAt: now, hasOpenableRun: false, pendingInteractionCount: 0,
       openTerminalCount: 0, archivedAt: now - ${40 * DAY},

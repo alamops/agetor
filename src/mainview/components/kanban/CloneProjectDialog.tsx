@@ -223,7 +223,7 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
                 mode: launch.mode,
                 model: launch.model,
                 effort: launch.effort,
-                fast: launch.fast,
+                speed: launch.speed,
                 maxMode: launch.maxMode,
               }
           : {}),

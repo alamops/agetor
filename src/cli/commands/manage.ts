@@ -6,7 +6,7 @@ import { c, out, printJson } from "../output.ts";
 import { ApiError, type PatchTaskInput } from "../api-client.ts";
 import { COLUMNS } from "../../shared/types.ts";
 import { flagValue } from "../args.ts";
-import { usageError } from "../usage.ts";
+import { parseSpeedFlag, usageError } from "../usage.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id);
 
@@ -33,8 +33,11 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
       case "--model": patch.model = val(); break;
       case "--mode": patch.mode = val(); break;
       case "--effort": patch.effort = val(); break;
-      case "--fast": patch.fast = true; break;
-      case "--no-fast": patch.fast = false; break;
+      // --fast / --no-fast are aliases of --speed fast / off; the later of
+      // several speed flags wins. Only `speed` goes on the wire.
+      case "--speed": patch.speed = parseSpeedFlag(val()); break;
+      case "--fast": patch.speed = "fast"; break;
+      case "--no-fast": patch.speed = "off"; break;
       case "--max-mode": patch.maxMode = true; break;
       case "--no-max-mode": patch.maxMode = false; break;
       case "--type": patch.taskType = val(); break;
@@ -45,7 +48,7 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   }
   if (Object.keys(patch).length === 0 && !detachProfile) {
     throw new Error(
-      "nothing to edit — pass at least one of --title/--prompt/--agent/--workdir/--model/--mode/--effort/--fast/--no-fast/--max-mode/--no-max-mode/--type/--column/--detach-profile",
+      "nothing to edit — pass at least one of --title/--prompt/--agent/--workdir/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode/--type/--column/--detach-profile",
     );
   }
   if (patch.column && !COLUMN_IDS.includes(patch.column as (typeof COLUMN_IDS)[number])) {
@@ -55,7 +58,7 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   const task = await resolveTask(client, ref);
   // Detach first so a combined `--detach-profile --model …` unlocks the
   // bound fields before the patch that wants to change them — the server
-  // 409s a PATCH that touches agent/mode/model/effort/fast/maxMode while
+  // 409s a PATCH that touches agent/mode/model/effort/speed/maxMode while
   // still bound. That 409's message says "agent" (the server's own
   // vocabulary — "agent" = harness there), which would read as nonsense at
   // the CLI boundary where "agent" = harness and "profile" = agent profile

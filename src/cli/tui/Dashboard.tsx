@@ -34,6 +34,7 @@ import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts
 // `../at-warn.ts` is owned by a sibling — import its pure exports only, never edit the file.
 import { discoveredExtensionNames, filterUnresolvedRefs } from "../at-warn.ts";
 import { trimmedResultNote } from "../commands/logs.ts";
+import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
 
 type Mode = "nav" | "compose" | "answer";
 
@@ -466,7 +467,9 @@ export function Dashboard({
   // rows wrap unexpectedly in a real terminal.
   const listWidth = Math.max(26, Math.min(50, Math.floor(cols * 0.38)));
   const detailWidth = cols - listWidth - 4; // detail box minus list, borders, paddingX
-  const visible = events.slice(-Math.max(8, rows - 9));
+  // fx's internal tool calls (`isHiddenToolEvent`, D19) are dropped BEFORE
+  // the window is cut, so they never take a slot from a line that renders.
+  const visible = events.filter((e) => !isHiddenToolEvent(e.stream, e.data)).slice(-Math.max(8, rows - 9));
 
   return (
     <Box flexDirection="column" height={rows}>
@@ -933,7 +936,7 @@ const EventLine = memo(function EventLine({
         );
       }
       if (recoveryLine === null) return null;
-      // Internal-only sentinel status chunks (permission-mode chip, fx usage
+      // Internal-only sentinel status chunks (permission-mode chip, fx/cursor usage
       // chip, …) are UI-plumbing, not transcript content — see
       // `isInternalStatusSentinel` in shared/types.ts, the one predicate every
       // raw-status renderer must consult. Skip rendering them.

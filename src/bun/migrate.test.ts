@@ -12,6 +12,9 @@ import antigravityEffortInModelId from "./migrations/065_antigravity_effort_in_m
 import retireGemini37And35Flash from "./migrations/066_retire_gemini_3_7_and_3_5_flash.sql" with { type: "text" };
 import retentionSweptTasks from "./migrations/067_retention_swept_tasks.sql" with { type: "text" };
 import claudeSessionSeen from "./migrations/071_claude_session_seen.sql" with { type: "text" };
+import taskSpeed from "./migrations/072_task_speed.sql" with { type: "text" };
+import harnessProfileMcpServers from "./migrations/073_harness_profile_mcp_servers.sql" with { type: "text" };
+import retireFxModels from "./migrations/074_retire_fx_models.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
 
 // Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
@@ -1138,11 +1141,22 @@ test("070 (imported claude session backfill) is registered right after 069", () 
   expect(migrations[at]?.sql).toContain("imported_claude_session_id");
 });
 
-test("071 (claude session seen) is the last registered migration, right after 070", () => {
+test("071 (claude session seen) is registered right after 070", () => {
   const at = migrations.findIndex((m) => m.id === "071_claude_session_seen");
-  expect(at).toBe(migrations.length - 1);
+  expect(at).toBeGreaterThan(0);
   expect(migrations[at - 1]?.id).toBe("070_imported_claude_session_backfill");
   expect(migrations[at]?.sql).toBe(claudeSessionSeen);
+});
+
+test("074 (retire fx models) is the last registered migration, after 073 (harness profile MCP servers), after 072 (task speed), after 071", () => {
+  const at = migrations.findIndex((m) => m.id === "074_retire_fx_models");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("073_harness_profile_mcp_servers");
+  expect(migrations[at - 2]?.id).toBe("072_task_speed");
+  expect(migrations[at - 3]?.id).toBe("071_claude_session_seen");
+  expect(migrations[at]?.sql).toBe(retireFxModels);
+  expect(migrations[at - 1]?.sql).toBe(harnessProfileMcpServers);
+  expect(migrations[at - 2]?.sql).toBe(taskSpeed);
 });
 
 test("071 moves the seen-id preference into claude_session_seen in order and drops the preference", () => {
@@ -1238,4 +1252,227 @@ test("the Gemini 4 Argon migrations were renumbered 063-065 -> 064-066 when main
   expect(ran).toEqual(["063_task_checkout_branch"]);
   const ids = db.query<{ id: string }, []>(`SELECT id FROM _migrations`).all().map((r) => r.id);
   for (const [id] of renumbered) expect(ids).toContain(id);
+});
+
+function columnNames(db: Database, table: string): string[] {
+  return db
+    .query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+    .all()
+    .map((r) => r.name);
+}
+
+test("072_task_speed turns fast 1/0 into speed fast/off on tasks and agent profiles, drops the fast column, and moves lastFast:<kind> prefs to lastSpeed:<kind>", () => {
+  const { db } = makeModelMigrationDb(
+    [
+      ["cursor", "cursor"],
+      ["codex", "codex"],
+    ],
+    `
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t1', 'cursor', 'composer-2', NULL, 1),
+      ('t2', 'cursor', 'composer-2', NULL, 0),
+      ('t3', 'codex', 'gpt-6.1-sol', 'high', 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p1', 'cursor', 'composer-2', NULL, 1),
+      ('p2', 'codex', 'gpt-6.1-sol', 'high', 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastFast:cursor', 'true', 7),
+      ('lastFast:codex', 'false', 8),
+      ('lastFast:fx', 'garbage', 9),
+      ('lastSpeed:codex', 'fast', 1),
+      ('lastModel:cursor', 'composer-2', 3);
+    `,
+  );
+
+  db.exec(taskSpeed);
+
+  expect(columnNames(db, "tasks")).not.toContain("fast");
+  expect(columnNames(db, "tasks")).toContain("speed");
+  expect(columnNames(db, "agent_profiles")).not.toContain("fast");
+  expect(columnNames(db, "agent_profiles")).toContain("speed");
+
+  expect(
+    db.query<{ id: string; model: string; speed: string }, []>(`SELECT id, model, speed FROM tasks ORDER BY id`).all(),
+  ).toEqual([
+    { id: "t1", model: "composer-2", speed: "fast" },
+    { id: "t2", model: "composer-2", speed: "off" },
+    { id: "t3", model: "gpt-6.1-sol", speed: "off" },
+  ]);
+  expect(
+    db.query<{ id: string; speed: string }, []>(`SELECT id, speed FROM agent_profiles ORDER BY id`).all(),
+  ).toEqual([
+    { id: "p1", speed: "fast" },
+    { id: "p2", speed: "off" },
+  ]);
+  // The migrated value replaces a pre-existing lastSpeed key; a non-'true'
+  // value reads as off; updated_at is carried over; every lastFast key goes.
+  expect(
+    db
+      .query<{ key: string; value: string; updated_at: number }, []>(
+        `SELECT key, value, updated_at FROM preferences ORDER BY key`,
+      )
+      .all(),
+  ).toEqual([
+    { key: "lastModel:cursor", value: "composer-2", updated_at: 3 },
+    { key: "lastSpeed:codex", value: "off", updated_at: 8 },
+    { key: "lastSpeed:cursor", value: "fast", updated_at: 7 },
+    { key: "lastSpeed:fx", value: "off", updated_at: 9 },
+  ]);
+
+  // New rows default to off, and the CHECK rejects anything but the three ids.
+  db.exec(`INSERT INTO tasks (id, agent) VALUES ('t4', 'cursor')`);
+  expect(db.query<{ speed: string }, []>(`SELECT speed FROM tasks WHERE id = 't4'`).get()?.speed).toBe("off");
+  db.exec(`UPDATE tasks SET speed = 'ultrafast' WHERE id = 't4'`);
+  expect(db.query<{ speed: string }, []>(`SELECT speed FROM tasks WHERE id = 't4'`).get()?.speed).toBe("ultrafast");
+  expect(() => db.exec(`UPDATE tasks SET speed = 'bogus' WHERE id = 't4'`)).toThrow();
+  expect(() => db.exec(`INSERT INTO tasks (id, agent, speed) VALUES ('t5', 'cursor', 'bogus')`)).toThrow();
+  expect(() =>
+    db.exec(`INSERT INTO agent_profiles (id, harness_id, model, speed) VALUES ('p3', 'cursor', 'x', 'bogus')`),
+  ).toThrow();
+  expect(() => db.exec(`UPDATE agent_profiles SET speed = NULL WHERE id = 'p1'`)).toThrow();
+  db.close();
+});
+
+test("073_harness_profile_mcp_servers adds profile_mcp_servers defaulting existing and new harness rows to 1", () => {
+  const db = new Database(":memory:");
+  db.exec(HARNESSES_DDL);
+  db.exec(`
+    INSERT INTO harnesses (id, kind, label, is_builtin, created_at, updated_at) VALUES
+      ('claude-code', 'claude-code', 'Claude Code', 1, 1, 1),
+      ('codex', 'codex', 'Codex', 1, 1, 1);
+  `);
+  db.exec(harnessProfileMcpServers);
+  expect(columnNames(db, "harnesses")).toContain("profile_mcp_servers");
+  db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('codex-2', 'codex', 'Codex 2', 2, 2)`);
+  expect(
+    db
+      .query<{ id: string; profile_mcp_servers: number }, []>(
+        `SELECT id, profile_mcp_servers FROM harnesses ORDER BY id`,
+      )
+      .all(),
+  ).toEqual([
+    { id: "claude-code", profile_mcp_servers: 1 },
+    { id: "codex", profile_mcp_servers: 1 },
+    { id: "codex-2", profile_mcp_servers: 1 },
+  ]);
+  db.exec(`UPDATE harnesses SET profile_mcp_servers = 0 WHERE id = 'codex'`);
+  expect(
+    db.query<{ v: number }, []>(`SELECT profile_mcp_servers AS v FROM harnesses WHERE id = 'codex'`).get()?.v,
+  ).toBe(0);
+  db.close();
+});
+
+test("074_retire_fx_models moves fx-kind rows on the 3 retired ids to deepseek/deepseek-v4-flash, leaves other kinds and zai/glm-5.3-flash rows alone, moves lastModel:fx off the retired ids and glm-5.3-flash, idempotently", () => {
+  const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
+    [
+      ["fx", "fx"],
+      ["fx-2", "fx"],
+      ["cursor", "cursor"],
+      ["codex", "codex"],
+    ],
+    `
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'fx', 'alibaba/qwen3-coder-plus', NULL, 0),
+      ('t02', 'fx', 'mistral/devstral-2', NULL, 0),
+      ('t03', 'fx-2', 'anthropic/claude-3-haiku', NULL, 0),
+      ('t04', 'fx', 'zai/glm-5.3-flash', 'auto', 0),
+      ('t05', 'fx', 'openai/gpt-5.2', 'high', 0),
+      ('t06', 'fx', NULL, NULL, 0),
+      ('t07', 'cursor', 'anthropic/claude-3-haiku', NULL, 0),
+      ('t08', 'codex', 'mistral/devstral-2', NULL, 0),
+      ('t09', 'deleted-fx', 'alibaba/qwen3-coder-plus', NULL, 0),
+      ('t10', 'fx', 'deepseek/deepseek-v4-flash', 'high', 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'fx', 'mistral/devstral-2', NULL, 0),
+      ('p02', 'fx-2', 'alibaba/qwen3-coder-plus', NULL, 0),
+      ('p03', 'fx', 'zai/glm-5.3-flash', NULL, 0),
+      ('p04', 'cursor', 'alibaba/qwen3-coder-plus', NULL, 0),
+      ('p05', 'codex', 'anthropic/claude-3-haiku', NULL, 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:fx', 'anthropic/claude-3-haiku', 5),
+      ('lastModel:cursor', 'mistral/devstral-2', 5),
+      ('lastModel:codex', 'zai/glm-5.3-flash', 5),
+      ('lastEffort:fx', 'auto', 5);
+    `,
+  );
+
+  db.exec(retireFxModels);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "deepseek/deepseek-v4-flash", effort: null, fast: 0 },
+    { id: "t02", model: "deepseek/deepseek-v4-flash", effort: null, fast: 0 },
+    { id: "t03", model: "deepseek/deepseek-v4-flash", effort: null, fast: 0 }, // extra fx harness via kind join
+    { id: "t04", model: "zai/glm-5.3-flash", effort: "auto", fast: 0 }, // untouched — not retired
+    { id: "t05", model: "openai/gpt-5.2", effort: "high", fast: 0 }, // untouched — other model
+    { id: "t06", model: null, effort: null, fast: 0 }, // untouched — NULL
+    { id: "t07", model: "anthropic/claude-3-haiku", effort: null, fast: 0 }, // untouched — cursor (kind-join control)
+    { id: "t08", model: "mistral/devstral-2", effort: null, fast: 0 }, // untouched — codex
+    { id: "t09", model: "alibaba/qwen3-coder-plus", effort: null, fast: 0 }, // untouched — orphan
+    { id: "t10", model: "deepseek/deepseek-v4-flash", effort: "high", fast: 0 },
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "deepseek/deepseek-v4-flash", effort: null, fast: 0 },
+    { id: "p02", model: "deepseek/deepseek-v4-flash", effort: null, fast: 0 },
+    { id: "p03", model: "zai/glm-5.3-flash", effort: null, fast: 0 }, // untouched — not retired
+    { id: "p04", model: "alibaba/qwen3-coder-plus", effort: null, fast: 0 }, // untouched — cursor
+    { id: "p05", model: "anthropic/claude-3-haiku", effort: null, fast: 0 }, // untouched — codex
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastEffort:fx", value: "auto", updated_at: 5 },
+    { key: "lastModel:codex", value: "zai/glm-5.3-flash", updated_at: 5 }, // untouched — other kind
+    { key: "lastModel:cursor", value: "mistral/devstral-2", updated_at: 5 }, // untouched — other kind
+    { key: "lastModel:fx", value: "deepseek/deepseek-v4-flash", updated_at: 5 },
+  ]);
+
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(retireFxModels);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+  db.close();
+});
+
+test("074 moves lastModel:fx off each retired id and off zai/glm-5.3-flash, and leaves a live fx pick alone", () => {
+  const cases: Array<[string, string]> = [
+    ["alibaba/qwen3-coder-plus", "deepseek/deepseek-v4-flash"],
+    ["mistral/devstral-2", "deepseek/deepseek-v4-flash"],
+    ["anthropic/claude-3-haiku", "deepseek/deepseek-v4-flash"],
+    ["zai/glm-5.3-flash", "deepseek/deepseek-v4-flash"],
+    ["openai/gpt-5.2", "openai/gpt-5.2"],
+    ["spacexai/grok-4.7", "spacexai/grok-4.7"],
+  ];
+  for (const [before, after] of cases) {
+    const { db, readPrefs } = makeModelMigrationDb(
+      [["fx", "fx"]],
+      `INSERT INTO preferences (key, value, updated_at) VALUES ('lastModel:fx', '${before}', 1);`,
+    );
+    db.exec(retireFxModels);
+    expect(readPrefs()).toEqual([{ key: "lastModel:fx", value: after, updated_at: 1 }]);
+    db.close();
+  }
+});
+
+test("a fresh DB migrated through 074 has speed (no fast) on tasks and agent_profiles and profile_mcp_servers on harnesses; re-running is a no-op", () => {
+  const db = new Database(":memory:");
+  migrate(db, migrations);
+  expect(columnNames(db, "tasks")).toContain("speed");
+  expect(columnNames(db, "tasks")).not.toContain("fast");
+  expect(columnNames(db, "agent_profiles")).toContain("speed");
+  expect(columnNames(db, "agent_profiles")).not.toContain("fast");
+  expect(columnNames(db, "harnesses")).toContain("profile_mcp_servers");
+  // Seeded built-in harnesses picked up the default.
+  const flags = db
+    .query<{ v: number }, []>(`SELECT profile_mcp_servers AS v FROM harnesses`)
+    .all()
+    .map((r) => r.v);
+  expect(flags.length).toBeGreaterThan(0);
+  expect(flags.every((v) => v === 1)).toBe(true);
+  // The CHECK survives in the stored schema.
+  const tasksSql = db
+    .query<{ sql: string }, []>(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'`)
+    .get()?.sql;
+  expect(tasksSql).toContain("'ultrafast'");
+  expect(migrate(db, migrations)).toEqual([]);
+  db.close();
 });

@@ -5,14 +5,14 @@ import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { api, type AgentModelMap } from "@/lib/api";
 import { useAgentProfiles } from "@/lib/agent-profiles";
-import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
+import { discoveredEffortsFor, mergeModelOptions, type DiscoveredModel } from "../../../shared/model-options.ts";
+import { supportedSpeeds } from "../../../shared/speed.ts";
 import {
   AGENT_OPTIONS,
   CATALOG_SCOPED_KINDS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   cursorModelIdCoveredByCatalog,
-  cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
   defaultModeFor,
   supportedEfforts,
@@ -22,11 +22,13 @@ import {
   type AgentProfile,
   type AgentStatus,
   type Harness,
+  type Speed,
 } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
 import { AgentProfileCard } from "./AgentProfileCard";
 import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
+import { showsSpeedPicker, SpeedPicker } from "./SpeedPicker";
 
 const initialMode = (kind: AgentKind) => defaultModeFor(kind);
 
@@ -49,33 +51,40 @@ export interface TaskLaunch {
   /** Per-harness model catalog (fx account-scoped, keyed by harness id) —
    *  preferred over `agentModels`' kind-level list when it has an entry for
    *  the selected harness, mirroring `NewTaskForm`'s `harnessModels` prop. */
-  harnessModels: Record<string, { id: string; label?: string }[]>;
+  harnessModels: Record<string, DiscoveredModel[]>;
   agent: string;
   kind: AgentKind;
   selectedStatus: AgentStatus | undefined;
   mode: string;
   model: string;
   effort: string | null;
-  /** Cursor-only "fast variant" toggle — auto-clears to `false` whenever
-   *  `fastAvailable` goes false (kind/model/effort change), mirroring
-   *  `NewTaskForm`'s identical rule. */
-  fast: boolean;
-  /** Cursor-only "Max Mode" (extra context) toggle — same auto-clear rule
-   *  as `fast`, keyed on `maxModeAvailable`. */
+  /** Speed tier (`off | fast | ultrafast`). Cursor auto-clears it to
+   *  `"off"` whenever the model/effort pair has no Fast variant (and every
+   *  kind but fx whenever the tier isn't offered); fx resets it only on a
+   *  user model change whose new model's tiers are known and exclude it
+   *  (see `setModel`) — never on load, since discovery may not be ready. */
+  speed: Speed;
+  /** Cursor-only "Max Mode" (extra context) toggle — auto-clears to
+   *  `false` whenever `maxModeAvailable` goes false. */
   maxMode: boolean;
-  setFast: (fast: boolean) => void;
+  setSpeed: (speed: Speed) => void;
   setMaxMode: (maxMode: boolean) => void;
-  fastAvailable: boolean;
+  /** The tiers the current kind/model/effort offers (`supportedSpeeds`, fed
+   *  the selected model's merged option so fx's discovery flags count). */
+  speedOptions: Speed[];
   maxModeAvailable: boolean;
   models: AgentOption[];
   modes: AgentOption[];
   efforts: AgentOption[];
   setMode: (mode: string) => void;
+  /** A user model pick. For fx it also resets `speed` to `"off"` when the
+   *  new model's tiers are known (discovery non-empty and trusted) and
+   *  don't include the current tier. */
   setModel: (model: string) => void;
   setEffort: (effort: string | null) => void;
   /** Switches the selected harness, resetting mode/model/effort to the new
    *  kind's defaults when the kind actually changes (matches
-   *  `ResolveConflictsDialog`'s `switchAgent`). */
+   *  `ResolveConflictsDialog`'s `switchAgent`; speed resets to `"off"`). */
   switchAgent: (nextId: string) => void;
   /** Persists the current mode/model/effort as `lastMode/lastModel/lastEffort:<kind>`
    *  preferences — call this right after a successful `createAndStartTask()`,
@@ -123,7 +132,7 @@ export interface TaskLaunch {
     mode: string;
     model: string;
     effort: string | null;
-    fast: boolean;
+    speed: Speed;
     maxMode: boolean;
   }>) => void;
 }
@@ -133,7 +142,7 @@ export function useTaskLaunch(
   opts?: {
     withProfiles?: boolean;
     /**
-     * Seed values for the manual harness/mode/model/effort/fast/maxMode
+     * Seed values for the manual harness/mode/model/effort/speed/maxMode
      * block, resolved by the open-effect INSTEAD OF `prefs.defaultHarness` /
      * `lastMode:<kind>` / `lastModel:<kind>` / `lastEffort:<kind>` — for a
      * caller seeding the picker from an already-fully-formed object (e.g.
@@ -164,7 +173,7 @@ export function useTaskLaunch(
       mode: string | null;
       model: string;
       effort: string | null;
-      fast: boolean;
+      speed: Speed;
       maxMode: boolean;
     };
   },
@@ -174,7 +183,7 @@ export function useTaskLaunch(
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], antigravity: [], fx: [] });
-  const [harnessModels, setHarnessModels] = useState<Record<string, { id: string; label?: string }[]>>({});
+  const [harnessModels, setHarnessModels] = useState<Record<string, DiscoveredModel[]>>({});
   // Seeded from `open` (not a bare `false`) so a hook whose owning component
   // mounts already-open is truthful on its very first render instead of
   // reporting "not loading" for one paint before the effect below flips it —
@@ -211,7 +220,7 @@ export function useTaskLaunch(
   });
   const [model, setModel] = useState<string>(initial?.model ?? DEFAULT_MODEL["claude-code"]);
   const [effort, setEffort] = useState<string | null>(initial ? initial.effort : DEFAULT_EFFORT["claude-code"]);
-  const [fast, setFast] = useState(initial?.fast ?? false);
+  const [speed, setSpeed] = useState<Speed>(initial?.speed ?? "off");
   const [maxMode, setMaxMode] = useState(initial?.maxMode ?? false);
 
   const [agentProfileId, setAgentProfileId] = useState<string | null>(null);
@@ -253,7 +262,7 @@ export function useTaskLaunch(
           setMode(initial.mode ?? initialMode(nextKind));
           setModel(initial.model);
           setEffort(initial.effort);
-          setFast(initial.fast);
+          setSpeed(initial.speed);
           setMaxMode(initial.maxMode);
           return;
         }
@@ -339,7 +348,9 @@ export function useTaskLaunch(
   const efforts = supportedEfforts(kind, model, discoveredEffortsFor(models, model));
   const effortsKey = efforts.map((o) => o.id).join(",");
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(model);
-  const fastAvailable = kind === "cursor" && cursorModelSupportsFast(model, effort);
+  const selectedModelOption = models.find((m) => m.id === model);
+  const speedOptions = supportedSpeeds(kind, model, effort, selectedModelOption);
+  const speedOptionsKey = speedOptions.join(",");
 
   useEffect(() => {
     if (efforts.length === 0) {
@@ -351,9 +362,15 @@ export function useTaskLaunch(
     setEffort(fallback);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, model, effortsKey]);
+  // Every kind but fx clears an unoffered tier as soon as it isn't offered
+  // (cursor: the model/effort pair lost its Fast variant — today's rule).
+  // fx never auto-clears here: its tiers come from discovery, which may not
+  // be ready yet; `setModel` below handles the one fx reset.
   useEffect(() => {
-    if (!fastAvailable && fast) setFast(false);
-  }, [fastAvailable, fast]);
+    if (speed === "off" || kind === "fx") return;
+    if (!speedOptions.includes(speed)) setSpeed("off");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kind, speed, speedOptionsKey]);
   useEffect(() => {
     if (!maxModeAvailable && maxMode) setMaxMode(false);
   }, [maxModeAvailable, maxMode]);
@@ -374,7 +391,21 @@ export function useTaskLaunch(
       setMode(initialMode(nextKind));
       setModel(DEFAULT_MODEL[nextKind]);
       setEffort(DEFAULT_EFFORT[nextKind]);
+      setSpeed("off");
     }
+  };
+
+  // The user-facing model pick. fx's one speed reset lives here, not in an
+  // effect: only a deliberate model change may drop the tier, and only when
+  // the harness's discovered catalog is known (non-empty, not distrusted as
+  // logged out) — the merged rows then carry the new model's real flags.
+  const pickModel = (next: string) => {
+    setModel(next);
+    if (kind !== "fx" || speed === "off" || next === model) return;
+    const discovered = harnessModels[agent] ?? agentModels[kind] ?? [];
+    if (discovered.length === 0 || selectedStatus?.loggedIn === false) return;
+    const nextOption = models.find((m) => m.id === next);
+    if (!supportedSpeeds(kind, next, effort, nextOption).includes(speed)) setSpeed("off");
   };
 
   const seed = (values: Partial<{
@@ -382,14 +413,14 @@ export function useTaskLaunch(
     mode: string;
     model: string;
     effort: string | null;
-    fast: boolean;
+    speed: Speed;
     maxMode: boolean;
   }>) => {
     if (values.agent !== undefined) switchAgent(values.agent);
     if (values.mode !== undefined) setMode(values.mode);
     if (values.model !== undefined) setModel(values.model);
     if (values.effort !== undefined) setEffort(values.effort);
-    if (values.fast !== undefined) setFast(values.fast);
+    if (values.speed !== undefined) setSpeed(values.speed);
     if (values.maxMode !== undefined) setMaxMode(values.maxMode);
   };
 
@@ -429,17 +460,17 @@ export function useTaskLaunch(
     mode,
     model,
     effort,
-    fast,
+    speed,
     maxMode,
-    setFast,
+    setSpeed,
     setMaxMode,
-    fastAvailable,
+    speedOptions,
     maxModeAvailable,
     models,
     modes,
     efforts,
     setMode,
-    setModel,
+    setModel: pickModel,
     setEffort,
     switchAgent,
     rememberPicks,
@@ -463,7 +494,7 @@ export function useTaskLaunch(
  *
  *  Renders an `<AgentProfilePicker>` above the manual controls unless
  *  `hideProfilePicker` is set. Once `launch.agentProfileId` names a profile,
- *  the harness grid / mode / model / effort / fast / max-mode controls are
+ *  the harness grid / mode / model / effort / speed / max-mode controls are
  *  replaced by a single `<AgentProfileCard variant="selected">` — the
  *  launch form's "one selection" rule (plan D5). */
 export function TaskLaunchPickers({
@@ -488,11 +519,11 @@ export function TaskLaunchPickers({
     models,
     effort,
     efforts,
-    fast,
+    speed,
     maxMode,
-    setFast,
+    setSpeed,
     setMaxMode,
-    fastAvailable,
+    speedOptions,
     maxModeAvailable,
     switchAgent,
     setMode,
@@ -630,36 +661,27 @@ export function TaskLaunchPickers({
             </div>
           </div>
 
-          {kind === "cursor" && (maxModeAvailable || maxMode || fastAvailable || fast) && (
+          {showsSpeedPicker(speedOptions, speed) && (
+            <div className="space-y-1">
+              <label className="text-muted-foreground">Speed</label>
+              <SpeedPicker options={speedOptions} value={speed} onChange={setSpeed} testId="launch-speed" />
+            </div>
+          )}
+
+          {kind === "cursor" && (maxModeAvailable || maxMode) && (
             <div className="grid grid-cols-2 gap-2">
-              {(maxModeAvailable || maxMode) && (
-                <label
-                  data-testid="launch-max-mode-toggle"
-                  className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs"
-                >
-                  <span>Max Mode</span>
-                  <Switch
-                    checked={maxMode}
-                    onCheckedChange={setMaxMode}
-                    disabled={!maxModeAvailable}
-                    aria-label="Use Cursor Max Mode context"
-                  />
-                </label>
-              )}
-              {(fastAvailable || fast) && (
-                <label
-                  data-testid="launch-fast-toggle"
-                  className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs"
-                >
-                  <span>Fast</span>
-                  <Switch
-                    checked={fast}
-                    onCheckedChange={setFast}
-                    disabled={!fastAvailable}
-                    aria-label="Use Cursor fast variant"
-                  />
-                </label>
-              )}
+              <label
+                data-testid="launch-max-mode-toggle"
+                className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs"
+              >
+                <span>Max Mode</span>
+                <Switch
+                  checked={maxMode}
+                  onCheckedChange={setMaxMode}
+                  disabled={!maxModeAvailable}
+                  aria-label="Use Cursor Max Mode context"
+                />
+              </label>
             </div>
           )}
         </>

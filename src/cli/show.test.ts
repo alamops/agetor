@@ -220,7 +220,7 @@ test("show: a task bound to an agent profile prints a 'profile:' line (not 'agen
         model: "opus-5",
         effort: null,
         mode: null,
-        fast: false,
+        speed: "off",
         maxMode: false,
         instructions: "",
         skills: [],

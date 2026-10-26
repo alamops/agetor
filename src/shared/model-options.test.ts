@@ -524,6 +524,82 @@ test("discoveredEffortsFor over merged rows: loggedIn:false distrusts discovered
   expect(discoveredEffortsFor(merged, "a")).toBeNull();
 });
 
+// --- rule 8: discovered speed flags (fast / ultrafast) -------------------
+
+test("rule 8: a curated∩discovered row copies fast/ultrafast, keeping curated label/hint", () => {
+  const curated = curatedFixture();
+  const discovered: DiscoveredModel[] = [{ id: "openai/gpt-5.2", label: "Ignored", fast: true, ultrafast: true }];
+  for (const scoped of [false, true]) {
+    const result = mergeModelOptions({ curated, discovered, scoped, selected: null });
+    expect(result.find((r) => r.id === "openai/gpt-5.2")).toEqual({
+      id: "openai/gpt-5.2",
+      label: "GPT-5.2",
+      fast: true,
+      ultrafast: true,
+    });
+  }
+});
+
+test("rule 8: a discovered-only row copies its speed flags alongside efforts", () => {
+  const curated = curatedFixture();
+  const discovered: DiscoveredModel[] = [
+    { id: "e2e/discovered-only", label: "Discovered Only", efforts: ["high"], fast: true },
+  ];
+  const result = mergeModelOptions({ curated, discovered, scoped: true, selected: null });
+  expect(result.find((r) => r.id === "e2e/discovered-only")).toEqual({
+    id: "e2e/discovered-only",
+    label: "Discovered Only",
+    efforts: ["high"],
+    fast: true,
+  });
+});
+
+test("rule 8: a selected id present only in discovery keeps its speed flags (the selected row is never stripped of them)", () => {
+  const curated = curatedFixture();
+  const discovered: DiscoveredModel[] = [{ id: "e2e/selected-fast", ultrafast: true }];
+  const result = mergeModelOptions({ curated, discovered, scoped: true, selected: "e2e/selected-fast" });
+  const row = result.find((r) => r.id === "e2e/selected-fast");
+  expect(row?.unlisted).toBeUndefined();
+  expect(row?.ultrafast).toBe(true);
+  expect(row).not.toHaveProperty("fast");
+});
+
+test("rule 8: the rule-6 unlisted row for a selected id absent from both lists carries no speed flags", () => {
+  const curated = curatedFixture();
+  const discovered: DiscoveredModel[] = [{ id: "openai/gpt-5.2", fast: true, ultrafast: true }];
+  const result = mergeModelOptions({ curated, discovered, scoped: true, selected: "e2e/stale-model" });
+  const row = result.find((r) => r.id === "e2e/stale-model");
+  expect(row?.unlisted).toBe(true);
+  expect(row).not.toHaveProperty("fast");
+  expect(row).not.toHaveProperty("ultrafast");
+});
+
+test("rule 8: false speed flags never attach a key, on any row kind", () => {
+  const curated = curatedFixture();
+  const discovered: DiscoveredModel[] = [
+    { id: "openai/gpt-5.2", fast: false, ultrafast: false },
+    { id: "e2e/discovered-only", fast: false, ultrafast: false },
+  ];
+  const result = mergeModelOptions({ curated, discovered, scoped: false, selected: null });
+  for (const id of ["openai/gpt-5.2", "e2e/discovered-only"]) {
+    const row = result.find((r) => r.id === id);
+    expect(row).toBeDefined();
+    expect(row).not.toHaveProperty("fast");
+    expect(row).not.toHaveProperty("ultrafast");
+  }
+});
+
+test("rule 8: loggedIn:false and the discovery-empty fallback carry no speed flags", () => {
+  const curated = curatedFixture();
+  const discovered: DiscoveredModel[] = [{ id: "openai/gpt-5.2", fast: true, ultrafast: true }];
+  const loggedOut = mergeModelOptions({ curated, discovered, scoped: true, selected: null, loggedIn: false });
+  const empty = mergeModelOptions({ curated, discovered: [], scoped: true, selected: null });
+  for (const row of [...loggedOut, ...empty]) {
+    expect(row).not.toHaveProperty("fast");
+    expect(row).not.toHaveProperty("ultrafast");
+  }
+});
+
 test("discoveredEffortsFor over merged rows: loggedIn:true (or omitted) trusts discovered efforts", () => {
   const mergedLoggedIn = mergeModelOptions({
     curated: [{ id: "a", label: "A" }],

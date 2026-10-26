@@ -42,7 +42,7 @@ async function settle(ms = 200) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
-test("createTask({agentProfileId}) copies harness/model/effort/mode/fast/maxMode from the profile (body values ignored) and stores the snapshot; unknown id -> {error}", async () => {
+test("createTask({agentProfileId}) copies harness/model/effort/mode/speed/maxMode from the profile (body values ignored) and stores the snapshot; unknown id -> {error}", async () => {
   const { createTask } = await import("./orchestrator.ts");
   const { db, agentProfiles, harnesses } = await import("./db.ts");
   const claudeHarness = harnesses.getByIdOrKind("claude-code");
@@ -54,7 +54,7 @@ test("createTask({agentProfileId}) copies harness/model/effort/mode/fast/maxMode
     model: "profile-model-x",
     effort: "high",
     mode: "auto",
-    fast: true,
+    speed: "fast",
     maxMode: false,
     instructions: "Always write tests first.",
     skills: ["code-review", "simplify"],
@@ -70,7 +70,7 @@ test("createTask({agentProfileId}) copies harness/model/effort/mode/fast/maxMode
       model: "body-model-should-be-ignored",
       effort: "low",
       mode: "manual",
-      fast: false,
+      speed: "off",
       maxMode: true,
       workdir: process.cwd(),
       isolation: "none",
@@ -83,7 +83,8 @@ test("createTask({agentProfileId}) copies harness/model/effort/mode/fast/maxMode
     expect(task.model).toBe("profile-model-x");
     expect(task.effort).toBe("high");
     expect(task.mode).toBe("auto");
-    expect(task.fast).toBe(true);
+    expect(task.speed).toBe("fast");
+    expect(task.agentProfile?.speed).toBe("fast");
     expect(task.maxMode).toBe(false);
 
     expect(task.agentProfileId).toBe(profile.id);
@@ -130,7 +131,7 @@ test("createTask(input, { resolvedAgentProfile }) binds the supplied profile eve
     model: "profile-model-resolved",
     effort: "high",
     mode: "auto",
-    fast: false,
+    speed: "off",
     maxMode: false,
     instructions: "Validated before a slow side effect.",
     skills: [],
@@ -246,6 +247,53 @@ test("createTask + startTask: a profile with effort:null on claude-code's defaul
   }
 });
 
+// Speed tier (plan §3.1 / T5): `speed` is one of the six fields the live-
+// profile refresh copies down, so a profile edit made after create but
+// before the first run must reach the task row (and its snapshot) at Run.
+test("startTask: an unstarted profile-bound task picks up a profile speed change at first run", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { db, agentProfiles, tasks } = await import("./db.ts");
+  const { DEFAULT_MODEL } = await import("../shared/types.ts");
+
+  const profile = agentProfiles.insert({
+    name: uniqueProfileName("speed-drift"),
+    harness: "claude-code",
+    model: DEFAULT_MODEL["claude-code"],
+    effort: "high",
+    speed: "off",
+    instructions: "",
+    skills: [],
+  });
+
+  const created = await createTask({
+    title: "profile speed changes before first run",
+    prompt: "hello",
+    workdir: process.cwd(),
+    isolation: "none",
+    agentProfileId: profile.id,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  try {
+    expect(created.task.speed).toBe("off");
+    expect(created.task.agentProfile?.speed).toBe("off");
+
+    agentProfiles.update(profile.id, { speed: "fast" });
+
+    const started = await startTask(taskId);
+    if ("error" in started) throw new Error(started.error);
+    await settle();
+
+    const afterStart = tasks.get(taskId);
+    expect(afterStart?.speed).toBe("fast");
+    expect(afterStart?.agentProfile?.speed).toBe("fast");
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    agentProfiles.delete(profile.id);
+  }
+});
+
 // Review fix F1 finding 3: `driftedFromRow`'s snapshot comparison must
 // exclude `capturedAt` (stamped fresh on every `effectiveAgentProfile()`
 // call) — otherwise it's always "true" and `startTaskInner`'s live-profile
@@ -262,7 +310,7 @@ test("agentProfileSnapshotDrifted: true when prior is null or a real field diffe
     model: "opus-5",
     effort: "high",
     mode: "auto",
-    fast: false,
+    speed: "off" as const,
     maxMode: false,
     instructions: "be terse",
     skills: ["a", "b"],

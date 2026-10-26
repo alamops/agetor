@@ -52,11 +52,17 @@ export const PERMISSION_MODE_STATUS_PREFIX = "permission-mode: ";
  * Sentinel prefix for the `status` chunk fx-acp.ts emits per ACP
  * `usage_update` notification. Payload is JSON: `{used, size, cost?:
  * {amount, currency}}` (verbatim ACP shape — `used`/`size` are token counts,
- * `cost` is present only when fx reports one). RunPanel suppresses this
- * prefix from the transcript's status dividers (same as
- * `PERMISSION_MODE_STATUS_PREFIX` — that suppression is load-bearing, not
+ * `cost` is present only when fx reports one; fx 0.0.14 dropped `cost` from
+ * `usage_update` altogether, so it stays optional for older binaries only).
+ * RunPanel suppresses this prefix from the transcript's status dividers (same
+ * as `PERMISSION_MODE_STATUS_PREFIX` — that suppression is load-bearing, not
  * dead code) and instead derives the latest value into a small usage chip on
  * the run's summary row.
+ *
+ * Despite the `fx-` name the sentinel is harness-neutral: the cursor driver
+ * reuses it for cursor-agent's `result.usage` (a `{turn: {...}}` body with
+ * input/output/cache token counts), since every surface already suppresses
+ * and parses it (docs/plans/fx-0.0.14-and-cursor-updates.md §3.3 D24).
  */
 export const FX_USAGE_STATUS_PREFIX = "fx-usage: ";
 
@@ -75,8 +81,10 @@ export interface FxUsagePayload {
   /** Context tokens used / window size — ACP `usage_update` (fx ≥0.0.8). */
   used?: number;
   size?: number;
+  /** fx 0.0.8–0.0.13 only — fx 0.0.14 no longer sends `cost`. */
   cost?: { amount: number; currency: string };
-  /** Per-turn token counts from the `session/prompt` result (fx ≥0.0.8). */
+  /** Per-turn token counts from the `session/prompt` result (fx ≥0.0.8), or
+   *  cursor-agent's `result.usage` (no `reasoningTokens` there). */
   turn?: {
     inputTokens?: number;
     outputTokens?: number;
@@ -154,7 +162,7 @@ export const FX_RECOVERY_STATUS_PREFIX = "fx-recovery: ";
  *  {@link FxRecoveryPayload}. `"cleared"` is agetor's own label for a wire
  *  `modelResponseRecovery: null` (fx has dropped the checkpoint), not a
  *  state fx itself names. */
-export type FxRecoveryState = "active" | "paused" | "recovered" | "cleared";
+export type FxRecoveryState = "active" | "paused" | "recovered" | "failed" | "cleared";
 
 /**
  * JSON body carried after `FX_RECOVERY_STATUS_PREFIX`. Mirrors fx's own
@@ -164,9 +172,11 @@ export type FxRecoveryState = "active" | "paused" | "recovered" | "cleared";
  */
 export interface FxRecoveryPayload {
   /** `"active"` while fx is mid-retry, `"paused"` once fx gives up and the
-   *  checkpoint is resumable, `"recovered"` once a retry succeeds, or
-   *  `"cleared"` for the wire's `modelResponseRecovery: null` (checkpoint
-   *  dropped — e.g. consumed by a normal follow-up prompt). */
+   *  checkpoint is resumable, `"recovered"` once a retry succeeds, `"failed"`
+   *  (fx ≥0.0.14: `kind == terminal_provider_error` without a pause — fx
+   *  stopped retrying and there is nothing to resume), or `"cleared"` for the
+   *  wire's `modelResponseRecovery: null` (checkpoint dropped — e.g. consumed
+   *  by a normal follow-up prompt). */
   state: FxRecoveryState;
   /** Verbatim fx enum tags (forward-compat: unknown values pass through and
    *  render as-is). `kind` distinguishes e.g. `auto_retry` from
@@ -174,15 +184,17 @@ export interface FxRecoveryPayload {
   kind?: string;
   /** Why this attempt is happening, e.g. `rate_limited`, `network_interrupted`,
    *  `response_interrupted`, `provider_stream_timeout`, `provider_unavailable`,
-   *  `system_resumed`, `authentication`, `request_limit_reached`. */
+   *  `system_resumed`, `authentication`, `request_limit_reached`, and (fx
+   *  0.0.14) `connectivity_lost`, `compaction_prepared`. */
   cause?: string;
   /** What fx is doing about it, e.g. `retrying_request`, `continuing_response`,
    *  `regenerating_tool`, `continuing_after_tool`, `reconciling_tool`,
-   *  `waiting_for_connectivity`, `paused`. */
+   *  `waiting_for_connectivity`, `paused`, and (fx 0.0.14) `checking_liveness`,
+   *  `delivering_response`. */
   action?: string;
   /** Set only on a `paused` update: what the caller needs to do next, e.g.
    *  `continue_later` (Resume applies), `inspect_uncertain_tool`,
-   *  `change_request`. */
+   *  `change_request`, `surface_stall` (fx 0.0.14; not resumable). */
   requiredAction?: string;
   /** 1-based retry attempt number and the configured cap for this recovery
    *  episode (fx's `10/10` in "recovery paused after 10/10 attempts"). */
@@ -340,6 +352,12 @@ export interface Harness {
    *  toggleable too — this is the one carve-out from the built-in
    *  immutability rule. */
   enabled: boolean;
+  /** fx only (`harnesses.profile_mcp_servers`, migration 073): when on, the
+   *  fx driver asks fx (0.0.13 or later) to load the user's own fx profile
+   *  MCP servers into each ACP session (`_meta.fx.profileMcpServers: true` on
+   *  `session/new`/`resume`/`load`). Absent ⇒ on; meaningless for other
+   *  kinds. */
+  profileMcpServers?: boolean;
 }
 
 /** A user-global reusable prompt snippet — not tied to any task or project. */
@@ -351,8 +369,14 @@ export interface SavedPrompt {
   updatedAt: number;
 }
 
+/** Speed tier a task or agent profile runs at. `fast` replaced the old
+ *  cursor-only boolean; `ultrafast` is fx's faster Gateway lane. See
+ *  `./speed.ts` for the pure helpers (`supportedSpeeds`, `resolveSpeedInput`). */
+export type Speed = "off" | "fast" | "ultrafast";
+export const SPEEDS = ["off", "fast", "ultrafast"] as const satisfies readonly Speed[];
+
 /**
- * A reusable, named bundle of harness + model + effort + mode + fast/maxMode
+ * A reusable, named bundle of harness + model + effort + mode + speed/maxMode
  * + free-text instructions + skills, picked on task launch instead of
  * choosing each field by hand. Persisted in the `agent_profiles` table
  * (`src/bun/db.ts`'s `agentProfiles` module); names are unique
@@ -368,7 +392,12 @@ export interface AgentProfile {
   model: string;
   effort: string | null;
   mode: string | null; // null ⇒ defaultModeFor(kind) at spawn
-  fast: boolean; // cursor only
+  /** Speed tier (`supportedSpeeds` in `./speed.ts` says which tiers a
+   *  kind/model offers). Stored in `agent_profiles.speed` (migration 072). */
+  speed: Speed;
+  /** Derived `speed !== "off"`, emitted for older clients (D13) — never read
+   *  by agetor code. */
+  fast?: boolean;
   maxMode: boolean; // cursor only
   instructions: string; // may be ""
   skills: string[]; // bare skill names, no leading "/", deduped, max 50, each ≤ 100 chars
@@ -403,7 +432,11 @@ export interface AgentProfileSnapshot {
   model: string;
   effort: string | null;
   mode: string | null;
-  fast: boolean;
+  speed: Speed;
+  /** Derived `speed !== "off"`, kept for older readers of the frozen
+   *  snapshot JSON — never read by agetor code (legacy `{fast}` snapshots are
+   *  read through `speedFromFast` in `src/bun/db.ts`). */
+  fast?: boolean;
   maxMode: boolean;
   instructions: string;
   skills: string[];
@@ -853,6 +886,12 @@ export interface HarnessStatus {
    *  probe supplies one, else one of agetor's two synthesized fallback hints
    *  (missing credentials vs. an expired login); otherwise null. */
   authHelp: string | null;
+  /** fx only: the permission mode fx's own saved profile starts in
+   *  (`fx status --json` `permission_mode`, reported since fx 0.0.8; probed
+   *  WITHOUT `FX_PERMISSION_MODE` so the env override can't mask it). `"ask"`
+   *  drives the Settings / `agetor harness ls` hint. `null` (or absent) when
+   *  the kind isn't fx, the field is absent, or the probe failed. */
+  fxProfilePermissionMode?: string | null;
 }
 
 /**
@@ -1428,7 +1467,7 @@ export interface Task {
    * Set only at create time by `createTask` from `POST /tasks`'s
    * `agentProfileId` (400 on an unknown id); never patchable (kept out of
    * `ALLOWED_PATCH_FIELDS` — `PATCH /tasks/:id` instead 409s when it would
-   * touch agent/mode/model/effort/fast/maxMode while this is set). Refreshed
+   * touch agent/mode/model/effort/speed/maxMode while this is set). Refreshed
    * — together with `agentProfile` and the six copied fields — by
    * `startTask`, but only before the task's first run (the "live-until-
    * first-run" rule: a not-yet-started task tracks live profile edits,
@@ -1520,11 +1559,15 @@ export interface Task {
    */
   effort: string | null;
   /**
-   * Fast model variant toggle. Currently only consumed by Cursor, whose CLI
-   * exposes Fast as part of the selected model id rather than as a standalone
-   * flag. Non-Cursor harnesses ignore it.
+   * Speed tier — `off | fast | ultrafast` (`tasks.speed`, migration 072).
+   * Cursor folds Fast into the model id (`cursorModelArg`); fx sets its ACP
+   * `fast`/`ultrafast` session options. Other kinds only offer `off`
+   * (`supportedSpeeds` in `./speed.ts`).
    */
-  fast: boolean;
+  speed: Speed;
+  /** Derived `speed !== "off"`, emitted for older clients (D13) — never read
+   *  by agetor code. */
+  fast?: boolean;
   /**
    * Cursor Max Mode / large-context toggle. This is intentionally separate
    * from effort="max", which means maximum reasoning/thinking effort.
@@ -2504,28 +2547,25 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // accounts with 3.1 preview access (else to 3 Pro preview, or 2.5 Pro with
   // no preview access at all — gemini-cli 0.58.0 resolveModel, 2026-09-02).
   "gemini": "gemini-3.1-pro-preview",
-  // Owner-chosen default (2026-08-27). fx's own compiled default is still
-  // moonshotai/kimi-k3 (verified via empty-HOME `fx status --json` on
-  // 0.0.6), but the Vercel AI Gateway catalog is account-scoped — K3 is
-  // absent from a standard `fx login` team account's 158-id catalog — so
-  // agetor pins the model fx actually runs on that account instead
-  // (`~/.fx/settings.json` on the reference account). Ids are Vercel AI
-  // Gateway ids, passed verbatim. fx is exempt from the "always default to
-  // the best available model" rule above: the Gateway bills per token to the
-  // user's own account, and flagship tiers (the twenty `catalogOnly` rows in
-  // `AGENT_OPTIONS.fx.models`) stay one click away
-  // in the picker as catalog-gated rows — offered only when the signed-in
-  // account's catalog actually contains them (see `AgentOption.catalogOnly`).
-  // Re-verified 2026-08-31 on fx 0.0.7: compiled default unchanged
-  // (moonshotai/kimi-k3 via empty-HOME `fx status --json`), zai/glm-5.3-flash
-  // still present in the (grown to 234-id) unauth catalog — the reference
-  // signed-in 158-id account could not be re-checked this pass (expired
-  // login token). Re-verified 2026-09-08 and 0.0.8 (`builtins/gateway.zig
-  // default_model`): compiled default still moonshotai/kimi-k3, unchanged.
-  // Latest: 2026-09-14 on 0.0.9 and 0.0.10 — compiled default still
-  // moonshotai/kimi-k3, unauth catalog grown to 247 ids, zai/glm-5.3-flash
-  // still present; signed-in 158-id account still unverifiable.
-  "fx": "zai/glm-5.3-flash",
+  // Owner decision 2026-10-22 (docs/plans/fx-0.0.14-and-cursor-updates-grill.md
+  // D21, evidence G2): deepseek/deepseek-v4-flash. The Vercel AI Gateway
+  // catalog is account-scoped, and the owner's signed-in standard `fx login`
+  // catalog (145 ids, measured 2026-10-22) lacks both the previous default
+  // (zai/glm-5.3-flash, owner pick of 2026-08-27, which stays a curated row)
+  // and fx's own compiled default — spacexai/grok-4.7 since fx 0.0.11
+  // (previously moonshotai/kimi-k3), which stays `catalogOnly` for the same
+  // reason. DeepSeek V4 Flash is present in that signed-in catalog and in
+  // fx 0.0.14's 264-id unauthenticated one. Ids are Vercel AI Gateway ids,
+  // passed verbatim. fx is exempt from the "always default to the best
+  // available model" rule above: the Gateway bills per token to the user's
+  // own account, and flagship tiers (the `catalogOnly` rows in
+  // `AGENT_OPTIONS.fx.models`) stay one click away in the picker as
+  // catalog-gated rows — offered only when the signed-in account's catalog
+  // actually contains them (see `AgentOption.catalogOnly`). Migration 074
+  // rewrites the retired fx ids (and a `lastModel:fx` pref on
+  // zai/glm-5.3-flash) to this value; null-model fx tasks resolve to it at
+  // spawn with no data migration.
+  "fx": "deepseek/deepseek-v4-flash",
   "antigravity": "gemini-3.8-flash-high",
 };
 
@@ -3059,10 +3099,12 @@ export function cursorModelArg(model: string, effort: string | null, fast: boole
 export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> = {
   "claude-code": { code: "auto", plan: "plan" },
   "codex": { code: "auto", plan: "ask" },
-  // Cursor has no first-class plan mode either — same posture as codex:
-  // Plan routes to "ask" (propose-only; cursor cannot execute unapproved
-  // actions headlessly).
-  "cursor": { code: "auto", plan: "ask" },
+  // cursor-agent has a native read-only planning mode (`--mode plan`,
+  // verified on 2026.10.22 — docs/plans/fx-0.0.14-and-cursor-updates.md
+  // §3.3), so Plan maps to it; approving the plan flips an unbound task to
+  // "auto".
+  // "ask" (`--mode ask`, read-only Q&A) stays an explicit picker choice.
+  "cursor": { code: "auto", plan: "plan" },
   // Gemini's `--approval-mode plan` is a real read-only mode (verified via
   // `gemini --help` on CLI 0.54.0), closer to claude's native `plan` than
   // codex's read-only-sandbox stand-in — but reuse codex's "ask" id since
@@ -3116,7 +3158,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "high", label: "High", hint: "Deep reasoning. The API default on most models (Opus 5.5 defaults to medium)." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
-  { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where Cursor exposes it." },
+  { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where the harness exposes it (Cursor, fx)." },
   { id: "none", label: "No thinking", hint: "Skip thinking where the model exposes a no-thinking variant." },
   { id: "auto", label: "Model default", hint: "Let the model/gateway pick its own reasoning level — fx only today (fx's `auto`, its 'default' option). fx-only by construction: curated tables and the discovered branch both keep it off every other kind." },
 ];
@@ -3278,47 +3320,56 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // it on 2026-09-28 the same way (see its row); a 34th, openai/gpt-6.1-sol,
   // joined it on 2026-09-30 the same way (see its row); a 35th,
   // anthropic/claude-haiku-5.5, joined it on 2026-10-07 the same way (see
-  // its row). An
+  // its row).
+  // 2026-10-22 (fx 0.0.14, docs/plans/fx-0.0.14-and-cursor-updates.md §3.4
+  // P10/D6/D10): fx 0.0.14's `models --json` now carries each model's
+  // `efforts` (the ACP `effort` option is that list plus `auto`), and 20 of
+  // the curated sets differed from it — those rows were refreshed to the
+  // 0.0.14 catalog (several no-effort rows now advertise a set, and `minimal`
+  // appears for the OpenAI GPT-5.x rows); the other 13 are unchanged.
+  // alibaba/qwen3-coder-plus, mistral/devstral-2 and anthropic/claude-3-haiku
+  // were retired (absent from both the unauthenticated and the owner's
+  // signed-in catalog; migration 074). Discovery is now the first source —
+  // `ModelOption.efforts` from `models[].efforts` wins over this table in
+  // `supportedEfforts` — so this table only matters while discovery is
+  // empty (fx ≤0.0.13, not installed, probe failed). An
   // unknown/discovered-only fx id falls back to `DEFAULT_MODEL.fx`'s set via
   // `supportedEfforts`, and the driver validates at runtime against whatever
   // `effort` option fx actually returns for that session — so drift between
   // this curated table and the live Gateway catalog is only a picker-hint
   // problem, never a failed run (an unoffered value degrades to a status
   // breadcrumb). Ids map to fx's own values verbatim
-  // (`low|medium|high|xhigh|max|none|auto`).
+  // (`minimal|low|medium|high|xhigh|max|none|auto`).
   fx: {
     "zai/glm-5.3-flash": ["max", "high", "low", "auto"],
-    "zai/glm-5v-turbo": [],
-    "zai/glm-4.7": [],
-    "openai/gpt-5.2": ["xhigh", "high", "medium", "low", "none", "auto"],
-    "openai/gpt-5.1-codex-max": ["xhigh", "high", "medium", "low", "auto"],
-    "openai/gpt-5.4-mini": ["xhigh", "high", "medium", "low", "none", "auto"],
-    "spacexai/grok-4.6": [],
-    "spacexai/grok-build-0.1": [],
-    "moonshotai/kimi-k2.7-code": [],
-    "deepseek/deepseek-v4-flash": ["xhigh", "high", "auto"],
+    "zai/glm-5v-turbo": ["high", "medium", "low", "none", "auto"],
+    "zai/glm-4.7": ["high", "medium", "low", "none", "auto"],
+    "openai/gpt-5.2": ["xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+    "openai/gpt-5.1-codex-max": ["high", "medium", "low", "none", "auto"],
+    "openai/gpt-5.4-mini": ["xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+    "spacexai/grok-4.6": ["xhigh", "high", "medium", "low", "auto"],
+    "spacexai/grok-build-0.1": ["high", "medium", "low", "none", "auto"],
+    "moonshotai/kimi-k2.7-code": ["high", "medium", "low", "none", "auto"],
+    "deepseek/deepseek-v4-flash": ["high", "medium", "low", "none", "auto"],
     "minimax/minimax-m3": [],
-    "alibaba/qwen3.8-flash": [],
-    "alibaba/qwen3-coder-plus": [],
-    "mistral/devstral-2": [],
-    "google/gemini-2.5-flash": [],
-    "anthropic/claude-3-haiku": [],
-    "anthropic/claude-opus-5": ["max", "xhigh", "high", "medium", "low", "auto"],
-    "anthropic/claude-sonnet-5": ["xhigh", "high", "medium", "low", "auto"],
-    "openai/gpt-5.5": ["xhigh", "high", "medium", "low", "none", "auto"],
-    "google/gemini-3.1-pro-preview": ["high", "medium", "low", "auto"],
-    "google/gemini-3.8-flash": ["high", "medium", "low", "auto"],
+    "alibaba/qwen3.8-flash": ["xhigh", "medium", "low", "auto"],
+    "google/gemini-2.5-flash": ["high", "medium", "low", "none", "auto"],
+    "anthropic/claude-opus-5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "anthropic/claude-sonnet-5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "openai/gpt-5.5": ["xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+    "google/gemini-3.1-pro-preview": ["high", "low", "auto"],
+    "google/gemini-3.8-flash": ["high", "low", "auto"],
     "moonshotai/kimi-k3": ["max", "high", "low", "auto"],
-    "anthropic/claude-fable-5.1": ["xhigh", "high", "medium", "low", "auto"],
+    "anthropic/claude-fable-5.1": ["max", "xhigh", "high", "medium", "low", "auto"],
     "anthropic/claude-haiku-4.5": [],
     "openai/gpt-6-astra": ["max", "xhigh", "high", "medium", "low", "auto"],
-    "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"],
     "zai/glm-5.3": ["max", "high", "low", "auto"],
-    "deepseek/deepseek-v4-pro": ["xhigh", "high", "auto"],
-    // 2026-09-21: not ACP-probed (no fx credentials that pass) — `[]` rests on
-    // the public Gateway catalog entry, which carries no `reasoning_options`,
-    // exactly like spacexai/grok-4.6. docs/plans/add-grok-4-7.md §8 A1.
-    "spacexai/grok-4.7": [],
+    "deepseek/deepseek-v4-pro": ["max", "high", "low", "none", "auto"],
+    // Added 2026-09-21 as `[]` (docs/plans/add-grok-4-7.md §8 A1); refreshed
+    // 2026-10-22 from fx 0.0.14's `models[].efforts`, same set as
+    // spacexai/grok-4.6.
+    "spacexai/grok-4.7": ["xhigh", "high", "medium", "low", "auto"],
     // 2026-09-22: not ACP-probed (no fx credentials that pass) — rests on the
     // public Gateway catalog entry's reasoning_options (effort
     // low/medium/high/xhigh/max, no none: thinking can't be disabled) plus
@@ -3603,7 +3654,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     })),
     modes: [
       { id: "auto", label: "Auto (force)", hint: "Hands-off — runs with --force, executing edits and commands without approval prompts." },
-      { id: "ask", label: "Read-only", hint: "Propose-only — cursor cannot execute unapproved actions headlessly." },
+      { id: "plan", label: "Plan", hint: "Read-only planning — cursor-agent --mode plan. Approve the plan to implement." },
+      { id: "ask", label: "Read-only", hint: "Read-only Q&A — cursor-agent --mode ask. Answers questions, makes no edits." },
     ],
     efforts: EFFORT_OPTIONS,
   },
@@ -3727,8 +3779,20 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // total. This pass also found alibaba/qwen3-coder-plus and
     // anthropic/claude-3-haiku absent from the unauth view (mistral/devstral-2
     // still gone) — left as-is, see docs/plans/add-gemini-4-argon.md §9.
+    // 2026-10-22 (fx 0.0.14, docs/plans/fx-0.0.14-and-cursor-updates.md §3.4):
+    // the unauthenticated catalog reads 264 ids and the owner's signed-in
+    // standard `fx login` catalog 145. Neither carries
+    // alibaba/qwen3-coder-plus, mistral/devstral-2 or anthropic/claude-3-haiku,
+    // so those three are retired (migration 074 moves fx-kind tasks and
+    // profiles on them to the default) — 13 standard + 20 catalogOnly rows,
+    // 33 curated ids total. The signed-in catalog also lacks
+    // zai/glm-5.3-flash and spacexai/grok-4.7, so the default moved to
+    // deepseek/deepseek-v4-flash (first row; see `DEFAULT_MODEL.fx`);
+    // zai/glm-5.3-flash stays a standard row (not retired, just absent from
+    // that account — the curated ∩ discovered merge hides it there).
     models: [
-      { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
+      { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash", hint: "Default — 1M context · 384K output. In a standard signed-in Gateway catalog." },
+      { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "1M context · 131K output. Absent from some signed-in standard catalogs." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
       { id: "zai/glm-4.7", label: "GLM 4.7", hint: "200K context · 120K output, prior Z.AI flagship." },
       { id: "openai/gpt-5.2", label: "GPT-5.2", hint: "400K context · 128K output — top OpenAI tier on a standard Gateway plan; openai/gpt-5.2-fast via discovery." },
@@ -3736,14 +3800,10 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "openai/gpt-5.4-mini", label: "GPT-5.4 Mini", hint: "400K context · 128K output, newest-gen small model." },
       { id: "spacexai/grok-4.6", label: "Grok 4.6", hint: "500K context · 500K output." },
       { id: "spacexai/grok-build-0.1", label: "Grok Build 0.1", hint: "256K context · 256K output, xAI's coding-agent model." },
-      { id: "moonshotai/kimi-k2.7-code", label: "Kimi K2.7 Code", hint: "256K context · 32K output — nearest available successor to fx's compiled default (K3)." },
-      { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash", hint: "1M context · 384K output." },
+      { id: "moonshotai/kimi-k2.7-code", label: "Kimi K2.7 Code", hint: "256K context · 32K output, Moonshot's coding-tuned tier." },
       { id: "minimax/minimax-m3", label: "MiniMax M3", hint: "1M context · 1M output." },
       { id: "alibaba/qwen3.8-flash", label: "Qwen 3.8 Flash", hint: "991K context · 128K output." },
-      { id: "alibaba/qwen3-coder-plus", label: "Qwen3 Coder Plus", hint: "1M context · 65K output, coding-tuned." },
-      { id: "mistral/devstral-2", label: "Devstral 2", hint: "256K context · 256K output, coding-tuned." },
       { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "1M context · 65K output." },
-      { id: "anthropic/claude-3-haiku", label: "Claude 3 Haiku", hint: "200K context · 4K output — the only Anthropic id a standard Gateway plan exposes." },
       { id: "anthropic/claude-opus-5", label: "Claude Opus 5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "openai/gpt-5.5", label: "GPT-5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
@@ -3770,16 +3830,14 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
-    // 23 of the 36 curated models accept the effort flag (see
-    // MODEL_EFFORT_SUPPORT.fx — 16 live-probed on fx 0.0.10, plus
-    // anthropic/claude-opus-5.5, openai/gpt-6-sol and openai/gpt-6-luna from
-    // their Gateway reasoning_options, all 2026-09-22, and
-    // anthropic/claude-sonnet-5.5 on 2026-09-28 and openai/gpt-6.1-sol on
-    // 2026-09-30, anthropic/claude-haiku-5.5 on 2026-10-07, and
-    // google/gemini-4-argon on 2026-10-14); the other 13
-    // report an empty set and the picker collapses for those, same as any
-    // other kind's no-effort models. Every id-supported model always
-    // includes `auto` (fx's own default) last, per EFFORT_OPTIONS.
+    // 31 of the 33 curated models accept the effort flag (see
+    // MODEL_EFFORT_SUPPORT.fx, refreshed 2026-10-22 against fx 0.0.14's
+    // `models[].efforts`); the other 2 (minimax/minimax-m3,
+    // anthropic/claude-haiku-4.5) report an empty set and the picker
+    // collapses for those, same as any other kind's no-effort models. A
+    // discovered `models[].efforts` set wins over the table. Every
+    // id-supported model always includes `auto` (fx's own default) last, per
+    // EFFORT_OPTIONS.
     efforts: EFFORT_OPTIONS,
   },
   antigravity: {

@@ -9,6 +9,7 @@ import { escapeFreeText } from "../../shared/terminal-text.ts";
 import type { RunEvent, GlobalEvent, Task } from "../../shared/types.ts";
 import { FX_RECOVERY_STATUS_PREFIX, isInternalStatusSentinel, retentionTrimNote } from "../../shared/types.ts";
 import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../../shared/fx-recovery.ts";
+import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
 import { COMPACTION_SUMMARY_LABEL, compactionSummaryLine } from "../../shared/compaction.ts";
 import {
@@ -141,14 +142,18 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   });
 }
 
-// Internal-only sentinel status chunks (permission-mode chip, fx usage chip,
+// Internal-only sentinel status chunks (permission-mode chip, fx/cursor usage chip,
 // …) are UI-plumbing, not transcript content — see `isInternalStatusSentinel`
 // in shared/types.ts, the one predicate every raw-status renderer must
 // consult so a new sentinel can't leak verbatim into one surface while
-// another suppresses it. `--json` still emits the raw event for programmatic
-// consumers; only the human-readable render skips it.
+// another suppresses it. fx's internal tool calls (a `tool_use`/`tool_result`
+// stamped `"internal": true`, `isHiddenToolEvent`) are skipped the same way —
+// the rows stay persisted, hidden only where a transcript is rendered (D19).
+// `--json` still emits the raw event for programmatic consumers; only the
+// human-readable render skips it.
 function shouldSkipEvent(e: RunEvent): boolean {
-  return e.stream === "status" && isInternalStatusSentinel(e.data);
+  if (e.stream === "status") return isInternalStatusSentinel(e.data);
+  return isHiddenToolEvent(e.stream, e.data);
 }
 
 /**
@@ -165,7 +170,7 @@ function shouldSkipEvent(e: RunEvent): boolean {
  * retrying request in 8s · attempt 5/10") — the whole point of surfacing
  * the Gateway rate-limit storm in `agetor logs` as it happens — so it
  * prints in yellow via `fxRecoveryNoticeText`. Every other state
- * (`paused`/`recovered`/`cleared`) — or a body that fails to parse — prints
+ * (`paused`/`recovered`/`failed`/`cleared`) — or a body that fails to parse — prints
  * NOTHING here: the driver already emits a separate, persisted PLAIN status
  * line at those terminal transitions (`fxRecoverySummaryLine`, see
  * fx-acp.ts), and rendering this sentinel too would double it. A payload

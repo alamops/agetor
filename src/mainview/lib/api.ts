@@ -80,6 +80,7 @@ import type {
   RunEvent,
   SavedPrompt,
   Subagent,
+  Speed,
   Task,
   TaskDiff,
   TaskEventsReplayMeta,
@@ -206,12 +207,12 @@ export interface AvailableExtension {
  *  built-in harness only — see `HarnessModelMap` for the per-harness list a
  *  multi-account setup needs. */
 export interface AgentModelMap {
-  "claude-code": { id: string; label?: string; efforts?: string[] }[];
-  "codex": { id: string; label?: string; efforts?: string[] }[];
-  "cursor": { id: string; label?: string; efforts?: string[] }[];
-  "gemini": { id: string; label?: string; efforts?: string[] }[];
-  "antigravity": { id: string; label?: string; efforts?: string[] }[];
-  "fx": { id: string; label?: string; efforts?: string[] }[];
+  "claude-code": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "codex": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "cursor": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "gemini": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "antigravity": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "fx": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
 }
 
 /** Per-harness model id list from `GET /agent-models/harnesses` — one entry
@@ -221,10 +222,11 @@ export interface AgentModelMap {
  *  `ready` is false until the boot discovery sweep has resolved at least
  *  once — before that, `byHarness` may be incomplete or empty. `efforts`
  *  carries the CLI-discovered per-model reasoning-effort ids (codex only
- *  today; see `discoveredEffortsFor` in `src/shared/model-options.ts`). */
+ *  today; see `discoveredEffortsFor` in `src/shared/model-options.ts`), and
+ *  `fast`/`ultrafast` the fx speed-tier flags (`supportedSpeeds`). */
 export interface HarnessModelMap {
   ready: boolean;
-  byHarness: Record<string, { id: string; label?: string; efforts?: string[] }[]>;
+  byHarness: Record<string, { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[]>;
 }
 
 /** Pending multi-question card from claude's built-in AskUserQuestion tool
@@ -496,6 +498,8 @@ export interface HarnessInput {
   home: string | null;
   bin: string | null;
   env: Record<string, string>;
+  /** Forward the profile's MCP servers to the harness (absent ⇒ on). */
+  profileMcpServers?: boolean;
 }
 
 /** Body shape for `POST /agent-profiles` / `PATCH /agent-profiles/:id` — see
@@ -509,7 +513,7 @@ export interface AgentProfileInput {
   model: string;
   effort: string | null;
   mode: string | null;
-  fast: boolean;
+  speed: Speed;
   maxMode: boolean;
   instructions: string;
   skills: string[];
@@ -639,7 +643,7 @@ export const api = {
   deleteAgentProfile: (id: string) =>
     j<void>(`/agent-profiles/${encodeURIComponent(id)}`, { method: "DELETE" }),
   /** Detach a task from its bound agent profile — the values it copied stay
-   *  on the task row, but the four dropdowns (+ cursor fast/max) unlock.
+   *  on the task row, but the four dropdowns (+ speed, cursor max) unlock.
    *  404 unknown task, 409 archived. */
   detachTaskAgentProfile: (taskId: string) =>
     j<Task>(`/tasks/${encodeURIComponent(taskId)}/agent-profile`, { method: "DELETE" }),
@@ -770,7 +774,7 @@ export const api = {
     mode?: string;
     model?: string;
     effort?: string | null;
-    fast?: boolean;
+    speed?: Speed;
     maxMode?: boolean;
     agentProfileId?: string;
     /** Client-minted uuid so the caller can subscribe to this clone's
@@ -1561,7 +1565,7 @@ export const api = {
     mode?: string | null;
     model?: string | null;
     effort?: string | null;
-    fast?: boolean;
+    speed?: Speed;
     maxMode?: boolean;
     /** Initial column. Defaults to "backlog" if omitted. */
     column?: ColumnId;
@@ -1576,7 +1580,7 @@ export const api = {
      *  alongside `issueUrl`. */
     issueSnapshot?: string;
     /** Id of an {@link AgentProfile} to launch from — the server resolves it
-     *  and overrides `agent`/`model`/`effort`/`mode`/`fast`/`maxMode` from the
+     *  and overrides `agent`/`model`/`effort`/`mode`/`speed`/`maxMode` from the
      *  profile (body-provided values for those fields are ignored); 400 on an
      *  unknown id. */
     agentProfileId?: string | null;
@@ -1780,8 +1784,11 @@ export const api = {
    *  auto-sends an approval message that resumes the agent.
    *  `retry: false` — like `sendRunInput`, a replay would re-send a
    *  duplicate approval message to a live agent session. */
+  /** Resolves to the updated Task. A profile-bound cursor task in Plan mode
+   *  (which the route can't switch to Auto) additionally carries `warning`,
+   *  the same line the route writes to the transcript. */
   approvePlan: (taskId: string, planId: string) =>
-    j<Task>(`/tasks/${encodeURIComponent(taskId)}/plans/${encodeURIComponent(planId)}/approve`, {
+    j<Task & { warning?: string }>(`/tasks/${encodeURIComponent(taskId)}/plans/${encodeURIComponent(planId)}/approve`, {
       method: "POST",
     }, { retry: false }),
 

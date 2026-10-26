@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { AlertCircle, ClipboardList, Info, Loader2, X } from "lucide-react";
+import { toast } from "sonner";
 import { Dialog } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -281,8 +282,9 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
       if (plan.editedContent !== null && text === plan.content) {
         onPlanUpdated(await api.savePlanEdit(task.id, plan.id, null));
       }
-      const updated = await api.approvePlan(task.id, plan.id);
+      const { warning, ...updated } = await api.approvePlan(task.id, plan.id);
       onPlanUpdated(updated);
+      if (warning) toast.warning(warning);
       // Approval succeeded and the message reached the agent — the dialog's
       // job is done. Close directly (not `requestClose`): any persisted draft
       // was reconciled above, so the only local divergence left is a
@@ -307,8 +309,9 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
       // parent's `plans` mirror already carries the persisted edit, so the
       // dialog doesn't read falsely dirty until the next poll catches up.
       onPlanUpdated(await api.savePlanEdit(task.id, plan.id, text));
-      const updated = await api.approvePlan(task.id, plan.id);
+      const { warning, ...updated } = await api.approvePlan(task.id, plan.id);
       onPlanUpdated(updated);
+      if (warning) toast.warning(warning);
       // Same as doApprove — the edit was just persisted, so nothing is dirty.
       onClose();
     } catch (e) {

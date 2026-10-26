@@ -184,7 +184,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
         mode: launch.mode,
         model: launch.model,
         effort: launch.effort,
-        fast: launch.fast,
+        speed: launch.speed,
         maxMode: launch.maxMode,
         // Omit entirely when no profile is selected (finding F2-1) — see
         // NewTaskForm.submit's matching comment.

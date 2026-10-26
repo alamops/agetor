@@ -11,7 +11,7 @@ import type {
   Task,
 } from "../../shared/types.ts";
 import { newStep } from "../../shared/pipeline.ts";
-import { AGENT_OPTIONS, DEFAULT_MODEL, supportedEfforts } from "../../shared/types.ts";
+import { AGENT_OPTIONS, DEFAULT_MODEL, cursorModelSupportsFast, supportedEfforts } from "../../shared/types.ts";
 import type { DiscoveredModel } from "../../shared/model-options.ts";
 import { buildIssueTaskPrompt, issueTaskTitle, renderIssueThreadMarkdown } from "../../shared/issue-task.ts";
 
@@ -64,9 +64,8 @@ afterAll(() => {
   mock.module("../output.ts", () => realOutputSnapshot);
 });
 
-const { parseAdd, cmdAdd, chooseAddPath, resolveInitialModel, defaultNonInteractiveMode } = await import(
-  "./add.ts"
-);
+const { parseAdd, cmdAdd, chooseAddPath, resolveInitialModel, defaultNonInteractiveMode, wizardSpeedChoices } =
+  await import("./add.ts");
 
 // ── fixtures ─────────────────────────────────────────────────────────────
 
@@ -166,7 +165,7 @@ function makeAgentProfile(overrides: Partial<AgentProfile> = {}): AgentProfile {
     model: "gpt-6-astra",
     effort: "high",
     mode: "auto",
-    fast: false,
+    speed: "off",
     maxMode: false,
     instructions: "Be thorough.",
     skills: ["code-review"],
@@ -773,6 +772,147 @@ test("cmdAdd: an add with no --agent at all defaults its mode via claude-code's 
   expect(createTaskCalls[0]!.mode).toBe("auto");
 });
 
+// ── --speed / --fast / --no-fast (docs/plans/fx-0.0.14-and-cursor-updates.md
+// §3.1 "CLI alias") ───────────────────────────────────────────────────────
+
+describe("--speed", () => {
+  test("parseAdd: --speed takes each tier", () => {
+    expect(parseAdd(["--speed", "off"]).speed).toBe("off");
+    expect(parseAdd(["--speed", "fast"]).speed).toBe("fast");
+    expect(parseAdd(["--speed", "ultrafast"]).speed).toBe("ultrafast");
+  });
+
+  test("parseAdd: --fast is --speed fast and --no-fast is --speed off", () => {
+    expect(parseAdd(["--fast"]).speed).toBe("fast");
+    expect(parseAdd(["--no-fast"]).speed).toBe("off");
+  });
+
+  test("parseAdd: the later of several speed flags wins", () => {
+    expect(parseAdd(["--speed", "ultrafast", "--fast"]).speed).toBe("fast");
+    expect(parseAdd(["--fast", "--speed", "ultrafast"]).speed).toBe("ultrafast");
+    expect(parseAdd(["--fast", "--no-fast"]).speed).toBe("off");
+    expect(parseAdd(["--no-fast", "--fast"]).speed).toBe("fast");
+    expect(parseAdd(["--speed", "fast", "--no-fast"]).speed).toBe("off");
+  });
+
+  test("parseAdd: no speed flag leaves speed undefined", () => {
+    expect(parseAdd(["--title", "T", "--prompt", "P"]).speed).toBeUndefined();
+  });
+
+  test("parseAdd: an unknown --speed tier is a usage error naming the tiers", () => {
+    expect(() => parseAdd(["--speed", "turbo"])).toThrow("'--speed' must be one of off, fast, ultrafast (got 'turbo')");
+  });
+
+  test("parseAdd: --speed with no value (or a flag as its value) is refused", () => {
+    expect(() => parseAdd(["--speed"])).toThrow("'--speed' needs a value");
+    expect(() => parseAdd(["--speed", "--fast"])).toThrow("'--speed' needs a value");
+  });
+
+  test("cmdAdd: an invalid --speed fails before any request", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+    await expect(cmdAdd(["--title", "T", "--prompt", "P", "--speed", "warp"], flags())).rejects.toThrow(
+      /'--speed' must be one of off, fast, ultrafast/,
+    );
+    expect(createTaskCalls).toEqual([]);
+  });
+
+  test("cmdAdd: --speed ultrafast sends speed, never the legacy fast field", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx", "--speed", "ultrafast"], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.speed).toBe("ultrafast");
+    expect("fast" in createTaskCalls[0]!).toBe(false);
+  });
+
+  test("cmdAdd: --fast sends speed fast and --no-fast sends speed off", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "cursor", "--fast"], flags());
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "cursor", "--no-fast"], flags());
+
+    expect(createTaskCalls.map((c) => c.speed)).toEqual(["fast", "off"]);
+    expect(createTaskCalls.some((c) => "fast" in c)).toBe(false);
+  });
+
+  test("cmdAdd: the later speed flag is the one sent", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx", "--fast", "--speed", "ultrafast"], flags());
+
+    expect(createTaskCalls[0]!.speed).toBe("ultrafast");
+  });
+
+  test("cmdAdd: no speed flag leaves speed to the server's default", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "codex"], flags());
+
+    expect(createTaskCalls[0]!.speed).toBeUndefined();
+  });
+
+  // The wizard's Speed step reads exactly this helper (cmdAdd itself always
+  // runs with the mocked `isTTY: false`, so the step isn't driven here).
+
+  test("wizardSpeedChoices: a kind with nothing beyond off offers no step", () => {
+    expect(wizardSpeedChoices("claude-code", DEFAULT_MODEL["claude-code"], null, [])).toEqual([]);
+    expect(wizardSpeedChoices("codex", DEFAULT_MODEL.codex, "high", [])).toEqual([]);
+  });
+
+  test("wizardSpeedChoices: fx offers the tiers discovery flagged on the selected model row", () => {
+    const rows = [
+      { id: "vendor/model-a", label: "A", fast: true, ultrafast: true },
+      { id: "vendor/model-b", label: "B", fast: true },
+      { id: "vendor/model-c", label: "C" },
+    ];
+    expect(wizardSpeedChoices("fx", "vendor/model-a", "auto", rows).map((o) => o.id)).toEqual([
+      "off",
+      "fast",
+      "ultrafast",
+    ]);
+    expect(wizardSpeedChoices("fx", "vendor/model-b", "auto", rows).map((o) => o.id)).toEqual(["off", "fast"]);
+    expect(wizardSpeedChoices("fx", "vendor/model-c", "auto", rows)).toEqual([]);
+    // A model with no merged row (nothing discovered) offers nothing beyond off.
+    expect(wizardSpeedChoices("fx", "vendor/unknown", "auto", rows)).toEqual([]);
+  });
+
+  test("wizardSpeedChoices: cursor offers Fast exactly when the model/effort pair has a Fast variant", () => {
+    const fastCapable = AGENT_OPTIONS.cursor.models.find((m) =>
+      [null, ...supportedEfforts("cursor", m.id).map((e) => e.id)].some((e) => cursorModelSupportsFast(m.id, e)),
+    );
+    expect(fastCapable).toBeDefined();
+    const effort =
+      [null, ...supportedEfforts("cursor", fastCapable!.id).map((e) => e.id)].find((e) =>
+        cursorModelSupportsFast(fastCapable!.id, e),
+      ) ?? null;
+    expect(wizardSpeedChoices("cursor", fastCapable!.id, effort, []).map((o) => o.id)).toEqual(["off", "fast"]);
+    const notCapable = AGENT_OPTIONS.cursor.models.find(
+      (m) => ![null, ...supportedEfforts("cursor", m.id).map((e) => e.id)].some((e) => cursorModelSupportsFast(m.id, e)),
+    );
+    if (notCapable) expect(wizardSpeedChoices("cursor", notCapable.id, null, [])).toEqual([]);
+  });
+
+  test("wizardSpeedChoices: rows carry the shared Off / Fast / Ultrafast labels", () => {
+    const rows = [{ id: "vendor/model-a", label: "A", fast: true, ultrafast: true }];
+    expect(wizardSpeedChoices("fx", "vendor/model-a", null, rows).map((o) => o.label)).toEqual([
+      "Off",
+      "Fast",
+      "Ultrafast",
+    ]);
+  });
+});
+
 // ── --profile (docs/plans/agent-profiles.md §3 D13, TT6) ────────────────
 //
 // `--profile <id|name>` launches a task from a saved AgentProfile instead of
@@ -780,7 +920,7 @@ test("cmdAdd: an add with no --agent at all defaults its mode via claude-code's 
 // exported — checked through `cmdAdd`'s thrown usage error) rejects
 // combining it with any of the six manual fields; `baseInput` (not exported
 // either) sends only `agentProfileId` and omits agent/model/mode/effort/
-// fast/maxMode entirely when a profile id is present; ref resolution goes
+// speed/maxMode entirely when a profile id is present; ref resolution goes
 // through the already-unit-tested `matchAgentProfileRef`.
 
 describe("--profile", () => {
@@ -807,7 +947,7 @@ describe("--profile", () => {
     reset();
     await expect(
       cmdAdd(["--profile", "Reviewer", "--agent", "codex"], flags()),
-    ).rejects.toThrow(/--profile cannot be combined with --agent\/--model\/--mode\/--effort\/--fast\/--max-mode/);
+    ).rejects.toThrow(/--profile cannot be combined with --agent\/--model\/--mode\/--effort\/--speed\/--fast\/--max-mode/);
   });
 
   test("cmdAdd: --profile combined with --model throws the usage error", async () => {
@@ -829,6 +969,20 @@ describe("--profile", () => {
     await expect(
       cmdAdd(["--profile", "Reviewer", "--effort", "high"], flags()),
     ).rejects.toThrow(/--profile cannot be combined/);
+  });
+
+  test("cmdAdd: --profile combined with --speed throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--speed", "ultrafast"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile combined with --speed off throws the usage error too", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--speed", "off"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
   });
 
   test("cmdAdd: --profile combined with --fast throws the usage error", async () => {
@@ -926,9 +1080,9 @@ describe("--profile", () => {
   });
 
   // ── baseInput's profile branch: agentProfileId replaces the whole manual
-  // agent/model/mode/effort/fast/maxMode block ────────────────────────────
+  // agent/model/mode/effort/speed/maxMode block ───────────────────────────
 
-  test("cmdAdd: a --profile task carries agentProfileId and omits agent/model/mode/effort/fast/maxMode entirely", async () => {
+  test("cmdAdd: a --profile task carries agentProfileId and omits agent/model/mode/effort/speed/maxMode entirely", async () => {
     reset();
     const { client, createTaskCalls } = makeProfileClient([makeAgentProfile({ id: "abc-123", name: "Reviewer" })]);
     currentClient = client;
@@ -941,7 +1095,8 @@ describe("--profile", () => {
     expect(input.agent).toBeUndefined();
     expect(input.model).toBeUndefined();
     expect(input.effort).toBeUndefined();
-    expect(input.fast).toBeUndefined();
+    expect(input.speed).toBeUndefined();
+    expect("fast" in input).toBe(false);
     expect(input.maxMode).toBeUndefined();
     // Also proves `defaultNonInteractiveMode`'s fill-the-gap fallback is
     // skipped for a profile add (`if (!o.mode && !o.profile) …`) — a manual
@@ -990,7 +1145,7 @@ describe("--profile", () => {
 // task. `assertPipelineFlagCombo` (not exported — checked through cmdAdd's
 // thrown usage error) rejects combining it with `--profile` or any of the
 // six manual-launch fields; `baseInput` (not exported either) sends only
-// `pipelineId` and omits agentProfileId/agent/model/mode/effort/fast/
+// `pipelineId` and omits agentProfileId/agent/model/mode/effort/speed/
 // maxMode entirely when a pipeline id is present; ref resolution goes
 // through the already-unit-tested `matchPipelineRef`.
 
@@ -1013,7 +1168,7 @@ describe("--pipeline", () => {
     reset();
     await expect(
       cmdAdd(["--pipeline", "Bug fix flow", "--profile", "Reviewer"], flags()),
-    ).rejects.toThrow(/--pipeline cannot be combined with --profile\/--agent\/--model\/--mode\/--effort\/--fast\/--max-mode/);
+    ).rejects.toThrow(/--pipeline cannot be combined with --profile\/--agent\/--model\/--mode\/--effort\/--speed\/--fast\/--max-mode/);
   });
 
   test("cmdAdd: --pipeline combined with --agent throws the usage error", async () => {
@@ -1042,6 +1197,13 @@ describe("--pipeline", () => {
     await expect(
       cmdAdd(["--pipeline", "Bug fix flow", "--effort", "high"], flags()),
     ).rejects.toThrow(/--pipeline cannot be combined/);
+  });
+
+  test("cmdAdd: --pipeline combined with --speed throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--pipeline", "Bug fix flow", "--speed", "fast"], flags())).rejects.toThrow(
+      /--pipeline cannot be combined/,
+    );
   });
 
   test("cmdAdd: --pipeline combined with --fast throws the usage error", async () => {
@@ -1138,9 +1300,9 @@ describe("--pipeline", () => {
   });
 
   // ── baseInput's pipeline branch: pipelineId replaces the whole manual
-  // agent/model/mode/effort/fast/maxMode AND agentProfileId block ─────────
+  // agent/model/mode/effort/speed/maxMode AND agentProfileId block ────────
 
-  test("cmdAdd: a --pipeline task carries pipelineId and omits agentProfileId/agent/model/mode/effort/fast/maxMode entirely", async () => {
+  test("cmdAdd: a --pipeline task carries pipelineId and omits agentProfileId/agent/model/mode/effort/speed/maxMode entirely", async () => {
     reset();
     const { client, createTaskCalls } = makePipelineClient([makePipeline({ id: "abc-123", name: "Bug fix flow" })]);
     currentClient = client;
@@ -1154,7 +1316,8 @@ describe("--pipeline", () => {
     expect(input.agent).toBeUndefined();
     expect(input.model).toBeUndefined();
     expect(input.effort).toBeUndefined();
-    expect(input.fast).toBeUndefined();
+    expect(input.speed).toBeUndefined();
+    expect("fast" in input).toBe(false);
     expect(input.maxMode).toBeUndefined();
     // Also proves the non-interactive mode-fill fallback is skipped for a
     // pipeline add (`if (!o.mode && !o.profile && !o.pipeline) …`), same as

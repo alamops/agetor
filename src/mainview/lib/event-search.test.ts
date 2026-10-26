@@ -294,6 +294,57 @@ test("findMatchingEventIds: multiple tool_results folding into the same owner al
 });
 
 // ---------------------------------------------------------------------------
+// hidden (internal) tool events — D19
+// ---------------------------------------------------------------------------
+
+test("searchableEventText: an internal-stamped tool_use / tool_result is never searchable", () => {
+  expect(searchableEventText("tool_use", JSON.stringify({ id: "t1", name: "needle_tool", input: {}, internal: true }))).toBeNull();
+  expect(searchableEventText("tool_result", JSON.stringify({ toolUseId: "t1", content: "needle", internal: true }))).toBeNull();
+});
+
+test("searchableEventText: `internal: true` nested in input (not top-level) stays searchable", () => {
+  const data = JSON.stringify({ id: "t1", name: "Bash", input: { internal: true, cmd: "needle" } });
+  expect(searchableEventText("tool_use", data)).toContain("needle");
+});
+
+test("findMatchingEventIds: a hidden tool_use and its stamped result never match", () => {
+  const events = [
+    ev("assistant", "needle in prose"),
+    ev("tool_use", JSON.stringify({ id: "t1", name: "needle_tool", input: { q: "needle" }, internal: true })),
+    ev("tool_result", JSON.stringify({ toolUseId: "t1", content: "needle output", internal: true })),
+  ];
+  expect(findMatchingEventIds(events, "needle")).toEqual([0]);
+  expect(findMatchingEventIds(events, "needle_tool")).toBe(NO_MATCHES);
+});
+
+test("findMatchingEventIds: an unstamped result answering a hidden tool_use is dropped with it, never an orphan match", () => {
+  const events = [
+    ev("tool_use", JSON.stringify({ id: "t1", name: "plumbing", input: {}, internal: true })),
+    ev("tool_result", JSON.stringify({ toolUseId: "t1", content: "needle output" })),
+  ];
+  expect(findMatchingEventIds(events, "needle")).toBe(NO_MATCHES);
+});
+
+test("findMatchingEventIds: a stamped result under a visible tool_use adds no text to its owner", () => {
+  const events = [
+    ev("tool_use", JSON.stringify({ id: "t1", name: "Bash", input: "ls" })),
+    ev("tool_result", JSON.stringify({ toolUseId: "t1", content: "needle", internal: true })),
+  ];
+  expect(findMatchingEventIds(events, "needle")).toBe(NO_MATCHES);
+  expect(findMatchingEventIds(events, "bash")).toEqual([0]);
+});
+
+test("findMatchingEventIds: a visible tool call next to a hidden one still matches at its own index", () => {
+  const events = [
+    ev("tool_use", JSON.stringify({ id: "h1", name: "plumbing", input: "needle", internal: true })),
+    ev("tool_result", JSON.stringify({ toolUseId: "h1", content: "needle", internal: true })),
+    ev("tool_use", JSON.stringify({ id: "v1", name: "Read", input: "x" })),
+    ev("tool_result", JSON.stringify({ toolUseId: "v1", content: "needle found" })),
+  ];
+  expect(findMatchingEventIds(events, "needle")).toEqual([2]);
+});
+
+// ---------------------------------------------------------------------------
 // stepMatchIndex
 // ---------------------------------------------------------------------------
 

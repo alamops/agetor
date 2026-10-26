@@ -65,7 +65,7 @@ async function onePipelineTask(stepInstructions: string) {
   const { newStep } = await import("../shared/pipeline.ts");
   const profile = agentProfiles.insert({
     name: `checkout-${randomUUID()}`, harness: "claude-code", model: "fake-model", effort: null, mode: null,
-    fast: false, maxMode: false, instructions: "", skills: [],
+    speed: "off", maxMode: false, instructions: "", skills: [],
   });
   const A = newStep({ name: "A", agentProfileId: profile.id, instructions: stepInstructions });
   const pipeline = pipelines.insert({

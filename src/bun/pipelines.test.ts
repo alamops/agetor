@@ -94,7 +94,7 @@ function makeTaskRow(taskId: string, overrides: Partial<Task> = {}): Task {
     mode: null,
     model: null,
     effort: null,
-    fast: false,
+    speed: "off",
     maxMode: false,
     references: [],
     backlog: [],
@@ -873,9 +873,12 @@ test("parsePipelineRunState: a snapshot.graph that's shape-valid but semanticall
   expect(validParsed?.snapshot?.maxSteps).toBe(10);
   expect(validParsed?.snapshot?.capturedAt).toBe(123);
   // `profiles` is kept as "a record of objects" (not deep-validated against
-  // `AgentProfileSnapshot`) — same type escape hatch as the handoff fixture.
+  // `AgentProfileSnapshot`) — same type escape hatch as the handoff fixture —
+  // except that each entry's speed tier is normalized on read: a snapshot
+  // with neither `speed` nor legacy `fast` reads as `speed: "off"` plus the
+  // derived `fast: false`.
   expect(validParsed?.snapshot?.profiles).toEqual(
-    { "profile-1": { id: "profile-1" } } as unknown as PipelineRunSnapshotProfiles,
+    { "profile-1": { id: "profile-1", speed: "off", fast: false } } as unknown as PipelineRunSnapshotProfiles,
   );
 });
 

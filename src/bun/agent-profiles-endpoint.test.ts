@@ -64,7 +64,7 @@ async function createProfile(overrides: Record<string, unknown> = {}): Promise<A
       model: "claude-opus-4-7",
       effort: "high",
       mode: "auto",
-      fast: false,
+      speed: "off",
       maxMode: false,
       instructions: "Be terse.",
       skills: ["skill-a", "skill-b"],
@@ -116,6 +116,7 @@ test("POST /agent-profiles happy path creates and returns the profile with the e
     model: "claude-opus-4-7",
     effort: "high",
     mode: "auto",
+    speed: "off",
     fast: false,
     maxMode: false,
     instructions: "Be terse.",
@@ -129,7 +130,7 @@ test("POST /agent-profiles happy path creates and returns the profile with the e
   expect(list).toEqual([created]);
 });
 
-test("POST /agent-profiles defaults effort/mode to null, fast/maxMode to false, instructions to '', skills to [] when omitted", async () => {
+test("POST /agent-profiles defaults effort/mode to null, speed to off (fast/maxMode false), instructions to '', skills to [] when omitted", async () => {
   const res = await call("/agent-profiles", {
     method: "POST",
     body: JSON.stringify({ name: "Minimal", harness: "claude-code", model: "m" }),
@@ -138,6 +139,7 @@ test("POST /agent-profiles defaults effort/mode to null, fast/maxMode to false, 
   const created = (await res.json()) as AgentProfile;
   expect(created.effort).toBeNull();
   expect(created.mode).toBeNull();
+  expect(created.speed).toBe("off");
   expect(created.fast).toBe(false);
   expect(created.maxMode).toBe(false);
   expect(created.instructions).toBe("");
@@ -535,14 +537,14 @@ test("DELETE /agent-profiles/:id happy path returns { ok: true } and the list om
 // POST /tasks with agentProfileId — overrides + 400s
 // ---------------------------------------------------------------------------
 
-test("POST /tasks with agentProfileId overrides agent/model/effort/mode/fast/maxMode from the profile and stores the snapshot", async () => {
+test("POST /tasks with agentProfileId overrides agent/model/effort/mode/speed/maxMode from the profile and stores the snapshot", async () => {
   const profile = await createProfile({
     name: "Overriding Agent",
     harness: "claude-code",
     model: "claude-opus-4-7",
     effort: "high",
     mode: "auto",
-    fast: true,
+    speed: "fast",
     maxMode: true,
     instructions: "Be nice.",
     skills: ["a", "b"],
@@ -554,7 +556,7 @@ test("POST /tasks with agentProfileId overrides agent/model/effort/mode/fast/max
     model: "ignored-model",
     effort: "ignored-effort",
     mode: "ignored-mode",
-    fast: false,
+    speed: "off",
     maxMode: false,
   });
 
@@ -563,6 +565,7 @@ test("POST /tasks with agentProfileId overrides agent/model/effort/mode/fast/max
   expect(task.model).toBe("claude-opus-4-7");
   expect(task.effort).toBe("high");
   expect(task.mode).toBe("auto");
+  expect(task.speed).toBe("fast");
   expect(task.fast).toBe(true);
   expect(task.maxMode).toBe(true);
 
@@ -575,7 +578,7 @@ test("POST /tasks with agentProfileId overrides agent/model/effort/mode/fast/max
     model: "claude-opus-4-7",
     effort: "high",
     mode: "auto",
-    fast: true,
+    speed: "fast",
     maxMode: true,
     instructions: "Be nice.",
     skills: ["a", "b"],

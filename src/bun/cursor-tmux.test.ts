@@ -7,8 +7,8 @@ import path from "node:path";
 // from it. Set a temp dir before importing (mirrors codex-tmux.test.ts).
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-cursor-tmux-"));
 
-const { mapCursorEvent, cursorLogPath, readCursorExitCode } = await import("./cursor-tmux.ts");
-import type { RunEventStream } from "../shared/types.ts";
+const { mapCursorEvent, createCursorMapCtx, flushCursorThinking, cursorLogPath, readCursorExitCode } = await import("./cursor-tmux.ts");
+import { FX_USAGE_STATUS_PREFIX, type RunEventStream } from "../shared/types.ts";
 
 type Chunk = { stream: RunEventStream; data: string; lineUuid?: string };
 function collect() {
@@ -287,3 +287,207 @@ test("readCursorExitCode returns null for non-numeric or empty sidecar contents"
 // it's caught, surfaced as a `stderr` chunk containing the raw line text
 // (lineUuid left undefined), `nextLineIndex` is still incremented, and the
 // tailer continues to the next line.
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * cursor-agent 2026.10.x stream: thinking blocks, result.usage, tool keys.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+// Event SHAPES copied from a live cursor-agent 2026.10.22 `--trust --mode plan`
+// capture; text, paths and ids are synthetic.
+const SID = "sess-fixture";
+const CALL_A = "call-aaaa-0\nfc_aaaa_0";
+const CALL_B = "call-bbbb-1\nfc_bbbb_0";
+const think = (subtype: "delta" | "completed", text?: string) => ({
+  type: "thinking",
+  subtype,
+  ...(text !== undefined ? { text } : {}),
+  session_id: SID,
+  timestamp_ms: 1700000000000,
+});
+const P3_FIXTURE: Array<Parameters<typeof mapCursorEvent>[0]> = [
+  { type: "system", subtype: "init", apiKeySource: "login", cwd: "/work/repo", session_id: SID, model: "Auto", permissionMode: "default" },
+  { type: "user", message: { role: "user", content: [{ type: "text", text: "Read notes.txt." }] }, session_id: SID },
+  think("delta", "Reading"),
+  think("delta", " notes.txt to find"),
+  think("delta", " its first word."),
+  think("completed"),
+  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "I'll read the file." }] }, session_id: SID, model_call_id: "mc-0" },
+  {
+    type: "tool_call", subtype: "started", call_id: CALL_A,
+    tool_call: { globToolCall: { args: { globPattern: "**/notes.txt" } }, hookAdditionalContexts: [], toolCallId: CALL_A, startedAtMs: "1700000000100" },
+    model_call_id: "mc-0", session_id: SID,
+  },
+  {
+    type: "tool_call", subtype: "completed", call_id: CALL_A,
+    tool_call: {
+      globToolCall: { args: { globPattern: "**/notes.txt" }, result: { success: { files: ["./notes.txt"], totalFiles: 1 } } },
+      hookAdditionalContexts: [], toolCallId: CALL_A, startedAtMs: "1700000000100", completedAtMs: "1700000000200",
+    },
+    model_call_id: "mc-0", session_id: SID,
+  },
+  think("delta", "Found"),
+  think("delta", " it. Reading"),
+  think("delta", " now."),
+  think("completed"),
+  {
+    type: "tool_call", subtype: "started", call_id: CALL_B,
+    tool_call: { readToolCall: { args: { path: "/work/repo/notes.txt" } }, hookAdditionalContexts: [], toolCallId: CALL_B, startedAtMs: "1700000000300" },
+    model_call_id: "mc-1", session_id: SID,
+  },
+  {
+    type: "tool_call", subtype: "completed", call_id: CALL_B,
+    tool_call: {
+      readToolCall: { args: { path: "/work/repo/notes.txt" }, result: { success: { content: "alpha\n", totalLines: 2 } } },
+      hookAdditionalContexts: [], toolCallId: CALL_B, startedAtMs: "1700000000300", completedAtMs: "1700000000400",
+    },
+    model_call_id: "mc-1", session_id: SID,
+  },
+  think("delta", "The"),
+  think("delta", " first word"),
+  think("delta", " is alpha."),
+  think("completed"),
+  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "alpha" }] }, session_id: SID },
+  {
+    type: "result", subtype: "success", duration_ms: 7000, is_error: false,
+    result: "I'll read the file.alpha", session_id: SID, request_id: "req-1",
+    usage: { inputTokens: 1200, outputTokens: 200, cacheReadTokens: 3600, cacheWriteTokens: 0 },
+  },
+];
+
+/** Replays a stream through one mapper ctx the way the tailer does. */
+function replay(events: Array<Parameters<typeof mapCursorEvent>[0]>, ctx = createCursorMapCtx()) {
+  const { chunks, onChunk } = collect();
+  let prior = false;
+  let done: number | undefined;
+  events.forEach((evt, lineIndex) => {
+    const r = mapCursorEvent(evt, onChunk, lineIndex, prior, ctx);
+    if (r.assistantTextEmitted) prior = true;
+    if (typeof r.done === "number") done = r.done;
+  });
+  return { chunks, done, ctx };
+}
+
+test("2026.10 stream: thinking deltas coalesce into one chunk per block, keyed by the block's first line", () => {
+  const { chunks } = replay(P3_FIXTURE);
+  const thinking = chunks.filter((c) => c.stream === "thinking");
+  expect(thinking).toEqual([
+    { stream: "thinking", data: "Reading notes.txt to find its first word.", lineUuid: "cursor:thinking:2" },
+    { stream: "thinking", data: "Found it. Reading now.", lineUuid: "cursor:thinking:9" },
+    { stream: "thinking", data: "The first word is alpha.", lineUuid: "cursor:thinking:15" },
+  ]);
+});
+
+test("2026.10 stream: full chunk order, one usage sentinel, tool names from the *ToolCall key", () => {
+  const { chunks, done } = replay(P3_FIXTURE);
+  expect(done).toBe(0);
+  expect(chunks.map((c) => `${c.stream} ${c.lineUuid}`)).toEqual([
+    "thinking cursor:thinking:2",
+    "assistant cursor:6",
+    `tool_use tool_call:${CALL_A}:started`,
+    `tool_result tool_call:${CALL_A}:completed`,
+    "thinking cursor:thinking:9",
+    `tool_use tool_call:${CALL_B}:started`,
+    `tool_result tool_call:${CALL_B}:completed`,
+    "thinking cursor:thinking:15",
+    "assistant cursor:19",
+    "status cursor:usage:20",
+  ]);
+  const toolNames = chunks.filter((c) => c.stream === "tool_use").map((c) => JSON.parse(c.data).name);
+  expect(toolNames).toEqual(["globToolCall", "readToolCall"]);
+  const usage = chunks.filter((c) => c.stream === "status");
+  expect(usage).toHaveLength(1);
+  expect(usage[0]!.data.startsWith(FX_USAGE_STATUS_PREFIX)).toBe(true);
+  expect(JSON.parse(usage[0]!.data.slice(FX_USAGE_STATUS_PREFIX.length))).toEqual({
+    turn: { inputTokens: 1200, outputTokens: 200, cacheReadTokens: 3600, cacheWriteTokens: 0 },
+  });
+});
+
+test("2026.10 stream: a reattach replay from offset 0 with a fresh ctx yields identical chunks and keys", () => {
+  const first = replay(P3_FIXTURE).chunks;
+  const second = replay(P3_FIXTURE).chunks;
+  expect(second).toEqual(first);
+});
+
+test("a thinking block is flushed by the next non-thinking event, before that event's own chunk", () => {
+  const ctx = createCursorMapCtx();
+  const { chunks, onChunk } = collect();
+  mapCursorEvent(think("delta", "plan"), onChunk, 3, false, ctx);
+  mapCursorEvent(think("delta", "ning"), onChunk, 4, false, ctx);
+  expect(chunks).toHaveLength(0);
+  mapCursorEvent({ type: "assistant", message: { content: [{ type: "text", text: "ok" }] } }, onChunk, 5, false, ctx);
+  expect(chunks).toEqual([
+    { stream: "thinking", data: "planning", lineUuid: "cursor:thinking:3" },
+    { stream: "assistant", data: "ok", lineUuid: "cursor:5" },
+  ]);
+  expect(ctx.thinking).toBeNull();
+});
+
+test("an open thinking block is kept by flushCursorThinking at settle; a whitespace-only block emits nothing", () => {
+  const ctx = createCursorMapCtx();
+  const { chunks, onChunk } = collect();
+  mapCursorEvent(think("delta", "unfinished"), onChunk, 7, false, ctx);
+  flushCursorThinking(ctx, onChunk);
+  flushCursorThinking(ctx, onChunk); // idempotent
+  expect(chunks).toEqual([{ stream: "thinking", data: "unfinished", lineUuid: "cursor:thinking:7" }]);
+
+  const blank = collect();
+  mapCursorEvent(think("delta", "  "), blank.onChunk, 1, false, ctx);
+  mapCursorEvent(think("completed"), blank.onChunk, 2, false, ctx);
+  expect(blank.chunks).toHaveLength(0);
+});
+
+test("without a ctx each thinking delta is its own block and thinking/completed emits nothing", () => {
+  const { chunks, onChunk } = collect();
+  mapCursorEvent(think("delta", "one"), onChunk, 2);
+  mapCursorEvent(think("delta", "two"), onChunk, 3);
+  mapCursorEvent(think("completed"), onChunk, 4);
+  expect(chunks).toEqual([
+    { stream: "thinking", data: "one", lineUuid: "cursor:thinking:2" },
+    { stream: "thinking", data: "two", lineUuid: "cursor:thinking:3" },
+  ]);
+});
+
+test("the no-ctx path maps the whole 2026.10 stream (usage and tool names included)", () => {
+  const { chunks, onChunk } = collect();
+  let prior = false;
+  P3_FIXTURE.forEach((evt, i) => {
+    const r = mapCursorEvent(evt, onChunk, i, prior);
+    if (r.assistantTextEmitted) prior = true;
+  });
+  expect(chunks.filter((c) => c.stream === "thinking")).toHaveLength(9);
+  expect(chunks.filter((c) => c.stream === "status").map((c) => c.lineUuid)).toEqual(["cursor:usage:20"]);
+  expect(chunks.filter((c) => c.stream === "assistant").map((c) => c.data)).toEqual(["I'll read the file.", "alpha"]);
+});
+
+test("result.usage keeps finite numbers only and emits nothing when none survive", () => {
+  const partial = collect();
+  mapCursorEvent(
+    { type: "result", is_error: false, usage: { inputTokens: 10, outputTokens: "20", cacheReadTokens: Number.NaN, cacheWriteTokens: 4, extra: 9 } },
+    partial.onChunk,
+    5,
+  );
+  expect(partial.chunks).toEqual([
+    { stream: "status", data: `${FX_USAGE_STATUS_PREFIX}{"turn":{"inputTokens":10,"cacheWriteTokens":4}}`, lineUuid: "cursor:usage:5" },
+  ]);
+
+  for (const usage of [{ inputTokens: "x" }, [1, 2], null, 42]) {
+    const none = collect();
+    mapCursorEvent({ type: "result", is_error: false, usage }, none.onChunk, 6);
+    expect(none.chunks).toHaveLength(0);
+  }
+});
+
+test("tool name: the *ToolCall key wins regardless of key order; bookkeeping siblings never become the name", () => {
+  const name = (toolCall: unknown) => {
+    const { chunks, onChunk } = collect();
+    mapCursorEvent({ type: "tool_call", call_id: "c", subtype: "started", tool_call: toolCall }, onChunk, 0);
+    return JSON.parse(chunks[0]!.data).name;
+  };
+  expect(name({ hookAdditionalContexts: [], toolCallId: "c", startedAtMs: "1", createPlanToolCall: { args: { plan: "# P" } } }))
+    .toBe("createPlanToolCall");
+  expect(name({ createPlanToolCall: { args: {} }, hookAdditionalContexts: [] })).toBe("createPlanToolCall");
+  expect(name({ name: "shellToolCall", readToolCall: {} })).toBe("readToolCall");
+  expect(name({ hookAdditionalContexts: [], toolCallId: "c", futureTool: {} })).toBe("futureTool");
+  expect(name({ hookAdditionalContexts: [], toolCallId: "c", startedAtMs: "1", completedAtMs: "2" })).toBe("tool_call");
+  expect(name("not-an-object")).toBe("tool_call");
+});

@@ -183,6 +183,7 @@ import { appendReferences } from "../shared/refs.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
 import { expandAtReferencesDetailed } from "./project-files.ts";
 import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
+import { isSpeed } from "../shared/speed.ts";
 
 type Listener = (e: RunEvent) => void;
 const listeners = new Set<Listener>();
@@ -202,6 +203,14 @@ interface ActiveRun {
    * same run row.
    */
   writeInput: (line: string) => boolean;
+  /**
+   * fx-only (steering, fx 0.0.13 or later): fold a follow-up into the turn
+   * that is running right now instead of queueing it for the next one.
+   * Returns true only when the steer was actually sent; `sendFxTurn` queues
+   * on false.
+   * Absent for every other kind and for an fx turn that can't steer.
+   */
+  steer?: (line: string) => boolean;
   /** Set when claude code emitted an `isApiErrorMessage` line during this
    *  run (e.g. 529 Overloaded). The chunk handler flips the column to
    *  `blocked` immediately; the done handler reads this on resolution to
@@ -1520,7 +1529,7 @@ async function startTaskInner(
       task.model !== profile.model ||
       task.effort !== resolvedEffort ||
       task.mode !== profile.mode ||
-      task.fast !== profile.fast ||
+      task.speed !== profile.speed ||
       task.maxMode !== profile.maxMode ||
       agentProfileSnapshotDrifted(task.agentProfile ?? null, profile);
     if (driftedFromRow) {
@@ -1529,7 +1538,7 @@ async function startTaskInner(
         model: profile.model,
         effort: resolvedEffort,
         mode: profile.mode,
-        fast: profile.fast,
+        speed: profile.speed,
         maxMode: profile.maxMode,
       }) ?? task;
       task = tasks.setAgentProfile(taskId, profile.id, profile) ?? task;
@@ -1791,7 +1800,9 @@ async function startTaskInner(
         ? { antigravitySessionId: sessionId }
         : { fxSessionId: sessionId });
     },
-    opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, fast: task.fast, maxMode: task.maxMode },
+    // fx: a mid-turn steer fx didn't take comes back here as the next turn.
+    ...(harness.kind === "fx" ? { onSteerDropped: fxSteerDroppedHandler(taskId, runId, harness.id) } : {}),
+    opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, speed: task.speed, maxMode: task.maxMode },
   };
 
   // Everything from here on — the actual spawn and everything that depends
@@ -2442,6 +2453,7 @@ function registerActiveRun(
     sessionDied: false,
     unknownCommand: false,
     writeInput: (line) => agent.writeInput(line),
+    ...(agent.steer ? { steer: (line: string) => agent.steer?.(line) === true } : {}),
   });
 }
 
@@ -2668,6 +2680,9 @@ function attachDoneHandler(
       await drainCursorQueue(taskId);
       await drainGeminiQueue(taskId);
       await drainAntigravityQueue(taskId);
+      // Every steer this run accepted has now been reported (dropped ones
+      // before `done` resolved) or absorbed — forget the bookkeeping.
+      fxPendingSteers.delete(runId);
       await drainFxQueue(taskId);
     })
     .catch(async (err) => {
@@ -2708,6 +2723,9 @@ function attachDoneHandler(
       await drainCursorQueue(taskId);
       await drainGeminiQueue(taskId);
       await drainAntigravityQueue(taskId);
+      // Every steer this run accepted has now been reported (dropped ones
+      // before `done` resolved) or absorbed — forget the bookkeeping.
+      fxPendingSteers.delete(runId);
       await drainFxQueue(taskId);
     });
 }
@@ -2769,7 +2787,7 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     // alias swaps keep the picks — those ids stay valid.
     if (afterKind && beforeKind !== afterKind) {
       const nextMode = defaultModeFor(afterKind);
-      tasks.update(taskId, { mode: nextMode, model: null, effort: null, fast: false, maxMode: false });
+      tasks.update(taskId, { mode: nextMode, model: null, effort: null, speed: "off", maxMode: false });
     }
     return;
   }
@@ -3402,7 +3420,11 @@ export type SendInputResult =
  *
  *   • fx: same queue-and-resume shape as codex/cursor/gemini (`sendFxTurn`/
  *     `drainFxQueue`), resuming via fx's ACP session id for each queued
- *     follow-up — fx has no persistent REPL either (see fx-acp.ts).
+ *     follow-up — fx has no persistent REPL either (see fx-acp.ts). On fx
+ *     0.0.13 or later a message sent while a turn runs steers that turn
+ *     instead (`ActiveRun.steer`, no new run row) when nothing is queued
+ *     ahead of it; a steer fx drops is re-queued in send order
+ *     (`fxSteerDroppedHandler`).
  *
  * Archived / detached-worktree restore: a message to an archived task
  * auto-unarchives it (sending is an unambiguous signal of continued
@@ -3974,7 +3996,7 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
         effort: task.effort,
-        fast: task.fast,
+        speed: task.speed,
         maxMode: task.maxMode,
         resumeSessionId: priorThreadId,
       },
@@ -4175,7 +4197,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
         effort: task.effort,
-        fast: task.fast,
+        speed: task.speed,
         maxMode: task.maxMode,
         // Same generic resume-session field claude-code and codex already
         // thread through `spawnAgent` → `buildCommand` — cursor's `session_id`
@@ -4359,7 +4381,7 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
         effort: task.effort,
-        fast: task.fast,
+        speed: task.speed,
         maxMode: task.maxMode,
         resumeSessionId: priorSessionId,
       },
@@ -4525,7 +4547,7 @@ async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string)
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
         effort: task.effort,
-        fast: task.fast,
+        speed: task.speed,
         maxMode: task.maxMode,
         resumeSessionId: priorSessionId,
       },
@@ -4576,13 +4598,86 @@ function findLastAntigravitySessionId(taskId: string): string | null {
   return row?.antigravity_session_id ?? null;
 }
 
-/** * Per-task queue of follow-up lines received while an fx turn is in flight.
+/**
+ * Per-task queue of follow-up lines received while an fx turn is in flight.
  * fx is driven over ACP/stdio (`fx-acp.ts`), one turn per spawn — no
  * persistent REPL, no tmux session — so exactly like codex/cursor/gemini we
  * hold the message and spawn a fresh resumed turn once the active turn
- * resolves (`drainFxQueue`, called from `attachDoneHandler`).
+ * resolves (`drainFxQueue`, called from `attachDoneHandler`). On fx 0.0.13 or
+ * later a follow-up usually steers the running turn instead
+ * (`ActiveRun.steer`) and only lands here when steering isn't possible (older
+ * fx, still in the handshake, over 64 KiB), when an earlier follow-up is
+ * already waiting here (a later message never steers past it) — or when fx
+ * didn't take the steer before the turn ended (`fxSteerDroppedHandler`,
+ * re-queued in send order unless the task was torn down or moved to another
+ * fx harness).
  */
-const fxTurnQueue = new Map<string, string[]>();
+const fxTurnQueue = new Map<string, QueuedFxLine[]>();
+
+/** One queued fx follow-up. `echoed` marks a steer fx dropped: its `user`
+ *  bubble was already written on the run it steered, so the turn that sends
+ *  it must not write a second one. `seq` is the order the user sent it in
+ *  (`fxSendSeq`) — a dropped steer re-enters the queue at the position it
+ *  was sent, not behind follow-ups that were queued after it. */
+interface QueuedFxLine {
+  line: string;
+  seq: number;
+  echoed?: boolean;
+}
+
+/** Monotonic send order across every fx follow-up (queued or steered). */
+let fxSendSeq = 0;
+
+/** Steers fx accepted on a still-running run, keyed by that run's id, with
+ *  the send order each was given — so `fxSteerDroppedHandler` can re-queue a
+ *  dropped one in place. Absorbed steers are never reported back; the run's
+ *  entry is forgotten once it settles (`attachDoneHandler`). */
+const fxPendingSteers = new Map<string, { text: string; seq: number }[]>();
+
+/** Inserts `item` into `q` keeping it ordered by `seq`. */
+function insertBySendOrder(q: QueuedFxLine[], item: QueuedFxLine): void {
+  const at = q.findIndex((existing) => existing.seq > item.seq);
+  if (at === -1) q.push(item);
+  else q.splice(at, 0, item);
+}
+
+/**
+ * The `onSteerDropped` callback an fx spawn carries: a steer fx didn't take
+ * before its turn ended is queued as the task's next turn (no second `user`
+ * bubble — see {@link QueuedFxLine}). The driver calls it BEFORE the run's
+ * `done` resolves, so the `drainFxQueue` that `attachDoneHandler` runs after
+ * every settle (cancelled included) picks it up. Dropped instead when the
+ * task is gone, archived, being deleted, or no longer on the fx harness the
+ * run was spawned with (`harnessId`) — the same teardowns that clear
+ * `fxTurnQueue` outright (archive/delete/agent switch kill the run and
+ * `dropFxSession` after clearing the queue, and both report a still-pending
+ * steer dropped). A switch to ANOTHER fx harness counts as a teardown too:
+ * the queued turn would resume the old harness's session id under the new
+ * harness's account. A Stop is not a teardown: its dropped steers re-queue
+ * and drain like any other queued follow-up. Returns whether the text was
+ * queued — the driver only tells the user "sending it as the next turn"
+ * when it was.
+ */
+function fxSteerDroppedHandler(taskId: string, runId: string, harnessId: string): (text: string) => boolean {
+  return (text) => {
+    // Recover the send order this steer was given when fx accepted it.
+    const pending = fxPendingSteers.get(runId);
+    const idx = pending?.findIndex((p) => p.text === text) ?? -1;
+    const seq = idx >= 0 ? pending!.splice(idx, 1)[0]!.seq : ++fxSendSeq;
+    // `isTaskTearingDown` covers the window where a delete has started (its
+    // queue clear already ran) but the row still exists — `deleteTask` kills
+    // the run and `dropFxSession`s before `tasks.delete`.
+    if (isTaskTearingDown(taskId)) return false;
+    const task = tasks.get(taskId);
+    if (!task || task.archivedAt != null) return false;
+    const current = resolveHarness(task.agent);
+    if (current?.kind !== "fx" || current.id !== harnessId) return false;
+    const q = fxTurnQueue.get(taskId) ?? [];
+    insertBySendOrder(q, { line: text, seq, echoed: true });
+    fxTurnQueue.set(taskId, q);
+    return true;
+  };
+}
 
 /**
  * Pending auto-resume timer for a paused fx task, one per task id (plan
@@ -4691,7 +4786,8 @@ function appendFxStatusLine(taskId: string, runId: string, data: string): void {
 /**
  * Send a follow-up to an fx task. Each follow-up is its own run row + its own
  * resumed ACP turn (sequential-turn model, same as codex/cursor/gemini). When
- * a turn is already running, the message is queued; otherwise it spawns
+ * a turn is already running, the message steers it (fx 0.0.13 or later, no
+ * new run row) or, when it can't, is queued; otherwise it spawns
  * immediately. Returns the run id the message was attached to, or null on
  * lookup failure — or when `spawnFxRun` declined to mint a run because
  * `startingTaskIds` was already claimed for this task (see that set's doc,
@@ -4708,12 +4804,29 @@ async function sendFxTurn(taskId: string, line: string): Promise<string | null> 
   // here it's just the timer, so a still-in-flight schedule can't fire while
   // this follow-up is in transit.
   cancelFxAutoResumeTimer(taskId);
-  if (task.runId && active.has(task.runId)) {
-    const q = fxTurnQueue.get(taskId) ?? [];
-    q.push(line);
-    fxTurnQueue.set(taskId, q);
+  const activeHandle = task.runId ? active.get(task.runId) : undefined;
+  if (task.runId && activeHandle) {
+    // fx 0.0.13 or later: steer the running turn first — the message joins
+    // this turn and gets no run row of its own. `steer` is absent (older fx,
+    // other fakes) or returns false (no capability, still in the handshake,
+    // over 64 KiB) when that isn't possible; then queue exactly as before. A
+    // steer fx later drops comes back through `fxSteerDroppedHandler`. Never
+    // steer past a non-empty queue: an earlier message that had to queue
+    // (sent during the handshake, over 64 KiB, or still waiting behind a turn
+    // the queue started) must reach the model before this one does.
+    const seq = ++fxSendSeq;
+    const queueEmpty = (fxTurnQueue.get(taskId)?.length ?? 0) === 0;
+    if (queueEmpty && activeHandle.steer?.(line) === true) {
+      const pending = fxPendingSteers.get(task.runId) ?? [];
+      pending.push({ text: line, seq });
+      fxPendingSteers.set(task.runId, pending);
+    } else {
+      const q = fxTurnQueue.get(taskId) ?? [];
+      q.push({ line, seq });
+      fxTurnQueue.set(taskId, q);
+    }
     // Record the user bubble on the active run so the panel reflects it right
-    // away; the queued turn that answers it lands as a later run row.
+    // away; a queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
     runs.appendEvent(runId, "user", data);
@@ -4743,7 +4856,7 @@ async function sendFxTurn(taskId: string, line: string): Promise<string | null> 
  * tell an automatic resume apart from a manual click.
  */
 type FxTurn =
-  | { line: string }
+  | { line: string; echoed?: boolean }
   | { continueRecovery: true; origin?: "manual" | "auto"; attempt?: number; max?: number };
 
 /**
@@ -4758,7 +4871,8 @@ type FxTurn =
  * claim, the run-row insert, the column flip/emit, `spawnAgentOrFail` /
  * `registerActiveRun` / `attachDoneHandler`, and the queue-drop-on-spawn-
  * failure) is identical between them. They differ only in: whether a `user`
- * bubble is echoed (never for `continueRecovery` — nothing was typed), the
+ * bubble is echoed (never for `continueRecovery` — nothing was typed — nor
+ * for a dropped steer, `echoed: true`, whose bubble already exists), the
  * status line, the prompt text handed to the driver (`""` for
  * `continueRecovery`; fx-acp.ts sends an empty `prompt` content array
  * downstream when `continueRecovery` is set, per ACP's continue-recovery
@@ -4821,7 +4935,8 @@ async function spawnFxRun(
     const kind: AgentKind = harness?.kind ?? "fx";
     const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
     if ("line" in turn) {
-      onChunk("user", normalizeUserText(turn.line));
+      // A dropped steer's bubble already sits on the run it steered.
+      if (turn.echoed !== true) onChunk("user", normalizeUserText(turn.line));
       onChunk(
         "status",
         priorSessionId
@@ -4879,11 +4994,12 @@ async function spawnFxRun(
       onSessionId: (sessionId) => {
         runs.update(newRunId, { fxSessionId: sessionId });
       },
+      onSteerDropped: fxSteerDroppedHandler(taskId, newRunId, harness.id),
       opts: {
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
         effort: task.effort,
-        fast: task.fast,
+        speed: task.speed,
         maxMode: task.maxMode,
         resumeSessionId: priorSessionId,
         ...("continueRecovery" in turn ? { continueRecovery: true } : {}),
@@ -4936,7 +5052,9 @@ async function drainFxQueue(taskId: string): Promise<void> {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) fxTurnQueue.delete(taskId);
-  if (next !== undefined) await spawnFxRun(task, taskId, { line: next });
+  if (next !== undefined) {
+    await spawnFxRun(task, taskId, next.echoed ? { line: next.line, echoed: true } : { line: next.line });
+  }
 }
 
 /** Most-recent fx session id across the task's runs (for resume). */
@@ -6090,7 +6208,7 @@ async function spawnResumedSessionInner(
           mode: task.mode,
           model: task.model ?? DEFAULT_MODEL[harness.kind],
           effort: task.effort,
-          fast: task.fast,
+          speed: task.speed,
           maxMode: task.maxMode,
           resumeSessionId: priorSessionId,
         },
@@ -6195,7 +6313,7 @@ export interface CreateTaskInput extends Partial<Task> {
    * Bind this task to a reusable {@link AgentProfile} at create time
    * (docs/plans/agent-profiles.md). When set to a resolvable profile id,
    * `createTask` overrides the effective `agent`/`model`/`effort`/`mode`/
-   * `fast`/`maxMode` from the profile — any of those six fields also present
+   * `speed`/`maxMode` from the profile — any of those six fields also present
    * in the body are ignored — and stores both the id and a point-in-time
    * `AgentProfileSnapshot` on the new row. Also settable via the inherited
    * `Partial<Task>` field; listed here too so its doc comment lives next to
@@ -6208,7 +6326,7 @@ export interface CreateTaskInput extends Partial<Task> {
    * D1) — mutually exclusive with `agentProfileId` (`{ error }` when both are
    * set). The created row is a **pipeline task**: `startTask` routes it to
    * `startPipelineRun` instead of spawning an agent, and its own
-   * agent/model/effort/mode/fast/maxMode fields are cosmetic, mirroring the
+   * agent/model/effort/mode/speed/maxMode fields are cosmetic, mirroring the
    * graph's start step (A1). Also settable via the inherited `Partial<Task>`
    * field; listed here too so its doc comment lives next to the validation it
    * triggers. An unresolvable id, a graph with no resolvable start step, or
@@ -6334,7 +6452,7 @@ export async function createTask(
   // Pipeline binding (D1, docs/plans/pipelines.md): mutually exclusive with
   // `agentProfileId` — a pipeline task never launches an agent of its own
   // (the runner drives hidden step tasks instead), but its own
-  // agent/model/effort/mode/fast/maxMode fields still cosmetically mirror
+  // agent/model/effort/mode/speed/maxMode fields still cosmetically mirror
   // the graph's start step (A1) so every existing per-task surface that
   // reads those fields (board filters, badges, CLI `ls`) keeps working
   // unchanged. Validated up front, before `profile` below, so a bad
@@ -6376,7 +6494,7 @@ export async function createTask(
       return { error: `unknown agent profile "${requestedProfileId}"` };
     }
   }
-  // Cosmetic defaults source for agent/model/effort/mode/fast/maxMode: a
+  // Cosmetic defaults source for agent/model/effort/mode/speed/maxMode: a
   // bound profile wins as before; otherwise a pipeline task's start-step
   // profile fills the same role (A1) — but `profile` itself stays null
   // below, so the task row is never recorded as BOUND to that profile
@@ -6556,7 +6674,7 @@ export async function createTask(
     mode: defaultsProfile ? defaultsProfile.mode : (input.mode ?? null),
     model,
     effort,
-    fast: defaultsProfile ? defaultsProfile.fast : input.fast === true,
+    speed: defaultsProfile ? defaultsProfile.speed : isSpeed(input.speed) ? input.speed : "off",
     maxMode: defaultsProfile ? defaultsProfile.maxMode : input.maxMode === true,
     agentProfileId: profile?.id ?? null,
     agentProfile: agentProfileSnapshot,

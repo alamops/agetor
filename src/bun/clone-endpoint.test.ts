@@ -266,6 +266,24 @@ test("manual harness/model/effort/mode selection lands on the task", async () =>
   expect(task.mode).toBe("ask");
 });
 
+// Speed alias (D13): `speed` lands on the explainer task as-is, and the
+// legacy boolean `fast` maps onto it (`true` → "fast").
+test.each([
+  ["speed", { speed: "ultrafast" }, "ultrafast"],
+  ["fast alias", { fast: true }, "fast"],
+] as const)("launch %s lands on the task as speed", async (label, launch, expected) => {
+  const dest = path.join(WORK_DIR, `clone-speed-${label.replace(/\s+/g, "-")}`);
+  const res = await call("/projects/clone", {
+    method: "POST",
+    body: JSON.stringify({ url: `someowner/speed${label.replace(/\s+/g, "")}`, dest, agent: "claude-code", ...launch }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { eli5TaskId: string | null; eli5Error: string | null };
+  expect(body.eli5Error).toBeNull();
+  const task = tasks.get(body.eli5TaskId!)!;
+  expect(task.speed).toBe(expected);
+});
+
 test("agentProfileId binds and its model overrides a manual model field", async () => {
   const profile: AgentProfile = agentProfiles.insert({
     name: `Clone Launch Profile ${Date.now()}`,
@@ -335,6 +353,7 @@ test("wrong-typed launch fields 400 before cloning anything", async () => {
     { field: "model", body: { model: 5 } },
     { field: "effort", body: { effort: 5 } },
     { field: "fast", body: { fast: "yes" } },
+    { field: "speed", body: { speed: "turbo" } },
   ];
   const before = tasks.list().length;
   for (const { field, body } of cases) {

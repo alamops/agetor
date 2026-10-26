@@ -22,17 +22,20 @@ import {
   type TaskFxRecovery,
 } from "./types.ts";
 
-/** The four values {@link FxRecoveryState} can take, as one tuple both the
+/** The five values {@link FxRecoveryState} can take, as one tuple both the
  *  parsers below and any caller that wants to validate a state id can share
  *  — avoids two independently-typed copies of the same literal union
  *  drifting apart. */
-export const FX_RECOVERY_STATES = ["active", "paused", "recovered", "cleared"] as const satisfies readonly FxRecoveryState[];
+export const FX_RECOVERY_STATES = ["active", "paused", "recovered", "failed", "cleared"] as const satisfies readonly FxRecoveryState[];
 
 /** Subset of {@link FX_RECOVERY_STATES} fx itself ever puts on the wire
  *  inside a non-null `modelResponseRecovery` object — `"cleared"` is
  *  agetor's own label for the wire's `modelResponseRecovery: null`, never a
- *  string fx sends. */
-const WIRE_OBJECT_STATES = ["active", "paused", "recovered"] as const;
+ *  string fx sends. `"failed"` arrived with fx 0.0.11: a
+ *  `terminal_provider_error` whose `action` isn't `paused` (fx stopped
+ *  retrying and kept no resumable checkpoint), where earlier versions sent
+ *  every terminal error as `"paused"`. */
+const WIRE_OBJECT_STATES = ["active", "paused", "recovered", "failed"] as const;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -71,9 +74,10 @@ function extractFields(raw: Record<string, unknown>): Omit<FxRecoveryPayload, "s
  *  - `{ state: "cleared" }` — the key is present and explicitly `null`: fx
  *    has dropped the recovery checkpoint.
  *  - a built `FxRecoveryPayload` — the key holds an object; its `state`
- *    becomes the wire value when it's one of `active`/`paused`/`recovered`,
- *    else defaults to `"active"` (fx is expected to always send one of the
- *    three; a missing/garbled one still reads as "something is happening").
+ *    becomes the wire value when it's one of `active`/`paused`/`recovered`/
+ *    `failed`, else defaults to `"active"` (fx is expected to always send one
+ *    of the four; a missing/garbled or future one still reads as "something
+ *    is happening").
  * A `modelResponseRecovery` value that is neither `null` nor a plain object
  * (a stray string/number/array) is treated the same as "key absent":
  * `undefined`.
@@ -99,7 +103,7 @@ export function parseFxRecoveryMeta(update: Record<string, unknown>): FxRecovery
  * Parse a persisted `FX_RECOVERY_STATUS_PREFIX` sentinel body (the JSON
  * agetor itself wrote) back into a {@link FxRecoveryPayload}. Stricter than
  * {@link parseFxRecoveryMeta}: `null` on invalid JSON, a non-object payload,
- * or a `state` that isn't one of all four {@link FX_RECOVERY_STATES} — a
+ * or a `state` that isn't one of all five {@link FX_RECOVERY_STATES} — a
  * sentinel agetor wrote should always carry a valid state, so an invalid one
  * means the row is corrupt/foreign rather than "default to active".
  */
@@ -122,9 +126,13 @@ export function parseFxRecoveryPayload(json: string): FxRecoveryPayload | null {
   return payload;
 }
 
-/** fx's own words for `cause` tags, used only when `message` is absent. */
+/** fx's own words for `cause` tags, used only when `message` is absent
+ *  (`compaction_prepared` is agetor's wording: fx's own label varies by
+ *  state — "Resuming saved compaction" mid-flight, "Saved compaction" once
+ *  stopped). */
 const CAUSE_LABELS: Record<string, string> = {
   network_interrupted: "Network interrupted",
+  connectivity_lost: "Connection lost",
   response_interrupted: "Response ended early",
   provider_stream_timeout: "Gateway stream timed out",
   provider_unavailable: "Provider unavailable",
@@ -132,6 +140,7 @@ const CAUSE_LABELS: Record<string, string> = {
   system_resumed: "Mac woke from sleep",
   authentication: "Authentication refreshed",
   request_limit_reached: "Provider request limit reached",
+  compaction_prepared: "Context compacted",
 };
 
 /** fx's own words for `action` tags, used only when `message` is absent. */
@@ -142,7 +151,9 @@ const ACTION_LABELS: Record<string, string> = {
   continuing_after_tool: "continuing after confirmed tool",
   reconciling_tool: "checking uncertain tool state",
   waiting_for_connectivity: "waiting for connection",
+  checking_liveness: "checking the connection",
   paused: "recovery paused",
+  delivering_response: "delivering saved response",
 };
 
 /** `"N/M"` when both `attempt` and `attemptLimit` are known, else `undefined`. */
@@ -151,6 +162,14 @@ function attemptFraction(p: FxRecoveryPayload): string | undefined {
     ? `${p.attempt}/${p.attemptLimit}`
     : undefined;
 }
+
+/** The fixed call to action {@link fxRecoverySummaryLine} appends to a
+ *  `paused` line — exported so tests and seams can match it without copying
+ *  the wording. */
+export const FX_PAUSED_SUMMARY_SUFFIX = " — fx paused this response; resume it, or send a new message.";
+
+/** The fixed tail {@link fxRecoverySummaryLine} appends to a `failed` line. */
+export const FX_FAILED_SUMMARY_SUFFIX = " — fx stopped retrying this response.";
 
 /**
  * Human-readable one-liner for a recovery payload — what RunPanel's live
@@ -169,7 +188,8 @@ function attemptFraction(p: FxRecoveryPayload): string | undefined {
  *    verbatim rather than being dropped), omitting whichever of the three
  *    segments has nothing to show (no cause, no action, or no attempt
  *    fraction). When neither cause nor action nor message is known at all,
- *    falls back to `"⚠ Recovering model response"`.
+ *    falls back to `"⚠ Recovering model response"` — or, for `failed`, to
+ *    fx's own `"⚠ Model response failed"`, since nothing is recovering.
  */
 export function fxRecoveryNoticeText(p: FxRecoveryPayload): string {
   if (p.state === "cleared") return "";
@@ -183,7 +203,9 @@ export function fxRecoveryNoticeText(p: FxRecoveryPayload): string {
 
   const causeLabel = p.cause ? (CAUSE_LABELS[p.cause] ?? p.cause) : undefined;
   const actionLabel = p.action ? (ACTION_LABELS[p.action] ?? p.action) : undefined;
-  if (!causeLabel && !actionLabel) return "⚠ Recovering model response";
+  if (!causeLabel && !actionLabel) {
+    return p.state === "failed" ? "⚠ Model response failed" : "⚠ Recovering model response";
+  }
 
   const segments = [causeLabel, actionLabel].filter((s): s is string => Boolean(s));
   const attempt = attemptFraction(p);
@@ -197,12 +219,17 @@ export function fxRecoveryNoticeText(p: FxRecoveryPayload): string {
  * history after the fact (emitted once by the driver, not derived on every
  * render). `null` for `active` (still in progress — nothing final to say
  * yet) and `cleared` (nothing happened worth a line).
- *  - `paused`: `fxRecoveryNoticeText(p)` plus a fixed call to action —
- *    `" — resume once the limit clears, or send a new message."`.
+ *  - `paused`: `fxRecoveryNoticeText(p)` plus {@link FX_PAUSED_SUMMARY_SUFFIX}.
+ *    The call to action makes no claim about why fx paused — since 0.0.11 a
+ *    transient failure (a 429 included) never pauses; fx keeps retrying it,
+ *    so a pause is fx's own lifecycle stop, not a rate limit to wait out.
+ *  - `failed`: `fxRecoveryNoticeText(p)` plus {@link FX_FAILED_SUMMARY_SUFFIX}
+ *    — terminal, nothing to resume.
  *  - `recovered`: `fxRecoveryNoticeText(p)` verbatim.
  */
 export function fxRecoverySummaryLine(p: FxRecoveryPayload): string | null {
-  if (p.state === "paused") return `${fxRecoveryNoticeText(p)} — resume once the limit clears, or send a new message.`;
+  if (p.state === "paused") return `${fxRecoveryNoticeText(p)}${FX_PAUSED_SUMMARY_SUFFIX}`;
+  if (p.state === "failed") return `${fxRecoveryNoticeText(p)}${FX_FAILED_SUMMARY_SUFFIX}`;
   if (p.state === "recovered") return fxRecoveryNoticeText(p);
   return null;
 }
@@ -211,9 +238,13 @@ export function fxRecoverySummaryLine(p: FxRecoveryPayload): string | null {
  * Whether a `paused` recovery payload is the kind Resume can act on: fx's
  * `requiredAction` is `continue_later` (defaulting to `continue_later` when
  * absent, since that's the only `requiredAction` observed live) rather than
- * `inspect_uncertain_tool`/`change_request`, which need a human decision
- * Resume can't make for them. `false` for every other state and for
- * `undefined`/`null` (no payload at all — nothing to resume).
+ * `inspect_uncertain_tool`/`change_request`/`surface_stall` (fx 0.0.11+: the
+ * same failure repeated at the same progress point, so fx stopped instead of
+ * looping), which a plain continue can't fix. `false` for every other state —
+ * `failed` above all, fx's terminal stop with no checkpoint — and for
+ * `undefined`/`null` (no payload at all — nothing to resume). This is also
+ * the orchestrator's auto-resume gate (`latestResumableFxPause`), so a
+ * `failed` or stalled run never schedules an auto-resume.
  */
 export function isFxRecoveryResumable(p: FxRecoveryPayload | undefined | null): boolean {
   return p != null && p.state === "paused" && (p.requiredAction ?? "continue_later") === "continue_later";

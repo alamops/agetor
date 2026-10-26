@@ -3,9 +3,10 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type ImportedClaudeSession, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Subagent, type SubagentStatus } from "../shared/types.ts";
+import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type ImportedClaudeSession, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Speed, type Subagent, type SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
+import { isSpeed, speedFromFast } from "../shared/speed.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import { migrate } from "./migrate.ts";
@@ -85,7 +86,10 @@ type TaskRow = {
   pr_url: string | null;
   issue_url: string | null;
   mode: string | null; model: string | null; effort: string | null;
-  fast: number;
+  // Speed tier (migration 072, which dropped the old cursor-only `fast`
+  // INTEGER column) — a CHECK keeps it to `off | fast | ultrafast`, but
+  // `toTask` still validates through `isSpeed` before trusting it.
+  speed: string;
   max_mode: number;
   refs: string;
   backlog: string;
@@ -396,9 +400,11 @@ const sanitizeSkillsList = (raw: unknown): string[] => {
  * cosmetic display string that must not be load-bearing — a missing or
  * non-string value falls back to the (already-validated) `harness` id rather
  * than nulling the whole snapshot, `effort`/`mode` a string or `null`,
- * `fast`/`maxMode` coerced to booleans, `instructions` a string (default
- * `""`), `skills` sanitized via {@link sanitizeSkillsList}, and `capturedAt`
- * a number (default `0`).
+ * `speed` read through {@link readSnapshotSpeed} (a valid tier, else the
+ * legacy pre-072 `fast` boolean, else `"off"`) and emitted alongside its
+ * derived `fast`, `maxMode` coerced to a boolean, `instructions` a string
+ * (default `""`), `skills` sanitized via {@link sanitizeSkillsList}, and
+ * `capturedAt` a number (default `0`).
  */
 const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | null => {
   if (!raw) return null;
@@ -408,6 +414,30 @@ const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | n
   } catch {
     return null;
   }
+  return sanitizeAgentProfileSnapshot(parsed);
+};
+
+/** A snapshot's speed tier: its own `speed` when that is a valid tier, else
+ *  the legacy `fast` boolean every snapshot written before migration 072
+ *  carries (`true` → `"fast"`), else `"off"`. Frozen snapshots (a task's
+ *  `agent_profile` column, a pipeline run's `snapshot.profiles`) are never
+ *  rewritten by a migration, so this read is the only upgrade path. */
+const readSnapshotSpeed = (rec: Record<string, unknown>): Speed =>
+  isSpeed(rec.speed) ? rec.speed : speedFromFast(rec.fast === true);
+
+/** A row's `speed` column (validated — the CHECK already guards it, but a
+ *  hand-edited row must not reach a launch as an unknown tier) plus the
+ *  derived `fast` every Task / AgentProfile response carries for older
+ *  clients (D13). Shared by `toTask` and `toAgentProfile`. */
+const speedFields = (raw: string): { speed: Speed; fast: boolean } => {
+  const speed: Speed = isSpeed(raw) ? raw : "off";
+  return { speed, fast: speed !== "off" };
+};
+
+/** The object-level half of {@link parseAgentProfileSnapshot} — shared with
+ *  `sanitizeRunSnapshot`'s `profiles` map, whose entries are already-parsed
+ *  objects rather than a JSON column. */
+const sanitizeAgentProfileSnapshot = (parsed: unknown): AgentProfileSnapshot | null => {
   if (!parsed || typeof parsed !== "object") return null;
   const rec = parsed as Record<string, unknown>;
 
@@ -427,6 +457,7 @@ const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | n
   const mode = rec.mode;
   const instructions = rec.instructions;
   const capturedAt = rec.capturedAt;
+  const speed = readSnapshotSpeed(rec);
 
   return {
     id,
@@ -437,7 +468,8 @@ const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | n
     model,
     effort: typeof effort === "string" ? effort : null,
     mode: typeof mode === "string" ? mode : null,
-    fast: rec.fast === true,
+    speed,
+    fast: speed !== "off",
     maxMode: rec.maxMode === true,
     instructions: typeof instructions === "string" ? instructions : "",
     skills: sanitizeSkillsList(rec.skills),
@@ -666,10 +698,19 @@ const sanitizeRunSnapshot = (raw: unknown): PipelineRunSnapshot | null => {
   }
   const graph = rec.graph as unknown as PipelineGraph;
 
+  // Each profile goes through the same sanitizer a task's own
+  // `agent_profile` column uses, so a run frozen before migration 072 (whose
+  // profiles carry only the legacy `fast` boolean) reads back with a real
+  // `speed`. An entry that sanitizer refuses is still kept (the lenient
+  // "record of objects" contract above — a step launch reads its fields
+  // straight off it), with only its speed pair normalized.
   const profiles: PipelineRunSnapshot["profiles"] = {};
   if (isPlainObject(rec.profiles)) {
     for (const [id, value] of Object.entries(rec.profiles)) {
-      if (isPlainObject(value)) profiles[id] = value as unknown as AgentProfileSnapshot;
+      if (!isPlainObject(value)) continue;
+      const speed = readSnapshotSpeed(value);
+      profiles[id] = sanitizeAgentProfileSnapshot(value)
+        ?? ({ ...value, speed, fast: speed !== "off" } as unknown as AgentProfileSnapshot);
     }
   }
 
@@ -810,7 +851,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   mode: r.mode,
   model: r.model,
   effort: r.effort,
-  fast: r.fast === 1,
+  ...speedFields(r.speed),
   maxMode: r.max_mode === 1,
   references: parseRefs(r.refs),
   backlog: parseBacklog(r.backlog),
@@ -969,7 +1010,7 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans, todo_progress,
+          branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, speed, max_mode, refs, backlog, draft, plans, todo_progress,
           agent_profile_id, agent_profile,
           pipeline_id, pipeline_run, pipeline_parent_id, pipeline_step_id,
           checkout_branch,
@@ -979,7 +1020,7 @@ export const tasks = {
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
-        t.branch, t.branchSource, t.worktreePath, t.baseRef, t.prUrl ?? null, t.issueUrl ?? null, t.mode, t.model, t.effort, t.fast ? 1 : 0, t.maxMode ? 1 : 0,
+        t.branch, t.branchSource, t.worktreePath, t.baseRef, t.prUrl ?? null, t.issueUrl ?? null, t.mode, t.model, t.effort, t.speed, t.maxMode ? 1 : 0,
         JSON.stringify(t.references ?? []),
         JSON.stringify(t.backlog ?? []),
         t.draft ? JSON.stringify(t.draft) : null,
@@ -1003,7 +1044,10 @@ export const tasks = {
     // that mutate t shouldn't accidentally get a stale shape).
     return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, checkoutBranch: t.checkoutBranch ?? null, importedClaude: null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
-  update(id: string, patch: Partial<Task>): Task | null {
+  /** `fast` is excluded from the patch type: it is only the derived echo of
+   *  `speed` (the column migration 072 dropped), so a caller changes the tier
+   *  through `speed` alone. */
+  update(id: string, patch: Partial<Omit<Task, "fast">>): Task | null {
     const current = this.get(id);
     if (!current) return null;
     const next: Task = { ...current, ...patch, id, updatedAt: Date.now() };
@@ -1031,7 +1075,7 @@ export const tasks = {
     // `tasks.setAgentProfile` below via its own targeted UPDATE. A generic
     // PATCH must never clobber the point-in-time snapshot — most pointedly,
     // the copy-down of the profile's own fields (agent/model/effort/mode/
-    // fast/maxMode) that `startTask` performs right before a task's first
+    // speed/maxMode) that `startTask` performs right before a task's first
     // run must not race a concurrent unrelated edit into silently detaching
     // the profile — and, like the watermarks/`sent_files`/`fx_recovery`,
     // this write never bumps `updated_at` either.
@@ -1058,13 +1102,13 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, issue_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
+         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, issue_url=?, mode=?, model=?, effort=?, speed=?, max_mode=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
         next.taskType,
-        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.prUrl ?? null, next.issueUrl ?? null, next.mode, next.model, next.effort, next.fast ? 1 : 0, next.maxMode ? 1 : 0,
+        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.prUrl ?? null, next.issueUrl ?? null, next.mode, next.model, next.effort, next.speed, next.maxMode ? 1 : 0,
         JSON.stringify(next.references ?? []),
         JSON.stringify(next.backlog ?? []),
         next.draft ? JSON.stringify(next.draft) : null,
@@ -1662,6 +1706,9 @@ type HarnessRow = {
   bin: string | null;
   env_json: string;
   enabled: number;
+  // fx-only per-harness toggle (migration 073, default 1) — see
+  // `Harness.profileMcpServers`.
+  profile_mcp_servers: number;
   created_at: number;
   updated_at: number;
 };
@@ -1685,6 +1732,7 @@ const toHarness = (r: HarnessRow): Harness => {
     bin: r.bin,
     env,
     enabled: r.enabled === 1,
+    profileMcpServers: r.profile_mcp_servers !== 0,
   };
 };
 
@@ -1721,6 +1769,8 @@ export interface HarnessInsertInput {
   home?: string | null;
   bin?: string | null;
   env?: Record<string, string>;
+  /** Defaults to on (the column's default) when omitted. */
+  profileMcpServers?: boolean;
 }
 
 export interface HarnessPatch {
@@ -1728,6 +1778,8 @@ export interface HarnessPatch {
   home?: string | null;
   bin?: string | null;
   env?: Record<string, string>;
+  /** The one field `update` accepts on a built-in harness too — see its doc. */
+  profileMcpServers?: boolean;
 }
 
 export const harnesses = {
@@ -1774,6 +1826,7 @@ export const harnesses = {
         bin: null,
         env: {},
         enabled: true,
+        profileMcpServers: true,
       } satisfies Harness;
     }
     return null;
@@ -1794,8 +1847,8 @@ export const harnesses = {
     const now = Date.now();
     const envJson = JSON.stringify(input.env ?? {});
     db.run(
-      `INSERT INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at)
-       VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+      `INSERT INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, profile_mcp_servers, created_at, updated_at)
+       VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
       [
         input.id,
         input.kind,
@@ -1803,31 +1856,43 @@ export const harnesses = {
         input.home ?? null,
         input.bin ?? null,
         envJson,
+        input.profileMcpServers === false ? 0 : 1,
         now,
         now,
       ],
     );
     return this.get(input.id) as Harness;
   },
+  /**
+   * Edit a harness's config. Built-ins refuse every identity/config field
+   * (`HarnessBuiltinError`), but `profileMcpServers` is a behaviour toggle
+   * like `enabled` — the built-in fx row is the harness most users run — so
+   * a patch carrying only that field is accepted on a built-in too.
+   */
   update(id: string, patch: HarnessPatch): Harness {
     const current = this.get(id);
     if (!current) throw new Error(`harness not found: ${id}`);
-    if (current.isBuiltin) throw new HarnessBuiltinError("edit");
+    const touchesConfig =
+      patch.label !== undefined || patch.home !== undefined ||
+      patch.bin !== undefined || patch.env !== undefined;
+    if (current.isBuiltin && touchesConfig) throw new HarnessBuiltinError("edit");
     const next = {
       label: patch.label ?? current.label,
       home: patch.home === undefined ? current.home : patch.home,
       bin: patch.bin === undefined ? current.bin : patch.bin,
       env: patch.env ?? current.env,
+      profileMcpServers: patch.profileMcpServers ?? current.profileMcpServers !== false,
     };
     db.run(
       `UPDATE harnesses
-         SET label = ?, home = ?, bin = ?, env_json = ?, updated_at = ?
+         SET label = ?, home = ?, bin = ?, env_json = ?, profile_mcp_servers = ?, updated_at = ?
        WHERE id = ?`,
       [
         next.label,
         next.home,
         next.bin,
         JSON.stringify(next.env),
+        next.profileMcpServers ? 1 : 0,
         Date.now(),
         id,
       ],
@@ -2042,7 +2107,7 @@ type AgentProfileRow = {
   model: string;
   effort: string | null;
   mode: string | null;
-  fast: number;
+  speed: string;
   max_mode: number;
   instructions: string;
   skills_json: string;
@@ -2070,7 +2135,7 @@ const toAgentProfile = (r: AgentProfileRow): AgentProfile => ({
   model: r.model,
   effort: r.effort,
   mode: r.mode,
-  fast: r.fast === 1,
+  ...speedFields(r.speed),
   maxMode: r.max_mode === 1,
   instructions: r.instructions,
   skills: parseSkillsJson(r.skills_json),
@@ -2084,7 +2149,7 @@ export interface AgentProfileInsertInput {
   model: string;
   effort?: string | null;
   mode?: string | null;
-  fast?: boolean;
+  speed?: Speed;
   maxMode?: boolean;
   instructions?: string;
   skills?: string[];
@@ -2096,7 +2161,7 @@ export interface AgentProfilePatch {
   model?: string;
   effort?: string | null;
   mode?: string | null;
-  fast?: boolean;
+  speed?: Speed;
   maxMode?: boolean;
   instructions?: string;
   skills?: string[];
@@ -2166,12 +2231,12 @@ export const agentProfiles = {
     try {
       db.run(
         `INSERT INTO agent_profiles
-           (id, name, name_key, harness_id, model, effort, mode, fast, max_mode, instructions, skills_json, created_at, updated_at)
+           (id, name, name_key, harness_id, model, effort, mode, speed, max_mode, instructions, skills_json, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id, name, nameKey, input.harness, input.model,
           input.effort ?? null, input.mode ?? null,
-          input.fast ? 1 : 0, input.maxMode ? 1 : 0,
+          input.speed ?? "off", input.maxMode ? 1 : 0,
           instructions, JSON.stringify(skills), now, now,
         ],
       );
@@ -2198,7 +2263,7 @@ export const agentProfiles = {
       model: patch.model ?? current.model,
       effort: patch.effort !== undefined ? patch.effort : current.effort,
       mode: patch.mode !== undefined ? patch.mode : current.mode,
-      fast: patch.fast ?? current.fast,
+      speed: patch.speed ?? current.speed,
       maxMode: patch.maxMode ?? current.maxMode,
       skills: patch.skills !== undefined ? sanitizeSkillsList(patch.skills) : current.skills,
     };
@@ -2206,11 +2271,11 @@ export const agentProfiles = {
     try {
       db.run(
         `UPDATE agent_profiles SET
-           name = ?, name_key = ?, harness_id = ?, model = ?, effort = ?, mode = ?, fast = ?, max_mode = ?, instructions = ?, skills_json = ?, updated_at = ?
+           name = ?, name_key = ?, harness_id = ?, model = ?, effort = ?, mode = ?, speed = ?, max_mode = ?, instructions = ?, skills_json = ?, updated_at = ?
          WHERE id = ?`,
         [
           name, nameKey, next.harness, next.model, next.effort, next.mode,
-          next.fast ? 1 : 0, next.maxMode ? 1 : 0, nextInstructions, JSON.stringify(next.skills),
+          next.speed, next.maxMode ? 1 : 0, nextInstructions, JSON.stringify(next.skills),
           Date.now(), id,
         ],
       );

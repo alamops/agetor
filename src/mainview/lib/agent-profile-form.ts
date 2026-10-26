@@ -1,5 +1,5 @@
 /** The text-like fields of the agent-profile form — everything except the
- *  harness/mode/model/effort/fast/maxMode block, which `useTaskLaunch` owns
+ *  harness/mode/model/effort/speed/maxMode block, which `useTaskLaunch` owns
  *  and seeds asynchronously (so it is tracked by interaction, not by value —
  *  see `AgentProfileFormBody`). */
 export interface AgentProfileTextDraft {

@@ -139,7 +139,7 @@ function bundleText(agent: Record<string, unknown> = {}, extra: Record<string, u
           model: "opus-5.5",
           effort: "high",
           mode: null,
-          fast: false,
+          speed: "off",
           maxMode: false,
           instructions: "Work carefully.",
           skills: [],

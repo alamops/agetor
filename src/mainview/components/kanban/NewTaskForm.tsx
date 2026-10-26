@@ -8,7 +8,8 @@ import {
   Workflow,
 } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
-import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
+import { discoveredEffortsFor, hasDiscoveredCatalog, mergeModelOptions } from "../../../shared/model-options.ts";
+import { isSpeed, supportedSpeeds } from "../../../shared/speed.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
 import { resolveStartStep } from "../../../shared/pipeline.ts";
@@ -27,7 +28,6 @@ import {
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
   cursorModelIdCoveredByCatalog,
-  cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
   defaultModeFor,
   supportedEfforts,
@@ -38,6 +38,7 @@ import {
   type Harness,
   type Isolation,
   type Pipeline,
+  type Speed,
   type TaskReference,
   type TaskType,
 } from "../../../shared/types.ts";
@@ -46,6 +47,7 @@ import { AgentProfileCard } from "./AgentProfileCard";
 import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
 import { PipelinePicker } from "@/components/pipelines";
+import { showsSpeedPicker, SpeedPicker } from "./SpeedPicker";
 import { ProjectPicker } from "./ProjectPicker";
 import { TaskTypePicker } from "./TaskTypePicker";
 import { captureDroppedOrPastedItems } from "./ReferencesPicker";
@@ -75,13 +77,13 @@ interface Props {
       mode: string | null;
       model: string | null;
       effort: string | null;
-      fast: boolean;
+      speed: Speed;
       maxMode: boolean;
       references: TaskReference[];
       taskType: TaskType;
       /** Id of the {@link AgentProfile} this task launches from, or null —
        *  see `AgentProfilePicker` above the harness grid. The server
-       *  resolves it and overrides `agent`/`model`/`effort`/`mode`/`fast`/
+       *  resolves it and overrides `agent`/`model`/`effort`/`mode`/`speed`/
        *  `maxMode` from the profile; this form already sends the profile's
        *  own values for those fields (see `submit`), so the override is a
        *  no-op in practice but keeps a body-only consumer honest. */
@@ -223,6 +225,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // claude-code (back-compat) when the harness list hasn't loaded yet or
   // the selected id was deleted out-of-band.
   const kind: AgentKind = selectedHarness?.kind ?? "claude-code";
+  // Latest kind for the mount-once preference seed below: the user can switch
+  // harness before `listPreferences()` resolves, and the seed must then fill
+  // the form from the kind now selected, not the kind at mount.
+  const kindRef = useRef(kind);
+  kindRef.current = kind;
   // workdir starts empty — the OS cwd / home is NOT auto-added as a project.
   // After the user picks (or adds) one and submits a task, we retain the value
   // so the next task pre-fills with the same project ("previous task's project
@@ -240,7 +247,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // `null` is reserved for the Haiku-style "model doesn't accept effort" case.
   // Every other state is a real effort id from EFFORT_OPTIONS.
   const [effort, setEffort] = useState<string | null>(DEFAULT_EFFORT["claude-code"]);
-  const [fast, setFast] = useState(false);
+  const [speed, setSpeed] = useState<Speed>("off");
   const [maxMode, setMaxMode] = useState(false);
   // Spins the Model label's ↻ button while a manual `onRefreshModels` probe
   // is in flight for the currently-selected harness.
@@ -297,13 +304,13 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // picks (mode/model/effort are kind-specific, not alias-specific).
   // Reads/writes happen synchronously inside `switchAgent` — no effects, so
   // no transient wrong-slot writes on render commit.
-  const agentCache = useRef<Record<AgentKind, { mode: string; model: string; effort: string | null; fast: boolean; maxMode: boolean }>>({
-    "claude-code": { mode: initialMode("claude-code"), model: DEFAULT_MODEL["claude-code"], effort: DEFAULT_EFFORT["claude-code"], fast: false, maxMode: false },
-    "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"], fast: false, maxMode: false },
-    "cursor": { mode: initialMode("cursor"), model: DEFAULT_MODEL["cursor"], effort: DEFAULT_EFFORT["cursor"], fast: false, maxMode: false },
-    "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"], fast: false, maxMode: false },
-    "antigravity": { mode: initialMode("antigravity"), model: DEFAULT_MODEL["antigravity"], effort: DEFAULT_EFFORT["antigravity"], fast: false, maxMode: false },
-    "fx": { mode: initialMode("fx"), model: DEFAULT_MODEL["fx"], effort: DEFAULT_EFFORT["fx"], fast: false, maxMode: false },
+  const agentCache = useRef<Record<AgentKind, { mode: string; model: string; effort: string | null; speed: Speed; maxMode: boolean }>>({
+    "claude-code": { mode: initialMode("claude-code"), model: DEFAULT_MODEL["claude-code"], effort: DEFAULT_EFFORT["claude-code"], speed: "off", maxMode: false },
+    "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"], speed: "off", maxMode: false },
+    "cursor": { mode: initialMode("cursor"), model: DEFAULT_MODEL["cursor"], effort: DEFAULT_EFFORT["cursor"], speed: "off", maxMode: false },
+    "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"], speed: "off", maxMode: false },
+    "antigravity": { mode: initialMode("antigravity"), model: DEFAULT_MODEL["antigravity"], effort: DEFAULT_EFFORT["antigravity"], speed: "off", maxMode: false },
+    "fx": { mode: initialMode("fx"), model: DEFAULT_MODEL["fx"], effort: DEFAULT_EFFORT["fx"], speed: "off", maxMode: false },
   });
 
   // Seed mode + model + effort defaults from the last submitted picks,
@@ -326,7 +333,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
         const md = prefs[`lastMode:${a}`];
         const m = prefs[`lastModel:${a}`];
         const e = prefs[`lastEffort:${a}`];
-        const f = prefs[`lastFast:${a}`];
+        const sp = prefs[`lastSpeed:${a}`];
         const mm = prefs[`lastMaxMode:${a}`];
         if (md && AGENT_OPTIONS[a].modes.some((x) => x.id === md)) {
           agentCache.current[a].mode = md;
@@ -350,8 +357,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
             agentCache.current[a].effort = null;
           }
         }
-        if (f === "true" || f === "false") {
-          agentCache.current[a].fast = f === "true";
+        if (isSpeed(sp)) {
+          agentCache.current[a].speed = sp;
         }
         if (mm === "true" || mm === "false") {
           agentCache.current[a].maxMode = mm === "true";
@@ -363,11 +370,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
       seed("gemini");
       seed("antigravity");
       seed("fx");
-      const active = agentCache.current[kind];
+      const active = agentCache.current[kindRef.current];
       setMode(active.mode);
       setModel(active.model);
       setEffort(active.effort);
-      setFast(active.fast);
+      setSpeed(active.speed);
       setMaxMode(active.maxMode);
     }).catch(() => { /* preferences failure is non-fatal — defaults stay */ });
     return () => { cancelled = true; };
@@ -381,13 +388,13 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     // Stash the current picks under the current kind, then restore the
     // next kind's picks. Aliases of the same kind share the cache slot, so
     // a swap claude-work ↔ claude-personal keeps the user's last pick.
-    agentCache.current[kind] = { mode, model, effort, fast, maxMode };
+    agentCache.current[kind] = { mode, model, effort, speed, maxMode };
     const saved = agentCache.current[nextKind];
     setAgent(nextId);
     setMode(saved.mode);
     setModel(saved.model);
     setEffort(saved.effort);
-    setFast(saved.fast);
+    setSpeed(saved.speed);
     setMaxMode(saved.maxMode);
   };
 
@@ -428,7 +435,24 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   const efforts = supportedEfforts(kind, model, discoveredEffortsFor(models, model));
   const effortsKey = efforts.map((o) => o.id).join(",");
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(model);
-  const fastAvailable = kind === "cursor" && cursorModelSupportsFast(model, effort);
+  // Speed tiers the selected kind/model/effort offers (`supportedSpeeds`,
+  // always starting with "off"): cursor's Fast variant follows the
+  // model/effort pair, fx's Fast/Ultrafast come only from the discovered
+  // catalog's per-model flags (rule 8 copies them onto the merged row).
+  const speedOptions = supportedSpeeds(kind, model, effort, models.find((m) => m.id === model));
+  // fx's tiers are only trustworthy once discovery has a catalog for this
+  // harness (and rule 7 isn't distrusting it for a logged-out harness) —
+  // until then an fx model reads `["off"]` and must not reset a stored tier.
+  const speedTiersKnown = hasDiscoveredCatalog(discoveredForAgent) && selectedStatus?.loggedIn !== false;
+  // A user model change: fx resets a tier the new model doesn't offer, but
+  // only when the tiers are known (plan §3.1, D16) — never on load or while
+  // discovery is still empty. cursor's own reset is the effect below.
+  const changeModel = (next: string) => {
+    setModel(next);
+    if (kind !== "fx" || speed === "off" || !speedTiersKnown) return;
+    const nextOptions = supportedSpeeds(kind, next, effort, models.find((m) => m.id === next));
+    if (!nextOptions.includes(speed)) setSpeed("off");
+  };
   useEffect(() => {
     if (efforts.length === 0) {
       if (effort !== null) setEffort(null);
@@ -441,9 +465,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     setEffort(fallback);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, model, effortsKey]);
+  const cursorSpeedKey = kind === "cursor" ? speedOptions.join(",") : null;
   useEffect(() => {
-    if (!fastAvailable && fast) setFast(false);
-  }, [fastAvailable, fast]);
+    if (cursorSpeedKey === null || speed === "off") return;
+    if (!cursorSpeedKey.split(",").includes(speed)) setSpeed("off");
+  }, [cursorSpeedKey, speed]);
   useEffect(() => {
     if (!maxModeAvailable && maxMode) setMaxMode(false);
   }, [maxModeAvailable, maxMode]);
@@ -588,7 +614,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
         title: title.trim(),
         prompt: prompt.trim(),
         // When a profile is selected, the manual agent/mode/model/effort/
-        // fast/maxMode state above is hidden and stale — send the profile's
+        // speed/maxMode state above is hidden and stale — send the profile's
         // own values instead. The server re-resolves and overrides these
         // from the profile anyway (`createTask`); sending them here too
         // keeps the request body self-consistent for any other consumer.
@@ -603,7 +629,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
         mode: selectedProfile ? selectedProfile.mode : mode,
         model: selectedProfile ? selectedProfile.model : model,
         effort: selectedProfile ? selectedProfile.effort : effort,
-        fast: selectedProfile ? selectedProfile.fast : (kind === "cursor" ? fast : false),
+        speed: selectedProfile ? selectedProfile.speed : (kind === "cursor" || kind === "fx" ? speed : "off"),
         maxMode: selectedProfile ? selectedProfile.maxMode : (kind === "cursor" ? maxMode : false),
         references,
         taskType,
@@ -627,11 +653,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     // picks, and there's no "last used profile"/"last used pipeline"
     // preference (plan D12).
     if (!selectedProfile && !selectedPipeline) {
-      agentCache.current[kind] = { mode, model, effort, fast, maxMode };
+      agentCache.current[kind] = { mode, model, effort, speed, maxMode };
       void api.setPreference(`lastMode:${kind}`, mode).catch(() => {});
       void api.setPreference(`lastModel:${kind}`, model).catch(() => {});
       if (effort !== null) void api.setPreference(`lastEffort:${kind}`, effort).catch(() => {});
-      void api.setPreference(`lastFast:${kind}`, String(kind === "cursor" && fast)).catch(() => {});
+      void api.setPreference(`lastSpeed:${kind}`, kind === "cursor" || kind === "fx" ? speed : "off").catch(() => {});
       void api.setPreference(`lastMaxMode:${kind}`, String(kind === "cursor" && maxMode)).catch(() => {});
     }
     setTitle("");
@@ -869,7 +895,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
               </div>
 
               {/* "One selection" (plan D5): a picked profile replaces the
-                  entire manual harness/mode/model/effort(/fast/max) block
+                  entire manual harness/mode/model/effort(/speed/max) block
                   below with its own card — nothing under here is read from
                   when `selectedProfile` is set (see `submit`). */}
               {selectedProfile ? (
@@ -961,7 +987,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                       kind === "codex"
                         ? "Codex has no native plan mode — routed to 'ask' so nothing auto-executes."
                         : kind === "cursor"
-                        ? "Cursor has no native plan mode — routed to propose-only 'ask' so nothing auto-executes."
+                        ? "Routed to cursor-agent's --mode plan — a real read-only planning mode. Approving the plan switches the task to Auto (force)."
                         : kind === "gemini"
                         ? "Routed to gemini's --approval-mode plan — a real read-only mode, no changes made."
                         : kind === "antigravity"
@@ -1021,7 +1047,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                   </div>
                   <Select
                     value={model}
-                    onChange={(e) => setModel(e.target.value)}
+                    onChange={(e) => changeModel(e.target.value)}
                     className="h-8"
                   >
                     {models.map((m) => (
@@ -1055,7 +1081,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                 </div>
               </div>
 
-              {kind === "cursor" && (maxModeAvailable || maxMode || fastAvailable || fast) && (
+              {kind === "cursor" && (maxModeAvailable || maxMode) && (
                 <div className="grid grid-cols-2 gap-2">
                   {(maxModeAvailable || maxMode) && (
                     <label className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs">
@@ -1068,17 +1094,18 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                       />
                     </label>
                   )}
-                  {(fastAvailable || fast) && (
-                    <label className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs">
-                      <span>Fast</span>
-                      <Switch
-                        checked={fast}
-                        onCheckedChange={setFast}
-                        disabled={!fastAvailable}
-                        aria-label="Use Cursor fast variant"
-                      />
-                    </label>
-                  )}
+                </div>
+              )}
+
+              {(kind === "cursor" || kind === "fx") && showsSpeedPicker(speedOptions, speed) && (
+                <div className="space-y-1">
+                  <label className="text-muted-foreground">Speed</label>
+                  <SpeedPicker
+                    testId="new-task-speed"
+                    options={speedOptions}
+                    value={speed}
+                    onChange={setSpeed}
+                  />
                 </div>
               )}
 

@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import path from "node:path";import { cursorModelArg, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness } from "../shared/types.ts";
+import path from "node:path";import { cursorModelArg, DEFAULT_MODEL, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness, type Speed } from "../shared/types.ts";
 import { compactionStatusLine } from "../shared/compaction.ts";
 import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
 import { HANDOFF_TAG } from "../shared/pipeline.ts";
@@ -15,9 +15,9 @@ import {
   type SpawnedAgent,
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
-import { spawnCursorViaTmux } from "./cursor-tmux.ts";
+import { createCursorMapCtx, flushCursorThinking, mapCursorEvent, spawnCursorViaTmux } from "./cursor-tmux.ts";
 import { dataDir, subagents as subagentsDb, tasks } from "./db.ts";
-import { spawnFxViaAcp, type FxMode } from "./fx-acp.ts";
+import { FX_STEER_DROPPED_STATUS, fxRefusedStatusLine, fxSpeedNotOfferedLine, mapFxUpdate, spawnFxViaAcp, type FxLaunchOptions, type FxMode, type FxUpdateCtx } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
 import { spawnAntigravityViaTmux } from "./antigravity-tmux.ts";
 import { answerFxPermission, registerFxPermission } from "./interactions.ts";
@@ -88,8 +88,11 @@ export interface AgentRunOptions {
   model?: string | null;
   /** Friendly reasoning-effort id (codex: minimal|low|medium|high). */
   effort?: string | null;
-  /** Fast model variant toggle. Currently consumed by cursor only. */
-  fast?: boolean | null;
+  /**
+   * Speed tier (`off | fast | ultrafast`). Cursor folds `fast` into the
+   * model id; fx applies it as an ACP session option. Other kinds ignore it.
+   */
+  speed?: Speed | null;
   /** Cursor Max Mode / large-context toggle. Currently consumed by cursor only. */
   maxMode?: boolean | null;
   /**
@@ -607,19 +610,34 @@ export function buildCommand(
     }
     // Cursor exposes thinking level and Fast as model variants. Curated base
     // model ids are composed here; unknown/discovered ids pass through.
-    args.push("--model", cursorModelArg(opts.model, opts.effort ?? null, opts.fast === true, opts.maxMode === true));
+    args.push("--model", cursorModelArg(opts.model, opts.effort ?? null, opts.speed === "fast", opts.maxMode === true));
 
     // Mode → auto-execute posture. `auto` (also the null default, per house
     // convention) runs with --force --sandbox disabled so cursor executes
     // edits/commands without approval prompts — same "no sandbox"
     // philosophy as claude's --dangerously-skip-permissions and codex's
-    // danger-full-access escalation. `ask` emits neither flag: cursor-agent
-    // -p cannot execute unapproved actions headlessly, so this is a
-    // propose-only run. No gitWritableRoots escalation is needed here
-    // (plan §3.4) — auto never runs sandboxed for cursor in the first place.
+    // danger-full-access escalation. `plan` and `ask` map onto cursor-agent's
+    // own read-only modes (`--mode plan`: plan first, implement once the plan
+    // is approved; `--mode ask`: Q&A, no edits) — cursor-agent -p can't
+    // execute unapproved actions headlessly, so neither ever edits. Unknown
+    // mode ids get no mode flag (house passthrough). No gitWritableRoots
+    // escalation is needed here (plan §3.4) — auto never runs sandboxed for
+    // cursor in the first place.
     const mode = opts.mode ?? defaultModeFor(harness.kind);
     if (mode === "auto") {
       args.push("--force", "--sandbox", "disabled");
+    } else if (mode === "plan" || mode === "ask") {
+      args.push("--mode", mode);
+    }
+    // Every run without `--force` passes `--trust`: `cursor-agent -p` in a
+    // directory with no trusted ancestor exits 1 with "Workspace Trust
+    // Required" unless it gets `--trust`, `--yolo` or `-f` (`--force` skips
+    // the gate), and an agetor worktree is a fresh path. Trust is recorded
+    // per path under `~/.cursor/projects/` and lets the worktree's project
+    // rules/hooks/MCP config apply, same as auto mode already gets (grill
+    // D22). An `AGETOR_CURSOR_ARGS` `--force` counts too.
+    if (!args.includes("--force") && !extra.includes("--force")) {
+      args.push("--trust");
     }
 
     args.push(...extra);
@@ -904,7 +922,12 @@ export async function buildCodexCommand(
  * rather than touching tmux. Keeps orchestrator integration tests fast and
  * isolated from a real CLI.
  */
-type FakeDriverInstance = SpawnedAgent & { _record: string[] };
+type FakeDriverInstance = SpawnedAgent & {
+  _record: string[];
+  /** The speed tier the spawn's run options carried (recorded by the fake
+   *  fx branch, so orchestrator tests can see `task.speed` reach the spawn). */
+  _speed?: Speed | null;
+};
 const fakeDrivers = new Map<string, FakeDriverInstance>();
 export function __getFakeDriver(taskId: string): FakeDriverInstance | undefined {
   return fakeDrivers.get(taskId);
@@ -1393,6 +1416,75 @@ export const FAKE_FX_RECOVERY_URL_PROMPT_MARKER = "__agetor_fake_fx_recovery_url
  */
 export const FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER = "__agetor_fake_fx_effort_unoffered__";
 /**
+ * Prompt-marker trigger for fx 0.0.11+'s terminal `failed` recovery state
+ * (docs/plans/fx-0.0.14-and-cursor-updates.md §3.6/§5): two `active` retry
+ * updates, then a `failed` one — fx stopped retrying and kept no resumable
+ * checkpoint — then the turn ends `refused` and the run fails. Each update is
+ * a canned `session_info_update` fed through the real `mapFxUpdate`, so the
+ * sentinels and the `failed` summary line are exactly what the real driver
+ * would persist. `AGETOR_FAKE_FX_RECOVERY_FAILED=1` is the process-wide
+ * equivalent, same rationale as {@link FAKE_FX_RECOVERY_PROMPT_MARKER}'s env
+ * twin. Ignored on a `continueRecovery` launch (a failed turn has nothing to
+ * continue).
+ */
+export const FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER = "__agetor_fake_fx_recovery_failed__";
+/**
+ * Prompt-marker trigger for fx-acp.ts's speed "isn't offered" breadcrumb
+ * (`applyFxSpeed`, plan §3.2): the generic fake fx turn emits
+ * `fxSpeedNotOfferedLine(<task speed>, <model>)` for a `fast`/`ultrafast`
+ * task and nothing for `off` — the fake has no session `configOptions` to
+ * consult, so it treats the tier as never offered. Marker only (no env twin).
+ */
+export const FAKE_FX_SPEED_UNOFFERED_PROMPT_MARKER = "__agetor_fake_fx_speed_unoffered__";
+/**
+ * Prompt-marker trigger for fx 0.0.14's tool-call identity metadata and
+ * structured notices (plan §3.2, §3.6): an internal `capability_search` call
+ * (`_meta.fx.toolCall.internal: true`) and its result, an MCP call
+ * (`_meta.fx.toolCall.mcp: {server: "e2e-mcp", tool: "lookup"}`) and its
+ * result, and a `warning` `notice` titled "e2e notice" — all canned
+ * `session/update`s fed through the real `mapFxUpdate` — then an ordinary
+ * assistant reply and a successful turn. Marker only (no env twin).
+ */
+export const FAKE_FX_TOOL_META_PROMPT_MARKER = "__agetor_fake_fx_tool_meta__";
+/**
+ * Prompt-marker trigger for fx 0.0.14 mid-turn steering (plan §3.2 "D17/D18,
+ * steering", §5): `__agetor_fake_fx_steer__:absorbed` or `:dropped`. The fake
+ * turn holds for `AGETOR_FAKE_FX_STEER_HOLD_MS` (default
+ * {@link FAKE_FX_STEER_DEFAULT_HOLD_MS}) and the agent exposes `steer()`,
+ * which accepts every line while the turn is in flight. At settle, `absorbed`
+ * acknowledges each steered line with an assistant line; `dropped` hands each
+ * one to `onSteerDropped` and emits `FX_STEER_DROPPED_STATUS` when it was
+ * re-queued, both before
+ * `done` resolves — the order the real driver guarantees; a kill of a
+ * `:dropped` turn reports its pending steers dropped too (no status line). Read from the
+ * current turn's prompt, else the task's stored prompt (a steered or
+ * re-queued follow-up never carries the marker itself). Without the marker
+ * the fake agent has no `steer` at all. Marker only (no env twin); e2e specs
+ * keep a literal copy.
+ */
+export const FAKE_FX_STEER_PROMPT_MARKER = "__agetor_fake_fx_steer__";
+const FAKE_FX_STEER_SUFFIX_RE = new RegExp(`${FAKE_FX_STEER_PROMPT_MARKER}:(absorbed|dropped)`);
+const FAKE_FX_STEER_DEFAULT_HOLD_MS = 4000;
+
+/** The steer scenario this spawn runs, from the current prompt or (for a
+ *  marker-less follow-up) the task's stored prompt; `null` when neither
+ *  carries a well-formed `:absorbed`/`:dropped` marker. */
+function resolveFakeFxSteerMode(taskId: string, prompt: string): "absorbed" | "dropped" | null {
+  const own = FAKE_FX_STEER_SUFFIX_RE.exec(prompt);
+  if (own) return own[1] as "absorbed" | "dropped";
+  const stored = tasks.get(taskId)?.prompt;
+  const fromStored = stored ? FAKE_FX_STEER_SUFFIX_RE.exec(stored) : null;
+  return fromStored ? (fromStored[1] as "absorbed" | "dropped") : null;
+}
+
+/** How long the steer scenario's turn holds: `AGETOR_FAKE_FX_STEER_HOLD_MS`
+ *  when it is a finite number ≥ 0, else 4000 ms. */
+function fakeFxSteerHoldMs(): number {
+  const raw = process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  const parsed = raw === undefined || raw === "" ? Number.NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : FAKE_FX_STEER_DEFAULT_HOLD_MS;
+}
+/**
  * Same prompt-marker trick as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER}, for the
  * "Claude Code Monitor" scenario (see
  * `docs/plans/claude-code-monitors-hold-running.md`): drives the real "held
@@ -1543,6 +1635,138 @@ function emitFakeFxRecoveryStorm(
   });
 }
 
+/** A fresh `mapFxUpdate` context for one fake fx turn — one ctx per turn,
+ *  shared by every canned update in it, exactly as the real driver threads
+ *  its per-run state through `dispatchSessionUpdate`. */
+function fakeFxUpdateCtx(runId: string): FxUpdateCtx {
+  let seq = 0;
+  return { runId, nextSeq: () => seq++ };
+}
+
+/** Feed one canned fx `session/update` through the real `mapFxUpdate` and
+ *  forward whatever it maps to, line_uuids included. */
+function emitFakeFxUpdate(onChunk: ChunkHandler, ctx: FxUpdateCtx, update: Record<string, unknown>): void {
+  for (const chunk of mapFxUpdate(update, ctx)) onChunk(chunk.stream, chunk.data, chunk.lineUuid);
+}
+
+/** A `session_info_update` carrying fx's `_meta.fx.modelResponseRecovery`. */
+function fakeFxRecoveryUpdate(recovery: Record<string, unknown>): Record<string, unknown> {
+  return { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: recovery } } };
+}
+
+/**
+ * The {@link FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER} scenario: two `active`
+ * retry attempts (+5/+200 ms, the second with `delaySeconds`), then at +400 ms
+ * a terminal `failed` update — fx 0.0.11+ sends `failed` for a
+ * `terminal_provider_error` it doesn't pause on, so there is no checkpoint
+ * and nothing to resume — then the same `fx turn ended: refused` line the
+ * real driver's stopReason switch writes (`fxRefusedStatusLine`, which only
+ * adds "resumable" for a resumable pause) and `resolveDone(1)`.
+ */
+function emitFakeFxRecoveryFailed(
+  onChunk: ChunkHandler,
+  after: (ms: number, fn: () => void) => void,
+  resolveDone: (code: number) => void,
+  ctx: FxUpdateCtx,
+): void {
+  const base = { kind: "auto_retry", cause: "provider_unavailable", action: "retrying_request", attemptLimit: 3, durable: true };
+  after(5, () => {
+    emitFakeFxUpdate(onChunk, ctx, fakeFxRecoveryUpdate({
+      ...base,
+      state: "active",
+      attempt: 1,
+      message: "⚠ Provider unavailable · HTTP 503 · fake gateway outage · retrying request · attempt 1/3",
+    }));
+  });
+  after(200, () => {
+    emitFakeFxUpdate(onChunk, ctx, fakeFxRecoveryUpdate({
+      ...base,
+      state: "active",
+      attempt: 2,
+      delaySeconds: 1,
+      message: "⚠ Provider unavailable · HTTP 503 · fake gateway outage · retrying request in 1s · attempt 2/3",
+    }));
+  });
+  after(400, () => {
+    emitFakeFxUpdate(onChunk, ctx, fakeFxRecoveryUpdate({
+      state: "failed",
+      kind: "terminal_provider_error",
+      cause: "provider_unavailable",
+      attempt: 3,
+      attemptLimit: 3,
+      durable: true,
+      message: "⚠ Provider unavailable · HTTP 503 · fake gateway outage · request failed after 3/3 attempts",
+    }));
+    onChunk("status", fxRefusedStatusLine("refused", ctx.lastRecovery));
+    resolveDone(1);
+  });
+}
+
+/**
+ * The {@link FAKE_FX_TOOL_META_PROMPT_MARKER} scenario: fx 0.0.14's
+ * `_meta.fx.toolCall` identity on two tool calls — an internal discovery
+ * step a host may hide, and an MCP call carrying its server/tool — plus a
+ * structured `notice`, all through the real `mapFxUpdate`, then an ordinary
+ * assistant reply and a successful turn (usage/title sentinels, "turn
+ * complete", `resolveDone(0)`).
+ */
+function emitFakeFxToolMetaTurn(
+  onChunk: ChunkHandler,
+  after: (ms: number, fn: () => void) => void,
+  resolveDone: (code: number) => void,
+  ctx: FxUpdateCtx,
+): void {
+  after(5, () => {
+    emitFakeFxUpdate(onChunk, ctx, {
+      sessionUpdate: "tool_call",
+      toolCallId: "fake-fx-internal-1",
+      name: "capability_search",
+      title: "Search capabilities",
+      kind: "search",
+      status: "pending",
+      rawInput: { query: "lookup" },
+      _meta: { fx: { toolCall: { internal: true } } },
+    });
+    emitFakeFxUpdate(onChunk, ctx, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "fake-fx-internal-1",
+      status: "completed",
+      content: [{ type: "content", content: { type: "text", text: "1 capability: e2e-mcp · lookup" } }],
+    });
+  });
+  after(10, () => {
+    emitFakeFxUpdate(onChunk, ctx, {
+      sessionUpdate: "tool_call",
+      toolCallId: "fake-fx-mcp-1",
+      name: "lookup",
+      title: "Look up a key",
+      kind: "other",
+      status: "pending",
+      rawInput: { key: "alpha" },
+      _meta: { fx: { toolCall: { internal: false, mcp: { server: "e2e-mcp", tool: "lookup" } } } },
+    });
+    emitFakeFxUpdate(onChunk, ctx, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "fake-fx-mcp-1",
+      status: "completed",
+      content: [{ type: "content", content: { type: "text", text: "alpha = 42" } }],
+    });
+  });
+  after(15, () => {
+    emitFakeFxUpdate(onChunk, ctx, { sessionUpdate: "notice", severity: "warning", title: "e2e notice" });
+    emitFakeFxUpdate(onChunk, ctx, {
+      sessionUpdate: "agent_message_chunk",
+      messageId: "fake-fx-msg-1",
+      content: { type: "text", text: "Looked it up: alpha is 42." },
+    });
+  });
+  after(20, () => {
+    emitFakeFxUsageAndTitle(onChunk);
+    onChunk("status", "turn complete");
+    resolveDone(0);
+  });
+}
+
 /**
  * Prompt-marker trigger for the markdown-image fake-driver scenario (see
  * `makeFakeAgent` below): a substring in the *prompt* rather than an env var,
@@ -1675,6 +1899,8 @@ function makeFakeAgent(
     continueRecovery?: boolean;
     effort?: string | null;
     model?: string;
+    speed?: Speed | null;
+    onSteerDropped?: (text: string) => boolean;
   } = {},
 ): SpawnedAgent {  const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
@@ -1702,6 +1928,13 @@ function makeFakeAgent(
   // Set only by the FAKE_CLAUDE_REAL_WATCHER scenario: the real watcher this
   // turn attached, so `kill()` (Stop/delete) can detach it.
   let realWatcherHandle: SubagentWatcherHandle | undefined;
+  // Set only by the FAKE_FX_STEER scenario: the agent's `steer()`. Left
+  // undefined otherwise, so the returned agent carries no `steer` key at all.
+  let steer: ((line: string) => boolean) | undefined;
+  // Set alongside `steer`: what `kill()` does with steers the turn hadn't
+  // settled yet (the `:dropped` variant reports them dropped). Returns true
+  // when it took over resolving `done`.
+  let settleSteersOnKill: (() => boolean) | undefined;
   // Test hook: simulate a claude code API error mid-turn so orchestrator
   // tests can exercise the api-error → `blocked` column flip without having
   // to plumb a real synthetic-message JSONL through the driver. Mirrors what
@@ -2092,6 +2325,76 @@ function makeFakeAgent(
     });
   } else if (
     fakeOpts.kind === "fx"
+    && fakeOpts.continueRecovery !== true
+    && (
+      process.env.AGETOR_FAKE_FX_RECOVERY_FAILED === "1"
+      || prompt.includes(FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER)
+    )
+  ) {
+    // Test hook: fx 0.0.11+'s terminal `failed` recovery state — see
+    // FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER's doc comment. Checked before the
+    // storm branch below; the two markers never overlap as substrings.
+    onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+    emitFakeFxRecoveryFailed(onChunk, after, resolveDone, fakeFxUpdateCtx(fakeOpts.runId ?? `fake-${taskId}`));
+  } else if (fakeOpts.kind === "fx" && prompt.includes(FAKE_FX_TOOL_META_PROMPT_MARKER)) {
+    // Test hook: fx 0.0.14 tool-call identity metadata + structured notice —
+    // see FAKE_FX_TOOL_META_PROMPT_MARKER's doc comment.
+    onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+    emitFakeFxToolMetaTurn(onChunk, after, resolveDone, fakeFxUpdateCtx(fakeOpts.runId ?? `fake-${taskId}`));
+  } else if (
+    fakeOpts.kind === "fx"
+    && fakeOpts.continueRecovery !== true
+    && resolveFakeFxSteerMode(taskId, prompt) !== null
+  ) {
+    // Test hook: fx 0.0.14 mid-turn steering — see FAKE_FX_STEER_PROMPT_MARKER's
+    // doc comment. The turn holds so a follow-up can arrive while it runs;
+    // `steer()` takes every line until the turn settles (or is killed). A
+    // kill (Stop, delete, archive, agent switch) of a `:dropped` turn hands
+    // every pending steer to `onSteerDropped` before `done` resolves, like the
+    // real driver's cancel and `dropFxSession` paths — a tick later, since
+    // the real drop arrives asynchronously after the kill too — but emits no
+    // status chunk, since a kill can land after a deleted run's row is gone.
+    const steerMode = resolveFakeFxSteerMode(taskId, prompt) as "absorbed" | "dropped";
+    const steered: string[] = [];
+    let steerSettled = false;
+    steer = (line) => {
+      if (steerSettled || killed) return false;
+      // Same per-message cap the real driver enforces (fx refuses > 64 KiB).
+      if (Buffer.byteLength(line, "utf8") > 64 * 1024) return false;
+      record.push(`steer:${line}`);
+      steered.push(line);
+      return true;
+    };
+    settleSteersOnKill = () => {
+      if (steerSettled) return false;
+      steerSettled = true;
+      if (steerMode !== "dropped" || steered.length === 0) return false;
+      setTimeout(() => {
+        for (const text of steered) fakeOpts.onSteerDropped?.(text);
+        resolveDone(0);
+      }, 0);
+      return true;
+    };
+    onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+    after(5, () => {
+      onChunk("thinking", "fake fx reasoning");
+      onChunk("assistant", "fake fx steer turn: working…");
+    });
+    after(Math.max(fakeFxSteerHoldMs(), 6), () => {
+      steerSettled = true;
+      for (const text of steered) {
+        if (steerMode === "absorbed") {
+          onChunk("assistant", `fake fx took your steer: ${text}`);
+        } else {
+          if (fakeOpts.onSteerDropped?.(text) === true) onChunk("status", FX_STEER_DROPPED_STATUS);
+        }
+      }
+      emitFakeFxUsageAndTitle(onChunk);
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+  } else if (
+    fakeOpts.kind === "fx"
     && (
       fakeOpts.continueRecovery === true
       || process.env.AGETOR_FAKE_FX_RECOVERY === "1"
@@ -2478,9 +2781,20 @@ function makeFakeAgent(
       onChunk(
         "status",
         `fx: effort ${fakeOpts.effort ?? "auto"} isn't offered for ${
-          fakeOpts.model ?? "zai/glm-5.3-flash"
+          fakeOpts.model ?? DEFAULT_MODEL.fx
         } (offers: auto, low, high, max) — running at fx's default`,
       );
+    }
+    // fx 0.0.14 mirror: `applyFxSpeed` (fx-acp.ts) runs right after
+    // `applyFxEffort` and breadcrumbs a Fast/Ultrafast tier the model doesn't
+    // offer — see FAKE_FX_SPEED_UNOFFERED_PROMPT_MARKER's doc comment. Silent
+    // for `off`/unset, like the real driver.
+    if (
+      fakeOpts.kind === "fx"
+      && prompt.includes(FAKE_FX_SPEED_UNOFFERED_PROMPT_MARKER)
+      && (fakeOpts.speed === "fast" || fakeOpts.speed === "ultrafast")
+    ) {
+      onChunk("status", fxSpeedNotOfferedLine(fakeOpts.speed, fakeOpts.model ?? DEFAULT_MODEL.fx));
     }
     after(5, () => {
       // fx ≥0.0.8 mirror: a `thinking` chunk precedes the turn's assistant
@@ -2507,6 +2821,7 @@ function makeFakeAgent(
   }
   const inst: FakeDriverInstance = {
     _record: record,
+    _speed: fakeOpts.speed,
     kill: () => {
       record.push("kill");
       // Set before anything else so the fx-permission scenario's still-
@@ -2530,9 +2845,10 @@ function makeFakeAgent(
       if (fxPermissionCardId !== undefined) {
         answerFxPermission(fxPermissionCardId, { cancelled: true });
       }
-      resolveDone(0);
+      if (settleSteersOnKill?.() !== true) resolveDone(0);
     },
     writeInput: (line) => { record.push(`write:${line}`); return true; },
+    ...(steer ? { steer } : {}),
     done,
   };
   fakeDrivers.set(taskId, inst);
@@ -2621,6 +2937,109 @@ function makeFakeCursorPlanAgent(taskId: string, prompt: string, onChunk: ChunkH
   return inst;
 }
 
+/**
+ * Prompt-marker trigger for the cursor stream scenario
+ * (docs/plans/fx-0.0.14-and-cursor-updates.md §3.3/§5): the fake cursor
+ * driver replays a canned NDJSON turn shaped like cursor-agent 2026.10.22's
+ * real `--output-format stream-json` output — two `thinking` blocks (deltas
+ * then `completed`), a `globToolCall` started/completed pair, an assistant
+ * message and a `result` carrying `usage` — through the real `mapCursorEvent`
+ * with one shared `CursorMapCtx`, so the coalesced thinking chunks
+ * (`cursor:thinking:<n>`) and the usage sentinel (`cursor:usage:<n>`) are
+ * exactly what a real run persists. `AGETOR_FAKE_CURSOR_STREAM=1` is the
+ * process-wide equivalent. The marker wins over `AGETOR_FAKE_CURSOR_PLAN=1`;
+ * the env twin doesn't (see `spawnAgent`'s cursor branch).
+ */
+export const FAKE_CURSOR_STREAM_PROMPT_MARKER = "__agetor_fake_cursor_stream__";
+
+/** Synthetic cursor-agent 2026.10.22 stream-json turn for
+ *  {@link FAKE_CURSOR_STREAM_PROMPT_MARKER} — the live capture's shape
+ *  (inner tool key first, then cursor's bookkeeping siblings; `result.usage`
+ *  with all four token counts) with genericized content. */
+function fakeCursorStreamEvents(sessionId: string, prompt: string): Record<string, unknown>[] {
+  const callId = "call-fake-stream-1\nfc_fake_stream_1";
+  const globArgs = { globPattern: "**/notes.txt" };
+  const toolBookkeeping = { hookAdditionalContexts: [], toolCallId: callId, startedAtMs: "1700000000000" };
+  return [
+    { type: "system", subtype: "init", apiKeySource: "login", cwd: "/fake/cwd", session_id: sessionId, model: "Auto", permissionMode: "default" },
+    { type: "user", message: { role: "user", content: [{ type: "text", text: prompt }] }, session_id: sessionId },
+    { type: "thinking", subtype: "delta", text: "Looking for", session_id: sessionId },
+    { type: "thinking", subtype: "delta", text: " the notes file", session_id: sessionId },
+    { type: "thinking", subtype: "delta", text: " first.", session_id: sessionId },
+    { type: "thinking", subtype: "completed", session_id: sessionId },
+    {
+      type: "tool_call",
+      subtype: "started",
+      call_id: callId,
+      tool_call: { globToolCall: { args: globArgs }, ...toolBookkeeping },
+      session_id: sessionId,
+    },
+    {
+      type: "tool_call",
+      subtype: "completed",
+      call_id: callId,
+      tool_call: {
+        globToolCall: { args: globArgs, result: { success: { pattern: "", path: "", files: ["./notes.txt"], totalFiles: 1 } } },
+        ...toolBookkeeping,
+        completedAtMs: "1700000000050",
+      },
+      session_id: sessionId,
+    },
+    { type: "thinking", subtype: "delta", text: "Found it.", session_id: sessionId },
+    { type: "thinking", subtype: "delta", text: " Answering now.", session_id: sessionId },
+    { type: "thinking", subtype: "completed", session_id: sessionId },
+    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "The notes file is ./notes.txt." }] }, session_id: sessionId },
+    {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "The notes file is ./notes.txt.",
+      session_id: sessionId,
+      request_id: "fake-request-1",
+      usage: { inputTokens: 1200, outputTokens: 80, cacheReadTokens: 3400, cacheWriteTokens: 0 },
+    },
+  ];
+}
+
+/** The {@link FAKE_CURSOR_STREAM_PROMPT_MARKER} fake agent: one canned event
+ *  per 3 ms through `mapCursorEvent`, lineIndex = the NDJSON line index the
+ *  real tailer would use, settling with the `result` event's exit code (no
+ *  "turn complete" line — the real cursor driver writes none). */
+function makeFakeCursorStreamAgent(taskId: string, prompt: string, onChunk: ChunkHandler): SpawnedAgent {
+  const record: string[] = [`spawn:${prompt}`];
+  let resolveDone!: (code: number) => void;
+  const done = new Promise<number>((res) => { resolveDone = res; });
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
+
+  const ctx = createCursorMapCtx();
+  let assistantTextEmitted = false;
+  const events = fakeCursorStreamEvents(`fake-cursor-session-${taskId}`, prompt);
+  events.forEach((evt, lineIndex) => {
+    after(5 + lineIndex * 3, () => {
+      const result = mapCursorEvent(evt as Parameters<typeof mapCursorEvent>[0], onChunk, lineIndex, assistantTextEmitted, ctx);
+      if (result.assistantTextEmitted) assistantTextEmitted = true;
+      if (lineIndex === events.length - 1) {
+        flushCursorThinking(ctx, onChunk);
+        resolveDone(result.done ?? 0);
+      }
+    });
+  });
+
+  const inst: FakeDriverInstance = {
+    _record: record,
+    kill: () => {
+      record.push("kill");
+      for (const t of timers) clearTimeout(t);
+      resolveDone(0);
+    },
+    writeInput: (line) => { record.push(`write:${line}`); return true; },
+    done,
+  };
+  fakeDrivers.set(taskId, inst);
+  return inst;
+}
+
 export interface SpawnAgentArgs {
   taskId: string;
   /** The run row this spawn belongs to. Used by the codex driver to key its
@@ -2643,7 +3062,45 @@ export interface SpawnAgentArgs {
    * kind now has one.
    */
   onSessionId?: (sessionId: string) => void;
+  /**
+   * fx-only: called with the text of a mid-turn steer (`SpawnedAgent.steer`)
+   * fx didn't take before the turn ended, so the caller can send it as the
+   * next turn instead. Fires BEFORE the agent's `done` resolves; returns
+   * whether the text was queued. Forwarded to
+   * `FxLaunchOptions.onSteerDropped`; every other kind ignores it.
+   */
+  onSteerDropped?: (text: string) => boolean;
   opts?: AgentRunOptions;
+}
+
+/**
+ * The `FxLaunchOptions` `spawnAgent` hands `spawnFxViaAcp` for a real fx
+ * spawn — split out so tests can pin exactly what reaches the driver
+ * (the speed tier and the harness's profile-MCP toggle in particular)
+ * without spawning an fx child. `speed: null` means "skip speed
+ * reconciliation" in the driver; `profileMcpServers` is on unless the harness
+ * explicitly turned it off (an absent field reads as on).
+ */
+export function buildFxLaunchOptions(args: SpawnAgentArgs, built: AgentCommand): FxLaunchOptions {
+  const { taskId, runId, harness, prompt, cwd, onChunk, onSessionId, onSteerDropped, opts = {} } = args;
+  return {
+    taskId,
+    runId,
+    argv: built.cmd,
+    env: built.env ?? {},
+    cwd,
+    promptText: prompt,
+    mode: (opts.mode ?? defaultModeFor(harness.kind)) as FxMode,
+    resumeSessionId: opts.resumeSessionId ?? undefined,
+    continueRecovery: opts.continueRecovery === true,
+    effort: opts.effort ?? null,
+    speed: opts.speed ?? null,
+    profileMcpServers: harness.profileMcpServers !== false,
+    model: opts.model ?? undefined,
+    onChunk,
+    onSessionId,
+    onSteerDropped,
+  };
 }
 
 /**
@@ -2720,10 +3177,19 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       // and can route follow-ups through `--resume` — mirrors what a real
       // `system/init` event would deliver.
       onSessionId?.(`fake-cursor-session-${taskId}`);
-      // Test hook, additive: without the env var this is unreachable and
-      // behavior is unchanged (see `makeFakeCursorPlanAgent`'s header).
+      // Test hooks, additive: without their marker/env these are unreachable
+      // and behavior is unchanged (see `makeFakeCursorPlanAgent`'s and
+      // FAKE_CURSOR_STREAM_PROMPT_MARKER's headers). The per-prompt stream
+      // marker is checked first so an e2e worker running with
+      // AGETOR_FAKE_CURSOR_PLAN=1 can still drive a stream task.
+      if (prompt.includes(FAKE_CURSOR_STREAM_PROMPT_MARKER)) {
+        return makeFakeCursorStreamAgent(taskId, prompt, onChunk);
+      }
       if (process.env.AGETOR_FAKE_CURSOR_PLAN === "1") {
         return makeFakeCursorPlanAgent(taskId, prompt, onChunk);
+      }
+      if (process.env.AGETOR_FAKE_CURSOR_STREAM === "1") {
+        return makeFakeCursorStreamAgent(taskId, prompt, onChunk);
       }      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });    }
     const built = buildCommand(harness, prompt, opts);
     return await spawnCursorViaTmux({
@@ -2811,24 +3277,12 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
         continueRecovery: opts.continueRecovery === true,
         effort: opts.effort ?? null,
         model: opts.model ?? undefined,
+        speed: opts.speed ?? null,
+        onSteerDropped: args.onSteerDropped,
       });
     }
     const built = buildCommand(harness, prompt, { ...opts, runId });
-    return spawnFxViaAcp({
-      taskId,
-      runId,
-      argv: built.cmd,
-      env: built.env ?? {},
-      cwd,
-      promptText: prompt,
-      mode: (opts.mode ?? defaultModeFor(harness.kind)) as FxMode,
-      resumeSessionId: opts.resumeSessionId ?? undefined,
-      continueRecovery: opts.continueRecovery === true,
-      effort: opts.effort ?? null,
-      model: opts.model ?? undefined,
-      onChunk,
-      onSessionId,
-    });
+    return spawnFxViaAcp(buildFxLaunchOptions(args, built));
   }
 
   // codex — hosted in a per-task tmux session via codex-tmux.ts (so a mid-turn

@@ -11,9 +11,10 @@ import type { AgentKind } from "../shared/types.ts";
  *
  * `efforts`, when present, is the deduped list of bare reasoning-effort ids
  * (e.g. `"high"`, `"ultra"`) the CLI itself reported as supported for this
- * model — codex only today, sourced from `codex app-server`'s `model/list`
- * response (`supportedReasoningEfforts[].reasoningEffort`; see
- * `parseCodexModelList`). Omitted entirely when the CLI reported no efforts
+ * model — codex, sourced from `codex app-server`'s `model/list` response
+ * (`supportedReasoningEfforts[].reasoningEffort`; see `parseCodexModelList`),
+ * and fx ≥0.0.14, sourced from `fx models --json`'s `models[].efforts` plus
+ * `auto` (see `parseFxModels`). Omitted entirely when the CLI reported no efforts
  * (never an empty array), so a model with no discovered effort data is
  * byte-identical to the pre-`efforts` shape. Consumed via `supportedEfforts`'
  * third argument (`src/shared/types.ts`), where a non-empty discovered set
@@ -23,6 +24,12 @@ export interface DiscoveredModel {
   id: string;
   label?: string;
   efforts?: string[];
+  /** fx ≥0.0.14 only (`models --json` `models[].fast === true`): the model
+   *  offers the ACP `fast` session option. Never attached as `false`. */
+  fast?: boolean;
+  /** fx ≥0.0.14 only (`models[].ultrafast === true`): the model offers the
+   *  ACP `ultrafast` session option. Never attached as `false`. */
+  ultrafast?: boolean;
 }
 
 /**
@@ -547,25 +554,95 @@ async function discoverAntigravity(): Promise<DiscoveredModel[]> {
  * this measurement) are present in the unauth catalog; the signed-in
  * reference account still couldn't be re-measured (no valid local login at
  * measurement time).
+ *
+ * fx 0.0.14 (binary probe of the release build 1a070af32cdf + source,
+ * 2026-10-22) ADDS a `models` array beside `ids`: one
+ * `{id, name, efforts: string[], fast: boolean, ultrafast: boolean}` object
+ * per id, same ids in the same order. The unauthenticated catalog read 264
+ * ids that day; the owner's signed-in account reads 145 (2026-10-22). Of
+ * the 264, 72 report no efforts, 33 are `fast` and 2 `ultrafast`
+ * (openai/gpt-6.1-sol, openai/gpt-6-astra). `efforts` is listed weakest
+ * first (`["none","low","medium","high"]`), and the ACP `effort` option fx
+ * builds per session equals it plus `auto`. `fast`/`ultrafast` say whether
+ * the session offers the ACP `fast`/`ultrafast` options (Ultrafast wins
+ * when both are set). So when `models` is present this parser reads it
+ * (see `parseFxModelEntry`): discovered efforts then win over the curated
+ * `MODEL_EFFORT_SUPPORT.fx` table through `supportedEfforts`, discovered
+ * names become labels, and the speed flags feed `supportedSpeeds`. With
+ * no `models` (fx ≤0.0.13) it reads `ids` exactly as before — no efforts,
+ * no labels, no speed flags — and the curated table stays the source.
  */
 function parseFxModels(stdout: string): DiscoveredModel[] {
   try {
     const parsed: unknown = JSON.parse(stdout.trim());
-    if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { ids?: unknown }).ids)) {
-      return [];
-    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+    const envelope = parsed as { ids?: unknown; models?: unknown };
+    const hasModels = Array.isArray(envelope.models);
+    if (!hasModels && !Array.isArray(envelope.ids)) return [];
     const out: DiscoveredModel[] = [];
     const seen = new Set<string>();
-    for (const id of (parsed as { ids: unknown[] }).ids) {
-      if (typeof id !== "string" || id.length === 0) continue;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      out.push({ id });
+    if (hasModels) {
+      for (const entry of envelope.models as unknown[]) {
+        const model = parseFxModelEntry(entry);
+        if (!model || seen.has(model.id)) continue;
+        seen.add(model.id);
+        out.push(model);
+      }
+    }
+    // `ids` is the whole catalog on every version (0.0.14 lists the same
+    // ids, in the same order, in both arrays). Appending any id `models[]`
+    // didn't cover keeps a malformed or partial `models[]` from shrinking
+    // the catalog — such an id just carries no efforts/label/speed flags.
+    if (Array.isArray(envelope.ids)) {
+      for (const id of envelope.ids) {
+        if (typeof id !== "string" || id.length === 0) continue;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push({ id });
+      }
     }
     return out;
   } catch {
     return [];
   }
+}
+
+/**
+ * One fx ≥0.0.14 `models[]` entry, `{id, name, efforts, fast, ultrafast}`,
+ * mapped to a {@link DiscoveredModel}; `null` when `id` isn't a non-empty
+ * string. Every other field is optional and validated on its own, and a
+ * key is attached only when it carries information: `label` for a
+ * non-empty string `name`, `efforts` for a non-empty list of non-empty
+ * strings (deduped, fx's reported order kept — the same convention as
+ * `parseCodexModelList`; `supportedEfforts` reorders by `EFFORT_OPTIONS`
+ * anyway) with `auto` appended, and `fast`/`ultrafast` only when exactly
+ * `true`. The appended `auto` mirrors fx's ACP `effort` session option,
+ * which is always `models[].efforts` plus `auto` ("default") — spike S3,
+ * 0.0.14 — and is what lets an fx task keep `DEFAULT_EFFORT.fx = "auto"`
+ * when discovery wins over the curated table.
+ */
+function parseFxModelEntry(entry: unknown): DiscoveredModel | null {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  const rec = entry as { id?: unknown; name?: unknown; efforts?: unknown; fast?: unknown; ultrafast?: unknown };
+  if (typeof rec.id !== "string" || rec.id.length === 0) return null;
+  const model: DiscoveredModel = { id: rec.id };
+  if (typeof rec.name === "string" && rec.name.trim().length > 0) model.label = rec.name;
+  if (Array.isArray(rec.efforts)) {
+    const efforts: string[] = [];
+    const seen = new Set<string>();
+    for (const effort of rec.efforts) {
+      if (typeof effort !== "string" || effort.length === 0 || seen.has(effort)) continue;
+      seen.add(effort);
+      efforts.push(effort);
+    }
+    if (efforts.length > 0) {
+      if (!seen.has("auto")) efforts.push("auto");
+      model.efforts = efforts;
+    }
+  }
+  if (rec.fast === true) model.fast = true;
+  if (rec.ultrafast === true) model.ultrafast = true;
+  return model;
 }
 
 /**
@@ -625,9 +702,15 @@ function parseFxModels(stdout: string): DiscoveredModel[] {
  * The hardcoded `AGENT_OPTIONS.fx.models` stays the labeled/hinted curated
  * subset shown first in the picker; this discovered list merges with it the
  * same way the codex/cursor discovered lists merge with their own curated
- * arrays (nothing fx-specific to change on the UI side). No labels come back
- * from fx's CLI, so every discovered entry is `{id}` only — the picker falls
- * back to rendering the bare id, same as codex.
+ * arrays (nothing fx-specific to change on the UI side). Before 0.0.14 no
+ * labels came back from fx's CLI, so every discovered entry was `{id}` only
+ * and the picker rendered the bare id, same as codex; 0.0.14's `models[]`
+ * carries a display `name` (used as the label), efforts and speed flags.
+ *
+ * Re-verified against fx 0.0.14 (2026-10-22): still zero filesystem writes
+ * under an empty `HOME`; the unauth catalog reads 264 ids and the owner's
+ * signed-in account 145 — a catalog that lacks zai/glm-5.3-flash and
+ * spacexai/grok-4.7.
  */
 /**
  * The default fx binary resolution — `AGETOR_FX_BIN ?? "fx"`, rehydrated

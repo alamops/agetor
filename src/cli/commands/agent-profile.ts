@@ -3,11 +3,11 @@ import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, table } from "../output.ts";
 import { flagValue } from "../args.ts";
 import type { AgetorClient, AgentProfileInput } from "../api-client.ts";
-import { usageError } from "../usage.ts";
+import { parseSpeedFlag, usageError } from "../usage.ts";
 import { cmdExportOne, cmdImportAs, printableLines } from "./bundle.ts";
 import { asProfileError, matchAgentProfileRef, normalizeSkillName } from "../../shared/agent-profile.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
-import type { AgentProfile } from "../../shared/types.ts";
+import type { AgentProfile, Speed } from "../../shared/types.ts";
 
 export async function cmdAgentProfile(args: string[], flags: Flags): Promise<void> {
   const sub = args[0] ?? "ls";
@@ -36,20 +36,7 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       if (!ref) throw usageError("profile");
       const profile = await resolveProfile(client, ref);
       if (flags.json) return printJson(profile);
-      out(`${c.bold(safe(profile.name))}  ${c.dim(profile.id)}`);
-      out(
-        `  ${label("harness")} ${safe(profile.harness)}   ${label("model")} ${safe(profile.model)}` +
-          `   ${label("effort")} ${safe(profile.effort ?? "-")}   ${label("mode")} ${safe(profile.mode ?? "-")}`,
-      );
-      out(`  ${label("fast")} ${profile.fast ? "yes" : "no"}   ${label("max mode")} ${profile.maxMode ? "yes" : "no"}`);
-      out(
-        `  ${label("skills")} ${profile.skills.length ? profile.skills.map((s) => `/${safe(s)}`).join(", ") : c.dim("none")}`,
-      );
-      out(`  ${label("used by")} ${taskCountText(profile.taskCount ?? 0)}`);
-      out(`  ${label("instructions")}${profile.instructions ? "" : ` ${c.dim("none")}`}`);
-      if (profile.instructions) {
-        for (const line of printableLines(profile.instructions.replace(/\s+$/, ""))) out(`    ${line}`);
-      }
+      for (const line of formatAgentProfileShow(profile)) out(line);
       return;
     }
     case "add": {
@@ -64,7 +51,7 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
         model: f.model,
         effort: f.effort ?? null,
         mode: f.mode ?? null,
-        fast: f.fast ?? false,
+        speed: f.speed ?? "off",
         maxMode: f.maxMode ?? false,
         instructions: instructions ?? "",
         skills: normalizeSkillList(f.skills),
@@ -84,7 +71,7 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
         f.model !== undefined ||
         f.effort !== undefined ||
         f.mode !== undefined ||
-        f.fast !== undefined ||
+        f.speed !== undefined ||
         f.maxMode !== undefined ||
         f.instructions !== undefined ||
         f.instructionsFile !== undefined ||
@@ -92,7 +79,7 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
         f.clearSkills;
       if (!hasAnyFlag) {
         throw new Error(
-          "nothing to edit — pass at least one of --name/--harness/--model/--mode/--effort/--fast/--no-fast/--max-mode/--no-max-mode/--instructions/--instructions-file/--skill/--clear-skills",
+          "nothing to edit — pass at least one of --name/--harness/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode/--instructions/--instructions-file/--skill/--clear-skills",
         );
       }
       const profile = await resolveProfile(client, ref);
@@ -103,7 +90,7 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       if (f.model !== undefined) patch.model = f.model;
       if (f.effort !== undefined) patch.effort = f.effort;
       if (f.mode !== undefined) patch.mode = f.mode;
-      if (f.fast !== undefined) patch.fast = f.fast;
+      if (f.speed !== undefined) patch.speed = f.speed;
       if (f.maxMode !== undefined) patch.maxMode = f.maxMode;
       if (instructions !== undefined) patch.instructions = instructions;
       if (f.clearSkills) {
@@ -225,6 +212,25 @@ export function formatAgentProfileListRow(pr: AgentProfile): string[] {
   ];
 }
 
+/** Pure line formatter for `agetor profile show` — exported so the printed
+ *  fields (the `speed:` tier among them) are unit-testable without a
+ *  client/daemon, like {@link formatAgentProfileListRow}. */
+export function formatAgentProfileShow(profile: AgentProfile): string[] {
+  const lines = [
+    `${c.bold(safe(profile.name))}  ${c.dim(profile.id)}`,
+    `  ${label("harness")} ${safe(profile.harness)}   ${label("model")} ${safe(profile.model)}` +
+      `   ${label("effort")} ${safe(profile.effort ?? "-")}   ${label("mode")} ${safe(profile.mode ?? "-")}`,
+    `  ${label("speed")} ${safe(profile.speed)}   ${label("max mode")} ${profile.maxMode ? "yes" : "no"}`,
+    `  ${label("skills")} ${profile.skills.length ? profile.skills.map((s) => `/${safe(s)}`).join(", ") : c.dim("none")}`,
+    `  ${label("used by")} ${taskCountText(profile.taskCount ?? 0)}`,
+    `  ${label("instructions")}${profile.instructions ? "" : ` ${c.dim("none")}`}`,
+  ];
+  if (profile.instructions) {
+    for (const line of printableLines(profile.instructions.replace(/\s+$/, ""))) lines.push(`    ${line}`);
+  }
+  return lines;
+}
+
 /** Canonicalize instructions text read from any `--instructions-file`
  *  delivery channel (a real path or the `-` stdin marker) so the stored
  *  value doesn't depend on which one was used — a pure, exported helper so
@@ -251,7 +257,9 @@ export interface AgentProfileFlags {
   model?: string;
   effort?: string;
   mode?: string;
-  fast?: boolean;
+  /** `--speed <tier>`, or `--fast` (`fast`) / `--no-fast` (`off`) — the
+   *  later of several speed flags wins. */
+  speed?: Speed;
   maxMode?: boolean;
   instructions?: string;
   instructionsFile?: string;
@@ -274,8 +282,9 @@ export function parseAgentProfileFlags(args: string[]): AgentProfileFlags {
       case "--model": f.model = val(); break;
       case "--effort": f.effort = val(); break;
       case "--mode": f.mode = val(); break;
-      case "--fast": f.fast = true; break;
-      case "--no-fast": f.fast = false; break;
+      case "--speed": f.speed = parseSpeedFlag(val()); break;
+      case "--fast": f.speed = "fast"; break;
+      case "--no-fast": f.speed = "off"; break;
       case "--max-mode": f.maxMode = true; break;
       case "--no-max-mode": f.maxMode = false; break;
       case "--instructions": f.instructions = val(); break;

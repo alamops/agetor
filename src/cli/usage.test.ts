@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { USAGE, canonical, usageError, helpFor } from "./usage.ts";
+import { USAGE, canonical, usageError, helpFor, parseSpeedFlag } from "./usage.ts";
 
 const COMMANDS = [
   "add", "ls", "ps", "show", "start", "send", "commit", "answer", "commands", "logs",
@@ -139,4 +139,36 @@ test("export/import: top-level blocks plus profile and pipeline shortcut blocks"
   expect(USAGE["pipeline import"]!.split("\n", 1)[0]).toContain("[--yes]");
   expect(USAGE["profile import"]!.split("\n", 1)[0]).toContain("[--yes]");
   expect(USAGE["pipeline export"]).toContain("agetor bundle");
+});
+
+// docs/plans/fx-0.0.14-and-cursor-updates.md §3.1 "CLI alias": --speed on
+// add / edit / profile add / profile edit, --fast and --no-fast documented as
+// its aliases, and the later-flag-wins rule spelled out.
+test("--speed is documented on add, edit, profile add and profile edit, with the alias and later-wins rule", () => {
+  for (const cmd of ["add", "edit", "profile add", "profile edit"]) {
+    const block = USAGE[cmd]!;
+    expect(block, cmd).toContain("--speed");
+    expect(block, cmd).toMatch(/--fast (=|is the\s+same as)\s+--speed\s+fast/);
+    expect(block, cmd).toMatch(/--no-fast (=|as)\s+--speed\s+off/);
+    expect(block, cmd).toMatch(/later (flag|one) wins/);
+  }
+  expect(USAGE["add"]).toContain("off | fast | ultrafast");
+  expect(USAGE["edit"]).toContain("off | fast | ultrafast");
+  expect(usageError("profile add").message).toContain("[--speed off|fast|ultrafast]");
+  expect(usageError("profile edit").message).toContain("[--speed off|fast|ultrafast]");
+});
+
+test("add usage lists --speed among the flags --profile and --pipeline cannot be combined with", () => {
+  expect(USAGE["add"]).toContain("--effort/\n                        --speed/--fast/--max-mode, the profile defines them");
+  expect(USAGE["add"]).toContain("--agent/--model/--mode/--effort/--speed/--fast/");
+});
+
+test("parseSpeedFlag accepts the three tiers and refuses anything else with the tier list", () => {
+  expect(parseSpeedFlag("off")).toBe("off");
+  expect(parseSpeedFlag("fast")).toBe("fast");
+  expect(parseSpeedFlag("ultrafast")).toBe("ultrafast");
+  expect(() => parseSpeedFlag("Fast")).toThrow("'--speed' must be one of off, fast, ultrafast (got 'Fast')");
+  expect(() => parseSpeedFlag("")).toThrow("'--speed' must be one of off, fast, ultrafast");
+  // A typed value is echoed escaped, never as a raw control character.
+  expect(() => parseSpeedFlag("x\u001b[31m")).toThrow("(got 'x\\u001b[31m')");
 });

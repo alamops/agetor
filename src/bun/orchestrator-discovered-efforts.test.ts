@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { plantFakeCodexAppServer } from "./test-codex-app-server.ts";
@@ -445,4 +445,137 @@ test("createTask + PATCH guard: a second codex harness's own discovered catalog 
   // The row itself must be untouched by the rejected patch.
   const stillHas = tasks.get(created2.task.id);
   expect(stillHas?.effort).toBe("medium");
+});
+
+/* ── Case 6: fx 0.0.14 discovered efforts (docs/plans/fx-0.0.14-and-cursor-updates.md
+      §3.4 "discovery first") — `parseFxModels` reads `models[].efforts` and
+      appends `auto`, and both consumers honour that set exactly as they do
+      codex's. `minimax/minimax-m3` is a curated fx row whose curated effort
+      set is `[]`, so a discovered set is the only way it can offer efforts:
+      that is what makes "discovery wins" observable here. ── */
+
+/** A fake `fx` binary answering `models --json` with an fx 0.0.14 envelope. */
+function plantFakeFx0014ModelsBin(models: Array<Record<string, unknown>>): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-discovered-efforts-fx-"));
+  const bin = path.join(dir, "fx");
+  const body = JSON.stringify({ kind: "models", count: models.length, ids: models.map((m) => m.id), models });
+  writeFileSync(
+    bin,
+    `#!/bin/sh\nif [ "$1" = "models" ] && [ "$2" = "--json" ]; then echo '${body}'; exit 0; fi\nexit 1\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+async function refreshFxWith(models: Array<Record<string, unknown>>): Promise<void> {
+  discoveryTesting.resetForTests();
+  await withEnvOverride("AGETOR_FX_BIN", plantFakeFx0014ModelsBin(models), async () => {
+    await refreshKindModels("fx");
+  });
+}
+
+const FX_NO_CURATED_EFFORTS = "minimax/minimax-m3";
+
+test("createTask (fx, discovery empty): a model whose curated effort set is [] stores effort null", async () => {
+  discoveryTesting.resetForTests();
+  const created = await createTask({
+    title: "case6-fx-curated-empty",
+    prompt: "p",
+    agent: "fx",
+    model: FX_NO_CURATED_EFFORTS,
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  expect(created.task.effort).toBeNull();
+});
+
+test("createTask (fx, 0.0.14 discovered efforts): the discovered set wins over the curated [] — defaults to DEFAULT_EFFORT.fx ('auto'), which discovery appends", async () => {
+  await refreshFxWith([
+    { id: FX_NO_CURATED_EFFORTS, name: "MiniMax M3", efforts: ["low", "medium", "high"], fast: false, ultrafast: false },
+  ]);
+  const created = await createTask({
+    title: "case6-fx-discovered",
+    prompt: "p",
+    agent: "fx",
+    model: FX_NO_CURATED_EFFORTS,
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  expect(created.task.effort).toBe("auto");
+});
+
+test("createTask (fx, ids-only ≤0.0.13 envelope): no discovered efforts, so the curated table still decides", async () => {
+  discoveryTesting.resetForTests();
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-discovered-efforts-fx-ids-"));
+  const bin = path.join(dir, "fx");
+  writeFileSync(
+    bin,
+    `#!/bin/sh\nif [ "$1" = "models" ]; then echo '{"ids":["${FX_NO_CURATED_EFFORTS}"]}'; exit 0; fi\nexit 1\n`,
+    { mode: 0o755 },
+  );
+  await withEnvOverride("AGETOR_FX_BIN", bin, async () => {
+    await refreshKindModels("fx");
+  });
+  const created = await createTask({
+    title: "case6-fx-ids-only",
+    prompt: "p",
+    agent: "fx",
+    model: FX_NO_CURATED_EFFORTS,
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  expect(created.task.effort).toBeNull();
+});
+
+test("PATCH /tasks/:id (fx, discovery empty): a curated no-effort model allows the null-clear", async () => {
+  discoveryTesting.resetForTests();
+  const created = await createTask({
+    title: "case6-fx-clear-allowed",
+    prompt: "p",
+    agent: "fx",
+    model: FX_NO_CURATED_EFFORTS,
+    effort: "auto",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const res = await authedFetch(`/tasks/${created.task.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ effort: null }),
+  });
+  expect(res.status).toBe(200);
+  expect(tasks.get(created.task.id)?.effort).toBeNull();
+});
+
+test("PATCH /tasks/:id (fx, 0.0.14 discovered efforts): the same model now offers efforts, so the null-clear is rejected", async () => {
+  await refreshFxWith([
+    { id: FX_NO_CURATED_EFFORTS, name: "MiniMax M3", efforts: ["low", "high"], fast: false, ultrafast: false },
+  ]);
+  const created = await createTask({
+    title: "case6-fx-clear-guard",
+    prompt: "p",
+    agent: "fx",
+    model: FX_NO_CURATED_EFFORTS,
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  expect(created.task.effort).toBe("auto");
+
+  const res = await authedFetch(`/tasks/${created.task.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ effort: null }),
+  });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toBe(`effort cannot be cleared for model "${FX_NO_CURATED_EFFORTS}"`);
+  expect(tasks.get(created.task.id)?.effort).toBe("auto");
 });

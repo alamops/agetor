@@ -1,9 +1,11 @@
-// Pure helpers for fx's usage/cost sentinel (`FX_USAGE_STATUS_PREFIX`, see
-// src/shared/types.ts for the wire shape and the two sources that feed it —
-// the ACP `usage_update` notification's `{used, size, cost?}` and the
-// `session/prompt` result's per-turn `usage` object, mapped to `{turn}`).
-// No React here so both the webview and bun-side tests can import this
-// directly. RunPanel is the sole consumer today.
+// Pure helpers for the usage/cost sentinel (`FX_USAGE_STATUS_PREFIX`, see
+// src/shared/types.ts for the wire shape). Despite the `fx` names it is
+// harness-neutral: fx feeds it from the ACP `usage_update` notification's
+// `{used, size, cost?}` (fx 0.0.14 no longer sends `cost`; older binaries
+// may, so it stays optional) and the `session/prompt` result's per-turn
+// `usage` object, mapped to `{turn}`; cursor feeds the same `{turn}` shape
+// from its `result.usage`. No React here so both the webview and bun-side
+// tests can import this directly. RunPanel is the sole consumer today.
 import { FX_TURN_KEYS, type FxUsagePayload } from "../../shared/types.ts";
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -112,7 +114,7 @@ export function fxUsageChipText(u: FxUsagePayload): string | null {
 
 /**
  * The chip's hover tooltip: the exact (non-abbreviated) numbers behind
- * {@link fxUsageChipText}. `fx usage: <used>/<size> tokens` (toLocaleString)
+ * {@link fxUsageChipText}. `usage: <used>/<size> tokens` (toLocaleString)
  * when both are known, followed by `· <amount> <currency>` when a cost is
  * known; then a `turn: in <n> · out <n> · cache read <n> · cache write <n> ·
  * reasoning <n>` segment listing only the per-turn fields that are present
@@ -123,7 +125,7 @@ export function fxUsageTitle(u: FxUsagePayload): string {
   const segments: string[] = [];
 
   if (typeof u.used === "number" && typeof u.size === "number") {
-    let usageSegment = `fx usage: ${u.used.toLocaleString()}/${u.size.toLocaleString()} tokens`;
+    let usageSegment = `usage: ${u.used.toLocaleString()}/${u.size.toLocaleString()} tokens`;
     if (u.cost) usageSegment += ` · ${u.cost.amount} ${u.cost.currency}`;
     segments.push(usageSegment);
   }

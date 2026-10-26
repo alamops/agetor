@@ -99,6 +99,9 @@ import m068 from "./068_imported_claude_session.sql" with { type: "text" };
 import m069 from "./069_imported_claude_session_unique.sql" with { type: "text" };
 import m070 from "./070_imported_claude_session_backfill.sql" with { type: "text" };
 import m071 from "./071_claude_session_seen.sql" with { type: "text" };
+import m072 from "./072_task_speed.sql" with { type: "text" };
+import m073 from "./073_harness_profile_mcp_servers.sql" with { type: "text" };
+import m074 from "./074_retire_fx_models.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -179,4 +182,7 @@ export const migrations: Migration[] = [
   { id: "069_imported_claude_session_unique", sql: m069 },
   { id: "070_imported_claude_session_backfill", sql: m070 },
   { id: "071_claude_session_seen", sql: m071 },
+  { id: "072_task_speed", sql: m072 },
+  { id: "073_harness_profile_mcp_servers", sql: m073 },
+  { id: "074_retire_fx_models", sql: m074 },
 ];
