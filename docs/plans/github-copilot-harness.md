@@ -578,3 +578,14 @@ The owner approved the plan with these as written (2026-10-27). Each still names
 | Copilot commit trailer / auto-update flags | None by decision | Owner D19 |
 | `--disable-builtin-mcps` | None by decision | Owner D25 (built-in GitHub MCP stays on) |
 | Renumbering the migration at merge | In this run, at merge time | §3.11 rule; whoever merges second |
+
+## 10. Execution record (2026-10-27)
+
+- **Commits:** `82d670c` (plan docs), `5972205` (wave 1), `3c82ee5` (wave 2), `6471e96` (wave 3), `4b76907` (test-isolation fix).
+- **Verification:** `bun run typecheck` green. Full `bun test`: 8706 pass. The only failures were two copilot reconcile tests that hit the `AGETOR_TMUX_BIN=/bin/echo` cross-file leak (fixed in `4b76907`) and the `at-file-filter` perf test at load average 36 (it passes alone). TT8 (real copilot 1.0.104, BYOK): 10/10. Full e2e: 333 passed; 5 load flakes at load average ~106 all passed on re-run (35/35, incl. the 21 that did not run). `e2e/copilot-harness.spec.ts`: 6/6, twice.
+- **Driver checked against the spike's real JSONL:** the `result` event carries `exitCode`/`sessionId` at the top level (no `data`, no `id`). This is fixed and pinned by a regression test.
+- **A9 resolved:** a `/skill` prompt works in `-p`, and Copilot injects the skill body, so skill inserts stay `/name`.
+- **A10 resolved (BYOK):** `assistant.reasoning` reaches stdout and maps to `thinking`.
+- **Read-only, refined:** Copilot still auto-approves read-only shell commands; only edits and file-changing commands are denied. The mode copy was updated.
+- **A7:** no effort-unsupported notice was observed (BYOK `gpt-5.4` accepted `high`).
+- **Wave 5 (live smoke): not run.** By owner decision, Copilot CLI is not installed on this machine. Still unverified against a real login: the AI-credit conversion (A4 — `aiCredits` stays flagged unverified and is to be removed if a later smoke can't confirm it), `exit_plan_mode.requested`/plan.md in `-p` (A3), and `COPILOT_HOME` login isolation (A5). T17 did not run.
