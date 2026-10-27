@@ -37,7 +37,7 @@ function seedTask(): string {
     workdir: "/tmp", isolation: "none", taskType: "task",
     branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
     mode: "auto", model: null, effort: null,
-    speed: "off", maxMode: false, references: [], backlog: [], plans: [], draft: null, runId: null,
+    speed: "off", maxMode: false, opencodeServer: "shared", references: [], backlog: [], plans: [], draft: null, runId: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
   });

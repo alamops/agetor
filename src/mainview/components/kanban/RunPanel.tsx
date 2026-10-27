@@ -1804,7 +1804,7 @@ function RunPanelBody({
     const provider = new Map<string, string>();
     const title = new Map<string, string>();
     const recovery = new Map<string, FxRecoveryPayload>();
-    if (kind !== "fx" && kind !== "cursor") {
+    if (kind !== "fx" && kind !== "cursor" && kind !== "opencode") {
       return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title, recoveryByRunId: recovery };
     }
     for (const e of events) {

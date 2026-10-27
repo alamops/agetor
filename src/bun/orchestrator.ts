@@ -6676,6 +6676,11 @@ export async function createTask(
     effort,
     speed: defaultsProfile ? defaultsProfile.speed : isSpeed(input.speed) ? input.speed : "off",
     maxMode: defaultsProfile ? defaultsProfile.maxMode : input.maxMode === true,
+    opencodeServer: defaultsProfile
+      ? (defaultsProfile.opencodeServer ?? "shared")
+      : input.opencodeServer === "standalone"
+        ? "standalone"
+        : "shared",
     agentProfileId: profile?.id ?? null,
     agentProfile: agentProfileSnapshot,
     // Pipeline binding (D1): only the parent row carries `pipelineId` (set

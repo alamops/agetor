@@ -37,10 +37,23 @@ import type { AgentKind, HarnessStatus } from "../shared/types.ts";
  */
 
 const DEBOUNCE_MS = 500;
+
+/**
+ * The kinds whose catalog varies per harness and so get probed one harness
+ * at a time (`HarnessTarget`): fx and codex are account-scoped catalogs, and
+ * an OpenCode harness lists only the providers its own config/env credential
+ * (spike Q7). Every other kind shares one kind-level list.
+ */
+type PerHarnessKind = NonNullable<HarnessTarget["kind"]>;
+const PER_HARNESS_KINDS: ReadonlySet<AgentKind> = new Set<PerHarnessKind>(["fx", "codex", "opencode"]);
+
+function isPerHarnessKind(kind: AgentKind): kind is PerHarnessKind {
+  return PER_HARNESS_KINDS.has(kind);
+}
 const DEFAULT_PERIODIC_MS = 15 * 60_000;
 
 /**
- * Every *enabled* fx or codex harness, as a `HarnessTarget` (its own
+ * Every *enabled* fx, codex or opencode harness, as a `HarnessTarget` (its own
  * `harnessEnv` and `resolveBin` — so an additional-account harness (fx's
  * `fx-2`-style alias, or a second codex harness with its own `home`) is
  * probed under its own env override rather than agetor's process env, *and*
@@ -59,8 +72,8 @@ const DEFAULT_PERIODIC_MS = 15 * 60_000;
 function discoveryTargets(): HarnessTarget[] {
   return harnesses
     .list()
-    .filter((h) => h.enabled !== false && (h.kind === "fx" || h.kind === "codex"))
-    .map((h) => ({ harnessId: h.id, kind: h.kind as "fx" | "codex", env: harnessEnv(h), bin: resolveBin(h) }));
+    .filter((h) => h.enabled !== false && isPerHarnessKind(h.kind))
+    .map((h) => ({ harnessId: h.id, kind: h.kind as PerHarnessKind, env: harnessEnv(h), bin: resolveBin(h) }));
 }
 
 /**
@@ -86,14 +99,16 @@ function snapshotKey(models: DiscoveredModel[]): string {
   return JSON.stringify(models.map((m) => [
     m.id,
     m.label ?? null,
-    m.efforts ?? [],
+    // `null` vs `[]` is meaningful for OpenCode (unknown vs "no variants",
+    // D-6), so a probe that starts or stops answering for a model counts.
+    m.efforts ?? null,
     m.fast === true,
     m.ultrafast === true,
   ]));
 }
 
 function modelsForHarness(harnessId: string, kind: AgentKind): DiscoveredModel[] {
-  return kind === "fx" || kind === "codex" ? getHarnessDiscoveredModels(harnessId) : getDiscoveredModels(kind);
+  return isPerHarnessKind(kind) ? getHarnessDiscoveredModels(harnessId) : getDiscoveredModels(kind);
 }
 
 /**
@@ -127,8 +142,8 @@ function publishIfChanged(): void {
 }
 
 /**
- * Full sweep: every kind's built-in discoverer plus every enabled fx or
- * codex harness's own account-scoped catalog. Broadcasts `agent_models_changed`
+ * Full sweep: every kind's built-in discoverer plus every enabled fx,
+ * codex or opencode harness's own catalog (`PER_HARNESS_KINDS`). Broadcasts `agent_models_changed`
  * for whichever harnesses' lists changed. Never throws — this is called
  * fire-and-forget (`void refreshAllModels()`) from index.ts/headless.ts at
  * boot and from the periodic timer, with no caller left to observe a
@@ -154,10 +169,11 @@ export async function refreshAllModels(): Promise<void> {
 /**
  * Refreshes exactly one harness — kind-targeted, not a five-kind sweep:
  * an unknown/deleted harness id does nothing at all (there's nothing to
- * refresh and no kind to resolve it to); fx and codex each probe that
- * harness's own account-scoped catalog directly (`refreshHarnessTarget`,
- * keyed by harness id, since both kinds' catalogs vary per harness — codex
- * joined fx on this path via code-review finding #4); every other kind
+ * refresh and no kind to resolve it to); fx, codex and opencode each probe
+ * that harness's own catalog directly (`refreshHarnessTarget`, keyed by
+ * harness id, since those kinds' catalogs vary per harness — codex joined fx
+ * on this path via code-review finding #4, opencode with its harness); every
+ * other kind
  * refreshes just that kind's shared cache (`refreshKindModels` — kind-level
  * lists are shared across every harness of that kind, so there's nothing
  * harness-specific left to probe beyond the kind itself). Publishes at most
@@ -169,7 +185,7 @@ export async function refreshHarnessModels(harnessId: string): Promise<void> {
   const harness = harnesses.get(harnessId);
   if (!harness) return;
   try {
-    if (harness.kind === "fx" || harness.kind === "codex") {
+    if (isPerHarnessKind(harness.kind)) {
       await refreshHarnessTarget({
         harnessId: harness.id,
         kind: harness.kind,
@@ -213,7 +229,7 @@ export function noteHarnessRemoved(harnessId: string): void {
 
 /**
  * `GET /agent-models/harnesses`'s payload: one key per *enabled* harness
- * (all kinds) — fx and codex harnesses get their own per-harness catalog,
+ * (all kinds) — fx, codex and opencode harnesses get their own per-harness catalog,
  * every other kind maps to its shared kind-level list, so callers have a
  * single lookup regardless of kind. `ready` mirrors `isDiscoveryReady()` —
  * false until the first full sweep has settled, so the webview's boot-race

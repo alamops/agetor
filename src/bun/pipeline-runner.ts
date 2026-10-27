@@ -813,6 +813,7 @@ async function launchStep(
     effort: profile.effort ?? defaultEffortFor(profile.harnessKind, profile.model, profile.harness),
     speed: profile.speed,
     maxMode: profile.maxMode,
+    opencodeServer: profile.opencodeServer ?? "shared",
     agentProfileId: profile.id,
     agentProfile: profile,
     references,

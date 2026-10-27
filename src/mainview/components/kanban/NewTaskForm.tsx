@@ -311,6 +311,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"], speed: "off", maxMode: false },
     "antigravity": { mode: initialMode("antigravity"), model: DEFAULT_MODEL["antigravity"], effort: DEFAULT_EFFORT["antigravity"], speed: "off", maxMode: false },
     "fx": { mode: initialMode("fx"), model: DEFAULT_MODEL["fx"], effort: DEFAULT_EFFORT["fx"], speed: "off", maxMode: false },
+    "opencode": { mode: initialMode("opencode"), model: DEFAULT_MODEL["opencode"], effort: DEFAULT_EFFORT["opencode"], speed: "off", maxMode: false },
   });
 
   // Seed mode + model + effort defaults from the last submitted picks,
@@ -370,6 +371,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
       seed("gemini");
       seed("antigravity");
       seed("fx");
+      seed("opencode");
       const active = agentCache.current[kindRef.current];
       setMode(active.mode);
       setModel(active.model);
@@ -992,6 +994,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                         ? "Routed to gemini's --approval-mode plan — a real read-only mode, no changes made."
                         : kind === "antigravity"
                         ? "Routed to agy's --mode plan — a real read-only planning mode."
+                        : kind === "opencode"
+                        ? "Routed to OpenCode's Plan agent — no file edits, but shell commands still run."
                         : kind === "fx"
                         ? "fx has no native plan mode — routed to 'ask': only pre-approved rules run; anything else surfaces as an approval card in the run panel."
                         : "Plan only — agent describes what it would do without making changes."

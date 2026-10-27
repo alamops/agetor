@@ -167,6 +167,7 @@ function makeAgentProfile(overrides: Partial<AgentProfile> = {}): AgentProfile {
     mode: "auto",
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     instructions: "Be thorough.",
     skills: ["code-review"],
     createdAt: 1,

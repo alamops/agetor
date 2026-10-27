@@ -25,6 +25,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     model: null,
     effort: null,
     speed: "off",
+    opencodeServer: "shared",
     maxMode: false,
     references: [],
     backlog: [],

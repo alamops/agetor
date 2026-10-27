@@ -213,6 +213,7 @@ export interface AgentModelMap {
   "gemini": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
   "antigravity": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
   "fx": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "opencode": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
 }
 
 /** Per-harness model id list from `GET /agent-models/harnesses` — one entry

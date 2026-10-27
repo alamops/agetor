@@ -1,4 +1,4 @@
-import { Antigravity, ClaudeCode, Codex, Cursor, GeminiCLI, Vercel } from "@lobehub/icons";
+import { Antigravity, ClaudeCode, Codex, Cursor, GeminiCLI, OpenCode, Vercel } from "@lobehub/icons";
 import type { ComponentType } from "react";
 import { cn } from "@/lib/utils";
 import type { AgentKind } from "../../../shared/types.ts";
@@ -18,6 +18,8 @@ const ICONS: Record<AgentKind, ComponentType<IconProps>> = {
   // for Vercel (fx's maker), so the plain (Mono) triangle glyph is the
   // closest equivalent.
   "fx": Vercel,
+  // OpenCode's mark is monochrome too (no `.Color` export) — plain Mono glyph.
+  "opencode": OpenCode,
 };
 
 /**

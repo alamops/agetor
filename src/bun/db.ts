@@ -3,10 +3,11 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type ImportedClaudeSession, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Speed, type Subagent, type SubagentStatus } from "../shared/types.ts";
+import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type ImportedClaudeSession, type ImportedOpencodeSession, type OpencodeServerMode, OPENCODE_SERVER_MODES, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Speed, type Subagent, type SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { isSpeed, speedFromFast } from "../shared/speed.ts";
+import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import { migrate } from "./migrate.ts";
@@ -138,6 +139,17 @@ type TaskRow = {
   // by `tasks.insert` (new rows stay NULL) or the generic `update` SET
   // clause — same rationale as `fx_recovery`/`checkout_branch`.
   imported_claude: string | null;
+  // Which OpenCode server an opencode task's turns use (migration 078,
+  // `OpencodeServerMode`). Patchable — the generic `update` SET clause
+  // writes it. A CHECK keeps it to `shared | standalone`; `toTask` still
+  // validates before trusting it.
+  opencode_server: string;
+  // Provenance for an OpenCode session imported from outside Agetor
+  // (migration 078, `ImportedOpencodeSession` JSON). Written exclusively by
+  // `tasks.setImportedOpencode`, never by `tasks.insert` or the generic
+  // `update` SET clause — same rationale as `imported_claude`. Its claim
+  // column `imported_opencode_session_id` is never read into `Task`.
+  imported_opencode: string | null;
   // Unread-indicator watermark pair (migration 045). Not spread into `Task`
   // directly — only the derived `unread` boolean is (see `toTask`). Written
   // exclusively by `tasks.noteAssistantEvent` / `tasks.markSeen`, never by
@@ -404,7 +416,9 @@ const sanitizeSkillsList = (raw: unknown): string[] => {
  * legacy pre-072 `fast` boolean, else `"off"`) and emitted alongside its
  * derived `fast`, `maxMode` coerced to a boolean, `instructions` a string
  * (default `""`), `skills` sanitized via {@link sanitizeSkillsList}, and
- * `capturedAt` a number (default `0`).
+ * `capturedAt` a number (default `0`), and `opencodeServer` a valid
+ * `OpencodeServerMode` (absent — every snapshot frozen before migration 078
+ * — or invalid reads as `"shared"`).
  */
 const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | null => {
   if (!raw) return null;
@@ -471,6 +485,9 @@ const sanitizeAgentProfileSnapshot = (parsed: unknown): AgentProfileSnapshot | n
     speed,
     fast: speed !== "off",
     maxMode: rec.maxMode === true,
+    // Absent (every snapshot frozen before migration 078) or invalid ⇒
+    // "shared", the column default.
+    opencodeServer: readOpencodeServer(rec.opencodeServer),
     instructions: typeof instructions === "string" ? instructions : "",
     skills: sanitizeSkillsList(rec.skills),
     capturedAt: typeof capturedAt === "number" ? capturedAt : 0,
@@ -710,7 +727,7 @@ const sanitizeRunSnapshot = (raw: unknown): PipelineRunSnapshot | null => {
       if (!isPlainObject(value)) continue;
       const speed = readSnapshotSpeed(value);
       profiles[id] = sanitizeAgentProfileSnapshot(value)
-        ?? ({ ...value, speed, fast: speed !== "off" } as unknown as AgentProfileSnapshot);
+        ?? ({ ...value, speed, fast: speed !== "off", opencodeServer: readOpencodeServer(value.opencodeServer) } as unknown as AgentProfileSnapshot);
     }
   }
 
@@ -833,6 +850,44 @@ function parseImportedClaude(raw: string | null | undefined): ImportedClaudeSess
   };
 }
 
+const IMPORTED_OPENCODE_STATUSES = new Set(["importing", "ready", "failed"]);
+
+/** Tolerant read of `tasks.imported_opencode`, same contract as
+ *  {@link parseImportedClaude}: bad JSON, or a shape missing a required
+ *  field, reads as null — never throws. */
+function parseImportedOpencode(raw: string | null | undefined): ImportedOpencodeSession | null {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const o = parsed as Record<string, unknown>;
+  if (typeof o.sessionId !== "string" || o.sessionId.length === 0) return null;
+  if (typeof o.harnessId !== "string" || o.harnessId.length === 0) return null;
+  if (typeof o.directory !== "string" || o.directory.length === 0) return null;
+  if (typeof o.status !== "string" || !IMPORTED_OPENCODE_STATUSES.has(o.status)) return null;
+  if (typeof o.importedAt !== "number" || !Number.isFinite(o.importedAt)) return null;
+  const error = o.error === null ? null : typeof o.error === "string" ? o.error : undefined;
+  if (error === undefined) return null;
+  return {
+    sessionId: o.sessionId,
+    harnessId: o.harnessId,
+    directory: o.directory,
+    importedAt: o.importedAt,
+    status: o.status as ImportedOpencodeSession["status"],
+    error,
+  };
+}
+
+/** A row's `opencode_server` column, or a snapshot's `opencodeServer` field:
+ *  a valid {@link OpencodeServerMode}, else `"shared"` (the column default).
+ *  Shared by `toTask`, `toAgentProfile` and the profile-snapshot reader. */
+const readOpencodeServer = (raw: unknown): OpencodeServerMode =>
+  (OPENCODE_SERVER_MODES as readonly unknown[]).includes(raw) ? (raw as OpencodeServerMode) : "shared";
+
 const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   id: r.id,
   title: r.title,
@@ -853,6 +908,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   effort: r.effort,
   ...speedFields(r.speed),
   maxMode: r.max_mode === 1,
+  opencodeServer: readOpencodeServer(r.opencode_server),
   references: parseRefs(r.refs),
   backlog: parseBacklog(r.backlog),
   draft: parseDraft(r.draft),
@@ -875,6 +931,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   pipelineStepId: r.pipeline_step_id ?? null,
   checkoutBranch: r.checkout_branch ?? null,
   importedClaude: parseImportedClaude(r.imported_claude),
+  importedOpencode: parseImportedOpencode(r.imported_opencode),
   // Derived, never stored: a monotonic-id watermark comparison, race-free by
   // construction (see migration 045's doc comment). NULL
   // `last_assistant_event_id` (no assistant event ever observed) always
@@ -903,6 +960,23 @@ export class ImportedClaudeSessionTaken extends Error {
   constructor(sessionId: string) {
     super("session is already imported");
     this.name = "ImportedClaudeSessionTaken";
+    this.sessionId = sessionId;
+  }
+}
+
+/** Send and Retry use this when another task holds the OpenCode session
+ *  claim — the OpenCode counterpart of {@link IMPORTED_CLAUDE_HELD_ELSEWHERE}. */
+export const IMPORTED_OPENCODE_HELD_ELSEWHERE =
+  "another task already holds this OpenCode session";
+
+/** Another task already holds this OpenCode session id
+ *  (`tasks.imported_opencode_session_id`, migration 078) — the OpenCode
+ *  counterpart of {@link ImportedClaudeSessionTaken}. */
+export class ImportedOpencodeSessionTaken extends Error {
+  readonly sessionId: string;
+  constructor(sessionId: string) {
+    super("session is already imported");
+    this.name = "ImportedOpencodeSessionTaken";
     this.sessionId = sessionId;
   }
 }
@@ -967,6 +1041,18 @@ export const tasks = {
     }
     return ids;
   },
+  /** Tasks whose OpenCode import is still `importing` — the
+   *  {@link importingClaudeIds} counterpart, same in-process parse. */
+  importingOpencodeIds(): string[] {
+    const rows = db.query<{ id: string; imported_opencode: string }, []>(
+      `SELECT id, imported_opencode FROM tasks WHERE imported_opencode IS NOT NULL`,
+    ).all();
+    const ids: string[] = [];
+    for (const row of rows) {
+      if (parseImportedOpencode(row.imported_opencode)?.status === "importing") ids.push(row.id);
+    }
+    return ids;
+  },
   get(id: string): Task | null {
     const row = db.query<TaskRow, [string]>(
       `${TASKS_SELECT}
@@ -1010,17 +1096,18 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, speed, max_mode, refs, backlog, draft, plans, todo_progress,
+          branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, speed, max_mode, opencode_server, refs, backlog, draft, plans, todo_progress,
           agent_profile_id, agent_profile,
           pipeline_id, pipeline_run, pipeline_parent_id, pipeline_step_id,
           checkout_branch,
           last_assistant_event_id, last_seen_event_id,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
         t.branch, t.branchSource, t.worktreePath, t.baseRef, t.prUrl ?? null, t.issueUrl ?? null, t.mode, t.model, t.effort, t.speed, t.maxMode ? 1 : 0,
+        readOpencodeServer(t.opencodeServer),
         JSON.stringify(t.references ?? []),
         JSON.stringify(t.backlog ?? []),
         t.draft ? JSON.stringify(t.draft) : null,
@@ -1042,7 +1129,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, checkoutBranch: t.checkoutBranch ?? null, importedClaude: null, unread: false, hasAssistantMessages: false, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, checkoutBranch: t.checkoutBranch ?? null, opencodeServer: readOpencodeServer(t.opencodeServer), importedClaude: null, importedOpencode: null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
   /** `fast` is excluded from the patch type: it is only the derived echo of
    *  `speed` (the column migration 072 dropped), so a caller changes the tier
@@ -1099,16 +1186,21 @@ export const tasks = {
     // never clobber an in-flight history backfill or drop the session claim,
     // and that write never bumps `updated_at`. `tasks.insert` leaves both
     // columns NULL.
+    // `imported_opencode`/`imported_opencode_session_id` (migration 078)
+    // join the same skip list on the same rationale: both are written only
+    // by `tasks.setImportedOpencode` below. `opencode_server` (also 078) is
+    // NOT skipped — it is an ordinary patchable launch field like `speed`.
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, issue_url=?, mode=?, model=?, effort=?, speed=?, max_mode=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
+         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, issue_url=?, mode=?, model=?, effort=?, speed=?, max_mode=?, opencode_server=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
         next.taskType,
         next.branch, next.branchSource, next.worktreePath, next.baseRef, next.prUrl ?? null, next.issueUrl ?? null, next.mode, next.model, next.effort, next.speed, next.maxMode ? 1 : 0,
+        readOpencodeServer(next.opencodeServer),
         JSON.stringify(next.references ?? []),
         JSON.stringify(next.backlog ?? []),
         next.draft ? JSON.stringify(next.draft) : null,
@@ -1324,6 +1416,69 @@ export const tasks = {
       `SELECT imported_claude_session_id FROM tasks WHERE imported_claude_session_id IS NOT NULL`,
     ).all();
     return new Set(rows.map((r) => r.imported_claude_session_id));
+  },
+  /**
+   * Write (or clear) a task's imported-OpenCode provenance in one targeted
+   * UPDATE — the OpenCode counterpart of {@link setImportedClaude}, same
+   * contract: no `updated_at` bump, the only writer of `imported_opencode`
+   * and `imported_opencode_session_id` (migration 078), a missing task id
+   * matches zero rows.
+   *
+   * Binding a `sessionId` another task already holds throws
+   * {@link ImportedOpencodeSessionTaken} — the unique index
+   * `tasks_imported_opencode_session_uidx` makes the write the atomic claim.
+   * `opts.claim === false` writes the JSON only and leaves the claim column
+   * untouched, so a duplicate that lost the claim can be marked failed.
+   */
+  setImportedOpencode(
+    taskId: string,
+    value: ImportedOpencodeSession | null,
+    opts?: { claim?: boolean },
+  ): Task | null {
+    const claim = opts?.claim !== false;
+    try {
+      if (value && !claim) {
+        db.run(
+          `UPDATE tasks SET imported_opencode = ? WHERE id = ?`,
+          [JSON.stringify(value), taskId],
+        );
+      } else {
+        db.run(
+          `UPDATE tasks SET imported_opencode = ?, imported_opencode_session_id = ? WHERE id = ?`,
+          [value ? JSON.stringify(value) : null, value ? value.sessionId : null, taskId],
+        );
+      }
+    } catch (err) {
+      if (value && claim && isUniqueConstraintError(err)) throw new ImportedOpencodeSessionTaken(value.sessionId);
+      throw err;
+    }
+    return this.get(taskId);
+  },
+  /** The task whose imported-OpenCode claim holds `sessionId`, if any.
+   *  Served by `tasks_imported_opencode_session_uidx`. A session owned only
+   *  as a normal run is not returned — see `runs.hasOpencodeSessionId`. */
+  findTaskByImportedOpencodeSession(sessionId: string): Task | null {
+    if (!sessionId) return null;
+    const row = db.query<{ id: string }, [string]>(
+      `SELECT id FROM tasks WHERE imported_opencode_session_id = ? LIMIT 1`,
+    ).get(sessionId);
+    return row ? this.get(row.id) : null;
+  },
+  /** True when `sessionId` is claimed by a task other than `taskId`. Send
+   *  and Retry on an imported OpenCode session must refuse in that case. */
+  importedOpencodeSessionHeldElsewhere(taskId: string, sessionId: string): boolean {
+    if (!sessionId) return false;
+    const holder = this.findTaskByImportedOpencodeSession(sessionId);
+    return holder != null && holder.id !== taskId;
+  },
+  /** Every non-null `tasks.imported_opencode_session_id`. Served by
+   *  `tasks_imported_opencode_session_uidx`. Pair with
+   *  `runs.opencodeSessionIdsOwned` via {@link hiddenOpencodeSessionIds}. */
+  importedOpencodeSessionIds(): Set<string> {
+    const rows = db.query<{ imported_opencode_session_id: string }, []>(
+      `SELECT imported_opencode_session_id FROM tasks WHERE imported_opencode_session_id IS NOT NULL`,
+    ).all();
+    return new Set(rows.map((r) => r.imported_opencode_session_id));
   },
   /**
    * Record the branch agetor last observed checked out in a task's worktree
@@ -1697,6 +1852,53 @@ export const claudeSessionSeen = {
   },
 };
 
+/**
+ * Bookkeeping for the "turn a built-in harness on once its CLI is installed"
+ * hook (migration 079, `src/bun/harness-auto-enable.ts`,
+ * docs/plans/add-opencode-harness.md D-14). A harness id here has been acted
+ * on once and is never auto-enabled again — so a user who turns it back Off
+ * keeps it off. `notified = 0` rows are the ones whose
+ * `harnesses_auto_enabled` notice has not yet reached an `/app/events`
+ * client. No FK to `harnesses` (a harnesses rebuild would cascade it away).
+ */
+export const harnessAutoEnabled = {
+  has(harnessId: string): boolean {
+    const row = db.query<{ one: number }, [string]>(
+      `SELECT 1 AS one FROM harness_auto_enabled WHERE harness_id = ? LIMIT 1`,
+    ).get(harnessId);
+    return row != null;
+  },
+  /** Record a harness as acted on. A second record of the same id is a
+   *  no-op: it keeps the first `enabled_at` and never resets `notified`. */
+  record(harnessId: string, now: number = Date.now()): void {
+    db.run(
+      `INSERT OR IGNORE INTO harness_auto_enabled (harness_id, enabled_at, notified) VALUES (?, ?, 0)`,
+      [harnessId, now],
+    );
+  },
+  /** Recorded ids whose notice is still owed, oldest record first. */
+  pending(): string[] {
+    return db.query<{ harness_id: string }, []>(
+      `SELECT harness_id FROM harness_auto_enabled WHERE notified = 0
+         ORDER BY enabled_at ASC, harness_id ASC`,
+    ).all().map((r) => r.harness_id);
+  },
+  markNotified(harnessIds: readonly string[]): void {
+    if (harnessIds.length === 0) return;
+    db.transaction(() => {
+      for (const id of harnessIds) {
+        db.run(`UPDATE harness_auto_enabled SET notified = 1 WHERE harness_id = ?`, [id]);
+      }
+    })();
+  },
+  all(): { harnessId: string; enabledAt: number; notified: boolean }[] {
+    return db.query<{ harness_id: string; enabled_at: number; notified: number }, []>(
+      `SELECT harness_id, enabled_at, notified FROM harness_auto_enabled
+         ORDER BY enabled_at ASC, harness_id ASC`,
+    ).all().map((r) => ({ harnessId: r.harness_id, enabledAt: r.enabled_at, notified: r.notified === 1 }));
+  },
+};
+
 type HarnessRow = {
   id: string;
   kind: string;
@@ -1808,7 +2010,7 @@ export const harnesses = {
     if (direct) return direct;
     if (
       id === "claude-code" || id === "codex" || id === "cursor" ||
-      id === "gemini" || id === "fx" || id === "antigravity"
+      id === "gemini" || id === "fx" || id === "antigravity" || id === "opencode"
     ) {
       const label =
         id === "claude-code" ? "Claude Code"
@@ -1816,7 +2018,8 @@ export const harnesses = {
         : id === "cursor" ? "Cursor"
         : id === "gemini" ? "Gemini CLI"
         : id === "fx" ? "fx.sh"
-        : "Antigravity";
+        : id === "antigravity" ? "Antigravity"
+        : "OpenCode";
       return {
         id,
         kind: id,
@@ -1840,7 +2043,8 @@ export const harnesses = {
     if (
       input.kind !== "claude-code" && input.kind !== "codex" &&
       input.kind !== "cursor" && input.kind !== "gemini" &&
-      input.kind !== "antigravity" && input.kind !== "fx"
+      input.kind !== "antigravity" && input.kind !== "fx" &&
+      input.kind !== "opencode"
     ) {
       throw new Error(`unknown harness kind: ${input.kind}`);
     }
@@ -2109,6 +2313,8 @@ type AgentProfileRow = {
   mode: string | null;
   speed: string;
   max_mode: number;
+  // opencode only (migration 078): `OpencodeServerMode`, CHECK-guarded.
+  opencode_server: string;
   instructions: string;
   skills_json: string;
   created_at: number;
@@ -2137,6 +2343,7 @@ const toAgentProfile = (r: AgentProfileRow): AgentProfile => ({
   mode: r.mode,
   ...speedFields(r.speed),
   maxMode: r.max_mode === 1,
+  opencodeServer: readOpencodeServer(r.opencode_server),
   instructions: r.instructions,
   skills: parseSkillsJson(r.skills_json),
   createdAt: r.created_at,
@@ -2151,6 +2358,8 @@ export interface AgentProfileInsertInput {
   mode?: string | null;
   speed?: Speed;
   maxMode?: boolean;
+  /** opencode only; omitted ⇒ `"shared"` on insert, unchanged on update. */
+  opencodeServer?: OpencodeServerMode;
   instructions?: string;
   skills?: string[];
 }
@@ -2163,6 +2372,8 @@ export interface AgentProfilePatch {
   mode?: string | null;
   speed?: Speed;
   maxMode?: boolean;
+  /** opencode only; omitted ⇒ `"shared"` on insert, unchanged on update. */
+  opencodeServer?: OpencodeServerMode;
   instructions?: string;
   skills?: string[];
 }
@@ -2184,6 +2395,16 @@ const validateAgentProfileNameAndInstructions = (name: string, instructions: str
     throw new Error(`agent instructions must be ${AGENT_PROFILE_LIMITS.instructions} characters or fewer`);
   }
   return { name: trimmed, nameKey: trimmed.toLowerCase() };
+};
+
+/** `opencodeServer` on an agent-profile insert/patch: `undefined` passes
+ *  through, a member of `OPENCODE_SERVER_MODES` passes as itself, anything
+ *  else throws (the routes 400 on it first via `parseOpencodeServerInput`;
+ *  this is the db-layer backstop ahead of the column's CHECK). */
+const validateOpencodeServer = (v: unknown): OpencodeServerMode | undefined => {
+  if (v === undefined) return undefined;
+  if ((OPENCODE_SERVER_MODES as readonly unknown[]).includes(v)) return v as OpencodeServerMode;
+  throw new Error(OPENCODE_SERVER_INPUT_ERROR);
 };
 
 /**
@@ -2223,6 +2444,7 @@ export const agentProfiles = {
   insert(input: AgentProfileInsertInput): AgentProfile {
     const instructions = input.instructions ?? "";
     const { name, nameKey } = validateAgentProfileNameAndInstructions(input.name, instructions);
+    const opencodeServer = validateOpencodeServer(input.opencodeServer) ?? "shared";
     if (this.findByName(name)) throw new AgentProfileNameError(name);
 
     const skills = sanitizeSkillsList(input.skills ?? []);
@@ -2231,12 +2453,12 @@ export const agentProfiles = {
     try {
       db.run(
         `INSERT INTO agent_profiles
-           (id, name, name_key, harness_id, model, effort, mode, speed, max_mode, instructions, skills_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, name, name_key, harness_id, model, effort, mode, speed, max_mode, opencode_server, instructions, skills_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id, name, nameKey, input.harness, input.model,
           input.effort ?? null, input.mode ?? null,
-          input.speed ?? "off", input.maxMode ? 1 : 0,
+          input.speed ?? "off", input.maxMode ? 1 : 0, opencodeServer,
           instructions, JSON.stringify(skills), now, now,
         ],
       );
@@ -2265,17 +2487,18 @@ export const agentProfiles = {
       mode: patch.mode !== undefined ? patch.mode : current.mode,
       speed: patch.speed ?? current.speed,
       maxMode: patch.maxMode ?? current.maxMode,
+      opencodeServer: validateOpencodeServer(patch.opencodeServer) ?? current.opencodeServer,
       skills: patch.skills !== undefined ? sanitizeSkillsList(patch.skills) : current.skills,
     };
 
     try {
       db.run(
         `UPDATE agent_profiles SET
-           name = ?, name_key = ?, harness_id = ?, model = ?, effort = ?, mode = ?, speed = ?, max_mode = ?, instructions = ?, skills_json = ?, updated_at = ?
+           name = ?, name_key = ?, harness_id = ?, model = ?, effort = ?, mode = ?, speed = ?, max_mode = ?, opencode_server = ?, instructions = ?, skills_json = ?, updated_at = ?
          WHERE id = ?`,
         [
           name, nameKey, next.harness, next.model, next.effort, next.mode,
-          next.speed, next.maxMode ? 1 : 0, nextInstructions, JSON.stringify(next.skills),
+          next.speed, next.maxMode ? 1 : 0, next.opencodeServer, nextInstructions, JSON.stringify(next.skills),
           Date.now(), id,
         ],
       );
@@ -2569,8 +2792,24 @@ type RunRow = {
   gemini_session_id: string | null;
   fx_session_id: string | null;
   antigravity_session_id: string | null;
+  // OpenCode's own session id (`ses_…`, migration 077), discovered from the
+  // first NDJSON line that carries a `sessionID` and replayed via `-s`.
+  opencode_session_id: string | null;
   origin: string | null;
 };
+
+/** Every per-kind session-id column on `runs` — the closed whitelist
+ *  `runs.sessionIdsForTask` interpolates into its SQL. */
+export const SESSION_ID_COLUMNS = [
+  "claude_session_id",
+  "codex_session_id",
+  "cursor_session_id",
+  "gemini_session_id",
+  "antigravity_session_id",
+  "fx_session_id",
+  "opencode_session_id",
+] as const;
+export type SessionIdColumn = (typeof SESSION_ID_COLUMNS)[number];
 
 /**
  * Given rows in DESC (newest-first) id order — each carrying its `data`
@@ -2664,6 +2903,7 @@ const toRun = (r: RunRow): Run => ({
   geminiSessionId: r.gemini_session_id,
   fxSessionId: r.fx_session_id,
   antigravitySessionId: r.antigravity_session_id,
+  opencodeSessionId: r.opencode_session_id,
   origin: (r.origin as Run["origin"]) ?? null,
 });
 
@@ -2707,9 +2947,9 @@ export const runs = {
    *  bun:sqlite would otherwise bind. */
   insert(r: Run): Run {
     db.run(
-      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, origin)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.cursorSessionId, r.geminiSessionId, r.fxSessionId ?? null, r.antigravitySessionId ?? null, r.origin ?? null],
+      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, opencode_session_id, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.cursorSessionId, r.geminiSessionId, r.fxSessionId ?? null, r.antigravitySessionId ?? null, r.opencodeSessionId ?? null, r.origin ?? null],
     );
     return { ...r, origin: r.origin ?? null };
   },
@@ -2719,8 +2959,8 @@ export const runs = {
     const current = toRun(row);
     const next: Run = { ...current, ...patch, id };
     db.run(
-      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=?, cursor_session_id=?, gemini_session_id=?, fx_session_id=?, antigravity_session_id=? WHERE id=?`,
-      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, next.cursorSessionId, next.geminiSessionId, next.fxSessionId, next.antigravitySessionId ?? null, id],
+      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=?, cursor_session_id=?, gemini_session_id=?, fx_session_id=?, antigravity_session_id=?, opencode_session_id=? WHERE id=?`,
+      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, next.cursorSessionId, next.geminiSessionId, next.fxSessionId, next.antigravitySessionId ?? null, next.opencodeSessionId ?? null, id],
     );
     return next;
   },
@@ -3202,6 +3442,43 @@ export const runs = {
     ).all();
     return new Set(rows.map((r) => r.claude_session_id));
   },
+  /** Every non-null `runs.opencode_session_id` — the OpenCode ids Agetor
+   *  owns as runs. One query, served by `runs_opencode_session_id_idx`
+   *  (migration 078). The scanner hides the union of this set and the import
+   *  claim column — see {@link hiddenOpencodeSessionIds}. */
+  opencodeSessionIdsOwned(): Set<string> {
+    const rows = db.query<{ opencode_session_id: string }, []>(
+      `SELECT opencode_session_id FROM runs WHERE opencode_session_id IS NOT NULL`,
+    ).all();
+    return new Set(rows.map((r) => r.opencode_session_id));
+  },
+  /** True when any run already records this OpenCode session id. */
+  hasOpencodeSessionId(sessionId: string): boolean {
+    if (!sessionId) return false;
+    const row = db.query<{ one: number }, [string]>(
+      `SELECT 1 AS one FROM runs WHERE opencode_session_id = ? LIMIT 1`,
+    ).get(sessionId);
+    return row != null;
+  },
+  /**
+   * Every non-null session id recorded in `column` across a task's runs,
+   * newest run first, each with the run's `agent` (the harness id that ran
+   * it). The building block for harness-scoped resume
+   * (`findLastSessionIdForHarness`, docs/plans/add-opencode-harness.md
+   * D-15): a caller picks the newest row whose `agent` matches the task's
+   * current harness, so a same-kind harness switch never resumes the other
+   * account's session. `column` is a closed whitelist (it is interpolated
+   * into the SQL); anything outside {@link SESSION_ID_COLUMNS} throws.
+   * Reads `runs` only — never `run_events`.
+   */
+  sessionIdsForTask(taskId: string, column: SessionIdColumn): { sessionId: string; agent: string }[] {
+    if (!SESSION_ID_COLUMNS.includes(column)) throw new Error(`unknown session id column: ${String(column)}`);
+    return db.query<{ sessionId: string; agent: string }, [string]>(
+      `SELECT ${column} AS sessionId, agent FROM runs
+         WHERE task_id = ? AND ${column} IS NOT NULL
+         ORDER BY started_at DESC, rowid DESC`,
+    ).all(taskId);
+  },
   /** True when any run already records this Claude session id. Not a
    *  uniqueness check — several runs on one task share an id. */
   hasClaudeSessionId(sessionId: string): boolean {
@@ -3399,6 +3676,15 @@ export function hiddenClaudeSessionIds(): Set<string> {
   return ids;
 }
 
+/** OpenCode session ids the import list must not offer — the
+ *  {@link hiddenClaudeSessionIds} counterpart: a run records the id, or a
+ *  task's claim column holds it before the seed run exists. */
+export function hiddenOpencodeSessionIds(): Set<string> {
+  const ids = runs.opencodeSessionIdsOwned();
+  for (const id of tasks.importedOpencodeSessionIds()) ids.add(id);
+  return ids;
+}
+
 interface SubagentRow {
   id: string;
   task_id: string;
@@ -3420,7 +3706,7 @@ interface SubagentRow {
  *  still land on a member of the union, so `toSubagent` falls back to
  *  `"subagent"` for anything not listed here. Keep in sync with
  *  `Subagent.parentKind` in shared/types.ts. */
-const PARENT_KINDS = new Set<string>(["subagent", "bg_session", "workflow", "workflow_agent", "monitor"]);
+const PARENT_KINDS = new Set<string>(["subagent", "bg_session", "workflow", "workflow_agent", "monitor", "opencode_subagent"]);
 
 function toSubagent(r: SubagentRow): Subagent {
   return {

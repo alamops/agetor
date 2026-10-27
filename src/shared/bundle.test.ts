@@ -38,6 +38,7 @@ function profile(id: string, name: string, overrides: Partial<AgentProfile> = {}
     mode: null,
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     instructions: "",
     skills: [],
     createdAt: 1,

@@ -116,6 +116,7 @@ test.skipIf(!HAVE_TMUX)("follow-up to a task whose session outlived the process 
       effort: "medium",
       speed: "off",
       maxMode: false,
+      opencodeServer: "shared",
       references: [],
       backlog: [], plans: [], draft: null,
       runId: priorRunId,
