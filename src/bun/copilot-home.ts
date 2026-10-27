@@ -13,7 +13,14 @@ import path from "node:path";
  *   1. the harness `env` map's own `COPILOT_HOME` (an explicit user override)
  *   2. `harness.home` (what the "Additional GitHub Copilot" template sets)
  *   3. the agetor process's `COPILOT_HOME`
- *   4. `~/.copilot` (Copilot's own default)
+ *   4. `<HOME>/.copilot` (Copilot's own default), where `<HOME>` is the
+ *      harness `env` map's `HOME` when it sets one (the spawned process sees
+ *      that HOME, so its `~` is there) and the process home otherwise
+ *
+ * Copilot has no XDG lookup for this directory — its docs name `~/.copilot`
+ * as the default and `COPILOT_HOME` as the only override, and older XDG
+ * locations are migrated into `~/.copilot` — so `XDG_CONFIG_HOME` is
+ * deliberately ignored.
  */
 export interface CopilotHomeInput {
   /** `harness.home` (null/undefined/blank when the harness has none). */
@@ -30,18 +37,19 @@ function nonBlank(v: string | null | undefined): string | null {
   return t.length > 0 ? t : null;
 }
 
-function expandHome(p: string): string {
-  if (p === "~") return os.homedir();
-  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
+function expandHome(p: string, home: string): string {
+  if (p === "~") return home;
+  if (p.startsWith("~/")) return path.join(home, p.slice(2));
   return p;
 }
 
 export function copilotHome(input: CopilotHomeInput = {}): string {
   const processEnv = input.processEnv ?? process.env;
+  const home = nonBlank(input.harnessEnv?.HOME) ?? os.homedir();
   const chosen =
     nonBlank(input.harnessEnv?.COPILOT_HOME) ??
     nonBlank(input.harnessHome) ??
     nonBlank(processEnv.COPILOT_HOME) ??
-    path.join(os.homedir(), ".copilot");
-  return expandHome(chosen);
+    path.join(home, ".copilot");
+  return expandHome(chosen, home);
 }

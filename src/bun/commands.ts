@@ -1,6 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { findAtTokens } from "../shared/at-refs.ts";
 import type { AgentKind } from "../shared/types.ts";
 import { diskProjectTree, emptyProjectTree, loadRefProjectTree, type ProjectTree } from "./ref-tree.ts";
 import { copilotHome } from "./copilot-home.ts";
@@ -147,8 +148,20 @@ function discoverSkills(tree: ProjectTree, relDir: string, source: EntrySource):
  * `$COPILOT_HOME/agents`, project `.github/agents`). The name is the
  * frontmatter `name:` when present, else the filename minus `.agent.md` /
  * `.md`. Returned as extension rows (`kind: "agent"`, insert `@<name>`) since
- * agents aren't slash-invokable.
+ * agents aren't slash-invokable. The inserted mention must survive the shared
+ * `@` tokenizer as ONE bare token, so a frontmatter name with whitespace falls
+ * back to the filename stem, and an agent whose stem has whitespace too is
+ * skipped rather than offered as a mention that would split mid-name.
  */
+/** True when `@<name>` reads back through the shared `@` tokenizer as exactly
+ *  one bare token covering the whole name — no whitespace splitting it, no
+ *  trailing sentence punctuation the tokenizer would strip, no leading `"`. */
+function isBareMentionName(name: string): boolean {
+  const mention = "@" + name;
+  const tokens = findAtTokens(mention);
+  return tokens.length === 1 && !tokens[0]!.quoted && tokens[0]!.raw === mention;
+}
+
 function discoverCopilotAgents(tree: ProjectTree, relDir: string, source: "user" | "project"): AvailableExtension[] {
   const out: AvailableExtension[] = [];
   for (const entry of tree.list(relDir)) {
@@ -156,7 +169,7 @@ function discoverCopilotAgents(tree: ProjectTree, relDir: string, source: "user"
     const text = tree.read(`${relDir}/${entry.name}`);
     if (text == null) continue;
     const fileBase = entry.name.endsWith(".agent.md") ? entry.name.slice(0, -".agent.md".length) : entry.name.slice(0, -".md".length);
-    const name = readMdFrontmatterName(text) ?? fileBase;
+    const name = [readMdFrontmatterName(text), fileBase].find((n) => !!n && isBareMentionName(n));
     if (!name) continue;
     out.push({
       name,

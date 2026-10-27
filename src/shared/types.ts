@@ -92,15 +92,6 @@ export interface FxUsagePayload {
     cacheWriteTokens?: number;
     reasoningTokens?: number;
   };
-  /**
-   * GitHub Copilot AI credits spent this turn (`totalNanoAiu / 1e9` from the
-   * driver's `--usage-output-file`), present only when Copilot reports them
-   * (`aiCreditsStatus` is not `"unavailable"`) and the value is > 0. The
-   * nano-AIU → credits conversion is unverified against Copilot's own credit
-   * display; docs/plans/github-copilot-harness.md §3.4 removes this field
-   * before merge if the live smoke can't confirm it.
-   */
-  aiCredits?: number;
 }
 
 /**
@@ -4956,7 +4947,10 @@ export type SubagentStatus =
  * tab); and a Claude Code `Monitor` the main agent armed (`"monitor"` — id =
  * the monitor's `taskId` from its launch stub, no source file of its own, its
  * tab streams each `<event>` the monitor reports; holds the task in `running`
- * until the monitor times out or is stopped).
+ * until the monitor times out or is stopped); and a GitHub Copilot CLI
+ * subagent (`"copilot_subagent"` — reported inline in the copilot run's own
+ * JSONL log, persisted by the orchestrator's copilot sink, no source file of
+ * its own; never seeded or tailed by the Claude subagent watcher).
  */
 export interface Subagent {
   /** Claude's agentId — the basename of `subagents/agent-<id>.jsonl`. */
@@ -4964,7 +4958,7 @@ export interface Subagent {
   taskId: string;
   /** Parent run that was in flight when this subagent was spawned. */
   runId: string | null;
-  parentKind: "subagent" | "bg_session" | "workflow" | "workflow_agent" | "monitor";
+  parentKind: "subagent" | "bg_session" | "workflow" | "workflow_agent" | "monitor" | "copilot_subagent";
   /** Registered subagent type, e.g. "Explore" / "general-purpose". */
   agentType: string | null;
   /** Short human label from the spawning Agent tool call. */

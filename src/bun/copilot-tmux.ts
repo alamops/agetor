@@ -193,11 +193,11 @@ const USAGE_TURN_FIELDS = [
  *      cacheReadTokens, cacheWriteTokens, reasoningTokens? }, totalNanoAiu? } },
  *      totalNanoAiu?, aiCreditsStatus?, codeChanges }`
  * Token fields are summed across `modelMetrics` (a turn can span models);
- * a field no model reported is omitted. `aiCredits = totalNanoAiu / 1e9`
- * (top-level `totalNanoAiu`, else the per-model sum) only when
- * `aiCreditsStatus !== "unavailable"` and the value is > 0. The nano-AIU
- * conversion is UNVERIFIED (plan §3.4 / §8 A4). Returns `null` for
- * unparsable text or when nothing usable is present.
+ * a field no model reported is omitted. The `totalNanoAiu` credit figures are
+ * deliberately NOT surfaced: the nano-AIU → AI-credits conversion could not be
+ * verified against Copilot's own credit display (plan §3.4 / §8 A4), and a
+ * wrong number on a billing chip is worse than none. Returns `null` for
+ * unparsable text or when no token field is present.
  */
 export function parseCopilotUsageFile(text: string): FxUsagePayload | null {
   let parsed: unknown;
@@ -209,9 +209,6 @@ export function parseCopilotUsageFile(text: string): FxUsagePayload | null {
   if (!isRecord(parsed)) return null;
 
   const sums: Partial<Record<(typeof USAGE_TURN_FIELDS)[number], number>> = {};
-  let perModelNano = 0;
-  let perModelNanoSeen = false;
-  let perModelStatus: string | undefined;
   const metrics = parsed.modelMetrics;
   if (isRecord(metrics)) {
     for (const entry of Object.values(metrics)) {
@@ -223,30 +220,15 @@ export function parseCopilotUsageFile(text: string): FxUsagePayload | null {
           if (n !== undefined) sums[field] = (sums[field] ?? 0) + n;
         }
       }
-      const nano = finiteNumber(entry.totalNanoAiu);
-      if (nano !== undefined) {
-        perModelNano += nano;
-        perModelNanoSeen = true;
-      }
-      perModelStatus ??= str(entry.aiCreditsStatus);
     }
   }
 
-  const payload: FxUsagePayload = {};
   const turn: NonNullable<FxUsagePayload["turn"]> = {};
   for (const field of USAGE_TURN_FIELDS) {
     const n = sums[field];
     if (n !== undefined) turn[field] = n;
   }
-  if (Object.keys(turn).length > 0) payload.turn = turn;
-
-  const nano = finiteNumber(parsed.totalNanoAiu) ?? (perModelNanoSeen ? perModelNano : undefined);
-  const status = str(parsed.aiCreditsStatus) ?? perModelStatus;
-  if (nano !== undefined && nano > 0 && status !== "unavailable") {
-    payload.aiCredits = nano / 1e9;
-  }
-
-  return payload.turn || payload.aiCredits !== undefined ? payload : null;
+  return Object.keys(turn).length > 0 ? { turn } : null;
 }
 
 /** The `status` chunk body for a usage payload (`FX_USAGE_STATUS_PREFIX` + JSON). */

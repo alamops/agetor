@@ -3425,7 +3425,14 @@ interface SubagentRow {
  *  still land on a member of the union, so `toSubagent` falls back to
  *  `"subagent"` for anything not listed here. Keep in sync with
  *  `Subagent.parentKind` in shared/types.ts. */
-const PARENT_KINDS = new Set<string>(["subagent", "bg_session", "workflow", "workflow_agent", "monitor"]);
+const PARENT_KINDS = new Set<string>([
+  "subagent",
+  "bg_session",
+  "workflow",
+  "workflow_agent",
+  "monitor",
+  "copilot_subagent",
+]);
 
 function toSubagent(r: SubagentRow): Subagent {
   return {

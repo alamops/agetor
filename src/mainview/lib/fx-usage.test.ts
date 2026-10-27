@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test";
 import {
-  formatAiCredits,
   formatUsageCount,
   fxUsageChipText,
   fxUsageTitle,
@@ -201,39 +200,4 @@ test("fxUsageTitle: a known cost is appended to the used/size segment", () => {
 
 test("fxUsageTitle: an empty payload renders an empty string", () => {
   expect(fxUsageTitle({})).toBe("");
-});
-
-// --- aiCredits (GitHub Copilot) -----------------------------------------
-
-test("parseFxUsage: aiCredits is kept when a finite number > 0", () => {
-  expect(parseFxUsage('{"turn":{"inputTokens":42},"aiCredits":1.25}'))
-    .toEqual({ turn: { inputTokens: 42 }, aiCredits: 1.25 });
-});
-
-test("parseFxUsage: aiCredits of 0, negative, non-numeric or overflowing is dropped", () => {
-  expect(parseFxUsage('{"aiCredits":0}')).toBeNull();
-  expect(parseFxUsage('{"aiCredits":-3}')).toBeNull();
-  expect(parseFxUsage('{"aiCredits":"2"}')).toBeNull();
-  expect(parseFxUsage('{"aiCredits":1e999}')).toBeNull();
-  expect(parseFxUsage('{"used":5,"aiCredits":0}')).toEqual({ used: 5 });
-});
-
-test("mergeFxUsage: aiCredits merges alongside used/size and turn", () => {
-  const prev = { used: 10, size: 100 };
-  const next = { turn: { inputTokens: 1 }, aiCredits: 0.5 };
-  expect(mergeFxUsage(prev, next)).toEqual({ used: 10, size: 100, turn: { inputTokens: 1 }, aiCredits: 0.5 });
-  expect(mergeFxUsage({ aiCredits: 1 }, { aiCredits: 2 })).toEqual({ aiCredits: 2 });
-});
-
-test("formatAiCredits: two decimals, trailing zeros dropped, sub-cent widened", () => {
-  expect(formatAiCredits(1.256)).toBe("1.26");
-  expect(formatAiCredits(2.5)).toBe("2.5");
-  expect(formatAiCredits(3)).toBe("3");
-  expect(formatAiCredits(0.0042)).toBe("0.0042");
-});
-
-test("fxUsageTitle: aiCredits appends an 'AI credits' segment", () => {
-  expect(fxUsageTitle({ turn: { inputTokens: 42, outputTokens: 7 }, aiCredits: 1.25 }))
-    .toBe("turn: in 42 · out 7 · AI credits: 1.25");
-  expect(fxUsageTitle({ aiCredits: 0.0042 })).toBe("AI credits: 0.0042");
 });

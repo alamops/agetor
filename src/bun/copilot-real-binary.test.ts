@@ -233,6 +233,10 @@ suite(`copilot real binary (${binVersion.trim().split("\n")[0] ?? ""})`, () => {
     provider.reset();
     const first = await runTurn({ prompt: "remember-marker-alpha", sessionId, taskId, ...ws });
     expect(first.code).toBe(0);
+    // The orchestrator only resumes an id whose `<COPILOT_HOME>/session-state/<id>/`
+    // dir exists (`copilotSessionDirExists`) and otherwise starts fresh, so the
+    // real CLI must keep writing exactly that layout under the pinned home.
+    expect(existsSync(path.join(ws.home, "session-state", sessionId))).toBe(true);
     provider.reset();
     const second = await runTurn({ prompt: "second-turn-beta", sessionId, taskId, resume: true, ...ws });
     expect(second.code).toBe(0);

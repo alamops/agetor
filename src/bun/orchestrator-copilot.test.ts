@@ -285,10 +285,12 @@ test("stream marker: a subagent row runs then completes, its events carry the su
   const open = subagents.listForTask(taskId).find((s) => s.status === "running")!;
   expect(open.id).toBe(`cp-${runId}-call_sub`);
   expect(open.runId).toBe(runId);
-  expect(open.parentKind).toBe("subagent");
+  // A dedicated kind (round-trips through db.ts's PARENT_KINDS allow-list) so
+  // the Claude watcher's seed never tails it, and no source file of its own.
+  expect(open.parentKind).toBe("copilot_subagent");
   expect(open.spawnDepth).toBe(1);
   expect(open.toolUseId).toBe("call_sub");
-  expect(open.sourcePath).toContain(runId);
+  expect(open.sourcePath).toBe("");
 
   await waitForRunSettled(taskId, runId);
   const row = subagents.get(`cp-${runId}-call_sub`)!;
@@ -455,11 +457,11 @@ test("reconcileOrphans: a running copilot run with no live session flips to orph
     id: `cp-${runId}-call_x`,
     taskId,
     runId,
-    parentKind: "subagent",
+    parentKind: "copilot_subagent",
     agentType: "explore",
     description: "stale",
     spawnDepth: 1,
-    sourcePath: "/dev/null",
+    sourcePath: "",
     toolUseId: "call_x",
     status: "running",
     startedAt: Date.now(),

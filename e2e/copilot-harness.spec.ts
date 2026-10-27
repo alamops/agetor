@@ -308,7 +308,7 @@ test.describe("GitHub Copilot harness", () => {
 
     // The turn finishes: final message, a settled task, and the usage chip
     // (per-turn tokens only → the compact ↑in ↓out form; the tooltip lists the
-    // counts and the AI credits).
+    // token counts and never an unverified AI-credits figure).
     await expect
       .poll(async () => (await getTask(request, freshBackend, task.id)).column, { timeout: 60_000 })
       .toBe("review");
@@ -319,7 +319,7 @@ test.describe("GitHub Copilot harness", () => {
     await expect(usageChip).toHaveText("↑1.2k ↓340");
     await expect(usageChip).toHaveAttribute("title", /cache read 800/);
     await expect(usageChip).toHaveAttribute("title", /reasoning 60/);
-    await expect(usageChip).toHaveAttribute("title", /AI credits: 2\.5/);
+    await expect(usageChip).not.toHaveAttribute("title", /AI credits/);
     // The raw sentinel never renders as a transcript line.
     await expect(panel.getByText("fx-usage:", { exact: false })).toHaveCount(0);
 

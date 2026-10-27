@@ -444,7 +444,7 @@ describe("mapCopilotEvent", () => {
  * ────────────────────────────────────────────────────────────────────────── */
 
 describe("parseCopilotUsageFile", () => {
-  test("sums token metrics across models and converts nano-AIU to credits", () => {
+  test("sums token metrics across models and never surfaces the unverified nano-AIU credits", () => {
     const text = JSON.stringify({
       modelMetrics: {
         "claude-sonnet-5.5": {
@@ -457,11 +457,10 @@ describe("parseCopilotUsageFile", () => {
     });
     expect(parseCopilotUsageFile(text)).toEqual({
       turn: { inputTokens: 120, outputTokens: 12, cacheReadTokens: 50, cacheWriteTokens: 5, reasoningTokens: 3 },
-      aiCredits: 3,
     });
   });
 
-  test("omits aiCredits when unavailable or zero, keeps tokens", () => {
+  test("ignores every credits field, keeps tokens", () => {
     const base = { modelMetrics: { m: { usage: { inputTokens: 1, outputTokens: 2 } } } };
     for (const extra of [
       { totalNanoAiu: 5e9, aiCreditsStatus: "unavailable" },
@@ -473,11 +472,15 @@ describe("parseCopilotUsageFile", () => {
     }
   });
 
-  test("falls back to the per-model nano-AIU sum and returns credits-only payloads", () => {
+  test("a credits-only file (no token fields) yields no payload", () => {
     const res = parseCopilotUsageFile(
-      JSON.stringify({ modelMetrics: { a: { totalNanoAiu: 1e9 }, b: { totalNanoAiu: 2e9 } } }),
+      JSON.stringify({
+        modelMetrics: { a: { totalNanoAiu: 1e9 }, b: { totalNanoAiu: 2e9 } },
+        totalNanoAiu: 3e9,
+        aiCreditsStatus: "available",
+      }),
     );
-    expect(res).toEqual({ aiCredits: 3 });
+    expect(res).toBeNull();
   });
 
   test("returns null for junk and for payloads with nothing usable", () => {
@@ -723,6 +726,15 @@ describe("copilotHome", () => {
     expect(copilotHome({ harnessHome: "~/alt", processEnv: {} })).toBe(path.join(home, "alt"));
     expect(copilotHome({ harnessEnv: null, harnessHome: null, processEnv: {} })).toBe(path.join(home, ".copilot"));
   });
+
+  test("a harness env HOME moves the default and the ~ expansion, but never beats an explicit home", () => {
+    expect(copilotHome({ harnessEnv: { HOME: "/alt-home" }, processEnv: {} })).toBe(path.join("/alt-home", ".copilot"));
+    expect(copilotHome({ harnessEnv: { HOME: "/alt-home" }, harnessHome: "~/acct", processEnv: {} })).toBe(
+      path.join("/alt-home", "acct"),
+    );
+    expect(copilotHome({ harnessEnv: { HOME: "/alt-home" }, processEnv: { COPILOT_HOME: "/proc" } })).toBe("/proc");
+    expect(copilotHome({ harnessEnv: { HOME: "  " }, processEnv: {} })).toBe(path.join(home, ".copilot"));
+  });
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -871,7 +883,6 @@ lifecycle("spawnCopilotViaTmux lifecycle", () => {
     expect(usageChunk?.lineUuid).toBe(`copilot:usage:${ids.runId}`);
     expect(JSON.parse(usageChunk!.data.slice(FX_USAGE_STATUS_PREFIX.length))).toEqual({
       turn: { inputTokens: 10, outputTokens: 2, cacheReadTokens: 1, cacheWriteTokens: 0 },
-      aiCredits: 4,
     });
     // The usage sentinel is the last thing emitted before `done`.
     expect(chunks[chunks.length - 1]).toBe(usageChunk!);
@@ -1134,7 +1145,9 @@ describe("copilot-fake", () => {
     expect(chunks.some((c) => c.data === "GitHub Copilot auto picked claude-sonnet-5.5")).toBe(true);
     expect(calls.map((c) => c.kind)).toEqual(["started", "event", "event", "event", "settled", "settleAll"]);
     const usage = chunks.find((c) => c.data.startsWith(FX_USAGE_STATUS_PREFIX));
-    expect(JSON.parse(usage!.data.slice(FX_USAGE_STATUS_PREFIX.length)).aiCredits).toBe(2.5);
+    const usagePayload = JSON.parse(usage!.data.slice(FX_USAGE_STATUS_PREFIX.length));
+    expect(usagePayload.turn.inputTokens).toBe(1200);
+    expect(usagePayload).not.toHaveProperty("aiCredits");
     // Not Plan mode → no plan chunk.
     expect(chunks.some((c) => c.stream === "tool_use" && c.lineUuid?.startsWith("copilot:plan:"))).toBe(false);
   });

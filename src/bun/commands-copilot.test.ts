@@ -43,9 +43,13 @@ function makeRepo(label: string): string {
   skill(repo, ".claude/skills", "claude-skill-zq", "from .claude");
   write(repo, ".mcp.json", JSON.stringify({ mcpServers: { "root-mcp-zq": { command: "node" } } }));
   write(repo, ".github/mcp.json", JSON.stringify({ servers: { "gh-servers-zq": { url: "https://example.com/mcp" } } }));
-  write(repo, ".github/agents/reviewer-zq.agent.md", "---\nname: Fancy Reviewer\ndescription: Reviews code\n---\nbody");
+  write(repo, ".github/agents/reviewer-zq.agent.md", "---\nname: fancy-reviewer-zq\ndescription: Reviews code\n---\nbody");
   write(repo, ".github/agents/plain-zq.agent.md", "Plain agent body line");
   write(repo, ".github/agents/old-zq.md", "---\ndescription: legacy name\n---\nbody");
+  // Names that would not survive the `@` tokenizer as one token.
+  write(repo, ".github/agents/spaced-zq.agent.md", "---\nname: Spaced Name\n---\nbody");
+  write(repo, ".github/agents/trail-zq.agent.md", "---\nname: Trail.\n---\nbody");
+  write(repo, ".github/agents/two words zq.agent.md", "---\nname: Two Words\n---\nbody");
   git(["add", "-A"], repo);
   git(["commit", "-q", "-m", "init"], repo);
   return repo;
@@ -59,7 +63,7 @@ beforeAll(() => {
   skill(copilotDir, "skills", "shared-zq", "from user");
   skill(home, ".agents/skills", "home-agents-zq", "from ~/.agents");
   write(copilotDir, "mcp-config.json", JSON.stringify({ mcpServers: { "user-mcp-zq": { command: "uvx" } } }));
-  write(copilotDir, "agents/user-agent-zq.agent.md", "---\nname: User Agent\ndescription: mine\n---\nbody");
+  write(copilotDir, "agents/user-agent-zq.agent.md", "---\nname: user-agent-named-zq\ndescription: mine\n---\nbody");
   write(copilotDir, "agents/shared-agent-zq.md", "---\ndescription: from user\n---\nbody");
 });
 
@@ -125,15 +129,29 @@ describe("copilot capability discovery (live disk)", () => {
     const repo = makeRepo("agents");
     const { extensions } = await caps(repo);
     const agents = new Map(extensions.filter((e) => e.kind === "agent").map((e) => [e.name, e]));
-    expect(agents.get("Fancy Reviewer")).toMatchObject({
+    expect(agents.get("fancy-reviewer-zq")).toMatchObject({
       source: "project",
-      insert: "@Fancy Reviewer",
+      insert: "@fancy-reviewer-zq",
       description: "Reviews code",
     });
     expect(agents.has("plain-zq")).toBe(true); // `.agent.md` stripped
     expect(agents.has("old-zq")).toBe(true); // `.md` stripped
-    expect(agents.get("User Agent")?.source).toBe("user");
+    expect(agents.get("user-agent-named-zq")?.source).toBe("user");
     expect(agents.get("shared-agent-zq")?.source).toBe("user");
+  });
+
+  test("custom agents: a name the @ tokenizer would split falls back to the filename stem, else is skipped", async () => {
+    const repo = makeRepo("agent-names");
+    const { extensions } = await caps(repo);
+    const agents = extensions.filter((e) => e.kind === "agent");
+    const names = agents.map((e) => e.name);
+    expect(names).toContain("spaced-zq"); // "Spaced Name" has whitespace
+    expect(names).toContain("trail-zq"); // "Trail." would lose its trailing "."
+    expect(names).not.toContain("Spaced Name");
+    expect(names).not.toContain("Trail.");
+    // Neither the frontmatter name nor the stem is one token → not offered.
+    expect(names.some((n) => /two\s*words/i.test(n))).toBe(false);
+    for (const a of agents) expect(a.insert).toBe(`@${a.name}`);
   });
 
   test("project agent overrides a same-named user agent", async () => {
@@ -173,7 +191,7 @@ describe("copilot capability discovery (live disk)", () => {
     const { commands, extensions } = await caps(null);
     expect(commands.map((c) => c.source)).not.toContain("project");
     expect(extensions.map((e) => e.source)).not.toContain("project");
-    expect(extensions.some((e) => e.kind === "agent" && e.name === "User Agent")).toBe(true);
+    expect(extensions.some((e) => e.kind === "agent" && e.name === "user-agent-named-zq")).toBe(true);
   });
 });
 
@@ -198,10 +216,10 @@ describe("copilot capability discovery (git ref)", () => {
     expect(mcp).not.toContain("disk-only-zq");
 
     const agents = extensions.filter((e) => e.kind === "agent").map((e) => e.name);
-    expect(agents).toEqual(expect.arrayContaining(["Fancy Reviewer", "plain-zq", "old-zq"]));
+    expect(agents).toEqual(expect.arrayContaining(["fancy-reviewer-zq", "plain-zq", "old-zq"]));
     expect(agents).not.toContain("disk-only-zq");
     // user-level rows still come from disk
-    expect(agents).toContain("User Agent");
+    expect(agents).toContain("user-agent-named-zq");
   });
 
   test("project overrides user at a ref", async () => {

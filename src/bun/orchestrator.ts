@@ -119,7 +119,6 @@ import {
 } from "./antigravity-tmux.ts";
 import {
   COPILOT_PLAN_TOOL_NAME,
-  copilotLogPath,
   dropCopilotSession,
   reattachCopilotSession,
   type CopilotSubagentSink,
@@ -2550,11 +2549,16 @@ function makeCopilotSubagentSink(runId: string, taskId: string): CopilotSubagent
         id,
         taskId,
         runId,
-        parentKind: "subagent",
+        // A dedicated kind (never "subagent") so the Claude watcher's seed
+        // skips the row — see `seedRow` in claude-subagents.ts. No source file
+        // of its own: its events live inline in the copilot run's log and are
+        // persisted by this sink, so `sourcePath` stays empty (which also keeps
+        // `subagentActivityWithin` from stat'ing the main log for it).
+        parentKind: "copilot_subagent",
         agentType: info.agentType ?? info.name ?? null,
         description: info.description || info.name || null,
         spawnDepth: 1,
-        sourcePath: copilotLogPath(runId),
+        sourcePath: "",
         toolUseId: info.toolCallId,
         status: "running",
         startedAt: Date.now(),

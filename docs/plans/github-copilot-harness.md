@@ -298,6 +298,8 @@ Emitted last, it is the run's last `tool_use`. A new orchestrator `detectCopilot
 
 **If the live smoke can't confirm the conversion against Copilot's own credit display, task T17 removes `aiCredits` before merge.** A wrong number is not shipped.
 
+**Outcome (Bug Fix step, after code review):** the live smoke was not run, so `aiCredits` was removed — `FxUsagePayload` has no such field, `parseCopilotUsageFile` ignores `totalNanoAiu`/`aiCreditsStatus`, and `fx-usage.ts` is back to its pre-copilot shape. The chip shows tokens only.
+
 ### 3.5 Subagent tabs (D12)
 
 The orchestrator implements `makeCopilotSubagentSink(runId, taskId)`:
