@@ -334,6 +334,47 @@ test("a non-final refresh leaves an unfinished child running but settles a compl
   expect(row(notDone).status).toBe("running");
 });
 
+test("a non-final refresh settles a complete child and fills its tab", async () => {
+  installEmitter();
+  const { taskId, runId } = seedTask();
+  const done = `ses_nfdone${randomUUID().replace(/-/g, "")}`;
+  installExports({ [done]: "v2-session-export-child.json" });
+  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(done) });
+  await mod.refreshOpencodeSubagents(refreshArgs(taskId, { final: false }));
+  expect(row(done).status).toBe("completed");
+  expect(emitted.some((e) => e.subagentId === row(done).id && e.stream === "assistant")).toBe(true);
+});
+
+test("the re-check window only gives up on a final refresh; a throwing export still gives up", async () => {
+  installEmitter();
+  const { taskId, runId } = seedTask();
+  const expired = `ses_exp${randomUUID().replace(/-/g, "")}`;
+  installExports({ [expired]: "throw" });
+  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(expired, { description: "Expired job" }) });
+  db.subagents.setStatus(mod.opencodeSubagentId(expired), "orphaned", Date.now() - mod.ORPHAN_RECHECK_MAX_AGE_MS - 1000);
+  // A mid-turn (non-final) refresh says nothing about a child left by an
+  // earlier turn: it stays orphaned, no status line.
+  await mod.refreshOpencodeSubagents(refreshArgs(taskId, { final: false }));
+  expect(row(expired).status).toBe("orphaned");
+  expect(emitted.filter((e) => e.stream === "status")).toEqual([]);
+  // The turn end gives up on it even though its export threw.
+  await mod.refreshOpencodeSubagents(refreshArgs(taskId, { final: true }));
+  expect(row(expired).status).toBe("failed");
+  expect(emitted.filter((e) => e.stream === "status").map((e) => e.data)).toEqual([
+    'OpenCode subagent "Expired job" never reported finishing — stopped checking on it',
+  ]);
+});
+
+test("a row orphaned just inside the re-check window keeps being re-checked", async () => {
+  const { taskId, runId } = seedTask();
+  const recent = `ses_recent${randomUUID().replace(/-/g, "")}`;
+  installExports({ [recent]: null });
+  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(recent) });
+  db.subagents.setStatus(mod.opencodeSubagentId(recent), "orphaned", Date.now() - mod.ORPHAN_RECHECK_MAX_AGE_MS + 60_000);
+  await mod.refreshOpencodeSubagents(refreshArgs(taskId, { final: true }));
+  expect(row(recent).status).toBe("orphaned");
+});
+
 test("the Claude subagent watcher never seeds opencode_subagent rows", async () => {
   const { taskId, runId } = seedTask();
   const child = `ses_watch${randomUUID().replace(/-/g, "")}`;

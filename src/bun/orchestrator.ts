@@ -2390,7 +2390,17 @@ function makeChunkHandler(
   _mode: Task["mode"],
 ) {
   return (stream: RunEvent["stream"], data: string, lineUuid?: string) => {
-    const eventId = runs.appendEvent(runId, stream, data, lineUuid);
+    let eventId: number | null;
+    try {
+      eventId = runs.appendEvent(runId, stream, data, lineUuid);
+    } catch (err) {
+      // A chunk can still arrive after deleteTask cascade-deleted this run
+      // (e.g. claude's boot-timeout stderr lines, 30 s after the spawn), and
+      // the insert then fails its run_events foreign key. There is nothing
+      // left to record it on, so drop it; any other failure still throws.
+      if (!runs.get(runId)) return;
+      throw err;
+    }
     emit({ runId, taskId, stream, data, ts: Date.now() });
     // Todo/task-tools board summary: re-derive + persist on any
     // TodoWrite/TaskCreate/TaskUpdate chunk, for every agent kind. Cheap

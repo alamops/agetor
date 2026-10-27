@@ -22,6 +22,8 @@ import { gotoApp } from "./helpers";
  * - (d) The subagent marker: a subagent tab appears and holds the child
  *   transcript after the turn.
  * - (e) Settings shows the "No OpenCode credentials found" notice.
+ * - (f) A stored variant on a model discovery doesn't list is kept when the
+ *   task is opened (RunPanel's effort cascade sends no PATCH).
  */
 
 /** Literal copy of `FAKE_OPENCODE_SUBAGENT_PROMPT_MARKER` (src/bun/agents.ts)
@@ -506,5 +508,52 @@ test.describe("OpenCode harness (fake driver + stub CLI)", () => {
     });
     // An OpenCode 2 install gets no upgrade line.
     await expect(row.getByText(/OpenCode 2 is available/)).toHaveCount(0);
+  });
+
+  test("(f) a stored variant on a model discovery doesn't list survives opening the task (no effort PATCH)", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(120_000);
+    // The stub's catalog lists two Zen ids; this model is neither, so its
+    // variants are unknown. RunPanel's effort cascade must keep the stored
+    // variant instead of PATCHing it to "auto" (`retainableEfforts`).
+    const model = `acme/e2e-unlisted-${suffix}`;
+    const workdir = await registerProject(backend, `opencode-e2e-effort-${suffix}`);
+    const title = `opencode-effort-e2e ${suffix}`;
+    const task = await createTaskRest(request, backend, { title, prompt: title, agent: "opencode", workdir, model });
+    const patched = await request.patch(`${backend.apiBase}/tasks/${task.id}`, {
+      headers: auth(backend),
+      data: { effort: "high" },
+    });
+    expect(patched.ok(), `PATCH /tasks/${task.id} -> ${patched.status()}: ${await patched.text()}`).toBeTruthy();
+    const stored = await getTask(request, backend, task.id);
+    expect(stored.model).toBe(model);
+    expect(stored.effort).toBe("high");
+
+    const effortPatches: string[] = [];
+    page.on("request", (req) => {
+      if (req.method() !== "PATCH" || !req.url().endsWith(`/tasks/${task.id}`)) return;
+      const body = req.postData() ?? "";
+      if (body.includes('"effort"')) effortPatches.push(body);
+    });
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await panel.getByText("Task details", { exact: true }).click();
+    const effort = panel.getByText("Effort", { exact: true }).locator("xpath=following-sibling::dd[1]").locator("select");
+    await expect(effort).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(effort).toHaveValue("high");
+
+    // The cascade re-runs on every render. Let two board polls (2 s apart)
+    // and the harness-model poll land, then check nothing reset the value.
+    const isTaskList = (url: string, method: string) => method === "GET" && new URL(url).pathname.endsWith("/tasks");
+    for (let i = 0; i < 2; i++) {
+      await page.waitForResponse((r) => isTaskList(r.url(), r.request().method()), { timeout: CONVERGE_TIMEOUT });
+    }
+    await expect(effort).toHaveValue("high");
+    expect(effortPatches).toEqual([]);
+    expect((await getTask(request, backend, task.id)).effort).toBe("high");
   });
 });

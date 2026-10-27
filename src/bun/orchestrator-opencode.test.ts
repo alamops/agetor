@@ -292,7 +292,13 @@ async function seedRunningChild(taskId: string, runId: string, description: stri
 }
 
 /** Insert a bare task + one run row directly (no spawn). */
-function insertTaskWithRun(over: { agent: string; column: Task["column"]; runStatus: Run["status"] }): { taskId: string; runId: string } {
+function insertTaskWithRun(over: {
+  agent: string;
+  column: Task["column"];
+  runStatus: Run["status"];
+  tmuxSession?: (taskId: string) => string;
+  opencodeSessionId?: string;
+}): { taskId: string; runId: string } {
   const taskId = randomUUID();
   const runId = randomUUID();
   const now = Date.now();
@@ -306,8 +312,8 @@ function insertTaskWithRun(over: { agent: string; column: Task["column"]; runSta
   db.runs.insert({
     id: runId, taskId, agent: over.agent, status: over.runStatus, startedAt: now,
     endedAt: over.runStatus === "running" ? null : now, exitCode: over.runStatus === "succeeded" ? 0 : null,
-    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null,
-    fxSessionId: null, antigravitySessionId: null, opencodeSessionId: null,
+    tmuxSession: over.tmuxSession?.(taskId) ?? null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null,
+    fxSessionId: null, antigravitySessionId: null, opencodeSessionId: over.opencodeSessionId ?? null,
   });
   return { taskId, runId };
 }
@@ -410,6 +416,43 @@ test("deleting a held task settles its rows without moving the card (no column e
   }
   expect(db.tasks.get(taskId)).toBeNull();
   expect(columns).toEqual([]);
+});
+
+test("archiving a held task settles its rows without moving the frozen card (no column event)", async () => {
+  // Held, and archived without stopRun: the archive sets `archivedAt` first,
+  // then the deferred teardown drops the session and settles the rows — the
+  // settle hook must not then move the archived card to `review`.
+  const { taskId, runId } = insertTaskWithRun({ agent: "opencode", column: "running", runStatus: "succeeded" });
+  const rowId = await seedRunningChild(taskId, runId, "Archived child");
+  const columns: string[] = [];
+  const unsubscribe = orch.subscribeGlobal((e) => {
+    if (e.kind === "column" && e.taskId === taskId) columns.push(e.column);
+  });
+  try {
+    const res = await orch.archiveTask(taskId, { force: true, awaitTeardown: true });
+    if ("error" in res) throw new Error(res.error);
+    await settle(100);
+  } finally {
+    unsubscribe();
+  }
+  // The teardown did settle the row (no breadcrumb → the Shared default).
+  expect(db.subagents.get(rowId)?.status).toBe("orphaned");
+  expect(statusLines(runId)).toContain('OpenCode subagent "Archived child" was left unfinished — the task was archived');
+  const after = db.tasks.get(taskId)!;
+  expect(after.archivedAt).not.toBeNull();
+  expect(after.column).toBe("running");
+  expect(columns).toEqual([]);
+});
+
+test("a held task that isn't being torn down is still released by the settle", async () => {
+  // Counterpart of the two guards above: the same settle on a live, unarchived
+  // held task moves it on to `review`.
+  const { taskId, runId } = insertTaskWithRun({ agent: "opencode", column: "running", runStatus: "succeeded" });
+  const rowId = await seedRunningChild(taskId, runId, "Live child");
+  const { orphanRunningOpencodeSubagents } = await import("./opencode-subagents.ts");
+  expect(orphanRunningOpencodeSubagents(taskId, "test settle")).toBe(1);
+  expect(db.subagents.get(rowId)?.status).toBe("orphaned");
+  expect(db.tasks.get(taskId)?.column).toBe("review");
 });
 
 test("createTask: a valid opencodeServer is stored, anything else reads as shared", async () => {
@@ -576,6 +619,164 @@ test("boot reconcile reattaches a running opencode run with the subagent hooks w
   expect(row?.status).toBe("completed");
   expect(db.tasks.get(taskId)?.column).toBe("review");
   setTmux("absent");
+});
+
+/**
+ * A running opencode run whose turn finished while agetor was down: its log
+ * (`logLines`) and exit file are on disk, and `has-session` answers live, so
+ * boot reconcile reattaches to it. `breadcrumb` is the D-19 opening line the
+ * turn persisted, if any.
+ */
+async function seedReattachableRun(opts: {
+  sessionId: string;
+  logLines: string[];
+  breadcrumb?: string;
+}): Promise<{ taskId: string; runId: string }> {
+  const { opencodeLogPath, opencodeExitPath, opencodeSessionNameFor } = await import("./opencode-tmux.ts");
+  const { taskId, runId } = insertTaskWithRun({
+    agent: "opencode",
+    column: "running",
+    runStatus: "running",
+    tmuxSession: opencodeSessionNameFor,
+    opencodeSessionId: opts.sessionId,
+  });
+  db.tasks.update(taskId, { mode: "auto", model: "opencode-default", effort: "auto" });
+  if (opts.breadcrumb) db.runs.appendEvent(runId, "status", opts.breadcrumb);
+  mkdirSync(path.dirname(opencodeLogPath(runId)), { recursive: true });
+  writeFileSync(opencodeLogPath(runId), [...opts.logLines, ""].join("\n"));
+  writeFileSync(opencodeExitPath(runId), "0\n");
+  return { taskId, runId };
+}
+
+/** A v2 turn whose only tool call is a background subagent `child`. */
+function v2SubagentLog(sessionId: string, child: string, description: string): string[] {
+  const now = Date.now();
+  const env = (type: string, body: Record<string, unknown>) => JSON.stringify({ type, timestamp: now, sessionID: sessionId, ...body });
+  return [
+    env("step_start", { part: { id: `prt_${child}_1`, sessionID: sessionId, messageID: `msg_${child}`, type: "step-start" } }),
+    env("tool_use", {
+      part: {
+        partID: `prt_${child}_2`,
+        sessionID: sessionId,
+        messageID: `msg_${child}`,
+        type: "tool",
+        id: `call-${child}`,
+        tool: "subagent",
+        state: {
+          status: "completed",
+          input: { prompt: "keep going", description, agent: "explore", background: true },
+          output: `<subagent sessionID="${child}" state="running">\nstarted\n</subagent>`,
+          title: "subagent",
+          metadata: { metadata: { sessionID: child, status: "running" } },
+          time: { start: now, end: now + 1 },
+        },
+      },
+    }),
+    env("text", { part: { id: `prt_${child}_3`, sessionID: sessionId, messageID: `msg_${child}`, type: "text", text: "kicked it off" } }),
+    env("step_finish", {
+      part: {
+        id: `prt_${child}_4`, sessionID: sessionId, messageID: `msg_${child}`, type: "step-finish", reason: "stop", cost: 0,
+        tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    }),
+  ];
+}
+
+/** Run `fn` with every child export reading as unavailable (the child
+ *  never finished), recording what each export was asked for. */
+async function withUnfinishedExports(
+  fn: (calls: Array<{ sessionId: string; major: 1 | 2; standalone: boolean }>) => Promise<void>,
+): Promise<void> {
+  const exportMod = await import("./opencode-export.ts");
+  const calls: Array<{ sessionId: string; major: 1 | 2; standalone: boolean }> = [];
+  const prev = exportMod.__forTest.setExportRunner(async (a) => {
+    calls.push({ sessionId: a.sessionId, major: a.major, standalone: a.standalone });
+    return null;
+  });
+  try {
+    await fn(calls);
+  } finally {
+    exportMod.__forTest.setExportRunner(prev);
+  }
+}
+
+test("boot reattach settles children from the turn's recorded server mode: a Standalone line fails them", async () => {
+  // The task now says Shared; the turn's own D-19 line says it ran Standalone
+  // — its private server (and the child with it) died with the turn.
+  setTmux("live");
+  const { opencodeSubagentId } = await import("./opencode-subagents.ts");
+  const sessionId = `ses_reatsa${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  const child = `ses_reatsachild${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  const { taskId, runId } = await seedReattachableRun({
+    sessionId,
+    logLines: v2SubagentLog(sessionId, child, "Standalone child"),
+    breadcrumb: "opencode 2.x · server=standalone · model=OpenCode default · effort=auto · mode=auto",
+  });
+  try {
+    await withUnfinishedExports(async (calls) => {
+      await orch.reconcileOrphans();
+      await waitFor(() => db.runs.get(runId)?.status !== "running");
+      expect(calls).toEqual([{ sessionId: child, major: 2, standalone: true }]);
+    });
+    expect(db.runs.get(runId)?.status).toBe("succeeded");
+    expect(db.subagents.get(opencodeSubagentId(child))?.status).toBe("failed");
+    expect(statusLines(runId)).toContain('OpenCode subagent "Standalone child" stopped when the turn ended');
+    expect(db.tasks.get(taskId)?.column).toBe("review");
+  } finally {
+    setTmux("absent");
+  }
+});
+
+test("boot reattach with no recorded line treats the turn as v2 Shared: an unfinished child is orphaned", async () => {
+  setTmux("live");
+  const { opencodeSubagentId } = await import("./opencode-subagents.ts");
+  const sessionId = `ses_reatsh${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  const child = `ses_reatshchild${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  // The task says Standalone, but nothing recorded what the turn ran with.
+  const { taskId, runId } = await seedReattachableRun({ sessionId, logLines: v2SubagentLog(sessionId, child, "Shared child") });
+  db.tasks.update(taskId, { opencodeServer: "standalone" });
+  try {
+    await withUnfinishedExports(async (calls) => {
+      await orch.reconcileOrphans();
+      await waitFor(() => db.runs.get(runId)?.status !== "running");
+      expect(calls).toEqual([{ sessionId: child, major: 2, standalone: false }]);
+    });
+    expect(db.subagents.get(opencodeSubagentId(child))?.status).toBe("orphaned");
+    expect(statusLines(runId)).toContain(
+      'OpenCode subagent "Shared child" is still running — its tab fills when a later turn finishes',
+    );
+  } finally {
+    setTmux("absent");
+  }
+});
+
+test("boot reattach reads the CLI line from the turn's breadcrumb, not the binary installed now", async () => {
+  // A v1 turn (the captured v1 subagent run) reattached after the harness's
+  // binary was upgraded to v2: parsed with the v1 mapper, its child failed.
+  setTmux("live");
+  const { opencodeSubagentId } = await import("./opencode-subagents.ts");
+  // The fixture's child id is renamed: subagent row ids derive from it, and
+  // other test files (one shared db per `bun test` process) register it too.
+  const child = `ses_reatv1child${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  const fixture = readFileSync(path.join(import.meta.dir, "fixtures", "opencode", "v1-run-subagent.jsonl"), "utf8")
+    .replaceAll("ses_e825eafb7ffeOjjZhBrQwKVqet", child);
+  expect(fixture).toContain(child);
+  const { runId } = await seedReattachableRun({
+    sessionId: "ses_e825ec104ffenteQsfLQHUAZwn",
+    logLines: fixture.split("\n").filter(Boolean),
+    breadcrumb: "opencode 1.x · server=n/a · model=OpenCode default · effort=auto · mode=auto",
+  });
+  try {
+    await withUnfinishedExports(async (calls) => {
+      await orch.reconcileOrphans();
+      await waitFor(() => db.runs.get(runId)?.status !== "running");
+      expect(calls).toEqual([{ sessionId: child, major: 1, standalone: false }]);
+    });
+    expect(db.subagents.get(opencodeSubagentId(child))?.status).toBe("failed");
+    expect(statusLines(runId)).toContain('OpenCode subagent "List files in directory" stopped when the turn ended');
+  } finally {
+    setTmux("absent");
+  }
 });
 
 function importedProvenance(status: ImportedOpencodeSession["status"], error: string | null = null): ImportedOpencodeSession {
