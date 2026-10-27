@@ -172,6 +172,72 @@ test("unfinished child on a v2 Shared turn → orphaned once, re-checked and com
   expect(row(child).status).toBe("completed");
 });
 
+test("an orphaned child re-checked by a later Standalone (or v1) turn stays orphaned, never relabeled stopped", async () => {
+  installEmitter();
+  const { taskId, runId } = seedTask();
+  const child = `ses_orph${randomUUID().replace(/-/g, "")}`;
+  installExports({ [child]: "v2-session-export-bg-child-dead.json" });
+  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child, { description: "Shared job" }) });
+  await mod.refreshOpencodeSubagents(refreshArgs(taskId, { standalone: false }));
+  expect(row(child).status).toBe("orphaned");
+  // A later turn ran Standalone / on v1: it says nothing about a child an
+  // earlier Shared turn left in OpenCode's service.
+  await mod.refreshOpencodeSubagents(refreshArgs(taskId, { standalone: true }));
+  await mod.refreshOpencodeSubagents(refreshArgs(taskId, { major: 1 }));
+  expect(row(child).status).toBe("orphaned");
+  expect(emitted.some((e) => e.stream === "status" && e.data.includes("stopped when the turn ended"))).toBe(false);
+});
+
+test("every settle fires the settle hook — a refresh that lands late still releases a held task", async () => {
+  const fired: string[] = [];
+  const prev = mod.setOpencodeSubagentSettleHook((id) => fired.push(id));
+  try {
+    const { taskId, runId } = seedTask();
+    const done = `ses_hook${randomUUID().replace(/-/g, "")}`;
+    installExports({ [done]: "v2-session-export-child.json" });
+    mod.registerOpencodeSubagent({ taskId, runId, notice: notice(done) });
+    await mod.refreshOpencodeSubagents(refreshArgs(taskId));
+    expect(row(done).status).toBe("completed");
+    expect(fired).toEqual([taskId]);
+  } finally {
+    mod.setOpencodeSubagentSettleHook(prev);
+  }
+});
+
+test("orphanRunningOpencodeSubagents flips only running OpenCode rows, posts a status line and fires the hook once", () => {
+  installEmitter();
+  const fired: string[] = [];
+  const prev = mod.setOpencodeSubagentSettleHook((id) => fired.push(id));
+  try {
+    const { taskId, runId } = seedTask();
+    const a = `ses_dropa${randomUUID().replace(/-/g, "")}`;
+    const b = `ses_dropb${randomUUID().replace(/-/g, "")}`;
+    mod.registerOpencodeSubagent({ taskId, runId, notice: notice(a, { description: "Job A" }) });
+    mod.registerOpencodeSubagent({ taskId, runId, notice: notice(b) });
+    db.subagents.setStatus(mod.opencodeSubagentId(b), "completed", Date.now());
+    // A Claude row on the same task is left alone (its own watcher owns it).
+    const claudeRow: Subagent = {
+      id: `claude-${randomUUID()}`, taskId, runId, parentKind: "subagent", agentType: "x", description: null,
+      spawnDepth: 1, sourcePath: "/tmp/agent-x.jsonl", toolUseId: null, status: "running", startedAt: Date.now(), endedAt: null,
+    };
+    db.subagents.insertIfAbsent(claudeRow);
+
+    expect(mod.orphanRunningOpencodeSubagents(taskId, "the task switched harness")).toBe(1);
+    expect(row(a).status).toBe("orphaned");
+    expect(row(b).status).toBe("completed");
+    expect(db.subagents.get(claudeRow.id)?.status).toBe("running");
+    expect(fired).toEqual([taskId]);
+    expect(emitted.filter((e) => e.stream === "status").map((e) => e.data)).toEqual([
+      'OpenCode subagent "Job A" was left unfinished — the task switched harness',
+    ]);
+    // Nothing left to flip: no second hook call.
+    expect(mod.orphanRunningOpencodeSubagents(taskId, "again")).toBe(0);
+    expect(fired).toEqual([taskId]);
+  } finally {
+    mod.setOpencodeSubagentSettleHook(prev);
+  }
+});
+
 test("v1: an unfinished child is failed even without --standalone", async () => {
   const { taskId, runId } = seedTask();
   const child = `ses_v1${randomUUID().replace(/-/g, "")}`;

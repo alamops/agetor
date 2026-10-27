@@ -3732,16 +3732,28 @@ function opencodeEfforts(model: string | null, discoveredEfforts: readonly strin
  * so the control never renders blank.
  *
  * OpenCode is the exception: it has no curated table, so its retainable set
- * is exactly `supportedEfforts("opencode", model, discoveredEfforts)`.
+ * is `supportedEfforts("opencode", model, discoveredEfforts)` — plus, while
+ * the model's variants are UNKNOWN (`discoveredEfforts` null/undefined:
+ * discovery hasn't loaded, or its variant probe failed), the task's `current`
+ * effort, since nothing can prove a stored variant wrong yet. Without that a
+ * panel opened before discovery lands would PATCH a chosen variant to `auto`.
+ * A known-empty variant list (`[]`) and the "OpenCode default" sentinel (no
+ * effort reaches the CLI at all) still don't retain it.
  */
 export function retainableEfforts(
   agent: AgentKind,
   model: string | null,
   discoveredEfforts?: readonly string[] | null,
+  current?: string | null,
 ): ReadonlySet<string> {
   // OpenCode has no curated table to union with (D-6): what discovery says
-  // for this model is the whole answer.
-  if (agent === "opencode") return new Set(supportedEfforts(agent, model, discoveredEfforts).map((o) => o.id));
+  // for this model is the whole answer, once discovery has said anything.
+  if (agent === "opencode") {
+    const ids = new Set(supportedEfforts(agent, model, discoveredEfforts).map((o) => o.id));
+    const unknown = discoveredEfforts === null || discoveredEfforts === undefined;
+    if (unknown && current && model !== null && model !== OPENCODE_DEFAULT_MODEL) ids.add(current);
+    return ids;
+  }
   const ids = new Set<string>();
   for (const o of supportedEfforts(agent, model, discoveredEfforts)) ids.add(o.id);
   for (const o of supportedEfforts(agent, model)) ids.add(o.id);

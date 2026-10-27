@@ -147,9 +147,14 @@ import {
 } from "./antigravity-tmux.ts";
 import {
   dropOpencodeSession,
+  opencodeSessionActive,
   reattachOpencodeSession,
 } from "./opencode-tmux.ts";
-import { setOpencodeSubagentEmitter } from "./opencode-subagents.ts";
+import {
+  orphanRunningOpencodeSubagents,
+  setOpencodeSubagentEmitter,
+  setOpencodeSubagentSettleHook,
+} from "./opencode-subagents.ts";
 import {
   dropFxSession,
 } from "./fx-acp.ts";
@@ -403,6 +408,10 @@ setOpencodeSubagentEmitter(emit);
 // by the background agents themselves. Register the release as the subagent
 // settle hook so the last-agent-finishing edge lands the card in `review`.
 setSubagentSettleHook(maybeReleaseHeldTask);
+// OpenCode subagent rows settle outside the claude watcher (turn-end export
+// refresh, teardown, boot) — same release, so a refresh that lands after the
+// driver's `beforeSettle` budget still frees a held task.
+setOpencodeSubagentSettleHook(maybeReleaseHeldTask);
 
 // Parked-discovery: a subagent newly (or once again) `running` should pull a
 // `review` card back to `running` — the mirror-image of the settle hook
@@ -1041,10 +1050,21 @@ export async function reconcileOrphans(): Promise<number> {
   for (const heldId of heldTaskIds) {
     const task = tasks.get(heldId);
     if (!task) continue;
-    // Only claude-code writes subagent rows; a codex or cursor task can never
-    // be held, so it never reaches here. Guard the session probe on kind for
-    // clarity.
-    if (resolveHarness(task.agent)?.kind !== "claude-code") continue;
+    const heldKind = resolveHarness(task.agent)?.kind;
+    // OpenCode rows settle at turn end (the export refresh in the driver's
+    // `beforeSettle`). Only a reattached OpenCode tail (above) will still run
+    // one; with none — the turn died with the restart, or the task has since
+    // switched harness — nothing ever will, so orphan them now. The settle
+    // hook then releases a held card. Runs before the claude branch so a
+    // claude task's leftover OpenCode rows can't hold it either.
+    if (!(heldKind === "opencode" && opencodeSessionActive(heldId))) {
+      released += orphanRunningOpencodeSubagents(heldId, "agetor restarted while it was running");
+    }
+    // Only claude-code (and opencode, handled above) writes subagent rows; a
+    // codex or cursor task can never be held, so it never reaches here.
+    // Guard the session probe on kind for clarity.
+    if (heldKind !== "claude-code") continue;
+    if (!subagents.hasRunning(heldId)) continue;
 
     if (task.column === "running") {
       // Classic held-task path, unchanged: only proceed when the terminal run
@@ -2838,7 +2858,7 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     else if (beforeKind === "cursor") await dropCursorSession(taskId);
     else if (beforeKind === "gemini") await dropGeminiSession(taskId);
     else if (beforeKind === "antigravity") await dropAntigravitySession(taskId);
-    else if (beforeKind === "opencode") await dropOpencodeSession(taskId); // graceful C-c, then kill (D-10)
+    else if (beforeKind === "opencode") await dropOpencodeTask(taskId, "the task switched harness"); // graceful C-c, then kill (D-10)
     else if (beforeKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
     // Same reasoning for a pending fx auto-resume schedule: it belongs to
     // the old fx session, and the new agent (fx or otherwise) has nothing to
@@ -4798,6 +4818,18 @@ async function drainOpencodeQueue(taskId: string): Promise<void> {
   const next = q.shift();
   if (q.length === 0) opencodeTurnQueue.delete(taskId);
   if (next !== undefined) await spawnOpencodeTurnNow(task, taskId, next);
+}
+
+/**
+ * Tear down a task's OpenCode session (D-10) and orphan any subagent row the
+ * killed turn left `running`: the drop resolves the tail WITHOUT
+ * `beforeSettle`, so no final refresh will ever settle those rows, and a
+ * `running` row would hold the task's next turn — on any harness — in
+ * `running` forever (`isTaskHeldByBackgroundAgents`).
+ */
+async function dropOpencodeTask(taskId: string, reason: string): Promise<void> {
+  await dropOpencodeSession(taskId);
+  orphanRunningOpencodeSubagents(taskId, reason);
 }
 
 /**
@@ -7134,7 +7166,7 @@ function enqueueArchiveTeardown(
     else if (kind === "cursor") await dropCursorSession(cur.id);
     else if (kind === "gemini") await dropGeminiSession(cur.id);
     else if (kind === "antigravity") await dropAntigravitySession(cur.id);
-    else if (kind === "opencode") await dropOpencodeSession(cur.id); // graceful C-c, then kill (D-10)
+    else if (kind === "opencode") await dropOpencodeTask(cur.id, "the task was archived"); // graceful C-c, then kill (D-10)
     else if (kind === "fx") dropFxSession(cur.id); // fx has no tmux session — stays sync
     // Pipeline step rows share the parent's worktree (D2, docs/plans/pipelines.md)
     // — a step's own archive teardown must never detach it out from under
@@ -7510,7 +7542,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     else if (deleteKind === "cursor") await dropCursorSession(taskId);
     else if (deleteKind === "gemini") await dropGeminiSession(taskId);
     else if (deleteKind === "antigravity") await dropAntigravitySession(taskId);
-    else if (deleteKind === "opencode") await dropOpencodeSession(taskId); // graceful C-c, then kill (D-10)
+    else if (deleteKind === "opencode") await dropOpencodeTask(taskId, "the task was deleted"); // graceful C-c, then kill (D-10)
     else if (deleteKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
     // A step task's worktree is the shared parent's (D2) — never remove it
     // out from under the parent (or any sibling step) just because one step

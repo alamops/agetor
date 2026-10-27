@@ -427,10 +427,25 @@ async function getCachedStatus(
 const versionCache = new Map<string, { value: string; expiresAt: number }>();
 
 /**
+ * The env a status/version probe runs with: the harness's spawn env, plus —
+ * for OpenCode — `OPENCODE_DISABLE_AUTOUPDATE=1` unless the harness's own env
+ * map says otherwise, same as every spawn and discovery probe: a background
+ * poll must never self-update the binary.
+ */
+function probeEnvFor(harness: Harness): Record<string, string> {
+  const env = harnessEnv(harness);
+  if (harness.kind === "opencode") env.OPENCODE_DISABLE_AUTOUPDATE ??= "1";
+  return env;
+}
+
+/**
  * The harness binary's `--version` first line (e.g. `opencode v2.1.3`,
- * `1.19.4`), memoized for 60 s per `harness.id:path`. `null` when the binary
- * isn't found or the probe fails — a null is never cached, so the next call
- * retries.
+ * `1.19.4`), memoized for 60 s per `harness.id:path`. A failed probe (a
+ * timeout under load, a transient spawn error) is never cached — the next
+ * call retries — but it returns the last version this binary reported, if
+ * any, rather than `null`: `null` reads as "unknown → v2" downstream, which
+ * would hand a v1 install v2-only flags (`--standalone`, `-m id#variant`).
+ * `null` only when the binary isn't found or has never answered.
  */
 export async function cachedCliVersion(harness: Harness): Promise<string | null> {
   const path = resolveBinPath(resolveBin(harness));
@@ -438,9 +453,12 @@ export async function cachedCliVersion(harness: Harness): Promise<string | null>
   const key = `${harness.id}:${path}`;
   const hit = versionCache.get(key);
   if (hit && hit.expiresAt > Date.now()) return hit.value;
-  const value = await probeVersion(path, harnessEnv(harness));
-  if (value !== null) versionCache.set(key, { value, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
-  return value;
+  const value = await probeVersion(path, probeEnvFor(harness));
+  if (value !== null) {
+    versionCache.set(key, { value, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
+    return value;
+  }
+  return hit?.value ?? null;
 }
 
 type CommandOutput = { code: number; stdout: string; stderr: string };
@@ -688,7 +706,7 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
     // the system install and always passes — no per-harness symlink needed.
   }
 
-  const env = harnessEnv(harness);
+  const env = probeEnvFor(harness);
   // Started now, awaited below: the OpenCode credential probe overlaps it.
   const versionProbe = probeVersion(path, env);
   const authProbe = harness.kind === "opencode" ? getCachedOpencodeAuth(harness, path, env, versionProbe) : null;

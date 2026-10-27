@@ -36,18 +36,30 @@ export function claudeRowKey(sessionId: string): string {
   return `claude-code:${sessionId}`;
 }
 
+/** Key recording that a session id was imported, whichever harness's row
+ *  it was imported from: one session becomes one task, so every row listing
+ *  it (another account sharing the project) is gone once it is imported. */
+export function opencodeSessionKey(sessionId: string): string {
+  return `opencode-session:${sessionId}`;
+}
+
 /**
  * Group OpenCode rows by the harness that listed them, for one
- * `importOpencodeSessions(ids, harnessId)` call per harness. A session id
- * appears once per harness; insertion order is kept.
+ * `importOpencodeSessions(ids, harnessId)` call per harness. A session id is
+ * imported once: when two harnesses' rows of the same session are both
+ * picked, the first row's harness takes it (the other would only fail as
+ * "already imported"). Insertion order is kept.
  */
 export function groupOpencodeImports(
   rows: readonly Pick<OpencodeSessionListItem, "harnessId" | "sessionId">[],
 ): Map<string, string[]> {
   const groups = new Map<string, string[]>();
+  const taken = new Set<string>();
   for (const row of rows) {
+    if (taken.has(row.sessionId)) continue;
+    taken.add(row.sessionId);
     const ids = groups.get(row.harnessId) ?? [];
-    if (!ids.includes(row.sessionId)) ids.push(row.sessionId);
+    ids.push(row.sessionId);
     groups.set(row.harnessId, ids);
   }
   return groups;

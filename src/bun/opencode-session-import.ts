@@ -15,6 +15,7 @@
  * export and the `(run_id, line_uuid)` index skips what already landed.
  */
 import { statSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import {
@@ -65,7 +66,9 @@ const UNFINISHED_LINE_UUID = "opencode:import:unfinished";
 
 export interface ImportOpencodeSessionsOptions {
   /** The OpenCode harness the new task runs under. Default: the harness
-   *  whose `session list` reported the session. */
+   *  whose `session list` reported the session. Refused for a harness that
+   *  reads another OpenCode data dir: its `-s <id>` follow-ups couldn't see
+   *  the session (v2 would silently start an empty one, spike Q4). */
   harnessId?: string;
   /** Test seam: the backfill waits here before writing events. */
   backfillGate?: Promise<void>;
@@ -429,6 +432,28 @@ export async function importOpencodeSessions(
   return { results };
 }
 
+/**
+ * The OpenCode data dir a harness's CLI reads (sessions live in its
+ * `opencode/opencode.db`): `XDG_DATA_HOME`, else `$HOME/.local/share`, over
+ * the env a spawn actually gets — agetor's own env with the harness's
+ * (`harnessEnv`: a `home` pins HOME + XDG_*, an env map may set either) on top.
+ */
+function opencodeDataDirOf(h: Harness): string {
+  const env = { ...process.env, ...harnessEnv(h) };
+  const xdg = env.XDG_DATA_HOME?.trim();
+  if (xdg) return path.resolve(xdg);
+  return path.resolve(env.HOME?.trim() || homedir(), ".local", "share");
+}
+
+/** Error for a `harnessId` override that can't resume the session, or null. */
+function overrideMismatch(id: string, record: OpencodeSessionRecord, target: Harness): string | null {
+  if (record.harnessId === target.id) return null;
+  const listedUnder = harnesses.get(record.harnessId);
+  if (listedUnder?.kind === "opencode" && opencodeDataDirOf(listedUnder) === opencodeDataDirOf(target)) return null;
+  const listedLabel = listedUnder?.label ?? record.harnessId;
+  return `OpenCode session ${id} belongs to "${listedLabel}" — "${target.label}" reads another OpenCode data dir and couldn't continue it; import it under "${listedLabel}"`;
+}
+
 async function commitOne(
   id: string,
   record: OpencodeSessionRecord | null,
@@ -438,6 +463,8 @@ async function commitOne(
   if (sessionAlreadyBound(id)) return { id, error: ALREADY_IMPORTED };
   if (!record) return { id, error: "session not found" };
   if (record.blockedReason === "missing-folder") return { id, error: MISSING_FOLDER_IMPORT_ERROR };
+  const mismatch = target ? overrideMismatch(id, record, target) : null;
+  if (mismatch) return { id, error: mismatch };
   const found = record;
 
   return withCommitLock(id, async () => {

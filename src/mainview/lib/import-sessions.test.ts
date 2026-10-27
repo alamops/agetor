@@ -10,6 +10,7 @@ import {
   OPENCODE_BUSY_UNKNOWN_COPY,
   opencodeBlockedCopy,
   opencodeRowKey,
+  opencodeSessionKey,
   opencodeSessionsFoundText,
   opencodeWarningCopy,
 } from "./import-sessions.ts";
@@ -67,6 +68,25 @@ describe("groupOpencodeImports", () => {
       ["opencode", ["ses_1", "ses_3"]],
       ["opencode-2", ["ses_2"]],
     ]);
+  });
+
+  test("imports a session listed by two harnesses once, under the first picked row's harness", () => {
+    const groups = groupOpencodeImports([
+      row({ sessionId: "ses_1", harnessId: "opencode-2" }),
+      row({ sessionId: "ses_1" }),
+      row({ sessionId: "ses_2" }),
+    ]);
+    expect([...groups.entries()]).toEqual([
+      ["opencode-2", ["ses_1"]],
+      ["opencode", ["ses_2"]],
+    ]);
+  });
+});
+
+describe("opencodeSessionKey", () => {
+  test("is per session, not per harness row", () => {
+    expect(opencodeSessionKey("ses_1")).toBe("opencode-session:ses_1");
+    expect(opencodeSessionKey("ses_1")).not.toBe(opencodeRowKey(row({ sessionId: "ses_1" })));
   });
 });
 

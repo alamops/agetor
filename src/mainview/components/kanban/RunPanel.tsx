@@ -7160,9 +7160,11 @@ function TaskDetails({
     () => new Set(supportedEffortsForModel.map((o) => o.id)),
     [supportedEffortsForModel],
   );
+  // `task.effort` rides along so OpenCode keeps a stored variant while its
+  // model's variants are still unknown (see `retainableEfforts`).
   const retainable = useMemo(
-    () => retainableEfforts(kind, task.model, discoveredEffortsForTask),
-    [kind, task.model, discoveredEffortsForTask],
+    () => retainableEfforts(kind, task.model, discoveredEffortsForTask, task.effort),
+    [kind, task.model, discoveredEffortsForTask, task.effort],
   );
   // Mirrors `mergeModelOptions` rule 6: a task's current effort can be
   // retained (kept valid by the cascade above) without being one the picker

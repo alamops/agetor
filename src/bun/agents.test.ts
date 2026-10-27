@@ -2905,7 +2905,11 @@ const OC_CASES: OcCase[] = [
   { name: "v2 variant rides in the model id", opts: { cliVersion: V2, model: "opencode/deepseek-v4.1-flash-free", effort: "high" }, cmd: [...BASE, "-m", "opencode/deepseek-v4.1-flash-free#high", "--auto"] },
   { name: "v1 variant is --variant", opts: { cliVersion: V1, model: "opencode/deepseek-v4.1-flash-free", effort: "high" }, cmd: [...BASE, "-m", "opencode/deepseek-v4.1-flash-free", "--variant", "high", "--auto"] },
   { name: "sentinel drops a stored variant", opts: { cliVersion: V2, effort: "high" }, cmd: [...BASE, "--auto"] },
-  { name: "fresh session carries --title", opts: { cliVersion: V2, title: "Fix the login bug" }, cmd: [...BASE, "--auto", "--title", "Fix the login bug"] },
+  { name: "fresh session carries --title", opts: { cliVersion: V2, title: "Fix the login bug" }, cmd: [...BASE, "--auto", "--title=Fix the login bug"] },
+  // A dash-leading title must stay one `--title=` item: OpenCode v2 parses a
+  // separate `-v2 migration` value as `-v` (prints the version, runs nothing).
+  { name: "dash-leading title stays the --title= value", opts: { cliVersion: V2, title: "-v2 migration" }, cmd: [...BASE, "--auto", "--title=-v2 migration"] },
+  { name: "double-dash title stays the --title= value (v1)", opts: { cliVersion: V1, title: "--version bump" }, cmd: [...BASE, "--auto", "--title=--version bump"] },
   { name: "blank title is omitted", opts: { cliVersion: V2, title: "   " }, cmd: [...BASE, "--auto"] },
   { name: "v2 resume: -s, no --title, then --standalone", opts: { cliVersion: V2, title: "T", resumeSessionId: "ses_abc123", opencodeServer: "standalone", mode: "plan", model: "p/m", effort: "low" }, cmd: [...BASE, "-m", "p/m#low", "--agent", "plan", "-s", "ses_abc123", "--standalone"] },
   { name: "v1 resume", opts: { cliVersion: V1, resumeSessionId: "ses_abc123", model: "p/m", effort: "low" }, cmd: [...BASE, "-m", "p/m", "--variant", "low", "--auto", "-s", "ses_abc123"] },
@@ -2929,7 +2933,7 @@ test("opencode resume returns a freshArgv: the same argv without -s, plus --titl
     title: "Task title",
   });
   expect(built.cmd).toEqual([...BASE, "-m", "p/m#high", "--auto", "-s", "ses_old1", "--standalone"]);
-  expect(built.freshArgv).toEqual([...BASE, "-m", "p/m#high", "--auto", "--title", "Task title", "--standalone"]);
+  expect(built.freshArgv).toEqual([...BASE, "-m", "p/m#high", "--auto", "--title=Task title", "--standalone"]);
 });
 
 test("opencode fresh session returns no freshArgv", () => {
@@ -2945,7 +2949,7 @@ test("other kinds never get a freshArgv, even when resuming", () => {
 test("opencode --title is cut to OPENCODE_TITLE_MAX_CHARS code points, never mid-surrogate", () => {
   const title = "😀".repeat(OPENCODE_TITLE_MAX_CHARS + 50);
   const { cmd } = buildCommand(builtin("opencode"), "p", { ...opencodeDefaults, cliVersion: V2, title });
-  const value = cmd[cmd.indexOf("--title") + 1]!;
+  const value = cmd.find((a) => a.startsWith("--title="))!.slice("--title=".length);
   expect(Array.from(value)).toHaveLength(OPENCODE_TITLE_MAX_CHARS);
   expect(value).toBe("😀".repeat(OPENCODE_TITLE_MAX_CHARS));
 });

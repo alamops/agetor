@@ -22,7 +22,16 @@ import { exportOutcome, exportToEvents, runOpencodeExport, type OpencodeExport }
  *    child dies with the client (spike Q12), and v1 children are always
  *    foreground (agetor never sets `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS`);
  *  - unfinished child on a v2 Shared turn → `orphaned`: OpenCode's service
- *    may still be running it, so later turn ends re-check orphaned rows.
+ *    may still be running it, so later turn ends re-check orphaned rows (a
+ *    re-check only settles one once its export reports an outcome; it never
+ *    relabels it "stopped", whatever server mode the later turn ran in).
+ *
+ * Two paths skip `beforeSettle` and are covered separately: a session
+ * teardown (delete/archive/agent switch → `dropOpencodeSession`) and a boot
+ * with no live tail to finish the turn; both call
+ * `orphanRunningOpencodeSubagents`. Every settle fires the settle hook (the
+ * orchestrator's held-task release), so a refresh that outlives the driver's
+ * `beforeSettle` budget still lets a held task go when it finally lands.
  */
 
 let emitFn: ((e: RunEvent) => void) | null = null;
@@ -33,6 +42,25 @@ export function setOpencodeSubagentEmitter(fn: ((e: RunEvent) => void) | null): 
   const prev = emitFn;
   emitFn = fn;
   return prev;
+}
+
+let settleFn: ((taskId: string) => void) | null = null;
+
+/** Held-task release hook (the orchestrator registers `maybeReleaseHeldTask`,
+ *  same as Claude's `setSubagentSettleHook`). Fired after a row leaves
+ *  `running`. Returns the previous hook (tests restore it). */
+export function setOpencodeSubagentSettleHook(fn: ((taskId: string) => void) | null): ((taskId: string) => void) | null {
+  const prev = settleFn;
+  settleFn = fn;
+  return prev;
+}
+
+function fireSettle(taskId: string): void {
+  try {
+    settleFn?.(taskId);
+  } catch (e) {
+    console.error(`[opencode-subagents] settle hook failed for task ${taskId}:`, e);
+  }
 }
 
 export const OPENCODE_SUBAGENT_SOURCE_PREFIX = "opencode-session:";
@@ -136,6 +164,7 @@ function settleRow(row: Subagent, status: SubagentStatus): void {
   const endedAt = Date.now();
   subagents.setStatus(row.id, status, endedAt);
   emitLifecycle({ ...row, status, endedAt }, "finished");
+  fireSettle(row.taskId);
 }
 
 async function refreshRow(
@@ -169,6 +198,11 @@ async function refreshRow(
     return;
   }
   if (!a.final) return;
+  // An orphaned row is a child an EARLIER Shared turn left running in the
+  // service; only an export outcome (above) may settle it. This turn's own
+  // server mode says nothing about it — a Standalone turn must not call it
+  // "stopped" (or fail it) just because the export still reads unfinished.
+  if (row.status === "orphaned") return;
 
   if (a.standalone || a.major === 1) {
     // The child died with the turn's private server (A6a); show what it got done.
@@ -179,7 +213,6 @@ async function refreshRow(
     settleRow(row, "failed");
     return;
   }
-  if (row.status === "orphaned") return; // re-checked, still running: nothing new to say
   if (runId) {
     append(
       row,
@@ -191,6 +224,45 @@ async function refreshRow(
     );
   }
   settleRow(row, "orphaned");
+}
+
+/**
+ * Flip every still-`running` OpenCode subagent row of a task to `orphaned`
+ * when nothing will run a final refresh for it: the task's OpenCode session
+ * was torn down (delete/archive/agent switch — `dropOpencodeSession` resolves
+ * the tail without `beforeSettle`) or agetor booted with no live tail. Left
+ * `running`, the row would hold the task's next turn (any harness) in
+ * `running` forever. `orphaned`, not `failed`: a v2 Shared child may still be
+ * running in OpenCode's service, and a later OpenCode turn re-checks it.
+ * Fires the settle hook once. Returns how many rows it flipped; never throws.
+ */
+export function orphanRunningOpencodeSubagents(taskId: string, reason: string): number {
+  let rows: Subagent[];
+  try {
+    rows = subagents
+      .listForTask(taskId)
+      .filter((r) => isOpencodeSubagentRow(r) && r.status === "running");
+  } catch (e) {
+    console.error("[opencode-subagents] failed to list subagents:", e);
+    return 0;
+  }
+  let flipped = 0;
+  for (const row of rows) {
+    try {
+      const endedAt = Date.now();
+      subagents.setStatus(row.id, "orphaned", endedAt);
+      emitLifecycle({ ...row, status: "orphaned", endedAt }, "finished");
+      flipped++;
+      const runId = runIdFor(row);
+      if (runId) {
+        append(row, runId, "status", `OpenCode subagent "${label(row)}" was left unfinished — ${reason}`, `opencode:subagent:${row.id}:left`, null);
+      }
+    } catch (e) {
+      console.error(`[opencode-subagents] failed to orphan ${row.id}:`, e);
+    }
+  }
+  if (flipped > 0) fireSettle(taskId);
+  return flipped;
 }
 
 const REFRESH_EXPORT_TIMEOUT_MS = 10_000;

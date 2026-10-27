@@ -264,6 +264,28 @@ test("opts.harnessId runs the task under another OpenCode harness", async () => 
   expect(task.importedOpencode?.status).toBe("ready");
 });
 
+test("opts.harnessId refuses a harness that reads another OpenCode data dir", async () => {
+  // A harness with its own home has its own `opencode.db`: `-s <id>` there
+  // can't see the session, and v2 would silently start an empty one (Q4).
+  const hHome = harnesses.insert({
+    id: `oc-imp-home-${suffix}`,
+    kind: "opencode",
+    label: "OpenCode Home",
+    bin: stub,
+    home: path.join(scratch, "other-home"),
+    env: { OC_VERSION: "opencode v2.1.3", OC_FIX: fix, OC_TAG: "home" },
+  });
+  try {
+    const { id } = plant();
+    const r = await importOne(id, { harnessId: hHome.id });
+    expect(r.taskId).toBeUndefined();
+    expect(r.error).toContain('belongs to "OpenCode A"');
+    expect(tasks.findTaskByImportedOpencodeSession(id)).toBeNull();
+  } finally {
+    harnesses.delete(hHome.id);
+  }
+});
+
 test("retry re-runs the export for a failed import", async () => {
   const { id } = plant();
   const r = await importOne(id);

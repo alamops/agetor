@@ -9,6 +9,7 @@ import {
   mergeByActivity,
   opencodeBlockedCopy,
   opencodeRowKey,
+  opencodeSessionKey,
   opencodeWarningCopy,
 } from "@/lib/import-sessions";
 import { LONG_PATH_IMPORT_ERROR, MISSING_FOLDER_IMPORT_ERROR } from "../../../shared/claude-session-meta.ts";
@@ -125,7 +126,9 @@ export function ImportSessionsDialog({ open, onClose, onImported }: Props) {
     try {
       const res = recheck ? await api.recheckOpencodeSessions() : await api.listOpencodeSessions();
       const imported = importedAtRef.current;
-      setOpencodeSessions(res.sessions.filter((s) => (imported.get(opencodeRowKey(s)) ?? -Infinity) < startedAt));
+      setOpencodeSessions(res.sessions.filter((s) => (
+        Math.max(imported.get(opencodeRowKey(s)) ?? -Infinity, imported.get(opencodeSessionKey(s.sessionId)) ?? -Infinity)
+      ) < startedAt));
       if (recheck) setRowError((prev) => omitKeys(prev, Object.keys(prev).filter((k) => k.startsWith("opencode:"))));
     } catch (err) {
       setOpencodeError(err instanceof ApiError ? err.message : "Couldn't list OpenCode sessions");
@@ -240,10 +243,28 @@ export function ImportSessionsDialog({ open, onClose, onImported }: Props) {
   const importOpencode = async (harnessId: string, ids: string[]): Promise<boolean> => {
     const res = await api.importOpencodeSessions(ids, harnessId);
     const missing = ids.filter((id) => !res.results.some((r) => r.id === id));
-    return applyImportResults(
+    const imported = applyImportResults(
       [...res.results, ...missing.map((id) => ({ id, error: "Import failed" }))],
       (id) => opencodeRowKey({ harnessId, sessionId: id }),
     );
+    // The same session may also be listed under another OpenCode harness
+    // (two accounts sharing the project): it is one task now, so drop those
+    // rows too, and keep a reload that started before the import from
+    // bringing them back.
+    const done = new Set(res.results.filter((r) => !r.error && r.taskId).map((r) => r.id));
+    if (done.size > 0) {
+      const now = Date.now();
+      for (const id of done) importedAtRef.current.set(opencodeSessionKey(id), now);
+      setOpencodeSessions((prev) => prev.filter((s) => !done.has(s.sessionId)));
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const key of prev) {
+          if (key.startsWith("opencode:") && done.has(key.slice(key.lastIndexOf(":") + 1))) next.delete(key);
+        }
+        return next;
+      });
+    }
+    return imported;
   };
 
   const importOne = async (row: Row) => {

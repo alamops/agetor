@@ -295,6 +295,29 @@ test("retainableEfforts('fx', 'deepseek/deepseek-v4-flash') contains 'auto'", ()
   expect(retained.has("auto")).toBe(true);
 });
 
+test("retainableEfforts('opencode', …) keeps the current variant while the model's variants are unknown", () => {
+  // Discovery not loaded / variant probe failed: a stored variant can't be
+  // proven wrong, so the panel's cascade must not PATCH it to `auto`.
+  expect(retainableEfforts("opencode", "p/m", null, "high").has("high")).toBe(true);
+  expect(retainableEfforts("opencode", "p/m", undefined, "thinking").has("thinking")).toBe(true);
+  // `auto` stays retainable too, and nothing is added without a current effort.
+  expect([...retainableEfforts("opencode", "p/m", null)]).toEqual(["auto"]);
+});
+
+test("retainableEfforts('opencode', …) drops a variant once discovery is known, and never keeps one on the sentinel", () => {
+  // Known variants that omit it: the cascade may clear it.
+  expect(retainableEfforts("opencode", "p/m", ["low"], "high").has("high")).toBe(false);
+  // Known-empty variant list: the model takes no variant at all.
+  expect(retainableEfforts("opencode", "p/m", [], "high").size).toBe(0);
+  // The "OpenCode default" sentinel passes no `-m`, so no effort reaches the CLI.
+  expect(retainableEfforts("opencode", "opencode-default", null, "high").size).toBe(0);
+  expect(retainableEfforts("opencode", null, null, "high").size).toBe(0);
+});
+
+test("retainableEfforts ignores `current` for every other kind", () => {
+  expect(retainableEfforts("codex", "gpt-6.1-sol", null, "bogus").has("bogus")).toBe(false);
+});
+
 test("none of the seven previously-curated fx ids survives as an unconditional row — each is either absent or catalogOnly — and the nonexistent google/gemini-3-pro id is gone entirely", () => {
   const models = AGENT_OPTIONS.fx.models;
   const byId = new Map(models.map((m) => [m.id, m]));

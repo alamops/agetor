@@ -50,7 +50,7 @@ export interface AgentCommand {
   /**
    * Set only by the opencode branch of `buildCommand`, and only when the turn
    * resumes a session (`opts.resumeSessionId`): the same argv without
-   * `-s <id>`, plus `--title` when a title was given. `spawnAgent` forwards
+   * `-s <id>`, plus `--title=<t>` when a title was given. `spawnAgent` forwards
    * it to `spawnOpencodeViaTmux` as `OpencodeLaunchOptions.freshArgv`, which
    * relaunches with it once when a v1 resume fails with "Session not found"
    * before any line carried a session id (D-9, spike A5). Undefined for every
@@ -937,8 +937,11 @@ export function buildCommand(
         args.push("-s", resumeId);
       } else if (title) {
         // Only on a fresh session: OpenCode keeps the original title when
-        // `-s` resumes one (spike Q15).
-        args.push("--title", title);
+        // `-s` resumes one (spike Q15). One `--title=<t>` argv item, never
+        // `--title <t>`: v2's parser reads a dash-leading VALUE as a flag
+        // (`-v2 migration` printed the version and the turn did nothing), and
+        // both majors parse the `=` form (v1 is yargs).
+        args.push(`--title=${title}`);
       }
       // v2 only (v1 rejects unknown flags): run without the shared background
       // service. A harness with a home always lands here (spike A14 — the

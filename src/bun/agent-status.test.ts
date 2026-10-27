@@ -1164,4 +1164,31 @@ describe("cachedCliVersion", () => {
     writeFileSync(bin, "#!/bin/sh\necho 1.2.3\n", { mode: 0o755 });
     expect(await cachedCliVersion(harness)).toBe("1.2.3");
   });
+
+  test("a failed re-probe returns the last version the binary reported, not null (null would read as v2)", async () => {
+    const bin = path.join(dir, "flaky-later");
+    writeFileSync(bin, "#!/bin/sh\necho 1.19.4\n", { mode: 0o755 });
+    const harness = opencodeHarness(bin, "flaky-later");
+    expect(await cachedCliVersion(harness)).toBe("1.19.4");
+    writeFileSync(bin, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    setSystemTime(new Date(Date.now() + 61_000));
+    try {
+      expect(await cachedCliVersion(harness)).toBe("1.19.4");
+      // Not re-cached as fresh: once the binary answers again, its new
+      // version wins on the very next call.
+      writeFileSync(bin, "#!/bin/sh\necho opencode v2.1.3\n", { mode: 0o755 });
+      expect(await cachedCliVersion(harness)).toBe("opencode v2.1.3");
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("probes OpenCode with OPENCODE_DISABLE_AUTOUPDATE=1 unless the harness env sets it", async () => {
+    const bin = path.join(dir, "env-echo");
+    writeFileSync(bin, `#!/bin/sh\necho "v-$OPENCODE_DISABLE_AUTOUPDATE"\n`, { mode: 0o755 });
+    expect(await cachedCliVersion(opencodeHarness(bin, "env-a"))).toBe("v-1");
+    const own: Harness = { ...opencodeHarness(bin, "env-b"), isBuiltin: false, env: { OPENCODE_DISABLE_AUTOUPDATE: "0" } };
+    expect(await cachedCliVersion(own)).toBe("v-0");
+    expect((await checkHarness(opencodeHarness(bin, "env-c"))).version).toBe("v-1");
+  });
 });

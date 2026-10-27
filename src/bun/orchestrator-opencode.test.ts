@@ -279,6 +279,68 @@ test("a cross-kind agent switch resets opencodeServer to shared", async () => {
   expect(fresh.model).toBeNull();
 });
 
+/** A `running` OpenCode subagent row on `runId` (what a killed turn leaves). */
+async function seedRunningChild(taskId: string, runId: string, description: string): Promise<string> {
+  const { registerOpencodeSubagent, opencodeSubagentId } = await import("./opencode-subagents.ts");
+  const child = `ses_left${randomUUID().replace(/-/g, "")}`;
+  registerOpencodeSubagent({
+    taskId,
+    runId,
+    notice: { childSessionId: child, description, agentType: "explore", toolUseId: `call-${child}`, background: true },
+  });
+  return opencodeSubagentId(child);
+}
+
+/** Insert a bare task + one run row directly (no spawn). */
+function insertTaskWithRun(over: { agent: string; column: Task["column"]; runStatus: Run["status"] }): { taskId: string; runId: string } {
+  const taskId = randomUUID();
+  const runId = randomUUID();
+  const now = Date.now();
+  db.tasks.insert({
+    id: taskId, title: "left rows", prompt: "p", column: over.column, agent: over.agent, workdir: WORKDIR,
+    isolation: "none", taskType: "task", branch: null, branchSource: "created", worktreePath: null, baseRef: null,
+    prUrl: null, mode: null, model: null, effort: null, speed: "off", maxMode: false, opencodeServer: "shared",
+    references: [], backlog: [], plans: [], draft: null, runId, createdAt: now, updatedAt: now,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, archivedAt: null,
+  });
+  db.runs.insert({
+    id: runId, taskId, agent: over.agent, status: over.runStatus, startedAt: now,
+    endedAt: over.runStatus === "running" ? null : now, exitCode: over.runStatus === "succeeded" ? 0 : null,
+    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null,
+    fxSessionId: null, antigravitySessionId: null, opencodeSessionId: null,
+  });
+  return { taskId, runId };
+}
+
+test("an agent switch away from opencode orphans the subagent rows the dropped turn left running", async () => {
+  // The drop resolves the tail without `beforeSettle`, so no final refresh
+  // will ever settle them — left `running` they'd hold the next claude run.
+  const { taskId, runId } = insertTaskWithRun({ agent: "opencode", column: "review", runStatus: "succeeded" });
+  const rowId = await seedRunningChild(taskId, runId, "Background scan");
+  const before = db.tasks.get(taskId)!;
+  const after = db.tasks.update(taskId, { agent: "claude-code" })!;
+  await orch.reconcileTaskSession(taskId, before, after);
+  expect(db.subagents.get(rowId)?.status).toBe("orphaned");
+  expect(db.subagents.hasRunning(taskId)).toBe(false);
+  expect(statusLines(runId)).toContain('OpenCode subagent "Background scan" was left unfinished — the task switched harness');
+});
+
+test("boot reconcile orphans OpenCode rows no live tail will settle — and releases a claude task they held", async () => {
+  setTmux("absent");
+  // An opencode task whose turn died with the restart (no tmux session).
+  const oc = insertTaskWithRun({ agent: "opencode", column: "review", runStatus: "succeeded" });
+  const ocRow = await seedRunningChild(oc.taskId, oc.runId, "Died with the restart");
+  // A claude task (switched from opencode) held in `running` by a leftover row.
+  const cl = insertTaskWithRun({ agent: "claude-code", column: "running", runStatus: "succeeded" });
+  const clRow = await seedRunningChild(cl.taskId, cl.runId, "Leftover");
+  await orch.reconcileOrphans();
+  expect(db.subagents.get(ocRow)?.status).toBe("orphaned");
+  expect(db.subagents.get(clRow)?.status).toBe("orphaned");
+  // The settle hook's held-task release moved the claude card on.
+  expect(db.tasks.get(cl.taskId)?.column).toBe("review");
+  expect(db.tasks.get(oc.taskId)?.column).toBe("review");
+});
+
 test("createTask: a valid opencodeServer is stored, anything else reads as shared", async () => {
   expect((await newTask({ opencodeServer: "standalone" })).opencodeServer).toBe("standalone");
   expect((await newTask({ opencodeServer: "shared" })).opencodeServer).toBe("shared");
