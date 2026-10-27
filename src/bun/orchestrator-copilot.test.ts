@@ -432,7 +432,21 @@ async function insertRunningCopilotRun(taskId: string, sessionId: string | null)
   return runId;
 }
 
-test("reconcileOrphans: a running copilot run with no live session flips to orphaned, task to ready, its subagent rows to orphaned", async () => {
+// reconcileOrphans asks tmux whether a run's session is alive. Other test files
+// in the same `bun test` process leave AGETOR_TMUX_BIN=/bin/echo behind, which
+// answers "alive" for every session; pin a real answer for the reconcile tests.
+async function withRealTmux<T>(fn: () => Promise<T>): Promise<T> {
+  const prevBin = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = Bun.which("tmux") ?? "/usr/bin/false";
+  try {
+    return await fn();
+  } finally {
+    if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevBin;
+  }
+}
+
+test("reconcileOrphans: a running copilot run with no live session flips to orphaned, task to ready, its subagent rows to orphaned", () => withRealTmux(async () => {
   const { runs, tasks, subagents } = await import("./db.ts");
   const { reconcileOrphans } = await import("./orchestrator.ts");
   const taskId = await createCopilotTask("hello");
@@ -458,11 +472,11 @@ test("reconcileOrphans: a running copilot run with no live session flips to orph
   expect(tasks.get(taskId)?.column).toBe("ready");
   expect(subagents.get(`cp-${runId}-call_x`)?.status).toBe("orphaned");
   expect(subagents.hasRunning(taskId)).toBe(false);
-});
+}));
 
 const hasTmux = Bun.which("tmux") !== null;
 
-(hasTmux ? test : test.skip)("reconcileOrphans: a running copilot run whose tmux session is alive is reattached and settles from the log", async () => {
+(hasTmux ? test : test.skip)("reconcileOrphans: a running copilot run whose tmux session is alive is reattached and settles from the log", () => withRealTmux(async () => {
   const { runs, tasks } = await import("./db.ts");
   const { reconcileOrphans } = await import("./orchestrator.ts");
   const { sessionNameFor, sessionExistsByName } = await import("./claude-tmux.ts");
@@ -517,4 +531,4 @@ const hasTmux = Bun.which("tmux") !== null;
   } finally {
     Bun.spawnSync([resolveTmuxBin(), ...tmuxSocketArgs(), "kill-session", "-t", "=" + name]);
   }
-}, 30_000);
+}), 30_000);
